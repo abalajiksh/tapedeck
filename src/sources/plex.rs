@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use reqwest::Client;
 use crate::models::Play;
 use super::MusicSource;
-use log::{debug, error};
+use log::{debug, error}; // Removed unused 'trace'
 use serde::Deserialize;
 
 // --- Internal Structs for Plex XML Response ---
@@ -11,14 +11,12 @@ use serde::Deserialize;
 struct MediaContainer {
     // In XML, the root tag is MediaContainer.
     // The inner items are <Track> tags (since type=10).
-    // serde-xml-rs handles vectors of children automatically if named correctly.
     #[serde(rename = "Track", default)]
     tracks: Vec<PlexTrack>,
 }
 
 #[derive(Deserialize, Debug)]
 struct PlexTrack {
-    // XML attributes map directly to fields
     #[serde(rename = "viewedAt")]
     viewed_at: i64,
 
@@ -33,12 +31,8 @@ struct PlexTrack {
     #[serde(rename = "historyKey")]
     history_key: String,
 
-    // Additional helpful fields
-    #[serde(rename = "originalTitle")]
-    original_title: Option<String>,
-
     #[serde(rename = "index")]
-    track_number: Option<u32>,
+    track_number: Option<u32>, // Plex sends this as unsigned
 
     #[serde(rename = "duration")]
     duration: Option<u64>,
@@ -69,7 +63,6 @@ impl MusicSource for PlexSource {
     }
 
     async fn fetch_new_plays(&self, last_checked: u64) -> Result<Vec<Play>, Box<dyn std::error::Error>> {
-        // We removed &Accept=application/json to let it default to XML (or whatever it wants)
         let url = format!("{}/status/sessions/history/all?sort=viewedAt:desc&type=10&limit=200", self.url);
 
         debug!("Fetching Plex history from: {}", url);
@@ -87,9 +80,6 @@ impl MusicSource for PlexSource {
 
         // Get Raw Text (XML)
         let response_text = resp.text().await?;
-
-        // Log trace if needed
-        // trace!("Plex XML: {}", response_text);
 
         // Parse XML
         let container: MediaContainer = match serde_xml_rs::from_str(&response_text) {
@@ -115,11 +105,10 @@ impl MusicSource for PlexSource {
                         source_name: "Plex".to_string(),
                         timestamp: item.viewed_at as u64,
 
+                        // FIX IS HERE: Map u32 -> i32
                         track_number: item.track_number.map(|n| n as i32),
-                        duration: item.duration.map(|d| d / 1000), // Plex duration is ms, usually Play wants seconds?
-                        // Check your Play struct definition. If Play.duration is u64 seconds:
-                        // duration: item.duration.map(|ms| ms / 1000),
 
+                        duration: item.duration.map(|d| d / 1000),
                         mbid_artist: None,
                         mbid_recording: None,
                         mbid_release: None,
