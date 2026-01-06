@@ -1,6 +1,6 @@
 use serde::Deserialize;
 use reqwest::Client;
-use log::{info, debug, error};
+use log::{debug, error};
 use std::time::Duration;
 use crate::models::Play;
 use crate::sources::MusicSource;
@@ -11,26 +11,16 @@ use async_trait::async_trait;
 pub struct MediaContainer {
     #[serde(default)]
     pub size: Option<u32>,
-    #[serde(rename = "$value", default)]
-    pub children: Vec<MediaItem>,
-}
-
-#[derive(Debug, Deserialize)]
-pub enum MediaItem {
-    #[serde(rename = "Video")]
-    Video(Video),
-    #[serde(rename = "Track")]
-    Track(Track),
-    #[serde(other)]
-    Other,
+    #[serde(rename = "Track", default)]
+    pub tracks: Vec<Track>,
+    #[serde(rename = "Video", default)]
+    pub videos: Vec<Video>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct Video {
     #[serde(default)]
     pub title: String,
-    #[serde(default)]
-    pub type_: String,
     #[serde(rename = "grandparentTitle", default)]
     pub grandparent_title: Option<String>,
     #[serde(rename = "parentTitle", default)]
@@ -39,10 +29,6 @@ pub struct Video {
     pub viewed_at: Option<u64>,
     #[serde(rename = "duration", default)]
     pub duration: Option<u64>,
-    #[serde(rename = "User", default)]
-    pub user: Option<User>,
-    #[serde(rename = "Player", default)]
-    pub player: Option<Player>,
     #[serde(rename = "ratingKey", default)]
     pub rating_key: Option<String>,
 }
@@ -57,24 +43,8 @@ pub struct Track {
     pub album: Option<String>,
     #[serde(rename = "viewedAt", default)]
     pub viewed_at: Option<u64>,
-    #[serde(rename = "User", default)]
-    pub user: Option<User>,
-    #[serde(rename = "Player", default)]
-    pub player: Option<Player>,
     #[serde(rename = "ratingKey", default)]
     pub rating_key: Option<String>,
-}
-
-#[derive(Debug, Deserialize, Clone)]
-pub struct User {
-    #[serde(default)]
-    pub title: String,
-}
-
-#[derive(Debug, Deserialize, Clone)]
-pub struct Player {
-    #[serde(default)]
-    pub state: String,
 }
 
 pub struct PlexSource {
@@ -108,7 +78,6 @@ impl PlexSource {
         let text = resp.text().await?;
         debug!("Response text received, length: {}", text.len());
 
-        // Parse XML using the Enum approach to handle mixed children
         let container: MediaContainer = serde_xml_rs::from_str(&text).map_err(|e| {
             error!("Failed to parse Plex XML: {}", e);
             format!("Plex XML Parse Error: {}", e)
@@ -116,56 +85,55 @@ impl PlexSource {
 
         let mut plays = Vec::new();
 
-        for item in container.children {
-            match item {
-                MediaItem::Video(video) => {
-                    if let Some(viewed_at) = video.viewed_at {
-                        let artist = video.grandparent_title.clone().or(video.parent_title.clone()).unwrap_or("Unknown".to_string());
-                        let title = video.title.clone();
-                        let source_id = video.rating_key.clone().unwrap_or_else(|| format!("plex-hist-{}", viewed_at));
+        // Process Videos
+        for video in container.videos {
+            if let Some(viewed_at) = video.viewed_at {
+                let artist = video.grandparent_title
+                    .or(video.parent_title.clone())
+                    .unwrap_or_else(|| "Unknown".to_string());
+                let source_id = video.rating_key
+                    .unwrap_or_else(|| format!("plex-hist-{}", viewed_at));
 
-                        plays.push(Play {
-                            title,
-                            artist,
-                            artists: None,
-                            album: video.parent_title,
-                            timestamp: viewed_at,
-                            duration: video.duration,
-                            track_number: None,
-                            mbid_artist: None,
-                            mbid_release: None,
-                            mbid_release_group: None,
-                            mbid_recording: None,
-                            source_id,
-                            source_name: "Plex".to_string(),
-                        });
-                    }
-                },
-                MediaItem::Track(track) => {
-                    if let Some(viewed_at) = track.viewed_at {
-                        let artist = track.artist.clone().unwrap_or("Unknown".to_string());
-                        let source_id = track.rating_key.clone().unwrap_or_else(|| format!("plex-hist-{}", viewed_at));
+                plays.push(Play {
+                    title: video.title,
+                    artist,
+                    artists: None,
+                    album: video.parent_title,
+                    timestamp: viewed_at,
+                    duration: video.duration,
+                    track_number: None,
+                    mbid_artist: None,
+                    mbid_release: None,
+                    mbid_release_group: None,
+                    mbid_recording: None,
+                    source_id,
+                    source_name: "Plex".to_string(),
+                });
+            }
+        }
 
-                        plays.push(Play {
-                            title: track.title,
-                            artist,
-                            artists: None,
-                            album: track.album,
-                            timestamp: viewed_at,
-                            duration: None, // Tracks in history often don't have duration in attributes
-                            track_number: None,
-                            mbid_artist: None,
-                            mbid_release: None,
-                            mbid_release_group: None,
-                            mbid_recording: None,
-                            source_id,
-                            source_name: "Plex".to_string(),
-                        });
-                    }
-                },
-                MediaItem::Other => {
-                    // Ignore other tags
-                }
+        // Process Tracks
+        for track in container.tracks {
+            if let Some(viewed_at) = track.viewed_at {
+                let artist = track.artist.unwrap_or_else(|| "Unknown".to_string());
+                let source_id = track.rating_key
+                    .unwrap_or_else(|| format!("plex-hist-{}", viewed_at));
+
+                plays.push(Play {
+                    title: track.title,
+                    artist,
+                    artists: None,
+                    album: track.album,
+                    timestamp: viewed_at,
+                    duration: None,
+                    track_number: None,
+                    mbid_artist: None,
+                    mbid_release: None,
+                    mbid_release_group: None,
+                    mbid_recording: None,
+                    source_id,
+                    source_name: "Plex".to_string(),
+                });
             }
         }
 
@@ -182,7 +150,6 @@ impl MusicSource for PlexSource {
 
     async fn fetch_new_plays(&self, last_checked: u64) -> Result<Vec<Play>, Box<dyn std::error::Error>> {
         let history = self.fetch_history().await?;
-        // Filter plays strictly newer than last_checked
         Ok(history.into_iter().filter(|p| p.timestamp > last_checked).collect())
     }
 }
