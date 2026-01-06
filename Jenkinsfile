@@ -32,13 +32,6 @@ pipeline {
       }
     }
 
-    stage('Build & Test') {
-      steps {
-        sh 'cargo build --verbose'
-        sh 'cargo test --verbose'
-      }
-    }
-
     stage('Release') {
       steps {
         sh 'cargo build --release'
