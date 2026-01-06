@@ -24,7 +24,7 @@ async fn main() {
 
     // Use config.plex instead of env::var("PLEX_ENABLED")
     if config.plex.enabled {
-        sources.push(Box::new(sources::plex::PlexSource::new(
+        sources.push(Box::new(sources::PlexSource::new(
             config.plex.url.clone(),
             config.plex.token.clone(),
         )));
@@ -36,14 +36,14 @@ async fn main() {
     let mut sinks: Vec<Box<dyn ScrobbleSink>> = Vec::new();
 
     if config.listenbrainz.enabled {
-        sinks.push(Box::new(sinks::listenbrainz::ListenBrainzSink::new(
+        sinks.push(Box::new(sinks::ListenBrainzSink::new(
             config.listenbrainz.token.clone(),
             config.listenbrainz.base_url.clone() // Now this works because `config` exists!
         )));
     }
 
     if config.lastfm.enabled {
-        sinks.push(Box::new(sinks::lastfm::LastFmSink::new(
+        sinks.push(Box::new(sinks::LastFmSink::new(
             config.lastfm.api_key.clone(),
             config.lastfm.secret.clone(),
             config.lastfm.session_key.clone(),

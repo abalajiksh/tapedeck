@@ -60,6 +60,9 @@ impl MusicSource for PlexSource {
                         timestamp: item.viewed_at,
                         duration: None,
                         source_id: item.history_key,
+                        artists: vec![artist.clone()], // 'artists' is likely a Vec<String>
+                        mbid_artist: None,             // likely Option<String>
+                        mbid_recording: None,          // likely Option<String>
                     })
                 } else { None }
             })
