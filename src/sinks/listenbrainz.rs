@@ -87,7 +87,7 @@ impl ScrobbleSink for ListenBrainzSink {
                     additional_info: AdditionalInfo {
                         submission_client: "rust-plex-scrobbler",
                         submission_client_version: "0.1.0",
-                        track_number: play.track_number,
+                        track_number: play.track_number.map(|n| n as u32),
                         duration_ms: play.duration.map(|d| d * 1000),
                         artist_names: play.artists.as_ref(),
                         artist_mbids: play.mbid_artist.as_ref(),
