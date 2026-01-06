@@ -146,6 +146,10 @@ impl PlexSource {
         })?;
 
         debug!("Parsed {} videos and {} tracks", container.videos.len(), container.tracks.len());
+        if let Some(first_track) = container.tracks.first() {
+            debug!("First track: title='{}', artist={:?}, viewedAt={:?}",
+           first_track.title, first_track.artist, first_track.viewed_at);
+        }
 
         let mut plays = Vec::new();
 
