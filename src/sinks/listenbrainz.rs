@@ -1,66 +1,24 @@
-use super::ScrobbleSink;
-use crate::models::Play;
 use async_trait::async_trait;
 use reqwest::Client;
-use serde::Serialize;
-// use serde_json::json; // Unused import removed
-use log::{info, debug, error, trace}; // Added logging imports
+use serde_json::json;
+use crate::models::Play;
+use super::ScrobbleSink;
+use log::{info, debug, error};
 
 pub struct ListenBrainzSink {
-    pub token: String,
-    client: Client,
     base_url: String,
+    token: String,
+    client: Client,
 }
 
 impl ListenBrainzSink {
-    pub fn new(token: String, base_url: String) -> Self {
+    pub fn new(base_url: String, token: String) -> Self {
         Self {
+            base_url: base_url.trim_end_matches('/').to_string(),
             token,
             client: Client::new(),
-            base_url,
         }
     }
-}
-
-// ... [Struct definitions ListenPayload, PayloadItem, etc. remain unchanged] ...
-#[derive(Serialize)]
-struct ListenPayload<'a> {
-    listen_type: &'static str,
-    payload: Vec<PayloadItem<'a>>,
-}
-
-#[derive(Serialize)]
-struct PayloadItem<'a> {
-    listened_at: u64,
-    track_metadata: TrackMetadata<'a>,
-}
-
-#[derive(Serialize)]
-struct TrackMetadata<'a> {
-    artist_name: &'a str,
-    track_name: &'a str,
-    release_name: Option<&'a str>,
-    additional_info: AdditionalInfo<'a>,
-}
-
-#[derive(Serialize)]
-struct AdditionalInfo<'a> {
-    submission_client: &'static str,
-    submission_client_version: &'static str,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    track_number: Option<u32>, // Changed from Option to specific type if needed, assuming u32/i32
-    #[serde(skip_serializing_if = "Option::is_none")]
-    duration_ms: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    artist_names: Option<&'a Vec<String>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    artist_mbids: Option<&'a Vec<String>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    recording_mbid: Option<&'a String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    release_mbid: Option<&'a String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    release_group_mbid: Option<&'a String>,
 }
 
 #[async_trait]
@@ -69,6 +27,7 @@ impl ScrobbleSink for ListenBrainzSink {
         "ListenBrainz"
     }
 
+    // FIX: Renamed to match trait definition
     async fn scrobble(&self, plays: &[Play]) -> Result<(), Box<dyn std::error::Error>> {
         if plays.is_empty() {
             return Ok(());
@@ -76,59 +35,78 @@ impl ScrobbleSink for ListenBrainzSink {
 
         info!("Submitting {} plays to ListenBrainz...", plays.len());
 
-        let payload_items: Vec<PayloadItem> = plays.iter().map(|play| {
+        let payload_items: Vec<serde_json::Value> = plays.iter().map(|play| {
             debug!("Preparing ListenBrainz payload for: {} - {}", play.artist, play.title);
-            PayloadItem {
-                listened_at: play.timestamp,
-                track_metadata: TrackMetadata {
-                    artist_name: &play.artist,
-                    track_name: &play.title,
-                    release_name: play.album.as_deref(), // Fixed to use as_deref() for Option<String> -> Option<&str>
-                    additional_info: AdditionalInfo {
-                        submission_client: "rust-plex-scrobbler",
-                        submission_client_version: "0.1.0",
-                        track_number: play.track_number.map(|n| n as u32),
-                        duration_ms: play.duration.map(|d| d * 1000),
-                        artist_names: play.artists.as_ref(),
-                        artist_mbids: play.mbid_artist.as_ref(),
-                        recording_mbid: play.mbid_recording.as_ref(),
-                        release_mbid: play.mbid_release.as_ref(),
-                        release_group_mbid: play.mbid_release_group.as_ref(),
-                    },
-                },
+
+            let mut track_metadata = json!({
+                "artist_name": play.artist,
+                "track_name": play.title,
+            });
+
+            if let Some(meta) = track_metadata.as_object_mut() {
+                if let Some(ref album) = play.album {
+                    meta.insert("release_name".to_string(), json!(album));
+                }
+
+                let mut additional_info = serde_json::Map::new();
+                additional_info.insert("submission_client".to_string(), json!(env!("CARGO_PKG_NAME")));
+                additional_info.insert("submission_client_version".to_string(), json!(env!("CARGO_PKG_VERSION")));
+
+                if let Some(dur) = play.duration {
+                    additional_info.insert("duration_ms".to_string(), json!(dur * 1000));
+                }
+
+                if let Some(num) = play.track_number {
+                    additional_info.insert("track_number".to_string(), json!(num));
+                }
+
+                // Add MBIDs if available
+                if let Some(ref mbid) = play.mbid_artist {
+                    additional_info.insert("artist_mbids".to_string(), json!([mbid]));
+                }
+                if let Some(ref mbid) = play.mbid_release {
+                    additional_info.insert("release_mbid".to_string(), json!(mbid));
+                }
+                if let Some(ref mbid) = play.mbid_recording {
+                    additional_info.insert("recording_mbid".to_string(), json!(mbid));
+                }
+
+                if !additional_info.is_empty() {
+                    meta.insert("additional_info".to_string(), serde_json::Value::Object(additional_info));
+                }
             }
+
+            json!({
+                "listened_at": play.timestamp,
+                "track_metadata": track_metadata
+            })
         }).collect();
 
-        let body = ListenPayload {
-            listen_type: "import",
-            payload: payload_items,
+        let body = json!({
+            "listen_type": "import",
+            "payload": payload_items
+        });
+
+        let endpoint = if self.base_url.ends_with("submit-listens") {
+            self.base_url.clone()
+        } else {
+            format!("{}/1/submit-listens", self.base_url)
         };
 
-        // Trace log the body for deep debugging
-        if log::log_enabled!(log::Level::Trace) {
-            match serde_json::to_string(&body) {
-                Ok(json) => trace!("ListenBrainz Request Body: {}", json),
-                Err(e) => error!("Failed to serialize debug payload: {}", e),
-            }
-        }
-
-        let resp = self.client.post(&self.base_url)
+        let resp = self.client.post(&endpoint)
             .header("Authorization", format!("Token {}", self.token))
-            .header("Content-Type", "application/json")
             .json(&body)
             .send()
             .await?;
 
-        let status = resp.status();
-        debug!("ListenBrainz API Response Status: {}", status);
-
-        if !status.is_success() {
+        if !resp.status().is_success() {
+            let status = resp.status();
             let error_text = resp.text().await.unwrap_or_default();
             error!("ListenBrainz submission failed. Status: {}, Response: {}", status, error_text);
             return Err(format!("ListenBrainz API Error: {}", error_text).into());
         }
 
-        info!("Successfully scrobbled {} plays to ListenBrainz", plays.len());
+        info!("Successfully submitted {} plays to ListenBrainz", plays.len());
         Ok(())
     }
 }
