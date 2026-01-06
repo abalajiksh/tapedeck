@@ -1,8 +1,40 @@
 use async_trait::async_trait;
 use reqwest::Client;
-use crate::models::{Play, PlexHistoryResponse};
-use super::MusicSource; // We need to IMPLEMENT this trait
-use log::{info, debug, warn, error};
+use crate::models::Play; // Only import Play from models
+use super::MusicSource;
+use log::{debug, error}; // info and warn removed if unused
+use serde::Deserialize; // <--- CRITICAL: Import Deserialize macro
+
+// --- Internal Structs for Plex Response ---
+// Defined here because they are specific to this source
+
+#[derive(Deserialize)]
+struct PlexHistoryResponse {
+    #[serde(rename = "MediaContainer")]
+    container: MediaContainer,
+}
+
+#[derive(Deserialize)]
+struct MediaContainer {
+    #[serde(rename = "Metadata", default)]
+    metadata: Vec<PlexItem>,
+}
+
+#[derive(Deserialize)]
+struct PlexItem {
+    #[serde(rename = "viewedAt")]
+    viewed_at: i64, // Use i64 for timestamps (or u64)
+    title: String,
+    #[serde(rename = "parentTitle")]
+    album: Option<String>,
+    #[serde(rename = "grandparentTitle")]
+    artist: Option<String>,
+    #[serde(rename = "historyKey")]
+    history_key: String,
+    // Add other fields if needed for debugging, but these are minimum required
+}
+
+// --- Source Implementation ---
 
 pub struct PlexSource {
     url: String,
@@ -18,29 +50,6 @@ impl PlexSource {
             client: Client::new(),
         }
     }
-}
-
-#[derive(Deserialize)]
-struct PlexHistoryResponse {
-    #[serde(rename = "MediaContainer")]
-    container: MediaContainer,
-}
-#[derive(Deserialize)]
-struct MediaContainer {
-    #[serde(rename = "Metadata", default)]
-    metadata: Vec<PlexItem>,
-}
-#[derive(Deserialize)]
-struct PlexItem {
-    #[serde(rename = "viewedAt")]
-    viewed_at: u64,
-    title: String,
-    #[serde(rename = "parentTitle")]
-    artist: Option<String>,
-    #[serde(rename = "grandparentTitle")]
-    album: Option<String>,
-    #[serde(rename = "historyKey")]
-    history_key: String,
 }
 
 #[async_trait]
@@ -69,22 +78,21 @@ impl MusicSource for PlexSource {
         let data: PlexHistoryResponse = resp.json().await?;
 
         let plays: Vec<Play> = data.container.metadata.into_iter()
-            .filter(|item| item.viewed_at > last_checked)
+            .filter(|item| item.viewed_at as u64 > last_checked) // Cast i64 -> u64
             .filter_map(|item| {
                 if let Some(ref artist) = item.artist {
                     Some(Play {
                         title: item.title.to_string(),
-                        album: item.album.clone(), // Option<String>
-                        artist: artist.clone(),    // String
-                        artists: Some(vec![artist.clone()]), // Option<Vec<String>>
+                        album: item.album.clone(),
+                        artist: artist.clone(),
+                        artists: Some(vec![artist.clone()]),
 
                         source_id: item.history_key.clone(),
                         source_name: "Plex".to_string(),
                         timestamp: item.viewed_at as u64,
 
-                        // Default missing fields
-                        track_number: None, // Plex doesn't always provide this in history
-                        duration: None,     // You can add item.duration (u64 ms) / 1000 if available
+                        track_number: None,
+                        duration: None,
                         mbid_artist: None,
                         mbid_recording: None,
                         mbid_release: None,
