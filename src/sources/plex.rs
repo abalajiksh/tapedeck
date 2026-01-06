@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use reqwest::Client;
 use crate::models::Play;
 use super::MusicSource;
-use log::{debug, error, trace};
+use log::{debug, error};
 use serde::Deserialize;
 
 // --- Internal Structs for Plex XML Response ---
@@ -115,7 +115,7 @@ impl MusicSource for PlexSource {
                         source_name: "Plex".to_string(),
                         timestamp: item.viewed_at as u64,
 
-                        track_number: item.track_number,
+                        track_number: item.track_number.map(|n| n as i32),
                         duration: item.duration.map(|d| d / 1000), // Plex duration is ms, usually Play wants seconds?
                         // Check your Play struct definition. If Play.duration is u64 seconds:
                         // duration: item.duration.map(|ms| ms / 1000),
