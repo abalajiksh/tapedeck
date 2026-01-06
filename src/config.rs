@@ -43,12 +43,24 @@ pub struct LastFmConfig {
 pub struct ListenBrainzConfig {
     pub enabled: bool,
     pub token: String,
+    pub base_url: String, // Added this field
 }
 
 impl Config {
     pub fn from_env() -> Self {
         // Load .env file if it exists
         dotenv().ok();
+
+        // Determine ListenBrainz URL logic
+        // Default is PRODUCTION (true) unless explicitly set to "false"
+        let is_prod = get_env_bool("IS_PRODUCTION", true);
+
+        let lb_url = if is_prod {
+            "https://api.listenbrainz.org/1/submit-listen".to_string()
+        } else {
+            // In DEV mode, use custom URL or fallback to localhost mock
+            get_env("LISTENBRAINZ_URL", "http://localhost:8080/1/submit-listen")
+        };
 
         Config {
             plex: PlexConfig {
@@ -75,6 +87,7 @@ impl Config {
             listenbrainz: ListenBrainzConfig {
                 enabled: get_env_bool("LISTENBRAINZ_ENABLED", false),
                 token: get_env("LISTENBRAINZ_TOKEN", ""),
+                base_url: lb_url,
             },
         }
     }

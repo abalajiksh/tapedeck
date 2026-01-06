@@ -8,15 +8,16 @@ use serde_json::json;
 pub struct ListenBrainzSink {
     pub token: String,
     client: Client,
-    base_url: String,
+    base_url: String, // Dynamic URL
 }
 
 impl ListenBrainzSink {
-    pub fn new(token: String) -> Self {
+    // Constructor now takes URL from Config
+    pub fn new(token: String, base_url: String) -> Self {
         Self {
             token,
             client: Client::new(),
-            base_url: "https://api.listenbrainz.org/1/submit-listen".to_string(),
+            base_url,
         }
     }
 }
@@ -101,7 +102,7 @@ impl ScrobbleSink for ListenBrainzSink {
             payload: payload_items,
         };
 
-        // Send Request
+        // Send Request to the dynamic URL
         let resp = self.client.post(&self.base_url)
             .header("Authorization", format!("Token {}", self.token))
             .header("Content-Type", "application/json")

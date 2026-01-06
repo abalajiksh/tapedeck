@@ -3,43 +3,55 @@ mod models;
 mod sources;
 mod sinks;
 
-use dotenv::dotenv;
-use std::env;
+// Remove `use dotenv::dotenv;` and `use std::env;`
+// because `config::Config::from_env()` handles loading .env internally now.
 use std::time::Duration;
 use tokio::time::sleep;
 use crate::sources::MusicSource;
 use crate::sinks::ScrobbleSink;
+use crate::config::Config; // Import the Config struct
 
 #[tokio::main]
 async fn main() {
-    dotenv().ok(); // Load .env
-
-    // 1. Initialize Sources
-    let mut sources: Vec<Box<dyn MusicSource>> = Vec::new();
-
-    if env::var("PLEX_ENABLED").unwrap_or("false".into()) == "true" {
-        sources.push(Box::new(sources::plex::PlexSource::new(
-            env::var("PLEX_URL").unwrap(),
-            env::var("PLEX_TOKEN").unwrap(),
-        )));
-    }
-
-    // (Add Navidrome/Jellyfin/Lyrion init here...)
-
-    // 2. Initialize Sinks
-    let mut sinks: Vec<Box<dyn ScrobbleSink>> = Vec::new();
-
-    if env::var("LISTENBRAINZ_ENABLED").unwrap_or("false".into()) == "true" {
-        sinks.push(Box::new(sinks::listenbrainz::ListenBrainzSink::new(
-            env::var("LISTENBRAINZ_TOKEN").unwrap()
-        )));
-    }
-
-    // 3. State Management (Simple timestamp tracker)
-    // Ideally, load this from a file: state.json -> {"Plex": 1670000000, "Navidrome": ...}
-    let mut last_check_time = 1700000000; // Example start time
+    // 1. Load Configuration
+    // This loads .env and parses all variables into the struct
+    let config = Config::from_env();
 
     println!("🚀 Scrobbler Service Started");
+
+    // 2. Initialize Sources
+    let mut sources: Vec<Box<dyn MusicSource>> = Vec::new();
+
+    // Use config.plex instead of env::var("PLEX_ENABLED")
+    if config.plex.enabled {
+        sources.push(Box::new(sources::plex::PlexSource::new(
+            config.plex.url.clone(),
+            config.plex.token.clone(),
+        )));
+    }
+
+    // Add other sources similarly using config.navidrome, etc.
+
+    // 3. Initialize Sinks
+    let mut sinks: Vec<Box<dyn ScrobbleSink>> = Vec::new();
+
+    if config.listenbrainz.enabled {
+        sinks.push(Box::new(sinks::listenbrainz::ListenBrainzSink::new(
+            config.listenbrainz.token.clone(),
+            config.listenbrainz.base_url.clone() // Now this works because `config` exists!
+        )));
+    }
+
+    if config.lastfm.enabled {
+        sinks.push(Box::new(sinks::lastfm::LastFmSink::new(
+            config.lastfm.api_key.clone(),
+            config.lastfm.secret.clone(),
+            config.lastfm.session_key.clone(),
+        )));
+    }
+
+    // 4. State Management
+    let mut last_check_time = 1700000000; // Ideally load from file
 
     loop {
         let current_time = std::time::SystemTime::now()
@@ -51,7 +63,6 @@ async fn main() {
                     if !plays.is_empty() {
                         println!("Found {} plays from {}", plays.len(), source.name());
 
-                        // Push to ALL sinks
                         for sink in &sinks {
                             if let Err(e) = sink.scrobble(&plays).await {
                                 eprintln!("❌ Error sending to {}: {}", sink.name(), e);
@@ -65,10 +76,7 @@ async fn main() {
             }
         }
 
-        // Update checkpoint
         last_check_time = current_time;
-
-        // Wait 10 minutes
         sleep(Duration::from_secs(600)).await;
     }
 }
