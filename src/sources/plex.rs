@@ -1,59 +1,73 @@
-use async_trait::async_trait;
-use reqwest::Client;
-use crate::models::Play;
-use super::MusicSource;
-use log::{debug, error};
 use serde::Deserialize;
+use reqwest::Client;
+use log::{info, debug, error};
+use std::time::Duration;
+use crate::models::Play;
+use crate::sources::MusicSource;
+use async_trait::async_trait;
 
-// --- Internal Structs for Plex XML Response ---
-
-#[derive(Deserialize, Debug)]
-struct MediaContainer {
-    // We use a flat vector of "PlexItem" enums to handle mixed <Track> and <Video> tags.
-    // serde-xml-rs will automatically map <Track> to PlexItem::Track and <Video> to PlexItem::Video
-    #[serde(rename = "$value")]
-    items: Vec<PlexItem>,
+#[derive(Debug, Deserialize)]
+#[serde(rename = "MediaContainer")]
+pub struct MediaContainer {
+    #[serde(default)]
+    pub size: Option<u32>,
+    #[serde(rename = "Video", default)]
+    pub videos: Vec<Video>,
+    #[serde(rename = "Track", default)]
+    pub tracks: Vec<Track>,
 }
 
-#[derive(Deserialize, Debug)]
-enum PlexItem {
-    #[serde(rename = "Track")]
-    Track(PlexTrack),
-    #[serde(rename = "Video")]
-    Video(PlexVideo), // We'll ignore these, but we need to parse them to not break the list
+#[derive(Debug, Deserialize, Clone)]
+pub struct Video {
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub type_: String,
+    #[serde(rename = "grandparentTitle", default)]
+    pub grandparent_title: Option<String>,
+    #[serde(rename = "parentTitle", default)]
+    pub parent_title: Option<String>,
+    #[serde(rename = "viewedAt", default)]
+    pub viewed_at: Option<u64>,
+    #[serde(rename = "duration", default)]
+    pub duration: Option<u64>,
+    #[serde(rename = "User", default)]
+    pub user: Option<User>,
+    #[serde(rename = "Player", default)]
+    pub player: Option<Player>,
+    #[serde(rename = "ratingKey", default)]
+    pub rating_key: Option<String>, // Added for source_id
 }
 
-#[derive(Deserialize, Debug)]
-struct PlexVideo {
-    // We don't care about fields here, just need to consume the tag
-    #[serde(rename = "ratingKey")]
-    rating_key: Option<String>,
+#[derive(Debug, Deserialize, Clone)]
+pub struct Track {
+    #[serde(default)]
+    pub title: String,
+    #[serde(rename = "grandparentTitle", default)]
+    pub artist: Option<String>,
+    #[serde(rename = "parentTitle", default)]
+    pub album: Option<String>,
+    #[serde(rename = "viewedAt", default)]
+    pub viewed_at: Option<u64>,
+    #[serde(rename = "User", default)]
+    pub user: Option<User>,
+    #[serde(rename = "Player", default)]
+    pub player: Option<Player>,
+    #[serde(rename = "ratingKey", default)]
+    pub rating_key: Option<String>, // Added for source_id
 }
 
-#[derive(Deserialize, Debug)]
-struct PlexTrack {
-    #[serde(rename = "viewedAt")]
-    viewed_at: i64,
-
-    title: String,
-
-    #[serde(rename = "parentTitle")] // Album
-    album: Option<String>,
-
-    #[serde(rename = "grandparentTitle")] // Artist
-    artist: Option<String>,
-
-    #[serde(rename = "historyKey")]
-    history_key: String,
-
-    #[serde(rename = "index")]
-    track_number: Option<u32>,
-
-    #[serde(rename = "duration")]
-    duration: Option<u64>,
+#[derive(Debug, Deserialize, Clone)]
+pub struct User {
+    #[serde(default)]
+    pub title: String,
 }
 
-// --- Source Implementation ---
+#[derive(Debug, Deserialize, Clone)]
+pub struct Player {
+    #[serde(default)]
+    pub state: String,
+}
 
 pub struct PlexSource {
     url: String,
@@ -64,10 +78,82 @@ pub struct PlexSource {
 impl PlexSource {
     pub fn new(url: String, token: String) -> Self {
         Self {
-            url,
+            url: url.trim_end_matches('/').to_string(),
             token,
-            client: Client::new(),
+            client: Client::builder()
+                .timeout(Duration::from_secs(10))
+                .build()
+                .unwrap_or_else(|_| Client::new()),
         }
+    }
+
+    pub async fn fetch_history(&self) -> Result<Vec<Play>, Box<dyn std::error::Error>> {
+        let endpoint = format!("{}/status/sessions/history/all", self.url);
+        debug!("Fetching Plex history from: {}", endpoint);
+
+        let resp = self.client.get(&endpoint)
+            .query(&[("sort", "viewedAt:desc"), ("limit", "200"), ("X-Plex-Token", &self.token)])
+            .send()
+            .await?;
+
+        let text = resp.text().await?;
+
+        let container: MediaContainer = serde_xml_rs::from_str(&text).map_err(|e| {
+            error!("Failed to parse Plex XML: {}", e);
+            format!("Plex XML Parse Error: {}", e)
+        })?;
+
+        let mut plays = Vec::new();
+
+        // Process Videos
+        for video in container.videos {
+            if let Some(viewed_at) = video.viewed_at {
+                let artist = video.grandparent_title.clone().or(video.parent_title.clone()).unwrap_or("Unknown".to_string());
+                let title = video.title.clone();
+                let source_id = video.rating_key.clone().unwrap_or_else(|| format!("plex-hist-{}", viewed_at));
+
+                plays.push(Play {
+                    title,
+                    artist,
+                    artists: None,
+                    album: video.parent_title,
+                    timestamp: viewed_at,
+                    duration: video.duration,
+                    track_number: None,
+                    mbid_artist: None,
+                    mbid_release: None,
+                    mbid_release_group: None,
+                    mbid_recording: None,
+                    source_id,
+                    source_name: "Plex".to_string(),
+                });
+            }
+        }
+
+        // Process Tracks
+        for track in container.tracks {
+            if let Some(viewed_at) = track.viewed_at {
+                let source_id = track.rating_key.clone().unwrap_or_else(|| format!("plex-hist-{}", viewed_at));
+
+                plays.push(Play {
+                    title: track.title,
+                    artist: track.artist.unwrap_or("Unknown".to_string()),
+                    artists: None,
+                    album: track.album,
+                    timestamp: viewed_at,
+                    duration: None,
+                    track_number: None,
+                    mbid_artist: None,
+                    mbid_release: None,
+                    mbid_release_group: None,
+                    mbid_recording: None,
+                    source_id,
+                    source_name: "Plex".to_string(),
+                });
+            }
+        }
+
+        Ok(plays)
     }
 }
 
@@ -78,66 +164,7 @@ impl MusicSource for PlexSource {
     }
 
     async fn fetch_new_plays(&self, last_checked: u64) -> Result<Vec<Play>, Box<dyn std::error::Error>> {
-        // Fetch everything (mixed history)
-        let url = format!("{}/status/sessions/history/all?sort=viewedAt:desc&limit=200", self.url);
-
-        debug!("Fetching Plex history from: {}", url);
-
-        let resp = self.client.get(&url)
-            .header("X-Plex-Token", &self.token)
-            .send()
-            .await?;
-
-        if !resp.status().is_success() {
-            let error_text = resp.text().await.unwrap_or_default();
-            error!("Plex API error: {}", error_text);
-            return Err(format!("Plex API error: {}", error_text).into());
-        }
-
-        let response_text = resp.text().await?;
-
-        // Parse XML into mixed enum list
-        let container: MediaContainer = match serde_xml_rs::from_str(&response_text) {
-            Ok(c) => c,
-            Err(e) => {
-                error!("Failed to parse Plex XML: {}", e);
-                // debug!("Response was: {}", response_text); // Uncomment if needed
-                return Err(Box::new(e));
-            }
-        };
-
-        let plays: Vec<Play> = container.items.into_iter()
-            .filter_map(|item| match item {
-                PlexItem::Track(track) => Some(track),
-                PlexItem::Video(_) => None, // Ignore videos
-            })
-            .filter(|track| track.viewed_at as u64 > last_checked)
-            .filter_map(|item| {
-                if let Some(ref artist) = item.artist {
-                    Some(Play {
-                        title: item.title.clone(),
-                        album: item.album.clone(),
-                        artist: artist.clone(),
-                        artists: Some(vec![artist.clone()]),
-
-                        source_id: item.history_key.clone(),
-                        source_name: "Plex".to_string(),
-                        timestamp: item.viewed_at as u64,
-
-                        track_number: item.track_number.map(|n| n as i32),
-                        duration: item.duration.map(|d| d / 1000),
-
-                        mbid_artist: None,
-                        mbid_recording: None,
-                        mbid_release: None,
-                        mbid_release_group: None,
-                    })
-                } else {
-                    None
-                }
-            })
-            .collect();
-
-        Ok(plays)
+        let history = self.fetch_history().await?;
+        Ok(history.into_iter().filter(|p| p.timestamp > last_checked).collect())
     }
 }
