@@ -54,20 +54,32 @@ impl MusicSource for PlexSource {
             .filter_map(|item| {
                 if let Some(artist) = item.artist {
                     Some(Play {
-                        title: title.to_string(),
-                        album: album.to_string(),
-                        // FIXED: Wrap in Some()
-                        artists: Some(vec![artist.clone()]),
+                        // 1. Title is available directly
+                        title: item.title.to_string(),
 
-                        // FIXED: Initialize missing fields
+                        // 2. Album is optional in PlexItem, so handle the None case
+                        album: item.album.clone().unwrap_or_default(),
+
+                        // 3. Artist comes from the item
+                        artist: item.artist.clone(),
+                        artists: Some(vec![item.artist.clone()]),
+
+                        // 4. Use history_key for the ID (compiler confirmed this field exists)
+                        source_id: item.history_key.clone(),
+                        source_name: "Plex".to_string(),
+
+                        // 5. Timestamp is mandatory u64. item.viewed_at is usually the timestamp.
+                        timestamp: item.viewed_at as u64,
+
+                        // 6. Track number is missing from PlexItem, so we default it
+                        track_number: None,
+
+                        // Other fields
+                        duration: None,
                         mbid_artist: None,
                         mbid_recording: None,
                         mbid_release: None,
                         mbid_release_group: None,
-                        source_name: Some("Plex".to_string()),
-
-                        // Add the final missing field (likely duration)
-                        duration: None,
                     })
                 } else { None }
             })
