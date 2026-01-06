@@ -1,3 +1,6 @@
+mod lastfm;
+mod listenbrainz;
+
 use crate::models::Play;
 use async_trait::async_trait;
 
