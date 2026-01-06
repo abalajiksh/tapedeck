@@ -1,5 +1,7 @@
 mod lastfm;
 mod listenbrainz;
+pub use lastfm::LastFmSink;
+pub use listenbrainz::ListenBrainzSink;
 
 use crate::models::Play;
 use async_trait::async_trait;

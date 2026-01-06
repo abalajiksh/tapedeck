@@ -1,4 +1,5 @@
 mod plex;
+pub use plex::PlexSource;
 
 use crate::models::Play;
 use async_trait::async_trait;
