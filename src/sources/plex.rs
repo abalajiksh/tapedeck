@@ -1,37 +1,47 @@
 use async_trait::async_trait;
 use reqwest::Client;
-use crate::models::Play; // Only import Play from models
+use crate::models::Play;
 use super::MusicSource;
-use log::{debug, error}; // info and warn removed if unused
-use serde::Deserialize; // <--- CRITICAL: Import Deserialize macro
+use log::{debug, error, trace};
+use serde::Deserialize;
 
-// --- Internal Structs for Plex Response ---
-// Defined here because they are specific to this source
+// --- Internal Structs for Plex XML Response ---
 
-#[derive(Deserialize)]
-struct PlexHistoryResponse {
-    #[serde(rename = "MediaContainer")]
-    container: MediaContainer,
-}
-
-#[derive(Deserialize)]
+#[derive(Deserialize, Debug)]
 struct MediaContainer {
-    #[serde(rename = "Metadata", default)]
-    metadata: Vec<PlexItem>,
+    // In XML, the root tag is MediaContainer.
+    // The inner items are <Track> tags (since type=10).
+    // serde-xml-rs handles vectors of children automatically if named correctly.
+    #[serde(rename = "Track", default)]
+    tracks: Vec<PlexTrack>,
 }
 
-#[derive(Deserialize)]
-struct PlexItem {
+#[derive(Deserialize, Debug)]
+struct PlexTrack {
+    // XML attributes map directly to fields
     #[serde(rename = "viewedAt")]
-    viewed_at: i64, // Use i64 for timestamps (or u64)
+    viewed_at: i64,
+
     title: String,
-    #[serde(rename = "parentTitle")]
+
+    #[serde(rename = "parentTitle")] // Album
     album: Option<String>,
-    #[serde(rename = "grandparentTitle")]
+
+    #[serde(rename = "grandparentTitle")] // Artist
     artist: Option<String>,
+
     #[serde(rename = "historyKey")]
     history_key: String,
-    // Add other fields if needed for debugging, but these are minimum required
+
+    // Additional helpful fields
+    #[serde(rename = "originalTitle")]
+    original_title: Option<String>,
+
+    #[serde(rename = "index")]
+    track_number: Option<u32>,
+
+    #[serde(rename = "duration")]
+    duration: Option<u64>,
 }
 
 // --- Source Implementation ---
@@ -59,13 +69,13 @@ impl MusicSource for PlexSource {
     }
 
     async fn fetch_new_plays(&self, last_checked: u64) -> Result<Vec<Play>, Box<dyn std::error::Error>> {
+        // We removed &Accept=application/json to let it default to XML (or whatever it wants)
         let url = format!("{}/status/sessions/history/all?sort=viewedAt:desc&type=10&limit=200", self.url);
 
         debug!("Fetching Plex history from: {}", url);
 
         let resp = self.client.get(&url)
             .header("X-Plex-Token", &self.token)
-            .header("Accept", "application/json")
             .send()
             .await?;
 
@@ -75,14 +85,28 @@ impl MusicSource for PlexSource {
             return Err(format!("Plex API error: {}", error_text).into());
         }
 
-        let data: PlexHistoryResponse = resp.json().await?;
+        // Get Raw Text (XML)
+        let response_text = resp.text().await?;
 
-        let plays: Vec<Play> = data.container.metadata.into_iter()
-            .filter(|item| item.viewed_at as u64 > last_checked) // Cast i64 -> u64
+        // Log trace if needed
+        // trace!("Plex XML: {}", response_text);
+
+        // Parse XML
+        let container: MediaContainer = match serde_xml_rs::from_str(&response_text) {
+            Ok(c) => c,
+            Err(e) => {
+                error!("Failed to parse Plex XML: {}", e);
+                debug!("Response was: {}", response_text);
+                return Err(Box::new(e));
+            }
+        };
+
+        let plays: Vec<Play> = container.tracks.into_iter()
+            .filter(|item| item.viewed_at as u64 > last_checked)
             .filter_map(|item| {
                 if let Some(ref artist) = item.artist {
                     Some(Play {
-                        title: item.title.to_string(),
+                        title: item.title.clone(),
                         album: item.album.clone(),
                         artist: artist.clone(),
                         artists: Some(vec![artist.clone()]),
@@ -91,8 +115,11 @@ impl MusicSource for PlexSource {
                         source_name: "Plex".to_string(),
                         timestamp: item.viewed_at as u64,
 
-                        track_number: None,
-                        duration: None,
+                        track_number: item.track_number,
+                        duration: item.duration.map(|d| d / 1000), // Plex duration is ms, usually Play wants seconds?
+                        // Check your Play struct definition. If Play.duration is u64 seconds:
+                        // duration: item.duration.map(|ms| ms / 1000),
+
                         mbid_artist: None,
                         mbid_recording: None,
                         mbid_release: None,
