@@ -1,4 +1,4 @@
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 use reqwest::Client;
 use log::{debug, error};
 use std::time::Duration;
@@ -6,10 +6,21 @@ use crate::models::Play;
 use crate::sources::MusicSource;
 use async_trait::async_trait;
 
+fn deserialize_u64_from_string<'de, D>(deserializer: D) -> Result<Option<u64>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let s: Option<String> = Option::deserialize(deserializer)?;
+    match s {
+        Some(s) => s.parse::<u64>().map(Some).map_err(serde::de::Error::custom),
+        None => Ok(None),
+    }
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename = "MediaContainer")]
 pub struct MediaContainer {
-    #[serde(default)]
+    #[serde(rename = "@size", default)]
     pub size: Option<u32>,
     #[serde(rename = "Track", default)]
     pub tracks: Vec<Track>,
@@ -19,94 +30,32 @@ pub struct MediaContainer {
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct Video {
-    // Attributes we use
-    #[serde(default)]
+    #[serde(rename = "@title", default)]
     pub title: String,
-    #[serde(rename = "grandparentTitle", default)]
+    #[serde(rename = "@grandparentTitle", default)]
     pub grandparent_title: Option<String>,
-    #[serde(rename = "parentTitle", default)]
+    #[serde(rename = "@parentTitle", default)]
     pub parent_title: Option<String>,
-    #[serde(rename = "viewedAt", default)]
+    #[serde(rename = "@viewedAt", default, deserialize_with = "deserialize_u64_from_string")]
     pub viewed_at: Option<u64>,
-    #[serde(rename = "duration", default)]
+    #[serde(rename = "@duration", default, deserialize_with = "deserialize_u64_from_string")]
     pub duration: Option<u64>,
-    #[serde(rename = "ratingKey", default)]
+    #[serde(rename = "@ratingKey", default)]
     pub rating_key: Option<String>,
-
-    // Other attributes (ignored but needed for deserialization)
-    #[serde(rename = "historyKey", default)]
-    pub history_key: Option<String>,
-    #[serde(default)]
-    pub key: Option<String>,
-    #[serde(rename = "librarySectionID", default)]
-    pub library_section_id: Option<String>,
-    #[serde(rename = "parentKey", default)]
-    pub parent_key: Option<String>,
-    #[serde(rename = "grandparentKey", default)]
-    pub grandparent_key: Option<String>,
-    #[serde(rename = "type", default)]
-    pub type_: Option<String>,
-    #[serde(default)]
-    pub thumb: Option<String>,
-    #[serde(rename = "parentThumb", default)]
-    pub parent_thumb: Option<String>,
-    #[serde(rename = "grandparentThumb", default)]
-    pub grandparent_thumb: Option<String>,
-    #[serde(rename = "grandparentArt", default)]
-    pub grandparent_art: Option<String>,
-    #[serde(default)]
-    pub index: Option<u32>,
-    #[serde(rename = "parentIndex", default)]
-    pub parent_index: Option<u32>,
-    #[serde(rename = "accountID", default)]
-    pub account_id: Option<String>,
-    #[serde(rename = "deviceID", default)]
-    pub device_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct Track {
-    // Attributes we use
-    #[serde(default)]
+    #[serde(rename = "@title", default)]
     pub title: String,
-    #[serde(rename = "grandparentTitle", default)]
+    #[serde(rename = "@grandparentTitle", default)]
     pub artist: Option<String>,
-    #[serde(rename = "parentTitle", default)]
+    #[serde(rename = "@parentTitle", default)]
     pub album: Option<String>,
-    #[serde(rename = "viewedAt", default)]
+    #[serde(rename = "@viewedAt", default, deserialize_with = "deserialize_u64_from_string")]
     pub viewed_at: Option<u64>,
-    #[serde(rename = "ratingKey", default)]
+    #[serde(rename = "@ratingKey", default)]
     pub rating_key: Option<String>,
-
-    // Other attributes (ignored but needed for deserialization)
-    #[serde(rename = "historyKey", default)]
-    pub history_key: Option<String>,
-    #[serde(default)]
-    pub key: Option<String>,
-    #[serde(rename = "librarySectionID", default)]
-    pub library_section_id: Option<String>,
-    #[serde(rename = "parentKey", default)]
-    pub parent_key: Option<String>,
-    #[serde(rename = "grandparentKey", default)]
-    pub grandparent_key: Option<String>,
-    #[serde(rename = "type", default)]
-    pub type_: Option<String>,
-    #[serde(default)]
-    pub thumb: Option<String>,
-    #[serde(rename = "parentThumb", default)]
-    pub parent_thumb: Option<String>,
-    #[serde(rename = "grandparentThumb", default)]
-    pub grandparent_thumb: Option<String>,
-    #[serde(rename = "grandparentArt", default)]
-    pub grandparent_art: Option<String>,
-    #[serde(default)]
-    pub index: Option<u32>,
-    #[serde(rename = "parentIndex", default)]
-    pub parent_index: Option<u32>,
-    #[serde(rename = "accountID", default)]
-    pub account_id: Option<String>,
-    #[serde(rename = "deviceID", default)]
-    pub device_id: Option<String>,
 }
 
 pub struct PlexSource {
@@ -146,9 +95,10 @@ impl PlexSource {
         })?;
 
         debug!("Parsed {} videos and {} tracks", container.videos.len(), container.tracks.len());
+
         if let Some(first_track) = container.tracks.first() {
             debug!("First track: title='{}', artist={:?}, viewedAt={:?}",
-           first_track.title, first_track.artist, first_track.viewed_at);
+                   first_track.title, first_track.artist, first_track.viewed_at);
         }
 
         let mut plays = Vec::new();
