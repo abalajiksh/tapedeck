@@ -10,12 +10,19 @@ use tokio::time::sleep;
 use crate::sources::MusicSource;
 use crate::sinks::ScrobbleSink;
 use crate::config::Config; // Import the Config struct
+use log::{info, error, debug, warn};
 
 #[tokio::main]
 async fn main() {
     // 1. Load Configuration
     // This loads .env and parses all variables into the struct
     let config = Config::from_env();
+
+    // Initialize logger. Default to "info" if RUST_LOG isn't set.
+    if std::env::var("RUST_LOG").is_err() {
+        std::env::set_var("RUST_LOG", "info");
+    }
+    env_logger::init();
 
     println!("🚀 Scrobbler Service Started");
 

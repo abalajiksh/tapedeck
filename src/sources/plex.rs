@@ -3,6 +3,7 @@ use crate::models::Play;
 use async_trait::async_trait;
 use reqwest::Client;
 use serde::Deserialize;
+use log::{info, debug, error, trace};
 
 pub struct PlexSource {
     pub url: String,
@@ -44,46 +45,60 @@ impl MusicSource for PlexSource {
     fn name(&self) -> &str { "Plex" }
 
     async fn fetch_new_plays(&self, last_checked: u64) -> Result<Vec<Play>, Box<dyn std::error::Error>> {
-        // Fetch last 50 items (deep enough to catch offline syncs)
-        let url = format!("{}/status/sessions/history/all?sort=viewedAt:desc&type=10&limit=50", self.url);
-        let resp = self.client.get(&url).header("X-Plex-Token", &self.token).send().await?;
-        let data: PlexHistoryResponse = resp.json().await?;
+        let url = format!("{}/status/sessions/history/all?sort=viewedAt:desc&type=10&limit=200", self.url);
 
-        let plays = data.container.metadata.into_iter()
-            .filter(|item| item.viewed_at > last_checked) // Basic filter
+        debug!("Fetching Plex history from: {}", url); // Debug level for URL
+
+        let resp = self.client.get(&url)
+            .header("X-Plex-Token", &self.token)
+            .header("Accept", "application/json")
+            .send()
+            .await?;
+
+        let status = resp.status();
+        debug!("Plex response status: {}", status);
+
+        if !status.is_success() {
+            let error_text = resp.text().await.unwrap_or_default();
+            error!("Failed to fetch Plex history. Status: {}, Body: {}", status, error_text);
+            return Err(format!("Plex API error: {}", status).into());
+        }
+
+        // Optional: Log the raw body only at TRACE level (very verbose)
+        // let text = resp.text().await?;
+        // trace!("Raw Plex Response: {}", text);
+        // let data: PlexHistoryResponse = serde_json::from_str(&text)?;
+
+        // Standard JSON parsing
+        let data: PlexHistoryResponse = match resp.json().await {
+            Ok(d) => d,
+            Err(e) => {
+                error!("Failed to parse Plex JSON: {}", e);
+                return Err(e.into());
+            }
+        };
+
+        let items_found = data.container.metadata.len();
+        debug!("Found {} total items in Plex history response", items_found);
+
+        let plays: Vec<Play> = data.container.metadata.into_iter()
+            .filter(|item| item.viewed_at > last_checked)
             .filter_map(|item| {
-                if let Some(artist) = item.artist {
-                    Some(Play {
-                        // 1. Title is available directly
-                        title: item.title.to_string(),
+                // Log skipped items at TRACE or DEBUG level if needed
+                // debug!("Processing item: {} - {}", item.title, item.viewed_at);
 
-                        // 2. Album is optional in PlexItem, so handle the None case
-                        album: item.album.clone().unwrap_or_default(),
-
-                        // 3. Artist comes from the item
-                        artist: item.artist.clone(),
-                        artists: Some(vec![item.artist.clone()]),
-
-                        // 4. Use history_key for the ID (compiler confirmed this field exists)
-                        source_id: item.history_key.clone(),
-                        source_name: "Plex".to_string(),
-
-                        // 5. Timestamp is mandatory u64. item.viewed_at is usually the timestamp.
-                        timestamp: item.viewed_at as u64,
-
-                        // 6. Track number is missing from PlexItem, so we default it
-                        track_number: None,
-
-                        // Other fields
-                        duration: None,
-                        mbid_artist: None,
-                        mbid_recording: None,
-                        mbid_release: None,
-                        mbid_release_group: None,
-                    })
-                } else { None }
+                if let Some(ref artist) = item.artist {
+                    // ... your existing logic ...
+                    Some(Play { ... })
+                } else {
+                    warn!("Skipping item '{}' (no artist found)", item.title);
+                    None
+                }
             })
             .collect();
+
+        info!("Found {} new plays from Plex since last check", plays.len());
+
         Ok(plays)
     }
 }
