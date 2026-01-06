@@ -44,8 +44,8 @@ async fn main() {
 
     if config.listenbrainz.enabled {
         sinks.push(Box::new(sinks::ListenBrainzSink::new(
-            config.listenbrainz.token.clone(),
-            config.listenbrainz.base_url.clone() // Now this works because `config` exists!
+            config.listenbrainz.base_url.clone(),
+            config.listenbrainz.token.clone(), // Now this works because `config` exists!
         )));
     }
 

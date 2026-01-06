@@ -13,9 +13,14 @@ pub struct ListenBrainzSink {
 
 impl ListenBrainzSink {
     pub fn new(base_url: String, token: String) -> Self {
+        let sanitized_token = token.trim()
+            .chars()
+            .filter(|c| c.is_ascii() && !c.is_control())
+            .collect::<String>();
+
         Self {
             base_url: base_url.trim_end_matches('/').to_string(),
-            token: token.trim().to_string(), // Trim whitespace from token
+            token: sanitized_token,
             client: Client::new(),
         }
     }
@@ -48,8 +53,8 @@ impl ScrobbleSink for ListenBrainzSink {
 
             // Build additional_info
             let mut additional_info = serde_json::Map::new();
-            additional_info.insert("submission_client".to_string(), json!(env!("CARGO_PKG_NAME")));
-            additional_info.insert("submission_client_version".to_string(), json!(env!("CARGO_PKG_VERSION")));
+            additional_info.insert("submission_client".to_string(), json!("tapedeck"));
+            additional_info.insert("submission_client_version".to_string(), json!("0.1.0"));
 
             if let Some(dur) = play.duration {
                 additional_info.insert("duration_ms".to_string(), json!(dur * 1000));
@@ -61,7 +66,9 @@ impl ScrobbleSink for ListenBrainzSink {
 
             // Add MBIDs if available
             if let Some(ref mbid) = play.mbid_artist {
-                additional_info.insert("artist_mbids".to_string(), json!([mbid]));
+                if let Some(first_mbid) = mbid.first() {
+                    additional_info.insert("artist_mbids".to_string(), json!([first_mbid]));
+                }
             }
 
             if let Some(ref mbid) = play.mbid_release {
@@ -95,17 +102,28 @@ impl ScrobbleSink for ListenBrainzSink {
 
         debug!("Submitting to ListenBrainz endpoint: {}", endpoint);
         debug!("Payload size: {} listens", payload_items.len());
+        debug!("Token length: {} chars", self.token.len());
 
-        let resp = self.client.post(&endpoint)
-            .header("Authorization", format!("Token {}", self.token))
-            .header("Content-Type", "application/json")
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| {
-                error!("Failed to send request to ListenBrainz: {}", e);
-                format!("Request builder error: {}", e)
-            })?;
+        // Build request step by step to isolate the error
+        let auth_header_value = format!("Token {}", self.token);
+
+        debug!("Building POST request...");
+        let mut request_builder = self.client.post(&endpoint);
+
+        debug!("Adding Authorization header...");
+        request_builder = request_builder.header("Authorization", &auth_header_value);
+
+        debug!("Adding Content-Type header...");
+        request_builder = request_builder.header("Content-Type", "application/json");
+
+        debug!("Adding JSON body...");
+        request_builder = request_builder.json(&body);
+
+        debug!("Sending request...");
+        let resp = request_builder.send().await.map_err(|e| {
+            error!("Failed to send request to ListenBrainz: {:?}", e);
+            format!("Request error: {}", e)
+        })?;
 
         if !resp.status().is_success() {
             let status = resp.status();
