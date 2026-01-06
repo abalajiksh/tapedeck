@@ -1,9 +1,9 @@
 use async_trait::async_trait;
-use reqwest::Client;
+use reqwest::{Client, Response};
 use crate::models::Play;
 use super::ScrobbleSink;
 use log::{info, error};
-use std::collections::HashMap; // Import HashMap
+use std::collections::HashMap;
 
 pub struct LastFmSink {
     api_key: String,
@@ -80,10 +80,10 @@ impl ScrobbleSink for LastFmSink {
             params.push(("api_sig", signature));
             params.push(("format", "json".to_string()));
 
-            // FIX: Convert Vec to HashMap for reliable serialization
+            // FIX: Removed .cloned() which was causing the type mismatch error
             let form_data: HashMap<&str, String> = params.into_iter().collect();
 
-            let resp = self.client.post("https://ws.audioscrobbler.com/2.0/")
+            let resp: Response = self.client.post("https://ws.audioscrobbler.com/2.0/")
                 .form(&form_data)
                 .send()
                 .await?;
