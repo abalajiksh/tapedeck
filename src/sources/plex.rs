@@ -19,6 +19,7 @@ pub struct MediaContainer {
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct Video {
+    // Attributes we use
     #[serde(default)]
     pub title: String,
     #[serde(rename = "grandparentTitle", default)]
@@ -31,10 +32,41 @@ pub struct Video {
     pub duration: Option<u64>,
     #[serde(rename = "ratingKey", default)]
     pub rating_key: Option<String>,
+
+    // Other attributes (ignored but needed for deserialization)
+    #[serde(rename = "historyKey", default)]
+    pub history_key: Option<String>,
+    #[serde(default)]
+    pub key: Option<String>,
+    #[serde(rename = "librarySectionID", default)]
+    pub library_section_id: Option<String>,
+    #[serde(rename = "parentKey", default)]
+    pub parent_key: Option<String>,
+    #[serde(rename = "grandparentKey", default)]
+    pub grandparent_key: Option<String>,
+    #[serde(rename = "type", default)]
+    pub type_: Option<String>,
+    #[serde(default)]
+    pub thumb: Option<String>,
+    #[serde(rename = "parentThumb", default)]
+    pub parent_thumb: Option<String>,
+    #[serde(rename = "grandparentThumb", default)]
+    pub grandparent_thumb: Option<String>,
+    #[serde(rename = "grandparentArt", default)]
+    pub grandparent_art: Option<String>,
+    #[serde(default)]
+    pub index: Option<u32>,
+    #[serde(rename = "parentIndex", default)]
+    pub parent_index: Option<u32>,
+    #[serde(rename = "accountID", default)]
+    pub account_id: Option<String>,
+    #[serde(rename = "deviceID", default)]
+    pub device_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct Track {
+    // Attributes we use
     #[serde(default)]
     pub title: String,
     #[serde(rename = "grandparentTitle", default)]
@@ -45,6 +77,36 @@ pub struct Track {
     pub viewed_at: Option<u64>,
     #[serde(rename = "ratingKey", default)]
     pub rating_key: Option<String>,
+
+    // Other attributes (ignored but needed for deserialization)
+    #[serde(rename = "historyKey", default)]
+    pub history_key: Option<String>,
+    #[serde(default)]
+    pub key: Option<String>,
+    #[serde(rename = "librarySectionID", default)]
+    pub library_section_id: Option<String>,
+    #[serde(rename = "parentKey", default)]
+    pub parent_key: Option<String>,
+    #[serde(rename = "grandparentKey", default)]
+    pub grandparent_key: Option<String>,
+    #[serde(rename = "type", default)]
+    pub type_: Option<String>,
+    #[serde(default)]
+    pub thumb: Option<String>,
+    #[serde(rename = "parentThumb", default)]
+    pub parent_thumb: Option<String>,
+    #[serde(rename = "grandparentThumb", default)]
+    pub grandparent_thumb: Option<String>,
+    #[serde(rename = "grandparentArt", default)]
+    pub grandparent_art: Option<String>,
+    #[serde(default)]
+    pub index: Option<u32>,
+    #[serde(rename = "parentIndex", default)]
+    pub parent_index: Option<u32>,
+    #[serde(rename = "accountID", default)]
+    pub account_id: Option<String>,
+    #[serde(rename = "deviceID", default)]
+    pub device_id: Option<String>,
 }
 
 pub struct PlexSource {
@@ -82,6 +144,8 @@ impl PlexSource {
             error!("Failed to parse Plex XML: {}", e);
             format!("Plex XML Parse Error: {}", e)
         })?;
+
+        debug!("Parsed {} videos and {} tracks", container.videos.len(), container.tracks.len());
 
         let mut plays = Vec::new();
 
