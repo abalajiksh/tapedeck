@@ -54,15 +54,20 @@ impl MusicSource for PlexSource {
             .filter_map(|item| {
                 if let Some(artist) = item.artist {
                     Some(Play {
-                        title: item.title,
-                        artist,
-                        album: item.album,
-                        timestamp: item.viewed_at,
+                        title: title.to_string(),
+                        album: album.to_string(),
+                        // FIXED: Wrap in Some()
+                        artists: Some(vec![artist.clone()]),
+
+                        // FIXED: Initialize missing fields
+                        mbid_artist: None,
+                        mbid_recording: None,
+                        mbid_release: None,
+                        mbid_release_group: None,
+                        source_name: Some("Plex".to_string()),
+
+                        // Add the final missing field (likely duration)
                         duration: None,
-                        source_id: item.history_key,
-                        artists: vec![artist.clone()], // 'artists' is likely a Vec<String>
-                        mbid_artist: None,             // likely Option<String>
-                        mbid_recording: None,          // likely Option<String>
                     })
                 } else { None }
             })
