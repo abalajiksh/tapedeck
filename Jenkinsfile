@@ -32,6 +32,12 @@ pipeline {
       }
     }
 
+    stage('Clean') {
+      steps {
+        sh 'cargo clean'
+      }
+    }
+
     stage('Release') {
       steps {
         sh 'cargo build --release'
