@@ -23,6 +23,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 1. Load Configuration
     let config = Config::from_env();
 
+    // Debug: Print loaded config
+    debug!("ListenBrainz enabled: {}", config.listenbrainz.enabled);
+    debug!("ListenBrainz token: '{}'", if config.listenbrainz.token.is_empty() { "<empty>" } else { "<set>" });
+    debug!("ListenBrainz URL: {}", config.listenbrainz.base_url);
+
     // 2. Initialize Sources
     let mut sources: Vec<Box<dyn MusicSource>> = Vec::new();
 
