@@ -7,6 +7,7 @@ use std::time::Duration;
 use tokio::time::sleep;
 use crate::sources::MusicSource;
 use crate::sinks::ScrobbleSink;
+use crate::sinks::ListenBrainzSink;
 use crate::config::Config;
 use log::{info, error, debug, warn};
 
@@ -130,6 +131,45 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         // Fetch plays from all sources
         for source in &mut sources {
+            // Handle Plex specially for now_playing support
+            if source.name() == "Plex" {
+                if let Some(plex) = source.as_any_mut().downcast_mut::<sources::plex::PlexSource>() {
+                    match plex.fetch_sessions_extended().await {
+                        Ok(session_result) => {
+                            // Send now_playing updates (only to ListenBrainz)
+                            for play in &session_result.now_playing {
+                                for sink in &sinks {
+                                    if sink.name() == "ListenBrainz" {
+                                        // Downcast to call submit_now_playing
+                                        if let Some(lb_sink) = (&**sink as &dyn std::any::Any).downcast_ref::<ListenBrainzSink>() {
+                                            if let Err(e) = lb_sink.submit_now_playing(play).await {
+                                                debug!("Now playing error: {}", e);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
+                            // Scrobble completed plays
+                            if !session_result.ready_to_scrobble.is_empty() {
+                                info!("🎵 Found {} new play(s) from Plex", session_result.ready_to_scrobble.len());
+                                for sink in &sinks {
+                                    match sink.scrobble(&session_result.ready_to_scrobble).await {
+                                        Ok(_) => info!("✅ Successfully sent {} play(s) to {}", session_result.ready_to_scrobble.len(), sink.name()),
+                                        Err(e) => error!("❌ Error sending to {}: {}", sink.name(), e),
+                                    }
+                                }
+                            } else {
+                                debug!("No new plays from Plex");
+                            }
+                        }
+                        Err(e) => error!("⚠️  Error fetching from Plex: {}", e),
+                    }
+                    continue; // Skip the generic handling below
+                }
+            }
+
+            // Generic handling for other sources
             match source.fetch_new_plays(last_check_time).await {
                 Ok(plays) => {
                     if !plays.is_empty() {

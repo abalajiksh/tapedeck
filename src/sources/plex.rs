@@ -255,6 +255,13 @@ pub struct PlexSource {
     libraries: Vec<Library>,
 }
 
+/// Result from fetching sessions - separates active playing vs ready to scrobble
+#[derive(Debug, Default)]
+pub struct SessionResult {
+    pub now_playing: Vec<Play>,      // Currently playing, send as "playing_now"
+    pub ready_to_scrobble: Vec<Play>, // Met threshold, send as scrobble
+}
+
 impl PlexSource {
     pub fn new(url: String, token: String) -> Self {
         Self::with_filters(url, token, PlexFilters::default())
@@ -353,6 +360,153 @@ impl PlexSource {
         Ok(plays)
     }
 
+    /// Fetch active sessions with separate now_playing and scrobble results
+    pub async fn fetch_sessions_extended(&mut self) -> Result<SessionResult, Box<dyn std::error::Error>> {
+        let endpoint = format!("{}/status/sessions", self.url);
+        debug!("Fetching Plex sessions from: {}", endpoint);
+
+        let resp = self.client.get(&endpoint)
+            .header("X-Plex-Token", &self.token)
+            .header("Accept", "application/json")
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            return Err(format!("Plex API error: {}", resp.status()).into());
+        }
+
+        let text = resp.text().await?;
+        debug!("Plex sessions response: {}", &text[..text.len().min(500)]);
+
+        let sessions_response: SessionsResponse = match serde_json::from_str(&text) {
+            Ok(parsed) => parsed,
+            Err(e) => {
+                debug!("Failed to parse sessions response: {}", e);
+                return Ok(SessionResult::default());
+            }
+        };
+
+        let mut result = SessionResult::default();
+
+        for session in sessions_response.media_container.metadata {
+            if let Some(reason) = self.validate_session(&session) {
+                debug!("Skipping session: {}", reason);
+                continue;
+            }
+
+            if session.media_type.as_deref() != Some("track") {
+                continue;
+            }
+
+            // Check if playing
+            let is_playing = session.player.as_ref()
+                .and_then(|p| p.state.as_deref())
+                .map(|s| s == "playing")
+                .unwrap_or(false);
+
+            if let Some((play, is_scrobble)) = self.process_session_extended(session, is_playing).await {
+                if is_scrobble {
+                    result.ready_to_scrobble.push(play);
+                } else if is_playing {
+                    result.now_playing.push(play);
+                }
+            }
+        }
+
+        Ok(result)
+    }
+
+    /// Process session and return (Play, is_ready_to_scrobble)
+    async fn process_session_extended(&mut self, session: SessionMetadata, is_playing: bool) -> Option<(Play, bool)> {
+        let rating_key = session.rating_key.as_ref()?;
+        let session_key = session.session_key.as_ref()?;
+        let duration = session.duration?;
+        let view_offset = session.view_offset.unwrap_or(0);
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        // Check if track changed
+        let track_changed = self.session_states.get(session_key)
+            .map(|s| s.rating_key != *rating_key)
+            .unwrap_or(false);
+
+        if track_changed {
+            debug!("Track changed in session {}, resetting", session_key);
+            self.session_states.remove(session_key);
+        }
+
+        let (should_scrobble, needs_now_playing) = {
+            let state = self.session_states.entry(session_key.clone()).or_insert_with(|| {
+                SessionState {
+                    session_key: session_key.clone(),
+                    rating_key: rating_key.clone(),
+                    position: view_offset,
+                    duration,
+                    started_at: now,
+                    last_seen: now,
+                    scrobbled: false,
+                }
+            });
+
+            state.position = view_offset;
+            state.last_seen = now;
+
+            let progress_pct = (view_offset as f64 / duration as f64) * 100.0;
+            let progress_time = view_offset / 1000;
+
+            let ready = !state.scrobbled && (progress_pct >= 50.0 || progress_time >= 240);
+            let needs_np = is_playing && !state.scrobbled; // Send now_playing while not yet scrobbled
+
+            (ready, needs_np)
+        };
+
+        // Build the Play object
+        let (artists, _) = if let Some(track_artist) = &session.original_title {
+            (vec![track_artist.clone()], session.grandparent_title.clone())
+        } else {
+            (session.grandparent_title.as_ref().map(|a| vec![a.clone()]).unwrap_or_default(), session.grandparent_title.clone())
+        };
+
+        let mbid_recording = self.get_musicbrainz_id(rating_key).await;
+        let mbid_release = if let Some(pk) = &session.parent_rating_key {
+            self.get_musicbrainz_id(pk).await
+        } else { None };
+        let mbid_artist = if let Some(gk) = &session.grandparent_rating_key {
+            self.get_musicbrainz_id(gk).await
+        } else { None };
+
+        let play = Play {
+            title: session.title.unwrap_or_default(),
+            artist: artists.first().cloned().unwrap_or_else(|| "Unknown".to_string()),
+            artists: if artists.is_empty() { None } else { Some(artists) },
+            album: session.parent_title,
+            timestamp: now,
+            duration: Some(duration / 1000),
+            track_number: None,
+            mbid_artist: mbid_artist.map(|id| vec![id]),
+            mbid_release,
+            mbid_release_group: None,
+            mbid_recording,
+            source_id: format!("plex-session-{}-{}", session_key, now),
+            source_name: "Plex".to_string(),
+        };
+
+        if should_scrobble {
+            if let Some(state) = self.session_states.get_mut(session_key) {
+                state.scrobbled = true;
+            }
+            Some((play, true))
+        } else if needs_now_playing {
+            Some((play, false))
+        } else {
+            None
+        }
+    }
+
+
     /// Validate session against filters
     fn validate_session(&self, session: &SessionMetadata) -> Option<String> {
         let user = session.user.as_ref()
@@ -412,6 +566,7 @@ impl PlexSource {
     }
 
     /// Process a session and convert to Play
+    /// Process a session and convert to Play
     async fn process_session(&mut self, session: SessionMetadata) -> Option<Play> {
         let rating_key = session.rating_key.as_ref()?;
         let session_key = session.session_key.as_ref()?;
@@ -428,6 +583,16 @@ impl PlexSource {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_secs();
+
+        // Check if track changed within the same session (new song started)
+        let track_changed = self.session_states.get(session_key)
+            .map(|s| s.rating_key != *rating_key)
+            .unwrap_or(false);
+
+        if track_changed {
+            debug!("Track changed in session {} (new rating_key: {}), resetting state", session_key, rating_key);
+            self.session_states.remove(session_key);
+        }
 
         // Update or create session state
         let should_scrobble = {
