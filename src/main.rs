@@ -75,7 +75,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             warn!("ListenBrainz is enabled but token is empty");
         } else {
             info!("Initializing ListenBrainz sink...");
-            sinks.push(Box::new(sinks::listenbrainz::ListenBrainzSink::new(
+            sinks.push(Box::new(sinks::ListenBrainzSink::new(
                 config.listenbrainz.base_url.clone(),
                 config.listenbrainz.token.clone(),
             )));

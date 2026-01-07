@@ -20,22 +20,6 @@ where
     }
 }
 
-#[async_trait]
-impl MusicSource for PlexSource {
-    fn name(&self) -> &str {
-        "Plex"
-    }
-
-    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
-        self
-    }
-
-    async fn fetch_new_plays(&mut self, _last_checked: u64) -> Result<Vec<Play>, Box<dyn std::error::Error>> {
-        // Use session monitoring for real-time tracking
-        self.fetch_sessions().await
-    }
-}
-
 fn deserialize_f64_from_string<'de, D>(deserializer: D) -> Result<Option<f64>, D::Error>
 where
     D: Deserializer<'de>,
@@ -570,7 +554,11 @@ impl MusicSource for PlexSource {
         "Plex"
     }
 
-    async fn fetch_new_plays(&mut self, last_checked: u64) -> Result<Vec<Play>, Box<dyn std::error::Error>> {
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
+
+    async fn fetch_new_plays(&mut self, _last_checked: u64) -> Result<Vec<Play>, Box<dyn std::error::Error>> {
         // Use session monitoring for real-time tracking
         self.fetch_sessions().await
     }
