@@ -166,8 +166,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         last_check_time = current_time;
 
-        // Wait before next check (10 minutes for historical, could be shorter for real-time)
-        let sleep_duration = Duration::from_secs(600);
+        // Poll every 15 seconds for real-time session monitoring
+        let sleep_duration = Duration::from_secs(15);
         debug!("Sleeping for {} seconds until next check...", sleep_duration.as_secs());
         sleep(sleep_duration).await;
     }
