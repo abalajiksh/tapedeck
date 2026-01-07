@@ -23,4 +23,3 @@ target
 src/.DS_Store
 src/sources/.DS_Store
 src/sinks/.DS_Store
-curl.log

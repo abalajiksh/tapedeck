@@ -283,7 +283,20 @@ impl PlexSource {
             return Err(format!("Plex API error: {}", resp.status()).into());
         }
 
-        let sessions_response: SessionsResponse = resp.json().await?;
+        // Get the response text first for debugging
+        let text = resp.text().await?;
+        debug!("Plex sessions response: {}", &text[..text.len().min(500)]);
+
+        // Parse the JSON, handling empty/malformed responses
+        let sessions_response: SessionsResponse = match serde_json::from_str(&text) {
+            Ok(parsed) => parsed,
+            Err(e) => {
+                // If parsing fails, it might be an empty response - that's OK
+                debug!("Failed to parse sessions response (might be empty): {}", e);
+                return Ok(Vec::new());
+            }
+        };
+
         let mut plays = Vec::new();
 
         for session in sessions_response.media_container.metadata {
