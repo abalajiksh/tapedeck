@@ -47,7 +47,7 @@ pipeline {
           // cargo pkgid returns a URL-like string ending in #name:version
           // We use 'cut' to extract just the version part after the last colon
           def version = sh(
-            script: "cargo pkgid | cut -d# -f2 | cut -d: -f2",
+            script: "cargo pkgid | cut -d# -f2 | cut -d@ -f2", 
             returnStdout: true
           ).trim()
 
