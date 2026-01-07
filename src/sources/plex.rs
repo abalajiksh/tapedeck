@@ -464,7 +464,7 @@ impl PlexSource {
         };
 
         // Build the Play object
-        let (artists, _) = if let Some(track_artist) = &session.original_title {
+        let (artists, _album_artist) = if let Some(track_artist) = &session.original_title {
             (vec![track_artist.clone()], session.grandparent_title.clone())
         } else {
             (session.grandparent_title.as_ref().map(|a| vec![a.clone()]).unwrap_or_default(), session.grandparent_title.clone())
@@ -574,7 +574,7 @@ impl PlexSource {
         let view_offset = session.view_offset.unwrap_or(0);
 
         // Check player state
-        let is_playing = session.player.as_ref()
+        let _is_playing = session.player.as_ref()
             .and_then(|p| p.state.as_deref())
             .map(|s| s == "playing")
             .unwrap_or(false);
@@ -628,7 +628,7 @@ impl PlexSource {
         }
 
         // Extract artist information (track artist vs album artist)
-        let (artists, album_artist) = if let Some(track_artist) = &session.original_title {
+        let (artists, _album_artist) = if let Some(track_artist) = &session.original_title {
             // originalTitle is the track artist, grandparentTitle is album artist
             (
                 vec![track_artist.clone()],

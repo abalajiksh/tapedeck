@@ -141,7 +141,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 for sink in &sinks {
                                     if sink.name() == "ListenBrainz" {
                                         // Downcast to call submit_now_playing
-                                        if let Some(lb_sink) = (&**sink as &dyn std::any::Any).downcast_ref::<ListenBrainzSink>() {
+                                        if let Some(lb_sink) = sink.as_any().downcast_ref::<ListenBrainzSink>() {
                                             if let Err(e) = lb_sink.submit_now_playing(play).await {
                                                 debug!("Now playing error: {}", e);
                                             }

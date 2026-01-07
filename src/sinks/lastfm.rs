@@ -53,6 +53,10 @@ impl ScrobbleSink for LastFmSink {
         "Last.fm"
     }
 
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
     async fn scrobble(&self, plays: &[Play]) -> Result<(), Box<dyn std::error::Error>> {
         if plays.is_empty() {
             return Ok(());
