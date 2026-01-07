@@ -24,6 +24,61 @@ impl ListenBrainzSink {
             client: Client::new(),
         }
     }
+
+    /// Submit "now playing" status for a track
+    pub async fn submit_now_playing(&self, play: &Play) -> Result<(), Box<dyn std::error::Error>> {
+        debug!("Submitting now playing: {} - {}", play.artist, play.title);
+
+        let mut track_meta = serde_json::Map::new();
+        track_meta.insert("artist_name".to_string(), json!(play.artist));
+        track_meta.insert("track_name".to_string(), json!(play.title));
+
+        if let Some(ref album) = play.album {
+            track_meta.insert("release_name".to_string(), json!(album));
+        }
+
+        let mut additional_info = serde_json::Map::new();
+        additional_info.insert("submission_client".to_string(), json!(env!("CARGO_PKG_NAME")));
+        additional_info.insert("submission_client_version".to_string(), json!(env!("CARGO_PKG_VERSION")));
+
+        if let Some(dur) = play.duration {
+            additional_info.insert("duration_ms".to_string(), json!(dur * 1000));
+        }
+
+        if let Some(ref mbid) = play.mbid_recording {
+            additional_info.insert("recording_mbid".to_string(), json!(mbid));
+        }
+
+        if !additional_info.is_empty() {
+            track_meta.insert("additional_info".to_string(), serde_json::Value::Object(additional_info));
+        }
+
+        let body = json!({
+            "listen_type": "playing_now",
+            "payload": [{
+                "track_metadata": track_meta
+            }]
+        });
+
+        let endpoint = format!("{}/1/submit-listens", self.base_url);
+        let auth_header_value = format!("Token {}", self.token);
+
+        let resp = self.client.post(&endpoint)
+            .header("Authorization", &auth_header_value)
+            .header("Content-Type", "application/json")
+            .json(&body)
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            let error_text = resp.text().await.unwrap_or_default();
+            error!("Now playing submission failed: {}", error_text);
+        } else {
+            debug!("✅ Now playing submitted: {} - {}", play.artist, play.title);
+        }
+
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -53,8 +108,8 @@ impl ScrobbleSink for ListenBrainzSink {
 
             // Build additional_info
             let mut additional_info = serde_json::Map::new();
-            additional_info.insert("submission_client".to_string(), json!("tapedeck"));
-            additional_info.insert("submission_client_version".to_string(), json!("0.1.0"));
+            additional_info.insert("submission_client".to_string(), json!(env!("CARGO_PKG_NAME")));
+            additional_info.insert("submission_client_version".to_string(), json!(env!("CARGO_PKG_VERSION")));
 
             if let Some(dur) = play.duration {
                 additional_info.insert("duration_ms".to_string(), json!(dur * 1000));
