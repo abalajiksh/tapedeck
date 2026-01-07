@@ -1,10 +1,9 @@
 pipeline {
-  agent any // Removed 'docker', runs directly on the agent
+  agent any
 
   options {
     timestamps()
     disableConcurrentBuilds()
-    // Removed 'ansiColor' to fix the second error
   }
 
   triggers {
@@ -12,9 +11,7 @@ pipeline {
   }
 
   environment {
-    // Force color output even without ansiColor plugin (logs might look raw, but usually fine)
     CARGO_TERM_COLOR = 'always'
-    // Ensure cargo is in PATH if not already (adjust path if needed, e.g., /home/jenkins/.cargo/bin)
     PATH = "$HOME/.cargo/bin:$PATH"
   }
 
@@ -46,8 +43,21 @@ pipeline {
 
     stage('Archive') {
       steps {
-        // Change 'tapedeck' to your actual binary name if different
-        archiveArtifacts artifacts: 'target/release/tapedeck', fingerprint: true, allowEmptyArchive: true
+        script {
+          // Extract version from Cargo.toml
+          def version = sh(
+            script: "cargo metadata --format-version=1 --no-deps | grep '\"version\":' | head -n1 | cut -d'\"' -f4",
+            returnStdout: true
+          ).trim()
+
+          echo "Version: ${version}"
+
+          // Copy binary with version in the name
+          sh "cp target/release/tapedeck target/release/tapedeck-${version}"
+
+          // Archive the versioned binary
+          archiveArtifacts artifacts: "target/release/tapedeck-${version}", fingerprint: true, allowEmptyArchive: false
+        }
       }
     }
   }
