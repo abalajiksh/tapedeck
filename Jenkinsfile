@@ -44,19 +44,18 @@ pipeline {
     stage('Archive') {
       steps {
         script {
-          // Extract version from Cargo.toml
+          // cargo pkgid returns a URL-like string ending in #name:version
+          // We use 'cut' to extract just the version part after the last colon
           def version = sh(
-            script: "cargo metadata --format-version=1 --no-deps | grep '\"version\":' | head -n1 | cut -d'\"' -f4",
+            script: "cargo pkgid | cut -d# -f2 | cut -d: -f2",
             returnStdout: true
           ).trim()
 
-          echo "Version: ${version}"
+          echo "Detected version: ${version}"
 
-          // Copy binary with version in the name
+          // Copy and archive
           sh "cp target/release/tapedeck target/release/tapedeck-${version}"
-
-          // Archive the versioned binary
-          archiveArtifacts artifacts: "target/release/tapedeck-${version}", fingerprint: true, allowEmptyArchive: false
+          archiveArtifacts artifacts: "target/release/tapedeck-${version}", fingerprint: true
         }
       }
     }
