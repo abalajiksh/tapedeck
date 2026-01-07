@@ -15,6 +15,13 @@ pub struct PlexConfig {
     pub enabled: bool,
     pub url: String,
     pub token: String,
+    // Filtering options
+    pub users_allow: Vec<String>,
+    pub users_block: Vec<String>,
+    pub devices_allow: Vec<String>,
+    pub devices_block: Vec<String>,
+    pub libraries_allow: Vec<String>,
+    pub libraries_block: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -43,7 +50,7 @@ pub struct LastFmConfig {
 pub struct ListenBrainzConfig {
     pub enabled: bool,
     pub token: String,
-    pub base_url: String, // Added this field
+    pub base_url: String,
 }
 
 impl Config {
@@ -54,12 +61,11 @@ impl Config {
         // Determine ListenBrainz URL logic
         // Default is PRODUCTION (true) unless explicitly set to "false"
         let is_prod = get_env_bool("IS_PRODUCTION", true);
-
         let lb_url = if is_prod {
-            "https://api.listenbrainz.org/1/submit-listen".to_string()
+            "https://api.listenbrainz.org".to_string()
         } else {
             // In DEV mode, use custom URL or fallback to localhost mock
-            get_env("LISTENBRAINZ_URL", "http://localhost:8080/1/submit-listen")
+            get_env("LISTENBRAINZ_URL", "http://localhost:8080")
         };
 
         Config {
@@ -67,6 +73,12 @@ impl Config {
                 enabled: get_env_bool("PLEX_ENABLED", false),
                 url: get_env("PLEX_URL", "http://localhost:32400"),
                 token: get_env("PLEX_TOKEN", ""),
+                users_allow: parse_list(&get_env("PLEX_USERS_ALLOW", "")),
+                users_block: parse_list(&get_env("PLEX_USERS_BLOCK", "")),
+                devices_allow: parse_list(&get_env("PLEX_DEVICES_ALLOW", "")),
+                devices_block: parse_list(&get_env("PLEX_DEVICES_BLOCK", "")),
+                libraries_allow: parse_list(&get_env("PLEX_LIBRARIES_ALLOW", "")),
+                libraries_block: parse_list(&get_env("PLEX_LIBRARIES_BLOCK", "")),
             },
             navidrome: NavidromeConfig {
                 enabled: get_env_bool("NAVIDROME_ENABLED", false),
@@ -107,4 +119,13 @@ fn get_env_bool(key: &str, default: bool) -> bool {
         }
         Err(_) => default,
     }
+}
+
+/// Parse comma-separated list from env var
+fn parse_list(input: &str) -> Vec<String> {
+    input
+        .split(',')
+        .map(|s| s.trim().to_lowercase())
+        .filter(|s| !s.is_empty())
+        .collect()
 }
