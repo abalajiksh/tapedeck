@@ -1,7 +1,7 @@
-use serde::{Deserialize, Deserializer, Serialize};
+use serde::{Deserialize, Deserializer};
 use reqwest::Client;
-use log::{debug, error, info, warn};
-use std::collections::{HashMap, HashSet};
+use log::{debug, info, warn};
+use std::collections::HashMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use crate::models::Play;
 use crate::sources::MusicSource;
@@ -9,26 +9,59 @@ use async_trait::async_trait;
 
 // ==================== Deserialization Helpers ====================
 
-fn deserialize_u64_from_string<'de, D>(deserializer: D) -> Result<Option<u64>, D::Error>
+/// Deserialize a u64 that might come as either a number or a string
+fn deserialize_u64_flexible<'de, D>(deserializer: D) -> Result<Option<u64>, D::Error>
 where
     D: Deserializer<'de>,
 {
-    let s: Option<String> = Option::deserialize(deserializer)?;
-    match s {
-        Some(s) => s.parse::<u64>().map(Some).map_err(serde::de::Error::custom),
-        None => Ok(None),
-    }
-}
+    use serde::de::{self, Visitor};
 
-fn deserialize_f64_from_string<'de, D>(deserializer: D) -> Result<Option<f64>, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    let s: Option<String> = Option::deserialize(deserializer)?;
-    match s {
-        Some(s) => s.parse::<f64>().map(Some).map_err(serde::de::Error::custom),
-        None => Ok(None),
+    struct U64Visitor;
+
+    impl<'de> Visitor<'de> for U64Visitor {
+        type Value = Option<u64>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+            formatter.write_str("a u64 as either a number or a string")
+        }
+
+        fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            Ok(Some(value))
+        }
+
+        fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            Ok(Some(value as u64))
+        }
+
+        fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            value.parse::<u64>().map(Some).map_err(de::Error::custom)
+        }
+
+        fn visit_none<E>(self) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            Ok(None)
+        }
+
+        fn visit_unit<E>(self) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            Ok(None)
+        }
     }
+
+    deserializer.deserialize_any(U64Visitor)
 }
 
 // ==================== Plex API Response Structures ====================
@@ -55,7 +88,7 @@ pub struct SessionMetadata {
     pub title: Option<String>,
     pub parent_title: Option<String>,
     pub grandparent_title: Option<String>,
-    pub original_title: Option<String>, // Track artist when album artist exists
+    pub original_title: Option<String>,
 
     pub rating_key: Option<String>,
     pub parent_rating_key: Option<String>,
@@ -64,10 +97,10 @@ pub struct SessionMetadata {
     pub library_section_title: Option<String>,
     pub library_section_id: Option<String>,
 
-    #[serde(deserialize_with = "deserialize_u64_from_string", default)]
+    #[serde(deserialize_with = "deserialize_u64_flexible", default)]
     pub duration: Option<u64>,
 
-    #[serde(deserialize_with = "deserialize_u64_from_string", default)]
+    #[serde(deserialize_with = "deserialize_u64_flexible", default)]
     pub view_offset: Option<u64>,
 
     pub session_key: Option<String>,
