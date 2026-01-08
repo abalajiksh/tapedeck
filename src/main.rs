@@ -134,7 +134,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // Handle Plex specially for now_playing support
             if source.name() == "Plex" {
                 if let Some(plex) = source.as_any_mut().downcast_mut::<sources::plex::PlexSource>() {
-                    match plex.fetch_sessions_extended().await {
+                    match plex.fetch_sessions_extended(Some(last_check_time)).await {
                         Ok(session_result) => {
                             // Send now_playing updates (only to ListenBrainz)
                             for play in &session_result.now_playing {

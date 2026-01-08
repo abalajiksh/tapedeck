@@ -360,55 +360,155 @@ impl PlexSource {
         Ok(plays)
     }
 
-    /// Fetch active sessions with separate now_playing and scrobble results
-    pub async fn fetch_sessions_extended(&mut self) -> Result<SessionResult, Box<dyn std::error::Error>> {
-        let endpoint = format!("{}/status/sessions", self.url);
-        debug!("Fetching Plex sessions from: {}", endpoint);
+    /// Fetch historical plays from Plex (for offline sync)
+    async fn fetch_history_plays(&self, min_timestamp: u64) -> Result<Vec<Play>, Box<dyn std::error::Error>> {
+        let endpoint = format!("{}/status/sessions/history/all", self.url);
+        debug!("Fetching Plex history (since {}) from: {}", min_timestamp, endpoint);
 
+        // Plex stores history in `viewedAt`.
         let resp = self.client.get(&endpoint)
+            .query(&[("sort", "viewedAt:desc"), ("limit", "50"), ("accountID", "")]) // You might need accountID if multiple users
             .header("X-Plex-Token", &self.token)
             .header("Accept", "application/json")
             .send()
             .await?;
 
         if !resp.status().is_success() {
-            return Err(format!("Plex API error: {}", resp.status()).into());
+            return Err(format!("Plex History API error: {}", resp.status()).into());
         }
 
         let text = resp.text().await?;
-        debug!("Plex sessions response: {}", &text[..text.len().min(500)]);
 
-        let sessions_response: SessionsResponse = match serde_json::from_str(&text) {
-            Ok(parsed) => parsed,
+        // Reuse SessionsResponse struct if the shape matches, or create a specific one.
+        // History response usually has "MediaContainer" -> "Metadata" just like sessions.
+        // Let's try to reuse SessionsResponse, but history items have slightly different fields.
+        // Specifically "viewedAt" instead of active session data.
+
+        #[derive(Deserialize)]
+        struct HistoryResponse {
+            #[serde(rename = "MediaContainer")]
+            media_container: HistoryContainer,
+        }
+
+        #[derive(Deserialize)]
+        struct HistoryContainer {
+            #[serde(default, rename = "Metadata")]
+            metadata: Vec<HistoryItem>,
+        }
+
+        #[derive(Deserialize)]
+        struct HistoryItem {
+            #[serde(rename = "type")]
+            media_type: String,
+            #[serde(rename = "viewedAt")]
+            viewed_at: u64,
+            title: Option<String>,
+            #[serde(rename = "grandparentTitle")]
+            artist: Option<String>,
+            #[serde(rename = "parentTitle")]
+            album: Option<String>,
+            #[serde(rename = "originalTitle")]
+            track_artist: Option<String>,
+        }
+
+        let history: HistoryResponse = match serde_json::from_str(&text) {
+            Ok(h) => h,
             Err(e) => {
-                debug!("Failed to parse sessions response: {}", e);
-                return Ok(SessionResult::default());
+                debug!("Failed to parse history: {}", e);
+                return Ok(Vec::new());
             }
         };
 
+        let mut plays = Vec::new();
+        for item in history.media_container.metadata {
+            if item.media_type != "track" { continue; }
+
+            // Only include plays that happened AFTER our last check
+            // AND are older than 10 seconds (to avoid race conditions with active sessions?)
+            // Actually, just strictly > last_checked.
+            if item.viewed_at <= min_timestamp {
+                continue;
+            }
+
+            // Build Play object
+            let (artists, _) = if let Some(track_artist) = &item.track_artist {
+                (vec![track_artist.clone()], item.artist.clone())
+            } else {
+                (item.artist.as_ref().map(|a| vec![a.clone()]).unwrap_or_default(), item.artist.clone())
+            };
+
+            let play = Play {
+                title: item.title.unwrap_or_default(),
+                artist: artists.first().cloned().unwrap_or_else(|| "Unknown".to_string()),
+                artists: if artists.is_empty() { None } else { Some(artists) },
+                album: item.album,
+                timestamp: item.viewed_at,
+                duration: None, // History might not give duration, or we can fetch it
+                track_number: None,
+                mbid_artist: None, // Fetching MBIDs for history items might be expensive/slow
+                mbid_release: None,
+                mbid_recording: None,
+                mbid_release_group: None,
+                source_id: format!("plex-hist-{}", item.viewed_at), // Unique ID
+                source_name: "Plex".to_string(),
+            };
+
+            plays.push(play);
+        }
+
+        Ok(plays)
+    }
+
+
+    /// Fetch active sessions with separate now_playing and scrobble results
+    pub async fn fetch_sessions_extended(&mut self, last_checked: Option<u64>) -> Result<SessionResult, Box<dyn std::error::Error>> {
         let mut result = SessionResult::default();
 
-        for session in sessions_response.media_container.metadata {
-            if let Some(reason) = self.validate_session(&session) {
-                debug!("Skipping session: {}", reason);
-                continue;
+        // 1. Fetch Active Sessions (Current Logic)
+        let endpoint = format!("{}/status/sessions", self.url);
+        debug!("Fetching Plex sessions from: {}", endpoint);
+
+        // ... (keep your existing active session fetching logic exactly as is, just wrapped in this block) ...
+        let resp = self.client.get(&endpoint)
+            .header("X-Plex-Token", &self.token)
+            .header("Accept", "application/json")
+            .send()
+            .await?;
+
+        if resp.status().is_success() {
+            let text = resp.text().await?;
+            // Handle parsing gracefully
+            let sessions_response: SessionsResponse = match serde_json::from_str(&text) {
+                Ok(p) => p,
+                Err(_) => SessionsResponse { media_container: SessionsContainer { metadata: vec![] } }
+            };
+
+            for session in sessions_response.media_container.metadata {
+                // ... (keep existing session processing logic) ...
+                if let Some(_reason) = self.validate_session(&session) { continue; }
+                if session.media_type.as_deref() != Some("track") { continue; }
+
+                let is_playing = session.player.as_ref()
+                    .and_then(|p| p.state.as_deref())
+                    .map(|s| s == "playing")
+                    .unwrap_or(false);
+
+                if let Some((play, is_scrobble)) = self.process_session_extended(session, is_playing).await {
+                    if is_scrobble {
+                        result.ready_to_scrobble.push(play);
+                    } else if is_playing {
+                        result.now_playing.push(play);
+                    }
+                }
             }
+        }
 
-            if session.media_type.as_deref() != Some("track") {
-                continue;
-            }
-
-            // Check if playing
-            let is_playing = session.player.as_ref()
-                .and_then(|p| p.state.as_deref())
-                .map(|s| s == "playing")
-                .unwrap_or(false);
-
-            if let Some((play, is_scrobble)) = self.process_session_extended(session, is_playing).await {
-                if is_scrobble {
-                    result.ready_to_scrobble.push(play);
-                } else if is_playing {
-                    result.now_playing.push(play);
+        // 2. Fetch History (Offline Sync) - NEW LOGIC
+        if let Some(timestamp) = last_checked {
+            if let Ok(history_plays) = self.fetch_history_plays(timestamp).await {
+                if !history_plays.is_empty() {
+                    info!("Found {} historical plays from Plex", history_plays.len());
+                    result.ready_to_scrobble.extend(history_plays);
                 }
             }
         }
