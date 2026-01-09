@@ -219,9 +219,10 @@ struct HistoryTrack {
 
 // ==================== MusicBrainz Cache ====================
 
+/// Cache only successful MBID lookups, not failures
 #[derive(Clone)]
 struct MBIDCache {
-    cache: HashMap<String, Option<String>>,
+    cache: HashMap<String, String>, // Only stores successful MBIDs
     max_size: usize,
 }
 
@@ -229,14 +230,45 @@ impl MBIDCache {
     fn new(max_size: usize) -> Self {
         Self { cache: HashMap::new(), max_size }
     }
-    fn get(&self, key: &str) -> Option<&Option<String>> { self.cache.get(key) }
-    fn set(&mut self, key: String, value: Option<String>) {
+    
+    fn get(&self, key: &str) -> Option<String> { 
+        self.cache.get(key).cloned()
+    }
+    
+    fn set(&mut self, key: String, value: String) {
         if self.cache.len() >= self.max_size {
             if let Some(first_key) = self.cache.keys().next().cloned() {
                 self.cache.remove(&first_key);
             }
         }
         self.cache.insert(key, value);
+    }
+}
+
+// ==================== MBID Fetch Result ====================
+
+#[derive(Debug)]
+struct MBIDFetchResult {
+    mbid: Option<String>,
+    attempted: bool,
+    error: Option<String>,
+}
+
+impl MBIDFetchResult {
+    fn success(mbid: String) -> Self {
+        Self { mbid: Some(mbid), attempted: true, error: None }
+    }
+    
+    fn not_found() -> Self {
+        Self { mbid: None, attempted: true, error: Some("No MBID in Plex metadata".to_string()) }
+    }
+    
+    fn error(err: String) -> Self {
+        Self { mbid: None, attempted: true, error: Some(err) }
+    }
+    
+    fn skipped() -> Self {
+        Self { mbid: None, attempted: false, error: None }
     }
 }
 
@@ -289,9 +321,12 @@ impl PlexSource {
         Self {
             url: url.trim_end_matches('/').to_string(),
             token,
-            client: Client::builder().timeout(Duration::from_secs(10)).build().unwrap_or_else(|_| Client::new()),
+            client: Client::builder()
+                .timeout(Duration::from_secs(10))
+                .build()
+                .unwrap_or_else(|_| Client::new()),
             filters,
-            mbid_cache: MBIDCache::new(1000),
+            mbid_cache: MBIDCache::new(2000), // Increased cache size
             session_states: HashMap::new(),
             libraries: Vec::new(),
         }
@@ -305,37 +340,61 @@ impl PlexSource {
 
     async fn fetch_libraries(&self) -> Result<Vec<Library>, Box<dyn std::error::Error>> {
         let endpoint = format!("{}/library/sections", self.url);
-        let resp = self.client.get(&endpoint).header("X-Plex-Token", &self.token).header("Accept", "application/json").send().await?;
-        if !resp.status().is_success() { return Err(format!("Plex API error: {}", resp.status()).into()); }
+        let resp = self.client.get(&endpoint)
+            .header("X-Plex-Token", &self.token)
+            .header("Accept", "application/json")
+            .send().await?;
+        if !resp.status().is_success() { 
+            return Err(format!("Plex API error: {}", resp.status()).into()); 
+        }
         let lib_response: LibrariesResponse = resp.json().await?;
         Ok(lib_response.media_container.directory)
     }
 
     // ==================== Core Resolution Logic ====================
 
-    /// Central method to convert a raw Plex track into a Play object, ENFORCING MBID resolution.
+    /// Central method to convert a raw Plex track into a Play object with ENFORCED MBID resolution.
+    /// This method deliberately fetches all available MBIDs concurrently and logs the results.
     async fn resolve_play(&mut self, track: PlexTrack, source_id_suffix: &str) -> Play {
         let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
-
-        // 1. Resolve MBIDs (Forcefully fetched)
-        let mbid_recording = self.get_musicbrainz_id(&track.rating_key).await;
         
-        let mbid_release = if let Some(pk) = &track.parent_rating_key {
-            self.get_musicbrainz_id(pk).await
-        } else { None };
-        
-        let mbid_artist = if let Some(gk) = &track.grandparent_rating_key {
-            self.get_musicbrainz_id(gk).await
-        } else { None };
+        info!("Resolving track: '{}' by '{}' (rating_key: {})", 
+              track.title, track.artist, track.rating_key);
 
-        // 2. Resolve Artists
+        // 1. Deliberately fetch ALL MBIDs concurrently with retry logic
+        let (recording_result, release_result, artist_result) = tokio::join!(
+            self.fetch_musicbrainz_id_with_retry(&track.rating_key, "recording", 3),
+            async {
+                if let Some(pk) = &track.parent_rating_key {
+                    self.fetch_musicbrainz_id_with_retry(pk, "release", 3).await
+                } else {
+                    MBIDFetchResult::skipped()
+                }
+            },
+            async {
+                if let Some(gk) = &track.grandparent_rating_key {
+                    self.fetch_musicbrainz_id_with_retry(gk, "artist", 3).await
+                } else {
+                    MBIDFetchResult::skipped()
+                }
+            }
+        );
+
+        // 2. Log MBID fetch results
+        self.log_mbid_results(&track.title, &track.artist, &recording_result, &release_result, &artist_result);
+
+        let mbid_recording = recording_result.mbid;
+        let mbid_release = release_result.mbid;
+        let mbid_artist = artist_result.mbid;
+
+        // 3. Resolve Artists
         let (artists, _) = if let Some(ta) = &track.track_artist {
             (vec![ta.clone()], track.artist.clone())
         } else {
             (vec![track.artist.clone()], track.artist.clone())
         };
 
-        // 3. Construct Play
+        // 4. Construct Play with all available metadata
         let timestamp = track.viewed_at.unwrap_or(now);
         let source_id = format!("plex-{}-{}", track.rating_key, source_id_suffix);
 
@@ -356,45 +415,105 @@ impl PlexSource {
         }
     }
 
-    async fn get_musicbrainz_id(&mut self, rating_key: &str) -> Option<String> {
-        if let Some(cached) = self.mbid_cache.get(rating_key) {
-            return cached.clone();
+    /// Fetch MusicBrainz ID with retry logic and exponential backoff
+    async fn fetch_musicbrainz_id_with_retry(&mut self, rating_key: &str, entity_type: &str, max_retries: u32) -> MBIDFetchResult {
+        // Check cache first (only successful results are cached)
+        if let Some(cached_mbid) = self.mbid_cache.get(rating_key) {
+            debug!("Cache hit for {} {}: {}", entity_type, rating_key, cached_mbid);
+            return MBIDFetchResult::success(cached_mbid);
         }
 
         let endpoint = format!("{}/library/metadata/{}", self.url, rating_key);
-        debug!("Fetching MBID for rating key: {}", rating_key);
-
-        let result: Result<Option<String>, Box<dyn std::error::Error>> = async {
-            let resp = self.client.get(&endpoint)
-                .header("X-Plex-Token", &self.token)
-                .header("Accept", "application/json")
-                .timeout(Duration::from_secs(5))
-                .send().await?;
-
-            if !resp.status().is_success() { return Ok(None); }
-            let metadata: MetadataResponse = resp.json().await?;
+        let mut last_error = String::new();
+        
+        for attempt in 1..=max_retries {
+            let delay_ms = 100 * (2_u64.pow(attempt - 1)); // Exponential backoff: 100ms, 200ms, 400ms
             
-            for item in metadata.media_container.metadata {
-                for guid in item.guid {
-                    if let Some(mbid) = guid.id.strip_prefix("mbid://") {
-                        return Ok(Some(mbid.to_string()));
+            if attempt > 1 {
+                debug!("Retry #{} for {} {} after {}ms", attempt, entity_type, rating_key, delay_ms);
+                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+            }
+
+            let result: Result<Option<String>, Box<dyn std::error::Error>> = async {
+                let resp = self.client.get(&endpoint)
+                    .header("X-Plex-Token", &self.token)
+                    .header("Accept", "application/json")
+                    .timeout(Duration::from_secs(8))
+                    .send().await?;
+
+                if !resp.status().is_success() { 
+                    return Err(format!("HTTP {}", resp.status()).into());
+                }
+                
+                let metadata: MetadataResponse = resp.json().await?;
+                
+                for item in metadata.media_container.metadata {
+                    for guid in item.guid {
+                        if let Some(mbid) = guid.id.strip_prefix("mbid://") {
+                            return Ok(Some(mbid.to_string()));
+                        }
                     }
                 }
-            }
-            Ok(None)
-        }.await;
+                Ok(None)
+            }.await;
 
-        match result {
-            Ok(mbid) => {
-                self.mbid_cache.set(rating_key.to_string(), mbid.clone());
-                mbid
-            }
-            Err(e) => {
-                warn!("MBID fetch failed for {}: {}", rating_key, e);
-                self.mbid_cache.set(rating_key.to_string(), None);
-                None
+            match result {
+                Ok(Some(mbid)) => {
+                    debug!("Successfully fetched {} MBID for {}: {}", entity_type, rating_key, mbid);
+                    // Cache only successful results
+                    self.mbid_cache.set(rating_key.to_string(), mbid.clone());
+                    return MBIDFetchResult::success(mbid);
+                }
+                Ok(None) => {
+                    // MBID not present in Plex metadata - not an error, just missing data
+                    debug!("No {} MBID found in Plex metadata for {}", entity_type, rating_key);
+                    return MBIDFetchResult::not_found();
+                }
+                Err(e) => {
+                    last_error = format!("{}", e);
+                    warn!("Attempt {}/{} failed for {} {}: {}", attempt, max_retries, entity_type, rating_key, e);
+                }
             }
         }
+        
+        error!("Failed to fetch {} MBID for {} after {} attempts: {}", 
+               entity_type, rating_key, max_retries, last_error);
+        MBIDFetchResult::error(last_error)
+    }
+
+    /// Log comprehensive MBID fetch results for a track
+    fn log_mbid_results(&self, title: &str, artist: &str, recording: &MBIDFetchResult, release: &MBIDFetchResult, artist_mbid: &MBIDFetchResult) {
+        let recording_status = if let Some(ref mbid) = recording.mbid {
+            format!("✓ {}", mbid)
+        } else if recording.attempted {
+            format!("✗ {}", recording.error.as_ref().unwrap_or(&"unknown".to_string()))
+        } else {
+            "⊘ skipped".to_string()
+        };
+        
+        let release_status = if let Some(ref mbid) = release.mbid {
+            format!("✓ {}", mbid)
+        } else if release.attempted {
+            format!("✗ {}", release.error.as_ref().unwrap_or(&"unknown".to_string()))
+        } else {
+            "⊘ skipped".to_string()
+        };
+        
+        let artist_status = if let Some(ref mbid) = artist_mbid.mbid {
+            format!("✓ {}", mbid)
+        } else if artist_mbid.attempted {
+            format!("✗ {}", artist_mbid.error.as_ref().unwrap_or(&"unknown".to_string()))
+        } else {
+            "⊘ skipped".to_string()
+        };
+
+        let total_found = [recording.mbid.is_some(), release.mbid.is_some(), artist_mbid.mbid.is_some()]
+            .iter()
+            .filter(|&&x| x)
+            .count();
+        
+        info!("MBID enrichment for '{}' by '{}': [{}/3] Recording: {} | Release: {} | Artist: {}",
+              title, artist, total_found, recording_status, release_status, artist_status);
     }
 
     // ==================== Session Processing ====================
@@ -404,9 +523,15 @@ impl PlexSource {
 
         // A. Live Sessions
         let endpoint = format!("{}/status/sessions", self.url);
-        if let Ok(resp) = self.client.get(&endpoint).header("X-Plex-Token", &self.token).header("Accept", "application/json").send().await {
+        if let Ok(resp) = self.client.get(&endpoint)
+            .header("X-Plex-Token", &self.token)
+            .header("Accept", "application/json")
+            .send().await 
+        {
             if resp.status().is_success() {
                 if let Ok(sessions) = resp.json::<SessionsResponse>().await {
+                    info!("Processing {} active Plex sessions", sessions.media_container.metadata.len());
+                    
                     for session in sessions.media_container.metadata {
                         if let Some(reason) = self.validate_session(&session) {
                             debug!("Skipping session: {}", reason);
@@ -414,7 +539,9 @@ impl PlexSource {
                         }
                         if session.media_type.as_deref() != Some("track") { continue; }
 
-                        let is_playing = session.player.as_ref().map(|p| p.state.as_deref() == Some("playing")).unwrap_or(false);
+                        let is_playing = session.player.as_ref()
+                            .map(|p| p.state.as_deref() == Some("playing"))
+                            .unwrap_or(false);
                         
                         if let Some(track) = PlexTrack::from_session(session) {
                             self.process_live_track(track, is_playing, &mut result).await;
@@ -426,9 +553,12 @@ impl PlexSource {
 
         // B. History Sync
         if let Ok(history) = self.fetch_history_plays(0).await {
+            info!("Fetched {} tracks from Plex history", history.len());
             result.ready_to_scrobble.extend(history);
         }
 
+        info!("Session fetch complete: {} now playing, {} ready to scrobble", 
+              result.now_playing.len(), result.ready_to_scrobble.len());
         Ok(result)
     }
 
@@ -442,6 +572,7 @@ impl PlexSource {
         // Detect track change
         if let Some(state) = self.session_states.get(&session_key) {
             if state.rating_key != rating_key {
+                debug!("Track changed in session {}: {} -> {}", session_key, state.rating_key, rating_key);
                 self.session_states.remove(&session_key);
             }
         }
@@ -463,10 +594,14 @@ impl PlexSource {
         };
 
         if should_scrobble {
-            if let Some(state) = self.session_states.get_mut(&session_key) { state.scrobbled = true; }
+            info!("Track ready for scrobble: '{}' by '{}'", track.title, track.artist);
+            if let Some(state) = self.session_states.get_mut(&session_key) { 
+                state.scrobbled = true; 
+            }
             let play = self.resolve_play(track, &format!("scrobble-{}", now)).await;
             result.ready_to_scrobble.push(play);
         } else if needs_np {
+            info!("Track now playing: '{}' by '{}'", track.title, track.artist);
             let play = self.resolve_play(track, "np").await;
             result.now_playing.push(play);
         }
@@ -477,56 +612,88 @@ impl PlexSource {
     async fn fetch_history_plays(&mut self, _min_timestamp: u64) -> Result<Vec<Play>, Box<dyn std::error::Error>> {
         let endpoint = format!("{}/status/sessions/history/all", self.url);
         let resp = self.client.get(&endpoint)
-            .query(&[("sort", "viewedAt:desc"), ("limit", "50")]) // Reduced limit for simpler sync
+            .query(&[("sort", "viewedAt:desc"), ("limit", "50")])
             .header("X-Plex-Token", &self.token)
             .header("Accept", "application/xml")
             .send().await?;
 
-        if !resp.status().is_success() { return Ok(Vec::new()); }
+        if !resp.status().is_success() { 
+            warn!("History fetch failed: HTTP {}", resp.status());
+            return Ok(Vec::new()); 
+        }
+        
         let text = resp.text().await?;
         
         let container: HistoryMediaContainer = match quick_xml::de::from_str(&text) {
             Ok(c) => c,
-            Err(_) => return Ok(Vec::new()),
+            Err(e) => {
+                warn!("Failed to parse history XML: {}", e);
+                return Ok(Vec::new());
+            }
         };
 
         let mut plays = Vec::new();
-        let seven_days_ago = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs().saturating_sub(7 * 86400);
+        let seven_days_ago = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            .saturating_sub(7 * 86400);
 
+        info!("Processing {} history tracks from Plex", container.tracks.len());
+        
         for h_track in container.tracks {
             if h_track.media_type.as_deref() != Some("track") { continue; }
             if let Some(ts) = h_track.viewed_at {
-                if ts < seven_days_ago { continue; }
+                if ts < seven_days_ago { 
+                    debug!("Skipping old history track (viewed_at: {})", ts);
+                    continue; 
+                }
             }
 
-            // Convert to intermediate struct
             if let Some(track) = PlexTrack::from_history(h_track) {
-                // Resolve with full MBID enrichment
                 let play = self.resolve_play(track, "hist").await;
                 plays.push(play);
             }
         }
+        
         Ok(plays)
     }
 
     // ==================== Validation ====================
 
     fn validate_session(&self, session: &SessionMetadata) -> Option<String> {
-        let user = session.user.as_ref().and_then(|u| u.title.as_deref()).unwrap_or("unknown").to_lowercase();
-        if !self.filters.users_allow.is_empty() && !self.filters.users_allow.contains(&user) { return Some(format!("User blocked: {}", user)); }
-        if self.filters.users_block.contains(&user) { return Some(format!("User blocked: {}", user)); }
+        let user = session.user.as_ref()
+            .and_then(|u| u.title.as_deref())
+            .unwrap_or("unknown")
+            .to_lowercase();
+            
+        if !self.filters.users_allow.is_empty() && !self.filters.users_allow.contains(&user) { 
+            return Some(format!("User not in allow list: {}", user)); 
+        }
+        if self.filters.users_block.contains(&user) { 
+            return Some(format!("User in block list: {}", user)); 
+        }
         
         if let Some(lib) = &session.library_section_title {
             let lib_lower = lib.to_lowercase();
-            if !self.filters.libraries_allow.is_empty() && !self.filters.libraries_allow.contains(&lib_lower) { return Some(format!("Lib blocked: {}", lib)); }
-            if !self.libraries.iter().any(|l| l.title == *lib && l.collection_type == "artist") { return Some("Not music lib".to_string()); }
+            if !self.filters.libraries_allow.is_empty() && !self.filters.libraries_allow.contains(&lib_lower) { 
+                return Some(format!("Library not in allow list: {}", lib)); 
+            }
+            if !self.libraries.iter().any(|l| l.title == *lib && l.collection_type == "artist") { 
+                return Some(format!("Not a music library: {}", lib)); 
+            }
         }
         None
     }
 
     pub fn cleanup_sessions(&mut self, max_age_seconds: u64) {
         let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+        let before_count = self.session_states.len();
         self.session_states.retain(|_, state| now - state.last_seen < max_age_seconds);
+        let removed = before_count - self.session_states.len();
+        if removed > 0 {
+            debug!("Cleaned up {} stale sessions", removed);
+        }
     }
 
     // ==================== Wrapper for trait compliance ====================
