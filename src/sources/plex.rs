@@ -1,6 +1,6 @@
 use serde::{Deserialize, Deserializer};
 use reqwest::Client;
-use log::{debug, info, warn};
+use log::{debug, info, warn, error};
 use std::collections::HashMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use crate::models::Play;
@@ -172,6 +172,39 @@ pub struct Library {
     pub collection_type: String,
     pub uuid: String,
     pub key: String,
+}
+
+// ==================== History XML Structures ====================
+
+#[derive(Debug, Deserialize)]
+struct HistoryResponse {
+    #[serde(rename = "MediaContainer")]
+    media_container: HistoryContainer,
+}
+
+#[derive(Debug, Deserialize)]
+struct HistoryContainer {
+    #[serde(default, rename = "Track")]
+    tracks: Vec<HistoryTrack>,
+}
+
+#[derive(Debug, Deserialize)]
+struct HistoryTrack {
+    #[serde(rename = "type")]
+    media_type: Option<String>,
+    #[serde(rename = "viewedAt")]
+    viewed_at: Option<u64>,
+    #[serde(rename = "historyKey")]
+    history_key: Option<String>,
+    title: Option<String>,
+    #[serde(rename = "grandparentTitle")]
+    artist: Option<String>,
+    #[serde(rename = "parentTitle")]
+    album: Option<String>,
+    #[serde(rename = "originalTitle")]
+    track_artist: Option<String>,
+    #[serde(rename = "duration")]
+    duration: Option<u64>,
 }
 
 // ==================== MusicBrainz Cache ====================
@@ -360,102 +393,94 @@ impl PlexSource {
         Ok(plays)
     }
 
-    /// Fetch historical plays from Plex (for offline sync)
+    /// Fetch historical plays from Plex (for offline sync) - FIXED to parse XML
     async fn fetch_history_plays(&self, min_timestamp: u64) -> Result<Vec<Play>, Box<dyn std::error::Error>> {
         let endpoint = format!("{}/status/sessions/history/all", self.url);
         debug!("Fetching Plex history (since {}) from: {}", min_timestamp, endpoint);
 
-        // Plex stores history in `viewedAt`.
         let resp = self.client.get(&endpoint)
-            .query(&[("sort", "viewedAt:desc"), ("limit", "50"), ("accountID", "")]) // You might need accountID if multiple users
+            .query(&[("sort", "viewedAt:desc"), ("limit", "200")])
             .header("X-Plex-Token", &self.token)
-            .header("Accept", "application/json")
+            .header("Accept", "application/xml")
             .send()
             .await?;
 
         if !resp.status().is_success() {
-            return Err(format!("Plex History API error: {}", resp.status()).into());
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_else(|_| "<unable to read body>".to_string());
+            error!("Plex History API error: {} - Body: {}", status, &body[..body.len().min(500)]);
+            return Err(format!("Plex History API error: {}", status).into());
         }
 
         let text = resp.text().await?;
+        debug!("History response (first 1000 chars): {}", &text[..text.len().min(1000)]);
 
-        // Reuse SessionsResponse struct if the shape matches, or create a specific one.
-        // History response usually has "MediaContainer" -> "Metadata" just like sessions.
-        // Let's try to reuse SessionsResponse, but history items have slightly different fields.
-        // Specifically "viewedAt" instead of active session data.
-
-        #[derive(Deserialize)]
-        struct HistoryResponse {
-            #[serde(rename = "MediaContainer")]
-            media_container: HistoryContainer,
-        }
-
-        #[derive(Deserialize)]
-        struct HistoryContainer {
-            #[serde(default, rename = "Metadata")]
-            metadata: Vec<HistoryItem>,
-        }
-
-        #[derive(Deserialize)]
-        struct HistoryItem {
-            #[serde(rename = "type")]
-            media_type: String,
-            #[serde(rename = "viewedAt")]
-            viewed_at: u64,
-            title: Option<String>,
-            #[serde(rename = "grandparentTitle")]
-            artist: Option<String>,
-            #[serde(rename = "parentTitle")]
-            album: Option<String>,
-            #[serde(rename = "originalTitle")]
-            track_artist: Option<String>,
-        }
-
-        let history: HistoryResponse = match serde_json::from_str(&text) {
+        let history: HistoryResponse = match serde_xml_rs::from_str(&text) {
             Ok(h) => h,
             Err(e) => {
-                debug!("Failed to parse history: {}", e);
+                error!("Failed to parse history XML: {} - Raw XML: {}", e, &text[..text.len().min(500)]);
                 return Ok(Vec::new());
             }
         };
 
         let mut plays = Vec::new();
-        for item in history.media_container.metadata {
-            if item.media_type != "track" { continue; }
-
-            // Only include plays that happened AFTER our last check
-            // AND are older than 10 seconds (to avoid race conditions with active sessions?)
-            // Actually, just strictly > last_checked.
-            if item.viewed_at <= min_timestamp {
+        for track in history.media_container.tracks {
+            // Skip non-track entries (shouldn't happen, but be safe)
+            if track.media_type.as_deref() != Some("track") {
                 continue;
             }
 
+            let viewed_at = match track.viewed_at {
+                Some(ts) => ts,
+                None => {
+                    debug!("Skipping history entry with no viewedAt");
+                    continue;
+                }
+            };
+
+            // CRITICAL FIX: Don't filter by min_timestamp here!
+            // SQLite will handle deduplication, and we want to catch late-synced plays.
+            // Only skip if it's more than 7 days old to avoid processing ancient history.
+            let seven_days_ago = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs()
+                .saturating_sub(7 * 86400);
+
+            if viewed_at < seven_days_ago {
+                debug!("Skipping very old play from {}", viewed_at);
+                continue;
+            }
+
+            let history_key = track.history_key.unwrap_or_else(|| format!("hist-{}", viewed_at));
+
             // Build Play object
-            let (artists, _) = if let Some(track_artist) = &item.track_artist {
-                (vec![track_artist.clone()], item.artist.clone())
+            let (artists, _) = if let Some(track_artist) = &track.track_artist {
+                (vec![track_artist.clone()], track.artist.clone())
             } else {
-                (item.artist.as_ref().map(|a| vec![a.clone()]).unwrap_or_default(), item.artist.clone())
+                (track.artist.as_ref().map(|a| vec![a.clone()]).unwrap_or_default(), track.artist.clone())
             };
 
             let play = Play {
-                title: item.title.unwrap_or_default(),
+                title: track.title.unwrap_or_else(|| "Unknown".to_string()),
                 artist: artists.first().cloned().unwrap_or_else(|| "Unknown".to_string()),
                 artists: if artists.is_empty() { None } else { Some(artists) },
-                album: item.album,
-                timestamp: item.viewed_at,
-                duration: None, // History might not give duration, or we can fetch it
+                album: track.album,
+                timestamp: viewed_at,
+                duration: track.duration.map(|d| d / 1000), // Convert ms to seconds
                 track_number: None,
-                mbid_artist: None, // Fetching MBIDs for history items might be expensive/slow
+                mbid_artist: None,
                 mbid_release: None,
                 mbid_recording: None,
                 mbid_release_group: None,
-                source_id: format!("plex-hist-{}", item.viewed_at), // Unique ID
+                source_id: format!("plex-hist-{}", history_key),
                 source_name: "Plex".to_string(),
             };
 
             plays.push(play);
         }
 
+        info!("Parsed {} track(s) from Plex history", plays.len());
         Ok(plays)
     }
 
@@ -524,14 +549,17 @@ impl PlexSource {
             debug!("Plex sessions request failed: {}", resp.status());
         }
 
-        // 2. Fetch History (Offline Sync)
-        if let Some(timestamp) = last_checked {
-            debug!("Fetching Plex history since {}", timestamp);
-            if let Ok(history_plays) = self.fetch_history_plays(timestamp).await {
+        // 2. Fetch History (Offline Sync) - now ignores last_checked for 7-day window
+        debug!("Fetching Plex history (7-day window)");
+        match self.fetch_history_plays(0).await {
+            Ok(history_plays) => {
                 if !history_plays.is_empty() {
                     info!("Found {} historical plays from Plex", history_plays.len());
                     result.ready_to_scrobble.extend(history_plays);
                 }
+            }
+            Err(e) => {
+                error!("Failed to fetch Plex history: {}", e);
             }
         }
 
