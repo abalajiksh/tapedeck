@@ -26,11 +26,11 @@ impl ListenBrainzSink {
         }
     }
 
-    /// Submit "now playing" status for a track
-    pub async fn submit_now_playing(&self, play: &Play) -> Result<(), Box<dyn std::error::Error>> {
-        debug!("Submitting now playing: {} - {}", play.artist, play.title);
-
+    /// Build track metadata with proper mbid_mapping structure
+    fn build_track_metadata(play: &Play) -> serde_json::Map<String, serde_json::Value> {
         let mut track_meta = serde_json::Map::new();
+        
+        // Basic metadata
         track_meta.insert("artist_name".to_string(), json!(play.artist));
         track_meta.insert("track_name".to_string(), json!(play.title));
 
@@ -38,6 +38,7 @@ impl ListenBrainzSink {
             track_meta.insert("release_name".to_string(), json!(album));
         }
 
+        // Build additional_info (non-MBID metadata)
         let mut additional_info = serde_json::Map::new();
         additional_info.insert("submission_client".to_string(), json!(env!("CARGO_PKG_NAME")));
         additional_info.insert("submission_client_version".to_string(), json!(env!("CARGO_PKG_VERSION")));
@@ -46,13 +47,65 @@ impl ListenBrainzSink {
             additional_info.insert("duration_ms".to_string(), json!(dur * 1000));
         }
 
-        if let Some(ref mbid) = play.mbid_recording {
-            additional_info.insert("recording_mbid".to_string(), json!(mbid));
+        if let Some(num) = play.track_number {
+            additional_info.insert("track_number".to_string(), json!(num));
         }
 
         if !additional_info.is_empty() {
             track_meta.insert("additional_info".to_string(), serde_json::Value::Object(additional_info));
         }
+
+        // Build mbid_mapping object (ListenBrainz preferred structure)
+        let mut has_mbid_data = false;
+        let mut mbid_mapping = serde_json::Map::new();
+
+        if let Some(ref mbid) = play.mbid_recording {
+            mbid_mapping.insert("recording_mbid".to_string(), json!(mbid));
+            has_mbid_data = true;
+        }
+
+        if let Some(ref mbid) = play.mbid_release {
+            mbid_mapping.insert("release_mbid".to_string(), json!(mbid));
+            has_mbid_data = true;
+        }
+
+        if let Some(ref mbids) = play.mbid_artist {
+            if !mbids.is_empty() {
+                mbid_mapping.insert("artist_mbids".to_string(), json!(mbids));
+                has_mbid_data = true;
+
+                // Build artists array with proper structure
+                let artists_array: Vec<serde_json::Value> = mbids.iter().enumerate().map(|(idx, mbid)| {
+                    let artist_name = if let Some(ref artists) = play.artists {
+                        artists.get(idx).cloned().unwrap_or_else(|| play.artist.clone())
+                    } else {
+                        play.artist.clone()
+                    };
+
+                    json!({
+                        "artist_credit_name": artist_name,
+                        "join_phrase": "",
+                        "artist_mbid": mbid
+                    })
+                }).collect();
+
+                mbid_mapping.insert("artists".to_string(), json!(artists_array));
+            }
+        }
+
+        // Only add mbid_mapping if we have at least one MBID
+        if has_mbid_data {
+            track_meta.insert("mbid_mapping".to_string(), serde_json::Value::Object(mbid_mapping));
+        }
+
+        track_meta
+    }
+
+    /// Submit "now playing" status for a track
+    pub async fn submit_now_playing(&self, play: &Play) -> Result<(), Box<dyn std::error::Error>> {
+        debug!("Submitting now playing: {} - {}", play.artist, play.title);
+
+        let track_meta = Self::build_track_metadata(play);
 
         let body = json!({
             "listen_type": "playing_now",
@@ -133,46 +186,7 @@ impl ScrobbleSink for ListenBrainzSink {
         let payload_items: Vec<serde_json::Value> = plays.iter().map(|play| {
             debug!("Preparing ListenBrainz payload for: {} - {}", play.artist, play.title);
 
-            // Build track_metadata
-            let mut track_meta = serde_json::Map::new();
-            track_meta.insert("artist_name".to_string(), json!(play.artist));
-            track_meta.insert("track_name".to_string(), json!(play.title));
-
-            if let Some(ref album) = play.album {
-                track_meta.insert("release_name".to_string(), json!(album));
-            }
-
-            // Build additional_info
-            let mut additional_info = serde_json::Map::new();
-            additional_info.insert("submission_client".to_string(), json!(env!("CARGO_PKG_NAME")));
-            additional_info.insert("submission_client_version".to_string(), json!(env!("CARGO_PKG_VERSION")));
-
-            if let Some(dur) = play.duration {
-                additional_info.insert("duration_ms".to_string(), json!(dur * 1000));
-            }
-
-            if let Some(num) = play.track_number {
-                additional_info.insert("track_number".to_string(), json!(num));
-            }
-
-            // Add MBIDs if available
-            if let Some(ref mbid) = play.mbid_artist {
-                if let Some(first_mbid) = mbid.first() {
-                    additional_info.insert("artist_mbids".to_string(), json!([first_mbid]));
-                }
-            }
-
-            if let Some(ref mbid) = play.mbid_release {
-                additional_info.insert("release_mbid".to_string(), json!(mbid));
-            }
-
-            if let Some(ref mbid) = play.mbid_recording {
-                additional_info.insert("recording_mbid".to_string(), json!(mbid));
-            }
-
-            if !additional_info.is_empty() {
-                track_meta.insert("additional_info".to_string(), serde_json::Value::Object(additional_info));
-            }
+            let track_meta = Self::build_track_metadata(play);
 
             json!({
                 "listened_at": play.timestamp,
