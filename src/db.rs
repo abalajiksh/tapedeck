@@ -1,6 +1,6 @@
 use sqlx::{sqlite::SqlitePoolOptions, Pool, Sqlite, FromRow};
 use crate::models::Play;
-use log::{info, error};
+use log::{info, debug};
 
 #[derive(Debug, FromRow)]
 pub struct ScrobbleRecord {
@@ -51,8 +51,15 @@ impl Database {
     }
 
     pub async fn save_scrobble(&self, play: &Play) -> Result<bool, sqlx::Error> {
-        let exists = self.exists(&play.source_id, &play.source_name).await?;
-        if exists {
+        // 1. Exact match check
+        if self.exists(&play.source_id, &play.source_name).await? {
+            return Ok(false);
+        }
+
+        // 2. Fuzzy match check (Title + Artist + Time Delta)
+        // This prevents duplicates where one source is "live session" and other is "history"
+        if self.fuzzy_exists(&play.title, &play.artist, play.timestamp as i64).await? {
+            debug!("Skipping duplicate play (fuzzy match): {} - {}", play.artist, play.title);
             return Ok(false);
         }
 
@@ -85,6 +92,23 @@ impl Database {
         Ok(count.0 > 0)
     }
 
+    pub async fn fuzzy_exists(&self, title: &str, artist: &str, timestamp: i64) -> Result<bool, sqlx::Error> {
+        // Check for same song within +/- 10 minutes (600 seconds)
+        let count: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM scrobbles 
+             WHERE title = ? AND artist = ? 
+             AND timestamp BETWEEN ? - 600 AND ? + 600"
+        )
+        .bind(title)
+        .bind(artist)
+        .bind(timestamp)
+        .bind(timestamp)
+        .fetch_one(&self.pool)
+        .await?;
+
+        Ok(count.0 > 0)
+    }
+
     pub async fn get_pending_scrobbles(&self) -> Result<Vec<Play>, sqlx::Error> {
         let records: Vec<ScrobbleRecord> = sqlx::query_as::<_, ScrobbleRecord>(
             "SELECT * FROM scrobbles WHERE status = 'pending' ORDER BY timestamp ASC"
@@ -98,7 +122,7 @@ impl Database {
             album: r.album,
             timestamp: r.timestamp as u64,
             duration: r.duration.map(|d| d as u64),
-            track_number: None, // Not persisted for now
+            track_number: None,
             source_id: r.source_id,
             source_name: r.source_name,
             mbid_recording: None,
