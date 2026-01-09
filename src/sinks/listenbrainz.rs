@@ -3,7 +3,8 @@ use reqwest::Client;
 use serde_json::json;
 use crate::models::Play;
 use super::ScrobbleSink;
-use log::{info, debug, error};
+use log::{info, debug, error, warn};
+use tokio::time::{sleep, Duration};
 
 pub struct ListenBrainzSink {
     base_url: String,
@@ -63,21 +64,52 @@ impl ListenBrainzSink {
         let endpoint = format!("{}/1/submit-listens", self.base_url);
         let auth_header_value = format!("Token {}", self.token);
 
-        let resp = self.client.post(&endpoint)
-            .header("Authorization", &auth_header_value)
-            .header("Content-Type", "application/json")
-            .json(&body)
-            .send()
-            .await?;
+        // Simple retry logic for now playing, but less aggressive than scrobble
+        let mut retries = 0;
+        const MAX_RETRIES: u32 = 1;
 
-        if !resp.status().is_success() {
-            let error_text = resp.text().await.unwrap_or_default();
-            error!("Now playing submission failed: {}", error_text);
-        } else {
-            debug!("✅ Now playing submitted: {} - {}", play.artist, play.title);
+        loop {
+            let resp = self.client.post(&endpoint)
+                .header("Authorization", &auth_header_value)
+                .header("Content-Type", "application/json")
+                .json(&body)
+                .send()
+                .await;
+
+            match resp {
+                Ok(response) => {
+                    if response.status().is_success() {
+                        debug!("✅ Now playing submitted: {} - {}", play.artist, play.title);
+                        return Ok(());
+                    } else if response.status() == 429 {
+                        if retries >= MAX_RETRIES {
+                            let error_text = response.text().await.unwrap_or_default();
+                            error!("Now playing rate limited (gave up): {}", error_text);
+                            return Ok(()); // Don't fail the whole app for now playing
+                        }
+                        
+                        let retry_after = response.headers()
+                            .get("X-RateLimit-Reset-In")
+                            .and_then(|h| h.to_str().ok())
+                            .and_then(|s| s.parse::<u64>().ok())
+                            .unwrap_or(2); // Default to 2s if header missing
+                        
+                        debug!("Rate limited on now playing, waiting {}s", retry_after);
+                        sleep(Duration::from_secs(retry_after + 1)).await;
+                        retries += 1;
+                        continue;
+                    } else {
+                        let error_text = response.text().await.unwrap_or_default();
+                        error!("Now playing submission failed: {}", error_text);
+                        return Ok(()); // Swallow error for now playing
+                    }
+                }
+                Err(e) => {
+                    error!("Network error sending now playing: {}", e);
+                    return Ok(());
+                }
+            }
         }
-
-        Ok(())
     }
 }
 
@@ -148,50 +180,91 @@ impl ScrobbleSink for ListenBrainzSink {
             })
         }).collect();
 
-        let body = json!({
-            "listen_type": "import",
-            "payload": payload_items
-        });
+        // ListenBrainz supports max 1000 listens per request
+        // We'll chunk them just in case, though usually plays.len() is small
+        for chunk in payload_items.chunks(100) {
+            let body = json!({
+                "listen_type": "import",
+                "payload": chunk
+            });
 
-        let endpoint = if self.base_url.ends_with("submit-listens") {
-            self.base_url.clone()
-        } else {
-            format!("{}/1/submit-listens", self.base_url)
-        };
+            let endpoint = if self.base_url.ends_with("submit-listens") {
+                self.base_url.clone()
+            } else {
+                format!("{}/1/submit-listens", self.base_url)
+            };
 
-        debug!("Submitting to ListenBrainz endpoint: {}", endpoint);
-        debug!("Payload size: {} listens", payload_items.len());
-        debug!("Token length: {} chars", self.token.len());
+            let auth_header_value = format!("Token {}", self.token);
+            
+            let mut retries = 0;
+            const MAX_RETRIES: u32 = 5;
+            let mut backoff = 2;
 
-        // Build request step by step to isolate the error
-        let auth_header_value = format!("Token {}", self.token);
+            loop {
+                debug!("Submitting chunk of {} plays (attempt {}/{})", chunk.len(), retries + 1, MAX_RETRIES);
+                
+                let resp = self.client.post(&endpoint)
+                    .header("Authorization", &auth_header_value)
+                    .header("Content-Type", "application/json")
+                    .json(&body)
+                    .send()
+                    .await;
 
-        debug!("Building POST request...");
-        let mut request_builder = self.client.post(&endpoint);
+                match resp {
+                    Ok(response) => {
+                        if response.status().is_success() {
+                            info!("✅ Successfully submitted {} plays to ListenBrainz", chunk.len());
+                            break; // Chunk success, move to next chunk
+                        } else if response.status() == 429 {
+                            let reset_in = response.headers()
+                                .get("X-RateLimit-Reset-In")
+                                .and_then(|h| h.to_str().ok())
+                                .and_then(|s| s.parse::<u64>().ok());
+                            
+                            let remaining = response.headers()
+                                .get("X-RateLimit-Remaining")
+                                .and_then(|h| h.to_str().ok())
+                                .unwrap_or("?");
 
-        debug!("Adding Authorization header...");
-        request_builder = request_builder.header("Authorization", &auth_header_value);
-
-        debug!("Adding Content-Type header...");
-        request_builder = request_builder.header("Content-Type", "application/json");
-
-        debug!("Adding JSON body...");
-        request_builder = request_builder.json(&body);
-
-        debug!("Sending request...");
-        let resp = request_builder.send().await.map_err(|e| {
-            error!("Failed to send request to ListenBrainz: {:?}", e);
-            format!("Request error: {}", e)
-        })?;
-
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let error_text = resp.text().await.unwrap_or_default();
-            error!("ListenBrainz submission failed. Status: {}, Response: {}", status, error_text);
-            return Err(format!("ListenBrainz API Error: {}", error_text).into());
+                            let wait_time = reset_in.unwrap_or(backoff);
+                            
+                            warn!("ListenBrainz rate limit exceeded (remaining: {}). Waiting {}s before retry...", remaining, wait_time);
+                            
+                            sleep(Duration::from_secs(wait_time + 1)).await;
+                            
+                            retries += 1;
+                            if retries > MAX_RETRIES {
+                                let error_text = response.text().await.unwrap_or_default();
+                                error!("Max retries exceeded for ListenBrainz. Last error: {}", error_text);
+                                return Err(format!("Rate limit exceeded after retries: {}", error_text).into());
+                            }
+                            
+                            // Exponential backoff fallback if header was missing
+                            if reset_in.is_none() {
+                                backoff *= 2;
+                            }
+                            continue;
+                        } else {
+                            let status = response.status();
+                            let error_text = response.text().await.unwrap_or_default();
+                            error!("ListenBrainz submission failed. Status: {}, Response: {}", status, error_text);
+                            return Err(format!("ListenBrainz API Error: {}", error_text).into());
+                        }
+                    }
+                    Err(e) => {
+                        error!("Network error sending to ListenBrainz: {}", e);
+                        retries += 1;
+                        if retries > MAX_RETRIES {
+                            return Err(format!("Network error after retries: {}", e).into());
+                        }
+                        sleep(Duration::from_secs(backoff)).await;
+                        backoff *= 2;
+                        continue;
+                    }
+                }
+            }
         }
 
-        info!("✅ Successfully submitted {} plays to ListenBrainz", plays.len());
         Ok(())
     }
 }
