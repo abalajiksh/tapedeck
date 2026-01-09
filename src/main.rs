@@ -2,6 +2,7 @@ mod config;
 mod models;
 mod sources;
 mod sinks;
+mod db;
 
 use std::time::Duration;
 use tokio::time::sleep;
@@ -9,6 +10,7 @@ use crate::sources::MusicSource;
 use crate::sinks::ScrobbleSink;
 use crate::sinks::ListenBrainzSink;
 use crate::config::Config;
+use crate::db::Database;
 use log::{info, error, debug, warn};
 
 #[tokio::main]
@@ -21,15 +23,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     info!("🚀 Tapedeck Scrobbler Service Started");
 
-    // 1. Load Configuration
+    // 1. Initialize Database
+    let db_url = std::env::var("DATABASE_URL").unwrap_or_else(|_| "sqlite:scrobbles.db".to_string());
+    info!("📦 Initializing SQLite database at {}", db_url);
+    let db = match Database::new(&db_url).await {
+        Ok(db) => db,
+        Err(e) => {
+            error!("❌ Failed to connect to database: {}", e);
+            return Err(e.into());
+        }
+    };
+
+    // 2. Load Configuration
     let config = Config::from_env();
 
-    // Debug: Print loaded config
-    debug!("ListenBrainz enabled: {}", config.listenbrainz.enabled);
-    debug!("ListenBrainz token: '{}'", if config.listenbrainz.token.is_empty() { "<empty>" } else { "<set>" });
-    debug!("ListenBrainz URL: {}", config.listenbrainz.base_url);
-
-    // 2. Initialize Sources
+    // 3. Initialize Sources
     let mut sources: Vec<Box<dyn MusicSource>> = Vec::new();
 
     // Initialize Plex with filters
@@ -51,7 +59,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             filters,
         );
 
-        // Initialize to fetch libraries
         match plex_source.initialize().await {
             Ok(_) => {
                 info!("✅ Plex source initialized successfully");
@@ -59,141 +66,123 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             Err(e) => {
                 error!("❌ Failed to initialize Plex: {}", e);
-                if config.plex.url.is_empty() || config.plex.token.is_empty() {
-                    error!("Please set PLEX_URL and PLEX_TOKEN in your .env file");
-                }
             }
         }
     }
 
-    // TODO: Add other sources (Navidrome, Jellyfin) similarly
-
     if sources.is_empty() {
-        error!("❌ No music sources enabled! Please enable at least one source in .env");
+        error!("❌ No music sources enabled!");
         return Ok(());
     }
 
-    // 3. Initialize Sinks
+    // 4. Initialize Sinks
     let mut sinks: Vec<Box<dyn ScrobbleSink>> = Vec::new();
 
     if config.listenbrainz.enabled {
-        if config.listenbrainz.token.is_empty() {
-            warn!("ListenBrainz is enabled but token is empty");
-        } else {
-            info!("Initializing ListenBrainz sink...");
-            sinks.push(Box::new(sinks::ListenBrainzSink::new(
-                config.listenbrainz.base_url.clone(),
-                config.listenbrainz.token.clone(),
-            )));
-            info!("✅ ListenBrainz sink initialized");
-        }
+        info!("Initializing ListenBrainz sink...");
+        sinks.push(Box::new(sinks::ListenBrainzSink::new(
+            config.listenbrainz.base_url.clone(),
+            config.listenbrainz.token.clone(),
+        )));
     }
 
     if config.lastfm.enabled {
-        if config.lastfm.api_key.is_empty() || config.lastfm.secret.is_empty() || config.lastfm.session_key.is_empty() {
-            warn!("Last.fm is enabled but credentials are incomplete");
-        } else {
-            info!("Initializing Last.fm sink...");
-            sinks.push(Box::new(sinks::LastFmSink::new(
-                config.lastfm.api_key.clone(),
-                config.lastfm.secret.clone(),
-                config.lastfm.session_key.clone(),
-            )));
-            info!("✅ Last.fm sink initialized");
-        }
+        info!("Initializing Last.fm sink...");
+        sinks.push(Box::new(sinks::LastFmSink::new(
+            config.lastfm.api_key.clone(),
+            config.lastfm.secret.clone(),
+            config.lastfm.session_key.clone(),
+        )));
     }
 
     if sinks.is_empty() {
-        error!("❌ No scrobble destinations enabled! Please enable ListenBrainz or Last.fm in .env");
+        error!("❌ No scrobble destinations enabled!");
         return Ok(());
     }
 
-    // 4. State Management
-    let mut last_check_time = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs()
-        .saturating_sub(3600); // Start from 1 hour ago
-
     info!("🎵 Starting scrobble loop...");
-    info!("📊 Monitoring {} source(s) and {} destination(s)", sources.len(), sinks.len());
-
-    let mut iteration = 0u64;
+    
+    // We fetch history for the last 24 hours to catch offline plays
+    // SQLite handles deduplication
+    let history_window_seconds = 86400; // 24 hours
 
     loop {
-        iteration += 1;
-        debug!("Starting iteration #{}", iteration);
-
         let current_time = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_secs();
 
-        // Fetch plays from all sources
+        // 1. Fetch from Sources and Store in DB
         for source in &mut sources {
-            // Handle Plex specially for now_playing support
             if source.name() == "Plex" {
                 if let Some(plex) = source.as_any_mut().downcast_mut::<sources::plex::PlexSource>() {
-                    match plex.fetch_sessions_extended(Some(last_check_time)).await {
+                    // Fetch recent history + active sessions
+                    // We look back 24h to catch any late-synced plays
+                    let lookback_time = current_time.saturating_sub(history_window_seconds);
+                    
+                    match plex.fetch_sessions_extended(Some(lookback_time)).await {
                         Ok(session_result) => {
-                            // Send now_playing updates (only to ListenBrainz)
+                            // A. Handle Now Playing (Stateless, immediate)
                             for play in &session_result.now_playing {
                                 for sink in &sinks {
-                                    if sink.name() == "ListenBrainz" {
-                                        // Downcast to call submit_now_playing
-                                        if let Some(lb_sink) = sink.as_any().downcast_ref::<ListenBrainzSink>() {
-                                            if let Err(e) = lb_sink.submit_now_playing(play).await {
-                                                debug!("Now playing error: {}", e);
+                                    if let Some(lb_sink) = sink.as_any().downcast_ref::<ListenBrainzSink>() {
+                                        let _ = lb_sink.submit_now_playing(play).await;
+                                    }
+                                }
+                            }
+
+                            // B. Store Scrobble Candidates in DB
+                            if !session_result.ready_to_scrobble.is_empty() {
+                                debug!("Processing {} potential scrobbles from Plex", session_result.ready_to_scrobble.len());
+                                for play in session_result.ready_to_scrobble {
+                                    match db.save_scrobble(&play).await {
+                                        Ok(saved) => {
+                                            if saved {
+                                                info!("📥 Queued new play: {} - {}", play.artist, play.title);
                                             }
                                         }
+                                        Err(e) => error!("Database error: {}", e),
                                     }
                                 }
-                            }
-
-                            // Scrobble completed plays
-                            if !session_result.ready_to_scrobble.is_empty() {
-                                info!("🎵 Found {} new play(s) from Plex", session_result.ready_to_scrobble.len());
-                                for sink in &sinks {
-                                    match sink.scrobble(&session_result.ready_to_scrobble).await {
-                                        Ok(_) => info!("✅ Successfully sent {} play(s) to {}", session_result.ready_to_scrobble.len(), sink.name()),
-                                        Err(e) => error!("❌ Error sending to {}: {}", sink.name(), e),
-                                    }
-                                }
-                            } else {
-                                debug!("No new plays from Plex");
                             }
                         }
-                        Err(e) => error!("⚠️  Error fetching from Plex: {}", e),
+                        Err(e) => error!("Error fetching from Plex: {}", e),
                     }
-                    continue; // Skip the generic handling below
                 }
             }
+            // TODO: Add generic handling for other sources if needed
+        }
 
-            // Generic handling for other sources
-            match source.fetch_new_plays(last_check_time).await {
-                Ok(plays) => {
-                    if !plays.is_empty() {
-                        info!("🎵 Found {} new play(s) from {}", plays.len(), source.name());
-
-                        // Send to all sinks
+        // 2. Process Pending Scrobbles from DB
+        match db.get_pending_scrobbles().await {
+            Ok(pending_plays) => {
+                if !pending_plays.is_empty() {
+                    info!("🚀 Processing {} pending scrobble(s)", pending_plays.len());
+                    
+                    for play in pending_plays {
+                        let mut all_succeeded = true;
+                        
                         for sink in &sinks {
-                            match sink.scrobble(&plays).await {
-                                Ok(_) => {
-                                    info!("✅ Successfully sent {} play(s) to {}", plays.len(), sink.name());
-                                }
+                            match sink.scrobble(&vec![play.clone()]).await {
+                                Ok(_) => debug!("Sent to {}", sink.name()),
                                 Err(e) => {
-                                    error!("❌ Error sending to {}: {}", sink.name(), e);
+                                    error!("Failed to send to {}: {}", sink.name(), e);
+                                    all_succeeded = false;
                                 }
                             }
                         }
-                    } else {
-                        debug!("No new plays from {}", source.name());
+
+                        if all_succeeded {
+                            if let Err(e) = db.mark_as_scrobbled(&play.source_id, &play.source_name).await {
+                                error!("Failed to mark as scrobbled: {}", e);
+                            } else {
+                                info!("✅ Synced: {} - {}", play.artist, play.title);
+                            }
+                        }
                     }
                 }
-                Err(e) => {
-                    error!("⚠️  Error fetching from {}: {}", source.name(), e);
-                }
             }
+            Err(e) => error!("Failed to fetch pending scrobbles: {}", e),
         }
 
         // Clean up old session states (Plex-specific)
@@ -201,14 +190,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .find(|s| s.name() == "Plex")
             .and_then(|s| s.as_any_mut().downcast_mut::<sources::plex::PlexSource>())
         {
-            plex_source.cleanup_sessions(3600); // 1 hour
+            plex_source.cleanup_sessions(3600);
         }
 
-        last_check_time = current_time;
-
-        // Poll every 15 seconds for real-time session monitoring
-        let sleep_duration = Duration::from_secs(15);
-        debug!("Sleeping for {} seconds until next check...", sleep_duration.as_secs());
-        sleep(sleep_duration).await;
+        sleep(Duration::from_secs(15)).await;
     }
 }
