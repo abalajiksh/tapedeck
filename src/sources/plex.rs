@@ -354,31 +354,28 @@ impl PlexSource {
     // ==================== Core Resolution Logic ====================
 
     /// Central method to convert a raw Plex track into a Play object with ENFORCED MBID resolution.
-    /// This method deliberately fetches all available MBIDs concurrently and logs the results.
+    /// This method deliberately fetches all available MBIDs sequentially and logs the results.
     async fn resolve_play(&mut self, track: PlexTrack, source_id_suffix: &str) -> Play {
         let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
         
         info!("Resolving track: '{}' by '{}' (rating_key: {})", 
               track.title, track.artist, track.rating_key);
 
-        // 1. Deliberately fetch ALL MBIDs concurrently with retry logic
-        let (recording_result, release_result, artist_result) = tokio::join!(
-            self.fetch_musicbrainz_id_with_retry(&track.rating_key, "recording", 3),
-            async {
-                if let Some(pk) = &track.parent_rating_key {
-                    self.fetch_musicbrainz_id_with_retry(pk, "release", 3).await
-                } else {
-                    MBIDFetchResult::skipped()
-                }
-            },
-            async {
-                if let Some(gk) = &track.grandparent_rating_key {
-                    self.fetch_musicbrainz_id_with_retry(gk, "artist", 3).await
-                } else {
-                    MBIDFetchResult::skipped()
-                }
-            }
-        );
+        // 1. Deliberately fetch ALL MBIDs sequentially with retry logic
+        // Sequential to avoid borrow checker issues with mutable self
+        let recording_result = self.fetch_musicbrainz_id_with_retry(&track.rating_key, "recording", 3).await;
+        
+        let release_result = if let Some(pk) = &track.parent_rating_key {
+            self.fetch_musicbrainz_id_with_retry(pk, "release", 3).await
+        } else {
+            MBIDFetchResult::skipped()
+        };
+        
+        let artist_result = if let Some(gk) = &track.grandparent_rating_key {
+            self.fetch_musicbrainz_id_with_retry(gk, "artist", 3).await
+        } else {
+            MBIDFetchResult::skipped()
+        };
 
         // 2. Log MBID fetch results
         self.log_mbid_results(&track.title, &track.artist, &recording_result, &release_result, &artist_result);
