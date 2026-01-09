@@ -364,7 +364,7 @@ impl PlexSource {
         let endpoint = format!("{}/library/metadata/{}", self.url, rating_key);
         debug!("Fetching MBID for rating key: {}", rating_key);
 
-        let result = async {
+        let result: Result<Option<String>, Box<dyn std::error::Error>> = async {
             let resp = self.client.get(&endpoint)
                 .header("X-Plex-Token", &self.token)
                 .header("Accept", "application/json")
@@ -527,6 +527,13 @@ impl PlexSource {
     pub fn cleanup_sessions(&mut self, max_age_seconds: u64) {
         let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
         self.session_states.retain(|_, state| now - state.last_seen < max_age_seconds);
+    }
+
+    // ==================== Wrapper for trait compliance ====================
+
+    pub async fn fetch_sessions(&mut self) -> Result<Vec<Play>, Box<dyn std::error::Error>> {
+        let result = self.fetch_sessions_extended(None).await?;
+        Ok(result.ready_to_scrobble)
     }
 }
 
