@@ -64,7 +64,7 @@ where
     deserializer.deserialize_any(U64Visitor)
 }
 
-// ==================== Plex API Response Structures ====================
+// ==================== Plex API Response Structures (JSON) ====================
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "PascalCase")]
@@ -174,16 +174,13 @@ pub struct Library {
     pub key: String,
 }
 
-// ==================== History XML Structures ====================
+// ==================== History XML Structures (Fixed for serde-xml-rs) ====================
+
+// In serde-xml-rs, the root element is NOT wrapped in a struct field if you deserialize from the root.
+// But here the root is <MediaContainer>, so we should map that struct directly.
 
 #[derive(Debug, Deserialize)]
-struct HistoryResponse {
-    #[serde(rename = "MediaContainer")]
-    media_container: HistoryContainer,
-}
-
-#[derive(Debug, Deserialize)]
-struct HistoryContainer {
+struct HistoryMediaContainer {
     #[serde(default, rename = "Track")]
     tracks: Vec<HistoryTrack>,
 }
@@ -196,6 +193,8 @@ struct HistoryTrack {
     viewed_at: Option<u64>,
     #[serde(rename = "historyKey")]
     history_key: Option<String>,
+    
+    // In XML attributes are flattened
     title: Option<String>,
     #[serde(rename = "grandparentTitle")]
     artist: Option<String>,
@@ -393,7 +392,7 @@ impl PlexSource {
         Ok(plays)
     }
 
-    /// Fetch historical plays from Plex (for offline sync) - FIXED to parse XML
+    /// Fetch historical plays from Plex (for offline sync) - FIXED for serde-xml-rs
     async fn fetch_history_plays(&self, min_timestamp: u64) -> Result<Vec<Play>, Box<dyn std::error::Error>> {
         let endpoint = format!("{}/status/sessions/history/all", self.url);
         debug!("Fetching Plex history (since {}) from: {}", min_timestamp, endpoint);
@@ -415,8 +414,10 @@ impl PlexSource {
         let text = resp.text().await?;
         debug!("History response (first 1000 chars): {}", &text[..text.len().min(1000)]);
 
-        let history: HistoryResponse = match serde_xml_rs::from_str(&text) {
-            Ok(h) => h,
+        // FIXED: serde-xml-rs parses the root element directly into the struct
+        // It does not look for "MediaContainer" field unless the XML has a wrapper around MediaContainer
+        let container: HistoryMediaContainer = match serde_xml_rs::from_str(&text) {
+            Ok(c) => c,
             Err(e) => {
                 error!("Failed to parse history XML: {} - Raw XML: {}", e, &text[..text.len().min(500)]);
                 return Ok(Vec::new());
@@ -424,7 +425,7 @@ impl PlexSource {
         };
 
         let mut plays = Vec::new();
-        for track in history.media_container.tracks {
+        for track in container.tracks {
             // Skip non-track entries (shouldn't happen, but be safe)
             if track.media_type.as_deref() != Some("track") {
                 continue;
@@ -438,9 +439,6 @@ impl PlexSource {
                 }
             };
 
-            // CRITICAL FIX: Don't filter by min_timestamp here!
-            // SQLite will handle deduplication, and we want to catch late-synced plays.
-            // Only skip if it's more than 7 days old to avoid processing ancient history.
             let seven_days_ago = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
