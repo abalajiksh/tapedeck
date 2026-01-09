@@ -468,7 +468,6 @@ impl PlexSource {
         let endpoint = format!("{}/status/sessions", self.url);
         debug!("Fetching Plex sessions from: {}", endpoint);
 
-        // ... (keep your existing active session fetching logic exactly as is, just wrapped in this block) ...
         let resp = self.client.get(&endpoint)
             .header("X-Plex-Token", &self.token)
             .header("Accept", "application/json")
@@ -477,34 +476,57 @@ impl PlexSource {
 
         if resp.status().is_success() {
             let text = resp.text().await?;
-            // Handle parsing gracefully
+            // Restore debug logging
+            debug!("Plex sessions response: {}", &text[..text.len().min(1000)]);
+
             let sessions_response: SessionsResponse = match serde_json::from_str(&text) {
                 Ok(p) => p,
-                Err(_) => SessionsResponse { media_container: SessionsContainer { metadata: vec![] } }
+                Err(e) => {
+                    debug!("Failed to parse sessions JSON: {}", e);
+                    // Don't just return empty, maybe log the error
+                    SessionsResponse { media_container: SessionsContainer { metadata: vec![] } }
+                }
             };
 
             for session in sessions_response.media_container.metadata {
-                // ... (keep existing session processing logic) ...
-                if let Some(_reason) = self.validate_session(&session) { continue; }
-                if session.media_type.as_deref() != Some("track") { continue; }
+                // Debug each session to see why it might be skipped
+                debug!("Checking session: {:?}", session.title);
+
+                if let Some(reason) = self.validate_session(&session) {
+                    debug!("Skipping session: {}", reason);
+                    continue;
+                }
+
+                if session.media_type.as_deref() != Some("track") {
+                    debug!("Skipping non-track media type: {:?}", session.media_type);
+                    continue;
+                }
 
                 let is_playing = session.player.as_ref()
                     .and_then(|p| p.state.as_deref())
                     .map(|s| s == "playing")
                     .unwrap_or(false);
 
+                debug!("Session state: is_playing={}", is_playing);
+
                 if let Some((play, is_scrobble)) = self.process_session_extended(session, is_playing).await {
+                    debug!("Processed session -> Play: {}, is_scrobble: {}", play.title, is_scrobble);
                     if is_scrobble {
                         result.ready_to_scrobble.push(play);
                     } else if is_playing {
                         result.now_playing.push(play);
                     }
+                } else {
+                    debug!("process_session_extended returned None");
                 }
             }
+        } else {
+            debug!("Plex sessions request failed: {}", resp.status());
         }
 
-        // 2. Fetch History (Offline Sync) - NEW LOGIC
+        // 2. Fetch History (Offline Sync)
         if let Some(timestamp) = last_checked {
+            debug!("Fetching Plex history since {}", timestamp);
             if let Ok(history_plays) = self.fetch_history_plays(timestamp).await {
                 if !history_plays.is_empty() {
                     info!("Found {} historical plays from Plex", history_plays.len());
