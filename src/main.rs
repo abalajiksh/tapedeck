@@ -15,6 +15,9 @@ use log::{info, error, debug, warn};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Load .env file first
+    dotenv::dotenv().ok();
+
     // Initialize logger. Default to "info" if RUST_LOG isn't set.
     if std::env::var("RUST_LOG").is_err() {
         std::env::set_var("RUST_LOG", "info");
@@ -23,7 +26,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     info!("🚀 Tapedeck Scrobbler Service Started");
 
-    // 1. Initialize Database
+    // 1. Load Configuration
+    let config = Config::from_env();
+
+    // 2. Initialize Database
     let db_url = std::env::var("DATABASE_URL").unwrap_or_else(|_| "sqlite:scrobbles.db".to_string());
     info!("📦 Initializing SQLite database at {}", db_url);
     let db = match Database::new(&db_url).await {
@@ -33,9 +39,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             return Err(e.into());
         }
     };
-
-    // 2. Load Configuration
-    let config = Config::from_env();
 
     // 3. Initialize Sources
     let mut sources: Vec<Box<dyn MusicSource>> = Vec::new();
