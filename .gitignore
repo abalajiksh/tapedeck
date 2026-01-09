@@ -26,3 +26,4 @@ src/sources/.DS_Store
 src/sinks/.DS_Store
 .idea/
 scrobbles.db
+Cargo.lock
