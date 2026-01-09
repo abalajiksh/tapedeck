@@ -208,6 +208,15 @@ struct HistoryTrack {
     
     #[serde(rename = "@duration")]
     duration: Option<u64>,
+
+    #[serde(rename = "@ratingKey")]
+    rating_key: Option<String>,
+
+    #[serde(rename = "@parentRatingKey")]
+    parent_rating_key: Option<String>,
+
+    #[serde(rename = "@grandparentRatingKey")]
+    grandparent_rating_key: Option<String>,
 }
 
 // ==================== MusicBrainz Cache ====================
@@ -396,8 +405,8 @@ impl PlexSource {
         Ok(plays)
     }
 
-    /// Fetch historical plays from Plex (for offline sync) - FIXED for quick-xml attributes
-    async fn fetch_history_plays(&self, min_timestamp: u64) -> Result<Vec<Play>, Box<dyn std::error::Error>> {
+    /// Fetch historical plays from Plex (for offline sync) - WITH MUSICBRAINZ METADATA
+    async fn fetch_history_plays(&mut self, min_timestamp: u64) -> Result<Vec<Play>, Box<dyn std::error::Error>> {
         let endpoint = format!("{}/status/sessions/history/all", self.url);
         debug!("Fetching Plex history (since {}) from: {}", min_timestamp, endpoint);
 
@@ -462,6 +471,19 @@ impl PlexSource {
                 (track.artist.as_ref().map(|a| vec![a.clone()]).unwrap_or_default(), track.artist.clone())
             };
 
+            // **FIX**: Fetch MusicBrainz IDs for historical plays
+            let mbid_recording = if let Some(rk) = &track.rating_key {
+                self.get_musicbrainz_id(rk).await
+            } else { None };
+            
+            let mbid_release = if let Some(pk) = &track.parent_rating_key {
+                self.get_musicbrainz_id(pk).await
+            } else { None };
+            
+            let mbid_artist = if let Some(gk) = &track.grandparent_rating_key {
+                self.get_musicbrainz_id(gk).await
+            } else { None };
+
             let play = Play {
                 title: track.title.unwrap_or_else(|| "Unknown".to_string()),
                 artist: artists.first().cloned().unwrap_or_else(|| "Unknown".to_string()),
@@ -470,9 +492,9 @@ impl PlexSource {
                 timestamp: viewed_at,
                 duration: track.duration.map(|d| d / 1000), // Convert ms to seconds
                 track_number: None,
-                mbid_artist: None,
-                mbid_release: None,
-                mbid_recording: None,
+                mbid_artist: mbid_artist.map(|id| vec![id]),
+                mbid_release,
+                mbid_recording,
                 mbid_release_group: None,
                 source_id: format!("plex-hist-{}", history_key),
                 source_name: "Plex".to_string(),
