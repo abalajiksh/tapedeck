@@ -1,4 +1,5 @@
-use sqlx::{sqlite::SqlitePoolOptions, Pool, Sqlite, FromRow};
+use sqlx::{sqlite::{SqlitePoolOptions, SqliteConnectOptions}, Pool, Sqlite, FromRow};
+use std::str::FromStr;
 use crate::models::Play;
 use log::{info, debug};
 
@@ -21,9 +22,13 @@ pub struct Database {
 
 impl Database {
     pub async fn new(database_url: &str) -> Result<Self, sqlx::Error> {
+        // Parse the connection string options
+        let options = SqliteConnectOptions::from_str(database_url)?
+            .create_if_missing(true);
+
         let pool = SqlitePoolOptions::new()
             .max_connections(5)
-            .connect(database_url).await?;
+            .connect_with(options).await?;
 
         let db = Self { pool };
         db.init().await?;
