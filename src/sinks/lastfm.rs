@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use reqwest::{Client, Response};
 use crate::models::Play;
 use super::ScrobbleSink;
-use log::{info, error};
+use log::{info, error, debug};
 use std::collections::HashMap;
 
 pub struct LastFmSink {
@@ -64,6 +64,7 @@ impl ScrobbleSink for LastFmSink {
 
         info!("Submitting {} plays to Last.fm...", plays.len());
 
+        // Last.fm allows up to 50 scrobbles per request
         for chunk in plays.chunks(50) {
             let mut params: Vec<(&str, String)> = Vec::new();
             params.push(("method", "track.scrobble".to_string()));
@@ -71,12 +72,41 @@ impl ScrobbleSink for LastFmSink {
             params.push(("sk", self.session_key.clone()));
 
             for (i, play) in chunk.iter().enumerate() {
+                debug!("Preparing Last.fm scrobble for: {} - {}", play.artist, play.title);
+                
+                // Required fields
                 params.push((Box::leak(format!("artist[{}]", i).into_boxed_str()), play.artist.clone()));
                 params.push((Box::leak(format!("track[{}]", i).into_boxed_str()), play.title.clone()));
                 params.push((Box::leak(format!("timestamp[{}]", i).into_boxed_str()), play.timestamp.to_string()));
 
+                // Optional fields
                 if let Some(ref album) = play.album {
                     params.push((Box::leak(format!("album[{}]", i).into_boxed_str()), album.clone()));
+                }
+
+                // Album artist (if available from artists field)
+                if let Some(ref artists) = play.artists {
+                    if let Some(album_artist) = artists.first() {
+                        if album_artist != &play.artist {
+                            params.push((Box::leak(format!("albumArtist[{}]", i).into_boxed_str()), album_artist.clone()));
+                        }
+                    }
+                }
+
+                // Duration in seconds
+                if let Some(duration) = play.duration {
+                    params.push((Box::leak(format!("duration[{}]", i).into_boxed_str()), duration.to_string()));
+                }
+
+                // Track number
+                if let Some(track_num) = play.track_number {
+                    params.push((Box::leak(format!("trackNumber[{}]", i).into_boxed_str()), track_num.to_string()));
+                }
+
+                // MusicBrainz Track ID (recording MBID)
+                if let Some(ref mbid) = play.mbid_recording {
+                    params.push((Box::leak(format!("mbid[{}]", i).into_boxed_str()), mbid.clone()));
+                    debug!("Including recording MBID for '{}': {}", play.title, mbid);
                 }
             }
 
@@ -84,7 +114,6 @@ impl ScrobbleSink for LastFmSink {
             params.push(("api_sig", signature));
             params.push(("format", "json".to_string()));
 
-            // FIX: Removed .cloned() which was causing the type mismatch error
             let form_data: HashMap<&str, String> = params.into_iter().collect();
 
             let resp: Response = self.client.post("https://ws.audioscrobbler.com/2.0/")
@@ -97,9 +126,11 @@ impl ScrobbleSink for LastFmSink {
                 error!("Last.fm submission failed: {}", error_text);
                 return Err(format!("Last.fm API Error: {}", error_text).into());
             }
+
+            debug!("Successfully submitted chunk of {} plays to Last.fm", chunk.len());
         }
 
-        info!("Successfully submitted {} plays to Last.fm", plays.len());
+        info!("✅ Successfully submitted {} plays to Last.fm", plays.len());
         Ok(())
     }
 }
