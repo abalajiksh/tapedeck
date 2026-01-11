@@ -244,7 +244,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if !pending_plays.is_empty() {
                     info!("🚀 Processing {} pending scrobble(s)", pending_plays.len());
                     
-                    for play in pending_plays {
+                    for mut play in pending_plays {
+                        // Enrich with MusicBrainz if we don't have MBIDs yet (for old scrobbles)
+                        if play.mbid_recording.is_none() {
+                            debug!("Enriching pending scrobble: {} - {}", play.artist, play.title);
+                            match mb_client.fetch_metadata(
+                                &play.title,
+                                &play.artist,
+                                play.album.as_deref(),
+                            ).await {
+                                Ok(metadata) => {
+                                    play.mbid_recording = metadata.track_mbid;
+                                    play.mbid_release = metadata.album_mbid;
+                                    play.mbid_artist = metadata.artist_mbid.as_ref().map(|id| vec![id.clone()]);
+                                    play.caa_id = metadata.caa_id;
+                                    play.caa_release_mbid = metadata.caa_release_mbid;
+                                    debug!("✓ Enriched pending scrobble with MBIDs");
+                                }
+                                Err(e) => {
+                                    debug!("Could not enrich pending scrobble: {}", e);
+                                }
+                            }
+                        }
+                        
                         let mut all_succeeded = true;
                         
                         for sink in &sinks {
