@@ -1998,7 +1998,7 @@ dependencies = [
 
 [[package]]
 name = "tapedeck"
-version = "0.3.6"
+version = "0.3.7"
 dependencies = [
  "async-trait",
  "dotenv",
@@ -2012,6 +2012,7 @@ dependencies = [
  "serde_json",
  "sqlx",
  "tokio",
+ "urlencoding",
 ]
 
 [[package]]
