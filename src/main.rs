@@ -8,7 +8,7 @@ mod musicbrainz;
 use std::time::Duration;
 use tokio::time::sleep;
 use sqlx::SqlitePool;
-use crate::sources::MusicSource;
+use crate::sources::{MusicSource, PlexSource, PlexFilters};
 use crate::sinks::ScrobbleSink;
 use crate::sinks::ListenBrainzSink;
 use crate::config::Config;
@@ -74,7 +74,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if config.plex.enabled {
         info!("Initializing Plex source...");
 
-        let filters = sources::plex::PlexFilters {
+        let filters = PlexFilters {
             users_allow: config.plex.users_allow.clone(),
             users_block: config.plex.users_block.clone(),
             devices_allow: config.plex.devices_allow.clone(),
@@ -83,7 +83,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             libraries_block: config.plex.libraries_block.clone(),
         };
 
-        let mut plex_source = sources::plex::PlexSource::with_filters(
+        let mut plex_source = PlexSource::with_filters(
             config.plex.url.clone(),
             config.plex.token.clone(),
             filters,
@@ -145,7 +145,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // 1. Fetch from Sources and Enrich with MusicBrainz metadata
         for source in &mut sources {
             if source.name() == "Plex" {
-                if let Some(plex) = source.as_any_mut().downcast_mut::<sources::plex::PlexSource>() {
+                if let Some(plex) = source.as_any_mut().downcast_mut::<PlexSource>() {
                     // Fetch recent history + active sessions
                     // We look back 24h to catch any late-synced plays
                     let lookback_time = current_time.saturating_sub(history_window_seconds);
@@ -295,7 +295,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Clean up old session states (Plex-specific)
         if let Some(plex_source) = sources.iter_mut()
             .find(|s| s.name() == "Plex")
-            .and_then(|s| s.as_any_mut().downcast_mut::<sources::plex::PlexSource>())
+            .and_then(|s| s.as_any_mut().downcast_mut::<PlexSource>())
         {
             plex_source.cleanup_sessions(3600);
         }
