@@ -14,6 +14,11 @@ pub struct ScrobbleRecord {
     pub source_id: String,
     pub source_name: String,
     pub status: String,
+    pub mbid_recording: Option<String>,
+    pub mbid_release: Option<String>,
+    pub mbid_artist: Option<String>,
+    pub caa_id: Option<i64>,
+    pub caa_release_mbid: Option<String>,
 }
 
 pub struct Database {
@@ -47,6 +52,11 @@ impl Database {
                 source_id TEXT NOT NULL,
                 source_name TEXT NOT NULL,
                 status TEXT NOT NULL DEFAULT 'pending',
+                mbid_recording TEXT,
+                mbid_release TEXT,
+                mbid_artist TEXT,
+                caa_id INTEGER,
+                caa_release_mbid TEXT,
                 UNIQUE(source_id, source_name)
             )"
         )
@@ -68,9 +78,16 @@ impl Database {
             return Ok(false);
         }
 
+        // Convert Vec<String> to JSON string for mbid_artist
+        let mbid_artist_json = play.mbid_artist.as_ref()
+            .map(|arr| serde_json::to_string(arr).unwrap());
+
         sqlx::query(
-            "INSERT INTO scrobbles (title, artist, album, timestamp, duration, source_id, source_name, status)
-             VALUES (?, ?, ?, ?, ?, ?, ?, 'pending')"
+            "INSERT INTO scrobbles (
+                title, artist, album, timestamp, duration, source_id, source_name, status,
+                mbid_recording, mbid_release, mbid_artist, caa_id, caa_release_mbid
+            )
+             VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?)"
         )
         .bind(&play.title)
         .bind(&play.artist)
@@ -79,6 +96,11 @@ impl Database {
         .bind(play.duration.map(|d| d as i64))
         .bind(&play.source_id)
         .bind(&play.source_name)
+        .bind(&play.mbid_recording)
+        .bind(&play.mbid_release)
+        .bind(&mbid_artist_json)
+        .bind(play.caa_id)
+        .bind(&play.caa_release_mbid)
         .execute(&self.pool)
         .await?;
 
@@ -121,20 +143,29 @@ impl Database {
         .fetch_all(&self.pool)
         .await?;
 
-        let plays = records.into_iter().map(|r| Play {
-            title: r.title,
-            artist: r.artist,
-            album: r.album,
-            timestamp: r.timestamp as u64,
-            duration: r.duration.map(|d| d as u64),
-            track_number: None,
-            source_id: r.source_id,
-            source_name: r.source_name,
-            mbid_recording: None,
-            mbid_release: None,
-            mbid_artist: None,
-            artists: None,
-            mbid_release_group: None,
+        let plays = records.into_iter().map(|r| {
+            // Parse mbid_artist JSON back to Vec<String>
+            let mbid_artist = r.mbid_artist.and_then(|json_str| {
+                serde_json::from_str::<Vec<String>>(&json_str).ok()
+            });
+
+            Play {
+                title: r.title,
+                artist: r.artist,
+                album: r.album,
+                timestamp: r.timestamp as u64,
+                duration: r.duration.map(|d| d as u64),
+                track_number: None,
+                source_id: r.source_id,
+                source_name: r.source_name,
+                mbid_recording: r.mbid_recording,
+                mbid_release: r.mbid_release,
+                mbid_artist,
+                artists: None,
+                mbid_release_group: None,
+                caa_id: r.caa_id,
+                caa_release_mbid: r.caa_release_mbid,
+            }
         }).collect();
 
         Ok(plays)
