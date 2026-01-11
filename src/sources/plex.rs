@@ -1,10 +1,8 @@
 use serde::{Deserialize, Deserializer};
 use reqwest::Client;
-use log::{debug, info, warn, error};
+use log::{debug, info, warn};
 use std::collections::HashMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use std::sync::Arc;
-use tokio::sync::Mutex;
 use crate::models::Play;
 use crate::sources::MusicSource;
 use async_trait::async_trait;
@@ -36,20 +34,19 @@ where
 // ==================== Unified Track Structure ====================
 
 /// A unified representation of a Plex track, whether from Session (JSON) or History (XML).
-/// This intermediate struct holds all the keys needed to fetch metadata.
-#[derive(Debug)]
-struct PlexTrack {
-    title: String,
-    artist: String, // Album Artist
-    track_artist: Option<String>,
-    album: Option<String>,
-    duration: Option<u64>,
-    view_offset: Option<u64>, // Only relevant for sessions
-    rating_key: String,
-    parent_rating_key: Option<String>,
-    grandparent_rating_key: Option<String>,
-    session_key: Option<String>, // Only for sessions
-    viewed_at: Option<u64>,      // Only for history
+#[derive(Debug, Clone)]
+pub struct PlexTrack {
+    pub title: String,
+    pub artist: String, // Album Artist
+    pub track_artist: Option<String>,
+    pub album: Option<String>,
+    pub duration: Option<u64>,
+    pub view_offset: Option<u64>, // Only relevant for sessions
+    pub rating_key: String,
+    pub parent_rating_key: Option<String>,
+    pub grandparent_rating_key: Option<String>,
+    pub session_key: Option<String>, // Only for sessions
+    pub viewed_at: Option<u64>,      // Only for history
 }
 
 impl PlexTrack {
@@ -83,6 +80,36 @@ impl PlexTrack {
             session_key: None,
             viewed_at: h.viewed_at,
         })
+    }
+
+    /// Convert PlexTrack to Play object (basic metadata only, no MBIDs)
+    pub fn to_play(&self, source_id_suffix: &str) -> Play {
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+        let timestamp = self.viewed_at.unwrap_or(now);
+        let source_id = format!("plex-{}-{}", self.rating_key, source_id_suffix);
+
+        // Resolve artists
+        let (artists, _) = if let Some(ta) = &self.track_artist {
+            (vec![ta.clone()], self.artist.clone())
+        } else {
+            (vec![self.artist.clone()], self.artist.clone())
+        };
+
+        Play {
+            title: self.title.clone(),
+            artist: artists.first().cloned().unwrap_or_else(|| "Unknown".to_string()),
+            artists: if artists.is_empty() { None } else { Some(artists) },
+            album: self.album.clone(),
+            timestamp,
+            duration: self.duration.map(|d| d / 1000),
+            track_number: None,
+            mbid_artist: None, // Will be filled by MusicBrainz module
+            mbid_release: None,
+            mbid_release_group: None,
+            mbid_recording: None,
+            source_id,
+            source_name: "Plex".to_string(),
+        }
     }
 }
 
@@ -141,31 +168,6 @@ pub struct User {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "PascalCase")]
-pub struct MetadataResponse {
-    pub media_container: MetadataContainer,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "PascalCase")]
-pub struct MetadataContainer {
-    #[serde(default)]
-    pub metadata: Vec<MetadataItem>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "PascalCase")]
-pub struct MetadataItem {
-    #[serde(default)]
-    pub guid: Vec<Guid>,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct Guid {
-    pub id: String,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "PascalCase")]
 pub struct LibrariesResponse {
     pub media_container: LibrariesContainer,
 }
@@ -219,101 +221,6 @@ struct HistoryTrack {
     grandparent_rating_key: Option<String>,
 }
 
-// ==================== MusicBrainz API Structures ====================
-
-#[derive(Debug, Deserialize)]
-struct MBSearchResponse {
-    recordings: Vec<MBRecording>,
-}
-
-#[derive(Debug, Deserialize)]
-struct MBRecording {
-    id: String,
-    #[serde(default)]
-    releases: Vec<MBRelease>,
-    #[serde(rename = "artist-credit", default)]
-    artist_credit: Vec<MBArtistCredit>,
-}
-
-#[derive(Debug, Deserialize)]
-struct MBRelease {
-    id: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct MBArtistCredit {
-    artist: MBArtist,
-}
-
-#[derive(Debug, Deserialize)]
-struct MBArtist {
-    id: String,
-}
-
-// ==================== MusicBrainz Cache ====================
-
-/// Cache only successful MBID lookups, not failures
-#[derive(Clone)]
-struct MBIDCache {
-    cache: HashMap<String, String>, // Only stores successful MBIDs
-    max_size: usize,
-}
-
-impl MBIDCache {
-    fn new(max_size: usize) -> Self {
-        Self { cache: HashMap::new(), max_size }
-    }
-    
-    fn get(&self, key: &str) -> Option<String> { 
-        self.cache.get(key).cloned()
-    }
-    
-    fn set(&mut self, key: String, value: String) {
-        if self.cache.len() >= self.max_size {
-            if let Some(first_key) = self.cache.keys().next().cloned() {
-                self.cache.remove(&first_key);
-            }
-        }
-        self.cache.insert(key, value);
-    }
-}
-
-// ==================== MBID Fetch Result ====================
-
-#[derive(Debug)]
-struct MBIDFetchResult {
-    mbid: Option<String>,
-    attempted: bool,
-    error: Option<String>,
-}
-
-impl MBIDFetchResult {
-    fn success(mbid: String) -> Self {
-        Self { mbid: Some(mbid), attempted: true, error: None }
-    }
-    
-    fn not_found() -> Self {
-        Self { mbid: None, attempted: true, error: Some("No MBID in Plex metadata".to_string()) }
-    }
-    
-    fn error(err: String) -> Self {
-        Self { mbid: None, attempted: true, error: Some(err) }
-    }
-    
-    fn skipped() -> Self {
-        Self { mbid: None, attempted: false, error: None }
-    }
-}
-
-// ==================== MusicBrainz Search Results ====================
-
-#[derive(Debug, Default)]
-struct MBSearchResults {
-    recording_mbid: Option<String>,
-    release_mbid: Option<String>,
-    artist_mbids: Vec<String>,
-}
-
 // ==================== Session Tracking ====================
 
 #[derive(Debug, Clone)]
@@ -342,17 +249,15 @@ pub struct PlexSource {
     token: String,
     client: Client,
     filters: PlexFilters,
-    mbid_cache: MBIDCache,
     session_states: HashMap<String, SessionState>, // Keyed by session_key
     libraries: Vec<Library>,
-    mb_last_request: Arc<Mutex<SystemTime>>, // Rate limiting for MusicBrainz
 }
 
 /// Result from fetching sessions
 #[derive(Debug, Default)]
 pub struct SessionResult {
-    pub now_playing: Vec<Play>,
-    pub ready_to_scrobble: Vec<Play>,
+    pub now_playing: Vec<PlexTrack>,
+    pub ready_to_scrobble: Vec<PlexTrack>,
 }
 
 impl PlexSource {
@@ -370,10 +275,8 @@ impl PlexSource {
                 .build()
                 .unwrap_or_else(|_| Client::new()),
             filters,
-            mbid_cache: MBIDCache::new(2000),
             session_states: HashMap::new(),
             libraries: Vec::new(),
-            mb_last_request: Arc::new(Mutex::new(SystemTime::UNIX_EPOCH)),
         }
     }
 
@@ -396,273 +299,9 @@ impl PlexSource {
         Ok(lib_response.media_container.directory)
     }
 
-    // ==================== MusicBrainz API Fallback ====================
-
-    /// Search MusicBrainz for track metadata when Plex doesn't have MBIDs
-    async fn search_musicbrainz(&self, artist: &str, title: &str, album: Option<&str>) -> Result<MBSearchResults, Box<dyn std::error::Error>> {
-        // Respect MusicBrainz rate limit: 1 request per second
-        let mut last_req = self.mb_last_request.lock().await;
-        let now = SystemTime::now();
-        let elapsed = now.duration_since(*last_req).unwrap_or(Duration::from_secs(2));
-        
-        if elapsed < Duration::from_secs(1) {
-            let wait_time = Duration::from_secs(1) - elapsed;
-            debug!("MusicBrainz rate limit: waiting {:?}", wait_time);
-            tokio::time::sleep(wait_time).await;
-        }
-        *last_req = SystemTime::now();
-        drop(last_req);
-
-        // Build search query
-        let mut query_parts = vec![
-            format!("recording:{}", Self::escape_lucene(title)),
-            format!("artist:{}", Self::escape_lucene(artist)),
-        ];
-        
-        if let Some(album_name) = album {
-            query_parts.push(format!("release:{}", Self::escape_lucene(album_name)));
-        }
-        
-        let query = query_parts.join(" AND ");
-        debug!("MusicBrainz search query: {}", query);
-
-        let url = format!(
-            "https://musicbrainz.org/ws/2/recording?query={}&limit=1&fmt=json",
-            urlencoding::encode(&query)
-        );
-
-        let resp = self.client.get(&url)
-            .header("User-Agent", format!("{}/{}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION")))
-            .send()
-            .await?;
-
-        if !resp.status().is_success() {
-            return Err(format!("MusicBrainz API error: {}", resp.status()).into());
-        }
-
-        let mb_resp: MBSearchResponse = resp.json().await?;
-        
-        let mut results = MBSearchResults::default();
-        
-        if let Some(recording) = mb_resp.recordings.first() {
-            results.recording_mbid = Some(recording.id.clone());
-            
-            if let Some(release) = recording.releases.first() {
-                results.release_mbid = Some(release.id.clone());
-            }
-            
-            results.artist_mbids = recording.artist_credit
-                .iter()
-                .map(|ac| ac.artist.id.clone())
-                .collect();
-            
-            info!("✓ MusicBrainz found: recording={}, release={:?}, artists={:?}",
-                  recording.id,
-                  results.release_mbid,
-                  results.artist_mbids);
-        }
-
-        Ok(results)
-    }
-
-    /// Escape special Lucene query characters
-    fn escape_lucene(input: &str) -> String {
-        input.replace('\\', "\\\\")
-            .replace('+', "\\+")
-            .replace('-', "\\-")
-            .replace('!', "\\!")
-            .replace('(', "\\(")
-            .replace(')', "\\)")
-            .replace('[', "\\[")
-            .replace(']', "\\]")
-            .replace('{', "\\{")
-            .replace('}', "\\}")
-            .replace('^', "\\^")
-            .replace('~', "\\~")
-            .replace('*', "\\*")
-            .replace('?', "\\?")
-            .replace(':', "\\:")
-            .replace('"', "\\\"")
-    }
-
-    // ==================== Core Resolution Logic ====================
-
-    /// Central method to convert a raw Plex track into a Play object with ENFORCED MBID resolution.
-    async fn resolve_play(&mut self, track: PlexTrack, source_id_suffix: &str) -> Play {
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
-        
-        info!("Resolving track: '{}' by '{}' (rating_key: {})", 
-              track.title, track.artist, track.rating_key);
-
-        // 1. Try fetching MBIDs from Plex metadata
-        let recording_result = self.fetch_musicbrainz_id_with_retry(&track.rating_key, "recording", 3).await;
-        
-        let release_result = if let Some(pk) = &track.parent_rating_key {
-            self.fetch_musicbrainz_id_with_retry(pk, "release", 3).await
-        } else {
-            MBIDFetchResult::skipped()
-        };
-        
-        let artist_result = if let Some(gk) = &track.grandparent_rating_key {
-            self.fetch_musicbrainz_id_with_retry(gk, "artist", 3).await
-        } else {
-            MBIDFetchResult::skipped()
-        };
-
-        let mut mbid_recording = recording_result.mbid.clone();
-        let mut mbid_release = release_result.mbid.clone();
-        let mut mbid_artist_vec = artist_result.mbid.clone().map(|id| vec![id]);
-
-        // 2. If no MBIDs from Plex, fallback to MusicBrainz API
-        if mbid_recording.is_none() && mbid_release.is_none() && mbid_artist_vec.is_none() {
-            info!("No MBIDs in Plex, querying MusicBrainz API...");
-            
-            match self.search_musicbrainz(&track.artist, &track.title, track.album.as_deref()).await {
-                Ok(mb_results) => {
-                    mbid_recording = mb_results.recording_mbid;
-                    mbid_release = mb_results.release_mbid;
-                    if !mb_results.artist_mbids.is_empty() {
-                        mbid_artist_vec = Some(mb_results.artist_mbids);
-                    }
-                }
-                Err(e) => {
-                    warn!("MusicBrainz search failed: {}", e);
-                }
-            }
-        }
-
-        // 3. Log final MBID results
-        self.log_mbid_results(&track.title, &track.artist, &recording_result, &release_result, &artist_result);
-
-        // 4. Resolve Artists
-        let (artists, _) = if let Some(ta) = &track.track_artist {
-            (vec![ta.clone()], track.artist.clone())
-        } else {
-            (vec![track.artist.clone()], track.artist.clone())
-        };
-
-        // 5. Construct Play with all available metadata
-        let timestamp = track.viewed_at.unwrap_or(now);
-        let source_id = format!("plex-{}-{}", track.rating_key, source_id_suffix);
-
-        Play {
-            title: track.title,
-            artist: artists.first().cloned().unwrap_or_else(|| "Unknown".to_string()),
-            artists: if artists.is_empty() { None } else { Some(artists) },
-            album: track.album,
-            timestamp,
-            duration: track.duration.map(|d| d / 1000),
-            track_number: None,
-            mbid_artist: mbid_artist_vec,
-            mbid_release,
-            mbid_release_group: None,
-            mbid_recording,
-            source_id,
-            source_name: "Plex".to_string(),
-        }
-    }
-
-    /// Fetch MusicBrainz ID with retry logic and exponential backoff
-    async fn fetch_musicbrainz_id_with_retry(&mut self, rating_key: &str, entity_type: &str, max_retries: u32) -> MBIDFetchResult {
-        // Check cache first (only successful results are cached)
-        if let Some(cached_mbid) = self.mbid_cache.get(rating_key) {
-            debug!("Cache hit for {} {}: {}", entity_type, rating_key, cached_mbid);
-            return MBIDFetchResult::success(cached_mbid);
-        }
-
-        let endpoint = format!("{}/library/metadata/{}", self.url, rating_key);
-        let mut last_error = String::new();
-        
-        for attempt in 1..=max_retries {
-            let delay_ms = 100 * (2_u64.pow(attempt - 1)); // Exponential backoff
-            
-            if attempt > 1 {
-                debug!("Retry #{} for {} {} after {}ms", attempt, entity_type, rating_key, delay_ms);
-                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
-            }
-
-            let result: Result<Option<String>, Box<dyn std::error::Error>> = async {
-                let resp = self.client.get(&endpoint)
-                    .header("X-Plex-Token", &self.token)
-                    .header("Accept", "application/json")
-                    .timeout(Duration::from_secs(8))
-                    .send().await?;
-
-                if !resp.status().is_success() { 
-                    return Err(format!("HTTP {}", resp.status()).into());
-                }
-                
-                let metadata: MetadataResponse = resp.json().await?;
-                
-                for item in metadata.media_container.metadata {
-                    for guid in item.guid {
-                        if let Some(mbid) = guid.id.strip_prefix("mbid://") {
-                            return Ok(Some(mbid.to_string()));
-                        }
-                    }
-                }
-                Ok(None)
-            }.await;
-
-            match result {
-                Ok(Some(mbid)) => {
-                    debug!("Successfully fetched {} MBID for {}: {}", entity_type, rating_key, mbid);
-                    self.mbid_cache.set(rating_key.to_string(), mbid.clone());
-                    return MBIDFetchResult::success(mbid);
-                }
-                Ok(None) => {
-                    debug!("No {} MBID found in Plex metadata for {}", entity_type, rating_key);
-                    return MBIDFetchResult::not_found();
-                }
-                Err(e) => {
-                    last_error = format!("{}", e);
-                    warn!("Attempt {}/{} failed for {} {}: {}", attempt, max_retries, entity_type, rating_key, e);
-                }
-            }
-        }
-        
-        error!("Failed to fetch {} MBID for {} after {} attempts: {}", 
-               entity_type, rating_key, max_retries, last_error);
-        MBIDFetchResult::error(last_error)
-    }
-
-    /// Log comprehensive MBID fetch results for a track
-    fn log_mbid_results(&self, title: &str, artist: &str, recording: &MBIDFetchResult, release: &MBIDFetchResult, artist_mbid: &MBIDFetchResult) {
-        let recording_status = if let Some(ref mbid) = recording.mbid {
-            format!("✓ {}", mbid)
-        } else if recording.attempted {
-            format!("✗ {}", recording.error.as_ref().unwrap_or(&"unknown".to_string()))
-        } else {
-            "⊘ skipped".to_string()
-        };
-        
-        let release_status = if let Some(ref mbid) = release.mbid {
-            format!("✓ {}", mbid)
-        } else if release.attempted {
-            format!("✗ {}", release.error.as_ref().unwrap_or(&"unknown".to_string()))
-        } else {
-            "⊘ skipped".to_string()
-        };
-        
-        let artist_status = if let Some(ref mbid) = artist_mbid.mbid {
-            format!("✓ {}", mbid)
-        } else if artist_mbid.attempted {
-            format!("✗ {}", artist_mbid.error.as_ref().unwrap_or(&"unknown".to_string()))
-        } else {
-            "⊘ skipped".to_string()
-        };
-
-        let total_found = [recording.mbid.is_some(), release.mbid.is_some(), artist_mbid.mbid.is_some()]
-            .iter()
-            .filter(|&&x| x)
-            .count();
-        
-        info!("MBID enrichment for '{}' by '{}': [{}/3] Recording: {} | Release: {} | Artist: {}",
-              title, artist, total_found, recording_status, release_status, artist_status);
-    }
-
     // ==================== Session Processing ====================
 
+    /// Fetch current sessions and history, returning PlexTrack objects
     pub async fn fetch_sessions_extended(&mut self, _last_checked: Option<u64>) -> Result<SessionResult, Box<dyn std::error::Error>> {
         let mut result = SessionResult::default();
 
@@ -697,7 +336,7 @@ impl PlexSource {
         }
 
         // B. History Sync
-        if let Ok(history) = self.fetch_history_plays(0).await {
+        if let Ok(history) = self.fetch_history_tracks(0).await {
             info!("Fetched {} tracks from Plex history", history.len());
             result.ready_to_scrobble.extend(history);
         }
@@ -743,18 +382,16 @@ impl PlexSource {
             if let Some(state) = self.session_states.get_mut(&session_key) { 
                 state.scrobbled = true; 
             }
-            let play = self.resolve_play(track, &format!("scrobble-{}", now)).await;
-            result.ready_to_scrobble.push(play);
+            result.ready_to_scrobble.push(track);
         } else if needs_np {
             info!("Track now playing: '{}' by '{}'", track.title, track.artist);
-            let play = self.resolve_play(track, "np").await;
-            result.now_playing.push(play);
+            result.now_playing.push(track);
         }
     }
 
     // ==================== History Processing ====================
 
-    async fn fetch_history_plays(&mut self, _min_timestamp: u64) -> Result<Vec<Play>, Box<dyn std::error::Error>> {
+    async fn fetch_history_tracks(&mut self, _min_timestamp: u64) -> Result<Vec<PlexTrack>, Box<dyn std::error::Error>> {
         let endpoint = format!("{}/status/sessions/history/all", self.url);
         let resp = self.client.get(&endpoint)
             .query(&[("sort", "viewedAt:desc"), ("limit", "50")])
@@ -777,7 +414,7 @@ impl PlexSource {
             }
         };
 
-        let mut plays = Vec::new();
+        let mut tracks = Vec::new();
         let seven_days_ago = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -796,12 +433,11 @@ impl PlexSource {
             }
 
             if let Some(track) = PlexTrack::from_history(h_track) {
-                let play = self.resolve_play(track, "hist").await;
-                plays.push(play);
+                tracks.push(track);
             }
         }
         
-        Ok(plays)
+        Ok(tracks)
     }
 
     // ==================== Validation ====================
@@ -841,11 +477,20 @@ impl PlexSource {
         }
     }
 
-    // ==================== Wrapper for trait compliance ====================
+    // ==================== Public API for getting Play objects ====================
 
+    /// Get now playing and scrobbles as PlexTrack objects (for MusicBrainz enrichment)
+    pub async fn get_playback_data(&mut self) -> Result<SessionResult, Box<dyn std::error::Error>> {
+        self.fetch_sessions_extended(None).await
+    }
+
+    /// Wrapper for trait compliance - converts to Play objects
     pub async fn fetch_sessions(&mut self) -> Result<Vec<Play>, Box<dyn std::error::Error>> {
         let result = self.fetch_sessions_extended(None).await?;
-        Ok(result.ready_to_scrobble)
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+        Ok(result.ready_to_scrobble.into_iter()
+            .map(|track| track.to_play(&format!("scrobble-{}", now)))
+            .collect())
     }
 }
 

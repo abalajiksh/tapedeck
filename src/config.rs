@@ -8,6 +8,8 @@ pub struct Config {
     pub jellyfin: JellyfinConfig,
     pub lastfm: LastFmConfig,
     pub listenbrainz: ListenBrainzConfig,
+    pub musicbrainz: MusicBrainzConfig,
+    pub database: DatabaseConfig,
 }
 
 #[derive(Debug, Clone)]
@@ -53,6 +55,19 @@ pub struct ListenBrainzConfig {
     pub base_url: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct MusicBrainzConfig {
+    pub user_agent: String,
+    pub rate_limit_per_second: u32,
+    pub postgres_url: Option<String>,
+    pub enable_postgres: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct DatabaseConfig {
+    pub sqlite_path: String,
+}
+
 impl Config {
     pub fn from_env() -> Self {
         // Load .env file if it exists
@@ -67,6 +82,10 @@ impl Config {
             // In DEV mode, use custom URL or fallback to localhost mock
             get_env("LISTENBRAINZ_URL", "http://localhost:8080")
         };
+
+        // MusicBrainz PostgreSQL URL (optional)
+        let mb_pg_url = env::var("MUSICBRAINZ_POSTGRES_URL").ok();
+        let mb_pg_enabled = mb_pg_url.is_some() && get_env_bool("MUSICBRAINZ_POSTGRES_ENABLED", false);
 
         Config {
             plex: PlexConfig {
@@ -100,6 +119,20 @@ impl Config {
                 enabled: get_env_bool("LISTENBRAINZ_ENABLED", false),
                 token: get_env("LISTENBRAINZ_TOKEN", ""),
                 base_url: lb_url,
+            },
+            musicbrainz: MusicBrainzConfig {
+                user_agent: get_env(
+                    "MUSICBRAINZ_USER_AGENT",
+                    &format!("Tapedeck/0.3.7 ( {} )", get_env("CONTACT_EMAIL", "contact@example.com")),
+                ),
+                rate_limit_per_second: get_env("MUSICBRAINZ_RATE_LIMIT", "1")
+                    .parse()
+                    .unwrap_or(1),
+                postgres_url: mb_pg_url,
+                enable_postgres: mb_pg_enabled,
+            },
+            database: DatabaseConfig {
+                sqlite_path: get_env("SQLITE_DB_PATH", "./tapedeck.db"),
             },
         }
     }
