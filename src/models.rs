@@ -20,6 +20,10 @@ pub struct Play {
     pub mbid_artist: Option<Vec<String>>,   // Array of Artist MBIDs
     pub artists: Option<Vec<String>>,       // Array of Artist Names
     pub mbid_release_group: Option<String>,
+    
+    // Cover Art Archive
+    pub caa_id: Option<i64>,
+    pub caa_release_mbid: Option<String>,
 }
 
 impl Play {
@@ -39,6 +43,8 @@ impl Play {
             mbid_artist: None,
             artists: None,
             mbid_release_group: None,
+            caa_id: None,
+            caa_release_mbid: None,
         }
     }
 }
