@@ -16,6 +16,8 @@ pub struct MusicBrainzMetadata {
     pub album_name: Option<String>,
     pub release_date: Option<String>,
     pub genres: Vec<String>,
+    pub caa_id: Option<i64>,
+    pub caa_release_mbid: Option<String>,
     pub fetched_at: i64,
 }
 
@@ -202,9 +204,9 @@ impl MusicBrainzClient {
             INSERT INTO musicbrainz_cache (
                 track_mbid, artist_mbid, album_mbid,
                 track_title, artist_name, album_name,
-                release_date, genres, fetched_at
+                release_date, genres, caa_id, caa_release_mbid, fetched_at
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
             ON CONFLICT(track_title, artist_name, album_name)
             DO UPDATE SET
                 track_mbid = EXCLUDED.track_mbid,
@@ -212,6 +214,8 @@ impl MusicBrainzClient {
                 album_mbid = EXCLUDED.album_mbid,
                 release_date = EXCLUDED.release_date,
                 genres = EXCLUDED.genres,
+                caa_id = EXCLUDED.caa_id,
+                caa_release_mbid = EXCLUDED.caa_release_mbid,
                 fetched_at = EXCLUDED.fetched_at
             "#
         )
@@ -223,6 +227,8 @@ impl MusicBrainzClient {
             .bind(&metadata.album_name)
             .bind(&metadata.release_date)
             .bind(genres_json)
+            .bind(metadata.caa_id)
+            .bind(&metadata.caa_release_mbid)
             .bind(metadata.fetched_at)
             .execute(&self.sqlite_pool)
             .await?;
@@ -281,6 +287,8 @@ impl MusicBrainzClient {
                 album_name: row.release_name,
                 release_date: None,
                 genres: Vec::new(),
+                caa_id: None,
+                caa_release_mbid: None,
                 fetched_at: chrono::Utc::now().timestamp(),
             })),
             None => Ok(None),
@@ -302,7 +310,7 @@ impl MusicBrainzClient {
         let query = format!(r#"recording:"{}" AND artist:"{}""#, track_title, artist_name);
 
         let url = format!(
-            "{}/recording?query={}&fmt=json&limit=1",
+            "{}/recording?query={}&fmt=json&limit=1&inc=releases+artist-credits",
             self.config.api_base_url,
             urlencoding::encode(&query)
         );
@@ -320,12 +328,21 @@ impl MusicBrainzClient {
         let api_response: MBApiResponse = response.json().await?;
 
         if let Some(recording) = api_response.recordings.first() {
+            let album_mbid = recording.releases.first().map(|r| r.id.clone());
+            
+            // Fetch cover art info if we have a release MBID
+            let (caa_id, caa_release_mbid) = if let Some(ref release_mbid) = album_mbid {
+                self.fetch_cover_art_info(release_mbid).await.unwrap_or((None, None))
+            } else {
+                (None, None)
+            };
+
             Ok(MusicBrainzMetadata {
                 track_mbid: Some(recording.id.clone()),
                 artist_mbid: recording.artist_credit.first()
                     .and_then(|ac| ac.artist.as_ref())
                     .map(|a| a.id.clone()),
-                album_mbid: recording.releases.first().map(|r| r.id.clone()),
+                album_mbid,
                 track_title: recording.title.clone(),
                 artist_name: recording.artist_credit.first()
                     .map(|ac| ac.name.clone())
@@ -334,10 +351,47 @@ impl MusicBrainzClient {
                 release_date: recording.releases.first()
                     .and_then(|r| r.date.clone()),
                 genres: recording.tags.iter().map(|t| t.name.clone()).collect(),
+                caa_id,
+                caa_release_mbid,
                 fetched_at: chrono::Utc::now().timestamp(),
             })
         } else {
             Err(anyhow!("No results found for {} - {}", artist_name, track_title))
+        }
+    }
+
+    /// Fetch Cover Art Archive info for a release
+    async fn fetch_cover_art_info(&self, release_mbid: &str) -> Result<(Option<i64>, Option<String>)> {
+        // Rate limiting
+        self.rate_limiter.acquire().await;
+
+        let url = format!(
+            "https://coverartarchive.org/release/{}",
+            release_mbid
+        );
+
+        let response = self.http_client
+            .get(&url)
+            .header("User-Agent", &self.config.user_agent)
+            .send()
+            .await?;
+
+        if !response.status().is_success() {
+            // No cover art available
+            return Ok((None, None));
+        }
+
+        let caa_response: CAAResponse = response.json().await?;
+
+        // Get the front cover or first image
+        let front_image = caa_response.images.iter()
+            .find(|img| img.front)
+            .or_else(|| caa_response.images.first());
+
+        if let Some(image) = front_image {
+            Ok((Some(image.id), Some(caa_response.release.clone())))
+        } else {
+            Ok((None, None))
         }
     }
 
@@ -354,6 +408,8 @@ impl MusicBrainzClient {
                 album_name TEXT,
                 release_date TEXT,
                 genres TEXT,
+                caa_id INTEGER,
+                caa_release_mbid TEXT,
                 fetched_at INTEGER NOT NULL,
                 UNIQUE(track_title, artist_name, album_name)
             );
@@ -384,6 +440,8 @@ struct MusicBrainzMetadataRow {
     album_name: Option<String>,
     release_date: Option<String>,
     genres: String,
+    caa_id: Option<i64>,
+    caa_release_mbid: Option<String>,
     fetched_at: i64,
 }
 
@@ -399,6 +457,8 @@ impl From<MusicBrainzMetadataRow> for MusicBrainzMetadata {
             album_name: row.album_name,
             release_date: row.release_date,
             genres,
+            caa_id: row.caa_id,
+            caa_release_mbid: row.caa_release_mbid,
             fetched_at: row.fetched_at,
         }
     }
@@ -451,4 +511,16 @@ struct MBRelease {
 #[derive(Debug, Deserialize)]
 struct MBTag {
     name: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct CAAResponse {
+    release: String,
+    images: Vec<CAAImage>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CAAImage {
+    id: i64,
+    front: bool,
 }
