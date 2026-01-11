@@ -37,6 +37,7 @@ impl Database {
 
         let db = Self { pool };
         db.init().await?;
+        db.migrate().await?;
         Ok(db)
     }
 
@@ -62,6 +63,46 @@ impl Database {
         )
         .execute(&self.pool)
         .await?;
+        Ok(())
+    }
+
+    async fn migrate(&self) -> Result<(), sqlx::Error> {
+        // Check if mbid_recording column exists
+        let column_check: Result<(i64,), _> = sqlx::query_as(
+            "SELECT COUNT(*) FROM pragma_table_info('scrobbles') WHERE name='mbid_recording'"
+        )
+        .fetch_one(&self.pool)
+        .await;
+
+        if let Ok((count,)) = column_check {
+            if count == 0 {
+                info!("⚙️ Migrating scrobbles database to add MusicBrainz and CAA fields...");
+                
+                // Add MBID columns
+                sqlx::query("ALTER TABLE scrobbles ADD COLUMN mbid_recording TEXT")
+                    .execute(&self.pool)
+                    .await?;
+                
+                sqlx::query("ALTER TABLE scrobbles ADD COLUMN mbid_release TEXT")
+                    .execute(&self.pool)
+                    .await?;
+                
+                sqlx::query("ALTER TABLE scrobbles ADD COLUMN mbid_artist TEXT")
+                    .execute(&self.pool)
+                    .await?;
+                
+                sqlx::query("ALTER TABLE scrobbles ADD COLUMN caa_id INTEGER")
+                    .execute(&self.pool)
+                    .await?;
+                
+                sqlx::query("ALTER TABLE scrobbles ADD COLUMN caa_release_mbid TEXT")
+                    .execute(&self.pool)
+                    .await?;
+                
+                info!("✅ Database migration complete");
+            }
+        }
+
         Ok(())
     }
 
