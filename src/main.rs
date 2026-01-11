@@ -35,7 +35,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 2. Initialize SQLite Pool for MusicBrainz Cache
     let sqlite_path = config.database.sqlite_path.clone();
     info!("📦 Initializing SQLite database at {}", sqlite_path);
-    let sqlite_pool = SqlitePool::connect(&format!("sqlite:{}", sqlite_path)).await?;
+    let sqlite_pool = SqlitePool::connect(&format!("sqlite:{}?mode=rwc", sqlite_path)).await?;
 
     // 3. Initialize MusicBrainz Client with 3-tier caching
     info!("🎵 Initializing MusicBrainz metadata client...");
@@ -57,7 +57,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // 4. Initialize Scrobble Database
-    let db_url = std::env::var("DATABASE_URL").unwrap_or_else(|_| "sqlite:scrobbles.db".to_string());
+    let db_url = std::env::var("DATABASE_URL").unwrap_or_else(|_| "sqlite:scrobbles.db?mode=rwc".to_string());
     info!("📦 Initializing scrobble database at {}", db_url);
     let db = match Database::new(&db_url).await {
         Ok(db) => db,
