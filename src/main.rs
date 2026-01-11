@@ -3,14 +3,17 @@ mod models;
 mod sources;
 mod sinks;
 mod db;
+mod musicbrainz;
 
 use std::time::Duration;
 use tokio::time::sleep;
+use sqlx::SqlitePool;
 use crate::sources::MusicSource;
 use crate::sinks::ScrobbleSink;
 use crate::sinks::ListenBrainzSink;
 use crate::config::Config;
 use crate::db::Database;
+use crate::musicbrainz::MusicBrainzClient;
 use log::{info, error, debug, warn};
 
 #[tokio::main]
@@ -29,18 +32,42 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 1. Load Configuration
     let config = Config::from_env();
 
-    // 2. Initialize Database
+    // 2. Initialize SQLite Pool for MusicBrainz Cache
+    let sqlite_path = config.database.sqlite_path.clone();
+    info!("📦 Initializing SQLite database at {}", sqlite_path);
+    let sqlite_pool = SqlitePool::connect(&format!("sqlite:{}", sqlite_path)).await?;
+
+    // 3. Initialize MusicBrainz Client with 3-tier caching
+    info!("🎵 Initializing MusicBrainz metadata client...");
+    let mb_config = musicbrainz::MusicBrainzConfig {
+        api_base_url: "https://musicbrainz.org/ws/2".to_string(),
+        user_agent: config.musicbrainz.user_agent.clone(),
+        rate_limit_per_second: config.musicbrainz.rate_limit_per_second,
+        postgres_url: config.musicbrainz.postgres_url.clone(),
+        enable_postgres: config.musicbrainz.enable_postgres,
+    };
+    
+    let mb_client = MusicBrainzClient::new(mb_config, sqlite_pool.clone()).await?;
+    mb_client.initialize_schema().await?;
+    
+    if config.musicbrainz.enable_postgres {
+        info!("✅ MusicBrainz client initialized with PostgreSQL dump support");
+    } else {
+        info!("✅ MusicBrainz client initialized (SQLite + API)");
+    }
+
+    // 4. Initialize Scrobble Database
     let db_url = std::env::var("DATABASE_URL").unwrap_or_else(|_| "sqlite:scrobbles.db".to_string());
-    info!("📦 Initializing SQLite database at {}", db_url);
+    info!("📦 Initializing scrobble database at {}", db_url);
     let db = match Database::new(&db_url).await {
         Ok(db) => db,
         Err(e) => {
-            error!("❌ Failed to connect to database: {}", e);
+            error!("❌ Failed to connect to scrobble database: {}", e);
             return Err(e.into());
         }
     };
 
-    // 3. Initialize Sources
+    // 5. Initialize Sources
     let mut sources: Vec<Box<dyn MusicSource>> = Vec::new();
 
     // Initialize Plex with filters
@@ -78,7 +105,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    // 4. Initialize Sinks
+    // 6. Initialize Sinks
     let mut sinks: Vec<Box<dyn ScrobbleSink>> = Vec::new();
 
     if config.listenbrainz.enabled {
@@ -103,7 +130,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    info!("🎵 Starting scrobble loop...");
+    info!("🎵 Starting scrobble loop with MusicBrainz metadata enrichment...");
     
     // We fetch history for the last 24 hours to catch offline plays
     // SQLite handles deduplication
@@ -115,7 +142,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .unwrap()
             .as_secs();
 
-        // 1. Fetch from Sources and Store in DB
+        // 1. Fetch from Sources and Enrich with MusicBrainz metadata
         for source in &mut sources {
             if source.name() == "Plex" {
                 if let Some(plex) = source.as_any_mut().downcast_mut::<sources::plex::PlexSource>() {
@@ -126,18 +153,68 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     match plex.fetch_sessions_extended(Some(lookback_time)).await {
                         Ok(session_result) => {
                             // A. Handle Now Playing (Stateless, immediate)
-                            for play in &session_result.now_playing {
+                            for plex_track in &session_result.now_playing {
+                                let mut play = plex_track.to_play("np");
+                                
+                                // Try to enrich with MusicBrainz metadata (non-blocking)
+                                match mb_client.fetch_metadata(
+                                    &plex_track.title,
+                                    &plex_track.artist,
+                                    plex_track.album.as_deref(),
+                                ).await {
+                                    Ok(metadata) => {
+                                        play.mbid_recording = metadata.track_mbid;
+                                        play.mbid_release = metadata.album_mbid;
+                                        play.mbid_artist = metadata.artist_mbid.map(|id| vec![id]);
+                                        debug!("✓ Enriched now playing with MBIDs: {} - {}", play.artist, play.title);
+                                    }
+                                    Err(e) => {
+                                        debug!("Could not fetch MusicBrainz metadata for now playing: {}", e);
+                                    }
+                                }
+                                
+                                // Submit to sinks
                                 for sink in &sinks {
                                     if let Some(lb_sink) = sink.as_any().downcast_ref::<ListenBrainzSink>() {
-                                        let _ = lb_sink.submit_now_playing(play).await;
+                                        let _ = lb_sink.submit_now_playing(&play).await;
                                     }
                                 }
                             }
 
-                            // B. Store Scrobble Candidates in DB
+                            // B. Process Scrobble Candidates with MusicBrainz Enrichment
                             if !session_result.ready_to_scrobble.is_empty() {
                                 debug!("Processing {} potential scrobbles from Plex", session_result.ready_to_scrobble.len());
-                                for play in session_result.ready_to_scrobble {
+                                
+                                for plex_track in session_result.ready_to_scrobble {
+                                    let mut play = plex_track.to_play(&format!("scrobble-{}", current_time));
+                                    
+                                    // Enrich with MusicBrainz metadata before saving
+                                    match mb_client.fetch_metadata(
+                                        &plex_track.title,
+                                        &plex_track.artist,
+                                        plex_track.album.as_deref(),
+                                    ).await {
+                                        Ok(metadata) => {
+                                            play.mbid_recording = metadata.track_mbid.clone();
+                                            play.mbid_release = metadata.album_mbid.clone();
+                                            play.mbid_artist = metadata.artist_mbid.map(|id| vec![id]);
+                                            
+                                            info!("✓ Enriched: {} - {} [recording: {}, release: {}, artist: {}]",
+                                                play.artist,
+                                                play.title,
+                                                metadata.track_mbid.as_deref().unwrap_or("none"),
+                                                metadata.album_mbid.as_deref().unwrap_or("none"),
+                                                metadata.artist_mbid.as_deref().unwrap_or("none")
+                                            );
+                                        }
+                                        Err(e) => {
+                                            warn!("⚠ MusicBrainz lookup failed for {} - {}: {}", 
+                                                play.artist, play.title, e);
+                                            // Continue with basic metadata from Plex
+                                        }
+                                    }
+                                    
+                                    // Save to database (with or without MBIDs)
                                     match db.save_scrobble(&play).await {
                                         Ok(saved) => {
                                             if saved {
