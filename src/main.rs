@@ -166,6 +166,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         play.mbid_recording = metadata.track_mbid;
                                         play.mbid_release = metadata.album_mbid;
                                         play.mbid_artist = metadata.artist_mbid.as_ref().map(|id| vec![id.clone()]);
+                                        play.caa_id = metadata.caa_id;
+                                        play.caa_release_mbid = metadata.caa_release_mbid;
                                         debug!("✓ Enriched now playing with MBIDs: {} - {}", play.artist, play.title);
                                     }
                                     Err(e) => {
@@ -198,13 +200,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                             play.mbid_recording = metadata.track_mbid.clone();
                                             play.mbid_release = metadata.album_mbid.clone();
                                             play.mbid_artist = metadata.artist_mbid.as_ref().map(|id| vec![id.clone()]);
+                                            play.caa_id = metadata.caa_id;
+                                            play.caa_release_mbid = metadata.caa_release_mbid.clone();
                                             
-                                            info!("✓ Enriched: {} - {} [recording: {}, release: {}, artist: {}]",
+                                            info!("✓ Enriched: {} - {} [recording: {}, release: {}, artist: {}, caa: {}]",
                                                 play.artist,
                                                 play.title,
                                                 metadata.track_mbid.as_deref().unwrap_or("none"),
                                                 metadata.album_mbid.as_deref().unwrap_or("none"),
-                                                metadata.artist_mbid.as_deref().unwrap_or("none")
+                                                metadata.artist_mbid.as_deref().unwrap_or("none"),
+                                                metadata.caa_id.map(|id| id.to_string()).as_deref().unwrap_or("none")
                                             );
                                         }
                                         Err(e) => {
