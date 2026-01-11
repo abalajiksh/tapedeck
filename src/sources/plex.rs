@@ -107,6 +107,8 @@ impl PlexTrack {
             mbid_release: None,
             mbid_release_group: None,
             mbid_recording: None,
+            caa_id: None, // Will be filled by MusicBrainz module
+            caa_release_mbid: None, // Will be filled by MusicBrainz module
             source_id,
             source_name: "Plex".to_string(),
         }
