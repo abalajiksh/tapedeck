@@ -165,7 +165,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     Ok(metadata) => {
                                         play.mbid_recording = metadata.track_mbid;
                                         play.mbid_release = metadata.album_mbid;
-                                        play.mbid_artist = metadata.artist_mbid.map(|id| vec![id]);
+                                        play.mbid_artist = metadata.artist_mbid.as_ref().map(|id| vec![id.clone()]);
                                         debug!("✓ Enriched now playing with MBIDs: {} - {}", play.artist, play.title);
                                     }
                                     Err(e) => {
@@ -197,7 +197,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         Ok(metadata) => {
                                             play.mbid_recording = metadata.track_mbid.clone();
                                             play.mbid_release = metadata.album_mbid.clone();
-                                            play.mbid_artist = metadata.artist_mbid.map(|id| vec![id]);
+                                            play.mbid_artist = metadata.artist_mbid.as_ref().map(|id| vec![id.clone()]);
                                             
                                             info!("✓ Enriched: {} - {} [recording: {}, release: {}, artist: {}]",
                                                 play.artist,
