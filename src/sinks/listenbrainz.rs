@@ -59,16 +59,20 @@ impl ListenBrainzSink {
         let mut has_mbid_data = false;
         let mut mbid_mapping = serde_json::Map::new();
 
+        // Recording MBID (track)
         if let Some(ref mbid) = play.mbid_recording {
             mbid_mapping.insert("recording_mbid".to_string(), json!(mbid));
+            mbid_mapping.insert("recording_name".to_string(), json!(play.title));
             has_mbid_data = true;
         }
 
+        // Release MBID (album)
         if let Some(ref mbid) = play.mbid_release {
             mbid_mapping.insert("release_mbid".to_string(), json!(mbid));
             has_mbid_data = true;
         }
 
+        // Artist MBIDs and artists array
         if let Some(ref mbids) = play.mbid_artist {
             if !mbids.is_empty() {
                 mbid_mapping.insert("artist_mbids".to_string(), json!(mbids));
@@ -95,7 +99,11 @@ impl ListenBrainzSink {
 
         // Only add mbid_mapping if we have at least one MBID
         if has_mbid_data {
+            debug!("Adding mbid_mapping: recording={:?}, release={:?}, artist={:?}",
+                play.mbid_recording, play.mbid_release, play.mbid_artist);
             track_meta.insert("mbid_mapping".to_string(), serde_json::Value::Object(mbid_mapping));
+        } else {
+            debug!("No MBIDs available for {} - {}", play.artist, play.title);
         }
 
         track_meta
@@ -103,7 +111,8 @@ impl ListenBrainzSink {
 
     /// Submit "now playing" status for a track
     pub async fn submit_now_playing(&self, play: &Play) -> Result<(), Box<dyn std::error::Error>> {
-        debug!("Submitting now playing: {} - {}", play.artist, play.title);
+        debug!("Submitting now playing: {} - {} (MBIDs: rec={:?}, rel={:?}, art={:?})",
+            play.artist, play.title, play.mbid_recording, play.mbid_release, play.mbid_artist);
 
         let track_meta = Self::build_track_metadata(play);
 
@@ -184,7 +193,8 @@ impl ScrobbleSink for ListenBrainzSink {
         info!("Submitting {} plays to ListenBrainz...", plays.len());
 
         let payload_items: Vec<serde_json::Value> = plays.iter().map(|play| {
-            debug!("Preparing ListenBrainz payload for: {} - {}", play.artist, play.title);
+            debug!("Preparing ListenBrainz payload for: {} - {} (MBIDs: rec={:?}, rel={:?}, art={:?})",
+                play.artist, play.title, play.mbid_recording, play.mbid_release, play.mbid_artist);
 
             let track_meta = Self::build_track_metadata(play);
 
