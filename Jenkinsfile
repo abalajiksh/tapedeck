@@ -1,6 +1,14 @@
 pipeline {
   agent any
 
+  parameters {
+    string(
+      name: 'COMMIT_ID',
+      defaultValue: 'main',
+      description: 'Git commit ID, branch name, or tag to build (default: main)'
+    )
+  }
+
   options {
     timestamps()
     disableConcurrentBuilds()
@@ -25,7 +33,14 @@ pipeline {
 
     stage('Checkout') {
       steps {
-        checkout scm
+        script {
+          echo "Building commit/branch: ${params.COMMIT_ID}"
+          checkout([
+            $class: 'GitSCM',
+            branches: [[name: "${params.COMMIT_ID}"]],
+            userRemoteConfigs: scm.userRemoteConfigs
+          ])
+        }
       }
     }
 
@@ -51,13 +66,26 @@ pipeline {
             returnStdout: true
           ).trim()
 
-          echo "Detected version: ${version}"
+          // Get short commit SHA for artifact naming
+          def commitSha = sh(
+            script: 'git rev-parse --short HEAD',
+            returnStdout: true
+          ).trim()
 
-          // Copy and archive
-          sh "cp target/release/tapedeck target/release/tapedeck-${version}"
-          archiveArtifacts artifacts: "target/release/tapedeck-${version}", fingerprint: true
+          echo "Detected version: ${version}"
+          echo "Commit SHA: ${commitSha}"
+
+          // Copy and archive with version and commit info
+          sh "cp target/release/tapedeck target/release/tapedeck-${version}-${commitSha}"
+          archiveArtifacts artifacts: "target/release/tapedeck-${version}-${commitSha}", fingerprint: true
         }
       }
+    }
+  }
+
+  post {
+    always {
+      echo "Build completed for commit: ${params.COMMIT_ID}"
     }
   }
 }
