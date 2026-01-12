@@ -130,7 +130,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    info!("🎵 Starting scrobble loop with MusicBrainz metadata enrichment...");
+    info!("🎵 Starting scrobble loop with prioritized MusicBrainz metadata enrichment...");
     
     // We fetch history for the last 24 hours to catch offline plays
     // SQLite handles deduplication
@@ -142,7 +142,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .unwrap()
             .as_secs();
 
-        // 1. Fetch from Sources and Enrich with MusicBrainz metadata
+        // Track if there are any active now playing sessions
+        let mut has_active_now_playing = false;
+
+        // 1. PRIORITY: Handle Now Playing and New Scrobbles with MusicBrainz enrichment
         for source in &mut sources {
             if source.name() == "Plex" {
                 if let Some(plex) = source.as_any_mut().downcast_mut::<PlexSource>() {
@@ -152,11 +155,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     
                     match plex.fetch_sessions_extended(Some(lookback_time)).await {
                         Ok(session_result) => {
-                            // A. Handle Now Playing (Stateless, immediate)
+                            // A. Handle Now Playing (Stateless, immediate) - ALWAYS with metadata
+                            if !session_result.now_playing.is_empty() {
+                                has_active_now_playing = true;
+                                info!("🎧 {} active now playing session(s) detected", session_result.now_playing.len());
+                            }
+
                             for plex_track in &session_result.now_playing {
                                 let mut play = plex_track.to_play("np");
                                 
-                                // Try to enrich with MusicBrainz metadata (non-blocking)
+                                // PRIORITY: Always fetch MusicBrainz metadata for now playing
+                                debug!("Fetching MusicBrainz metadata for now playing: {} - {}", play.artist, play.title);
                                 match mb_client.fetch_metadata(
                                     &plex_track.title,
                                     &plex_track.artist,
@@ -168,29 +177,39 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         play.mbid_artist = metadata.artist_mbid.as_ref().map(|id| vec![id.clone()]);
                                         play.caa_id = metadata.caa_id;
                                         play.caa_release_mbid = metadata.caa_release_mbid;
-                                        debug!("✓ Enriched now playing with MBIDs: {} - {}", play.artist, play.title);
+                                        info!("✓ Enriched now playing: {} - {} [recording: {}, release: {}, artist: {}]",
+                                            play.artist,
+                                            play.title,
+                                            metadata.track_mbid.as_deref().unwrap_or("none"),
+                                            metadata.album_mbid.as_deref().unwrap_or("none"),
+                                            metadata.artist_mbid.as_deref().unwrap_or("none")
+                                        );
                                     }
                                     Err(e) => {
-                                        debug!("Could not fetch MusicBrainz metadata for now playing: {}", e);
+                                        warn!("⚠ MusicBrainz lookup failed for now playing {} - {}: {}", 
+                                            play.artist, play.title, e);
                                     }
                                 }
                                 
                                 // Submit to sinks
                                 for sink in &sinks {
                                     if let Some(lb_sink) = sink.as_any().downcast_ref::<ListenBrainzSink>() {
-                                        let _ = lb_sink.submit_now_playing(&play).await;
+                                        if let Err(e) = lb_sink.submit_now_playing(&play).await {
+                                            error!("Failed to submit now playing to {}: {}", sink.name(), e);
+                                        }
                                     }
                                 }
                             }
 
-                            // B. Process Scrobble Candidates with MusicBrainz Enrichment
+                            // B. Process Scrobble Candidates - ALWAYS with MusicBrainz Enrichment
                             if !session_result.ready_to_scrobble.is_empty() {
-                                debug!("Processing {} potential scrobbles from Plex", session_result.ready_to_scrobble.len());
+                                info!("📀 Processing {} ready-to-scrobble track(s)", session_result.ready_to_scrobble.len());
                                 
                                 for plex_track in session_result.ready_to_scrobble {
                                     let mut play = plex_track.to_play(&format!("scrobble-{}", current_time));
                                     
-                                    // Enrich with MusicBrainz metadata before saving
+                                    // PRIORITY: Always fetch MusicBrainz metadata for scrobbles
+                                    debug!("Fetching MusicBrainz metadata for scrobble: {} - {}", play.artist, play.title);
                                     match mb_client.fetch_metadata(
                                         &plex_track.title,
                                         &plex_track.artist,
@@ -203,7 +222,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                             play.caa_id = metadata.caa_id;
                                             play.caa_release_mbid = metadata.caa_release_mbid.clone();
                                             
-                                            info!("✓ Enriched: {} - {} [recording: {}, release: {}, artist: {}, caa: {}]",
+                                            info!("✓ Enriched scrobble: {} - {} [recording: {}, release: {}, artist: {}, caa: {}]",
                                                 play.artist,
                                                 play.title,
                                                 metadata.track_mbid.as_deref().unwrap_or("none"),
@@ -213,7 +232,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                             );
                                         }
                                         Err(e) => {
-                                            warn!("⚠ MusicBrainz lookup failed for {} - {}: {}", 
+                                            warn!("⚠ MusicBrainz lookup failed for scrobble {} - {}: {}", 
                                                 play.artist, play.title, e);
                                             // Continue with basic metadata from Plex
                                         }
@@ -238,58 +257,62 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // TODO: Add generic handling for other sources if needed
         }
 
-        // 2. Process Pending Scrobbles from DB
-        match db.get_pending_scrobbles().await {
-            Ok(pending_plays) => {
-                if !pending_plays.is_empty() {
-                    info!("🚀 Processing {} pending scrobble(s)", pending_plays.len());
-                    
-                    for mut play in pending_plays {
-                        // Enrich with MusicBrainz if we don't have MBIDs yet (for old scrobbles)
-                        if play.mbid_recording.is_none() {
-                            debug!("Enriching pending scrobble: {} - {}", play.artist, play.title);
-                            match mb_client.fetch_metadata(
-                                &play.title,
-                                &play.artist,
-                                play.album.as_deref(),
-                            ).await {
-                                Ok(metadata) => {
-                                    play.mbid_recording = metadata.track_mbid;
-                                    play.mbid_release = metadata.album_mbid;
-                                    play.mbid_artist = metadata.artist_mbid.as_ref().map(|id| vec![id.clone()]);
-                                    play.caa_id = metadata.caa_id;
-                                    play.caa_release_mbid = metadata.caa_release_mbid;
-                                    debug!("✓ Enriched pending scrobble with MBIDs");
-                                }
-                                Err(e) => {
-                                    debug!("Could not enrich pending scrobble: {}", e);
+        // 2. DEFERRED: Process Pending Scrobbles ONLY when no active now playing
+        if !has_active_now_playing {
+            match db.get_pending_scrobbles().await {
+                Ok(pending_plays) => {
+                    if !pending_plays.is_empty() {
+                        info!("🔄 No active sessions - processing {} pending scrobble(s) from history", pending_plays.len());
+                        
+                        for mut play in pending_plays {
+                            // Enrich with MusicBrainz if we don't have MBIDs yet (for old scrobbles)
+                            if play.mbid_recording.is_none() {
+                                debug!("Enriching pending scrobble: {} - {}", play.artist, play.title);
+                                match mb_client.fetch_metadata(
+                                    &play.title,
+                                    &play.artist,
+                                    play.album.as_deref(),
+                                ).await {
+                                    Ok(metadata) => {
+                                        play.mbid_recording = metadata.track_mbid;
+                                        play.mbid_release = metadata.album_mbid;
+                                        play.mbid_artist = metadata.artist_mbid.as_ref().map(|id| vec![id.clone()]);
+                                        play.caa_id = metadata.caa_id;
+                                        play.caa_release_mbid = metadata.caa_release_mbid;
+                                        debug!("✓ Enriched pending scrobble with MBIDs");
+                                    }
+                                    Err(e) => {
+                                        debug!("Could not enrich pending scrobble: {}", e);
+                                    }
                                 }
                             }
-                        }
-                        
-                        let mut all_succeeded = true;
-                        
-                        for sink in &sinks {
-                            match sink.scrobble(&vec![play.clone()]).await {
-                                Ok(_) => debug!("Sent to {}", sink.name()),
-                                Err(e) => {
-                                    error!("Failed to send to {}: {}", sink.name(), e);
-                                    all_succeeded = false;
+                            
+                            let mut all_succeeded = true;
+                            
+                            for sink in &sinks {
+                                match sink.scrobble(&vec![play.clone()]).await {
+                                    Ok(_) => debug!("Sent to {}", sink.name()),
+                                    Err(e) => {
+                                        error!("Failed to send to {}: {}", sink.name(), e);
+                                        all_succeeded = false;
+                                    }
                                 }
                             }
-                        }
 
-                        if all_succeeded {
-                            if let Err(e) = db.mark_as_scrobbled(&play.source_id, &play.source_name).await {
-                                error!("Failed to mark as scrobbled: {}", e);
-                            } else {
-                                info!("✅ Synced: {} - {}", play.artist, play.title);
+                            if all_succeeded {
+                                if let Err(e) = db.mark_as_scrobbled(&play.source_id, &play.source_name).await {
+                                    error!("Failed to mark as scrobbled: {}", e);
+                                } else {
+                                    info!("✅ Synced: {} - {}", play.artist, play.title);
+                                }
                             }
                         }
                     }
                 }
+                Err(e) => error!("Failed to fetch pending scrobbles: {}", e),
             }
-            Err(e) => error!("Failed to fetch pending scrobbles: {}", e),
+        } else {
+            debug!("⏸ Skipping pending scrobbles processing - active now playing session detected");
         }
 
         // Clean up old session states (Plex-specific)
