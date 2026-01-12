@@ -307,7 +307,7 @@ impl MusicBrainzClient {
         self.rate_limiter.acquire().await;
 
         // Build search query
-        let query = format!(r#"recording:"{}" AND artist:"{}"", track_title, artist_name);
+        let query = format!(r#"recording:"{}" AND artist:"{}""#, track_title, artist_name);
 
         let url = format!(
             "{}/recording?query={}&fmt=json&limit=1&inc=releases+artist-credits",

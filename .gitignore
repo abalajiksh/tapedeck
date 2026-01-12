@@ -27,5 +27,5 @@ src/sinks/.DS_Store
 .idea/
 scrobbles.db
 tapedeck.db
-Cargo.lock
+
 *.lock
