@@ -63,8 +63,8 @@ while true; do
     break
   fi
 
-  # Process each listen
-  echo "$LISTENS" | while IFS= read -r listen; do
+  # Process each listen - FIXED: using process substitution instead of pipe
+  while IFS= read -r listen; do
     LISTENED_AT=$(echo "$listen" | jq -r '.listened_at')
     RECORDING_MSID=$(echo "$listen" | jq -r '.recording_msid')
     TRACK_NAME=$(echo "$listen" | jq -r '.track_metadata.track_name // "Unknown"')
@@ -93,7 +93,7 @@ while true; do
 
     # Rate limiting - be gentle on the API
     sleep 0.1
-  done
+  done < <(echo "$LISTENS")  # FIXED: Process substitution instead of pipe
 
   # Get the oldest timestamp from this batch for next iteration
   MAX_TS=$(echo "$RESPONSE" | jq -r '.payload.listens[-1].listened_at')
