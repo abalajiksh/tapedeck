@@ -172,17 +172,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     plex_track.album.as_deref(),
                                 ).await {
                                     Ok(metadata) => {
+                                        // Clone values for logging before moving them
+                                        let track_mbid_str = metadata.track_mbid.as_deref().unwrap_or("none").to_string();
+                                        let album_mbid_str = metadata.album_mbid.as_deref().unwrap_or("none").to_string();
+                                        let artist_mbid_str = metadata.artist_mbid.as_deref().unwrap_or("none").to_string();
+                                        
                                         play.mbid_recording = metadata.track_mbid;
                                         play.mbid_release = metadata.album_mbid;
                                         play.mbid_artist = metadata.artist_mbid.as_ref().map(|id| vec![id.clone()]);
                                         play.caa_id = metadata.caa_id;
                                         play.caa_release_mbid = metadata.caa_release_mbid;
+                                        
                                         info!("✓ Enriched now playing: {} - {} [recording: {}, release: {}, artist: {}]",
                                             play.artist,
                                             play.title,
-                                            metadata.track_mbid.as_deref().unwrap_or("none"),
-                                            metadata.album_mbid.as_deref().unwrap_or("none"),
-                                            metadata.artist_mbid.as_deref().unwrap_or("none")
+                                            track_mbid_str,
+                                            album_mbid_str,
+                                            artist_mbid_str
                                         );
                                     }
                                     Err(e) => {
@@ -216,19 +222,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         plex_track.album.as_deref(),
                                     ).await {
                                         Ok(metadata) => {
-                                            play.mbid_recording = metadata.track_mbid.clone();
-                                            play.mbid_release = metadata.album_mbid.clone();
+                                            // Clone values for logging before moving them
+                                            let track_mbid_str = metadata.track_mbid.as_deref().unwrap_or("none").to_string();
+                                            let album_mbid_str = metadata.album_mbid.as_deref().unwrap_or("none").to_string();
+                                            let artist_mbid_str = metadata.artist_mbid.as_deref().unwrap_or("none").to_string();
+                                            let caa_id_str = metadata.caa_id.map(|id| id.to_string()).unwrap_or_else(|| "none".to_string());
+                                            
+                                            play.mbid_recording = metadata.track_mbid;
+                                            play.mbid_release = metadata.album_mbid;
                                             play.mbid_artist = metadata.artist_mbid.as_ref().map(|id| vec![id.clone()]);
                                             play.caa_id = metadata.caa_id;
-                                            play.caa_release_mbid = metadata.caa_release_mbid.clone();
+                                            play.caa_release_mbid = metadata.caa_release_mbid;
                                             
                                             info!("✓ Enriched scrobble: {} - {} [recording: {}, release: {}, artist: {}, caa: {}]",
                                                 play.artist,
                                                 play.title,
-                                                metadata.track_mbid.as_deref().unwrap_or("none"),
-                                                metadata.album_mbid.as_deref().unwrap_or("none"),
-                                                metadata.artist_mbid.as_deref().unwrap_or("none"),
-                                                metadata.caa_id.map(|id| id.to_string()).as_deref().unwrap_or("none")
+                                                track_mbid_str,
+                                                album_mbid_str,
+                                                artist_mbid_str,
+                                                caa_id_str
                                             );
                                         }
                                         Err(e) => {
