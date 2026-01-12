@@ -503,7 +503,9 @@ struct MBRecording {
     title: String,
     #[serde(rename = "artist-credit")]
     artist_credit: Vec<MBArtistCredit>,
+    #[serde(default)]
     releases: Vec<MBRelease>,
+    #[serde(default)]
     tags: Vec<MBTag>,
 }
 
@@ -523,13 +525,17 @@ struct MBArtist {
 struct MBRelease {
     id: String,
     title: String,
+    #[serde(default)]
     date: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 struct MBTag {
     name: String,
+    #[serde(default)]
+    count: Option<i32>,
 }
+
 
 #[derive(Debug, Deserialize)]
 struct CAAResponse {
