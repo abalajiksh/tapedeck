@@ -307,7 +307,7 @@ impl MusicBrainzClient {
         self.rate_limiter.acquire().await;
 
         // Build search query
-        let query = format!(r#"recording:"{}" AND artist:"{}""#, track_title, artist_name);
+        let query = format!(r#"recording:"{}" AND artist:"{}""У, track_title, artist_name);
 
         let url = format!(
             "{}/recording?query={}&fmt=json&limit=1&inc=releases+artist-credits",
@@ -361,6 +361,7 @@ impl MusicBrainzClient {
     }
 
     /// Fetch Cover Art Archive info for a release
+    /// Returns (caa_id, release_mbid) - extracts just the MBID from the URL
     async fn fetch_cover_art_info(&self, release_mbid: &str) -> Result<(Option<i64>, Option<String>)> {
         // Rate limiting
         self.rate_limiter.acquire().await;
@@ -389,9 +390,27 @@ impl MusicBrainzClient {
             .or_else(|| caa_response.images.first());
 
         if let Some(image) = front_image {
-            Ok((Some(image.id), Some(caa_response.release.clone())))
+            // Extract MBID from URL if needed
+            // CAA returns "https://musicbrainz.org/release/{mbid}" but we only want the MBID
+            let release_mbid_clean = Self::extract_mbid_from_url(&caa_response.release);
+            Ok((Some(image.id), Some(release_mbid_clean)))
         } else {
             Ok((None, None))
+        }
+    }
+
+    /// Extract MBID from a MusicBrainz URL or return as-is if already just an MBID
+    fn extract_mbid_from_url(url_or_mbid: &str) -> String {
+        // If it's a URL like "https://musicbrainz.org/release/{mbid}", extract the MBID
+        if url_or_mbid.starts_with("http://") || url_or_mbid.starts_with("https://") {
+            url_or_mbid
+                .split('/')
+                .last()
+                .unwrap_or(url_or_mbid)
+                .to_string()
+        } else {
+            // Already just an MBID
+            url_or_mbid.to_string()
         }
     }
 
