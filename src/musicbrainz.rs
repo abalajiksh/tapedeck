@@ -307,7 +307,7 @@ impl MusicBrainzClient {
         self.rate_limiter.acquire().await;
 
         // Build search query
-        let query = format!(r#"recording:"{}" AND artist:"{}""У, track_title, artist_name);
+        let query = format!(r#"recording:"{}" AND artist:"{}"", track_title, artist_name);
 
         let url = format!(
             "{}/recording?query={}&fmt=json&limit=1&inc=releases+artist-credits",
@@ -395,8 +395,7 @@ impl MusicBrainzClient {
             let release_mbid_clean = Self::extract_mbid_from_url(&caa_response.release);
             Ok((Some(image.id), Some(release_mbid_clean)))
         } else {
-            Ok((None, None))
-        }
+            Ok((None, None))}
     }
 
     /// Extract MBID from a MusicBrainz URL or return as-is if already just an MBID
