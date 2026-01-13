@@ -1,6 +1,14 @@
 pipeline {
   agent any
 
+  tools {
+    // Reference the SonarQube Scanner installed via Jenkins plugin
+    // Make sure this matches the name in Jenkins Global Tool Configuration
+    // Default name is usually 'SonarQube Scanner' but verify in:
+    // Manage Jenkins → Global Tool Configuration → SonarQube Scanner
+    'hudson.plugins.sonar.SonarRunnerInstallation' 'SonarQube Scanner'
+  }
+
   parameters {
     string(
       name: 'COMMIT_ID',
@@ -28,13 +36,12 @@ pipeline {
     PATH = "$HOME/.cargo/bin:$PATH"
     DEPLOY_HOST = credentials('tapedeck-lxc-ip')
     DEPLOY_DIR = credentials('tapedeck-lxc-dir')
-    DEPLOY_CRED = credentials('tapedeck-lxc-cred')
+    DEPLOY_USER = credentials('tapedeck-deploy-user')
     
     // SonarQube configuration
     SONAR_PROJECT_KEY = 'tapedeck'
     SONAR_PROJECT_NAME = 'Tapedeck'
     SONAR_SOURCES = 'src'
-    SONARQUBE_URL = "${env.SONARQUBE_LXC ?: 'http://localhost:9000'}"
   }
 
   stages {
@@ -77,28 +84,24 @@ pipeline {
       steps {
         script {
           try {
-            withCredentials([string(credentialsId: 'sonarqube-token', variable: 'SONAR_TOKEN')]) {
-              sh '''
-                if ! command -v sonar-scanner >/dev/null 2>&1; then
-                  echo "⚠ sonar-scanner not found, skipping SonarQube analysis"
-                  exit 0
-                fi
-                
-                echo "=========================================="
-                echo "Running SonarQube Analysis"
-                echo "=========================================="
-                
+            // Use withSonarQubeEnv to leverage Jenkins SonarQube plugin
+            // 'SonarQube' should match the server name in Jenkins System Configuration
+            withSonarQubeEnv('SonarQube') {
+              echo "=========================================="
+              echo "Running SonarQube Analysis"
+              echo "=========================================="
+              
+              sh """
                 sonar-scanner \
                   -Dsonar.projectKey=${SONAR_PROJECT_KEY} \
                   -Dsonar.projectName="${SONAR_PROJECT_NAME}" \
-                  -Dsonar.sources=${SONAR_SOURCES} \
-                  -Dsonar.host.url=${SONARQUBE_URL} \
-                  -Dsonar.login=${SONAR_TOKEN}
-              '''
+                  -Dsonar.sources=${SONAR_SOURCES}
+              """
             }
           } catch (Exception e) {
-            echo "⚠ SonarQube credential not found (sonarqube-token), skipping analysis"
-            echo "  To enable: Add 'sonarqube-token' credential in Jenkins"
+            echo "⚠ SonarQube analysis failed: ${e.message}"
+            echo "  Verify: SonarQube server configured in Jenkins System settings"
+            echo "  Verify: SonarQube Scanner tool installed in Global Tool Configuration"
           }
         }
       }
@@ -107,35 +110,29 @@ pipeline {
     stage('Deploy') {
       steps {
         script {
-          withCredentials([sshUserPrivateKey(credentialsId: 'tapedeck-ssh-key', keyFileVariable: 'SSH_KEY', usernameVariable: 'SSH_USER')]) {
+          // Use sshagent instead of manual key handling to avoid libcrypto issues
+          sshagent(credentials: ['tapedeck-ssh-key']) {
             sh """
-              # Set proper permissions on the key file
-              chmod 600 \${SSH_KEY}
+              echo "=========================================="
+              echo "Deploying to ${DEPLOY_HOST}"
+              echo "=========================================="
               
-              # Check key format and convert if needed
-              if head -n 1 \${SSH_KEY} | grep -q 'BEGIN OPENSSH PRIVATE KEY'; then
-                echo "Key is in OpenSSH format, converting to PEM..."
-                ssh-keygen -p -m PEM -f \${SSH_KEY} -N '' || true
-              fi
-              
-              # Test SSH connection first
+              # Test SSH connection
               echo "Testing SSH connection..."
-              ssh -i \${SSH_KEY} -o StrictHostKeyChecking=no -o BatchMode=yes \
-                \${DEPLOY_CRED_USR}@\${DEPLOY_HOST} 'echo "SSH connection successful"'
+              ssh -o StrictHostKeyChecking=no ${DEPLOY_USER}@${DEPLOY_HOST} 'echo "SSH connection successful"'
               
               # Copy binary to target server
               echo "Copying binary..."
-              scp -i \${SSH_KEY} -o StrictHostKeyChecking=no \
-                target/release/tapedeck \
-                \${DEPLOY_CRED_USR}@\${DEPLOY_HOST}:\${DEPLOY_DIR}/
+              scp -o StrictHostKeyChecking=no target/release/tapedeck ${DEPLOY_USER}@${DEPLOY_HOST}:${DEPLOY_DIR}/
               
               # Make executable and restart service
               echo "Restarting service..."
-              ssh -i \${SSH_KEY} -o StrictHostKeyChecking=no \
-                \${DEPLOY_CRED_USR}@\${DEPLOY_HOST} \
-                "chmod +x \${DEPLOY_DIR}/tapedeck && \
+              ssh -o StrictHostKeyChecking=no ${DEPLOY_USER}@${DEPLOY_HOST} \
+                "chmod +x ${DEPLOY_DIR}/tapedeck && \
                  systemctl restart tapedeck && \
                  systemctl status tapedeck --no-pager"
+              
+              echo "Deployment completed successfully!"
             """
           }
         }
@@ -174,10 +171,10 @@ pipeline {
       echo "Build completed for commit: ${params.COMMIT_ID}"
     }
     success {
-      echo 'Deployment completed successfully!'
+      echo 'Build and deployment completed successfully!'
     }
     failure {
-      echo 'Deployment failed!'
+      echo 'Build or deployment failed!'
     }
   }
 }
