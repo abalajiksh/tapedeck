@@ -4,6 +4,8 @@ mod sources;
 mod sinks;
 mod db;
 mod musicbrainz;
+mod logging;
+mod admin_api;
 
 use std::time::Duration;
 use tokio::time::sleep;
@@ -14,20 +16,58 @@ use crate::sinks::ListenBrainzSink;
 use crate::config::Config;
 use crate::db::Database;
 use crate::musicbrainz::MusicBrainzClient;
-use log::{info, error, debug, warn};
+use tracing::{info, error, debug, warn};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Load .env file first
     dotenv::dotenv().ok();
 
-    // Initialize logger. Default to "info" if RUST_LOG isn't set.
-    if std::env::var("RUST_LOG").is_err() {
-        std::env::set_var("RUST_LOG", "info");
-    }
-    env_logger::init();
+    // Initialize logging with file output and runtime control
+    let enable_file_logging = std::env::var("ENABLE_FILE_LOGGING")
+        .unwrap_or_else(|_| "true".to_string())
+        .parse::<bool>()
+        .unwrap_or(true);
+    
+    let enable_console = std::env::var("ENABLE_CONSOLE_LOGGING")
+        .unwrap_or_else(|_| "true".to_string())
+        .parse::<bool>()
+        .unwrap_or(true);
+    
+    let log_dir = std::env::var("LOG_DIR").ok();
+    
+    let log_handle = logging::init_logging(
+        log_dir.as_deref(),
+        enable_file_logging,
+        enable_console,
+    )?;
 
     info!("🚀 Tapedeck Scrobbler Service Started");
+    
+    // Start admin API server in background
+    let admin_port = std::env::var("ADMIN_PORT")
+        .unwrap_or_else(|_| "8080".to_string())
+        .parse::<u16>()
+        .unwrap_or(8080);
+    
+    let admin_router = admin_api::create_admin_router(log_handle.clone());
+    
+    tokio::spawn(async move {
+        let addr = format!("0.0.0.0:{}", admin_port);
+        info!("🔧 Starting admin API server on {}", addr);
+        
+        let listener = match tokio::net::TcpListener::bind(&addr).await {
+            Ok(l) => l,
+            Err(e) => {
+                error!("Failed to bind admin API server: {}", e);
+                return;
+            }
+        };
+        
+        if let Err(e) = axum::serve(listener, admin_router).await {
+            error!("Admin API server error: {}", e);
+        }
+    });
 
     // 1. Load Configuration
     let config = Config::from_env();
