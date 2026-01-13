@@ -23,7 +23,7 @@ pipeline {
     PATH = "$HOME/.cargo/bin:$PATH"
     DEPLOY_HOST = credentials('tapedeck-lxc-ip')
     DEPLOY_DIR = credentials('tapedeck-lxc-dir')
-    DEPLOY_USER = credentials('tapedeck-lxc-user')
+    DEPLOY_CRED = credentials('tapedeck-lxc-cred')
   }
 
   stages {
@@ -66,10 +66,10 @@ pipeline {
             sh """
               scp -o StrictHostKeyChecking=no \
                 target/release/tapedeck \
-                \${DEPLOY_USER}@\${DEPLOY_HOST}:\${DEPLOY_DIR}/
+                \${DEPLOY_CRED_USR}@\${DEPLOY_HOST}:\${DEPLOY_DIR}/
               
               ssh -o StrictHostKeyChecking=no \
-                \${DEPLOY_USER}@\${DEPLOY_HOST} \
+                \${DEPLOY_CRED_USR}@\${DEPLOY_HOST} \
                 "chmod +x \${DEPLOY_DIR}/tapedeck && \
                  systemctl restart tapedeck"
             """
