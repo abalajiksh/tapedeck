@@ -112,27 +112,23 @@ pipeline {
               echo "Deploying to \$DEPLOY_HOST"
               echo "=========================================="
               
-              echo "Debug: Checking Environment"
-              echo "PATH is: \$PATH"
-              echo "sshpass location: \$(command -v sshpass)"
-              sshpass -V || echo "sshpass version check failed"
-              
               # Define common SSH options
-              # StrictHostKeyChecking=no is used to avoid interactive prompt for new hosts
               SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
               
               # Test SSH connection
               echo "Testing SSH connection to \$LXC_USER@\$DEPLOY_HOST..."
               sshpass -p "\$LXC_PASS" ssh \$SSH_OPTS "\$LXC_USER@\$DEPLOY_HOST" 'echo "SSH connection successful"'
               
-              # Copy binary to target server
-              echo "Copying binary..."
-              sshpass -p "\$LXC_PASS" scp \$SSH_OPTS target/release/tapedeck "\$LXC_USER@\$DEPLOY_HOST:\$DEPLOY_DIR/"
+              # Copy binary to /tmp first (avoids permission/busy file issues)
+              echo "Copying binary to /tmp..."
+              sshpass -p "\$LXC_PASS" scp \$SSH_OPTS target/release/tapedeck "\$LXC_USER@\$DEPLOY_HOST:/tmp/tapedeck_new"
               
-              # Make executable and restart service
-              echo "Restarting service..."
+              # Move to destination, set ownership, and restart service
+              echo "Installing binary and restarting service..."
               sshpass -p "\$LXC_PASS" ssh \$SSH_OPTS "\$LXC_USER@\$DEPLOY_HOST" \
-                "chmod +x \$DEPLOY_DIR/tapedeck && \
+                "mv /tmp/tapedeck_new \$DEPLOY_DIR/tapedeck && \
+                 chown tapedeck:tapedeck \$DEPLOY_DIR/tapedeck && \
+                 chmod +x \$DEPLOY_DIR/tapedeck && \
                  systemctl restart tapedeck && \
                  systemctl status tapedeck --no-pager"
               
