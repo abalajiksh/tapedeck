@@ -112,12 +112,10 @@ pipeline {
               echo "Deploying to \$DEPLOY_HOST"
               echo "=========================================="
               
-              # Check for sshpass
-              if ! command -v sshpass &> /dev/null; then
-                  echo "Error: sshpass is not installed on this Jenkins agent."
-                  echo "Please install it (e.g., apt-get install sshpass) to use password auth."
-                  exit 1
-              fi
+              echo "Debug: Checking Environment"
+              echo "PATH is: \$PATH"
+              echo "sshpass location: \$(command -v sshpass)"
+              sshpass -V || echo "sshpass version check failed"
               
               # Define common SSH options
               # StrictHostKeyChecking=no is used to avoid interactive prompt for new hosts
