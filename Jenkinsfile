@@ -28,13 +28,11 @@ pipeline {
     PATH = "$HOME/.cargo/bin:$PATH"
     DEPLOY_HOST = credentials('tapedeck-lxc-ip')
     DEPLOY_DIR = credentials('tapedeck-lxc-dir')
-    DEPLOY_USER = credentials('tapedeck-deploy-user')
     
     // SonarQube configuration
     SONAR_PROJECT_KEY = 'tapedeck'
     SONAR_PROJECT_NAME = 'Tapedeck'
     SONAR_SOURCES = 'src'
-    // Default URL if not provided
     SONARQUBE_URL = "${env.SONARQUBE_URL ?: 'http://192.168.178.101:9000'}"
   }
 
@@ -85,10 +83,6 @@ pipeline {
               echo "Running SonarQube Analysis"
               echo "=========================================="
               
-              // Debug: Check if token is loaded (print length only)
-              sh 'echo "Token loaded. Length: ${#SONAR_TOKEN}"'
-
-              // Using -Dsonar.login instead of -Dsonar.token for broader compatibility
               sh """
                 "${scannerHome}/bin/sonar-scanner" \
                   -Dsonar.projectKey=${SONAR_PROJECT_KEY} \
@@ -109,28 +103,40 @@ pipeline {
     stage('Deploy') {
       steps {
         script {
-          withCredentials([sshUserPrivateKey(credentialsId: 'tapedeck-ssh-key', keyFileVariable: 'SSH_KEY')]) {
+          // Use username/password credential for simpler auth
+          withCredentials([usernamePassword(credentialsId: 'tapedeck-lxc-auth', usernameVariable: 'LXC_USER', passwordVariable: 'LXC_PASS')]) {
             sh """
-              echo "=========================================="
-              echo "DEBUG: SSH Key Validation"
-              echo "=========================================="
-              
-              # Check key file format (headers only) to diagnose libcrypto error
-              echo "Key file header:"
-              head -n 1 "\$SSH_KEY"
-              echo "Key file footer:"
-              tail -n 1 "\$SSH_KEY"
-              
-              chmod 600 "\$SSH_KEY"
-              
               echo "=========================================="
               echo "Deploying to \$DEPLOY_HOST"
               echo "=========================================="
               
-              ssh -v -i "\$SSH_KEY" -o StrictHostKeyChecking=no "\$DEPLOY_USER@\$DEPLOY_HOST" \
+              # Check for sshpass
+              if ! command -v sshpass &> /dev/null; then
+                  echo "Error: sshpass is not installed on this Jenkins agent."
+                  echo "Please install it (e.g., apt-get install sshpass) to use password auth."
+                  exit 1
+              fi
+              
+              # Define common SSH options
+              # StrictHostKeyChecking=no is used to avoid interactive prompt for new hosts
+              SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
+              
+              # Test SSH connection
+              echo "Testing SSH connection to \$LXC_USER@\$DEPLOY_HOST..."
+              sshpass -p "\$LXC_PASS" ssh \$SSH_OPTS "\$LXC_USER@\$DEPLOY_HOST" 'echo "SSH connection successful"'
+              
+              # Copy binary to target server
+              echo "Copying binary..."
+              sshpass -p "\$LXC_PASS" scp \$SSH_OPTS target/release/tapedeck "\$LXC_USER@\$DEPLOY_HOST:\$DEPLOY_DIR/"
+              
+              # Make executable and restart service
+              echo "Restarting service..."
+              sshpass -p "\$LXC_PASS" ssh \$SSH_OPTS "\$LXC_USER@\$DEPLOY_HOST" \
                 "chmod +x \$DEPLOY_DIR/tapedeck && \
                  systemctl restart tapedeck && \
                  systemctl status tapedeck --no-pager"
+              
+              echo "Deployment completed successfully!"
             """
           }
         }
