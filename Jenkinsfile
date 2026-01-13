@@ -80,17 +80,21 @@ pipeline {
             def scannerHome = tool name: 'SonarQube Scanner', type: 'hudson.plugins.sonar.SonarRunnerInstallation'
             
             withSonarQubeEnv('SonarQube') {
-              echo "=========================================="
-              echo "Running SonarQube Analysis"
-              echo "=========================================="
-              
-              // Use absolute path to scanner executable
-              sh """
-                "${scannerHome}/bin/sonar-scanner" \
-                  -Dsonar.projectKey=${SONAR_PROJECT_KEY} \
-                  -Dsonar.projectName="${SONAR_PROJECT_NAME}" \
-                  -Dsonar.sources=${SONAR_SOURCES}
-              """
+              // Explicitly inject the token again to ensure authentication works
+              withCredentials([string(credentialsId: 'sonarqube-token', variable: 'SONAR_TOKEN')]) {
+                echo "=========================================="
+                echo "Running SonarQube Analysis"
+                echo "=========================================="
+                
+                // Use absolute path and explicit token
+                sh """
+                  "${scannerHome}/bin/sonar-scanner" \
+                    -Dsonar.projectKey=${SONAR_PROJECT_KEY} \
+                    -Dsonar.projectName="${SONAR_PROJECT_NAME}" \
+                    -Dsonar.sources=${SONAR_SOURCES} \
+                    -Dsonar.token=\$SONAR_TOKEN
+                """
+              }
             }
           } catch (Exception e) {
             echo "⚠ SonarQube analysis failed: ${e.message}"
