@@ -1,14 +1,6 @@
 pipeline {
   agent any
 
-  tools {
-    // Reference the SonarQube Scanner installed via Jenkins plugin
-    // Make sure this matches the name in Jenkins Global Tool Configuration
-    // Default name is usually 'SonarQube Scanner' but verify in:
-    // Manage Jenkins → Global Tool Configuration → SonarQube Scanner
-    'hudson.plugins.sonar.SonarRunnerInstallation' 'SonarQube Scanner'
-  }
-
   parameters {
     string(
       name: 'COMMIT_ID',
@@ -84,15 +76,17 @@ pipeline {
       steps {
         script {
           try {
-            // Use withSonarQubeEnv to leverage Jenkins SonarQube plugin
-            // 'SonarQube' should match the server name in Jenkins System Configuration
+            // Retrieve the scanner tool path explicitly
+            def scannerHome = tool name: 'SonarQube Scanner', type: 'hudson.plugins.sonar.SonarRunnerInstallation'
+            
             withSonarQubeEnv('SonarQube') {
               echo "=========================================="
               echo "Running SonarQube Analysis"
               echo "=========================================="
               
+              // Use absolute path to scanner executable
               sh """
-                sonar-scanner \
+                "${scannerHome}/bin/sonar-scanner" \
                   -Dsonar.projectKey=${SONAR_PROJECT_KEY} \
                   -Dsonar.projectName="${SONAR_PROJECT_NAME}" \
                   -Dsonar.sources=${SONAR_SOURCES}
@@ -110,25 +104,25 @@ pipeline {
     stage('Deploy') {
       steps {
         script {
-          // Use sshagent instead of manual key handling to avoid libcrypto issues
           sshagent(credentials: ['tapedeck-ssh-key']) {
+            // Use shell environment variables (prefixed with $) instead of Groovy interpolation
             sh """
               echo "=========================================="
-              echo "Deploying to ${DEPLOY_HOST}"
+              echo "Deploying to \$DEPLOY_HOST"
               echo "=========================================="
               
               # Test SSH connection
-              echo "Testing SSH connection..."
-              ssh -o StrictHostKeyChecking=no ${DEPLOY_USER}@${DEPLOY_HOST} 'echo "SSH connection successful"'
+              echo "Testing SSH connection to \$DEPLOY_USER@\$DEPLOY_HOST..."
+              ssh -o StrictHostKeyChecking=no "\$DEPLOY_USER@\$DEPLOY_HOST" 'echo "SSH connection successful"'
               
               # Copy binary to target server
               echo "Copying binary..."
-              scp -o StrictHostKeyChecking=no target/release/tapedeck ${DEPLOY_USER}@${DEPLOY_HOST}:${DEPLOY_DIR}/
+              scp -o StrictHostKeyChecking=no target/release/tapedeck "\$DEPLOY_USER@\$DEPLOY_HOST:\$DEPLOY_DIR/"
               
               # Make executable and restart service
               echo "Restarting service..."
-              ssh -o StrictHostKeyChecking=no ${DEPLOY_USER}@${DEPLOY_HOST} \
-                "chmod +x ${DEPLOY_DIR}/tapedeck && \
+              ssh -o StrictHostKeyChecking=no "\$DEPLOY_USER@\$DEPLOY_HOST" \
+                "chmod +x \$DEPLOY_DIR/tapedeck && \
                  systemctl restart tapedeck && \
                  systemctl status tapedeck --no-pager"
               
@@ -142,14 +136,11 @@ pipeline {
     stage('Archive') {
       steps {
         script {
-          // cargo pkgid returns a URL-like string ending in #name:version
-          // We use 'cut' to extract just the version part after the last colon
           def version = sh(
             script: "cargo pkgid | cut -d# -f2 | cut -d@ -f2",
             returnStdout: true
           ).trim()
 
-          // Get short commit SHA for artifact naming
           def commitSha = sh(
             script: 'git rev-parse --short HEAD',
             returnStdout: true
@@ -158,7 +149,6 @@ pipeline {
           echo "Detected version: ${version}"
           echo "Commit SHA: ${commitSha}"
 
-          // Copy and archive with version and commit info
           sh "cp target/release/tapedeck target/release/tapedeck-${version}-${commitSha}"
           archiveArtifacts artifacts: "target/release/tapedeck-${version}-${commitSha}", fingerprint: true
         }
