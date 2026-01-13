@@ -34,7 +34,7 @@ pipeline {
     SONAR_PROJECT_KEY = 'tapedeck'
     SONAR_PROJECT_NAME = 'Tapedeck'
     SONAR_SOURCES = 'src'
-    SONARQUBE_URL = "${env.SONARQUBE-LXC ?: 'http://localhost:9000'}"
+    SONARQUBE_URL = "${env.SONARQUBE_LXC ?: 'http://localhost:9000'}"
   }
 
   stages {
