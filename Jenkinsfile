@@ -62,13 +62,18 @@ pipeline {
     stage('Deploy') {
       steps {
         script {
-          sshagent(credentials: ['tapedeck-ssh-key']) {
+          withCredentials([sshUserPrivateKey(credentialsId: 'tapedeck-ssh-key', keyFileVariable: 'SSH_KEY')]) {
             sh """
-              scp -o StrictHostKeyChecking=no \
+              # Set proper permissions on the key file
+              chmod 600 \${SSH_KEY}
+              
+              # Copy binary to target server
+              scp -i \${SSH_KEY} -o StrictHostKeyChecking=no \
                 target/release/tapedeck \
                 \${DEPLOY_CRED_USR}@\${DEPLOY_HOST}:\${DEPLOY_DIR}/
               
-              ssh -o StrictHostKeyChecking=no \
+              # Make executable and restart service
+              ssh -i \${SSH_KEY} -o StrictHostKeyChecking=no \
                 \${DEPLOY_CRED_USR}@\${DEPLOY_HOST} \
                 "chmod +x \${DEPLOY_DIR}/tapedeck && \
                  systemctl restart tapedeck"
