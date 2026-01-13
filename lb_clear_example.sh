@@ -4,6 +4,9 @@
 LB_SERVER="https://your-listenbrainz-server.com"  # Change to your server URL
 USER_TOKEN="your-user-token-here"                  # Get from /settings/
 USERNAME="username"
+# This will not delete the listens, it will set up a queue to delete them, to actually delete the listens
+# you have to run this at project root "./develop.sh manage delete_pending_listens" of the listenbrainz
+# server that you are hosting somewhere.
 
 # Colors for output
 RED='\033[0;31m'
