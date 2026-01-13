@@ -17,6 +17,8 @@ pipeline {
   options {
     timestamps()
     disableConcurrentBuilds()
+    // Keep only the last 10 builds to save space
+    buildDiscarder(logRotator(numToKeepStr: '10'))
   }
 
   triggers {
