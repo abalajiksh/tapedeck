@@ -1,0 +1,94 @@
+[Unit]
+Description=Tapedeck Music Scrobbler Service
+Documentation=https://github.com/abalajiksh/tapedeck
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=tapedeck
+Group=tapedeck
+Restart=on-failure
+RestartSec=10s
+
+# Working directory
+WorkingDirectory=/var/tapedeck
+
+# Binary location
+ExecStart=/var/tapedeck/tapedeck
+
+# Environment file (optional - can override with inline env vars below)
+EnvironmentFile=-/etc/tapedeck/tapedeck.env
+
+# Logging Configuration
+Environment="RUST_LOG=info"
+Environment="ENABLE_FILE_LOGGING=true"
+Environment="ENABLE_CONSOLE_LOGGING=true"
+Environment="LOG_DIR=/var/log/tapedeck"
+
+# Admin API Configuration
+Environment="ADMIN_PORT=8080"
+
+# Database Configuration
+Environment="DATABASE_URL=sqlite:/var/tapedeck/data/scrobbles.db?mode=rwc"
+
+# Plex Configuration
+Environment="PLEX_ENABLED=true"
+Environment="PLEX_URL=http://localhost:32400"
+Environment="PLEX_TOKEN=your-plex-token-here"
+
+# Plex Filters (optional)
+# Environment="PLEX_USERS_ALLOW=user1,user2"
+# Environment="PLEX_USERS_BLOCK=guest"
+# Environment="PLEX_DEVICES_ALLOW="
+# Environment="PLEX_DEVICES_BLOCK="
+# Environment="PLEX_LIBRARIES_ALLOW=Music"
+# Environment="PLEX_LIBRARIES_BLOCK="
+
+# ListenBrainz Configuration
+Environment="LISTENBRAINZ_ENABLED=true"
+Environment="LISTENBRAINZ_BASE_URL=https://api.listenbrainz.org"
+Environment="LISTENBRAINZ_TOKEN=your-listenbrainz-token-here"
+
+# Last.fm Configuration (optional)
+Environment="LASTFM_ENABLED=false"
+# Environment="LASTFM_API_KEY=your-lastfm-api-key"
+# Environment="LASTFM_SECRET=your-lastfm-secret"
+# Environment="LASTFM_SESSION_KEY=your-lastfm-session-key"
+
+# MusicBrainz Configuration
+Environment="MUSICBRAINZ_USER_AGENT=Tapedeck/0.3.13 (https://github.com/abalajiksh/tapedeck)"
+Environment="MUSICBRAINZ_RATE_LIMIT=1"
+Environment="MUSICBRAINZ_ENABLE_POSTGRES=false"
+# Environment="MUSICBRAINZ_POSTGRES_URL=postgresql://user:pass@localhost/musicbrainz"
+Environment="MUSICBRAINZ_SQLITE_PATH=/var/tapedeck/data/musicbrainz_cache.db"
+
+# Security: Sandboxing and Hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/tapedeck/data /var/log/tapedeck
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictNamespaces=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+
+# Resource Limits
+LimitNOFILE=65535
+MemoryMax=512M
+CPUQuota=100%
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=tapedeck
+
+[Install]
+WantedBy=multi-user.target
