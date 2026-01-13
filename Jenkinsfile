@@ -123,13 +123,14 @@ pipeline {
               echo "Copying binary to /tmp..."
               sshpass -p "\$LXC_PASS" scp \$SSH_OPTS target/release/tapedeck "\$LXC_USER@\$DEPLOY_HOST:/tmp/tapedeck_new"
               
-              # Move to destination, set ownership, and restart service
-              echo "Installing binary and restarting service..."
+              # Stop service, move binary, restore ownership, and start service
+              echo "Updating binary and restarting service..."
               sshpass -p "\$LXC_PASS" ssh \$SSH_OPTS "\$LXC_USER@\$DEPLOY_HOST" \
-                "mv /tmp/tapedeck_new \$DEPLOY_DIR/tapedeck && \
+                "systemctl stop tapedeck && \
+                 mv /tmp/tapedeck_new \$DEPLOY_DIR/tapedeck && \
                  chown tapedeck:tapedeck \$DEPLOY_DIR/tapedeck && \
                  chmod +x \$DEPLOY_DIR/tapedeck && \
-                 systemctl restart tapedeck && \
+                 systemctl start tapedeck && \
                  systemctl status tapedeck --no-pager"
               
               echo "Deployment completed successfully!"
