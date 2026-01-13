@@ -7,6 +7,11 @@ pipeline {
       defaultValue: 'main',
       description: 'Git commit ID, branch name, or tag to build (default: main)'
     )
+    booleanParam(
+      name: 'SKIP_SONARQUBE',
+      defaultValue: false,
+      description: 'Skip SonarQube analysis'
+    )
   }
 
   options {
@@ -24,6 +29,12 @@ pipeline {
     DEPLOY_HOST = credentials('tapedeck-lxc-ip')
     DEPLOY_DIR = credentials('tapedeck-lxc-dir')
     DEPLOY_CRED = credentials('tapedeck-lxc-cred')
+    
+    // SonarQube configuration
+    SONAR_PROJECT_KEY = 'tapedeck'
+    SONAR_PROJECT_NAME = 'Tapedeck'
+    SONAR_SOURCES = 'src'
+    SONARQUBE_URL = "${env.SONARQUBE_URL ?: 'http://localhost:9000'}"
   }
 
   stages {
@@ -56,6 +67,40 @@ pipeline {
     stage('Release') {
       steps {
         sh 'cargo build --release'
+      }
+    }
+
+    stage('SonarQube Analysis') {
+      when {
+        expression { return !params.SKIP_SONARQUBE }
+      }
+      steps {
+        script {
+          try {
+            withCredentials([string(credentialsId: 'sonarqube-token', variable: 'SONAR_TOKEN')]) {
+              sh '''
+                if ! command -v sonar-scanner >/dev/null 2>&1; then
+                  echo "⚠ sonar-scanner not found, skipping SonarQube analysis"
+                  exit 0
+                fi
+                
+                echo "=========================================="
+                echo "Running SonarQube Analysis"
+                echo "=========================================="
+                
+                sonar-scanner \
+                  -Dsonar.projectKey=${SONAR_PROJECT_KEY} \
+                  -Dsonar.projectName="${SONAR_PROJECT_NAME}" \
+                  -Dsonar.sources=${SONAR_SOURCES} \
+                  -Dsonar.host.url=${SONARQUBE_URL} \
+                  -Dsonar.login=${SONAR_TOKEN}
+              '''
+            }
+          } catch (Exception e) {
+            echo "⚠ SonarQube credential not found (sonarqube-token), skipping analysis"
+            echo "  To enable: Add 'sonarqube-token' credential in Jenkins"
+          }
+        }
       }
     }
 
