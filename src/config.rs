@@ -79,8 +79,8 @@ impl Config {
         let lb_url = if is_prod {
             "https://api.listenbrainz.org".to_string()
         } else {
-            // In DEV mode, use custom URL or fallback to localhost mock
-            get_env("LISTENBRAINZ_URL", "http://localhost:8080")
+            // Accept both LISTENBRAINZ_URL and LISTENBRAINZ_BASE_URL
+            get_env("LISTENBRAINZ_URL", &get_env("LISTENBRAINZ_BASE_URL", "http://localhost:8080"))
         };
 
         // MusicBrainz PostgreSQL URL (optional)
