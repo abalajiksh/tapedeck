@@ -34,8 +34,7 @@ pipeline {
     SONAR_PROJECT_KEY = 'tapedeck'
     SONAR_PROJECT_NAME = 'Tapedeck'
     SONAR_SOURCES = 'src'
-    // Ensure this URL is correct. The previous log showed http://192.168.178.101:9000
-    // If you have a different internal URL, verify this variable.
+    // Default URL if not provided
     SONARQUBE_URL = "${env.SONARQUBE_URL ?: 'http://192.168.178.101:9000'}"
   }
 
@@ -79,29 +78,29 @@ pipeline {
       steps {
         script {
           try {
-            // Retrieve the scanner tool path explicitly
             def scannerHome = tool name: 'SonarQube Scanner', type: 'hudson.plugins.sonar.SonarRunnerInstallation'
             
-            // MANUAL CONFIGURATION: We are NOT using withSonarQubeEnv to avoid plugin conflicts.
-            // We inject the token directly and configure all properties manually.
             withCredentials([string(credentialsId: 'sonarqube-token', variable: 'SONAR_TOKEN')]) {
               echo "=========================================="
-              echo "Running SonarQube Analysis (Manual Config)"
+              echo "Running SonarQube Analysis"
               echo "=========================================="
               
+              // Debug: Check if token is loaded (print length only)
+              sh 'echo "Token loaded. Length: ${#SONAR_TOKEN}"'
+
+              // Using -Dsonar.login instead of -Dsonar.token for broader compatibility
               sh """
                 "${scannerHome}/bin/sonar-scanner" \
                   -Dsonar.projectKey=${SONAR_PROJECT_KEY} \
                   -Dsonar.projectName="${SONAR_PROJECT_NAME}" \
                   -Dsonar.sources=${SONAR_SOURCES} \
                   -Dsonar.host.url=${SONARQUBE_URL} \
-                  -Dsonar.token=\$SONAR_TOKEN
+                  -Dsonar.login=\$SONAR_TOKEN
               """
             }
           } catch (Exception e) {
             echo "⚠ SonarQube analysis failed: ${e.message}"
-            echo "  Verify: 'sonarqube-token' credential exists and is a valid User Token"
-            echo "  Verify: SONARQUBE_URL is reachable from the Jenkins agent"
+            echo "  Verify: 'sonarqube-token' credential is valid"
           }
         }
       }
@@ -110,45 +109,28 @@ pipeline {
     stage('Deploy') {
       steps {
         script {
-          // Reverting to withCredentials to allow debugging of the key file
-          // We DO NOT attempt to convert the key format, avoiding the libcrypto error
           withCredentials([sshUserPrivateKey(credentialsId: 'tapedeck-ssh-key', keyFileVariable: 'SSH_KEY')]) {
             sh """
               echo "=========================================="
-              echo "DEBUG: SSH Key Inspection"
+              echo "DEBUG: SSH Key Validation"
               echo "=========================================="
               
-              # Set permissions (safe operation)
-              chmod 600 "\$SSH_KEY"
+              # Check key file format (headers only) to diagnose libcrypto error
+              echo "Key file header:"
+              head -n 1 "\$SSH_KEY"
+              echo "Key file footer:"
+              tail -n 1 "\$SSH_KEY"
               
-              # 1. Print the PUBLIC key derived from the private key.
-              #    User can copy this output and check if it exists in ~/.ssh/authorized_keys on the target.
-              echo "---------------------------------------------------------"
-              echo "DEBUG: The PUBLIC KEY for this credential is:"
-              ssh-keygen -y -f "\$SSH_KEY" || echo "Failed to extract public key"
-              echo "---------------------------------------------------------"
-              echo "ACTION REQUIRED: Ensure the line above exists in ~/.ssh/authorized_keys on \$DEPLOY_HOST"
+              chmod 600 "\$SSH_KEY"
               
               echo "=========================================="
               echo "Deploying to \$DEPLOY_HOST"
               echo "=========================================="
               
-              # Test SSH connection with Verbose mode (-v) for more details
-              echo "Testing SSH connection to \$DEPLOY_USER@\$DEPLOY_HOST..."
-              ssh -v -i "\$SSH_KEY" -o StrictHostKeyChecking=no "\$DEPLOY_USER@\$DEPLOY_HOST" 'echo "SSH connection successful"'
-              
-              # Copy binary to target server
-              echo "Copying binary..."
-              scp -i "\$SSH_KEY" -o StrictHostKeyChecking=no target/release/tapedeck "\$DEPLOY_USER@\$DEPLOY_HOST:\$DEPLOY_DIR/"
-              
-              # Make executable and restart service
-              echo "Restarting service..."
-              ssh -i "\$SSH_KEY" -o StrictHostKeyChecking=no "\$DEPLOY_USER@\$DEPLOY_HOST" \
+              ssh -v -i "\$SSH_KEY" -o StrictHostKeyChecking=no "\$DEPLOY_USER@\$DEPLOY_HOST" \
                 "chmod +x \$DEPLOY_DIR/tapedeck && \
                  systemctl restart tapedeck && \
                  systemctl status tapedeck --no-pager"
-              
-              echo "Deployment completed successfully!"
             """
           }
         }
