@@ -60,21 +60,20 @@ pipeline {
     }
 
     stage('Deploy') {
-            steps {
-                script {
-                    sh """
-                        sshpass -p "\${DEPLOY_CRED_PSW}" scp -o StrictHostKeyChecking=no \
-                            target/release/tapedeck \
-                            \${DEPLOY_CRED_USR}@\${DEPLOY_HOST}:\${DEPLOY_DIR}/
-                        
-                        sshpass -p "\${DEPLOY_CRED_PSW}" ssh -o StrictHostKeyChecking=no \
-                            \${DEPLOY_CRED_USR}@\${DEPLOY_HOST} \
-                            "chmod +x \${DEPLOY_DIR}/tapedeck && \
-                             systemctl restart tapedeck"
-                    """
-                }
-            }
+      steps {
+        script {
+          sh """
+            sshpass -p "\${DEPLOY_CRED_PSW}" scp -o StrictHostKeyChecking=no \
+              target/release/tapedeck \
+              \${DEPLOY_CRED_USR}@\${DEPLOY_HOST}:\${DEPLOY_DIR}/
+            
+            sshpass -p "\${DEPLOY_CRED_PSW}" ssh -o StrictHostKeyChecking=no \
+              \${DEPLOY_CRED_USR}@\${DEPLOY_HOST} \
+              "chmod +x \${DEPLOY_DIR}/tapedeck && \
+               systemctl restart tapedeck"
+          """
         }
+      }
     }
 
     stage('Archive') {
@@ -109,10 +108,10 @@ pipeline {
       echo "Build completed for commit: ${params.COMMIT_ID}"
     }
     success {
-            echo 'Deployment completed successfully!'
-        }
-        failure {
-            echo 'Deployment failed!'
+      echo 'Deployment completed successfully!'
+    }
+    failure {
+      echo 'Deployment failed!'
     }
   }
 }
