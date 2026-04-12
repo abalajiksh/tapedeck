@@ -17,7 +17,6 @@ pub struct PlexConfig {
     pub enabled: bool,
     pub url: String,
     pub token: String,
-    // Filtering options
     pub users_allow: Vec<String>,
     pub users_block: Vec<String>,
     pub devices_allow: Vec<String>,
@@ -70,20 +69,15 @@ pub struct DatabaseConfig {
 
 impl Config {
     pub fn from_env() -> Self {
-        // Load .env file if it exists
         dotenv().ok();
 
-        // Determine ListenBrainz URL logic
-        // Default is PRODUCTION (true) unless explicitly set to "false"
         let is_prod = get_env_bool("IS_PRODUCTION", true);
         let lb_url = if is_prod {
             "https://api.listenbrainz.org".to_string()
         } else {
-            // Accept both LISTENBRAINZ_URL and LISTENBRAINZ_BASE_URL
             get_env("LISTENBRAINZ_URL", &get_env("LISTENBRAINZ_BASE_URL", "http://localhost:8080"))
         };
 
-        // MusicBrainz PostgreSQL URL (optional)
         let mb_pg_url = env::var("MUSICBRAINZ_POSTGRES_URL").ok();
         let mb_pg_enabled = mb_pg_url.is_some() && get_env_bool("MUSICBRAINZ_POSTGRES_ENABLED", false);
 
@@ -138,12 +132,10 @@ impl Config {
     }
 }
 
-/// Helper to get an Env Var with a Default
 fn get_env(key: &str, default: &str) -> String {
     env::var(key).unwrap_or_else(|_| default.to_string())
 }
 
-/// Helper to get a Boolean Env Var (e.g., "true" or "1")
 fn get_env_bool(key: &str, default: bool) -> bool {
     match env::var(key) {
         Ok(val) => {
@@ -154,7 +146,6 @@ fn get_env_bool(key: &str, default: bool) -> bool {
     }
 }
 
-/// Parse comma-separated list from env var
 fn parse_list(input: &str) -> Vec<String> {
     input
         .split(',')

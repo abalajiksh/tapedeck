@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use reqwest::{Client, Response};
 use crate::models::Play;
 use super::ScrobbleSink;
-use log::{info, error, debug};
+use tracing::{info, error, debug};
 use std::collections::HashMap;
 
 pub struct LastFmSink {
@@ -31,14 +31,14 @@ impl LastFmSink {
         }
     }
 
-    fn generate_signature(&self, params: &Vec<(&str, String)>) -> String {
-        let mut sorted_params = params.clone();
-        sorted_params.sort_by(|a, b| a.0.cmp(b.0));
+    fn generate_signature(&self, params: &[(String, String)]) -> String {
+        let mut sorted_params: Vec<_> = params.iter().collect();
+        sorted_params.sort_by(|a, b| a.0.cmp(&b.0));
 
         let mut sig_base = String::new();
         for (k, v) in sorted_params {
             sig_base.push_str(k);
-            sig_base.push_str(&v);
+            sig_base.push_str(v);
         }
         sig_base.push_str(&self.secret);
 
@@ -66,55 +66,50 @@ impl ScrobbleSink for LastFmSink {
 
         // Last.fm allows up to 50 scrobbles per request
         for chunk in plays.chunks(50) {
-            let mut params: Vec<(&str, String)> = Vec::new();
-            params.push(("method", "track.scrobble".to_string()));
-            params.push(("api_key", self.api_key.clone()));
-            params.push(("sk", self.session_key.clone()));
+            // Use owned Strings for both key and value — no more Box::leak
+            let mut params: Vec<(String, String)> = Vec::new();
+            params.push(("method".into(), "track.scrobble".into()));
+            params.push(("api_key".into(), self.api_key.clone()));
+            params.push(("sk".into(), self.session_key.clone()));
 
             for (i, play) in chunk.iter().enumerate() {
                 debug!("Preparing Last.fm scrobble for: {} - {}", play.artist, play.title);
-                
-                // Required fields
-                params.push((Box::leak(format!("artist[{}]", i).into_boxed_str()), play.artist.clone()));
-                params.push((Box::leak(format!("track[{}]", i).into_boxed_str()), play.title.clone()));
-                params.push((Box::leak(format!("timestamp[{}]", i).into_boxed_str()), play.timestamp.to_string()));
 
-                // Optional fields
+                params.push((format!("artist[{}]", i), play.artist.clone()));
+                params.push((format!("track[{}]", i), play.title.clone()));
+                params.push((format!("timestamp[{}]", i), play.timestamp.to_string()));
+
                 if let Some(ref album) = play.album {
-                    params.push((Box::leak(format!("album[{}]", i).into_boxed_str()), album.clone()));
+                    params.push((format!("album[{}]", i), album.clone()));
                 }
 
-                // Album artist (if available from artists field)
                 if let Some(ref artists) = play.artists {
                     if let Some(album_artist) = artists.first() {
                         if album_artist != &play.artist {
-                            params.push((Box::leak(format!("albumArtist[{}]", i).into_boxed_str()), album_artist.clone()));
+                            params.push((format!("albumArtist[{}]", i), album_artist.clone()));
                         }
                     }
                 }
 
-                // Duration in seconds
                 if let Some(duration) = play.duration {
-                    params.push((Box::leak(format!("duration[{}]", i).into_boxed_str()), duration.to_string()));
+                    params.push((format!("duration[{}]", i), duration.to_string()));
                 }
 
-                // Track number
                 if let Some(track_num) = play.track_number {
-                    params.push((Box::leak(format!("trackNumber[{}]", i).into_boxed_str()), track_num.to_string()));
+                    params.push((format!("trackNumber[{}]", i), track_num.to_string()));
                 }
 
-                // MusicBrainz Track ID (recording MBID)
                 if let Some(ref mbid) = play.mbid_recording {
-                    params.push((Box::leak(format!("mbid[{}]", i).into_boxed_str()), mbid.clone()));
+                    params.push((format!("mbid[{}]", i), mbid.clone()));
                     debug!("Including recording MBID for '{}': {}", play.title, mbid);
                 }
             }
 
             let signature = self.generate_signature(&params);
-            params.push(("api_sig", signature));
-            params.push(("format", "json".to_string()));
+            params.push(("api_sig".into(), signature));
+            params.push(("format".into(), "json".into()));
 
-            let form_data: HashMap<&str, String> = params.into_iter().collect();
+            let form_data: HashMap<String, String> = params.into_iter().collect();
 
             let resp: Response = self.client.post("https://ws.audioscrobbler.com/2.0/")
                 .form(&form_data)

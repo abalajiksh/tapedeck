@@ -1,6 +1,6 @@
 use serde::{Deserialize, Deserializer};
 use reqwest::Client;
-use log::{debug, info, warn};
+use tracing::{debug, info, warn};
 use std::collections::HashMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use crate::models::Play;
@@ -33,20 +33,19 @@ where
 
 // ==================== Unified Track Structure ====================
 
-/// A unified representation of a Plex track, whether from Session (JSON) or History (XML).
 #[derive(Debug, Clone)]
 pub struct PlexTrack {
     pub title: String,
-    pub artist: String, // Album Artist
+    pub artist: String,
     pub track_artist: Option<String>,
     pub album: Option<String>,
     pub duration: Option<u64>,
-    pub view_offset: Option<u64>, // Only relevant for sessions
+    pub view_offset: Option<u64>,
     pub rating_key: String,
     pub parent_rating_key: Option<String>,
     pub grandparent_rating_key: Option<String>,
-    pub session_key: Option<String>, // Only for sessions
-    pub viewed_at: Option<u64>,      // Only for history
+    pub session_key: Option<String>,
+    pub viewed_at: Option<u64>,
 }
 
 impl PlexTrack {
@@ -82,13 +81,11 @@ impl PlexTrack {
         })
     }
 
-    /// Convert PlexTrack to Play object (basic metadata only, no MBIDs)
     pub fn to_play(&self, source_id_suffix: &str) -> Play {
         let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
         let timestamp = self.viewed_at.unwrap_or(now);
         let source_id = format!("plex-{}-{}", self.rating_key, source_id_suffix);
 
-        // Resolve artists
         let (artists, _) = if let Some(ta) = &self.track_artist {
             (vec![ta.clone()], self.artist.clone())
         } else {
@@ -103,19 +100,19 @@ impl PlexTrack {
             timestamp,
             duration: self.duration.map(|d| d / 1000),
             track_number: None,
-            mbid_artist: None, // Will be filled by MusicBrainz module
+            mbid_artist: None,
             mbid_release: None,
             mbid_release_group: None,
             mbid_recording: None,
-            caa_id: None, // Will be filled by MusicBrainz module
-            caa_release_mbid: None, // Will be filled by MusicBrainz module
+            caa_id: None,
+            caa_release_mbid: None,
             source_id,
             source_name: "Plex".to_string(),
         }
     }
 }
 
-// ==================== Plex API Response Structures (JSON) ====================
+// ==================== Plex API Response Structures ====================
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "PascalCase")]
@@ -251,11 +248,10 @@ pub struct PlexSource {
     token: String,
     client: Client,
     filters: PlexFilters,
-    session_states: HashMap<String, SessionState>, // Keyed by session_key
+    session_states: HashMap<String, SessionState>,
     libraries: Vec<Library>,
 }
 
-/// Result from fetching sessions
 #[derive(Debug, Default)]
 pub struct SessionResult {
     pub now_playing: Vec<PlexTrack>,
@@ -294,16 +290,13 @@ impl PlexSource {
             .header("X-Plex-Token", &self.token)
             .header("Accept", "application/json")
             .send().await?;
-        if !resp.status().is_success() { 
-            return Err(format!("Plex API error: {}", resp.status()).into()); 
+        if !resp.status().is_success() {
+            return Err(format!("Plex API error: {}", resp.status()).into());
         }
         let lib_response: LibrariesResponse = resp.json().await?;
         Ok(lib_response.media_container.directory)
     }
 
-    // ==================== Session Processing ====================
-
-    /// Fetch current sessions and history, returning PlexTrack objects
     pub async fn fetch_sessions_extended(&mut self, _last_checked: Option<u64>) -> Result<SessionResult, Box<dyn std::error::Error>> {
         let mut result = SessionResult::default();
 
@@ -312,12 +305,12 @@ impl PlexSource {
         if let Ok(resp) = self.client.get(&endpoint)
             .header("X-Plex-Token", &self.token)
             .header("Accept", "application/json")
-            .send().await 
+            .send().await
         {
             if resp.status().is_success() {
                 if let Ok(sessions) = resp.json::<SessionsResponse>().await {
                     info!("Processing {} active Plex sessions", sessions.media_container.metadata.len());
-                    
+
                     for session in sessions.media_container.metadata {
                         if let Some(reason) = self.validate_session(&session) {
                             debug!("Skipping session: {}", reason);
@@ -328,7 +321,7 @@ impl PlexSource {
                         let is_playing = session.player.as_ref()
                             .map(|p| p.state.as_deref() == Some("playing"))
                             .unwrap_or(false);
-                        
+
                         if let Some(track) = PlexTrack::from_session(session) {
                             self.process_live_track(track, is_playing, &mut result).await;
                         }
@@ -343,7 +336,7 @@ impl PlexSource {
             result.ready_to_scrobble.extend(history);
         }
 
-        info!("Session fetch complete: {} now playing, {} ready to scrobble", 
+        info!("Session fetch complete: {} now playing, {} ready to scrobble",
               result.now_playing.len(), result.ready_to_scrobble.len());
         Ok(result)
     }
@@ -355,7 +348,6 @@ impl PlexSource {
         let view_offset = track.view_offset.unwrap_or(0);
         let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
 
-        // Detect track change
         if let Some(state) = self.session_states.get(&session_key) {
             if state.rating_key != rating_key {
                 debug!("Track changed in session {}: {} -> {}", session_key, state.rating_key, rating_key);
@@ -373,7 +365,7 @@ impl PlexSource {
 
             let pct = if duration > 0 { (view_offset as f64 / duration as f64) * 100.0 } else { 0.0 };
             let seconds = view_offset / 1000;
-            
+
             let ready = !state.scrobbled && (pct >= 50.0 || seconds >= 240);
             let np = is_playing && !state.scrobbled;
             (ready, np)
@@ -381,8 +373,8 @@ impl PlexSource {
 
         if should_scrobble {
             info!("Track ready for scrobble: '{}' by '{}'", track.title, track.artist);
-            if let Some(state) = self.session_states.get_mut(&session_key) { 
-                state.scrobbled = true; 
+            if let Some(state) = self.session_states.get_mut(&session_key) {
+                state.scrobbled = true;
             }
             result.ready_to_scrobble.push(track);
         } else if needs_np {
@@ -390,8 +382,6 @@ impl PlexSource {
             result.now_playing.push(track);
         }
     }
-
-    // ==================== History Processing ====================
 
     async fn fetch_history_tracks(&mut self, _min_timestamp: u64) -> Result<Vec<PlexTrack>, Box<dyn std::error::Error>> {
         let endpoint = format!("{}/status/sessions/history/all", self.url);
@@ -401,13 +391,13 @@ impl PlexSource {
             .header("Accept", "application/xml")
             .send().await?;
 
-        if !resp.status().is_success() { 
+        if !resp.status().is_success() {
             warn!("History fetch failed: HTTP {}", resp.status());
-            return Ok(Vec::new()); 
+            return Ok(Vec::new());
         }
-        
+
         let text = resp.text().await?;
-        
+
         let container: HistoryMediaContainer = match quick_xml::de::from_str(&text) {
             Ok(c) => c,
             Err(e) => {
@@ -424,13 +414,13 @@ impl PlexSource {
             .saturating_sub(7 * 86400);
 
         info!("Processing {} history tracks from Plex", container.tracks.len());
-        
+
         for h_track in container.tracks {
             if h_track.media_type.as_deref() != Some("track") { continue; }
             if let Some(ts) = h_track.viewed_at {
-                if ts < seven_days_ago { 
+                if ts < seven_days_ago {
                     debug!("Skipping old history track (viewed_at: {})", ts);
-                    continue; 
+                    continue;
                 }
             }
 
@@ -438,32 +428,30 @@ impl PlexSource {
                 tracks.push(track);
             }
         }
-        
+
         Ok(tracks)
     }
-
-    // ==================== Validation ====================
 
     fn validate_session(&self, session: &SessionMetadata) -> Option<String> {
         let user = session.user.as_ref()
             .and_then(|u| u.title.as_deref())
             .unwrap_or("unknown")
             .to_lowercase();
-            
-        if !self.filters.users_allow.is_empty() && !self.filters.users_allow.contains(&user) { 
-            return Some(format!("User not in allow list: {}", user)); 
+
+        if !self.filters.users_allow.is_empty() && !self.filters.users_allow.contains(&user) {
+            return Some(format!("User not in allow list: {}", user));
         }
-        if self.filters.users_block.contains(&user) { 
-            return Some(format!("User in block list: {}", user)); 
+        if self.filters.users_block.contains(&user) {
+            return Some(format!("User in block list: {}", user));
         }
-        
+
         if let Some(lib) = &session.library_section_title {
             let lib_lower = lib.to_lowercase();
-            if !self.filters.libraries_allow.is_empty() && !self.filters.libraries_allow.contains(&lib_lower) { 
-                return Some(format!("Library not in allow list: {}", lib)); 
+            if !self.filters.libraries_allow.is_empty() && !self.filters.libraries_allow.contains(&lib_lower) {
+                return Some(format!("Library not in allow list: {}", lib));
             }
-            if !self.libraries.iter().any(|l| l.title == *lib && l.collection_type == "artist") { 
-                return Some(format!("Not a music library: {}", lib)); 
+            if !self.libraries.iter().any(|l| l.title == *lib && l.collection_type == "artist") {
+                return Some(format!("Not a music library: {}", lib));
             }
         }
         None
@@ -479,14 +467,10 @@ impl PlexSource {
         }
     }
 
-    // ==================== Public API for getting Play objects ====================
-
-    /// Get now playing and scrobbles as PlexTrack objects (for MusicBrainz enrichment)
     pub async fn get_playback_data(&mut self) -> Result<SessionResult, Box<dyn std::error::Error>> {
         self.fetch_sessions_extended(None).await
     }
 
-    /// Wrapper for trait compliance - converts to Play objects
     pub async fn fetch_sessions(&mut self) -> Result<Vec<Play>, Box<dyn std::error::Error>> {
         let result = self.fetch_sessions_extended(None).await?;
         let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();

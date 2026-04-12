@@ -1,0 +1,37 @@
+mod admin;
+pub mod auth;
+pub mod ingest;
+pub mod models;
+mod users;
+
+use std::sync::Arc;
+
+use axum::{routing::post, Router};
+
+use crate::db::Database;
+use crate::logging::LogLevelHandle;
+use crate::musicbrainz::MusicBrainzClient;
+use crate::sinks::ScrobbleSink;
+
+/// Shared application state available to all request handlers.
+pub struct AppState {
+    pub db: Arc<Database>,
+    pub mb_client: Arc<MusicBrainzClient>,
+    pub sinks: Arc<Vec<Box<dyn ScrobbleSink>>>,
+    pub log_handle: LogLevelHandle,
+}
+
+/// Build the full Axum application.
+pub fn build_app(state: Arc<AppState>) -> Router {
+    let admin = admin::create_admin_router(state.log_handle.clone());
+    let user_mgmt = users::create_user_management_router();
+
+    let api = Router::new()
+        .route("/1/submit-listens", post(ingest::submit_listens))
+        .merge(user_mgmt)
+        .with_state(state);
+
+    Router::new()
+        .merge(admin)
+        .merge(api)
+}

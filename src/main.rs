@@ -1,84 +1,52 @@
 mod config;
-mod models;
-mod sources;
-mod sinks;
 mod db;
-mod musicbrainz;
+mod engine;
+mod error;
 mod logging;
-mod admin_api;
+mod models;
+mod musicbrainz;
+mod server;
+mod sinks;
+mod sources;
 
-use std::time::Duration;
-use tokio::time::sleep;
+use std::sync::Arc;
+
 use sqlx::SqlitePool;
-use crate::sources::{MusicSource, PlexSource, PlexFilters};
-use crate::sinks::ScrobbleSink;
-use crate::sinks::ListenBrainzSink;
+use tracing::{error, info};
+
 use crate::config::Config;
 use crate::db::Database;
+use crate::engine::ScrobbleEngine;
 use crate::musicbrainz::MusicBrainzClient;
-use tracing::{info, error, debug, warn};
+use crate::sinks::ScrobbleSink;
+use crate::sources::{MusicSource, PlexSource, PlexFilters};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Load .env file first
     dotenv::dotenv().ok();
 
-    // Initialize logging with file output and runtime control
+    // ── Logging ──
     let enable_file_logging = std::env::var("ENABLE_FILE_LOGGING")
-        .unwrap_or_else(|_| "true".to_string())
+        .unwrap_or_else(|_| "true".into())
         .parse::<bool>()
         .unwrap_or(true);
-    
     let enable_console = std::env::var("ENABLE_CONSOLE_LOGGING")
-        .unwrap_or_else(|_| "true".to_string())
+        .unwrap_or_else(|_| "true".into())
         .parse::<bool>()
         .unwrap_or(true);
-    
     let log_dir = std::env::var("LOG_DIR").ok();
-    
-    let log_handle = logging::init_logging(
-        log_dir.as_deref(),
-        enable_file_logging,
-        enable_console,
-    )?;
 
+    let log_handle = logging::init_logging(log_dir.as_deref(), enable_file_logging, enable_console)?;
     info!("🚀 Tapedeck Scrobbler Service Started");
-    
-    // Start admin API server in background
-    let admin_port = std::env::var("ADMIN_PORT")
-        .unwrap_or_else(|_| "8080".to_string())
-        .parse::<u16>()
-        .unwrap_or(8080);
-    
-    let admin_router = admin_api::create_admin_router(log_handle.clone());
-    
-    tokio::spawn(async move {
-        let addr = format!("0.0.0.0:{}", admin_port);
-        info!("🔧 Starting admin API server on {}", addr);
-        
-        let listener = match tokio::net::TcpListener::bind(&addr).await {
-            Ok(l) => l,
-            Err(e) => {
-                error!("Failed to bind admin API server: {}", e);
-                return;
-            }
-        };
-        
-        if let Err(e) = axum::serve(listener, admin_router).await {
-            error!("Admin API server error: {}", e);
-        }
-    });
 
-    // 1. Load Configuration
+    // ── Configuration ──
     let config = Config::from_env();
 
-    // 2. Initialize SQLite Pool for MusicBrainz Cache
+    // ── MusicBrainz client ──
     let sqlite_path = config.database.sqlite_path.clone();
     info!("📦 Initializing SQLite database at {}", sqlite_path);
     let sqlite_pool = SqlitePool::connect(&format!("sqlite:{}?mode=rwc", sqlite_path)).await?;
 
-    // 3. Initialize MusicBrainz Client with 3-tier caching
-    info!("🎵 Initializing MusicBrainz metadata client...");
     let mb_config = musicbrainz::MusicBrainzConfig {
         api_base_url: "https://musicbrainz.org/ws/2".to_string(),
         user_agent: config.musicbrainz.user_agent.clone(),
@@ -86,34 +54,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         postgres_url: config.musicbrainz.postgres_url.clone(),
         enable_postgres: config.musicbrainz.enable_postgres,
     };
-    
     let mb_client = MusicBrainzClient::new(mb_config, sqlite_pool.clone()).await?;
     mb_client.initialize_schema().await?;
-    
-    if config.musicbrainz.enable_postgres {
-        info!("✅ MusicBrainz client initialized with PostgreSQL dump support");
-    } else {
-        info!("✅ MusicBrainz client initialized (SQLite + API)");
+    info!("✅ MusicBrainz client initialized");
+
+    let mb_client = Arc::new(mb_client);
+
+    // ── Scrobble database ──
+    let db_url = std::env::var("DATABASE_URL")
+        .unwrap_or_else(|_| "sqlite:scrobbles.db?mode=rwc".into());
+    info!("📦 Initializing scrobble database at {}", db_url);
+    let db = Arc::new(Database::new(&db_url).await?);
+
+    // ── First-run setup ──
+    if !db.has_users().await? {
+        info!("🔑 First run detected — creating admin user and token...");
+        let user_id = db
+            .create_user("admin", Some("Admin"), "not-used-yet")
+            .await?;
+        let token = db
+            .create_token(user_id, "default", "submit")
+            .await?;
+        info!("════════════════════════════════════════════════════════");
+        info!("🔑 Admin API token (save this — it won't be shown again!):");
+        info!("   {}", token);
+        info!("════════════════════════════════════════════════════════");
     }
 
-    // 4. Initialize Scrobble Database
-    let db_url = std::env::var("DATABASE_URL").unwrap_or_else(|_| "sqlite:scrobbles.db?mode=rwc".to_string());
-    info!("📦 Initializing scrobble database at {}", db_url);
-    let db = match Database::new(&db_url).await {
-        Ok(db) => db,
-        Err(e) => {
-            error!("❌ Failed to connect to scrobble database: {}", e);
-            return Err(e.into());
-        }
-    };
-
-    // 5. Initialize Sources
+    // ── Sources ──
     let mut sources: Vec<Box<dyn MusicSource>> = Vec::new();
 
-    // Initialize Plex with filters
     if config.plex.enabled {
         info!("Initializing Plex source...");
-
         let filters = PlexFilters {
             users_allow: config.plex.users_allow.clone(),
             users_block: config.plex.users_block.clone(),
@@ -122,259 +94,82 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             libraries_allow: config.plex.libraries_allow.clone(),
             libraries_block: config.plex.libraries_block.clone(),
         };
-
-        let mut plex_source = PlexSource::with_filters(
+        let mut plex = PlexSource::with_filters(
             config.plex.url.clone(),
             config.plex.token.clone(),
             filters,
         );
-
-        match plex_source.initialize().await {
+        match plex.initialize().await {
             Ok(_) => {
-                info!("✅ Plex source initialized successfully");
-                sources.push(Box::new(plex_source));
+                info!("✅ Plex source initialized");
+                sources.push(Box::new(plex));
             }
-            Err(e) => {
-                error!("❌ Failed to initialize Plex: {}", e);
-            }
+            Err(e) => error!("❌ Failed to initialize Plex: {}", e),
         }
     }
 
+    // Sources are optional now — ingest API can work without any polling sources
     if sources.is_empty() {
-        error!("❌ No music sources enabled!");
-        return Ok(());
+        info!("ℹ️ No polling sources enabled — running in ingest-only mode");
     }
 
-    // 6. Initialize Sinks
-    let mut sinks: Vec<Box<dyn ScrobbleSink>> = Vec::new();
+    // ── Sinks ──
+    let mut sink_vec: Vec<Box<dyn ScrobbleSink>> = Vec::new();
 
     if config.listenbrainz.enabled {
         info!("Initializing ListenBrainz sink...");
-        sinks.push(Box::new(sinks::ListenBrainzSink::new(
+        sink_vec.push(Box::new(sinks::ListenBrainzSink::new(
             config.listenbrainz.base_url.clone(),
             config.listenbrainz.token.clone(),
         )));
     }
-
     if config.lastfm.enabled {
         info!("Initializing Last.fm sink...");
-        sinks.push(Box::new(sinks::LastFmSink::new(
+        sink_vec.push(Box::new(sinks::LastFmSink::new(
             config.lastfm.api_key.clone(),
             config.lastfm.secret.clone(),
             config.lastfm.session_key.clone(),
         )));
     }
 
-    if sinks.is_empty() {
-        error!("❌ No scrobble destinations enabled!");
-        return Ok(());
+    if sink_vec.is_empty() {
+        info!("ℹ️ No scrobble sinks enabled — listens will be stored locally only");
     }
 
-    info!("🎵 Starting scrobble loop with prioritized MusicBrainz metadata enrichment...");
-    
-    // We fetch history for the last 24 hours to catch offline plays
-    // SQLite handles deduplication
-    let history_window_seconds = 86400; // 24 hours
+    let sinks: Arc<Vec<Box<dyn ScrobbleSink>>> = Arc::new(sink_vec);
 
-    loop {
-        let current_time = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
+    // ── HTTP server ──
+    let server_port: u16 = std::env::var("PORT")
+        .or_else(|_| std::env::var("ADMIN_PORT"))
+        .unwrap_or_else(|_| "8080".into())
+        .parse()
+        .unwrap_or(8080);
 
-        // Track if there are any active now playing sessions
-        let mut has_active_now_playing = false;
+    let app_state = Arc::new(server::AppState {
+        db: db.clone(),
+        mb_client: mb_client.clone(),
+        sinks: sinks.clone(),
+        log_handle: log_handle.clone(),
+    });
 
-        // 1. PRIORITY: Handle Now Playing and New Scrobbles with MusicBrainz enrichment
-        for source in &mut sources {
-            if source.name() == "Plex" {
-                if let Some(plex) = source.as_any_mut().downcast_mut::<PlexSource>() {
-                    // Fetch recent history + active sessions
-                    // We look back 24h to catch any late-synced plays
-                    let lookback_time = current_time.saturating_sub(history_window_seconds);
-                    
-                    match plex.fetch_sessions_extended(Some(lookback_time)).await {
-                        Ok(session_result) => {
-                            // A. Handle Now Playing (Stateless, immediate) - ALWAYS with metadata
-                            if !session_result.now_playing.is_empty() {
-                                has_active_now_playing = true;
-                                info!("🎧 {} active now playing session(s) detected", session_result.now_playing.len());
-                            }
+    let app = server::build_app(app_state);
 
-                            for plex_track in &session_result.now_playing {
-                                let mut play = plex_track.to_play("np");
-                                
-                                // PRIORITY: Always fetch MusicBrainz metadata for now playing
-                                debug!("Fetching MusicBrainz metadata for now playing: {} - {}", play.artist, play.title);
-                                match mb_client.fetch_metadata(
-                                    &plex_track.title,
-                                    &plex_track.artist,
-                                    plex_track.album.as_deref(),
-                                ).await {
-                                    Ok(metadata) => {
-                                        // Clone values for logging before moving them
-                                        let track_mbid_str = metadata.track_mbid.as_deref().unwrap_or("none").to_string();
-                                        let album_mbid_str = metadata.album_mbid.as_deref().unwrap_or("none").to_string();
-                                        let artist_mbid_str = metadata.artist_mbid.as_deref().unwrap_or("none").to_string();
-                                        
-                                        play.mbid_recording = metadata.track_mbid;
-                                        play.mbid_release = metadata.album_mbid;
-                                        play.mbid_artist = metadata.artist_mbid.as_ref().map(|id| vec![id.clone()]);
-                                        play.caa_id = metadata.caa_id;
-                                        play.caa_release_mbid = metadata.caa_release_mbid;
-                                        
-                                        info!("✓ Enriched now playing: {} - {} [recording: {}, release: {}, artist: {}]",
-                                            play.artist,
-                                            play.title,
-                                            track_mbid_str,
-                                            album_mbid_str,
-                                            artist_mbid_str
-                                        );
-                                    }
-                                    Err(e) => {
-                                        warn!("⚠ MusicBrainz lookup failed for now playing {} - {}: {}", 
-                                            play.artist, play.title, e);
-                                    }
-                                }
-                                
-                                // Submit to sinks
-                                for sink in &sinks {
-                                    if let Some(lb_sink) = sink.as_any().downcast_ref::<ListenBrainzSink>() {
-                                        if let Err(e) = lb_sink.submit_now_playing(&play).await {
-                                            error!("Failed to submit now playing to {}: {}", sink.name(), e);
-                                        }
-                                    }
-                                }
-                            }
-
-                            // B. Process Scrobble Candidates - ALWAYS with MusicBrainz Enrichment
-                            if !session_result.ready_to_scrobble.is_empty() {
-                                info!("📀 Processing {} ready-to-scrobble track(s)", session_result.ready_to_scrobble.len());
-                                
-                                for plex_track in session_result.ready_to_scrobble {
-                                    let mut play = plex_track.to_play(&format!("scrobble-{}", current_time));
-                                    
-                                    // PRIORITY: Always fetch MusicBrainz metadata for scrobbles
-                                    debug!("Fetching MusicBrainz metadata for scrobble: {} - {}", play.artist, play.title);
-                                    match mb_client.fetch_metadata(
-                                        &plex_track.title,
-                                        &plex_track.artist,
-                                        plex_track.album.as_deref(),
-                                    ).await {
-                                        Ok(metadata) => {
-                                            // Clone values for logging before moving them
-                                            let track_mbid_str = metadata.track_mbid.as_deref().unwrap_or("none").to_string();
-                                            let album_mbid_str = metadata.album_mbid.as_deref().unwrap_or("none").to_string();
-                                            let artist_mbid_str = metadata.artist_mbid.as_deref().unwrap_or("none").to_string();
-                                            let caa_id_str = metadata.caa_id.map(|id| id.to_string()).unwrap_or_else(|| "none".to_string());
-                                            
-                                            play.mbid_recording = metadata.track_mbid;
-                                            play.mbid_release = metadata.album_mbid;
-                                            play.mbid_artist = metadata.artist_mbid.as_ref().map(|id| vec![id.clone()]);
-                                            play.caa_id = metadata.caa_id;
-                                            play.caa_release_mbid = metadata.caa_release_mbid;
-                                            
-                                            info!("✓ Enriched scrobble: {} - {} [recording: {}, release: {}, artist: {}, caa: {}]",
-                                                play.artist,
-                                                play.title,
-                                                track_mbid_str,
-                                                album_mbid_str,
-                                                artist_mbid_str,
-                                                caa_id_str
-                                            );
-                                        }
-                                        Err(e) => {
-                                            warn!("⚠ MusicBrainz lookup failed for scrobble {} - {}: {}", 
-                                                play.artist, play.title, e);
-                                            // Continue with basic metadata from Plex
-                                        }
-                                    }
-                                    
-                                    // Save to database (with or without MBIDs)
-                                    match db.save_scrobble(&play).await {
-                                        Ok(saved) => {
-                                            if saved {
-                                                info!("📥 Queued new play: {} - {}", play.artist, play.title);
-                                            }
-                                        }
-                                        Err(e) => error!("Database error: {}", e),
-                                    }
-                                }
-                            }
-                        }
-                        Err(e) => error!("Error fetching from Plex: {}", e),
-                    }
-                }
+    tokio::spawn(async move {
+        let addr = format!("0.0.0.0:{}", server_port);
+        info!("🌐 Starting server on {}", addr);
+        let listener = match tokio::net::TcpListener::bind(&addr).await {
+            Ok(l) => l,
+            Err(e) => {
+                error!("Failed to bind server: {}", e);
+                return;
             }
-            // TODO: Add generic handling for other sources if needed
+        };
+        if let Err(e) = axum::serve(listener, app).await {
+            error!("Server error: {}", e);
         }
+    });
 
-        // 2. DEFERRED: Process Pending Scrobbles ONLY when no active now playing
-        if !has_active_now_playing {
-            match db.get_pending_scrobbles().await {
-                Ok(pending_plays) => {
-                    if !pending_plays.is_empty() {
-                        info!("🔄 No active sessions - processing {} pending scrobble(s) from history", pending_plays.len());
-                        
-                        for mut play in pending_plays {
-                            // Enrich with MusicBrainz if we don't have MBIDs yet (for old scrobbles)
-                            if play.mbid_recording.is_none() {
-                                debug!("Enriching pending scrobble: {} - {}", play.artist, play.title);
-                                match mb_client.fetch_metadata(
-                                    &play.title,
-                                    &play.artist,
-                                    play.album.as_deref(),
-                                ).await {
-                                    Ok(metadata) => {
-                                        play.mbid_recording = metadata.track_mbid;
-                                        play.mbid_release = metadata.album_mbid;
-                                        play.mbid_artist = metadata.artist_mbid.as_ref().map(|id| vec![id.clone()]);
-                                        play.caa_id = metadata.caa_id;
-                                        play.caa_release_mbid = metadata.caa_release_mbid;
-                                        debug!("✓ Enriched pending scrobble with MBIDs");
-                                    }
-                                    Err(e) => {
-                                        debug!("Could not enrich pending scrobble: {}", e);
-                                    }
-                                }
-                            }
-                            
-                            let mut all_succeeded = true;
-                            
-                            for sink in &sinks {
-                                match sink.scrobble(&vec![play.clone()]).await {
-                                    Ok(_) => debug!("Sent to {}", sink.name()),
-                                    Err(e) => {
-                                        error!("Failed to send to {}: {}", sink.name(), e);
-                                        all_succeeded = false;
-                                    }
-                                }
-                            }
-
-                            if all_succeeded {
-                                if let Err(e) = db.mark_as_scrobbled(&play.source_id, &play.source_name).await {
-                                    error!("Failed to mark as scrobbled: {}", e);
-                                } else {
-                                    info!("✅ Synced: {} - {}", play.artist, play.title);
-                                }
-                            }
-                        }
-                    }
-                }
-                Err(e) => error!("Failed to fetch pending scrobbles: {}", e),
-            }
-        } else {
-            debug!("⏸ Skipping pending scrobbles processing - active now playing session detected");
-        }
-
-        // Clean up old session states (Plex-specific)
-        if let Some(plex_source) = sources.iter_mut()
-            .find(|s| s.name() == "Plex")
-            .and_then(|s| s.as_any_mut().downcast_mut::<PlexSource>())
-        {
-            plex_source.cleanup_sessions(3600);
-        }
-
-        sleep(Duration::from_secs(15)).await;
-    }
+    // ── Scrobble engine ──
+    let mut engine = ScrobbleEngine::new(sources, sinks, db, mb_client);
+    engine.run().await;
 }

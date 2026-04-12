@@ -11,7 +11,5 @@ pub trait MusicSource: Send + Sync {
     async fn fetch_new_plays(&mut self, last_checked: u64) -> Result<Vec<Play>, Box<dyn std::error::Error>>;
 }
 
-// Re-export Plex types only when they're used in main.rs
-// These are pub so main.rs can access them directly
 pub use plex::PlexSource;
 pub use plex::PlexFilters;
