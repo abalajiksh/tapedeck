@@ -1,6 +1,6 @@
 use sqlx::{sqlite::{SqlitePoolOptions, SqliteConnectOptions}, Pool, Sqlite, FromRow};
 use std::str::FromStr;
-use crate::models::{AuthUser, Play};
+use crate::models::*;
 use tracing::{info, debug};
 use sha2::{Sha256, Digest};
 
@@ -21,6 +21,27 @@ pub struct ScrobbleRecord {
     pub mbid_artist: Option<String>,
     pub caa_id: Option<i64>,
     pub caa_release_mbid: Option<String>,
+    // Quality fields
+    pub format_type: Option<String>,
+    pub codec: Option<String>,
+    pub bitrate: Option<i32>,
+    pub sample_rate: Option<i32>,
+    pub bit_depth: Option<i32>,
+    pub channels: Option<i32>,
+    pub is_lossless: Option<bool>,
+    pub dsd_rate: Option<i64>,
+    pub dsd_multiplier: Option<i32>,
+    pub delivery_codec: Option<String>,
+    pub delivery_bitrate: Option<i32>,
+    pub is_transcoded: Option<bool>,
+    pub transcode_reason: Option<String>,
+    pub quality_score: Option<f64>,
+    // Context fields
+    pub device_id: Option<i64>,
+    pub chain_id: Option<i64>,
+    pub session_id: Option<i64>,
+    pub listening_context: Option<String>,
+    pub submission_client: Option<String>,
 }
 
 pub struct Database {
@@ -43,6 +64,7 @@ impl Database {
     }
 
     async fn init(&self) -> Result<(), sqlx::Error> {
+        // ── Scrobbles (v2 schema with quality + context) ──
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS scrobbles (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -55,17 +77,43 @@ impl Database {
                 source_id TEXT NOT NULL,
                 source_name TEXT NOT NULL,
                 status TEXT NOT NULL DEFAULT 'pending',
+                -- MusicBrainz
                 mbid_recording TEXT,
                 mbid_release TEXT,
                 mbid_artist TEXT,
                 caa_id INTEGER,
                 caa_release_mbid TEXT,
+                -- Audio quality (PCM)
+                format_type TEXT,
+                codec TEXT,
+                bitrate INTEGER,
+                sample_rate INTEGER,
+                bit_depth INTEGER,
+                channels INTEGER,
+                is_lossless BOOLEAN,
+                -- Audio quality (DSD)
+                dsd_rate INTEGER,
+                dsd_multiplier INTEGER,
+                -- Delivery quality
+                delivery_codec TEXT,
+                delivery_bitrate INTEGER,
+                is_transcoded BOOLEAN,
+                transcode_reason TEXT,
+                -- Computed
+                quality_score REAL,
+                -- Context
+                device_id INTEGER REFERENCES devices(id),
+                chain_id INTEGER REFERENCES signal_chains(id),
+                session_id INTEGER REFERENCES sessions(id),
+                listening_context TEXT,
+                submission_client TEXT,
                 UNIQUE(user_id, source_id, source_name)
             )"
         )
         .execute(&self.pool)
         .await?;
 
+        // ── Users ──
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS users (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -79,6 +127,7 @@ impl Database {
         .execute(&self.pool)
         .await?;
 
+        // ── Tokens ──
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS tokens (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -94,62 +143,157 @@ impl Database {
         .execute(&self.pool)
         .await?;
 
+        // ── Signal Chains ──
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS signal_chains (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL REFERENCES users(id),
+                name TEXT NOT NULL,
+                description TEXT,
+                components JSON NOT NULL DEFAULT '[]',
+                listening_context TEXT NOT NULL DEFAULT 'unknown',
+                is_active BOOLEAN DEFAULT TRUE,
+                total_hours REAL DEFAULT 0,
+                created_at INTEGER NOT NULL,
+                UNIQUE(user_id, name)
+            )"
+        )
+        .execute(&self.pool)
+        .await?;
+
+        // ── Devices ──
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS devices (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL REFERENCES users(id),
+                machine_id TEXT NOT NULL,
+                name TEXT,
+                platform TEXT,
+                product TEXT,
+                device_type TEXT,
+                default_chain_id INTEGER REFERENCES signal_chains(id),
+                first_seen INTEGER NOT NULL,
+                last_seen INTEGER NOT NULL,
+                total_listens INTEGER DEFAULT 0,
+                UNIQUE(user_id, machine_id)
+            )"
+        )
+        .execute(&self.pool)
+        .await?;
+
+        // ── Equipment ──
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS equipment (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL REFERENCES users(id),
+                name TEXT NOT NULL,
+                type TEXT NOT NULL,
+                brand TEXT,
+                model TEXT,
+                total_hours REAL DEFAULT 0,
+                first_used INTEGER,
+                last_used INTEGER,
+                notes TEXT,
+                UNIQUE(user_id, name)
+            )"
+        )
+        .execute(&self.pool)
+        .await?;
+
+        // ── Sessions ──
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS sessions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL REFERENCES users(id),
+                device_id INTEGER REFERENCES devices(id),
+                chain_id INTEGER REFERENCES signal_chains(id),
+                started_at INTEGER NOT NULL,
+                ended_at INTEGER,
+                track_count INTEGER DEFAULT 0,
+                total_duration INTEGER DEFAULT 0,
+                skip_count INTEGER DEFAULT 0,
+                avg_quality_score REAL,
+                listening_context TEXT DEFAULT 'unknown'
+            )"
+        )
+        .execute(&self.pool)
+        .await?;
+
         Ok(())
     }
 
     async fn migrate(&self) -> Result<(), sqlx::Error> {
-        let column_check: Result<(i64,), _> = sqlx::query_as(
-            "SELECT COUNT(*) FROM pragma_table_info('scrobbles') WHERE name='mbid_recording'"
-        )
-        .fetch_one(&self.pool)
-        .await;
-
-        if let Ok((count,)) = column_check {
-            if count == 0 {
-                info!("⚙️ Migrating scrobbles database to add MusicBrainz and CAA fields...");
-
-                sqlx::query("ALTER TABLE scrobbles ADD COLUMN mbid_recording TEXT")
-                    .execute(&self.pool).await?;
-                sqlx::query("ALTER TABLE scrobbles ADD COLUMN mbid_release TEXT")
-                    .execute(&self.pool).await?;
-                sqlx::query("ALTER TABLE scrobbles ADD COLUMN mbid_artist TEXT")
-                    .execute(&self.pool).await?;
-                sqlx::query("ALTER TABLE scrobbles ADD COLUMN caa_id INTEGER")
-                    .execute(&self.pool).await?;
-                sqlx::query("ALTER TABLE scrobbles ADD COLUMN caa_release_mbid TEXT")
-                    .execute(&self.pool).await?;
-
-                info!("✅ Database migration complete");
-            }
+        // Helper: check if column exists
+        async fn has_column(pool: &Pool<Sqlite>, table: &str, column: &str) -> bool {
+            let result: Result<(i64,), _> = sqlx::query_as(
+                &format!("SELECT COUNT(*) FROM pragma_table_info('{}') WHERE name='{}'", table, column)
+            )
+            .fetch_one(pool)
+            .await;
+            matches!(result, Ok((count,)) if count > 0)
         }
 
-        // Migration: add user_id column if missing (v2 multi-user support)
-        let user_id_check: Result<(i64,), _> = sqlx::query_as(
-            "SELECT COUNT(*) FROM pragma_table_info('scrobbles') WHERE name='user_id'"
-        )
-        .fetch_one(&self.pool)
-        .await;
-
-        if let Ok((count,)) = user_id_check {
-            if count == 0 {
-                info!("⚙️ Migrating scrobbles database to add user_id...");
-                sqlx::query("ALTER TABLE scrobbles ADD COLUMN user_id INTEGER NOT NULL DEFAULT 1")
-                    .execute(&self.pool).await?;
-                // Recreate unique index to include user_id
-                sqlx::query("CREATE UNIQUE INDEX IF NOT EXISTS idx_scrobbles_user_source ON scrobbles(user_id, source_id, source_name)")
-                    .execute(&self.pool).await?;
-                info!("✅ user_id migration complete");
+        // Migration 1: MusicBrainz fields
+        if !has_column(&self.pool, "scrobbles", "mbid_recording").await {
+            info!("⚙️ Migrating: adding MusicBrainz fields...");
+            for col in &["mbid_recording TEXT", "mbid_release TEXT", "mbid_artist TEXT",
+                         "caa_id INTEGER", "caa_release_mbid TEXT"] {
+                let _ = sqlx::query(&format!("ALTER TABLE scrobbles ADD COLUMN {}", col))
+                    .execute(&self.pool).await;
             }
+            info!("✅ MusicBrainz migration complete");
+        }
+
+        // Migration 2: user_id
+        if !has_column(&self.pool, "scrobbles", "user_id").await {
+            info!("⚙️ Migrating: adding user_id...");
+            let _ = sqlx::query("ALTER TABLE scrobbles ADD COLUMN user_id INTEGER NOT NULL DEFAULT 1")
+                .execute(&self.pool).await;
+            let _ = sqlx::query("CREATE UNIQUE INDEX IF NOT EXISTS idx_scrobbles_user_source ON scrobbles(user_id, source_id, source_name)")
+                .execute(&self.pool).await;
+            info!("✅ user_id migration complete");
+        }
+
+        // Migration 3: Phase 2 quality + context columns
+        if !has_column(&self.pool, "scrobbles", "format_type").await {
+            info!("⚙️ Migrating: adding Phase 2 quality and context fields...");
+            let quality_cols = [
+                "format_type TEXT", "codec TEXT", "bitrate INTEGER",
+                "sample_rate INTEGER", "bit_depth INTEGER", "channels INTEGER",
+                "is_lossless BOOLEAN", "dsd_rate INTEGER", "dsd_multiplier INTEGER",
+                "delivery_codec TEXT", "delivery_bitrate INTEGER",
+                "is_transcoded BOOLEAN", "transcode_reason TEXT", "quality_score REAL",
+                "device_id INTEGER", "chain_id INTEGER", "session_id INTEGER",
+                "listening_context TEXT", "submission_client TEXT",
+            ];
+            for col in &quality_cols {
+                let _ = sqlx::query(&format!("ALTER TABLE scrobbles ADD COLUMN {}", col))
+                    .execute(&self.pool).await;
+            }
+            info!("✅ Phase 2 migration complete");
         }
 
         Ok(())
     }
 
-    pub async fn save_scrobble(&self, user_id: i64, play: &Play) -> Result<bool, sqlx::Error> {
+    // ════════════════════════════════════════════════════════════
+    //  Scrobble CRUD
+    // ════════════════════════════════════════════════════════════
+
+    /// Save a scrobble with optional quality and context metadata.
+    pub async fn save_scrobble(
+        &self,
+        user_id: i64,
+        play: &Play,
+        quality: Option<&AudioQuality>,
+        device_id: Option<i64>,
+        chain_id: Option<i64>,
+        listening_context: Option<&str>,
+        submission_client: Option<&str>,
+    ) -> Result<bool, sqlx::Error> {
         if self.exists(user_id, &play.source_id, &play.source_name).await? {
             return Ok(false);
         }
-
         if self.fuzzy_exists(user_id, &play.title, &play.artist, play.timestamp as i64).await? {
             debug!("Skipping duplicate play (fuzzy match): {} - {}", play.artist, play.title);
             return Ok(false);
@@ -158,12 +302,24 @@ impl Database {
         let mbid_artist_json = play.mbid_artist.as_ref()
             .map(|arr| serde_json::to_string(arr).unwrap());
 
+        let q = quality.cloned().unwrap_or_default();
+
         sqlx::query(
             "INSERT INTO scrobbles (
                 user_id, title, artist, album, timestamp, duration, source_id, source_name, status,
-                mbid_recording, mbid_release, mbid_artist, caa_id, caa_release_mbid
-            )
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?)"
+                mbid_recording, mbid_release, mbid_artist, caa_id, caa_release_mbid,
+                format_type, codec, bitrate, sample_rate, bit_depth, channels, is_lossless,
+                dsd_rate, dsd_multiplier, delivery_codec, delivery_bitrate,
+                is_transcoded, transcode_reason, quality_score,
+                device_id, chain_id, listening_context, submission_client
+            ) VALUES (
+                ?, ?, ?, ?, ?, ?, ?, ?, 'pending',
+                ?, ?, ?, ?, ?,
+                ?, ?, ?, ?, ?, ?, ?,
+                ?, ?, ?, ?,
+                ?, ?, ?,
+                ?, ?, ?, ?
+            )"
         )
         .bind(user_id)
         .bind(&play.title)
@@ -178,6 +334,26 @@ impl Database {
         .bind(&mbid_artist_json)
         .bind(play.caa_id)
         .bind(&play.caa_release_mbid)
+        // Quality
+        .bind(&q.format_type)
+        .bind(&q.codec)
+        .bind(q.bitrate)
+        .bind(q.sample_rate)
+        .bind(q.bit_depth.map(|v| v as i32))
+        .bind(q.channels.map(|v| v as i32))
+        .bind(q.is_lossless)
+        .bind(q.dsd_rate)
+        .bind(q.dsd_multiplier.map(|v| v as i32))
+        .bind(&q.delivery_codec)
+        .bind(q.delivery_bitrate)
+        .bind(q.is_transcoded)
+        .bind(&q.transcode_reason)
+        .bind(q.quality_score)
+        // Context
+        .bind(device_id)
+        .bind(chain_id)
+        .bind(listening_context)
+        .bind(submission_client)
         .execute(&self.pool)
         .await?;
 
@@ -188,12 +364,8 @@ impl Database {
         let count: (i64,) = sqlx::query_as(
             "SELECT COUNT(*) FROM scrobbles WHERE user_id = ? AND source_id = ? AND source_name = ?"
         )
-        .bind(user_id)
-        .bind(source_id)
-        .bind(source_name)
-        .fetch_one(&self.pool)
-        .await?;
-
+        .bind(user_id).bind(source_id).bind(source_name)
+        .fetch_one(&self.pool).await?;
         Ok(count.0 > 0)
     }
 
@@ -203,66 +375,249 @@ impl Database {
              WHERE user_id = ? AND title = ? AND artist = ?
              AND timestamp BETWEEN ? - 600 AND ? + 600"
         )
-        .bind(user_id)
-        .bind(title)
-        .bind(artist)
-        .bind(timestamp)
-        .bind(timestamp)
-        .fetch_one(&self.pool)
-        .await?;
-
+        .bind(user_id).bind(title).bind(artist).bind(timestamp).bind(timestamp)
+        .fetch_one(&self.pool).await?;
         Ok(count.0 > 0)
     }
 
-    /// Returns `(user_id, Play)` tuples for all pending scrobbles across all users.
     pub async fn get_pending_scrobbles(&self) -> Result<Vec<(i64, Play)>, sqlx::Error> {
         let records: Vec<ScrobbleRecord> = sqlx::query_as::<_, ScrobbleRecord>(
             "SELECT * FROM scrobbles WHERE status = 'pending' ORDER BY timestamp ASC"
         )
-        .fetch_all(&self.pool)
-        .await?;
+        .fetch_all(&self.pool).await?;
 
         let plays = records.into_iter().map(|r| {
             let user_id = r.user_id;
-            let mbid_artist = r.mbid_artist.and_then(|json_str| {
-                serde_json::from_str::<Vec<String>>(&json_str).ok()
-            });
-
+            let mbid_artist = r.mbid_artist.and_then(|s| serde_json::from_str::<Vec<String>>(&s).ok());
             (user_id, Play {
-                title: r.title,
-                artist: r.artist,
-                album: r.album,
+                title: r.title, artist: r.artist, album: r.album,
                 timestamp: r.timestamp as u64,
                 duration: r.duration.map(|d| d as u64),
                 track_number: None,
-                source_id: r.source_id,
-                source_name: r.source_name,
-                mbid_recording: r.mbid_recording,
-                mbid_release: r.mbid_release,
-                mbid_artist,
-                artists: None,
-                mbid_release_group: None,
-                caa_id: r.caa_id,
-                caa_release_mbid: r.caa_release_mbid,
+                source_id: r.source_id, source_name: r.source_name,
+                mbid_recording: r.mbid_recording, mbid_release: r.mbid_release,
+                mbid_artist, artists: None, mbid_release_group: None,
+                caa_id: r.caa_id, caa_release_mbid: r.caa_release_mbid,
             })
         }).collect();
-
         Ok(plays)
     }
 
     pub async fn mark_as_scrobbled(&self, user_id: i64, source_id: &str, source_name: &str) -> Result<(), sqlx::Error> {
-        sqlx::query(
-            "UPDATE scrobbles SET status = 'synced' WHERE user_id = ? AND source_id = ? AND source_name = ?"
-        )
-        .bind(user_id)
-        .bind(source_id)
-        .bind(source_name)
-        .execute(&self.pool)
-        .await?;
+        sqlx::query("UPDATE scrobbles SET status = 'synced' WHERE user_id = ? AND source_id = ? AND source_name = ?")
+            .bind(user_id).bind(source_id).bind(source_name)
+            .execute(&self.pool).await?;
         Ok(())
     }
 
-    // ── User & Token Management (roadmap 4.3) ──
+    // ════════════════════════════════════════════════════════════
+    //  Signal Chains
+    // ════════════════════════════════════════════════════════════
+
+    pub async fn create_chain(&self, chain: &SignalChain) -> Result<i64, sqlx::Error> {
+        let components_json = serde_json::to_string(&chain.components).unwrap_or_else(|_| "[]".into());
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
+
+        let result = sqlx::query(
+            "INSERT INTO signal_chains (user_id, name, description, components, listening_context, is_active, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?)"
+        )
+        .bind(chain.user_id)
+        .bind(&chain.name)
+        .bind(&chain.description)
+        .bind(&components_json)
+        .bind(chain.listening_context.as_str())
+        .bind(chain.is_active)
+        .bind(now)
+        .execute(&self.pool).await?;
+
+        Ok(result.last_insert_rowid())
+    }
+
+    pub async fn get_chains(&self, user_id: i64) -> Result<Vec<SignalChain>, sqlx::Error> {
+        let rows: Vec<ChainRow> = sqlx::query_as(
+            "SELECT * FROM signal_chains WHERE user_id = ? ORDER BY name ASC"
+        )
+        .bind(user_id)
+        .fetch_all(&self.pool).await?;
+
+        Ok(rows.into_iter().map(|r| r.into()).collect())
+    }
+
+    pub async fn get_chain(&self, user_id: i64, chain_id: i64) -> Result<Option<SignalChain>, sqlx::Error> {
+        let row: Option<ChainRow> = sqlx::query_as(
+            "SELECT * FROM signal_chains WHERE id = ? AND user_id = ?"
+        )
+        .bind(chain_id).bind(user_id)
+        .fetch_optional(&self.pool).await?;
+
+        Ok(row.map(|r| r.into()))
+    }
+
+    pub async fn update_chain_hours(&self, chain_id: i64, hours_to_add: f64) -> Result<(), sqlx::Error> {
+        sqlx::query("UPDATE signal_chains SET total_hours = total_hours + ? WHERE id = ?")
+            .bind(hours_to_add).bind(chain_id)
+            .execute(&self.pool).await?;
+        Ok(())
+    }
+
+    // ════════════════════════════════════════════════════════════
+    //  Devices
+    // ════════════════════════════════════════════════════════════
+
+    /// Find or create a device by machine_id. Returns the device ID.
+    pub async fn upsert_device(
+        &self,
+        user_id: i64,
+        machine_id: &str,
+        name: Option<&str>,
+        platform: Option<&str>,
+        product: Option<&str>,
+    ) -> Result<i64, sqlx::Error> {
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
+
+        // Try to find existing
+        let existing: Option<(i64,)> = sqlx::query_as(
+            "SELECT id FROM devices WHERE user_id = ? AND machine_id = ?"
+        )
+        .bind(user_id).bind(machine_id)
+        .fetch_optional(&self.pool).await?;
+
+        if let Some((id,)) = existing {
+            // Update last_seen and increment listens
+            sqlx::query(
+                "UPDATE devices SET last_seen = ?, total_listens = total_listens + 1,
+                 name = COALESCE(?, name), platform = COALESCE(?, platform), product = COALESCE(?, product)
+                 WHERE id = ?"
+            )
+            .bind(now).bind(name).bind(platform).bind(product).bind(id)
+            .execute(&self.pool).await?;
+            Ok(id)
+        } else {
+            let result = sqlx::query(
+                "INSERT INTO devices (user_id, machine_id, name, platform, product, first_seen, last_seen, total_listens)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, 1)"
+            )
+            .bind(user_id).bind(machine_id).bind(name).bind(platform).bind(product).bind(now).bind(now)
+            .execute(&self.pool).await?;
+            Ok(result.last_insert_rowid())
+        }
+    }
+
+    pub async fn get_devices(&self, user_id: i64) -> Result<Vec<DeviceRow>, sqlx::Error> {
+        sqlx::query_as("SELECT * FROM devices WHERE user_id = ? ORDER BY last_seen DESC")
+            .bind(user_id)
+            .fetch_all(&self.pool).await
+    }
+
+    // ════════════════════════════════════════════════════════════
+    //  Equipment
+    // ════════════════════════════════════════════════════════════
+
+    pub async fn upsert_equipment(
+        &self,
+        user_id: i64,
+        name: &str,
+        equipment_type: &str,
+        brand: Option<&str>,
+        model: Option<&str>,
+        hours_to_add: f64,
+    ) -> Result<i64, sqlx::Error> {
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
+
+        let existing: Option<(i64,)> = sqlx::query_as(
+            "SELECT id FROM equipment WHERE user_id = ? AND name = ?"
+        ).bind(user_id).bind(name).fetch_optional(&self.pool).await?;
+
+        if let Some((id,)) = existing {
+            sqlx::query(
+                "UPDATE equipment SET total_hours = total_hours + ?, last_used = ? WHERE id = ?"
+            ).bind(hours_to_add).bind(now).bind(id)
+            .execute(&self.pool).await?;
+            Ok(id)
+        } else {
+            let result = sqlx::query(
+                "INSERT INTO equipment (user_id, name, type, brand, model, total_hours, first_used, last_used)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+            )
+            .bind(user_id).bind(name).bind(equipment_type).bind(brand).bind(model)
+            .bind(hours_to_add).bind(now).bind(now)
+            .execute(&self.pool).await?;
+            Ok(result.last_insert_rowid())
+        }
+    }
+
+    pub async fn get_equipment(&self, user_id: i64) -> Result<Vec<EquipmentRow>, sqlx::Error> {
+        sqlx::query_as("SELECT * FROM equipment WHERE user_id = ? ORDER BY total_hours DESC")
+            .bind(user_id)
+            .fetch_all(&self.pool).await
+    }
+
+    // ════════════════════════════════════════════════════════════
+    //  Sessions
+    // ════════════════════════════════════════════════════════════
+
+    /// Find or create a session for a scrobble. Sessions are grouped by
+    /// contiguous listening with gaps < session_gap_seconds (default 1800 = 30min).
+    pub async fn assign_session(
+        &self,
+        user_id: i64,
+        timestamp: i64,
+        duration_secs: i64,
+        device_id: Option<i64>,
+        chain_id: Option<i64>,
+        quality_score: Option<f64>,
+        listening_context: &str,
+        session_gap_seconds: i64,
+    ) -> Result<i64, sqlx::Error> {
+        // Find an open session that this scrobble belongs to
+        let recent: Option<(i64, i64)> = sqlx::query_as(
+            "SELECT id, ended_at FROM sessions
+             WHERE user_id = ? AND ended_at >= ? - ?
+             ORDER BY ended_at DESC LIMIT 1"
+        )
+        .bind(user_id).bind(timestamp).bind(session_gap_seconds)
+        .fetch_optional(&self.pool).await?;
+
+        let ended_at = timestamp + duration_secs;
+
+        if let Some((session_id, _)) = recent {
+            // Extend existing session
+            sqlx::query(
+                "UPDATE sessions SET
+                    ended_at = MAX(ended_at, ?),
+                    track_count = track_count + 1,
+                    total_duration = total_duration + ?,
+                    avg_quality_score = CASE
+                        WHEN ? IS NOT NULL THEN
+                            (COALESCE(avg_quality_score, 0) * track_count + ?) / (track_count + 1)
+                        ELSE avg_quality_score
+                    END
+                 WHERE id = ?"
+            )
+            .bind(ended_at).bind(duration_secs)
+            .bind(quality_score).bind(quality_score)
+            .bind(session_id)
+            .execute(&self.pool).await?;
+            Ok(session_id)
+        } else {
+            // Create new session
+            let result = sqlx::query(
+                "INSERT INTO sessions (user_id, device_id, chain_id, started_at, ended_at,
+                    track_count, total_duration, avg_quality_score, listening_context)
+                 VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?)"
+            )
+            .bind(user_id).bind(device_id).bind(chain_id)
+            .bind(timestamp).bind(ended_at)
+            .bind(duration_secs).bind(quality_score).bind(listening_context)
+            .execute(&self.pool).await?;
+            Ok(result.last_insert_rowid())
+        }
+    }
+
+    // ════════════════════════════════════════════════════════════
+    //  User & Token Management
+    // ════════════════════════════════════════════════════════════
 
     fn hash_token(token: &str) -> String {
         let mut hasher = Sha256::new();
@@ -270,133 +625,68 @@ impl Database {
         format!("{:x}", hasher.finalize())
     }
 
-    /// Validate a token and return the associated user.
-    /// Also updates `last_used_at`.
     pub async fn validate_token(&self, token: &str) -> Result<Option<AuthUser>, sqlx::Error> {
         let token_hash = Self::hash_token(token);
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs() as i64;
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
 
         let row: Option<(i64, String)> = sqlx::query_as(
-            "SELECT u.id, u.username
-             FROM tokens t
-             JOIN users u ON t.user_id = u.id
-             WHERE t.token_hash = ?
-               AND (t.expires_at IS NULL OR t.expires_at > ?)"
+            "SELECT u.id, u.username FROM tokens t JOIN users u ON t.user_id = u.id
+             WHERE t.token_hash = ? AND (t.expires_at IS NULL OR t.expires_at > ?)"
         )
-        .bind(&token_hash)
-        .bind(now)
-        .fetch_optional(&self.pool)
-        .await?;
+        .bind(&token_hash).bind(now)
+        .fetch_optional(&self.pool).await?;
 
         if let Some((user_id, username)) = &row {
-            // Fire-and-forget last_used update
             let _ = sqlx::query("UPDATE tokens SET last_used_at = ? WHERE token_hash = ?")
-                .bind(now)
-                .bind(&token_hash)
-                .execute(&self.pool)
-                .await;
-
-            Ok(Some(AuthUser {
-                user_id: *user_id,
-                username: username.clone(),
-            }))
+                .bind(now).bind(&token_hash).execute(&self.pool).await;
+            Ok(Some(AuthUser { user_id: *user_id, username: username.clone() }))
         } else {
             Ok(None)
         }
     }
 
-    /// Create a new user. Returns the user id.
-    pub async fn create_user(
-        &self,
-        username: &str,
-        display_name: Option<&str>,
-        password_hash: &str,
-    ) -> Result<i64, sqlx::Error> {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs() as i64;
-
-        let result = sqlx::query(
-            "INSERT INTO users (username, display_name, password_hash, created_at)
-             VALUES (?, ?, ?, ?)"
-        )
-        .bind(username)
-        .bind(display_name)
-        .bind(password_hash)
-        .bind(now)
-        .execute(&self.pool)
-        .await?;
-
+    pub async fn create_user(&self, username: &str, display_name: Option<&str>, password_hash: &str) -> Result<i64, sqlx::Error> {
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
+        let result = sqlx::query("INSERT INTO users (username, display_name, password_hash, created_at) VALUES (?, ?, ?, ?)")
+            .bind(username).bind(display_name).bind(password_hash).bind(now)
+            .execute(&self.pool).await?;
         Ok(result.last_insert_rowid())
     }
 
-    /// Create a new API token. Returns the raw token string (`td_<hex>`).
-    pub async fn create_token(
-        &self,
-        user_id: i64,
-        name: &str,
-        scopes: &str,
-    ) -> Result<String, sqlx::Error> {
+    pub async fn create_token(&self, user_id: i64, name: &str, scopes: &str) -> Result<String, sqlx::Error> {
         use rand::Rng;
         let raw: [u8; 24] = rand::rng().random();
         let token = format!("td_{}", hex::encode(raw));
         let token_hash = Self::hash_token(&token);
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
 
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs() as i64;
-
-        sqlx::query(
-            "INSERT INTO tokens (user_id, token_hash, name, scopes, created_at)
-             VALUES (?, ?, ?, ?, ?)"
-        )
-        .bind(user_id)
-        .bind(&token_hash)
-        .bind(name)
-        .bind(scopes)
-        .bind(now)
-        .execute(&self.pool)
-        .await?;
+        sqlx::query("INSERT INTO tokens (user_id, token_hash, name, scopes, created_at) VALUES (?, ?, ?, ?, ?)")
+            .bind(user_id).bind(&token_hash).bind(name).bind(scopes).bind(now)
+            .execute(&self.pool).await?;
 
         info!("🔑 Created token '{}' for user_id {}", name, user_id);
         Ok(token)
     }
 
-    /// Check if any users exist (for first-run setup).
     pub async fn has_users(&self) -> Result<bool, sqlx::Error> {
-        let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM users")
-            .fetch_one(&self.pool)
-            .await?;
+        let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM users").fetch_one(&self.pool).await?;
         Ok(count.0 > 0)
     }
 
-    /// List all users.
     pub async fn list_users(&self) -> Result<Vec<UserRecord>, sqlx::Error> {
-        sqlx::query_as::<_, UserRecord>(
-            "SELECT id, username, display_name, created_at FROM users ORDER BY id ASC"
-        )
-        .fetch_all(&self.pool)
-        .await
+        sqlx::query_as("SELECT id, username, display_name, created_at FROM users ORDER BY id ASC")
+            .fetch_all(&self.pool).await
     }
 
-    /// List all tokens for a given user (without exposing the hash).
     pub async fn list_tokens(&self, user_id: i64) -> Result<Vec<TokenRecord>, sqlx::Error> {
-        sqlx::query_as::<_, TokenRecord>(
-            "SELECT id, name, scopes, created_at, last_used_at
-             FROM tokens WHERE user_id = ? ORDER BY created_at ASC"
-        )
-        .bind(user_id)
-        .fetch_all(&self.pool)
-        .await
+        sqlx::query_as("SELECT id, name, scopes, created_at, last_used_at FROM tokens WHERE user_id = ? ORDER BY created_at ASC")
+            .bind(user_id).fetch_all(&self.pool).await
     }
 }
 
-// ── Supporting record types ──
+// ════════════════════════════════════════════════════════════
+//  Row types
+// ════════════════════════════════════════════════════════════
 
 #[derive(Debug, FromRow, serde::Serialize)]
 pub struct UserRecord {
@@ -413,4 +703,59 @@ pub struct TokenRecord {
     pub scopes: String,
     pub created_at: i64,
     pub last_used_at: Option<i64>,
+}
+
+#[derive(Debug, FromRow)]
+pub struct ChainRow {
+    pub id: i64,
+    pub user_id: i64,
+    pub name: String,
+    pub description: Option<String>,
+    pub components: String,
+    pub listening_context: String,
+    pub is_active: bool,
+    pub total_hours: f64,
+    pub created_at: i64,
+}
+
+impl From<ChainRow> for SignalChain {
+    fn from(r: ChainRow) -> Self {
+        let components = serde_json::from_str(&r.components).unwrap_or_default();
+        SignalChain {
+            id: Some(r.id), user_id: r.user_id, name: r.name,
+            description: r.description, components,
+            listening_context: ListeningContext::from_str_loose(&r.listening_context),
+            is_active: r.is_active, total_hours: r.total_hours, created_at: r.created_at,
+        }
+    }
+}
+
+#[derive(Debug, FromRow, serde::Serialize)]
+pub struct DeviceRow {
+    pub id: i64,
+    pub user_id: i64,
+    pub machine_id: String,
+    pub name: Option<String>,
+    pub platform: Option<String>,
+    pub product: Option<String>,
+    pub device_type: Option<String>,
+    pub default_chain_id: Option<i64>,
+    pub first_seen: i64,
+    pub last_seen: i64,
+    pub total_listens: i64,
+}
+
+#[derive(Debug, FromRow, serde::Serialize)]
+pub struct EquipmentRow {
+    pub id: i64,
+    pub user_id: i64,
+    pub name: String,
+    #[sqlx(rename = "type")]
+    pub equipment_type: String,
+    pub brand: Option<String>,
+    pub model: Option<String>,
+    pub total_hours: f64,
+    pub first_used: Option<i64>,
+    pub last_used: Option<i64>,
+    pub notes: Option<String>,
 }
