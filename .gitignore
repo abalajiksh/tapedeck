@@ -30,3 +30,11 @@ scrobbles.db
 tapedeck.db
 
 *.lock
+
+
+static/*
+!static/index.html
+
+# Bun / Node
+web/node_modules/
+web/.svelte-kit/

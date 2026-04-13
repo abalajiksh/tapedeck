@@ -8,6 +8,7 @@ mod musicbrainz;
 mod server;
 mod sinks;
 mod sources;
+mod web_assets;
 
 use std::sync::Arc;
 

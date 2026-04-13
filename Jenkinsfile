@@ -65,6 +65,20 @@ pipeline {
       }
     }
 
+    stage('Build Frontend') {
+      steps {
+        sh '''
+          if ! command -v bun &> /dev/null; then
+            curl -fsSL https://bun.sh/install | bash
+            export PATH="$HOME/.bun/bin:$PATH"
+          fi
+          cd web
+          bun install --frozen-lockfile
+          bun run build
+        '''
+      }
+    }
+
     stage('Release') {
       steps {
         sh 'cargo build --release'

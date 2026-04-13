@@ -1,6 +1,6 @@
 [package]
 name = "tapedeck"
-version = "0.5.2"
+version = "0.6.0"
 edition = "2021"
 
 [dependencies]
@@ -43,3 +43,7 @@ hex = "0.4"
 dotenv = "0.15"
 urlencoding = "2.1"
 chrono = "0.4"
+
+# Frontend
+rust-embed = "8"
+mime_guess = "2"

@@ -13,6 +13,7 @@ use crate::db::Database;
 use crate::logging::LogLevelHandle;
 use crate::musicbrainz::MusicBrainzClient;
 use crate::sinks::ScrobbleSink;
+use crate::web_assets;
 
 /// Shared application state available to all request handlers.
 pub struct AppState {
@@ -37,4 +38,5 @@ pub fn build_app(state: Arc<AppState>) -> Router {
     Router::new()
         .merge(admin)
         .merge(api)
+	.merge(web_assets::create_frontend_router())
 }

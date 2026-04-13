@@ -1,0 +1,49 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+	body {
+		@apply bg-rp-base text-rp-text font-sans antialiased;
+	}
+
+	/* Scrollbar styling */
+	::-webkit-scrollbar {
+		width: 8px;
+		height: 8px;
+	}
+	::-webkit-scrollbar-track {
+		@apply bg-rp-base;
+	}
+	::-webkit-scrollbar-thumb {
+		@apply bg-rp-hl-high rounded-full;
+	}
+	::-webkit-scrollbar-thumb:hover {
+		@apply bg-rp-muted;
+	}
+
+	/* Selection */
+	::selection {
+		@apply bg-rp-iris/30 text-rp-text;
+	}
+}
+
+@layer components {
+	/* Quality badges */
+	.badge-lossless {
+		@apply inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-medium tracking-wide uppercase
+		       bg-rp-pine/20 text-rp-foam border border-rp-pine/30;
+	}
+	.badge-lossy {
+		@apply inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-medium tracking-wide uppercase
+		       bg-rp-gold/15 text-rp-gold border border-rp-gold/25;
+	}
+	.badge-dsd {
+		@apply inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-medium tracking-wide uppercase
+		       bg-rp-iris/20 text-rp-iris border border-rp-iris/30;
+	}
+	.badge-bt {
+		@apply inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-medium tracking-wide uppercase
+		       bg-rp-love/15 text-rp-love border border-rp-love/25;
+	}
+}
