@@ -11,8 +11,6 @@ use crate::sources::{MusicSource, PlexSource};
 
 use super::enrichment::enrich_play;
 
-/// Central orchestrator that owns all runtime resources and drives the
-/// poll → enrich → dedup → store → dispatch pipeline.
 pub struct ScrobbleEngine {
     sources: Vec<Box<dyn MusicSource>>,
     sinks: Arc<Vec<Box<dyn ScrobbleSink>>>,
@@ -30,10 +28,7 @@ impl ScrobbleEngine {
         mb_client: Arc<MusicBrainzClient>,
     ) -> Self {
         Self {
-            sources,
-            sinks,
-            db,
-            mb_client,
+            sources, sinks, db, mb_client,
             poll_interval: Duration::from_secs(15),
             default_user_id: 1,
         }
@@ -81,12 +76,19 @@ impl ScrobbleEngine {
                                     let mut play = plex_track.to_play(&format!("scrobble-{}", current_time));
                                     enrich_play(&mb_client, &mut play, plex_track.album.as_deref()).await;
 
-                                    // Polling sources don't send quality/device/chain yet
+                                    // Pass Plex-extracted audio quality if available
+                                    let quality_ref = plex_track.audio_quality.as_ref();
+                                    let quality_log = quality_ref
+                                        .and_then(|q| q.quality_score)
+                                        .map(|s| format!("{:.0}", s))
+                                        .unwrap_or_else(|| "n/a".into());
+
                                     match db.save_scrobble(
-                                        default_user_id, &play, None,
+                                        default_user_id, &play, quality_ref,
                                         None, None, None, Some("Plex"),
                                     ).await {
-                                        Ok(true) => info!("📥 Queued new play: {} - {}", play.artist, play.title),
+                                        Ok(true) => info!("📥 Queued: {} - {} [quality: {}]",
+                                            play.artist, play.title, quality_log),
                                         Ok(false) => {}
                                         Err(e) => error!("Database error: {}", e),
                                     }

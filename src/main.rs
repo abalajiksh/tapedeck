@@ -23,24 +23,19 @@ use crate::sources::{MusicSource, PlexSource, PlexFilters};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Load .env first (Config::load() also calls dotenv, but we need it for RUST_LOG before logging init)
     dotenv::dotenv().ok();
 
+    // ── Configuration (TOML + env overrides) ──
+    let config = Config::load();
+
     // ── Logging ──
-    let enable_file_logging = std::env::var("ENABLE_FILE_LOGGING")
-        .unwrap_or_else(|_| "true".into())
-        .parse::<bool>()
-        .unwrap_or(true);
-    let enable_console = std::env::var("ENABLE_CONSOLE_LOGGING")
-        .unwrap_or_else(|_| "true".into())
-        .parse::<bool>()
-        .unwrap_or(true);
-    let log_dir = std::env::var("LOG_DIR").ok();
-
-    let log_handle = logging::init_logging(log_dir.as_deref(), enable_file_logging, enable_console)?;
-    info!("🚀 Tapedeck Scrobbler Service Started");
-
-    // ── Configuration ──
-    let config = Config::from_env();
+    let log_handle = logging::init_logging(
+        Some(&config.logging.dir),
+        config.logging.file_enabled,
+        config.logging.console_enabled,
+    )?;
+    info!("🚀 Tapedeck v{} Started", env!("CARGO_PKG_VERSION"));
 
     // ── MusicBrainz client ──
     let sqlite_path = config.database.sqlite_path.clone();
@@ -61,20 +56,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mb_client = Arc::new(mb_client);
 
     // ── Scrobble database ──
-    let db_url = std::env::var("DATABASE_URL")
-        .unwrap_or_else(|_| "sqlite:scrobbles.db?mode=rwc".into());
-    info!("📦 Initializing scrobble database at {}", db_url);
-    let db = Arc::new(Database::new(&db_url).await?);
+    info!("📦 Initializing scrobble database at {}", config.database.scrobble_db_url);
+    let db = Arc::new(Database::new(&config.database.scrobble_db_url).await?);
 
     // ── First-run setup ──
     if !db.has_users().await? {
         info!("🔑 First run detected — creating admin user and token...");
-        let user_id = db
-            .create_user("admin", Some("Admin"), "not-used-yet")
-            .await?;
-        let token = db
-            .create_token(user_id, "default", "submit")
-            .await?;
+        let user_id = db.create_user("admin", Some("Admin"), "not-used-yet").await?;
+        let token = db.create_token(user_id, "default", "submit").await?;
         info!("════════════════════════════════════════════════════════");
         info!("🔑 Admin API token (save this — it won't be shown again!):");
         info!("   {}", token);
@@ -108,7 +97,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // Sources are optional now — ingest API can work without any polling sources
     if sources.is_empty() {
         info!("ℹ️ No polling sources enabled — running in ingest-only mode");
     }
@@ -139,12 +127,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let sinks: Arc<Vec<Box<dyn ScrobbleSink>>> = Arc::new(sink_vec);
 
     // ── HTTP server ──
-    let server_port: u16 = std::env::var("PORT")
-        .or_else(|_| std::env::var("ADMIN_PORT"))
-        .unwrap_or_else(|_| "8080".into())
-        .parse()
-        .unwrap_or(8080);
-
     let app_state = Arc::new(server::AppState {
         db: db.clone(),
         mb_client: mb_client.clone(),
@@ -153,9 +135,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     let app = server::build_app(app_state);
+    let server_port = config.server.port;
+    let server_host = config.server.host.clone();
 
     tokio::spawn(async move {
-        let addr = format!("0.0.0.0:{}", server_port);
+        let addr = format!("{}:{}", server_host, server_port);
         info!("🌐 Starting server on {}", addr);
         let listener = match tokio::net::TcpListener::bind(&addr).await {
             Ok(l) => l,

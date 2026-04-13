@@ -1,6 +1,6 @@
 [package]
 name = "tapedeck"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2021"
 
 [dependencies]
@@ -18,12 +18,13 @@ reqwest = { version = "0.12.28", features = ["json"] }
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+toml = "0.8"
 quick-xml = { version = "0.31", features = ["serialize"] }
 
 # Database
 sqlx = { version = "0.7", features = ["runtime-tokio-rustls", "sqlite", "postgres"] }
 
-# Logging (tracing ecosystem — log + env_logger removed in 0.4.0)
+# Logging
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 tracing-appender = "0.2"
