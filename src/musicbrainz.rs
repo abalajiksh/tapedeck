@@ -6,6 +6,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{Semaphore, RwLock};
 
+/// How long (seconds) to cache a "not found" result before retrying the API.
+const NEGATIVE_CACHE_TTL_SECS: i64 = 7 * 24 * 3600; // 7 days
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MusicBrainzMetadata {
     pub track_mbid: Option<String>,
@@ -112,8 +115,13 @@ impl MusicBrainzClient {
         artist_name: &str,
         album_name: Option<&str>,
     ) -> Result<MusicBrainzMetadata> {
-        // Tier 1: Check SQLite cache
+        // Tier 1: Check SQLite cache (includes negative cache entries)
         if let Some(cached) = self.get_from_sqlite(track_title, artist_name, album_name).await? {
+            if cached.track_mbid.is_none() {
+                // Negative cache hit — return the error without hitting the API
+                tracing::debug!("Skipping API call (negative cache): {} - {}", artist_name, track_title);
+                return Err(anyhow!("No results found for {} - {} (cached)", artist_name, track_title));
+            }
             tracing::debug!("Cache hit (SQLite) for: {} - {}", artist_name, track_title);
             return Ok(cached);
         }
@@ -191,7 +199,21 @@ impl MusicBrainzClient {
         };
 
         match query.fetch_optional(&self.sqlite_pool).await? {
-            Some(row) => Ok(Some(row.into())),
+            Some(row) => {
+                let metadata: MusicBrainzMetadata = row.into();
+                // Check if this is a negative cache entry (no track MBID found)
+                if metadata.track_mbid.is_none() {
+                    let now = chrono::Utc::now().timestamp();
+                    if now - metadata.fetched_at > NEGATIVE_CACHE_TTL_SECS {
+                        // Stale negative entry — allow a retry
+                        tracing::debug!("Negative cache expired for: {} - {}", artist_name, track_title);
+                        return Ok(None);
+                    }
+                    // Fresh negative entry — return it to skip the API call
+                    tracing::debug!("Negative cache hit for: {} - {}", artist_name, track_title);
+                }
+                Ok(Some(metadata))
+            }
             None => Ok(None),
         }
     }
@@ -249,8 +271,6 @@ impl MusicBrainzClient {
             None => return Ok(None),
         };
 
-        // Query the MusicBrainz PostgreSQL dump
-        // Adjust table/column names based on your actual MB schema
         let result = sqlx::query_as::<_, PostgresMBRow>(
             r#"
             SELECT
@@ -356,12 +376,29 @@ impl MusicBrainzClient {
                 fetched_at: chrono::Utc::now().timestamp(),
             })
         } else {
+            // Store a negative-cache sentinel so we don't re-query this every cycle
+            let negative = MusicBrainzMetadata {
+                track_mbid: None,
+                artist_mbid: None,
+                album_mbid: None,
+                track_title: track_title.to_string(),
+                artist_name: artist_name.to_string(),
+                album_name: _album_name.map(|s| s.to_string()),
+                release_date: None,
+                genres: Vec::new(),
+                caa_id: None,
+                caa_release_mbid: None,
+                fetched_at: chrono::Utc::now().timestamp(),
+            };
+            // Best-effort cache — don't fail the whole call if this errors
+            if let Err(e) = self.store_in_sqlite(&negative).await {
+                tracing::warn!("Failed to store negative cache entry: {}", e);
+            }
             Err(anyhow!("No results found for {} - {}", artist_name, track_title))
         }
     }
 
     /// Fetch Cover Art Archive info for a release
-    /// Returns (caa_id, release_mbid) - extracts just the MBID from the URL
     async fn fetch_cover_art_info(&self, release_mbid: &str) -> Result<(Option<i64>, Option<String>)> {
         // Rate limiting
         self.rate_limiter.acquire().await;
@@ -378,29 +415,24 @@ impl MusicBrainzClient {
             .await?;
 
         if !response.status().is_success() {
-            // No cover art available
             return Ok((None, None));
         }
 
         let caa_response: CAAResponse = response.json().await?;
 
-        // Get the front cover or first image
         let front_image = caa_response.images.iter()
             .find(|img| img.front)
             .or_else(|| caa_response.images.first());
 
         if let Some(image) = front_image {
-            // Extract MBID from URL if needed
-            // CAA returns "https://musicbrainz.org/release/{mbid}" but we only want the MBID
             let release_mbid_clean = Self::extract_mbid_from_url(&caa_response.release);
             Ok((Some(image.id), Some(release_mbid_clean)))
         } else {
-            Ok((None, None))}
+            Ok((None, None))
+        }
     }
 
-    /// Extract MBID from a MusicBrainz URL or return as-is if already just an MBID
     fn extract_mbid_from_url(url_or_mbid: &str) -> String {
-        // If it's a URL like "https://musicbrainz.org/release/{mbid}", extract the MBID
         if url_or_mbid.starts_with("http://") || url_or_mbid.starts_with("https://") {
             url_or_mbid
                 .split('/')
@@ -408,7 +440,6 @@ impl MusicBrainzClient {
                 .unwrap_or(url_or_mbid)
                 .to_string()
         } else {
-            // Already just an MBID
             url_or_mbid.to_string()
         }
     }
@@ -535,7 +566,6 @@ struct MBTag {
     #[serde(default)]
     count: Option<i32>,
 }
-
 
 #[derive(Debug, Deserialize)]
 struct CAAResponse {

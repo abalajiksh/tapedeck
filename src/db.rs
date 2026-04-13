@@ -4,7 +4,7 @@ use crate::models::*;
 use tracing::{info, debug};
 use sha2::{Sha256, Digest};
 
-#[derive(Debug, FromRow)]
+#[derive(Debug, FromRow, serde::Serialize)]
 pub struct ScrobbleRecord {
     pub id: i64,
     pub user_id: i64,
@@ -411,6 +411,113 @@ impl Database {
     }
 
     // ════════════════════════════════════════════════════════════
+    //  Scrobble Reads (for the web UI)
+    // ════════════════════════════════════════════════════════════
+
+    /// Fetch scrobbles for a user with optional filters, ordered newest-first.
+    pub async fn get_recent_scrobbles(
+        &self,
+        user_id: i64,
+        limit: i64,
+        offset: i64,
+        artist_filter: Option<&str>,
+        album_filter: Option<&str>,
+        after: Option<i64>,
+        before: Option<i64>,
+    ) -> Result<Vec<ScrobbleRecord>, sqlx::Error> {
+        let rows: Vec<ScrobbleRecord> = sqlx::query_as::<_, ScrobbleRecord>(
+            "SELECT * FROM scrobbles
+             WHERE user_id = ?
+               AND (? IS NULL OR LOWER(artist) LIKE '%' || LOWER(?) || '%')
+               AND (? IS NULL OR LOWER(album) LIKE '%' || LOWER(?) || '%')
+               AND (? IS NULL OR timestamp >= ?)
+               AND (? IS NULL OR timestamp <= ?)
+             ORDER BY timestamp DESC
+             LIMIT ? OFFSET ?"
+        )
+        .bind(user_id)
+        .bind(artist_filter).bind(artist_filter)
+        .bind(album_filter).bind(album_filter)
+        .bind(after).bind(after)
+        .bind(before).bind(before)
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows)
+    }
+
+    /// Quick dashboard stats: today's count, week count, lossless percentage, top artist.
+    pub async fn get_dashboard_stats(&self, user_id: i64) -> Result<serde_json::Value, sqlx::Error> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
+        let today_start = now - (now % 86400);
+        let week_start = now - (7 * 86400);
+
+        let today: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM scrobbles WHERE user_id = ? AND timestamp >= ?"
+        ).bind(user_id).bind(today_start).fetch_one(&self.pool).await?;
+
+        let week: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM scrobbles WHERE user_id = ? AND timestamp >= ?"
+        ).bind(user_id).bind(week_start).fetch_one(&self.pool).await?;
+
+        let total: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM scrobbles WHERE user_id = ?"
+        ).bind(user_id).fetch_one(&self.pool).await?;
+
+        let lossless_count: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM scrobbles WHERE user_id = ? AND is_lossless = TRUE"
+        ).bind(user_id).fetch_one(&self.pool).await?;
+
+        let lossless_pct = if total.0 > 0 {
+            (lossless_count.0 as f64 / total.0 as f64 * 100.0).round() as i64
+        } else { 0 };
+
+        let top_artist: Option<(String, i64)> = sqlx::query_as(
+            "SELECT artist, COUNT(*) as cnt FROM scrobbles
+             WHERE user_id = ? AND timestamp >= ?
+             GROUP BY artist ORDER BY cnt DESC LIMIT 1"
+        ).bind(user_id).bind(now - 30 * 86400).fetch_optional(&self.pool).await?;
+
+        let unique_artists: (i64,) = sqlx::query_as(
+            "SELECT COUNT(DISTINCT artist) FROM scrobbles WHERE user_id = ?"
+        ).bind(user_id).fetch_one(&self.pool).await?;
+
+        let unique_albums: (i64,) = sqlx::query_as(
+            "SELECT COUNT(DISTINCT album) FROM scrobbles WHERE user_id = ? AND album IS NOT NULL"
+        ).bind(user_id).fetch_one(&self.pool).await?;
+
+        let unique_tracks: (i64,) = sqlx::query_as(
+            "SELECT COUNT(DISTINCT title || '|' || artist) FROM scrobbles WHERE user_id = ?"
+        ).bind(user_id).fetch_one(&self.pool).await?;
+
+        let total_duration: (Option<i64>,) = sqlx::query_as(
+            "SELECT SUM(duration) FROM scrobbles WHERE user_id = ? AND duration IS NOT NULL"
+        ).bind(user_id).fetch_one(&self.pool).await?;
+        let total_hours = total_duration.0.unwrap_or(0) as f64 / 3600.0;
+
+        let avg_quality: (Option<f64>,) = sqlx::query_as(
+            "SELECT AVG(quality_score) FROM scrobbles WHERE user_id = ? AND quality_score IS NOT NULL"
+        ).bind(user_id).fetch_one(&self.pool).await?;
+
+        Ok(serde_json::json!({
+            "today": today.0,
+            "this_week": week.0,
+            "total": total.0,
+            "lossless_pct": lossless_pct,
+            "top_artist": top_artist.as_ref().map(|(a, _)| a.as_str()).unwrap_or("—"),
+            "top_artist_count": top_artist.as_ref().map(|(_, c)| *c).unwrap_or(0),
+            "unique_artists": unique_artists.0,
+            "unique_albums": unique_albums.0,
+            "unique_tracks": unique_tracks.0,
+            "total_hours": (total_hours * 10.0).round() / 10.0,
+            "avg_quality": avg_quality.0.map(|q| (q * 10.0).round() / 10.0).unwrap_or(0.0),
+        }))
+    }
+
+    // ════════════════════════════════════════════════════════════
     //  Signal Chains
     // ════════════════════════════════════════════════════════════
 
@@ -465,7 +572,6 @@ impl Database {
     //  Devices
     // ════════════════════════════════════════════════════════════
 
-    /// Find or create a device by machine_id. Returns the device ID.
     pub async fn upsert_device(
         &self,
         user_id: i64,
@@ -476,7 +582,6 @@ impl Database {
     ) -> Result<i64, sqlx::Error> {
         let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
 
-        // Try to find existing
         let existing: Option<(i64,)> = sqlx::query_as(
             "SELECT id FROM devices WHERE user_id = ? AND machine_id = ?"
         )
@@ -484,7 +589,6 @@ impl Database {
         .fetch_optional(&self.pool).await?;
 
         if let Some((id,)) = existing {
-            // Update last_seen and increment listens
             sqlx::query(
                 "UPDATE devices SET last_seen = ?, total_listens = total_listens + 1,
                  name = COALESCE(?, name), platform = COALESCE(?, platform), product = COALESCE(?, product)
@@ -557,8 +661,6 @@ impl Database {
     //  Sessions
     // ════════════════════════════════════════════════════════════
 
-    /// Find or create a session for a scrobble. Sessions are grouped by
-    /// contiguous listening with gaps < session_gap_seconds (default 1800 = 30min).
     pub async fn assign_session(
         &self,
         user_id: i64,
@@ -570,7 +672,6 @@ impl Database {
         listening_context: &str,
         session_gap_seconds: i64,
     ) -> Result<i64, sqlx::Error> {
-        // Find an open session that this scrobble belongs to
         let recent: Option<(i64, i64)> = sqlx::query_as(
             "SELECT id, ended_at FROM sessions
              WHERE user_id = ? AND ended_at >= ? - ?
@@ -582,7 +683,6 @@ impl Database {
         let ended_at = timestamp + duration_secs;
 
         if let Some((session_id, _)) = recent {
-            // Extend existing session
             sqlx::query(
                 "UPDATE sessions SET
                     ended_at = MAX(ended_at, ?),
@@ -601,7 +701,6 @@ impl Database {
             .execute(&self.pool).await?;
             Ok(session_id)
         } else {
-            // Create new session
             let result = sqlx::query(
                 "INSERT INTO sessions (user_id, device_id, chain_id, started_at, ended_at,
                     track_count, total_duration, avg_quality_score, listening_context)

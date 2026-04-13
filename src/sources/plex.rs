@@ -74,7 +74,6 @@ pub struct PlexTrack {
 
 impl PlexTrack {
     fn from_session(s: SessionMetadata) -> Option<Self> {
-        // Extract audio quality from Media[0].Part[0].Stream[0] (audio streams)
         let audio_quality = Self::extract_quality(&s);
 
         Some(Self {
@@ -106,20 +105,13 @@ impl PlexTrack {
             grandparent_rating_key: h.grandparent_rating_key,
             session_key: None,
             viewed_at: h.viewed_at,
-            audio_quality: None, // History API doesn't include media info
+            audio_quality: None,
         })
     }
 
-    /// Extract audio quality from Plex session metadata.
-    ///
-    /// Plex returns quality data in:
-    ///   - `Media[0].audioCodec`, `Media[0].bitrate`
-    ///   - `Media[0].Part[0].Stream[0]` (where streamType=2 is audio)
-    ///   - `TranscodeSession` if transcoding is active
     fn extract_quality(session: &SessionMetadata) -> Option<AudioQuality> {
         let media = session.media.as_ref()?.first()?;
 
-        // Find the audio stream (streamType == 2)
         let audio_stream = media.part.as_ref()
             .and_then(|parts| parts.first())
             .and_then(|part| part.stream.as_ref())
@@ -139,19 +131,16 @@ impl PlexTrack {
             .and_then(|s| s.channels)
             .or(media.audio_channels);
 
-        // Determine format type and lossless status
         let codec_lower = codec.as_deref().unwrap_or("").to_lowercase();
         let is_lossless = matches!(codec_lower.as_str(), "flac" | "alac" | "wav" | "aiff" | "dsd" | "pcm");
         let format_type = if codec_lower == "dsd" { "dsd" } else { "pcm" };
 
-        // Container from the media
         let container = media.container.clone();
 
-        // Check for transcoding
         let (is_transcoded, delivery_codec, delivery_bitrate, transcode_reason) =
             if let Some(ref tc) = session.transcode_session {
                 let tc_codec = tc.audio_codec.clone();
-                let is_tc = tc_codec.as_deref() != codec.as_deref(); // different codec = transcoded
+                let is_tc = tc_codec.as_deref() != codec.as_deref();
                 let reason = if is_tc {
                     tc.transcode_hw_requested.map(|_| "server_transcode".to_string())
                         .or_else(|| Some("bandwidth".to_string()))
@@ -163,7 +152,6 @@ impl PlexTrack {
                 (Some(false), None, None, None)
             };
 
-        // Only return if we have meaningful data
         if codec.is_none() && bitrate.is_none() && sample_rate.is_none() {
             return None;
         }
@@ -256,10 +244,8 @@ pub struct SessionMetadata {
     pub player: Option<Player>,
     #[serde(rename = "User")]
     pub user: Option<User>,
-    /// Media streams with codec/quality info
     #[serde(rename = "Media", default)]
     pub media: Option<Vec<PlexMedia>>,
-    /// Present when Plex is transcoding
     #[serde(rename = "TranscodeSession")]
     pub transcode_session: Option<TranscodeSession>,
 }
@@ -278,7 +264,6 @@ pub struct User {
     pub title: Option<String>,
 }
 
-/// Plex Media object containing codec and stream info
 #[derive(Debug, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct PlexMedia {
@@ -300,8 +285,6 @@ pub struct PlexPart {
     pub stream: Option<Vec<PlexStream>>,
 }
 
-/// Individual stream within a Plex media part.
-/// streamType 1 = video, 2 = audio, 3 = subtitle
 #[derive(Debug, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct PlexStream {
@@ -318,7 +301,6 @@ pub struct PlexStream {
     pub bit_depth: Option<i32>,
 }
 
-/// Plex transcode session info — present when server is transcoding
 #[derive(Debug, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct TranscodeSession {
@@ -348,7 +330,7 @@ pub struct Library {
     pub collection_type: String,
 }
 
-// ==================== History Track (used by manual XML parser) ====================
+// ==================== History Track ====================
 
 #[derive(Debug)]
 struct HistoryTrack {
@@ -548,6 +530,7 @@ impl PlexSource {
     fn parse_history_xml(xml: &str) -> Vec<HistoryTrack> {
         use quick_xml::Reader;
         use quick_xml::events::Event;
+        use quick_xml::escape::unescape;
 
         let mut reader = Reader::from_str(xml);
         let mut tracks = Vec::new();
@@ -572,7 +555,11 @@ impl PlexSource {
                     };
 
                     for attr in e.attributes().flatten() {
-                        let val = String::from_utf8_lossy(&attr.value).to_string();
+                        // FIX: Decode XML/HTML entities (&#339; → œ, &#8217; → ', etc.)
+                        let raw = String::from_utf8_lossy(&attr.value);
+                        let val = unescape(&raw)
+                            .map(|s| s.into_owned())
+                            .unwrap_or_else(|_| raw.into_owned());
                         match attr.key.as_ref() {
                             b"type" => track.media_type = Some(val),
                             b"viewedAt" => track.viewed_at = val.parse().ok(),

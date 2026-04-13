@@ -12,7 +12,7 @@
 	let error = '';
 	let connected = false;
 
-	// Quick stats (will come from a stats endpoint later)
+	// Quick stats
 	let todayCount = 0;
 	let weekCount = 0;
 	let losslessPct = 0;
@@ -24,11 +24,29 @@
 		} catch {
 			connected = false;
 			error = 'Cannot reach Tapedeck backend. Is it running?';
+			loading = false;
+			return;
 		}
-		loading = false;
 
-		// TODO: Wire up real endpoints once /api/v1/scrobbles exists
-		// For now, the page renders the empty/disconnected states.
+		// Fetch dashboard stats
+		try {
+			const stats = await api.getDashboardStats();
+			todayCount = stats.today;
+			weekCount = stats.this_week;
+			losslessPct = stats.lossless_pct;
+		} catch (e) {
+			console.warn('Stats not available:', e);
+		}
+
+		// Fetch recent scrobbles
+		try {
+			const res = await api.getScrobbles({ limit: 20 });
+			recentScrobbles = res.scrobbles;
+		} catch (e) {
+			console.warn('Scrobbles not available:', e);
+		}
+
+		loading = false;
 	});
 </script>
 

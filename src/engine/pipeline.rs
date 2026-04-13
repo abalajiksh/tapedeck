@@ -74,6 +74,17 @@ impl ScrobbleEngine {
 
                                 for plex_track in session_result.ready_to_scrobble {
                                     let mut play = plex_track.to_play(&format!("scrobble-{}", current_time));
+
+                                    // ── FIX: Check dedup BEFORE enrichment to avoid wasting MB API calls ──
+                                    let already_exists = db.exists(default_user_id, &play.source_id, &play.source_name).await.unwrap_or(false)
+                                        || db.fuzzy_exists(default_user_id, &play.title, &play.artist, play.timestamp as i64).await.unwrap_or(false);
+
+                                    if already_exists {
+                                        debug!("Skipping already-scrobbled: {} - {}", play.artist, play.title);
+                                        continue;
+                                    }
+
+                                    // Only enrich new tracks
                                     enrich_play(&mb_client, &mut play, plex_track.album.as_deref()).await;
 
                                     // Pass Plex-extracted audio quality if available

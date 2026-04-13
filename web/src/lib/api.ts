@@ -31,6 +31,20 @@ export interface Scrobble {
 	caa_release_mbid: string | null;
 }
 
+export interface DashboardStats {
+	today: number;
+	this_week: number;
+	total: number;
+	lossless_pct: number;
+	top_artist: string;
+	top_artist_count: number;
+	unique_artists: number;
+	unique_albums: number;
+	unique_tracks: number;
+	total_hours: number;
+	avg_quality: number;
+}
+
 export interface SignalChain {
 	id: number;
 	name: string;
@@ -71,6 +85,7 @@ export interface Equipment {
 export interface HealthStatus {
 	status: string;
 	service: string;
+	version: string;
 }
 
 class TapedeckAPI {
@@ -116,6 +131,31 @@ class TapedeckAPI {
 	// Health
 	async health(): Promise<HealthStatus> {
 		return this.get('/health');
+	}
+
+	// Scrobbles
+	async getScrobbles(params?: {
+		limit?: number;
+		offset?: number;
+		artist?: string;
+		album?: string;
+		after?: number;
+		before?: number;
+	}): Promise<{ scrobbles: Scrobble[]; count: number }> {
+		const query = new URLSearchParams();
+		if (params?.limit) query.set('limit', String(params.limit));
+		if (params?.offset) query.set('offset', String(params.offset));
+		if (params?.artist) query.set('artist', params.artist);
+		if (params?.album) query.set('album', params.album);
+		if (params?.after) query.set('after', String(params.after));
+		if (params?.before) query.set('before', String(params.before));
+		const qs = query.toString();
+		return this.get(`/api/v1/scrobbles${qs ? '?' + qs : ''}`);
+	}
+
+	// Dashboard stats
+	async getDashboardStats(): Promise<DashboardStats> {
+		return this.get('/api/v1/stats/dashboard');
 	}
 
 	// Chains
