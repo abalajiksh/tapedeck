@@ -595,7 +595,7 @@ impl PlexSource {
                 }
                 Ok(Event::Eof) => break,
                 Err(e) => {
-                    warn!("Error parsing history XML at position {}: {}", reader.error_position(), e);
+                    warn!("Error parsing history XML: {}",  e);
                     break;
                 }
                 _ => {}
