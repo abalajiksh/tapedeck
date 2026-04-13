@@ -33,8 +33,12 @@ tapedeck.db
 
 
 static/*
-!static/index.html
+
 
 # Bun / Node
 web/node_modules/
 web/.svelte-kit/
+
+
+logs/
+
