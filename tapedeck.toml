@@ -28,7 +28,7 @@ scrobble_db_url = "sqlite:scrobbles.db?mode=rwc"
 # dir = "./logs"
 
 [musicbrainz]
-user_agent = "Tapedeck/0.4.0 ( your-email@example.com )"
+user_agent = "Tapedeck/0.5.0 ( your-email@example.com )"
 rate_limit_per_second = 1
 # postgres_url = "postgresql://localhost/musicbrainz_db"
 # postgres_enabled = false
@@ -70,6 +70,13 @@ enabled = false
 api_key = ""                        # or set LASTFM_API_KEY
 secret = ""                         # or set LASTFM_SECRET
 session_key = ""                    # or set LASTFM_SESSION_KEY
+
+[sinks.librefm]
+enabled = false
+api_key = ""                        # or set LIBREFM_API_KEY
+secret = ""                         # or set LIBREFM_SECRET
+session_key = ""                    # or set LIBREFM_SESSION_KEY
+base_url = "https://libre.fm/2.0/"  # or your GNU FM instance URL
 
 # [sinks.maloja]
 # enabled = false

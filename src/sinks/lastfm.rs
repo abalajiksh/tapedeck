@@ -5,15 +5,43 @@ use super::ScrobbleSink;
 use tracing::{info, error, debug};
 use std::collections::HashMap;
 
+/// A scrobble sink for Last.fm-compatible APIs (Last.fm, Libre.fm, or any GNU FM instance).
 pub struct LastFmSink {
     api_key: String,
     secret: String,
     session_key: String,
     client: Client,
+    base_url: String,
+    service_name: String,
 }
 
 impl LastFmSink {
+    /// Create a sink for Last.fm (api.audioscrobbler.com).
     pub fn new(api_key: String, secret: String, session_key: String) -> Self {
+        Self::with_url(
+            api_key, secret, session_key,
+            "https://ws.audioscrobbler.com/2.0/".to_string(),
+            "Last.fm".to_string(),
+        )
+    }
+
+    /// Create a sink for Libre.fm (libre.fm) or any GNU FM-compatible server.
+    pub fn libre_fm(api_key: String, secret: String, session_key: String, base_url: Option<String>) -> Self {
+        Self::with_url(
+            api_key, secret, session_key,
+            base_url.unwrap_or_else(|| "https://libre.fm/2.0/".to_string()),
+            "Libre.fm".to_string(),
+        )
+    }
+
+    /// Create a sink with a custom API URL and service name.
+    pub fn with_url(
+        api_key: String,
+        secret: String,
+        session_key: String,
+        base_url: String,
+        service_name: String,
+    ) -> Self {
         let app_name = env!("CARGO_PKG_NAME");
         let app_version = env!("CARGO_PKG_VERSION");
         let user_agent = format!("{}/{}", app_name, app_version);
@@ -28,7 +56,13 @@ impl LastFmSink {
             secret,
             session_key,
             client,
+            base_url: base_url.trim_end_matches('/').to_string(),
+            service_name,
         }
+    }
+
+    fn api_endpoint(&self) -> &str {
+        &self.base_url
     }
 
     fn generate_signature(&self, params: &[(String, String)]) -> String {
@@ -50,7 +84,7 @@ impl LastFmSink {
 #[async_trait]
 impl ScrobbleSink for LastFmSink {
     fn name(&self) -> &str {
-        "Last.fm"
+        &self.service_name
     }
 
     fn as_any(&self) -> &dyn std::any::Any {
@@ -62,18 +96,16 @@ impl ScrobbleSink for LastFmSink {
             return Ok(());
         }
 
-        info!("Submitting {} plays to Last.fm...", plays.len());
+        info!("Submitting {} plays to {}...", plays.len(), self.service_name);
 
-        // Last.fm allows up to 50 scrobbles per request
         for chunk in plays.chunks(50) {
-            // Use owned Strings for both key and value — no more Box::leak
             let mut params: Vec<(String, String)> = Vec::new();
             params.push(("method".into(), "track.scrobble".into()));
             params.push(("api_key".into(), self.api_key.clone()));
             params.push(("sk".into(), self.session_key.clone()));
 
             for (i, play) in chunk.iter().enumerate() {
-                debug!("Preparing Last.fm scrobble for: {} - {}", play.artist, play.title);
+                debug!("Preparing {} scrobble for: {} - {}", self.service_name, play.artist, play.title);
 
                 params.push((format!("artist[{}]", i), play.artist.clone()));
                 params.push((format!("track[{}]", i), play.title.clone()));
@@ -111,21 +143,21 @@ impl ScrobbleSink for LastFmSink {
 
             let form_data: HashMap<String, String> = params.into_iter().collect();
 
-            let resp: Response = self.client.post("https://ws.audioscrobbler.com/2.0/")
+            let resp: Response = self.client.post(self.api_endpoint())
                 .form(&form_data)
                 .send()
                 .await?;
 
             if !resp.status().is_success() {
                 let error_text = resp.text().await.unwrap_or_default();
-                error!("Last.fm submission failed: {}", error_text);
-                return Err(format!("Last.fm API Error: {}", error_text).into());
+                error!("{} submission failed: {}", self.service_name, error_text);
+                return Err(format!("{} API Error: {}", self.service_name, error_text).into());
             }
 
-            debug!("Successfully submitted chunk of {} plays to Last.fm", chunk.len());
+            debug!("Successfully submitted chunk of {} plays to {}", chunk.len(), self.service_name);
         }
 
-        info!("✅ Successfully submitted {} plays to Last.fm", plays.len());
+        info!("✅ Successfully submitted {} plays to {}", plays.len(), self.service_name);
         Ok(())
     }
 }

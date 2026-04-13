@@ -23,7 +23,6 @@ use crate::sources::{MusicSource, PlexSource, PlexFilters};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Load .env first (Config::load() also calls dotenv, but we need it for RUST_LOG before logging init)
     dotenv::dotenv().ok();
 
     // ── Configuration (TOML + env overrides) ──
@@ -117,6 +116,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             config.lastfm.api_key.clone(),
             config.lastfm.secret.clone(),
             config.lastfm.session_key.clone(),
+        )));
+    }
+    if config.librefm.enabled {
+        info!("Initializing Libre.fm sink...");
+        sink_vec.push(Box::new(sinks::LastFmSink::libre_fm(
+            config.librefm.api_key.clone(),
+            config.librefm.secret.clone(),
+            config.librefm.session_key.clone(),
+            Some(config.librefm.base_url.clone()),
         )));
     }
 
