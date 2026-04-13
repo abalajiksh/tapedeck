@@ -348,38 +348,21 @@ pub struct Library {
     pub collection_type: String,
 }
 
-// ==================== History XML Structures ====================
+// ==================== History Track (used by manual XML parser) ====================
 
-#[derive(Debug, Deserialize)]
-#[serde(rename = "MediaContainer")]
-struct HistoryMediaContainer {
-    #[serde(rename = "Track", default)]
-    tracks: Vec<HistoryTrack>,
-}
-
-#[derive(Debug, Deserialize)]
+#[derive(Debug)]
 struct HistoryTrack {
-    #[serde(rename = "@type")]
     media_type: Option<String>,
-    #[serde(rename = "@viewedAt")]
     viewed_at: Option<u64>,
-    #[serde(rename = "@historyKey")]
+    #[allow(dead_code)]
     history_key: Option<String>,
-    #[serde(rename = "@title")]
     title: Option<String>,
-    #[serde(rename = "@grandparentTitle")]
     artist: Option<String>,
-    #[serde(rename = "@parentTitle")]
     album: Option<String>,
-    #[serde(rename = "@originalTitle")]
     track_artist: Option<String>,
-    #[serde(rename = "@duration")]
     duration: Option<u64>,
-    #[serde(rename = "@ratingKey")]
     rating_key: Option<String>,
-    #[serde(rename = "@parentRatingKey")]
     parent_rating_key: Option<String>,
-    #[serde(rename = "@grandparentRatingKey")]
     grandparent_rating_key: Option<String>,
 }
 
@@ -558,6 +541,70 @@ impl PlexSource {
         }
     }
 
+    /// Parse Plex history XML manually using quick_xml::Reader.
+    ///
+    /// quick_xml's serde deserializer fails on repeated same-name elements
+    /// ("duplicate field `Track`"), so we extract <Track> attributes directly.
+    fn parse_history_xml(xml: &str) -> Vec<HistoryTrack> {
+        use quick_xml::Reader;
+        use quick_xml::events::Event;
+
+        let mut reader = Reader::from_str(xml);
+        let mut tracks = Vec::new();
+
+        loop {
+            match reader.read_event() {
+                Ok(Event::Empty(ref e)) | Ok(Event::Start(ref e))
+                    if e.name().as_ref() == b"Track" =>
+                {
+                    let mut track = HistoryTrack {
+                        media_type: None,
+                        viewed_at: None,
+                        history_key: None,
+                        title: None,
+                        artist: None,
+                        album: None,
+                        track_artist: None,
+                        duration: None,
+                        rating_key: None,
+                        parent_rating_key: None,
+                        grandparent_rating_key: None,
+                    };
+
+                    for attr in e.attributes().flatten() {
+                        let val = String::from_utf8_lossy(&attr.value).to_string();
+                        match attr.key.as_ref() {
+                            b"type" => track.media_type = Some(val),
+                            b"viewedAt" => track.viewed_at = val.parse().ok(),
+                            b"historyKey" => track.history_key = Some(val),
+                            b"title" => track.title = Some(val),
+                            b"grandparentTitle" => track.artist = Some(val),
+                            b"parentTitle" => track.album = Some(val),
+                            b"originalTitle" => track.track_artist = Some(val),
+                            b"duration" => track.duration = val.parse().ok(),
+                            b"ratingKey" => track.rating_key = Some(val),
+                            b"parentRatingKey" => track.parent_rating_key = Some(val),
+                            b"grandparentRatingKey" => {
+                                track.grandparent_rating_key = Some(val)
+                            }
+                            _ => {}
+                        }
+                    }
+
+                    tracks.push(track);
+                }
+                Ok(Event::Eof) => break,
+                Err(e) => {
+                    warn!("Error parsing history XML at position {}: {}", reader.error_position(), e);
+                    break;
+                }
+                _ => {}
+            }
+        }
+
+        tracks
+    }
+
     async fn fetch_history_tracks(&mut self, _min_timestamp: u64) -> Result<Vec<PlexTrack>, Box<dyn std::error::Error>> {
         let endpoint = format!("{}/status/sessions/history/all", self.url);
         let resp = self.client.get(&endpoint)
@@ -572,21 +619,15 @@ impl PlexSource {
         }
 
         let text = resp.text().await?;
-        let container: HistoryMediaContainer = match quick_xml::de::from_str(&text) {
-            Ok(c) => c,
-            Err(e) => {
-                warn!("Failed to parse history XML: {}", e);
-                return Ok(Vec::new());
-            }
-        };
+        let history_tracks = Self::parse_history_xml(&text);
 
         let mut tracks = Vec::new();
         let seven_days_ago = SystemTime::now()
             .duration_since(UNIX_EPOCH).unwrap().as_secs()
             .saturating_sub(7 * 86400);
 
-        info!("Processing {} history tracks from Plex", container.tracks.len());
-        for h_track in container.tracks {
+        info!("Processing {} history tracks from Plex", history_tracks.len());
+        for h_track in history_tracks {
             if h_track.media_type.as_deref() != Some("track") { continue; }
             if let Some(ts) = h_track.viewed_at {
                 if ts < seven_days_ago {
