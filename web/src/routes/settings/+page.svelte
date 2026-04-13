@@ -2,13 +2,21 @@
 	import { onMount } from 'svelte';
 	import { api } from '$lib/api';
 
+	declare const __UI_VERSION__: string;
+	const uiVersion = __UI_VERSION__;
+	let backendVersion = '…';
+
 	let token = '';
 	let saved = false;
 	let healthStatus = '';
 	let checking = false;
 
-	onMount(() => {
+	onMount(async () => {
 		token = api.getToken();
+		try {
+			const health = await api.health();
+			backendVersion = health.version;
+		} catch { /* shown as '…' */ }
 	});
 
 	function saveToken() {
@@ -122,7 +130,7 @@
 	<section class="rounded-xl bg-rp-surface border border-rp-hl-med p-5">
 		<h2 class="text-sm font-medium text-rp-text mb-1">About</h2>
 		<div class="text-xs text-rp-muted space-y-1">
-			<p>Tapedeck v0.5.2</p>
+			<p>Server v{backendVersion} · UI v{uiVersion}</p>
 			<p>A self-hosted music intelligence hub.</p>
 			<p>
 				<a href="https://github.com/abalajiksh/tapedeck" target="_blank" rel="noopener"

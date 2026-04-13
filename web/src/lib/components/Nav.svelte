@@ -1,5 +1,20 @@
 <script lang="ts">
 	import { page } from '$app/stores';
+	import { onMount } from 'svelte';
+	import { api } from '$lib/api';
+
+	declare const __UI_VERSION__: string;
+	const uiVersion = __UI_VERSION__;
+	let backendVersion = '…';
+
+	onMount(async () => {
+		try {
+			const health = await api.health();
+			backendVersion = health.version;
+		} catch {
+			backendVersion = '?';
+		}
+	});
 
 	const navItems = [
 		{ href: '/',        label: 'Dashboard',  icon: '⏺' },
@@ -35,6 +50,6 @@
 
 	<!-- Footer -->
 	<div class="px-5 py-3 border-t border-rp-hl-med">
-		<p class="text-[11px] text-rp-muted">Tapedeck v0.5.2</p>
+		<p class="text-[11px] text-rp-muted">server v{backendVersion} · ui v{uiVersion}</p>
 	</div>
 </nav>
