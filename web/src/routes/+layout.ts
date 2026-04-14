@@ -1,4 +1,3 @@
-// All rendering happens client-side (SPA mode).
-// The adapter-static generates a single index.html that handles all routes.
+// SPA mode — client-side only, adapter-static generates index.html fallback
 export const ssr = false;
 export const prerender = true;
