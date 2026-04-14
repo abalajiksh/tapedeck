@@ -27,12 +27,14 @@ pub struct AppState {
 /// Build the full Axum application.
 pub fn build_app(state: Arc<AppState>) -> Router {
     let admin = admin::create_admin_router(state.log_handle.clone());
+    let auth_router = users::create_auth_router();
     let user_mgmt = users::create_user_management_router();
     let gear = chains::create_gear_router();
     let scrobbles_router = scrobbles::create_scrobbles_router();
 
     let api = Router::new()
         .route("/1/submit-listens", post(ingest::submit_listens))
+        .merge(auth_router)
         .merge(user_mgmt)
         .merge(gear)
         .merge(scrobbles_router)
@@ -41,5 +43,5 @@ pub fn build_app(state: Arc<AppState>) -> Router {
     Router::new()
         .merge(admin)
         .merge(api)
-	.merge(web_assets::create_frontend_router())
+        .merge(web_assets::create_frontend_router())
 }

@@ -1,6 +1,6 @@
 [package]
 name = "tapedeck"
-version = "0.6.1"
+version = "0.6.2"
 edition = "2021"
 
 [dependencies]
@@ -34,6 +34,7 @@ anyhow = "1.0"
 thiserror = "2"
 
 # Auth & crypto
+argon2 = "0.5"
 sha2 = "0.10"
 rand = "0.9"
 md5 = "0.8"

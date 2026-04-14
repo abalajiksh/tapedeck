@@ -61,13 +61,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // ── First-run setup ──
     if !db.has_users().await? {
-        info!("🔑 First run detected — creating admin user and token...");
-        let user_id = db.create_user("admin", Some("Admin"), "not-used-yet").await?;
-        let token = db.create_token(user_id, "default", "submit").await?;
+        info!("🔑 First run — creating admin user (password not set yet)");
+        let _ = db.create_user("admin", Some("Admin"), "not-used-yet", "admin").await?;
         info!("════════════════════════════════════════════════════════");
-        info!("🔑 Admin API token (save this — it won't be shown again!):");
-        info!("   {}", token);
+        info!("📋 Visit the web UI to complete setup and set your password.");
         info!("════════════════════════════════════════════════════════");
+    } else if db.needs_setup().await? {
+        info!("📋 Admin password not set — visit the web UI to complete setup.");
     }
 
     // ── Sources ──
