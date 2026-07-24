@@ -1427,4 +1427,68 @@ mod tests {
         let rows = db.get_all_scrobbles(uid).await.unwrap();
         assert_eq!(rows.iter().filter(|r| r.chain_id == Some(cid)).count(), 1);
     }
+
+    #[tokio::test]
+    async fn disabled_user_cannot_authenticate_by_password_token_or_session() {
+        let db = testdb().await;
+        let hash = Database::hash_password("password123").unwrap();
+        let uid = db.create_user("carol", None, &hash, "user").await.unwrap();
+        let token = db.create_token(uid, "t", "submit").await.unwrap();
+        let session = db.create_web_session(uid).await.unwrap();
+
+        // enabled: all three work
+        assert!(db.authenticate("carol", "password123").await.unwrap().is_some());
+        assert!(db.validate_token(&token).await.unwrap().is_some());
+        assert!(db.validate_session(&session).await.unwrap().is_some());
+
+        db.set_user_disabled(uid, true).await.unwrap();
+
+        // disabled: every path is rejected
+        assert!(db.authenticate("carol", "password123").await.unwrap().is_none());
+        assert!(db.validate_token(&token).await.unwrap().is_none());
+        assert!(db.validate_session(&session).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn count_active_admins_excludes_disabled() {
+        let db = testdb().await;
+        let a1 = db.create_user("a1", None, "x", "admin").await.unwrap();
+        db.create_user("a2", None, "x", "admin").await.unwrap();
+        assert_eq!(db.count_active_admins().await.unwrap(), 2);
+        db.set_user_disabled(a1, true).await.unwrap();
+        assert_eq!(db.count_active_admins().await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn delete_user_cascades_their_data() {
+        let db = testdb().await;
+        let uid = db.create_user("dave", None, "x", "user").await.unwrap();
+        db.save_scrobble(uid, &play("s", "a", 5), None, None, None, None, None).await.unwrap();
+        db.create_token(uid, "t", "submit").await.unwrap();
+
+        assert!(db.delete_user(uid).await.unwrap());
+        assert!(db.get_all_scrobbles(uid).await.unwrap().is_empty());
+        assert!(db.list_users().await.unwrap().iter().all(|u| u.id != uid));
+        assert!(db.list_tokens(uid).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn connections_round_trip_and_hide_creds() {
+        let db = testdb().await;
+        let uid = db.create_user("erin", None, "x", "user").await.unwrap();
+        db.set_connection(uid, "listenbrainz", r#"{"token":"secret"}"#, Some("erin_lb")).await.unwrap();
+
+        // engine sees the credentials
+        let fwd = db.get_connections_for_forwarding(uid).await.unwrap();
+        assert_eq!(fwd, vec![("listenbrainz".to_string(), r#"{"token":"secret"}"#.to_string())]);
+
+        // the public list exposes only service + account, never the token
+        let list = db.list_connections(uid).await.unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].0, "listenbrainz");
+        assert_eq!(list[0].1.as_deref(), Some("erin_lb"));
+
+        assert!(db.delete_connection(uid, "listenbrainz").await.unwrap());
+        assert!(db.list_connections(uid).await.unwrap().is_empty());
+    }
 }

@@ -196,6 +196,34 @@ async fn lastfm_complete(
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lastfm_sign_is_deterministic_and_secret_sensitive() {
+        let mut p = BTreeMap::new();
+        p.insert("api_key", "KEY");
+        p.insert("method", "auth.getToken");
+        // md5("api_keyKEYmethodauth.getTokenSECRET")
+        let sig = lastfm_sign(&p, "SECRET");
+        assert_eq!(sig.len(), 32);
+        assert!(sig.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_eq!(sig, lastfm_sign(&p, "SECRET"), "same input → same signature");
+        assert_ne!(sig, lastfm_sign(&p, "OTHER"), "signature depends on the secret");
+    }
+
+    #[test]
+    fn lastfm_sign_sorts_params() {
+        // BTreeMap sorts keys, so insertion order doesn't change the signature.
+        let mut a = BTreeMap::new();
+        a.insert("b", "2"); a.insert("a", "1");
+        let mut b = BTreeMap::new();
+        b.insert("a", "1"); b.insert("b", "2");
+        assert_eq!(lastfm_sign(&a, "s"), lastfm_sign(&b, "s"));
+    }
+}
+
 pub fn create_connections_router() -> Router<Arc<AppState>> {
     use axum::routing::{delete, post, put};
     Router::new()

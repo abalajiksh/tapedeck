@@ -145,6 +145,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         lastfm_api_key: config.lastfm.api_key.clone(),
         lastfm_secret: config.lastfm.secret.clone(),
         listenbrainz_base_url: config.listenbrainz.base_url.clone(),
+        login_limiter: Arc::new(server::ratelimit::RateLimiter::new(
+            8, std::time::Duration::from_secs(300))),
     });
 
     let app = server::build_app(app_state);
@@ -159,7 +161,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Ok(l) => l,
             Err(e) => { error!("Failed to bind server: {}", e); return; }
         };
-        if let Err(e) = axum::serve(listener, app)
+        if let Err(e) = axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
             .with_graceful_shutdown(shutdown_signal())
             .await
         {

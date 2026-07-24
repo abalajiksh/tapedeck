@@ -7,6 +7,7 @@ pub mod import;
 pub mod ingest;
 pub mod models;
 mod preferences;
+pub mod ratelimit;
 mod scrobbles;
 mod users;
 
@@ -33,6 +34,8 @@ pub struct AppState {
     pub lastfm_secret: String,
     /// ListenBrainz base URL for validating per-user tokens.
     pub listenbrainz_base_url: String,
+    /// Brute-force throttle for the login endpoint, keyed by client IP.
+    pub login_limiter: Arc<ratelimit::RateLimiter>,
 }
 
 /// Build the full Axum application.

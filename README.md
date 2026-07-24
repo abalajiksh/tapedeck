@@ -105,6 +105,9 @@ Built to be trusted as your system of record:
 - **Backups.** `GET /api/v1/backup` (or the Settings screen) downloads a
   consistent `VACUUM INTO` snapshot of the whole database, safe to take while
   running. `GET /health` reports DB connectivity for uptime monitoring.
+- **Login throttling.** Repeated failed logins from an IP are rate-limited
+  (8 tries / 5 min, `Retry-After` on block) to blunt online password guessing;
+  Argon2 hashing already makes each attempt expensive.
 
 ### MusicBrainz Enrichment
 

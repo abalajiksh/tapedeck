@@ -1,11 +1,12 @@
 use axum::{
-    extract::{Path, State},
+    extract::{ConnectInfo, Path, State},
     http::{header, HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Json},
     routing::{delete, get, post},
     Router,
 };
 use serde::{Deserialize, Serialize};
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use super::auth::AuthUser;
@@ -156,21 +157,49 @@ struct LoginRequest {
     password: String,
 }
 
+/// Client key for rate limiting: the first `X-Forwarded-For` hop (behind a
+/// reverse proxy) or the direct socket IP.
+fn client_key(headers: &HeaderMap, addr: SocketAddr) -> String {
+    headers.get("x-forwarded-for")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.split(',').next())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| addr.ip().to_string())
+}
+
 async fn login(
     State(state): State<Arc<AppState>>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     Json(body): Json<LoginRequest>,
 ) -> impl IntoResponse {
+    let key = client_key(&headers, addr);
+    if let Some(retry_after) = state.login_limiter.blocked_for(&key) {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            [(header::RETRY_AFTER, retry_after.to_string())],
+            Json(serde_json::json!(ErrorResponse {
+                code: 429, error: format!("Too many failed logins. Try again in {}s.", retry_after),
+            })),
+        ).into_response();
+    }
+
     let user = match state.db.authenticate(&body.username, &body.password).await {
         Ok(Some(u)) => u,
-        Ok(None) => return (
-            StatusCode::UNAUTHORIZED,
-            Json(serde_json::json!(ErrorResponse { code: 401, error: "Invalid username or password".into() })),
-        ).into_response(),
+        Ok(None) => {
+            state.login_limiter.record_failure(&key);
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!(ErrorResponse { code: 401, error: "Invalid username or password".into() })),
+            ).into_response();
+        }
         Err(e) => return (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!(ErrorResponse { code: 500, error: e.to_string() })),
         ).into_response(),
     };
+    state.login_limiter.reset(&key);
 
     let session_token = match state.db.create_web_session(user.user_id).await {
         Ok(t) => t,
