@@ -170,35 +170,5 @@ impl ListeningContext {
     }
 }
 
-// ── Phase 2: Devices ──
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Device {
-    pub id: Option<i64>, pub user_id: i64, pub machine_id: String,
-    pub name: Option<String>, pub platform: Option<String>, pub product: Option<String>,
-    pub device_type: Option<String>, pub default_chain_id: Option<i64>,
-    pub first_seen: i64, pub last_seen: i64, pub total_listens: i64,
-}
-
-// ── Phase 2: Equipment ──
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Equipment {
-    pub id: Option<i64>, pub user_id: i64, pub name: String,
-    #[serde(rename = "type")]
-    pub equipment_type: String,
-    pub brand: Option<String>, pub model: Option<String>,
-    pub total_hours: f64, pub first_used: Option<i64>, pub last_used: Option<i64>,
-    pub notes: Option<String>,
-}
-
-// ── Phase 2: Listening Sessions ──
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ListeningSession {
-    pub id: Option<i64>, pub user_id: i64,
-    pub device_id: Option<i64>, pub chain_id: Option<i64>,
-    pub started_at: i64, pub ended_at: Option<i64>,
-    pub track_count: i32, pub total_duration: i64, pub skip_count: i32,
-    pub avg_quality_score: Option<f64>, pub listening_context: ListeningContext,
-}
+// Device, Equipment, and ListeningSession rows are read back as ad-hoc tuples
+// or the DeviceRow/EquipmentRow types in db.rs — no shared model struct needed.

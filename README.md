@@ -396,9 +396,19 @@ the `td_session` cookie set by the web UI login.
 | GET | `/api/v1/chains` | Token | List signal chains |
 | POST | `/api/v1/chains` | Token | Create signal chain |
 | GET | `/api/v1/chains/{id}` | Token | Get chain details |
+| PATCH | `/api/v1/chains/{id}` | Token | Update a chain |
+| DELETE | `/api/v1/chains/{id}` | Token | Delete a chain (unlinks listens, keeps them) |
 | GET | `/api/v1/devices` | Token | List auto-discovered devices |
 | GET | `/api/v1/equipment` | Token | List equipment with usage hours |
 | POST | `/api/v1/equipment` | Token | Register equipment |
+| PATCH | `/api/v1/equipment/{id}` | Token | Update equipment |
+| DELETE | `/api/v1/equipment/{id}` | Token | Delete equipment |
+
+Clients tag a listen with a chain by sending its **name** in
+`additional_info.tapedeck_chain.chain_id`; the server resolves the name to the
+chain, tags the listen and its session, propagates the chain's listening
+context, and accumulates hours. Unknown names are ignored (the listen is still
+stored).
 
 ## Project Structure
 

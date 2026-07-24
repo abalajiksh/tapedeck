@@ -82,6 +82,21 @@ export interface ChainComponent {
 	detail: string | null;
 }
 
+export interface ChainInput {
+	name: string;
+	description?: string;
+	components: ChainComponent[];
+	listening_context?: string;
+}
+
+export interface EquipmentInput {
+	name: string;
+	type: string;
+	brand?: string;
+	model?: string;
+	notes?: string;
+}
+
 export interface Device {
 	id: number;
 	machine_id: string;
@@ -263,13 +278,24 @@ class TapedeckAPI {
 	// ── Chains ──
 	async getChains(): Promise<{ chains: SignalChain[] }> { return this.get('/api/v1/chains'); }
 	async getChain(id: number): Promise<SignalChain> { return this.get(`/api/v1/chains/${id}`); }
-	async createChain(data: { name: string; description?: string; components: ChainComponent[]; listening_context?: string }): Promise<{ id: number }> {
+	async createChain(data: ChainInput): Promise<{ id: number }> {
 		return this.post('/api/v1/chains', data);
 	}
+	async updateChain(id: number, data: ChainInput): Promise<{ id: number }> {
+		return this.patch(`/api/v1/chains/${id}`, data);
+	}
+	async deleteChain(id: number): Promise<void> { return this.delNoBody(`/api/v1/chains/${id}`); }
 
 	// ── Devices & Equipment ──
 	async getDevices(): Promise<{ devices: Device[] }> { return this.get('/api/v1/devices'); }
 	async getEquipment(): Promise<{ equipment: Equipment[] }> { return this.get('/api/v1/equipment'); }
+	async createEquipment(data: EquipmentInput): Promise<{ id: number }> {
+		return this.post('/api/v1/equipment', data);
+	}
+	async updateEquipment(id: number, data: EquipmentInput): Promise<{ id: number }> {
+		return this.patch(`/api/v1/equipment/${id}`, data);
+	}
+	async deleteEquipment(id: number): Promise<void> { return this.delNoBody(`/api/v1/equipment/${id}`); }
 
 	// ── Users ──
 	async getUsers(): Promise<{ users: Array<{ id: number; username: string; display_name: string | null; role: string; created_at: number }> }> {

@@ -1,7 +1,6 @@
 mod config;
 mod db;
 mod engine;
-mod error;
 mod logging;
 mod models;
 mod musicbrainz;

@@ -11,8 +11,6 @@ pub struct Config {
     pub logging: LoggingConfig,
     pub musicbrainz: MusicBrainzConfig,
     pub plex: PlexConfig,
-    pub navidrome: NavidromeConfig,
-    pub jellyfin: JellyfinConfig,
     pub listenbrainz: ListenBrainzConfig,
     pub lastfm: LastFmConfig,
     pub librefm: LibreFmConfig,
@@ -57,20 +55,6 @@ pub struct PlexConfig {
     pub devices_block: Vec<String>,
     pub libraries_allow: Vec<String>,
     pub libraries_block: Vec<String>,
-}
-
-#[derive(Debug, Clone)]
-pub struct NavidromeConfig {
-    pub enabled: bool,
-    pub db_path: String,
-}
-
-#[derive(Debug, Clone)]
-pub struct JellyfinConfig {
-    pub enabled: bool,
-    pub url: String,
-    pub user_id: String,
-    pub token: String,
 }
 
 #[derive(Debug, Clone)]
@@ -179,8 +163,6 @@ impl Default for TomlMusicBrainz {
 #[serde(default)]
 struct TomlSources {
     plex: TomlPlex,
-    navidrome: TomlNavidrome,
-    jellyfin: TomlJellyfin,
 }
 
 #[derive(Deserialize)]
@@ -204,22 +186,6 @@ impl Default for TomlPlex {
             devices_allow: Vec::new(), devices_block: Vec::new(),
             libraries_allow: Vec::new(), libraries_block: Vec::new(),
         }
-    }
-}
-
-#[derive(Deserialize)]
-#[serde(default)]
-struct TomlNavidrome { enabled: bool, db_path: String }
-impl Default for TomlNavidrome {
-    fn default() -> Self { Self { enabled: false, db_path: "./navidrome.db".into() } }
-}
-
-#[derive(Deserialize)]
-#[serde(default)]
-struct TomlJellyfin { enabled: bool, url: String, user_id: String, token: String }
-impl Default for TomlJellyfin {
-    fn default() -> Self {
-        Self { enabled: false, url: "http://localhost:8096".into(), user_id: String::new(), token: String::new() }
     }
 }
 
@@ -320,16 +286,6 @@ impl Config {
                 devices_block: env_or_list("PLEX_DEVICES_BLOCK", t.sources.plex.devices_block),
                 libraries_allow: env_or_list("PLEX_LIBRARIES_ALLOW", t.sources.plex.libraries_allow),
                 libraries_block: env_or_list("PLEX_LIBRARIES_BLOCK", t.sources.plex.libraries_block),
-            },
-            navidrome: NavidromeConfig {
-                enabled: env_or_bool("NAVIDROME_ENABLED", t.sources.navidrome.enabled),
-                db_path: env_or("NAVIDROME_DB_PATH", t.sources.navidrome.db_path),
-            },
-            jellyfin: JellyfinConfig {
-                enabled: env_or_bool("JELLYFIN_ENABLED", t.sources.jellyfin.enabled),
-                url: env_or("JELLYFIN_URL", t.sources.jellyfin.url),
-                user_id: env_or("JELLYFIN_USER_ID", t.sources.jellyfin.user_id),
-                token: env_or("JELLYFIN_TOKEN", t.sources.jellyfin.token),
             },
             listenbrainz: ListenBrainzConfig {
                 enabled: env_or_bool("LISTENBRAINZ_ENABLED", t.sinks.listenbrainz.enabled),

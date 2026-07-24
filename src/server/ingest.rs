@@ -106,15 +106,22 @@ pub async fn submit_listens(
         } else { None };
 
         // ── Phase 2: Resolve chain ──
-        let chain_id = info_ref
+        // Layered: explicit chain name from the client → the source device's
+        // default chain. (Output-device bindings are resolved in Phase B.)
+        let explicit_chain_name = info_ref
             .and_then(|ai| ai.tapedeck_chain.as_ref())
-            .and_then(|tc| tc.chain_id.as_ref())
-            .and_then(|name| {
-                // Chain IDs from the client are names — we'd need to look them up.
-                // For now, just log it. Full resolution requires async lookup per-listen.
-                debug!("Client specified chain: {}", name);
-                None::<i64>
-            });
+            .and_then(|tc| tc.chain_id.as_ref());
+        let chain_id: Option<i64> = if let Some(name) = explicit_chain_name {
+            match state.db.get_chain_by_name(user.user_id, name).await {
+                Ok(Some(id)) => Some(id),
+                Ok(None) => { debug!("Unknown chain name from client: {}", name); None }
+                Err(e) => { debug!("Chain lookup failed: {}", e); None }
+            }
+        } else if let Some(dev) = device_id {
+            state.db.get_device_default_chain(user.user_id, dev).await.ok().flatten()
+        } else {
+            None
+        };
 
         // ── Phase 2: Listening context from chain default ──
         let listening_context = if let Some(cid) = chain_id {
@@ -153,6 +160,11 @@ pub async fn submit_listens(
                             listening_context.as_deref().unwrap_or("unknown"),
                             1800,
                         ).await;
+
+                        // Accumulate hours on the resolved chain
+                        if let Some(cid) = chain_id {
+                            let _ = state.db.update_chain_hours(cid, dur as f64 / 3600.0).await;
+                        }
 
                         info!("📥 Ingested: {} - {} [user: {}, client: {}, quality: {}]",
                             play.artist, play.title, user.username, submission_client,

@@ -364,14 +364,6 @@ impl Database {
         Ok(())
     }
 
-    /// Clean up expired sessions.
-    pub async fn cleanup_expired_sessions(&self) -> Result<u64, sqlx::Error> {
-        let now = Self::now_secs();
-        let result = sqlx::query("DELETE FROM web_sessions WHERE expires_at <= ?")
-            .bind(now).execute(&self.pool).await?;
-        Ok(result.rows_affected())
-    }
-
     // ════════════════════════════════════════════════════════════
     //  Scrobble CRUD
     // ════════════════════════════════════════════════════════════
@@ -739,6 +731,52 @@ impl Database {
         Ok(())
     }
 
+    /// Resolve a chain *name* (as sent by clients in `tapedeck_chain.chain_id`)
+    /// to its id for this user. Case-insensitive.
+    pub async fn get_chain_by_name(&self, user_id: i64, name: &str) -> Result<Option<i64>, sqlx::Error> {
+        let row: Option<(i64,)> = sqlx::query_as(
+            "SELECT id FROM signal_chains WHERE user_id = ? AND LOWER(name) = LOWER(?)"
+        ).bind(user_id).bind(name).fetch_optional(&self.pool).await?;
+        Ok(row.map(|(id,)| id))
+    }
+
+    /// A source device's configured default chain, if any (fallback for listens
+    /// that don't carry an explicit chain or output binding).
+    pub async fn get_device_default_chain(&self, user_id: i64, device_id: i64) -> Result<Option<i64>, sqlx::Error> {
+        let row: Option<(Option<i64>,)> = sqlx::query_as(
+            "SELECT default_chain_id FROM devices WHERE id = ? AND user_id = ?"
+        ).bind(device_id).bind(user_id).fetch_optional(&self.pool).await?;
+        Ok(row.and_then(|(c,)| c))
+    }
+
+    pub async fn update_chain(&self, user_id: i64, chain_id: i64, name: &str, description: Option<&str>,
+        components: &[ChainComponent], listening_context: &str) -> Result<bool, sqlx::Error> {
+        let components_json = serde_json::to_string(components).unwrap_or_else(|_| "[]".into());
+        let res = sqlx::query(
+            "UPDATE signal_chains SET name = ?, description = ?, components = ?, listening_context = ?
+             WHERE id = ? AND user_id = ?"
+        ).bind(name).bind(description).bind(&components_json).bind(listening_context)
+         .bind(chain_id).bind(user_id).execute(&self.pool).await?;
+        Ok(res.rows_affected() > 0)
+    }
+
+    /// Delete a chain, first unlinking (not deleting) anything that references
+    /// it — listens and sessions keep their data with `chain_id` cleared. Done
+    /// in a transaction so we never leave dangling FKs (sqlx enables them).
+    pub async fn delete_chain(&self, user_id: i64, chain_id: i64) -> Result<bool, sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("UPDATE scrobbles SET chain_id = NULL WHERE chain_id = ? AND user_id = ?")
+            .bind(chain_id).bind(user_id).execute(&mut *tx).await?;
+        sqlx::query("UPDATE sessions SET chain_id = NULL WHERE chain_id = ? AND user_id = ?")
+            .bind(chain_id).bind(user_id).execute(&mut *tx).await?;
+        sqlx::query("UPDATE devices SET default_chain_id = NULL WHERE default_chain_id = ? AND user_id = ?")
+            .bind(chain_id).bind(user_id).execute(&mut *tx).await?;
+        let res = sqlx::query("DELETE FROM signal_chains WHERE id = ? AND user_id = ?")
+            .bind(chain_id).bind(user_id).execute(&mut *tx).await?;
+        tx.commit().await?;
+        Ok(res.rows_affected() > 0)
+    }
+
     // ════════════════════════════════════════════════════════════
     //  Devices
     // ════════════════════════════════════════════════════════════
@@ -792,6 +830,21 @@ impl Database {
     pub async fn get_equipment(&self, user_id: i64) -> Result<Vec<EquipmentRow>, sqlx::Error> {
         sqlx::query_as("SELECT * FROM equipment WHERE user_id = ? ORDER BY total_hours DESC")
             .bind(user_id).fetch_all(&self.pool).await
+    }
+
+    pub async fn update_equipment(&self, user_id: i64, id: i64, name: &str, equipment_type: &str,
+        brand: Option<&str>, model: Option<&str>, notes: Option<&str>) -> Result<bool, sqlx::Error> {
+        let res = sqlx::query(
+            "UPDATE equipment SET name = ?, type = ?, brand = ?, model = ?, notes = ? WHERE id = ? AND user_id = ?"
+        ).bind(name).bind(equipment_type).bind(brand).bind(model).bind(notes)
+         .bind(id).bind(user_id).execute(&self.pool).await?;
+        Ok(res.rows_affected() > 0)
+    }
+
+    pub async fn delete_equipment(&self, user_id: i64, id: i64) -> Result<bool, sqlx::Error> {
+        let res = sqlx::query("DELETE FROM equipment WHERE id = ? AND user_id = ?")
+            .bind(id).bind(user_id).execute(&self.pool).await?;
+        Ok(res.rows_affected() > 0)
     }
 
     // ════════════════════════════════════════════════════════════

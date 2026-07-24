@@ -76,6 +76,32 @@ async fn get_chain(
     }
 }
 
+async fn update_chain(
+    State(state): State<Arc<AppState>>,
+    user: AuthUser,
+    Path(id): Path<i64>,
+    Json(body): Json<CreateChainRequest>,
+) -> impl IntoResponse {
+    let ctx: &str = body.listening_context.as_str();
+    match state.db.update_chain(user.user_id, id, &body.name, body.description.as_deref(), &body.components, ctx).await {
+        Ok(true) => (StatusCode::OK, Json(serde_json::json!({ "id": id, "status": "updated" }))).into_response(),
+        Ok(false) => (StatusCode::NOT_FOUND, Json(serde_json::json!(ErrorResponse { code: 404, error: "Chain not found".into() }))).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!(ErrorResponse { code: 500, error: e.to_string() }))).into_response(),
+    }
+}
+
+async fn delete_chain(
+    State(state): State<Arc<AppState>>,
+    user: AuthUser,
+    Path(id): Path<i64>,
+) -> impl IntoResponse {
+    match state.db.delete_chain(user.user_id, id).await {
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => (StatusCode::NOT_FOUND, Json(serde_json::json!(ErrorResponse { code: 404, error: "Chain not found".into() }))).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!(ErrorResponse { code: 500, error: e.to_string() }))).into_response(),
+    }
+}
+
 // ── Device endpoints ──
 
 async fn list_devices(
@@ -124,12 +150,40 @@ async fn list_equipment(
     }
 }
 
+async fn update_equipment(
+    State(state): State<Arc<AppState>>,
+    user: AuthUser,
+    Path(id): Path<i64>,
+    Json(body): Json<CreateEquipmentRequest>,
+) -> impl IntoResponse {
+    match state.db.update_equipment(user.user_id, id, &body.name, &body.equipment_type,
+        body.brand.as_deref(), body.model.as_deref(), body.notes.as_deref()).await {
+        Ok(true) => (StatusCode::OK, Json(serde_json::json!({ "id": id, "status": "updated" }))).into_response(),
+        Ok(false) => (StatusCode::NOT_FOUND, Json(serde_json::json!(ErrorResponse { code: 404, error: "Equipment not found".into() }))).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!(ErrorResponse { code: 500, error: e.to_string() }))).into_response(),
+    }
+}
+
+async fn delete_equipment(
+    State(state): State<Arc<AppState>>,
+    user: AuthUser,
+    Path(id): Path<i64>,
+) -> impl IntoResponse {
+    match state.db.delete_equipment(user.user_id, id).await {
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => (StatusCode::NOT_FOUND, Json(serde_json::json!(ErrorResponse { code: 404, error: "Equipment not found".into() }))).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!(ErrorResponse { code: 500, error: e.to_string() }))).into_response(),
+    }
+}
+
 // ── Router ──
 
 pub fn create_gear_router() -> Router<Arc<AppState>> {
+    use axum::routing::patch;
     Router::new()
         .route("/api/v1/chains", post(create_chain).get(list_chains))
-        .route("/api/v1/chains/:id", get(get_chain))
+        .route("/api/v1/chains/:id", get(get_chain).patch(update_chain).delete(delete_chain))
         .route("/api/v1/devices", get(list_devices))
         .route("/api/v1/equipment", post(create_equipment).get(list_equipment))
+        .route("/api/v1/equipment/:id", patch(update_equipment).delete(delete_equipment))
 }
