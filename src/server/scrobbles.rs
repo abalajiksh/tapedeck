@@ -152,16 +152,37 @@ fn range_after(range: Option<&str>) -> Option<i64> {
     }
 }
 
+/// The user's IANA timezone from their preferences (defaults to UTC).
+async fn user_tz(state: &AppState, user_id: i64) -> chrono_tz::Tz {
+    let name = state.db.get_preferences(user_id).await.ok()
+        .and_then(|p| p.get("timezone").and_then(|v| v.as_str().map(str::to_string)))
+        .unwrap_or_default();
+    crate::analytics::parse_tz(&name)
+}
+
+fn to_listen_rows(rows: Vec<(i64, String, String, Option<String>, Option<i32>)>) -> Vec<crate::analytics::ListenRow> {
+    rows.into_iter()
+        .map(|(ts, artist, title, album, track_number)| crate::analytics::ListenRow { ts, artist, title, album, track_number })
+        .collect()
+}
+
 /// GET /api/v1/stats?range=week|month|last30|year|all — ranged analytics.
 async fn ranged_stats(
     State(state): State<Arc<AppState>>,
     user: AuthUser,
     Query(q): Query<StatsQuery>,
 ) -> impl IntoResponse {
-    match state.db.get_ranged_stats(user.user_id, range_after(q.range.as_deref())).await {
-        Ok(stats) => (StatusCode::OK, Json(stats)).into_response(),
-        Err(e) => server_error(e.to_string()),
+    let after = range_after(q.range.as_deref());
+    let mut stats = match state.db.get_ranged_stats(user.user_id, after).await {
+        Ok(s) => s,
+        Err(e) => return server_error(e.to_string()),
+    };
+    // Recompute the heatmap in the user's local timezone.
+    if let Ok(rows) = state.db.get_listen_rows(user.user_id, after).await {
+        let tz = user_tz(&state, user.user_id).await;
+        stats["heatmap"] = serde_json::json!(crate::analytics::heatmap_local(&to_listen_rows(rows), tz));
     }
+    (StatusCode::OK, Json(stats)).into_response()
 }
 
 /// GET /api/v1/personality?range=… — five-axis listening personality.
@@ -172,10 +193,8 @@ async fn personality(
 ) -> impl IntoResponse {
     match state.db.get_listen_rows(user.user_id, range_after(q.range.as_deref())).await {
         Ok(rows) => {
-            let listens: Vec<crate::analytics::ListenRow> = rows.into_iter()
-                .map(|(ts, artist, title, album)| crate::analytics::ListenRow { ts, artist, title, album })
-                .collect();
-            (StatusCode::OK, Json(crate::analytics::compute_personality(&listens))).into_response()
+            let tz = user_tz(&state, user.user_id).await;
+            (StatusCode::OK, Json(crate::analytics::compute_personality(&to_listen_rows(rows), tz))).into_response()
         }
         Err(e) => server_error(e.to_string()),
     }

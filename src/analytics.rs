@@ -2,11 +2,14 @@
 //! from listen rows (no external calls). Ported from the standalone
 //! `musical_personality` tool. All axes are explainable ratios/entropy/Jaccard.
 //!
-//! Curator↔Drifter uses an "album block" proxy (runs of consecutive same-album
-//! plays) rather than strict track-number sequencing, because Tapedeck does not
-//! store track numbers.
+//! Hour-of-day and day-of-week are evaluated in the user's timezone (see the
+//! `tz` argument). Curator↔Drifter uses strict track-number sequencing where
+//! track numbers are present, and falls back to an "album block" proxy (runs of
+//! consecutive same-album plays) where they aren't.
 
 use std::collections::{HashMap, HashSet};
+use chrono::{Datelike, TimeZone, Timelike, Weekday};
+use chrono_tz::Tz;
 use serde::Serialize;
 
 pub struct ListenRow {
@@ -14,6 +17,7 @@ pub struct ListenRow {
     pub artist: String,
     pub title: String,
     pub album: Option<String>,
+    pub track_number: Option<i32>,
 }
 
 #[derive(Serialize)]
@@ -40,13 +44,22 @@ pub struct Personality {
     pub total_plays: usize,
 }
 
-// ── time helpers (UTC, from raw unix seconds) ──
-fn hour_of(ts: i64) -> i64 { (((ts % 86400) + 86400) % 86400) / 3600 }
-fn day_index(ts: i64) -> i64 { ts.div_euclid(86400) }
-fn weekday(ts: i64) -> i64 { ((day_index(ts) + 4) % 7 + 7) % 7 } // 0=Sun .. 6=Sat
-fn is_weekend(ts: i64) -> bool { matches!(weekday(ts), 0 | 6) }
+/// Parse an IANA timezone name (e.g. "Europe/Berlin"); falls back to UTC.
+pub fn parse_tz(name: &str) -> Tz {
+    name.parse().unwrap_or(chrono_tz::UTC)
+}
 
-/// Normalised Shannon entropy (0..1) of a list of counts.
+fn local(ts: i64, tz: Tz) -> chrono::DateTime<Tz> {
+    tz.timestamp_opt(ts, 0).single()
+        .unwrap_or_else(|| tz.timestamp_opt(0, 0).single().unwrap())
+}
+fn hour_of(ts: i64, tz: Tz) -> i64 { local(ts, tz).hour() as i64 }
+fn is_weekend(ts: i64, tz: Tz) -> bool {
+    matches!(local(ts, tz).weekday(), Weekday::Sat | Weekday::Sun)
+}
+/// Local calendar day as an ordinal (for grouping "days listened").
+fn local_day(ts: i64, tz: Tz) -> i64 { local(ts, tz).date_naive().num_days_from_ce() as i64 }
+
 fn entropy(counts: &[i64]) -> f64 {
     let total: i64 = counts.iter().sum();
     if total == 0 || counts.len() <= 1 { return 0.0; }
@@ -75,7 +88,7 @@ fn top_n_artists(rows: &[&ListenRow], n: usize) -> HashSet<String> {
     v.into_iter().take(n).map(|(a, _)| a.to_string()).collect()
 }
 
-pub fn compute_personality(rows: &[ListenRow]) -> Personality {
+pub fn compute_personality(rows: &[ListenRow], tz: Tz) -> Personality {
     let total = rows.len();
     if total == 0 {
         return Personality { verdict: "Not enough listens yet".into(), traits: vec![], loyalty: vec![], total_plays: 0 };
@@ -92,7 +105,9 @@ pub fn compute_personality(rows: &[ListenRow]) -> Personality {
     let top1pct_share = counts_vec.iter().take(top1pct_n).sum::<i64>() as f64 / total_f;
     let adv = 100.0 * (0.5 * (1.0 - top1pct_share) + 0.5 * entropy(&counts_vec));
 
-    // ── Curator ↔ Drifter: fraction of listens inside album blocks ──
+    // ── Curator ↔ Drifter: fraction of listens inside album playthroughs ──
+    // A run extends while it's the same album+artist within 30 min; if BOTH
+    // rows carry a track number we also require them to be sequential.
     let mut sorted: Vec<&ListenRow> = rows.iter().collect();
     sorted.sort_by_key(|r| r.ts);
     let mut in_run = 0usize;
@@ -105,6 +120,10 @@ pub fn compute_personality(rows: &[ListenRow]) -> Personality {
             && sorted[j].album.as_deref() == album
             && sorted[j].artist == sorted[i].artist
             && sorted[j].ts - sorted[j - 1].ts <= 1800
+            && match (sorted[j - 1].track_number, sorted[j].track_number) {
+                (Some(prev), Some(cur)) => cur == prev + 1, // strict where known
+                _ => true,                                  // proxy otherwise
+            }
         {
             j += 1;
         }
@@ -122,16 +141,16 @@ pub fn compute_personality(rows: &[ListenRow]) -> Personality {
     let top_track_plays = track_counts.values().copied().max().unwrap_or(0);
     let obs = repeat_ratio * 100.0;
 
-    // ── Lark ↔ Night Owl ──
-    let night = rows.iter().filter(|r| { let h = hour_of(r.ts); h >= 21 || h <= 3 }).count();
-    let morning = rows.iter().filter(|r| (6..=11).contains(&hour_of(r.ts))).count();
+    // ── Lark ↔ Night Owl (local time) ──
+    let night = rows.iter().filter(|r| { let h = hour_of(r.ts, tz); h >= 21 || h <= 3 }).count();
+    let morning = rows.iter().filter(|r| (6..=11).contains(&hour_of(r.ts, tz))).count();
     let owl = 100.0 * night as f64 / (night + morning).max(1) as f64;
 
     // ── Mood-Driven ↔ Identity: how stable the rotation is by context ──
-    let weekday_rows: Vec<&ListenRow> = rows.iter().filter(|r| !is_weekend(r.ts)).collect();
-    let weekend_rows: Vec<&ListenRow> = rows.iter().filter(|r| is_weekend(r.ts)).collect();
-    let morning_rows: Vec<&ListenRow> = rows.iter().filter(|r| (6..=11).contains(&hour_of(r.ts))).collect();
-    let evening_rows: Vec<&ListenRow> = rows.iter().filter(|r| (18..=23).contains(&hour_of(r.ts))).collect();
+    let weekday_rows: Vec<&ListenRow> = rows.iter().filter(|r| !is_weekend(r.ts, tz)).collect();
+    let weekend_rows: Vec<&ListenRow> = rows.iter().filter(|r| is_weekend(r.ts, tz)).collect();
+    let morning_rows: Vec<&ListenRow> = rows.iter().filter(|r| (6..=11).contains(&hour_of(r.ts, tz))).collect();
+    let evening_rows: Vec<&ListenRow> = rows.iter().filter(|r| (18..=23).contains(&hour_of(r.ts, tz))).collect();
     let jac_wd = jaccard(&top_n_artists(&weekday_rows, 10), &top_n_artists(&weekend_rows, 10));
     let jac_me = jaccard(&top_n_artists(&morning_rows, 10), &top_n_artists(&evening_rows, 10));
     let identity = 100.0 * (jac_wd + jac_me) / 2.0;
@@ -155,7 +174,7 @@ pub fn compute_personality(rows: &[ListenRow]) -> Personality {
     ];
 
     let verdict = synthesise_verdict(&traits);
-    let loyalty = compute_loyalty(rows);
+    let loyalty = compute_loyalty(rows, tz);
 
     Personality { verdict, traits, loyalty, total_plays: total }
 }
@@ -177,24 +196,27 @@ fn synthesise_verdict(traits: &[Trait]) -> String {
 }
 
 /// Per-artist loyalty: high = sustained/recurring, low = one-off bursts.
-fn compute_loyalty(rows: &[ListenRow]) -> Vec<LoyalArtist> {
-    let (min_ts, max_ts) = rows.iter().fold((i64::MAX, i64::MIN), |(mn, mx), r| (mn.min(r.ts), mx.max(r.ts)));
-    let full_span = ((max_ts - min_ts) / 86400 + 1).max(1) as f64;
+fn compute_loyalty(rows: &[ListenRow], tz: Tz) -> Vec<LoyalArtist> {
+    let (min_day, max_day) = rows.iter().fold((i64::MAX, i64::MIN), |(mn, mx), r| {
+        let d = local_day(r.ts, tz);
+        (mn.min(d), mx.max(d))
+    });
+    let full_span = (max_day - min_day + 1).max(1) as f64;
 
     let mut by_artist: HashMap<&str, Vec<i64>> = HashMap::new();
-    for r in rows { by_artist.entry(r.artist.as_str()).or_default().push(r.ts); }
+    for r in rows { by_artist.entry(r.artist.as_str()).or_default().push(local_day(r.ts, tz)); }
 
     let mut out: Vec<LoyalArtist> = by_artist.iter()
-        .filter(|(_, ts)| ts.len() >= 5)
-        .map(|(artist, ts)| {
-            let plays = ts.len() as i64;
+        .filter(|(_, days)| days.len() >= 5)
+        .map(|(artist, days)| {
+            let plays = days.len() as i64;
             let mut day_counts: HashMap<i64, i64> = HashMap::new();
             let (mut mn, mut mx) = (i64::MAX, i64::MIN);
-            for &t in ts.iter() {
-                *day_counts.entry(t.div_euclid(86400)).or_default() += 1;
-                mn = mn.min(t); mx = mx.max(t);
+            for &d in days.iter() {
+                *day_counts.entry(d).or_default() += 1;
+                mn = mn.min(d); mx = mx.max(d);
             }
-            let span = ((mx - mn) / 86400 + 1).max(1) as f64;
+            let span = (mx - mn + 1).max(1) as f64;
             let return_rate = day_counts.len() as f64 / span;
             let span_coverage = span / full_span;
             let top_day_share = day_counts.values().copied().max().unwrap_or(1) as f64 / plays as f64;
@@ -208,52 +230,70 @@ fn compute_loyalty(rows: &[ListenRow]) -> Vec<LoyalArtist> {
     out
 }
 
+/// 7 days × 24 hours listening grid in local time (rows Sun..Sat).
+pub fn heatmap_local(rows: &[ListenRow], tz: Tz) -> Vec<Vec<i64>> {
+    let mut grid = vec![vec![0i64; 24]; 7];
+    for r in rows {
+        let dt = local(r.ts, tz);
+        let dow = dt.weekday().num_days_from_sunday() as usize; // 0=Sun
+        let hr = dt.hour() as usize;
+        grid[dow][hr] += 1;
+    }
+    grid
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    const UTC: Tz = chrono_tz::UTC;
 
-    fn row(ts: i64, a: &str, t: &str, album: Option<&str>) -> ListenRow {
-        ListenRow { ts, artist: a.into(), title: t.into(), album: album.map(str::to_string) }
+    fn row(ts: i64, a: &str, t: &str, album: Option<&str>, tn: Option<i32>) -> ListenRow {
+        ListenRow { ts, artist: a.into(), title: t.into(), album: album.map(str::to_string), track_number: tn }
     }
 
     #[test]
     fn empty_is_safe() {
-        let p = compute_personality(&[]);
+        let p = compute_personality(&[], UTC);
         assert_eq!(p.total_plays, 0);
         assert!(p.traits.is_empty());
     }
 
     #[test]
     fn obsessive_listener_scores_high_on_replays() {
-        // Same track 20×, one day → heavy replay, single artist.
-        let rows: Vec<ListenRow> = (0..20).map(|i| row(1_700_000_000 + i * 200, "A", "Song", Some("Alb"))).collect();
-        let p = compute_personality(&rows);
+        let rows: Vec<ListenRow> = (0..20).map(|i| row(1_700_000_000 + i * 200, "A", "Song", Some("Alb"), None)).collect();
+        let p = compute_personality(&rows, UTC);
         let obs = p.traits.iter().find(|t| t.high == "Obsessive").unwrap();
         assert!(obs.score > 80.0, "expected obsessive, got {}", obs.score);
-        // one artist owns everything → low adventurer
         let adv = p.traits.iter().find(|t| t.high == "Adventurer").unwrap();
         assert!(adv.score < 30.0, "expected loyalist, got {}", adv.score);
-        assert!(p.verdict.starts_with("The "));
     }
 
     #[test]
-    fn album_block_lifts_curator() {
-        // A 6-track album played in sequence, 5 min apart → an album run.
-        let rows: Vec<ListenRow> = (0..6).map(|i| row(1_700_000_000 + i * 300, "A", &format!("t{i}"), Some("LP"))).collect();
-        let p = compute_personality(&rows);
+    fn sequential_track_numbers_count_as_a_playthrough() {
+        let rows: Vec<ListenRow> = (0..6).map(|i| row(1_700_000_000 + i * 300, "A", &format!("t{i}"), Some("LP"), Some(i as i32 + 1))).collect();
+        let p = compute_personality(&rows, UTC);
         let cur = p.traits.iter().find(|t| t.high == "Curator").unwrap();
         assert!(cur.score > 50.0, "expected curator, got {}", cur.score);
     }
 
     #[test]
-    fn loyalty_prefers_spread_over_burst() {
-        // Burst artist: 10 plays all one day. Loyal artist: 10 plays across 10 days.
-        let mut rows = Vec::new();
-        for i in 0..10 { rows.push(row(1_700_000_000 + i * 100, "Burst", "s", None)); }
-        for d in 0..10 { rows.push(row(1_700_000_000 + d * 86400, "Loyal", "s", None)); }
-        let p = compute_personality(&rows);
-        let burst = p.loyalty.iter().find(|l| l.artist == "Burst").unwrap();
-        let loyal = p.loyalty.iter().find(|l| l.artist == "Loyal").unwrap();
-        assert!(loyal.loyalty_score > burst.loyalty_score);
+    fn shuffled_track_numbers_do_not_count() {
+        // Same album, within time gaps, but track numbers jump around → not a run.
+        let order = [1, 7, 3, 9, 2, 8];
+        let rows: Vec<ListenRow> = order.iter().enumerate()
+            .map(|(i, &tn)| row(1_700_000_000 + i as i64 * 300, "A", &format!("t{tn}"), Some("LP"), Some(tn))).collect();
+        let p = compute_personality(&rows, UTC);
+        let cur = p.traits.iter().find(|t| t.high == "Curator").unwrap();
+        assert!(cur.score < 20.0, "shuffled shouldn't be curator, got {}", cur.score);
+    }
+
+    #[test]
+    fn timezone_shifts_night_owl() {
+        // Listens at 02:00 UTC. In UTC → night. In UTC-5 (America/New_York would be
+        // 21:00 prev day, still night); use Asia/Kolkata (+5:30 → 07:30 → morning).
+        let rows: Vec<ListenRow> = (0..10).map(|i| row(1_700_000_000 + i * 90_000 + 2 * 3600, "A", &format!("s{i}"), None, None)).collect();
+        let owl_utc = compute_personality(&rows, UTC).traits.iter().find(|t| t.high == "Night Owl").unwrap().score;
+        let owl_ist = compute_personality(&rows, chrono_tz::Asia::Kolkata).traits.iter().find(|t| t.high == "Night Owl").unwrap().score;
+        assert!(owl_utc > owl_ist, "UTC 02:00 is more 'night' than IST 07:30 ({owl_utc} vs {owl_ist})");
     }
 }

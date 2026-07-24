@@ -152,7 +152,9 @@ listening), **Casual ↔ Obsessive** (replays), **Lark ↔ Night Owl** (hours), 
 **Mood-Driven ↔ Identity** (how much your rotation shifts by context) — and names
 you (e.g. "The Obsessive Night Owl"). It also scores each artist's *loyalty*,
 separating long-haul favourites from one-week bursts. All computed locally from
-your own listen history — no external calls.
+your own listen history — no external calls. Time-of-day and weekday axes (and
+the listening heatmap) use your timezone, auto-detected from the browser and
+editable in Settings; album-playthrough detection uses stored track numbers.
 
 ### Import & Export
 

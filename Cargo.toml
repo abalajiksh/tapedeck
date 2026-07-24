@@ -45,6 +45,7 @@ hex = "0.4"
 dotenv = "0.15"
 urlencoding = "2.1"
 chrono = "0.4"
+chrono-tz = "0.9"
 
 # Frontend
 rust-embed = "8"

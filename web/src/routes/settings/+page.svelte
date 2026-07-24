@@ -27,6 +27,13 @@
 	let clearing = false;
 	let exportMsg = '';
 
+	let timezone = '';
+	let tzSaved = false;
+	async function saveTimezone() {
+		try { await api.putPreferences({ timezone: timezone.trim() }); tzSaved = true; setTimeout(() => (tzSaved = false), 2000); }
+		catch { /* ignore */ }
+	}
+
 	// connections
 	let connections: Connection[] = [];
 	let lastfmAvailable = false;
@@ -89,6 +96,10 @@
 			tokens = tokensRes.tokens;
 		} catch { /* fallback */ }
 		try { listenCount = (await api.getDashboardStats()).total; } catch { /* optional */ }
+		try {
+			const prefs = await api.getPreferences();
+			timezone = (prefs.timezone as string) || Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC';
+		} catch { timezone = 'UTC'; }
 		loadConnections();
 		loading = false;
 	});
@@ -187,6 +198,15 @@
 		{#each themes as o}
 			<button class="seg-btn" class:on={$theme === o.v} on:click={() => setTheme(o.v)} style="flex:1;">{o.label}</button>
 		{/each}
+	</div>
+
+	<div style="margin-top:18px;">
+		<div class="field" style="max-width:360px;"><label for="tz">Timezone <span style="opacity:.6">(for local-time analytics)</span></label>
+			<div style="display:flex;gap:8px;">
+				<input id="tz" class="input" bind:value={timezone} placeholder="Europe/Berlin">
+				<button class="btn btn-secondary" on:click={saveTimezone}>{tzSaved ? '✓' : 'Save'}</button>
+			</div>
+		</div>
 	</div>
 </div>
 

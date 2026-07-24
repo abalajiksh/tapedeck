@@ -126,6 +126,7 @@ impl Database {
                 session_id INTEGER REFERENCES sessions(id),
                 listening_context TEXT, submission_client TEXT,
                 delivered_sinks TEXT NOT NULL DEFAULT '[]',
+                track_number INTEGER,
                 UNIQUE(user_id, source_id, source_name)
             )"
         ).execute(&self.pool).await?;
@@ -337,6 +338,13 @@ impl Database {
                 .execute(&self.pool).await;
         }
 
+        // Migration 7: track_number on scrobbles (album-playthrough analytics)
+        if !has_column(&self.pool, "scrobbles", "track_number").await {
+            info!("⚙️ Migrating: adding scrobbles.track_number...");
+            let _ = sqlx::query("ALTER TABLE scrobbles ADD COLUMN track_number INTEGER")
+                .execute(&self.pool).await;
+        }
+
         Ok(())
     }
 
@@ -499,11 +507,11 @@ impl Database {
                 format_type, codec, bitrate, sample_rate, bit_depth, channels, is_lossless,
                 dsd_rate, dsd_multiplier, delivery_codec, delivery_bitrate,
                 is_transcoded, transcode_reason, quality_score,
-                device_id, chain_id, listening_context, submission_client
+                device_id, chain_id, listening_context, submission_client, track_number
             ) VALUES (
                 ?, ?, ?, ?, ?, ?, ?, ?, 'pending',
                 ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
             )"
         )
         .bind(user_id).bind(&play.title).bind(&play.artist).bind(&play.album)
@@ -517,6 +525,7 @@ impl Database {
         .bind(&q.delivery_codec).bind(q.delivery_bitrate)
         .bind(q.is_transcoded).bind(&q.transcode_reason).bind(q.quality_score)
         .bind(device_id).bind(chain_id).bind(listening_context).bind(submission_client)
+        .bind(play.track_number)
         .execute(&self.pool).await?;
         Ok(true)
     }
@@ -627,10 +636,11 @@ impl Database {
         .fetch_all(&self.pool).await
     }
 
-    /// Minimal columns for personality analytics: (timestamp, artist, title, album).
-    pub async fn get_listen_rows(&self, user_id: i64, after: Option<i64>) -> Result<Vec<(i64, String, String, Option<String>)>, sqlx::Error> {
+    /// Minimal columns for analytics: (timestamp, artist, title, album, track_number).
+    pub async fn get_listen_rows(&self, user_id: i64, after: Option<i64>)
+        -> Result<Vec<(i64, String, String, Option<String>, Option<i32>)>, sqlx::Error> {
         sqlx::query_as(
-            "SELECT timestamp, artist, title, album FROM scrobbles
+            "SELECT timestamp, artist, title, album, track_number FROM scrobbles
              WHERE user_id = ? AND (? IS NULL OR timestamp >= ?)"
         ).bind(user_id).bind(after).bind(after).fetch_all(&self.pool).await
     }
@@ -803,19 +813,6 @@ impl Database {
             serde_json::json!({ "name": name, "plays": plays, "hours": (secs.unwrap_or(0) as f64 / 3600.0 * 10.0).round() / 10.0 })
         }).collect();
 
-        // 7 days × 24 hours listening heatmap
-        let hm_rows: Vec<(i64, i64, i64)> = sqlx::query_as(
-            "SELECT CAST(strftime('%w', timestamp, 'unixepoch') AS INTEGER) as dow,
-                    CAST(strftime('%H', timestamp, 'unixepoch') AS INTEGER) as hr,
-                    COUNT(*) as c
-             FROM scrobbles WHERE user_id = ? AND (? IS NULL OR timestamp >= ?)
-             GROUP BY dow, hr"
-        ).bind(user_id).bind(after).bind(after).fetch_all(&self.pool).await?;
-        let mut heatmap = vec![vec![0i64; 24]; 7];
-        for (dow, hr, c) in hm_rows {
-            if (0..7).contains(&dow) && (0..24).contains(&hr) { heatmap[dow as usize][hr as usize] = c; }
-        }
-
         Ok(serde_json::json!({
             "totals": {
                 "plays": total, "hours": (hours * 10.0).round() / 10.0,
@@ -825,7 +822,8 @@ impl Database {
             },
             "top_artists": top_artists,
             "genres": [], "languages": [], "regions": [], "decades": [],
-            "heatmap": heatmap,
+            // heatmap is filled in by the handler in the user's local timezone
+            "heatmap": Vec::<Vec<i64>>::new(),
         }))
     }
 

@@ -2,6 +2,7 @@
 	import '../app.css';
 	import { onMount } from 'svelte';
 	import { page } from '$app/stores';
+	import { api } from '$lib/api';
 	import { theme, initTheme, setTheme, type ThemeMode } from '$lib/theme';
 
 	let state: 'loading' | 'public' | 'authenticated' | 'error' = 'loading';
@@ -51,6 +52,15 @@
 				if (!data.authenticated) return (window.location.href = '/login');
 				isAdmin = !!data.is_admin;
 				state = 'authenticated';
+
+				// Record the browser timezone once, so analytics use local time.
+				try {
+					const prefs = await api.getPreferences();
+					if (!prefs.timezone) {
+						const tz = Intl.DateTimeFormat().resolvedOptions().timeZone;
+						if (tz) await api.putPreferences({ timezone: tz });
+					}
+				} catch { /* non-fatal */ }
 			} catch (err) {
 				state = 'error';
 				errorMsg = err instanceof Error ? err.message : String(err);
