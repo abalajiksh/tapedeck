@@ -142,6 +142,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         mb_client: mb_client.clone(),
         sinks: sinks.clone(),
         log_handle: log_handle.clone(),
+        imports: Default::default(),
+        lastfm_api_key: config.lastfm.api_key.clone(),
     });
 
     let app = server::build_app(app_state);

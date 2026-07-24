@@ -1,111 +1,120 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
-	import StatsCard from '$lib/components/StatsCard.svelte';
+	import { api, type RangedStats, type StatsRange } from '$lib/api';
 
+	const ranges: { v: StatsRange; label: string }[] = [
+		{ v: 'week', label: 'Week' },
+		{ v: 'month', label: 'Month' },
+		{ v: 'last30', label: 'Last 30' },
+		{ v: 'year', label: 'Year' },
+		{ v: 'all', label: 'All' }
+	];
+	let range: StatsRange = 'all';
+	let stats: RangedStats | null = null;
 	let loading = true;
+	let metric: 'plays' | 'hours' = 'plays';
 
-	// Placeholder stats — will come from /api/v1/stats once built
-	let stats = {
-		totalScrobbles: 0,
-		uniqueArtists: 0,
-		uniqueAlbums: 0,
-		uniqueTracks: 0,
-		totalHours: 0,
-		avgQuality: 0,
-		pctLossless: 0,
-		pctDsd: 0,
-		topArtist: '—',
-		topAlbum: '—',
-	};
+	const days = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
 
-	// Listening hours heatmap placeholder (hour × day-of-week)
-	let heatmap: number[][] = Array.from({ length: 7 }, () => Array(24).fill(0));
+	$: maxArtist = stats ? Math.max(1, ...stats.top_artists.map((a) => (metric === 'plays' ? a.plays : a.hours))) : 1;
+	$: maxHeat = stats ? Math.max(1, ...stats.heatmap.flat()) : 1;
 
-	const dayLabels = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
-
-	onMount(async () => {
-		// TODO: fetch from /api/v1/stats
+	async function load() {
+		loading = true;
+		try { stats = await api.getRangedStats(range); } catch (e) { console.warn('stats', e); }
 		loading = false;
-	});
-
-	function heatColor(val: number, max: number): string {
-		if (max === 0 || val === 0) return 'bg-rp-hl-low';
-		const pct = val / max;
-		if (pct > 0.75) return 'bg-rp-iris';
-		if (pct > 0.5) return 'bg-rp-iris/60';
-		if (pct > 0.25) return 'bg-rp-iris/35';
-		return 'bg-rp-iris/15';
 	}
 
-	$: heatMax = Math.max(1, ...heatmap.flat());
+	function setRange(r: StatsRange) { range = r; load(); }
+
+	onMount(load);
 </script>
 
-<svelte:head>
-	<title>Statistics — Tapedeck</title>
-</svelte:head>
+<svelte:head><title>Analytics — Tapedeck</title></svelte:head>
 
-<div class="max-w-4xl mx-auto px-6 py-8">
-	<h1 class="text-2xl font-light text-rp-text mb-6">Statistics</h1>
+<div style="display:flex;align-items:flex-end;justify-content:space-between;gap:16px;flex-wrap:wrap;margin-bottom:20px;">
+	<div>
+		<h1 class="h-display" style="font-size:38px;">Analytics</h1>
+		<p style="margin:6px 0 0;color:var(--td-muted);font-size:15px;">The shape of your listening.</p>
+	</div>
+	<div style="display:inline-flex;background:var(--td-sidebar);border-radius:999px;padding:4px;gap:2px;">
+		{#each ranges as r}
+			<button class="seg-btn" class:on={range === r.v} on:click={() => setRange(r.v)}>{r.label}</button>
+		{/each}
+	</div>
+</div>
 
-	{#if loading}
-		<div class="flex items-center justify-center py-20">
-			<div class="w-5 h-5 border-2 border-rp-iris/30 border-t-rp-iris rounded-full animate-spin"></div>
-		</div>
-	{:else}
-		<!-- Overview cards -->
-		<div class="grid grid-cols-2 md:grid-cols-4 gap-3 mb-8">
-			<StatsCard label="Total Scrobbles" value={stats.totalScrobbles} accent="foam" />
-			<StatsCard label="Artists" value={stats.uniqueArtists} accent="iris" />
-			<StatsCard label="Albums" value={stats.uniqueAlbums} accent="rose" />
-			<StatsCard label="Tracks" value={stats.uniqueTracks} accent="gold" />
-		</div>
-
-		<div class="grid grid-cols-2 md:grid-cols-4 gap-3 mb-8">
-			<StatsCard label="Listening Hours" value={stats.totalHours} accent="pine" />
-			<StatsCard label="Avg Quality" value={stats.avgQuality} sub="out of 100" accent="iris" />
-			<StatsCard label="Lossless" value="{stats.pctLossless}%" accent="foam" />
-			<StatsCard label="DSD" value="{stats.pctDsd}%" accent="iris" />
-		</div>
-
-		<!-- Top artist / album -->
-		<div class="grid grid-cols-2 gap-3 mb-8">
-			<div class="rounded-lg bg-rp-surface border border-rp-hl-med p-4">
-				<p class="text-xs text-rp-muted uppercase tracking-wider mb-1">Top Artist</p>
-				<p class="text-lg text-rp-rose font-light truncate">{stats.topArtist}</p>
+{#if loading && !stats}
+	<div style="display:flex;justify-content:center;padding:80px;"><div class="spin" style="width:22px;height:22px;border:2px solid var(--td-track);border-top-color:var(--td-accent);border-radius:50%;"></div></div>
+{:else if stats}
+	{@const t = stats.totals}
+	<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:14px;margin-bottom:14px;">
+		{#each [['Total Plays', t.plays], ['Artists', t.artists], ['Albums', t.albums], ['Tracks', t.tracks]] as [label, val]}
+			<div class="panel" style="border-radius:20px;padding:18px 20px;">
+				<div style="font-size:10.5px;letter-spacing:.1em;text-transform:uppercase;color:var(--td-muted-2);margin-bottom:6px;">{label}</div>
+				<div class="h-display" style="font-size:30px;line-height:1;">{val}</div>
 			</div>
-			<div class="rounded-lg bg-rp-surface border border-rp-hl-med p-4">
-				<p class="text-xs text-rp-muted uppercase tracking-wider mb-1">Top Album</p>
-				<p class="text-lg text-rp-gold font-light truncate">{stats.topAlbum}</p>
+		{/each}
+	</div>
+	<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:14px;margin-bottom:28px;">
+		<div class="panel" style="border-radius:20px;padding:18px 20px;"><div style="font-size:10.5px;letter-spacing:.1em;text-transform:uppercase;color:var(--td-muted-2);margin-bottom:6px;">Hours</div><div class="h-display" style="font-size:30px;line-height:1;">{t.hours}</div></div>
+		<div class="panel" style="border-radius:20px;padding:18px 20px;"><div style="font-size:10.5px;letter-spacing:.1em;text-transform:uppercase;color:var(--td-muted-2);margin-bottom:6px;">Avg Quality</div><div class="h-display" style="font-size:30px;line-height:1;">{t.avg_quality}<span style="font-size:16px;color:var(--td-muted-2);">/100</span></div></div>
+		<div class="panel" style="border-radius:20px;padding:18px 20px;"><div style="font-size:10.5px;letter-spacing:.1em;text-transform:uppercase;color:var(--td-muted-2);margin-bottom:6px;">Lossless</div><div class="h-display" style="font-size:30px;line-height:1;color:var(--td-good-fg);">{t.lossless_pct}%</div></div>
+		<div class="panel" style="border-radius:20px;padding:18px 20px;"><div style="font-size:10.5px;letter-spacing:.1em;text-transform:uppercase;color:var(--td-muted-2);margin-bottom:6px;">DSD</div><div class="h-display" style="font-size:30px;line-height:1;color:#b2622d;">{t.dsd_pct}%</div></div>
+	</div>
+
+	<!-- Top artists -->
+	<div class="panel" style="border-radius:22px;padding:22px;margin-bottom:16px;">
+		<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px;">
+			<h3 class="h-display" style="font-size:19px;">Top Artists</h3>
+			<div style="display:inline-flex;background:var(--td-sidebar);border-radius:999px;padding:3px;gap:2px;">
+				<button class="seg-btn" class:on={metric === 'plays'} on:click={() => (metric = 'plays')}>Plays</button>
+				<button class="seg-btn" class:on={metric === 'hours'} on:click={() => (metric = 'hours')}>Hours</button>
 			</div>
 		</div>
+		{#if stats.top_artists.length}
+			{#each stats.top_artists as a}
+				{@const v = metric === 'plays' ? a.plays : a.hours}
+				<div style="margin-bottom:13px;">
+					<div style="display:flex;justify-content:space-between;font-size:13px;margin-bottom:5px;"><span style="font-weight:600;">{a.name}</span><span style="color:var(--td-muted-2);">{v}{metric === 'hours' ? 'h' : ''}</span></div>
+					<div style="height:10px;border-radius:999px;background:var(--td-track);overflow:hidden;"><div style="width:{(v / maxArtist * 100).toFixed(0)}%;height:100%;background:linear-gradient(90deg,#c67139,#e07a55);border-radius:999px;"></div></div>
+				</div>
+			{/each}
+		{:else}
+			<p style="color:var(--td-muted);font-size:14px;margin:0;">No plays in this range yet.</p>
+		{/if}
+	</div>
 
-		<!-- Listening heatmap -->
-		<section>
-			<h2 class="text-sm font-medium text-rp-subtle uppercase tracking-wider mb-3">Listening Heatmap</h2>
-			<div class="rounded-xl bg-rp-surface border border-rp-hl-med p-4 overflow-x-auto">
-				<div class="min-w-[600px]">
-					<!-- Hour labels -->
-					<div class="flex items-center mb-1 ml-10">
-						{#each Array(24) as _, h}
-							<span class="flex-1 text-center text-[9px] text-rp-muted">
-								{h % 6 === 0 ? `${h}` : ''}
-							</span>
-						{/each}
-					</div>
-					<!-- Grid -->
-					{#each heatmap as row, dayIdx}
-						<div class="flex items-center gap-1 mb-0.5">
-							<span class="w-8 text-[10px] text-rp-muted text-right mr-1">{dayLabels[dayIdx]}</span>
-							{#each row as val}
-								<div
-									class="flex-1 h-3 rounded-sm {heatColor(val, heatMax)} transition-colors"
-									title="{val} listens"
-								></div>
-							{/each}
-						</div>
+	<!-- Heatmap -->
+	<h3 class="h-display" style="font-size:19px;margin:0 0 12px;">Listening Clock</h3>
+	<div class="panel" style="border-radius:22px;padding:22px;overflow-x:auto;">
+		<div style="min-width:560px;">
+			<div style="display:flex;margin-left:38px;margin-bottom:6px;">
+				{#each Array(24) as _, h}<span style="flex:1;text-align:center;font-size:9px;color:var(--td-muted-3);">{h % 6 === 0 ? h : ''}</span>{/each}
+			</div>
+			{#each stats.heatmap as row, di}
+				<div style="display:flex;align-items:center;gap:3px;margin-bottom:3px;">
+					<span style="width:34px;font-size:10.5px;color:var(--td-muted-3);text-align:right;padding-right:6px;">{days[di]}</span>
+					{#each row as c}
+						<span title={`${c} plays`} style="flex:1;aspect-ratio:1;max-width:20px;border-radius:3px;background:rgba(198,113,57,{c === 0 ? 0.06 : 0.15 + 0.8 * (c / maxHeat)});"></span>
 					{/each}
 				</div>
-			</div>
-		</section>
-	{/if}
-</div>
+			{/each}
+			<div style="display:flex;align-items:center;gap:6px;margin-top:14px;margin-left:38px;font-size:10.5px;color:var(--td-muted-3);">Less
+				<span style="width:13px;height:13px;border-radius:3px;background:rgba(198,113,57,.12);"></span>
+				<span style="width:13px;height:13px;border-radius:3px;background:rgba(198,113,57,.38);"></span>
+				<span style="width:13px;height:13px;border-radius:3px;background:rgba(198,113,57,.64);"></span>
+				<span style="width:13px;height:13px;border-radius:3px;background:rgba(198,113,57,.92);"></span>More</div>
+		</div>
+	</div>
+	<p style="color:var(--td-muted-3);font-size:12.5px;margin:16px 0 0;">Genre, language, and region breakdowns appear once MusicBrainz enrichment is available.</p>
+{/if}
+
+<style>
+	.spin { animation: td-spin 0.7s linear infinite; }
+	.seg-btn {
+		border: none; background: transparent; cursor: pointer; color: var(--td-nav-fg);
+		font-size: 12.5px; padding: 6px 14px; border-radius: 999px; font-family: inherit;
+	}
+	.seg-btn.on { background: var(--td-accent); color: #fbf5ea; }
+</style>

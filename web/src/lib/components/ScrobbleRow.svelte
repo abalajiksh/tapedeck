@@ -1,56 +1,31 @@
 <script lang="ts">
-	import { timeAgo, qualityLabel, coverArtUrl, formatDuration } from '$lib/utils';
 	import type { Scrobble } from '$lib/api';
+	import { qualityLabel, tierTagClass, coverStyle, formatDuration, timeAgo } from '$lib/utils';
+	import { createEventDispatcher } from 'svelte';
 
 	export let scrobble: Scrobble;
-	export let showTimestamp = true;
+	export let showMenu = false;
 
-	$: quality = qualityLabel(scrobble);
-	$: cover = coverArtUrl(scrobble.caa_id, scrobble.caa_release_mbid, 250);
-	$: badgeClass =
-		quality.tier === 'dsd' ? 'badge-dsd' :
-		quality.tier === 'lossless' ? 'badge-lossless' :
-		quality.tier === 'bt' ? 'badge-bt' :
-		'badge-lossy';
+	const dispatch = createEventDispatcher<{ menu: Scrobble }>();
+
+	$: q = qualityLabel(scrobble);
+	$: seed = scrobble.artist || scrobble.title || '?';
+	$: initial = (scrobble.artist || scrobble.title || '?').charAt(0).toUpperCase();
+	$: time = new Date(scrobble.timestamp * 1000).toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' });
 </script>
 
-<div class="group flex items-center gap-3 px-3 py-2.5 rounded-lg hover:bg-rp-hl-low transition-colors">
-	<!-- Cover art -->
-	<div class="w-10 h-10 rounded bg-rp-overlay shrink-0 overflow-hidden">
-		{#if cover}
-			<img src={cover} alt="" class="w-full h-full object-cover" loading="lazy" />
-		{:else}
-			<div class="w-full h-full flex items-center justify-center text-rp-muted text-lg">♫</div>
-		{/if}
+<div style="display:flex;align-items:center;gap:14px;padding:13px 18px;border-bottom:1px solid var(--td-border);">
+	<div style="width:40px;height:40px;flex:none;border-radius:9px;display:flex;align-items:center;justify-content:center;color:rgba(255,255,255,.92);font-family:'Caprasimo',serif;font-size:17px;{coverStyle(seed)}">{initial}</div>
+	<div style="flex:1;min-width:0;">
+		<div style="font-size:14.5px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">{scrobble.title}</div>
+		<div style="font-size:12.5px;color:var(--td-muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">{scrobble.artist}{scrobble.album ? ` — ${scrobble.album}` : ''}</div>
 	</div>
-
-	<!-- Track info -->
-	<div class="flex-1 min-w-0">
-		<p class="text-sm text-rp-text truncate font-medium">{scrobble.title}</p>
-		<p class="text-xs text-rp-subtle truncate">
-			{scrobble.artist}
-			{#if scrobble.album}
-				<span class="text-rp-muted"> — {scrobble.album}</span>
-			{/if}
-		</p>
-	</div>
-
-	<!-- Quality badge -->
-	{#if quality.text}
-		<span class={badgeClass}>{quality.text}</span>
-	{/if}
-
-	<!-- Duration -->
-	{#if scrobble.duration}
-		<span class="text-xs text-rp-muted w-12 text-right shrink-0">
-			{formatDuration(scrobble.duration)}
-		</span>
-	{/if}
-
-	<!-- Timestamp -->
-	{#if showTimestamp}
-		<span class="text-xs text-rp-muted w-16 text-right shrink-0">
-			{timeAgo(scrobble.timestamp)}
-		</span>
+	{#if q.text}<span class={tierTagClass(q.tier)}>{q.text}</span>{/if}
+	<span style="font-size:12px;color:var(--td-muted-3);width:54px;text-align:right;flex:none;">{formatDuration(scrobble.duration)}</span>
+	<span style="font-size:12px;color:var(--td-muted-3);width:52px;text-align:right;flex:none;">{showMenu ? time : timeAgo(scrobble.timestamp)}</span>
+	{#if showMenu}
+		<button on:click={() => dispatch('menu', scrobble)} aria-label="Listen actions" style="border:none;background:transparent;cursor:pointer;color:var(--td-muted-3);padding:5px;border-radius:8px;flex:none;display:flex;">
+			<svg viewBox="0 0 24 24" width="18" fill="currentColor"><circle cx="12" cy="5" r="1.7"/><circle cx="12" cy="12" r="1.7"/><circle cx="12" cy="19" r="1.7"/></svg>
+		</button>
 	{/if}
 </div>

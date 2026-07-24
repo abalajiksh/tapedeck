@@ -1,8 +1,11 @@
 mod admin;
 pub mod auth;
 mod chains;
+mod export;
+pub mod import;
 pub mod ingest;
 pub mod models;
+mod preferences;
 mod scrobbles;
 mod users;
 
@@ -22,6 +25,10 @@ pub struct AppState {
     pub mb_client: Arc<MusicBrainzClient>,
     pub sinks: Arc<Vec<Box<dyn ScrobbleSink>>>,
     pub log_handle: LogLevelHandle,
+    /// In-memory registry of running/finished import jobs.
+    pub imports: import::ImportRegistry,
+    /// Last.fm API key (for user.getRecentTracks import); empty = import disabled.
+    pub lastfm_api_key: String,
 }
 
 /// Build the full Axum application.
@@ -38,6 +45,9 @@ pub fn build_app(state: Arc<AppState>) -> Router {
         .merge(user_mgmt)
         .merge(gear)
         .merge(scrobbles_router)
+        .merge(preferences::create_preferences_router())
+        .merge(export::create_export_router())
+        .merge(import::create_import_router())
         .with_state(state);
 
     // The SPA is the fallback, not a `/*path` route: a route would only answer

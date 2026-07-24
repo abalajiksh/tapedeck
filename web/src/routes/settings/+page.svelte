@@ -3,14 +3,16 @@
 	import { api } from '$lib/api';
 	import type { TokenInfo } from '$lib/api';
 	import { formatDateTime } from '$lib/utils';
+	import { theme, setTheme, type ThemeMode } from '$lib/theme';
 
 	const uiVersion = __UI_VERSION__;
 	let backendVersion = '…';
+	let origin = typeof window !== 'undefined' ? window.location.origin : 'http://your-server:8080';
 
 	let tokens: TokenInfo[] = [];
 	let loading = true;
+	let listenCount = 0;
 
-	// New token form
 	let newTokenName = '';
 	let newTokenScopes = 'submit';
 	let createdToken = '';
@@ -20,15 +22,23 @@
 	let healthStatus = '';
 	let checking = false;
 
+	let confirmClear = false;
+	let clearing = false;
+	let exportMsg = '';
+
+	const themes: { v: ThemeMode; label: string }[] = [
+		{ v: 'light', label: 'Light' },
+		{ v: 'dark', label: 'Dark' },
+		{ v: 'system', label: 'System' }
+	];
+
 	onMount(async () => {
 		try {
-			const [health, tokensRes] = await Promise.all([
-				api.health(),
-				api.getTokens(),
-			]);
+			const [health, tokensRes] = await Promise.all([api.health(), api.getTokens()]);
 			backendVersion = health.version;
 			tokens = tokensRes.tokens;
-		} catch { /* shown as fallback */ }
+		} catch { /* fallback */ }
+		try { listenCount = (await api.getDashboardStats()).total; } catch { /* optional */ }
 		loading = false;
 	});
 
@@ -40,12 +50,8 @@
 			const result = await api.createToken(newTokenName.trim(), newTokenScopes);
 			createdToken = result.token;
 			newTokenName = '';
-			// Refresh token list
-			const res = await api.getTokens();
-			tokens = res.tokens;
-		} catch (e: any) {
-			console.error('Create token failed:', e);
-		}
+			tokens = (await api.getTokens()).tokens;
+		} catch (e) { console.error('Create token failed:', e); }
 		creating = false;
 	}
 
@@ -53,10 +59,8 @@
 		if (!confirm('Revoke this token? Any clients using it will stop working.')) return;
 		try {
 			await api.revokeToken(id);
-			tokens = tokens.filter(t => t.id !== id);
-		} catch (e: any) {
-			console.error('Revoke failed:', e);
-		}
+			tokens = tokens.filter((t) => t.id !== id);
+		} catch (e) { console.error('Revoke failed:', e); }
 	}
 
 	function copyToken() {
@@ -71,10 +75,32 @@
 		try {
 			const h = await api.health();
 			healthStatus = h.status === 'ok' ? '✓ Connected' : `⚠ Status: ${h.status}`;
-		} catch (e: any) {
-			healthStatus = `✗ ${e.message}`;
-		}
+		} catch (e) { healthStatus = `✗ ${e instanceof Error ? e.message : e}`; }
 		checking = false;
+	}
+
+	async function doExport(format: 'json' | 'csv') {
+		try {
+			const blob = await api.exportBlob(format);
+			const url = URL.createObjectURL(blob);
+			const a = document.createElement('a');
+			a.href = url;
+			a.download = `tapedeck-export.${format}`;
+			a.click();
+			URL.revokeObjectURL(url);
+			exportMsg = `Exported ${format.toUpperCase()}`;
+			setTimeout(() => (exportMsg = ''), 3000);
+		} catch (e) { exportMsg = 'Export failed'; }
+	}
+
+	async function doClear() {
+		clearing = true;
+		try {
+			await api.clearScrobbles();
+			listenCount = 0;
+			confirmClear = false;
+		} catch (e) { alert('Clear failed: ' + e); }
+		clearing = false;
 	}
 
 	async function handleLogout() {
@@ -83,164 +109,132 @@
 	}
 </script>
 
-<svelte:head>
-	<title>Settings — Tapedeck</title>
-</svelte:head>
+<svelte:head><title>Settings — Tapedeck</title></svelte:head>
 
-<div class="max-w-2xl mx-auto px-6 py-8">
-	<h1 class="text-2xl font-light text-rp-text mb-6">Settings</h1>
+<h1 class="h-display" style="font-size:38px;margin-bottom:6px;">Settings</h1>
+<p style="margin:0 0 24px;color:var(--td-muted);font-size:15px;">Tokens, connections, and the machinery behind the deck.</p>
 
-	<!-- API Tokens -->
-	<section class="rounded-xl bg-rp-surface border border-rp-hl-med p-5 mb-6">
-		<h2 class="text-sm font-medium text-rp-text mb-1">API Tokens</h2>
-		<p class="text-xs text-rp-muted mb-4">
-			Tokens for Pano Scrobbler and other external clients. Each token authenticates via
-			<code class="text-rp-foam">Authorization: Token td_…</code>
-		</p>
+<!-- Appearance -->
+<div class="panel" style="border-radius:22px;padding:24px;margin-bottom:18px;">
+	<h3 class="h-display" style="font-size:19px;margin-bottom:4px;">Appearance</h3>
+	<p style="font-size:13px;color:var(--td-muted);margin:0 0 16px;">Choose a theme, or follow your system. Saved to your profile so every device matches.</p>
+	<div style="display:flex;background:var(--td-sidebar);border-radius:999px;padding:4px;gap:2px;max-width:360px;">
+		{#each themes as o}
+			<button class="seg-btn" class:on={$theme === o.v} on:click={() => setTheme(o.v)} style="flex:1;">{o.label}</button>
+		{/each}
+	</div>
+</div>
 
-		{#if loading}
-			<div class="flex justify-center py-4">
-				<div class="w-4 h-4 border-2 border-rp-iris/30 border-t-rp-iris rounded-full animate-spin"></div>
-			</div>
-		{:else}
-			<!-- Token list -->
-			{#if tokens.length > 0}
-				<div class="space-y-2 mb-4">
-					{#each tokens as token (token.id)}
-						<div class="flex items-center justify-between bg-rp-base rounded-lg px-3.5 py-2.5 border border-rp-hl-low">
-							<div class="min-w-0">
-								<span class="text-sm text-rp-text font-medium">{token.name}</span>
-								<span class="text-[10px] text-rp-muted ml-2 uppercase">{token.scopes}</span>
-								<p class="text-xs text-rp-muted mt-0.5">
-									Created {formatDateTime(token.created_at)}
-									{#if token.last_used_at}
-										 · Last used {formatDateTime(token.last_used_at)}
-									{:else}
-										 · Never used
-									{/if}
-								</p>
-							</div>
-							<button
-								on:click={() => revokeToken(token.id)}
-								class="shrink-0 text-xs text-rp-love/70 hover:text-rp-love transition-colors ml-3"
-							>
-								Revoke
-							</button>
+<!-- API Tokens -->
+<div class="panel" style="border-radius:22px;padding:24px;margin-bottom:18px;">
+	<h3 class="h-display" style="font-size:19px;margin-bottom:4px;">API Tokens</h3>
+	<p style="font-size:13px;color:var(--td-muted);margin:0 0 16px;">Tokens let Pano Scrobbler and other clients submit listens via <code class="chip">Authorization: Token td_…</code></p>
+
+	{#if loading}
+		<div style="display:flex;justify-content:center;padding:16px;"><div class="spin" style="width:18px;height:18px;border:2px solid var(--td-track);border-top-color:var(--td-accent);border-radius:50%;"></div></div>
+	{:else}
+		{#if tokens.length}
+			<div style="display:flex;flex-direction:column;gap:8px;margin-bottom:16px;">
+				{#each tokens as t (t.id)}
+					<div style="display:flex;align-items:center;justify-content:space-between;gap:12px;background:var(--td-surface2);border:1px solid var(--td-border);border-radius:14px;padding:12px 16px;">
+						<div style="min-width:0;">
+							<div><span style="font-weight:600;font-size:14px;">{t.name}</span> <span style="font-size:10px;letter-spacing:.08em;text-transform:uppercase;color:var(--td-muted-3);margin-left:6px;">{t.scopes}</span></div>
+							<div style="font-size:12px;color:var(--td-muted-2);margin-top:2px;">Created {formatDateTime(t.created_at)} · {t.last_used_at ? `Last used ${formatDateTime(t.last_used_at)}` : 'Never used'}</div>
 						</div>
-					{/each}
-				</div>
-			{:else}
-				<p class="text-sm text-rp-muted mb-4">No tokens yet.</p>
-			{/if}
-
-			<!-- New token created banner -->
-			{#if createdToken}
-				<div class="rounded-lg bg-rp-base border border-rp-gold/30 p-4 mb-4">
-					<p class="text-xs text-rp-gold uppercase tracking-wider font-medium mb-2">New token created — copy it now!</p>
-					<div class="flex gap-2">
-						<code class="flex-1 bg-rp-overlay rounded px-3 py-2 text-sm text-rp-foam font-mono break-all select-all">
-							{createdToken}
-						</code>
-						<button
-							on:click={copyToken}
-							class="shrink-0 px-3 py-2 rounded-lg text-xs font-medium
-							       bg-rp-gold/15 text-rp-gold border border-rp-gold/25 hover:bg-rp-gold/25"
-						>
-							{tokenCopied ? '✓' : 'Copy'}
-						</button>
+						<button class="btn btn-secondary" style="font-size:12.5px;color:#b2622d;" on:click={() => revokeToken(t.id)}>Revoke</button>
 					</div>
-				</div>
-			{/if}
-
-			<!-- Create new token -->
-			<div class="flex gap-2">
-				<input
-					type="text"
-					bind:value={newTokenName}
-					placeholder="Token name (e.g. walkman, phone)"
-					class="flex-1 bg-rp-base border border-rp-hl-med rounded-lg px-3.5 py-2 text-sm text-rp-text
-					       placeholder:text-rp-muted focus:outline-none focus:border-rp-iris/50 transition-colors"
-				/>
-				<select
-					bind:value={newTokenScopes}
-					class="bg-rp-base border border-rp-hl-med rounded-lg px-2 py-2 text-sm text-rp-text
-					       focus:outline-none focus:border-rp-iris/50"
-				>
-					<option value="submit">submit</option>
-					<option value="submit,read">submit + read</option>
-					<option value="submit,read,admin">all</option>
-				</select>
-				<button
-					on:click={createToken}
-					disabled={creating || !newTokenName.trim()}
-					class="px-4 py-2 rounded-lg text-sm font-medium transition-colors
-					       bg-rp-iris/20 text-rp-iris border border-rp-iris/30
-					       hover:bg-rp-iris/30 disabled:opacity-40"
-				>
-					{creating ? '…' : 'Create'}
-				</button>
+				{/each}
 			</div>
 		{/if}
-	</section>
 
-	<!-- Connection check -->
-	<section class="rounded-xl bg-rp-surface border border-rp-hl-med p-5 mb-6">
-		<h2 class="text-sm font-medium text-rp-text mb-1">Connection</h2>
-		<p class="text-xs text-rp-muted mb-4">Test connectivity to the Tapedeck backend.</p>
-		<div class="flex items-center gap-3">
-			<button
-				on:click={checkConnection}
-				disabled={checking}
-				class="px-4 py-2 rounded-lg text-sm font-medium transition-colors
-				       bg-rp-pine/20 text-rp-foam border border-rp-pine/30
-				       hover:bg-rp-pine/30 disabled:opacity-50"
-			>
-				{checking ? 'Checking…' : 'Test Connection'}
-			</button>
-			{#if healthStatus}
-				<span class="text-sm {healthStatus.startsWith('✓') ? 'text-rp-foam' : 'text-rp-love'}">{healthStatus}</span>
-			{/if}
-		</div>
-	</section>
-
-	<!-- Pano Scrobbler setup -->
-	<section class="rounded-xl bg-rp-surface border border-rp-hl-med p-5 mb-6">
-		<h2 class="text-sm font-medium text-rp-text mb-1">Pano Scrobbler Setup</h2>
-		<p class="text-xs text-rp-muted mb-4">Connect all your devices in one step.</p>
-		<ol class="text-sm text-rp-subtle space-y-2">
-			<li class="flex gap-2"><span class="text-rp-iris shrink-0">1.</span> Open Pano Scrobbler → Settings → Scrobble services</li>
-			<li class="flex gap-2"><span class="text-rp-iris shrink-0">2.</span> Add a custom ListenBrainz server</li>
-			<li class="flex gap-2"><span class="text-rp-iris shrink-0">3.</span>
-				<span>URL: <code class="text-rp-foam bg-rp-hl-low px-1.5 py-0.5 rounded text-xs">{typeof window !== 'undefined' ? window.location.origin : 'http://your-server:8080'}</code></span>
-			</li>
-			<li class="flex gap-2"><span class="text-rp-iris shrink-0">4.</span>
-				<span>Token: one of your <code class="text-rp-foam bg-rp-hl-low px-1.5 py-0.5 rounded text-xs">td_…</code> tokens from above</span>
-			</li>
-		</ol>
-	</section>
-
-	<!-- About + Logout -->
-	<section class="rounded-xl bg-rp-surface border border-rp-hl-med p-5">
-		<div class="flex items-start justify-between">
-			<div>
-				<h2 class="text-sm font-medium text-rp-text mb-1">About</h2>
-				<div class="text-xs text-rp-muted space-y-1">
-					<p>Server v{backendVersion} · UI v{uiVersion}</p>
-					<p>A self-hosted music intelligence hub.</p>
-					<p>
-						<a href="https://github.com/abalajiksh/tapedeck" target="_blank" rel="noopener"
-						   class="text-rp-iris hover:underline">GitHub</a>
-					</p>
+		{#if createdToken}
+			<div style="background:var(--td-panel);border-radius:16px;padding:16px;margin-bottom:16px;">
+				<div style="font-size:10.5px;letter-spacing:.1em;text-transform:uppercase;color:#e0a06a;margin-bottom:8px;">New token — copy it now, it won't be shown again</div>
+				<div style="display:flex;gap:8px;align-items:center;">
+					<code style="flex:1;background:var(--td-panel2);color:#a9c48a;border-radius:10px;padding:10px 12px;font-size:13px;word-break:break-all;">{createdToken}</code>
+					<button class="btn btn-primary" on:click={copyToken}>{tokenCopied ? '✓ Copied' : 'Copy'}</button>
 				</div>
 			</div>
-			<button
-				on:click={handleLogout}
-				class="px-4 py-2 rounded-lg text-sm font-medium transition-colors
-				       bg-rp-love/10 text-rp-love border border-rp-love/20
-				       hover:bg-rp-love/20"
-			>
-				Sign out
-			</button>
+		{/if}
+
+		<div style="display:flex;gap:8px;flex-wrap:wrap;">
+			<input class="input" style="flex:1;min-width:180px;" bind:value={newTokenName} placeholder="Token name (e.g. walkman, phone)">
+			<select class="input" style="width:auto;" bind:value={newTokenScopes}>
+				<option value="submit">submit</option>
+				<option value="submit,read">submit + read</option>
+				<option value="submit,read,admin">all</option>
+			</select>
+			<button class="btn btn-primary" on:click={createToken} disabled={creating || !newTokenName.trim()}>{creating ? '…' : 'Create'}</button>
 		</div>
-	</section>
+	{/if}
 </div>
+
+<!-- Connection -->
+<div class="panel" style="border-radius:22px;padding:24px;margin-bottom:18px;">
+	<h3 class="h-display" style="font-size:19px;margin-bottom:4px;">Connection</h3>
+	<p style="font-size:13px;color:var(--td-muted);margin:0 0 16px;">Test connectivity to the Tapedeck backend.</p>
+	<div style="display:flex;align-items:center;gap:14px;">
+		<button class="btn btn-secondary" on:click={checkConnection} disabled={checking}>{checking ? 'Checking…' : 'Test connection'}</button>
+		{#if healthStatus}<span style="font-size:14px;font-weight:600;color:{healthStatus.startsWith('✓') ? 'var(--td-good-fg)' : '#b2622d'};">{healthStatus}</span>{/if}
+	</div>
+</div>
+
+<!-- Pano setup -->
+<div class="panel" style="border-radius:22px;padding:24px;margin-bottom:18px;">
+	<h3 class="h-display" style="font-size:19px;margin-bottom:4px;">Pano Scrobbler Setup</h3>
+	<p style="font-size:13px;color:var(--td-muted);margin:0 0 16px;">Point every device at your instance in one step.</p>
+	<ol style="margin:0;padding-left:22px;font-size:14px;color:var(--td-nav-fg);display:flex;flex-direction:column;gap:8px;">
+		<li>Open Pano Scrobbler → Settings → Scrobble services</li>
+		<li>Add a custom ListenBrainz server</li>
+		<li>URL: <code class="chip">{origin}</code></li>
+		<li>Token: one of your <code class="chip">td_…</code> tokens above</li>
+	</ol>
+</div>
+
+<!-- Data & Backups -->
+<div class="panel" style="border-radius:22px;padding:24px;margin-bottom:18px;">
+	<h3 class="h-display" style="font-size:19px;margin-bottom:4px;">Data &amp; Backups</h3>
+	<p style="font-size:13px;color:var(--td-muted);margin:0 0 16px;">{listenCount} listens recorded. Export a full backup or wipe the deck clean.</p>
+	<div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center;">
+		<button class="btn btn-secondary" on:click={() => doExport('json')}>Export JSON</button>
+		<button class="btn btn-secondary" on:click={() => doExport('csv')}>Export CSV</button>
+		<span style="flex:1;"></span>
+		<button class="btn btn-ghost" style="color:#b2622d;" on:click={() => (confirmClear = true)}>Clear history</button>
+	</div>
+	{#if exportMsg}
+		<div style="margin-top:14px;display:inline-flex;align-items:center;gap:8px;font-size:13px;color:var(--td-good-fg);background:var(--td-good-bg);padding:7px 14px;border-radius:999px;">✓ {exportMsg}</div>
+	{/if}
+</div>
+
+<!-- About -->
+<div class="panel" style="border-radius:22px;padding:24px;display:flex;align-items:flex-start;justify-content:space-between;gap:16px;">
+	<div>
+		<h3 class="h-display" style="font-size:19px;margin-bottom:6px;">About</h3>
+		<div style="font-size:13px;color:var(--td-muted);display:flex;flex-direction:column;gap:3px;">
+			<span>Server v{backendVersion} · UI v{uiVersion}</span>
+			<span>A self-hosted music listening journal.</span>
+			<a href="https://github.com/abalajiksh/tapedeck" target="_blank" rel="noopener">View on GitHub →</a>
+		</div>
+	</div>
+	<button class="btn btn-secondary" style="color:#b2622d;" on:click={handleLogout}>Sign out</button>
+</div>
+
+{#if confirmClear}
+	<div class="dialog-backdrop" on:click={() => (confirmClear = false)} on:keydown={() => {}} role="presentation">
+		<div class="dialog" on:click|stopPropagation on:keydown|stopPropagation role="presentation">
+			<div class="dialog-title">Clear listen history?</div>
+			<div class="dialog-body" style="color:var(--td-nav-fg);">This permanently deletes all {listenCount} recorded listens from this instance. Export a backup first if you might want them back — this can't be undone.</div>
+			<div class="dialog-actions">
+				<button class="btn btn-secondary" on:click={() => (confirmClear = false)}>Cancel</button>
+				<button class="btn btn-primary" style="background:#b2622d;" on:click={doClear} disabled={clearing}>{clearing ? 'Clearing…' : 'Clear everything'}</button>
+			</div>
+		</div>
+	</div>
+{/if}
+
+<style>
+	.spin { animation: td-spin 0.7s linear infinite; }
+	.seg-btn { border: none; background: transparent; cursor: pointer; color: var(--td-nav-fg); font-size: 13px; padding: 7px 14px; border-radius: 999px; font-family: inherit; }
+	.seg-btn.on { background: var(--td-accent); color: #fbf5ea; }
+	.chip { background: var(--td-sidebar); padding: 2px 6px; border-radius: 6px; font-size: 12px; }
+</style>

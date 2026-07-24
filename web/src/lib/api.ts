@@ -42,6 +42,30 @@ export interface DashboardStats {
 	avg_quality: number;
 }
 
+export type StatsRange = 'week' | 'month' | 'last30' | 'year' | 'all';
+
+export interface RangedStats {
+	totals: {
+		plays: number; hours: number; artists: number; albums: number; tracks: number;
+		avg_quality: number; lossless_pct: number; dsd_pct: number;
+	};
+	top_artists: { name: string; plays: number; hours: number }[];
+	genres: { name: string; pct: number }[];
+	languages: { name: string; pct: number }[];
+	regions: { name: string; pct: number }[];
+	decades: { name: string; pct: number }[];
+	heatmap: number[][]; // 7 days × 24 hours
+}
+
+export interface ImportJob {
+	job_id: string; source: string; state: 'running' | 'done' | 'error';
+	fetched: number; imported: number; total: number | null; status: string; date: number;
+}
+
+export interface ImportRecord {
+	source: string; date: number; count: number; status: string;
+}
+
 export interface SignalChain {
 	id: number;
 	name: string;
@@ -129,6 +153,16 @@ class TapedeckAPI {
 		return this.request('DELETE', path);
 	}
 
+	private async patch<T>(path: string, body?: unknown): Promise<T> {
+		return this.request('PATCH', path, body);
+	}
+
+	/** DELETE that tolerates an empty 204 body (the JSON helpers assume a body). */
+	private async delNoBody(path: string): Promise<void> {
+		const res = await fetch(`${BASE}${path}`, { method: 'DELETE', credentials: 'same-origin' });
+		if (!res.ok) throw new Error(`API ${res.status}: ${await res.text()}`);
+	}
+
 	// ── Auth ──
 	async authStatus(): Promise<AuthStatus> {
 		return this.get('/api/v1/auth/status');
@@ -174,6 +208,57 @@ class TapedeckAPI {
 	async getDashboardStats(): Promise<DashboardStats> {
 		return this.get('/api/v1/stats/dashboard');
 	}
+
+	async getRangedStats(range: StatsRange = 'all'): Promise<RangedStats> {
+		return this.get(`/api/v1/stats?range=${range}`);
+	}
+
+	async patchScrobble(id: number, changes: Partial<{
+		title: string; artist: string; album: string; mbid_recording: string;
+		signal_chain_id: number; listening_context: string; format_type: string; codec: string;
+	}>): Promise<Scrobble> {
+		return this.patch(`/api/v1/scrobbles/${id}`, changes);
+	}
+
+	async deleteScrobble(id: number): Promise<void> {
+		return this.delNoBody(`/api/v1/scrobbles/${id}`);
+	}
+
+	async clearScrobbles(): Promise<void> {
+		return this.delNoBody('/api/v1/scrobbles?confirm=true');
+	}
+
+	// ── Preferences ──
+	async getPreferences(): Promise<Record<string, unknown>> { return this.get('/api/v1/preferences'); }
+	async putPreferences(patch: Record<string, unknown>): Promise<Record<string, unknown>> {
+		return this.request('PUT', '/api/v1/preferences', patch);
+	}
+
+	// ── Export (returns a Blob to trigger a download) ──
+	async exportBlob(format: 'json' | 'csv'): Promise<Blob> {
+		const res = await fetch(`${BASE}/api/v1/export?format=${format}`, { credentials: 'same-origin' });
+		if (!res.ok) throw new Error(`API ${res.status}: ${await res.text()}`);
+		return res.blob();
+	}
+
+	// ── Import ──
+	async importListenBrainz(username: string, token?: string): Promise<{ job_id: string }> {
+		return this.post('/api/v1/import/listenbrainz', { username, token });
+	}
+	async importLastfm(username: string): Promise<{ job_id: string }> {
+		return this.post('/api/v1/import/lastfm', { username });
+	}
+	async importFile(file: File): Promise<{ job_id: string }> {
+		const form = new FormData();
+		form.append('file', file);
+		const res = await fetch(`${BASE}/api/v1/import/file`, {
+			method: 'POST', credentials: 'same-origin', body: form
+		});
+		if (!res.ok) throw new Error(`API ${res.status}: ${await res.text()}`);
+		return res.json();
+	}
+	async importJob(jobId: string): Promise<ImportJob> { return this.get(`/api/v1/import/jobs/${jobId}`); }
+	async importHistory(): Promise<{ imports: ImportRecord[] }> { return this.get('/api/v1/import/history'); }
 
 	// ── Chains ──
 	async getChains(): Promise<{ chains: SignalChain[] }> { return this.get('/api/v1/chains'); }

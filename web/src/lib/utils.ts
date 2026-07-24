@@ -74,6 +74,23 @@ export function qualityLabel(scrobble: {
 	return { text: '', tier: 'lossy' };
 }
 
+/** Map a quality tier to the DS tag class used for badges. */
+export function tierTagClass(tier: 'dsd' | 'lossless' | 'lossy' | 'bt'): string {
+	return 'tag ' + ({ lossless: 'tag-accent-2', dsd: 'tag-accent', lossy: 'tag-neutral', bt: 'tag-outline' }[tier] ?? 'tag-neutral');
+}
+
+/** Deterministic gradient cover for a track, keyed by artist/title initial. */
+const COVERS: [string, string][] = [
+	['#c67139', '#e07a55'], ['#7a8a5e', '#aebf92'], ['#b2622d', '#f6a06b'],
+	['#56633f', '#8fa073'], ['#8c491a', '#d67f48'], ['#645c50', '#a19786']
+];
+export function coverStyle(seed: string): string {
+	let h = 0;
+	for (let i = 0; i < seed.length; i++) h = (h * 31 + seed.charCodeAt(i)) >>> 0;
+	const [a, b] = COVERS[h % COVERS.length];
+	return `background:linear-gradient(135deg,${a},${b});`;
+}
+
 /** Cover Art Archive URL from caa_id and release MBID */
 export function coverArtUrl(
 	caaId: number | null | undefined,

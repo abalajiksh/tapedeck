@@ -8,17 +8,10 @@
 	let loading = false;
 
 	onMount(async () => {
-		// If already authenticated, go to dashboard
 		try {
 			const status = await api.authStatus();
-			if (status.needs_setup) {
-				window.location.href = '/setup';
-				return;
-			}
-			if (status.authenticated) {
-				window.location.href = '/';
-				return;
-			}
+			if (status.needs_setup) return (window.location.href = '/setup');
+			if (status.authenticated) return (window.location.href = '/');
 		} catch { /* proceed to login form */ }
 	});
 
@@ -27,10 +20,9 @@
 		loading = true;
 		try {
 			await api.login(username, password);
-			// Full reload to re-run layout auth check with the new session cookie
 			window.location.href = '/';
-		} catch (e: any) {
-			error = e.message?.includes('401') ? 'Invalid username or password' : 'Connection error';
+		} catch (e) {
+			error = String(e).includes('401') ? 'Invalid username or password' : 'Connection error';
 		}
 		loading = false;
 	}
@@ -40,66 +32,35 @@
 	}
 </script>
 
-<svelte:head>
-	<title>Login — Tapedeck</title>
-</svelte:head>
+<svelte:head><title>Login — Tapedeck</title></svelte:head>
 
-<div class="min-h-screen bg-rp-base flex items-center justify-center px-4">
-	<div class="w-full max-w-sm">
-		<!-- Logo -->
-		<div class="text-center mb-8">
-			<span class="text-4xl">📼</span>
-			<h1 class="text-2xl font-light text-rp-text mt-2">Tapedeck</h1>
-			<p class="text-sm text-rp-muted mt-1">Sign in to your instance</p>
+<div style="min-height:100vh;display:flex;align-items:center;justify-content:center;padding:32px;background:radial-gradient(120% 120% at 50% 0%, var(--td-surface) 0%, var(--td-bg) 100%);">
+	<div style="width:100%;max-width:420px;">
+		<div style="text-align:center;margin-bottom:26px;">
+			<div style="display:inline-flex;align-items:center;justify-content:center;width:64px;height:64px;border-radius:20px;background:var(--td-panel);box-shadow:0 8px 24px rgba(46,43,37,.25);">
+				<svg viewBox="0 0 32 20" width="34" fill="none"><rect x="1" y="1" width="30" height="18" rx="4" stroke="#f4e7cf" stroke-width="1.6"/><circle cx="11" cy="11" r="3.4" stroke="#c67139" stroke-width="1.6"/><circle cx="21" cy="11" r="3.4" stroke="#7a8a5e" stroke-width="1.6"/></svg>
+			</div>
+			<h1 class="h-display" style="font-size:40px;margin:14px 0 2px;">Tapedeck</h1>
+			<p style="margin:0;color:var(--td-muted);font-size:14.5px;">Sign in to your instance</p>
 		</div>
 
-		<!-- Login form -->
-		<div class="rounded-xl bg-rp-surface border border-rp-hl-med p-6">
+		<div class="panel" style="border-radius:26px;box-shadow:0 12px 32px rgba(46,43,37,.12);padding:26px;">
 			{#if error}
-				<div class="rounded-lg bg-rp-love/10 border border-rp-love/20 px-4 py-2.5 mb-4">
-					<p class="text-sm text-rp-love">{error}</p>
+				<div style="background:var(--td-good-bg);filter:hue-rotate(300deg);border-radius:14px;padding:10px 14px;margin-bottom:14px;">
+					<p style="margin:0;font-size:13px;color:#b2622d;">{error}</p>
 				</div>
 			{/if}
-
-			<div class="space-y-4">
-				<div>
-					<label for="username" class="block text-xs text-rp-muted uppercase tracking-wider mb-1.5">Username</label>
-					<input
-						id="username"
-						type="text"
-						bind:value={username}
-						on:keydown={onKeydown}
-						autocomplete="username"
-						class="w-full bg-rp-base border border-rp-hl-med rounded-lg px-3.5 py-2.5 text-sm text-rp-text
-						       placeholder:text-rp-muted focus:outline-none focus:border-rp-iris/50 transition-colors"
-						placeholder="admin"
-					/>
-				</div>
-
-				<div>
-					<label for="password" class="block text-xs text-rp-muted uppercase tracking-wider mb-1.5">Password</label>
-					<input
-						id="password"
-						type="password"
-						bind:value={password}
-						on:keydown={onKeydown}
-						autocomplete="current-password"
-						class="w-full bg-rp-base border border-rp-hl-med rounded-lg px-3.5 py-2.5 text-sm text-rp-text
-						       placeholder:text-rp-muted focus:outline-none focus:border-rp-iris/50 transition-colors"
-						placeholder="••••••••"
-					/>
-				</div>
-
-				<button
-					on:click={handleLogin}
-					disabled={loading || !username || !password}
-					class="w-full px-4 py-2.5 rounded-lg text-sm font-medium transition-colors
-					       bg-rp-iris/20 text-rp-iris border border-rp-iris/30
-					       hover:bg-rp-iris/30 disabled:opacity-40 disabled:cursor-not-allowed"
-				>
+			<div style="display:flex;flex-direction:column;gap:14px;">
+				<div class="field"><label for="u">Username</label>
+					<input id="u" class="input" bind:value={username} on:keydown={onKeydown} autocomplete="username" placeholder="admin"></div>
+				<div class="field"><label for="p">Password</label>
+					<input id="p" class="input" type="password" bind:value={password} on:keydown={onKeydown} autocomplete="current-password" placeholder="••••••••"></div>
+				<button class="btn btn-primary btn-block" on:click={handleLogin} disabled={loading || !username || !password}>
 					{loading ? 'Signing in…' : 'Sign in'}
 				</button>
+				<p style="text-align:center;margin:2px 0 0;font-size:13px;color:var(--td-muted);">First run? <a href="/setup">Set up your instance</a></p>
 			</div>
 		</div>
+		<p style="text-align:center;margin:20px 0 0;font-size:12px;color:var(--td-muted-2);">A self-hosted listening journal</p>
 	</div>
 </div>

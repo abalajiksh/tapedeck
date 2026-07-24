@@ -526,6 +526,186 @@ impl Database {
     }
 
     // ════════════════════════════════════════════════════════════
+    //  Scrobble Edit / Delete / Import / Export
+    // ════════════════════════════════════════════════════════════
+
+    /// PATCH a listen. Every field is optional; only provided (`Some`) fields
+    /// change (COALESCE keeps the existing value on NULL). Scoped by user_id.
+    /// Returns false if no row matched (wrong id or not owned by user).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn update_scrobble(
+        &self, user_id: i64, id: i64,
+        title: Option<&str>, artist: Option<&str>, album: Option<&str>,
+        mbid_recording: Option<&str>, chain_id: Option<i64>,
+        listening_context: Option<&str>, format_type: Option<&str>, codec: Option<&str>,
+    ) -> Result<bool, sqlx::Error> {
+        let res = sqlx::query(
+            "UPDATE scrobbles SET
+                title = COALESCE(?, title),
+                artist = COALESCE(?, artist),
+                album = COALESCE(?, album),
+                mbid_recording = COALESCE(?, mbid_recording),
+                chain_id = COALESCE(?, chain_id),
+                listening_context = COALESCE(?, listening_context),
+                format_type = COALESCE(?, format_type),
+                codec = COALESCE(?, codec)
+             WHERE id = ? AND user_id = ?"
+        )
+        .bind(title).bind(artist).bind(album)
+        .bind(mbid_recording).bind(chain_id)
+        .bind(listening_context).bind(format_type).bind(codec)
+        .bind(id).bind(user_id)
+        .execute(&self.pool).await?;
+        Ok(res.rows_affected() > 0)
+    }
+
+    /// Delete a single listen owned by the user. Returns false if not found.
+    pub async fn delete_scrobble(&self, user_id: i64, id: i64) -> Result<bool, sqlx::Error> {
+        let res = sqlx::query("DELETE FROM scrobbles WHERE id = ? AND user_id = ?")
+            .bind(id).bind(user_id).execute(&self.pool).await?;
+        Ok(res.rows_affected() > 0)
+    }
+
+    /// Delete ALL listens for the user. Returns the number removed.
+    pub async fn clear_scrobbles(&self, user_id: i64) -> Result<u64, sqlx::Error> {
+        let res = sqlx::query("DELETE FROM scrobbles WHERE user_id = ?")
+            .bind(user_id).execute(&self.pool).await?;
+        Ok(res.rows_affected())
+    }
+
+    /// Every listen for a user, newest first — for full-backup export.
+    pub async fn get_all_scrobbles(&self, user_id: i64) -> Result<Vec<ScrobbleRecord>, sqlx::Error> {
+        sqlx::query_as::<_, ScrobbleRecord>(
+            "SELECT * FROM scrobbles WHERE user_id = ? ORDER BY timestamp DESC"
+        ).bind(user_id).fetch_all(&self.pool).await
+    }
+
+    /// Insert a historical listen from an import. Deduped like `save_scrobble`,
+    /// but inserted as `imported` (not `pending`) so the outbound sink engine
+    /// never re-scrobbles a back-fill to Last.fm/ListenBrainz. Returns true if
+    /// a new row was inserted.
+    pub async fn import_listen(&self, user_id: i64, play: &Play) -> Result<bool, sqlx::Error> {
+        if self.exists(user_id, &play.source_id, &play.source_name).await? { return Ok(false); }
+        if self.fuzzy_exists(user_id, &play.title, &play.artist, play.timestamp as i64).await? {
+            return Ok(false);
+        }
+        let mbid_artist_json = play.mbid_artist.as_ref().map(|arr| serde_json::to_string(arr).unwrap());
+        sqlx::query(
+            "INSERT INTO scrobbles (
+                user_id, title, artist, album, timestamp, duration, source_id, source_name, status,
+                mbid_recording, mbid_release, mbid_artist, caa_id, caa_release_mbid, submission_client
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'imported', ?, ?, ?, ?, ?, 'import')"
+        )
+        .bind(user_id).bind(&play.title).bind(&play.artist).bind(&play.album)
+        .bind(play.timestamp as i64).bind(play.duration.map(|d| d as i64))
+        .bind(&play.source_id).bind(&play.source_name)
+        .bind(&play.mbid_recording).bind(&play.mbid_release).bind(&mbid_artist_json)
+        .bind(play.caa_id).bind(&play.caa_release_mbid)
+        .execute(&self.pool).await?;
+        Ok(true)
+    }
+
+    // ════════════════════════════════════════════════════════════
+    //  Ranged analytics  (GET /api/v1/stats?range=...)
+    // ════════════════════════════════════════════════════════════
+
+    /// `after` = None means all-time. Genres/languages/regions/decades need
+    /// MusicBrainz enrichment we don't have yet, so they return empty arrays
+    /// (the UI hides empty breakdowns). totals/top_artists/heatmap are real.
+    pub async fn get_ranged_stats(&self, user_id: i64, after: Option<i64>) -> Result<serde_json::Value, sqlx::Error> {
+        let plays: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM scrobbles WHERE user_id = ? AND (? IS NULL OR timestamp >= ?)"
+        ).bind(user_id).bind(after).bind(after).fetch_one(&self.pool).await?;
+        let total = plays.0;
+
+        let secs: (Option<i64>,) = sqlx::query_as(
+            "SELECT SUM(duration) FROM scrobbles WHERE user_id = ? AND (? IS NULL OR timestamp >= ?) AND duration IS NOT NULL"
+        ).bind(user_id).bind(after).bind(after).fetch_one(&self.pool).await?;
+        let hours = secs.0.unwrap_or(0) as f64 / 3600.0;
+
+        let artists: (i64,) = sqlx::query_as(
+            "SELECT COUNT(DISTINCT artist) FROM scrobbles WHERE user_id = ? AND (? IS NULL OR timestamp >= ?)"
+        ).bind(user_id).bind(after).bind(after).fetch_one(&self.pool).await?;
+        let albums: (i64,) = sqlx::query_as(
+            "SELECT COUNT(DISTINCT album) FROM scrobbles WHERE user_id = ? AND (? IS NULL OR timestamp >= ?) AND album IS NOT NULL"
+        ).bind(user_id).bind(after).bind(after).fetch_one(&self.pool).await?;
+        let tracks: (i64,) = sqlx::query_as(
+            "SELECT COUNT(DISTINCT title || '|' || artist) FROM scrobbles WHERE user_id = ? AND (? IS NULL OR timestamp >= ?)"
+        ).bind(user_id).bind(after).bind(after).fetch_one(&self.pool).await?;
+        let avg_quality: (Option<f64>,) = sqlx::query_as(
+            "SELECT AVG(quality_score) FROM scrobbles WHERE user_id = ? AND (? IS NULL OR timestamp >= ?) AND quality_score IS NOT NULL"
+        ).bind(user_id).bind(after).bind(after).fetch_one(&self.pool).await?;
+        let lossless: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM scrobbles WHERE user_id = ? AND (? IS NULL OR timestamp >= ?) AND is_lossless = TRUE"
+        ).bind(user_id).bind(after).bind(after).fetch_one(&self.pool).await?;
+        let dsd: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM scrobbles WHERE user_id = ? AND (? IS NULL OR timestamp >= ?) AND format_type = 'dsd'"
+        ).bind(user_id).bind(after).bind(after).fetch_one(&self.pool).await?;
+        let pct = |n: i64| if total > 0 { (n as f64 / total as f64 * 100.0).round() as i64 } else { 0 };
+
+        let top_rows: Vec<(String, i64, Option<i64>)> = sqlx::query_as(
+            "SELECT artist, COUNT(*) as plays, SUM(duration) as secs
+             FROM scrobbles WHERE user_id = ? AND (? IS NULL OR timestamp >= ?)
+             GROUP BY artist ORDER BY plays DESC LIMIT 10"
+        ).bind(user_id).bind(after).bind(after).fetch_all(&self.pool).await?;
+        let top_artists: Vec<serde_json::Value> = top_rows.into_iter().map(|(name, plays, secs)| {
+            serde_json::json!({ "name": name, "plays": plays, "hours": (secs.unwrap_or(0) as f64 / 3600.0 * 10.0).round() / 10.0 })
+        }).collect();
+
+        // 7 days × 24 hours listening heatmap
+        let hm_rows: Vec<(i64, i64, i64)> = sqlx::query_as(
+            "SELECT CAST(strftime('%w', timestamp, 'unixepoch') AS INTEGER) as dow,
+                    CAST(strftime('%H', timestamp, 'unixepoch') AS INTEGER) as hr,
+                    COUNT(*) as c
+             FROM scrobbles WHERE user_id = ? AND (? IS NULL OR timestamp >= ?)
+             GROUP BY dow, hr"
+        ).bind(user_id).bind(after).bind(after).fetch_all(&self.pool).await?;
+        let mut heatmap = vec![vec![0i64; 24]; 7];
+        for (dow, hr, c) in hm_rows {
+            if (0..7).contains(&dow) && (0..24).contains(&hr) { heatmap[dow as usize][hr as usize] = c; }
+        }
+
+        Ok(serde_json::json!({
+            "totals": {
+                "plays": total, "hours": (hours * 10.0).round() / 10.0,
+                "artists": artists.0, "albums": albums.0, "tracks": tracks.0,
+                "avg_quality": avg_quality.0.map(|q| (q * 10.0).round() / 10.0).unwrap_or(0.0),
+                "lossless_pct": pct(lossless.0), "dsd_pct": pct(dsd.0),
+            },
+            "top_artists": top_artists,
+            "genres": [], "languages": [], "regions": [], "decades": [],
+            "heatmap": heatmap,
+        }))
+    }
+
+    // ════════════════════════════════════════════════════════════
+    //  User preferences  (stored in users.settings JSON — no new table)
+    // ════════════════════════════════════════════════════════════
+
+    /// Returns the user's `settings` JSON object (defaults to `{}`).
+    pub async fn get_preferences(&self, user_id: i64) -> Result<serde_json::Value, sqlx::Error> {
+        let row: Option<(Option<String>,)> = sqlx::query_as("SELECT settings FROM users WHERE id = ?")
+            .bind(user_id).fetch_optional(&self.pool).await?;
+        let json = row.and_then(|(s,)| s)
+            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+            .filter(|v| v.is_object())
+            .unwrap_or_else(|| serde_json::json!({}));
+        Ok(json)
+    }
+
+    /// Shallow-merge `patch` into the user's stored preferences and persist.
+    /// Returns the merged object.
+    pub async fn merge_preferences(&self, user_id: i64, patch: &serde_json::Value) -> Result<serde_json::Value, sqlx::Error> {
+        let mut current = self.get_preferences(user_id).await?;
+        if let (Some(obj), Some(p)) = (current.as_object_mut(), patch.as_object()) {
+            for (k, v) in p { obj.insert(k.clone(), v.clone()); }
+        }
+        sqlx::query("UPDATE users SET settings = ? WHERE id = ?")
+            .bind(current.to_string()).bind(user_id).execute(&self.pool).await?;
+        Ok(current)
+    }
+
+    // ════════════════════════════════════════════════════════════
     //  Signal Chains
     // ════════════════════════════════════════════════════════════
 
