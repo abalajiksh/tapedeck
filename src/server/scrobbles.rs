@@ -141,22 +141,42 @@ pub struct StatsQuery {
     pub range: Option<String>,
 }
 
+/// Map a range label to a lower-bound timestamp (None = all time).
+fn range_after(range: Option<&str>) -> Option<i64> {
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
+    match range.unwrap_or("all") {
+        "week" => Some(now - 7 * 86400),
+        "month" | "last30" => Some(now - 30 * 86400),
+        "year" => Some(now - 365 * 86400),
+        _ => None,
+    }
+}
+
 /// GET /api/v1/stats?range=week|month|last30|year|all — ranged analytics.
 async fn ranged_stats(
     State(state): State<Arc<AppState>>,
     user: AuthUser,
     Query(q): Query<StatsQuery>,
 ) -> impl IntoResponse {
-    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
-    let after = match q.range.as_deref().unwrap_or("all") {
-        "week" => Some(now - 7 * 86400),
-        "month" => Some(now - 30 * 86400),
-        "last30" => Some(now - 30 * 86400),
-        "year" => Some(now - 365 * 86400),
-        _ => None, // "all"
-    };
-    match state.db.get_ranged_stats(user.user_id, after).await {
+    match state.db.get_ranged_stats(user.user_id, range_after(q.range.as_deref())).await {
         Ok(stats) => (StatusCode::OK, Json(stats)).into_response(),
+        Err(e) => server_error(e.to_string()),
+    }
+}
+
+/// GET /api/v1/personality?range=… — five-axis listening personality.
+async fn personality(
+    State(state): State<Arc<AppState>>,
+    user: AuthUser,
+    Query(q): Query<StatsQuery>,
+) -> impl IntoResponse {
+    match state.db.get_listen_rows(user.user_id, range_after(q.range.as_deref())).await {
+        Ok(rows) => {
+            let listens: Vec<crate::analytics::ListenRow> = rows.into_iter()
+                .map(|(ts, artist, title, album)| crate::analytics::ListenRow { ts, artist, title, album })
+                .collect();
+            (StatusCode::OK, Json(crate::analytics::compute_personality(&listens))).into_response()
+        }
         Err(e) => server_error(e.to_string()),
     }
 }
@@ -199,4 +219,5 @@ pub fn create_scrobbles_router() -> Router<Arc<AppState>> {
         .route("/api/v1/scrobbles/:id", patch(update_scrobble).delete(delete_scrobble))
         .route("/api/v1/stats/dashboard", get(dashboard_stats))
         .route("/api/v1/stats", get(ranged_stats))
+        .route("/api/v1/personality", get(personality))
 }

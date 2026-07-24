@@ -58,6 +58,20 @@ export interface RangedStats {
 	heatmap: number[][]; // 7 days × 24 hours
 }
 
+export interface PersonalityTrait {
+	label: string;
+	low: string;
+	high: string;
+	score: number; // 0..100, 50 = balanced
+	evidence: string;
+}
+export interface Personality {
+	verdict: string;
+	traits: PersonalityTrait[];
+	loyalty: { artist: string; plays: number; loyalty_score: number }[];
+	total_plays: number;
+}
+
 export interface ImportJob {
 	job_id: string; source: string; state: 'running' | 'done' | 'error';
 	fetched: number; imported: number; total: number | null; status: string; date: number;
@@ -252,6 +266,10 @@ class TapedeckAPI {
 
 	async getRangedStats(range: StatsRange = 'all'): Promise<RangedStats> {
 		return this.get(`/api/v1/stats?range=${range}`);
+	}
+
+	async getPersonality(range: StatsRange = 'all'): Promise<Personality> {
+		return this.get(`/api/v1/personality?range=${range}`);
 	}
 
 	async patchScrobble(id: number, changes: Partial<{

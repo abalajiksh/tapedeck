@@ -144,6 +144,16 @@ with:
 - **Signal Chains & Equipment**, plus **Settings** for appearance, API tokens,
   connection test, and data export / wipe.
 
+### Musical Personality
+
+The Analytics screen profiles *how* you listen across five explainable axes —
+**Adventurer ↔ Loyalist** (artist spread), **Curator ↔ Drifter** (album-block
+listening), **Casual ↔ Obsessive** (replays), **Lark ↔ Night Owl** (hours), and
+**Mood-Driven ↔ Identity** (how much your rotation shifts by context) — and names
+you (e.g. "The Obsessive Night Owl"). It also scores each artist's *loyalty*,
+separating long-haul favourites from one-week bursts. All computed locally from
+your own listen history — no external calls.
+
 ### Import & Export
 
 Backfill your history from elsewhere and take it with you:
@@ -410,6 +420,7 @@ the `td_session` cookie set by the web UI login.
 | DELETE | `/api/v1/scrobbles?confirm=true` | Auth | Clear all listens for the user |
 | GET | `/api/v1/stats/dashboard` | Auth | Dashboard summary counts |
 | GET | `/api/v1/stats?range=` | Auth | Ranged analytics (`week`/`month`/`last30`/`year`/`all`) |
+| GET | `/api/v1/personality?range=` | Auth | Five-axis listening personality + per-artist loyalty |
 
 ### Preferences, Export & Import
 

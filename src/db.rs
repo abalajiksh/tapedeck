@@ -627,6 +627,14 @@ impl Database {
         .fetch_all(&self.pool).await
     }
 
+    /// Minimal columns for personality analytics: (timestamp, artist, title, album).
+    pub async fn get_listen_rows(&self, user_id: i64, after: Option<i64>) -> Result<Vec<(i64, String, String, Option<String>)>, sqlx::Error> {
+        sqlx::query_as(
+            "SELECT timestamp, artist, title, album FROM scrobbles
+             WHERE user_id = ? AND (? IS NULL OR timestamp >= ?)"
+        ).bind(user_id).bind(after).bind(after).fetch_all(&self.pool).await
+    }
+
     pub async fn get_dashboard_stats(&self, user_id: i64) -> Result<serde_json::Value, sqlx::Error> {
         let now = Self::now_secs();
         let today_start = now - (now % 86400);

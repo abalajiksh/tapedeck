@@ -1,3 +1,4 @@
+mod analytics;
 mod config;
 mod db;
 mod engine;

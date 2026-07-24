@@ -1,6 +1,6 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
-	import { api, type RangedStats, type StatsRange } from '$lib/api';
+	import { api, type RangedStats, type StatsRange, type Personality } from '$lib/api';
 
 	const ranges: { v: StatsRange; label: string }[] = [
 		{ v: 'week', label: 'Week' },
@@ -11,6 +11,7 @@
 	];
 	let range: StatsRange = 'all';
 	let stats: RangedStats | null = null;
+	let persona: Personality | null = null;
 	let loading = true;
 	let metric: 'plays' | 'hours' = 'plays';
 
@@ -21,7 +22,9 @@
 
 	async function load() {
 		loading = true;
-		try { stats = await api.getRangedStats(range); } catch (e) { console.warn('stats', e); }
+		try {
+			[stats, persona] = await Promise.all([api.getRangedStats(range), api.getPersonality(range)]);
+		} catch (e) { console.warn('stats', e); }
 		loading = false;
 	}
 
@@ -47,6 +50,39 @@
 {#if loading && !stats}
 	<div style="display:flex;justify-content:center;padding:80px;"><div class="spin" style="width:22px;height:22px;border:2px solid var(--td-track);border-top-color:var(--td-accent);border-radius:50%;"></div></div>
 {:else if stats}
+	<!-- Musical personality -->
+	{#if persona && persona.traits.length}
+		<div class="panel" style="border-radius:22px;padding:24px;margin-bottom:24px;background:linear-gradient(135deg, var(--td-panel), var(--td-panel2));color:#f4e7cf;">
+			<div style="font-size:11px;letter-spacing:.16em;text-transform:uppercase;color:#c9a678;margin-bottom:8px;">Your musical personality</div>
+			<div class="h-display" style="font-size:32px;margin-bottom:20px;color:#f4e7cf;">{persona.verdict}</div>
+			<div style="display:flex;flex-direction:column;gap:16px;">
+				{#each persona.traits as tr}
+					<div>
+						<div style="display:flex;justify-content:space-between;font-size:12.5px;margin-bottom:6px;color:#e9dcc4;">
+							<span style="opacity:{tr.score < 50 ? 1 : .5};font-weight:600;">{tr.low}</span>
+							<span style="color:#c9a678;">{tr.evidence}</span>
+							<span style="opacity:{tr.score > 50 ? 1 : .5};font-weight:600;">{tr.high}</span>
+						</div>
+						<div style="position:relative;height:8px;border-radius:999px;background:rgba(244,231,207,.14);">
+							<div style="position:absolute;top:50%;left:50%;width:1px;height:14px;transform:translate(-50%,-50%);background:rgba(244,231,207,.3);"></div>
+							<div style="position:absolute;top:-3px;width:14px;height:14px;border-radius:50%;background:var(--td-accent-hi);box-shadow:0 0 0 3px rgba(224,122,85,.25);left:calc({tr.score}% - 7px);"></div>
+						</div>
+					</div>
+				{/each}
+			</div>
+			{#if persona.loyalty.length}
+				<div style="margin-top:22px;padding-top:16px;border-top:1px solid rgba(244,231,207,.14);">
+					<div style="font-size:11px;letter-spacing:.14em;text-transform:uppercase;color:#c9a678;margin-bottom:10px;">Most loyal to</div>
+					<div style="display:flex;gap:8px;flex-wrap:wrap;">
+						{#each persona.loyalty.slice(0, 6) as l}
+							<span class="tag" style="background:rgba(244,231,207,.1);color:#e9dcc4;border:none;">{l.artist} · {Math.round(l.loyalty_score)}</span>
+						{/each}
+					</div>
+				</div>
+			{/if}
+		</div>
+	{/if}
+
 	{@const t = stats.totals}
 	<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:14px;margin-bottom:14px;">
 		{#each [['Total Plays', t.plays], ['Artists', t.artists], ['Albums', t.albums], ['Tracks', t.tracks]] as [label, val]}
