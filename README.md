@@ -74,8 +74,12 @@ track count, quality stats, and listening context.
 ### Multi-User Support
 
 Multiple users in the same household can each have their own token, their own
-scrobble history, their own signal chains. Data is isolated per-user. First
-run creates an admin user; additional users are created via the API.
+scrobble history, their own signal chains. Data is isolated per-user. First run
+is a web onboarding flow — open the UI and it walks you through creating the
+admin account (no config files, no console token hunting). Admins then manage
+everyone from the **Users** screen: create accounts, change roles, reset
+passwords, and remove users (with guards against deleting yourself or the last
+admin).
 
 ### Reliability
 
@@ -369,8 +373,10 @@ the `td_session` cookie set by the web UI login.
 |--------|------|------|-------------|
 | GET | `/health` | None | Health check |
 | GET/POST | `/log-level` | None | View/set runtime log level |
-| GET | `/admin/users` | Token | List users |
-| POST | `/admin/users` | Token | Create user (returns token) |
+| GET | `/admin/users` | Admin | List users |
+| POST | `/admin/users` | Admin | Create user (returns token) |
+| PATCH | `/admin/users/{id}` | Admin | Change role / reset password |
+| DELETE | `/admin/users/{id}` | Admin | Delete user + all their data |
 | GET | `/admin/tokens` | Token | List your tokens |
 | POST | `/admin/tokens` | Token | Create new token |
 | DELETE | `/admin/tokens/{id}` | Token | Revoke a token |

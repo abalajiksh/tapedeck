@@ -137,6 +137,15 @@ export interface HealthStatus {
 export interface AuthStatus {
 	needs_setup: boolean;
 	authenticated: boolean;
+	is_admin: boolean;
+}
+
+export interface User {
+	id: number;
+	username: string;
+	display_name: string | null;
+	role: string;
+	created_at: number;
 }
 
 export interface UserInfo {
@@ -325,9 +334,18 @@ class TapedeckAPI {
 		return this.post('/api/v1/scrobbles/bulk-chain', { ids, signal_chain_id });
 	}
 
-	// ── Users ──
-	async getUsers(): Promise<{ users: Array<{ id: number; username: string; display_name: string | null; role: string; created_at: number }> }> {
+	// ── Users (admin) ──
+	async getUsers(): Promise<{ users: User[] }> {
 		return this.get('/admin/users');
+	}
+	async createUser(username: string, display_name?: string, password?: string): Promise<{ user_id: number; username: string; token: string; message: string }> {
+		return this.post('/admin/users', { username, display_name, password });
+	}
+	async updateUser(id: number, changes: { role?: string; password?: string }): Promise<{ status: string }> {
+		return this.patch(`/admin/users/${id}`, changes);
+	}
+	async deleteUser(id: number): Promise<void> {
+		return this.delNoBody(`/admin/users/${id}`);
 	}
 
 	// ── Tokens ──

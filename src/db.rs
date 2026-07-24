@@ -1133,6 +1133,45 @@ impl Database {
         Ok(result.last_insert_rowid())
     }
 
+    pub async fn get_user_role(&self, id: i64) -> Result<Option<String>, sqlx::Error> {
+        let row: Option<(String,)> = sqlx::query_as("SELECT role FROM users WHERE id = ?")
+            .bind(id).fetch_optional(&self.pool).await?;
+        Ok(row.map(|(r,)| r))
+    }
+
+    pub async fn count_admins(&self) -> Result<i64, sqlx::Error> {
+        let c: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM users WHERE role = 'admin'")
+            .fetch_one(&self.pool).await?;
+        Ok(c.0)
+    }
+
+    pub async fn update_user_role(&self, id: i64, role: &str) -> Result<bool, sqlx::Error> {
+        let res = sqlx::query("UPDATE users SET role = ? WHERE id = ?")
+            .bind(role).bind(id).execute(&self.pool).await?;
+        Ok(res.rows_affected() > 0)
+    }
+
+    pub async fn update_user_password(&self, id: i64, password_hash: &str) -> Result<bool, sqlx::Error> {
+        let res = sqlx::query("UPDATE users SET password_hash = ? WHERE id = ?")
+            .bind(password_hash).bind(id).execute(&self.pool).await?;
+        Ok(res.rows_affected() > 0)
+    }
+
+    /// Delete a user and everything they own, in one transaction. Every listen,
+    /// token, chain, device, session, binding, and import record scoped to the
+    /// user is removed first so foreign keys stay consistent.
+    pub async fn delete_user(&self, id: i64) -> Result<bool, sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
+        for table in ["scrobbles", "tokens", "signal_chains", "devices",
+                      "equipment", "sessions", "chain_bindings", "import_jobs", "web_sessions"] {
+            sqlx::query(&format!("DELETE FROM {} WHERE user_id = ?", table))
+                .bind(id).execute(&mut *tx).await?;
+        }
+        let res = sqlx::query("DELETE FROM users WHERE id = ?").bind(id).execute(&mut *tx).await?;
+        tx.commit().await?;
+        Ok(res.rows_affected() > 0)
+    }
+
     pub async fn create_token(&self, user_id: i64, name: &str, scopes: &str) -> Result<String, sqlx::Error> {
         use rand::Rng;
         let raw: [u8; 24] = rand::rng().random();

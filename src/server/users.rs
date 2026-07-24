@@ -50,16 +50,20 @@ async fn auth_status(
 ) -> impl IntoResponse {
     let needs_setup = state.db.needs_setup().await.unwrap_or(true);
 
-    let authenticated = if let Some(session_token) = headers.get("cookie")
+    let session_user = if let Some(session_token) = headers.get("cookie")
         .and_then(|v| v.to_str().ok())
         .and_then(|c| c.split(';').find_map(|s| s.trim().strip_prefix("td_session=").map(|v| v.to_string())))
     {
-        state.db.validate_session(&session_token).await.ok().flatten().is_some()
+        state.db.validate_session(&session_token).await.ok().flatten()
     } else {
-        false
+        None
     };
 
-    Json(serde_json::json!({ "needs_setup": needs_setup, "authenticated": authenticated }))
+    Json(serde_json::json!({
+        "needs_setup": needs_setup,
+        "authenticated": session_user.is_some(),
+        "is_admin": session_user.as_ref().map(|u| u.is_admin).unwrap_or(false),
+    }))
 }
 
 /// POST /api/v1/auth/setup — first-run: set admin password, get token
@@ -301,6 +305,100 @@ async fn list_users(
     }
 }
 
+/// PATCH /admin/users/:id — change role and/or reset password (admin-only).
+#[derive(Deserialize)]
+pub struct UpdateUserRequest {
+    pub role: Option<String>,        // "admin" | "user"
+    pub password: Option<String>,    // reset to this (min 8 chars)
+}
+
+async fn update_user(
+    State(state): State<Arc<AppState>>,
+    user: AuthUser,
+    Path(id): Path<i64>,
+    Json(body): Json<UpdateUserRequest>,
+) -> impl IntoResponse {
+    if !user.is_admin {
+        return forbidden("modify users");
+    }
+
+    if let Some(ref role) = body.role {
+        if role != "admin" && role != "user" {
+            return (StatusCode::BAD_REQUEST, Json(serde_json::json!(
+                ErrorResponse { code: 400, error: "role must be 'admin' or 'user'".into() }
+            ))).into_response();
+        }
+        // Don't let the last admin be demoted (would lock everyone out of admin).
+        if role == "user" {
+            let target_is_admin = state.db.get_user_role(id).await.ok().flatten().as_deref() == Some("admin");
+            let admins = state.db.count_admins().await.unwrap_or(0);
+            if target_is_admin && admins <= 1 {
+                return (StatusCode::BAD_REQUEST, Json(serde_json::json!(
+                    ErrorResponse { code: 400, error: "Cannot demote the last admin".into() }
+                ))).into_response();
+            }
+        }
+        if let Err(e) = state.db.update_user_role(id, role).await {
+            return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!(
+                ErrorResponse { code: 500, error: e.to_string() }
+            ))).into_response();
+        }
+    }
+
+    if let Some(ref pw) = body.password {
+        if pw.len() < 8 {
+            return (StatusCode::BAD_REQUEST, Json(serde_json::json!(
+                ErrorResponse { code: 400, error: "Password must be at least 8 characters".into() }
+            ))).into_response();
+        }
+        let hash = match Database::hash_password(pw) {
+            Ok(h) => h,
+            Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!(
+                ErrorResponse { code: 500, error: e }
+            ))).into_response(),
+        };
+        if let Err(e) = state.db.update_user_password(id, &hash).await {
+            return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!(
+                ErrorResponse { code: 500, error: e.to_string() }
+            ))).into_response();
+        }
+    }
+
+    (StatusCode::OK, Json(serde_json::json!({ "status": "updated" }))).into_response()
+}
+
+/// DELETE /admin/users/:id — remove a user and all their data (admin-only).
+async fn delete_user(
+    State(state): State<Arc<AppState>>,
+    user: AuthUser,
+    Path(id): Path<i64>,
+) -> impl IntoResponse {
+    if !user.is_admin {
+        return forbidden("delete users");
+    }
+    if id == user.user_id {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!(
+            ErrorResponse { code: 400, error: "You cannot delete your own account".into() }
+        ))).into_response();
+    }
+    // Guard against removing the last admin.
+    let target_is_admin = state.db.get_user_role(id).await.ok().flatten().as_deref() == Some("admin");
+    if target_is_admin && state.db.count_admins().await.unwrap_or(0) <= 1 {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!(
+            ErrorResponse { code: 400, error: "Cannot delete the last admin".into() }
+        ))).into_response();
+    }
+    match state.db.delete_user(id).await {
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => (StatusCode::NOT_FOUND, Json(serde_json::json!(
+            ErrorResponse { code: 404, error: "User not found".into() }
+        ))).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!(
+            ErrorResponse { code: 500, error: e.to_string() }
+        ))).into_response(),
+    }
+}
+
 // ═══════════════════════════════════════════════════════════
 //  Token management
 // ═══════════════════════════════════════════════════════════
@@ -394,8 +492,10 @@ pub fn create_auth_router() -> Router<Arc<AppState>> {
 
 /// User + token management (authenticated).
 pub fn create_user_management_router() -> Router<Arc<AppState>> {
+    use axum::routing::patch;
     Router::new()
         .route("/admin/users", post(create_user).get(list_users))
+        .route("/admin/users/:id", patch(update_user).delete(delete_user))
         .route("/admin/tokens", post(create_token).get(list_tokens))
         .route("/admin/tokens/:id", delete(revoke_token))
 }
