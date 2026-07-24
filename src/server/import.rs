@@ -27,6 +27,8 @@ pub type ImportRegistry = Arc<Mutex<HashMap<String, ImportJob>>>;
 #[derive(Clone, Serialize)]
 pub struct ImportJob {
     pub job_id: String,
+    #[serde(skip)]
+    pub user_id: i64,             // owner (not serialized to clients)
     pub source: String,           // "listenbrainz" | "lastfm" | "file"
     pub state: String,            // "running" | "done" | "error"
     pub fetched: usize,           // listens pulled from the source
@@ -48,15 +50,25 @@ fn update<F: FnOnce(&mut ImportJob)>(reg: &ImportRegistry, id: &str, f: F) {
 }
 
 /// Register a fresh running job and return its id.
-fn start(reg: &ImportRegistry, source: &str) -> String {
+fn start(reg: &ImportRegistry, source: &str, user_id: i64) -> String {
     let id = job_id();
     let job = ImportJob {
-        job_id: id.clone(), source: source.into(), state: "running".into(),
+        job_id: id.clone(), user_id, source: source.into(), state: "running".into(),
         fetched: 0, imported: 0, total: None, status: "started".into(),
         date: chrono_now(),
     };
     if let Ok(mut m) = reg.lock() { m.insert(id.clone(), job); }
     id
+}
+
+/// After a job finishes, persist its final state to the import history table so
+/// history survives restarts (the live registry stays in-memory for progress).
+async fn persist_job(reg: &ImportRegistry, id: &str, db: &Database) {
+    let job = reg.lock().ok().and_then(|m| m.get(id).cloned());
+    if let Some(j) = job {
+        let _ = db.record_import(j.user_id, &j.source, &j.state,
+            j.fetched as i64, j.imported as i64, &j.status).await;
+    }
 }
 
 fn chrono_now() -> i64 {
@@ -100,13 +112,14 @@ async fn import_listenbrainz(
     user: AuthUser,
     Json(body): Json<ServiceImport>,
 ) -> impl IntoResponse {
-    let id = start(&state.imports, "listenbrainz");
+    let id = start(&state.imports, "listenbrainz", user.user_id);
     let (reg, db, uid) = (state.imports.clone(), state.db.clone(), user.user_id);
     let ret = id.clone();
     tokio::spawn(async move {
         if let Err(e) = run_listenbrainz(&reg, &id, &db, uid, &body.username, body.token.as_deref()).await {
             update(&reg, &id, |j| { j.state = "error".into(); j.status = e; });
         }
+        persist_job(&reg, &id, &db).await;
     });
     (StatusCode::ACCEPTED, Json(serde_json::json!({ "job_id": ret }))).into_response()
 }
@@ -121,13 +134,14 @@ async fn import_lastfm(
             ErrorResponse { code: 400, error: "Last.fm import requires LASTFM_API_KEY to be configured".into() }
         ))).into_response();
     }
-    let id = start(&state.imports, "lastfm");
+    let id = start(&state.imports, "lastfm", user.user_id);
     let (reg, db, uid, key) = (state.imports.clone(), state.db.clone(), user.user_id, state.lastfm_api_key.clone());
     let ret = id.clone();
     tokio::spawn(async move {
         if let Err(e) = run_lastfm(&reg, &id, &db, uid, &body.username, &key).await {
             update(&reg, &id, |j| { j.state = "error".into(); j.status = e; });
         }
+        persist_job(&reg, &id, &db).await;
     });
     (StatusCode::ACCEPTED, Json(serde_json::json!({ "job_id": ret }))).into_response()
 }
@@ -149,23 +163,26 @@ async fn import_file(
         ))).into_response();
     };
 
-    let id = start(&state.imports, "file");
+    let id = start(&state.imports, "file", user.user_id);
     let (reg, db, uid) = (state.imports.clone(), state.db.clone(), user.user_id);
     let ret = id.clone();
     tokio::spawn(async move {
         if let Err(e) = run_file(&reg, &id, &db, uid, &bytes, &name).await {
             update(&reg, &id, |j| { j.state = "error".into(); j.status = e; });
         }
+        persist_job(&reg, &id, &db).await;
     });
     (StatusCode::ACCEPTED, Json(serde_json::json!({ "job_id": ret }))).into_response()
 }
 
 async fn job_status(
     State(state): State<Arc<AppState>>,
-    _user: AuthUser,
+    user: AuthUser,
     Path(job): Path<String>,
 ) -> impl IntoResponse {
-    let found = state.imports.lock().ok().and_then(|m| m.get(&job).cloned());
+    let found = state.imports.lock().ok()
+        .and_then(|m| m.get(&job).cloned())
+        .filter(|j| j.user_id == user.user_id);
     match found {
         Some(j) => (StatusCode::OK, Json(serde_json::json!(j))).into_response(),
         None => (StatusCode::NOT_FOUND, Json(serde_json::json!(
@@ -176,14 +193,19 @@ async fn job_status(
 
 async fn import_history(
     State(state): State<Arc<AppState>>,
-    _user: AuthUser,
+    user: AuthUser,
 ) -> impl IntoResponse {
-    let mut jobs: Vec<ImportJob> = state.imports.lock().map(|m| m.values().cloned().collect()).unwrap_or_default();
-    jobs.sort_by_key(|j| std::cmp::Reverse(j.date));
-    let imports: Vec<serde_json::Value> = jobs.iter().map(|j| serde_json::json!({
-        "source": j.source, "date": j.date, "count": j.imported, "status": j.state,
-    })).collect();
-    (StatusCode::OK, Json(serde_json::json!({ "imports": imports }))).into_response()
+    match state.db.list_imports(user.user_id).await {
+        Ok(rows) => {
+            let imports: Vec<serde_json::Value> = rows.iter().map(|r| serde_json::json!({
+                "source": r.source, "date": r.created_at, "count": r.imported, "status": r.state,
+            })).collect();
+            (StatusCode::OK, Json(serde_json::json!({ "imports": imports }))).into_response()
+        }
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!(
+            ErrorResponse { code: 500, error: e.to_string() }
+        ))).into_response(),
+    }
 }
 
 // ════════════════════════════════════════════════════════════

@@ -75,9 +75,16 @@ impl ScrobbleEngine {
                                 for plex_track in session_result.ready_to_scrobble {
                                     let mut play = plex_track.to_play(&format!("scrobble-{}", current_time));
 
+                                    // Map the Plex account to a Tapedeck user by
+                                    // username; fall back to the default user.
+                                    let user_id = match &plex_track.plex_user {
+                                        Some(name) => db.get_user_id_by_username(name).await.ok().flatten().unwrap_or(default_user_id),
+                                        None => default_user_id,
+                                    };
+
                                     // ── FIX: Check dedup BEFORE enrichment to avoid wasting MB API calls ──
-                                    let already_exists = db.exists(default_user_id, &play.source_id, &play.source_name).await.unwrap_or(false)
-                                        || db.fuzzy_exists(default_user_id, &play.title, &play.artist, play.timestamp as i64).await.unwrap_or(false);
+                                    let already_exists = db.exists(user_id, &play.source_id, &play.source_name).await.unwrap_or(false)
+                                        || db.fuzzy_exists(user_id, &play.title, &play.artist, play.timestamp as i64).await.unwrap_or(false);
 
                                     if already_exists {
                                         debug!("Skipping already-scrobbled: {} - {}", play.artist, play.title);
@@ -95,7 +102,7 @@ impl ScrobbleEngine {
                                         .unwrap_or_else(|| "n/a".into());
 
                                     match db.save_scrobble(
-                                        default_user_id, &play, quality_ref,
+                                        user_id, &play, quality_ref,
                                         None, None, None, Some("Plex"),
                                     ).await {
                                         Ok(true) => info!("📥 Queued: {} - {} [quality: {}]",

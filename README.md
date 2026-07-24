@@ -479,7 +479,6 @@ web/                         SvelteKit SPA (built into static/, embedded)
 - [ ] **Phase 5** — AI-powered features (recommendations, profile compression, smart corrections)
 - [ ] **Phase 6** — Discord rich presence, outbound webhooks
 - [ ] MusicBrainz-driven genre/language/region breakdowns in Analytics
-- [ ] Persist import history (currently in-memory, resets on restart)
 - [ ] Docker container
 - [ ] Jellyfin + Navidrome source support
 - [ ] Plex audio quality extraction from session metadata

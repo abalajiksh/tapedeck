@@ -57,6 +57,18 @@ pub struct BindingRow {
     pub hits: i64,
 }
 
+#[derive(Debug, FromRow, serde::Serialize)]
+pub struct ImportHistoryRow {
+    pub id: i64,
+    pub user_id: i64,
+    pub source: String,
+    pub state: String,
+    pub fetched: i64,
+    pub imported: i64,
+    pub status: String,
+    pub created_at: i64,
+}
+
 pub struct Database {
     pool: Pool<Sqlite>,
 }
@@ -204,6 +216,20 @@ impl Database {
             )"
         ).execute(&self.pool).await?;
 
+        // ── Import history (one row per finished import job) ──
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS import_jobs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL REFERENCES users(id),
+                source TEXT NOT NULL,
+                state TEXT NOT NULL,
+                fetched INTEGER NOT NULL,
+                imported INTEGER NOT NULL,
+                status TEXT NOT NULL,
+                created_at INTEGER NOT NULL
+            )"
+        ).execute(&self.pool).await?;
+
         Ok(())
     }
 
@@ -309,6 +335,14 @@ impl Database {
             }
         }
         Ok(None)
+    }
+
+    /// Look up a user id by username (case-insensitive). Used to map a polled
+    /// Plex account to the matching Tapedeck user.
+    pub async fn get_user_id_by_username(&self, username: &str) -> Result<Option<i64>, sqlx::Error> {
+        let row: Option<(i64,)> = sqlx::query_as("SELECT id FROM users WHERE LOWER(username) = LOWER(?)")
+            .bind(username).fetch_optional(&self.pool).await?;
+        Ok(row.map(|(id,)| id))
     }
 
     /// Update the password for user_id=1 during setup.
@@ -857,6 +891,25 @@ impl Database {
         let res = sqlx::query("DELETE FROM chain_bindings WHERE id = ? AND user_id = ?")
             .bind(id).bind(user_id).execute(&self.pool).await?;
         Ok(res.rows_affected() > 0)
+    }
+
+    // ════════════════════════════════════════════════════════════
+    //  Import history (persisted; the live job registry is in-memory)
+    // ════════════════════════════════════════════════════════════
+
+    pub async fn record_import(&self, user_id: i64, source: &str, state: &str,
+        fetched: i64, imported: i64, status: &str) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "INSERT INTO import_jobs (user_id, source, state, fetched, imported, status, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?)"
+        ).bind(user_id).bind(source).bind(state).bind(fetched).bind(imported).bind(status)
+         .bind(Self::now_secs()).execute(&self.pool).await?;
+        Ok(())
+    }
+
+    pub async fn list_imports(&self, user_id: i64) -> Result<Vec<ImportHistoryRow>, sqlx::Error> {
+        sqlx::query_as("SELECT * FROM import_jobs WHERE user_id = ? ORDER BY created_at DESC LIMIT 50")
+            .bind(user_id).fetch_all(&self.pool).await
     }
 
     /// Bulk-reassign the chain for a set of listens (History bulk edit).

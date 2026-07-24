@@ -70,6 +70,9 @@ pub struct PlexTrack {
     pub viewed_at: Option<u64>,
     /// Audio quality extracted from Plex Media/Stream metadata
     pub audio_quality: Option<AudioQuality>,
+    /// Plex account name (from the session's `User` element), used to map the
+    /// listen to the matching Tapedeck user. None for history-derived tracks.
+    pub plex_user: Option<String>,
 }
 
 impl PlexTrack {
@@ -89,6 +92,7 @@ impl PlexTrack {
             session_key: s.session_key,
             viewed_at: None,
             audio_quality,
+            plex_user: s.user.as_ref().and_then(|u| u.title.clone()),
         })
     }
 
@@ -106,6 +110,7 @@ impl PlexTrack {
             session_key: None,
             viewed_at: h.viewed_at,
             audio_quality: None,
+            plex_user: None,
         })
     }
 
