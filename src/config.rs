@@ -20,6 +20,7 @@ pub struct Config {
 pub struct ServerConfig {
     pub port: u16,
     pub host: String,
+    pub trust_proxy: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -101,9 +102,10 @@ struct TomlConfig {
 struct TomlServer {
     port: u16,
     host: String,
+    trust_proxy: bool,
 }
 impl Default for TomlServer {
-    fn default() -> Self { Self { port: 8080, host: "0.0.0.0".into() } }
+    fn default() -> Self { Self { port: 8080, host: "0.0.0.0".into(), trust_proxy: false } }
 }
 
 #[derive(Deserialize)]
@@ -259,6 +261,7 @@ impl Config {
             server: ServerConfig {
                 port: env_or_parse("PORT", env_or_parse("ADMIN_PORT", t.server.port)),
                 host: env_or("HOST", t.server.host),
+                trust_proxy: env_or_bool("TRUST_PROXY", t.server.trust_proxy),
             },
             database: DatabaseConfig {
                 sqlite_path: env_or("SQLITE_DB_PATH", t.database.sqlite_path),

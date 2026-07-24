@@ -2,59 +2,15 @@ use axum::{
     extract::State,
     http::StatusCode,
     response::{IntoResponse, Json},
-    routing::{get, post},
+    routing::get,
     Router,
 };
-use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use crate::db::Database;
-use crate::logging::LogLevelHandle;
 
 #[derive(Clone)]
 pub struct AdminState {
-    pub log_handle: LogLevelHandle,
     pub db: Arc<Database>,
-}
-
-#[derive(Serialize)]
-struct LogLevelResponse {
-    current_level: String,
-    message: String,
-}
-
-#[derive(Deserialize)]
-struct SetLogLevelRequest {
-    level: String,
-}
-
-async fn get_log_level(State(state): State<Arc<AdminState>>) -> impl IntoResponse {
-    let level = state.log_handle.get_level();
-    Json(LogLevelResponse {
-        current_level: level.clone(),
-        message: format!("Current log level: {}", level),
-    })
-}
-
-async fn set_log_level(
-    State(state): State<Arc<AdminState>>,
-    Json(payload): Json<SetLogLevelRequest>,
-) -> impl IntoResponse {
-    match state.log_handle.set_level(&payload.level) {
-        Ok(_) => (
-            StatusCode::OK,
-            Json(LogLevelResponse {
-                current_level: payload.level.to_uppercase(),
-                message: format!("Log level updated to {}", payload.level.to_uppercase()),
-            }),
-        ),
-        Err(e) => (
-            StatusCode::BAD_REQUEST,
-            Json(LogLevelResponse {
-                current_level: "ERROR".to_string(),
-                message: e,
-            }),
-        ),
-    }
 }
 
 async fn health_check(State(state): State<Arc<AdminState>>) -> impl IntoResponse {
@@ -68,12 +24,11 @@ async fn health_check(State(state): State<Arc<AdminState>>) -> impl IntoResponse
     })))
 }
 
-pub fn create_admin_router(log_handle: LogLevelHandle, db: Arc<Database>) -> Router {
-    let state = Arc::new(AdminState { log_handle, db });
-
+/// Only `/health` lives here (intentionally unauthenticated). `/log-level` moved
+/// to the authenticated, admin-gated router.
+pub fn create_admin_router(db: Arc<Database>) -> Router {
+    let state = Arc::new(AdminState { db });
     Router::new()
         .route("/health", get(health_check))
-        .route("/log-level", get(get_log_level))
-        .route("/log-level", post(set_log_level))
         .with_state(state)
 }

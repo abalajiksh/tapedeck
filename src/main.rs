@@ -150,6 +150,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         listenbrainz_base_url: config.listenbrainz.base_url.clone(),
         login_limiter: Arc::new(server::ratelimit::RateLimiter::new(
             8, std::time::Duration::from_secs(300))),
+        analytics_row_cap: analytics_row_cap(),
+        trust_proxy: config.server.trust_proxy,
     });
 
     let app = server::build_app(app_state);
@@ -195,6 +197,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// Resolve when the process receives Ctrl-C or (on Unix) SIGTERM, so systemd /
 /// Docker `stop` lets in-flight requests finish before we exit. Pending
 /// scrobbles are durable in SQLite, so an interrupted poll tick loses nothing.
+/// Cap on rows an in-memory analytics/personality pass will load, scaled to the
+/// machine's RAM so a large history can't OOM a request on a small box (e.g. a
+/// Pi Zero). Rows are ~200 bytes; we budget ~1/16 of total RAM per pass.
+fn analytics_row_cap() -> i64 {
+    let total_mb = std::fs::read_to_string("/proc/meminfo").ok()
+        .and_then(|s| s.lines().find(|l| l.starts_with("MemTotal:"))
+            .and_then(|l| l.split_whitespace().nth(1))
+            .and_then(|kb| kb.parse::<i64>().ok()))
+        .map(|kb| kb / 1024)
+        .unwrap_or(2048); // assume 2 GB if unreadable
+    (total_mb / 16 * 5_000).clamp(100_000, 5_000_000)
+}
+
 async fn shutdown_signal() {
     use tokio::signal;
     let ctrl_c = async { let _ = signal::ctrl_c().await; };

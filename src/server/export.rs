@@ -1,4 +1,5 @@
 use axum::{
+    body::Body,
     extract::{Query, State},
     http::{header, StatusCode},
     response::{IntoResponse, Json},
@@ -17,45 +18,70 @@ pub struct ExportQuery {
     pub format: Option<String>,
 }
 
-/// GET /api/v1/export?format=json|csv — full listen dump for the session user.
+/// Streaming phase for the paged export (keeps memory O(page), not O(history)).
+enum Phase { Open, Rows(i64), Close, End }
+
+/// GET /api/v1/export?format=json|csv — full listen dump, streamed in pages so a
+/// huge history can't blow up memory. JSON is a plain array (import-compatible).
 async fn export(
     State(state): State<Arc<AppState>>,
     user: AuthUser,
     Query(q): Query<ExportQuery>,
 ) -> impl IntoResponse {
-    let rows = match state.db.get_all_scrobbles(user.user_id).await {
-        Ok(r) => r,
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!(
-            ErrorResponse { code: 500, error: e.to_string() }
-        ))).into_response(),
-    };
+    let csv_fmt = q.format.as_deref() == Some("csv");
+    let db = state.db.clone();
+    let uid = user.user_id;
+    const PAGE: i64 = 5000;
 
-    if q.format.as_deref() == Some("csv") {
-        let mut out = String::from("title,artist,album,format,chain,mbid,time\n");
-        for r in &rows {
-            out.push_str(&format!("{},{},{},{},{},{},{}\n",
-                csv(&r.title), csv(&r.artist), csv(r.album.as_deref().unwrap_or("")),
-                csv(r.format_type.as_deref().unwrap_or("")),
-                r.chain_id.map(|c| c.to_string()).unwrap_or_default(),
-                csv(r.mbid_recording.as_deref().unwrap_or("")),
-                r.timestamp,
-            ));
+    let stream = futures_util::stream::unfold((Phase::Open, true), move |(phase, first)| {
+        let db = db.clone();
+        async move {
+            match phase {
+                Phase::Open => {
+                    let chunk = if csv_fmt { "title,artist,album,format,chain,mbid,time\n".to_string() } else { "[".to_string() };
+                    Some((Ok::<String, std::io::Error>(chunk), (Phase::Rows(0), first)))
+                }
+                Phase::Rows(off) => {
+                    let page = db.get_recent_scrobbles(uid, PAGE, off, None, None, None, None).await.unwrap_or_default();
+                    if page.is_empty() {
+                        return Some((Ok(String::new()), (Phase::Close, first)));
+                    }
+                    let mut buf = String::new();
+                    let mut first = first;
+                    for r in &page {
+                        if csv_fmt {
+                            buf.push_str(&format!("{},{},{},{},{},{},{}\n",
+                                csv(&r.title), csv(&r.artist), csv(r.album.as_deref().unwrap_or("")),
+                                csv(r.format_type.as_deref().unwrap_or("")),
+                                r.chain_id.map(|c| c.to_string()).unwrap_or_default(),
+                                csv(r.mbid_recording.as_deref().unwrap_or("")),
+                                r.timestamp));
+                        } else {
+                            if first { first = false; } else { buf.push(','); }
+                            buf.push_str(&serde_json::to_string(r).unwrap_or_default());
+                        }
+                    }
+                    let n = page.len() as i64;
+                    Some((Ok(buf), (Phase::Rows(off + n), first)))
+                }
+                Phase::Close => {
+                    let chunk = if csv_fmt { String::new() } else { "]".to_string() };
+                    Some((Ok(chunk), (Phase::End, first)))
+                }
+                Phase::End => None,
+            }
         }
-        return (
-            StatusCode::OK,
-            [(header::CONTENT_TYPE, "text/csv"),
-             (header::CONTENT_DISPOSITION, "attachment; filename=\"tapedeck-export.csv\"")],
-            out,
-        ).into_response();
-    }
+    });
 
-    // default: JSON
-    let body = serde_json::json!({ "version": env!("CARGO_PKG_VERSION"), "count": rows.len(), "scrobbles": rows });
+    let (ct, disp) = if csv_fmt {
+        ("text/csv", "attachment; filename=\"tapedeck-export.csv\"")
+    } else {
+        ("application/json", "attachment; filename=\"tapedeck-export.json\"")
+    };
     (
         StatusCode::OK,
-        [(header::CONTENT_TYPE, "application/json"),
-         (header::CONTENT_DISPOSITION, "attachment; filename=\"tapedeck-export.json\"")],
-        serde_json::to_string(&body).unwrap_or_default(),
+        [(header::CONTENT_TYPE, ct), (header::CONTENT_DISPOSITION, disp)],
+        Body::from_stream(stream),
     ).into_response()
 }
 

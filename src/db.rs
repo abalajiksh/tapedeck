@@ -645,12 +645,14 @@ impl Database {
     }
 
     /// Minimal columns for analytics: (timestamp, artist, title, album, track_number).
-    pub async fn get_listen_rows(&self, user_id: i64, after: Option<i64>)
+    /// Capped to the most-recent `limit` rows to bound memory on large histories.
+    pub async fn get_listen_rows(&self, user_id: i64, after: Option<i64>, limit: i64)
         -> Result<Vec<(i64, String, String, Option<String>, Option<i32>)>, sqlx::Error> {
         sqlx::query_as(
             "SELECT timestamp, artist, title, album, track_number FROM scrobbles
-             WHERE user_id = ? AND (? IS NULL OR timestamp >= ?)"
-        ).bind(user_id).bind(after).bind(after).fetch_all(&self.pool).await
+             WHERE user_id = ? AND (? IS NULL OR timestamp >= ?)
+             ORDER BY timestamp DESC LIMIT ?"
+        ).bind(user_id).bind(after).bind(after).bind(limit).fetch_all(&self.pool).await
     }
 
     // ── Language enrichment ──
@@ -763,6 +765,12 @@ impl Database {
         let res = sqlx::query("DELETE FROM scrobbles WHERE user_id = ?")
             .bind(user_id).execute(&self.pool).await?;
         Ok(res.rows_affected())
+    }
+
+    /// A single listen by id, scoped to the user.
+    pub async fn get_scrobble(&self, user_id: i64, id: i64) -> Result<Option<ScrobbleRecord>, sqlx::Error> {
+        sqlx::query_as::<_, ScrobbleRecord>("SELECT * FROM scrobbles WHERE id = ? AND user_id = ?")
+            .bind(id).bind(user_id).fetch_optional(&self.pool).await
     }
 
     /// Every listen for a user, newest first — for full-backup export.
@@ -1281,7 +1289,8 @@ impl Database {
     pub async fn delete_user(&self, id: i64) -> Result<bool, sqlx::Error> {
         let mut tx = self.pool.begin().await?;
         for table in ["scrobbles", "tokens", "signal_chains", "devices",
-                      "equipment", "sessions", "chain_bindings", "import_jobs", "web_sessions"] {
+                      "equipment", "sessions", "chain_bindings", "import_jobs",
+                      "web_sessions", "user_connections"] {
             sqlx::query(&format!("DELETE FROM {} WHERE user_id = ?", table))
                 .bind(id).execute(&mut *tx).await?;
         }
@@ -1513,11 +1522,15 @@ mod tests {
         let uid = db.create_user("dave", None, "x", "user").await.unwrap();
         db.save_scrobble(uid, &play("s", "a", 5), None, None, None, None, None).await.unwrap();
         db.create_token(uid, "t", "submit").await.unwrap();
+        // A connection has an FK to users — deletion must clear it, or the whole
+        // cascade rolls back (the bug this guards against).
+        db.set_connection(uid, "listenbrainz", r#"{"token":"secret"}"#, Some("dave")).await.unwrap();
 
         assert!(db.delete_user(uid).await.unwrap());
         assert!(db.get_all_scrobbles(uid).await.unwrap().is_empty());
         assert!(db.list_users().await.unwrap().iter().all(|u| u.id != uid));
         assert!(db.list_tokens(uid).await.unwrap().is_empty());
+        assert!(db.list_connections(uid).await.unwrap().is_empty());
     }
 
     #[tokio::test]

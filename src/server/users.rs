@@ -157,15 +157,21 @@ struct LoginRequest {
     password: String,
 }
 
-/// Client key for rate limiting: the first `X-Forwarded-For` hop (behind a
-/// reverse proxy) or the direct socket IP.
-fn client_key(headers: &HeaderMap, addr: SocketAddr) -> String {
-    headers.get("x-forwarded-for")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.split(',').next())
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| addr.ip().to_string())
+/// Client key for rate limiting. `X-Forwarded-For` is only trusted when the
+/// instance is configured to sit behind a proxy — otherwise a direct client
+/// could spoof the header and evade the throttle, so we use the socket IP.
+fn client_key(headers: &HeaderMap, addr: SocketAddr, trust_proxy: bool) -> String {
+    if trust_proxy {
+        if let Some(ip) = headers.get("x-forwarded-for")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.split(',').next())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+        {
+            return ip;
+        }
+    }
+    addr.ip().to_string()
 }
 
 async fn login(
@@ -174,7 +180,7 @@ async fn login(
     headers: HeaderMap,
     Json(body): Json<LoginRequest>,
 ) -> impl IntoResponse {
-    let key = client_key(&headers, addr);
+    let key = client_key(&headers, addr, state.trust_proxy);
     if let Some(retry_after) = state.login_limiter.blocked_for(&key) {
         return (
             StatusCode::TOO_MANY_REQUESTS,
@@ -527,6 +533,30 @@ async fn revoke_token(
 }
 
 // ═══════════════════════════════════════════════════════════
+//  Runtime log level (admin-only)
+// ═══════════════════════════════════════════════════════════
+
+#[derive(Deserialize)]
+struct LogLevelRequest { level: String }
+
+async fn get_log_level(State(state): State<Arc<AppState>>, user: AuthUser) -> impl IntoResponse {
+    if !user.is_admin { return forbidden("view the log level"); }
+    (StatusCode::OK, Json(serde_json::json!({ "current_level": state.log_handle.get_level() }))).into_response()
+}
+
+async fn set_log_level(
+    State(state): State<Arc<AppState>>,
+    user: AuthUser,
+    Json(body): Json<LogLevelRequest>,
+) -> impl IntoResponse {
+    if !user.is_admin { return forbidden("set the log level"); }
+    match state.log_handle.set_level(&body.level) {
+        Ok(_) => (StatusCode::OK, Json(serde_json::json!({ "current_level": body.level.to_uppercase() }))).into_response(),
+        Err(e) => (StatusCode::BAD_REQUEST, Json(serde_json::json!(ErrorResponse { code: 400, error: e }))).into_response(),
+    }
+}
+
+// ═══════════════════════════════════════════════════════════
 //  Routers
 // ═══════════════════════════════════════════════════════════
 
@@ -548,4 +578,5 @@ pub fn create_user_management_router() -> Router<Arc<AppState>> {
         .route("/admin/users/:id", patch(update_user).delete(delete_user))
         .route("/admin/tokens", post(create_token).get(list_tokens))
         .route("/admin/tokens/:id", delete(revoke_token))
+        .route("/log-level", get(get_log_level).post(set_log_level))
 }

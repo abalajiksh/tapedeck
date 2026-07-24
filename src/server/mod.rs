@@ -36,11 +36,15 @@ pub struct AppState {
     pub listenbrainz_base_url: String,
     /// Brute-force throttle for the login endpoint, keyed by client IP.
     pub login_limiter: Arc<ratelimit::RateLimiter>,
+    /// Max rows an in-memory analytics pass will load (scaled to host RAM).
+    pub analytics_row_cap: i64,
+    /// Only trust `X-Forwarded-For` for the client IP when behind a known proxy.
+    pub trust_proxy: bool,
 }
 
 /// Build the full Axum application.
 pub fn build_app(state: Arc<AppState>) -> Router {
-    let admin = admin::create_admin_router(state.log_handle.clone(), state.db.clone());
+    let admin = admin::create_admin_router(state.db.clone());
     let auth_router = users::create_auth_router();
     let user_mgmt = users::create_user_management_router();
     let gear = chains::create_gear_router();

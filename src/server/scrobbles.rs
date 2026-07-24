@@ -88,13 +88,10 @@ async fn update_scrobble(
         body.listening_context.as_deref(), body.format_type.as_deref(), body.codec.as_deref(),
     ).await;
     match updated {
-        Ok(true) => match state.db.get_all_scrobbles(user.user_id).await {
+        Ok(true) => match state.db.get_scrobble(user.user_id, id).await {
             // return the fresh row so the UI can re-render without a refetch
-            Ok(rows) => match rows.into_iter().find(|r| r.id == id) {
-                Some(r) => (StatusCode::OK, Json(serde_json::json!(r))).into_response(),
-                None => (StatusCode::OK, Json(serde_json::json!({ "id": id, "status": "updated" }))).into_response(),
-            },
-            Err(_) => (StatusCode::OK, Json(serde_json::json!({ "id": id, "status": "updated" }))).into_response(),
+            Ok(Some(r)) => (StatusCode::OK, Json(serde_json::json!(r))).into_response(),
+            _ => (StatusCode::OK, Json(serde_json::json!({ "id": id, "status": "updated" }))).into_response(),
         },
         Ok(false) => not_found(),
         Err(e) => server_error(e.to_string()),
@@ -178,7 +175,7 @@ async fn ranged_stats(
         Err(e) => return server_error(e.to_string()),
     };
     // Recompute the heatmap in the user's local timezone.
-    if let Ok(rows) = state.db.get_listen_rows(user.user_id, after).await {
+    if let Ok(rows) = state.db.get_listen_rows(user.user_id, after, state.analytics_row_cap).await {
         let tz = user_tz(&state, user.user_id).await;
         stats["heatmap"] = serde_json::json!(crate::analytics::heatmap_local(&to_listen_rows(rows), tz));
     }
@@ -191,7 +188,7 @@ async fn personality(
     user: AuthUser,
     Query(q): Query<StatsQuery>,
 ) -> impl IntoResponse {
-    match state.db.get_listen_rows(user.user_id, range_after(q.range.as_deref())).await {
+    match state.db.get_listen_rows(user.user_id, range_after(q.range.as_deref()), state.analytics_row_cap).await {
         Ok(rows) => {
             let tz = user_tz(&state, user.user_id).await;
             (StatusCode::OK, Json(crate::analytics::compute_personality(&to_listen_rows(rows), tz))).into_response()
