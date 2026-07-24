@@ -9,14 +9,14 @@ use tracing::{debug, error, info, warn};
 
 use crate::engine::enrichment::enrich_play;
 use crate::models::{AudioQuality, Play};
-use super::auth::AuthUser;
+use super::auth::IngestAuth;
 use super::models::*;
 use super::AppState;
 
 /// POST /1/submit-listens
 pub async fn submit_listens(
     State(state): State<Arc<AppState>>,
-    user: AuthUser,
+    IngestAuth(user): IngestAuth,
     Json(body): Json<SubmitListensRequest>,
 ) -> impl IntoResponse {
     let listen_count = body.payload.len();

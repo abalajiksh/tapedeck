@@ -15,7 +15,6 @@
 	let listenCount = 0;
 
 	let newTokenName = '';
-	let newTokenScopes = 'submit';
 	let createdToken = '';
 	let tokenCopied = false;
 	let creating = false;
@@ -138,7 +137,7 @@
 		creating = true;
 		createdToken = '';
 		try {
-			const result = await api.createToken(newTokenName.trim(), newTokenScopes);
+			const result = await api.createToken(newTokenName.trim());
 			createdToken = result.token;
 			newTokenName = '';
 			tokens = (await api.getTokens()).tokens;
@@ -335,13 +334,9 @@
 
 		<div style="display:flex;gap:8px;flex-wrap:wrap;">
 			<input class="input" style="flex:1;min-width:180px;" bind:value={newTokenName} placeholder="Token name (e.g. walkman, phone)">
-			<select class="input" style="width:auto;" bind:value={newTokenScopes}>
-				<option value="submit">submit</option>
-				<option value="submit,read">submit + read</option>
-				<option value="submit,read,admin">all</option>
-			</select>
 			<button class="btn btn-primary" on:click={createToken} disabled={creating || !newTokenName.trim()}>{creating ? '…' : 'Create'}</button>
 		</div>
+		<p style="font-size:12px;color:var(--td-muted-2);margin:10px 0 0;">Tokens can only submit listens. Reading, editing, and admin actions require signing in here.</p>
 	{/if}
 </div>
 

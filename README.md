@@ -379,8 +379,13 @@ curl -X POST http://localhost:8080/1/submit-listens \
 
 ## API Reference
 
-Auth accepts either an `Authorization: Token td_…` header (external clients) or
-the `td_session` cookie set by the web UI login.
+**Auth model.** API tokens (`Authorization: Token td_…`) can do exactly one
+thing: **submit listens** to `/1/submit-listens`. Everything else — reading,
+editing, deleting, and all admin actions — requires a logged-in **session**
+(the `td_session` cookie from the web UI). This is enforced at the extractor
+level, so a leaked device token can only *add* listens, never read or destroy
+your data. The tables below mark `Token` only where tokens are accepted; `Auth`
+means session-only.
 
 ### Ingest
 
@@ -398,9 +403,9 @@ the `td_session` cookie set by the web UI login.
 | POST | `/admin/users` | Admin | Create user (returns token) |
 | PATCH | `/admin/users/{id}` | Admin | Change role / reset password |
 | DELETE | `/admin/users/{id}` | Admin | Delete user + all their data |
-| GET | `/admin/tokens` | Token | List your tokens |
-| POST | `/admin/tokens` | Token | Create new token |
-| DELETE | `/admin/tokens/{id}` | Token | Revoke a token |
+| GET | `/admin/tokens` | Session | List your tokens |
+| POST | `/admin/tokens` | Session | Create new token |
+| DELETE | `/admin/tokens/{id}` | Session | Revoke a token |
 
 ### Auth
 
@@ -448,19 +453,19 @@ the `td_session` cookie set by the web UI login.
 
 | Method | Path | Auth | Description |
 |--------|------|------|-------------|
-| GET | `/api/v1/chains` | Token | List signal chains |
-| POST | `/api/v1/chains` | Token | Create signal chain |
-| GET | `/api/v1/chains/{id}` | Token | Get chain details |
-| PATCH | `/api/v1/chains/{id}` | Token | Update a chain |
-| DELETE | `/api/v1/chains/{id}` | Token | Delete a chain (unlinks listens, keeps them) |
-| GET | `/api/v1/devices` | Token | List auto-discovered devices |
-| GET | `/api/v1/equipment` | Token | List equipment with usage hours |
-| POST | `/api/v1/equipment` | Token | Register equipment |
-| PATCH | `/api/v1/equipment/{id}` | Token | Update equipment |
-| DELETE | `/api/v1/equipment/{id}` | Token | Delete equipment |
-| GET | `/api/v1/bindings` | Token | List output→chain bindings (mapped + auto-learned) |
-| PUT | `/api/v1/bindings` | Token | Set/clear the chain for an output (`{identifier, chain_id}`) |
-| DELETE | `/api/v1/bindings/{id}` | Token | Forget an output |
+| GET | `/api/v1/chains` | Session | List signal chains |
+| POST | `/api/v1/chains` | Session | Create signal chain |
+| GET | `/api/v1/chains/{id}` | Session | Get chain details |
+| PATCH | `/api/v1/chains/{id}` | Session | Update a chain |
+| DELETE | `/api/v1/chains/{id}` | Session | Delete a chain (unlinks listens, keeps them) |
+| GET | `/api/v1/devices` | Session | List auto-discovered devices |
+| GET | `/api/v1/equipment` | Session | List equipment with usage hours |
+| POST | `/api/v1/equipment` | Session | Register equipment |
+| PATCH | `/api/v1/equipment/{id}` | Session | Update equipment |
+| DELETE | `/api/v1/equipment/{id}` | Session | Delete equipment |
+| GET | `/api/v1/bindings` | Session | List output→chain bindings (mapped + auto-learned) |
+| PUT | `/api/v1/bindings` | Session | Set/clear the chain for an output (`{identifier, chain_id}`) |
+| DELETE | `/api/v1/bindings/{id}` | Session | Forget an output |
 | POST | `/api/v1/scrobbles/bulk-chain` | Auth | Reassign many listens' chain (`{ids, signal_chain_id}`) |
 
 ### How a listen gets its chain
