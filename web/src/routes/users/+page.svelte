@@ -60,6 +60,13 @@
 		}
 	}
 
+	async function toggleDisabled(u: User) {
+		try {
+			await api.updateUser(u.id, { disabled: !u.disabled });
+			users = users.map((x) => (x.id === u.id ? { ...x, disabled: !u.disabled } : x));
+		} catch (e) { alert(String(e).replace(/^API \d+: /, '')); }
+	}
+
 	async function resetPassword() {
 		if (!resetFor || rpPass.length < 8) return;
 		resetting = true;
@@ -107,11 +114,12 @@
 			<thead><tr><th>User</th><th>Role</th><th>Created</th><th style="text-align:right;">Actions</th></tr></thead>
 			<tbody>
 				{#each users as u (u.id)}
-					<tr>
+					<tr style={u.disabled ? 'opacity:.55;' : ''}>
 						<td>
 							<span style="font-weight:600;">{u.username}</span>
 							{#if u.display_name}<span style="color:var(--td-muted);margin-left:6px;">({u.display_name})</span>{/if}
 							{#if u.id === meId}<span class="tag tag-neutral" style="margin-left:6px;">you</span>{/if}
+							{#if u.disabled}<span class="tag tag-outline" style="margin-left:6px;">disabled</span>{/if}
 						</td>
 						<td>
 							<select class="input" style="width:auto;min-width:100px;padding:4px 12px;min-height:32px;"
@@ -124,6 +132,7 @@
 						<td style="text-align:right;white-space:nowrap;">
 							<button class="btn btn-secondary" style="padding:5px 12px;font-size:12.5px;" on:click={() => { resetFor = u; rpPass = ''; }}>Reset password</button>
 							{#if u.id !== meId}
+								<button class="btn btn-secondary" style="padding:5px 12px;font-size:12.5px;margin-left:6px;" on:click={() => toggleDisabled(u)}>{u.disabled ? 'Enable' : 'Disable'}</button>
 								<button class="btn btn-secondary" style="padding:5px 12px;font-size:12.5px;color:#b2622d;margin-left:6px;" on:click={() => (confirmDelete = u)}>Delete</button>
 							{/if}
 						</td>

@@ -138,7 +138,8 @@ impl Database {
                 password_hash TEXT NOT NULL,
                 role TEXT NOT NULL DEFAULT 'user',
                 created_at INTEGER NOT NULL,
-                settings JSON DEFAULT '{}'
+                settings JSON DEFAULT '{}',
+                disabled INTEGER NOT NULL DEFAULT 0
             )"
         ).execute(&self.pool).await?;
 
@@ -315,6 +316,13 @@ impl Database {
                 .execute(&self.pool).await;
         }
 
+        // Migration 6: disabled flag on users
+        if !has_column(&self.pool, "users", "disabled").await {
+            info!("⚙️ Migrating: adding users.disabled...");
+            let _ = sqlx::query("ALTER TABLE users ADD COLUMN disabled INTEGER NOT NULL DEFAULT 0")
+                .execute(&self.pool).await;
+        }
+
         Ok(())
     }
 
@@ -351,7 +359,7 @@ impl Database {
     /// Verify username + password, return user info if valid.
     pub async fn authenticate(&self, username: &str, password: &str) -> Result<Option<AuthUser>, sqlx::Error> {
         let row: Option<(i64, String, String, String)> = sqlx::query_as(
-            "SELECT id, username, password_hash, role FROM users WHERE username = ?"
+            "SELECT id, username, password_hash, role FROM users WHERE username = ? AND disabled = 0"
         ).bind(username).fetch_optional(&self.pool).await?;
 
         if let Some((user_id, uname, hash, role)) = row {
@@ -430,7 +438,7 @@ impl Database {
         let row: Option<(i64, i64, String, String)> = sqlx::query_as(
             "SELECT ws.id, u.id, u.username, u.role FROM web_sessions ws
              JOIN users u ON ws.user_id = u.id
-             WHERE ws.session_hash = ? AND ws.expires_at > ?"
+             WHERE ws.session_hash = ? AND ws.expires_at > ? AND u.disabled = 0"
         )
         .bind(&session_hash).bind(now)
         .fetch_optional(&self.pool).await?;
@@ -1111,7 +1119,7 @@ impl Database {
         let now = Self::now_secs();
         let row: Option<(i64, String, String)> = sqlx::query_as(
             "SELECT u.id, u.username, u.role FROM tokens t JOIN users u ON t.user_id = u.id
-             WHERE t.token_hash = ? AND (t.expires_at IS NULL OR t.expires_at > ?)"
+             WHERE t.token_hash = ? AND (t.expires_at IS NULL OR t.expires_at > ?) AND u.disabled = 0"
         ).bind(&token_hash).bind(now).fetch_optional(&self.pool).await?;
 
         if let Some((user_id, username, role)) = row {
@@ -1133,14 +1141,17 @@ impl Database {
         Ok(result.last_insert_rowid())
     }
 
-    pub async fn get_user_role(&self, id: i64) -> Result<Option<String>, sqlx::Error> {
-        let row: Option<(String,)> = sqlx::query_as("SELECT role FROM users WHERE id = ?")
+    /// Returns (role, disabled) for a user, if they exist.
+    pub async fn get_user_role_disabled(&self, id: i64) -> Result<Option<(String, bool)>, sqlx::Error> {
+        let row: Option<(String, bool)> = sqlx::query_as("SELECT role, disabled FROM users WHERE id = ?")
             .bind(id).fetch_optional(&self.pool).await?;
-        Ok(row.map(|(r,)| r))
+        Ok(row)
     }
 
-    pub async fn count_admins(&self) -> Result<i64, sqlx::Error> {
-        let c: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM users WHERE role = 'admin'")
+    /// Count admins who can actually log in (enabled). Used to guard against
+    /// leaving the instance with no reachable admin.
+    pub async fn count_active_admins(&self) -> Result<i64, sqlx::Error> {
+        let c: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM users WHERE role = 'admin' AND disabled = 0")
             .fetch_one(&self.pool).await?;
         Ok(c.0)
     }
@@ -1148,6 +1159,16 @@ impl Database {
     pub async fn update_user_role(&self, id: i64, role: &str) -> Result<bool, sqlx::Error> {
         let res = sqlx::query("UPDATE users SET role = ? WHERE id = ?")
             .bind(role).bind(id).execute(&self.pool).await?;
+        Ok(res.rows_affected() > 0)
+    }
+
+    pub async fn set_user_disabled(&self, id: i64, disabled: bool) -> Result<bool, sqlx::Error> {
+        let res = sqlx::query("UPDATE users SET disabled = ? WHERE id = ?")
+            .bind(disabled).bind(id).execute(&self.pool).await?;
+        // Disabling a user invalidates their live web sessions immediately.
+        if disabled {
+            let _ = sqlx::query("DELETE FROM web_sessions WHERE user_id = ?").bind(id).execute(&self.pool).await;
+        }
         Ok(res.rows_affected() > 0)
     }
 
@@ -1197,7 +1218,7 @@ impl Database {
     }
 
     pub async fn list_users(&self) -> Result<Vec<UserRecord>, sqlx::Error> {
-        sqlx::query_as("SELECT id, username, display_name, role, created_at FROM users ORDER BY id ASC")
+        sqlx::query_as("SELECT id, username, display_name, role, created_at, disabled FROM users ORDER BY id ASC")
             .fetch_all(&self.pool).await
     }
 
@@ -1218,6 +1239,7 @@ pub struct UserRecord {
     pub display_name: Option<String>,
     pub role: String,
     pub created_at: i64,
+    pub disabled: bool,
 }
 
 #[derive(Debug, FromRow, serde::Serialize)]

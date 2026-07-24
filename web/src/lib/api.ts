@@ -146,6 +146,7 @@ export interface User {
 	display_name: string | null;
 	role: string;
 	created_at: number;
+	disabled: boolean;
 }
 
 export interface UserInfo {
@@ -341,7 +342,7 @@ class TapedeckAPI {
 	async createUser(username: string, display_name?: string, password?: string): Promise<{ user_id: number; username: string; token: string; message: string }> {
 		return this.post('/admin/users', { username, display_name, password });
 	}
-	async updateUser(id: number, changes: { role?: string; password?: string }): Promise<{ status: string }> {
+	async updateUser(id: number, changes: { role?: string; password?: string; disabled?: boolean }): Promise<{ status: string }> {
 		return this.patch(`/admin/users/${id}`, changes);
 	}
 	async deleteUser(id: number): Promise<void> {

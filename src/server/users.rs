@@ -310,6 +310,7 @@ async fn list_users(
 pub struct UpdateUserRequest {
     pub role: Option<String>,        // "admin" | "user"
     pub password: Option<String>,    // reset to this (min 8 chars)
+    pub disabled: Option<bool>,      // block/allow login without deleting data
 }
 
 async fn update_user(
@@ -322,23 +323,42 @@ async fn update_user(
         return forbidden("modify users");
     }
 
+    // Whether this action would strip the last admin who can still log in.
+    let (target_role, target_disabled) = state.db.get_user_role_disabled(id).await.ok().flatten()
+        .unwrap_or_else(|| ("user".into(), false));
+    let target_is_active_admin = target_role == "admin" && !target_disabled;
+    let is_last_admin = target_is_active_admin && state.db.count_active_admins().await.unwrap_or(0) <= 1;
+
     if let Some(ref role) = body.role {
         if role != "admin" && role != "user" {
             return (StatusCode::BAD_REQUEST, Json(serde_json::json!(
                 ErrorResponse { code: 400, error: "role must be 'admin' or 'user'".into() }
             ))).into_response();
         }
-        // Don't let the last admin be demoted (would lock everyone out of admin).
-        if role == "user" {
-            let target_is_admin = state.db.get_user_role(id).await.ok().flatten().as_deref() == Some("admin");
-            let admins = state.db.count_admins().await.unwrap_or(0);
-            if target_is_admin && admins <= 1 {
-                return (StatusCode::BAD_REQUEST, Json(serde_json::json!(
-                    ErrorResponse { code: 400, error: "Cannot demote the last admin".into() }
-                ))).into_response();
-            }
+        if role == "user" && is_last_admin {
+            return (StatusCode::BAD_REQUEST, Json(serde_json::json!(
+                ErrorResponse { code: 400, error: "Cannot demote the last admin".into() }
+            ))).into_response();
         }
         if let Err(e) = state.db.update_user_role(id, role).await {
+            return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!(
+                ErrorResponse { code: 500, error: e.to_string() }
+            ))).into_response();
+        }
+    }
+
+    if let Some(disabled) = body.disabled {
+        if disabled && id == user.user_id {
+            return (StatusCode::BAD_REQUEST, Json(serde_json::json!(
+                ErrorResponse { code: 400, error: "You cannot disable your own account".into() }
+            ))).into_response();
+        }
+        if disabled && is_last_admin {
+            return (StatusCode::BAD_REQUEST, Json(serde_json::json!(
+                ErrorResponse { code: 400, error: "Cannot disable the last admin".into() }
+            ))).into_response();
+        }
+        if let Err(e) = state.db.set_user_disabled(id, disabled).await {
             return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!(
                 ErrorResponse { code: 500, error: e.to_string() }
             ))).into_response();
@@ -381,9 +401,10 @@ async fn delete_user(
             ErrorResponse { code: 400, error: "You cannot delete your own account".into() }
         ))).into_response();
     }
-    // Guard against removing the last admin.
-    let target_is_admin = state.db.get_user_role(id).await.ok().flatten().as_deref() == Some("admin");
-    if target_is_admin && state.db.count_admins().await.unwrap_or(0) <= 1 {
+    // Guard against removing the last admin who can still log in.
+    let (role, disabled) = state.db.get_user_role_disabled(id).await.ok().flatten()
+        .unwrap_or_else(|| ("user".into(), false));
+    if role == "admin" && !disabled && state.db.count_active_admins().await.unwrap_or(0) <= 1 {
         return (StatusCode::BAD_REQUEST, Json(serde_json::json!(
             ErrorResponse { code: 400, error: "Cannot delete the last admin".into() }
         ))).into_response();
