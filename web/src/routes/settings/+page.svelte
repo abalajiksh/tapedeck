@@ -4,6 +4,7 @@
 	import type { TokenInfo } from '$lib/api';
 	import { formatDateTime } from '$lib/utils';
 	import { theme, setTheme, type ThemeMode } from '$lib/theme';
+	import type { Connection } from '$lib/api';
 
 	const uiVersion = __UI_VERSION__;
 	let backendVersion = '…';
@@ -26,6 +27,55 @@
 	let clearing = false;
 	let exportMsg = '';
 
+	// connections
+	let connections: Connection[] = [];
+	let lastfmAvailable = false;
+	let lbToken = '';
+	let lbBusy = false;
+	let fmBusy = false;
+	let fmPendingToken = ''; // set after 'start', cleared after 'complete'
+	let connError = '';
+	$: conn = (svc: string) => connections.find((c) => c.service === svc) ?? null;
+
+	async function loadConnections() {
+		try {
+			const r = await api.getConnections();
+			connections = r.connections;
+			lastfmAvailable = r.lastfm_available;
+		} catch { /* optional */ }
+	}
+	async function connectLB() {
+		connError = '';
+		if (!lbToken.trim()) return;
+		lbBusy = true;
+		try {
+			await api.connectListenBrainz(lbToken.trim());
+			lbToken = '';
+			await loadConnections();
+		} catch (e) { connError = String(e).replace(/^API \d+: /, ''); }
+		lbBusy = false;
+	}
+	async function lastfmConnect() {
+		connError = '';
+		fmBusy = true;
+		try {
+			if (!fmPendingToken) {
+				const { token, auth_url } = await api.lastfmStart();
+				fmPendingToken = token;
+				window.open(auth_url, '_blank', 'noopener');
+			} else {
+				await api.lastfmComplete(fmPendingToken);
+				fmPendingToken = '';
+				await loadConnections();
+			}
+		} catch (e) { connError = String(e).replace(/^API \d+: /, ''); }
+		fmBusy = false;
+	}
+	async function disconnectSvc(svc: string) {
+		try { await api.disconnect(svc); await loadConnections(); } catch (e) { connError = String(e).replace(/^API \d+: /, ''); }
+		if (svc === 'lastfm') fmPendingToken = '';
+	}
+
 	const themes: { v: ThemeMode; label: string }[] = [
 		{ v: 'light', label: 'Light' },
 		{ v: 'dark', label: 'Dark' },
@@ -39,6 +89,7 @@
 			tokens = tokensRes.tokens;
 		} catch { /* fallback */ }
 		try { listenCount = (await api.getDashboardStats()).total; } catch { /* optional */ }
+		loadConnections();
 		loading = false;
 	});
 
@@ -136,6 +187,54 @@
 		{#each themes as o}
 			<button class="seg-btn" class:on={$theme === o.v} on:click={() => setTheme(o.v)} style="flex:1;">{o.label}</button>
 		{/each}
+	</div>
+</div>
+
+<!-- Connections -->
+<div class="panel" style="border-radius:22px;padding:24px;margin-bottom:18px;">
+	<h3 class="h-display" style="font-size:19px;margin-bottom:4px;">Scrobble Connections</h3>
+	<p style="font-size:13px;color:var(--td-muted);margin:0 0 16px;">Forward <em>your</em> listens to your own Last.fm and ListenBrainz. Until you connect here, listens use the server's default configuration.</p>
+
+	{#if connError}<div style="font-size:13px;color:#b2622d;margin-bottom:12px;">{connError}</div>{/if}
+
+	<!-- ListenBrainz -->
+	<div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;padding:12px 0;border-bottom:1px solid var(--td-border);">
+		<div style="flex:1;min-width:160px;">
+			<div style="font-weight:600;font-size:14px;">ListenBrainz</div>
+			{#if conn('listenbrainz')}
+				<div style="font-size:12.5px;color:var(--td-good-fg);">Connected{conn('listenbrainz')?.username ? ` as ${conn('listenbrainz')?.username}` : ''}</div>
+			{:else}
+				<div style="font-size:12.5px;color:var(--td-muted-2);">Paste your user token from listenbrainz.org → Settings.</div>
+			{/if}
+		</div>
+		{#if conn('listenbrainz')}
+			<button class="btn btn-secondary" style="color:#b2622d;" on:click={() => disconnectSvc('listenbrainz')}>Disconnect</button>
+		{:else}
+			<input class="input" style="width:220px;" type="password" bind:value={lbToken} placeholder="ListenBrainz token">
+			<button class="btn btn-primary" on:click={connectLB} disabled={lbBusy || !lbToken.trim()}>{lbBusy ? '…' : 'Connect'}</button>
+		{/if}
+	</div>
+
+	<!-- Last.fm -->
+	<div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;padding:12px 0;">
+		<div style="flex:1;min-width:160px;">
+			<div style="font-weight:600;font-size:14px;">Last.fm</div>
+			{#if conn('lastfm')}
+				<div style="font-size:12.5px;color:var(--td-good-fg);">Connected{conn('lastfm')?.username ? ` as ${conn('lastfm')?.username}` : ''}</div>
+			{:else if !lastfmAvailable}
+				<div style="font-size:12.5px;color:var(--td-muted-2);">Not available — the server needs LASTFM_API_KEY and LASTFM_SECRET set.</div>
+			{:else if fmPendingToken}
+				<div style="font-size:12.5px;color:var(--td-accent);">Approve Tapedeck in the Last.fm tab, then click “Finish”.</div>
+			{:else}
+				<div style="font-size:12.5px;color:var(--td-muted-2);">Click Connect, approve on Last.fm, then finish.</div>
+			{/if}
+		</div>
+		{#if conn('lastfm')}
+			<button class="btn btn-secondary" style="color:#b2622d;" on:click={() => disconnectSvc('lastfm')}>Disconnect</button>
+		{:else if lastfmAvailable}
+			<button class="btn btn-primary" on:click={lastfmConnect} disabled={fmBusy}>{fmBusy ? '…' : (fmPendingToken ? 'Finish connecting' : 'Connect Last.fm')}</button>
+			{#if fmPendingToken}<button class="btn btn-secondary" on:click={() => (fmPendingToken = '')}>Cancel</button>{/if}
+		{/if}
 	</div>
 </div>
 

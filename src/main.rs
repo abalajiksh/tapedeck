@@ -143,6 +143,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         log_handle: log_handle.clone(),
         imports: Default::default(),
         lastfm_api_key: config.lastfm.api_key.clone(),
+        lastfm_secret: config.lastfm.secret.clone(),
+        listenbrainz_base_url: config.listenbrainz.base_url.clone(),
     });
 
     let app = server::build_app(app_state);
@@ -169,7 +171,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // shutdown signal drains the server, the select completes and we exit
     // cleanly. Pending scrobbles are durable in SQLite, so an interrupted tick
     // loses nothing.
-    let mut engine = ScrobbleEngine::new(sources, sinks, db, mb_client);
+    let mut engine = ScrobbleEngine::new(
+        sources, sinks, db, mb_client,
+        config.lastfm.api_key.clone(),
+        config.lastfm.secret.clone(),
+        config.listenbrainz.base_url.clone(),
+    );
     tokio::select! {
         _ = engine.run() => {},
         _ = server_task => { info!("👋 Server stopped; shutting down") },

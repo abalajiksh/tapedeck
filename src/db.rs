@@ -237,6 +237,20 @@ impl Database {
             )"
         ).execute(&self.pool).await?;
 
+        // ── Per-user scrobble connections (Last.fm / ListenBrainz) ──
+        // Credentials stay server-side; the API only ever exposes the connected
+        // account name, never the token/session key.
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS user_connections (
+                user_id INTEGER NOT NULL REFERENCES users(id),
+                service TEXT NOT NULL,
+                credentials TEXT NOT NULL,
+                connected_username TEXT,
+                connected_at INTEGER NOT NULL,
+                PRIMARY KEY (user_id, service)
+            )"
+        ).execute(&self.pool).await?;
+
         // ── Import history (one row per finished import job) ──
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS import_jobs (
@@ -971,6 +985,41 @@ impl Database {
     // ════════════════════════════════════════════════════════════
     //  Import history (persisted; the live job registry is in-memory)
     // ════════════════════════════════════════════════════════════
+
+    // ════════════════════════════════════════════════════════════
+    //  Per-user scrobble connections
+    // ════════════════════════════════════════════════════════════
+
+    pub async fn set_connection(&self, user_id: i64, service: &str, credentials: &str, username: Option<&str>) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "INSERT INTO user_connections (user_id, service, credentials, connected_username, connected_at)
+             VALUES (?, ?, ?, ?, ?)
+             ON CONFLICT(user_id, service) DO UPDATE SET
+                credentials = excluded.credentials,
+                connected_username = excluded.connected_username,
+                connected_at = excluded.connected_at"
+        ).bind(user_id).bind(service).bind(credentials).bind(username).bind(Self::now_secs())
+         .execute(&self.pool).await?;
+        Ok(())
+    }
+
+    pub async fn delete_connection(&self, user_id: i64, service: &str) -> Result<bool, sqlx::Error> {
+        let res = sqlx::query("DELETE FROM user_connections WHERE user_id = ? AND service = ?")
+            .bind(user_id).bind(service).execute(&self.pool).await?;
+        Ok(res.rows_affected() > 0)
+    }
+
+    /// Public-facing list: service + connected account only, never credentials.
+    pub async fn list_connections(&self, user_id: i64) -> Result<Vec<(String, Option<String>, i64)>, sqlx::Error> {
+        sqlx::query_as("SELECT service, connected_username, connected_at FROM user_connections WHERE user_id = ?")
+            .bind(user_id).fetch_all(&self.pool).await
+    }
+
+    /// Credentials for the engine to build this user's sinks. `(service, credentials_json)`.
+    pub async fn get_connections_for_forwarding(&self, user_id: i64) -> Result<Vec<(String, String)>, sqlx::Error> {
+        sqlx::query_as("SELECT service, credentials FROM user_connections WHERE user_id = ?")
+            .bind(user_id).fetch_all(&self.pool).await
+    }
 
     pub async fn record_import(&self, user_id: i64, source: &str, state: &str,
         fetched: i64, imported: i64, status: &str) -> Result<(), sqlx::Error> {

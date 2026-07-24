@@ -1,6 +1,7 @@
 mod admin;
 pub mod auth;
 mod chains;
+mod connections;
 mod export;
 pub mod import;
 pub mod ingest;
@@ -27,8 +28,11 @@ pub struct AppState {
     pub log_handle: LogLevelHandle,
     /// In-memory registry of running/finished import jobs.
     pub imports: import::ImportRegistry,
-    /// Last.fm API key (for user.getRecentTracks import); empty = import disabled.
+    /// Last.fm app credentials (for import + per-user OAuth connect); empty = disabled.
     pub lastfm_api_key: String,
+    pub lastfm_secret: String,
+    /// ListenBrainz base URL for validating per-user tokens.
+    pub listenbrainz_base_url: String,
 }
 
 /// Build the full Axum application.
@@ -48,6 +52,7 @@ pub fn build_app(state: Arc<AppState>) -> Router {
         .merge(preferences::create_preferences_router())
         .merge(export::create_export_router())
         .merge(import::create_import_router())
+        .merge(connections::create_connections_router())
         .with_state(state);
 
     // The SPA is the fallback, not a `/*path` route: a route would only answer

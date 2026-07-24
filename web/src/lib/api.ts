@@ -98,6 +98,12 @@ export interface EquipmentInput {
 	notes?: string;
 }
 
+export interface Connection {
+	service: string;
+	username: string | null;
+	connected_at: number;
+}
+
 export interface Binding {
 	id: number;
 	identifier: string;
@@ -280,6 +286,23 @@ class TapedeckAPI {
 		const res = await fetch(`${BASE}/api/v1/backup`, { credentials: 'same-origin' });
 		if (!res.ok) throw new Error(`API ${res.status}: ${await res.text()}`);
 		return res.blob();
+	}
+
+	// ── Per-user scrobble connections ──
+	async getConnections(): Promise<{ connections: Connection[]; lastfm_available: boolean }> {
+		return this.get('/api/v1/connections');
+	}
+	async connectListenBrainz(token: string): Promise<{ connected: boolean; username: string | null }> {
+		return this.request('PUT', '/api/v1/connections/listenbrainz', { token });
+	}
+	async disconnect(service: string): Promise<void> {
+		return this.delNoBody(`/api/v1/connections/${service}`);
+	}
+	async lastfmStart(): Promise<{ token: string; auth_url: string }> {
+		return this.post('/api/v1/connections/lastfm/start');
+	}
+	async lastfmComplete(token: string): Promise<{ connected: boolean; username: string | null }> {
+		return this.post('/api/v1/connections/lastfm/complete', { token });
 	}
 
 	// ── Import ──

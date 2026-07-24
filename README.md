@@ -33,6 +33,12 @@ Tapedeck stores listens locally *and* forwards them to Last.fm and
 ListenBrainz simultaneously. You don't have to choose — Tapedeck sits in
 front of both.
 
+Forwarding is **per user**: each account connects its own Last.fm (one-click
+OAuth) and ListenBrainz (paste a token) from Settings → Scrobble Connections,
+so everyone's listens go to their own services. A user who hasn't connected
+anything falls back to the server's global env/TOML configuration, so a
+single-user setup works out of the box.
+
 ### Signal Chain Intelligence (Phase 2)
 
 Define your audio signal chains — the ordered path from source to ears:
@@ -409,6 +415,11 @@ the `td_session` cookie set by the web UI login.
 | GET/PUT | `/api/v1/preferences` | Auth | Per-user settings (theme, …) |
 | GET | `/api/v1/export?format=` | Auth | Listen dump — `json` or `csv` |
 | GET | `/api/v1/backup` | Admin | Consistent full-database `.db` snapshot |
+| GET | `/api/v1/connections` | Auth | Your connected scrobble services |
+| PUT | `/api/v1/connections/listenbrainz` | Auth | Connect ListenBrainz (`{token}`) |
+| POST | `/api/v1/connections/lastfm/start` | Auth | Begin Last.fm OAuth → `{auth_url, token}` |
+| POST | `/api/v1/connections/lastfm/complete` | Auth | Finish Last.fm OAuth after approval |
+| DELETE | `/api/v1/connections/{service}` | Auth | Disconnect a service |
 | POST | `/api/v1/import/listenbrainz` | Auth | Import by ListenBrainz username |
 | POST | `/api/v1/import/lastfm` | Auth | Import by Last.fm username (needs `LASTFM_API_KEY`) |
 | POST | `/api/v1/import/file` | Auth | Import an uploaded `.json`/`.csv` |

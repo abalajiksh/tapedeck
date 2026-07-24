@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::sleep;
@@ -6,7 +7,7 @@ use tracing::{debug, error, info};
 use crate::db::Database;
 use crate::models::Play;
 use crate::musicbrainz::MusicBrainzClient;
-use crate::sinks::{ListenBrainzSink, ScrobbleSink};
+use crate::sinks::{LastFmSink, ListenBrainzSink, ScrobbleSink};
 use crate::sources::{MusicSource, PlexSource};
 
 use super::enrichment::enrich_play;
@@ -18,6 +19,10 @@ pub struct ScrobbleEngine {
     mb_client: Arc<MusicBrainzClient>,
     poll_interval: Duration,
     default_user_id: i64,
+    // App-level credentials used to build per-user sinks from stored connections.
+    lastfm_api_key: String,
+    lastfm_secret: String,
+    listenbrainz_base_url: String,
 }
 
 impl ScrobbleEngine {
@@ -26,12 +31,37 @@ impl ScrobbleEngine {
         sinks: Arc<Vec<Box<dyn ScrobbleSink>>>,
         db: Arc<Database>,
         mb_client: Arc<MusicBrainzClient>,
+        lastfm_api_key: String,
+        lastfm_secret: String,
+        listenbrainz_base_url: String,
     ) -> Self {
         Self {
             sources, sinks, db, mb_client,
             poll_interval: Duration::from_secs(15),
             default_user_id: 1,
+            lastfm_api_key, lastfm_secret, listenbrainz_base_url,
         }
+    }
+
+    /// Build this user's own sinks from their stored connections. Empty if they
+    /// haven't connected anything (caller then falls back to the global sinks).
+    fn build_user_sinks(&self, conns: &[(String, String)]) -> Vec<Box<dyn ScrobbleSink>> {
+        let mut sinks: Vec<Box<dyn ScrobbleSink>> = Vec::new();
+        for (service, creds_json) in conns {
+            let creds: serde_json::Value = serde_json::from_str(creds_json).unwrap_or_default();
+            match service.as_str() {
+                "lastfm" => if let Some(sk) = creds["session_key"].as_str() {
+                    sinks.push(Box::new(LastFmSink::new(
+                        self.lastfm_api_key.clone(), self.lastfm_secret.clone(), sk.to_string())));
+                },
+                "listenbrainz" => if let Some(t) = creds["token"].as_str() {
+                    sinks.push(Box::new(ListenBrainzSink::new(
+                        self.listenbrainz_base_url.clone(), t.to_string())));
+                },
+                _ => {}
+            }
+        }
+        sinks
     }
 
     pub async fn run(&mut self) -> ! {
@@ -162,37 +192,50 @@ impl ScrobbleEngine {
         if pending.is_empty() { return; }
         info!("🔄 Processing {} pending scrobble(s)", pending.len());
 
-        let enabled: Vec<String> = self.sinks.iter().map(|s| s.name().to_string()).collect();
+        // Group by user so each user's listens forward to *their* connected
+        // services (falling back to the global sinks when they've connected none).
+        let global = self.sinks.clone();
+        let mut by_user: HashMap<i64, Vec<crate::db::PendingScrobble>> = HashMap::new();
+        for ps in pending { by_user.entry(ps.user_id).or_default().push(ps); }
 
-        for mut ps in pending {
-            if ps.play.mbid_recording.is_none() {
-                let album_hint = ps.play.album.clone();
-                enrich_play(&self.mb_client, &mut ps.play, album_hint.as_deref()).await;
-            }
+        for (uid, items) in by_user {
+            let conns = self.db.get_connections_for_forwarding(uid).await.unwrap_or_default();
+            let user_sinks = self.build_user_sinks(&conns);
+            // ponytail: sinks are rebuilt each flush (fresh reqwest client) — fine
+            // at self-host volume; cache per user if throughput ever matters.
+            let targets: &[Box<dyn ScrobbleSink>] = if user_sinks.is_empty() { &global } else { &user_sinks };
+            let enabled: Vec<String> = targets.iter().map(|s| s.name().to_string()).collect();
 
-            // Only send to sinks that haven't already accepted this listen, so a
-            // retry after a partial failure can't double-scrobble.
-            for sink in self.sinks.iter() {
-                let name = sink.name().to_string();
-                if ps.delivered.contains(&name) { continue; }
-                match sink.scrobble(&[ps.play.clone()]).await {
-                    Ok(_) => {
-                        ps.delivered.push(name.clone());
-                        if let Err(e) = self.db.mark_sink_delivered(ps.id, &name).await {
-                            error!("Failed to record delivery to {}: {}", name, e);
-                        }
-                    }
-                    Err(e) => error!("Failed to send to {}: {}", name, e),
+            for mut ps in items {
+                if ps.play.mbid_recording.is_none() {
+                    let album_hint = ps.play.album.clone();
+                    enrich_play(&self.mb_client, &mut ps.play, album_hint.as_deref()).await;
                 }
-            }
 
-            // Fully synced once every enabled sink has accepted it (trivially
-            // true when no sinks are configured — store-locally-only mode).
-            if enabled.iter().all(|n| ps.delivered.contains(n)) {
-                if let Err(e) = self.db.mark_scrobble_synced(ps.id).await {
-                    error!("Failed to mark synced: {}", e);
-                } else {
-                    info!("✅ Synced: {} - {}", ps.play.artist, ps.play.title);
+                // Only send to sinks that haven't already accepted this listen, so
+                // a retry after a partial failure can't double-scrobble.
+                for sink in targets.iter() {
+                    let name = sink.name().to_string();
+                    if ps.delivered.contains(&name) { continue; }
+                    match sink.scrobble(&[ps.play.clone()]).await {
+                        Ok(_) => {
+                            ps.delivered.push(name.clone());
+                            if let Err(e) = self.db.mark_sink_delivered(ps.id, &name).await {
+                                error!("Failed to record delivery to {}: {}", name, e);
+                            }
+                        }
+                        Err(e) => error!("Failed to send to {}: {}", name, e),
+                    }
+                }
+
+                // Fully synced once every target sink has accepted it (trivially
+                // true when there are no sinks — store-locally-only mode).
+                if enabled.iter().all(|n| ps.delivered.contains(n)) {
+                    if let Err(e) = self.db.mark_scrobble_synced(ps.id).await {
+                        error!("Failed to mark synced: {}", e);
+                    } else {
+                        info!("✅ Synced: {} - {}", ps.play.artist, ps.play.title);
+                    }
                 }
             }
         }
