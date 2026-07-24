@@ -93,6 +93,35 @@ Polls Plex history and active sessions directly — no webhooks required, no
 Plex Pass needed. Session tracking with accurate scrobble thresholds
 (50% played or 4 minutes). Now Playing support for ListenBrainz.
 
+### Web UI (Phase 3)
+
+A SvelteKit single-page app is embedded directly in the binary (via
+`rust-embed`) — no separate deployment. The "cassette deck" interface ships
+with:
+
+- **Light / dark / system theme**, chosen per user. The choice is applied
+  before first paint (no flash), cached in `localStorage`, and persisted
+  server-side so every device matches.
+- **Dashboard** — a now-rolling cassette hero, quick stats, and recent listens.
+- **History** — grouped by day with inline edit (fix title/artist/album,
+  recording MBID, signal chain, format) and per-listen delete.
+- **Analytics** — timeframe-ranged totals, top artists, and a listening-clock
+  heatmap.
+- **Import** — pull from ListenBrainz or Last.fm, or upload a `.json`/`.csv`
+  export, with live progress.
+- **Signal Chains & Equipment**, plus **Settings** for appearance, API tokens,
+  connection test, and data export / wipe.
+
+### Import & Export
+
+Backfill your history from elsewhere and take it with you:
+
+- **Import** public listens from ListenBrainz or Last.fm by username, or upload
+  a ListenBrainz `.json` dump or a `.csv` export. Imports run as background
+  jobs, are deduplicated against existing listens, and are stored so they are
+  never re-forwarded to your scrobble sinks.
+- **Export** your entire history as JSON (full dump) or CSV.
+
 ## Architecture
 
 ```
@@ -131,21 +160,35 @@ Plex Pass needed. Session tracking with accurate scrobble thresholds
 ### Prerequisites
 
 - Rust toolchain (1.75+)
+- [Bun](https://bun.sh) (to build the embedded web UI)
 - A Plex Media Server (optional — ingest API works standalone)
 - ListenBrainz token (optional)
 - Last.fm API credentials (optional)
 
 ### Build
 
+The web UI is compiled into `static/` and then baked into the binary via
+`rust-embed`, so it must be built **before** `cargo build`:
+
 ```bash
 git clone https://github.com/abalajiksh/tapedeck.git
 cd tapedeck
+./build-web.sh            # bun install + vite build → static/  (required first)
 cargo build --release
+```
+
+For frontend iteration with hot reload (proxies the API to `localhost:8080`):
+
+```bash
+cargo run                 # backend on :8080
+cd web && bun run dev     # UI on :5173
 ```
 
 ## Configuration
 
-Copy `.env.example` to `.env` and configure:
+Configure via environment variables, a `.env` file, or `tapedeck.toml`
+(precedence: env > `.env` > `tapedeck.toml`). Copy `.env.example` to `.env`, or
+`tapedeck.toml.example` to `tapedeck.toml`:
 
 ```bash
 # ── General ──
@@ -292,6 +335,9 @@ curl -X POST http://localhost:8080/1/submit-listens \
 
 ## API Reference
 
+Auth accepts either an `Authorization: Token td_…` header (external clients) or
+the `td_session` cookie set by the web UI login.
+
 ### Ingest
 
 | Method | Path | Auth | Description |
@@ -308,6 +354,40 @@ curl -X POST http://localhost:8080/1/submit-listens \
 | POST | `/admin/users` | Token | Create user (returns token) |
 | GET | `/admin/tokens` | Token | List your tokens |
 | POST | `/admin/tokens` | Token | Create new token |
+| DELETE | `/admin/tokens/{id}` | Token | Revoke a token |
+
+### Auth
+
+| Method | Path | Auth | Description |
+|--------|------|------|-------------|
+| GET | `/api/v1/auth/status` | None | Whether setup is needed / session is valid |
+| POST | `/api/v1/auth/setup` | None | First-run: create the admin user |
+| POST | `/api/v1/auth/login` | None | Log in, set session cookie |
+| POST | `/api/v1/auth/logout` | Session | Log out |
+| GET | `/api/v1/auth/me` | Auth | Current user info |
+
+### Scrobbles & Stats
+
+| Method | Path | Auth | Description |
+|--------|------|------|-------------|
+| GET | `/api/v1/scrobbles` | Auth | List listens (`limit`, `offset`, `artist`, `album`, `after`, `before`) |
+| PATCH | `/api/v1/scrobbles/{id}` | Auth | Edit a listen (metadata, MBID, chain, format) |
+| DELETE | `/api/v1/scrobbles/{id}` | Auth | Delete one listen |
+| DELETE | `/api/v1/scrobbles?confirm=true` | Auth | Clear all listens for the user |
+| GET | `/api/v1/stats/dashboard` | Auth | Dashboard summary counts |
+| GET | `/api/v1/stats?range=` | Auth | Ranged analytics (`week`/`month`/`last30`/`year`/`all`) |
+
+### Preferences, Export & Import
+
+| Method | Path | Auth | Description |
+|--------|------|------|-------------|
+| GET/PUT | `/api/v1/preferences` | Auth | Per-user settings (theme, …) |
+| GET | `/api/v1/export?format=` | Auth | Full backup — `json` or `csv` |
+| POST | `/api/v1/import/listenbrainz` | Auth | Import by ListenBrainz username |
+| POST | `/api/v1/import/lastfm` | Auth | Import by Last.fm username (needs `LASTFM_API_KEY`) |
+| POST | `/api/v1/import/file` | Auth | Import an uploaded `.json`/`.csv` |
+| GET | `/api/v1/import/jobs/{id}` | Auth | Import job progress |
+| GET | `/api/v1/import/history` | Auth | Recent import jobs |
 
 ### Signal Chains & Gear
 
@@ -331,22 +411,29 @@ src/
 ├── db.rs                    SQLite: all tables, migrations, CRUD
 ├── musicbrainz.rs           3-tier metadata client
 ├── logging.rs               tracing + file output
+├── web_assets.rs            serves the embedded SvelteKit SPA
 ├── engine/
 │   ├── pipeline.rs          ScrobbleEngine (poll → enrich → store → dispatch)
 │   └── enrichment.rs        MusicBrainz enrichment helper
 ├── server/
 │   ├── mod.rs               AppState, build_app()
 │   ├── admin.rs             Health + log level endpoints
-│   ├── auth.rs              Token auth extractor
+│   ├── auth.rs              Session/token auth extractor
 │   ├── ingest.rs            /1/submit-listens (LB-compatible)
 │   ├── models.rs            Request/response types + Tapedeck extensions
-│   ├── users.rs             User + token management
+│   ├── users.rs             Auth, user + token management
+│   ├── scrobbles.rs         Listen list/edit/delete + stats endpoints
+│   ├── preferences.rs       Per-user settings (theme, …)
+│   ├── export.rs            JSON/CSV backup export
+│   ├── import.rs            ListenBrainz/Last.fm/file import + jobs
 │   └── chains.rs            Signal chain, device, equipment endpoints
 ├── sinks/
 │   ├── lastfm.rs            Last.fm scrobble sink
 │   └── listenbrainz.rs      ListenBrainz scrobble + now-playing sink
 └── sources/
     └── plex.rs              Plex polling source
+
+web/                         SvelteKit SPA (built into static/, embedded)
 ```
 
 ## Roadmap
@@ -355,15 +442,18 @@ src/
 
 - [x] **Phase 1** — Universal ingest API, multi-user, scrobble proxy
 - [x] **Phase 2** — Signal chains, audio quality model, device tracking, sessions
-- [x] **Tech debt** — Engine extraction, thiserror, log→tracing, Box::leak fix
+- [x] **Phase 3** — Embedded SvelteKit UI (light/dark theme, quality badges, inline edit)
+- [x] **Analytics** — Dashboard + ranged stats, top artists, listening heatmap
+- [x] **Import / Export** — ListenBrainz/Last.fm/file import, JSON/CSV export
+- [x] TOML configuration (env > `.env` > `tapedeck.toml`)
 
 ### Upcoming
 
-- [ ] **Phase 3** — SvelteKit UI embedded in the binary (dark mode, album art, quality badges)
-- [ ] **Phase 4** — Analytics engine (materialized stats, patterns, year-in-review)
+- [ ] **Phase 4** — Materialized stats, listening patterns, year-in-review
 - [ ] **Phase 5** — AI-powered features (recommendations, profile compression, smart corrections)
-- [ ] **Phase 6** — Discord rich presence, outbound webhooks, import/export (Spotify, Rockbox)
-- [ ] TOML configuration (replace .env)
+- [ ] **Phase 6** — Discord rich presence, outbound webhooks
+- [ ] MusicBrainz-driven genre/language/region breakdowns in Analytics
+- [ ] Persist import history (currently in-memory, resets on restart)
 - [ ] Docker container
 - [ ] Jellyfin + Navidrome source support
 - [ ] Plex audio quality extraction from session metadata
