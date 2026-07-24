@@ -20,6 +20,7 @@ export interface Scrobble {
 	dsd_multiplier: number | null;
 	delivery_codec: string | null;
 	quality_score: number | null;
+	chain_id: number | null;
 	listening_context: string | null;
 	submission_client: string | null;
 	mbid_recording: string | null;
@@ -95,6 +96,15 @@ export interface EquipmentInput {
 	brand?: string;
 	model?: string;
 	notes?: string;
+}
+
+export interface Binding {
+	id: number;
+	identifier: string;
+	interface: string | null;
+	chain_id: number | null; // null = detected but unmapped
+	last_seen: number;
+	hits: number;
 }
 
 export interface Device {
@@ -296,6 +306,18 @@ class TapedeckAPI {
 		return this.patch(`/api/v1/equipment/${id}`, data);
 	}
 	async deleteEquipment(id: number): Promise<void> { return this.delNoBody(`/api/v1/equipment/${id}`); }
+
+	// ── Output-device → chain bindings ──
+	async getBindings(): Promise<{ bindings: Binding[] }> { return this.get('/api/v1/bindings'); }
+	async setBinding(identifier: string, chain_id: number | null): Promise<void> {
+		await this.request('PUT', '/api/v1/bindings', { identifier, chain_id });
+	}
+	async deleteBinding(id: number): Promise<void> { return this.delNoBody(`/api/v1/bindings/${id}`); }
+
+	// ── Bulk chain reassignment (History) ──
+	async bulkSetChain(ids: number[], signal_chain_id: number | null): Promise<{ updated: number }> {
+		return this.post('/api/v1/scrobbles/bulk-chain', { ids, signal_chain_id });
+	}
 
 	// ── Users ──
 	async getUsers(): Promise<{ users: Array<{ id: number; username: string; display_name: string | null; role: string; created_at: number }> }> {

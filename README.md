@@ -403,12 +403,28 @@ the `td_session` cookie set by the web UI login.
 | POST | `/api/v1/equipment` | Token | Register equipment |
 | PATCH | `/api/v1/equipment/{id}` | Token | Update equipment |
 | DELETE | `/api/v1/equipment/{id}` | Token | Delete equipment |
+| GET | `/api/v1/bindings` | Token | List output→chain bindings (mapped + auto-learned) |
+| PUT | `/api/v1/bindings` | Token | Set/clear the chain for an output (`{identifier, chain_id}`) |
+| DELETE | `/api/v1/bindings/{id}` | Token | Forget an output |
+| POST | `/api/v1/scrobbles/bulk-chain` | Auth | Reassign many listens' chain (`{ids, signal_chain_id}`) |
 
-Clients tag a listen with a chain by sending its **name** in
-`additional_info.tapedeck_chain.chain_id`; the server resolves the name to the
-chain, tags the listen and its session, propagates the chain's listening
-context, and accumulates hours. Unknown names are ignored (the listen is still
-stored).
+### How a listen gets its chain
+
+Attribution happens at the source, but a chain lives downstream — so the server
+resolves the chain in layers (first match wins):
+
+1. **Explicit chain name** — the client sends it in `tapedeck_chain.chain_id`
+   (a name); the server looks it up.
+2. **Output-device binding** — the client reports the OS output device in
+   `tapedeck_device.output_device` (a USB DAC name, a Bluetooth device, "wired",
+   …). Every distinct output is **auto-learned** and shown in the UI's *Outputs*
+   panel; you map it to a chain **once**, and every future listen through it
+   attributes automatically.
+3. **Source-device default** — the machine's default chain, if set.
+
+Once resolved, the chain tags the listen and its session, propagates the chain's
+listening context, and accumulates hours. Ambiguous cases (one output feeding
+two rigs) are fixed retroactively with History's bulk chain-reassign.
 
 ## Project Structure
 

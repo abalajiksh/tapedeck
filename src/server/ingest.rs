@@ -105,9 +105,23 @@ pub async fn submit_listens(
             } else { None }
         } else { None };
 
-        // ── Phase 2: Resolve chain ──
-        // Layered: explicit chain name from the client → the source device's
-        // default chain. (Output-device bindings are resolved in Phase B.)
+        // ── Phase B: Record the output device (auto-learn bindings) ──
+        // Every distinct output we see is recorded so the UI can surface
+        // unmapped ones for one-tap assignment.
+        let output_dev = info_ref
+            .and_then(|ai| ai.tapedeck_device.as_ref())
+            .and_then(|td| td.output_device.as_ref());
+        let output_iface = info_ref
+            .and_then(|ai| ai.tapedeck_device.as_ref())
+            .and_then(|td| td.interface.as_ref().or(td.output_type.as_ref()));
+        if let Some(dev) = output_dev {
+            let _ = state.db.record_output(user.user_id, dev, output_iface.map(|s| s.as_str())).await;
+        }
+
+        // ── Resolve chain (layered, first match wins) ──
+        //   1. explicit chain name from the client
+        //   2. output-device binding (auto-learned / user-set)
+        //   3. source device's default chain
         let explicit_chain_name = info_ref
             .and_then(|ai| ai.tapedeck_chain.as_ref())
             .and_then(|tc| tc.chain_id.as_ref());
@@ -117,6 +131,11 @@ pub async fn submit_listens(
                 Ok(None) => { debug!("Unknown chain name from client: {}", name); None }
                 Err(e) => { debug!("Chain lookup failed: {}", e); None }
             }
+        } else if let Some(binding) = match output_dev {
+            Some(dev) => state.db.resolve_binding(user.user_id, dev).await.ok().flatten(),
+            None => None,
+        } {
+            Some(binding)
         } else if let Some(dev) = device_id {
             state.db.get_device_default_chain(user.user_id, dev).await.ok().flatten()
         } else {

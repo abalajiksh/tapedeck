@@ -161,6 +161,25 @@ async fn ranged_stats(
     }
 }
 
+#[derive(Debug, Deserialize)]
+pub struct BulkChain {
+    pub ids: Vec<i64>,
+    pub signal_chain_id: Option<i64>, // null clears the chain on those listens
+}
+
+/// POST /api/v1/scrobbles/bulk-chain — reassign many listens' chain at once
+/// (History bulk edit, for the one-output-many-rigs case).
+async fn bulk_set_chain(
+    State(state): State<Arc<AppState>>,
+    user: AuthUser,
+    Json(body): Json<BulkChain>,
+) -> impl IntoResponse {
+    match state.db.bulk_set_scrobble_chain(user.user_id, &body.ids, body.signal_chain_id).await {
+        Ok(n) => (StatusCode::OK, Json(serde_json::json!({ "updated": n }))).into_response(),
+        Err(e) => server_error(e.to_string()),
+    }
+}
+
 fn not_found() -> axum::response::Response {
     (StatusCode::NOT_FOUND, Json(serde_json::json!(
         ErrorResponse { code: 404, error: "Scrobble not found".into() }
@@ -176,6 +195,7 @@ pub fn create_scrobbles_router() -> Router<Arc<AppState>> {
     use axum::routing::patch;
     Router::new()
         .route("/api/v1/scrobbles", get(list_scrobbles).delete(clear_scrobbles))
+        .route("/api/v1/scrobbles/bulk-chain", axum::routing::post(bulk_set_chain))
         .route("/api/v1/scrobbles/:id", patch(update_scrobble).delete(delete_scrobble))
         .route("/api/v1/stats/dashboard", get(dashboard_stats))
         .route("/api/v1/stats", get(ranged_stats))

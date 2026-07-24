@@ -1,13 +1,18 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
 	import { api } from '$lib/api';
-	import type { SignalChain, Equipment, ChainComponent, ChainInput, EquipmentInput } from '$lib/api';
-	import { formatHours } from '$lib/utils';
+	import type { SignalChain, Equipment, ChainComponent, ChainInput, EquipmentInput, Binding } from '$lib/api';
+	import { formatHours, timeAgo } from '$lib/utils';
 
 	let chains: SignalChain[] = [];
 	let equipment: Equipment[] = [];
+	let bindings: Binding[] = [];
 	let loading = true;
 	let error = '';
+
+	$: unmapped = bindings.filter((b) => b.chain_id == null);
+	$: mapped = bindings.filter((b) => b.chain_id != null);
+	$: chainName = (id: number | null) => chains.find((c) => c.id === id)?.name ?? '—';
 
 	const contexts = ['active', 'active-mobile', 'passive', 'background', 'unknown'];
 	const compTypes = ['source', 'dac', 'amp', 'transducer', 'cable', 'other'];
@@ -34,13 +39,25 @@
 
 	async function load() {
 		try {
-			const [c, g] = await Promise.all([api.getChains(), api.getEquipment()]);
+			const [c, g, b] = await Promise.all([api.getChains(), api.getEquipment(), api.getBindings()]);
 			chains = c.chains;
 			equipment = g.equipment;
+			bindings = b.bindings;
 		} catch (e) {
 			error = e instanceof Error ? e.message : 'Failed to load data';
 		}
 		loading = false;
+	}
+
+	async function assignBinding(b: Binding, value: string) {
+		const cid = value ? Number(value) : null;
+		try {
+			await api.setBinding(b.identifier, cid);
+			bindings = bindings.map((x) => (x.id === b.id ? { ...x, chain_id: cid } : x));
+		} catch (e) { alert('Failed to set binding: ' + e); }
+	}
+	async function removeBinding(b: Binding) {
+		try { await api.deleteBinding(b.id); bindings = bindings.filter((x) => x.id !== b.id); } catch (e) { alert('Delete failed: ' + e); }
 	}
 
 	// ── chain editor ──
@@ -162,6 +179,38 @@
 			<div class="panel" style="border-radius:22px;padding:44px;text-align:center;color:var(--td-muted);">
 				No signal chains yet. <button class="btn btn-ghost" on:click={newChain}>Create your first</button>.
 			</div>
+		{/if}
+	</div>
+
+	<!-- Outputs → chain bindings (auto-learned) -->
+	<div style="margin-bottom:12px;">
+		<h3 class="h-display" style="font-size:19px;">Outputs</h3>
+		<p style="margin:4px 0 0;color:var(--td-muted);font-size:13.5px;">Map each playback output to a chain once — every future listen through it attributes automatically.</p>
+	</div>
+	<div class="panel" style="border-radius:22px;padding:18px 20px;margin-bottom:34px;">
+		{#if bindings.length}
+			{#if unmapped.length}
+				<div style="font-size:11px;letter-spacing:.1em;text-transform:uppercase;color:var(--td-accent);margin-bottom:8px;">Needs assignment</div>
+			{/if}
+			{#each [...unmapped, ...mapped] as b (b.id)}
+				<div style="display:flex;align-items:center;gap:12px;padding:10px 0;border-bottom:1px solid var(--td-border);flex-wrap:wrap;">
+					<div style="flex:1;min-width:160px;">
+						<div style="font-weight:600;font-size:14px;display:flex;align-items:center;gap:8px;">
+							{b.identifier}
+							{#if b.interface}<span class="tag tag-neutral">{b.interface}</span>{/if}
+							{#if b.chain_id == null}<span class="tag tag-accent">unmapped</span>{/if}
+						</div>
+						<div style="font-size:12px;color:var(--td-muted-2);margin-top:2px;">{b.hits} plays · last seen {timeAgo(b.last_seen)}</div>
+					</div>
+					<select class="input" style="width:auto;min-width:180px;" value={b.chain_id ?? ''} on:change={(e) => assignBinding(b, e.currentTarget.value)}>
+						<option value="">— unmapped —</option>
+						{#each chains as c}<option value={c.id}>{c.name}</option>{/each}
+					</select>
+					<button class="icon-btn danger" title="Forget this output" on:click={() => removeBinding(b)} aria-label="Delete binding">✕</button>
+				</div>
+			{/each}
+		{:else}
+			<p style="color:var(--td-muted);font-size:14px;margin:0;">No outputs detected yet. They appear here automatically once a client reports its output device (USB DAC, Bluetooth, headphone jack…).</p>
 		{/if}
 	</div>
 

@@ -19,6 +19,32 @@
 	let confirmDelete: Scrobble | null = null;
 	let saving = false;
 
+	// bulk selection
+	let selectMode = false;
+	let selected = new Set<number>();
+	let bulkChain = '';
+	$: selectedCount = selected.size;
+
+	function toggleSelect(s: Scrobble) {
+		if (selected.has(s.id)) selected.delete(s.id);
+		else selected.add(s.id);
+		selected = selected; // trigger reactivity
+	}
+	function exitSelect() { selectMode = false; selected = new Set(); bulkChain = ''; }
+
+	async function applyBulkChain() {
+		if (!selected.size) return;
+		const cid = bulkChain ? Number(bulkChain) : null;
+		saving = true;
+		try {
+			await api.bulkSetChain([...selected], cid);
+			const chain = cid; // scrobbles carry chain_id
+			scrobbles = scrobbles.map((s) => (selected.has(s.id) ? { ...s, chain_id: chain } : s));
+			exitSelect();
+		} catch (e) { alert('Bulk update failed: ' + e); }
+		saving = false;
+	}
+
 	$: groups = groupByDay(scrobbles);
 
 	function dayLabel(ts: number): string {
@@ -108,8 +134,28 @@
 		<h1 class="h-display" style="font-size:38px;">History</h1>
 		<p style="margin:6px 0 0;color:var(--td-muted);font-size:15px;">Every side you've ever pressed play on.</p>
 	</div>
-	<input class="input" style="width:230px;" bind:value={filter} on:input={onFilter} placeholder="Filter by artist…">
+	<div style="display:flex;gap:10px;align-items:center;">
+		{#if selectMode}
+			<button class="btn btn-secondary" on:click={exitSelect}>Done</button>
+		{:else}
+			<button class="btn btn-secondary" on:click={() => (selectMode = true)}>Select</button>
+		{/if}
+		<input class="input" style="width:200px;" bind:value={filter} on:input={onFilter} placeholder="Filter by artist…">
+	</div>
 </div>
+
+{#if selectMode}
+	<div class="panel" style="position:sticky;top:0;z-index:30;border-radius:14px;padding:12px 16px;margin-bottom:16px;display:flex;align-items:center;gap:12px;flex-wrap:wrap;background:var(--td-surface2);">
+		<span style="font-weight:600;font-size:14px;">{selectedCount} selected</span>
+		<span style="flex:1;"></span>
+		<span style="font-size:13px;color:var(--td-muted);">Set chain:</span>
+		<select class="input" style="width:auto;min-width:170px;" bind:value={bulkChain}>
+			<option value="">— clear chain —</option>
+			{#each chains as c}<option value={c.id}>{c.name}</option>{/each}
+		</select>
+		<button class="btn btn-primary" on:click={applyBulkChain} disabled={!selectedCount || saving}>{saving ? 'Applying…' : 'Apply'}</button>
+	</div>
+{/if}
 
 {#if groups.length}
 	{#each groups as g}
@@ -120,7 +166,8 @@
 		</div>
 		<div class="panel" style="border-radius:22px;overflow:hidden;">
 			{#each g.items as s (s.id)}
-				<ScrobbleRow scrobble={s} showMenu on:menu={(e) => (menuFor = e.detail)} />
+				<ScrobbleRow scrobble={s} showMenu selectable={selectMode} selected={selected.has(s.id)}
+					on:menu={(e) => (menuFor = e.detail)} on:toggle={(e) => toggleSelect(e.detail)} />
 			{/each}
 		</div>
 	{/each}

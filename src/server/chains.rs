@@ -176,6 +176,47 @@ async fn delete_equipment(
     }
 }
 
+// ── Output-device → chain bindings (Phase B) ──
+
+async fn list_bindings(
+    State(state): State<Arc<AppState>>,
+    user: AuthUser,
+) -> impl IntoResponse {
+    match state.db.list_bindings(user.user_id).await {
+        Ok(bindings) => (StatusCode::OK, Json(serde_json::json!({ "bindings": bindings }))).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!(ErrorResponse { code: 500, error: e.to_string() }))).into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct SetBindingRequest {
+    pub identifier: String,
+    pub chain_id: Option<i64>, // null clears the mapping
+}
+
+async fn set_binding(
+    State(state): State<Arc<AppState>>,
+    user: AuthUser,
+    Json(body): Json<SetBindingRequest>,
+) -> impl IntoResponse {
+    match state.db.set_binding(user.user_id, &body.identifier, body.chain_id).await {
+        Ok(()) => (StatusCode::OK, Json(serde_json::json!({ "status": "ok" }))).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!(ErrorResponse { code: 500, error: e.to_string() }))).into_response(),
+    }
+}
+
+async fn delete_binding(
+    State(state): State<Arc<AppState>>,
+    user: AuthUser,
+    Path(id): Path<i64>,
+) -> impl IntoResponse {
+    match state.db.delete_binding(user.user_id, id).await {
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => (StatusCode::NOT_FOUND, Json(serde_json::json!(ErrorResponse { code: 404, error: "Binding not found".into() }))).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!(ErrorResponse { code: 500, error: e.to_string() }))).into_response(),
+    }
+}
+
 // ── Router ──
 
 pub fn create_gear_router() -> Router<Arc<AppState>> {
@@ -186,4 +227,6 @@ pub fn create_gear_router() -> Router<Arc<AppState>> {
         .route("/api/v1/devices", get(list_devices))
         .route("/api/v1/equipment", post(create_equipment).get(list_equipment))
         .route("/api/v1/equipment/:id", patch(update_equipment).delete(delete_equipment))
+        .route("/api/v1/bindings", get(list_bindings).put(set_binding))
+        .route("/api/v1/bindings/:id", axum::routing::delete(delete_binding))
 }

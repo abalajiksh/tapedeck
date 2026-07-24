@@ -46,6 +46,17 @@ pub struct ScrobbleRecord {
     pub submission_client: Option<String>,
 }
 
+#[derive(Debug, FromRow, serde::Serialize)]
+pub struct BindingRow {
+    pub id: i64,
+    pub user_id: i64,
+    pub identifier: String,
+    pub interface: Option<String>,
+    pub chain_id: Option<i64>,
+    pub last_seen: i64,
+    pub hits: i64,
+}
+
 pub struct Database {
     pool: Pool<Sqlite>,
 }
@@ -173,6 +184,23 @@ impl Database {
                 created_at INTEGER NOT NULL,
                 expires_at INTEGER NOT NULL,
                 last_active_at INTEGER NOT NULL
+            )"
+        ).execute(&self.pool).await?;
+
+        // ── Output-device → chain bindings (Phase B) ──
+        // One row per distinct output the client reports (USB DAC name, BT
+        // device, "wired", …). chain_id NULL = seen but unmapped, which the UI
+        // surfaces for one-tap assignment (auto-learn).
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS chain_bindings (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL REFERENCES users(id),
+                identifier TEXT NOT NULL,
+                interface TEXT,
+                chain_id INTEGER REFERENCES signal_chains(id),
+                last_seen INTEGER NOT NULL,
+                hits INTEGER NOT NULL DEFAULT 0,
+                UNIQUE(user_id, identifier)
             )"
         ).execute(&self.pool).await?;
 
@@ -771,10 +799,75 @@ impl Database {
             .bind(chain_id).bind(user_id).execute(&mut *tx).await?;
         sqlx::query("UPDATE devices SET default_chain_id = NULL WHERE default_chain_id = ? AND user_id = ?")
             .bind(chain_id).bind(user_id).execute(&mut *tx).await?;
+        sqlx::query("UPDATE chain_bindings SET chain_id = NULL WHERE chain_id = ? AND user_id = ?")
+            .bind(chain_id).bind(user_id).execute(&mut *tx).await?;
         let res = sqlx::query("DELETE FROM signal_chains WHERE id = ? AND user_id = ?")
             .bind(chain_id).bind(user_id).execute(&mut *tx).await?;
         tx.commit().await?;
         Ok(res.rows_affected() > 0)
+    }
+
+    // ════════════════════════════════════════════════════════════
+    //  Output-device → chain bindings (Phase B)
+    // ════════════════════════════════════════════════════════════
+
+    /// Record that we saw a listen come through this output device. Inserts a
+    /// new unmapped row (chain_id NULL) the first time, else bumps hits/last_seen
+    /// and refreshes the interface. Never overwrites an existing chain mapping.
+    pub async fn record_output(&self, user_id: i64, identifier: &str, interface: Option<&str>) -> Result<(), sqlx::Error> {
+        let now = Self::now_secs();
+        sqlx::query(
+            "INSERT INTO chain_bindings (user_id, identifier, interface, chain_id, last_seen, hits)
+             VALUES (?, ?, ?, NULL, ?, 1)
+             ON CONFLICT(user_id, identifier) DO UPDATE SET
+                hits = hits + 1, last_seen = excluded.last_seen,
+                interface = COALESCE(excluded.interface, chain_bindings.interface)"
+        ).bind(user_id).bind(identifier).bind(interface).bind(now)
+         .execute(&self.pool).await?;
+        Ok(())
+    }
+
+    /// Resolve an output-device identifier to its bound chain, if mapped.
+    pub async fn resolve_binding(&self, user_id: i64, identifier: &str) -> Result<Option<i64>, sqlx::Error> {
+        let row: Option<(Option<i64>,)> = sqlx::query_as(
+            "SELECT chain_id FROM chain_bindings WHERE user_id = ? AND identifier = ?"
+        ).bind(user_id).bind(identifier).fetch_optional(&self.pool).await?;
+        Ok(row.and_then(|(c,)| c))
+    }
+
+    pub async fn list_bindings(&self, user_id: i64) -> Result<Vec<BindingRow>, sqlx::Error> {
+        sqlx::query_as("SELECT * FROM chain_bindings WHERE user_id = ? ORDER BY chain_id IS NOT NULL, last_seen DESC")
+            .bind(user_id).fetch_all(&self.pool).await
+    }
+
+    /// Assign (or clear, with None) the chain for an output identifier. Creates
+    /// the binding if the identifier hasn't been seen yet (manual add).
+    pub async fn set_binding(&self, user_id: i64, identifier: &str, chain_id: Option<i64>) -> Result<(), sqlx::Error> {
+        let now = Self::now_secs();
+        sqlx::query(
+            "INSERT INTO chain_bindings (user_id, identifier, chain_id, last_seen, hits)
+             VALUES (?, ?, ?, ?, 0)
+             ON CONFLICT(user_id, identifier) DO UPDATE SET chain_id = excluded.chain_id"
+        ).bind(user_id).bind(identifier).bind(chain_id).bind(now)
+         .execute(&self.pool).await?;
+        Ok(())
+    }
+
+    pub async fn delete_binding(&self, user_id: i64, id: i64) -> Result<bool, sqlx::Error> {
+        let res = sqlx::query("DELETE FROM chain_bindings WHERE id = ? AND user_id = ?")
+            .bind(id).bind(user_id).execute(&self.pool).await?;
+        Ok(res.rows_affected() > 0)
+    }
+
+    /// Bulk-reassign the chain for a set of listens (History bulk edit).
+    pub async fn bulk_set_scrobble_chain(&self, user_id: i64, ids: &[i64], chain_id: Option<i64>) -> Result<u64, sqlx::Error> {
+        if ids.is_empty() { return Ok(0); }
+        let placeholders = std::iter::repeat("?").take(ids.len()).collect::<Vec<_>>().join(",");
+        let sql = format!("UPDATE scrobbles SET chain_id = ? WHERE user_id = ? AND id IN ({})", placeholders);
+        let mut q = sqlx::query(&sql).bind(chain_id).bind(user_id);
+        for id in ids { q = q.bind(id); }
+        let res = q.execute(&self.pool).await?;
+        Ok(res.rows_affected())
     }
 
     // ════════════════════════════════════════════════════════════
