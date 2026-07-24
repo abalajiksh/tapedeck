@@ -264,7 +264,9 @@ impl MusicBrainzClient {
         &self,
         track_title: &str,
         artist_name: &str,
-        album_name: Option<&str>,
+        // The Postgres dump query matches on recording + artist only; kept for
+        // signature parity with the other tiers.
+        _album_name: Option<&str>,
     ) -> Result<Option<MusicBrainzMetadata>> {
         let pool = match &self.postgres_pool {
             Some(p) => p,
@@ -435,8 +437,8 @@ impl MusicBrainzClient {
     fn extract_mbid_from_url(url_or_mbid: &str) -> String {
         if url_or_mbid.starts_with("http://") || url_or_mbid.starts_with("https://") {
             url_or_mbid
-                .split('/')
-                .last()
+                .rsplit('/')
+                .next()
                 .unwrap_or(url_or_mbid)
                 .to_string()
         } else {

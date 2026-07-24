@@ -50,7 +50,7 @@ pub async fn submit_listens(
             .and_then(|ai| ai.submission_client.as_deref())
             .unwrap_or("unknown");
 
-        let source_id = format!("ingest-{}-{}-{}", user.user_id, timestamp, &meta.track_name);
+        let source_id = format!("ingest-{}-{}-{}", user.user_id, timestamp, meta.track_name);
 
         let duration = info_ref.and_then(|ai| ai.duration_ms).map(|ms| (ms / 1000) as u64);
         let track_number = info_ref.and_then(|ai| ai.track_number);

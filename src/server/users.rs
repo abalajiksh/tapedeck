@@ -8,10 +8,23 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
-use super::auth::{extract_session_cookie, AuthUser};
+use super::auth::AuthUser;
 use super::models::ErrorResponse;
 use super::AppState;
 use crate::db::Database;
+
+/// `AuthUser` proves *authentication* only. Anything that reads or mutates
+/// other users' data must gate on this explicitly.
+fn forbidden(action: &str) -> axum::response::Response {
+    (
+        StatusCode::FORBIDDEN,
+        Json(serde_json::json!(ErrorResponse {
+            code: 403,
+            error: format!("Admin privileges required to {}", action),
+        })),
+    )
+        .into_response()
+}
 
 // ═══════════════════════════════════════════════════════════
 //  Cookie helpers
@@ -222,9 +235,12 @@ pub struct CreateUserResponse {
 
 async fn create_user(
     State(state): State<Arc<AppState>>,
-    _user: AuthUser,
+    user: AuthUser,
     Json(body): Json<CreateUserRequest>,
 ) -> impl IntoResponse {
+    if !user.is_admin {
+        return forbidden("create users");
+    }
     if body.username.trim().is_empty() {
         return (StatusCode::BAD_REQUEST, Json(serde_json::json!(
             ErrorResponse { code: 400, error: "Username cannot be empty".into() }
@@ -272,8 +288,11 @@ async fn create_user(
 
 async fn list_users(
     State(state): State<Arc<AppState>>,
-    _user: AuthUser,
+    user: AuthUser,
 ) -> impl IntoResponse {
+    if !user.is_admin {
+        return forbidden("list users");
+    }
     match state.db.list_users().await {
         Ok(users) => (StatusCode::OK, Json(serde_json::json!({ "users": users }))).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!(
@@ -309,7 +328,12 @@ async fn create_token(
     user: AuthUser,
     Json(body): Json<CreateTokenRequest>,
 ) -> impl IntoResponse {
+    // Minting a token *for someone else* is an account takeover, so it is
+    // admin-only. Without this, any user can hand themselves an admin token.
     let target_user_id = body.user_id.unwrap_or(user.user_id);
+    if target_user_id != user.user_id && !user.is_admin {
+        return forbidden("issue tokens for another user");
+    }
     if body.name.trim().is_empty() {
         return (StatusCode::BAD_REQUEST, Json(serde_json::json!(
             ErrorResponse { code: 400, error: "Token name cannot be empty".into() }
@@ -373,5 +397,5 @@ pub fn create_user_management_router() -> Router<Arc<AppState>> {
     Router::new()
         .route("/admin/users", post(create_user).get(list_users))
         .route("/admin/tokens", post(create_token).get(list_tokens))
-        .route("/admin/tokens/{id}", delete(revoke_token))
+        .route("/admin/tokens/:id", delete(revoke_token))
 }

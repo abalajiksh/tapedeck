@@ -129,7 +129,7 @@ async fn list_equipment(
 pub fn create_gear_router() -> Router<Arc<AppState>> {
     Router::new()
         .route("/api/v1/chains", post(create_chain).get(list_chains))
-        .route("/api/v1/chains/{id}", get(get_chain))
+        .route("/api/v1/chains/:id", get(get_chain))
         .route("/api/v1/devices", get(list_devices))
         .route("/api/v1/equipment", post(create_equipment).get(list_equipment))
 }

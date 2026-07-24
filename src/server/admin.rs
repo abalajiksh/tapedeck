@@ -26,7 +26,7 @@ struct SetLogLevelRequest {
 }
 
 async fn get_log_level(State(state): State<Arc<AdminState>>) -> impl IntoResponse {
-    let level = state.log_handle.get_level().await;
+    let level = state.log_handle.get_level();
     Json(LogLevelResponse {
         current_level: level.clone(),
         message: format!("Current log level: {}", level),
@@ -37,7 +37,7 @@ async fn set_log_level(
     State(state): State<Arc<AdminState>>,
     Json(payload): Json<SetLogLevelRequest>,
 ) -> impl IntoResponse {
-    match state.log_handle.set_level(&payload.level).await {
+    match state.log_handle.set_level(&payload.level) {
         Ok(_) => (
             StatusCode::OK,
             Json(LogLevelResponse {

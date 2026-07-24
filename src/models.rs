@@ -146,14 +146,12 @@ pub enum ComponentType {
     Source, Transport, Dac, Amp, Transducer, Network, Bluetooth,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ListeningContext {
-    Active, ActiveMobile, Passive, Background, Unknown,
-}
-
-impl Default for ListeningContext {
-    fn default() -> Self { Self::Unknown }
+    Active, ActiveMobile, Passive, Background,
+    #[default]
+    Unknown,
 }
 
 impl ListeningContext {

@@ -1,43 +1,43 @@
-use std::sync::Arc;
-use tokio::sync::RwLock;
-use tracing::Level;
 use tracing_subscriber::{
     layer::SubscriberExt,
+    reload,
     util::SubscriberInitExt,
     EnvFilter,
-    Layer,
     Registry,
 };
 use tracing_appender::rolling::{RollingFileAppender, Rotation};
-use std::path::Path;
 
-/// Shared handle for runtime log level control
+/// Shared handle for runtime log level control.
+///
+/// Wraps the live `reload::Handle` for the subscriber's `EnvFilter`, so
+/// swapping the level here actually takes effect on the running subscriber.
 #[derive(Clone)]
 pub struct LogLevelHandle {
-    filter: Arc<RwLock<EnvFilter>>,
+    filter: reload::Handle<EnvFilter, Registry>,
 }
 
 impl LogLevelHandle {
     /// Update the log level at runtime
-    pub async fn set_level(&self, level: &str) -> Result<(), String> {
-        let new_filter = match level.to_uppercase().as_str() {
-            "TRACE" => EnvFilter::new("trace"),
-            "DEBUG" => EnvFilter::new("debug"),
-            "INFO" => EnvFilter::new("info"),
-            "WARN" => EnvFilter::new("warn"),
-            "ERROR" => EnvFilter::new("error"),
+    pub fn set_level(&self, level: &str) -> Result<(), String> {
+        let directive = match level.to_uppercase().as_str() {
+            "TRACE" => "trace",
+            "DEBUG" => "debug",
+            "INFO" => "info",
+            "WARN" => "warn",
+            "ERROR" => "error",
             _ => return Err(format!("Invalid log level: {}", level)),
         };
 
-        let mut filter = self.filter.write().await;
-        *filter = new_filter;
-        Ok(())
+        self.filter
+            .reload(EnvFilter::new(directive))
+            .map_err(|e| format!("Failed to apply log level: {}", e))
     }
 
     /// Get the current log level
-    pub async fn get_level(&self) -> String {
-        let filter = self.filter.read().await;
-        format!("{:?}", filter)
+    pub fn get_level(&self) -> String {
+        self.filter
+            .with_current(|f| f.to_string())
+            .unwrap_or_else(|_| "unknown".to_string())
     }
 }
 
@@ -47,28 +47,24 @@ impl LogLevelHandle {
 /// * `log_dir` - Directory for log files (default: "./logs")
 /// * `enable_file_logging` - Whether to write logs to files
 /// * `enable_console` - Whether to write logs to stdout/stderr
-/// 
+/// * `level` - Initial filter directive (e.g. "info", "tapedeck=debug")
+///
 /// # Returns
 /// A handle to control log levels at runtime
 pub fn init_logging(
     log_dir: Option<&str>,
     enable_file_logging: bool,
     enable_console: bool,
+    level: &str,
 ) -> Result<LogLevelHandle, Box<dyn std::error::Error>> {
-    // Get initial log level from environment or default to INFO
-    let initial_level = std::env::var("RUST_LOG")
-        .unwrap_or_else(|_| "info".to_string());
-    
-    let filter = Arc::new(RwLock::new(
-        EnvFilter::try_new(&initial_level)?
-    ));
+    let (filter_layer, reload_handle) =
+        reload::Layer::<EnvFilter, Registry>::new(EnvFilter::try_new(level)?);
 
-    let handle = LogLevelHandle {
-        filter: filter.clone(),
-    };
+    let handle = LogLevelHandle { filter: reload_handle };
 
-    // Create the subscriber with layers
-    let subscriber = Registry::default();
+    // The filter layer must be part of the subscriber, otherwise every event
+    // is emitted regardless of level and runtime reloads do nothing.
+    let subscriber = Registry::default().with(filter_layer);
 
     // Console layer
     if enable_console {

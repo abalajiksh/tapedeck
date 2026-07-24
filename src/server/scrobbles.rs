@@ -28,7 +28,7 @@ async fn list_scrobbles(
     user: AuthUser,
     Query(params): Query<ScrobblesQuery>,
 ) -> impl IntoResponse {
-    let limit = params.limit.unwrap_or(50).min(500).max(1);
+    let limit = params.limit.unwrap_or(50).clamp(1, 500);
     let offset = params.offset.unwrap_or(0).max(0);
 
     match state.db.get_recent_scrobbles(

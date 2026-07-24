@@ -4,7 +4,6 @@
 	import type { TokenInfo } from '$lib/api';
 	import { formatDateTime } from '$lib/utils';
 
-	declare const __UI_VERSION__: string;
 	const uiVersion = __UI_VERSION__;
 	let backendVersion = '…';
 

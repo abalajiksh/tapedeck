@@ -34,6 +34,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some(&config.logging.dir),
         config.logging.file_enabled,
         config.logging.console_enabled,
+        &config.logging.level,
     )?;
     info!("🚀 Tapedeck v{} Started", env!("CARGO_PKG_VERSION"));
 

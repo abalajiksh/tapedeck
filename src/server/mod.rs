@@ -40,8 +40,11 @@ pub fn build_app(state: Arc<AppState>) -> Router {
         .merge(scrobbles_router)
         .with_state(state);
 
+    // The SPA is the fallback, not a `/*path` route: a route would only answer
+    // the methods it registers (so an unmatched DELETE would 405 instead of
+    // 404) and would let unknown API paths render the HTML shell.
     Router::new()
         .merge(admin)
         .merge(api)
-        .merge(web_assets::create_frontend_router())
+        .fallback(web_assets::spa_fallback)
 }

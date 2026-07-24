@@ -240,14 +240,9 @@ impl Default for TomlListenBrainz {
     }
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Default)]
 #[serde(default)]
 struct TomlLastFm { enabled: bool, api_key: String, secret: String, session_key: String }
-impl Default for TomlLastFm {
-    fn default() -> Self {
-        Self { enabled: false, api_key: String::new(), secret: String::new(), session_key: String::new() }
-    }
-}
 
 #[derive(Deserialize)]
 #[serde(default)]

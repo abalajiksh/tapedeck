@@ -3,7 +3,6 @@
 	import { onMount } from 'svelte';
 	import { api } from '$lib/api';
 
-	declare const __UI_VERSION__: string;
 	const uiVersion = __UI_VERSION__;
 	let backendVersion = '…';
 
