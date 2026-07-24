@@ -59,6 +59,41 @@ async fn export(
     ).into_response()
 }
 
+/// GET /api/v1/backup — admin-only consistent SQLite snapshot download.
+async fn backup(
+    State(state): State<Arc<AppState>>,
+    user: AuthUser,
+) -> impl IntoResponse {
+    if !user.is_admin {
+        return (StatusCode::FORBIDDEN, Json(serde_json::json!(
+            ErrorResponse { code: 403, error: "Admin only".into() }
+        ))).into_response();
+    }
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+    let tmp = std::env::temp_dir().join(format!("tapedeck-backup-{now}.db"));
+    let tmp_str = tmp.to_string_lossy().to_string();
+
+    if let Err(e) = state.db.backup_to(&tmp_str).await {
+        return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!(
+            ErrorResponse { code: 500, error: format!("Backup failed: {e}") }
+        ))).into_response();
+    }
+    let bytes = match tokio::fs::read(&tmp).await {
+        Ok(b) => b,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!(
+            ErrorResponse { code: 500, error: format!("Backup read failed: {e}") }
+        ))).into_response(),
+    };
+    let _ = tokio::fs::remove_file(&tmp).await;
+
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "application/x-sqlite3"),
+         (header::CONTENT_DISPOSITION, "attachment; filename=\"tapedeck-backup.db\"")],
+        bytes,
+    ).into_response()
+}
+
 /// Minimal RFC-4180 field escaping: quote if it contains a comma, quote, or newline.
 fn csv(s: &str) -> String {
     if s.contains([',', '"', '\n', '\r']) {
@@ -69,5 +104,7 @@ fn csv(s: &str) -> String {
 }
 
 pub fn create_export_router() -> Router<Arc<AppState>> {
-    Router::new().route("/api/v1/export", get(export))
+    Router::new()
+        .route("/api/v1/export", get(export))
+        .route("/api/v1/backup", get(backup))
 }

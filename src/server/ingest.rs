@@ -33,6 +33,7 @@ pub async fn submit_listens(
 
     let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64;
     let mut accepted = 0u32;
+    let mut failed = 0u32; // listens we could not persist (DB error) — triggers a retryable response
 
     for listen in &body.payload {
         let timestamp = match body.listen_type {
@@ -44,6 +45,13 @@ pub async fn submit_listens(
         };
 
         let meta = &listen.track_metadata;
+
+        // Reject malformed listens (no retry — it's bad client data, not our fault)
+        if meta.artist_name.trim().is_empty() || meta.track_name.trim().is_empty() {
+            warn!("Listen missing artist/track, skipping");
+            continue;
+        }
+
         let info_ref = meta.additional_info.as_ref();
 
         let submission_client = info_ref
@@ -192,14 +200,24 @@ pub async fn submit_listens(
                         accepted += 1;
                     }
                     Ok(false) => { accepted += 1; } // dupe
-                    Err(e) => error!("Database error: {}", e),
+                    Err(e) => { error!("Database error persisting listen: {}", e); failed += 1; }
                 }
             }
         }
     }
 
-    info!("Ingest complete: {}/{} listens accepted [user: {}, type: {:?}]",
-        accepted, listen_count, user.username, body.listen_type);
+    info!("Ingest complete: {} accepted, {} failed of {} [user: {}, type: {:?}]",
+        accepted, failed, listen_count, user.username, body.listen_type);
+
+    // If any listen failed to persist, return a retryable error so the client
+    // resends the batch — our dedup (source_id + fuzzy match) makes retries safe,
+    // and this prevents silently losing listens on a transient DB error.
+    if failed > 0 {
+        return (StatusCode::SERVICE_UNAVAILABLE, Json(ErrorResponse {
+            code: 503,
+            error: format!("{} of {} listens could not be stored; please retry", failed, listen_count),
+        })).into_response();
+    }
 
     (StatusCode::OK, Json(SubmitListensResponse { status: "ok".into() })).into_response()
 }

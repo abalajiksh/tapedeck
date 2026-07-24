@@ -93,6 +93,20 @@
 		} catch (e) { exportMsg = 'Export failed'; }
 	}
 
+	async function doBackup() {
+		try {
+			const blob = await api.backupBlob();
+			const url = URL.createObjectURL(blob);
+			const a = document.createElement('a');
+			a.href = url;
+			a.download = 'tapedeck-backup.db';
+			a.click();
+			URL.revokeObjectURL(url);
+			exportMsg = 'Backup downloaded';
+			setTimeout(() => (exportMsg = ''), 3000);
+		} catch (e) { exportMsg = 'Backup failed (admin only)'; }
+	}
+
 	async function doClear() {
 		clearing = true;
 		try {
@@ -198,6 +212,7 @@
 	<div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center;">
 		<button class="btn btn-secondary" on:click={() => doExport('json')}>Export JSON</button>
 		<button class="btn btn-secondary" on:click={() => doExport('csv')}>Export CSV</button>
+		<button class="btn btn-secondary" on:click={doBackup}>Download DB backup</button>
 		<span style="flex:1;"></span>
 		<button class="btn btn-ghost" style="color:#b2622d;" on:click={() => (confirmClear = true)}>Clear history</button>
 	</div>

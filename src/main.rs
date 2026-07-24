@@ -149,22 +149,51 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let server_port = config.server.port;
     let server_host = config.server.host.clone();
 
-    tokio::spawn(async move {
+    // ── HTTP server (background task; drains in-flight requests on shutdown) ──
+    let server_task = tokio::spawn(async move {
         let addr = format!("{}:{}", server_host, server_port);
         info!("🌐 Starting server on {}", addr);
         let listener = match tokio::net::TcpListener::bind(&addr).await {
             Ok(l) => l,
-            Err(e) => {
-                error!("Failed to bind server: {}", e);
-                return;
-            }
+            Err(e) => { error!("Failed to bind server: {}", e); return; }
         };
-        if let Err(e) = axum::serve(listener, app).await {
+        if let Err(e) = axum::serve(listener, app)
+            .with_graceful_shutdown(shutdown_signal())
+            .await
+        {
             error!("Server error: {}", e);
         }
     });
 
-    // ── Scrobble engine ──
+    // ── Scrobble engine (foreground) ── raced against the server: when a
+    // shutdown signal drains the server, the select completes and we exit
+    // cleanly. Pending scrobbles are durable in SQLite, so an interrupted tick
+    // loses nothing.
     let mut engine = ScrobbleEngine::new(sources, sinks, db, mb_client);
-    engine.run().await;
+    tokio::select! {
+        _ = engine.run() => {},
+        _ = server_task => { info!("👋 Server stopped; shutting down") },
+    }
+    Ok(())
+}
+
+/// Resolve when the process receives Ctrl-C or (on Unix) SIGTERM, so systemd /
+/// Docker `stop` lets in-flight requests finish before we exit. Pending
+/// scrobbles are durable in SQLite, so an interrupted poll tick loses nothing.
+async fn shutdown_signal() {
+    use tokio::signal;
+    let ctrl_c = async { let _ = signal::ctrl_c().await; };
+    #[cfg(unix)]
+    let terminate = async {
+        if let Ok(mut s) = signal::unix::signal(signal::unix::SignalKind::terminate()) {
+            s.recv().await;
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+    tokio::select! {
+        _ = ctrl_c => {},
+        _ = terminate => {},
+    }
+    info!("🛑 Shutdown signal received, draining…");
 }

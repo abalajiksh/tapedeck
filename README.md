@@ -77,6 +77,25 @@ Multiple users in the same household can each have their own token, their own
 scrobble history, their own signal chains. Data is isolated per-user. First
 run creates an admin user; additional users are created via the API.
 
+### Reliability
+
+Built to be trusted as your system of record:
+
+- **Durable ingest.** Listens are written to SQLite (WAL mode + busy-timeout so
+  concurrent writers wait rather than error) before the API returns. If a listen
+  can't be persisted, `/1/submit-listens` returns a retryable `503` so the client
+  resends — dedup makes retries safe, so nothing is silently dropped.
+- **At-least-once forwarding, no double-scrobbles.** Each pending listen tracks
+  which sinks have accepted it; a retry only re-sends to the sinks that haven't,
+  so a flaky Last.fm won't get duplicate scrobbles when ListenBrainz was down.
+  Both sinks retry with backoff.
+- **Crash-safe.** Pending scrobbles live in the DB, so a crash or restart resumes
+  where it left off. The poll loop isolates per-tick panics, and the server drains
+  in-flight requests on `SIGTERM`.
+- **Backups.** `GET /api/v1/backup` (or the Settings screen) downloads a
+  consistent `VACUUM INTO` snapshot of the whole database, safe to take while
+  running. `GET /health` reports DB connectivity for uptime monitoring.
+
 ### MusicBrainz Enrichment
 
 3-tier metadata lookup:
@@ -382,7 +401,8 @@ the `td_session` cookie set by the web UI login.
 | Method | Path | Auth | Description |
 |--------|------|------|-------------|
 | GET/PUT | `/api/v1/preferences` | Auth | Per-user settings (theme, …) |
-| GET | `/api/v1/export?format=` | Auth | Full backup — `json` or `csv` |
+| GET | `/api/v1/export?format=` | Auth | Listen dump — `json` or `csv` |
+| GET | `/api/v1/backup` | Admin | Consistent full-database `.db` snapshot |
 | POST | `/api/v1/import/listenbrainz` | Auth | Import by ListenBrainz username |
 | POST | `/api/v1/import/lastfm` | Auth | Import by Last.fm username (needs `LASTFM_API_KEY`) |
 | POST | `/api/v1/import/file` | Auth | Import an uploaded `.json`/`.csv` |

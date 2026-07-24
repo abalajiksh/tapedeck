@@ -1,9 +1,11 @@
 use async_trait::async_trait;
-use reqwest::{Client, Response};
+use reqwest::Client;
 use crate::models::Play;
 use super::ScrobbleSink;
-use tracing::{info, error, debug};
+use tracing::{info, warn, error, debug};
 use std::collections::HashMap;
+use std::time::Duration;
+use tokio::time::sleep;
 
 /// A scrobble sink for Last.fm-compatible APIs (Last.fm, Libre.fm, or any GNU FM instance).
 pub struct LastFmSink {
@@ -143,18 +145,43 @@ impl ScrobbleSink for LastFmSink {
 
             let form_data: HashMap<String, String> = params.into_iter().collect();
 
-            let resp: Response = self.client.post(self.api_endpoint())
-                .form(&form_data)
-                .send()
-                .await?;
-
-            if !resp.status().is_success() {
-                let error_text = resp.text().await.unwrap_or_default();
-                error!("{} submission failed: {}", self.service_name, error_text);
-                return Err(format!("{} API Error: {}", self.service_name, error_text).into());
+            // Retry transient failures with exponential backoff so a flaky
+            // network or a brief service outage doesn't fail the scrobble.
+            const MAX_RETRIES: u32 = 3;
+            let mut backoff = 2u64;
+            let mut attempt = 0u32;
+            loop {
+                attempt += 1;
+                match self.client.post(self.api_endpoint()).form(&form_data).send().await {
+                    Ok(resp) if resp.status().is_success() => {
+                        debug!("Successfully submitted chunk of {} plays to {}", chunk.len(), self.service_name);
+                        break;
+                    }
+                    Ok(resp) => {
+                        let status = resp.status();
+                        let error_text = resp.text().await.unwrap_or_default();
+                        if attempt >= MAX_RETRIES {
+                            error!("{} submission failed after {} attempts (status {}): {}",
+                                self.service_name, attempt, status, error_text);
+                            return Err(format!("{} API Error: {}", self.service_name, error_text).into());
+                        }
+                        warn!("{} submission failed (status {}), retry {}/{} in {}s",
+                            self.service_name, status, attempt, MAX_RETRIES, backoff);
+                        sleep(Duration::from_secs(backoff)).await;
+                        backoff *= 2;
+                    }
+                    Err(e) => {
+                        if attempt >= MAX_RETRIES {
+                            error!("{} request failed after {} attempts: {}", self.service_name, attempt, e);
+                            return Err(Box::new(e));
+                        }
+                        warn!("{} request error, retry {}/{} in {}s: {}",
+                            self.service_name, attempt, MAX_RETRIES, backoff, e);
+                        sleep(Duration::from_secs(backoff)).await;
+                        backoff *= 2;
+                    }
+                }
             }
-
-            debug!("Successfully submitted chunk of {} plays to {}", chunk.len(), self.service_name);
         }
 
         info!("✅ Successfully submitted {} plays to {}", plays.len(), self.service_name);

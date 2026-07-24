@@ -7,11 +7,13 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use crate::db::Database;
 use crate::logging::LogLevelHandle;
 
 #[derive(Clone)]
 pub struct AdminState {
     pub log_handle: LogLevelHandle,
+    pub db: Arc<Database>,
 }
 
 #[derive(Serialize)]
@@ -55,16 +57,19 @@ async fn set_log_level(
     }
 }
 
-async fn health_check() -> impl IntoResponse {
-    Json(serde_json::json!({
-        "status": "ok",
+async fn health_check(State(state): State<Arc<AdminState>>) -> impl IntoResponse {
+    let db_ok = state.db.ping().await.is_ok();
+    let code = if db_ok { StatusCode::OK } else { StatusCode::SERVICE_UNAVAILABLE };
+    (code, Json(serde_json::json!({
+        "status": if db_ok { "ok" } else { "degraded" },
         "service": "tapedeck",
-	"version": env!("CARGO_PKG_VERSION"),
-    }))
+        "database": if db_ok { "ok" } else { "unreachable" },
+        "version": env!("CARGO_PKG_VERSION"),
+    })))
 }
 
-pub fn create_admin_router(log_handle: LogLevelHandle) -> Router {
-    let state = Arc::new(AdminState { log_handle });
+pub fn create_admin_router(log_handle: LogLevelHandle, db: Arc<Database>) -> Router {
+    let state = Arc::new(AdminState { log_handle, db });
 
     Router::new()
         .route("/health", get(health_check))

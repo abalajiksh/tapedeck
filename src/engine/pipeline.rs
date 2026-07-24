@@ -35,9 +35,20 @@ impl ScrobbleEngine {
     }
 
     pub async fn run(&mut self) -> ! {
+        use futures_util::future::FutureExt;
+        use std::panic::AssertUnwindSafe;
+
         info!("🎵 Starting scrobble loop with prioritized MusicBrainz metadata enrichment...");
         loop {
-            self.run_tick().await;
+            // Isolate each tick: a panic here would otherwise kill the engine
+            // task while the HTTP server keeps running, silently stopping all
+            // scrobbling. Catch it, log it, and carry on next tick.
+            if let Err(p) = AssertUnwindSafe(self.run_tick()).catch_unwind().await {
+                let msg = p.downcast_ref::<&str>().map(|s| s.to_string())
+                    .or_else(|| p.downcast_ref::<String>().cloned())
+                    .unwrap_or_else(|| "unknown panic".into());
+                error!("💥 Scrobble tick panicked (recovered): {}", msg);
+            }
             sleep(self.poll_interval).await;
         }
     }
@@ -144,38 +155,46 @@ impl ScrobbleEngine {
     }
 
     async fn flush_pending(&mut self) {
-        match self.db.get_pending_scrobbles().await {
-            Ok(pending_plays) => {
-                if pending_plays.is_empty() { return; }
-                info!("🔄 Processing {} pending scrobble(s)", pending_plays.len());
+        let pending = match self.db.get_pending_scrobbles().await {
+            Ok(p) => p,
+            Err(e) => { error!("Failed to fetch pending scrobbles: {}", e); return; }
+        };
+        if pending.is_empty() { return; }
+        info!("🔄 Processing {} pending scrobble(s)", pending.len());
 
-                for (user_id, mut play) in pending_plays {
-                    if play.mbid_recording.is_none() {
-                        let album_hint = play.album.clone();
-                        enrich_play(&self.mb_client, &mut play, album_hint.as_deref()).await;
-                    }
+        let enabled: Vec<String> = self.sinks.iter().map(|s| s.name().to_string()).collect();
 
-                    let mut all_succeeded = true;
-                    for sink in self.sinks.iter() {
-                        match sink.scrobble(&[play.clone()]).await {
-                            Ok(_) => debug!("Sent to {}", sink.name()),
-                            Err(e) => {
-                                error!("Failed to send to {}: {}", sink.name(), e);
-                                all_succeeded = false;
-                            }
+        for mut ps in pending {
+            if ps.play.mbid_recording.is_none() {
+                let album_hint = ps.play.album.clone();
+                enrich_play(&self.mb_client, &mut ps.play, album_hint.as_deref()).await;
+            }
+
+            // Only send to sinks that haven't already accepted this listen, so a
+            // retry after a partial failure can't double-scrobble.
+            for sink in self.sinks.iter() {
+                let name = sink.name().to_string();
+                if ps.delivered.contains(&name) { continue; }
+                match sink.scrobble(&[ps.play.clone()]).await {
+                    Ok(_) => {
+                        ps.delivered.push(name.clone());
+                        if let Err(e) = self.db.mark_sink_delivered(ps.id, &name).await {
+                            error!("Failed to record delivery to {}: {}", name, e);
                         }
                     }
-
-                    if all_succeeded {
-                        if let Err(e) = self.db.mark_as_scrobbled(user_id, &play.source_id, &play.source_name).await {
-                            error!("Failed to mark as scrobbled: {}", e);
-                        } else {
-                            info!("✅ Synced: {} - {}", play.artist, play.title);
-                        }
-                    }
+                    Err(e) => error!("Failed to send to {}: {}", name, e),
                 }
             }
-            Err(e) => error!("Failed to fetch pending scrobbles: {}", e),
+
+            // Fully synced once every enabled sink has accepted it (trivially
+            // true when no sinks are configured — store-locally-only mode).
+            if enabled.iter().all(|n| ps.delivered.contains(n)) {
+                if let Err(e) = self.db.mark_scrobble_synced(ps.id).await {
+                    error!("Failed to mark synced: {}", e);
+                } else {
+                    info!("✅ Synced: {} - {}", ps.play.artist, ps.play.title);
+                }
+            }
         }
     }
 }

@@ -11,7 +11,7 @@ mod users;
 
 use std::sync::Arc;
 
-use axum::{routing::post, Router};
+use axum::{extract::DefaultBodyLimit, routing::post, Router};
 
 use crate::db::Database;
 use crate::logging::LogLevelHandle;
@@ -33,7 +33,7 @@ pub struct AppState {
 
 /// Build the full Axum application.
 pub fn build_app(state: Arc<AppState>) -> Router {
-    let admin = admin::create_admin_router(state.log_handle.clone());
+    let admin = admin::create_admin_router(state.log_handle.clone(), state.db.clone());
     let auth_router = users::create_auth_router();
     let user_mgmt = users::create_user_management_router();
     let gear = chains::create_gear_router();
@@ -57,4 +57,7 @@ pub fn build_app(state: Arc<AppState>) -> Router {
         .merge(admin)
         .merge(api)
         .fallback(web_assets::spa_fallback)
+        // Allow large uploads (full history exports for import) — axum defaults
+        // to 2MB, which rejects real Last.fm/ListenBrainz dumps.
+        .layer(DefaultBodyLimit::max(64 * 1024 * 1024))
 }

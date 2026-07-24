@@ -266,6 +266,12 @@ class TapedeckAPI {
 		return res.blob();
 	}
 
+	async backupBlob(): Promise<Blob> {
+		const res = await fetch(`${BASE}/api/v1/backup`, { credentials: 'same-origin' });
+		if (!res.ok) throw new Error(`API ${res.status}: ${await res.text()}`);
+		return res.blob();
+	}
+
 	// ── Import ──
 	async importListenBrainz(username: string, token?: string): Promise<{ job_id: string }> {
 		return this.post('/api/v1/import/listenbrainz', { username, token });

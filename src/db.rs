@@ -1,5 +1,6 @@
-use sqlx::{sqlite::{SqlitePoolOptions, SqliteConnectOptions}, Pool, Sqlite, FromRow};
+use sqlx::{sqlite::{SqlitePoolOptions, SqliteConnectOptions, SqliteJournalMode, SqliteSynchronous}, Pool, Sqlite, FromRow};
 use std::str::FromStr;
+use std::time::Duration;
 use crate::models::*;
 use tracing::{info, debug};
 use sha2::{Sha256, Digest};
@@ -44,6 +45,17 @@ pub struct ScrobbleRecord {
     pub session_id: Option<i64>,
     pub listening_context: Option<String>,
     pub submission_client: Option<String>,
+    #[serde(default)]
+    pub delivered_sinks: Option<String>,
+}
+
+/// A pending scrobble awaiting delivery, with the set of sinks it has already
+/// been delivered to (so retries only hit sinks that haven't succeeded).
+pub struct PendingScrobble {
+    pub id: i64,
+    pub user_id: i64,
+    pub play: Play,
+    pub delivered: Vec<String>,
 }
 
 #[derive(Debug, FromRow, serde::Serialize)]
@@ -75,8 +87,15 @@ pub struct Database {
 
 impl Database {
     pub async fn new(database_url: &str) -> Result<Self, sqlx::Error> {
+        // WAL + a busy_timeout let concurrent writers (poll engine, HTTP
+        // handlers, background imports) wait for the lock instead of erroring
+        // out with SQLITE_BUSY — which would otherwise drop listens on ingest.
         let options = SqliteConnectOptions::from_str(database_url)?
-            .create_if_missing(true);
+            .create_if_missing(true)
+            .journal_mode(SqliteJournalMode::Wal)
+            .busy_timeout(Duration::from_secs(10))
+            .synchronous(SqliteSynchronous::Normal)
+            .foreign_keys(true);
         let pool = SqlitePoolOptions::new()
             .max_connections(5)
             .connect_with(options).await?;
@@ -106,6 +125,7 @@ impl Database {
                 chain_id INTEGER REFERENCES signal_chains(id),
                 session_id INTEGER REFERENCES sessions(id),
                 listening_context TEXT, submission_client TEXT,
+                delivered_sinks TEXT NOT NULL DEFAULT '[]',
                 UNIQUE(user_id, source_id, source_name)
             )"
         ).execute(&self.pool).await?;
@@ -286,6 +306,13 @@ impl Database {
             let _ = sqlx::query("UPDATE users SET role = 'admin' WHERE id = 1")
                 .execute(&self.pool).await;
             info!("✅ Role migration complete");
+        }
+
+        // Migration 5: per-sink delivery tracking
+        if !has_column(&self.pool, "scrobbles", "delivered_sinks").await {
+            info!("⚙️ Migrating: adding delivered_sinks...");
+            let _ = sqlx::query("ALTER TABLE scrobbles ADD COLUMN delivered_sinks TEXT NOT NULL DEFAULT '[]'")
+                .execute(&self.pool).await;
         }
 
         Ok(())
@@ -488,28 +515,68 @@ impl Database {
         Ok(count.0 > 0)
     }
 
-    pub async fn get_pending_scrobbles(&self) -> Result<Vec<(i64, Play)>, sqlx::Error> {
+    pub async fn get_pending_scrobbles(&self) -> Result<Vec<PendingScrobble>, sqlx::Error> {
         let records: Vec<ScrobbleRecord> = sqlx::query_as::<_, ScrobbleRecord>(
             "SELECT * FROM scrobbles WHERE status = 'pending' ORDER BY timestamp ASC"
         ).fetch_all(&self.pool).await?;
 
         Ok(records.into_iter().map(|r| {
-            let user_id = r.user_id;
             let mbid_artist = r.mbid_artist.and_then(|s| serde_json::from_str::<Vec<String>>(&s).ok());
-            (user_id, Play {
-                title: r.title, artist: r.artist, album: r.album,
-                timestamp: r.timestamp as u64, duration: r.duration.map(|d| d as u64),
-                track_number: None, source_id: r.source_id, source_name: r.source_name,
-                mbid_recording: r.mbid_recording, mbid_release: r.mbid_release,
-                mbid_artist, artists: None, mbid_release_group: None,
-                caa_id: r.caa_id, caa_release_mbid: r.caa_release_mbid,
-            })
+            let delivered = r.delivered_sinks.as_deref()
+                .and_then(|s| serde_json::from_str::<Vec<String>>(s).ok())
+                .unwrap_or_default();
+            PendingScrobble {
+                id: r.id,
+                user_id: r.user_id,
+                delivered,
+                play: Play {
+                    title: r.title, artist: r.artist, album: r.album,
+                    timestamp: r.timestamp as u64, duration: r.duration.map(|d| d as u64),
+                    track_number: None, source_id: r.source_id, source_name: r.source_name,
+                    mbid_recording: r.mbid_recording, mbid_release: r.mbid_release,
+                    mbid_artist, artists: None, mbid_release_group: None,
+                    caa_id: r.caa_id, caa_release_mbid: r.caa_release_mbid,
+                },
+            }
         }).collect())
     }
 
-    pub async fn mark_as_scrobbled(&self, user_id: i64, source_id: &str, source_name: &str) -> Result<(), sqlx::Error> {
-        sqlx::query("UPDATE scrobbles SET status = 'synced' WHERE user_id = ? AND source_id = ? AND source_name = ?")
-            .bind(user_id).bind(source_id).bind(source_name).execute(&self.pool).await?;
+    /// Append a sink to a scrobble's delivered set (idempotent). Prevents a
+    /// retry from re-sending to a sink that already accepted the listen.
+    pub async fn mark_sink_delivered(&self, id: i64, sink_name: &str) -> Result<(), sqlx::Error> {
+        let row: Option<(Option<String>,)> = sqlx::query_as("SELECT delivered_sinks FROM scrobbles WHERE id = ?")
+            .bind(id).fetch_optional(&self.pool).await?;
+        let mut set: Vec<String> = row.and_then(|(s,)| s)
+            .and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
+        if !set.iter().any(|s| s == sink_name) {
+            set.push(sink_name.to_string());
+            sqlx::query("UPDATE scrobbles SET delivered_sinks = ? WHERE id = ?")
+                .bind(serde_json::to_string(&set).unwrap_or_else(|_| "[]".into())).bind(id)
+                .execute(&self.pool).await?;
+        }
+        Ok(())
+    }
+
+    /// Mark a scrobble fully synced (delivered to every enabled sink).
+    pub async fn mark_scrobble_synced(&self, id: i64) -> Result<(), sqlx::Error> {
+        sqlx::query("UPDATE scrobbles SET status = 'synced' WHERE id = ?")
+            .bind(id).execute(&self.pool).await?;
+        Ok(())
+    }
+
+    /// Lightweight liveness check for the DB connection (used by /health).
+    pub async fn ping(&self) -> Result<(), sqlx::Error> {
+        sqlx::query("SELECT 1").execute(&self.pool).await?;
+        Ok(())
+    }
+
+    /// Write a consistent, compacted snapshot of the whole database to `path`
+    /// (`VACUUM INTO`), safe to run while the server is live — including under
+    /// WAL. The path must be server-controlled; single quotes are escaped since
+    /// VACUUM INTO takes a string literal, not a bound parameter.
+    pub async fn backup_to(&self, path: &str) -> Result<(), sqlx::Error> {
+        let safe = path.replace('\'', "''");
+        sqlx::query(&format!("VACUUM INTO '{}'", safe)).execute(&self.pool).await?;
         Ok(())
     }
 
@@ -915,7 +982,7 @@ impl Database {
     /// Bulk-reassign the chain for a set of listens (History bulk edit).
     pub async fn bulk_set_scrobble_chain(&self, user_id: i64, ids: &[i64], chain_id: Option<i64>) -> Result<u64, sqlx::Error> {
         if ids.is_empty() { return Ok(0); }
-        let placeholders = std::iter::repeat("?").take(ids.len()).collect::<Vec<_>>().join(",");
+        let placeholders = vec!["?"; ids.len()].join(",");
         let sql = format!("UPDATE scrobbles SET chain_id = ? WHERE user_id = ? AND id IN ({})", placeholders);
         let mut q = sqlx::query(&sql).bind(chain_id).bind(user_id);
         for id in ids { q = q.bind(id); }
@@ -978,6 +1045,7 @@ impl Database {
             .bind(user_id).fetch_all(&self.pool).await
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn update_equipment(&self, user_id: i64, id: i64, name: &str, equipment_type: &str,
         brand: Option<&str>, model: Option<&str>, notes: Option<&str>) -> Result<bool, sqlx::Error> {
         let res = sqlx::query(
@@ -1159,4 +1227,94 @@ pub struct EquipmentRow {
     pub brand: Option<String>, pub model: Option<String>,
     pub total_hours: f64, pub first_used: Option<i64>,
     pub last_used: Option<i64>, pub notes: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    static N: AtomicU32 = AtomicU32::new(0);
+
+    async fn testdb() -> Database {
+        let n = N.fetch_add(1, Ordering::SeqCst);
+        let path = std::env::temp_dir().join(format!("td-test-{}-{}.db", std::process::id(), n));
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{}", path.display(), suffix));
+        }
+        Database::new(&format!("sqlite:{}", path.display())).await.unwrap()
+    }
+
+    fn play(title: &str, artist: &str, ts: u64) -> Play {
+        Play::new(title.into(), artist.into(), ts, format!("src-{ts}"), "test".into())
+    }
+
+    #[tokio::test]
+    async fn dedup_rejects_duplicate_source() {
+        let db = testdb().await;
+        let p = play("Teardrop", "Massive Attack", 1000);
+        assert!(db.save_scrobble(1, &p, None, None, None, None, None).await.unwrap());
+        // same source_id + name → deduped
+        assert!(!db.save_scrobble(1, &p, None, None, None, None, None).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn per_sink_delivery_is_tracked() {
+        let db = testdb().await;
+        db.save_scrobble(1, &play("T", "A", 2000), None, None, None, None, None).await.unwrap();
+
+        let pending = db.get_pending_scrobbles().await.unwrap();
+        assert_eq!(pending.len(), 1);
+        assert!(pending[0].delivered.is_empty());
+        let id = pending[0].id;
+
+        db.mark_sink_delivered(id, "lastfm").await.unwrap();
+        db.mark_sink_delivered(id, "lastfm").await.unwrap(); // idempotent
+        let pending = db.get_pending_scrobbles().await.unwrap();
+        assert_eq!(pending[0].delivered, vec!["lastfm".to_string()]);
+
+        // still pending until marked synced
+        db.mark_scrobble_synced(id).await.unwrap();
+        assert!(db.get_pending_scrobbles().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn chain_name_and_output_binding_resolve() {
+        let db = testdb().await;
+        let uid = db.create_user("alice", None, "not-used-yet", "admin").await.unwrap();
+        let chain = SignalChain {
+            id: None, user_id: uid, name: "Desktop".into(), description: None,
+            components: vec![], listening_context: ListeningContext::Active,
+            is_active: true, total_hours: 0.0, created_at: 0,
+        };
+        let cid = db.create_chain(&chain).await.unwrap();
+
+        // name → id (case-insensitive)
+        assert_eq!(db.get_chain_by_name(uid, "desktop").await.unwrap(), Some(cid));
+        assert_eq!(db.get_chain_by_name(uid, "nope").await.unwrap(), None);
+
+        // auto-learn an output, unmapped resolves to None, then bind it
+        db.record_output(uid, "Schiit Mimir", Some("usb")).await.unwrap();
+        assert_eq!(db.resolve_binding(uid, "Schiit Mimir").await.unwrap(), None);
+        db.set_binding(uid, "Schiit Mimir", Some(cid)).await.unwrap();
+        assert_eq!(db.resolve_binding(uid, "Schiit Mimir").await.unwrap(), Some(cid));
+    }
+
+    #[tokio::test]
+    async fn bulk_set_chain_updates_only_targets() {
+        let db = testdb().await;
+        let uid = db.create_user("bob", None, "not-used-yet", "admin").await.unwrap();
+        let cid = db.create_chain(&SignalChain {
+            id: None, user_id: uid, name: "C".into(), description: None, components: vec![],
+            listening_context: ListeningContext::Active, is_active: true, total_hours: 0.0, created_at: 0,
+        }).await.unwrap();
+        db.save_scrobble(uid, &play("a", "x", 10), None, None, None, None, None).await.unwrap();
+        db.save_scrobble(uid, &play("b", "y", 20), None, None, None, None, None).await.unwrap();
+        let ids: Vec<i64> = db.get_all_scrobbles(uid).await.unwrap().iter().map(|r| r.id).collect();
+
+        let n = db.bulk_set_scrobble_chain(uid, &ids[..1], Some(cid)).await.unwrap();
+        assert_eq!(n, 1);
+        let rows = db.get_all_scrobbles(uid).await.unwrap();
+        assert_eq!(rows.iter().filter(|r| r.chain_id == Some(cid)).count(), 1);
+    }
 }
