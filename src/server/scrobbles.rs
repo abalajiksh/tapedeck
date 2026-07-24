@@ -219,6 +219,39 @@ async fn bulk_set_chain(
     }
 }
 
+/// GET /api/v1/languages/status — instance-wide classification coverage.
+async fn language_status(
+    State(state): State<Arc<AppState>>,
+    _user: AuthUser,
+) -> impl IntoResponse {
+    match state.db.language_coverage().await {
+        Ok((total, resolved)) => (StatusCode::OK, Json(serde_json::json!({
+            "total": total, "resolved": resolved, "pending": total - resolved,
+        }))).into_response(),
+        Err(e) => server_error(e.to_string()),
+    }
+}
+
+/// POST /api/v1/languages/backfill — admin: run a full classification pass in
+/// the background (script instantly, MusicBrainz for the rest).
+async fn backfill_languages_now(
+    State(state): State<Arc<AppState>>,
+    user: AuthUser,
+) -> impl IntoResponse {
+    if !user.is_admin {
+        return (StatusCode::FORBIDDEN, Json(serde_json::json!(
+            ErrorResponse { code: 403, error: "Admin only".into() }
+        ))).into_response();
+    }
+    let (db, mb) = (state.db.clone(), state.mb_client.clone());
+    tokio::spawn(async move {
+        loop {
+            if crate::enrich::backfill_languages(&db, &mb, 200, 200).await == 0 { break; }
+        }
+    });
+    (StatusCode::ACCEPTED, Json(serde_json::json!({ "status": "started" }))).into_response()
+}
+
 fn not_found() -> axum::response::Response {
     (StatusCode::NOT_FOUND, Json(serde_json::json!(
         ErrorResponse { code: 404, error: "Scrobble not found".into() }
@@ -239,4 +272,6 @@ pub fn create_scrobbles_router() -> Router<Arc<AppState>> {
         .route("/api/v1/stats/dashboard", get(dashboard_stats))
         .route("/api/v1/stats", get(ranged_stats))
         .route("/api/v1/personality", get(personality))
+        .route("/api/v1/languages/status", get(language_status))
+        .route("/api/v1/languages/backfill", axum::routing::post(backfill_languages_now))
 }

@@ -272,6 +272,13 @@ class TapedeckAPI {
 		return this.get(`/api/v1/personality?range=${range}`);
 	}
 
+	async getLanguageStatus(): Promise<{ total: number; resolved: number; pending: number }> {
+		return this.get('/api/v1/languages/status');
+	}
+	async backfillLanguages(): Promise<{ status: string }> {
+		return this.post('/api/v1/languages/backfill');
+	}
+
 	async patchScrobble(id: number, changes: Partial<{
 		title: string; artist: string; album: string; mbid_recording: string;
 		signal_chain_id: number; listening_context: string; format_type: string; codec: string;

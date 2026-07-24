@@ -423,6 +423,8 @@ the `td_session` cookie set by the web UI login.
 | GET | `/api/v1/stats/dashboard` | Auth | Dashboard summary counts |
 | GET | `/api/v1/stats?range=` | Auth | Ranged analytics (`week`/`month`/`last30`/`year`/`all`) |
 | GET | `/api/v1/personality?range=` | Auth | Five-axis listening personality + per-artist loyalty |
+| GET | `/api/v1/languages/status` | Auth | Language-classification coverage |
+| POST | `/api/v1/languages/backfill` | Admin | Run a full language-classification pass |
 
 ### Preferences, Export & Import
 

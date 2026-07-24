@@ -2,6 +2,8 @@ mod analytics;
 mod config;
 mod db;
 mod engine;
+mod enrich;
+mod language;
 mod logging;
 mod models;
 mod musicbrainz;

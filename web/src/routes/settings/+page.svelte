@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { onMount } from 'svelte';
+	import { onMount, onDestroy } from 'svelte';
 	import { api } from '$lib/api';
 	import type { TokenInfo } from '$lib/api';
 	import { formatDateTime } from '$lib/utils';
@@ -29,6 +29,31 @@
 
 	let timezone = '';
 	let tzSaved = false;
+
+	// language enrichment
+	let isAdmin = false;
+	let langStatus: { total: number; resolved: number; pending: number } | null = null;
+	let enriching = false;
+	let langPoll: ReturnType<typeof setInterval> | null = null;
+	async function loadLangStatus() {
+		try { langStatus = await api.getLanguageStatus(); } catch { /* optional */ }
+	}
+	async function runEnrichment() {
+		enriching = true;
+		try {
+			await api.backfillLanguages();
+			// poll progress until it stops moving
+			langPoll = setInterval(async () => {
+				const prev = langStatus?.pending ?? -1;
+				await loadLangStatus();
+				if (langStatus && (langStatus.pending === 0 || langStatus.pending === prev)) {
+					if (langPoll) clearInterval(langPoll);
+					langPoll = null;
+					enriching = false;
+				}
+			}, 2000);
+		} catch (e) { enriching = false; alert(String(e).replace(/^API \d+: /, '')); }
+	}
 	async function saveTimezone() {
 		try { await api.putPreferences({ timezone: timezone.trim() }); tzSaved = true; setTimeout(() => (tzSaved = false), 2000); }
 		catch { /* ignore */ }
@@ -100,9 +125,13 @@
 			const prefs = await api.getPreferences();
 			timezone = (prefs.timezone as string) || Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC';
 		} catch { timezone = 'UTC'; }
+		try { isAdmin = (await api.me()).is_admin; } catch { /* optional */ }
 		loadConnections();
+		loadLangStatus();
 		loading = false;
 	});
+
+	onDestroy(() => { if (langPoll) clearInterval(langPoll); });
 
 	async function createToken() {
 		if (!newTokenName.trim()) return;
@@ -209,6 +238,20 @@
 		</div>
 	</div>
 </div>
+
+<!-- Language enrichment (admin) -->
+{#if isAdmin}
+	<div class="panel" style="border-radius:22px;padding:24px;margin-bottom:18px;">
+		<h3 class="h-display" style="font-size:19px;margin-bottom:4px;">Language Enrichment</h3>
+		<p style="font-size:13px;color:var(--td-muted);margin:0 0 16px;">Classify listens by language for the Analytics breakdown — instant for non-Latin scripts, MusicBrainz (rate-limited) for the rest. Runs automatically in the background; use this to fill the backlog now.</p>
+		<div style="display:flex;align-items:center;gap:14px;flex-wrap:wrap;">
+			<button class="btn btn-primary" on:click={runEnrichment} disabled={enriching}>{enriching ? 'Enriching…' : 'Enrich languages'}</button>
+			{#if langStatus}
+				<span style="font-size:13.5px;color:var(--td-muted);">{langStatus.resolved} / {langStatus.total} classified{langStatus.pending ? ` · ${langStatus.pending} pending` : ''}</span>
+			{/if}
+		</div>
+	</div>
+{/if}
 
 <!-- Connections -->
 <div class="panel" style="border-radius:22px;padding:24px;margin-bottom:18px;">

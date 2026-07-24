@@ -127,6 +127,7 @@ impl Database {
                 listening_context TEXT, submission_client TEXT,
                 delivered_sinks TEXT NOT NULL DEFAULT '[]',
                 track_number INTEGER,
+                language TEXT,
                 UNIQUE(user_id, source_id, source_name)
             )"
         ).execute(&self.pool).await?;
@@ -342,6 +343,13 @@ impl Database {
         if !has_column(&self.pool, "scrobbles", "track_number").await {
             info!("⚙️ Migrating: adding scrobbles.track_number...");
             let _ = sqlx::query("ALTER TABLE scrobbles ADD COLUMN track_number INTEGER")
+                .execute(&self.pool).await;
+        }
+
+        // Migration 8: language on scrobbles (language breakdown analytics)
+        if !has_column(&self.pool, "scrobbles", "language").await {
+            info!("⚙️ Migrating: adding scrobbles.language...");
+            let _ = sqlx::query("ALTER TABLE scrobbles ADD COLUMN language TEXT")
                 .execute(&self.pool).await;
         }
 
@@ -645,6 +653,29 @@ impl Database {
         ).bind(user_id).bind(after).bind(after).fetch_all(&self.pool).await
     }
 
+    // ── Language enrichment ──
+
+    /// Listens still needing a language, newest first. (id, title, album, mbid_recording)
+    pub async fn scrobbles_needing_language(&self, limit: i64) -> Result<Vec<(i64, String, Option<String>, Option<String>)>, sqlx::Error> {
+        sqlx::query_as(
+            "SELECT id, title, album, mbid_recording FROM scrobbles
+             WHERE language IS NULL ORDER BY timestamp DESC LIMIT ?"
+        ).bind(limit).fetch_all(&self.pool).await
+    }
+
+    pub async fn set_scrobble_language(&self, id: i64, language: &str) -> Result<(), sqlx::Error> {
+        sqlx::query("UPDATE scrobbles SET language = ? WHERE id = ?")
+            .bind(language).bind(id).execute(&self.pool).await?;
+        Ok(())
+    }
+
+    /// (total, with a language set) — for backfill progress.
+    pub async fn language_coverage(&self) -> Result<(i64, i64), sqlx::Error> {
+        let total: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM scrobbles").fetch_one(&self.pool).await?;
+        let done: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM scrobbles WHERE language IS NOT NULL").fetch_one(&self.pool).await?;
+        Ok((total.0, done.0))
+    }
+
     pub async fn get_dashboard_stats(&self, user_id: i64) -> Result<serde_json::Value, sqlx::Error> {
         let now = Self::now_secs();
         let today_start = now - (now % 86400);
@@ -813,6 +844,17 @@ impl Database {
             serde_json::json!({ "name": name, "plays": plays, "hours": (secs.unwrap_or(0) as f64 / 3600.0 * 10.0).round() / 10.0 })
         }).collect();
 
+        // Language breakdown (only listens that have been classified).
+        let lang_rows: Vec<(String, i64)> = sqlx::query_as(
+            "SELECT language, COUNT(*) as c FROM scrobbles
+             WHERE user_id = ? AND (? IS NULL OR timestamp >= ?) AND language IS NOT NULL
+             GROUP BY language ORDER BY c DESC LIMIT 12"
+        ).bind(user_id).bind(after).bind(after).fetch_all(&self.pool).await?;
+        let lang_total: i64 = lang_rows.iter().map(|(_, c)| c).sum();
+        let languages: Vec<serde_json::Value> = lang_rows.into_iter().map(|(name, c)| {
+            serde_json::json!({ "name": name, "pct": if lang_total > 0 { (c as f64 / lang_total as f64 * 100.0).round() as i64 } else { 0 } })
+        }).collect();
+
         Ok(serde_json::json!({
             "totals": {
                 "plays": total, "hours": (hours * 10.0).round() / 10.0,
@@ -821,7 +863,7 @@ impl Database {
                 "lossless_pct": pct(lossless.0), "dsd_pct": pct(dsd.0),
             },
             "top_artists": top_artists,
-            "genres": [], "languages": [], "regions": [], "decades": [],
+            "genres": [], "languages": languages, "regions": [], "decades": [],
             // heatmap is filled in by the handler in the user's local timezone
             "heatmap": Vec::<Vec<i64>>::new(),
         }))

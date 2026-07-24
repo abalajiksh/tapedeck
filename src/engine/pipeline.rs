@@ -172,6 +172,10 @@ impl ScrobbleEngine {
         {
             plex.cleanup_sessions(3600);
         }
+
+        // Incrementally classify listen languages (script instantly, a few
+        // MusicBrainz lookups per tick to respect the rate limit).
+        crate::enrich::backfill_languages(&self.db, &self.mb_client, 50, 8).await;
     }
 
     async fn submit_now_playing_to(sinks: &[Box<dyn ScrobbleSink>], play: &Play) {

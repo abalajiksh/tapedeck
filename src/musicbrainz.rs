@@ -470,12 +470,79 @@ impl MusicBrainzClient {
 
             CREATE INDEX IF NOT EXISTS idx_mb_cache_mbid
             ON musicbrainz_cache(track_mbid, artist_mbid);
+
+            CREATE TABLE IF NOT EXISTS mb_language_cache (
+                recording_mbid TEXT PRIMARY KEY,
+                language TEXT,          -- NULL/'' = looked up, none found
+                fetched_at INTEGER NOT NULL
+            );
             "#
         )
             .execute(&self.sqlite_pool)
             .await?;
 
         Ok(())
+    }
+
+    /// Resolve the language of a recording via its linked MusicBrainz *work*.
+    /// Postgres dump first (instant, local), then the API (rate-limited), cached
+    /// by recording MBID. Returns `Ok(None)` when no work-language is available;
+    /// the negative result is cached too so we don't re-query.
+    pub async fn fetch_recording_language(&self, recording_mbid: &str) -> Result<Option<String>> {
+        let cached: Option<(Option<String>,)> = sqlx::query_as(
+            "SELECT language FROM mb_language_cache WHERE recording_mbid = ?"
+        ).bind(recording_mbid).fetch_optional(&self.sqlite_pool).await.unwrap_or(None);
+        if let Some((lang,)) = cached {
+            return Ok(lang.filter(|s| !s.is_empty()));
+        }
+
+        let mut resolved: Option<String> = None;
+
+        // Tier 1: Postgres MB dump — l_recording_work → work_language → language.
+        if let Some(pool) = &self.postgres_pool {
+            let row: Option<(String,)> = sqlx::query_as(
+                r#"
+                SELECT lang.name
+                FROM recording r
+                JOIN l_recording_work lrw ON lrw.entity0 = r.id
+                JOIN work w ON w.id = lrw.entity1
+                JOIN work_language wl ON wl.work = w.id
+                JOIN language lang ON lang.id = wl.language
+                WHERE r.gid = $1::uuid
+                LIMIT 1
+                "#
+            ).bind(recording_mbid).fetch_optional(pool).await.unwrap_or(None);
+            if let Some((name,)) = row {
+                resolved = Some(name); // Postgres `language.name` is already a display name
+            }
+        }
+
+        // Tier 2: API — recording?inc=work-rels → work.languages[0] (ISO 639-3).
+        if resolved.is_none() {
+            self.rate_limiter.acquire().await;
+            let url = format!("{}/recording/{}?inc=work-rels&fmt=json", self.config.api_base_url, recording_mbid);
+            if let Ok(resp) = self.http_client.get(&url).header("User-Agent", &self.config.user_agent).send().await {
+                if resp.status().is_success() {
+                    if let Ok(v) = resp.json::<serde_json::Value>().await {
+                        resolved = v["relations"].as_array().into_iter().flatten()
+                            .filter(|rel| rel["target-type"] == "work")
+                            .find_map(|rel| {
+                                let w = &rel["work"];
+                                w["languages"].as_array().and_then(|ls| ls.first()).and_then(|l| l.as_str())
+                                    .or_else(|| w["language"].as_str())
+                                    .map(crate::language::iso_to_display)
+                            });
+                    }
+                }
+            }
+        }
+
+        let _ = sqlx::query(
+            "INSERT OR REPLACE INTO mb_language_cache (recording_mbid, language, fetched_at) VALUES (?, ?, ?)"
+        ).bind(recording_mbid).bind(resolved.clone().unwrap_or_default())
+         .bind(chrono::Utc::now().timestamp()).execute(&self.sqlite_pool).await;
+
+        Ok(resolved)
     }
 }
 

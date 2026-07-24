@@ -143,7 +143,20 @@
 				<span style="width:13px;height:13px;border-radius:3px;background:rgba(198,113,57,.92);"></span>More</div>
 		</div>
 	</div>
-	<p style="color:var(--td-muted-3);font-size:12.5px;margin:16px 0 0;">Genre, language, and region breakdowns appear once MusicBrainz enrichment is available.</p>
+	<!-- Languages -->
+	{#if stats.languages.length}
+		<h3 class="h-display" style="font-size:19px;margin:24px 0 12px;">Languages</h3>
+		<div class="panel" style="border-radius:22px;padding:22px;">
+			{#each stats.languages as l}
+				<div style="margin-bottom:12px;">
+					<div style="display:flex;justify-content:space-between;font-size:13px;margin-bottom:5px;"><span style="font-weight:600;">{l.name}</span><span style="color:var(--td-muted-2);">{l.pct}%</span></div>
+					<div style="height:10px;border-radius:999px;background:var(--td-track);overflow:hidden;"><div style="width:{l.pct}%;height:100%;background:linear-gradient(90deg,#7a8a5e,#aebf92);border-radius:999px;"></div></div>
+				</div>
+			{/each}
+		</div>
+	{:else}
+		<p style="color:var(--td-muted-3);font-size:12.5px;margin:16px 0 0;">Language breakdown fills in as listens are classified (Settings → run enrichment). Genre and region breakdowns are still to come.</p>
+	{/if}
 {/if}
 
 <style>
