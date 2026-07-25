@@ -1,8 +1,9 @@
 use axum::{
-    extract::State,
-    http::StatusCode,
+    extract::{Query, State},
+    http::{HeaderMap, StatusCode},
     response::{IntoResponse, Json},
 };
+use serde::Deserialize;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{debug, error, info, warn};
@@ -13,6 +14,64 @@ use super::auth::IngestAuth;
 use super::models::*;
 use super::now_playing::NowPlaying;
 use super::AppState;
+
+#[derive(Deserialize)]
+pub struct TokenQuery {
+    token: Option<String>,
+}
+
+/// GET /1/validate-token — the handshake ListenBrainz clients (Pano Scrobbler,
+/// multi-scrobbler, Web Scrobbler…) use to check a token before submitting.
+///
+/// Deliberately mirrors ListenBrainz's contract rather than Tapedeck's own
+/// conventions: the token may arrive in the `Authorization` header *or* as a
+/// `?token=` query parameter, and an invalid token is reported as HTTP 200 with
+/// `valid: false` — not a 401. Clients branch on that field, so returning an
+/// auth error here makes them report a server fault instead of a bad token.
+pub async fn validate_token(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(q): Query<TokenQuery>,
+) -> impl IntoResponse {
+    let header_token = headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|h| h.strip_prefix("Token ").or_else(|| h.strip_prefix("token ")))
+        .map(str::trim);
+
+    let token = header_token
+        .map(str::to_string)
+        .or_else(|| q.token.map(|t| t.trim().to_string()))
+        .unwrap_or_default();
+
+    if token.is_empty() {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "code": 400,
+            "error": "You need to provide an Authorization header.",
+        }))).into_response();
+    }
+
+    match state.db.validate_token(&token).await {
+        Ok(Some(user)) => (StatusCode::OK, Json(serde_json::json!({
+            "code": 200,
+            "message": "Token valid.",
+            "valid": true,
+            "user_name": user.username,
+        }))).into_response(),
+        Ok(None) => (StatusCode::OK, Json(serde_json::json!({
+            "code": 200,
+            "message": "Token invalid.",
+            "valid": false,
+        }))).into_response(),
+        Err(e) => {
+            error!("Token validation error: {}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+                "code": 500,
+                "error": "Internal server error",
+            }))).into_response()
+        }
+    }
+}
 
 /// POST /1/submit-listens
 pub async fn submit_listens(

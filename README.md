@@ -398,6 +398,7 @@ means session-only.
 
 | Method | Path | Auth | Description |
 |--------|------|------|-------------|
+| GET | `/1/validate-token` | Token | ListenBrainz-compatible token check (`{valid, user_name}`) |
 | POST | `/1/submit-listens` | Token | LB-compatible listen submission |
 
 ### Admin

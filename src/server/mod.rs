@@ -15,7 +15,7 @@ mod users;
 
 use std::sync::Arc;
 
-use axum::{extract::DefaultBodyLimit, routing::post, Router};
+use axum::{extract::DefaultBodyLimit, routing::{get, post}, Router};
 
 use crate::db::Database;
 use crate::logging::LogLevelHandle;
@@ -52,6 +52,7 @@ pub fn build_app(state: Arc<AppState>) -> Router {
 
     let api = Router::new()
         .route("/1/submit-listens", post(ingest::submit_listens))
+        .route("/1/validate-token", get(ingest::validate_token))
         .merge(auth_router)
         .merge(user_mgmt)
         .merge(gear)
