@@ -1,9 +1,10 @@
 //! Listen import: ListenBrainz / Last.fm public history + file upload.
 //!
-//! Jobs run as detached tokio tasks and report progress through an in-memory
-//! registry. ponytail: registry is in-memory, so job status + import history
-//! reset on restart — fine for a single-binary self-host; persist to a table if
-//! durable history is ever needed.
+//! Jobs run as detached tokio tasks. Live progress is tracked in an in-memory
+//! registry (for the polling `/jobs/:id` endpoint), while each job is also
+//! persisted to `import_jobs` at start and updated on completion — so history
+//! survives restarts and an interrupted job is recorded (marked `interrupted`
+//! on the next startup) rather than lost.
 
 use axum::{
     extract::{Multipart, Path, State},
@@ -29,6 +30,8 @@ pub struct ImportJob {
     pub job_id: String,
     #[serde(skip)]
     pub user_id: i64,             // owner (not serialized to clients)
+    #[serde(skip)]
+    pub db_id: i64,               // row in import_jobs (persisted for durable history)
     pub source: String,           // "listenbrainz" | "lastfm" | "file"
     pub state: String,            // "running" | "done" | "error"
     pub fetched: usize,           // listens pulled from the source
@@ -49,11 +52,12 @@ fn update<F: FnOnce(&mut ImportJob)>(reg: &ImportRegistry, id: &str, f: F) {
     }
 }
 
-/// Register a fresh running job and return its id.
-fn start(reg: &ImportRegistry, source: &str, user_id: i64) -> String {
+/// Register a fresh running job (persisted to the DB at start) and return its id.
+async fn start(reg: &ImportRegistry, db: &Database, source: &str, user_id: i64) -> String {
     let id = job_id();
+    let db_id = db.create_import_job(user_id, source).await.unwrap_or(0);
     let job = ImportJob {
-        job_id: id.clone(), user_id, source: source.into(), state: "running".into(),
+        job_id: id.clone(), user_id, db_id, source: source.into(), state: "running".into(),
         fetched: 0, imported: 0, total: None, status: "started".into(),
         date: chrono_now(),
     };
@@ -61,13 +65,12 @@ fn start(reg: &ImportRegistry, source: &str, user_id: i64) -> String {
     id
 }
 
-/// After a job finishes, persist its final state to the import history table so
-/// history survives restarts (the live registry stays in-memory for progress).
+/// After a job finishes, update its persisted row so history survives restarts
+/// (the live registry stays in-memory for progress).
 async fn persist_job(reg: &ImportRegistry, id: &str, db: &Database) {
     let job = reg.lock().ok().and_then(|m| m.get(id).cloned());
     if let Some(j) = job {
-        let _ = db.record_import(j.user_id, &j.source, &j.state,
-            j.fetched as i64, j.imported as i64, &j.status).await;
+        let _ = db.finish_import_job(j.db_id, &j.state, j.fetched as i64, j.imported as i64, &j.status).await;
     }
 }
 
@@ -112,7 +115,7 @@ async fn import_listenbrainz(
     user: AuthUser,
     Json(body): Json<ServiceImport>,
 ) -> impl IntoResponse {
-    let id = start(&state.imports, "listenbrainz", user.user_id);
+    let id = start(&state.imports, &state.db, "listenbrainz", user.user_id).await;
     let (reg, db, uid) = (state.imports.clone(), state.db.clone(), user.user_id);
     let ret = id.clone();
     tokio::spawn(async move {
@@ -134,7 +137,7 @@ async fn import_lastfm(
             ErrorResponse { code: 400, error: "Last.fm import requires LASTFM_API_KEY to be configured".into() }
         ))).into_response();
     }
-    let id = start(&state.imports, "lastfm", user.user_id);
+    let id = start(&state.imports, &state.db, "lastfm", user.user_id).await;
     let (reg, db, uid, key) = (state.imports.clone(), state.db.clone(), user.user_id, state.lastfm_api_key.clone());
     let ret = id.clone();
     tokio::spawn(async move {
@@ -163,7 +166,7 @@ async fn import_file(
         ))).into_response();
     };
 
-    let id = start(&state.imports, "file", user.user_id);
+    let id = start(&state.imports, &state.db, "file", user.user_id).await;
     let (reg, db, uid) = (state.imports.clone(), state.db.clone(), user.user_id);
     let ret = id.clone();
     tokio::spawn(async move {

@@ -62,6 +62,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("📦 Initializing scrobble database at {}", config.database.scrobble_db_url);
     let db = Arc::new(Database::new(&config.database.scrobble_db_url).await?);
 
+    // Any import left 'running' by a previous process died with it — record that.
+    match db.mark_running_imports_interrupted().await {
+        Ok(n) if n > 0 => info!("⚠️ Marked {} interrupted import(s) from a previous run", n),
+        _ => {}
+    }
+
     // ── First-run setup ──
     if !db.has_users().await? {
         info!("🔑 First run — creating admin user (password not set yet)");
@@ -158,13 +164,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let server_port = config.server.port;
     let server_host = config.server.host.clone();
 
+    // Shutdown coordination: the HTTP server drains first, then flips this so
+    // the engine finishes its current tick and returns cleanly.
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+
     // ── HTTP server (background task; drains in-flight requests on shutdown) ──
     let server_task = tokio::spawn(async move {
         let addr = format!("{}:{}", server_host, server_port);
         info!("🌐 Starting server on {}", addr);
         let listener = match tokio::net::TcpListener::bind(&addr).await {
             Ok(l) => l,
-            Err(e) => { error!("Failed to bind server: {}", e); return; }
+            Err(e) => { error!("Failed to bind server: {}", e); let _ = shutdown_tx.send(true); return; }
         };
         if let Err(e) = axum::serve(
             listener,
@@ -175,28 +185,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         {
             error!("Server error: {}", e);
         }
+        // Server has drained all in-flight requests — now tell the engine to stop.
+        let _ = shutdown_tx.send(true);
     });
 
-    // ── Scrobble engine (foreground) ── raced against the server: when a
-    // shutdown signal drains the server, the select completes and we exit
-    // cleanly. Pending scrobbles are durable in SQLite, so an interrupted tick
-    // loses nothing.
+    // ── Scrobble engine (foreground) ── runs until the server drains and signals
+    // shutdown, at which point it finishes the current tick and returns. Between
+    // that and the server's request draining, no in-progress work is cut off:
+    // committed writes are durable (WAL) and pending scrobbles resume on restart.
     let mut engine = ScrobbleEngine::new(
         sources, sinks, db, mb_client,
         config.lastfm.api_key.clone(),
         config.lastfm.secret.clone(),
         config.listenbrainz.base_url.clone(),
     );
-    tokio::select! {
-        _ = engine.run() => {},
-        _ = server_task => { info!("👋 Server stopped; shutting down") },
-    }
+    engine.run(shutdown_rx).await;
+    let _ = server_task.await;
+    info!("👋 Shut down cleanly");
     Ok(())
 }
 
-/// Resolve when the process receives Ctrl-C or (on Unix) SIGTERM, so systemd /
-/// Docker `stop` lets in-flight requests finish before we exit. Pending
-/// scrobbles are durable in SQLite, so an interrupted poll tick loses nothing.
 /// Cap on rows an in-memory analytics/personality pass will load, scaled to the
 /// machine's RAM so a large history can't OOM a request on a small box (e.g. a
 /// Pi Zero). Rows are ~200 bytes; we budget ~1/16 of total RAM per pass.
@@ -210,6 +218,8 @@ fn analytics_row_cap() -> i64 {
     (total_mb / 16 * 5_000).clamp(100_000, 5_000_000)
 }
 
+/// Resolves on Ctrl-C or (Unix) SIGTERM — the trigger for the server's graceful
+/// drain, which then stops the engine.
 async fn shutdown_signal() {
     use tokio::signal;
     let ctrl_c = async { let _ = signal::ctrl_c().await; };

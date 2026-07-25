@@ -64,12 +64,18 @@ impl ScrobbleEngine {
         sinks
     }
 
-    pub async fn run(&mut self) -> ! {
+    /// Runs the poll loop until `shutdown` flips to `true`. A tick always runs
+    /// to completion (never interrupted mid-write); shutdown is checked at the
+    /// tick boundary, and the between-ticks sleep is interruptible so we stop
+    /// promptly. Returning cleanly guarantees we exit at a consistent point.
+    pub async fn run(&mut self, mut shutdown: tokio::sync::watch::Receiver<bool>) {
         use futures_util::future::FutureExt;
         use std::panic::AssertUnwindSafe;
 
         info!("🎵 Starting scrobble loop with prioritized MusicBrainz metadata enrichment...");
         loop {
+            if *shutdown.borrow() { break; }
+
             // Isolate each tick: a panic here would otherwise kill the engine
             // task while the HTTP server keeps running, silently stopping all
             // scrobbling. Catch it, log it, and carry on next tick.
@@ -79,8 +85,16 @@ impl ScrobbleEngine {
                     .unwrap_or_else(|| "unknown panic".into());
                 error!("💥 Scrobble tick panicked (recovered): {}", msg);
             }
-            sleep(self.poll_interval).await;
+
+            // A completed tick reached a clean boundary — stop now if asked.
+            if *shutdown.borrow() { break; }
+
+            tokio::select! {
+                _ = sleep(self.poll_interval) => {}
+                _ = shutdown.changed() => {}
+            }
         }
+        info!("🛑 Scrobble engine stopped cleanly");
     }
 
     pub async fn run_tick(&mut self) {
@@ -214,6 +228,12 @@ impl ScrobbleEngine {
                 if ps.play.mbid_recording.is_none() {
                     let album_hint = ps.play.album.clone();
                     enrich_play(&self.mb_client, &mut ps.play, album_hint.as_deref()).await;
+                    // Persist the resolved MBIDs so language/analytics can use them.
+                    if ps.play.mbid_recording.is_some() {
+                        if let Err(e) = self.db.update_scrobble_enrichment(ps.id, &ps.play).await {
+                            error!("Failed to persist enrichment for scrobble {}: {}", ps.id, e);
+                        }
+                    }
                 }
 
                 // Only send to sinks that haven't already accepted this listen, so

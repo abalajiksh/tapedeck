@@ -1,0 +1,42 @@
+# Tapedeck systemd unit. Copy to /etc/systemd/system/tapedeck.service, adjust
+# the paths/user, then: systemctl daemon-reload && systemctl enable --now tapedeck
+#
+# Assumes the binary and its data live in /opt/tapedeck, owned by a dedicated
+# `tapedeck` system user (useradd --system --home /opt/tapedeck tapedeck).
+
+[Unit]
+Description=Tapedeck — self-hosted scrobbler / music intelligence hub
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+User=tapedeck
+Group=tapedeck
+WorkingDirectory=/opt/tapedeck
+ExecStart=/opt/tapedeck/tapedeck
+EnvironmentFile=-/opt/tapedeck/.env
+
+# Restart on crash; the DB is crash-safe (SQLite WAL) so this is always safe.
+Restart=on-failure
+RestartSec=5
+
+# On stop, systemd sends SIGTERM. Tapedeck drains in-flight HTTP requests and
+# finishes the current poll tick before exiting (usually within a second or
+# two). This is the grace window before systemd escalates to SIGKILL — generous
+# headroom, but even a SIGKILL cannot corrupt the database.
+KillSignal=SIGTERM
+TimeoutStopSec=45
+
+# ── Hardening ──
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/tapedeck
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+
+[Install]
+WantedBy=multi-user.target

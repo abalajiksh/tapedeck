@@ -596,6 +596,20 @@ impl Database {
         Ok(())
     }
 
+    /// Persist MusicBrainz IDs onto a stored listen after the engine enriches it
+    /// (enrichment moved off the ingest request path — see server/ingest.rs).
+    pub async fn update_scrobble_enrichment(&self, id: i64, play: &Play) -> Result<(), sqlx::Error> {
+        let mbid_artist_json = play.mbid_artist.as_ref().map(|a| serde_json::to_string(a).unwrap_or_default());
+        sqlx::query(
+            "UPDATE scrobbles SET mbid_recording = ?, mbid_release = ?, mbid_artist = ?, caa_id = ?, caa_release_mbid = ?
+             WHERE id = ?"
+        )
+        .bind(&play.mbid_recording).bind(&play.mbid_release).bind(&mbid_artist_json)
+        .bind(play.caa_id).bind(&play.caa_release_mbid).bind(id)
+        .execute(&self.pool).await?;
+        Ok(())
+    }
+
     /// Mark a scrobble fully synced (delivered to every enabled sink).
     pub async fn mark_scrobble_synced(&self, id: i64) -> Result<(), sqlx::Error> {
         sqlx::query("UPDATE scrobbles SET status = 'synced' WHERE id = ?")
@@ -1077,14 +1091,31 @@ impl Database {
             .bind(user_id).fetch_all(&self.pool).await
     }
 
-    pub async fn record_import(&self, user_id: i64, source: &str, state: &str,
-        fetched: i64, imported: i64, status: &str) -> Result<(), sqlx::Error> {
-        sqlx::query(
+    /// Record a new import as `running` and return its row id. Persisting at
+    /// start (not just completion) means an interrupted import leaves a durable
+    /// record instead of a job that vanishes with the process.
+    pub async fn create_import_job(&self, user_id: i64, source: &str) -> Result<i64, sqlx::Error> {
+        let res = sqlx::query(
             "INSERT INTO import_jobs (user_id, source, state, fetched, imported, status, created_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?)"
-        ).bind(user_id).bind(source).bind(state).bind(fetched).bind(imported).bind(status)
-         .bind(Self::now_secs()).execute(&self.pool).await?;
+             VALUES (?, ?, 'running', 0, 0, 'started', ?)"
+        ).bind(user_id).bind(source).bind(Self::now_secs()).execute(&self.pool).await?;
+        Ok(res.last_insert_rowid())
+    }
+
+    /// Update a job to its final state on completion.
+    pub async fn finish_import_job(&self, id: i64, state: &str, fetched: i64, imported: i64, status: &str) -> Result<(), sqlx::Error> {
+        sqlx::query("UPDATE import_jobs SET state = ?, fetched = ?, imported = ?, status = ? WHERE id = ?")
+            .bind(state).bind(fetched).bind(imported).bind(status).bind(id).execute(&self.pool).await?;
         Ok(())
+    }
+
+    /// On startup, any import still marked `running` died with the previous
+    /// process — mark it interrupted so history is accurate and nothing lingers.
+    pub async fn mark_running_imports_interrupted(&self) -> Result<u64, sqlx::Error> {
+        let res = sqlx::query(
+            "UPDATE import_jobs SET state = 'interrupted', status = 'interrupted by shutdown' WHERE state = 'running'"
+        ).execute(&self.pool).await?;
+        Ok(res.rows_affected())
     }
 
     pub async fn list_imports(&self, user_id: i64) -> Result<Vec<ImportHistoryRow>, sqlx::Error> {
@@ -1531,6 +1562,26 @@ mod tests {
         assert!(db.list_users().await.unwrap().iter().all(|u| u.id != uid));
         assert!(db.list_tokens(uid).await.unwrap().is_empty());
         assert!(db.list_connections(uid).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn interrupted_import_is_marked_on_startup() {
+        let db = testdb().await;
+        let uid = db.create_user("fay", None, "x", "admin").await.unwrap();
+        // A job that started but never finished (process died) stays 'running'.
+        let jid = db.create_import_job(uid, "file").await.unwrap();
+        // A job that completed normally.
+        let done = db.create_import_job(uid, "lastfm").await.unwrap();
+        db.finish_import_job(done, "done", 10, 8, "ok").await.unwrap();
+
+        let n = db.mark_running_imports_interrupted().await.unwrap();
+        assert_eq!(n, 1, "only the unfinished job is touched");
+
+        let imports = db.list_imports(uid).await.unwrap();
+        let running = imports.iter().find(|r| r.id == jid).unwrap();
+        assert_eq!(running.state, "interrupted");
+        let finished = imports.iter().find(|r| r.id == done).unwrap();
+        assert_eq!(finished.state, "done"); // untouched
     }
 
     #[tokio::test]

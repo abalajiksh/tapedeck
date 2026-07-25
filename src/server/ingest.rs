@@ -85,11 +85,12 @@ pub async fn submit_listens(
             caa_id, caa_release_mbid,
         };
 
-        // Enrich with MusicBrainz if no MBIDs were provided
-        if play.mbid_recording.is_none() {
-            let album_hint = play.album.clone();
-            enrich_play(&state.mb_client, &mut play, album_hint.as_deref()).await;
-        }
+        // MusicBrainz enrichment is NOT done inline for stored listens — it's a
+        // rate-limited network call, so doing it per-listen would make a bulk
+        // submit take minutes and risk being killed on shutdown. Stored listens
+        // are saved immediately and enriched by the engine's flush loop, which
+        // writes the MBIDs back. (Now-playing is enriched below since it's a
+        // single track forwarded right away.)
 
         // ── Phase 2: Extract quality metadata ──
         let mut quality = extract_audio_quality(info_ref);
@@ -160,6 +161,12 @@ pub async fn submit_listens(
 
         match body.listen_type {
             ListenType::PlayingNow => {
+                // Enrich the single now-playing track inline so the forwarded
+                // metadata is complete (it isn't stored, so nothing back-fills it).
+                if play.mbid_recording.is_none() {
+                    let album_hint = play.album.clone();
+                    enrich_play(&state.mb_client, &mut play, album_hint.as_deref()).await;
+                }
                 debug!("Now playing (ingest): {} - {} [user: {}]", play.artist, play.title, user.username);
                 for sink in state.sinks.iter() {
                     if let Some(lb_sink) = sink.as_any().downcast_ref::<crate::sinks::ListenBrainzSink>() {

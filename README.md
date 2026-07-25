@@ -99,9 +99,13 @@ Built to be trusted as your system of record:
   which sinks have accepted it; a retry only re-sends to the sinks that haven't,
   so a flaky Last.fm won't get duplicate scrobbles when ListenBrainz was down.
   Both sinks retry with backoff.
-- **Crash-safe.** Pending scrobbles live in the DB, so a crash or restart resumes
-  where it left off. The poll loop isolates per-tick panics, and the server drains
-  in-flight requests on `SIGTERM`.
+- **Graceful, data-safe shutdown.** On `SIGTERM` the HTTP server drains in-flight
+  requests, then the poll engine finishes its current tick and exits — no work is
+  cut mid-write. Even a hard `SIGKILL` can't corrupt the DB (WAL + atomic writes);
+  pending scrobbles resume on restart, and an interrupted import is recorded as
+  such rather than left hanging. Metadata enrichment runs off the request path,
+  so a bulk submit returns in milliseconds and can't stall shutdown. A sample
+  hardened `systemd` unit (with a sensible `TimeoutStopSec`) is in `deploy/`.
 - **Backups.** `GET /api/v1/backup` (or the Settings screen) downloads a
   consistent `VACUUM INTO` snapshot of the whole database, safe to take while
   running. `GET /health` reports DB connectivity for uptime monitoring.
