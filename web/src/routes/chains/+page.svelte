@@ -177,7 +177,7 @@
 			{/each}
 		{:else}
 			<div class="panel" style="border-radius:22px;padding:44px;text-align:center;color:var(--td-muted);">
-				No signal chains yet. <button class="btn btn-ghost" on:click={newChain}>Create your first</button>.
+				No signal chains yet — <button class="btn btn-ghost" on:click={newChain}>create your first</button>
 			</div>
 		{/if}
 	</div>
@@ -242,7 +242,7 @@
 				</tbody>
 			</table>
 		{:else}
-			<p style="color:var(--td-muted);font-size:14px;padding:16px 0;margin:0;">No equipment yet. <button class="btn btn-ghost" on:click={newGear}>Add your first</button>.</p>
+			<p style="color:var(--td-muted);font-size:14px;padding:16px 0;margin:0;">No equipment yet — <button class="btn btn-ghost" on:click={newGear}>add your first</button></p>
 		{/if}
 	</div>
 {/if}

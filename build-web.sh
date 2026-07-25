@@ -23,13 +23,32 @@ fi
 
 cd "$WEB_DIR"
 
-# Install dependencies
+# Install dependencies. bun.lock IS committed — a frozen install keeps the
+# toolchain pinned. Drifting off it is how vite/vite-plugin-svelte once ended up
+# on incompatible majors, which silently compiled every onMount out of the app.
 echo "📦 Installing dependencies..."
-bun install --frozen-lockfile 2>/dev/null || bun install
+if ! bun install --frozen-lockfile; then
+    echo "⚠️  Lockfile is out of date with package.json — re-resolving."
+    echo "   Commit the updated web/bun.lock afterwards."
+    bun install
+fi
 
 # Build SvelteKit with adapter-static
 echo "🔨 Building SvelteKit..."
 bun run build
+
+# Smoke-test the bundle. The root layout's onMount is what boots the whole SPA
+# (auth gate → /setup or /login redirect); if a broken toolchain drops lifecycle
+# callbacks, the build still "succeeds" and ships a page that renders a spinner
+# forever. Assert that call survived rather than finding out in the browser.
+echo "🔎 Verifying bundle..."
+if ! grep -rq "auth/status" "$OUT_DIR/_app"; then
+    echo "❌ Built bundle never calls /api/v1/auth/status."
+    echo "   The root layout's onMount was compiled away — the SPA would boot"
+    echo "   to a blank page. Check svelte / vite / @sveltejs/vite-plugin-svelte"
+    echo "   are on mutually compatible majors (see 'bun pm ls')."
+    exit 1
+fi
 
 echo "✅ Frontend built → $OUT_DIR"
 echo ""

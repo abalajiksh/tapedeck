@@ -30,6 +30,10 @@ scrobbles.db
 tapedeck.db
 
 *.lock
+# ...except the frontend lockfile. Without it every build re-resolves the
+# ^ ranges in web/package.json, and a mismatched svelte/vite toolchain breaks
+# the SPA silently rather than loudly.
+!web/bun.lock
 
 
 static/*
@@ -49,3 +53,5 @@ CLAUDE.md
 
 # CI pipeline lives in the separate tapedeck-cicd repo
 /Jenkinsfile
+export/
+
