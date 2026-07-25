@@ -3,6 +3,7 @@
 	import { api } from '$lib/api';
 	import type { Scrobble, SignalChain } from '$lib/api';
 	import ScrobbleRow from '$lib/components/ScrobbleRow.svelte';
+	import InspectListen from '$lib/components/InspectListen.svelte';
 
 	let scrobbles: Scrobble[] = [];
 	let chains: SignalChain[] = [];
@@ -14,6 +15,7 @@
 
 	// row menu + dialogs
 	let menuFor: Scrobble | null = null;
+	let inspecting: Scrobble | null = null;
 	let editing: Scrobble | null = null;
 	let edit = { title: '', artist: '', album: '', mbid_recording: '', signal_chain_id: 0, format_type: '' };
 	let confirmDelete: Scrobble | null = null;
@@ -194,9 +196,15 @@
 	<div style="position:fixed;z-index:66;right:40px;top:50%;transform:translateY(-50%);background:var(--td-surface);border:1px solid var(--td-border);border-radius:14px;box-shadow:0 12px 32px rgba(46,43,37,.2);padding:6px;min-width:180px;display:flex;flex-direction:column;">
 		<button class="menu-item" on:click={() => menuFor && openEdit(menuFor)}>
 			<svg viewBox="0 0 24 24" width="16" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4z"/></svg>Edit details</button>
+		<button class="menu-item" on:click={() => { inspecting = menuFor; menuFor = null; }}>
+			<svg viewBox="0 0 24 24" width="16" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M9 8l-5 4 5 4"/><path d="M15 8l5 4-5 4"/></svg>Inspect listen</button>
 		<button class="menu-item danger" on:click={() => { confirmDelete = menuFor; menuFor = null; }}>
 			<svg viewBox="0 0 24 24" width="16" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M4 7h16"/><path d="M10 11v6M14 11v6"/><path d="M6 7l1 13h10l1-13"/><path d="M9 7V4h6v3"/></svg>Delete listen</button>
 	</div>
+{/if}
+
+{#if inspecting}
+	<InspectListen scrobble={inspecting} on:close={() => (inspecting = null)} />
 {/if}
 
 <!-- Edit dialog -->

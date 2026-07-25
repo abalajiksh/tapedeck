@@ -31,13 +31,38 @@ fn forbidden(action: &str) -> axum::response::Response {
 //  Cookie helpers
 // ═══════════════════════════════════════════════════════════
 
-fn session_set_cookie(token: &str) -> HeaderValue {
-    format!("td_session={}; HttpOnly; SameSite=Lax; Path=/; Max-Age=604800", token)
+/// Whether to mark the session cookie `Secure`.
+///
+/// The flag is enforced by the *browser*, so what matters is the scheme the
+/// browser used — not the scheme we were reached on. Behind a TLS-terminating
+/// proxy (Cloudflare Tunnel, nginx, Caddy) the origin sees plain HTTP while the
+/// browser is on HTTPS, so we read `X-Forwarded-Proto`.
+///
+/// Only trusted when `trust_proxy` is set: otherwise anyone could send the
+/// header directly. With it off we leave `Secure` unset, which keeps a
+/// plain-HTTP LAN deployment working — setting it there would make the cookie
+/// unusable and lock everyone out.
+fn cookie_is_secure(headers: &HeaderMap, trust_proxy: bool) -> bool {
+    trust_proxy
+        && headers.get("x-forwarded-proto")
+            .and_then(|v| v.to_str().ok())
+            // May be a comma-separated chain; the first hop is the client's.
+            .map(|v| v.split(',').next().unwrap_or("").trim().eq_ignore_ascii_case("https"))
+            .unwrap_or(false)
+}
+
+fn session_set_cookie(token: &str, secure: bool) -> HeaderValue {
+    format!("td_session={}; HttpOnly; SameSite=Lax; Path=/; Max-Age=604800{}",
+        token, if secure { "; Secure" } else { "" })
         .parse().unwrap()
 }
 
-fn session_clear_cookie() -> HeaderValue {
-    "td_session=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0".parse().unwrap()
+/// Must carry the same attributes as the cookie it clears, or the browser keeps
+/// the original and logout silently does nothing.
+fn session_clear_cookie(secure: bool) -> HeaderValue {
+    format!("td_session=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0{}",
+        if secure { "; Secure" } else { "" })
+        .parse().unwrap()
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -77,6 +102,7 @@ struct SetupRequest {
 
 async fn setup(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Json(body): Json<SetupRequest>,
 ) -> impl IntoResponse {
     // Guard: only works if no user has a real password yet
@@ -140,7 +166,8 @@ async fn setup(
     };
 
     let mut resp_headers = HeaderMap::new();
-    resp_headers.insert(header::SET_COOKIE, session_set_cookie(&session_token));
+    resp_headers.insert(header::SET_COOKIE,
+        session_set_cookie(&session_token, cookie_is_secure(&headers, state.trust_proxy)));
 
     (StatusCode::OK, resp_headers, Json(serde_json::json!({
         "user_id": user_id,
@@ -215,10 +242,12 @@ async fn login(
         ).into_response(),
     };
 
-    let mut headers = HeaderMap::new();
-    headers.insert(header::SET_COOKIE, session_set_cookie(&session_token));
+    // Read the *request* headers for the proto before building the response set.
+    let secure = cookie_is_secure(&headers, state.trust_proxy);
+    let mut resp_headers = HeaderMap::new();
+    resp_headers.insert(header::SET_COOKIE, session_set_cookie(&session_token, secure));
 
-    (StatusCode::OK, headers, Json(serde_json::json!({
+    (StatusCode::OK, resp_headers, Json(serde_json::json!({
         "user_id": user.user_id,
         "username": user.username,
         "is_admin": user.is_admin,
@@ -239,7 +268,8 @@ async fn logout(
     }
 
     let mut resp_headers = HeaderMap::new();
-    resp_headers.insert(header::SET_COOKIE, session_clear_cookie());
+    resp_headers.insert(header::SET_COOKIE,
+        session_clear_cookie(cookie_is_secure(&headers, state.trust_proxy)));
 
     (StatusCode::OK, resp_headers, Json(serde_json::json!({ "status": "logged out" })))
 }

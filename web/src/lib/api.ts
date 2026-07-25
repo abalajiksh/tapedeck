@@ -345,6 +345,13 @@ class TapedeckAPI {
 		return this.get(`/api/v1/personality?range=${range}`);
 	}
 
+	async getArtworkStatus(): Promise<{ total: number; resolved: number; pending: number }> {
+		return this.get('/api/v1/artwork/status');
+	}
+	async backfillArtwork(): Promise<{ status: string }> {
+		return this.post('/api/v1/artwork/backfill');
+	}
+
 	async getLanguageStatus(): Promise<{ total: number; resolved: number; pending: number }> {
 		return this.get('/api/v1/languages/status');
 	}

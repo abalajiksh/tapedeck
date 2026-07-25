@@ -249,6 +249,40 @@ async fn backfill_languages_now(
     (StatusCode::ACCEPTED, Json(serde_json::json!({ "status": "started" }))).into_response()
 }
 
+/// GET /api/v1/artwork/status — cover-art coverage for the calling user.
+async fn artwork_status(
+    State(state): State<Arc<AppState>>,
+    user: AuthUser,
+) -> impl IntoResponse {
+    match state.db.artwork_coverage(user.user_id).await {
+        Ok((total, resolved)) => (StatusCode::OK, Json(serde_json::json!({
+            "total": total, "resolved": resolved, "pending": total - resolved,
+        }))).into_response(),
+        Err(e) => server_error(e.to_string()),
+    }
+}
+
+/// POST /api/v1/artwork/backfill — admin: resolve missing cover art in the
+/// background. Rate-limited by the MusicBrainz client, so a large history takes
+/// a while; the status endpoint is the progress bar.
+async fn backfill_artwork_now(
+    State(state): State<Arc<AppState>>,
+    user: AuthUser,
+) -> impl IntoResponse {
+    if !user.is_admin {
+        return (StatusCode::FORBIDDEN, Json(serde_json::json!(
+            ErrorResponse { code: 403, error: "Admin only".into() }
+        ))).into_response();
+    }
+    let (db, mb) = (state.db.clone(), state.mb_client.clone());
+    tokio::spawn(async move {
+        loop {
+            if crate::enrich::backfill_artwork(&db, &mb, 200, 200).await == 0 { break; }
+        }
+    });
+    (StatusCode::ACCEPTED, Json(serde_json::json!({ "status": "started" }))).into_response()
+}
+
 fn not_found() -> axum::response::Response {
     (StatusCode::NOT_FOUND, Json(serde_json::json!(
         ErrorResponse { code: 404, error: "Scrobble not found".into() }
@@ -271,4 +305,6 @@ pub fn create_scrobbles_router() -> Router<Arc<AppState>> {
         .route("/api/v1/personality", get(personality))
         .route("/api/v1/languages/status", get(language_status))
         .route("/api/v1/languages/backfill", axum::routing::post(backfill_languages_now))
+        .route("/api/v1/artwork/status", get(artwork_status))
+        .route("/api/v1/artwork/backfill", axum::routing::post(backfill_artwork_now))
 }

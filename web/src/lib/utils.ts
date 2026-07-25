@@ -101,6 +101,8 @@ export function coverArtUrl(
 	releaseId: string | null | undefined,
 	size: 250 | 500 | 1200 = 250
 ): string | null {
-	if (!caaId || !releaseId) return null;
+	// The backfill records -1 for "looked up, nothing there", so it stops
+	// retrying; treat any non-positive id as no artwork.
+	if (!caaId || caaId <= 0 || !releaseId) return null;
 	return `https://coverartarchive.org/release/${releaseId}/${caaId}-${size}.jpg`;
 }

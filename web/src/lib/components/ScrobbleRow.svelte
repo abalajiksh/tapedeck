@@ -1,6 +1,7 @@
 <script lang="ts">
 	import type { Scrobble } from '$lib/api';
-	import { qualityLabel, tierTagClass, coverStyle, formatDuration, timeAgo } from '$lib/utils';
+	import { qualityLabel, tierTagClass, formatDuration, timeAgo } from '$lib/utils';
+	import CoverArt from './CoverArt.svelte';
 	import { createEventDispatcher } from 'svelte';
 
 	export let scrobble: Scrobble;
@@ -12,7 +13,6 @@
 
 	$: q = qualityLabel(scrobble);
 	$: seed = scrobble.artist || scrobble.title || '?';
-	$: initial = (scrobble.artist || scrobble.title || '?').charAt(0).toUpperCase();
 	$: time = new Date(scrobble.timestamp * 1000).toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' });
 </script>
 
@@ -21,7 +21,7 @@
 		<input type="checkbox" checked={selected} on:change={() => dispatch('toggle', scrobble)}
 			aria-label="Select listen" style="width:18px;height:18px;flex:none;accent-color:var(--td-accent);cursor:pointer;">
 	{/if}
-	<div style="width:40px;height:40px;flex:none;border-radius:9px;display:flex;align-items:center;justify-content:center;color:rgba(255,255,255,.92);font-family:'Caprasimo',serif;font-size:17px;{coverStyle(seed)}">{initial}</div>
+	<CoverArt caaId={scrobble.caa_id} releaseMbid={scrobble.caa_release_mbid} {seed} />
 	<div style="flex:1;min-width:0;">
 		<div style="font-size:14.5px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">{scrobble.title}</div>
 		<div style="font-size:12.5px;color:var(--td-muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">{scrobble.artist}{scrobble.album ? ` — ${scrobble.album}` : ''}</div>

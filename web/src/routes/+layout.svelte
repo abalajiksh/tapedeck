@@ -4,6 +4,7 @@
 	import { page } from '$app/stores';
 	import { api } from '$lib/api';
 	import { deck, watchNowPlaying } from '$lib/nowplaying';
+	import { initPrefs } from '$lib/prefs';
 	import { theme, initTheme, setTheme, type ThemeMode } from '$lib/theme';
 
 	let state: 'loading' | 'public' | 'authenticated' | 'error' = 'loading';
@@ -63,6 +64,8 @@
 				try {
 					serverVersion = (await api.health()).version;
 				} catch { /* footer just shows the UI version */ }
+
+				initPrefs();
 
 				// Record the browser timezone once, so analytics use local time.
 				try {

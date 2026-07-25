@@ -67,11 +67,15 @@ pub async fn backfill_release_years(db: &Database, mb: &MusicBrainzClient, batch
         if budget <= 0 { break; }
         budget -= 1;
 
-        let year = match mb.fetch_metadata(&title, &artist, album.as_deref()).await {
-            Ok(meta) => meta.release_date.as_deref().and_then(parse_year).unwrap_or(0),
-            Err(_) => 0,
+        let (year, caa_id, caa_mbid) = match mb.fetch_metadata(&title, &artist, album.as_deref()).await {
+            Ok(meta) => (
+                meta.release_date.as_deref().and_then(parse_year).unwrap_or(0),
+                meta.caa_id,
+                meta.caa_release_mbid,
+            ),
+            Err(_) => (0, None, None),
         };
-        if db.set_scrobble_release_year(id, year).await.is_ok() { done += 1; }
+        if db.set_scrobble_release_year(id, year, caa_id, caa_mbid.as_deref()).await.is_ok() { done += 1; }
     }
     done
 }
@@ -80,4 +84,33 @@ pub async fn backfill_release_years(db: &Database, mb: &MusicBrainzClient, batch
 fn parse_year(date: &str) -> Option<i32> {
     let y: i32 = date.get(..4)?.parse().ok()?;
     (1000..=2999).contains(&y).then_some(y)
+}
+
+/// Fill in cover art for listens that have none. Shares `fetch_metadata` with
+/// the other backfills, so anything already in the MusicBrainz cache is free and
+/// `mb_budget` only bounds live API calls.
+///
+/// A listen with no art available is recorded as `caa_id = -1` rather than left
+/// NULL, so repeat passes move on instead of retrying the same misses forever;
+/// the UI treats a negative id as "no artwork" and falls back to the initial.
+pub async fn backfill_artwork(db: &Database, mb: &MusicBrainzClient, batch: i64, mb_budget: i64) -> usize {
+    let rows = match db.scrobbles_needing_artwork(batch).await {
+        Ok(r) => r,
+        Err(_) => return 0,
+    };
+    let mut done = 0usize;
+    let mut budget = mb_budget;
+
+    for (id, title, artist, album) in rows {
+        if budget <= 0 { break; }
+        budget -= 1;
+
+        let (caa_id, caa_mbid) = match mb.fetch_metadata(&title, &artist, album.as_deref()).await {
+            Ok(meta) => (meta.caa_id, meta.caa_release_mbid),
+            Err(_) => (None, None),
+        };
+        let resolved = caa_id.unwrap_or(-1);
+        if db.set_scrobble_artwork(id, Some(resolved), caa_mbid.as_deref()).await.is_ok() { done += 1; }
+    }
+    done
 }

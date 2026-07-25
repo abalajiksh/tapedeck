@@ -155,7 +155,11 @@ with:
   server-side so every device matches.
 - **Dashboard** — a now-rolling cassette hero, quick stats, and recent listens.
 - **History** — grouped by day with inline edit (fix title/artist/album,
-  recording MBID, signal chain, format) and per-listen delete.
+  recording MBID, signal chain, format), per-listen delete, and **Inspect
+  listen**: the stored row verbatim, every column including the ones no screen
+  renders, with copy-to-clipboard and MusicBrainz links.
+- **Album art** from the Cover Art Archive, matched via MusicBrainz and
+  backfilled in the background; toggle it off in Settings for lettered tiles.
 - **Analytics** — timeframe-ranged totals, top artists, and a listening-clock
   heatmap.
 - **Import** — pull from ListenBrainz or Last.fm, or upload a `.json`/`.csv`
@@ -411,6 +415,8 @@ means session-only.
 
 | Method | Path | Auth | Description |
 |--------|------|------|-------------|
+| GET | `/api/v1/artwork/status` | Auth | Cover-art coverage for the caller |
+| POST | `/api/v1/artwork/backfill` | Admin | Resolve missing cover art in the background |
 | GET | `/1/validate-token` | Token | LB token check (`{valid, user_name}`) |
 | POST | `/1/submit-listens` | Token | LB listen submission |
 | GET | `/1/user/:user/listens` | Token | LB listen history (`max_ts`/`min_ts`/`count`) |

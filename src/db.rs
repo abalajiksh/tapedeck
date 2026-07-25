@@ -759,9 +759,46 @@ impl Database {
     }
 
     /// `0` records "looked up, no date known" so the row isn't retried forever.
-    pub async fn set_scrobble_release_year(&self, id: i64, year: i32) -> Result<(), sqlx::Error> {
-        sqlx::query("UPDATE scrobbles SET release_year = ? WHERE id = ?")
-            .bind(year).bind(id).execute(&self.pool).await?;
+    /// Cover art rides along: the same MusicBrainz lookup returns it, and older
+    /// listens predate anything persisting it, so backfilling both in one pass
+    /// costs no extra API calls.
+    pub async fn set_scrobble_release_year(
+        &self, id: i64, year: i32, caa_id: Option<i64>, caa_release_mbid: Option<&str>,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "UPDATE scrobbles SET release_year = ?,
+                caa_id = COALESCE(caa_id, ?),
+                caa_release_mbid = COALESCE(caa_release_mbid, ?)
+             WHERE id = ?"
+        )
+        .bind(year).bind(caa_id).bind(caa_release_mbid).bind(id)
+        .execute(&self.pool).await?;
+        Ok(())
+    }
+
+    /// (total, with cover art) — drives the Settings artwork progress readout.
+    pub async fn artwork_coverage(&self, user_id: i64) -> Result<(i64, i64), sqlx::Error> {
+        let total: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM scrobbles WHERE user_id = ?")
+            .bind(user_id).fetch_one(&self.pool).await?;
+        let with_art: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM scrobbles WHERE user_id = ? AND caa_id IS NOT NULL"
+        ).bind(user_id).fetch_one(&self.pool).await?;
+        Ok((total.0, with_art.0))
+    }
+
+    /// Listens with neither artwork nor a resolved release year — the queue the
+    /// artwork backfill works through. Newest first, so recent history fills in
+    /// while older listens catch up in the background.
+    pub async fn scrobbles_needing_artwork(&self, limit: i64) -> Result<Vec<(i64, String, String, Option<String>)>, sqlx::Error> {
+        sqlx::query_as(
+            "SELECT id, title, artist, album FROM scrobbles
+             WHERE caa_id IS NULL ORDER BY timestamp DESC LIMIT ?"
+        ).bind(limit).fetch_all(&self.pool).await
+    }
+
+    pub async fn set_scrobble_artwork(&self, id: i64, caa_id: Option<i64>, caa_release_mbid: Option<&str>) -> Result<(), sqlx::Error> {
+        sqlx::query("UPDATE scrobbles SET caa_id = ?, caa_release_mbid = ? WHERE id = ?")
+            .bind(caa_id).bind(caa_release_mbid).bind(id).execute(&self.pool).await?;
         Ok(())
     }
 

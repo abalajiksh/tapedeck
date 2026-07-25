@@ -4,6 +4,7 @@
 	import type { TokenInfo } from '$lib/api';
 	import { formatDateTime } from '$lib/utils';
 	import { theme, setTheme, type ThemeMode } from '$lib/theme';
+	import { showArtwork, setShowArtwork } from '$lib/prefs';
 	import type { Connection, PlexSettings, PlexTestResult } from '$lib/api';
 
 	const uiVersion = __UI_VERSION__;
@@ -53,6 +54,30 @@
 			}, 2000);
 		} catch (e) { enriching = false; alert(String(e).replace(/^API \d+: /, '')); }
 	}
+	// artwork
+	let artStatus: { total: number; resolved: number; pending: number } | null = null;
+	let fetchingArt = false;
+	let artPoll: ReturnType<typeof setInterval> | null = null;
+	async function loadArtStatus() {
+		try { artStatus = await api.getArtworkStatus(); } catch { /* optional */ }
+	}
+	async function runArtworkBackfill() {
+		fetchingArt = true;
+		try {
+			await api.backfillArtwork();
+			artPoll = setInterval(async () => {
+				const prev = artStatus?.pending ?? -1;
+				await loadArtStatus();
+				// Stop when it's done, or when a pass made no progress at all.
+				if (artStatus && (artStatus.pending === 0 || artStatus.pending === prev)) {
+					if (artPoll) clearInterval(artPoll);
+					artPoll = null;
+					fetchingArt = false;
+				}
+			}, 2500);
+		} catch (e) { fetchingArt = false; alert(String(e).replace(/^API \d+: /, '')); }
+	}
+
 	async function saveTimezone() {
 		try { await api.putPreferences({ timezone: timezone.trim() }); tzSaved = true; setTimeout(() => (tzSaved = false), 2000); }
 		catch { /* ignore */ }
@@ -233,12 +258,16 @@
 		} catch { timezone = 'UTC'; }
 		try { isAdmin = (await api.me()).is_admin; } catch { /* optional */ }
 		if (isAdmin) loadPlex();
+		loadArtStatus();
 		loadConnections();
 		loadLangStatus();
 		loading = false;
 	});
 
-	onDestroy(() => { if (langPoll) clearInterval(langPoll); });
+	onDestroy(() => {
+		if (langPoll) clearInterval(langPoll);
+		if (artPoll) clearInterval(artPoll);
+	});
 
 	async function createToken() {
 		if (!newTokenName.trim()) return;
@@ -334,6 +363,40 @@
 		{#each themes as o}
 			<button class="seg-btn" class:on={$theme === o.v} on:click={() => setTheme(o.v)} style="flex:1;">{o.label}</button>
 		{/each}
+	</div>
+
+	<div style="margin-top:18px;padding-top:18px;border-top:1px solid var(--td-border);">
+		<label style="display:flex;align-items:center;gap:10px;cursor:pointer;font-size:14px;">
+			<input type="checkbox" checked={$showArtwork} on:change={(e) => setShowArtwork(e.currentTarget.checked)}
+				style="width:16px;height:16px;accent-color:var(--td-accent);cursor:pointer;">
+			Show album art
+		</label>
+		<p style="font-size:12.5px;color:var(--td-muted);margin:6px 0 0;">
+			Covers come from the Cover Art Archive, matched via MusicBrainz. Listens without a match keep the lettered tile.
+		</p>
+
+		{#if artStatus}
+			<div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-top:12px;">
+				<div style="flex:1;min-width:180px;">
+					<div style="height:8px;border-radius:999px;background:var(--td-track);overflow:hidden;">
+						<div style="height:100%;width:{artStatus.total ? (artStatus.resolved / artStatus.total) * 100 : 0}%;background:linear-gradient(90deg,var(--td-accent-2),var(--td-accent));border-radius:999px;transition:width .4s;"></div>
+					</div>
+					<div style="font-size:12.5px;color:var(--td-muted-2);margin-top:6px;">
+						{artStatus.resolved} / {artStatus.total} listens have artwork
+					</div>
+				</div>
+				{#if isAdmin}
+					<button class="btn btn-secondary" on:click={runArtworkBackfill} disabled={fetchingArt || artStatus.pending === 0}>
+						{fetchingArt ? 'Fetching…' : artStatus.pending === 0 ? 'All fetched' : 'Fetch missing art'}
+					</button>
+				{/if}
+			</div>
+			{#if fetchingArt}
+				<p style="font-size:12px;color:var(--td-muted-3);margin:8px 0 0;">
+					Rate-limited by MusicBrainz, so a large history takes a while. It also runs on its own in the background — you can leave this page.
+				</p>
+			{/if}
+		{/if}
 	</div>
 
 	<div style="margin-top:18px;">

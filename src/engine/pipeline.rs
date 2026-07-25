@@ -261,6 +261,7 @@ impl ScrobbleEngine {
         // Same deal for release years (feeds the by-decade breakdown) — cache
         // hits are free, so the budget only bounds real API calls.
         crate::enrich::backfill_release_years(&self.db, &self.mb_client, 50, 8).await;
+        crate::enrich::backfill_artwork(&self.db, &self.mb_client, 50, 8).await;
     }
 
     async fn flush_pending(&mut self) {
