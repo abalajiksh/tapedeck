@@ -18,11 +18,10 @@ use sqlx::SqlitePool;
 use tracing::{error, info};
 
 use crate::config::Config;
-use crate::db::Database;
+use crate::db::{Database, PlexSettings};
 use crate::engine::ScrobbleEngine;
 use crate::musicbrainz::MusicBrainzClient;
-use crate::sinks::ScrobbleSink;
-use crate::sources::{MusicSource, PlexSource, PlexFilters};
+use crate::sources::MusicSource;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -80,80 +79,60 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // ── Sources ──
-    let mut sources: Vec<Box<dyn MusicSource>> = Vec::new();
-
-    if config.plex.enabled {
-        info!("Initializing Plex source...");
-        let filters = PlexFilters {
-            users_allow: config.plex.users_allow.clone(),
-            users_block: config.plex.users_block.clone(),
-            devices_allow: config.plex.devices_allow.clone(),
-            devices_block: config.plex.devices_block.clone(),
-            libraries_allow: config.plex.libraries_allow.clone(),
-            libraries_block: config.plex.libraries_block.clone(),
-        };
-        let mut plex = PlexSource::with_filters(
-            config.plex.url.clone(),
-            config.plex.token.clone(),
-            filters,
-        );
-        match plex.initialize().await {
-            Ok(_) => {
-                info!("✅ Plex source initialized");
-                sources.push(Box::new(plex));
+    // Plex config lives in the database so it can be edited from the UI and
+    // applied live. `tapedeck.toml` / PLEX_* env vars only *seed* the row on
+    // first run — after that the database is authoritative and editing the
+    // config file has no effect.
+    let plex_settings = match db.get_plex_settings().await? {
+        Some(s) => s,
+        None => {
+            let seeded = PlexSettings {
+                enabled: config.plex.enabled,
+                url: config.plex.url.clone(),
+                token: config.plex.token.clone(),
+                users_allow: config.plex.users_allow.join(","),
+                users_block: config.plex.users_block.join(","),
+                devices_allow: config.plex.devices_allow.join(","),
+                devices_block: config.plex.devices_block.join(","),
+                libraries_allow: config.plex.libraries_allow.join(","),
+                libraries_block: config.plex.libraries_block.join(","),
+                updated_at: 0,
+            };
+            if seeded.enabled {
+                info!("⚙️ Seeding Plex settings from config (the UI owns them from now on)");
             }
-            Err(e) => error!("❌ Failed to initialize Plex: {}", e),
+            db.save_plex_settings(&seeded).await?;
+            db.get_plex_settings().await?.unwrap_or(seeded)
         }
-    }
+    };
 
-    if sources.is_empty() {
+    // The engine builds the Plex source itself on its first tick, from these
+    // same settings — one code path for startup and for later UI edits.
+    let sources: Vec<Box<dyn MusicSource>> = Vec::new();
+
+    if plex_settings.is_usable() {
+        info!("🎧 Plex source enabled ({})", plex_settings.url);
+    } else {
         info!("ℹ️ No polling sources enabled — running in ingest-only mode");
     }
 
     // ── Sinks ──
-    let mut sink_vec: Vec<Box<dyn ScrobbleSink>> = Vec::new();
+    // There are no server-wide sinks: every listen forwards only to the
+    // accounts its own user connected (Settings → Scrobble Connections), built
+    // per user at forward time by `sinks::sinks_for_user`.
 
-    if config.listenbrainz.enabled {
-        info!("Initializing ListenBrainz sink...");
-        sink_vec.push(Box::new(sinks::ListenBrainzSink::new(
-            config.listenbrainz.base_url.clone(),
-            config.listenbrainz.token.clone(),
-        )));
-    }
-    if config.lastfm.enabled {
-        info!("Initializing Last.fm sink...");
-        sink_vec.push(Box::new(sinks::LastFmSink::new(
-            config.lastfm.api_key.clone(),
-            config.lastfm.secret.clone(),
-            config.lastfm.session_key.clone(),
-        )));
-    }
-    if config.librefm.enabled {
-        info!("Initializing Libre.fm sink...");
-        sink_vec.push(Box::new(sinks::LastFmSink::libre_fm(
-            config.librefm.api_key.clone(),
-            config.librefm.secret.clone(),
-            config.librefm.session_key.clone(),
-            Some(config.librefm.base_url.clone()),
-        )));
-    }
-
-    if sink_vec.is_empty() {
-        info!("ℹ️ No scrobble sinks enabled — listens will be stored locally only");
-    }
-
-    let sinks: Arc<Vec<Box<dyn ScrobbleSink>>> = Arc::new(sink_vec);
+    // Shared between the HTTP layer (reads it for the deck, writes it from
+    // `playing_now` ingests) and the poll engine (writes it from Plex sessions).
+    let now_playing = server::now_playing::NowPlayingRegistry::default();
 
     // ── HTTP server ──
     let app_state = Arc::new(server::AppState {
         db: db.clone(),
         mb_client: mb_client.clone(),
-        sinks: sinks.clone(),
         log_handle: log_handle.clone(),
+        listenbrainz_url: config.listenbrainz_url.clone(),
         imports: Default::default(),
-        lastfm_api_key: config.lastfm.api_key.clone(),
-        lastfm_secret: config.lastfm.secret.clone(),
-        listenbrainz_base_url: config.listenbrainz.base_url.clone(),
+        now_playing: now_playing.clone(),
         login_limiter: Arc::new(server::ratelimit::RateLimiter::new(
             8, std::time::Duration::from_secs(300))),
         analytics_row_cap: analytics_row_cap(),
@@ -193,12 +172,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // shutdown, at which point it finishes the current tick and returns. Between
     // that and the server's request draining, no in-progress work is cut off:
     // committed writes are durable (WAL) and pending scrobbles resume on restart.
-    let mut engine = ScrobbleEngine::new(
-        sources, sinks, db, mb_client,
-        config.lastfm.api_key.clone(),
-        config.lastfm.secret.clone(),
-        config.listenbrainz.base_url.clone(),
-    );
+    let mut engine = ScrobbleEngine::new(sources, db, mb_client, now_playing, config.listenbrainz_url.clone());
     engine.run(shutdown_rx).await;
     let _ = server_task.await;
     info!("👋 Shut down cleanly");

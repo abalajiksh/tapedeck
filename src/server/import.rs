@@ -132,13 +132,13 @@ async fn import_lastfm(
     user: AuthUser,
     Json(body): Json<ServiceImport>,
 ) -> impl IntoResponse {
-    if state.lastfm_api_key.is_empty() {
+    if crate::sinks::LASTFM_API_KEY.is_empty() {
         return (StatusCode::BAD_REQUEST, Json(serde_json::json!(
             ErrorResponse { code: 400, error: "Last.fm import requires LASTFM_API_KEY to be configured".into() }
         ))).into_response();
     }
     let id = start(&state.imports, &state.db, "lastfm", user.user_id).await;
-    let (reg, db, uid, key) = (state.imports.clone(), state.db.clone(), user.user_id, state.lastfm_api_key.clone());
+    let (reg, db, uid, key) = (state.imports.clone(), state.db.clone(), user.user_id, crate::sinks::LASTFM_API_KEY.to_string());
     let ret = id.clone();
     tokio::spawn(async move {
         if let Err(e) = run_lastfm(&reg, &id, &db, uid, &body.username, &key).await {

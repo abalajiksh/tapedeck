@@ -18,7 +18,17 @@
 	const days = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
 
 	$: maxArtist = stats ? Math.max(1, ...stats.top_artists.map((a) => (metric === 'plays' ? a.plays : a.hours))) : 1;
+	$: maxAlbum = stats ? Math.max(1, ...stats.top_albums.map((a) => (metric === 'plays' ? a.plays : a.hours))) : 1;
+	$: maxDecade = stats ? Math.max(1, ...stats.decades.map((d) => d.plays)) : 1;
 	$: maxHeat = stats ? Math.max(1, ...stats.heatmap.flat()) : 1;
+
+	// Match the quality-badge colours so a tier reads the same everywhere.
+	const fidelityFill = (tier: string) =>
+		({
+			DSD: 'linear-gradient(90deg,#c67139,#e07a55)',
+			Lossless: 'linear-gradient(90deg,#7a8a5e,#aebf92)',
+			Lossy: 'linear-gradient(90deg,#8a8172,#b3a487)'
+		})[tier] ?? 'linear-gradient(90deg,#645c50,#9a8f7d)';
 
 	async function load() {
 		loading = true;
@@ -121,6 +131,62 @@
 		{/if}
 	</div>
 
+	<!-- Top albums -->
+	<div class="panel" style="border-radius:22px;padding:22px;margin-bottom:16px;">
+		<h3 class="h-display" style="font-size:19px;margin:0 0 16px;">Top Albums</h3>
+		{#if stats.top_albums.length}
+			{#each stats.top_albums as al}
+				{@const v = metric === 'plays' ? al.plays : al.hours}
+				<div style="margin-bottom:13px;">
+					<div style="display:flex;justify-content:space-between;gap:12px;font-size:13px;margin-bottom:5px;">
+						<span style="min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">
+							<span style="font-weight:600;">{al.name}</span>
+							<span style="color:var(--td-muted-3);"> — {al.artist}</span>
+						</span>
+						<span style="color:var(--td-muted-2);flex:none;">{v}{metric === 'hours' ? 'h' : ''}</span>
+					</div>
+					<div style="height:10px;border-radius:999px;background:var(--td-track);overflow:hidden;"><div style="width:{(v / maxAlbum * 100).toFixed(0)}%;height:100%;background:linear-gradient(90deg,#7a8a5e,#aebf92);border-radius:999px;"></div></div>
+				</div>
+			{/each}
+		{:else}
+			<p style="color:var(--td-muted);font-size:14px;margin:0;">No album data in this range yet.</p>
+		{/if}
+	</div>
+
+	<!-- Fidelity mix -->
+	{#if stats.fidelity.length}
+		<h3 class="h-display" style="font-size:19px;margin:0 0 12px;">Fidelity Mix</h3>
+		<div class="panel" style="border-radius:22px;padding:22px;margin-bottom:16px;display:flex;flex-direction:column;gap:14px;">
+			{#each stats.fidelity as f}
+				<div>
+					<div style="display:flex;justify-content:space-between;font-size:13px;margin-bottom:6px;">
+						<span style="font-weight:600;">{f.name}</span>
+						<span style="color:var(--td-muted-2);">{f.pct}% · {f.plays}</span>
+					</div>
+					<div style="height:10px;border-radius:999px;background:var(--td-track);overflow:hidden;"><div style="width:{f.pct}%;height:100%;background:{fidelityFill(f.name)};border-radius:999px;"></div></div>
+				</div>
+			{/each}
+		</div>
+	{/if}
+
+	<!-- Decades -->
+	{#if stats.decades.length}
+		<h3 class="h-display" style="font-size:19px;margin:0 0 12px;">By Decade</h3>
+		<div class="panel" style="border-radius:22px;padding:22px;margin-bottom:16px;overflow-x:auto;">
+			<div style="display:flex;align-items:flex-end;gap:16px;height:150px;min-width:{stats.decades.length * 60}px;">
+				{#each stats.decades as d}
+					<div style="flex:1;display:flex;flex-direction:column;align-items:center;justify-content:flex-end;height:100%;gap:8px;">
+						<span style="font-size:12px;color:var(--td-muted-2);">{d.plays}</span>
+						<div style="width:100%;background:var(--td-track);border-radius:12px;overflow:hidden;display:flex;align-items:flex-end;height:100%;">
+							<div style="width:100%;height:{Math.max(4, (d.plays / maxDecade) * 100)}%;background:linear-gradient(180deg,#e07a55,#c67139);border-radius:12px;"></div>
+						</div>
+						<span style="font-size:12.5px;font-weight:600;">{d.name}</span>
+					</div>
+				{/each}
+			</div>
+		</div>
+	{/if}
+
 	<!-- Heatmap -->
 	<h3 class="h-display" style="font-size:19px;margin:0 0 12px;">Listening Clock</h3>
 	<div class="panel" style="border-radius:22px;padding:22px;overflow-x:auto;">
@@ -155,7 +221,7 @@
 			{/each}
 		</div>
 	{:else}
-		<p style="color:var(--td-muted-3);font-size:12.5px;margin:16px 0 0;">Language breakdown fills in as listens are classified (Settings → run enrichment). Genre and region breakdowns are still to come.</p>
+		<p style="color:var(--td-muted-3);font-size:12.5px;margin:16px 0 0;">Language breakdown fills in as listens are classified (Settings → run enrichment).</p>
 	{/if}
 {/if}
 

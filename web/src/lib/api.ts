@@ -33,6 +33,8 @@ export interface DashboardStats {
 	today: number;
 	this_week: number;
 	total: number;
+	today_hours: number;
+	week_hours: number;
 	lossless_pct: number;
 	top_artist: string;
 	top_artist_count: number;
@@ -51,10 +53,12 @@ export interface RangedStats {
 		avg_quality: number; lossless_pct: number; dsd_pct: number;
 	};
 	top_artists: { name: string; plays: number; hours: number }[];
+	top_albums: { name: string; artist: string; plays: number; hours: number }[];
+	fidelity: { name: string; plays: number; pct: number }[];
 	genres: { name: string; pct: number }[];
 	languages: { name: string; pct: number }[];
 	regions: { name: string; pct: number }[];
-	decades: { name: string; pct: number }[];
+	decades: { name: string; plays: number; pct: number }[];
 	heatmap: number[][]; // 7 days × 24 hours
 }
 
@@ -146,6 +150,57 @@ export interface Equipment {
 	total_hours: number;
 	first_used: number | null;
 	last_used: number | null;
+}
+
+/** Live playback state. Field names mirror `Scrobble` so `qualityLabel()` works on it. */
+export interface NowPlayingTrack {
+	title: string;
+	artist: string;
+	album: string | null;
+	duration: number | null;
+	progress: number;
+	updated_at: number;
+	source: string;
+	listening_context: string | null;
+	format_type: string | null;
+	codec: string | null;
+	bit_depth: number | null;
+	sample_rate: number | null;
+	dsd_multiplier: number | null;
+	delivery_codec: string | null;
+	is_lossless: boolean | null;
+}
+
+export interface NowPlayingState {
+	playing: boolean;
+	/** Seconds into the track, as of the moment the server answered. */
+	position?: number;
+	track?: NowPlayingTrack;
+}
+
+/** Server-wide Plex source config (admin only). The token is never sent back. */
+export interface PlexSettings {
+	enabled: boolean;
+	url: string;
+	has_token: boolean;
+	users_allow: string[];
+	users_block: string[];
+	devices_allow: string[];
+	devices_block: string[];
+	libraries_allow: string[];
+	libraries_block: string[];
+	updated_at: number;
+}
+
+/** Partial update. Omitting `token` keeps the stored one. */
+export type PlexSettingsUpdate = Partial<Omit<PlexSettings, 'has_token' | 'updated_at'>> & {
+	token?: string;
+};
+
+export interface PlexTestResult {
+	ok: boolean;
+	libraries?: string[];
+	error?: string;
 }
 
 export interface HealthStatus {
@@ -244,6 +299,24 @@ class TapedeckAPI {
 		return this.get('/health');
 	}
 
+	// ── Now playing ──
+	async getNowPlaying(): Promise<NowPlayingState> {
+		return this.get('/api/v1/now-playing');
+	}
+
+	// ── Sources (admin) ──
+	async getPlexSettings(): Promise<PlexSettings> {
+		return this.get('/api/v1/sources/plex');
+	}
+
+	async putPlexSettings(body: PlexSettingsUpdate): Promise<PlexSettings> {
+		return this.request('PUT', '/api/v1/sources/plex', body);
+	}
+
+	async testPlex(body: { url?: string; token?: string }): Promise<PlexTestResult> {
+		return this.post('/api/v1/sources/plex/test', body);
+	}
+
 	// ── Scrobbles ──
 	async getScrobbles(params?: {
 		limit?: number; offset?: number; artist?: string;
@@ -323,11 +396,15 @@ class TapedeckAPI {
 	async disconnect(service: string): Promise<void> {
 		return this.delNoBody(`/api/v1/connections/${service}`);
 	}
-	async lastfmStart(): Promise<{ token: string; auth_url: string }> {
-		return this.post('/api/v1/connections/lastfm/start');
+	/** `service` is 'lastfm' or 'librefm' — both speak the AudioScrobbler auth flow. */
+	async scrobblerStart(service: 'lastfm' | 'librefm'): Promise<{ token: string; auth_url: string }> {
+		return this.post(`/api/v1/connections/${service}/start`);
 	}
-	async lastfmComplete(token: string): Promise<{ connected: boolean; username: string | null }> {
-		return this.post('/api/v1/connections/lastfm/complete', { token });
+	async scrobblerComplete(
+		service: 'lastfm' | 'librefm',
+		token: string
+	): Promise<{ connected: boolean; username: string | null }> {
+		return this.post(`/api/v1/connections/${service}/complete`, { token });
 	}
 
 	// ── Import ──

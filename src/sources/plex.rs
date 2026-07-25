@@ -417,6 +417,12 @@ impl PlexSource {
         Ok(())
     }
 
+    /// Library titles discovered by `initialize`. Used by the settings UI to
+    /// show what a URL/token pair can actually see.
+    pub fn library_names(&self) -> Vec<String> {
+        self.libraries.iter().map(|l| l.title.clone()).collect()
+    }
+
     async fn fetch_libraries(&self) -> Result<Vec<Library>, Box<dyn std::error::Error>> {
         let endpoint = format!("{}/library/sections", self.url);
         let resp = self.client.get(&endpoint)

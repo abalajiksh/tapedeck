@@ -10,10 +10,8 @@ pub struct Config {
     pub database: DatabaseConfig,
     pub logging: LoggingConfig,
     pub musicbrainz: MusicBrainzConfig,
+    pub listenbrainz_url: String,
     pub plex: PlexConfig,
-    pub listenbrainz: ListenBrainzConfig,
-    pub lastfm: LastFmConfig,
-    pub librefm: LibreFmConfig,
 }
 
 #[derive(Debug, Clone)]
@@ -58,30 +56,6 @@ pub struct PlexConfig {
     pub libraries_block: Vec<String>,
 }
 
-#[derive(Debug, Clone)]
-pub struct ListenBrainzConfig {
-    pub enabled: bool,
-    pub token: String,
-    pub base_url: String,
-}
-
-#[derive(Debug, Clone)]
-pub struct LastFmConfig {
-    pub enabled: bool,
-    pub api_key: String,
-    pub secret: String,
-    pub session_key: String,
-}
-
-#[derive(Debug, Clone)]
-pub struct LibreFmConfig {
-    pub enabled: bool,
-    pub api_key: String,
-    pub secret: String,
-    pub session_key: String,
-    pub base_url: String,
-}
-
 // ════════════════════════════════════════════════════════════
 //  TOML deserialization structs (with defaults)
 // ════════════════════════════════════════════════════════════
@@ -94,7 +68,16 @@ struct TomlConfig {
     logging: TomlLogging,
     musicbrainz: TomlMusicBrainz,
     sources: TomlSources,
-    sinks: TomlSinks,
+    listenbrainz: TomlListenBrainz,
+}
+
+#[derive(Deserialize)]
+#[serde(default)]
+struct TomlListenBrainz { url: String }
+impl Default for TomlListenBrainz {
+    fn default() -> Self {
+        Self { url: crate::sinks::LISTENBRAINZ_DEFAULT_URL.into() }
+    }
 }
 
 #[derive(Deserialize)]
@@ -191,40 +174,6 @@ impl Default for TomlPlex {
     }
 }
 
-#[derive(Deserialize, Default)]
-#[serde(default)]
-struct TomlSinks {
-    listenbrainz: TomlListenBrainz,
-    lastfm: TomlLastFm,
-    librefm: TomlLibreFm,
-}
-
-#[derive(Deserialize)]
-#[serde(default)]
-struct TomlListenBrainz { enabled: bool, token: String, base_url: String }
-impl Default for TomlListenBrainz {
-    fn default() -> Self {
-        Self { enabled: false, token: String::new(), base_url: "https://api.listenbrainz.org".into() }
-    }
-}
-
-#[derive(Deserialize, Default)]
-#[serde(default)]
-struct TomlLastFm { enabled: bool, api_key: String, secret: String, session_key: String }
-
-#[derive(Deserialize)]
-#[serde(default)]
-struct TomlLibreFm { enabled: bool, api_key: String, secret: String, session_key: String, base_url: String }
-impl Default for TomlLibreFm {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            api_key: String::new(), secret: String::new(), session_key: String::new(),
-            base_url: "https://libre.fm/2.0/".into(),
-        }
-    }
-}
-
 // ════════════════════════════════════════════════════════════
 //  Loading logic
 // ════════════════════════════════════════════════════════════
@@ -273,6 +222,7 @@ impl Config {
                 console_enabled: env_or_bool("ENABLE_CONSOLE_LOGGING", t.logging.console_enabled),
                 dir: env_or("LOG_DIR", t.logging.dir),
             },
+            listenbrainz_url: env_or("LISTENBRAINZ_URL", t.listenbrainz.url),
             musicbrainz: MusicBrainzConfig {
                 user_agent: env_or("MUSICBRAINZ_USER_AGENT", t.musicbrainz.user_agent),
                 rate_limit_per_second: env_or_parse("MUSICBRAINZ_RATE_LIMIT", t.musicbrainz.rate_limit_per_second),
@@ -289,25 +239,6 @@ impl Config {
                 devices_block: env_or_list("PLEX_DEVICES_BLOCK", t.sources.plex.devices_block),
                 libraries_allow: env_or_list("PLEX_LIBRARIES_ALLOW", t.sources.plex.libraries_allow),
                 libraries_block: env_or_list("PLEX_LIBRARIES_BLOCK", t.sources.plex.libraries_block),
-            },
-            listenbrainz: ListenBrainzConfig {
-                enabled: env_or_bool("LISTENBRAINZ_ENABLED", t.sinks.listenbrainz.enabled),
-                token: env_or("LISTENBRAINZ_TOKEN", t.sinks.listenbrainz.token),
-                base_url: env_or("LISTENBRAINZ_URL",
-                    env_or("LISTENBRAINZ_BASE_URL", t.sinks.listenbrainz.base_url)),
-            },
-            lastfm: LastFmConfig {
-                enabled: env_or_bool("LASTFM_ENABLED", t.sinks.lastfm.enabled),
-                api_key: env_or("LASTFM_API_KEY", t.sinks.lastfm.api_key),
-                secret: env_or("LASTFM_SECRET", t.sinks.lastfm.secret),
-                session_key: env_or("LASTFM_SESSION_KEY", t.sinks.lastfm.session_key),
-            },
-            librefm: LibreFmConfig {
-                enabled: env_or_bool("LIBREFM_ENABLED", t.sinks.librefm.enabled),
-                api_key: env_or("LIBREFM_API_KEY", t.sinks.librefm.api_key),
-                secret: env_or("LIBREFM_SECRET", t.sinks.librefm.secret),
-                session_key: env_or("LIBREFM_SESSION_KEY", t.sinks.librefm.session_key),
-                base_url: env_or("LIBREFM_BASE_URL", t.sinks.librefm.base_url),
             },
         }
     }

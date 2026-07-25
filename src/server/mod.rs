@@ -6,9 +6,11 @@ mod export;
 pub mod import;
 pub mod ingest;
 pub mod models;
+pub mod now_playing;
 mod preferences;
 pub mod ratelimit;
 mod scrobbles;
+mod sources;
 mod users;
 
 use std::sync::Arc;
@@ -18,22 +20,20 @@ use axum::{extract::DefaultBodyLimit, routing::post, Router};
 use crate::db::Database;
 use crate::logging::LogLevelHandle;
 use crate::musicbrainz::MusicBrainzClient;
-use crate::sinks::ScrobbleSink;
 use crate::web_assets;
 
 /// Shared application state available to all request handlers.
 pub struct AppState {
     pub db: Arc<Database>,
     pub mb_client: Arc<MusicBrainzClient>,
-    pub sinks: Arc<Vec<Box<dyn ScrobbleSink>>>,
     pub log_handle: LogLevelHandle,
+    /// ListenBrainz endpoint (self-hosted instances override the default).
+    pub listenbrainz_url: String,
     /// In-memory registry of running/finished import jobs.
     pub imports: import::ImportRegistry,
-    /// Last.fm app credentials (for import + per-user OAuth connect); empty = disabled.
-    pub lastfm_api_key: String,
-    pub lastfm_secret: String,
-    /// ListenBrainz base URL for validating per-user tokens.
-    pub listenbrainz_base_url: String,
+    /// Live "now playing" per user. Shared with the poll engine, which writes
+    /// it from Plex sessions; `ingest` writes it from `playing_now` submissions.
+    pub now_playing: now_playing::NowPlayingRegistry,
     /// Brute-force throttle for the login endpoint, keyed by client IP.
     pub login_limiter: Arc<ratelimit::RateLimiter>,
     /// Max rows an in-memory analytics pass will load (scaled to host RAM).
@@ -57,6 +57,8 @@ pub fn build_app(state: Arc<AppState>) -> Router {
         .merge(gear)
         .merge(scrobbles_router)
         .merge(preferences::create_preferences_router())
+        .merge(now_playing::create_now_playing_router())
+        .merge(sources::create_sources_router())
         .merge(export::create_export_router())
         .merge(import::create_import_router())
         .merge(connections::create_connections_router())

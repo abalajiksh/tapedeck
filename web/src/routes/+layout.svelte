@@ -3,6 +3,7 @@
 	import { onMount } from 'svelte';
 	import { page } from '$app/stores';
 	import { api } from '$lib/api';
+	import { deck, watchNowPlaying } from '$lib/nowplaying';
 	import { theme, initTheme, setTheme, type ThemeMode } from '$lib/theme';
 
 	let state: 'loading' | 'public' | 'authenticated' | 'error' = 'loading';
@@ -10,6 +11,7 @@
 	let navOpen = false;
 	let isMobile = false;
 	let isAdmin = false;
+	let serverVersion = '';
 
 	// Check path immediately (before onMount) so public pages don't flash a spinner
 	const path = typeof window !== 'undefined' ? window.location.pathname : '/';
@@ -43,6 +45,11 @@
 		mq.addEventListener('change', (e) => (isMobile = e.matches));
 
 		if (isPublic) return;
+
+		// The sidebar card polls alongside whatever the page does; the store
+		// reference-counts so this and the dashboard share one request.
+		const stopDeck = watchNowPlaying();
+
 		(async () => {
 			try {
 				const res = await fetch('/api/v1/auth/status', { credentials: 'same-origin' });
@@ -52,6 +59,10 @@
 				if (!data.authenticated) return (window.location.href = '/login');
 				isAdmin = !!data.is_admin;
 				state = 'authenticated';
+
+				try {
+					serverVersion = (await api.health()).version;
+				} catch { /* footer just shows the UI version */ }
 
 				// Record the browser timezone once, so analytics use local time.
 				try {
@@ -66,6 +77,8 @@
 				errorMsg = err instanceof Error ? err.message : String(err);
 			}
 		})();
+
+		return stopDeck;
 	});
 </script>
 
@@ -135,8 +148,25 @@
 				{/if}
 			</nav>
 
+			{#if $deck.playing && $deck.track}
+				<a
+					href="/"
+					on:click={() => (navOpen = false)}
+					style="margin:8px 12px 14px;padding:12px 14px;border-radius:18px;background:var(--td-panel);color:#f4e7cf;text-decoration:none;display:block;"
+				>
+					<div style="display:flex;align-items:center;gap:8px;margin-bottom:8px;">
+						<span style="width:7px;height:7px;border-radius:50%;background:#e07a55;animation:td-blink 1.6s ease-in-out infinite;"></span>
+						<span style="font-size:10px;letter-spacing:.14em;text-transform:uppercase;color:#c9a678;">Now Playing</span>
+					</div>
+					<div style="font-size:13.5px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">{$deck.track.title}</div>
+					<div style="font-size:12px;color:#b3a487;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">{$deck.track.artist}</div>
+				</a>
+			{/if}
+
 			<div style="padding:2px 12px 14px;display:flex;align-items:center;justify-content:space-between;gap:10px;">
-				<span style="font-size:11px;color:var(--td-muted-2);padding-left:10px;">ui v2.0</span>
+				<span style="font-size:11px;color:var(--td-muted-2);padding-left:10px;">
+					{serverVersion ? `server v${serverVersion} · ` : ''}ui v{__UI_VERSION__}
+				</span>
 				<button on:click={toggleTheme} aria-label="Toggle dark mode" class="theme-toggle">
 					{#if $theme === 'dark' || (typeof document !== 'undefined' && document.documentElement.dataset.theme === 'dark')}
 						<svg viewBox="0 0 24 24" width="18" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="4.2"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg>

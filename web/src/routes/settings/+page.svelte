@@ -4,7 +4,7 @@
 	import type { TokenInfo } from '$lib/api';
 	import { formatDateTime } from '$lib/utils';
 	import { theme, setTheme, type ThemeMode } from '$lib/theme';
-	import type { Connection } from '$lib/api';
+	import type { Connection, PlexSettings, PlexTestResult } from '$lib/api';
 
 	const uiVersion = __UI_VERSION__;
 	let backendVersion = '…';
@@ -58,13 +58,50 @@
 		catch { /* ignore */ }
 	}
 
+	// Typeahead over the browser's own IANA zone list — no bundled table to go
+	// stale. Older engines lack supportedValuesOf; there the field stays free text.
+	const allZones: string[] = (() => {
+		try { return (Intl as any).supportedValuesOf?.('timeZone') ?? []; }
+		catch { return []; }
+	})();
+	let tzFocused = false;
+	let tzIndex = 0;
+
+	function matchZones(query: string, focused: boolean): string[] {
+		if (!focused || !allZones.length) return [];
+		const q = query.trim().toLowerCase().replace(/\s+/g, '_');
+		const pool = q ? allZones.filter((z) => z.toLowerCase().includes(q)) : allZones;
+		// An exact hit means they've already chosen — don't hover a list over it.
+		if (pool.length === 1 && pool[0].toLowerCase() === q) return [];
+		return pool.slice(0, 60);
+	}
+
+	$: tzMatches = matchZones(timezone, tzFocused);
+	$: if (tzIndex >= tzMatches.length) tzIndex = 0;
+
+	function pickZone(z: string) {
+		timezone = z;
+		tzFocused = false;
+		saveTimezone();
+	}
+
+	function tzKeydown(e: KeyboardEvent) {
+		if (!tzMatches.length) return;
+		if (e.key === 'ArrowDown') { e.preventDefault(); tzIndex = (tzIndex + 1) % tzMatches.length; }
+		else if (e.key === 'ArrowUp') { e.preventDefault(); tzIndex = (tzIndex - 1 + tzMatches.length) % tzMatches.length; }
+		else if (e.key === 'Enter') { e.preventDefault(); pickZone(tzMatches[tzIndex]); }
+		else if (e.key === 'Escape') { tzFocused = false; }
+	}
+
 	// connections
 	let connections: Connection[] = [];
-	let lastfmAvailable = false;
 	let lbToken = '';
 	let lbBusy = false;
-	let fmBusy = false;
-	let fmPendingToken = ''; // set after 'start', cleared after 'complete'
+	// Last.fm and Libre.fm share the same approve-then-finish flow, so their
+	// in-flight state is keyed by service rather than duplicated.
+	type Scrobbler = 'lastfm' | 'librefm';
+	let fmBusy: Scrobbler | null = null;
+	let fmPendingToken: Record<Scrobbler, string> = { lastfm: '', librefm: '' };
 	let connError = '';
 	$: conn = (svc: string) => connections.find((c) => c.service === svc) ?? null;
 
@@ -72,7 +109,6 @@
 		try {
 			const r = await api.getConnections();
 			connections = r.connections;
-			lastfmAvailable = r.lastfm_available;
 		} catch { /* optional */ }
 	}
 	async function connectLB() {
@@ -86,25 +122,96 @@
 		} catch (e) { connError = String(e).replace(/^API \d+: /, ''); }
 		lbBusy = false;
 	}
-	async function lastfmConnect() {
+	async function scrobblerConnect(svc: Scrobbler) {
 		connError = '';
-		fmBusy = true;
+		fmBusy = svc;
 		try {
-			if (!fmPendingToken) {
-				const { token, auth_url } = await api.lastfmStart();
-				fmPendingToken = token;
+			if (!fmPendingToken[svc]) {
+				const { token, auth_url } = await api.scrobblerStart(svc);
+				fmPendingToken[svc] = token;
 				window.open(auth_url, '_blank', 'noopener');
 			} else {
-				await api.lastfmComplete(fmPendingToken);
-				fmPendingToken = '';
+				await api.scrobblerComplete(svc, fmPendingToken[svc]);
+				fmPendingToken[svc] = '';
 				await loadConnections();
 			}
 		} catch (e) { connError = String(e).replace(/^API \d+: /, ''); }
-		fmBusy = false;
+		fmBusy = null;
 	}
 	async function disconnectSvc(svc: string) {
 		try { await api.disconnect(svc); await loadConnections(); } catch (e) { connError = String(e).replace(/^API \d+: /, ''); }
-		if (svc === 'lastfm') fmPendingToken = '';
+		if (svc === 'lastfm' || svc === 'librefm') fmPendingToken[svc as Scrobbler] = '';
+	}
+
+	// ── Plex source (admin only, server-wide) ──
+	let plex: PlexSettings | null = null;
+	let plexUrl = '';
+	let plexToken = '';        // blank = keep the stored one; never sent back to us
+	let plexEnabled = false;
+	let plexFilters = {
+		users_allow: '', users_block: '',
+		devices_allow: '', devices_block: '',
+		libraries_allow: '', libraries_block: ''
+	};
+	let plexAdvanced = false;
+	let plexBusy = false;
+	let plexMsg = '';
+	let plexError = '';
+	let plexTest: PlexTestResult | null = null;
+
+	function applyPlex(s: PlexSettings) {
+		plex = s;
+		plexUrl = s.url;
+		plexEnabled = s.enabled;
+		plexToken = '';
+		plexFilters = {
+			users_allow: s.users_allow.join(', '),
+			users_block: s.users_block.join(', '),
+			devices_allow: s.devices_allow.join(', '),
+			devices_block: s.devices_block.join(', '),
+			libraries_allow: s.libraries_allow.join(', '),
+			libraries_block: s.libraries_block.join(', ')
+		};
+	}
+
+	const splitList = (s: string) => s.split(',').map((x) => x.trim()).filter(Boolean);
+
+	async function loadPlex() {
+		try { applyPlex(await api.getPlexSettings()); } catch { /* non-admin or unreachable */ }
+	}
+
+	async function savePlex() {
+		plexBusy = true; plexError = ''; plexMsg = ''; plexTest = null;
+		try {
+			applyPlex(await api.putPlexSettings({
+				enabled: plexEnabled,
+				url: plexUrl.trim(),
+				...(plexToken.trim() ? { token: plexToken.trim() } : {}),
+				users_allow: splitList(plexFilters.users_allow),
+				users_block: splitList(plexFilters.users_block),
+				devices_allow: splitList(plexFilters.devices_allow),
+				devices_block: splitList(plexFilters.devices_block),
+				libraries_allow: splitList(plexFilters.libraries_allow),
+				libraries_block: splitList(plexFilters.libraries_block)
+			}));
+			plexMsg = 'Saved — the poll engine picks this up within a few seconds.';
+		} catch (e) {
+			plexError = String(e).replace(/^API \d+: /, '');
+		}
+		plexBusy = false;
+	}
+
+	async function testPlex() {
+		plexBusy = true; plexError = ''; plexMsg = ''; plexTest = null;
+		try {
+			plexTest = await api.testPlex({
+				url: plexUrl.trim(),
+				...(plexToken.trim() ? { token: plexToken.trim() } : {})
+			});
+		} catch (e) {
+			plexError = String(e).replace(/^API \d+: /, '');
+		}
+		plexBusy = false;
 	}
 
 	const themes: { v: ThemeMode; label: string }[] = [
@@ -125,6 +232,7 @@
 			timezone = (prefs.timezone as string) || Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC';
 		} catch { timezone = 'UTC'; }
 		try { isAdmin = (await api.me()).is_admin; } catch { /* optional */ }
+		if (isAdmin) loadPlex();
 		loadConnections();
 		loadLangStatus();
 		loading = false;
@@ -230,8 +338,31 @@
 
 	<div style="margin-top:18px;">
 		<div class="field" style="max-width:360px;"><label for="tz">Timezone <span style="opacity:.6">(for local-time analytics)</span></label>
-			<div style="display:flex;gap:8px;">
-				<input id="tz" class="input" bind:value={timezone} placeholder="Europe/Berlin">
+			<div style="display:flex;gap:8px;position:relative;">
+				<div style="flex:1;position:relative;">
+					<input
+						id="tz" class="input" bind:value={timezone} placeholder="Type to search — e.g. Berlin"
+						autocomplete="off" role="combobox" aria-expanded={tzMatches.length > 0} aria-controls="tz-list"
+						on:focus={() => (tzFocused = true)}
+						on:blur={() => setTimeout(() => (tzFocused = false), 120)}
+						on:keydown={tzKeydown}
+					>
+					{#if tzMatches.length}
+						<ul id="tz-list" class="tz-list">
+							{#each tzMatches as z, i}
+								<li>
+									<button
+										type="button"
+										class="tz-option"
+										class:active={i === tzIndex}
+										on:mouseenter={() => (tzIndex = i)}
+										on:click={() => pickZone(z)}
+									>{z.replace(/_/g, ' ')}</button>
+								</li>
+							{/each}
+						</ul>
+					{/if}
+				</div>
 				<button class="btn btn-secondary" on:click={saveTimezone}>{tzSaved ? '✓' : 'Save'}</button>
 			</div>
 		</div>
@@ -255,7 +386,7 @@
 <!-- Connections -->
 <div class="panel" style="border-radius:22px;padding:24px;margin-bottom:18px;">
 	<h3 class="h-display" style="font-size:19px;margin-bottom:4px;">Scrobble Connections</h3>
-	<p style="font-size:13px;color:var(--td-muted);margin:0 0 16px;">Forward <em>your</em> listens to your own Last.fm and ListenBrainz. Until you connect here, listens use the server's default configuration.</p>
+	<p style="font-size:13px;color:var(--td-muted);margin:0 0 16px;">Forward <em>your</em> listens to your own accounts. Nothing is shared across users, and a service you don't connect simply isn't forwarded to — listens are always kept locally either way.</p>
 
 	{#if connError}<div style="font-size:13px;color:#b2622d;margin-bottom:12px;">{connError}</div>{/if}
 
@@ -277,28 +408,108 @@
 		{/if}
 	</div>
 
-	<!-- Last.fm -->
-	<div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;padding:12px 0;">
-		<div style="flex:1;min-width:160px;">
-			<div style="font-weight:600;font-size:14px;">Last.fm</div>
-			{#if conn('lastfm')}
-				<div style="font-size:12.5px;color:var(--td-good-fg);">Connected{conn('lastfm')?.username ? ` as ${conn('lastfm')?.username}` : ''}</div>
-			{:else if !lastfmAvailable}
-				<div style="font-size:12.5px;color:var(--td-muted-2);">Not available — the server needs LASTFM_API_KEY and LASTFM_SECRET set.</div>
-			{:else if fmPendingToken}
-				<div style="font-size:12.5px;color:var(--td-accent);">Approve Tapedeck in the Last.fm tab, then click “Finish”.</div>
+	<!-- Last.fm and Libre.fm: same approve-then-finish flow -->
+	{#each [{ id: 'lastfm', label: 'Last.fm' }, { id: 'librefm', label: 'Libre.fm' }] as svc, i}
+		{@const key = svc.id as 'lastfm' | 'librefm'}
+		<div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;padding:12px 0;{i === 0 ? 'border-bottom:1px solid var(--td-border);' : ''}">
+			<div style="flex:1;min-width:160px;">
+				<div style="font-weight:600;font-size:14px;">{svc.label}</div>
+				{#if conn(key)}
+					<div style="font-size:12.5px;color:var(--td-good-fg);">Connected{conn(key)?.username ? ` as ${conn(key)?.username}` : ''}</div>
+				{:else if fmPendingToken[key]}
+					<div style="font-size:12.5px;color:var(--td-accent);">Approve Tapedeck in the {svc.label} tab, then click “Finish”.</div>
+				{:else}
+					<div style="font-size:12.5px;color:var(--td-muted-2);">Click Connect, approve on {svc.label}, then finish.</div>
+				{/if}
+			</div>
+			{#if conn(key)}
+				<button class="btn btn-secondary" style="color:#b2622d;" on:click={() => disconnectSvc(key)}>Disconnect</button>
 			{:else}
-				<div style="font-size:12.5px;color:var(--td-muted-2);">Click Connect, approve on Last.fm, then finish.</div>
+				<button class="btn btn-primary" on:click={() => scrobblerConnect(key)} disabled={fmBusy !== null}>
+					{fmBusy === key ? '…' : fmPendingToken[key] ? 'Finish connecting' : `Connect ${svc.label}`}
+				</button>
+				{#if fmPendingToken[key]}<button class="btn btn-secondary" on:click={() => (fmPendingToken[key] = '')}>Cancel</button>{/if}
 			{/if}
 		</div>
-		{#if conn('lastfm')}
-			<button class="btn btn-secondary" style="color:#b2622d;" on:click={() => disconnectSvc('lastfm')}>Disconnect</button>
-		{:else if lastfmAvailable}
-			<button class="btn btn-primary" on:click={lastfmConnect} disabled={fmBusy}>{fmBusy ? '…' : (fmPendingToken ? 'Finish connecting' : 'Connect Last.fm')}</button>
-			{#if fmPendingToken}<button class="btn btn-secondary" on:click={() => (fmPendingToken = '')}>Cancel</button>{/if}
+	{/each}
+</div>
+
+<!-- Plex source — admin only, and server-wide rather than per-user -->
+{#if isAdmin && plex}
+	<div class="panel" style="border-radius:22px;padding:24px;margin-bottom:18px;">
+		<h3 class="h-display" style="font-size:19px;margin-bottom:4px;">Plex</h3>
+		<p style="font-size:13px;color:var(--td-muted);margin:0 0 16px;">
+			Where listens come <em>from</em>. Tapedeck polls this server and records what everyone plays,
+			matching each Plex account to a Tapedeck user by name. This is instance-wide, not per-account —
+			only admins can change it, and it applies without a restart.
+		</p>
+
+		{#if plexError}<div style="font-size:13px;color:#b2622d;margin-bottom:12px;">{plexError}</div>{/if}
+
+		<div style="display:flex;align-items:center;gap:12px;padding:4px 0 14px;">
+			<label style="display:flex;align-items:center;gap:10px;cursor:pointer;font-size:14px;">
+				<input type="checkbox" bind:checked={plexEnabled} style="width:16px;height:16px;accent-color:var(--td-accent);cursor:pointer;">
+				Poll this Plex server
+			</label>
+			{#if plex.enabled && plex.url}
+				<span class="tag tag-accent-2" style="font-size:11px;">active</span>
+			{/if}
+		</div>
+
+		<div style="display:flex;gap:12px;flex-wrap:wrap;">
+			<div class="field" style="flex:2;min-width:240px;">
+				<label for="plex-url">Server URL</label>
+				<input id="plex-url" class="input" bind:value={plexUrl} placeholder="http://192.168.1.10:32400">
+			</div>
+			<div class="field" style="flex:1;min-width:200px;">
+				<label for="plex-token">
+					X-Plex-Token {#if plex.has_token}<span style="color:var(--td-good-fg);">· stored</span>{/if}
+				</label>
+				<input id="plex-token" class="input" type="password" bind:value={plexToken}
+					placeholder={plex.has_token ? 'Leave blank to keep' : 'Paste your token'}>
+			</div>
+		</div>
+
+		<button class="btn btn-ghost" style="margin-top:12px;font-size:13px;" on:click={() => (plexAdvanced = !plexAdvanced)}>
+			{plexAdvanced ? '− Hide' : '+ Show'} filters
+		</button>
+
+		{#if plexAdvanced}
+			<p style="font-size:12.5px;color:var(--td-muted-2);margin:8px 0 12px;">
+				Comma-separated. Leave a list empty to allow everything; a block list always wins over an allow list.
+			</p>
+			<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px;">
+				<div class="field"><label for="pf-ua">Users — allow</label><input id="pf-ua" class="input" bind:value={plexFilters.users_allow} placeholder="ashwin, partner"></div>
+				<div class="field"><label for="pf-ub">Users — block</label><input id="pf-ub" class="input" bind:value={plexFilters.users_block} placeholder="guest"></div>
+				<div class="field"><label for="pf-da">Devices — allow</label><input id="pf-da" class="input" bind:value={plexFilters.devices_allow} placeholder="Living Room"></div>
+				<div class="field"><label for="pf-db">Devices — block</label><input id="pf-db" class="input" bind:value={plexFilters.devices_block} placeholder="Chrome"></div>
+				<div class="field"><label for="pf-la">Libraries — allow</label><input id="pf-la" class="input" bind:value={plexFilters.libraries_allow} placeholder="Music"></div>
+				<div class="field"><label for="pf-lb">Libraries — block</label><input id="pf-lb" class="input" bind:value={plexFilters.libraries_block} placeholder="Podcasts"></div>
+			</div>
+		{/if}
+
+		<div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-top:16px;">
+			<button class="btn btn-primary" on:click={savePlex} disabled={plexBusy}>{plexBusy ? '…' : 'Save'}</button>
+			<button class="btn btn-secondary" on:click={testPlex} disabled={plexBusy}>Test connection</button>
+			{#if plexMsg}
+				<span style="font-size:13px;color:var(--td-good-fg);">✓ {plexMsg}</span>
+			{/if}
+		</div>
+
+		{#if plexTest}
+			<div style="margin-top:14px;font-size:13px;">
+				{#if plexTest.ok}
+					<span style="color:var(--td-good-fg);">✓ Connected.</span>
+					<span style="color:var(--td-muted);">
+						{plexTest.libraries?.length ? `Libraries: ${plexTest.libraries.join(', ')}` : 'No libraries reported.'}
+					</span>
+				{:else}
+					<span style="color:#b2622d;">✗ {plexTest.error}</span>
+				{/if}
+			</div>
 		{/if}
 	</div>
-</div>
+{/if}
 
 <!-- API Tokens -->
 <div class="panel" style="border-radius:22px;padding:24px;margin-bottom:18px;">
@@ -385,7 +596,7 @@
 		<div style="font-size:13px;color:var(--td-muted);display:flex;flex-direction:column;gap:3px;">
 			<span>Server v{backendVersion} · UI v{uiVersion}</span>
 			<span>A self-hosted music listening journal.</span>
-			<a href="https://github.com/abalajiksh/tapedeck" target="_blank" rel="noopener">View on GitHub →</a>
+			<a href="https://codeberg.org/abksh/tapedeck" target="_blank" rel="noopener">View on Codeberg →</a>
 		</div>
 	</div>
 	<button class="btn btn-secondary" style="color:#b2622d;" on:click={handleLogout}>Sign out</button>
@@ -405,6 +616,38 @@
 {/if}
 
 <style>
+	.tz-list {
+		position: absolute;
+		z-index: 30;
+		top: calc(100% + 4px);
+		left: 0;
+		right: 0;
+		max-height: 240px;
+		overflow-y: auto;
+		margin: 0;
+		padding: 5px;
+		list-style: none;
+		background: var(--td-surface);
+		border: 1px solid var(--td-border);
+		border-radius: 16px;
+		box-shadow: 0 12px 28px rgba(46, 43, 37, 0.18);
+	}
+	.tz-option {
+		display: block;
+		width: 100%;
+		text-align: left;
+		border: none;
+		background: transparent;
+		cursor: pointer;
+		font: inherit;
+		font-size: 13.5px;
+		color: var(--td-text);
+		padding: 7px 12px;
+		border-radius: 10px;
+	}
+	.tz-option.active {
+		background: var(--td-nav-hover);
+	}
 	.spin { animation: td-spin 0.7s linear infinite; }
 	.seg-btn { border: none; background: transparent; cursor: pointer; color: var(--td-nav-fg); font-size: 13px; padding: 7px 14px; border-radius: 999px; font-family: inherit; }
 	.seg-btn.on { background: var(--td-accent); color: #fbf5ea; }

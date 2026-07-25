@@ -1,98 +1,36 @@
-# ══════════════════════════════════════════════════════════
-#  Tapedeck Configuration
-# ══════════════════════════════════════════════════════════
+# Tapedeck — infrastructure settings only.
 #
-#  Copy this file to tapedeck.toml and customize.
+# Everything user-facing lives in the web UI and the database: scrobble
+# connections (ListenBrainz / Last.fm / Libre.fm) are per-user under
+# Settings → Scrobble Connections, and Plex is under Settings → Plex (admin).
+# Nothing in this file can move there — it's needed before the UI can be served.
 #
-#  Secrets (tokens, API keys) can be set here OR via
-#  environment variables / .env file. Env vars always
-#  override TOML values — useful for Docker, CI, or
-#  keeping secrets out of version control.
-#
-#  Env override format: section_key (uppercase, underscore)
-#    e.g. [sources.plex] token → PLEX_TOKEN
-# ══════════════════════════════════════════════════════════
+# Precedence: environment > .env > this file > built-in default.
+# Every key has a matching env var, e.g. [server] port -> PORT.
 
 [server]
 port = 8080
-# host = "0.0.0.0"
+host = "0.0.0.0"
+# Only enable behind a reverse proxy you control — it makes X-Forwarded-For
+# trusted for client IPs, which the login rate limiter keys on.
+trust_proxy = false
 
 [database]
+# Listens and all app state.
+scrobble_db_url = "sqlite:scrobbles.db"
+# Separate SQLite file for the MusicBrainz metadata cache.
 sqlite_path = "./tapedeck.db"
-scrobble_db_url = "sqlite:scrobbles.db?mode=rwc"
 
 [logging]
-# level = "info"            # or RUST_LOG env var
-# file_enabled = true
-# console_enabled = true
-# dir = "./logs"
+level = "info"
+dir = "./logs"
+file_enabled = true
+console_enabled = true
 
 [musicbrainz]
-user_agent = "Tapedeck/0.5.0 ( your-email@example.com )"
+# Their API requires a contact address in the User-Agent.
+user_agent = "Tapedeck/0.7.0 ( your-email@example.com )"
 rate_limit_per_second = 1
-# postgres_url = "postgresql://localhost/musicbrainz_db"
-# postgres_enabled = false
-
-# ── Sources ──────────────────────────────────────────────
-
-[sources.plex]
-enabled = true
-url = "http://192.168.1.100:32400"
-token = ""                          # or set PLEX_TOKEN env var
-
-# Filters (arrays, case-insensitive)
-users_allow = []                    # empty = allow all
-users_block = ["guest"]
-devices_allow = []
-devices_block = ["chromecast", "smart tv"]
-libraries_allow = ["music"]
-libraries_block = ["audiobooks", "podcasts"]
-
-# [sources.navidrome]
-# enabled = false
-# db_path = "./navidrome.db"
-
-# [sources.jellyfin]
-# enabled = false
-# url = "http://localhost:8096"
-# user_id = ""
-# token = ""
-
-# ── Sinks ────────────────────────────────────────────────
-
-[sinks.listenbrainz]
-enabled = true
-token = ""                          # or set LISTENBRAINZ_TOKEN env var
-base_url = "https://api.listenbrainz.org"
-
-[sinks.lastfm]
-enabled = false
-api_key = ""                        # or set LASTFM_API_KEY
-secret = ""                         # or set LASTFM_SECRET
-session_key = ""                    # or set LASTFM_SESSION_KEY
-
-[sinks.librefm]
-enabled = false
-api_key = ""                        # or set LIBREFM_API_KEY
-secret = ""                         # or set LIBREFM_SECRET
-session_key = ""                    # or set LIBREFM_SESSION_KEY
-base_url = "https://libre.fm/2.0/"  # or your GNU FM instance URL
-
-# [sinks.maloja]
-# enabled = false
-# url = "http://localhost:42010"
-# token = ""
-
-# ── Future ───────────────────────────────────────────────
-
-# [ai]
-# enabled = false
-# provider = "ollama"               # "ollama", "anthropic", "openai"
-# base_url = "http://localhost:11434"
-# model = "llama3.2"
-# daily_limit = 100
-
-# [integrations.discord]
-# rich_presence = true
-# show_quality = true
-# show_chain = true
+# Optional: a local MusicBrainz Postgres mirror, queried before the API.
+enable_postgres = false
+postgres_url = ""

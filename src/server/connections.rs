@@ -1,6 +1,9 @@
-//! Per-user scrobble connections: each user connects their own Last.fm and
-//! ListenBrainz accounts. Credentials live server-side; responses only ever
-//! reveal the connected account name, never the token/session key.
+//! Per-user scrobble connections: each user connects their own ListenBrainz,
+//! Last.fm and Libre.fm accounts. Credentials live server-side; responses only
+//! ever reveal the connected account name, never the token/session key.
+//!
+//! There is no server-wide equivalent — a listen is only ever forwarded to the
+//! accounts its own user connected here.
 
 use axum::{
     extract::{Path, State},
@@ -32,10 +35,11 @@ async fn list_connections(
             let items: Vec<serde_json::Value> = rows.into_iter().map(|(service, username, at)| {
                 serde_json::json!({ "service": service, "username": username, "connected_at": at })
             }).collect();
-            // Also surface whether Last.fm connect is even possible (app creds present).
+            // Kept for the UI's shape; Tapedeck ships its own Last.fm app
+            // credentials, so connecting is always possible.
             (StatusCode::OK, Json(serde_json::json!({
                 "connections": items,
-                "lastfm_available": !state.lastfm_api_key.is_empty() && !state.lastfm_secret.is_empty(),
+                "lastfm_available": true,
             }))).into_response()
         }
         Err(e) => err(500, e.to_string()),
@@ -47,7 +51,7 @@ async fn disconnect(
     user: AuthUser,
     Path(service): Path<String>,
 ) -> impl IntoResponse {
-    if service != "lastfm" && service != "listenbrainz" {
+    if !matches!(service.as_str(), "lastfm" | "listenbrainz" | "librefm") {
         return err(400, "Unknown service");
     }
     match state.db.delete_connection(user.user_id, &service).await {
@@ -71,7 +75,7 @@ async fn connect_listenbrainz(
         return err(400, "Token required");
     }
     // Validate against ListenBrainz and capture the account name.
-    let url = format!("{}/1/validate-token", state.listenbrainz_base_url.trim_end_matches('/'));
+    let url = format!("{}/1/validate-token", state.listenbrainz_url.trim_end_matches('/'));
     let resp = reqwest::Client::new()
         .get(&url)
         .header("Authorization", format!("Token {token}"))
@@ -108,26 +112,36 @@ fn lastfm_sign(params: &BTreeMap<&str, &str>, secret: &str) -> String {
     format!("{:x}", md5::compute(s))
 }
 
-fn lastfm_ready(state: &AppState) -> bool {
-    !state.lastfm_api_key.is_empty() && !state.lastfm_secret.is_empty()
+/// Libre.fm runs GNU FM, which implements the same AudioScrobbler 2.0 auth
+/// methods as Last.fm — so both services share one flow, differing only in
+/// which endpoints they talk to.
+struct Scrobbler {
+    label: &'static str,
+    api: &'static str,
+    auth_page: &'static str,
 }
 
-/// POST /api/v1/connections/lastfm/start — get a request token + the approval URL.
-async fn lastfm_start(
-    State(state): State<Arc<AppState>>,
-    _user: AuthUser,
-) -> impl IntoResponse {
-    if !lastfm_ready(&state) {
-        return err(400, "Last.fm is not configured on this server (set LASTFM_API_KEY and LASTFM_SECRET)");
-    }
+const LASTFM: Scrobbler = Scrobbler {
+    label: "Last.fm",
+    api: "https://ws.audioscrobbler.com/2.0/",
+    auth_page: "https://www.last.fm/api/auth/",
+};
+const LIBREFM: Scrobbler = Scrobbler {
+    label: "Libre.fm",
+    api: "https://libre.fm/2.0/",
+    auth_page: "https://libre.fm/api/auth/",
+};
+
+/// Step 1: get a request token and the URL the user approves it at.
+async fn scrobbler_start(svc: &Scrobbler) -> axum::response::Response {
     let mut params = BTreeMap::new();
-    params.insert("api_key", state.lastfm_api_key.as_str());
+    params.insert("api_key", crate::sinks::LASTFM_API_KEY);
     params.insert("method", "auth.getToken");
-    let sig = lastfm_sign(&params, &state.lastfm_secret);
+    let sig = lastfm_sign(&params, crate::sinks::LASTFM_SECRET);
 
     let url = format!(
-        "https://ws.audioscrobbler.com/2.0/?method=auth.getToken&api_key={}&api_sig={}&format=json",
-        state.lastfm_api_key, sig,
+        "{}?method=auth.getToken&api_key={}&api_sig={}&format=json",
+        svc.api, crate::sinks::LASTFM_API_KEY, sig,
     );
     let resp = reqwest::Client::new().get(&url).send().await;
     let token = match resp {
@@ -135,14 +149,66 @@ async fn lastfm_start(
             let v: serde_json::Value = r.json().await.unwrap_or_default();
             match v["token"].as_str() {
                 Some(t) => t.to_string(),
-                None => return err(502, format!("Last.fm getToken failed: {}", v["message"].as_str().unwrap_or("unknown"))),
+                None => return err(502, format!("{} getToken failed: {}", svc.label,
+                    v["message"].as_str().unwrap_or("unknown"))),
             }
         }
-        Err(e) => return err(502, format!("Could not reach Last.fm: {e}")),
+        Err(e) => return err(502, format!("Could not reach {}: {e}", svc.label)),
     };
 
-    let auth_url = format!("https://www.last.fm/api/auth/?api_key={}&token={}", state.lastfm_api_key, token);
+    let auth_url = format!("{}?api_key={}&token={}", svc.auth_page, crate::sinks::LASTFM_API_KEY, token);
     (StatusCode::OK, Json(serde_json::json!({ "token": token, "auth_url": auth_url }))).into_response()
+}
+
+/// Step 2: exchange the approved token for a long-lived session key.
+async fn scrobbler_complete(
+    state: &Arc<AppState>, user: &AuthUser, svc: &Scrobbler, service_key: &str, token: &str,
+) -> axum::response::Response {
+    if token.is_empty() {
+        return err(400, "Missing token");
+    }
+
+    let mut params = BTreeMap::new();
+    params.insert("api_key", crate::sinks::LASTFM_API_KEY);
+    params.insert("method", "auth.getSession");
+    params.insert("token", token);
+    let sig = lastfm_sign(&params, crate::sinks::LASTFM_SECRET);
+
+    let url = format!(
+        "{}?method=auth.getSession&api_key={}&token={}&api_sig={}&format=json",
+        svc.api, crate::sinks::LASTFM_API_KEY, token, sig,
+    );
+    let resp = reqwest::Client::new().get(&url).send().await;
+    let (session_key, username) = match resp {
+        Ok(r) => {
+            let v: serde_json::Value = r.json().await.unwrap_or_default();
+            match v["session"]["key"].as_str() {
+                Some(k) => (k.to_string(), v["session"]["name"].as_str().map(str::to_string)),
+                None => {
+                    // error 14/15 = token not authorized yet
+                    return err(400, format!("Not yet approved on {} — click Connect again after approving ({})",
+                        svc.label, v["message"].as_str().unwrap_or("no session")));
+                }
+            }
+        }
+        Err(e) => return err(502, format!("Could not reach {}: {e}", svc.label)),
+    };
+
+    let creds = serde_json::json!({ "session_key": session_key }).to_string();
+    match state.db.set_connection(user.user_id, service_key, &creds, username.as_deref()).await {
+        Ok(()) => (StatusCode::OK, Json(serde_json::json!({ "connected": true, "username": username }))).into_response(),
+        Err(e) => err(500, e.to_string()),
+    }
+}
+
+/// POST /api/v1/connections/lastfm/start — get a request token + the approval URL.
+async fn lastfm_start(_user: AuthUser) -> impl IntoResponse {
+    scrobbler_start(&LASTFM).await
+}
+
+/// POST /api/v1/connections/librefm/start
+async fn librefm_start(_user: AuthUser) -> impl IntoResponse {
+    scrobbler_start(&LIBREFM).await
 }
 
 #[derive(Deserialize)]
@@ -155,45 +221,16 @@ async fn lastfm_complete(
     user: AuthUser,
     Json(body): Json<LastfmComplete>,
 ) -> impl IntoResponse {
-    if !lastfm_ready(&state) {
-        return err(400, "Last.fm is not configured on this server");
-    }
-    let token = body.token.trim();
-    if token.is_empty() {
-        return err(400, "Missing token");
-    }
+    scrobbler_complete(&state, &user, &LASTFM, "lastfm", body.token.trim()).await
+}
 
-    let mut params = BTreeMap::new();
-    params.insert("api_key", state.lastfm_api_key.as_str());
-    params.insert("method", "auth.getSession");
-    params.insert("token", token);
-    let sig = lastfm_sign(&params, &state.lastfm_secret);
-
-    let url = format!(
-        "https://ws.audioscrobbler.com/2.0/?method=auth.getSession&api_key={}&token={}&api_sig={}&format=json",
-        state.lastfm_api_key, token, sig,
-    );
-    let resp = reqwest::Client::new().get(&url).send().await;
-    let (session_key, username) = match resp {
-        Ok(r) => {
-            let v: serde_json::Value = r.json().await.unwrap_or_default();
-            match v["session"]["key"].as_str() {
-                Some(k) => (k.to_string(), v["session"]["name"].as_str().map(str::to_string)),
-                None => {
-                    // error 14/15 = token not authorized yet
-                    return err(400, format!("Not yet approved on Last.fm — click Connect again after approving ({})",
-                        v["message"].as_str().unwrap_or("no session")));
-                }
-            }
-        }
-        Err(e) => return err(502, format!("Could not reach Last.fm: {e}")),
-    };
-
-    let creds = serde_json::json!({ "session_key": session_key }).to_string();
-    match state.db.set_connection(user.user_id, "lastfm", &creds, username.as_deref()).await {
-        Ok(()) => (StatusCode::OK, Json(serde_json::json!({ "connected": true, "username": username }))).into_response(),
-        Err(e) => err(500, e.to_string()),
-    }
+/// POST /api/v1/connections/librefm/complete
+async fn librefm_complete(
+    State(state): State<Arc<AppState>>,
+    user: AuthUser,
+    Json(body): Json<LastfmComplete>,
+) -> impl IntoResponse {
+    scrobbler_complete(&state, &user, &LIBREFM, "librefm", body.token.trim()).await
 }
 
 #[cfg(test)]
@@ -232,4 +269,6 @@ pub fn create_connections_router() -> Router<Arc<AppState>> {
         .route("/api/v1/connections/listenbrainz", put(connect_listenbrainz))
         .route("/api/v1/connections/lastfm/start", post(lastfm_start))
         .route("/api/v1/connections/lastfm/complete", post(lastfm_complete))
+        .route("/api/v1/connections/librefm/start", post(librefm_start))
+        .route("/api/v1/connections/librefm/complete", post(librefm_complete))
 }

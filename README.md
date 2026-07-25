@@ -33,11 +33,13 @@ Tapedeck stores listens locally *and* forwards them to Last.fm and
 ListenBrainz simultaneously. You don't have to choose — Tapedeck sits in
 front of both.
 
-Forwarding is **per user**: each account connects its own Last.fm (one-click
-OAuth) and ListenBrainz (paste a token) from Settings → Scrobble Connections,
-so everyone's listens go to their own services. A user who hasn't connected
-anything falls back to the server's global env/TOML configuration, so a
-single-user setup works out of the box.
+Forwarding is **strictly per user**: each account connects its own Last.fm and
+Libre.fm (one-click OAuth) and ListenBrainz (paste a token) from Settings →
+Scrobble Connections. There are no server-wide credentials, so a listen can only
+ever reach accounts the listening user connected themselves — nothing leaks
+between users on a shared instance. Connect nothing and your listens simply stay
+local. Tapedeck ships its own registered Last.fm application key, so there's no
+API registration step.
 
 ### Signal Chain Intelligence (Phase 2)
 
@@ -210,8 +212,7 @@ Backfill your history from elsewhere and take it with you:
 - Rust toolchain (1.75+)
 - [Bun](https://bun.sh) (to build the embedded web UI)
 - A Plex Media Server (optional — ingest API works standalone)
-- ListenBrainz token (optional)
-- Last.fm API credentials (optional)
+- A ListenBrainz / Last.fm / Libre.fm account (optional — connected per user in the UI)
 
 ### Build
 
@@ -219,7 +220,7 @@ The web UI is compiled into `static/` and then baked into the binary via
 `rust-embed`, so it must be built **before** `cargo build`:
 
 ```bash
-git clone https://github.com/abalajiksh/tapedeck.git
+git clone https://codeberg.org/abksh/tapedeck.git
 cd tapedeck
 ./build-web.sh            # bun install + vite build → static/  (required first)
 cargo build --release
@@ -234,42 +235,44 @@ cd web && bun run dev     # UI on :5173
 
 ## Configuration
 
-Configure via environment variables, a `.env` file, or `tapedeck.toml`
-(precedence: env > `.env` > `tapedeck.toml`). Copy `.env.example` to `.env`, or
-`tapedeck.toml.example` to `tapedeck.toml`:
+**Almost nothing is configured in files.** Scrobble connections
+(ListenBrainz / Last.fm / Libre.fm) are per user, set in *Settings → Scrobble
+Connections*. Plex is set in *Settings → Plex* (admin-only) and applies within a
+poll interval without a restart; "Test connection" verifies a URL/token pair by
+listing the libraries it can see. `PLEX_*` variables and the `[sources.plex]`
+TOML block **only seed the database on first run** — after that the database is
+authoritative and editing them does nothing.
+
+What is left in files is infrastructure that has to exist before the UI can be
+served. Copy `.env.example` to `.env`, or `tapedeck.toml.example` to
+`tapedeck.toml` (precedence: env > `.env` > `tapedeck.toml`):
 
 ```bash
-# ── General ──
-RUST_LOG=info
+# ── Server ──
 PORT=8080
+HOST=0.0.0.0
+TRUST_PROXY=false
 
 # ── Database ──
-SQLITE_DB_PATH=./tapedeck.db
 DATABASE_URL=sqlite:scrobbles.db
+SQLITE_DB_PATH=./tapedeck.db
+
+# ── Logging ──
+RUST_LOG=info
+LOG_DIR=./logs
 
 # ── MusicBrainz ──
-CONTACT_EMAIL=your-email@example.com
+MUSICBRAINZ_USER_AGENT=Tapedeck/0.7.0 ( your-email@example.com )
 MUSICBRAINZ_RATE_LIMIT=1
 
-# ── Plex (optional) ──
-PLEX_ENABLED=true
-PLEX_URL=http://192.168.1.X:32400
-PLEX_TOKEN=your-plex-token
-
-# ── ListenBrainz (optional) ──
-LISTENBRAINZ_ENABLED=true
-LISTENBRAINZ_TOKEN=your-lb-token
-
-# ── Last.fm (optional) ──
-LASTFM_ENABLED=true
-LASTFM_API_KEY=your-api-key
-LASTFM_SECRET=your-secret
-LASTFM_SESSION_KEY=your-session-key
-
-# ── Filtering ──
-PLEX_USERS_ALLOW=myusername
-PLEX_LIBRARIES_ALLOW=music
+# ── ListenBrainz endpoint (only for a self-hosted instance) ──
+# LISTENBRAINZ_URL=https://api.listenbrainz.org
 ```
+
+There are **no server-wide scrobble credentials.** A listen is only ever
+forwarded to accounts the listening user connected themselves; a user who has
+connected nothing keeps their listens local. Tapedeck ships its own registered
+Last.fm application key, so nobody needs to register one.
 
 ## Usage
 
@@ -446,9 +449,14 @@ means session-only.
 | PUT | `/api/v1/connections/listenbrainz` | Auth | Connect ListenBrainz (`{token}`) |
 | POST | `/api/v1/connections/lastfm/start` | Auth | Begin Last.fm OAuth → `{auth_url, token}` |
 | POST | `/api/v1/connections/lastfm/complete` | Auth | Finish Last.fm OAuth after approval |
+| POST | `/api/v1/connections/librefm/start` | Auth | Begin Libre.fm OAuth → `{auth_url, token}` |
+| POST | `/api/v1/connections/librefm/complete` | Auth | Finish Libre.fm OAuth after approval |
+| GET/PUT | `/api/v1/sources/plex` | Admin | Read / update the Plex source settings |
+| POST | `/api/v1/sources/plex/test` | Admin | Verify a Plex URL + token |
+| GET | `/api/v1/now-playing` | Auth | What this user is playing right now |
 | DELETE | `/api/v1/connections/{service}` | Auth | Disconnect a service |
 | POST | `/api/v1/import/listenbrainz` | Auth | Import by ListenBrainz username |
-| POST | `/api/v1/import/lastfm` | Auth | Import by Last.fm username (needs `LASTFM_API_KEY`) |
+| POST | `/api/v1/import/lastfm` | Auth | Import by Last.fm username |
 | POST | `/api/v1/import/file` | Auth | Import an uploaded `.json`/`.csv` |
 | GET | `/api/v1/import/jobs/{id}` | Auth | Import job progress |
 | GET | `/api/v1/import/history` | Auth | Recent import jobs |

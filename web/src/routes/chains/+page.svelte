@@ -15,7 +15,33 @@
 	$: chainName = (id: number | null) => chains.find((c) => c.id === id)?.name ?? '—';
 
 	const contexts = ['active', 'active-mobile', 'passive', 'background', 'unknown'];
-	const compTypes = ['source', 'dac', 'amp', 'transducer', 'cable', 'other'];
+	// Must stay in sync with `ComponentType` in src/models.rs — serde rejects
+	// anything else with a 422, so an extra option here is a broken save.
+	const compTypes = ['source', 'transport', 'dac', 'amp', 'transducer', 'network', 'bluetooth'];
+
+	// Free text on the backend (`equipment_type` is a plain string), so this list
+	// is a UI convenience. Unknown values from older rows are preserved below.
+	const gearTypes = [
+		{ v: 'headphones', label: 'Headphones' },
+		{ v: 'iem', label: 'IEM' },
+		{ v: 'speakers', label: 'Speakers' },
+		{ v: 'dac', label: 'DAC' },
+		{ v: 'amp', label: 'Amplifier' },
+		{ v: 'dac-amp', label: 'DAC / Amp combo' },
+		{ v: 'preamp', label: 'Preamp' },
+		{ v: 'source', label: 'Source / Streamer' },
+		{ v: 'transport', label: 'Transport' },
+		{ v: 'turntable', label: 'Turntable' },
+		{ v: 'interface', label: 'Audio interface' },
+		{ v: 'cable', label: 'Cable' },
+		{ v: 'other', label: 'Other' }
+	];
+	// Keep whatever an existing row already has, even if it predates this list.
+	$: gearTypeOptions = gearTypes.some((t) => t.v === gType)
+		? gearTypes
+		: [...gearTypes, { v: gType, label: gType }];
+	// "iem" and "dac-amp" don't survive text-transform:capitalize intact.
+	const gearTypeLabel = (v: string) => gearTypes.find((t) => t.v === v)?.label ?? v;
 
 	// chain editor
 	let chainOpen = false;
@@ -226,7 +252,7 @@
 					{#each equipment as e (e.id)}
 						<tr>
 							<td style="font-weight:600;">{e.name}</td>
-							<td style="color:var(--td-muted);text-transform:capitalize;">{e.equipment_type}</td>
+							<td style="color:var(--td-muted);">{gearTypeLabel(e.equipment_type)}</td>
 							<td style="color:var(--td-muted);">{e.brand ?? '—'}</td>
 							<td style="text-align:right;color:var(--td-good-fg);font-weight:600;">{formatHours(e.total_hours)}</td>
 							<td style="text-align:right;white-space:nowrap;">
@@ -290,7 +316,11 @@
 			<div class="dialog-body">
 				<div style="display:flex;flex-direction:column;gap:13px;">
 					<div class="field"><label for="gn">Name</label><input id="gn" class="input" bind:value={gName} placeholder="HD 650"></div>
-					<div class="field"><label for="gt">Type</label><input id="gt" class="input" bind:value={gType} placeholder="headphones, dac, amp, iem…"></div>
+					<div class="field"><label for="gt">Type</label>
+						<select id="gt" class="input" bind:value={gType}>
+							{#each gearTypeOptions as t}<option value={t.v}>{t.label}</option>{/each}
+						</select>
+					</div>
 					<div style="display:flex;gap:12px;flex-wrap:wrap;">
 						<div class="field" style="flex:1;min-width:160px;"><label for="gb">Brand</label><input id="gb" class="input" bind:value={gBrand} placeholder="Sennheiser"></div>
 						<div class="field" style="flex:1;min-width:160px;"><label for="gm">Model</label><input id="gm" class="input" bind:value={gModel}></div>

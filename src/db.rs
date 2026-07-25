@@ -81,6 +81,34 @@ pub struct ImportHistoryRow {
     pub created_at: i64,
 }
 
+/// Server-wide Plex source config. The list fields are comma-separated so the
+/// row stays a flat, hand-editable shape like the rest of the schema.
+#[derive(Debug, Clone, Default, FromRow)]
+pub struct PlexSettings {
+    pub enabled: bool,
+    pub url: String,
+    pub token: String,
+    pub users_allow: String,
+    pub users_block: String,
+    pub devices_allow: String,
+    pub devices_block: String,
+    pub libraries_allow: String,
+    pub libraries_block: String,
+    pub updated_at: i64,
+}
+
+impl PlexSettings {
+    /// Split a stored comma-separated field into the `PlexFilters` shape.
+    pub fn list(field: &str) -> Vec<String> {
+        field.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect()
+    }
+
+    /// Whether the engine can actually poll with this config.
+    pub fn is_usable(&self) -> bool {
+        self.enabled && !self.url.trim().is_empty() && !self.token.trim().is_empty()
+    }
+}
+
 pub struct Database {
     pool: Pool<Sqlite>,
 }
@@ -128,6 +156,7 @@ impl Database {
                 delivered_sinks TEXT NOT NULL DEFAULT '[]',
                 track_number INTEGER,
                 language TEXT,
+                release_year INTEGER,
                 UNIQUE(user_id, source_id, source_name)
             )"
         ).execute(&self.pool).await?;
@@ -267,6 +296,24 @@ impl Database {
             )"
         ).execute(&self.pool).await?;
 
+        // Plex is a single server-wide source, not a per-user connection, so
+        // this is deliberately a one-row table (the CHECK enforces it).
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS plex_settings (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                enabled INTEGER NOT NULL DEFAULT 0,
+                url TEXT NOT NULL DEFAULT '',
+                token TEXT NOT NULL DEFAULT '',
+                users_allow TEXT NOT NULL DEFAULT '',
+                users_block TEXT NOT NULL DEFAULT '',
+                devices_allow TEXT NOT NULL DEFAULT '',
+                devices_block TEXT NOT NULL DEFAULT '',
+                libraries_allow TEXT NOT NULL DEFAULT '',
+                libraries_block TEXT NOT NULL DEFAULT '',
+                updated_at INTEGER NOT NULL DEFAULT 0
+            )"
+        ).execute(&self.pool).await?;
+
         Ok(())
     }
 
@@ -350,6 +397,13 @@ impl Database {
         if !has_column(&self.pool, "scrobbles", "language").await {
             info!("⚙️ Migrating: adding scrobbles.language...");
             let _ = sqlx::query("ALTER TABLE scrobbles ADD COLUMN language TEXT")
+                .execute(&self.pool).await;
+        }
+
+        // Migration: release year, for the by-decade breakdown.
+        if !has_column(&self.pool, "scrobbles", "release_year").await {
+            info!("⚙️ Migrating: adding scrobbles.release_year...");
+            let _ = sqlx::query("ALTER TABLE scrobbles ADD COLUMN release_year INTEGER")
                 .execute(&self.pool).await;
         }
 
@@ -685,6 +739,22 @@ impl Database {
         Ok(())
     }
 
+    /// Listens with an MBID but no resolved release year yet. Rows without an
+    /// MBID are skipped: there's nothing to look them up with.
+    pub async fn scrobbles_needing_release_year(&self, limit: i64) -> Result<Vec<(i64, String, String, Option<String>)>, sqlx::Error> {
+        sqlx::query_as(
+            "SELECT id, title, artist, album FROM scrobbles
+             WHERE release_year IS NULL ORDER BY timestamp DESC LIMIT ?"
+        ).bind(limit).fetch_all(&self.pool).await
+    }
+
+    /// `0` records "looked up, no date known" so the row isn't retried forever.
+    pub async fn set_scrobble_release_year(&self, id: i64, year: i32) -> Result<(), sqlx::Error> {
+        sqlx::query("UPDATE scrobbles SET release_year = ? WHERE id = ?")
+            .bind(year).bind(id).execute(&self.pool).await?;
+        Ok(())
+    }
+
     /// (total, with a language set) — for backfill progress.
     pub async fn language_coverage(&self) -> Result<(i64, i64), sqlx::Error> {
         let total: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM scrobbles").fetch_one(&self.pool).await?;
@@ -718,6 +788,12 @@ impl Database {
         let total_duration: (Option<i64>,) = sqlx::query_as("SELECT SUM(duration) FROM scrobbles WHERE user_id = ? AND duration IS NOT NULL")
             .bind(user_id).fetch_one(&self.pool).await?;
         let total_hours = total_duration.0.unwrap_or(0) as f64 / 3600.0;
+        let today_duration: (Option<i64>,) = sqlx::query_as("SELECT SUM(duration) FROM scrobbles WHERE user_id = ? AND timestamp >= ? AND duration IS NOT NULL")
+            .bind(user_id).bind(today_start).fetch_one(&self.pool).await?;
+        let week_duration: (Option<i64>,) = sqlx::query_as("SELECT SUM(duration) FROM scrobbles WHERE user_id = ? AND timestamp >= ? AND duration IS NOT NULL")
+            .bind(user_id).bind(week_start).fetch_one(&self.pool).await?;
+        let today_hours = today_duration.0.unwrap_or(0) as f64 / 3600.0;
+        let week_hours = week_duration.0.unwrap_or(0) as f64 / 3600.0;
         let avg_quality: (Option<f64>,) = sqlx::query_as("SELECT AVG(quality_score) FROM scrobbles WHERE user_id = ? AND quality_score IS NOT NULL")
             .bind(user_id).fetch_one(&self.pool).await?;
 
@@ -729,6 +805,8 @@ impl Database {
             "unique_artists": unique_artists.0, "unique_albums": unique_albums.0,
             "unique_tracks": unique_tracks.0,
             "total_hours": (total_hours * 10.0).round() / 10.0,
+            "today_hours": (today_hours * 10.0).round() / 10.0,
+            "week_hours": (week_hours * 10.0).round() / 10.0,
             "avg_quality": avg_quality.0.map(|q| (q * 10.0).round() / 10.0).unwrap_or(0.0),
         }))
     }
@@ -866,6 +944,47 @@ impl Database {
             serde_json::json!({ "name": name, "plays": plays, "hours": (secs.unwrap_or(0) as f64 / 3600.0 * 10.0).round() / 10.0 })
         }).collect();
 
+        let album_rows: Vec<(String, String, i64, Option<i64>)> = sqlx::query_as(
+            "SELECT album, artist, COUNT(*) as plays, SUM(duration) as secs
+             FROM scrobbles WHERE user_id = ? AND (? IS NULL OR timestamp >= ?)
+               AND album IS NOT NULL AND album != ''
+             GROUP BY album, artist ORDER BY plays DESC LIMIT 10"
+        ).bind(user_id).bind(after).bind(after).fetch_all(&self.pool).await?;
+        let top_albums: Vec<serde_json::Value> = album_rows.into_iter().map(|(name, artist, plays, secs)| {
+            serde_json::json!({ "name": name, "artist": artist, "plays": plays,
+                "hours": (secs.unwrap_or(0) as f64 / 3600.0 * 10.0).round() / 10.0 })
+        }).collect();
+
+        // Fidelity mix, bucketed the way the badges are: DSD > lossless > lossy,
+        // with anything unlabelled called out rather than silently dropped.
+        let fidelity_rows: Vec<(String, i64)> = sqlx::query_as(
+            "SELECT CASE
+                    WHEN format_type = 'dsd' THEN 'DSD'
+                    WHEN is_lossless = TRUE THEN 'Lossless'
+                    WHEN codec IS NOT NULL AND codec != '' THEN 'Lossy'
+                    ELSE 'Unknown'
+                END AS tier, COUNT(*) as c
+             FROM scrobbles WHERE user_id = ? AND (? IS NULL OR timestamp >= ?)
+             GROUP BY tier ORDER BY c DESC"
+        ).bind(user_id).bind(after).bind(after).fetch_all(&self.pool).await?;
+        let fidelity: Vec<serde_json::Value> = fidelity_rows.into_iter().map(|(name, c)| {
+            serde_json::json!({ "name": name, "plays": c, "pct": pct(c) })
+        }).collect();
+
+        // Release decades. Only listens whose release year has been resolved by
+        // the MusicBrainz backfill count — the rest are simply absent.
+        let decade_rows: Vec<(i64, i64)> = sqlx::query_as(
+            "SELECT (release_year / 10) * 10 AS decade, COUNT(*) as c
+             FROM scrobbles WHERE user_id = ? AND (? IS NULL OR timestamp >= ?)
+               AND release_year IS NOT NULL AND release_year > 1000
+             GROUP BY decade ORDER BY decade"
+        ).bind(user_id).bind(after).bind(after).fetch_all(&self.pool).await?;
+        let decade_total: i64 = decade_rows.iter().map(|(_, c)| c).sum();
+        let decades: Vec<serde_json::Value> = decade_rows.into_iter().map(|(d, c)| {
+            serde_json::json!({ "name": format!("{}s", d), "plays": c,
+                "pct": if decade_total > 0 { (c as f64 / decade_total as f64 * 100.0).round() as i64 } else { 0 } })
+        }).collect();
+
         // Language breakdown (only listens that have been classified).
         let lang_rows: Vec<(String, i64)> = sqlx::query_as(
             "SELECT language, COUNT(*) as c FROM scrobbles
@@ -885,7 +1004,10 @@ impl Database {
                 "lossless_pct": pct(lossless.0), "dsd_pct": pct(dsd.0),
             },
             "top_artists": top_artists,
-            "genres": [], "languages": languages, "regions": [], "decades": [],
+            "top_albums": top_albums,
+            "fidelity": fidelity,
+            "decades": decades,
+            "genres": [], "languages": languages, "regions": [],
             // heatmap is filled in by the handler in the user's local timezone
             "heatmap": Vec::<Vec<i64>>::new(),
         }))
@@ -1089,6 +1211,43 @@ impl Database {
     pub async fn get_connections_for_forwarding(&self, user_id: i64) -> Result<Vec<(String, String)>, sqlx::Error> {
         sqlx::query_as("SELECT service, credentials FROM user_connections WHERE user_id = ?")
             .bind(user_id).fetch_all(&self.pool).await
+    }
+
+    // ════════════════════════════════════════════════════════════
+    //  Plex source settings (server-wide, one row)
+    // ════════════════════════════════════════════════════════════
+
+    /// The stored Plex config, or `None` before first-run seeding.
+    pub async fn get_plex_settings(&self) -> Result<Option<PlexSettings>, sqlx::Error> {
+        sqlx::query_as(
+            "SELECT enabled, url, token, users_allow, users_block, devices_allow,
+                    devices_block, libraries_allow, libraries_block, updated_at
+             FROM plex_settings WHERE id = 1"
+        ).fetch_optional(&self.pool).await
+    }
+
+    /// Write the single settings row. `updated_at` doubles as the change stamp
+    /// the engine watches to decide when to rebuild its Plex source.
+    pub async fn save_plex_settings(&self, s: &PlexSettings) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "INSERT INTO plex_settings
+                (id, enabled, url, token, users_allow, users_block, devices_allow,
+                 devices_block, libraries_allow, libraries_block, updated_at)
+             VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT(id) DO UPDATE SET
+                enabled=excluded.enabled, url=excluded.url, token=excluded.token,
+                users_allow=excluded.users_allow, users_block=excluded.users_block,
+                devices_allow=excluded.devices_allow, devices_block=excluded.devices_block,
+                libraries_allow=excluded.libraries_allow, libraries_block=excluded.libraries_block,
+                updated_at=excluded.updated_at"
+        )
+        .bind(s.enabled).bind(&s.url).bind(&s.token)
+        .bind(&s.users_allow).bind(&s.users_block)
+        .bind(&s.devices_allow).bind(&s.devices_block)
+        .bind(&s.libraries_allow).bind(&s.libraries_block)
+        .bind(Self::now_secs())
+        .execute(&self.pool).await?;
+        Ok(())
     }
 
     /// Record a new import as `running` and return its row id. Persisting at

@@ -5,63 +5,110 @@ use tokio::time::sleep;
 use tracing::{debug, error, info};
 
 use crate::db::Database;
-use crate::models::Play;
 use crate::musicbrainz::MusicBrainzClient;
-use crate::sinks::{LastFmSink, ListenBrainzSink, ScrobbleSink};
-use crate::sources::{MusicSource, PlexSource};
+use crate::server::now_playing::{NowPlaying, NowPlayingRegistry};
+use crate::sinks;
+use crate::sources::{MusicSource, PlexFilters, PlexSource};
 
 use super::enrichment::enrich_play;
 
 pub struct ScrobbleEngine {
     sources: Vec<Box<dyn MusicSource>>,
-    sinks: Arc<Vec<Box<dyn ScrobbleSink>>>,
     db: Arc<Database>,
     mb_client: Arc<MusicBrainzClient>,
     poll_interval: Duration,
     default_user_id: i64,
-    // App-level credentials used to build per-user sinks from stored connections.
-    lastfm_api_key: String,
-    lastfm_secret: String,
-    listenbrainz_base_url: String,
+    /// ListenBrainz endpoint (self-hosted instances override the default).
+    listenbrainz_url: String,
+    /// Shared with the HTTP layer so the dashboard deck reflects Plex sessions.
+    now_playing: NowPlayingRegistry,
+    /// `plex_settings.updated_at` of the config the current source was built
+    /// from. A newer stamp means an admin edited it and we rebuild.
+    plex_config_stamp: i64,
+    /// Set once we've reported an unreachable Plex, so the per-tick retry
+    /// doesn't repeat the same error every poll interval.
+    plex_unreachable_logged: bool,
 }
 
 impl ScrobbleEngine {
     pub fn new(
         sources: Vec<Box<dyn MusicSource>>,
-        sinks: Arc<Vec<Box<dyn ScrobbleSink>>>,
         db: Arc<Database>,
         mb_client: Arc<MusicBrainzClient>,
-        lastfm_api_key: String,
-        lastfm_secret: String,
-        listenbrainz_base_url: String,
+        now_playing: NowPlayingRegistry,
+        listenbrainz_url: String,
     ) -> Self {
         Self {
-            sources, sinks, db, mb_client,
+            sources, db, mb_client,
             poll_interval: Duration::from_secs(15),
             default_user_id: 1,
-            lastfm_api_key, lastfm_secret, listenbrainz_base_url,
+            now_playing,
+            listenbrainz_url,
+            plex_config_stamp: 0,
+            plex_unreachable_logged: false,
         }
     }
 
-    /// Build this user's own sinks from their stored connections. Empty if they
-    /// haven't connected anything (caller then falls back to the global sinks).
-    fn build_user_sinks(&self, conns: &[(String, String)]) -> Vec<Box<dyn ScrobbleSink>> {
-        let mut sinks: Vec<Box<dyn ScrobbleSink>> = Vec::new();
-        for (service, creds_json) in conns {
-            let creds: serde_json::Value = serde_json::from_str(creds_json).unwrap_or_default();
-            match service.as_str() {
-                "lastfm" => if let Some(sk) = creds["session_key"].as_str() {
-                    sinks.push(Box::new(LastFmSink::new(
-                        self.lastfm_api_key.clone(), self.lastfm_secret.clone(), sk.to_string())));
-                },
-                "listenbrainz" => if let Some(t) = creds["token"].as_str() {
-                    sinks.push(Box::new(ListenBrainzSink::new(
-                        self.listenbrainz_base_url.clone(), t.to_string())));
-                },
-                _ => {}
+    /// Bring the Plex source in line with the stored settings. Runs every tick,
+    /// so an admin's save applies within one poll interval instead of at the
+    /// next restart — and a server that was unreachable when we first tried
+    /// (still booting, network not up yet) gets picked up when it comes back.
+    async fn reconcile_plex_source(&mut self) {
+        let settings = match self.db.get_plex_settings().await {
+            Ok(Some(s)) => s,
+            Ok(None) => return, // never configured; nothing to reconcile
+            Err(e) => { error!("Failed to read Plex settings: {}", e); return; }
+        };
+
+        let config_changed = settings.updated_at != self.plex_config_stamp;
+
+        if config_changed {
+            self.plex_config_stamp = settings.updated_at;
+            self.plex_unreachable_logged = false; // new config: report failures loudly again
+            // Drop the old source either way — a disabled or reconfigured Plex
+            // must not keep polling with stale credentials.
+            self.sources.retain(|s| s.name() != "Plex");
+            self.now_playing.clear_source("Plex");
+        }
+
+        if !settings.is_usable() {
+            if config_changed { info!("⚙️ Plex source disabled"); }
+            return;
+        }
+
+        // Already running on the current config — nothing to do. Otherwise we
+        // either just applied a change or a previous build failed; retry.
+        if self.sources.iter().any(|s| s.name() == "Plex") {
+            return;
+        }
+
+        let filters = PlexFilters {
+            users_allow: crate::db::PlexSettings::list(&settings.users_allow),
+            users_block: crate::db::PlexSettings::list(&settings.users_block),
+            devices_allow: crate::db::PlexSettings::list(&settings.devices_allow),
+            devices_block: crate::db::PlexSettings::list(&settings.devices_block),
+            libraries_allow: crate::db::PlexSettings::list(&settings.libraries_allow),
+            libraries_block: crate::db::PlexSettings::list(&settings.libraries_block),
+        };
+        let mut plex = PlexSource::with_filters(settings.url.clone(), settings.token.clone(), filters);
+        match plex.initialize().await {
+            Ok(()) => {
+                info!("✅ Plex source connected ({})", settings.url);
+                self.plex_unreachable_logged = false;
+                self.sources.push(Box::new(plex));
+            }
+            Err(e) => {
+                // Retried every tick, so log the first failure and then stay
+                // quiet rather than filling the log while a server is down.
+                if !self.plex_unreachable_logged {
+                    error!("❌ Plex unreachable ({}): {} — retrying every {}s",
+                        settings.url, e, self.poll_interval.as_secs());
+                    self.plex_unreachable_logged = true;
+                } else {
+                    debug!("Plex still unreachable: {}", e);
+                }
             }
         }
-        sinks
     }
 
     /// Runs the poll loop until `shutdown` flips to `true`. A tick always runs
@@ -98,10 +145,12 @@ impl ScrobbleEngine {
     }
 
     pub async fn run_tick(&mut self) {
+        self.reconcile_plex_source().await;
+
         let mut has_active_now_playing = false;
 
-        let sinks = self.sinks.clone();
         let mb_client = self.mb_client.clone();
+        let lb_url = self.listenbrainz_url.clone();
         let db = self.db.clone();
         let default_user_id = self.default_user_id;
 
@@ -118,7 +167,22 @@ impl ScrobbleEngine {
                             for plex_track in &session_result.now_playing {
                                 let mut play = plex_track.to_play("np");
                                 enrich_play(&mb_client, &mut play, plex_track.album.as_deref()).await;
-                                Self::submit_now_playing_to(&sinks, &play).await;
+
+                                // Feed the dashboard deck. Plex reports the real
+                                // playhead, so the UI gets a true position rather
+                                // than counting up from when we first saw it.
+                                let user_id = match &plex_track.plex_user {
+                                    Some(name) => db.get_user_id_by_username(name).await.ok().flatten().unwrap_or(default_user_id),
+                                    None => default_user_id,
+                                };
+                                let progress = plex_track.view_offset.unwrap_or(0) / 1000;
+                                self.now_playing.set(user_id, NowPlaying::from_play(
+                                    &play, "Plex", plex_track.audio_quality.as_ref(), progress,
+                                ));
+
+                                // Forward to *that* user's connected accounts.
+                                let user_sinks = sinks::sinks_for_user(&db, user_id, &lb_url).await;
+                                sinks::submit_now_playing(&user_sinks, &play).await;
                             }
 
                             if !session_result.ready_to_scrobble.is_empty() {
@@ -175,6 +239,9 @@ impl ScrobbleEngine {
         }
 
         if !has_active_now_playing {
+            // A Plex tick with no sessions is an authoritative "stopped" — clear
+            // the deck now instead of letting the entry time out on its own.
+            self.now_playing.clear_source("Plex");
             self.flush_pending().await;
         } else {
             debug!("⏸ Skipping pending scrobbles - active now playing session");
@@ -190,16 +257,10 @@ impl ScrobbleEngine {
         // Incrementally classify listen languages (script instantly, a few
         // MusicBrainz lookups per tick to respect the rate limit).
         crate::enrich::backfill_languages(&self.db, &self.mb_client, 50, 8).await;
-    }
 
-    async fn submit_now_playing_to(sinks: &[Box<dyn ScrobbleSink>], play: &Play) {
-        for sink in sinks.iter() {
-            if let Some(lb_sink) = sink.as_any().downcast_ref::<ListenBrainzSink>() {
-                if let Err(e) = lb_sink.submit_now_playing(play).await {
-                    error!("Failed to submit now playing to {}: {}", sink.name(), e);
-                }
-            }
-        }
+        // Same deal for release years (feeds the by-decade breakdown) — cache
+        // hits are free, so the budget only bounds real API calls.
+        crate::enrich::backfill_release_years(&self.db, &self.mb_client, 50, 8).await;
     }
 
     async fn flush_pending(&mut self) {
@@ -211,17 +272,15 @@ impl ScrobbleEngine {
         info!("🔄 Processing {} pending scrobble(s)", pending.len());
 
         // Group by user so each user's listens forward to *their* connected
-        // services (falling back to the global sinks when they've connected none).
-        let global = self.sinks.clone();
+        // services — and only those. No server-wide fallback: a user who has
+        // connected nothing keeps their listens local.
         let mut by_user: HashMap<i64, Vec<crate::db::PendingScrobble>> = HashMap::new();
         for ps in pending { by_user.entry(ps.user_id).or_default().push(ps); }
 
         for (uid, items) in by_user {
-            let conns = self.db.get_connections_for_forwarding(uid).await.unwrap_or_default();
-            let user_sinks = self.build_user_sinks(&conns);
-            // ponytail: sinks are rebuilt each flush (fresh reqwest client) — fine
-            // at self-host volume; cache per user if throughput ever matters.
-            let targets: &[Box<dyn ScrobbleSink>] = if user_sinks.is_empty() { &global } else { &user_sinks };
+            // Rebuilt each flush (fresh reqwest client) — fine at self-host
+            // volume; cache per user if throughput ever matters.
+            let targets = sinks::sinks_for_user(&self.db, uid, &self.listenbrainz_url).await;
             let enabled: Vec<String> = targets.iter().map(|s| s.name().to_string()).collect();
 
             for mut ps in items {

@@ -3,31 +3,63 @@
 	import { api } from '$lib/api';
 	import type { Scrobble } from '$lib/api';
 	import ScrobbleRow from '$lib/components/ScrobbleRow.svelte';
-	import { qualityLabel, tierTagClass } from '$lib/utils';
+	import { deck, watchNowPlaying } from '$lib/nowplaying';
+	import { formatDuration, qualityLabel, tierTagClass } from '$lib/utils';
 
 	let recent: Scrobble[] = [];
 	let loading = true;
 	let connected = false;
 	let today = 0, thisWeek = 0, losslessPct = 0;
+	let todayHours = 0, weekHours = 0;
 
-	$: hero = recent[0] ?? null;
+	// The deck shows what's playing when a source is reporting, and falls back
+	// to the most recent listen otherwise.
+	$: live = $deck.playing ? $deck.track : null;
+	$: hero = live ?? recent[0] ?? null;
 	$: heroQ = hero ? qualityLabel(hero) : null;
+	$: progressPct = live?.duration ? Math.min(100, ($deck.position / live.duration) * 100) : 0;
+	// A tape counter is just a position readout — four digits, like the real thing.
+	$: counter = String(Math.floor($deck.position) % 10000).padStart(4, '0');
 
-	onMount(async () => {
-		try {
-			connected = (await api.health()).status === 'ok';
-		} catch { connected = false; }
+	// 14 bars, staggered so the meter doesn't pulse in unison.
+	const vuBars = Array.from({ length: 14 }, (_, i) => ({
+		duration: 0.55 + (i % 5) * 0.13,
+		delay: i * 0.05
+	}));
 
-		try {
-			const s = await api.getDashboardStats();
-			today = s.today; thisWeek = s.this_week; losslessPct = s.lossless_pct;
-		} catch (e) { console.warn('stats', e); }
+	// Purely cosmetic — digital audio has no sides. It's a nod to the format,
+	// so it only changes the label and which way the reels turn.
+	let side: 'A' | 'B' = 'A';
+	function flip() {
+		side = side === 'A' ? 'B' : 'A';
+	}
 
-		try {
-			recent = (await api.getScrobbles({ limit: 8 })).scrobbles;
-		} catch (e) { console.warn('scrobbles', e); }
+	function playsLabel(plays: number, hours: number): string {
+		return hours >= 0.1 ? `plays · ${hours} hrs` : 'plays';
+	}
 
-		loading = false;
+	onMount(() => {
+		const stop = watchNowPlaying();
+
+		(async () => {
+			try {
+				connected = (await api.health()).status === 'ok';
+			} catch { connected = false; }
+
+			try {
+				const s = await api.getDashboardStats();
+				today = s.today; thisWeek = s.this_week; losslessPct = s.lossless_pct;
+				todayHours = s.today_hours; weekHours = s.week_hours;
+			} catch (e) { console.warn('stats', e); }
+
+			try {
+				recent = (await api.getScrobbles({ limit: 8 })).scrobbles;
+			} catch (e) { console.warn('scrobbles', e); }
+
+			loading = false;
+		})();
+
+		return stop;
 	});
 </script>
 
@@ -57,7 +89,7 @@
 				<rect x="62" y="88" width="216" height="92" rx="12" fill="#1b1712"/>
 				<rect x="120" y="120" width="100" height="28" rx="3" fill="#3a3128"/>
 				{#each [120, 220] as cx}
-					<g class="reel" style="transform-box:fill-box;transform-origin:center;">
+					<g class="reel" class:rolling={$deck.playing} class:reverse={side === 'B'} style="transform-box:fill-box;transform-origin:center;">
 						<circle {cx} cy="134" r="33" fill="none" stroke="#e9dcc4" stroke-width="3"/>
 						<circle {cx} cy="134" r="22" fill="none" stroke="#7a6f5c" stroke-width="2" opacity=".6"/>
 						<circle {cx} cy="134" r="8" fill="#e9dcc4"/>
@@ -71,15 +103,42 @@
 		<div style="flex:1;min-width:260px;">
 			{#if hero}
 				<div style="display:flex;align-items:center;gap:8px;margin-bottom:8px;">
-					<span style="width:8px;height:8px;border-radius:50%;background:#e07a55;animation:td-blink 1.6s ease-in-out infinite;"></span>
-					<span style="font-size:11px;letter-spacing:.16em;text-transform:uppercase;color:#c67139;font-weight:600;">Last Played</span>
+					<span style="width:8px;height:8px;border-radius:50%;background:{live ? '#e07a55' : 'var(--td-muted-3)'};{live ? 'animation:td-blink 1.6s ease-in-out infinite;' : ''}"></span>
+					<span style="font-size:11px;letter-spacing:.16em;text-transform:uppercase;color:#c67139;font-weight:600;">{live ? `Now Playing · Side ${side}` : 'Last Played'}</span>
 				</div>
 				<h2 class="h-display" style="font-size:28px;margin:0 0 4px;">{hero.title}</h2>
 				<p style="margin:0 0 14px;color:var(--td-muted);font-size:15.5px;">{hero.artist}{hero.album ? ` — ${hero.album}` : ''}</p>
-				<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
+
+				<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;{live ? 'margin-bottom:16px;' : ''}">
 					{#if heroQ?.text}<span class={tierTagClass(heroQ.tier)}>{heroQ.text}</span>{/if}
 					{#if hero.listening_context}<span class="tag tag-neutral">{hero.listening_context}</span>{/if}
+					{#if live}
+						<div style="display:flex;align-items:flex-end;gap:3px;height:34px;margin-left:4px;">
+							{#each vuBars as bar}
+								<span class="vu" style="animation-duration:{bar.duration}s;animation-delay:{bar.delay}s;"></span>
+							{/each}
+						</div>
+					{/if}
 				</div>
+
+				{#if live}
+					<div style="height:8px;border-radius:999px;background:var(--td-track);overflow:hidden;margin-bottom:8px;">
+						<div style="height:100%;width:{progressPct}%;border-radius:999px;background:linear-gradient(90deg,var(--td-accent-2),var(--td-accent-hi));transition:width .9s linear;"></div>
+					</div>
+					<div style="display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;">
+						<div style="display:flex;align-items:center;gap:14px;flex-wrap:wrap;">
+							<div style="font-variant-numeric:tabular-nums;font-size:13.5px;color:var(--td-muted);">
+								{formatDuration($deck.position)}{live.duration ? ` / ${formatDuration(live.duration)}` : ''}
+							</div>
+							<button class="btn btn-secondary" on:click={flip} title="Cosmetic — flips the side label" style="font-size:12.5px;padding:6px 14px;gap:7px;">
+								<svg viewBox="0 0 24 24" width="15" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12a9 9 0 0 1 15-6.7L21 8"/><path d="M21 12a9 9 0 0 1-15 6.7L3 16"/></svg>Flip · Side {side}
+							</button>
+						</div>
+						<div style="display:flex;align-items:center;gap:8px;background:var(--td-panel2);color:#e9dcc4;padding:6px 12px;border-radius:9px;font-variant-numeric:tabular-nums;letter-spacing:.14em;font-size:15px;">
+							<span style="font-size:9px;letter-spacing:.14em;color:#9a8c72;">TAPE</span>{counter}
+						</div>
+					</div>
+				{/if}
 			{:else}
 				<h2 class="h-display" style="font-size:26px;margin:0 0 6px;">The deck is empty</h2>
 				<p style="margin:0;color:var(--td-muted);font-size:15px;">Nothing recorded yet — <a href="/import">import a backup</a> or start scrobbling.</p>
@@ -92,12 +151,12 @@
 		<div class="panel" style="border-radius:22px;padding:20px 22px;">
 			<div style="font-size:11px;letter-spacing:.12em;text-transform:uppercase;color:var(--td-muted-2);margin-bottom:6px;">Today</div>
 			<div class="h-display" style="font-size:36px;line-height:1;">{today}</div>
-			<div style="font-size:12.5px;color:var(--td-muted-2);margin-top:6px;">plays</div>
+			<div style="font-size:12.5px;color:var(--td-muted-2);margin-top:6px;">{playsLabel(today, todayHours)}</div>
 		</div>
 		<div class="panel" style="border-radius:22px;padding:20px 22px;">
 			<div style="font-size:11px;letter-spacing:.12em;text-transform:uppercase;color:var(--td-muted-2);margin-bottom:6px;">This Week</div>
 			<div class="h-display" style="font-size:36px;line-height:1;">{thisWeek}</div>
-			<div style="font-size:12.5px;color:var(--td-muted-2);margin-top:6px;">plays</div>
+			<div style="font-size:12.5px;color:var(--td-muted-2);margin-top:6px;">{playsLabel(thisWeek, weekHours)}</div>
 		</div>
 		<div style="background:var(--td-panel);color:#f4e7cf;border-radius:22px;padding:20px 22px;">
 			<div style="font-size:11px;letter-spacing:.12em;text-transform:uppercase;color:#c9a678;margin-bottom:6px;">Lossless</div>
@@ -121,6 +180,26 @@
 {/if}
 
 <style>
-	.reel { animation: td-spin 4s linear infinite; }
-	.spin { animation: td-spin 0.7s linear infinite; }
+	/* The reels only turn while something is actually playing — a still deck
+	   is the honest signal that no source is reporting. */
+	.reel.rolling {
+		animation: td-spin 4s linear infinite;
+	}
+	.reel.rolling.reverse {
+		animation-direction: reverse;
+	}
+	.spin {
+		animation: td-spin 0.7s linear infinite;
+	}
+	.vu {
+		width: 4px;
+		height: 34px;
+		border-radius: 2px;
+		background: linear-gradient(var(--td-accent-2), var(--td-accent));
+		transform-origin: bottom;
+		animation-name: td-vu;
+		animation-timing-function: ease-in-out;
+		animation-iteration-count: infinite;
+		animation-direction: alternate;
+	}
 </style>

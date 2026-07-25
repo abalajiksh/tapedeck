@@ -7,6 +7,18 @@ use std::collections::HashMap;
 use std::time::Duration;
 use tokio::time::sleep;
 
+/// Tapedeck's registered Last.fm application credentials.
+///
+/// These are baked in on purpose. Last.fm issues one key per *application*, not
+/// per user — every desktop scrobbler (fooyin, Audacious, Clementine…) ships its
+/// key the same way, because a client-side app has nowhere to hide one. They
+/// identify Tapedeck; the thing that authorises a scrobble is the per-user
+/// session key obtained through the auth flow and stored in `user_connections`.
+/// So this is not a secret worth protecting — it just means users don't have to
+/// register their own app before connecting Last.fm.
+pub const LASTFM_API_KEY: &str = "f90c2a1009b9e296ad339bd65e059ec7";
+pub const LASTFM_SECRET: &str = "7f5ef26759ce73de771845e65375050e";
+
 /// A scrobble sink for Last.fm-compatible APIs (Last.fm, Libre.fm, or any GNU FM instance).
 pub struct LastFmSink {
     api_key: String,

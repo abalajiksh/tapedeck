@@ -24,9 +24,13 @@ export function formatDateTime(timestamp: number): string {
 	});
 }
 
-/** Format duration in seconds to mm:ss or h:mm:ss */
+/**
+ * Format duration in seconds to mm:ss or h:mm:ss.
+ * Zero is a real value here (a track that just started), so only missing or
+ * nonsensical input renders as an em dash.
+ */
 export function formatDuration(seconds: number | null | undefined): string {
-	if (!seconds) return '—';
+	if (seconds == null || !Number.isFinite(seconds) || seconds < 0) return '—';
 	const h = Math.floor(seconds / 3600);
 	const m = Math.floor((seconds % 3600) / 60);
 	const s = seconds % 60;

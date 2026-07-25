@@ -11,6 +11,7 @@ use crate::engine::enrichment::enrich_play;
 use crate::models::{AudioQuality, Play};
 use super::auth::IngestAuth;
 use super::models::*;
+use super::now_playing::NowPlaying;
 use super::AppState;
 
 /// POST /1/submit-listens
@@ -168,13 +169,17 @@ pub async fn submit_listens(
                     enrich_play(&state.mb_client, &mut play, album_hint.as_deref()).await;
                 }
                 debug!("Now playing (ingest): {} - {} [user: {}]", play.artist, play.title, user.username);
-                for sink in state.sinks.iter() {
-                    if let Some(lb_sink) = sink.as_any().downcast_ref::<crate::sinks::ListenBrainzSink>() {
-                        if let Err(e) = lb_sink.submit_now_playing(&play).await {
-                            error!("Failed to forward now playing to {}: {}", sink.name(), e);
-                        }
-                    }
-                }
+
+                // Feed the deck. Clients submit `playing_now` at track start
+                // and carry no position, so we start at 0 and let the registry
+                // extrapolate from `duration`.
+                let mut np = NowPlaying::from_play(&play, "ingest", quality_opt, 0);
+                np.listening_context = listening_context.clone();
+                state.now_playing.set(user.user_id, np);
+
+                // Forward to the submitting user's own connected accounts only.
+                let user_sinks = crate::sinks::sinks_for_user(&state.db, user.user_id, &state.listenbrainz_url).await;
+                crate::sinks::submit_now_playing(&user_sinks, &play).await;
                 accepted += 1;
             }
             ListenType::Single | ListenType::Import => {
