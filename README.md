@@ -19,13 +19,26 @@ listening experience, not just the listening history.
 
 ### Universal Ingest API (Phase 1)
 
-Tapedeck exposes a ListenBrainz-compatible `/1/submit-listens` endpoint. Any
-client that speaks the LB protocol works out of the box — Pano Scrobbler,
-Web Scrobbler, multi-scrobbler, mpdscribble. Point it at your Tapedeck URL,
-set your token, done.
+Tapedeck implements the ListenBrainz Core API endpoints a scrobble client
+actually exercises — `validate-token`, `submit-listens`, `user/…/listens`,
+`playing-now`, `listen-count`, `services`, `playing-now/delete` and
+`latest-import` — so clients like Pano Scrobbler, Web Scrobbler,
+multi-scrobbler and mpdscribble work out of the box. Point one at your Tapedeck
+URL, paste a token, done.
+
+Two deliberate differences from listenbrainz.org:
+
+- **Reads need a token.** On ListenBrainz a user's listens are public. A
+  self-hosted Tapedeck is usually private, so these endpoints require
+  authentication and only return your own data (admins can read any user).
+- **No MSIDs.** Tapedeck keys listens by source rather than assigning recording
+  MSIDs, so `/1/delete-listen` isn't implemented — use
+  `DELETE /api/v1/scrobbles/:id`. Playlists, `lb-radio` and similar-users aren't
+  implemented either; they return a clean JSON 404 rather than a stub.
 
 Beyond the LB spec, Tapedeck accepts extended fields for audio quality,
-device identification, signal chain tagging, and session metadata.
+device identification, signal chain tagging, and session metadata — and reads
+them back in `additional_info`, so a listen round-trips intact.
 
 ### Scrobble Proxy
 
@@ -398,8 +411,14 @@ means session-only.
 
 | Method | Path | Auth | Description |
 |--------|------|------|-------------|
-| GET | `/1/validate-token` | Token | ListenBrainz-compatible token check (`{valid, user_name}`) |
-| POST | `/1/submit-listens` | Token | LB-compatible listen submission |
+| GET | `/1/validate-token` | Token | LB token check (`{valid, user_name}`) |
+| POST | `/1/submit-listens` | Token | LB listen submission |
+| GET | `/1/user/:user/listens` | Token | LB listen history (`max_ts`/`min_ts`/`count`) |
+| GET | `/1/user/:user/playing-now` | Token | LB now-playing |
+| GET | `/1/user/:user/listen-count` | Token | LB total listen count |
+| GET | `/1/user/:user/services` | Token | LB connected-services list |
+| POST | `/1/playing-now/delete` | Token | Clear your now-playing |
+| GET/POST | `/1/latest-import` | Token | LB import high-water mark |
 
 ### Admin
 

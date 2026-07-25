@@ -45,6 +45,7 @@ pub struct ScrobbleRecord {
     pub session_id: Option<i64>,
     pub listening_context: Option<String>,
     pub submission_client: Option<String>,
+    pub track_number: Option<i32>,
     #[serde(default)]
     pub delivered_sinks: Option<String>,
 }
@@ -710,6 +711,15 @@ impl Database {
         .bind(after).bind(after).bind(before).bind(before)
         .bind(limit).bind(offset)
         .fetch_all(&self.pool).await
+    }
+
+    /// (total listens, newest listened_at) for a user — the two numbers the
+    /// ListenBrainz-compatible endpoints report alongside a listen page.
+    pub async fn listen_count_and_latest(&self, user_id: i64) -> Result<(i64, Option<i64>), sqlx::Error> {
+        let row: (i64, Option<i64>) = sqlx::query_as(
+            "SELECT COUNT(*), MAX(timestamp) FROM scrobbles WHERE user_id = ?"
+        ).bind(user_id).fetch_one(&self.pool).await?;
+        Ok(row)
     }
 
     /// Minimal columns for analytics: (timestamp, artist, title, album, track_number).

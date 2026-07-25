@@ -105,6 +105,14 @@ impl NowPlayingRegistry {
         }
     }
 
+    /// Drop this user's entry, whatever reported it. Backs
+    /// `POST /1/playing-now/delete`.
+    pub fn clear_user(&self, user_id: i64) {
+        if let Ok(mut map) = self.0.write() {
+            map.remove(&user_id);
+        }
+    }
+
     /// The user's current track, or `None` once it has run its course.
     /// Expired entries are dropped on read so the map can't grow unbounded.
     pub fn get(&self, user_id: i64) -> Option<(NowPlaying, u64)> {

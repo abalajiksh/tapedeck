@@ -5,6 +5,7 @@ mod connections;
 mod export;
 pub mod import;
 pub mod ingest;
+mod lb_api;
 pub mod models;
 pub mod now_playing;
 mod preferences;
@@ -53,6 +54,7 @@ pub fn build_app(state: Arc<AppState>) -> Router {
     let api = Router::new()
         .route("/1/submit-listens", post(ingest::submit_listens))
         .route("/1/validate-token", get(ingest::validate_token))
+        .merge(lb_api::create_lb_api_router())
         .merge(auth_router)
         .merge(user_mgmt)
         .merge(gear)
