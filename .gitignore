@@ -46,3 +46,6 @@ tapedeck.toml
 tapedeck.toml
 
 CLAUDE.md
+
+# CI pipeline lives in the separate tapedeck-cicd repo
+/Jenkinsfile

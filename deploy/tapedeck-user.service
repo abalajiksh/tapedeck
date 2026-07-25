@@ -1,0 +1,36 @@
+# Tapedeck as a *user* systemd service — runs as your login user with no root
+# or sudo, which is exactly what the CI deploy needs (it only has SSH-key access
+# as `abalaji`). Recommended for the Pi Zero / any single-user host.
+#
+# One-time setup on the target (as the deploy user, e.g. abalaji):
+#
+#   mkdir -p ~/tapedeck ~/.config/systemd/user
+#   cp tapedeck-user.service ~/.config/systemd/user/tapedeck.service
+#   loginctl enable-linger "$USER"          # keep the service running with no active login
+#   systemctl --user daemon-reload
+#   systemctl --user enable tapedeck        # start on boot
+#   # (optional) create ~/tapedeck/.env for config; the DB lives in ~/tapedeck/
+#
+# The CI pipeline drops the binary at ~/tapedeck/tapedeck and runs
+# `systemctl --user restart tapedeck`. On the very first run the binary won't
+# exist yet, so let the pipeline deploy it, then `systemctl --user start tapedeck`.
+
+[Unit]
+Description=Tapedeck — self-hosted scrobbler
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+WorkingDirectory=%h/tapedeck
+ExecStart=%h/tapedeck/tapedeck
+EnvironmentFile=-%h/tapedeck/.env
+Restart=on-failure
+RestartSec=5
+# Match the app's graceful shutdown window (drains requests + finishes the
+# current poll tick). Even a hard kill can't corrupt the SQLite DB (WAL).
+KillSignal=SIGTERM
+TimeoutStopSec=45
+
+[Install]
+WantedBy=default.target
