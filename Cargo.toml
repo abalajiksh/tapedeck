@@ -1,6 +1,6 @@
 [package]
 name = "tapedeck"
-version = "0.8.0"
+version = "0.9.0"
 edition = "2021"
 
 [dependencies]
@@ -55,3 +55,8 @@ rust-embed = "8"
 mime_guess = "2"
 chacha20poly1305 = "0.11.0"
 base64 = "0.23.0"
+
+# Liner notes. Markdown is rendered server-side so sanitisation happens once,
+# in one place, rather than in every client that ever shows a note.
+pulldown-cmark = { version = "0.13.4", default-features = false, features = ["html"] }
+ammonia = "4.1.4"

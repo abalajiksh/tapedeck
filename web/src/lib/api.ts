@@ -211,6 +211,84 @@ export type UserSourceUpdate = Partial<
 	Omit<UserSource, 'id' | 'kind' | 'has_token' | 'remote_account' | 'last_polled_at' | 'last_error' | 'updated_at'>
 > & { kind?: string; token?: string; username?: string; password?: string; api_key?: string };
 
+// ── Liner notes (Phase 7) ──
+
+/** Something a note or a love can point at. */
+export interface Entity {
+	id: number;
+	kind: 'recording' | 'release' | 'artist';
+	name: string;
+	/** Empty for an artist, where the name *is* the artist. */
+	artist_name: string;
+	mbid: string | null;
+	created_at: number;
+}
+
+export interface NoteListen {
+	id: number;
+	title: string;
+	artist: string;
+	album: string | null;
+	timestamp: number;
+}
+
+/** Stored from the start because Phase 6 needs it — nothing is served to other
+ *  users yet, so today every value behaves as private. */
+export type Visibility = 'private' | 'patched' | 'public';
+
+/**
+ * How the API addresses a note's target. Use exactly one form: an existing
+ * entity, a listen, the track/album/artist *of* a listen, or a spelled-out
+ * name. `kind` accepts the shortcode spelling (track/album/artist).
+ */
+export interface NoteTarget {
+	entity_id?: number;
+	scrobble_id?: number;
+	from_scrobble?: number;
+	kind?: 'track' | 'album' | 'artist';
+	name?: string;
+	artist?: string;
+	mbid?: string;
+}
+
+export interface Note {
+	id: number;
+	body_md: string;
+	/** Server-rendered and sanitised — safe for {@html}. Absent in list views. */
+	body_html?: string;
+	excerpt: string;
+	visibility: Visibility;
+	created_at: number;
+	updated_at: number;
+	entity: Entity | null;
+	listen: NoteListen | null;
+	loved: boolean;
+	revisions: number;
+}
+
+/** Per-target state around one listen. `entity_id` is null until something has
+ *  actually been written or loved — inspecting a listen creates nothing. */
+export interface Annotation {
+	name: string;
+	entity_id: number | null;
+	note_id: number | null;
+	loved: boolean;
+}
+
+export interface ListenAnnotations {
+	listen_note_id: number | null;
+	track: Annotation | null;
+	album: Annotation | null;
+	artist: Annotation | null;
+}
+
+export interface NoteRevision {
+	id: number;
+	body_md: string;
+	excerpt: string;
+	created_at: number;
+}
+
 export interface SourceTestResult {
 	ok: boolean;
 	libraries?: string[];
@@ -495,6 +573,42 @@ class TapedeckAPI {
 	// ── Bulk chain reassignment (History) ──
 	async bulkSetChain(ids: number[], signal_chain_id: number | null): Promise<{ updated: number }> {
 		return this.post('/api/v1/scrobbles/bulk-chain', { ids, signal_chain_id });
+	}
+
+	// ── Liner notes & loves ──
+	async getNotes(): Promise<{ notes: Note[] }> { return this.get('/api/v1/notes'); }
+	async getNote(id: number): Promise<Note> { return this.get(`/api/v1/notes/${id}`); }
+	async saveNote(body: NoteTarget & { body_md: string; visibility?: Visibility }): Promise<Note> {
+		return this.post('/api/v1/notes', body);
+	}
+	async deleteNote(id: number): Promise<void> { await this.del(`/api/v1/notes/${id}`); }
+	async noteRevisions(id: number): Promise<{ revisions: NoteRevision[] }> {
+		return this.get(`/api/v1/notes/${id}/revisions`);
+	}
+	/** Render without saving, so the editor can show what a shortcode resolves to. */
+	async previewNote(body: NoteTarget & { body_md: string }): Promise<{ body_html: string }> {
+		return this.post('/api/v1/notes/preview', body);
+	}
+	/** The note for a target, if any — plus the resolved target itself. */
+	async noteFor(target: NoteTarget): Promise<{ note: Note | null; target: { entity?: Entity | null; listen?: NoteListen | null }; loved: boolean }> {
+		const q = new URLSearchParams();
+		for (const [k, v] of Object.entries(target)) {
+			if (v !== undefined && v !== null) q.set(k, String(v));
+		}
+		return this.get(`/api/v1/notes/for?${q}`);
+	}
+	async getLoves(): Promise<{ loves: { entity: Entity; loved_at: number }[] }> {
+		return this.get('/api/v1/loves');
+	}
+	async setLove(target: NoteTarget, loved: boolean): Promise<{ entity: Entity; loved: boolean }> {
+		return this.post('/api/v1/loves', { ...target, loved });
+	}
+	async getEntity(id: number): Promise<{ entity: Entity; loved: boolean; note: Note | null }> {
+		return this.get(`/api/v1/entities/${id}`);
+	}
+	/** Notes and loves around one listen. Read-only — nothing is created. */
+	async listenAnnotations(id: number): Promise<ListenAnnotations> {
+		return this.get(`/api/v1/scrobbles/${id}/annotations`);
 	}
 
 	// ── Users (admin) ──

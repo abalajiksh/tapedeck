@@ -38,6 +38,11 @@ pub struct AdditionalInfo {
     pub submission_client: Option<String>,
     pub submission_client_version: Option<String>,
     pub duration_ms: Option<i64>,
+    /// ListenBrainz spells this `tracknumber`; Tapedeck's own submissions and
+    /// some clients use `track_number`. A mismatch here is silent — the number
+    /// simply goes missing, taking album-playthrough analytics and `[[track:3]]`
+    /// with it — so accept both spellings.
+    #[serde(alias = "tracknumber", alias = "trackNumber")]
     pub track_number: Option<i32>,
 
     // ── Tapedeck extensions ──

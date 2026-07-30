@@ -75,6 +75,38 @@ pub struct BindingRow {
     pub hits: i64,
 }
 
+/// Something a note or a love can point at: a recording, a release, an artist.
+#[derive(Debug, Clone, FromRow, serde::Serialize)]
+pub struct EntityRow {
+    pub id: i64,
+    pub kind: String,
+    pub name: String,
+    /// Empty for `kind = 'artist'`, where the name *is* the artist.
+    pub artist_name: String,
+    pub mbid: Option<String>,
+    pub created_at: i64,
+}
+
+#[derive(Debug, Clone, FromRow, serde::Serialize)]
+pub struct NoteRow {
+    pub id: i64,
+    pub user_id: i64,
+    pub entity_id: Option<i64>,
+    pub scrobble_id: Option<i64>,
+    pub body_md: String,
+    pub visibility: String,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, FromRow, serde::Serialize)]
+pub struct NoteRevisionRow {
+    pub id: i64,
+    pub note_id: i64,
+    pub body_md: String,
+    pub created_at: i64,
+}
+
 #[derive(Debug, FromRow, serde::Serialize)]
 pub struct ImportHistoryRow {
     pub id: i64,
@@ -394,6 +426,85 @@ impl Database {
                 mbid TEXT,
                 image_url TEXT,
                 updated_at INTEGER NOT NULL DEFAULT 0
+            )"
+        ).execute(&self.pool).await?;
+
+        // ── Entities, liner notes and loves (Phase 7) ──
+        //
+        // Anything you can write about: a recording, a release, an artist.
+        // Deliberately *not* keyed by MBID — an un-enriched listen has none, so
+        // notes would silently fail on exactly the obscure records worth
+        // annotating. The MBID is one alias among others.
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS entities (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                kind TEXT NOT NULL,
+                name TEXT NOT NULL,
+                artist_name TEXT NOT NULL DEFAULT '',
+                entity_key TEXT NOT NULL UNIQUE,
+                mbid TEXT,
+                created_at INTEGER NOT NULL
+            )"
+        ).execute(&self.pool).await?;
+
+        // Other names the same entity answers to. Today this carries MBIDs; it
+        // is what makes merging two spellings of one record possible later
+        // without rewriting every note that points at either.
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS entity_aliases (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                entity_id INTEGER NOT NULL REFERENCES entities(id),
+                alias_kind TEXT NOT NULL,
+                value TEXT NOT NULL,
+                UNIQUE(entity_id, alias_kind, value)
+            )"
+        ).execute(&self.pool).await?;
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_entity_aliases_lookup ON entity_aliases(alias_kind, value)")
+            .execute(&self.pool).await?;
+
+        // A note is a living document: one per user per target, edited in place.
+        // Exactly one of entity_id / scrobble_id is set — a note about a record
+        // and a note about one particular playing of it are different things.
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS notes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL REFERENCES users(id),
+                entity_id INTEGER REFERENCES entities(id),
+                scrobble_id INTEGER REFERENCES scrobbles(id),
+                body_md TEXT NOT NULL,
+                visibility TEXT NOT NULL DEFAULT 'private',
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                CHECK ((entity_id IS NULL) <> (scrobble_id IS NULL))
+            )"
+        ).execute(&self.pool).await?;
+        // Partial uniques: one note per target per user, enforced by the
+        // database rather than by every write path remembering to check.
+        sqlx::query("CREATE UNIQUE INDEX IF NOT EXISTS idx_notes_user_entity ON notes(user_id, entity_id) WHERE entity_id IS NOT NULL")
+            .execute(&self.pool).await?;
+        sqlx::query("CREATE UNIQUE INDEX IF NOT EXISTS idx_notes_user_scrobble ON notes(user_id, scrobble_id) WHERE scrobble_id IS NOT NULL")
+            .execute(&self.pool).await?;
+
+        // Every edit keeps what was there before. These are meant to be kept for
+        // years; a rewrite in 2031 shouldn't erase what you thought in 2026.
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS note_revisions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                note_id INTEGER NOT NULL REFERENCES notes(id),
+                body_md TEXT NOT NULL,
+                created_at INTEGER NOT NULL
+            )"
+        ).execute(&self.pool).await?;
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_note_revisions_note ON note_revisions(note_id, created_at)")
+            .execute(&self.pool).await?;
+
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS loves (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL REFERENCES users(id),
+                entity_id INTEGER NOT NULL REFERENCES entities(id),
+                created_at INTEGER NOT NULL,
+                UNIQUE(user_id, entity_id)
             )"
         ).execute(&self.pool).await?;
 
@@ -1109,7 +1220,13 @@ impl Database {
     }
 
     /// Delete a single listen owned by the user. Returns false if not found.
+    ///
+    /// Foreign keys are on, so a note attached to this listen has to go first —
+    /// otherwise the delete fails outright. The note is about *this playing* of
+    /// the track, so it has nothing to survive onto; notes about the record
+    /// itself hang off an entity and are untouched.
     pub async fn delete_scrobble(&self, user_id: i64, id: i64) -> Result<bool, sqlx::Error> {
+        self.delete_notes_for_scrobbles(user_id, Some(id)).await?;
         let res = sqlx::query("DELETE FROM scrobbles WHERE id = ? AND user_id = ?")
             .bind(id).bind(user_id).execute(&self.pool).await?;
         Ok(res.rows_affected() > 0)
@@ -1117,9 +1234,28 @@ impl Database {
 
     /// Delete ALL listens for the user. Returns the number removed.
     pub async fn clear_scrobbles(&self, user_id: i64) -> Result<u64, sqlx::Error> {
+        self.delete_notes_for_scrobbles(user_id, None).await?;
         let res = sqlx::query("DELETE FROM scrobbles WHERE user_id = ?")
             .bind(user_id).execute(&self.pool).await?;
         Ok(res.rows_affected())
+    }
+
+    /// Clear listen-attached notes (and their revisions) for one listen, or for
+    /// every listen this user has when `id` is None.
+    async fn delete_notes_for_scrobbles(&self, user_id: i64, id: Option<i64>) -> Result<(), sqlx::Error> {
+        let ids: Vec<(i64,)> = match id {
+            Some(id) => sqlx::query_as("SELECT id FROM notes WHERE user_id = ? AND scrobble_id = ?")
+                .bind(user_id).bind(id).fetch_all(&self.pool).await?,
+            None => sqlx::query_as("SELECT id FROM notes WHERE user_id = ? AND scrobble_id IS NOT NULL")
+                .bind(user_id).fetch_all(&self.pool).await?,
+        };
+        for (note_id,) in ids {
+            sqlx::query("DELETE FROM note_revisions WHERE note_id = ?")
+                .bind(note_id).execute(&self.pool).await?;
+            sqlx::query("DELETE FROM notes WHERE id = ?")
+                .bind(note_id).execute(&self.pool).await?;
+        }
+        Ok(())
     }
 
     /// A single listen by id, scoped to the user.
@@ -1612,6 +1748,280 @@ impl Database {
         Ok((total.0, with_image.0))
     }
 
+    // ════════════════════════════════════════════════════════════
+    //  Entities, liner notes and loves (Phase 7)
+    // ════════════════════════════════════════════════════════════
+
+    /// Identity of an entity: kind + artist + name, all case- and
+    /// padding-insensitive. Two spellings of one record should be one row, and
+    /// the same track title by two artists must not be.
+    fn entity_key(kind: &str, artist_name: &str, name: &str) -> String {
+        format!(
+            "{}|{}|{}",
+            kind.trim().to_lowercase(),
+            artist_name.trim().to_lowercase(),
+            name.trim().to_lowercase()
+        )
+    }
+
+    /// The three things a note or a love can point at. Callers validate against
+    /// this before writing — the column is a plain TEXT.
+    pub const ENTITY_KINDS: [&'static str; 3] = ["recording", "release", "artist"];
+
+    /// Get-or-create. An MBID is recorded when the caller has one, but never
+    /// required and never the identity — `COALESCE` so a later lookup that
+    /// finds nothing can't erase an MBID we already had.
+    pub async fn upsert_entity(
+        &self, kind: &str, name: &str, artist_name: &str, mbid: Option<&str>,
+    ) -> Result<i64, sqlx::Error> {
+        let key = Self::entity_key(kind, artist_name, name);
+        sqlx::query(
+            "INSERT INTO entities (kind, name, artist_name, entity_key, mbid, created_at)
+             VALUES (?, ?, ?, ?, ?, ?)
+             ON CONFLICT(entity_key) DO UPDATE SET mbid = COALESCE(excluded.mbid, entities.mbid)"
+        )
+        .bind(kind.trim().to_lowercase()).bind(name.trim()).bind(artist_name.trim())
+        .bind(&key).bind(mbid).bind(Self::now_secs())
+        .execute(&self.pool).await?;
+
+        let (id,): (i64,) = sqlx::query_as("SELECT id FROM entities WHERE entity_key = ?")
+            .bind(&key).fetch_one(&self.pool).await?;
+
+        if let Some(mbid) = mbid.filter(|m| !m.trim().is_empty()) {
+            let _ = sqlx::query(
+                "INSERT OR IGNORE INTO entity_aliases (entity_id, alias_kind, value) VALUES (?, 'mbid', ?)"
+            ).bind(id).bind(mbid.trim()).execute(&self.pool).await;
+        }
+        Ok(id)
+    }
+
+    pub async fn get_entity(&self, id: i64) -> Result<Option<EntityRow>, sqlx::Error> {
+        sqlx::query_as("SELECT id, kind, name, artist_name, mbid, created_at FROM entities WHERE id = ?")
+            .bind(id).fetch_optional(&self.pool).await
+    }
+
+    /// Exact match on the identity key, or — when the artist isn't known — the
+    /// oldest entity of that kind with the name.
+    pub async fn find_entity(
+        &self, kind: &str, name: &str, artist_name: Option<&str>,
+    ) -> Result<Option<EntityRow>, sqlx::Error> {
+        if let Some(artist) = artist_name.filter(|a| !a.trim().is_empty()) {
+            let key = Self::entity_key(kind, artist, name);
+            let hit: Option<EntityRow> = sqlx::query_as(
+                "SELECT id, kind, name, artist_name, mbid, created_at FROM entities WHERE entity_key = ?"
+            ).bind(key).fetch_optional(&self.pool).await?;
+            if hit.is_some() { return Ok(hit); }
+        }
+        sqlx::query_as(
+            "SELECT id, kind, name, artist_name, mbid, created_at FROM entities
+             WHERE kind = ? AND LOWER(TRIM(name)) = ? ORDER BY id LIMIT 1"
+        )
+        .bind(kind.trim().to_lowercase()).bind(name.trim().to_lowercase())
+        .fetch_optional(&self.pool).await
+    }
+
+    /// What a `[[track:…]]` / `[[album:…]]` / `[[artist:…]]` shortcode points at.
+    ///
+    /// Resolution walks outward: an entity that already exists, then the user's
+    /// own listening history. The history step **creates** the entity it finds,
+    /// which is a write on a read path — deliberately, because the alternative
+    /// is that every cross-reference renders dead until you happen to annotate
+    /// the thing it points at. Entities are shared metadata, not user content,
+    /// so minting one costs nothing and makes references work for anything you
+    /// have actually played.
+    ///
+    /// `position` handles `[[track:3]]`: the third track of `ctx_album`,
+    /// resolved through the listen history and rendered with its real title.
+    pub async fn resolve_reference(
+        &self, user_id: i64, kind: &str, target: &str,
+        position: Option<i64>, ctx_artist: Option<&str>, ctx_album: Option<&str>,
+    ) -> Result<Option<(i64, String)>, sqlx::Error> {
+        let needle = target.trim().to_lowercase();
+        if needle.is_empty() { return Ok(None); }
+
+        // "Track 3 of this record" — only answerable with an album in context.
+        if let (Some(pos), Some(album)) = (position.filter(|_| kind == "recording"), ctx_album) {
+            let row: Option<(String, String, Option<String>)> = sqlx::query_as(
+                "SELECT title, artist, mbid_recording FROM scrobbles
+                 WHERE user_id = ? AND LOWER(TRIM(album)) = ? AND track_number = ?
+                 ORDER BY id DESC LIMIT 1"
+            )
+            .bind(user_id).bind(album.trim().to_lowercase()).bind(pos)
+            .fetch_optional(&self.pool).await?;
+            if let Some((title, artist, mbid)) = row {
+                let id = self.upsert_entity("recording", &title, &artist, mbid.as_deref()).await?;
+                return Ok(Some((id, title)));
+            }
+            return Ok(None);
+        }
+        if position.is_some() { return Ok(None); }
+
+        if let Some(e) = self.find_entity(kind, target, ctx_artist).await? {
+            return Ok(Some((e.id, e.name)));
+        }
+
+        // Nothing annotated yet — fall back to what this user has listened to.
+        let found: Option<(String, String, Option<String>)> = match kind {
+            "artist" => sqlx::query_as(
+                "SELECT artist, '', mbid_artist FROM scrobbles
+                 WHERE user_id = ? AND LOWER(TRIM(artist)) = ? ORDER BY id DESC LIMIT 1"
+            ).bind(user_id).bind(&needle).fetch_optional(&self.pool).await?,
+
+            // `ORDER BY (artist = ctx) DESC` prefers the record by the artist
+            // this note is about when two of them share a title.
+            "release" => sqlx::query_as(
+                "SELECT album, artist, mbid_release FROM scrobbles
+                 WHERE user_id = ? AND LOWER(TRIM(album)) = ?
+                 ORDER BY (LOWER(TRIM(artist)) = ?) DESC, id DESC LIMIT 1"
+            )
+            .bind(user_id).bind(&needle)
+            .bind(ctx_artist.unwrap_or_default().trim().to_lowercase())
+            .fetch_optional(&self.pool).await?,
+
+            _ => sqlx::query_as(
+                "SELECT title, artist, mbid_recording FROM scrobbles
+                 WHERE user_id = ? AND LOWER(TRIM(title)) = ?
+                 ORDER BY (LOWER(TRIM(album)) = ?) DESC, (LOWER(TRIM(artist)) = ?) DESC, id DESC LIMIT 1"
+            )
+            .bind(user_id).bind(&needle)
+            .bind(ctx_album.unwrap_or_default().trim().to_lowercase())
+            .bind(ctx_artist.unwrap_or_default().trim().to_lowercase())
+            .fetch_optional(&self.pool).await?,
+        };
+
+        let Some((name, artist, mbid)) = found else { return Ok(None) };
+        if name.trim().is_empty() { return Ok(None); }
+        let id = self.upsert_entity(kind, &name, &artist, mbid.as_deref()).await?;
+        Ok(Some((id, name)))
+    }
+
+    /// The album this user most recently heard a given track on. Supplies the
+    /// album context for a note about a *track*, so `[[track:3]]` still means
+    /// "the third track of the record this one is from".
+    pub async fn album_for_track(&self, user_id: i64, title: &str, artist: &str)
+        -> Result<Option<String>, sqlx::Error>
+    {
+        let row: Option<(Option<String>,)> = sqlx::query_as(
+            "SELECT album FROM scrobbles
+             WHERE user_id = ? AND LOWER(TRIM(title)) = ? AND LOWER(TRIM(artist)) = ?
+               AND album IS NOT NULL AND album <> ''
+             ORDER BY id DESC LIMIT 1"
+        )
+        .bind(user_id).bind(title.trim().to_lowercase()).bind(artist.trim().to_lowercase())
+        .fetch_optional(&self.pool).await?;
+        Ok(row.and_then(|(album,)| album))
+    }
+
+    /// Write a note, keeping what it said before.
+    ///
+    /// One note per user per target: the second write edits the first rather
+    /// than stacking up, and the previous body is archived first so an edit
+    /// never destroys what was there. An unchanged body writes no revision —
+    /// toggling visibility isn't a rewrite.
+    pub async fn upsert_note(
+        &self, user_id: i64, entity_id: Option<i64>, scrobble_id: Option<i64>,
+        body_md: &str, visibility: &str,
+    ) -> Result<i64, sqlx::Error> {
+        let now = Self::now_secs();
+        let existing = match (entity_id, scrobble_id) {
+            (Some(e), _) => self.note_for_entity(user_id, e).await?,
+            (_, Some(s)) => self.note_for_scrobble(user_id, s).await?,
+            _ => None,
+        };
+
+        if let Some(note) = existing {
+            if note.body_md != body_md {
+                sqlx::query("INSERT INTO note_revisions (note_id, body_md, created_at) VALUES (?, ?, ?)")
+                    .bind(note.id).bind(&note.body_md).bind(note.updated_at)
+                    .execute(&self.pool).await?;
+            }
+            sqlx::query("UPDATE notes SET body_md = ?, visibility = ?, updated_at = ? WHERE id = ? AND user_id = ?")
+                .bind(body_md).bind(visibility).bind(now).bind(note.id).bind(user_id)
+                .execute(&self.pool).await?;
+            return Ok(note.id);
+        }
+
+        let result = sqlx::query(
+            "INSERT INTO notes (user_id, entity_id, scrobble_id, body_md, visibility, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?)"
+        )
+        .bind(user_id).bind(entity_id).bind(scrobble_id).bind(body_md).bind(visibility)
+        .bind(now).bind(now)
+        .execute(&self.pool).await?;
+        Ok(result.last_insert_rowid())
+    }
+
+    pub async fn get_note(&self, user_id: i64, id: i64) -> Result<Option<NoteRow>, sqlx::Error> {
+        sqlx::query_as("SELECT * FROM notes WHERE id = ? AND user_id = ?")
+            .bind(id).bind(user_id).fetch_optional(&self.pool).await
+    }
+
+    pub async fn note_for_entity(&self, user_id: i64, entity_id: i64) -> Result<Option<NoteRow>, sqlx::Error> {
+        sqlx::query_as("SELECT * FROM notes WHERE user_id = ? AND entity_id = ?")
+            .bind(user_id).bind(entity_id).fetch_optional(&self.pool).await
+    }
+
+    pub async fn note_for_scrobble(&self, user_id: i64, scrobble_id: i64) -> Result<Option<NoteRow>, sqlx::Error> {
+        sqlx::query_as("SELECT * FROM notes WHERE user_id = ? AND scrobble_id = ?")
+            .bind(user_id).bind(scrobble_id).fetch_optional(&self.pool).await
+    }
+
+    pub async fn list_notes(&self, user_id: i64) -> Result<Vec<NoteRow>, sqlx::Error> {
+        sqlx::query_as("SELECT * FROM notes WHERE user_id = ? ORDER BY updated_at DESC")
+            .bind(user_id).fetch_all(&self.pool).await
+    }
+
+    /// Revisions newest-first, scoped through the note's owner so an id from
+    /// another user's note reads as "no revisions" rather than as history.
+    pub async fn note_revisions(&self, user_id: i64, note_id: i64) -> Result<Vec<NoteRevisionRow>, sqlx::Error> {
+        sqlx::query_as(
+            "SELECT r.id, r.note_id, r.body_md, r.created_at FROM note_revisions r
+             JOIN notes n ON n.id = r.note_id
+             WHERE r.note_id = ? AND n.user_id = ? ORDER BY r.created_at DESC, r.id DESC"
+        ).bind(note_id).bind(user_id).fetch_all(&self.pool).await
+    }
+
+    /// Foreign keys are on, so the revisions have to go first.
+    pub async fn delete_note(&self, user_id: i64, id: i64) -> Result<bool, sqlx::Error> {
+        if self.get_note(user_id, id).await?.is_none() { return Ok(false); }
+        sqlx::query("DELETE FROM note_revisions WHERE note_id = ?").bind(id).execute(&self.pool).await?;
+        let result = sqlx::query("DELETE FROM notes WHERE id = ? AND user_id = ?")
+            .bind(id).bind(user_id).execute(&self.pool).await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    pub async fn set_love(&self, user_id: i64, entity_id: i64, loved: bool) -> Result<(), sqlx::Error> {
+        if loved {
+            sqlx::query("INSERT OR IGNORE INTO loves (user_id, entity_id, created_at) VALUES (?, ?, ?)")
+                .bind(user_id).bind(entity_id).bind(Self::now_secs())
+                .execute(&self.pool).await?;
+        } else {
+            sqlx::query("DELETE FROM loves WHERE user_id = ? AND entity_id = ?")
+                .bind(user_id).bind(entity_id).execute(&self.pool).await?;
+        }
+        Ok(())
+    }
+
+    pub async fn is_loved(&self, user_id: i64, entity_id: i64) -> Result<bool, sqlx::Error> {
+        let row: Option<(i64,)> = sqlx::query_as("SELECT 1 FROM loves WHERE user_id = ? AND entity_id = ?")
+            .bind(user_id).bind(entity_id).fetch_optional(&self.pool).await?;
+        Ok(row.is_some())
+    }
+
+    /// Loved entities, newest first, with the timestamp of the love.
+    pub async fn list_loves(&self, user_id: i64) -> Result<Vec<(EntityRow, i64)>, sqlx::Error> {
+        let rows: Vec<(i64, String, String, String, Option<String>, i64, i64)> = sqlx::query_as(
+            "SELECT e.id, e.kind, e.name, e.artist_name, e.mbid, e.created_at, l.created_at
+             FROM loves l JOIN entities e ON e.id = l.entity_id
+             WHERE l.user_id = ? ORDER BY l.created_at DESC"
+        ).bind(user_id).fetch_all(&self.pool).await?;
+        Ok(rows.into_iter()
+            .map(|(id, kind, name, artist_name, mbid, created_at, loved_at)| {
+                (EntityRow { id, kind, name, artist_name, mbid, created_at }, loved_at)
+            })
+            .collect())
+    }
+
     /// Lowest-numbered admin — the migration target for config that used to be
     /// instance-wide and now needs an owner.
     pub async fn first_admin_id(&self) -> Result<Option<i64>, sqlx::Error> {
@@ -2005,7 +2415,13 @@ impl Database {
     /// user is removed first so foreign keys stay consistent.
     pub async fn delete_user(&self, id: i64) -> Result<bool, sqlx::Error> {
         let mut tx = self.pool.begin().await?;
-        for table in ["scrobbles", "tokens", "signal_chains", "devices",
+        // Revisions reference notes, and notes reference scrobbles, so both have
+        // to be cleared before the rows they point at. Entities are shared
+        // metadata and stay; the loves and notes that pointed at them go.
+        sqlx::query(
+            "DELETE FROM note_revisions WHERE note_id IN (SELECT id FROM notes WHERE user_id = ?)"
+        ).bind(id).execute(&mut *tx).await?;
+        for table in ["notes", "loves", "scrobbles", "tokens", "signal_chains", "devices",
                       "equipment", "sessions", "chain_bindings", "import_jobs",
                       "web_sessions", "user_connections"] {
             sqlx::query(&format!("DELETE FROM {} WHERE user_id = ?", table))
@@ -2419,5 +2835,150 @@ mod tests {
         assert_eq!(before.updated_at, after.updated_at);
         assert_eq!(after.last_error.as_deref(), Some("boom"));
         assert!(after.last_polled_at.is_some());
+    }
+
+    // ── Liner notes (Phase 7) ──
+
+    #[tokio::test]
+    async fn one_entity_per_spelling_and_the_mbid_is_only_an_alias() {
+        let db = testdb().await;
+        let first = db.upsert_entity("recording", "Xtal", "Aphex Twin", None).await.unwrap();
+        // Same record typed differently is the same row...
+        let again = db.upsert_entity("recording", " xtal ", "aphex twin", Some("mb-1")).await.unwrap();
+        assert_eq!(first, again);
+        // ...and learning the MBID later doesn't create a second one.
+        assert_eq!(db.get_entity(first).await.unwrap().unwrap().mbid.as_deref(), Some("mb-1"));
+
+        // A later lookup that knows nothing must not erase what we had.
+        db.upsert_entity("recording", "Xtal", "Aphex Twin", None).await.unwrap();
+        assert_eq!(db.get_entity(first).await.unwrap().unwrap().mbid.as_deref(), Some("mb-1"));
+
+        // Same title by someone else is a different record.
+        let other = db.upsert_entity("recording", "Xtal", "Some Coverband", None).await.unwrap();
+        assert_ne!(first, other);
+    }
+
+    #[tokio::test]
+    async fn editing_a_note_keeps_what_it_said_before() {
+        let db = testdb().await;
+        let uid = db.create_user("ann", None, "x", "user").await.unwrap();
+        let e = db.upsert_entity("release", "SAW 85-92", "Aphex Twin", None).await.unwrap();
+
+        let id = db.upsert_note(uid, Some(e), None, "first thoughts", "private").await.unwrap();
+        let again = db.upsert_note(uid, Some(e), None, "second thoughts", "public").await.unwrap();
+
+        // One note per target — the second write edits rather than stacks.
+        assert_eq!(id, again);
+        assert_eq!(db.list_notes(uid).await.unwrap().len(), 1);
+        let note = db.get_note(uid, id).await.unwrap().unwrap();
+        assert_eq!(note.body_md, "second thoughts");
+        assert_eq!(note.visibility, "public");
+
+        // The earlier body survives the rewrite.
+        let revs = db.note_revisions(uid, id).await.unwrap();
+        assert_eq!(revs.len(), 1);
+        assert_eq!(revs[0].body_md, "first thoughts");
+
+        // Changing only the visibility is not a rewrite.
+        db.upsert_note(uid, Some(e), None, "second thoughts", "private").await.unwrap();
+        assert_eq!(db.note_revisions(uid, id).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_record_and_one_playing_of_it_hold_separate_notes() {
+        let db = testdb().await;
+        let uid = db.create_user("bo", None, "x", "user").await.unwrap();
+        db.save_scrobble(uid, &play("Xtal", "Aphex Twin", 1000), None, None, None, None, None, None).await.unwrap();
+        let listen = db.get_recent_scrobbles(uid, 1, 0, None, None, None, None).await.unwrap().remove(0);
+        let e = db.upsert_entity("recording", "Xtal", "Aphex Twin", None).await.unwrap();
+
+        db.upsert_note(uid, Some(e), None, "about the record", "private").await.unwrap();
+        db.upsert_note(uid, None, Some(listen.id), "heard this on the train", "private").await.unwrap();
+
+        assert_eq!(db.list_notes(uid).await.unwrap().len(), 2);
+        assert_eq!(db.note_for_entity(uid, e).await.unwrap().unwrap().body_md, "about the record");
+        assert_eq!(db.note_for_scrobble(uid, listen.id).await.unwrap().unwrap().body_md, "heard this on the train");
+
+        // Deleting the listen takes its note with it — foreign keys are on, so
+        // without that cleanup the delete would fail outright — and leaves the
+        // note about the record alone.
+        assert!(db.delete_scrobble(uid, listen.id).await.unwrap());
+        assert_eq!(db.list_notes(uid).await.unwrap().len(), 1);
+        assert!(db.note_for_entity(uid, e).await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn notes_and_revisions_are_scoped_to_their_owner() {
+        let db = testdb().await;
+        let ann = db.create_user("ann2", None, "x", "user").await.unwrap();
+        let bob = db.create_user("bob2", None, "x", "user").await.unwrap();
+        let e = db.upsert_entity("artist", "Aphex Twin", "", None).await.unwrap();
+
+        let id = db.upsert_note(ann, Some(e), None, "mine", "public").await.unwrap();
+        db.upsert_note(ann, Some(e), None, "mine, edited", "public").await.unwrap();
+
+        // Even a `public` note isn't served to anyone else yet — patches don't
+        // exist, so every read path is still self-only.
+        assert!(db.get_note(bob, id).await.unwrap().is_none());
+        assert!(db.note_for_entity(bob, e).await.unwrap().is_none());
+        assert!(db.note_revisions(bob, id).await.unwrap().is_empty());
+        assert!(!db.delete_note(bob, id).await.unwrap());
+        assert!(db.get_note(ann, id).await.unwrap().is_some());
+
+        // Both users can annotate the same entity without colliding.
+        let bobs = db.upsert_note(bob, Some(e), None, "his", "private").await.unwrap();
+        assert_ne!(id, bobs);
+    }
+
+    #[tokio::test]
+    async fn shortcodes_resolve_through_the_listening_history() {
+        let db = testdb().await;
+        let uid = db.create_user("cy", None, "x", "user").await.unwrap();
+
+        let mut p = play("Ageispolis", "Aphex Twin", 1000);
+        p.album = Some("SAW 85-92".into());
+        p.track_number = Some(3);
+        db.save_scrobble(uid, &p, None, None, None, None, None, None).await.unwrap();
+
+        // A named track with nothing annotated yet still resolves, because the
+        // user has actually played it.
+        let (id, label) = db.resolve_reference(uid, "recording", "ageispolis", None, Some("Aphex Twin"), None)
+            .await.unwrap().unwrap();
+        assert_eq!(label, "Ageispolis");
+
+        // [[track:3]] means the third track of the record in context, and
+        // renders with its real title rather than the number.
+        let (pos_id, pos_label) = db.resolve_reference(uid, "recording", "3", Some(3), Some("Aphex Twin"), Some("SAW 85-92"))
+            .await.unwrap().unwrap();
+        assert_eq!(pos_label, "Ageispolis");
+        assert_eq!(pos_id, id);
+
+        // A position with no album in scope, and a track nobody has heard,
+        // resolve to nothing — which renders as plain text, not an error.
+        assert!(db.resolve_reference(uid, "recording", "3", Some(3), None, None).await.unwrap().is_none());
+        assert!(db.resolve_reference(uid, "recording", "Windowlicker", None, None, None).await.unwrap().is_none());
+
+        // Another user's history is not a resolution source.
+        let other = db.create_user("dee", None, "x", "user").await.unwrap();
+        assert!(db.resolve_reference(other, "release", "SAW 85-92", None, None, None).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn loves_toggle_and_stay_per_user() {
+        let db = testdb().await;
+        let ann = db.create_user("ann3", None, "x", "user").await.unwrap();
+        let bob = db.create_user("bob3", None, "x", "user").await.unwrap();
+        let e = db.upsert_entity("recording", "Xtal", "Aphex Twin", None).await.unwrap();
+
+        db.set_love(ann, e, true).await.unwrap();
+        // Loving twice is not two loves.
+        db.set_love(ann, e, true).await.unwrap();
+        assert!(db.is_loved(ann, e).await.unwrap());
+        assert!(!db.is_loved(bob, e).await.unwrap());
+        assert_eq!(db.list_loves(ann).await.unwrap().len(), 1);
+        assert!(db.list_loves(bob).await.unwrap().is_empty());
+
+        db.set_love(ann, e, false).await.unwrap();
+        assert!(!db.is_loved(ann, e).await.unwrap());
     }
 }

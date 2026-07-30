@@ -9,6 +9,7 @@ mod logging;
 mod metadata;
 mod models;
 mod musicbrainz;
+mod notes;
 mod rockbox;
 mod server;
 mod sinks;
