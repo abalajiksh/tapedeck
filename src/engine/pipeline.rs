@@ -25,6 +25,9 @@ pub struct ScrobbleEngine {
     listenbrainz_url: String,
     /// Shared with the HTTP layer so the dashboard deck reflects Plex sessions.
     now_playing: NowPlayingRegistry,
+    /// Artwork lookup chain, cheapest first. Built once — each provider holds a
+    /// pooled HTTP client.
+    artwork_providers: Vec<Box<dyn crate::metadata::ArtworkProvider>>,
 }
 
 /// A built, polling source and the bookkeeping the engine needs around it.
@@ -79,6 +82,7 @@ impl ScrobbleEngine {
             poll_interval: Duration::from_secs(15),
             now_playing,
             listenbrainz_url,
+            artwork_providers: vec![Box::new(crate::metadata::deezer::DeezerProvider::new())],
         }
     }
 
@@ -424,7 +428,7 @@ impl ScrobbleEngine {
         // Same deal for release years (feeds the by-decade breakdown) — cache
         // hits are free, so the budget only bounds real API calls.
         crate::enrich::backfill_release_years(&self.db, &self.mb_client, 50, 8).await;
-        crate::enrich::backfill_artwork(&self.db, &self.mb_client, 50, 8).await;
+        crate::enrich::backfill_artwork(&self.db, &self.mb_client, &self.artwork_providers, 50, 8).await;
     }
 
     async fn flush_pending(&mut self) {

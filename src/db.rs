@@ -48,6 +48,7 @@ pub struct ScrobbleRecord {
     pub listening_context: Option<String>,
     pub submission_client: Option<String>,
     pub track_number: Option<i32>,
+    pub artwork_url: Option<String>,
     #[serde(default)]
     pub delivered_sinks: Option<String>,
 }
@@ -235,6 +236,7 @@ impl Database {
                 language TEXT,
                 release_year INTEGER,
                 skipped BOOLEAN NOT NULL DEFAULT FALSE,
+                artwork_url TEXT,
                 UNIQUE(user_id, source_id, source_name)
             )"
         ).execute(&self.pool).await?;
@@ -496,6 +498,15 @@ impl Database {
         if !has_column(&self.pool, "scrobbles", "language").await {
             info!("⚙️ Migrating: adding scrobbles.language...");
             let _ = sqlx::query("ALTER TABLE scrobbles ADD COLUMN language TEXT")
+                .execute(&self.pool).await;
+        }
+
+        // Migration: resolved artwork URL. Supersedes deriving a Cover Art
+        // Archive link from caa_id — artwork can now come from Deezer or the
+        // user's own library, neither of which has a CAA id.
+        if !has_column(&self.pool, "scrobbles", "artwork_url").await {
+            info!("⚙️ Migrating: adding scrobbles.artwork_url...");
+            let _ = sqlx::query("ALTER TABLE scrobbles ADD COLUMN artwork_url TEXT")
                 .execute(&self.pool).await;
         }
 
@@ -874,20 +885,16 @@ impl Database {
     }
 
     /// `0` records "looked up, no date known" so the row isn't retried forever.
-    /// Cover art rides along: the same MusicBrainz lookup returns it, and older
-    /// listens predate anything persisting it, so backfilling both in one pass
-    /// costs no extra API calls.
-    pub async fn set_scrobble_release_year(
-        &self, id: i64, year: i32, caa_id: Option<i64>, caa_release_mbid: Option<&str>,
-    ) -> Result<(), sqlx::Error> {
-        sqlx::query(
-            "UPDATE scrobbles SET release_year = ?,
-                caa_id = COALESCE(caa_id, ?),
-                caa_release_mbid = COALESCE(caa_release_mbid, ?)
-             WHERE id = ?"
-        )
-        .bind(year).bind(caa_id).bind(caa_release_mbid).bind(id)
-        .execute(&self.pool).await?;
+    ///
+    /// Deliberately does **not** touch `caa_id`. It used to, on the reasoning
+    /// that the same MusicBrainz lookup returned artwork anyway — but that
+    /// silently pre-empted the artwork provider chain: setting `caa_id` removes
+    /// the row from `scrobbles_needing_artwork`, so Deezer never got asked and
+    /// the row ended up with a Cover Art Archive id but no `artwork_url`.
+    /// Artwork is `backfill_artwork`'s job alone.
+    pub async fn set_scrobble_release_year(&self, id: i64, year: i32) -> Result<(), sqlx::Error> {
+        sqlx::query("UPDATE scrobbles SET release_year = ? WHERE id = ?")
+            .bind(year).bind(id).execute(&self.pool).await?;
         Ok(())
     }
 
@@ -896,24 +903,46 @@ impl Database {
         let total: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM scrobbles WHERE user_id = ? AND skipped = FALSE")
             .bind(user_id).fetch_one(&self.pool).await?;
         let with_art: (i64,) = sqlx::query_as(
-            "SELECT COUNT(*) FROM scrobbles WHERE user_id = ? AND caa_id IS NOT NULL"
+            "SELECT COUNT(*) FROM scrobbles WHERE user_id = ? AND artwork_url IS NOT NULL"
         ).bind(user_id).fetch_one(&self.pool).await?;
         Ok((total.0, with_art.0))
     }
 
-    /// Listens with neither artwork nor a resolved release year — the queue the
-    /// artwork backfill works through. Newest first, so recent history fills in
-    /// while older listens catch up in the background.
-    pub async fn scrobbles_needing_artwork(&self, limit: i64) -> Result<Vec<(i64, String, String, Option<String>)>, sqlx::Error> {
+    /// The artwork queue: listens whose artwork has never been resolved.
+    ///
+    /// Keyed purely on `artwork_url` being NULL. It deliberately does *not* look
+    /// at `caa_id`, which several other paths write (ingest `mbid_mapping`,
+    /// flush-time enrichment) — using it here meant a row that had merely been
+    /// through MusicBrainz was treated as "artwork done" and never got a URL.
+    /// `artwork_url = ''` is the tombstone for "looked, found nothing".
+    ///
+    /// Returns any Cover Art Archive ids already on the row so the backfill can
+    /// build a URL from them for free rather than looking anything up.
+    pub async fn scrobbles_needing_artwork(&self, limit: i64)
+        -> Result<Vec<(i64, String, String, Option<String>, Option<i64>, Option<String>)>, sqlx::Error>
+    {
         sqlx::query_as(
-            "SELECT id, title, artist, album FROM scrobbles
-             WHERE caa_id IS NULL AND skipped = FALSE ORDER BY timestamp DESC LIMIT ?"
+            "SELECT id, title, artist, album, caa_id, caa_release_mbid FROM scrobbles
+             WHERE artwork_url IS NULL AND skipped = FALSE
+             ORDER BY timestamp DESC LIMIT ?"
         ).bind(limit).fetch_all(&self.pool).await
     }
 
-    pub async fn set_scrobble_artwork(&self, id: i64, caa_id: Option<i64>, caa_release_mbid: Option<&str>) -> Result<(), sqlx::Error> {
-        sqlx::query("UPDATE scrobbles SET caa_id = ?, caa_release_mbid = ? WHERE id = ?")
-            .bind(caa_id).bind(caa_release_mbid).bind(id).execute(&self.pool).await?;
+    /// Record artwork for a listen. Pass `""` to tombstone a row whose artwork
+    /// could not be found anywhere, so later passes skip it instead of re-asking
+    /// every provider forever. `caa_id` is only written when a lookup produced
+    /// one; it is provenance, not queue state.
+    pub async fn set_scrobble_artwork(
+        &self, id: i64, url: &str, caa_id: Option<i64>, caa_release_mbid: Option<&str>,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "UPDATE scrobbles SET artwork_url = ?,
+                caa_id = COALESCE(?, caa_id),
+                caa_release_mbid = COALESCE(?, caa_release_mbid)
+             WHERE id = ?"
+        )
+        .bind(url).bind(caa_id).bind(caa_release_mbid).bind(id)
+        .execute(&self.pool).await?;
         Ok(())
     }
 

@@ -27,6 +27,8 @@ export interface Scrobble {
 	mbid_release: string | null;
 	caa_id: number | null;
 	caa_release_mbid: string | null;
+	/** Resolved cover image from whichever provider answered. */
+	artwork_url: string | null;
 }
 
 export interface DashboardStats {

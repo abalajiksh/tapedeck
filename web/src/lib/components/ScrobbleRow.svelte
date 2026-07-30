@@ -21,7 +21,7 @@
 		<input type="checkbox" checked={selected} on:change={() => dispatch('toggle', scrobble)}
 			aria-label="Select listen" style="width:18px;height:18px;flex:none;accent-color:var(--td-accent);cursor:pointer;">
 	{/if}
-	<CoverArt caaId={scrobble.caa_id} releaseMbid={scrobble.caa_release_mbid} {seed} />
+	<CoverArt url={scrobble.artwork_url} caaId={scrobble.caa_id} releaseMbid={scrobble.caa_release_mbid} {seed} />
 	<div style="flex:1;min-width:0;">
 		<div style="font-size:14.5px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">{scrobble.title}</div>
 		<div style="font-size:12.5px;color:var(--td-muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">{scrobble.artist}{scrobble.album ? ` — ${scrobble.album}` : ''}</div>

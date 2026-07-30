@@ -276,8 +276,10 @@ async fn backfill_artwork_now(
     }
     let (db, mb) = (state.db.clone(), state.mb_client.clone());
     tokio::spawn(async move {
+        let providers: Vec<Box<dyn crate::metadata::ArtworkProvider>> =
+            vec![Box::new(crate::metadata::deezer::DeezerProvider::new())];
         loop {
-            if crate::enrich::backfill_artwork(&db, &mb, 200, 200).await == 0 { break; }
+            if crate::enrich::backfill_artwork(&db, &mb, &providers, 200, 200).await == 0 { break; }
         }
     });
     (StatusCode::ACCEPTED, Json(serde_json::json!({ "status": "started" }))).into_response()

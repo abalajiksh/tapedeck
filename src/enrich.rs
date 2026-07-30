@@ -11,6 +11,7 @@
 //! endpoint.
 
 use crate::db::Database;
+use crate::metadata::ArtworkProvider;
 use crate::musicbrainz::MusicBrainzClient;
 use crate::language::{script_language, DEFAULT_LANGUAGE};
 
@@ -67,15 +68,11 @@ pub async fn backfill_release_years(db: &Database, mb: &MusicBrainzClient, batch
         if budget <= 0 { break; }
         budget -= 1;
 
-        let (year, caa_id, caa_mbid) = match mb.fetch_metadata(&title, &artist, album.as_deref()).await {
-            Ok(meta) => (
-                meta.release_date.as_deref().and_then(parse_year).unwrap_or(0),
-                meta.caa_id,
-                meta.caa_release_mbid,
-            ),
-            Err(_) => (0, None, None),
+        let year = match mb.fetch_metadata(&title, &artist, album.as_deref()).await {
+            Ok(meta) => meta.release_date.as_deref().and_then(parse_year).unwrap_or(0),
+            Err(_) => 0,
         };
-        if db.set_scrobble_release_year(id, year, caa_id, caa_mbid.as_deref()).await.is_ok() { done += 1; }
+        if db.set_scrobble_release_year(id, year).await.is_ok() { done += 1; }
     }
     done
 }
@@ -86,14 +83,21 @@ fn parse_year(date: &str) -> Option<i32> {
     (1000..=2999).contains(&y).then_some(y)
 }
 
-/// Fill in cover art for listens that have none. Shares `fetch_metadata` with
-/// the other backfills, so anything already in the MusicBrainz cache is free and
-/// `mb_budget` only bounds live API calls.
+/// Fill in cover art for listens that have none, cheapest provider first.
 ///
-/// A listen with no art available is recorded as `caa_id = -1` rather than left
-/// NULL, so repeat passes move on instead of retrying the same misses forever;
-/// the UI treats a negative id as "no artwork" and falls back to the initial.
-pub async fn backfill_artwork(db: &Database, mb: &MusicBrainzClient, batch: i64, mb_budget: i64) -> usize {
+/// Deezer is tried before MusicBrainz because it needs no auth and imposes no
+/// one-per-second limit, so a large backfill finishes in minutes rather than
+/// hours — and every hit is one fewer request aimed at a free public service.
+/// MusicBrainz/Cover Art Archive remains the fallback for everything Deezer
+/// doesn't carry, which is most of the obscure end of a collection.
+///
+/// A listen with nothing anywhere is tombstoned as `caa_id = -1` so later passes
+/// move on instead of re-asking forever.
+pub async fn backfill_artwork(
+    db: &Database, mb: &MusicBrainzClient,
+    providers: &[Box<dyn ArtworkProvider>],
+    batch: i64, mb_budget: i64,
+) -> usize {
     let rows = match db.scrobbles_needing_artwork(batch).await {
         Ok(r) => r,
         Err(_) => return 0,
@@ -101,16 +105,46 @@ pub async fn backfill_artwork(db: &Database, mb: &MusicBrainzClient, batch: i64,
     let mut done = 0usize;
     let mut budget = mb_budget;
 
-    for (id, title, artist, album) in rows {
+    for (id, title, artist, album, caa_id, caa_mbid) in rows {
+        // 0. Already have a Cover Art Archive id from earlier enrichment — build
+        //    the URL from it rather than asking anyone anything.
+        if let (Some(cid), Some(mbid)) = (caa_id.filter(|c| *c > 0), caa_mbid.as_deref()) {
+            let url = caa_url(mbid, cid);
+            if db.set_scrobble_artwork(id, &url, None, None).await.is_ok() { done += 1; }
+            continue;
+        }
+
+        // 1. Providers that cost MusicBrainz nothing (Deezer today; the user's
+        //    own library once Phase 4 finishes).
+        if let Some(found) = crate::metadata::resolve(providers, &artist, &title, album.as_deref()).await {
+            if let Some(url) = found.image_url {
+                if db.set_scrobble_artwork(id, &url, None, None).await.is_ok() {
+                    done += 1;
+                    continue;
+                }
+            }
+        }
+
+        // 2. MusicBrainz + Cover Art Archive, bounded by the rate limit.
         if budget <= 0 { break; }
         budget -= 1;
 
-        let (caa_id, caa_mbid) = match mb.fetch_metadata(&title, &artist, album.as_deref()).await {
+        let (found_id, found_mbid) = match mb.fetch_metadata(&title, &artist, album.as_deref()).await {
             Ok(meta) => (meta.caa_id, meta.caa_release_mbid),
             Err(_) => (None, None),
         };
-        let resolved = caa_id.unwrap_or(-1);
-        if db.set_scrobble_artwork(id, Some(resolved), caa_mbid.as_deref()).await.is_ok() { done += 1; }
+        // Empty string tombstones "looked everywhere, nothing there".
+        let url = match (found_id.filter(|c| *c > 0), found_mbid.as_deref()) {
+            (Some(cid), Some(mbid)) => caa_url(mbid, cid),
+            _ => String::new(),
+        };
+        if db.set_scrobble_artwork(id, &url, found_id, found_mbid.as_deref()).await.is_ok() {
+            done += 1;
+        }
     }
     done
+}
+
+fn caa_url(release_mbid: &str, caa_id: i64) -> String {
+    format!("https://coverartarchive.org/release/{release_mbid}/{caa_id}-250.jpg")
 }

@@ -6,6 +6,7 @@ mod engine;
 mod enrich;
 mod language;
 mod logging;
+mod metadata;
 mod models;
 mod musicbrainz;
 mod rockbox;
