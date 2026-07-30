@@ -116,7 +116,12 @@ pub fn parse(text: &str, device_tz: Tz) -> ParsedLog {
         }
     }
 
-    ParsedLog { entries, declared_tz, client, malformed }
+    ParsedLog {
+        entries,
+        declared_tz,
+        client,
+        malformed,
+    }
 }
 
 fn parse_row(line: &str, declared: LogTimezone, device_tz: Tz) -> Option<LogEntry> {
@@ -153,13 +158,19 @@ fn parse_row(line: &str, declared: LogTimezone, device_tz: Tz) -> Option<LogEntr
 
     Some(LogEntry {
         artist: artist.to_string(),
-        album: Some(f[1].trim()).filter(|s| !s.is_empty()).map(str::to_string),
+        album: Some(f[1].trim())
+            .filter(|s| !s.is_empty())
+            .map(str::to_string),
         title: title.to_string(),
         track_number: f[3].trim().parse().ok().filter(|n| *n > 0),
         duration: f[4].trim().parse().ok().filter(|d| *d > 0),
         skipped,
         timestamp,
-        mbid: f.get(7).map(|s| s.trim()).filter(|s| !s.is_empty()).map(str::to_string),
+        mbid: f
+            .get(7)
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .map(str::to_string),
     })
 }
 
@@ -171,14 +182,17 @@ fn parse_row(line: &str, declared: LogTimezone, device_tz: Tz) -> Option<LogEntr
 /// offset; a nonexistent one (spring-forward gap) is dropped rather than guessed.
 fn local_epoch_to_utc(raw: i64, tz: Tz) -> Option<i64> {
     let naive = chrono::DateTime::from_timestamp(raw, 0)?.naive_utc();
-    tz.from_local_datetime(&naive).earliest().map(|dt| dt.timestamp())
+    tz.from_local_datetime(&naive)
+        .earliest()
+        .map(|dt| dt.timestamp())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    const HEADER_UNKNOWN: &str = "#AUDIOSCROBBLER/1.1\n#TZ/UNKNOWN\n#CLIENT/Rockbox sansae200 $Revision$\n";
+    const HEADER_UNKNOWN: &str =
+        "#AUDIOSCROBBLER/1.1\n#TZ/UNKNOWN\n#CLIENT/Rockbox sansae200 $Revision$\n";
     const HEADER_UTC: &str = "#AUDIOSCROBBLER/1.1\n#TZ/UTC\n#CLIENT/Rockbox ipod6g\n";
 
     #[test]
@@ -209,8 +223,10 @@ mod tests {
 
     #[test]
     fn marks_skips_without_dropping_them() {
-        let log = format!("{HEADER_UTC}A\tAl\tListened\t1\t100\tL\t1700000000\n\
-                                       B\tAl\tSkipped\t2\t100\tS\t1700000100\n");
+        let log = format!(
+            "{HEADER_UTC}A\tAl\tListened\t1\t100\tL\t1700000000\n\
+                                       B\tAl\tSkipped\t2\t100\tS\t1700000100\n"
+        );
         let p = parse(&log, chrono_tz::UTC);
         assert_eq!(p.entries.len(), 2);
         assert!(!p.entries[0].skipped);
@@ -237,10 +253,12 @@ mod tests {
 
     #[test]
     fn counts_malformed_rows_instead_of_silently_dropping() {
-        let log = format!("{HEADER_UTC}A\tAl\tT\t1\t100\tL\t1700000000\n\
+        let log = format!(
+            "{HEADER_UTC}A\tAl\tT\t1\t100\tL\t1700000000\n\
                                        too\tfew\tcolumns\n\
                                        B\tAl\tT2\t1\t100\tX\t1700000100\n\
-                                       \tAl\tNoArtist\t1\t100\tL\t1700000200\n");
+                                       \tAl\tNoArtist\t1\t100\tL\t1700000200\n"
+        );
         let p = parse(&log, chrono_tz::UTC);
         assert_eq!(p.entries.len(), 1);
         assert_eq!(p.malformed, 3); // short row, bad rating, missing artist

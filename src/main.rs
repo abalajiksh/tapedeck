@@ -63,10 +63,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ── Credential encryption ──
     // Deliberately a separate file from the database: `GET /api/v1/backup` hands
     // out a whole-DB snapshot, and a key stored inside it would ride along.
-    let secrets = Arc::new(crypto::SecretBox::load(std::path::Path::new(&config.secret_key_path))?);
+    let secrets = Arc::new(crypto::SecretBox::load(std::path::Path::new(
+        &config.secret_key_path,
+    ))?);
 
     // ── Scrobble database ──
-    info!("📦 Initializing scrobble database at {}", config.database.scrobble_db_url);
+    info!(
+        "📦 Initializing scrobble database at {}",
+        config.database.scrobble_db_url
+    );
     let db = Arc::new(Database::new(&config.database.scrobble_db_url, secrets.clone()).await?);
 
     // Any import left 'running' by a previous process died with it — record that.
@@ -78,7 +83,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ── First-run setup ──
     if !db.has_users().await? {
         info!("🔑 First run — creating admin user (password not set yet)");
-        let _ = db.create_user("admin", Some("Admin"), "not-used-yet", "admin").await?;
+        let _ = db
+            .create_user("admin", Some("Admin"), "not-used-yet", "admin")
+            .await?;
         info!("════════════════════════════════════════════════════════");
         info!("📋 Visit the web UI to complete setup and set your password.");
         info!("════════════════════════════════════════════════════════");
@@ -110,7 +117,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         imports: Default::default(),
         now_playing: now_playing.clone(),
         login_limiter: Arc::new(server::ratelimit::RateLimiter::new(
-            8, std::time::Duration::from_secs(300))),
+            8,
+            std::time::Duration::from_secs(300),
+        )),
         analytics_row_cap: analytics_row_cap(),
         trust_proxy: config.server.trust_proxy,
     });
@@ -129,14 +138,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         info!("🌐 Starting server on {}", addr);
         let listener = match tokio::net::TcpListener::bind(&addr).await {
             Ok(l) => l,
-            Err(e) => { error!("Failed to bind server: {}", e); let _ = shutdown_tx.send(true); return; }
+            Err(e) => {
+                error!("Failed to bind server: {}", e);
+                let _ = shutdown_tx.send(true);
+                return;
+            }
         };
         if let Err(e) = axum::serve(
             listener,
             app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
         )
-            .with_graceful_shutdown(shutdown_signal())
-            .await
+        .with_graceful_shutdown(shutdown_signal())
+        .await
         {
             error!("Server error: {}", e);
         }
@@ -148,7 +161,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // shutdown, at which point it finishes the current tick and returns. Between
     // that and the server's request draining, no in-progress work is cut off:
     // committed writes are durable (WAL) and pending scrobbles resume on restart.
-    let mut engine = ScrobbleEngine::new(db, mb_client, now_playing, config.listenbrainz_url.clone());
+    let mut engine =
+        ScrobbleEngine::new(db, mb_client, now_playing, config.listenbrainz_url.clone());
     engine.run(shutdown_rx).await;
     let _ = server_task.await;
     info!("👋 Shut down cleanly");
@@ -166,7 +180,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// Anyone who was previously being name-matched is no longer ingested until they
 /// connect their own Plex — which the warning below says out loud, since it's a
 /// silent behaviour change otherwise.
-async fn migrate_global_plex(db: &Database, config: &Config) -> Result<(), Box<dyn std::error::Error>> {
+async fn migrate_global_plex(
+    db: &Database,
+    config: &Config,
+) -> Result<(), Box<dyn std::error::Error>> {
     // Seed the legacy row from config on a first run so an existing
     // docker-compose keeps working long enough to be migrated below.
     if db.get_plex_settings().await?.is_none() {
@@ -185,27 +202,37 @@ async fn migrate_global_plex(db: &Database, config: &Config) -> Result<(), Box<d
         db.save_plex_settings(&seeded).await?;
     }
 
-    let Some(legacy) = db.get_plex_settings().await? else { return Ok(()) };
+    let Some(legacy) = db.get_plex_settings().await? else {
+        return Ok(());
+    };
     if !legacy.is_usable() {
         return Ok(());
     }
 
-    let Some(admin_id) = db.first_admin_id().await? else { return Ok(()) };
+    let Some(admin_id) = db.first_admin_id().await? else {
+        return Ok(());
+    };
     // Already migrated if the admin has any Plex source at all.
-    if db.list_sources_for_user(admin_id).await?.iter().any(|s| s.kind == "plex") {
+    if db
+        .list_sources_for_user(admin_id)
+        .await?
+        .iter()
+        .any(|s| s.kind == "plex")
+    {
         return Ok(());
     }
 
     // Resolve the token to its Plex account so the new source can filter to it.
     // If plex.tv is unreachable we still migrate, disabled, and let the user
     // finish in the UI — better than dropping their config on the floor.
-    let account = match crate::sources::PlexSource::resolve_account(&legacy.url, &legacy.token).await {
-        Ok(name) => Some(name),
-        Err(e) => {
-            warn!("⚠️ Could not resolve the Plex account for the existing token: {e}");
-            None
-        }
-    };
+    let account =
+        match crate::sources::PlexSource::resolve_account(&legacy.url, &legacy.token).await {
+            Ok(name) => Some(name),
+            Err(e) => {
+                warn!("⚠️ Could not resolve the Plex account for the existing token: {e}");
+                None
+            }
+        };
 
     let credentials = serde_json::json!({ "token": legacy.token }).to_string();
     // Carry the library/device filters over. Dropping them would silently start
@@ -215,11 +242,20 @@ async fn migrate_global_plex(db: &Database, config: &Config) -> Result<(), Box<d
         "libraries_block": PlexSettings::list(&legacy.libraries_block),
         "devices_allow": PlexSettings::list(&legacy.devices_allow),
         "devices_block": PlexSettings::list(&legacy.devices_block),
-    }).to_string();
+    })
+    .to_string();
     db.create_source(
-        admin_id, "plex", "Plex", account.is_some(), &legacy.url,
-        &credentials, account.as_deref(), None, &options,
-    ).await?;
+        admin_id,
+        "plex",
+        "Plex",
+        account.is_some(),
+        &legacy.url,
+        &credentials,
+        account.as_deref(),
+        None,
+        &options,
+    )
+    .await?;
 
     info!("⚙️ Migrated the server-wide Plex config to a personal source for the admin");
     if let Some(name) = &account {
@@ -227,8 +263,10 @@ async fn migrate_global_plex(db: &Database, config: &Config) -> Result<(), Box<d
     } else {
         info!("   Left disabled: open Settings → Sources and reconnect to finish");
     }
-    warn!("⚠️ Plex is per-user now. Anyone previously matched by Plex account name \
-           will not be ingested until they connect their own Plex in Settings → Sources.");
+    warn!(
+        "⚠️ Plex is per-user now. Anyone previously matched by Plex account name \
+           will not be ingested until they connect their own Plex in Settings → Sources."
+    );
     Ok(())
 }
 
@@ -236,10 +274,14 @@ async fn migrate_global_plex(db: &Database, config: &Config) -> Result<(), Box<d
 /// machine's RAM so a large history can't OOM a request on a small box (e.g. a
 /// Pi Zero). Rows are ~200 bytes; we budget ~1/16 of total RAM per pass.
 fn analytics_row_cap() -> i64 {
-    let total_mb = std::fs::read_to_string("/proc/meminfo").ok()
-        .and_then(|s| s.lines().find(|l| l.starts_with("MemTotal:"))
-            .and_then(|l| l.split_whitespace().nth(1))
-            .and_then(|kb| kb.parse::<i64>().ok()))
+    let total_mb = std::fs::read_to_string("/proc/meminfo")
+        .ok()
+        .and_then(|s| {
+            s.lines()
+                .find(|l| l.starts_with("MemTotal:"))
+                .and_then(|l| l.split_whitespace().nth(1))
+                .and_then(|kb| kb.parse::<i64>().ok())
+        })
         .map(|kb| kb / 1024)
         .unwrap_or(2048); // assume 2 GB if unreadable
     (total_mb / 16 * 5_000).clamp(100_000, 5_000_000)
@@ -249,7 +291,9 @@ fn analytics_row_cap() -> i64 {
 /// drain, which then stops the engine.
 async fn shutdown_signal() {
     use tokio::signal;
-    let ctrl_c = async { let _ = signal::ctrl_c().await; };
+    let ctrl_c = async {
+        let _ = signal::ctrl_c().await;
+    };
     #[cfg(unix)]
     let terminate = async {
         if let Ok(mut s) = signal::unix::signal(signal::unix::SignalKind::terminate()) {

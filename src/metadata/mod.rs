@@ -50,7 +50,10 @@ pub trait ArtworkProvider: Send + Sync {
     /// provider"; `Err` means the provider itself failed and the chain should
     /// still continue — a Deezer outage must not stop MusicBrainz answering.
     async fn lookup(
-        &self, artist: &str, title: &str, album: Option<&str>,
+        &self,
+        artist: &str,
+        title: &str,
+        album: Option<&str>,
     ) -> Result<Option<TrackArtwork>, Box<dyn std::error::Error + Send + Sync>>;
 }
 
@@ -61,14 +64,22 @@ pub trait ArtworkProvider: Send + Sync {
 /// availability.
 pub async fn resolve(
     providers: &[Box<dyn ArtworkProvider>],
-    artist: &str, title: &str, album: Option<&str>,
+    artist: &str,
+    title: &str,
+    album: Option<&str>,
 ) -> Option<TrackArtwork> {
     for p in providers {
         match p.lookup(artist, title, album).await {
             Ok(Some(found)) if !found.is_empty() => return Some(found),
             Ok(_) => continue,
             Err(e) => {
-                tracing::debug!("{} lookup failed for {} - {}: {}", p.name(), artist, title, e);
+                tracing::debug!(
+                    "{} lookup failed for {} - {}: {}",
+                    p.name(),
+                    artist,
+                    title,
+                    e
+                );
                 continue;
             }
         }

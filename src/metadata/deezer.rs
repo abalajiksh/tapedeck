@@ -70,7 +70,11 @@ impl DeezerProvider {
         Self {
             client: Client::builder()
                 .timeout(Duration::from_secs(10))
-                .user_agent(format!("{}/{}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION")))
+                .user_agent(format!(
+                    "{}/{}",
+                    env!("CARGO_PKG_NAME"),
+                    env!("CARGO_PKG_VERSION")
+                ))
                 .build()
                 .unwrap_or_else(|_| Client::new()),
         }
@@ -94,10 +98,12 @@ impl DeezerProvider {
     /// worse than showing none.
     fn best_hit(hits: Vec<SearchHit>, artist: &str) -> Option<SearchHit> {
         let wanted = artist.trim().to_lowercase();
-        hits.into_iter()
-            .find(|h| h.artist.as_ref()
+        hits.into_iter().find(|h| {
+            h.artist
+                .as_ref()
                 .map(|a| a.name.trim().to_lowercase() == wanted)
-                .unwrap_or(false))
+                .unwrap_or(false)
+        })
     }
 }
 
@@ -108,16 +114,24 @@ impl ArtworkProvider for DeezerProvider {
     }
 
     async fn lookup(
-        &self, artist: &str, title: &str, album: Option<&str>,
+        &self,
+        artist: &str,
+        title: &str,
+        album: Option<&str>,
     ) -> Result<Option<TrackArtwork>, Box<dyn std::error::Error + Send + Sync>> {
         if artist.trim().is_empty() || title.trim().is_empty() {
             return Ok(None);
         }
 
-        let resp = self.client
+        let resp = self
+            .client
             .get(SEARCH_URL)
-            .query(&[("q", Self::query(artist, title, album)), ("limit", "10".into())])
-            .send().await?;
+            .query(&[
+                ("q", Self::query(artist, title, album)),
+                ("limit", "10".into()),
+            ])
+            .send()
+            .await?;
 
         if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
             return Err("Deezer rate limit reached".into());
@@ -137,9 +151,13 @@ impl ArtworkProvider for DeezerProvider {
             return Ok(None);
         };
 
-        let image_url = hit.album.as_ref()
+        let image_url = hit
+            .album
+            .as_ref()
             .and_then(|a| a.cover_big.clone().or_else(|| a.cover_medium.clone()));
-        let artist_image_url = hit.artist.as_ref()
+        let artist_image_url = hit
+            .artist
+            .as_ref()
             .and_then(|a| a.picture_big.clone().or_else(|| a.picture_medium.clone()));
 
         let found = TrackArtwork {

@@ -1,3 +1,4 @@
+use crate::db::Database;
 use axum::{
     extract::State,
     http::StatusCode,
@@ -6,7 +7,6 @@ use axum::{
     Router,
 };
 use std::sync::Arc;
-use crate::db::Database;
 
 #[derive(Clone)]
 pub struct AdminState {
@@ -15,13 +15,20 @@ pub struct AdminState {
 
 async fn health_check(State(state): State<Arc<AdminState>>) -> impl IntoResponse {
     let db_ok = state.db.ping().await.is_ok();
-    let code = if db_ok { StatusCode::OK } else { StatusCode::SERVICE_UNAVAILABLE };
-    (code, Json(serde_json::json!({
-        "status": if db_ok { "ok" } else { "degraded" },
-        "service": "tapedeck",
-        "database": if db_ok { "ok" } else { "unreachable" },
-        "version": env!("CARGO_PKG_VERSION"),
-    })))
+    let code = if db_ok {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+    (
+        code,
+        Json(serde_json::json!({
+            "status": if db_ok { "ok" } else { "degraded" },
+            "service": "tapedeck",
+            "database": if db_ok { "ok" } else { "unreachable" },
+            "version": env!("CARGO_PKG_VERSION"),
+        })),
+    )
 }
 
 /// Only `/health` lives here (intentionally unauthenticated). `/log-level` moved

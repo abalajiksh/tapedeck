@@ -40,11 +40,21 @@ impl Play {
         source_name: String,
     ) -> Self {
         Self {
-            title, artist, album: None, timestamp, duration: None,
-            track_number: None, source_id, source_name,
-            mbid_recording: None, mbid_release: None, mbid_artist: None,
-            artists: None, mbid_release_group: None,
-            caa_id: None, caa_release_mbid: None,
+            title,
+            artist,
+            album: None,
+            timestamp,
+            duration: None,
+            track_number: None,
+            source_id,
+            source_name,
+            mbid_recording: None,
+            mbid_release: None,
+            mbid_artist: None,
+            artists: None,
+            mbid_release_group: None,
+            caa_id: None,
+            caa_release_mbid: None,
         }
     }
 }
@@ -87,33 +97,46 @@ impl AudioQuality {
                 let lossless = self.is_lossless.unwrap_or(false);
                 if !lossless {
                     match self.bitrate.unwrap_or(0) {
-                        b if b >= 320 => 60.0, b if b >= 256 => 55.0,
-                        b if b >= 192 => 50.0, b if b >= 128 => 40.0, _ => 30.0,
+                        b if b >= 320 => 60.0,
+                        b if b >= 256 => 55.0,
+                        b if b >= 192 => 50.0,
+                        b if b >= 128 => 40.0,
+                        _ => 30.0,
                     }
                 } else {
                     match (bd, sr) {
-                        (24, s) if s >= 192000 => 90.0, (24, s) if s >= 96000 => 85.0,
-                        (24, _) => 82.0, (16, 44100) => 80.0,
-                        (16, s) if s >= 48000 => 81.0, _ => 78.0,
+                        (24, s) if s >= 192000 => 90.0,
+                        (24, s) if s >= 96000 => 85.0,
+                        (24, _) => 82.0,
+                        (16, 44100) => 80.0,
+                        (16, s) if s >= 48000 => 81.0,
+                        _ => 78.0,
                     }
                 }
             }
             _ => 50.0,
         };
         let mut score: f64 = base;
-        if self.is_transcoded.unwrap_or(false) { score -= 10.0; }
+        if self.is_transcoded.unwrap_or(false) {
+            score -= 10.0;
+        }
         if self.delivery_codec.is_some() {
             match self.delivery_codec.as_deref() {
-                Some("ldac") => score -= 3.0, Some("aptx_hd") => score -= 5.0,
-                Some("aac") => score -= 8.0, Some("sbc") => score -= 15.0, _ => score -= 5.0,
+                Some("ldac") => score -= 3.0,
+                Some("aptx_hd") => score -= 5.0,
+                Some("aac") => score -= 8.0,
+                Some("sbc") => score -= 15.0,
+                _ => score -= 5.0,
             }
         }
         self.quality_score = Some(score.clamp(0.0, 100.0));
     }
 
     pub fn has_data(&self) -> bool {
-        self.format_type.is_some() || self.codec.is_some()
-            || self.bitrate.is_some() || self.sample_rate.is_some()
+        self.format_type.is_some()
+            || self.codec.is_some()
+            || self.bitrate.is_some()
+            || self.sample_rate.is_some()
     }
 }
 
@@ -143,13 +166,22 @@ pub struct ChainComponent {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ComponentType {
-    Source, Transport, Dac, Amp, Transducer, Network, Bluetooth,
+    Source,
+    Transport,
+    Dac,
+    Amp,
+    Transducer,
+    Network,
+    Bluetooth,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ListeningContext {
-    Active, ActiveMobile, Passive, Background,
+    Active,
+    ActiveMobile,
+    Passive,
+    Background,
     #[default]
     Unknown,
 }
@@ -157,15 +189,20 @@ pub enum ListeningContext {
 impl ListeningContext {
     pub fn as_str(&self) -> &'static str {
         match self {
-            Self::Active => "active", Self::ActiveMobile => "active-mobile",
-            Self::Passive => "passive", Self::Background => "background",
+            Self::Active => "active",
+            Self::ActiveMobile => "active-mobile",
+            Self::Passive => "passive",
+            Self::Background => "background",
             Self::Unknown => "unknown",
         }
     }
     pub fn from_str_loose(s: &str) -> Self {
         match s {
-            "active" => Self::Active, "active-mobile" | "active_mobile" => Self::ActiveMobile,
-            "passive" => Self::Passive, "background" => Self::Background, _ => Self::Unknown,
+            "active" => Self::Active,
+            "active-mobile" | "active_mobile" => Self::ActiveMobile,
+            "passive" => Self::Passive,
+            "background" => Self::Background,
+            _ => Self::Unknown,
         }
     }
 }

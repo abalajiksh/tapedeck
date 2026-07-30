@@ -22,14 +22,18 @@ use super::AppState;
 
 fn err(code: u16, msg: impl Into<String>) -> axum::response::Response {
     let code_status = StatusCode::from_u16(code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-    (code_status, Json(serde_json::json!(ErrorResponse { code, error: msg.into() }))).into_response()
+    (
+        code_status,
+        Json(serde_json::json!(ErrorResponse {
+            code,
+            error: msg.into()
+        })),
+    )
+        .into_response()
 }
 
 /// GET /api/v1/connections — which services this user has connected.
-async fn list_connections(
-    State(state): State<Arc<AppState>>,
-    user: AuthUser,
-) -> impl IntoResponse {
+async fn list_connections(State(state): State<Arc<AppState>>, user: AuthUser) -> impl IntoResponse {
     match state.db.list_connections(user.user_id).await {
         Ok(rows) => {
             let items: Vec<serde_json::Value> = rows.into_iter().map(|(service, username, at)| {
@@ -37,10 +41,14 @@ async fn list_connections(
             }).collect();
             // Kept for the UI's shape; Tapedeck ships its own Last.fm app
             // credentials, so connecting is always possible.
-            (StatusCode::OK, Json(serde_json::json!({
-                "connections": items,
-                "lastfm_available": true,
-            }))).into_response()
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "connections": items,
+                    "lastfm_available": true,
+                })),
+            )
+                .into_response()
         }
         Err(e) => err(500, e.to_string()),
     }
@@ -63,7 +71,9 @@ async fn disconnect(
 // ── ListenBrainz: paste a user token ──
 
 #[derive(Deserialize)]
-struct LbConnect { token: String }
+struct LbConnect {
+    token: String,
+}
 
 async fn connect_listenbrainz(
     State(state): State<Arc<AppState>>,
@@ -75,11 +85,15 @@ async fn connect_listenbrainz(
         return err(400, "Token required");
     }
     // Validate against ListenBrainz and capture the account name.
-    let url = format!("{}/1/validate-token", state.listenbrainz_url.trim_end_matches('/'));
+    let url = format!(
+        "{}/1/validate-token",
+        state.listenbrainz_url.trim_end_matches('/')
+    );
     let resp = reqwest::Client::new()
         .get(&url)
         .header("Authorization", format!("Token {token}"))
-        .send().await;
+        .send()
+        .await;
     let username = match resp {
         Ok(r) if r.status().is_success() => {
             let v: serde_json::Value = r.json().await.unwrap_or_default();
@@ -93,8 +107,16 @@ async fn connect_listenbrainz(
     };
 
     let creds = serde_json::json!({ "token": token }).to_string();
-    match state.db.set_connection(user.user_id, "listenbrainz", &creds, username.as_deref()).await {
-        Ok(()) => (StatusCode::OK, Json(serde_json::json!({ "connected": true, "username": username }))).into_response(),
+    match state
+        .db
+        .set_connection(user.user_id, "listenbrainz", &creds, username.as_deref())
+        .await
+    {
+        Ok(()) => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "connected": true, "username": username })),
+        )
+            .into_response(),
         Err(e) => err(500, e.to_string()),
     }
 }
@@ -141,7 +163,9 @@ async fn scrobbler_start(svc: &Scrobbler) -> axum::response::Response {
 
     let url = format!(
         "{}?method=auth.getToken&api_key={}&api_sig={}&format=json",
-        svc.api, crate::sinks::LASTFM_API_KEY, sig,
+        svc.api,
+        crate::sinks::LASTFM_API_KEY,
+        sig,
     );
     let resp = reqwest::Client::new().get(&url).send().await;
     let token = match resp {
@@ -149,20 +173,41 @@ async fn scrobbler_start(svc: &Scrobbler) -> axum::response::Response {
             let v: serde_json::Value = r.json().await.unwrap_or_default();
             match v["token"].as_str() {
                 Some(t) => t.to_string(),
-                None => return err(502, format!("{} getToken failed: {}", svc.label,
-                    v["message"].as_str().unwrap_or("unknown"))),
+                None => {
+                    return err(
+                        502,
+                        format!(
+                            "{} getToken failed: {}",
+                            svc.label,
+                            v["message"].as_str().unwrap_or("unknown")
+                        ),
+                    )
+                }
             }
         }
         Err(e) => return err(502, format!("Could not reach {}: {e}", svc.label)),
     };
 
-    let auth_url = format!("{}?api_key={}&token={}", svc.auth_page, crate::sinks::LASTFM_API_KEY, token);
-    (StatusCode::OK, Json(serde_json::json!({ "token": token, "auth_url": auth_url }))).into_response()
+    let auth_url = format!(
+        "{}?api_key={}&token={}",
+        svc.auth_page,
+        crate::sinks::LASTFM_API_KEY,
+        token
+    );
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({ "token": token, "auth_url": auth_url })),
+    )
+        .into_response()
 }
 
 /// Step 2: exchange the approved token for a long-lived session key.
 async fn scrobbler_complete(
-    state: &Arc<AppState>, user: &AuthUser, svc: &Scrobbler, service_key: &str, token: &str,
+    state: &Arc<AppState>,
+    user: &AuthUser,
+    svc: &Scrobbler,
+    service_key: &str,
+    token: &str,
 ) -> axum::response::Response {
     if token.is_empty() {
         return err(400, "Missing token");
@@ -176,18 +221,30 @@ async fn scrobbler_complete(
 
     let url = format!(
         "{}?method=auth.getSession&api_key={}&token={}&api_sig={}&format=json",
-        svc.api, crate::sinks::LASTFM_API_KEY, token, sig,
+        svc.api,
+        crate::sinks::LASTFM_API_KEY,
+        token,
+        sig,
     );
     let resp = reqwest::Client::new().get(&url).send().await;
     let (session_key, username) = match resp {
         Ok(r) => {
             let v: serde_json::Value = r.json().await.unwrap_or_default();
             match v["session"]["key"].as_str() {
-                Some(k) => (k.to_string(), v["session"]["name"].as_str().map(str::to_string)),
+                Some(k) => (
+                    k.to_string(),
+                    v["session"]["name"].as_str().map(str::to_string),
+                ),
                 None => {
                     // error 14/15 = token not authorized yet
-                    return err(400, format!("Not yet approved on {} — click Connect again after approving ({})",
-                        svc.label, v["message"].as_str().unwrap_or("no session")));
+                    return err(
+                        400,
+                        format!(
+                            "Not yet approved on {} — click Connect again after approving ({})",
+                            svc.label,
+                            v["message"].as_str().unwrap_or("no session")
+                        ),
+                    );
                 }
             }
         }
@@ -195,8 +252,16 @@ async fn scrobbler_complete(
     };
 
     let creds = serde_json::json!({ "session_key": session_key }).to_string();
-    match state.db.set_connection(user.user_id, service_key, &creds, username.as_deref()).await {
-        Ok(()) => (StatusCode::OK, Json(serde_json::json!({ "connected": true, "username": username }))).into_response(),
+    match state
+        .db
+        .set_connection(user.user_id, service_key, &creds, username.as_deref())
+        .await
+    {
+        Ok(()) => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "connected": true, "username": username })),
+        )
+            .into_response(),
         Err(e) => err(500, e.to_string()),
     }
 }
@@ -212,7 +277,9 @@ async fn librefm_start(_user: AuthUser) -> impl IntoResponse {
 }
 
 #[derive(Deserialize)]
-struct LastfmComplete { token: String }
+struct LastfmComplete {
+    token: String,
+}
 
 /// POST /api/v1/connections/lastfm/complete — exchange the approved token for a
 /// session key. Fails if the user hasn't approved on Last.fm's site yet.
@@ -246,17 +313,27 @@ mod tests {
         let sig = lastfm_sign(&p, "SECRET");
         assert_eq!(sig.len(), 32);
         assert!(sig.chars().all(|c| c.is_ascii_hexdigit()));
-        assert_eq!(sig, lastfm_sign(&p, "SECRET"), "same input → same signature");
-        assert_ne!(sig, lastfm_sign(&p, "OTHER"), "signature depends on the secret");
+        assert_eq!(
+            sig,
+            lastfm_sign(&p, "SECRET"),
+            "same input → same signature"
+        );
+        assert_ne!(
+            sig,
+            lastfm_sign(&p, "OTHER"),
+            "signature depends on the secret"
+        );
     }
 
     #[test]
     fn lastfm_sign_sorts_params() {
         // BTreeMap sorts keys, so insertion order doesn't change the signature.
         let mut a = BTreeMap::new();
-        a.insert("b", "2"); a.insert("a", "1");
+        a.insert("b", "2");
+        a.insert("a", "1");
         let mut b = BTreeMap::new();
-        b.insert("a", "1"); b.insert("b", "2");
+        b.insert("a", "1");
+        b.insert("b", "2");
         assert_eq!(lastfm_sign(&a, "s"), lastfm_sign(&b, "s"));
     }
 }
@@ -266,9 +343,15 @@ pub fn create_connections_router() -> Router<Arc<AppState>> {
     Router::new()
         .route("/api/v1/connections", get(list_connections))
         .route("/api/v1/connections/:service", delete(disconnect))
-        .route("/api/v1/connections/listenbrainz", put(connect_listenbrainz))
+        .route(
+            "/api/v1/connections/listenbrainz",
+            put(connect_listenbrainz),
+        )
         .route("/api/v1/connections/lastfm/start", post(lastfm_start))
         .route("/api/v1/connections/lastfm/complete", post(lastfm_complete))
         .route("/api/v1/connections/librefm/start", post(librefm_start))
-        .route("/api/v1/connections/librefm/complete", post(librefm_complete))
+        .route(
+            "/api/v1/connections/librefm/complete",
+            post(librefm_complete),
+        )
 }

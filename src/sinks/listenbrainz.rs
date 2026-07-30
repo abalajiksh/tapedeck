@@ -1,10 +1,10 @@
+use super::ScrobbleSink;
+use crate::models::Play;
 use async_trait::async_trait;
 use reqwest::Client;
 use serde_json::json;
-use crate::models::Play;
-use super::ScrobbleSink;
-use tracing::{info, debug, error, warn};
 use tokio::time::{sleep, Duration};
+use tracing::{debug, error, info, warn};
 
 pub struct ListenBrainzSink {
     base_url: String,
@@ -14,7 +14,8 @@ pub struct ListenBrainzSink {
 
 impl ListenBrainzSink {
     pub fn new(base_url: String, token: String) -> Self {
-        let sanitized_token = token.trim()
+        let sanitized_token = token
+            .trim()
             .chars()
             .filter(|c| c.is_ascii() && !c.is_control())
             .collect::<String>();
@@ -39,8 +40,14 @@ impl ListenBrainzSink {
 
         // additional_info
         let mut additional_info = serde_json::Map::new();
-        additional_info.insert("submission_client".to_string(), json!(env!("CARGO_PKG_NAME")));
-        additional_info.insert("submission_client_version".to_string(), json!(env!("CARGO_PKG_VERSION")));
+        additional_info.insert(
+            "submission_client".to_string(),
+            json!(env!("CARGO_PKG_NAME")),
+        );
+        additional_info.insert(
+            "submission_client_version".to_string(),
+            json!(env!("CARGO_PKG_VERSION")),
+        );
 
         if let Some(dur) = play.duration {
             additional_info.insert("duration_ms".to_string(), json!(dur * 1000));
@@ -49,7 +56,10 @@ impl ListenBrainzSink {
             additional_info.insert("track_number".to_string(), json!(num));
         }
         if !additional_info.is_empty() {
-            track_meta.insert("additional_info".to_string(), serde_json::Value::Object(additional_info));
+            track_meta.insert(
+                "additional_info".to_string(),
+                serde_json::Value::Object(additional_info),
+            );
         }
 
         // mbid_mapping
@@ -78,18 +88,25 @@ impl ListenBrainzSink {
                 mbid_mapping.insert("artist_mbids".to_string(), json!(mbids));
                 has_mbid_data = true;
 
-                let artists_array: Vec<serde_json::Value> = mbids.iter().enumerate().map(|(idx, mbid)| {
-                    let artist_name = if let Some(ref artists) = play.artists {
-                        artists.get(idx).cloned().unwrap_or_else(|| play.artist.clone())
-                    } else {
-                        play.artist.clone()
-                    };
-                    json!({
-                        "artist_credit_name": artist_name,
-                        "join_phrase": "",
-                        "artist_mbid": mbid
+                let artists_array: Vec<serde_json::Value> = mbids
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, mbid)| {
+                        let artist_name = if let Some(ref artists) = play.artists {
+                            artists
+                                .get(idx)
+                                .cloned()
+                                .unwrap_or_else(|| play.artist.clone())
+                        } else {
+                            play.artist.clone()
+                        };
+                        json!({
+                            "artist_credit_name": artist_name,
+                            "join_phrase": "",
+                            "artist_mbid": mbid
+                        })
                     })
-                }).collect();
+                    .collect();
 
                 mbid_mapping.insert("artists".to_string(), json!(artists_array));
             }
@@ -98,7 +115,10 @@ impl ListenBrainzSink {
         if has_mbid_data {
             debug!("Adding mbid_mapping: recording={:?}, release={:?}, artist={:?}, caa_id={:?}, caa_release={:?}",
                 play.mbid_recording, play.mbid_release, play.mbid_artist, play.caa_id, play.caa_release_mbid);
-            track_meta.insert("mbid_mapping".to_string(), serde_json::Value::Object(mbid_mapping));
+            track_meta.insert(
+                "mbid_mapping".to_string(),
+                serde_json::Value::Object(mbid_mapping),
+            );
         } else {
             debug!("No MBIDs available for {} - {}", play.artist, play.title);
         }
@@ -108,8 +128,15 @@ impl ListenBrainzSink {
 
     /// Submit "now playing" status for a track
     pub async fn submit_now_playing(&self, play: &Play) -> Result<(), Box<dyn std::error::Error>> {
-        debug!("Submitting now playing: {} - {} (MBIDs: rec={:?}, rel={:?}, art={:?}, caa={:?})",
-            play.artist, play.title, play.mbid_recording, play.mbid_release, play.mbid_artist, play.caa_id);
+        debug!(
+            "Submitting now playing: {} - {} (MBIDs: rec={:?}, rel={:?}, art={:?}, caa={:?})",
+            play.artist,
+            play.title,
+            play.mbid_recording,
+            play.mbid_release,
+            play.mbid_artist,
+            play.caa_id
+        );
 
         let track_meta = Self::build_track_metadata(play);
 
@@ -127,7 +154,9 @@ impl ListenBrainzSink {
         const MAX_RETRIES: u32 = 1;
 
         loop {
-            let resp = self.client.post(&endpoint)
+            let resp = self
+                .client
+                .post(&endpoint)
                 .header("Authorization", &auth_header_value)
                 .header("Content-Type", "application/json")
                 .json(&body)
@@ -145,7 +174,8 @@ impl ListenBrainzSink {
                             error!("Now playing rate limited (gave up): {}", error_text);
                             return Ok(());
                         }
-                        let retry_after = response.headers()
+                        let retry_after = response
+                            .headers()
                             .get("X-RateLimit-Reset-In")
                             .and_then(|h| h.to_str().ok())
                             .and_then(|s| s.parse::<u64>().ok())
@@ -217,9 +247,16 @@ impl ScrobbleSink for ListenBrainzSink {
             let mut backoff = 2;
 
             loop {
-                debug!("Submitting chunk of {} plays (attempt {}/{})", chunk.len(), retries + 1, MAX_RETRIES);
+                debug!(
+                    "Submitting chunk of {} plays (attempt {}/{})",
+                    chunk.len(),
+                    retries + 1,
+                    MAX_RETRIES
+                );
 
-                let resp = self.client.post(&endpoint)
+                let resp = self
+                    .client
+                    .post(&endpoint)
                     .header("Authorization", &auth_header_value)
                     .header("Content-Type", "application/json")
                     .json(&body)
@@ -229,15 +266,20 @@ impl ScrobbleSink for ListenBrainzSink {
                 match resp {
                     Ok(response) => {
                         if response.status().is_success() {
-                            info!("✅ Successfully submitted {} plays to ListenBrainz", chunk.len());
+                            info!(
+                                "✅ Successfully submitted {} plays to ListenBrainz",
+                                chunk.len()
+                            );
                             break;
                         } else if response.status() == 429 {
-                            let reset_in = response.headers()
+                            let reset_in = response
+                                .headers()
                                 .get("X-RateLimit-Reset-In")
                                 .and_then(|h| h.to_str().ok())
                                 .and_then(|s| s.parse::<u64>().ok());
 
-                            let remaining = response.headers()
+                            let remaining = response
+                                .headers()
                                 .get("X-RateLimit-Remaining")
                                 .and_then(|h| h.to_str().ok())
                                 .unwrap_or("?");
@@ -251,8 +293,15 @@ impl ScrobbleSink for ListenBrainzSink {
                             retries += 1;
                             if retries > MAX_RETRIES {
                                 let error_text = response.text().await.unwrap_or_default();
-                                error!("Max retries exceeded for ListenBrainz. Last error: {}", error_text);
-                                return Err(format!("Rate limit exceeded after retries: {}", error_text).into());
+                                error!(
+                                    "Max retries exceeded for ListenBrainz. Last error: {}",
+                                    error_text
+                                );
+                                return Err(format!(
+                                    "Rate limit exceeded after retries: {}",
+                                    error_text
+                                )
+                                .into());
                             }
 
                             if reset_in.is_none() {
@@ -262,7 +311,10 @@ impl ScrobbleSink for ListenBrainzSink {
                         } else {
                             let status = response.status();
                             let error_text = response.text().await.unwrap_or_default();
-                            error!("ListenBrainz submission failed. Status: {}, Response: {}", status, error_text);
+                            error!(
+                                "ListenBrainz submission failed. Status: {}, Response: {}",
+                                status, error_text
+                            );
                             return Err(format!("ListenBrainz API Error: {}", error_text).into());
                         }
                     }

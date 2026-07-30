@@ -27,11 +27,11 @@ use serde::Deserialize;
 use std::sync::Arc;
 use tracing::info;
 
-use crate::db::UserSource;
-use crate::sources::{JellyfinSource, NavidromeSource, PlexFilters, PlexSource};
 use super::auth::AuthUser;
 use super::models::ErrorResponse;
 use super::AppState;
+use crate::db::UserSource;
+use crate::sources::{JellyfinSource, NavidromeSource, PlexFilters, PlexSource};
 
 /// Kinds we can actually build. Kept explicit so a typo'd path can't create a
 /// row the engine will never poll.
@@ -39,7 +39,14 @@ const KINDS: [&str; 3] = ["plex", "navidrome", "jellyfin"];
 
 fn err(code: u16, msg: impl Into<String>) -> axum::response::Response {
     let status = StatusCode::from_u16(code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-    (status, Json(serde_json::json!(ErrorResponse { code, error: msg.into() }))).into_response()
+    (
+        status,
+        Json(serde_json::json!(ErrorResponse {
+            code,
+            error: msg.into()
+        })),
+    )
+        .into_response()
 }
 
 fn public_view(s: &UserSource) -> serde_json::Value {
@@ -64,17 +71,18 @@ fn public_view(s: &UserSource) -> serde_json::Value {
 }
 
 /// GET /api/v1/sources — the caller's own sources.
-async fn list_sources(
-    State(state): State<Arc<AppState>>,
-    user: AuthUser,
-) -> impl IntoResponse {
+async fn list_sources(State(state): State<Arc<AppState>>, user: AuthUser) -> impl IntoResponse {
     match state.db.list_sources_for_user(user.user_id).await {
         Ok(rows) => {
             let items: Vec<serde_json::Value> = rows.iter().map(public_view).collect();
-            (StatusCode::OK, Json(serde_json::json!({
-                "sources": items,
-                "kinds": KINDS,
-            }))).into_response()
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "sources": items,
+                    "kinds": KINDS,
+                })),
+            )
+                .into_response()
         }
         Err(e) => err(500, e.to_string()),
     }
@@ -116,15 +124,21 @@ struct Resolved {
 /// Work out the final credential set and confirm which remote account it
 /// belongs to. Shared by create and update so both validate identically.
 async fn resolve_save(
-    kind: &str, body: &mut SourceUpdate, current: Option<&UserSource>, enabled: bool,
+    kind: &str,
+    body: &mut SourceUpdate,
+    current: Option<&UserSource>,
+    enabled: bool,
 ) -> Result<Resolved, axum::response::Response> {
-    let url = body.url.take()
+    let url = body
+        .url
+        .take()
         .map(|u| u.trim().trim_end_matches('/').to_string())
         .or_else(|| current.map(|c| c.url.clone()))
         .unwrap_or_default();
 
     let keep = |incoming: Option<String>, key: &str| -> String {
-        incoming.filter(|v| !v.trim().is_empty())
+        incoming
+            .filter(|v| !v.trim().is_empty())
             .map(|v| v.trim().to_string())
             .or_else(|| current.and_then(|c| c.credential(key)))
             .unwrap_or_default()
@@ -141,11 +155,16 @@ async fn resolve_save(
         _ => false,
     };
     if enabled && !complete {
-        return Err(err(400, match kind {
-            "navidrome" => "A server URL, username and password are required to enable Navidrome",
-            "jellyfin" => "A server URL and API key are required to enable Jellyfin",
-            _ => "A server URL and token are required to enable Plex",
-        }));
+        return Err(err(
+            400,
+            match kind {
+                "navidrome" => {
+                    "A server URL, username and password are required to enable Navidrome"
+                }
+                "jellyfin" => "A server URL and API key are required to enable Jellyfin",
+                _ => "A server URL and token are required to enable Plex",
+            },
+        ));
     }
 
     // Establishing *which account* the credentials belong to is what keeps one
@@ -160,29 +179,46 @@ async fn resolve_save(
             if complete && changed {
                 match PlexSource::resolve_account(&url, &token).await {
                     Ok(name) => remote_account = Some(name),
-                    Err(e) => return Err(err(400, format!(
-                        "Could not confirm which Plex account that token belongs to: {e}. \
+                    Err(e) => {
+                        return Err(err(
+                            400,
+                            format!(
+                                "Could not confirm which Plex account that token belongs to: {e}. \
                          Tapedeck needs this to keep other people's sessions out of your history."
-                    ))),
+                            ),
+                        ))
+                    }
                 }
             }
-            if token.is_empty() { String::new() }
-            else { serde_json::json!({ "token": token }).to_string() }
+            if token.is_empty() {
+                String::new()
+            } else {
+                serde_json::json!({ "token": token }).to_string()
+            }
         }
         "jellyfin" => {
             let changed = current.map(|c| c.url != url).unwrap_or(true)
-                || current.and_then(|c| c.credential("api_key")).as_deref() != Some(jf_key.as_str())
+                || current.and_then(|c| c.credential("api_key")).as_deref()
+                    != Some(jf_key.as_str())
                 || remote_account.is_none();
             if complete && changed {
                 match JellyfinSource::resolve_account(&url, &jf_key).await {
                     Ok(name) => remote_account = Some(name),
-                    Err(e) => return Err(err(400, format!(
-                        "Could not confirm which Jellyfin account that key belongs to: {e}"
-                    ))),
+                    Err(e) => {
+                        return Err(err(
+                            400,
+                            format!(
+                                "Could not confirm which Jellyfin account that key belongs to: {e}"
+                            ),
+                        ))
+                    }
                 }
             }
-            if jf_key.is_empty() { String::new() }
-            else { serde_json::json!({ "api_key": jf_key }).to_string() }
+            if jf_key.is_empty() {
+                String::new()
+            } else {
+                serde_json::json!({ "api_key": jf_key }).to_string()
+            }
         }
         _ => {
             if complete && enabled {
@@ -192,18 +228,24 @@ async fn resolve_save(
                 }
             }
             remote_account = (!nd_user.is_empty()).then(|| nd_user.clone());
-            if nd_user.is_empty() { String::new() }
-            else { serde_json::json!({ "username": nd_user, "password": nd_pass }).to_string() }
+            if nd_user.is_empty() {
+                String::new()
+            } else {
+                serde_json::json!({ "username": nd_user, "password": nd_pass }).to_string()
+            }
         }
     };
 
     // A list the body omits keeps its stored value, so saving a URL doesn't wipe
     // someone's podcast exclusions.
     let keep_list = |incoming: Option<Vec<String>>, key: &str| -> Vec<String> {
-        incoming.map(|v| v.into_iter()
-                .map(|s| s.trim().to_lowercase())
-                .filter(|s| !s.is_empty())
-                .collect())
+        incoming
+            .map(|v| {
+                v.into_iter()
+                    .map(|s| s.trim().to_lowercase())
+                    .filter(|s| !s.is_empty())
+                    .collect()
+            })
             .unwrap_or_else(|| current.map(|c| c.option_list(key)).unwrap_or_default())
     };
     let options = serde_json::json!({
@@ -211,9 +253,16 @@ async fn resolve_save(
         "libraries_block": keep_list(body.libraries_block.take(), "libraries_block"),
         "devices_allow": keep_list(body.devices_allow.take(), "devices_allow"),
         "devices_block": keep_list(body.devices_block.take(), "devices_block"),
-    }).to_string();
+    })
+    .to_string();
 
-    Ok(Resolved { url, credentials, remote_account, options, complete })
+    Ok(Resolved {
+        url,
+        credentials,
+        remote_account,
+        options,
+        complete,
+    })
 }
 
 /// POST /api/v1/sources — add another server.
@@ -235,10 +284,21 @@ async fn create_source(
         Err(resp) => return resp,
     };
 
-    match state.db.create_source(
-        user.user_id, &kind, &label, enabled && resolved.complete, &resolved.url,
-        &resolved.credentials, resolved.remote_account.as_deref(), interval, &resolved.options,
-    ).await {
+    match state
+        .db
+        .create_source(
+            user.user_id,
+            &kind,
+            &label,
+            enabled && resolved.complete,
+            &resolved.url,
+            &resolved.credentials,
+            resolved.remote_account.as_deref(),
+            interval,
+            &resolved.options,
+        )
+        .await
+    {
         Ok(id) => {
             info!("⚙️ {} source added by {}", kind, user.username);
             match state.db.get_source(user.user_id, id).await {
@@ -264,7 +324,12 @@ async fn update_source(
     };
 
     let enabled = body.enabled.unwrap_or(current.enabled);
-    let label = body.label.clone().unwrap_or_else(|| current.label.clone()).trim().to_string();
+    let label = body
+        .label
+        .clone()
+        .unwrap_or_else(|| current.label.clone())
+        .trim()
+        .to_string();
     let interval = body.poll_interval_secs.or(current.poll_interval_secs);
 
     let resolved = match resolve_save(&current.kind, &mut body, Some(&current), enabled).await {
@@ -272,12 +337,26 @@ async fn update_source(
         Err(resp) => return resp,
     };
 
-    match state.db.update_source(
-        user.user_id, id, &label, enabled, &resolved.url,
-        &resolved.credentials, resolved.remote_account.as_deref(), interval, &resolved.options,
-    ).await {
+    match state
+        .db
+        .update_source(
+            user.user_id,
+            id,
+            &label,
+            enabled,
+            &resolved.url,
+            &resolved.credentials,
+            resolved.remote_account.as_deref(),
+            interval,
+            &resolved.options,
+        )
+        .await
+    {
         Ok(true) => {
-            info!("⚙️ {} source updated by {} (enabled: {})", current.kind, user.username, enabled);
+            info!(
+                "⚙️ {} source updated by {} (enabled: {})",
+                current.kind, user.username, enabled
+            );
             match state.db.get_source(user.user_id, id).await {
                 Ok(Some(s)) => (StatusCode::OK, Json(public_view(&s))).into_response(),
                 _ => err(500, "source vanished after write"),
@@ -332,20 +411,25 @@ async fn test_source(
         None => None,
     };
 
-    let kind = body.kind.clone()
+    let kind = body
+        .kind
+        .clone()
         .or_else(|| stored.as_ref().map(|s| s.kind.clone()))
         .unwrap_or_default();
     if !KINDS.contains(&kind.as_str()) {
         return err(400, format!("Unknown source kind: {kind}"));
     }
 
-    let url = body.url.clone()
+    let url = body
+        .url
+        .clone()
         .map(|u| u.trim().trim_end_matches('/').to_string())
         .filter(|u| !u.is_empty())
         .or_else(|| stored.as_ref().map(|s| s.url.clone()))
         .unwrap_or_default();
     let cred = |incoming: Option<String>, key: &str| -> String {
-        incoming.filter(|v| !v.trim().is_empty())
+        incoming
+            .filter(|v| !v.trim().is_empty())
             .map(|v| v.trim().to_string())
             .or_else(|| stored.as_ref().and_then(|s| s.credential(key)))
             .unwrap_or_default()
@@ -358,19 +442,38 @@ async fn test_source(
                 return err(400, "Enter a server URL and API key first");
             }
             match JellyfinSource::resolve_account(&url, &key).await {
-                Ok(name) => (StatusCode::OK, Json(serde_json::json!({ "ok": true, "account": name }))).into_response(),
-                Err(e) => (StatusCode::OK, Json(serde_json::json!({ "ok": false, "error": e.to_string() }))).into_response(),
+                Ok(name) => (
+                    StatusCode::OK,
+                    Json(serde_json::json!({ "ok": true, "account": name })),
+                )
+                    .into_response(),
+                Err(e) => (
+                    StatusCode::OK,
+                    Json(serde_json::json!({ "ok": false, "error": e.to_string() })),
+                )
+                    .into_response(),
             }
         }
         "navidrome" => {
-            let (u, p) = (cred(body.username.clone(), "username"), cred(body.password.clone(), "password"));
+            let (u, p) = (
+                cred(body.username.clone(), "username"),
+                cred(body.password.clone(), "password"),
+            );
             if url.is_empty() || u.is_empty() || p.is_empty() {
                 return err(400, "Enter a server URL, username and password first");
             }
             let mut probe = NavidromeSource::new(url, u.clone(), p);
             match probe.initialize().await {
-                Ok(()) => (StatusCode::OK, Json(serde_json::json!({ "ok": true, "account": u }))).into_response(),
-                Err(e) => (StatusCode::OK, Json(serde_json::json!({ "ok": false, "error": e.to_string() }))).into_response(),
+                Ok(()) => (
+                    StatusCode::OK,
+                    Json(serde_json::json!({ "ok": true, "account": u })),
+                )
+                    .into_response(),
+                Err(e) => (
+                    StatusCode::OK,
+                    Json(serde_json::json!({ "ok": false, "error": e.to_string() })),
+                )
+                    .into_response(),
             }
         }
         _ => {
@@ -388,15 +491,23 @@ async fn test_source(
             };
             let mut probe = PlexSource::with_filters(url, token, PlexFilters::default());
             match probe.initialize().await {
-                Ok(()) => (StatusCode::OK, Json(serde_json::json!({
-                    "ok": true,
-                    "libraries": probe.library_names(),
-                    "account": account,
-                    "account_error": account_error,
-                }))).into_response(),
-                Err(e) => (StatusCode::OK, Json(serde_json::json!({
-                    "ok": false, "error": e.to_string(),
-                }))).into_response(),
+                Ok(()) => (
+                    StatusCode::OK,
+                    Json(serde_json::json!({
+                        "ok": true,
+                        "libraries": probe.library_names(),
+                        "account": account,
+                        "account_error": account_error,
+                    })),
+                )
+                    .into_response(),
+                Err(e) => (
+                    StatusCode::OK,
+                    Json(serde_json::json!({
+                        "ok": false, "error": e.to_string(),
+                    })),
+                )
+                    .into_response(),
             }
         }
     }
@@ -408,5 +519,8 @@ pub fn create_sources_router() -> Router<Arc<AppState>> {
         // parameterised route.
         .route("/api/v1/sources/test", post(test_source))
         .route("/api/v1/sources", get(list_sources).post(create_source))
-        .route("/api/v1/sources/:id", axum::routing::put(update_source).delete(delete_source))
+        .route(
+            "/api/v1/sources/:id",
+            axum::routing::put(update_source).delete(delete_source),
+        )
 }

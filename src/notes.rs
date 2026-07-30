@@ -102,7 +102,9 @@ pub fn scan(src: &str) -> Vec<Shortcode> {
             i += 1;
             continue;
         }
-        let Some(rel_end) = src[i + 2..].find("]]") else { break };
+        let Some(rel_end) = src[i + 2..].find("]]") else {
+            break;
+        };
         let inner_end = i + 2 + rel_end;
         let inner = &src[i + 2..inner_end];
 
@@ -162,11 +164,15 @@ fn substitute(src: &str, resolved: &HashMap<(RefKind, String), Resolved>) -> Str
 }
 
 fn escape_link_text(s: &str) -> String {
-    s.replace('\\', r"\\").replace('[', r"\[").replace(']', r"\]")
+    s.replace('\\', r"\\")
+        .replace('[', r"\[")
+        .replace(']', r"\]")
 }
 
 fn escape_html(s: &str) -> String {
-    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
 }
 
 /// Markdown → sanitised HTML, with shortcodes substituted first.
@@ -222,7 +228,10 @@ pub fn excerpt(src: &str, max_chars: usize) -> String {
         return flat;
     }
     let cut: String = flat.chars().take(max_chars).collect();
-    let cut = cut.rsplit_once(' ').map(|(head, _)| head.to_string()).unwrap_or(cut);
+    let cut = cut
+        .rsplit_once(' ')
+        .map(|(head, _)| head.to_string())
+        .unwrap_or(cut);
     format!("{cut}…")
 }
 
@@ -231,9 +240,16 @@ mod tests {
     use super::*;
 
     fn resolved(pairs: &[(RefKind, &str, i64, &str)]) -> HashMap<(RefKind, String), Resolved> {
-        pairs.iter()
+        pairs
+            .iter()
             .map(|(k, t, id, label)| {
-                ((*k, t.to_lowercase()), Resolved { entity_id: *id, label: label.to_string() })
+                (
+                    (*k, t.to_lowercase()),
+                    Resolved {
+                        entity_id: *id,
+                        label: label.to_string(),
+                    },
+                )
             })
             .collect()
     }

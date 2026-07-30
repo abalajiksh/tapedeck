@@ -1,11 +1,7 @@
-use tracing_subscriber::{
-    layer::SubscriberExt,
-    reload,
-    util::SubscriberInitExt,
-    EnvFilter,
-    Registry,
-};
 use tracing_appender::rolling::{RollingFileAppender, Rotation};
+use tracing_subscriber::{
+    layer::SubscriberExt, reload, util::SubscriberInitExt, EnvFilter, Registry,
+};
 
 /// Shared handle for runtime log level control.
 ///
@@ -42,7 +38,7 @@ impl LogLevelHandle {
 }
 
 /// Initialize logging with file output and runtime level control
-/// 
+///
 /// # Arguments
 /// * `log_dir` - Directory for log files (default: "./logs")
 /// * `enable_file_logging` - Whether to write logs to files
@@ -60,7 +56,9 @@ pub fn init_logging(
     let (filter_layer, reload_handle) =
         reload::Layer::<EnvFilter, Registry>::new(EnvFilter::try_new(level)?);
 
-    let handle = LogLevelHandle { filter: reload_handle };
+    let handle = LogLevelHandle {
+        filter: reload_handle,
+    };
 
     // The filter layer must be part of the subscriber, otherwise every event
     // is emitted regardless of level and runtime reloads do nothing.
@@ -74,21 +72,21 @@ pub fn init_logging(
             .with_file(false)
             .with_line_number(false)
             .compact();
-        
+
         let subscriber = subscriber.with(console_layer);
-        
+
         // File layer (if enabled)
         if enable_file_logging {
             let log_path = log_dir.unwrap_or("./logs");
             std::fs::create_dir_all(log_path)?;
-            
+
             let file_appender = RollingFileAppender::builder()
                 .rotation(Rotation::DAILY)
                 .filename_prefix("tapedeck")
                 .filename_suffix("log")
                 .max_log_files(7) // Keep 7 days of logs
                 .build(log_path)?;
-            
+
             let file_layer = tracing_subscriber::fmt::layer()
                 .with_writer(file_appender)
                 .with_ansi(false) // No color codes in files
@@ -96,7 +94,7 @@ pub fn init_logging(
                 .with_thread_ids(true)
                 .with_file(true)
                 .with_line_number(true);
-            
+
             subscriber.with(file_layer).init();
         } else {
             subscriber.init();
@@ -105,14 +103,14 @@ pub fn init_logging(
         // File only, no console
         let log_path = log_dir.unwrap_or("./logs");
         std::fs::create_dir_all(log_path)?;
-        
+
         let file_appender = RollingFileAppender::builder()
             .rotation(Rotation::DAILY)
             .filename_prefix("tapedeck")
             .filename_suffix("log")
             .max_log_files(7)
             .build(log_path)?;
-        
+
         let file_layer = tracing_subscriber::fmt::layer()
             .with_writer(file_appender)
             .with_ansi(false)
@@ -120,7 +118,7 @@ pub fn init_logging(
             .with_thread_ids(true)
             .with_file(true)
             .with_line_number(true);
-        
+
         subscriber.with(file_layer).init();
     }
 

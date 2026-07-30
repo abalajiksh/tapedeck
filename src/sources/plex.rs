@@ -1,11 +1,11 @@
-use serde::{Deserialize, Deserializer};
-use reqwest::Client;
-use tracing::{debug, info, warn};
-use std::collections::HashMap;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use crate::models::{AudioQuality, Play};
 use crate::sources::MusicSource;
 use async_trait::async_trait;
+use reqwest::Client;
+use serde::{Deserialize, Deserializer};
+use std::collections::HashMap;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tracing::{debug, info, warn};
 
 // ==================== Deserialization Helpers ====================
 
@@ -20,13 +20,36 @@ where
         fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
             formatter.write_str("a u64 as either a number or a string")
         }
-        fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E> where E: de::Error { Ok(Some(value)) }
-        fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E> where E: de::Error { Ok(Some(value as u64)) }
-        fn visit_str<E>(self, value: &str) -> Result<Self::Value, E> where E: de::Error {
+        fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            Ok(Some(value))
+        }
+        fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            Ok(Some(value as u64))
+        }
+        fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
             value.parse::<u64>().map(Some).map_err(de::Error::custom)
         }
-        fn visit_none<E>(self) -> Result<Self::Value, E> where E: de::Error { Ok(None) }
-        fn visit_unit<E>(self) -> Result<Self::Value, E> where E: de::Error { Ok(None) }
+        fn visit_none<E>(self) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            Ok(None)
+        }
+        fn visit_unit<E>(self) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            Ok(None)
+        }
     }
     deserializer.deserialize_any(U64Visitor)
 }
@@ -42,13 +65,36 @@ where
         fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
             formatter.write_str("an i32 as either a number or a string")
         }
-        fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E> where E: de::Error { Ok(Some(value as i32)) }
-        fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E> where E: de::Error { Ok(Some(value as i32)) }
-        fn visit_str<E>(self, value: &str) -> Result<Self::Value, E> where E: de::Error {
+        fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            Ok(Some(value as i32))
+        }
+        fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            Ok(Some(value as i32))
+        }
+        fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
             value.parse::<i32>().map(Some).map_err(de::Error::custom)
         }
-        fn visit_none<E>(self) -> Result<Self::Value, E> where E: de::Error { Ok(None) }
-        fn visit_unit<E>(self) -> Result<Self::Value, E> where E: de::Error { Ok(None) }
+        fn visit_none<E>(self) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            Ok(None)
+        }
+        fn visit_unit<E>(self) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            Ok(None)
+        }
     }
     deserializer.deserialize_any(I32Visitor)
 }
@@ -117,7 +163,9 @@ impl PlexTrack {
     fn extract_quality(session: &SessionMetadata) -> Option<AudioQuality> {
         let media = session.media.as_ref()?.first()?;
 
-        let audio_stream = media.part.as_ref()
+        let audio_stream = media
+            .part
+            .as_ref()
             .and_then(|parts| parts.first())
             .and_then(|part| part.stream.as_ref())
             .and_then(|streams| streams.iter().find(|s| s.stream_type == Some(2)));
@@ -126,9 +174,7 @@ impl PlexTrack {
             .and_then(|s| s.codec.clone())
             .or_else(|| media.audio_codec.clone());
 
-        let bitrate = audio_stream
-            .and_then(|s| s.bitrate)
-            .or(media.bitrate);
+        let bitrate = audio_stream.and_then(|s| s.bitrate).or(media.bitrate);
 
         let sample_rate = audio_stream.and_then(|s| s.sampling_rate);
         let bit_depth = audio_stream.and_then(|s| s.bit_depth);
@@ -137,7 +183,10 @@ impl PlexTrack {
             .or(media.audio_channels);
 
         let codec_lower = codec.as_deref().unwrap_or("").to_lowercase();
-        let is_lossless = matches!(codec_lower.as_str(), "flac" | "alac" | "wav" | "aiff" | "dsd" | "pcm");
+        let is_lossless = matches!(
+            codec_lower.as_str(),
+            "flac" | "alac" | "wav" | "aiff" | "dsd" | "pcm"
+        );
         let format_type = if codec_lower == "dsd" { "dsd" } else { "pcm" };
 
         let container = media.container.clone();
@@ -147,12 +196,18 @@ impl PlexTrack {
                 let tc_codec = tc.audio_codec.clone();
                 let is_tc = tc_codec.as_deref() != codec.as_deref();
                 let reason = if is_tc {
-                    tc.transcode_hw_requested.map(|_| "server_transcode".to_string())
+                    tc.transcode_hw_requested
+                        .map(|_| "server_transcode".to_string())
                         .or_else(|| Some("bandwidth".to_string()))
                 } else {
                     None
                 };
-                (Some(is_tc), if is_tc { tc_codec } else { None }, None, reason)
+                (
+                    Some(is_tc),
+                    if is_tc { tc_codec } else { None },
+                    None,
+                    reason,
+                )
             } else {
                 (Some(false), None, None, None)
             };
@@ -182,7 +237,10 @@ impl PlexTrack {
     }
 
     pub fn to_play(&self, source_id_suffix: &str) -> Play {
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
         let timestamp = self.viewed_at.unwrap_or(now);
         let source_id = format!("plex-{}-{}", self.rating_key, source_id_suffix);
 
@@ -194,8 +252,15 @@ impl PlexTrack {
 
         Play {
             title: self.title.clone(),
-            artist: artists.first().cloned().unwrap_or_else(|| "Unknown".to_string()),
-            artists: if artists.is_empty() { None } else { Some(artists) },
+            artist: artists
+                .first()
+                .cloned()
+                .unwrap_or_else(|| "Unknown".to_string()),
+            artists: if artists.is_empty() {
+                None
+            } else {
+                Some(artists)
+            },
             album: self.album.clone(),
             timestamp,
             duration: self.duration.map(|d| d / 1000),
@@ -402,7 +467,11 @@ impl PlexSource {
             token,
             client: Client::builder()
                 .timeout(Duration::from_secs(10))
-                .user_agent(format!("{}/{}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION")))
+                .user_agent(format!(
+                    "{}/{}",
+                    env!("CARGO_PKG_NAME"),
+                    env!("CARGO_PKG_VERSION")
+                ))
                 .build()
                 .unwrap_or_else(|_| Client::new()),
             filters,
@@ -428,7 +497,10 @@ impl PlexSource {
     /// is *playing*, not who a token belongs to. That means this needs outbound
     /// internet access even for a LAN-only Plex — callers should treat failure as
     /// "ask the user to type their Plex username" rather than fatal.
-    pub async fn resolve_account(url: &str, token: &str) -> Result<String, Box<dyn std::error::Error>> {
+    pub async fn resolve_account(
+        url: &str,
+        token: &str,
+    ) -> Result<String, Box<dyn std::error::Error>> {
         #[derive(Deserialize)]
         struct PlexTvUser {
             username: Option<String>,
@@ -438,7 +510,11 @@ impl PlexSource {
 
         let client = Client::builder()
             .timeout(Duration::from_secs(10))
-            .user_agent(format!("{}/{}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION")))
+            .user_agent(format!(
+                "{}/{}",
+                env!("CARGO_PKG_NAME"),
+                env!("CARGO_PKG_VERSION")
+            ))
             .build()?;
 
         let resp = client
@@ -446,8 +522,12 @@ impl PlexSource {
             .header("X-Plex-Token", token)
             .header("Accept", "application/json")
             .header("X-Plex-Product", env!("CARGO_PKG_NAME"))
-            .header("X-Plex-Client-Identifier", format!("tapedeck-{}", env!("CARGO_PKG_VERSION")))
-            .send().await?;
+            .header(
+                "X-Plex-Client-Identifier",
+                format!("tapedeck-{}", env!("CARGO_PKG_VERSION")),
+            )
+            .send()
+            .await?;
 
         if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
             return Err("Plex rejected that token".into());
@@ -474,20 +554,25 @@ impl PlexSource {
     ///
     /// Proxied for the same reason as Navidrome's: a LAN Plex isn't reachable
     /// from the browser, and the token must not leave the server.
-    pub async fn fetch_cover_art(&self, rating_key: &str)
-        -> Result<(Vec<u8>, String), Box<dyn std::error::Error + Send + Sync>>
-    {
+    pub async fn fetch_cover_art(
+        &self,
+        rating_key: &str,
+    ) -> Result<(Vec<u8>, String), Box<dyn std::error::Error + Send + Sync>> {
         // `thumb` on a track is the album cover Plex already generated.
         let endpoint = format!("{}/library/metadata/{}/thumb", self.url, rating_key);
-        let resp = self.client
+        let resp = self
+            .client
             .get(&endpoint)
             .header("X-Plex-Token", &self.token)
-            .send().await?;
+            .send()
+            .await?;
 
         if !resp.status().is_success() {
             return Err(format!("Plex artwork returned {}", resp.status()).into());
         }
-        let content_type = resp.headers().get(reqwest::header::CONTENT_TYPE)
+        let content_type = resp
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
             .and_then(|v| v.to_str().ok())
             .unwrap_or("image/jpeg")
             .to_string();
@@ -505,10 +590,13 @@ impl PlexSource {
 
     async fn fetch_libraries(&self) -> Result<Vec<Library>, Box<dyn std::error::Error>> {
         let endpoint = format!("{}/library/sections", self.url);
-        let resp = self.client.get(&endpoint)
+        let resp = self
+            .client
+            .get(&endpoint)
             .header("X-Plex-Token", &self.token)
             .header("Accept", "application/json")
-            .send().await?;
+            .send()
+            .await?;
         if !resp.status().is_success() {
             return Err(format!("Plex API error: {}", resp.status()).into());
         }
@@ -516,45 +604,69 @@ impl PlexSource {
         Ok(lib_response.media_container.directory)
     }
 
-    pub async fn fetch_sessions_extended(&mut self, _last_checked: Option<u64>) -> Result<SessionResult, Box<dyn std::error::Error>> {
+    pub async fn fetch_sessions_extended(
+        &mut self,
+        _last_checked: Option<u64>,
+    ) -> Result<SessionResult, Box<dyn std::error::Error>> {
         let mut result = SessionResult::default();
 
         // A. Live Sessions
         let endpoint = format!("{}/status/sessions", self.url);
-        if let Ok(resp) = self.client.get(&endpoint)
+        if let Ok(resp) = self
+            .client
+            .get(&endpoint)
             .header("X-Plex-Token", &self.token)
             .header("Accept", "application/json")
-            .send().await
+            .send()
+            .await
         {
             if resp.status().is_success() {
                 if let Ok(sessions) = resp.json::<SessionsResponse>().await {
-                    info!("Processing {} active Plex sessions", sessions.media_container.metadata.len());
+                    info!(
+                        "Processing {} active Plex sessions",
+                        sessions.media_container.metadata.len()
+                    );
 
                     for session in sessions.media_container.metadata {
                         if let Some(reason) = self.validate_session(&session) {
                             debug!("Skipping session: {}", reason);
                             continue;
                         }
-                        if session.media_type.as_deref() != Some("track") { continue; }
+                        if session.media_type.as_deref() != Some("track") {
+                            continue;
+                        }
 
-                        let is_playing = session.player.as_ref()
+                        let is_playing = session
+                            .player
+                            .as_ref()
                             .map(|p| p.state.as_deref() == Some("playing"))
                             .unwrap_or(false);
 
                         if let Some(track) = PlexTrack::from_session(session) {
                             if let Some(ref q) = track.audio_quality {
-                                debug!("Plex quality: {} {} {}/{} score={:.0}{}",
+                                debug!(
+                                    "Plex quality: {} {} {}/{} score={:.0}{}",
                                     q.codec.as_deref().unwrap_or("?"),
-                                    if q.is_lossless.unwrap_or(false) { "lossless" } else { "lossy" },
+                                    if q.is_lossless.unwrap_or(false) {
+                                        "lossless"
+                                    } else {
+                                        "lossy"
+                                    },
                                     q.bit_depth.unwrap_or(0),
                                     q.sample_rate.unwrap_or(0),
                                     q.quality_score.unwrap_or(0.0),
                                     if q.is_transcoded.unwrap_or(false) {
-                                        format!(" → transcoded to {}", q.delivery_codec.as_deref().unwrap_or("?"))
-                                    } else { String::new() },
+                                        format!(
+                                            " → transcoded to {}",
+                                            q.delivery_codec.as_deref().unwrap_or("?")
+                                        )
+                                    } else {
+                                        String::new()
+                                    },
                                 );
                             }
-                            self.process_live_track(track, is_playing, &mut result).await;
+                            self.process_live_track(track, is_playing, &mut result)
+                                .await;
                         }
                     }
                 }
@@ -567,34 +679,55 @@ impl PlexSource {
             result.ready_to_scrobble.extend(history);
         }
 
-        info!("Session fetch complete: {} now playing, {} ready to scrobble",
-              result.now_playing.len(), result.ready_to_scrobble.len());
+        info!(
+            "Session fetch complete: {} now playing, {} ready to scrobble",
+            result.now_playing.len(),
+            result.ready_to_scrobble.len()
+        );
         Ok(result)
     }
 
-    async fn process_live_track(&mut self, track: PlexTrack, is_playing: bool, result: &mut SessionResult) {
+    async fn process_live_track(
+        &mut self,
+        track: PlexTrack,
+        is_playing: bool,
+        result: &mut SessionResult,
+    ) {
         let session_key = track.session_key.clone().unwrap_or_default();
         let rating_key = track.rating_key.clone();
         let duration = track.duration.unwrap_or(0);
         let view_offset = track.view_offset.unwrap_or(0);
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
 
         if let Some(state) = self.session_states.get(&session_key) {
             if state.rating_key != rating_key {
-                debug!("Track changed in session {}: {} -> {}", session_key, state.rating_key, rating_key);
+                debug!(
+                    "Track changed in session {}: {} -> {}",
+                    session_key, state.rating_key, rating_key
+                );
                 self.session_states.remove(&session_key);
             }
         }
 
         let (should_scrobble, needs_np) = {
-            let state = self.session_states.entry(session_key.clone()).or_insert_with(|| SessionState {
-                rating_key: rating_key.clone(),
-                last_seen: now,
-                scrobbled: false,
-            });
+            let state = self
+                .session_states
+                .entry(session_key.clone())
+                .or_insert_with(|| SessionState {
+                    rating_key: rating_key.clone(),
+                    last_seen: now,
+                    scrobbled: false,
+                });
             state.last_seen = now;
 
-            let pct = if duration > 0 { (view_offset as f64 / duration as f64) * 100.0 } else { 0.0 };
+            let pct = if duration > 0 {
+                (view_offset as f64 / duration as f64) * 100.0
+            } else {
+                0.0
+            };
             let seconds = view_offset / 1000;
 
             let ready = !state.scrobbled && (pct >= 50.0 || seconds >= 240);
@@ -603,7 +736,10 @@ impl PlexSource {
         };
 
         if should_scrobble {
-            info!("Track ready for scrobble: '{}' by '{}'", track.title, track.artist);
+            info!(
+                "Track ready for scrobble: '{}' by '{}'",
+                track.title, track.artist
+            );
             if let Some(state) = self.session_states.get_mut(&session_key) {
                 state.scrobbled = true;
             }
@@ -619,9 +755,9 @@ impl PlexSource {
     /// quick_xml's serde deserializer fails on repeated same-name elements
     /// ("duplicate field `Track`"), so we extract <Track> attributes directly.
     fn parse_history_xml(xml: &str) -> Vec<HistoryTrack> {
-        use quick_xml::Reader;
-        use quick_xml::events::Event;
         use quick_xml::escape::unescape;
+        use quick_xml::events::Event;
+        use quick_xml::Reader;
 
         let mut reader = Reader::from_str(xml);
         let mut tracks = Vec::new();
@@ -662,9 +798,7 @@ impl PlexSource {
                             b"duration" => track.duration = val.parse().ok(),
                             b"ratingKey" => track.rating_key = Some(val),
                             b"parentRatingKey" => track.parent_rating_key = Some(val),
-                            b"grandparentRatingKey" => {
-                                track.grandparent_rating_key = Some(val)
-                            }
+                            b"grandparentRatingKey" => track.grandparent_rating_key = Some(val),
                             _ => {}
                         }
                     }
@@ -673,7 +807,7 @@ impl PlexSource {
                 }
                 Ok(Event::Eof) => break,
                 Err(e) => {
-                    warn!("Error parsing history XML: {}",  e);
+                    warn!("Error parsing history XML: {}", e);
                     break;
                 }
                 _ => {}
@@ -683,13 +817,19 @@ impl PlexSource {
         tracks
     }
 
-    async fn fetch_history_tracks(&mut self, _min_timestamp: u64) -> Result<Vec<PlexTrack>, Box<dyn std::error::Error>> {
+    async fn fetch_history_tracks(
+        &mut self,
+        _min_timestamp: u64,
+    ) -> Result<Vec<PlexTrack>, Box<dyn std::error::Error>> {
         let endpoint = format!("{}/status/sessions/history/all", self.url);
-        let resp = self.client.get(&endpoint)
+        let resp = self
+            .client
+            .get(&endpoint)
             .query(&[("sort", "viewedAt:desc"), ("limit", "50")])
             .header("X-Plex-Token", &self.token)
             .header("Accept", "application/xml")
-            .send().await?;
+            .send()
+            .await?;
 
         if !resp.status().is_success() {
             warn!("History fetch failed: HTTP {}", resp.status());
@@ -701,12 +841,19 @@ impl PlexSource {
 
         let mut tracks = Vec::new();
         let seven_days_ago = SystemTime::now()
-            .duration_since(UNIX_EPOCH).unwrap().as_secs()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
             .saturating_sub(7 * 86400);
 
-        info!("Processing {} history tracks from Plex", history_tracks.len());
+        info!(
+            "Processing {} history tracks from Plex",
+            history_tracks.len()
+        );
         for h_track in history_tracks {
-            if h_track.media_type.as_deref() != Some("track") { continue; }
+            if h_track.media_type.as_deref() != Some("track") {
+                continue;
+            }
             if let Some(ts) = h_track.viewed_at {
                 if ts < seven_days_ago {
                     debug!("Skipping old history track (viewed_at: {})", ts);
@@ -721,7 +868,9 @@ impl PlexSource {
     }
 
     fn validate_session(&self, session: &SessionMetadata) -> Option<String> {
-        let user = session.user.as_ref()
+        let user = session
+            .user
+            .as_ref()
             .and_then(|u| u.title.as_deref())
             .unwrap_or("unknown")
             .to_lowercase();
@@ -735,10 +884,16 @@ impl PlexSource {
 
         if let Some(lib) = &session.library_section_title {
             let lib_lower = lib.to_lowercase();
-            if !self.filters.libraries_allow.is_empty() && !self.filters.libraries_allow.contains(&lib_lower) {
+            if !self.filters.libraries_allow.is_empty()
+                && !self.filters.libraries_allow.contains(&lib_lower)
+            {
                 return Some(format!("Library not in allow list: {}", lib));
             }
-            if !self.libraries.iter().any(|l| l.title == *lib && l.collection_type == "artist") {
+            if !self
+                .libraries
+                .iter()
+                .any(|l| l.title == *lib && l.collection_type == "artist")
+            {
                 return Some(format!("Not a music library: {}", lib));
             }
         }
@@ -746,9 +901,13 @@ impl PlexSource {
     }
 
     pub fn cleanup_sessions(&mut self, max_age_seconds: u64) {
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
         let before_count = self.session_states.len();
-        self.session_states.retain(|_, state| now - state.last_seen < max_age_seconds);
+        self.session_states
+            .retain(|_, state| now - state.last_seen < max_age_seconds);
         let removed = before_count - self.session_states.len();
         if removed > 0 {
             debug!("Cleaned up {} stale sessions", removed);
@@ -761,8 +920,13 @@ impl PlexSource {
 
     pub async fn fetch_sessions(&mut self) -> Result<Vec<Play>, Box<dyn std::error::Error>> {
         let result = self.fetch_sessions_extended(None).await?;
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
-        Ok(result.ready_to_scrobble.into_iter()
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        Ok(result
+            .ready_to_scrobble
+            .into_iter()
             .map(|track| track.to_play(&format!("scrobble-{}", now)))
             .collect())
     }
@@ -770,9 +934,16 @@ impl PlexSource {
 
 #[async_trait]
 impl MusicSource for PlexSource {
-    fn name(&self) -> &str { "Plex" }
-    fn as_any_mut(&mut self) -> &mut dyn std::any::Any { self }
-    async fn fetch_new_plays(&mut self, _last_checked: u64) -> Result<Vec<Play>, Box<dyn std::error::Error>> {
+    fn name(&self) -> &str {
+        "Plex"
+    }
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
+    async fn fetch_new_plays(
+        &mut self,
+        _last_checked: u64,
+    ) -> Result<Vec<Play>, Box<dyn std::error::Error>> {
         self.fetch_sessions().await
     }
 }

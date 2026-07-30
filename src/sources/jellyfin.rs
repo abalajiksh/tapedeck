@@ -150,7 +150,11 @@ impl JellyfinSource {
             account,
             client: Client::builder()
                 .timeout(Duration::from_secs(10))
-                .user_agent(format!("{}/{}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION")))
+                .user_agent(format!(
+                    "{}/{}",
+                    env!("CARGO_PKG_NAME"),
+                    env!("CARGO_PKG_VERSION")
+                ))
                 .build()
                 .unwrap_or_else(|_| Client::new()),
             seen: HashMap::new(),
@@ -162,9 +166,10 @@ impl JellyfinSource {
     /// The same job `PlexSource::resolve_account` does, but answered by the
     /// server itself rather than a cloud service — so unlike Plex this works on
     /// a fully offline LAN install.
-    pub async fn resolve_account(url: &str, api_key: &str)
-        -> Result<String, Box<dyn std::error::Error + Send + Sync>>
-    {
+    pub async fn resolve_account(
+        url: &str,
+        api_key: &str,
+    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
         #[derive(Deserialize)]
         #[serde(rename_all = "PascalCase")]
         struct Me {
@@ -174,14 +179,19 @@ impl JellyfinSource {
 
         let client = Client::builder()
             .timeout(Duration::from_secs(10))
-            .user_agent(format!("{}/{}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION")))
+            .user_agent(format!(
+                "{}/{}",
+                env!("CARGO_PKG_NAME"),
+                env!("CARGO_PKG_VERSION")
+            ))
             .build()?;
 
         let resp = client
             .get(format!("{}/Users/Me", url.trim_end_matches('/')))
             .header("X-Emby-Token", api_key)
             .header("Accept", "application/json")
-            .send().await?;
+            .send()
+            .await?;
 
         if resp.status() == StatusCode::UNAUTHORIZED {
             return Err("Jellyfin rejected that API key".into());
@@ -190,16 +200,19 @@ impl JellyfinSource {
             return Err(format!("Jellyfin returned {}", resp.status()).into());
         }
         let me: Me = resp.json().await?;
-        me.name.filter(|n| !n.trim().is_empty())
+        me.name
+            .filter(|n| !n.trim().is_empty())
             .ok_or_else(|| "Jellyfin did not report a username for that key".into())
     }
 
     /// Confirm the server answers and the key is good.
     pub async fn initialize(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        let resp = self.client
+        let resp = self
+            .client
             .get(format!("{}/System/Info", self.url))
             .header("X-Emby-Token", &self.api_key)
-            .send().await?;
+            .send()
+            .await?;
         if resp.status() == StatusCode::UNAUTHORIZED {
             return Err("Jellyfin rejected that API key".into());
         }
@@ -211,13 +224,13 @@ impl JellyfinSource {
 
     /// Poll `/Sessions`, returning what's playing and what has crossed the
     /// scrobble threshold since the last poll.
-    pub async fn fetch_sessions(&mut self)
-        -> Result<JellyfinSessions, Box<dyn std::error::Error>>
-    {
-        let resp = self.client
+    pub async fn fetch_sessions(&mut self) -> Result<JellyfinSessions, Box<dyn std::error::Error>> {
+        let resp = self
+            .client
             .get(format!("{}/Sessions", self.url))
             .header("X-Emby-Token", &self.api_key)
-            .send().await?;
+            .send()
+            .await?;
         if !resp.status().is_success() {
             return Err(format!("Jellyfin /Sessions returned {}", resp.status()).into());
         }
@@ -228,19 +241,25 @@ impl JellyfinSource {
 
         for session in sessions {
             // Other people's playback on a shared server is not this user's.
-            if !session.user_name.as_deref()
+            if !session
+                .user_name
+                .as_deref()
                 .map(|u| u.eq_ignore_ascii_case(&self.account))
                 .unwrap_or(false)
             {
                 continue;
             }
-            let Some(item) = session.now_playing_item else { continue };
+            let Some(item) = session.now_playing_item else {
+                continue;
+            };
             // Jellyfin sessions cover video too.
             if !item.item_type.eq_ignore_ascii_case("Audio") {
                 continue;
             }
 
-            let position = session.play_state.as_ref()
+            let position = session
+                .play_state
+                .as_ref()
                 .and_then(|p| p.position_ticks)
                 .map(|t| t / TICKS_PER_SECOND)
                 .unwrap_or(0);
@@ -256,10 +275,19 @@ impl JellyfinSource {
 
             // A paused track is still "now playing" for the deck, but its
             // position isn't advancing, so it shouldn't cross the threshold.
-            let paused = session.play_state.as_ref().and_then(|p| p.is_paused).unwrap_or(false);
+            let paused = session
+                .play_state
+                .as_ref()
+                .and_then(|p| p.is_paused)
+                .unwrap_or(false);
 
-            let entry = self.seen.entry(session.id.clone())
-                .or_insert_with(|| SessionProgress { item_id: item.id.clone(), scrobbled: false });
+            let entry = self
+                .seen
+                .entry(session.id.clone())
+                .or_insert_with(|| SessionProgress {
+                    item_id: item.id.clone(),
+                    scrobbled: false,
+                });
 
             // A new track in the same session resets the scrobble state,
             // otherwise only the first song of a queue would ever count.
@@ -268,12 +296,14 @@ impl JellyfinSource {
                 entry.scrobbled = false;
             }
 
-            let past_threshold = !paused && match duration {
-                Some(d) if d > 0 => {
-                    position as f64 >= d as f64 * SCROBBLE_FRACTION || position >= SCROBBLE_AFTER_SECS
-                }
-                _ => position >= SCROBBLE_AFTER_SECS,
-            };
+            let past_threshold = !paused
+                && match duration {
+                    Some(d) if d > 0 => {
+                        position as f64 >= d as f64 * SCROBBLE_FRACTION
+                            || position >= SCROBBLE_AFTER_SECS
+                    }
+                    _ => position >= SCROBBLE_AFTER_SECS,
+                };
 
             if past_threshold && !entry.scrobbled {
                 entry.scrobbled = true;
@@ -289,7 +319,9 @@ impl JellyfinSource {
     }
 
     fn to_play(item: &NowPlayingItem, device: &Option<String>) -> Play {
-        let artist = item.artists.as_ref()
+        let artist = item
+            .artists
+            .as_ref()
             .and_then(|a| a.first().cloned())
             .or_else(|| item.album_artist.clone())
             .unwrap_or_else(|| "Unknown".to_string());
@@ -298,7 +330,11 @@ impl JellyfinSource {
             // The item id alone would collide across repeat plays, so the
             // session and device disambiguate; the flush-time dedup handles the
             // rest.
-            source_id: format!("jellyfin-{}-{}", item.id, device.as_deref().unwrap_or("session")),
+            source_id: format!(
+                "jellyfin-{}-{}",
+                item.id,
+                device.as_deref().unwrap_or("session")
+            ),
             source_name: "jellyfin".into(),
             title: item.name.clone(),
             artist,
@@ -308,25 +344,38 @@ impl JellyfinSource {
             track_number: item.index_number.filter(|n| *n > 0),
             // Jellyfin carries MusicBrainz ids when the library was tagged —
             // another listen that never needs a MusicBrainz lookup.
-            mbid_recording: item.provider_ids.as_ref().and_then(|p| p.musicbrainz_track.clone()),
-            mbid_release: item.provider_ids.as_ref().and_then(|p| p.musicbrainz_album.clone()),
+            mbid_recording: item
+                .provider_ids
+                .as_ref()
+                .and_then(|p| p.musicbrainz_track.clone()),
+            mbid_release: item
+                .provider_ids
+                .as_ref()
+                .and_then(|p| p.musicbrainz_album.clone()),
             mbid_artist: None,
             artists: item.artists.clone(),
             mbid_release_group: None,
-            caa_id: None, caa_release_mbid: None,
+            caa_id: None,
+            caa_release_mbid: None,
         }
     }
 
     fn extract_quality(item: &NowPlayingItem) -> Option<AudioQuality> {
         let streams = item.media_streams.as_ref()?;
         let audio = streams.iter().find(|s| {
-            let t = s.stream_type.as_deref().or(s.type_.as_deref()).unwrap_or("");
+            let t = s
+                .stream_type
+                .as_deref()
+                .or(s.type_.as_deref())
+                .unwrap_or("");
             t.eq_ignore_ascii_case("Audio")
         })?;
 
         let codec_lower = audio.codec.as_deref().unwrap_or("").to_lowercase();
-        let is_lossless = matches!(codec_lower.as_str(),
-            "flac" | "alac" | "wav" | "aiff" | "ape" | "wavpack" | "pcm" | "dsd");
+        let is_lossless = matches!(
+            codec_lower.as_str(),
+            "flac" | "alac" | "wav" | "aiff" | "ape" | "wavpack" | "pcm" | "dsd"
+        );
 
         let mut q = AudioQuality {
             format_type: Some(if codec_lower == "dsd" { "dsd" } else { "pcm" }.to_string()),
@@ -343,18 +392,23 @@ impl JellyfinSource {
     }
 
     /// Cover art bytes, proxied for the same reason as Plex's and Navidrome's.
-    pub async fn fetch_cover_art(&self, item_id: &str)
-        -> Result<(Vec<u8>, String), Box<dyn std::error::Error + Send + Sync>>
-    {
-        let resp = self.client
+    pub async fn fetch_cover_art(
+        &self,
+        item_id: &str,
+    ) -> Result<(Vec<u8>, String), Box<dyn std::error::Error + Send + Sync>> {
+        let resp = self
+            .client
             .get(format!("{}/Items/{}/Images/Primary", self.url, item_id))
             .header("X-Emby-Token", &self.api_key)
             .query(&[("maxWidth", "500")])
-            .send().await?;
+            .send()
+            .await?;
         if !resp.status().is_success() {
             return Err(format!("Jellyfin artwork returned {}", resp.status()).into());
         }
-        let content_type = resp.headers().get(reqwest::header::CONTENT_TYPE)
+        let content_type = resp
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
             .and_then(|v| v.to_str().ok())
             .unwrap_or("image/jpeg")
             .to_string();
@@ -367,7 +421,9 @@ impl JellyfinSource {
 
 fn now_secs() -> u64 {
     std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH).unwrap().as_secs()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
 }
 
 #[async_trait]
@@ -382,7 +438,10 @@ impl MusicSource for JellyfinSource {
 
     /// Jellyfin has no history to page through — everything comes from the live
     /// session poll, so this returns nothing rather than pretending otherwise.
-    async fn fetch_new_plays(&mut self, _last_checked: u64) -> Result<Vec<Play>, Box<dyn std::error::Error>> {
+    async fn fetch_new_plays(
+        &mut self,
+        _last_checked: u64,
+    ) -> Result<Vec<Play>, Box<dyn std::error::Error>> {
         Ok(Vec::new())
     }
 }

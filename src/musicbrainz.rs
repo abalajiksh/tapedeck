@@ -1,10 +1,10 @@
 // musicbrainz.rs - MusicBrainz metadata with 3-tier caching
 use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
-use sqlx::{Pool, Sqlite, Postgres};
+use sqlx::{Pool, Postgres, Sqlite};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::{Semaphore, RwLock};
+use tokio::sync::{RwLock, Semaphore};
 
 /// How long (seconds) to cache a "not found" result before retrying the API.
 const NEGATIVE_CACHE_TTL_SECS: i64 = 7 * 24 * 3600; // 7 days
@@ -116,11 +116,22 @@ impl MusicBrainzClient {
         album_name: Option<&str>,
     ) -> Result<MusicBrainzMetadata> {
         // Tier 1: Check SQLite cache (includes negative cache entries)
-        if let Some(cached) = self.get_from_sqlite(track_title, artist_name, album_name).await? {
+        if let Some(cached) = self
+            .get_from_sqlite(track_title, artist_name, album_name)
+            .await?
+        {
             if cached.track_mbid.is_none() {
                 // Negative cache hit — return the error without hitting the API
-                tracing::debug!("Skipping API call (negative cache): {} - {}", artist_name, track_title);
-                return Err(anyhow!("No results found for {} - {} (cached)", artist_name, track_title));
+                tracing::debug!(
+                    "Skipping API call (negative cache): {} - {}",
+                    artist_name,
+                    track_title
+                );
+                return Err(anyhow!(
+                    "No results found for {} - {} (cached)",
+                    artist_name,
+                    track_title
+                ));
             }
             tracing::debug!("Cache hit (SQLite) for: {} - {}", artist_name, track_title);
             return Ok(cached);
@@ -128,8 +139,15 @@ impl MusicBrainzClient {
 
         // Tier 2: Check PostgreSQL dump (if enabled)
         if self.postgres_pool.is_some() {
-            if let Some(pg_data) = self.get_from_postgres(track_title, artist_name, album_name).await? {
-                tracing::debug!("Cache hit (PostgreSQL) for: {} - {}", artist_name, track_title);
+            if let Some(pg_data) = self
+                .get_from_postgres(track_title, artist_name, album_name)
+                .await?
+            {
+                tracing::debug!(
+                    "Cache hit (PostgreSQL) for: {} - {}",
+                    artist_name,
+                    track_title
+                );
                 // Store in SQLite for faster future access
                 self.store_in_sqlite(&pg_data).await?;
                 return Ok(pg_data);
@@ -137,8 +155,14 @@ impl MusicBrainzClient {
         }
 
         // Tier 3: Fetch from MusicBrainz API with rate limiting
-        tracing::debug!("Fetching from MusicBrainz API: {} - {}", artist_name, track_title);
-        let api_data = self.fetch_from_api(track_title, artist_name, album_name).await?;
+        tracing::debug!(
+            "Fetching from MusicBrainz API: {} - {}",
+            artist_name,
+            track_title
+        );
+        let api_data = self
+            .fetch_from_api(track_title, artist_name, album_name)
+            .await?;
 
         // Cache the result
         self.store_in_sqlite(&api_data).await?;
@@ -154,7 +178,9 @@ impl MusicBrainzClient {
         let mut results = Vec::new();
 
         for (track_title, artist_name, album_name) in tracks {
-            let result = self.fetch_metadata(track_title, artist_name, album_name).await;
+            let result = self
+                .fetch_metadata(track_title, artist_name, album_name)
+                .await;
             results.push(result);
         }
 
@@ -178,11 +204,11 @@ impl MusicBrainzClient {
                   AND LOWER(album_name) = LOWER($3)
                 ORDER BY fetched_at DESC
                 LIMIT 1
-                "#
+                "#,
             )
-                .bind(track_title)
-                .bind(artist_name)
-                .bind(album)
+            .bind(track_title)
+            .bind(artist_name)
+            .bind(album)
         } else {
             sqlx::query_as::<_, MusicBrainzMetadataRow>(
                 r#"
@@ -192,10 +218,10 @@ impl MusicBrainzClient {
                   AND album_name IS NULL
                 ORDER BY fetched_at DESC
                 LIMIT 1
-                "#
+                "#,
             )
-                .bind(track_title)
-                .bind(artist_name)
+            .bind(track_title)
+            .bind(artist_name)
         };
 
         match query.fetch_optional(&self.sqlite_pool).await? {
@@ -206,7 +232,11 @@ impl MusicBrainzClient {
                     let now = chrono::Utc::now().timestamp();
                     if now - metadata.fetched_at > NEGATIVE_CACHE_TTL_SECS {
                         // Stale negative entry — allow a retry
-                        tracing::debug!("Negative cache expired for: {} - {}", artist_name, track_title);
+                        tracing::debug!(
+                            "Negative cache expired for: {} - {}",
+                            artist_name,
+                            track_title
+                        );
                         return Ok(None);
                     }
                     // Fresh negative entry — return it to skip the API call
@@ -239,21 +269,21 @@ impl MusicBrainzClient {
                 caa_id = EXCLUDED.caa_id,
                 caa_release_mbid = EXCLUDED.caa_release_mbid,
                 fetched_at = EXCLUDED.fetched_at
-            "#
+            "#,
         )
-            .bind(&metadata.track_mbid)
-            .bind(&metadata.artist_mbid)
-            .bind(&metadata.album_mbid)
-            .bind(&metadata.track_title)
-            .bind(&metadata.artist_name)
-            .bind(&metadata.album_name)
-            .bind(&metadata.release_date)
-            .bind(genres_json)
-            .bind(metadata.caa_id)
-            .bind(&metadata.caa_release_mbid)
-            .bind(metadata.fetched_at)
-            .execute(&self.sqlite_pool)
-            .await?;
+        .bind(&metadata.track_mbid)
+        .bind(&metadata.artist_mbid)
+        .bind(&metadata.album_mbid)
+        .bind(&metadata.track_title)
+        .bind(&metadata.artist_name)
+        .bind(&metadata.album_name)
+        .bind(&metadata.release_date)
+        .bind(genres_json)
+        .bind(metadata.caa_id)
+        .bind(&metadata.caa_release_mbid)
+        .bind(metadata.fetched_at)
+        .execute(&self.sqlite_pool)
+        .await?;
 
         Ok(())
     }
@@ -292,12 +322,12 @@ impl MusicBrainzClient {
             WHERE LOWER(r.name) = LOWER($1)
               AND LOWER(ar.name) = LOWER($2)
             LIMIT 1
-            "#
+            "#,
         )
-            .bind(track_title)
-            .bind(artist_name)
-            .fetch_optional(pool)
-            .await?;
+        .bind(track_title)
+        .bind(artist_name)
+        .fetch_optional(pool)
+        .await?;
 
         match result {
             Some(row) => Ok(Some(MusicBrainzMetadata {
@@ -329,7 +359,10 @@ impl MusicBrainzClient {
         self.rate_limiter.acquire().await;
 
         // Build search query
-        let query = format!(r#"recording:"{}" AND artist:"{}""#, track_title, artist_name);
+        let query = format!(
+            r#"recording:"{}" AND artist:"{}""#,
+            track_title, artist_name
+        );
 
         let url = format!(
             "{}/recording?query={}&fmt=json&limit=1&inc=releases+artist-credits",
@@ -337,7 +370,8 @@ impl MusicBrainzClient {
             urlencoding::encode(&query)
         );
 
-        let response = self.http_client
+        let response = self
+            .http_client
             .get(&url)
             .header("User-Agent", &self.config.user_agent)
             .send()
@@ -351,27 +385,32 @@ impl MusicBrainzClient {
 
         if let Some(recording) = api_response.recordings.first() {
             let album_mbid = recording.releases.first().map(|r| r.id.clone());
-            
+
             // Fetch cover art info if we have a release MBID
             let (caa_id, caa_release_mbid) = if let Some(ref release_mbid) = album_mbid {
-                self.fetch_cover_art_info(release_mbid).await.unwrap_or((None, None))
+                self.fetch_cover_art_info(release_mbid)
+                    .await
+                    .unwrap_or((None, None))
             } else {
                 (None, None)
             };
 
             Ok(MusicBrainzMetadata {
                 track_mbid: Some(recording.id.clone()),
-                artist_mbid: recording.artist_credit.first()
+                artist_mbid: recording
+                    .artist_credit
+                    .first()
                     .and_then(|ac| ac.artist.as_ref())
                     .map(|a| a.id.clone()),
                 album_mbid,
                 track_title: recording.title.clone(),
-                artist_name: recording.artist_credit.first()
+                artist_name: recording
+                    .artist_credit
+                    .first()
                     .map(|ac| ac.name.clone())
                     .unwrap_or_else(|| artist_name.to_string()),
                 album_name: recording.releases.first().map(|r| r.title.clone()),
-                release_date: recording.releases.first()
-                    .and_then(|r| r.date.clone()),
+                release_date: recording.releases.first().and_then(|r| r.date.clone()),
                 genres: recording.tags.iter().map(|t| t.name.clone()).collect(),
                 caa_id,
                 caa_release_mbid,
@@ -396,21 +435,26 @@ impl MusicBrainzClient {
             if let Err(e) = self.store_in_sqlite(&negative).await {
                 tracing::warn!("Failed to store negative cache entry: {}", e);
             }
-            Err(anyhow!("No results found for {} - {}", artist_name, track_title))
+            Err(anyhow!(
+                "No results found for {} - {}",
+                artist_name,
+                track_title
+            ))
         }
     }
 
     /// Fetch Cover Art Archive info for a release
-    async fn fetch_cover_art_info(&self, release_mbid: &str) -> Result<(Option<i64>, Option<String>)> {
+    async fn fetch_cover_art_info(
+        &self,
+        release_mbid: &str,
+    ) -> Result<(Option<i64>, Option<String>)> {
         // Rate limiting
         self.rate_limiter.acquire().await;
 
-        let url = format!(
-            "https://coverartarchive.org/release/{}",
-            release_mbid
-        );
+        let url = format!("https://coverartarchive.org/release/{}", release_mbid);
 
-        let response = self.http_client
+        let response = self
+            .http_client
             .get(&url)
             .header("User-Agent", &self.config.user_agent)
             .send()
@@ -422,7 +466,9 @@ impl MusicBrainzClient {
 
         let caa_response: CAAResponse = response.json().await?;
 
-        let front_image = caa_response.images.iter()
+        let front_image = caa_response
+            .images
+            .iter()
             .find(|img| img.front)
             .or_else(|| caa_response.images.first());
 
@@ -476,10 +522,10 @@ impl MusicBrainzClient {
                 language TEXT,          -- NULL/'' = looked up, none found
                 fetched_at INTEGER NOT NULL
             );
-            "#
+            "#,
         )
-            .execute(&self.sqlite_pool)
-            .await?;
+        .execute(&self.sqlite_pool)
+        .await?;
 
         Ok(())
     }
@@ -489,9 +535,12 @@ impl MusicBrainzClient {
     /// by recording MBID. Returns `Ok(None)` when no work-language is available;
     /// the negative result is cached too so we don't re-query.
     pub async fn fetch_recording_language(&self, recording_mbid: &str) -> Result<Option<String>> {
-        let cached: Option<(Option<String>,)> = sqlx::query_as(
-            "SELECT language FROM mb_language_cache WHERE recording_mbid = ?"
-        ).bind(recording_mbid).fetch_optional(&self.sqlite_pool).await.unwrap_or(None);
+        let cached: Option<(Option<String>,)> =
+            sqlx::query_as("SELECT language FROM mb_language_cache WHERE recording_mbid = ?")
+                .bind(recording_mbid)
+                .fetch_optional(&self.sqlite_pool)
+                .await
+                .unwrap_or(None);
         if let Some((lang,)) = cached {
             return Ok(lang.filter(|s| !s.is_empty()));
         }
@@ -510,8 +559,12 @@ impl MusicBrainzClient {
                 JOIN language lang ON lang.id = wl.language
                 WHERE r.gid = $1::uuid
                 LIMIT 1
-                "#
-            ).bind(recording_mbid).fetch_optional(pool).await.unwrap_or(None);
+                "#,
+            )
+            .bind(recording_mbid)
+            .fetch_optional(pool)
+            .await
+            .unwrap_or(None);
             if let Some((name,)) = row {
                 resolved = Some(name); // Postgres `language.name` is already a display name
             }
@@ -520,15 +573,30 @@ impl MusicBrainzClient {
         // Tier 2: API — recording?inc=work-rels → work.languages[0] (ISO 639-3).
         if resolved.is_none() {
             self.rate_limiter.acquire().await;
-            let url = format!("{}/recording/{}?inc=work-rels&fmt=json", self.config.api_base_url, recording_mbid);
-            if let Ok(resp) = self.http_client.get(&url).header("User-Agent", &self.config.user_agent).send().await {
+            let url = format!(
+                "{}/recording/{}?inc=work-rels&fmt=json",
+                self.config.api_base_url, recording_mbid
+            );
+            if let Ok(resp) = self
+                .http_client
+                .get(&url)
+                .header("User-Agent", &self.config.user_agent)
+                .send()
+                .await
+            {
                 if resp.status().is_success() {
                     if let Ok(v) = resp.json::<serde_json::Value>().await {
-                        resolved = v["relations"].as_array().into_iter().flatten()
+                        resolved = v["relations"]
+                            .as_array()
+                            .into_iter()
+                            .flatten()
                             .filter(|rel| rel["target-type"] == "work")
                             .find_map(|rel| {
                                 let w = &rel["work"];
-                                w["languages"].as_array().and_then(|ls| ls.first()).and_then(|l| l.as_str())
+                                w["languages"]
+                                    .as_array()
+                                    .and_then(|ls| ls.first())
+                                    .and_then(|l| l.as_str())
                                     .or_else(|| w["language"].as_str())
                                     .map(crate::language::iso_to_display)
                             });

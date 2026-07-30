@@ -10,9 +10,9 @@ use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::models::{AudioQuality, Play};
 use super::auth::AuthUser;
 use super::AppState;
+use crate::models::{AudioQuality, Play};
 
 /// Nothing here is persisted: "now playing" is live state, so a restart
 /// correctly shows an empty deck until a source reports again.
@@ -41,7 +41,12 @@ pub struct NowPlaying {
 }
 
 impl NowPlaying {
-    pub fn from_play(play: &Play, source: &str, quality: Option<&AudioQuality>, progress: u64) -> Self {
+    pub fn from_play(
+        play: &Play,
+        source: &str,
+        quality: Option<&AudioQuality>,
+        progress: u64,
+    ) -> Self {
         Self {
             title: play.title.clone(),
             artist: play.artist.clone(),
@@ -80,7 +85,10 @@ impl NowPlaying {
 }
 
 fn now_secs() -> i64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64
 }
 
 /// In-memory "what's playing right now", keyed by user. Shared by the HTTP
@@ -141,17 +149,22 @@ impl NowPlayingRegistry {
 }
 
 /// GET /api/v1/now-playing → `{ playing, track?, position? }`
-async fn now_playing(
-    State(state): State<Arc<AppState>>,
-    user: AuthUser,
-) -> impl IntoResponse {
+async fn now_playing(State(state): State<Arc<AppState>>, user: AuthUser) -> impl IntoResponse {
     match state.now_playing.get(user.user_id) {
-        Some((track, position)) => (StatusCode::OK, Json(serde_json::json!({
-            "playing": true,
-            "position": position,
-            "track": track,
-        }))).into_response(),
-        None => (StatusCode::OK, Json(serde_json::json!({ "playing": false }))).into_response(),
+        Some((track, position)) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "playing": true,
+                "position": position,
+                "track": track,
+            })),
+        )
+            .into_response(),
+        None => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "playing": false })),
+        )
+            .into_response(),
     }
 }
 

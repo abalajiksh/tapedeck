@@ -8,10 +8,10 @@ use axum::{
 use serde::Deserialize;
 use std::sync::Arc;
 
-use crate::models::*;
 use super::auth::AuthUser;
 use super::models::ErrorResponse;
 use super::AppState;
+use crate::models::*;
 
 // ── Signal Chain endpoints ──
 
@@ -42,25 +42,51 @@ async fn create_chain(
     };
 
     match state.db.create_chain(&chain).await {
-        Ok(id) => (StatusCode::CREATED, Json(serde_json::json!({ "id": id, "status": "created" }))).into_response(),
+        Ok(id) => (
+            StatusCode::CREATED,
+            Json(serde_json::json!({ "id": id, "status": "created" })),
+        )
+            .into_response(),
         Err(e) => {
             let msg = e.to_string();
             if msg.contains("UNIQUE") {
-                (StatusCode::CONFLICT, Json(serde_json::json!(ErrorResponse { code: 409, error: format!("Chain '{}' already exists", chain.name) }))).into_response()
+                (
+                    StatusCode::CONFLICT,
+                    Json(serde_json::json!(ErrorResponse {
+                        code: 409,
+                        error: format!("Chain '{}' already exists", chain.name)
+                    })),
+                )
+                    .into_response()
             } else {
-                (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!(ErrorResponse { code: 500, error: msg }))).into_response()
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!(ErrorResponse {
+                        code: 500,
+                        error: msg
+                    })),
+                )
+                    .into_response()
             }
         }
     }
 }
 
-async fn list_chains(
-    State(state): State<Arc<AppState>>,
-    user: AuthUser,
-) -> impl IntoResponse {
+async fn list_chains(State(state): State<Arc<AppState>>, user: AuthUser) -> impl IntoResponse {
     match state.db.get_chains(user.user_id).await {
-        Ok(chains) => (StatusCode::OK, Json(serde_json::json!({ "chains": chains }))).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!(ErrorResponse { code: 500, error: e.to_string() }))).into_response(),
+        Ok(chains) => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "chains": chains })),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!(ErrorResponse {
+                code: 500,
+                error: e.to_string()
+            })),
+        )
+            .into_response(),
     }
 }
 
@@ -71,8 +97,22 @@ async fn get_chain(
 ) -> impl IntoResponse {
     match state.db.get_chain(user.user_id, id).await {
         Ok(Some(chain)) => (StatusCode::OK, Json(serde_json::json!(chain))).into_response(),
-        Ok(None) => (StatusCode::NOT_FOUND, Json(serde_json::json!(ErrorResponse { code: 404, error: "Chain not found".into() }))).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!(ErrorResponse { code: 500, error: e.to_string() }))).into_response(),
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!(ErrorResponse {
+                code: 404,
+                error: "Chain not found".into()
+            })),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!(ErrorResponse {
+                code: 500,
+                error: e.to_string()
+            })),
+        )
+            .into_response(),
     }
 }
 
@@ -83,10 +123,39 @@ async fn update_chain(
     Json(body): Json<CreateChainRequest>,
 ) -> impl IntoResponse {
     let ctx: &str = body.listening_context.as_str();
-    match state.db.update_chain(user.user_id, id, &body.name, body.description.as_deref(), &body.components, ctx).await {
-        Ok(true) => (StatusCode::OK, Json(serde_json::json!({ "id": id, "status": "updated" }))).into_response(),
-        Ok(false) => (StatusCode::NOT_FOUND, Json(serde_json::json!(ErrorResponse { code: 404, error: "Chain not found".into() }))).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!(ErrorResponse { code: 500, error: e.to_string() }))).into_response(),
+    match state
+        .db
+        .update_chain(
+            user.user_id,
+            id,
+            &body.name,
+            body.description.as_deref(),
+            &body.components,
+            ctx,
+        )
+        .await
+    {
+        Ok(true) => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "id": id, "status": "updated" })),
+        )
+            .into_response(),
+        Ok(false) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!(ErrorResponse {
+                code: 404,
+                error: "Chain not found".into()
+            })),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!(ErrorResponse {
+                code: 500,
+                error: e.to_string()
+            })),
+        )
+            .into_response(),
     }
 }
 
@@ -97,20 +166,42 @@ async fn delete_chain(
 ) -> impl IntoResponse {
     match state.db.delete_chain(user.user_id, id).await {
         Ok(true) => StatusCode::NO_CONTENT.into_response(),
-        Ok(false) => (StatusCode::NOT_FOUND, Json(serde_json::json!(ErrorResponse { code: 404, error: "Chain not found".into() }))).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!(ErrorResponse { code: 500, error: e.to_string() }))).into_response(),
+        Ok(false) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!(ErrorResponse {
+                code: 404,
+                error: "Chain not found".into()
+            })),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!(ErrorResponse {
+                code: 500,
+                error: e.to_string()
+            })),
+        )
+            .into_response(),
     }
 }
 
 // ── Device endpoints ──
 
-async fn list_devices(
-    State(state): State<Arc<AppState>>,
-    user: AuthUser,
-) -> impl IntoResponse {
+async fn list_devices(State(state): State<Arc<AppState>>, user: AuthUser) -> impl IntoResponse {
     match state.db.get_devices(user.user_id).await {
-        Ok(devices) => (StatusCode::OK, Json(serde_json::json!({ "devices": devices }))).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!(ErrorResponse { code: 500, error: e.to_string() }))).into_response(),
+        Ok(devices) => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "devices": devices })),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!(ErrorResponse {
+                code: 500,
+                error: e.to_string()
+            })),
+        )
+            .into_response(),
     }
 }
 
@@ -131,22 +222,49 @@ async fn create_equipment(
     user: AuthUser,
     Json(body): Json<CreateEquipmentRequest>,
 ) -> impl IntoResponse {
-    match state.db.upsert_equipment(
-        user.user_id, &body.name, &body.equipment_type,
-        body.brand.as_deref(), body.model.as_deref(), 0.0,
-    ).await {
-        Ok(id) => (StatusCode::CREATED, Json(serde_json::json!({ "id": id, "status": "created" }))).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!(ErrorResponse { code: 500, error: e.to_string() }))).into_response(),
+    match state
+        .db
+        .upsert_equipment(
+            user.user_id,
+            &body.name,
+            &body.equipment_type,
+            body.brand.as_deref(),
+            body.model.as_deref(),
+            0.0,
+        )
+        .await
+    {
+        Ok(id) => (
+            StatusCode::CREATED,
+            Json(serde_json::json!({ "id": id, "status": "created" })),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!(ErrorResponse {
+                code: 500,
+                error: e.to_string()
+            })),
+        )
+            .into_response(),
     }
 }
 
-async fn list_equipment(
-    State(state): State<Arc<AppState>>,
-    user: AuthUser,
-) -> impl IntoResponse {
+async fn list_equipment(State(state): State<Arc<AppState>>, user: AuthUser) -> impl IntoResponse {
     match state.db.get_equipment(user.user_id).await {
-        Ok(gear) => (StatusCode::OK, Json(serde_json::json!({ "equipment": gear }))).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!(ErrorResponse { code: 500, error: e.to_string() }))).into_response(),
+        Ok(gear) => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "equipment": gear })),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!(ErrorResponse {
+                code: 500,
+                error: e.to_string()
+            })),
+        )
+            .into_response(),
     }
 }
 
@@ -156,11 +274,40 @@ async fn update_equipment(
     Path(id): Path<i64>,
     Json(body): Json<CreateEquipmentRequest>,
 ) -> impl IntoResponse {
-    match state.db.update_equipment(user.user_id, id, &body.name, &body.equipment_type,
-        body.brand.as_deref(), body.model.as_deref(), body.notes.as_deref()).await {
-        Ok(true) => (StatusCode::OK, Json(serde_json::json!({ "id": id, "status": "updated" }))).into_response(),
-        Ok(false) => (StatusCode::NOT_FOUND, Json(serde_json::json!(ErrorResponse { code: 404, error: "Equipment not found".into() }))).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!(ErrorResponse { code: 500, error: e.to_string() }))).into_response(),
+    match state
+        .db
+        .update_equipment(
+            user.user_id,
+            id,
+            &body.name,
+            &body.equipment_type,
+            body.brand.as_deref(),
+            body.model.as_deref(),
+            body.notes.as_deref(),
+        )
+        .await
+    {
+        Ok(true) => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "id": id, "status": "updated" })),
+        )
+            .into_response(),
+        Ok(false) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!(ErrorResponse {
+                code: 404,
+                error: "Equipment not found".into()
+            })),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!(ErrorResponse {
+                code: 500,
+                error: e.to_string()
+            })),
+        )
+            .into_response(),
     }
 }
 
@@ -171,20 +318,42 @@ async fn delete_equipment(
 ) -> impl IntoResponse {
     match state.db.delete_equipment(user.user_id, id).await {
         Ok(true) => StatusCode::NO_CONTENT.into_response(),
-        Ok(false) => (StatusCode::NOT_FOUND, Json(serde_json::json!(ErrorResponse { code: 404, error: "Equipment not found".into() }))).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!(ErrorResponse { code: 500, error: e.to_string() }))).into_response(),
+        Ok(false) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!(ErrorResponse {
+                code: 404,
+                error: "Equipment not found".into()
+            })),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!(ErrorResponse {
+                code: 500,
+                error: e.to_string()
+            })),
+        )
+            .into_response(),
     }
 }
 
 // ── Output-device → chain bindings (Phase B) ──
 
-async fn list_bindings(
-    State(state): State<Arc<AppState>>,
-    user: AuthUser,
-) -> impl IntoResponse {
+async fn list_bindings(State(state): State<Arc<AppState>>, user: AuthUser) -> impl IntoResponse {
     match state.db.list_bindings(user.user_id).await {
-        Ok(bindings) => (StatusCode::OK, Json(serde_json::json!({ "bindings": bindings }))).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!(ErrorResponse { code: 500, error: e.to_string() }))).into_response(),
+        Ok(bindings) => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "bindings": bindings })),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!(ErrorResponse {
+                code: 500,
+                error: e.to_string()
+            })),
+        )
+            .into_response(),
     }
 }
 
@@ -199,9 +368,20 @@ async fn set_binding(
     user: AuthUser,
     Json(body): Json<SetBindingRequest>,
 ) -> impl IntoResponse {
-    match state.db.set_binding(user.user_id, &body.identifier, body.chain_id).await {
+    match state
+        .db
+        .set_binding(user.user_id, &body.identifier, body.chain_id)
+        .await
+    {
         Ok(()) => (StatusCode::OK, Json(serde_json::json!({ "status": "ok" }))).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!(ErrorResponse { code: 500, error: e.to_string() }))).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!(ErrorResponse {
+                code: 500,
+                error: e.to_string()
+            })),
+        )
+            .into_response(),
     }
 }
 
@@ -212,8 +392,22 @@ async fn delete_binding(
 ) -> impl IntoResponse {
     match state.db.delete_binding(user.user_id, id).await {
         Ok(true) => StatusCode::NO_CONTENT.into_response(),
-        Ok(false) => (StatusCode::NOT_FOUND, Json(serde_json::json!(ErrorResponse { code: 404, error: "Binding not found".into() }))).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!(ErrorResponse { code: 500, error: e.to_string() }))).into_response(),
+        Ok(false) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!(ErrorResponse {
+                code: 404,
+                error: "Binding not found".into()
+            })),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!(ErrorResponse {
+                code: 500,
+                error: e.to_string()
+            })),
+        )
+            .into_response(),
     }
 }
 
@@ -223,10 +417,22 @@ pub fn create_gear_router() -> Router<Arc<AppState>> {
     use axum::routing::patch;
     Router::new()
         .route("/api/v1/chains", post(create_chain).get(list_chains))
-        .route("/api/v1/chains/:id", get(get_chain).patch(update_chain).delete(delete_chain))
+        .route(
+            "/api/v1/chains/:id",
+            get(get_chain).patch(update_chain).delete(delete_chain),
+        )
         .route("/api/v1/devices", get(list_devices))
-        .route("/api/v1/equipment", post(create_equipment).get(list_equipment))
-        .route("/api/v1/equipment/:id", patch(update_equipment).delete(delete_equipment))
+        .route(
+            "/api/v1/equipment",
+            post(create_equipment).get(list_equipment),
+        )
+        .route(
+            "/api/v1/equipment/:id",
+            patch(update_equipment).delete(delete_equipment),
+        )
         .route("/api/v1/bindings", get(list_bindings).put(set_binding))
-        .route("/api/v1/bindings/:id", axum::routing::delete(delete_binding))
+        .route(
+            "/api/v1/bindings/:id",
+            axum::routing::delete(delete_binding),
+        )
 }

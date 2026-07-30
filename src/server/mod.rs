@@ -18,7 +18,11 @@ mod users;
 
 use std::sync::Arc;
 
-use axum::{extract::DefaultBodyLimit, routing::{get, post}, Router};
+use axum::{
+    extract::DefaultBodyLimit,
+    routing::{get, post},
+    Router,
+};
 
 use crate::db::Database;
 use crate::logging::LogLevelHandle;

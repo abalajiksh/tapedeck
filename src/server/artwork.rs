@@ -26,15 +26,20 @@ use axum::{
 };
 use std::sync::Arc;
 
-use crate::sources::{JellyfinSource, NavidromeSource, PlexFilters, PlexSource};
 use super::auth::AuthUser;
 use super::models::ErrorResponse;
 use super::AppState;
+use crate::sources::{JellyfinSource, NavidromeSource, PlexFilters, PlexSource};
 
 fn not_found(msg: &str) -> Response {
-    (StatusCode::NOT_FOUND, Json(serde_json::json!(
-        ErrorResponse { code: 404, error: msg.into() }
-    ))).into_response()
+    (
+        StatusCode::NOT_FOUND,
+        Json(serde_json::json!(ErrorResponse {
+            code: 404,
+            error: msg.into()
+        })),
+    )
+        .into_response()
 }
 
 /// Recover the remote item id from a listen's `source_id`.
@@ -73,7 +78,9 @@ async fn scrobble_art(
     // the listen records exactly which one it came from, so there's nothing to
     // guess. Listens predating the column have none and can't be resolved.
     let Some(source_ref) = scrobble.source_ref else {
-        return not_found("This listen predates per-source artwork; re-fetch artwork to resolve it");
+        return not_found(
+            "This listen predates per-source artwork; re-fetch artwork to resolve it",
+        );
     };
     let Ok(Some(source)) = state.db.get_source(user.user_id, source_ref).await else {
         return not_found("That source is no longer connected");
@@ -82,23 +89,28 @@ async fn scrobble_art(
     let fetched = match source.kind.as_str() {
         "navidrome" => {
             let (Some(u), Some(p)) = (source.credential("username"), source.credential("password"))
-                else { return not_found("Navidrome credentials are missing") };
+            else {
+                return not_found("Navidrome credentials are missing");
+            };
             NavidromeSource::new(source.url.clone(), u, p)
-                .fetch_cover_art(&item_id).await
+                .fetch_cover_art(&item_id)
+                .await
         }
         "jellyfin" => {
             let Some(key) = source.credential("api_key") else {
-                return not_found("Jellyfin API key is missing")
+                return not_found("Jellyfin API key is missing");
             };
             JellyfinSource::new(source.url.clone(), key, String::new())
-                .fetch_cover_art(&item_id).await
+                .fetch_cover_art(&item_id)
+                .await
         }
         _ => {
             let Some(token) = source.credential("token") else {
-                return not_found("Plex token is missing")
+                return not_found("Plex token is missing");
             };
             PlexSource::with_filters(source.url.clone(), token, PlexFilters::default())
-                .fetch_cover_art(&item_id).await
+                .fetch_cover_art(&item_id)
+                .await
         }
     };
 
@@ -112,7 +124,8 @@ async fn scrobble_art(
                 (header::CACHE_CONTROL, "private, max-age=604800".to_string()),
             ],
             Body::from(bytes),
-        ).into_response(),
+        )
+            .into_response(),
         // A 404 lets the UI fall back to the lettered tile, which is the right
         // outcome when a server is off or the item was deleted.
         Err(e) => not_found(&format!("Could not fetch artwork: {e}")),
@@ -129,10 +142,22 @@ mod tests {
 
     #[test]
     fn extracts_navidrome_and_plex_ids() {
-        assert_eq!(remote_item_id("navidrome", "navidrome-abc123-1700000000").as_deref(), Some("abc123"));
-        assert_eq!(remote_item_id("navidrome", "navidrome-abc123-np").as_deref(), Some("abc123"));
-        assert_eq!(remote_item_id("Plex", "plex-55821-np").as_deref(), Some("55821"));
-        assert_eq!(remote_item_id("Plex", "plex-55821-scrobble-1700000000").as_deref(), Some("55821-scrobble"));
+        assert_eq!(
+            remote_item_id("navidrome", "navidrome-abc123-1700000000").as_deref(),
+            Some("abc123")
+        );
+        assert_eq!(
+            remote_item_id("navidrome", "navidrome-abc123-np").as_deref(),
+            Some("abc123")
+        );
+        assert_eq!(
+            remote_item_id("Plex", "plex-55821-np").as_deref(),
+            Some("55821")
+        );
+        assert_eq!(
+            remote_item_id("Plex", "plex-55821-scrobble-1700000000").as_deref(),
+            Some("55821-scrobble")
+        );
     }
 
     #[test]
@@ -149,7 +174,10 @@ mod tests {
     #[test]
     fn ignores_sources_with_no_library_behind_them() {
         // An ingested or imported listen has no media server to ask.
-        assert_eq!(remote_item_id("ingest:pano", "ingest-1-1700000000-Title"), None);
+        assert_eq!(
+            remote_item_id("ingest:pano", "ingest-1-1700000000-Title"),
+            None
+        );
         assert_eq!(remote_item_id("rockbox", "rockbox-abc"), None);
         assert_eq!(remote_item_id("import", "import-x-1"), None);
     }

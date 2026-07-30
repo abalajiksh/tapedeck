@@ -19,16 +19,8 @@ pub async fn enrich_play(
         .await
     {
         Ok(metadata) => {
-            let track_mbid_str = metadata
-                .track_mbid
-                .as_deref()
-                .unwrap_or("none")
-                .to_string();
-            let album_mbid_str = metadata
-                .album_mbid
-                .as_deref()
-                .unwrap_or("none")
-                .to_string();
+            let track_mbid_str = metadata.track_mbid.as_deref().unwrap_or("none").to_string();
+            let album_mbid_str = metadata.album_mbid.as_deref().unwrap_or("none").to_string();
             let artist_mbid_str = metadata
                 .artist_mbid
                 .as_deref()

@@ -161,7 +161,11 @@ impl NavidromeSource {
             password,
             client: Client::builder()
                 .timeout(Duration::from_secs(15))
-                .user_agent(format!("{}/{}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION")))
+                .user_agent(format!(
+                    "{}/{}",
+                    env!("CARGO_PKG_NAME"),
+                    env!("CARGO_PKG_VERSION")
+                ))
                 .build()
                 .unwrap_or_else(|_| Client::new()),
             nd_token: None,
@@ -195,10 +199,12 @@ impl NavidromeSource {
     // ── Native API ──
 
     async fn login(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        let resp = self.client
+        let resp = self
+            .client
             .post(format!("{}/auth/login", self.url))
             .json(&serde_json::json!({ "username": self.username, "password": self.password }))
-            .send().await?;
+            .send()
+            .await?;
 
         if resp.status() == StatusCode::UNAUTHORIZED {
             return Err("Navidrome rejected those credentials".into());
@@ -212,19 +218,23 @@ impl NavidromeSource {
     }
 
     /// GET against the native API, logging in again once if the token expired.
-    async fn native_get(&mut self, path: &str, query: &[(&str, String)])
-        -> Result<reqwest::Response, Box<dyn std::error::Error>>
-    {
+    async fn native_get(
+        &mut self,
+        path: &str,
+        query: &[(&str, String)],
+    ) -> Result<reqwest::Response, Box<dyn std::error::Error>> {
         for attempt in 0..2 {
             if self.nd_token.is_none() {
                 self.login().await?;
             }
             let token = self.nd_token.clone().unwrap_or_default();
-            let resp = self.client
+            let resp = self
+                .client
                 .get(format!("{}{}", self.url, path))
                 .header("x-nd-authorization", format!("Bearer {token}"))
                 .query(query)
-                .send().await?;
+                .send()
+                .await?;
 
             if resp.status() == StatusCode::UNAUTHORIZED && attempt == 0 {
                 debug!("Navidrome native token expired; re-authenticating");
@@ -241,21 +251,30 @@ impl NavidromeSource {
 
     /// Scrobbles submitted after `from`. This is the backfill: Navidrome keeps
     /// its own play history, so a new Tapedeck install can pull years of it.
-    pub async fn fetch_scrobbles(&mut self, from: u64)
-        -> Result<Vec<Play>, Box<dyn std::error::Error>>
-    {
-        let resp = self.native_get("/api/scrobble/", &[
-            ("from", from.to_string()),
-            ("_start", "0".into()),
-            ("_end", "10000".into()),
-        ]).await?;
+    pub async fn fetch_scrobbles(
+        &mut self,
+        from: u64,
+    ) -> Result<Vec<Play>, Box<dyn std::error::Error>> {
+        let resp = self
+            .native_get(
+                "/api/scrobble/",
+                &[
+                    ("from", from.to_string()),
+                    ("_start", "0".into()),
+                    ("_end", "10000".into()),
+                ],
+            )
+            .await?;
         let rows: Vec<NativeScrobble> = resp.json().await?;
         if rows.is_empty() {
             return Ok(Vec::new());
         }
 
         // Only load the catalogue when we actually have rows referencing it.
-        if rows.iter().any(|r| !self.songs.contains_key(&r.media_file_id)) {
+        if rows
+            .iter()
+            .any(|r| !self.songs.contains_key(&r.media_file_id))
+        {
             self.load_songs().await?;
         }
 
@@ -264,7 +283,10 @@ impl NavidromeSource {
         for row in rows {
             newest = newest.max(row.submission_time);
             let Some(song) = self.songs.get(&row.media_file_id) else {
-                debug!("Navidrome scrobble references unknown song {}", row.media_file_id);
+                debug!(
+                    "Navidrome scrobble references unknown song {}",
+                    row.media_file_id
+                );
                 continue;
             };
             plays.push(song.to_play(row.submission_time, &row.media_file_id));
@@ -274,19 +296,29 @@ impl NavidromeSource {
     }
 
     async fn load_songs(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        let resp = self.native_get("/api/song", &[
-            ("_start", "0".into()),
-            ("_end", "100000".into()),
-        ]).await?;
+        let resp = self
+            .native_get(
+                "/api/song",
+                &[("_start", "0".into()), ("_end", "100000".into())],
+            )
+            .await?;
         let songs: Vec<NativeSong> = resp.json().await?;
-        self.songs = songs.into_iter().map(|s| (s.id.clone(), NavidromeSong {
-            title: s.title,
-            artist: s.artist,
-            album: s.album,
-            duration: (s.duration > 0.0).then_some(s.duration as u64),
-            track_number: s.track_number.filter(|n| *n > 0),
-            mbid: s.mbz_recording_id.filter(|m| !m.is_empty()),
-        })).collect();
+        self.songs = songs
+            .into_iter()
+            .map(|s| {
+                (
+                    s.id.clone(),
+                    NavidromeSong {
+                        title: s.title,
+                        artist: s.artist,
+                        album: s.album,
+                        duration: (s.duration > 0.0).then_some(s.duration as u64),
+                        track_number: s.track_number.filter(|n| *n > 0),
+                        mbid: s.mbz_recording_id.filter(|m| !m.is_empty()),
+                    },
+                )
+            })
+            .collect();
         debug!("Navidrome: cached {} songs", self.songs.len());
         Ok(())
     }
@@ -310,17 +342,25 @@ impl NavidromeSource {
         ]
     }
 
-    async fn subsonic_get(&self, endpoint: &str) -> Result<SubsonicResponse, Box<dyn std::error::Error>> {
-        let resp = self.client
+    async fn subsonic_get(
+        &self,
+        endpoint: &str,
+    ) -> Result<SubsonicResponse, Box<dyn std::error::Error>> {
+        let resp = self
+            .client
             .get(format!("{}/rest/{}", self.url, endpoint))
             .query(&self.subsonic_params())
-            .send().await?;
+            .send()
+            .await?;
         if !resp.status().is_success() {
             return Err(format!("Subsonic {} returned {}", endpoint, resp.status()).into());
         }
         let env: SubsonicEnvelope = resp.json().await?;
         if env.response.status != "ok" {
-            let msg = env.response.error.and_then(|e| e.message)
+            let msg = env
+                .response
+                .error
+                .and_then(|e| e.message)
                 .unwrap_or_else(|| "unknown Subsonic error".into());
             return Err(format!("Subsonic {endpoint}: {msg}").into());
         }
@@ -337,22 +377,27 @@ impl NavidromeSource {
     /// reach a LAN Navidrome, and it must never be handed the credentials that
     /// would let it. Returns the bytes plus the content type so the proxy can
     /// pass both through.
-    pub async fn fetch_cover_art(&self, item_id: &str)
-        -> Result<(Vec<u8>, String), Box<dyn std::error::Error + Send + Sync>>
-    {
+    pub async fn fetch_cover_art(
+        &self,
+        item_id: &str,
+    ) -> Result<(Vec<u8>, String), Box<dyn std::error::Error + Send + Sync>> {
         let mut params = self.subsonic_params();
         params.push(("id".into(), item_id.to_string()));
         params.push(("size".into(), "500".into()));
 
-        let resp = self.client
+        let resp = self
+            .client
             .get(format!("{}/rest/getCoverArt", self.url))
             .query(&params)
-            .send().await?;
+            .send()
+            .await?;
 
         if !resp.status().is_success() {
             return Err(format!("Navidrome cover art returned {}", resp.status()).into());
         }
-        let content_type = resp.headers().get(reqwest::header::CONTENT_TYPE)
+        let content_type = resp
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
             .and_then(|v| v.to_str().ok())
             .unwrap_or("image/jpeg")
             .to_string();
@@ -370,13 +415,14 @@ impl NavidromeSource {
     /// Navidrome keeps reporting a finished track for a while, so entries that
     /// haven't been touched in a few minutes are dropped — otherwise the deck
     /// would show a stale song long after playback stopped.
-    pub async fn fetch_now_playing(&self)
-        -> Result<Vec<NavidromeNowPlaying>, Box<dyn std::error::Error>>
-    {
+    pub async fn fetch_now_playing(
+        &self,
+    ) -> Result<Vec<NavidromeNowPlaying>, Box<dyn std::error::Error>> {
         let resp = self.subsonic_get("getNowPlaying").await?;
         let entries = resp.now_playing.map(|n| n.entry).unwrap_or_default();
 
-        Ok(entries.into_iter()
+        Ok(entries
+            .into_iter()
             .filter(|e| e.minutes_ago.unwrap_or(0) < 5)
             .map(|e| {
                 let minutes_ago = e.minutes_ago.unwrap_or(0);
@@ -390,9 +436,13 @@ impl NavidromeSource {
                         timestamp: now_secs(),
                         duration: e.duration,
                         track_number: e.track,
-                        mbid_recording: None, mbid_release: None, mbid_artist: None,
-                        artists: None, mbid_release_group: None,
-                        caa_id: None, caa_release_mbid: None,
+                        mbid_recording: None,
+                        mbid_release: None,
+                        mbid_artist: None,
+                        artists: None,
+                        mbid_release_group: None,
+                        caa_id: None,
+                        caa_release_mbid: None,
                     },
                     username: e.username,
                     minutes_ago,
@@ -417,16 +467,21 @@ impl NavidromeSong {
             duration: self.duration,
             track_number: self.track_number,
             mbid_recording: self.mbid.clone(),
-            mbid_release: None, mbid_artist: None,
-            artists: None, mbid_release_group: None,
-            caa_id: None, caa_release_mbid: None,
+            mbid_release: None,
+            mbid_artist: None,
+            artists: None,
+            mbid_release_group: None,
+            caa_id: None,
+            caa_release_mbid: None,
         }
     }
 }
 
 fn now_secs() -> u64 {
     std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH).unwrap().as_secs()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
 }
 
 #[async_trait]
@@ -439,7 +494,10 @@ impl MusicSource for NavidromeSource {
         self
     }
 
-    async fn fetch_new_plays(&mut self, last_checked: u64) -> Result<Vec<Play>, Box<dyn std::error::Error>> {
+    async fn fetch_new_plays(
+        &mut self,
+        last_checked: u64,
+    ) -> Result<Vec<Play>, Box<dyn std::error::Error>> {
         let from = self.last_submission.max(last_checked);
         match self.fetch_scrobbles(from).await {
             Ok(plays) => Ok(plays),
@@ -507,13 +565,22 @@ mod tests {
     fn accepts_navidrome_mbid_field_spellings() {
         // Each of these has been the field name at some point; a mismatch is
         // invisible at runtime, so pin them all.
-        for key in ["mbzRecordingID", "mbzRecordingId", "mbzTrackId", "musicBrainzId"] {
+        for key in [
+            "mbzRecordingID",
+            "mbzRecordingId",
+            "mbzTrackId",
+            "musicBrainzId",
+        ] {
             let json = format!(
                 r#"{{"id":"1","title":"T","artist":"A","duration":100.0,"{key}":"mb-123"}}"#
             );
             let song: NativeSong = serde_json::from_str(&json)
                 .unwrap_or_else(|e| panic!("{key} failed to parse: {e}"));
-            assert_eq!(song.mbz_recording_id.as_deref(), Some("mb-123"), "{key} did not map");
+            assert_eq!(
+                song.mbz_recording_id.as_deref(),
+                Some("mb-123"),
+                "{key} did not map"
+            );
         }
     }
 

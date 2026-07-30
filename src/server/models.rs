@@ -65,7 +65,7 @@ pub struct MbidMapping {
 
 #[derive(Debug, Deserialize)]
 pub struct TapedeckAudio {
-    pub format_type: Option<String>,  // "pcm", "dsd", "mqa"
+    pub format_type: Option<String>, // "pcm", "dsd", "mqa"
     pub codec: Option<String>,
     pub bitrate: Option<i32>,
     pub sample_rate: Option<i32>,

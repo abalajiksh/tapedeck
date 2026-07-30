@@ -29,8 +29,7 @@ fn is_api_path(path: &str) -> bool {
 /// A path that names a concrete file (hashed bundle, image, favicon) rather
 /// than a client-side route. Missing ones are a real 404, not an SPA route.
 fn looks_like_file(path: &str) -> bool {
-    path.starts_with("_app/")
-        || path.rsplit('/').next().is_some_and(|seg| seg.contains('.'))
+    path.starts_with("_app/") || path.rsplit('/').next().is_some_and(|seg| seg.contains('.'))
 }
 
 /// Router fallback: serve an embedded asset, else the SPA shell.

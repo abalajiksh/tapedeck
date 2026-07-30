@@ -19,7 +19,12 @@ pub struct ExportQuery {
 }
 
 /// Streaming phase for the paged export (keeps memory O(page), not O(history)).
-enum Phase { Open, Rows(i64), Close, End }
+enum Phase {
+    Open,
+    Rows(i64),
+    Close,
+    End,
+}
 
 /// GET /api/v1/export?format=json|csv — full listen dump, streamed in pages so a
 /// huge history can't blow up memory. JSON is a plain array (import-compatible).
@@ -38,11 +43,18 @@ async fn export(
         async move {
             match phase {
                 Phase::Open => {
-                    let chunk = if csv_fmt { "title,artist,album,format,chain,mbid,time\n".to_string() } else { "[".to_string() };
+                    let chunk = if csv_fmt {
+                        "title,artist,album,format,chain,mbid,time\n".to_string()
+                    } else {
+                        "[".to_string()
+                    };
                     Some((Ok::<String, std::io::Error>(chunk), (Phase::Rows(0), first)))
                 }
                 Phase::Rows(off) => {
-                    let page = db.get_recent_scrobbles(uid, PAGE, off, None, None, None, None).await.unwrap_or_default();
+                    let page = db
+                        .get_recent_scrobbles(uid, PAGE, off, None, None, None, None)
+                        .await
+                        .unwrap_or_default();
                     if page.is_empty() {
                         return Some((Ok(String::new()), (Phase::Close, first)));
                     }
@@ -50,14 +62,22 @@ async fn export(
                     let mut first = first;
                     for r in &page {
                         if csv_fmt {
-                            buf.push_str(&format!("{},{},{},{},{},{},{}\n",
-                                csv(&r.title), csv(&r.artist), csv(r.album.as_deref().unwrap_or("")),
+                            buf.push_str(&format!(
+                                "{},{},{},{},{},{},{}\n",
+                                csv(&r.title),
+                                csv(&r.artist),
+                                csv(r.album.as_deref().unwrap_or("")),
                                 csv(r.format_type.as_deref().unwrap_or("")),
                                 r.chain_id.map(|c| c.to_string()).unwrap_or_default(),
                                 csv(r.mbid_recording.as_deref().unwrap_or("")),
-                                r.timestamp));
+                                r.timestamp
+                            ));
                         } else {
-                            if first { first = false; } else { buf.push(','); }
+                            if first {
+                                first = false;
+                            } else {
+                                buf.push(',');
+                            }
                             buf.push_str(&serde_json::to_string(r).unwrap_or_default());
                         }
                     }
@@ -65,7 +85,11 @@ async fn export(
                     Some((Ok(buf), (Phase::Rows(off + n), first)))
                 }
                 Phase::Close => {
-                    let chunk = if csv_fmt { String::new() } else { "]".to_string() };
+                    let chunk = if csv_fmt {
+                        String::new()
+                    } else {
+                        "]".to_string()
+                    };
                     Some((Ok(chunk), (Phase::End, first)))
                 }
                 Phase::End => None,
@@ -76,48 +100,78 @@ async fn export(
     let (ct, disp) = if csv_fmt {
         ("text/csv", "attachment; filename=\"tapedeck-export.csv\"")
     } else {
-        ("application/json", "attachment; filename=\"tapedeck-export.json\"")
+        (
+            "application/json",
+            "attachment; filename=\"tapedeck-export.json\"",
+        )
     };
     (
         StatusCode::OK,
-        [(header::CONTENT_TYPE, ct), (header::CONTENT_DISPOSITION, disp)],
+        [
+            (header::CONTENT_TYPE, ct),
+            (header::CONTENT_DISPOSITION, disp),
+        ],
         Body::from_stream(stream),
-    ).into_response()
+    )
+        .into_response()
 }
 
 /// GET /api/v1/backup — admin-only consistent SQLite snapshot download.
-async fn backup(
-    State(state): State<Arc<AppState>>,
-    user: AuthUser,
-) -> impl IntoResponse {
+async fn backup(State(state): State<Arc<AppState>>, user: AuthUser) -> impl IntoResponse {
     if !user.is_admin {
-        return (StatusCode::FORBIDDEN, Json(serde_json::json!(
-            ErrorResponse { code: 403, error: "Admin only".into() }
-        ))).into_response();
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!(ErrorResponse {
+                code: 403,
+                error: "Admin only".into()
+            })),
+        )
+            .into_response();
     }
-    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
     let tmp = std::env::temp_dir().join(format!("tapedeck-backup-{now}.db"));
     let tmp_str = tmp.to_string_lossy().to_string();
 
     if let Err(e) = state.db.backup_to(&tmp_str).await {
-        return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!(
-            ErrorResponse { code: 500, error: format!("Backup failed: {e}") }
-        ))).into_response();
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!(ErrorResponse {
+                code: 500,
+                error: format!("Backup failed: {e}")
+            })),
+        )
+            .into_response();
     }
     let bytes = match tokio::fs::read(&tmp).await {
         Ok(b) => b,
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!(
-            ErrorResponse { code: 500, error: format!("Backup read failed: {e}") }
-        ))).into_response(),
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!(ErrorResponse {
+                    code: 500,
+                    error: format!("Backup read failed: {e}")
+                })),
+            )
+                .into_response()
+        }
     };
     let _ = tokio::fs::remove_file(&tmp).await;
 
     (
         StatusCode::OK,
-        [(header::CONTENT_TYPE, "application/x-sqlite3"),
-         (header::CONTENT_DISPOSITION, "attachment; filename=\"tapedeck-backup.db\"")],
+        [
+            (header::CONTENT_TYPE, "application/x-sqlite3"),
+            (
+                header::CONTENT_DISPOSITION,
+                "attachment; filename=\"tapedeck-backup.db\"",
+            ),
+        ],
         bytes,
-    ).into_response()
+    )
+        .into_response()
 }
 
 /// Minimal RFC-4180 field escaping: quote if it contains a comma, quote, or newline.

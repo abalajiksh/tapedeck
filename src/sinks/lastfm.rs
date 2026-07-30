@@ -1,11 +1,11 @@
+use super::ScrobbleSink;
+use crate::models::Play;
 use async_trait::async_trait;
 use reqwest::Client;
-use crate::models::Play;
-use super::ScrobbleSink;
-use tracing::{info, warn, error, debug};
 use std::collections::HashMap;
 use std::time::Duration;
 use tokio::time::sleep;
+use tracing::{debug, error, info, warn};
 
 /// Tapedeck's registered Last.fm application credentials.
 ///
@@ -33,16 +33,25 @@ impl LastFmSink {
     /// Create a sink for Last.fm (api.audioscrobbler.com).
     pub fn new(api_key: String, secret: String, session_key: String) -> Self {
         Self::with_url(
-            api_key, secret, session_key,
+            api_key,
+            secret,
+            session_key,
             "https://ws.audioscrobbler.com/2.0/".to_string(),
             "Last.fm".to_string(),
         )
     }
 
     /// Create a sink for Libre.fm (libre.fm) or any GNU FM-compatible server.
-    pub fn libre_fm(api_key: String, secret: String, session_key: String, base_url: Option<String>) -> Self {
+    pub fn libre_fm(
+        api_key: String,
+        secret: String,
+        session_key: String,
+        base_url: Option<String>,
+    ) -> Self {
         Self::with_url(
-            api_key, secret, session_key,
+            api_key,
+            secret,
+            session_key,
             base_url.unwrap_or_else(|| "https://libre.fm/2.0/".to_string()),
             "Libre.fm".to_string(),
         )
@@ -110,7 +119,11 @@ impl ScrobbleSink for LastFmSink {
             return Ok(());
         }
 
-        info!("Submitting {} plays to {}...", plays.len(), self.service_name);
+        info!(
+            "Submitting {} plays to {}...",
+            plays.len(),
+            self.service_name
+        );
 
         for chunk in plays.chunks(50) {
             let mut params: Vec<(String, String)> = Vec::new();
@@ -119,7 +132,10 @@ impl ScrobbleSink for LastFmSink {
             params.push(("sk".into(), self.session_key.clone()));
 
             for (i, play) in chunk.iter().enumerate() {
-                debug!("Preparing {} scrobble for: {} - {}", self.service_name, play.artist, play.title);
+                debug!(
+                    "Preparing {} scrobble for: {} - {}",
+                    self.service_name, play.artist, play.title
+                );
 
                 params.push((format!("artist[{}]", i), play.artist.clone()));
                 params.push((format!("track[{}]", i), play.title.clone()));
@@ -164,31 +180,52 @@ impl ScrobbleSink for LastFmSink {
             let mut attempt = 0u32;
             loop {
                 attempt += 1;
-                match self.client.post(self.api_endpoint()).form(&form_data).send().await {
+                match self
+                    .client
+                    .post(self.api_endpoint())
+                    .form(&form_data)
+                    .send()
+                    .await
+                {
                     Ok(resp) if resp.status().is_success() => {
-                        debug!("Successfully submitted chunk of {} plays to {}", chunk.len(), self.service_name);
+                        debug!(
+                            "Successfully submitted chunk of {} plays to {}",
+                            chunk.len(),
+                            self.service_name
+                        );
                         break;
                     }
                     Ok(resp) => {
                         let status = resp.status();
                         let error_text = resp.text().await.unwrap_or_default();
                         if attempt >= MAX_RETRIES {
-                            error!("{} submission failed after {} attempts (status {}): {}",
-                                self.service_name, attempt, status, error_text);
-                            return Err(format!("{} API Error: {}", self.service_name, error_text).into());
+                            error!(
+                                "{} submission failed after {} attempts (status {}): {}",
+                                self.service_name, attempt, status, error_text
+                            );
+                            return Err(
+                                format!("{} API Error: {}", self.service_name, error_text).into()
+                            );
                         }
-                        warn!("{} submission failed (status {}), retry {}/{} in {}s",
-                            self.service_name, status, attempt, MAX_RETRIES, backoff);
+                        warn!(
+                            "{} submission failed (status {}), retry {}/{} in {}s",
+                            self.service_name, status, attempt, MAX_RETRIES, backoff
+                        );
                         sleep(Duration::from_secs(backoff)).await;
                         backoff *= 2;
                     }
                     Err(e) => {
                         if attempt >= MAX_RETRIES {
-                            error!("{} request failed after {} attempts: {}", self.service_name, attempt, e);
+                            error!(
+                                "{} request failed after {} attempts: {}",
+                                self.service_name, attempt, e
+                            );
                             return Err(Box::new(e));
                         }
-                        warn!("{} request error, retry {}/{} in {}s: {}",
-                            self.service_name, attempt, MAX_RETRIES, backoff, e);
+                        warn!(
+                            "{} request error, retry {}/{} in {}s: {}",
+                            self.service_name, attempt, MAX_RETRIES, backoff, e
+                        );
                         sleep(Duration::from_secs(backoff)).await;
                         backoff *= 2;
                     }
@@ -196,7 +233,11 @@ impl ScrobbleSink for LastFmSink {
             }
         }
 
-        info!("✅ Successfully submitted {} plays to {}", plays.len(), self.service_name);
+        info!(
+            "✅ Successfully submitted {} plays to {}",
+            plays.len(),
+            self.service_name
+        );
         Ok(())
     }
 }

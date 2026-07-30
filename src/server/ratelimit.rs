@@ -20,7 +20,11 @@ pub struct RateLimiter {
 
 impl RateLimiter {
     pub fn new(max_failures: u32, window: Duration) -> Self {
-        Self { inner: Mutex::new(HashMap::new()), max_failures, window }
+        Self {
+            inner: Mutex::new(HashMap::new()),
+            max_failures,
+            window,
+        }
     }
 
     /// If the key is currently blocked, returns `Some(retry_after_seconds)`.
@@ -39,8 +43,10 @@ impl RateLimiter {
 
     pub fn record_failure(&self, key: &str) {
         let mut map = self.inner.lock().unwrap();
-        let a = map.entry(key.to_string())
-            .or_insert(Attempt { failures: 0, window_start: Instant::now() });
+        let a = map.entry(key.to_string()).or_insert(Attempt {
+            failures: 0,
+            window_start: Instant::now(),
+        });
         if a.window_start.elapsed() >= self.window {
             a.failures = 0;
             a.window_start = Instant::now();
@@ -76,7 +82,10 @@ mod tests {
         rl.record_failure("ip");
         assert!(rl.blocked_for("ip").is_some());
         std::thread::sleep(Duration::from_millis(55));
-        assert!(rl.blocked_for("ip").is_none(), "window expired, no longer blocked");
+        assert!(
+            rl.blocked_for("ip").is_none(),
+            "window expired, no longer blocked"
+        );
     }
 
     #[test]

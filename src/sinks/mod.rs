@@ -27,25 +27,47 @@ pub trait ScrobbleSink: Any + Send + Sync {
 /// nothing gets an empty vec and their listens stay local. Used by both the
 /// HTTP layer (now-playing on ingest) and the poll engine (scrobble flush,
 /// now-playing from Plex), so the rule can't drift between them.
-pub async fn sinks_for_user(db: &Database, user_id: i64, listenbrainz_url: &str) -> Vec<Box<dyn ScrobbleSink>> {
-    let conns = db.get_connections_for_forwarding(user_id).await.unwrap_or_default();
+pub async fn sinks_for_user(
+    db: &Database,
+    user_id: i64,
+    listenbrainz_url: &str,
+) -> Vec<Box<dyn ScrobbleSink>> {
+    let conns = db
+        .get_connections_for_forwarding(user_id)
+        .await
+        .unwrap_or_default();
     let mut sinks: Vec<Box<dyn ScrobbleSink>> = Vec::new();
 
     for (service, creds_json) in conns {
         let creds: serde_json::Value = serde_json::from_str(&creds_json).unwrap_or_default();
         match service.as_str() {
-            "listenbrainz" => if let Some(t) = creds["token"].as_str() {
-                sinks.push(Box::new(ListenBrainzSink::new(
-                    listenbrainz_url.to_string(), t.to_string())));
-            },
-            "lastfm" => if let Some(sk) = creds["session_key"].as_str() {
-                sinks.push(Box::new(LastFmSink::new(
-                    LASTFM_API_KEY.to_string(), LASTFM_SECRET.to_string(), sk.to_string())));
-            },
-            "librefm" => if let Some(sk) = creds["session_key"].as_str() {
-                sinks.push(Box::new(LastFmSink::libre_fm(
-                    LASTFM_API_KEY.to_string(), LASTFM_SECRET.to_string(), sk.to_string(), None)));
-            },
+            "listenbrainz" => {
+                if let Some(t) = creds["token"].as_str() {
+                    sinks.push(Box::new(ListenBrainzSink::new(
+                        listenbrainz_url.to_string(),
+                        t.to_string(),
+                    )));
+                }
+            }
+            "lastfm" => {
+                if let Some(sk) = creds["session_key"].as_str() {
+                    sinks.push(Box::new(LastFmSink::new(
+                        LASTFM_API_KEY.to_string(),
+                        LASTFM_SECRET.to_string(),
+                        sk.to_string(),
+                    )));
+                }
+            }
+            "librefm" => {
+                if let Some(sk) = creds["session_key"].as_str() {
+                    sinks.push(Box::new(LastFmSink::libre_fm(
+                        LASTFM_API_KEY.to_string(),
+                        LASTFM_SECRET.to_string(),
+                        sk.to_string(),
+                        None,
+                    )));
+                }
+            }
             _ => {}
         }
     }

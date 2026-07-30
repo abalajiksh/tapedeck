@@ -33,19 +33,25 @@ use axum::{
 use serde::Deserialize;
 use std::sync::Arc;
 
-use crate::db::ScrobbleRecord;
 use super::auth::IngestAuth;
 use super::AppState;
+use crate::db::ScrobbleRecord;
 
 fn error(code: u16, msg: impl Into<String>) -> axum::response::Response {
     let status = StatusCode::from_u16(code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-    (status, Json(serde_json::json!({ "code": code, "error": msg.into() }))).into_response()
+    (
+        status,
+        Json(serde_json::json!({ "code": code, "error": msg.into() })),
+    )
+        .into_response()
 }
 
 /// Resolve the `{user}` path segment, enforcing that it's the caller (or that
 /// the caller is an admin). Returns the target user's id on success.
 async fn authorize_for(
-    state: &Arc<AppState>, caller: &crate::models::AuthUser, requested: &str,
+    state: &Arc<AppState>,
+    caller: &crate::models::AuthUser,
+    requested: &str,
 ) -> Result<i64, axum::response::Response> {
     if requested.eq_ignore_ascii_case(&caller.username) {
         return Ok(caller.user_id);
@@ -78,8 +84,12 @@ fn to_lb_listen(s: &ScrobbleRecord, include_listened_at: bool) -> serde_json::Va
     if let Some(ref m) = s.mbid_artist {
         // Stored as a JSON array string; pass it through as an array when it parses.
         match serde_json::from_str::<serde_json::Value>(m) {
-            Ok(v) if v.is_array() => { additional.insert("artist_mbids".into(), v); }
-            _ => { additional.insert("artist_mbids".into(), serde_json::json!([m])); }
+            Ok(v) if v.is_array() => {
+                additional.insert("artist_mbids".into(), v);
+            }
+            _ => {
+                additional.insert("artist_mbids".into(), serde_json::json!([m]));
+            }
         }
     }
     if let Some(ref c) = s.submission_client {
@@ -90,14 +100,30 @@ fn to_lb_listen(s: &ScrobbleRecord, include_listened_at: bool) -> serde_json::Va
     }
 
     let mut audio = serde_json::Map::new();
-    if let Some(ref v) = s.format_type { audio.insert("format_type".into(), serde_json::json!(v)); }
-    if let Some(ref v) = s.codec { audio.insert("codec".into(), serde_json::json!(v)); }
-    if let Some(v) = s.bitrate { audio.insert("bitrate".into(), serde_json::json!(v)); }
-    if let Some(v) = s.sample_rate { audio.insert("sample_rate".into(), serde_json::json!(v)); }
-    if let Some(v) = s.bit_depth { audio.insert("bit_depth".into(), serde_json::json!(v)); }
-    if let Some(v) = s.is_lossless { audio.insert("is_lossless".into(), serde_json::json!(v)); }
-    if let Some(v) = s.dsd_multiplier { audio.insert("dsd_multiplier".into(), serde_json::json!(v)); }
-    if let Some(ref v) = s.delivery_codec { audio.insert("delivery_codec".into(), serde_json::json!(v)); }
+    if let Some(ref v) = s.format_type {
+        audio.insert("format_type".into(), serde_json::json!(v));
+    }
+    if let Some(ref v) = s.codec {
+        audio.insert("codec".into(), serde_json::json!(v));
+    }
+    if let Some(v) = s.bitrate {
+        audio.insert("bitrate".into(), serde_json::json!(v));
+    }
+    if let Some(v) = s.sample_rate {
+        audio.insert("sample_rate".into(), serde_json::json!(v));
+    }
+    if let Some(v) = s.bit_depth {
+        audio.insert("bit_depth".into(), serde_json::json!(v));
+    }
+    if let Some(v) = s.is_lossless {
+        audio.insert("is_lossless".into(), serde_json::json!(v));
+    }
+    if let Some(v) = s.dsd_multiplier {
+        audio.insert("dsd_multiplier".into(), serde_json::json!(v));
+    }
+    if let Some(ref v) = s.delivery_codec {
+        audio.insert("delivery_codec".into(), serde_json::json!(v));
+    }
     if !audio.is_empty() {
         additional.insert("tapedeck_audio".into(), serde_json::Value::Object(audio));
     }
@@ -106,12 +132,15 @@ fn to_lb_listen(s: &ScrobbleRecord, include_listened_at: bool) -> serde_json::Va
     if include_listened_at {
         listen.insert("listened_at".into(), serde_json::json!(s.timestamp));
     }
-    listen.insert("track_metadata".into(), serde_json::json!({
-        "artist_name": s.artist,
-        "track_name": s.title,
-        "release_name": s.album,
-        "additional_info": serde_json::Value::Object(additional),
-    }));
+    listen.insert(
+        "track_metadata".into(),
+        serde_json::json!({
+            "artist_name": s.artist,
+            "track_name": s.title,
+            "release_name": s.album,
+            "additional_info": serde_json::Value::Object(additional),
+        }),
+    );
     serde_json::Value::Object(listen)
 }
 
@@ -141,21 +170,33 @@ async fn user_listens(
     let before = q.max_ts.map(|t| t - 1);
     let after = q.min_ts.map(|t| t + 1);
 
-    let rows = match state.db.get_recent_scrobbles(user_id, count, 0, None, None, after, before).await {
+    let rows = match state
+        .db
+        .get_recent_scrobbles(user_id, count, 0, None, None, after, before)
+        .await
+    {
         Ok(r) => r,
         Err(e) => return error(500, e.to_string()),
     };
-    let (_, latest) = state.db.listen_count_and_latest(user_id).await.unwrap_or((0, None));
+    let (_, latest) = state
+        .db
+        .listen_count_and_latest(user_id)
+        .await
+        .unwrap_or((0, None));
     let listens: Vec<serde_json::Value> = rows.iter().map(|s| to_lb_listen(s, true)).collect();
 
-    (StatusCode::OK, Json(serde_json::json!({
-        "payload": {
-            "count": listens.len(),
-            "user_id": user,
-            "listens": listens,
-            "latest_listen_ts": latest.unwrap_or(0),
-        }
-    }))).into_response()
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "payload": {
+                "count": listens.len(),
+                "user_id": user,
+                "listens": listens,
+                "latest_listen_ts": latest.unwrap_or(0),
+            }
+        })),
+    )
+        .into_response()
 }
 
 /// GET /1/user/:user/playing-now
@@ -190,14 +231,18 @@ async fn user_playing_now(
         None => Vec::new(),
     };
 
-    (StatusCode::OK, Json(serde_json::json!({
-        "payload": {
-            "count": listens.len(),
-            "user_id": user,
-            "listens": listens,
-            "playing_now": true,
-        }
-    }))).into_response()
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "payload": {
+                "count": listens.len(),
+                "user_id": user,
+                "listens": listens,
+                "playing_now": true,
+            }
+        })),
+    )
+        .into_response()
 }
 
 /// GET /1/user/:user/listen-count
@@ -211,9 +256,13 @@ async fn user_listen_count(
         Err(resp) => return resp,
     };
     match state.db.listen_count_and_latest(user_id).await {
-        Ok((count, _)) => (StatusCode::OK, Json(serde_json::json!({
-            "payload": { "count": count }
-        }))).into_response(),
+        Ok((count, _)) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "payload": { "count": count }
+            })),
+        )
+            .into_response(),
         Err(e) => error(500, e.to_string()),
     }
 }
@@ -231,9 +280,13 @@ async fn user_services(
     match state.db.list_connections(user_id).await {
         Ok(rows) => {
             let services: Vec<String> = rows.into_iter().map(|(s, _, _)| s).collect();
-            (StatusCode::OK, Json(serde_json::json!({
-                "user_name": user, "services": services,
-            }))).into_response()
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "user_name": user, "services": services,
+                })),
+            )
+                .into_response()
         }
         Err(e) => error(500, e.to_string()),
     }
@@ -270,12 +323,20 @@ async fn get_latest_import(
         Ok(id) => id,
         Err(resp) => return resp,
     };
-    let ts = state.db.get_preferences(user_id).await.ok()
+    let ts = state
+        .db
+        .get_preferences(user_id)
+        .await
+        .ok()
         .and_then(|p| p.get("latest_import").and_then(|v| v.as_i64()))
         .unwrap_or(0);
-    (StatusCode::OK, Json(serde_json::json!({
-        "musicbrainz_id": user, "latest_import": ts,
-    }))).into_response()
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "musicbrainz_id": user, "latest_import": ts,
+        })),
+    )
+        .into_response()
 }
 
 #[derive(Deserialize)]
@@ -292,7 +353,14 @@ async fn set_latest_import(
     if body.ts < 0 {
         return error(400, "ts must be a positive integer");
     }
-    match state.db.merge_preferences(caller.user_id, &serde_json::json!({ "latest_import": body.ts })).await {
+    match state
+        .db
+        .merge_preferences(
+            caller.user_id,
+            &serde_json::json!({ "latest_import": body.ts }),
+        )
+        .await
+    {
         Ok(_) => (StatusCode::OK, Json(serde_json::json!({ "status": "ok" }))).into_response(),
         Err(e) => error(500, e.to_string()),
     }
@@ -306,5 +374,8 @@ pub fn create_lb_api_router() -> Router<Arc<AppState>> {
         .route("/1/user/:user/listen-count", get(user_listen_count))
         .route("/1/user/:user/services", get(user_services))
         .route("/1/playing-now/delete", post(playing_now_delete))
-        .route("/1/latest-import", get(get_latest_import).post(set_latest_import))
+        .route(
+            "/1/latest-import",
+            get(get_latest_import).post(set_latest_import),
+        )
 }

@@ -75,10 +75,14 @@ struct TomlConfig {
 
 #[derive(Deserialize)]
 #[serde(default)]
-struct TomlListenBrainz { url: String }
+struct TomlListenBrainz {
+    url: String,
+}
 impl Default for TomlListenBrainz {
     fn default() -> Self {
-        Self { url: crate::sinks::LISTENBRAINZ_DEFAULT_URL.into() }
+        Self {
+            url: crate::sinks::LISTENBRAINZ_DEFAULT_URL.into(),
+        }
     }
 }
 
@@ -91,7 +95,14 @@ struct TomlServer {
     secret_key_path: String,
 }
 impl Default for TomlServer {
-    fn default() -> Self { Self { port: 8080, host: "0.0.0.0".into(), trust_proxy: false, secret_key_path: "./tapedeck.key".into() } }
+    fn default() -> Self {
+        Self {
+            port: 8080,
+            host: "0.0.0.0".into(),
+            trust_proxy: false,
+            secret_key_path: "./tapedeck.key".into(),
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -169,10 +180,15 @@ struct TomlPlex {
 impl Default for TomlPlex {
     fn default() -> Self {
         Self {
-            enabled: false, url: "http://localhost:32400".into(), token: String::new(),
-            users_allow: Vec::new(), users_block: Vec::new(),
-            devices_allow: Vec::new(), devices_block: Vec::new(),
-            libraries_allow: Vec::new(), libraries_block: Vec::new(),
+            enabled: false,
+            url: "http://localhost:32400".into(),
+            token: String::new(),
+            users_allow: Vec::new(),
+            users_block: Vec::new(),
+            devices_allow: Vec::new(),
+            devices_block: Vec::new(),
+            libraries_allow: Vec::new(),
+            libraries_block: Vec::new(),
         }
     }
 }
@@ -229,9 +245,17 @@ impl Config {
             secret_key_path: env_or("TAPEDECK_SECRET_KEY_PATH", t.server.secret_key_path),
             musicbrainz: MusicBrainzConfig {
                 user_agent: env_or("MUSICBRAINZ_USER_AGENT", t.musicbrainz.user_agent),
-                rate_limit_per_second: env_or_parse("MUSICBRAINZ_RATE_LIMIT", t.musicbrainz.rate_limit_per_second),
-                postgres_url: env::var("MUSICBRAINZ_POSTGRES_URL").ok().or(t.musicbrainz.postgres_url),
-                enable_postgres: env_or_bool("MUSICBRAINZ_POSTGRES_ENABLED", t.musicbrainz.postgres_enabled),
+                rate_limit_per_second: env_or_parse(
+                    "MUSICBRAINZ_RATE_LIMIT",
+                    t.musicbrainz.rate_limit_per_second,
+                ),
+                postgres_url: env::var("MUSICBRAINZ_POSTGRES_URL")
+                    .ok()
+                    .or(t.musicbrainz.postgres_url),
+                enable_postgres: env_or_bool(
+                    "MUSICBRAINZ_POSTGRES_ENABLED",
+                    t.musicbrainz.postgres_enabled,
+                ),
             },
             plex: PlexConfig {
                 enabled: env_or_bool("PLEX_ENABLED", t.sources.plex.enabled),
@@ -241,8 +265,14 @@ impl Config {
                 users_block: env_or_list("PLEX_USERS_BLOCK", t.sources.plex.users_block),
                 devices_allow: env_or_list("PLEX_DEVICES_ALLOW", t.sources.plex.devices_allow),
                 devices_block: env_or_list("PLEX_DEVICES_BLOCK", t.sources.plex.devices_block),
-                libraries_allow: env_or_list("PLEX_LIBRARIES_ALLOW", t.sources.plex.libraries_allow),
-                libraries_block: env_or_list("PLEX_LIBRARIES_BLOCK", t.sources.plex.libraries_block),
+                libraries_allow: env_or_list(
+                    "PLEX_LIBRARIES_ALLOW",
+                    t.sources.plex.libraries_allow,
+                ),
+                libraries_block: env_or_list(
+                    "PLEX_LIBRARIES_BLOCK",
+                    t.sources.plex.libraries_block,
+                ),
             },
         }
     }
@@ -262,21 +292,29 @@ fn env_or(key: &str, default: String) -> String {
 }
 
 fn env_or_parse<T: std::str::FromStr + Copy>(key: &str, default: T) -> T {
-    env::var(key).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+    env::var(key)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
 }
 
 fn env_or_bool(key: &str, default: bool) -> bool {
     match env::var(key) {
-        Ok(val) => { let v = val.to_lowercase(); v == "true" || v == "1" || v == "yes" }
+        Ok(val) => {
+            let v = val.to_lowercase();
+            v == "true" || v == "1" || v == "yes"
+        }
         Err(_) => default,
     }
 }
 
 fn env_or_list(key: &str, default: Vec<String>) -> Vec<String> {
     match env::var(key) {
-        Ok(val) if !val.is_empty() => {
-            val.split(',').map(|s| s.trim().to_lowercase()).filter(|s| !s.is_empty()).collect()
-        }
+        Ok(val) if !val.is_empty() => val
+            .split(',')
+            .map(|s| s.trim().to_lowercase())
+            .filter(|s| !s.is_empty())
+            .collect(),
         _ => default.into_iter().map(|s| s.to_lowercase()).collect(),
     }
 }
