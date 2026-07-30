@@ -11,6 +11,8 @@ pub struct Config {
     pub logging: LoggingConfig,
     pub musicbrainz: MusicBrainzConfig,
     pub listenbrainz_url: String,
+    /// Where the credential-encryption key lives (never inside the database).
+    pub secret_key_path: String,
     pub plex: PlexConfig,
 }
 
@@ -86,9 +88,10 @@ struct TomlServer {
     port: u16,
     host: String,
     trust_proxy: bool,
+    secret_key_path: String,
 }
 impl Default for TomlServer {
-    fn default() -> Self { Self { port: 8080, host: "0.0.0.0".into(), trust_proxy: false } }
+    fn default() -> Self { Self { port: 8080, host: "0.0.0.0".into(), trust_proxy: false, secret_key_path: "./tapedeck.key".into() } }
 }
 
 #[derive(Deserialize)]
@@ -223,6 +226,7 @@ impl Config {
                 dir: env_or("LOG_DIR", t.logging.dir),
             },
             listenbrainz_url: env_or("LISTENBRAINZ_URL", t.listenbrainz.url),
+            secret_key_path: env_or("TAPEDECK_SECRET_KEY_PATH", t.server.secret_key_path),
             musicbrainz: MusicBrainzConfig {
                 user_agent: env_or("MUSICBRAINZ_USER_AGENT", t.musicbrainz.user_agent),
                 rate_limit_per_second: env_or_parse("MUSICBRAINZ_RATE_LIMIT", t.musicbrainz.rate_limit_per_second),

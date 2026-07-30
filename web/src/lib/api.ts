@@ -178,28 +178,37 @@ export interface NowPlayingState {
 	track?: NowPlayingTrack;
 }
 
-/** Server-wide Plex source config (admin only). The token is never sent back. */
-export interface PlexSettings {
+/**
+ * One of the caller's own polling sources. Credentials are never sent back —
+ * `has_token` is all the UI gets.
+ */
+export interface UserSource {
+	kind: string;
 	enabled: boolean;
 	url: string;
 	has_token: boolean;
-	users_allow: string[];
-	users_block: string[];
-	devices_allow: string[];
-	devices_block: string[];
+	/** The remote account the token resolves to; sessions are filtered to it. */
+	remote_account: string | null;
+	poll_interval_secs: number | null;
 	libraries_allow: string[];
 	libraries_block: string[];
+	devices_allow: string[];
+	devices_block: string[];
+	last_polled_at: number | null;
+	last_error: string | null;
 	updated_at: number;
 }
 
 /** Partial update. Omitting `token` keeps the stored one. */
-export type PlexSettingsUpdate = Partial<Omit<PlexSettings, 'has_token' | 'updated_at'>> & {
-	token?: string;
-};
+export type UserSourceUpdate = Partial<
+	Omit<UserSource, 'kind' | 'has_token' | 'remote_account' | 'last_polled_at' | 'last_error' | 'updated_at'>
+> & { token?: string };
 
-export interface PlexTestResult {
+export interface SourceTestResult {
 	ok: boolean;
 	libraries?: string[];
+	account?: string | null;
+	account_error?: string | null;
 	error?: string;
 }
 
@@ -304,17 +313,21 @@ class TapedeckAPI {
 		return this.get('/api/v1/now-playing');
 	}
 
-	// ── Sources (admin) ──
-	async getPlexSettings(): Promise<PlexSettings> {
-		return this.get('/api/v1/sources/plex');
+	// ── Sources (per user) ──
+	async getSources(): Promise<{ sources: UserSource[]; kinds: string[] }> {
+		return this.get('/api/v1/sources');
 	}
 
-	async putPlexSettings(body: PlexSettingsUpdate): Promise<PlexSettings> {
-		return this.request('PUT', '/api/v1/sources/plex', body);
+	async putSource(kind: string, body: UserSourceUpdate): Promise<UserSource> {
+		return this.request('PUT', `/api/v1/sources/${kind}`, body);
 	}
 
-	async testPlex(body: { url?: string; token?: string }): Promise<PlexTestResult> {
-		return this.post('/api/v1/sources/plex/test', body);
+	async deleteSource(kind: string): Promise<void> {
+		return this.delNoBody(`/api/v1/sources/${kind}`);
+	}
+
+	async testSource(kind: string, body: { url?: string; token?: string }): Promise<SourceTestResult> {
+		return this.post(`/api/v1/sources/${kind}/test`, body);
 	}
 
 	// ── Scrobbles ──

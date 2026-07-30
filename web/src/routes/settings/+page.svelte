@@ -2,10 +2,10 @@
 	import { onMount, onDestroy } from 'svelte';
 	import { api } from '$lib/api';
 	import type { TokenInfo } from '$lib/api';
-	import { formatDateTime } from '$lib/utils';
+	import { formatDateTime, timeAgo } from '$lib/utils';
 	import { theme, setTheme, type ThemeMode } from '$lib/theme';
 	import { showArtwork, setShowArtwork } from '$lib/prefs';
-	import type { Connection, PlexSettings, PlexTestResult } from '$lib/api';
+	import type { Connection, UserSource, SourceTestResult } from '$lib/api';
 
 	const uiVersion = __UI_VERSION__;
 	let backendVersion = '…';
@@ -168,58 +168,54 @@
 		if (svc === 'lastfm' || svc === 'librefm') fmPendingToken[svc as Scrobbler] = '';
 	}
 
-	// ── Plex source (admin only, server-wide) ──
-	let plex: PlexSettings | null = null;
+	// ── Sources (per user) ──
+	// Every user configures their own; nothing here is admin-gated any more.
+	let plex: UserSource | null = null;
 	let plexUrl = '';
 	let plexToken = '';        // blank = keep the stored one; never sent back to us
 	let plexEnabled = false;
-	let plexFilters = {
-		users_allow: '', users_block: '',
-		devices_allow: '', devices_block: '',
-		libraries_allow: '', libraries_block: ''
-	};
+	let plexFilters = { libraries_allow: '', libraries_block: '', devices_allow: '', devices_block: '' };
 	let plexAdvanced = false;
 	let plexBusy = false;
 	let plexMsg = '';
 	let plexError = '';
-	let plexTest: PlexTestResult | null = null;
+	let plexTest: SourceTestResult | null = null;
 
-	function applyPlex(s: PlexSettings) {
+	function applyPlex(s: UserSource | null) {
 		plex = s;
-		plexUrl = s.url;
-		plexEnabled = s.enabled;
+		plexUrl = s?.url ?? '';
+		plexEnabled = s?.enabled ?? false;
 		plexToken = '';
 		plexFilters = {
-			users_allow: s.users_allow.join(', '),
-			users_block: s.users_block.join(', '),
-			devices_allow: s.devices_allow.join(', '),
-			devices_block: s.devices_block.join(', '),
-			libraries_allow: s.libraries_allow.join(', '),
-			libraries_block: s.libraries_block.join(', ')
+			libraries_allow: (s?.libraries_allow ?? []).join(', '),
+			libraries_block: (s?.libraries_block ?? []).join(', '),
+			devices_allow: (s?.devices_allow ?? []).join(', '),
+			devices_block: (s?.devices_block ?? []).join(', ')
 		};
 	}
 
 	const splitList = (s: string) => s.split(',').map((x) => x.trim()).filter(Boolean);
 
-	async function loadPlex() {
-		try { applyPlex(await api.getPlexSettings()); } catch { /* non-admin or unreachable */ }
+	async function loadSources() {
+		try {
+			const r = await api.getSources();
+			applyPlex(r.sources.find((s) => s.kind === 'plex') ?? null);
+		} catch { /* leave the form empty */ }
 	}
 
 	async function savePlex() {
 		plexBusy = true; plexError = ''; plexMsg = ''; plexTest = null;
 		try {
-			applyPlex(await api.putPlexSettings({
+			applyPlex(await api.putSource('plex', {
 				enabled: plexEnabled,
 				url: plexUrl.trim(),
 				...(plexToken.trim() ? { token: plexToken.trim() } : {}),
-				users_allow: splitList(plexFilters.users_allow),
-				users_block: splitList(plexFilters.users_block),
-				devices_allow: splitList(plexFilters.devices_allow),
-				devices_block: splitList(plexFilters.devices_block),
 				libraries_allow: splitList(plexFilters.libraries_allow),
-				libraries_block: splitList(plexFilters.libraries_block)
+				libraries_block: splitList(plexFilters.libraries_block),
+				devices_allow: splitList(plexFilters.devices_allow),
+				devices_block: splitList(plexFilters.devices_block)
 			}));
-			plexMsg = 'Saved — the poll engine picks this up within a few seconds.';
+			plexMsg = 'Saved — polling starts within a few seconds.';
 		} catch (e) {
 			plexError = String(e).replace(/^API \d+: /, '');
 		}
@@ -229,10 +225,22 @@
 	async function testPlex() {
 		plexBusy = true; plexError = ''; plexMsg = ''; plexTest = null;
 		try {
-			plexTest = await api.testPlex({
+			plexTest = await api.testSource('plex', {
 				url: plexUrl.trim(),
 				...(plexToken.trim() ? { token: plexToken.trim() } : {})
 			});
+		} catch (e) {
+			plexError = String(e).replace(/^API \d+: /, '');
+		}
+		plexBusy = false;
+	}
+
+	async function disconnectPlex() {
+		plexBusy = true; plexError = ''; plexMsg = ''; plexTest = null;
+		try {
+			await api.deleteSource('plex');
+			applyPlex(null);
+			plexMsg = 'Disconnected.';
 		} catch (e) {
 			plexError = String(e).replace(/^API \d+: /, '');
 		}
@@ -257,7 +265,7 @@
 			timezone = (prefs.timezone as string) || Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC';
 		} catch { timezone = 'UTC'; }
 		try { isAdmin = (await api.me()).is_admin; } catch { /* optional */ }
-		if (isAdmin) loadPlex();
+		loadSources();
 		loadArtStatus();
 		loadConnections();
 		loadLangStatus();
@@ -497,82 +505,165 @@
 	{/each}
 </div>
 
-<!-- Plex source — admin only, and server-wide rather than per-user -->
-{#if isAdmin && plex}
-	<div class="panel" style="border-radius:22px;padding:24px;margin-bottom:18px;">
-		<h3 class="h-display" style="font-size:19px;margin-bottom:4px;">Plex</h3>
-		<p style="font-size:13px;color:var(--td-muted);margin:0 0 16px;">
-			Where listens come <em>from</em>. Tapedeck polls this server and records what everyone plays,
-			matching each Plex account to a Tapedeck user by name. This is instance-wide, not per-account —
-			only admins can change it, and it applies without a restart.
-		</p>
+<!-- Sources: where this user's listens come *from*. Per user, not per server. -->
+<div class="panel" style="border-radius:22px;padding:24px;margin-bottom:18px;">
+	<h3 class="h-display" style="font-size:19px;margin-bottom:4px;">Plex</h3>
+	<p style="font-size:13px;color:var(--td-muted);margin:0 0 16px;">
+		Where <em>your</em> listens come from. Paste your own Plex token — Tapedeck works out which
+		Plex account it belongs to and only records that account's playback, so nobody else on the
+		server ends up in your history.
+	</p>
 
-		{#if plexError}<div style="font-size:13px;color:#b2622d;margin-bottom:12px;">{plexError}</div>{/if}
+	{#if plexError}<div style="font-size:13px;color:#b2622d;margin-bottom:12px;">{plexError}</div>{/if}
 
-		<div style="display:flex;align-items:center;gap:12px;padding:4px 0 14px;">
-			<label style="display:flex;align-items:center;gap:10px;cursor:pointer;font-size:14px;">
-				<input type="checkbox" bind:checked={plexEnabled} style="width:16px;height:16px;accent-color:var(--td-accent);cursor:pointer;">
-				Poll this Plex server
-			</label>
-			{#if plex.enabled && plex.url}
-				<span class="tag tag-accent-2" style="font-size:11px;">active</span>
-			{/if}
-		</div>
-
-		<div style="display:flex;gap:12px;flex-wrap:wrap;">
-			<div class="field" style="flex:2;min-width:240px;">
-				<label for="plex-url">Server URL</label>
-				<input id="plex-url" class="input" bind:value={plexUrl} placeholder="http://192.168.1.10:32400">
-			</div>
-			<div class="field" style="flex:1;min-width:200px;">
-				<label for="plex-token">
-					X-Plex-Token {#if plex.has_token}<span style="color:var(--td-good-fg);">· stored</span>{/if}
-				</label>
-				<input id="plex-token" class="input" type="password" bind:value={plexToken}
-					placeholder={plex.has_token ? 'Leave blank to keep' : 'Paste your token'}>
-			</div>
-		</div>
-
-		<button class="btn btn-ghost" style="margin-top:12px;font-size:13px;" on:click={() => (plexAdvanced = !plexAdvanced)}>
-			{plexAdvanced ? '− Hide' : '+ Show'} filters
-		</button>
-
-		{#if plexAdvanced}
-			<p style="font-size:12.5px;color:var(--td-muted-2);margin:8px 0 12px;">
-				Comma-separated. Leave a list empty to allow everything; a block list always wins over an allow list.
-			</p>
-			<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px;">
-				<div class="field"><label for="pf-ua">Users — allow</label><input id="pf-ua" class="input" bind:value={plexFilters.users_allow} placeholder="ashwin, partner"></div>
-				<div class="field"><label for="pf-ub">Users — block</label><input id="pf-ub" class="input" bind:value={plexFilters.users_block} placeholder="guest"></div>
-				<div class="field"><label for="pf-da">Devices — allow</label><input id="pf-da" class="input" bind:value={plexFilters.devices_allow} placeholder="Living Room"></div>
-				<div class="field"><label for="pf-db">Devices — block</label><input id="pf-db" class="input" bind:value={plexFilters.devices_block} placeholder="Chrome"></div>
-				<div class="field"><label for="pf-la">Libraries — allow</label><input id="pf-la" class="input" bind:value={plexFilters.libraries_allow} placeholder="Music"></div>
-				<div class="field"><label for="pf-lb">Libraries — block</label><input id="pf-lb" class="input" bind:value={plexFilters.libraries_block} placeholder="Podcasts"></div>
-			</div>
+	<div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;padding:4px 0 14px;">
+		<label style="display:flex;align-items:center;gap:10px;cursor:pointer;font-size:14px;">
+			<input type="checkbox" bind:checked={plexEnabled} style="width:16px;height:16px;accent-color:var(--td-accent);cursor:pointer;">
+			Poll my Plex
+		</label>
+		{#if plex?.remote_account}
+			<span class="tag tag-accent-2" style="font-size:11px;">{plex.remote_account}</span>
 		{/if}
-
-		<div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-top:16px;">
-			<button class="btn btn-primary" on:click={savePlex} disabled={plexBusy}>{plexBusy ? '…' : 'Save'}</button>
-			<button class="btn btn-secondary" on:click={testPlex} disabled={plexBusy}>Test connection</button>
-			{#if plexMsg}
-				<span style="font-size:13px;color:var(--td-good-fg);">✓ {plexMsg}</span>
-			{/if}
-		</div>
-
-		{#if plexTest}
-			<div style="margin-top:14px;font-size:13px;">
-				{#if plexTest.ok}
-					<span style="color:var(--td-good-fg);">✓ Connected.</span>
-					<span style="color:var(--td-muted);">
-						{plexTest.libraries?.length ? `Libraries: ${plexTest.libraries.join(', ')}` : 'No libraries reported.'}
-					</span>
-				{:else}
-					<span style="color:#b2622d;">✗ {plexTest.error}</span>
-				{/if}
-			</div>
+		{#if plex?.last_error}
+			<span class="tag tag-outline" style="font-size:11px;color:#b2622d;">last poll failed</span>
+		{:else if plex?.last_polled_at}
+			<span style="font-size:12px;color:var(--td-muted-3);">polled {timeAgo(plex.last_polled_at)}</span>
 		{/if}
 	</div>
+
+	<div style="display:flex;gap:12px;flex-wrap:wrap;">
+		<div class="field" style="flex:2;min-width:240px;">
+			<label for="plex-url">Server URL</label>
+			<input id="plex-url" class="input" bind:value={plexUrl} placeholder="http://192.168.1.10:32400">
+		</div>
+		<div class="field" style="flex:1;min-width:200px;">
+			<label for="plex-token">
+				X-Plex-Token {#if plex?.has_token}<span style="color:var(--td-good-fg);">· stored</span>{/if}
+			</label>
+			<input id="plex-token" class="input" type="password" bind:value={plexToken}
+				placeholder={plex?.has_token ? 'Leave blank to keep' : 'Paste your token'}>
+		</div>
+	</div>
+
+	{#if plex?.last_error}
+		<p style="font-size:12.5px;color:#b2622d;margin:10px 0 0;font-family:monospace;word-break:break-word;">
+			{plex.last_error}
+		</p>
+	{/if}
+
+	<button class="btn btn-ghost" style="margin-top:12px;font-size:13px;" on:click={() => (plexAdvanced = !plexAdvanced)}>
+		{plexAdvanced ? '− Hide' : '+ Show'} filters
+	</button>
+
+	{#if plexAdvanced}
+		<p style="font-size:12.5px;color:var(--td-muted-2);margin:8px 0 12px;">
+			Comma-separated. Leave a list empty to allow everything; a block list always wins over an
+			allow list. Blocking your Podcasts and Audiobooks libraries is the usual reason to touch this.
+		</p>
+		<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px;">
+			<div class="field"><label for="pf-la">Libraries — allow</label><input id="pf-la" class="input" bind:value={plexFilters.libraries_allow} placeholder="Music"></div>
+			<div class="field"><label for="pf-lb">Libraries — block</label><input id="pf-lb" class="input" bind:value={plexFilters.libraries_block} placeholder="Podcasts, Audiobooks"></div>
+			<div class="field"><label for="pf-da">Devices — allow</label><input id="pf-da" class="input" bind:value={plexFilters.devices_allow} placeholder="Living Room"></div>
+			<div class="field"><label for="pf-db">Devices — block</label><input id="pf-db" class="input" bind:value={plexFilters.devices_block} placeholder="Chrome"></div>
+		</div>
+	{/if}
+
+	<div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-top:16px;">
+		<button class="btn btn-primary" on:click={savePlex} disabled={plexBusy}>{plexBusy ? '…' : 'Save'}</button>
+		<button class="btn btn-secondary" on:click={testPlex} disabled={plexBusy}>Test connection</button>
+		{#if plex}
+			<button class="btn btn-secondary" style="color:#b2622d;" on:click={disconnectPlex} disabled={plexBusy}>Disconnect</button>
+		{/if}
+		{#if plexMsg}
+			<span style="font-size:13px;color:var(--td-good-fg);">✓ {plexMsg}</span>
+		{/if}
+	</div>
+
+	{#if plexTest}
+		<div style="margin-top:14px;font-size:13px;">
+			{#if plexTest.ok}
+				<span style="color:var(--td-good-fg);">✓ Reached the server.</span>
+				<span style="color:var(--td-muted);">
+					{plexTest.libraries?.length ? `Libraries: ${plexTest.libraries.join(', ')}` : 'No libraries reported.'}
+				</span>
+				<div style="margin-top:6px;">
+					{#if plexTest.account}
+						<span style="color:var(--td-good-fg);">✓ Token belongs to {plexTest.account}</span>
+					{:else}
+						<span style="color:#b2622d;">✗ Could not identify the account: {plexTest.account_error}</span>
+					{/if}
+				</div>
+			{:else}
+				<span style="color:#b2622d;">✗ {plexTest.error}</span>
+			{/if}
+		</div>
+	{/if}
+</div>
+
+<!-- Language enrichment (admin) -->
+{#if isAdmin}
+	<div class="panel" style="border-radius:22px;padding:24px;margin-bottom:18px;">
+		<h3 class="h-display" style="font-size:19px;margin-bottom:4px;">Language Enrichment</h3>
+		<p style="font-size:13px;color:var(--td-muted);margin:0 0 16px;">Classify listens by language for the Analytics breakdown — instant for non-Latin scripts, MusicBrainz (rate-limited) for the rest. Runs automatically in the background; use this to fill the backlog now.</p>
+		<div style="display:flex;align-items:center;gap:14px;flex-wrap:wrap;">
+			<button class="btn btn-primary" on:click={runEnrichment} disabled={enriching}>{enriching ? 'Enriching…' : 'Enrich languages'}</button>
+			{#if langStatus}
+				<span style="font-size:13.5px;color:var(--td-muted);">{langStatus.resolved} / {langStatus.total} classified{langStatus.pending ? ` · ${langStatus.pending} pending` : ''}</span>
+			{/if}
+		</div>
+	</div>
 {/if}
+
+<!-- Connections -->
+<div class="panel" style="border-radius:22px;padding:24px;margin-bottom:18px;">
+	<h3 class="h-display" style="font-size:19px;margin-bottom:4px;">Scrobble Connections</h3>
+	<p style="font-size:13px;color:var(--td-muted);margin:0 0 16px;">Forward <em>your</em> listens to your own accounts. Nothing is shared across users, and a service you don't connect simply isn't forwarded to — listens are always kept locally either way.</p>
+
+	{#if connError}<div style="font-size:13px;color:#b2622d;margin-bottom:12px;">{connError}</div>{/if}
+
+	<!-- ListenBrainz -->
+	<div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;padding:12px 0;border-bottom:1px solid var(--td-border);">
+		<div style="flex:1;min-width:160px;">
+			<div style="font-weight:600;font-size:14px;">ListenBrainz</div>
+			{#if conn('listenbrainz')}
+				<div style="font-size:12.5px;color:var(--td-good-fg);">Connected{conn('listenbrainz')?.username ? ` as ${conn('listenbrainz')?.username}` : ''}</div>
+			{:else}
+				<div style="font-size:12.5px;color:var(--td-muted-2);">Paste your user token from listenbrainz.org → Settings.</div>
+			{/if}
+		</div>
+		{#if conn('listenbrainz')}
+			<button class="btn btn-secondary" style="color:#b2622d;" on:click={() => disconnectSvc('listenbrainz')}>Disconnect</button>
+		{:else}
+			<input class="input" style="width:220px;" type="password" bind:value={lbToken} placeholder="ListenBrainz token">
+			<button class="btn btn-primary" on:click={connectLB} disabled={lbBusy || !lbToken.trim()}>{lbBusy ? '…' : 'Connect'}</button>
+		{/if}
+	</div>
+
+	<!-- Last.fm and Libre.fm: same approve-then-finish flow -->
+	{#each [{ id: 'lastfm', label: 'Last.fm' }, { id: 'librefm', label: 'Libre.fm' }] as svc, i}
+		{@const key = svc.id as 'lastfm' | 'librefm'}
+		<div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;padding:12px 0;{i === 0 ? 'border-bottom:1px solid var(--td-border);' : ''}">
+			<div style="flex:1;min-width:160px;">
+				<div style="font-weight:600;font-size:14px;">{svc.label}</div>
+				{#if conn(key)}
+					<div style="font-size:12.5px;color:var(--td-good-fg);">Connected{conn(key)?.username ? ` as ${conn(key)?.username}` : ''}</div>
+				{:else if fmPendingToken[key]}
+					<div style="font-size:12.5px;color:var(--td-accent);">Approve Tapedeck in the {svc.label} tab, then click “Finish”.</div>
+				{:else}
+					<div style="font-size:12.5px;color:var(--td-muted-2);">Click Connect, approve on {svc.label}, then finish.</div>
+				{/if}
+			</div>
+			{#if conn(key)}
+				<button class="btn btn-secondary" style="color:#b2622d;" on:click={() => disconnectSvc(key)}>Disconnect</button>
+			{:else}
+				<button class="btn btn-primary" on:click={() => scrobblerConnect(key)} disabled={fmBusy !== null}>
+					{fmBusy === key ? '…' : fmPendingToken[key] ? 'Finish connecting' : `Connect ${svc.label}`}
+				</button>
+				{#if fmPendingToken[key]}<button class="btn btn-secondary" on:click={() => (fmPendingToken[key] = '')}>Cancel</button>{/if}
+			{/if}
+		</div>
+	{/each}
+</div>
 
 <!-- API Tokens -->
 <div class="panel" style="border-radius:22px;padding:24px;margin-bottom:18px;">

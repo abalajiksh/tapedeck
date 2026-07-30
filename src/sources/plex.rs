@@ -417,6 +417,59 @@ impl PlexSource {
         Ok(())
     }
 
+    /// Which Plex account a token belongs to.
+    ///
+    /// This is what makes per-user Plex possible: a Tapedeck user supplies their
+    /// *own* token, we resolve it to a Plex username, and only that account's
+    /// sessions become their listens. Without it we'd be back to polling every
+    /// session on the server and guessing owners by name.
+    ///
+    /// Asks plex.tv rather than the media server, because the server reports who
+    /// is *playing*, not who a token belongs to. That means this needs outbound
+    /// internet access even for a LAN-only Plex — callers should treat failure as
+    /// "ask the user to type their Plex username" rather than fatal.
+    pub async fn resolve_account(url: &str, token: &str) -> Result<String, Box<dyn std::error::Error>> {
+        #[derive(Deserialize)]
+        struct PlexTvUser {
+            username: Option<String>,
+            title: Option<String>,
+            email: Option<String>,
+        }
+
+        let client = Client::builder()
+            .timeout(Duration::from_secs(10))
+            .user_agent(format!("{}/{}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION")))
+            .build()?;
+
+        let resp = client
+            .get("https://plex.tv/api/v2/user")
+            .header("X-Plex-Token", token)
+            .header("Accept", "application/json")
+            .header("X-Plex-Product", env!("CARGO_PKG_NAME"))
+            .header("X-Plex-Client-Identifier", format!("tapedeck-{}", env!("CARGO_PKG_VERSION")))
+            .send().await?;
+
+        if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
+            return Err("Plex rejected that token".into());
+        }
+        if !resp.status().is_success() {
+            return Err(format!("plex.tv returned {}", resp.status()).into());
+        }
+
+        let user: PlexTvUser = resp.json().await?;
+        // Prefer the stable username; `title` is the display name shown in
+        // sessions, which is what we actually match against, so it's the better
+        // fallback than email.
+        user.username
+            .or(user.title)
+            .or(user.email)
+            .filter(|s| !s.trim().is_empty())
+            .ok_or_else(|| {
+                let _ = url; // server URL unused here; kept for call-site symmetry
+                "plex.tv did not report an account name for that token".into()
+            })
+    }
+
     /// Library titles discovered by `initialize`. Used by the settings UI to
     /// show what a URL/token pair can actually see.
     pub fn library_names(&self) -> Vec<String> {

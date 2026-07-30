@@ -1,8 +1,10 @@
 use sqlx::{sqlite::{SqlitePoolOptions, SqliteConnectOptions, SqliteJournalMode, SqliteSynchronous}, Pool, Sqlite, FromRow};
 use std::str::FromStr;
+use std::sync::Arc;
 use std::time::Duration;
+use crate::crypto::SecretBox;
 use crate::models::*;
-use tracing::{info, debug};
+use tracing::{error, info, debug};
 use sha2::{Sha256, Digest};
 use argon2::{
     password_hash::{rand_core::OsRng, PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
@@ -82,6 +84,76 @@ pub struct ImportHistoryRow {
     pub created_at: i64,
 }
 
+/// A configured source, credentials decrypted. `kind` is `plex` | `navidrome` |
+/// `jellyfin`; `credentials` is a per-kind JSON blob (Plex: `{"token":…}`).
+#[derive(Debug, Clone)]
+pub struct UserSource {
+    pub id: i64,
+    pub user_id: i64,
+    pub kind: String,
+    pub enabled: bool,
+    pub url: String,
+    pub credentials: String,
+    /// The remote account the credentials resolve to — for Plex this is the Plex
+    /// username, used to keep other people's sessions out of this user's history.
+    pub remote_account: Option<String>,
+    pub poll_interval_secs: Option<i64>,
+    /// Per-source options as JSON — currently the library/device allow and block
+    /// lists. A JSON blob rather than columns so a new source kind can carry its
+    /// own knobs without a migration.
+    pub options: String,
+    pub last_polled_at: Option<i64>,
+    pub last_error: Option<String>,
+    pub updated_at: i64,
+}
+
+impl UserSource {
+    /// A comma-or-array option read as a lowercased list, which is the shape
+    /// `PlexFilters` matches against.
+    pub fn option_list(&self, key: &str) -> Vec<String> {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(&self.options) else { return Vec::new() };
+        match v.get(key) {
+            Some(serde_json::Value::Array(items)) => items.iter()
+                .filter_map(|i| i.as_str())
+                .map(|s| s.trim().to_lowercase())
+                .filter(|s| !s.is_empty())
+                .collect(),
+            Some(serde_json::Value::String(s)) => s.split(',')
+                .map(|p| p.trim().to_lowercase())
+                .filter(|p| !p.is_empty())
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// Pull a field out of the credential blob.
+    pub fn credential(&self, key: &str) -> Option<String> {
+        serde_json::from_str::<serde_json::Value>(&self.credentials).ok()?
+            .get(key)?.as_str().map(str::to_string)
+    }
+
+    pub fn is_usable(&self) -> bool {
+        self.enabled && !self.url.trim().is_empty() && !self.credentials.trim().is_empty()
+    }
+}
+
+/// Raw row, credentials still sealed. Never leaves `db.rs`.
+#[derive(FromRow)]
+struct UserSourceRow {
+    id: i64,
+    user_id: i64,
+    kind: String,
+    enabled: bool,
+    url: String,
+    credentials: String,
+    remote_account: Option<String>,
+    poll_interval_secs: Option<i64>,
+    options: String,
+    last_polled_at: Option<i64>,
+    last_error: Option<String>,
+    updated_at: i64,
+}
+
 /// Server-wide Plex source config. The list fields are comma-separated so the
 /// row stays a flat, hand-editable shape like the rest of the schema.
 #[derive(Debug, Clone, Default, FromRow)]
@@ -112,10 +184,13 @@ impl PlexSettings {
 
 pub struct Database {
     pool: Pool<Sqlite>,
+    /// Encrypts the credential blobs Tapedeck must keep replayable. Held here so
+    /// ciphertext never escapes this module — callers pass and receive plaintext.
+    secrets: Arc<SecretBox>,
 }
 
 impl Database {
-    pub async fn new(database_url: &str) -> Result<Self, sqlx::Error> {
+    pub async fn new(database_url: &str, secrets: Arc<SecretBox>) -> Result<Self, sqlx::Error> {
         // WAL + a busy_timeout let concurrent writers (poll engine, HTTP
         // handlers, background imports) wait for the lock instead of erroring
         // out with SQLITE_BUSY — which would otherwise drop listens on ingest.
@@ -128,9 +203,10 @@ impl Database {
         let pool = SqlitePoolOptions::new()
             .max_connections(5)
             .connect_with(options).await?;
-        let db = Self { pool };
+        let db = Self { pool, secrets };
         db.init().await?;
         db.migrate().await?;
+        db.encrypt_legacy_credentials().await?;
         Ok(db)
     }
 
@@ -297,6 +373,27 @@ impl Database {
             )"
         ).execute(&self.pool).await?;
 
+        // One row per user per source kind. Replaces the single-row
+        // `plex_settings`: a source belongs to the person whose account it
+        // reads, so nobody's token can see anybody else's listening.
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS user_sources (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL REFERENCES users(id),
+                kind TEXT NOT NULL,
+                enabled INTEGER NOT NULL DEFAULT 1,
+                url TEXT NOT NULL DEFAULT '',
+                credentials TEXT NOT NULL DEFAULT '',
+                remote_account TEXT,
+                poll_interval_secs INTEGER,
+                options TEXT NOT NULL DEFAULT '{}',
+                last_polled_at INTEGER,
+                last_error TEXT,
+                updated_at INTEGER NOT NULL DEFAULT 0,
+                UNIQUE(user_id, kind)
+            )"
+        ).execute(&self.pool).await?;
+
         // Plex is a single server-wide source, not a per-user connection, so
         // this is deliberately a one-row table (the CHECK enforces it).
         sqlx::query(
@@ -398,6 +495,15 @@ impl Database {
         if !has_column(&self.pool, "scrobbles", "language").await {
             info!("⚙️ Migrating: adding scrobbles.language...");
             let _ = sqlx::query("ALTER TABLE scrobbles ADD COLUMN language TEXT")
+                .execute(&self.pool).await;
+        }
+
+        // Migration: per-source options (library/device filters). `user_sources`
+        // is young enough that few databases will need this, but the table was
+        // shipped without the column for one build.
+        if !has_column(&self.pool, "user_sources", "options").await {
+            info!("⚙️ Migrating: adding user_sources.options...");
+            let _ = sqlx::query("ALTER TABLE user_sources ADD COLUMN options TEXT NOT NULL DEFAULT '{}'")
                 .execute(&self.pool).await;
         }
 
@@ -1237,8 +1343,10 @@ impl Database {
                 credentials = excluded.credentials,
                 connected_username = excluded.connected_username,
                 connected_at = excluded.connected_at"
-        ).bind(user_id).bind(service).bind(credentials).bind(username).bind(Self::now_secs())
-         .execute(&self.pool).await?;
+        )
+        .bind(user_id).bind(service)
+        .bind(self.seal(credentials)).bind(username).bind(Self::now_secs())
+        .execute(&self.pool).await?;
         Ok(())
     }
 
@@ -1256,12 +1364,179 @@ impl Database {
 
     /// Credentials for the engine to build this user's sinks. `(service, credentials_json)`.
     pub async fn get_connections_for_forwarding(&self, user_id: i64) -> Result<Vec<(String, String)>, sqlx::Error> {
-        sqlx::query_as("SELECT service, credentials FROM user_connections WHERE user_id = ?")
-            .bind(user_id).fetch_all(&self.pool).await
+        let rows: Vec<(String, String)> = sqlx::query_as(
+            "SELECT service, credentials FROM user_connections WHERE user_id = ?"
+        ).bind(user_id).fetch_all(&self.pool).await?;
+        // A row we can't decrypt is skipped rather than fatal: one bad credential
+        // shouldn't stop the user's other services from receiving listens.
+        Ok(rows.into_iter().filter_map(|(service, blob)| {
+            match self.secrets.decrypt(&blob) {
+                Ok(plain) => Some((service, plain)),
+                Err(e) => { error!("Undecryptable {} credential for user {}: {}", service, user_id, e); None }
+            }
+        }).collect())
+    }
+
+    /// Wrap a credential for storage. Encryption failure is not silently
+    /// tolerated — storing plaintext because the cipher errored would defeat the
+    /// point, so the row keeps whatever it had and the caller sees the error via
+    /// the write failing.
+    fn seal(&self, plaintext: &str) -> String {
+        match self.secrets.encrypt(plaintext) {
+            Ok(sealed) => sealed,
+            Err(e) => {
+                error!("Credential encryption failed: {} — refusing to store plaintext", e);
+                String::new()
+            }
+        }
+    }
+
+    fn unseal(&self, stored: &str) -> Option<String> {
+        match self.secrets.decrypt(stored) {
+            Ok(plain) => Some(plain),
+            Err(e) => { error!("Could not decrypt stored credential: {}", e); None }
+        }
+    }
+
+    /// One-time upgrade for rows written before encryption existed. Idempotent —
+    /// already-encrypted values carry a prefix and are skipped, so this is safe
+    /// to run on every boot.
+    async fn encrypt_legacy_credentials(&self) -> Result<(), sqlx::Error> {
+        let rows: Vec<(i64, String, String)> = sqlx::query_as(
+            "SELECT user_id, service, credentials FROM user_connections"
+        ).fetch_all(&self.pool).await?;
+
+        let mut upgraded = 0;
+        for (user_id, service, blob) in rows {
+            if SecretBox::is_encrypted(&blob) || blob.is_empty() { continue; }
+            let sealed = self.seal(&blob);
+            if sealed.is_empty() { continue; }
+            sqlx::query("UPDATE user_connections SET credentials = ? WHERE user_id = ? AND service = ?")
+                .bind(sealed).bind(user_id).bind(&service)
+                .execute(&self.pool).await?;
+            upgraded += 1;
+        }
+        if upgraded > 0 {
+            info!("🔐 Encrypted {} stored credential(s) at rest", upgraded);
+        }
+        Ok(())
+    }
+
+    /// Lowest-numbered admin — the migration target for config that used to be
+    /// instance-wide and now needs an owner.
+    pub async fn first_admin_id(&self) -> Result<Option<i64>, sqlx::Error> {
+        let row: Option<(i64,)> = sqlx::query_as(
+            "SELECT id FROM users WHERE role = 'admin' AND disabled = 0 ORDER BY id LIMIT 1"
+        ).fetch_optional(&self.pool).await?;
+        Ok(row.map(|r| r.0))
     }
 
     // ════════════════════════════════════════════════════════════
-    //  Plex source settings (server-wide, one row)
+    //  Per-user sources
+    // ════════════════════════════════════════════════════════════
+
+    /// Every enabled source across all users — what the engine reconciles its
+    /// registry against each tick. Credentials come back decrypted; a row we
+    /// can't decrypt is dropped rather than failing the whole tick.
+    pub async fn list_enabled_sources(&self) -> Result<Vec<UserSource>, sqlx::Error> {
+        let rows: Vec<UserSourceRow> = sqlx::query_as(
+            "SELECT id, user_id, kind, enabled, url, credentials, remote_account,
+                    poll_interval_secs, options, last_polled_at, last_error, updated_at
+             FROM user_sources WHERE enabled = 1 ORDER BY user_id, kind"
+        ).fetch_all(&self.pool).await?;
+        Ok(rows.into_iter().filter_map(|r| self.hydrate_source(r)).collect())
+    }
+
+    /// This user's sources, for the Settings screen. Credentials are decrypted
+    /// here too — the handler decides what is safe to send to the browser.
+    pub async fn list_sources_for_user(&self, user_id: i64) -> Result<Vec<UserSource>, sqlx::Error> {
+        let rows: Vec<UserSourceRow> = sqlx::query_as(
+            "SELECT id, user_id, kind, enabled, url, credentials, remote_account,
+                    poll_interval_secs, options, last_polled_at, last_error, updated_at
+             FROM user_sources WHERE user_id = ? ORDER BY kind"
+        ).bind(user_id).fetch_all(&self.pool).await?;
+        Ok(rows.into_iter().filter_map(|r| self.hydrate_source(r)).collect())
+    }
+
+    pub async fn get_source(&self, user_id: i64, kind: &str) -> Result<Option<UserSource>, sqlx::Error> {
+        let row: Option<UserSourceRow> = sqlx::query_as(
+            "SELECT id, user_id, kind, enabled, url, credentials, remote_account,
+                    poll_interval_secs, options, last_polled_at, last_error, updated_at
+             FROM user_sources WHERE user_id = ? AND kind = ?"
+        ).bind(user_id).bind(kind).fetch_optional(&self.pool).await?;
+        Ok(row.and_then(|r| self.hydrate_source(r)))
+    }
+
+    fn hydrate_source(&self, row: UserSourceRow) -> Option<UserSource> {
+        let credentials = if row.credentials.is_empty() {
+            String::new()
+        } else {
+            self.unseal(&row.credentials)?
+        };
+        Some(UserSource {
+            id: row.id,
+            user_id: row.user_id,
+            kind: row.kind,
+            enabled: row.enabled,
+            url: row.url,
+            credentials,
+            remote_account: row.remote_account,
+            poll_interval_secs: row.poll_interval_secs,
+            options: row.options,
+            last_polled_at: row.last_polled_at,
+            last_error: row.last_error,
+            updated_at: row.updated_at,
+        })
+    }
+
+    /// Upsert a source. `updated_at` doubles as the change stamp the engine
+    /// watches, so any save causes a rebuild on the next tick.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn save_source(
+        &self, user_id: i64, kind: &str, enabled: bool, url: &str,
+        credentials: &str, remote_account: Option<&str>, poll_interval_secs: Option<i64>,
+        options: &str,
+    ) -> Result<(), sqlx::Error> {
+        let sealed = if credentials.is_empty() { String::new() } else { self.seal(credentials) };
+        sqlx::query(
+            "INSERT INTO user_sources
+                (user_id, kind, enabled, url, credentials, remote_account,
+                 poll_interval_secs, options, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT(user_id, kind) DO UPDATE SET
+                enabled = excluded.enabled,
+                url = excluded.url,
+                credentials = excluded.credentials,
+                remote_account = excluded.remote_account,
+                poll_interval_secs = excluded.poll_interval_secs,
+                options = excluded.options,
+                updated_at = excluded.updated_at"
+        )
+        .bind(user_id).bind(kind).bind(enabled).bind(url)
+        .bind(sealed).bind(remote_account).bind(poll_interval_secs)
+        .bind(options).bind(Self::now_secs())
+        .execute(&self.pool).await?;
+        Ok(())
+    }
+
+    pub async fn delete_source(&self, user_id: i64, kind: &str) -> Result<bool, sqlx::Error> {
+        let res = sqlx::query("DELETE FROM user_sources WHERE user_id = ? AND kind = ?")
+            .bind(user_id).bind(kind).execute(&self.pool).await?;
+        Ok(res.rows_affected() > 0)
+    }
+
+    /// Record the outcome of a poll. Deliberately does *not* touch
+    /// `updated_at` — that would look like a config change and make the engine
+    /// rebuild the source on every tick.
+    pub async fn record_source_poll(&self, id: i64, error: Option<&str>) -> Result<(), sqlx::Error> {
+        sqlx::query("UPDATE user_sources SET last_polled_at = ?, last_error = ? WHERE id = ?")
+            .bind(Self::now_secs()).bind(error).bind(id)
+            .execute(&self.pool).await?;
+        Ok(())
+    }
+
+    // ════════════════════════════════════════════════════════════
+    //  Plex source settings (legacy server-wide row, migrated away)
     // ════════════════════════════════════════════════════════════
 
     /// The stored Plex config, or `None` before first-run seeding.
@@ -1646,7 +1921,10 @@ mod tests {
         for suffix in ["", "-wal", "-shm"] {
             let _ = std::fs::remove_file(format!("{}{}", path.display(), suffix));
         }
-        Database::new(&format!("sqlite:{}", path.display())).await.unwrap()
+        Database::new(
+            &format!("sqlite:{}", path.display()),
+            Arc::new(SecretBox::test_key()),
+        ).await.unwrap()
     }
 
     fn play(title: &str, artist: &str, ts: u64) -> Play {
@@ -1808,5 +2086,82 @@ mod tests {
 
         assert!(db.delete_connection(uid, "listenbrainz").await.unwrap());
         assert!(db.list_connections(uid).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn connection_credentials_are_encrypted_at_rest() {
+        let db = testdb().await;
+        let uid = db.create_user("frank", None, "x", "user").await.unwrap();
+        db.set_connection(uid, "listenbrainz", r#"{"token":"PLAINTEXT_MARKER"}"#, None).await.unwrap();
+
+        // The raw column must not contain the secret — a leaked backup is the
+        // whole threat this defends against.
+        let raw: (String,) = sqlx::query_as("SELECT credentials FROM user_connections WHERE user_id = ?")
+            .bind(uid).fetch_one(&db.pool).await.unwrap();
+        assert!(!raw.0.contains("PLAINTEXT_MARKER"), "credential stored in the clear: {}", raw.0);
+        assert!(SecretBox::is_encrypted(&raw.0));
+
+        // …while the forwarding path still gets usable plaintext back.
+        let fwd = db.get_connections_for_forwarding(uid).await.unwrap();
+        assert_eq!(fwd, vec![("listenbrainz".to_string(), r#"{"token":"PLAINTEXT_MARKER"}"#.to_string())]);
+    }
+
+    #[tokio::test]
+    async fn source_credentials_round_trip_and_stay_sealed() {
+        let db = testdb().await;
+        let uid = db.create_user("grace", None, "x", "user").await.unwrap();
+        db.save_source(uid, "plex", true, "http://plex.local:32400",
+            r#"{"token":"PLEX_SECRET"}"#, Some("grace_plex"), None, "{}").await.unwrap();
+
+        let raw: (String,) = sqlx::query_as("SELECT credentials FROM user_sources WHERE user_id = ?")
+            .bind(uid).fetch_one(&db.pool).await.unwrap();
+        assert!(!raw.0.contains("PLEX_SECRET"));
+
+        let src = db.get_source(uid, "plex").await.unwrap().unwrap();
+        assert_eq!(src.credential("token").as_deref(), Some("PLEX_SECRET"));
+        assert_eq!(src.remote_account.as_deref(), Some("grace_plex"));
+        assert!(src.is_usable());
+    }
+
+    #[tokio::test]
+    async fn sources_are_scoped_per_user() {
+        let db = testdb().await;
+        let a = db.create_user("heidi", None, "x", "user").await.unwrap();
+        let b = db.create_user("ivan", None, "x", "user").await.unwrap();
+        db.save_source(a, "plex", true, "http://a", r#"{"token":"ta"}"#, Some("heidi_plex"), None, "{}").await.unwrap();
+        db.save_source(b, "plex", true, "http://b", r#"{"token":"tb"}"#, Some("ivan_plex"), None, "{}").await.unwrap();
+
+        // Each user sees only their own row…
+        assert_eq!(db.list_sources_for_user(a).await.unwrap().len(), 1);
+        assert_eq!(db.get_source(a, "plex").await.unwrap().unwrap().url, "http://a");
+        assert!(db.get_source(b, "plex").await.unwrap().unwrap().credential("token").as_deref() == Some("tb"));
+
+        // …while the engine sees both, each carrying its owner.
+        let all = db.list_enabled_sources().await.unwrap();
+        assert_eq!(all.len(), 2);
+        assert!(all.iter().any(|s| s.user_id == a && s.remote_account.as_deref() == Some("heidi_plex")));
+        assert!(all.iter().any(|s| s.user_id == b && s.remote_account.as_deref() == Some("ivan_plex")));
+
+        // Disabling drops it from the engine's view but keeps the config.
+        db.save_source(a, "plex", false, "http://a", r#"{"token":"ta"}"#, Some("heidi_plex"), None, "{}").await.unwrap();
+        assert_eq!(db.list_enabled_sources().await.unwrap().len(), 1);
+        assert!(db.get_source(a, "plex").await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn recording_a_poll_does_not_look_like_a_config_change() {
+        let db = testdb().await;
+        let uid = db.create_user("judy", None, "x", "user").await.unwrap();
+        db.save_source(uid, "plex", true, "http://p", r#"{"token":"t"}"#, Some("judy_plex"), None, "{}").await.unwrap();
+        let before = db.get_source(uid, "plex").await.unwrap().unwrap();
+
+        db.record_source_poll(before.id, Some("boom")).await.unwrap();
+        let after = db.get_source(uid, "plex").await.unwrap().unwrap();
+
+        // If a poll bumped updated_at the engine would rebuild the source every
+        // single tick, reconnecting endlessly.
+        assert_eq!(before.updated_at, after.updated_at);
+        assert_eq!(after.last_error.as_deref(), Some("boom"));
+        assert!(after.last_polled_at.is_some());
     }
 }

@@ -140,9 +140,22 @@ Archive artwork references.
 
 ### Plex Integration
 
-Polls Plex history and active sessions directly — no webhooks required, no
-Plex Pass needed. Session tracking with accurate scrobble thresholds
-(50% played or 4 minutes). Now Playing support for ListenBrainz.
+Polls Plex active sessions directly — no webhooks required, no Plex Pass needed.
+Session tracking with accurate scrobble thresholds (50% played or 4 minutes),
+and Now Playing on the dashboard.
+
+**Plex is per user.** Each person connects their *own* Plex token in Settings;
+Tapedeck resolves it to a Plex account and records only that account's playback.
+Nobody's token can see anyone else's listening, and there's no fragile matching
+of Plex display names against Tapedeck usernames. Sources are polled on their own
+schedule and staggered, so several household members don't all hit the server on
+the same tick.
+
+Credentials Tapedeck has to replay — Plex tokens, Last.fm session keys,
+ListenBrainz tokens — are encrypted at rest with a key held outside the database
+(`tapedeck.key`, or `TAPEDECK_SECRET_KEY`). That protects a leaked backup, which
+is a real risk given `GET /api/v1/backup` hands out the whole database; it does
+not protect against host compromise, and isn't claimed to.
 
 ### Web UI (Phase 3)
 
@@ -415,6 +428,9 @@ means session-only.
 
 | Method | Path | Auth | Description |
 |--------|------|------|-------------|
+| GET | `/api/v1/sources` | Auth | The caller's own polling sources |
+| PUT/DELETE | `/api/v1/sources/:kind` | Auth | Configure or remove one |
+| POST | `/api/v1/sources/:kind/test` | Auth | Verify URL + token, report the account |
 | GET | `/api/v1/artwork/status` | Auth | Cover-art coverage for the caller |
 | POST | `/api/v1/artwork/backfill` | Admin | Resolve missing cover art in the background |
 | GET | `/1/validate-token` | Token | LB token check (`{valid, user_name}`) |

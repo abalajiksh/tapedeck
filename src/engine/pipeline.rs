@@ -13,101 +13,164 @@ use crate::sources::{MusicSource, PlexFilters, PlexSource};
 use super::enrichment::enrich_play;
 
 pub struct ScrobbleEngine {
-    sources: Vec<Box<dyn MusicSource>>,
+    /// Live sources, one per (user, kind) row in `user_sources`. Reconciled at
+    /// the top of every tick against the database.
+    sources: Vec<ActiveSource>,
     db: Arc<Database>,
     mb_client: Arc<MusicBrainzClient>,
+    /// How often the tick itself runs. Individual sources are polled on their
+    /// own schedule, which may be slower than this.
     poll_interval: Duration,
-    default_user_id: i64,
     /// ListenBrainz endpoint (self-hosted instances override the default).
     listenbrainz_url: String,
     /// Shared with the HTTP layer so the dashboard deck reflects Plex sessions.
     now_playing: NowPlayingRegistry,
-    /// `plex_settings.updated_at` of the config the current source was built
-    /// from. A newer stamp means an admin edited it and we rebuild.
-    plex_config_stamp: i64,
-    /// Set once we've reported an unreachable Plex, so the per-tick retry
-    /// doesn't repeat the same error every poll interval.
-    plex_unreachable_logged: bool,
+}
+
+/// A built, polling source and the bookkeeping the engine needs around it.
+struct ActiveSource {
+    /// `user_sources.id` — for writing poll outcomes back.
+    row_id: i64,
+    /// The Tapedeck user this source belongs to. Listens from it are *theirs*;
+    /// there is no name-matching and no fallback user any more.
+    user_id: i64,
+    kind: String,
+    /// `updated_at` of the row this was built from; a newer value means rebuild.
+    stamp: i64,
+    source: Box<dyn MusicSource>,
+    /// Staggered so N users × M sources don't all fire on the same tick.
+    next_poll_at: i64,
+    poll_interval: i64,
+    /// Set after reporting a failure, so a source that stays down doesn't fill
+    /// the log at every interval.
+    error_logged: bool,
+}
+
+/// Default per-source cadence. Slower than the tick, because a source that is
+/// idle most of the day doesn't need 4 requests a minute.
+const DEFAULT_SOURCE_INTERVAL_SECS: i64 = 30;
+
+/// `user_sources.kind` → the label the now-playing registry stores. They differ
+/// because the registry's label is user-visible and predates the kind column.
+fn source_label(kind: &str) -> &'static str {
+    match kind {
+        "plex" => "Plex",
+        "navidrome" => "Navidrome",
+        "jellyfin" => "Jellyfin",
+        _ => "unknown",
+    }
+}
+
+fn now_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64
 }
 
 impl ScrobbleEngine {
     pub fn new(
-        sources: Vec<Box<dyn MusicSource>>,
         db: Arc<Database>,
         mb_client: Arc<MusicBrainzClient>,
         now_playing: NowPlayingRegistry,
         listenbrainz_url: String,
     ) -> Self {
         Self {
-            sources, db, mb_client,
+            sources: Vec::new(),
+            db, mb_client,
             poll_interval: Duration::from_secs(15),
-            default_user_id: 1,
             now_playing,
             listenbrainz_url,
-            plex_config_stamp: 0,
-            plex_unreachable_logged: false,
         }
     }
 
-    /// Bring the Plex source in line with the stored settings. Runs every tick,
-    /// so an admin's save applies within one poll interval instead of at the
-    /// next restart — and a server that was unreachable when we first tried
-    /// (still booting, network not up yet) gets picked up when it comes back.
-    async fn reconcile_plex_source(&mut self) {
-        let settings = match self.db.get_plex_settings().await {
-            Ok(Some(s)) => s,
-            Ok(None) => return, // never configured; nothing to reconcile
-            Err(e) => { error!("Failed to read Plex settings: {}", e); return; }
+    /// Bring the live source registry in line with `user_sources`.
+    ///
+    /// Runs at the top of every tick, so a user's save applies within a tick
+    /// instead of at the next restart, and a server that was unreachable when we
+    /// first tried gets picked up when it comes back. One code path for startup
+    /// and for later edits.
+    async fn reconcile_sources(&mut self) {
+        let configured = match self.db.list_enabled_sources().await {
+            Ok(v) => v,
+            Err(e) => { error!("Failed to read user sources: {}", e); return; }
         };
 
-        let config_changed = settings.updated_at != self.plex_config_stamp;
-
-        if config_changed {
-            self.plex_config_stamp = settings.updated_at;
-            self.plex_unreachable_logged = false; // new config: report failures loudly again
-            // Drop the old source either way — a disabled or reconfigured Plex
-            // must not keep polling with stale credentials.
-            self.sources.retain(|s| s.name() != "Plex");
-            self.now_playing.clear_source("Plex");
-        }
-
-        if !settings.is_usable() {
-            if config_changed { info!("⚙️ Plex source disabled"); }
-            return;
-        }
-
-        // Already running on the current config — nothing to do. Otherwise we
-        // either just applied a change or a previous build failed; retry.
-        if self.sources.iter().any(|s| s.name() == "Plex") {
-            return;
-        }
-
-        let filters = PlexFilters {
-            users_allow: crate::db::PlexSettings::list(&settings.users_allow),
-            users_block: crate::db::PlexSettings::list(&settings.users_block),
-            devices_allow: crate::db::PlexSettings::list(&settings.devices_allow),
-            devices_block: crate::db::PlexSettings::list(&settings.devices_block),
-            libraries_allow: crate::db::PlexSettings::list(&settings.libraries_allow),
-            libraries_block: crate::db::PlexSettings::list(&settings.libraries_block),
-        };
-        let mut plex = PlexSource::with_filters(settings.url.clone(), settings.token.clone(), filters);
-        match plex.initialize().await {
-            Ok(()) => {
-                info!("✅ Plex source connected ({})", settings.url);
-                self.plex_unreachable_logged = false;
-                self.sources.push(Box::new(plex));
+        // Drop anything that was disabled, deleted, or reconfigured. A stale
+        // token must stop polling immediately, not linger until the next edit.
+        let live: Vec<(i64, i64)> = configured.iter().map(|c| (c.id, c.updated_at)).collect();
+        self.sources.retain(|active| {
+            let still_current = live.iter().any(|(id, stamp)| *id == active.row_id && *stamp == active.stamp);
+            if !still_current {
+                self.now_playing.clear_user_source(active.user_id, source_label(&active.kind));
+                info!("⚙️ Source {} for user {} stopped (changed or disabled)", active.kind, active.user_id);
             }
-            Err(e) => {
-                // Retried every tick, so log the first failure and then stay
-                // quiet rather than filling the log while a server is down.
-                if !self.plex_unreachable_logged {
-                    error!("❌ Plex unreachable ({}): {} — retrying every {}s",
-                        settings.url, e, self.poll_interval.as_secs());
-                    self.plex_unreachable_logged = true;
-                } else {
-                    debug!("Plex still unreachable: {}", e);
+            still_current
+        });
+
+        for cfg in configured {
+            if self.sources.iter().any(|a| a.row_id == cfg.id) { continue; }
+            if !cfg.is_usable() { continue; }
+
+            match self.build_source(&cfg).await {
+                Ok(source) => {
+                    info!("✅ {} connected for user {} ({})", cfg.kind, cfg.user_id, cfg.url);
+                    let _ = self.db.record_source_poll(cfg.id, None).await;
+                    let interval = cfg.poll_interval_secs
+                        .filter(|s| *s > 0)
+                        .unwrap_or(DEFAULT_SOURCE_INTERVAL_SECS);
+                    self.sources.push(ActiveSource {
+                        row_id: cfg.id,
+                        user_id: cfg.user_id,
+                        kind: cfg.kind.clone(),
+                        stamp: cfg.updated_at,
+                        source,
+                        // Stagger the first poll so several sources coming up at
+                        // once don't all fire on the same tick.
+                        next_poll_at: now_secs() + (self.sources.len() as i64 % interval.max(1)),
+                        poll_interval: interval,
+                        error_logged: false,
+                    });
+                }
+                Err(e) => {
+                    // Not added, so the next tick retries. Record it so the
+                    // Settings screen can show why nothing is arriving.
+                    let msg = e.to_string();
+                    error!("❌ {} unreachable for user {} ({}): {}", cfg.kind, cfg.user_id, cfg.url, msg);
+                    let _ = self.db.record_source_poll(cfg.id, Some(&msg)).await;
                 }
             }
+        }
+    }
+
+    /// Construct and connect one source from its stored config.
+    ///
+    /// For Plex this is where per-user isolation is enforced: the source is
+    /// pinned to the Plex account the user's own token belongs to, so other
+    /// people's sessions on the same server are filtered out rather than
+    /// attributed by guesswork.
+    async fn build_source(&self, cfg: &crate::db::UserSource)
+        -> Result<Box<dyn MusicSource>, Box<dyn std::error::Error>>
+    {
+        match cfg.kind.as_str() {
+            "plex" => {
+                let token = cfg.credential("token").ok_or("no Plex token stored")?;
+                let account = cfg.remote_account.clone()
+                    .ok_or("Plex account not resolved — reconnect the source")?;
+
+                let filters = PlexFilters {
+                    // The allow-list *is* the isolation. Empty would mean
+                    // "everyone on the server", which is what we're moving away from.
+                    users_allow: vec![account.to_lowercase()],
+                    users_block: Vec::new(),
+                    libraries_allow: cfg.option_list("libraries_allow"),
+                    libraries_block: cfg.option_list("libraries_block"),
+                    devices_allow: cfg.option_list("devices_allow"),
+                    devices_block: cfg.option_list("devices_block"),
+                };
+                let mut plex = PlexSource::with_filters(cfg.url.clone(), token, filters);
+                plex.initialize().await?;
+                Ok(Box::new(plex))
+            }
+            other => Err(format!("unknown source kind: {other}").into()),
         }
     }
 
@@ -145,113 +208,116 @@ impl ScrobbleEngine {
     }
 
     pub async fn run_tick(&mut self) {
-        self.reconcile_plex_source().await;
+        self.reconcile_sources().await;
 
-        let mut has_active_now_playing = false;
-
+        let db = self.db.clone();
         let mb_client = self.mb_client.clone();
         let lb_url = self.listenbrainz_url.clone();
-        let db = self.db.clone();
-        let default_user_id = self.default_user_id;
+        let now_playing = self.now_playing.clone();
+        let now = now_secs();
+        let mut has_active_now_playing = false;
 
-        for source in &mut self.sources {
-            if source.name() == "Plex" {
-                if let Some(plex) = source.as_any_mut().downcast_mut::<PlexSource>() {
-                    match plex.fetch_sessions_extended(None).await {
-                        Ok(session_result) => {
-                            if !session_result.now_playing.is_empty() {
-                                has_active_now_playing = true;
-                                info!("🎧 {} active now playing session(s)", session_result.now_playing.len());
-                            }
+        for i in 0..self.sources.len() {
+            if self.sources[i].next_poll_at > now { continue; }
+            self.sources[i].next_poll_at = now + self.sources[i].poll_interval;
 
-                            for plex_track in &session_result.now_playing {
-                                let mut play = plex_track.to_play("np");
-                                enrich_play(&mb_client, &mut play, plex_track.album.as_deref()).await;
+            let (row_id, user_id) = (self.sources[i].row_id, self.sources[i].user_id);
 
-                                // Feed the dashboard deck. Plex reports the real
-                                // playhead, so the UI gets a true position rather
-                                // than counting up from when we first saw it.
-                                let user_id = match &plex_track.plex_user {
-                                    Some(name) => db.get_user_id_by_username(name).await.ok().flatten().unwrap_or(default_user_id),
-                                    None => default_user_id,
-                                };
-                                let progress = plex_track.view_offset.unwrap_or(0) / 1000;
-                                self.now_playing.set(user_id, NowPlaying::from_play(
-                                    &play, "Plex", plex_track.audio_quality.as_ref(), progress,
-                                ));
+            // Plex is the only kind so far; Navidrome and Jellyfin slot in here
+            // with their own arms once their sources exist.
+            let Some(plex) = self.sources[i].source.as_any_mut().downcast_mut::<PlexSource>() else {
+                continue;
+            };
 
-                                // Forward to *that* user's connected accounts.
-                                let user_sinks = sinks::sinks_for_user(&db, user_id, &lb_url).await;
-                                sinks::submit_now_playing(&user_sinks, &play).await;
-                            }
-
-                            if !session_result.ready_to_scrobble.is_empty() {
-                                info!("📀 Processing {} ready-to-scrobble track(s)", session_result.ready_to_scrobble.len());
-
-                                let current_time = std::time::SystemTime::now()
-                                    .duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
-
-                                for plex_track in session_result.ready_to_scrobble {
-                                    let mut play = plex_track.to_play(&format!("scrobble-{}", current_time));
-
-                                    // Map the Plex account to a Tapedeck user by
-                                    // username; fall back to the default user.
-                                    let user_id = match &plex_track.plex_user {
-                                        Some(name) => db.get_user_id_by_username(name).await.ok().flatten().unwrap_or(default_user_id),
-                                        None => default_user_id,
-                                    };
-
-                                    // ── FIX: Check dedup BEFORE enrichment to avoid wasting MB API calls ──
-                                    let already_exists = db.exists(user_id, &play.source_id, &play.source_name).await.unwrap_or(false)
-                                        || db.fuzzy_exists(user_id, &play.title, &play.artist, play.timestamp as i64).await.unwrap_or(false);
-
-                                    if already_exists {
-                                        debug!("Skipping already-scrobbled: {} - {}", play.artist, play.title);
-                                        continue;
-                                    }
-
-                                    // Only enrich new tracks
-                                    enrich_play(&mb_client, &mut play, plex_track.album.as_deref()).await;
-
-                                    // Pass Plex-extracted audio quality if available
-                                    let quality_ref = plex_track.audio_quality.as_ref();
-                                    let quality_log = quality_ref
-                                        .and_then(|q| q.quality_score)
-                                        .map(|s| format!("{:.0}", s))
-                                        .unwrap_or_else(|| "n/a".into());
-
-                                    match db.save_scrobble(
-                                        user_id, &play, quality_ref,
-                                        None, None, None, Some("Plex"),
-                                    ).await {
-                                        Ok(true) => info!("📥 Queued: {} - {} [quality: {}]",
-                                            play.artist, play.title, quality_log),
-                                        Ok(false) => {}
-                                        Err(e) => error!("Database error: {}", e),
-                                    }
-                                }
-                            }
-                        }
-                        Err(e) => error!("Error fetching from Plex: {}", e),
+            let session_result = match plex.fetch_sessions_extended(None).await {
+                Ok(r) => {
+                    if self.sources[i].error_logged {
+                        info!("✅ Plex recovered for user {}", user_id);
+                        self.sources[i].error_logged = false;
                     }
+                    let _ = db.record_source_poll(row_id, None).await;
+                    r
+                }
+                Err(e) => {
+                    // Logged once per outage, then quietly, so a server that is
+                    // off overnight doesn't produce hundreds of identical lines.
+                    let msg = e.to_string();
+                    if !self.sources[i].error_logged {
+                        error!("Error fetching Plex for user {}: {}", user_id, msg);
+                        self.sources[i].error_logged = true;
+                    } else {
+                        debug!("Plex still failing for user {}: {}", user_id, msg);
+                    }
+                    let _ = db.record_source_poll(row_id, Some(&msg)).await;
+                    continue;
+                }
+            };
+
+            if session_result.now_playing.is_empty() {
+                // Authoritative "stopped" for this user's Plex — but only for
+                // Plex, so an ingest client reporting for the same user survives.
+                now_playing.clear_user_source(user_id, "Plex");
+            } else {
+                has_active_now_playing = true;
+                info!("🎧 {} active Plex session(s) for user {}", session_result.now_playing.len(), user_id);
+            }
+
+            for plex_track in &session_result.now_playing {
+                let mut play = plex_track.to_play("np");
+                enrich_play(&mb_client, &mut play, plex_track.album.as_deref()).await;
+
+                // The owning user comes from the source row, not from matching
+                // the Plex account name against Tapedeck usernames.
+                let progress = plex_track.view_offset.unwrap_or(0) / 1000;
+                now_playing.set(user_id, NowPlaying::from_play(
+                    &play, "Plex", plex_track.audio_quality.as_ref(), progress,
+                ));
+
+                let user_sinks = sinks::sinks_for_user(&db, user_id, &lb_url).await;
+                sinks::submit_now_playing(&user_sinks, &play).await;
+            }
+
+            if session_result.ready_to_scrobble.is_empty() { continue; }
+            info!("📀 Processing {} ready-to-scrobble track(s) for user {}",
+                session_result.ready_to_scrobble.len(), user_id);
+
+            let current_time = now_secs() as u64;
+            for plex_track in session_result.ready_to_scrobble {
+                let mut play = plex_track.to_play(&format!("scrobble-{}", current_time));
+
+                // Dedup before enrichment, so a duplicate doesn't cost a
+                // MusicBrainz call.
+                let already_exists = db.exists(user_id, &play.source_id, &play.source_name).await.unwrap_or(false)
+                    || db.fuzzy_exists(user_id, &play.title, &play.artist, play.timestamp as i64).await.unwrap_or(false);
+                if already_exists {
+                    debug!("Skipping already-scrobbled: {} - {}", play.artist, play.title);
+                    continue;
+                }
+
+                enrich_play(&mb_client, &mut play, plex_track.album.as_deref()).await;
+
+                let quality_ref = plex_track.audio_quality.as_ref();
+                let quality_log = quality_ref
+                    .and_then(|q| q.quality_score)
+                    .map(|s| format!("{:.0}", s))
+                    .unwrap_or_else(|| "n/a".into());
+
+                match db.save_scrobble(
+                    user_id, &play, quality_ref,
+                    None, None, None, Some("Plex"),
+                ).await {
+                    Ok(true) => info!("📥 Queued for user {}: {} - {} [quality: {}]",
+                        user_id, play.artist, play.title, quality_log),
+                    Ok(false) => {}
+                    Err(e) => error!("Database error: {}", e),
                 }
             }
         }
 
         if !has_active_now_playing {
-            // A Plex tick with no sessions is an authoritative "stopped" — clear
-            // the deck now instead of letting the entry time out on its own.
-            self.now_playing.clear_source("Plex");
             self.flush_pending().await;
         } else {
             debug!("⏸ Skipping pending scrobbles - active now playing session");
-        }
-
-        if let Some(plex) = self.sources.iter_mut()
-            .find(|s| s.name() == "Plex")
-            .and_then(|s| s.as_any_mut().downcast_mut::<PlexSource>())
-        {
-            plex.cleanup_sessions(3600);
         }
 
         // Incrementally classify listen languages (script instantly, a few

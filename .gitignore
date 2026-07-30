@@ -29,6 +29,11 @@ src/sinks/.DS_Store
 scrobbles.db
 tapedeck.db
 
+# Credential-encryption key. Never commit, and keep it OUT of database backups —
+# a backup plus this file is the same as storing credentials in the clear.
+*.key
+tapedeck.key
+
 *.lock
 # ...except the frontend lockfile. Without it every build re-resolves the
 # ^ ranges in web/package.json, and a mismatched svelte/vite toolchain breaks
@@ -54,4 +59,7 @@ CLAUDE.md
 # CI pipeline lives in the separate tapedeck-cicd repo
 /Jenkinsfile
 export/
+
+# Third-party source read for reference while planning features — not ours to ship
+temp/
 

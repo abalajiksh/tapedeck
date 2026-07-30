@@ -1,5 +1,6 @@
 mod analytics;
 mod config;
+mod crypto;
 mod db;
 mod engine;
 mod enrich;
@@ -15,13 +16,12 @@ mod web_assets;
 use std::sync::Arc;
 
 use sqlx::SqlitePool;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use crate::config::Config;
 use crate::db::{Database, PlexSettings};
 use crate::engine::ScrobbleEngine;
 use crate::musicbrainz::MusicBrainzClient;
-use crate::sources::MusicSource;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -57,9 +57,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mb_client = Arc::new(mb_client);
 
+    // ── Credential encryption ──
+    // Deliberately a separate file from the database: `GET /api/v1/backup` hands
+    // out a whole-DB snapshot, and a key stored inside it would ride along.
+    let secrets = Arc::new(crypto::SecretBox::load(std::path::Path::new(&config.secret_key_path))?);
+
     // ── Scrobble database ──
     info!("📦 Initializing scrobble database at {}", config.database.scrobble_db_url);
-    let db = Arc::new(Database::new(&config.database.scrobble_db_url).await?);
+    let db = Arc::new(Database::new(&config.database.scrobble_db_url, secrets.clone()).await?);
 
     // Any import left 'running' by a previous process died with it — record that.
     match db.mark_running_imports_interrupted().await {
@@ -79,42 +84,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // ── Sources ──
-    // Plex config lives in the database so it can be edited from the UI and
-    // applied live. `tapedeck.toml` / PLEX_* env vars only *seed* the row on
-    // first run — after that the database is authoritative and editing the
-    // config file has no effect.
-    let plex_settings = match db.get_plex_settings().await? {
-        Some(s) => s,
-        None => {
-            let seeded = PlexSettings {
-                enabled: config.plex.enabled,
-                url: config.plex.url.clone(),
-                token: config.plex.token.clone(),
-                users_allow: config.plex.users_allow.join(","),
-                users_block: config.plex.users_block.join(","),
-                devices_allow: config.plex.devices_allow.join(","),
-                devices_block: config.plex.devices_block.join(","),
-                libraries_allow: config.plex.libraries_allow.join(","),
-                libraries_block: config.plex.libraries_block.join(","),
-                updated_at: 0,
-            };
-            if seeded.enabled {
-                info!("⚙️ Seeding Plex settings from config (the UI owns them from now on)");
-            }
-            db.save_plex_settings(&seeded).await?;
-            db.get_plex_settings().await?.unwrap_or(seeded)
-        }
-    };
-
-    // The engine builds the Plex source itself on its first tick, from these
-    // same settings — one code path for startup and for later UI edits.
-    let sources: Vec<Box<dyn MusicSource>> = Vec::new();
-
-    if plex_settings.is_usable() {
-        info!("🎧 Plex source enabled ({})", plex_settings.url);
-    } else {
-        info!("ℹ️ No polling sources enabled — running in ingest-only mode");
-    }
+    // Every source belongs to a user (`user_sources`), and the engine builds
+    // them itself on its first tick — one code path for startup and for later
+    // edits from the UI. `main` only migrates the old server-wide Plex row.
+    migrate_global_plex(&db, &config).await?;
 
     // ── Sinks ──
     // There are no server-wide sinks: every listen forwards only to the
@@ -172,10 +145,86 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // shutdown, at which point it finishes the current tick and returns. Between
     // that and the server's request draining, no in-progress work is cut off:
     // committed writes are durable (WAL) and pending scrobbles resume on restart.
-    let mut engine = ScrobbleEngine::new(sources, db, mb_client, now_playing, config.listenbrainz_url.clone());
+    let mut engine = ScrobbleEngine::new(db, mb_client, now_playing, config.listenbrainz_url.clone());
     engine.run(shutdown_rx).await;
     let _ = server_task.await;
     info!("👋 Shut down cleanly");
+    Ok(())
+}
+
+/// Move the old server-wide Plex row onto the admin as a personal source.
+///
+/// Plex used to be one instance-wide config: one token, polling every session on
+/// the server and attributing listens by matching the Plex account name against
+/// Tapedeck usernames. That let the operator's token see everyone's listening and
+/// broke whenever the names didn't line up. Sources are per-user now.
+///
+/// The old row becomes the *admin's* source, because that's whose token it was.
+/// Anyone who was previously being name-matched is no longer ingested until they
+/// connect their own Plex — which the warning below says out loud, since it's a
+/// silent behaviour change otherwise.
+async fn migrate_global_plex(db: &Database, config: &Config) -> Result<(), Box<dyn std::error::Error>> {
+    // Seed the legacy row from config on a first run so an existing
+    // docker-compose keeps working long enough to be migrated below.
+    if db.get_plex_settings().await?.is_none() {
+        let seeded = PlexSettings {
+            enabled: config.plex.enabled,
+            url: config.plex.url.clone(),
+            token: config.plex.token.clone(),
+            users_allow: config.plex.users_allow.join(","),
+            users_block: config.plex.users_block.join(","),
+            devices_allow: config.plex.devices_allow.join(","),
+            devices_block: config.plex.devices_block.join(","),
+            libraries_allow: config.plex.libraries_allow.join(","),
+            libraries_block: config.plex.libraries_block.join(","),
+            updated_at: 0,
+        };
+        db.save_plex_settings(&seeded).await?;
+    }
+
+    let Some(legacy) = db.get_plex_settings().await? else { return Ok(()) };
+    if !legacy.is_usable() {
+        return Ok(());
+    }
+
+    let Some(admin_id) = db.first_admin_id().await? else { return Ok(()) };
+    if db.get_source(admin_id, "plex").await?.is_some() {
+        return Ok(()); // already migrated
+    }
+
+    // Resolve the token to its Plex account so the new source can filter to it.
+    // If plex.tv is unreachable we still migrate, disabled, and let the user
+    // finish in the UI — better than dropping their config on the floor.
+    let account = match crate::sources::PlexSource::resolve_account(&legacy.url, &legacy.token).await {
+        Ok(name) => Some(name),
+        Err(e) => {
+            warn!("⚠️ Could not resolve the Plex account for the existing token: {e}");
+            None
+        }
+    };
+
+    let credentials = serde_json::json!({ "token": legacy.token }).to_string();
+    // Carry the library/device filters over. Dropping them would silently start
+    // scrobbling whatever they were excluding — podcasts and audiobooks, usually.
+    let options = serde_json::json!({
+        "libraries_allow": PlexSettings::list(&legacy.libraries_allow),
+        "libraries_block": PlexSettings::list(&legacy.libraries_block),
+        "devices_allow": PlexSettings::list(&legacy.devices_allow),
+        "devices_block": PlexSettings::list(&legacy.devices_block),
+    }).to_string();
+    db.save_source(
+        admin_id, "plex", account.is_some(), &legacy.url,
+        &credentials, account.as_deref(), None, &options,
+    ).await?;
+
+    info!("⚙️ Migrated the server-wide Plex config to a personal source for the admin");
+    if let Some(name) = &account {
+        info!("   Plex account: {name} — only that account's sessions are ingested now");
+    } else {
+        info!("   Left disabled: open Settings → Sources and reconnect to finish");
+    }
+    warn!("⚠️ Plex is per-user now. Anyone previously matched by Plex account name \
+           will not be ingested until they connect their own Plex in Settings → Sources.");
     Ok(())
 }
 

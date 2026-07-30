@@ -10,6 +10,9 @@
 
 [server]
 port = 8080
+# Credential-encryption key. Generated on first run; keep it out of database
+# backups, since a backup plus this key is the same as no encryption at all.
+secret_key_path = "./tapedeck.key"
 host = "0.0.0.0"
 # Only enable behind a reverse proxy you control — it makes X-Forwarded-For
 # trusted for client IPs, which the login rate limiter keys on.

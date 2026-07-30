@@ -105,6 +105,18 @@ impl NowPlayingRegistry {
         }
     }
 
+    /// Drop this user's entry only if `source` reported it.
+    ///
+    /// Needed once sources are per-user: an idle Plex must not wipe a
+    /// now-playing that the user's phone is currently reporting over ingest.
+    pub fn clear_user_source(&self, user_id: i64, source: &str) {
+        if let Ok(mut map) = self.0.write() {
+            if map.get(&user_id).is_some_and(|np| np.source == source) {
+                map.remove(&user_id);
+            }
+        }
+    }
+
     /// Drop this user's entry, whatever reported it. Backs
     /// `POST /1/playing-now/delete`.
     pub fn clear_user(&self, user_id: i64) {
