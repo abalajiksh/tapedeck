@@ -187,8 +187,10 @@ export interface UserSource {
 	enabled: boolean;
 	url: string;
 	has_token: boolean;
-	/** The remote account the token resolves to; sessions are filtered to it. */
+	/** The remote account the credentials resolve to; playback is filtered to it. */
 	remote_account: string | null;
+	/** Navidrome only — the login it's configured with. */
+	username?: string | null;
 	poll_interval_secs: number | null;
 	libraries_allow: string[];
 	libraries_block: string[];
@@ -202,7 +204,7 @@ export interface UserSource {
 /** Partial update. Omitting `token` keeps the stored one. */
 export type UserSourceUpdate = Partial<
 	Omit<UserSource, 'kind' | 'has_token' | 'remote_account' | 'last_polled_at' | 'last_error' | 'updated_at'>
-> & { token?: string };
+> & { token?: string; username?: string; password?: string };
 
 export interface SourceTestResult {
 	ok: boolean;
@@ -326,7 +328,10 @@ class TapedeckAPI {
 		return this.delNoBody(`/api/v1/sources/${kind}`);
 	}
 
-	async testSource(kind: string, body: { url?: string; token?: string }): Promise<SourceTestResult> {
+	async testSource(
+		kind: string,
+		body: { url?: string; token?: string; username?: string; password?: string }
+	): Promise<SourceTestResult> {
 		return this.post(`/api/v1/sources/${kind}/test`, body);
 	}
 
@@ -434,8 +439,10 @@ class TapedeckAPI {
 	async importLastfm(username: string): Promise<{ job_id: string }> {
 		return this.post('/api/v1/import/lastfm', { username });
 	}
-	async importFile(file: File): Promise<{ job_id: string }> {
+	/** `timezone` is only consulted for a Rockbox log whose header says #TZ/UNKNOWN. */
+	async importFile(file: File, timezone?: string): Promise<{ job_id: string }> {
 		const form = new FormData();
+		if (timezone) form.append('timezone', timezone);
 		form.append('file', file);
 		const res = await fetch(`${BASE}/api/v1/import/file`, {
 			method: 'POST', credentials: 'same-origin', body: form

@@ -22,14 +22,14 @@ use std::sync::Arc;
 use tracing::info;
 
 use crate::db::UserSource;
-use crate::sources::{PlexFilters, PlexSource};
+use crate::sources::{NavidromeSource, PlexFilters, PlexSource};
 use super::auth::AuthUser;
 use super::models::ErrorResponse;
 use super::AppState;
 
 /// Kinds we can actually build. Kept explicit so a typo'd path can't create a
 /// row the engine will never poll.
-const KINDS: [&str; 1] = ["plex"];
+const KINDS: [&str; 2] = ["plex", "navidrome"];
 
 fn err(code: u16, msg: impl Into<String>) -> axum::response::Response {
     let status = StatusCode::from_u16(code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
@@ -43,6 +43,7 @@ fn public_view(s: &UserSource) -> serde_json::Value {
         "url": s.url,
         "has_token": !s.credentials.is_empty(),
         "remote_account": s.remote_account,
+        "username": s.credential("username"),
         "poll_interval_secs": s.poll_interval_secs,
         "libraries_allow": s.option_list("libraries_allow"),
         "libraries_block": s.option_list("libraries_block"),
@@ -78,6 +79,11 @@ struct SourceUpdate {
     /// Omitted or empty keeps the stored credential — it's never sent back, so
     /// the UI can't echo it even if it wanted to.
     token: Option<String>,
+    /// Navidrome logs in as a user, so it needs a username too. Subsonic hashes
+    /// password+salt per request, which is why the password itself is stored
+    /// (encrypted) rather than a token.
+    username: Option<String>,
+    password: Option<String>,
     poll_interval_secs: Option<i64>,
     libraries_allow: Option<Vec<String>>,
     libraries_block: Option<Vec<String>>,
@@ -106,41 +112,68 @@ async fn put_source(
         .or_else(|| current.as_ref().map(|c| c.url.clone()))
         .unwrap_or_default();
 
-    let token = match body.token.filter(|t| !t.trim().is_empty()) {
-        Some(t) => t.trim().to_string(),
-        None => current.as_ref().and_then(|c| c.credential("token")).unwrap_or_default(),
+    let keep_cred = |incoming: Option<String>, key: &str| -> String {
+        incoming.filter(|v| !v.trim().is_empty())
+            .map(|v| v.trim().to_string())
+            .or_else(|| current.as_ref().and_then(|c| c.credential(key)))
+            .unwrap_or_default()
     };
+    let token = keep_cred(body.token, "token");
+    let nd_user = keep_cred(body.username, "username");
+    let nd_pass = keep_cred(body.password, "password");
 
     let enabled = body.enabled.or_else(|| current.as_ref().map(|c| c.enabled)).unwrap_or(false);
     let interval = body.poll_interval_secs.or_else(|| current.as_ref().and_then(|c| c.poll_interval_secs));
 
-    if enabled && (url.is_empty() || token.is_empty()) {
-        return err(400, "A server URL and token are required to enable a source");
+    let complete = match kind.as_str() {
+        "plex" => !url.is_empty() && !token.is_empty(),
+        "navidrome" => !url.is_empty() && !nd_user.is_empty() && !nd_pass.is_empty(),
+        _ => false,
+    };
+    if enabled && !complete {
+        return err(400, match kind.as_str() {
+            "navidrome" => "A server URL, username and password are required to enable Navidrome",
+            _ => "A server URL and token are required to enable a source",
+        });
     }
 
-    // Resolving the account is what makes this source *this user's*. Do it on
-    // save so the failure is visible here rather than as silence later.
+    // Establishing *which account* the credentials belong to is what makes a
+    // source this user's. Plex needs a lookup; Navidrome you simply log in as.
     let mut remote_account = current.as_ref().and_then(|c| c.remote_account.clone());
-    if !url.is_empty() && !token.is_empty() {
-        let changed = current.as_ref().map(|c| c.url != url).unwrap_or(true)
-            || current.as_ref().and_then(|c| c.credential("token")).as_deref() != Some(token.as_str())
-            || remote_account.is_none();
-        if changed {
-            match PlexSource::resolve_account(&url, &token).await {
-                Ok(name) => remote_account = Some(name),
-                Err(e) => return err(400, format!(
-                    "Could not confirm which Plex account that token belongs to: {e}. \
-                     Tapedeck needs this to keep other people's sessions out of your history."
-                )),
+    let credentials;
+    match kind.as_str() {
+        "plex" => {
+            if complete {
+                let changed = current.as_ref().map(|c| c.url != url).unwrap_or(true)
+                    || current.as_ref().and_then(|c| c.credential("token")).as_deref() != Some(token.as_str())
+                    || remote_account.is_none();
+                if changed {
+                    match PlexSource::resolve_account(&url, &token).await {
+                        Ok(name) => remote_account = Some(name),
+                        Err(e) => return err(400, format!(
+                            "Could not confirm which Plex account that token belongs to: {e}. \
+                             Tapedeck needs this to keep other people's sessions out of your history."
+                        )),
+                    }
+                }
             }
+            credentials = if token.is_empty() { String::new() }
+                else { serde_json::json!({ "token": token }).to_string() };
+        }
+        _ => {
+            // Verify before saving — a wrong password would otherwise show up as
+            // an unexplained empty history rather than an error on this screen.
+            if complete && enabled {
+                let mut probe = NavidromeSource::new(url.clone(), nd_user.clone(), nd_pass.clone());
+                if let Err(e) = probe.initialize().await {
+                    return err(400, format!("Could not sign in to Navidrome: {e}"));
+                }
+            }
+            remote_account = (!nd_user.is_empty()).then(|| nd_user.clone());
+            credentials = if nd_user.is_empty() { String::new() }
+                else { serde_json::json!({ "username": nd_user, "password": nd_pass }).to_string() };
         }
     }
-
-    let credentials = if token.is_empty() {
-        String::new()
-    } else {
-        serde_json::json!({ "token": token }).to_string()
-    };
 
     // Any list the body omits keeps its stored value, so saving a URL doesn't
     // wipe someone's podcast exclusions.
@@ -190,6 +223,8 @@ async fn delete_source(
 struct SourceTest {
     url: Option<String>,
     token: Option<String>,
+    username: Option<String>,
+    password: Option<String>,
 }
 
 /// POST /api/v1/sources/:kind/test — verify a URL/token pair, report which
@@ -206,6 +241,32 @@ async fn test_source(
     }
 
     let stored = state.db.get_source(user.user_id, &kind).await.ok().flatten();
+
+    if kind == "navidrome" {
+        let url = body.url.map(|u| u.trim().trim_end_matches('/').to_string())
+            .filter(|u| !u.is_empty())
+            .or_else(|| stored.as_ref().map(|s| s.url.clone()))
+            .unwrap_or_default();
+        let u = body.username.filter(|v| !v.trim().is_empty()).map(|v| v.trim().to_string())
+            .or_else(|| stored.as_ref().and_then(|s| s.credential("username")))
+            .unwrap_or_default();
+        let p = body.password.filter(|v| !v.trim().is_empty())
+            .or_else(|| stored.as_ref().and_then(|s| s.credential("password")))
+            .unwrap_or_default();
+        if url.is_empty() || u.is_empty() || p.is_empty() {
+            return err(400, "Enter a server URL, username and password first");
+        }
+        let mut probe = NavidromeSource::new(url, u.clone(), p);
+        return match probe.initialize().await {
+            Ok(()) => (StatusCode::OK, Json(serde_json::json!({
+                "ok": true, "account": u,
+            }))).into_response(),
+            Err(e) => (StatusCode::OK, Json(serde_json::json!({
+                "ok": false, "error": e.to_string(),
+            }))).into_response(),
+        };
+    }
+
     let url = body.url
         .map(|u| u.trim().trim_end_matches('/').to_string())
         .filter(|u| !u.is_empty())

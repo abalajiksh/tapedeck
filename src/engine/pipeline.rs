@@ -8,7 +8,7 @@ use crate::db::Database;
 use crate::musicbrainz::MusicBrainzClient;
 use crate::server::now_playing::{NowPlaying, NowPlayingRegistry};
 use crate::sinks;
-use crate::sources::{MusicSource, PlexFilters, PlexSource};
+use crate::sources::{MusicSource, NavidromeSource, PlexFilters, PlexSource};
 
 use super::enrichment::enrich_play;
 
@@ -170,6 +170,19 @@ impl ScrobbleEngine {
                 plex.initialize().await?;
                 Ok(Box::new(plex))
             }
+            "navidrome" => {
+                let username = cfg.credential("username").ok_or("no Navidrome username stored")?;
+                let password = cfg.credential("password").ok_or("no Navidrome password stored")?;
+                let mut nd = NavidromeSource::new(cfg.url.clone(), username, password);
+                nd.initialize().await?;
+                // Navidrome keeps its own play history, so without a high-water
+                // mark a restart would re-walk all of it. Dedup would absorb the
+                // duplicates, but only after thousands of pointless inserts.
+                if let Some(ts) = cfg.last_polled_at {
+                    nd.resume_from(ts.max(0) as u64);
+                }
+                Ok(Box::new(nd))
+            }
             other => Err(format!("unknown source kind: {other}").into()),
         }
     }
@@ -207,6 +220,87 @@ impl ScrobbleEngine {
         info!("🛑 Scrobble engine stopped cleanly");
     }
 
+    /// Poll one Navidrome source: new scrobbles from its own history, plus
+    /// whatever the account is playing right now.
+    #[allow(clippy::too_many_arguments)]
+    async fn poll_navidrome(
+        &mut self, i: usize,
+        db: &Arc<Database>, mb_client: &Arc<MusicBrainzClient>, lb_url: &str,
+        now_playing: &NowPlayingRegistry, has_active: &mut bool,
+    ) {
+        let (row_id, user_id) = (self.sources[i].row_id, self.sources[i].user_id);
+        let Some(nd) = self.sources[i].source.as_any_mut().downcast_mut::<NavidromeSource>() else {
+            return;
+        };
+
+        // Only this source's own account counts — a shared Navidrome reports
+        // every user's playback, same as Plex.
+        let account = nd.username_owned();
+
+        match nd.fetch_now_playing().await {
+            Ok(entries) => {
+                let mine: Vec<_> = entries.into_iter()
+                    .filter(|e| e.username.as_deref()
+                        .map(|u| u.eq_ignore_ascii_case(&account))
+                        .unwrap_or(true))
+                    .collect();
+                if mine.is_empty() {
+                    now_playing.clear_user_source(user_id, "Navidrome");
+                } else {
+                    *has_active = true;
+                }
+                for entry in mine {
+                    let mut play = entry.play.clone();
+                    let album = play.album.clone();
+                    enrich_play(mb_client, &mut play, album.as_deref()).await;
+                    now_playing.set(user_id, NowPlaying::from_play(&play, "Navidrome", None, 0));
+                    let sinks = sinks::sinks_for_user(db, user_id, lb_url).await;
+                    sinks::submit_now_playing(&sinks, &play).await;
+                }
+            }
+            Err(e) => debug!("Navidrome now-playing failed for user {}: {}", user_id, e),
+        }
+
+        let from = nd.last_submission();
+        match nd.fetch_scrobbles(from).await {
+            Ok(plays) => {
+                if self.sources[i].error_logged {
+                    info!("✅ Navidrome recovered for user {}", user_id);
+                    self.sources[i].error_logged = false;
+                }
+                let _ = db.record_source_poll(row_id, None).await;
+                if !plays.is_empty() {
+                    info!("📀 {} Navidrome listen(s) for user {}", plays.len(), user_id);
+                }
+                for mut play in plays {
+                    let dupe = db.exists(user_id, &play.source_id, &play.source_name).await.unwrap_or(false)
+                        || db.fuzzy_exists(user_id, &play.title, &play.artist, play.timestamp as i64).await.unwrap_or(false);
+                    if dupe { continue; }
+                    // A library MBID means enrichment is already done.
+                    if play.mbid_recording.is_none() {
+                        let album = play.album.clone();
+                        enrich_play(mb_client, &mut play, album.as_deref()).await;
+                    }
+                    match db.save_scrobble(user_id, &play, None, None, None, None, Some("Navidrome")).await {
+                        Ok(true) => info!("📥 Queued for user {}: {} - {}", user_id, play.artist, play.title),
+                        Ok(false) => {}
+                        Err(e) => error!("Database error: {}", e),
+                    }
+                }
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                if !self.sources[i].error_logged {
+                    error!("Navidrome fetch failed for user {}: {}", user_id, msg);
+                    self.sources[i].error_logged = true;
+                } else {
+                    debug!("Navidrome still failing for user {}: {}", user_id, msg);
+                }
+                let _ = db.record_source_poll(row_id, Some(&msg)).await;
+            }
+        }
+    }
+
     pub async fn run_tick(&mut self) {
         self.reconcile_sources().await;
 
@@ -223,8 +317,11 @@ impl ScrobbleEngine {
 
             let (row_id, user_id) = (self.sources[i].row_id, self.sources[i].user_id);
 
-            // Plex is the only kind so far; Navidrome and Jellyfin slot in here
-            // with their own arms once their sources exist.
+            if self.sources[i].kind == "navidrome" {
+                self.poll_navidrome(i, &db, &mb_client, &lb_url, &now_playing, &mut has_active_now_playing).await;
+                continue;
+            }
+
             let Some(plex) = self.sources[i].source.as_any_mut().downcast_mut::<PlexSource>() else {
                 continue;
             };

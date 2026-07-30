@@ -1,3 +1,4 @@
+mod navidrome;
 mod plex;
 
 use async_trait::async_trait;
@@ -11,5 +12,6 @@ pub trait MusicSource: Send + Sync {
     async fn fetch_new_plays(&mut self, last_checked: u64) -> Result<Vec<Play>, Box<dyn std::error::Error>>;
 }
 
+pub use navidrome::NavidromeSource;
 pub use plex::PlexSource;
 pub use plex::PlexFilters;

@@ -156,9 +156,17 @@ async fn import_file(
 ) -> impl IntoResponse {
     let mut bytes: Option<Vec<u8>> = None;
     let mut name = String::new();
+    // Rockbox logs whose header says `#TZ/UNKNOWN` carry local-clock timestamps,
+    // so the client sends the device's timezone alongside the file.
+    let mut device_tz: Option<String> = None;
     while let Ok(Some(field)) = multipart.next_field().await {
-        name = field.file_name().unwrap_or("").to_string();
-        if let Ok(b) = field.bytes().await { bytes = Some(b.to_vec()); }
+        match field.name().unwrap_or("") {
+            "timezone" => { device_tz = field.text().await.ok().filter(|t| !t.trim().is_empty()); }
+            _ => {
+                name = field.file_name().unwrap_or("").to_string();
+                if let Ok(b) = field.bytes().await { bytes = Some(b.to_vec()); }
+            }
+        }
     }
     let Some(bytes) = bytes else {
         return (StatusCode::BAD_REQUEST, Json(serde_json::json!(
@@ -170,7 +178,7 @@ async fn import_file(
     let (reg, db, uid) = (state.imports.clone(), state.db.clone(), user.user_id);
     let ret = id.clone();
     tokio::spawn(async move {
-        if let Err(e) = run_file(&reg, &id, &db, uid, &bytes, &name).await {
+        if let Err(e) = run_file(&reg, &id, &db, uid, &bytes, &name, device_tz.as_deref()).await {
             update(&reg, &id, |j| { j.state = "error".into(); j.status = e; });
         }
         persist_job(&reg, &id, &db).await;
@@ -302,11 +310,15 @@ async fn run_lastfm(
 /// (`title,artist,album,format,chain,mbid,time`, our own export shape).
 async fn run_file(
     reg: &ImportRegistry, id: &str, db: &Database, uid: i64,
-    bytes: &[u8], name: &str,
+    bytes: &[u8], name: &str, device_tz: Option<&str>,
 ) -> Result<(), String> {
     let text = String::from_utf8_lossy(bytes);
-    let is_csv = name.to_lowercase().ends_with(".csv") || (!text.trim_start().starts_with(['{', '[']));
 
+    if crate::rockbox::looks_like_scrobbler_log(&text) {
+        return run_scrobbler_log(reg, id, db, uid, &text, device_tz).await;
+    }
+
+    let is_csv = name.to_lowercase().ends_with(".csv") || (!text.trim_start().starts_with(['{', '[']));
     let plays: Vec<Play> = if is_csv { parse_csv(&text) } else { parse_json(&text)? };
     update(reg, id, |j| j.total = Some(plays.len()));
     for p in &plays {
@@ -314,6 +326,67 @@ async fn run_file(
         update(reg, id, |j| { j.fetched += 1; if inserted { j.imported += 1; } });
     }
     update(reg, id, |j| { j.state = "done".into(); j.status = format!("Imported {} new listens", j.imported); });
+    Ok(())
+}
+
+/// Rockbox `.scrobbler.log`.
+///
+/// Refuses rather than guesses when the log declares `#TZ/UNKNOWN` and no
+/// timezone was supplied: assuming the server's zone would silently shift a whole
+/// device's history, and the original offset can't be recovered afterwards.
+async fn run_scrobbler_log(
+    reg: &ImportRegistry, id: &str, db: &Database, uid: i64,
+    text: &str, device_tz: Option<&str>,
+) -> Result<(), String> {
+    use crate::rockbox::{parse, peek_timezone, LogTimezone};
+
+    let tz = match (peek_timezone(text), device_tz) {
+        (LogTimezone::Utc, _) => chrono_tz::UTC,
+        (LogTimezone::Unknown, Some(name)) => name.parse::<chrono_tz::Tz>()
+            .map_err(|_| format!("Unknown timezone: {name}"))?,
+        (LogTimezone::Unknown, None) => return Err(
+            "This log's header says #TZ/UNKNOWN, so its timestamps are in the player's              local time. Pick the timezone the device was set to and import again."
+                .to_string()),
+    };
+
+    let parsed = parse(text, tz);
+    update(reg, id, |j| j.total = Some(parsed.entries.len()));
+
+    let mut skips = 0usize;
+    for e in &parsed.entries {
+        let p = Play {
+            source_id: source_id(e.timestamp, &e.artist, &e.title),
+            source_name: "rockbox".into(),
+            title: e.title.clone(),
+            artist: e.artist.clone(),
+            album: e.album.clone(),
+            timestamp: e.timestamp.max(0) as u64,
+            duration: e.duration,
+            track_number: e.track_number,
+            // Column 8 when the player wrote one — these skip MusicBrainz entirely.
+            mbid_recording: e.mbid.clone(),
+            mbid_release: None, mbid_artist: None,
+            artists: None, mbid_release_group: None,
+            caa_id: None, caa_release_mbid: None,
+        };
+        let inserted = db.import_listen_flagged(uid, &p, e.skipped).await.map_err(|e| e.to_string())?;
+        if inserted && e.skipped { skips += 1; }
+        update(reg, id, |j| {
+            j.fetched += 1;
+            // Skips are stored but are not listens, so they don't inflate the count.
+            if inserted && !e.skipped { j.imported += 1; }
+        });
+    }
+
+    let client = parsed.client.clone().unwrap_or_else(|| "Rockbox".into());
+    let malformed = parsed.malformed;
+    update(reg, id, |j| {
+        j.state = "done".into();
+        let mut parts = vec![format!("Imported {} new listens from {}", j.imported, client)];
+        if skips > 0 { parts.push(format!("{skips} skips recorded")); }
+        if malformed > 0 { parts.push(format!("{malformed} unreadable rows ignored")); }
+        j.status = parts.join(" · ");
+    });
     Ok(())
 }
 

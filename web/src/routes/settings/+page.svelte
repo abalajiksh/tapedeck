@@ -196,11 +196,60 @@
 
 	const splitList = (s: string) => s.split(',').map((x) => x.trim()).filter(Boolean);
 
+	// ── Navidrome ──
+	// Logs in as a user rather than with a token: Subsonic hashes password+salt
+	// on every request, so the password itself has to be stored (encrypted).
+	let nd: UserSource | null = null;
+	let ndUrl = '', ndUser = '', ndPass = '', ndEnabled = false;
+	let ndBusy = false, ndMsg = '', ndError = '';
+	let ndTest: SourceTestResult | null = null;
+
+	function applyNd(s: UserSource | null) {
+		nd = s;
+		ndUrl = s?.url ?? '';
+		ndUser = s?.username ?? '';
+		ndEnabled = s?.enabled ?? false;
+		ndPass = '';
+	}
+
 	async function loadSources() {
 		try {
 			const r = await api.getSources();
 			applyPlex(r.sources.find((s) => s.kind === 'plex') ?? null);
-		} catch { /* leave the form empty */ }
+			applyNd(r.sources.find((s) => s.kind === 'navidrome') ?? null);
+		} catch { /* leave the forms empty */ }
+	}
+
+	async function saveNd() {
+		ndBusy = true; ndError = ''; ndMsg = ''; ndTest = null;
+		try {
+			applyNd(await api.putSource('navidrome', {
+				enabled: ndEnabled,
+				url: ndUrl.trim(),
+				username: ndUser.trim(),
+				...(ndPass ? { password: ndPass } : {})
+			}));
+			ndMsg = 'Saved — history backfill starts within a few seconds.';
+		} catch (e) { ndError = String(e).replace(/^API \d+: /, ''); }
+		ndBusy = false;
+	}
+
+	async function testNd() {
+		ndBusy = true; ndError = ''; ndMsg = ''; ndTest = null;
+		try {
+			ndTest = await api.testSource('navidrome', {
+				url: ndUrl.trim(), username: ndUser.trim(),
+				...(ndPass ? { password: ndPass } : {})
+			});
+		} catch (e) { ndError = String(e).replace(/^API \d+: /, ''); }
+		ndBusy = false;
+	}
+
+	async function disconnectNd() {
+		ndBusy = true; ndError = ''; ndMsg = '';
+		try { await api.deleteSource('navidrome'); applyNd(null); ndMsg = 'Disconnected.'; }
+		catch (e) { ndError = String(e).replace(/^API \d+: /, ''); }
+		ndBusy = false;
 	}
 
 	async function savePlex() {
@@ -438,6 +487,76 @@
 			</div>
 		</div>
 	</div>
+</div>
+
+<!-- Navidrome: history backfill + now playing, per user -->
+<div class="panel" style="border-radius:22px;padding:24px;margin-bottom:18px;">
+	<h3 class="h-display" style="font-size:19px;margin-bottom:4px;">Navidrome</h3>
+	<p style="font-size:13px;color:var(--td-muted);margin:0 0 16px;">
+		Signs in as you and pulls <em>your</em> play history — Navidrome keeps its own, so this
+		backfills listens from before Tapedeck existed, then keeps up live. Your library's
+		MusicBrainz IDs come along, which spares those listens a MusicBrainz lookup.
+	</p>
+
+	{#if ndError}<div style="font-size:13px;color:#b2622d;margin-bottom:12px;">{ndError}</div>{/if}
+
+	<div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;padding:4px 0 14px;">
+		<label style="display:flex;align-items:center;gap:10px;cursor:pointer;font-size:14px;">
+			<input type="checkbox" bind:checked={ndEnabled} style="width:16px;height:16px;accent-color:var(--td-accent);cursor:pointer;">
+			Poll my Navidrome
+		</label>
+		{#if nd?.last_error}
+			<span class="tag tag-outline" style="font-size:11px;color:#b2622d;">last poll failed</span>
+		{:else if nd?.last_polled_at}
+			<span style="font-size:12px;color:var(--td-muted-3);">polled {timeAgo(nd.last_polled_at)}</span>
+		{/if}
+	</div>
+
+	<div style="display:flex;gap:12px;flex-wrap:wrap;">
+		<div class="field" style="flex:2;min-width:220px;">
+			<label for="nd-url">Server URL</label>
+			<input id="nd-url" class="input" bind:value={ndUrl} placeholder="http://192.168.1.10:4533">
+		</div>
+		<div class="field" style="flex:1;min-width:150px;">
+			<label for="nd-user">Username</label>
+			<input id="nd-user" class="input" bind:value={ndUser} placeholder="ashwin">
+		</div>
+		<div class="field" style="flex:1;min-width:150px;">
+			<label for="nd-pass">
+				Password {#if nd?.has_token}<span style="color:var(--td-good-fg);">· stored</span>{/if}
+			</label>
+			<input id="nd-pass" class="input" type="password" bind:value={ndPass}
+				placeholder={nd?.has_token ? 'Leave blank to keep' : 'Your Navidrome password'}>
+		</div>
+	</div>
+
+	<p style="font-size:12.5px;color:var(--td-muted-2);margin:10px 0 0;">
+		Navidrome's Subsonic API hashes your password on every request, so unlike a token it has to
+		be stored rather than exchanged. It's encrypted at rest with a key kept outside the database.
+	</p>
+
+	{#if nd?.last_error}
+		<p style="font-size:12.5px;color:#b2622d;margin:10px 0 0;font-family:monospace;word-break:break-word;">{nd.last_error}</p>
+	{/if}
+
+	<div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-top:16px;">
+		<button class="btn btn-primary" on:click={saveNd} disabled={ndBusy}>{ndBusy ? '…' : 'Save'}</button>
+		<button class="btn btn-secondary" on:click={testNd} disabled={ndBusy}>Test connection</button>
+		{#if nd}
+			<button class="btn btn-secondary" style="color:#b2622d;" on:click={disconnectNd} disabled={ndBusy}>Disconnect</button>
+		{/if}
+		{#if ndMsg}<span style="font-size:13px;color:var(--td-good-fg);">✓ {ndMsg}</span>{/if}
+	</div>
+
+	{#if ndTest}
+		<div style="margin-top:14px;font-size:13px;">
+			{#if ndTest.ok}
+				<span style="color:var(--td-good-fg);">✓ Signed in as {ndTest.account}</span>
+			{:else}
+				<span style="color:#b2622d;">✗ {ndTest.error}</span>
+			{/if}
+		</div>
+	{/if}
 </div>
 
 <!-- Language enrichment (admin) -->

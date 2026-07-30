@@ -234,6 +234,7 @@ impl Database {
                 track_number INTEGER,
                 language TEXT,
                 release_year INTEGER,
+                skipped BOOLEAN NOT NULL DEFAULT FALSE,
                 UNIQUE(user_id, source_id, source_name)
             )"
         ).execute(&self.pool).await?;
@@ -495,6 +496,14 @@ impl Database {
         if !has_column(&self.pool, "scrobbles", "language").await {
             info!("⚙️ Migrating: adding scrobbles.language...");
             let _ = sqlx::query("ALTER TABLE scrobbles ADD COLUMN language TEXT")
+                .execute(&self.pool).await;
+        }
+
+        // Migration: skipped listens (Rockbox logs mark rows L or S). Stored so
+        // skip-rate analytics are possible, but excluded from every count.
+        if !has_column(&self.pool, "scrobbles", "skipped").await {
+            info!("⚙️ Migrating: adding scrobbles.skipped...");
+            let _ = sqlx::query("ALTER TABLE scrobbles ADD COLUMN skipped BOOLEAN NOT NULL DEFAULT FALSE")
                 .execute(&self.pool).await;
         }
 
@@ -804,7 +813,7 @@ impl Database {
         after: Option<i64>, before: Option<i64>,
     ) -> Result<Vec<ScrobbleRecord>, sqlx::Error> {
         sqlx::query_as::<_, ScrobbleRecord>(
-            "SELECT * FROM scrobbles WHERE user_id = ?
+            "SELECT * FROM scrobbles WHERE user_id = ? AND skipped = FALSE
                AND (? IS NULL OR LOWER(artist) LIKE '%' || LOWER(?) || '%')
                AND (? IS NULL OR LOWER(album) LIKE '%' || LOWER(?) || '%')
                AND (? IS NULL OR timestamp >= ?)
@@ -823,7 +832,7 @@ impl Database {
     /// ListenBrainz-compatible endpoints report alongside a listen page.
     pub async fn listen_count_and_latest(&self, user_id: i64) -> Result<(i64, Option<i64>), sqlx::Error> {
         let row: (i64, Option<i64>) = sqlx::query_as(
-            "SELECT COUNT(*), MAX(timestamp) FROM scrobbles WHERE user_id = ?"
+            "SELECT COUNT(*), MAX(timestamp) FROM scrobbles WHERE user_id = ? AND skipped = FALSE"
         ).bind(user_id).fetch_one(&self.pool).await?;
         Ok(row)
     }
@@ -834,7 +843,7 @@ impl Database {
         -> Result<Vec<(i64, String, String, Option<String>, Option<i32>)>, sqlx::Error> {
         sqlx::query_as(
             "SELECT timestamp, artist, title, album, track_number FROM scrobbles
-             WHERE user_id = ? AND (? IS NULL OR timestamp >= ?)
+             WHERE user_id = ? AND skipped = FALSE AND (? IS NULL OR timestamp >= ?)
              ORDER BY timestamp DESC LIMIT ?"
         ).bind(user_id).bind(after).bind(after).bind(limit).fetch_all(&self.pool).await
     }
@@ -845,7 +854,7 @@ impl Database {
     pub async fn scrobbles_needing_language(&self, limit: i64) -> Result<Vec<(i64, String, Option<String>, Option<String>)>, sqlx::Error> {
         sqlx::query_as(
             "SELECT id, title, album, mbid_recording FROM scrobbles
-             WHERE language IS NULL ORDER BY timestamp DESC LIMIT ?"
+             WHERE language IS NULL AND skipped = FALSE ORDER BY timestamp DESC LIMIT ?"
         ).bind(limit).fetch_all(&self.pool).await
     }
 
@@ -860,7 +869,7 @@ impl Database {
     pub async fn scrobbles_needing_release_year(&self, limit: i64) -> Result<Vec<(i64, String, String, Option<String>)>, sqlx::Error> {
         sqlx::query_as(
             "SELECT id, title, artist, album FROM scrobbles
-             WHERE release_year IS NULL ORDER BY timestamp DESC LIMIT ?"
+             WHERE release_year IS NULL AND skipped = FALSE ORDER BY timestamp DESC LIMIT ?"
         ).bind(limit).fetch_all(&self.pool).await
     }
 
@@ -884,7 +893,7 @@ impl Database {
 
     /// (total, with cover art) — drives the Settings artwork progress readout.
     pub async fn artwork_coverage(&self, user_id: i64) -> Result<(i64, i64), sqlx::Error> {
-        let total: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM scrobbles WHERE user_id = ?")
+        let total: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM scrobbles WHERE user_id = ? AND skipped = FALSE")
             .bind(user_id).fetch_one(&self.pool).await?;
         let with_art: (i64,) = sqlx::query_as(
             "SELECT COUNT(*) FROM scrobbles WHERE user_id = ? AND caa_id IS NOT NULL"
@@ -898,7 +907,7 @@ impl Database {
     pub async fn scrobbles_needing_artwork(&self, limit: i64) -> Result<Vec<(i64, String, String, Option<String>)>, sqlx::Error> {
         sqlx::query_as(
             "SELECT id, title, artist, album FROM scrobbles
-             WHERE caa_id IS NULL ORDER BY timestamp DESC LIMIT ?"
+             WHERE caa_id IS NULL AND skipped = FALSE ORDER BY timestamp DESC LIMIT ?"
         ).bind(limit).fetch_all(&self.pool).await
     }
 
@@ -920,34 +929,34 @@ impl Database {
         let today_start = now - (now % 86400);
         let week_start = now - (7 * 86400);
 
-        let today: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM scrobbles WHERE user_id = ? AND timestamp >= ?")
+        let today: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM scrobbles WHERE user_id = ? AND skipped = FALSE AND timestamp >= ?")
             .bind(user_id).bind(today_start).fetch_one(&self.pool).await?;
-        let week: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM scrobbles WHERE user_id = ? AND timestamp >= ?")
+        let week: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM scrobbles WHERE user_id = ? AND skipped = FALSE AND timestamp >= ?")
             .bind(user_id).bind(week_start).fetch_one(&self.pool).await?;
-        let total: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM scrobbles WHERE user_id = ?")
+        let total: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM scrobbles WHERE user_id = ? AND skipped = FALSE")
             .bind(user_id).fetch_one(&self.pool).await?;
-        let lossless_count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM scrobbles WHERE user_id = ? AND is_lossless = TRUE")
+        let lossless_count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM scrobbles WHERE user_id = ? AND skipped = FALSE AND is_lossless = TRUE")
             .bind(user_id).fetch_one(&self.pool).await?;
         let lossless_pct = if total.0 > 0 { (lossless_count.0 as f64 / total.0 as f64 * 100.0).round() as i64 } else { 0 };
         let top_artist: Option<(String, i64)> = sqlx::query_as(
             "SELECT artist, COUNT(*) as cnt FROM scrobbles WHERE user_id = ? AND timestamp >= ? GROUP BY artist ORDER BY cnt DESC LIMIT 1"
         ).bind(user_id).bind(now - 30 * 86400).fetch_optional(&self.pool).await?;
-        let unique_artists: (i64,) = sqlx::query_as("SELECT COUNT(DISTINCT artist) FROM scrobbles WHERE user_id = ?")
+        let unique_artists: (i64,) = sqlx::query_as("SELECT COUNT(DISTINCT artist) FROM scrobbles WHERE user_id = ? AND skipped = FALSE")
             .bind(user_id).fetch_one(&self.pool).await?;
-        let unique_albums: (i64,) = sqlx::query_as("SELECT COUNT(DISTINCT album) FROM scrobbles WHERE user_id = ? AND album IS NOT NULL")
+        let unique_albums: (i64,) = sqlx::query_as("SELECT COUNT(DISTINCT album) FROM scrobbles WHERE user_id = ? AND skipped = FALSE AND album IS NOT NULL")
             .bind(user_id).fetch_one(&self.pool).await?;
-        let unique_tracks: (i64,) = sqlx::query_as("SELECT COUNT(DISTINCT title || '|' || artist) FROM scrobbles WHERE user_id = ?")
+        let unique_tracks: (i64,) = sqlx::query_as("SELECT COUNT(DISTINCT title || '|' || artist) FROM scrobbles WHERE user_id = ? AND skipped = FALSE")
             .bind(user_id).fetch_one(&self.pool).await?;
-        let total_duration: (Option<i64>,) = sqlx::query_as("SELECT SUM(duration) FROM scrobbles WHERE user_id = ? AND duration IS NOT NULL")
+        let total_duration: (Option<i64>,) = sqlx::query_as("SELECT SUM(duration) FROM scrobbles WHERE user_id = ? AND skipped = FALSE AND duration IS NOT NULL")
             .bind(user_id).fetch_one(&self.pool).await?;
         let total_hours = total_duration.0.unwrap_or(0) as f64 / 3600.0;
-        let today_duration: (Option<i64>,) = sqlx::query_as("SELECT SUM(duration) FROM scrobbles WHERE user_id = ? AND timestamp >= ? AND duration IS NOT NULL")
+        let today_duration: (Option<i64>,) = sqlx::query_as("SELECT SUM(duration) FROM scrobbles WHERE user_id = ? AND skipped = FALSE AND timestamp >= ? AND duration IS NOT NULL")
             .bind(user_id).bind(today_start).fetch_one(&self.pool).await?;
-        let week_duration: (Option<i64>,) = sqlx::query_as("SELECT SUM(duration) FROM scrobbles WHERE user_id = ? AND timestamp >= ? AND duration IS NOT NULL")
+        let week_duration: (Option<i64>,) = sqlx::query_as("SELECT SUM(duration) FROM scrobbles WHERE user_id = ? AND skipped = FALSE AND timestamp >= ? AND duration IS NOT NULL")
             .bind(user_id).bind(week_start).fetch_one(&self.pool).await?;
         let today_hours = today_duration.0.unwrap_or(0) as f64 / 3600.0;
         let week_hours = week_duration.0.unwrap_or(0) as f64 / 3600.0;
-        let avg_quality: (Option<f64>,) = sqlx::query_as("SELECT AVG(quality_score) FROM scrobbles WHERE user_id = ? AND quality_score IS NOT NULL")
+        let avg_quality: (Option<f64>,) = sqlx::query_as("SELECT AVG(quality_score) FROM scrobbles WHERE user_id = ? AND skipped = FALSE AND quality_score IS NOT NULL")
             .bind(user_id).fetch_one(&self.pool).await?;
 
         Ok(serde_json::json!({
@@ -1030,6 +1039,16 @@ impl Database {
     /// never re-scrobbles a back-fill to Last.fm/ListenBrainz. Returns true if
     /// a new row was inserted.
     pub async fn import_listen(&self, user_id: i64, play: &Play) -> Result<bool, sqlx::Error> {
+        self.import_listen_flagged(user_id, play, false).await
+    }
+
+    /// Import a listen, optionally marking it a skip.
+    ///
+    /// Skips are stored but never counted: they are excluded from listen counts,
+    /// analytics and the history listing, and because imports land as `imported`
+    /// rather than `pending` they are never forwarded to Last.fm either — a
+    /// forwarded skip would be a wrong scrobble on a permanent record.
+    pub async fn import_listen_flagged(&self, user_id: i64, play: &Play, skipped: bool) -> Result<bool, sqlx::Error> {
         if self.exists(user_id, &play.source_id, &play.source_name).await? { return Ok(false); }
         if self.fuzzy_exists(user_id, &play.title, &play.artist, play.timestamp as i64).await? {
             return Ok(false);
@@ -1038,14 +1057,16 @@ impl Database {
         sqlx::query(
             "INSERT INTO scrobbles (
                 user_id, title, artist, album, timestamp, duration, source_id, source_name, status,
-                mbid_recording, mbid_release, mbid_artist, caa_id, caa_release_mbid, submission_client
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'imported', ?, ?, ?, ?, ?, 'import')"
+                mbid_recording, mbid_release, mbid_artist, caa_id, caa_release_mbid,
+                submission_client, track_number, skipped
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'imported', ?, ?, ?, ?, ?, 'import', ?, ?)"
         )
         .bind(user_id).bind(&play.title).bind(&play.artist).bind(&play.album)
         .bind(play.timestamp as i64).bind(play.duration.map(|d| d as i64))
         .bind(&play.source_id).bind(&play.source_name)
         .bind(&play.mbid_recording).bind(&play.mbid_release).bind(&mbid_artist_json)
         .bind(play.caa_id).bind(&play.caa_release_mbid)
+        .bind(play.track_number).bind(skipped)
         .execute(&self.pool).await?;
         Ok(true)
     }
@@ -1059,38 +1080,38 @@ impl Database {
     /// (the UI hides empty breakdowns). totals/top_artists/heatmap are real.
     pub async fn get_ranged_stats(&self, user_id: i64, after: Option<i64>) -> Result<serde_json::Value, sqlx::Error> {
         let plays: (i64,) = sqlx::query_as(
-            "SELECT COUNT(*) FROM scrobbles WHERE user_id = ? AND (? IS NULL OR timestamp >= ?)"
+            "SELECT COUNT(*) FROM scrobbles WHERE user_id = ? AND skipped = FALSE AND (? IS NULL OR timestamp >= ?)"
         ).bind(user_id).bind(after).bind(after).fetch_one(&self.pool).await?;
         let total = plays.0;
 
         let secs: (Option<i64>,) = sqlx::query_as(
-            "SELECT SUM(duration) FROM scrobbles WHERE user_id = ? AND (? IS NULL OR timestamp >= ?) AND duration IS NOT NULL"
+            "SELECT SUM(duration) FROM scrobbles WHERE user_id = ? AND skipped = FALSE AND (? IS NULL OR timestamp >= ?) AND duration IS NOT NULL"
         ).bind(user_id).bind(after).bind(after).fetch_one(&self.pool).await?;
         let hours = secs.0.unwrap_or(0) as f64 / 3600.0;
 
         let artists: (i64,) = sqlx::query_as(
-            "SELECT COUNT(DISTINCT artist) FROM scrobbles WHERE user_id = ? AND (? IS NULL OR timestamp >= ?)"
+            "SELECT COUNT(DISTINCT artist) FROM scrobbles WHERE user_id = ? AND skipped = FALSE AND (? IS NULL OR timestamp >= ?)"
         ).bind(user_id).bind(after).bind(after).fetch_one(&self.pool).await?;
         let albums: (i64,) = sqlx::query_as(
-            "SELECT COUNT(DISTINCT album) FROM scrobbles WHERE user_id = ? AND (? IS NULL OR timestamp >= ?) AND album IS NOT NULL"
+            "SELECT COUNT(DISTINCT album) FROM scrobbles WHERE user_id = ? AND skipped = FALSE AND (? IS NULL OR timestamp >= ?) AND album IS NOT NULL"
         ).bind(user_id).bind(after).bind(after).fetch_one(&self.pool).await?;
         let tracks: (i64,) = sqlx::query_as(
-            "SELECT COUNT(DISTINCT title || '|' || artist) FROM scrobbles WHERE user_id = ? AND (? IS NULL OR timestamp >= ?)"
+            "SELECT COUNT(DISTINCT title || '|' || artist) FROM scrobbles WHERE user_id = ? AND skipped = FALSE AND (? IS NULL OR timestamp >= ?)"
         ).bind(user_id).bind(after).bind(after).fetch_one(&self.pool).await?;
         let avg_quality: (Option<f64>,) = sqlx::query_as(
-            "SELECT AVG(quality_score) FROM scrobbles WHERE user_id = ? AND (? IS NULL OR timestamp >= ?) AND quality_score IS NOT NULL"
+            "SELECT AVG(quality_score) FROM scrobbles WHERE user_id = ? AND skipped = FALSE AND (? IS NULL OR timestamp >= ?) AND quality_score IS NOT NULL"
         ).bind(user_id).bind(after).bind(after).fetch_one(&self.pool).await?;
         let lossless: (i64,) = sqlx::query_as(
-            "SELECT COUNT(*) FROM scrobbles WHERE user_id = ? AND (? IS NULL OR timestamp >= ?) AND is_lossless = TRUE"
+            "SELECT COUNT(*) FROM scrobbles WHERE user_id = ? AND skipped = FALSE AND (? IS NULL OR timestamp >= ?) AND is_lossless = TRUE"
         ).bind(user_id).bind(after).bind(after).fetch_one(&self.pool).await?;
         let dsd: (i64,) = sqlx::query_as(
-            "SELECT COUNT(*) FROM scrobbles WHERE user_id = ? AND (? IS NULL OR timestamp >= ?) AND format_type = 'dsd'"
+            "SELECT COUNT(*) FROM scrobbles WHERE user_id = ? AND skipped = FALSE AND (? IS NULL OR timestamp >= ?) AND format_type = 'dsd'"
         ).bind(user_id).bind(after).bind(after).fetch_one(&self.pool).await?;
         let pct = |n: i64| if total > 0 { (n as f64 / total as f64 * 100.0).round() as i64 } else { 0 };
 
         let top_rows: Vec<(String, i64, Option<i64>)> = sqlx::query_as(
             "SELECT artist, COUNT(*) as plays, SUM(duration) as secs
-             FROM scrobbles WHERE user_id = ? AND (? IS NULL OR timestamp >= ?)
+             FROM scrobbles WHERE user_id = ? AND skipped = FALSE AND (? IS NULL OR timestamp >= ?)
              GROUP BY artist ORDER BY plays DESC LIMIT 10"
         ).bind(user_id).bind(after).bind(after).fetch_all(&self.pool).await?;
         let top_artists: Vec<serde_json::Value> = top_rows.into_iter().map(|(name, plays, secs)| {
@@ -1099,7 +1120,7 @@ impl Database {
 
         let album_rows: Vec<(String, String, i64, Option<i64>)> = sqlx::query_as(
             "SELECT album, artist, COUNT(*) as plays, SUM(duration) as secs
-             FROM scrobbles WHERE user_id = ? AND (? IS NULL OR timestamp >= ?)
+             FROM scrobbles WHERE user_id = ? AND skipped = FALSE AND (? IS NULL OR timestamp >= ?)
                AND album IS NOT NULL AND album != ''
              GROUP BY album, artist ORDER BY plays DESC LIMIT 10"
         ).bind(user_id).bind(after).bind(after).fetch_all(&self.pool).await?;
@@ -1117,7 +1138,7 @@ impl Database {
                     WHEN codec IS NOT NULL AND codec != '' THEN 'Lossy'
                     ELSE 'Unknown'
                 END AS tier, COUNT(*) as c
-             FROM scrobbles WHERE user_id = ? AND (? IS NULL OR timestamp >= ?)
+             FROM scrobbles WHERE user_id = ? AND skipped = FALSE AND (? IS NULL OR timestamp >= ?)
              GROUP BY tier ORDER BY c DESC"
         ).bind(user_id).bind(after).bind(after).fetch_all(&self.pool).await?;
         let fidelity: Vec<serde_json::Value> = fidelity_rows.into_iter().map(|(name, c)| {
@@ -1128,7 +1149,7 @@ impl Database {
         // the MusicBrainz backfill count — the rest are simply absent.
         let decade_rows: Vec<(i64, i64)> = sqlx::query_as(
             "SELECT (release_year / 10) * 10 AS decade, COUNT(*) as c
-             FROM scrobbles WHERE user_id = ? AND (? IS NULL OR timestamp >= ?)
+             FROM scrobbles WHERE user_id = ? AND skipped = FALSE AND (? IS NULL OR timestamp >= ?)
                AND release_year IS NOT NULL AND release_year > 1000
              GROUP BY decade ORDER BY decade"
         ).bind(user_id).bind(after).bind(after).fetch_all(&self.pool).await?;

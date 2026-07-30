@@ -7,6 +7,30 @@
 	let src: Src = 'listenbrainz';
 
 	let lbUser = '', lbToken = '', fmUser = '', file: File | null = null;
+
+	// Rockbox writes `.scrobbler.log` with a `#TZ` header. When it says UNKNOWN
+	// the timestamps came off a device clock with no idea what zone it was in, so
+	// we have to ask — guessing shifts a whole player's history permanently.
+	let logNeedsTz = false;
+	let deviceTz = typeof Intl !== 'undefined'
+		? Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC'
+		: 'UTC';
+	const zones: string[] = (() => {
+		try { return (Intl as any).supportedValuesOf?.('timeZone') ?? []; }
+		catch { return []; }
+	})();
+
+	async function inspectFile(f: File | null) {
+		file = f;
+		logNeedsTz = false;
+		if (!f) return;
+		// Only the header matters, so read the first slice rather than the file.
+		const head = await f.slice(0, 512).text();
+		const isLog = head.split('\n').slice(0, 5).some((l) => l.trim().toUpperCase().startsWith('#AUDIOSCROBBLER'));
+		if (!isLog) return;
+		const tzLine = head.split('\n').find((l) => l.trim().startsWith('#TZ/'));
+		logNeedsTz = !tzLine || !tzLine.trim().slice(4).trim().toUpperCase().startsWith('UTC');
+	}
 	let job: ImportJob | null = null;
 	let history: ImportRecord[] = [];
 	let error = '';
@@ -45,7 +69,7 @@
 				res = await api.importLastfm(fmUser);
 			} else {
 				if (!file) return (error = 'Choose a file to upload');
-				res = await api.importFile(file);
+				res = await api.importFile(file, logNeedsTz ? deviceTz : undefined);
 			}
 			job = await api.importJob(res.job_id);
 			startPolling(res.job_id);
@@ -96,13 +120,28 @@
 		</div>
 	{:else}
 		<h3 class="h-display" style="font-size:19px;margin-bottom:4px;">Upload an export</h3>
-		<p style="font-size:13px;color:var(--td-muted);margin:0 0 18px;">Drop a ListenBrainz <code class="chip">.json</code> dump or a <code class="chip">.csv</code> export.</p>
+		<p style="font-size:13px;color:var(--td-muted);margin:0 0 18px;">Drop a ListenBrainz <code class="chip">.json</code> dump, a <code class="chip">.csv</code> export, or a Rockbox <code class="chip">.scrobbler.log</code> straight off your DAP.</p>
 		<label style="display:flex;flex-direction:column;align-items:center;justify-content:center;gap:10px;border:2px dashed rgba(198,113,57,.4);border-radius:18px;padding:34px;cursor:pointer;background:var(--td-surface2);max-width:440px;">
 			<svg viewBox="0 0 24 24" width="30" fill="none" stroke="#c67139" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 16V4"/><path d="M8 8l4-4 4 4"/><path d="M4 20h16"/></svg>
 			<span style="font-size:14px;color:var(--td-nav-fg);font-weight:600;">{file ? file.name : 'Choose a file'}</span>
-			<span style="font-size:12px;color:var(--td-muted-2);">.json or .csv</span>
-			<input type="file" accept=".json,.csv" on:change={(e) => (file = e.currentTarget.files?.[0] ?? null)} style="display:none;">
+			<span style="font-size:12px;color:var(--td-muted-2);">.json, .csv or .log</span>
+			<input type="file" accept=".json,.csv,.log,.txt" on:change={(e) => inspectFile(e.currentTarget.files?.[0] ?? null)} style="display:none;">
 		</label>
+
+		{#if logNeedsTz}
+			<div style="margin-top:16px;max-width:440px;">
+				<div class="field">
+					<label for="dev-tz">Player's timezone</label>
+					<input id="dev-tz" class="input" list="tz-zones" bind:value={deviceTz} placeholder="Europe/Berlin">
+					<datalist id="tz-zones">{#each zones as z}<option value={z}></option>{/each}</datalist>
+				</div>
+				<p style="font-size:12.5px;color:var(--td-muted-2);margin:8px 0 0;">
+					This log says <code class="chip">#TZ/UNKNOWN</code> — its timestamps came from the
+					player's own clock. Pick the zone the device was set to, or every listen lands at the
+					wrong hour and the listening clock is skewed for good.
+				</p>
+			</div>
+		{/if}
 		<button class="btn btn-primary" style="margin-top:16px;" on:click={start} disabled={running}>Import file</button>
 	{/if}
 

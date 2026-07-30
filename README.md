@@ -138,6 +138,32 @@ Built to be trusted as your system of record:
 Every scrobble gets recording, release, and artist MBIDs plus Cover Art
 Archive artwork references.
 
+### Navidrome
+
+Signs in as *you* and pulls your play history — Navidrome keeps its own, so this
+backfills listens from before Tapedeck existed and then keeps up live. Uses both
+of Navidrome's APIs: the native one for history (`/api/scrobble/?from=`) and
+Subsonic for now-playing. Your library's MusicBrainz IDs come along, so those
+listens never need a MusicBrainz lookup.
+
+Subsonic hashes `password + salt` on every request, so Navidrome needs the
+account password rather than a token. It's encrypted at rest like every other
+stored credential.
+
+### Rockbox / DAP imports
+
+Upload a `.scrobbler.log` straight off a Rockbox player. Track numbers, lengths
+and any MusicBrainz IDs the player recorded all come across.
+
+Skips (`S` rows) are **kept but never counted** — excluded from listen counts,
+analytics and forwarding, so they can power skip-rate analytics later without
+ever becoming a wrong scrobble on Last.fm.
+
+If the log's header says `#TZ/UNKNOWN` — normal for a player with no time sync —
+Tapedeck asks which timezone the device was set to rather than guessing. Assuming
+the server's zone would shift the whole device's history by the offset, and it
+can't be recovered afterwards.
+
 ### Plex Integration
 
 Polls Plex active sessions directly — no webhooks required, no Plex Pass needed.
@@ -176,7 +202,7 @@ with:
 - **Analytics** — timeframe-ranged totals, top artists, and a listening-clock
   heatmap.
 - **Import** — pull from ListenBrainz or Last.fm, or upload a `.json`/`.csv`
-  export, with live progress.
+  export or a Rockbox `.scrobbler.log`, with live progress.
 - **Signal Chains & Equipment**, plus **Settings** for appearance, API tokens,
   connection test, and data export / wipe.
 

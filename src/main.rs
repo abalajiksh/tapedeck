@@ -8,6 +8,7 @@ mod language;
 mod logging;
 mod models;
 mod musicbrainz;
+mod rockbox;
 mod server;
 mod sinks;
 mod sources;
