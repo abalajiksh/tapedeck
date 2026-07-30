@@ -1,3 +1,4 @@
+mod jellyfin;
 mod navidrome;
 mod plex;
 
@@ -12,6 +13,7 @@ pub trait MusicSource: Send + Sync {
     async fn fetch_new_plays(&mut self, last_checked: u64) -> Result<Vec<Play>, Box<dyn std::error::Error>>;
 }
 
+pub use jellyfin::JellyfinSource;
 pub use navidrome::NavidromeSource;
 pub use plex::PlexSource;
 pub use plex::PlexFilters;

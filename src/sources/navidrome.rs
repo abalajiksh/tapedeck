@@ -331,6 +331,40 @@ impl NavidromeSource {
         self.subsonic_get("ping").await.map(|_| ())
     }
 
+    /// Cover art bytes for one library item.
+    ///
+    /// Streamed through Tapedeck rather than linked directly: the browser can't
+    /// reach a LAN Navidrome, and it must never be handed the credentials that
+    /// would let it. Returns the bytes plus the content type so the proxy can
+    /// pass both through.
+    pub async fn fetch_cover_art(&self, item_id: &str)
+        -> Result<(Vec<u8>, String), Box<dyn std::error::Error + Send + Sync>>
+    {
+        let mut params = self.subsonic_params();
+        params.push(("id".into(), item_id.to_string()));
+        params.push(("size".into(), "500".into()));
+
+        let resp = self.client
+            .get(format!("{}/rest/getCoverArt", self.url))
+            .query(&params)
+            .send().await?;
+
+        if !resp.status().is_success() {
+            return Err(format!("Navidrome cover art returned {}", resp.status()).into());
+        }
+        let content_type = resp.headers().get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("image/jpeg")
+            .to_string();
+
+        // Subsonic reports "no artwork" as a JSON error body with HTTP 200, so a
+        // non-image response means there's nothing to show.
+        if content_type.contains("json") || content_type.contains("xml") {
+            return Err("no cover art for that item".into());
+        }
+        Ok((resp.bytes().await?.to_vec(), content_type))
+    }
+
     /// What's playing right now, per account.
     ///
     /// Navidrome keeps reporting a finished track for a while, so entries that

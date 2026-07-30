@@ -105,8 +105,19 @@ pub async fn backfill_artwork(
     let mut done = 0usize;
     let mut budget = mb_budget;
 
-    for (id, title, artist, album, caa_id, caa_mbid) in rows {
-        // 0. Already have a Cover Art Archive id from earlier enrichment — build
+    for (id, title, artist, album, caa_id, caa_mbid, source_name) in rows {
+        // 0a. Came from the user's own media server — the proxy can serve the
+        //     cover of the exact file that was played, with no lookup at all and
+        //     nothing asked of a third party. Always the best answer available.
+        if matches!(source_name.as_str(), "navidrome" | "Plex" | "plex" | "jellyfin" | "Jellyfin") {
+            let url = format!("/api/v1/art/{id}");
+            if db.set_scrobble_artwork(id, &url, None, None).await.is_ok() {
+                done += 1;
+                continue;
+            }
+        }
+
+        // 0b. Already have a Cover Art Archive id from earlier enrichment — build
         //    the URL from it rather than asking anyone anything.
         if let (Some(cid), Some(mbid)) = (caa_id.filter(|c| *c > 0), caa_mbid.as_deref()) {
             let url = caa_url(mbid, cid);
@@ -117,6 +128,11 @@ pub async fn backfill_artwork(
         // 1. Providers that cost MusicBrainz nothing (Deezer today; the user's
         //    own library once Phase 4 finishes).
         if let Some(found) = crate::metadata::resolve(providers, &artist, &title, album.as_deref()).await {
+            // Providers hand back an artist portrait alongside the cover; it has
+            // nowhere to live on a listen, so it goes to the artist entity.
+            if let Some(ref portrait) = found.artist_image_url {
+                let _ = db.upsert_artist(&artist, Some(portrait), None).await;
+            }
             if let Some(url) = found.image_url {
                 if db.set_scrobble_artwork(id, &url, None, None).await.is_ok() {
                     done += 1;

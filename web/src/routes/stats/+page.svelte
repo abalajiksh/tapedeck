@@ -1,6 +1,7 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
 	import { api, type RangedStats, type StatsRange, type Personality } from '$lib/api';
+	import CoverArt from '$lib/components/CoverArt.svelte';
 
 	const ranges: { v: StatsRange; label: string }[] = [
 		{ v: 'week', label: 'Week' },
@@ -121,9 +122,12 @@
 		{#if stats.top_artists.length}
 			{#each stats.top_artists as a}
 				{@const v = metric === 'plays' ? a.plays : a.hours}
-				<div style="margin-bottom:13px;">
-					<div style="display:flex;justify-content:space-between;font-size:13px;margin-bottom:5px;"><span style="font-weight:600;">{a.name}</span><span style="color:var(--td-muted-2);">{v}{metric === 'hours' ? 'h' : ''}</span></div>
-					<div style="height:10px;border-radius:999px;background:var(--td-track);overflow:hidden;"><div style="width:{(v / maxArtist * 100).toFixed(0)}%;height:100%;background:linear-gradient(90deg,#c67139,#e07a55);border-radius:999px;"></div></div>
+				<div style="display:flex;align-items:center;gap:12px;margin-bottom:13px;">
+					<CoverArt url={a.image_url} seed={a.name} size={34} radius={999} />
+					<div style="flex:1;min-width:0;">
+						<div style="display:flex;justify-content:space-between;font-size:13px;margin-bottom:5px;"><span style="font-weight:600;">{a.name}</span><span style="color:var(--td-muted-2);">{v}{metric === 'hours' ? 'h' : ''}</span></div>
+						<div style="height:10px;border-radius:999px;background:var(--td-track);overflow:hidden;"><div style="width:{(v / maxArtist * 100).toFixed(0)}%;height:100%;background:linear-gradient(90deg,#c67139,#e07a55);border-radius:999px;"></div></div>
+					</div>
 				</div>
 			{/each}
 		{:else}

@@ -1,4 +1,5 @@
 use sqlx::{sqlite::{SqlitePoolOptions, SqliteConnectOptions, SqliteJournalMode, SqliteSynchronous}, Pool, Sqlite, FromRow};
+use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -49,6 +50,7 @@ pub struct ScrobbleRecord {
     pub submission_client: Option<String>,
     pub track_number: Option<i32>,
     pub artwork_url: Option<String>,
+    pub source_ref: Option<i64>,
     #[serde(default)]
     pub delivered_sinks: Option<String>,
 }
@@ -92,6 +94,8 @@ pub struct UserSource {
     pub id: i64,
     pub user_id: i64,
     pub kind: String,
+    /// User-supplied name, so two servers of the same kind are tellable apart.
+    pub label: String,
     pub enabled: bool,
     pub url: String,
     pub credentials: String,
@@ -144,6 +148,7 @@ struct UserSourceRow {
     id: i64,
     user_id: i64,
     kind: String,
+    label: String,
     enabled: bool,
     url: String,
     credentials: String,
@@ -237,6 +242,7 @@ impl Database {
                 release_year INTEGER,
                 skipped BOOLEAN NOT NULL DEFAULT FALSE,
                 artwork_url TEXT,
+                source_ref INTEGER,
                 UNIQUE(user_id, source_id, source_name)
             )"
         ).execute(&self.pool).await?;
@@ -376,6 +382,21 @@ impl Database {
             )"
         ).execute(&self.pool).await?;
 
+        // Artists as entities rather than bare strings on a listen. Needed for
+        // anywhere an artist has properties of its own — an image today, MBIDs
+        // and liner notes later. Global, not per-user: "Aphex Twin" is the same
+        // artist for everyone on the instance.
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS artists (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                name_key TEXT NOT NULL UNIQUE,
+                mbid TEXT,
+                image_url TEXT,
+                updated_at INTEGER NOT NULL DEFAULT 0
+            )"
+        ).execute(&self.pool).await?;
+
         // One row per user per source kind. Replaces the single-row
         // `plex_settings`: a source belongs to the person whose account it
         // reads, so nobody's token can see anybody else's listening.
@@ -384,6 +405,7 @@ impl Database {
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_id INTEGER NOT NULL REFERENCES users(id),
                 kind TEXT NOT NULL,
+                label TEXT NOT NULL DEFAULT '',
                 enabled INTEGER NOT NULL DEFAULT 1,
                 url TEXT NOT NULL DEFAULT '',
                 credentials TEXT NOT NULL DEFAULT '',
@@ -392,8 +414,7 @@ impl Database {
                 options TEXT NOT NULL DEFAULT '{}',
                 last_polled_at INTEGER,
                 last_error TEXT,
-                updated_at INTEGER NOT NULL DEFAULT 0,
-                UNIQUE(user_id, kind)
+                updated_at INTEGER NOT NULL DEFAULT 0
             )"
         ).execute(&self.pool).await?;
 
@@ -499,6 +520,53 @@ impl Database {
             info!("⚙️ Migrating: adding scrobbles.language...");
             let _ = sqlx::query("ALTER TABLE scrobbles ADD COLUMN language TEXT")
                 .execute(&self.pool).await;
+        }
+
+        // Migration: which `user_sources` row a listen came from. Needed once a
+        // user can have two Plex servers — `plex-55821-np` alone doesn't say
+        // which one, so the artwork proxy would have to guess.
+        if !has_column(&self.pool, "scrobbles", "source_ref").await {
+            info!("⚙️ Migrating: adding scrobbles.source_ref...");
+            let _ = sqlx::query("ALTER TABLE scrobbles ADD COLUMN source_ref INTEGER")
+                .execute(&self.pool).await;
+        }
+
+        // Migration: several sources of the same kind per user. SQLite can't
+        // drop a UNIQUE constraint in place, so the table is rebuilt. Guarded on
+        // the `label` column, which only the new shape has.
+        if !has_column(&self.pool, "user_sources", "label").await {
+            info!("⚙️ Migrating: allowing multiple sources of the same kind...");
+            let rebuild = [
+                "CREATE TABLE IF NOT EXISTS user_sources_new (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER NOT NULL REFERENCES users(id),
+                    kind TEXT NOT NULL,
+                    label TEXT NOT NULL DEFAULT '',
+                    enabled INTEGER NOT NULL DEFAULT 1,
+                    url TEXT NOT NULL DEFAULT '',
+                    credentials TEXT NOT NULL DEFAULT '',
+                    remote_account TEXT,
+                    poll_interval_secs INTEGER,
+                    options TEXT NOT NULL DEFAULT '{}',
+                    last_polled_at INTEGER,
+                    last_error TEXT,
+                    updated_at INTEGER NOT NULL DEFAULT 0
+                )",
+                "INSERT INTO user_sources_new
+                    (id, user_id, kind, label, enabled, url, credentials, remote_account,
+                     poll_interval_secs, options, last_polled_at, last_error, updated_at)
+                 SELECT id, user_id, kind, '', enabled, url, credentials, remote_account,
+                        poll_interval_secs, options, last_polled_at, last_error, updated_at
+                 FROM user_sources",
+                "DROP TABLE user_sources",
+                "ALTER TABLE user_sources_new RENAME TO user_sources",
+            ];
+            for stmt in rebuild {
+                if let Err(e) = sqlx::query(stmt).execute(&self.pool).await {
+                    error!("user_sources rebuild failed: {} — leaving the old table in place", e);
+                    break;
+                }
+            }
         }
 
         // Migration: resolved artwork URL. Supersedes deriving a Cover Art
@@ -680,6 +748,7 @@ impl Database {
         &self, user_id: i64, play: &Play, quality: Option<&AudioQuality>,
         device_id: Option<i64>, chain_id: Option<i64>,
         listening_context: Option<&str>, submission_client: Option<&str>,
+        source_ref: Option<i64>,
     ) -> Result<bool, sqlx::Error> {
         if self.exists(user_id, &play.source_id, &play.source_name).await? { return Ok(false); }
         if self.fuzzy_exists(user_id, &play.title, &play.artist, play.timestamp as i64).await? {
@@ -696,11 +765,12 @@ impl Database {
                 format_type, codec, bitrate, sample_rate, bit_depth, channels, is_lossless,
                 dsd_rate, dsd_multiplier, delivery_codec, delivery_bitrate,
                 is_transcoded, transcode_reason, quality_score,
-                device_id, chain_id, listening_context, submission_client, track_number
+                device_id, chain_id, listening_context, submission_client, track_number,
+                source_ref
             ) VALUES (
                 ?, ?, ?, ?, ?, ?, ?, ?, 'pending',
                 ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
             )"
         )
         .bind(user_id).bind(&play.title).bind(&play.artist).bind(&play.album)
@@ -714,7 +784,7 @@ impl Database {
         .bind(&q.delivery_codec).bind(q.delivery_bitrate)
         .bind(q.is_transcoded).bind(&q.transcode_reason).bind(q.quality_score)
         .bind(device_id).bind(chain_id).bind(listening_context).bind(submission_client)
-        .bind(play.track_number)
+        .bind(play.track_number).bind(source_ref)
         .execute(&self.pool).await?;
         Ok(true)
     }
@@ -918,11 +988,13 @@ impl Database {
     ///
     /// Returns any Cover Art Archive ids already on the row so the backfill can
     /// build a URL from them for free rather than looking anything up.
+    #[allow(clippy::type_complexity)]
     pub async fn scrobbles_needing_artwork(&self, limit: i64)
-        -> Result<Vec<(i64, String, String, Option<String>, Option<i64>, Option<String>)>, sqlx::Error>
+        -> Result<Vec<(i64, String, String, Option<String>, Option<i64>, Option<String>, String)>, sqlx::Error>
     {
         sqlx::query_as(
-            "SELECT id, title, artist, album, caa_id, caa_release_mbid FROM scrobbles
+            "SELECT id, title, artist, album, caa_id, caa_release_mbid, source_name
+             FROM scrobbles
              WHERE artwork_url IS NULL AND skipped = FALSE
              ORDER BY timestamp DESC LIMIT ?"
         ).bind(limit).fetch_all(&self.pool).await
@@ -1143,8 +1215,15 @@ impl Database {
              FROM scrobbles WHERE user_id = ? AND skipped = FALSE AND (? IS NULL OR timestamp >= ?)
              GROUP BY artist ORDER BY plays DESC LIMIT 10"
         ).bind(user_id).bind(after).bind(after).fetch_all(&self.pool).await?;
+        let names: Vec<String> = top_rows.iter().map(|(n, _, _)| n.clone()).collect();
+        let images = self.artist_images(&names).await.unwrap_or_default();
         let top_artists: Vec<serde_json::Value> = top_rows.into_iter().map(|(name, plays, secs)| {
-            serde_json::json!({ "name": name, "plays": plays, "hours": (secs.unwrap_or(0) as f64 / 3600.0 * 10.0).round() / 10.0 })
+            let image = images.get(&Self::artist_key(&name)).cloned();
+            serde_json::json!({
+                "name": name, "plays": plays,
+                "hours": (secs.unwrap_or(0) as f64 / 3600.0 * 10.0).round() / 10.0,
+                "image_url": image,
+            })
         }).collect();
 
         let album_rows: Vec<(String, String, i64, Option<i64>)> = sqlx::query_as(
@@ -1472,6 +1551,67 @@ impl Database {
         Ok(())
     }
 
+    // ════════════════════════════════════════════════════════════
+    //  Artists
+    // ════════════════════════════════════════════════════════════
+
+    /// Case- and padding-insensitive key, so "Aphex Twin" and "aphex twin " are
+    /// one artist rather than two rows that each learn half the metadata.
+    fn artist_key(name: &str) -> String {
+        name.trim().to_lowercase()
+    }
+
+    /// Record what we've learned about an artist. Existing values are kept
+    /// unless the caller has something better — a later lookup that finds no
+    /// image must not erase one we already had.
+    pub async fn upsert_artist(
+        &self, name: &str, image_url: Option<&str>, mbid: Option<&str>,
+    ) -> Result<(), sqlx::Error> {
+        let key = Self::artist_key(name);
+        if key.is_empty() { return Ok(()); }
+        sqlx::query(
+            "INSERT INTO artists (name, name_key, mbid, image_url, updated_at)
+             VALUES (?, ?, ?, ?, ?)
+             ON CONFLICT(name_key) DO UPDATE SET
+                mbid = COALESCE(excluded.mbid, artists.mbid),
+                image_url = COALESCE(excluded.image_url, artists.image_url),
+                updated_at = excluded.updated_at"
+        )
+        .bind(name.trim()).bind(&key).bind(mbid).bind(image_url).bind(Self::now_secs())
+        .execute(&self.pool).await?;
+        Ok(())
+    }
+
+    /// Images for a set of artist names, keyed by the same normalised form the
+    /// table uses. Returned as a map so a stats page can decorate its rows with
+    /// one query rather than one per artist.
+    pub async fn artist_images(&self, names: &[String]) -> Result<HashMap<String, String>, sqlx::Error> {
+        if names.is_empty() { return Ok(HashMap::new()); }
+        let placeholders = vec!["?"; names.len()].join(",");
+        let sql = format!(
+            "SELECT name_key, image_url FROM artists
+             WHERE image_url IS NOT NULL AND name_key IN ({placeholders})"
+        );
+        let mut q = sqlx::query_as::<_, (String, String)>(&sql);
+        for n in names {
+            q = q.bind(Self::artist_key(n));
+        }
+        Ok(q.fetch_all(&self.pool).await?.into_iter().collect())
+    }
+
+    /// How many distinct artists in this user's history have an image yet.
+    pub async fn artist_image_coverage(&self, user_id: i64) -> Result<(i64, i64), sqlx::Error> {
+        let total: (i64,) = sqlx::query_as(
+            "SELECT COUNT(DISTINCT artist) FROM scrobbles WHERE user_id = ? AND skipped = FALSE"
+        ).bind(user_id).fetch_one(&self.pool).await?;
+        let with_image: (i64,) = sqlx::query_as(
+            "SELECT COUNT(DISTINCT s.artist) FROM scrobbles s
+             JOIN artists a ON a.name_key = LOWER(TRIM(s.artist))
+             WHERE s.user_id = ? AND s.skipped = FALSE AND a.image_url IS NOT NULL"
+        ).bind(user_id).fetch_one(&self.pool).await?;
+        Ok((total.0, with_image.0))
+    }
+
     /// Lowest-numbered admin — the migration target for config that used to be
     /// instance-wide and now needs an owner.
     pub async fn first_admin_id(&self) -> Result<Option<i64>, sqlx::Error> {
@@ -1490,7 +1630,7 @@ impl Database {
     /// can't decrypt is dropped rather than failing the whole tick.
     pub async fn list_enabled_sources(&self) -> Result<Vec<UserSource>, sqlx::Error> {
         let rows: Vec<UserSourceRow> = sqlx::query_as(
-            "SELECT id, user_id, kind, enabled, url, credentials, remote_account,
+            "SELECT id, user_id, kind, label, enabled, url, credentials, remote_account,
                     poll_interval_secs, options, last_polled_at, last_error, updated_at
              FROM user_sources WHERE enabled = 1 ORDER BY user_id, kind"
         ).fetch_all(&self.pool).await?;
@@ -1501,19 +1641,21 @@ impl Database {
     /// here too — the handler decides what is safe to send to the browser.
     pub async fn list_sources_for_user(&self, user_id: i64) -> Result<Vec<UserSource>, sqlx::Error> {
         let rows: Vec<UserSourceRow> = sqlx::query_as(
-            "SELECT id, user_id, kind, enabled, url, credentials, remote_account,
+            "SELECT id, user_id, kind, label, enabled, url, credentials, remote_account,
                     poll_interval_secs, options, last_polled_at, last_error, updated_at
              FROM user_sources WHERE user_id = ? ORDER BY kind"
         ).bind(user_id).fetch_all(&self.pool).await?;
         Ok(rows.into_iter().filter_map(|r| self.hydrate_source(r)).collect())
     }
 
-    pub async fn get_source(&self, user_id: i64, kind: &str) -> Result<Option<UserSource>, sqlx::Error> {
+    /// One source by id, scoped to its owner so an id from another user is a
+    /// miss rather than a leak.
+    pub async fn get_source(&self, user_id: i64, id: i64) -> Result<Option<UserSource>, sqlx::Error> {
         let row: Option<UserSourceRow> = sqlx::query_as(
-            "SELECT id, user_id, kind, enabled, url, credentials, remote_account,
+            "SELECT id, user_id, kind, label, enabled, url, credentials, remote_account,
                     poll_interval_secs, options, last_polled_at, last_error, updated_at
-             FROM user_sources WHERE user_id = ? AND kind = ?"
-        ).bind(user_id).bind(kind).fetch_optional(&self.pool).await?;
+             FROM user_sources WHERE user_id = ? AND id = ?"
+        ).bind(user_id).bind(id).fetch_optional(&self.pool).await?;
         Ok(row.and_then(|r| self.hydrate_source(r)))
     }
 
@@ -1527,6 +1669,7 @@ impl Database {
             id: row.id,
             user_id: row.user_id,
             kind: row.kind,
+            label: row.label,
             enabled: row.enabled,
             url: row.url,
             credentials,
@@ -1539,39 +1682,51 @@ impl Database {
         })
     }
 
-    /// Upsert a source. `updated_at` doubles as the change stamp the engine
-    /// watches, so any save causes a rebuild on the next tick.
+    /// Create a source, returning its id. `updated_at` doubles as the change
+    /// stamp the engine watches, so a save is picked up on the next tick.
     #[allow(clippy::too_many_arguments)]
-    pub async fn save_source(
-        &self, user_id: i64, kind: &str, enabled: bool, url: &str,
+    pub async fn create_source(
+        &self, user_id: i64, kind: &str, label: &str, enabled: bool, url: &str,
         credentials: &str, remote_account: Option<&str>, poll_interval_secs: Option<i64>,
         options: &str,
-    ) -> Result<(), sqlx::Error> {
+    ) -> Result<i64, sqlx::Error> {
         let sealed = if credentials.is_empty() { String::new() } else { self.seal(credentials) };
-        sqlx::query(
+        let res = sqlx::query(
             "INSERT INTO user_sources
-                (user_id, kind, enabled, url, credentials, remote_account,
+                (user_id, kind, label, enabled, url, credentials, remote_account,
                  poll_interval_secs, options, updated_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-             ON CONFLICT(user_id, kind) DO UPDATE SET
-                enabled = excluded.enabled,
-                url = excluded.url,
-                credentials = excluded.credentials,
-                remote_account = excluded.remote_account,
-                poll_interval_secs = excluded.poll_interval_secs,
-                options = excluded.options,
-                updated_at = excluded.updated_at"
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
         )
-        .bind(user_id).bind(kind).bind(enabled).bind(url)
+        .bind(user_id).bind(kind).bind(label).bind(enabled).bind(url)
         .bind(sealed).bind(remote_account).bind(poll_interval_secs)
         .bind(options).bind(Self::now_secs())
         .execute(&self.pool).await?;
-        Ok(())
+        Ok(res.last_insert_rowid())
     }
 
-    pub async fn delete_source(&self, user_id: i64, kind: &str) -> Result<bool, sqlx::Error> {
-        let res = sqlx::query("DELETE FROM user_sources WHERE user_id = ? AND kind = ?")
-            .bind(user_id).bind(kind).execute(&self.pool).await?;
+    #[allow(clippy::too_many_arguments)]
+    pub async fn update_source(
+        &self, user_id: i64, id: i64, label: &str, enabled: bool, url: &str,
+        credentials: &str, remote_account: Option<&str>, poll_interval_secs: Option<i64>,
+        options: &str,
+    ) -> Result<bool, sqlx::Error> {
+        let sealed = if credentials.is_empty() { String::new() } else { self.seal(credentials) };
+        let res = sqlx::query(
+            "UPDATE user_sources SET
+                label = ?, enabled = ?, url = ?, credentials = ?, remote_account = ?,
+                poll_interval_secs = ?, options = ?, updated_at = ?
+             WHERE id = ? AND user_id = ?"
+        )
+        .bind(label).bind(enabled).bind(url).bind(sealed).bind(remote_account)
+        .bind(poll_interval_secs).bind(options).bind(Self::now_secs())
+        .bind(id).bind(user_id)
+        .execute(&self.pool).await?;
+        Ok(res.rows_affected() > 0)
+    }
+
+    pub async fn delete_source(&self, user_id: i64, id: i64) -> Result<bool, sqlx::Error> {
+        let res = sqlx::query("DELETE FROM user_sources WHERE user_id = ? AND id = ?")
+            .bind(user_id).bind(id).execute(&self.pool).await?;
         Ok(res.rows_affected() > 0)
     }
 
@@ -1985,15 +2140,15 @@ mod tests {
     async fn dedup_rejects_duplicate_source() {
         let db = testdb().await;
         let p = play("Teardrop", "Massive Attack", 1000);
-        assert!(db.save_scrobble(1, &p, None, None, None, None, None).await.unwrap());
+        assert!(db.save_scrobble(1, &p, None, None, None, None, None, None).await.unwrap());
         // same source_id + name → deduped
-        assert!(!db.save_scrobble(1, &p, None, None, None, None, None).await.unwrap());
+        assert!(!db.save_scrobble(1, &p, None, None, None, None, None, None).await.unwrap());
     }
 
     #[tokio::test]
     async fn per_sink_delivery_is_tracked() {
         let db = testdb().await;
-        db.save_scrobble(1, &play("T", "A", 2000), None, None, None, None, None).await.unwrap();
+        db.save_scrobble(1, &play("T", "A", 2000), None, None, None, None, None, None).await.unwrap();
 
         let pending = db.get_pending_scrobbles().await.unwrap();
         assert_eq!(pending.len(), 1);
@@ -2040,8 +2195,8 @@ mod tests {
             id: None, user_id: uid, name: "C".into(), description: None, components: vec![],
             listening_context: ListeningContext::Active, is_active: true, total_hours: 0.0, created_at: 0,
         }).await.unwrap();
-        db.save_scrobble(uid, &play("a", "x", 10), None, None, None, None, None).await.unwrap();
-        db.save_scrobble(uid, &play("b", "y", 20), None, None, None, None, None).await.unwrap();
+        db.save_scrobble(uid, &play("a", "x", 10), None, None, None, None, None, None).await.unwrap();
+        db.save_scrobble(uid, &play("b", "y", 20), None, None, None, None, None, None).await.unwrap();
         let ids: Vec<i64> = db.get_all_scrobbles(uid).await.unwrap().iter().map(|r| r.id).collect();
 
         let n = db.bulk_set_scrobble_chain(uid, &ids[..1], Some(cid)).await.unwrap();
@@ -2085,7 +2240,7 @@ mod tests {
     async fn delete_user_cascades_their_data() {
         let db = testdb().await;
         let uid = db.create_user("dave", None, "x", "user").await.unwrap();
-        db.save_scrobble(uid, &play("s", "a", 5), None, None, None, None, None).await.unwrap();
+        db.save_scrobble(uid, &play("s", "a", 5), None, None, None, None, None, None).await.unwrap();
         db.create_token(uid, "t", "submit").await.unwrap();
         // A connection has an FK to users — deletion must clear it, or the whole
         // cascade rolls back (the bug this guards against).
@@ -2160,14 +2315,14 @@ mod tests {
     async fn source_credentials_round_trip_and_stay_sealed() {
         let db = testdb().await;
         let uid = db.create_user("grace", None, "x", "user").await.unwrap();
-        db.save_source(uid, "plex", true, "http://plex.local:32400",
+        db.create_source(uid, "plex", "Main", true, "http://plex.local:32400",
             r#"{"token":"PLEX_SECRET"}"#, Some("grace_plex"), None, "{}").await.unwrap();
 
         let raw: (String,) = sqlx::query_as("SELECT credentials FROM user_sources WHERE user_id = ?")
             .bind(uid).fetch_one(&db.pool).await.unwrap();
         assert!(!raw.0.contains("PLEX_SECRET"));
 
-        let src = db.get_source(uid, "plex").await.unwrap().unwrap();
+        let src = db.list_sources_for_user(uid).await.unwrap().remove(0);
         assert_eq!(src.credential("token").as_deref(), Some("PLEX_SECRET"));
         assert_eq!(src.remote_account.as_deref(), Some("grace_plex"));
         assert!(src.is_usable());
@@ -2178,13 +2333,15 @@ mod tests {
         let db = testdb().await;
         let a = db.create_user("heidi", None, "x", "user").await.unwrap();
         let b = db.create_user("ivan", None, "x", "user").await.unwrap();
-        db.save_source(a, "plex", true, "http://a", r#"{"token":"ta"}"#, Some("heidi_plex"), None, "{}").await.unwrap();
-        db.save_source(b, "plex", true, "http://b", r#"{"token":"tb"}"#, Some("ivan_plex"), None, "{}").await.unwrap();
+        let a_id = db.create_source(a, "plex", "A", true, "http://a", r#"{"token":"ta"}"#, Some("heidi_plex"), None, "{}").await.unwrap();
+        let b_id = db.create_source(b, "plex", "B", true, "http://b", r#"{"token":"tb"}"#, Some("ivan_plex"), None, "{}").await.unwrap();
 
         // Each user sees only their own row…
         assert_eq!(db.list_sources_for_user(a).await.unwrap().len(), 1);
-        assert_eq!(db.get_source(a, "plex").await.unwrap().unwrap().url, "http://a");
-        assert!(db.get_source(b, "plex").await.unwrap().unwrap().credential("token").as_deref() == Some("tb"));
+        assert_eq!(db.get_source(a, a_id).await.unwrap().unwrap().url, "http://a");
+        assert!(db.get_source(b, b_id).await.unwrap().unwrap().credential("token").as_deref() == Some("tb"));
+        // An id belonging to someone else is a miss, not a leak.
+        assert!(db.get_source(a, b_id).await.unwrap().is_none());
 
         // …while the engine sees both, each carrying its owner.
         let all = db.list_enabled_sources().await.unwrap();
@@ -2193,20 +2350,69 @@ mod tests {
         assert!(all.iter().any(|s| s.user_id == b && s.remote_account.as_deref() == Some("ivan_plex")));
 
         // Disabling drops it from the engine's view but keeps the config.
-        db.save_source(a, "plex", false, "http://a", r#"{"token":"ta"}"#, Some("heidi_plex"), None, "{}").await.unwrap();
+        db.update_source(a, a_id, "A", false, "http://a", r#"{"token":"ta"}"#, Some("heidi_plex"), None, "{}").await.unwrap();
         assert_eq!(db.list_enabled_sources().await.unwrap().len(), 1);
-        assert!(db.get_source(a, "plex").await.unwrap().is_some());
+        assert!(db.get_source(a, a_id).await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn several_sources_of_one_kind_coexist() {
+        let db = testdb().await;
+        let uid = db.create_user("kate", None, "x", "user").await.unwrap();
+
+        let living = db.create_source(uid, "plex", "Living Room", true, "http://plex-a",
+            r#"{"token":"ta"}"#, Some("kate"), None, "{}").await.unwrap();
+        let study = db.create_source(uid, "plex", "Study", true, "http://plex-b",
+            r#"{"token":"tb"}"#, Some("kate"), None, "{}").await.unwrap();
+        let nav = db.create_source(uid, "navidrome", "NAS", true, "http://nd",
+            r#"{"username":"kate","password":"pw"}"#, Some("kate"), None, "{}").await.unwrap();
+
+        // Two Plex servers used to be impossible: the table had UNIQUE(user, kind).
+        assert_ne!(living, study);
+        assert_eq!(db.list_sources_for_user(uid).await.unwrap().len(), 3);
+        assert_eq!(db.list_enabled_sources().await.unwrap().len(), 3);
+
+        // Each keeps its own credentials and label.
+        assert_eq!(db.get_source(uid, living).await.unwrap().unwrap().credential("token").as_deref(), Some("ta"));
+        assert_eq!(db.get_source(uid, study).await.unwrap().unwrap().credential("token").as_deref(), Some("tb"));
+        assert_eq!(db.get_source(uid, study).await.unwrap().unwrap().label, "Study");
+
+        // Deleting one leaves its twin alone.
+        assert!(db.delete_source(uid, living).await.unwrap());
+        let left = db.list_sources_for_user(uid).await.unwrap();
+        assert_eq!(left.len(), 2);
+        assert!(left.iter().any(|s| s.id == study));
+        assert!(left.iter().any(|s| s.id == nav));
+    }
+
+    #[tokio::test]
+    async fn a_listen_remembers_which_source_produced_it() {
+        let db = testdb().await;
+        let uid = db.create_user("liam", None, "x", "user").await.unwrap();
+        let a = db.create_source(uid, "plex", "A", true, "http://a", r#"{"token":"ta"}"#, Some("liam"), None, "{}").await.unwrap();
+        let b = db.create_source(uid, "plex", "B", true, "http://b", r#"{"token":"tb"}"#, Some("liam"), None, "{}").await.unwrap();
+
+        db.save_scrobble(uid, &play("From A", "Artist", 100), None, None, None, None, Some("Plex"), Some(a)).await.unwrap();
+        db.save_scrobble(uid, &play("From B", "Artist", 200), None, None, None, None, Some("Plex"), Some(b)).await.unwrap();
+
+        // Without this the artwork proxy couldn't tell which of two Plex servers
+        // to ask for a given listen's cover.
+        let rows = db.get_all_scrobbles(uid).await.unwrap();
+        let from_a = rows.iter().find(|r| r.title == "From A").unwrap();
+        let from_b = rows.iter().find(|r| r.title == "From B").unwrap();
+        assert_eq!(from_a.source_ref, Some(a));
+        assert_eq!(from_b.source_ref, Some(b));
     }
 
     #[tokio::test]
     async fn recording_a_poll_does_not_look_like_a_config_change() {
         let db = testdb().await;
         let uid = db.create_user("judy", None, "x", "user").await.unwrap();
-        db.save_source(uid, "plex", true, "http://p", r#"{"token":"t"}"#, Some("judy_plex"), None, "{}").await.unwrap();
-        let before = db.get_source(uid, "plex").await.unwrap().unwrap();
+        let sid = db.create_source(uid, "plex", "P", true, "http://p", r#"{"token":"t"}"#, Some("judy_plex"), None, "{}").await.unwrap();
+        let before = db.get_source(uid, sid).await.unwrap().unwrap();
 
         db.record_source_poll(before.id, Some("boom")).await.unwrap();
-        let after = db.get_source(uid, "plex").await.unwrap().unwrap();
+        let after = db.get_source(uid, sid).await.unwrap().unwrap();
 
         // If a poll bumped updated_at the engine would rebuild the source every
         // single tick, reconnecting endlessly.

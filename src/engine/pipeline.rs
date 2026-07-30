@@ -8,7 +8,7 @@ use crate::db::Database;
 use crate::musicbrainz::MusicBrainzClient;
 use crate::server::now_playing::{NowPlaying, NowPlayingRegistry};
 use crate::sinks;
-use crate::sources::{MusicSource, NavidromeSource, PlexFilters, PlexSource};
+use crate::sources::{JellyfinSource, MusicSource, NavidromeSource, PlexFilters, PlexSource};
 
 use super::enrichment::enrich_play;
 
@@ -187,6 +187,14 @@ impl ScrobbleEngine {
                 }
                 Ok(Box::new(nd))
             }
+            "jellyfin" => {
+                let key = cfg.credential("api_key").ok_or("no Jellyfin API key stored")?;
+                let account = cfg.remote_account.clone()
+                    .ok_or("Jellyfin account not resolved — reconnect the source")?;
+                let mut jf = JellyfinSource::new(cfg.url.clone(), key, account);
+                jf.initialize().await?;
+                Ok(Box::new(jf))
+            }
             other => Err(format!("unknown source kind: {other}").into()),
         }
     }
@@ -285,7 +293,7 @@ impl ScrobbleEngine {
                         let album = play.album.clone();
                         enrich_play(mb_client, &mut play, album.as_deref()).await;
                     }
-                    match db.save_scrobble(user_id, &play, None, None, None, None, Some("Navidrome")).await {
+                    match db.save_scrobble(user_id, &play, None, None, None, None, Some("Navidrome"), Some(row_id)).await {
                         Ok(true) => info!("📥 Queued for user {}: {} - {}", user_id, play.artist, play.title),
                         Ok(false) => {}
                         Err(e) => error!("Database error: {}", e),
@@ -301,6 +309,77 @@ impl ScrobbleEngine {
                     debug!("Navidrome still failing for user {}: {}", user_id, msg);
                 }
                 let _ = db.record_source_poll(row_id, Some(&msg)).await;
+            }
+        }
+    }
+
+    /// Poll one Jellyfin source. Session-shaped like Plex — there is no history
+    /// endpoint to backfill from, so everything comes from what's playing now.
+    #[allow(clippy::too_many_arguments)]
+    async fn poll_jellyfin(
+        &mut self, i: usize,
+        db: &Arc<Database>, mb_client: &Arc<MusicBrainzClient>, lb_url: &str,
+        now_playing: &NowPlayingRegistry, has_active: &mut bool,
+    ) {
+        let (row_id, user_id) = (self.sources[i].row_id, self.sources[i].user_id);
+        let Some(jf) = self.sources[i].source.as_any_mut().downcast_mut::<JellyfinSource>() else {
+            return;
+        };
+
+        let sessions = match jf.fetch_sessions().await {
+            Ok(s) => {
+                if self.sources[i].error_logged {
+                    info!("✅ Jellyfin recovered for user {}", user_id);
+                    self.sources[i].error_logged = false;
+                }
+                let _ = db.record_source_poll(row_id, None).await;
+                s
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                if !self.sources[i].error_logged {
+                    error!("Jellyfin fetch failed for user {}: {}", user_id, msg);
+                    self.sources[i].error_logged = true;
+                } else {
+                    debug!("Jellyfin still failing for user {}: {}", user_id, msg);
+                }
+                let _ = db.record_source_poll(row_id, Some(&msg)).await;
+                return;
+            }
+        };
+
+        if sessions.now_playing.is_empty() {
+            now_playing.clear_user_source(user_id, "Jellyfin");
+        } else {
+            *has_active = true;
+        }
+
+        for track in &sessions.now_playing {
+            let mut play = track.play.clone();
+            if play.mbid_recording.is_none() {
+                let album = play.album.clone();
+                enrich_play(mb_client, &mut play, album.as_deref()).await;
+            }
+            now_playing.set(user_id, NowPlaying::from_play(
+                &play, "Jellyfin", track.quality.as_ref(), track.position,
+            ));
+            let sinks = sinks::sinks_for_user(db, user_id, lb_url).await;
+            sinks::submit_now_playing(&sinks, &play).await;
+        }
+
+        for track in sessions.ready_to_scrobble {
+            let mut play = track.play;
+            let dupe = db.exists(user_id, &play.source_id, &play.source_name).await.unwrap_or(false)
+                || db.fuzzy_exists(user_id, &play.title, &play.artist, play.timestamp as i64).await.unwrap_or(false);
+            if dupe { continue; }
+            if play.mbid_recording.is_none() {
+                let album = play.album.clone();
+                enrich_play(mb_client, &mut play, album.as_deref()).await;
+            }
+            match db.save_scrobble(user_id, &play, track.quality.as_ref(), None, None, None, Some("Jellyfin"), Some(row_id)).await {
+                Ok(true) => info!("📥 Queued for user {}: {} - {}", user_id, play.artist, play.title),
+                Ok(false) => {}
+                Err(e) => error!("Database error: {}", e),
             }
         }
     }
@@ -321,6 +400,10 @@ impl ScrobbleEngine {
 
             let (row_id, user_id) = (self.sources[i].row_id, self.sources[i].user_id);
 
+            if self.sources[i].kind == "jellyfin" {
+                self.poll_jellyfin(i, &db, &mb_client, &lb_url, &now_playing, &mut has_active_now_playing).await;
+                continue;
+            }
             if self.sources[i].kind == "navidrome" {
                 self.poll_navidrome(i, &db, &mb_client, &lb_url, &now_playing, &mut has_active_now_playing).await;
                 continue;
@@ -405,7 +488,7 @@ impl ScrobbleEngine {
 
                 match db.save_scrobble(
                     user_id, &play, quality_ref,
-                    None, None, None, Some("Plex"),
+                    None, None, None, Some("Plex"), Some(row_id),
                 ).await {
                     Ok(true) => info!("📥 Queued for user {}: {} - {} [quality: {}]",
                         user_id, play.artist, play.title, quality_log),

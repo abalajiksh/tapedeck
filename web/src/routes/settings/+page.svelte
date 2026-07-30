@@ -2,14 +2,34 @@
 	import { onMount, onDestroy } from 'svelte';
 	import { api } from '$lib/api';
 	import type { TokenInfo } from '$lib/api';
-	import { formatDateTime, timeAgo } from '$lib/utils';
+	import { formatDateTime } from '$lib/utils';
 	import { theme, setTheme, type ThemeMode } from '$lib/theme';
 	import { showArtwork, setShowArtwork } from '$lib/prefs';
-	import type { Connection, UserSource, SourceTestResult } from '$lib/api';
+	import type { Connection } from '$lib/api';
+	import SourcesPanel from '$lib/components/SourcesPanel.svelte';
 
 	const uiVersion = __UI_VERSION__;
 	let backendVersion = '…';
 	let origin = typeof window !== 'undefined' ? window.location.origin : 'http://your-server:8080';
+
+	// ── Sub-sections ──
+	// The page had grown to nine stacked panels; splitting it means the thing you
+	// came for is one click away instead of a scroll hunt. The section lives in the
+	// hash so a link like /settings#sources lands where it says it will.
+	const SECTIONS = [
+		{ id: 'appearance', label: 'Appearance', hint: 'Theme, artwork, timezone' },
+		{ id: 'sources', label: 'Sources', hint: 'Plex, Navidrome, Jellyfin' },
+		{ id: 'connections', label: 'Connections', hint: 'Where listens are forwarded' },
+		{ id: 'tokens', label: 'API Tokens', hint: 'Scrobble clients' },
+		{ id: 'data', label: 'Data', hint: 'Export, backup, wipe' },
+		{ id: 'maintenance', label: 'Maintenance', hint: 'Enrichment and health' },
+		{ id: 'about', label: 'About', hint: 'Version, sign out' }
+	];
+	let section = 'appearance';
+	function go(id: string) {
+		section = id;
+		if (typeof history !== 'undefined') history.replaceState(null, '', `#${id}`);
+	}
 
 	let tokens: TokenInfo[] = [];
 	let loading = true;
@@ -168,141 +188,23 @@
 		if (svc === 'lastfm' || svc === 'librefm') fmPendingToken[svc as Scrobbler] = '';
 	}
 
-	// ── Sources (per user) ──
-	// Every user configures their own; nothing here is admin-gated any more.
-	let plex: UserSource | null = null;
-	let plexUrl = '';
-	let plexToken = '';        // blank = keep the stored one; never sent back to us
-	let plexEnabled = false;
-	let plexFilters = { libraries_allow: '', libraries_block: '', devices_allow: '', devices_block: '' };
-	let plexAdvanced = false;
-	let plexBusy = false;
-	let plexMsg = '';
-	let plexError = '';
-	let plexTest: SourceTestResult | null = null;
-
-	function applyPlex(s: UserSource | null) {
-		plex = s;
-		plexUrl = s?.url ?? '';
-		plexEnabled = s?.enabled ?? false;
-		plexToken = '';
-		plexFilters = {
-			libraries_allow: (s?.libraries_allow ?? []).join(', '),
-			libraries_block: (s?.libraries_block ?? []).join(', '),
-			devices_allow: (s?.devices_allow ?? []).join(', '),
-			devices_block: (s?.devices_block ?? []).join(', ')
-		};
-	}
-
-	const splitList = (s: string) => s.split(',').map((x) => x.trim()).filter(Boolean);
-
-	// ── Navidrome ──
-	// Logs in as a user rather than with a token: Subsonic hashes password+salt
-	// on every request, so the password itself has to be stored (encrypted).
-	let nd: UserSource | null = null;
-	let ndUrl = '', ndUser = '', ndPass = '', ndEnabled = false;
-	let ndBusy = false, ndMsg = '', ndError = '';
-	let ndTest: SourceTestResult | null = null;
-
-	function applyNd(s: UserSource | null) {
-		nd = s;
-		ndUrl = s?.url ?? '';
-		ndUser = s?.username ?? '';
-		ndEnabled = s?.enabled ?? false;
-		ndPass = '';
-	}
-
-	async function loadSources() {
-		try {
-			const r = await api.getSources();
-			applyPlex(r.sources.find((s) => s.kind === 'plex') ?? null);
-			applyNd(r.sources.find((s) => s.kind === 'navidrome') ?? null);
-		} catch { /* leave the forms empty */ }
-	}
-
-	async function saveNd() {
-		ndBusy = true; ndError = ''; ndMsg = ''; ndTest = null;
-		try {
-			applyNd(await api.putSource('navidrome', {
-				enabled: ndEnabled,
-				url: ndUrl.trim(),
-				username: ndUser.trim(),
-				...(ndPass ? { password: ndPass } : {})
-			}));
-			ndMsg = 'Saved — history backfill starts within a few seconds.';
-		} catch (e) { ndError = String(e).replace(/^API \d+: /, ''); }
-		ndBusy = false;
-	}
-
-	async function testNd() {
-		ndBusy = true; ndError = ''; ndMsg = ''; ndTest = null;
-		try {
-			ndTest = await api.testSource('navidrome', {
-				url: ndUrl.trim(), username: ndUser.trim(),
-				...(ndPass ? { password: ndPass } : {})
-			});
-		} catch (e) { ndError = String(e).replace(/^API \d+: /, ''); }
-		ndBusy = false;
-	}
-
-	async function disconnectNd() {
-		ndBusy = true; ndError = ''; ndMsg = '';
-		try { await api.deleteSource('navidrome'); applyNd(null); ndMsg = 'Disconnected.'; }
-		catch (e) { ndError = String(e).replace(/^API \d+: /, ''); }
-		ndBusy = false;
-	}
-
-	async function savePlex() {
-		plexBusy = true; plexError = ''; plexMsg = ''; plexTest = null;
-		try {
-			applyPlex(await api.putSource('plex', {
-				enabled: plexEnabled,
-				url: plexUrl.trim(),
-				...(plexToken.trim() ? { token: plexToken.trim() } : {}),
-				libraries_allow: splitList(plexFilters.libraries_allow),
-				libraries_block: splitList(plexFilters.libraries_block),
-				devices_allow: splitList(plexFilters.devices_allow),
-				devices_block: splitList(plexFilters.devices_block)
-			}));
-			plexMsg = 'Saved — polling starts within a few seconds.';
-		} catch (e) {
-			plexError = String(e).replace(/^API \d+: /, '');
-		}
-		plexBusy = false;
-	}
-
-	async function testPlex() {
-		plexBusy = true; plexError = ''; plexMsg = ''; plexTest = null;
-		try {
-			plexTest = await api.testSource('plex', {
-				url: plexUrl.trim(),
-				...(plexToken.trim() ? { token: plexToken.trim() } : {})
-			});
-		} catch (e) {
-			plexError = String(e).replace(/^API \d+: /, '');
-		}
-		plexBusy = false;
-	}
-
-	async function disconnectPlex() {
-		plexBusy = true; plexError = ''; plexMsg = ''; plexTest = null;
-		try {
-			await api.deleteSource('plex');
-			applyPlex(null);
-			plexMsg = 'Disconnected.';
-		} catch (e) {
-			plexError = String(e).replace(/^API \d+: /, '');
-		}
-		plexBusy = false;
-	}
-
 	const themes: { v: ThemeMode; label: string }[] = [
 		{ v: 'light', label: 'Light' },
 		{ v: 'dark', label: 'Dark' },
 		{ v: 'system', label: 'System' }
 	];
 
+	function sectionFromHash() {
+		const h = window.location.hash.slice(1);
+		if (SECTIONS.some((s) => s.id === h)) section = h;
+	}
+
 	onMount(async () => {
+		sectionFromHash();
+		// A hash-only navigation (a link from elsewhere in the SPA, or Back after
+		// clicking through sections) doesn't remount this page, so follow it.
+		window.addEventListener('hashchange', sectionFromHash);
+
 		try {
 			const [health, tokensRes] = await Promise.all([api.health(), api.getTokens()]);
 			backendVersion = health.version;
@@ -314,7 +216,6 @@
 			timezone = (prefs.timezone as string) || Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC';
 		} catch { timezone = 'UTC'; }
 		try { isAdmin = (await api.me()).is_admin; } catch { /* optional */ }
-		loadSources();
 		loadArtStatus();
 		loadConnections();
 		loadLangStatus();
@@ -324,6 +225,7 @@
 	onDestroy(() => {
 		if (langPoll) clearInterval(langPoll);
 		if (artPoll) clearInterval(artPoll);
+		if (typeof window !== 'undefined') window.removeEventListener('hashchange', sectionFromHash);
 	});
 
 	async function createToken() {
@@ -412,467 +314,276 @@
 <h1 class="h-display" style="font-size:38px;margin-bottom:6px;">Settings</h1>
 <p style="margin:0 0 24px;color:var(--td-muted);font-size:15px;">Tokens, connections, and the machinery behind the deck.</p>
 
-<!-- Appearance -->
-<div class="panel" style="border-radius:22px;padding:24px;margin-bottom:18px;">
-	<h3 class="h-display" style="font-size:19px;margin-bottom:4px;">Appearance</h3>
-	<p style="font-size:13px;color:var(--td-muted);margin:0 0 16px;">Choose a theme, or follow your system. Saved to your profile so every device matches.</p>
-	<div style="display:flex;background:var(--td-sidebar);border-radius:999px;padding:4px;gap:2px;max-width:360px;">
-		{#each themes as o}
-			<button class="seg-btn" class:on={$theme === o.v} on:click={() => setTheme(o.v)} style="flex:1;">{o.label}</button>
+<div class="settings-layout">
+	<nav class="settings-nav" aria-label="Settings sections">
+		{#each SECTIONS as s}
+			<button class="nav-item" class:on={section === s.id} on:click={() => go(s.id)}>
+				<span class="nav-label">{s.label}</span>
+				<span class="nav-hint">{s.hint}</span>
+			</button>
 		{/each}
-	</div>
+	</nav>
 
-	<div style="margin-top:18px;padding-top:18px;border-top:1px solid var(--td-border);">
-		<label style="display:flex;align-items:center;gap:10px;cursor:pointer;font-size:14px;">
-			<input type="checkbox" checked={$showArtwork} on:change={(e) => setShowArtwork(e.currentTarget.checked)}
-				style="width:16px;height:16px;accent-color:var(--td-accent);cursor:pointer;">
-			Show album art
-		</label>
-		<p style="font-size:12.5px;color:var(--td-muted);margin:6px 0 0;">
-			Covers come from the Cover Art Archive, matched via MusicBrainz. Listens without a match keep the lettered tile.
-		</p>
-
-		{#if artStatus}
-			<div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-top:12px;">
-				<div style="flex:1;min-width:180px;">
-					<div style="height:8px;border-radius:999px;background:var(--td-track);overflow:hidden;">
-						<div style="height:100%;width:{artStatus.total ? (artStatus.resolved / artStatus.total) * 100 : 0}%;background:linear-gradient(90deg,var(--td-accent-2),var(--td-accent));border-radius:999px;transition:width .4s;"></div>
-					</div>
-					<div style="font-size:12.5px;color:var(--td-muted-2);margin-top:6px;">
-						{artStatus.resolved} / {artStatus.total} listens have artwork
-					</div>
+	<div class="settings-body">
+		{#if section === 'appearance'}
+			<div class="panel" style="border-radius:22px;padding:24px;margin-bottom:18px;">
+				<h3 class="h-display" style="font-size:19px;margin-bottom:4px;">Appearance</h3>
+				<p style="font-size:13px;color:var(--td-muted);margin:0 0 16px;">Choose a theme, or follow your system. Saved to your profile so every device matches.</p>
+				<div style="display:flex;background:var(--td-sidebar);border-radius:999px;padding:4px;gap:2px;max-width:360px;">
+					{#each themes as o}
+						<button class="seg-btn" class:on={$theme === o.v} on:click={() => setTheme(o.v)} style="flex:1;">{o.label}</button>
+					{/each}
 				</div>
-				{#if isAdmin}
-					<button class="btn btn-secondary" on:click={runArtworkBackfill} disabled={fetchingArt || artStatus.pending === 0}>
-						{fetchingArt ? 'Fetching…' : artStatus.pending === 0 ? 'All fetched' : 'Fetch missing art'}
-					</button>
-				{/if}
-			</div>
-			{#if fetchingArt}
-				<p style="font-size:12px;color:var(--td-muted-3);margin:8px 0 0;">
-					Rate-limited by MusicBrainz, so a large history takes a while. It also runs on its own in the background — you can leave this page.
-				</p>
-			{/if}
-		{/if}
-	</div>
 
-	<div style="margin-top:18px;">
-		<div class="field" style="max-width:360px;"><label for="tz">Timezone <span style="opacity:.6">(for local-time analytics)</span></label>
-			<div style="display:flex;gap:8px;position:relative;">
-				<div style="flex:1;position:relative;">
-					<input
-						id="tz" class="input" bind:value={timezone} placeholder="Type to search — e.g. Berlin"
-						autocomplete="off" role="combobox" aria-expanded={tzMatches.length > 0} aria-controls="tz-list"
-						on:focus={() => (tzFocused = true)}
-						on:blur={() => setTimeout(() => (tzFocused = false), 120)}
-						on:keydown={tzKeydown}
-					>
-					{#if tzMatches.length}
-						<ul id="tz-list" class="tz-list">
-							{#each tzMatches as z, i}
-								<li>
-									<button
-										type="button"
-										class="tz-option"
-										class:active={i === tzIndex}
-										on:mouseenter={() => (tzIndex = i)}
-										on:click={() => pickZone(z)}
-									>{z.replace(/_/g, ' ')}</button>
-								</li>
-							{/each}
-						</ul>
-					{/if}
+				<div style="margin-top:18px;padding-top:18px;border-top:1px solid var(--td-border);">
+					<label style="display:flex;align-items:center;gap:10px;cursor:pointer;font-size:14px;">
+						<input type="checkbox" checked={$showArtwork} on:change={(e) => setShowArtwork(e.currentTarget.checked)}
+							style="width:16px;height:16px;accent-color:var(--td-accent);cursor:pointer;">
+						Show album art
+					</label>
+					<p style="font-size:12.5px;color:var(--td-muted);margin:6px 0 0;">
+						Covers come from your own library where the listen came from one, then Deezer, then the
+						Cover Art Archive. Listens with no match anywhere keep the lettered tile.
+						{#if artStatus}
+							<a href="#maintenance" on:click|preventDefault={() => go('maintenance')}>Fetch missing art →</a>
+						{/if}
+					</p>
 				</div>
-				<button class="btn btn-secondary" on:click={saveTimezone}>{tzSaved ? '✓' : 'Save'}</button>
-			</div>
-		</div>
-	</div>
-</div>
 
-<!-- Navidrome: history backfill + now playing, per user -->
-<div class="panel" style="border-radius:22px;padding:24px;margin-bottom:18px;">
-	<h3 class="h-display" style="font-size:19px;margin-bottom:4px;">Navidrome</h3>
-	<p style="font-size:13px;color:var(--td-muted);margin:0 0 16px;">
-		Signs in as you and pulls <em>your</em> play history — Navidrome keeps its own, so this
-		backfills listens from before Tapedeck existed, then keeps up live. Your library's
-		MusicBrainz IDs come along, which spares those listens a MusicBrainz lookup.
-	</p>
-
-	{#if ndError}<div style="font-size:13px;color:#b2622d;margin-bottom:12px;">{ndError}</div>{/if}
-
-	<div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;padding:4px 0 14px;">
-		<label style="display:flex;align-items:center;gap:10px;cursor:pointer;font-size:14px;">
-			<input type="checkbox" bind:checked={ndEnabled} style="width:16px;height:16px;accent-color:var(--td-accent);cursor:pointer;">
-			Poll my Navidrome
-		</label>
-		{#if nd?.last_error}
-			<span class="tag tag-outline" style="font-size:11px;color:#b2622d;">last poll failed</span>
-		{:else if nd?.last_polled_at}
-			<span style="font-size:12px;color:var(--td-muted-3);">polled {timeAgo(nd.last_polled_at)}</span>
-		{/if}
-	</div>
-
-	<div style="display:flex;gap:12px;flex-wrap:wrap;">
-		<div class="field" style="flex:2;min-width:220px;">
-			<label for="nd-url">Server URL</label>
-			<input id="nd-url" class="input" bind:value={ndUrl} placeholder="http://192.168.1.10:4533">
-		</div>
-		<div class="field" style="flex:1;min-width:150px;">
-			<label for="nd-user">Username</label>
-			<input id="nd-user" class="input" bind:value={ndUser} placeholder="ashwin">
-		</div>
-		<div class="field" style="flex:1;min-width:150px;">
-			<label for="nd-pass">
-				Password {#if nd?.has_token}<span style="color:var(--td-good-fg);">· stored</span>{/if}
-			</label>
-			<input id="nd-pass" class="input" type="password" bind:value={ndPass}
-				placeholder={nd?.has_token ? 'Leave blank to keep' : 'Your Navidrome password'}>
-		</div>
-	</div>
-
-	<p style="font-size:12.5px;color:var(--td-muted-2);margin:10px 0 0;">
-		Navidrome's Subsonic API hashes your password on every request, so unlike a token it has to
-		be stored rather than exchanged. It's encrypted at rest with a key kept outside the database.
-	</p>
-
-	{#if nd?.last_error}
-		<p style="font-size:12.5px;color:#b2622d;margin:10px 0 0;font-family:monospace;word-break:break-word;">{nd.last_error}</p>
-	{/if}
-
-	<div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-top:16px;">
-		<button class="btn btn-primary" on:click={saveNd} disabled={ndBusy}>{ndBusy ? '…' : 'Save'}</button>
-		<button class="btn btn-secondary" on:click={testNd} disabled={ndBusy}>Test connection</button>
-		{#if nd}
-			<button class="btn btn-secondary" style="color:#b2622d;" on:click={disconnectNd} disabled={ndBusy}>Disconnect</button>
-		{/if}
-		{#if ndMsg}<span style="font-size:13px;color:var(--td-good-fg);">✓ {ndMsg}</span>{/if}
-	</div>
-
-	{#if ndTest}
-		<div style="margin-top:14px;font-size:13px;">
-			{#if ndTest.ok}
-				<span style="color:var(--td-good-fg);">✓ Signed in as {ndTest.account}</span>
-			{:else}
-				<span style="color:#b2622d;">✗ {ndTest.error}</span>
-			{/if}
-		</div>
-	{/if}
-</div>
-
-<!-- Language enrichment (admin) -->
-{#if isAdmin}
-	<div class="panel" style="border-radius:22px;padding:24px;margin-bottom:18px;">
-		<h3 class="h-display" style="font-size:19px;margin-bottom:4px;">Language Enrichment</h3>
-		<p style="font-size:13px;color:var(--td-muted);margin:0 0 16px;">Classify listens by language for the Analytics breakdown — instant for non-Latin scripts, MusicBrainz (rate-limited) for the rest. Runs automatically in the background; use this to fill the backlog now.</p>
-		<div style="display:flex;align-items:center;gap:14px;flex-wrap:wrap;">
-			<button class="btn btn-primary" on:click={runEnrichment} disabled={enriching}>{enriching ? 'Enriching…' : 'Enrich languages'}</button>
-			{#if langStatus}
-				<span style="font-size:13.5px;color:var(--td-muted);">{langStatus.resolved} / {langStatus.total} classified{langStatus.pending ? ` · ${langStatus.pending} pending` : ''}</span>
-			{/if}
-		</div>
-	</div>
-{/if}
-
-<!-- Connections -->
-<div class="panel" style="border-radius:22px;padding:24px;margin-bottom:18px;">
-	<h3 class="h-display" style="font-size:19px;margin-bottom:4px;">Scrobble Connections</h3>
-	<p style="font-size:13px;color:var(--td-muted);margin:0 0 16px;">Forward <em>your</em> listens to your own accounts. Nothing is shared across users, and a service you don't connect simply isn't forwarded to — listens are always kept locally either way.</p>
-
-	{#if connError}<div style="font-size:13px;color:#b2622d;margin-bottom:12px;">{connError}</div>{/if}
-
-	<!-- ListenBrainz -->
-	<div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;padding:12px 0;border-bottom:1px solid var(--td-border);">
-		<div style="flex:1;min-width:160px;">
-			<div style="font-weight:600;font-size:14px;">ListenBrainz</div>
-			{#if conn('listenbrainz')}
-				<div style="font-size:12.5px;color:var(--td-good-fg);">Connected{conn('listenbrainz')?.username ? ` as ${conn('listenbrainz')?.username}` : ''}</div>
-			{:else}
-				<div style="font-size:12.5px;color:var(--td-muted-2);">Paste your user token from listenbrainz.org → Settings.</div>
-			{/if}
-		</div>
-		{#if conn('listenbrainz')}
-			<button class="btn btn-secondary" style="color:#b2622d;" on:click={() => disconnectSvc('listenbrainz')}>Disconnect</button>
-		{:else}
-			<input class="input" style="width:220px;" type="password" bind:value={lbToken} placeholder="ListenBrainz token">
-			<button class="btn btn-primary" on:click={connectLB} disabled={lbBusy || !lbToken.trim()}>{lbBusy ? '…' : 'Connect'}</button>
-		{/if}
-	</div>
-
-	<!-- Last.fm and Libre.fm: same approve-then-finish flow -->
-	{#each [{ id: 'lastfm', label: 'Last.fm' }, { id: 'librefm', label: 'Libre.fm' }] as svc, i}
-		{@const key = svc.id as 'lastfm' | 'librefm'}
-		<div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;padding:12px 0;{i === 0 ? 'border-bottom:1px solid var(--td-border);' : ''}">
-			<div style="flex:1;min-width:160px;">
-				<div style="font-weight:600;font-size:14px;">{svc.label}</div>
-				{#if conn(key)}
-					<div style="font-size:12.5px;color:var(--td-good-fg);">Connected{conn(key)?.username ? ` as ${conn(key)?.username}` : ''}</div>
-				{:else if fmPendingToken[key]}
-					<div style="font-size:12.5px;color:var(--td-accent);">Approve Tapedeck in the {svc.label} tab, then click “Finish”.</div>
-				{:else}
-					<div style="font-size:12.5px;color:var(--td-muted-2);">Click Connect, approve on {svc.label}, then finish.</div>
-				{/if}
-			</div>
-			{#if conn(key)}
-				<button class="btn btn-secondary" style="color:#b2622d;" on:click={() => disconnectSvc(key)}>Disconnect</button>
-			{:else}
-				<button class="btn btn-primary" on:click={() => scrobblerConnect(key)} disabled={fmBusy !== null}>
-					{fmBusy === key ? '…' : fmPendingToken[key] ? 'Finish connecting' : `Connect ${svc.label}`}
-				</button>
-				{#if fmPendingToken[key]}<button class="btn btn-secondary" on:click={() => (fmPendingToken[key] = '')}>Cancel</button>{/if}
-			{/if}
-		</div>
-	{/each}
-</div>
-
-<!-- Sources: where this user's listens come *from*. Per user, not per server. -->
-<div class="panel" style="border-radius:22px;padding:24px;margin-bottom:18px;">
-	<h3 class="h-display" style="font-size:19px;margin-bottom:4px;">Plex</h3>
-	<p style="font-size:13px;color:var(--td-muted);margin:0 0 16px;">
-		Where <em>your</em> listens come from. Paste your own Plex token — Tapedeck works out which
-		Plex account it belongs to and only records that account's playback, so nobody else on the
-		server ends up in your history.
-	</p>
-
-	{#if plexError}<div style="font-size:13px;color:#b2622d;margin-bottom:12px;">{plexError}</div>{/if}
-
-	<div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;padding:4px 0 14px;">
-		<label style="display:flex;align-items:center;gap:10px;cursor:pointer;font-size:14px;">
-			<input type="checkbox" bind:checked={plexEnabled} style="width:16px;height:16px;accent-color:var(--td-accent);cursor:pointer;">
-			Poll my Plex
-		</label>
-		{#if plex?.remote_account}
-			<span class="tag tag-accent-2" style="font-size:11px;">{plex.remote_account}</span>
-		{/if}
-		{#if plex?.last_error}
-			<span class="tag tag-outline" style="font-size:11px;color:#b2622d;">last poll failed</span>
-		{:else if plex?.last_polled_at}
-			<span style="font-size:12px;color:var(--td-muted-3);">polled {timeAgo(plex.last_polled_at)}</span>
-		{/if}
-	</div>
-
-	<div style="display:flex;gap:12px;flex-wrap:wrap;">
-		<div class="field" style="flex:2;min-width:240px;">
-			<label for="plex-url">Server URL</label>
-			<input id="plex-url" class="input" bind:value={plexUrl} placeholder="http://192.168.1.10:32400">
-		</div>
-		<div class="field" style="flex:1;min-width:200px;">
-			<label for="plex-token">
-				X-Plex-Token {#if plex?.has_token}<span style="color:var(--td-good-fg);">· stored</span>{/if}
-			</label>
-			<input id="plex-token" class="input" type="password" bind:value={plexToken}
-				placeholder={plex?.has_token ? 'Leave blank to keep' : 'Paste your token'}>
-		</div>
-	</div>
-
-	{#if plex?.last_error}
-		<p style="font-size:12.5px;color:#b2622d;margin:10px 0 0;font-family:monospace;word-break:break-word;">
-			{plex.last_error}
-		</p>
-	{/if}
-
-	<button class="btn btn-ghost" style="margin-top:12px;font-size:13px;" on:click={() => (plexAdvanced = !plexAdvanced)}>
-		{plexAdvanced ? '− Hide' : '+ Show'} filters
-	</button>
-
-	{#if plexAdvanced}
-		<p style="font-size:12.5px;color:var(--td-muted-2);margin:8px 0 12px;">
-			Comma-separated. Leave a list empty to allow everything; a block list always wins over an
-			allow list. Blocking your Podcasts and Audiobooks libraries is the usual reason to touch this.
-		</p>
-		<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px;">
-			<div class="field"><label for="pf-la">Libraries — allow</label><input id="pf-la" class="input" bind:value={plexFilters.libraries_allow} placeholder="Music"></div>
-			<div class="field"><label for="pf-lb">Libraries — block</label><input id="pf-lb" class="input" bind:value={plexFilters.libraries_block} placeholder="Podcasts, Audiobooks"></div>
-			<div class="field"><label for="pf-da">Devices — allow</label><input id="pf-da" class="input" bind:value={plexFilters.devices_allow} placeholder="Living Room"></div>
-			<div class="field"><label for="pf-db">Devices — block</label><input id="pf-db" class="input" bind:value={plexFilters.devices_block} placeholder="Chrome"></div>
-		</div>
-	{/if}
-
-	<div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-top:16px;">
-		<button class="btn btn-primary" on:click={savePlex} disabled={plexBusy}>{plexBusy ? '…' : 'Save'}</button>
-		<button class="btn btn-secondary" on:click={testPlex} disabled={plexBusy}>Test connection</button>
-		{#if plex}
-			<button class="btn btn-secondary" style="color:#b2622d;" on:click={disconnectPlex} disabled={plexBusy}>Disconnect</button>
-		{/if}
-		{#if plexMsg}
-			<span style="font-size:13px;color:var(--td-good-fg);">✓ {plexMsg}</span>
-		{/if}
-	</div>
-
-	{#if plexTest}
-		<div style="margin-top:14px;font-size:13px;">
-			{#if plexTest.ok}
-				<span style="color:var(--td-good-fg);">✓ Reached the server.</span>
-				<span style="color:var(--td-muted);">
-					{plexTest.libraries?.length ? `Libraries: ${plexTest.libraries.join(', ')}` : 'No libraries reported.'}
-				</span>
-				<div style="margin-top:6px;">
-					{#if plexTest.account}
-						<span style="color:var(--td-good-fg);">✓ Token belongs to {plexTest.account}</span>
-					{:else}
-						<span style="color:#b2622d;">✗ Could not identify the account: {plexTest.account_error}</span>
-					{/if}
-				</div>
-			{:else}
-				<span style="color:#b2622d;">✗ {plexTest.error}</span>
-			{/if}
-		</div>
-	{/if}
-</div>
-
-<!-- Language enrichment (admin) -->
-{#if isAdmin}
-	<div class="panel" style="border-radius:22px;padding:24px;margin-bottom:18px;">
-		<h3 class="h-display" style="font-size:19px;margin-bottom:4px;">Language Enrichment</h3>
-		<p style="font-size:13px;color:var(--td-muted);margin:0 0 16px;">Classify listens by language for the Analytics breakdown — instant for non-Latin scripts, MusicBrainz (rate-limited) for the rest. Runs automatically in the background; use this to fill the backlog now.</p>
-		<div style="display:flex;align-items:center;gap:14px;flex-wrap:wrap;">
-			<button class="btn btn-primary" on:click={runEnrichment} disabled={enriching}>{enriching ? 'Enriching…' : 'Enrich languages'}</button>
-			{#if langStatus}
-				<span style="font-size:13.5px;color:var(--td-muted);">{langStatus.resolved} / {langStatus.total} classified{langStatus.pending ? ` · ${langStatus.pending} pending` : ''}</span>
-			{/if}
-		</div>
-	</div>
-{/if}
-
-<!-- Connections -->
-<div class="panel" style="border-radius:22px;padding:24px;margin-bottom:18px;">
-	<h3 class="h-display" style="font-size:19px;margin-bottom:4px;">Scrobble Connections</h3>
-	<p style="font-size:13px;color:var(--td-muted);margin:0 0 16px;">Forward <em>your</em> listens to your own accounts. Nothing is shared across users, and a service you don't connect simply isn't forwarded to — listens are always kept locally either way.</p>
-
-	{#if connError}<div style="font-size:13px;color:#b2622d;margin-bottom:12px;">{connError}</div>{/if}
-
-	<!-- ListenBrainz -->
-	<div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;padding:12px 0;border-bottom:1px solid var(--td-border);">
-		<div style="flex:1;min-width:160px;">
-			<div style="font-weight:600;font-size:14px;">ListenBrainz</div>
-			{#if conn('listenbrainz')}
-				<div style="font-size:12.5px;color:var(--td-good-fg);">Connected{conn('listenbrainz')?.username ? ` as ${conn('listenbrainz')?.username}` : ''}</div>
-			{:else}
-				<div style="font-size:12.5px;color:var(--td-muted-2);">Paste your user token from listenbrainz.org → Settings.</div>
-			{/if}
-		</div>
-		{#if conn('listenbrainz')}
-			<button class="btn btn-secondary" style="color:#b2622d;" on:click={() => disconnectSvc('listenbrainz')}>Disconnect</button>
-		{:else}
-			<input class="input" style="width:220px;" type="password" bind:value={lbToken} placeholder="ListenBrainz token">
-			<button class="btn btn-primary" on:click={connectLB} disabled={lbBusy || !lbToken.trim()}>{lbBusy ? '…' : 'Connect'}</button>
-		{/if}
-	</div>
-
-	<!-- Last.fm and Libre.fm: same approve-then-finish flow -->
-	{#each [{ id: 'lastfm', label: 'Last.fm' }, { id: 'librefm', label: 'Libre.fm' }] as svc, i}
-		{@const key = svc.id as 'lastfm' | 'librefm'}
-		<div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;padding:12px 0;{i === 0 ? 'border-bottom:1px solid var(--td-border);' : ''}">
-			<div style="flex:1;min-width:160px;">
-				<div style="font-weight:600;font-size:14px;">{svc.label}</div>
-				{#if conn(key)}
-					<div style="font-size:12.5px;color:var(--td-good-fg);">Connected{conn(key)?.username ? ` as ${conn(key)?.username}` : ''}</div>
-				{:else if fmPendingToken[key]}
-					<div style="font-size:12.5px;color:var(--td-accent);">Approve Tapedeck in the {svc.label} tab, then click “Finish”.</div>
-				{:else}
-					<div style="font-size:12.5px;color:var(--td-muted-2);">Click Connect, approve on {svc.label}, then finish.</div>
-				{/if}
-			</div>
-			{#if conn(key)}
-				<button class="btn btn-secondary" style="color:#b2622d;" on:click={() => disconnectSvc(key)}>Disconnect</button>
-			{:else}
-				<button class="btn btn-primary" on:click={() => scrobblerConnect(key)} disabled={fmBusy !== null}>
-					{fmBusy === key ? '…' : fmPendingToken[key] ? 'Finish connecting' : `Connect ${svc.label}`}
-				</button>
-				{#if fmPendingToken[key]}<button class="btn btn-secondary" on:click={() => (fmPendingToken[key] = '')}>Cancel</button>{/if}
-			{/if}
-		</div>
-	{/each}
-</div>
-
-<!-- API Tokens -->
-<div class="panel" style="border-radius:22px;padding:24px;margin-bottom:18px;">
-	<h3 class="h-display" style="font-size:19px;margin-bottom:4px;">API Tokens</h3>
-	<p style="font-size:13px;color:var(--td-muted);margin:0 0 16px;">Tokens let Pano Scrobbler and other clients submit listens via <code class="chip">Authorization: Token td_…</code></p>
-
-	{#if loading}
-		<div style="display:flex;justify-content:center;padding:16px;"><div class="spin" style="width:18px;height:18px;border:2px solid var(--td-track);border-top-color:var(--td-accent);border-radius:50%;"></div></div>
-	{:else}
-		{#if tokens.length}
-			<div style="display:flex;flex-direction:column;gap:8px;margin-bottom:16px;">
-				{#each tokens as t (t.id)}
-					<div style="display:flex;align-items:center;justify-content:space-between;gap:12px;background:var(--td-surface2);border:1px solid var(--td-border);border-radius:14px;padding:12px 16px;">
-						<div style="min-width:0;">
-							<div><span style="font-weight:600;font-size:14px;">{t.name}</span> <span style="font-size:10px;letter-spacing:.08em;text-transform:uppercase;color:var(--td-muted-3);margin-left:6px;">{t.scopes}</span></div>
-							<div style="font-size:12px;color:var(--td-muted-2);margin-top:2px;">Created {formatDateTime(t.created_at)} · {t.last_used_at ? `Last used ${formatDateTime(t.last_used_at)}` : 'Never used'}</div>
+				<div style="margin-top:18px;">
+					<div class="field" style="max-width:360px;"><label for="tz">Timezone <span style="opacity:.6">(for local-time analytics)</span></label>
+						<div style="display:flex;gap:8px;position:relative;">
+							<div style="flex:1;position:relative;">
+								<input
+									id="tz" class="input" bind:value={timezone} placeholder="Type to search — e.g. Berlin"
+									autocomplete="off" role="combobox" aria-expanded={tzMatches.length > 0} aria-controls="tz-list"
+									on:focus={() => (tzFocused = true)}
+									on:blur={() => setTimeout(() => (tzFocused = false), 120)}
+									on:keydown={tzKeydown}
+								>
+								{#if tzMatches.length}
+									<ul id="tz-list" class="tz-list">
+										{#each tzMatches as z, i}
+											<li>
+												<button
+													type="button"
+													class="tz-option"
+													class:active={i === tzIndex}
+													on:mouseenter={() => (tzIndex = i)}
+													on:click={() => pickZone(z)}
+												>{z.replace(/_/g, ' ')}</button>
+											</li>
+										{/each}
+									</ul>
+								{/if}
+							</div>
+							<button class="btn btn-secondary" on:click={saveTimezone}>{tzSaved ? '✓' : 'Save'}</button>
 						</div>
-						<button class="btn btn-secondary" style="font-size:12.5px;color:#b2622d;" on:click={() => revokeToken(t.id)}>Revoke</button>
+					</div>
+				</div>
+			</div>
+		{/if}
+
+		{#if section === 'sources'}
+			<SourcesPanel />
+		{/if}
+
+		{#if section === 'connections'}
+			<div class="panel" style="border-radius:22px;padding:24px;margin-bottom:18px;">
+				<h3 class="h-display" style="font-size:19px;margin-bottom:4px;">Scrobble Connections</h3>
+				<p style="font-size:13px;color:var(--td-muted);margin:0 0 16px;">Forward <em>your</em> listens to your own accounts. Nothing is shared across users, and a service you don't connect simply isn't forwarded to — listens are always kept locally either way.</p>
+
+				{#if connError}<div style="font-size:13px;color:#b2622d;margin-bottom:12px;">{connError}</div>{/if}
+
+				<!-- ListenBrainz -->
+				<div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;padding:12px 0;border-bottom:1px solid var(--td-border);">
+					<div style="flex:1;min-width:160px;">
+						<div style="font-weight:600;font-size:14px;">ListenBrainz</div>
+						{#if conn('listenbrainz')}
+							<div style="font-size:12.5px;color:var(--td-good-fg);">Connected{conn('listenbrainz')?.username ? ` as ${conn('listenbrainz')?.username}` : ''}</div>
+						{:else}
+							<div style="font-size:12.5px;color:var(--td-muted-2);">Paste your user token from listenbrainz.org → Settings.</div>
+						{/if}
+					</div>
+					{#if conn('listenbrainz')}
+						<button class="btn btn-secondary" style="color:#b2622d;" on:click={() => disconnectSvc('listenbrainz')}>Disconnect</button>
+					{:else}
+						<input class="input" style="width:220px;" type="password" bind:value={lbToken} placeholder="ListenBrainz token">
+						<button class="btn btn-primary" on:click={connectLB} disabled={lbBusy || !lbToken.trim()}>{lbBusy ? '…' : 'Connect'}</button>
+					{/if}
+				</div>
+
+				<!-- Last.fm and Libre.fm: same approve-then-finish flow -->
+				{#each [{ id: 'lastfm', label: 'Last.fm' }, { id: 'librefm', label: 'Libre.fm' }] as svc, i}
+					{@const key = svc.id as 'lastfm' | 'librefm'}
+					<div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;padding:12px 0;{i === 0 ? 'border-bottom:1px solid var(--td-border);' : ''}">
+						<div style="flex:1;min-width:160px;">
+							<div style="font-weight:600;font-size:14px;">{svc.label}</div>
+							{#if conn(key)}
+								<div style="font-size:12.5px;color:var(--td-good-fg);">Connected{conn(key)?.username ? ` as ${conn(key)?.username}` : ''}</div>
+							{:else if fmPendingToken[key]}
+								<div style="font-size:12.5px;color:var(--td-accent);">Approve Tapedeck in the {svc.label} tab, then click “Finish”.</div>
+							{:else}
+								<div style="font-size:12.5px;color:var(--td-muted-2);">Click Connect, approve on {svc.label}, then finish.</div>
+							{/if}
+						</div>
+						{#if conn(key)}
+							<button class="btn btn-secondary" style="color:#b2622d;" on:click={() => disconnectSvc(key)}>Disconnect</button>
+						{:else}
+							<button class="btn btn-primary" on:click={() => scrobblerConnect(key)} disabled={fmBusy !== null}>
+								{fmBusy === key ? '…' : fmPendingToken[key] ? 'Finish connecting' : `Connect ${svc.label}`}
+							</button>
+							{#if fmPendingToken[key]}<button class="btn btn-secondary" on:click={() => (fmPendingToken[key] = '')}>Cancel</button>{/if}
+						{/if}
 					</div>
 				{/each}
 			</div>
 		{/if}
 
-		{#if createdToken}
-			<div style="background:var(--td-panel);border-radius:16px;padding:16px;margin-bottom:16px;">
-				<div style="font-size:10.5px;letter-spacing:.1em;text-transform:uppercase;color:#e0a06a;margin-bottom:8px;">New token — copy it now, it won't be shown again</div>
-				<div style="display:flex;gap:8px;align-items:center;">
-					<code style="flex:1;background:var(--td-panel2);color:#a9c48a;border-radius:10px;padding:10px 12px;font-size:13px;word-break:break-all;">{createdToken}</code>
-					<button class="btn btn-primary" on:click={copyToken}>{tokenCopied ? '✓ Copied' : 'Copy'}</button>
+		{#if section === 'tokens'}
+			<div class="panel" style="border-radius:22px;padding:24px;margin-bottom:18px;">
+				<h3 class="h-display" style="font-size:19px;margin-bottom:4px;">API Tokens</h3>
+				<p style="font-size:13px;color:var(--td-muted);margin:0 0 16px;">Tokens let Pano Scrobbler and other clients submit listens via <code class="chip">Authorization: Token td_…</code></p>
+
+				{#if loading}
+					<div style="display:flex;justify-content:center;padding:16px;"><div class="spin" style="width:18px;height:18px;border:2px solid var(--td-track);border-top-color:var(--td-accent);border-radius:50%;"></div></div>
+				{:else}
+					{#if tokens.length}
+						<div style="display:flex;flex-direction:column;gap:8px;margin-bottom:16px;">
+							{#each tokens as t (t.id)}
+								<div style="display:flex;align-items:center;justify-content:space-between;gap:12px;background:var(--td-surface2);border:1px solid var(--td-border);border-radius:14px;padding:12px 16px;">
+									<div style="min-width:0;">
+										<div><span style="font-weight:600;font-size:14px;">{t.name}</span> <span style="font-size:10px;letter-spacing:.08em;text-transform:uppercase;color:var(--td-muted-3);margin-left:6px;">{t.scopes}</span></div>
+										<div style="font-size:12px;color:var(--td-muted-2);margin-top:2px;">Created {formatDateTime(t.created_at)} · {t.last_used_at ? `Last used ${formatDateTime(t.last_used_at)}` : 'Never used'}</div>
+									</div>
+									<button class="btn btn-secondary" style="font-size:12.5px;color:#b2622d;" on:click={() => revokeToken(t.id)}>Revoke</button>
+								</div>
+							{/each}
+						</div>
+					{/if}
+
+					{#if createdToken}
+						<div style="background:var(--td-panel);border-radius:16px;padding:16px;margin-bottom:16px;">
+							<div style="font-size:10.5px;letter-spacing:.1em;text-transform:uppercase;color:#e0a06a;margin-bottom:8px;">New token — copy it now, it won't be shown again</div>
+							<div style="display:flex;gap:8px;align-items:center;">
+								<code style="flex:1;background:var(--td-panel2);color:#a9c48a;border-radius:10px;padding:10px 12px;font-size:13px;word-break:break-all;">{createdToken}</code>
+								<button class="btn btn-primary" on:click={copyToken}>{tokenCopied ? '✓ Copied' : 'Copy'}</button>
+							</div>
+						</div>
+					{/if}
+
+					<div style="display:flex;gap:8px;flex-wrap:wrap;">
+						<input class="input" style="flex:1;min-width:180px;" bind:value={newTokenName} placeholder="Token name (e.g. walkman, phone)">
+						<button class="btn btn-primary" on:click={createToken} disabled={creating || !newTokenName.trim()}>{creating ? '…' : 'Create'}</button>
+					</div>
+					<p style="font-size:12px;color:var(--td-muted-2);margin:10px 0 0;">Tokens can only submit listens. Reading, editing, and admin actions require signing in here.</p>
+				{/if}
+			</div>
+
+			<div class="panel" style="border-radius:22px;padding:24px;margin-bottom:18px;">
+				<h3 class="h-display" style="font-size:19px;margin-bottom:4px;">Pano Scrobbler Setup</h3>
+				<p style="font-size:13px;color:var(--td-muted);margin:0 0 16px;">Point every device at your instance in one step.</p>
+				<ol style="margin:0;padding-left:22px;font-size:14px;color:var(--td-nav-fg);display:flex;flex-direction:column;gap:8px;">
+					<li>Open Pano Scrobbler → Settings → Scrobble services</li>
+					<li>Add a custom ListenBrainz server</li>
+					<li>URL: <code class="chip">{origin}</code></li>
+					<li>Token: one of your <code class="chip">td_…</code> tokens above</li>
+				</ol>
+			</div>
+		{/if}
+
+		{#if section === 'data'}
+			<div class="panel" style="border-radius:22px;padding:24px;margin-bottom:18px;">
+				<h3 class="h-display" style="font-size:19px;margin-bottom:4px;">Data &amp; Backups</h3>
+				<p style="font-size:13px;color:var(--td-muted);margin:0 0 16px;">{listenCount} listens recorded. Export a full backup or wipe the deck clean.</p>
+				<div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center;">
+					<button class="btn btn-secondary" on:click={() => doExport('json')}>Export JSON</button>
+					<button class="btn btn-secondary" on:click={() => doExport('csv')}>Export CSV</button>
+					<button class="btn btn-secondary" on:click={doBackup}>Download DB backup</button>
+					<span style="flex:1;"></span>
+					<button class="btn btn-ghost" style="color:#b2622d;" on:click={() => (confirmClear = true)}>Clear history</button>
+				</div>
+				{#if exportMsg}
+					<div style="margin-top:14px;display:inline-flex;align-items:center;gap:8px;font-size:13px;color:var(--td-good-fg);background:var(--td-good-bg);padding:7px 14px;border-radius:999px;">✓ {exportMsg}</div>
+				{/if}
+				<p style="font-size:12px;color:var(--td-muted-2);margin:14px 0 0;">
+					The DB backup contains every user's listens and their encrypted credentials — treat it
+					like a password file. The encryption key is kept outside the database and is
+					<em>not</em> in the backup, so a leaked copy alone won't hand over your tokens.
+				</p>
+			</div>
+		{/if}
+
+		{#if section === 'maintenance'}
+			<div class="panel" style="border-radius:22px;padding:24px;margin-bottom:18px;">
+				<h3 class="h-display" style="font-size:19px;margin-bottom:4px;">Album Art</h3>
+				<p style="font-size:13px;color:var(--td-muted);margin:0 0 16px;">
+					Art is resolved in order: your own library (free and exact), then Deezer, then the Cover
+					Art Archive. It runs in the background — this fills the backlog now.
+				</p>
+				{#if artStatus}
+					<div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;">
+						<div style="flex:1;min-width:180px;">
+							<div style="height:8px;border-radius:999px;background:var(--td-track);overflow:hidden;">
+								<div style="height:100%;width:{artStatus.total ? (artStatus.resolved / artStatus.total) * 100 : 0}%;background:linear-gradient(90deg,var(--td-accent-2),var(--td-accent));border-radius:999px;transition:width .4s;"></div>
+							</div>
+							<div style="font-size:12.5px;color:var(--td-muted-2);margin-top:6px;">
+								{artStatus.resolved} / {artStatus.total} listens have artwork
+							</div>
+						</div>
+						{#if isAdmin}
+							<button class="btn btn-secondary" on:click={runArtworkBackfill} disabled={fetchingArt || artStatus.pending === 0}>
+								{fetchingArt ? 'Fetching…' : artStatus.pending === 0 ? 'All fetched' : 'Fetch missing art'}
+							</button>
+						{/if}
+					</div>
+					{#if fetchingArt}
+						<p style="font-size:12px;color:var(--td-muted-3);margin:10px 0 0;">
+							MusicBrainz is rate-limited, so a large history takes a while. You can leave this page.
+						</p>
+					{/if}
+				{:else}
+					<p style="font-size:13px;color:var(--td-muted-3);margin:0;">No status available.</p>
+				{/if}
+			</div>
+
+			{#if isAdmin}
+				<div class="panel" style="border-radius:22px;padding:24px;margin-bottom:18px;">
+					<h3 class="h-display" style="font-size:19px;margin-bottom:4px;">Language Enrichment</h3>
+					<p style="font-size:13px;color:var(--td-muted);margin:0 0 16px;">Classify listens by language for the Analytics breakdown — instant for non-Latin scripts, MusicBrainz (rate-limited) for the rest. Runs automatically in the background; use this to fill the backlog now.</p>
+					<div style="display:flex;align-items:center;gap:14px;flex-wrap:wrap;">
+						<button class="btn btn-primary" on:click={runEnrichment} disabled={enriching}>{enriching ? 'Enriching…' : 'Enrich languages'}</button>
+						{#if langStatus}
+							<span style="font-size:13.5px;color:var(--td-muted);">{langStatus.resolved} / {langStatus.total} classified{langStatus.pending ? ` · ${langStatus.pending} pending` : ''}</span>
+						{/if}
+					</div>
+				</div>
+			{/if}
+
+			<div class="panel" style="border-radius:22px;padding:24px;margin-bottom:18px;">
+				<h3 class="h-display" style="font-size:19px;margin-bottom:4px;">Connection</h3>
+				<p style="font-size:13px;color:var(--td-muted);margin:0 0 16px;">Test connectivity to the Tapedeck backend.</p>
+				<div style="display:flex;align-items:center;gap:14px;">
+					<button class="btn btn-secondary" on:click={checkConnection} disabled={checking}>{checking ? 'Checking…' : 'Test connection'}</button>
+					{#if healthStatus}<span style="font-size:14px;font-weight:600;color:{healthStatus.startsWith('✓') ? 'var(--td-good-fg)' : '#b2622d'};">{healthStatus}</span>{/if}
 				</div>
 			</div>
 		{/if}
 
-		<div style="display:flex;gap:8px;flex-wrap:wrap;">
-			<input class="input" style="flex:1;min-width:180px;" bind:value={newTokenName} placeholder="Token name (e.g. walkman, phone)">
-			<button class="btn btn-primary" on:click={createToken} disabled={creating || !newTokenName.trim()}>{creating ? '…' : 'Create'}</button>
-		</div>
-		<p style="font-size:12px;color:var(--td-muted-2);margin:10px 0 0;">Tokens can only submit listens. Reading, editing, and admin actions require signing in here.</p>
-	{/if}
-</div>
-
-<!-- Connection -->
-<div class="panel" style="border-radius:22px;padding:24px;margin-bottom:18px;">
-	<h3 class="h-display" style="font-size:19px;margin-bottom:4px;">Connection</h3>
-	<p style="font-size:13px;color:var(--td-muted);margin:0 0 16px;">Test connectivity to the Tapedeck backend.</p>
-	<div style="display:flex;align-items:center;gap:14px;">
-		<button class="btn btn-secondary" on:click={checkConnection} disabled={checking}>{checking ? 'Checking…' : 'Test connection'}</button>
-		{#if healthStatus}<span style="font-size:14px;font-weight:600;color:{healthStatus.startsWith('✓') ? 'var(--td-good-fg)' : '#b2622d'};">{healthStatus}</span>{/if}
+		{#if section === 'about'}
+			<div class="panel" style="border-radius:22px;padding:24px;display:flex;align-items:flex-start;justify-content:space-between;gap:16px;">
+				<div>
+					<h3 class="h-display" style="font-size:19px;margin-bottom:6px;">About</h3>
+					<div style="font-size:13px;color:var(--td-muted);display:flex;flex-direction:column;gap:3px;">
+						<span>Server v{backendVersion} · UI v{uiVersion}</span>
+						<span>A self-hosted music listening journal.</span>
+						<a href="https://codeberg.org/abksh/tapedeck" target="_blank" rel="noopener">View on Codeberg →</a>
+					</div>
+				</div>
+				<button class="btn btn-secondary" style="color:#b2622d;" on:click={handleLogout}>Sign out</button>
+			</div>
+		{/if}
 	</div>
-</div>
-
-<!-- Pano setup -->
-<div class="panel" style="border-radius:22px;padding:24px;margin-bottom:18px;">
-	<h3 class="h-display" style="font-size:19px;margin-bottom:4px;">Pano Scrobbler Setup</h3>
-	<p style="font-size:13px;color:var(--td-muted);margin:0 0 16px;">Point every device at your instance in one step.</p>
-	<ol style="margin:0;padding-left:22px;font-size:14px;color:var(--td-nav-fg);display:flex;flex-direction:column;gap:8px;">
-		<li>Open Pano Scrobbler → Settings → Scrobble services</li>
-		<li>Add a custom ListenBrainz server</li>
-		<li>URL: <code class="chip">{origin}</code></li>
-		<li>Token: one of your <code class="chip">td_…</code> tokens above</li>
-	</ol>
-</div>
-
-<!-- Data & Backups -->
-<div class="panel" style="border-radius:22px;padding:24px;margin-bottom:18px;">
-	<h3 class="h-display" style="font-size:19px;margin-bottom:4px;">Data &amp; Backups</h3>
-	<p style="font-size:13px;color:var(--td-muted);margin:0 0 16px;">{listenCount} listens recorded. Export a full backup or wipe the deck clean.</p>
-	<div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center;">
-		<button class="btn btn-secondary" on:click={() => doExport('json')}>Export JSON</button>
-		<button class="btn btn-secondary" on:click={() => doExport('csv')}>Export CSV</button>
-		<button class="btn btn-secondary" on:click={doBackup}>Download DB backup</button>
-		<span style="flex:1;"></span>
-		<button class="btn btn-ghost" style="color:#b2622d;" on:click={() => (confirmClear = true)}>Clear history</button>
-	</div>
-	{#if exportMsg}
-		<div style="margin-top:14px;display:inline-flex;align-items:center;gap:8px;font-size:13px;color:var(--td-good-fg);background:var(--td-good-bg);padding:7px 14px;border-radius:999px;">✓ {exportMsg}</div>
-	{/if}
-</div>
-
-<!-- About -->
-<div class="panel" style="border-radius:22px;padding:24px;display:flex;align-items:flex-start;justify-content:space-between;gap:16px;">
-	<div>
-		<h3 class="h-display" style="font-size:19px;margin-bottom:6px;">About</h3>
-		<div style="font-size:13px;color:var(--td-muted);display:flex;flex-direction:column;gap:3px;">
-			<span>Server v{backendVersion} · UI v{uiVersion}</span>
-			<span>A self-hosted music listening journal.</span>
-			<a href="https://codeberg.org/abksh/tapedeck" target="_blank" rel="noopener">View on Codeberg →</a>
-		</div>
-	</div>
-	<button class="btn btn-secondary" style="color:#b2622d;" on:click={handleLogout}>Sign out</button>
 </div>
 
 {#if confirmClear}
@@ -889,6 +600,56 @@
 {/if}
 
 <style>
+	.settings-layout {
+		display: grid;
+		grid-template-columns: 208px minmax(0, 1fr);
+		gap: 24px;
+		align-items: start;
+	}
+	.settings-nav {
+		display: flex;
+		flex-direction: column;
+		gap: 2px;
+		position: sticky;
+		top: 24px;
+	}
+	.nav-item {
+		display: flex;
+		flex-direction: column;
+		gap: 2px;
+		text-align: left;
+		border: none;
+		background: transparent;
+		font: inherit;
+		cursor: pointer;
+		padding: 9px 14px;
+		border-radius: 12px;
+		color: var(--td-nav-fg);
+	}
+	.nav-item:hover { background: var(--td-nav-hover); }
+	.nav-item.on { background: var(--td-sidebar); color: var(--td-text); }
+	.nav-label { font-size: 14px; font-weight: 600; }
+	.nav-hint { font-size: 11.5px; color: var(--td-muted-3); }
+	.nav-item.on .nav-hint { color: var(--td-muted-2); }
+
+	/* Narrow screens get the same list as a scrolling strip above the content —
+	   a 208px rail would eat half a phone. */
+	@media (max-width: 720px) {
+		.settings-layout { grid-template-columns: minmax(0, 1fr); gap: 16px; }
+		.settings-nav {
+			position: static;
+			flex-direction: row;
+			gap: 6px;
+			overflow-x: auto;
+			padding-bottom: 4px;
+		}
+		.nav-item { flex: none; padding: 7px 14px; border-radius: 999px; background: var(--td-surface2); }
+		/* The rail's subtle tint isn't enough to read as "selected" on a row of
+		   pills, so the active one takes the accent outright. */
+		.nav-item.on { background: var(--td-accent); color: #fbf5ea; }
+		.nav-hint { display: none; }
+	}
+
 	.tz-list {
 		position: absolute;
 		z-index: 30;

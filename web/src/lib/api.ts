@@ -54,7 +54,7 @@ export interface RangedStats {
 		plays: number; hours: number; artists: number; albums: number; tracks: number;
 		avg_quality: number; lossless_pct: number; dsd_pct: number;
 	};
-	top_artists: { name: string; plays: number; hours: number }[];
+	top_artists: { name: string; plays: number; hours: number; image_url: string | null }[];
 	top_albums: { name: string; artist: string; plays: number; hours: number }[];
 	fidelity: { name: string; plays: number; pct: number }[];
 	genres: { name: string; pct: number }[];
@@ -185,7 +185,10 @@ export interface NowPlayingState {
  * `has_token` is all the UI gets.
  */
 export interface UserSource {
+	id: number;
 	kind: string;
+	/** User-supplied name — several servers of one kind are allowed. */
+	label: string;
 	enabled: boolean;
 	url: string;
 	has_token: boolean;
@@ -205,8 +208,8 @@ export interface UserSource {
 
 /** Partial update. Omitting `token` keeps the stored one. */
 export type UserSourceUpdate = Partial<
-	Omit<UserSource, 'kind' | 'has_token' | 'remote_account' | 'last_polled_at' | 'last_error' | 'updated_at'>
-> & { token?: string; username?: string; password?: string };
+	Omit<UserSource, 'id' | 'kind' | 'has_token' | 'remote_account' | 'last_polled_at' | 'last_error' | 'updated_at'>
+> & { kind?: string; token?: string; username?: string; password?: string; api_key?: string };
 
 export interface SourceTestResult {
 	ok: boolean;
@@ -322,19 +325,24 @@ class TapedeckAPI {
 		return this.get('/api/v1/sources');
 	}
 
-	async putSource(kind: string, body: UserSourceUpdate): Promise<UserSource> {
-		return this.request('PUT', `/api/v1/sources/${kind}`, body);
+	async createSource(body: UserSourceUpdate): Promise<UserSource> {
+		return this.post('/api/v1/sources', body);
 	}
 
-	async deleteSource(kind: string): Promise<void> {
-		return this.delNoBody(`/api/v1/sources/${kind}`);
+	async updateSource(id: number, body: UserSourceUpdate): Promise<UserSource> {
+		return this.request('PUT', `/api/v1/sources/${id}`, body);
 	}
 
-	async testSource(
-		kind: string,
-		body: { url?: string; token?: string; username?: string; password?: string }
-	): Promise<SourceTestResult> {
-		return this.post(`/api/v1/sources/${kind}/test`, body);
+	async deleteSource(id: number): Promise<void> {
+		return this.delNoBody(`/api/v1/sources/${id}`);
+	}
+
+	/** Pass `kind` to test before saving, or `id` to re-test a stored source. */
+	async testSource(body: {
+		kind?: string; id?: number; url?: string;
+		token?: string; username?: string; password?: string; api_key?: string;
+	}): Promise<SourceTestResult> {
+		return this.post('/api/v1/sources/test', body);
 	}
 
 	// ── Scrobbles ──

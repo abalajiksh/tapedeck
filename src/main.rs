@@ -190,8 +190,9 @@ async fn migrate_global_plex(db: &Database, config: &Config) -> Result<(), Box<d
     }
 
     let Some(admin_id) = db.first_admin_id().await? else { return Ok(()) };
-    if db.get_source(admin_id, "plex").await?.is_some() {
-        return Ok(()); // already migrated
+    // Already migrated if the admin has any Plex source at all.
+    if db.list_sources_for_user(admin_id).await?.iter().any(|s| s.kind == "plex") {
+        return Ok(());
     }
 
     // Resolve the token to its Plex account so the new source can filter to it.
@@ -214,8 +215,8 @@ async fn migrate_global_plex(db: &Database, config: &Config) -> Result<(), Box<d
         "devices_allow": PlexSettings::list(&legacy.devices_allow),
         "devices_block": PlexSettings::list(&legacy.devices_block),
     }).to_string();
-    db.save_source(
-        admin_id, "plex", account.is_some(), &legacy.url,
+    db.create_source(
+        admin_id, "plex", "Plex", account.is_some(), &legacy.url,
         &credentials, account.as_deref(), None, &options,
     ).await?;
 

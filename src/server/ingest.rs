@@ -247,6 +247,7 @@ pub async fn submit_listens(
                     device_id, chain_id,
                     listening_context.as_deref(),
                     Some(submission_client),
+                    None, // pushed by a client, not pulled from a configured source
                 ).await {
                     Ok(true) => {
                         // Assign to a session

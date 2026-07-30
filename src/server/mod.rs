@@ -1,4 +1,5 @@
 mod admin;
+mod artwork;
 pub mod auth;
 mod chains;
 mod connections;
@@ -61,6 +62,7 @@ pub fn build_app(state: Arc<AppState>) -> Router {
         .merge(scrobbles_router)
         .merge(preferences::create_preferences_router())
         .merge(now_playing::create_now_playing_router())
+        .merge(artwork::create_artwork_router())
         .merge(sources::create_sources_router())
         .merge(export::create_export_router())
         .merge(import::create_import_router())

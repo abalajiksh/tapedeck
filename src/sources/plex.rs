@@ -470,6 +470,33 @@ impl PlexSource {
             })
     }
 
+    /// Cover art bytes for one library item (a track's `ratingKey`).
+    ///
+    /// Proxied for the same reason as Navidrome's: a LAN Plex isn't reachable
+    /// from the browser, and the token must not leave the server.
+    pub async fn fetch_cover_art(&self, rating_key: &str)
+        -> Result<(Vec<u8>, String), Box<dyn std::error::Error + Send + Sync>>
+    {
+        // `thumb` on a track is the album cover Plex already generated.
+        let endpoint = format!("{}/library/metadata/{}/thumb", self.url, rating_key);
+        let resp = self.client
+            .get(&endpoint)
+            .header("X-Plex-Token", &self.token)
+            .send().await?;
+
+        if !resp.status().is_success() {
+            return Err(format!("Plex artwork returned {}", resp.status()).into());
+        }
+        let content_type = resp.headers().get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("image/jpeg")
+            .to_string();
+        if !content_type.starts_with("image/") {
+            return Err("no artwork for that item".into());
+        }
+        Ok((resp.bytes().await?.to_vec(), content_type))
+    }
+
     /// Library titles discovered by `initialize`. Used by the settings UI to
     /// show what a URL/token pair can actually see.
     pub fn library_names(&self) -> Vec<String> {
