@@ -32,7 +32,7 @@ console_enabled = true
 
 [musicbrainz]
 # Their API requires a contact address in the User-Agent.
-user_agent = "Tapedeck/0.7.0 ( your-email@example.com )"
+user_agent = "Tapedeck/0.8.0 ( your-email@example.com )"
 rate_limit_per_second = 1
 # Optional: a local MusicBrainz Postgres mirror, queried before the API.
 enable_postgres = false

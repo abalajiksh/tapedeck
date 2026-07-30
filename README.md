@@ -318,7 +318,7 @@ RUST_LOG=info
 LOG_DIR=./logs
 
 # ── MusicBrainz ──
-MUSICBRAINZ_USER_AGENT=Tapedeck/0.7.0 ( your-email@example.com )
+MUSICBRAINZ_USER_AGENT=Tapedeck/0.8.0 ( your-email@example.com )
 MUSICBRAINZ_RATE_LIMIT=1
 
 # ── ListenBrainz endpoint (only for a self-hosted instance) ──
