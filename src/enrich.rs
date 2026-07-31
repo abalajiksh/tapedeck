@@ -91,11 +91,7 @@ pub async fn backfill_release_years(
         budget -= 1;
 
         let year = match mb.fetch_metadata(&title, &artist, album.as_deref()).await {
-            Ok(meta) => meta
-                .release_date
-                .as_deref()
-                .and_then(parse_year)
-                .unwrap_or(0),
+            Ok(meta) => meta.release_date.as_deref().and_then(parse_year).unwrap_or(0),
             Err(_) => 0,
         };
         if db.set_scrobble_release_year(id, year).await.is_ok() {
@@ -139,10 +135,7 @@ pub async fn backfill_artwork(
         // 0a. Came from the user's own media server — the proxy can serve the
         //     cover of the exact file that was played, with no lookup at all and
         //     nothing asked of a third party. Always the best answer available.
-        if matches!(
-            source_name.as_str(),
-            "navidrome" | "Plex" | "plex" | "jellyfin" | "Jellyfin"
-        ) {
+        if matches!(source_name.as_str(), "navidrome" | "Plex" | "plex" | "jellyfin" | "Jellyfin") {
             let url = format!("/api/v1/art/{id}");
             if db.set_scrobble_artwork(id, &url, None, None).await.is_ok() {
                 done += 1;
@@ -194,11 +187,7 @@ pub async fn backfill_artwork(
             (Some(cid), Some(mbid)) => caa_url(mbid, cid),
             _ => String::new(),
         };
-        if db
-            .set_scrobble_artwork(id, &url, found_id, found_mbid.as_deref())
-            .await
-            .is_ok()
-        {
+        if db.set_scrobble_artwork(id, &url, found_id, found_mbid.as_deref()).await.is_ok() {
             done += 1;
         }
     }

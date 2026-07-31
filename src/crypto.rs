@@ -82,9 +82,7 @@ impl SecretBox {
 
     fn from_bytes(raw: &[u8]) -> Self {
         let key = Key::try_from(raw).expect("key length checked by callers");
-        Self {
-            cipher: XChaCha20Poly1305::new(&key),
-        }
+        Self { cipher: XChaCha20Poly1305::new(&key) }
     }
 
     pub fn encrypt(&self, plaintext: &str) -> Result<String, Box<dyn std::error::Error>> {
@@ -92,10 +90,7 @@ impl SecretBox {
         OsRng.try_fill_bytes(&mut nonce)?;
         let ciphertext = self
             .cipher
-            .encrypt(
-                &XNonce::try_from(&nonce[..]).expect("fixed-size nonce"),
-                plaintext.as_bytes(),
-            )
+            .encrypt(&XNonce::try_from(&nonce[..]).expect("fixed-size nonce"), plaintext.as_bytes())
             .map_err(|_| "credential encryption failed")?;
 
         let mut blob = Vec::with_capacity(NONCE_LEN + ciphertext.len());
@@ -120,10 +115,7 @@ impl SecretBox {
         let (nonce, ciphertext) = blob.split_at(NONCE_LEN);
         let plaintext = self
             .cipher
-            .decrypt(
-                &XNonce::try_from(nonce).map_err(|_| "bad nonce length")?,
-                ciphertext,
-            )
+            .decrypt(&XNonce::try_from(nonce).map_err(|_| "bad nonce length")?, ciphertext)
             // Almost always the wrong key rather than tampering — say so, since
             // that's the recoverable case.
             .map_err(|_| "could not decrypt credential — wrong TAPEDECK_SECRET_KEY or keyfile?")?;
@@ -145,11 +137,7 @@ impl SecretBox {
 fn restrict_permissions(path: &Path) {
     use std::os::unix::fs::PermissionsExt;
     if let Err(e) = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)) {
-        warn!(
-            "Could not restrict permissions on {}: {}",
-            path.display(),
-            e
-        );
+        warn!("Could not restrict permissions on {}: {}", path.display(), e);
     }
 }
 
@@ -202,8 +190,6 @@ mod tests {
         let mut bytes = B64.decode(enc.strip_prefix(PREFIX).unwrap()).unwrap();
         let last = bytes.len() - 1;
         bytes[last] ^= 0xff;
-        assert!(sb
-            .decrypt(&format!("{PREFIX}{}", B64.encode(&bytes)))
-            .is_err());
+        assert!(sb.decrypt(&format!("{PREFIX}{}", B64.encode(&bytes))).is_err());
     }
 }

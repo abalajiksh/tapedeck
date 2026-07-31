@@ -31,9 +31,7 @@ impl LogLevelHandle {
 
     /// Get the current log level
     pub fn get_level(&self) -> String {
-        self.filter
-            .with_current(|f| f.to_string())
-            .unwrap_or_else(|_| "unknown".to_string())
+        self.filter.with_current(|f| f.to_string()).unwrap_or_else(|_| "unknown".to_string())
     }
 }
 
@@ -56,9 +54,7 @@ pub fn init_logging(
     let (filter_layer, reload_handle) =
         reload::Layer::<EnvFilter, Registry>::new(EnvFilter::try_new(level)?);
 
-    let handle = LogLevelHandle {
-        filter: reload_handle,
-    };
+    let handle = LogLevelHandle { filter: reload_handle };
 
     // The filter layer must be part of the subscriber, otherwise every event
     // is emitted regardless of level and runtime reloads do nothing.

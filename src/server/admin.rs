@@ -15,11 +15,7 @@ pub struct AdminState {
 
 async fn health_check(State(state): State<Arc<AdminState>>) -> impl IntoResponse {
     let db_ok = state.db.ping().await.is_ok();
-    let code = if db_ok {
-        StatusCode::OK
-    } else {
-        StatusCode::SERVICE_UNAVAILABLE
-    };
+    let code = if db_ok { StatusCode::OK } else { StatusCode::SERVICE_UNAVAILABLE };
     (
         code,
         Json(serde_json::json!({
@@ -35,7 +31,5 @@ async fn health_check(State(state): State<Arc<AdminState>>) -> impl IntoResponse
 /// to the authenticated, admin-gated router.
 pub fn create_admin_router(db: Arc<Database>) -> Router {
     let state = Arc::new(AdminState { db });
-    Router::new()
-        .route("/health", get(health_check))
-        .with_state(state)
+    Router::new().route("/health", get(health_check)).with_state(state)
 }

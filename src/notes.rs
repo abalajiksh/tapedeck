@@ -164,15 +164,11 @@ fn substitute(src: &str, resolved: &HashMap<(RefKind, String), Resolved>) -> Str
 }
 
 fn escape_link_text(s: &str) -> String {
-    s.replace('\\', r"\\")
-        .replace('[', r"\[")
-        .replace(']', r"\]")
+    s.replace('\\', r"\\").replace('[', r"\[").replace(']', r"\]")
 }
 
 fn escape_html(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
+    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
 }
 
 /// Markdown → sanitised HTML, with shortcodes substituted first.
@@ -228,10 +224,7 @@ pub fn excerpt(src: &str, max_chars: usize) -> String {
         return flat;
     }
     let cut: String = flat.chars().take(max_chars).collect();
-    let cut = cut
-        .rsplit_once(' ')
-        .map(|(head, _)| head.to_string())
-        .unwrap_or(cut);
+    let cut = cut.rsplit_once(' ').map(|(head, _)| head.to_string()).unwrap_or(cut);
     format!("{cut}…")
 }
 
@@ -243,13 +236,7 @@ mod tests {
         pairs
             .iter()
             .map(|(k, t, id, label)| {
-                (
-                    (*k, t.to_lowercase()),
-                    Resolved {
-                        entity_id: *id,
-                        label: label.to_string(),
-                    },
-                )
+                ((*k, t.to_lowercase()), Resolved { entity_id: *id, label: label.to_string() })
             })
             .collect()
     }
@@ -299,10 +286,8 @@ mod tests {
     fn positional_ref_renders_the_real_title() {
         // Resolution keys on the raw target ("3"), but the label is the title —
         // that substitution is the entire reason to write [[track:3]].
-        let html = render(
-            "[[track:3]] is the one",
-            &resolved(&[(RefKind::Track, "3", 12, "Ageispolis")]),
-        );
+        let html =
+            render("[[track:3]] is the one", &resolved(&[(RefKind::Track, "3", 12, "Ageispolis")]));
         assert!(html.contains(">Ageispolis</a>"), "{html}");
         assert!(!html.contains(">3</a>"), "{html}");
     }

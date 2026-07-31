@@ -150,11 +150,7 @@ impl JellyfinSource {
             account,
             client: Client::builder()
                 .timeout(Duration::from_secs(10))
-                .user_agent(format!(
-                    "{}/{}",
-                    env!("CARGO_PKG_NAME"),
-                    env!("CARGO_PKG_VERSION")
-                ))
+                .user_agent(format!("{}/{}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION")))
                 .build()
                 .unwrap_or_else(|_| Client::new()),
             seen: HashMap::new(),
@@ -179,11 +175,7 @@ impl JellyfinSource {
 
         let client = Client::builder()
             .timeout(Duration::from_secs(10))
-            .user_agent(format!(
-                "{}/{}",
-                env!("CARGO_PKG_NAME"),
-                env!("CARGO_PKG_VERSION")
-            ))
+            .user_agent(format!("{}/{}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION")))
             .build()?;
 
         let resp = client
@@ -275,19 +267,12 @@ impl JellyfinSource {
 
             // A paused track is still "now playing" for the deck, but its
             // position isn't advancing, so it shouldn't cross the threshold.
-            let paused = session
-                .play_state
-                .as_ref()
-                .and_then(|p| p.is_paused)
-                .unwrap_or(false);
+            let paused = session.play_state.as_ref().and_then(|p| p.is_paused).unwrap_or(false);
 
             let entry = self
                 .seen
                 .entry(session.id.clone())
-                .or_insert_with(|| SessionProgress {
-                    item_id: item.id.clone(),
-                    scrobbled: false,
-                });
+                .or_insert_with(|| SessionProgress { item_id: item.id.clone(), scrobbled: false });
 
             // A new track in the same session resets the scrobble state,
             // otherwise only the first song of a queue would ever count.
@@ -330,11 +315,7 @@ impl JellyfinSource {
             // The item id alone would collide across repeat plays, so the
             // session and device disambiguate; the flush-time dedup handles the
             // rest.
-            source_id: format!(
-                "jellyfin-{}-{}",
-                item.id,
-                device.as_deref().unwrap_or("session")
-            ),
+            source_id: format!("jellyfin-{}-{}", item.id, device.as_deref().unwrap_or("session")),
             source_name: "jellyfin".into(),
             title: item.name.clone(),
             artist,
@@ -344,14 +325,8 @@ impl JellyfinSource {
             track_number: item.index_number.filter(|n| *n > 0),
             // Jellyfin carries MusicBrainz ids when the library was tagged —
             // another listen that never needs a MusicBrainz lookup.
-            mbid_recording: item
-                .provider_ids
-                .as_ref()
-                .and_then(|p| p.musicbrainz_track.clone()),
-            mbid_release: item
-                .provider_ids
-                .as_ref()
-                .and_then(|p| p.musicbrainz_album.clone()),
+            mbid_recording: item.provider_ids.as_ref().and_then(|p| p.musicbrainz_track.clone()),
+            mbid_release: item.provider_ids.as_ref().and_then(|p| p.musicbrainz_album.clone()),
             mbid_artist: None,
             artists: item.artists.clone(),
             mbid_release_group: None,
@@ -363,11 +338,7 @@ impl JellyfinSource {
     fn extract_quality(item: &NowPlayingItem) -> Option<AudioQuality> {
         let streams = item.media_streams.as_ref()?;
         let audio = streams.iter().find(|s| {
-            let t = s
-                .stream_type
-                .as_deref()
-                .or(s.type_.as_deref())
-                .unwrap_or("");
+            let t = s.stream_type.as_deref().or(s.type_.as_deref()).unwrap_or("");
             t.eq_ignore_ascii_case("Audio")
         })?;
 
@@ -420,10 +391,7 @@ impl JellyfinSource {
 }
 
 fn now_secs() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs()
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs()
 }
 
 #[async_trait]

@@ -39,11 +39,7 @@ use crate::db::ScrobbleRecord;
 
 fn error(code: u16, msg: impl Into<String>) -> axum::response::Response {
     let status = StatusCode::from_u16(code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-    (
-        status,
-        Json(serde_json::json!({ "code": code, "error": msg.into() })),
-    )
-        .into_response()
+    (status, Json(serde_json::json!({ "code": code, "error": msg.into() }))).into_response()
 }
 
 /// Resolve the `{user}` path segment, enforcing that it's the caller (or that
@@ -170,19 +166,12 @@ async fn user_listens(
     let before = q.max_ts.map(|t| t - 1);
     let after = q.min_ts.map(|t| t + 1);
 
-    let rows = match state
-        .db
-        .get_recent_scrobbles(user_id, count, 0, None, None, after, before)
-        .await
-    {
-        Ok(r) => r,
-        Err(e) => return error(500, e.to_string()),
-    };
-    let (_, latest) = state
-        .db
-        .listen_count_and_latest(user_id)
-        .await
-        .unwrap_or((0, None));
+    let rows =
+        match state.db.get_recent_scrobbles(user_id, count, 0, None, None, after, before).await {
+            Ok(r) => r,
+            Err(e) => return error(500, e.to_string()),
+        };
+    let (_, latest) = state.db.listen_count_and_latest(user_id).await.unwrap_or((0, None));
     let listens: Vec<serde_json::Value> = rows.iter().map(|s| to_lb_listen(s, true)).collect();
 
     (
@@ -355,10 +344,7 @@ async fn set_latest_import(
     }
     match state
         .db
-        .merge_preferences(
-            caller.user_id,
-            &serde_json::json!({ "latest_import": body.ts }),
-        )
+        .merge_preferences(caller.user_id, &serde_json::json!({ "latest_import": body.ts }))
         .await
     {
         Ok(_) => (StatusCode::OK, Json(serde_json::json!({ "status": "ok" }))).into_response(),
@@ -374,8 +360,5 @@ pub fn create_lb_api_router() -> Router<Arc<AppState>> {
         .route("/1/user/:user/listen-count", get(user_listen_count))
         .route("/1/user/:user/services", get(user_services))
         .route("/1/playing-now/delete", post(playing_now_delete))
-        .route(
-            "/1/latest-import",
-            get(get_latest_import).post(set_latest_import),
-        )
+        .route("/1/latest-import", get(get_latest_import).post(set_latest_import))
 }

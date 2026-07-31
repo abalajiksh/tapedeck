@@ -170,23 +170,18 @@ impl PlexTrack {
             .and_then(|part| part.stream.as_ref())
             .and_then(|streams| streams.iter().find(|s| s.stream_type == Some(2)));
 
-        let codec = audio_stream
-            .and_then(|s| s.codec.clone())
-            .or_else(|| media.audio_codec.clone());
+        let codec =
+            audio_stream.and_then(|s| s.codec.clone()).or_else(|| media.audio_codec.clone());
 
         let bitrate = audio_stream.and_then(|s| s.bitrate).or(media.bitrate);
 
         let sample_rate = audio_stream.and_then(|s| s.sampling_rate);
         let bit_depth = audio_stream.and_then(|s| s.bit_depth);
-        let channels = audio_stream
-            .and_then(|s| s.channels)
-            .or(media.audio_channels);
+        let channels = audio_stream.and_then(|s| s.channels).or(media.audio_channels);
 
         let codec_lower = codec.as_deref().unwrap_or("").to_lowercase();
-        let is_lossless = matches!(
-            codec_lower.as_str(),
-            "flac" | "alac" | "wav" | "aiff" | "dsd" | "pcm"
-        );
+        let is_lossless =
+            matches!(codec_lower.as_str(), "flac" | "alac" | "wav" | "aiff" | "dsd" | "pcm");
         let format_type = if codec_lower == "dsd" { "dsd" } else { "pcm" };
 
         let container = media.container.clone();
@@ -202,12 +197,7 @@ impl PlexTrack {
                 } else {
                     None
                 };
-                (
-                    Some(is_tc),
-                    if is_tc { tc_codec } else { None },
-                    None,
-                    reason,
-                )
+                (Some(is_tc), if is_tc { tc_codec } else { None }, None, reason)
             } else {
                 (Some(false), None, None, None)
             };
@@ -237,10 +227,7 @@ impl PlexTrack {
     }
 
     pub fn to_play(&self, source_id_suffix: &str) -> Play {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
         let timestamp = self.viewed_at.unwrap_or(now);
         let source_id = format!("plex-{}-{}", self.rating_key, source_id_suffix);
 
@@ -252,15 +239,8 @@ impl PlexTrack {
 
         Play {
             title: self.title.clone(),
-            artist: artists
-                .first()
-                .cloned()
-                .unwrap_or_else(|| "Unknown".to_string()),
-            artists: if artists.is_empty() {
-                None
-            } else {
-                Some(artists)
-            },
+            artist: artists.first().cloned().unwrap_or_else(|| "Unknown".to_string()),
+            artists: if artists.is_empty() { None } else { Some(artists) },
             album: self.album.clone(),
             timestamp,
             duration: self.duration.map(|d| d / 1000),
@@ -467,11 +447,7 @@ impl PlexSource {
             token,
             client: Client::builder()
                 .timeout(Duration::from_secs(10))
-                .user_agent(format!(
-                    "{}/{}",
-                    env!("CARGO_PKG_NAME"),
-                    env!("CARGO_PKG_VERSION")
-                ))
+                .user_agent(format!("{}/{}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION")))
                 .build()
                 .unwrap_or_else(|_| Client::new()),
             filters,
@@ -510,11 +486,7 @@ impl PlexSource {
 
         let client = Client::builder()
             .timeout(Duration::from_secs(10))
-            .user_agent(format!(
-                "{}/{}",
-                env!("CARGO_PKG_NAME"),
-                env!("CARGO_PKG_VERSION")
-            ))
+            .user_agent(format!("{}/{}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION")))
             .build()?;
 
         let resp = client
@@ -522,10 +494,7 @@ impl PlexSource {
             .header("X-Plex-Token", token)
             .header("Accept", "application/json")
             .header("X-Plex-Product", env!("CARGO_PKG_NAME"))
-            .header(
-                "X-Plex-Client-Identifier",
-                format!("tapedeck-{}", env!("CARGO_PKG_VERSION")),
-            )
+            .header("X-Plex-Client-Identifier", format!("tapedeck-{}", env!("CARGO_PKG_VERSION")))
             .send()
             .await?;
 
@@ -540,14 +509,12 @@ impl PlexSource {
         // Prefer the stable username; `title` is the display name shown in
         // sessions, which is what we actually match against, so it's the better
         // fallback than email.
-        user.username
-            .or(user.title)
-            .or(user.email)
-            .filter(|s| !s.trim().is_empty())
-            .ok_or_else(|| {
+        user.username.or(user.title).or(user.email).filter(|s| !s.trim().is_empty()).ok_or_else(
+            || {
                 let _ = url; // server URL unused here; kept for call-site symmetry
                 "plex.tv did not report an account name for that token".into()
-            })
+            },
+        )
     }
 
     /// Cover art bytes for one library item (a track's `ratingKey`).
@@ -560,12 +527,7 @@ impl PlexSource {
     ) -> Result<(Vec<u8>, String), Box<dyn std::error::Error + Send + Sync>> {
         // `thumb` on a track is the album cover Plex already generated.
         let endpoint = format!("{}/library/metadata/{}/thumb", self.url, rating_key);
-        let resp = self
-            .client
-            .get(&endpoint)
-            .header("X-Plex-Token", &self.token)
-            .send()
-            .await?;
+        let resp = self.client.get(&endpoint).header("X-Plex-Token", &self.token).send().await?;
 
         if !resp.status().is_success() {
             return Err(format!("Plex artwork returned {}", resp.status()).into());
@@ -665,8 +627,7 @@ impl PlexSource {
                                     },
                                 );
                             }
-                            self.process_live_track(track, is_playing, &mut result)
-                                .await;
+                            self.process_live_track(track, is_playing, &mut result).await;
                         }
                     }
                 }
@@ -697,10 +658,7 @@ impl PlexSource {
         let rating_key = track.rating_key.clone();
         let duration = track.duration.unwrap_or(0);
         let view_offset = track.view_offset.unwrap_or(0);
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
 
         if let Some(state) = self.session_states.get(&session_key) {
             if state.rating_key != rating_key {
@@ -713,21 +671,13 @@ impl PlexSource {
         }
 
         let (should_scrobble, needs_np) = {
-            let state = self
-                .session_states
-                .entry(session_key.clone())
-                .or_insert_with(|| SessionState {
-                    rating_key: rating_key.clone(),
-                    last_seen: now,
-                    scrobbled: false,
-                });
+            let state = self.session_states.entry(session_key.clone()).or_insert_with(|| {
+                SessionState { rating_key: rating_key.clone(), last_seen: now, scrobbled: false }
+            });
             state.last_seen = now;
 
-            let pct = if duration > 0 {
-                (view_offset as f64 / duration as f64) * 100.0
-            } else {
-                0.0
-            };
+            let pct =
+                if duration > 0 { (view_offset as f64 / duration as f64) * 100.0 } else { 0.0 };
             let seconds = view_offset / 1000;
 
             let ready = !state.scrobbled && (pct >= 50.0 || seconds >= 240);
@@ -736,10 +686,7 @@ impl PlexSource {
         };
 
         if should_scrobble {
-            info!(
-                "Track ready for scrobble: '{}' by '{}'",
-                track.title, track.artist
-            );
+            info!("Track ready for scrobble: '{}' by '{}'", track.title, track.artist);
             if let Some(state) = self.session_states.get_mut(&session_key) {
                 state.scrobbled = true;
             }
@@ -846,10 +793,7 @@ impl PlexSource {
             .as_secs()
             .saturating_sub(7 * 86400);
 
-        info!(
-            "Processing {} history tracks from Plex",
-            history_tracks.len()
-        );
+        info!("Processing {} history tracks from Plex", history_tracks.len());
         for h_track in history_tracks {
             if h_track.media_type.as_deref() != Some("track") {
                 continue;
@@ -889,11 +833,7 @@ impl PlexSource {
             {
                 return Some(format!("Library not in allow list: {}", lib));
             }
-            if !self
-                .libraries
-                .iter()
-                .any(|l| l.title == *lib && l.collection_type == "artist")
-            {
+            if !self.libraries.iter().any(|l| l.title == *lib && l.collection_type == "artist") {
                 return Some(format!("Not a music library: {}", lib));
             }
         }
@@ -901,13 +841,9 @@ impl PlexSource {
     }
 
     pub fn cleanup_sessions(&mut self, max_age_seconds: u64) {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
         let before_count = self.session_states.len();
-        self.session_states
-            .retain(|_, state| now - state.last_seen < max_age_seconds);
+        self.session_states.retain(|_, state| now - state.last_seen < max_age_seconds);
         let removed = before_count - self.session_states.len();
         if removed > 0 {
             debug!("Cleaned up {} stale sessions", removed);
@@ -920,10 +856,7 @@ impl PlexSource {
 
     pub async fn fetch_sessions(&mut self) -> Result<Vec<Play>, Box<dyn std::error::Error>> {
         let result = self.fetch_sessions_extended(None).await?;
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
         Ok(result
             .ready_to_scrobble
             .into_iter()

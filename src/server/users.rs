@@ -48,13 +48,7 @@ fn cookie_is_secure(headers: &HeaderMap, trust_proxy: bool) -> bool {
             .get("x-forwarded-proto")
             .and_then(|v| v.to_str().ok())
             // May be a comma-separated chain; the first hop is the client's.
-            .map(|v| {
-                v.split(',')
-                    .next()
-                    .unwrap_or("")
-                    .trim()
-                    .eq_ignore_ascii_case("https")
-            })
+            .map(|v| v.split(',').next().unwrap_or("").trim().eq_ignore_ascii_case("https"))
             .unwrap_or(false)
 }
 
@@ -87,19 +81,11 @@ fn session_clear_cookie(secure: bool) -> HeaderValue {
 async fn auth_status(State(state): State<Arc<AppState>>, headers: HeaderMap) -> impl IntoResponse {
     let needs_setup = state.db.needs_setup().await.unwrap_or(true);
 
-    let session_user = if let Some(session_token) = headers
-        .get("cookie")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|c| {
-            c.split(';')
-                .find_map(|s| s.trim().strip_prefix("td_session=").map(|v| v.to_string()))
+    let session_user = if let Some(session_token) =
+        headers.get("cookie").and_then(|v| v.to_str().ok()).and_then(|c| {
+            c.split(';').find_map(|s| s.trim().strip_prefix("td_session=").map(|v| v.to_string()))
         }) {
-        state
-            .db
-            .validate_session(&session_token)
-            .await
-            .ok()
-            .flatten()
+        state.db.validate_session(&session_token).await.ok().flatten()
     } else {
         None
     };
@@ -140,10 +126,7 @@ async fn setup(
         Err(e) => {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!(ErrorResponse {
-                    code: 500,
-                    error: e.to_string()
-                })),
+                Json(serde_json::json!(ErrorResponse { code: 500, error: e.to_string() })),
             )
                 .into_response()
         }
@@ -165,10 +148,7 @@ async fn setup(
         Err(e) => {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!(ErrorResponse {
-                    code: 500,
-                    error: e
-                })),
+                Json(serde_json::json!(ErrorResponse { code: 500, error: e })),
             )
                 .into_response()
         }
@@ -176,32 +156,21 @@ async fn setup(
 
     let user_id = match state
         .db
-        .setup_admin(
-            body.username.trim(),
-            body.display_name.as_deref(),
-            &password_hash,
-        )
+        .setup_admin(body.username.trim(), body.display_name.as_deref(), &password_hash)
         .await
     {
         Ok(id) => id,
         Err(e) => {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!(ErrorResponse {
-                    code: 500,
-                    error: e.to_string()
-                })),
+                Json(serde_json::json!(ErrorResponse { code: 500, error: e.to_string() })),
             )
                 .into_response()
         }
     };
 
     // Create a default API token
-    let token = match state
-        .db
-        .create_token(user_id, "default", "submit,read,admin")
-        .await
-    {
+    let token = match state.db.create_token(user_id, "default", "submit,read,admin").await {
         Ok(t) => t,
         Err(e) => {
             return (
@@ -221,10 +190,7 @@ async fn setup(
         Err(e) => {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!(ErrorResponse {
-                    code: 500,
-                    error: e.to_string()
-                })),
+                Json(serde_json::json!(ErrorResponse { code: 500, error: e.to_string() })),
             )
                 .into_response()
         }
@@ -233,10 +199,7 @@ async fn setup(
     let mut resp_headers = HeaderMap::new();
     resp_headers.insert(
         header::SET_COOKIE,
-        session_set_cookie(
-            &session_token,
-            cookie_is_secure(&headers, state.trust_proxy),
-        ),
+        session_set_cookie(&session_token, cookie_is_secure(&headers, state.trust_proxy)),
     );
 
     (
@@ -312,10 +275,7 @@ async fn login(
         Err(e) => {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!(ErrorResponse {
-                    code: 500,
-                    error: e.to_string()
-                })),
+                Json(serde_json::json!(ErrorResponse { code: 500, error: e.to_string() })),
             )
                 .into_response()
         }
@@ -327,10 +287,7 @@ async fn login(
         Err(e) => {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!(ErrorResponse {
-                    code: 500,
-                    error: e.to_string()
-                })),
+                Json(serde_json::json!(ErrorResponse { code: 500, error: e.to_string() })),
             )
                 .into_response()
         }
@@ -339,10 +296,7 @@ async fn login(
     // Read the *request* headers for the proto before building the response set.
     let secure = cookie_is_secure(&headers, state.trust_proxy);
     let mut resp_headers = HeaderMap::new();
-    resp_headers.insert(
-        header::SET_COOKIE,
-        session_set_cookie(&session_token, secure),
-    );
+    resp_headers.insert(header::SET_COOKIE, session_set_cookie(&session_token, secure));
 
     (
         StatusCode::OK,
@@ -359,14 +313,9 @@ async fn login(
 /// POST /api/v1/auth/logout — reads cookie, no AuthUser required
 async fn logout(State(state): State<Arc<AppState>>, headers: HeaderMap) -> impl IntoResponse {
     // Try to delete the session from DB
-    if let Some(session_token) = headers
-        .get("cookie")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|c| {
-            c.split(';')
-                .find_map(|s| s.trim().strip_prefix("td_session=").map(|v| v.to_string()))
-        })
-    {
+    if let Some(session_token) = headers.get("cookie").and_then(|v| v.to_str().ok()).and_then(|c| {
+        c.split(';').find_map(|s| s.trim().strip_prefix("td_session=").map(|v| v.to_string()))
+    }) {
         let _ = state.db.delete_web_session(&session_token).await;
     }
 
@@ -376,11 +325,7 @@ async fn logout(State(state): State<Arc<AppState>>, headers: HeaderMap) -> impl 
         session_clear_cookie(cookie_is_secure(&headers, state.trust_proxy)),
     );
 
-    (
-        StatusCode::OK,
-        resp_headers,
-        Json(serde_json::json!({ "status": "logged out" })),
-    )
+    (StatusCode::OK, resp_headers, Json(serde_json::json!({ "status": "logged out" })))
 }
 
 /// GET /api/v1/auth/me — requires auth
@@ -436,10 +381,7 @@ async fn create_user(
             Err(e) => {
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(serde_json::json!(ErrorResponse {
-                        code: 500,
-                        error: e
-                    })),
+                    Json(serde_json::json!(ErrorResponse { code: 500, error: e })),
                 )
                     .into_response()
             }
@@ -450,34 +392,20 @@ async fn create_user(
 
     let user_id = match state
         .db
-        .create_user(
-            body.username.trim(),
-            body.display_name.as_deref(),
-            &password_hash,
-            "user",
-        )
+        .create_user(body.username.trim(), body.display_name.as_deref(), &password_hash, "user")
         .await
     {
         Ok(id) => id,
         Err(e) => {
             let msg = e.to_string();
             let (status, error) = if msg.contains("UNIQUE") {
-                (
-                    StatusCode::CONFLICT,
-                    format!("Username '{}' already exists", body.username),
-                )
+                (StatusCode::CONFLICT, format!("Username '{}' already exists", body.username))
             } else {
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("Failed to create user: {}", msg),
-                )
+                (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to create user: {}", msg))
             };
             return (
                 status,
-                Json(serde_json::json!(ErrorResponse {
-                    code: status.as_u16(),
-                    error
-                })),
+                Json(serde_json::json!(ErrorResponse { code: status.as_u16(), error })),
             )
                 .into_response();
         }
@@ -580,10 +508,7 @@ async fn update_user(
         if let Err(e) = state.db.update_user_role(id, role).await {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!(ErrorResponse {
-                    code: 500,
-                    error: e.to_string()
-                })),
+                Json(serde_json::json!(ErrorResponse { code: 500, error: e.to_string() })),
             )
                 .into_response();
         }
@@ -613,10 +538,7 @@ async fn update_user(
         if let Err(e) = state.db.set_user_disabled(id, disabled).await {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!(ErrorResponse {
-                    code: 500,
-                    error: e.to_string()
-                })),
+                Json(serde_json::json!(ErrorResponse { code: 500, error: e.to_string() })),
             )
                 .into_response();
         }
@@ -638,10 +560,7 @@ async fn update_user(
             Err(e) => {
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(serde_json::json!(ErrorResponse {
-                        code: 500,
-                        error: e
-                    })),
+                    Json(serde_json::json!(ErrorResponse { code: 500, error: e })),
                 )
                     .into_response()
             }
@@ -649,20 +568,13 @@ async fn update_user(
         if let Err(e) = state.db.update_user_password(id, &hash).await {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!(ErrorResponse {
-                    code: 500,
-                    error: e.to_string()
-                })),
+                Json(serde_json::json!(ErrorResponse { code: 500, error: e.to_string() })),
             )
                 .into_response();
         }
     }
 
-    (
-        StatusCode::OK,
-        Json(serde_json::json!({ "status": "updated" })),
-    )
-        .into_response()
+    (StatusCode::OK, Json(serde_json::json!({ "status": "updated" }))).into_response()
 }
 
 /// DELETE /admin/users/:id — remove a user and all their data (admin-only).
@@ -706,18 +618,12 @@ async fn delete_user(
         Ok(true) => StatusCode::NO_CONTENT.into_response(),
         Ok(false) => (
             StatusCode::NOT_FOUND,
-            Json(serde_json::json!(ErrorResponse {
-                code: 404,
-                error: "User not found".into()
-            })),
+            Json(serde_json::json!(ErrorResponse { code: 404, error: "User not found".into() })),
         )
             .into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!(ErrorResponse {
-                code: 500,
-                error: e.to_string()
-            })),
+            Json(serde_json::json!(ErrorResponse { code: 500, error: e.to_string() })),
         )
             .into_response(),
     }
@@ -768,11 +674,7 @@ async fn create_token(
         )
             .into_response();
     }
-    match state
-        .db
-        .create_token(target_user_id, body.name.trim(), &body.scopes)
-        .await
-    {
+    match state.db.create_token(target_user_id, body.name.trim(), &body.scopes).await {
         Ok(token) => (
             StatusCode::CREATED,
             Json(serde_json::json!(CreateTokenResponse {
@@ -796,11 +698,9 @@ async fn create_token(
 
 async fn list_tokens(State(state): State<Arc<AppState>>, user: AuthUser) -> impl IntoResponse {
     match state.db.list_tokens(user.user_id).await {
-        Ok(tokens) => (
-            StatusCode::OK,
-            Json(serde_json::json!({ "tokens": tokens })),
-        )
-            .into_response(),
+        Ok(tokens) => {
+            (StatusCode::OK, Json(serde_json::json!({ "tokens": tokens }))).into_response()
+        }
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!(ErrorResponse {
@@ -818,25 +718,17 @@ async fn revoke_token(
     Path(token_id): Path<i64>,
 ) -> impl IntoResponse {
     match state.db.delete_token(user.user_id, token_id).await {
-        Ok(true) => (
-            StatusCode::OK,
-            Json(serde_json::json!({ "status": "revoked" })),
-        )
-            .into_response(),
+        Ok(true) => {
+            (StatusCode::OK, Json(serde_json::json!({ "status": "revoked" }))).into_response()
+        }
         Ok(false) => (
             StatusCode::NOT_FOUND,
-            Json(serde_json::json!(ErrorResponse {
-                code: 404,
-                error: "Token not found".into()
-            })),
+            Json(serde_json::json!(ErrorResponse { code: 404, error: "Token not found".into() })),
         )
             .into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!(ErrorResponse {
-                code: 500,
-                error: e.to_string()
-            })),
+            Json(serde_json::json!(ErrorResponse { code: 500, error: e.to_string() })),
         )
             .into_response(),
     }
@@ -855,10 +747,7 @@ async fn get_log_level(State(state): State<Arc<AppState>>, user: AuthUser) -> im
     if !user.is_admin {
         return forbidden("view the log level");
     }
-    (
-        StatusCode::OK,
-        Json(serde_json::json!({ "current_level": state.log_handle.get_level() })),
-    )
+    (StatusCode::OK, Json(serde_json::json!({ "current_level": state.log_handle.get_level() })))
         .into_response()
 }
 
@@ -878,10 +767,7 @@ async fn set_log_level(
             .into_response(),
         Err(e) => (
             StatusCode::BAD_REQUEST,
-            Json(serde_json::json!(ErrorResponse {
-                code: 400,
-                error: e
-            })),
+            Json(serde_json::json!(ErrorResponse { code: 400, error: e })),
         )
             .into_response(),
     }

@@ -14,11 +14,8 @@ pub struct ListenBrainzSink {
 
 impl ListenBrainzSink {
     pub fn new(base_url: String, token: String) -> Self {
-        let sanitized_token = token
-            .trim()
-            .chars()
-            .filter(|c| c.is_ascii() && !c.is_control())
-            .collect::<String>();
+        let sanitized_token =
+            token.trim().chars().filter(|c| c.is_ascii() && !c.is_control()).collect::<String>();
 
         Self {
             base_url: base_url.trim_end_matches('/').to_string(),
@@ -40,14 +37,9 @@ impl ListenBrainzSink {
 
         // additional_info
         let mut additional_info = serde_json::Map::new();
-        additional_info.insert(
-            "submission_client".to_string(),
-            json!(env!("CARGO_PKG_NAME")),
-        );
-        additional_info.insert(
-            "submission_client_version".to_string(),
-            json!(env!("CARGO_PKG_VERSION")),
-        );
+        additional_info.insert("submission_client".to_string(), json!(env!("CARGO_PKG_NAME")));
+        additional_info
+            .insert("submission_client_version".to_string(), json!(env!("CARGO_PKG_VERSION")));
 
         if let Some(dur) = play.duration {
             additional_info.insert("duration_ms".to_string(), json!(dur * 1000));
@@ -56,10 +48,8 @@ impl ListenBrainzSink {
             additional_info.insert("track_number".to_string(), json!(num));
         }
         if !additional_info.is_empty() {
-            track_meta.insert(
-                "additional_info".to_string(),
-                serde_json::Value::Object(additional_info),
-            );
+            track_meta
+                .insert("additional_info".to_string(), serde_json::Value::Object(additional_info));
         }
 
         // mbid_mapping
@@ -93,10 +83,7 @@ impl ListenBrainzSink {
                     .enumerate()
                     .map(|(idx, mbid)| {
                         let artist_name = if let Some(ref artists) = play.artists {
-                            artists
-                                .get(idx)
-                                .cloned()
-                                .unwrap_or_else(|| play.artist.clone())
+                            artists.get(idx).cloned().unwrap_or_else(|| play.artist.clone())
                         } else {
                             play.artist.clone()
                         };
@@ -115,10 +102,7 @@ impl ListenBrainzSink {
         if has_mbid_data {
             debug!("Adding mbid_mapping: recording={:?}, release={:?}, artist={:?}, caa_id={:?}, caa_release={:?}",
                 play.mbid_recording, play.mbid_release, play.mbid_artist, play.caa_id, play.caa_release_mbid);
-            track_meta.insert(
-                "mbid_mapping".to_string(),
-                serde_json::Value::Object(mbid_mapping),
-            );
+            track_meta.insert("mbid_mapping".to_string(), serde_json::Value::Object(mbid_mapping));
         } else {
             debug!("No MBIDs available for {} - {}", play.artist, play.title);
         }

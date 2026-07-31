@@ -73,13 +73,7 @@ pub async fn resolve(
             Ok(Some(found)) if !found.is_empty() => return Some(found),
             Ok(_) => continue,
             Err(e) => {
-                tracing::debug!(
-                    "{} lookup failed for {} - {}: {}",
-                    p.name(),
-                    artist,
-                    title,
-                    e
-                );
+                tracing::debug!("{} lookup failed for {} - {}: {}", p.name(), artist, title, e);
                 continue;
             }
         }

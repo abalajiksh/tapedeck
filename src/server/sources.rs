@@ -39,14 +39,7 @@ const KINDS: [&str; 3] = ["plex", "navidrome", "jellyfin"];
 
 fn err(code: u16, msg: impl Into<String>) -> axum::response::Response {
     let status = StatusCode::from_u16(code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-    (
-        status,
-        Json(serde_json::json!(ErrorResponse {
-            code,
-            error: msg.into()
-        })),
-    )
-        .into_response()
+    (status, Json(serde_json::json!(ErrorResponse { code, error: msg.into() }))).into_response()
 }
 
 fn public_view(s: &UserSource) -> serde_json::Value {
@@ -241,10 +234,7 @@ async fn resolve_save(
     let keep_list = |incoming: Option<Vec<String>>, key: &str| -> Vec<String> {
         incoming
             .map(|v| {
-                v.into_iter()
-                    .map(|s| s.trim().to_lowercase())
-                    .filter(|s| !s.is_empty())
-                    .collect()
+                v.into_iter().map(|s| s.trim().to_lowercase()).filter(|s| !s.is_empty()).collect()
             })
             .unwrap_or_else(|| current.map(|c| c.option_list(key)).unwrap_or_default())
     };
@@ -256,13 +246,7 @@ async fn resolve_save(
     })
     .to_string();
 
-    Ok(Resolved {
-        url,
-        credentials,
-        remote_account,
-        options,
-        complete,
-    })
+    Ok(Resolved { url, credentials, remote_account, options, complete })
 }
 
 /// POST /api/v1/sources — add another server.
@@ -324,12 +308,7 @@ async fn update_source(
     };
 
     let enabled = body.enabled.unwrap_or(current.enabled);
-    let label = body
-        .label
-        .clone()
-        .unwrap_or_else(|| current.label.clone())
-        .trim()
-        .to_string();
+    let label = body.label.clone().unwrap_or_else(|| current.label.clone()).trim().to_string();
     let interval = body.poll_interval_secs.or(current.poll_interval_secs);
 
     let resolved = match resolve_save(&current.kind, &mut body, Some(&current), enabled).await {
@@ -353,10 +332,7 @@ async fn update_source(
         .await
     {
         Ok(true) => {
-            info!(
-                "⚙️ {} source updated by {} (enabled: {})",
-                current.kind, user.username, enabled
-            );
+            info!("⚙️ {} source updated by {} (enabled: {})", current.kind, user.username, enabled);
             match state.db.get_source(user.user_id, id).await {
                 Ok(Some(s)) => (StatusCode::OK, Json(public_view(&s))).into_response(),
                 _ => err(500, "source vanished after write"),
@@ -411,11 +387,8 @@ async fn test_source(
         None => None,
     };
 
-    let kind = body
-        .kind
-        .clone()
-        .or_else(|| stored.as_ref().map(|s| s.kind.clone()))
-        .unwrap_or_default();
+    let kind =
+        body.kind.clone().or_else(|| stored.as_ref().map(|s| s.kind.clone())).unwrap_or_default();
     if !KINDS.contains(&kind.as_str()) {
         return err(400, format!("Unknown source kind: {kind}"));
     }
@@ -442,11 +415,10 @@ async fn test_source(
                 return err(400, "Enter a server URL and API key first");
             }
             match JellyfinSource::resolve_account(&url, &key).await {
-                Ok(name) => (
-                    StatusCode::OK,
-                    Json(serde_json::json!({ "ok": true, "account": name })),
-                )
-                    .into_response(),
+                Ok(name) => {
+                    (StatusCode::OK, Json(serde_json::json!({ "ok": true, "account": name })))
+                        .into_response()
+                }
                 Err(e) => (
                     StatusCode::OK,
                     Json(serde_json::json!({ "ok": false, "error": e.to_string() })),
@@ -455,19 +427,14 @@ async fn test_source(
             }
         }
         "navidrome" => {
-            let (u, p) = (
-                cred(body.username.clone(), "username"),
-                cred(body.password.clone(), "password"),
-            );
+            let (u, p) =
+                (cred(body.username.clone(), "username"), cred(body.password.clone(), "password"));
             if url.is_empty() || u.is_empty() || p.is_empty() {
                 return err(400, "Enter a server URL, username and password first");
             }
             let mut probe = NavidromeSource::new(url, u.clone(), p);
             match probe.initialize().await {
-                Ok(()) => (
-                    StatusCode::OK,
-                    Json(serde_json::json!({ "ok": true, "account": u })),
-                )
+                Ok(()) => (StatusCode::OK, Json(serde_json::json!({ "ok": true, "account": u })))
                     .into_response(),
                 Err(e) => (
                     StatusCode::OK,
@@ -519,8 +486,5 @@ pub fn create_sources_router() -> Router<Arc<AppState>> {
         // parameterised route.
         .route("/api/v1/sources/test", post(test_source))
         .route("/api/v1/sources", get(list_sources).post(create_source))
-        .route(
-            "/api/v1/sources/:id",
-            axum::routing::put(update_source).delete(delete_source),
-        )
+        .route("/api/v1/sources/:id", axum::routing::put(update_source).delete(delete_source))
 }

@@ -161,11 +161,7 @@ impl NavidromeSource {
             password,
             client: Client::builder()
                 .timeout(Duration::from_secs(15))
-                .user_agent(format!(
-                    "{}/{}",
-                    env!("CARGO_PKG_NAME"),
-                    env!("CARGO_PKG_VERSION")
-                ))
+                .user_agent(format!("{}/{}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION")))
                 .build()
                 .unwrap_or_else(|_| Client::new()),
             nd_token: None,
@@ -258,11 +254,7 @@ impl NavidromeSource {
         let resp = self
             .native_get(
                 "/api/scrobble/",
-                &[
-                    ("from", from.to_string()),
-                    ("_start", "0".into()),
-                    ("_end", "10000".into()),
-                ],
+                &[("from", from.to_string()), ("_start", "0".into()), ("_end", "10000".into())],
             )
             .await?;
         let rows: Vec<NativeScrobble> = resp.json().await?;
@@ -271,10 +263,7 @@ impl NavidromeSource {
         }
 
         // Only load the catalogue when we actually have rows referencing it.
-        if rows
-            .iter()
-            .any(|r| !self.songs.contains_key(&r.media_file_id))
-        {
+        if rows.iter().any(|r| !self.songs.contains_key(&r.media_file_id)) {
             self.load_songs().await?;
         }
 
@@ -283,10 +272,7 @@ impl NavidromeSource {
         for row in rows {
             newest = newest.max(row.submission_time);
             let Some(song) = self.songs.get(&row.media_file_id) else {
-                debug!(
-                    "Navidrome scrobble references unknown song {}",
-                    row.media_file_id
-                );
+                debug!("Navidrome scrobble references unknown song {}", row.media_file_id);
                 continue;
             };
             plays.push(song.to_play(row.submission_time, &row.media_file_id));
@@ -297,10 +283,7 @@ impl NavidromeSource {
 
     async fn load_songs(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         let resp = self
-            .native_get(
-                "/api/song",
-                &[("_start", "0".into()), ("_end", "100000".into())],
-            )
+            .native_get("/api/song", &[("_start", "0".into()), ("_end", "100000".into())])
             .await?;
         let songs: Vec<NativeSong> = resp.json().await?;
         self.songs = songs
@@ -328,9 +311,8 @@ impl NavidromeSource {
     /// Salted-MD5 auth, computed per request as the protocol requires.
     fn subsonic_params(&self) -> Vec<(String, String)> {
         use rand::Rng;
-        let salt: String = (0..12)
-            .map(|_| rand::rng().sample(rand::distr::Alphanumeric) as char)
-            .collect();
+        let salt: String =
+            (0..12).map(|_| rand::rng().sample(rand::distr::Alphanumeric) as char).collect();
         let token = format!("{:x}", md5::compute(format!("{}{}", self.password, salt)));
         vec![
             ("u".into(), self.username.clone()),
@@ -385,12 +367,8 @@ impl NavidromeSource {
         params.push(("id".into(), item_id.to_string()));
         params.push(("size".into(), "500".into()));
 
-        let resp = self
-            .client
-            .get(format!("{}/rest/getCoverArt", self.url))
-            .query(&params)
-            .send()
-            .await?;
+        let resp =
+            self.client.get(format!("{}/rest/getCoverArt", self.url)).query(&params).send().await?;
 
         if !resp.status().is_success() {
             return Err(format!("Navidrome cover art returned {}", resp.status()).into());
@@ -478,10 +456,7 @@ impl NavidromeSong {
 }
 
 fn now_secs() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs()
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs()
 }
 
 #[async_trait]
@@ -565,22 +540,13 @@ mod tests {
     fn accepts_navidrome_mbid_field_spellings() {
         // Each of these has been the field name at some point; a mismatch is
         // invisible at runtime, so pin them all.
-        for key in [
-            "mbzRecordingID",
-            "mbzRecordingId",
-            "mbzTrackId",
-            "musicBrainzId",
-        ] {
+        for key in ["mbzRecordingID", "mbzRecordingId", "mbzTrackId", "musicBrainzId"] {
             let json = format!(
                 r#"{{"id":"1","title":"T","artist":"A","duration":100.0,"{key}":"mb-123"}}"#
             );
             let song: NativeSong = serde_json::from_str(&json)
                 .unwrap_or_else(|e| panic!("{key} failed to parse: {e}"));
-            assert_eq!(
-                song.mbz_recording_id.as_deref(),
-                Some("mb-123"),
-                "{key} did not map"
-            );
+            assert_eq!(song.mbz_recording_id.as_deref(), Some("mb-123"), "{key} did not map");
         }
     }
 

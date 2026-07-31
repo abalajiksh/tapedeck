@@ -69,10 +69,8 @@ impl LastFmSink {
         let app_version = env!("CARGO_PKG_VERSION");
         let user_agent = format!("{}/{}", app_name, app_version);
 
-        let client = Client::builder()
-            .user_agent(user_agent)
-            .build()
-            .unwrap_or_else(|_| Client::new());
+        let client =
+            Client::builder().user_agent(user_agent).build().unwrap_or_else(|_| Client::new());
 
         Self {
             api_key,
@@ -119,11 +117,7 @@ impl ScrobbleSink for LastFmSink {
             return Ok(());
         }
 
-        info!(
-            "Submitting {} plays to {}...",
-            plays.len(),
-            self.service_name
-        );
+        info!("Submitting {} plays to {}...", plays.len(), self.service_name);
 
         for chunk in plays.chunks(50) {
             let mut params: Vec<(String, String)> = Vec::new();
@@ -180,13 +174,7 @@ impl ScrobbleSink for LastFmSink {
             let mut attempt = 0u32;
             loop {
                 attempt += 1;
-                match self
-                    .client
-                    .post(self.api_endpoint())
-                    .form(&form_data)
-                    .send()
-                    .await
-                {
+                match self.client.post(self.api_endpoint()).form(&form_data).send().await {
                     Ok(resp) if resp.status().is_success() => {
                         debug!(
                             "Successfully submitted chunk of {} plays to {}",
@@ -233,11 +221,7 @@ impl ScrobbleSink for LastFmSink {
             }
         }
 
-        info!(
-            "✅ Successfully submitted {} plays to {}",
-            plays.len(),
-            self.service_name
-        );
+        info!("✅ Successfully submitted {} plays to {}", plays.len(), self.service_name);
         Ok(())
     }
 }

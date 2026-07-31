@@ -119,10 +119,7 @@ async fn update_scrobble(
         Ok(true) => match state.db.get_scrobble(user.user_id, id).await {
             // return the fresh row so the UI can re-render without a refetch
             Ok(Some(r)) => (StatusCode::OK, Json(serde_json::json!(r))).into_response(),
-            _ => (
-                StatusCode::OK,
-                Json(serde_json::json!({ "id": id, "status": "updated" })),
-            )
+            _ => (StatusCode::OK, Json(serde_json::json!({ "id": id, "status": "updated" })))
                 .into_response(),
         },
         Ok(false) => not_found(),
@@ -177,10 +174,8 @@ pub struct StatsQuery {
 
 /// Map a range label to a lower-bound timestamp (None = all time).
 fn range_after(range: Option<&str>) -> Option<i64> {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs() as i64;
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs()
+        as i64;
     match range.unwrap_or("all") {
         "week" => Some(now - 7 * 86400),
         "month" | "last30" => Some(now - 30 * 86400),
@@ -196,10 +191,7 @@ async fn user_tz(state: &AppState, user_id: i64) -> chrono_tz::Tz {
         .get_preferences(user_id)
         .await
         .ok()
-        .and_then(|p| {
-            p.get("timezone")
-                .and_then(|v| v.as_str().map(str::to_string))
-        })
+        .and_then(|p| p.get("timezone").and_then(|v| v.as_str().map(str::to_string)))
         .unwrap_or_default();
     crate::analytics::parse_tz(&name)
 }
@@ -208,15 +200,13 @@ fn to_listen_rows(
     rows: Vec<(i64, String, String, Option<String>, Option<i32>)>,
 ) -> Vec<crate::analytics::ListenRow> {
     rows.into_iter()
-        .map(
-            |(ts, artist, title, album, track_number)| crate::analytics::ListenRow {
-                ts,
-                artist,
-                title,
-                album,
-                track_number,
-            },
-        )
+        .map(|(ts, artist, title, album, track_number)| crate::analytics::ListenRow {
+            ts,
+            artist,
+            title,
+            album,
+            track_number,
+        })
         .collect()
 }
 
@@ -232,11 +222,7 @@ async fn ranged_stats(
         Err(e) => return server_error(e.to_string()),
     };
     // Recompute the heatmap in the user's local timezone.
-    if let Ok(rows) = state
-        .db
-        .get_listen_rows(user.user_id, after, state.analytics_row_cap)
-        .await
-    {
+    if let Ok(rows) = state.db.get_listen_rows(user.user_id, after, state.analytics_row_cap).await {
         let tz = user_tz(&state, user.user_id).await;
         stats["heatmap"] =
             serde_json::json!(crate::analytics::heatmap_local(&to_listen_rows(rows), tz));
@@ -252,22 +238,12 @@ async fn personality(
 ) -> impl IntoResponse {
     match state
         .db
-        .get_listen_rows(
-            user.user_id,
-            range_after(q.range.as_deref()),
-            state.analytics_row_cap,
-        )
+        .get_listen_rows(user.user_id, range_after(q.range.as_deref()), state.analytics_row_cap)
         .await
     {
         Ok(rows) => {
             let tz = user_tz(&state, user.user_id).await;
-            (
-                StatusCode::OK,
-                Json(crate::analytics::compute_personality(
-                    &to_listen_rows(rows),
-                    tz,
-                )),
-            )
+            (StatusCode::OK, Json(crate::analytics::compute_personality(&to_listen_rows(rows), tz)))
                 .into_response()
         }
         Err(e) => server_error(e.to_string()),
@@ -287,11 +263,7 @@ async fn bulk_set_chain(
     user: AuthUser,
     Json(body): Json<BulkChain>,
 ) -> impl IntoResponse {
-    match state
-        .db
-        .bulk_set_scrobble_chain(user.user_id, &body.ids, body.signal_chain_id)
-        .await
-    {
+    match state.db.bulk_set_scrobble_chain(user.user_id, &body.ids, body.signal_chain_id).await {
         Ok(n) => (StatusCode::OK, Json(serde_json::json!({ "updated": n }))).into_response(),
         Err(e) => server_error(e.to_string()),
     }
@@ -320,10 +292,7 @@ async fn backfill_languages_now(
     if !user.is_admin {
         return (
             StatusCode::FORBIDDEN,
-            Json(serde_json::json!(ErrorResponse {
-                code: 403,
-                error: "Admin only".into()
-            })),
+            Json(serde_json::json!(ErrorResponse { code: 403, error: "Admin only".into() })),
         )
             .into_response();
     }
@@ -335,11 +304,7 @@ async fn backfill_languages_now(
             }
         }
     });
-    (
-        StatusCode::ACCEPTED,
-        Json(serde_json::json!({ "status": "started" })),
-    )
-        .into_response()
+    (StatusCode::ACCEPTED, Json(serde_json::json!({ "status": "started" }))).into_response()
 }
 
 /// GET /api/v1/artwork/status — cover-art coverage for the calling user.
@@ -366,10 +331,7 @@ async fn backfill_artwork_now(
     if !user.is_admin {
         return (
             StatusCode::FORBIDDEN,
-            Json(serde_json::json!(ErrorResponse {
-                code: 403,
-                error: "Admin only".into()
-            })),
+            Json(serde_json::json!(ErrorResponse { code: 403, error: "Admin only".into() })),
         )
             .into_response();
     }
@@ -383,30 +345,20 @@ async fn backfill_artwork_now(
             }
         }
     });
-    (
-        StatusCode::ACCEPTED,
-        Json(serde_json::json!({ "status": "started" })),
-    )
-        .into_response()
+    (StatusCode::ACCEPTED, Json(serde_json::json!({ "status": "started" }))).into_response()
 }
 
 fn not_found() -> axum::response::Response {
     (
         StatusCode::NOT_FOUND,
-        Json(serde_json::json!(ErrorResponse {
-            code: 404,
-            error: "Scrobble not found".into()
-        })),
+        Json(serde_json::json!(ErrorResponse { code: 404, error: "Scrobble not found".into() })),
     )
         .into_response()
 }
 fn server_error(msg: String) -> axum::response::Response {
     (
         StatusCode::INTERNAL_SERVER_ERROR,
-        Json(serde_json::json!(ErrorResponse {
-            code: 500,
-            error: msg
-        })),
+        Json(serde_json::json!(ErrorResponse { code: 500, error: msg })),
     )
         .into_response()
 }
@@ -414,29 +366,14 @@ fn server_error(msg: String) -> axum::response::Response {
 pub fn create_scrobbles_router() -> Router<Arc<AppState>> {
     use axum::routing::patch;
     Router::new()
-        .route(
-            "/api/v1/scrobbles",
-            get(list_scrobbles).delete(clear_scrobbles),
-        )
-        .route(
-            "/api/v1/scrobbles/bulk-chain",
-            axum::routing::post(bulk_set_chain),
-        )
-        .route(
-            "/api/v1/scrobbles/:id",
-            patch(update_scrobble).delete(delete_scrobble),
-        )
+        .route("/api/v1/scrobbles", get(list_scrobbles).delete(clear_scrobbles))
+        .route("/api/v1/scrobbles/bulk-chain", axum::routing::post(bulk_set_chain))
+        .route("/api/v1/scrobbles/:id", patch(update_scrobble).delete(delete_scrobble))
         .route("/api/v1/stats/dashboard", get(dashboard_stats))
         .route("/api/v1/stats", get(ranged_stats))
         .route("/api/v1/personality", get(personality))
         .route("/api/v1/languages/status", get(language_status))
-        .route(
-            "/api/v1/languages/backfill",
-            axum::routing::post(backfill_languages_now),
-        )
+        .route("/api/v1/languages/backfill", axum::routing::post(backfill_languages_now))
         .route("/api/v1/artwork/status", get(artwork_status))
-        .route(
-            "/api/v1/artwork/backfill",
-            axum::routing::post(backfill_artwork_now),
-        )
+        .route("/api/v1/artwork/backfill", axum::routing::post(backfill_artwork_now))
 }

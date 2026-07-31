@@ -85,11 +85,7 @@ async fn export(
                     Some((Ok(buf), (Phase::Rows(off + n), first)))
                 }
                 Phase::Close => {
-                    let chunk = if csv_fmt {
-                        String::new()
-                    } else {
-                        "]".to_string()
-                    };
+                    let chunk = if csv_fmt { String::new() } else { "]".to_string() };
                     Some((Ok(chunk), (Phase::End, first)))
                 }
                 Phase::End => None,
@@ -100,17 +96,11 @@ async fn export(
     let (ct, disp) = if csv_fmt {
         ("text/csv", "attachment; filename=\"tapedeck-export.csv\"")
     } else {
-        (
-            "application/json",
-            "attachment; filename=\"tapedeck-export.json\"",
-        )
+        ("application/json", "attachment; filename=\"tapedeck-export.json\"")
     };
     (
         StatusCode::OK,
-        [
-            (header::CONTENT_TYPE, ct),
-            (header::CONTENT_DISPOSITION, disp),
-        ],
+        [(header::CONTENT_TYPE, ct), (header::CONTENT_DISPOSITION, disp)],
         Body::from_stream(stream),
     )
         .into_response()
@@ -121,17 +111,11 @@ async fn backup(State(state): State<Arc<AppState>>, user: AuthUser) -> impl Into
     if !user.is_admin {
         return (
             StatusCode::FORBIDDEN,
-            Json(serde_json::json!(ErrorResponse {
-                code: 403,
-                error: "Admin only".into()
-            })),
+            Json(serde_json::json!(ErrorResponse { code: 403, error: "Admin only".into() })),
         )
             .into_response();
     }
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
     let tmp = std::env::temp_dir().join(format!("tapedeck-backup-{now}.db"));
     let tmp_str = tmp.to_string_lossy().to_string();
 
@@ -164,10 +148,7 @@ async fn backup(State(state): State<Arc<AppState>>, user: AuthUser) -> impl Into
         StatusCode::OK,
         [
             (header::CONTENT_TYPE, "application/x-sqlite3"),
-            (
-                header::CONTENT_DISPOSITION,
-                "attachment; filename=\"tapedeck-backup.db\"",
-            ),
+            (header::CONTENT_DISPOSITION, "attachment; filename=\"tapedeck-backup.db\""),
         ],
         bytes,
     )
@@ -184,7 +165,5 @@ fn csv(s: &str) -> String {
 }
 
 pub fn create_export_router() -> Router<Arc<AppState>> {
-    Router::new()
-        .route("/api/v1/export", get(export))
-        .route("/api/v1/backup", get(backup))
+    Router::new().route("/api/v1/export", get(export)).route("/api/v1/backup", get(backup))
 }

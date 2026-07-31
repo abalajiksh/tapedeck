@@ -41,9 +41,7 @@ pub async fn spa_fallback(uri: Uri) -> Response {
     }
 
     if let Some(content) = Assets::get(path) {
-        let mime = mime_guess::from_path(path)
-            .first_or_octet_stream()
-            .to_string();
+        let mime = mime_guess::from_path(path).first_or_octet_stream().to_string();
 
         let mut response = (StatusCode::OK, content.data.to_vec()).into_response();
         let headers = response.headers_mut();
@@ -79,11 +77,7 @@ fn serve_index() -> Response {
             index.data.to_vec(),
         )
             .into_response(),
-        None => (
-            StatusCode::NOT_FOUND,
-            "Frontend not built — run ./build-web.sh",
-        )
-            .into_response(),
+        None => (StatusCode::NOT_FOUND, "Frontend not built — run ./build-web.sh").into_response(),
     }
 }
 

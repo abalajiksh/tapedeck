@@ -101,9 +101,7 @@ impl MusicBrainzClient {
             config,
             sqlite_pool,
             postgres_pool,
-            http_client: reqwest::Client::builder()
-                .timeout(Duration::from_secs(30))
-                .build()?,
+            http_client: reqwest::Client::builder().timeout(Duration::from_secs(30)).build()?,
             rate_limiter,
         })
     }
@@ -116,10 +114,7 @@ impl MusicBrainzClient {
         album_name: Option<&str>,
     ) -> Result<MusicBrainzMetadata> {
         // Tier 1: Check SQLite cache (includes negative cache entries)
-        if let Some(cached) = self
-            .get_from_sqlite(track_title, artist_name, album_name)
-            .await?
-        {
+        if let Some(cached) = self.get_from_sqlite(track_title, artist_name, album_name).await? {
             if cached.track_mbid.is_none() {
                 // Negative cache hit — return the error without hitting the API
                 tracing::debug!(
@@ -139,15 +134,10 @@ impl MusicBrainzClient {
 
         // Tier 2: Check PostgreSQL dump (if enabled)
         if self.postgres_pool.is_some() {
-            if let Some(pg_data) = self
-                .get_from_postgres(track_title, artist_name, album_name)
-                .await?
+            if let Some(pg_data) =
+                self.get_from_postgres(track_title, artist_name, album_name).await?
             {
-                tracing::debug!(
-                    "Cache hit (PostgreSQL) for: {} - {}",
-                    artist_name,
-                    track_title
-                );
+                tracing::debug!("Cache hit (PostgreSQL) for: {} - {}", artist_name, track_title);
                 // Store in SQLite for faster future access
                 self.store_in_sqlite(&pg_data).await?;
                 return Ok(pg_data);
@@ -155,14 +145,8 @@ impl MusicBrainzClient {
         }
 
         // Tier 3: Fetch from MusicBrainz API with rate limiting
-        tracing::debug!(
-            "Fetching from MusicBrainz API: {} - {}",
-            artist_name,
-            track_title
-        );
-        let api_data = self
-            .fetch_from_api(track_title, artist_name, album_name)
-            .await?;
+        tracing::debug!("Fetching from MusicBrainz API: {} - {}", artist_name, track_title);
+        let api_data = self.fetch_from_api(track_title, artist_name, album_name).await?;
 
         // Cache the result
         self.store_in_sqlite(&api_data).await?;
@@ -178,9 +162,7 @@ impl MusicBrainzClient {
         let mut results = Vec::new();
 
         for (track_title, artist_name, album_name) in tracks {
-            let result = self
-                .fetch_metadata(track_title, artist_name, album_name)
-                .await;
+            let result = self.fetch_metadata(track_title, artist_name, album_name).await;
             results.push(result);
         }
 
@@ -359,10 +341,7 @@ impl MusicBrainzClient {
         self.rate_limiter.acquire().await;
 
         // Build search query
-        let query = format!(
-            r#"recording:"{}" AND artist:"{}""#,
-            track_title, artist_name
-        );
+        let query = format!(r#"recording:"{}" AND artist:"{}""#, track_title, artist_name);
 
         let url = format!(
             "{}/recording?query={}&fmt=json&limit=1&inc=releases+artist-credits",
@@ -370,12 +349,8 @@ impl MusicBrainzClient {
             urlencoding::encode(&query)
         );
 
-        let response = self
-            .http_client
-            .get(&url)
-            .header("User-Agent", &self.config.user_agent)
-            .send()
-            .await?;
+        let response =
+            self.http_client.get(&url).header("User-Agent", &self.config.user_agent).send().await?;
 
         if !response.status().is_success() {
             return Err(anyhow!("MusicBrainz API error: {}", response.status()));
@@ -388,9 +363,7 @@ impl MusicBrainzClient {
 
             // Fetch cover art info if we have a release MBID
             let (caa_id, caa_release_mbid) = if let Some(ref release_mbid) = album_mbid {
-                self.fetch_cover_art_info(release_mbid)
-                    .await
-                    .unwrap_or((None, None))
+                self.fetch_cover_art_info(release_mbid).await.unwrap_or((None, None))
             } else {
                 (None, None)
             };
@@ -435,11 +408,7 @@ impl MusicBrainzClient {
             if let Err(e) = self.store_in_sqlite(&negative).await {
                 tracing::warn!("Failed to store negative cache entry: {}", e);
             }
-            Err(anyhow!(
-                "No results found for {} - {}",
-                artist_name,
-                track_title
-            ))
+            Err(anyhow!("No results found for {} - {}", artist_name, track_title))
         }
     }
 
@@ -453,12 +422,8 @@ impl MusicBrainzClient {
 
         let url = format!("https://coverartarchive.org/release/{}", release_mbid);
 
-        let response = self
-            .http_client
-            .get(&url)
-            .header("User-Agent", &self.config.user_agent)
-            .send()
-            .await?;
+        let response =
+            self.http_client.get(&url).header("User-Agent", &self.config.user_agent).send().await?;
 
         if !response.status().is_success() {
             return Ok((None, None));
@@ -482,11 +447,7 @@ impl MusicBrainzClient {
 
     fn extract_mbid_from_url(url_or_mbid: &str) -> String {
         if url_or_mbid.starts_with("http://") || url_or_mbid.starts_with("https://") {
-            url_or_mbid
-                .rsplit('/')
-                .next()
-                .unwrap_or(url_or_mbid)
-                .to_string()
+            url_or_mbid.rsplit('/').next().unwrap_or(url_or_mbid).to_string()
         } else {
             url_or_mbid.to_string()
         }

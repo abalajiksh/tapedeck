@@ -80,9 +80,7 @@ struct TomlListenBrainz {
 }
 impl Default for TomlListenBrainz {
     fn default() -> Self {
-        Self {
-            url: crate::sinks::LISTENBRAINZ_DEFAULT_URL.into(),
-        }
+        Self { url: crate::sinks::LISTENBRAINZ_DEFAULT_URL.into() }
     }
 }
 
@@ -292,10 +290,7 @@ fn env_or(key: &str, default: String) -> String {
 }
 
 fn env_or_parse<T: std::str::FromStr + Copy>(key: &str, default: T) -> T {
-    env::var(key)
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(default)
+    env::var(key).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
 }
 
 fn env_or_bool(key: &str, default: bool) -> bool {
@@ -310,11 +305,9 @@ fn env_or_bool(key: &str, default: bool) -> bool {
 
 fn env_or_list(key: &str, default: Vec<String>) -> Vec<String> {
     match env::var(key) {
-        Ok(val) if !val.is_empty() => val
-            .split(',')
-            .map(|s| s.trim().to_lowercase())
-            .filter(|s| !s.is_empty())
-            .collect(),
+        Ok(val) if !val.is_empty() => {
+            val.split(',').map(|s| s.trim().to_lowercase()).filter(|s| !s.is_empty()).collect()
+        }
         _ => default.into_iter().map(|s| s.to_lowercase()).collect(),
     }
 }

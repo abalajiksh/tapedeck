@@ -37,13 +37,7 @@ use crate::notes::{self, RefKind, Resolved};
 const VISIBILITIES: [&str; 3] = ["private", "patched", "public"];
 
 fn err(code: StatusCode, msg: impl Into<String>) -> axum::response::Response {
-    (
-        code,
-        Json(serde_json::json!(ErrorResponse {
-            code: code.as_u16(),
-            error: msg.into()
-        })),
-    )
+    (code, Json(serde_json::json!(ErrorResponse { code: code.as_u16(), error: msg.into() })))
         .into_response()
 }
 
@@ -117,11 +111,7 @@ async fn resolve_target(db: &Database, user_id: i64, spec: &TargetSpec) -> Resul
             .map_err(|e| e.to_string())?
             .ok_or("No such listen")?;
         let (name, artist, mbid) = match kind {
-            "artist" => (
-                listen.artist.clone(),
-                String::new(),
-                listen.mbid_artist.clone(),
-            ),
+            "artist" => (listen.artist.clone(), String::new(), listen.mbid_artist.clone()),
             "release" => (
                 listen
                     .album
@@ -131,11 +121,7 @@ async fn resolve_target(db: &Database, user_id: i64, spec: &TargetSpec) -> Resul
                 listen.artist.clone(),
                 listen.mbid_release.clone(),
             ),
-            _ => (
-                listen.title.clone(),
-                listen.artist.clone(),
-                listen.mbid_recording.clone(),
-            ),
+            _ => (listen.title.clone(), listen.artist.clone(), listen.mbid_recording.clone()),
         };
         let id = db
             .upsert_entity(kind, &name, &artist, mbid.as_deref())
@@ -144,19 +130,11 @@ async fn resolve_target(db: &Database, user_id: i64, spec: &TargetSpec) -> Resul
         return Ok(Target::Entity(id));
     }
 
-    let name = spec
-        .name
-        .as_deref()
-        .map(str::trim)
-        .filter(|n| !n.is_empty())
-        .ok_or("name is required")?;
+    let name =
+        spec.name.as_deref().map(str::trim).filter(|n| !n.is_empty()).ok_or("name is required")?;
     // An artist entity's name *is* the artist; carrying it twice would make
     // "Aphex Twin" and "Aphex Twin by Aphex Twin" two different rows.
-    let artist = if kind == "artist" {
-        ""
-    } else {
-        spec.artist.as_deref().unwrap_or("").trim()
-    };
+    let artist = if kind == "artist" { "" } else { spec.artist.as_deref().unwrap_or("").trim() };
     let id = db
         .upsert_entity(kind, name, artist, spec.mbid.as_deref())
         .await
@@ -188,11 +166,7 @@ async fn note_context(
         "release" => (Some(e.artist_name), Some(e.name)),
         // For a track, the album comes from where this user actually heard it.
         _ => {
-            let album = db
-                .album_for_track(user_id, &e.name, &e.artist_name)
-                .await
-                .ok()
-                .flatten();
+            let album = db.album_for_track(user_id, &e.name, &e.artist_name).await.ok().flatten();
             (Some(e.artist_name), album)
         }
     }
@@ -257,11 +231,7 @@ async fn note_json(
         Some(id) => db.is_loved(user_id, id).await.unwrap_or(false),
         None => false,
     };
-    let revisions = db
-        .note_revisions(user_id, note.id)
-        .await
-        .map(|r| r.len())
-        .unwrap_or(0);
+    let revisions = db.note_revisions(user_id, note.id).await.map(|r| r.len()).unwrap_or(0);
 
     let mut out = serde_json::json!({
         "id": note.id,
@@ -276,14 +246,8 @@ async fn note_json(
         "revisions": revisions,
     });
     if with_html {
-        let html = render(
-            db,
-            user_id,
-            &note.body_md,
-            ctx_artist.as_deref(),
-            ctx_album.as_deref(),
-        )
-        .await;
+        let html =
+            render(db, user_id, &note.body_md, ctx_artist.as_deref(), ctx_album.as_deref()).await;
         out["body_html"] = serde_json::Value::String(html);
     }
     out
@@ -328,25 +292,15 @@ async fn save_note(
 
     match state
         .db
-        .upsert_note(
-            user.user_id,
-            entity_id,
-            scrobble_id,
-            &body.body_md,
-            &visibility,
-        )
+        .upsert_note(user.user_id, entity_id, scrobble_id, &body.body_md, &visibility)
         .await
     {
         Ok(id) => match state.db.get_note(user.user_id, id).await {
-            Ok(Some(note)) => (
-                StatusCode::OK,
-                Json(note_json(&state.db, user.user_id, &note, true).await),
-            )
-                .into_response(),
-            Ok(None) => err(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "Note vanished after saving",
-            ),
+            Ok(Some(note)) => {
+                (StatusCode::OK, Json(note_json(&state.db, user.user_id, &note, true).await))
+                    .into_response()
+            }
+            Ok(None) => err(StatusCode::INTERNAL_SERVER_ERROR, "Note vanished after saving"),
             Err(e) => server_error(e),
         },
         Err(e) => server_error(e),
@@ -374,11 +328,10 @@ async fn get_note(
     Path(id): Path<i64>,
 ) -> impl IntoResponse {
     match state.db.get_note(user.user_id, id).await {
-        Ok(Some(note)) => (
-            StatusCode::OK,
-            Json(note_json(&state.db, user.user_id, &note, true).await),
-        )
-            .into_response(),
+        Ok(Some(note)) => {
+            (StatusCode::OK, Json(note_json(&state.db, user.user_id, &note, true).await))
+                .into_response()
+        }
         Ok(None) => err(StatusCode::NOT_FOUND, "No such note"),
         Err(e) => server_error(e),
     }
@@ -391,11 +344,9 @@ async fn delete_note(
     Path(id): Path<i64>,
 ) -> impl IntoResponse {
     match state.db.delete_note(user.user_id, id).await {
-        Ok(true) => (
-            StatusCode::OK,
-            Json(serde_json::json!({ "status": "deleted" })),
-        )
-            .into_response(),
+        Ok(true) => {
+            (StatusCode::OK, Json(serde_json::json!({ "status": "deleted" }))).into_response()
+        }
         Ok(false) => err(StatusCode::NOT_FOUND, "No such note"),
         Err(e) => server_error(e),
     }
@@ -420,11 +371,7 @@ async fn note_revisions(
                     })
                 })
                 .collect();
-            (
-                StatusCode::OK,
-                Json(serde_json::json!({ "revisions": out })),
-            )
-                .into_response()
+            (StatusCode::OK, Json(serde_json::json!({ "revisions": out }))).into_response()
         }
         Err(e) => server_error(e),
     }
@@ -477,19 +424,10 @@ async fn preview(
         Err(_) => (None, None),
     };
 
-    let html = render(
-        &state.db,
-        user.user_id,
-        &body.body_md,
-        ctx_artist.as_deref(),
-        ctx_album.as_deref(),
-    )
-    .await;
-    (
-        StatusCode::OK,
-        Json(serde_json::json!({ "body_html": html })),
-    )
-        .into_response()
+    let html =
+        render(&state.db, user.user_id, &body.body_md, ctx_artist.as_deref(), ctx_album.as_deref())
+            .await;
+    (StatusCode::OK, Json(serde_json::json!({ "body_html": html }))).into_response()
 }
 
 #[derive(Deserialize)]
@@ -596,10 +534,7 @@ async fn set_love(
     match state.db.set_love(user.user_id, entity_id, loved).await {
         Ok(()) => {
             let entity = state.db.get_entity(entity_id).await.ok().flatten();
-            (
-                StatusCode::OK,
-                Json(serde_json::json!({ "entity": entity, "loved": loved })),
-            )
+            (StatusCode::OK, Json(serde_json::json!({ "entity": entity, "loved": loved })))
                 .into_response()
         }
         Err(e) => server_error(e),
@@ -656,17 +591,8 @@ async fn listen_annotations(
             out[label] = serde_json::Value::Null;
             continue;
         }
-        let artist = if kind == "artist" {
-            None
-        } else {
-            Some(listen.artist.as_str())
-        };
-        let entity = state
-            .db
-            .find_entity(kind, name, artist)
-            .await
-            .ok()
-            .flatten();
+        let artist = if kind == "artist" { None } else { Some(listen.artist.as_str()) };
+        let entity = state.db.find_entity(kind, name, artist).await.ok().flatten();
         out[label] = match entity {
             Some(e) => serde_json::json!({
                 "name": name,
@@ -691,12 +617,7 @@ async fn get_entity(
     match state.db.get_entity(id).await {
         Ok(Some(entity)) => {
             let loved = state.db.is_loved(user.user_id, id).await.unwrap_or(false);
-            let note = state
-                .db
-                .note_for_entity(user.user_id, id)
-                .await
-                .ok()
-                .flatten();
+            let note = state.db.note_for_entity(user.user_id, id).await.ok().flatten();
             let note_json = match note {
                 Some(n) => note_json(&state.db, user.user_id, &n, true).await,
                 None => serde_json::Value::Null,

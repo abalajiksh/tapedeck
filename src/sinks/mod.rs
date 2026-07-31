@@ -32,10 +32,7 @@ pub async fn sinks_for_user(
     user_id: i64,
     listenbrainz_url: &str,
 ) -> Vec<Box<dyn ScrobbleSink>> {
-    let conns = db
-        .get_connections_for_forwarding(user_id)
-        .await
-        .unwrap_or_default();
+    let conns = db.get_connections_for_forwarding(user_id).await.unwrap_or_default();
     let mut sinks: Vec<Box<dyn ScrobbleSink>> = Vec::new();
 
     for (service, creds_json) in conns {

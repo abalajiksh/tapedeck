@@ -50,9 +50,7 @@ pub fn parse_tz(name: &str) -> Tz {
 }
 
 fn local(ts: i64, tz: Tz) -> chrono::DateTime<Tz> {
-    tz.timestamp_opt(ts, 0)
-        .single()
-        .unwrap_or_else(|| tz.timestamp_opt(0, 0).single().unwrap())
+    tz.timestamp_opt(ts, 0).single().unwrap_or_else(|| tz.timestamp_opt(0, 0).single().unwrap())
 }
 fn hour_of(ts: i64, tz: Tz) -> i64 {
     local(ts, tz).hour() as i64
@@ -165,9 +163,7 @@ pub fn compute_personality(rows: &[ListenRow], tz: Tz) -> Personality {
     // ── Casual ↔ Obsessive: replay ratio ──
     let mut track_counts: HashMap<(&str, &str), i64> = HashMap::new();
     for r in rows {
-        *track_counts
-            .entry((r.artist.as_str(), r.title.as_str()))
-            .or_default() += 1;
+        *track_counts.entry((r.artist.as_str(), r.title.as_str())).or_default() += 1;
     }
     let distinct = track_counts.len();
     let repeat_ratio = 1.0 - (distinct as f64 / total_f);
@@ -182,31 +178,18 @@ pub fn compute_personality(rows: &[ListenRow], tz: Tz) -> Personality {
             h >= 21 || h <= 3
         })
         .count();
-    let morning = rows
-        .iter()
-        .filter(|r| (6..=11).contains(&hour_of(r.ts, tz)))
-        .count();
+    let morning = rows.iter().filter(|r| (6..=11).contains(&hour_of(r.ts, tz))).count();
     let owl = 100.0 * night as f64 / (night + morning).max(1) as f64;
 
     // ── Mood-Driven ↔ Identity: how stable the rotation is by context ──
     let weekday_rows: Vec<&ListenRow> = rows.iter().filter(|r| !is_weekend(r.ts, tz)).collect();
     let weekend_rows: Vec<&ListenRow> = rows.iter().filter(|r| is_weekend(r.ts, tz)).collect();
-    let morning_rows: Vec<&ListenRow> = rows
-        .iter()
-        .filter(|r| (6..=11).contains(&hour_of(r.ts, tz)))
-        .collect();
-    let evening_rows: Vec<&ListenRow> = rows
-        .iter()
-        .filter(|r| (18..=23).contains(&hour_of(r.ts, tz)))
-        .collect();
-    let jac_wd = jaccard(
-        &top_n_artists(&weekday_rows, 10),
-        &top_n_artists(&weekend_rows, 10),
-    );
-    let jac_me = jaccard(
-        &top_n_artists(&morning_rows, 10),
-        &top_n_artists(&evening_rows, 10),
-    );
+    let morning_rows: Vec<&ListenRow> =
+        rows.iter().filter(|r| (6..=11).contains(&hour_of(r.ts, tz))).collect();
+    let evening_rows: Vec<&ListenRow> =
+        rows.iter().filter(|r| (18..=23).contains(&hour_of(r.ts, tz))).collect();
+    let jac_wd = jaccard(&top_n_artists(&weekday_rows, 10), &top_n_artists(&weekend_rows, 10));
+    let jac_me = jaccard(&top_n_artists(&morning_rows, 10), &top_n_artists(&evening_rows, 10));
     let identity = 100.0 * (jac_wd + jac_me) / 2.0;
 
     let traits = vec![
@@ -262,33 +245,19 @@ pub fn compute_personality(rows: &[ListenRow], tz: Tz) -> Personality {
     let verdict = synthesise_verdict(&traits);
     let loyalty = compute_loyalty(rows, tz);
 
-    Personality {
-        verdict,
-        traits,
-        loyalty,
-        total_plays: total,
-    }
+    Personality { verdict, traits, loyalty, total_plays: total }
 }
 
 /// The two most-pronounced traits name the listener, e.g. "The Obsessive Night Owl".
 fn synthesise_verdict(traits: &[Trait]) -> String {
     let mut rated: Vec<&Trait> = traits.iter().collect();
-    rated.sort_by(|a, b| {
-        (b.score - 50.0)
-            .abs()
-            .partial_cmp(&(a.score - 50.0).abs())
-            .unwrap()
-    });
+    rated.sort_by(|a, b| (b.score - 50.0).abs().partial_cmp(&(a.score - 50.0).abs()).unwrap());
     let mut descriptors = Vec::new();
     for t in rated.iter().take(2) {
         if (t.score - 50.0).abs() < 15.0 {
             continue;
         }
-        descriptors.push(if t.score > 50.0 {
-            t.high.clone()
-        } else {
-            t.low.clone()
-        });
+        descriptors.push(if t.score > 50.0 { t.high.clone() } else { t.low.clone() });
     }
     match descriptors.len() {
         0 => "The Balanced Listener".into(),
@@ -307,10 +276,7 @@ fn compute_loyalty(rows: &[ListenRow], tz: Tz) -> Vec<LoyalArtist> {
 
     let mut by_artist: HashMap<&str, Vec<i64>> = HashMap::new();
     for r in rows {
-        by_artist
-            .entry(r.artist.as_str())
-            .or_default()
-            .push(local_day(r.ts, tz));
+        by_artist.entry(r.artist.as_str()).or_default().push(local_day(r.ts, tz));
     }
 
     let mut out: Vec<LoyalArtist> = by_artist
@@ -333,11 +299,7 @@ fn compute_loyalty(rows: &[ListenRow], tz: Tz) -> Vec<LoyalArtist> {
             let loyalty_score = (100.0
                 * (0.45 * return_rate + 0.35 * span_coverage + 0.20 * (1.0 - top_day_share)))
                 .clamp(0.0, 100.0);
-            LoyalArtist {
-                artist: (*artist).to_string(),
-                plays,
-                loyalty_score,
-            }
+            LoyalArtist { artist: (*artist).to_string(), plays, loyalty_score }
         })
         .collect();
     out.sort_by(|a, b| b.plays.cmp(&a.plays));
@@ -381,9 +343,8 @@ mod tests {
 
     #[test]
     fn obsessive_listener_scores_high_on_replays() {
-        let rows: Vec<ListenRow> = (0..20)
-            .map(|i| row(1_700_000_000 + i * 200, "A", "Song", Some("Alb"), None))
-            .collect();
+        let rows: Vec<ListenRow> =
+            (0..20).map(|i| row(1_700_000_000 + i * 200, "A", "Song", Some("Alb"), None)).collect();
         let p = compute_personality(&rows, UTC);
         let obs = p.traits.iter().find(|t| t.high == "Obsessive").unwrap();
         assert!(obs.score > 80.0, "expected obsessive, got {}", obs.score);
@@ -395,13 +356,7 @@ mod tests {
     fn sequential_track_numbers_count_as_a_playthrough() {
         let rows: Vec<ListenRow> = (0..6)
             .map(|i| {
-                row(
-                    1_700_000_000 + i * 300,
-                    "A",
-                    &format!("t{i}"),
-                    Some("LP"),
-                    Some(i as i32 + 1),
-                )
+                row(1_700_000_000 + i * 300, "A", &format!("t{i}"), Some("LP"), Some(i as i32 + 1))
             })
             .collect();
         let p = compute_personality(&rows, UTC);
@@ -417,22 +372,12 @@ mod tests {
             .iter()
             .enumerate()
             .map(|(i, &tn)| {
-                row(
-                    1_700_000_000 + i as i64 * 300,
-                    "A",
-                    &format!("t{tn}"),
-                    Some("LP"),
-                    Some(tn),
-                )
+                row(1_700_000_000 + i as i64 * 300, "A", &format!("t{tn}"), Some("LP"), Some(tn))
             })
             .collect();
         let p = compute_personality(&rows, UTC);
         let cur = p.traits.iter().find(|t| t.high == "Curator").unwrap();
-        assert!(
-            cur.score < 20.0,
-            "shuffled shouldn't be curator, got {}",
-            cur.score
-        );
+        assert!(cur.score < 20.0, "shuffled shouldn't be curator, got {}", cur.score);
     }
 
     #[test]
@@ -440,15 +385,7 @@ mod tests {
         // Listens at 02:00 UTC. In UTC → night. In UTC-5 (America/New_York would be
         // 21:00 prev day, still night); use Asia/Kolkata (+5:30 → 07:30 → morning).
         let rows: Vec<ListenRow> = (0..10)
-            .map(|i| {
-                row(
-                    1_700_000_000 + i * 90_000 + 2 * 3600,
-                    "A",
-                    &format!("s{i}"),
-                    None,
-                    None,
-                )
-            })
+            .map(|i| row(1_700_000_000 + i * 90_000 + 2 * 3600, "A", &format!("s{i}"), None, None))
             .collect();
         let owl_utc = compute_personality(&rows, UTC)
             .traits

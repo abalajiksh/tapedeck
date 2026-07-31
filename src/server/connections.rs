@@ -22,13 +22,7 @@ use super::AppState;
 
 fn err(code: u16, msg: impl Into<String>) -> axum::response::Response {
     let code_status = StatusCode::from_u16(code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-    (
-        code_status,
-        Json(serde_json::json!(ErrorResponse {
-            code,
-            error: msg.into()
-        })),
-    )
+    (code_status, Json(serde_json::json!(ErrorResponse { code, error: msg.into() })))
         .into_response()
 }
 
@@ -85,10 +79,7 @@ async fn connect_listenbrainz(
         return err(400, "Token required");
     }
     // Validate against ListenBrainz and capture the account name.
-    let url = format!(
-        "{}/1/validate-token",
-        state.listenbrainz_url.trim_end_matches('/')
-    );
+    let url = format!("{}/1/validate-token", state.listenbrainz_url.trim_end_matches('/'));
     let resp = reqwest::Client::new()
         .get(&url)
         .header("Authorization", format!("Token {token}"))
@@ -107,16 +98,11 @@ async fn connect_listenbrainz(
     };
 
     let creds = serde_json::json!({ "token": token }).to_string();
-    match state
-        .db
-        .set_connection(user.user_id, "listenbrainz", &creds, username.as_deref())
-        .await
-    {
-        Ok(()) => (
-            StatusCode::OK,
-            Json(serde_json::json!({ "connected": true, "username": username })),
-        )
-            .into_response(),
+    match state.db.set_connection(user.user_id, "listenbrainz", &creds, username.as_deref()).await {
+        Ok(()) => {
+            (StatusCode::OK, Json(serde_json::json!({ "connected": true, "username": username })))
+                .into_response()
+        }
         Err(e) => err(500, e.to_string()),
     }
 }
@@ -188,16 +174,9 @@ async fn scrobbler_start(svc: &Scrobbler) -> axum::response::Response {
         Err(e) => return err(502, format!("Could not reach {}: {e}", svc.label)),
     };
 
-    let auth_url = format!(
-        "{}?api_key={}&token={}",
-        svc.auth_page,
-        crate::sinks::LASTFM_API_KEY,
-        token
-    );
-    (
-        StatusCode::OK,
-        Json(serde_json::json!({ "token": token, "auth_url": auth_url })),
-    )
+    let auth_url =
+        format!("{}?api_key={}&token={}", svc.auth_page, crate::sinks::LASTFM_API_KEY, token);
+    (StatusCode::OK, Json(serde_json::json!({ "token": token, "auth_url": auth_url })))
         .into_response()
 }
 
@@ -231,10 +210,7 @@ async fn scrobbler_complete(
         Ok(r) => {
             let v: serde_json::Value = r.json().await.unwrap_or_default();
             match v["session"]["key"].as_str() {
-                Some(k) => (
-                    k.to_string(),
-                    v["session"]["name"].as_str().map(str::to_string),
-                ),
+                Some(k) => (k.to_string(), v["session"]["name"].as_str().map(str::to_string)),
                 None => {
                     // error 14/15 = token not authorized yet
                     return err(
@@ -252,16 +228,11 @@ async fn scrobbler_complete(
     };
 
     let creds = serde_json::json!({ "session_key": session_key }).to_string();
-    match state
-        .db
-        .set_connection(user.user_id, service_key, &creds, username.as_deref())
-        .await
-    {
-        Ok(()) => (
-            StatusCode::OK,
-            Json(serde_json::json!({ "connected": true, "username": username })),
-        )
-            .into_response(),
+    match state.db.set_connection(user.user_id, service_key, &creds, username.as_deref()).await {
+        Ok(()) => {
+            (StatusCode::OK, Json(serde_json::json!({ "connected": true, "username": username })))
+                .into_response()
+        }
         Err(e) => err(500, e.to_string()),
     }
 }
@@ -313,16 +284,8 @@ mod tests {
         let sig = lastfm_sign(&p, "SECRET");
         assert_eq!(sig.len(), 32);
         assert!(sig.chars().all(|c| c.is_ascii_hexdigit()));
-        assert_eq!(
-            sig,
-            lastfm_sign(&p, "SECRET"),
-            "same input → same signature"
-        );
-        assert_ne!(
-            sig,
-            lastfm_sign(&p, "OTHER"),
-            "signature depends on the secret"
-        );
+        assert_eq!(sig, lastfm_sign(&p, "SECRET"), "same input → same signature");
+        assert_ne!(sig, lastfm_sign(&p, "OTHER"), "signature depends on the secret");
     }
 
     #[test]
@@ -343,15 +306,9 @@ pub fn create_connections_router() -> Router<Arc<AppState>> {
     Router::new()
         .route("/api/v1/connections", get(list_connections))
         .route("/api/v1/connections/:service", delete(disconnect))
-        .route(
-            "/api/v1/connections/listenbrainz",
-            put(connect_listenbrainz),
-        )
+        .route("/api/v1/connections/listenbrainz", put(connect_listenbrainz))
         .route("/api/v1/connections/lastfm/start", post(lastfm_start))
         .route("/api/v1/connections/lastfm/complete", post(lastfm_complete))
         .route("/api/v1/connections/librefm/start", post(librefm_start))
-        .route(
-            "/api/v1/connections/librefm/complete",
-            post(librefm_complete),
-        )
+        .route("/api/v1/connections/librefm/complete", post(librefm_complete))
 }

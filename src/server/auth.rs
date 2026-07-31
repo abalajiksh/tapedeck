@@ -10,13 +10,7 @@ pub use crate::models::AuthUser;
 type Rejection = (StatusCode, Json<super::models::ErrorResponse>);
 
 fn unauthorized(msg: &str) -> Rejection {
-    (
-        StatusCode::UNAUTHORIZED,
-        Json(super::models::ErrorResponse {
-            code: 401,
-            error: msg.into(),
-        }),
-    )
+    (StatusCode::UNAUTHORIZED, Json(super::models::ErrorResponse { code: 401, error: msg.into() }))
 }
 
 /// Extract the `td_session` cookie value from the Cookie header.
@@ -79,11 +73,7 @@ impl FromRequestParts<Arc<super::AppState>> for IngestAuth {
         }
 
         // 2. Authorization: Token (external scrobble clients).
-        let header = parts
-            .headers
-            .get("authorization")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("");
+        let header = parts.headers.get("authorization").and_then(|v| v.to_str().ok()).unwrap_or("");
         let token = header
             .strip_prefix("Token ")
             .or_else(|| header.strip_prefix("token "))

@@ -85,10 +85,7 @@ impl NowPlaying {
 }
 
 fn now_secs() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_secs() as i64
+    SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64
 }
 
 /// In-memory "what's playing right now", keyed by user. Shared by the HTTP
@@ -160,11 +157,7 @@ async fn now_playing(State(state): State<Arc<AppState>>, user: AuthUser) -> impl
             })),
         )
             .into_response(),
-        None => (
-            StatusCode::OK,
-            Json(serde_json::json!({ "playing": false })),
-        )
-            .into_response(),
+        None => (StatusCode::OK, Json(serde_json::json!({ "playing": false }))).into_response(),
     }
 }
 

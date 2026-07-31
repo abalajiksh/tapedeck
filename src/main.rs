@@ -63,15 +63,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ── Credential encryption ──
     // Deliberately a separate file from the database: `GET /api/v1/backup` hands
     // out a whole-DB snapshot, and a key stored inside it would ride along.
-    let secrets = Arc::new(crypto::SecretBox::load(std::path::Path::new(
-        &config.secret_key_path,
-    ))?);
+    let secrets = Arc::new(crypto::SecretBox::load(std::path::Path::new(&config.secret_key_path))?);
 
     // ── Scrobble database ──
-    info!(
-        "📦 Initializing scrobble database at {}",
-        config.database.scrobble_db_url
-    );
+    info!("📦 Initializing scrobble database at {}", config.database.scrobble_db_url);
     let db = Arc::new(Database::new(&config.database.scrobble_db_url, secrets.clone()).await?);
 
     // Any import left 'running' by a previous process died with it — record that.
@@ -83,9 +78,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ── First-run setup ──
     if !db.has_users().await? {
         info!("🔑 First run — creating admin user (password not set yet)");
-        let _ = db
-            .create_user("admin", Some("Admin"), "not-used-yet", "admin")
-            .await?;
+        let _ = db.create_user("admin", Some("Admin"), "not-used-yet", "admin").await?;
         info!("════════════════════════════════════════════════════════");
         info!("📋 Visit the web UI to complete setup and set your password.");
         info!("════════════════════════════════════════════════════════");
@@ -144,12 +137,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 return;
             }
         };
-        if let Err(e) = axum::serve(
-            listener,
-            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
-        )
-        .with_graceful_shutdown(shutdown_signal())
-        .await
+        if let Err(e) =
+            axum::serve(listener, app.into_make_service_with_connect_info::<std::net::SocketAddr>())
+                .with_graceful_shutdown(shutdown_signal())
+                .await
         {
             error!("Server error: {}", e);
         }
@@ -213,12 +204,7 @@ async fn migrate_global_plex(
         return Ok(());
     };
     // Already migrated if the admin has any Plex source at all.
-    if db
-        .list_sources_for_user(admin_id)
-        .await?
-        .iter()
-        .any(|s| s.kind == "plex")
-    {
+    if db.list_sources_for_user(admin_id).await?.iter().any(|s| s.kind == "plex") {
         return Ok(());
     }
 

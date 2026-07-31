@@ -36,10 +36,7 @@ pub async fn validate_token(
     let header_token = headers
         .get("authorization")
         .and_then(|v| v.to_str().ok())
-        .and_then(|h| {
-            h.strip_prefix("Token ")
-                .or_else(|| h.strip_prefix("token "))
-        })
+        .and_then(|h| h.strip_prefix("Token ").or_else(|| h.strip_prefix("token ")))
         .map(str::trim);
 
     let token = header_token
@@ -123,18 +120,12 @@ pub async fn submit_listens(
     if listen_count > 1000 {
         return (
             StatusCode::BAD_REQUEST,
-            Json(ErrorResponse {
-                code: 400,
-                error: "Maximum 1000 listens per request".into(),
-            }),
+            Json(ErrorResponse { code: 400, error: "Maximum 1000 listens per request".into() }),
         )
             .into_response();
     }
 
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_secs() as i64;
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64;
     let mut accepted = 0u32;
     let mut failed = 0u32; // listens we could not persist (DB error) — triggers a retryable response
 
@@ -160,15 +151,12 @@ pub async fn submit_listens(
 
         let info_ref = meta.additional_info.as_ref();
 
-        let submission_client = info_ref
-            .and_then(|ai| ai.submission_client.as_deref())
-            .unwrap_or("unknown");
+        let submission_client =
+            info_ref.and_then(|ai| ai.submission_client.as_deref()).unwrap_or("unknown");
 
         let source_id = format!("ingest-{}-{}-{}", user.user_id, timestamp, meta.track_name);
 
-        let duration = info_ref
-            .and_then(|ai| ai.duration_ms)
-            .map(|ms| (ms / 1000) as u64);
+        let duration = info_ref.and_then(|ai| ai.duration_ms).map(|ms| (ms / 1000) as u64);
         let track_number = info_ref.and_then(|ai| ai.track_number);
 
         // Pre-populate MBIDs from mbid_mapping
@@ -209,11 +197,7 @@ pub async fn submit_listens(
         if quality.has_data() {
             quality.compute_score();
         }
-        let quality_opt = if quality.has_data() {
-            Some(&quality)
-        } else {
-            None
-        };
+        let quality_opt = if quality.has_data() { Some(&quality) } else { None };
 
         // ── Phase 2: Resolve device ──
         let device_id = if let Some(td) = info_ref.and_then(|ai| ai.tapedeck_device.as_ref()) {
@@ -252,19 +236,16 @@ pub async fn submit_listens(
             .and_then(|ai| ai.tapedeck_device.as_ref())
             .and_then(|td| td.interface.as_ref().or(td.output_type.as_ref()));
         if let Some(dev) = output_dev {
-            let _ = state
-                .db
-                .record_output(user.user_id, dev, output_iface.map(|s| s.as_str()))
-                .await;
+            let _ =
+                state.db.record_output(user.user_id, dev, output_iface.map(|s| s.as_str())).await;
         }
 
         // ── Resolve chain (layered, first match wins) ──
         //   1. explicit chain name from the client
         //   2. output-device binding (auto-learned / user-set)
         //   3. source device's default chain
-        let explicit_chain_name = info_ref
-            .and_then(|ai| ai.tapedeck_chain.as_ref())
-            .and_then(|tc| tc.chain_id.as_ref());
+        let explicit_chain_name =
+            info_ref.and_then(|ai| ai.tapedeck_chain.as_ref()).and_then(|tc| tc.chain_id.as_ref());
         let chain_id: Option<i64> = if let Some(name) = explicit_chain_name {
             match state.db.get_chain_by_name(user.user_id, name).await {
                 Ok(Some(id)) => Some(id),
@@ -278,22 +259,12 @@ pub async fn submit_listens(
                 }
             }
         } else if let Some(binding) = match output_dev {
-            Some(dev) => state
-                .db
-                .resolve_binding(user.user_id, dev)
-                .await
-                .ok()
-                .flatten(),
+            Some(dev) => state.db.resolve_binding(user.user_id, dev).await.ok().flatten(),
             None => None,
         } {
             Some(binding)
         } else if let Some(dev) = device_id {
-            state
-                .db
-                .get_device_default_chain(user.user_id, dev)
-                .await
-                .ok()
-                .flatten()
+            state.db.get_device_default_chain(user.user_id, dev).await.ok().flatten()
         } else {
             None
         };
@@ -419,13 +390,7 @@ pub async fn submit_listens(
             .into_response();
     }
 
-    (
-        StatusCode::OK,
-        Json(SubmitListensResponse {
-            status: "ok".into(),
-        }),
-    )
-        .into_response()
+    (StatusCode::OK, Json(SubmitListensResponse { status: "ok".into() })).into_response()
 }
 
 /// Extract audio quality from Tapedeck extension fields.

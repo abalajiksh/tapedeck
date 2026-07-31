@@ -82,22 +82,13 @@ async fn persist_job(reg: &ImportRegistry, id: &str, db: &Database) {
     let job = reg.lock().ok().and_then(|m| m.get(id).cloned());
     if let Some(j) = job {
         let _ = db
-            .finish_import_job(
-                j.db_id,
-                &j.state,
-                j.fetched as i64,
-                j.imported as i64,
-                &j.status,
-            )
+            .finish_import_job(j.db_id, &j.state, j.fetched as i64, j.imported as i64, &j.status)
             .await;
     }
 }
 
 fn chrono_now() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs() as i64
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64
 }
 
 /// Stable per-listen key so re-imports dedupe on the exact-match path too
@@ -165,11 +156,7 @@ async fn import_listenbrainz(
         }
         persist_job(&reg, &id, &db).await;
     });
-    (
-        StatusCode::ACCEPTED,
-        Json(serde_json::json!({ "job_id": ret })),
-    )
-        .into_response()
+    (StatusCode::ACCEPTED, Json(serde_json::json!({ "job_id": ret }))).into_response()
 }
 
 async fn import_lastfm(
@@ -204,11 +191,7 @@ async fn import_lastfm(
         }
         persist_job(&reg, &id, &db).await;
     });
-    (
-        StatusCode::ACCEPTED,
-        Json(serde_json::json!({ "job_id": ret })),
-    )
-        .into_response()
+    (StatusCode::ACCEPTED, Json(serde_json::json!({ "job_id": ret }))).into_response()
 }
 
 async fn import_file(
@@ -257,11 +240,7 @@ async fn import_file(
         }
         persist_job(&reg, &id, &db).await;
     });
-    (
-        StatusCode::ACCEPTED,
-        Json(serde_json::json!({ "job_id": ret })),
-    )
-        .into_response()
+    (StatusCode::ACCEPTED, Json(serde_json::json!({ "job_id": ret }))).into_response()
 }
 
 async fn job_status(
@@ -279,10 +258,7 @@ async fn job_status(
         Some(j) => (StatusCode::OK, Json(serde_json::json!(j))).into_response(),
         None => (
             StatusCode::NOT_FOUND,
-            Json(serde_json::json!(ErrorResponse {
-                code: 404,
-                error: "Unknown job".into()
-            })),
+            Json(serde_json::json!(ErrorResponse { code: 404, error: "Unknown job".into() })),
         )
             .into_response(),
     }
@@ -294,18 +270,11 @@ async fn import_history(State(state): State<Arc<AppState>>, user: AuthUser) -> i
             let imports: Vec<serde_json::Value> = rows.iter().map(|r| serde_json::json!({
                 "source": r.source, "date": r.created_at, "count": r.imported, "status": r.state,
             })).collect();
-            (
-                StatusCode::OK,
-                Json(serde_json::json!({ "imports": imports })),
-            )
-                .into_response()
+            (StatusCode::OK, Json(serde_json::json!({ "imports": imports }))).into_response()
         }
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!(ErrorResponse {
-                code: 500,
-                error: e.to_string()
-            })),
+            Json(serde_json::json!(ErrorResponse { code: 500, error: e.to_string() })),
         )
             .into_response(),
     }
@@ -343,10 +312,7 @@ async fn run_listenbrainz(
             return Err(format!("ListenBrainz returned {}", resp.status()));
         }
         let v: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
-        let listens = v["payload"]["listens"]
-            .as_array()
-            .cloned()
-            .unwrap_or_default();
+        let listens = v["payload"]["listens"].as_array().cloned().unwrap_or_default();
         if listens.is_empty() {
             break;
         }
@@ -364,9 +330,7 @@ async fn run_listenbrainz(
                 continue;
             }
             let album = tm["release_name"].as_str().map(str::to_string);
-            let mbid = tm["mbid_mapping"]["recording_mbid"]
-                .as_str()
-                .map(str::to_string);
+            let mbid = tm["mbid_mapping"]["recording_mbid"].as_str().map(str::to_string);
             let inserted = db
                 .import_listen(uid, &play(ts, title, artist, album, mbid))
                 .await
@@ -421,23 +385,15 @@ async fn run_lastfm(
         }
 
         let rt = &v["recenttracks"];
-        let total_pages: u32 = rt["@attr"]["totalPages"]
-            .as_str()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(1);
-        if let Some(t) = rt["@attr"]["total"]
-            .as_str()
-            .and_then(|s| s.parse::<usize>().ok())
-        {
+        let total_pages: u32 =
+            rt["@attr"]["totalPages"].as_str().and_then(|s| s.parse().ok()).unwrap_or(1);
+        if let Some(t) = rt["@attr"]["total"].as_str().and_then(|s| s.parse::<usize>().ok()) {
             update(reg, id, |j| j.total = Some(t));
         }
         let tracks = rt["track"].as_array().cloned().unwrap_or_default();
         for t in &tracks {
             // Skip the "now playing" row (no date, @attr.nowplaying=true).
-            let Some(ts) = t["date"]["uts"]
-                .as_str()
-                .and_then(|s| s.parse::<i64>().ok())
-            else {
+            let Some(ts) = t["date"]["uts"].as_str().and_then(|s| s.parse::<i64>().ok()) else {
                 continue;
             };
             let title = t["name"].as_str().unwrap_or("").to_string();
@@ -449,14 +405,8 @@ async fn run_lastfm(
             if title.is_empty() || artist.is_empty() {
                 continue;
             }
-            let album = t["album"]["#text"]
-                .as_str()
-                .filter(|s| !s.is_empty())
-                .map(str::to_string);
-            let mbid = t["mbid"]
-                .as_str()
-                .filter(|s| !s.is_empty())
-                .map(str::to_string);
+            let album = t["album"]["#text"].as_str().filter(|s| !s.is_empty()).map(str::to_string);
+            let mbid = t["mbid"].as_str().filter(|s| !s.is_empty()).map(str::to_string);
             let inserted = db
                 .import_listen(uid, &play(ts, title, artist, album, mbid))
                 .await
@@ -499,11 +449,7 @@ async fn run_file(
 
     let is_csv =
         name.to_lowercase().ends_with(".csv") || (!text.trim_start().starts_with(['{', '[']));
-    let plays: Vec<Play> = if is_csv {
-        parse_csv(&text)
-    } else {
-        parse_json(&text)?
-    };
+    let plays: Vec<Play> = if is_csv { parse_csv(&text) } else { parse_json(&text)? };
     update(reg, id, |j| j.total = Some(plays.len()));
     for p in &plays {
         let inserted = db.import_listen(uid, p).await.map_err(|e| e.to_string())?;
@@ -568,10 +514,8 @@ async fn run_scrobbler_log(
             caa_id: None,
             caa_release_mbid: None,
         };
-        let inserted = db
-            .import_listen_flagged(uid, &p, e.skipped)
-            .await
-            .map_err(|e| e.to_string())?;
+        let inserted =
+            db.import_listen_flagged(uid, &p, e.skipped).await.map_err(|e| e.to_string())?;
         if inserted && e.skipped {
             skips += 1;
         }
@@ -588,10 +532,7 @@ async fn run_scrobbler_log(
     let malformed = parsed.malformed;
     update(reg, id, |j| {
         j.state = "done".into();
-        let mut parts = vec![format!(
-            "Imported {} new listens from {}",
-            j.imported, client
-        )];
+        let mut parts = vec![format!("Imported {} new listens from {}", j.imported, client)];
         if skips > 0 {
             parts.push(format!("{skips} skips recorded"));
         }
@@ -616,26 +557,11 @@ fn parse_json(text: &str) -> Result<Vec<Play>, String> {
     Ok(arr
         .iter()
         .filter_map(|l| {
-            let ts = l["listened_at"]
-                .as_i64()
-                .or_else(|| l["timestamp"].as_i64())?;
-            let tm = if l["track_metadata"].is_object() {
-                &l["track_metadata"]
-            } else {
-                l
-            };
-            let title = tm["track_name"]
-                .as_str()
-                .or(tm["title"].as_str())?
-                .to_string();
-            let artist = tm["artist_name"]
-                .as_str()
-                .or(tm["artist"].as_str())?
-                .to_string();
-            let album = tm["release_name"]
-                .as_str()
-                .or(tm["album"].as_str())
-                .map(str::to_string);
+            let ts = l["listened_at"].as_i64().or_else(|| l["timestamp"].as_i64())?;
+            let tm = if l["track_metadata"].is_object() { &l["track_metadata"] } else { l };
+            let title = tm["track_name"].as_str().or(tm["title"].as_str())?.to_string();
+            let artist = tm["artist_name"].as_str().or(tm["artist"].as_str())?.to_string();
+            let album = tm["release_name"].as_str().or(tm["album"].as_str()).map(str::to_string);
             let mbid = tm["mbid_mapping"]["recording_mbid"]
                 .as_str()
                 .or(tm["mbid_recording"].as_str())

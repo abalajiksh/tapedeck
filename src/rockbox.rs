@@ -67,9 +67,7 @@ pub struct ParsedLog {
 /// Does this look like an Audioscrobbler log? Used to route an upload to this
 /// parser rather than the JSON/CSV one.
 pub fn looks_like_scrobbler_log(text: &str) -> bool {
-    text.lines()
-        .take(5)
-        .any(|l| l.trim_start().to_uppercase().starts_with("#AUDIOSCROBBLER"))
+    text.lines().take(5).any(|l| l.trim_start().to_uppercase().starts_with("#AUDIOSCROBBLER"))
 }
 
 /// Read the `#TZ` header without parsing the whole file, so the UI can ask for a
@@ -116,12 +114,7 @@ pub fn parse(text: &str, device_tz: Tz) -> ParsedLog {
         }
     }
 
-    ParsedLog {
-        entries,
-        declared_tz,
-        client,
-        malformed,
-    }
+    ParsedLog { entries, declared_tz, client, malformed }
 }
 
 fn parse_row(line: &str, declared: LogTimezone, device_tz: Tz) -> Option<LogEntry> {
@@ -158,19 +151,13 @@ fn parse_row(line: &str, declared: LogTimezone, device_tz: Tz) -> Option<LogEntr
 
     Some(LogEntry {
         artist: artist.to_string(),
-        album: Some(f[1].trim())
-            .filter(|s| !s.is_empty())
-            .map(str::to_string),
+        album: Some(f[1].trim()).filter(|s| !s.is_empty()).map(str::to_string),
         title: title.to_string(),
         track_number: f[3].trim().parse().ok().filter(|n| *n > 0),
         duration: f[4].trim().parse().ok().filter(|d| *d > 0),
         skipped,
         timestamp,
-        mbid: f
-            .get(7)
-            .map(|s| s.trim())
-            .filter(|s| !s.is_empty())
-            .map(str::to_string),
+        mbid: f.get(7).map(|s| s.trim()).filter(|s| !s.is_empty()).map(str::to_string),
     })
 }
 
@@ -182,9 +169,7 @@ fn parse_row(line: &str, declared: LogTimezone, device_tz: Tz) -> Option<LogEntr
 /// offset; a nonexistent one (spring-forward gap) is dropped rather than guessed.
 fn local_epoch_to_utc(raw: i64, tz: Tz) -> Option<i64> {
     let naive = chrono::DateTime::from_timestamp(raw, 0)?.naive_utc();
-    tz.from_local_datetime(&naive)
-        .earliest()
-        .map(|dt| dt.timestamp())
+    tz.from_local_datetime(&naive).earliest().map(|dt| dt.timestamp())
 }
 
 #[cfg(test)]

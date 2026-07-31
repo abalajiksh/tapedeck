@@ -70,11 +70,7 @@ impl DeezerProvider {
         Self {
             client: Client::builder()
                 .timeout(Duration::from_secs(10))
-                .user_agent(format!(
-                    "{}/{}",
-                    env!("CARGO_PKG_NAME"),
-                    env!("CARGO_PKG_VERSION")
-                ))
+                .user_agent(format!("{}/{}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION")))
                 .build()
                 .unwrap_or_else(|_| Client::new()),
         }
@@ -99,10 +95,7 @@ impl DeezerProvider {
     fn best_hit(hits: Vec<SearchHit>, artist: &str) -> Option<SearchHit> {
         let wanted = artist.trim().to_lowercase();
         hits.into_iter().find(|h| {
-            h.artist
-                .as_ref()
-                .map(|a| a.name.trim().to_lowercase() == wanted)
-                .unwrap_or(false)
+            h.artist.as_ref().map(|a| a.name.trim().to_lowercase() == wanted).unwrap_or(false)
         })
     }
 }
@@ -126,10 +119,7 @@ impl ArtworkProvider for DeezerProvider {
         let resp = self
             .client
             .get(SEARCH_URL)
-            .query(&[
-                ("q", Self::query(artist, title, album)),
-                ("limit", "10".into()),
-            ])
+            .query(&[("q", Self::query(artist, title, album)), ("limit", "10".into())])
             .send()
             .await?;
 
@@ -151,10 +141,8 @@ impl ArtworkProvider for DeezerProvider {
             return Ok(None);
         };
 
-        let image_url = hit
-            .album
-            .as_ref()
-            .and_then(|a| a.cover_big.clone().or_else(|| a.cover_medium.clone()));
+        let image_url =
+            hit.album.as_ref().and_then(|a| a.cover_big.clone().or_else(|| a.cover_medium.clone()));
         let artist_image_url = hit
             .artist
             .as_ref()
@@ -202,10 +190,7 @@ mod tests {
                 picture_medium: Some("pic".into()),
                 picture_big: None,
             }),
-            album: Some(DeezerAlbum {
-                cover_medium: Some("cov".into()),
-                cover_big: None,
-            }),
+            album: Some(DeezerAlbum { cover_medium: Some("cov".into()), cover_big: None }),
         }
     }
 

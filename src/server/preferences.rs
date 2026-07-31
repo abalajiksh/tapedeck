@@ -17,10 +17,7 @@ async fn get_preferences(State(state): State<Arc<AppState>>, user: AuthUser) -> 
         Ok(prefs) => (StatusCode::OK, Json(prefs)).into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!(ErrorResponse {
-                code: 500,
-                error: e.to_string()
-            })),
+            Json(serde_json::json!(ErrorResponse { code: 500, error: e.to_string() })),
         )
             .into_response(),
     }
@@ -47,18 +44,12 @@ async fn put_preferences(
         Ok(prefs) => (StatusCode::OK, Json(prefs)).into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!(ErrorResponse {
-                code: 500,
-                error: e.to_string()
-            })),
+            Json(serde_json::json!(ErrorResponse { code: 500, error: e.to_string() })),
         )
             .into_response(),
     }
 }
 
 pub fn create_preferences_router() -> Router<Arc<AppState>> {
-    Router::new().route(
-        "/api/v1/preferences",
-        get(get_preferences).put(put_preferences),
-    )
+    Router::new().route("/api/v1/preferences", get(get_preferences).put(put_preferences))
 }

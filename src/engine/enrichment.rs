@@ -9,27 +9,15 @@ pub async fn enrich_play(
     play: &mut Play,
     album_hint: Option<&str>,
 ) -> bool {
-    debug!(
-        "Fetching MusicBrainz metadata for: {} - {}",
-        play.artist, play.title
-    );
+    debug!("Fetching MusicBrainz metadata for: {} - {}", play.artist, play.title);
 
-    match mb_client
-        .fetch_metadata(&play.title, &play.artist, album_hint)
-        .await
-    {
+    match mb_client.fetch_metadata(&play.title, &play.artist, album_hint).await {
         Ok(metadata) => {
             let track_mbid_str = metadata.track_mbid.as_deref().unwrap_or("none").to_string();
             let album_mbid_str = metadata.album_mbid.as_deref().unwrap_or("none").to_string();
-            let artist_mbid_str = metadata
-                .artist_mbid
-                .as_deref()
-                .unwrap_or("none")
-                .to_string();
-            let caa_id_str = metadata
-                .caa_id
-                .map(|id| id.to_string())
-                .unwrap_or_else(|| "none".to_string());
+            let artist_mbid_str = metadata.artist_mbid.as_deref().unwrap_or("none").to_string();
+            let caa_id_str =
+                metadata.caa_id.map(|id| id.to_string()).unwrap_or_else(|| "none".to_string());
 
             play.mbid_recording = metadata.track_mbid;
             play.mbid_release = metadata.album_mbid;
@@ -49,10 +37,7 @@ pub async fn enrich_play(
             true
         }
         Err(e) => {
-            warn!(
-                "⚠ MusicBrainz lookup failed for {} - {}: {}",
-                play.artist, play.title, e
-            );
+            warn!("⚠ MusicBrainz lookup failed for {} - {}: {}", play.artist, play.title, e);
             false
         }
     }

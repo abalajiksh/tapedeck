@@ -161,11 +161,9 @@ impl UserSource {
                 .map(|s| s.trim().to_lowercase())
                 .filter(|s| !s.is_empty())
                 .collect(),
-            Some(serde_json::Value::String(s)) => s
-                .split(',')
-                .map(|p| p.trim().to_lowercase())
-                .filter(|p| !p.is_empty())
-                .collect(),
+            Some(serde_json::Value::String(s)) => {
+                s.split(',').map(|p| p.trim().to_lowercase()).filter(|p| !p.is_empty()).collect()
+            }
             _ => Vec::new(),
         }
     }
@@ -221,11 +219,7 @@ pub struct PlexSettings {
 impl PlexSettings {
     /// Split a stored comma-separated field into the `PlexFilters` shape.
     pub fn list(field: &str) -> Vec<String> {
-        field
-            .split(',')
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .collect()
+        field.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect()
     }
 
     /// Whether the engine can actually poll with this config.
@@ -252,10 +246,7 @@ impl Database {
             .busy_timeout(Duration::from_secs(10))
             .synchronous(SqliteSynchronous::Normal)
             .foreign_keys(true);
-        let pool = SqlitePoolOptions::new()
-            .max_connections(5)
-            .connect_with(options)
-            .await?;
+        let pool = SqlitePoolOptions::new().max_connections(5).connect_with(options).await?;
         let db = Self { pool, secrets };
         db.init().await?;
         db.migrate().await?;
@@ -760,10 +751,7 @@ impl Database {
             ];
             for stmt in rebuild {
                 if let Err(e) = sqlx::query(stmt).execute(&self.pool).await {
-                    error!(
-                        "user_sources rebuild failed: {} — leaving the old table in place",
-                        e
-                    );
+                    error!("user_sources rebuild failed: {} — leaving the old table in place", e);
                     break;
                 }
             }
@@ -833,9 +821,7 @@ impl Database {
         let Ok(parsed) = PasswordHash::new(hash) else {
             return false;
         };
-        Argon2::default()
-            .verify_password(password.as_bytes(), &parsed)
-            .is_ok()
+        Argon2::default().verify_password(password.as_bytes(), &parsed).is_ok()
     }
 
     // ════════════════════════════════════════════════════════════
@@ -863,11 +849,7 @@ impl Database {
 
         if let Some((user_id, uname, hash, role)) = row {
             if Self::verify_password(password, &hash) {
-                return Ok(Some(AuthUser {
-                    user_id,
-                    username: uname,
-                    is_admin: role == "admin",
-                }));
+                return Ok(Some(AuthUser { user_id, username: uname, is_admin: role == "admin" }));
             }
         }
         Ok(None)
@@ -906,8 +888,7 @@ impl Database {
             Ok(1)
         } else {
             // Create new admin
-            self.create_user(username, display_name, password_hash, "admin")
-                .await
+            self.create_user(username, display_name, password_hash, "admin").await
         }
     }
 
@@ -963,11 +944,7 @@ impl Database {
                 .bind(session_id)
                 .execute(&self.pool)
                 .await;
-            Ok(Some(AuthUser {
-                user_id,
-                username,
-                is_admin: role == "admin",
-            }))
+            Ok(Some(AuthUser { user_id, username, is_admin: role == "admin" }))
         } else {
             Ok(None)
         }
@@ -998,26 +975,15 @@ impl Database {
         submission_client: Option<&str>,
         source_ref: Option<i64>,
     ) -> Result<bool, sqlx::Error> {
-        if self
-            .exists(user_id, &play.source_id, &play.source_name)
-            .await?
-        {
+        if self.exists(user_id, &play.source_id, &play.source_name).await? {
             return Ok(false);
         }
-        if self
-            .fuzzy_exists(user_id, &play.title, &play.artist, play.timestamp as i64)
-            .await?
-        {
-            debug!(
-                "Skipping duplicate play (fuzzy match): {} - {}",
-                play.artist, play.title
-            );
+        if self.fuzzy_exists(user_id, &play.title, &play.artist, play.timestamp as i64).await? {
+            debug!("Skipping duplicate play (fuzzy match): {} - {}", play.artist, play.title);
             return Ok(false);
         }
-        let mbid_artist_json = play
-            .mbid_artist
-            .as_ref()
-            .map(|arr| serde_json::to_string(arr).unwrap());
+        let mbid_artist_json =
+            play.mbid_artist.as_ref().map(|arr| serde_json::to_string(arr).unwrap());
         let q = quality.cloned().unwrap_or_default();
 
         sqlx::query(
@@ -1116,9 +1082,8 @@ impl Database {
         Ok(records
             .into_iter()
             .map(|r| {
-                let mbid_artist = r
-                    .mbid_artist
-                    .and_then(|s| serde_json::from_str::<Vec<String>>(&s).ok());
+                let mbid_artist =
+                    r.mbid_artist.and_then(|s| serde_json::from_str::<Vec<String>>(&s).ok());
                 let delivered = r
                     .delivered_sinks
                     .as_deref()
@@ -1158,10 +1123,8 @@ impl Database {
                 .bind(id)
                 .fetch_optional(&self.pool)
                 .await?;
-        let mut set: Vec<String> = row
-            .and_then(|(s,)| s)
-            .and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or_default();
+        let mut set: Vec<String> =
+            row.and_then(|(s,)| s).and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
         if !set.iter().any(|s| s == sink_name) {
             set.push(sink_name.to_string());
             sqlx::query("UPDATE scrobbles SET delivered_sinks = ? WHERE id = ?")
@@ -1180,10 +1143,8 @@ impl Database {
         id: i64,
         play: &Play,
     ) -> Result<(), sqlx::Error> {
-        let mbid_artist_json = play
-            .mbid_artist
-            .as_ref()
-            .map(|a| serde_json::to_string(a).unwrap_or_default());
+        let mbid_artist_json =
+            play.mbid_artist.as_ref().map(|a| serde_json::to_string(a).unwrap_or_default());
         sqlx::query(
             "UPDATE scrobbles SET mbid_recording = ?, mbid_release = ?, mbid_artist = ?, caa_id = ?, caa_release_mbid = ?
              WHERE id = ?"
@@ -1215,9 +1176,7 @@ impl Database {
     /// VACUUM INTO takes a string literal, not a bound parameter.
     pub async fn backup_to(&self, path: &str) -> Result<(), sqlx::Error> {
         let safe = path.replace('\'', "''");
-        sqlx::query(&format!("VACUUM INTO '{}'", safe))
-            .execute(&self.pool)
-            .await?;
+        sqlx::query(&format!("VACUUM INTO '{}'", safe)).execute(&self.pool).await?;
         Ok(())
     }
 
@@ -1382,15 +1341,7 @@ impl Database {
         &self,
         limit: i64,
     ) -> Result<
-        Vec<(
-            i64,
-            String,
-            String,
-            Option<String>,
-            Option<i64>,
-            Option<String>,
-            String,
-        )>,
+        Vec<(i64, String, String, Option<String>, Option<i64>, Option<String>, String)>,
         sqlx::Error,
     > {
         sqlx::query_as(
@@ -1432,9 +1383,8 @@ impl Database {
 
     /// (total, with a language set) — for backfill progress.
     pub async fn language_coverage(&self) -> Result<(i64, i64), sqlx::Error> {
-        let total: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM scrobbles")
-            .fetch_one(&self.pool)
-            .await?;
+        let total: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM scrobbles").fetch_one(&self.pool).await?;
         let done: (i64,) =
             sqlx::query_as("SELECT COUNT(*) FROM scrobbles WHERE language IS NOT NULL")
                 .fetch_one(&self.pool)
@@ -1606,10 +1556,7 @@ impl Database {
                 .bind(note_id)
                 .execute(&self.pool)
                 .await?;
-            sqlx::query("DELETE FROM notes WHERE id = ?")
-                .bind(note_id)
-                .execute(&self.pool)
-                .await?;
+            sqlx::query("DELETE FROM notes WHERE id = ?").bind(note_id).execute(&self.pool).await?;
         }
         Ok(())
     }
@@ -1660,22 +1607,14 @@ impl Database {
         play: &Play,
         skipped: bool,
     ) -> Result<bool, sqlx::Error> {
-        if self
-            .exists(user_id, &play.source_id, &play.source_name)
-            .await?
-        {
+        if self.exists(user_id, &play.source_id, &play.source_name).await? {
             return Ok(false);
         }
-        if self
-            .fuzzy_exists(user_id, &play.title, &play.artist, play.timestamp as i64)
-            .await?
-        {
+        if self.fuzzy_exists(user_id, &play.title, &play.artist, play.timestamp as i64).await? {
             return Ok(false);
         }
-        let mbid_artist_json = play
-            .mbid_artist
-            .as_ref()
-            .map(|arr| serde_json::to_string(arr).unwrap());
+        let mbid_artist_json =
+            play.mbid_artist.as_ref().map(|arr| serde_json::to_string(arr).unwrap());
         sqlx::query(
             "INSERT INTO scrobbles (
                 user_id, title, artist, album, timestamp, duration, source_id, source_name, status,
@@ -2199,10 +2138,7 @@ impl Database {
             .filter_map(|(service, blob)| match self.secrets.decrypt(&blob) {
                 Ok(plain) => Some((service, plain)),
                 Err(e) => {
-                    error!(
-                        "Undecryptable {} credential for user {}: {}",
-                        service, user_id, e
-                    );
+                    error!("Undecryptable {} credential for user {}: {}", service, user_id, e);
                     None
                 }
             })
@@ -2217,10 +2153,7 @@ impl Database {
         match self.secrets.encrypt(plaintext) {
             Ok(sealed) => sealed,
             Err(e) => {
-                error!(
-                    "Credential encryption failed: {} — refusing to store plaintext",
-                    e
-                );
+                error!("Credential encryption failed: {} — refusing to store plaintext", e);
                 String::new()
             }
         }
@@ -2485,9 +2418,7 @@ impl Database {
             .fetch_optional(&self.pool)
             .await?;
             if let Some((title, artist, mbid)) = row {
-                let id = self
-                    .upsert_entity("recording", &title, &artist, mbid.as_deref())
-                    .await?;
+                let id = self.upsert_entity("recording", &title, &artist, mbid.as_deref()).await?;
                 return Ok(Some((id, title)));
             }
             return Ok(None);
@@ -2535,9 +2466,7 @@ impl Database {
         if name.trim().is_empty() {
             return Ok(None);
         }
-        let id = self
-            .upsert_entity(kind, &name, &artist, mbid.as_deref())
-            .await?;
+        let id = self.upsert_entity(kind, &name, &artist, mbid.as_deref()).await?;
         Ok(Some((id, name)))
     }
 
@@ -2733,21 +2662,9 @@ impl Database {
         .await?;
         Ok(rows
             .into_iter()
-            .map(
-                |(id, kind, name, artist_name, mbid, created_at, loved_at)| {
-                    (
-                        EntityRow {
-                            id,
-                            kind,
-                            name,
-                            artist_name,
-                            mbid,
-                            created_at,
-                        },
-                        loved_at,
-                    )
-                },
-            )
+            .map(|(id, kind, name, artist_name, mbid, created_at, loved_at)| {
+                (EntityRow { id, kind, name, artist_name, mbid, created_at }, loved_at)
+            })
             .collect())
     }
 
@@ -2777,10 +2694,7 @@ impl Database {
         )
         .fetch_all(&self.pool)
         .await?;
-        Ok(rows
-            .into_iter()
-            .filter_map(|r| self.hydrate_source(r))
-            .collect())
+        Ok(rows.into_iter().filter_map(|r| self.hydrate_source(r)).collect())
     }
 
     /// This user's sources, for the Settings screen. Credentials are decrypted
@@ -2797,10 +2711,7 @@ impl Database {
         .bind(user_id)
         .fetch_all(&self.pool)
         .await?;
-        Ok(rows
-            .into_iter()
-            .filter_map(|r| self.hydrate_source(r))
-            .collect())
+        Ok(rows.into_iter().filter_map(|r| self.hydrate_source(r)).collect())
     }
 
     /// One source by id, scoped to its owner so an id from another user is a
@@ -2823,11 +2734,8 @@ impl Database {
     }
 
     fn hydrate_source(&self, row: UserSourceRow) -> Option<UserSource> {
-        let credentials = if row.credentials.is_empty() {
-            String::new()
-        } else {
-            self.unseal(&row.credentials)?
-        };
+        let credentials =
+            if row.credentials.is_empty() { String::new() } else { self.unseal(&row.credentials)? };
         Some(UserSource {
             id: row.id,
             user_id: row.user_id,
@@ -2860,11 +2768,7 @@ impl Database {
         poll_interval_secs: Option<i64>,
         options: &str,
     ) -> Result<i64, sqlx::Error> {
-        let sealed = if credentials.is_empty() {
-            String::new()
-        } else {
-            self.seal(credentials)
-        };
+        let sealed = if credentials.is_empty() { String::new() } else { self.seal(credentials) };
         let res = sqlx::query(
             "INSERT INTO user_sources
                 (user_id, kind, label, enabled, url, credentials, remote_account,
@@ -2899,11 +2803,7 @@ impl Database {
         poll_interval_secs: Option<i64>,
         options: &str,
     ) -> Result<bool, sqlx::Error> {
-        let sealed = if credentials.is_empty() {
-            String::new()
-        } else {
-            self.seal(credentials)
-        };
+        let sealed = if credentials.is_empty() { String::new() } else { self.seal(credentials) };
         let res = sqlx::query(
             "UPDATE user_sources SET
                 label = ?, enabled = ?, url = ?, credentials = ?, remote_account = ?,
@@ -3249,10 +3149,7 @@ impl Database {
     }
 
     fn now_secs() -> i64 {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs() as i64
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64
     }
 
     pub async fn validate_token(&self, token: &str) -> Result<Option<AuthUser>, sqlx::Error> {
@@ -3269,11 +3166,7 @@ impl Database {
                 .bind(&token_hash)
                 .execute(&self.pool)
                 .await;
-            Ok(Some(AuthUser {
-                user_id,
-                username,
-                is_admin: role == "admin",
-            }))
+            Ok(Some(AuthUser { user_id, username, is_admin: role == "admin" }))
         } else {
             Ok(None)
         }
@@ -3388,10 +3281,7 @@ impl Database {
                 .execute(&mut *tx)
                 .await?;
         }
-        let res = sqlx::query("DELETE FROM users WHERE id = ?")
-            .bind(id)
-            .execute(&mut *tx)
-            .await?;
+        let res = sqlx::query("DELETE FROM users WHERE id = ?").bind(id).execute(&mut *tx).await?;
         tx.commit().await?;
         Ok(res.rows_affected() > 0)
     }
@@ -3424,9 +3314,8 @@ impl Database {
     }
 
     pub async fn has_users(&self) -> Result<bool, sqlx::Error> {
-        let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM users")
-            .fetch_one(&self.pool)
-            .await?;
+        let count: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM users").fetch_one(&self.pool).await?;
         Ok(count.0 > 0)
     }
 
@@ -3537,37 +3426,22 @@ mod tests {
         for suffix in ["", "-wal", "-shm"] {
             let _ = std::fs::remove_file(format!("{}{}", path.display(), suffix));
         }
-        Database::new(
-            &format!("sqlite:{}", path.display()),
-            Arc::new(SecretBox::test_key()),
-        )
-        .await
-        .unwrap()
+        Database::new(&format!("sqlite:{}", path.display()), Arc::new(SecretBox::test_key()))
+            .await
+            .unwrap()
     }
 
     fn play(title: &str, artist: &str, ts: u64) -> Play {
-        Play::new(
-            title.into(),
-            artist.into(),
-            ts,
-            format!("src-{ts}"),
-            "test".into(),
-        )
+        Play::new(title.into(), artist.into(), ts, format!("src-{ts}"), "test".into())
     }
 
     #[tokio::test]
     async fn dedup_rejects_duplicate_source() {
         let db = testdb().await;
         let p = play("Teardrop", "Massive Attack", 1000);
-        assert!(db
-            .save_scrobble(1, &p, None, None, None, None, None, None)
-            .await
-            .unwrap());
+        assert!(db.save_scrobble(1, &p, None, None, None, None, None, None).await.unwrap());
         // same source_id + name → deduped
-        assert!(!db
-            .save_scrobble(1, &p, None, None, None, None, None, None)
-            .await
-            .unwrap());
+        assert!(!db.save_scrobble(1, &p, None, None, None, None, None, None).await.unwrap());
     }
 
     #[tokio::test]
@@ -3595,10 +3469,7 @@ mod tests {
     #[tokio::test]
     async fn chain_name_and_output_binding_resolve() {
         let db = testdb().await;
-        let uid = db
-            .create_user("alice", None, "not-used-yet", "admin")
-            .await
-            .unwrap();
+        let uid = db.create_user("alice", None, "not-used-yet", "admin").await.unwrap();
         let chain = SignalChain {
             id: None,
             user_id: uid,
@@ -3613,33 +3484,20 @@ mod tests {
         let cid = db.create_chain(&chain).await.unwrap();
 
         // name → id (case-insensitive)
-        assert_eq!(
-            db.get_chain_by_name(uid, "desktop").await.unwrap(),
-            Some(cid)
-        );
+        assert_eq!(db.get_chain_by_name(uid, "desktop").await.unwrap(), Some(cid));
         assert_eq!(db.get_chain_by_name(uid, "nope").await.unwrap(), None);
 
         // auto-learn an output, unmapped resolves to None, then bind it
-        db.record_output(uid, "Schiit Mimir", Some("usb"))
-            .await
-            .unwrap();
+        db.record_output(uid, "Schiit Mimir", Some("usb")).await.unwrap();
         assert_eq!(db.resolve_binding(uid, "Schiit Mimir").await.unwrap(), None);
-        db.set_binding(uid, "Schiit Mimir", Some(cid))
-            .await
-            .unwrap();
-        assert_eq!(
-            db.resolve_binding(uid, "Schiit Mimir").await.unwrap(),
-            Some(cid)
-        );
+        db.set_binding(uid, "Schiit Mimir", Some(cid)).await.unwrap();
+        assert_eq!(db.resolve_binding(uid, "Schiit Mimir").await.unwrap(), Some(cid));
     }
 
     #[tokio::test]
     async fn bulk_set_chain_updates_only_targets() {
         let db = testdb().await;
-        let uid = db
-            .create_user("bob", None, "not-used-yet", "admin")
-            .await
-            .unwrap();
+        let uid = db.create_user("bob", None, "not-used-yet", "admin").await.unwrap();
         let cid = db
             .create_chain(&SignalChain {
                 id: None,
@@ -3660,18 +3518,9 @@ mod tests {
         db.save_scrobble(uid, &play("b", "y", 20), None, None, None, None, None, None)
             .await
             .unwrap();
-        let ids: Vec<i64> = db
-            .get_all_scrobbles(uid)
-            .await
-            .unwrap()
-            .iter()
-            .map(|r| r.id)
-            .collect();
+        let ids: Vec<i64> = db.get_all_scrobbles(uid).await.unwrap().iter().map(|r| r.id).collect();
 
-        let n = db
-            .bulk_set_scrobble_chain(uid, &ids[..1], Some(cid))
-            .await
-            .unwrap();
+        let n = db.bulk_set_scrobble_chain(uid, &ids[..1], Some(cid)).await.unwrap();
         assert_eq!(n, 1);
         let rows = db.get_all_scrobbles(uid).await.unwrap();
         assert_eq!(rows.iter().filter(|r| r.chain_id == Some(cid)).count(), 1);
@@ -3686,22 +3535,14 @@ mod tests {
         let session = db.create_web_session(uid).await.unwrap();
 
         // enabled: all three work
-        assert!(db
-            .authenticate("carol", "password123")
-            .await
-            .unwrap()
-            .is_some());
+        assert!(db.authenticate("carol", "password123").await.unwrap().is_some());
         assert!(db.validate_token(&token).await.unwrap().is_some());
         assert!(db.validate_session(&session).await.unwrap().is_some());
 
         db.set_user_disabled(uid, true).await.unwrap();
 
         // disabled: every path is rejected
-        assert!(db
-            .authenticate("carol", "password123")
-            .await
-            .unwrap()
-            .is_none());
+        assert!(db.authenticate("carol", "password123").await.unwrap().is_none());
         assert!(db.validate_token(&token).await.unwrap().is_none());
         assert!(db.validate_session(&session).await.unwrap().is_none());
     }
@@ -3745,9 +3586,7 @@ mod tests {
         let jid = db.create_import_job(uid, "file").await.unwrap();
         // A job that completed normally.
         let done = db.create_import_job(uid, "lastfm").await.unwrap();
-        db.finish_import_job(done, "done", 10, 8, "ok")
-            .await
-            .unwrap();
+        db.finish_import_job(done, "done", 10, 8, "ok").await.unwrap();
 
         let n = db.mark_running_imports_interrupted().await.unwrap();
         assert_eq!(n, 1, "only the unfinished job is touched");
@@ -3763,24 +3602,13 @@ mod tests {
     async fn connections_round_trip_and_hide_creds() {
         let db = testdb().await;
         let uid = db.create_user("erin", None, "x", "user").await.unwrap();
-        db.set_connection(
-            uid,
-            "listenbrainz",
-            r#"{"token":"secret"}"#,
-            Some("erin_lb"),
-        )
-        .await
-        .unwrap();
+        db.set_connection(uid, "listenbrainz", r#"{"token":"secret"}"#, Some("erin_lb"))
+            .await
+            .unwrap();
 
         // engine sees the credentials
         let fwd = db.get_connections_for_forwarding(uid).await.unwrap();
-        assert_eq!(
-            fwd,
-            vec![(
-                "listenbrainz".to_string(),
-                r#"{"token":"secret"}"#.to_string()
-            )]
-        );
+        assert_eq!(fwd, vec![("listenbrainz".to_string(), r#"{"token":"secret"}"#.to_string())]);
 
         // the public list exposes only service + account, never the token
         let list = db.list_connections(uid).await.unwrap();
@@ -3808,21 +3636,14 @@ mod tests {
                 .fetch_one(&db.pool)
                 .await
                 .unwrap();
-        assert!(
-            !raw.0.contains("PLAINTEXT_MARKER"),
-            "credential stored in the clear: {}",
-            raw.0
-        );
+        assert!(!raw.0.contains("PLAINTEXT_MARKER"), "credential stored in the clear: {}", raw.0);
         assert!(SecretBox::is_encrypted(&raw.0));
 
         // …while the forwarding path still gets usable plaintext back.
         let fwd = db.get_connections_for_forwarding(uid).await.unwrap();
         assert_eq!(
             fwd,
-            vec![(
-                "listenbrainz".to_string(),
-                r#"{"token":"PLAINTEXT_MARKER"}"#.to_string()
-            )]
+            vec![("listenbrainz".to_string(), r#"{"token":"PLAINTEXT_MARKER"}"#.to_string())]
         );
     }
 
@@ -3894,17 +3715,9 @@ mod tests {
 
         // Each user sees only their own row…
         assert_eq!(db.list_sources_for_user(a).await.unwrap().len(), 1);
-        assert_eq!(
-            db.get_source(a, a_id).await.unwrap().unwrap().url,
-            "http://a"
-        );
+        assert_eq!(db.get_source(a, a_id).await.unwrap().unwrap().url, "http://a");
         assert!(
-            db.get_source(b, b_id)
-                .await
-                .unwrap()
-                .unwrap()
-                .credential("token")
-                .as_deref()
+            db.get_source(b, b_id).await.unwrap().unwrap().credential("token").as_deref()
                 == Some("tb")
         );
         // An id belonging to someone else is a miss, not a leak.
@@ -3993,27 +3806,14 @@ mod tests {
 
         // Each keeps its own credentials and label.
         assert_eq!(
-            db.get_source(uid, living)
-                .await
-                .unwrap()
-                .unwrap()
-                .credential("token")
-                .as_deref(),
+            db.get_source(uid, living).await.unwrap().unwrap().credential("token").as_deref(),
             Some("ta")
         );
         assert_eq!(
-            db.get_source(uid, study)
-                .await
-                .unwrap()
-                .unwrap()
-                .credential("token")
-                .as_deref(),
+            db.get_source(uid, study).await.unwrap().unwrap().credential("token").as_deref(),
             Some("tb")
         );
-        assert_eq!(
-            db.get_source(uid, study).await.unwrap().unwrap().label,
-            "Study"
-        );
+        assert_eq!(db.get_source(uid, study).await.unwrap().unwrap().label, "Study");
 
         // Deleting one leaves its twin alone.
         assert!(db.delete_source(uid, living).await.unwrap());
@@ -4110,9 +3910,7 @@ mod tests {
             .unwrap();
         let before = db.get_source(uid, sid).await.unwrap().unwrap();
 
-        db.record_source_poll(before.id, Some("boom"))
-            .await
-            .unwrap();
+        db.record_source_poll(before.id, Some("boom")).await.unwrap();
         let after = db.get_source(uid, sid).await.unwrap().unwrap();
 
         // If a poll bumped updated_at the engine would rebuild the source every
@@ -4127,36 +3925,20 @@ mod tests {
     #[tokio::test]
     async fn one_entity_per_spelling_and_the_mbid_is_only_an_alias() {
         let db = testdb().await;
-        let first = db
-            .upsert_entity("recording", "Xtal", "Aphex Twin", None)
-            .await
-            .unwrap();
+        let first = db.upsert_entity("recording", "Xtal", "Aphex Twin", None).await.unwrap();
         // Same record typed differently is the same row...
-        let again = db
-            .upsert_entity("recording", " xtal ", "aphex twin", Some("mb-1"))
-            .await
-            .unwrap();
+        let again =
+            db.upsert_entity("recording", " xtal ", "aphex twin", Some("mb-1")).await.unwrap();
         assert_eq!(first, again);
         // ...and learning the MBID later doesn't create a second one.
-        assert_eq!(
-            db.get_entity(first).await.unwrap().unwrap().mbid.as_deref(),
-            Some("mb-1")
-        );
+        assert_eq!(db.get_entity(first).await.unwrap().unwrap().mbid.as_deref(), Some("mb-1"));
 
         // A later lookup that knows nothing must not erase what we had.
-        db.upsert_entity("recording", "Xtal", "Aphex Twin", None)
-            .await
-            .unwrap();
-        assert_eq!(
-            db.get_entity(first).await.unwrap().unwrap().mbid.as_deref(),
-            Some("mb-1")
-        );
+        db.upsert_entity("recording", "Xtal", "Aphex Twin", None).await.unwrap();
+        assert_eq!(db.get_entity(first).await.unwrap().unwrap().mbid.as_deref(), Some("mb-1"));
 
         // Same title by someone else is a different record.
-        let other = db
-            .upsert_entity("recording", "Xtal", "Some Coverband", None)
-            .await
-            .unwrap();
+        let other = db.upsert_entity("recording", "Xtal", "Some Coverband", None).await.unwrap();
         assert_ne!(first, other);
     }
 
@@ -4164,19 +3946,10 @@ mod tests {
     async fn editing_a_note_keeps_what_it_said_before() {
         let db = testdb().await;
         let uid = db.create_user("ann", None, "x", "user").await.unwrap();
-        let e = db
-            .upsert_entity("release", "SAW 85-92", "Aphex Twin", None)
-            .await
-            .unwrap();
+        let e = db.upsert_entity("release", "SAW 85-92", "Aphex Twin", None).await.unwrap();
 
-        let id = db
-            .upsert_note(uid, Some(e), None, "first thoughts", "private")
-            .await
-            .unwrap();
-        let again = db
-            .upsert_note(uid, Some(e), None, "second thoughts", "public")
-            .await
-            .unwrap();
+        let id = db.upsert_note(uid, Some(e), None, "first thoughts", "private").await.unwrap();
+        let again = db.upsert_note(uid, Some(e), None, "second thoughts", "public").await.unwrap();
 
         // One note per target — the second write edits rather than stacks.
         assert_eq!(id, again);
@@ -4191,9 +3964,7 @@ mod tests {
         assert_eq!(revs[0].body_md, "first thoughts");
 
         // Changing only the visibility is not a rewrite.
-        db.upsert_note(uid, Some(e), None, "second thoughts", "private")
-            .await
-            .unwrap();
+        db.upsert_note(uid, Some(e), None, "second thoughts", "private").await.unwrap();
         assert_eq!(db.note_revisions(uid, id).await.unwrap().len(), 1);
     }
 
@@ -4213,40 +3984,19 @@ mod tests {
         )
         .await
         .unwrap();
-        let listen = db
-            .get_recent_scrobbles(uid, 1, 0, None, None, None, None)
-            .await
-            .unwrap()
-            .remove(0);
-        let e = db
-            .upsert_entity("recording", "Xtal", "Aphex Twin", None)
-            .await
-            .unwrap();
+        let listen =
+            db.get_recent_scrobbles(uid, 1, 0, None, None, None, None).await.unwrap().remove(0);
+        let e = db.upsert_entity("recording", "Xtal", "Aphex Twin", None).await.unwrap();
 
-        db.upsert_note(uid, Some(e), None, "about the record", "private")
+        db.upsert_note(uid, Some(e), None, "about the record", "private").await.unwrap();
+        db.upsert_note(uid, None, Some(listen.id), "heard this on the train", "private")
             .await
             .unwrap();
-        db.upsert_note(
-            uid,
-            None,
-            Some(listen.id),
-            "heard this on the train",
-            "private",
-        )
-        .await
-        .unwrap();
 
         assert_eq!(db.list_notes(uid).await.unwrap().len(), 2);
+        assert_eq!(db.note_for_entity(uid, e).await.unwrap().unwrap().body_md, "about the record");
         assert_eq!(
-            db.note_for_entity(uid, e).await.unwrap().unwrap().body_md,
-            "about the record"
-        );
-        assert_eq!(
-            db.note_for_scrobble(uid, listen.id)
-                .await
-                .unwrap()
-                .unwrap()
-                .body_md,
+            db.note_for_scrobble(uid, listen.id).await.unwrap().unwrap().body_md,
             "heard this on the train"
         );
 
@@ -4263,18 +4013,10 @@ mod tests {
         let db = testdb().await;
         let ann = db.create_user("ann2", None, "x", "user").await.unwrap();
         let bob = db.create_user("bob2", None, "x", "user").await.unwrap();
-        let e = db
-            .upsert_entity("artist", "Aphex Twin", "", None)
-            .await
-            .unwrap();
+        let e = db.upsert_entity("artist", "Aphex Twin", "", None).await.unwrap();
 
-        let id = db
-            .upsert_note(ann, Some(e), None, "mine", "public")
-            .await
-            .unwrap();
-        db.upsert_note(ann, Some(e), None, "mine, edited", "public")
-            .await
-            .unwrap();
+        let id = db.upsert_note(ann, Some(e), None, "mine", "public").await.unwrap();
+        db.upsert_note(ann, Some(e), None, "mine, edited", "public").await.unwrap();
 
         // Even a `public` note isn't served to anyone else yet — patches don't
         // exist, so every read path is still self-only.
@@ -4285,10 +4027,7 @@ mod tests {
         assert!(db.get_note(ann, id).await.unwrap().is_some());
 
         // Both users can annotate the same entity without colliding.
-        let bobs = db
-            .upsert_note(bob, Some(e), None, "his", "private")
-            .await
-            .unwrap();
+        let bobs = db.upsert_note(bob, Some(e), None, "his", "private").await.unwrap();
         assert_ne!(id, bobs);
     }
 
@@ -4300,21 +4039,12 @@ mod tests {
         let mut p = play("Ageispolis", "Aphex Twin", 1000);
         p.album = Some("SAW 85-92".into());
         p.track_number = Some(3);
-        db.save_scrobble(uid, &p, None, None, None, None, None, None)
-            .await
-            .unwrap();
+        db.save_scrobble(uid, &p, None, None, None, None, None, None).await.unwrap();
 
         // A named track with nothing annotated yet still resolves, because the
         // user has actually played it.
         let (id, label) = db
-            .resolve_reference(
-                uid,
-                "recording",
-                "ageispolis",
-                None,
-                Some("Aphex Twin"),
-                None,
-            )
+            .resolve_reference(uid, "recording", "ageispolis", None, Some("Aphex Twin"), None)
             .await
             .unwrap()
             .unwrap();
@@ -4364,10 +4094,7 @@ mod tests {
         let db = testdb().await;
         let ann = db.create_user("ann3", None, "x", "user").await.unwrap();
         let bob = db.create_user("bob3", None, "x", "user").await.unwrap();
-        let e = db
-            .upsert_entity("recording", "Xtal", "Aphex Twin", None)
-            .await
-            .unwrap();
+        let e = db.upsert_entity("recording", "Xtal", "Aphex Twin", None).await.unwrap();
 
         db.set_love(ann, e, true).await.unwrap();
         // Loving twice is not two loves.

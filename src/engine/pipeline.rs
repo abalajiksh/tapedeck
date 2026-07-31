@@ -65,10 +65,7 @@ fn source_label(kind: &str) -> &'static str {
 }
 
 fn now_secs() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs() as i64
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64
 }
 
 impl ScrobbleEngine {
@@ -108,12 +105,10 @@ impl ScrobbleEngine {
         // token must stop polling immediately, not linger until the next edit.
         let live: Vec<(i64, i64)> = configured.iter().map(|c| (c.id, c.updated_at)).collect();
         self.sources.retain(|active| {
-            let still_current = live
-                .iter()
-                .any(|(id, stamp)| *id == active.row_id && *stamp == active.stamp);
+            let still_current =
+                live.iter().any(|(id, stamp)| *id == active.row_id && *stamp == active.stamp);
             if !still_current {
-                self.now_playing
-                    .clear_user_source(active.user_id, source_label(&active.kind));
+                self.now_playing.clear_user_source(active.user_id, source_label(&active.kind));
                 info!(
                     "⚙️ Source {} for user {} stopped (changed or disabled)",
                     active.kind, active.user_id
@@ -132,10 +127,7 @@ impl ScrobbleEngine {
 
             match self.build_source(&cfg).await {
                 Ok(source) => {
-                    info!(
-                        "✅ {} connected for user {} ({})",
-                        cfg.kind, cfg.user_id, cfg.url
-                    );
+                    info!("✅ {} connected for user {} ({})", cfg.kind, cfg.user_id, cfg.url);
                     let _ = self.db.record_source_poll(cfg.id, None).await;
                     let interval = cfg
                         .poll_interval_secs
@@ -201,12 +193,8 @@ impl ScrobbleEngine {
                 Ok(Box::new(plex))
             }
             "navidrome" => {
-                let username = cfg
-                    .credential("username")
-                    .ok_or("no Navidrome username stored")?;
-                let password = cfg
-                    .credential("password")
-                    .ok_or("no Navidrome password stored")?;
+                let username = cfg.credential("username").ok_or("no Navidrome username stored")?;
+                let password = cfg.credential("password").ok_or("no Navidrome password stored")?;
                 let mut nd = NavidromeSource::new(cfg.url.clone(), username, password);
                 nd.initialize().await?;
                 // Navidrome keeps its own play history, so without a high-water
@@ -218,9 +206,7 @@ impl ScrobbleEngine {
                 Ok(Box::new(nd))
             }
             "jellyfin" => {
-                let key = cfg
-                    .credential("api_key")
-                    .ok_or("no Jellyfin API key stored")?;
+                let key = cfg.credential("api_key").ok_or("no Jellyfin API key stored")?;
                 let account = cfg
                     .remote_account
                     .clone()
@@ -285,11 +271,7 @@ impl ScrobbleEngine {
         has_active: &mut bool,
     ) {
         let (row_id, user_id) = (self.sources[i].row_id, self.sources[i].user_id);
-        let Some(nd) = self.sources[i]
-            .source
-            .as_any_mut()
-            .downcast_mut::<NavidromeSource>()
-        else {
+        let Some(nd) = self.sources[i].source.as_any_mut().downcast_mut::<NavidromeSource>() else {
             return;
         };
 
@@ -334,11 +316,7 @@ impl ScrobbleEngine {
                 }
                 let _ = db.record_source_poll(row_id, None).await;
                 if !plays.is_empty() {
-                    info!(
-                        "📀 {} Navidrome listen(s) for user {}",
-                        plays.len(),
-                        user_id
-                    );
+                    info!("📀 {} Navidrome listen(s) for user {}", plays.len(), user_id);
                 }
                 for mut play in plays {
                     let dupe = db
@@ -405,11 +383,7 @@ impl ScrobbleEngine {
         has_active: &mut bool,
     ) {
         let (row_id, user_id) = (self.sources[i].row_id, self.sources[i].user_id);
-        let Some(jf) = self.sources[i]
-            .source
-            .as_any_mut()
-            .downcast_mut::<JellyfinSource>()
-        else {
+        let Some(jf) = self.sources[i].source.as_any_mut().downcast_mut::<JellyfinSource>() else {
             return;
         };
 
@@ -457,14 +431,12 @@ impl ScrobbleEngine {
 
         for track in sessions.ready_to_scrobble {
             let mut play = track.play;
-            let dupe = db
-                .exists(user_id, &play.source_id, &play.source_name)
-                .await
-                .unwrap_or(false)
-                || db
-                    .fuzzy_exists(user_id, &play.title, &play.artist, play.timestamp as i64)
-                    .await
-                    .unwrap_or(false);
+            let dupe =
+                db.exists(user_id, &play.source_id, &play.source_name).await.unwrap_or(false)
+                    || db
+                        .fuzzy_exists(user_id, &play.title, &play.artist, play.timestamp as i64)
+                        .await
+                        .unwrap_or(false);
             if dupe {
                 continue;
             }
@@ -485,10 +457,9 @@ impl ScrobbleEngine {
                 )
                 .await
             {
-                Ok(true) => info!(
-                    "📥 Queued for user {}: {} - {}",
-                    user_id, play.artist, play.title
-                ),
+                Ok(true) => {
+                    info!("📥 Queued for user {}: {} - {}", user_id, play.artist, play.title)
+                }
                 Ok(false) => {}
                 Err(e) => error!("Database error: {}", e),
             }
@@ -538,10 +509,7 @@ impl ScrobbleEngine {
                 continue;
             }
 
-            let Some(plex) = self.sources[i]
-                .source
-                .as_any_mut()
-                .downcast_mut::<PlexSource>()
+            let Some(plex) = self.sources[i].source.as_any_mut().downcast_mut::<PlexSource>()
             else {
                 continue;
             };
@@ -619,19 +587,14 @@ impl ScrobbleEngine {
 
                 // Dedup before enrichment, so a duplicate doesn't cost a
                 // MusicBrainz call.
-                let already_exists = db
-                    .exists(user_id, &play.source_id, &play.source_name)
-                    .await
-                    .unwrap_or(false)
-                    || db
-                        .fuzzy_exists(user_id, &play.title, &play.artist, play.timestamp as i64)
-                        .await
-                        .unwrap_or(false);
+                let already_exists =
+                    db.exists(user_id, &play.source_id, &play.source_name).await.unwrap_or(false)
+                        || db
+                            .fuzzy_exists(user_id, &play.title, &play.artist, play.timestamp as i64)
+                            .await
+                            .unwrap_or(false);
                 if already_exists {
-                    debug!(
-                        "Skipping already-scrobbled: {} - {}",
-                        play.artist, play.title
-                    );
+                    debug!("Skipping already-scrobbled: {} - {}", play.artist, play.title);
                     continue;
                 }
 

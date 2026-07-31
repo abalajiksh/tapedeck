@@ -32,13 +32,7 @@ use super::AppState;
 use crate::sources::{JellyfinSource, NavidromeSource, PlexFilters, PlexSource};
 
 fn not_found(msg: &str) -> Response {
-    (
-        StatusCode::NOT_FOUND,
-        Json(serde_json::json!(ErrorResponse {
-            code: 404,
-            error: msg.into()
-        })),
-    )
+    (StatusCode::NOT_FOUND, Json(serde_json::json!(ErrorResponse { code: 404, error: msg.into() })))
         .into_response()
 }
 
@@ -92,9 +86,7 @@ async fn scrobble_art(
             else {
                 return not_found("Navidrome credentials are missing");
             };
-            NavidromeSource::new(source.url.clone(), u, p)
-                .fetch_cover_art(&item_id)
-                .await
+            NavidromeSource::new(source.url.clone(), u, p).fetch_cover_art(&item_id).await
         }
         "jellyfin" => {
             let Some(key) = source.credential("api_key") else {
@@ -146,14 +138,8 @@ mod tests {
             remote_item_id("navidrome", "navidrome-abc123-1700000000").as_deref(),
             Some("abc123")
         );
-        assert_eq!(
-            remote_item_id("navidrome", "navidrome-abc123-np").as_deref(),
-            Some("abc123")
-        );
-        assert_eq!(
-            remote_item_id("Plex", "plex-55821-np").as_deref(),
-            Some("55821")
-        );
+        assert_eq!(remote_item_id("navidrome", "navidrome-abc123-np").as_deref(), Some("abc123"));
+        assert_eq!(remote_item_id("Plex", "plex-55821-np").as_deref(), Some("55821"));
         assert_eq!(
             remote_item_id("Plex", "plex-55821-scrobble-1700000000").as_deref(),
             Some("55821-scrobble")
@@ -174,10 +160,7 @@ mod tests {
     #[test]
     fn ignores_sources_with_no_library_behind_them() {
         // An ingested or imported listen has no media server to ask.
-        assert_eq!(
-            remote_item_id("ingest:pano", "ingest-1-1700000000-Title"),
-            None
-        );
+        assert_eq!(remote_item_id("ingest:pano", "ingest-1-1700000000-Title"), None);
         assert_eq!(remote_item_id("rockbox", "rockbox-abc"), None);
         assert_eq!(remote_item_id("import", "import-x-1"), None);
     }
