@@ -271,10 +271,13 @@ editable in Settings; album-playthrough detection uses stored track numbers.
 
 Backfill your history from elsewhere and take it with you:
 
-- **Import** public listens from ListenBrainz or Last.fm by username, or upload
-  a ListenBrainz `.json` dump or a `.csv` export. Imports run as background
-  jobs, are deduplicated against existing listens, and are stored so they are
-  never re-forwarded to your scrobble sinks.
+- **Import** the `.zip` from ListenBrainz's *Export your data* — listens **and**
+  loved tracks, with the MusicBrainz IDs and cover-art references already in it,
+  so a 20,000-listen history costs no lookups at all. Or pull public listens from
+  ListenBrainz / Last.fm by username, or upload a single `.json`/`.jsonl`, a
+  `.csv`, or a Rockbox `.scrobbler.log`. Imports run as background jobs, are
+  deduplicated against existing listens, and are stored so they are never
+  re-forwarded to your scrobble sinks.
 - **Export** your entire history as JSON (full dump) or CSV.
 
 ## Architecture
@@ -371,7 +374,7 @@ RUST_LOG=info
 LOG_DIR=./logs
 
 # ── MusicBrainz ──
-MUSICBRAINZ_USER_AGENT=Tapedeck/0.9.0 ( your-email@example.com )
+MUSICBRAINZ_USER_AGENT=Tapedeck/0.10.0 ( your-email@example.com )
 MUSICBRAINZ_RATE_LIMIT=1
 
 # ── ListenBrainz endpoint (only for a self-hosted instance) ──

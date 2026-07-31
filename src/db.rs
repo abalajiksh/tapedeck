@@ -2470,6 +2470,26 @@ impl Database {
         Ok(Some((id, name)))
     }
 
+    /// Title and artist of a recording this user has actually listened to,
+    /// found by MusicBrainz recording id.
+    ///
+    /// A ListenBrainz `feedback.jsonl` row carries an MBID and a score but no
+    /// names, so this is how a loved track becomes something nameable.
+    pub async fn track_by_recording_mbid(
+        &self,
+        user_id: i64,
+        mbid: &str,
+    ) -> Result<Option<(String, String)>, sqlx::Error> {
+        sqlx::query_as(
+            "SELECT title, artist FROM scrobbles
+             WHERE user_id = ? AND mbid_recording = ? ORDER BY id DESC LIMIT 1",
+        )
+        .bind(user_id)
+        .bind(mbid)
+        .fetch_optional(&self.pool)
+        .await
+    }
+
     /// The album this user most recently heard a given track on. Supplies the
     /// album context for a note about a *track*, so `[[track:3]]` still means
     /// "the third track of the record this one is from".

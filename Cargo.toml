@@ -1,6 +1,6 @@
 [package]
 name = "tapedeck"
-version = "0.9.0"
+version = "0.10.0"
 edition = "2021"
 
 [dependencies]
@@ -60,3 +60,8 @@ base64 = "0.23.0"
 # in one place, rather than in every client that ever shows a note.
 pulldown-cmark = { version = "0.13.4", default-features = false, features = ["html"] }
 ammonia = "4.1.4"
+
+# ListenBrainz hands out its export as a zip of JSONL files, which is the form
+# people actually have. Deflate only — that's what the export uses, and the other
+# codecs pull in C libraries that would spoil cross-compiling for ARM boards.
+zip = { version = "8.6.0", default-features = false, features = ["deflate"] }

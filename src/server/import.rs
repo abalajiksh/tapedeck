@@ -430,8 +430,8 @@ async fn run_lastfm(
     Ok(())
 }
 
-/// Parse an uploaded backup: ListenBrainz JSON export or a CSV
-/// (`title,artist,album,format,chain,mbid,time`, our own export shape).
+/// Parse an uploaded backup: a ListenBrainz export (`.zip` or a single
+/// `.json`/`.jsonl`), our own CSV, or a Rockbox `.scrobbler.log`.
 async fn run_file(
     reg: &ImportRegistry,
     id: &str,
@@ -441,6 +441,13 @@ async fn run_file(
     name: &str,
     device_tz: Option<&str>,
 ) -> Result<(), String> {
+    // Sniff the archive by its magic bytes rather than the filename: people
+    // rename downloads, and a mislabelled `.json` that is really a zip should
+    // still import rather than fail on the first byte.
+    if bytes.starts_with(b"PK\x03\x04") {
+        return run_listenbrainz_archive(reg, id, db, uid, bytes).await;
+    }
+
     let text = String::from_utf8_lossy(bytes);
 
     if crate::rockbox::looks_like_scrobbler_log(&text) {
@@ -449,7 +456,7 @@ async fn run_file(
 
     let is_csv =
         name.to_lowercase().ends_with(".csv") || (!text.trim_start().starts_with(['{', '[']));
-    let plays: Vec<Play> = if is_csv { parse_csv(&text) } else { parse_json(&text)? };
+    let plays: Vec<Play> = if is_csv { parse_csv(&text) } else { parse_listens(&text)? };
     update(reg, id, |j| j.total = Some(plays.len()));
     for p in &plays {
         let inserted = db.import_listen(uid, p).await.map_err(|e| e.to_string())?;
@@ -465,6 +472,127 @@ async fn run_file(
         j.status = format!("Imported {} new listens", j.imported);
     });
     Ok(())
+}
+
+/// A ListenBrainz "export your data" archive.
+///
+/// Shape (as of 2026): `user.json`, `feedback.jsonl`, and `listens/<year>/<month>.jsonl`
+/// with one listen per line. Every `.jsonl` under `listens/` is read; anything
+/// else in the archive is ignored, so a future export can add files without
+/// breaking this.
+///
+/// The listens carry a full `mbid_mapping`, so this is the one import path where
+/// recording/release/artist MBIDs and cover art come for free — those listens
+/// never need a MusicBrainz lookup afterwards.
+async fn run_listenbrainz_archive(
+    reg: &ImportRegistry,
+    id: &str,
+    db: &Database,
+    uid: i64,
+    bytes: &[u8],
+) -> Result<(), String> {
+    use std::io::Read;
+
+    let reader = std::io::Cursor::new(bytes);
+    let mut zip = zip::ZipArchive::new(reader).map_err(|e| format!("Unreadable zip: {e}"))?;
+
+    // Read everything first so `total` is known before the slow part starts —
+    // an import with no upper bound shows a progress bar that never fills.
+    let mut plays: Vec<Play> = Vec::new();
+    let mut feedback = String::new();
+    let mut listen_files = 0usize;
+    for i in 0..zip.len() {
+        let mut entry = zip.by_index(i).map_err(|e| format!("Unreadable zip entry: {e}"))?;
+        if !entry.is_file() {
+            continue;
+        }
+        let path = entry.name().to_string();
+        // macOS zips carry a __MACOSX shadow tree of AppleDouble files.
+        if path.starts_with("__MACOSX/") || path.contains("/.") || path.starts_with('.') {
+            continue;
+        }
+        let mut text = String::new();
+        if path.ends_with("feedback.jsonl") {
+            let _ = entry.read_to_string(&mut feedback);
+            continue;
+        }
+        if !path.ends_with(".jsonl") && !path.ends_with(".json") {
+            continue;
+        }
+        if path.ends_with("user.json") {
+            continue;
+        }
+        entry.read_to_string(&mut text).map_err(|e| format!("Could not read {path}: {e}"))?;
+        listen_files += 1;
+        plays.extend(parse_listens(&text)?);
+    }
+
+    if plays.is_empty() {
+        return Err("No listens found in that archive — is it a ListenBrainz export?".into());
+    }
+
+    // Oldest first, so an interrupted import leaves a contiguous history rather
+    // than a hole in the middle.
+    plays.sort_by_key(|p| p.timestamp);
+    update(reg, id, |j| j.total = Some(plays.len()));
+
+    for p in &plays {
+        let inserted = db.import_listen(uid, p).await.map_err(|e| e.to_string())?;
+        update(reg, id, |j| {
+            j.fetched += 1;
+            if inserted {
+                j.imported += 1;
+            }
+        });
+    }
+
+    let loved = import_feedback(db, uid, &feedback).await;
+
+    update(reg, id, |j| {
+        j.state = "done".into();
+        let mut parts = vec![format!(
+            "Imported {} new listens from {} file{}",
+            j.imported,
+            listen_files,
+            if listen_files == 1 { "" } else { "s" }
+        )];
+        if loved > 0 {
+            parts.push(format!("{loved} loved tracks"));
+        }
+        j.status = parts.join(" · ");
+    });
+    Ok(())
+}
+
+/// Turn `feedback.jsonl` into loves.
+///
+/// The rows carry only a `recording_mbid` and a score, so the track has to be
+/// matched against a listen we now hold to learn its title and artist. That's
+/// why this runs *after* the listens are in. A love whose recording never
+/// appears in the history is skipped rather than guessed at, and `score: -1`
+/// (a "hate" on ListenBrainz) has no equivalent here, so it's ignored.
+///
+/// Never fails the import: the listens are the point, and losing a love is not
+/// worth failing a 50,000-row import over.
+async fn import_feedback(db: &Database, uid: i64, jsonl: &str) -> usize {
+    let mut loved = 0usize;
+    for line in jsonl.lines().filter(|l| !l.trim().is_empty()) {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { continue };
+        if v["score"].as_i64() != Some(1) {
+            continue;
+        }
+        let Some(mbid) = v["recording_mbid"].as_str() else { continue };
+        let Ok(Some((title, artist))) = db.track_by_recording_mbid(uid, mbid).await else {
+            continue;
+        };
+        let Ok(entity) = db.upsert_entity("recording", &title, &artist, Some(mbid)).await else {
+            continue;
+        };
+        if db.set_love(uid, entity, true).await.is_ok() {
+            loved += 1;
+        }
+    }
+    loved
 }
 
 /// Rockbox `.scrobbler.log`.
@@ -544,31 +672,91 @@ async fn run_scrobbler_log(
     Ok(())
 }
 
-/// ListenBrainz export: top-level array of listens, or `{ "listens": [...] }`.
-fn parse_json(text: &str) -> Result<Vec<Play>, String> {
-    let v: serde_json::Value =
-        serde_json::from_str(text).map_err(|e| format!("Invalid JSON: {e}"))?;
-    let arr = v
+/// ListenBrainz listens as JSON or JSONL.
+///
+/// Accepts a top-level array, `{ "listens": [...] }`, or — which is what the
+/// export archive actually contains — one JSON object per line. JSONL is
+/// detected by the whole-document parse failing, so a file that is valid JSON is
+/// never re-read line by line.
+fn parse_listens(text: &str) -> Result<Vec<Play>, String> {
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(text) {
+        if let Some(arr) = v
+            .as_array()
+            .cloned()
+            .or_else(|| v["listens"].as_array().cloned())
+            .or_else(|| v["scrobbles"].as_array().cloned())
+        {
+            return Ok(arr.iter().filter_map(listen_to_play).collect());
+        }
+        // A month with exactly one listen in it is a single JSON object, which
+        // parses whole and would otherwise be rejected for not being an array.
+        if let Some(p) = listen_to_play(&v) {
+            return Ok(vec![p]);
+        }
+        return Err("Expected a JSON array of listens or a { listens: [...] } object".into());
+    }
+
+    let mut out = Vec::new();
+    let mut lines = 0usize;
+    for line in text.lines().filter(|l| !l.trim().is_empty()) {
+        lines += 1;
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
+            if let Some(p) = listen_to_play(&v) {
+                out.push(p);
+            }
+        }
+    }
+    if lines == 0 {
+        return Err("Empty file".into());
+    }
+    if out.is_empty() {
+        return Err("Not valid JSON, and no listens found reading it line by line".into());
+    }
+    Ok(out)
+}
+
+/// One listen object → a `Play`, keeping everything the export knows.
+///
+/// The archive's `mbid_mapping` is the whole reason this import is cheap:
+/// recording/release/artist MBIDs and the cover-art ids come with it, so these
+/// listens skip MusicBrainz enrichment *and* the artwork chain entirely. Losing
+/// them would mean re-looking-up a decade of history one rate-limited request at
+/// a time.
+fn listen_to_play(l: &serde_json::Value) -> Option<Play> {
+    let ts = l["listened_at"].as_i64().or_else(|| l["timestamp"].as_i64())?;
+    let tm = if l["track_metadata"].is_object() { &l["track_metadata"] } else { l };
+    let title = tm["track_name"].as_str().or(tm["title"].as_str())?.to_string();
+    let artist = tm["artist_name"].as_str().or(tm["artist"].as_str())?.to_string();
+    let album = tm["release_name"].as_str().or(tm["album"].as_str()).map(str::to_string);
+
+    let mapping = &tm["mbid_mapping"];
+    let info = &tm["additional_info"];
+    let str_of = |v: &serde_json::Value| v.as_str().map(str::to_string);
+
+    let mut p = play(
+        ts,
+        title,
+        artist,
+        album,
+        str_of(&mapping["recording_mbid"])
+            .or_else(|| str_of(&tm["mbid_recording"]))
+            .or_else(|| str_of(&info["recording_mbid"])),
+    );
+    p.mbid_release = str_of(&mapping["release_mbid"]).or_else(|| str_of(&info["release_mbid"]));
+    p.mbid_release_group = str_of(&mapping["release_group_mbid"]);
+    p.mbid_artist = mapping["artist_mbids"]
         .as_array()
-        .cloned()
-        .or_else(|| v["listens"].as_array().cloned())
-        .or_else(|| v["scrobbles"].as_array().cloned())
-        .ok_or("Expected a JSON array of listens or a { listens: [...] } object")?;
-    Ok(arr
-        .iter()
-        .filter_map(|l| {
-            let ts = l["listened_at"].as_i64().or_else(|| l["timestamp"].as_i64())?;
-            let tm = if l["track_metadata"].is_object() { &l["track_metadata"] } else { l };
-            let title = tm["track_name"].as_str().or(tm["title"].as_str())?.to_string();
-            let artist = tm["artist_name"].as_str().or(tm["artist"].as_str())?.to_string();
-            let album = tm["release_name"].as_str().or(tm["album"].as_str()).map(str::to_string);
-            let mbid = tm["mbid_mapping"]["recording_mbid"]
-                .as_str()
-                .or(tm["mbid_recording"].as_str())
-                .map(str::to_string);
-            Some(play(ts, title, artist, album, mbid))
-        })
-        .collect())
+        .map(|a| a.iter().filter_map(|m| m.as_str().map(str::to_string)).collect::<Vec<_>>())
+        .filter(|v: &Vec<String>| !v.is_empty());
+    p.caa_id = mapping["caa_id"].as_i64();
+    p.caa_release_mbid = str_of(&mapping["caa_release_mbid"]);
+    p.duration = info["duration_ms"]
+        .as_i64()
+        .map(|ms| (ms / 1000).max(0) as u64)
+        .or_else(|| info["duration"].as_i64().map(|s| s.max(0) as u64));
+    p.track_number =
+        info["tracknumber"].as_i64().or_else(|| info["track_number"].as_i64()).map(|n| n as i32);
+    Some(p)
 }
 
 /// CSV: header row `title,artist,album,format,chain,mbid,time`.
@@ -659,9 +847,62 @@ mod tests {
     #[test]
     fn parse_json_listenbrainz_shape() {
         let js = r#"{"listens":[{"listened_at":1700000000,"track_metadata":{"track_name":"T","artist_name":"A","release_name":"R"}}]}"#;
-        let plays = parse_json(js).unwrap();
+        let plays = parse_listens(js).unwrap();
         assert_eq!(plays.len(), 1);
         assert_eq!(plays[0].artist, "A");
         assert_eq!(plays[0].album.as_deref(), Some("R"));
+    }
+
+    /// One JSON object per line — the shape inside a ListenBrainz export.
+    #[test]
+    fn parse_jsonl_one_listen_per_line() {
+        let jsonl = "{\"listened_at\":1700000000,\"track_metadata\":{\"track_name\":\"A\",\"artist_name\":\"X\"}}\n\
+                     \n\
+                     {\"listened_at\":1700000100,\"track_metadata\":{\"track_name\":\"B\",\"artist_name\":\"X\"}}\n";
+        let plays = parse_listens(jsonl).unwrap();
+        assert_eq!(plays.len(), 2);
+        assert_eq!(plays[1].title, "B");
+    }
+
+    /// A single unreadable line must not lose the rest of the month.
+    #[test]
+    fn jsonl_tolerates_one_bad_line() {
+        let jsonl = "{\"listened_at\":1,\"track_metadata\":{\"track_name\":\"A\",\"artist_name\":\"X\"}}\n\
+                     {not json at all\n\
+                     {\"listened_at\":2,\"track_metadata\":{\"track_name\":\"B\",\"artist_name\":\"X\"}}\n";
+        assert_eq!(parse_listens(jsonl).unwrap().len(), 2);
+        // But a file with nothing readable in it is an error, not silence.
+        assert!(parse_listens("not json\nstill not json\n").is_err());
+    }
+
+    /// The export's `mbid_mapping` is the reason this import is cheap — every
+    /// field dropped here is a rate-limited MusicBrainz lookup later.
+    #[test]
+    fn export_mbid_mapping_is_kept() {
+        let line = r#"{"listened_at":1759320594,"track_metadata":{
+            "track_name":"Up!","artist_name":"Shania Twain","release_name":"Up!",
+            "mbid_mapping":{"caa_id":3827741944,
+              "artist_mbids":["faabb55d-3c9e-4c23-8779-732ac2ee2c0d"],
+              "release_mbid":"480bdf50-a119-49cb-b3d1-54e1e811b4fd",
+              "recording_mbid":"1cecdf15-8596-4985-a865-6cbd624b483f",
+              "caa_release_mbid":"480bdf50-a119-49cb-b3d1-54e1e811b4fd"},
+            "additional_info":{"duration_ms":213376,"tracknumber":3}}}"#;
+        let p = &parse_listens(line).unwrap()[0];
+        assert_eq!(p.mbid_recording.as_deref(), Some("1cecdf15-8596-4985-a865-6cbd624b483f"));
+        assert_eq!(p.mbid_release.as_deref(), Some("480bdf50-a119-49cb-b3d1-54e1e811b4fd"));
+        assert_eq!(p.mbid_artist.as_deref().map(|v| v.len()), Some(1));
+        assert_eq!(p.caa_id, Some(3827741944));
+        assert_eq!(p.duration, Some(213));
+        assert_eq!(p.track_number, Some(3));
+    }
+
+    /// A listen with no mapping at all still imports — most of anyone's older
+    /// history is un-enriched, and dropping it would be the wrong trade.
+    #[test]
+    fn a_listen_with_no_mapping_still_imports() {
+        let line = r#"{"listened_at":1,"track_metadata":{"track_name":"T","artist_name":"A"}}"#;
+        let p = &parse_listens(line).unwrap()[0];
+        assert!(p.mbid_recording.is_none() && p.caa_id.is_none());
+        assert_eq!(p.title, "T");
     }
 }

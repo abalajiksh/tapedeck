@@ -25,6 +25,9 @@
 		logNeedsTz = false;
 		if (!f) return;
 		// Only the header matters, so read the first slice rather than the file.
+		// A zip starts with PK\x03\x04 and is never a Rockbox log, so skip the
+		// sniffing entirely rather than reading binary as text.
+		if (f.name.toLowerCase().endsWith('.zip')) return;
 		const head = await f.slice(0, 512).text();
 		const isLog = head.split('\n').slice(0, 5).some((l) => l.trim().toUpperCase().startsWith('#AUDIOSCROBBLER'));
 		if (!isLog) return;
@@ -39,7 +42,7 @@
 	const tabs: { v: Src; title: string; sub: string }[] = [
 		{ v: 'listenbrainz', title: 'ListenBrainz', sub: 'Pull via username + token' },
 		{ v: 'lastfm', title: 'Last.fm', sub: 'Pull scrobbles by username' },
-		{ v: 'file', title: 'Upload Export', sub: '.json / .csv from either' }
+		{ v: 'file', title: 'Upload Export', sub: '.zip / .json / .csv / .log' }
 	];
 
 	$: running = job?.state === 'running';
@@ -120,12 +123,18 @@
 		</div>
 	{:else}
 		<h3 class="h-display" style="font-size:19px;margin-bottom:4px;">Upload an export</h3>
-		<p style="font-size:13px;color:var(--td-muted);margin:0 0 18px;">Drop a ListenBrainz <code class="chip">.json</code> dump, a <code class="chip">.csv</code> export, or a Rockbox <code class="chip">.scrobbler.log</code> straight off your DAP.</p>
+		<p style="font-size:13px;color:var(--td-muted);margin:0 0 18px;">
+			Drop the <code class="chip">.zip</code> straight from ListenBrainz's “Export your data”
+			— listens <em>and</em> loved tracks come across, with the MusicBrainz IDs already in it, so
+			nothing has to be looked up again. A single <code class="chip">.json</code>/<code class="chip">.jsonl</code>,
+			a <code class="chip">.csv</code> export, or a Rockbox <code class="chip">.scrobbler.log</code>
+			off your DAP all work too.
+		</p>
 		<label style="display:flex;flex-direction:column;align-items:center;justify-content:center;gap:10px;border:2px dashed rgba(198,113,57,.4);border-radius:18px;padding:34px;cursor:pointer;background:var(--td-surface2);max-width:440px;">
 			<svg viewBox="0 0 24 24" width="30" fill="none" stroke="#c67139" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 16V4"/><path d="M8 8l4-4 4 4"/><path d="M4 20h16"/></svg>
 			<span style="font-size:14px;color:var(--td-nav-fg);font-weight:600;">{file ? file.name : 'Choose a file'}</span>
-			<span style="font-size:12px;color:var(--td-muted-2);">.json, .csv or .log</span>
-			<input type="file" accept=".json,.csv,.log,.txt" on:change={(e) => inspectFile(e.currentTarget.files?.[0] ?? null)} style="display:none;">
+			<span style="font-size:12px;color:var(--td-muted-2);">.zip, .json, .jsonl, .csv or .log</span>
+			<input type="file" accept=".zip,.json,.jsonl,.csv,.log,.txt" on:change={(e) => inspectFile(e.currentTarget.files?.[0] ?? null)} style="display:none;">
 		</label>
 
 		{#if logNeedsTz}
