@@ -5,7 +5,7 @@
 	import { formatDateTime } from '$lib/utils';
 	import { theme, setTheme, type ThemeMode } from '$lib/theme';
 	import { showArtwork, setShowArtwork } from '$lib/prefs';
-	import type { Connection } from '$lib/api';
+	import type { Connection, SignalChain } from '$lib/api';
 	import SourcesPanel from '$lib/components/SourcesPanel.svelte';
 
 	const uiVersion = __UI_VERSION__;
@@ -32,10 +32,12 @@
 	}
 
 	let tokens: TokenInfo[] = [];
+	let chains: SignalChain[] = [];
 	let loading = true;
 	let listenCount = 0;
 
 	let newTokenName = '';
+	let newTokenChain = ''; // '' = no chain; otherwise the chain id as a string
 	let createdToken = '';
 	let tokenCopied = false;
 	let creating = false;
@@ -210,6 +212,9 @@
 			backendVersion = health.version;
 			tokens = tokensRes.tokens;
 		} catch { /* fallback */ }
+		// Chains drive the per-token dropdown; an instance with none simply
+		// doesn't show it, so this failing is not worth surfacing.
+		try { chains = (await api.getChains()).chains; } catch { /* optional */ }
 		try { listenCount = (await api.getDashboardStats()).total; } catch { /* optional */ }
 		try {
 			const prefs = await api.getPreferences();
@@ -233,12 +238,29 @@
 		creating = true;
 		createdToken = '';
 		try {
-			const result = await api.createToken(newTokenName.trim());
+			const result = await api.createToken(newTokenName.trim(), {
+				default_chain_id: newTokenChain ? Number(newTokenChain) : null
+			});
 			createdToken = result.token;
 			newTokenName = '';
+			newTokenChain = '';
 			tokens = (await api.getTokens()).tokens;
 		} catch (e) { console.error('Create token failed:', e); }
 		creating = false;
+	}
+
+	/** Repoint a token at a different chain. Optimistic — the row is the only
+	 *  place this value is shown, so a failure just puts it back. */
+	async function setTokenChain(t: TokenInfo, value: string) {
+		const chain_id = value ? Number(value) : null;
+		const before = t.default_chain_id;
+		tokens = tokens.map((x) => (x.id === t.id ? { ...x, default_chain_id: chain_id } : x));
+		try {
+			await api.updateToken(t.id, { default_chain_id: chain_id });
+		} catch (e) {
+			tokens = tokens.map((x) => (x.id === t.id ? { ...x, default_chain_id: before } : x));
+			alert('Failed to set chain: ' + e);
+		}
 	}
 
 	async function revokeToken(id: number) {
@@ -451,15 +473,24 @@
 					{#if tokens.length}
 						<div style="display:flex;flex-direction:column;gap:8px;margin-bottom:16px;">
 							{#each tokens as t (t.id)}
-								<div style="display:flex;align-items:center;justify-content:space-between;gap:12px;background:var(--td-surface2);border:1px solid var(--td-border);border-radius:14px;padding:12px 16px;">
-									<div style="min-width:0;">
+								<div style="display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;background:var(--td-surface2);border:1px solid var(--td-border);border-radius:14px;padding:12px 16px;">
+									<div style="min-width:0;flex:1;">
 										<div><span style="font-weight:600;font-size:14px;">{t.name}</span> <span style="font-size:10px;letter-spacing:.08em;text-transform:uppercase;color:var(--td-muted-3);margin-left:6px;">{t.scopes}</span></div>
 										<div style="font-size:12px;color:var(--td-muted-2);margin-top:2px;">Created {formatDateTime(t.created_at)} · {t.last_used_at ? `Last used ${formatDateTime(t.last_used_at)}` : 'Never used'}</div>
 									</div>
+									<select class="input" style="width:auto;min-width:170px;font-size:12.5px;" value={t.default_chain_id ?? ''}
+										on:change={(e) => setTokenChain(t, e.currentTarget.value)} aria-label="Default signal chain">
+										<option value="">— no chain —</option>
+										{#each chains as c}<option value={c.id}>{c.name}</option>{/each}
+									</select>
 									<button class="btn btn-secondary" style="font-size:12.5px;color:#b2622d;" on:click={() => revokeToken(t.id)}>Revoke</button>
 								</div>
 							{/each}
 						</div>
+						<p style="font-size:12px;color:var(--td-muted-2);margin:-6px 0 16px;">
+							Changing a chain here takes effect immediately — the token itself doesn't change, so there's nothing to re-paste into the app.
+							{#if !chains.length}<a href="/chains">Create a chain first →</a>{/if}
+						</p>
 					{/if}
 
 					{#if createdToken}
@@ -473,10 +504,20 @@
 					{/if}
 
 					<div style="display:flex;gap:8px;flex-wrap:wrap;">
-						<input class="input" style="flex:1;min-width:180px;" bind:value={newTokenName} placeholder="Token name (e.g. walkman, phone)">
+						<input class="input" style="flex:1;min-width:180px;" bind:value={newTokenName} placeholder="Token name (e.g. fooyin, Pano on Android)">
+						{#if chains.length}
+							<select class="input" style="width:auto;min-width:170px;" bind:value={newTokenChain} aria-label="Default signal chain for the new token">
+								<option value="">— no chain —</option>
+								{#each chains as c}<option value={String(c.id)}>{c.name}</option>{/each}
+							</select>
+						{/if}
 						<button class="btn btn-primary" on:click={createToken} disabled={creating || !newTokenName.trim()}>{creating ? '…' : 'Create'}</button>
 					</div>
-					<p style="font-size:12px;color:var(--td-muted-2);margin:10px 0 0;">Tokens can only submit listens. Reading, editing, and admin actions require signing in here.</p>
+					<p style="font-size:12px;color:var(--td-muted-2);margin:10px 0 0;">
+						One token per app is the idea: give it a chain here and every listen it submits is attributed to that setup, with nothing to configure in the app itself.
+						A listen that carries its own chain, or arrives through a mapped output, still wins.
+					</p>
+					<p style="font-size:12px;color:var(--td-muted-2);margin:8px 0 0;">Tokens can only submit listens. Reading, editing, and admin actions require signing in here.</p>
 				{/if}
 			</div>
 

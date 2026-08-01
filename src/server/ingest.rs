@@ -56,7 +56,7 @@ pub async fn validate_token(
     }
 
     match state.db.validate_token(&token).await {
-        Ok(Some(user)) => (
+        Ok(Some((user, _))) => (
             StatusCode::OK,
             Json(serde_json::json!({
                 "code": 200,
@@ -92,7 +92,7 @@ pub async fn validate_token(
 /// POST /1/submit-listens
 pub async fn submit_listens(
     State(state): State<Arc<AppState>>,
-    IngestAuth(user): IngestAuth,
+    IngestAuth { user, token_chain_id }: IngestAuth,
     Json(body): Json<SubmitListensRequest>,
 ) -> impl IntoResponse {
     let listen_count = body.payload.len();
@@ -243,7 +243,15 @@ pub async fn submit_listens(
         // ── Resolve chain (layered, first match wins) ──
         //   1. explicit chain name from the client
         //   2. output-device binding (auto-learned / user-set)
-        //   3. source device's default chain
+        //   3. the submitting token's default chain
+        //   4. source device's default chain
+        //
+        // The token layer sits below the binding because a binding is evidence
+        // about *this* listen (what it actually came out of) while the token is
+        // a standing assumption about the app. It sits above the device default
+        // because one machine can run several players — a token per app is the
+        // finer-grained statement, and the more deliberate one: you picked the
+        // chain when you issued the token.
         let explicit_chain_name =
             info_ref.and_then(|ai| ai.tapedeck_chain.as_ref()).and_then(|tc| tc.chain_id.as_ref());
         let chain_id: Option<i64> = if let Some(name) = explicit_chain_name {
@@ -263,6 +271,8 @@ pub async fn submit_listens(
             None => None,
         } {
             Some(binding)
+        } else if let Some(tc) = token_chain_id {
+            Some(tc)
         } else if let Some(dev) = device_id {
             state.db.get_device_default_chain(user.user_id, dev).await.ok().flatten()
         } else {

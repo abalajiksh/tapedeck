@@ -57,7 +57,13 @@ impl FromRequestParts<Arc<super::AppState>> for AuthUser {
 /// `IngestAuth` accepts a session cookie **or** an `Authorization: Token` header.
 /// Used by exactly one route — `POST /1/submit-listens` — so a token can
 /// authenticate nowhere else.
-pub struct IngestAuth(pub AuthUser);
+pub struct IngestAuth {
+    pub user: AuthUser,
+    /// The signal chain the authenticating *token* defaults to. `None` for a
+    /// browser session, which has no token and therefore no default. Consumed
+    /// by the ingest chain ladder; every other `IngestAuth` route ignores it.
+    pub token_chain_id: Option<i64>,
+}
 
 #[axum::async_trait]
 impl FromRequestParts<Arc<super::AppState>> for IngestAuth {
@@ -69,7 +75,7 @@ impl FromRequestParts<Arc<super::AppState>> for IngestAuth {
     ) -> Result<Self, Self::Rejection> {
         // 1. Session cookie (browser).
         if let Some(user) = session_user(parts, state).await {
-            return Ok(IngestAuth(user));
+            return Ok(IngestAuth { user, token_chain_id: None });
         }
 
         // 2. Authorization: Token (external scrobble clients).
@@ -81,7 +87,7 @@ impl FromRequestParts<Arc<super::AppState>> for IngestAuth {
             .trim();
         if !token.is_empty() {
             return match state.db.validate_token(token).await {
-                Ok(Some(user)) => Ok(IngestAuth(user)),
+                Ok(Some((user, token_chain_id))) => Ok(IngestAuth { user, token_chain_id }),
                 Ok(None) => Err(unauthorized("Invalid token")),
                 Err(e) => {
                     tracing::error!("Token validation error: {}", e);

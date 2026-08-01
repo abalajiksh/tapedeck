@@ -67,6 +67,17 @@ When a scrobble arrives tagged with a chain, the context propagates
 automatically. The gear choice reflects the intent — respect the gear,
 respect the classification.
 
+Components are picked from your equipment list rather than typed, so a piece of
+gear is one record whichever chains it appears in. A step can still be free text
+for something you don't own.
+
+**You never have to tag a listen by hand.** A chain is resolved per listen, first
+match winning: an explicit chain named by the client, then the output device it
+came out of (auto-learned and mapped once), then **the chain the submitting API
+token defaults to**, then the submitting machine's default. Issuing one token per
+app — `fooyin`, `Pano on Android` — and giving each a chain is the whole setup:
+the app itself needs no Tapedeck-specific configuration.
+
 ### Audio Quality Tracking
 
 Every scrobble can carry audio quality metadata: codec, sample rate, bit depth,
@@ -432,10 +443,10 @@ curl -X POST http://localhost:8080/admin/users \
 curl http://localhost:8080/admin/users \
   -H "Authorization: Token td_your_admin_token"
 
-# Create additional tokens
+# Create additional tokens — one per app, each with the chain it plays through
 curl -X POST http://localhost:8080/admin/tokens \
   -H "Authorization: Token td_your_admin_token" \
-  -d '{"user_id": 2, "name": "walkman"}'
+  -d '{"user_id": 2, "name": "walkman", "default_chain_id": 3}'
 ```
 
 ### Managing Signal Chains
@@ -453,7 +464,7 @@ curl -X POST http://localhost:8080/api/v1/chains \
       {"type": "source", "name": "Fooyin", "detail": "Fedora Sway"},
       {"type": "dac", "name": "Schiit Mimir", "detail": "USB input"},
       {"type": "amp", "name": "Schiit Midgaard"},
-      {"type": "transducer", "name": "Sennheiser HD 650", "detail": "balanced cable"}
+      {"type": "transducer", "name": "Sennheiser HD 650", "equipment_id": 4}
     ]
   }'
 
@@ -545,8 +556,9 @@ means session-only.
 | POST | `/admin/users` | Admin | Create user (returns token) |
 | PATCH | `/admin/users/{id}` | Admin | Change role / reset password |
 | DELETE | `/admin/users/{id}` | Admin | Delete user + all their data |
-| GET | `/admin/tokens` | Session | List your tokens |
-| POST | `/admin/tokens` | Session | Create new token |
+| GET | `/admin/tokens` | Session | List your tokens (with their default chain) |
+| POST | `/admin/tokens` | Session | Create new token (`{name, scopes?, default_chain_id?}`) |
+| PATCH | `/admin/tokens/{id}` | Session | Rename or repoint a token (`{name?, default_chain_id?}`) |
 | DELETE | `/admin/tokens/{id}` | Session | Revoke a token |
 
 ### Auth
@@ -622,6 +634,7 @@ A note target is one of: `entity_id`, `scrobble_id`, `from_scrobble` + `kind`
 | PATCH | `/api/v1/chains/{id}` | Session | Update a chain |
 | DELETE | `/api/v1/chains/{id}` | Session | Delete a chain (unlinks listens, keeps them) |
 | GET | `/api/v1/devices` | Session | List auto-discovered devices |
+| PATCH | `/api/v1/devices/{id}` | Session | Set/clear a device's default chain (`{chain_id}`) |
 | GET | `/api/v1/equipment` | Session | List equipment with usage hours |
 | POST | `/api/v1/equipment` | Session | Register equipment |
 | PATCH | `/api/v1/equipment/{id}` | Session | Update equipment |

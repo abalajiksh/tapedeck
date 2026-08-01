@@ -161,6 +161,13 @@ pub struct ChainComponent {
     pub component_type: ComponentType,
     pub name: String,
     pub detail: Option<String>,
+    /// The `equipment` row this step *is*, when it was picked from the user's
+    /// gear rather than typed. Optional on purpose: a chain can name something
+    /// you don't own (a friend's amp, a rental) and old chains predate the link
+    /// entirely. `name` stays a snapshot so a deleted gear row leaves the chain
+    /// readable instead of blank.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub equipment_id: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

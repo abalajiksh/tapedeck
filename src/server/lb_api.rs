@@ -150,7 +150,7 @@ pub struct ListensQuery {
 /// GET /1/user/:user/listens
 async fn user_listens(
     State(state): State<Arc<AppState>>,
-    IngestAuth(caller): IngestAuth,
+    IngestAuth { user: caller, .. }: IngestAuth,
     Path(user): Path<String>,
     Query(q): Query<ListensQuery>,
 ) -> impl IntoResponse {
@@ -191,7 +191,7 @@ async fn user_listens(
 /// GET /1/user/:user/playing-now
 async fn user_playing_now(
     State(state): State<Arc<AppState>>,
-    IngestAuth(caller): IngestAuth,
+    IngestAuth { user: caller, .. }: IngestAuth,
     Path(user): Path<String>,
 ) -> impl IntoResponse {
     let user_id = match authorize_for(&state, &caller, &user).await {
@@ -237,7 +237,7 @@ async fn user_playing_now(
 /// GET /1/user/:user/listen-count
 async fn user_listen_count(
     State(state): State<Arc<AppState>>,
-    IngestAuth(caller): IngestAuth,
+    IngestAuth { user: caller, .. }: IngestAuth,
     Path(user): Path<String>,
 ) -> impl IntoResponse {
     let user_id = match authorize_for(&state, &caller, &user).await {
@@ -259,7 +259,7 @@ async fn user_listen_count(
 /// GET /1/user/:user/services — which scrobble services this user has connected.
 async fn user_services(
     State(state): State<Arc<AppState>>,
-    IngestAuth(caller): IngestAuth,
+    IngestAuth { user: caller, .. }: IngestAuth,
     Path(user): Path<String>,
 ) -> impl IntoResponse {
     let user_id = match authorize_for(&state, &caller, &user).await {
@@ -284,7 +284,7 @@ async fn user_services(
 /// POST /1/playing-now/delete — stop reporting this user as playing.
 async fn playing_now_delete(
     State(state): State<Arc<AppState>>,
-    IngestAuth(caller): IngestAuth,
+    IngestAuth { user: caller, .. }: IngestAuth,
 ) -> impl IntoResponse {
     state.now_playing.clear_user(caller.user_id);
     (StatusCode::OK, Json(serde_json::json!({ "status": "ok" }))).into_response()
@@ -304,7 +304,7 @@ pub struct LatestImportQuery {
 /// GET /1/latest-import?user_name=…
 async fn get_latest_import(
     State(state): State<Arc<AppState>>,
-    IngestAuth(caller): IngestAuth,
+    IngestAuth { user: caller, .. }: IngestAuth,
     Query(q): Query<LatestImportQuery>,
 ) -> impl IntoResponse {
     let user = q.user_name.unwrap_or_else(|| caller.username.clone());
@@ -336,7 +336,7 @@ pub struct LatestImportBody {
 /// POST /1/latest-import — body `{"ts": <unix seconds>}`, always the caller's own.
 async fn set_latest_import(
     State(state): State<Arc<AppState>>,
-    IngestAuth(caller): IngestAuth,
+    IngestAuth { user: caller, .. }: IngestAuth,
     Json(body): Json<LatestImportBody>,
 ) -> impl IntoResponse {
     if body.ts < 0 {

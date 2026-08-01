@@ -311,7 +311,8 @@ impl Database {
                 scopes TEXT DEFAULT 'submit',
                 created_at INTEGER NOT NULL,
                 last_used_at INTEGER,
-                expires_at INTEGER
+                expires_at INTEGER,
+                default_chain_id INTEGER REFERENCES signal_chains(id)
             )",
         )
         .execute(&self.pool)
@@ -796,6 +797,19 @@ impl Database {
             let _ = sqlx::query("ALTER TABLE scrobbles ADD COLUMN release_year INTEGER")
                 .execute(&self.pool)
                 .await;
+        }
+
+        // Migration: a token's default signal chain. One token per app ("Pano
+        // on Android", "fooyin") is how people actually organise these, so the
+        // token is the natural place to say what the listens through it came
+        // out of — no client-side config, nothing to type per listen.
+        if !has_column(&self.pool, "tokens", "default_chain_id").await {
+            info!("⚙️ Migrating: adding tokens.default_chain_id...");
+            let _ = sqlx::query(
+                "ALTER TABLE tokens ADD COLUMN default_chain_id INTEGER REFERENCES signal_chains(id)",
+            )
+            .execute(&self.pool)
+            .await;
         }
 
         Ok(())
@@ -1931,6 +1945,23 @@ impl Database {
                 .fetch_optional(&self.pool)
                 .await?;
         Ok(row.and_then(|(c,)| c))
+    }
+
+    /// Point a source device at a chain (or clear it with `None`).
+    pub async fn set_device_default_chain(
+        &self,
+        user_id: i64,
+        device_id: i64,
+        chain_id: Option<i64>,
+    ) -> Result<bool, sqlx::Error> {
+        let result =
+            sqlx::query("UPDATE devices SET default_chain_id = ? WHERE id = ? AND user_id = ?")
+                .bind(chain_id)
+                .bind(device_id)
+                .bind(user_id)
+                .execute(&self.pool)
+                .await?;
+        Ok(result.rows_affected() > 0)
     }
 
     pub async fn update_chain(
@@ -3172,21 +3203,28 @@ impl Database {
         std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64
     }
 
-    pub async fn validate_token(&self, token: &str) -> Result<Option<AuthUser>, sqlx::Error> {
+    /// Resolve a raw API token to its owner **and** the signal chain that token
+    /// defaults to. The chain rides along because the ingest path needs it on
+    /// every submission and this is already the one query that touches the row.
+    pub async fn validate_token(
+        &self,
+        token: &str,
+    ) -> Result<Option<(AuthUser, Option<i64>)>, sqlx::Error> {
         let token_hash = Self::hash_token(token);
         let now = Self::now_secs();
-        let row: Option<(i64, String, String)> = sqlx::query_as(
-            "SELECT u.id, u.username, u.role FROM tokens t JOIN users u ON t.user_id = u.id
+        let row: Option<(i64, String, String, Option<i64>)> = sqlx::query_as(
+            "SELECT u.id, u.username, u.role, t.default_chain_id
+             FROM tokens t JOIN users u ON t.user_id = u.id
              WHERE t.token_hash = ? AND (t.expires_at IS NULL OR t.expires_at > ?) AND u.disabled = 0"
         ).bind(&token_hash).bind(now).fetch_optional(&self.pool).await?;
 
-        if let Some((user_id, username, role)) = row {
+        if let Some((user_id, username, role, default_chain_id)) = row {
             let _ = sqlx::query("UPDATE tokens SET last_used_at = ? WHERE token_hash = ?")
                 .bind(now)
                 .bind(&token_hash)
                 .execute(&self.pool)
                 .await;
-            Ok(Some(AuthUser { user_id, username, is_admin: role == "admin" }))
+            Ok(Some((AuthUser { user_id, username, is_admin: role == "admin" }, default_chain_id)))
         } else {
             Ok(None)
         }
@@ -3311,17 +3349,41 @@ impl Database {
         user_id: i64,
         name: &str,
         scopes: &str,
+        default_chain_id: Option<i64>,
     ) -> Result<String, sqlx::Error> {
         use rand::Rng;
         let raw: [u8; 24] = rand::rng().random();
         let token = format!("td_{}", hex::encode(raw));
         let token_hash = Self::hash_token(&token);
         let now = Self::now_secs();
-        sqlx::query("INSERT INTO tokens (user_id, token_hash, name, scopes, created_at) VALUES (?, ?, ?, ?, ?)")
+        sqlx::query("INSERT INTO tokens (user_id, token_hash, name, scopes, created_at, default_chain_id) VALUES (?, ?, ?, ?, ?, ?)")
             .bind(user_id).bind(&token_hash).bind(name).bind(scopes).bind(now)
+            .bind(default_chain_id)
             .execute(&self.pool).await?;
         info!("🔑 Created token '{}' for user_id {}", name, user_id);
         Ok(token)
+    }
+
+    /// Rename a token or repoint its default chain. The token itself is never
+    /// re-issued — the whole point is that you can fix the chain after the fact
+    /// without touching the client you already pasted it into.
+    pub async fn update_token(
+        &self,
+        user_id: i64,
+        token_id: i64,
+        name: &str,
+        default_chain_id: Option<i64>,
+    ) -> Result<bool, sqlx::Error> {
+        let result = sqlx::query(
+            "UPDATE tokens SET name = ?, default_chain_id = ? WHERE id = ? AND user_id = ?",
+        )
+        .bind(name)
+        .bind(default_chain_id)
+        .bind(token_id)
+        .bind(user_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() > 0)
     }
 
     pub async fn delete_token(&self, user_id: i64, token_id: i64) -> Result<bool, sqlx::Error> {
@@ -3345,8 +3407,15 @@ impl Database {
     }
 
     pub async fn list_tokens(&self, user_id: i64) -> Result<Vec<TokenRecord>, sqlx::Error> {
-        sqlx::query_as("SELECT id, name, scopes, created_at, last_used_at FROM tokens WHERE user_id = ? ORDER BY created_at ASC")
-            .bind(user_id).fetch_all(&self.pool).await
+        sqlx::query_as(
+            "SELECT t.id, t.name, t.scopes, t.created_at, t.last_used_at, t.default_chain_id,
+                    c.name AS default_chain_name
+             FROM tokens t LEFT JOIN signal_chains c ON c.id = t.default_chain_id
+             WHERE t.user_id = ? ORDER BY t.created_at ASC",
+        )
+        .bind(user_id)
+        .fetch_all(&self.pool)
+        .await
     }
 }
 
@@ -3371,6 +3440,9 @@ pub struct TokenRecord {
     pub scopes: String,
     pub created_at: i64,
     pub last_used_at: Option<i64>,
+    pub default_chain_id: Option<i64>,
+    /// Joined for display so the token list doesn't need a second round-trip.
+    pub default_chain_name: Option<String>,
 }
 
 #[derive(Debug, FromRow)]
@@ -3546,12 +3618,49 @@ mod tests {
         assert_eq!(rows.iter().filter(|r| r.chain_id == Some(cid)).count(), 1);
     }
 
+    /// A token per app, each with its own chain, is the whole point of
+    /// `default_chain_id` — so validating a token must hand back the chain in
+    /// the same breath as the identity, and editing must not re-issue it.
+    #[tokio::test]
+    async fn a_token_carries_its_default_chain_and_keeps_working_after_an_edit() {
+        let db = testdb().await;
+        let uid = db.create_user("erin", None, "x", "user").await.unwrap();
+        let mk = |name: &str| SignalChain {
+            id: None,
+            user_id: uid,
+            name: name.into(),
+            description: None,
+            components: vec![],
+            listening_context: ListeningContext::Active,
+            is_active: true,
+            total_hours: 0.0,
+            created_at: 0,
+        };
+        let desk = db.create_chain(&mk("Desk")).await.unwrap();
+        let couch = db.create_chain(&mk("Couch")).await.unwrap();
+
+        let token = db.create_token(uid, "fooyin", "submit", Some(desk)).await.unwrap();
+        assert_eq!(db.validate_token(&token).await.unwrap().unwrap().1, Some(desk));
+
+        let id = db.list_tokens(uid).await.unwrap()[0].id;
+        assert!(db.update_token(uid, id, "fooyin", Some(couch)).await.unwrap());
+        // Same token string, new chain — nothing to re-paste into the client.
+        assert_eq!(db.validate_token(&token).await.unwrap().unwrap().1, Some(couch));
+
+        assert!(db.update_token(uid, id, "fooyin", None).await.unwrap());
+        assert_eq!(db.validate_token(&token).await.unwrap().unwrap().1, None);
+
+        // Someone else's token id is not editable.
+        let other = db.create_user("frank", None, "x", "user").await.unwrap();
+        assert!(!db.update_token(other, id, "stolen", Some(desk)).await.unwrap());
+    }
+
     #[tokio::test]
     async fn disabled_user_cannot_authenticate_by_password_token_or_session() {
         let db = testdb().await;
         let hash = Database::hash_password("password123").unwrap();
         let uid = db.create_user("carol", None, &hash, "user").await.unwrap();
-        let token = db.create_token(uid, "t", "submit").await.unwrap();
+        let token = db.create_token(uid, "t", "submit", None).await.unwrap();
         let session = db.create_web_session(uid).await.unwrap();
 
         // enabled: all three work
@@ -3584,7 +3693,7 @@ mod tests {
         db.save_scrobble(uid, &play("s", "a", 5), None, None, None, None, None, None)
             .await
             .unwrap();
-        db.create_token(uid, "t", "submit").await.unwrap();
+        db.create_token(uid, "t", "submit", None).await.unwrap();
         // A connection has an FK to users — deletion must clear it, or the whole
         // cascade rolls back (the bug this guards against).
         db.set_connection(uid, "listenbrainz", r#"{"token":"secret"}"#, Some("dave"))

@@ -2,7 +2,7 @@ use axum::{
     extract::{ConnectInfo, Path, State},
     http::{header, HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Json},
-    routing::{delete, get, post},
+    routing::{get, post},
     Router,
 };
 use serde::{Deserialize, Serialize};
@@ -170,7 +170,7 @@ async fn setup(
     };
 
     // Create a default API token
-    let token = match state.db.create_token(user_id, "default", "submit,read,admin").await {
+    let token = match state.db.create_token(user_id, "default", "submit,read,admin", None).await {
         Ok(t) => t,
         Err(e) => {
             return (
@@ -411,7 +411,7 @@ async fn create_user(
         }
     };
 
-    let token = match state.db.create_token(user_id, "default", "submit").await {
+    let token = match state.db.create_token(user_id, "default", "submit", None).await {
         Ok(t) => t,
         Err(e) => {
             return (
@@ -639,6 +639,10 @@ pub struct CreateTokenRequest {
     pub name: String,
     #[serde(default = "default_scopes")]
     pub scopes: String,
+    /// The chain every listen submitted with this token is attributed to,
+    /// unless the listen carries better evidence. Optional — a token with no
+    /// chain behaves exactly as before.
+    pub default_chain_id: Option<i64>,
 }
 
 fn default_scopes() -> String {
@@ -674,7 +678,20 @@ async fn create_token(
         )
             .into_response();
     }
-    match state.db.create_token(target_user_id, body.name.trim(), &body.scopes).await {
+    // A chain id from the request body is user input: check it belongs to the
+    // token's owner, or a token could be pointed at someone else's chain.
+    if let Some(cid) = body.default_chain_id {
+        match state.db.get_chain(target_user_id, cid).await {
+            Ok(Some(_)) => {}
+            _ => return chain_not_found(),
+        }
+    }
+
+    match state
+        .db
+        .create_token(target_user_id, body.name.trim(), &body.scopes, body.default_chain_id)
+        .await
+    {
         Ok(token) => (
             StatusCode::CREATED,
             Json(serde_json::json!(CreateTokenResponse {
@@ -691,6 +708,96 @@ async fn create_token(
                 code: 500,
                 error: format!("Failed to create token: {}", e)
             })),
+        )
+            .into_response(),
+    }
+}
+
+fn chain_not_found() -> axum::response::Response {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(serde_json::json!(ErrorResponse { code: 400, error: "Unknown signal chain".into() })),
+    )
+        .into_response()
+}
+
+#[derive(Deserialize)]
+pub struct UpdateTokenRequest {
+    pub name: Option<String>,
+    /// Present-and-null clears the chain; absent leaves it alone. Serde can't
+    /// tell those apart on a plain `Option`, so this is a nested one.
+    #[serde(default, deserialize_with = "double_option")]
+    pub default_chain_id: Option<Option<i64>>,
+}
+
+fn double_option<'de, D>(de: D) -> Result<Option<Option<i64>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<i64>::deserialize(de).map(Some)
+}
+
+/// Rename a token or repoint its chain, without re-issuing it — so fixing the
+/// chain doesn't mean editing config in the client you already set up.
+async fn update_token(
+    State(state): State<Arc<AppState>>,
+    user: AuthUser,
+    Path(token_id): Path<i64>,
+    Json(body): Json<UpdateTokenRequest>,
+) -> impl IntoResponse {
+    let existing = match state.db.list_tokens(user.user_id).await {
+        Ok(tokens) => tokens.into_iter().find(|t| t.id == token_id),
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!(ErrorResponse { code: 500, error: e.to_string() })),
+            )
+                .into_response()
+        }
+    };
+    let Some(existing) = existing else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!(ErrorResponse { code: 404, error: "Token not found".into() })),
+        )
+            .into_response();
+    };
+
+    let name = match body.name.as_deref().map(str::trim) {
+        Some("") => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!(ErrorResponse {
+                    code: 400,
+                    error: "Token name cannot be empty".into()
+                })),
+            )
+                .into_response()
+        }
+        Some(n) => n.to_string(),
+        None => existing.name.clone(),
+    };
+    let chain_id = body.default_chain_id.unwrap_or(existing.default_chain_id);
+
+    if let Some(cid) = chain_id {
+        match state.db.get_chain(user.user_id, cid).await {
+            Ok(Some(_)) => {}
+            _ => return chain_not_found(),
+        }
+    }
+
+    match state.db.update_token(user.user_id, token_id, &name, chain_id).await {
+        Ok(true) => {
+            (StatusCode::OK, Json(serde_json::json!({ "status": "updated" }))).into_response()
+        }
+        Ok(false) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!(ErrorResponse { code: 404, error: "Token not found".into() })),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!(ErrorResponse { code: 500, error: e.to_string() })),
         )
             .into_response(),
     }
@@ -794,6 +901,6 @@ pub fn create_user_management_router() -> Router<Arc<AppState>> {
         .route("/admin/users", post(create_user).get(list_users))
         .route("/admin/users/:id", patch(update_user).delete(delete_user))
         .route("/admin/tokens", post(create_token).get(list_tokens))
-        .route("/admin/tokens/:id", delete(revoke_token))
+        .route("/admin/tokens/:id", patch(update_token).delete(revoke_token))
         .route("/log-level", get(get_log_level).post(set_log_level))
 }

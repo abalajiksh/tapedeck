@@ -168,6 +168,49 @@ async fn list_devices(State(state): State<Arc<AppState>>, user: AuthUser) -> imp
     }
 }
 
+#[derive(Deserialize)]
+pub struct SetDeviceChainRequest {
+    pub chain_id: Option<i64>, // null clears it
+}
+
+/// Point a submitting device at a chain. The lowest rung of the resolution
+/// ladder in `ingest.rs`, and until now the only one with no UI to set it.
+async fn set_device_chain(
+    State(state): State<Arc<AppState>>,
+    user: AuthUser,
+    Path(id): Path<i64>,
+    Json(body): Json<SetDeviceChainRequest>,
+) -> impl IntoResponse {
+    if let Some(cid) = body.chain_id {
+        match state.db.get_chain(user.user_id, cid).await {
+            Ok(Some(_)) => {}
+            _ => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!(ErrorResponse {
+                        code: 400,
+                        error: "Unknown signal chain".into()
+                    })),
+                )
+                    .into_response()
+            }
+        }
+    }
+    match state.db.set_device_default_chain(user.user_id, id, body.chain_id).await {
+        Ok(true) => (StatusCode::OK, Json(serde_json::json!({ "status": "ok" }))).into_response(),
+        Ok(false) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!(ErrorResponse { code: 404, error: "Device not found".into() })),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!(ErrorResponse { code: 500, error: e.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
 // ── Equipment endpoints ──
 
 #[derive(Deserialize)]
@@ -344,6 +387,7 @@ pub fn create_gear_router() -> Router<Arc<AppState>> {
         .route("/api/v1/chains", post(create_chain).get(list_chains))
         .route("/api/v1/chains/:id", get(get_chain).patch(update_chain).delete(delete_chain))
         .route("/api/v1/devices", get(list_devices))
+        .route("/api/v1/devices/:id", patch(set_device_chain))
         .route("/api/v1/equipment", post(create_equipment).get(list_equipment))
         .route("/api/v1/equipment/:id", patch(update_equipment).delete(delete_equipment))
         .route("/api/v1/bindings", get(list_bindings).put(set_binding))

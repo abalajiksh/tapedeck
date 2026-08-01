@@ -101,6 +101,9 @@ export interface ChainComponent {
 	type: string;
 	name: string;
 	detail: string | null;
+	/** The `Equipment` row this step is, when picked from your gear. `name` is
+	 *  kept as a snapshot so the chain still reads if the gear is deleted. */
+	equipment_id?: number | null;
 }
 
 export interface ChainInput {
@@ -139,6 +142,8 @@ export interface Device {
 	name: string | null;
 	platform: string | null;
 	product: string | null;
+	device_type: string | null;
+	default_chain_id: number | null;
 	total_listens: number;
 	last_seen: number;
 }
@@ -330,6 +335,10 @@ export interface TokenInfo {
 	scopes: string;
 	created_at: number;
 	last_used_at: number | null;
+	/** Listens submitted with this token attribute here unless the listen
+	 *  itself says otherwise. One token per app is the intended use. */
+	default_chain_id: number | null;
+	default_chain_name: string | null;
 }
 
 class TapedeckAPI {
@@ -554,6 +563,9 @@ class TapedeckAPI {
 
 	// ── Devices & Equipment ──
 	async getDevices(): Promise<{ devices: Device[] }> { return this.get('/api/v1/devices'); }
+	async setDeviceChain(id: number, chain_id: number | null): Promise<void> {
+		await this.patch(`/api/v1/devices/${id}`, { chain_id });
+	}
 	async getEquipment(): Promise<{ equipment: Equipment[] }> { return this.get('/api/v1/equipment'); }
 	async createEquipment(data: EquipmentInput): Promise<{ id: number }> {
 		return this.post('/api/v1/equipment', data);
@@ -627,8 +639,16 @@ class TapedeckAPI {
 
 	// ── Tokens ──
 	async getTokens(): Promise<{ tokens: TokenInfo[] }> { return this.get('/admin/tokens'); }
-	async createToken(name: string, scopes?: string): Promise<{ token: string; name: string; user_id: number; message: string }> {
-		return this.post('/admin/tokens', { name, scopes: scopes ?? 'submit' });
+	async createToken(name: string, opts?: { scopes?: string; default_chain_id?: number | null }): Promise<{ token: string; name: string; user_id: number; message: string }> {
+		return this.post('/admin/tokens', {
+			name,
+			scopes: opts?.scopes ?? 'submit',
+			default_chain_id: opts?.default_chain_id ?? null
+		});
+	}
+	/** Rename a token or repoint its chain. The token itself is not re-issued. */
+	async updateToken(id: number, data: { name?: string; default_chain_id?: number | null }): Promise<void> {
+		await this.patch(`/admin/tokens/${id}`, data);
 	}
 	async revokeToken(id: number): Promise<void> { await this.del(`/admin/tokens/${id}`); }
 }
