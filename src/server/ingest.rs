@@ -56,13 +56,13 @@ pub async fn validate_token(
     }
 
     match state.db.validate_token(&token).await {
-        Ok(Some((user, _))) => (
+        Ok(Some(t)) => (
             StatusCode::OK,
             Json(serde_json::json!({
                 "code": 200,
                 "message": "Token valid.",
                 "valid": true,
-                "user_name": user.username,
+                "user_name": t.user.username,
             })),
         )
             .into_response(),
@@ -92,7 +92,7 @@ pub async fn validate_token(
 /// POST /1/submit-listens
 pub async fn submit_listens(
     State(state): State<Arc<AppState>>,
-    IngestAuth { user, token_chain_id }: IngestAuth,
+    IngestAuth { user, token_chain_id, token_id }: IngestAuth,
     Json(body): Json<SubmitListensRequest>,
 ) -> impl IntoResponse {
     let listen_count = body.payload.len();
@@ -345,6 +345,7 @@ pub async fn submit_listens(
                                 quality.quality_score,
                                 listening_context.as_deref().unwrap_or("unknown"),
                                 1800,
+                                token_id,
                             )
                             .await;
 

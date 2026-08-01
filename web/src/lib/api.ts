@@ -363,6 +363,16 @@ export interface StatCard {
 	tone: 'plain' | 'dark';
 }
 
+/** Prose from the description chain. `text` null means every provider was
+ *  asked and none had anything — a tombstone, not a pending fetch.
+ *  `attribution` is **mandatory to display** when present (Last.fm is CC BY-SA). */
+export interface BioBlock {
+	text: string | null;
+	attribution: string | null;
+	provider: string | null;
+	url: string | null;
+}
+
 export interface AlbumView {
 	id: number;
 	title: string;
@@ -378,6 +388,7 @@ export interface AlbumView {
 	caa_id: number | null;
 	caa_release_mbid: string | null;
 	loved: boolean;
+	bio: BioBlock;
 	stats: StatCard[];
 	tracks: TrackAggregate[];
 	more: AlbumAggregate[];
@@ -393,10 +404,28 @@ export interface ArtistView {
 	album_count: number;
 	track_count: number;
 	loved: boolean;
+	bio: BioBlock;
 	stats: StatCard[];
 	albums: AlbumAggregate[];
 	top_tracks: TrackAggregate[];
 	trend: { label: string; value: number }[];
+}
+
+export interface SanitizePreview {
+	/** Albums whose listens disagree about which release they are. */
+	mixed_albums: {
+		artist: string; album: string; plays: number;
+		variants: number; winner: string | null; winner_plays: number;
+	}[];
+	/** `Artist feat. X` strings that fragment an album or artist page. */
+	featured_artists: { artist: string; primary: string; plays: number }[];
+}
+
+export interface SanitizeResult {
+	albums_fixed: number;
+	album_listens_changed: number;
+	artists_folded: number;
+	artist_listens_changed: number;
 }
 
 export interface SearchResults {
@@ -639,6 +668,12 @@ class TapedeckAPI {
 	async deleteChain(id: number): Promise<void> { return this.delNoBody(`/api/v1/chains/${id}`); }
 
 	// ── Devices & Equipment ──
+	// ── Metadata sanitiser ──
+	async sanitizePreview(): Promise<SanitizePreview> { return this.get('/api/v1/sanitize'); }
+	async sanitizeApply(opts: { albums?: boolean; artists?: boolean; artist?: string; album?: string }): Promise<SanitizeResult> {
+		return this.post('/api/v1/sanitize', opts);
+	}
+
 	// ── Search ──
 	async search(q: string, limit = 10): Promise<SearchResults> {
 		return this.get(`/api/v1/search?q=${encodeURIComponent(q)}&limit=${limit}`);

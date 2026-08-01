@@ -45,6 +45,32 @@
 	let healthStatus = '';
 	let checking = false;
 
+	// ── Metadata sanitiser ──
+	// Preview first, always. Scrobble metadata that came from a real MusicBrainz
+	// mapping is still data; rewriting it without showing what changes would be
+	// a worse failure than the mismatch being fixed.
+	let sanitize: import('$lib/api').SanitizePreview | null = null;
+	let sanitizing = false;
+	let sanitizeMsg = '';
+	let fixAlbums = true;
+	let fixArtists = true;
+
+	async function loadSanitize() {
+		try { sanitize = await api.sanitizePreview(); } catch { sanitize = null; }
+	}
+	async function runSanitize() {
+		sanitizing = true;
+		sanitizeMsg = '';
+		try {
+			const r = await api.sanitizeApply({ albums: fixAlbums, artists: fixArtists });
+			sanitizeMsg = `Fixed ${r.albums_fixed} album${r.albums_fixed === 1 ? '' : 's'} (${r.album_listens_changed} listens) and folded ${r.artists_folded} artist credit${r.artists_folded === 1 ? '' : 's'} (${r.artist_listens_changed} listens). Artwork will re-resolve in the background.`;
+			await loadSanitize();
+		} catch (e) {
+			sanitizeMsg = 'Failed: ' + e;
+		}
+		sanitizing = false;
+	}
+
 	let confirmClear = false;
 	let clearing = false;
 	let exportMsg = '';
@@ -222,6 +248,7 @@
 		} catch { timezone = 'UTC'; }
 		try { isAdmin = (await api.me()).is_admin; } catch { /* optional */ }
 		loadArtStatus();
+		loadSanitize();
 		loadConnections();
 		loadLangStatus();
 		loading = false;
@@ -556,6 +583,68 @@
 		{/if}
 
 		{#if section === 'maintenance'}
+			<div class="panel" style="border-radius:22px;padding:24px;margin-bottom:18px;">
+				<h3 class="h-display" style="font-size:19px;margin-bottom:4px;">Metadata Sanitiser</h3>
+				<p style="font-size:13px;color:var(--td-muted);margin:0 0 16px;">
+					Scrobble clients tag each track on its own, so one song from an album routinely arrives
+					carrying a compilation's release — wrong cover, and it drops out of the album's stats.
+					This finds those and puts them back on the release the rest of the album agrees on.
+				</p>
+
+				{#if sanitize}
+					{#if sanitize.mixed_albums.length || sanitize.featured_artists.length}
+						<div style="display:flex;flex-direction:column;gap:14px;margin-bottom:16px;">
+							{#if sanitize.mixed_albums.length}
+								<div>
+									<label style="display:flex;align-items:center;gap:9px;cursor:pointer;font-size:14px;font-weight:600;">
+										<input type="checkbox" bind:checked={fixAlbums} style="width:16px;height:16px;accent-color:var(--td-accent);cursor:pointer;">
+										{sanitize.mixed_albums.length} album{sanitize.mixed_albums.length === 1 ? '' : 's'} with mixed releases
+									</label>
+									<div style="margin:8px 0 0 25px;font-size:12.5px;color:var(--td-muted-2);display:flex;flex-direction:column;gap:4px;">
+										{#each sanitize.mixed_albums.slice(0, 6) as a}
+											<div>{a.album} — {a.artist} <span style="color:var(--td-muted-3);">· {a.variants} releases across {a.plays} plays</span></div>
+										{/each}
+										{#if sanitize.mixed_albums.length > 6}
+											<div style="color:var(--td-muted-3);">…and {sanitize.mixed_albums.length - 6} more</div>
+										{/if}
+									</div>
+								</div>
+							{/if}
+							{#if sanitize.featured_artists.length}
+								<div>
+									<label style="display:flex;align-items:center;gap:9px;cursor:pointer;font-size:14px;font-weight:600;">
+										<input type="checkbox" bind:checked={fixArtists} style="width:16px;height:16px;accent-color:var(--td-accent);cursor:pointer;">
+										{sanitize.featured_artists.length} featured credit{sanitize.featured_artists.length === 1 ? '' : 's'} splitting an artist
+									</label>
+									<div style="margin:8px 0 0 25px;font-size:12.5px;color:var(--td-muted-2);display:flex;flex-direction:column;gap:4px;">
+										{#each sanitize.featured_artists.slice(0, 6) as a}
+											<div>{a.artist} <span style="color:var(--td-muted-3);">→ {a.primary} · {a.plays} plays</span></div>
+										{/each}
+										{#if sanitize.featured_artists.length > 6}
+											<div style="color:var(--td-muted-3);">…and {sanitize.featured_artists.length - 6} more</div>
+										{/if}
+									</div>
+									<p style="margin:8px 0 0 25px;font-size:12px;color:var(--td-muted-3);">
+										The full credit is kept, so the featured performer isn't lost — it just stops
+										fragmenting the album and artist pages. Names joined by “&amp;” or “,” are left alone.
+									</p>
+								</div>
+							{/if}
+						</div>
+						<button class="btn btn-primary" on:click={runSanitize} disabled={sanitizing || (!fixAlbums && !fixArtists)}>
+							{sanitizing ? 'Sanitising…' : 'Apply fixes'}
+						</button>
+					{:else}
+						<p style="font-size:14px;color:var(--td-muted);margin:0;">Nothing to fix — every album agrees with itself.</p>
+					{/if}
+				{:else}
+					<p style="font-size:14px;color:var(--td-muted);margin:0;">Checking…</p>
+				{/if}
+				{#if sanitizeMsg}
+					<p style="font-size:13px;color:var(--td-good-fg);margin:12px 0 0;">{sanitizeMsg}</p>
+				{/if}
+			</div>
+
 			<div class="panel" style="border-radius:22px;padding:24px;margin-bottom:18px;">
 				<h3 class="h-display" style="font-size:19px;margin-bottom:4px;">Album Art</h3>
 				<p style="font-size:13px;color:var(--td-muted);margin:0 0 16px;">

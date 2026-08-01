@@ -76,6 +76,70 @@ fn year_and_day(ts: Option<i64>) -> (String, String) {
     }
 }
 
+/// How long a cached description is trusted before it is re-asked. Descriptions
+/// change on the order of years; a tombstone is worth re-checking eventually
+/// because coverage grows, but not often.
+const BIO_TTL_SECS: i64 = 30 * 24 * 60 * 60;
+
+/// The cached description for an entity, fetching it if we've never asked (or
+/// haven't asked in a month).
+///
+/// Providers are only ever called from here — never from the browser. The
+/// attribution rides with the text because Last.fm's is CC BY-SA and showing
+/// one without the other breaks the licence.
+async fn bio_for(
+    state: &Arc<AppState>,
+    entity_id: i64,
+    kind: crate::metadata::bio::BioKind,
+    name: &str,
+    artist: &str,
+    mbid: Option<&str>,
+) -> serde_json::Value {
+    use crate::metadata::bio::{fetch_bio, BioQuery};
+
+    let now = chrono::Utc::now().timestamp();
+    if let Ok(Some(row)) = state.db.get_bio(entity_id).await {
+        if now - row.fetched_at < BIO_TTL_SECS {
+            return serde_json::json!({
+                "text": row.bio,
+                "attribution": row.attribution,
+                "provider": row.provider,
+                "url": row.url,
+            });
+        }
+    }
+
+    let q = BioQuery {
+        kind,
+        name: name.to_string(),
+        artist: artist.to_string(),
+        mbid: mbid.map(str::to_string),
+    };
+    let found = fetch_bio(&state.bio_providers, &q).await;
+
+    // Written either way: `None` is the tombstone that stops us asking again.
+    let _ = state
+        .db
+        .set_bio(
+            entity_id,
+            found.as_ref().map(|b| b.text.as_str()),
+            found.as_ref().and_then(|b| b.attribution.as_deref()),
+            found.as_ref().map(|b| b.provider),
+            found.as_ref().and_then(|b| b.url.as_deref()),
+        )
+        .await;
+
+    match found {
+        Some(b) => serde_json::json!({
+            "text": b.text, "attribution": b.attribution,
+            "provider": b.provider, "url": b.url,
+        }),
+        None => serde_json::json!({
+            "text": null, "attribution": null, "provider": null, "url": null,
+        }),
+    }
+}
+
 // ── GET /api/v1/albums/:id ──
 
 async fn album_detail(
@@ -105,6 +169,15 @@ async fn album_detail(
     let artist_entity_id = state.db.upsert_entity("artist", &artist, "", None).await.ok();
 
     let loved = state.db.is_loved(user.user_id, id).await.unwrap_or(false);
+    let bio = bio_for(
+        &state,
+        id,
+        crate::metadata::bio::BioKind::Album,
+        &album,
+        &artist,
+        entity.mbid.as_deref(),
+    )
+    .await;
 
     // A record with no plays is still a real page — it just has zeroes on it.
     // Falling through to a 404 would be wrong for something you annotated once
@@ -161,6 +234,7 @@ async fn album_detail(
             "caa_id": artwork.as_ref().and_then(|a| a.1),
             "caa_release_mbid": artwork.as_ref().and_then(|a| a.2.clone()),
             "loved": loved,
+            "bio": bio,
             "stats": stats,
             "tracks": tracks,
             "more": more,
@@ -195,6 +269,15 @@ async fn artist_detail(
     let (rank, artist_total) = state.db.artist_rank(user.user_id, &name).await.unwrap_or((0, 0));
     let all_plays = state.db.total_plays(user.user_id).await.unwrap_or(0);
     let loved = state.db.is_loved(user.user_id, id).await.unwrap_or(false);
+    let bio = bio_for(
+        &state,
+        id,
+        crate::metadata::bio::BioKind::Artist,
+        &name,
+        "",
+        entity.mbid.as_deref(),
+    )
+    .await;
 
     let stats = match &summary {
         Some(s) => {
@@ -242,6 +325,7 @@ async fn artist_detail(
             "album_count": summary.as_ref().map(|s| s.album_count).unwrap_or(0),
             "track_count": summary.as_ref().map(|s| s.track_count).unwrap_or(0),
             "loved": loved,
+            "bio": bio,
             "stats": stats,
             "albums": albums,
             "top_tracks": top_tracks,

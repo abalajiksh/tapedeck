@@ -18,6 +18,7 @@
 //! persisting their artwork, and library art needs the user's credentials to
 //! fetch — so it's proxied on demand instead (`server/artwork.rs`).
 
+pub mod bio;
 pub mod deezer;
 
 use async_trait::async_trait;

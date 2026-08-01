@@ -121,6 +121,108 @@ async fn search(
     }
 }
 
+/// GET /api/v1/sanitize — what the sanitiser *would* change, changing nothing.
+///
+/// Always a preview first. Scrobble metadata that arrived from a real
+/// MusicBrainz mapping is still data, and rewriting it silently would be a
+/// worse failure than the mismatch it fixes.
+async fn sanitize_preview(State(state): State<Arc<AppState>>, user: AuthUser) -> impl IntoResponse {
+    let albums = state.db.albums_with_mixed_releases(user.user_id).await.unwrap_or_default();
+    let artists = state.db.artists_with_featured_credits(user.user_id).await.unwrap_or_default();
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "mixed_albums": albums,
+            "featured_artists": artists,
+        })),
+    )
+        .into_response()
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SanitizeRequest {
+    /// Unify every listen of an album onto the release the majority agree on.
+    #[serde(default)]
+    pub albums: bool,
+    /// Fold `Artist feat. X` into `Artist`, keeping the full credit.
+    #[serde(default)]
+    pub artists: bool,
+    /// Limit to one album (`artist` + `album`) instead of the whole library.
+    pub artist: Option<String>,
+    pub album: Option<String>,
+}
+
+/// POST /api/v1/sanitize — apply the fixes the preview listed.
+async fn sanitize_apply(
+    State(state): State<Arc<AppState>>,
+    user: AuthUser,
+    Json(body): Json<SanitizeRequest>,
+) -> impl IntoResponse {
+    let mut album_rows = 0u64;
+    let mut albums_fixed = 0u64;
+    let mut artist_rows = 0u64;
+    let mut artists_folded = 0u64;
+
+    if body.albums {
+        let candidates = match state.db.albums_with_mixed_releases(user.user_id).await {
+            Ok(c) => c,
+            Err(e) => return server_error(e.to_string()),
+        };
+        for c in candidates {
+            // Scoped run: skip everything but the album that was asked for.
+            if let (Some(a), Some(al)) = (body.artist.as_deref(), body.album.as_deref()) {
+                if !c.artist.eq_ignore_ascii_case(a.trim())
+                    || !c.album.eq_ignore_ascii_case(al.trim())
+                {
+                    continue;
+                }
+            }
+            let Some(winner) = c.winner.as_deref() else { continue };
+            match state.db.unify_album_release(user.user_id, &c.artist, &c.album, winner).await {
+                Ok(n) if n > 0 => {
+                    album_rows += n;
+                    albums_fixed += 1;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    if body.artists {
+        let candidates = match state.db.artists_with_featured_credits(user.user_id).await {
+            Ok(c) => c,
+            Err(e) => return server_error(e.to_string()),
+        };
+        for c in candidates {
+            if let Ok(n) = state.db.fold_artist_credit(user.user_id, &c.artist, &c.primary).await {
+                if n > 0 {
+                    artist_rows += n;
+                    artists_folded += 1;
+                }
+            }
+        }
+    }
+
+    tracing::info!(
+        "🧹 Sanitised: {} listens across {} albums, {} listens across {} artist credits",
+        album_rows,
+        albums_fixed,
+        artist_rows,
+        artists_folded
+    );
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "albums_fixed": albums_fixed,
+            "album_listens_changed": album_rows,
+            "artists_folded": artists_folded,
+            "artist_listens_changed": artist_rows,
+        })),
+    )
+        .into_response()
+}
+
 /// GET /api/v1/stats/dashboard
 async fn dashboard_stats(State(state): State<Arc<AppState>>, user: AuthUser) -> impl IntoResponse {
     match state.db.get_dashboard_stats(user.user_id).await {
@@ -143,6 +245,9 @@ pub struct UpdateScrobble {
     pub artist: Option<String>,
     pub album: Option<String>,
     pub mbid_recording: Option<String>,
+    /// Fixing this also clears the resolved artwork, so the cover is re-fetched
+    /// for the release you actually meant.
+    pub mbid_release: Option<String>,
     pub signal_chain_id: Option<i64>,
     pub listening_context: Option<String>,
     pub format_type: Option<String>,
@@ -165,6 +270,7 @@ async fn update_scrobble(
             body.artist.as_deref(),
             body.album.as_deref(),
             body.mbid_recording.as_deref(),
+            body.mbid_release.as_deref(),
             body.signal_chain_id,
             body.listening_context.as_deref(),
             body.format_type.as_deref(),
@@ -426,6 +532,7 @@ pub fn create_scrobbles_router() -> Router<Arc<AppState>> {
         .route("/api/v1/scrobbles/bulk-chain", axum::routing::post(bulk_set_chain))
         .route("/api/v1/scrobbles/:id", patch(update_scrobble).delete(delete_scrobble))
         .route("/api/v1/search", get(search))
+        .route("/api/v1/sanitize", get(sanitize_preview).post(sanitize_apply))
         .route("/api/v1/stats/dashboard", get(dashboard_stats))
         .route("/api/v1/stats", get(ranged_stats))
         .route("/api/v1/personality", get(personality))

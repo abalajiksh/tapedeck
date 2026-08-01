@@ -16,9 +16,20 @@
 	$: chainName = (id: number | null) => chains.find((c) => c.id === id)?.name ?? '—';
 
 	const contexts = ['active', 'active-mobile', 'passive', 'background', 'unknown'];
-	// Must stay in sync with `ComponentType` in src/models.rs — serde rejects
-	// anything else with a 422, so an extra option here is a broken save.
-	const compTypes = ['source', 'transport', 'dac', 'amp', 'transducer', 'network', 'bluetooth'];
+	// Values must stay in sync with `ComponentType` in src/models.rs — serde
+	// rejects anything else with a 422, so an extra option here is a broken save.
+	// The *labels* are ours to choose, and "transducer" is jargon: the thing at
+	// the end of the chain is headphones or speakers, and that's what it says.
+	const compTypes = [
+		{ v: 'source', label: 'Source' },
+		{ v: 'transport', label: 'Transport' },
+		{ v: 'dac', label: 'DAC' },
+		{ v: 'amp', label: 'Amplifier' },
+		{ v: 'transducer', label: 'Headphones / Speakers' },
+		{ v: 'network', label: 'Network' },
+		{ v: 'bluetooth', label: 'Bluetooth' }
+	];
+	const compTypeLabel = (v: string) => compTypes.find((t) => t.v === v)?.label ?? v;
 
 	// Free text on the backend (`equipment_type` is a plain string), so this list
 	// is a UI convenience. Unknown values from older rows are preserved below.
@@ -26,14 +37,20 @@
 		{ v: 'headphones', label: 'Headphones' },
 		{ v: 'iem', label: 'IEM' },
 		{ v: 'speakers', label: 'Speakers' },
+		{ v: 'builtin-speakers', label: 'Built-in speakers (phone / laptop)' },
+		{ v: 'earbuds', label: 'Wireless earbuds' },
 		{ v: 'dac', label: 'DAC' },
 		{ v: 'amp', label: 'Amplifier' },
 		{ v: 'dac-amp', label: 'DAC / Amp combo' },
 		{ v: 'preamp', label: 'Preamp' },
 		{ v: 'source', label: 'Source / Streamer' },
+		{ v: 'phone', label: 'Phone' },
+		{ v: 'computer', label: 'Computer' },
+		{ v: 'dap', label: 'DAP / Music player' },
 		{ v: 'transport', label: 'Transport' },
 		{ v: 'turntable', label: 'Turntable' },
 		{ v: 'interface', label: 'Audio interface' },
+		{ v: 'receiver', label: 'Receiver / Amp-DAC' },
 		{ v: 'cable', label: 'Cable' },
 		{ v: 'other', label: 'Other' }
 	];
@@ -45,15 +62,30 @@
 	const gearTypeLabel = (v: string) => gearTypes.find((t) => t.v === v)?.label ?? v;
 
 	// Picking a piece of gear should fill in its chain position too — nobody
-	// wants to tell the app twice that headphones are the transducer. Guessed
-	// once on selection and freely overridable, never re-applied afterwards.
+	// wants to tell the app twice that headphones go at the end. Guessed once on
+	// selection and freely overridable, never re-applied afterwards.
 	const componentTypeForGear: Record<string, string> = {
 		headphones: 'transducer', iem: 'transducer', speakers: 'transducer',
-		dac: 'dac', 'dac-amp': 'dac', interface: 'dac',
+		'builtin-speakers': 'transducer', earbuds: 'bluetooth',
+		dac: 'dac', 'dac-amp': 'dac', interface: 'dac', receiver: 'dac',
 		amp: 'amp', preamp: 'amp',
-		source: 'source', turntable: 'source', other: 'source',
+		source: 'source', turntable: 'source', phone: 'source',
+		computer: 'source', dap: 'source', other: 'source',
 		transport: 'transport', cable: 'transport'
 	};
+
+	// The reverse: which gear belongs in a given slot. A DAC slot listing every
+	// pair of headphones you own is the thing that made this dropdown useless.
+	// Anything unmapped stays visible everywhere rather than becoming
+	// unreachable, and "Show all gear" is always one click away.
+	const gearTypesForComponent: Record<string, string[]> = {};
+	for (const [gear, comp] of Object.entries(componentTypeForGear)) {
+		(gearTypesForComponent[comp] ??= []).push(gear);
+	}
+	function gearFitsSlot(gearType: string, compType: string): boolean {
+		const known = componentTypeForGear[gearType];
+		return known === undefined || known === compType;
+	}
 
 	// chain editor
 	let chainOpen = false;
@@ -137,6 +169,7 @@
 
 	function pickGear(i: number, value: string) {
 		if (value === 'new') { gearForComp = i; newGear(); return; }
+		if (value === 'all') { showAllGear = { ...showAllGear, [i]: true }; return; }
 		if (value === 'custom') {
 			cComps[i] = { ...cComps[i], equipment_id: null };
 			cComps = cComps;
@@ -161,10 +194,34 @@
 	// the body closes over, so a plain function never re-renders the options
 	// when `equipment` changes — gear added from inside this dialog would land
 	// in a dropdown that has no option for it, and the select would blank out.
-	$: availableGear = ((_eq: Equipment[], _cc: ChainComponent[]) => (i: number): Equipment[] => {
-		const taken = new Set(_cc.filter((_, j) => j !== i).map((c) => c.equipment_id).filter((x) => x != null));
-		return _eq.filter((e) => !taken.has(e.id));
-	})(equipment, cComps);
+	//
+	// Also filtered to gear that fits the slot's component type — picking "DAC"
+	// and being shown every pair of headphones is what made this unusable.
+	// `showAllGear` opts out per row, for gear typed unusually.
+	let showAllGear: Record<number, boolean> = {};
+	$: availableGear = ((_eq: Equipment[], _cc: ChainComponent[], _all: Record<number, boolean>) =>
+		(i: number): Equipment[] => {
+			const taken = new Set(
+				_cc.filter((_, j) => j !== i).map((c) => c.equipment_id).filter((x) => x != null)
+			);
+			const slot = _cc[i]?.type ?? '';
+			return _eq.filter(
+				(e) => !taken.has(e.id) && (_all[i] || gearFitsSlot(e.equipment_type, slot))
+			);
+		})(equipment, cComps, showAllGear);
+
+	/** How much gear the slot filter is hiding, so the escape hatch is honest. */
+	$: hiddenGearCount = ((_eq: Equipment[], _cc: ChainComponent[], _all: Record<number, boolean>) =>
+		(i: number): number => {
+			if (_all[i]) return 0;
+			const taken = new Set(
+				_cc.filter((_, j) => j !== i).map((c) => c.equipment_id).filter((x) => x != null)
+			);
+			const slot = _cc[i]?.type ?? '';
+			return _eq.filter(
+				(e) => !taken.has(e.id) && !gearFitsSlot(e.equipment_type, slot)
+			).length;
+		})(equipment, cComps, showAllGear);
 
 	async function saveChain() {
 		if (!cName.trim()) return;
@@ -291,7 +348,7 @@
 						<div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;">
 							{#each c.components as step, i}
 								<span style="display:inline-flex;flex-direction:column;background:var(--td-surface2);border:1px solid var(--td-border);border-radius:12px;padding:7px 12px;">
-									<span style="font-size:10px;letter-spacing:.08em;text-transform:uppercase;color:var(--td-muted-3);">{step.type}</span>
+									<span style="font-size:10px;letter-spacing:.08em;text-transform:uppercase;color:var(--td-muted-3);">{compTypeLabel(step.type)}</span>
 									<span style="font-size:13.5px;font-weight:600;display:flex;align-items:center;gap:5px;">
 										{step.name}
 										{#if step.equipment_id != null}<span title="From your equipment" style="color:var(--td-accent);font-size:10px;">●</span>{/if}
@@ -424,7 +481,9 @@
 						<div style="display:flex;flex-direction:column;gap:8px;">
 							{#each cComps as comp, i}
 								<div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap;">
-									<select class="input" style="width:118px;flex:none;" bind:value={comp.type}>{#each compTypes as ct}<option value={ct}>{ct}</option>{/each}</select>
+									<select class="input" style="width:170px;flex:none;" bind:value={comp.type}>
+										{#each compTypes as ct}<option value={ct.v}>{ct.label}</option>{/each}
+									</select>
 									<select class="input" style="flex:1;min-width:150px;" value={compValue(comp)} on:change={(e) => pickGear(i, e.currentTarget.value)}>
 										{#if availableGear(i).length}
 											<optgroup label="Your gear">
@@ -433,6 +492,9 @@
 										{/if}
 										<option value="custom">Something else…</option>
 										<option value="new">＋ Add new gear…</option>
+										{#if hiddenGearCount(i)}
+											<option value="all">Show all gear ({hiddenGearCount(i)} hidden)…</option>
+										{/if}
 									</select>
 									{#if comp.equipment_id == null}
 										<input class="input" style="flex:1;min-width:150px;" bind:value={comp.name} placeholder="e.g. a friend's Bifrost">

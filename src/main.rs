@@ -115,6 +115,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )),
         analytics_row_cap: analytics_row_cap(),
         trust_proxy: config.server.trust_proxy,
+        // Built once: each provider holds an HTTP client with its own
+        // connection pool. Apple Music is unconfigured unless a developer token
+        // is supplied, and simply steps aside when it is.
+        bio_providers: metadata::bio::default_chain(
+            std::env::var("TAPEDECK_AUDIODB_KEY").ok(),
+            std::env::var("TAPEDECK_APPLE_MUSIC_TOKEN").ok(),
+            std::env::var("TAPEDECK_APPLE_MUSIC_STOREFRONT").ok(),
+        ),
     });
 
     let app = server::build_app(app_state);

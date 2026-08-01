@@ -2,6 +2,8 @@
 	import { onMount } from 'svelte';
 	import { api, type RangedStats, type StatsRange, type Personality } from '$lib/api';
 	import CoverArt from '$lib/components/CoverArt.svelte';
+	import BarChart from '$lib/components/BarChart.svelte';
+	import { openAlbum, openArtist } from '$lib/entities';
 
 	const ranges: { v: StatsRange; label: string }[] = [
 		{ v: 'week', label: 'Week' },
@@ -20,7 +22,6 @@
 
 	$: maxArtist = stats ? Math.max(1, ...stats.top_artists.map((a) => (metric === 'plays' ? a.plays : a.hours))) : 1;
 	$: maxAlbum = stats ? Math.max(1, ...stats.top_albums.map((a) => (metric === 'plays' ? a.plays : a.hours))) : 1;
-	$: maxDecade = stats ? Math.max(1, ...stats.decades.map((d) => d.plays)) : 1;
 	$: maxHeat = stats ? Math.max(1, ...stats.heatmap.flat()) : 1;
 
 	// Match the quality-badge colours so a tier reads the same everywhere.
@@ -122,13 +123,13 @@
 		{#if stats.top_artists.length}
 			{#each stats.top_artists as a}
 				{@const v = metric === 'plays' ? a.plays : a.hours}
-				<div style="display:flex;align-items:center;gap:12px;margin-bottom:13px;">
+				<button class="rank-row" on:click={() => openArtist(a.name)} title={`Open ${a.name}`}>
 					<CoverArt url={a.image_url} seed={a.name} size={34} radius={999} />
 					<div style="flex:1;min-width:0;">
-						<div style="display:flex;justify-content:space-between;font-size:13px;margin-bottom:5px;"><span style="font-weight:600;">{a.name}</span><span style="color:var(--td-muted-2);">{v}{metric === 'hours' ? 'h' : ''}</span></div>
+						<div style="display:flex;justify-content:space-between;font-size:13px;margin-bottom:5px;"><span class="rank-name">{a.name}</span><span style="color:var(--td-muted-2);">{v}{metric === 'hours' ? 'h' : ''}</span></div>
 						<div style="height:10px;border-radius:999px;background:var(--td-track);overflow:hidden;"><div style="width:{(v / maxArtist * 100).toFixed(0)}%;height:100%;background:linear-gradient(90deg,#c67139,#e07a55);border-radius:999px;"></div></div>
 					</div>
-				</div>
+				</button>
 			{/each}
 		{:else}
 			<p style="color:var(--td-muted);font-size:14px;margin:0;">No plays in this range yet.</p>
@@ -141,16 +142,16 @@
 		{#if stats.top_albums.length}
 			{#each stats.top_albums as al}
 				{@const v = metric === 'plays' ? al.plays : al.hours}
-				<div style="margin-bottom:13px;">
+				<button class="rank-row block" on:click={() => openAlbum(al.artist, al.name)} title={`Open ${al.name}`}>
 					<div style="display:flex;justify-content:space-between;gap:12px;font-size:13px;margin-bottom:5px;">
 						<span style="min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">
-							<span style="font-weight:600;">{al.name}</span>
+							<span class="rank-name">{al.name}</span>
 							<span style="color:var(--td-muted-3);"> — {al.artist}</span>
 						</span>
 						<span style="color:var(--td-muted-2);flex:none;">{v}{metric === 'hours' ? 'h' : ''}</span>
 					</div>
 					<div style="height:10px;border-radius:999px;background:var(--td-track);overflow:hidden;"><div style="width:{(v / maxAlbum * 100).toFixed(0)}%;height:100%;background:linear-gradient(90deg,#7a8a5e,#aebf92);border-radius:999px;"></div></div>
-				</div>
+				</button>
 			{/each}
 		{:else}
 			<p style="color:var(--td-muted);font-size:14px;margin:0;">No album data in this range yet.</p>
@@ -176,41 +177,34 @@
 	<!-- Decades -->
 	{#if stats.decades.length}
 		<h3 class="h-display" style="font-size:19px;margin:0 0 12px;">By Decade</h3>
-		<div class="panel" style="border-radius:22px;padding:22px;margin-bottom:16px;overflow-x:auto;">
-			<div style="display:flex;align-items:flex-end;gap:16px;height:150px;min-width:{stats.decades.length * 60}px;">
-				{#each stats.decades as d}
-					<div style="flex:1;display:flex;flex-direction:column;align-items:center;justify-content:flex-end;height:100%;gap:8px;">
-						<span style="font-size:12px;color:var(--td-muted-2);">{d.plays}</span>
-						<div style="width:100%;background:var(--td-track);border-radius:12px;overflow:hidden;display:flex;align-items:flex-end;height:100%;">
-							<div style="width:100%;height:{Math.max(4, (d.plays / maxDecade) * 100)}%;background:linear-gradient(180deg,#e07a55,#c67139);border-radius:12px;"></div>
-						</div>
-						<span style="font-size:12.5px;font-weight:600;">{d.name}</span>
-					</div>
-				{/each}
-			</div>
-		</div>
+		<BarChart bars={stats.decades.map((d) => ({ label: d.name, value: d.plays }))} />
 	{/if}
 
 	<!-- Heatmap -->
 	<h3 class="h-display" style="font-size:19px;margin:0 0 12px;">Listening Clock</h3>
 	<div class="panel" style="border-radius:22px;padding:22px;overflow-x:auto;">
-		<div style="min-width:560px;">
-			<div style="display:flex;margin-left:38px;margin-bottom:6px;">
-				{#each Array(24) as _, h}<span style="flex:1;text-align:center;font-size:9px;color:var(--td-muted-3);">{h % 6 === 0 ? h : ''}</span>{/each}
+		<!-- Header and rows share one grid template. They used to be separate flex
+		     rows, and because the cells were capped at 20px while the hour labels
+		     were not, the two drifted apart as the panel got wider — on a desktop
+		     the "18" ended up well past the last cell. -->
+		<div class="heat">
+			<div class="heat-row heat-head">
+				<span></span>
+				{#each Array(24) as _, h}<span class="heat-hour">{h % 6 === 0 ? h : ''}</span>{/each}
 			</div>
 			{#each stats.heatmap as row, di}
-				<div style="display:flex;align-items:center;gap:3px;margin-bottom:3px;">
-					<span style="width:34px;font-size:10.5px;color:var(--td-muted-3);text-align:right;padding-right:6px;">{days[di]}</span>
+				<div class="heat-row">
+					<span class="heat-day">{days[di]}</span>
 					{#each row as c}
-						<span title={`${c} plays`} style="flex:1;aspect-ratio:1;max-width:20px;border-radius:3px;background:rgba(198,113,57,{c === 0 ? 0.06 : 0.15 + 0.8 * (c / maxHeat)});"></span>
+						<span title={`${c} plays`} class="heat-cell" style="background:rgba(198,113,57,{c === 0 ? 0.06 : 0.15 + 0.8 * (c / maxHeat)});"></span>
 					{/each}
 				</div>
 			{/each}
-			<div style="display:flex;align-items:center;gap:6px;margin-top:14px;margin-left:38px;font-size:10.5px;color:var(--td-muted-3);">Less
-				<span style="width:13px;height:13px;border-radius:3px;background:rgba(198,113,57,.12);"></span>
-				<span style="width:13px;height:13px;border-radius:3px;background:rgba(198,113,57,.38);"></span>
-				<span style="width:13px;height:13px;border-radius:3px;background:rgba(198,113,57,.64);"></span>
-				<span style="width:13px;height:13px;border-radius:3px;background:rgba(198,113,57,.92);"></span>More</div>
+			<div class="heat-legend">Less
+				<span style="background:rgba(198,113,57,.12);"></span>
+				<span style="background:rgba(198,113,57,.38);"></span>
+				<span style="background:rgba(198,113,57,.64);"></span>
+				<span style="background:rgba(198,113,57,.92);"></span>More</div>
 		</div>
 	</div>
 	<!-- Languages -->
@@ -230,6 +224,64 @@
 {/if}
 
 <style>
+	/* One template for the labels and the cells, so they can't drift apart.
+	   `minmax(0, 22px)` lets the grid shrink on a phone and stops it stretching
+	   into fat rectangles on a wide screen. */
+	.heat { min-width: 560px; }
+	.heat-row {
+		display: grid;
+		grid-template-columns: 38px repeat(24, minmax(0, 22px));
+		gap: 3px;
+		align-items: center;
+		margin-bottom: 3px;
+	}
+	.heat-head { margin-bottom: 6px; }
+	.heat-hour {
+		font-size: 9px;
+		color: var(--td-muted-3);
+		text-align: center;
+	}
+	.heat-day {
+		font-size: 10.5px;
+		color: var(--td-muted-3);
+		text-align: right;
+		padding-right: 6px;
+	}
+	.heat-cell { aspect-ratio: 1; border-radius: 3px; }
+	.heat-legend {
+		display: flex;
+		align-items: center;
+		gap: 6px;
+		margin-top: 14px;
+		margin-left: 41px;
+		font-size: 10.5px;
+		color: var(--td-muted-3);
+	}
+	.heat-legend span { width: 13px; height: 13px; border-radius: 3px; }
+
+	/* The top-artist and top-album rows are the most obvious place to want an
+	   entity page from, and until now they were the only ranked lists in the app
+	   you couldn't click. Buttons, not anchors: the id is resolved on click. */
+	.rank-row {
+		display: flex;
+		align-items: center;
+		gap: 12px;
+		width: 100%;
+		margin-bottom: 13px;
+		padding: 4px 6px;
+		border: none;
+		border-radius: 12px;
+		background: transparent;
+		color: inherit;
+		font: inherit;
+		text-align: left;
+		cursor: pointer;
+	}
+	.rank-row.block { display: block; }
+	.rank-row:hover { background: var(--td-nav-hover); }
+	.rank-name { font-weight: 600; }
+	.rank-row:hover .rank-name { color: var(--td-accent); }
+
 	.spin { animation: td-spin 0.7s linear infinite; }
 	.seg-btn {
 		border: none; background: transparent; cursor: pointer; color: var(--td-nav-fg);

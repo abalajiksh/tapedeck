@@ -8,6 +8,7 @@
 	import { lovedKeys } from '$lib/loves';
 	import CoverArt from '$lib/components/CoverArt.svelte';
 	import StatStrip from '$lib/components/StatStrip.svelte';
+	import BioCard from '$lib/components/BioCard.svelte';
 	import AlbumCard from '$lib/components/AlbumCard.svelte';
 
 	let album: AlbumView | null = null;
@@ -20,6 +21,21 @@
 	// The tracklist bars are relative to the album's own most-played track, not
 	// to anything global — the shape of *this* record is what's being shown.
 	$: topPlays = album?.tracks.reduce((m, t) => Math.max(m, t.plays), 0) ?? 0;
+
+	// Two ways to read a tracklist: what you play most, and the record's own
+	// running order. The server sorts by plays; sequence is a client-side
+	// re-sort. Tracks with no track number sink to the end rather than
+	// pretending to be track zero.
+	let sort: 'plays' | 'sequence' = 'plays';
+	$: tracks = (() => {
+		const list = [...(album?.tracks ?? [])];
+		if (sort === 'plays') return list;
+		return list.sort((a, b) => {
+			const an = a.track_number ?? Number.MAX_SAFE_INTEGER;
+			const bn = b.track_number ?? Number.MAX_SAFE_INTEGER;
+			return an === bn ? a.title.localeCompare(b.title) : an - bn;
+		});
+	})();
 
 	// The album's own runtime, summed over its distinct tracks — `listening_seconds`
 	// from the API is how long *you* have spent on it, which the Hours stat says.
@@ -130,16 +146,21 @@
 
 	<StatStrip stats={album.stats} />
 
+	<BioCard bio={album.bio} heading="About this release" />
+
 	{#if album.tracks.length}
 		<div class="sec-head">
 			<h3 class="h-display" style="font-size:20px;margin:0;">Tracks</h3>
-			<span style="font-size:12.5px;color:var(--td-muted-3);">by plays</span>
+			<div style="display:inline-flex;background:var(--td-sidebar);border-radius:999px;padding:3px;gap:2px;">
+				<button class="seg-btn" class:on={sort === 'plays'} on:click={() => (sort = 'plays')}>By plays</button>
+				<button class="seg-btn" class:on={sort === 'sequence'} on:click={() => (sort = 'sequence')}>Track order</button>
+			</div>
 		</div>
 		<div class="panel" style="border-radius:22px;overflow:hidden;">
-			{#each album.tracks as t, i}
+			{#each tracks as t, i}
 				{@const q = qualityLabel(t)}
 				<div class="track">
-					<span class="n">{t.track_number ?? i + 1}</span>
+					<span class="n">{sort === 'sequence' ? (t.track_number ?? '—') : i + 1}</span>
 					<div style="flex:1;min-width:0;">
 						<div class="t-title">{t.title}</div>
 						<div class="bar"><div class="fill" style="width:{topPlays ? (t.plays / topPlays) * 100 : 0}%"></div></div>
@@ -210,6 +231,13 @@
 		display: flex; align-items: center; justify-content: space-between;
 		gap: 12px; margin-bottom: 12px;
 	}
+	/* Same segmented control as the Statistics range picker. Styles are scoped
+	   per page in this codebase, so it's repeated rather than shared. */
+	.seg-btn {
+		border: none; background: transparent; cursor: pointer; color: var(--td-nav-fg);
+		font-size: 12.5px; padding: 6px 14px; border-radius: 999px; font-family: inherit;
+	}
+	.seg-btn.on { background: var(--td-accent); color: #fbf5ea; }
 	.track {
 		display: flex; align-items: center; gap: 14px;
 		padding: 12px 18px; border-bottom: 1px solid var(--td-border);

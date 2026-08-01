@@ -314,6 +314,7 @@ impl Database {
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_id INTEGER NOT NULL DEFAULT 1,
                 title TEXT NOT NULL, artist TEXT NOT NULL, album TEXT,
+                artist_credit TEXT,
                 timestamp INTEGER NOT NULL, duration INTEGER,
                 source_id TEXT NOT NULL, source_name TEXT NOT NULL,
                 status TEXT NOT NULL DEFAULT 'pending',
@@ -426,7 +427,8 @@ impl Database {
                 started_at INTEGER NOT NULL, ended_at INTEGER,
                 track_count INTEGER DEFAULT 0, total_duration INTEGER DEFAULT 0,
                 skip_count INTEGER DEFAULT 0, avg_quality_score REAL,
-                listening_context TEXT DEFAULT 'unknown'
+                listening_context TEXT DEFAULT 'unknown',
+                token_id INTEGER REFERENCES tokens(id)
             )",
         )
         .execute(&self.pool)
@@ -537,6 +539,19 @@ impl Database {
         // Other names the same entity answers to. Today this carries MBIDs; it
         // is what makes merging two spellings of one record possible later
         // without rewriting every note that points at either.
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS bio_cache (
+                entity_id INTEGER PRIMARY KEY REFERENCES entities(id),
+                bio TEXT,
+                attribution TEXT,
+                provider TEXT,
+                url TEXT,
+                fetched_at INTEGER NOT NULL
+            )",
+        )
+        .execute(&self.pool)
+        .await?;
+
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS entity_aliases (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -857,6 +872,28 @@ impl Database {
         // on Android", "fooyin") is how people actually organise these, so the
         // token is the natural place to say what the listens through it came
         // out of — no client-side config, nothing to type per listen.
+        // Migration: the full artist credit, kept when a `feat.` suffix is
+        // folded out of `artist` so the featured performer is never lost —
+        // it just stops fragmenting every grouping query.
+        if !has_column(&self.pool, "scrobbles", "artist_credit").await {
+            info!("⚙️ Migrating: adding scrobbles.artist_credit...");
+            let _ = sqlx::query("ALTER TABLE scrobbles ADD COLUMN artist_credit TEXT")
+                .execute(&self.pool)
+                .await;
+        }
+
+        // Migration: which token a session's listens came in on. A change of
+        // token means a change of app, which in practice means a change of
+        // setup — so it ends the session even inside the 30-minute gap.
+        if !has_column(&self.pool, "sessions", "token_id").await {
+            info!("⚙️ Migrating: adding sessions.token_id...");
+            let _ = sqlx::query(
+                "ALTER TABLE sessions ADD COLUMN token_id INTEGER REFERENCES tokens(id)",
+            )
+            .execute(&self.pool)
+            .await;
+        }
+
         if !has_column(&self.pool, "tokens", "default_chain_id").await {
             info!("⚙️ Migrating: adding tokens.default_chain_id...");
             let _ = sqlx::query(
@@ -1604,6 +1641,142 @@ impl Database {
         .await
     }
 
+    // ════════════════════════════════════════════════════════════
+    //  Metadata sanitiser
+    //
+    //  Scrobble clients tag per *track*, not per album, so one listen out of
+    //  twelve routinely arrives carrying a compilation's release MBID. Nothing
+    //  is wrong with that listen on its own — but the album page groups by name
+    //  and the artwork comes from the release, so a single outlier shows the
+    //  wrong cover and skews the record's stats.
+    //
+    //  The fix is a majority vote *within one album*, never across the library,
+    //  and it is always offered as a preview before it is applied. Metadata that
+    //  arrived from a real MusicBrainz mapping is still data; overwriting it
+    //  silently would be worse than the problem.
+    // ════════════════════════════════════════════════════════════
+
+    /// Albums where the listens disagree about which release they are.
+    ///
+    /// Returns (artist, album, total plays, distinct release MBIDs, the winning
+    /// MBID, how many rows carry it).
+    pub async fn albums_with_mixed_releases(
+        &self,
+        user_id: i64,
+    ) -> Result<Vec<MixedAlbum>, sqlx::Error> {
+        sqlx::query_as(
+            "WITH per_release AS (
+                 SELECT artist, album, mbid_release, COUNT(*) AS n
+                 FROM scrobbles
+                 WHERE user_id = ? AND skipped = FALSE
+                   AND album IS NOT NULL AND TRIM(album) != ''
+                   AND mbid_release IS NOT NULL AND TRIM(mbid_release) != ''
+                 GROUP BY LOWER(TRIM(artist)), LOWER(TRIM(album)), mbid_release
+             )
+             SELECT artist, album,
+                    SUM(n) AS plays,
+                    COUNT(*) AS variants,
+                    (SELECT p2.mbid_release FROM per_release p2
+                      WHERE LOWER(TRIM(p2.artist)) = LOWER(TRIM(p.artist))
+                        AND LOWER(TRIM(p2.album)) = LOWER(TRIM(p.album))
+                      ORDER BY p2.n DESC, p2.mbid_release ASC LIMIT 1) AS winner,
+                    (SELECT MAX(p2.n) FROM per_release p2
+                      WHERE LOWER(TRIM(p2.artist)) = LOWER(TRIM(p.artist))
+                        AND LOWER(TRIM(p2.album)) = LOWER(TRIM(p.album))) AS winner_plays
+             FROM per_release p
+             GROUP BY LOWER(TRIM(artist)), LOWER(TRIM(album))
+             HAVING variants > 1
+             ORDER BY plays DESC",
+        )
+        .bind(user_id)
+        .fetch_all(&self.pool)
+        .await
+    }
+
+    /// Force every listen of one album onto a single release MBID.
+    ///
+    /// Artwork is cleared alongside it — the resolved cover belongs to the
+    /// release being replaced, and `artwork_url`/`caa_id` are the queue keys for
+    /// the backfill, so nulling them is what re-fetches the right one.
+    /// Returns how many rows changed.
+    pub async fn unify_album_release(
+        &self,
+        user_id: i64,
+        artist: &str,
+        album: &str,
+        mbid_release: &str,
+    ) -> Result<u64, sqlx::Error> {
+        let res = sqlx::query(
+            "UPDATE scrobbles
+                SET mbid_release = ?, artwork_url = NULL, caa_id = NULL, caa_release_mbid = NULL
+              WHERE user_id = ?
+                AND LOWER(TRIM(artist)) = ? AND LOWER(TRIM(album)) = ?
+                AND (mbid_release IS NULL OR mbid_release != ?)",
+        )
+        .bind(mbid_release)
+        .bind(user_id)
+        .bind(artist.trim().to_lowercase())
+        .bind(album.trim().to_lowercase())
+        .bind(mbid_release)
+        .execute(&self.pool)
+        .await?;
+        Ok(res.rows_affected())
+    }
+
+    /// Artist strings that carry a featured credit, with the primary artist they
+    /// would fold into and how many listens are affected.
+    ///
+    /// `Cœur de pirate feat. Loud` is a *different artist* to every query in the
+    /// app, so one track drops out of its own album and off its own artist page.
+    /// Only the explicit `feat.` / `ft.` / `featuring` / `with` forms are
+    /// matched — `&` and `,` are left alone, because "Simon & Garfunkel" and
+    /// "Earth, Wind & Fire" are names, not credits.
+    pub async fn artists_with_featured_credits(
+        &self,
+        user_id: i64,
+    ) -> Result<Vec<FeaturedArtist>, sqlx::Error> {
+        let rows: Vec<(String, i64)> = sqlx::query_as(
+            "SELECT artist, COUNT(*) AS plays FROM scrobbles
+             WHERE user_id = ? AND skipped = FALSE
+             GROUP BY LOWER(TRIM(artist)) ORDER BY plays DESC",
+        )
+        .bind(user_id)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows
+            .into_iter()
+            .filter_map(|(artist, plays)| {
+                let primary = split_featured(&artist)?;
+                Some(FeaturedArtist { artist, primary, plays })
+            })
+            .collect())
+    }
+
+    /// Rewrite one artist string to another across a user's listens.
+    ///
+    /// The full credit is kept in `artist_credit` so nothing is lost — the
+    /// featured performer is still recorded, it just stops fragmenting every
+    /// grouping query.
+    pub async fn fold_artist_credit(
+        &self,
+        user_id: i64,
+        from: &str,
+        to: &str,
+    ) -> Result<u64, sqlx::Error> {
+        let res = sqlx::query(
+            "UPDATE scrobbles
+                SET artist_credit = COALESCE(artist_credit, artist), artist = ?
+              WHERE user_id = ? AND LOWER(TRIM(artist)) = ?",
+        )
+        .bind(to)
+        .bind(user_id)
+        .bind(from.trim().to_lowercase())
+        .execute(&self.pool)
+        .await?;
+        Ok(res.rows_affected())
+    }
+
     /// (total listens, newest listened_at) for a user — the two numbers the
     /// ListenBrainz-compatible endpoints report alongside a listen page.
     pub async fn listen_count_and_latest(
@@ -1858,31 +2031,46 @@ impl Database {
         artist: Option<&str>,
         album: Option<&str>,
         mbid_recording: Option<&str>,
+        mbid_release: Option<&str>,
         chain_id: Option<i64>,
         listening_context: Option<&str>,
         format_type: Option<&str>,
         codec: Option<&str>,
     ) -> Result<bool, sqlx::Error> {
+        // Changing the release means the artwork we resolved is for the wrong
+        // record, so the tombstones are cleared and the backfill picks the row
+        // up again. This is the whole point of being able to fix an MBID by
+        // hand: the cover is what made the mistake visible in the first place.
+        let clear_artwork = mbid_release.is_some();
+
         let res = sqlx::query(
             "UPDATE scrobbles SET
                 title = COALESCE(?, title),
                 artist = COALESCE(?, artist),
                 album = COALESCE(?, album),
                 mbid_recording = COALESCE(?, mbid_recording),
+                mbid_release = COALESCE(?, mbid_release),
                 chain_id = COALESCE(?, chain_id),
                 listening_context = COALESCE(?, listening_context),
                 format_type = COALESCE(?, format_type),
-                codec = COALESCE(?, codec)
+                codec = COALESCE(?, codec),
+                artwork_url = CASE WHEN ? THEN NULL ELSE artwork_url END,
+                caa_id = CASE WHEN ? THEN NULL ELSE caa_id END,
+                caa_release_mbid = CASE WHEN ? THEN NULL ELSE caa_release_mbid END
              WHERE id = ? AND user_id = ?",
         )
         .bind(title)
         .bind(artist)
         .bind(album)
         .bind(mbid_recording)
+        .bind(mbid_release)
         .bind(chain_id)
         .bind(listening_context)
         .bind(format_type)
         .bind(codec)
+        .bind(clear_artwork)
+        .bind(clear_artwork)
+        .bind(clear_artwork)
         .bind(id)
         .bind(user_id)
         .execute(&self.pool)
@@ -3064,6 +3252,49 @@ impl Database {
         Ok(())
     }
 
+    /// A cached description, and how old it is.
+    ///
+    /// A row with `bio IS NULL` is a **tombstone**: every provider was asked and
+    /// none had anything. Same discipline as `artwork_url = ''` and
+    /// `caa_id = -1` — without it, the records nobody has written about get
+    /// re-asked on every page view forever.
+    pub async fn get_bio(&self, entity_id: i64) -> Result<Option<BioRow>, sqlx::Error> {
+        sqlx::query_as(
+            "SELECT entity_id, bio, attribution, provider, url, fetched_at
+               FROM bio_cache WHERE entity_id = ?",
+        )
+        .bind(entity_id)
+        .fetch_optional(&self.pool)
+        .await
+    }
+
+    pub async fn set_bio(
+        &self,
+        entity_id: i64,
+        bio: Option<&str>,
+        attribution: Option<&str>,
+        provider: Option<&str>,
+        url: Option<&str>,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "INSERT INTO bio_cache (entity_id, bio, attribution, provider, url, fetched_at)
+             VALUES (?, ?, ?, ?, ?, ?)
+             ON CONFLICT(entity_id) DO UPDATE SET
+                bio = excluded.bio, attribution = excluded.attribution,
+                provider = excluded.provider, url = excluded.url,
+                fetched_at = excluded.fetched_at",
+        )
+        .bind(entity_id)
+        .bind(bio)
+        .bind(attribution)
+        .bind(provider)
+        .bind(url)
+        .bind(Self::now_secs())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     /// Identity keys of everything this user loves, for the row hearts.
     ///
     /// Built with the same `kind|artist|name` shape as `entity_key` so the
@@ -3519,11 +3750,32 @@ impl Database {
         .await
     }
 
+    /// Gear with its hours **derived from the chains that use it**.
+    ///
+    /// The stored `equipment.total_hours` was only ever written at creation, so
+    /// it sat at zero forever while the chains above it accumulated properly —
+    /// a chain reading "1.7h logged" over gear reading "0min" was the visible
+    /// symptom. Now that a chain component carries `equipment_id`, the number is
+    /// derivable, and deriving it means it can't drift from the chain's own
+    /// total. `json_each` walks the components blob; gear that predates the
+    /// link (free-text steps) still reports zero, which is honest — nothing
+    /// records what it was attached to.
     pub async fn get_equipment(&self, user_id: i64) -> Result<Vec<EquipmentRow>, sqlx::Error> {
-        sqlx::query_as("SELECT * FROM equipment WHERE user_id = ? ORDER BY total_hours DESC")
-            .bind(user_id)
-            .fetch_all(&self.pool)
-            .await
+        sqlx::query_as(
+            "SELECT e.id, e.user_id, e.name, e.type, e.brand, e.model,
+                    COALESCE((
+                        SELECT SUM(c.total_hours) FROM signal_chains c, json_each(c.components) j
+                         WHERE c.user_id = e.user_id
+                           AND json_extract(j.value, '$.equipment_id') = e.id
+                    ), 0) AS total_hours,
+                    e.first_used, e.last_used, e.notes
+               FROM equipment e
+              WHERE e.user_id = ?
+              ORDER BY total_hours DESC, e.name ASC",
+        )
+        .bind(user_id)
+        .fetch_all(&self.pool)
+        .await
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -3567,12 +3819,19 @@ impl Database {
         quality_score: Option<f64>,
         listening_context: &str,
         session_gap_seconds: i64,
+        token_id: Option<i64>,
     ) -> Result<i64, sqlx::Error> {
-        let recent: Option<(i64, i64)> = sqlx::query_as(
-            "SELECT id, ended_at FROM sessions WHERE user_id = ? AND ended_at >= ? - ? ORDER BY ended_at DESC LIMIT 1"
+        // A session is contiguous listening *through one setup*. The gap is the
+        // usual test, but a change of submitting token ends it too: one token
+        // per app is how these are organised, so "fooyin stopped, Pano started"
+        // is a different setup even if it happened a minute later. A browser
+        // submission carries no token and is treated as its own bucket.
+        let recent: Option<(i64, i64, Option<i64>)> = sqlx::query_as(
+            "SELECT id, ended_at, token_id FROM sessions WHERE user_id = ? AND ended_at >= ? - ? ORDER BY ended_at DESC LIMIT 1"
         ).bind(user_id).bind(timestamp).bind(session_gap_seconds).fetch_optional(&self.pool).await?;
         let ended_at = timestamp + duration_secs;
-        if let Some((session_id, _)) = recent {
+        let recent = recent.filter(|(_, _, prev_token)| *prev_token == token_id);
+        if let Some((session_id, _, _)) = recent {
             sqlx::query(
                 "UPDATE sessions SET ended_at = MAX(ended_at, ?), track_count = track_count + 1,
                     total_duration = total_duration + ?,
@@ -3591,8 +3850,8 @@ impl Database {
         } else {
             let result = sqlx::query(
                 "INSERT INTO sessions (user_id, device_id, chain_id, started_at, ended_at,
-                    track_count, total_duration, avg_quality_score, listening_context)
-                 VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?)",
+                    track_count, total_duration, avg_quality_score, listening_context, token_id)
+                 VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?, ?)",
             )
             .bind(user_id)
             .bind(device_id)
@@ -3602,6 +3861,7 @@ impl Database {
             .bind(duration_secs)
             .bind(quality_score)
             .bind(listening_context)
+            .bind(token_id)
             .execute(&self.pool)
             .await?;
             Ok(result.last_insert_rowid())
@@ -3625,25 +3885,26 @@ impl Database {
     /// Resolve a raw API token to its owner **and** the signal chain that token
     /// defaults to. The chain rides along because the ingest path needs it on
     /// every submission and this is already the one query that touches the row.
-    pub async fn validate_token(
-        &self,
-        token: &str,
-    ) -> Result<Option<(AuthUser, Option<i64>)>, sqlx::Error> {
+    pub async fn validate_token(&self, token: &str) -> Result<Option<TokenAuth>, sqlx::Error> {
         let token_hash = Self::hash_token(token);
         let now = Self::now_secs();
-        let row: Option<(i64, String, String, Option<i64>)> = sqlx::query_as(
-            "SELECT u.id, u.username, u.role, t.default_chain_id
+        let row: Option<(i64, String, String, i64, Option<i64>)> = sqlx::query_as(
+            "SELECT u.id, u.username, u.role, t.id, t.default_chain_id
              FROM tokens t JOIN users u ON t.user_id = u.id
              WHERE t.token_hash = ? AND (t.expires_at IS NULL OR t.expires_at > ?) AND u.disabled = 0"
         ).bind(&token_hash).bind(now).fetch_optional(&self.pool).await?;
 
-        if let Some((user_id, username, role, default_chain_id)) = row {
+        if let Some((user_id, username, role, token_id, default_chain_id)) = row {
             let _ = sqlx::query("UPDATE tokens SET last_used_at = ? WHERE token_hash = ?")
                 .bind(now)
                 .bind(&token_hash)
                 .execute(&self.pool)
                 .await;
-            Ok(Some((AuthUser { user_id, username, is_admin: role == "admin" }, default_chain_id)))
+            Ok(Some(TokenAuth {
+                user: AuthUser { user_id, username, is_admin: role == "admin" },
+                token_id,
+                default_chain_id,
+            }))
         } else {
             Ok(None)
         }
@@ -3850,6 +4111,71 @@ pub struct UserRecord {
     pub role: String,
     pub created_at: i64,
     pub disabled: bool,
+}
+
+/// A cached description. `bio IS NULL` means every provider was asked and none
+/// had anything — a tombstone, not a miss to retry on the next page view.
+#[derive(Debug, FromRow, serde::Serialize)]
+pub struct BioRow {
+    pub entity_id: i64,
+    pub bio: Option<String>,
+    pub attribution: Option<String>,
+    pub provider: Option<String>,
+    pub url: Option<String>,
+    pub fetched_at: i64,
+}
+
+/// An album whose listens disagree about which release they belong to.
+#[derive(Debug, FromRow, serde::Serialize)]
+pub struct MixedAlbum {
+    pub artist: String,
+    pub album: String,
+    pub plays: i64,
+    /// How many distinct release MBIDs the listens carry. Always > 1 here.
+    pub variants: i64,
+    /// The MBID the majority of listens agree on — the proposed fix.
+    pub winner: Option<String>,
+    pub winner_plays: i64,
+}
+
+/// An artist string carrying a featured credit, and the primary artist it would
+/// fold into.
+#[derive(Debug, serde::Serialize)]
+pub struct FeaturedArtist {
+    pub artist: String,
+    pub primary: String,
+    pub plays: i64,
+}
+
+/// Split `Artist feat. Someone` into its primary artist.
+///
+/// Only the explicit credit forms are matched. `&` and `,` are deliberately
+/// left alone: "Simon & Garfunkel" and "Earth, Wind & Fire" are names, and
+/// folding them would invent artists that never existed. Case-insensitive, and
+/// the separator has to be surrounded by whitespace so a track by a band called
+/// "Feature" survives.
+pub fn split_featured(artist: &str) -> Option<String> {
+    const MARKERS: [&str; 6] = [" feat. ", " feat ", " ft. ", " ft ", " featuring ", " with "];
+    let lower = artist.to_lowercase();
+    for m in MARKERS {
+        if let Some(pos) = lower.find(m) {
+            let primary = artist[..pos].trim();
+            if !primary.is_empty() && primary.len() != artist.trim().len() {
+                return Some(primary.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// What an API token resolves to. The id is carried because a session is now
+/// split when the submitting token changes — a different app means a different
+/// setup far more often than not.
+#[derive(Debug)]
+pub struct TokenAuth {
+    pub user: AuthUser,
+    pub token_id: i64,
+    pub default_chain_id: Option<i64>,
 }
 
 #[derive(Debug, FromRow, serde::Serialize)]
@@ -4059,15 +4385,15 @@ mod tests {
         let couch = db.create_chain(&mk("Couch")).await.unwrap();
 
         let token = db.create_token(uid, "fooyin", "submit", Some(desk)).await.unwrap();
-        assert_eq!(db.validate_token(&token).await.unwrap().unwrap().1, Some(desk));
+        assert_eq!(db.validate_token(&token).await.unwrap().unwrap().default_chain_id, Some(desk));
 
         let id = db.list_tokens(uid).await.unwrap()[0].id;
         assert!(db.update_token(uid, id, "fooyin", Some(couch)).await.unwrap());
         // Same token string, new chain — nothing to re-paste into the client.
-        assert_eq!(db.validate_token(&token).await.unwrap().unwrap().1, Some(couch));
+        assert_eq!(db.validate_token(&token).await.unwrap().unwrap().default_chain_id, Some(couch));
 
         assert!(db.update_token(uid, id, "fooyin", None).await.unwrap());
-        assert_eq!(db.validate_token(&token).await.unwrap().unwrap().1, None);
+        assert_eq!(db.validate_token(&token).await.unwrap().unwrap().default_chain_id, None);
 
         // Someone else's token id is not editable.
         let other = db.create_user("frank", None, "x", "user").await.unwrap();

@@ -4,7 +4,7 @@
 
 	export let scrobble: Scrobble;
 
-	const dispatch = createEventDispatcher<{ close: void }>();
+	const dispatch = createEventDispatcher<{ close: void; updated: Scrobble }>();
 
 	// Liner notes for this listen and for the things it's *of*. Read-only: the
 	// entities behind track/album/artist are only created when you write or love
@@ -59,6 +59,55 @@
 		['Cover art release', scrobble.caa_release_mbid, 'release']
 	].filter(([, id]) => !!id) as [string, string, string][];
 
+	// ── Fixing MBIDs after the fact ──
+	// The cover is what makes a bad release MBID visible (one track showing a
+	// compilation's art), and this dialog is where you land when you go looking.
+	// Saving a release also clears the resolved artwork so the right cover is
+	// fetched — see `update_scrobble` in db.rs.
+	let editing = false;
+	let saving = false;
+	let saveMsg = '';
+	let editRec = '';
+	let editRel = '';
+
+	function startEdit() {
+		editRec = scrobble.mbid_recording ?? '';
+		editRel = scrobble.mbid_release ?? '';
+		saveMsg = '';
+		editing = true;
+	}
+
+	/** MusicBrainz ids are UUIDs; anything else is a paste gone wrong. */
+	const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+	$: recValid = !editRec.trim() || UUID.test(editRec.trim());
+	$: relValid = !editRel.trim() || UUID.test(editRel.trim());
+
+	async function saveMbids() {
+		if (!recValid || !relValid) return;
+		saving = true;
+		saveMsg = '';
+		const patch: Record<string, string> = {};
+		if (editRec.trim() && editRec.trim() !== scrobble.mbid_recording) patch.mbid_recording = editRec.trim();
+		if (editRel.trim() && editRel.trim() !== scrobble.mbid_release) patch.mbid_release = editRel.trim();
+		if (!Object.keys(patch).length) {
+			editing = false;
+			saving = false;
+			return;
+		}
+		try {
+			const updated = await api.patchScrobble(scrobble.id, patch);
+			scrobble = updated;
+			dispatch('updated', updated);
+			saveMsg = patch.mbid_release
+				? 'Saved. The cover will re-resolve in the background.'
+				: 'Saved.';
+			editing = false;
+		} catch (e) {
+			saveMsg = 'Failed: ' + String(e).replace(/^API \d+: /, '');
+		}
+		saving = false;
+	}
+
 	let copied = false;
 	async function copy() {
 		try {
@@ -107,19 +156,59 @@
 				</div>
 			{/if}
 
-			{#if links.length}
-				<div style="display:flex;flex-wrap:wrap;gap:8px;margin-bottom:12px;">
-					{#each links as [label, id, kind]}
-						<a
-							class="tag tag-outline"
-							style="text-decoration:none;"
-							href={`https://musicbrainz.org/${kind}/${id}`}
-							target="_blank"
-							rel="noopener"
-						>{label} on MusicBrainz →</a>
-					{/each}
+			<div class="notes-block">
+				<div class="notes-head" style="display:flex;align-items:center;justify-content:space-between;gap:10px;">
+					<span>MusicBrainz ids</span>
+					{#if !editing}
+						<button class="btn btn-ghost notes-btn" on:click={startEdit}>Fix ids</button>
+					{/if}
 				</div>
-			{/if}
+
+				{#if editing}
+					<div style="display:flex;flex-direction:column;gap:10px;">
+						<div class="field">
+							<label for="mbrec">Recording</label>
+							<input id="mbrec" class="input" bind:value={editRec} spellcheck="false"
+								placeholder="00000000-0000-0000-0000-000000000000">
+							{#if !recValid}<div class="warn">That isn't a MusicBrainz id.</div>{/if}
+						</div>
+						<div class="field">
+							<label for="mbrel">Release</label>
+							<input id="mbrel" class="input" bind:value={editRel} spellcheck="false"
+								placeholder="00000000-0000-0000-0000-000000000000">
+							{#if !relValid}<div class="warn">That isn't a MusicBrainz id.</div>{/if}
+						</div>
+						<p style="margin:0;font-size:11.5px;color:var(--td-muted-3);">
+							Changing the release clears this listen's cached cover so the right one is fetched.
+							To fix a whole album at once, use Settings → Maintenance → Metadata Sanitiser.
+						</p>
+						<div style="display:flex;gap:8px;">
+							<button class="btn btn-secondary notes-btn" on:click={() => (editing = false)}>Cancel</button>
+							<button class="btn btn-primary notes-btn" on:click={saveMbids} disabled={saving || !recValid || !relValid}>
+								{saving ? 'Saving…' : 'Save'}
+							</button>
+						</div>
+					</div>
+				{:else if links.length}
+					<div style="display:flex;flex-wrap:wrap;gap:8px;">
+						{#each links as [label, id, kind]}
+							<a
+								class="tag tag-outline"
+								style="text-decoration:none;"
+								href={`https://musicbrainz.org/${kind}/${id}`}
+								target="_blank"
+								rel="noopener"
+							>{label} on MusicBrainz →</a>
+						{/each}
+					</div>
+				{:else}
+					<p style="margin:0;font-size:12.5px;color:var(--td-muted-2);">
+						No ids on this listen. Pasting the right ones is what makes it show the right cover
+						and count towards the right record.
+					</p>
+				{/if}
+				{#if saveMsg}<p style="margin:10px 0 0;font-size:12.5px;color:var(--td-good-fg);">{saveMsg}</p>{/if}
+			</div>
 
 			<pre class="inspect-json">{pretty}</pre>
 		</div>
@@ -164,6 +253,7 @@
 		white-space: nowrap;
 	}
 	.notes-btn { font-size: 12.5px; padding: 5px 12px; }
+	.warn { font-size: 11.5px; color: #b2622d; margin-top: 4px; }
 
 	.inspect-json {
 		margin: 0;

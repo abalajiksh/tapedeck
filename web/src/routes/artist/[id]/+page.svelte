@@ -7,6 +7,8 @@
 	import { openAlbum } from '$lib/entities';
 	import { lovedKeys } from '$lib/loves';
 	import StatStrip from '$lib/components/StatStrip.svelte';
+	import BioCard from '$lib/components/BioCard.svelte';
+	import BarChart from '$lib/components/BarChart.svelte';
 	import AlbumCard from '$lib/components/AlbumCard.svelte';
 
 	let artist: ArtistView | null = null;
@@ -16,7 +18,6 @@
 
 	$: id = Number($page.params.id);
 	$: topPlays = artist?.top_tracks.reduce((m, t) => Math.max(m, t.plays), 0) ?? 0;
-	$: peakYear = artist?.trend.reduce((m, t) => Math.max(m, t.value), 0) ?? 0;
 
 	// An artist entity's key carries an empty artist half — the name *is* the
 	// artist. Matches `Database::entity_key`.
@@ -133,16 +134,11 @@
 
 	<StatStrip stats={artist.stats} />
 
+	<BioCard bio={artist.bio} heading="Liner notes" />
+
 	{#if artist.trend.length > 1}
 		<h3 class="h-display" style="font-size:20px;margin:0 0 12px;">Plays by year</h3>
-		<div class="panel trend">
-			{#each artist.trend as t}
-				<div class="tcol">
-					<div class="tbar" style="height:{peakYear ? Math.max(4, (t.value / peakYear) * 100) : 4}%" title={`${t.value} plays`}></div>
-					<div class="tlabel">{t.label}</div>
-				</div>
-			{/each}
-		</div>
+		<div style="margin-bottom:14px;"><BarChart bars={artist.trend} /></div>
 	{/if}
 
 	{#if artist.albums.length}
@@ -218,16 +214,6 @@
 		font-size: 12.5px; font-weight: 600; color: var(--td-nav-fg);
 	}
 	.love:hover, .love.on { color: #b2622d; }
-	.trend {
-		border-radius: 22px; padding: 18px 20px; margin-bottom: 30px;
-		display: flex; align-items: flex-end; gap: 10px; height: 150px;
-	}
-	.tcol { flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: flex-end; height: 100%; }
-	.tbar {
-		width: 100%; max-width: 46px; border-radius: 7px 7px 3px 3px;
-		background: linear-gradient(var(--td-accent-2), var(--td-accent));
-	}
-	.tlabel { font-size: 11.5px; color: var(--td-muted-3); margin-top: 7px; }
 	.sec-head {
 		display: flex; align-items: center; justify-content: space-between;
 		gap: 12px; margin-bottom: 12px;

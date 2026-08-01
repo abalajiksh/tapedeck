@@ -48,6 +48,10 @@ pub struct AppState {
     pub analytics_row_cap: i64,
     /// Only trust `X-Forwarded-For` for the client IP when behind a known proxy.
     pub trust_proxy: bool,
+    /// Description providers, in preference order. Built once — each holds an
+    /// HTTP client with its own connection pool, so rebuilding per request
+    /// would throw those away.
+    pub bio_providers: Vec<crate::metadata::bio::BioProviderBox>,
 }
 
 /// Build the full Axum application.

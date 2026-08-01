@@ -63,6 +63,9 @@ pub struct IngestAuth {
     /// browser session, which has no token and therefore no default. Consumed
     /// by the ingest chain ladder; every other `IngestAuth` route ignores it.
     pub token_chain_id: Option<i64>,
+    /// Which token authenticated, if one did. Sessions are split on it: a
+    /// different app almost always means a different setup.
+    pub token_id: Option<i64>,
 }
 
 #[axum::async_trait]
@@ -75,7 +78,7 @@ impl FromRequestParts<Arc<super::AppState>> for IngestAuth {
     ) -> Result<Self, Self::Rejection> {
         // 1. Session cookie (browser).
         if let Some(user) = session_user(parts, state).await {
-            return Ok(IngestAuth { user, token_chain_id: None });
+            return Ok(IngestAuth { user, token_chain_id: None, token_id: None });
         }
 
         // 2. Authorization: Token (external scrobble clients).
@@ -87,7 +90,11 @@ impl FromRequestParts<Arc<super::AppState>> for IngestAuth {
             .trim();
         if !token.is_empty() {
             return match state.db.validate_token(token).await {
-                Ok(Some((user, token_chain_id))) => Ok(IngestAuth { user, token_chain_id }),
+                Ok(Some(t)) => Ok(IngestAuth {
+                    user: t.user,
+                    token_chain_id: t.default_chain_id,
+                    token_id: Some(t.token_id),
+                }),
                 Ok(None) => Err(unauthorized("Invalid token")),
                 Err(e) => {
                     tracing::error!("Token validation error: {}", e);
