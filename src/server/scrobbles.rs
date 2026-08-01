@@ -18,6 +18,7 @@ pub struct ScrobblesQuery {
     pub offset: Option<i64>,
     pub artist: Option<String>,
     pub album: Option<String>,
+    pub track: Option<String>,
     pub after: Option<i64>,
     pub before: Option<i64>,
 }
@@ -39,6 +40,7 @@ async fn list_scrobbles(
             offset,
             params.artist.as_deref(),
             params.album.as_deref(),
+            params.track.as_deref(),
             params.after,
             params.before,
         )
@@ -60,6 +62,60 @@ async fn list_scrobbles(
                 code: 500,
                 error: format!("Failed to fetch scrobbles: {}", e)
             })),
+        )
+            .into_response(),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SearchQuery {
+    pub q: Option<String>,
+    pub limit: Option<i64>,
+}
+
+/// GET /api/v1/search?q= — grouped matches from the caller's own history.
+///
+/// Scoped to `user.user_id` like every other read: on a shared instance one
+/// person's library is not searchable by another.
+async fn search(
+    State(state): State<Arc<AppState>>,
+    user: AuthUser,
+    Query(params): Query<SearchQuery>,
+) -> impl IntoResponse {
+    let q = params.q.unwrap_or_default();
+    let limit = params.limit.unwrap_or(10).clamp(1, 50);
+
+    match state.db.search_library(user.user_id, &q, limit).await {
+        Ok((artists, albums, tracks)) => {
+            let artists: Vec<_> = artists
+                .into_iter()
+                .map(|(name, plays)| serde_json::json!({ "name": name, "plays": plays }))
+                .collect();
+            let albums: Vec<_> = albums
+                .into_iter()
+                .map(|(name, artist, plays)| {
+                    serde_json::json!({ "name": name, "artist": artist, "plays": plays })
+                })
+                .collect();
+            let tracks: Vec<_> = tracks
+                .into_iter()
+                .map(|(title, artist, album, plays)| {
+                    serde_json::json!({
+                        "title": title, "artist": artist, "album": album, "plays": plays
+                    })
+                })
+                .collect();
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "artists": artists, "albums": albums, "tracks": tracks,
+                })),
+            )
+                .into_response()
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!(ErrorResponse { code: 500, error: e.to_string() })),
         )
             .into_response(),
     }
@@ -369,6 +425,7 @@ pub fn create_scrobbles_router() -> Router<Arc<AppState>> {
         .route("/api/v1/scrobbles", get(list_scrobbles).delete(clear_scrobbles))
         .route("/api/v1/scrobbles/bulk-chain", axum::routing::post(bulk_set_chain))
         .route("/api/v1/scrobbles/:id", patch(update_scrobble).delete(delete_scrobble))
+        .route("/api/v1/search", get(search))
         .route("/api/v1/stats/dashboard", get(dashboard_stats))
         .route("/api/v1/stats", get(ranged_stats))
         .route("/api/v1/personality", get(personality))

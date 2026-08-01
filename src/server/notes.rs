@@ -73,7 +73,9 @@ enum Target {
 /// Accepts the shortcode spelling (`track`/`album`) as well as the stored one
 /// (`recording`/`release`), because the UI thinks in the former.
 fn entity_kind(raw: &str) -> Option<&'static str> {
-    RefKind::parse(raw).map(|k| k.entity_kind())
+    // `gear` parses as a shortcode kind but is not an entity, so it is not a
+    // valid note or love target — it falls out here as `None`.
+    RefKind::parse(raw).and_then(|k| k.entity_kind())
 }
 
 /// Turn a spec into a concrete target, creating the entity if that's what was
@@ -187,10 +189,19 @@ async fn render(
         if resolved.contains_key(&key) {
             continue;
         }
+        // Gear is the caller's own equipment, on its own route; the other three
+        // are entities. This is the only place the two are told apart, which is
+        // why `notes.rs` takes an href rather than building one.
+        let Some(entity_kind) = code.kind.entity_kind() else {
+            if let Ok(Some((id, label))) = db.find_equipment_by_name(user_id, &code.target).await {
+                resolved.insert(key, Resolved { label, href: format!("/chains?gear={}", id) });
+            }
+            continue;
+        };
         let hit = db
             .resolve_reference(
                 user_id,
-                code.kind.entity_kind(),
+                entity_kind,
                 &code.target,
                 code.position(),
                 ctx_artist,
@@ -198,7 +209,7 @@ async fn render(
             )
             .await;
         if let Ok(Some((entity_id, label))) = hit {
-            resolved.insert(key, Resolved { entity_id, label });
+            resolved.insert(key, Resolved { label, href: format!("/notes?entity={}", entity_id) });
         }
     }
     notes::render(body_md, &resolved)
@@ -534,9 +545,38 @@ async fn set_love(
     match state.db.set_love(user.user_id, entity_id, loved).await {
         Ok(()) => {
             let entity = state.db.get_entity(entity_id).await.ok().flatten();
+
+            // Mirror it outward, but only for recordings — see `set_loved` on
+            // the sink trait. Spawned rather than awaited: the love is already
+            // stored, and the UI shouldn't wait on Last.fm to fill a heart.
+            if let Some(e) = entity.as_ref().filter(|e| e.kind == "recording") {
+                let (db, url) = (state.db.clone(), state.listenbrainz_url.clone());
+                let (artist, title, mbid, uid) =
+                    (e.artist_name.clone(), e.name.clone(), e.mbid.clone(), user.user_id);
+                tokio::spawn(async move {
+                    let sinks = crate::sinks::sinks_for_user(&db, uid, &url).await;
+                    crate::sinks::submit_love(&sinks, &artist, &title, mbid.as_deref(), loved)
+                        .await;
+                });
+            }
+
             (StatusCode::OK, Json(serde_json::json!({ "entity": entity, "loved": loved })))
                 .into_response()
         }
+        Err(e) => server_error(e),
+    }
+}
+
+/// GET /api/v1/loves/keys — every loved entity as its identity key.
+///
+/// The history and dashboard put a heart on every row, and asking per row would
+/// be one request per listen. The key is deterministic (`kind|artist|name`,
+/// lowercased — `Database::entity_key`), so the client fetches this once and
+/// matches locally. Entities are only created when something is annotated or
+/// loved, so this stays small even on a large library.
+async fn love_keys(State(state): State<Arc<AppState>>, user: AuthUser) -> impl IntoResponse {
+    match state.db.loved_keys(user.user_id).await {
+        Ok(keys) => (StatusCode::OK, Json(serde_json::json!({ "keys": keys }))).into_response(),
         Err(e) => server_error(e),
     }
 }
@@ -642,6 +682,7 @@ pub fn create_notes_router() -> Router<Arc<AppState>> {
         .route("/api/v1/notes/:id", get(get_note).delete(delete_note))
         .route("/api/v1/notes/:id/revisions", get(note_revisions))
         .route("/api/v1/loves", get(list_loves).post(set_love))
+        .route("/api/v1/loves/keys", get(love_keys))
         .route("/api/v1/entities/:id", get(get_entity))
         .route("/api/v1/scrobbles/:id/annotations", get(listen_annotations))
 }

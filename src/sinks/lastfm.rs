@@ -225,6 +225,47 @@ impl ScrobbleSink for LastFmSink {
         Ok(())
     }
 
+    /// `track.love` / `track.unlove`. Last.fm matches on the artist and track
+    /// names, not the MBID, so `mbid` is unused here — it's carried for
+    /// ListenBrainz, which needs it.
+    async fn set_loved(
+        &self,
+        artist: &str,
+        title: &str,
+        _mbid: Option<&str>,
+        loved: bool,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let method = if loved { "track.love" } else { "track.unlove" };
+        let mut params: Vec<(String, String)> = vec![
+            ("method".into(), method.into()),
+            ("api_key".into(), self.api_key.clone()),
+            ("sk".into(), self.session_key.clone()),
+            ("artist".into(), artist.to_string()),
+            ("track".into(), title.to_string()),
+        ];
+        let signature = self.generate_signature(&params);
+        params.push(("api_sig".into(), signature));
+        params.push(("format".into(), "json".into()));
+
+        let form_data: HashMap<String, String> = params.into_iter().collect();
+        let resp = self.client.post(self.api_endpoint()).form(&form_data).send().await?;
+        if resp.status().is_success() {
+            info!(
+                "{} {} — {} on {}",
+                if loved { "❤️ Loved" } else { "Un-loved" },
+                artist,
+                title,
+                self.service_name
+            );
+            Ok(())
+        } else {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            Err(format!("{} {} failed (status {}): {}", self.service_name, method, status, body)
+                .into())
+        }
+    }
+
     /// `track.updateNowPlaying` — the same signed form POST as a scrobble, but
     /// unindexed and with no timestamp, since it describes a single track that
     /// is playing rather than one that finished.

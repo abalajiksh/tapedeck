@@ -232,7 +232,22 @@
 	$: chainsUsing = ((_ch: SignalChain[]) => (e: Equipment) =>
 		_ch.filter((c) => c.components?.some((x) => x.equipment_id === e.id)))(chains);
 
-	onMount(load);
+	// A `[[gear:…]]` shortcode in a liner note links to /chains?gear=<id>. There
+	// is no gear detail page yet, so the link highlights the row it means rather
+	// than dropping you at the top of a long page with nothing to look at.
+	let highlightGear: number | null = null;
+
+	onMount(async () => {
+		const g = new URLSearchParams(window.location.search).get('gear');
+		highlightGear = g ? Number(g) : null;
+		await load();
+		if (highlightGear != null) {
+			await tick();
+			document
+				.getElementById(`gear-${highlightGear}`)
+				?.scrollIntoView({ block: 'center', behavior: 'smooth' });
+		}
+	});
 </script>
 
 <svelte:head><title>Signal Chains — Tapedeck</title></svelte:head>
@@ -309,7 +324,7 @@
 				<thead><tr><th>Gear</th><th>Type</th><th>Brand</th><th>In chains</th><th style="text-align:right;">Hours</th><th></th></tr></thead>
 				<tbody>
 					{#each equipment as e (e.id)}
-						<tr>
+						<tr id={`gear-${e.id}`} class:highlight={highlightGear === e.id}>
 							<td style="font-weight:600;">{e.name}</td>
 							<td style="color:var(--td-muted);">{gearTypeLabel(e.equipment_type)}</td>
 							<td style="color:var(--td-muted);">{e.brand ?? '—'}</td>
@@ -505,4 +520,7 @@
 	}
 	.icon-btn:hover { background: var(--td-nav-hover); color: var(--td-text); }
 	.icon-btn.danger:hover { color: #b2622d; }
+	tr.highlight {
+		background: color-mix(in srgb, var(--td-accent) 12%, transparent);
+	}
 </style>

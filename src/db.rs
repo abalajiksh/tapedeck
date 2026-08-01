@@ -1205,6 +1205,7 @@ impl Database {
         offset: i64,
         artist_filter: Option<&str>,
         album_filter: Option<&str>,
+        track_filter: Option<&str>,
         after: Option<i64>,
         before: Option<i64>,
     ) -> Result<Vec<ScrobbleRecord>, sqlx::Error> {
@@ -1212,6 +1213,7 @@ impl Database {
             "SELECT * FROM scrobbles WHERE user_id = ? AND skipped = FALSE
                AND (? IS NULL OR LOWER(artist) LIKE '%' || LOWER(?) || '%')
                AND (? IS NULL OR LOWER(album) LIKE '%' || LOWER(?) || '%')
+               AND (? IS NULL OR LOWER(title) LIKE '%' || LOWER(?) || '%')
                AND (? IS NULL OR timestamp >= ?)
                AND (? IS NULL OR timestamp <= ?)
              ORDER BY timestamp DESC LIMIT ? OFFSET ?",
@@ -1221,6 +1223,8 @@ impl Database {
         .bind(artist_filter)
         .bind(album_filter)
         .bind(album_filter)
+        .bind(track_filter)
+        .bind(track_filter)
         .bind(after)
         .bind(after)
         .bind(before)
@@ -1229,6 +1233,68 @@ impl Database {
         .bind(offset)
         .fetch_all(&self.pool)
         .await
+    }
+
+    /// Search a user's own listening history by name.
+    ///
+    /// Deliberately over `scrobbles` rather than `entities`: entities only exist
+    /// for things already annotated or loved, so searching them would find only
+    /// what you've already been to. Grouped rather than a flat row list because
+    /// "that Radiohead album" is an album, not fifty listens of it.
+    #[allow(clippy::type_complexity)]
+    pub async fn search_library(
+        &self,
+        user_id: i64,
+        q: &str,
+        limit: i64,
+    ) -> Result<
+        (
+            Vec<(String, i64)>,
+            Vec<(String, String, i64)>,
+            Vec<(String, String, Option<String>, i64)>,
+        ),
+        sqlx::Error,
+    > {
+        let needle = q.trim().to_lowercase();
+        if needle.is_empty() {
+            return Ok((Vec::new(), Vec::new(), Vec::new()));
+        }
+
+        let artists: Vec<(String, i64)> = sqlx::query_as(
+            "SELECT artist, COUNT(*) AS plays FROM scrobbles
+             WHERE user_id = ? AND skipped = FALSE AND LOWER(artist) LIKE '%' || ? || '%'
+             GROUP BY LOWER(artist) ORDER BY plays DESC LIMIT ?",
+        )
+        .bind(user_id)
+        .bind(&needle)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let albums: Vec<(String, String, i64)> = sqlx::query_as(
+            "SELECT album, artist, COUNT(*) AS plays FROM scrobbles
+             WHERE user_id = ? AND skipped = FALSE AND album IS NOT NULL AND album != ''
+               AND LOWER(album) LIKE '%' || ? || '%'
+             GROUP BY LOWER(album), LOWER(artist) ORDER BY plays DESC LIMIT ?",
+        )
+        .bind(user_id)
+        .bind(&needle)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let tracks: Vec<(String, String, Option<String>, i64)> = sqlx::query_as(
+            "SELECT title, artist, album, COUNT(*) AS plays FROM scrobbles
+             WHERE user_id = ? AND skipped = FALSE AND LOWER(title) LIKE '%' || ? || '%'
+             GROUP BY LOWER(title), LOWER(artist) ORDER BY plays DESC LIMIT ?",
+        )
+        .bind(user_id)
+        .bind(&needle)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok((artists, albums, tracks))
     }
 
     /// (total listens, newest listened_at) for a user — the two numbers the
@@ -2691,6 +2757,23 @@ impl Database {
         Ok(())
     }
 
+    /// Identity keys of everything this user loves, for the row hearts.
+    ///
+    /// Built with the same `kind|artist|name` shape as `entity_key` so the
+    /// client can derive a listen's key without a round-trip. `entity_key` is
+    /// stored, so this is a plain column read rather than a recomputation that
+    /// could drift from it.
+    pub async fn loved_keys(&self, user_id: i64) -> Result<Vec<String>, sqlx::Error> {
+        let rows: Vec<(String,)> = sqlx::query_as(
+            "SELECT e.entity_key FROM loves l JOIN entities e ON e.id = l.entity_id
+             WHERE l.user_id = ?",
+        )
+        .bind(user_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(|(k,)| k).collect())
+    }
+
     pub async fn is_loved(&self, user_id: i64, entity_id: i64) -> Result<bool, sqlx::Error> {
         let row: Option<(i64,)> =
             sqlx::query_as("SELECT 1 FROM loves WHERE user_id = ? AND entity_id = ?")
@@ -3098,6 +3181,35 @@ impl Database {
             .bind(hours_to_add).bind(now).bind(now).execute(&self.pool).await?;
             Ok(result.last_insert_rowid())
         }
+    }
+
+    /// Resolve a `[[gear:…]]` shortcode to one of the user's equipment rows.
+    ///
+    /// Unlike `resolve_reference` this never *creates* anything: gear is
+    /// something you own and catalogue deliberately, so a note naming a piece
+    /// you haven't added should render as unresolved rather than conjuring an
+    /// empty record with no type or brand. Matches the name first, then the
+    /// model, so "[[gear:HD 650]]" finds it whichever field it was entered in.
+    pub async fn find_equipment_by_name(
+        &self,
+        user_id: i64,
+        needle: &str,
+    ) -> Result<Option<(i64, String)>, sqlx::Error> {
+        let needle = needle.trim().to_lowercase();
+        if needle.is_empty() {
+            return Ok(None);
+        }
+        sqlx::query_as(
+            "SELECT id, name FROM equipment
+             WHERE user_id = ? AND (LOWER(TRIM(name)) = ? OR LOWER(TRIM(model)) = ?)
+             ORDER BY (LOWER(TRIM(name)) = ?) DESC, id ASC LIMIT 1",
+        )
+        .bind(user_id)
+        .bind(&needle)
+        .bind(&needle)
+        .bind(&needle)
+        .fetch_optional(&self.pool)
+        .await
     }
 
     pub async fn get_equipment(&self, user_id: i64) -> Result<Vec<EquipmentRow>, sqlx::Error> {
@@ -4113,8 +4225,11 @@ mod tests {
         )
         .await
         .unwrap();
-        let listen =
-            db.get_recent_scrobbles(uid, 1, 0, None, None, None, None).await.unwrap().remove(0);
+        let listen = db
+            .get_recent_scrobbles(uid, 1, 0, None, None, None, None, None)
+            .await
+            .unwrap()
+            .remove(0);
         let e = db.upsert_entity("recording", "Xtal", "Aphex Twin", None).await.unwrap();
 
         db.upsert_note(uid, Some(e), None, "about the record", "private").await.unwrap();

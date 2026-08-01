@@ -329,6 +329,12 @@ export interface UserInfo {
 	is_admin: boolean;
 }
 
+export interface SearchResults {
+	artists: { name: string; plays: number }[];
+	albums: { name: string; artist: string; plays: number }[];
+	tracks: { title: string; artist: string; album: string | null; plays: number }[];
+}
+
 export interface TokenInfo {
 	id: number;
 	name: string;
@@ -435,13 +441,14 @@ class TapedeckAPI {
 	// ── Scrobbles ──
 	async getScrobbles(params?: {
 		limit?: number; offset?: number; artist?: string;
-		album?: string; after?: number; before?: number;
+		album?: string; track?: string; after?: number; before?: number;
 	}): Promise<{ scrobbles: Scrobble[]; count: number }> {
 		const query = new URLSearchParams();
 		if (params?.limit) query.set('limit', String(params.limit));
 		if (params?.offset) query.set('offset', String(params.offset));
 		if (params?.artist) query.set('artist', params.artist);
 		if (params?.album) query.set('album', params.album);
+		if (params?.track) query.set('track', params.track);
 		if (params?.after) query.set('after', String(params.after));
 		if (params?.before) query.set('before', String(params.before));
 		const qs = query.toString();
@@ -562,6 +569,11 @@ class TapedeckAPI {
 	async deleteChain(id: number): Promise<void> { return this.delNoBody(`/api/v1/chains/${id}`); }
 
 	// ── Devices & Equipment ──
+	// ── Search ──
+	async search(q: string, limit = 10): Promise<SearchResults> {
+		return this.get(`/api/v1/search?q=${encodeURIComponent(q)}&limit=${limit}`);
+	}
+
 	async getDevices(): Promise<{ devices: Device[] }> { return this.get('/api/v1/devices'); }
 	async setDeviceChain(id: number, chain_id: number | null): Promise<void> {
 		await this.patch(`/api/v1/devices/${id}`, { chain_id });
@@ -611,6 +623,11 @@ class TapedeckAPI {
 	}
 	async getLoves(): Promise<{ loves: { entity: Entity; loved_at: number }[] }> {
 		return this.get('/api/v1/loves');
+	}
+	/** Identity keys of everything loved, so rows can render a heart without
+	 *  one request each. See `loveKey()` in `$lib/loves`. */
+	async getLoveKeys(): Promise<{ keys: string[] }> {
+		return this.get('/api/v1/loves/keys');
 	}
 	async setLove(target: NoteTarget, loved: boolean): Promise<{ entity: Entity; loved: boolean }> {
 		return this.post('/api/v1/loves', { ...target, loved });

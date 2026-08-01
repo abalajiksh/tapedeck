@@ -575,7 +575,8 @@ means session-only.
 
 | Method | Path | Auth | Description |
 |--------|------|------|-------------|
-| GET | `/api/v1/scrobbles` | Auth | List listens (`limit`, `offset`, `artist`, `album`, `after`, `before`) |
+| GET | `/api/v1/scrobbles` | Auth | List listens (`limit`, `offset`, `artist`, `album`, `track`, `after`, `before`) |
+| GET | `/api/v1/search` | Auth | Search your own history (`q`, `limit`) — grouped artists / albums / tracks |
 | PATCH | `/api/v1/scrobbles/{id}` | Auth | Edit a listen (metadata, MBID, chain, format) |
 | DELETE | `/api/v1/scrobbles/{id}` | Auth | Delete one listen |
 | DELETE | `/api/v1/scrobbles?confirm=true` | Auth | Clear all listens for the user |
@@ -617,6 +618,7 @@ means session-only.
 | GET | `/api/v1/notes/for` | Auth | The note for a target, if any, plus the resolved target |
 | POST | `/api/v1/notes/preview` | Auth | Render Markdown + shortcodes without saving |
 | GET/POST | `/api/v1/loves` | Auth | List loves / love or un-love an entity |
+| GET | `/api/v1/loves/keys` | Auth | Loved entity keys, so listen rows render a heart without a request each |
 | GET | `/api/v1/entities/{id}` | Auth | An entity with the caller's note and love state |
 | GET | `/api/v1/scrobbles/{id}/annotations` | Auth | Notes and loves around one listen (read-only — creates nothing) |
 

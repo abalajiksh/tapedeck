@@ -166,11 +166,14 @@ async fn user_listens(
     let before = q.max_ts.map(|t| t - 1);
     let after = q.min_ts.map(|t| t + 1);
 
-    let rows =
-        match state.db.get_recent_scrobbles(user_id, count, 0, None, None, after, before).await {
-            Ok(r) => r,
-            Err(e) => return error(500, e.to_string()),
-        };
+    let rows = match state
+        .db
+        .get_recent_scrobbles(user_id, count, 0, None, None, None, after, before)
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => return error(500, e.to_string()),
+    };
     let (_, latest) = state.db.listen_count_and_latest(user_id).await.unwrap_or((0, None));
     let listens: Vec<serde_json::Value> = rows.iter().map(|s| to_lb_listen(s, true)).collect();
 

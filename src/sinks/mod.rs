@@ -29,6 +29,21 @@ pub trait ScrobbleSink: Any + Send + Sync {
     async fn update_now_playing(&self, _play: &Play) -> Result<(), Box<dyn std::error::Error>> {
         Ok(())
     }
+
+    /// Mirror a love (or un-love) of one *recording* to the service.
+    ///
+    /// Only recordings: Last.fm's `track.love` and ListenBrainz's feedback both
+    /// take a track, and neither has a notion of loving an album or an artist —
+    /// so those stay local rather than being approximated. Defaults to a no-op.
+    async fn set_loved(
+        &self,
+        _artist: &str,
+        _title: &str,
+        _mbid: Option<&str>,
+        _loved: bool,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        Ok(())
+    }
 }
 
 /// Build the sinks for one user from their stored connections.
@@ -87,6 +102,26 @@ pub async fn submit_now_playing(sinks: &[Box<dyn ScrobbleSink>], play: &Play) {
     for sink in sinks {
         if let Err(e) = sink.update_now_playing(play).await {
             tracing::error!("Failed to forward now playing to {}: {}", sink.name(), e);
+        }
+    }
+}
+
+/// Forward a love to every one of a user's sinks.
+///
+/// Never fails the caller: the love is already stored locally, and a service
+/// being unreachable shouldn't make the heart in the UI refuse to fill. This is
+/// the one piece of forwarding with no retry queue — unlike a scrobble, a love
+/// is idempotent and re-assertable, so the next toggle fixes a missed one.
+pub async fn submit_love(
+    sinks: &[Box<dyn ScrobbleSink>],
+    artist: &str,
+    title: &str,
+    mbid: Option<&str>,
+    loved: bool,
+) {
+    for sink in sinks {
+        if let Err(e) = sink.set_loved(artist, title, mbid, loved).await {
+            tracing::error!("Failed to forward love to {}: {}", sink.name(), e);
         }
     }
 }

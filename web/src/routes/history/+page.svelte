@@ -4,6 +4,7 @@
 	import type { Scrobble, SignalChain } from '$lib/api';
 	import ScrobbleRow from '$lib/components/ScrobbleRow.svelte';
 	import InspectListen from '$lib/components/InspectListen.svelte';
+	import { loadLoves, lovedKeys, loveKey, toggleLove } from '$lib/loves';
 
 	let scrobbles: Scrobble[] = [];
 	let chains: SignalChain[] = [];
@@ -12,6 +13,28 @@
 	let offset = 0;
 	let hasMore = true;
 	const PAGE = 50;
+
+	// Search results link here with ?artist= / ?album= / ?track=, so a result
+	// opens the actual listens rather than a dead end.
+	let scope: { artist?: string; album?: string; track?: string } = {};
+	$: scopeLabel = scope.track ?? scope.album ?? scope.artist ?? '';
+
+	function clearScope() {
+		scope = {};
+		history.replaceState(null, '', '/history');
+		load(true);
+	}
+
+	// Back to top: a long history is thousands of rows deep, and the browser's
+	// own Home key doesn't work once focus is inside the page.
+	let scrolled = false;
+	function onScroll() {
+		scrolled = window.scrollY > 900;
+	}
+	function toTop() {
+		const still = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+		window.scrollTo({ top: 0, behavior: still ? 'auto' : 'smooth' });
+	}
 
 	// row menu + dialogs
 	let menuFor: Scrobble | null = null;
@@ -74,7 +97,15 @@
 		if (reset) { offset = 0; scrobbles = []; hasMore = true; }
 		loading = true;
 		try {
-			const res = await api.getScrobbles({ limit: PAGE, offset, artist: filter || undefined });
+			const res = await api.getScrobbles({
+				limit: PAGE,
+				offset,
+				// The typed filter is an artist filter; a scope from search can
+				// narrow by album or track instead.
+				artist: filter || scope.artist || undefined,
+				album: scope.album,
+				track: scope.track
+			});
 			scrobbles = reset ? res.scrobbles : [...scrobbles, ...res.scrobbles];
 			offset += res.scrobbles.length;
 			hasMore = res.scrobbles.length === PAGE;
@@ -124,10 +155,19 @@
 	}
 
 	onMount(async () => {
+		const q = new URLSearchParams(window.location.search);
+		scope = {
+			artist: q.get('artist') ?? undefined,
+			album: q.get('album') ?? undefined,
+			track: q.get('track') ?? undefined
+		};
+		loadLoves();
 		try { chains = (await api.getChains()).chains; } catch { /* optional */ }
 		load(true);
 	});
 </script>
+
+<svelte:window on:scroll={onScroll} />
 
 <svelte:head><title>History — Tapedeck</title></svelte:head>
 
@@ -145,6 +185,17 @@
 		<input class="input" style="width:200px;" bind:value={filter} on:input={onFilter} placeholder="Filter by artist…">
 	</div>
 </div>
+
+{#if scopeLabel}
+	<div class="panel" style="border-radius:14px;padding:10px 16px;margin-bottom:16px;display:flex;align-items:center;gap:10px;flex-wrap:wrap;">
+		<span style="font-size:13px;color:var(--td-muted);">
+			Showing {scope.track ? 'listens of' : scope.album ? 'the album' : 'everything by'}
+		</span>
+		<span style="font-weight:600;font-size:14px;">{scopeLabel}</span>
+		<span style="flex:1;"></span>
+		<button class="btn btn-ghost" style="font-size:12.5px;" on:click={clearScope}>Clear</button>
+	</div>
+{/if}
 
 {#if selectMode}
 	<div class="panel" style="position:sticky;top:0;z-index:30;border-radius:14px;padding:12px 16px;margin-bottom:16px;display:flex;align-items:center;gap:12px;flex-wrap:wrap;background:var(--td-surface2);">
@@ -194,6 +245,17 @@
 {#if menuFor}
 	<div on:click={() => (menuFor = null)} on:keydown={() => {}} role="presentation" style="position:fixed;inset:0;z-index:65;"></div>
 	<div style="position:fixed;z-index:66;right:40px;top:50%;transform:translateY(-50%);background:var(--td-surface);border:1px solid var(--td-border);border-radius:14px;box-shadow:0 12px 32px rgba(46,43,37,.2);padding:6px;min-width:180px;display:flex;flex-direction:column;">
+		<!-- The bare heart on the row means the track; album and artist are
+		     explicit here, where there's room to say which. -->
+		{#each [{ k: 'album', label: 'album' }, { k: 'artist', label: 'artist' }] as t}
+			{@const key = menuFor && loveKey(menuFor, t.k as 'album' | 'artist')}
+			{#if key}
+				<button class="menu-item" on:click={() => { if (menuFor) toggleLove(menuFor, t.k as 'album' | 'artist'); menuFor = null; }}>
+					<svg viewBox="0 0 24 24" width="16" fill={$lovedKeys.has(key) ? 'currentColor' : 'none'} stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.8 4.6a5.5 5.5 0 0 0-7.8 0L12 5.7l-1-1.1a5.5 5.5 0 0 0-7.8 7.8l1.1 1L12 21l7.7-7.6 1.1-1a5.5 5.5 0 0 0 0-7.8z"/></svg>
+					{$lovedKeys.has(key) ? `Un-love ${t.label}` : `Love ${t.label}`}
+				</button>
+			{/if}
+		{/each}
 		<button class="menu-item" on:click={() => menuFor && openEdit(menuFor)}>
 			<svg viewBox="0 0 24 24" width="16" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4z"/></svg>Edit details</button>
 		<button class="menu-item" on:click={() => { inspecting = menuFor; menuFor = null; }}>
@@ -205,6 +267,14 @@
 
 {#if inspecting}
 	<InspectListen scrobble={inspecting} on:close={() => (inspecting = null)} />
+{/if}
+
+{#if scrolled}
+	<button class="to-top" on:click={toTop} title="Back to top" aria-label="Back to top">
+		<svg viewBox="0 0 24 24" width="20" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round">
+			<path d="M12 19V5"/><path d="M5 12l7-7 7 7"/>
+		</svg>
+	</button>
 {/if}
 
 <!-- Edit dialog -->
@@ -265,4 +335,31 @@
 	}
 	.menu-item:hover { background: var(--td-nav-hover); }
 	.menu-item.danger { color: #b2622d; }
+	.to-top {
+		position: fixed;
+		right: 26px;
+		bottom: 26px;
+		z-index: 40;
+		width: 44px;
+		height: 44px;
+		border-radius: 50%;
+		border: 1px solid var(--td-border);
+		background: var(--td-surface);
+		color: var(--td-text);
+		cursor: pointer;
+		display: flex;
+		align-items: center;
+		justify-content: center;
+		box-shadow: 0 8px 24px rgba(46, 43, 37, .18);
+		animation: to-top-in .18s ease-out;
+	}
+	.to-top:hover { background: var(--td-nav-hover); }
+	@keyframes to-top-in {
+		from { opacity: 0; transform: translateY(8px); }
+		to { opacity: 1; transform: none; }
+	}
+	/* Someone who asked for less motion gets the button, not the entrance. */
+	@media (prefers-reduced-motion: reduce) {
+		.to-top { animation: none; }
+	}
 </style>

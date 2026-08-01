@@ -197,6 +197,48 @@ impl ScrobbleSink for ListenBrainzSink {
         self.submit_now_playing(play).await
     }
 
+    /// `POST /1/feedback/recording-feedback`, score 1 (love) or 0 (clear).
+    ///
+    /// Needs a recording MBID: the endpoint's only other key is a `recording_msid`,
+    /// which is an id ListenBrainz assigns to listens *it* received and Tapedeck
+    /// therefore doesn't have. A track that was never enriched is skipped rather
+    /// than guessed at — locally the love still stands.
+    async fn set_loved(
+        &self,
+        artist: &str,
+        title: &str,
+        mbid: Option<&str>,
+        loved: bool,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let Some(mbid) = mbid.filter(|m| !m.trim().is_empty()) else {
+            debug!("No recording MBID for {} - {}; not sending feedback", artist, title);
+            return Ok(());
+        };
+
+        let body = json!({ "recording_mbid": mbid, "score": if loved { 1 } else { 0 } });
+        let resp = self
+            .client
+            .post(format!("{}/1/feedback/recording-feedback", self.base_url))
+            .header("Authorization", format!("Token {}", self.token))
+            .json(&body)
+            .send()
+            .await?;
+
+        if resp.status().is_success() {
+            info!(
+                "{} {} — {} on ListenBrainz",
+                if loved { "❤️ Loved" } else { "Un-loved" },
+                artist,
+                title
+            );
+            Ok(())
+        } else {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            Err(format!("ListenBrainz feedback failed (status {}): {}", status, text).into())
+        }
+    }
+
     async fn scrobble(&self, plays: &[Play]) -> Result<(), Box<dyn std::error::Error>> {
         if plays.is_empty() {
             return Ok(());

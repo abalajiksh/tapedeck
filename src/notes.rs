@@ -31,6 +31,10 @@ pub enum RefKind {
     Track,
     Album,
     Artist,
+    /// A piece of the writer's own equipment. Not an entity — gear lives in its
+    /// own table and is per-user, so it resolves and links differently. "Heard
+    /// this on the [[gear:Bifrost 2]] for the first time" is the point.
+    Gear,
 }
 
 impl RefKind {
@@ -39,16 +43,18 @@ impl RefKind {
             "track" | "recording" | "song" => Some(Self::Track),
             "album" | "release" => Some(Self::Album),
             "artist" => Some(Self::Artist),
+            "gear" | "equipment" => Some(Self::Gear),
             _ => None,
         }
     }
 
-    /// The `entities.kind` this maps to.
-    pub fn entity_kind(&self) -> &'static str {
+    /// The `entities.kind` this maps to, for the three that are entities.
+    pub fn entity_kind(&self) -> Option<&'static str> {
         match self {
-            Self::Track => "recording",
-            Self::Album => "release",
-            Self::Artist => "artist",
+            Self::Track => Some("recording"),
+            Self::Album => Some("release"),
+            Self::Artist => Some("artist"),
+            Self::Gear => None,
         }
     }
 }
@@ -81,10 +87,13 @@ impl Shortcode {
 /// Where a resolved shortcode points, and what to call it.
 #[derive(Debug, Clone)]
 pub struct Resolved {
-    pub entity_id: i64,
     /// Display text — for a positional ref this is the track's actual title,
     /// which is the whole point of writing `[[track:3]]`.
     pub label: String,
+    /// The URL to link to. Supplied by the caller rather than built here: gear
+    /// and entities live on different routes, and this module stays free of
+    /// any knowledge of how the app is laid out.
+    pub href: String,
 }
 
 /// Every shortcode in the text, in order of appearance.
@@ -147,8 +156,8 @@ fn substitute(src: &str, resolved: &HashMap<(RefKind, String), Resolved>) -> Str
                 // renderer rather than injected as HTML.
                 out.push('[');
                 out.push_str(&escape_link_text(&r.label));
-                out.push_str("](/notes?entity=");
-                out.push_str(&r.entity_id.to_string());
+                out.push_str("](");
+                out.push_str(&escape_link_dest(&r.href));
                 out.push(')');
             }
             None => {
@@ -165,6 +174,17 @@ fn substitute(src: &str, resolved: &HashMap<(RefKind, String), Resolved>) -> Str
 
 fn escape_link_text(s: &str) -> String {
     s.replace('\\', r"\\").replace('[', r"\[").replace(']', r"\]")
+}
+
+/// Hrefs are built by the caller, but a stray space or paren would end the
+/// Markdown destination early and spill the rest into the document. Angle
+/// brackets are Markdown's own escape for exactly this.
+fn escape_link_dest(s: &str) -> String {
+    if s.contains([' ', '(', ')', '<', '>']) {
+        format!("<{}>", s.replace('<', "%3C").replace('>', "%3E"))
+    } else {
+        s.to_string()
+    }
 }
 
 fn escape_html(s: &str) -> String {
@@ -236,17 +256,36 @@ mod tests {
         pairs
             .iter()
             .map(|(k, t, id, label)| {
-                ((*k, t.to_lowercase()), Resolved { entity_id: *id, label: label.to_string() })
+                let href = match k {
+                    RefKind::Gear => format!("/chains?gear={id}"),
+                    _ => format!("/notes?entity={id}"),
+                };
+                ((*k, t.to_lowercase()), Resolved { label: label.to_string(), href })
             })
             .collect()
     }
 
     #[test]
     fn finds_each_shortcode_kind() {
-        let codes = scan("[[track:Xtal]] from [[album:SAW 85-92]] by [[artist:Aphex Twin]]");
+        let codes = scan(
+            "[[track:Xtal]] from [[album:SAW 85-92]] by [[artist:Aphex Twin]] on [[gear:HD 650]]",
+        );
         let kinds: Vec<_> = codes.iter().map(|c| c.kind).collect();
-        assert_eq!(kinds, vec![RefKind::Track, RefKind::Album, RefKind::Artist]);
+        assert_eq!(kinds, vec![RefKind::Track, RefKind::Album, RefKind::Artist, RefKind::Gear]);
         assert_eq!(codes[1].target, "SAW 85-92");
+    }
+
+    /// Gear links somewhere else entirely, which is the reason `Resolved`
+    /// carries an href instead of an entity id.
+    #[test]
+    fn gear_refs_link_to_the_gear_page() {
+        let html = render(
+            "Heard it on the [[gear:Bifrost 2]], and on [[gear:something I don't own]].",
+            &resolved(&[(RefKind::Gear, "bifrost 2", 4, "Bifrost 2")]),
+        );
+        assert!(html.contains(r#"href="/chains?gear=4""#), "{html}");
+        // Gear you haven't catalogued is never invented — it reads as prose.
+        assert!(html.contains("td-unresolved"), "{html}");
     }
 
     #[test]
