@@ -18,6 +18,17 @@ pub trait ScrobbleSink: Any + Send + Sync {
     fn name(&self) -> &str;
     async fn scrobble(&self, plays: &[Play]) -> Result<(), Box<dyn std::error::Error>>;
     fn as_any(&self) -> &dyn Any;
+
+    /// Tell the service what's playing right now.
+    ///
+    /// Defaults to a no-op so a sink that has no such concept doesn't have to
+    /// say so. This is a trait method rather than a downcast because every
+    /// service Tapedeck forwards to *does* have the concept — it's ordinary
+    /// sink behaviour, unlike the source-specific capabilities the pipeline
+    /// downcasts for.
+    async fn update_now_playing(&self, _play: &Play) -> Result<(), Box<dyn std::error::Error>> {
+        Ok(())
+    }
 }
 
 /// Build the sinks for one user from their stored connections.
@@ -71,13 +82,11 @@ pub async fn sinks_for_user(
     sinks
 }
 
-/// Forward a now-playing update to whichever of a user's sinks support it.
+/// Forward a now-playing update to every one of a user's sinks.
 pub async fn submit_now_playing(sinks: &[Box<dyn ScrobbleSink>], play: &Play) {
     for sink in sinks {
-        if let Some(lb) = sink.as_any().downcast_ref::<ListenBrainzSink>() {
-            if let Err(e) = lb.submit_now_playing(play).await {
-                tracing::error!("Failed to forward now playing to {}: {}", sink.name(), e);
-            }
+        if let Err(e) = sink.update_now_playing(play).await {
+            tracing::error!("Failed to forward now playing to {}: {}", sink.name(), e);
         }
     }
 }

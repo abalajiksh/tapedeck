@@ -193,6 +193,10 @@ impl ScrobbleSink for ListenBrainzSink {
         self
     }
 
+    async fn update_now_playing(&self, play: &Play) -> Result<(), Box<dyn std::error::Error>> {
+        self.submit_now_playing(play).await
+    }
+
     async fn scrobble(&self, plays: &[Play]) -> Result<(), Box<dyn std::error::Error>> {
         if plays.is_empty() {
             return Ok(());

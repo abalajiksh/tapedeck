@@ -224,4 +224,58 @@ impl ScrobbleSink for LastFmSink {
         info!("✅ Successfully submitted {} plays to {}", plays.len(), self.service_name);
         Ok(())
     }
+
+    /// `track.updateNowPlaying` — the same signed form POST as a scrobble, but
+    /// unindexed and with no timestamp, since it describes a single track that
+    /// is playing rather than one that finished.
+    ///
+    /// Deliberately **not** retried. Now-playing is ephemeral: the next tick
+    /// supersedes it, so a backoff loop would only queue stale state behind a
+    /// flaky network and report it as current. A failure is logged and dropped.
+    async fn update_now_playing(&self, play: &Play) -> Result<(), Box<dyn std::error::Error>> {
+        let mut params: Vec<(String, String)> = vec![
+            ("method".into(), "track.updateNowPlaying".into()),
+            ("api_key".into(), self.api_key.clone()),
+            ("sk".into(), self.session_key.clone()),
+            ("artist".into(), play.artist.clone()),
+            ("track".into(), play.title.clone()),
+        ];
+
+        if let Some(ref album) = play.album {
+            params.push(("album".into(), album.clone()));
+        }
+        if let Some(ref artists) = play.artists {
+            if let Some(album_artist) = artists.first() {
+                if album_artist != &play.artist {
+                    params.push(("albumArtist".into(), album_artist.clone()));
+                }
+            }
+        }
+        if let Some(duration) = play.duration {
+            params.push(("duration".into(), duration.to_string()));
+        }
+        if let Some(track_num) = play.track_number {
+            params.push(("trackNumber".into(), track_num.to_string()));
+        }
+        if let Some(ref mbid) = play.mbid_recording {
+            params.push(("mbid".into(), mbid.clone()));
+        }
+
+        let signature = self.generate_signature(&params);
+        params.push(("api_sig".into(), signature));
+        params.push(("format".into(), "json".into()));
+
+        let form_data: HashMap<String, String> = params.into_iter().collect();
+
+        let resp = self.client.post(self.api_endpoint()).form(&form_data).send().await?;
+        if resp.status().is_success() {
+            debug!("Now playing sent to {}: {} - {}", self.service_name, play.artist, play.title);
+            Ok(())
+        } else {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            Err(format!("{} now-playing failed (status {}): {}", self.service_name, status, body)
+                .into())
+        }
+    }
 }
