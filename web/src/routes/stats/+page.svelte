@@ -22,6 +22,15 @@
 
 	$: maxArtist = stats ? Math.max(1, ...stats.top_artists.map((a) => (metric === 'plays' ? a.plays : a.hours))) : 1;
 	$: maxAlbum = stats ? Math.max(1, ...stats.top_albums.map((a) => (metric === 'plays' ? a.plays : a.hours))) : 1;
+	$: maxTrack = stats ? Math.max(1, ...(stats.top_tracks ?? []).map((t) => (metric === 'plays' ? t.plays : t.hours))) : 1;
+
+	/** There is no track page, so a track opens the record it's on — which is
+	 *  where its play count sits in context. Without an album there's nothing to
+	 *  open, so it falls back to the listens themselves. */
+	function openTrack(t: { title: string; artist: string; album: string | null }) {
+		if (t.album) return openAlbum(t.artist, t.album);
+		window.location.href = `/history?track=${encodeURIComponent(t.title)}`;
+	}
 	$: maxHeat = stats ? Math.max(1, ...stats.heatmap.flat()) : 1;
 
 	// Match the quality-badge colours so a tier reads the same everywhere.
@@ -87,7 +96,7 @@
 					<div style="font-size:11px;letter-spacing:.14em;text-transform:uppercase;color:#c9a678;margin-bottom:10px;">Most loyal to</div>
 					<div style="display:flex;gap:8px;flex-wrap:wrap;">
 						{#each persona.loyalty.slice(0, 6) as l}
-							<span class="tag" style="background:rgba(244,231,207,.1);color:#e9dcc4;border:none;">{l.artist} · {Math.round(l.loyalty_score)}</span>
+							<button class="tag loyal-tag" on:click={() => openArtist(l.artist)} title={`Open ${l.artist}`}>{l.artist} · {Math.round(l.loyalty_score)}</button>
 						{/each}
 					</div>
 				</div>
@@ -155,6 +164,28 @@
 			{/each}
 		{:else}
 			<p style="color:var(--td-muted);font-size:14px;margin:0;">No album data in this range yet.</p>
+		{/if}
+	</div>
+
+	<!-- Top tracks -->
+	<div class="panel" style="border-radius:22px;padding:22px;margin-bottom:16px;">
+		<h3 class="h-display" style="font-size:19px;margin:0 0 16px;">Top Tracks</h3>
+		{#if stats.top_tracks?.length}
+			{#each stats.top_tracks as t}
+				{@const v = metric === 'plays' ? t.plays : t.hours}
+				<button class="rank-row block" on:click={() => openTrack(t)} title={t.album ? `Open ${t.album}` : `Listens of ${t.title}`}>
+					<div style="display:flex;justify-content:space-between;gap:12px;font-size:13px;margin-bottom:5px;">
+						<span style="min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">
+							<span class="rank-name">{t.title}</span>
+							<span style="color:var(--td-muted-3);"> — {t.artist}</span>
+						</span>
+						<span style="color:var(--td-muted-2);flex:none;">{v}{metric === 'hours' ? 'h' : ''}</span>
+					</div>
+					<div style="height:10px;border-radius:999px;background:var(--td-track);overflow:hidden;"><div style="width:{(v / maxTrack * 100).toFixed(0)}%;height:100%;background:linear-gradient(90deg,#b2622d,#e0a06a);border-radius:999px;"></div></div>
+				</button>
+			{/each}
+		{:else}
+			<p style="color:var(--td-muted);font-size:14px;margin:0;">No plays in this range yet.</p>
 		{/if}
 	</div>
 
@@ -280,6 +311,17 @@
 	.rank-row.block { display: block; }
 	.rank-row:hover { background: var(--td-nav-hover); }
 	.rank-name { font-weight: 600; }
+	/* The loyalty chips sit on the dark personality panel, so they carry their
+	   own colours rather than the page's tag defaults. */
+	.loyal-tag {
+		background: rgba(244, 231, 207, .1);
+		color: #e9dcc4;
+		border: none;
+		cursor: pointer;
+		font: inherit;
+		font-size: 12.5px;
+	}
+	.loyal-tag:hover { background: rgba(244, 231, 207, .2); }
 	.rank-row:hover .rank-name { color: var(--td-accent); }
 
 	.spin { animation: td-spin 0.7s linear infinite; }

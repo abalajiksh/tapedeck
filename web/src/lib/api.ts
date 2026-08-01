@@ -56,6 +56,7 @@ export interface RangedStats {
 	};
 	top_artists: { name: string; plays: number; hours: number; image_url: string | null }[];
 	top_albums: { name: string; artist: string; plays: number; hours: number }[];
+	top_tracks: { title: string; artist: string; album: string | null; plays: number; hours: number }[];
 	fidelity: { name: string; plays: number; pct: number }[];
 	genres: { name: string; pct: number }[];
 	languages: { name: string; pct: number }[];

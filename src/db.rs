@@ -2308,6 +2308,28 @@ impl Database {
             })
             .collect();
 
+        // Grouped case-insensitively on title+artist, like every other listing
+        // query — the same song submitted as "Xtal" and "XTAL" by two clients is
+        // one track, not two entries competing for the same slot.
+        let track_rows: Vec<(String, String, Option<String>, i64, Option<i64>)> = sqlx::query_as(
+            "SELECT title, artist, MAX(album) AS album, COUNT(*) as plays, SUM(duration) as secs
+             FROM scrobbles WHERE user_id = ? AND skipped = FALSE AND (? IS NULL OR timestamp >= ?)
+             GROUP BY LOWER(TRIM(title)), LOWER(TRIM(artist)) ORDER BY plays DESC LIMIT 10",
+        )
+        .bind(user_id)
+        .bind(after)
+        .bind(after)
+        .fetch_all(&self.pool)
+        .await?;
+        let top_tracks: Vec<serde_json::Value> = track_rows
+            .into_iter()
+            .map(|(title, artist, album, plays, secs)| {
+                serde_json::json!({ "title": title, "artist": artist, "album": album,
+                "plays": plays,
+                "hours": (secs.unwrap_or(0) as f64 / 3600.0 * 10.0).round() / 10.0 })
+            })
+            .collect();
+
         // Fidelity mix, bucketed the way the badges are: DSD > lossless > lossy,
         // with anything unlabelled called out rather than silently dropped.
         let fidelity_rows: Vec<(String, i64)> = sqlx::query_as(
@@ -2374,6 +2396,7 @@ impl Database {
             },
             "top_artists": top_artists,
             "top_albums": top_albums,
+            "top_tracks": top_tracks,
             "fidelity": fidelity,
             "decades": decades,
             "genres": [], "languages": languages, "regions": [],
