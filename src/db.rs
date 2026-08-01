@@ -90,6 +90,60 @@ pub struct EntityRow {
     pub created_at: i64,
 }
 
+/// Aggregates behind the album and artist pages (UX 4). These are shapes for
+/// one user's own history, not catalogue facts — `plays` is *your* plays.
+#[derive(Debug, FromRow, serde::Serialize)]
+pub struct AlbumSummary {
+    pub plays: i64,
+    pub seconds: i64,
+    pub track_count: i64,
+    pub first_heard: Option<i64>,
+    pub last_heard: Option<i64>,
+    pub lossless: i64,
+    pub year: Option<i32>,
+}
+
+#[derive(Debug, FromRow, serde::Serialize)]
+pub struct ArtistSummary {
+    pub plays: i64,
+    pub seconds: i64,
+    pub track_count: i64,
+    pub album_count: i64,
+    pub first_heard: Option<i64>,
+    pub last_heard: Option<i64>,
+    pub lossless: i64,
+}
+
+/// One distinct track. The quality columns are carried raw so the frontend's
+/// existing `qualityLabel()` produces the same tag it does on a history row —
+/// duplicating that logic server-side would let the two drift.
+#[derive(Debug, FromRow, serde::Serialize)]
+pub struct TrackAggregate {
+    pub title: String,
+    pub plays: i64,
+    pub duration: Option<i64>,
+    pub track_number: Option<i32>,
+    /// Set on artist top-tracks (where the album varies), null on an album page.
+    pub album: Option<String>,
+    pub format_type: Option<String>,
+    pub codec: Option<String>,
+    pub bit_depth: Option<i32>,
+    pub sample_rate: Option<i32>,
+    pub dsd_multiplier: Option<i32>,
+    pub delivery_codec: Option<String>,
+    pub is_lossless: Option<bool>,
+}
+
+#[derive(Debug, FromRow, serde::Serialize)]
+pub struct AlbumAggregate {
+    pub name: String,
+    pub plays: i64,
+    pub year: Option<i32>,
+    pub artwork_url: Option<String>,
+    pub caa_id: Option<i64>,
+    pub caa_release_mbid: Option<String>,
+}
+
 #[derive(Debug, Clone, FromRow, serde::Serialize)]
 pub struct NoteRow {
     pub id: i64,
@@ -1295,6 +1349,259 @@ impl Database {
         .await?;
 
         Ok((artists, albums, tracks))
+    }
+
+    // ════════════════════════════════════════════════════════════
+    //  Album & artist pages (UX 4)
+    //
+    //  All of these aggregate over `scrobbles` matched by *name*, not MBID.
+    //  Most of a library is un-enriched and those are exactly the records worth
+    //  a page, so an MBID join would leave the interesting ones blank. Every
+    //  count filters `skipped = FALSE` like the rest of the counting queries.
+    // ════════════════════════════════════════════════════════════
+
+    /// Headline numbers for one album: plays, seconds, distinct tracks, first
+    /// and last heard, lossless share, and the newest release year seen.
+    #[allow(clippy::type_complexity)]
+    pub async fn album_summary(
+        &self,
+        user_id: i64,
+        artist: &str,
+        album: &str,
+    ) -> Result<Option<AlbumSummary>, sqlx::Error> {
+        let row: Option<AlbumSummary> = sqlx::query_as(
+            "SELECT COUNT(*) AS plays,
+                    COALESCE(SUM(duration), 0) AS seconds,
+                    COUNT(DISTINCT LOWER(TRIM(title))) AS track_count,
+                    MIN(timestamp) AS first_heard,
+                    MAX(timestamp) AS last_heard,
+                    SUM(CASE WHEN is_lossless = TRUE THEN 1 ELSE 0 END) AS lossless,
+                    MAX(release_year) AS year
+             FROM scrobbles
+             WHERE user_id = ? AND skipped = FALSE
+               AND LOWER(TRIM(artist)) = ? AND LOWER(TRIM(album)) = ?",
+        )
+        .bind(user_id)
+        .bind(artist.trim().to_lowercase())
+        .bind(album.trim().to_lowercase())
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.filter(|r| r.plays > 0))
+    }
+
+    /// One row per distinct track on the album, most played first.
+    ///
+    /// The quality columns come from the *most recent* listen of that track
+    /// rather than an average: "what it sounds like when I play it now" is the
+    /// useful answer, and averaging a codec is meaningless anyway.
+    pub async fn album_tracks(
+        &self,
+        user_id: i64,
+        artist: &str,
+        album: &str,
+    ) -> Result<Vec<TrackAggregate>, sqlx::Error> {
+        sqlx::query_as(
+            "SELECT title,
+                    COUNT(*) AS plays,
+                    MAX(duration) AS duration,
+                    MIN(track_number) AS track_number,
+                    NULL AS album,
+                    (SELECT s2.format_type FROM scrobbles s2 WHERE s2.user_id = s.user_id
+                       AND LOWER(TRIM(s2.title)) = LOWER(TRIM(s.title))
+                       AND LOWER(TRIM(s2.artist)) = LOWER(TRIM(s.artist))
+                       AND s2.skipped = FALSE ORDER BY s2.timestamp DESC LIMIT 1) AS format_type,
+                    (SELECT s2.codec FROM scrobbles s2 WHERE s2.user_id = s.user_id
+                       AND LOWER(TRIM(s2.title)) = LOWER(TRIM(s.title))
+                       AND LOWER(TRIM(s2.artist)) = LOWER(TRIM(s.artist))
+                       AND s2.skipped = FALSE ORDER BY s2.timestamp DESC LIMIT 1) AS codec,
+                    (SELECT s2.bit_depth FROM scrobbles s2 WHERE s2.user_id = s.user_id
+                       AND LOWER(TRIM(s2.title)) = LOWER(TRIM(s.title))
+                       AND LOWER(TRIM(s2.artist)) = LOWER(TRIM(s.artist))
+                       AND s2.skipped = FALSE ORDER BY s2.timestamp DESC LIMIT 1) AS bit_depth,
+                    (SELECT s2.sample_rate FROM scrobbles s2 WHERE s2.user_id = s.user_id
+                       AND LOWER(TRIM(s2.title)) = LOWER(TRIM(s.title))
+                       AND LOWER(TRIM(s2.artist)) = LOWER(TRIM(s.artist))
+                       AND s2.skipped = FALSE ORDER BY s2.timestamp DESC LIMIT 1) AS sample_rate,
+                    (SELECT s2.dsd_multiplier FROM scrobbles s2 WHERE s2.user_id = s.user_id
+                       AND LOWER(TRIM(s2.title)) = LOWER(TRIM(s.title))
+                       AND LOWER(TRIM(s2.artist)) = LOWER(TRIM(s.artist))
+                       AND s2.skipped = FALSE ORDER BY s2.timestamp DESC LIMIT 1) AS dsd_multiplier,
+                    (SELECT s2.delivery_codec FROM scrobbles s2 WHERE s2.user_id = s.user_id
+                       AND LOWER(TRIM(s2.title)) = LOWER(TRIM(s.title))
+                       AND LOWER(TRIM(s2.artist)) = LOWER(TRIM(s.artist))
+                       AND s2.skipped = FALSE ORDER BY s2.timestamp DESC LIMIT 1) AS delivery_codec,
+                    (SELECT s2.is_lossless FROM scrobbles s2 WHERE s2.user_id = s.user_id
+                       AND LOWER(TRIM(s2.title)) = LOWER(TRIM(s.title))
+                       AND LOWER(TRIM(s2.artist)) = LOWER(TRIM(s.artist))
+                       AND s2.skipped = FALSE ORDER BY s2.timestamp DESC LIMIT 1) AS is_lossless
+             FROM scrobbles s
+             WHERE user_id = ? AND skipped = FALSE
+               AND LOWER(TRIM(artist)) = ? AND LOWER(TRIM(album)) = ?
+             GROUP BY LOWER(TRIM(title))
+             ORDER BY plays DESC, track_number ASC",
+        )
+        .bind(user_id)
+        .bind(artist.trim().to_lowercase())
+        .bind(album.trim().to_lowercase())
+        .fetch_all(&self.pool)
+        .await
+    }
+
+    /// This artist's albums, most played first. `exclude` drops the one you're
+    /// already looking at, for the "More from …" strip.
+    pub async fn artist_albums(
+        &self,
+        user_id: i64,
+        artist: &str,
+        exclude: Option<&str>,
+        limit: i64,
+    ) -> Result<Vec<AlbumAggregate>, sqlx::Error> {
+        sqlx::query_as(
+            "SELECT album AS name, COUNT(*) AS plays, MAX(release_year) AS year,
+                    MAX(artwork_url) AS artwork_url, MAX(caa_id) AS caa_id,
+                    MAX(caa_release_mbid) AS caa_release_mbid
+             FROM scrobbles
+             WHERE user_id = ? AND skipped = FALSE AND LOWER(TRIM(artist)) = ?
+               AND album IS NOT NULL AND TRIM(album) != ''
+               AND (? IS NULL OR LOWER(TRIM(album)) != ?)
+             GROUP BY LOWER(TRIM(album))
+             ORDER BY plays DESC LIMIT ?",
+        )
+        .bind(user_id)
+        .bind(artist.trim().to_lowercase())
+        .bind(exclude.map(|e| e.trim().to_lowercase()))
+        .bind(exclude.map(|e| e.trim().to_lowercase()))
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+    }
+
+    /// Headline numbers for one artist, plus their share of everything.
+    pub async fn artist_summary(
+        &self,
+        user_id: i64,
+        artist: &str,
+    ) -> Result<Option<ArtistSummary>, sqlx::Error> {
+        let row: Option<ArtistSummary> = sqlx::query_as(
+            "SELECT COUNT(*) AS plays,
+                    COALESCE(SUM(duration), 0) AS seconds,
+                    COUNT(DISTINCT LOWER(TRIM(title))) AS track_count,
+                    COUNT(DISTINCT CASE WHEN album IS NOT NULL AND TRIM(album) != ''
+                          THEN LOWER(TRIM(album)) END) AS album_count,
+                    MIN(timestamp) AS first_heard,
+                    MAX(timestamp) AS last_heard,
+                    SUM(CASE WHEN is_lossless = TRUE THEN 1 ELSE 0 END) AS lossless
+             FROM scrobbles
+             WHERE user_id = ? AND skipped = FALSE AND LOWER(TRIM(artist)) = ?",
+        )
+        .bind(user_id)
+        .bind(artist.trim().to_lowercase())
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.filter(|r| r.plays > 0))
+    }
+
+    /// Where this artist sits in the user's all-time ranking, and how many
+    /// artists they've heard at all (so the UI can say "#3 of 412").
+    pub async fn artist_rank(&self, user_id: i64, artist: &str) -> Result<(i64, i64), sqlx::Error> {
+        let rows: Vec<(String, i64)> = sqlx::query_as(
+            "SELECT artist, COUNT(*) AS plays FROM scrobbles
+             WHERE user_id = ? AND skipped = FALSE
+             GROUP BY LOWER(TRIM(artist)) ORDER BY plays DESC",
+        )
+        .bind(user_id)
+        .fetch_all(&self.pool)
+        .await?;
+        let needle = artist.trim().to_lowercase();
+        let rank = rows
+            .iter()
+            .position(|(a, _)| a.trim().to_lowercase() == needle)
+            .map(|i| i as i64 + 1)
+            .unwrap_or(0);
+        Ok((rank, rows.len() as i64))
+    }
+
+    /// This artist's most played tracks, with the album each was heard on.
+    pub async fn artist_top_tracks(
+        &self,
+        user_id: i64,
+        artist: &str,
+        limit: i64,
+    ) -> Result<Vec<TrackAggregate>, sqlx::Error> {
+        sqlx::query_as(
+            "SELECT title,
+                    COUNT(*) AS plays,
+                    MAX(duration) AS duration,
+                    MIN(track_number) AS track_number,
+                    MAX(album) AS album,
+                    MAX(format_type) AS format_type,
+                    MAX(codec) AS codec,
+                    MAX(bit_depth) AS bit_depth,
+                    MAX(sample_rate) AS sample_rate,
+                    MAX(dsd_multiplier) AS dsd_multiplier,
+                    MAX(delivery_codec) AS delivery_codec,
+                    MAX(is_lossless) AS is_lossless
+             FROM scrobbles
+             WHERE user_id = ? AND skipped = FALSE AND LOWER(TRIM(artist)) = ?
+             GROUP BY LOWER(TRIM(title))
+             ORDER BY plays DESC LIMIT ?",
+        )
+        .bind(user_id)
+        .bind(artist.trim().to_lowercase())
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+    }
+
+    /// Plays per calendar year for the artist trend bars. Years are formatted
+    /// with SQLite's own `strftime` so they follow the stored UTC timestamp;
+    /// this is a shape, not a precise local-time histogram.
+    pub async fn artist_trend(
+        &self,
+        user_id: i64,
+        artist: &str,
+    ) -> Result<Vec<(String, i64)>, sqlx::Error> {
+        sqlx::query_as(
+            "SELECT strftime('%Y', timestamp, 'unixepoch') AS year, COUNT(*) AS plays
+             FROM scrobbles
+             WHERE user_id = ? AND skipped = FALSE AND LOWER(TRIM(artist)) = ?
+             GROUP BY year ORDER BY year ASC",
+        )
+        .bind(user_id)
+        .bind(artist.trim().to_lowercase())
+        .fetch_all(&self.pool)
+        .await
+    }
+
+    /// Total non-skipped listens, for "share of your listening".
+    pub async fn total_plays(&self, user_id: i64) -> Result<i64, sqlx::Error> {
+        let (n,): (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM scrobbles WHERE user_id = ? AND skipped = FALSE")
+                .bind(user_id)
+                .fetch_one(&self.pool)
+                .await?;
+        Ok(n)
+    }
+
+    /// Best artwork known for an album — used by the album hero and the cards.
+    pub async fn album_artwork(
+        &self,
+        user_id: i64,
+        artist: &str,
+        album: &str,
+    ) -> Result<Option<(Option<String>, Option<i64>, Option<String>)>, sqlx::Error> {
+        sqlx::query_as(
+            "SELECT artwork_url, caa_id, caa_release_mbid FROM scrobbles
+             WHERE user_id = ? AND skipped = FALSE
+               AND LOWER(TRIM(artist)) = ? AND LOWER(TRIM(album)) = ?
+               AND (artwork_url IS NOT NULL AND artwork_url != '' OR caa_id > 0)
+             ORDER BY timestamp DESC LIMIT 1",
+        )
+        .bind(user_id)
+        .bind(artist.trim().to_lowercase())
+        .bind(album.trim().to_lowercase())
+        .fetch_optional(&self.pool)
+        .await
     }
 
     /// (total listens, newest listened_at) for a user — the two numbers the

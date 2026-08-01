@@ -7,6 +7,7 @@ mod export;
 pub mod import;
 pub mod ingest;
 mod lb_api;
+mod library;
 pub mod models;
 mod notes;
 pub mod now_playing;
@@ -73,6 +74,7 @@ pub fn build_app(state: Arc<AppState>) -> Router {
         .merge(import::create_import_router())
         .merge(connections::create_connections_router())
         .merge(notes::create_notes_router())
+        .merge(library::create_library_router())
         .with_state(state);
 
     // The SPA is the fallback, not a `/*path` route: a route would only answer

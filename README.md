@@ -619,6 +619,9 @@ means session-only.
 | POST | `/api/v1/notes/preview` | Auth | Render Markdown + shortcodes without saving |
 | GET/POST | `/api/v1/loves` | Auth | List loves / love or un-love an entity |
 | GET | `/api/v1/loves/keys` | Auth | Loved entity keys, so listen rows render a heart without a request each |
+| GET | `/api/v1/albums/{id}` | Auth | Album page — your plays, tracklist, other records by that artist |
+| GET | `/api/v1/artists/{id}` | Auth | Artist page — rank, top albums and tracks, plays by year |
+| GET | `/api/v1/resolve` | Auth | Name → entity id (`kind`, `name`, `artist`), created on first use |
 | GET | `/api/v1/entities/{id}` | Auth | An entity with the caller's note and love state |
 | GET | `/api/v1/scrobbles/{id}/annotations` | Auth | Notes and loves around one listen (read-only — creates nothing) |
 

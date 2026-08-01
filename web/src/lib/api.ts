@@ -329,6 +329,76 @@ export interface UserInfo {
 	is_admin: boolean;
 }
 
+/** Raw quality columns, carried so `qualityLabel()` produces the same tag it
+ *  does on a history row rather than a second implementation. */
+export interface TrackAggregate {
+	title: string;
+	plays: number;
+	duration: number | null;
+	track_number: number | null;
+	album: string | null;
+	format_type: string | null;
+	codec: string | null;
+	bit_depth: number | null;
+	sample_rate: number | null;
+	dsd_multiplier: number | null;
+	delivery_codec: string | null;
+	is_lossless: boolean | null;
+}
+
+export interface AlbumAggregate {
+	name: string;
+	plays: number;
+	year: number | null;
+	artwork_url: string | null;
+	caa_id: number | null;
+	caa_release_mbid: string | null;
+}
+
+/** Pre-formatted by the server so every surface phrases a number identically. */
+export interface StatCard {
+	k: string;
+	v: string;
+	sub: string;
+	tone: 'plain' | 'dark';
+}
+
+export interface AlbumView {
+	id: number;
+	title: string;
+	artist: string;
+	artist_entity_id: number | null;
+	mbid: string | null;
+	year: number | null;
+	track_count: number;
+	/** Time you've spent on this record — not the record's length. */
+	listening_seconds: number;
+	plays: number;
+	artwork_url: string | null;
+	caa_id: number | null;
+	caa_release_mbid: string | null;
+	loved: boolean;
+	stats: StatCard[];
+	tracks: TrackAggregate[];
+	more: AlbumAggregate[];
+}
+
+export interface ArtistView {
+	id: number;
+	name: string;
+	mbid: string | null;
+	rank: number;
+	artist_total: number;
+	plays: number;
+	album_count: number;
+	track_count: number;
+	loved: boolean;
+	stats: StatCard[];
+	albums: AlbumAggregate[];
+	top_tracks: TrackAggregate[];
+	trend: { label: string; value: number }[];
+}
+
 export interface SearchResults {
 	artists: { name: string; plays: number }[];
 	albums: { name: string; artist: string; plays: number }[];
@@ -572,6 +642,16 @@ class TapedeckAPI {
 	// ── Search ──
 	async search(q: string, limit = 10): Promise<SearchResults> {
 		return this.get(`/api/v1/search?q=${encodeURIComponent(q)}&limit=${limit}`);
+	}
+
+	// ── Album & artist pages ──
+	async getAlbum(id: number): Promise<AlbumView> { return this.get(`/api/v1/albums/${id}`); }
+	async getArtist(id: number): Promise<ArtistView> { return this.get(`/api/v1/artists/${id}`); }
+	/** Name → entity id, creating it on first use. See `$lib/entities`. */
+	async resolveEntity(kind: 'album' | 'artist' | 'track', name: string, artist?: string): Promise<{ id: number; kind: string }> {
+		const q = new URLSearchParams({ kind, name });
+		if (artist) q.set('artist', artist);
+		return this.get(`/api/v1/resolve?${q}`);
 	}
 
 	async getDevices(): Promise<{ devices: Device[] }> { return this.get('/api/v1/devices'); }

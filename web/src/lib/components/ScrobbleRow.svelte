@@ -4,6 +4,7 @@
 	import CoverArt from './CoverArt.svelte';
 	import { createEventDispatcher } from 'svelte';
 	import { lovedKeys, loveKey, toggleLove } from '$lib/loves';
+	import { openAlbum, openArtist } from '$lib/entities';
 
 	export let scrobble: Scrobble;
 	export let showMenu = false;
@@ -12,6 +13,8 @@
 	/** The heart is the point of the row for most people, but selection mode is
 	 *  about bulk edits — a stray love there is a misclick, so it's hidden. */
 	export let showLove = true;
+	/** Off in selection mode, where a click is meant to select the row. */
+	$: linkable = !selectable;
 
 	const dispatch = createEventDispatcher<{ menu: Scrobble; toggle: Scrobble }>();
 
@@ -33,7 +36,20 @@
 	<CoverArt url={scrobble.artwork_url} caaId={scrobble.caa_id} releaseMbid={scrobble.caa_release_mbid} {seed} />
 	<div style="flex:1;min-width:0;">
 		<div style="font-size:14.5px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">{scrobble.title}</div>
-		<div style="font-size:12.5px;color:var(--td-muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">{scrobble.artist}{scrobble.album ? ` — ${scrobble.album}` : ''}</div>
+		<div style="font-size:12.5px;color:var(--td-muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">
+			{#if linkable}
+				<!-- Buttons rather than anchors: the row knows names, and an entity
+				     id has to be resolved (and possibly created) before there is a
+				     URL to go to. -->
+				<button class="xref" on:click|stopPropagation={() => openArtist(scrobble.artist)}>{scrobble.artist}</button>
+				{#if scrobble.album}
+					<span aria-hidden="true"> — </span>
+					<button class="xref" on:click|stopPropagation={() => scrobble.album && openAlbum(scrobble.artist, scrobble.album)}>{scrobble.album}</button>
+				{/if}
+			{:else}
+				{scrobble.artist}{scrobble.album ? ` — ${scrobble.album}` : ''}
+			{/if}
+		</div>
 	</div>
 	{#if showLove && !selectable}
 		<button
@@ -85,4 +101,15 @@
 	@media (hover: none) {
 		.love { opacity: 1; }
 	}
+	/* Reads as the secondary line it replaces until you point at it — the row
+	   shouldn't look like two links stapled under every title. */
+	.xref {
+		border: none;
+		background: transparent;
+		padding: 0;
+		cursor: pointer;
+		font: inherit;
+		color: inherit;
+	}
+	.xref:hover { color: var(--td-accent); text-decoration: underline; }
 </style>
