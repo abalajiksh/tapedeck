@@ -2268,7 +2268,7 @@ impl Database {
         let top_rows: Vec<(String, i64, Option<i64>)> = sqlx::query_as(
             "SELECT artist, COUNT(*) as plays, SUM(duration) as secs
              FROM scrobbles WHERE user_id = ? AND skipped = FALSE AND (? IS NULL OR timestamp >= ?)
-             GROUP BY artist ORDER BY plays DESC LIMIT 10",
+             GROUP BY artist ORDER BY plays DESC LIMIT 50",
         )
         .bind(user_id)
         .bind(after)
@@ -2293,7 +2293,7 @@ impl Database {
             "SELECT album, artist, COUNT(*) as plays, SUM(duration) as secs
              FROM scrobbles WHERE user_id = ? AND skipped = FALSE AND (? IS NULL OR timestamp >= ?)
                AND album IS NOT NULL AND album != ''
-             GROUP BY album, artist ORDER BY plays DESC LIMIT 10",
+             GROUP BY album, artist ORDER BY plays DESC LIMIT 50",
         )
         .bind(user_id)
         .bind(after)
@@ -2314,7 +2314,7 @@ impl Database {
         let track_rows: Vec<(String, String, Option<String>, i64, Option<i64>)> = sqlx::query_as(
             "SELECT title, artist, MAX(album) AS album, COUNT(*) as plays, SUM(duration) as secs
              FROM scrobbles WHERE user_id = ? AND skipped = FALSE AND (? IS NULL OR timestamp >= ?)
-             GROUP BY LOWER(TRIM(title)), LOWER(TRIM(artist)) ORDER BY plays DESC LIMIT 10",
+             GROUP BY LOWER(TRIM(title)), LOWER(TRIM(artist)) ORDER BY plays DESC LIMIT 50",
         )
         .bind(user_id)
         .bind(after)

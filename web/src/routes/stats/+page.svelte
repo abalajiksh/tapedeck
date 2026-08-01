@@ -18,6 +18,14 @@
 	let loading = true;
 	let metric: 'plays' | 'hours' = 'plays';
 
+	/** How many rows a top list shows before "See all". Six is what fits beside
+	 *  its neighbours without the panels growing unequal. */
+	const COLLAPSED = 6;
+	/** Computed once rather than re-tested in every row: inside an `{#each}` the
+	 *  checker narrows `metric` to its initialiser and flags the comparison. */
+	$: unit = metric === 'hours' ? 'h' : '';
+	let showAll = { artists: false, albums: false, tracks: false };
+
 	const days = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
 
 	$: maxArtist = stats ? Math.max(1, ...stats.top_artists.map((a) => (metric === 'plays' ? a.plays : a.hours))) : 1;
@@ -61,10 +69,19 @@
 		<h1 class="h-display" style="font-size:38px;">Analytics</h1>
 		<p style="margin:6px 0 0;color:var(--td-muted);font-size:15px;">The shape of your listening.</p>
 	</div>
-	<div style="display:inline-flex;background:var(--td-sidebar);border-radius:999px;padding:4px;gap:2px;">
-		{#each ranges as r}
-			<button class="seg-btn" class:on={range === r.v} on:click={() => setRange(r.v)}>{r.label}</button>
-		{/each}
+	<!-- Plays/Hours drove all three top lists but sat inside the Top Artists
+	     header; side by side there is no one panel it belongs to, so it moves up
+	     next to the range it works with. -->
+	<div style="display:flex;gap:10px;flex-wrap:wrap;">
+		<div style="display:inline-flex;background:var(--td-sidebar);border-radius:999px;padding:4px;gap:2px;">
+			{#each ranges as r}
+				<button class="seg-btn" class:on={range === r.v} on:click={() => setRange(r.v)}>{r.label}</button>
+			{/each}
+		</div>
+		<div style="display:inline-flex;background:var(--td-sidebar);border-radius:999px;padding:4px;gap:2px;">
+			<button class="seg-btn" class:on={metric === 'plays'} on:click={() => (metric = 'plays')}>Plays</button>
+			<button class="seg-btn" class:on={metric === 'hours'} on:click={() => (metric = 'hours')}>Hours</button>
+		</div>
 	</div>
 </div>
 
@@ -120,73 +137,92 @@
 		<div class="panel" style="border-radius:20px;padding:18px 20px;"><div style="font-size:10.5px;letter-spacing:.1em;text-transform:uppercase;color:var(--td-muted-2);margin-bottom:6px;">DSD</div><div class="h-display" style="font-size:30px;line-height:1;color:#b2622d;">{t.dsd_pct}%</div></div>
 	</div>
 
-	<!-- Top artists -->
-	<div class="panel" style="border-radius:22px;padding:22px;margin-bottom:16px;">
-		<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px;">
-			<h3 class="h-display" style="font-size:19px;">Top Artists</h3>
-			<div style="display:inline-flex;background:var(--td-sidebar);border-radius:999px;padding:3px;gap:2px;">
-				<button class="seg-btn" class:on={metric === 'plays'} on:click={() => (metric = 'plays')}>Plays</button>
-				<button class="seg-btn" class:on={metric === 'hours'} on:click={() => (metric = 'hours')}>Hours</button>
+	<!-- Top artists / albums / tracks.
+	     Side by side, as the redesign has them: three stacked full-width panels
+	     of six bars each was a lot of vertical space for very little. `auto-fit`
+	     drops them to two columns and then one as the viewport narrows. -->
+	<div class="tops">
+		<div class="panel top-panel">
+			<div class="top-head">
+				<h3 class="h-display" style="font-size:19px;margin:0;">Top Artists</h3>
+				{#if stats.top_artists.length > COLLAPSED}
+					<button class="see-all" on:click={() => (showAll.artists = !showAll.artists)}>
+						{showAll.artists ? 'Show less' : `See all ${stats.top_artists.length} →`}
+					</button>
+				{/if}
 			</div>
+			{#if stats.top_artists.length}
+				<div class="top-list" class:expanded={showAll.artists}>
+					{#each showAll.artists ? stats.top_artists : stats.top_artists.slice(0, COLLAPSED) as a, i}
+						{@const v = metric === 'plays' ? a.plays : a.hours}
+						<button class="rank-row" on:click={() => openArtist(a.name)} title={`Open ${a.name}`}>
+							<span class="rank-n">{i + 1}</span>
+							<CoverArt url={a.image_url} seed={a.name} size={30} radius={999} />
+							<div style="flex:1;min-width:0;">
+								<div class="rank-line"><span class="rank-name">{a.name}</span><span class="rank-val">{v}{unit}</span></div>
+								<div class="rank-track"><div style="width:{(v / maxArtist * 100).toFixed(0)}%;height:100%;background:linear-gradient(90deg,#c67139,#e07a55);border-radius:999px;"></div></div>
+							</div>
+						</button>
+					{/each}
+				</div>
+			{:else}
+				<p style="color:var(--td-muted);font-size:14px;margin:0;">No plays in this range yet.</p>
+			{/if}
 		</div>
-		{#if stats.top_artists.length}
-			{#each stats.top_artists as a}
-				{@const v = metric === 'plays' ? a.plays : a.hours}
-				<button class="rank-row" on:click={() => openArtist(a.name)} title={`Open ${a.name}`}>
-					<CoverArt url={a.image_url} seed={a.name} size={34} radius={999} />
-					<div style="flex:1;min-width:0;">
-						<div style="display:flex;justify-content:space-between;font-size:13px;margin-bottom:5px;"><span class="rank-name">{a.name}</span><span style="color:var(--td-muted-2);">{v}{metric === 'hours' ? 'h' : ''}</span></div>
-						<div style="height:10px;border-radius:999px;background:var(--td-track);overflow:hidden;"><div style="width:{(v / maxArtist * 100).toFixed(0)}%;height:100%;background:linear-gradient(90deg,#c67139,#e07a55);border-radius:999px;"></div></div>
-					</div>
-				</button>
-			{/each}
-		{:else}
-			<p style="color:var(--td-muted);font-size:14px;margin:0;">No plays in this range yet.</p>
-		{/if}
-	</div>
 
-	<!-- Top albums -->
-	<div class="panel" style="border-radius:22px;padding:22px;margin-bottom:16px;">
-		<h3 class="h-display" style="font-size:19px;margin:0 0 16px;">Top Albums</h3>
-		{#if stats.top_albums.length}
-			{#each stats.top_albums as al}
-				{@const v = metric === 'plays' ? al.plays : al.hours}
-				<button class="rank-row block" on:click={() => openAlbum(al.artist, al.name)} title={`Open ${al.name}`}>
-					<div style="display:flex;justify-content:space-between;gap:12px;font-size:13px;margin-bottom:5px;">
-						<span style="min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">
-							<span class="rank-name">{al.name}</span>
-							<span style="color:var(--td-muted-3);"> — {al.artist}</span>
-						</span>
-						<span style="color:var(--td-muted-2);flex:none;">{v}{metric === 'hours' ? 'h' : ''}</span>
-					</div>
-					<div style="height:10px;border-radius:999px;background:var(--td-track);overflow:hidden;"><div style="width:{(v / maxAlbum * 100).toFixed(0)}%;height:100%;background:linear-gradient(90deg,#7a8a5e,#aebf92);border-radius:999px;"></div></div>
-				</button>
-			{/each}
-		{:else}
-			<p style="color:var(--td-muted);font-size:14px;margin:0;">No album data in this range yet.</p>
-		{/if}
-	</div>
+		<div class="panel top-panel">
+			<div class="top-head">
+				<h3 class="h-display" style="font-size:19px;margin:0;">Top Albums</h3>
+				{#if stats.top_albums.length > COLLAPSED}
+					<button class="see-all" on:click={() => (showAll.albums = !showAll.albums)}>
+						{showAll.albums ? 'Show less' : `See all ${stats.top_albums.length} →`}
+					</button>
+				{/if}
+			</div>
+			{#if stats.top_albums.length}
+				<div class="top-list" class:expanded={showAll.albums}>
+					{#each showAll.albums ? stats.top_albums : stats.top_albums.slice(0, COLLAPSED) as al, i}
+						{@const v = metric === 'plays' ? al.plays : al.hours}
+						<button class="rank-row block" on:click={() => openAlbum(al.artist, al.name)} title={`Open ${al.name}`}>
+							<div class="rank-line">
+								<span class="rank-label"><span class="rank-n inline">{i + 1}</span><span class="rank-name">{al.name}</span><span class="rank-sub"> — {al.artist}</span></span>
+								<span class="rank-val">{v}{unit}</span>
+							</div>
+							<div class="rank-track"><div style="width:{(v / maxAlbum * 100).toFixed(0)}%;height:100%;background:linear-gradient(90deg,#7a8a5e,#aebf92);border-radius:999px;"></div></div>
+						</button>
+					{/each}
+				</div>
+			{:else}
+				<p style="color:var(--td-muted);font-size:14px;margin:0;">No album data in this range yet.</p>
+			{/if}
+		</div>
 
-	<!-- Top tracks -->
-	<div class="panel" style="border-radius:22px;padding:22px;margin-bottom:16px;">
-		<h3 class="h-display" style="font-size:19px;margin:0 0 16px;">Top Tracks</h3>
-		{#if stats.top_tracks?.length}
-			{#each stats.top_tracks as t}
-				{@const v = metric === 'plays' ? t.plays : t.hours}
-				<button class="rank-row block" on:click={() => openTrack(t)} title={t.album ? `Open ${t.album}` : `Listens of ${t.title}`}>
-					<div style="display:flex;justify-content:space-between;gap:12px;font-size:13px;margin-bottom:5px;">
-						<span style="min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">
-							<span class="rank-name">{t.title}</span>
-							<span style="color:var(--td-muted-3);"> — {t.artist}</span>
-						</span>
-						<span style="color:var(--td-muted-2);flex:none;">{v}{metric === 'hours' ? 'h' : ''}</span>
-					</div>
-					<div style="height:10px;border-radius:999px;background:var(--td-track);overflow:hidden;"><div style="width:{(v / maxTrack * 100).toFixed(0)}%;height:100%;background:linear-gradient(90deg,#b2622d,#e0a06a);border-radius:999px;"></div></div>
-				</button>
-			{/each}
-		{:else}
-			<p style="color:var(--td-muted);font-size:14px;margin:0;">No plays in this range yet.</p>
-		{/if}
+		<div class="panel top-panel">
+			<div class="top-head">
+				<h3 class="h-display" style="font-size:19px;margin:0;">Top Tracks</h3>
+				{#if (stats.top_tracks?.length ?? 0) > COLLAPSED}
+					<button class="see-all" on:click={() => (showAll.tracks = !showAll.tracks)}>
+						{showAll.tracks ? 'Show less' : `See all ${stats.top_tracks.length} →`}
+					</button>
+				{/if}
+			</div>
+			{#if stats.top_tracks?.length}
+				<div class="top-list" class:expanded={showAll.tracks}>
+					{#each showAll.tracks ? stats.top_tracks : stats.top_tracks.slice(0, COLLAPSED) as t, i}
+						{@const v = metric === 'plays' ? t.plays : t.hours}
+						<button class="rank-row block" on:click={() => openTrack(t)} title={t.album ? `Open ${t.album}` : `Listens of ${t.title}`}>
+							<div class="rank-line">
+								<span class="rank-label"><span class="rank-n inline">{i + 1}</span><span class="rank-name">{t.title}</span><span class="rank-sub"> — {t.artist}</span></span>
+								<span class="rank-val">{v}{unit}</span>
+							</div>
+							<div class="rank-track"><div style="width:{(v / maxTrack * 100).toFixed(0)}%;height:100%;background:linear-gradient(90deg,#b2622d,#e0a06a);border-radius:999px;"></div></div>
+						</button>
+					{/each}
+				</div>
+			{:else}
+				<p style="color:var(--td-muted);font-size:14px;margin:0;">No plays in this range yet.</p>
+			{/if}
+		</div>
 	</div>
 
 	<!-- Fidelity mix -->
@@ -256,15 +292,18 @@
 
 <style>
 	/* One template for the labels and the cells, so they can't drift apart.
-	   `minmax(0, 22px)` lets the grid shrink on a phone and stops it stretching
-	   into fat rectangles on a wide screen. */
+	   The columns are `1fr`, not a fixed cap: capping them left most of the
+	   panel empty on a desktop while the hour labels still spanned its full
+	   width. `aspect-ratio` on the cell keeps them square as they grow, and
+	   `min-width` on the block keeps it scrollable rather than crushed on a
+	   phone. */
 	.heat { min-width: 560px; }
 	.heat-row {
 		display: grid;
-		grid-template-columns: 38px repeat(24, minmax(0, 22px));
-		gap: 3px;
+		grid-template-columns: 38px repeat(24, minmax(0, 1fr));
+		gap: 4px;
 		align-items: center;
-		margin-bottom: 3px;
+		margin-bottom: 4px;
 	}
 	.heat-head { margin-bottom: 6px; }
 	.heat-hour {
@@ -290,13 +329,53 @@
 	}
 	.heat-legend span { width: 13px; height: 13px; border-radius: 3px; }
 
-	/* The top-artist and top-album rows are the most obvious place to want an
-	   entity page from, and until now they were the only ranked lists in the app
-	   you couldn't click. Buttons, not anchors: the id is resolved on click. */
+	.tops {
+		display: grid;
+		grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+		gap: 16px;
+		margin-bottom: 16px;
+	}
+	.top-panel {
+		border-radius: 22px;
+		padding: 22px;
+		/* Equal height regardless of how many rows each list has. */
+		display: flex;
+		flex-direction: column;
+	}
+	.top-head {
+		display: flex;
+		align-items: baseline;
+		justify-content: space-between;
+		gap: 10px;
+		margin-bottom: 16px;
+	}
+	.see-all {
+		border: none;
+		background: transparent;
+		padding: 0;
+		cursor: pointer;
+		font: inherit;
+		font-size: 12.5px;
+		color: #c67139;
+		white-space: nowrap;
+	}
+	.see-all:hover { color: #e07a55; text-decoration: underline; }
+	/* Expanded, the list scrolls inside the panel rather than pushing the page
+	   down by forty rows. */
+	.top-list.expanded {
+		max-height: 420px;
+		overflow-y: auto;
+		margin-right: -6px;
+		padding-right: 6px;
+	}
+
+	/* The ranked rows are the most obvious place to want an entity page from,
+	   and until now they were the only lists in the app you couldn't click.
+	   Buttons, not anchors: the id is resolved on click. */
 	.rank-row {
 		display: flex;
 		align-items: center;
-		gap: 12px;
+		gap: 10px;
 		width: 100%;
 		margin-bottom: 13px;
 		padding: 4px 6px;
@@ -310,6 +389,36 @@
 	}
 	.rank-row.block { display: block; }
 	.rank-row:hover { background: var(--td-nav-hover); }
+	.rank-n {
+		flex: none;
+		width: 16px;
+		font-size: 11.5px;
+		font-variant-numeric: tabular-nums;
+		color: var(--td-muted-3);
+		text-align: right;
+	}
+	.rank-n.inline { display: inline-block; margin-right: 7px; }
+	.rank-line {
+		display: flex;
+		justify-content: space-between;
+		gap: 10px;
+		font-size: 13px;
+		margin-bottom: 5px;
+	}
+	.rank-label {
+		min-width: 0;
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
+	}
+	.rank-sub { color: var(--td-muted-3); }
+	.rank-val { color: var(--td-muted-2); flex: none; }
+	.rank-track {
+		height: 10px;
+		border-radius: 999px;
+		background: var(--td-track);
+		overflow: hidden;
+	}
 	.rank-name { font-weight: 600; }
 	/* The loyalty chips sit on the dark personality panel, so they carry their
 	   own colours rather than the page's tag defaults. */
