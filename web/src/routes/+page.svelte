@@ -5,6 +5,7 @@
 	import ScrobbleRow from '$lib/components/ScrobbleRow.svelte';
 	import { deck, watchNowPlaying } from '$lib/nowplaying';
 	import { formatDuration, qualityLabel, tierTagClass } from '$lib/utils';
+	import { loadLoves } from '$lib/loves';
 
 	let recent: Scrobble[] = [];
 	let loading = true;
@@ -38,8 +39,46 @@
 		return hours >= 0.1 ? `plays · ${hours} hrs` : 'plays';
 	}
 
+	// The deck updates itself every few seconds, so a stale list of recent
+	// listens underneath it was the one part of this page you had to reload by
+	// hand. Refreshed on a slow timer *and* the moment the playing track
+	// changes — a change means the previous one has just been scrobbled, which
+	// is exactly when the list below is wrong.
+	const REFRESH_MS = 30_000;
+	let refreshing = false;
+
+	async function refreshRecent() {
+		if (refreshing) return;
+		refreshing = true;
+		try {
+			const [s, r] = await Promise.all([
+				api.getDashboardStats(),
+				api.getScrobbles({ limit: 8 })
+			]);
+			today = s.today; thisWeek = s.this_week; losslessPct = s.lossless_pct;
+			todayHours = s.today_hours; weekHours = s.week_hours;
+			recent = r.scrobbles;
+		} catch {
+			// Leave what's on screen; the next tick tries again.
+		}
+		refreshing = false;
+	}
+
+	// `$deck.track` is replaced wholesale by the poll, so compare identity by
+	// name rather than by reference or it fires on every poll.
+	$: nowKey = $deck.track ? `${$deck.track.artist}|${$deck.track.title}` : '';
+	let lastKey: string | null = null;
+	$: if (!loading && nowKey !== lastKey) {
+		// The scrobble lands when the *previous* track ends, which the source
+		// reports a moment before the new one shows up here.
+		const first = lastKey === null;
+		lastKey = nowKey;
+		if (!first) setTimeout(refreshRecent, 1500);
+	}
+
 	onMount(() => {
 		const stop = watchNowPlaying();
+		loadLoves();
 
 		(async () => {
 			try {
@@ -59,7 +98,8 @@
 			loading = false;
 		})();
 
-		return stop;
+		const timer = setInterval(refreshRecent, REFRESH_MS);
+		return () => { clearInterval(timer); stop(); };
 	});
 </script>
 
