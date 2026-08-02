@@ -268,7 +268,6 @@ impl ScrobbleEngine {
         mb_client: &Arc<MusicBrainzClient>,
         lb_url: &str,
         now_playing: &NowPlayingRegistry,
-        has_active: &mut bool,
     ) {
         let (row_id, user_id) = (self.sources[i].row_id, self.sources[i].user_id);
         let Some(nd) = self.sources[i].source.as_any_mut().downcast_mut::<NavidromeSource>() else {
@@ -292,8 +291,6 @@ impl ScrobbleEngine {
                     .collect();
                 if mine.is_empty() {
                     now_playing.clear_user_source(user_id, "Navidrome");
-                } else {
-                    *has_active = true;
                 }
                 for entry in mine {
                     let mut play = entry.play.clone();
@@ -380,7 +377,6 @@ impl ScrobbleEngine {
         mb_client: &Arc<MusicBrainzClient>,
         lb_url: &str,
         now_playing: &NowPlayingRegistry,
-        has_active: &mut bool,
     ) {
         let (row_id, user_id) = (self.sources[i].row_id, self.sources[i].user_id);
         let Some(jf) = self.sources[i].source.as_any_mut().downcast_mut::<JellyfinSource>() else {
@@ -411,8 +407,6 @@ impl ScrobbleEngine {
 
         if sessions.now_playing.is_empty() {
             now_playing.clear_user_source(user_id, "Jellyfin");
-        } else {
-            *has_active = true;
         }
 
         for track in &sessions.now_playing {
@@ -474,7 +468,6 @@ impl ScrobbleEngine {
         let lb_url = self.listenbrainz_url.clone();
         let now_playing = self.now_playing.clone();
         let now = now_secs();
-        let mut has_active_now_playing = false;
 
         for i in 0..self.sources.len() {
             if self.sources[i].next_poll_at > now {
@@ -485,27 +478,11 @@ impl ScrobbleEngine {
             let (row_id, user_id) = (self.sources[i].row_id, self.sources[i].user_id);
 
             if self.sources[i].kind == "jellyfin" {
-                self.poll_jellyfin(
-                    i,
-                    &db,
-                    &mb_client,
-                    &lb_url,
-                    &now_playing,
-                    &mut has_active_now_playing,
-                )
-                .await;
+                self.poll_jellyfin(i, &db, &mb_client, &lb_url, &now_playing).await;
                 continue;
             }
             if self.sources[i].kind == "navidrome" {
-                self.poll_navidrome(
-                    i,
-                    &db,
-                    &mb_client,
-                    &lb_url,
-                    &now_playing,
-                    &mut has_active_now_playing,
-                )
-                .await;
+                self.poll_navidrome(i, &db, &mb_client, &lb_url, &now_playing).await;
                 continue;
             }
 
@@ -543,8 +520,9 @@ impl ScrobbleEngine {
                 // Plex, so an ingest client reporting for the same user survives.
                 now_playing.clear_user_source(user_id, "Plex");
             } else {
-                has_active_now_playing = true;
-                info!(
+                // Debug, not info: a track is now reported every tick for its
+                // whole length, so this fires once per poll while music plays.
+                debug!(
                     "🎧 {} active Plex session(s) for user {}",
                     session_result.now_playing.len(),
                     user_id
@@ -629,11 +607,13 @@ impl ScrobbleEngine {
             }
         }
 
-        if !has_active_now_playing {
-            self.flush_pending().await;
-        } else {
-            debug!("⏸ Skipping pending scrobbles - active now playing session");
-        }
+        // Deliberately not gated on "is anything playing". Now that a track is
+        // reported for its whole length rather than only its first half, that
+        // gate would hold every pending scrobble until the music stopped.
+        // Forwarding a listen while the same track is still on the deck is what
+        // every scrobble client does, and `delivered_sinks` stops a retry from
+        // sending it twice.
+        self.flush_pending().await;
 
         // Incrementally classify listen languages (script instantly, a few
         // MusicBrainz lookups per tick to respect the rate limit).

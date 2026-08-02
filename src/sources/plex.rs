@@ -681,7 +681,13 @@ impl PlexSource {
             let seconds = view_offset / 1000;
 
             let ready = !state.scrobbled && (pct >= 50.0 || seconds >= 240);
-            let np = is_playing && !state.scrobbled;
+            // Whether we've already banked the scrobble says nothing about
+            // what's on the deck. Gating now-playing on `!scrobbled` meant a
+            // track stopped being reported the moment it passed the halfway
+            // mark, and the pipeline reads an empty session list as
+            // "stopped" — so the deck went blank for the back half of every
+            // track and fell back to the last listen.
+            let np = is_playing;
             (ready, np)
         };
 
@@ -690,9 +696,10 @@ impl PlexSource {
             if let Some(state) = self.session_states.get_mut(&session_key) {
                 state.scrobbled = true;
             }
-            result.ready_to_scrobble.push(track);
-        } else if needs_np {
-            info!("Track now playing: '{}' by '{}'", track.title, track.artist);
+            result.ready_to_scrobble.push(track.clone());
+        }
+        if needs_np {
+            debug!("Track now playing: '{}' by '{}'", track.title, track.artist);
             result.now_playing.push(track);
         }
     }
@@ -878,5 +885,59 @@ impl MusicSource for PlexSource {
         _last_checked: u64,
     ) -> Result<Vec<Play>, Box<dyn std::error::Error>> {
         self.fetch_sessions().await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn track(offset_ms: u64) -> PlexTrack {
+        PlexTrack {
+            title: "Xtal".into(),
+            artist: "Aphex Twin".into(),
+            track_artist: None,
+            album: Some("Selected Ambient Works 85-92".into()),
+            duration: Some(300_000),
+            view_offset: Some(offset_ms),
+            rating_key: "rk1".into(),
+            parent_rating_key: None,
+            grandparent_rating_key: None,
+            session_key: Some("sk1".into()),
+            viewed_at: None,
+            audio_quality: None,
+            plex_user: None,
+        }
+    }
+
+    /// The deck must keep reporting a track after it has been banked for
+    /// scrobbling. Gating now-playing on `!scrobbled` blanked it for the back
+    /// half of every track, and the pipeline reads an empty list as "stopped".
+    #[tokio::test]
+    async fn now_playing_survives_the_scrobble_threshold() {
+        let mut src = PlexSource::new("http://localhost:32400".into(), "t".into());
+
+        // 20% in — playing, nothing to scrobble yet.
+        let mut r = SessionResult::default();
+        src.process_live_track(track(60_000), true, &mut r).await;
+        assert!(r.ready_to_scrobble.is_empty());
+        assert_eq!(r.now_playing.len(), 1);
+
+        // Crosses halfway: scrobble queued *and* still on the deck.
+        let mut r = SessionResult::default();
+        src.process_live_track(track(160_000), true, &mut r).await;
+        assert_eq!(r.ready_to_scrobble.len(), 1);
+        assert_eq!(r.now_playing.len(), 1);
+
+        // Rest of the track: still on the deck, never scrobbled twice.
+        let mut r = SessionResult::default();
+        src.process_live_track(track(260_000), true, &mut r).await;
+        assert!(r.ready_to_scrobble.is_empty());
+        assert_eq!(r.now_playing.len(), 1);
+
+        // Paused stays off the deck — an idle session is a stopped one.
+        let mut r = SessionResult::default();
+        src.process_live_track(track(270_000), false, &mut r).await;
+        assert!(r.now_playing.is_empty());
     }
 }
