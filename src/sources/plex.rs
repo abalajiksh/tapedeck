@@ -285,6 +285,11 @@ pub struct SessionMetadata {
     pub parent_rating_key: Option<String>,
     pub grandparent_rating_key: Option<String>,
     pub library_section_title: Option<String>,
+    /// Art path Plex itself reports, e.g. `/library/metadata/55821/thumb/1699`.
+    /// A track usually has none of its own and inherits the album's, which is
+    /// what `parent_thumb` carries.
+    pub thumb: Option<String>,
+    pub parent_thumb: Option<String>,
     #[serde(deserialize_with = "deserialize_u64_flexible", default)]
     pub duration: Option<u64>,
     #[serde(deserialize_with = "deserialize_u64_flexible", default)]
@@ -525,8 +530,29 @@ impl PlexSource {
         &self,
         rating_key: &str,
     ) -> Result<(Vec<u8>, String), Box<dyn std::error::Error + Send + Sync>> {
-        // `thumb` on a track is the album cover Plex already generated.
-        let endpoint = format!("{}/library/metadata/{}/thumb", self.url, rating_key);
+        // Ask Plex where the art is rather than assuming the URL shape:
+        // `/library/metadata/<key>/thumb` 404s for a track, because a track
+        // normally has no art of its own and inherits the album's. The metadata
+        // response carries both, already versioned.
+        let meta_url = format!("{}/library/metadata/{}", self.url, rating_key);
+        let meta: SessionsResponse = self
+            .client
+            .get(&meta_url)
+            .header("X-Plex-Token", &self.token)
+            .header("Accept", "application/json")
+            .send()
+            .await?
+            .json()
+            .await?;
+
+        let art_path = meta
+            .media_container
+            .metadata
+            .first()
+            .and_then(|m| m.thumb.clone().or_else(|| m.parent_thumb.clone()))
+            .ok_or("Plex has no artwork for that item")?;
+
+        let endpoint = format!("{}{}", self.url, art_path);
         let resp = self.client.get(&endpoint).header("X-Plex-Token", &self.token).send().await?;
 
         if !resp.status().is_success() {
@@ -939,5 +965,50 @@ mod tests {
         let mut r = SessionResult::default();
         src.process_live_track(track(270_000), false, &mut r).await;
         assert!(r.now_playing.is_empty());
+    }
+
+    /// The art path is read off Plex's own metadata response, so the field
+    /// names have to match what it actually sends. A track carries no `thumb`
+    /// of its own — it inherits the album's `parentThumb`, and missing that is
+    /// how `fetch_cover_art` ends up with nothing to fetch.
+    #[test]
+    fn track_metadata_falls_back_to_the_album_thumb() {
+        let body = r#"{
+            "MediaContainer": {
+                "size": 1,
+                "Metadata": [{
+                    "ratingKey": "55821",
+                    "type": "track",
+                    "title": "Xtal",
+                    "parentRatingKey": "55820",
+                    "parentTitle": "Selected Ambient Works 85-92",
+                    "parentThumb": "/library/metadata/55820/thumb/1699999999",
+                    "grandparentTitle": "Aphex Twin"
+                }]
+            }
+        }"#;
+        let parsed: SessionsResponse = serde_json::from_str(body).expect("Plex metadata shape");
+        let m = parsed.media_container.metadata.first().expect("one item");
+        assert_eq!(m.thumb, None);
+        assert_eq!(
+            m.thumb.clone().or_else(|| m.parent_thumb.clone()).as_deref(),
+            Some("/library/metadata/55820/thumb/1699999999")
+        );
+    }
+
+    /// An album asked for directly does have its own thumb, and it wins.
+    #[test]
+    fn an_items_own_thumb_wins() {
+        let body = r#"{"MediaContainer":{"Metadata":[{
+            "ratingKey":"55820","type":"album",
+            "thumb":"/library/metadata/55820/thumb/17",
+            "parentThumb":"/library/metadata/900/thumb/12"
+        }]}}"#;
+        let parsed: SessionsResponse = serde_json::from_str(body).unwrap();
+        let m = parsed.media_container.metadata.first().unwrap();
+        assert_eq!(
+            m.thumb.clone().or_else(|| m.parent_thumb.clone()).as_deref(),
+            Some("/library/metadata/55820/thumb/17")
+        );
     }
 }

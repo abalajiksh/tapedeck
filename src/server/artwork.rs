@@ -38,19 +38,29 @@ fn not_found(msg: &str) -> Response {
 
 /// Recover the remote item id from a listen's `source_id`.
 ///
-/// Formats are `navidrome-<mediaFileId>-<submissionTime>` and
-/// `plex-<ratingKey>-<suffix>`. Both ids are opaque strings that may themselves
-/// contain dashes, so split off the known prefix and the known trailing segment
-/// rather than splitting on every dash.
+/// The three formats disagree about which end is safe to split, so this can't
+/// be one rule:
+///
+/// * `plex-<ratingKey>-<suffix>` — the suffix is `np` for now-playing but
+///   `scrobble-<timestamp>` for a real listen, i.e. *two* segments. Splitting
+///   from the right yielded `<ratingKey>-scrobble` for every scrobble Plex ever
+///   produced, so the proxy asked the server for an item that doesn't exist and
+///   every polled listen fell back to the lettered tile. Rating keys are
+///   numeric, so split from the left instead.
+/// * `jellyfin-<itemId>-<device>` — device names contain dashes
+///   (`Living-Room-Mac`), and item ids are dashless hex. Left again.
+/// * `navidrome-<mediaFileId>-<submissionTime>` — ids are UUIDs, full of
+///   dashes, and the suffix is a single numeric segment. This one must split
+///   from the right.
 fn remote_item_id(source_name: &str, source_id: &str) -> Option<String> {
-    let prefix = match source_name {
-        "navidrome" => "navidrome-",
-        "Plex" | "plex" => "plex-",
-        "jellyfin" | "Jellyfin" => "jellyfin-",
+    let (prefix, from_left) = match source_name {
+        "navidrome" => ("navidrome-", false),
+        "Plex" | "plex" => ("plex-", true),
+        "jellyfin" | "Jellyfin" => ("jellyfin-", true),
         _ => return None,
     };
     let rest = source_id.strip_prefix(prefix)?;
-    let (id, _suffix) = rest.rsplit_once('-')?;
+    let id = if from_left { rest.split_once('-')?.0 } else { rest.rsplit_once('-')?.0 };
     (!id.is_empty()).then(|| id.to_string())
 }
 
@@ -140,9 +150,17 @@ mod tests {
         );
         assert_eq!(remote_item_id("navidrome", "navidrome-abc123-np").as_deref(), Some("abc123"));
         assert_eq!(remote_item_id("Plex", "plex-55821-np").as_deref(), Some("55821"));
+        // The suffix a scrobble carries is `scrobble-<ts>` — two segments. This
+        // assertion used to pin the broken `55821-scrobble`, which is why the
+        // proxy 404'd on every polled listen without anyone noticing.
         assert_eq!(
             remote_item_id("Plex", "plex-55821-scrobble-1700000000").as_deref(),
-            Some("55821-scrobble")
+            Some("55821")
+        );
+        // Jellyfin's suffix is a device name, and those contain dashes.
+        assert_eq!(
+            remote_item_id("jellyfin", "jellyfin-a1b2c3d4-Living-Room-Mac").as_deref(),
+            Some("a1b2c3d4")
         );
     }
 

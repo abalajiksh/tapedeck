@@ -135,6 +135,11 @@ pub async fn backfill_artwork(
         // 0a. Came from the user's own media server — the proxy can serve the
         //     cover of the exact file that was played, with no lookup at all and
         //     nothing asked of a third party. Always the best answer available.
+        // ponytail: written without checking the image resolves, and
+        // `artwork_url` is this queue — so a library item with genuinely no
+        // cover is stuck here and never reaches Deezer or MusicBrainz. Verify by
+        // fetching once (or have the proxy's 404 path re-queue the row) if that
+        // turns out to be common; media servers almost always have album art.
         if matches!(source_name.as_str(), "navidrome" | "Plex" | "plex" | "jellyfin" | "Jellyfin") {
             let url = format!("/api/v1/art/{id}");
             if db.set_scrobble_artwork(id, &url, None, None).await.is_ok() {
