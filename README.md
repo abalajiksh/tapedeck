@@ -632,7 +632,7 @@ means session-only.
 | POST | `/api/v1/loves/pull` | Auth | Fetch loved tracks from every connected service |
 | GET | `/metrics` | Token/Session | Prometheus exposition (`TAPEDECK_METRICS_TOKEN` bearer) |
 | GET | `/api/v1/sanitize` | Auth | Preview metadata fixes (mixed album releases, featured credits) |
-| POST | `/api/v1/sanitize` | Auth | Apply them (`{albums, artists, artist?, album?}`) |
+| POST | `/api/v1/sanitize` | Auth | Apply them — per-edit (`{album_edits, credit_edits, variant_edits}`) or whole-category (`{albums, artists, variants}`) |
 | GET | `/api/v1/entities/{id}` | Auth | An entity with the caller's note and love state |
 | GET | `/api/v1/scrobbles/{id}/annotations` | Auth | Notes and loves around one listen (read-only — creates nothing) |
 

@@ -52,9 +52,33 @@
 	let sanitize: import('$lib/api').SanitizePreview | null = null;
 	let sanitizing = false;
 	let sanitizeMsg = '';
-	let fixAlbums = true;
-	let fixArtists = true;
-	let fixVariants = true;
+	// Per-edit review: every proposed change is its own row with its own
+	// checkbox, because a majority vote of 4-of-29 is a guess and only the
+	// person who did the listening can tell. Keyed by identity, not index, so a
+	// refreshed preview doesn't silently re-point a tick at something else.
+	let pickedAlbums = new Set<string>();
+	let pickedCredits = new Set<string>();
+	let pickedVariants = new Set<string>();
+	/** Which release each album should unify onto — defaults to the plurality. */
+	let albumChoice: Record<string, string> = {};
+	const albumKey = (a: { artist: string; album: string }) => `${a.artist}\u0001${a.album}`;
+	const variantKey = (from: string, to: string) => `${from}\u0001${to}`;
+
+	/** Everything ticked, which is genuinely the common case. */
+	function selectAll(on: boolean) {
+		if (!sanitize) return;
+		pickedAlbums = new Set(on ? sanitize.mixed_albums.map(albumKey) : []);
+		pickedCredits = new Set(on ? sanitize.featured_artists.map((a) => a.artist) : []);
+		pickedVariants = new Set(
+			on
+				? sanitize.artist_variants.flatMap((v) =>
+						v.variants.map((x) => variantKey(x[0], v.primary))
+					)
+				: []
+		);
+	}
+
+	$: pickedCount = pickedAlbums.size + pickedCredits.size + pickedVariants.size;
 
 	// ── Rebuilding sessions ──
 	// Needed on any existing install: `assign_session` kept the session rows but
@@ -97,19 +121,56 @@
 	}
 
 	async function loadSanitize() {
-		try { sanitize = await api.sanitizePreview(); } catch { sanitize = null; }
+		try {
+			sanitize = await api.sanitizePreview();
+			// Default each album to the plurality; the operator overrules it per row.
+			albumChoice = {};
+			for (const a of sanitize.mixed_albums) {
+				if (a.winner) albumChoice[albumKey(a)] = a.winner;
+			}
+			selectAll(true);
+		} catch { sanitize = null; }
 	}
 	async function runSanitize() {
+		if (!sanitize || !pickedCount) return;
 		sanitizing = true;
 		sanitizeMsg = '';
 		try {
-			const r = await api.sanitizeApply({ albums: fixAlbums, artists: fixArtists, variants: fixVariants });
-			sanitizeMsg = `Fixed ${r.albums_fixed} album${r.albums_fixed === 1 ? '' : 's'} (${r.album_listens_changed} listens), folded ${r.artists_folded} featured credit${r.artists_folded === 1 ? '' : 's'} (${r.artist_listens_changed} listens) and merged ${r.variants_merged} artist spelling${r.variants_merged === 1 ? '' : 's'} (${r.variant_listens_changed} listens). Artwork will re-resolve in the background.`;
+			const r = await api.sanitizeApply({
+				album_edits: sanitize.mixed_albums
+					.filter((a) => pickedAlbums.has(albumKey(a)) && albumChoice[albumKey(a)])
+					.map((a) => ({
+						artist: a.artist,
+						album: a.album,
+						mbid_release: albumChoice[albumKey(a)]
+					})),
+				credit_edits: sanitize.featured_artists
+					.filter((a) => pickedCredits.has(a.artist))
+					.map((a) => ({ artist: a.artist })),
+				variant_edits: sanitize.artist_variants.flatMap((v) =>
+					v.variants
+						.filter((x) => pickedVariants.has(variantKey(x[0], v.primary)))
+						.map((x) => ({ from: x[0], to: v.primary }))
+				)
+			});
+			sanitizeMsg =
+				`Fixed ${r.albums_fixed} album${r.albums_fixed === 1 ? '' : 's'} (${r.album_listens_changed} listens), ` +
+				`folded ${r.artists_folded} featured credit${r.artists_folded === 1 ? '' : 's'} (${r.artist_listens_changed} listens) ` +
+				`and merged ${r.variants_merged} spelling${r.variants_merged === 1 ? '' : 's'} (${r.variant_listens_changed} listens). ` +
+				`Artwork will re-resolve in the background.`;
 			await loadSanitize();
 		} catch (e) {
-			sanitizeMsg = 'Failed: ' + e;
+			sanitizeMsg = 'Failed: ' + String(e).replace(/^API \d+: /, '');
 		}
 		sanitizing = false;
+	}
+
+	/** Set-in-a-let needs the reassignment to publish. */
+	function toggle(set: Set<string>, key: string): Set<string> {
+		const next = new Set(set);
+		if (next.has(key)) next.delete(key);
+		else next.add(key);
+		return next;
 	}
 
 	let confirmClear = false;
@@ -651,70 +712,89 @@
 				</p>
 
 				{#if sanitize}
-					{#if sanitize.mixed_albums.length || sanitize.featured_artists.length}
-						<div style="display:flex;flex-direction:column;gap:14px;margin-bottom:16px;">
-							{#if sanitize.mixed_albums.length}
-								<div>
-									<label style="display:flex;align-items:center;gap:9px;cursor:pointer;font-size:14px;font-weight:600;">
-										<input type="checkbox" bind:checked={fixAlbums} style="width:16px;height:16px;accent-color:var(--td-accent);cursor:pointer;">
-										{sanitize.mixed_albums.length} album{sanitize.mixed_albums.length === 1 ? '' : 's'} with mixed releases
-									</label>
-									<div style="margin:8px 0 0 25px;font-size:12.5px;color:var(--td-muted-2);display:flex;flex-direction:column;gap:4px;">
-										{#each sanitize.mixed_albums.slice(0, 6) as a}
-											<div>{a.album} — {a.artist} <span style="color:var(--td-muted-3);">· {a.variants} releases across {a.plays} plays</span></div>
-										{/each}
-										{#if sanitize.mixed_albums.length > 6}
-											<div style="color:var(--td-muted-3);">…and {sanitize.mixed_albums.length - 6} more</div>
-										{/if}
-									</div>
-								</div>
-							{/if}
-							{#if sanitize.featured_artists.length}
-								<div>
-									<label style="display:flex;align-items:center;gap:9px;cursor:pointer;font-size:14px;font-weight:600;">
-										<input type="checkbox" bind:checked={fixArtists} style="width:16px;height:16px;accent-color:var(--td-accent);cursor:pointer;">
-										{sanitize.featured_artists.length} featured credit{sanitize.featured_artists.length === 1 ? '' : 's'} splitting an artist
-									</label>
-									<div style="margin:8px 0 0 25px;font-size:12.5px;color:var(--td-muted-2);display:flex;flex-direction:column;gap:4px;">
-										{#each sanitize.featured_artists.slice(0, 6) as a}
-											<div>{a.artist} <span style="color:var(--td-muted-3);">→ {a.primary} · {a.plays} plays</span></div>
-										{/each}
-										{#if sanitize.featured_artists.length > 6}
-											<div style="color:var(--td-muted-3);">…and {sanitize.featured_artists.length - 6} more</div>
-										{/if}
-									</div>
-									<p style="margin:8px 0 0 25px;font-size:12px;color:var(--td-muted-3);">
-										The full credit is kept, so the featured performer isn't lost — it just stops
-										fragmenting the album and artist pages. Names joined by “&amp;” or “,” are left alone.
-									</p>
-								</div>
-							{/if}
-							{#if sanitize.artist_variants.length}
-								<div>
-									<label style="display:flex;align-items:center;gap:9px;cursor:pointer;font-size:14px;font-weight:600;">
-										<input type="checkbox" bind:checked={fixVariants} style="width:16px;height:16px;accent-color:var(--td-accent);cursor:pointer;">
-										{sanitize.artist_variants.length} artist{sanitize.artist_variants.length === 1 ? '' : 's'} spelled more than one way
-									</label>
-									<div style="margin:8px 0 0 25px;font-size:12.5px;color:var(--td-muted-2);display:flex;flex-direction:column;gap:4px;">
-										{#each sanitize.artist_variants.slice(0, 6) as v}
-											<div>
-												{v.variants.map((x) => x[0]).join(', ')}
-												<span style="color:var(--td-muted-3);">→ {v.primary} ({v.primary_plays} plays)</span>
-											</div>
-										{/each}
-										{#if sanitize.artist_variants.length > 6}
-											<div style="color:var(--td-muted-3);">…and {sanitize.artist_variants.length - 6} more</div>
-										{/if}
-									</div>
-									<p style="margin:8px 0 0 25px;font-size:12px;color:var(--td-muted-3);">
-										Same artist, different punctuation — “A.R. Rahman” and “A. R. Rahman” chart as two
-										people and split their play count. The most-played spelling wins.
-									</p>
-								</div>
-							{/if}
+					{@const total = sanitize.mixed_albums.length + sanitize.featured_artists.length + sanitize.artist_variants.length}
+					{#if total}
+						<div class="san-bar">
+							<span style="font-weight:600;font-size:14px;">{pickedCount} of {total} selected</span>
+							<span style="flex:1;"></span>
+							<button class="btn btn-ghost" style="font-size:12.5px;" on:click={() => selectAll(true)}>Select all</button>
+							<button class="btn btn-ghost" style="font-size:12.5px;" on:click={() => selectAll(false)}>None</button>
 						</div>
-						<button class="btn btn-primary" on:click={runSanitize} disabled={sanitizing || (!fixAlbums && !fixArtists && !fixVariants)}>
-							{sanitizing ? 'Sanitising…' : 'Apply fixes'}
+
+						{#if sanitize.mixed_albums.length}
+							<div class="san-group">Albums on more than one release</div>
+							{#each sanitize.mixed_albums as a (albumKey(a))}
+								{@const key = albumKey(a)}
+								{@const chosen = albumChoice[key]}
+								{@const chosenPlays = a.candidates.find((c) => c.mbid === chosen)?.plays ?? 0}
+								{@const weak = chosenPlays * 2 <= a.plays}
+								<label class="san-row" class:on={pickedAlbums.has(key)}>
+									<input type="checkbox" checked={pickedAlbums.has(key)}
+										on:change={() => (pickedAlbums = toggle(pickedAlbums, key))}>
+									<span style="flex:1;min-width:0;">
+										<span class="san-name">{a.album}</span>
+										<span class="san-sub">
+											{a.artist} · {a.plays} plays across {a.variants} releases{#if a.untagged}, {a.untagged} with none{/if}
+										</span>
+										<span class="san-controls">
+											<select class="input san-select" value={chosen ?? ''}
+												on:change={(e) => (albumChoice = { ...albumChoice, [key]: e.currentTarget.value })}
+												aria-label="Release to unify onto">
+												{#each a.candidates as c}
+													<option value={c.mbid}>{c.mbid.slice(0, 8)}… — {c.plays} play{c.plays === 1 ? '' : 's'}</option>
+												{/each}
+											</select>
+											{#if weak}
+												<span class="san-warn" title="No release has a clear majority — worth checking on MusicBrainz first">
+													weak majority
+												</span>
+											{/if}
+											{#if chosen}
+												<a class="san-link" href={`https://musicbrainz.org/release/${chosen}`} target="_blank" rel="noopener">check →</a>
+											{/if}
+										</span>
+									</span>
+								</label>
+							{/each}
+						{/if}
+
+						{#if sanitize.featured_artists.length}
+							<div class="san-group">Featured credits splitting an artist</div>
+							{#each sanitize.featured_artists as a (a.artist)}
+								<label class="san-row" class:on={pickedCredits.has(a.artist)}>
+									<input type="checkbox" checked={pickedCredits.has(a.artist)}
+										on:change={() => (pickedCredits = toggle(pickedCredits, a.artist))}>
+									<span style="flex:1;min-width:0;">
+										<span class="san-name">{a.artist}</span>
+										<span class="san-sub">→ {a.primary} · {a.plays} play{a.plays === 1 ? '' : 's'} · full credit is kept</span>
+									</span>
+								</label>
+							{/each}
+						{/if}
+
+						{#if sanitize.artist_variants.length}
+							<div class="san-group">One artist spelled several ways</div>
+							{#each sanitize.artist_variants as v}
+								{#each v.variants as x}
+									{@const key = variantKey(x[0], v.primary)}
+									<label class="san-row" class:on={pickedVariants.has(key)}>
+										<input type="checkbox" checked={pickedVariants.has(key)}
+											on:change={() => (pickedVariants = toggle(pickedVariants, key))}>
+										<span style="flex:1;min-width:0;">
+											<span class="san-name">{x[0]}</span>
+											<span class="san-sub">
+												→ {v.primary} · {x[1]} play{x[1] === 1 ? '' : 's'} moved to the spelling with {v.primary_plays}
+												· not reversible
+											</span>
+										</span>
+									</label>
+								{/each}
+							{/each}
+						{/if}
+
+						<button class="btn btn-primary" style="margin-top:16px;" on:click={runSanitize}
+							disabled={sanitizing || !pickedCount}>
+							{sanitizing ? 'Sanitising…' : `Apply ${pickedCount} change${pickedCount === 1 ? '' : 's'}`}
 						</button>
 					{:else}
 						<p style="font-size:14px;color:var(--td-muted);margin:0;">Nothing to fix — every album agrees with itself.</p>
@@ -838,6 +918,34 @@
 {/if}
 
 <style>
+	.san-bar {
+		display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+		padding: 10px 0 12px; border-bottom: 1px solid var(--td-border);
+	}
+	.san-group {
+		font-size: 11px; letter-spacing: .1em; text-transform: uppercase;
+		color: var(--td-muted-3); margin: 16px 0 6px;
+	}
+	.san-row {
+		display: flex; align-items: flex-start; gap: 10px;
+		padding: 9px 10px; border-radius: 12px; cursor: pointer;
+	}
+	.san-row:hover { background: var(--td-nav-hover); }
+	.san-row.on { background: color-mix(in srgb, var(--td-accent) 7%, transparent); }
+	.san-row input { width: 16px; height: 16px; margin-top: 2px; accent-color: var(--td-accent); cursor: pointer; flex: none; }
+	.san-name { display: block; font-size: 14px; font-weight: 600; overflow-wrap: anywhere; }
+	.san-sub { display: block; font-size: 12.5px; color: var(--td-muted-2); margin-top: 2px; }
+	.san-controls { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-top: 7px; }
+	.san-select { width: auto; font-size: 12px; padding: 4px 10px; }
+	/* Named rather than coloured-only: "the plurality is a minority" is the one
+	   thing the operator most needs to notice before applying. */
+	.san-warn {
+		font-size: 11px; font-weight: 600; color: #b2622d;
+		background: color-mix(in srgb, #b2622d 12%, transparent);
+		padding: 3px 8px; border-radius: 999px; white-space: nowrap;
+	}
+	.san-link { font-size: 11.5px; }
+
 	.settings-layout {
 		display: grid;
 		grid-template-columns: 208px minmax(0, 1fr);

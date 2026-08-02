@@ -447,12 +447,25 @@ export interface Session {
 	token_name: string | null;
 }
 
+export interface ReleaseCandidate { mbid: string; plays: number }
+
+export interface MixedAlbum {
+	artist: string;
+	album: string;
+	plays: number;
+	variants: number;
+	/** The plurality — a proposal, not a verdict. */
+	winner: string | null;
+	winner_plays: number;
+	/** Listens with no release at all; unifying stamps these too. */
+	untagged: number;
+	/** The whole ballot, most-claimed first, so a weak plurality is visible. */
+	candidates: ReleaseCandidate[];
+}
+
 export interface SanitizePreview {
 	/** Albums whose listens disagree about which release they are. */
-	mixed_albums: {
-		artist: string; album: string; plays: number;
-		variants: number; winner: string | null; winner_plays: number;
-	}[];
+	mixed_albums: MixedAlbum[];
 	/** `Artist feat. X` strings that fragment an album or artist page. */
 	featured_artists: { artist: string; primary: string; plays: number }[];
 	/** One artist spelled several ways ("A.R. Rahman" / "A. R. Rahman"). */
@@ -713,7 +726,14 @@ class TapedeckAPI {
 	// ── Devices & Equipment ──
 	// ── Metadata sanitiser ──
 	async sanitizePreview(): Promise<SanitizePreview> { return this.get('/api/v1/sanitize'); }
-	async sanitizeApply(opts: { albums?: boolean; artists?: boolean; variants?: boolean; artist?: string; album?: string }): Promise<SanitizeResult> {
+	/** Booleans mean "everything in this category"; the `*_edits` lists name
+	 *  individual changes and take precedence over their boolean. */
+	async sanitizeApply(opts: {
+		albums?: boolean; artists?: boolean; variants?: boolean;
+		album_edits?: { artist: string; album: string; mbid_release: string }[];
+		credit_edits?: { artist: string }[];
+		variant_edits?: { from: string; to: string }[];
+	}): Promise<SanitizeResult> {
 		return this.post('/api/v1/sanitize', opts);
 	}
 

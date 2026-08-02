@@ -141,20 +141,52 @@ async fn sanitize_preview(State(state): State<Arc<AppState>>, user: AuthUser) ->
         .into_response()
 }
 
+/// One album to unify, and onto which release.
+///
+/// `mbid_release` is carried per edit rather than re-derived, so the operator
+/// can overrule the plurality — which is the point of reviewing at all.
 #[derive(Debug, Deserialize)]
+pub struct AlbumEdit {
+    pub artist: String,
+    pub album: String,
+    pub mbid_release: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CreditEdit {
+    /// The full credit as stored, e.g. `Cœur de pirate feat. Loud`.
+    pub artist: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct VariantEdit {
+    /// The spelling being retired.
+    pub from: String,
+    /// The spelling it becomes.
+    pub to: String,
+}
+
+/// What to apply.
+///
+/// Two ways to say it, because both are the common case at different times: the
+/// booleans mean "everything in this category", the lists name individual edits.
+/// A non-empty list wins over its boolean — asking for specific edits and
+/// getting all of them would be the worst possible reading.
+#[derive(Debug, Deserialize, Default)]
 pub struct SanitizeRequest {
-    /// Unify every listen of an album onto the release the majority agree on.
     #[serde(default)]
     pub albums: bool,
-    /// Fold `Artist feat. X` into `Artist`, keeping the full credit.
     #[serde(default)]
     pub artists: bool,
-    /// Merge spellings of one artist ("A.R. Rahman" / "A. R. Rahman").
     #[serde(default)]
     pub variants: bool,
-    /// Limit to one album (`artist` + `album`) instead of the whole library.
-    pub artist: Option<String>,
-    pub album: Option<String>,
+
+    #[serde(default)]
+    pub album_edits: Vec<AlbumEdit>,
+    #[serde(default)]
+    pub credit_edits: Vec<CreditEdit>,
+    #[serde(default)]
+    pub variant_edits: Vec<VariantEdit>,
 }
 
 /// POST /api/v1/sanitize — apply the fixes the preview listed.
@@ -167,21 +199,30 @@ async fn sanitize_apply(
     let mut albums_fixed = 0u64;
     let mut artist_rows = 0u64;
     let mut artists_folded = 0u64;
+    let mut variant_rows = 0u64;
+    let mut variants_merged = 0u64;
 
-    if body.albums {
+    // ── albums ──
+    if !body.album_edits.is_empty() {
+        for e in &body.album_edits {
+            match state
+                .db
+                .unify_album_release(user.user_id, &e.artist, &e.album, &e.mbid_release)
+                .await
+            {
+                Ok(n) if n > 0 => {
+                    album_rows += n;
+                    albums_fixed += 1;
+                }
+                _ => {}
+            }
+        }
+    } else if body.albums {
         let candidates = match state.db.albums_with_mixed_releases(user.user_id).await {
             Ok(c) => c,
             Err(e) => return server_error(e.to_string()),
         };
         for c in candidates {
-            // Scoped run: skip everything but the album that was asked for.
-            if let (Some(a), Some(al)) = (body.artist.as_deref(), body.album.as_deref()) {
-                if !c.artist.eq_ignore_ascii_case(a.trim())
-                    || !c.album.eq_ignore_ascii_case(al.trim())
-                {
-                    continue;
-                }
-            }
             let Some(winner) = c.winner.as_deref() else { continue };
             match state.db.unify_album_release(user.user_id, &c.artist, &c.album, winner).await {
                 Ok(n) if n > 0 => {
@@ -193,7 +234,21 @@ async fn sanitize_apply(
         }
     }
 
-    if body.artists {
+    // ── featured credits ──
+    // The primary is derived here rather than taken from the request: it is a
+    // pure function of the stored string, and accepting an arbitrary target
+    // would turn this into "rename any artist to anything".
+    if !body.credit_edits.is_empty() {
+        for e in &body.credit_edits {
+            let Some(primary) = crate::db::split_featured(&e.artist) else { continue };
+            if let Ok(n) = state.db.fold_artist_credit(user.user_id, &e.artist, &primary).await {
+                if n > 0 {
+                    artist_rows += n;
+                    artists_folded += 1;
+                }
+            }
+        }
+    } else if body.artists {
         let candidates = match state.db.artists_with_featured_credits(user.user_id).await {
             Ok(c) => c,
             Err(e) => return server_error(e.to_string()),
@@ -208,17 +263,32 @@ async fn sanitize_apply(
         }
     }
 
-    let mut variant_rows = 0u64;
-    let mut variants_merged = 0u64;
-    if body.variants {
+    // ── spelling variants ──
+    // `from` and `to` must be two spellings of *one* name. Without that check a
+    // caller could rename any artist to any other, which is a different and much
+    // more destructive operation than the one being offered.
+    if !body.variant_edits.is_empty() {
+        for e in &body.variant_edits {
+            if crate::db::normalise_artist(&e.from) != crate::db::normalise_artist(&e.to) {
+                return err_response(
+                    StatusCode::BAD_REQUEST,
+                    format!("\"{}\" and \"{}\" aren't spellings of the same name", e.from, e.to),
+                );
+            }
+            if let Ok(n) = state.db.rename_artist(user.user_id, &e.from, &e.to).await {
+                if n > 0 {
+                    variant_rows += n;
+                    variants_merged += 1;
+                }
+            }
+        }
+    } else if body.variants {
         let candidates = match state.db.artists_with_spelling_variants(user.user_id).await {
             Ok(c) => c,
             Err(e) => return server_error(e.to_string()),
         };
         for c in candidates {
             for (spelling, _) in &c.variants {
-                // Unlike the `feat.` fold this is a pure rename — the discarded
-                // spelling is the same credit, so nothing is worth preserving.
                 if let Ok(n) = state.db.rename_artist(user.user_id, spelling, &c.primary).await {
                     if n > 0 {
                         variant_rows += n;
@@ -230,11 +300,14 @@ async fn sanitize_apply(
     }
 
     tracing::info!(
-        "🧹 Sanitised: {} listens across {} albums, {} listens across {} artist credits",
+        "🧹 Sanitised: {} listens across {} albums, {} listens across {} artist credits, \
+         {} listens across {} spellings",
         album_rows,
         albums_fixed,
         artist_rows,
-        artists_folded
+        artists_folded,
+        variant_rows,
+        variants_merged
     );
 
     (
@@ -547,6 +620,12 @@ fn not_found() -> axum::response::Response {
     )
         .into_response()
 }
+/// A 4xx with a message, for the cases the caller can fix.
+fn err_response(code: StatusCode, msg: String) -> axum::response::Response {
+    (code, Json(serde_json::json!(ErrorResponse { code: code.as_u16(), error: msg })))
+        .into_response()
+}
+
 fn server_error(msg: String) -> axum::response::Response {
     (
         StatusCode::INTERNAL_SERVER_ERROR,

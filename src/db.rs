@@ -1694,33 +1694,57 @@ impl Database {
         &self,
         user_id: i64,
     ) -> Result<Vec<MixedAlbum>, sqlx::Error> {
-        sqlx::query_as(
-            "WITH per_release AS (
-                 SELECT artist, album, mbid_release, COUNT(*) AS n
-                 FROM scrobbles
-                 WHERE user_id = ? AND skipped = FALSE
-                   AND album IS NOT NULL AND TRIM(album) != ''
-                   AND mbid_release IS NOT NULL AND TRIM(mbid_release) != ''
-                 GROUP BY LOWER(TRIM(artist)), LOWER(TRIM(album)), mbid_release
-             )
-             SELECT artist, album,
-                    SUM(n) AS plays,
-                    COUNT(*) AS variants,
-                    (SELECT p2.mbid_release FROM per_release p2
-                      WHERE LOWER(TRIM(p2.artist)) = LOWER(TRIM(p.artist))
-                        AND LOWER(TRIM(p2.album)) = LOWER(TRIM(p.album))
-                      ORDER BY p2.n DESC, p2.mbid_release ASC LIMIT 1) AS winner,
-                    (SELECT MAX(p2.n) FROM per_release p2
-                      WHERE LOWER(TRIM(p2.artist)) = LOWER(TRIM(p.artist))
-                        AND LOWER(TRIM(p2.album)) = LOWER(TRIM(p.album))) AS winner_plays
-             FROM per_release p
-             GROUP BY LOWER(TRIM(artist)), LOWER(TRIM(album))
-             HAVING variants > 1
-             ORDER BY plays DESC",
+        // One flat query, grouped in Rust. The previous version did the
+        // majority vote in SQL with correlated subqueries and could only report
+        // the winner; per-edit review needs every candidate and its play count,
+        // because deciding whether a 4-of-29 plurality is trustworthy is
+        // exactly the judgement being handed to the operator.
+        let rows: Vec<(String, String, Option<String>, i64)> = sqlx::query_as(
+            "SELECT artist, album, mbid_release, COUNT(*) AS n
+               FROM scrobbles
+              WHERE user_id = ? AND skipped = FALSE
+                AND album IS NOT NULL AND TRIM(album) != ''
+              GROUP BY LOWER(TRIM(artist)), LOWER(TRIM(album)), mbid_release
+              ORDER BY n DESC",
         )
         .bind(user_id)
         .fetch_all(&self.pool)
-        .await
+        .await?;
+
+        // Key on the case-folded pair; keep the first spelling seen for display.
+        let mut groups: HashMap<(String, String), MixedAlbum> = HashMap::new();
+        for (artist, album, mbid, n) in rows {
+            let key = (artist.trim().to_lowercase(), album.trim().to_lowercase());
+            let entry = groups.entry(key).or_insert_with(|| MixedAlbum {
+                artist: artist.clone(),
+                album: album.clone(),
+                plays: 0,
+                variants: 0,
+                winner: None,
+                winner_plays: 0,
+                untagged: 0,
+                candidates: Vec::new(),
+            });
+            entry.plays += n;
+            match mbid.filter(|m| !m.trim().is_empty()) {
+                Some(m) => {
+                    entry.variants += 1;
+                    // Rows arrive most-played first, so the first is the winner.
+                    if entry.winner.is_none() {
+                        entry.winner = Some(m.clone());
+                        entry.winner_plays = n;
+                    }
+                    entry.candidates.push(ReleaseCandidate { mbid: m, plays: n });
+                }
+                // Listens with no release at all. Unifying stamps these too,
+                // which is worth showing rather than burying in the total.
+                None => entry.untagged += n,
+            }
+        }
+
+        let mut out: Vec<MixedAlbum> = groups.into_values().filter(|g| g.variants > 1).collect();
+        out.sort_by(|a, b| b.plays.cmp(&a.plays));
+        Ok(out)
     }
 
     /// Force every listen of one album onto a single release MBID.
@@ -4760,17 +4784,30 @@ pub struct BioRow {
     pub fetched_at: i64,
 }
 
+/// One release an album's listens claim to be, and how many say so.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ReleaseCandidate {
+    pub mbid: String,
+    pub plays: i64,
+}
+
 /// An album whose listens disagree about which release they belong to.
-#[derive(Debug, FromRow, serde::Serialize)]
+#[derive(Debug, serde::Serialize)]
 pub struct MixedAlbum {
     pub artist: String,
     pub album: String,
     pub plays: i64,
     /// How many distinct release MBIDs the listens carry. Always > 1 here.
     pub variants: i64,
-    /// The MBID the majority of listens agree on — the proposed fix.
+    /// The MBID the most listens agree on — the *proposed* fix, not a verdict.
     pub winner: Option<String>,
     pub winner_plays: i64,
+    /// Listens of this album carrying no release MBID at all. Unifying stamps
+    /// these with the chosen release too, so they're reported separately.
+    pub untagged: i64,
+    /// Every release the listens claim, most-claimed first, so the operator can
+    /// pick a different one than the plurality.
+    pub candidates: Vec<ReleaseCandidate>,
 }
 
 /// An artist string carrying a featured credit, and the primary artist it would
@@ -4836,7 +4873,7 @@ fn new_uuid() -> String {
 /// reduce to `arrahman`. It is only ever used to *group candidates for review*,
 /// never to rewrite anything on its own, so a false pairing costs a line in a
 /// preview rather than corrupted data.
-fn normalise_artist(s: &str) -> String {
+pub fn normalise_artist(s: &str) -> String {
     s.chars().filter(|c| c.is_alphanumeric()).flat_map(|c| c.to_lowercase()).collect()
 }
 
@@ -5132,6 +5169,47 @@ mod tests {
         let other = db.create_user("ivan", None, "x", "user").await.unwrap();
         assert!(db.merge_sessions(other, &[target, new_id]).await.unwrap().is_none());
         assert_eq!(db.list_sessions(uid, 50, 0).await.unwrap().len(), 2);
+    }
+
+    /// Per-edit review hands the operator a choice, so the preview has to show
+    /// the whole ballot — not just the winner — and count the listens that carry
+    /// no release at all, since unifying stamps those too.
+    #[tokio::test]
+    async fn mixed_album_preview_reports_every_candidate_and_the_untagged() {
+        let db = testdb().await;
+        let uid = db.create_user("jo", None, "x", "user").await.unwrap();
+
+        // Four listens on release A, one on B, two with no release at all.
+        let mut plays = Vec::new();
+        for i in 0..7 {
+            let mut p = play(&format!("t{i}"), "Band", 100 + i as u64);
+            p.album = Some("Record".into());
+            p.mbid_release = match i {
+                0..=3 => Some("aaaaaaaa-0000-0000-0000-000000000000".into()),
+                4 => Some("bbbbbbbb-0000-0000-0000-000000000000".into()),
+                _ => None,
+            };
+            plays.push(p);
+        }
+        for p in &plays {
+            db.save_scrobble(uid, p, None, None, None, None, None, None).await.unwrap();
+        }
+
+        let mixed = db.albums_with_mixed_releases(uid).await.unwrap();
+        assert_eq!(mixed.len(), 1, "{mixed:?}");
+        let m = &mixed[0];
+        assert_eq!(m.variants, 2);
+        assert_eq!(m.winner_plays, 4);
+        assert_eq!(m.untagged, 2, "listens with no release are counted separately");
+        assert_eq!(m.candidates.len(), 2, "the operator sees the whole ballot");
+        assert_eq!(m.candidates[0].plays, 4, "most-claimed first");
+
+        // Unifying onto the *minority* release is allowed — that's the point of
+        // reviewing — and it also stamps the untagged listens.
+        let loser = m.candidates[1].mbid.clone();
+        let n = db.unify_album_release(uid, "Band", "Record", &loser).await.unwrap();
+        assert_eq!(n, 6, "everything except the one already on that release");
+        assert!(db.albums_with_mixed_releases(uid).await.unwrap().is_empty());
     }
 
     /// The duplicate that started this: "A.R. Rahman" and "A. R. Rahman" split
