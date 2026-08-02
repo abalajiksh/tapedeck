@@ -95,10 +95,25 @@ fn now_secs() -> i64 {
 pub struct NowPlayingRegistry(Arc<RwLock<HashMap<i64, NowPlaying>>>);
 
 impl NowPlayingRegistry {
-    pub fn set(&self, user_id: i64, np: NowPlaying) {
-        if let Ok(mut map) = self.0.write() {
-            map.insert(user_id, np);
-        }
+    /// Record what this user is playing. Returns **true when the track itself
+    /// changed** (or nothing was playing), false when this is the same track
+    /// moving along.
+    ///
+    /// Polled sources re-report the same track every few seconds, and the deck
+    /// wants every one of those — that's how `progress` stays accurate. What
+    /// must *not* happen every few seconds is telling Last.fm and ListenBrainz
+    /// about it: their now-playing is a one-shot that expires on its own after
+    /// the track's duration, so re-sending is pure noise aimed at someone
+    /// else's servers. Callers forward on `true` only.
+    pub fn set(&self, user_id: i64, np: NowPlaying) -> bool {
+        let Ok(mut map) = self.0.write() else {
+            return false;
+        };
+        let changed = map.get(&user_id).is_none_or(|prev| {
+            prev.title != np.title || prev.artist != np.artist || prev.album != np.album
+        });
+        map.insert(user_id, np);
+        changed
     }
 
     /// Drop every entry reported by `source`. The poll engine calls this when a
@@ -163,4 +178,65 @@ async fn now_playing(State(state): State<Arc<AppState>>, user: AuthUser) -> impl
 
 pub fn create_now_playing_router() -> Router<Arc<AppState>> {
     Router::new().route("/api/v1/now-playing", get(now_playing))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn np(title: &str, source: &str) -> NowPlaying {
+        NowPlaying {
+            title: title.into(),
+            artist: "Aphex Twin".into(),
+            album: Some("Selected Ambient Works 85-92".into()),
+            duration: Some(300),
+            progress: 0,
+            updated_at: now_secs(),
+            source: source.into(),
+            listening_context: None,
+            format_type: None,
+            codec: None,
+            bit_depth: None,
+            sample_rate: None,
+            dsd_multiplier: None,
+            delivery_codec: None,
+            is_lossless: None,
+        }
+    }
+
+    /// The deck wants every poll; Last.fm and ListenBrainz want one per track.
+    /// A polled source calls `set` every few seconds, so if this reported a
+    /// change each time we would aim a now-playing request at both services
+    /// every tick for the whole length of every track.
+    #[test]
+    fn only_a_new_track_counts_as_a_change() {
+        let reg = NowPlayingRegistry::default();
+
+        assert!(reg.set(1, np("Xtal", "Plex")), "first track is a change");
+        assert!(!reg.set(1, np("Xtal", "Plex")), "same track re-reported is not");
+        assert!(reg.set(1, np("Tha", "Plex")), "a different track is");
+
+        // Another user's deck is its own thing.
+        assert!(reg.set(2, np("Tha", "Plex")), "first track for user 2");
+
+        // Stopping and starting the same track again is a change: the previous
+        // now-playing was cleared, so nothing downstream knows about it.
+        reg.clear_user_source(1, "Plex");
+        assert!(reg.set(1, np("Tha", "Plex")));
+    }
+
+    /// Progress must still advance on every call, change or not — that's what
+    /// keeps the position bar honest between the browser's own ticks.
+    #[test]
+    fn position_tracks_the_latest_report_even_without_a_change() {
+        let reg = NowPlayingRegistry::default();
+        reg.set(1, np("Xtal", "Plex"));
+
+        let mut later = np("Xtal", "Plex");
+        later.progress = 120;
+        assert!(!reg.set(1, later));
+
+        let (_, position) = reg.get(1).expect("still playing");
+        assert!(position >= 120, "expected the newer playhead, got {position}");
+    }
 }

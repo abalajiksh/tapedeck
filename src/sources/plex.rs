@@ -433,7 +433,16 @@ pub struct PlexSource {
     filters: PlexFilters,
     session_states: HashMap<String, SessionState>,
     libraries: Vec<Library>,
+    /// When the history endpoint was last walked. Sessions are polled every few
+    /// seconds so the deck is live; history is a much heavier request and only
+    /// exists to catch plays that finished between polls, which at this cadence
+    /// is close to nothing. Throttled separately rather than tied to the caller.
+    last_history_at: u64,
 }
+
+/// How often the Plex history endpoint is walked, independent of how often
+/// sessions are read.
+const HISTORY_SYNC_INTERVAL_SECS: u64 = 60;
 
 #[derive(Debug, Default)]
 pub struct SessionResult {
@@ -458,6 +467,7 @@ impl PlexSource {
             filters,
             session_states: HashMap::new(),
             libraries: Vec::new(),
+            last_history_at: 0,
         }
     }
 
@@ -660,13 +670,17 @@ impl PlexSource {
             }
         }
 
-        // B. History Sync
-        if let Ok(history) = self.fetch_history_tracks(0).await {
-            info!("Fetched {} tracks from Plex history", history.len());
-            result.ready_to_scrobble.extend(history);
+        // B. History Sync — on its own clock, see `last_history_at`.
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+        if now.saturating_sub(self.last_history_at) >= HISTORY_SYNC_INTERVAL_SECS {
+            self.last_history_at = now;
+            if let Ok(history) = self.fetch_history_tracks(0).await {
+                info!("Fetched {} tracks from Plex history", history.len());
+                result.ready_to_scrobble.extend(history);
+            }
         }
 
-        info!(
+        debug!(
             "Session fetch complete: {} now playing, {} ready to scrobble",
             result.now_playing.len(),
             result.ready_to_scrobble.len()

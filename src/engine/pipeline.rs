@@ -19,8 +19,12 @@ pub struct ScrobbleEngine {
     db: Arc<Database>,
     mb_client: Arc<MusicBrainzClient>,
     /// How often the tick itself runs. Individual sources are polled on their
-    /// own schedule, which may be slower than this.
+    /// own schedule, which may be slower than this. Short, because a session
+    /// source polled on this cadence is what makes the deck feel live — the
+    /// expensive work is throttled separately rather than by slowing the tick.
     poll_interval: Duration,
+    /// Next wall-clock second the enrichment backfills may run.
+    next_backfill_at: i64,
     /// ListenBrainz endpoint (self-hosted instances override the default).
     listenbrainz_url: String,
     /// Shared with the HTTP layer so the dashboard deck reflects Plex sessions.
@@ -49,9 +53,27 @@ struct ActiveSource {
     error_logged: bool,
 }
 
-/// Default per-source cadence. Slower than the tick, because a source that is
-/// idle most of the day doesn't need 4 requests a minute.
-const DEFAULT_SOURCE_INTERVAL_SECS: i64 = 30;
+/// Default per-source cadence, by kind. This is what the deck's latency is
+/// mostly made of, so it's set by how expensive one poll actually is rather
+/// than by a single number for everything.
+///
+/// Plex and Jellyfin answer with one small "what is playing right now"
+/// response, which is cheap enough to ask for every tick — and asking every 30s
+/// meant up to half a minute of silence after pressing play. Navidrome's poll
+/// also walks its history endpoint and writes a row back, so it stays slow; a
+/// user who wants it snappier can raise it per source in the UI.
+fn default_interval_secs(kind: &str) -> i64 {
+    match kind {
+        "plex" | "jellyfin" => 5,
+        _ => 30,
+    }
+}
+
+/// How often the MusicBrainz backfills and the artwork chain get a turn.
+/// Deliberately decoupled from the tick: the tick is fast so the deck is fast,
+/// and tripling the rate of rate-limited lookups is exactly what that must not
+/// cost.
+const BACKFILL_INTERVAL_SECS: i64 = 60;
 
 /// `user_sources.kind` → the label the now-playing registry stores. They differ
 /// because the registry's label is user-visible and predates the kind column.
@@ -79,7 +101,8 @@ impl ScrobbleEngine {
             sources: Vec::new(),
             db,
             mb_client,
-            poll_interval: Duration::from_secs(15),
+            poll_interval: Duration::from_secs(5),
+            next_backfill_at: 0,
             now_playing,
             listenbrainz_url,
             artwork_providers: vec![Box::new(crate::metadata::deezer::DeezerProvider::new())],
@@ -132,7 +155,7 @@ impl ScrobbleEngine {
                     let interval = cfg
                         .poll_interval_secs
                         .filter(|s| *s > 0)
-                        .unwrap_or(DEFAULT_SOURCE_INTERVAL_SECS);
+                        .unwrap_or_else(|| default_interval_secs(&cfg.kind));
                     self.sources.push(ActiveSource {
                         row_id: cfg.id,
                         user_id: cfg.user_id,
@@ -294,11 +317,17 @@ impl ScrobbleEngine {
                 }
                 for entry in mine {
                     let mut play = entry.play.clone();
-                    let album = play.album.clone();
-                    enrich_play(mb_client, &mut play, album.as_deref()).await;
-                    now_playing.set(user_id, NowPlaying::from_play(&play, "Navidrome", None, 0));
-                    let sinks = sinks::sinks_for_user(db, user_id, lb_url).await;
-                    sinks::submit_now_playing(&sinks, &play).await;
+                    // Deck first, network second: the registry needs nothing
+                    // from MusicBrainz, so enriching before writing it just
+                    // spent a rate-limited round trip on the user's latency.
+                    let changed = now_playing
+                        .set(user_id, NowPlaying::from_play(&play, "Navidrome", None, 0));
+                    if changed {
+                        let album = play.album.clone();
+                        enrich_play(mb_client, &mut play, album.as_deref()).await;
+                        let sinks = sinks::sinks_for_user(db, user_id, lb_url).await;
+                        sinks::submit_now_playing(&sinks, &play).await;
+                    }
                 }
             }
             Err(e) => debug!("Navidrome now-playing failed for user {}: {}", user_id, e),
@@ -411,16 +440,18 @@ impl ScrobbleEngine {
 
         for track in &sessions.now_playing {
             let mut play = track.play.clone();
-            if play.mbid_recording.is_none() {
-                let album = play.album.clone();
-                enrich_play(mb_client, &mut play, album.as_deref()).await;
-            }
-            now_playing.set(
+            let changed = now_playing.set(
                 user_id,
                 NowPlaying::from_play(&play, "Jellyfin", track.quality.as_ref(), track.position),
             );
-            let sinks = sinks::sinks_for_user(db, user_id, lb_url).await;
-            sinks::submit_now_playing(&sinks, &play).await;
+            if changed {
+                if play.mbid_recording.is_none() {
+                    let album = play.album.clone();
+                    enrich_play(mb_client, &mut play, album.as_deref()).await;
+                }
+                let sinks = sinks::sinks_for_user(db, user_id, lb_url).await;
+                sinks::submit_now_playing(&sinks, &play).await;
+            }
         }
 
         for track in sessions.ready_to_scrobble {
@@ -531,12 +562,15 @@ impl ScrobbleEngine {
 
             for plex_track in &session_result.now_playing {
                 let mut play = plex_track.to_play("np");
-                enrich_play(&mb_client, &mut play, plex_track.album.as_deref()).await;
 
                 // The owning user comes from the source row, not from matching
                 // the Plex account name against Tapedeck usernames.
                 let progress = plex_track.view_offset.unwrap_or(0) / 1000;
-                now_playing.set(
+                // Deck first. Enrichment is a rate-limited MusicBrainz round
+                // trip that the registry has no use for — only the sink payload
+                // does — so doing it first put a network wait between the user
+                // pressing play and the deck showing anything.
+                let changed = now_playing.set(
                     user_id,
                     NowPlaying::from_play(
                         &play,
@@ -546,8 +580,11 @@ impl ScrobbleEngine {
                     ),
                 );
 
-                let user_sinks = sinks::sinks_for_user(&db, user_id, &lb_url).await;
-                sinks::submit_now_playing(&user_sinks, &play).await;
+                if changed {
+                    enrich_play(&mb_client, &mut play, plex_track.album.as_deref()).await;
+                    let user_sinks = sinks::sinks_for_user(&db, user_id, &lb_url).await;
+                    sinks::submit_now_playing(&user_sinks, &play).await;
+                }
             }
 
             if session_result.ready_to_scrobble.is_empty() {
@@ -615,15 +652,29 @@ impl ScrobbleEngine {
         // sending it twice.
         self.flush_pending().await;
 
-        // Incrementally classify listen languages (script instantly, a few
-        // MusicBrainz lookups per tick to respect the rate limit).
-        crate::enrich::backfill_languages(&self.db, &self.mb_client, 50, 8).await;
+        // On their own clock, not the tick's. The tick is short so the deck is
+        // live; these are rate-limited lookups whose budgets were sized for a
+        // slow tick, and letting them ride it would just aim more traffic at
+        // MusicBrainz for no gain.
+        if now >= self.next_backfill_at {
+            self.next_backfill_at = now_secs() + BACKFILL_INTERVAL_SECS;
 
-        // Same deal for release years (feeds the by-decade breakdown) — cache
-        // hits are free, so the budget only bounds real API calls.
-        crate::enrich::backfill_release_years(&self.db, &self.mb_client, 50, 8).await;
-        crate::enrich::backfill_artwork(&self.db, &self.mb_client, &self.artwork_providers, 50, 8)
+            // Incrementally classify listen languages (script instantly, a few
+            // MusicBrainz lookups per pass to respect the rate limit).
+            crate::enrich::backfill_languages(&self.db, &self.mb_client, 50, 8).await;
+
+            // Same deal for release years (feeds the by-decade breakdown) —
+            // cache hits are free, so the budget only bounds real API calls.
+            crate::enrich::backfill_release_years(&self.db, &self.mb_client, 50, 8).await;
+            crate::enrich::backfill_artwork(
+                &self.db,
+                &self.mb_client,
+                &self.artwork_providers,
+                50,
+                8,
+            )
             .await;
+        }
     }
 
     async fn flush_pending(&mut self) {

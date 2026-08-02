@@ -15,7 +15,11 @@ export const deck = writable<DeckState>(EMPTY);
 
 // The sidebar card and the dashboard deck both want this, so the poll is
 // reference-counted — two subscribers still means one request every POLL_MS.
-const POLL_MS = 10_000;
+//
+// 3s rather than 10s: the server reads an in-memory map and returns a few
+// hundred bytes, so this is close to free, and it was the last stretch of the
+// delay between pressing play and the deck showing it.
+const POLL_MS = 3_000;
 let watchers = 0;
 let pollTimer: ReturnType<typeof setInterval> | null = null;
 let tickTimer: ReturnType<typeof setInterval> | null = null;
