@@ -62,11 +62,11 @@
 	onMount(load);
 </script>
 
-<svelte:head><title>Analytics — Tapedeck</title></svelte:head>
+<svelte:head><title>Statistics — Tapedeck</title></svelte:head>
 
 <div style="display:flex;align-items:flex-end;justify-content:space-between;gap:16px;flex-wrap:wrap;margin-bottom:20px;">
 	<div>
-		<h1 class="h-display" style="font-size:38px;">Analytics</h1>
+		<h1 class="h-display" style="font-size:38px;">Statistics</h1>
 		<p style="margin:6px 0 0;color:var(--td-muted);font-size:15px;">The shape of your listening.</p>
 	</div>
 	<!-- Plays/Hours drove all three top lists but sat inside the Top Artists

@@ -416,6 +416,8 @@ export interface ChartRow {
 	name: string;
 	/** Secondary line — the artist, for albums and tracks. */
 	sub: string | null;
+	/** Tracks only: the record it's on, so the row can open the album. */
+	album: string | null;
 	plays: number;
 	seconds: number;
 	artwork_url: string | null;

@@ -203,6 +203,13 @@
 			<div class="h-display" style="font-size:36px;line-height:1;">{losslessPct}<span style="font-size:20px;">%</span></div>
 			<div style="font-size:12.5px;color:#b3a487;margin-top:6px;">of all listens</div>
 		</div>
+		<a class="charts-card" href="/charts">
+			<svg viewBox="0 0 24 24" width="22" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M8 21h8"/><path d="M12 17v4"/><path d="M7 4h10v4a5 5 0 0 1-10 0z"/><path d="M17 5h3v2a3 3 0 0 1-3 3"/><path d="M7 5H4v2a3 3 0 0 0 3 3"/></svg>
+			<span>
+				<span class="charts-title">Top Charts</span>
+				<span class="charts-sub">Your most played, ranked</span>
+			</span>
+		</a>
 	</div>
 
 	<!-- Recent -->
@@ -231,6 +238,23 @@
 	.spin {
 		animation: td-spin 0.7s linear infinite;
 	}
+	/* The dashboard had no route to the charts at all; the redesign puts a
+	   "view full charts" affordance here. */
+	.charts-card {
+		display: flex;
+		align-items: center;
+		gap: 14px;
+		background: var(--td-surface);
+		border: 1px solid var(--td-border);
+		border-radius: 22px;
+		padding: 20px 22px;
+		text-decoration: none;
+		color: inherit;
+	}
+	.charts-card:hover { border-color: var(--td-accent); color: inherit; }
+	.charts-card svg { flex: none; color: var(--td-accent); }
+	.charts-title { display: block; font-weight: 600; font-size: 15px; }
+	.charts-sub { display: block; font-size: 12.5px; color: var(--td-muted-2); margin-top: 2px; }
 	.vu {
 		width: 4px;
 		height: 34px;

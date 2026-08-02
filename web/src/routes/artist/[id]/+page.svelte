@@ -134,7 +134,7 @@
 
 	<StatStrip stats={artist.stats} />
 
-	<BioCard bio={artist.bio} heading="Liner notes" />
+	<BioCard bio={artist.bio} heading="About this artist" />
 
 	{#if artist.trend.length > 1}
 		<h3 class="h-display" style="font-size:20px;margin:0 0 12px;">Plays by year</h3>

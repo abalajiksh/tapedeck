@@ -2,6 +2,7 @@
 	import { onMount } from 'svelte';
 	import { api } from '$lib/api';
 	import type { SearchResults } from '$lib/api';
+	import { openAlbum, openArtist } from '$lib/entities';
 
 	let q = '';
 	let results: SearchResults | null = null;
@@ -39,6 +40,14 @@
 			console.warn('search', e);
 		}
 		searching = false;
+	}
+
+	/** Same rule everywhere a track is listed: there is no track page, so it
+	 *  opens the record it's on, and only falls back to the raw listens when
+	 *  there's no album to open. */
+	function openTrack(t: { title: string; artist: string; album: string | null }) {
+		if (t.album) return openAlbum(t.artist, t.album);
+		window.location.href = `/history?track=${encodeURIComponent(t.title)}`;
 	}
 
 	const plays = (n: number) => `${n.toLocaleString()} ${n === 1 ? 'play' : 'plays'}`;
@@ -84,10 +93,10 @@
 		<h3 class="h-display sec">Artists</h3>
 		<div class="panel list">
 			{#each results.artists as a}
-				<a class="hit" href={`/history?artist=${encodeURIComponent(a.name)}`}>
+				<button class="hit" on:click={() => openArtist(a.name)}>
 					<span class="name">{a.name}</span>
 					<span class="count">{plays(a.plays)}</span>
-				</a>
+				</button>
 			{/each}
 		</div>
 	{/if}
@@ -96,10 +105,10 @@
 		<h3 class="h-display sec">Albums</h3>
 		<div class="panel list">
 			{#each results.albums as al}
-				<a class="hit" href={`/history?album=${encodeURIComponent(al.name)}`}>
+				<button class="hit" on:click={() => openAlbum(al.artist, al.name)}>
 					<span class="name">{al.name}<span class="sub">&nbsp;— {al.artist}</span></span>
 					<span class="count">{plays(al.plays)}</span>
-				</a>
+				</button>
 			{/each}
 		</div>
 	{/if}
@@ -108,10 +117,10 @@
 		<h3 class="h-display sec">Tracks</h3>
 		<div class="panel list">
 			{#each results.tracks as t}
-				<a class="hit" href={`/history?track=${encodeURIComponent(t.title)}`}>
+				<button class="hit" on:click={() => openTrack(t)}>
 					<span class="name">{t.title}<span class="sub">&nbsp;— {t.artist}{t.album ? ` · ${t.album}` : ''}</span></span>
 					<span class="count">{plays(t.plays)}</span>
-				</a>
+				</button>
 			{/each}
 		</div>
 	{/if}
@@ -131,7 +140,14 @@
 		border-radius: 22px;
 		overflow: hidden;
 	}
+	/* Buttons rather than anchors: an entity id has to be resolved (and possibly
+	   created) before there is a URL to go to. */
 	.hit {
+		width: 100%;
+		border: none;
+		background: transparent;
+		font: inherit;
+		cursor: pointer;
 		display: flex;
 		align-items: center;
 		gap: 14px;

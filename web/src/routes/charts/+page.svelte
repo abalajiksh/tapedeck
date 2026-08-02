@@ -37,12 +37,17 @@
 	$: rest = rows.slice(3);
 	$: totalPlays = rows.reduce((n, r) => n + r.plays, 0);
 
-	/** There is no track page, so a track opens its *artist*; an album opens
-	 *  itself. Same rule as the Statistics top lists. */
+	/** There is no track page, so a track opens the record it's on — the same
+	 *  rule as the Statistics top lists and search results. Falling back to the
+	 *  artist rather than the album made the identical row go two different
+	 *  places depending on which screen you clicked it from. */
 	function openRow(r: ChartRow) {
 		if (kind === 'artists') return openArtist(r.name);
 		if (kind === 'albums' && r.sub) return openAlbum(r.sub, r.name);
-		if (kind === 'tracks' && r.sub) return openArtist(r.sub);
+		if (kind === 'tracks') {
+			if (r.album && r.sub) return openAlbum(r.sub, r.album);
+			if (r.sub) return openArtist(r.sub);
+		}
 		return undefined;
 	}
 

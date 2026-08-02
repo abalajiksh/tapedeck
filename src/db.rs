@@ -3174,7 +3174,7 @@ impl Database {
         // ran. `sub` is the secondary line (an album's artist), null for artists.
         let sql = match kind {
             "albums" => {
-                "SELECT album AS name, artist AS sub, COUNT(*) AS plays,
+                "SELECT album AS name, artist AS sub, NULL AS album, COUNT(*) AS plays,
                         COALESCE(SUM(duration), 0) AS seconds,
                         MAX(artwork_url) AS artwork_url, MAX(caa_id) AS caa_id,
                         MAX(caa_release_mbid) AS caa_release_mbid
@@ -3185,7 +3185,7 @@ impl Database {
                  ORDER BY plays DESC LIMIT ?"
             }
             "tracks" => {
-                "SELECT title AS name, artist AS sub, COUNT(*) AS plays,
+                "SELECT title AS name, artist AS sub, MAX(album) AS album, COUNT(*) AS plays,
                         COALESCE(SUM(duration), 0) AS seconds,
                         MAX(artwork_url) AS artwork_url, MAX(caa_id) AS caa_id,
                         MAX(caa_release_mbid) AS caa_release_mbid
@@ -3195,7 +3195,7 @@ impl Database {
                  ORDER BY plays DESC LIMIT ?"
             }
             _ => {
-                "SELECT artist AS name, NULL AS sub, COUNT(*) AS plays,
+                "SELECT artist AS name, NULL AS sub, NULL AS album, COUNT(*) AS plays,
                         COALESCE(SUM(duration), 0) AS seconds,
                         NULL AS artwork_url, NULL AS caa_id, NULL AS caa_release_mbid
                  FROM scrobbles
@@ -4294,6 +4294,9 @@ pub struct UserRecord {
 pub struct ChartRow {
     pub name: String,
     pub sub: Option<String>,
+    /// Only set on a tracks chart — the record the track is on, so the row can
+    /// open the album like every other track listing in the app.
+    pub album: Option<String>,
     pub plays: i64,
     pub seconds: i64,
     pub artwork_url: Option<String>,
