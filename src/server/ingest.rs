@@ -332,9 +332,13 @@ pub async fn submit_listens(
                     .await
                 {
                     Ok(true) => {
-                        // Assign to a session
+                        // Assign to a session, and — the part that was missing —
+                        // point the listen back at it. `assign_session` has
+                        // maintained `sessions.track_count` since Phase 2 while
+                        // every `scrobbles.session_id` stayed NULL, so the
+                        // sessions existed but had no contents.
                         let dur = play.duration.unwrap_or(180) as i64;
-                        let _ = state
+                        if let Ok(session_id) = state
                             .db
                             .assign_session(
                                 user.user_id,
@@ -347,7 +351,13 @@ pub async fn submit_listens(
                                 1800,
                                 token_id,
                             )
-                            .await;
+                            .await
+                        {
+                            let _ = state
+                                .db
+                                .link_scrobble_session(user.user_id, &play.source_id, session_id)
+                                .await;
+                        }
 
                         // Accumulate hours on the resolved chain
                         if let Some(cid) = chain_id {

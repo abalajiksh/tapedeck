@@ -56,6 +56,26 @@
 	let fixArtists = true;
 	let fixVariants = true;
 
+	// ── Rebuilding sessions ──
+	// Needed on any existing install: `assign_session` kept the session rows but
+	// nothing ever wrote `scrobbles.session_id`, so the sessions had no contents
+	// until this runs once. Also the only way an imported history gets grouped.
+	let rebuildingSessions = false;
+	let sessionMsg = '';
+	let sessionGapMinutes = 30;
+	async function rebuildSessions() {
+		if (!confirm('Regroup every listen into sessions?\n\nThis discards any sessions you have merged or split by hand.')) return;
+		rebuildingSessions = true;
+		sessionMsg = '';
+		try {
+			const r = await api.rebuildSessions(Math.max(1, sessionGapMinutes) * 60);
+			sessionMsg = `Grouped ${r.listens.toLocaleString()} listens into ${r.sessions.toLocaleString()} sessions.`;
+		} catch (e) {
+			sessionMsg = 'Failed: ' + String(e).replace(/^API \d+: /, '');
+		}
+		rebuildingSessions = false;
+	}
+
 	// ── Pulling loves from connected services ──
 	let pullingLoves = false;
 	let lovesMsg = '';
@@ -704,6 +724,32 @@
 				{/if}
 				{#if sanitizeMsg}
 					<p style="font-size:13px;color:var(--td-good-fg);margin:12px 0 0;">{sanitizeMsg}</p>
+				{/if}
+			</div>
+
+			<div class="panel" style="border-radius:22px;padding:24px;margin-bottom:18px;">
+				<h3 class="h-display" style="font-size:19px;margin-bottom:4px;">Listening Sessions</h3>
+				<p style="font-size:13px;color:var(--td-muted);margin:0 0 16px;">
+					Listens are grouped into sessions as they arrive — contiguous listening, split by a
+					long gap or a change of app. Rebuilding regroups your whole history from scratch,
+					which is what an imported backlog needs, and lets you reconsider the gap.
+				</p>
+				<div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;">
+					<label style="font-size:13px;color:var(--td-muted);display:flex;align-items:center;gap:8px;">
+						New session after
+						<input class="input" type="number" min="1" max="1440" bind:value={sessionGapMinutes} style="width:80px;">
+						minutes
+					</label>
+					<button class="btn btn-secondary" on:click={rebuildSessions} disabled={rebuildingSessions}>
+						{rebuildingSessions ? 'Regrouping…' : 'Rebuild sessions'}
+					</button>
+				</div>
+				<p style="font-size:12px;color:var(--td-muted-3);margin:10px 0 0;">
+					Discards sessions you've merged or split by hand — those choices live in the same
+					place this rewrites.
+				</p>
+				{#if sessionMsg}
+					<p style="font-size:13px;color:var(--td-good-fg);margin:12px 0 0;">{sessionMsg}</p>
 				{/if}
 			</div>
 

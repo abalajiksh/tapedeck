@@ -622,6 +622,12 @@ means session-only.
 | GET | `/api/v1/albums/{id}` | Auth | Album page — your plays, tracklist, other records by that artist |
 | GET | `/api/v1/artists/{id}` | Auth | Artist page — rank, top albums and tracks, plays by year |
 | GET | `/api/v1/resolve` | Auth | Name → entity id (`kind`, `name`, `artist`), created on first use |
+| GET | `/api/v1/sessions` | Auth | Listening sessions, newest first |
+| GET | `/api/v1/sessions/{id}` | Auth | One session and the listens in it |
+| PATCH | `/api/v1/sessions/{id}` | Auth | Retag the whole sitting (`chain_id`) or name it (`title`) |
+| POST | `/api/v1/sessions/merge` | Auth | Fold sessions together (`{ids}`) — earliest survives |
+| POST | `/api/v1/sessions/{id}/split` | Auth | Cut at a listen (`{at_scrobble_id}`) |
+| POST | `/api/v1/sessions/rebuild` | Auth | Regroup all listens (`{gap_seconds}`) — discards hand edits |
 | GET | `/api/v1/charts` | Auth | Ranked chart (`kind`=artists\|albums\|tracks, `range`, `limit`) |
 | POST | `/api/v1/loves/pull` | Auth | Fetch loved tracks from every connected service |
 | GET | `/metrics` | Token/Session | Prometheus exposition (`TAPEDECK_METRICS_TOKEN` bearer) |

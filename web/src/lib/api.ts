@@ -428,6 +428,25 @@ export interface ChartRow {
 export type ChartKind = 'artists' | 'albums' | 'tracks';
 export type ChartRange = 'today' | 'd7' | 'month' | 'year' | 'all';
 
+export interface Session {
+	id: number;
+	/** Stable across merges and splits; the id a shared session will carry. */
+	uuid: string | null;
+	title: string | null;
+	started_at: number;
+	ended_at: number | null;
+	track_count: number;
+	total_duration: number;
+	avg_quality_score: number | null;
+	listening_context: string | null;
+	chain_id: number | null;
+	chain_name: string | null;
+	device_id: number | null;
+	device_name: string | null;
+	token_id: number | null;
+	token_name: string | null;
+}
+
 export interface SanitizePreview {
 	/** Albums whose listens disagree about which release they are. */
 	mixed_albums: {
@@ -701,6 +720,29 @@ class TapedeckAPI {
 	// ── Search ──
 	async search(q: string, limit = 10): Promise<SearchResults> {
 		return this.get(`/api/v1/search?q=${encodeURIComponent(q)}&limit=${limit}`);
+	}
+
+	// ── Sessions ──
+	async getSessions(limit = 50, offset = 0): Promise<{ sessions: Session[]; count: number }> {
+		return this.get(`/api/v1/sessions?limit=${limit}&offset=${offset}`);
+	}
+	async getSession(id: number): Promise<{ session: Session; scrobbles: Scrobble[] }> {
+		return this.get(`/api/v1/sessions/${id}`);
+	}
+	/** Two or more ids; the earliest survives and absorbs the rest. */
+	async mergeSessions(ids: number[]): Promise<{ session: Session }> {
+		return this.post('/api/v1/sessions/merge', { ids });
+	}
+	/** `at_scrobble_id` becomes the first listen of the new session. */
+	async splitSession(id: number, at_scrobble_id: number): Promise<{ session: Session; new_session: Session }> {
+		return this.post(`/api/v1/sessions/${id}/split`, { at_scrobble_id });
+	}
+	/** Regroup every listen from scratch. Discards manual merges and splits. */
+	async rebuildSessions(gap_seconds?: number): Promise<{ sessions: number; listens: number }> {
+		return this.post('/api/v1/sessions/rebuild', gap_seconds ? { gap_seconds } : {});
+	}
+	async updateSession(id: number, data: { chain_id?: number | null; title?: string | null }): Promise<{ session: Session }> {
+		return this.patch(`/api/v1/sessions/${id}`, data);
 	}
 
 	// ── Charts ──

@@ -5,6 +5,8 @@
 	import ScrobbleRow from '$lib/components/ScrobbleRow.svelte';
 	import InspectListen from '$lib/components/InspectListen.svelte';
 	import { loadLoves, lovedKeys, loveKey, toggleLove } from '$lib/loves';
+	import SessionCard from '$lib/components/SessionCard.svelte';
+	import type { Session } from '$lib/api';
 
 	let scrobbles: Scrobble[] = [];
 	let chains: SignalChain[] = [];
@@ -13,6 +15,50 @@
 	let offset = 0;
 	let hasMore = true;
 	const PAGE = 50;
+
+	// ── Sessions ──
+	// A calendar day is an arbitrary boundary for listening; a session is the
+	// thing you actually did. Grouping is *stored*, not recomputed here, because
+	// merges and splits are decisions no heuristic can re-derive.
+	let groupBy: 'day' | 'session' = 'day';
+	let sessions: Session[] = [];
+	let sessionsLoading = false;
+	let mergeMode = false;
+	let mergePick = new Set<number>();
+	let merging = false;
+	$: mergeCount = mergePick.size;
+
+	async function loadSessions() {
+		sessionsLoading = true;
+		try {
+			sessions = (await api.getSessions(60)).sessions;
+		} catch (e) { console.warn('sessions', e); }
+		sessionsLoading = false;
+	}
+
+	function setGroupBy(g: 'day' | 'session') {
+		groupBy = g;
+		if (g === 'session' && !sessions.length) loadSessions();
+		if (g === 'day') exitMerge();
+	}
+
+	function toggleMergePick(sess: Session) {
+		if (mergePick.has(sess.id)) mergePick.delete(sess.id);
+		else mergePick.add(sess.id);
+		mergePick = mergePick;
+	}
+	function exitMerge() { mergeMode = false; mergePick = new Set(); }
+
+	async function applyMerge() {
+		if (mergePick.size < 2) return;
+		merging = true;
+		try {
+			await api.mergeSessions([...mergePick]);
+			exitMerge();
+			await loadSessions();
+		} catch (e) { alert('Merge failed: ' + String(e).replace(/^API \d+: /, '')); }
+		merging = false;
+	}
 
 	// Search results link here with ?artist= / ?album= / ?track=, so a result
 	// opens the actual listens rather than a dead end.
@@ -176,13 +222,25 @@
 		<h1 class="h-display" style="font-size:38px;">History</h1>
 		<p style="margin:6px 0 0;color:var(--td-muted);font-size:15px;">Every side you've ever pressed play on.</p>
 	</div>
-	<div style="display:flex;gap:10px;align-items:center;">
-		{#if selectMode}
+	<div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;">
+		<div style="display:inline-flex;background:var(--td-sidebar);border-radius:999px;padding:3px;gap:2px;">
+			<button class="seg-btn" class:on={groupBy === 'day'} on:click={() => setGroupBy('day')}>By day</button>
+			<button class="seg-btn" class:on={groupBy === 'session'} on:click={() => setGroupBy('session')}>By session</button>
+		</div>
+		{#if groupBy === 'session'}
+			{#if mergeMode}
+				<button class="btn btn-secondary" on:click={exitMerge}>Done</button>
+			{:else}
+				<button class="btn btn-secondary" on:click={() => (mergeMode = true)}>Merge…</button>
+			{/if}
+		{:else if selectMode}
 			<button class="btn btn-secondary" on:click={exitSelect}>Done</button>
 		{:else}
 			<button class="btn btn-secondary" on:click={() => (selectMode = true)}>Select</button>
 		{/if}
-		<input class="input" style="width:200px;" bind:value={filter} on:input={onFilter} placeholder="Filter by artist…">
+		{#if groupBy === 'day'}
+			<input class="input" style="width:200px;" bind:value={filter} on:input={onFilter} placeholder="Filter by artist…">
+		{/if}
 	</div>
 </div>
 
@@ -210,7 +268,39 @@
 	</div>
 {/if}
 
-{#if groups.length}
+{#if groupBy === 'session'}
+	{#if mergeMode}
+		<div class="panel" style="position:sticky;top:0;z-index:30;border-radius:14px;padding:12px 16px;margin-bottom:16px;display:flex;align-items:center;gap:12px;flex-wrap:wrap;background:var(--td-surface2);">
+			<span style="font-weight:600;font-size:14px;">{mergeCount} selected</span>
+			<span style="font-size:12.5px;color:var(--td-muted-2);">
+				They fold into the earliest one, keeping its identity.
+			</span>
+			<span style="flex:1;"></span>
+			<button class="btn btn-primary" on:click={applyMerge} disabled={mergeCount < 2 || merging}>
+				{merging ? 'Merging…' : 'Merge selected'}
+			</button>
+		</div>
+	{/if}
+
+	{#if sessionsLoading && !sessions.length}
+		<div style="display:flex;justify-content:center;padding:60px;"><div class="spin" style="width:22px;height:22px;border:2px solid var(--td-track);border-top-color:var(--td-accent);border-radius:50%;"></div></div>
+	{:else if sessions.length}
+		{#each sessions as sess (sess.id)}
+			<SessionCard
+				session={sess}
+				{chains}
+				selectable={mergeMode}
+				selected={mergePick.has(sess.id)}
+				on:toggle={(e) => toggleMergePick(e.detail)}
+				on:changed={loadSessions}
+			/>
+		{/each}
+	{:else}
+		<div class="panel" style="border-radius:22px;padding:44px;text-align:center;color:var(--td-muted);">
+			No sessions yet — they're grouped from your listens as they arrive.
+		</div>
+	{/if}
+{:else if groups.length}
 	{#each groups as g}
 		<div style="display:flex;align-items:center;gap:12px;margin:22px 0 10px;">
 			<span style="font-size:12px;letter-spacing:.12em;text-transform:uppercase;color:var(--td-muted-2);font-weight:600;">{g.label}</span>
@@ -335,6 +425,11 @@
 	}
 	.menu-item:hover { background: var(--td-nav-hover); }
 	.menu-item.danger { color: #b2622d; }
+	.seg-btn {
+		border: none; background: transparent; cursor: pointer; color: var(--td-nav-fg);
+		font-size: 12.5px; padding: 6px 14px; border-radius: 999px; font-family: inherit;
+	}
+	.seg-btn.on { background: var(--td-accent); color: #fbf5ea; }
 	.to-top {
 		position: fixed;
 		right: 26px;

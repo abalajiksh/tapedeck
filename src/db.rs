@@ -428,7 +428,10 @@ impl Database {
                 track_count INTEGER DEFAULT 0, total_duration INTEGER DEFAULT 0,
                 skip_count INTEGER DEFAULT 0, avg_quality_score REAL,
                 listening_context TEXT DEFAULT 'unknown',
-                token_id INTEGER REFERENCES tokens(id)
+                token_id INTEGER REFERENCES tokens(id),
+                uuid TEXT,
+                title TEXT,
+                updated_at INTEGER
             )",
         )
         .execute(&self.pool)
@@ -872,6 +875,33 @@ impl Database {
         // on Android", "fooyin") is how people actually organise these, so the
         // token is the natural place to say what the listens through it came
         // out of — no client-side config, nothing to type per listen.
+        // Migration: sessions become a thing you can look at, name, merge and
+        // split — so they need a stable identity that survives all of that.
+        // `uuid` is added now rather than when Phase 6 shares one outward,
+        // because retrofitting an id onto rows other instances already hold is
+        // the migration that section warns about.
+        if !has_column(&self.pool, "sessions", "uuid").await {
+            info!("⚙️ Migrating: adding sessions.uuid/title/updated_at...");
+            for col in ["uuid TEXT", "title TEXT", "updated_at INTEGER"] {
+                let _ = sqlx::query(&format!("ALTER TABLE sessions ADD COLUMN {}", col))
+                    .execute(&self.pool)
+                    .await;
+            }
+            // Backfill: every existing session gets an id too, or the ones that
+            // predate this are the only ones that can never be shared.
+            let ids: Vec<(i64,)> = sqlx::query_as("SELECT id FROM sessions WHERE uuid IS NULL")
+                .fetch_all(&self.pool)
+                .await
+                .unwrap_or_default();
+            for (id,) in ids {
+                let _ = sqlx::query("UPDATE sessions SET uuid = ? WHERE id = ?")
+                    .bind(new_uuid())
+                    .bind(id)
+                    .execute(&self.pool)
+                    .await;
+            }
+        }
+
         // Migration: the full artist credit, kept when a `feat.` suffix is
         // folded out of `artist` so the featured performer is never lost —
         // it just stops fragmenting every grouping query.
@@ -3157,6 +3187,416 @@ impl Database {
     ///
     /// A ListenBrainz `feedback.jsonl` row carries an MBID and a score but no
     /// names, so this is how a loved track becomes something nameable.
+    // ════════════════════════════════════════════════════════════
+    //  Sessions
+    //
+    //  `assign_session` has grouped listens since Phase 2, but nothing ever read
+    //  the result. Making them visible also makes them **editable**, and that
+    //  settles a question left open in the design notes: the grouping cannot be
+    //  computed at read time, because a merge or a split is a decision no
+    //  heuristic can re-derive. So `scrobbles.session_id` stays the source of
+    //  truth and these operations rewrite it.
+    //
+    //  Every mutation recomputes the aggregates from the listens rather than
+    //  adjusting them arithmetically — a session that disagrees with its own
+    //  contents is the failure mode worth designing out.
+    // ════════════════════════════════════════════════════════════
+
+    /// Point a just-saved listen at its session.
+    ///
+    /// Keyed on `source_id`, which is the per-listen identity the dedup checks
+    /// already rely on.
+    pub async fn link_scrobble_session(
+        &self,
+        user_id: i64,
+        source_id: &str,
+        session_id: i64,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query("UPDATE scrobbles SET session_id = ? WHERE user_id = ? AND source_id = ?")
+            .bind(session_id)
+            .bind(user_id)
+            .bind(source_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Recalculate a session's aggregates from the listens that point at it.
+    ///
+    /// Deletes the session outright when nothing points at it any more, which
+    /// is what makes merge and split self-cleaning.
+    pub async fn recompute_session(&self, session_id: i64) -> Result<bool, sqlx::Error> {
+        let agg: Option<(i64, Option<i64>, Option<i64>, Option<i64>, Option<f64>)> =
+            sqlx::query_as(
+                "SELECT COUNT(*), MIN(timestamp), MAX(timestamp + COALESCE(duration, 0)),
+                        SUM(COALESCE(duration, 0)), AVG(quality_score)
+                 FROM scrobbles WHERE session_id = ?",
+            )
+            .bind(session_id)
+            .fetch_optional(&self.pool)
+            .await?;
+
+        let Some((count, started, ended, total, avg)) = agg else {
+            return Ok(false);
+        };
+        if count == 0 {
+            sqlx::query("DELETE FROM sessions WHERE id = ?")
+                .bind(session_id)
+                .execute(&self.pool)
+                .await?;
+            return Ok(false);
+        }
+
+        sqlx::query(
+            "UPDATE sessions SET started_at = ?, ended_at = ?, track_count = ?,
+                    total_duration = ?, avg_quality_score = ?, updated_at = ?
+             WHERE id = ?",
+        )
+        .bind(started.unwrap_or(0))
+        .bind(ended)
+        .bind(count)
+        .bind(total.unwrap_or(0))
+        .bind(avg)
+        .bind(Self::now_secs())
+        .bind(session_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(true)
+    }
+
+    /// Rebuild every session for one user from their listens.
+    ///
+    /// Needed because `assign_session` maintained the session rows while nothing
+    /// ever wrote `scrobbles.session_id`, so an existing database has sessions
+    /// with track counts and no contents. It's also the only way to re-group
+    /// after changing the gap, and the way an *imported* history — which never
+    /// went through the ingest path — gets sessions at all.
+    ///
+    /// Destructive by design: manual merges and splits are stored in this same
+    /// column, so a rebuild discards them. The caller is expected to say so.
+    pub async fn rebuild_sessions(
+        &self,
+        user_id: i64,
+        gap_seconds: i64,
+    ) -> Result<(u64, u64), sqlx::Error> {
+        // Clear the link first — the foreign key means sessions can't go while
+        // anything still points at them.
+        sqlx::query("UPDATE scrobbles SET session_id = NULL WHERE user_id = ?")
+            .bind(user_id)
+            .execute(&self.pool)
+            .await?;
+        sqlx::query("DELETE FROM sessions WHERE user_id = ?")
+            .bind(user_id)
+            .execute(&self.pool)
+            .await?;
+
+        // Ordered walk. Only the gap is available here: a listen doesn't record
+        // which token submitted it, so the token-change rule that `assign_session`
+        // applies live can't be reconstructed after the fact.
+        let rows: Vec<(
+            i64,
+            i64,
+            Option<i64>,
+            Option<i64>,
+            Option<i64>,
+            Option<f64>,
+            Option<String>,
+        )> = sqlx::query_as(
+            "SELECT id, timestamp, duration, device_id, chain_id, quality_score,
+                        listening_context
+                   FROM scrobbles WHERE user_id = ? AND skipped = FALSE
+                  ORDER BY timestamp ASC",
+        )
+        .bind(user_id)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut sessions = 0u64;
+        let mut linked = 0u64;
+        let mut current: Option<i64> = None;
+        let mut prev_end = i64::MIN;
+
+        for (id, ts, dur, device_id, chain_id, quality, context) in rows {
+            let start_new = current.is_none() || ts - prev_end > gap_seconds;
+            if start_new {
+                if let Some(sid) = current {
+                    self.recompute_session(sid).await?;
+                }
+                let res = sqlx::query(
+                    "INSERT INTO sessions (user_id, device_id, chain_id, started_at, ended_at,
+                        track_count, total_duration, avg_quality_score, listening_context,
+                        uuid, updated_at)
+                     VALUES (?, ?, ?, ?, ?, 0, 0, ?, ?, ?, ?)",
+                )
+                .bind(user_id)
+                .bind(device_id)
+                .bind(chain_id)
+                .bind(ts)
+                .bind(ts)
+                .bind(quality)
+                .bind(context.clone().unwrap_or_else(|| "unknown".into()))
+                .bind(new_uuid())
+                .bind(Self::now_secs())
+                .execute(&self.pool)
+                .await?;
+                current = Some(res.last_insert_rowid());
+                sessions += 1;
+            }
+
+            if let Some(sid) = current {
+                sqlx::query("UPDATE scrobbles SET session_id = ? WHERE id = ?")
+                    .bind(sid)
+                    .bind(id)
+                    .execute(&self.pool)
+                    .await?;
+                linked += 1;
+            }
+            prev_end = ts + dur.unwrap_or(0);
+        }
+
+        if let Some(sid) = current {
+            self.recompute_session(sid).await?;
+        }
+        info!("🧵 Rebuilt {} sessions across {} listens for user {}", sessions, linked, user_id);
+        Ok((sessions, linked))
+    }
+
+    /// A user's sessions, most recent first, with the chain's name joined so the
+    /// list doesn't need a second request per row.
+    pub async fn list_sessions(
+        &self,
+        user_id: i64,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<SessionRow>, sqlx::Error> {
+        sqlx::query_as(
+            "SELECT s.id, s.uuid, s.title, s.started_at, s.ended_at, s.track_count,
+                    s.total_duration, s.avg_quality_score, s.listening_context,
+                    s.chain_id, c.name AS chain_name, s.device_id, d.name AS device_name,
+                    s.token_id, t.name AS token_name
+               FROM sessions s
+               LEFT JOIN signal_chains c ON c.id = s.chain_id
+               LEFT JOIN devices d ON d.id = s.device_id
+               LEFT JOIN tokens t ON t.id = s.token_id
+              WHERE s.user_id = ? AND s.track_count > 0
+              ORDER BY s.started_at DESC LIMIT ? OFFSET ?",
+        )
+        .bind(user_id)
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(&self.pool)
+        .await
+    }
+
+    pub async fn get_session(
+        &self,
+        user_id: i64,
+        id: i64,
+    ) -> Result<Option<SessionRow>, sqlx::Error> {
+        sqlx::query_as(
+            "SELECT s.id, s.uuid, s.title, s.started_at, s.ended_at, s.track_count,
+                    s.total_duration, s.avg_quality_score, s.listening_context,
+                    s.chain_id, c.name AS chain_name, s.device_id, d.name AS device_name,
+                    s.token_id, t.name AS token_name
+               FROM sessions s
+               LEFT JOIN signal_chains c ON c.id = s.chain_id
+               LEFT JOIN devices d ON d.id = s.device_id
+               LEFT JOIN tokens t ON t.id = s.token_id
+              WHERE s.user_id = ? AND s.id = ?",
+        )
+        .bind(user_id)
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await
+    }
+
+    /// The listens in one session, oldest first — the order they were played.
+    pub async fn session_scrobbles(
+        &self,
+        user_id: i64,
+        session_id: i64,
+    ) -> Result<Vec<ScrobbleRecord>, sqlx::Error> {
+        sqlx::query_as(
+            "SELECT * FROM scrobbles WHERE user_id = ? AND session_id = ?
+             ORDER BY timestamp ASC",
+        )
+        .bind(user_id)
+        .bind(session_id)
+        .fetch_all(&self.pool)
+        .await
+    }
+
+    /// Fold several sessions into one.
+    ///
+    /// The **earliest** session survives, because its id is the one already
+    /// referenced by anything pointing at "that listening"; the rest hand over
+    /// their listens and are deleted by the recompute. Ownership is checked for
+    /// every id before anything moves, so a request naming someone else's
+    /// session changes nothing at all rather than half-merging.
+    pub async fn merge_sessions(
+        &self,
+        user_id: i64,
+        ids: &[i64],
+    ) -> Result<Option<i64>, sqlx::Error> {
+        if ids.len() < 2 {
+            return Ok(None);
+        }
+        let placeholders = vec!["?"; ids.len()].join(",");
+        let owned: Vec<(i64,)> = {
+            let sql = format!(
+                "SELECT id FROM sessions WHERE user_id = ? AND id IN ({}) ORDER BY started_at ASC",
+                placeholders
+            );
+            let mut q = sqlx::query_as(&sql).bind(user_id);
+            for id in ids {
+                q = q.bind(id);
+            }
+            q.fetch_all(&self.pool).await?
+        };
+        if owned.len() != ids.len() {
+            return Ok(None);
+        }
+
+        let target = owned[0].0;
+        let others: Vec<i64> = owned[1..].iter().map(|(id,)| *id).collect();
+        let others_ph = vec!["?"; others.len()].join(",");
+
+        {
+            let sql = format!(
+                "UPDATE scrobbles SET session_id = ? WHERE user_id = ? AND session_id IN ({})",
+                others_ph
+            );
+            let mut q = sqlx::query(&sql).bind(target).bind(user_id);
+            for id in &others {
+                q = q.bind(id);
+            }
+            q.execute(&self.pool).await?;
+        }
+
+        // Now empty; the recompute deletes each one.
+        for id in &others {
+            self.recompute_session(*id).await?;
+        }
+        self.recompute_session(target).await?;
+        Ok(Some(target))
+    }
+
+    /// Cut a session in two at `at_scrobble_id`, which becomes the first listen
+    /// of the new session.
+    ///
+    /// Returns the new session's id. Splitting at the very first listen is a
+    /// no-op rather than an error: it would leave one empty half, which is just
+    /// the session you already had.
+    pub async fn split_session(
+        &self,
+        user_id: i64,
+        session_id: i64,
+        at_scrobble_id: i64,
+    ) -> Result<Option<i64>, sqlx::Error> {
+        let listens = self.session_scrobbles(user_id, session_id).await?;
+        let Some(pos) = listens.iter().position(|s| s.id == at_scrobble_id) else {
+            return Ok(None);
+        };
+        if pos == 0 {
+            return Ok(None);
+        }
+
+        let old: Option<(i64, Option<i64>, Option<i64>, Option<String>)> = sqlx::query_as(
+            "SELECT started_at, device_id, chain_id, listening_context
+               FROM sessions WHERE id = ? AND user_id = ?",
+        )
+        .bind(session_id)
+        .bind(user_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        let Some((_, device_id, chain_id, context)) = old else {
+            return Ok(None);
+        };
+
+        // The tail inherits the setup — a split says "this was a separate
+        // sitting", not "this was different gear".
+        let moving: Vec<i64> = listens[pos..].iter().map(|s| s.id).collect();
+        let started = listens[pos].timestamp;
+
+        let res = sqlx::query(
+            "INSERT INTO sessions (user_id, device_id, chain_id, started_at, ended_at,
+                track_count, total_duration, listening_context, uuid, updated_at)
+             VALUES (?, ?, ?, ?, ?, 0, 0, ?, ?, ?)",
+        )
+        .bind(user_id)
+        .bind(device_id)
+        .bind(chain_id)
+        .bind(started)
+        .bind(started)
+        .bind(context.unwrap_or_else(|| "unknown".into()))
+        .bind(new_uuid())
+        .bind(Self::now_secs())
+        .execute(&self.pool)
+        .await?;
+        let new_id = res.last_insert_rowid();
+
+        let ph = vec!["?"; moving.len()].join(",");
+        let sql =
+            format!("UPDATE scrobbles SET session_id = ? WHERE user_id = ? AND id IN ({})", ph);
+        let mut q = sqlx::query(&sql).bind(new_id).bind(user_id);
+        for id in &moving {
+            q = q.bind(id);
+        }
+        q.execute(&self.pool).await?;
+
+        self.recompute_session(session_id).await?;
+        self.recompute_session(new_id).await?;
+        Ok(Some(new_id))
+    }
+
+    /// Retag a whole session's listens onto a chain, and the session with them.
+    ///
+    /// "This whole sitting was on the desk rig" is the edit sessions exist to
+    /// make cheap — the alternative is shift-selecting forty rows in history.
+    pub async fn set_session_chain(
+        &self,
+        user_id: i64,
+        session_id: i64,
+        chain_id: Option<i64>,
+    ) -> Result<u64, sqlx::Error> {
+        let res =
+            sqlx::query("UPDATE scrobbles SET chain_id = ? WHERE user_id = ? AND session_id = ?")
+                .bind(chain_id)
+                .bind(user_id)
+                .bind(session_id)
+                .execute(&self.pool)
+                .await?;
+        sqlx::query(
+            "UPDATE sessions SET chain_id = ?, updated_at = ? WHERE id = ? AND user_id = ?",
+        )
+        .bind(chain_id)
+        .bind(Self::now_secs())
+        .bind(session_id)
+        .bind(user_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(res.rows_affected())
+    }
+
+    /// Name a session. `None` clears it back to the derived label.
+    pub async fn set_session_title(
+        &self,
+        user_id: i64,
+        session_id: i64,
+        title: Option<&str>,
+    ) -> Result<bool, sqlx::Error> {
+        let res = sqlx::query(
+            "UPDATE sessions SET title = ?, updated_at = ? WHERE id = ? AND user_id = ?",
+        )
+        .bind(title.map(str::trim).filter(|t| !t.is_empty()))
+        .bind(Self::now_secs())
+        .bind(session_id)
+        .bind(user_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(res.rows_affected() > 0)
+    }
+
     /// One ranked chart: artists, albums or tracks over a window.
     ///
     /// Separate from `get_ranged_stats` because the charts page wants *one* long
@@ -4025,8 +4465,9 @@ impl Database {
         } else {
             let result = sqlx::query(
                 "INSERT INTO sessions (user_id, device_id, chain_id, started_at, ended_at,
-                    track_count, total_duration, avg_quality_score, listening_context, token_id)
-                 VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?, ?)",
+                    track_count, total_duration, avg_quality_score, listening_context, token_id,
+                    uuid, updated_at)
+                 VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?)",
             )
             .bind(user_id)
             .bind(device_id)
@@ -4037,6 +4478,9 @@ impl Database {
             .bind(quality_score)
             .bind(listening_context)
             .bind(token_id)
+            // Every session gets its stable id at birth — see the migration.
+            .bind(new_uuid())
+            .bind(Self::now_secs())
             .execute(&self.pool)
             .await?;
             Ok(result.last_insert_rowid())
@@ -4348,6 +4792,43 @@ pub struct VariantArtist {
     pub variants: Vec<(String, i64)>,
 }
 
+/// A listening session: contiguous listening through one setup.
+///
+/// `chain_name` / `device_name` / `token_name` are joined so a list of sessions
+/// renders without a request per row. `title` is a user label; when it's null
+/// the UI derives one from the span.
+#[derive(Debug, FromRow, serde::Serialize)]
+pub struct SessionRow {
+    pub id: i64,
+    /// Stable across merges and splits, and the id a shared session will carry.
+    pub uuid: Option<String>,
+    pub title: Option<String>,
+    pub started_at: i64,
+    pub ended_at: Option<i64>,
+    pub track_count: i64,
+    pub total_duration: i64,
+    pub avg_quality_score: Option<f64>,
+    pub listening_context: Option<String>,
+    pub chain_id: Option<i64>,
+    pub chain_name: Option<String>,
+    pub device_id: Option<i64>,
+    pub device_name: Option<String>,
+    pub token_id: Option<i64>,
+    pub token_name: Option<String>,
+}
+
+/// A stable, opaque id for a session.
+///
+/// Not a real UUID library — a hex random is enough for something that only has
+/// to be unique across instances and never parsed. It exists so a session keeps
+/// one identity through merges, splits and (later) being handed to someone
+/// else's Tapedeck.
+fn new_uuid() -> String {
+    use rand::Rng;
+    let raw: [u8; 16] = rand::rng().random();
+    hex::encode(raw)
+}
+
 /// Collapse an artist name to its identity for duplicate detection: lowercase,
 /// with punctuation and whitespace removed entirely.
 ///
@@ -4578,6 +5059,81 @@ mod tests {
     /// A token per app, each with its own chain, is the whole point of
     /// `default_chain_id` — so validating a token must hand back the chain in
     /// the same breath as the identity, and editing must not re-issue it.
+    /// Merge and split rewrite `session_id` across rows and then rebuild the
+    /// aggregates from what's left — the failure worth designing out is a
+    /// session whose counts disagree with its own listens.
+    #[tokio::test]
+    async fn sessions_merge_and_split_and_keep_their_aggregates_honest() {
+        let db = testdb().await;
+        let uid = db.create_user("hana", None, "x", "user").await.unwrap();
+
+        // Two sittings an hour apart: the gap heuristic makes them separate.
+        let mut ids = Vec::new();
+        for (i, ts) in [1_000, 1_200, 1_400, 10_000, 10_200].iter().enumerate() {
+            db.save_scrobble(
+                uid,
+                &play(&format!("t{i}"), "A", *ts),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+            let sid = db
+                .assign_session(uid, *ts as i64, 180, None, None, None, "active", 1800, None)
+                .await
+                .unwrap();
+            ids.push(sid);
+        }
+        // Point the listens at the sessions the assigner chose.
+        let rows = db.get_all_scrobbles(uid).await.unwrap();
+        for (row, sid) in rows.iter().rev().zip(ids.iter()) {
+            sqlx::query("UPDATE scrobbles SET session_id = ? WHERE id = ?")
+                .bind(sid)
+                .bind(row.id)
+                .execute(&db.pool)
+                .await
+                .unwrap();
+        }
+        for sid in &ids {
+            db.recompute_session(*sid).await.unwrap();
+        }
+
+        let sessions = db.list_sessions(uid, 50, 0).await.unwrap();
+        assert_eq!(sessions.len(), 2, "the hour gap should make two sittings");
+        let (first, second) = (sessions[1].id, sessions[0].id);
+        assert_eq!(sessions[1].track_count + sessions[0].track_count, 5);
+
+        // Merge: the earlier session survives and absorbs everything.
+        let target = db.merge_sessions(uid, &[first, second]).await.unwrap().unwrap();
+        assert_eq!(target, first);
+        let merged = db.list_sessions(uid, 50, 0).await.unwrap();
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].track_count, 5, "aggregates rebuilt from the listens");
+
+        // Split it back at the fourth listen.
+        let listens = db.session_scrobbles(uid, target).await.unwrap();
+        assert_eq!(listens.len(), 5);
+        let new_id = db.split_session(uid, target, listens[3].id).await.unwrap().unwrap();
+        let after = db.list_sessions(uid, 50, 0).await.unwrap();
+        assert_eq!(after.len(), 2);
+        assert_eq!(db.session_scrobbles(uid, target).await.unwrap().len(), 3);
+        assert_eq!(db.session_scrobbles(uid, new_id).await.unwrap().len(), 2);
+
+        // Splitting at the first listen is a no-op, not an empty session.
+        let head = db.session_scrobbles(uid, target).await.unwrap()[0].id;
+        assert!(db.split_session(uid, target, head).await.unwrap().is_none());
+        assert_eq!(db.list_sessions(uid, 50, 0).await.unwrap().len(), 2);
+
+        // Another user's session is untouchable.
+        let other = db.create_user("ivan", None, "x", "user").await.unwrap();
+        assert!(db.merge_sessions(other, &[target, new_id]).await.unwrap().is_none());
+        assert_eq!(db.list_sessions(uid, 50, 0).await.unwrap().len(), 2);
+    }
+
     /// The duplicate that started this: "A.R. Rahman" and "A. R. Rahman" split
     /// one artist across two rows of the same top-50.
     #[test]
