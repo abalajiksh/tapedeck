@@ -819,6 +819,35 @@ async fn list_tokens(State(state): State<Arc<AppState>>, user: AuthUser) -> impl
     }
 }
 
+/// Re-issue a token you no longer have a copy of. Scoped to the caller's own
+/// tokens by the query, same as revoke.
+async fn rotate_token(
+    State(state): State<Arc<AppState>>,
+    user: AuthUser,
+    Path(token_id): Path<i64>,
+) -> impl IntoResponse {
+    match state.db.rotate_token(user.user_id, token_id).await {
+        Ok(Some(token)) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "token": token,
+                "message": "Token re-issued. Copy it now — it won't be shown again.",
+            })),
+        )
+            .into_response(),
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!(ErrorResponse { code: 404, error: "Token not found".into() })),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!(ErrorResponse { code: 500, error: e.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
 async fn revoke_token(
     State(state): State<Arc<AppState>>,
     user: AuthUser,
@@ -902,5 +931,6 @@ pub fn create_user_management_router() -> Router<Arc<AppState>> {
         .route("/admin/users/:id", patch(update_user).delete(delete_user))
         .route("/admin/tokens", post(create_token).get(list_tokens))
         .route("/admin/tokens/:id", patch(update_token).delete(revoke_token))
+        .route("/admin/tokens/:id/rotate", post(rotate_token))
         .route("/log-level", get(get_log_level).post(set_log_level))
 }

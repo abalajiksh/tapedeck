@@ -399,6 +399,8 @@ export interface ArtistView {
 	id: number;
 	name: string;
 	mbid: string | null;
+	/** Portrait from the metadata chain (Deezer today); null until enriched. */
+	image_url: string | null;
 	rank: number;
 	artist_total: number;
 	plays: number;
@@ -879,6 +881,11 @@ class TapedeckAPI {
 		await this.patch(`/admin/tokens/${id}`, data);
 	}
 	async revokeToken(id: number): Promise<void> { await this.del(`/admin/tokens/${id}`); }
+	/** Re-issue a token you've lost. Same row, new secret — clients must be
+	 *  re-pasted, which is why it's separate from `updateToken`. */
+	async rotateToken(id: number): Promise<{ token: string; message: string }> {
+		return this.post(`/admin/tokens/${id}/rotate`, {});
+	}
 }
 
 export const api = new TapedeckAPI();

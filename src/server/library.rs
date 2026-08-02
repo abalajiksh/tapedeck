@@ -269,6 +269,15 @@ async fn artist_detail(
     let (rank, artist_total) = state.db.artist_rank(user.user_id, &name).await.unwrap_or((0, 0));
     let all_plays = state.db.total_plays(user.user_id).await.unwrap_or(0);
     let loved = state.db.is_loved(user.user_id, id).await.unwrap_or(false);
+    // Same portrait the top-artist charts use — the enrichment chain already
+    // stores it on the artist row, it just had nowhere to be shown here.
+    let image_url = state
+        .db
+        .artist_images(std::slice::from_ref(&name))
+        .await
+        .unwrap_or_default()
+        .into_values()
+        .next();
     let bio = bio_for(
         &state,
         id,
@@ -319,6 +328,7 @@ async fn artist_detail(
             "kind": "artist",
             "name": name,
             "mbid": entity.mbid,
+            "image_url": image_url,
             "rank": rank,
             "artist_total": artist_total,
             "plays": summary.as_ref().map(|s| s.plays).unwrap_or(0),

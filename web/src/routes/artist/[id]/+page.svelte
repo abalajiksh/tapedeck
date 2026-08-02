@@ -130,6 +130,14 @@
 					href={`/notes?entity=${artist.id}`}>Liner notes</a>
 			</div>
 		</div>
+
+		<!-- Portrait sits on the right like a CV photo, and only when the
+		     metadata chain actually found one — the cassette stack is the
+		     identity when it hasn't, not a placeholder to fill. -->
+		{#if artist.image_url}
+			<img class="portrait" src={artist.image_url} alt="" loading="lazy"
+				on:error={(e) => e.currentTarget.remove()}>
+		{/if}
 	</div>
 
 	<StatStrip stats={artist.stats} />
@@ -194,6 +202,11 @@
 		align-items: center; margin-bottom: 30px;
 	}
 	.stack { width: 230px; max-width: 100%; flex: none; position: relative; }
+	.portrait {
+		width: 168px; height: 168px; flex: none; object-fit: cover;
+		border-radius: 20px; background: var(--td-track);
+		border: 1px solid var(--td-border);
+	}
 	.sheet { position: absolute; inset: 0; border-radius: 24px; }
 	.sheet.a { transform: rotate(-7deg) translateY(6px); background: var(--td-track); opacity: .5; }
 	.sheet.b { transform: rotate(4deg) translateY(2px); background: var(--td-surface2); border: 1px solid var(--td-border); }

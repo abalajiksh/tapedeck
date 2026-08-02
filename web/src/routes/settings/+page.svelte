@@ -392,6 +392,16 @@
 		}
 	}
 
+	/** Lost the token? Only its hash is stored, so there is nothing to show —
+	 *  re-issuing in place is the recovery path. The row keeps its chain. */
+	async function resetToken(t: TokenInfo) {
+		if (!confirm(`Re-issue "${t.name}"? The old token stops working immediately and you'll need to paste the new one into that client.`)) return;
+		try {
+			createdToken = (await api.rotateToken(t.id)).token;
+			tokens = (await api.getTokens()).tokens;
+		} catch (e) { alert('Reset failed: ' + e); }
+	}
+
 	async function revokeToken(id: number) {
 		if (!confirm('Revoke this token? Any clients using it will stop working.')) return;
 		try {
@@ -630,19 +640,21 @@
 										<option value="">— no chain —</option>
 										{#each chains as c}<option value={c.id}>{c.name}</option>{/each}
 									</select>
+									<button class="btn btn-secondary" style="font-size:12.5px;" on:click={() => resetToken(t)}>Reset</button>
 									<button class="btn btn-secondary" style="font-size:12.5px;color:#b2622d;" on:click={() => revokeToken(t.id)}>Revoke</button>
 								</div>
 							{/each}
 						</div>
 						<p style="font-size:12px;color:var(--td-muted-2);margin:-6px 0 16px;">
 							Changing a chain here takes effect immediately — the token itself doesn't change, so there's nothing to re-paste into the app.
+							<strong>Reset</strong> is for a token you've lost: only its hash is stored, so it can't be shown again — it's re-issued instead, and the old one stops working.
 							{#if !chains.length}<a href="/chains">Create a chain first →</a>{/if}
 						</p>
 					{/if}
 
 					{#if createdToken}
 						<div style="background:var(--td-panel);border-radius:16px;padding:16px;margin-bottom:16px;">
-							<div style="font-size:10.5px;letter-spacing:.1em;text-transform:uppercase;color:#e0a06a;margin-bottom:8px;">New token — copy it now, it won't be shown again</div>
+							<div style="font-size:10.5px;letter-spacing:.1em;text-transform:uppercase;color:#e0a06a;margin-bottom:8px;">Copy it now — it won't be shown again</div>
 							<div style="display:flex;gap:8px;align-items:center;">
 								<code style="flex:1;background:var(--td-panel2);color:#a9c48a;border-radius:10px;padding:10px 12px;font-size:13px;word-break:break-all;">{createdToken}</code>
 								<button class="btn btn-primary" on:click={copyToken}>{tokenCopied ? '✓ Copied' : 'Copy'}</button>

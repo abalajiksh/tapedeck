@@ -4709,6 +4709,31 @@ impl Database {
         Ok(result.rows_affected() > 0)
     }
 
+    /// Re-issue a token in place: same id, name, scopes and chain, new secret.
+    /// Only the hash is stored, so a lost token can't be shown again — this is
+    /// the recovery path instead. Everything referencing the token id (sessions,
+    /// the default chain) keeps pointing at the same row.
+    pub async fn rotate_token(
+        &self,
+        user_id: i64,
+        token_id: i64,
+    ) -> Result<Option<String>, sqlx::Error> {
+        use rand::Rng;
+        let raw: [u8; 24] = rand::rng().random();
+        let token = format!("td_{}", hex::encode(raw));
+        let result = sqlx::query("UPDATE tokens SET token_hash = ? WHERE id = ? AND user_id = ?")
+            .bind(Self::hash_token(&token))
+            .bind(token_id)
+            .bind(user_id)
+            .execute(&self.pool)
+            .await?;
+        if result.rows_affected() == 0 {
+            return Ok(None);
+        }
+        info!("🔑 Rotated token {} for user_id {}", token_id, user_id);
+        Ok(Some(token))
+    }
+
     pub async fn delete_token(&self, user_id: i64, token_id: i64) -> Result<bool, sqlx::Error> {
         let result = sqlx::query("DELETE FROM tokens WHERE id = ? AND user_id = ?")
             .bind(token_id)
