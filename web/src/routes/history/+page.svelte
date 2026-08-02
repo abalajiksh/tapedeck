@@ -6,6 +6,7 @@
 	import InspectListen from '$lib/components/InspectListen.svelte';
 	import { loadLoves, lovedKeys, loveKey, toggleLove } from '$lib/loves';
 	import SessionCard from '$lib/components/SessionCard.svelte';
+	import ToTop from '$lib/components/ToTop.svelte';
 	import type { Session } from '$lib/api';
 
 	let scrobbles: Scrobble[] = [];
@@ -69,17 +70,6 @@
 		scope = {};
 		history.replaceState(null, '', '/history');
 		load(true);
-	}
-
-	// Back to top: a long history is thousands of rows deep, and the browser's
-	// own Home key doesn't work once focus is inside the page.
-	let scrolled = false;
-	function onScroll() {
-		scrolled = window.scrollY > 900;
-	}
-	function toTop() {
-		const still = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
-		window.scrollTo({ top: 0, behavior: still ? 'auto' : 'smooth' });
 	}
 
 	// row menu + dialogs
@@ -212,8 +202,6 @@
 		load(true);
 	});
 </script>
-
-<svelte:window on:scroll={onScroll} />
 
 <svelte:head><title>History — Tapedeck</title></svelte:head>
 
@@ -359,13 +347,7 @@
 	<InspectListen scrobble={inspecting} on:close={() => (inspecting = null)} />
 {/if}
 
-{#if scrolled}
-	<button class="to-top" on:click={toTop} title="Back to top" aria-label="Back to top">
-		<svg viewBox="0 0 24 24" width="20" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round">
-			<path d="M12 19V5"/><path d="M5 12l7-7 7 7"/>
-		</svg>
-	</button>
-{/if}
+<ToTop />
 
 <!-- Edit dialog -->
 {#if editing}
@@ -430,31 +412,4 @@
 		font-size: 12.5px; padding: 6px 14px; border-radius: 999px; font-family: inherit;
 	}
 	.seg-btn.on { background: var(--td-accent); color: #fbf5ea; }
-	.to-top {
-		position: fixed;
-		right: 26px;
-		bottom: 26px;
-		z-index: 40;
-		width: 44px;
-		height: 44px;
-		border-radius: 50%;
-		border: 1px solid var(--td-border);
-		background: var(--td-surface);
-		color: var(--td-text);
-		cursor: pointer;
-		display: flex;
-		align-items: center;
-		justify-content: center;
-		box-shadow: 0 8px 24px rgba(46, 43, 37, .18);
-		animation: to-top-in .18s ease-out;
-	}
-	.to-top:hover { background: var(--td-nav-hover); }
-	@keyframes to-top-in {
-		from { opacity: 0; transform: translateY(8px); }
-		to { opacity: 1; transform: none; }
-	}
-	/* Someone who asked for less motion gets the button, not the entrance. */
-	@media (prefers-reduced-motion: reduce) {
-		.to-top { animation: none; }
-	}
 </style>

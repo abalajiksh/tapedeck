@@ -4,6 +4,7 @@
 	import type { ChartRow, ChartKind, ChartRange } from '$lib/api';
 	import { openAlbum, openArtist } from '$lib/entities';
 	import CoverArt from '$lib/components/CoverArt.svelte';
+	import ToTop from '$lib/components/ToTop.svelte';
 
 	const kinds: { k: ChartKind; label: string }[] = [
 		{ k: 'artists', label: 'Artists' },
@@ -155,6 +156,8 @@
 	<div style="text-align:center;margin-top:22px;font-size:12.5px;color:var(--td-muted-3);">
 		Top {rows.length} {kindLabel.toLowerCase()} {rangeWord}
 	</div>
+
+	<ToTop />
 {/if}
 
 <style>
