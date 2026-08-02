@@ -16,6 +16,9 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
+use tokio::time::sleep;
+use tracing::warn;
 
 use super::auth::AuthUser;
 use super::models::ErrorResponse;
@@ -264,6 +267,26 @@ async fn job_status(
     }
 }
 
+/// GET /api/v1/import/jobs — the caller's jobs that are still running.
+///
+/// The import page only learned a job id from the response to the POST that
+/// started it, so navigating away and back lost the progress bar while the job
+/// carried on in the background. This lets the page find its own work again.
+async fn active_jobs(State(state): State<Arc<AppState>>, user: AuthUser) -> impl IntoResponse {
+    let jobs: Vec<ImportJob> = state
+        .imports
+        .lock()
+        .ok()
+        .map(|m| {
+            m.values()
+                .filter(|j| j.user_id == user.user_id && j.state == "running")
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default();
+    (StatusCode::OK, Json(serde_json::json!({ "jobs": jobs }))).into_response()
+}
+
 async fn import_history(State(state): State<Arc<AppState>>, user: AuthUser) -> impl IntoResponse {
     match state.db.list_imports(user.user_id).await {
         Ok(rows) => {
@@ -284,6 +307,99 @@ async fn import_history(State(state): State<Arc<AppState>>, user: AuthUser) -> i
 //  Workers
 // ════════════════════════════════════════════════════════════
 
+/// One page of listens, retried through the failures a long walk actually hits.
+///
+/// A 260k-listen history is ~2,600 requests, and around the 800th ListenBrainz
+/// starts closing connections on us — the import died at roughly 80k listens,
+/// twice, on two accounts. There was nothing wrong with the paging: the first
+/// read timeout propagated straight out and killed the job.
+///
+/// So: an explicit timeout (the default client has none, so a hung socket hangs
+/// forever), exponential backoff on network errors and 5xx, and 429 handled via
+/// `X-RateLimit-Reset-In` rather than a guess.
+async fn lb_get_page(
+    client: &reqwest::Client,
+    url: &str,
+    token: Option<&str>,
+    reg: &ImportRegistry,
+    id: &str,
+) -> Result<serde_json::Value, String> {
+    const MAX_ATTEMPTS: u32 = 6;
+    let mut attempt = 0u32;
+
+    loop {
+        attempt += 1;
+        let mut req = client.get(url).header("User-Agent", "tapedeck-import");
+        if let Some(t) = token.filter(|t| !t.is_empty()) {
+            req = req.header("Authorization", format!("Token {t}"));
+        }
+
+        let resp = match req.send().await {
+            Ok(r) => r,
+            Err(e) => {
+                if attempt >= MAX_ATTEMPTS {
+                    return Err(format!("giving up after {attempt} attempts: {e}"));
+                }
+                let wait = (1u64 << attempt).min(60);
+                warn!("Import: {} — retrying in {}s (attempt {})", e, wait, attempt);
+                update(reg, id, |j| {
+                    j.status = format!("Network hiccup, retrying in {wait}s…");
+                });
+                sleep(Duration::from_secs(wait)).await;
+                continue;
+            }
+        };
+
+        // Rate limited: the service tells us exactly how long to wait.
+        if resp.status().as_u16() == 429 {
+            let wait = resp
+                .headers()
+                .get("X-RateLimit-Reset-In")
+                .and_then(|h| h.to_str().ok())
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(5)
+                + 1;
+            update(reg, id, |j| j.status = format!("Rate limited, waiting {wait}s…"));
+            sleep(Duration::from_secs(wait)).await;
+            continue;
+        }
+
+        if resp.status().is_server_error() {
+            if attempt >= MAX_ATTEMPTS {
+                return Err(format!("ListenBrainz returned {}", resp.status()));
+            }
+            let wait = (1u64 << attempt).min(60);
+            update(reg, id, |j| j.status = format!("ListenBrainz busy, retrying in {wait}s…"));
+            sleep(Duration::from_secs(wait)).await;
+            continue;
+        }
+
+        if !resp.status().is_success() {
+            return Err(format!("ListenBrainz returned {}", resp.status()));
+        }
+
+        // Stay ahead of the limit rather than waiting to be told off — the
+        // headers are on every response, so this costs nothing.
+        let remaining = resp
+            .headers()
+            .get("X-RateLimit-Remaining")
+            .and_then(|h| h.to_str().ok())
+            .and_then(|s| s.parse::<i64>().ok());
+        let reset_in = resp
+            .headers()
+            .get("X-RateLimit-Reset-In")
+            .and_then(|h| h.to_str().ok())
+            .and_then(|s| s.parse::<u64>().ok());
+
+        let body = resp.json::<serde_json::Value>().await.map_err(|e| e.to_string())?;
+
+        if remaining.is_some_and(|r| r < 3) {
+            sleep(Duration::from_secs(reset_in.unwrap_or(1) + 1)).await;
+        }
+        return Ok(body);
+    }
+}
+
 /// Page https://api.listenbrainz.org public listens newest→oldest via max_ts.
 async fn run_listenbrainz(
     reg: &ImportRegistry,
@@ -293,29 +409,27 @@ async fn run_listenbrainz(
     username: &str,
     token: Option<&str>,
 ) -> Result<(), String> {
-    let client = reqwest::Client::new();
+    // The default client has *no* timeout: a stalled read would hang the job
+    // forever with no way to tell it from slow progress.
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .connect_timeout(Duration::from_secs(10))
+        .build()
+        .map_err(|e| e.to_string())?;
     let mut max_ts = chrono_now();
+    let mut pages = 0u32;
     loop {
         let url = format!(
             "https://api.listenbrainz.org/1/user/{}/listens?count=100&max_ts={}",
             urlencoding::encode(username),
             max_ts,
         );
-        let mut req = client.get(&url).header("User-Agent", "tapedeck-import");
-        if let Some(t) = token {
-            if !t.is_empty() {
-                req = req.header("Authorization", format!("Token {t}"));
-            }
-        }
-        let resp = req.send().await.map_err(|e| e.to_string())?;
-        if !resp.status().is_success() {
-            return Err(format!("ListenBrainz returned {}", resp.status()));
-        }
-        let v: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
+        let v = lb_get_page(&client, &url, token, reg, id).await?;
         let listens = v["payload"]["listens"].as_array().cloned().unwrap_or_default();
         if listens.is_empty() {
             break;
         }
+        pages += 1;
 
         let mut min_ts = max_ts;
         for l in &listens {
@@ -346,6 +460,15 @@ async fn run_listenbrainz(
             break;
         }
         max_ts = min_ts - 1;
+
+        update(reg, id, |j| {
+            j.status = format!("Fetched {} listens ({} pages)…", j.fetched, pages);
+        });
+        // Deliberate pacing. Without it a 260k history is 2,600 back-to-back
+        // requests, which is what got the connection closed on us in the first
+        // place; the wall-clock cost is ~17 minutes of waiting across an import
+        // that already takes far longer than that.
+        sleep(Duration::from_millis(400)).await;
     }
     update(reg, id, |j| {
         j.state = "done".into();
@@ -816,6 +939,7 @@ pub fn create_import_router() -> Router<Arc<AppState>> {
         .route("/api/v1/import/listenbrainz", post(import_listenbrainz))
         .route("/api/v1/import/lastfm", post(import_lastfm))
         .route("/api/v1/import/file", post(import_file))
+        .route("/api/v1/import/jobs", get(active_jobs))
         .route("/api/v1/import/jobs/:job_id", get(job_status))
         .route("/api/v1/import/history", get(import_history))
 }

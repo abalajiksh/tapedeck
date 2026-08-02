@@ -412,6 +412,20 @@ export interface ArtistView {
 	trend: { label: string; value: number }[];
 }
 
+export interface ChartRow {
+	name: string;
+	/** Secondary line — the artist, for albums and tracks. */
+	sub: string | null;
+	plays: number;
+	seconds: number;
+	artwork_url: string | null;
+	caa_id: number | null;
+	caa_release_mbid: string | null;
+}
+
+export type ChartKind = 'artists' | 'albums' | 'tracks';
+export type ChartRange = 'today' | 'd7' | 'month' | 'year' | 'all';
+
 export interface SanitizePreview {
 	/** Albums whose listens disagree about which release they are. */
 	mixed_albums: {
@@ -420,6 +434,8 @@ export interface SanitizePreview {
 	}[];
 	/** `Artist feat. X` strings that fragment an album or artist page. */
 	featured_artists: { artist: string; primary: string; plays: number }[];
+	/** One artist spelled several ways ("A.R. Rahman" / "A. R. Rahman"). */
+	artist_variants: { primary: string; primary_plays: number; variants: [string, number][] }[];
 }
 
 export interface SanitizeResult {
@@ -427,6 +443,8 @@ export interface SanitizeResult {
 	album_listens_changed: number;
 	artists_folded: number;
 	artist_listens_changed: number;
+	variants_merged: number;
+	variant_listens_changed: number;
 }
 
 export interface SearchResults {
@@ -654,6 +672,9 @@ class TapedeckAPI {
 		if (!res.ok) throw new Error(`API ${res.status}: ${await res.text()}`);
 		return res.json();
 	}
+	/** Jobs still running for this user — lets the page pick a live import back
+	 *  up after you navigate away and return. */
+	async activeImportJobs(): Promise<{ jobs: ImportJob[] }> { return this.get('/api/v1/import/jobs'); }
 	async importJob(jobId: string): Promise<ImportJob> { return this.get(`/api/v1/import/jobs/${jobId}`); }
 	async importHistory(): Promise<{ imports: ImportRecord[] }> { return this.get('/api/v1/import/history'); }
 
@@ -671,13 +692,23 @@ class TapedeckAPI {
 	// ── Devices & Equipment ──
 	// ── Metadata sanitiser ──
 	async sanitizePreview(): Promise<SanitizePreview> { return this.get('/api/v1/sanitize'); }
-	async sanitizeApply(opts: { albums?: boolean; artists?: boolean; artist?: string; album?: string }): Promise<SanitizeResult> {
+	async sanitizeApply(opts: { albums?: boolean; artists?: boolean; variants?: boolean; artist?: string; album?: string }): Promise<SanitizeResult> {
 		return this.post('/api/v1/sanitize', opts);
 	}
 
 	// ── Search ──
 	async search(q: string, limit = 10): Promise<SearchResults> {
 		return this.get(`/api/v1/search?q=${encodeURIComponent(q)}&limit=${limit}`);
+	}
+
+	// ── Charts ──
+	async getChart(kind: ChartKind, range: ChartRange, limit = 100): Promise<{ kind: ChartKind; range: string; rows: ChartRow[] }> {
+		return this.get(`/api/v1/charts?kind=${kind}&range=${range}&limit=${limit}`);
+	}
+
+	/** Fetch loved tracks from every connected service. */
+	async pullLoves(): Promise<{ loved: number; services: { service: string; found: number; loved: number; skipped: number; error: string | null }[] }> {
+		return this.post('/api/v1/loves/pull', {});
 	}
 
 	// ── Album & artist pages ──

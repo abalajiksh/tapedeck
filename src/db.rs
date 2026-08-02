@@ -1753,6 +1753,73 @@ impl Database {
             .collect())
     }
 
+    /// Artist names that differ only in punctuation or spacing.
+    ///
+    /// "A.R. Rahman" and "A. R. Rahman" are one person but two rows in every
+    /// grouping query, so they appear twice in the same top-50 and split their
+    /// own play count. Grouped by a key with all punctuation and whitespace
+    /// removed; the spelling with the most plays wins, on the theory that the
+    /// one you've scrobbled most is the one your library actually uses.
+    ///
+    /// Only *variants of one name* are matched — this can't merge two artists
+    /// who are genuinely different, because the normalised forms would differ.
+    pub async fn artists_with_spelling_variants(
+        &self,
+        user_id: i64,
+    ) -> Result<Vec<VariantArtist>, sqlx::Error> {
+        let rows: Vec<(String, i64)> = sqlx::query_as(
+            "SELECT artist, COUNT(*) AS plays FROM scrobbles
+             WHERE user_id = ? AND skipped = FALSE
+             GROUP BY LOWER(TRIM(artist)) ORDER BY plays DESC",
+        )
+        .bind(user_id)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut groups: HashMap<String, Vec<(String, i64)>> = HashMap::new();
+        for (artist, plays) in rows {
+            groups.entry(normalise_artist(&artist)).or_default().push((artist, plays));
+        }
+
+        let mut out: Vec<VariantArtist> = groups
+            .into_values()
+            .filter(|g| g.len() > 1)
+            .map(|mut g| {
+                // Already ordered by plays from the query; be explicit anyway.
+                g.sort_by(|a, b| b.1.cmp(&a.1));
+                let (primary, primary_plays) = g[0].clone();
+                VariantArtist {
+                    primary,
+                    primary_plays,
+                    variants: g[1..].iter().map(|(n, p)| (n.clone(), *p)).collect(),
+                }
+            })
+            .collect();
+        out.sort_by(|a, b| b.primary_plays.cmp(&a.primary_plays));
+        Ok(out)
+    }
+
+    /// Merge one spelling of an artist into another.
+    ///
+    /// A plain rename, unlike `fold_artist_credit`: both strings name the same
+    /// artist, so there is no lost credit to preserve in `artist_credit`.
+    pub async fn rename_artist(
+        &self,
+        user_id: i64,
+        from: &str,
+        to: &str,
+    ) -> Result<u64, sqlx::Error> {
+        let res = sqlx::query(
+            "UPDATE scrobbles SET artist = ? WHERE user_id = ? AND LOWER(TRIM(artist)) = ?",
+        )
+        .bind(to)
+        .bind(user_id)
+        .bind(from.trim().to_lowercase())
+        .execute(&self.pool)
+        .await?;
+        Ok(res.rows_affected())
+    }
+
     /// Rewrite one artist string to another across a user's listens.
     ///
     /// The full credit is kept in `artist_credit` so nothing is lost — the
@@ -3090,6 +3157,85 @@ impl Database {
     ///
     /// A ListenBrainz `feedback.jsonl` row carries an MBID and a score but no
     /// names, so this is how a loved track becomes something nameable.
+    /// One ranked chart: artists, albums or tracks over a window.
+    ///
+    /// Separate from `get_ranged_stats` because the charts page wants *one* long
+    /// list and none of the breakdowns, heatmap or personality that query also
+    /// computes — asking for all of it to render fifty rows would be wasteful on
+    /// a Pi.
+    pub async fn chart(
+        &self,
+        user_id: i64,
+        kind: &str,
+        after: Option<i64>,
+        limit: i64,
+    ) -> Result<Vec<ChartRow>, sqlx::Error> {
+        // Every branch selects the same shape so the caller doesn't care which
+        // ran. `sub` is the secondary line (an album's artist), null for artists.
+        let sql = match kind {
+            "albums" => {
+                "SELECT album AS name, artist AS sub, COUNT(*) AS plays,
+                        COALESCE(SUM(duration), 0) AS seconds,
+                        MAX(artwork_url) AS artwork_url, MAX(caa_id) AS caa_id,
+                        MAX(caa_release_mbid) AS caa_release_mbid
+                 FROM scrobbles
+                 WHERE user_id = ? AND skipped = FALSE AND (? IS NULL OR timestamp >= ?)
+                   AND album IS NOT NULL AND TRIM(album) != ''
+                 GROUP BY LOWER(TRIM(album)), LOWER(TRIM(artist))
+                 ORDER BY plays DESC LIMIT ?"
+            }
+            "tracks" => {
+                "SELECT title AS name, artist AS sub, COUNT(*) AS plays,
+                        COALESCE(SUM(duration), 0) AS seconds,
+                        MAX(artwork_url) AS artwork_url, MAX(caa_id) AS caa_id,
+                        MAX(caa_release_mbid) AS caa_release_mbid
+                 FROM scrobbles
+                 WHERE user_id = ? AND skipped = FALSE AND (? IS NULL OR timestamp >= ?)
+                 GROUP BY LOWER(TRIM(title)), LOWER(TRIM(artist))
+                 ORDER BY plays DESC LIMIT ?"
+            }
+            _ => {
+                "SELECT artist AS name, NULL AS sub, COUNT(*) AS plays,
+                        COALESCE(SUM(duration), 0) AS seconds,
+                        NULL AS artwork_url, NULL AS caa_id, NULL AS caa_release_mbid
+                 FROM scrobbles
+                 WHERE user_id = ? AND skipped = FALSE AND (? IS NULL OR timestamp >= ?)
+                 GROUP BY LOWER(TRIM(artist))
+                 ORDER BY plays DESC LIMIT ?"
+            }
+        };
+        sqlx::query_as(sql)
+            .bind(user_id)
+            .bind(after)
+            .bind(after)
+            .bind(limit)
+            .fetch_all(&self.pool)
+            .await
+    }
+
+    /// A track in this user's history matched by name.
+    ///
+    /// The fallback for services that report names rather than MBIDs (Last.fm).
+    /// Returns the *stored* spelling so the entity key matches everything else
+    /// keyed off this listen, rather than the remote service's capitalisation.
+    pub async fn track_by_name(
+        &self,
+        user_id: i64,
+        title: &str,
+        artist: &str,
+    ) -> Result<Option<(String, String)>, sqlx::Error> {
+        sqlx::query_as(
+            "SELECT title, artist FROM scrobbles
+             WHERE user_id = ? AND LOWER(TRIM(title)) = ? AND LOWER(TRIM(artist)) = ?
+             ORDER BY id DESC LIMIT 1",
+        )
+        .bind(user_id)
+        .bind(title.trim().to_lowercase())
+        .bind(artist.trim().to_lowercase())
+        .fetch_optional(&self.pool)
+        .await
+    }
+
     pub async fn track_by_recording_mbid(
         &self,
         user_id: i64,
@@ -3786,11 +3932,17 @@ impl Database {
     pub async fn get_equipment(&self, user_id: i64) -> Result<Vec<EquipmentRow>, sqlx::Error> {
         sqlx::query_as(
             "SELECT e.id, e.user_id, e.name, e.type, e.brand, e.model,
-                    COALESCE((
+                    -- CAST is load-bearing: SQLite types SUM() by what it
+                    -- actually summed, so a chain with 0 hours (or no matching
+                    -- chain at all, hitting the COALESCE) comes back INTEGER and
+                    -- sqlx refuses to decode it into f64. It only shows up once
+                    -- a user has gear with no hours on it, which is every new
+                    -- install.
+                    CAST(COALESCE((
                         SELECT SUM(c.total_hours) FROM signal_chains c, json_each(c.components) j
                          WHERE c.user_id = e.user_id
                            AND json_extract(j.value, '$.equipment_id') = e.id
-                    ), 0) AS total_hours,
+                    ), 0) AS REAL) AS total_hours,
                     e.first_used, e.last_used, e.notes
                FROM equipment e
               WHERE e.user_id = ?
@@ -4136,6 +4288,19 @@ pub struct UserRecord {
     pub disabled: bool,
 }
 
+/// One row of a chart. `sub` is the secondary line — an album's or track's
+/// artist — and is null for an artist chart, where the name says it all.
+#[derive(Debug, FromRow, serde::Serialize)]
+pub struct ChartRow {
+    pub name: String,
+    pub sub: Option<String>,
+    pub plays: i64,
+    pub seconds: i64,
+    pub artwork_url: Option<String>,
+    pub caa_id: Option<i64>,
+    pub caa_release_mbid: Option<String>,
+}
+
 /// A cached description. `bio IS NULL` means every provider was asked and none
 /// had anything — a tombstone, not a miss to retry on the next page view.
 #[derive(Debug, FromRow, serde::Serialize)]
@@ -4168,6 +4333,27 @@ pub struct FeaturedArtist {
     pub artist: String,
     pub primary: String,
     pub plays: i64,
+}
+
+/// An artist name with other spellings of itself in the same history.
+#[derive(Debug, serde::Serialize)]
+pub struct VariantArtist {
+    /// The most-played spelling — the one the others fold into.
+    pub primary: String,
+    pub primary_plays: i64,
+    /// `(spelling, plays)` for every other form of the same name.
+    pub variants: Vec<(String, i64)>,
+}
+
+/// Collapse an artist name to its identity for duplicate detection: lowercase,
+/// with punctuation and whitespace removed entirely.
+///
+/// Aggressive on purpose — "A.R. Rahman", "A. R. Rahman" and "AR Rahman" all
+/// reduce to `arrahman`. It is only ever used to *group candidates for review*,
+/// never to rewrite anything on its own, so a false pairing costs a line in a
+/// preview rather than corrupted data.
+fn normalise_artist(s: &str) -> String {
+    s.chars().filter(|c| c.is_alphanumeric()).flat_map(|c| c.to_lowercase()).collect()
 }
 
 /// Split `Artist feat. Someone` into its primary artist.
@@ -4389,6 +4575,49 @@ mod tests {
     /// A token per app, each with its own chain, is the whole point of
     /// `default_chain_id` — so validating a token must hand back the chain in
     /// the same breath as the identity, and editing must not re-issue it.
+    /// The duplicate that started this: "A.R. Rahman" and "A. R. Rahman" split
+    /// one artist across two rows of the same top-50.
+    #[test]
+    fn artist_spellings_normalise_to_one_identity() {
+        assert_eq!(normalise_artist("A.R. Rahman"), normalise_artist("A. R. Rahman"));
+        assert_eq!(normalise_artist("A.R. Rahman"), normalise_artist("AR Rahman"));
+        assert_eq!(normalise_artist("Sigur Rós"), normalise_artist("sigur rós"));
+        // Different artists must not collapse together.
+        assert_ne!(normalise_artist("Bill Evans"), normalise_artist("Gil Evans"));
+        assert_ne!(normalise_artist("The Beatles"), normalise_artist("Beatles"));
+    }
+
+    #[tokio::test]
+    async fn spelling_variants_are_found_and_merged_into_the_most_played() {
+        let db = testdb().await;
+        let uid = db.create_user("gina", None, "x", "user").await.unwrap();
+        for (i, artist) in
+            ["A.R. Rahman", "A.R. Rahman", "A.R. Rahman", "A. R. Rahman"].iter().enumerate()
+        {
+            db.save_scrobble(
+                uid,
+                &play(&format!("t{i}"), artist, 100 + i as u64),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        }
+
+        let found = db.artists_with_spelling_variants(uid).await.unwrap();
+        assert_eq!(found.len(), 1, "{found:?}");
+        // The spelling with the most plays is the one that survives.
+        assert_eq!(found[0].primary, "A.R. Rahman");
+        assert_eq!(found[0].variants.len(), 1);
+
+        db.rename_artist(uid, "A. R. Rahman", "A.R. Rahman").await.unwrap();
+        assert!(db.artists_with_spelling_variants(uid).await.unwrap().is_empty());
+    }
+
     #[tokio::test]
     async fn a_token_carries_its_default_chain_and_keeps_working_after_an_edit() {
         let db = testdb().await;

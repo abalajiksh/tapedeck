@@ -335,6 +335,44 @@ async fn artist_detail(
         .into_response()
 }
 
+// ── GET /api/v1/charts ──
+
+#[derive(Debug, Deserialize)]
+pub struct ChartQuery {
+    /// `artists` (default), `albums` or `tracks`.
+    pub kind: Option<String>,
+    pub range: Option<String>,
+    pub limit: Option<i64>,
+}
+
+/// Ranked chart over one window. The Statistics page shows the head of these
+/// three lists; this serves the whole thing for the dedicated charts screen.
+async fn charts(
+    State(state): State<Arc<AppState>>,
+    user: AuthUser,
+    Query(q): Query<ChartQuery>,
+) -> impl IntoResponse {
+    let kind = match q.kind.as_deref().unwrap_or("artists") {
+        k @ ("artists" | "albums" | "tracks") => k,
+        _ => return err(StatusCode::BAD_REQUEST, "kind must be artists, albums or tracks"),
+    };
+    let limit = q.limit.unwrap_or(100).clamp(1, 500);
+    let after = crate::server::scrobbles::range_after(q.range.as_deref());
+
+    match state.db.chart(user.user_id, kind, after, limit).await {
+        Ok(rows) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "kind": kind,
+                "range": q.range.unwrap_or_else(|| "all".into()),
+                "rows": rows,
+            })),
+        )
+            .into_response(),
+        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
+}
+
 // ── GET /api/v1/resolve ──
 
 #[derive(Debug, Deserialize)]
@@ -381,6 +419,7 @@ async fn resolve(
 pub fn create_library_router() -> Router<Arc<AppState>> {
     Router::new()
         .route("/api/v1/resolve", get(resolve))
+        .route("/api/v1/charts", get(charts))
         .route("/api/v1/albums/:id", get(album_detail))
         .route("/api/v1/artists/:id", get(artist_detail))
 }

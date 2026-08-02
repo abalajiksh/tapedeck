@@ -20,7 +20,7 @@ struct Assets;
 /// returning `index.html` for a mistyped API path hands the browser a 200 with
 /// an HTML body that `res.json()` then chokes on.
 const API_PREFIXES: [&str; 3] = ["api/", "1/", "admin/"];
-const API_EXACT: [&str; 2] = ["health", "log-level"];
+const API_EXACT: [&str; 3] = ["health", "log-level", "metrics"];
 
 fn is_api_path(path: &str) -> bool {
     API_PREFIXES.iter().any(|p| path.starts_with(p)) || API_EXACT.contains(&path)

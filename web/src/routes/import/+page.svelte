@@ -87,7 +87,23 @@
 		try { history = (await api.importHistory()).imports; } catch { /* optional */ }
 	}
 
-	onMount(loadHistory);
+	// An import keeps running server-side when you leave the page, so on arrival
+	// ask whether one of ours is still going and re-attach to it. Without this
+	// the progress bar simply vanished and looked like the import had died.
+	async function resumeRunningJob() {
+		try {
+			const { jobs } = await api.activeImportJobs();
+			if (jobs.length) {
+				job = jobs[0];
+				startPolling(jobs[0].job_id);
+			}
+		} catch { /* nothing running, or not reachable — no bar either way */ }
+	}
+
+	onMount(() => {
+		loadHistory();
+		resumeRunningJob();
+	});
 	onDestroy(stopPolling);
 </script>
 

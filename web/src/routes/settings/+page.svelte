@@ -54,6 +54,27 @@
 	let sanitizeMsg = '';
 	let fixAlbums = true;
 	let fixArtists = true;
+	let fixVariants = true;
+
+	// ── Pulling loves from connected services ──
+	let pullingLoves = false;
+	let lovesMsg = '';
+	async function pullLoves() {
+		pullingLoves = true;
+		lovesMsg = '';
+		try {
+			const r = await api.pullLoves();
+			const parts = r.services.map((s) =>
+				s.error
+					? `${s.service}: ${s.error}`
+					: `${s.service}: ${s.loved} new${s.skipped ? `, ${s.skipped} not in your history` : ''}`
+			);
+			lovesMsg = parts.length ? parts.join(' · ') : 'No connected services to pull from.';
+		} catch (e) {
+			lovesMsg = 'Failed: ' + String(e).replace(/^API \d+: /, '');
+		}
+		pullingLoves = false;
+	}
 
 	async function loadSanitize() {
 		try { sanitize = await api.sanitizePreview(); } catch { sanitize = null; }
@@ -62,8 +83,8 @@
 		sanitizing = true;
 		sanitizeMsg = '';
 		try {
-			const r = await api.sanitizeApply({ albums: fixAlbums, artists: fixArtists });
-			sanitizeMsg = `Fixed ${r.albums_fixed} album${r.albums_fixed === 1 ? '' : 's'} (${r.album_listens_changed} listens) and folded ${r.artists_folded} artist credit${r.artists_folded === 1 ? '' : 's'} (${r.artist_listens_changed} listens). Artwork will re-resolve in the background.`;
+			const r = await api.sanitizeApply({ albums: fixAlbums, artists: fixArtists, variants: fixVariants });
+			sanitizeMsg = `Fixed ${r.albums_fixed} album${r.albums_fixed === 1 ? '' : 's'} (${r.album_listens_changed} listens), folded ${r.artists_folded} featured credit${r.artists_folded === 1 ? '' : 's'} (${r.artist_listens_changed} listens) and merged ${r.variants_merged} artist spelling${r.variants_merged === 1 ? '' : 's'} (${r.variant_listens_changed} listens). Artwork will re-resolve in the background.`;
 			await loadSanitize();
 		} catch (e) {
 			sanitizeMsg = 'Failed: ' + e;
@@ -444,6 +465,24 @@
 
 				{#if connError}<div style="font-size:13px;color:#b2622d;margin-bottom:12px;">{connError}</div>{/if}
 
+				{#if connections.length}
+					<div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;padding:12px 14px;margin-bottom:14px;background:var(--td-surface2);border:1px solid var(--td-border);border-radius:14px;">
+						<div style="flex:1;min-width:180px;">
+							<div style="font-weight:600;font-size:14px;">Pull loved tracks</div>
+							<div style="font-size:12.5px;color:var(--td-muted-2);margin-top:2px;">
+								Brings your existing loves across from the services above. A track you've never
+								played here is skipped rather than invented.
+							</div>
+						</div>
+						<button class="btn btn-secondary" on:click={pullLoves} disabled={pullingLoves}>
+							{pullingLoves ? 'Pulling…' : 'Pull loves'}
+						</button>
+					</div>
+					{#if lovesMsg}
+						<p style="font-size:12.5px;color:var(--td-good-fg);margin:-6px 0 14px;">{lovesMsg}</p>
+					{/if}
+				{/if}
+
 				<!-- ListenBrainz -->
 				<div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;padding:12px 0;border-bottom:1px solid var(--td-border);">
 					<div style="flex:1;min-width:160px;">
@@ -630,8 +669,31 @@
 									</p>
 								</div>
 							{/if}
+							{#if sanitize.artist_variants.length}
+								<div>
+									<label style="display:flex;align-items:center;gap:9px;cursor:pointer;font-size:14px;font-weight:600;">
+										<input type="checkbox" bind:checked={fixVariants} style="width:16px;height:16px;accent-color:var(--td-accent);cursor:pointer;">
+										{sanitize.artist_variants.length} artist{sanitize.artist_variants.length === 1 ? '' : 's'} spelled more than one way
+									</label>
+									<div style="margin:8px 0 0 25px;font-size:12.5px;color:var(--td-muted-2);display:flex;flex-direction:column;gap:4px;">
+										{#each sanitize.artist_variants.slice(0, 6) as v}
+											<div>
+												{v.variants.map((x) => x[0]).join(', ')}
+												<span style="color:var(--td-muted-3);">→ {v.primary} ({v.primary_plays} plays)</span>
+											</div>
+										{/each}
+										{#if sanitize.artist_variants.length > 6}
+											<div style="color:var(--td-muted-3);">…and {sanitize.artist_variants.length - 6} more</div>
+										{/if}
+									</div>
+									<p style="margin:8px 0 0 25px;font-size:12px;color:var(--td-muted-3);">
+										Same artist, different punctuation — “A.R. Rahman” and “A. R. Rahman” chart as two
+										people and split their play count. The most-played spelling wins.
+									</p>
+								</div>
+							{/if}
 						</div>
-						<button class="btn btn-primary" on:click={runSanitize} disabled={sanitizing || (!fixAlbums && !fixArtists)}>
+						<button class="btn btn-primary" on:click={runSanitize} disabled={sanitizing || (!fixAlbums && !fixArtists && !fixVariants)}>
 							{sanitizing ? 'Sanitising…' : 'Apply fixes'}
 						</button>
 					{:else}

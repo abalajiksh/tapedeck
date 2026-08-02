@@ -8,12 +8,14 @@ pub mod import;
 pub mod ingest;
 mod lb_api;
 mod library;
+mod loves_pull;
+mod metrics;
 pub mod models;
 mod notes;
 pub mod now_playing;
 mod preferences;
 pub mod ratelimit;
-mod scrobbles;
+pub mod scrobbles;
 mod sources;
 mod users;
 
@@ -48,6 +50,8 @@ pub struct AppState {
     pub analytics_row_cap: i64,
     /// Only trust `X-Forwarded-For` for the client IP when behind a known proxy.
     pub trust_proxy: bool,
+    /// When this process started serving, for the uptime metric.
+    pub started_at: std::time::Instant,
     /// Description providers, in preference order. Built once — each holds an
     /// HTTP client with its own connection pool, so rebuilding per request
     /// would throw those away.
@@ -79,6 +83,8 @@ pub fn build_app(state: Arc<AppState>) -> Router {
         .merge(connections::create_connections_router())
         .merge(notes::create_notes_router())
         .merge(library::create_library_router())
+        .merge(loves_pull::create_loves_pull_router())
+        .merge(metrics::create_metrics_router())
         .with_state(state);
 
     // The SPA is the fallback, not a `/*path` route: a route would only answer

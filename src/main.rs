@@ -115,6 +115,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )),
         analytics_row_cap: analytics_row_cap(),
         trust_proxy: config.server.trust_proxy,
+        started_at: std::time::Instant::now(),
         // Built once: each provider holds an HTTP client with its own
         // connection pool. Apple Music is unconfigured unless a developer token
         // is supplied, and simply steps aside when it is.

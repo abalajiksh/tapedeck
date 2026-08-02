@@ -129,11 +129,13 @@ async fn search(
 async fn sanitize_preview(State(state): State<Arc<AppState>>, user: AuthUser) -> impl IntoResponse {
     let albums = state.db.albums_with_mixed_releases(user.user_id).await.unwrap_or_default();
     let artists = state.db.artists_with_featured_credits(user.user_id).await.unwrap_or_default();
+    let variants = state.db.artists_with_spelling_variants(user.user_id).await.unwrap_or_default();
     (
         StatusCode::OK,
         Json(serde_json::json!({
             "mixed_albums": albums,
             "featured_artists": artists,
+            "artist_variants": variants,
         })),
     )
         .into_response()
@@ -147,6 +149,9 @@ pub struct SanitizeRequest {
     /// Fold `Artist feat. X` into `Artist`, keeping the full credit.
     #[serde(default)]
     pub artists: bool,
+    /// Merge spellings of one artist ("A.R. Rahman" / "A. R. Rahman").
+    #[serde(default)]
+    pub variants: bool,
     /// Limit to one album (`artist` + `album`) instead of the whole library.
     pub artist: Option<String>,
     pub album: Option<String>,
@@ -203,6 +208,27 @@ async fn sanitize_apply(
         }
     }
 
+    let mut variant_rows = 0u64;
+    let mut variants_merged = 0u64;
+    if body.variants {
+        let candidates = match state.db.artists_with_spelling_variants(user.user_id).await {
+            Ok(c) => c,
+            Err(e) => return server_error(e.to_string()),
+        };
+        for c in candidates {
+            for (spelling, _) in &c.variants {
+                // Unlike the `feat.` fold this is a pure rename — the discarded
+                // spelling is the same credit, so nothing is worth preserving.
+                if let Ok(n) = state.db.rename_artist(user.user_id, spelling, &c.primary).await {
+                    if n > 0 {
+                        variant_rows += n;
+                        variants_merged += 1;
+                    }
+                }
+            }
+        }
+    }
+
     tracing::info!(
         "🧹 Sanitised: {} listens across {} albums, {} listens across {} artist credits",
         album_rows,
@@ -218,6 +244,8 @@ async fn sanitize_apply(
             "album_listens_changed": album_rows,
             "artists_folded": artists_folded,
             "artist_listens_changed": artist_rows,
+            "variants_merged": variants_merged,
+            "variant_listens_changed": variant_rows,
         })),
     )
         .into_response()
@@ -335,11 +363,13 @@ pub struct StatsQuery {
 }
 
 /// Map a range label to a lower-bound timestamp (None = all time).
-fn range_after(range: Option<&str>) -> Option<i64> {
+pub fn range_after(range: Option<&str>) -> Option<i64> {
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs()
         as i64;
     match range.unwrap_or("all") {
-        "week" => Some(now - 7 * 86400),
+        // `today` and `d7` exist for the charts screen's timeframe pills.
+        "today" => Some(now - 86400),
+        "d7" | "week" => Some(now - 7 * 86400),
         "month" | "last30" => Some(now - 30 * 86400),
         "year" => Some(now - 365 * 86400),
         _ => None,

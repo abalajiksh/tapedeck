@@ -23,6 +23,7 @@
 		{ href: '/', label: 'Dashboard', icon: 'dashboard' },
 		{ href: '/history', label: 'History', icon: 'history' },
 		{ href: '/search', label: 'Search', icon: 'search' },
+		{ href: '/charts', label: 'Top Charts', icon: 'charts' },
 		{ href: '/stats', label: 'Statistics', icon: 'stats' },
 		{ href: '/notes', label: 'Liner Notes', icon: 'notes' },
 		{ href: '/import', label: 'Import', icon: 'import' },
@@ -139,7 +140,8 @@
 						{#if item.icon === 'dashboard'}<svg viewBox="0 0 24 24" width="20" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round"><circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="2.4"/></svg>
 						{:else if item.icon === 'history'}<svg viewBox="0 0 24 24" width="20" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3.5 2"/></svg>
 						{:else if item.icon === 'search'}<svg viewBox="0 0 24 24" width="20" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"/><path d="M20 20l-3.6-3.6"/></svg>
-						{:else if item.icon === 'stats'}<svg viewBox="0 0 24 24" width="20" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><path d="M4 20V4"/><path d="M4 20h16"/><rect x="7" y="11" width="3.2" height="6" rx="1"/><rect x="13.5" y="7" width="3.2" height="10" rx="1"/></svg>
+						{:else if item.icon === 'charts'}<svg viewBox="0 0 24 24" width="20" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><path d="M8 21h8"/><path d="M12 17v4"/><path d="M7 4h10v4a5 5 0 0 1-10 0z"/><path d="M17 5h3v2a3 3 0 0 1-3 3"/><path d="M7 5H4v2a3 3 0 0 0 3 3"/></svg>
+					{:else if item.icon === 'stats'}<svg viewBox="0 0 24 24" width="20" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><path d="M4 20V4"/><path d="M4 20h16"/><rect x="7" y="11" width="3.2" height="6" rx="1"/><rect x="13.5" y="7" width="3.2" height="10" rx="1"/></svg>
 						{:else if item.icon === 'import'}<svg viewBox="0 0 24 24" width="20" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12"/><path d="M8 11l4 4 4-4"/><path d="M5 21h14"/></svg>
 						{:else if item.icon === 'notes'}<svg viewBox="0 0 24 24" width="20" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><path d="M6 4h9l4 4v12H6z"/><path d="M9 12h7"/><path d="M9 16h5"/></svg>
 						{:else if item.icon === 'chains'}<svg viewBox="0 0 24 24" width="20" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><path d="M9 12a3 3 0 0 1 3-3h2a3 3 0 0 1 0 6"/><path d="M15 12a3 3 0 0 1-3 3h-2a3 3 0 0 1 0-6"/></svg>
