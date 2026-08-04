@@ -3679,13 +3679,28 @@ impl Database {
                  ORDER BY plays DESC LIMIT ?"
             }
         };
-        sqlx::query_as(sql)
+        let mut rows: Vec<ChartRow> = sqlx::query_as(sql)
             .bind(user_id)
             .bind(after)
             .bind(after)
             .bind(limit)
             .fetch_all(&self.pool)
-            .await
+            .await?;
+
+        // An artist's portrait doesn't live on `scrobbles` — a listen carries
+        // its *cover*, which is the album's. It lives on `artists`, filled by
+        // the metadata chain, which is why the artists branch above selects a
+        // literal NULL. Statistics has always filled it in this second step
+        // (see `ranged_stats`); the charts screen never did, so every artist
+        // row fell back to the lettered tile.
+        if kind == "artists" {
+            let names: Vec<String> = rows.iter().map(|r| r.name.clone()).collect();
+            let images = self.artist_images(&names).await.unwrap_or_default();
+            for row in &mut rows {
+                row.artwork_url = images.get(&Self::artist_key(&row.name)).cloned();
+            }
+        }
+        Ok(rows)
     }
 
     /// A track in this user's history matched by name.
