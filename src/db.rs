@@ -1113,7 +1113,7 @@ impl Database {
         if self.exists(user_id, &play.source_id, &play.source_name).await? {
             return Ok(false);
         }
-        if self.fuzzy_exists(user_id, &play.title, &play.artist, play.timestamp as i64).await? {
+        if self.fuzzy_exists(user_id, play).await? {
             debug!("Skipping duplicate play (fuzzy match): {} - {}", play.artist, play.title);
             return Ok(false);
         }
@@ -1186,22 +1186,33 @@ impl Database {
         Ok(count.0 > 0)
     }
 
-    pub async fn fuzzy_exists(
-        &self,
-        user_id: i64,
-        title: &str,
-        artist: &str,
-        timestamp: i64,
-    ) -> Result<bool, sqlx::Error> {
+    /// Has this play already been recorded under a different `source_id`?
+    ///
+    /// The window is the track's own length rather than a flat ten minutes,
+    /// because those are two different questions. A duplicate — the same play
+    /// arriving from a second code path, such as Plex's history endpoint
+    /// re-reporting what the live session already banked — lands within
+    /// seconds. A track *on repeat* is a genuinely separate listen and cannot
+    /// arrive sooner than one track length later. A fixed ten-minute window
+    /// can't tell them apart and silently swallowed every repeat of anything
+    /// shorter than ten minutes, which is nearly everything.
+    ///
+    /// Unknown duration falls back to a conservative minute: better a rare
+    /// duplicate than a silently dropped listen.
+    pub async fn fuzzy_exists(&self, user_id: i64, play: &Play) -> Result<bool, sqlx::Error> {
+        let window = play.duration.map(|d| (d as i64).clamp(60, 600)).unwrap_or(60);
+        let timestamp = play.timestamp as i64;
         let count: (i64,) = sqlx::query_as(
             "SELECT COUNT(*) FROM scrobbles WHERE user_id = ? AND title = ? AND artist = ?
-             AND timestamp BETWEEN ? - 600 AND ? + 600",
+             AND timestamp BETWEEN ? - ? AND ? + ?",
         )
         .bind(user_id)
-        .bind(title)
-        .bind(artist)
+        .bind(&play.title)
+        .bind(&play.artist)
         .bind(timestamp)
+        .bind(window)
         .bind(timestamp)
+        .bind(window)
         .fetch_one(&self.pool)
         .await?;
         Ok(count.0 > 0)
@@ -2306,7 +2317,7 @@ impl Database {
         if self.exists(user_id, &play.source_id, &play.source_name).await? {
             return Ok(false);
         }
-        if self.fuzzy_exists(user_id, &play.title, &play.artist, play.timestamp as i64).await? {
+        if self.fuzzy_exists(user_id, play).await? {
             return Ok(false);
         }
         let mbid_artist_json =

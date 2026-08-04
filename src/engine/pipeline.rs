@@ -350,7 +350,7 @@ impl ScrobbleEngine {
                         .await
                         .unwrap_or(false)
                         || db
-                            .fuzzy_exists(user_id, &play.title, &play.artist, play.timestamp as i64)
+                            .fuzzy_exists(user_id, &play)
                             .await
                             .unwrap_or(false);
                     if dupe {
@@ -459,7 +459,7 @@ impl ScrobbleEngine {
             let dupe =
                 db.exists(user_id, &play.source_id, &play.source_name).await.unwrap_or(false)
                     || db
-                        .fuzzy_exists(user_id, &play.title, &play.artist, play.timestamp as i64)
+                        .fuzzy_exists(user_id, &play)
                         .await
                         .unwrap_or(false);
             if dupe {
@@ -605,7 +605,7 @@ impl ScrobbleEngine {
                 let already_exists =
                     db.exists(user_id, &play.source_id, &play.source_name).await.unwrap_or(false)
                         || db
-                            .fuzzy_exists(user_id, &play.title, &play.artist, play.timestamp as i64)
+                            .fuzzy_exists(user_id, &play)
                             .await
                             .unwrap_or(false);
                 if already_exists {

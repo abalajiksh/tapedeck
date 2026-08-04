@@ -119,6 +119,11 @@ pub struct PlexTrack {
     /// Plex account name (from the session's `User` element), used to map the
     /// listen to the matching Tapedeck user. None for history-derived tracks.
     pub plex_user: Option<String>,
+    /// Plex's own id for a *play event*, present only on history rows. It is
+    /// the one stable key a re-walked history entry keeps, so it becomes the
+    /// `source_id` — the old suffix was the poll's wall clock, which made every
+    /// walk of the same 50 rows look like 50 new plays to `Database::exists`.
+    pub history_key: Option<String>,
 }
 
 impl PlexTrack {
@@ -139,6 +144,7 @@ impl PlexTrack {
             viewed_at: None,
             audio_quality,
             plex_user: s.user.as_ref().and_then(|u| u.title.clone()),
+            history_key: None,
         })
     }
 
@@ -147,6 +153,7 @@ impl PlexTrack {
             title: h.title?,
             artist: h.artist.unwrap_or_else(|| "Unknown".to_string()),
             track_artist: h.track_artist,
+            history_key: h.history_key,
             album: h.album,
             duration: h.duration,
             view_offset: None,
@@ -229,7 +236,12 @@ impl PlexTrack {
     pub fn to_play(&self, source_id_suffix: &str) -> Play {
         let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
         let timestamp = self.viewed_at.unwrap_or(now);
-        let source_id = format!("plex-{}-{}", self.rating_key, source_id_suffix);
+        // A history row carries Plex's own play-event id, which is stable
+        // across walks; a live row has only the caller's suffix.
+        let source_id = match &self.history_key {
+            Some(hk) => format!("plex-hist-{}", hk),
+            None => format!("plex-{}-{}", self.rating_key, source_id_suffix),
+        };
 
         let (artists, _) = if let Some(ta) = &self.track_artist {
             (vec![ta.clone()], self.artist.clone())
@@ -391,7 +403,6 @@ pub struct Library {
 struct HistoryTrack {
     media_type: Option<String>,
     viewed_at: Option<u64>,
-    #[allow(dead_code)]
     history_key: Option<String>,
     title: Option<String>,
     artist: Option<String>,
@@ -410,6 +421,10 @@ struct SessionState {
     rating_key: String,
     last_seen: u64,
     scrobbled: bool,
+    /// Previous playhead, in ms. A track on repeat keeps the same `sessionKey`
+    /// *and* the same `ratingKey`, so the only evidence that it started over is
+    /// the playhead jumping backwards — see `process_live_track`.
+    last_offset: u64,
 }
 
 // ==================== Filter Configuration ====================
@@ -438,11 +453,33 @@ pub struct PlexSource {
     /// exists to catch plays that finished between polls, which at this cadence
     /// is close to nothing. Throttled separately rather than tied to the caller.
     last_history_at: u64,
+    /// `rating_key` -> when the live path last emitted a scrobble for it.
+    ///
+    /// The history endpoint re-reports plays the live path already caught, and
+    /// it reports them *differently*: Plex omits `originalTitle` there, so a
+    /// compilation track that played as "Punch" comes back as "Various
+    /// Artists". Neither dedup in `save_scrobble` catches that — `source_id`
+    /// carried the poll's wall clock so it never matched, and `fuzzy_exists`
+    /// keys on the artist, which is the very field that differs. The result was
+    /// two rows per play, one with quality metadata and one without.
+    recent_scrobbles: HashMap<String, u64>,
 }
 
 /// How often the Plex history endpoint is walked, independent of how often
 /// sessions are read.
 const HISTORY_SYNC_INTERVAL_SECS: u64 = 60;
+
+/// How far the playhead must jump backwards before it counts as the track
+/// starting over rather than the user scrubbing. Plex reports `viewOffset` a
+/// few seconds coarse, and a repeat always lands near zero, so this only has to
+/// clear ordinary seek noise.
+const REPEAT_REWIND_MS: u64 = 20_000;
+
+/// How long a live scrobble suppresses the same item arriving from the history
+/// endpoint. History is walked every 60s and returns the last 50 plays, so a
+/// track the live path already banked shows up there for the rest of the
+/// session — see `recent_scrobbles`.
+const HISTORY_SUPPRESS_SECS: u64 = 30 * 60;
 
 #[derive(Debug, Default)]
 pub struct SessionResult {
@@ -468,6 +505,7 @@ impl PlexSource {
             session_states: HashMap::new(),
             libraries: Vec::new(),
             last_history_at: 0,
+            recent_scrobbles: HashMap::new(),
         }
     }
 
@@ -674,9 +712,26 @@ impl PlexSource {
         let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
         if now.saturating_sub(self.last_history_at) >= HISTORY_SYNC_INTERVAL_SECS {
             self.last_history_at = now;
+            self.recent_scrobbles
+                .retain(|_, at| now.saturating_sub(*at) < HISTORY_SUPPRESS_SECS);
             if let Ok(history) = self.fetch_history_tracks(0).await {
-                info!("Fetched {} tracks from Plex history", history.len());
-                result.ready_to_scrobble.extend(history);
+                let fetched = history.len();
+                // Drop anything the live path already banked. History is the
+                // fallback for plays that finished between polls, not a second
+                // opinion on plays we watched happen — and its rows carry the
+                // album artist and no quality metadata, so letting one through
+                // is a visibly worse duplicate of a row we already have.
+                let fresh: Vec<PlexTrack> = history
+                    .into_iter()
+                    .filter(|t| !self.recent_scrobbles.contains_key(&t.rating_key))
+                    .collect();
+                info!(
+                    "Fetched {} tracks from Plex history, {} new ({} already banked live)",
+                    fetched,
+                    fresh.len(),
+                    fetched - fresh.len()
+                );
+                result.ready_to_scrobble.extend(fresh);
             }
         }
 
@@ -712,9 +767,34 @@ impl PlexSource {
 
         let (should_scrobble, needs_np) = {
             let state = self.session_states.entry(session_key.clone()).or_insert_with(|| {
-                SessionState { rating_key: rating_key.clone(), last_seen: now, scrobbled: false }
+                SessionState {
+                    rating_key: rating_key.clone(),
+                    last_seen: now,
+                    scrobbled: false,
+                    last_offset: view_offset,
+                }
             });
             state.last_seen = now;
+
+            // A track on repeat is invisible to the `rating_key` check above:
+            // Plex keeps the same session *and* the same item, so `scrobbled`
+            // stayed true forever and only the first of N plays was ever
+            // banked. The playhead jumping backwards is the one signal that
+            // the track started over. Require a real rewind (not a small
+            // seek-back) *and* that we'd already banked this pass, so scrubbing
+            // around inside one listen can't mint extra scrobbles.
+            if state.last_offset > view_offset
+                && state.last_offset.saturating_sub(view_offset) >= REPEAT_REWIND_MS
+            {
+                if state.scrobbled {
+                    debug!(
+                        "Playhead rewound in session {} ({}ms -> {}ms): '{}' started over",
+                        session_key, state.last_offset, view_offset, track.title
+                    );
+                }
+                state.scrobbled = false;
+            }
+            state.last_offset = view_offset;
 
             let pct =
                 if duration > 0 { (view_offset as f64 / duration as f64) * 100.0 } else { 0.0 };
@@ -736,6 +816,9 @@ impl PlexSource {
             if let Some(state) = self.session_states.get_mut(&session_key) {
                 state.scrobbled = true;
             }
+            // Claim this item so the history sync doesn't re-report the same
+            // play under its album artist a minute later.
+            self.recent_scrobbles.insert(rating_key.clone(), now);
             result.ready_to_scrobble.push(track.clone());
         }
         if needs_np {
@@ -947,6 +1030,7 @@ mod tests {
             viewed_at: None,
             audio_quality: None,
             plex_user: None,
+            history_key: None,
         }
     }
 
@@ -979,6 +1063,45 @@ mod tests {
         let mut r = SessionResult::default();
         src.process_live_track(track(270_000), false, &mut r).await;
         assert!(r.now_playing.is_empty());
+    }
+
+    /// A track on repeat keeps the same `sessionKey` *and* `ratingKey`, so the
+    /// track-changed reset never fires and only the first of N plays was
+    /// banked. The playhead rewinding is the only evidence it started over.
+    #[tokio::test]
+    async fn a_looped_track_scrobbles_once_per_pass() {
+        let mut src = PlexSource::new("http://localhost:32400".into(), "t".into());
+
+        let mut scrobbles = 0;
+        for pass in 0..3 {
+            // Each pass walks the playhead from near zero to the end. Same
+            // session, same item — only the offset says a new play began.
+            for offset in [5_000u64, 160_000, 280_000] {
+                let mut r = SessionResult::default();
+                src.process_live_track(track(offset), true, &mut r).await;
+                scrobbles += r.ready_to_scrobble.len();
+            }
+            assert_eq!(scrobbles, pass + 1, "pass {pass} should have banked exactly one");
+        }
+    }
+
+    /// Scrubbing backwards inside one listen is not a new play. Only a rewind
+    /// past `REPEAT_REWIND_MS` counts, so nudging the playhead back a few
+    /// seconds must not mint a second scrobble.
+    #[tokio::test]
+    async fn a_small_seek_back_is_not_a_repeat() {
+        let mut src = PlexSource::new("http://localhost:32400".into(), "t".into());
+
+        let mut r = SessionResult::default();
+        src.process_live_track(track(160_000), true, &mut r).await;
+        assert_eq!(r.ready_to_scrobble.len(), 1);
+
+        // Back five seconds, then forward again: still the same listen.
+        for offset in [155_000u64, 158_000, 200_000] {
+            let mut r = SessionResult::default();
+            src.process_live_track(track(offset), true, &mut r).await;
+            assert!(r.ready_to_scrobble.is_empty(), "seek at {offset}ms re-scrobbled");
+        }
     }
 
     /// The art path is read off Plex's own metadata response, so the field

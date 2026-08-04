@@ -63,3 +63,6 @@ export/
 # Third-party source read for reference while planning features — not ours to ship
 temp/
 
+
+# Design/planning docs, not shipped with the binary
+docs/
