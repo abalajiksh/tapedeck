@@ -1,7 +1,16 @@
 #!/usr/bin/env bash
 # build-web.sh — Build the SvelteKit frontend into static/ for rust-embed
 #
-# Run this before `cargo build` or wire it into your CI pipeline.
+# NO LONGER REQUIRED BEFORE `cargo build`. Since v0.14.0 build.rs does this
+# during the build, so a fresh clone compiles and static/ cannot go stale.
+#
+# This script is kept for frontend-only iteration — rebuilding the UI without
+# invoking cargo at all. It is the same sequence build.rs runs.
+#
+# The bundle smoke test at the bottom is deliberately duplicated in
+# build.rs::verify_bundle. If you change one, change the other: it guards a
+# failure mode that is completely silent (see the comment there).
+#
 # Requires: bun (https://bun.sh)
 
 set -euo pipefail

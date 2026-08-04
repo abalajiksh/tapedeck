@@ -1,7 +1,10 @@
 [package]
 name = "tapedeck"
-version = "0.13.4"
+version = "0.14.0"
 edition = "2021"
+# Builds the SvelteKit UI into static/ before rustc runs, so `cargo build` is
+# the whole build and a fresh clone compiles. See build.rs.
+build = "build.rs"
 
 [dependencies]
 # Async runtime
