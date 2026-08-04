@@ -5,7 +5,8 @@
 	import ScrobbleRow from '$lib/components/ScrobbleRow.svelte';
 	import { deck, watchNowPlaying } from '$lib/nowplaying';
 	import { formatDuration, qualityLabel, tierTagClass } from '$lib/utils';
-	import { loadLoves } from '$lib/loves';
+	import { loadLoves, lovedKeys, loveKeyOf, toggleLoveByName } from '$lib/loves';
+	import { openAlbum, openArtist } from '$lib/entities';
 
 	let recent: Scrobble[] = [];
 	let loading = true;
@@ -67,6 +68,19 @@
 	// `$deck.track` is replaced wholesale by the poll, so compare identity by
 	// name rather than by reference or it fires on every poll.
 	$: nowKey = $deck.track ? `${$deck.track.artist}|${$deck.track.title}` : '';
+
+	// The heart on the deck shares `lovedKeys` with the history rows, so loving
+	// what's playing fills the heart on its row too. `hero` may be a real
+	// scrobble (the fallback) or the in-memory deck track, and the key is
+	// derived from names either way — so both cases work without caring which.
+	/** The template's `{#if hero.album}` doesn't narrow inside a click handler,
+	 *  and a listen without an album is normal — guard here instead. */
+	function openAlbumOf(artist: string, album: string | null | undefined): void {
+		if (album) void openAlbum(artist, album);
+	}
+
+	$: heroTrackKey = hero ? loveKeyOf('track', hero.artist, hero.title) : null;
+	$: heroLoved = heroTrackKey ? $lovedKeys.has(heroTrackKey) : false;
 	let lastKey: string | null = null;
 	$: if (!loading && nowKey !== lastKey) {
 		// The scrobble lands when the *previous* track ends, which the source
@@ -146,8 +160,22 @@
 					<span style="width:8px;height:8px;border-radius:50%;background:{live ? '#e07a55' : 'var(--td-muted-3)'};{live ? 'animation:td-blink 1.6s ease-in-out infinite;' : ''}"></span>
 					<span style="font-size:11px;letter-spacing:.16em;text-transform:uppercase;color:#c67139;font-weight:600;">{live ? `Now Playing · Side ${side}` : 'Last Played'}</span>
 				</div>
-				<h2 class="h-display" style="font-size:28px;margin:0 0 4px;">{hero.title}</h2>
-				<p style="margin:0 0 14px;color:var(--td-muted);font-size:15.5px;">{hero.artist}{hero.album ? ` — ${hero.album}` : ''}</p>
+				<div style="display:flex;align-items:flex-start;gap:12px;margin:0 0 4px;">
+					<h2 class="h-display" style="font-size:28px;margin:0;flex:1;min-width:0;">{hero.title}</h2>
+					<button
+						class="deck-heart"
+						class:loved={heroLoved}
+						title={heroLoved ? 'Loved' : 'Love this track'}
+						aria-label={heroLoved ? 'Remove love' : 'Love this track'}
+						aria-pressed={heroLoved}
+						on:click={() => hero && toggleLoveByName('track', hero.artist, hero.title)}
+					>
+						<svg viewBox="0 0 24 24" width="21" fill={heroLoved ? 'currentColor' : 'none'} stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.8 4.6a5.5 5.5 0 0 0-7.8 0L12 5.7l-1-1.1a5.5 5.5 0 0 0-7.8 7.8l1.1 1L12 21l7.7-7.6 1.1-1a5.5 5.5 0 0 0 0-7.8z"/></svg>
+					</button>
+				</div>
+				<p style="margin:0 0 14px;color:var(--td-muted);font-size:15.5px;">
+					<button class="deck-link" on:click={() => hero && openArtist(hero.artist)}>{hero.artist}</button>{#if hero.album} — <button class="deck-link" on:click={() => hero && openAlbumOf(hero.artist, hero.album)}>{hero.album}</button>{/if}
+				</p>
 
 				<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;{live ? 'margin-bottom:16px;' : ''}">
 					{#if heroQ?.text}<span class={tierTagClass(heroQ.tier)}>{heroQ.text}</span>{/if}
@@ -227,6 +255,38 @@
 {/if}
 
 <style>
+	/* Unlike the history row's heart, this one is always visible: the deck has
+	   no hover affordance to reveal it and it's the primary action on the card. */
+	.deck-heart {
+		border: none;
+		background: transparent;
+		cursor: pointer;
+		color: var(--td-muted-3);
+		padding: 4px;
+		border-radius: 8px;
+		flex: none;
+		display: flex;
+		align-items: center;
+		transition: color .15s, transform .15s;
+	}
+	.deck-heart:hover { color: #b2622d; transform: scale(1.08); }
+	.deck-heart.loved { color: #c67139; }
+
+	/* Anchors would be wrong here — the deck knows names, not entity ids, so
+	   opening one is a resolve round-trip (see $lib/entities). Styled to read
+	   as a link anyway, since that is what it behaves like. */
+	.deck-link {
+		border: none;
+		background: none;
+		padding: 0;
+		font: inherit;
+		color: inherit;
+		cursor: pointer;
+		border-bottom: 1px solid transparent;
+	}
+	.deck-link:hover,
+	.deck-link:focus-visible { color: var(--td-fg); border-bottom-color: currentColor; }
+
 	/* The reels only turn while something is actually playing — a still deck
 	   is the honest signal that no source is reporting. */
 	.reel.rolling {

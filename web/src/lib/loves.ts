@@ -55,6 +55,47 @@ export async function loadLoves(force = false): Promise<void> {
 	}
 }
 
+/** The entity key for a track named directly, rather than via a listen row. */
+export function loveKeyOf(kind: LoveKind, artist: string, name: string): string | null {
+	if (kind === 'artist') return `artist||${norm(artist)}`;
+	if (!name.trim()) return null;
+	return `${kind === 'album' ? 'release' : 'recording'}|${norm(artist)}|${norm(name)}`;
+}
+
+/**
+ * Toggle a love for something identified by name.
+ *
+ * The deck is the case this exists for: now-playing is in-memory and never
+ * persisted, so the track being played has no scrobble id to hang a love off —
+ * and it may not have been scrobbled yet at all, since that happens at the
+ * halfway mark. The API's target spec already accepts `{kind, name, artist}`
+ * and resolves (or creates) the entity from those, so no listen is needed.
+ *
+ * Optimistic in the same way as `toggleLove`, and shares `lovedKeys`, so a
+ * heart filled on the deck is filled on the history row for the same track.
+ */
+export async function toggleLoveByName(
+	kind: LoveKind,
+	artist: string,
+	name: string
+): Promise<void> {
+	const key = loveKeyOf(kind, artist, name);
+	if (!key) return;
+
+	const before = get(lovedKeys);
+	const next = new Set(before);
+	const wanted = !before.has(key);
+	if (wanted) next.add(key);
+	else next.delete(key);
+	lovedKeys.set(next);
+
+	try {
+		await api.setLove({ kind, name: kind === 'artist' ? artist : name, artist }, wanted);
+	} catch {
+		lovedKeys.set(before);
+	}
+}
+
 /**
  * Toggle a love from a listen row.
  *
