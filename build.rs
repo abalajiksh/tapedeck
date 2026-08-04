@@ -90,9 +90,10 @@ fn run(program: &str, args: &[&str]) -> bool {
 /// finding out in a browser.
 fn verify_bundle() {
     let app = Path::new("static/_app");
-    let found = walk(app).unwrap_or_default().iter().any(|p| {
-        std::fs::read_to_string(p).is_ok_and(|s| s.contains("auth/status"))
-    });
+    let found = walk(app)
+        .unwrap_or_default()
+        .iter()
+        .any(|p| std::fs::read_to_string(p).is_ok_and(|s| s.contains("auth/status")));
     if !found {
         panic!(
             "Built bundle never references /api/v1/auth/status.\n\

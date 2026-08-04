@@ -349,10 +349,7 @@ impl ScrobbleEngine {
                         .exists(user_id, &play.source_id, &play.source_name)
                         .await
                         .unwrap_or(false)
-                        || db
-                            .fuzzy_exists(user_id, &play)
-                            .await
-                            .unwrap_or(false);
+                        || db.fuzzy_exists(user_id, &play).await.unwrap_or(false);
                     if dupe {
                         continue;
                     }
@@ -458,10 +455,7 @@ impl ScrobbleEngine {
             let mut play = track.play;
             let dupe =
                 db.exists(user_id, &play.source_id, &play.source_name).await.unwrap_or(false)
-                    || db
-                        .fuzzy_exists(user_id, &play)
-                        .await
-                        .unwrap_or(false);
+                    || db.fuzzy_exists(user_id, &play).await.unwrap_or(false);
             if dupe {
                 continue;
             }
@@ -604,10 +598,7 @@ impl ScrobbleEngine {
                 // MusicBrainz call.
                 let already_exists =
                     db.exists(user_id, &play.source_id, &play.source_name).await.unwrap_or(false)
-                        || db
-                            .fuzzy_exists(user_id, &play)
-                            .await
-                            .unwrap_or(false);
+                        || db.fuzzy_exists(user_id, &play).await.unwrap_or(false);
                 if already_exists {
                     debug!("Skipping already-scrobbled: {} - {}", play.artist, play.title);
                     continue;
@@ -640,11 +631,8 @@ impl ScrobbleEngine {
                             .await
                         {
                             Ok(dev) => {
-                                let chain = db
-                                    .get_device_default_chain(user_id, dev)
-                                    .await
-                                    .ok()
-                                    .flatten();
+                                let chain =
+                                    db.get_device_default_chain(user_id, dev).await.ok().flatten();
                                 (Some(dev), chain)
                             }
                             Err(e) => {

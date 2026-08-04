@@ -864,8 +864,7 @@ impl PlexSource {
         let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
         if now.saturating_sub(self.last_history_at) >= HISTORY_SYNC_INTERVAL_SECS {
             self.last_history_at = now;
-            self.recent_scrobbles
-                .retain(|_, at| now.saturating_sub(*at) < HISTORY_SUPPRESS_SECS);
+            self.recent_scrobbles.retain(|_, at| now.saturating_sub(*at) < HISTORY_SUPPRESS_SECS);
             if let Ok(history) = self.fetch_history_tracks(0).await {
                 let fetched = history.len();
                 // Drop anything the live path already banked. History is the
@@ -918,14 +917,13 @@ impl PlexSource {
         }
 
         let (should_scrobble, needs_np) = {
-            let state = self.session_states.entry(session_key.clone()).or_insert_with(|| {
-                SessionState {
+            let state =
+                self.session_states.entry(session_key.clone()).or_insert_with(|| SessionState {
                     rating_key: rating_key.clone(),
                     last_seen: now,
                     scrobbled: false,
                     last_offset: view_offset,
-                }
-            });
+                });
             state.last_seen = now;
 
             // A track on repeat is invisible to the `rating_key` check above:

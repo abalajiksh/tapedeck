@@ -196,6 +196,14 @@
 
 	let timezone = '';
 	let tzSaved = false;
+	// ── Discogs (admin, server-wide) ──
+	// Server-wide rather than per-user because it is one API credential for the
+	// instance, like the metrics token — not something each household member
+	// would hold separately.
+	let discogsConfigured = false;
+	let discogsFromEnv = false;
+	let discogsToken = '';
+	let discogsMsg = '';
 	/** 0=Sun..6=Sat. Monday is ISO-8601 and the default; Last.fm's chart week
 	 *  runs Friday to Friday, which is why this is settable at all. */
 	let weekStart = 1;
@@ -247,6 +255,26 @@
 				}
 			}, 2500);
 		} catch (e) { fetchingArt = false; alert(String(e).replace(/^API \d+: /, '')); }
+	}
+
+	async function loadDiscogs() {
+		try {
+			const d = await api.getDiscogsSetting();
+			discogsConfigured = d.configured;
+			discogsFromEnv = d.from_env;
+		} catch { /* non-admins simply don't see it */ }
+	}
+
+	async function saveDiscogs() {
+		try {
+			const r = await api.setDiscogsSetting(discogsToken);
+			discogsConfigured = r.configured || discogsFromEnv;
+			discogsToken = '';
+			discogsMsg = r.configured ? 'Saved — barcode lookups will use Discogs.' : 'Cleared.';
+			setTimeout(() => (discogsMsg = ''), 3000);
+		} catch (e) {
+			discogsMsg = String(e).replace(/^API \d+: /, '');
+		}
 	}
 
 	async function saveWeekStart() {
@@ -378,6 +406,7 @@
 		try { isAdmin = (await api.me()).is_admin; } catch { /* optional */ }
 		loadArtStatus();
 		loadSanitize();
+		loadDiscogs();
 		loadConnections();
 		loadLangStatus();
 		loading = false;
@@ -596,6 +625,35 @@
 		{/if}
 
 		{#if section === 'connections'}
+			{#if isAdmin}
+				<div class="panel" style="border-radius:22px;padding:24px;margin-bottom:18px;">
+					<h3 class="h-display" style="font-size:19px;margin-bottom:4px;">Discogs</h3>
+					<p style="font-size:13px;color:var(--td-muted);margin:0 0 14px;">
+						Used to identify a pressing from its barcode on the Vinyl &amp; Tape
+						screen. Optional — MusicBrainz works without it, but Discogs is a
+						collector's database and usually lands on the exact edition in your
+						hands. One token for the whole server.
+					</p>
+					<div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;">
+						<input class="input" type="password" bind:value={discogsToken} style="max-width:320px;"
+							placeholder={discogsConfigured ? '••••••••  (stored)' : 'Personal access token'}>
+						<button class="btn btn-secondary" on:click={saveDiscogs}>
+							{discogsToken.trim() ? 'Save' : 'Clear'}
+						</button>
+						{#if discogsMsg}<span style="font-size:13px;color:var(--td-good-fg);">{discogsMsg}</span>{/if}
+					</div>
+					<p style="font-size:12.5px;color:var(--td-muted-2);margin:10px 0 0;">
+						{#if discogsFromEnv}
+							Currently supplied by TAPEDECK_DISCOGS_TOKEN. Saving one here overrides it.
+						{:else if discogsConfigured}
+							Configured. Barcode lookups ask Discogs first.
+						{:else}
+							Not configured — lookups use MusicBrainz only.
+						{/if}
+					</p>
+				</div>
+			{/if}
+
 			<div class="panel" style="border-radius:22px;padding:24px;margin-bottom:18px;">
 				<h3 class="h-display" style="font-size:19px;margin-bottom:4px;">Scrobble Connections</h3>
 				<p style="font-size:13px;color:var(--td-muted);margin:0 0 16px;">Forward <em>your</em> listens to your own accounts. Nothing is shared across users, and a service you don't connect simply isn't forwarded to — listens are always kept locally either way.</p>

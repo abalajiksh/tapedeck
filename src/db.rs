@@ -176,6 +176,36 @@ pub struct ImportHistoryRow {
     pub created_at: i64,
 }
 
+/// A record or tape you own.
+///
+/// Distinct from an `entity`, which is a work you have listened to: this is an
+/// *object* with a pressing, a barcode and a side order. Two pressings of the
+/// same album are two of these and one entity.
+#[derive(Debug, Clone, sqlx::FromRow, serde::Serialize)]
+pub struct PhysicalRelease {
+    pub id: i64,
+    pub kind: String,
+    pub artist: String,
+    pub title: String,
+    pub year: Option<i64>,
+    pub mbid_release: Option<String>,
+    pub discogs_id: Option<String>,
+    pub barcode: Option<String>,
+    pub catalog_number: Option<String>,
+    pub artwork_url: Option<String>,
+    /// JSON array of `{side, position, title, duration_secs}`, served through
+    /// as-is — the browser is the only thing that reads its shape.
+    pub tracks: String,
+    pub notes: Option<String>,
+    pub added_at: i64,
+    /// How many sides have been played, and for how long. Derived in the
+    /// query rather than kept as a counter, so they cannot drift from the
+    /// plays they claim to count.
+    pub play_count: i64,
+    pub played_secs: i64,
+    pub last_played: Option<i64>,
+}
+
 /// A configured source, credentials decrypted. `kind` is `plex` | `navidrome` |
 /// `jellyfin`; `credentials` is a per-kind JSON blob (Plex: `{"token":…}`).
 #[derive(Debug, Clone)]
@@ -399,6 +429,68 @@ impl Database {
                 first_seen INTEGER NOT NULL, last_seen INTEGER NOT NULL,
                 total_listens INTEGER DEFAULT 0,
                 UNIQUE(user_id, machine_id)
+            )",
+        )
+        .execute(&self.pool)
+        .await?;
+
+        // ── Physical media ──
+        //
+        // A record or tape you own. Separate from `entities` on purpose: an
+        // entity is a work you have listened to, this is an *object* with a
+        // pressing, a barcode and a side order. Two pressings of the same album
+        // are two rows here and one entity.
+        //
+        // `tracks` is a JSON array of {side, position, title, duration_secs}.
+        // A blob rather than a table because it is only ever read and written
+        // whole, and because side assignment is frequently hand-corrected —
+        // MusicBrainz records vinyl track numbers as "A1" only when the editor
+        // bothered, and as plain 1..n otherwise.
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS physical_releases (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL REFERENCES users(id),
+                kind TEXT NOT NULL CHECK (kind IN ('vinyl', 'cassette')),
+                artist TEXT NOT NULL, title TEXT NOT NULL,
+                year INTEGER,
+                mbid_release TEXT, discogs_id TEXT, barcode TEXT, catalog_number TEXT,
+                artwork_url TEXT,
+                tracks TEXT NOT NULL DEFAULT '[]',
+                notes TEXT,
+                added_at INTEGER NOT NULL
+            )",
+        )
+        .execute(&self.pool)
+        .await?;
+
+        // One row per *side played*, which is the unit you actually handle: you
+        // put a side on, it plays through, you flip it. The listens themselves
+        // are ordinary `scrobbles` rows — this is the record of the physical
+        // act, and what stylus hours and a cassette counter are computed from.
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS physical_plays (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL REFERENCES users(id),
+                release_id INTEGER NOT NULL REFERENCES physical_releases(id),
+                side TEXT NOT NULL,
+                played_at INTEGER NOT NULL,
+                duration_secs INTEGER NOT NULL DEFAULT 0,
+                track_count INTEGER NOT NULL DEFAULT 0,
+                equipment_id INTEGER REFERENCES equipment(id),
+                chain_id INTEGER REFERENCES signal_chains(id)
+            )",
+        )
+        .execute(&self.pool)
+        .await?;
+
+        // Server-wide settings an admin sets in the UI, as opposed to
+        // `tapedeck.toml` (infrastructure) or per-user preferences. Values are
+        // encrypted, because the first inhabitant is a Discogs token.
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS app_settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL,
+                updated_at INTEGER NOT NULL
             )",
         )
         .execute(&self.pool)
@@ -1126,11 +1218,7 @@ impl Database {
         // the record is filed and what gets forwarded — and this keeps the
         // performers rather than discarding them. Same column and same meaning
         // as `fold_artist_credit`: the fuller form of the credit.
-        let artist_credit = play
-            .artists
-            .as_ref()
-            .filter(|a| a.len() > 1)
-            .map(|a| a.join("; "));
+        let artist_credit = play.artists.as_ref().filter(|a| a.len() > 1).map(|a| a.join("; "));
 
         sqlx::query(
             "INSERT INTO scrobbles (
@@ -1877,6 +1965,216 @@ impl Database {
         Ok(out)
     }
 
+    // ════════════════════════════════════════════════════════════
+    //  Physical media — records and tapes
+    // ════════════════════════════════════════════════════════════
+
+    pub async fn list_physical(
+        &self,
+        user_id: i64,
+        kind: Option<&str>,
+    ) -> Result<Vec<PhysicalRelease>, sqlx::Error> {
+        sqlx::query_as(
+            "SELECT r.*,
+                    (SELECT COUNT(*) FROM physical_plays p WHERE p.release_id = r.id) AS play_count,
+                    (SELECT COALESCE(SUM(p.duration_secs), 0) FROM physical_plays p
+                      WHERE p.release_id = r.id) AS played_secs,
+                    (SELECT MAX(p.played_at) FROM physical_plays p WHERE p.release_id = r.id)
+                      AS last_played
+               FROM physical_releases r
+              WHERE r.user_id = ? AND (? IS NULL OR r.kind = ?)
+              ORDER BY r.artist COLLATE NOCASE, r.title COLLATE NOCASE",
+        )
+        .bind(user_id)
+        .bind(kind)
+        .bind(kind)
+        .fetch_all(&self.pool)
+        .await
+    }
+
+    pub async fn get_physical(
+        &self,
+        user_id: i64,
+        id: i64,
+    ) -> Result<Option<PhysicalRelease>, sqlx::Error> {
+        sqlx::query_as(
+            "SELECT r.*,
+                    (SELECT COUNT(*) FROM physical_plays p WHERE p.release_id = r.id) AS play_count,
+                    (SELECT COALESCE(SUM(p.duration_secs), 0) FROM physical_plays p
+                      WHERE p.release_id = r.id) AS played_secs,
+                    (SELECT MAX(p.played_at) FROM physical_plays p WHERE p.release_id = r.id)
+                      AS last_played
+               FROM physical_releases r WHERE r.user_id = ? AND r.id = ?",
+        )
+        .bind(user_id)
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_physical(
+        &self,
+        user_id: i64,
+        kind: &str,
+        artist: &str,
+        title: &str,
+        year: Option<i64>,
+        mbid_release: Option<&str>,
+        discogs_id: Option<&str>,
+        barcode: Option<&str>,
+        catalog_number: Option<&str>,
+        artwork_url: Option<&str>,
+        tracks_json: &str,
+        notes: Option<&str>,
+    ) -> Result<i64, sqlx::Error> {
+        let res = sqlx::query(
+            "INSERT INTO physical_releases
+                (user_id, kind, artist, title, year, mbid_release, discogs_id, barcode,
+                 catalog_number, artwork_url, tracks, notes, added_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(user_id)
+        .bind(kind)
+        .bind(artist)
+        .bind(title)
+        .bind(year)
+        .bind(mbid_release)
+        .bind(discogs_id)
+        .bind(barcode)
+        .bind(catalog_number)
+        .bind(artwork_url)
+        .bind(tracks_json)
+        .bind(notes)
+        .bind(Self::now_secs())
+        .execute(&self.pool)
+        .await?;
+        Ok(res.last_insert_rowid())
+    }
+
+    /// Replace the stored tracklist — how a hand-corrected side split is saved.
+    pub async fn set_physical_tracks(
+        &self,
+        user_id: i64,
+        id: i64,
+        tracks_json: &str,
+    ) -> Result<bool, sqlx::Error> {
+        let res =
+            sqlx::query("UPDATE physical_releases SET tracks = ? WHERE user_id = ? AND id = ?")
+                .bind(tracks_json)
+                .bind(user_id)
+                .bind(id)
+                .execute(&self.pool)
+                .await?;
+        Ok(res.rows_affected() > 0)
+    }
+
+    pub async fn delete_physical(&self, user_id: i64, id: i64) -> Result<bool, sqlx::Error> {
+        // Plays reference the release, and foreign keys are on.
+        sqlx::query("DELETE FROM physical_plays WHERE user_id = ? AND release_id = ?")
+            .bind(user_id)
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        let res = sqlx::query("DELETE FROM physical_releases WHERE user_id = ? AND id = ?")
+            .bind(user_id)
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(res.rows_affected() > 0)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn record_physical_play(
+        &self,
+        user_id: i64,
+        release_id: i64,
+        side: &str,
+        played_at: i64,
+        duration_secs: i64,
+        track_count: i64,
+        equipment_id: Option<i64>,
+        chain_id: Option<i64>,
+    ) -> Result<i64, sqlx::Error> {
+        let res = sqlx::query(
+            "INSERT INTO physical_plays
+                (user_id, release_id, side, played_at, duration_secs, track_count,
+                 equipment_id, chain_id)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(user_id)
+        .bind(release_id)
+        .bind(side)
+        .bind(played_at)
+        .bind(duration_secs)
+        .bind(track_count)
+        .bind(equipment_id)
+        .bind(chain_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(res.last_insert_rowid())
+    }
+
+    /// Hours on a stylus or tape head, summed from the sides actually played
+    /// through it.
+    ///
+    /// Derived rather than accumulated, for the same reason chain hours are:
+    /// a counter that is incremented can drift from the events it claims to
+    /// count, and there is no way to tell which is wrong afterwards.
+    pub async fn equipment_playback_hours(
+        &self,
+        user_id: i64,
+        equipment_id: i64,
+    ) -> Result<(f64, i64), sqlx::Error> {
+        let row: (Option<i64>, i64) = sqlx::query_as(
+            "SELECT SUM(duration_secs), COUNT(*) FROM physical_plays
+              WHERE user_id = ? AND equipment_id = ?",
+        )
+        .bind(user_id)
+        .bind(equipment_id)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok((row.0.unwrap_or(0) as f64 / 3600.0, row.1))
+    }
+
+    // ── Server-wide settings ──
+
+    /// Read an admin-set server setting, decrypted.
+    pub async fn get_app_setting(&self, key: &str) -> Result<Option<String>, sqlx::Error> {
+        let row: Option<(String,)> = sqlx::query_as("SELECT value FROM app_settings WHERE key = ?")
+            .bind(key)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.and_then(|r| self.secrets.decrypt(&r.0).ok()).filter(|v| !v.trim().is_empty()))
+    }
+
+    /// Store (or clear) a server setting. Encrypted at rest like every other
+    /// credential that has to be replayed.
+    pub async fn set_app_setting(&self, key: &str, value: &str) -> Result<(), sqlx::Error> {
+        if value.trim().is_empty() {
+            sqlx::query("DELETE FROM app_settings WHERE key = ?")
+                .bind(key)
+                .execute(&self.pool)
+                .await?;
+            return Ok(());
+        }
+        sqlx::query(
+            "INSERT INTO app_settings (key, value, updated_at) VALUES (?, ?, ?)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value,
+                                            updated_at = excluded.updated_at",
+        )
+        .bind(key)
+        .bind(
+            self.secrets
+                .encrypt(value.trim())
+                .map_err(|e| sqlx::Error::Protocol(format!("encrypting setting: {e}")))?,
+        )
+        .bind(Self::now_secs())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     /// Tracks recorded under two different artists on the same record.
     ///
     /// The shape this exists for is a film soundtrack: Plex files the album
@@ -1950,7 +2248,9 @@ impl Database {
             credits.sort_by(|a, b| {
                 breadth(&b.0)
                     .cmp(&breadth(&a.0))
-                    .then_with(|| totals.get(&b.0).unwrap_or(&0).cmp(totals.get(&a.0).unwrap_or(&0)))
+                    .then_with(|| {
+                        totals.get(&b.0).unwrap_or(&0).cmp(totals.get(&a.0).unwrap_or(&0))
+                    })
                     .then(b.1.cmp(&a.1))
             });
             let (primary, primary_plays) = credits[0].clone();

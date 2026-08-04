@@ -20,6 +20,7 @@
 
 pub mod bio;
 pub mod deezer;
+pub mod release_lookup;
 
 use async_trait::async_trait;
 

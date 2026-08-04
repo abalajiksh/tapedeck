@@ -481,6 +481,61 @@ export interface MixedAlbum {
 	candidates: ReleaseCandidate[];
 }
 
+/** One track on a physical side. */
+export interface PhysicalTrack {
+	side: string;
+	position: number;
+	title: string;
+	artist?: string | null;
+	duration_secs?: number | null;
+}
+
+/** A candidate pressing from MusicBrainz or Discogs. */
+export interface ReleaseCandidate {
+	source: 'musicbrainz' | 'discogs';
+	artist: string;
+	title: string;
+	year: number | null;
+	country: string | null;
+	format: string | null;
+	mbid_release: string | null;
+	discogs_id: string | null;
+	barcode: string | null;
+	catalog_number: string | null;
+	artwork_url: string | null;
+	tracks: PhysicalTrack[];
+}
+
+/** A record or tape on the shelf. Counters are derived, never accumulated. */
+export interface PhysicalRelease {
+	id: number;
+	kind: 'vinyl' | 'cassette';
+	artist: string;
+	title: string;
+	year: number | null;
+	mbid_release: string | null;
+	discogs_id: string | null;
+	barcode: string | null;
+	catalog_number: string | null;
+	artwork_url: string | null;
+	/** JSON-encoded PhysicalTrack[] — parsed by the page that shows it. */
+	tracks: string;
+	notes: string | null;
+	added_at: number;
+	play_count: number;
+	played_secs: number;
+	last_played: number | null;
+}
+
+export interface PlayResult {
+	listens_added: number;
+	tracks: number;
+	duration_secs: number;
+	started_at: number;
+	/** Which side to reach for next — wraps, and knows a double LP has four. */
+	next_side: string | null;
+}
+
 export interface SanitizePreview {
 	/** Albums whose listens disagree about which release they are. */
 	mixed_albums: MixedAlbum[];
@@ -772,6 +827,48 @@ class TapedeckAPI {
 		split_edits?: { title: string; album: string; from: string; to: string }[];
 	}): Promise<SanitizeResult> {
 		return this.post('/api/v1/sanitize', opts);
+	}
+
+	// ── Physical media: records and tapes ──
+	async lookupPressing(q: {
+		barcode?: string; catalog_number?: string; artist?: string; release?: string; kind?: string;
+	}): Promise<{ candidates: ReleaseCandidate[]; discogs_enabled: boolean; notes: string[] }> {
+		const p = new URLSearchParams();
+		for (const [k, v] of Object.entries(q)) if (v) p.set(k, v);
+		return this.get(`/api/v1/physical/lookup?${p}`);
+	}
+	async discogsRelease(id: string): Promise<{ candidate: ReleaseCandidate }> {
+		return this.get(`/api/v1/physical/discogs/${encodeURIComponent(id)}`);
+	}
+	async listShelf(kind?: string): Promise<{ releases: PhysicalRelease[] }> {
+		return this.get(`/api/v1/physical${kind ? `?kind=${kind}` : ''}`);
+	}
+	async getPressing(id: number): Promise<{ release: PhysicalRelease }> {
+		return this.get(`/api/v1/physical/${id}`);
+	}
+	async addPressing(body: Partial<ReleaseCandidate> & { kind: string; tracks: PhysicalTrack[] }) {
+		return this.post<{ id: number }>('/api/v1/physical', body);
+	}
+	async setPressingTracks(id: number, tracks: PhysicalTrack[]) {
+		return this.request('PUT', `/api/v1/physical/${id}/tracks`, { tracks });
+	}
+	async deletePressing(id: number) {
+		return this.delNoBody(`/api/v1/physical/${id}`);
+	}
+	async playSide(
+		id: number,
+		body: { side: string; started_at?: number; equipment_id?: number | null; chain_id?: number | null }
+	): Promise<PlayResult> {
+		return this.post(`/api/v1/physical/${id}/play`, body);
+	}
+	async equipmentWear(id: number): Promise<{ hours: number; sides_played: number }> {
+		return this.get(`/api/v1/physical/equipment/${id}/wear`);
+	}
+	async getDiscogsSetting(): Promise<{ configured: boolean; from_env: boolean; stored: boolean }> {
+		return this.get('/api/v1/physical/settings/discogs');
+	}
+	async setDiscogsSetting(token: string): Promise<{ configured: boolean }> {
+		return this.request('PUT', '/api/v1/physical/settings/discogs', { token });
 	}
 
 	// ── Manual listen entry ──
