@@ -66,16 +66,26 @@ async fn metrics(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Resp
     };
 
     if !token_ok {
-        // Fall back to a browser session so an admin can eyeball it.
+        // Fall back to a browser session so an admin can eyeball it — but it
+        // has to actually be an admin. Every gauge below is instance-wide
+        // (`tapedeck_users`, `tapedeck_listens`, and every other user's import
+        // progress), so merely holding a valid session is not enough: on a
+        // household instance that is one member reading the others' totals.
         let session = extract_session_cookie_from(&headers);
-        let ok = match session {
-            Some(t) => state.db.validate_session(&t).await.ok().flatten().is_some(),
+        let is_admin = match session {
+            Some(t) => state
+                .db
+                .validate_session(&t)
+                .await
+                .ok()
+                .flatten()
+                .is_some_and(|u| u.is_admin),
             None => false,
         };
-        if !ok {
+        if !is_admin {
             return (
                 StatusCode::UNAUTHORIZED,
-                "Set TAPEDECK_METRICS_TOKEN and scrape with a Bearer token, or sign in.\n",
+                "Set TAPEDECK_METRICS_TOKEN and scrape with a Bearer token, or sign in as an admin.\n",
             )
                 .into_response();
         }
