@@ -152,6 +152,25 @@ pub struct PlexPlayer {
     pub product: Option<String>,
 }
 
+/// Does this track credit already name `artist`?
+///
+/// Substring rather than equality, because the overlapping case is a credit
+/// like "Anirudh Ravichander & Shruti Haasan" on a record whose artist is
+/// "Anirudh Ravichander" — he directed it and sang this one. Bounded to whole
+/// names so "Karthik" doesn't match inside "Karthika".
+fn credit_includes(credit: &str, artist: &str) -> bool {
+    let (credit, artist) = (credit.trim().to_lowercase(), artist.trim().to_lowercase());
+    if artist.is_empty() {
+        return false;
+    }
+    credit.match_indices(&artist).any(|(i, m)| {
+        let before = credit[..i].chars().next_back();
+        let after = credit[i + m.len()..].chars().next();
+        let boundary = |c: Option<char>| c.is_none_or(|c| !c.is_alphanumeric());
+        boundary(before) && boundary(after)
+    })
+}
+
 impl PlexTrack {
     fn from_session(s: SessionMetadata) -> Option<Self> {
         let audio_quality = Self::extract_quality(&s);
@@ -283,15 +302,48 @@ impl PlexTrack {
             None => format!("plex-{}-{}", self.rating_key, source_id_suffix),
         };
 
-        let (artists, _) = if let Some(ta) = &self.track_artist {
-            (vec![ta.clone()], self.artist.clone())
-        } else {
-            (vec![self.artist.clone()], self.artist.clone())
+        // Plex gives two attributions and they are not the same question.
+        // `grandparentTitle` is the record's artist — for a film soundtrack the
+        // music director — and `originalTitle` is who performed this track.
+        // Both are real credits and both are wanted; what was happening instead
+        // is that the live path took one and the history path the other, so the
+        // same play landed twice under two names and MusicBrainz then resolved
+        // those to two different recordings.
+        //
+        // The record's artist is primary: it is how the album is filed, and it
+        // keeps one row per record rather than one per performer combination.
+        //
+        // These two are *not* disjoint roles. A music director routinely sings
+        // on their own soundtrack, so the same person can be both the record's
+        // artist and a performer on some of its tracks. Nothing here labels a
+        // role for that reason — the credit is a list of everyone named, in
+        // record-artist-first order, and `credit_includes` keeps a name from
+        // appearing twice when the two overlap.
+        //
+        // Deliberately not asked of MusicBrainz. Its coverage for this
+        // repertoire is empty (no composer relations at all on the recordings
+        // checked) and its artist credits disagree with themselves, sometimes
+        // listing the director, sometimes the singers, sometimes both — with
+        // duplicate recordings for each. Plex already knows, for free.
+        let artists = match self.track_artist.as_deref().map(str::trim) {
+            // The performers already name the record's artist — the common case
+            // when a music director sings on their own soundtrack, which
+            // Anirudh Ravichander, Ilaiyaraaja, Harris Jayaraj and A. R. Rahman
+            // all do. The track credit is then simply the fuller one, and
+            // listing them separately would repeat a name.
+            Some(ta) if credit_includes(ta, &self.artist) => vec![ta.to_string()],
+            Some(ta) if !ta.is_empty() => vec![self.artist.clone(), ta.to_string()],
+            _ => vec![self.artist.clone()],
         };
 
         Play {
             title: self.title.clone(),
-            artist: artists.first().cloned().unwrap_or_else(|| "Unknown".to_string()),
+            // Always the record's artist, never `artists.first()`. The credit
+            // list can legitimately start with the fuller performer string when
+            // the two overlap, and deriving the primary from it would put the
+            // whole combination in `artist` — which is the fragmentation this
+            // change exists to stop.
+            artist: self.artist.clone(),
             artists: if artists.is_empty() { None } else { Some(artists) },
             album: self.album.clone(),
             timestamp,
@@ -1203,6 +1255,95 @@ mod tests {
             src.process_live_track(track(offset), true, &mut r).await;
             assert!(r.ready_to_scrobble.is_empty(), "seek at {offset}ms re-scrobbled");
         }
+    }
+
+    /// A film soundtrack names two different things and both are wanted: the
+    /// album artist is the music director, the track artist is the singers.
+    ///
+    /// The director is primary — the live path used to take the singers while
+    /// the history path took the director, which is how one play became two
+    /// rows under two names and then two MusicBrainz recordings. Making both
+    /// paths agree is half of that fix; keeping the performers in the credit is
+    /// what stops it being a loss.
+    #[test]
+    fn a_soundtrack_keeps_the_director_and_the_singers() {
+        let mut t = track(0);
+        t.title = "Vaarayo Vaarayo".into();
+        t.artist = "Harris Jayaraj".into();
+        t.track_artist = Some("Unnikrishnan, Chinmayi & Megha".into());
+        t.album = Some("Aadhavan".into());
+
+        let play = t.to_play("np");
+        assert_eq!(play.artist, "Harris Jayaraj", "the director is what charts and scrobbles use");
+        assert_eq!(
+            play.artists.as_deref(),
+            Some(&["Harris Jayaraj".to_string(), "Unnikrishnan, Chinmayi & Megha".to_string()][..]),
+            "the singers are kept alongside, not discarded"
+        );
+    }
+
+    /// A music director singing on their own soundtrack is normal — Anirudh
+    /// Ravichander, Ilaiyaraaja, Harris Jayaraj and A. R. Rahman all do it. The
+    /// record's artist and the track's performers overlap rather than being
+    /// disjoint roles, so the credit must not name the same person twice.
+    #[test]
+    fn a_director_who_sings_is_not_credited_twice() {
+        let mut t = track(0);
+        t.artist = "Anirudh Ravichander".into();
+        t.album = Some("Vikram".into());
+
+        // Sings it with someone else: the fuller credit already names him.
+        t.track_artist = Some("Anirudh Ravichander & Shruti Haasan".into());
+        let play = t.to_play("np");
+        assert_eq!(play.artist, "Anirudh Ravichander");
+        assert_eq!(
+            play.artists.as_deref(),
+            Some(&["Anirudh Ravichander & Shruti Haasan".to_string()][..]),
+            "the record artist is already in the credit — don't repeat him"
+        );
+
+        // Sings it alone.
+        t.track_artist = Some("Anirudh Ravichander".into());
+        assert_eq!(
+            t.to_play("np").artists.as_deref(),
+            Some(&["Anirudh Ravichander".to_string()][..])
+        );
+
+        // Doesn't sing this one: both names, record artist first.
+        t.track_artist = Some("Shreya Ghoshal".into());
+        assert_eq!(
+            t.to_play("np").artists.as_deref(),
+            Some(&["Anirudh Ravichander".to_string(), "Shreya Ghoshal".to_string()][..])
+        );
+    }
+
+    /// The containment check is on whole names — a shorter name that happens to
+    /// sit inside a longer one is a different person.
+    #[test]
+    fn credit_containment_respects_name_boundaries() {
+        assert!(credit_includes("Anirudh Ravichander & Shruti Haasan", "Anirudh Ravichander"));
+        assert!(credit_includes("Shreya Ghoshal, Karthik", "Karthik"));
+        assert!(!credit_includes("Karthika", "Karthik"), "Karthika is not Karthik");
+        assert!(!credit_includes("Shreya Ghoshal", "Anirudh Ravichander"));
+        assert!(!credit_includes("Anything", ""));
+    }
+
+    /// Most records name one artist twice over, and that must not become a
+    /// credit listing the same name twice.
+    #[test]
+    fn a_single_artist_record_gets_no_redundant_credit() {
+        let mut t = track(0);
+        t.artist = "Aphex Twin".into();
+
+        // No track artist at all.
+        let play = t.to_play("np");
+        assert_eq!(play.artist, "Aphex Twin");
+        assert_eq!(play.artists.as_deref(), Some(&["Aphex Twin".to_string()][..]));
+
+        // Track artist present but identical — Plex does send this.
+        t.track_artist = Some("Aphex Twin".into());
+        let play = t.to_play("np");
+        assert_eq!(play.artists.as_deref(), Some(&["Aphex Twin".to_string()][..]));
     }
 
     /// The `Player` element is what makes a Plex listen resolvable to a signal

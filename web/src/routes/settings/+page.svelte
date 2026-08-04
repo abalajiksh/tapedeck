@@ -63,6 +63,8 @@
 	let albumChoice: Record<string, string> = {};
 	const albumKey = (a: { artist: string; album: string }) => `${a.artist}\u0001${a.album}`;
 	const variantKey = (from: string, to: string) => `${from}\u0001${to}`;
+	let pickedSplits = new Set<string>();
+	const splitKey = (t: string, al: string, from: string) => `${t}\u0001${al}\u0001${from}`;
 
 	/** Everything ticked, which is genuinely the common case. */
 	function selectAll(on: boolean) {
@@ -76,9 +78,17 @@
 					)
 				: []
 		);
+		pickedSplits = new Set(
+			on
+				? sanitize.split_attributions.flatMap((sp) =>
+						sp.folding.map((f) => splitKey(sp.title, sp.album, f[0]))
+					)
+				: []
+		);
 	}
 
-	$: pickedCount = pickedAlbums.size + pickedCredits.size + pickedVariants.size;
+	$: pickedCount =
+		pickedAlbums.size + pickedCredits.size + pickedVariants.size + pickedSplits.size;
 
 	// ── Rebuilding sessions ──
 	// Needed on any existing install: `assign_session` kept the session rows but
@@ -151,12 +161,18 @@
 					v.variants
 						.filter((x) => pickedVariants.has(variantKey(x[0], v.primary)))
 						.map((x) => ({ from: x[0], to: v.primary }))
+				),
+				split_edits: sanitize.split_attributions.flatMap((sp) =>
+					sp.folding
+						.filter((f) => pickedSplits.has(splitKey(sp.title, sp.album, f[0])))
+						.map((f) => ({ title: sp.title, album: sp.album, from: f[0], to: sp.primary }))
 				)
 			});
 			sanitizeMsg =
 				`Fixed ${r.albums_fixed} album${r.albums_fixed === 1 ? '' : 's'} (${r.album_listens_changed} listens), ` +
 				`folded ${r.artists_folded} featured credit${r.artists_folded === 1 ? '' : 's'} (${r.artist_listens_changed} listens) ` +
-				`and merged ${r.variants_merged} spelling${r.variants_merged === 1 ? '' : 's'} (${r.variant_listens_changed} listens). ` +
+				`merged ${r.variants_merged} spelling${r.variants_merged === 1 ? '' : 's'} (${r.variant_listens_changed} listens) ` +
+				`and put ${r.splits_merged ?? 0} track${(r.splits_merged ?? 0) === 1 ? '' : 's'} back on their record's artist (${r.split_listens_changed ?? 0} listens). ` +
 				`Artwork will re-resolve in the background.`;
 			await loadSanitize();
 		} catch (e) {
@@ -753,7 +769,7 @@
 				</p>
 
 				{#if sanitize}
-					{@const total = sanitize.mixed_albums.length + sanitize.featured_artists.length + sanitize.artist_variants.length}
+					{@const total = sanitize.mixed_albums.length + sanitize.featured_artists.length + sanitize.artist_variants.length + sanitize.split_attributions.reduce((n, sp) => n + sp.folding.length, 0)}
 					{#if total}
 						<div class="san-bar">
 							<span style="font-weight:600;font-size:14px;">{pickedCount} of {total} selected</span>
@@ -826,6 +842,37 @@
 											<span class="san-sub">
 												→ {v.primary} · {x[1]} play{x[1] === 1 ? '' : 's'} moved to the spelling with {v.primary_plays}
 												· not reversible
+											</span>
+										</span>
+									</label>
+								{/each}
+							{/each}
+						{/if}
+
+						{#if sanitize.split_attributions.length}
+							<div class="san-group">One track credited two ways on the same record</div>
+							<p style="font-size:12.5px;color:var(--td-muted);margin:0 0 10px;">
+								A film soundtrack is filed under its music director while each track is
+								tagged with its singers, so the same song ends up split between them —
+								halving its plays and resolving to two different MusicBrainz recordings.
+								The record's own artist wins; every folded name is kept in the credit.
+							</p>
+							{#each sanitize.split_attributions as sp}
+								{#each sp.folding as f}
+									{@const key = splitKey(sp.title, sp.album, f[0])}
+									<label class="san-row" class:on={pickedSplits.has(key)}>
+										<input type="checkbox" checked={pickedSplits.has(key)}
+											on:change={() => (pickedSplits = toggle(pickedSplits, key))}>
+										<span style="flex:1;min-width:0;">
+											<span class="san-name">{f[0]}</span>
+											<span class="san-sub">
+												→ {sp.primary} · {f[1]} play{f[1] === 1 ? '' : 's'} on “{sp.title}”
+												({sp.album})
+												{#if sp.primary_album_tracks >= 3}
+													· credited on {sp.primary_album_tracks} tracks of this record
+												{:else}
+													· <span style="color:#b2622d;">weak — only on {sp.primary_album_tracks} track{sp.primary_album_tracks === 1 ? '' : 's'} of this record</span>
+												{/if}
 											</span>
 										</span>
 									</label>

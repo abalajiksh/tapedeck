@@ -9,7 +9,7 @@ use sqlx::{
     sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous},
     FromRow, Pool, Sqlite,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -1121,9 +1121,21 @@ impl Database {
             play.mbid_artist.as_ref().map(|arr| serde_json::to_string(arr).unwrap());
         let q = quality.cloned().unwrap_or_default();
 
+        // Everyone credited, when the source named more than one. `artist` is
+        // the primary — for a film soundtrack the music director, which is how
+        // the record is filed and what gets forwarded — and this keeps the
+        // performers rather than discarding them. Same column and same meaning
+        // as `fold_artist_credit`: the fuller form of the credit.
+        let artist_credit = play
+            .artists
+            .as_ref()
+            .filter(|a| a.len() > 1)
+            .map(|a| a.join("; "));
+
         sqlx::query(
             "INSERT INTO scrobbles (
-                user_id, title, artist, album, timestamp, duration, source_id, source_name, status,
+                user_id, title, artist, artist_credit, album, timestamp, duration,
+                source_id, source_name, status,
                 mbid_recording, mbid_release, mbid_artist, caa_id, caa_release_mbid,
                 format_type, codec, bitrate, sample_rate, bit_depth, channels, is_lossless,
                 dsd_rate, dsd_multiplier, delivery_codec, delivery_bitrate,
@@ -1131,7 +1143,7 @@ impl Database {
                 device_id, chain_id, listening_context, submission_client, track_number,
                 source_ref
             ) VALUES (
-                ?, ?, ?, ?, ?, ?, ?, ?, 'pending',
+                ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending',
                 ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
                 ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
             )",
@@ -1139,6 +1151,7 @@ impl Database {
         .bind(user_id)
         .bind(&play.title)
         .bind(&play.artist)
+        .bind(&artist_credit)
         .bind(&play.album)
         .bind(play.timestamp as i64)
         .bind(play.duration.map(|d| d as i64))
@@ -1862,6 +1875,147 @@ impl Database {
             .collect();
         out.sort_by(|a, b| b.primary_plays.cmp(&a.primary_plays));
         Ok(out)
+    }
+
+    /// Tracks recorded under two different artists on the same record.
+    ///
+    /// The shape this exists for is a film soundtrack: Plex files the album
+    /// under the music director but tags each track with its singers, and until
+    /// the ingest fix the live and history paths each picked a different one.
+    /// The same play therefore landed twice under two names, and MusicBrainz
+    /// then resolved those to two different recordings — so the plays, the
+    /// artwork, the loves and the charts all split in half.
+    ///
+    /// The album artist wins, matched against the album's most common artist
+    /// rather than assumed: it is how the record is filed, and picking the
+    /// most-played spelling instead would hand the record to whichever singer
+    /// happened to be on the tracks played most. Everything folded keeps its
+    /// name in `artist_credit`, exactly as `fold_artist_credit` does.
+    pub async fn tracks_with_split_attribution(
+        &self,
+        user_id: i64,
+    ) -> Result<Vec<SplitAttribution>, sqlx::Error> {
+        let rows: Vec<(String, String, String, i64)> = sqlx::query_as(
+            "SELECT title, album, artist, COUNT(*) AS plays FROM scrobbles
+             WHERE user_id = ? AND skipped = FALSE
+               AND album IS NOT NULL AND TRIM(album) != ''
+             GROUP BY LOWER(TRIM(title)), LOWER(TRIM(album)), LOWER(TRIM(artist))",
+        )
+        .bind(user_id)
+        .fetch_all(&self.pool)
+        .await?;
+
+        // The album's own artist is the one appearing on the most *distinct
+        // tracks* of the record — not the one with the most plays.
+        //
+        // Breadth is the signal that separates a director from a singer: the
+        // director is credited on every track, each singer on one or two. Play
+        // count is not, and using it got this backwards on real data — on an
+        // album where most tracks happened to be caught by the live path, one
+        // singer's total outweighed the director's and the fold ran the wrong
+        // way, moving "Harris Jayaraj" onto a singer. Total plays stays as the
+        // tiebreak for artists of equal breadth.
+        let mut album_tracks: HashMap<String, HashMap<String, HashSet<String>>> = HashMap::new();
+        let mut album_totals: HashMap<String, HashMap<String, i64>> = HashMap::new();
+        for (title, album, artist, plays) in &rows {
+            let key = album.trim().to_lowercase();
+            album_tracks
+                .entry(key.clone())
+                .or_default()
+                .entry(artist.clone())
+                .or_default()
+                .insert(title.trim().to_lowercase());
+            *album_totals.entry(key).or_default().entry(artist.clone()).or_default() += plays;
+        }
+
+        let mut by_track: HashMap<(String, String), Vec<(String, i64)>> = HashMap::new();
+        for (title, album, artist, plays) in rows {
+            by_track
+                .entry((title.trim().to_lowercase(), album.trim().to_lowercase()))
+                .or_default()
+                .push((artist, plays));
+        }
+
+        let mut out = Vec::new();
+        for ((title_key, album_key), mut credits) in by_track {
+            if credits.len() < 2 {
+                continue;
+            }
+            let Some(totals) = album_totals.get(&album_key) else { continue };
+            let breadth = |name: &str| -> usize {
+                album_tracks.get(&album_key).and_then(|m| m.get(name)).map_or(0, |t| t.len())
+            };
+            // Widest credit on the record first, then total plays, then plays
+            // on this track.
+            credits.sort_by(|a, b| {
+                breadth(&b.0)
+                    .cmp(&breadth(&a.0))
+                    .then_with(|| totals.get(&b.0).unwrap_or(&0).cmp(totals.get(&a.0).unwrap_or(&0)))
+                    .then(b.1.cmp(&a.1))
+            });
+            let (primary, primary_plays) = credits[0].clone();
+            let folding: Vec<(String, i64)> = credits[1..].to_vec();
+            if folding.is_empty() {
+                continue;
+            }
+            // Computed before the key is moved into the row.
+            let primary_album_tracks = breadth(&primary) as i64;
+            let primary_album_plays = *totals.get(&primary).unwrap_or(&0);
+            out.push(SplitAttribution {
+                title: title_key,
+                album: album_key,
+                primary_album_tracks,
+                primary_album_plays,
+                primary,
+                primary_plays,
+                folding,
+            });
+        }
+        out.sort_by(|a, b| {
+            let (x, y) = (
+                b.folding.iter().map(|f| f.1).sum::<i64>(),
+                a.folding.iter().map(|f| f.1).sum::<i64>(),
+            );
+            x.cmp(&y)
+        });
+        Ok(out)
+    }
+
+    /// Put one track's stray attribution back on the record's own artist.
+    ///
+    /// Matched case-insensitively on title+album+artist because that is how the
+    /// preview grouped them. The folded name is kept in `artist_credit` — this
+    /// is a credit being demoted, not a mistake being erased, and the singers
+    /// are exactly the information the whole change exists to preserve.
+    pub async fn merge_track_attribution(
+        &self,
+        user_id: i64,
+        title: &str,
+        album: &str,
+        from_artist: &str,
+        to_artist: &str,
+    ) -> Result<u64, sqlx::Error> {
+        let res = sqlx::query(
+            "UPDATE scrobbles
+                SET artist_credit = COALESCE(artist_credit, ? || '; ' || artist),
+                    artist = ?,
+                    mbid_recording = NULL,
+                    artwork_url = NULL,
+                    caa_id = NULL
+              WHERE user_id = ?
+                AND LOWER(TRIM(title)) = LOWER(TRIM(?))
+                AND LOWER(TRIM(album)) = LOWER(TRIM(?))
+                AND LOWER(TRIM(artist)) = LOWER(TRIM(?))",
+        )
+        .bind(to_artist)
+        .bind(to_artist)
+        .bind(user_id)
+        .bind(title)
+        .bind(album)
+        .bind(from_artist)
+        .execute(&self.pool)
+        .await?;
+        Ok(res.rows_affected())
     }
 
     /// Merge one spelling of an artist into another.
@@ -4879,6 +5033,26 @@ pub struct FeaturedArtist {
     pub plays: i64,
 }
 
+/// One track carrying two different artists on the same record.
+#[derive(Debug, serde::Serialize)]
+pub struct SplitAttribution {
+    /// Lowercased grouping keys — the same normalisation the query grouped on.
+    pub title: String,
+    pub album: String,
+    /// The record's own artist, and what everything else folds into.
+    pub primary: String,
+    /// This artist's plays *on this track*.
+    pub primary_plays: i64,
+    /// This artist's plays across the whole album.
+    pub primary_album_plays: i64,
+    /// How many distinct tracks of the album carry this artist. *This* is why
+    /// they win, and it is shown so a weak case is visible as one: a director
+    /// credited on twelve tracks is obvious, a winner with two is a guess.
+    pub primary_album_tracks: i64,
+    /// `(artist, plays)` for every other attribution on this track.
+    pub folding: Vec<(String, i64)>,
+}
+
 /// An artist name with other spellings of itself in the same history.
 #[derive(Debug, serde::Serialize)]
 pub struct VariantArtist {
@@ -5060,6 +5234,81 @@ mod tests {
 
     fn play(title: &str, artist: &str, ts: u64) -> Play {
         Play::new(title.into(), artist.into(), ts, format!("src-{ts}"), "test".into())
+    }
+
+    /// The soundtrack case, in the exact shape it has in real data: an album
+    /// where every track carries the music director and each track also carries
+    /// its own singers.
+    ///
+    /// The director must win, and must win *on breadth*. Ranking by play count
+    /// got this backwards on a real export — a singer whose one track had been
+    /// played more than the director's spread outranked them, and the fold ran
+    /// the wrong way, moving "Harris Jayaraj" onto a singer. Here the singers
+    /// deliberately out-play the director on their own track.
+    #[tokio::test]
+    async fn the_album_artist_wins_on_breadth_not_plays() {
+        let db = testdb().await;
+        let mut ts = 1_000u64;
+
+        // Written out rather than looped so the play counts are visible: the
+        // director is on three tracks with 1 play each, one singer has 9 on a
+        // single track. Play count would crown the singer.
+        let rows: [(&str, &str, usize); 5] = [
+            ("Vaarayo Vaarayo", "Harris Jayaraj", 1),
+            ("Hasili Fisiliye", "Harris Jayaraj", 1),
+            ("Yaaro Yaaro", "Harris Jayaraj", 1),
+            ("Vaarayo Vaarayo", "Unnikrishnan, Chinmayi & Megha", 9),
+            ("Hasili Fisiliye", "Karthik", 2),
+        ];
+        for (title, artist, n) in rows {
+            for _ in 0..n {
+                ts += 1000;
+                let mut p = play(title, artist, ts);
+                p.album = Some("Aadhavan".into());
+                db.save_scrobble(1, &p, None, None, None, None, None, None).await.unwrap();
+            }
+        }
+
+        let splits = db.tracks_with_split_attribution(1).await.unwrap();
+        let v = splits
+            .iter()
+            .find(|s| s.title == "vaarayo vaarayo")
+            .expect("the split track is listed");
+
+        assert_eq!(v.primary, "Harris Jayaraj", "the director wins despite fewer plays");
+        assert_eq!(v.primary_album_tracks, 3, "and wins because they are on every track");
+        assert_eq!(v.folding.len(), 1);
+        assert_eq!(v.folding[0].0, "Unnikrishnan, Chinmayi & Megha");
+        assert_eq!(v.folding[0].1, 9);
+
+        // Applying it keeps the singers rather than erasing them.
+        let n = db
+            .merge_track_attribution(
+                1,
+                "vaarayo vaarayo",
+                "aadhavan",
+                "Unnikrishnan, Chinmayi & Megha",
+                "Harris Jayaraj",
+            )
+            .await
+            .unwrap();
+        assert_eq!(n, 9, "every stray listen moves");
+
+        let credit: (Option<String>,) = sqlx::query_as(
+            "SELECT artist_credit FROM scrobbles
+             WHERE user_id = 1 AND LOWER(title) = 'vaarayo vaarayo'
+               AND artist_credit IS NOT NULL LIMIT 1",
+        )
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        let credit = credit.0.expect("the folded name is kept");
+        assert!(credit.contains("Unnikrishnan"), "singers survive in the credit: {credit}");
+        assert!(credit.contains("Harris Jayaraj"), "and so does the director: {credit}");
+
+        // Nothing is left split.
+        let after = db.tracks_with_split_attribution(1).await.unwrap();
+        assert!(!after.iter().any(|s| s.title == "vaarayo vaarayo"));
     }
 
     #[tokio::test]

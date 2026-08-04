@@ -130,12 +130,14 @@ async fn sanitize_preview(State(state): State<Arc<AppState>>, user: AuthUser) ->
     let albums = state.db.albums_with_mixed_releases(user.user_id).await.unwrap_or_default();
     let artists = state.db.artists_with_featured_credits(user.user_id).await.unwrap_or_default();
     let variants = state.db.artists_with_spelling_variants(user.user_id).await.unwrap_or_default();
+    let splits = state.db.tracks_with_split_attribution(user.user_id).await.unwrap_or_default();
     (
         StatusCode::OK,
         Json(serde_json::json!({
             "mixed_albums": albums,
             "featured_artists": artists,
             "artist_variants": variants,
+            "split_attributions": splits,
         })),
     )
         .into_response()
@@ -166,6 +168,20 @@ pub struct VariantEdit {
     pub to: String,
 }
 
+/// One track whose stray attribution goes back to the record's own artist.
+#[derive(Debug, Deserialize)]
+pub struct SplitEdit {
+    pub title: String,
+    pub album: String,
+    /// The attribution being folded — a singer, on a soundtrack.
+    pub from: String,
+    /// The record's artist. Checked against the preview rather than trusted:
+    /// taking this from the request would turn a narrow fix into "rename any
+    /// track to any artist", the same reason `split_featured` derives its own
+    /// target.
+    pub to: String,
+}
+
 /// What to apply.
 ///
 /// Two ways to say it, because both are the common case at different times: the
@@ -187,6 +203,10 @@ pub struct SanitizeRequest {
     pub credit_edits: Vec<CreditEdit>,
     #[serde(default)]
     pub variant_edits: Vec<VariantEdit>,
+    #[serde(default)]
+    pub splits: bool,
+    #[serde(default)]
+    pub split_edits: Vec<SplitEdit>,
 }
 
 /// POST /api/v1/sanitize — apply the fixes the preview listed.
@@ -299,6 +319,65 @@ async fn sanitize_apply(
         }
     }
 
+    // ── Split attributions ──
+    //
+    // The target is never taken from the request. It is looked up in the same
+    // preview the operator saw, so an edit can only move a track onto the
+    // artist Tapedeck itself worked out for that record — the same discipline
+    // as the featured-credit pass, where accepting an arbitrary primary would
+    // turn a narrow fix into a rename-anything endpoint.
+    let mut split_rows = 0u64;
+    let mut splits_merged = 0u64;
+    if !body.split_edits.is_empty() || body.splits {
+        let candidates =
+            state.db.tracks_with_split_attribution(user.user_id).await.unwrap_or_default();
+
+        let apply = |title: &str, album: &str, from: &str, to: &str| {
+            (title.to_string(), album.to_string(), from.to_string(), to.to_string())
+        };
+        let wanted: Vec<(String, String, String, String)> = if !body.split_edits.is_empty() {
+            body.split_edits
+                .iter()
+                .filter_map(|e| {
+                    let c = candidates.iter().find(|c| {
+                        c.title.eq_ignore_ascii_case(e.title.trim())
+                            && c.album.eq_ignore_ascii_case(e.album.trim())
+                    })?;
+                    // The named source must actually be one of the strays, and
+                    // the named target must be the record's own artist.
+                    if !c.folding.iter().any(|(n, _)| n.eq_ignore_ascii_case(e.from.trim())) {
+                        return None;
+                    }
+                    if !c.primary.eq_ignore_ascii_case(e.to.trim()) {
+                        return None;
+                    }
+                    Some(apply(&c.title, &c.album, e.from.trim(), &c.primary))
+                })
+                .collect()
+        } else {
+            candidates
+                .iter()
+                .flat_map(|c| {
+                    c.folding
+                        .iter()
+                        .map(|(from, _)| apply(&c.title, &c.album, from, &c.primary))
+                        .collect::<Vec<_>>()
+                })
+                .collect()
+        };
+
+        for (title, album, from, to) in wanted {
+            if let Ok(n) =
+                state.db.merge_track_attribution(user.user_id, &title, &album, &from, &to).await
+            {
+                if n > 0 {
+                    split_rows += n;
+                    splits_merged += 1;
+                }
+            }
+        }
+    }
+
     tracing::info!(
         "🧹 Sanitised: {} listens across {} albums, {} listens across {} artist credits, \
          {} listens across {} spellings",
@@ -319,6 +398,8 @@ async fn sanitize_apply(
             "artist_listens_changed": artist_rows,
             "variants_merged": variants_merged,
             "variant_listens_changed": variant_rows,
+            "splits_merged": splits_merged,
+            "split_listens_changed": split_rows,
         })),
     )
         .into_response()

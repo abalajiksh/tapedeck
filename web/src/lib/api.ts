@@ -486,9 +486,26 @@ export interface SanitizePreview {
 	featured_artists: { artist: string; primary: string; plays: number }[];
 	/** One artist spelled several ways ("A.R. Rahman" / "A. R. Rahman"). */
 	artist_variants: { primary: string; primary_plays: number; variants: [string, number][] }[];
+	/** One track on a record credited two different ways — the film-soundtrack
+	 *  case, where the album carries the music director and each track its
+	 *  singers. `primary_album_tracks` is *why* the winner won and shows how
+	 *  strong the case is: a director on twelve tracks is obvious, two is a guess. */
+	split_attributions: SplitAttribution[];
+}
+
+export interface SplitAttribution {
+	title: string;
+	album: string;
+	primary: string;
+	primary_plays: number;
+	primary_album_plays: number;
+	primary_album_tracks: number;
+	folding: [string, number][];
 }
 
 export interface SanitizeResult {
+	splits_merged?: number;
+	split_listens_changed?: number;
 	albums_fixed: number;
 	album_listens_changed: number;
 	artists_folded: number;
@@ -749,6 +766,8 @@ class TapedeckAPI {
 		album_edits?: { artist: string; album: string; mbid_release: string }[];
 		credit_edits?: { artist: string }[];
 		variant_edits?: { from: string; to: string }[];
+		splits?: boolean;
+		split_edits?: { title: string; album: string; from: string; to: string }[];
 	}): Promise<SanitizeResult> {
 		return this.post('/api/v1/sanitize', opts);
 	}
