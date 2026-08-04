@@ -20,6 +20,73 @@
 		catch { return []; }
 	})();
 
+	// ── Adding a listen by hand ──
+	//
+	// Goes through /1/submit-listens, the same endpoint external clients use, so
+	// a hand-entered listen gets the same validation, dedup and chain resolution
+	// as a real one. Parsed and shown back before anything is sent — the whole
+	// point of typing one out is that you meant something specific by it.
+	let manualJson = '';
+	let manualBusy = false;
+	let manualMsg = '';
+	let manualErr = '';
+
+	type ParsedListen = { title: string; artist: string; album?: string; at?: number };
+
+	/** Accepts a bare listen, an array of them, or a full submit-listens body. */
+	function extractListens(raw: string): unknown[] {
+		const v = JSON.parse(raw);
+		if (Array.isArray(v)) return v;
+		if (v && typeof v === 'object') {
+			const o = v as Record<string, unknown>;
+			if (Array.isArray(o.payload)) return o.payload;
+			if (Array.isArray(o.listens)) return o.listens;
+			return [v];
+		}
+		throw new Error('Expected a JSON object or array');
+	}
+
+	function describe(l: unknown): ParsedListen {
+		const o = (l ?? {}) as Record<string, unknown>;
+		const tm = (o.track_metadata ?? o) as Record<string, unknown>;
+		const str = (x: unknown) => (typeof x === 'string' && x.trim() ? x.trim() : undefined);
+		const title = str(tm.track_name) ?? str(tm.title);
+		const artist = str(tm.artist_name) ?? str(tm.artist);
+		if (!title || !artist) throw new Error('Each listen needs a track name and an artist');
+		const at = typeof o.listened_at === 'number' ? o.listened_at : undefined;
+		return { title, artist, album: str(tm.release_name) ?? str(tm.album), at };
+	}
+
+	// Reactive so the preview tracks what is typed; an invalid draft is a normal
+	// mid-typing state, not an error to shout about.
+	$: manualParsed = (() => {
+		if (!manualJson.trim()) return { ok: true as const, listens: [] as ParsedListen[] };
+		try {
+			return { ok: true as const, listens: extractListens(manualJson).map(describe) };
+		} catch (e) {
+			return { ok: false as const, error: (e as Error).message };
+		}
+	})();
+
+	async function submitManual() {
+		if (!manualParsed.ok || !manualParsed.listens.length) return;
+		manualBusy = true; manualMsg = ''; manualErr = '';
+		try {
+			const listens = extractListens(manualJson);
+			// `single` is for something playing now and carries no timestamp
+			// requirement; anything with a listened_at is a past listen, which
+			// is what `import` means to ListenBrainz.
+			const anyTimestamped = manualParsed.listens.some((l) => l.at);
+			await api.submitListens(listens, anyTimestamped ? 'import' : 'single');
+			manualMsg = `Added ${listens.length} listen${listens.length === 1 ? '' : 's'}.`;
+			manualJson = '';
+			await loadHistory();
+		} catch (e) {
+			manualErr = String(e).replace(/^API \d+: /, '');
+		}
+		manualBusy = false;
+	}
+
 	async function inspectFile(f: File | null) {
 		file = f;
 		logNeedsTz = false;
@@ -204,6 +271,64 @@
 		</div>
 	</div>
 {/if}
+
+<h3 class="h-display" style="font-size:19px;margin:0 0 12px;">Add a listen by hand</h3>
+<div class="panel" style="border-radius:22px;padding:24px;margin-bottom:20px;">
+	<p style="font-size:13px;color:var(--td-muted);margin:0 0 14px;">
+		Paste one ListenBrainz-shaped listen — or an array of them, or a whole
+		<code>submit-listens</code> body. It goes through the same endpoint your
+		scrobble clients use, so it is deduplicated and gets a signal chain like
+		any other listen. <code>listened_at</code> is unix seconds; leave it out
+		and the listen is treated as playing now.
+	</p>
+
+	<textarea
+		class="input"
+		rows="8"
+		spellcheck="false"
+		bind:value={manualJson}
+		placeholder={'{\n  "listened_at": 1785858587,\n  "track_metadata": {\n    "artist_name": "Chris Isaak",\n    "track_name": "Wicked Game",\n    "release_name": "Best of Chris Isaak"\n  }\n}'}
+		style="font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12.5px;line-height:1.55;resize:vertical;width:100%;"
+	></textarea>
+
+	{#if manualJson.trim()}
+		<div style="margin-top:12px;">
+			{#if !manualParsed.ok}
+				<div style="font-size:13px;color:#b2622d;">✗ {manualParsed.error}</div>
+			{:else}
+				<div style="font-size:12px;letter-spacing:.12em;text-transform:uppercase;color:var(--td-muted-2);margin-bottom:8px;">
+					{manualParsed.listens.length} listen{manualParsed.listens.length === 1 ? '' : 's'} ready
+				</div>
+				{#each manualParsed.listens.slice(0, 5) as l}
+					<div style="display:flex;gap:10px;align-items:baseline;font-size:13.5px;padding:5px 0;border-top:1px solid var(--td-line);">
+						<span style="font-weight:600;">{l.title}</span>
+						<span style="color:var(--td-muted);flex:1;min-width:0;">
+							{l.artist}{l.album ? ` — ${l.album}` : ''}
+						</span>
+						<span style="color:var(--td-muted-2);font-variant-numeric:tabular-nums;">
+							{l.at ? formatDateTime(l.at) : 'now'}
+						</span>
+					</div>
+				{/each}
+				{#if manualParsed.listens.length > 5}
+					<div style="font-size:12.5px;color:var(--td-muted-2);padding-top:6px;">
+						…and {manualParsed.listens.length - 5} more.
+					</div>
+				{/if}
+			{/if}
+		</div>
+	{/if}
+
+	<div style="display:flex;align-items:center;gap:12px;margin-top:16px;flex-wrap:wrap;">
+		<button
+			class="btn btn-primary"
+			on:click={submitManual}
+			disabled={manualBusy || !manualParsed.ok || !manualParsed.listens?.length}
+		>{manualBusy ? 'Adding…' : 'Add listen'}</button>
+		{#if manualMsg}<span style="font-size:13px;color:var(--td-good-fg);">{manualMsg}</span>{/if}
+		{#if manualErr}<span style="font-size:13px;color:#b2622d;">{manualErr}</span>{/if}
+	</div>
+</div>
 
 <h3 class="h-display" style="font-size:19px;margin:0 0 12px;">Past Imports</h3>
 <div class="panel" style="border-radius:22px;overflow:hidden;padding:6px 20px 14px;">

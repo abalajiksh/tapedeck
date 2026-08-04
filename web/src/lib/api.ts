@@ -774,6 +774,19 @@ class TapedeckAPI {
 		return this.post('/api/v1/sanitize', opts);
 	}
 
+	// ── Manual listen entry ──
+	/**
+	 * Submit listens through the ListenBrainz-compatible ingest endpoint.
+	 *
+	 * The same route external scrobble clients use — it already accepts a
+	 * browser session, so a hand-entered listen goes through exactly the
+	 * validation, deduplication and chain resolution that a real one does
+	 * rather than a parallel path that could drift from it.
+	 */
+	async submitListens(payload: unknown[], listen_type: 'single' | 'import' = 'single') {
+		return this.post('/1/submit-listens', { listen_type, payload });
+	}
+
 	// ── Search ──
 	async search(q: string, limit = 10): Promise<SearchResults> {
 		return this.get(`/api/v1/search?q=${encodeURIComponent(q)}&limit=${limit}`);
