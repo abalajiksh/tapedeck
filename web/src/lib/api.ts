@@ -215,7 +215,13 @@ export interface UserSource {
 /** Partial update. Omitting `token` keeps the stored one. */
 export type UserSourceUpdate = Partial<
 	Omit<UserSource, 'id' | 'kind' | 'has_token' | 'remote_account' | 'last_polled_at' | 'last_error' | 'updated_at'>
-> & { kind?: string; token?: string; username?: string; password?: string; api_key?: string };
+> & {
+	kind?: string; token?: string; username?: string; password?: string; api_key?: string;
+	/** Plex only. Which account on the server to scrobble. Omit for "whoever
+	 *  the token belongs to" — the right default for a personal token, wrong
+	 *  on a household server where one admin holds it. */
+	plex_account?: string;
+};
 
 // ── Liner notes (Phase 7) ──
 
@@ -295,11 +301,19 @@ export interface NoteRevision {
 	created_at: number;
 }
 
+export interface PlexAccount {
+	id: number;
+	name: string;
+}
+
 export interface SourceTestResult {
 	ok: boolean;
 	libraries?: string[];
 	account?: string | null;
 	account_error?: string | null;
+	/** Every account on the Plex server, for the "scrobble as" picker. Empty
+	 *  when the token may not read /accounts — the picker just isn't offered. */
+	accounts?: PlexAccount[];
 	error?: string;
 }
 

@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::sleep;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 use crate::db::Database;
 use crate::musicbrainz::MusicBrainzClient;
@@ -621,14 +621,60 @@ impl ScrobbleEngine {
                     .map(|s| format!("{:.0}", s))
                     .unwrap_or_else(|| "n/a".into());
 
+                // Register the player and let it carry the chain. A Plex listen
+                // has no token, so the ladder's first three rungs can never
+                // match; without a device it fell through all four and every
+                // Plex listen was stored with no signal chain at all. Binding a
+                // chain to "Plexamp on fedora" in the UI now attributes every
+                // listen from it, with nothing to configure per listen.
+                let (device_id, chain_id) = match &plex_track.player {
+                    Some(p) => {
+                        match db
+                            .upsert_device(
+                                user_id,
+                                &p.machine_id,
+                                p.name.as_deref(),
+                                p.platform.as_deref(),
+                                p.product.as_deref(),
+                            )
+                            .await
+                        {
+                            Ok(dev) => {
+                                let chain = db
+                                    .get_device_default_chain(user_id, dev)
+                                    .await
+                                    .ok()
+                                    .flatten();
+                                (Some(dev), chain)
+                            }
+                            Err(e) => {
+                                warn!("Could not record Plex player as a device: {}", e);
+                                (None, None)
+                            }
+                        }
+                    }
+                    // History rows have no player — nothing is playing by then.
+                    None => (None, None),
+                };
+
+                let listening_context = match chain_id {
+                    Some(cid) => db
+                        .get_chain(user_id, cid)
+                        .await
+                        .ok()
+                        .flatten()
+                        .map(|c| c.listening_context.as_str().to_string()),
+                    None => None,
+                };
+
                 match db
                     .save_scrobble(
                         user_id,
                         &play,
                         quality_ref,
-                        None,
-                        None,
-                        None,
+                        device_id,
+                        chain_id,
+                        listening_context.as_deref(),
                         Some("Plex"),
                         Some(row_id),
                     )

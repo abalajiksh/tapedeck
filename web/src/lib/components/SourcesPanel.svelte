@@ -46,6 +46,9 @@
 		secret: string;
 		username: string;
 		hasSecret: boolean;
+		/** Plex only. Which account on the server to scrobble; '' means the
+		 *  token's own, which is the right default for a personal token. */
+		plexAccount: string;
 		filters: { libraries_allow: string; libraries_block: string; devices_allow: string; devices_block: string };
 	};
 	let draft: Draft | null = null;
@@ -57,7 +60,7 @@
 
 	const blank = (kind: Kind): Draft => ({
 		id: null, kind, label: '', url: '', enabled: true,
-		secret: '', username: '', hasSecret: false,
+		secret: '', username: '', hasSecret: false, plexAccount: '',
 		filters: { libraries_allow: '', libraries_block: '', devices_allow: '', devices_block: '' }
 	});
 
@@ -71,6 +74,9 @@
 			secret: '',
 			username: s.username ?? '',
 			hasSecret: s.has_token,
+			// The stored account is the current choice; blank means "whoever the
+			// token belongs to", which is what an un-picked source has always done.
+			plexAccount: s.remote_account ?? '',
 			filters: {
 				libraries_allow: (s.libraries_allow ?? []).join(', '),
 				libraries_block: (s.libraries_block ?? []).join(', '),
@@ -120,6 +126,7 @@
 			enabled: d.enabled,
 			url: d.url.trim(),
 			...(d.kind === 'navidrome' ? { username: d.username.trim() } : {}),
+			...(d.kind === 'plex' && d.plexAccount.trim() ? { plex_account: d.plexAccount.trim() } : {}),
 			...secretPayload(d),
 			libraries_allow: split(d.filters.libraries_allow),
 			libraries_block: split(d.filters.libraries_block),
@@ -322,6 +329,21 @@
 						{/if}
 						{#if test.account_error}
 							<div style="color:#b2622d;margin-top:6px;">✗ Could not identify the account: {test.account_error}</div>
+						{/if}
+						{#if draft && draft.kind === 'plex' && test.accounts && test.accounts.length > 1}
+							<div class="field" style="margin-top:12px;max-width:340px;">
+								<label for="f-plexacct">Scrobble which Plex account?</label>
+								<select id="f-plexacct" class="input" bind:value={draft.plexAccount}>
+									<option value="">{test.account ? `${test.account} (this token)` : 'Whoever this token belongs to'}</option>
+									{#each test.accounts as a (a.id)}
+										<option value={a.name}>{a.name}</option>
+									{/each}
+								</select>
+								<p style="color:var(--td-muted);font-size:12px;margin-top:6px;">
+									Only this account's sessions are recorded. Pick a different one when
+									the token is the server owner's but the listening isn't.
+								</p>
+							</div>
 						{/if}
 					{:else}
 						<span style="color:#b2622d;">✗ {test.error}</span>

@@ -103,6 +103,15 @@ struct SourceUpdate {
     libraries_block: Option<Vec<String>>,
     devices_allow: Option<Vec<String>>,
     devices_block: Option<Vec<String>>,
+    /// Which Plex account's sessions this source should scrobble.
+    ///
+    /// Omitted means "whoever the token belongs to", which is the old behaviour
+    /// and the right default for a personal token. It matters on a household
+    /// server, where one admin holds the token: without this, every source
+    /// resolved to the server owner and a second user could not be set up at
+    /// all. Validated against `/accounts` on save — a name that isn't on the
+    /// server would match no session and scrobble nothing, silently.
+    plex_account: Option<String>,
 }
 
 /// Everything a save needs, resolved from the body and whatever is stored.
@@ -169,7 +178,40 @@ async fn resolve_save(
             let changed = current.map(|c| c.url != url).unwrap_or(true)
                 || current.and_then(|c| c.credential("token")).as_deref() != Some(token.as_str())
                 || remote_account.is_none();
-            if complete && changed {
+            // An explicitly chosen account wins, but only after checking it is
+            // real. Accepting it unverified would produce a source that looks
+            // saved and never scrobbles, which is the least debuggable outcome:
+            // no error anywhere, just an empty history.
+            let chosen = body.plex_account.take().filter(|a| !a.trim().is_empty());
+            if let Some(chosen) = chosen {
+                if complete {
+                    match PlexSource::list_accounts(&url, &token).await {
+                        Ok(accounts) => {
+                            match accounts
+                                .iter()
+                                .find(|a| a.name.eq_ignore_ascii_case(chosen.trim()))
+                            {
+                                // Store the server's spelling, not the caller's:
+                                // session matching is on this string.
+                                Some(found) => remote_account = Some(found.name.clone()),
+                                None => {
+                                    return Err(err(
+                                        400,
+                                        format!(
+                                            "No Plex account called \"{}\" on that server. \
+                                             Tapedeck would scrobble nothing.",
+                                            chosen.trim()
+                                        ),
+                                    ))
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            return Err(err(400, format!("Could not list Plex accounts: {e}")))
+                        }
+                    }
+                }
+            } else if complete && changed {
                 match PlexSource::resolve_account(&url, &token).await {
                     Ok(name) => remote_account = Some(name),
                     Err(e) => {
@@ -456,6 +498,12 @@ async fn test_source(
                 Ok(name) => (Some(name), None),
                 Err(e) => (None, Some(e.to_string())),
             };
+            // Every account on the server, so the UI can offer a picker instead
+            // of silently assuming the token holder. Best-effort: a shared token
+            // may not be allowed to read /accounts, and that is not a reason to
+            // fail the connection test — the caller just gets no picker and the
+            // token's own account as before.
+            let accounts = PlexSource::list_accounts(&url, &token).await.unwrap_or_default();
             let mut probe = PlexSource::with_filters(url, token, PlexFilters::default());
             match probe.initialize().await {
                 Ok(()) => (
@@ -465,6 +513,7 @@ async fn test_source(
                         "libraries": probe.library_names(),
                         "account": account,
                         "account_error": account_error,
+                        "accounts": accounts,
                     })),
                 )
                     .into_response(),

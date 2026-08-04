@@ -2,7 +2,7 @@ use crate::models::{AudioQuality, Play};
 use crate::sources::MusicSource;
 use async_trait::async_trait;
 use reqwest::Client;
-use serde::{Deserialize, Deserializer};
+use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::HashMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::{debug, info, warn};
@@ -124,6 +124,32 @@ pub struct PlexTrack {
     /// `source_id` — the old suffix was the poll's wall clock, which made every
     /// walk of the same 50 rows look like 50 new plays to `Database::exists`.
     pub history_key: Option<String>,
+    /// The player this came off, when it came from a live session.
+    ///
+    /// A Plex listen carries no submitting token, so three of the four rungs of
+    /// the chain ladder can never match and every one of them landed with no
+    /// signal chain at all. The `Player` element is the missing evidence: it
+    /// maps onto `devices` exactly, which makes the device rung reachable.
+    /// History rows have no player — nothing is playing by then.
+    pub player: Option<PlexPlayer>,
+}
+
+/// An account on the Plex server — the server owner plus any managed or shared
+/// users. `id` is Plex's own account id; sessions are matched on `name`, which
+/// is what the `User` element on a session carries.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlexAccount {
+    pub id: i64,
+    pub name: String,
+}
+
+/// The playing device, reduced to what `devices` stores.
+#[derive(Debug, Clone)]
+pub struct PlexPlayer {
+    pub machine_id: String,
+    pub name: Option<String>,
+    pub platform: Option<String>,
+    pub product: Option<String>,
 }
 
 impl PlexTrack {
@@ -145,6 +171,19 @@ impl PlexTrack {
             audio_quality,
             plex_user: s.user.as_ref().and_then(|u| u.title.clone()),
             history_key: None,
+            // No machineIdentifier means nothing stable to key a device on, so
+            // the listen keeps its old behaviour rather than getting a device
+            // row that a rename or reconnect would orphan.
+            player: s.player.as_ref().and_then(|p| {
+                p.machine_identifier.clone().map(|machine_id| PlexPlayer {
+                    machine_id,
+                    name: p.title.clone(),
+                    // "Linux" is more use on a device list than "Linux" the
+                    // platform, but Plex only sends `device` on some clients.
+                    platform: p.device.clone().or_else(|| p.platform.clone()),
+                    product: p.product.clone(),
+                })
+            }),
         })
     }
 
@@ -164,6 +203,7 @@ impl PlexTrack {
             viewed_at: h.viewed_at,
             audio_quality: None,
             plex_user: None,
+            player: None,
         })
     }
 
@@ -321,8 +361,15 @@ pub struct SessionMetadata {
 #[serde(rename_all = "camelCase")]
 pub struct Player {
     pub state: Option<String>,
+    /// The player's own name — "fedora.fritz.box", "Living Room".
     pub title: Option<String>,
+    /// The app: "Plexamp", "Plex for Android", "Plex Web".
     pub product: Option<String>,
+    /// Stable per-player id, and the natural `devices.machine_id`.
+    pub machine_identifier: Option<String>,
+    pub platform: Option<String>,
+    /// Hardware descriptor — "Linux", "iPhone", "Windows".
+    pub device: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -526,6 +573,59 @@ impl PlexSource {
     /// is *playing*, not who a token belongs to. That means this needs outbound
     /// internet access even for a LAN-only Plex — callers should treat failure as
     /// "ask the user to type their Plex username" rather than fatal.
+    /// Every account the server knows about, for the source-setup picker.
+    ///
+    /// `resolve_account` answers "whose token is this", which is the server
+    /// owner's — so a household where one admin holds the token could only ever
+    /// scrobble the admin's own listens. This is the other half: the server's
+    /// own `/accounts` lists managed and shared users, so a Tapedeck user can be
+    /// pointed at the account that is actually theirs.
+    ///
+    /// Plex keeps tombstones for removed accounts, which come back with an empty
+    /// `name`; they're dropped rather than shown as blank rows in a dropdown.
+    pub async fn list_accounts(
+        url: &str,
+        token: &str,
+    ) -> Result<Vec<PlexAccount>, Box<dyn std::error::Error>> {
+        #[derive(Deserialize)]
+        struct Container {
+            #[serde(rename = "Account", default)]
+            account: Vec<PlexAccount>,
+        }
+        #[derive(Deserialize)]
+        struct Wrapper {
+            #[serde(rename = "MediaContainer")]
+            media_container: Container,
+        }
+
+        let client = Client::builder()
+            .timeout(Duration::from_secs(10))
+            .user_agent(format!("{}/{}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION")))
+            .build()?;
+
+        let resp = client
+            .get(format!("{}/accounts", url.trim_end_matches('/')))
+            .header("X-Plex-Token", token)
+            .header("Accept", "application/json")
+            .send()
+            .await?;
+
+        if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
+            return Err("Plex rejected that token".into());
+        }
+        if !resp.status().is_success() {
+            return Err(format!("Plex returned {}", resp.status()).into());
+        }
+
+        let wrapper: Wrapper = resp.json().await?;
+        Ok(wrapper
+            .media_container
+            .account
+            .into_iter()
+            .filter(|a| !a.name.trim().is_empty())
+            .collect())
+    }
+
     pub async fn resolve_account(
         url: &str,
         token: &str,
@@ -1031,6 +1131,7 @@ mod tests {
             audio_quality: None,
             plex_user: None,
             history_key: None,
+            player: None,
         }
     }
 
@@ -1102,6 +1203,52 @@ mod tests {
             src.process_live_track(track(offset), true, &mut r).await;
             assert!(r.ready_to_scrobble.is_empty(), "seek at {offset}ms re-scrobbled");
         }
+    }
+
+    /// The `Player` element is what makes a Plex listen resolvable to a signal
+    /// chain, and a wrong field name here would be completely silent — the
+    /// device would just never be recorded and every listen would keep landing
+    /// with no chain, exactly the bug this fixed. Pinned against a real
+    /// /status/sessions response.
+    #[test]
+    fn the_player_element_maps_onto_a_device() {
+        let body = r#"{
+            "MediaContainer": {
+                "size": 1,
+                "Metadata": [{
+                    "ratingKey": "113444",
+                    "type": "track",
+                    "title": "Wicked Game",
+                    "grandparentTitle": "Chris Isaak",
+                    "parentTitle": "Best of Chris Isaak",
+                    "sessionKey": "49",
+                    "duration": 286880,
+                    "viewOffset": 182656,
+                    "User": { "id": "1", "title": "s.ashwinbalaji" },
+                    "Player": {
+                        "address": "192.168.178.96",
+                        "device": "Linux",
+                        "machineIdentifier": "721c1772-4434-4275-aa9a-39b37237f1b2",
+                        "platform": "Linux",
+                        "product": "Plexamp",
+                        "state": "playing",
+                        "title": "fedora.fritz.box"
+                    }
+                }]
+            }
+        }"#;
+        let mut resp: SessionsResponse = serde_json::from_str(body).expect("parses");
+        let meta = resp.media_container.metadata.pop().expect("one track");
+        let track = PlexTrack::from_session(meta).expect("becomes a track");
+
+        let player = track.player.expect("Player was parsed");
+        assert_eq!(player.machine_id, "721c1772-4434-4275-aa9a-39b37237f1b2");
+        assert_eq!(player.name.as_deref(), Some("fedora.fritz.box"));
+        assert_eq!(player.product.as_deref(), Some("Plexamp"));
+        // `device` is preferred over `platform` — both say "Linux" here, but
+        // only `device` is meaningful on clients that send both.
+        assert_eq!(player.platform.as_deref(), Some("Linux"));
+        assert_eq!(track.plex_user.as_deref(), Some("s.ashwinbalaji"));
     }
 
     /// The art path is read off Plex's own metadata response, so the field
