@@ -326,7 +326,9 @@ async fn sanitize_apply(
 
 /// GET /api/v1/stats/dashboard
 async fn dashboard_stats(State(state): State<Arc<AppState>>, user: AuthUser) -> impl IntoResponse {
-    match state.db.get_dashboard_stats(user.user_id).await {
+    let tz = user_tz(&state, user.user_id).await;
+    let week_start_day = user_week_start(&state, user.user_id).await;
+    match state.db.get_dashboard_stats(user.user_id, tz, week_start_day).await {
         Ok(stats) => (StatusCode::OK, Json(stats)).into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -459,6 +461,22 @@ async fn user_tz(state: &AppState, user_id: i64) -> chrono_tz::Tz {
         .and_then(|p| p.get("timezone").and_then(|v| v.as_str().map(str::to_string)))
         .unwrap_or_default();
     crate::analytics::parse_tz(&name)
+}
+
+/// First day of the week, 0 = Sunday .. 6 = Saturday.
+///
+/// Defaults to Monday, which is ISO-8601 and what most of the world means by
+/// "this week". Last.fm runs its charts Friday to Friday, which is exactly why
+/// this is a preference rather than a constant.
+async fn user_week_start(state: &AppState, user_id: i64) -> u32 {
+    state
+        .db
+        .get_preferences(user_id)
+        .await
+        .ok()
+        .and_then(|p| p.get("week_start").and_then(|v| v.as_u64()))
+        .map(|d| (d % 7) as u32)
+        .unwrap_or(1)
 }
 
 fn to_listen_rows(

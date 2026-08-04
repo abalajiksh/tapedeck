@@ -307,6 +307,42 @@ fn compute_loyalty(rows: &[ListenRow], tz: Tz) -> Vec<LoyalArtist> {
     out
 }
 
+/// Epoch second of local midnight for whatever day `ts` falls in.
+///
+/// Not `ts - ts % 86400` — that is midnight *UTC*, which is what made the
+/// dashboard's "today" roll over at 01:00 in CET and 02:00 in CEST. Going
+/// through the timezone also means DST is the library's problem rather than
+/// ours: the offset is looked up for this instant, so the CET/CEST switch needs
+/// no special case. A local midnight that doesn't exist (spring forward in a
+/// zone that skips it) resolves to the first valid instant after it.
+pub fn local_day_start(ts: i64, tz: Tz) -> i64 {
+    let date = local(ts, tz).date_naive();
+    date.and_hms_opt(0, 0, 0)
+        .and_then(|naive| tz.from_local_datetime(&naive).earliest())
+        .map(|dt| dt.timestamp())
+        // Fall back to the UTC-shaped answer rather than dropping the stat.
+        .unwrap_or(ts - ts.rem_euclid(86400))
+}
+
+/// Epoch second of the start of the week containing `ts`, where the week begins
+/// on `start_day` (0 = Sunday .. 6 = Saturday).
+///
+/// The dashboard's "this week" used to be a rolling 7×86400 window, which is a
+/// different statistic to a calendar week and never agreed with what anyone
+/// means by "this week" on a Monday morning. Which day it starts on is a real
+/// preference — Last.fm's charts run Friday to Friday — so it is a parameter,
+/// not a constant.
+pub fn local_week_start(ts: i64, tz: Tz, start_day: u32) -> i64 {
+    let today = local_day_start(ts, tz);
+    let dow = local(ts, tz).weekday().num_days_from_sunday();
+    // Days to step back to reach `start_day`; 0 when today *is* the start.
+    let back = (dow + 7 - (start_day % 7)) % 7;
+    // Step a day at a time through local midnights rather than subtracting
+    // 86400 × back: a DST boundary inside the week makes one of those days 23
+    // or 25 hours long, and a flat multiply lands an hour off.
+    (0..back).fold(today, |acc, _| local_day_start(acc - 1, tz))
+}
+
 /// 7 days × 24 hours listening grid in local time (rows Sun..Sat).
 pub fn heatmap_local(rows: &[ListenRow], tz: Tz) -> Vec<Vec<i64>> {
     let mut grid = vec![vec![0i64; 24]; 7];
@@ -323,6 +359,70 @@ pub fn heatmap_local(rows: &[ListenRow], tz: Tz) -> Vec<Vec<i64>> {
 mod tests {
     use super::*;
     const UTC: Tz = chrono_tz::UTC;
+
+    const BERLIN: Tz = chrono_tz::Europe::Berlin;
+
+    /// The reported bug: "today" began at 01:00 rather than midnight. That is
+    /// `now - now % 86400`, which is midnight UTC — one hour late in CET and
+    /// two in CEST. Both sides of the DST switch, since a fixed offset would
+    /// only fix one of them.
+    #[test]
+    fn local_midnight_is_local_in_both_cet_and_cest() {
+        // 2026-01-15 12:00 CET (UTC+1) -> local midnight is 23:00 UTC on the 14th.
+        let winter = 1768478400; // 2026-01-15T12:00:00Z
+        let start = local_day_start(winter, BERLIN);
+        let local_dt = local(start, BERLIN);
+        assert_eq!(local_dt.hour(), 0, "CET day must start at local midnight");
+        assert_eq!(local_dt.day(), 15);
+
+        // 2026-07-15 12:00 CEST (UTC+2) -> local midnight is 22:00 UTC on the 14th.
+        let summer = 1784116800; // 2026-07-15T12:00:00Z
+        let local_dt = local(local_day_start(summer, BERLIN), BERLIN);
+        assert_eq!(local_dt.hour(), 0, "CEST day must start at local midnight");
+        assert_eq!(local_dt.day(), 15);
+
+        // The old arithmetic, for contrast: midnight UTC read in Berlin is 01:00.
+        assert_eq!(local(winter - winter.rem_euclid(86400), BERLIN).hour(), 1);
+    }
+
+    /// A calendar week, starting on the day the user picked — Monday by
+    /// default, Friday for a Last.fm-shaped chart week.
+    #[test]
+    fn week_starts_on_the_chosen_day() {
+        // 2026-01-15 is a Thursday.
+        let thursday = 1768478400;
+        assert_eq!(local(thursday, BERLIN).weekday(), Weekday::Thu);
+
+        for (start_day, expect) in
+            [(1u32, Weekday::Mon), (0, Weekday::Sun), (5, Weekday::Fri), (4, Weekday::Thu)]
+        {
+            let ws = local_week_start(thursday, BERLIN, start_day);
+            let dt = local(ws, BERLIN);
+            assert_eq!(dt.weekday(), expect, "start_day {start_day}");
+            assert_eq!(dt.hour(), 0, "week must begin at local midnight");
+            assert!(ws <= thursday, "week start cannot be in the future");
+            assert!(thursday - ws < 7 * 86400 + 3600, "and within the last week");
+        }
+    }
+
+    /// Thursday with the week starting Thursday is a no-op, not a week back.
+    #[test]
+    fn a_week_starting_today_starts_today() {
+        let thursday = 1768478400;
+        assert_eq!(local_week_start(thursday, BERLIN, 4), local_day_start(thursday, BERLIN));
+    }
+
+    /// A week containing a DST switch has a 23- or 25-hour day in it, so
+    /// stepping back by a flat 86400 lands an hour off local midnight.
+    #[test]
+    fn a_week_spanning_the_dst_switch_still_starts_at_midnight() {
+        // 2026-03-29 is the CET->CEST switch in Berlin. Land on the Wednesday after.
+        let after = 1774785600; // 2026-04-01T12:00:00Z
+        let ws = local_week_start(after, BERLIN, 0); // week starting Sunday = the 29th
+        let dt = local(ws, BERLIN);
+        assert_eq!(dt.hour(), 0, "still local midnight across the switch");
+        assert_eq!(dt.weekday(), Weekday::Sun);
+    }
 
     fn row(ts: i64, a: &str, t: &str, album: Option<&str>, tn: Option<i32>) -> ListenRow {
         ListenRow {

@@ -2084,13 +2084,22 @@ impl Database {
         Ok((total.0, done.0))
     }
 
+    /// Dashboard counters, bounded in the *user's* local time.
+    ///
+    /// `tz` and `week_start_day` come from their preferences. Both used to be
+    /// implicit and both were wrong: "today" was midnight UTC, so the day
+    /// rolled over at 01:00 in CET and 02:00 in CEST, and "this week" was a
+    /// rolling 7×86400 window rather than a calendar week starting anywhere in
+    /// particular.
     pub async fn get_dashboard_stats(
         &self,
         user_id: i64,
+        tz: chrono_tz::Tz,
+        week_start_day: u32,
     ) -> Result<serde_json::Value, sqlx::Error> {
         let now = Self::now_secs();
-        let today_start = now - (now % 86400);
-        let week_start = now - (7 * 86400);
+        let today_start = crate::analytics::local_day_start(now, tz);
+        let week_start = crate::analytics::local_week_start(now, tz, week_start_day);
 
         let today: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM scrobbles WHERE user_id = ? AND skipped = FALSE AND timestamp >= ?")
             .bind(user_id).bind(today_start).fetch_one(&self.pool).await?;

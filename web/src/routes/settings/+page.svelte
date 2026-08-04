@@ -179,6 +179,10 @@
 
 	let timezone = '';
 	let tzSaved = false;
+	/** 0=Sun..6=Sat. Monday is ISO-8601 and the default; Last.fm's chart week
+	 *  runs Friday to Friday, which is why this is settable at all. */
+	let weekStart = 1;
+	let weekSaved = false;
 
 	// language enrichment
 	let isAdmin = false;
@@ -226,6 +230,11 @@
 				}
 			}, 2500);
 		} catch (e) { fetchingArt = false; alert(String(e).replace(/^API \d+: /, '')); }
+	}
+
+	async function saveWeekStart() {
+		try { await api.putPreferences({ week_start: weekStart }); weekSaved = true; setTimeout(() => (weekSaved = false), 2000); }
+		catch { /* ignore */ }
 	}
 
 	async function saveTimezone() {
@@ -347,6 +356,7 @@
 		try {
 			const prefs = await api.getPreferences();
 			timezone = (prefs.timezone as string) || Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC';
+			if (typeof prefs.week_start === 'number') weekStart = ((prefs.week_start % 7) + 7) % 7;
 		} catch { timezone = 'UTC'; }
 		try { isAdmin = (await api.me()).is_admin; } catch { /* optional */ }
 		loadArtStatus();
@@ -539,6 +549,25 @@
 								{/if}
 							</div>
 							<button class="btn btn-secondary" on:click={saveTimezone}>{tzSaved ? '✓' : 'Save'}</button>
+						</div>
+					</div>
+
+					<div class="row">
+						<div class="row-main">
+							<div class="row-title">Week starts on</div>
+							<div class="row-sub">
+								Sets the “this week” counter on the dashboard and the row order of the
+								listening heatmap.
+							</div>
+						</div>
+						<div style="display:flex;gap:8px;align-items:center;">
+							<select class="input" style="width:auto;" bind:value={weekStart} on:change={saveWeekStart}>
+								<option value={1}>Monday</option>
+								<option value={0}>Sunday</option>
+								<option value={5}>Friday</option>
+								<option value={6}>Saturday</option>
+							</select>
+							{#if weekSaved}<span style="color:var(--td-good-fg);">✓</span>{/if}
 						</div>
 					</div>
 				</div>

@@ -27,6 +27,11 @@
 	let showAll = { artists: false, albums: false, tracks: false };
 
 	const days = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+	/** First day of the week, 0=Sun..6=Sat. The backend builds the heatmap in a
+	 *  fixed Sun..Sat order (it's a grid, not a list), so the rotation happens
+	 *  here — the grid keeps its geometry and only the row order changes. */
+	let weekStart = 1;
+	$: heatOrder = Array.from({ length: 7 }, (_, i) => (weekStart + i) % 7);
 
 	$: maxArtist = stats ? Math.max(1, ...stats.top_artists.map((a) => (metric === 'plays' ? a.plays : a.hours))) : 1;
 	$: maxAlbum = stats ? Math.max(1, ...stats.top_albums.map((a) => (metric === 'plays' ? a.plays : a.hours))) : 1;
@@ -59,7 +64,17 @@
 
 	function setRange(r: StatsRange) { range = r; load(); }
 
-	onMount(load);
+	onMount(async () => {
+		// Not awaited together: a missing preference must not stop the stats
+		// themselves loading, and the default order is right for most people.
+		api.getPreferences()
+			.then((p) => {
+				const w = (p as Record<string, unknown>)?.week_start;
+				if (typeof w === 'number') weekStart = ((w % 7) + 7) % 7;
+			})
+			.catch(() => {});
+		await load();
+	});
 </script>
 
 <svelte:head><title>Statistics — Tapedeck</title></svelte:head>
@@ -259,10 +274,10 @@
 				<span></span>
 				{#each Array(24) as _, h}<span class="heat-hour">{h % 6 === 0 ? h : ''}</span>{/each}
 			</div>
-			{#each stats.heatmap as row, di}
+			{#each heatOrder as di}
 				<div class="heat-row">
 					<span class="heat-day">{days[di]}</span>
-					{#each row as c}
+					{#each stats.heatmap[di] as c}
 						<span title={`${c} plays`} class="heat-cell" style="background:rgba(198,113,57,{c === 0 ? 0.06 : 0.15 + 0.8 * (c / maxHeat)});"></span>
 					{/each}
 				</div>
