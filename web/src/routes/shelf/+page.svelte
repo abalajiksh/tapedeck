@@ -24,11 +24,66 @@
 	let searched = false;
 
 	// ── Playing a side ──
+	//
+	// Two ways in, because there are two moments you might reach for this. If
+	// you press *start* when you drop the needle, the start time is observed and
+	// every track lands where it actually played. If you only think of it once
+	// the side has finished, "already played" works it backwards from the
+	// running time — right ordering, right gaps, but a start time nobody saw.
+	//
+	// The spinning state lives in localStorage rather than on the server: a
+	// side in progress is a fact about *this* browser sitting in front of the
+	// turntable, and syncing it would mean a phone in another room claiming the
+	// record is on. It survives a refresh, which is the only durability it
+	// needs.
 	let open: PhysicalRelease | null = null;
 	let openTracks: PhysicalTrack[] = [];
 	let playing = false;
 	let flipPrompt = '';
 	let playMsg = '';
+
+	type Spinning = { releaseId: number; side: string; startedAt: number };
+	let spinning: Spinning | null = null;
+	let nowSec = Math.floor(Date.now() / 1000);
+
+	const SPIN_KEY = 'td-spinning';
+
+	function loadSpinning() {
+		try {
+			const raw = localStorage.getItem(SPIN_KEY);
+			spinning = raw ? (JSON.parse(raw) as Spinning) : null;
+		} catch {
+			spinning = null;
+		}
+	}
+	function saveSpinning(v: Spinning | null) {
+		spinning = v;
+		try {
+			if (v) localStorage.setItem(SPIN_KEY, JSON.stringify(v));
+			else localStorage.removeItem(SPIN_KEY);
+		} catch { /* private mode — the state is still live in memory */ }
+	}
+
+	function startSide(side: string) {
+		if (!open) return;
+		playMsg = '';
+		flipPrompt = '';
+		saveSpinning({ releaseId: open.id, side, startedAt: Math.floor(Date.now() / 1000) });
+	}
+
+	/** Elapsed and remaining for the side currently on. */
+	$: spinElapsed = spinning ? Math.max(0, nowSec - spinning.startedAt) : 0;
+	$: spinTotal = spinning ? sideSecs(spinning.side, spinRelease) : 0;
+	$: spinLeft = Math.max(0, spinTotal - spinElapsed);
+	$: spinPct = spinTotal ? Math.min(100, (spinElapsed / spinTotal) * 100) : 0;
+	/** Is the side that's on the one belonging to the record being shown? */
+	$: spinHere = !!(spinning && open && spinning.releaseId === open.id);
+	/** The record that's on, whichever one it is. */
+	$: spinRelease = spinning ? shelf.find((r) => r.id === spinning?.releaseId) ?? null : null;
+	/** Something is on, but you're looking at a different record. Without this
+	 *  the deck is invisible and every Start button is dead for no stated
+	 *  reason — which is exactly what it looked like in testing. */
+	$: spinElsewhere = !!(spinning && !spinHere);
 
 	$: sides = [...new Set(openTracks.map((t) => t.side))].sort();
 	$: shown = shelf.filter((r) => filter === 'all' || r.kind === filter);
@@ -97,12 +152,12 @@
 		}
 	}
 
-	async function play(side: string) {
+	async function play(side: string, startedAt?: number) {
 		if (!open) return;
 		playing = true;
 		playMsg = '';
 		try {
-			const r = await api.playSide(open.id, { side });
+			const r = await api.playSide(open.id, { side, started_at: startedAt });
 			playMsg = r.listens_added
 				? `Side ${side} — ${r.listens_added} listen${r.listens_added === 1 ? '' : 's'} recorded.`
 				: `Side ${side} was already recorded at that time.`;
@@ -110,6 +165,7 @@
 			// away from the screen while it plays, and the next thing you do is
 			// turn it over.
 			flipPrompt = r.next_side ?? '';
+			saveSpinning(null);
 			await load();
 			const fresh = shelf.find((x) => x.id === open?.id);
 			if (fresh) open = fresh;
@@ -130,13 +186,28 @@
 		}
 	}
 
-	function sideSecs(side: string): number {
-		return openTracks
-			.filter((t) => t.side === side)
-			.reduce((n, t) => n + (t.duration_secs ?? 180), 0);
+	function sideSecs(side: string, release?: PhysicalRelease | null): number {
+		// Defaults to the open record's tracks, but takes any record — the
+		// countdown has to keep running while you browse the rest of the shelf.
+		let list = openTracks;
+		if (release && release.id !== open?.id) {
+			try {
+				list = JSON.parse(release.tracks) as PhysicalTrack[];
+			} catch {
+				list = [];
+			}
+		}
+		return list.filter((t) => t.side === side).reduce((n, t) => n + (t.duration_secs ?? 180), 0);
 	}
 
-	onMount(load);
+	onMount(() => {
+		loadSpinning();
+		// Drives the countdown and the "side is over" prompt. One second is the
+		// right resolution for a twenty-minute side and costs nothing.
+		const tick = setInterval(() => (nowSec = Math.floor(Date.now() / 1000)), 1000);
+		load();
+		return () => clearInterval(tick);
+	});
 </script>
 
 <svelte:head><title>Vinyl & Tape — Tapedeck</title></svelte:head>
@@ -234,6 +305,20 @@
 	</div>
 {/if}
 
+{#if spinElsewhere && spinning}
+	<button class="nowon" on:click={() => spinRelease && openRelease(spinRelease)}>
+		<span class="pip"></span>
+		<span style="flex:1;min-width:0;text-align:left;">
+			<strong>Side {spinning.side} is on</strong>
+			{#if spinRelease}— {spinRelease.title}{/if}
+			<span style="color:var(--td-muted);font-variant-numeric:tabular-nums;">
+				· {formatDuration(spinElapsed)} / {formatDuration(spinTotal)}
+			</span>
+		</span>
+		<span style="color:var(--td-muted-2);font-size:12.5px;">Open it →</span>
+	</button>
+{/if}
+
 <div style="display:flex;gap:8px;margin:18px 0;">
 	{#each ['all', 'vinyl', 'cassette'] as f}
 		<button class="chip" class:on={filter === f} on:click={() => (filter = f as Filter)}>
@@ -306,6 +391,67 @@
 				from a lookup that has one.
 			</p>
 		{:else}
+			{#if spinHere && spinning}
+				<div class="deck" class:done={spinLeft === 0}>
+					{#if open.kind === 'vinyl'}
+						<!-- A platter, turning at 33⅓ — one revolution every 1.8s,
+						     which is the real speed rather than a decorative one. -->
+						<svg viewBox="0 0 80 80" width="76" height="76" class="platter" aria-hidden="true">
+							<circle cx="40" cy="40" r="38" fill="#201e1d" />
+							<circle cx="40" cy="40" r="38" fill="none" stroke="var(--td-accent)" stroke-width="1.5" opacity=".5" />
+							{#each [30, 24, 18] as r}
+								<circle cx="40" cy="40" r={r} fill="none" stroke="#3a3532" stroke-width="1" />
+							{/each}
+							<circle cx="40" cy="40" r="13" fill="var(--td-accent)" />
+							<circle cx="40" cy="40" r="2.5" fill="#201e1d" />
+							<!-- The mark that makes the rotation visible at all. -->
+							<rect x="39" y="4" width="2" height="10" rx="1" fill="var(--td-accent-hi, #e8a06a)" />
+						</svg>
+					{:else}
+						<!-- Two reels, the take-up one filling as the tape runs. -->
+						<svg viewBox="0 0 100 60" width="92" height="56" aria-hidden="true">
+							<rect x="2" y="6" width="96" height="48" rx="7" fill="#201e1d"
+								stroke="var(--td-accent)" stroke-width="1.5" opacity=".9" />
+							<rect x="18" y="18" width="64" height="24" rx="4" fill="#15130f" />
+							{#each [32, 68] as cx}
+								<g class="reel" style="transform-origin:{cx}px 30px;">
+									<circle cx={cx} cy="30" r="10" fill="none" stroke="#6a6259" stroke-width="2.5" />
+									<circle cx={cx} cy="30" r="4.5" fill="var(--td-accent)" />
+									{#each [0, 60, 120] as a}
+										<rect x={cx - 0.9} y="21" width="1.8" height="7" rx="0.9" fill="#8a8078"
+											style="transform-origin:{cx}px 30px;transform:rotate({a}deg);" />
+									{/each}
+								</g>
+							{/each}
+						</svg>
+					{/if}
+
+					<div style="flex:1;min-width:0;">
+						<div style="font-size:11px;letter-spacing:.16em;text-transform:uppercase;color:#c67139;font-weight:600;">
+							{spinLeft === 0 ? 'Side finished' : `Side ${spinning.side} playing`}
+						</div>
+						<div class="h-display" style="font-size:19px;margin-top:2px;">
+							{open.title}
+						</div>
+						<div style="font-variant-numeric:tabular-nums;font-size:13px;color:var(--td-muted);margin-top:4px;">
+							{formatDuration(spinElapsed)} / {formatDuration(spinTotal)}
+							{#if spinLeft > 0}· {formatDuration(spinLeft)} left{/if}
+						</div>
+						<div style="height:6px;border-radius:999px;background:var(--td-track);overflow:hidden;margin-top:8px;">
+							<div style="height:100%;width:{spinPct}%;border-radius:999px;background:linear-gradient(90deg,var(--td-accent-2),var(--td-accent-hi));transition:width 1s linear;"></div>
+						</div>
+					</div>
+
+					<div style="display:flex;flex-direction:column;gap:6px;">
+						<button class="btn btn-primary" disabled={playing}
+							on:click={() => spinning && play(spinning.side, spinning.startedAt)}>
+							{playing ? '…' : spinLeft === 0 ? 'Record it' : 'Stop & record'}
+						</button>
+						<button class="btn btn-secondary" on:click={() => saveSpinning(null)}>Cancel</button>
+					</div>
+				</div>
+			{/if}
+
 			{#if flipPrompt}
 				<div class="flip">
 					<span style="font-size:20px;">↻</span>
@@ -343,18 +489,25 @@
 								</li>
 							{/each}
 						</ol>
-						<button class="btn btn-primary" style="margin-top:12px;width:100%;"
-							disabled={playing} on:click={() => play(side)}>
-							{playing ? '…' : `Played side ${side}`}
-						</button>
+						<div style="display:flex;gap:6px;margin-top:12px;">
+							<button class="btn btn-primary" style="flex:1;"
+								disabled={playing || !!spinning} on:click={() => startSide(side)}>
+								Start side {side}
+							</button>
+							<button class="btn btn-secondary" title="Record it now, working the start time back from the running time"
+								disabled={playing || !!spinning} on:click={() => play(side)}>
+								Already played
+							</button>
+						</div>
 					</div>
 				{/each}
 			</div>
 
 			<p style="font-size:12px;color:var(--td-muted-2);margin:16px 0 0;">
-				Press it when the side finishes. Each track is recorded at the time it
-				would have played, worked out from the running order — you know when the
-				side started, not when track three did.
+				<strong>Start</strong> when you drop the needle and the start time is the
+				real one. <strong>Already played</strong> works it backwards from the
+				running time instead — the order and the gaps are right, but no one saw
+				the clock.
 			</p>
 		{/if}
 	</div>
@@ -402,6 +555,55 @@
 		border-radius: 14px;
 		padding: 14px;
 	}
+	/* The deck only moves while a side is actually on — a still platter is the
+	   honest signal that nothing is playing, the same rule the dashboard's reels
+	   follow. */
+	.deck {
+		display: flex;
+		gap: 16px;
+		align-items: center;
+		margin-top: 16px;
+		padding: 14px 16px;
+		border-radius: 16px;
+		border: 1px solid var(--td-accent);
+		background: color-mix(in srgb, var(--td-accent) 7%, transparent);
+		flex-wrap: wrap;
+	}
+	.deck.done { border-style: dashed; }
+	/* Shown when a side is on but you're looking elsewhere on the shelf. */
+	.nowon {
+		display: flex;
+		align-items: center;
+		gap: 10px;
+		width: 100%;
+		margin: 16px 0 0;
+		padding: 10px 14px;
+		border-radius: 12px;
+		border: 1px solid var(--td-accent);
+		background: color-mix(in srgb, var(--td-accent) 7%, transparent);
+		color: inherit;
+		font-size: 13.5px;
+		cursor: pointer;
+	}
+	.pip {
+		width: 8px;
+		height: 8px;
+		border-radius: 50%;
+		background: var(--td-accent);
+		animation: td-blink 1.6s ease-in-out infinite;
+		flex: none;
+	}
+	@media (prefers-reduced-motion: reduce) { .pip { animation: none; } }
+	/* 33⅓ rpm is one turn per 1.8s. Using the real speed costs nothing and is
+	   the sort of detail this app is for. */
+	.platter { animation: td-spin 1.8s linear infinite; }
+	.deck :global(.reel) { animation: td-spin 2.4s linear infinite; }
+	.deck.done .platter,
+	.deck.done :global(.reel) { animation-play-state: paused; }
+	@media (prefers-reduced-motion: reduce) {
+		.platter, .deck :global(.reel) { animation: none; }
+	}
+
 	/* The flip reminder is the one thing you look for after walking back to the
 	   deck, so it gets accent treatment rather than sitting in the list. */
 	.flip {
