@@ -22,6 +22,7 @@
 		{ id: 'connections', label: 'Connections', hint: 'Where listens are forwarded' },
 		{ id: 'tokens', label: 'API Tokens', hint: 'Scrobble clients' },
 		{ id: 'data', label: 'Data', hint: 'Export, backup, wipe' },
+		{ id: 'sanitiser', label: 'Sanitiser', hint: 'Fix split albums, artists and credits' },
 		{ id: 'maintenance', label: 'Maintenance', hint: 'Enrichment and health' },
 		{ id: 'about', label: 'About', hint: 'Version, sign out' }
 	];
@@ -759,7 +760,7 @@
 			</div>
 		{/if}
 
-		{#if section === 'maintenance'}
+		{#if section === 'sanitiser'}
 			<div class="panel" style="border-radius:22px;padding:24px;margin-bottom:18px;">
 				<h3 class="h-display" style="font-size:19px;margin-bottom:4px;">Metadata Sanitiser</h3>
 				<p style="font-size:13px;color:var(--td-muted);margin:0 0 16px;">
@@ -894,7 +895,9 @@
 					<p style="font-size:13px;color:var(--td-good-fg);margin:12px 0 0;">{sanitizeMsg}</p>
 				{/if}
 			</div>
+		{/if}
 
+		{#if section === 'maintenance'}
 			<div class="panel" style="border-radius:22px;padding:24px;margin-bottom:18px;">
 				<h3 class="h-display" style="font-size:19px;margin-bottom:4px;">Listening Sessions</h3>
 				<p style="font-size:13px;color:var(--td-muted);margin:0 0 16px;">
