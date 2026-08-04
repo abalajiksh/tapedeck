@@ -46,8 +46,9 @@
 		secret: string;
 		username: string;
 		hasSecret: boolean;
-		/** Plex only. Which account on the server to scrobble; '' means the
-		 *  token's own, which is the right default for a personal token. */
+		/** Which account on the server to scrobble; '' means "whatever the
+		 *  credential resolves to", which is right for a personal token and
+		 *  impossible for a Jellyfin API key — hence the picker. */
 		plexAccount: string;
 		filters: { libraries_allow: string; libraries_block: string; devices_allow: string; devices_block: string };
 	};
@@ -127,6 +128,9 @@
 			url: d.url.trim(),
 			...(d.kind === 'navidrome' ? { username: d.username.trim() } : {}),
 			...(d.kind === 'plex' && d.plexAccount.trim() ? { plex_account: d.plexAccount.trim() } : {}),
+			...(d.kind === 'jellyfin' && d.plexAccount.trim()
+				? { jellyfin_account: d.plexAccount.trim() }
+				: {}),
 			...secretPayload(d),
 			libraries_allow: split(d.filters.libraries_allow),
 			libraries_block: split(d.filters.libraries_block),
@@ -330,18 +334,23 @@
 						{#if test.account_error}
 							<div style="color:#b2622d;margin-top:6px;">✗ Could not identify the account: {test.account_error}</div>
 						{/if}
-						{#if draft && draft.kind === 'plex' && test.accounts && test.accounts.length > 1}
+						{#if draft && (draft.kind === 'plex' || draft.kind === 'jellyfin') && test.accounts && (test.accounts.length > 1 || (draft.kind === 'jellyfin' && !test.account))}
 							<div class="field" style="margin-top:12px;max-width:340px;">
-								<label for="f-plexacct">Scrobble which Plex account?</label>
+								<label for="f-plexacct">Scrobble which {kindLabel(draft.kind)} account?</label>
 								<select id="f-plexacct" class="input" bind:value={draft.plexAccount}>
-									<option value="">{test.account ? `${test.account} (this token)` : 'Whoever this token belongs to'}</option>
+									<option value="">{test.account ? `${test.account} (this credential)` : '— pick an account —'}</option>
 									{#each test.accounts as a (a.id)}
 										<option value={a.name}>{a.name}</option>
 									{/each}
 								</select>
 								<p style="color:var(--td-muted);font-size:12px;margin-top:6px;">
-									Only this account's sessions are recorded. Pick a different one when
-									the token is the server owner's but the listening isn't.
+									{#if draft.kind === 'jellyfin' && !test.account}
+										A Jellyfin API key isn't tied to a user, so the server can't say whose
+										listens these are — pick the account to record.
+									{:else}
+										Only this account's sessions are recorded. Pick a different one when
+										the credential is the server owner's but the listening isn't.
+									{/if}
 								</p>
 							</div>
 						{/if}

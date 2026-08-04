@@ -112,6 +112,12 @@ struct SourceUpdate {
     /// all. Validated against `/accounts` on save — a name that isn't on the
     /// server would match no session and scrobble nothing, silently.
     plex_account: Option<String>,
+    /// Which Jellyfin account's sessions to scrobble.
+    ///
+    /// Needed more often than the Plex equivalent: a dashboard API key belongs
+    /// to no user at all, so `/Users/Me` answers 400 and there is nothing to
+    /// infer from. Only a token minted by a user login resolves on its own.
+    jellyfin_account: Option<String>,
 }
 
 /// Everything a save needs, resolved from the body and whatever is stored.
@@ -236,7 +242,33 @@ async fn resolve_save(
                 || current.and_then(|c| c.credential("api_key")).as_deref()
                     != Some(jf_key.as_str())
                 || remote_account.is_none();
-            if complete && changed {
+            let chosen = body.jellyfin_account.take().filter(|a| !a.trim().is_empty());
+            if let Some(chosen) = chosen {
+                if complete {
+                    match JellyfinSource::list_accounts(&url, &jf_key).await {
+                        Ok(accounts) => match accounts
+                            .iter()
+                            .find(|a| a.name.eq_ignore_ascii_case(chosen.trim()))
+                        {
+                            // Store the server's spelling — sessions match on it.
+                            Some(found) => remote_account = Some(found.name.clone()),
+                            None => {
+                                return Err(err(
+                                    400,
+                                    format!(
+                                        "No Jellyfin account called \"{}\" on that server. \
+                                         Tapedeck would scrobble nothing.",
+                                        chosen.trim()
+                                    ),
+                                ))
+                            }
+                        },
+                        Err(e) => {
+                            return Err(err(400, format!("Could not list Jellyfin accounts: {e}")))
+                        }
+                    }
+                }
+            } else if complete && changed {
                 match JellyfinSource::resolve_account(&url, &jf_key).await {
                     Ok(name) => remote_account = Some(name),
                     Err(e) => {
@@ -456,11 +488,32 @@ async fn test_source(
             if url.is_empty() || key.is_empty() {
                 return err(400, "Enter a server URL and API key first");
             }
+            // Listed first: with a dashboard API key `resolve_account` cannot
+            // answer on its own, and the list is what the picker needs anyway.
+            let accounts = JellyfinSource::list_accounts(&url, &key).await.unwrap_or_default();
             match JellyfinSource::resolve_account(&url, &key).await {
-                Ok(name) => {
-                    (StatusCode::OK, Json(serde_json::json!({ "ok": true, "account": name })))
-                        .into_response()
-                }
+                Ok(name) => (
+                    StatusCode::OK,
+                    Json(serde_json::json!({
+                        "ok": true, "account": name, "accounts": accounts,
+                    })),
+                )
+                    .into_response(),
+                // Reaching the server but not being able to name the account is
+                // a different thing from an unreachable server, and with a list
+                // in hand it is recoverable — the caller picks. Reported as a
+                // successful connection with an account error, the same shape
+                // Plex uses.
+                Err(e) if !accounts.is_empty() => (
+                    StatusCode::OK,
+                    Json(serde_json::json!({
+                        "ok": true,
+                        "account": serde_json::Value::Null,
+                        "account_error": e.to_string(),
+                        "accounts": accounts,
+                    })),
+                )
+                    .into_response(),
                 Err(e) => (
                     StatusCode::OK,
                     Json(serde_json::json!({ "ok": false, "error": e.to_string() })),

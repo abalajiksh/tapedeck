@@ -311,8 +311,10 @@ export interface SourceTestResult {
 	libraries?: string[];
 	account?: string | null;
 	account_error?: string | null;
-	/** Every account on the Plex server, for the "scrobble as" picker. Empty
-	 *  when the token may not read /accounts — the picker just isn't offered. */
+	/** Every account on the server, for the "scrobble as" picker. Empty when
+	 *  the credential may not list them — the picker just isn't offered.
+	 *  Jellyfin needs this more than Plex: a dashboard API key belongs to no
+	 *  user, so the server cannot name an account on its own. */
 	accounts?: PlexAccount[];
 	error?: string;
 }

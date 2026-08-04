@@ -31,6 +31,14 @@ const TICKS_PER_SECOND: u64 = 10_000_000;
 const SCROBBLE_FRACTION: f64 = 0.5;
 const SCROBBLE_AFTER_SECS: u64 = 240;
 
+/// An account on the Jellyfin server. Sessions are matched on `name`, which is
+/// what `SessionInfo.UserName` carries.
+#[derive(Debug, Clone, serde::Serialize, Deserialize)]
+pub struct JellyfinAccount {
+    pub id: String,
+    pub name: String,
+}
+
 pub struct JellyfinSource {
     url: String,
     api_key: String,
@@ -188,13 +196,81 @@ impl JellyfinSource {
         if resp.status() == StatusCode::UNAUTHORIZED {
             return Err("Jellyfin rejected that API key".into());
         }
-        if !resp.status().is_success() {
-            return Err(format!("Jellyfin returned {}", resp.status()).into());
+
+        // `/Users/Me` only answers for a token minted by a *user* login. An API
+        // key created in the dashboard is server-scoped and belongs to nobody,
+        // so Jellyfin cannot resolve "Me" and answers 400 — which is what every
+        // connection test with an API key hit. Not an error to report: it just
+        // means the account has to be named rather than inferred.
+        if resp.status().is_success() {
+            let me: Me = resp.json().await?;
+            if let Some(name) = me.name.filter(|n| !n.trim().is_empty()) {
+                return Ok(name);
+            }
         }
-        let me: Me = resp.json().await?;
-        me.name
-            .filter(|n| !n.trim().is_empty())
-            .ok_or_else(|| "Jellyfin did not report a username for that key".into())
+
+        let users = Self::list_accounts(url, api_key).await?;
+        match users.len() {
+            0 => Err("Jellyfin reported no users for that key".into()),
+            // One user is unambiguous, so don't make them pick.
+            1 => Ok(users.into_iter().next().expect("checked").name),
+            _ => Err(format!(
+                "That API key isn't tied to a user, and this server has {}.                  Choose which account's listens to record.",
+                users.len()
+            )
+            .into()),
+        }
+    }
+
+    /// Every enabled account on the server, for the source-setup picker.
+    ///
+    /// Disabled users are dropped: they cannot play anything, so offering them
+    /// would only be a way to configure a source that never scrobbles.
+    pub async fn list_accounts(
+        url: &str,
+        api_key: &str,
+    ) -> Result<Vec<JellyfinAccount>, Box<dyn std::error::Error + Send + Sync>> {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "PascalCase")]
+        struct Policy {
+            #[serde(default)]
+            is_disabled: bool,
+        }
+        #[derive(Deserialize)]
+        #[serde(rename_all = "PascalCase")]
+        struct User {
+            id: String,
+            name: String,
+            #[serde(default)]
+            policy: Option<Policy>,
+        }
+
+        let client = Client::builder()
+            .timeout(Duration::from_secs(10))
+            .user_agent(format!("{}/{}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION")))
+            .build()?;
+
+        let resp = client
+            .get(format!("{}/Users", url.trim_end_matches('/')))
+            .header("X-Emby-Token", api_key)
+            .header("Accept", "application/json")
+            .send()
+            .await?;
+
+        if resp.status() == StatusCode::UNAUTHORIZED {
+            return Err("Jellyfin rejected that API key".into());
+        }
+        if !resp.status().is_success() {
+            return Err(format!("Jellyfin returned {} listing users", resp.status()).into());
+        }
+
+        let users: Vec<User> = resp.json().await?;
+        Ok(users
+            .into_iter()
+            .filter(|u| !u.policy.as_ref().is_some_and(|p| p.is_disabled))
+            .filter(|u| !u.name.trim().is_empty())
+            .map(|u| JellyfinAccount { id: u.id, name: u.name })
+            .collect())
     }
 
     /// Confirm the server answers and the key is good.
@@ -417,6 +493,56 @@ impl MusicSource for JellyfinSource {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `/Users` is the fallback that makes a dashboard API key usable at all —
+    /// `/Users/Me` answers 400 for one, because a server-scoped key belongs to
+    /// no user. Pinned against a real 10.11.11 response: these names are
+    /// PascalCase and a mismatch would be silent, leaving the picker empty and
+    /// the source unconfigurable with no error to explain it.
+    #[test]
+    fn the_users_list_parses_a_real_response() {
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "PascalCase")]
+        struct Policy {
+            #[serde(default)]
+            is_disabled: bool,
+        }
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "PascalCase")]
+        struct User {
+            id: String,
+            name: String,
+            #[serde(default)]
+            policy: Option<Policy>,
+        }
+
+        let body = r#"[
+            {
+                "Name": "abalaji",
+                "ServerId": "f61075a77ace44edb6a28a67eb9cfef0",
+                "Id": "2ed208b8f7314587915b25f0602d8df8",
+                "HasPassword": true,
+                "Policy": { "IsAdministrator": true, "IsHidden": true, "IsDisabled": false }
+            },
+            {
+                "Name": "retired",
+                "Id": "0000",
+                "Policy": { "IsAdministrator": false, "IsDisabled": true }
+            }
+        ]"#;
+
+        let users: Vec<User> = serde_json::from_str(body).expect("parses");
+        assert_eq!(users.len(), 2);
+        assert_eq!(users[0].name, "abalaji");
+        assert_eq!(users[0].id, "2ed208b8f7314587915b25f0602d8df8");
+
+        // A disabled account can't play anything, so offering it would only be
+        // a way to configure a source that never scrobbles.
+        let live: Vec<&User> =
+            users.iter().filter(|u| !u.policy.as_ref().is_some_and(|p| p.is_disabled)).collect();
+        assert_eq!(live.len(), 1);
+        assert_eq!(live[0].name, "abalaji");
+    }
 
     fn item(id: &str, secs: u64) -> NowPlayingItem {
         NowPlayingItem {
