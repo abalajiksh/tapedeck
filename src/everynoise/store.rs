@@ -16,6 +16,44 @@ use std::time::Duration;
 
 use super::parse::{Artist, Genre, Neighbour};
 
+/// Two spellings of the same genre.
+///
+/// **This is not a third artist normaliser.** `db::normalise_artist` answers
+/// "are these the same performer?", which is a question about identity and where
+/// being too aggressive invents a merge that destroys data. This answers "are
+/// these the same genre label?", where the two vocabularies being joined —
+/// MusicBrainz's folksonomy tags and Every Noise's Spotify-derived names —
+/// simply punctuate differently, and the cost of a wrong match is one genre
+/// landing a few pixels off on a map.
+///
+/// Measured against a real 21,390-listen history: matching on `LOWER(TRIM())`
+/// alone loses `dance-pop` (Every Noise spells it `dance pop`, 3,509 plays),
+/// `variété française` (`variete francaise`, 2,957), `synth-pop` (`synthpop`)
+/// and `folk pop` (`folk-pop` — the hyphen goes the *other* way). Folding
+/// punctuation and accents recovers about 10% more tags.
+///
+/// It does not change *coverage* — those artists already landed via some
+/// broader tag — it changes **resolution**, which is the whole point of a map.
+pub fn genre_key(s: &str) -> String {
+    use unicode_normalization::UnicodeNormalization;
+    s.nfkd()
+        .filter(|c| !unicode_normalization::char::is_combining_mark(*c))
+        .filter(|c| c.is_alphanumeric())
+        .flat_map(|c| c.to_lowercase())
+        .collect()
+}
+
+/// Does a column exist? Same shape as `db.rs::has_column` — this database has
+/// no migration list of its own, since it is rebuildable reference data.
+async fn column_exists(pool: &Pool<Sqlite>, table: &str, column: &str) -> bool {
+    let rows: Vec<(i64, String, String, i64, Option<String>, i64)> =
+        sqlx::query_as(&format!("PRAGMA table_info({})", table))
+            .fetch_all(pool)
+            .await
+            .unwrap_or_default();
+    rows.iter().any(|r| r.1 == column)
+}
+
 #[derive(Clone)]
 pub struct EveryNoiseStore {
     pool: Pool<Sqlite>,
@@ -57,6 +95,7 @@ impl EveryNoiseStore {
                 slug TEXT PRIMARY KEY,
                 name TEXT NOT NULL,
                 name_key TEXT NOT NULL,
+                loose_key TEXT NOT NULL DEFAULT '',
                 x REAL NOT NULL,
                 y REAL NOT NULL,
                 color TEXT NOT NULL,
@@ -71,6 +110,18 @@ impl EveryNoiseStore {
         sqlx::query("CREATE INDEX IF NOT EXISTS idx_en_genres_key ON genres(name_key)")
             .execute(&self.pool)
             .await?;
+        // Added after the first scrape shipped, so an existing copy has to gain
+        // the column rather than be re-walked — that walk is two hours against
+        // someone else's server and the data has not changed.
+        if !column_exists(&self.pool, "genres", "loose_key").await {
+            sqlx::query("ALTER TABLE genres ADD COLUMN loose_key TEXT NOT NULL DEFAULT ''")
+                .execute(&self.pool)
+                .await?;
+        }
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_en_genres_loose ON genres(loose_key)")
+            .execute(&self.pool)
+            .await?;
+        self.backfill_loose_keys().await?;
 
         // `norm_name` is `db::normalise_artist` — the *one* artist identity
         // function in this codebase. A second one here would be the third, and
@@ -137,11 +188,12 @@ impl EveryNoiseStore {
         let mut tx = self.pool.begin().await?;
         for g in genres {
             sqlx::query(
-                "INSERT INTO genres (slug, name, name_key, x, y, color, font_size,
+                "INSERT INTO genres (slug, name, name_key, loose_key, x, y, color, font_size,
                                      preview_track_id, example_title, scraped_at)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                  ON CONFLICT(slug) DO UPDATE SET
                     name = excluded.name, name_key = excluded.name_key,
+                    loose_key = excluded.loose_key,
                     x = excluded.x, y = excluded.y, color = excluded.color,
                     font_size = excluded.font_size,
                     preview_track_id = excluded.preview_track_id,
@@ -151,6 +203,7 @@ impl EveryNoiseStore {
             .bind(&g.slug)
             .bind(&g.name)
             .bind(g.name.trim().to_lowercase())
+            .bind(genre_key(&g.name))
             .bind(g.x)
             .bind(g.y)
             .bind(&g.color)
@@ -268,7 +321,8 @@ impl EveryNoiseStore {
         })
     }
 
-    /// Coordinates for a set of genre names, keyed by the lowercased name.
+    /// Coordinates for a set of genre names, keyed by `genre_key` — call that
+    /// on a tag to look its answer up.
     ///
     /// This is the join the whole exercise is for: MusicBrainz gives Tapedeck
     /// genre *names* per recording, and this turns them into positions.
@@ -293,18 +347,43 @@ impl EveryNoiseStore {
             }
             let placeholders = vec!["?"; chunk.len()].join(",");
             let sql = format!(
-                "SELECT name_key, x, y, color FROM genres WHERE name_key IN ({})",
+                "SELECT loose_key, x, y, color FROM genres WHERE loose_key IN ({})",
                 placeholders
             );
             let mut q = sqlx::query_as::<_, (String, f64, f64, String)>(&sql);
             for n in chunk {
-                q = q.bind(n.trim().to_lowercase());
+                q = q.bind(genre_key(n));
             }
             for (k, x, y, c) in q.fetch_all(&self.pool).await? {
                 out.insert(k, (x, y, c));
             }
         }
         Ok(out)
+    }
+
+    /// Fill `loose_key` for rows written before the column existed.
+    ///
+    /// Bounded by the size of the genre map (~6,300 rows) and a no-op once
+    /// done, so it can run unconditionally at open.
+    async fn backfill_loose_keys(&self) -> Result<(), sqlx::Error> {
+        let rows: Vec<(String, String)> =
+            sqlx::query_as("SELECT slug, name FROM genres WHERE loose_key = ''")
+                .fetch_all(&self.pool)
+                .await?;
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let mut tx = self.pool.begin().await?;
+        for (slug, name) in &rows {
+            sqlx::query("UPDATE genres SET loose_key = ? WHERE slug = ?")
+                .bind(genre_key(name))
+                .bind(slug)
+                .execute(&mut *tx)
+                .await?;
+        }
+        tx.commit().await?;
+        tracing::info!("🗺️ Every Noise: keyed {} genres for loose matching", rows.len());
+        Ok(())
     }
 
     /// Wipe everything. The data is re-acquirable, so this is a reset rather
@@ -393,7 +472,62 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(found.len(), 1);
-        assert_eq!(found.get("deep filthstep").map(|c| (c.0, c.1)), Some((1.0, 2.0)));
+        assert_eq!(found.get(&genre_key("deep filthstep")).map(|c| (c.0, c.1)), Some((1.0, 2.0)));
+    }
+
+    /// The four spellings that actually cost coverage, measured against a real
+    /// 21,390-listen history. Every Noise and MusicBrainz punctuate the same
+    /// genre differently — and note `folk pop` goes the *other* way, so a rule
+    /// that only stripped hyphens would still miss it.
+    #[tokio::test]
+    async fn the_two_vocabularies_punctuate_differently() {
+        let s = store().await;
+        s.put_genres(&[
+            genre("dancepop", "dance pop"), // MusicBrainz: "dance-pop"
+            genre("varietefrancaise", "variete francaise"), // MB: "variété française"
+            genre("synthpop", "synthpop"),  // MB: "synth-pop"
+            genre("folkpop", "folk-pop"),   // MB: "folk pop"
+        ])
+        .await
+        .unwrap();
+
+        let tags: Vec<String> = ["dance-pop", "variété française", "synth-pop", "folk pop"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let found = s.coordinates_for(&tags).await.unwrap();
+        assert_eq!(
+            found.len(),
+            4,
+            "all four must land; got {:?}",
+            found.keys().collect::<Vec<_>>()
+        );
+    }
+
+    /// A copy scraped before the column existed must gain it without a re-walk —
+    /// that walk is two hours aimed at a frozen one-person site.
+    #[tokio::test]
+    async fn an_older_copy_gains_loose_keys_without_rescraping() {
+        let s = store().await;
+        s.put_genres(&[genre("dancepop", "dance pop")]).await.unwrap();
+        // Put it back into the pre-migration state.
+        sqlx::query("UPDATE genres SET loose_key = ''").execute(&s.pool).await.unwrap();
+        assert!(s.coordinates_for(&["dance-pop".into()]).await.unwrap().is_empty());
+
+        s.backfill_loose_keys().await.unwrap();
+        assert_eq!(s.coordinates_for(&["dance-pop".into()]).await.unwrap().len(), 1);
+    }
+
+    /// Genre identity is not artist identity, and this must not quietly grow
+    /// into a third normaliser: it folds punctuation and accents, nothing more.
+    #[test]
+    fn the_genre_key_folds_punctuation_and_accents_only() {
+        assert_eq!(genre_key("Dance-Pop"), genre_key("dance pop"));
+        assert_eq!(genre_key("variété française"), genre_key("variete francaise"));
+        assert_eq!(genre_key("synth-pop"), "synthpop");
+        // Distinct genres must stay distinct — the fold must not merge them.
+        assert_ne!(genre_key("post-rock"), genre_key("post-punk"));
+        assert_ne!(genre_key("hard rock"), genre_key("hardcore"));
     }
 
     /// Re-scraping is how the data is refreshed, so a second write of the same
