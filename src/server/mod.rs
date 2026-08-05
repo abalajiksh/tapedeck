@@ -16,6 +16,7 @@ pub mod now_playing;
 pub mod physical;
 mod preferences;
 pub mod ratelimit;
+pub mod rediscovery;
 pub mod scrobbles;
 mod sessions;
 mod sources;
@@ -89,6 +90,7 @@ pub fn build_app(state: Arc<AppState>) -> Router {
         .merge(metrics::create_metrics_router())
         .merge(sessions::create_sessions_router())
         .merge(physical::create_physical_router())
+        .merge(rediscovery::create_rediscovery_router())
         .with_state(state);
 
     // The SPA is the fallback, not a `/*path` route: a route would only answer

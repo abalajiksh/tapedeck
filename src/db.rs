@@ -176,6 +176,22 @@ pub struct ImportHistoryRow {
     pub created_at: i64,
 }
 
+/// One suggestion on the Rediscovery screen.
+///
+/// Same shape whichever list produced it, so the page renders one row type and
+/// the reason lives on the list rather than the item.
+#[derive(Debug, Clone, sqlx::FromRow, serde::Serialize)]
+pub struct RediscoveryRow {
+    pub name: String,
+    pub artist: String,
+    pub album: Option<String>,
+    pub plays: i64,
+    pub last_played: Option<i64>,
+    pub artwork_url: Option<String>,
+    pub caa_id: Option<i64>,
+    pub caa_release_mbid: Option<String>,
+}
+
 /// A record or tape you own.
 ///
 /// Distinct from an `entity`, which is a work you have listened to: this is an
@@ -3457,6 +3473,190 @@ impl Database {
     /// Images for a set of artist names, keyed by the same normalised form the
     /// table uses. Returned as a map so a stats page can decorate its rows with
     /// one query rather than one per artist.
+    // ════════════════════════════════════════════════════════════
+    //  Rediscovery
+    // ════════════════════════════════════════════════════════════
+    //
+    // Every list here answers "something you already chose, that you are not
+    // choosing now". None of them recommend music you don't own — that is a
+    // different product, and it needs a corpus this app deliberately doesn't
+    // have. What it does have is your own history, which is enough to notice
+    // what has slipped.
+    //
+    // All of them exclude skips, like every other counting query.
+
+    /// Played a lot once, not lately.
+    ///
+    /// The bar is relative rather than absolute: "a lot" means it is in the
+    /// upper half of what you play at all, so a modest library still produces
+    /// a list. `quiet_since` is the cutoff for "not lately".
+    pub async fn forgotten_favourites(
+        &self,
+        user_id: i64,
+        quiet_since: i64,
+        limit: i64,
+    ) -> Result<Vec<RediscoveryRow>, sqlx::Error> {
+        sqlx::query_as(
+            "SELECT title AS name, artist, MAX(album) AS album, COUNT(*) AS plays,
+                    MAX(timestamp) AS last_played,
+                    MAX(artwork_url) AS artwork_url, MAX(caa_id) AS caa_id,
+                    MAX(caa_release_mbid) AS caa_release_mbid
+               FROM scrobbles
+              WHERE user_id = ? AND skipped = FALSE
+              GROUP BY LOWER(TRIM(title)), LOWER(TRIM(artist))
+             HAVING COUNT(*) >= 3 AND MAX(timestamp) < ?
+              ORDER BY COUNT(*) DESC, MAX(timestamp) ASC
+              LIMIT ?",
+        )
+        .bind(user_id)
+        .bind(quiet_since)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+    }
+
+    /// Loved, but hardly ever played.
+    ///
+    /// A love is the strongest signal this app collects — you went out of your
+    /// way — so a loved track with two plays is the sharpest "you meant to come
+    /// back to this" it can produce.
+    pub async fn loved_but_unplayed(
+        &self,
+        user_id: i64,
+        limit: i64,
+    ) -> Result<Vec<RediscoveryRow>, sqlx::Error> {
+        sqlx::query_as(
+            "SELECT e.name AS name, e.artist_name AS artist,
+                    (SELECT MAX(s.album) FROM scrobbles s
+                      WHERE s.user_id = l.user_id AND s.skipped = FALSE
+                        AND LOWER(TRIM(s.title)) = LOWER(TRIM(e.name))
+                        AND LOWER(TRIM(s.artist)) = LOWER(TRIM(e.artist_name))) AS album,
+                    (SELECT COUNT(*) FROM scrobbles s
+                      WHERE s.user_id = l.user_id AND s.skipped = FALSE
+                        AND LOWER(TRIM(s.title)) = LOWER(TRIM(e.name))
+                        AND LOWER(TRIM(s.artist)) = LOWER(TRIM(e.artist_name))) AS plays,
+                    (SELECT MAX(s.timestamp) FROM scrobbles s
+                      WHERE s.user_id = l.user_id AND s.skipped = FALSE
+                        AND LOWER(TRIM(s.title)) = LOWER(TRIM(e.name))
+                        AND LOWER(TRIM(s.artist)) = LOWER(TRIM(e.artist_name))) AS last_played,
+                    NULL AS artwork_url, NULL AS caa_id, NULL AS caa_release_mbid
+               FROM loves l JOIN entities e ON e.id = l.entity_id
+              WHERE l.user_id = ? AND e.kind = 'recording'
+              ORDER BY plays ASC, l.created_at DESC
+              LIMIT ?",
+        )
+        .bind(user_id)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+    }
+
+    /// Played exactly once, and long enough ago to have been forgotten.
+    ///
+    /// A record you heard once and never returned to is either a miss or a
+    /// thing you never got round to. This app can't tell which, which is the
+    /// point of showing it to you.
+    pub async fn heard_once(
+        &self,
+        user_id: i64,
+        before: i64,
+        limit: i64,
+    ) -> Result<Vec<RediscoveryRow>, sqlx::Error> {
+        sqlx::query_as(
+            "SELECT title AS name, artist, MAX(album) AS album, COUNT(*) AS plays,
+                    MAX(timestamp) AS last_played,
+                    MAX(artwork_url) AS artwork_url, MAX(caa_id) AS caa_id,
+                    MAX(caa_release_mbid) AS caa_release_mbid
+               FROM scrobbles
+              WHERE user_id = ? AND skipped = FALSE
+              GROUP BY LOWER(TRIM(title)), LOWER(TRIM(artist))
+             HAVING COUNT(*) = 1 AND MAX(timestamp) < ?
+              ORDER BY MAX(timestamp) DESC
+              LIMIT ?",
+        )
+        .bind(user_id)
+        .bind(before)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+    }
+
+    /// What you were playing this time of year, in years gone by.
+    ///
+    /// Month-of-year in the *user's* timezone would be more correct, but the
+    /// window is ±3 weeks wide, so an hour of offset cannot move anything
+    /// across it — and doing it in SQL keeps this one query rather than a scan.
+    /// Excludes the current year, or it would just be "recently played".
+    pub async fn seasonal(
+        &self,
+        user_id: i64,
+        limit: i64,
+    ) -> Result<Vec<RediscoveryRow>, sqlx::Error> {
+        sqlx::query_as(
+            "SELECT title AS name, artist, MAX(album) AS album, COUNT(*) AS plays,
+                    MAX(timestamp) AS last_played,
+                    MAX(artwork_url) AS artwork_url, MAX(caa_id) AS caa_id,
+                    MAX(caa_release_mbid) AS caa_release_mbid
+               FROM scrobbles
+              WHERE user_id = ? AND skipped = FALSE
+                AND STRFTIME('%Y', timestamp, 'unixepoch') <> STRFTIME('%Y', 'now')
+                AND ABS(
+                      CAST(STRFTIME('%j', timestamp, 'unixepoch') AS INTEGER)
+                    - CAST(STRFTIME('%j', 'now') AS INTEGER)
+                    ) <= 21
+              GROUP BY LOWER(TRIM(title)), LOWER(TRIM(artist))
+              ORDER BY COUNT(*) DESC
+              LIMIT ?",
+        )
+        .bind(user_id)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+    }
+
+    /// Things you like that have never been through a given piece of gear.
+    ///
+    /// The join is the reason `chain_id` on a listen matters: a chain names its
+    /// components, so "never heard on the HD 600s" is answerable without any
+    /// per-listen equipment field. Restricted to tracks you have played more
+    /// than once, because the interesting question is what your *favourites*
+    /// sound like on it, not your whole library.
+    pub async fn never_on_gear(
+        &self,
+        user_id: i64,
+        equipment_id: i64,
+        limit: i64,
+    ) -> Result<Vec<RediscoveryRow>, sqlx::Error> {
+        sqlx::query_as(
+            "SELECT title AS name, artist, MAX(album) AS album, COUNT(*) AS plays,
+                    MAX(timestamp) AS last_played,
+                    MAX(artwork_url) AS artwork_url, MAX(caa_id) AS caa_id,
+                    MAX(caa_release_mbid) AS caa_release_mbid
+               FROM scrobbles s
+              WHERE s.user_id = ? AND s.skipped = FALSE
+                AND NOT EXISTS (
+                      SELECT 1 FROM scrobbles s2
+                        JOIN signal_chains c ON c.id = s2.chain_id
+                       WHERE s2.user_id = s.user_id AND s2.skipped = FALSE
+                         AND LOWER(TRIM(s2.title)) = LOWER(TRIM(s.title))
+                         AND LOWER(TRIM(s2.artist)) = LOWER(TRIM(s.artist))
+                         AND EXISTS (
+                               SELECT 1 FROM json_each(c.components) j
+                                WHERE json_extract(j.value, '$.equipment_id') = ?
+                             )
+                    )
+              GROUP BY LOWER(TRIM(s.title)), LOWER(TRIM(s.artist))
+             HAVING COUNT(*) > 1
+              ORDER BY COUNT(*) DESC
+              LIMIT ?",
+        )
+        .bind(user_id)
+        .bind(equipment_id)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+    }
+
     /// The `artists` row id for a name, creating the row if it's new.
     ///
     /// Needed because an artist portrait is served through a proxy keyed by

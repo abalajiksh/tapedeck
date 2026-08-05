@@ -541,6 +541,28 @@ export interface PlayResult {
 	next_side: string | null;
 }
 
+/** One suggestion. Same shape whichever list produced it — the reason lives on
+ *  the list, not the row. */
+export interface RediscoveryRow {
+	name: string;
+	artist: string;
+	album: string | null;
+	plays: number;
+	last_played: number | null;
+	artwork_url: string | null;
+	caa_id: number | null;
+	caa_release_mbid: string | null;
+}
+
+export interface Rediscovery {
+	quiet_days: number;
+	forgotten_favourites: RediscoveryRow[];
+	loved_but_unplayed: RediscoveryRow[];
+	heard_once: RediscoveryRow[];
+	seasonal: RediscoveryRow[];
+	gear: { id: number; name: string; type: string }[];
+}
+
 export interface SanitizePreview {
 	/** Albums whose listens disagree about which release they are. */
 	mixed_albums: MixedAlbum[];
@@ -832,6 +854,14 @@ class TapedeckAPI {
 		split_edits?: { title: string; album: string; from: string; to: string }[];
 	}): Promise<SanitizeResult> {
 		return this.post('/api/v1/sanitize', opts);
+	}
+
+	// ── Rediscovery ──
+	async rediscovery(quietDays?: number): Promise<Rediscovery> {
+		return this.get(`/api/v1/rediscovery${quietDays ? `?quiet_days=${quietDays}` : ''}`);
+	}
+	async neverOnGear(equipmentId: number): Promise<{ rows: RediscoveryRow[] }> {
+		return this.get(`/api/v1/rediscovery/gear/${equipmentId}`);
 	}
 
 	// ── Physical media: records and tapes ──
