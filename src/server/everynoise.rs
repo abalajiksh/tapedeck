@@ -329,6 +329,155 @@ pub async fn genre_map(State(state): State<Arc<AppState>>, user: AuthUser) -> im
         .into_response()
 }
 
+/// A period needs this many placed plays before it gets a point.
+///
+/// A centroid computed from four listens is not a fact about a year, it is a
+/// fact about four listens — and drawn as part of a path it reads as a real
+/// movement in taste. Better to leave the period out and say so.
+const MIN_PLAYS_PER_PERIOD: i64 = 25;
+
+/// Below this many distinct years, bucket by month instead.
+///
+/// Measured on a real history: 21,390 listens spanning 2025–2026 give a yearly
+/// trajectory of **two points**, which is a line segment rather than a story.
+/// The same history by month is ~20 points and an actual path. Granularity has
+/// to follow the data — a fixed choice is wrong at one end or the other.
+const MONTHS_BELOW_YEARS: usize = 4;
+
+/// GET /api/v1/genre-map/trajectory — where your listening sat, year by year.
+///
+/// The play-weighted centroid of each year's genres, which is the closest thing
+/// the data supports to "how your taste moved". Two honesty constraints, both
+/// of which matter more than they look:
+///
+/// * The granularity is really **artist-level**. Every track by one artist
+///   carries that artist's genres and therefore sits at the same point, so this
+///   is an *artist-mix* trajectory. That is still taste evolution — your mix
+///   shifting is the thing — but it is not track-level and should not be
+///   described as such.
+/// * The genre backfill runs newest-first over hours, so a half-enriched
+///   history has recent years populated and older ones empty. A trajectory
+///   slices by time, which makes it the feature most distorted by that: it
+///   would look like the listening only started recently. Each year therefore
+///   reports its own enrichment coverage, and the client says so.
+#[derive(Deserialize)]
+pub struct TrajectoryQuery {
+    /// `year` or `month`. Omitted lets the server pick from the span.
+    pub by: Option<String>,
+}
+
+pub async fn genre_trajectory(
+    State(state): State<Arc<AppState>>,
+    user: AuthUser,
+    axum::extract::Query(q): axum::extract::Query<TrajectoryQuery>,
+) -> impl IntoResponse {
+    let tz = super::scrobbles::user_tz_for(&state, user.user_id).await;
+    // SQLite's `strftime` modifier wants a signed hour offset; derive it from
+    // the zone's *current* offset, which is right to the year boundary except
+    // for a listen inside the DST hour of New Year — which no zone has.
+    let offset_hours = {
+        use chrono::Offset;
+        let now = chrono::Utc::now().with_timezone(&tz);
+        now.offset().fix().local_minus_utc() as f64 / 3600.0
+    };
+
+    // How many distinct years are there? Cheap, and it decides the granularity.
+    let by_year = state.db.listens_by_period(user.user_id, offset_hours, "%Y").await;
+    let year_count = by_year.as_ref().map(|v| v.len()).unwrap_or(0);
+    let unit = match q.by.as_deref() {
+        Some("month") => "month",
+        Some("year") => "year",
+        _ if year_count < MONTHS_BELOW_YEARS => "month",
+        _ => "year",
+    };
+    let fmt = if unit == "month" { "%Y-%m" } else { "%Y" };
+
+    let rows = match state.db.genre_plays_by_period(user.user_id, offset_hours, fmt).await {
+        Ok(r) => r,
+        Err(e) => {
+            error!("Trajectory query failed: {}", e);
+            return err(500, "Could not read your listening over time");
+        }
+    };
+    if rows.is_empty() {
+        return (
+            StatusCode::OK,
+            Json(
+                serde_json::json!({ "years": [], "unit": unit, "note": "no genres resolved yet" }),
+            ),
+        )
+            .into_response();
+    }
+
+    let names: Vec<String> = {
+        let mut n: Vec<String> = rows.iter().map(|(_, g, _)| g.clone()).collect();
+        n.sort();
+        n.dedup();
+        n
+    };
+    let coords = match state.everynoise.coordinates_for(&names).await {
+        Ok(c) => c,
+        Err(e) => {
+            error!("Trajectory join failed: {}", e);
+            return err(500, "Could not place your listening on the map");
+        }
+    };
+
+    // Coverage per year, so a thin year can be labelled rather than drawn as if
+    // it were complete.
+    let coverage: std::collections::HashMap<String, (i64, i64)> = state
+        .db
+        .listens_by_period(user.user_id, offset_hours, fmt)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(y, listens, enriched)| (y, (listens, enriched)))
+        .collect();
+
+    // Accumulate a weighted centroid per year, and the colours that go with it.
+    let mut per_year: std::collections::BTreeMap<String, (f64, f64, i64, Vec<(String, i64)>)> =
+        Default::default();
+    for (year, genre, plays) in &rows {
+        let Some((x, y, colour)) = coords.get(&crate::everynoise::store::genre_key(genre)) else {
+            continue;
+        };
+        let e = per_year.entry(year.clone()).or_insert((0.0, 0.0, 0, Vec::new()));
+        e.0 += x * *plays as f64;
+        e.1 += y * *plays as f64;
+        e.2 += plays;
+        e.3.push((colour.clone(), *plays));
+    }
+
+    let years: Vec<serde_json::Value> = per_year
+        .into_iter()
+        .filter(|(_, (_, _, n, _))| *n >= MIN_PLAYS_PER_PERIOD)
+        .map(|(year, (sx, sy, n, colours))| {
+            let (listens, enriched) = coverage.get(&year).copied().unwrap_or((0, 0));
+            let weighted: Vec<(&str, i64)> =
+                colours.iter().map(|(c, p)| (c.as_str(), *p)).collect();
+            serde_json::json!({
+                "year": year,
+                "x": sx / n as f64,
+                "y": sy / n as f64,
+                "plays": n,
+                "colour": blend(&weighted),
+                "listens": listens,
+                "enriched": enriched,
+            })
+        })
+        .collect();
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "years": years,
+            "unit": unit,
+            "min_plays": MIN_PLAYS_PER_PERIOD,
+        })),
+    )
+        .into_response()
+}
+
 pub fn create_everynoise_router() -> Router<Arc<AppState>> {
     Router::new()
         .route("/admin/everynoise", get(status).delete(clear))
@@ -338,6 +487,7 @@ pub fn create_everynoise_router() -> Router<Arc<AppState>> {
         // Not admin: the map is shared reference data, the weighting is the
         // caller's own listening.
         .route("/api/v1/genre-map", get(genre_map))
+        .route("/api/v1/genre-map/trajectory", get(genre_trajectory))
 }
 
 #[cfg(test)]

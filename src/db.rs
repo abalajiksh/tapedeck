@@ -2621,6 +2621,62 @@ impl Database {
         .await
     }
 
+    /// Genre plays bucketed by year, for the listening trajectory.
+    ///
+    /// The year is computed in the caller's timezone rather than UTC — a listen
+    /// at 00:30 on 1 January in CET belongs to the new year, and bucketing it
+    /// in UTC would put it in the old one. Same reasoning as the dashboard's
+    /// "today", which had exactly this bug.
+    ///
+    /// Returns `(period, genre, plays)`; the caller turns that into a position.
+    /// `fmt` is a `strftime` pattern — `%Y` for years, `%Y-%m` for months.
+    pub async fn genre_plays_by_period(
+        &self,
+        user_id: i64,
+        tz_offset_hours: f64,
+        fmt: &str,
+    ) -> Result<Vec<(String, String, i64)>, sqlx::Error> {
+        let shift = format!("{} hours", tz_offset_hours);
+        sqlx::query_as(
+            "SELECT strftime(?, s.timestamp, 'unixepoch', ?) AS yr, g.value AS name,
+                    COUNT(*) AS plays
+               FROM scrobbles s, json_each(s.genres) g
+              WHERE s.user_id = ? AND s.skipped = FALSE AND s.genres IS NOT NULL
+              GROUP BY yr, LOWER(g.value)
+              ORDER BY yr",
+        )
+        .bind(fmt)
+        .bind(&shift)
+        .bind(user_id)
+        .fetch_all(&self.pool)
+        .await
+    }
+
+    /// Listens per year, and how many of them have genres resolved — so a
+    /// trajectory can say which years are still filling in rather than drawing
+    /// a confident line through a half-enriched history.
+    pub async fn listens_by_period(
+        &self,
+        user_id: i64,
+        tz_offset_hours: f64,
+        fmt: &str,
+    ) -> Result<Vec<(String, i64, i64)>, sqlx::Error> {
+        let shift = format!("{} hours", tz_offset_hours);
+        sqlx::query_as(
+            "SELECT strftime(?, timestamp, 'unixepoch', ?) AS yr,
+                    COUNT(*) AS listens,
+                    SUM(CASE WHEN genres IS NOT NULL THEN 1 ELSE 0 END) AS enriched
+               FROM scrobbles
+              WHERE user_id = ? AND skipped = FALSE
+              GROUP BY yr ORDER BY yr",
+        )
+        .bind(fmt)
+        .bind(&shift)
+        .bind(user_id)
+        .fetch_all(&self.pool)
+        .await
+    }
+
     /// How many of the user's listens carry any genre at all, and how many
     /// exist — so a thin map can say "the backfill is still running" rather
     /// than looking like a small life.

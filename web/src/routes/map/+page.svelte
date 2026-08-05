@@ -1,9 +1,11 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
 	import { api } from '$lib/api';
-	import type { GenreMap } from '$lib/api';
+	import type { GenreMap, GenreTrajectory } from '$lib/api';
 
 	let data: GenreMap | null = null;
+	let traj: GenreTrajectory | null = null;
+	let showPath = true;
 	let loading = true;
 	let error = '';
 	/** The map is 15× taller than wide, so the overview compresses the vertical
@@ -18,6 +20,9 @@
 		} catch (e) {
 			error = String(e).replace(/^API \d+: /, '');
 		}
+		// Optional: the map is useful on its own, so a trajectory failure must
+		// not take the page down with it.
+		try { traj = await api.getGenreTrajectory(); } catch { /* optional */ }
 		loading = false;
 	});
 
@@ -47,6 +52,15 @@
 	$: unit = data ? Math.max(data.map.width, viewH) / 260 : 1;
 	const radius = (plays: number, max: number, unit: number) =>
 		unit * (2 + 9 * Math.sqrt(plays / Math.max(max, 1)));
+
+	// A year whose listens are only partly enriched is drawn faintly: the
+	// backfill runs newest-first, so a trajectory is the view most distorted by
+	// a half-done pass — it would look like the listening only started recently.
+	const coverage = (y: { listens: number; enriched: number }) =>
+		y.listens > 0 ? y.enriched / y.listens : 0;
+	$: years = traj?.years ?? [];
+	$: path = years.map((y) => `${y.x},${(y.y * yScale).toFixed(1)}`).join(' ');
+	$: thinYears = years.filter((y) => coverage(y) < 0.9).length;
 
 	$: pending = data ? data.listens_total - data.listens_with_genres : 0;
 	$: top = data ? [...data.mine].sort((a, b) => b.plays - a.plays).slice(0, 12) : [];
@@ -96,9 +110,16 @@
 					· <span style="color:var(--td-muted-3);">{pending.toLocaleString()} listens still being enriched</span>
 				{/if}
 			</div>
-			<button class="btn btn-secondary" on:click={() => (trueScale = !trueScale)}>
-				{trueScale ? 'Fit to screen' : 'True proportions'}
-			</button>
+			<div style="display:flex;gap:8px;flex-wrap:wrap;">
+				{#if years.length > 1}
+					<button class="btn btn-secondary" on:click={() => (showPath = !showPath)}>
+						{showPath ? 'Hide trajectory' : 'Show trajectory'}
+					</button>
+				{/if}
+				<button class="btn btn-secondary" on:click={() => (trueScale = !trueScale)}>
+					{trueScale ? 'Fit to screen' : 'True proportions'}
+				</button>
+			</div>
 		</div>
 
 		<div style="{trueScale ? 'max-height:74vh;overflow-y:auto;' : ''}border-radius:14px;background:var(--td-track);">
@@ -116,6 +137,30 @@
 						role="button" aria-label="{m.name}, {m.plays} plays" tabindex="0"
 						style="cursor:pointer;" />
 				{/each}
+				{#if showPath && years.length > 1}
+					<!-- Drawn over the genres but under nothing: the path is the
+					     point of this view when it is on. -->
+					<polyline points={path} fill="none" stroke="var(--td-text)" stroke-opacity="0.5"
+						stroke-width={unit * 0.55} stroke-linejoin="round" stroke-linecap="round"
+						stroke-dasharray="{unit * 2} {unit * 1.6}" />
+					{#each years as y, i}
+						<circle cx={y.x} cy={y.y * yScale} r={unit * 2.2}
+							fill={y.colour ?? 'var(--td-accent)'} stroke="var(--td-text)"
+							stroke-width={unit * 0.5} opacity={coverage(y) < 0.9 ? 0.45 : 1}
+							on:mouseenter={() => (hovered = { name: `${y.year} — centre of ${y.plays.toLocaleString()} placed plays` })}
+							on:mouseleave={() => (hovered = null)}
+							role="button" aria-label="{y.year}, centre of {y.plays} plays" tabindex="0"
+							style="cursor:pointer;" />
+						{#if i === 0 || i === years.length - 1}
+							<!-- `paint-order: stroke` puts a halo behind the glyphs so the
+							     label survives landing on a dense patch of dots. -->
+							<text x={y.x + unit * 3.2} y={y.y * yScale + unit * 1.6}
+								font-size={unit * 5} fill="var(--td-text)"
+								stroke="var(--td-track)" stroke-width={unit * 1.2}
+								style="paint-order:stroke;">{y.year}</text>
+						{/if}
+					{/each}
+				{/if}
 			</svg>
 		</div>
 		{#if !trueScale}

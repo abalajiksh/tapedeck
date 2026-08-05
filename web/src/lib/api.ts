@@ -59,6 +59,26 @@ export interface GenreMap {
 	listens_total: number;
 }
 
+/** Play-weighted centre of each year's listening, on the same map coordinates. */
+export interface GenreTrajectory {
+	years: {
+		year: string;
+		x: number;
+		y: number;
+		plays: number;
+		colour: string | null;
+		/** Listens that year, and how many have genres — a year still being
+		 *  enriched is drawn faintly rather than presented as complete. */
+		listens: number;
+		enriched: number;
+	}[];
+	/** Which bucket the server chose — 'year', or 'month' for a short history. */
+	unit?: 'year' | 'month';
+	/** Periods below this many placed plays are omitted entirely. */
+	min_plays?: number;
+	note?: string;
+}
+
 /** State of the local copy of the Every Noise genre map, and any running scrape. */
 export interface EveryNoiseStatus {
 	summary: {
@@ -1012,6 +1032,11 @@ class TapedeckAPI {
 	/** Does the credential actually work? Discogs answers a bad one with a normal 200. */
 	async testDiscogsSetting(): Promise<{ ok: boolean; message: string }> {
 		return this.post('/api/v1/physical/settings/discogs/test');
+	}
+
+	/** Where the caller's listening sat, year by year. */
+	async getGenreTrajectory(): Promise<GenreTrajectory> {
+		return this.get('/api/v1/genre-map/trajectory');
 	}
 
 	/** The whole genre map, and where the caller's listening sits on it. */
