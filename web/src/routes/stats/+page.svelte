@@ -289,6 +289,25 @@
 				<span style="background:rgba(198,113,57,.92);"></span>More</div>
 		</div>
 	</div>
+	<!-- Genres -->
+	{#if stats.genres.length}
+		<h3 class="h-display" style="font-size:19px;margin:24px 0 12px;">Genres</h3>
+		<div class="panel" style="border-radius:22px;padding:22px;">
+			{#each stats.genres as g}
+				<div style="margin-bottom:12px;">
+					<div style="display:flex;justify-content:space-between;font-size:13px;margin-bottom:5px;"><span style="font-weight:600;">{g.name}</span><span style="color:var(--td-muted-2);">{g.pct}%</span></div>
+					<div style="height:10px;border-radius:999px;background:var(--td-track);overflow:hidden;"><div style="width:{g.pct}%;height:100%;background:linear-gradient(90deg,var(--td-accent-2),var(--td-accent));border-radius:999px;"></div></div>
+				</div>
+			{/each}
+			<p style="color:var(--td-muted-3);font-size:12px;margin:4px 0 0;">
+				A track usually carries several tags, so these are shares of tag mentions
+				rather than of listens — they add up to 100% across tags, not across plays.
+			</p>
+		</div>
+	{:else}
+		<p style="color:var(--td-muted-3);font-size:12.5px;margin:16px 0 0;">Genres fill in as listens are enriched from MusicBrainz.</p>
+	{/if}
+
 	<!-- Languages -->
 	{#if stats.languages.length}
 		<h3 class="h-display" style="font-size:19px;margin:24px 0 12px;">Languages</h3>

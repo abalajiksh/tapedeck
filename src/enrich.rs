@@ -101,6 +101,67 @@ pub async fn backfill_release_years(
     done
 }
 
+/// Fill in genres for listens that have none.
+///
+/// Costs nothing new: `fetch_metadata` has always returned genres and the cache
+/// has always stored them — they were simply never written onto the listen, so
+/// a history that had been fully enriched already has every answer sitting in
+/// `mb_cache` and this pass resolves it without a single API call.
+///
+/// A listen MusicBrainz has no tags for is recorded as `''` rather than left
+/// NULL, so it isn't re-asked forever — the same tombstone `artwork_url` and
+/// `caa_id = -1` use.
+pub async fn backfill_genres(
+    db: &Database,
+    mb: &MusicBrainzClient,
+    batch: i64,
+    mb_budget: i64,
+) -> usize {
+    let rows = match db.scrobbles_needing_genres(batch).await {
+        Ok(r) => r,
+        Err(_) => return 0,
+    };
+    let mut done = 0usize;
+    let mut budget = mb_budget;
+
+    for (id, title, artist, album) in rows {
+        if budget <= 0 {
+            break;
+        }
+
+        // The recording's own tags are the precise answer when they exist, and
+        // cost nothing on an enriched history — this is the same cached lookup
+        // the language and release-year passes already made.
+        let mut genres = match mb.fetch_metadata(&title, &artist, album.as_deref()).await {
+            Ok(meta) => meta.genres,
+            Err(_) => Vec::new(),
+        };
+
+        // Most recordings have none. Fall back to the artist's tags, which are
+        // both better populated and stable — see `fetch_artist_tags`. Cached
+        // per artist, so a library of one artist's records costs one lookup,
+        // not one per listen, and only a real API call spends budget.
+        if genres.is_empty() {
+            genres = match db.artist_genres(&artist).await {
+                Ok(Some(cached)) => cached,
+                _ => {
+                    budget -= 1;
+                    let fetched = mb.fetch_artist_tags(&artist).await.unwrap_or_default();
+                    // Written even when empty, so an artist MusicBrainz has
+                    // nothing for isn't re-asked on every pass.
+                    let _ = db.set_artist_genres(&artist, &fetched).await;
+                    fetched
+                }
+            };
+        }
+
+        if db.set_scrobble_genres(id, &genres).await.is_ok() {
+            done += 1;
+        }
+    }
+    done
+}
+
 /// MusicBrainz dates are `YYYY`, `YYYY-MM`, or `YYYY-MM-DD`.
 fn parse_year(date: &str) -> Option<i32> {
     let y: i32 = date.get(..4)?.parse().ok()?;

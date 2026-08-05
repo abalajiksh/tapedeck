@@ -386,6 +386,7 @@ impl Database {
                 delivered_sinks TEXT NOT NULL DEFAULT '[]',
                 track_number INTEGER,
                 language TEXT,
+                genres TEXT,
                 release_year INTEGER,
                 skipped BOOLEAN NOT NULL DEFAULT FALSE,
                 artwork_url TEXT,
@@ -629,6 +630,7 @@ impl Database {
                 name_key TEXT NOT NULL UNIQUE,
                 mbid TEXT,
                 image_url TEXT,
+                genres TEXT,
                 updated_at INTEGER NOT NULL DEFAULT 0
             )",
         )
@@ -1047,6 +1049,26 @@ impl Database {
             )
             .execute(&self.pool)
             .await;
+        }
+
+        // Migration: artist-level genres. A genre is a property of an artist far
+        // more than of one recording, and MusicBrainz tags it that way — so this
+        // is where the useful answers actually are.
+        if !has_column(&self.pool, "artists", "genres").await {
+            info!("⚙️ Migrating: adding artists.genres...");
+            let _ =
+                sqlx::query("ALTER TABLE artists ADD COLUMN genres TEXT").execute(&self.pool).await;
+        }
+
+        // Migration: genres, which MusicBrainz has been handing over since the
+        // cache existed. `mb_cache.genres` was written by every lookup and read
+        // by nothing, while the ranged-stats payload shipped a hardcoded empty
+        // list — the UI had a slot for this all along.
+        if !has_column(&self.pool, "scrobbles", "genres").await {
+            info!("⚙️ Migrating: adding scrobbles.genres...");
+            let _ = sqlx::query("ALTER TABLE scrobbles ADD COLUMN genres TEXT")
+                .execute(&self.pool)
+                .await;
         }
 
         // Migration: the five quality fields that were parsed and thrown away.
@@ -2527,6 +2549,40 @@ impl Database {
         Ok(())
     }
 
+    /// Listens with no genres resolved yet.
+    ///
+    /// `genres = '[]'` is the tombstone for "asked, nobody had any" — the same
+    /// discipline as `artwork_url = ''` and `caa_id = -1`, and the reason this
+    /// tests `IS NULL` rather than emptiness.
+    pub async fn scrobbles_needing_genres(
+        &self,
+        limit: i64,
+    ) -> Result<Vec<(i64, String, String, Option<String>)>, sqlx::Error> {
+        sqlx::query_as(
+            "SELECT id, title, artist, album FROM scrobbles
+             WHERE genres IS NULL AND skipped = FALSE ORDER BY timestamp DESC LIMIT ?",
+        )
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+    }
+
+    /// Store a listen's genres. An empty slice writes `[]`, which is the
+    /// tombstone for "asked, MusicBrainz had no tags".
+    pub async fn set_scrobble_genres(&self, id: i64, genres: &[String]) -> Result<(), sqlx::Error> {
+        // A JSON array rather than a delimited string, so the breakdown can
+        // `json_each` over it — the same tool `get_equipment` uses to sum hours
+        // across a chain's components. A comma-joined string would need a
+        // recursive CTE to split, for no gain.
+        let json = serde_json::to_string(genres).unwrap_or_else(|_| "[]".into());
+        sqlx::query("UPDATE scrobbles SET genres = ? WHERE id = ?")
+            .bind(&json)
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
     /// Listens with an MBID but no resolved release year yet. Rows without an
     /// MBID are skipped: there's nothing to look them up with.
     pub async fn scrobbles_needing_release_year(
@@ -3069,10 +3125,36 @@ impl Database {
                 "pct": if decade_total > 0 { (c as f64 / decade_total as f64 * 100.0).round() as i64 } else { 0 } })
         }).collect();
 
+        // Genre breakdown. One listen carries several tags, so `json_each`
+        // fans the array out and each tag is counted once per listen that has
+        // it — which means the percentages are a share of *tag mentions*, not
+        // of listens, and cannot be read as "40% of what I played was rock".
+        // Tombstoned rows (`[]`) contribute nothing and drop out naturally.
+        let genre_rows: Vec<(String, i64)> = sqlx::query_as(
+            "SELECT g.value AS name, COUNT(*) AS c
+               FROM scrobbles s, json_each(s.genres) g
+              WHERE s.user_id = ? AND s.skipped = FALSE
+                AND (? IS NULL OR s.timestamp >= ?) AND s.genres IS NOT NULL
+              GROUP BY LOWER(g.value) ORDER BY c DESC LIMIT 12",
+        )
+        .bind(user_id)
+        .bind(after)
+        .bind(after)
+        .fetch_all(&self.pool)
+        .await?;
+        let genre_total: i64 = genre_rows.iter().map(|(_, c)| c).sum();
+        let genres: Vec<serde_json::Value> = genre_rows.into_iter().map(|(name, c)| {
+            serde_json::json!({ "name": name, "plays": c,
+                "pct": if genre_total > 0 { (c as f64 / genre_total as f64 * 100.0).round() as i64 } else { 0 } })
+        }).collect();
+
         // Language breakdown (only listens that have been classified).
+        // `skipped = FALSE` was missing here: a skip is stored but must never be
+        // counted, and this is a counting query like any other.
         let lang_rows: Vec<(String, i64)> = sqlx::query_as(
             "SELECT language, COUNT(*) as c FROM scrobbles
-             WHERE user_id = ? AND (? IS NULL OR timestamp >= ?) AND language IS NOT NULL
+             WHERE user_id = ? AND skipped = FALSE AND (? IS NULL OR timestamp >= ?)
+               AND language IS NOT NULL
              GROUP BY language ORDER BY c DESC LIMIT 12",
         )
         .bind(user_id)
@@ -3097,7 +3179,7 @@ impl Database {
             "top_tracks": top_tracks,
             "fidelity": fidelity,
             "decades": decades,
-            "genres": [], "languages": languages, "regions": [],
+            "genres": genres, "languages": languages, "regions": [],
             // heatmap is filled in by the handler in the user's local timezone
             "heatmap": Vec::<Vec<i64>>::new(),
         }))
@@ -3850,6 +3932,46 @@ impl Database {
     /// Needed because an artist portrait is served through a proxy keyed by
     /// that id — the image lives on the user's own media server and the browser
     /// can't reach it, the same problem `server/artwork.rs` solves for covers.
+    /// An artist's cached genre tags. `Some(vec![])` is the tombstone for
+    /// "asked MusicBrainz, it had none"; `None` means not looked up yet.
+    pub async fn artist_genres(&self, name: &str) -> Result<Option<Vec<String>>, sqlx::Error> {
+        let key = Self::artist_key(name);
+        if key.is_empty() {
+            return Ok(None);
+        }
+        let row: Option<(Option<String>,)> =
+            sqlx::query_as("SELECT genres FROM artists WHERE name_key = ?")
+                .bind(&key)
+                .fetch_optional(&self.pool)
+                .await?;
+        Ok(row
+            .and_then(|r| r.0)
+            .map(|j| serde_json::from_str::<Vec<String>>(&j).unwrap_or_default()))
+    }
+
+    pub async fn set_artist_genres(
+        &self,
+        name: &str,
+        genres: &[String],
+    ) -> Result<(), sqlx::Error> {
+        let key = Self::artist_key(name);
+        if key.is_empty() {
+            return Ok(());
+        }
+        let json = serde_json::to_string(genres).unwrap_or_else(|_| "[]".into());
+        sqlx::query(
+            "INSERT INTO artists (name, name_key, genres, updated_at) VALUES (?, ?, ?, ?)
+             ON CONFLICT(name_key) DO UPDATE SET genres = excluded.genres",
+        )
+        .bind(name.trim())
+        .bind(&key)
+        .bind(&json)
+        .bind(Self::now_secs())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     pub async fn artist_row_id(&self, name: &str) -> Result<Option<i64>, sqlx::Error> {
         let key = Self::artist_key(name);
         if key.is_empty() {

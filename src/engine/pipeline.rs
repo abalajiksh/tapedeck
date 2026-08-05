@@ -743,6 +743,11 @@ impl ScrobbleEngine {
             // Same deal for release years (feeds the by-decade breakdown) —
             // cache hits are free, so the budget only bounds real API calls.
             crate::enrich::backfill_release_years(&self.db, &self.mb_client, 50, 8).await;
+
+            // Genres come off the same `fetch_metadata` call the two above use,
+            // so on an already-enriched history this resolves entirely out of
+            // the cache and spends none of its budget.
+            crate::enrich::backfill_genres(&self.db, &self.mb_client, 50, 8).await;
             crate::enrich::backfill_artwork(
                 &self.db,
                 &self.mb_client,

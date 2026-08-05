@@ -139,7 +139,7 @@ impl MusicBrainzClient {
             {
                 tracing::debug!("Cache hit (PostgreSQL) for: {} - {}", artist_name, track_title);
                 // Store in SQLite for faster future access
-                self.store_in_sqlite(&pg_data).await?;
+                self.store_in_sqlite(&pg_data, (track_title, artist_name, album_name)).await?;
                 return Ok(pg_data);
             }
         }
@@ -149,7 +149,7 @@ impl MusicBrainzClient {
         let api_data = self.fetch_from_api(track_title, artist_name, album_name).await?;
 
         // Cache the result
-        self.store_in_sqlite(&api_data).await?;
+        self.store_in_sqlite(&api_data, (track_title, artist_name, album_name)).await?;
 
         Ok(api_data)
     }
@@ -230,7 +230,24 @@ impl MusicBrainzClient {
         }
     }
 
-    async fn store_in_sqlite(&self, metadata: &MusicBrainzMetadata) -> Result<()> {
+    /// Cache a lookup **under the key it was asked for**.
+    ///
+    /// This used to key on `metadata.track_title/artist_name/album_name`, which
+    /// `fetch_from_api` fills with MusicBrainz's *canonical* strings — so a
+    /// successful lookup was filed under a name the caller had never used and
+    /// could not produce again. Every call therefore missed its own cache and
+    /// re-queried the API: submitting "Selected Ambient Works 85-92" cached it
+    /// under "Selected Ambient Works 85–92" (en dash), and the next lookup for
+    /// the same listen went back out to the network.
+    ///
+    /// Nothing reads the canonical names back out — consumers want the MBIDs,
+    /// the release date and the genres — so keying on the query loses nothing
+    /// and makes the cache actually cache.
+    async fn store_in_sqlite(
+        &self,
+        metadata: &MusicBrainzMetadata,
+        key: (&str, &str, Option<&str>),
+    ) -> Result<()> {
         let genres_json = serde_json::to_string(&metadata.genres)?;
 
         sqlx::query(
@@ -256,9 +273,9 @@ impl MusicBrainzClient {
         .bind(&metadata.track_mbid)
         .bind(&metadata.artist_mbid)
         .bind(&metadata.album_mbid)
-        .bind(&metadata.track_title)
-        .bind(&metadata.artist_name)
-        .bind(&metadata.album_name)
+        .bind(key.0)
+        .bind(key.1)
+        .bind(key.2)
         .bind(&metadata.release_date)
         .bind(genres_json)
         .bind(metadata.caa_id)
@@ -405,7 +422,9 @@ impl MusicBrainzClient {
                 fetched_at: chrono::Utc::now().timestamp(),
             };
             // Best-effort cache — don't fail the whole call if this errors
-            if let Err(e) = self.store_in_sqlite(&negative).await {
+            if let Err(e) =
+                self.store_in_sqlite(&negative, (track_title, artist_name, _album_name)).await
+            {
                 tracing::warn!("Failed to store negative cache entry: {}", e);
             }
             Err(anyhow!("No results found for {} - {}", artist_name, track_title))
@@ -495,6 +514,73 @@ impl MusicBrainzClient {
     /// Postgres dump first (instant, local), then the API (rate-limited), cached
     /// by recording MBID. Returns `Ok(None)` when no work-language is available;
     /// the negative result is cached too so we don't re-query.
+    /// An artist's genre tags from MusicBrainz.
+    ///
+    /// Recording-level tags are the more precise answer and are tried first by
+    /// the caller, but they are **sparse and unstable**: the recording search
+    /// takes `limit=1` against a ranking that is not deterministic, so for a
+    /// track with many recordings (originals, remasters, live versions) which
+    /// one comes back — and therefore whether it carries tags at all — varies
+    /// between identical calls. Measured: "Xtal" by Aphex Twin returned seven
+    /// tags on one run and none on the next.
+    ///
+    /// Artist tags do not have that problem. There is one artist, the search
+    /// finds it, and MusicBrainz's taggers work at this level far more than at
+    /// the recording level — every artist checked came back with six to eight.
+    /// A genre is more an artist's property than one recording's anyway.
+    ///
+    /// One call per *artist*, and the caller caches it, so this costs a handful
+    /// of lookups for a whole library rather than one per listen.
+    pub async fn fetch_artist_tags(&self, artist_name: &str) -> Result<Vec<String>> {
+        #[derive(Deserialize)]
+        struct Resp {
+            #[serde(default)]
+            artists: Vec<Entry>,
+        }
+        #[derive(Deserialize)]
+        struct Entry {
+            #[serde(default)]
+            tags: Vec<Tag>,
+        }
+        #[derive(Deserialize)]
+        struct Tag {
+            name: String,
+            #[serde(default)]
+            count: i64,
+        }
+
+        self.rate_limiter.acquire().await;
+        let query = format!(r#"artist:"{}""#, artist_name.replace('"', ""));
+        let url = format!(
+            "{}/artist?query={}&fmt=json&limit=1",
+            self.config.api_base_url,
+            urlencoding::encode(&query)
+        );
+        let resp =
+            self.http_client.get(&url).header("User-Agent", &self.config.user_agent).send().await?;
+        if !resp.status().is_success() {
+            return Err(anyhow!("MusicBrainz artist search returned {}", resp.status()));
+        }
+        let body: Resp = resp.json().await?;
+        let Some(entry) = body.artists.first() else {
+            return Ok(Vec::new());
+        };
+
+        // Tags are folksonomy, so a single downvoted tag is noise. Anything with
+        // a non-positive count is dropped, and the rest are ordered by how many
+        // people agreed.
+        let mut tags: Vec<(i64, String)> = entry
+            .tags
+            .iter()
+            .filter(|t| t.count > 0)
+            .map(|t| (t.count, t.name.trim().to_lowercase()))
+            .filter(|(_, n)| !n.is_empty())
+            .collect();
+        tags.sort_by(|a, b| b.0.cmp(&a.0));
+        tags.dedup_by(|a, b| a.1 == b.1);
+        Ok(tags.into_iter().take(6).map(|(_, n)| n).collect())
+    }
+
     pub async fn fetch_recording_language(&self, recording_mbid: &str) -> Result<Option<String>> {
         let cached: Option<(Option<String>,)> =
             sqlx::query_as("SELECT language FROM mb_language_cache WHERE recording_mbid = ?")

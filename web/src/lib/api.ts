@@ -92,7 +92,8 @@ export interface RangedStats {
 	top_albums: { name: string; artist: string; plays: number; hours: number }[];
 	top_tracks: { title: string; artist: string; album: string | null; plays: number; hours: number }[];
 	fidelity: { name: string; plays: number; pct: number }[];
-	genres: { name: string; pct: number }[];
+	/** A track carries several tags, so these are shares of tag mentions, not of listens. */
+	genres: { name: string; plays: number; pct: number }[];
 	languages: { name: string; pct: number }[];
 	regions: { name: string; pct: number }[];
 	decades: { name: string; plays: number; pct: number }[];
