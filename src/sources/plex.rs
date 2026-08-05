@@ -152,6 +152,30 @@ pub struct PlexPlayer {
     pub product: Option<String>,
 }
 
+/// Are these two spellings of the same artist?
+///
+/// Compared on letters and digits only, so "Cœur de pirate" matches "Coeur de
+/// Pirate" — the ligature and the capital are exactly the differences a media
+/// server and a scrobble tag disagree about. Deliberately not fuzzy beyond
+/// that: a near-miss here puts the wrong person's photograph on the page.
+pub fn artist_matches(a: &str, b: &str) -> bool {
+    fn key(s: &str) -> String {
+        s.to_lowercase()
+            .chars()
+            .flat_map(|c| match c {
+                // The ligatures that actually turn up in artist names.
+                'œ' => vec!['o', 'e'],
+                'æ' => vec!['a', 'e'],
+                'ß' => vec!['s', 's'],
+                c => vec![c],
+            })
+            .filter(|c| c.is_alphanumeric())
+            .collect()
+    }
+    let (a, b) = (key(a), key(b));
+    !a.is_empty() && a == b
+}
+
 /// Does this track credit already name `artist`?
 ///
 /// Substring rather than equality, because the overlapping case is a credit
@@ -726,6 +750,68 @@ impl PlexSource {
     ///
     /// Proxied for the same reason as Navidrome's: a LAN Plex isn't reachable
     /// from the browser, and the token must not leave the server.
+    /// Find an artist in the library by name, returning their rating key.
+    ///
+    /// `/hubs/search` rather than a section filter: it ranks across the whole
+    /// server and needs no section id, which `Library` doesn't carry. The match
+    /// is checked rather than trusted — the hub is a *search*, so asking for
+    /// "Cœur de pirate" also comes back with "Arkells", and taking the first
+    /// result would hang someone else's face on the artist page.
+    pub async fn find_artist(
+        &self,
+        name: &str,
+    ) -> Result<Option<String>, Box<dyn std::error::Error + Send + Sync>> {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "PascalCase")]
+        struct Resp {
+            media_container: Container,
+        }
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Container {
+            #[serde(rename = "Hub", default)]
+            hub: Vec<Hub>,
+        }
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Hub {
+            #[serde(rename = "type", default)]
+            kind: Option<String>,
+            #[serde(rename = "Metadata", default)]
+            metadata: Vec<Hit>,
+        }
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Hit {
+            #[serde(default)]
+            title: Option<String>,
+            #[serde(default)]
+            rating_key: Option<String>,
+        }
+
+        let resp = self
+            .client
+            .get(format!("{}/hubs/search", self.url))
+            .query(&[("query", name), ("limit", "10")])
+            .header("X-Plex-Token", &self.token)
+            .header("Accept", "application/json")
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            return Err(format!("Plex search returned {}", resp.status()).into());
+        }
+        let body: Resp = resp.json().await?;
+
+        Ok(body
+            .media_container
+            .hub
+            .into_iter()
+            .filter(|h| h.kind.as_deref() == Some("artist"))
+            .flat_map(|h| h.metadata)
+            .find(|m| m.title.as_deref().is_some_and(|t| artist_matches(t, name)))
+            .and_then(|m| m.rating_key))
+    }
+
     pub async fn fetch_cover_art(
         &self,
         rating_key: &str,
@@ -1253,6 +1339,21 @@ mod tests {
             src.process_live_track(track(offset), true, &mut r).await;
             assert!(r.ready_to_scrobble.is_empty(), "seek at {offset}ms re-scrobbled");
         }
+    }
+
+    /// Ligatures and capitals are exactly what a media server and a scrobble
+    /// tag disagree about — "Cœur de pirate" against "Coeur de Pirate" — and
+    /// getting this wrong puts a stranger's photograph on an artist page.
+    #[test]
+    fn artist_names_match_across_ligatures_and_case() {
+        assert!(artist_matches("Cœur de pirate", "Coeur de Pirate"));
+        assert!(artist_matches("cœur de pirate", "Cœur De Pirate"));
+        assert!(artist_matches("Sigur Rós", "Sigur Rós"));
+        assert!(artist_matches("A.R. Rahman", "A R Rahman"));
+        // Different artists must not collapse into one another.
+        assert!(!artist_matches("Cœur de pirate", "Arkells"));
+        assert!(!artist_matches("Karthik", "Karthika"));
+        assert!(!artist_matches("", ""));
     }
 
     /// A film soundtrack names two different things and both are wanted: the

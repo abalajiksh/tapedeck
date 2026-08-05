@@ -708,7 +708,81 @@ impl ScrobbleEngine {
                 8,
             )
             .await;
+
+            self.backfill_artist_images().await;
         }
+    }
+
+    /// Fill in artist portraits from the users' own libraries.
+    ///
+    /// A separate pass because portraits used to arrive only as a side effect
+    /// of the artwork chain — Deezer hands one back alongside a cover — so an
+    /// artist whose covers were already resolved never got a picture at all.
+    /// That is why a well-played artist could sit on a lettered tile forever.
+    ///
+    /// Deliberately small per pass. Each miss is a search against someone's own
+    /// media server, and the row is only claimed on a *hit*: a miss stays NULL
+    /// and is retried later, because the answer changes when they add the
+    /// artist to their library.
+    async fn backfill_artist_images(&mut self) {
+        const PER_PASS: i64 = 5;
+
+        let users = match self.db.list_users().await {
+            Ok(u) => u,
+            Err(e) => {
+                warn!("Artist-portrait backfill could not list users: {}", e);
+                return;
+            }
+        };
+        for user in users {
+            let names = match self.db.artists_without_images(user.id, PER_PASS).await {
+                Ok(n) if !n.is_empty() => n,
+                Ok(_) => continue,
+                Err(e) => {
+                    warn!("Artist-portrait backfill query failed: {}", e);
+                    continue;
+                }
+            };
+            debug!("🖼️ Looking for portraits: {:?}", names);
+            for name in names {
+                let Ok(Some(id)) = self.db.artist_row_id(&name).await else { continue };
+                // The stored value is a path to our own proxy rather than the
+                // library URL: the browser cannot reach a LAN server, and the
+                // credentials that could must not leave the backend.
+                if self.artist_is_in_a_library(user.id, &name).await {
+                    let path = format!("/api/v1/artists/img/{id}");
+                    if self.db.set_artist_image(id, Some(&path)).await.is_ok() {
+                        debug!("🖼️ Portrait for {} from the library", name);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Is this artist in any of the user's connected libraries?
+    async fn artist_is_in_a_library(&self, user_id: i64, name: &str) -> bool {
+        let Ok(sources) = self.db.list_sources_for_user(user_id).await else { return false };
+        for source in sources.iter().filter(|s| s.enabled) {
+            match source.kind.as_str() {
+                "plex" => {
+                    let Some(token) = source.credential("token") else { continue };
+                    let plex =
+                        PlexSource::with_filters(source.url.clone(), token, PlexFilters::default());
+                    if matches!(plex.find_artist(name).await, Ok(Some(_))) {
+                        return true;
+                    }
+                }
+                "jellyfin" => {
+                    let Some(key) = source.credential("api_key") else { continue };
+                    let jf = JellyfinSource::new(source.url.clone(), key, String::new());
+                    if matches!(jf.find_artist(name).await, Ok(Some(_))) {
+                        return true;
+                    }
+                }
+                _ => {}
+            }
+        }
+        false
     }
 
     async fn flush_pending(&mut self) {

@@ -1,6 +1,6 @@
 mod jellyfin;
 mod navidrome;
-mod plex;
+pub mod plex;
 
 use crate::models::Play;
 use async_trait::async_trait;

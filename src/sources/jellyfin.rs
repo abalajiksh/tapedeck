@@ -439,6 +439,55 @@ impl JellyfinSource {
     }
 
     /// Cover art bytes, proxied for the same reason as Plex's and Navidrome's.
+    /// Find an artist by name, returning their item id.
+    ///
+    /// `searchTerm` is a fuzzy match on Jellyfin's side, so the name is checked
+    /// here the same way it is for Plex — a search hit is a suggestion, not an
+    /// identification.
+    pub async fn find_artist(
+        &self,
+        name: &str,
+    ) -> Result<Option<String>, Box<dyn std::error::Error + Send + Sync>> {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "PascalCase")]
+        struct Resp {
+            #[serde(default)]
+            items: Vec<Item>,
+        }
+        #[derive(Deserialize)]
+        #[serde(rename_all = "PascalCase")]
+        struct Item {
+            id: String,
+            name: String,
+            #[serde(default)]
+            image_tags: std::collections::HashMap<String, String>,
+        }
+
+        let resp = self
+            .client
+            .get(format!("{}/Artists", self.url))
+            .query(&[("searchTerm", name), ("limit", "10")])
+            .header("X-Emby-Token", &self.api_key)
+            .header("Accept", "application/json")
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            return Err(format!("Jellyfin returned {} searching artists", resp.status()).into());
+        }
+        let body: Resp = resp.json().await?;
+
+        Ok(body
+            .items
+            .into_iter()
+            // No Primary image means nothing to fetch, so a match without one
+            // is not a match worth returning.
+            .find(|i| {
+                crate::sources::plex::artist_matches(&i.name, name)
+                    && i.image_tags.contains_key("Primary")
+            })
+            .map(|i| i.id))
+    }
+
     pub async fn fetch_cover_art(
         &self,
         item_id: &str,

@@ -415,8 +415,13 @@ export interface ArtistView {
 	id: number;
 	name: string;
 	mbid: string | null;
-	/** Portrait from the metadata chain (Deezer today); null until enriched. */
+	/** Portrait: from the metadata chain, from the user's own library through
+	 *  the proxy, or set by hand. Null means the lettered tile. */
 	image_url: string | null;
+	/** The `artists` row this name maps to — keyed by name and shared, unlike
+	 *  `id` which is this user's entity. Addresses the portrait proxy and the
+	 *  manual override. */
+	artist_row_id: number | null;
 	rank: number;
 	artist_total: number;
 	plays: number;
@@ -864,6 +869,11 @@ class TapedeckAPI {
 	async equipmentWear(id: number): Promise<{ hours: number; sides_played: number }> {
 		return this.get(`/api/v1/physical/equipment/${id}/wear`);
 	}
+	/** Set or clear an artist portrait by hand. Empty clears it. */
+	async setArtistImage(artistRowId: number, url: string): Promise<{ image_url: string | null }> {
+		return this.request('PUT', `/api/v1/artists/img/${artistRowId}`, { url });
+	}
+
 	async getDiscogsSetting(): Promise<{ configured: boolean; from_env: boolean; stored: boolean }> {
 		return this.get('/api/v1/physical/settings/discogs');
 	}

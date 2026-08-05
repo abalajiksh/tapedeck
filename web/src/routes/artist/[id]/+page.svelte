@@ -12,6 +12,28 @@
 	import AlbumCard from '$lib/components/AlbumCard.svelte';
 
 	let artist: ArtistView | null = null;
+	let editingPic = false;
+	let picUrl = '';
+	let picMsg = '';
+	/** A stored URL can rot — a library server goes off, a CDN link expires.
+	 *  Tracked rather than removing the node, so the edit control survives. */
+	let imgFailed = false;
+
+	async function savePicture(url: string) {
+		if (!artist?.artist_row_id) return;
+		picMsg = '';
+		try {
+			const r = await api.setArtistImage(artist.artist_row_id, url);
+			artist = { ...artist, image_url: r.image_url };
+			imgFailed = false;
+			picUrl = '';
+			editingPic = false;
+			picMsg = url ? 'Picture updated.' : 'Picture cleared.';
+			setTimeout(() => (picMsg = ''), 2500);
+		} catch (e) {
+			picMsg = String(e).replace(/^API \d+: /, '');
+		}
+	}
 	let loading = true;
 	let error = '';
 	let loveBusy = false;
@@ -134,11 +156,41 @@
 		<!-- Portrait sits on the right like a CV photo, and only when the
 		     metadata chain actually found one — the cassette stack is the
 		     identity when it hasn't, not a placeholder to fill. -->
-		{#if artist.image_url}
-			<img class="portrait" src={artist.image_url} alt="" loading="lazy"
-				on:error={(e) => e.currentTarget.remove()}>
-		{/if}
+		<div class="portrait-slot">
+			{#if artist.image_url && !imgFailed}
+				<img class="portrait" src={artist.image_url} alt="" loading="lazy"
+					on:error={() => (imgFailed = true)}>
+			{/if}
+			<!-- Tapedeck is a listening journal, so the last word on what an
+			     artist looks like belongs to whoever keeps it — not to whichever
+			     provider answered first. -->
+			{#if artist.artist_row_id}
+				<button class="pic-edit" on:click={() => (editingPic = !editingPic)}>
+					{artist.image_url ? 'Change picture' : 'Add a picture'}
+				</button>
+			{/if}
+		</div>
 	</div>
+
+	{#if editingPic}
+		<div class="panel" style="border-radius:18px;padding:16px;margin-bottom:14px;">
+			<div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center;">
+				<input class="input" style="flex:1;min-width:240px;" bind:value={picUrl}
+					placeholder="https://… or /api/v1/artists/img/{artist.artist_row_id}">
+				<button class="btn btn-primary" on:click={() => savePicture(picUrl)}>Save</button>
+				<button class="btn btn-secondary" on:click={() => savePicture('')}>Clear</button>
+				<button class="btn btn-secondary" on:click={() => (editingPic = false)}>Cancel</button>
+			</div>
+			<p style="font-size:12.5px;color:var(--td-muted);margin:10px 0 0;">
+				Paste any image URL. To use the picture from your own Plex or Jellyfin,
+				use <code>/api/v1/artists/img/{artist.artist_row_id}</code> — Tapedeck
+				fetches it server-side, since the browser can't reach your media server.
+			</p>
+		</div>
+	{/if}
+	{#if picMsg}
+		<p style="font-size:13px;color:var(--td-good-fg);margin:0 0 12px;">{picMsg}</p>
+	{/if}
 
 	<StatStrip stats={artist.stats} />
 
@@ -207,6 +259,15 @@
 		border-radius: 20px; background: var(--td-track);
 		border: 1px solid var(--td-border);
 	}
+	.portrait-slot { display: flex; flex-direction: column; gap: 8px; align-items: center; flex: none; }
+	/* Quiet until you go looking for it — this is a correction, not a
+	   call to action. */
+	.pic-edit {
+		border: none; background: none; padding: 0; cursor: pointer;
+		font: inherit; font-size: 12px; color: var(--td-muted-2);
+		text-decoration: underline; text-underline-offset: 3px;
+	}
+	.pic-edit:hover { color: var(--td-accent); }
 	.sheet { position: absolute; inset: 0; border-radius: 24px; }
 	.sheet.a { transform: rotate(-7deg) translateY(6px); background: var(--td-track); opacity: .5; }
 	.sheet.b { transform: rotate(4deg) translateY(2px); background: var(--td-surface2); border: 1px solid var(--td-border); }

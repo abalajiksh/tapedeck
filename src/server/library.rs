@@ -278,6 +278,11 @@ async fn artist_detail(
         .unwrap_or_default()
         .into_values()
         .next();
+    // The `artists` row is a different thing from this entity — it is keyed by
+    // name and shared across users — and it is what the portrait proxy and the
+    // manual override address. Created on demand so the override is always
+    // available, even for an artist the backfill hasn't reached.
+    let artist_row_id = state.db.artist_row_id(&name).await.unwrap_or(None);
     let bio = bio_for(
         &state,
         id,
@@ -329,6 +334,7 @@ async fn artist_detail(
             "name": name,
             "mbid": entity.mbid,
             "image_url": image_url,
+            "artist_row_id": artist_row_id,
             "rank": rank,
             "artist_total": artist_total,
             "plays": summary.as_ref().map(|s| s.plays).unwrap_or(0),

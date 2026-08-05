@@ -134,8 +134,125 @@ async fn scrobble_art(
     }
 }
 
+/// Find an artist in one of the user's own libraries and stream their portrait.
+///
+/// The same trade the cover proxy makes: the picture lives on a LAN server the
+/// browser can't reach, and handing the page those credentials is not an
+/// option, so Tapedeck fetches it. Sources are tried in turn and the first hit
+/// wins — a portrait is a portrait, and asking the rest costs the user's own
+/// servers a request for nothing.
+async fn artist_image_from_library(
+    state: &AppState,
+    user_id: i64,
+    name: &str,
+) -> Option<(Vec<u8>, String)> {
+    let sources = state.db.list_sources_for_user(user_id).await.ok()?;
+    for source in sources.iter().filter(|s| s.enabled) {
+        let found = match source.kind.as_str() {
+            "plex" => {
+                let token = source.credential("token")?;
+                let plex =
+                    PlexSource::with_filters(source.url.clone(), token, PlexFilters::default());
+                match plex.find_artist(name).await {
+                    Ok(Some(key)) => plex.fetch_cover_art(&key).await.ok(),
+                    _ => None,
+                }
+            }
+            "jellyfin" => {
+                let key = source.credential("api_key")?;
+                let jf = JellyfinSource::new(source.url.clone(), key, String::new());
+                match jf.find_artist(name).await {
+                    Ok(Some(id)) => jf.fetch_cover_art(&id).await.ok(),
+                    _ => None,
+                }
+            }
+            // Navidrome's Subsonic API can answer this too, but it isn't wired
+            // up yet — leaving it out is better than an untested path that
+            // silently returns nothing.
+            _ => None,
+        };
+        if found.is_some() {
+            return found;
+        }
+    }
+    None
+}
+
+/// GET /api/v1/artists/img/:id
+async fn artist_image(
+    State(state): State<Arc<AppState>>,
+    user: AuthUser,
+    Path(id): Path<i64>,
+) -> Response {
+    let Ok(Some((name, _))) = state.db.artist_by_id(id).await else {
+        return not_found("No such artist");
+    };
+
+    match artist_image_from_library(&state, user.user_id, &name).await {
+        Some((bytes, content_type)) => (
+            StatusCode::OK,
+            [
+                (header::CONTENT_TYPE, content_type),
+                (header::CACHE_CONTROL, "private, max-age=604800".to_string()),
+            ],
+            Body::from(bytes),
+        )
+            .into_response(),
+        // 404 lets the UI fall back to the lettered tile, which is right when a
+        // server is off or the artist isn't in the library.
+        None => not_found("No portrait for that artist in your libraries"),
+    }
+}
+
+#[derive(serde::Deserialize)]
+pub struct ArtistImageUpdate {
+    /// A URL to use, or empty to clear back to the lettered tile.
+    pub url: String,
+}
+
+/// PUT /api/v1/artists/img/:id — set the portrait by hand.
+///
+/// Tapedeck is a listening journal, so the operator gets the last word over
+/// anything a provider or a library guessed. Stored as given, and it beats the
+/// backfill because the backfill only ever fills a NULL.
+async fn set_artist_image(
+    State(state): State<Arc<AppState>>,
+    user: AuthUser,
+    Path(id): Path<i64>,
+    Json(body): Json<ArtistImageUpdate>,
+) -> Response {
+    let _ = &user;
+    let url = body.url.trim();
+    if !url.is_empty()
+        && !(url.starts_with("http://") || url.starts_with("https://") || url.starts_with('/'))
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!(ErrorResponse {
+                code: 400,
+                error: "That doesn't look like an image URL".into()
+            })),
+        )
+            .into_response();
+    }
+    let value = if url.is_empty() { None } else { Some(url) };
+    match state.db.set_artist_image(id, value).await {
+        Ok(true) => {
+            (StatusCode::OK, Json(serde_json::json!({ "image_url": value }))).into_response()
+        }
+        Ok(false) => not_found("No such artist"),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!(ErrorResponse { code: 500, error: e.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
 pub fn create_artwork_router() -> Router<Arc<AppState>> {
-    Router::new().route("/api/v1/art/:id", get(scrobble_art))
+    Router::new()
+        .route("/api/v1/art/:id", get(scrobble_art))
+        .route("/api/v1/artists/img/:id", get(artist_image).put(set_artist_image))
 }
 
 #[cfg(test)]

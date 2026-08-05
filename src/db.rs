@@ -3457,6 +3457,88 @@ impl Database {
     /// Images for a set of artist names, keyed by the same normalised form the
     /// table uses. Returned as a map so a stats page can decorate its rows with
     /// one query rather than one per artist.
+    /// The `artists` row id for a name, creating the row if it's new.
+    ///
+    /// Needed because an artist portrait is served through a proxy keyed by
+    /// that id — the image lives on the user's own media server and the browser
+    /// can't reach it, the same problem `server/artwork.rs` solves for covers.
+    pub async fn artist_row_id(&self, name: &str) -> Result<Option<i64>, sqlx::Error> {
+        let key = Self::artist_key(name);
+        if key.is_empty() {
+            return Ok(None);
+        }
+        sqlx::query("INSERT OR IGNORE INTO artists (name, name_key, updated_at) VALUES (?, ?, ?)")
+            .bind(name.trim())
+            .bind(&key)
+            .bind(Self::now_secs())
+            .execute(&self.pool)
+            .await?;
+        let row: Option<(i64,)> = sqlx::query_as("SELECT id FROM artists WHERE name_key = ?")
+            .bind(&key)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.map(|r| r.0))
+    }
+
+    pub async fn artist_by_id(
+        &self,
+        id: i64,
+    ) -> Result<Option<(String, Option<String>)>, sqlx::Error> {
+        let row: Option<(String, Option<String>)> =
+            sqlx::query_as("SELECT name, image_url FROM artists WHERE id = ?")
+                .bind(id)
+                .fetch_optional(&self.pool)
+                .await?;
+        Ok(row)
+    }
+
+    /// Set or clear an artist portrait.
+    ///
+    /// Unlike `upsert_artist` this *overwrites*, including with NULL — it backs
+    /// the manual override, and "I don't want that picture" has to be sayable.
+    /// An empty string is the tombstone the backfill reads as "asked, nothing
+    /// found", the same convention `artwork_url` uses.
+    pub async fn set_artist_image(
+        &self,
+        id: i64,
+        image_url: Option<&str>,
+    ) -> Result<bool, sqlx::Error> {
+        let res = sqlx::query("UPDATE artists SET image_url = ?, updated_at = ? WHERE id = ?")
+            .bind(image_url)
+            .bind(Self::now_secs())
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(res.rows_affected() > 0)
+    }
+
+    /// Artists this user has listened to that still have no portrait.
+    ///
+    /// Ordered by play count so the ones actually visible on the charts are
+    /// resolved first — a backfill that starts alphabetically spends its first
+    /// run on artists nobody sees.
+    pub async fn artists_without_images(
+        &self,
+        user_id: i64,
+        limit: i64,
+    ) -> Result<Vec<String>, sqlx::Error> {
+        let rows: Vec<(String,)> = sqlx::query_as(
+            "SELECT s.artist FROM scrobbles s
+              LEFT JOIN artists a ON a.name_key = LOWER(TRIM(s.artist))
+              WHERE s.user_id = ? AND s.skipped = FALSE
+                AND TRIM(s.artist) != ''
+                AND (a.image_url IS NULL)
+              GROUP BY LOWER(TRIM(s.artist))
+              ORDER BY COUNT(*) DESC
+              LIMIT ?",
+        )
+        .bind(user_id)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(|r| r.0).collect())
+    }
+
     pub async fn artist_images(
         &self,
         names: &[String],
