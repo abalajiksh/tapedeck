@@ -24,6 +24,7 @@
 		{ id: 'data', label: 'Data', hint: 'Export, backup, wipe' },
 		{ id: 'sanitiser', label: 'Sanitiser', hint: 'Fix split albums, artists and credits' },
 		{ id: 'maintenance', label: 'Maintenance', hint: 'Enrichment and health' },
+		{ id: 'genremap', label: 'Genre Map', hint: 'Every Noise at Once' },
 		{ id: 'about', label: 'About', hint: 'Version, sign out' }
 	];
 	let section = 'appearance';
@@ -257,6 +258,74 @@
 		} catch (e) { fetchingArt = false; alert(String(e).replace(/^API \d+: /, '')); }
 	}
 
+	// ── Every Noise genre map (admin) ──
+	// The site has been frozen since December 2023, so this is a one-time
+	// acquisition rather than anything that needs syncing.
+	let enStatus: import('$lib/api').EveryNoiseStatus | null = null;
+	let enContact = '';
+	let enMsg = '';
+	let enBusy = false;
+	let enPoll: ReturnType<typeof setInterval> | null = null;
+
+	async function loadEveryNoise() {
+		try {
+			enStatus = await api.getEveryNoise();
+			if (enStatus.contact && !enContact) enContact = enStatus.contact;
+			// A walk started before this page was opened should still show a bar.
+			if (enStatus.progress?.state === 'running' && !enPoll) startEnPoll();
+		} catch { /* non-admins simply don't see it */ }
+	}
+
+	function startEnPoll() {
+		if (enPoll) return;
+		enPoll = setInterval(async () => {
+			await loadEveryNoise();
+			if (enStatus?.progress?.state !== 'running') {
+				if (enPoll) clearInterval(enPoll);
+				enPoll = null;
+				enBusy = false;
+			}
+		}, 2000);
+	}
+
+	async function saveEnContact() {
+		try {
+			await api.setEveryNoiseContact(enContact.trim());
+			enMsg = enContact.trim() ? 'Saved.' : 'Cleared.';
+			setTimeout(() => (enMsg = ''), 3000);
+			await loadEveryNoise();
+		} catch (e) { enMsg = String(e).replace(/^API \d+: /, ''); }
+	}
+
+	async function startEnScrape(tier: 'map' | 'pages') {
+		// Two hours of requests at someone else's frozen site is worth one
+		// deliberate confirmation.
+		if (tier === 'pages' && !confirm(
+			`This walks every genre page one request per second — about ${Math.ceil((enStatus?.summary.genres || 6300) / 3600)} hours for ${enStatus?.summary.genres || 6300} genres.\n\nIt resumes where it stops, so it's safe to interrupt. Start?`
+		)) return;
+		enBusy = true;
+		enMsg = '';
+		try {
+			await api.startEveryNoiseScrape(tier);
+			await loadEveryNoise();
+			startEnPoll();
+		} catch (e) {
+			enBusy = false;
+			enMsg = String(e).replace(/^API \d+: /, '');
+		}
+	}
+
+	async function cancelEnScrape() {
+		try { await api.cancelEveryNoiseScrape(); await loadEveryNoise(); }
+		catch (e) { enMsg = String(e).replace(/^API \d+: /, ''); }
+	}
+
+	async function clearEveryNoise() {
+		if (!confirm('Delete the local genre map? Re-fetching the map is one request; re-walking every genre page is a couple of hours.')) return;
+		try { await api.clearEveryNoise(); enMsg = 'Cleared.'; await loadEveryNoise(); }
+		catch (e) { enMsg = String(e).replace(/^API \d+: /, ''); }
+	}
+
 	async function loadDiscogs() {
 		try {
 			const d = await api.getDiscogsSetting();
@@ -407,6 +476,7 @@
 		loadArtStatus();
 		loadSanitize();
 		loadDiscogs();
+		loadEveryNoise();
 		loadConnections();
 		loadLangStatus();
 		loading = false;
@@ -415,6 +485,7 @@
 	onDestroy(() => {
 		if (langPoll) clearInterval(langPoll);
 		if (artPoll) clearInterval(artPoll);
+		if (enPoll) clearInterval(enPoll);
 		if (typeof window !== 'undefined') window.removeEventListener('hashchange', sectionFromHash);
 	});
 
@@ -1046,6 +1117,109 @@
 					<button class="btn btn-secondary" on:click={checkConnection} disabled={checking}>{checking ? 'Checking…' : 'Test connection'}</button>
 					{#if healthStatus}<span style="font-size:14px;font-weight:600;color:{healthStatus.startsWith('✓') ? 'var(--td-good-fg)' : '#b2622d'};">{healthStatus}</span>{/if}
 				</div>
+			</div>
+		{/if}
+
+		{#if section === 'genremap'}
+			<div class="panel" style="border-radius:22px;padding:24px;margin-bottom:18px;">
+				<h3 class="h-display" style="font-size:19px;margin-bottom:4px;">Every Noise at Once</h3>
+				<p style="font-size:13px;color:var(--td-muted);margin:0 0 16px;">
+					Glenn McDonald's map of ~6,300 genres, where each one has a position, a colour and a
+					prominence. It's been frozen since December 2023, so this is a one-time fetch — there's
+					nothing to keep in sync. Your instance reads it directly rather than being shipped a
+					copy.
+				</p>
+
+				<label for="en-contact" style="display:block;font-size:13px;color:var(--td-muted);margin-bottom:6px;">
+					Contact email
+				</label>
+				<div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center;">
+					<input id="en-contact" class="input" type="email" bind:value={enContact}
+						placeholder="you@example.com" style="flex:1;min-width:220px;">
+					<button class="btn btn-secondary" on:click={saveEnContact}>Save</button>
+				</div>
+				<p style="font-size:12px;color:var(--td-muted-3);margin:8px 0 0;">
+					Sent in the request header so the site's owner can see who is asking. Required — a
+					personal site being read a few thousand times deserves to know by whom.
+				</p>
+				{#if enMsg}
+					<p style="font-size:13px;color:var(--td-good-fg);margin:10px 0 0;">{enMsg}</p>
+				{/if}
+			</div>
+
+			<div class="panel" style="border-radius:22px;padding:24px;margin-bottom:18px;">
+				<h3 class="h-display" style="font-size:19px;margin-bottom:12px;">What's stored</h3>
+				{#if enStatus}
+					<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:14px;margin-bottom:16px;">
+						<div>
+							<div style="font-size:22px;font-weight:600;">{enStatus.summary.genres.toLocaleString()}</div>
+							<div style="font-size:12px;color:var(--td-muted-2);">genres</div>
+						</div>
+						<div>
+							<div style="font-size:22px;font-weight:600;">{enStatus.summary.artists.toLocaleString()}</div>
+							<div style="font-size:12px;color:var(--td-muted-2);">artist placements</div>
+						</div>
+						<div>
+							<div style="font-size:22px;font-weight:600;">{enStatus.summary.edges.toLocaleString()}</div>
+							<div style="font-size:12px;color:var(--td-muted-2);">genre links</div>
+						</div>
+						<div>
+							<div style="font-size:22px;font-weight:600;">
+								{enStatus.summary.pages_scraped.toLocaleString()}<span style="font-size:14px;color:var(--td-muted-3);">/{enStatus.summary.genres.toLocaleString()}</span>
+							</div>
+							<div style="font-size:12px;color:var(--td-muted-2);">pages walked</div>
+						</div>
+					</div>
+
+					{#if enStatus.progress && enStatus.progress.state === 'running'}
+						<div style="margin-bottom:14px;">
+							<div style="height:8px;border-radius:999px;background:var(--td-track);overflow:hidden;">
+								<div style="height:100%;width:{enStatus.progress.total ? (enStatus.progress.done / enStatus.progress.total) * 100 : 0}%;background:linear-gradient(90deg,var(--td-accent-2),var(--td-accent));border-radius:999px;transition:width .4s;"></div>
+							</div>
+							<div style="font-size:12.5px;color:var(--td-muted-2);margin-top:6px;">
+								{enStatus.progress.done.toLocaleString()} / {enStatus.progress.total.toLocaleString()}
+								{#if enStatus.progress.current}· {enStatus.progress.current}{/if}
+							</div>
+						</div>
+					{:else if enStatus.progress?.message}
+						<p style="font-size:13px;color:{enStatus.progress.state === 'failed' ? 'var(--td-bad-fg)' : 'var(--td-good-fg)'};margin:0 0 14px;">
+							{enStatus.progress.message}
+						</p>
+					{/if}
+
+					<div style="display:flex;gap:10px;flex-wrap:wrap;">
+						<button class="btn btn-secondary" on:click={() => startEnScrape('map')}
+							disabled={enBusy || enStatus.progress?.state === 'running'}>
+							Fetch genre map — 1 request
+						</button>
+						<button class="btn btn-secondary" on:click={() => startEnScrape('pages')}
+							disabled={enBusy || enStatus.progress?.state === 'running' || !enStatus.summary.genres}>
+							Walk every genre page — ~2 hours
+						</button>
+						{#if enStatus.progress?.state === 'running'}
+							<button class="btn btn-secondary" on:click={cancelEnScrape}>Stop</button>
+						{/if}
+						{#if enStatus.summary.genres > 0}
+							<button class="btn btn-secondary" on:click={clearEveryNoise}
+								disabled={enStatus.progress?.state === 'running'}>Delete local copy</button>
+						{/if}
+					</div>
+
+					<p style="font-size:12px;color:var(--td-muted-3);margin:12px 0 0;">
+						The map is a single page load and gives every genre a position. Walking the
+						per-genre pages adds the artists in each one and the nearby/opposite links, at one
+						request per second — it resumes where it stops, so interrupting it costs nothing.
+					</p>
+					{#if enStatus.summary.last_scraped_at}
+						<p style="font-size:12px;color:var(--td-muted-3);margin:6px 0 0;">
+							Last updated {formatDateTime(enStatus.summary.last_scraped_at)}.
+						</p>
+					{/if}
+				{:else}
+					<p style="font-size:13px;color:var(--td-muted);margin:0;">
+						{loading ? 'Loading…' : 'Only an admin can manage the genre map.'}
+					</p>
+				{/if}
 			</div>
 		{/if}
 

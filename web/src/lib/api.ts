@@ -41,6 +41,30 @@ export interface Scrobble {
 	artwork_url: string | null;
 }
 
+/** State of the local copy of the Every Noise genre map, and any running scrape. */
+export interface EveryNoiseStatus {
+	summary: {
+		genres: number;
+		artists: number;
+		edges: number;
+		/** Genre pages walked, out of `genres`. */
+		pages_scraped: number;
+		last_scraped_at: number | null;
+	};
+	progress: {
+		tier: 'map' | 'pages';
+		state: 'running' | 'done' | 'failed' | 'cancelled';
+		done: number;
+		total: number;
+		current: string | null;
+		message: string | null;
+		started_at: number;
+	} | null;
+	/** The admin's contact address, sent in the scraper's User-Agent. */
+	contact: string | null;
+	source: string;
+}
+
 export interface DashboardStats {
 	today: number;
 	this_week: number;
@@ -951,6 +975,23 @@ class TapedeckAPI {
 	}
 	async setDiscogsSetting(token: string): Promise<{ configured: boolean }> {
 		return this.request('PUT', '/api/v1/physical/settings/discogs', { token });
+	}
+
+	// ── Every Noise genre map (admin) ──
+	async getEveryNoise(): Promise<EveryNoiseStatus> {
+		return this.get('/admin/everynoise');
+	}
+	async setEveryNoiseContact(contact: string): Promise<{ status: string }> {
+		return this.request('PUT', '/admin/everynoise/contact', { contact });
+	}
+	async startEveryNoiseScrape(tier: 'map' | 'pages'): Promise<{ status: string }> {
+		return this.post('/admin/everynoise/scrape', { tier });
+	}
+	async cancelEveryNoiseScrape(): Promise<{ status: string }> {
+		return this.post('/admin/everynoise/cancel');
+	}
+	async clearEveryNoise(): Promise<{ status: string }> {
+		return this.del('/admin/everynoise');
 	}
 
 	// ── Manual listen entry ──

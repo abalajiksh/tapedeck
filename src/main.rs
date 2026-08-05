@@ -4,6 +4,7 @@ mod crypto;
 mod db;
 mod engine;
 mod enrich;
+mod everynoise;
 mod language;
 mod logging;
 mod metadata;
@@ -101,6 +102,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // `playing_now` ingests) and the poll engine (writes it from Plex sessions).
     let now_playing = server::now_playing::NowPlayingRegistry::default();
 
+    // ── Genre map ──
+    // Its own database: bulk reference data scraped from everynoise.com, not
+    // anything the user did, and re-acquirable at any time. Opening it here
+    // rather than lazily means a bad path fails at startup instead of the first
+    // time someone opens Settings. Empty until an admin asks for a scrape.
+    let everynoise =
+        crate::everynoise::store::EveryNoiseStore::open(&config.database.everynoise_path).await?;
+
     // ── HTTP server ──
     let app_state = Arc::new(server::AppState {
         db: db.clone(),
@@ -124,6 +133,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             std::env::var("TAPEDECK_APPLE_MUSIC_TOKEN").ok(),
             std::env::var("TAPEDECK_APPLE_MUSIC_STOREFRONT").ok(),
         ),
+        everynoise,
+        everynoise_jobs: Default::default(),
     });
 
     let app = server::build_app(app_state);

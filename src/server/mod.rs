@@ -3,6 +3,7 @@ mod artwork;
 pub mod auth;
 mod chains;
 mod connections;
+mod everynoise;
 mod export;
 pub mod import;
 pub mod ingest;
@@ -59,6 +60,11 @@ pub struct AppState {
     /// HTTP client with its own connection pool, so rebuilding per request
     /// would throw those away.
     pub bio_providers: Vec<crate::metadata::bio::BioProviderBox>,
+    /// The Every Noise genre map, in a database of its own — bulk reference
+    /// data acquired from elsewhere, not anything the user did.
+    pub everynoise: crate::everynoise::store::EveryNoiseStore,
+    /// Progress for the one genre-map scrape that may be running.
+    pub everynoise_jobs: crate::everynoise::scrape::ScrapeRegistry,
 }
 
 /// Build the full Axum application.
@@ -91,6 +97,7 @@ pub fn build_app(state: Arc<AppState>) -> Router {
         .merge(sessions::create_sessions_router())
         .merge(physical::create_physical_router())
         .merge(rediscovery::create_rediscovery_router())
+        .merge(everynoise::create_everynoise_router())
         .with_state(state);
 
     // The SPA is the fallback, not a `/*path` route: a route would only answer

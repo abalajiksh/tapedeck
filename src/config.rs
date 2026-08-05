@@ -27,6 +27,11 @@ pub struct ServerConfig {
 pub struct DatabaseConfig {
     pub sqlite_path: String,
     pub scrobble_db_url: String,
+    /// The Every Noise genre map. Its own file because it is bulk reference
+    /// data acquired from a third party and rebuildable at any time — putting
+    /// it in the scrobble database would bloat every backup with data that is
+    /// not the user's.
+    pub everynoise_path: String,
 }
 
 #[derive(Debug, Clone)]
@@ -108,12 +113,14 @@ impl Default for TomlServer {
 struct TomlDatabase {
     sqlite_path: String,
     scrobble_db_url: String,
+    everynoise_path: String,
 }
 impl Default for TomlDatabase {
     fn default() -> Self {
         Self {
             sqlite_path: "./tapedeck.db".into(),
             scrobble_db_url: "sqlite:scrobbles.db?mode=rwc".into(),
+            everynoise_path: "sqlite:everynoise.db?mode=rwc".into(),
         }
     }
 }
@@ -232,6 +239,7 @@ impl Config {
             database: DatabaseConfig {
                 sqlite_path: env_or("SQLITE_DB_PATH", t.database.sqlite_path),
                 scrobble_db_url: env_or("DATABASE_URL", t.database.scrobble_db_url),
+                everynoise_path: env_or("EVERYNOISE_DB_PATH", t.database.everynoise_path),
             },
             logging: LoggingConfig {
                 level: env_or("RUST_LOG", t.logging.level),
