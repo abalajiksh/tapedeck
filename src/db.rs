@@ -5818,13 +5818,6 @@ fn new_uuid() -> String {
     hex::encode(raw)
 }
 
-/// Collapse an artist name to its identity for duplicate detection: lowercase,
-/// with punctuation and whitespace removed entirely.
-///
-/// Aggressive on purpose — "A.R. Rahman", "A. R. Rahman" and "AR Rahman" all
-/// reduce to `arrahman`. It is only ever used to *group candidates for review*,
-/// never to rewrite anything on its own, so a false pairing costs a line in a
-/// preview rather than corrupted data.
 /// A "no single artist" placeholder, not an artist.
 ///
 /// Shared with the Plex source, which must not record a compilation's tracks
@@ -5835,6 +5828,18 @@ pub fn is_various_artists(name: &str) -> bool {
     crate::sources::plex::is_various_artists(name)
 }
 
+/// Collapse an artist name to its identity for duplicate detection: lowercase,
+/// with punctuation and whitespace removed entirely.
+///
+/// Aggressive on purpose — "A.R. Rahman", "A. R. Rahman" and "AR Rahman" all
+/// reduce to `arrahman`. It is only ever used to *group candidates for review*,
+/// never to rewrite anything on its own, so a false pairing costs a line in a
+/// preview rather than corrupted data.
+///
+/// **Does not fold ligatures or accents**, so "Cœur de pirate" and "Coeur de
+/// pirate" are different identities here — see the note in CLAUDE.md.
+/// `sources::plex::artist_matches` *does* fold them, and the two should be one
+/// function.
 pub fn normalise_artist(s: &str) -> String {
     s.chars().filter(|c| c.is_alphanumeric()).flat_map(|c| c.to_lowercase()).collect()
 }
