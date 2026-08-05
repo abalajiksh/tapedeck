@@ -2666,8 +2666,12 @@ impl Database {
                 .bind(user_id)
                 .fetch_one(&self.pool)
                 .await?;
+        // Must match the total's population exactly. It didn't: the total
+        // excluded skips and this didn't, so a history with skipped listens
+        // that happened to have artwork reported more resolved than existed.
         let with_art: (i64,) = sqlx::query_as(
-            "SELECT COUNT(*) FROM scrobbles WHERE user_id = ? AND artwork_url IS NOT NULL",
+            "SELECT COUNT(*) FROM scrobbles
+              WHERE user_id = ? AND skipped = FALSE AND artwork_url IS NOT NULL",
         )
         .bind(user_id)
         .fetch_one(&self.pool)
@@ -2731,13 +2735,20 @@ impl Database {
     }
 
     /// (total, with a language set) — for backfill progress.
+    ///
+    /// Both halves filter `skipped = FALSE` to match `scrobbles_needing_language`,
+    /// which does. Counting rows the backfill will never process put them
+    /// permanently in the denominator, so the progress readout could not reach
+    /// 100% on any history containing a skip.
     pub async fn language_coverage(&self) -> Result<(i64, i64), sqlx::Error> {
-        let total: (i64,) =
-            sqlx::query_as("SELECT COUNT(*) FROM scrobbles").fetch_one(&self.pool).await?;
-        let done: (i64,) =
-            sqlx::query_as("SELECT COUNT(*) FROM scrobbles WHERE language IS NOT NULL")
-                .fetch_one(&self.pool)
-                .await?;
+        let total: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM scrobbles WHERE skipped = FALSE")
+            .fetch_one(&self.pool)
+            .await?;
+        let done: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM scrobbles WHERE skipped = FALSE AND language IS NOT NULL",
+        )
+        .fetch_one(&self.pool)
+        .await?;
         Ok((total.0, done.0))
     }
 
@@ -2775,8 +2786,14 @@ impl Database {
             0
         };
         let top_artist: Option<(String, i64)> = sqlx::query_as(
-            "SELECT artist, COUNT(*) as cnt FROM scrobbles WHERE user_id = ? AND timestamp >= ? GROUP BY artist ORDER BY cnt DESC LIMIT 1"
-        ).bind(user_id).bind(now - 30 * 86400).fetch_optional(&self.pool).await?;
+            "SELECT artist, COUNT(*) as cnt FROM scrobbles
+              WHERE user_id = ? AND skipped = FALSE AND timestamp >= ?
+              GROUP BY artist ORDER BY cnt DESC LIMIT 1",
+        )
+        .bind(user_id)
+        .bind(now - 30 * 86400)
+        .fetch_optional(&self.pool)
+        .await?;
         let unique_artists: (i64,) = sqlx::query_as(
             "SELECT COUNT(DISTINCT artist) FROM scrobbles WHERE user_id = ? AND skipped = FALSE",
         )
@@ -6452,6 +6469,63 @@ mod tests {
 
     fn play(title: &str, artist: &str, ts: u64) -> Play {
         Play::new(title.into(), artist.into(), ts, format!("src-{ts}"), "test".into())
+    }
+
+    /// A skip must not reach *any* readout that counts listens.
+    ///
+    /// This class of bug has now been found three times — the language
+    /// breakdown, the dashboard's top artist, and the artwork coverage
+    /// numerator — each time because a new query was written next to filtered
+    /// ones and quietly omitted the filter. Nothing errors; a number is simply
+    /// wrong. So this asserts on the *readouts* rather than on the SQL, which
+    /// is the only way a future query gets caught too.
+    #[tokio::test]
+    async fn a_skip_reaches_no_counting_readout() {
+        let db = testdb().await;
+        let uid = db.create_user("ash", None, "pw", "user").await.unwrap();
+        let now = Database::now_secs();
+
+        // One real listen, and five skips of a different artist — enough that a
+        // missing filter would put the skipped artist on top.
+        let mut played = play("Played", "Real Artist", (now - 100) as u64);
+        played.duration = Some(200);
+        db.save_scrobble(uid, &played, None, None, None, None, None, None, ListenDisposition::LIVE)
+            .await
+            .unwrap();
+        for i in 0..5 {
+            let mut p = play("Skipped", "Skipped Artist", (now - 3000 - i * 400) as u64);
+            p.duration = Some(200);
+            p.source_id = format!("skip-{i}");
+            db.save_scrobble(
+                uid,
+                &p,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                ListenDisposition { imported: false, skipped: true },
+            )
+            .await
+            .unwrap();
+        }
+
+        assert_eq!(db.listen_count_and_latest(uid).await.unwrap().0, 1, "listen count");
+
+        let stats = db.get_dashboard_stats(uid, chrono_tz::UTC, 1).await.unwrap();
+        assert_eq!(
+            stats["top_artist"].as_str(),
+            Some("Real Artist"),
+            "a skipped artist must never win the dashboard"
+        );
+
+        // Coverage readouts: both halves must count the same population, or the
+        // progress bar reports a fraction of the wrong whole.
+        let (art_total, _) = db.artwork_coverage(uid).await.unwrap();
+        assert_eq!(art_total, 1, "artwork coverage counts only real listens");
+        let (lang_total, _) = db.language_coverage().await.unwrap();
+        assert_eq!(lang_total, 1, "language coverage counts only what the backfill will process");
     }
 
     /// Three consecutive plays of one track must store three listens.
