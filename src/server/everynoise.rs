@@ -204,12 +204,140 @@ pub async fn clear(State(state): State<Arc<AppState>>, user: AuthUser) -> impl I
     }
 }
 
+/// Average a set of `#rrggbb` colours, weighted by plays.
+///
+/// Every Noise encodes audio character in the three channels, so a
+/// play-weighted average really is "what your listening sounds like" rather
+/// than a decorative accent — which is why this is worth a swatch of its own.
+///
+/// Averaged in **linear light**, not in sRGB. Mixing gamma-encoded values
+/// directly is the classic mistake: it drags everything toward mud, and with a
+/// few hundred genres in the mix the result would be the same brown-grey for
+/// everybody, which would make the feature look broken rather than personal.
+fn blend(weighted: &[(&str, i64)]) -> Option<String> {
+    let to_linear = |c: f64| {
+        let c = c / 255.0;
+        if c <= 0.04045 {
+            c / 12.92
+        } else {
+            ((c + 0.055) / 1.055).powf(2.4)
+        }
+    };
+    let to_srgb = |c: f64| {
+        let c = if c <= 0.0031308 { c * 12.92 } else { 1.055 * c.powf(1.0 / 2.4) - 0.055 };
+        (c.clamp(0.0, 1.0) * 255.0).round() as u8
+    };
+
+    let (mut r, mut g, mut b, mut total) = (0.0, 0.0, 0.0, 0i64);
+    for (hex, plays) in weighted {
+        let h = hex.trim_start_matches('#');
+        if h.len() != 6 || *plays <= 0 {
+            continue;
+        }
+        let ch = |i: usize| u8::from_str_radix(&h[i..i + 2], 16).ok().map(|v| v as f64);
+        let (Some(cr), Some(cg), Some(cb)) = (ch(0), ch(2), ch(4)) else { continue };
+        let w = *plays as f64;
+        r += to_linear(cr) * w;
+        g += to_linear(cg) * w;
+        b += to_linear(cb) * w;
+        total += plays;
+    }
+    (total > 0).then(|| {
+        let t = total as f64;
+        format!("#{:02x}{:02x}{:02x}", to_srgb(r / t), to_srgb(g / t), to_srgb(b / t))
+    })
+}
+
+/// GET /api/v1/genre-map — the whole map, and where the caller lives on it.
+///
+/// Not admin-only: the map itself is instance-wide reference data, but the
+/// weighting is entirely the caller's own listening, so this is scoped by
+/// `user_id` like every other read.
+pub async fn genre_map(State(state): State<Arc<AppState>>, user: AuthUser) -> impl IntoResponse {
+    let backdrop = match state.everynoise.all_points().await {
+        Ok(p) => p,
+        Err(e) => {
+            error!("Genre map read failed: {}", e);
+            return err(500, "Could not read the genre map");
+        }
+    };
+    if backdrop.is_empty() {
+        return err(
+            409,
+            "The genre map hasn't been fetched yet — an admin can do it in Settings → Genre Map",
+        );
+    }
+
+    let counts = state.db.genre_play_counts(user.user_id).await.unwrap_or_default();
+    let names: Vec<String> = counts.iter().map(|(n, _)| n.clone()).collect();
+    let coords = match state.everynoise.coordinates_for(&names).await {
+        Ok(c) => c,
+        Err(e) => {
+            error!("Genre map join failed: {}", e);
+            return err(500, "Could not place your listening on the map");
+        }
+    };
+
+    // The caller's genres that have a position. Tags with no place on the map
+    // (instruments, nationalities, roles — "saxophone", "french") simply drop
+    // out; they are not genres and there is nowhere to put them.
+    let mut mine = Vec::new();
+    let mut unplaced = 0i64;
+    for (name, plays) in &counts {
+        match coords.get(&crate::everynoise::store::genre_key(name)) {
+            Some((x, y, color)) => mine.push(serde_json::json!({
+                "name": name, "plays": plays, "x": x, "y": y, "color": color,
+            })),
+            None => unplaced += plays,
+        }
+    }
+
+    let weighted: Vec<(&str, i64)> = counts
+        .iter()
+        .filter_map(|(n, p)| {
+            coords.get(&crate::everynoise::store::genre_key(n)).map(|(_, _, c)| (c.as_str(), *p))
+        })
+        .collect();
+    let colour = blend(&weighted);
+
+    let (w, h) = state.everynoise.extent().await.unwrap_or((1500.0, 22648.0));
+    let (with_genres, total) =
+        state.db.genre_backfill_progress(user.user_id).await.unwrap_or((0, 0));
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            // Compact tuples rather than objects: 6,300 of these, and the
+            // difference between [n,x,y,c] and four keys apiece is most of the
+            // payload.
+            "map": {
+                "width": w, "height": h,
+                "points": backdrop.iter()
+                    .map(|(n, x, y, c)| serde_json::json!([n, x, y, c]))
+                    .collect::<Vec<_>>(),
+            },
+            "mine": mine,
+            "colour": colour,
+            "placed_tags": weighted.len(),
+            "unplaced_plays": unplaced,
+            // So a half-backfilled history says so rather than looking like a
+            // small life.
+            "listens_with_genres": with_genres,
+            "listens_total": total,
+        })),
+    )
+        .into_response()
+}
+
 pub fn create_everynoise_router() -> Router<Arc<AppState>> {
     Router::new()
         .route("/admin/everynoise", get(status).delete(clear))
         .route("/admin/everynoise/contact", put(set_contact))
         .route("/admin/everynoise/scrape", post(start))
         .route("/admin/everynoise/cancel", post(cancel))
+        // Not admin: the map is shared reference data, the weighting is the
+        // caller's own listening.
+        .route("/api/v1/genre-map", get(genre_map))
 }
 
 #[cfg(test)]

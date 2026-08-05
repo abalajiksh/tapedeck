@@ -2604,6 +2604,42 @@ impl Database {
         Ok(())
     }
 
+    /// Every genre the user has listened to, with play counts.
+    ///
+    /// One listen carries several tags, so the counts sum to more than the
+    /// listen count — each tag is counted once per listen that carries it,
+    /// which is what makes a weighted position meaningful.
+    pub async fn genre_play_counts(&self, user_id: i64) -> Result<Vec<(String, i64)>, sqlx::Error> {
+        sqlx::query_as(
+            "SELECT g.value AS name, COUNT(*) AS plays
+               FROM scrobbles s, json_each(s.genres) g
+              WHERE s.user_id = ? AND s.skipped = FALSE AND s.genres IS NOT NULL
+              GROUP BY LOWER(g.value) ORDER BY plays DESC",
+        )
+        .bind(user_id)
+        .fetch_all(&self.pool)
+        .await
+    }
+
+    /// How many of the user's listens carry any genre at all, and how many
+    /// exist — so a thin map can say "the backfill is still running" rather
+    /// than looking like a small life.
+    pub async fn genre_backfill_progress(&self, user_id: i64) -> Result<(i64, i64), sqlx::Error> {
+        let done: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM scrobbles
+              WHERE user_id = ? AND skipped = FALSE AND genres IS NOT NULL",
+        )
+        .bind(user_id)
+        .fetch_one(&self.pool)
+        .await?;
+        let total: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM scrobbles WHERE user_id = ? AND skipped = FALSE")
+                .bind(user_id)
+                .fetch_one(&self.pool)
+                .await?;
+        Ok((done.0, total.0))
+    }
+
     /// Listens with no genres resolved yet.
     ///
     /// `genres = '[]'` is the tombstone for "asked, nobody had any" — the same

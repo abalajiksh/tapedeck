@@ -44,6 +44,21 @@ export interface Scrobble {
 	artwork_url: string | null;
 }
 
+/** Your listening placed on Every Noise's genre map. */
+export interface GenreMap {
+	/** The backdrop: every genre as a compact [name, x, y, colour] tuple. */
+	map: { width: number; height: number; points: [string, number, number, string][] };
+	/** The caller's own genres, weighted by plays. */
+	mine: { name: string; plays: number; x: number; y: number; color: string }[];
+	/** Play-weighted average colour of the above — "what your listening sounds like". */
+	colour: string | null;
+	placed_tags: number;
+	/** Plays on tags with no place on the map (instruments, nationalities). */
+	unplaced_plays: number;
+	listens_with_genres: number;
+	listens_total: number;
+}
+
 /** State of the local copy of the Every Noise genre map, and any running scrape. */
 export interface EveryNoiseStatus {
 	summary: {
@@ -997,6 +1012,11 @@ class TapedeckAPI {
 	/** Does the credential actually work? Discogs answers a bad one with a normal 200. */
 	async testDiscogsSetting(): Promise<{ ok: boolean; message: string }> {
 		return this.post('/api/v1/physical/settings/discogs/test');
+	}
+
+	/** The whole genre map, and where the caller's listening sits on it. */
+	async getGenreMap(): Promise<GenreMap> {
+		return this.get('/api/v1/genre-map');
 	}
 
 	// ── Every Noise genre map (admin) ──

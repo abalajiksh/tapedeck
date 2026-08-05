@@ -386,6 +386,23 @@ impl EveryNoiseStore {
         Ok(())
     }
 
+    /// The whole map, for the backdrop: every genre's name, position and
+    /// colour. ~6,300 rows and identical for every user, so it is worth the
+    /// client caching it.
+    pub async fn all_points(&self) -> Result<Vec<(String, f64, f64, String)>, sqlx::Error> {
+        sqlx::query_as("SELECT name, x, y, color FROM genres ORDER BY font_size DESC")
+            .fetch_all(&self.pool)
+            .await
+    }
+
+    /// The map's extent, so the client can set a viewBox without scanning
+    /// every point itself.
+    pub async fn extent(&self) -> Result<(f64, f64), sqlx::Error> {
+        let row: (Option<f64>, Option<f64>) =
+            sqlx::query_as("SELECT MAX(x), MAX(y) FROM genres").fetch_one(&self.pool).await?;
+        Ok((row.0.unwrap_or(0.0), row.1.unwrap_or(0.0)))
+    }
+
     /// Wipe everything. The data is re-acquirable, so this is a reset rather
     /// than a destructive act — but it does mean another full walk.
     pub async fn clear(&self) -> Result<(), sqlx::Error> {
