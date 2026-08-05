@@ -534,6 +534,8 @@ export interface PhysicalRelease {
 
 export interface PlayResult {
 	listens_added: number;
+	/** Stored, but excluded from every count and never forwarded. */
+	skipped?: number;
 	tracks: number;
 	duration_secs: number;
 	started_at: number;
@@ -908,7 +910,13 @@ class TapedeckAPI {
 	}
 	async playSide(
 		id: number,
-		body: { side: string; started_at?: number; equipment_id?: number | null; chain_id?: number | null }
+		body: {
+			side: string; started_at?: number;
+			equipment_id?: number | null; chain_id?: number | null;
+			/** Per-track outcomes from the deck. The browser ran the clock, so
+			 *  it is the only thing that saw the pauses and the skips. */
+			tracks?: { position: number; started_at: number; skipped: boolean }[];
+		}
 	): Promise<PlayResult> {
 		return this.post(`/api/v1/physical/${id}/play`, body);
 	}

@@ -291,9 +291,32 @@ async fn delete_release(
 //  Playing a side
 // ════════════════════════════════════════════════════════════
 
+/// What actually happened to one track on the side.
+///
+/// The client sends this because it is the only thing that *knows*: it ran the
+/// clock, so it saw the pauses and the skips. Deriving it server-side from a
+/// start time and a running order can only describe an uninterrupted play.
+#[derive(Debug, Deserialize)]
+pub struct TrackOutcome {
+    pub position: i64,
+    /// When this track actually started, unix seconds.
+    pub started_at: i64,
+    /// Skipped rather than heard. Stored — `scrobbles.skipped` exists for
+    /// exactly this — but excluded from every count and never forwarded, which
+    /// is the rule the Rockbox import already follows. A skip forwarded to
+    /// Last.fm would be a wrong scrobble on a permanent record.
+    #[serde(default)]
+    pub skipped: bool,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct PlaySide {
     pub side: String,
+    /// Per-track outcomes from the deck. Authoritative when present; without it
+    /// the running order is laid out from `started_at`, which is what the
+    /// "already played" path sends.
+    #[serde(default)]
+    pub tracks: Vec<TrackOutcome>,
     /// When the side *started*, unix seconds. Defaults to now minus its running
     /// time, which is what you want when you press the button as it finishes.
     pub started_at: Option<i64>,
@@ -345,16 +368,26 @@ async fn play_side(
     // `devices` do), and a turntable is not a device that submits anything.
     let chain_id = body.chain_id;
 
+    // Outcomes the deck reported, by track position.
+    let reported: std::collections::HashMap<i64, &TrackOutcome> =
+        body.tracks.iter().map(|o| (o.position, o)).collect();
+
     let mut written = 0usize;
+    let mut skipped_count = 0usize;
     let mut at = start;
     for t in &tracks {
         let dur = t.duration_secs.unwrap_or(ASSUMED_SECS);
+        // The deck's own timing wins wherever it reported any — it ran the
+        // clock, so it is the only thing that saw the pauses.
+        let outcome = reported.get(&t.position);
+        let ts = outcome.map(|o| o.started_at).unwrap_or(at);
+        let was_skipped = outcome.is_some_and(|o| o.skipped);
         let play = Play {
             title: t.title.clone(),
             artist: t.artist.clone().unwrap_or_else(|| release.artist.clone()),
             artists: None,
             album: Some(release.title.clone()),
-            timestamp: at.max(0) as u64,
+            timestamp: ts.max(0) as u64,
             duration: Some(dur.max(0) as u64),
             track_number: Some(t.position as i32),
             mbid_recording: None,
@@ -383,18 +416,29 @@ async fn play_side(
             )
             .await
         {
-            Ok(true) => written += 1,
+            Ok(true) => {
+                if was_skipped {
+                    // Kept so skip-rate analytics has something real to count,
+                    // and marked so nothing else does.
+                    let _ = state.db.mark_scrobble_skipped(user.user_id, &play.source_id).await;
+                    skipped_count += 1;
+                } else {
+                    written += 1;
+                }
+            }
             Ok(false) => {}
             Err(e) => warn!("Could not store a physical listen: {}", e),
         }
-        at += dur;
+        // Only advances the derived clock; a reported track carries its own.
+        at = ts + dur;
     }
 
     // Only when something was actually recorded. A duplicate submission — the
     // same side at the same start time, which is what a double-tap produces —
     // dedups every listen, and counting stylus hours for it would wear the
-    // cartridge down on paper for a play that did not happen twice.
-    if written > 0 {
+    // cartridge down on paper for a play that did not happen twice. Skips
+    // count towards wear: the needle was still in the groove to get there.
+    if written + skipped_count > 0 {
         if let Err(e) = state
             .db
             .record_physical_play(
@@ -426,6 +470,7 @@ async fn play_side(
         StatusCode::OK,
         Json(serde_json::json!({
             "listens_added": written,
+            "skipped": skipped_count,
             "tracks": tracks.len(),
             "duration_secs": total,
             "started_at": start,

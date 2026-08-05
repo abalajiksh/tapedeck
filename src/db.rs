@@ -3626,6 +3626,29 @@ impl Database {
         .await
     }
 
+    /// Mark one listen as a skip.
+    ///
+    /// Skips are stored but never counted — history, charts, ranged stats and
+    /// every backfill filter `skipped = FALSE`, and a skip is never forwarded,
+    /// because a skip on someone's Last.fm is a wrong scrobble on a permanent
+    /// record. Setting `status` to `'imported'` is what takes it out of the
+    /// forwarding queue, the same mechanism the file importer uses.
+    pub async fn mark_scrobble_skipped(
+        &self,
+        user_id: i64,
+        source_id: &str,
+    ) -> Result<bool, sqlx::Error> {
+        let res = sqlx::query(
+            "UPDATE scrobbles SET skipped = TRUE, status = 'imported'
+              WHERE user_id = ? AND source_id = ?",
+        )
+        .bind(user_id)
+        .bind(source_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(res.rows_affected() > 0)
+    }
+
     /// Records and tapes that haven't left the shelf.
     ///
     /// The one list here that isn't about listens at all — it reads

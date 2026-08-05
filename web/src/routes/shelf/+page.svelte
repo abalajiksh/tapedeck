@@ -42,7 +42,28 @@
 	let flipPrompt = '';
 	let playMsg = '';
 
-	type Spinning = { releaseId: number; side: string; startedAt: number };
+	/**
+	 * A side in progress.
+	 *
+	 * `outcomes` is the record of what actually happened — the browser is the
+	 * only thing running the clock, so it is the only thing that sees a pause
+	 * or a skip. It is sent with the play and the server takes it as
+	 * authoritative, rather than laying tracks out from a start time, which can
+	 * only ever describe an uninterrupted side.
+	 *
+	 * `pausedAt` is null while running. `pausedTotal` accumulates, so elapsed
+	 * is wall clock minus time spent stopped — a paused record is not playing,
+	 * and counting it would put every later track minutes late.
+	 */
+	type Outcome = { position: number; started_at: number; skipped: boolean };
+	type Spinning = {
+		releaseId: number;
+		side: string;
+		startedAt: number;
+		pausedAt: number | null;
+		pausedTotal: number;
+		outcomes: Outcome[];
+	};
 	let spinning: Spinning | null = null;
 	let nowSec = Math.floor(Date.now() / 1000);
 
@@ -68,11 +89,97 @@
 		if (!open) return;
 		playMsg = '';
 		flipPrompt = '';
-		saveSpinning({ releaseId: open.id, side, startedAt: Math.floor(Date.now() / 1000) });
+		const now = Math.floor(Date.now() / 1000);
+		saveSpinning({
+			releaseId: open.id, side, startedAt: now,
+			pausedAt: null, pausedTotal: 0,
+			// The first track starts the moment the needle drops.
+			outcomes: [{ position: sideTracks(side)[0]?.position ?? 1, started_at: now, skipped: false }]
+		});
+	}
+
+	/** Tracks on a side, in order. */
+	function sideTracks(side: string, release?: PhysicalRelease | null): PhysicalTrack[] {
+		let list = openTracks;
+		if (release && release.id !== open?.id) {
+			try { list = JSON.parse(release.tracks) as PhysicalTrack[]; } catch { list = []; }
+		}
+		return list.filter((t) => t.side === side).sort((a, b) => a.position - b.position);
+	}
+
+	function togglePause() {
+		if (!spinning) return;
+		const now = Math.floor(Date.now() / 1000);
+		if (spinning.pausedAt === null) {
+			saveSpinning({ ...spinning, pausedAt: now });
+		} else {
+			// Resuming: everything after this shifts by however long it stood
+			// still, which is what `pausedTotal` feeds into `spinElapsed`.
+			saveSpinning({
+				...spinning,
+				pausedTotal: spinning.pausedTotal + (now - spinning.pausedAt),
+				pausedAt: null
+			});
+		}
+	}
+
+	/** Which track the elapsed clock is currently inside. */
+	function currentIndex(sp: Spinning): number {
+		const list = sideTracks(sp.side, spinRelease);
+		let acc = 0;
+		for (let i = 0; i < list.length; i++) {
+			acc += list[i].duration_secs ?? 180;
+			if (spinElapsed < acc) return i;
+		}
+		return Math.max(0, list.length - 1);
+	}
+
+	/**
+	 * Skip the track that's playing.
+	 *
+	 * It is still recorded — `scrobbles.skipped` exists precisely so skip-rate
+	 * analytics has something to count — but marked, so it stays out of every
+	 * total and is never forwarded. A skip on someone's Last.fm would be a
+	 * wrong scrobble on a permanent record.
+	 */
+	function skipTrack() {
+		if (!spinning) return;
+		const list = sideTracks(spinning.side, spinRelease);
+		const i = currentIndex(spinning);
+		const cur = list[i];
+		if (!cur) return;
+		const now = Math.floor(Date.now() / 1000);
+
+		const outcomes = spinning.outcomes.filter((o) => o.position !== cur.position);
+		outcomes.push({
+			position: cur.position,
+			started_at: spinning.outcomes.find((o) => o.position === cur.position)?.started_at ?? now,
+			skipped: true
+		});
+		const next = list[i + 1];
+		if (next && !outcomes.some((o) => o.position === next.position)) {
+			outcomes.push({ position: next.position, started_at: now, skipped: false });
+		}
+
+		// Jumping the clock forward past what's left of this track is what makes
+		// the next one current — the skip cost you the remainder, not the whole.
+		const played = list.slice(0, i + 1).reduce((n, t) => n + (t.duration_secs ?? 180), 0);
+		const shift = Math.max(0, played - spinElapsed);
+		saveSpinning({
+			...spinning,
+			outcomes,
+			pausedTotal: spinning.pausedTotal - shift
+		});
 	}
 
 	/** Elapsed and remaining for the side currently on. */
-	$: spinElapsed = spinning ? Math.max(0, nowSec - spinning.startedAt) : 0;
+	// Wall clock minus time spent stopped. A paused record is not playing.
+	$: spinElapsed = spinning
+		? Math.max(0, (spinning.pausedAt ?? nowSec) - spinning.startedAt - spinning.pausedTotal)
+		: 0;
+	$: paused = !!spinning?.pausedAt;
+	$: nowTrack = spinning && spinHere ? sideTracks(spinning.side)[currentIndex(spinning)] : null;
+	$: skippedSoFar = spinning?.outcomes.filter((o) => o.skipped).length ?? 0;
 	$: spinTotal = spinning ? sideSecs(spinning.side, spinRelease) : 0;
 	$: spinLeft = Math.max(0, spinTotal - spinElapsed);
 	$: spinPct = spinTotal ? Math.min(100, (spinElapsed / spinTotal) * 100) : 0;
@@ -157,9 +264,16 @@
 		playing = true;
 		playMsg = '';
 		try {
-			const r = await api.playSide(open.id, { side, started_at: startedAt });
-			playMsg = r.listens_added
-				? `Side ${side} — ${r.listens_added} listen${r.listens_added === 1 ? '' : 's'} recorded.`
+			const r = await api.playSide(open.id, {
+				side,
+				started_at: startedAt,
+				// Only when this deck ran the side; "already played" has none.
+				tracks: spinning && spinning.releaseId === open.id ? spinning.outcomes : undefined
+			});
+			const sk = r.skipped ?? 0;
+			playMsg = r.listens_added || sk
+				? `Side ${side} — ${r.listens_added} listen${r.listens_added === 1 ? '' : 's'} recorded` +
+					(sk ? `, ${sk} skipped.` : '.')
 				: `Side ${side} was already recorded at that time.`;
 			// The flip reminder is the whole point of tracking sides: you are
 			// away from the screen while it plays, and the next thing you do is
@@ -319,6 +433,43 @@
 	</button>
 {/if}
 
+<!-- The decks are on the page whether or not anything is on them. An empty
+     shelf otherwise opens on a wall of text, and this is a screen about
+     objects — the platter sitting still is also the honest signal that
+     nothing is playing, which is the rule the dashboard's reels follow. -->
+{#if !spinning}
+	<div class="idle">
+		<svg viewBox="0 0 120 120" width="86" height="86" aria-hidden="true">
+			<circle cx="60" cy="60" r="57" fill="var(--td-accent)" opacity=".10" />
+			<circle cx="60" cy="60" r="50" fill="#0d0a07" />
+			{#each [42, 34, 26] as r}
+				<circle cx="60" cy="60" r={r} fill="none" stroke="#2a241d" stroke-width="1" />
+			{/each}
+			<circle cx="60" cy="60" r="18" fill="var(--td-accent)" opacity=".75" />
+			<circle cx="60" cy="60" r="2.6" fill="#f4e7cf" />
+		</svg>
+		<svg viewBox="0 0 100 60" width="96" height="58" aria-hidden="true">
+			<rect x="2" y="6" width="96" height="48" rx="7" fill="#0d0a07"
+				stroke="var(--td-accent)" stroke-width="1.5" opacity=".55" />
+			<rect x="18" y="18" width="64" height="24" rx="4" fill="#15130f" />
+			{#each [32, 68] as cx}
+				<circle cx={cx} cy="30" r="10" fill="none" stroke="#6a6259" stroke-width="2.5" />
+				<circle cx={cx} cy="30" r="4.5" fill="var(--td-accent)" opacity=".75" />
+			{/each}
+		</svg>
+		<div style="flex:1;min-width:200px;">
+			<div style="font-size:11px;letter-spacing:.16em;text-transform:uppercase;color:var(--td-muted-2);font-weight:600;">
+				Nothing on either deck
+			</div>
+			<p style="margin:6px 0 0;font-size:13.5px;color:var(--td-muted);max-width:46ch;">
+				Open a record below and press <strong>Start</strong> when you drop the
+				needle. The deck runs the clock, so pauses and skips are recorded as
+				they happen.
+			</p>
+		</div>
+	</div>
+{/if}
+
 <div style="display:flex;gap:8px;margin:18px 0;">
 	{#each ['all', 'vinyl', 'cassette'] as f}
 		<button class="chip" class:on={filter === f} on:click={() => (filter = f as Filter)}>
@@ -392,7 +543,7 @@
 			</p>
 		{:else}
 			{#if spinHere && spinning}
-				<div class="deck" class:done={spinLeft === 0}>
+				<div class="deck" class:done={spinLeft === 0} class:paused>
 					{#if open.kind === 'vinyl'}
 						<!-- A platter, turning at 33⅓ — one revolution every 1.8s,
 						     which is the real speed rather than a decorative one. -->
@@ -428,11 +579,16 @@
 
 					<div style="flex:1;min-width:0;">
 						<div style="font-size:11px;letter-spacing:.16em;text-transform:uppercase;color:#c67139;font-weight:600;">
-							{spinLeft === 0 ? 'Side finished' : `Side ${spinning.side} playing`}
+							{spinLeft === 0 ? 'Side finished' : paused ? `Side ${spinning.side} paused` : `Side ${spinning.side} playing`}
 						</div>
 						<div class="h-display" style="font-size:19px;margin-top:2px;">
-							{open.title}
+							{nowTrack ? nowTrack.title : open.title}
 						</div>
+						{#if nowTrack}
+							<div style="font-size:12.5px;color:var(--td-muted);">
+								{open.title}{skippedSoFar ? ` · ${skippedSoFar} skipped` : ''}
+							</div>
+						{/if}
 						<div style="font-variant-numeric:tabular-nums;font-size:13px;color:var(--td-muted);margin-top:4px;">
 							{formatDuration(spinElapsed)} / {formatDuration(spinTotal)}
 							{#if spinLeft > 0}· {formatDuration(spinLeft)} left{/if}
@@ -442,7 +598,23 @@
 						</div>
 					</div>
 
-					<div style="display:flex;flex-direction:column;gap:6px;">
+					<div class="controls">
+						<!-- Both decks get both controls. You can lift a needle and
+						     you can fast-forward a tape; restricting either by
+						     format would be arbitrary, and each has the same
+						     consequence for what gets recorded. -->
+						<button class="ctl" title={paused ? 'Resume' : 'Pause'}
+							aria-label={paused ? 'Resume' : 'Pause'} on:click={togglePause}>
+							{#if paused}
+								<svg viewBox="0 0 24 24" width="18" fill="currentColor"><path d="M7 5l12 7-12 7z"/></svg>
+							{:else}
+								<svg viewBox="0 0 24 24" width="18" fill="currentColor"><rect x="6" y="5" width="4" height="14" rx="1"/><rect x="14" y="5" width="4" height="14" rx="1"/></svg>
+							{/if}
+						</button>
+						<button class="ctl" title="Skip this track" aria-label="Skip this track"
+							on:click={skipTrack} disabled={paused}>
+							<svg viewBox="0 0 24 24" width="18" fill="currentColor"><path d="M5 5l10 7-10 7z"/><rect x="16" y="5" width="3" height="14" rx="1"/></svg>
+						</button>
 						<button class="btn btn-primary" disabled={playing}
 							on:click={() => spinning && play(spinning.side, spinning.startedAt)}>
 							{playing ? '…' : spinLeft === 0 ? 'Record it' : 'Stop & record'}
@@ -571,6 +743,11 @@
 	}
 	.deck.done { border-style: dashed; }
 	/* Shown when a side is on but you're looking elsewhere on the shelf. */
+	.idle {
+		display: flex; align-items: center; gap: 20px; flex-wrap: wrap;
+		margin-top: 18px; padding: 18px 20px;
+		border: 1px dashed var(--td-line); border-radius: 18px;
+	}
 	.nowon {
 		display: flex;
 		align-items: center;
@@ -599,7 +776,21 @@
 	.platter { animation: td-spin 1.8s linear infinite; }
 	.deck :global(.reel) { animation: td-spin 2.4s linear infinite; }
 	.deck.done .platter,
-	.deck.done :global(.reel) { animation-play-state: paused; }
+	.deck.done :global(.reel),
+	.deck.paused .platter,
+	.deck.paused :global(.reel) { animation-play-state: paused; }
+	.controls { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+	/* Transport buttons read as a deck's, not as page actions. */
+	.ctl {
+		display: inline-flex; align-items: center; justify-content: center;
+		width: 38px; height: 38px; flex: none;
+		border-radius: 50%; cursor: pointer;
+		border: 1px solid var(--td-accent);
+		background: transparent; color: var(--td-accent);
+		transition: background .15s, color .15s;
+	}
+	.ctl:hover:not(:disabled) { background: var(--td-accent); color: #fff; }
+	.ctl:disabled { opacity: .4; cursor: default; }
 	@media (prefers-reduced-motion: reduce) {
 		.platter, .deck :global(.reel) { animation: none; }
 	}
