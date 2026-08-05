@@ -1160,6 +1160,23 @@ class TapedeckAPI {
 			default_chain_id: opts?.default_chain_id ?? null
 		});
 	}
+	// ── Device-code pairing ──
+	/** What the user is about to approve. */
+	async describePairing(userCode: string): Promise<{
+		client_name: string;
+		scopes: string;
+		can_read: boolean;
+		approved: boolean;
+	}> {
+		return this.get(`/api/v1/pair/${encodeURIComponent(userCode)}`);
+	}
+	/** Mint the token. It goes to the polling client, never into this response. */
+	async approvePairing(userCode: string, defaultChainId: number | null): Promise<{ status: string }> {
+		return this.post(`/api/v1/pair/${encodeURIComponent(userCode)}/approve`, {
+			default_chain_id: defaultChainId
+		});
+	}
+
 	/** Rename a token or repoint its chain. The token itself is not re-issued. */
 	async updateToken(id: number, data: { name?: string; default_chain_id?: number | null }): Promise<void> {
 		await this.patch(`/admin/tokens/${id}`, data);

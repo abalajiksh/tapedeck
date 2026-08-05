@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use super::auth::{AuthUser, ReadAuth};
+use super::auth::ReadAuth;
 use super::AppState;
 use crate::models::{AudioQuality, Play};
 

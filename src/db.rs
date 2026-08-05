@@ -511,6 +511,33 @@ impl Database {
         // Server-wide settings an admin sets in the UI, as opposed to
         // `tapedeck.toml` (infrastructure) or per-user preferences. Values are
         // encrypted, because the first inhabitant is a Discogs token.
+        // Device-code pairing. A client that cannot show a browser — a DAP, a
+        // headless player, a TV app — asks for a code here and polls; the user
+        // approves it in the web UI and the client collects its token.
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS pairing_requests (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                -- Hashed like a token: the device code is a bearer secret, and
+                -- a leaked database should not hand over pending pairings.
+                device_code_hash TEXT NOT NULL UNIQUE,
+                -- Short and typeable, so it can be read off one screen and into
+                -- another. Guessable by construction, which is why it lives for
+                -- five minutes, is single-use, and is rate limited.
+                user_code TEXT NOT NULL UNIQUE,
+                client_name TEXT NOT NULL,
+                scopes TEXT NOT NULL DEFAULT 'submit',
+                user_id INTEGER REFERENCES users(id),
+                default_chain_id INTEGER REFERENCES signal_chains(id),
+                -- The minted token, held only until the client collects it.
+                token TEXT,
+                created_at INTEGER NOT NULL,
+                expires_at INTEGER NOT NULL,
+                approved_at INTEGER
+            )",
+        )
+        .execute(&self.pool)
+        .await?;
+
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS app_settings (
                 key TEXT PRIMARY KEY,
@@ -5769,6 +5796,164 @@ impl Database {
         Ok(res.rows_affected() > 0)
     }
 
+    // ════════════════════════════════════════════════════════════
+    //  Device-code pairing
+    // ════════════════════════════════════════════════════════════
+
+    /// How long a pairing request lives. Short on purpose: the user code is
+    /// only eight characters, so its safety comes from the window being small,
+    /// the code being single-use, and polling being rate limited — not from
+    /// entropy.
+    pub const PAIRING_TTL_SECS: i64 = 300;
+
+    /// Start a pairing. Returns `(device_code, user_code)`.
+    ///
+    /// The device code is the bearer secret the client polls with and is stored
+    /// hashed; the user code is what a human carries between two screens.
+    pub async fn start_pairing(
+        &self,
+        client_name: &str,
+        scopes: &str,
+    ) -> Result<(String, String), sqlx::Error> {
+        use rand::Rng;
+        let raw: [u8; 24] = rand::rng().random();
+        let device_code = format!("tdp_{}", hex::encode(raw));
+
+        // No vowels and no 0/O/1/I/L: the whole point is reading it off one
+        // screen and typing it into another without a transcription error, and
+        // excluding those also means it cannot accidentally spell anything.
+        const ALPHABET: &[u8] = b"BCDFGHJKMNPQRSTVWXYZ23456789";
+        let now = Self::now_secs();
+        // Retry on the (vanishingly unlikely) collision rather than failing the
+        // request — the unique index is what makes that safe.
+        for _ in 0..8 {
+            let code: String = (0..8)
+                .map(|i| {
+                    let c = ALPHABET[rand::rng().random_range(0..ALPHABET.len())] as char;
+                    if i == 4 {
+                        format!("-{c}")
+                    } else {
+                        c.to_string()
+                    }
+                })
+                .collect();
+            let res = sqlx::query(
+                "INSERT INTO pairing_requests
+                    (device_code_hash, user_code, client_name, scopes, created_at, expires_at)
+                 VALUES (?, ?, ?, ?, ?, ?)",
+            )
+            .bind(Self::hash_token(&device_code))
+            .bind(&code)
+            .bind(client_name)
+            .bind(scopes)
+            .bind(now)
+            .bind(now + Self::PAIRING_TTL_SECS)
+            .execute(&self.pool)
+            .await;
+            match res {
+                Ok(_) => return Ok((device_code, code)),
+                Err(sqlx::Error::Database(e)) if e.is_unique_violation() => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        Err(sqlx::Error::Protocol("could not allocate a pairing code".into()))
+    }
+
+    /// What a user code refers to, for the approval screen. Expired requests
+    /// are not returned.
+    pub async fn pairing_by_user_code(
+        &self,
+        user_code: &str,
+    ) -> Result<Option<(i64, String, String, bool)>, sqlx::Error> {
+        let row: Option<(i64, String, String, Option<i64>)> = sqlx::query_as(
+            "SELECT id, client_name, scopes, approved_at FROM pairing_requests
+              WHERE user_code = ? AND expires_at > ?",
+        )
+        .bind(user_code.trim().to_uppercase())
+        .bind(Self::now_secs())
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|(id, name, scopes, approved)| (id, name, scopes, approved.is_some())))
+    }
+
+    /// Approve a pairing and mint its token.
+    ///
+    /// The token is stored on the request for the client to collect exactly
+    /// once. Returns `false` when the code is unknown, expired, or already
+    /// approved — a second approval must not mint a second token.
+    pub async fn approve_pairing(
+        &self,
+        user_code: &str,
+        user_id: i64,
+        default_chain_id: Option<i64>,
+    ) -> Result<bool, sqlx::Error> {
+        let now = Self::now_secs();
+        let row: Option<(i64, String, String)> = sqlx::query_as(
+            "SELECT id, client_name, scopes FROM pairing_requests
+              WHERE user_code = ? AND expires_at > ? AND approved_at IS NULL",
+        )
+        .bind(user_code.trim().to_uppercase())
+        .bind(now)
+        .fetch_optional(&self.pool)
+        .await?;
+        let Some((id, client_name, scopes)) = row else {
+            return Ok(false);
+        };
+
+        let token = self.create_token(user_id, &client_name, &scopes, default_chain_id).await?;
+        sqlx::query(
+            "UPDATE pairing_requests
+                SET user_id = ?, default_chain_id = ?, token = ?, approved_at = ?
+              WHERE id = ? AND approved_at IS NULL",
+        )
+        .bind(user_id)
+        .bind(default_chain_id)
+        .bind(&token)
+        .bind(now)
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        Ok(true)
+    }
+
+    /// What the polling client should be told.
+    pub async fn poll_pairing(&self, device_code: &str) -> Result<PairingPoll, sqlx::Error> {
+        let hash = Self::hash_token(device_code);
+        let row: Option<(i64, Option<String>, i64)> = sqlx::query_as(
+            "SELECT id, token, expires_at FROM pairing_requests WHERE device_code_hash = ?",
+        )
+        .bind(&hash)
+        .fetch_optional(&self.pool)
+        .await?;
+        let Some((id, token, expires_at)) = row else {
+            return Ok(PairingPoll::Unknown);
+        };
+        if let Some(token) = token {
+            // Handed over once, then cleared: the request row must not remain a
+            // second copy of a live credential.
+            sqlx::query("DELETE FROM pairing_requests WHERE id = ?")
+                .bind(id)
+                .execute(&self.pool)
+                .await?;
+            return Ok(PairingPoll::Approved(token));
+        }
+        if expires_at <= Self::now_secs() {
+            return Ok(PairingPoll::Expired);
+        }
+        Ok(PairingPoll::Pending)
+    }
+
+    /// Drop expired, unapproved requests. Cheap, and keeps a guessable code
+    /// from lingering.
+    pub async fn purge_expired_pairings(&self) -> Result<u64, sqlx::Error> {
+        let res =
+            sqlx::query("DELETE FROM pairing_requests WHERE expires_at <= ? AND token IS NULL")
+                .bind(Self::now_secs())
+                .execute(&self.pool)
+                .await?;
+        Ok(res.rows_affected())
+    }
+
     pub async fn create_token(
         &self,
         user_id: i64,
@@ -6115,6 +6300,24 @@ pub fn split_featured(artist: &str) -> Option<String> {
 /// What an API token resolves to. The id is carried because a session is now
 /// split when the submitting token changes — a different app means a different
 /// setup far more often than not.
+/// What a polling client is told about its pairing request.
+#[derive(Debug, PartialEq, Eq)]
+pub enum PairingPoll {
+    /// Not approved yet — keep polling.
+    Pending,
+    /// Approved; here is the token, once.
+    Approved(String),
+    /// The window closed. Start again.
+    Expired,
+    /// No such request. Deliberately distinct from `Expired` only to the
+    /// server — the handler reports both the same way, so polling cannot be
+    /// used to learn whether a device code was ever real.
+    Unknown,
+}
+
+/// What an API token resolves to. The id is carried because a session is now
+/// split when the submitting token changes — a different app means a different
+/// setup far more often than not.
 #[derive(Debug)]
 pub struct TokenAuth {
     pub user: AuthUser,
@@ -6232,6 +6435,51 @@ mod tests {
 
     fn play(title: &str, artist: &str, ts: u64) -> Play {
         Play::new(title.into(), artist.into(), ts, format!("src-{ts}"), "test".into())
+    }
+
+    /// A pairing code mints exactly one token and hands it over exactly once.
+    /// Both halves matter: a second approval would give an attacker who watched
+    /// someone type a code a token of their own, and a request row left holding
+    /// the token would be a second live copy of a credential.
+    #[tokio::test]
+    async fn a_pairing_code_is_single_use_in_both_directions() {
+        let db = testdb().await;
+        let uid = db.create_user("ash", None, "pw", "admin").await.unwrap();
+
+        let (device_code, user_code) =
+            db.start_pairing("Pano on Android", "submit read").await.unwrap();
+        assert_eq!(user_code.len(), 9, "8 characters plus the separator");
+        assert_eq!(db.poll_pairing(&device_code).await.unwrap(), PairingPoll::Pending);
+
+        assert!(db.approve_pairing(&user_code, uid, None).await.unwrap());
+        // A second approval must not mint a second token.
+        assert!(!db.approve_pairing(&user_code, uid, None).await.unwrap());
+
+        let token = match db.poll_pairing(&device_code).await.unwrap() {
+            PairingPoll::Approved(t) => t,
+            other => panic!("expected a token, got {other:?}"),
+        };
+        // Collected once; the row is gone, so polling again cannot re-serve it.
+        assert_eq!(db.poll_pairing(&device_code).await.unwrap(), PairingPoll::Unknown);
+
+        // The token really works, and carries the scopes that were asked for.
+        let auth = db.validate_token(&token).await.unwrap().expect("valid");
+        assert_eq!(auth.user.user_id, uid);
+        assert!(auth.can_read());
+    }
+
+    /// `read` is an explicit grant. A token that only says `submit` must not be
+    /// able to read, or the scope column would be decoration again.
+    #[tokio::test]
+    async fn read_is_not_implied_by_submit() {
+        let db = testdb().await;
+        let uid = db.create_user("ash", None, "pw", "user").await.unwrap();
+
+        let plain = db.create_token(uid, "scrobbler", "submit", None).await.unwrap();
+        assert!(!db.validate_token(&plain).await.unwrap().unwrap().can_read());
+
+        let reader = db.create_token(uid, "plugin", "submit read", None).await.unwrap();
+        assert!(db.validate_token(&reader).await.unwrap().unwrap().can_read());
     }
 
     /// `save_scrobble` hardcoded `status = 'pending'`, so a listen submitted as

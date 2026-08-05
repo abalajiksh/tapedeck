@@ -44,6 +44,44 @@
 	// implied by `submit`. A scrobble client that only posts listens has no
 	// business enumerating your gear.
 	let newTokenRead = false;
+
+	// ── Pairing a device ──
+	// For clients with no browser: they show a code, you type it here.
+	let pairCode = '';
+	let pairInfo: { client_name: string; scopes: string; can_read: boolean; approved: boolean } | null = null;
+	let pairChain = '';
+	let pairMsg = '';
+	let pairBusy = false;
+
+	async function lookupPairing() {
+		pairInfo = null;
+		pairMsg = '';
+		const code = pairCode.trim().toUpperCase();
+		if (!code) return;
+		pairBusy = true;
+		try {
+			pairInfo = await api.describePairing(code);
+			if (pairInfo.approved) pairMsg = 'That code has already been approved.';
+		} catch (e) {
+			pairMsg = String(e).replace(/^API \d+: /, '');
+		}
+		pairBusy = false;
+	}
+
+	async function approvePairing() {
+		pairBusy = true;
+		try {
+			await api.approvePairing(pairCode.trim().toUpperCase(), pairChain ? Number(pairChain) : null);
+			pairMsg = 'Approved — the device should pick up its token within a few seconds.';
+			pairInfo = null;
+			pairCode = '';
+			pairChain = '';
+			tokens = (await api.getTokens()).tokens;
+		} catch (e) {
+			pairMsg = String(e).replace(/^API \d+: /, '');
+		}
+		pairBusy = false;
+	}
 	let createdToken = '';
 	let tokenCopied = false;
 	let creating = false;
@@ -923,7 +961,47 @@
 						<br>
 						<strong>Allow reading</strong> additionally lets the app list your chains, devices, gear and what's playing — so it can offer a chain picker instead of asking you to type a name. It can still only read your own data, and can't change anything.
 					</p>
-					<p style="font-size:12px;color:var(--td-muted-2);margin:8px 0 0;">Tokens can only submit listens. Reading, editing, and admin actions require signing in here.</p>
+					<p style="font-size:12px;color:var(--td-muted-2);margin:8px 0 0;">Writes and admin actions always require signing in here — a token can never do either.</p>
+				{/if}
+			</div>
+
+			<div class="panel" style="border-radius:22px;padding:24px;margin-bottom:18px;">
+				<h3 class="h-display" style="font-size:19px;margin-bottom:4px;">Pair a device</h3>
+				<p style="font-size:13px;color:var(--td-muted);margin:0 0 14px;">
+					For players with no browser — a DAP, a TV app, a headless box. It shows a code;
+					type it here and it collects its own token. Codes last five minutes.
+				</p>
+				<div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;">
+					<input class="input" bind:value={pairCode} placeholder="XXXX-XXXX"
+						style="max-width:180px;text-transform:uppercase;letter-spacing:.1em;font-family:ui-monospace,monospace;"
+						on:keydown={(e) => e.key === 'Enter' && lookupPairing()}>
+					<button class="btn btn-secondary" on:click={lookupPairing} disabled={pairBusy || !pairCode.trim()}>
+						Look up
+					</button>
+				</div>
+
+				{#if pairInfo && !pairInfo.approved}
+					<div style="margin-top:16px;padding:14px;border-radius:14px;background:var(--td-track);">
+						<div style="font-size:14px;font-weight:600;margin-bottom:6px;">{pairInfo.client_name}</div>
+						<div style="font-size:12.5px;color:var(--td-muted-2);margin-bottom:12px;">
+							Will be able to submit listens{pairInfo.can_read ? ' and read your chains, devices, gear and what\'s playing' : ''}.
+							It can never write anything else or reach admin actions.
+						</div>
+						<div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;">
+							{#if chains.length}
+								<select class="input" style="width:auto;min-width:170px;" bind:value={pairChain} aria-label="Default signal chain for this device">
+									<option value="">No default chain</option>
+									{#each chains as c}<option value={String(c.id)}>{c.name}</option>{/each}
+								</select>
+							{/if}
+							<button class="btn btn-primary" on:click={approvePairing} disabled={pairBusy}>
+								{pairBusy ? '…' : 'Approve'}
+							</button>
+						</div>
+					</div>
+				{/if}
+				{#if pairMsg}
+					<p style="font-size:13px;color:var(--td-good-fg);margin:12px 0 0;">{pairMsg}</p>
 				{/if}
 			</div>
 
