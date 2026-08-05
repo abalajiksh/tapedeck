@@ -3,6 +3,7 @@
 	import { api } from '$lib/api';
 	import type { SignalChain, Equipment, ChainComponent, ChainInput, EquipmentInput, Binding, Device } from '$lib/api';
 	import { formatHours, timeAgo } from '$lib/utils';
+	import ChainIcon, { CHAIN_ICONS, CHAIN_ICON_LABELS } from '$lib/components/ChainIcon.svelte';
 
 	let chains: SignalChain[] = [];
 	let equipment: Equipment[] = [];
@@ -91,6 +92,7 @@
 	let chainOpen = false;
 	let chainId: number | null = null; // null = create
 	let cName = '', cDesc = '', cContext = 'active';
+	let cIcon: string | null = null;
 	let cComps: ChainComponent[] = [];
 	let savingChain = false;
 	let confirmChain: SignalChain | null = null;
@@ -144,12 +146,13 @@
 
 	// ── chain editor ──
 	function newChain() {
-		chainId = null; cName = ''; cDesc = ''; cContext = 'active';
+		chainId = null; cName = ''; cDesc = ''; cContext = 'active'; cIcon = null;
 		cComps = [blankComp('source')];
 		chainOpen = true;
 	}
 	function editChain(c: SignalChain) {
 		chainId = c.id; cName = c.name; cDesc = c.description ?? ''; cContext = c.listening_context;
+		cIcon = c.icon ?? null;
 		cComps = c.components?.length ? c.components.map((x) => ({ ...x })) : [blankComp('source')];
 		chainOpen = true;
 	}
@@ -157,6 +160,7 @@
 	function duplicateChain(c: SignalChain) {
 		chainId = null;
 		cName = `${c.name} (copy)`; cDesc = c.description ?? ''; cContext = c.listening_context;
+		cIcon = c.icon ?? null;
 		cComps = c.components?.length ? c.components.map((x) => ({ ...x })) : [blankComp('source')];
 		chainOpen = true;
 	}
@@ -229,6 +233,7 @@
 		const data: ChainInput = {
 			name: cName.trim(), description: cDesc.trim() || undefined,
 			listening_context: cContext,
+			icon: cIcon,
 			components: cComps.filter((c) => c.name.trim()).map((c) => ({ ...c, detail: c.detail || null }))
 		};
 		try {
@@ -328,7 +333,9 @@
 				<div class="panel" style="border-radius:22px;padding:22px;">
 					<div style="display:flex;align-items:flex-start;justify-content:space-between;gap:12px;margin-bottom:16px;">
 						<div style="flex:1;min-width:0;">
-							<div class="h-display" style="font-size:20px;line-height:1.15;">{c.name}</div>
+							<div class="h-display" style="font-size:20px;line-height:1.15;display:flex;align-items:center;gap:9px;">
+								<ChainIcon name={c.icon} size={19} title={c.name} />{c.name}
+							</div>
 							{#if c.description}<div style="font-size:13px;color:var(--td-muted);margin-top:4px;">{c.description}</div>{/if}
 						</div>
 						<div style="display:flex;align-items:center;gap:8px;flex:none;">
@@ -476,6 +483,19 @@
 					<div class="field"><label for="cx">Listening context</label>
 						<select id="cx" class="input" bind:value={cContext}>{#each contexts as ct}<option value={ct}>{ct}</option>{/each}</select>
 					</div>
+					<div style="margin-bottom:14px;">
+						<span style="display:block;font-size:13px;color:var(--td-muted);margin-bottom:7px;">Icon</span>
+						<div style="display:flex;gap:7px;flex-wrap:wrap;">
+							<button type="button" class="icon-pick" class:on={!cIcon} title="No icon"
+								on:click={() => (cIcon = null)}><ChainIcon name={null} size={17} /></button>
+							{#each CHAIN_ICONS as ic}
+								<button type="button" class="icon-pick" class:on={cIcon === ic}
+									title={CHAIN_ICON_LABELS[ic]} on:click={() => (cIcon = ic)}>
+									<ChainIcon name={ic} size={17} />
+								</button>
+							{/each}
+						</div>
+					</div>
 					<div class="field">
 						<div style="font-size:12px;margin-bottom:5px;color:var(--td-muted);">Components (source → ears)</div>
 						<div style="display:flex;flex-direction:column;gap:8px;">
@@ -575,6 +595,17 @@
 {/if}
 
 <style>
+	/* A row of toggles rather than a dropdown: eight glyphs are quicker to
+	   recognise than to read, which is the entire point of having them. */
+	.icon-pick {
+		display: flex; align-items: center; justify-content: center;
+		width: 34px; height: 34px; border-radius: 10px; cursor: pointer;
+		border: 1px solid var(--td-border); background: transparent;
+		color: var(--td-muted-2); transition: border-color .15s, color .15s, background .15s;
+	}
+	.icon-pick:hover { color: var(--td-text); border-color: var(--td-muted-3); }
+	.icon-pick.on { border-color: var(--td-accent); color: var(--td-accent); background: color-mix(in srgb, var(--td-accent) 10%, transparent); }
+
 	.spin { animation: td-spin 0.7s linear infinite; }
 	.icon-btn {
 		border: none; background: transparent; cursor: pointer; color: var(--td-muted-2);

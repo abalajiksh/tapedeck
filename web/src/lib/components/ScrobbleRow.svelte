@@ -2,6 +2,8 @@
 	import type { Scrobble } from '$lib/api';
 	import { qualityLabel, tierTagClass, formatDuration, timeAgo } from '$lib/utils';
 	import CoverArt from './CoverArt.svelte';
+	import SourceIcon from './SourceIcon.svelte';
+	import ChainIcon from './ChainIcon.svelte';
 	import { createEventDispatcher } from 'svelte';
 	import { lovedKeys, loveKey, toggleLove } from '$lib/loves';
 	import { openAlbum, openArtist } from '$lib/entities';
@@ -13,6 +15,10 @@
 	/** The heart is the point of the row for most people, but selection mode is
 	 *  about bulk edits — a stray love there is a misclick, so it's hidden. */
 	export let showLove = true;
+	/** Chains by id, so a row can show which setup it came out of. Optional —
+	 *  a caller that doesn't have them simply shows no chain glyph. */
+	export let chains: Record<number, { name: string; icon?: string | null }> = {};
+	$: chainFor = scrobble.chain_id != null ? chains[scrobble.chain_id] : undefined;
 	/** Off in selection mode, where a click is meant to select the row. */
 	$: linkable = !selectable;
 
@@ -37,6 +43,8 @@
 	<div style="flex:1;min-width:0;">
 		<div style="font-size:14.5px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">{scrobble.title}</div>
 		<div class="subline">
+			<SourceIcon source={scrobble.source_name} client={scrobble.submission_client} />
+			{#if chainFor}<ChainIcon name={chainFor.icon} title={chainFor.name} />{/if}
 			<span class="names">
 				{#if linkable}
 					<!-- Buttons rather than anchors: the row knows names, and an entity

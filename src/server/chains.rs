@@ -22,6 +22,11 @@ pub struct CreateChainRequest {
     pub components: Vec<ChainComponent>,
     #[serde(default)]
     pub listening_context: ListeningContext,
+    /// A glyph name from the UI's set. Not validated here — an unknown value
+    /// falls back to a generic mark on render, which is a better failure than
+    /// rejecting a save because the front end learned a new icon first.
+    #[serde(default)]
+    pub icon: Option<String>,
 }
 
 async fn create_chain(
@@ -36,6 +41,7 @@ async fn create_chain(
         description: body.description,
         components: body.components,
         listening_context: body.listening_context,
+        icon: body.icon.clone(),
         is_active: true,
         total_hours: 0.0,
         created_at: 0, // set by db
@@ -118,6 +124,7 @@ async fn update_chain(
             body.description.as_deref(),
             &body.components,
             ctx,
+            body.icon.as_deref(),
         )
         .await
     {

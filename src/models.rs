@@ -204,6 +204,12 @@ pub struct SignalChain {
     pub description: Option<String>,
     pub components: Vec<ChainComponent>,
     pub listening_context: ListeningContext,
+    /// A glyph name from the UI's fixed set, so a chain is recognisable at a
+    /// glance on a listen row. `None` falls back to a generic mark — an
+    /// unrecognised value does too, which is what keeps this from being a way
+    /// to inject anything into the page.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icon: Option<String>,
     pub is_active: bool,
     pub total_hours: f64,
     pub created_at: i64,

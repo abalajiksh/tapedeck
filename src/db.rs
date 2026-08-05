@@ -439,6 +439,7 @@ impl Database {
                 name TEXT NOT NULL, description TEXT,
                 components JSON NOT NULL DEFAULT '[]',
                 listening_context TEXT NOT NULL DEFAULT 'unknown',
+                icon TEXT,
                 is_active BOOLEAN DEFAULT TRUE,
                 total_hours REAL DEFAULT 0,
                 created_at INTEGER NOT NULL,
@@ -1080,6 +1081,16 @@ impl Database {
             )
             .execute(&self.pool)
             .await;
+        }
+
+        // Migration: a chain's icon. Which setup a listen came out of is the
+        // thing this app is about, and a name in a dropdown is a poor way to
+        // recognise one at a glance.
+        if !has_column(&self.pool, "signal_chains", "icon").await {
+            info!("⚙️ Migrating: adding signal_chains.icon...");
+            let _ = sqlx::query("ALTER TABLE signal_chains ADD COLUMN icon TEXT")
+                .execute(&self.pool)
+                .await;
         }
 
         // Migration: artist-level genres. A genre is a property of an artist far
@@ -3295,10 +3306,11 @@ impl Database {
             serde_json::to_string(&chain.components).unwrap_or_else(|_| "[]".into());
         let now = Self::now_secs();
         let result = sqlx::query(
-            "INSERT INTO signal_chains (user_id, name, description, components, listening_context, is_active, created_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?)"
+            "INSERT INTO signal_chains (user_id, name, description, components, listening_context, icon, is_active, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
         ).bind(chain.user_id).bind(&chain.name).bind(&chain.description)
-        .bind(&components_json).bind(chain.listening_context.as_str()).bind(chain.is_active).bind(now)
+        .bind(&components_json).bind(chain.listening_context.as_str()).bind(&chain.icon)
+        .bind(chain.is_active).bind(now)
         .execute(&self.pool).await?;
         Ok(result.last_insert_rowid())
     }
@@ -3397,12 +3409,13 @@ impl Database {
         description: Option<&str>,
         components: &[ChainComponent],
         listening_context: &str,
+        icon: Option<&str>,
     ) -> Result<bool, sqlx::Error> {
         let components_json = serde_json::to_string(components).unwrap_or_else(|_| "[]".into());
         let res = sqlx::query(
-            "UPDATE signal_chains SET name = ?, description = ?, components = ?, listening_context = ?
+            "UPDATE signal_chains SET name = ?, description = ?, components = ?, listening_context = ?, icon = ?
              WHERE id = ? AND user_id = ?"
-        ).bind(name).bind(description).bind(&components_json).bind(listening_context)
+        ).bind(name).bind(description).bind(&components_json).bind(listening_context).bind(icon)
          .bind(chain_id).bind(user_id).execute(&self.pool).await?;
         Ok(res.rows_affected() > 0)
     }
@@ -6397,6 +6410,7 @@ pub struct ChainRow {
     pub description: Option<String>,
     pub components: String,
     pub listening_context: String,
+    pub icon: Option<String>,
     pub is_active: bool,
     pub total_hours: f64,
     pub created_at: i64,
@@ -6412,6 +6426,7 @@ impl From<ChainRow> for SignalChain {
             description: r.description,
             components,
             listening_context: ListeningContext::from_str_loose(&r.listening_context),
+            icon: r.icon,
             is_active: r.is_active,
             total_hours: r.total_hours,
             created_at: r.created_at,
@@ -7035,6 +7050,7 @@ mod tests {
             description: None,
             components: vec![],
             listening_context: ListeningContext::Active,
+            icon: None,
             is_active: true,
             total_hours: 0.0,
             created_at: 0,
@@ -7064,6 +7080,7 @@ mod tests {
                 description: None,
                 components: vec![],
                 listening_context: ListeningContext::Active,
+                icon: None,
                 is_active: true,
                 total_hours: 0.0,
                 created_at: 0,
@@ -7281,6 +7298,7 @@ mod tests {
             description: None,
             components: vec![],
             listening_context: ListeningContext::Active,
+            icon: None,
             is_active: true,
             total_hours: 0.0,
             created_at: 0,

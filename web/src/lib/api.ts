@@ -33,6 +33,9 @@ export interface Scrobble {
 	chain_id: number | null;
 	listening_context: string | null;
 	submission_client: string | null;
+	/** Which code path produced it: Plex, jellyfin, navidrome, physical,
+	 *  rockbox, import, or `ingest:<client>`. */
+	source_name: string | null;
 	mbid_recording: string | null;
 	mbid_release: string | null;
 	caa_id: number | null;
@@ -129,6 +132,8 @@ export interface SignalChain {
 	description: string | null;
 	components: ChainComponent[];
 	listening_context: string;
+	/** A glyph name from ChainIcon's set; unknown or absent renders generic. */
+	icon?: string | null;
 	is_active: boolean;
 	total_hours: number;
 }
@@ -147,6 +152,7 @@ export interface ChainInput {
 	description?: string;
 	components: ChainComponent[];
 	listening_context?: string;
+	icon?: string | null;
 }
 
 export interface EquipmentInput {

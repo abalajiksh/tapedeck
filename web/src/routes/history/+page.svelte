@@ -11,6 +11,8 @@
 
 	let scrobbles: Scrobble[] = [];
 	let chains: SignalChain[] = [];
+	// Keyed by id for the row glyph — a listen carries a chain_id, not a chain.
+	$: chainsById = Object.fromEntries(chains.map((c) => [c.id, { name: c.name, icon: c.icon }]));
 	let filter = '';
 	let loading = true;
 	let offset = 0;
@@ -297,7 +299,7 @@
 		</div>
 		<div class="panel" style="border-radius:22px;overflow:hidden;">
 			{#each g.items as s (s.id)}
-				<ScrobbleRow scrobble={s} showMenu selectable={selectMode} selected={selected.has(s.id)}
+				<ScrobbleRow scrobble={s} chains={chainsById} showMenu selectable={selectMode} selected={selected.has(s.id)}
 					on:menu={(e) => (menuFor = e.detail)} on:toggle={(e) => toggleSelect(e.detail)} />
 			{/each}
 		</div>

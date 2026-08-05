@@ -49,6 +49,50 @@ fn err(code: u16, msg: impl Into<String>) -> axum::response::Response {
     (status, Json(serde_json::json!(ErrorResponse { code, error: msg.into() }))).into_response()
 }
 
+/// Where to send the user to approve, as something they can actually type.
+///
+/// This used to return the bare path `/settings#tokens`, which is useless in
+/// the one situation the whole flow exists for: a device with no browser
+/// showing an instruction on a TV or a DAP screen. "Go to /settings#tokens" is
+/// not an address.
+///
+/// The origin has to come from the request, because the server genuinely does
+/// not know its own public URL — it may be behind a tunnel or a reverse proxy
+/// on a different host and scheme entirely. Forwarded headers are believed only
+/// when `trust_proxy` says there is a proxy to believe, exactly as
+/// `cookie_is_secure` does for the session cookie. Falling back to the `Host`
+/// header is right too: that is the name the client used to reach us, which is
+/// the name that will work for whoever reads the screen.
+fn verification_uri(state: &AppState, headers: &HeaderMap) -> String {
+    build_verification_uri(state.trust_proxy, headers)
+}
+
+fn build_verification_uri(trust_proxy: bool, headers: &HeaderMap) -> String {
+    let header = |name: &str| headers.get(name).and_then(|v| v.to_str().ok());
+    // A forwarded header may be a comma-separated chain; the first hop is the
+    // client's.
+    let first = |v: &str| v.split(',').next().unwrap_or("").trim().to_string();
+
+    let scheme = trust_proxy
+        .then(|| header("x-forwarded-proto").map(first))
+        .flatten()
+        .filter(|s| s == "http" || s == "https")
+        .unwrap_or_else(|| "http".into());
+
+    let host = trust_proxy
+        .then(|| header("x-forwarded-host").map(first))
+        .flatten()
+        .or_else(|| header("host").map(str::to_string))
+        .filter(|h| !h.is_empty());
+
+    match host {
+        Some(host) => format!("{scheme}://{host}/settings#tokens"),
+        // No Host header at all (HTTP/1.0, or a client that omits it). A path
+        // is still better than nothing, and it is what this always returned.
+        None => "/settings#tokens".into(),
+    }
+}
+
 /// The client's address, for rate limiting. Mirrors the login endpoint: the
 /// forwarded header is only believed behind a proxy the operator has declared.
 fn client_key(state: &AppState, headers: &HeaderMap) -> String {
@@ -115,7 +159,7 @@ pub async fn start(
                 Json(serde_json::json!({
                     "device_code": device_code,
                     "user_code": user_code,
-                    "verification_uri": "/settings#tokens",
+                    "verification_uri": verification_uri(&state, &headers),
                     "expires_in": Database::PAIRING_TTL_SECS,
                     "interval": POLL_INTERVAL_SECS,
                 })),
@@ -126,6 +170,54 @@ pub async fn start(
             warn!("Could not start pairing: {}", e);
             err(500, "Could not start pairing")
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn hdrs(pairs: &[(&str, &str)]) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        for (k, v) in pairs {
+            h.insert(axum::http::HeaderName::from_bytes(k.as_bytes()).unwrap(), v.parse().unwrap());
+        }
+        h
+    }
+
+    /// The device shows this on a screen for someone to type. A bare path is
+    /// not an address, which is what it used to return.
+    #[test]
+    fn the_verification_uri_is_somewhere_you_can_actually_go() {
+        let plain = hdrs(&[("host", "tapedeck.lan:8080")]);
+        assert_eq!(
+            build_verification_uri(false, &plain),
+            "http://tapedeck.lan:8080/settings#tokens"
+        );
+
+        // Behind a trusted proxy the browser's scheme and host are the ones
+        // that work, not the origin's — the same reasoning `cookie_is_secure`
+        // applies to the session cookie.
+        let proxied = hdrs(&[
+            ("host", "127.0.0.1:8080"),
+            ("x-forwarded-proto", "https,http"),
+            ("x-forwarded-host", "music.example.com"),
+        ]);
+        assert_eq!(
+            build_verification_uri(true, &proxied),
+            "https://music.example.com/settings#tokens"
+        );
+
+        // Untrusted, the forwarded headers are a client-supplied lie and must
+        // be ignored — otherwise anyone could make the device display a host
+        // of their choosing.
+        assert_eq!(
+            build_verification_uri(false, &proxied),
+            "http://127.0.0.1:8080/settings#tokens"
+        );
+
+        // No Host at all: a path is still better than nothing.
+        assert_eq!(build_verification_uri(false, &hdrs(&[])), "/settings#tokens");
     }
 }
 
