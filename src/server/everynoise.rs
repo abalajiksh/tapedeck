@@ -329,6 +329,16 @@ pub async fn genre_map(State(state): State<Arc<AppState>>, user: AuthUser) -> im
         .into_response()
 }
 
+/// Running totals for one period of the trajectory: the play-weighted sums of
+/// x and y, the plays behind them, and the colours to blend.
+#[derive(Default)]
+struct PeriodAccumulator {
+    x: f64,
+    y: f64,
+    plays: i64,
+    colours: Vec<(String, i64)>,
+}
+
 /// A period needs this many placed plays before it gets a point.
 ///
 /// A centroid computed from four listens is not a fact about a year, it is a
@@ -435,31 +445,30 @@ pub async fn genre_trajectory(
         .collect();
 
     // Accumulate a weighted centroid per year, and the colours that go with it.
-    let mut per_year: std::collections::BTreeMap<String, (f64, f64, i64, Vec<(String, i64)>)> =
-        Default::default();
+    let mut per_year: std::collections::BTreeMap<String, PeriodAccumulator> = Default::default();
     for (year, genre, plays) in &rows {
         let Some((x, y, colour)) = coords.get(&crate::everynoise::store::genre_key(genre)) else {
             continue;
         };
-        let e = per_year.entry(year.clone()).or_insert((0.0, 0.0, 0, Vec::new()));
-        e.0 += x * *plays as f64;
-        e.1 += y * *plays as f64;
-        e.2 += plays;
-        e.3.push((colour.clone(), *plays));
+        let e = per_year.entry(year.clone()).or_default();
+        e.x += x * *plays as f64;
+        e.y += y * *plays as f64;
+        e.plays += plays;
+        e.colours.push((colour.clone(), *plays));
     }
 
     let years: Vec<serde_json::Value> = per_year
         .into_iter()
-        .filter(|(_, (_, _, n, _))| *n >= MIN_PLAYS_PER_PERIOD)
-        .map(|(year, (sx, sy, n, colours))| {
+        .filter(|(_, a)| a.plays >= MIN_PLAYS_PER_PERIOD)
+        .map(|(year, a)| {
             let (listens, enriched) = coverage.get(&year).copied().unwrap_or((0, 0));
             let weighted: Vec<(&str, i64)> =
-                colours.iter().map(|(c, p)| (c.as_str(), *p)).collect();
+                a.colours.iter().map(|(c, p)| (c.as_str(), *p)).collect();
             serde_json::json!({
                 "year": year,
-                "x": sx / n as f64,
-                "y": sy / n as f64,
-                "plays": n,
+                "x": a.x / a.plays as f64,
+                "y": a.y / a.plays as f64,
+                "plays": a.plays,
                 "colour": blend(&weighted),
                 "listens": listens,
                 "enriched": enriched,
@@ -478,6 +487,166 @@ pub async fn genre_trajectory(
         .into_response()
 }
 
+/// How many of the caller's top genres seed the neighbour walk.
+const SEED_GENRES: usize = 25;
+
+/// GET /api/v1/genre-map/neighbours — what sits next to your listening.
+///
+/// Every Noise precomputes, per genre, its ~20 nearest and ~20 maximally
+/// opposite genres. That graph is the tier-2 walk's real payoff — it is a
+/// *global* signal, unlike the artist coordinates from the same pages, which
+/// are page-local and cannot be compared across genres.
+///
+/// **This does not recommend music.** The vision rule is that Tapedeck never
+/// points at things the listener does not own, and a genre map makes it very
+/// easy to do so accidentally — Every Noise will happily name exemplar artists
+/// for any genre. So the response is split by whether the caller *already has
+/// music there*, and the artist lists are drawn **only from their own
+/// listening history**. A genre they own nothing in is reported as a region of
+/// the map and nothing more; there is deliberately no field in which an unowned
+/// artist could travel.
+pub async fn genre_neighbours(
+    State(state): State<Arc<AppState>>,
+    user: AuthUser,
+) -> impl IntoResponse {
+    let counts = state.db.genre_play_counts(user.user_id).await.unwrap_or_default();
+    if counts.is_empty() {
+        return (StatusCode::OK, Json(serde_json::json!({ "nearby": [], "opposite": [] })))
+            .into_response();
+    }
+
+    let all_names: Vec<String> = counts.iter().map(|(n, _)| n.clone()).collect();
+    let slugs = match state.everynoise.slugs_for(&all_names).await {
+        Ok(s) => s,
+        Err(e) => {
+            error!("Neighbour slug lookup failed: {}", e);
+            return err(500, "Could not read the genre map");
+        }
+    };
+    if slugs.is_empty() {
+        return err(409, "None of your genres are on the map yet");
+    }
+
+    // Plays per genre, and the slug each maps to. Seeded from the top genres
+    // only: walking all of them would return most of the map and mean nothing.
+    let mut plays_by_slug: std::collections::HashMap<String, i64> = Default::default();
+    for (name, plays) in &counts {
+        if let Some(slug) = slugs.get(&crate::everynoise::store::genre_key(name)) {
+            *plays_by_slug.entry(slug.clone()).or_default() += plays;
+        }
+    }
+    let mut seeds: Vec<(String, i64)> =
+        plays_by_slug.iter().map(|(s, p)| (s.clone(), *p)).collect();
+    seeds.sort_by(|a, b| b.1.cmp(&a.1));
+    seeds.truncate(SEED_GENRES);
+    let seed_slugs: Vec<String> = seeds.iter().map(|(s, _)| s.clone()).collect();
+
+    // The caller's own artists, keyed by genre — the only source an artist name
+    // in this response may come from.
+    let mut mine_by_genre: std::collections::HashMap<String, Vec<(String, i64)>> =
+        Default::default();
+    for (genre, artist, plays) in state.db.artists_by_genre(user.user_id).await.unwrap_or_default()
+    {
+        mine_by_genre
+            .entry(crate::everynoise::store::genre_key(&genre))
+            .or_default()
+            .push((artist, plays));
+    }
+
+    let collect = |edges: Vec<(String, String, f64, f64, String, i64)>,
+                   seeds: &[(String, i64)],
+                   plays_by_slug: &std::collections::HashMap<String, i64>,
+                   mine: &std::collections::HashMap<String, Vec<(String, i64)>>|
+     -> Vec<serde_json::Value> {
+        let seed_plays: std::collections::HashMap<&str, i64> =
+            seeds.iter().map(|(s, p)| (s.as_str(), *p)).collect();
+
+        // Affinity: a genre bordering several of your biggest genres, closely,
+        // is more "next door" than one bordering a single small genre at rank
+        // 19. Weighting by the seed's plays and discounting by rank says that.
+        let mut score: std::collections::HashMap<String, (f64, f64, f64, String, usize)> =
+            Default::default();
+        for (from, name, x, y, colour, position) in edges {
+            let w = *seed_plays.get(from.as_str()).unwrap_or(&0) as f64
+                / (position as f64 + 1.0).sqrt();
+            let e = score.entry(name).or_insert((0.0, x, y, colour, 0));
+            e.0 += w;
+            e.4 += 1;
+        }
+
+        let mut out: Vec<_> = score.into_iter().collect();
+        out.sort_by(|a, b| b.1 .0.partial_cmp(&a.1 .0).unwrap_or(std::cmp::Ordering::Equal));
+        out.into_iter()
+            .filter_map(|(name, (affinity, x, y, colour, borders))| {
+                let key = crate::everynoise::store::genre_key(&name);
+                // Genres you already play a lot are not "next door", they are
+                // where you live — the map above already shows those.
+                let slug_plays =
+                    slugs.get(&key).and_then(|s| plays_by_slug.get(s)).copied().unwrap_or(0);
+                let mut yours: Vec<&(String, i64)> =
+                    mine.get(&key).map(|v| v.iter().collect()).unwrap_or_default();
+                yours.sort_by(|a, b| b.1.cmp(&a.1));
+
+                Some(serde_json::json!({
+                    "name": name,
+                    "x": x, "y": y, "color": colour,
+                    "borders": borders,
+                    "affinity": (affinity * 10.0).round() / 10.0,
+                    "your_plays": slug_plays,
+                    // Strictly the caller's own artists. Empty is a real answer:
+                    // it means they own nothing here, and nothing is suggested.
+                    "your_artists": yours.iter().take(4)
+                        .map(|(a, p)| serde_json::json!({ "artist": a, "plays": p }))
+                        .collect::<Vec<_>>(),
+                }))
+            })
+            .collect()
+    };
+
+    let nearby_edges =
+        state.everynoise.neighbours_of(&seed_slugs, "nearby").await.unwrap_or_default();
+    let opposite_edges =
+        state.everynoise.neighbours_of(&seed_slugs, "opposite").await.unwrap_or_default();
+
+    let mut nearby = collect(nearby_edges, &seeds, &plays_by_slug, &mine_by_genre);
+    // Drop the genres that *are* your listening — bordering yourself is not a
+    // neighbourhood.
+    nearby.retain(|g| {
+        let k = g["name"].as_str().map(crate::everynoise::store::genre_key).unwrap_or_default();
+        !seed_slugs.iter().any(|s| slugs.get(&k) == Some(s))
+    });
+    // Split rather than sorted, because the two halves answer different
+    // questions and ranking them together buries the useful one. Sorting by
+    // affinity alone puts genres you own *nothing* in at the top — the least
+    // actionable rows, since the vision rule means there is nothing to point at
+    // in them. "You have 243 plays of boy band and it is not in your top 25" is
+    // the finding; everything else is context.
+    let (owned, unexplored): (Vec<_>, Vec<_>) = nearby
+        .into_iter()
+        .partition(|g| g["your_artists"].as_array().is_some_and(|a| !a.is_empty()));
+    let mut owned = owned;
+    let mut unexplored = unexplored;
+    owned.truncate(16);
+    unexplored.truncate(16);
+
+    let mut opposite = collect(opposite_edges, &seeds, &plays_by_slug, &mine_by_genre);
+    opposite.truncate(12);
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            // Bordering genres you already have music in, underplayed.
+            "next_door": owned,
+            // Bordering genres you own nothing in. A region of the map and
+            // nothing else — there is deliberately no artist field to fill.
+            "unexplored": unexplored,
+            "opposite": opposite,
+            "seeded_from": seeds.len(),
+        })),
+    )
+        .into_response()
+}
+
 pub fn create_everynoise_router() -> Router<Arc<AppState>> {
     Router::new()
         .route("/admin/everynoise", get(status).delete(clear))
@@ -488,6 +657,7 @@ pub fn create_everynoise_router() -> Router<Arc<AppState>> {
         // caller's own listening.
         .route("/api/v1/genre-map", get(genre_map))
         .route("/api/v1/genre-map/trajectory", get(genre_trajectory))
+        .route("/api/v1/genre-map/neighbours", get(genre_neighbours))
 }
 
 #[cfg(test)]

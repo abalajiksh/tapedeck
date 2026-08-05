@@ -2621,6 +2621,32 @@ impl Database {
         .await
     }
 
+    /// `(genre, artist, plays)` for everything the user has listened to.
+    ///
+    /// The join to the genre map has to happen in Rust because matching is on
+    /// `genre_key`, which SQLite cannot compute — so this hands over the raw
+    /// triples. Bounded by distinct (artist, tag) pairs, a few thousand rows on
+    /// a large history.
+    ///
+    /// It exists so "genres next door" can name music the user **already
+    /// owns**. Pointing at anything else would make this a shopping list, which
+    /// is explicitly not what Tapedeck is for.
+    pub async fn artists_by_genre(
+        &self,
+        user_id: i64,
+    ) -> Result<Vec<(String, String, i64)>, sqlx::Error> {
+        sqlx::query_as(
+            "SELECT g.value AS genre, s.artist, COUNT(*) AS plays
+               FROM scrobbles s, json_each(s.genres) g
+              WHERE s.user_id = ? AND s.skipped = FALSE AND s.genres IS NOT NULL
+              GROUP BY LOWER(g.value), s.artist
+              ORDER BY plays DESC",
+        )
+        .bind(user_id)
+        .fetch_all(&self.pool)
+        .await
+    }
+
     /// Genre plays bucketed by year, for the listening trajectory.
     ///
     /// The year is computed in the caller's timezone rather than UTC — a listen

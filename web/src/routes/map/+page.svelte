@@ -1,10 +1,11 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
 	import { api } from '$lib/api';
-	import type { GenreMap, GenreTrajectory } from '$lib/api';
+	import type { GenreMap, GenreTrajectory, GenreNeighbours } from '$lib/api';
 
 	let data: GenreMap | null = null;
 	let traj: GenreTrajectory | null = null;
+	let nbrs: GenreNeighbours | null = null;
 	let showPath = true;
 	let loading = true;
 	let error = '';
@@ -23,6 +24,7 @@
 		// Optional: the map is useful on its own, so a trajectory failure must
 		// not take the page down with it.
 		try { traj = await api.getGenreTrajectory(); } catch { /* optional */ }
+		try { nbrs = await api.getGenreNeighbours(); } catch { /* optional */ }
 		loading = false;
 	});
 
@@ -197,6 +199,66 @@
 					things like “saxophone”, “french” or “film composer”, which describe an instrument,
 					a nationality or a role rather than a genre.
 				</p>
+			{/if}
+		</div>
+	{/if}
+
+	{#if nbrs && (nbrs.next_door.length || nbrs.unexplored.length)}
+		<div class="panel" style="border-radius:22px;padding:22px;margin-top:18px;">
+			<h3 class="h-display" style="font-size:19px;margin:0 0 4px;">Next door</h3>
+			<p style="font-size:13px;color:var(--td-muted);margin:0 0 16px;max-width:70ch;">
+				Genres bordering the {nbrs.seeded_from} you play most, using Every Noise's own
+				adjacency. Nothing here is a recommendation — the first list is music
+				<strong>you already own</strong> and rarely reach for; the second is the shape of the
+				map next to you, with no artists attached.
+			</p>
+
+			{#if nbrs.next_door.length}
+				<div style="font-size:12.5px;color:var(--td-muted-2);margin-bottom:9px;">
+					You have music here and barely play it
+				</div>
+				<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));gap:10px;">
+					{#each nbrs.next_door as g}
+						<div style="padding:11px 13px;border-radius:14px;background:var(--td-track);">
+							<div style="display:flex;align-items:center;gap:8px;margin-bottom:4px;">
+								<span style="width:10px;height:10px;border-radius:50%;background:{g.color};flex:none;"></span>
+								<strong style="font-size:13.5px;">{g.name}</strong>
+								<span style="font-size:11.5px;color:var(--td-muted-3);margin-left:auto;">{g.your_plays.toLocaleString()} plays</span>
+							</div>
+							<div style="font-size:12px;color:var(--td-muted-2);">
+								{g.your_artists.map((a) => a.artist).join(' \u00b7 ')}
+							</div>
+						</div>
+					{/each}
+				</div>
+			{/if}
+
+			{#if nbrs.unexplored.length}
+				<div style="font-size:12.5px;color:var(--td-muted-2);margin:18px 0 9px;">
+					Bordering regions you have nothing in
+				</div>
+				<div style="display:flex;flex-wrap:wrap;gap:8px;">
+					{#each nbrs.unexplored as g}
+						<span style="display:inline-flex;align-items:center;gap:7px;padding:5px 11px;border-radius:999px;background:var(--td-track);font-size:12.5px;color:var(--td-muted);">
+							<span style="width:9px;height:9px;border-radius:50%;background:{g.color};flex:none;opacity:.8;"></span>
+							{g.name}
+						</span>
+					{/each}
+				</div>
+			{/if}
+
+			{#if nbrs.opposite.length}
+				<div style="font-size:12.5px;color:var(--td-muted-2);margin:18px 0 9px;">
+					Furthest from your listening
+				</div>
+				<div style="display:flex;flex-wrap:wrap;gap:8px;">
+					{#each nbrs.opposite.slice(0, 10) as g}
+						<span style="display:inline-flex;align-items:center;gap:7px;padding:5px 11px;border-radius:999px;background:var(--td-track);font-size:12.5px;color:var(--td-muted-3);">
+							<span style="width:9px;height:9px;border-radius:50%;background:{g.color};flex:none;opacity:.6;"></span>
+							{g.name}
+						</span>
+					{/each}
+				</div>
 			{/if}
 		</div>
 	{/if}

@@ -59,6 +59,31 @@ export interface GenreMap {
 	listens_total: number;
 }
 
+/** A genre adjacent to the caller's listening. */
+export interface NeighbourGenre {
+	name: string;
+	x: number;
+	y: number;
+	color: string;
+	/** How many of your top genres border it. */
+	borders: number;
+	affinity: number;
+	your_plays: number;
+	/** Strictly your own artists. Always empty for `unexplored` — Tapedeck
+	 *  never points at music you don't own. */
+	your_artists: { artist: string; plays: number }[];
+}
+
+export interface GenreNeighbours {
+	/** Bordering genres you already own music in, and underplay. */
+	next_door: NeighbourGenre[];
+	/** Bordering genres you own nothing in — a region, never a suggestion. */
+	unexplored: NeighbourGenre[];
+	/** Genres your listening is furthest from. */
+	opposite: NeighbourGenre[];
+	seeded_from: number;
+}
+
 /** Play-weighted centre of each year's listening, on the same map coordinates. */
 export interface GenreTrajectory {
 	years: {
@@ -1032,6 +1057,11 @@ class TapedeckAPI {
 	/** Does the credential actually work? Discogs answers a bad one with a normal 200. */
 	async testDiscogsSetting(): Promise<{ ok: boolean; message: string }> {
 		return this.post('/api/v1/physical/settings/discogs/test');
+	}
+
+	/** Genres bordering the caller's listening. */
+	async getGenreNeighbours(): Promise<GenreNeighbours> {
+		return this.get('/api/v1/genre-map/neighbours');
 	}
 
 	/** Where the caller's listening sat, year by year. */

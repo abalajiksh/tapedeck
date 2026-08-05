@@ -403,6 +403,63 @@ impl EveryNoiseStore {
         Ok((row.0.unwrap_or(0.0), row.1.unwrap_or(0.0)))
     }
 
+    /// Map genre names to slugs, keyed by `genre_key` — the entry point for
+    /// anything that needs the adjacency graph, which is keyed by slug.
+    pub async fn slugs_for(
+        &self,
+        names: &[String],
+    ) -> Result<std::collections::HashMap<String, String>, sqlx::Error> {
+        let mut out = std::collections::HashMap::new();
+        for chunk in names.chunks(500) {
+            if chunk.is_empty() {
+                continue;
+            }
+            let placeholders = vec!["?"; chunk.len()].join(",");
+            let sql =
+                format!("SELECT loose_key, slug FROM genres WHERE loose_key IN ({})", placeholders);
+            let mut q = sqlx::query_as::<_, (String, String)>(&sql);
+            for n in chunk {
+                q = q.bind(genre_key(n));
+            }
+            for (k, slug) in q.fetch_all(&self.pool).await? {
+                out.insert(k, slug);
+            }
+        }
+        Ok(out)
+    }
+
+    /// The neighbours of a set of genres, in one relation.
+    ///
+    /// Returns `(from_slug, to_name, x, y, colour, position)`. `position` is the
+    /// rank Every Noise itself gave the neighbour, so a caller can weight the
+    /// closest ones higher rather than treating twenty neighbours as equal.
+    pub async fn neighbours_of(
+        &self,
+        slugs: &[String],
+        relation: &str,
+    ) -> Result<Vec<(String, String, f64, f64, String, i64)>, sqlx::Error> {
+        let mut out = Vec::new();
+        for chunk in slugs.chunks(400) {
+            if chunk.is_empty() {
+                continue;
+            }
+            let placeholders = vec!["?"; chunk.len()].join(",");
+            let sql = format!(
+                "SELECT e.genre_slug, g.name, g.x, g.y, g.color, e.position
+                   FROM genre_edges e JOIN genres g ON g.slug = e.related_slug
+                  WHERE e.relation = ? AND e.genre_slug IN ({})",
+                placeholders
+            );
+            let mut q = sqlx::query_as::<_, (String, String, f64, f64, String, i64)>(&sql);
+            q = q.bind(relation);
+            for s in chunk {
+                q = q.bind(s);
+            }
+            out.extend(q.fetch_all(&self.pool).await?);
+        }
+        Ok(out)
+    }
+
     /// Wipe everything. The data is re-acquirable, so this is a reset rather
     /// than a destructive act — but it does mean another full walk.
     pub async fn clear(&self) -> Result<(), sqlx::Error> {
