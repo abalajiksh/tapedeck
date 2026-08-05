@@ -28,7 +28,7 @@
 	$: loved = trackKey ? $lovedKeys.has(trackKey) : false;
 </script>
 
-<div class="row" style="display:flex;align-items:center;gap:14px;padding:13px 18px;border-bottom:1px solid var(--td-border);{selected ? 'background:color-mix(in srgb, var(--td-accent) 8%, transparent);' : ''}">
+<div class="row" style="border-bottom:1px solid var(--td-border);{selected ? 'background:color-mix(in srgb, var(--td-accent) 8%, transparent);' : ''}">
 	{#if selectable}
 		<input type="checkbox" checked={selected} on:change={() => dispatch('toggle', scrobble)}
 			aria-label="Select listen" style="width:18px;height:18px;flex:none;accent-color:var(--td-accent);cursor:pointer;">
@@ -36,19 +36,26 @@
 	<CoverArt url={scrobble.artwork_url} caaId={scrobble.caa_id} releaseMbid={scrobble.caa_release_mbid} {seed} />
 	<div style="flex:1;min-width:0;">
 		<div style="font-size:14.5px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">{scrobble.title}</div>
-		<div style="font-size:12.5px;color:var(--td-muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">
-			{#if linkable}
-				<!-- Buttons rather than anchors: the row knows names, and an entity
-				     id has to be resolved (and possibly created) before there is a
-				     URL to go to. -->
-				<button class="xref" on:click|stopPropagation={() => openArtist(scrobble.artist)}>{scrobble.artist}</button>
-				{#if scrobble.album}
-					<span aria-hidden="true"> — </span>
-					<button class="xref" on:click|stopPropagation={() => scrobble.album && openAlbum(scrobble.artist, scrobble.album)}>{scrobble.album}</button>
+		<div class="subline">
+			<span class="names">
+				{#if linkable}
+					<!-- Buttons rather than anchors: the row knows names, and an entity
+					     id has to be resolved (and possibly created) before there is a
+					     URL to go to. -->
+					<button class="xref" on:click|stopPropagation={() => openArtist(scrobble.artist)}>{scrobble.artist}</button>
+					{#if scrobble.album}
+						<span aria-hidden="true"> — </span>
+						<button class="xref" on:click|stopPropagation={() => scrobble.album && openAlbum(scrobble.artist, scrobble.album)}>{scrobble.album}</button>
+					{/if}
+				{:else}
+					{scrobble.artist}{scrobble.album ? ` — ${scrobble.album}` : ''}
 				{/if}
-			{:else}
-				{scrobble.artist}{scrobble.album ? ` — ${scrobble.album}` : ''}
-			{/if}
+			</span>
+			<!-- The same badge as the one in the row, shown only once: narrow
+			     viewports move it down here so the title keeps the whole first
+			     line. Rendering it twice and letting CSS choose is what avoids a
+			     resize listener for something that is purely a layout question. -->
+			{#if q.text}<span class="{tierTagClass(q.tier)} qtag-inline">{q.text}</span>{/if}
 		</div>
 	</div>
 	{#if showLove && !selectable}
@@ -65,9 +72,9 @@
 			</svg>
 		</button>
 	{/if}
-	{#if q.text}<span class={tierTagClass(q.tier)}>{q.text}</span>{/if}
-	<span style="font-size:12px;color:var(--td-muted-3);width:54px;text-align:right;flex:none;">{formatDuration(scrobble.duration)}</span>
-	<span style="font-size:12px;color:var(--td-muted-3);width:52px;text-align:right;flex:none;">{showMenu ? time : timeAgo(scrobble.timestamp)}</span>
+	{#if q.text}<span class="{tierTagClass(q.tier)} qtag-row">{q.text}</span>{/if}
+	<span class="dur">{formatDuration(scrobble.duration)}</span>
+	<span class="when">{showMenu ? time : timeAgo(scrobble.timestamp)}</span>
 	{#if showMenu && !selectable}
 		<button on:click={() => dispatch('menu', scrobble)} aria-label="Listen actions" style="border:none;background:transparent;cursor:pointer;color:var(--td-muted-3);padding:5px;border-radius:8px;flex:none;display:flex;">
 			<svg viewBox="0 0 24 24" width="18" fill="currentColor"><circle cx="12" cy="5" r="1.7"/><circle cx="12" cy="12" r="1.7"/><circle cx="12" cy="19" r="1.7"/></svg>
@@ -76,6 +83,57 @@
 </div>
 
 <style>
+	.row {
+		display: flex;
+		align-items: center;
+		gap: 14px;
+		padding: 13px 18px;
+	}
+	.subline {
+		display: flex;
+		align-items: center;
+		gap: 8px;
+		font-size: 12.5px;
+		color: var(--td-muted);
+		min-width: 0;
+	}
+	.names {
+		white-space: nowrap;
+		overflow: hidden;
+		text-overflow: ellipsis;
+		min-width: 0;
+	}
+	.dur, .when {
+		font-size: 12px;
+		color: var(--td-muted-3);
+		text-align: right;
+		flex: none;
+	}
+	.dur { width: 54px; }
+	.when { width: 52px; }
+
+	/* One badge is shown at a time — the row's on wide viewports, the subline's
+	   on narrow ones. */
+	.qtag-inline { display: none; }
+	.qtag-row { flex: none; }
+
+	/* The row has seven fixed-width columns, and `.tag` is `white-space: nowrap`,
+	   so the badge never gave any width back. Everything else is `flex:none`,
+	   which left the title — the only `flex:1` item — absorbing the entire
+	   shortfall: on a 360px viewport the fixed columns already overflow the row,
+	   so the title was squeezed to a character or two. Below this width the
+	   title takes the whole first line and the badge drops to the subline. */
+	@media (max-width: 640px) {
+		.row { gap: 10px; padding: 12px 14px; }
+		.qtag-row { display: none; }
+		.qtag-inline { display: inline-flex; flex: none; }
+		/* Running time is the one column genuinely available elsewhere (the
+		   album page lists it); the timestamp is what makes a history row mean
+		   anything, so that stays. */
+		.dur { display: none; }
+		.when { width: 44px; }
+	}
+
 	/* Present but quiet until you go looking for it; a filled heart stays
 	   visible, because that one is information rather than an affordance. */
 	.love {
