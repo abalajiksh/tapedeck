@@ -19,6 +19,7 @@ use serde::Deserialize;
 use std::any::Any;
 use std::collections::HashMap;
 use std::time::Duration;
+use tracing::debug;
 
 use crate::models::{AudioQuality, Play};
 use crate::sources::MusicSource;
@@ -30,6 +31,16 @@ const TICKS_PER_SECOND: u64 = 10_000_000;
 /// comes first. Matches the Plex source and the Last.fm convention.
 const SCROBBLE_FRACTION: f64 = 0.5;
 const SCROBBLE_AFTER_SECS: u64 = 240;
+
+/// How far the playhead must jump backwards before it counts as the track
+/// starting over rather than the user scrubbing.
+///
+/// A repeat always lands near zero, so this only has to clear ordinary
+/// seek-back noise. Jellyfin reports an exact tick count rather than Plex's
+/// coarse `viewOffset`, but the same 20 seconds is used for both — the number
+/// is about what a *person* means by "I skipped back a bit", not about the
+/// precision of the source.
+const REPEAT_REWIND_SECS: u64 = 20;
 
 /// An account on the Jellyfin server. Sessions are matched on `name`, which is
 /// what `SessionInfo.UserName` carries.
@@ -54,6 +65,8 @@ pub struct JellyfinSource {
 struct SessionProgress {
     item_id: String,
     scrobbled: bool,
+    /// Last playhead seen, so a track starting over can be told from a seek.
+    last_position: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -391,7 +404,17 @@ impl JellyfinSource {
             return Err(format!("Jellyfin /Sessions returned {}", resp.status()).into());
         }
         let sessions: Vec<JellyfinSession> = resp.json().await?;
+        Ok(self.consume_sessions(sessions))
+    }
 
+    /// The pure half of `fetch_sessions`: decide what is playing and what has
+    /// crossed the threshold, given a batch of sessions.
+    ///
+    /// Split out so the repeat and seek behaviour can be tested without a
+    /// server — the same reason Plex has `process_live_track`. That behaviour
+    /// is state held across calls, which is exactly the kind that goes wrong
+    /// silently.
+    pub fn consume_sessions(&mut self, sessions: Vec<JellyfinSession>) -> JellyfinSessions {
         let mut result = JellyfinSessions::default();
         let mut live_sessions = Vec::new();
 
@@ -440,17 +463,40 @@ impl JellyfinSource {
             // position isn't advancing, so it shouldn't cross the threshold.
             let paused = session.play_state.as_ref().and_then(|p| p.is_paused).unwrap_or(false);
 
-            let entry = self
-                .seen
-                .entry(session.id.clone())
-                .or_insert_with(|| SessionProgress { item_id: item.id.clone(), scrobbled: false });
+            let entry = self.seen.entry(session.id.clone()).or_insert_with(|| SessionProgress {
+                item_id: item.id.clone(),
+                scrobbled: false,
+                last_position: position,
+            });
 
             // A new track in the same session resets the scrobble state,
             // otherwise only the first song of a queue would ever count.
             if entry.item_id != item.id {
                 entry.item_id = item.id.clone();
                 entry.scrobbled = false;
+            } else if entry.last_position > position
+                && entry.last_position - position >= REPEAT_REWIND_SECS
+            {
+                // A track on repeat is invisible to the item check above:
+                // Jellyfin keeps the same session *and* the same item, so
+                // `scrobbled` stayed true forever and only the first of N plays
+                // was ever banked — the same bug Plex had until v0.13.3, which
+                // this mirrors. The playhead jumping backwards is the one
+                // signal that the track started over.
+                //
+                // Requiring that we had *already* banked this pass is what
+                // stops scrubbing around inside one listen minting extra
+                // scrobbles: a rewind before the threshold changes nothing,
+                // because there was nothing to undo.
+                if entry.scrobbled {
+                    debug!(
+                        "Playhead rewound in session {} ({}s -> {}s): '{}' started over",
+                        session.id, entry.last_position, position, item.name
+                    );
+                }
+                entry.scrobbled = false;
             }
+            entry.last_position = position;
 
             let past_threshold = !paused
                 && match duration {
@@ -463,7 +509,16 @@ impl JellyfinSource {
 
             if past_threshold && !entry.scrobbled {
                 entry.scrobbled = true;
-                result.ready_to_scrobble.push(track.clone());
+                // The banked copy gets a source_id unique to *this pass*. The
+                // now-playing copy keeps the stable one, which is what the deck
+                // wants. Without this the id was `jellyfin-<item>-<device>` —
+                // identical on every repeat, so `Database::exists` dropped the
+                // second and third plays permanently, not merely within a
+                // window. Plex has always put the scrobble time in its suffix
+                // for exactly this reason.
+                let mut banked = track.clone();
+                banked.play.source_id = format!("jellyfin-{}-scrobble-{}", item.id, now_secs());
+                result.ready_to_scrobble.push(banked);
             }
             result.now_playing.push(track);
         }
@@ -471,7 +526,7 @@ impl JellyfinSource {
         // Forget sessions that have gone away, so the map doesn't grow forever
         // and a returning session starts clean.
         self.seen.retain(|id, _| live_sessions.contains(id));
-        Ok(result)
+        result
     }
 
     fn to_play(item: &NowPlayingItem, device: &Option<String>) -> Play {
@@ -973,6 +1028,62 @@ mod tests {
         // A different device is a different playback.
         let c = JellyfinSource::to_play(&item("i1", 293), &Some("Phone".into()));
         assert_ne!(a.source_id, c.source_id);
+    }
+
+    /// Build a `/Sessions` body for one track at a given playhead, always the
+    /// same session and the same item — which is exactly what repeat looks
+    /// like from here.
+    fn session_at(position_secs: u64) -> String {
+        format!(
+            r#"[{{
+                "Id": "sess-1", "UserName": "abalaji", "DeviceId": "dev-1",
+                "PlayState": {{ "PositionTicks": {}, "IsPaused": false, "PlayMethod": "DirectPlay" }},
+                "NowPlayingItem": {{
+                    "Id": "item-1", "Name": "Combustible", "Type": "Audio",
+                    "Album": "Blonde", "Artists": ["Cœur de pirate"],
+                    "RunTimeTicks": {}, "IndexNumber": 1
+                }}
+            }}]"#,
+            position_secs * TICKS_PER_SECOND,
+            200 * TICKS_PER_SECOND
+        )
+    }
+
+    /// Playing one track three times on repeat must bank three listens.
+    ///
+    /// This is the bug Plex had until v0.13.3 and Jellyfin still had after it:
+    /// the session and the item are both unchanged on a repeat, so the
+    /// `item_id` check never fired, `scrobbled` stayed true, and only the first
+    /// of N plays was ever recorded. Nothing errored — the listens were simply
+    /// missing.
+    #[tokio::test]
+    async fn a_looped_track_scrobbles_once_per_pass() {
+        let mut src = JellyfinSource::new("http://jf:8096".into(), "k".into(), "abalaji".into());
+        let mut banked = 0usize;
+
+        for pass in 0..3 {
+            // Each pass walks the playhead from near zero, past the halfway
+            // threshold, to the end. Only the offset says a new play began.
+            for secs in [3u64, 120, 195] {
+                let sessions: Vec<JellyfinSession> =
+                    serde_json::from_str(&session_at(secs)).unwrap();
+                banked += src.consume_sessions(sessions).ready_to_scrobble.len();
+            }
+            assert_eq!(banked, pass + 1, "pass {pass} should have banked exactly one");
+        }
+    }
+
+    /// Scrubbing back a few seconds inside one listen is not a new play, or
+    /// fidgeting with the playhead would mint scrobbles.
+    #[tokio::test]
+    async fn a_small_seek_back_is_not_a_repeat() {
+        let mut src = JellyfinSource::new("http://jf:8096".into(), "k".into(), "abalaji".into());
+        let mut banked = 0usize;
+        for secs in [120u64, 115, 118, 160, 195] {
+            let sessions: Vec<JellyfinSession> = serde_json::from_str(&session_at(secs)).unwrap();
+            banked += src.consume_sessions(sessions).ready_to_scrobble.len();
+        }
+        assert_eq!(banked, 1, "one listen, however much the playhead was nudged");
     }
 
     #[test]

@@ -340,6 +340,10 @@ pub struct Database {
     secrets: Arc<SecretBox>,
 }
 
+/// How long after a listen a second report of it is still assumed to be the
+/// same play rather than a repeat. See `fuzzy_exists`.
+const DUPLICATE_WINDOW_SECS: i64 = 60;
+
 impl Database {
     pub async fn new(database_url: &str, secrets: Arc<SecretBox>) -> Result<Self, sqlx::Error> {
         // WAL + a busy_timeout let concurrent writers (poll engine, HTTP
@@ -1416,7 +1420,20 @@ impl Database {
     /// Unknown duration falls back to a conservative minute: better a rare
     /// duplicate than a silently dropped listen.
     pub async fn fuzzy_exists(&self, user_id: i64, play: &Play) -> Result<bool, sqlx::Error> {
-        let window = play.duration.map(|d| (d as i64).clamp(60, 600)).unwrap_or(60);
+        // A duplicate is a *reporting lag* phenomenon and is therefore roughly
+        // constant: the same play arriving from a second code path lands within
+        // seconds (measured across a 21k-listen export: 0-51s, median 3s). A
+        // repeat is one full track later. So the window is a constant, capped
+        // below one track length so a short track's repeat still escapes it.
+        //
+        // It used to be the duration itself, which put a back-to-back repeat
+        // *exactly* on the boundary — and `BETWEEN` is inclusive, so whether a
+        // second play survived came down to poll jitter. That is why a track
+        // played twice showed up once, intermittently.
+        let window = play
+            .duration
+            .map(|d| (d as i64 * 4 / 5).clamp(20, DUPLICATE_WINDOW_SECS))
+            .unwrap_or(DUPLICATE_WINDOW_SECS);
         let timestamp = play.timestamp as i64;
         let count: (i64,) = sqlx::query_as(
             "SELECT COUNT(*) FROM scrobbles WHERE user_id = ? AND title = ? AND artist = ?
@@ -6435,6 +6452,82 @@ mod tests {
 
     fn play(title: &str, artist: &str, ts: u64) -> Play {
         Play::new(title.into(), artist.into(), ts, format!("src-{ts}"), "test".into())
+    }
+
+    /// Three consecutive plays of one track must store three listens.
+    ///
+    /// The window used to be the track's own duration, and a back-to-back
+    /// repeat lands *exactly* one duration later — right on an inclusive
+    /// `BETWEEN` boundary. Whether the second play survived came down to poll
+    /// jitter, which is why a track played twice showed up once, sometimes.
+    #[tokio::test]
+    async fn a_track_on_repeat_is_not_deduplicated_away() {
+        let db = testdb().await;
+        let duration = 200u64;
+
+        for pass in 0..3u64 {
+            // Each pass is banked halfway through, so consecutive plays are
+            // exactly one track length apart.
+            let scrobbled_at = 1_700_000_000 + pass * duration + duration / 2;
+            let mut p = play("Combustible", "Cœur de pirate", scrobbled_at);
+            p.duration = Some(duration);
+            // A per-pass id, as the live sources now produce.
+            p.source_id = format!("jellyfin-item1-scrobble-{scrobbled_at}");
+            assert!(
+                db.save_scrobble(
+                    1,
+                    &p,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    ListenDisposition::LIVE
+                )
+                .await
+                .unwrap(),
+                "pass {pass} should have been stored"
+            );
+        }
+        assert_eq!(db.listen_count_and_latest(1).await.unwrap().0, 3);
+    }
+
+    /// The same play arriving twice from two code paths — the live session and
+    /// the history walk — is still one listen. This is what the window is for,
+    /// and it must keep working now that the window is smaller.
+    #[tokio::test]
+    async fn the_same_play_reported_twice_is_still_one_listen() {
+        let db = testdb().await;
+        let mut first = play("Combustible", "Cœur de pirate", 1_700_000_000);
+        first.duration = Some(200);
+        assert!(db
+            .save_scrobble(1, &first, None, None, None, None, None, None, ListenDisposition::LIVE)
+            .await
+            .unwrap());
+
+        // Seconds later, under a different source_id, as the history endpoint
+        // re-reports what the live session already banked.
+        let mut echo = play("Combustible", "Cœur de pirate", 1_700_000_000 + 45);
+        echo.duration = Some(200);
+        echo.source_id = "jellyfin-item1-history-9".into();
+        assert!(
+            !db.save_scrobble(
+                1,
+                &echo,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                ListenDisposition::LIVE
+            )
+            .await
+            .unwrap(),
+            "a re-report within the lag window is the same listen"
+        );
+        assert_eq!(db.listen_count_and_latest(1).await.unwrap().0, 1);
     }
 
     /// A pairing code mints exactly one token and hands it over exactly once.
