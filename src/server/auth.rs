@@ -54,6 +54,80 @@ impl FromRequestParts<Arc<super::AppState>> for AuthUser {
     }
 }
 
+/// `ReadAuth` accepts a session cookie **or** an `Authorization: Token` header
+/// whose token carries the `read` scope.
+///
+/// It exists so a scrobble client can *ask* rather than guess. A plugin that
+/// wants to attribute a listen to a signal chain has to name one, and without
+/// this it could only take unvalidatable free text from the user — there was no
+/// way to fetch the list of chains that actually exist.
+///
+/// Three rules keep it narrow, and none of them should be relaxed casually:
+///
+/// * **`read` is an explicit grant**, never implied by `submit`. A client that
+///   only posts listens does not silently gain the ability to enumerate the
+///   user's gear because `tokens.scopes` happened to exist.
+/// * **Reads only, and only the caller's own data.** Every handler using this
+///   must still scope its queries by `user.user_id`, exactly as it did under
+///   `AuthUser` — this widens *who may ask*, not *what may be seen*.
+/// * **Nothing that writes, and nothing under `/admin/`.** Those stay on
+///   `AuthUser`, which is session-only, so a leaked token cannot change
+///   anything or reach user management.
+pub struct ReadAuth {
+    pub user: AuthUser,
+}
+
+#[axum::async_trait]
+impl FromRequestParts<Arc<super::AppState>> for ReadAuth {
+    type Rejection = Rejection;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &Arc<super::AppState>,
+    ) -> Result<Self, Self::Rejection> {
+        if let Some(user) = session_user(parts, state).await {
+            return Ok(ReadAuth { user });
+        }
+
+        let header = parts.headers.get("authorization").and_then(|v| v.to_str().ok()).unwrap_or("");
+        let token = header
+            .strip_prefix("Token ")
+            .or_else(|| header.strip_prefix("token "))
+            .unwrap_or("")
+            .trim();
+        if !token.is_empty() {
+            return match state.db.validate_token(token).await {
+                Ok(Some(t)) if t.can_read() => Ok(ReadAuth { user: t.user }),
+                // A valid token without the grant is 403, not 401: the caller
+                // authenticated fine and re-authenticating will not help. A 401
+                // would send a client into a token-refresh loop it cannot win.
+                Ok(Some(_)) => Err((
+                    StatusCode::FORBIDDEN,
+                    Json(super::models::ErrorResponse {
+                        code: 403,
+                        error: "This token does not have the 'read' scope".into(),
+                    }),
+                )),
+                Ok(None) => Err(unauthorized("Invalid token")),
+                Err(e) => {
+                    tracing::error!("Token validation error: {}", e);
+                    Err((
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(super::models::ErrorResponse {
+                            code: 500,
+                            error: "Internal server error".into(),
+                        }),
+                    ))
+                }
+            };
+        }
+
+        Err(unauthorized(
+            "Authentication required. Provide a session cookie or Authorization: Token header.",
+        ))
+    }
+}
+
 /// `IngestAuth` accepts a session cookie **or** an `Authorization: Token` header.
 /// Used by exactly one route — `POST /1/submit-listens` — so a token can
 /// authenticate nowhere else.

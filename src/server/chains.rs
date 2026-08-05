@@ -8,7 +8,7 @@ use axum::{
 use serde::Deserialize;
 use std::sync::Arc;
 
-use super::auth::AuthUser;
+use super::auth::{AuthUser, ReadAuth};
 use super::models::ErrorResponse;
 use super::AppState;
 use crate::models::*;
@@ -66,7 +66,10 @@ async fn create_chain(
     }
 }
 
-async fn list_chains(State(state): State<Arc<AppState>>, user: AuthUser) -> impl IntoResponse {
+async fn list_chains(
+    State(state): State<Arc<AppState>>,
+    ReadAuth { user }: ReadAuth,
+) -> impl IntoResponse {
     match state.db.get_chains(user.user_id).await {
         Ok(chains) => {
             (StatusCode::OK, Json(serde_json::json!({ "chains": chains }))).into_response()
@@ -155,7 +158,10 @@ async fn delete_chain(
 
 // ── Device endpoints ──
 
-async fn list_devices(State(state): State<Arc<AppState>>, user: AuthUser) -> impl IntoResponse {
+async fn list_devices(
+    State(state): State<Arc<AppState>>,
+    ReadAuth { user }: ReadAuth,
+) -> impl IntoResponse {
     match state.db.get_devices(user.user_id).await {
         Ok(devices) => {
             (StatusCode::OK, Json(serde_json::json!({ "devices": devices }))).into_response()
@@ -250,7 +256,10 @@ async fn create_equipment(
     }
 }
 
-async fn list_equipment(State(state): State<Arc<AppState>>, user: AuthUser) -> impl IntoResponse {
+async fn list_equipment(
+    State(state): State<Arc<AppState>>,
+    ReadAuth { user }: ReadAuth,
+) -> impl IntoResponse {
     match state.db.get_equipment(user.user_id).await {
         Ok(gear) => {
             (StatusCode::OK, Json(serde_json::json!({ "equipment": gear }))).into_response()
@@ -325,7 +334,10 @@ async fn delete_equipment(
 
 // ── Output-device → chain bindings (Phase B) ──
 
-async fn list_bindings(State(state): State<Arc<AppState>>, user: AuthUser) -> impl IntoResponse {
+async fn list_bindings(
+    State(state): State<Arc<AppState>>,
+    ReadAuth { user }: ReadAuth,
+) -> impl IntoResponse {
     match state.db.list_bindings(user.user_id).await {
         Ok(bindings) => {
             (StatusCode::OK, Json(serde_json::json!({ "bindings": bindings }))).into_response()

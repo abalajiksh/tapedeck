@@ -5632,13 +5632,13 @@ impl Database {
     pub async fn validate_token(&self, token: &str) -> Result<Option<TokenAuth>, sqlx::Error> {
         let token_hash = Self::hash_token(token);
         let now = Self::now_secs();
-        let row: Option<(i64, String, String, i64, Option<i64>)> = sqlx::query_as(
-            "SELECT u.id, u.username, u.role, t.id, t.default_chain_id
+        let row: Option<(i64, String, String, i64, Option<i64>, Option<String>)> = sqlx::query_as(
+            "SELECT u.id, u.username, u.role, t.id, t.default_chain_id, t.scopes
              FROM tokens t JOIN users u ON t.user_id = u.id
              WHERE t.token_hash = ? AND (t.expires_at IS NULL OR t.expires_at > ?) AND u.disabled = 0"
         ).bind(&token_hash).bind(now).fetch_optional(&self.pool).await?;
 
-        if let Some((user_id, username, role, token_id, default_chain_id)) = row {
+        if let Some((user_id, username, role, token_id, default_chain_id, scopes)) = row {
             let _ = sqlx::query("UPDATE tokens SET last_used_at = ? WHERE token_hash = ?")
                 .bind(now)
                 .bind(&token_hash)
@@ -5648,6 +5648,7 @@ impl Database {
                 user: AuthUser { user_id, username, is_admin: role == "admin" },
                 token_id,
                 default_chain_id,
+                scopes: scopes.unwrap_or_default(),
             }))
         } else {
             Ok(None)
@@ -6119,6 +6120,24 @@ pub struct TokenAuth {
     pub user: AuthUser,
     pub token_id: i64,
     pub default_chain_id: Option<i64>,
+    /// Space- or comma-separated grants from `tokens.scopes`. Written since
+    /// tokens existed and, until now, never read — so every token was
+    /// effectively `submit`-only by virtue of nothing else accepting one.
+    pub scopes: String,
+}
+
+impl TokenAuth {
+    /// May this token read the caller's own data?
+    ///
+    /// Deliberately narrow: `read` is an explicit grant, not something `submit`
+    /// implies. A scrobble client that only ever posts listens should not
+    /// silently gain the ability to enumerate the user's gear because the
+    /// scopes column happened to exist.
+    pub fn can_read(&self) -> bool {
+        self.scopes
+            .split(|c: char| c == ',' || c.is_whitespace())
+            .any(|s| matches!(s.trim(), "read" | "all"))
+    }
 }
 
 #[derive(Debug, FromRow, serde::Serialize)]

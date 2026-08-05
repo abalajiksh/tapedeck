@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use super::auth::AuthUser;
+use super::auth::{AuthUser, ReadAuth};
 use super::AppState;
 use crate::models::{AudioQuality, Play};
 
@@ -163,7 +163,10 @@ impl NowPlayingRegistry {
 }
 
 /// GET /api/v1/now-playing → `{ playing, track?, position? }`
-async fn now_playing(State(state): State<Arc<AppState>>, user: AuthUser) -> impl IntoResponse {
+async fn now_playing(
+    State(state): State<Arc<AppState>>,
+    ReadAuth { user }: ReadAuth,
+) -> impl IntoResponse {
     match state.now_playing.get(user.user_id) {
         Some((track, position)) => (
             StatusCode::OK,

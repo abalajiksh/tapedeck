@@ -40,6 +40,10 @@
 
 	let newTokenName = '';
 	let newTokenChain = ''; // '' = no chain; otherwise the chain id as a string
+	// Off by default, and deliberately: `read` is an explicit grant, never
+	// implied by `submit`. A scrobble client that only posts listens has no
+	// business enumerating your gear.
+	let newTokenRead = false;
 	let createdToken = '';
 	let tokenCopied = false;
 	let creating = false;
@@ -528,11 +532,13 @@
 		createdToken = '';
 		try {
 			const result = await api.createToken(newTokenName.trim(), {
+				scopes: newTokenRead ? 'submit read' : 'submit',
 				default_chain_id: newTokenChain ? Number(newTokenChain) : null
 			});
 			createdToken = result.token;
 			newTokenName = '';
 			newTokenChain = '';
+			newTokenRead = false;
 			tokens = (await api.getTokens()).tokens;
 		} catch (e) { console.error('Create token failed:', e); }
 		creating = false;
@@ -905,11 +911,17 @@
 								{#each chains as c}<option value={String(c.id)}>{c.name}</option>{/each}
 							</select>
 						{/if}
+						<label style="display:flex;align-items:center;gap:7px;font-size:13px;color:var(--td-muted);white-space:nowrap;">
+							<input type="checkbox" bind:checked={newTokenRead} style="width:16px;height:16px;accent-color:var(--td-accent);cursor:pointer;">
+							Allow reading
+						</label>
 						<button class="btn btn-primary" on:click={createToken} disabled={creating || !newTokenName.trim()}>{creating ? '…' : 'Create'}</button>
 					</div>
 					<p style="font-size:12px;color:var(--td-muted-2);margin:10px 0 0;">
 						One token per app is the idea: give it a chain here and every listen it submits is attributed to that setup, with nothing to configure in the app itself.
 						A listen that carries its own chain, or arrives through a mapped output, still wins.
+						<br>
+						<strong>Allow reading</strong> additionally lets the app list your chains, devices, gear and what's playing — so it can offer a chain picker instead of asking you to type a name. It can still only read your own data, and can't change anything.
 					</p>
 					<p style="font-size:12px;color:var(--td-muted-2);margin:8px 0 0;">Tokens can only submit listens. Reading, editing, and admin actions require signing in here.</p>
 				{/if}
