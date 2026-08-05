@@ -2259,6 +2259,18 @@ impl Database {
             let breadth = |name: &str| -> usize {
                 album_tracks.get(&album_key).and_then(|m| m.get(name)).map_or(0, |t| t.len())
             };
+            // A compilation files *every* track under "Various Artists", so it
+            // wins breadth on every record it appears on — and folding onto it
+            // would replace real performers with a placeholder, which is the
+            // exact damage this pass exists to undo. It can be folded *away
+            // from*, never *onto*.
+            if credits.iter().all(|(a, _)| is_various_artists(a)) {
+                continue;
+            }
+            credits.retain(|(a, _)| !is_various_artists(a));
+            if credits.len() < 2 {
+                continue;
+            }
             // Widest credit on the record first, then total plays, then plays
             // on this track.
             credits.sort_by(|a, b| {
@@ -5689,6 +5701,16 @@ fn new_uuid() -> String {
 /// reduce to `arrahman`. It is only ever used to *group candidates for review*,
 /// never to rewrite anything on its own, so a false pairing costs a line in a
 /// preview rather than corrupted data.
+/// A "no single artist" placeholder, not an artist.
+///
+/// Shared with the Plex source, which must not record a compilation's tracks
+/// under it. Here it keeps the sanitiser from folding real performers onto a
+/// placeholder: "Various Artists" is on every track of a compilation, so it
+/// wins the breadth test outright.
+pub fn is_various_artists(name: &str) -> bool {
+    crate::sources::plex::is_various_artists(name)
+}
+
 pub fn normalise_artist(s: &str) -> String {
     s.chars().filter(|c| c.is_alphanumeric()).flat_map(|c| c.to_lowercase()).collect()
 }

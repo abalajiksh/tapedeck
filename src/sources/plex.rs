@@ -176,6 +176,23 @@ pub fn artist_matches(a: &str, b: &str) -> bool {
     !a.is_empty() && a == b
 }
 
+/// Is this a "no single artist" placeholder rather than an artist?
+///
+/// A compilation files every track under one of these, so treating it as the
+/// record's artist records the whole album under it — which is what happened to
+/// "Do You Like Brahms?", where Punch and Kim Na Young became Various Artists.
+/// The placeholder means *look at the track*, so that is what we do.
+///
+/// Kept to the exact well-known forms. This decides which of two real names
+/// wins, so a loose match here would silently discard a genuine artist called,
+/// say, "Various Production".
+pub fn is_various_artists(name: &str) -> bool {
+    matches!(
+        name.trim().to_lowercase().as_str(),
+        "various artists" | "various artist" | "various" | "va" | "verschiedene interpreten"
+    )
+}
+
 /// Does this track credit already name `artist`?
 ///
 /// Substring rather than equality, because the overlapping case is a credit
@@ -337,6 +354,14 @@ impl PlexTrack {
         // The record's artist is primary: it is how the album is filed, and it
         // keeps one row per record rather than one per performer combination.
         //
+        // **Unless the record has no artist.** "Various Artists" is not an
+        // artist — it is a placeholder that means *look at the track*. A
+        // compilation files every track under it, so taking it as primary
+        // recorded all of "Do You Like Brahms?" as Various Artists instead of
+        // Punch and Kim Na Young, which is strictly worse than what it
+        // replaced. The rule is "the record's artist wins", and a placeholder
+        // is the case where there isn't one.
+        //
         // These two are *not* disjoint roles. A music director routinely sings
         // on their own soundtrack, so the same person can be both the record's
         // artist and a performer on some of its tracks. Nothing here labels a
@@ -349,25 +374,32 @@ impl PlexTrack {
         // checked) and its artist credits disagree with themselves, sometimes
         // listing the director, sometimes the singers, sometimes both — with
         // duplicate recordings for each. Plex already knows, for free.
-        let artists = match self.track_artist.as_deref().map(str::trim) {
+        let performer = self.track_artist.as_deref().map(str::trim).filter(|t| !t.is_empty());
+
+        let (primary, artists) = match performer {
+            // A compilation has no artist of its own, so the performer is it.
+            // Keeping the placeholder in the credit would only assert that the
+            // record is a compilation, which the album already says.
+            Some(p) if is_various_artists(&self.artist) => (p.to_string(), vec![p.to_string()]),
             // The performers already name the record's artist — the common case
             // when a music director sings on their own soundtrack, which
             // Anirudh Ravichander, Ilaiyaraaja, Harris Jayaraj and A. R. Rahman
-            // all do. The track credit is then simply the fuller one, and
-            // listing them separately would repeat a name.
-            Some(ta) if credit_includes(ta, &self.artist) => vec![ta.to_string()],
-            Some(ta) if !ta.is_empty() => vec![self.artist.clone(), ta.to_string()],
-            _ => vec![self.artist.clone()],
+            // all do. The credit is then simply the fuller one, and listing
+            // them separately would repeat a name.
+            Some(p) if credit_includes(p, &self.artist) => {
+                (self.artist.clone(), vec![p.to_string()])
+            }
+            Some(p) => (self.artist.clone(), vec![self.artist.clone(), p.to_string()]),
+            None => (self.artist.clone(), vec![self.artist.clone()]),
         };
 
         Play {
             title: self.title.clone(),
-            // Always the record's artist, never `artists.first()`. The credit
-            // list can legitimately start with the fuller performer string when
-            // the two overlap, and deriving the primary from it would put the
-            // whole combination in `artist` — which is the fragmentation this
-            // change exists to stop.
-            artist: self.artist.clone(),
+            // Decided above, never `artists.first()`. The credit list can
+            // legitimately start with the fuller performer string when the two
+            // overlap, and deriving the primary from it would put the whole
+            // combination in `artist` — the fragmentation this exists to stop.
+            artist: primary,
             artists: if artists.is_empty() { None } else { Some(artists) },
             album: self.album.clone(),
             timestamp,
@@ -1379,6 +1411,43 @@ mod tests {
             Some(&["Harris Jayaraj".to_string(), "Unnikrishnan, Chinmayi & Megha".to_string()][..]),
             "the singers are kept alongside, not discarded"
         );
+    }
+
+    /// "Various Artists" is not an artist — it is a placeholder meaning *look
+    /// at the track*. Taking it as the record's artist recorded the whole of
+    /// "Do You Like Brahms?" under it instead of Punch and Kim Na Young, which
+    /// was strictly worse than the behaviour it replaced.
+    #[test]
+    fn a_compilation_credits_the_performer_not_the_placeholder() {
+        let mut t = track(0);
+        t.artist = "Various Artists".into();
+        t.album = Some("Do You Like Brahms? (Original Television Soundtrack)".into());
+        t.track_artist = Some("Punch".into());
+
+        let play = t.to_play("np");
+        assert_eq!(play.artist, "Punch", "the performer is the artist on a compilation");
+        assert_eq!(
+            play.artists.as_deref(),
+            Some(&["Punch".to_string()][..]),
+            "and the placeholder is not kept — the album already says it is a compilation"
+        );
+
+        // With no performer named there is nothing better to use, so the
+        // placeholder stands rather than the listen being dropped.
+        t.track_artist = None;
+        assert_eq!(t.to_play("np").artist, "Various Artists");
+    }
+
+    /// The forms that actually appear, and the ones that must not match —
+    /// this decides which of two real names wins.
+    #[test]
+    fn various_artists_placeholders_are_recognised_narrowly() {
+        for yes in ["Various Artists", "various artists", "  VARIOUS  ", "VA", "Various Artist"] {
+            assert!(is_various_artists(yes), "{yes:?} should be a placeholder");
+        }
+        for no in ["Various Production", "Varius Manx", "The Various", "V.A.S.", ""] {
+            assert!(!is_various_artists(no), "{no:?} is a real name");
+        }
     }
 
     /// A music director singing on their own soundtrack is normal — Anirudh
