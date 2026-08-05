@@ -460,6 +460,29 @@ impl EveryNoiseStore {
         Ok(out)
     }
 
+    /// The map's own spread: the RMS distance of every genre from the map's
+    /// centre. It is the denominator that makes "reach" scale-free — a raw
+    /// distance in map units means nothing to anyone.
+    pub async fn spread(&self) -> Result<f64, sqlx::Error> {
+        let row: (Option<f64>, Option<f64>, i64) =
+            sqlx::query_as("SELECT AVG(x), AVG(y), COUNT(*) FROM genres")
+                .fetch_one(&self.pool)
+                .await?;
+        let (Some(mx), Some(my), n) = row else { return Ok(0.0) };
+        if n == 0 {
+            return Ok(0.0);
+        }
+        let var: (Option<f64>,) =
+            sqlx::query_as("SELECT AVG((x - ?) * (x - ?) + (y - ?) * (y - ?)) FROM genres")
+                .bind(mx)
+                .bind(mx)
+                .bind(my)
+                .bind(my)
+                .fetch_one(&self.pool)
+                .await?;
+        Ok(var.0.unwrap_or(0.0).max(0.0).sqrt())
+    }
+
     /// Wipe everything. The data is re-acquirable, so this is a reset rather
     /// than a destructive act — but it does mean another full walk.
     pub async fn clear(&self) -> Result<(), sqlx::Error> {

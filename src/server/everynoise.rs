@@ -268,7 +268,7 @@ pub async fn genre_map(State(state): State<Arc<AppState>>, user: AuthUser) -> im
         );
     }
 
-    let counts = state.db.genre_play_counts(user.user_id).await.unwrap_or_default();
+    let counts = state.db.genre_play_counts(user.user_id, None).await.unwrap_or_default();
     let names: Vec<String> = counts.iter().map(|(n, _)| n.clone()).collect();
     let coords = match state.everynoise.coordinates_for(&names).await {
         Ok(c) => c,
@@ -490,6 +490,78 @@ pub async fn genre_trajectory(
 /// How many of the caller's top genres seed the neighbour walk.
 const SEED_GENRES: usize = 25;
 
+/// How broad is a listening history, in two numbers that mean different things.
+///
+/// **Not a grid.** The obvious measure — bin the map into cells and count how
+/// many you occupy — was built and rejected: on a real history it returns
+/// anywhere from 5% to 34% depending purely on the cell size, which has no
+/// principled value. A number dominated by a parameter someone invented is a
+/// confident-looking way of saying nothing, and the naive alternative
+/// (`genres played / 6,291`) is worse still: 1.8%, which is both meaningless
+/// and demoralising, because Every Noise's genres are hyper-granular and nobody
+/// covers a meaningful share of them.
+///
+/// Both numbers below are scale-free and parameter-free, and both degenerate
+/// correctly: someone who only ever played one genre scores 1.0 and 0.0.
+///
+/// * **Effective genres** — `exp(H)` where `H` is Shannon entropy over play
+///   counts. The standard diversity measure, and it reads directly: "as varied
+///   as playing N genres equally". It answers *how evenly you listen*, and
+///   needs no map at all.
+/// * **Reach** — your play-weighted RMS distance from your own centre, over the
+///   map's RMS distance from its centre. It answers *how far apart in genre
+///   space* your listening is, which is a different question: a person can play
+///   forty genres that all sit in one corner.
+pub(crate) fn breadth(
+    counts: &[(String, i64)],
+    coords: &std::collections::HashMap<String, (f64, f64, String)>,
+    map_spread: f64,
+) -> serde_json::Value {
+    let total: i64 = counts.iter().map(|(_, p)| p).sum();
+    if total == 0 {
+        return serde_json::json!({ "genres_played": 0 });
+    }
+
+    // Evenness is over *everything* played, map or not — an untagged-by-Every-
+    // Noise genre is still a genre you listened to.
+    let entropy: f64 = counts
+        .iter()
+        .map(|(_, p)| *p as f64 / total as f64)
+        .filter(|w| *w > 0.0)
+        .map(|w| -w * w.ln())
+        .sum();
+    let effective = entropy.exp();
+
+    // Reach needs positions, so it is over the placed genres only.
+    let placed: Vec<(f64, f64, f64)> = counts
+        .iter()
+        .filter_map(|(name, plays)| {
+            coords
+                .get(&crate::everynoise::store::genre_key(name))
+                .map(|(x, y, _)| (*x, *y, *plays as f64))
+        })
+        .collect();
+    let placed_total: f64 = placed.iter().map(|(_, _, w)| w).sum();
+
+    let reach = (placed_total > 0.0 && map_spread > 0.0).then(|| {
+        let cx: f64 = placed.iter().map(|(x, _, w)| x * w).sum::<f64>() / placed_total;
+        let cy: f64 = placed.iter().map(|(_, y, w)| y * w).sum::<f64>() / placed_total;
+        let var: f64 =
+            placed.iter().map(|(x, y, w)| w * ((x - cx).powi(2) + (y - cy).powi(2))).sum::<f64>()
+                / placed_total;
+        (var.sqrt() / map_spread * 1000.0).round() / 1000.0
+    });
+
+    serde_json::json!({
+        "genres_played": counts.len(),
+        "genres_placed": placed.len(),
+        "effective_genres": (effective * 10.0).round() / 10.0,
+        // 1.0 would mean every genre played exactly equally.
+        "evenness": ((effective / counts.len() as f64) * 1000.0).round() / 1000.0,
+        "reach": reach,
+    })
+}
+
 /// GET /api/v1/genre-map/neighbours — what sits next to your listening.
 ///
 /// Every Noise precomputes, per genre, its ~20 nearest and ~20 maximally
@@ -509,7 +581,7 @@ pub async fn genre_neighbours(
     State(state): State<Arc<AppState>>,
     user: AuthUser,
 ) -> impl IntoResponse {
-    let counts = state.db.genre_play_counts(user.user_id).await.unwrap_or_default();
+    let counts = state.db.genre_play_counts(user.user_id, None).await.unwrap_or_default();
     if counts.is_empty() {
         return (StatusCode::OK, Json(serde_json::json!({ "nearby": [], "opposite": [] })))
             .into_response();

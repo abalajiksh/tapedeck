@@ -289,6 +289,45 @@
 				<span style="background:rgba(198,113,57,.92);"></span>More</div>
 		</div>
 	</div>
+	<!-- Breadth -->
+	{#if stats.breadth && stats.breadth.genres_played > 1}
+		<h3 class="h-display" style="font-size:19px;margin:24px 0 12px;">Breadth</h3>
+		<div class="panel" style="border-radius:22px;padding:22px;">
+			<div style="display:flex;gap:28px;flex-wrap:wrap;">
+				<div>
+					<div style="font-size:30px;font-weight:600;line-height:1.1;">
+						{stats.breadth.effective_genres.toLocaleString(undefined, { maximumFractionDigits: 0 })}
+					</div>
+					<div style="font-size:12.5px;color:var(--td-muted-2);margin-top:2px;">
+						effective genres, of {stats.breadth.genres_played.toLocaleString()} played
+					</div>
+				</div>
+				{#if stats.breadth.reach != null}
+					<div>
+						<div style="font-size:30px;font-weight:600;line-height:1.1;">
+							{Math.round(stats.breadth.reach * 100)}%
+						</div>
+						<div style="font-size:12.5px;color:var(--td-muted-2);margin-top:2px;">
+							of the genre map's own spread
+						</div>
+					</div>
+				{/if}
+			</div>
+			<p style="font-size:12.5px;color:var(--td-muted);margin:14px 0 0;max-width:70ch;">
+				Your listening is as varied as playing
+				<strong>{stats.breadth.effective_genres.toLocaleString(undefined, { maximumFractionDigits: 0 })}</strong>
+				genres in equal measure — fewer than the {stats.breadth.genres_played.toLocaleString()} you
+				actually touched, because you return to some far more than others.
+				{#if stats.breadth.reach != null}
+					Reach compares how far apart your genres sit on the
+					<a href="/map" style="color:var(--td-accent);">genre map</a> against how far apart the
+					whole map is, so it says whether that variety is spread out or clustered in one
+					corner. Based on {stats.breadth.genres_placed.toLocaleString()} genres with a position.
+				{/if}
+			</p>
+		</div>
+	{/if}
+
 	<!-- Genres -->
 	{#if stats.genres.length}
 		<h3 class="h-display" style="font-size:19px;margin:24px 0 12px;">Genres</h3>

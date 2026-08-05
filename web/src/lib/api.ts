@@ -157,6 +157,17 @@ export interface RangedStats {
 	fidelity: { name: string; plays: number; pct: number }[];
 	/** A track carries several tags, so these are shares of tag mentions, not of listens. */
 	genres: { name: string; plays: number; pct: number }[];
+	/** Present once the genre map is fetched and genres are backfilled. */
+	breadth?: {
+		genres_played: number;
+		genres_placed: number;
+		/** exp(Shannon entropy): "as varied as playing N genres equally". */
+		effective_genres: number;
+		/** effective / played; 1.0 would be every genre played equally. */
+		evenness: number;
+		/** Your spread over the map's own spread. Null if nothing is placed. */
+		reach: number | null;
+	};
 	languages: { name: string; pct: number }[];
 	regions: { name: string; pct: number }[];
 	decades: { name: string; plays: number; pct: number }[];

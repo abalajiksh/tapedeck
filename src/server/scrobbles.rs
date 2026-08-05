@@ -597,6 +597,17 @@ async fn ranged_stats(
         stats["heatmap"] =
             serde_json::json!(crate::analytics::heatmap_local(&to_listen_rows(rows), tz));
     }
+
+    // Breadth, when the genre map has been fetched and genres backfilled.
+    // Absent rather than zeroed otherwise — "you play 0 genres" would be a lie
+    // about the listening rather than a statement about the data.
+    let counts = state.db.genre_play_counts(user.user_id, after).await.unwrap_or_default();
+    if !counts.is_empty() {
+        let names: Vec<String> = counts.iter().map(|(n, _)| n.clone()).collect();
+        let coords = state.everynoise.coordinates_for(&names).await.unwrap_or_default();
+        let spread = state.everynoise.spread().await.unwrap_or(0.0);
+        stats["breadth"] = super::everynoise::breadth(&counts, &coords, spread);
+    }
     (StatusCode::OK, Json(stats)).into_response()
 }
 

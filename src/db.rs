@@ -2609,14 +2609,21 @@ impl Database {
     /// One listen carries several tags, so the counts sum to more than the
     /// listen count — each tag is counted once per listen that carries it,
     /// which is what makes a weighted position meaningful.
-    pub async fn genre_play_counts(&self, user_id: i64) -> Result<Vec<(String, i64)>, sqlx::Error> {
+    pub async fn genre_play_counts(
+        &self,
+        user_id: i64,
+        after: Option<i64>,
+    ) -> Result<Vec<(String, i64)>, sqlx::Error> {
         sqlx::query_as(
             "SELECT g.value AS name, COUNT(*) AS plays
                FROM scrobbles s, json_each(s.genres) g
               WHERE s.user_id = ? AND s.skipped = FALSE AND s.genres IS NOT NULL
+                AND (? IS NULL OR s.timestamp >= ?)
               GROUP BY LOWER(g.value) ORDER BY plays DESC",
         )
         .bind(user_id)
+        .bind(after)
+        .bind(after)
         .fetch_all(&self.pool)
         .await
     }
