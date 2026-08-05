@@ -970,11 +970,26 @@ class TapedeckAPI {
 		return this.request('PUT', `/api/v1/artists/img/${artistRowId}`, { url });
 	}
 
-	async getDiscogsSetting(): Promise<{ configured: boolean; from_env: boolean; stored: boolean }> {
+	async getDiscogsSetting(): Promise<{
+		configured: boolean;
+		from_env: boolean;
+		stored: boolean;
+		/** Which credential shape is in effect. */
+		kind: 'token' | 'key_secret' | 'none';
+	}> {
 		return this.get('/api/v1/physical/settings/discogs');
 	}
-	async setDiscogsSetting(token: string): Promise<{ configured: boolean }> {
-		return this.request('PUT', '/api/v1/physical/settings/discogs', { token });
+	/** Only the supplied fields are written, so saving one shape doesn't wipe the other. */
+	async setDiscogsSetting(patch: {
+		token?: string;
+		key?: string;
+		secret?: string;
+	}): Promise<{ configured: boolean }> {
+		return this.request('PUT', '/api/v1/physical/settings/discogs', patch);
+	}
+	/** Does the credential actually work? Discogs answers a bad one with a normal 200. */
+	async testDiscogsSetting(): Promise<{ ok: boolean; message: string }> {
+		return this.post('/api/v1/physical/settings/discogs/test');
 	}
 
 	// ── Every Noise genre map (admin) ──

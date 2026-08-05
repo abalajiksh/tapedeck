@@ -4,9 +4,9 @@
 //! needs no credential and has reliable tracklists with durations.
 //! **Discogs** is far better at *pressings* — it is a collector's database, so
 //! a barcode usually resolves to the exact edition — but its API is
-//! authenticated, so it stays switched off until a token is configured. Same
-//! shape as Apple Music in the bio chain: unconfigured is a normal state that
-//! steps aside, not an error.
+//! authenticated, so it stays switched off until a credential is configured.
+//! Same shape as Apple Music in the bio chain: unconfigured is a normal state
+//! that steps aside, not an error.
 //!
 //! **Sides are not reliably available anywhere.** MusicBrainz records a vinyl
 //! track number as "A1" only when the editor bothered; most releases carry
@@ -14,10 +14,53 @@
 //! checked against. So `assign_sides` parses a side letter when one is there
 //! and otherwise splits by playing time, and the result is presented as a guess
 //! the user corrects rather than as fact.
+//!
+//! Discogs, notably, *does* have the side letters for that same pressing — its
+//! tracklist positions come back `A1`, `A2`, `B1`… — which is the clearest
+//! statement of what it is for.
 
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 use tracing::debug;
+
+/// How to authenticate to Discogs.
+///
+/// Discogs has four auth tiers and only the bottom two are relevant here.
+/// Unauthenticated works but is capped at 25 requests a minute and returns no
+/// images. A **personal access token** or a **consumer key/secret pair** both
+/// lift that to 60 and unlock images, and either is enough for everything
+/// Tapedeck does — it only ever reads the public database.
+///
+/// The three-legged OAuth flow is deliberately **not** implemented. It exists
+/// so an application can act *as a particular user* (their collection,
+/// wantlist, marketplace orders); Tapedeck looks up pressings, which is not
+/// user-specific. Registering an application on Discogs hands you a consumer
+/// key and secret, and those work directly as a credential without any of the
+/// request-token/authorize/access-token dance — which is why the pair is
+/// accepted here rather than a flow being built.
+#[derive(Debug, Clone)]
+pub enum DiscogsAuth {
+    /// A personal access token from discogs.com/settings/developers.
+    Token(String),
+    /// An application's consumer key and secret, sent directly.
+    KeySecret { key: String, secret: String },
+}
+
+impl DiscogsAuth {
+    /// The `Authorization` header value.
+    ///
+    /// The key/secret form is sent as a header rather than as `?key=…&secret=…`
+    /// query parameters — Discogs documents both, but a secret in a query
+    /// string ends up in proxy logs and any error message that echoes the URL.
+    fn header(&self) -> String {
+        match self {
+            DiscogsAuth::Token(t) => format!("Discogs token={t}"),
+            DiscogsAuth::KeySecret { key, secret } => {
+                format!("Discogs key={key}, secret={secret}")
+            }
+        }
+    }
+}
 
 /// One track on a physical side.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -296,14 +339,72 @@ pub async fn musicbrainz_release(
     }))
 }
 
+/// Ask Discogs whether it actually accepts a credential.
+///
+/// Harder than it should be, and worth the paragraph because **most of the API
+/// does not reject a bad credential at all**. Measured rather than assumed:
+/// with `key=bogus, secret=bogus`, both `/releases/1` and `/database/search`
+/// answer a normal `200` with real data — and the rate limit header even reads
+/// the authenticated `60` rather than the anonymous `25`, because Discogs
+/// raises it for the *presence* of an `Authorization` header without checking
+/// what is in it. So neither the status code, nor the body, nor the headers
+/// distinguish a working credential from a typo on the paths Tapedeck uses.
+///
+/// `/users/{username}` is the endpoint that does verify, for both shapes: a bad
+/// pair gets `401 Invalid consumer key/secret`, a bad token `401 Invalid
+/// consumer token`. `/oauth/identity` is not usable for this — it wants
+/// *user*-level auth, so it 401s even for a perfectly good consumer pair.
+///
+/// The subject is Discogs' own account, because the request needs some user and
+/// that one is as stable as the API itself. A 404 would mean it had gone, which
+/// says nothing about the credential — so that is reported as inconclusive
+/// rather than as a failure.
+pub async fn discogs_verify(
+    auth: &DiscogsAuth,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let http = client()?;
+    let resp = http
+        .get("https://api.discogs.com/users/discogs")
+        .header("Authorization", auth.header())
+        .send()
+        .await?;
+
+    match resp.status() {
+        s if s.is_success() => Ok(()),
+        reqwest::StatusCode::UNAUTHORIZED => {
+            // Discogs words this precisely enough to be worth passing through:
+            // it names which of the two credential shapes it rejected.
+            let msg = resp
+                .json::<serde_json::Value>()
+                .await
+                .ok()
+                .and_then(|v| v.get("message").and_then(|m| m.as_str().map(str::to_string)))
+                .unwrap_or_else(|| "Discogs rejected that credential".into());
+            Err(msg.into())
+        }
+        reqwest::StatusCode::TOO_MANY_REQUESTS => {
+            Err("Discogs rate limit reached — try again in a minute".into())
+        }
+        reqwest::StatusCode::NOT_FOUND => {
+            Err("Could not verify — the account used for the check no longer exists".into())
+        }
+        other => Err(format!("Discogs returned {other}").into()),
+    }
+}
+
 /// Look a barcode up on Discogs.
 ///
-/// Requires a token, so this is only called when one is configured. Discogs is
-/// worth the extra step for physical media specifically: it catalogues
-/// *pressings*, so a barcode generally lands on the exact edition in your
-/// hands, where MusicBrainz will often only have "the album".
+/// Requires a credential, so this is only called when one is configured.
+/// Discogs is worth the extra step for physical media specifically: it
+/// catalogues *pressings*, so a barcode generally lands on the exact edition in
+/// your hands, where MusicBrainz will often only have "the album".
+///
+/// A scanned barcode is passed through as-is. Discogs stores them with the
+/// printed spacing (`5 099902 987613`) but normalises on its side, so the
+/// unspaced form a scanner produces matches — and in practice matches slightly
+/// *more* than the spaced one.
 pub async fn discogs_search(
-    token: &str,
+    auth: &DiscogsAuth,
     barcode: Option<&str>,
     query: Option<&str>,
 ) -> Result<Vec<ReleaseCandidate>, Box<dyn std::error::Error + Send + Sync>> {
@@ -334,7 +435,7 @@ pub async fn discogs_search(
     let http = client()?;
     let mut req = http
         .get("https://api.discogs.com/database/search")
-        .header("Authorization", format!("Discogs token={token}"))
+        .header("Authorization", auth.header())
         .query(&[("type", "release"), ("per_page", "10")]);
     if let Some(b) = barcode {
         req = req.query(&[("barcode", b)]);
@@ -345,7 +446,7 @@ pub async fn discogs_search(
 
     let resp = req.send().await?;
     if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
-        return Err("Discogs rejected that token".into());
+        return Err("Discogs rejected that credential".into());
     }
     if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
         return Err("Discogs rate limit reached — try again in a minute".into());
@@ -398,7 +499,7 @@ pub async fn discogs_search(
 
 /// A chosen Discogs release, with its tracklist.
 pub async fn discogs_release(
-    token: &str,
+    auth: &DiscogsAuth,
     id: &str,
 ) -> Result<Option<ReleaseCandidate>, Box<dyn std::error::Error + Send + Sync>> {
     #[derive(Deserialize)]
@@ -463,7 +564,7 @@ pub async fn discogs_release(
     let http = client()?;
     let resp = http
         .get(format!("https://api.discogs.com/releases/{id}"))
-        .header("Authorization", format!("Discogs token={token}"))
+        .header("Authorization", auth.header())
         .send()
         .await?;
     if resp.status() == reqwest::StatusCode::NOT_FOUND {

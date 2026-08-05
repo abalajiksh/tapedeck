@@ -204,6 +204,9 @@
 	let discogsConfigured = false;
 	let discogsFromEnv = false;
 	let discogsToken = '';
+	let discogsKey = '';
+	let discogsSecret = '';
+	let discogsKind = 'none';
 	let discogsMsg = '';
 	/** 0=Sun..6=Sat. Monday is ISO-8601 and the default; Last.fm's chart week
 	 *  runs Friday to Friday, which is why this is settable at all. */
@@ -326,21 +329,51 @@
 		catch (e) { enMsg = String(e).replace(/^API \d+: /, ''); }
 	}
 
+	// Discogs answers a bad credential with a normal 200, serving the request as
+	// anonymous — so "saved" says nothing about whether it works. This asks.
+	let discogsTesting = false;
+	let discogsTestOk: boolean | null = null;
+	async function testDiscogs() {
+		discogsTesting = true;
+		discogsTestOk = null;
+		try {
+			const r = await api.testDiscogsSetting();
+			discogsTestOk = r.ok;
+			discogsMsg = r.message;
+		} catch (e) {
+			discogsTestOk = false;
+			discogsMsg = String(e).replace(/^API \d+: /, '');
+		}
+		discogsTesting = false;
+	}
+
 	async function loadDiscogs() {
 		try {
 			const d = await api.getDiscogsSetting();
 			discogsConfigured = d.configured;
 			discogsFromEnv = d.from_env;
+			discogsKind = d.kind;
 		} catch { /* non-admins simply don't see it */ }
 	}
 
 	async function saveDiscogs() {
 		try {
-			const r = await api.setDiscogsSetting(discogsToken);
-			discogsConfigured = r.configured || discogsFromEnv;
-			discogsToken = '';
+			// Only the fields actually filled in are sent, so saving a key/secret
+			// pair doesn't wipe a token that was already working.
+			const patch: { token?: string; key?: string; secret?: string } = {};
+			if (discogsToken.trim()) patch.token = discogsToken.trim();
+			if (discogsKey.trim() || discogsSecret.trim()) {
+				patch.key = discogsKey.trim();
+				patch.secret = discogsSecret.trim();
+			}
+			// Nothing typed at all means "clear everything".
+			if (!Object.keys(patch).length) { patch.token = ''; patch.key = ''; patch.secret = ''; }
+			const r = await api.setDiscogsSetting(patch);
+			discogsConfigured = r.configured;
+			discogsToken = discogsKey = discogsSecret = '';
 			discogsMsg = r.configured ? 'Saved — barcode lookups will use Discogs.' : 'Cleared.';
 			setTimeout(() => (discogsMsg = ''), 3000);
+			await loadDiscogs();
 		} catch (e) {
 			discogsMsg = String(e).replace(/^API \d+: /, '');
 		}
@@ -703,23 +736,50 @@
 						Used to identify a pressing from its barcode on the Vinyl &amp; Tape
 						screen. Optional — MusicBrainz works without it, but Discogs is a
 						collector's database and usually lands on the exact edition in your
-						hands. One token for the whole server.
+						hands. One credential for the whole server.
 					</p>
-					<div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;">
+					<p style="font-size:12.5px;color:var(--td-muted-2);margin:0 0 14px;">
+						Discogs issues two kinds and <strong>either works</strong>. A personal access
+						token is one string; registering an application gives a consumer key and
+						secret. Fill in whichever you have — the OAuth flow isn't needed, since
+						Tapedeck only reads the public database.
+					</p>
+
+					<div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:10px;">
 						<input class="input" type="password" bind:value={discogsToken} style="max-width:320px;"
-							placeholder={discogsConfigured ? '••••••••  (stored)' : 'Personal access token'}>
-						<button class="btn btn-secondary" on:click={saveDiscogs}>
-							{discogsToken.trim() ? 'Save' : 'Clear'}
-						</button>
-						{#if discogsMsg}<span style="font-size:13px;color:var(--td-good-fg);">{discogsMsg}</span>{/if}
+							placeholder={discogsKind === 'token' ? '••••••••  (token stored)' : 'Personal access token'}>
 					</div>
+					<div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;">
+						<input class="input" type="password" bind:value={discogsKey} style="max-width:190px;"
+							placeholder={discogsKind === 'key_secret' ? '••••••  (key stored)' : 'Consumer key'}>
+						<input class="input" type="password" bind:value={discogsSecret} style="max-width:190px;"
+							placeholder={discogsKind === 'key_secret' ? '••••••  (secret stored)' : 'Consumer secret'}>
+						<button class="btn btn-secondary" on:click={saveDiscogs}>
+							{discogsToken.trim() || discogsKey.trim() || discogsSecret.trim() ? 'Save' : 'Clear'}
+						</button>
+						{#if discogsConfigured}
+							<button class="btn btn-secondary" on:click={testDiscogs} disabled={discogsTesting}>
+								{discogsTesting ? 'Testing…' : 'Test'}
+							</button>
+						{/if}
+					</div>
+					{#if discogsMsg}
+						<p style="font-size:13px;margin:10px 0 0;color:{discogsTestOk === false ? 'var(--td-bad-fg)' : 'var(--td-good-fg)'};">
+							{discogsMsg}
+						</p>
+					{/if}
 					<p style="font-size:12.5px;color:var(--td-muted-2);margin:10px 0 0;">
-						{#if discogsFromEnv}
+						{#if discogsFromEnv && discogsKind === 'key_secret'}
+							Currently supplied by the environment as a consumer key and secret. Saving
+							one here overrides it.
+						{:else if discogsFromEnv}
 							Currently supplied by TAPEDECK_DISCOGS_TOKEN. Saving one here overrides it.
 						{:else if discogsConfigured}
-							Configured. Barcode lookups ask Discogs first.
+							Configured ({discogsKind === 'key_secret' ? 'consumer key and secret' : 'personal access token'}).
+							Barcode lookups ask Discogs first, at 60 requests a minute.
 						{:else}
-							Not configured — lookups use MusicBrainz only.
+							Not configured — lookups use MusicBrainz only, which has no barcode
+							coverage for many pressings.
 						{/if}
 					</p>
 				</div>

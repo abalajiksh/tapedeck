@@ -37,16 +37,60 @@ fn err(code: u16, msg: impl Into<String>) -> axum::response::Response {
     (status, Json(serde_json::json!(ErrorResponse { code, error: msg.into() }))).into_response()
 }
 
-/// The configured Discogs token, if there is one.
+/// Where an admin-set consumer key/secret pair lives.
+pub const DISCOGS_KEY_KEY: &str = "discogs_key";
+pub const DISCOGS_SECRET_KEY: &str = "discogs_secret";
+
+fn env_nonempty(name: &str) -> Option<String> {
+    std::env::var(name).ok().map(|v| v.trim().to_string()).filter(|v| !v.is_empty())
+}
+
+/// The configured Discogs credential, if there is one.
 ///
-/// Database first, environment second. The env var is the deployment-time
-/// answer (and matches how the Apple Music token is supplied), the setting is
+/// Database first, environment second — the env var is the deployment-time
+/// answer (matching how the Apple Music token is supplied) and the setting is
 /// the one an admin can paste in without a restart.
-async fn discogs_token(state: &AppState) -> Option<String> {
+///
+/// Two credential shapes are accepted because Discogs issues two. Registering
+/// an application gives a **consumer key and secret**, which is what the
+/// developer settings page leads with; generating a **personal access token**
+/// is a separate button on the same page and easy to miss. Either works for
+/// reading the public database, so refusing one of them would just be a way to
+/// look broken.
+///
+/// A token wins when both are set: it is the narrower credential, scoped to one
+/// account rather than to an application.
+async fn discogs_auth(state: &AppState) -> Option<release_lookup::DiscogsAuth> {
     if let Ok(Some(t)) = state.db.get_app_setting(DISCOGS_TOKEN_KEY).await {
-        return Some(t);
+        if !t.trim().is_empty() {
+            return Some(release_lookup::DiscogsAuth::Token(t.trim().to_string()));
+        }
     }
-    std::env::var("TAPEDECK_DISCOGS_TOKEN").ok().filter(|t| !t.trim().is_empty())
+    let stored_key = state.db.get_app_setting(DISCOGS_KEY_KEY).await.ok().flatten();
+    let stored_secret = state.db.get_app_setting(DISCOGS_SECRET_KEY).await.ok().flatten();
+    if let (Some(k), Some(s)) = (&stored_key, &stored_secret) {
+        if !k.trim().is_empty() && !s.trim().is_empty() {
+            return Some(release_lookup::DiscogsAuth::KeySecret {
+                key: k.trim().to_string(),
+                secret: s.trim().to_string(),
+            });
+        }
+    }
+
+    if let Some(t) = env_nonempty("TAPEDECK_DISCOGS_TOKEN") {
+        return Some(release_lookup::DiscogsAuth::Token(t));
+    }
+    // The namespaced names first. `Consumer_Key`/`Consumer_Secret` are what
+    // Discogs' own docs call them and what people therefore export, but they
+    // are generic enough to belong to some other application on the same host —
+    // so they are accepted as a fallback rather than looked for first.
+    let key = env_nonempty("TAPEDECK_DISCOGS_KEY").or_else(|| env_nonempty("Consumer_Key"));
+    let secret =
+        env_nonempty("TAPEDECK_DISCOGS_SECRET").or_else(|| env_nonempty("Consumer_Secret"));
+    match (key, secret) {
+        (Some(key), Some(secret)) => Some(release_lookup::DiscogsAuth::KeySecret { key, secret }),
+        _ => None,
+    }
 }
 
 // ════════════════════════════════════════════════════════════
@@ -81,15 +125,15 @@ async fn lookup(
         return err(400, "Give a barcode, a catalogue number, or an artist and release");
     }
 
-    let token = discogs_token(&state).await;
+    let auth = discogs_auth(&state).await;
     let mut candidates = Vec::new();
     let mut notes: Vec<String> = Vec::new();
 
-    // Discogs first when a barcode is in hand and a token is configured: it
-    // catalogues *pressings*, so a barcode usually lands on the exact edition,
-    // where MusicBrainz will often only have "the album".
-    if let (Some(token), Some(barcode)) = (token.as_deref(), barcode) {
-        match release_lookup::discogs_search(token, Some(barcode), None).await {
+    // Discogs first when a barcode is in hand and a credential is configured:
+    // it catalogues *pressings*, so a barcode usually lands on the exact
+    // edition, where MusicBrainz will often only have "the album".
+    if let (Some(auth), Some(barcode)) = (auth.as_ref(), barcode) {
+        match release_lookup::discogs_search(auth, Some(barcode), None).await {
             Ok(mut hits) => candidates.append(&mut hits),
             Err(e) => {
                 warn!("Discogs barcode lookup failed: {}", e);
@@ -133,7 +177,7 @@ async fn lookup(
         StatusCode::OK,
         Json(serde_json::json!({
             "candidates": candidates,
-            "discogs_enabled": token.is_some(),
+            "discogs_enabled": auth.is_some(),
             "notes": notes,
         })),
     )
@@ -150,10 +194,10 @@ async fn discogs_detail(
     _user: AuthUser,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    let Some(token) = discogs_token(&state).await else {
+    let Some(auth) = discogs_auth(&state).await else {
         return err(400, "Discogs isn't configured on this server");
     };
-    match release_lookup::discogs_release(&token, &id).await {
+    match release_lookup::discogs_release(&auth, &id).await {
         Ok(Some(c)) => {
             (StatusCode::OK, Json(serde_json::json!({ "candidate": c }))).into_response()
         }
@@ -509,16 +553,40 @@ async fn get_discogs(State(state): State<Arc<AppState>>, user: AuthUser) -> impl
     if !user.is_admin {
         return err(403, "Admin only");
     }
-    let from_env =
-        std::env::var("TAPEDECK_DISCOGS_TOKEN").ok().is_some_and(|t| !t.trim().is_empty());
-    let stored = state.db.get_app_setting(DISCOGS_TOKEN_KEY).await.unwrap_or(None).is_some();
+    let token_env = env_nonempty("TAPEDECK_DISCOGS_TOKEN").is_some();
+    let key_env = env_nonempty("TAPEDECK_DISCOGS_KEY").or_else(|| env_nonempty("Consumer_Key"));
+    let secret_env =
+        env_nonempty("TAPEDECK_DISCOGS_SECRET").or_else(|| env_nonempty("Consumer_Secret"));
+    let pair_env = key_env.is_some() && secret_env.is_some();
+
+    let stored_token = state
+        .db
+        .get_app_setting(DISCOGS_TOKEN_KEY)
+        .await
+        .unwrap_or(None)
+        .is_some_and(|t| !t.trim().is_empty());
+    let stored_pair = matches!(
+        (
+            state.db.get_app_setting(DISCOGS_KEY_KEY).await.unwrap_or(None),
+            state.db.get_app_setting(DISCOGS_SECRET_KEY).await.unwrap_or(None)
+        ),
+        (Some(k), Some(s)) if !k.trim().is_empty() && !s.trim().is_empty()
+    );
+
+    let from_env = token_env || pair_env;
+    let stored = stored_token || stored_pair;
     (
         StatusCode::OK,
         Json(serde_json::json!({
-            // Never the token itself, the same rule source credentials follow.
+            // Never the credential itself, the same rule source credentials follow.
             "configured": stored || from_env,
             "from_env": from_env,
             "stored": stored,
+            // Which shape is in use, so the UI can say so rather than leaving
+            // someone guessing which of the two fields took effect.
+            "kind": if stored_token || (!stored && token_env) { "token" }
+                    else if stored_pair || (!stored && pair_env) { "key_secret" }
+                    else { "none" },
         })),
     )
         .into_response()
@@ -526,8 +594,14 @@ async fn get_discogs(State(state): State<Arc<AppState>>, user: AuthUser) -> impl
 
 #[derive(Debug, Deserialize)]
 pub struct DiscogsUpdate {
-    /// Empty clears it and falls back to the environment, if that is set.
-    pub token: String,
+    /// A personal access token. Empty clears it.
+    #[serde(default)]
+    pub token: Option<String>,
+    /// An application's consumer key and secret. Either empty clears the pair.
+    #[serde(default)]
+    pub key: Option<String>,
+    #[serde(default)]
+    pub secret: Option<String>,
 }
 
 async fn set_discogs(
@@ -538,13 +612,53 @@ async fn set_discogs(
     if !user.is_admin {
         return err(403, "Admin only");
     }
-    match state.db.set_app_setting(DISCOGS_TOKEN_KEY, &body.token).await {
+    // Each field is written only when present, so saving a key/secret pair does
+    // not silently wipe a token that was already working — and clearing one is
+    // an explicit empty string rather than an omission.
+    for (key, value) in [
+        (DISCOGS_TOKEN_KEY, &body.token),
+        (DISCOGS_KEY_KEY, &body.key),
+        (DISCOGS_SECRET_KEY, &body.secret),
+    ] {
+        if let Some(v) = value {
+            if let Err(e) = state.db.set_app_setting(key, v.trim()).await {
+                return err(500, e.to_string());
+            }
+        }
+    }
+    let configured = discogs_auth(&state).await.is_some();
+    (StatusCode::OK, Json(serde_json::json!({ "configured": configured }))).into_response()
+}
+
+/// POST /api/v1/physical/settings/discogs/test — does the credential work?
+///
+/// Separate from saving it because Discogs answers a bad key/secret with a
+/// normal 200, serving the request as anonymous. Without this, a typo looks
+/// exactly like success until someone notices barcode lookups are quietly
+/// worse.
+async fn test_discogs(State(state): State<Arc<AppState>>, user: AuthUser) -> impl IntoResponse {
+    if !user.is_admin {
+        return err(403, "Admin only");
+    }
+    let Some(auth) = discogs_auth(&state).await else {
+        return err(400, "Discogs isn't configured on this server");
+    };
+    match release_lookup::discogs_verify(&auth).await {
         Ok(()) => (
             StatusCode::OK,
-            Json(serde_json::json!({ "configured": !body.token.trim().is_empty() })),
+            Json(serde_json::json!({
+                "ok": true,
+                "message": "Working — Discogs accepted the credential.",
+            })),
         )
             .into_response(),
-        Err(e) => err(500, e.to_string()),
+        // A rejection is a 200 with `ok: false`, not an HTTP error: the request
+        // to Tapedeck succeeded and the answer is "no". The message is
+        // Discogs' own, which names which credential shape it rejected.
+        Err(e) => {
+            (StatusCode::OK, Json(serde_json::json!({ "ok": false, "message": e.to_string() })))
+                .into_response()
+        }
     }
 }
 
@@ -556,6 +670,7 @@ pub fn create_physical_router() -> Router<Arc<AppState>> {
         .route("/api/v1/physical/discogs/:id", get(discogs_detail))
         .route("/api/v1/physical/equipment/:id/wear", get(equipment_wear))
         .route("/api/v1/physical/settings/discogs", get(get_discogs).put(set_discogs))
+        .route("/api/v1/physical/settings/discogs/test", post(test_discogs))
         .route("/api/v1/physical", get(list_shelf).post(add_release))
         .route("/api/v1/physical/:id", get(get_one).delete(delete_release))
         .route("/api/v1/physical/:id/tracks", axum::routing::put(set_tracks))
