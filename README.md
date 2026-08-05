@@ -5,15 +5,25 @@ data from any source — Plex, Navidrome, Jellyfin, Pano Scrobbler, web browsers
 phones, DAPs — enriches it with MusicBrainz metadata and audio quality context,
 and stores a complete personal listening history with audiophile-grade analytics.
 
+It also records the listening nothing can report automatically: put a side of
+vinyl on, press start, and every track on it is logged with the pauses and skips
+you actually made.
+
 Single binary. Privacy-first. DSD is first-class.
 
 ## What makes Tapedeck different
 
 Most scrobblers track *what* you listened to. Tapedeck tracks *how* — the full
-signal chain from source file through DAC and amp to transducer, whether
-your FLAC was degraded to SBC over Bluetooth, and how many hours are on your
-HD 650 drivers. It's a scrobbler built by and for someone who cares about the
-listening experience, not just the listening history.
+signal chain from source file through DAC and amp to transducer, whether your
+FLAC was degraded to SBC over Bluetooth, and how many hours are on your HD 650
+drivers. It's a scrobbler built by and for someone who cares about the listening
+experience, not just the listening history.
+
+It is meant to become a **personal musical autobiography**: not only what you
+played, but how you played it, what you thought of it at the time, and how your
+taste and your equipment shaped each other. That framing decides arguments —
+your own library beats any metadata provider, nothing recommends music you don't
+own, and anything personal is editable by hand.
 
 ## Features
 
@@ -39,6 +49,13 @@ Two deliberate differences from listenbrainz.org:
 Beyond the LB spec, Tapedeck accepts extended fields for audio quality,
 device identification, signal chain tagging, and session metadata — and reads
 them back in `additional_info`, so a listen round-trips intact.
+
+### Adding a listen by hand
+
+Paste one ListenBrainz-shaped listen — or an array, or a whole `submit-listens`
+body — on the Import screen and it goes in. It takes the same path an external
+client's does, so it gets the same validation, deduplication and chain
+resolution; there is no parallel code path free to drift from the real one.
 
 ### Scrobble Proxy
 
@@ -220,22 +237,29 @@ with:
 - **Light / dark / system theme**, chosen per user. The choice is applied
   before first paint (no flash), cached in `localStorage`, and persisted
   server-side so every device matches.
-- **Dashboard** — a now-rolling cassette hero, quick stats, and recent listens.
+- **Dashboard** — a cassette hero whose reels turn only while something is
+  actually playing, with the artist and album clickable and a heart for the
+  track on the deck; quick stats and recent listens.
 - **History** — grouped by day with inline edit (fix title/artist/album,
   recording MBID, signal chain, format), per-listen delete, and **Inspect
   listen**: the stored row verbatim, every column including the ones no screen
   renders, with copy-to-clipboard and MusicBrainz links.
-- **Album art** from the provider chain above, backfilled in the background;
-  toggle it off in Settings for lettered tiles.
-- **Statistics** — timeframe-ranged totals, top artists, and a listening-clock
-  heatmap.
+- **Album & artist pages** — aggregations over your own listens, a provider bio
+  with its attribution, and a portrait from your library or one you set yourself.
+- **Top Charts** and **Statistics** — timeframe-ranged totals, top artists, and
+  a listening-clock heatmap. First day of the week is a preference (Monday by
+  default; Friday if you think in Last.fm chart weeks).
+- **Search** across everything you've played, resolving to the album or artist
+  page rather than a filtered list.
 - **Liner Notes** — write about a track, a record, an artist, or one particular
   playing; see below.
-- **Import** — pull from ListenBrainz or Last.fm, or upload a `.json`/`.csv`
-  export or a Rockbox `.scrobbler.log`, with live progress.
+- **Vinyl & Tape** — the shelf, and a deck with pause, skip and flip reminders.
+- **Rediscovery** — smart collections built from your own history.
+- **Import** — pull from ListenBrainz or Last.fm, upload a `.json`/`.csv` export
+  or a Rockbox `.scrobbler.log` with live progress, or paste a single listen.
 - **Signal Chains & Equipment**, plus **Settings** — split into sections
-  (Appearance, Sources, Connections, API Tokens, Data, Maintenance, About), each
-  deep-linkable as `/settings#sources`.
+  (Appearance, Sources, Connections, API Tokens, Data, Sanitiser, Maintenance,
+  About), each deep-linkable as `/settings#sources`.
 
 ### Liner Notes
 
@@ -265,6 +289,46 @@ display anywhere and shortcode resolution happens in the same pass.
 Notes carry a visibility (private / patched-in / public) for the coming social
 phase. Today every read path is self-only: nothing is served to another user
 whatever the setting says.
+
+### Vinyl & Cassette
+
+A shelf you catalogue and sides you play, for the listening nothing can report
+automatically. Look a pressing up by **barcode**, catalogue number, or artist and
+release — MusicBrainz always, Discogs first for a barcode when an admin has
+configured a token, because it catalogues *pressings* and usually lands on the
+exact edition.
+
+Playing a side writes **one listen per track**, not one per side: every counting
+query in Tapedeck is over listens, so a side-shaped row would be invisible to all
+of them. Press **Start** when the needle drops and the platter turns at a real
+33⅓ with a countdown; the browser runs the clock, so pause and skip are recorded
+as they happen and each track lands where it actually played. Press *Already
+played* instead and the running order is laid out backwards from the sleeve
+times — right ordering and gaps, but no one saw the clock, and the UI says so.
+
+A skipped track is stored and marked, so it stays out of every count and is never
+forwarded — a skip on your Last.fm is a wrong scrobble on a permanent record.
+Stylus hours and the cassette counter are **derived** from the sides played,
+never accumulated, so they cannot drift from the plays they claim to count.
+
+Sides are not reliably available from any provider — MusicBrainz records a vinyl
+track number as "A1" only when an editor entered one — so Tapedeck splits by
+**playing time** when it has to. A side holds around twenty minutes and a
+mastering engineer balances them; splitting by track count would put a
+nine-minute closer on the wrong side of the break. It's a guess, and the
+tracklist is editable.
+
+### Rediscovery
+
+Smart collections built entirely from your own history. Nothing here recommends
+music you don't own — that needs a corpus this app deliberately doesn't have.
+
+Forgotten favourites (played properly once, not lately — the window is yours),
+loved but barely played, one-listen records, what you played this time of year,
+deep cuts, the 3 AM club (hour-of-day in *your* timezone), dusty vinyl, and
+**never heard on a particular pair of headphones** — which is what
+`scrobbles.chain_id` was always for: a chain names its components, so the
+question is answerable with no per-listen equipment field at all.
 
 ### Musical Personality
 
@@ -337,14 +401,20 @@ Backfill your history from elsewhere and take it with you:
 
 ### Build
 
-The web UI is compiled into `static/` and then baked into the binary via
-`rust-embed`, so it must be built **before** `cargo build`:
+`cargo build` is the whole build. `build.rs` compiles the SvelteKit UI into
+`static/` before rustc runs, and `rust-embed` bakes it into the binary:
 
 ```bash
 git clone https://codeberg.org/abksh/tapedeck.git
 cd tapedeck
-./build-web.sh            # bun install + vite build → static/  (required first)
 cargo build --release
+```
+
+This means **bun is required for every cargo invocation**, including `cargo
+check` and `cargo clippy`. For Rust-only work against an existing `static/`:
+
+```bash
+TAPEDECK_SKIP_WEB_BUILD=1 cargo check
 ```
 
 For frontend iteration with hot reload (proxies the API to `localhost:8080`):
@@ -385,11 +455,22 @@ RUST_LOG=info
 LOG_DIR=./logs
 
 # ── MusicBrainz ──
-MUSICBRAINZ_USER_AGENT=Tapedeck/0.10.0 ( your-email@example.com )
+MUSICBRAINZ_USER_AGENT=Tapedeck/0.25.0 ( your-email@example.com )
 MUSICBRAINZ_RATE_LIMIT=1
 
 # ── ListenBrainz endpoint (only for a self-hosted instance) ──
 # LISTENBRAINZ_URL=https://api.listenbrainz.org
+
+# ── Optional service credentials ──
+# All optional. Unconfigured is a normal state: the provider steps aside
+# rather than erroring.
+# TAPEDECK_METRICS_TOKEN=...     # bearer token for scraping /metrics
+# TAPEDECK_DISCOGS_TOKEN=...     # barcode lookup; also settable in the UI
+# TAPEDECK_APPLE_MUSIC_TOKEN=... # one provider in the artist/album bio chain
+# TAPEDECK_SECRET_KEY=...        # credential encryption; generated on first run
+#                                # into a keyfile if unset. Keep it OUT of
+#                                # backups — a backup plus this key is the same
+#                                # as storing credentials in the clear.
 ```
 
 There are **no server-wide scrobble credentials.** A listen is only ever
@@ -535,6 +616,10 @@ means session-only.
 | PUT/DELETE | `/api/v1/sources/:id` | Auth | Update or remove one; an omitted credential keeps the stored one |
 | POST | `/api/v1/sources/test` | Auth | Verify credentials before saving (`kind`) or re-test a stored source (`id`) |
 | GET | `/api/v1/art/:scrobble_id` | Auth | Cover art proxied from the media server that produced the listen |
+| GET | `/api/v1/artists/img/{id}` | Auth | Artist portrait, proxied from your own library |
+| PUT | `/api/v1/artists/img/{id}` | Auth | Set the portrait by hand, or clear it |
+| GET/POST | `/api/v1/sanitize` | Auth | Metadata sanitiser: preview, then apply the edits you ticked |
+| GET | `/api/v1/resolve` | Auth | Name → entity id, creating it on first visit |
 | GET | `/api/v1/artwork/status` | Auth | Cover-art coverage for the caller |
 | POST | `/api/v1/artwork/backfill` | Admin | Resolve missing cover art in the background |
 | GET | `/1/validate-token` | Token | LB token check (`{valid, user_name}`) |
@@ -630,7 +715,7 @@ means session-only.
 | POST | `/api/v1/sessions/rebuild` | Auth | Regroup all listens (`{gap_seconds}`) — discards hand edits |
 | GET | `/api/v1/charts` | Auth | Ranked chart (`kind`=artists\|albums\|tracks, `range`, `limit`) |
 | POST | `/api/v1/loves/pull` | Auth | Fetch loved tracks from every connected service |
-| GET | `/metrics` | Token/Session | Prometheus exposition (`TAPEDECK_METRICS_TOKEN` bearer) |
+| GET | `/metrics` | Admin/Token | Prometheus exposition. Bearer `TAPEDECK_METRICS_TOKEN`, or an **admin** session — every gauge is instance-wide |
 | GET | `/api/v1/sanitize` | Auth | Preview metadata fixes (mixed album releases, featured credits) |
 | POST | `/api/v1/sanitize` | Auth | Apply them — per-edit (`{album_edits, credit_edits, variant_edits}`) or whole-category (`{albums, artists, variants}`) |
 | GET | `/api/v1/entities/{id}` | Auth | An entity with the caller's note and love state |
@@ -639,6 +724,40 @@ means session-only.
 A note target is one of: `entity_id`, `scrobble_id`, `from_scrobble` + `kind`
 (the track / album / artist *of* that listen, created on demand), or `kind` +
 `name` (+ `artist`) spelled out. `kind` is `track`, `album` or `artist`.
+
+### Vinyl, Cassette & Rediscovery
+
+| Method | Path | Auth | Description |
+|--------|------|------|-------------|
+| GET | `/api/v1/physical` | Auth | The shelf; `?kind=vinyl\|cassette` |
+| POST | `/api/v1/physical` | Auth | Add a record or tape |
+| GET | `/api/v1/physical/{id}` | Auth | One release, with derived play counts |
+| DELETE | `/api/v1/physical/{id}` | Auth | Remove it (listens are kept) |
+| PUT | `/api/v1/physical/{id}/tracks` | Auth | Save a corrected side split |
+| POST | `/api/v1/physical/{id}/play` | Auth | Record a side — one listen per track |
+| GET | `/api/v1/physical/lookup` | Auth | `?barcode=` / `?catalog_number=` / `?artist=&release=` |
+| GET | `/api/v1/physical/discogs/{id}` | Auth | One Discogs release, with tracklist |
+| GET | `/api/v1/physical/equipment/{id}/wear` | Auth | Stylus hours and sides played |
+| GET/PUT | `/api/v1/physical/settings/discogs` | Admin | Discogs token (never returned) |
+| GET | `/api/v1/rediscovery` | Auth | All collections; `?quiet_days=` |
+| GET | `/api/v1/rediscovery/gear/{id}` | Auth | Favourites never played through that gear |
+
+`POST /physical/{id}/play` takes per-track outcomes from the client, which is the
+only thing that saw the pauses and skips:
+
+```json
+{
+  "side": "A",
+  "started_at": 1785858587,
+  "tracks": [
+    { "position": 1, "started_at": 1785858587, "skipped": false },
+    { "position": 2, "started_at": 1785858655, "skipped": true }
+  ]
+}
+```
+
+Omit `tracks` and the running order is derived from `started_at` — which can only
+ever describe an uninterrupted side.
 
 ### Signal Chains & Gear
 
@@ -700,7 +819,9 @@ src/
 │   └── enrichment.rs        MusicBrainz enrichment helper
 ├── metadata/
 │   ├── mod.rs               ArtworkProvider trait + the ordered chain
-│   └── deezer.rs            Deezer artwork provider
+│   ├── deezer.rs            Deezer artwork provider
+│   ├── bio.rs               BioProvider chain (Last.fm → TheAudioDB → …)
+│   └── release_lookup.rs    Pressing lookup for vinyl/tape (MusicBrainz, Discogs)
 ├── server/
 │   ├── mod.rs               AppState, build_app()
 │   ├── admin.rs             Health + log level endpoints
@@ -719,7 +840,13 @@ src/
 │   ├── export.rs            JSON/CSV export + full DB backup
 │   ├── import.rs            ListenBrainz/Last.fm/file import + jobs
 │   ├── ratelimit.rs         Login throttle
-│   └── chains.rs            Signal chain, device, equipment, binding endpoints
+│   ├── chains.rs            Signal chain, device, equipment, binding endpoints
+│   ├── library.rs           Album/artist pages, charts, entity resolve
+│   ├── sessions.rs          Listening sessions: list, merge, split, rebuild
+│   ├── physical.rs          Records and tapes: the shelf, and playing a side
+│   ├── rediscovery.rs       Smart collections over your own history
+│   ├── loves_pull.rs        Pull loves back from Last.fm / ListenBrainz
+│   └── metrics.rs           Prometheus exposition (admin only)
 ├── sinks/
 │   ├── mod.rs               sinks_for_user() — the only place sinks are built
 │   ├── lastfm.rs            Last.fm sink (also drives Libre.fm)
@@ -756,6 +883,21 @@ deploy/                      Sample hardened systemd unit
 - [x] **Jellyfin source**, and several sources of any kind per user
 - [x] **Liner notes & loves** — Markdown notes with `[[track:…]]` shortcodes,
       revision history, notes on a listen as well as on a record
+- [x] **Album and artist pages** — aggregations over your own listens, provider
+      bios with attribution, artist portraits from your library or set by hand
+- [x] **Metadata sanitiser** — per-edit review for mixed releases, featured
+      credits, artist spellings and tracks credited two ways on one record
+- [x] **Sessions as objects** — merge, split, rebuild; stable UUIDs
+- [x] **Vinyl & cassette** — catalogue by barcode, catalogue number or name;
+      play a side and it records every track on it, with a real 33⅓ platter,
+      flip reminders, pause and skip, and derived stylus hours
+- [x] **Rediscovery** — forgotten favourites, loved-but-unplayed, one-listen
+      records, seasonal, deep cuts, the 3 AM club, dusty vinyl, and "never heard
+      on this pair of headphones"
+- [x] **`cargo build` builds everything** — `build.rs` compiles the UI, so a
+      fresh clone compiles
+- [x] **Prometheus `/metrics`** — admin-only, per-job import gauges
+- [x] **Plex audio quality** from session metadata, plus device → signal chain
 
 ### Next
 
@@ -766,9 +908,31 @@ deploy/                      Sample hardened systemd unit
       signatures. Open question first: ActivityStreams has no verb for
       "listened to a track", so the vocabulary has to be settled before the
       social schema freezes
+- [ ] **Spotify source** — OAuth, `recently-played` backfill. Note its history
+      endpoint reports when a track *ended*, while `scrobbles.timestamp` is
+      start-of-play everywhere, so the duration has to be subtracted on read
+- [ ] **Listening timeline** — monthly and yearly chapters, milestones,
+      equipment history, "this day in music"
 - [ ] Docker container
-- [ ] Plex audio quality extraction from session metadata
-- [ ] Prometheus `/metrics` endpoint
+- [ ] Notes: full-text search, tags, and Markdown export for Obsidian/Logseq
+- [ ] Mobile layout: the quality badge crowds the track title on narrow screens
+
+### Known gaps
+
+Things that look finished and aren't:
+
+- **Discogs lookup is implemented but untested against the live API** — no token
+  was available. The MusicBrainz path is fully verified.
+- **Artist portraits from Navidrome** aren't wired. Plex and Jellyfin are;
+  Subsonic can answer it, but an untested path that silently returns nothing is
+  worse than a stated gap.
+- **`listen_type: "import"` submitted through the ingest API is still
+  forwarded** to your connected services. The *file* importer marks its rows
+  `imported` and they are skipped; the ingest path has no equivalent yet. Don't
+  build a backfill client against it until that lands.
+- **Token scopes are stored and never enforced.** A token can submit listens but
+  cannot read any `/api/v1/` route, so an external client can't offer a chain
+  picker.
 
 ## Performance
 
@@ -782,15 +946,22 @@ deploy/                      Sample hardened systemd unit
 
 ## Contributing
 
-`static/` is gitignored but baked into the binary, so a fresh clone will not
-compile until the web UI has been built once:
-
 ```bash
-./build-web.sh            # required before the first cargo build
 cargo fmt
 cargo clippy
-cargo test
+cargo test          # 119 tests
 ```
+
+`static/` is gitignored but baked into the binary; `build.rs` builds it, so a
+fresh clone compiles. `build-web.sh` still exists for rebuilding the UI without
+invoking cargo.
+
+The test suite is unit-level — pure functions and a few `sqlx` tests against a
+temp database. There are **no HTTP-layer tests**, so handlers and anything
+touching a remote service are verified by running the binary and hitting it with
+`curl`. Where a remote API's shape matters, pin it against a real captured
+response: several of this codebase's worst bugs were field-name mismatches that
+compiled perfectly and silently produced `None` forever.
 
 ## License
 
