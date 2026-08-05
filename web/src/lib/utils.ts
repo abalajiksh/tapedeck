@@ -52,11 +52,17 @@ export function qualityLabel(scrobble: {
 	bit_depth?: number | null;
 	sample_rate?: number | null;
 	dsd_multiplier?: number | null;
+	dsd_to_pcm_converted?: boolean | null;
 	delivery_codec?: string | null;
 	is_lossless?: boolean | null;
 }): { text: string; tier: 'dsd' | 'lossless' | 'lossy' | 'bt' } {
 	if (scrobble.format_type === 'dsd' && scrobble.dsd_multiplier) {
-		return { text: `DSD${scrobble.dsd_multiplier}`, tier: 'dsd' };
+		// A DSD file decoded to PCM on the way out is not native DSD playback,
+		// and on a chain built around a DSD-capable DAC that difference is the
+		// whole point — so it is on the badge rather than buried in a detail
+		// panel. The tier stays `dsd`: it is still a DSD source.
+		const suffix = scrobble.dsd_to_pcm_converted ? '→PCM' : '';
+		return { text: `DSD${scrobble.dsd_multiplier}${suffix}`, tier: 'dsd' };
 	}
 
 	if (scrobble.delivery_codec) {

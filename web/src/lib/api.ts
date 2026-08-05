@@ -15,10 +15,20 @@ export interface Scrobble {
 	bitrate: number | null;
 	sample_rate: number | null;
 	bit_depth: number | null;
+	container: string | null;
+	/** What the player claimed it was handed, kept apart from the measurements
+	 *  above because the two can disagree. */
+	source_quality: string | null;
 	is_lossless: boolean | null;
 	dsd_rate: number | null;
 	dsd_multiplier: number | null;
+	/** A DSD stream decoded to PCM before it reached the output — a change of
+	 *  representation rather than a bitrate compromise, and the thing a
+	 *  DSD-capable DAC exists to avoid. */
+	dsd_to_pcm_converted: boolean | null;
 	delivery_codec: string | null;
+	delivery_sample_rate: number | null;
+	delivery_bit_depth: number | null;
 	quality_score: number | null;
 	chain_id: number | null;
 	listening_context: string | null;

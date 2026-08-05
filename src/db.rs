@@ -38,11 +38,16 @@ pub struct ScrobbleRecord {
     pub sample_rate: Option<i32>,
     pub bit_depth: Option<i32>,
     pub channels: Option<i32>,
+    pub container: Option<String>,
+    pub source_quality: Option<String>,
     pub is_lossless: Option<bool>,
     pub dsd_rate: Option<i64>,
     pub dsd_multiplier: Option<i32>,
+    pub dsd_to_pcm_converted: Option<bool>,
     pub delivery_codec: Option<String>,
     pub delivery_bitrate: Option<i32>,
+    pub delivery_sample_rate: Option<i32>,
+    pub delivery_bit_depth: Option<i32>,
     pub is_transcoded: Option<bool>,
     pub transcode_reason: Option<String>,
     pub quality_score: Option<f64>,
@@ -368,8 +373,11 @@ impl Database {
                 caa_id INTEGER, caa_release_mbid TEXT,
                 format_type TEXT, codec TEXT, bitrate INTEGER,
                 sample_rate INTEGER, bit_depth INTEGER, channels INTEGER,
+                container TEXT, source_quality TEXT,
                 is_lossless BOOLEAN, dsd_rate INTEGER, dsd_multiplier INTEGER,
+                dsd_to_pcm_converted BOOLEAN,
                 delivery_codec TEXT, delivery_bitrate INTEGER,
+                delivery_sample_rate INTEGER, delivery_bit_depth INTEGER,
                 is_transcoded BOOLEAN, transcode_reason TEXT, quality_score REAL,
                 device_id INTEGER REFERENCES devices(id),
                 chain_id INTEGER REFERENCES signal_chains(id),
@@ -1041,6 +1049,29 @@ impl Database {
             .await;
         }
 
+        // Migration: the five quality fields that were parsed and thrown away.
+        // `AudioQuality` has carried `container`, `delivery_sample_rate` and
+        // `delivery_bit_depth` since Phase 2 and the ingest path filled them in,
+        // but `save_scrobble` never had columns to bind them to — so the values
+        // were built on every listen and dropped on the floor. `source_quality`
+        // and `dsd_to_pcm_converted` arrived in the payload and weren't even
+        // mapped. "Was this DSD converted to PCM before it reached me?" is a
+        // question this app exists to answer and could not.
+        if !has_column(&self.pool, "scrobbles", "container").await {
+            info!("⚙️ Migrating: adding the remaining scrobble quality fields...");
+            for col in &[
+                "container TEXT",
+                "source_quality TEXT",
+                "dsd_to_pcm_converted BOOLEAN",
+                "delivery_sample_rate INTEGER",
+                "delivery_bit_depth INTEGER",
+            ] {
+                let _ = sqlx::query(&format!("ALTER TABLE scrobbles ADD COLUMN {}", col))
+                    .execute(&self.pool)
+                    .await;
+            }
+        }
+
         Ok(())
     }
 
@@ -1207,6 +1238,14 @@ impl Database {
     //  Scrobble CRUD
     // ════════════════════════════════════════════════════════════
 
+    /// Store one listen.
+    ///
+    /// `disposition` decides whether the row is ever forwarded. It used to be
+    /// hardcoded to `'pending'`, which meant an ingest-path backfill
+    /// (`listen_type: "import"`) was indistinguishable from a live listen and
+    /// got scrobbled onward — rewriting the user's real Last.fm history. Pass
+    /// `ListenDisposition::LIVE` only for something that just played.
+    #[allow(clippy::too_many_arguments)]
     pub async fn save_scrobble(
         &self,
         user_id: i64,
@@ -1217,6 +1256,7 @@ impl Database {
         listening_context: Option<&str>,
         submission_client: Option<&str>,
         source_ref: Option<i64>,
+        disposition: ListenDisposition,
     ) -> Result<bool, sqlx::Error> {
         if self.exists(user_id, &play.source_id, &play.source_name).await? {
             return Ok(false);
@@ -1239,17 +1279,20 @@ impl Database {
         sqlx::query(
             "INSERT INTO scrobbles (
                 user_id, title, artist, artist_credit, album, timestamp, duration,
-                source_id, source_name, status,
+                source_id, source_name, status, skipped,
                 mbid_recording, mbid_release, mbid_artist, caa_id, caa_release_mbid,
-                format_type, codec, bitrate, sample_rate, bit_depth, channels, is_lossless,
-                dsd_rate, dsd_multiplier, delivery_codec, delivery_bitrate,
+                format_type, codec, bitrate, sample_rate, bit_depth, channels,
+                container, source_quality, is_lossless,
+                dsd_rate, dsd_multiplier, dsd_to_pcm_converted,
+                delivery_codec, delivery_bitrate, delivery_sample_rate, delivery_bit_depth,
                 is_transcoded, transcode_reason, quality_score,
                 device_id, chain_id, listening_context, submission_client, track_number,
                 source_ref
             ) VALUES (
-                ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending',
-                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                ?, ?, ?, ?, ?, ?, ?, ?, ?
             )",
         )
         .bind(user_id)
@@ -1261,6 +1304,8 @@ impl Database {
         .bind(play.duration.map(|d| d as i64))
         .bind(&play.source_id)
         .bind(&play.source_name)
+        .bind(disposition.status())
+        .bind(disposition.skipped)
         .bind(&play.mbid_recording)
         .bind(&play.mbid_release)
         .bind(&mbid_artist_json)
@@ -1272,11 +1317,16 @@ impl Database {
         .bind(q.sample_rate)
         .bind(q.bit_depth.map(|v| v as i32))
         .bind(q.channels.map(|v| v as i32))
+        .bind(&q.container)
+        .bind(&q.source_quality)
         .bind(q.is_lossless)
         .bind(q.dsd_rate)
         .bind(q.dsd_multiplier.map(|v| v as i32))
+        .bind(q.dsd_to_pcm_converted)
         .bind(&q.delivery_codec)
         .bind(q.delivery_bitrate)
+        .bind(q.delivery_sample_rate)
+        .bind(q.delivery_bit_depth)
         .bind(q.is_transcoded)
         .bind(&q.transcode_reason)
         .bind(q.quality_score)
@@ -3651,29 +3701,6 @@ impl Database {
         .await
     }
 
-    /// Mark one listen as a skip.
-    ///
-    /// Skips are stored but never counted — history, charts, ranged stats and
-    /// every backfill filter `skipped = FALSE`, and a skip is never forwarded,
-    /// because a skip on someone's Last.fm is a wrong scrobble on a permanent
-    /// record. Setting `status` to `'imported'` is what takes it out of the
-    /// forwarding queue, the same mechanism the file importer uses.
-    pub async fn mark_scrobble_skipped(
-        &self,
-        user_id: i64,
-        source_id: &str,
-    ) -> Result<bool, sqlx::Error> {
-        let res = sqlx::query(
-            "UPDATE scrobbles SET skipped = TRUE, status = 'imported'
-              WHERE user_id = ? AND source_id = ?",
-        )
-        .bind(user_id)
-        .bind(source_id)
-        .execute(&self.pool)
-        .await?;
-        Ok(res.rows_affected() > 0)
-    }
-
     /// Records and tapes that haven't left the shelf.
     ///
     /// The one list here that isn't about listens at all — it reads
@@ -5240,6 +5267,26 @@ impl Database {
         }
     }
 
+    /// Look a device up without creating or touching it.
+    ///
+    /// `upsert_device` is the normal path and it *writes* — it bumps
+    /// `last_seen` and `total_listens`. A dry-run submit has to resolve the
+    /// chain ladder's device rung without leaving a trace, or "tell me what
+    /// would happen" would itself change what happens.
+    pub async fn find_device(
+        &self,
+        user_id: i64,
+        machine_id: &str,
+    ) -> Result<Option<i64>, sqlx::Error> {
+        let row: Option<(i64,)> =
+            sqlx::query_as("SELECT id FROM devices WHERE user_id = ? AND machine_id = ?")
+                .bind(user_id)
+                .bind(machine_id)
+                .fetch_optional(&self.pool)
+                .await?;
+        Ok(row.map(|(id,)| id))
+    }
+
     pub async fn get_devices(&self, user_id: i64) -> Result<Vec<DeviceRow>, sqlx::Error> {
         sqlx::query_as("SELECT * FROM devices WHERE user_id = ? ORDER BY last_seen DESC")
             .bind(user_id)
@@ -6046,6 +6093,151 @@ mod tests {
         Play::new(title.into(), artist.into(), ts, format!("src-{ts}"), "test".into())
     }
 
+    /// `save_scrobble` hardcoded `status = 'pending'`, so a listen submitted as
+    /// `listen_type: "import"` was indistinguishable from one that had just
+    /// played and went out to Last.fm — rewriting a permanent public record
+    /// with someone's backfill. The forwarding queue is the thing to assert on:
+    /// a backfill must never appear in it.
+    #[tokio::test]
+    async fn a_backfilled_listen_is_never_queued_for_forwarding() {
+        let db = testdb().await;
+
+        db.save_scrobble(
+            1,
+            &play("Live", "A", 1000),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            ListenDisposition::LIVE,
+        )
+        .await
+        .unwrap();
+        db.save_scrobble(
+            1,
+            &play("Backfilled", "A", 2000),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            ListenDisposition { imported: true, skipped: false },
+        )
+        .await
+        .unwrap();
+
+        let pending = db.get_pending_scrobbles().await.unwrap();
+        assert_eq!(pending.len(), 1, "only the live listen may be forwarded");
+        assert_eq!(pending[0].play.title, "Live");
+
+        // Both are still *stored* — an import is history, not a discard.
+        assert_eq!(db.listen_count_and_latest(1).await.unwrap().0, 2);
+    }
+
+    /// A skip is stored so skip-rate analytics has something real to count, and
+    /// filed as `'imported'` so nothing forwards it: a skip on someone's
+    /// Last.fm is a wrong scrobble on a permanent record.
+    #[tokio::test]
+    async fn a_skipped_listen_is_stored_uncounted_and_unforwarded() {
+        let db = testdb().await;
+
+        db.save_scrobble(
+            1,
+            &play("Played", "A", 1000),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            ListenDisposition::LIVE,
+        )
+        .await
+        .unwrap();
+        db.save_scrobble(
+            1,
+            &play("Skipped", "A", 2000),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            ListenDisposition { imported: false, skipped: true },
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            db.get_pending_scrobbles().await.unwrap().iter().all(|p| p.play.title != "Skipped"),
+            "a skip must never reach a sink"
+        );
+        assert_eq!(
+            db.listen_count_and_latest(1).await.unwrap().0,
+            1,
+            "a skip is excluded from every count"
+        );
+
+        let stored: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM scrobbles WHERE user_id = 1 AND skipped = TRUE")
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert_eq!(stored.0, 1, "but it is kept, so skip-rate analytics can see it");
+    }
+
+    /// These five were built on every listen and dropped on the floor:
+    /// `AudioQuality` carried them and `save_scrobble` had no columns to bind
+    /// them to. The regression to guard is silent — a field that is simply
+    /// always NULL.
+    #[tokio::test]
+    async fn the_full_quality_record_round_trips() {
+        let db = testdb().await;
+        let q = AudioQuality {
+            format_type: Some("dsd".into()),
+            container: Some("dsf".into()),
+            source_quality: Some("hi-res".into()),
+            dsd_rate: Some(2_822_400),
+            dsd_multiplier: Some(64),
+            dsd_to_pcm_converted: Some(true),
+            delivery_codec: Some("ldac".into()),
+            delivery_sample_rate: Some(96_000),
+            delivery_bit_depth: Some(24),
+            ..Default::default()
+        };
+        db.save_scrobble(
+            1,
+            &play("T", "A", 1000),
+            Some(&q),
+            None,
+            None,
+            None,
+            None,
+            None,
+            ListenDisposition::LIVE,
+        )
+        .await
+        .unwrap();
+
+        let row: (Option<String>, Option<String>, Option<bool>, Option<i32>, Option<i32>) =
+            sqlx::query_as(
+                "SELECT container, source_quality, dsd_to_pcm_converted,
+                        delivery_sample_rate, delivery_bit_depth
+                   FROM scrobbles WHERE user_id = 1",
+            )
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(row.0.as_deref(), Some("dsf"));
+        assert_eq!(row.1.as_deref(), Some("hi-res"));
+        assert_eq!(row.2, Some(true));
+        assert_eq!(row.3, Some(96_000));
+        assert_eq!(row.4, Some(24));
+    }
+
     /// The bug this pass had from the start: its SQL grouped by
     /// `LOWER(TRIM(artist))` while the Rust grouping also lowercases, so a
     /// case-only variant was merged away before anything could report it. On a
@@ -6058,9 +6250,19 @@ mod tests {
         for (artist, n) in [("Linkin Park", 5), ("LINKIN PARK", 2), ("Kiss", 1), ("KISS", 3)] {
             for _ in 0..n {
                 ts += 1000;
-                db.save_scrobble(1, &play("T", artist, ts), None, None, None, None, None, None)
-                    .await
-                    .unwrap();
+                db.save_scrobble(
+                    1,
+                    &play("T", artist, ts),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    ListenDisposition::LIVE,
+                )
+                .await
+                .unwrap();
             }
         }
 
@@ -6084,9 +6286,19 @@ mod tests {
         for (artist, n) in [("Cœur de pirate", 4), ("Coeur de Pirate", 2)] {
             for _ in 0..n {
                 ts += 1000;
-                db.save_scrobble(1, &play("T", artist, ts), None, None, None, None, None, None)
-                    .await
-                    .unwrap();
+                db.save_scrobble(
+                    1,
+                    &play("T", artist, ts),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    ListenDisposition::LIVE,
+                )
+                .await
+                .unwrap();
             }
         }
 
@@ -6105,9 +6317,19 @@ mod tests {
         let mut ts = 1000u64;
         for artist in ["Burial", "Aphex Twin", "Karthik", "Karthika"] {
             ts += 1000;
-            db.save_scrobble(1, &play("T", artist, ts), None, None, None, None, None, None)
-                .await
-                .unwrap();
+            db.save_scrobble(
+                1,
+                &play("T", artist, ts),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                ListenDisposition::LIVE,
+            )
+            .await
+            .unwrap();
         }
         assert!(db.artists_with_spelling_variants(1).await.unwrap().is_empty());
     }
@@ -6141,7 +6363,19 @@ mod tests {
                 ts += 1000;
                 let mut p = play(title, artist, ts);
                 p.album = Some("Aadhavan".into());
-                db.save_scrobble(1, &p, None, None, None, None, None, None).await.unwrap();
+                db.save_scrobble(
+                    1,
+                    &p,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    ListenDisposition::LIVE,
+                )
+                .await
+                .unwrap();
             }
         }
 
@@ -6191,17 +6425,33 @@ mod tests {
     async fn dedup_rejects_duplicate_source() {
         let db = testdb().await;
         let p = play("Teardrop", "Massive Attack", 1000);
-        assert!(db.save_scrobble(1, &p, None, None, None, None, None, None).await.unwrap());
+        assert!(db
+            .save_scrobble(1, &p, None, None, None, None, None, None, ListenDisposition::LIVE)
+            .await
+            .unwrap());
         // same source_id + name → deduped
-        assert!(!db.save_scrobble(1, &p, None, None, None, None, None, None).await.unwrap());
+        assert!(!db
+            .save_scrobble(1, &p, None, None, None, None, None, None, ListenDisposition::LIVE)
+            .await
+            .unwrap());
     }
 
     #[tokio::test]
     async fn per_sink_delivery_is_tracked() {
         let db = testdb().await;
-        db.save_scrobble(1, &play("T", "A", 2000), None, None, None, None, None, None)
-            .await
-            .unwrap();
+        db.save_scrobble(
+            1,
+            &play("T", "A", 2000),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            ListenDisposition::LIVE,
+        )
+        .await
+        .unwrap();
 
         let pending = db.get_pending_scrobbles().await.unwrap();
         assert_eq!(pending.len(), 1);
@@ -6264,12 +6514,32 @@ mod tests {
             })
             .await
             .unwrap();
-        db.save_scrobble(uid, &play("a", "x", 10), None, None, None, None, None, None)
-            .await
-            .unwrap();
-        db.save_scrobble(uid, &play("b", "y", 20), None, None, None, None, None, None)
-            .await
-            .unwrap();
+        db.save_scrobble(
+            uid,
+            &play("a", "x", 10),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            ListenDisposition::LIVE,
+        )
+        .await
+        .unwrap();
+        db.save_scrobble(
+            uid,
+            &play("b", "y", 20),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            ListenDisposition::LIVE,
+        )
+        .await
+        .unwrap();
         let ids: Vec<i64> = db.get_all_scrobbles(uid).await.unwrap().iter().map(|r| r.id).collect();
 
         let n = db.bulk_set_scrobble_chain(uid, &ids[..1], Some(cid)).await.unwrap();
@@ -6301,6 +6571,7 @@ mod tests {
                 None,
                 None,
                 None,
+                ListenDisposition::LIVE,
             )
             .await
             .unwrap();
@@ -6377,7 +6648,9 @@ mod tests {
             plays.push(p);
         }
         for p in &plays {
-            db.save_scrobble(uid, p, None, None, None, None, None, None).await.unwrap();
+            db.save_scrobble(uid, p, None, None, None, None, None, None, ListenDisposition::LIVE)
+                .await
+                .unwrap();
         }
 
         let mixed = db.albums_with_mixed_releases(uid).await.unwrap();
@@ -6425,6 +6698,7 @@ mod tests {
                 None,
                 None,
                 None,
+                ListenDisposition::LIVE,
             )
             .await
             .unwrap();
@@ -6509,9 +6783,19 @@ mod tests {
     async fn delete_user_cascades_their_data() {
         let db = testdb().await;
         let uid = db.create_user("dave", None, "x", "user").await.unwrap();
-        db.save_scrobble(uid, &play("s", "a", 5), None, None, None, None, None, None)
-            .await
-            .unwrap();
+        db.save_scrobble(
+            uid,
+            &play("s", "a", 5),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            ListenDisposition::LIVE,
+        )
+        .await
+        .unwrap();
         db.create_token(uid, "t", "submit", None).await.unwrap();
         // A connection has an FK to users — deletion must clear it, or the whole
         // cascade rolls back (the bug this guards against).
@@ -6813,6 +7097,7 @@ mod tests {
             None,
             Some("Plex"),
             Some(a),
+            ListenDisposition::LIVE,
         )
         .await
         .unwrap();
@@ -6825,6 +7110,7 @@ mod tests {
             None,
             Some("Plex"),
             Some(b),
+            ListenDisposition::LIVE,
         )
         .await
         .unwrap();
@@ -6929,6 +7215,7 @@ mod tests {
             None,
             None,
             None,
+            ListenDisposition::LIVE,
         )
         .await
         .unwrap();
@@ -6990,7 +7277,9 @@ mod tests {
         let mut p = play("Ageispolis", "Aphex Twin", 1000);
         p.album = Some("SAW 85-92".into());
         p.track_number = Some(3);
-        db.save_scrobble(uid, &p, None, None, None, None, None, None).await.unwrap();
+        db.save_scrobble(uid, &p, None, None, None, None, None, None, ListenDisposition::LIVE)
+            .await
+            .unwrap();
 
         // A named track with nothing annotated yet still resolves, because the
         // user has actually played it.

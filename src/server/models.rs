@@ -44,6 +44,13 @@ pub struct AdditionalInfo {
     /// with it — so accept both spellings.
     #[serde(alias = "tracknumber", alias = "trackNumber")]
     pub track_number: Option<i32>,
+    /// The client reporting that this track was skipped rather than played
+    /// through. `scrobbles.skipped` has existed since Phase 2 but only Rockbox
+    /// imports and the shelf's deck transport ever set it, so skip-rate
+    /// analytics had no live source. A skipped listen is stored, excluded from
+    /// every count, and never forwarded.
+    #[serde(default)]
+    pub skipped: Option<bool>,
 
     // ── Tapedeck extensions ──
     pub tapedeck_audio: Option<TapedeckAudio>,
@@ -115,9 +122,69 @@ pub struct TapedeckSession {
 
 // ── Response types ──
 
+/// The response to `submit-listens`.
+///
+/// Everything past `status` is a Tapedeck extension and purely additive:
+/// ListenBrainz clients branch on `status` alone, so extra keys cannot break
+/// them. It exists because a batch submit was previously all-or-nothing from
+/// the client's point of view — "ok" told a plugin author nothing about which
+/// listens were stored, which were already known, and which were malformed.
 #[derive(Debug, Serialize)]
 pub struct SubmitListensResponse {
     pub status: String,
+    /// Newly stored.
+    pub accepted: u32,
+    /// Recognised as already held, by `source_id` or by the fuzzy window.
+    /// Not an error — a client re-sending after a dropped connection is the
+    /// normal way this happens.
+    pub duplicate: u32,
+    /// Listens that could not be stored and should **not** be retried, each
+    /// with its index into the submitted payload. Always present, empty when
+    /// nothing was rejected — an absent key would be ambiguous.
+    pub rejected: Vec<RejectedListen>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RejectedListen {
+    /// Index into the submitted `payload`, so the client can map it back to
+    /// what it sent.
+    pub index: usize,
+    pub reason: String,
+}
+
+/// The response to `submit-listens?dry_run=1`: what *would* have happened.
+#[derive(Debug, Serialize)]
+pub struct DryRunResponse {
+    pub status: String,
+    pub dry_run: bool,
+    pub listens: Vec<DryRunListen>,
+    pub rejected: Vec<RejectedListen>,
+}
+
+/// One listen's resolved state, computed and thrown away.
+#[derive(Debug, Serialize)]
+pub struct DryRunListen {
+    pub index: usize,
+    pub artist: String,
+    pub title: String,
+    pub album: Option<String>,
+    pub timestamp: i64,
+    /// The score `AudioQuality::compute_score` derives from the submitted
+    /// fields — the main thing a plugin author is trying to get right.
+    pub quality_score: Option<f64>,
+    /// The winner of the four-rung ladder, and which rung won it.
+    pub chain_id: Option<i64>,
+    pub chain_name: Option<String>,
+    pub chain_source: &'static str,
+    pub device_id: Option<i64>,
+    pub listening_context: Option<String>,
+    /// What the row would be filed as: `pending` (will be forwarded onward) or
+    /// `imported` (stored only). The distinction a backfill has to get right.
+    pub status_if_stored: &'static str,
+    pub skipped: bool,
+    /// Whether the dedup would have swallowed it — checked read-only against
+    /// the same two rules the real path uses.
+    pub duplicate: bool,
 }
 
 #[derive(Debug, Serialize)]

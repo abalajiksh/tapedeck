@@ -5,6 +5,7 @@ use tokio::time::sleep;
 use tracing::{debug, error, info, warn};
 
 use crate::db::Database;
+use crate::models::ListenDisposition;
 use crate::musicbrainz::MusicBrainzClient;
 use crate::server::now_playing::{NowPlaying, NowPlayingRegistry};
 use crate::sinks;
@@ -368,6 +369,7 @@ impl ScrobbleEngine {
                             None,
                             Some("Navidrome"),
                             Some(row_id),
+                            ListenDisposition::LIVE,
                         )
                         .await
                     {
@@ -473,6 +475,7 @@ impl ScrobbleEngine {
                     None,
                     Some("Jellyfin"),
                     Some(row_id),
+                    ListenDisposition::LIVE,
                 )
                 .await
             {
@@ -665,6 +668,7 @@ impl ScrobbleEngine {
                         listening_context.as_deref(),
                         Some("Plex"),
                         Some(row_id),
+                        ListenDisposition::LIVE,
                     )
                     .await
                 {

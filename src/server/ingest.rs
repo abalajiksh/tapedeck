@@ -13,7 +13,7 @@ use super::models::*;
 use super::now_playing::NowPlaying;
 use super::AppState;
 use crate::engine::enrichment::enrich_play;
-use crate::models::{AudioQuality, Play};
+use crate::models::{AudioQuality, ListenDisposition, Play};
 
 #[derive(Deserialize)]
 pub struct TokenQuery {
@@ -89,12 +89,32 @@ pub async fn validate_token(
     }
 }
 
+#[derive(Deserialize)]
+pub struct SubmitQuery {
+    /// `?dry_run=1` — resolve everything, store nothing, forward nothing.
+    dry_run: Option<String>,
+}
+
+/// Accepts `1`, `true`, `yes`, and a bare `?dry_run` — a plugin author trying
+/// this by hand shouldn't have to guess which spelling we wanted.
+fn truthy(v: &Option<String>) -> bool {
+    match v {
+        Some(s) => {
+            let s = s.trim();
+            s.is_empty() || matches!(s.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on")
+        }
+        None => false,
+    }
+}
+
 /// POST /1/submit-listens
 pub async fn submit_listens(
     State(state): State<Arc<AppState>>,
     IngestAuth { user, token_chain_id, token_id }: IngestAuth,
+    Query(q): Query<SubmitQuery>,
     Json(body): Json<SubmitListensRequest>,
 ) -> impl IntoResponse {
+    let dry_run = truthy(&q.dry_run);
     let listen_count = body.payload.len();
 
     if listen_count == 0 {
@@ -127,15 +147,19 @@ pub async fn submit_listens(
 
     let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64;
     let mut accepted = 0u32;
+    let mut duplicate = 0u32;
+    let mut rejected: Vec<RejectedListen> = Vec::new();
+    let mut previews: Vec<DryRunListen> = Vec::new();
     let mut failed = 0u32; // listens we could not persist (DB error) — triggers a retryable response
 
-    for listen in &body.payload {
+    for (index, listen) in body.payload.iter().enumerate() {
         let timestamp = match body.listen_type {
             ListenType::PlayingNow => now,
             _ => match listen.listened_at {
                 Some(ts) => ts,
                 None => {
                     warn!("Listen missing listened_at, skipping");
+                    rejected.push(RejectedListen { index, reason: "missing listened_at".into() });
                     continue;
                 }
             },
@@ -146,6 +170,8 @@ pub async fn submit_listens(
         // Reject malformed listens (no retry — it's bad client data, not our fault)
         if meta.artist_name.trim().is_empty() || meta.track_name.trim().is_empty() {
             warn!("Listen missing artist/track, skipping");
+            rejected
+                .push(RejectedListen { index, reason: "missing artist_name or track_name".into() });
             continue;
         }
 
@@ -200,23 +226,30 @@ pub async fn submit_listens(
         let quality_opt = if quality.has_data() { Some(&quality) } else { None };
 
         // ── Phase 2: Resolve device ──
+        // `upsert_device` writes (it bumps `last_seen` and `total_listens`), so
+        // a dry run looks the device up instead. Asking what would happen must
+        // not itself be a listen.
         let device_id = if let Some(td) = info_ref.and_then(|ai| ai.tapedeck_device.as_ref()) {
             if let Some(ref mid) = td.machine_id {
-                match state
-                    .db
-                    .upsert_device(
-                        user.user_id,
-                        mid,
-                        td.player_name.as_deref(),
-                        td.platform.as_deref(),
-                        td.player_name.as_deref(),
-                    )
-                    .await
-                {
-                    Ok(id) => Some(id),
-                    Err(e) => {
-                        debug!("Device upsert failed: {}", e);
-                        None
+                if dry_run {
+                    state.db.find_device(user.user_id, mid).await.ok().flatten()
+                } else {
+                    match state
+                        .db
+                        .upsert_device(
+                            user.user_id,
+                            mid,
+                            td.player_name.as_deref(),
+                            td.platform.as_deref(),
+                            td.player_name.as_deref(),
+                        )
+                        .await
+                    {
+                        Ok(id) => Some(id),
+                        Err(e) => {
+                            debug!("Device upsert failed: {}", e);
+                            None
+                        }
                     }
                 }
             } else {
@@ -236,8 +269,12 @@ pub async fn submit_listens(
             .and_then(|ai| ai.tapedeck_device.as_ref())
             .and_then(|td| td.interface.as_ref().or(td.output_type.as_ref()));
         if let Some(dev) = output_dev {
-            let _ =
-                state.db.record_output(user.user_id, dev, output_iface.map(|s| s.as_str())).await;
+            if !dry_run {
+                let _ = state
+                    .db
+                    .record_output(user.user_id, dev, output_iface.map(|s| s.as_str()))
+                    .await;
+            }
         }
 
         // ── Resolve chain (layered, first match wins) ──
@@ -254,40 +291,81 @@ pub async fn submit_listens(
         // chain when you issued the token.
         let explicit_chain_name =
             info_ref.and_then(|ai| ai.tapedeck_chain.as_ref()).and_then(|tc| tc.chain_id.as_ref());
-        let chain_id: Option<i64> = if let Some(name) = explicit_chain_name {
-            match state.db.get_chain_by_name(user.user_id, name).await {
-                Ok(Some(id)) => Some(id),
-                Ok(None) => {
-                    debug!("Unknown chain name from client: {}", name);
-                    None
+        // `chain_source` names the rung that won, which is only reported by the
+        // dry run — but it is the single most useful thing to see there, since
+        // a chain arriving from the wrong rung looks identical to one arriving
+        // from the right one.
+        let (chain_id, chain_source): (Option<i64>, &'static str) =
+            if let Some(name) = explicit_chain_name {
+                match state.db.get_chain_by_name(user.user_id, name).await {
+                    Ok(Some(id)) => (Some(id), "explicit"),
+                    Ok(None) => {
+                        debug!("Unknown chain name from client: {}", name);
+                        (None, "none")
+                    }
+                    Err(e) => {
+                        debug!("Chain lookup failed: {}", e);
+                        (None, "none")
+                    }
                 }
-                Err(e) => {
-                    debug!("Chain lookup failed: {}", e);
-                    None
+            } else if let Some(binding) = match output_dev {
+                Some(dev) => state.db.resolve_binding(user.user_id, dev).await.ok().flatten(),
+                None => None,
+            } {
+                (Some(binding), "output_binding")
+            } else if let Some(tc) = token_chain_id {
+                (Some(tc), "token_default")
+            } else if let Some(dev) = device_id {
+                match state.db.get_device_default_chain(user.user_id, dev).await.ok().flatten() {
+                    Some(cid) => (Some(cid), "device_default"),
+                    None => (None, "none"),
                 }
-            }
-        } else if let Some(binding) = match output_dev {
-            Some(dev) => state.db.resolve_binding(user.user_id, dev).await.ok().flatten(),
-            None => None,
-        } {
-            Some(binding)
-        } else if let Some(tc) = token_chain_id {
-            Some(tc)
-        } else if let Some(dev) = device_id {
-            state.db.get_device_default_chain(user.user_id, dev).await.ok().flatten()
-        } else {
-            None
-        };
+            } else {
+                (None, "none")
+            };
 
         // ── Phase 2: Listening context from chain default ──
-        let listening_context = if let Some(cid) = chain_id {
-            match state.db.get_chain(user.user_id, cid).await {
-                Ok(Some(c)) => Some(c.listening_context.as_str().to_string()),
-                _ => None,
-            }
-        } else {
-            None
+        // Fetched once: the context and the chain's name both come off the same
+        // row, and the dry run wants the name.
+        let chain = match chain_id {
+            Some(cid) => state.db.get_chain(user.user_id, cid).await.ok().flatten(),
+            None => None,
         };
+        let listening_context = chain.as_ref().map(|c| c.listening_context.as_str().to_string());
+        let chain_name = chain.as_ref().map(|c| c.name.clone());
+
+        if dry_run {
+            let disposition = ListenDisposition {
+                imported: body.listen_type == ListenType::Import,
+                skipped: info_ref.and_then(|ai| ai.skipped).unwrap_or(false),
+            };
+            // Both dedup rules are read-only, so the preview can answer the
+            // question a client most often has — "will this be swallowed?" —
+            // rather than making them submit and find out.
+            let duplicate =
+                matches!(
+                    state.db.exists(user.user_id, &play.source_id, &play.source_name).await,
+                    Ok(true)
+                ) || matches!(state.db.fuzzy_exists(user.user_id, &play).await, Ok(true));
+
+            previews.push(DryRunListen {
+                index,
+                artist: play.artist.clone(),
+                title: play.title.clone(),
+                album: play.album.clone(),
+                timestamp,
+                quality_score: quality.quality_score,
+                chain_id,
+                chain_name,
+                chain_source,
+                device_id,
+                listening_context,
+                status_if_stored: disposition.status(),
+                skipped: disposition.skipped,
+                duplicate,
+            });
+            continue;
+        }
 
         match body.listen_type {
             ListenType::PlayingNow => {
@@ -317,6 +395,17 @@ pub async fn submit_listens(
                 accepted += 1;
             }
             ListenType::Single | ListenType::Import => {
+                // What this listen *is*, and therefore whether it is ever
+                // forwarded. `import` is a backfill: the client is telling us
+                // about something that already happened, and pushing that to
+                // Last.fm rewrites a permanent public record. This used to be
+                // hardcoded `'pending'` in `save_scrobble`, so every
+                // plugin-driven backfill was scrobbled onward as if live.
+                let disposition = ListenDisposition {
+                    imported: body.listen_type == ListenType::Import,
+                    skipped: info_ref.and_then(|ai| ai.skipped).unwrap_or(false),
+                };
+
                 match state
                     .db
                     .save_scrobble(
@@ -328,6 +417,7 @@ pub async fn submit_listens(
                         listening_context.as_deref(),
                         Some(submission_client),
                         None, // pushed by a client, not pulled from a configured source
+                        disposition,
                     )
                     .await
                 {
@@ -359,13 +449,26 @@ pub async fn submit_listens(
                                 .await;
                         }
 
-                        // Accumulate hours on the resolved chain
+                        // Accumulate hours on the resolved chain — but not for a
+                        // skip. A skipped track is a few seconds of listening,
+                        // and crediting the gear with its full running time is
+                        // the same error `skipped = FALSE` guards everywhere
+                        // else.
                         if let Some(cid) = chain_id {
-                            let _ = state.db.update_chain_hours(cid, dur as f64 / 3600.0).await;
+                            if !disposition.skipped {
+                                let _ = state.db.update_chain_hours(cid, dur as f64 / 3600.0).await;
+                            }
                         }
 
                         info!(
-                            "📥 Ingested: {} - {} [user: {}, client: {}, quality: {}]",
+                            "📥 Ingested{}: {} - {} [user: {}, client: {}, quality: {}]",
+                            if disposition.skipped {
+                                " (skipped)"
+                            } else if disposition.imported {
+                                " (backfill)"
+                            } else {
+                                ""
+                            },
                             play.artist,
                             play.title,
                             user.username,
@@ -377,9 +480,14 @@ pub async fn submit_listens(
                         );
                         accepted += 1;
                     }
+                    // Already held — by `source_id` or by the fuzzy window.
+                    // Counted apart from `accepted` now: a client resending
+                    // after a dropped connection is normal, but a client whose
+                    // every listen comes back `duplicate` has a bug, and
+                    // folding the two together hid that.
                     Ok(false) => {
-                        accepted += 1;
-                    } // dupe
+                        duplicate += 1;
+                    }
                     Err(e) => {
                         error!("Database error persisting listen: {}", e);
                         failed += 1;
@@ -389,14 +497,37 @@ pub async fn submit_listens(
         }
     }
 
+    if dry_run {
+        info!(
+            "🔍 Dry run: {} listens resolved, {} rejected [user: {}, type: {:?}]",
+            previews.len(),
+            rejected.len(),
+            user.username,
+            body.listen_type
+        );
+        return (
+            StatusCode::OK,
+            Json(DryRunResponse {
+                status: "ok".into(),
+                dry_run: true,
+                listens: previews,
+                rejected,
+            }),
+        )
+            .into_response();
+    }
+
     info!(
-        "Ingest complete: {} accepted, {} failed of {} [user: {}, type: {:?}]",
-        accepted, failed, listen_count, user.username, body.listen_type
+        "Ingest complete: {} accepted, {} duplicate, {} rejected, {} failed of {} [user: {}, type: {:?}]",
+        accepted, duplicate, rejected.len(), failed, listen_count, user.username, body.listen_type
     );
 
     // If any listen failed to persist, return a retryable error so the client
     // resends the batch — our dedup (source_id + fuzzy match) makes retries safe,
     // and this prevents silently losing listens on a transient DB error.
+    //
+    // Note this is separate from `rejected`, which is the *don't* retry list:
+    // a rejected listen is malformed and resending it changes nothing.
     if failed > 0 {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -411,7 +542,11 @@ pub async fn submit_listens(
             .into_response();
     }
 
-    (StatusCode::OK, Json(SubmitListensResponse { status: "ok".into() })).into_response()
+    (
+        StatusCode::OK,
+        Json(SubmitListensResponse { status: "ok".into(), accepted, duplicate, rejected }),
+    )
+        .into_response()
 }
 
 /// Extract audio quality from Tapedeck extension fields.
@@ -431,9 +566,11 @@ fn extract_audio_quality(info: Option<&AdditionalInfo>) -> AudioQuality {
         bit_depth: ta.bit_depth,
         channels: ta.channels,
         container: ta.container.clone(),
+        source_quality: ta.source_quality.clone(),
         is_lossless: ta.is_lossless,
         dsd_rate: ta.dsd_rate,
         dsd_multiplier: ta.dsd_multiplier,
+        dsd_to_pcm_converted: ta.dsd_to_pcm_converted,
         delivery_codec: ta.delivery_codec.clone(),
         delivery_bitrate: ta.delivery_bitrate,
         delivery_sample_rate: ta.delivery_sample_rate,

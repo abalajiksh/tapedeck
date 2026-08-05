@@ -77,12 +77,66 @@ pub struct AudioQuality {
     pub delivery_bitrate: Option<i32>,
     pub delivery_sample_rate: Option<i32>,
     pub delivery_bit_depth: Option<i32>,
+    /// What the player believes it was handed — "lossless", "hi-res", "cd",
+    /// "lossy". The player's own claim about the file, kept apart from the
+    /// measurements beside it because the two can disagree and the
+    /// disagreement is the interesting part.
+    pub source_quality: Option<String>,
+    /// Was a DSD stream decoded to PCM before it reached the output?
+    ///
+    /// Deliberately separate from `is_transcoded`: a DSD→PCM conversion is not
+    /// a bitrate compromise, it's a change of representation, and on a chain
+    /// built around a DSD-capable DAC it is the difference between native
+    /// playback and the thing you bought the DAC to avoid. It does **not**
+    /// enter `compute_score` — see the note there.
+    pub dsd_to_pcm_converted: Option<bool>,
     pub is_transcoded: Option<bool>,
     pub transcode_reason: Option<String>,
     pub quality_score: Option<f64>,
 }
 
+/// How a listen should be filed: is it a backfill, and was it skipped?
+///
+/// Both answers come out as `status = 'imported'`, which is what takes a row
+/// out of `flush_pending`'s queue — so this is the one place that decides
+/// whether a listen is ever forwarded to Last.fm / ListenBrainz / Libre.fm.
+/// It exists as a struct rather than two more positional arguments because the
+/// coupling is the point: forgetting either one puts a wrong scrobble on
+/// someone's permanent public record.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ListenDisposition {
+    /// The submission declared itself a backfill (`listen_type: "import"`, or
+    /// a file import). A historical listen is not news — forwarding it
+    /// rewrites the user's scrobble history at the far end.
+    pub imported: bool,
+    /// The client reported the track was skipped rather than played through.
+    /// Stored so skip-rate analytics has something real to count, excluded
+    /// from every count, and never forwarded.
+    pub skipped: bool,
+}
+
+impl ListenDisposition {
+    pub const LIVE: Self = Self { imported: false, skipped: false };
+
+    /// `'pending'` only for a live, played-through listen; everything else is
+    /// filed as already-delivered so the flush loop leaves it alone.
+    pub fn status(&self) -> &'static str {
+        if self.imported || self.skipped {
+            "imported"
+        } else {
+            "pending"
+        }
+    }
+}
+
 impl AudioQuality {
+    /// Note what is deliberately *not* in here: `dsd_to_pcm_converted` and
+    /// `source_quality`. Both are stored and both are worth seeing, but the
+    /// score is written once at ingest and never recomputed, so folding a new
+    /// term in would silently make every listen recorded after the change
+    /// incomparable with every listen before it. If these should count, the
+    /// change is a backfill that rescores the whole history, not a new line
+    /// here.
     pub fn compute_score(&mut self) {
         let base = match self.format_type.as_deref() {
             Some("dsd") => match self.dsd_multiplier {

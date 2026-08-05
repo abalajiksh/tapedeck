@@ -36,6 +36,7 @@ pub struct NowPlaying {
     pub bit_depth: Option<i16>,
     pub sample_rate: Option<i32>,
     pub dsd_multiplier: Option<i16>,
+    pub dsd_to_pcm_converted: Option<bool>,
     pub delivery_codec: Option<String>,
     pub is_lossless: Option<bool>,
 }
@@ -61,6 +62,7 @@ impl NowPlaying {
             bit_depth: quality.and_then(|q| q.bit_depth),
             sample_rate: quality.and_then(|q| q.sample_rate),
             dsd_multiplier: quality.and_then(|q| q.dsd_multiplier),
+            dsd_to_pcm_converted: quality.and_then(|q| q.dsd_to_pcm_converted),
             delivery_codec: quality.and_then(|q| q.delivery_codec.clone()),
             is_lossless: quality.and_then(|q| q.is_lossless),
         }
@@ -199,6 +201,7 @@ mod tests {
             bit_depth: None,
             sample_rate: None,
             dsd_multiplier: None,
+            dsd_to_pcm_converted: None,
             delivery_codec: None,
             is_lossless: None,
         }

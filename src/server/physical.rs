@@ -27,7 +27,7 @@ use super::auth::AuthUser;
 use super::models::ErrorResponse;
 use super::AppState;
 use crate::metadata::release_lookup::{self, PhysicalTrack};
-use crate::models::Play;
+use crate::models::{ListenDisposition, Play};
 
 /// Where an admin-set Discogs token lives.
 pub const DISCOGS_TOKEN_KEY: &str = "discogs_token";
@@ -413,14 +413,16 @@ async fn play_side(
                 None,
                 Some(if release.kind == "vinyl" { "Vinyl" } else { "Cassette" }),
                 None,
+                // Kept so skip-rate analytics has something real to count, and
+                // filed so nothing else does. This used to be an UPDATE after
+                // the insert, which left the row briefly `'pending'` — long
+                // enough for a flush tick to forward a skip.
+                ListenDisposition { imported: false, skipped: was_skipped },
             )
             .await
         {
             Ok(true) => {
                 if was_skipped {
-                    // Kept so skip-rate analytics has something real to count,
-                    // and marked so nothing else does.
-                    let _ = state.db.mark_scrobble_skipped(user.user_id, &play.source_id).await;
                     skipped_count += 1;
                 } else {
                     written += 1;

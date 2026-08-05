@@ -111,15 +111,49 @@ fn to_lb_listen(s: &ScrobbleRecord, include_listened_at: bool) -> serde_json::Va
     if let Some(v) = s.bit_depth {
         audio.insert("bit_depth".into(), serde_json::json!(v));
     }
+    if let Some(v) = s.channels {
+        audio.insert("channels".into(), serde_json::json!(v));
+    }
+    if let Some(ref v) = s.container {
+        audio.insert("container".into(), serde_json::json!(v));
+    }
+    if let Some(ref v) = s.source_quality {
+        audio.insert("source_quality".into(), serde_json::json!(v));
+    }
     if let Some(v) = s.is_lossless {
         audio.insert("is_lossless".into(), serde_json::json!(v));
+    }
+    if let Some(v) = s.dsd_rate {
+        audio.insert("dsd_rate".into(), serde_json::json!(v));
     }
     if let Some(v) = s.dsd_multiplier {
         audio.insert("dsd_multiplier".into(), serde_json::json!(v));
     }
+    if let Some(v) = s.dsd_to_pcm_converted {
+        audio.insert("dsd_to_pcm_converted".into(), serde_json::json!(v));
+    }
     if let Some(ref v) = s.delivery_codec {
         audio.insert("delivery_codec".into(), serde_json::json!(v));
     }
+    if let Some(v) = s.delivery_bitrate {
+        audio.insert("delivery_bitrate".into(), serde_json::json!(v));
+    }
+    if let Some(v) = s.delivery_sample_rate {
+        audio.insert("delivery_sample_rate".into(), serde_json::json!(v));
+    }
+    if let Some(v) = s.delivery_bit_depth {
+        audio.insert("delivery_bit_depth".into(), serde_json::json!(v));
+    }
+    if let Some(v) = s.is_transcoded {
+        audio.insert("is_transcoded".into(), serde_json::json!(v));
+    }
+    if let Some(ref v) = s.transcode_reason {
+        audio.insert("transcode_reason".into(), serde_json::json!(v));
+    }
+    // `quality_score` is deliberately not emitted. It is derived, written once
+    // at ingest, and re-importing it would fossilise a number computed under
+    // whatever formula was current then — the reader should recompute from the
+    // measurements above, which are the facts.
     if !audio.is_empty() {
         additional.insert("tapedeck_audio".into(), serde_json::Value::Object(audio));
     }
