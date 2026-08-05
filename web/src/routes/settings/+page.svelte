@@ -890,6 +890,14 @@
 
 						{#if sanitize.artist_variants.length}
 							<div class="san-group">One artist spelled several ways</div>
+							<p style="font-size:12.5px;color:var(--td-muted);margin:0 0 10px;">
+								Merging spellings is <strong>not reversible</strong> — unlike the
+								featured-credit fold, nothing is kept, because both strings name the
+								same artist. The ones marked <em>counts split</em> are the ones that
+								matter: those spellings are separate artists to every chart. The
+								rest only display inconsistently, since every counting query already
+								lowercases.
+							</p>
 							{#each sanitize.artist_variants as v}
 								{#each v.variants as x}
 									{@const key = variantKey(x[0], v.primary)}
@@ -900,7 +908,11 @@
 											<span class="san-name">{x[0]}</span>
 											<span class="san-sub">
 												→ {v.primary} · {x[1]} play{x[1] === 1 ? '' : 's'} moved to the spelling with {v.primary_plays}
-												· not reversible
+												{#if v.case_only}
+													· <span style="color:var(--td-muted-3);">capitalisation only — counts are already correct</span>
+												{:else}
+													· <span style="color:#b2622d;font-weight:600;">counts split</span>
+												{/if}
 											</span>
 										</span>
 									</label>

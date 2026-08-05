@@ -154,43 +154,10 @@ pub struct PlexPlayer {
 
 /// Are these two spellings of the same artist?
 ///
-/// Compared on letters and digits only, so "Cœur de pirate" matches "Coeur de
-/// Pirate" — the ligature and the capital are exactly the differences a media
-/// server and a scrobble tag disagree about. Deliberately not fuzzy beyond
-/// that: a near-miss here puts the wrong person's photograph on the page.
+/// Delegates to `db::artist_matches` so there is exactly one answer to this in
+/// the codebase — this used to be a second, subtly different implementation.
 pub fn artist_matches(a: &str, b: &str) -> bool {
-    fn key(s: &str) -> String {
-        s.to_lowercase()
-            .chars()
-            .flat_map(|c| match c {
-                // The ligatures that actually turn up in artist names.
-                'œ' => vec!['o', 'e'],
-                'æ' => vec!['a', 'e'],
-                'ß' => vec!['s', 's'],
-                c => vec![c],
-            })
-            .filter(|c| c.is_alphanumeric())
-            .collect()
-    }
-    let (a, b) = (key(a), key(b));
-    !a.is_empty() && a == b
-}
-
-/// Is this a "no single artist" placeholder rather than an artist?
-///
-/// A compilation files every track under one of these, so treating it as the
-/// record's artist records the whole album under it — which is what happened to
-/// "Do You Like Brahms?", where Punch and Kim Na Young became Various Artists.
-/// The placeholder means *look at the track*, so that is what we do.
-///
-/// Kept to the exact well-known forms. This decides which of two real names
-/// wins, so a loose match here would silently discard a genuine artist called,
-/// say, "Various Production".
-pub fn is_various_artists(name: &str) -> bool {
-    matches!(
-        name.trim().to_lowercase().as_str(),
-        "various artists" | "various artist" | "various" | "va" | "verschiedene interpreten"
-    )
+    crate::db::artist_matches(a, b)
 }
 
 /// Does this track credit already name `artist`?
@@ -380,7 +347,9 @@ impl PlexTrack {
             // A compilation has no artist of its own, so the performer is it.
             // Keeping the placeholder in the credit would only assert that the
             // record is a compilation, which the album already says.
-            Some(p) if is_various_artists(&self.artist) => (p.to_string(), vec![p.to_string()]),
+            Some(p) if crate::db::is_various_artists(&self.artist) => {
+                (p.to_string(), vec![p.to_string()])
+            }
             // The performers already name the record's artist — the common case
             // when a music director sings on their own soundtrack, which
             // Anirudh Ravichander, Ilaiyaraaja, Harris Jayaraj and A. R. Rahman
@@ -1443,10 +1412,10 @@ mod tests {
     #[test]
     fn various_artists_placeholders_are_recognised_narrowly() {
         for yes in ["Various Artists", "various artists", "  VARIOUS  ", "VA", "Various Artist"] {
-            assert!(is_various_artists(yes), "{yes:?} should be a placeholder");
+            assert!(crate::db::is_various_artists(yes), "{yes:?} should be a placeholder");
         }
         for no in ["Various Production", "Varius Manx", "The Various", "V.A.S.", ""] {
-            assert!(!is_various_artists(no), "{no:?} is a real name");
+            assert!(!crate::db::is_various_artists(no), "{no:?} is a real name");
         }
     }
 

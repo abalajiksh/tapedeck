@@ -1699,6 +1699,8 @@ impl Database {
     /// Where this artist sits in the user's all-time ranking, and how many
     /// artists they've heard at all (so the UI can say "#3 of 412").
     pub async fn artist_rank(&self, user_id: i64, artist: &str) -> Result<(i64, i64), sqlx::Error> {
+        // Ranking groups case-insensitively on purpose: "LINKIN PARK" and
+        // "Linkin Park" are one artist to the charts, so they must be one here.
         let rows: Vec<(String, i64)> = sqlx::query_as(
             "SELECT artist, COUNT(*) AS plays FROM scrobbles
              WHERE user_id = ? AND skipped = FALSE
@@ -1949,10 +1951,21 @@ impl Database {
         &self,
         user_id: i64,
     ) -> Result<Vec<VariantArtist>, sqlx::Error> {
+        // Grouped by the **exact** string, not by `LOWER(TRIM(artist))`.
+        //
+        // That was the bug: the Rust grouping below also lowercases, so
+        // anything it would merge on case alone, the SQL had already merged —
+        // SQLite returned one arbitrarily-chosen spelling per lowercased name
+        // and the group came back with a single member. Case-only variants
+        // were therefore invisible *by construction*: on a 21k-listen history
+        // this reported nothing while thirteen real groups sat in the data.
+        // The half that worked — punctuation and spacing, "A.R. Rahman"
+        // against "A R Rahman" — survives the collapse, which is why it
+        // looked correct.
         let rows: Vec<(String, i64)> = sqlx::query_as(
             "SELECT artist, COUNT(*) AS plays FROM scrobbles
              WHERE user_id = ? AND skipped = FALSE
-             GROUP BY LOWER(TRIM(artist)) ORDER BY plays DESC",
+             GROUP BY artist ORDER BY plays DESC",
         )
         .bind(user_id)
         .fetch_all(&self.pool)
@@ -1970,14 +1983,26 @@ impl Database {
                 // Already ordered by plays from the query; be explicit anyway.
                 g.sort_by(|a, b| b.1.cmp(&a.1));
                 let (primary, primary_plays) = g[0].clone();
+                // Whether these differ by anything a reader would notice.
+                // Most read paths already lowercase — `chart()` groups on
+                // `LOWER(TRIM(artist))`, `entity_key` lowercases — so a
+                // case-only group has correct counts and merely displays
+                // inconsistently. Flagged rather than hidden: it is a real
+                // variant, just a cosmetic one, and burying it with the
+                // count-splitting kind would make the list unreadable.
+                let case_only = g.iter().all(|(n, _)| n.to_lowercase() == primary.to_lowercase());
                 VariantArtist {
                     primary,
                     primary_plays,
                     variants: g[1..].iter().map(|(n, p)| (n.clone(), *p)).collect(),
+                    case_only,
                 }
             })
             .collect();
-        out.sort_by(|a, b| b.primary_plays.cmp(&a.primary_plays));
+        // The ones that actually split a play count first; cosmetic ones last.
+        out.sort_by(|a, b| {
+            a.case_only.cmp(&b.case_only).then(b.primary_plays.cmp(&a.primary_plays))
+        });
         Ok(out)
     }
 
@@ -5779,6 +5804,13 @@ pub struct VariantArtist {
     pub primary_plays: i64,
     /// `(spelling, plays)` for every other form of the same name.
     pub variants: Vec<(String, i64)>,
+    /// These differ only in capitalisation or spacing.
+    ///
+    /// Worth separating because the consequences differ. A case-only variant
+    /// costs nothing but display consistency — every read path that counts
+    /// already lowercases. Anything else ("Cœur de pirate" against "Coeur de
+    /// pirate") is genuinely two artists to every query, and splits the plays.
+    pub case_only: bool,
 }
 
 /// A listening session: contiguous listening through one setup.
@@ -5825,23 +5857,68 @@ fn new_uuid() -> String {
 /// placeholder: "Various Artists" is on every track of a compilation, so it
 /// wins the breadth test outright.
 pub fn is_various_artists(name: &str) -> bool {
-    crate::sources::plex::is_various_artists(name)
+    matches!(
+        name.trim().to_lowercase().as_str(),
+        "various artists" | "various artist" | "various" | "va" | "verschiedene interpreten"
+    )
 }
 
-/// Collapse an artist name to its identity for duplicate detection: lowercase,
-/// with punctuation and whitespace removed entirely.
+/// Collapse an artist name to its identity for duplicate detection.
 ///
-/// Aggressive on purpose — "A.R. Rahman", "A. R. Rahman" and "AR Rahman" all
-/// reduce to `arrahman`. It is only ever used to *group candidates for review*,
-/// never to rewrite anything on its own, so a false pairing costs a line in a
-/// preview rather than corrupted data.
+/// **The one artist-identity function in the codebase.** There used to be two —
+/// this and `sources::plex::artist_matches`, written for portrait lookup — and
+/// they disagreed about whether "Cœur de pirate" and "Coeur de pirate" were the
+/// same person. The portrait code said yes and the sanitiser said no, so a
+/// history could hold both spellings as separate artists while sharing one
+/// photograph. Two answers to one question is worse than either answer.
 ///
-/// **Does not fold ligatures or accents**, so "Cœur de pirate" and "Coeur de
-/// pirate" are different identities here — see the note in CLAUDE.md.
-/// `sources::plex::artist_matches` *does* fold them, and the two should be one
-/// function.
+/// Three steps, each earning its place:
+///
+/// 1. **Ligature expansion.** `œ`, `æ` and `ß` have no Unicode decomposition —
+///    they are letters, not accented forms — so they need naming explicitly.
+///    This is the case that actually split 2,958 plays from 3 in a real
+///    history.
+/// 2. **NFKD, then drop combining marks.** Turns `ó` into `o`, `ü` into `u`.
+///    Handles every accented Latin form without a table to maintain, and folds
+///    the ligatures Unicode *does* decompose (`ﬁ`) for free.
+/// 3. **Keep alphanumerics, lowercase.** So "A.R. Rahman", "A. R. Rahman" and
+///    "AR Rahman" all reduce to `arrahman`.
+///
+/// Aggressive on purpose. It groups *candidates for review* and never rewrites
+/// on its own, so a false pairing costs a line in a preview rather than
+/// corrupted data — with one exception worth knowing: `artist_matches` uses it
+/// to decide which artist a portrait belongs to, where a false pairing shows
+/// the wrong face. Accent folding is safe there because an accent has never
+/// distinguished two different artists; it is the same person, spelled by a
+/// tagger who couldn't be bothered.
 pub fn normalise_artist(s: &str) -> String {
-    s.chars().filter(|c| c.is_alphanumeric()).flat_map(|c| c.to_lowercase()).collect()
+    use unicode_normalization::UnicodeNormalization;
+    s.chars()
+        .flat_map(|c| match c {
+            'œ' | 'Œ' => "oe".chars().collect::<Vec<_>>(),
+            'æ' | 'Æ' => "ae".chars().collect(),
+            'ß' => "ss".chars().collect(),
+            // Not decomposable either — a stroke through the letter.
+            'ø' | 'Ø' => "o".chars().collect(),
+            'đ' | 'Đ' | 'ð' | 'Ð' => "d".chars().collect(),
+            'ł' | 'Ł' => "l".chars().collect(),
+            'þ' | 'Þ' => "th".chars().collect(),
+            c => vec![c],
+        })
+        .nfkd()
+        .filter(|c| !unicode_normalization::char::is_combining_mark(*c))
+        .filter(|c| c.is_alphanumeric())
+        .flat_map(|c| c.to_lowercase())
+        .collect()
+}
+
+/// Are these two strings the same artist?
+///
+/// Both sides go through `normalise_artist`, so this and the sanitiser can
+/// never disagree again.
+pub fn artist_matches(a: &str, b: &str) -> bool {
+    let (a, b) = (normalise_artist(a), normalise_artist(b));
+    !a.is_empty() && a == b
 }
 
 /// Split `Artist feat. Someone` into its primary artist.
@@ -5967,6 +6044,72 @@ mod tests {
 
     fn play(title: &str, artist: &str, ts: u64) -> Play {
         Play::new(title.into(), artist.into(), ts, format!("src-{ts}"), "test".into())
+    }
+
+    /// The bug this pass had from the start: its SQL grouped by
+    /// `LOWER(TRIM(artist))` while the Rust grouping also lowercases, so a
+    /// case-only variant was merged away before anything could report it. On a
+    /// real 21k-listen history that meant thirteen groups went unreported and
+    /// the screen said there was nothing to fix.
+    #[tokio::test]
+    async fn case_only_variants_are_reported() {
+        let db = testdb().await;
+        let mut ts = 1000u64;
+        for (artist, n) in [("Linkin Park", 5), ("LINKIN PARK", 2), ("Kiss", 1), ("KISS", 3)] {
+            for _ in 0..n {
+                ts += 1000;
+                db.save_scrobble(1, &play("T", artist, ts), None, None, None, None, None, None)
+                    .await
+                    .unwrap();
+            }
+        }
+
+        let v = db.artists_with_spelling_variants(1).await.unwrap();
+        let lp = v.iter().find(|g| g.primary.eq_ignore_ascii_case("linkin park")).expect("found");
+        assert_eq!(lp.primary, "Linkin Park", "the most-played spelling wins");
+        assert_eq!(lp.variants, vec![("LINKIN PARK".to_string(), 2)]);
+        assert!(lp.case_only, "differs only in case");
+
+        let kiss = v.iter().find(|g| g.primary.eq_ignore_ascii_case("kiss")).expect("found");
+        assert_eq!(kiss.primary, "KISS", "and it is the count that decides, not the casing");
+    }
+
+    /// The other half: a ligature is not a case difference. These are two
+    /// artists to every query — two chart rows, two entity keys — so they must
+    /// be reported *and* not marked cosmetic.
+    #[tokio::test]
+    async fn ligature_variants_are_reported_as_real() {
+        let db = testdb().await;
+        let mut ts = 1000u64;
+        for (artist, n) in [("Cœur de pirate", 4), ("Coeur de Pirate", 2)] {
+            for _ in 0..n {
+                ts += 1000;
+                db.save_scrobble(1, &play("T", artist, ts), None, None, None, None, None, None)
+                    .await
+                    .unwrap();
+            }
+        }
+
+        let v = db.artists_with_spelling_variants(1).await.unwrap();
+        let g = v.iter().find(|g| g.primary.starts_with('C')).expect("grouped");
+        assert_eq!(g.primary, "Cœur de pirate");
+        assert_eq!(g.variants, vec![("Coeur de Pirate".to_string(), 2)]);
+        assert!(!g.case_only, "a ligature splits the play count — not cosmetic");
+    }
+
+    /// Two genuinely different artists must never be grouped, whatever the
+    /// normaliser folds.
+    #[tokio::test]
+    async fn different_artists_are_not_grouped() {
+        let db = testdb().await;
+        let mut ts = 1000u64;
+        for artist in ["Burial", "Aphex Twin", "Karthik", "Karthika"] {
+            ts += 1000;
+            db.save_scrobble(1, &play("T", artist, ts), None, None, None, None, None, None)
+                .await
+                .unwrap();
+        }
+        assert!(db.artists_with_spelling_variants(1).await.unwrap().is_empty());
     }
 
     /// The soundtrack case, in the exact shape it has in real data: an album

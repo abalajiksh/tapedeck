@@ -587,7 +587,15 @@ export interface SanitizePreview {
 	/** `Artist feat. X` strings that fragment an album or artist page. */
 	featured_artists: { artist: string; primary: string; plays: number }[];
 	/** One artist spelled several ways ("A.R. Rahman" / "A. R. Rahman"). */
-	artist_variants: { primary: string; primary_plays: number; variants: [string, number][] }[];
+	artist_variants: {
+		primary: string;
+		primary_plays: number;
+		variants: [string, number][];
+		/** Differs only in capitalisation. Cosmetic — every counting query
+		 *  already lowercases, so these display inconsistently but count
+		 *  correctly. Anything else genuinely splits the play total. */
+		case_only: boolean;
+	}[];
 	/** One track on a record credited two different ways — the film-soundtrack
 	 *  case, where the album carries the music director and each track its
 	 *  singers. `primary_album_tracks` is *why* the winner won and shows how
