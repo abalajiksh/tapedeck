@@ -1,7 +1,6 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
-	import { api, type Rediscovery, type RediscoveryRow } from '$lib/api';
-	import { formatDateTime } from '$lib/utils';
+	import { api, type Rediscovery, type RediscoveryCollection, type RediscoveryRow } from '$lib/api';
 	import { openAlbum, openArtist } from '$lib/entities';
 	import CoverArt from '$lib/components/CoverArt.svelte';
 
@@ -18,6 +17,10 @@
 		{ days: 730, label: '2 years' }
 	];
 	let quietDays = 180;
+
+	/** Which card is expanded. Collections are summaries first — the two sample
+	 *  tracks are the hook, the full list is a click away. */
+	let openKey: string | null = null;
 
 	let gearId: number | null = null;
 	let gearRows: RediscoveryRow[] = [];
@@ -46,127 +49,167 @@
 		gearLoading = false;
 	}
 
-	async function setWindow(days: number) {
-		quietDays = days;
-		await load();
-	}
-
-	/** A track row opens the record it's on — the same rule every other track
-	 *  listing in the app follows, falling back to the artist when there's no
-	 *  album to open. */
+	/** A track row opens the record it's on — the rule every track listing in
+	 *  the app follows — falling back to the artist when there's no album. */
 	function openRow(r: RediscoveryRow) {
 		if (r.album) return openAlbum(r.artist, r.album);
 		return openArtist(r.artist);
 	}
 
-	function ago(ts: number | null): string {
-		if (!ts) return 'never';
-		const days = Math.floor((Date.now() / 1000 - ts) / 86400);
-		if (days < 1) return 'today';
-		if (days < 30) return `${days}d ago`;
-		if (days < 365) return `${Math.floor(days / 30)}mo ago`;
-		const y = Math.floor(days / 365);
-		return `${y}y ago`;
+	/** The accent at low opacity, for the badge behind each icon. */
+	function tint(hex: string, alpha: number): string {
+		const n = parseInt(hex.replace('#', ''), 16);
+		return `rgba(${(n >> 16) & 255}, ${(n >> 8) & 255}, ${n & 255}, ${alpha})`;
 	}
 
 	onMount(load);
 </script>
 
-<svelte:head><title>Rediscover — Tapedeck</title></svelte:head>
+<svelte:head><title>Rediscovery — Tapedeck</title></svelte:head>
 
-<h1 class="h-display" style="font-size:34px;margin:0;">Rediscover</h1>
-<p style="margin:6px 0 0;color:var(--td-muted);font-size:15px;max-width:60ch;">
-	Nothing here is a recommendation — it's all things you already chose, and
-	aren't choosing now.
-</p>
+<div style="margin-bottom:22px;">
+	<h1 class="h-display" style="font-size:38px;margin:0 0 6px;letter-spacing:-.02em;">Rediscovery</h1>
+	<p style="margin:0;color:var(--td-muted);font-size:15px;">
+		Smart collections that dig up what you've loved and lost — all of it from
+		your own listening history.
+	</p>
+</div>
 
-<div style="display:flex;gap:8px;align-items:center;margin:18px 0;flex-wrap:wrap;">
+<div style="display:flex;gap:8px;align-items:center;margin-bottom:22px;flex-wrap:wrap;">
 	<span style="font-size:12.5px;color:var(--td-muted-2);">Quiet for</span>
 	{#each WINDOWS as w}
-		<button class="chip" class:on={quietDays === w.days} on:click={() => setWindow(w.days)}>
-			{w.label}
-		</button>
+		<button class="chip" class:on={quietDays === w.days}
+			on:click={() => { quietDays = w.days; load(); }}>{w.label}</button>
 	{/each}
 </div>
 
-{#if error}
-	<p style="color:#b2622d;font-size:14px;">{error}</p>
-{/if}
+{#if error}<p style="color:#b2622d;font-size:14px;">{error}</p>{/if}
 
 {#if loading}
 	<p style="color:var(--td-muted);font-size:14px;">Looking through your history…</p>
 {:else if data}
-	{#snippet list(title: string, blurb: string, rows: RediscoveryRow[])}
-		<section style="margin-bottom:28px;">
-			<h3 class="h-display" style="font-size:20px;margin:0 0 2px;">{title}</h3>
-			<p style="margin:0 0 12px;font-size:13px;color:var(--td-muted);">{blurb}</p>
-			{#if rows.length}
-				<div class="panel" style="border-radius:20px;overflow:hidden;">
-					{#each rows as r, i}
-						<button class="row" on:click={() => openRow(r)}>
-							<CoverArt url={r.artwork_url} caaId={r.caa_id} releaseMbid={r.caa_release_mbid}
-								seed={`${r.artist} ${r.name}`} size={38} radius={8} />
-							<span style="flex:1;min-width:0;text-align:left;">
-								<span class="nm">{r.name}</span>
-								<span class="sb">{r.artist}{r.album ? ` — ${r.album}` : ''}</span>
-							</span>
-							<span class="meta">
-								{r.plays} play{r.plays === 1 ? '' : 's'}
-								<span style="color:var(--td-muted-3);">· {ago(r.last_played)}</span>
-							</span>
-						</button>
-						{#if i < rows.length - 1}<div class="sep"></div>{/if}
-					{/each}
-				</div>
-			{:else}
-				<p style="font-size:13.5px;color:var(--td-muted-2);margin:0;">
-					Nothing here yet — which is its own kind of answer.
+	{#if data.featured}
+		<!-- The hero. Its record turns because this is the one thing on the page
+		     asking to be picked up — the rest are a catalogue. -->
+		<div class="hero">
+			<div style="width:120px;height:120px;flex:none;">
+				<svg viewBox="0 0 120 120" style="width:100%;height:auto;display:block;">
+					<circle cx="60" cy="60" r="57" fill="#c67139" opacity=".14" />
+					<g class="platter" style="transform-origin:60px 60px;">
+						<circle cx="60" cy="60" r="52" fill="#0d0a07" />
+						{#each [44, 35, 26] as r}
+							<circle cx="60" cy="60" r={r} fill="none" stroke="#2a241d" stroke-width="1" />
+						{/each}
+						<circle cx="60" cy="60" r="19" fill={data.featured.accent} />
+						<circle cx="60" cy="60" r="14" fill="none" stroke="#f4e7cf" stroke-width="1" opacity=".5" />
+						<line x1="60" y1="45" x2="60" y2="52" stroke="#f4e7cf" stroke-width="1.6" stroke-linecap="round" />
+						<circle cx="60" cy="60" r="2.6" fill="#f4e7cf" />
+					</g>
+				</svg>
+			</div>
+			<div style="flex:1;min-width:240px;">
+				<div class="eyebrow">This week's rediscovery</div>
+				<h2 class="h-display" style="font-size:27px;margin:0 0 6px;letter-spacing:-.015em;">
+					{data.featured.title}
+				</h2>
+				<p style="margin:0 0 14px;color:#c9bfa8;font-size:14.5px;max-width:52ch;">
+					{data.featured.blurb}
 				</p>
-			{/if}
-		</section>
-	{/snippet}
+				<div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:16px;font-size:12.5px;color:#b3a487;">
+					<span class="pill" style="background:{data.featured.accent};">
+						{data.featured.count} track{data.featured.count === 1 ? '' : 's'}
+					</span>
+					<span>{data.featured.stat}</span>
+				</div>
+				<button class="btn btn-primary"
+					on:click={() => (openKey = openKey === data?.featured?.key ? null : (data?.featured?.key ?? null))}>
+					{openKey === data.featured.key ? 'Hide' : 'See all'}
+				</button>
+			</div>
+		</div>
+	{/if}
 
-	{@render list(
-		'Forgotten favourites',
-		`Played properly once, and not in the last ${WINDOWS.find((w) => w.days === quietDays)?.label ?? 'while'}.`,
-		data.forgotten_favourites
-	)}
+	<div class="cards">
+		{#each data.collections as c (c.key)}
+			<div class="card" class:empty={!c.count}>
+				<div style="display:flex;gap:14px;align-items:flex-start;margin-bottom:14px;">
+					<div class="badge" style="background:{tint(c.accent, 0.15)};color:{c.accent};">
+						<svg viewBox="0 0 24 24" width="22" fill="none" stroke="currentColor"
+							stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round">
+							<path d="M3 5v5h5" /><path d="M4.2 14a8 8 0 1 0 1.3-6.3L3 10" />
+						</svg>
+					</div>
+					<div style="flex:1;min-width:0;">
+						<h3 class="h-display" style="font-size:17.5px;margin:0 0 4px;line-height:1.15;">{c.title}</h3>
+						<p style="margin:0;color:var(--td-muted);font-size:13px;line-height:1.45;">{c.blurb}</p>
+					</div>
+				</div>
 
-	{@render list(
-		'Loved, barely played',
-		'You went out of your way to love these, then didn’t come back.',
-		data.loved_but_unplayed
-	)}
+				<div style="display:flex;align-items:center;gap:9px;flex-wrap:wrap;margin-bottom:12px;">
+					<span class="pill" style="background:{c.accent};">
+						{c.count} {c.key === 'dusty' ? (c.count === 1 ? 'record' : 'records') : (c.count === 1 ? 'track' : 'tracks')}
+					</span>
+					<span style="font-size:12px;color:var(--td-muted-2);">{c.stat}</span>
+				</div>
 
-	{@render list(
-		'Heard once',
-		'One listen, long enough ago that you’d have forgotten whether it landed.',
-		data.heard_once
-	)}
+				{#if c.count}
+					<!-- Two samples, as chips. Enough to tell you whether the
+					     collection is worth opening, which is all a card owes you. -->
+					<div style="display:flex;flex-direction:column;gap:6px;margin-bottom:16px;">
+						{#each c.rows.slice(0, 2) as t}
+							<span class="tchip">{t.name} · {t.artist}</span>
+						{/each}
+					</div>
+					<div style="display:flex;gap:8px;margin-top:auto;">
+						<button class="btn btn-secondary" style="font-size:13px;padding:8px 15px;"
+							on:click={() => (openKey = openKey === c.key ? null : c.key)}>
+							{openKey === c.key ? 'Hide' : `See all ${c.count}`}
+						</button>
+					</div>
+				{:else}
+					<p style="margin:0;font-size:12.5px;color:var(--td-muted-3);">
+						Nothing here yet — which is its own kind of answer.
+					</p>
+				{/if}
+			</div>
+		{/each}
+	</div>
 
-	{@render list(
-		'This time of year',
-		'What you were playing around now, in years gone by.',
-		data.seasonal
-	)}
+	{#each data.collections.filter((c) => c.key === openKey) as c (c.key)}
+		<div class="panel expanded" style="border-color:{c.accent};">
+			<div style="display:flex;justify-content:space-between;align-items:baseline;gap:12px;padding:16px 18px 10px;">
+				<h3 class="h-display" style="font-size:19px;margin:0;">{c.title}</h3>
+				<button class="linkish" on:click={() => (openKey = null)}>Close</button>
+			</div>
+			{#each c.rows as r, i}
+				<button class="row" on:click={() => openRow(r)}>
+					<CoverArt url={r.artwork_url} caaId={r.caa_id} releaseMbid={r.caa_release_mbid}
+						seed={`${r.artist} ${r.name}`} size={38} radius={8} />
+					<span style="flex:1;min-width:0;text-align:left;">
+						<span class="nm">{r.name}</span>
+						<span class="sb">{r.artist}{r.album && r.album !== r.name ? ` — ${r.album}` : ''}</span>
+					</span>
+					<span class="meta">{r.plays} play{r.plays === 1 ? '' : 's'}</span>
+				</button>
+				{#if i < c.rows.length - 1}<div class="sep"></div>{/if}
+			{/each}
+		</div>
+	{/each}
 
-	<section style="margin-bottom:28px;">
+	<!-- Gear needs a choice made, so it can't be a card like the rest. -->
+	<div style="margin-top:30px;">
 		<h3 class="h-display" style="font-size:20px;margin:0 0 2px;">Never heard on…</h3>
 		<p style="margin:0 0 12px;font-size:13px;color:var(--td-muted);">
-			Favourites that have never been through a particular piece of gear. Needs
-			listens with a signal chain attached — that's where the connection comes
-			from.
+			Favourites that have never been through a particular piece of gear. Comes
+			from the signal chain on each listen — a chain names its components.
 		</p>
 
 		{#if data.gear.length}
 			<div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px;">
 				{#each data.gear as g}
-					<button class="chip" class:on={gearId === g.id} on:click={() => loadGear(g.id)}>
-						{g.name}
-					</button>
+					<button class="chip" class:on={gearId === g.id} on:click={() => loadGear(g.id)}>{g.name}</button>
 				{/each}
 			</div>
-
 			{#if gearLoading}
 				<p style="font-size:13.5px;color:var(--td-muted);">Checking…</p>
 			{:else if gearId && gearRows.length}
@@ -194,41 +237,81 @@
 				No gear catalogued yet — add some under <a href="/chains">Signal Chains</a>.
 			</p>
 		{/if}
-	</section>
+	</div>
 {/if}
 
 <style>
+	.hero {
+		background: var(--td-panel);
+		color: #f4e7cf;
+		border-radius: 28px;
+		padding: 26px;
+		margin-bottom: 26px;
+		display: flex;
+		gap: 26px;
+		flex-wrap: wrap;
+		align-items: center;
+		box-shadow: 0 10px 30px rgba(46, 43, 37, 0.14);
+	}
+	/* 33⅓ — the same real speed the vinyl deck turns at. */
+	.platter { animation: td-spin 1.8s linear infinite; }
+	@media (prefers-reduced-motion: reduce) { .platter { animation: none; } }
+	.eyebrow {
+		font-size: 11px; letter-spacing: 0.16em; text-transform: uppercase;
+		color: #c9a678; margin-bottom: 8px; font-weight: 600;
+	}
+	.pill {
+		display: inline-flex; align-items: center; gap: 6px;
+		font-size: 11.5px; font-weight: 600; color: #fff;
+		border-radius: 999px; padding: 4px 11px; white-space: nowrap;
+	}
+	.cards {
+		display: grid;
+		grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+		gap: 18px;
+	}
+	.card {
+		background: var(--td-surface, var(--td-panel));
+		border: 1px solid var(--td-border, var(--td-line));
+		border-radius: 22px;
+		padding: 20px;
+		display: flex;
+		flex-direction: column;
+	}
+	/* An empty collection stays on the page rather than vanishing — that it is
+	   empty is information, and a grid that reflows as data arrives is worse. */
+	.card.empty { opacity: 0.62; }
+	.badge {
+		display: inline-flex; align-items: center; justify-content: center;
+		width: 44px; height: 44px; flex: none; border-radius: 13px;
+	}
+	.tchip {
+		display: inline-flex; align-items: center; max-width: 100%;
+		background: var(--td-surface2, var(--td-panel2));
+		border: 1px solid var(--td-border, var(--td-line));
+		border-radius: 999px; padding: 5px 11px; font-size: 12px;
+		color: var(--td-nav-fg, inherit);
+		white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+	}
+	.expanded { border-radius: 20px; overflow: hidden; margin-top: 18px; border-width: 1px; border-style: solid; }
 	.chip {
-		border: 1px solid var(--td-line);
-		background: transparent;
-		color: var(--td-muted);
-		border-radius: 999px;
-		padding: 6px 14px;
-		font-size: 12.5px;
-		font-weight: 600;
-		cursor: pointer;
+		border: 1px solid var(--td-line); background: transparent; color: var(--td-muted);
+		border-radius: 999px; padding: 6px 14px; font-size: 12.5px; font-weight: 600; cursor: pointer;
 	}
 	.chip.on { background: var(--td-accent); border-color: var(--td-accent); color: #fff; }
+	.linkish {
+		border: none; background: none; padding: 0; font: inherit; font-size: 13px;
+		color: var(--td-muted-2); cursor: pointer; text-decoration: underline; text-underline-offset: 3px;
+	}
 	.row {
-		display: flex;
-		align-items: center;
-		gap: 12px;
-		width: 100%;
-		padding: 11px 16px;
-		background: none;
-		border: none;
-		color: inherit;
-		cursor: pointer;
-		text-align: left;
+		display: flex; align-items: center; gap: 12px; width: 100%;
+		padding: 11px 16px; background: none; border: none; color: inherit;
+		cursor: pointer; text-align: left;
 	}
 	.row:hover { background: var(--td-panel2); }
 	.nm { display: block; font-size: 14px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 	.sb { display: block; font-size: 12.5px; color: var(--td-muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 	.meta { font-size: 12.5px; color: var(--td-muted-2); flex: none; font-variant-numeric: tabular-nums; }
 	.sep { height: 1px; background: var(--td-line); margin: 0 16px; }
-	/* The lists stack on a phone rather than squeezing the metadata off the
-	   right-hand edge, which is what killed the track name on the history row. */
-	@media (max-width: 520px) {
-		.meta { display: none; }
-	}
+	@media (max-width: 520px) { .meta { display: none; } }
 </style>

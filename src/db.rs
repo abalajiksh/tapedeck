@@ -3626,6 +3626,107 @@ impl Database {
         .await
     }
 
+    /// Records and tapes that haven't left the shelf.
+    ///
+    /// The one list here that isn't about listens at all — it reads
+    /// `physical_plays`, so it only says something once the shelf is in use.
+    /// A record never played is included: never is longer than 18 months.
+    pub async fn dusty_shelf(
+        &self,
+        user_id: i64,
+        quiet_since: i64,
+        limit: i64,
+    ) -> Result<Vec<RediscoveryRow>, sqlx::Error> {
+        sqlx::query_as(
+            "SELECT r.title AS name, r.artist AS artist, r.title AS album,
+                    (SELECT COUNT(*) FROM physical_plays p WHERE p.release_id = r.id) AS plays,
+                    (SELECT MAX(p.played_at) FROM physical_plays p WHERE p.release_id = r.id)
+                      AS last_played,
+                    r.artwork_url AS artwork_url, NULL AS caa_id,
+                    r.mbid_release AS caa_release_mbid
+               FROM physical_releases r
+              WHERE r.user_id = ?
+                AND COALESCE(
+                      (SELECT MAX(p.played_at) FROM physical_plays p WHERE p.release_id = r.id), 0
+                    ) < ?
+              ORDER BY last_played ASC NULLS FIRST, r.added_at ASC
+              LIMIT ?",
+        )
+        .bind(user_id)
+        .bind(quiet_since)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+    }
+
+    /// Tracks you only ever reach for after midnight.
+    ///
+    /// Hour-of-day in the user's timezone, because "after midnight" in UTC is
+    /// the evening in one place and the afternoon in another — the same bug
+    /// that made the dashboard's day start at 01:00. The offset is applied to
+    /// the timestamp before the hour is taken.
+    pub async fn late_night(
+        &self,
+        user_id: i64,
+        tz_offset_secs: i64,
+        limit: i64,
+    ) -> Result<Vec<RediscoveryRow>, sqlx::Error> {
+        sqlx::query_as(
+            "SELECT title AS name, artist, MAX(album) AS album, COUNT(*) AS plays,
+                    MAX(timestamp) AS last_played,
+                    MAX(artwork_url) AS artwork_url, MAX(caa_id) AS caa_id,
+                    MAX(caa_release_mbid) AS caa_release_mbid
+               FROM scrobbles
+              WHERE user_id = ? AND skipped = FALSE
+              GROUP BY LOWER(TRIM(title)), LOWER(TRIM(artist))
+             HAVING COUNT(*) >= 3
+                AND SUM(
+                      CASE WHEN CAST(STRFTIME('%H', timestamp + ?, 'unixepoch') AS INTEGER)
+                                 >= 0
+                            AND CAST(STRFTIME('%H', timestamp + ?, 'unixepoch') AS INTEGER) < 5
+                           THEN 1 ELSE 0 END
+                    ) * 1.0 / COUNT(*) >= 0.7
+              ORDER BY COUNT(*) DESC
+              LIMIT ?",
+        )
+        .bind(user_id)
+        .bind(tz_offset_secs)
+        .bind(tz_offset_secs)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+    }
+
+    /// Album tracks you play that are never the single.
+    ///
+    /// "Buried on side B" in the design. Approximated by track number, which is
+    /// the only positional information a listen carries: a track from the back
+    /// half of a record that you nonetheless keep returning to.
+    pub async fn deep_cuts(
+        &self,
+        user_id: i64,
+        limit: i64,
+    ) -> Result<Vec<RediscoveryRow>, sqlx::Error> {
+        sqlx::query_as(
+            "SELECT title AS name, artist, MAX(album) AS album, COUNT(*) AS plays,
+                    MAX(timestamp) AS last_played,
+                    MAX(artwork_url) AS artwork_url, MAX(caa_id) AS caa_id,
+                    MAX(caa_release_mbid) AS caa_release_mbid
+               FROM scrobbles
+              WHERE user_id = ? AND skipped = FALSE
+                AND track_number IS NOT NULL AND track_number >= 6
+                AND album IS NOT NULL AND TRIM(album) != ''
+              GROUP BY LOWER(TRIM(title)), LOWER(TRIM(artist))
+             HAVING COUNT(*) >= 3
+              ORDER BY COUNT(*) DESC
+              LIMIT ?",
+        )
+        .bind(user_id)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+    }
+
     /// Things you like that have never been through a given piece of gear.
     ///
     /// The join is the reason `chain_id` on a listen matters: a chain names its

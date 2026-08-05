@@ -554,12 +554,28 @@ export interface RediscoveryRow {
 	caa_release_mbid: string | null;
 }
 
+/** A card, not a bare list: the accent, blurb and stat are what make a
+ *  collection legible at a glance. No play/queue action — Tapedeck has no
+ *  playback, and a dead button is worse than an absent one. */
+export interface RediscoveryCollection {
+	key: string;
+	title: string;
+	blurb: string;
+	/** Per-collection accent, straight from the design. */
+	accent: string;
+	/** Names the evidence ("Last played 14 months ago"), not the blurb again. */
+	stat: string;
+	count: number;
+	rows: RediscoveryRow[];
+}
+
 export interface Rediscovery {
 	quiet_days: number;
-	forgotten_favourites: RediscoveryRow[];
-	loved_but_unplayed: RediscoveryRow[];
-	heard_once: RediscoveryRow[];
-	seasonal: RediscoveryRow[];
+	window: string;
+	/** Whichever collection has the most to say — a fixed one would leave a new
+	 *  instance with an empty hero. */
+	featured: RediscoveryCollection | null;
+	collections: RediscoveryCollection[];
 	gear: { id: number; name: string; type: string }[];
 }
 

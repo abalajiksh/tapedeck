@@ -533,6 +533,12 @@ pub fn range_after(range: Option<&str>) -> Option<i64> {
 }
 
 /// The user's IANA timezone from their preferences (defaults to UTC).
+/// The caller's timezone. Shared with Rediscovery, which needs it for the
+/// after-midnight collection — "after midnight" in UTC means nothing.
+pub async fn user_tz_for(state: &AppState, user_id: i64) -> chrono_tz::Tz {
+    user_tz(state, user_id).await
+}
+
 async fn user_tz(state: &AppState, user_id: i64) -> chrono_tz::Tz {
     let name = state
         .db
