@@ -465,14 +465,53 @@ impl ScrobbleEngine {
                 let album = play.album.clone();
                 enrich_play(mb_client, &mut play, album.as_deref()).await;
             }
+
+            // Register the client and let it carry the chain — the same fix
+            // Plex got in v0.22.0, and it was missing here for the same reason.
+            // A Jellyfin listen has no token, so the ladder's first three rungs
+            // can never match; with no device it fell through all four and
+            // every Jellyfin listen was stored with no signal chain at all.
+            let (device_id, chain_id) = match &track.player {
+                Some(p) => match db
+                    .upsert_device(
+                        user_id,
+                        &p.machine_id,
+                        p.name.as_deref(),
+                        p.platform.as_deref(),
+                        p.product.as_deref(),
+                    )
+                    .await
+                {
+                    Ok(dev) => {
+                        let chain = db.get_device_default_chain(user_id, dev).await.ok().flatten();
+                        (Some(dev), chain)
+                    }
+                    Err(e) => {
+                        warn!("Could not record Jellyfin client as a device: {}", e);
+                        (None, None)
+                    }
+                },
+                None => (None, None),
+            };
+
+            let listening_context = match chain_id {
+                Some(cid) => db
+                    .get_chain(user_id, cid)
+                    .await
+                    .ok()
+                    .flatten()
+                    .map(|c| c.listening_context.as_str().to_string()),
+                None => None,
+            };
+
             match db
                 .save_scrobble(
                     user_id,
                     &play,
                     track.quality.as_ref(),
-                    None,
-                    None,
-                    None,
+                    device_id,
+                    chain_id,
+                    listening_context.as_deref(),
                     Some("Jellyfin"),
                     Some(row_id),
                     ListenDisposition::LIVE,

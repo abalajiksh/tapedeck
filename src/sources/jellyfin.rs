@@ -69,6 +69,73 @@ struct JellyfinSession {
     play_state: Option<PlayState>,
     #[serde(default)]
     device_name: Option<String>,
+    /// Stable per installed client — Jellyfin keeps it across restarts, which is
+    /// what makes it usable as a `devices.machine_id`.
+    #[serde(default)]
+    device_id: Option<String>,
+    #[serde(default)]
+    device_type: Option<String>,
+    /// The app: "Jellyfin Media Player", "Finamp", "Jellyfin Web".
+    #[serde(default)]
+    client: Option<String>,
+    /// Present **only while actually transcoding** — Jellyfin leaves it null for
+    /// a direct play, so its absence is itself the answer.
+    #[serde(default)]
+    transcoding_info: Option<TranscodingInfo>,
+}
+
+/// The delivery half: what the server actually sent, as opposed to what is on
+/// disk. Null unless a transcode is running.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+/// Only the fields Tapedeck has somewhere to put are parsed. `Container`,
+/// `AudioChannels`, `Framerate` and the video ones are deliberately left out:
+/// storing the delivery container or a downmix would need columns that don't
+/// exist, and parsing a field with nowhere to put it is how the five dropped
+/// quality fields happened in the first place. Add the column first.
+struct TranscodingInfo {
+    #[serde(default)]
+    audio_codec: Option<String>,
+    #[serde(default)]
+    bitrate: Option<i32>,
+    /// True when the audio is passed through untouched even though a transcode
+    /// is running for some other reason.
+    #[serde(default)]
+    is_audio_direct: Option<bool>,
+    /// An array of enum names in the 12.x schema, a comma-joined string in
+    /// 10.8. Accepting one shape would be silently wrong on the other, and the
+    /// symptom — an empty `transcode_reason` — looks exactly like a direct
+    /// play.
+    #[serde(default, deserialize_with = "string_or_seq")]
+    transcode_reasons: Option<Vec<String>>,
+}
+
+/// Deserialise `"A, B"` or `["A", "B"]` into the same `Vec<String>`.
+fn string_or_seq<'de, D>(d: D) -> Result<Option<Vec<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum OneOrMany {
+        One(String),
+        Many(Vec<String>),
+    }
+    Ok(Option::<OneOrMany>::deserialize(d)?.map(|v| match v {
+        OneOrMany::One(s) => {
+            s.split(',').map(|p| p.trim().to_string()).filter(|p| !p.is_empty()).collect()
+        }
+        OneOrMany::Many(v) => v,
+    }))
+}
+
+/// The client an item is playing on, in the shape `devices` wants.
+#[derive(Debug, Clone)]
+pub struct JellyfinPlayer {
+    pub machine_id: String,
+    pub name: Option<String>,
+    pub platform: Option<String>,
+    pub product: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -94,6 +161,9 @@ struct NowPlayingItem {
     provider_ids: Option<ProviderIds>,
     #[serde(default)]
     media_streams: Option<Vec<MediaStream>>,
+    /// The source container as it sits on disk — `flac`, `dsf`, `m4a`.
+    #[serde(default)]
+    container: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -103,6 +173,15 @@ struct ProviderIds {
     musicbrainz_track: Option<String>,
     #[serde(rename = "MusicBrainzAlbum", default)]
     musicbrainz_album: Option<String>,
+    /// The performer. Jellyfin writes `MusicBrainzArtist` for the track artist
+    /// and `MusicBrainzAlbumArtist` for the record's — prefer the former and
+    /// fall back, since that is the order `Play.mbid_artist` means.
+    #[serde(rename = "MusicBrainzArtist", default)]
+    musicbrainz_artist: Option<String>,
+    #[serde(rename = "MusicBrainzAlbumArtist", default)]
+    musicbrainz_album_artist: Option<String>,
+    #[serde(rename = "MusicBrainzReleaseGroup", default)]
+    musicbrainz_release_group: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -131,6 +210,11 @@ struct PlayState {
     position_ticks: Option<u64>,
     #[serde(default)]
     is_paused: Option<bool>,
+    /// `DirectPlay` | `DirectStream` | `Transcode`. The authoritative answer to
+    /// "did this file reach the listener intact?" — `TranscodingInfo` describes
+    /// *how* a transcode is happening, but this says *whether* one is.
+    #[serde(default)]
+    play_method: Option<String>,
 }
 
 /// A track Jellyfin says is playing, already attributed and converted.
@@ -142,6 +226,10 @@ pub struct JellyfinTrack {
     /// gets a true position rather than one counted up from first sight.
     pub position: u64,
     pub session_id: String,
+    /// The client this is playing on, so the listen can carry a device and
+    /// therefore a signal chain. `None` only when Jellyfin reported no
+    /// `DeviceId` at all.
+    pub player: Option<JellyfinPlayer>,
 }
 
 #[derive(Debug, Default)]
@@ -317,7 +405,9 @@ impl JellyfinSource {
             {
                 continue;
             }
-            let Some(item) = session.now_playing_item else {
+            // Borrowed rather than moved out: the session is still needed for
+            // the client identity that becomes the listen's device.
+            let Some(item) = session.now_playing_item.as_ref() else {
                 continue;
             };
             // Jellyfin sessions cover video too.
@@ -334,10 +424,15 @@ impl JellyfinSource {
             let duration = item.run_time_ticks.map(|t| t / TICKS_PER_SECOND);
 
             let track = JellyfinTrack {
-                quality: Self::extract_quality(&item),
-                play: Self::to_play(&item, &session.device_name),
+                quality: Self::extract_quality(
+                    item,
+                    session.transcoding_info.as_ref(),
+                    session.play_state.as_ref().and_then(|p| p.play_method.as_deref()),
+                ),
+                play: Self::to_play(item, &session.device_name),
                 position,
                 session_id: session.id.clone(),
+                player: Self::to_player(&session),
             };
             live_sessions.push(session.id.clone());
 
@@ -403,15 +498,53 @@ impl JellyfinSource {
             // another listen that never needs a MusicBrainz lookup.
             mbid_recording: item.provider_ids.as_ref().and_then(|p| p.musicbrainz_track.clone()),
             mbid_release: item.provider_ids.as_ref().and_then(|p| p.musicbrainz_album.clone()),
-            mbid_artist: None,
+            mbid_artist: item
+                .provider_ids
+                .as_ref()
+                .and_then(|p| {
+                    p.musicbrainz_artist.clone().or_else(|| p.musicbrainz_album_artist.clone())
+                })
+                .map(|id| vec![id]),
             artists: item.artists.clone(),
-            mbid_release_group: None,
+            mbid_release_group: item
+                .provider_ids
+                .as_ref()
+                .and_then(|p| p.musicbrainz_release_group.clone()),
             caa_id: None,
             caa_release_mbid: None,
         }
     }
 
-    fn extract_quality(item: &NowPlayingItem) -> Option<AudioQuality> {
+    /// The client this session is running on, in `devices` terms.
+    ///
+    /// `DeviceId` is the key: it is stable per installed client across
+    /// restarts, where `DeviceName` is a label the user can change. A session
+    /// without one can't be a device, so it stays `None` rather than being
+    /// keyed on something that will drift.
+    fn to_player(session: &JellyfinSession) -> Option<JellyfinPlayer> {
+        let machine_id = session.device_id.clone()?;
+        Some(JellyfinPlayer {
+            machine_id,
+            // "Living Room" if the user named it, else the app name.
+            name: session.device_name.clone().or_else(|| session.client.clone()),
+            platform: session.device_type.clone(),
+            // The app, which is what a chain is usually bound to — "Finamp on
+            // the phone" is a different signal path from the web player.
+            product: session.client.clone(),
+        })
+    }
+
+    /// Quality, both halves: the file on disk from `MediaStreams`, and what was
+    /// actually delivered from `TranscodingInfo` / `PlayMethod`.
+    ///
+    /// Keeping them apart is the whole point — a FLAC transcoded to 128k Opus
+    /// for a phone is a lossless *source* and a lossy *listen*, and collapsing
+    /// them loses the fact that the transcode happened at all.
+    fn extract_quality(
+        item: &NowPlayingItem,
+        transcoding: Option<&TranscodingInfo>,
+        play_method: Option<&str>,
+    ) -> Option<AudioQuality> {
         let streams = item.media_streams.as_ref()?;
         let audio = streams.iter().find(|s| {
             let t = s.stream_type.as_deref().or(s.type_.as_deref()).unwrap_or("");
@@ -424,6 +557,25 @@ impl JellyfinSource {
             "flac" | "alac" | "wav" | "aiff" | "ape" | "wavpack" | "pcm" | "dsd"
         );
 
+        // `PlayMethod` is the authority; `TranscodingInfo` merely describes a
+        // transcode that is running. Note `IsAudioDirect` — a video transcode
+        // can leave the audio untouched, and calling that a transcoded listen
+        // would be wrong.
+        let audio_direct = transcoding.and_then(|t| t.is_audio_direct).unwrap_or(false);
+        let is_transcoded = match play_method {
+            Some(m) if m.eq_ignore_ascii_case("Transcode") => !audio_direct,
+            // DirectStream remuxes the container without touching the audio;
+            // DirectPlay touches nothing. Neither alters what was heard.
+            Some(_) => false,
+            // No PlayMethod at all: fall back to whether a transcode is running.
+            None => transcoding.is_some() && !audio_direct,
+        };
+
+        let transcode_reason = transcoding
+            .and_then(|t| t.transcode_reasons.as_ref())
+            .filter(|r| !r.is_empty())
+            .map(|r| r.join(", "));
+
         let mut q = AudioQuality {
             format_type: Some(if codec_lower == "dsd" { "dsd" } else { "pcm" }.to_string()),
             codec: audio.codec.clone(),
@@ -431,9 +583,26 @@ impl JellyfinSource {
             sample_rate: audio.sample_rate,
             bit_depth: audio.bit_depth.map(|b| b as i16),
             channels: audio.channels.map(|c| c as i16),
+            container: item.container.clone(),
             is_lossless: Some(is_lossless),
+            is_transcoded: Some(is_transcoded),
+            transcode_reason,
             ..Default::default()
         };
+
+        // Only describe the delivery side when it really is a different thing
+        // from the source, or `delivery_codec` would claim a Bluetooth-style
+        // downgrade on every direct play — and `compute_score` docks points for
+        // one.
+        if is_transcoded {
+            if let Some(t) = transcoding {
+                q.delivery_codec = t.audio_codec.clone().map(|c| c.to_lowercase());
+                // Jellyfin reports this in bits per second; Tapedeck's other
+                // sources and the score thresholds are in kbps.
+                q.delivery_bitrate = t.bitrate.map(|b| if b > 10_000 { b / 1000 } else { b });
+            }
+        }
+
         q.compute_score();
         Some(q)
     }
@@ -603,9 +772,13 @@ mod tests {
             artists: Some(vec!["Aphex Twin".into()]),
             run_time_ticks: Some(secs * TICKS_PER_SECOND),
             index_number: Some(1),
+            container: Some("flac".into()),
             provider_ids: Some(ProviderIds {
                 musicbrainz_track: Some("mb-track".into()),
                 musicbrainz_album: Some("mb-album".into()),
+                musicbrainz_artist: Some("mb-artist".into()),
+                musicbrainz_album_artist: Some("mb-album-artist".into()),
+                musicbrainz_release_group: Some("mb-rg".into()),
             }),
             media_streams: Some(vec![MediaStream {
                 type_: None,
@@ -617,6 +790,150 @@ mod tests {
                 channels: Some(2),
             }]),
         }
+    }
+
+    /// A `/Sessions` element carrying the transcode and client fields.
+    ///
+    /// **Built from the 12.0.0 OpenAPI schema, not captured from a live
+    /// server** — unlike `the_users_list_parses_a_real_response` above, which
+    /// is a real 10.11.11 body. It pins the PascalCase spellings and the shapes
+    /// the schema declares, which is the half that fails silently; it cannot
+    /// prove Jellyfin actually populates these on a session, and that is worth
+    /// confirming against a real server before relying on the transcode data.
+    const SESSION_TRANSCODING: &str = r#"{
+        "Id": "sess-1",
+        "UserName": "abalaji",
+        "Client": "Finamp",
+        "DeviceName": "Pixel 8",
+        "DeviceId": "0f1e2d3c4b5a",
+        "DeviceType": "Android",
+        "ApplicationVersion": "0.9.2",
+        "PlayState": {
+            "PositionTicks": 1230000000,
+            "IsPaused": false,
+            "PlayMethod": "Transcode"
+        },
+        "TranscodingInfo": {
+            "AudioCodec": "opus",
+            "Container": "ogg",
+            "Bitrate": 128000,
+            "AudioChannels": 2,
+            "IsAudioDirect": false,
+            "TranscodeReasons": ["ContainerNotSupported", "AudioCodecNotSupported"]
+        },
+        "NowPlayingItem": {
+            "Id": "item-1",
+            "Name": "Xtal",
+            "Type": "Audio",
+            "Album": "SAW 85-92",
+            "Artists": ["Aphex Twin"],
+            "Container": "flac",
+            "RunTimeTicks": 2930000000,
+            "IndexNumber": 1,
+            "ProviderIds": { "MusicBrainzTrack": "mb-track" },
+            "MediaStreams": [
+                { "Type": "Audio", "Codec": "flac", "BitRate": 900000,
+                  "SampleRate": 44100, "BitDepth": 16, "Channels": 2 }
+            ]
+        }
+    }"#;
+
+    #[test]
+    fn a_session_parses_its_client_and_transcode_fields() {
+        let s: JellyfinSession = serde_json::from_str(SESSION_TRANSCODING).expect("parses");
+        let player = JellyfinSource::to_player(&s).expect("has a device id");
+        // DeviceId is the key, not DeviceName — the name is user-editable and
+        // would re-register the client as a new device when changed.
+        assert_eq!(player.machine_id, "0f1e2d3c4b5a");
+        assert_eq!(player.name.as_deref(), Some("Pixel 8"));
+        assert_eq!(player.product.as_deref(), Some("Finamp"));
+        assert_eq!(player.platform.as_deref(), Some("Android"));
+
+        let item = s.now_playing_item.as_ref().unwrap();
+        let q = JellyfinSource::extract_quality(
+            item,
+            s.transcoding_info.as_ref(),
+            s.play_state.as_ref().and_then(|p| p.play_method.as_deref()),
+        )
+        .expect("has streams");
+
+        // The source half is the file on disk and must not be overwritten by
+        // what was delivered.
+        assert_eq!(q.codec.as_deref(), Some("flac"));
+        assert_eq!(q.container.as_deref(), Some("flac"));
+        assert_eq!(q.is_lossless, Some(true));
+        assert_eq!(q.sample_rate, Some(44100));
+
+        // The delivery half.
+        assert_eq!(q.is_transcoded, Some(true));
+        assert_eq!(q.delivery_codec.as_deref(), Some("opus"));
+        assert_eq!(q.delivery_bitrate, Some(128), "bits per second → kbps");
+        assert_eq!(
+            q.transcode_reason.as_deref(),
+            Some("ContainerNotSupported, AudioCodecNotSupported")
+        );
+    }
+
+    /// Jellyfin 10.8 sent `TranscodeReasons` as a comma-joined string; 12.x
+    /// sends an array. Reading only one shape leaves `transcode_reason` empty
+    /// on the other — which looks exactly like a direct play, so nothing
+    /// errors and the data is quietly wrong.
+    #[test]
+    fn transcode_reasons_parse_as_a_string_or_an_array() {
+        let as_array: JellyfinSession = serde_json::from_str(SESSION_TRANSCODING).unwrap();
+        let as_string: JellyfinSession = serde_json::from_str(&SESSION_TRANSCODING.replace(
+            r#"["ContainerNotSupported", "AudioCodecNotSupported"]"#,
+            r#""ContainerNotSupported, AudioCodecNotSupported""#,
+        ))
+        .expect("the 10.8 spelling parses too");
+
+        let reasons = |s: &JellyfinSession| {
+            s.transcoding_info.as_ref().unwrap().transcode_reasons.clone().unwrap()
+        };
+        assert_eq!(reasons(&as_array), reasons(&as_string));
+        assert_eq!(reasons(&as_array).len(), 2);
+    }
+
+    /// A direct play must not claim a delivery codec. `compute_score` docks
+    /// points whenever `delivery_codec` is set, so reporting one for an
+    /// untouched file would quietly penalise the best listens on the system.
+    #[test]
+    fn a_direct_play_reports_no_delivery_downgrade() {
+        let body = SESSION_TRANSCODING
+            .replace(r#""PlayMethod": "Transcode""#, r#""PlayMethod": "DirectPlay""#);
+        let body = body[..body.find(r#""TranscodingInfo""#).unwrap()].to_string()
+            + &body[body.find(r#""NowPlayingItem""#).unwrap()..];
+        let s: JellyfinSession =
+            serde_json::from_str(&body).expect("parses without TranscodingInfo");
+
+        let q = JellyfinSource::extract_quality(
+            s.now_playing_item.as_ref().unwrap(),
+            s.transcoding_info.as_ref(),
+            s.play_state.as_ref().and_then(|p| p.play_method.as_deref()),
+        )
+        .unwrap();
+        assert_eq!(q.is_transcoded, Some(false));
+        assert_eq!(q.delivery_codec, None);
+        assert_eq!(q.transcode_reason, None);
+    }
+
+    /// A video transcode can leave the audio untouched. Calling that a
+    /// transcoded listen would be wrong, and `IsAudioDirect` is the only field
+    /// that says so.
+    #[test]
+    fn a_passthrough_audio_stream_is_not_a_transcoded_listen() {
+        let s: JellyfinSession = serde_json::from_str(
+            &SESSION_TRANSCODING.replace(r#""IsAudioDirect": false"#, r#""IsAudioDirect": true"#),
+        )
+        .unwrap();
+        let q = JellyfinSource::extract_quality(
+            s.now_playing_item.as_ref().unwrap(),
+            s.transcoding_info.as_ref(),
+            s.play_state.as_ref().and_then(|p| p.play_method.as_deref()),
+        )
+        .unwrap();
+        assert_eq!(q.is_transcoded, Some(false));
+        assert_eq!(q.delivery_codec, None);
     }
 
     #[test]
@@ -639,7 +956,8 @@ mod tests {
 
     #[test]
     fn reads_quality_from_the_audio_stream() {
-        let q = JellyfinSource::extract_quality(&item("i1", 293)).expect("has streams");
+        let q = JellyfinSource::extract_quality(&item("i1", 293), None, Some("DirectPlay"))
+            .expect("has streams");
         assert_eq!(q.codec.as_deref(), Some("flac"));
         assert_eq!(q.sample_rate, Some(44100));
         assert_eq!(q.bit_depth, Some(16));
