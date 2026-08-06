@@ -719,6 +719,34 @@ impl Database {
         sqlx::query("CREATE INDEX IF NOT EXISTS idx_entity_aliases_lookup ON entity_aliases(alias_kind, value)")
             .execute(&self.pool).await?;
 
+        // `scrobbles` carried no index at all beyond the UNIQUE it needs for
+        // dedup, so every ranged query — history, stats, all seven rediscovery
+        // collections — was a full scan of the user's rows plus a temp B-tree.
+        // Fine at 21k rows on a laptop, and the reason Rediscovery could take
+        // long enough on a small host to be killed by a gateway timeout.
+        //
+        // `CREATE INDEX IF NOT EXISTS` is idempotent, so this needs no
+        // `migrate()` block — an existing database gains the index on next
+        // open. That is the one schema change that does not need the
+        // add-to-init-*and*-migrate dance.
+        //
+        // `(user_id, timestamp)` is the shape nearly every query wants: scoped
+        // to the caller, then bounded or ordered by time. `skipped` is left out
+        // deliberately — it is a low-cardinality flag, and putting it in front
+        // of `timestamp` would help no range scan while making the index wider.
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_scrobbles_user_time ON scrobbles(user_id, timestamp)",
+        )
+        .execute(&self.pool)
+        .await?;
+        // Grouping queries (top artists/albums/tracks, the variant pass) sort
+        // by artist within a user before they aggregate.
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_scrobbles_user_artist ON scrobbles(user_id, artist)",
+        )
+        .execute(&self.pool)
+        .await?;
+
         // A note is a living document: one per user per target, edited in place.
         // Exactly one of entity_id / scrobble_id is set — a note about a record
         // and a note about one particular playing of it are different things.
@@ -3179,7 +3207,17 @@ impl Database {
         &self,
         user_id: i64,
         after: Option<i64>,
+        by_hours: bool,
     ) -> Result<serde_json::Value, sqlx::Error> {
+        // The top lists are cut to 50 rows, so the sort has to happen in SQL:
+        // re-sorting the returned 50 by hours in the browser would rank within
+        // the top 50 *by plays*, and silently miss a long record played a few
+        // times — exactly the row switching to Hours exists to surface.
+        //
+        // `SUM(duration)` is NULL for listens whose source reported no length,
+        // so it is coalesced to 0; those sort last under Hours, which is right
+        // — an unknown running time is not a large one.
+        let order = if by_hours { "COALESCE(secs, 0) DESC, plays DESC" } else { "plays DESC" };
         let plays: (i64,) = sqlx::query_as(
             "SELECT COUNT(*) FROM scrobbles WHERE user_id = ? AND skipped = FALSE AND (? IS NULL OR timestamp >= ?)"
         ).bind(user_id).bind(after).bind(after).fetch_one(&self.pool).await?;
@@ -3216,11 +3254,12 @@ impl Database {
             }
         };
 
-        let top_rows: Vec<(String, i64, Option<i64>)> = sqlx::query_as(
+        let top_rows: Vec<(String, i64, Option<i64>)> = sqlx::query_as(&format!(
             "SELECT artist, COUNT(*) as plays, SUM(duration) as secs
              FROM scrobbles WHERE user_id = ? AND skipped = FALSE AND (? IS NULL OR timestamp >= ?)
-             GROUP BY artist ORDER BY plays DESC LIMIT 50",
-        )
+             GROUP BY artist ORDER BY {} LIMIT 50",
+            order
+        ))
         .bind(user_id)
         .bind(after)
         .bind(after)
@@ -3240,12 +3279,13 @@ impl Database {
             })
             .collect();
 
-        let album_rows: Vec<(String, String, i64, Option<i64>)> = sqlx::query_as(
+        let album_rows: Vec<(String, String, i64, Option<i64>)> = sqlx::query_as(&format!(
             "SELECT album, artist, COUNT(*) as plays, SUM(duration) as secs
              FROM scrobbles WHERE user_id = ? AND skipped = FALSE AND (? IS NULL OR timestamp >= ?)
                AND album IS NOT NULL AND album != ''
-             GROUP BY album, artist ORDER BY plays DESC LIMIT 50",
-        )
+             GROUP BY album, artist ORDER BY {} LIMIT 50",
+            order
+        ))
         .bind(user_id)
         .bind(after)
         .bind(after)
@@ -3263,9 +3303,11 @@ impl Database {
         // query — the same song submitted as "Xtal" and "XTAL" by two clients is
         // one track, not two entries competing for the same slot.
         let track_rows: Vec<(String, String, Option<String>, i64, Option<i64>)> = sqlx::query_as(
-            "SELECT title, artist, MAX(album) AS album, COUNT(*) as plays, SUM(duration) as secs
+            &format!(            "SELECT title, artist, MAX(album) AS album, COUNT(*) as plays, SUM(duration) as secs
              FROM scrobbles WHERE user_id = ? AND skipped = FALSE AND (? IS NULL OR timestamp >= ?)
-             GROUP BY LOWER(TRIM(title)), LOWER(TRIM(artist)) ORDER BY plays DESC LIMIT 50",
+             GROUP BY LOWER(TRIM(title)), LOWER(TRIM(artist)) ORDER BY {} LIMIT 50",
+                order
+            ),
         )
         .bind(user_id)
         .bind(after)
@@ -4898,12 +4940,20 @@ impl Database {
         kind: &str,
         after: Option<i64>,
         limit: i64,
+        by_hours: bool,
     ) -> Result<Vec<ChartRow>, sqlx::Error> {
+        // Same reasoning as `get_ranged_stats`: the chart is cut to `limit`
+        // rows, so ranking by the chosen metric has to happen in SQL. It also
+        // has to agree with Statistics — "See more" hands off from there
+        // carrying its metric, and landing on a differently-ranked list would
+        // be the exact inconsistency that handoff exists to remove.
+        let order = if by_hours { "seconds DESC, plays DESC" } else { "plays DESC" };
         // Every branch selects the same shape so the caller doesn't care which
         // ran. `sub` is the secondary line (an album's artist), null for artists.
-        let sql = match kind {
+        let sql: String = match kind {
             "albums" => {
-                "SELECT album AS name, artist AS sub, NULL AS album, COUNT(*) AS plays,
+                format!(
+                    "SELECT album AS name, artist AS sub, NULL AS album, COUNT(*) AS plays,
                         COALESCE(SUM(duration), 0) AS seconds,
                         MAX(artwork_url) AS artwork_url, MAX(caa_id) AS caa_id,
                         MAX(caa_release_mbid) AS caa_release_mbid
@@ -4911,29 +4961,34 @@ impl Database {
                  WHERE user_id = ? AND skipped = FALSE AND (? IS NULL OR timestamp >= ?)
                    AND album IS NOT NULL AND TRIM(album) != ''
                  GROUP BY LOWER(TRIM(album)), LOWER(TRIM(artist))
-                 ORDER BY plays DESC LIMIT ?"
+                 ORDER BY {order} LIMIT ?"
+                )
             }
             "tracks" => {
-                "SELECT title AS name, artist AS sub, MAX(album) AS album, COUNT(*) AS plays,
+                format!(
+                    "SELECT title AS name, artist AS sub, MAX(album) AS album, COUNT(*) AS plays,
                         COALESCE(SUM(duration), 0) AS seconds,
                         MAX(artwork_url) AS artwork_url, MAX(caa_id) AS caa_id,
                         MAX(caa_release_mbid) AS caa_release_mbid
                  FROM scrobbles
                  WHERE user_id = ? AND skipped = FALSE AND (? IS NULL OR timestamp >= ?)
                  GROUP BY LOWER(TRIM(title)), LOWER(TRIM(artist))
-                 ORDER BY plays DESC LIMIT ?"
+                 ORDER BY {order} LIMIT ?"
+                )
             }
             _ => {
-                "SELECT artist AS name, NULL AS sub, NULL AS album, COUNT(*) AS plays,
+                format!(
+                    "SELECT artist AS name, NULL AS sub, NULL AS album, COUNT(*) AS plays,
                         COALESCE(SUM(duration), 0) AS seconds,
                         NULL AS artwork_url, NULL AS caa_id, NULL AS caa_release_mbid
                  FROM scrobbles
                  WHERE user_id = ? AND skipped = FALSE AND (? IS NULL OR timestamp >= ?)
                  GROUP BY LOWER(TRIM(artist))
-                 ORDER BY plays DESC LIMIT ?"
+                 ORDER BY {order} LIMIT ?"
+                )
             }
         };
-        let mut rows: Vec<ChartRow> = sqlx::query_as(sql)
+        let mut rows: Vec<ChartRow> = sqlx::query_as(&sql)
             .bind(user_id)
             .bind(after)
             .bind(after)

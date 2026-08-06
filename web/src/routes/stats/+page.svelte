@@ -24,7 +24,6 @@
 	/** Computed once rather than re-tested in every row: inside an `{#each}` the
 	 *  checker narrows `metric` to its initialiser and flags the comparison. */
 	$: unit = metric === 'hours' ? 'h' : '';
-	let showAll = { artists: false, albums: false, tracks: false };
 
 	const days = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
 	/** First day of the week, 0=Sun..6=Sat. The backend builds the heatmap in a
@@ -57,12 +56,43 @@
 	async function load() {
 		loading = true;
 		try {
-			[stats, persona] = await Promise.all([api.getRangedStats(range), api.getPersonality(range)]);
+			[stats, persona] = await Promise.all([
+				api.getRangedStats(range, metric),
+				api.getPersonality(range)
+			]);
 		} catch (e) { console.warn('stats', e); }
 		loading = false;
 	}
 
 	function setRange(r: StatsRange) { range = r; load(); }
+	/** Refetches rather than re-sorting locally: the server cuts each list to
+	 *  50 rows, so the top six by hours can contain a record that is nowhere
+	 *  near the top 50 by plays. */
+	function setMetric(m: 'plays' | 'hours') { metric = m; load(); }
+
+	/** Statistics and Top Charts have different range vocabularies — Charts has
+	 *  a Today that Statistics doesn't, and Statistics splits Month from
+	 *  Last 30. Handing the ranking off means translating, so the answer you
+	 *  land on is the one you asked for here. */
+	const RANGE_TO_CHART: Record<StatsRange, string> = {
+		week: 'd7',
+		month: 'month',
+		last30: 'month',
+		year: 'year',
+		all: 'all'
+	};
+	/** "See more" hands off to Top Charts rather than expanding in place. Charts
+	 *  is the ranking surface — 100 rows, a podium, artwork — so growing a
+	 *  second, shorter copy of it inside a panel was the duplication, not the
+	 *  fix. Metric travels too, so switching to Hours here keeps meaning there.
+	 *
+	 *  Reactive, not a plain `const`: Svelte tracks the dependencies of the
+	 *  *expression* in the markup, which would just be the function identity.
+	 *  A const closing over `range` and `metric` never changes identity, so the
+	 *  hrefs would silently keep whatever they were built with on first render.
+	 */
+	$: chartsHref = (kind: 'artists' | 'albums' | 'tracks') =>
+		`/charts?kind=${kind}&range=${RANGE_TO_CHART[range]}&metric=${metric}`;
 
 	onMount(async () => {
 		// Not awaited together: a missing preference must not stop the stats
@@ -94,8 +124,8 @@
 			{/each}
 		</div>
 		<div style="display:inline-flex;background:var(--td-sidebar);border-radius:999px;padding:4px;gap:2px;">
-			<button class="seg-btn" class:on={metric === 'plays'} on:click={() => (metric = 'plays')}>Plays</button>
-			<button class="seg-btn" class:on={metric === 'hours'} on:click={() => (metric = 'hours')}>Hours</button>
+			<button class="seg-btn" class:on={metric === 'plays'} on:click={() => setMetric('plays')}>Plays</button>
+			<button class="seg-btn" class:on={metric === 'hours'} on:click={() => setMetric('hours')}>Hours</button>
 		</div>
 	</div>
 </div>
@@ -161,14 +191,12 @@
 			<div class="top-head">
 				<h3 class="h-display" style="font-size:19px;margin:0;">Top Artists</h3>
 				{#if stats.top_artists.length > COLLAPSED}
-					<button class="see-all" on:click={() => (showAll.artists = !showAll.artists)}>
-						{showAll.artists ? 'Show less' : `See all ${stats.top_artists.length} →`}
-					</button>
+					<a class="see-all" href={chartsHref('artists')}>See more →</a>
 				{/if}
 			</div>
 			{#if stats.top_artists.length}
-				<div class="top-list" class:expanded={showAll.artists}>
-					{#each showAll.artists ? stats.top_artists : stats.top_artists.slice(0, COLLAPSED) as a, i}
+				<div class="top-list">
+					{#each stats.top_artists.slice(0, COLLAPSED) as a, i}
 						{@const v = metric === 'plays' ? a.plays : a.hours}
 						<button class="rank-row" on:click={() => openArtist(a.name)} title={`Open ${a.name}`}>
 							<span class="rank-n">{i + 1}</span>
@@ -189,14 +217,12 @@
 			<div class="top-head">
 				<h3 class="h-display" style="font-size:19px;margin:0;">Top Albums</h3>
 				{#if stats.top_albums.length > COLLAPSED}
-					<button class="see-all" on:click={() => (showAll.albums = !showAll.albums)}>
-						{showAll.albums ? 'Show less' : `See all ${stats.top_albums.length} →`}
-					</button>
+					<a class="see-all" href={chartsHref('albums')}>See more →</a>
 				{/if}
 			</div>
 			{#if stats.top_albums.length}
-				<div class="top-list" class:expanded={showAll.albums}>
-					{#each showAll.albums ? stats.top_albums : stats.top_albums.slice(0, COLLAPSED) as al, i}
+				<div class="top-list">
+					{#each stats.top_albums.slice(0, COLLAPSED) as al, i}
 						{@const v = metric === 'plays' ? al.plays : al.hours}
 						<button class="rank-row block" on:click={() => openAlbum(al.artist, al.name)} title={`Open ${al.name}`}>
 							<div class="rank-line">
@@ -216,14 +242,12 @@
 			<div class="top-head">
 				<h3 class="h-display" style="font-size:19px;margin:0;">Top Tracks</h3>
 				{#if (stats.top_tracks?.length ?? 0) > COLLAPSED}
-					<button class="see-all" on:click={() => (showAll.tracks = !showAll.tracks)}>
-						{showAll.tracks ? 'Show less' : `See all ${stats.top_tracks.length} →`}
-					</button>
+					<a class="see-all" href={chartsHref('tracks')}>See more →</a>
 				{/if}
 			</div>
 			{#if stats.top_tracks?.length}
-				<div class="top-list" class:expanded={showAll.tracks}>
-					{#each showAll.tracks ? stats.top_tracks : stats.top_tracks.slice(0, COLLAPSED) as t, i}
+				<div class="top-list">
+					{#each stats.top_tracks.slice(0, COLLAPSED) as t, i}
 						{@const v = metric === 'plays' ? t.plays : t.hours}
 						<button class="rank-row block" on:click={() => openTrack(t)} title={t.album ? `Open ${t.album}` : `Listens of ${t.title}`}>
 							<div class="rank-line">
@@ -328,42 +352,57 @@
 		</div>
 	{/if}
 
-	<!-- Genres -->
-	{#if stats.genres.length}
-		<h3 class="h-display" style="font-size:19px;margin:24px 0 12px;">Genres</h3>
-		<div class="panel" style="border-radius:22px;padding:22px;">
-			{#each stats.genres as g}
-				<div style="margin-bottom:12px;">
-					<div style="display:flex;justify-content:space-between;font-size:13px;margin-bottom:5px;"><span style="font-weight:600;">{g.name}</span><span style="color:var(--td-muted-2);">{g.pct}%</span></div>
-					<div style="height:10px;border-radius:999px;background:var(--td-track);overflow:hidden;"><div style="width:{g.pct}%;height:100%;background:linear-gradient(90deg,var(--td-accent-2),var(--td-accent));border-radius:999px;"></div></div>
+	<!-- Genres and Languages, side by side. Both are short lists of labelled
+	     percentage bars — at full width each bar was a metre of empty panel with
+	     a word at one end. `auto-fit` drops them back to one column under the
+	     same breakpoint the top lists use. -->
+	<div class="breakdowns">
+		<div>
+			<h3 class="h-display" style="font-size:19px;margin:24px 0 12px;">Genres</h3>
+			{#if stats.genres.length}
+				<div class="panel" style="border-radius:22px;padding:22px;">
+					{#each stats.genres as g}
+						<div style="margin-bottom:12px;">
+							<div style="display:flex;justify-content:space-between;gap:10px;font-size:13px;margin-bottom:5px;"><span style="font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">{g.name}</span><span style="color:var(--td-muted-2);flex:none;">{g.pct}%</span></div>
+							<div style="height:10px;border-radius:999px;background:var(--td-track);overflow:hidden;"><div style="width:{g.pct}%;height:100%;background:linear-gradient(90deg,var(--td-accent-2),var(--td-accent));border-radius:999px;"></div></div>
+						</div>
+					{/each}
+					<p style="color:var(--td-muted-3);font-size:12px;margin:4px 0 0;">
+						A track usually carries several tags, so these are shares of tag mentions
+						rather than of listens — they add up to 100% across tags, not across plays.
+					</p>
 				</div>
-			{/each}
-			<p style="color:var(--td-muted-3);font-size:12px;margin:4px 0 0;">
-				A track usually carries several tags, so these are shares of tag mentions
-				rather than of listens — they add up to 100% across tags, not across plays.
-			</p>
+			{:else}
+				<p style="color:var(--td-muted-3);font-size:12.5px;margin:0;">Genres fill in as listens are enriched from MusicBrainz.</p>
+			{/if}
 		</div>
-	{:else}
-		<p style="color:var(--td-muted-3);font-size:12.5px;margin:16px 0 0;">Genres fill in as listens are enriched from MusicBrainz.</p>
-	{/if}
 
-	<!-- Languages -->
-	{#if stats.languages.length}
-		<h3 class="h-display" style="font-size:19px;margin:24px 0 12px;">Languages</h3>
-		<div class="panel" style="border-radius:22px;padding:22px;">
-			{#each stats.languages as l}
-				<div style="margin-bottom:12px;">
-					<div style="display:flex;justify-content:space-between;font-size:13px;margin-bottom:5px;"><span style="font-weight:600;">{l.name}</span><span style="color:var(--td-muted-2);">{l.pct}%</span></div>
-					<div style="height:10px;border-radius:999px;background:var(--td-track);overflow:hidden;"><div style="width:{l.pct}%;height:100%;background:linear-gradient(90deg,#7a8a5e,#aebf92);border-radius:999px;"></div></div>
+		<div>
+			<h3 class="h-display" style="font-size:19px;margin:24px 0 12px;">Languages</h3>
+			{#if stats.languages.length}
+				<div class="panel" style="border-radius:22px;padding:22px;">
+					{#each stats.languages as l}
+						<div style="margin-bottom:12px;">
+							<div style="display:flex;justify-content:space-between;gap:10px;font-size:13px;margin-bottom:5px;"><span style="font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">{l.name}</span><span style="color:var(--td-muted-2);flex:none;">{l.pct}%</span></div>
+							<div style="height:10px;border-radius:999px;background:var(--td-track);overflow:hidden;"><div style="width:{l.pct}%;height:100%;background:linear-gradient(90deg,#7a8a5e,#aebf92);border-radius:999px;"></div></div>
+						</div>
+					{/each}
 				</div>
-			{/each}
+			{:else}
+				<p style="color:var(--td-muted-3);font-size:12.5px;margin:0;">Language breakdown fills in as listens are classified (Settings → run enrichment).</p>
+			{/if}
 		</div>
-	{:else}
-		<p style="color:var(--td-muted-3);font-size:12.5px;margin:16px 0 0;">Language breakdown fills in as listens are classified (Settings → run enrichment).</p>
-	{/if}
+	</div>
 {/if}
 
 <style>
+	.breakdowns {
+		display: grid;
+		grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+		gap: 18px;
+		align-items: start;
+	}
+
 	/* One template for the labels and the cells, so they can't drift apart.
 	   The columns are `1fr`, not a fixed cap: capping them left most of the
 	   panel empty on a desktop while the hour labels still spanned its full
@@ -422,25 +461,16 @@
 		gap: 10px;
 		margin-bottom: 16px;
 	}
+	/* An anchor now, not a button: it hands off to Top Charts rather than
+	   growing a second ranking inside this panel. */
 	.see-all {
-		border: none;
-		background: transparent;
-		padding: 0;
-		cursor: pointer;
-		font: inherit;
 		font-size: 12.5px;
-		color: #c67139;
+		font-weight: 600;
+		color: var(--td-accent);
 		white-space: nowrap;
+		text-decoration: none;
 	}
-	.see-all:hover { color: #e07a55; text-decoration: underline; }
-	/* Expanded, the list scrolls inside the panel rather than pushing the page
-	   down by forty rows. */
-	.top-list.expanded {
-		max-height: 420px;
-		overflow-y: auto;
-		margin-right: -6px;
-		padding-right: 6px;
-	}
+	.see-all:hover { color: var(--td-accent-hi); text-decoration: underline; }
 
 	/* The ranked rows are the most obvious place to want an entity page from,
 	   and until now they were the only lists in the app you couldn't click.

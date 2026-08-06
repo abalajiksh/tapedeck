@@ -25,7 +25,7 @@ openapi: 3.1.0
 
 info:
   title: Tapedeck
-  version: 0.39.0
+  version: 0.40.0
   summary: Self-hosted scrobbler and listening journal.
   description: |
     Tapedeck ingests listens, enriches them with MusicBrainz metadata, stores
@@ -1272,7 +1272,18 @@ paths:
         The genre breakdown is a share of **tag mentions, not listens** — one
         track carries several tags. Never present it as a percentage of plays.
       security: [{ sessionCookie: [] }, { apiToken: [read] }]
-      parameters: [{ $ref: '#/components/parameters/StatsRange' }]
+      parameters:
+        - $ref: '#/components/parameters/StatsRange'
+        - name: metric
+          in: query
+          description: |
+            How the three top lists are **ranked**, not merely what number is
+            shown. They are cut to 50 rows server-side, so re-sorting in the
+            client would only reorder the top 50 *by plays* and would miss a
+            long record played a handful of times — which is exactly the row
+            switching to `hours` exists to surface. Listens whose source
+            reported no duration count as zero and sort last.
+          schema: { type: string, enum: [plays, hours], default: plays }
       responses:
         '200':
           description: OK.
@@ -1360,6 +1371,14 @@ paths:
       parameters:
         - { name: kind, in: query, schema: { type: string, enum: [artists, albums, tracks], default: artists } }
         - { name: range, in: query, schema: { type: string, enum: [today, d7, month, year, all], default: all } }
+        - name: metric
+          in: query
+          description: |
+            Ranks the chart, not just the number shown — it is cut to `limit`
+            rows, so the sort happens in SQL. Statistics' "See more" hands off
+            here carrying its metric, and the two ranking differently would
+            defeat the point of that handoff.
+          schema: { type: string, enum: [plays, hours], default: plays }
         - $ref: '#/components/parameters/Limit'
       responses:
         '200':

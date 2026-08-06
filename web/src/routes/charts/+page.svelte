@@ -55,18 +55,21 @@
 	async function load() {
 		loading = true;
 		try {
-			rows = (await api.getChart(kind, range, 100)).rows;
+			rows = (await api.getChart(kind, range, 100, metric)).rows;
 		} catch (e) {
 			console.warn('charts', e);
 			rows = [];
 		}
 		loading = false;
 		// Linkable: a chart you're looking at should survive a reload.
-		history.replaceState(null, '', `/charts?kind=${kind}&range=${range}`);
+		history.replaceState(null, '', `/charts?kind=${kind}&range=${range}&metric=${metric}`);
 	}
 
 	function setKind(k: ChartKind) { kind = k; load(); }
 	function setRange(r: ChartRange) { range = r; load(); }
+	/** Refetches, like the range does — the chart is cut to 100 rows, so the
+	 *  ranking has to come back from the server. */
+	function setMetric(m: 'plays' | 'hours') { metric = m; load(); }
 
 	const medals = ['#c9a227', '#a8a8ad', '#a3703c'];
 
@@ -74,8 +77,12 @@
 		const q = new URLSearchParams(window.location.search);
 		const k = q.get('kind') as ChartKind | null;
 		const r = q.get('range') as ChartRange | null;
+		// Statistics' "See more" hands off here and brings its metric with it,
+		// so choosing Hours there doesn't silently land on Plays.
+		const m = q.get('metric');
 		if (k && kinds.some((x) => x.k === k)) kind = k;
 		if (r && timeframes.some((x) => x.k === r)) range = r;
+		if (m === 'plays' || m === 'hours') metric = m;
 		load();
 	});
 </script>
@@ -91,8 +98,8 @@
 		</p>
 	</div>
 	<div style="display:inline-flex;background:var(--td-sidebar);border-radius:999px;padding:3px;gap:2px;">
-		<button class="seg-btn" class:on={metric === 'plays'} on:click={() => (metric = 'plays')}>Plays</button>
-		<button class="seg-btn" class:on={metric === 'hours'} on:click={() => (metric = 'hours')}>Hours</button>
+		<button class="seg-btn" class:on={metric === 'plays'} on:click={() => setMetric('plays')}>Plays</button>
+		<button class="seg-btn" class:on={metric === 'hours'} on:click={() => setMetric('hours')}>Hours</button>
 	</div>
 </div>
 

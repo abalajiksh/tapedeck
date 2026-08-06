@@ -519,6 +519,11 @@ async fn clear_scrobbles(
 #[derive(Debug, Deserialize)]
 pub struct StatsQuery {
     pub range: Option<String>,
+    /// `plays` (default) or `hours`. Decides how the three top lists are
+    /// *ranked*, not just what number is shown — they are cut to 50 rows, so
+    /// sorting in the browser would rank within the top 50 by plays and miss
+    /// the long record played a handful of times.
+    pub metric: Option<String>,
 }
 
 /// Map a range label to a lower-bound timestamp (None = all time).
@@ -590,7 +595,8 @@ async fn ranged_stats(
     Query(q): Query<StatsQuery>,
 ) -> impl IntoResponse {
     let after = range_after(q.range.as_deref());
-    let mut stats = match state.db.get_ranged_stats(user.user_id, after).await {
+    let by_hours = q.metric.as_deref() == Some("hours");
+    let mut stats = match state.db.get_ranged_stats(user.user_id, after, by_hours).await {
         Ok(s) => s,
         Err(e) => return server_error(e.to_string()),
     };

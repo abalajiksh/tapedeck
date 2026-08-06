@@ -46,8 +46,75 @@
 	// with everything else. The distortion is real and the UI says so; the y axis
 	// still orders genres organic-to-mechanical, it just does it in less space.
 	const VIEW_H = 1150;
-	$: yScale = data && !trueScale ? VIEW_H / data.map.height : 1;
-	$: viewH = data ? (trueScale ? data.map.height : VIEW_H) : 0;
+	/** Drawn width : height of the plot. Every view is fitted to this, which is
+	 *  what makes the compression fall out of the geometry instead of being a
+	 *  constant someone picked. */
+	const PANEL_ASPECT = 1500 / VIEW_H;
+
+	/** Zoom stages, 0 = the whole map. Discrete rather than a slider: there are
+	 *  only a handful of useful framings and a stage is something you can click
+	 *  back out of. */
+	const ZOOM_STAGES = 4;
+	let zoom = 0;
+
+	// The region of the map currently in view, in map coordinates.
+	//
+	// Zooming interpolates from the whole map toward the *trajectory's* own
+	// bounding box. Note this is not the framing that was tried and rejected
+	// before: that one framed to the user's **genres**, which on a real history
+	// span y 1,048–21,730 of 22,648 — almost the whole canvas, so the framed
+	// aspect came out worse than the full map. A trajectory is a path of
+	// play-weighted *centroids*, and centroids cluster; its box is small and
+	// far better proportioned. The earlier argument simply does not apply to it.
+	$: focus = (() => {
+		if (!data) return null;
+		const W = data.map.width, H = data.map.height;
+		if (years.length < 2) return null;
+		const xs = years.map((y) => y.x), ys = years.map((y) => y.y);
+		const x0 = Math.min(...xs), x1 = Math.max(...xs);
+		const y0 = Math.min(...ys), y1 = Math.max(...ys);
+		// Pad generously: a path pressed against the edge of the frame reads as
+		// clipped even when it isn't.
+		const padX = Math.max((x1 - x0) * 0.35, W * 0.04);
+		const padY = Math.max((y1 - y0) * 0.35, H * 0.01);
+		return {
+			w: Math.min(W, x1 - x0 + padX * 2),
+			h: Math.min(H, y1 - y0 + padY * 2),
+			cx: (x0 + x1) / 2,
+			cy: (y0 + y1) / 2
+		};
+	})();
+
+	$: region = (() => {
+		if (!data) return { x: 0, y: 0, w: 1, h: 1 };
+		const W = data.map.width, H = data.map.height;
+		const full = { w: W, h: H, cx: W / 2, cy: H / 2 };
+		const t = focus && !trueScale ? zoom / ZOOM_STAGES : 0;
+		const lerp = (a: number, b: number) => a + (b - a) * t;
+		const w = lerp(full.w, focus?.w ?? full.w);
+		const h = lerp(full.h, focus?.h ?? full.h);
+		const cx = lerp(full.cx, focus?.cx ?? full.cx);
+		const cy = lerp(full.cy, focus?.cy ?? full.cy);
+		// Keep the window inside the map rather than panning off the edge.
+		return {
+			w, h,
+			x: Math.min(Math.max(cx - w / 2, 0), Math.max(W - w, 0)),
+			y: Math.min(Math.max(cy - h / 2, 0), Math.max(H - h, 0))
+		};
+	})();
+
+	// The compression is *derived*, not a constant: whatever region is in view
+	// is squeezed exactly enough to fill the panel. At zoom 0 that reproduces
+	// the old fixed ~20×; zoom in and the region is squarer, so it needs less,
+	// and the distortion falls away on its own. "True proportions" is then the
+	// limit of this rather than a separate mode you jump to.
+	$: yScale = trueScale ? 1 : region.w / (region.h * PANEL_ASPECT);
+	$: viewH = trueScale ? (data?.map.height ?? 0) : region.h * yScale;
+	$: viewBox = trueScale
+		? `0 0 ${data?.map.width ?? 0} ${viewH}`
+		: `${region.x} ${region.y * yScale} ${region.w} ${viewH}`;
+	/** How much taller-than-wide the view still is, for the caption. */
+	$: squash = region.h > 0 && yScale > 0 ? Math.round(1 / yScale) : 1;
 
 	// Every point is drawn: 6,291 circles is nothing for an SVG, and at this
 	// compression the backdrop *is* the picture — the shape of the whole space.
@@ -56,7 +123,10 @@
 	// Radius by play count, on a square root so one dominant genre doesn't
 	// swallow the plot — area reads as quantity, and sqrt makes area linear.
 	$: maxPlays = data?.mine.length ? Math.max(...data.mine.map((m) => m.plays)) : 1;
-	$: unit = data ? Math.max(data.map.width, viewH) / 260 : 1;
+	// Derived from the *visible* width, not the map's, so a mark keeps the same
+	// size on screen as you zoom. Scaling the viewBox alone would magnify every
+	// circle and label with it, which is the opposite of what zooming is for.
+	$: unit = trueScale ? Math.max(data?.map.width ?? 1, viewH) / 260 : region.w / 260;
 	const radius = (plays: number, max: number, unit: number) =>
 		unit * (2 + 9 * Math.sqrt(plays / Math.max(max, 1)));
 
@@ -138,11 +208,22 @@
 				<button class="btn btn-secondary" on:click={() => (trueScale = !trueScale)}>
 					{trueScale ? 'Fit to screen' : 'True proportions'}
 				</button>
+				{#if focus && !trueScale}
+					<!-- Zooming reframes toward the trajectory *and* relaxes the
+					     vertical squash as it goes, so the path stops being a
+					     cluster of overlapping dots without jumping to a
+					     different projection. -->
+					<div class="seg-zoom">
+						<button class="zoom-btn" disabled={zoom === 0} on:click={() => (zoom = Math.max(0, zoom - 1))} aria-label="Zoom out">&minus;</button>
+						<span class="zoom-label">{zoom === 0 ? 'Whole map' : `Zoom ${zoom}/${ZOOM_STAGES}`}</span>
+						<button class="zoom-btn" disabled={zoom === ZOOM_STAGES} on:click={() => (zoom = Math.min(ZOOM_STAGES, zoom + 1))} aria-label="Zoom in">+</button>
+					</div>
+				{/if}
 			</div>
 		</div>
 
 		<div style="{trueScale ? 'max-height:74vh;overflow-y:auto;' : ''}border-radius:14px;background:var(--td-track);">
-			<svg viewBox="0 0 {data.map.width} {viewH}" role="img"
+			<svg {viewBox} role="img"
 				aria-label="Your listening plotted on the Every Noise genre map"
 				style="width:100%;height:auto;display:block;">
 				{#each backdrop as p}
@@ -184,8 +265,13 @@
 		</div>
 		{#if !trueScale}
 			<p style="font-size:12px;color:var(--td-muted-3);margin:8px 0 0;">
-				Vertically compressed about 20× so the whole map fits — the axis still runs organic to
-				mechanical, in less room. “True proportions” shows it undistorted.
+				Vertically compressed about {squash}× so this view fills the panel — the axis still
+				runs organic to mechanical, in less room.
+				{#if focus && zoom < ZOOM_STAGES}
+					Zooming in frames the path and needs less squashing, so the distortion drops as you go.
+				{:else if focus}
+					As close as it frames. “True proportions” shows the whole map undistorted.
+				{/if}
 			</p>
 		{/if}
 
@@ -321,3 +407,40 @@
 		</div>
 	{/if}
 {/if}
+
+<style>
+	.seg-zoom {
+		display: inline-flex;
+		align-items: center;
+		gap: 2px;
+		background: var(--td-sidebar);
+		border-radius: 999px;
+		padding: 3px;
+	}
+	.zoom-btn {
+		border: none;
+		background: transparent;
+		color: var(--td-text);
+		cursor: pointer;
+		font: inherit;
+		font-size: 15px;
+		line-height: 1;
+		width: 28px;
+		height: 28px;
+		border-radius: 999px;
+	}
+	.zoom-btn:hover:not(:disabled) {
+		background: var(--td-nav-hover);
+	}
+	.zoom-btn:disabled {
+		opacity: 0.35;
+		cursor: default;
+	}
+	.zoom-label {
+		font-size: 12px;
+		font-weight: 600;
+		color: var(--td-muted);
+		min-width: 74px;
+		text-align: center;
+	}
+</style>

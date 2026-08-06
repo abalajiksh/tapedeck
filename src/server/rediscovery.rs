@@ -101,15 +101,27 @@ async fn rediscover(
             as i64
     };
 
-    let (forgotten, loved, once, seasonal, dusty, late, deep) = tokio::join!(
-        state.db.forgotten_favourites(user.user_id, quiet_since, limit),
-        state.db.loved_but_unplayed(user.user_id, limit),
-        state.db.heard_once(user.user_id, heard_once_before, limit),
-        state.db.seasonal(user.user_id, limit),
-        state.db.dusty_shelf(user.user_id, dusty_since, limit),
-        state.db.late_night(user.user_id, offset, limit),
-        state.db.deep_cuts(user.user_id, limit),
-    );
+    // Sequential, deliberately — this used to be a `tokio::join!` of all seven.
+    //
+    // The join looked like free parallelism and was the opposite. The pool
+    // holds five connections, so seven concurrent queries immediately queue two
+    // of them, and every one of these is an unindexed `GROUP BY` over the
+    // user's whole history. Worse, they compete with the poll engine and the
+    // MusicBrainz backfills for the same five connections, and sqlx will wait
+    // 30s to acquire one on top of the 10s `busy_timeout` — so on a small host
+    // behind a proxy this screen, and only this screen, could exceed the
+    // gateway timeout and come back as a 502 with nothing in the log.
+    //
+    // SQLite serialises these anyway. Measured on a 21,390-listen history the
+    // whole set is ~140ms either way, so the join bought nothing and cost the
+    // one endpoint that fires seven queries its reliability.
+    let forgotten = state.db.forgotten_favourites(user.user_id, quiet_since, limit).await;
+    let loved = state.db.loved_but_unplayed(user.user_id, limit).await;
+    let once = state.db.heard_once(user.user_id, heard_once_before, limit).await;
+    let seasonal = state.db.seasonal(user.user_id, limit).await;
+    let dusty = state.db.dusty_shelf(user.user_id, dusty_since, limit).await;
+    let late = state.db.late_night(user.user_id, offset, limit).await;
+    let deep = state.db.deep_cuts(user.user_id, limit).await;
 
     let window = match quiet_days {
         d if d <= 90 => "three months".to_string(),

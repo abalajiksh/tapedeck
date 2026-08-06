@@ -359,6 +359,10 @@ pub struct ChartQuery {
     pub kind: Option<String>,
     pub range: Option<String>,
     pub limit: Option<i64>,
+    /// `plays` (default) or `hours` — the *ranking*, not just the number shown.
+    /// Statistics hands off here carrying its own metric, and the two lists
+    /// disagreeing would defeat the point of the handoff.
+    pub metric: Option<String>,
 }
 
 /// Ranked chart over one window. The Statistics page shows the head of these
@@ -375,7 +379,8 @@ async fn charts(
     let limit = q.limit.unwrap_or(100).clamp(1, 500);
     let after = crate::server::scrobbles::range_after(q.range.as_deref());
 
-    match state.db.chart(user.user_id, kind, after, limit).await {
+    let by_hours = q.metric.as_deref() == Some("hours");
+    match state.db.chart(user.user_id, kind, after, limit, by_hours).await {
         Ok(rows) => (
             StatusCode::OK,
             Json(serde_json::json!({

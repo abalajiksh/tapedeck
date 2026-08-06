@@ -870,8 +870,11 @@ class TapedeckAPI {
 		return this.get('/api/v1/stats/dashboard');
 	}
 
-	async getRangedStats(range: StatsRange = 'all'): Promise<RangedStats> {
-		return this.get(`/api/v1/stats?range=${range}`);
+	/** `metric` decides how the three top lists are *ranked*, not only what
+	 *  number is displayed — they are cut to 50 rows server-side, so sorting in
+	 *  the browser would only reorder the top 50 by plays. */
+	async getRangedStats(range: StatsRange = 'all', metric: 'plays' | 'hours' = 'plays'): Promise<RangedStats> {
+		return this.get(`/api/v1/stats?range=${range}&metric=${metric}`);
 	}
 
 	async getPersonality(range: StatsRange = 'all'): Promise<Personality> {
@@ -1148,8 +1151,8 @@ class TapedeckAPI {
 	}
 
 	// ── Charts ──
-	async getChart(kind: ChartKind, range: ChartRange, limit = 100): Promise<{ kind: ChartKind; range: string; rows: ChartRow[] }> {
-		return this.get(`/api/v1/charts?kind=${kind}&range=${range}&limit=${limit}`);
+	async getChart(kind: ChartKind, range: ChartRange, limit = 100, metric: 'plays' | 'hours' = 'plays'): Promise<{ kind: ChartKind; range: string; rows: ChartRow[] }> {
+		return this.get(`/api/v1/charts?kind=${kind}&range=${range}&limit=${limit}&metric=${metric}`);
 	}
 
 	/** Fetch loved tracks from every connected service. */

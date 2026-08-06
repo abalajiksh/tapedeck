@@ -130,7 +130,9 @@
 	{/if}
 
 	<div class="cards">
-		{#each data.collections as c (c.key)}
+		<!-- The hero is one of these, so it has to come out of the grid — whichever
+		     collection has the most to say was being rendered twice. -->
+		{#each data.collections.filter((c) => c.key !== data?.featured?.key) as c (c.key)}
 			<div class="card" class:empty={!c.count}>
 				<div style="display:flex;gap:14px;align-items:flex-start;margin-bottom:14px;">
 					<div class="badge" style="background:{tint(c.accent, 0.15)};color:{c.accent};">
