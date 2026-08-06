@@ -430,14 +430,18 @@ impl EveryNoiseStore {
 
     /// The neighbours of a set of genres, in one relation.
     ///
-    /// Returns `(from_slug, to_name, x, y, colour, position)`. `position` is the
-    /// rank Every Noise itself gave the neighbour, so a caller can weight the
-    /// closest ones higher rather than treating twenty neighbours as equal.
+    /// Returns `(from_slug, to_slug, to_name, x, y, colour, position)`.
+    /// `position` is the rank Every Noise itself gave the neighbour, so a
+    /// caller can weight the closest ones higher rather than treating twenty
+    /// neighbours as equal. The neighbour's *slug* travels alongside its name
+    /// because it is the only key `exemplars_for` can be asked with — a
+    /// bordering genre the user owns nothing in never appears in `slugs_for`,
+    /// which is built from their own vocabulary.
     pub async fn neighbours_of(
         &self,
         slugs: &[String],
         relation: &str,
-    ) -> Result<Vec<(String, String, f64, f64, String, i64)>, sqlx::Error> {
+    ) -> Result<Vec<(String, String, String, f64, f64, String, i64)>, sqlx::Error> {
         let mut out = Vec::new();
         for chunk in slugs.chunks(400) {
             if chunk.is_empty() {
@@ -445,17 +449,64 @@ impl EveryNoiseStore {
             }
             let placeholders = vec!["?"; chunk.len()].join(",");
             let sql = format!(
-                "SELECT e.genre_slug, g.name, g.x, g.y, g.color, e.position
+                "SELECT e.genre_slug, g.slug, g.name, g.x, g.y, g.color, e.position
                    FROM genre_edges e JOIN genres g ON g.slug = e.related_slug
                   WHERE e.relation = ? AND e.genre_slug IN ({})",
                 placeholders
             );
-            let mut q = sqlx::query_as::<_, (String, String, f64, f64, String, i64)>(&sql);
+            let mut q =
+                sqlx::query_as::<_, (String, String, String, f64, f64, String, i64)>(&sql);
             q = q.bind(relation);
             for s in chunk {
                 q = q.bind(s);
             }
             out.extend(q.fetch_all(&self.pool).await?);
+        }
+        Ok(out)
+    }
+
+    /// Every Noise's own exemplar artists for a set of genres, most prominent
+    /// first.
+    ///
+    /// **These are not the caller's artists** and every path that surfaces them
+    /// has to say so. The vision rule — Tapedeck points at music you own — is
+    /// what kept them out of the neighbours response originally; they are back
+    /// as *labelled* context for a genre nobody in this instance has any music
+    /// in, where the alternative was a bare word on a coloured pill. Anything
+    /// that would read as a recommendation still must not use this.
+    ///
+    /// Empty for every slug until a tier-2 walk has run — `genre_artists` is
+    /// filled a page at a time by the ~6,300-request scrape, not by tier 1.
+    pub async fn exemplars_for(
+        &self,
+        slugs: &[String],
+        per_genre: usize,
+    ) -> Result<std::collections::HashMap<String, Vec<String>>, sqlx::Error> {
+        let mut out: std::collections::HashMap<String, Vec<String>> = Default::default();
+        for chunk in slugs.chunks(400) {
+            if chunk.is_empty() {
+                continue;
+            }
+            let placeholders = vec!["?"; chunk.len()].join(",");
+            // `font_size` is Every Noise's own prominence encoding — the same
+            // number that sizes the label on the genre's page — so it ranks
+            // these the way the site itself does.
+            let sql = format!(
+                "SELECT genre_slug, name FROM genre_artists
+                  WHERE genre_slug IN ({})
+                  ORDER BY genre_slug, font_size DESC, name",
+                placeholders
+            );
+            let mut q = sqlx::query_as::<_, (String, String)>(&sql);
+            for s in chunk {
+                q = q.bind(s);
+            }
+            for (slug, name) in q.fetch_all(&self.pool).await? {
+                let e = out.entry(slug).or_default();
+                if e.len() < per_genre {
+                    e.push(name);
+                }
+            }
         }
         Ok(out)
     }

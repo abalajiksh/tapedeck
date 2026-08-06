@@ -69,9 +69,13 @@ export interface NeighbourGenre {
 	borders: number;
 	affinity: number;
 	your_plays: number;
-	/** Strictly your own artists. Always empty for `unexplored` — Tapedeck
-	 *  never points at music you don't own. */
+	/** Strictly your own artists, from your own history. Always empty for
+	 *  `unexplored`, which is what puts a genre in that half. */
 	your_artists: { artist: string; plays: number }[];
+	/** Every Noise's own exemplars, set only where `your_artists` is empty.
+	 *  **These name music you do not own** — anything rendering them has to say
+	 *  so. Empty until a tier-2 scrape has run. */
+	exemplar_artists: string[];
 }
 
 export interface GenreNeighbours {

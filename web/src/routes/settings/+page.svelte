@@ -17,7 +17,8 @@
 	// came for is one click away instead of a scroll hunt. The section lives in the
 	// hash so a link like /settings#sources lands where it says it will.
 	const SECTIONS = [
-		{ id: 'appearance', label: 'Appearance', hint: 'Theme, artwork, timezone' },
+		{ id: 'appearance', label: 'Appearance', hint: 'Theme and artwork' },
+		{ id: 'time', label: 'Time', hint: 'Timezone and week start' },
 		{ id: 'sources', label: 'Sources', hint: 'Plex, Navidrome, Jellyfin' },
 		{ id: 'connections', label: 'Connections', hint: 'Where listens are forwarded' },
 		{ id: 'tokens', label: 'API Tokens', hint: 'Scrobble clients' },
@@ -449,6 +450,70 @@
 		return pool.slice(0, 60);
 	}
 
+	/** What a zone actually does, read out of the browser's own tz database
+	 *  rather than a table we would have to keep current.
+	 *
+	 *  Two things this gets right that the obvious version does not.
+	 *
+	 *  **No single locale names every zone.** `en-GB` gives CET/CEST for Berlin
+	 *  but `GMT-5` for New York; `en-US` gives EST/EDT for New York but `GMT+1`
+	 *  for Berlin. Those named forms are exactly what people go hunting for in
+	 *  the picker, so both are asked and whichever returns a real name wins.
+	 *
+	 *  **Standard vs daylight is decided by the offset, not by the month.**
+	 *  Probing January and July and calling them winter and summer is wrong for
+	 *  the entire southern hemisphere — Sydney's January is its summer. The
+	 *  larger UTC offset is the shifted one wherever the zone sits. */
+	function zoneFacts(name: string) {
+		const abbr = (d: Date) => {
+			for (const loc of ['en-GB', 'en-US']) {
+				const v = new Intl.DateTimeFormat(loc, { timeZone: name, timeZoneName: 'short' })
+					.formatToParts(d)
+					.find((p) => p.type === 'timeZoneName')?.value;
+				// A bare `GMT+2` is a fallback, not a name — keep looking.
+				if (v && !/^(GMT|UTC)[+-]/.test(v)) return v;
+			}
+			return new Intl.DateTimeFormat('en-GB', { timeZone: name, timeZoneName: 'short' })
+				.formatToParts(d)
+				.find((p) => p.type === 'timeZoneName')?.value ?? '';
+		};
+		/** Minutes east of UTC, from the offset the browser reports. */
+		const offsetMins = (d: Date) => {
+			const v = new Intl.DateTimeFormat('en-GB', { timeZone: name, timeZoneName: 'longOffset' })
+				.formatToParts(d)
+				.find((p) => p.type === 'timeZoneName')?.value ?? '';
+			const m = /GMT([+-])(\d{2}):(\d{2})/.exec(v);
+			return m ? (m[1] === '-' ? -1 : 1) * (+m[2] * 60 + +m[3]) : 0;
+		};
+		const offsetText = (d: Date) =>
+			new Intl.DateTimeFormat('en-GB', { timeZone: name, timeZoneName: 'longOffset' })
+				.formatToParts(d)
+				.find((p) => p.type === 'timeZoneName')?.value ?? '';
+		try {
+			const now = new Date();
+			const jan = new Date(Date.UTC(now.getUTCFullYear(), 0, 15));
+			const jul = new Date(Date.UTC(now.getUTCFullYear(), 6, 15));
+			const janAbbr = abbr(jan);
+			if (!janAbbr) return null;
+			const julAbbr = abbr(jul);
+			// Whichever probe sits further east is the shifted one.
+			const janIsDst = offsetMins(jan) > offsetMins(jul);
+			return {
+				now: abbr(now),
+				offset: offsetText(now) || 'GMT+00:00',
+				standard: janIsDst ? julAbbr : janAbbr,
+				daylight: janIsDst ? janAbbr : julAbbr,
+				observesDst: offsetMins(jan) !== offsetMins(jul)
+			};
+		} catch {
+			// An unrecognised zone throws rather than returning anything — that
+			// is the signal the field holds half-typed text, not a zone.
+			return null;
+		}
+	}
+
+	$: tzFacts = timezone.trim() ? zoneFacts(timezone.trim()) : null;
+
 	$: tzMatches = matchZones(timezone, tzFocused);
 	$: if (tzIndex >= tzMatches.length) tzIndex = 0;
 
@@ -715,7 +780,18 @@
 					</p>
 				</div>
 
-				<div style="margin-top:18px;">
+			</div>
+		{/if}
+
+		{#if section === 'time'}
+			<div class="panel" style="border-radius:22px;padding:24px;margin-bottom:18px;">
+				<h3 class="h-display" style="font-size:19px;margin-bottom:4px;">Time</h3>
+				<p style="font-size:13px;color:var(--td-muted);margin:0 0 16px;max-width:62ch;">
+					Every date in Tapedeck is stored in UTC and displayed in your zone — which is what
+					makes “today”, the listening clock and the yearly trajectory line up with the day
+					you actually had.
+				</p>
+				<div>
 					<div class="field" style="max-width:360px;"><label for="tz">Timezone <span style="opacity:.6">(for local-time analytics)</span></label>
 						<div style="display:flex;gap:8px;position:relative;">
 							<div style="flex:1;position:relative;">
@@ -745,6 +821,30 @@
 							<button class="btn btn-secondary" on:click={saveTimezone}>{tzSaved ? '✓' : 'Save'}</button>
 						</div>
 					</div>
+
+					{#if tzFacts}
+						<!-- The question this answers is "why can't I pick CET or CEST?".
+						     Because those are the two halves of one zone, and picking
+						     either would freeze the offset and shift half the year's
+						     listening. Naming the region and showing it switching is a
+						     shorter answer than a paragraph about it. -->
+						<p style="font-size:12.5px;color:var(--td-muted);margin:-4px 0 0;max-width:62ch;">
+							Currently <strong>{tzFacts.now}</strong> ({tzFacts.offset}).
+							{#if tzFacts.observesDst}
+								This region switches between {tzFacts.standard} and {tzFacts.daylight}, and
+								Tapedeck follows that on the right dates by itself. It is why the list holds
+								regions like <code>Europe/Berlin</code> rather than CET and CEST — those are
+								the two halves of one zone, and pinning either would put half your year an
+								hour out.
+							{:else}
+								This region does not observe daylight saving, so the offset never moves.
+							{/if}
+						</p>
+					{:else if timezone}
+						<p style="font-size:12.5px;color:var(--td-muted-3);margin:-4px 0 0;">
+							Not a zone this browser recognises — pick one from the list.
+						</p>
+					{/if}
 
 					<div class="row">
 						<div class="row-main">

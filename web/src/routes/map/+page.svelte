@@ -7,6 +7,11 @@
 	let traj: GenreTrajectory | null = null;
 	let nbrs: GenreNeighbours | null = null;
 	let showPath = true;
+	/** The lit points crowd the trajectory — they are the densest thing on the
+	 *  plot and the path runs straight through the middle of them. Hiding them
+	 *  leaves the faint backdrop, which is still the shape of the whole map, so
+	 *  the path keeps its context without competing with it. */
+	let showMine = true;
 	let loading = true;
 	let error = '';
 	/** The map is 15× taller than wide, so the overview compresses the vertical
@@ -64,6 +69,12 @@
 	$: path = years.map((y) => `${y.x},${(y.y * yScale).toFixed(1)}`).join(' ');
 	$: thinYears = years.filter((y) => coverage(y) < 0.9).length;
 
+	// `genre_artists` is only filled by the tier-2 walk, so an instance that has
+	// only fetched the one-request map has adjacency but no exemplars. Say so
+	// rather than showing bare cards that look like a bug.
+	$: anyExemplars = !!nbrs
+		&& [...nbrs.unexplored, ...nbrs.opposite].some((g) => g.exemplar_artists?.length);
+
 	$: pending = data ? data.listens_total - data.listens_with_genres : 0;
 	$: top = data ? [...data.mine].sort((a, b) => b.plays - a.plays).slice(0, 12) : [];
 </script>
@@ -118,6 +129,12 @@
 						{showPath ? 'Hide trajectory' : 'Show trajectory'}
 					</button>
 				{/if}
+				<!-- Clearing `hovered` matters: the circle is removed rather than
+				     moused out, so no `mouseleave` fires and the caption would keep
+				     naming a genre that is no longer drawn. -->
+				<button class="btn btn-secondary" on:click={() => { showMine = !showMine; hovered = null; }}>
+					{showMine ? 'Hide my genres' : 'Show my genres'}
+				</button>
 				<button class="btn btn-secondary" on:click={() => (trueScale = !trueScale)}>
 					{trueScale ? 'Fit to screen' : 'True proportions'}
 				</button>
@@ -131,7 +148,7 @@
 				{#each backdrop as p}
 					<circle cx={p[1]} cy={p[2] * yScale} r={unit * 1.1} fill={p[3]} opacity="0.2" />
 				{/each}
-				{#each data.mine as m}
+				{#each showMine ? data.mine : [] as m}
 					<circle cx={m.x} cy={m.y * yScale} r={radius(m.plays, maxPlays, unit)} fill={m.color}
 						stroke="var(--td-bg)" stroke-width={unit * 0.45} opacity="0.95"
 						on:mouseenter={() => (hovered = m)} on:mouseleave={() => (hovered = null)}
@@ -176,6 +193,8 @@
 			{#if hovered}
 				<strong style="color:var(--td-text);">{hovered.name}</strong>
 				{#if hovered.plays}· {hovered.plays.toLocaleString()} plays{/if}
+			{:else if !showMine}
+				Your genres are hidden — the faint backdrop is the whole map.
 			{:else}
 				Hover a lit point for its genre.
 			{/if}
@@ -209,8 +228,8 @@
 			<p style="font-size:13px;color:var(--td-muted);margin:0 0 16px;max-width:70ch;">
 				Genres bordering the {nbrs.seeded_from} you play most, using Every Noise's own
 				adjacency. Nothing here is a recommendation — the first list is music
-				<strong>you already own</strong> and rarely reach for; the second is the shape of the
-				map next to you, with no artists attached.
+				<strong>you already own</strong> and rarely reach for; the lists below it are the
+				shape of the map next to you, named by Every Noise rather than by your library.
 			</p>
 
 			{#if nbrs.next_door.length}
@@ -234,15 +253,32 @@
 			{/if}
 
 			{#if nbrs.unexplored.length}
-				<div style="font-size:12.5px;color:var(--td-muted-2);margin:18px 0 9px;">
+				<div style="font-size:12.5px;color:var(--td-muted-2);margin:18px 0 3px;">
 					Bordering regions you have nothing in
 				</div>
-				<div style="display:flex;flex-wrap:wrap;gap:8px;">
+				{#if anyExemplars}
+					<!-- The provenance line is not decoration. These names are the
+					     one place on the page that is *not* drawn from the user's
+					     own history, and the card style alone can't say that. -->
+					<div style="font-size:11.5px;color:var(--td-muted-3);margin:0 0 9px;">
+						Artists here are Every Noise's own exemplars for the genre, not from your library.
+					</div>
+				{:else}
+					<div style="height:6px;"></div>
+				{/if}
+				<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));gap:10px;">
 					{#each nbrs.unexplored as g}
-						<span style="display:inline-flex;align-items:center;gap:7px;padding:5px 11px;border-radius:999px;background:var(--td-track);font-size:12.5px;color:var(--td-muted);">
-							<span style="width:9px;height:9px;border-radius:50%;background:{g.color};flex:none;opacity:.8;"></span>
-							{g.name}
-						</span>
+						<div style="padding:11px 13px;border-radius:14px;border:1px dashed var(--td-border);background:transparent;">
+							<div style="display:flex;align-items:center;gap:8px;">
+								<span style="width:10px;height:10px;border-radius:50%;background:{g.color};flex:none;opacity:.8;"></span>
+								<strong style="font-size:13.5px;color:var(--td-muted);">{g.name}</strong>
+							</div>
+							{#if g.exemplar_artists?.length}
+								<div style="font-size:12px;color:var(--td-muted-3);margin-top:4px;font-style:italic;">
+									{g.exemplar_artists.join(' · ')}
+								</div>
+							{/if}
+						</div>
 					{/each}
 				</div>
 			{/if}
@@ -251,14 +287,36 @@
 				<div style="font-size:12.5px;color:var(--td-muted-2);margin:18px 0 9px;">
 					Furthest from your listening
 				</div>
-				<div style="display:flex;flex-wrap:wrap;gap:8px;">
+				<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));gap:10px;opacity:.85;">
 					{#each nbrs.opposite.slice(0, 10) as g}
-						<span style="display:inline-flex;align-items:center;gap:7px;padding:5px 11px;border-radius:999px;background:var(--td-track);font-size:12.5px;color:var(--td-muted-3);">
-							<span style="width:9px;height:9px;border-radius:50%;background:{g.color};flex:none;opacity:.6;"></span>
-							{g.name}
-						</span>
+						<div style="padding:11px 13px;border-radius:14px;border:1px dashed var(--td-border);background:transparent;">
+							<div style="display:flex;align-items:center;gap:8px;">
+								<span style="width:10px;height:10px;border-radius:50%;background:{g.color};flex:none;opacity:.6;"></span>
+								<strong style="font-size:13.5px;color:var(--td-muted-3);">{g.name}</strong>
+							</div>
+							{#if g.exemplar_artists?.length}
+								<div style="font-size:12px;color:var(--td-muted-3);margin-top:4px;font-style:italic;">
+									{g.exemplar_artists.join(' · ')}
+								</div>
+							{:else if g.your_artists?.length}
+								<!-- Rare but real: a genre maximally far from your
+								     listening that you nonetheless own something in.
+								     Those are yours, so they are not italicised. -->
+								<div style="font-size:12px;color:var(--td-muted-2);margin-top:4px;">
+									{g.your_artists.map((a) => a.artist).join(' · ')}
+								</div>
+							{/if}
+						</div>
 					{/each}
 				</div>
+			{/if}
+
+			{#if !anyExemplars && (nbrs.unexplored.length || nbrs.opposite.length)}
+				<p style="font-size:11.5px;color:var(--td-muted-3);margin:12px 0 0;">
+					Example artists for these regions come from Every Noise's per-genre pages, which
+					only the full scrape collects. Run the deep scrape in Settings → Genre Map to fill
+					them in.
+				</p>
 			{/if}
 		</div>
 	{/if}

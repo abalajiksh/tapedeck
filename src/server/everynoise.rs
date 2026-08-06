@@ -490,6 +490,11 @@ pub async fn genre_trajectory(
 /// How many of the caller's top genres seed the neighbour walk.
 const SEED_GENRES: usize = 25;
 
+/// How many Every Noise exemplars a genre the caller owns nothing in carries.
+/// Kept small on purpose: enough to give a bare genre name a texture, few
+/// enough that the card cannot be mistaken for a list of things to go and get.
+const EXEMPLARS_PER_GENRE: usize = 4;
+
 /// How broad is a listening history, in two numbers that mean different things.
 ///
 /// **Not a grid.** The obvious measure — bin the map into cells and count how
@@ -571,12 +576,26 @@ pub(crate) fn breadth(
 ///
 /// **This does not recommend music.** The vision rule is that Tapedeck never
 /// points at things the listener does not own, and a genre map makes it very
-/// easy to do so accidentally — Every Noise will happily name exemplar artists
-/// for any genre. So the response is split by whether the caller *already has
-/// music there*, and the artist lists are drawn **only from their own
-/// listening history**. A genre they own nothing in is reported as a region of
-/// the map and nothing more; there is deliberately no field in which an unowned
-/// artist could travel.
+/// easy to do so accidentally. So the response is split by whether the caller
+/// *already has music there*, and the two halves carry artists in **two
+/// different fields that must never be merged**:
+///
+/// * `your_artists` — from the caller's own listening history. Only ever set on
+///   `next_door`, which is the half that leads, because "you have 243 plays of
+///   boy band and it is not in your top 25" is the actionable finding.
+/// * `exemplar_artists` — Every Noise's own exemplars for a genre the caller
+///   owns *nothing* in. These name music they do not have, so the field is
+///   separate rather than shared: any consumer that renders them without
+///   saying where they came from is doing it wrong, and a distinct field name
+///   is what makes that visible at the call site rather than a convention to
+///   remember. Empty until a tier-2 walk has run.
+///
+/// The original design left unowned genres with no artist field at all, which
+/// enforced the rule by shape. Labelling replaced that (2026-08-06, at
+/// Ashwin's direction): a bordering region reduced to one word on a pill said
+/// less than the rule was protecting, and the honest fix is provenance, not
+/// omission. The shape still enforces the half that matters — nothing can
+/// present an Every Noise exemplar as something the listener owns.
 pub async fn genre_neighbours(
     State(state): State<Arc<AppState>>,
     user: AuthUser,
@@ -625,7 +644,29 @@ pub async fn genre_neighbours(
             .push((artist, plays));
     }
 
-    let collect = |edges: Vec<(String, String, f64, f64, String, i64)>,
+    let nearby_edges =
+        state.everynoise.neighbours_of(&seed_slugs, "nearby").await.unwrap_or_default();
+    let opposite_edges =
+        state.everynoise.neighbours_of(&seed_slugs, "opposite").await.unwrap_or_default();
+
+    // Every Noise's own exemplars, fetched once for both relations. Keyed by
+    // the neighbour's slug rather than its name, because a genre the caller
+    // owns nothing in — which is exactly the set this exists for — never
+    // appears in `slugs`, built from their own vocabulary.
+    let reachable: Vec<String> = {
+        let mut v: Vec<String> = nearby_edges
+            .iter()
+            .chain(opposite_edges.iter())
+            .map(|(_, slug, ..)| slug.clone())
+            .collect();
+        v.sort();
+        v.dedup();
+        v
+    };
+    let exemplars =
+        state.everynoise.exemplars_for(&reachable, EXEMPLARS_PER_GENRE).await.unwrap_or_default();
+
+    let collect = |edges: Vec<(String, String, String, f64, f64, String, i64)>,
                    seeds: &[(String, i64)],
                    plays_by_slug: &std::collections::HashMap<String, i64>,
                    mine: &std::collections::HashMap<String, Vec<(String, i64)>>|
@@ -636,12 +677,12 @@ pub async fn genre_neighbours(
         // Affinity: a genre bordering several of your biggest genres, closely,
         // is more "next door" than one bordering a single small genre at rank
         // 19. Weighting by the seed's plays and discounting by rank says that.
-        let mut score: std::collections::HashMap<String, (f64, f64, f64, String, usize)> =
+        let mut score: std::collections::HashMap<String, (f64, f64, f64, String, usize, String)> =
             Default::default();
-        for (from, name, x, y, colour, position) in edges {
+        for (from, slug, name, x, y, colour, position) in edges {
             let w = *seed_plays.get(from.as_str()).unwrap_or(&0) as f64
                 / (position as f64 + 1.0).sqrt();
-            let e = score.entry(name).or_insert((0.0, x, y, colour, 0));
+            let e = score.entry(name).or_insert((0.0, x, y, colour, 0, slug));
             e.0 += w;
             e.4 += 1;
         }
@@ -649,7 +690,7 @@ pub async fn genre_neighbours(
         let mut out: Vec<_> = score.into_iter().collect();
         out.sort_by(|a, b| b.1 .0.partial_cmp(&a.1 .0).unwrap_or(std::cmp::Ordering::Equal));
         out.into_iter()
-            .filter_map(|(name, (affinity, x, y, colour, borders))| {
+            .filter_map(|(name, (affinity, x, y, colour, borders, slug))| {
                 let key = crate::everynoise::store::genre_key(&name);
                 // Genres you already play a lot are not "next door", they are
                 // where you live — the map above already shows those.
@@ -659,26 +700,33 @@ pub async fn genre_neighbours(
                     mine.get(&key).map(|v| v.iter().collect()).unwrap_or_default();
                 yours.sort_by(|a, b| b.1.cmp(&a.1));
 
+                // Exemplars fill in exactly where the caller's own history has
+                // nothing to say, and never alongside it — a card showing both
+                // would be the one place a reader could confuse the two.
+                let exemplar_artists: Vec<&String> = if yours.is_empty() {
+                    exemplars.get(&slug).map(|v| v.iter().collect()).unwrap_or_default()
+                } else {
+                    Vec::new()
+                };
+
                 Some(serde_json::json!({
                     "name": name,
                     "x": x, "y": y, "color": colour,
                     "borders": borders,
                     "affinity": (affinity * 10.0).round() / 10.0,
                     "your_plays": slug_plays,
-                    // Strictly the caller's own artists. Empty is a real answer:
-                    // it means they own nothing here, and nothing is suggested.
+                    // Strictly the caller's own artists. Empty is a real answer
+                    // and it is what splits the response — see `exemplar_artists`.
                     "your_artists": yours.iter().take(4)
                         .map(|(a, p)| serde_json::json!({ "artist": a, "plays": p }))
                         .collect::<Vec<_>>(),
+                    // Every Noise's exemplars. **Not the caller's music.** Any
+                    // consumer rendering these owes the reader that provenance.
+                    "exemplar_artists": exemplar_artists,
                 }))
             })
             .collect()
     };
-
-    let nearby_edges =
-        state.everynoise.neighbours_of(&seed_slugs, "nearby").await.unwrap_or_default();
-    let opposite_edges =
-        state.everynoise.neighbours_of(&seed_slugs, "opposite").await.unwrap_or_default();
 
     let mut nearby = collect(nearby_edges, &seeds, &plays_by_slug, &mine_by_genre);
     // Drop the genres that *are* your listening — bordering yourself is not a
@@ -709,8 +757,9 @@ pub async fn genre_neighbours(
         Json(serde_json::json!({
             // Bordering genres you already have music in, underplayed.
             "next_door": owned,
-            // Bordering genres you own nothing in. A region of the map and
-            // nothing else — there is deliberately no artist field to fill.
+            // Bordering genres you own nothing in. `your_artists` is empty by
+            // construction here; `exemplar_artists` is Every Noise's, and has
+            // to be presented as such.
             "unexplored": unexplored,
             "opposite": opposite,
             "seeded_from": seeds.len(),
