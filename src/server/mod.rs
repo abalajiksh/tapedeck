@@ -19,6 +19,7 @@ pub mod physical;
 mod preferences;
 pub mod ratelimit;
 pub mod rediscovery;
+pub mod reports;
 pub mod scrobbles;
 mod sessions;
 mod sources;
@@ -100,6 +101,7 @@ pub fn build_app(state: Arc<AppState>) -> Router {
         .merge(rediscovery::create_rediscovery_router())
         .merge(everynoise::create_everynoise_router())
         .merge(pairing::create_pairing_router())
+        .merge(reports::create_reports_router())
         // The spec describes *this* instance at *this* version — the one
         // thing a separately hosted docs site cannot do.
         .route("/api/openapi.yaml", axum::routing::get(crate::openapi::spec))

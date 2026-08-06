@@ -25,7 +25,7 @@ openapi: 3.1.0
 
 info:
   title: Tapedeck
-  version: 0.40.0
+  version: 0.41.0
   summary: Self-hosted scrobbler and listening journal.
   description: |
     Tapedeck ingests listens, enriches them with MusicBrainz metadata, stores
@@ -1329,6 +1329,92 @@ paths:
                       reach:
                         type: [number, 'null']
                         description: Your spread over the map's own spread, 0–1.
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /api/v1/reports:
+    get:
+      tags: [Statistics]
+      summary: Period reports — a feed of week / month / year cards, newest first.
+      description: |
+        Scope: `read` *(since v0.41)*.
+
+        Reads the history **once** and folds it in Rust. A card carries a dozen
+        aggregates and every one is bucketed in the caller's own timezone, which
+        SQL here cannot do — a year of monthly cards would otherwise be hundreds
+        of round trips.
+
+        Weeks are ISO (Monday-start), deliberately **not** the caller's
+        week-start preference: that setting shapes the dashboard counter and the
+        heatmap rows, whereas a report is a named object and its boundary has to
+        stay put, or last month's report changes shape when the preference does.
+
+        `avg_daily` divides by **calendar** days — a finished period by its full
+        length, one still running by the days it has actually had. Dividing by
+        days-with-listens would report the rate of your busiest fortnight as the
+        month's average.
+
+        Two things deliberately absent. There is **no percentile against other
+        users** ("you out-listened 88% of listeners"): that needs other people's
+        listening, and on a private instance it would leak how much the rest of
+        the household plays. And `crush` is omitted for the oldest period, where
+        every artist is new by construction and it would just be the top artist
+        relabelled.
+      security: [{ sessionCookie: [] }, { apiToken: [read] }]
+      parameters:
+        - { name: unit, in: query, schema: { type: string, enum: [week, month, year], default: month } }
+        - { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 60, default: 12 } }
+      responses:
+        '200':
+          description: OK.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  unit: { type: string, enum: [week, month, year] }
+                  timezone: { type: string, description: The IANA zone the buckets were cut in. }
+                  capped:
+                    type: boolean
+                    description: |
+                      The scan hit the analytics row cap, so the oldest periods
+                      are partial and must not be presented as final.
+                  periods:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        key: { type: string, example: '2026-08' }
+                        label: { type: string, example: August 2026 }
+                        start: { type: integer }
+                        end: { type: integer }
+                        plays: { type: integer }
+                        hours: { type: number }
+                        avg_daily: { type: integer }
+                        artists: { type: integer }
+                        albums: { type: integer }
+                        tracks: { type: integer }
+                        new_artists: { type: integer, description: Artists with no earlier listen anywhere in the history. }
+                        top_artist: { type: [object, 'null'], additionalProperties: true }
+                        top_album: { type: [object, 'null'], additionalProperties: true }
+                        top_track: { type: [object, 'null'], additionalProperties: true }
+                        clock: { type: array, items: { type: integer }, description: 24 counts, local hours. }
+                        sub:
+                          type: array
+                          items: { type: integer }
+                          description: One level finer than the period — days across a week, weeks across a month, months across a year.
+                        sub_labels: { type: array, items: { type: string } }
+                        genres:
+                          type: array
+                          description: Shares of **tag mentions**, not of listens.
+                          items: { type: object, additionalProperties: true }
+                        colour: { type: [string, 'null'], description: Play-weighted blend of the period's genre colours, in linear light. Null until the genre map is fetched. }
+                        on_repeat: { type: array, items: { type: object, additionalProperties: true } }
+                        crush: { type: [object, 'null'], description: Most-played artist never played before. Absent for the oldest period. }
+                        shelf: { type: object, additionalProperties: true }
+                        top_chain: { type: [string, 'null'] }
+                        milestones: { type: array, items: { type: string } }
+                        prev: { type: [object, 'null'], additionalProperties: true, description: The period before, for deltas. }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
 

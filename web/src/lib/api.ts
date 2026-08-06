@@ -178,6 +178,57 @@ export interface RangedStats {
 	heatmap: number[][]; // 7 days × 24 hours
 }
 
+/** One period card on the Reports feed. */
+export interface ReportPeriod {
+	key: string;
+	label: string;
+	start: number;
+	end: number;
+	plays: number;
+	hours: number;
+	/** Plays per calendar day — full length for a finished period, days elapsed
+	 *  for one still running. */
+	avg_daily: number;
+	artists: number;
+	albums: number;
+	tracks: number;
+	new_artists: number;
+	top_artist: { name: string; plays: number; hours: number } | null;
+	top_album: { name: string; artist: string; plays: number } | null;
+	top_track: { title: string; artist: string; plays: number } | null;
+	/** 24 counts, bucketed in your own timezone. */
+	clock: number[];
+	/** Plays per sub-bucket: days across a week, weeks across a month, months
+	 *  across a year. */
+	sub: number[];
+	sub_labels: string[];
+	/** Shares of **tag mentions**, not of listens — say so wherever shown. */
+	genres: { name: string; pct: number }[];
+	/** Play-weighted average of the period's genre colours. Null until the
+	 *  genre map has been fetched. */
+	colour: string | null;
+	on_repeat: { title: string; artist: string; plays: number }[];
+	/** The most-played artist you had never played before. Absent for the
+	 *  oldest period, where everything is new by construction. */
+	crush: { name: string; plays: number; since: number } | null;
+	shelf: { sides: number; rows: { title: string; artist: string; side: string; spins: number }[] };
+	top_chain: string | null;
+	milestones: string[];
+	prev: {
+		label: string; plays: number; hours: number; avg_daily: number;
+		artists: number; albums: number; tracks: number; sub: number[];
+	} | null;
+}
+
+export interface Reports {
+	unit: 'week' | 'month' | 'year';
+	timezone: string;
+	periods: ReportPeriod[];
+	/** True when the history hit the analytics row cap — the oldest periods are
+	 *  then incomplete and should not be presented as final. */
+	capped?: boolean;
+}
+
 export interface PersonalityTrait {
 	label: string;
 	low: string;
@@ -875,6 +926,11 @@ class TapedeckAPI {
 	 *  the browser would only reorder the top 50 by plays. */
 	async getRangedStats(range: StatsRange = 'all', metric: 'plays' | 'hours' = 'plays'): Promise<RangedStats> {
 		return this.get(`/api/v1/stats?range=${range}&metric=${metric}`);
+	}
+
+	/** Period reports, newest first. */
+	async getReports(unit: 'week' | 'month' | 'year' = 'month', limit = 12): Promise<Reports> {
+		return this.get(`/api/v1/reports?unit=${unit}&limit=${limit}`);
 	}
 
 	async getPersonality(range: StatsRange = 'all'): Promise<Personality> {

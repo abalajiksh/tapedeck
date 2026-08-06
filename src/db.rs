@@ -2586,6 +2586,56 @@ impl Database {
         Ok(row)
     }
 
+    /// Every listen a report needs, oldest first.
+    ///
+    /// One query and one pass, deliberately. A report card wants a dozen
+    /// different aggregates per period — counts, distincts, top artist, an
+    /// hour histogram, genre shares, repeat days — and the periods themselves
+    /// depend on the user's timezone, which SQL here cannot bucket by. Doing it
+    /// as a dozen queries per period would be hundreds of round trips for a
+    /// year of months; doing it in Rust from one ordered scan is a few
+    /// milliseconds.
+    ///
+    /// **Ascending**, unlike every other listing query, because "the first time
+    /// you played this artist" is what makes a discovery a discovery — walking
+    /// forwards means first-seen is simply the first time a name appears.
+    pub async fn report_rows(
+        &self,
+        user_id: i64,
+        limit: i64,
+    ) -> Result<Vec<ReportRow>, sqlx::Error> {
+        sqlx::query_as(
+            "SELECT timestamp, artist, title, album, duration, genres, chain_id
+             FROM scrobbles
+             WHERE user_id = ? AND skipped = FALSE
+             ORDER BY timestamp ASC LIMIT ?",
+        )
+        .bind(user_id)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+    }
+
+    /// Sides played by hand, for the "off the shelf" block.
+    pub async fn physical_plays_in(
+        &self,
+        user_id: i64,
+        from: i64,
+        to: i64,
+    ) -> Result<Vec<(String, String, String, i64)>, sqlx::Error> {
+        sqlx::query_as(
+            "SELECT r.title, r.artist, p.side, COUNT(*) AS spins
+             FROM physical_plays p JOIN physical_releases r ON r.id = p.release_id
+             WHERE p.user_id = ? AND p.played_at >= ? AND p.played_at < ?
+             GROUP BY r.id, p.side ORDER BY spins DESC, r.title",
+        )
+        .bind(user_id)
+        .bind(from)
+        .bind(to)
+        .fetch_all(&self.pool)
+        .await
+    }
+
     /// Minimal columns for analytics: (timestamp, artist, title, album, track_number).
     /// Capped to the most-recent `limit` rows to bound memory on large histories.
     pub async fn get_listen_rows(
@@ -6540,6 +6590,20 @@ pub enum PairingPoll {
     /// server — the handler reports both the same way, so polling cannot be
     /// used to learn whether a device code was ever real.
     Unknown,
+}
+
+/// One listen, as a report reads it.
+#[derive(Debug, FromRow)]
+pub struct ReportRow {
+    pub timestamp: i64,
+    pub artist: String,
+    pub title: String,
+    pub album: Option<String>,
+    pub duration: Option<i64>,
+    /// JSON array of tag names, written by the genre backfill. Absent until
+    /// that listen has been enriched.
+    pub genres: Option<String>,
+    pub chain_id: Option<i64>,
 }
 
 /// What an API token resolves to. The id is carried because a session is now

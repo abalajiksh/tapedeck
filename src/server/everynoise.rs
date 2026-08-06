@@ -214,7 +214,7 @@ pub async fn clear(State(state): State<Arc<AppState>>, user: AuthUser) -> impl I
 /// directly is the classic mistake: it drags everything toward mud, and with a
 /// few hundred genres in the mix the result would be the same brown-grey for
 /// everybody, which would make the feature look broken rather than personal.
-fn blend(weighted: &[(&str, i64)]) -> Option<String> {
+pub(crate) fn blend(weighted: &[(&str, i64)]) -> Option<String> {
     let to_linear = |c: f64| {
         let c = c / 255.0;
         if c <= 0.04045 {

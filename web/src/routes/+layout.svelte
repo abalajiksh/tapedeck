@@ -25,6 +25,7 @@
 		{ href: '/search', label: 'Search', icon: 'search' },
 		{ href: '/charts', label: 'Top Charts', icon: 'charts' },
 		{ href: '/stats', label: 'Statistics', icon: 'stats' },
+		{ href: '/reports', label: 'Reports', icon: 'reports' },
 		{ href: '/notes', label: 'Liner Notes', icon: 'notes' },
 		{ href: '/shelf', label: 'Vinyl & Tape', icon: 'shelf' },
 		{ href: '/rediscover', label: 'Rediscovery', icon: 'rediscover' },
@@ -154,6 +155,7 @@
 						{:else if item.icon === 'search'}<svg viewBox="0 0 24 24" width="20" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"/><path d="M20 20l-3.6-3.6"/></svg>
 						{:else if item.icon === 'charts'}<svg viewBox="0 0 24 24" width="20" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><path d="M8 21h8"/><path d="M12 17v4"/><path d="M7 4h10v4a5 5 0 0 1-10 0z"/><path d="M17 5h3v2a3 3 0 0 1-3 3"/><path d="M7 5H4v2a3 3 0 0 0 3 3"/></svg>
 					{:else if item.icon === 'stats'}<svg viewBox="0 0 24 24" width="20" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><path d="M4 20V4"/><path d="M4 20h16"/><rect x="7" y="11" width="3.2" height="6" rx="1"/><rect x="13.5" y="7" width="3.2" height="10" rx="1"/></svg>
+					{:else if item.icon === 'reports'}<svg viewBox="0 0 24 24" width="20" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><path d="M6 3h9l4 4v14a1 1 0 0 1-1 1H6a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1z"/><path d="M14 3v5h5"/><path d="M9 13h6"/><path d="M9 17h4"/></svg>
 						{:else if item.icon === 'import'}<svg viewBox="0 0 24 24" width="20" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12"/><path d="M8 11l4 4 4-4"/><path d="M5 21h14"/></svg>
 						{:else if item.icon === 'notes'}<svg viewBox="0 0 24 24" width="20" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><path d="M6 4h9l4 4v12H6z"/><path d="M9 12h7"/><path d="M9 16h5"/></svg>
 						{:else if item.icon === 'map'}<svg viewBox="0 0 24 24" width="20" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><path d="M9 4 3 6.5v13L9 17l6 2.5 6-2.5v-13L15 7z"/><path d="M9 4v13"/><path d="M15 7v12.5"/></svg>
