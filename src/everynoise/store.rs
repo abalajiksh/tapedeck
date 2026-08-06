@@ -454,8 +454,7 @@ impl EveryNoiseStore {
                   WHERE e.relation = ? AND e.genre_slug IN ({})",
                 placeholders
             );
-            let mut q =
-                sqlx::query_as::<_, (String, String, String, f64, f64, String, i64)>(&sql);
+            let mut q = sqlx::query_as::<_, (String, String, String, f64, f64, String, i64)>(&sql);
             q = q.bind(relation);
             for s in chunk {
                 q = q.bind(s);

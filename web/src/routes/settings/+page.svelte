@@ -45,6 +45,7 @@
 	// implied by `submit`. A scrobble client that only posts listens has no
 	// business enumerating your gear.
 	let newTokenRead = false;
+	let newTokenWrite = false;
 
 	// ── Pairing a device ──
 	// For clients with no browser: they show a code, you type it here.
@@ -635,13 +636,14 @@
 		createdToken = '';
 		try {
 			const result = await api.createToken(newTokenName.trim(), {
-				scopes: newTokenRead ? 'submit read' : 'submit',
+				scopes: ['submit', newTokenRead && 'read', newTokenWrite && 'write'].filter(Boolean).join(' '),
 				default_chain_id: newTokenChain ? Number(newTokenChain) : null
 			});
 			createdToken = result.token;
 			newTokenName = '';
 			newTokenChain = '';
 			newTokenRead = false;
+			newTokenWrite = false;
 			tokens = (await api.getTokens()).tokens;
 		} catch (e) { console.error('Create token failed:', e); }
 		creating = false;
@@ -1053,6 +1055,10 @@
 							<input type="checkbox" bind:checked={newTokenRead} style="width:16px;height:16px;accent-color:var(--td-accent);cursor:pointer;">
 							Allow reading
 						</label>
+						<label style="display:flex;align-items:center;gap:7px;font-size:13px;color:var(--td-muted);white-space:nowrap;">
+							<input type="checkbox" bind:checked={newTokenWrite} style="width:16px;height:16px;accent-color:var(--td-accent);cursor:pointer;">
+							Allow writing
+						</label>
 						<button class="btn btn-primary" on:click={createToken} disabled={creating || !newTokenName.trim()}>{creating ? '…' : 'Create'}</button>
 					</div>
 					<p style="font-size:12px;color:var(--td-muted-2);margin:10px 0 0;">
@@ -1060,6 +1066,8 @@
 						A listen that carries its own chain, or arrives through a mapped output, still wins.
 						<br>
 						<strong>Allow reading</strong> additionally lets the app list your chains, devices, gear and what's playing — so it can offer a chain picker instead of asking you to type a name. It can still only read your own data, and can't change anything.
+						<br>
+						<strong>Allow writing</strong> lets it edit and delete your listens, and save loves and liner notes. The two are separate grants and neither implies the other, so give an app only what it needs. Neither one reaches your sources, your forwarding connections, an export of your data, or anything under user management — those stay signed-in-browser only. If a device is lost, revoke its token here.
 					</p>
 					<p style="font-size:12px;color:var(--td-muted-2);margin:8px 0 0;">Writes and admin actions always require signing in here — a token can never do either.</p>
 				{/if}

@@ -8,7 +8,7 @@ use axum::{
 use serde::Deserialize;
 use std::sync::Arc;
 
-use super::auth::AuthUser;
+use super::auth::{AuthUser, ReadAuth, WriteAuth};
 use super::models::ErrorResponse;
 use super::AppState;
 
@@ -26,7 +26,7 @@ pub struct ScrobblesQuery {
 /// GET /api/v1/scrobbles
 async fn list_scrobbles(
     State(state): State<Arc<AppState>>,
-    user: AuthUser,
+    ReadAuth { user }: ReadAuth,
     Query(params): Query<ScrobblesQuery>,
 ) -> impl IntoResponse {
     let limit = params.limit.unwrap_or(50).clamp(1, 500);
@@ -406,7 +406,10 @@ async fn sanitize_apply(
 }
 
 /// GET /api/v1/stats/dashboard
-async fn dashboard_stats(State(state): State<Arc<AppState>>, user: AuthUser) -> impl IntoResponse {
+async fn dashboard_stats(
+    State(state): State<Arc<AppState>>,
+    ReadAuth { user }: ReadAuth,
+) -> impl IntoResponse {
     let tz = user_tz(&state, user.user_id).await;
     let week_start_day = user_week_start(&state, user.user_id).await;
     match state.db.get_dashboard_stats(user.user_id, tz, week_start_day).await {
@@ -441,7 +444,7 @@ pub struct UpdateScrobble {
 /// PATCH /api/v1/scrobbles/:id — edit a listen (fix MBID / chain / metadata).
 async fn update_scrobble(
     State(state): State<Arc<AppState>>,
-    user: AuthUser,
+    WriteAuth { user }: WriteAuth,
     Path(id): Path<i64>,
     Json(body): Json<UpdateScrobble>,
 ) -> impl IntoResponse {
@@ -476,7 +479,7 @@ async fn update_scrobble(
 /// DELETE /api/v1/scrobbles/:id — remove one listen owned by the user.
 async fn delete_scrobble(
     State(state): State<Arc<AppState>>,
-    user: AuthUser,
+    WriteAuth { user }: WriteAuth,
     Path(id): Path<i64>,
 ) -> impl IntoResponse {
     match state.db.delete_scrobble(user.user_id, id).await {
@@ -583,7 +586,7 @@ fn to_listen_rows(
 /// GET /api/v1/stats?range=week|month|last30|year|all — ranged analytics.
 async fn ranged_stats(
     State(state): State<Arc<AppState>>,
-    user: AuthUser,
+    ReadAuth { user }: ReadAuth,
     Query(q): Query<StatsQuery>,
 ) -> impl IntoResponse {
     let after = range_after(q.range.as_deref());

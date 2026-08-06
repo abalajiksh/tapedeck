@@ -111,13 +111,19 @@
 {:else}
 	<div style="display:flex;min-height:100vh;">
 		<!-- SIDEBAR -->
+		<!-- `overflow:hidden` plus a scrolling `nav` is what makes this usable on a
+		     short screen. The aside is a fixed `100vh` flex column, so before this
+		     anything past the fold simply painted outside it with no way to reach
+		     it — on a 1366×768 laptop that was the version line and the theme
+		     toggle. Only the nav scrolls: the brand stays put at the top and the
+		     footer stays put at the bottom, which is where people look for them. -->
 		<aside
-			style="background:var(--td-sidebar);border-right:1px solid var(--td-border);display:flex;flex-direction:column;
+			style="background:var(--td-sidebar);border-right:1px solid var(--td-border);display:flex;flex-direction:column;overflow:hidden;
 			{isMobile
 				? `position:fixed;top:0;left:0;z-index:60;width:260px;max-width:82vw;height:100vh;transform:translateX(${navOpen ? '0' : '-102%'});transition:transform .3s cubic-bezier(.4,0,.2,1);box-shadow:${navOpen ? '0 0 40px rgba(46,43,37,.3)' : 'none'};`
 				: 'width:250px;flex:none;position:sticky;top:0;height:100vh;'}"
 		>
-			<div style="display:flex;align-items:center;gap:12px;padding:22px 22px 18px;">
+			<div style="flex:none;display:flex;align-items:center;gap:12px;padding:22px 22px 18px;">
 				<div style="display:inline-flex;align-items:center;justify-content:center;width:42px;height:42px;border-radius:13px;background:var(--td-panel);">
 					<svg viewBox="0 0 32 20" width="24" fill="none"><rect x="1" y="1" width="30" height="18" rx="4" stroke="#f4e7cf" stroke-width="1.7"/><circle cx="11" cy="11" r="3.2" stroke="#c67139" stroke-width="1.7"/><circle cx="21" cy="11" r="3.2" stroke="#7a8a5e" stroke-width="1.7"/></svg>
 				</div>
@@ -132,7 +138,10 @@
 				{/if}
 			</div>
 
-			<nav style="display:flex;flex-direction:column;gap:3px;padding:8px 12px;flex:1;">
+			<!-- `min-height:0` is the load-bearing half: without it a flex child
+			     refuses to shrink below its content, so `overflow-y:auto` never
+			     engages and the links still overflow the column. -->
+			<nav class="nav-scroll" style="display:flex;flex-direction:column;gap:3px;padding:8px 12px;flex:1;min-height:0;overflow-y:auto;">
 				{#each nav as item}
 					<a
 						href={item.href}
@@ -167,7 +176,7 @@
 				<a
 					href="/"
 					on:click={() => (navOpen = false)}
-					style="margin:8px 12px 14px;padding:12px 14px;border-radius:18px;background:var(--td-panel);color:#f4e7cf;text-decoration:none;display:block;"
+					style="flex:none;margin:8px 12px 14px;padding:12px 14px;border-radius:18px;background:var(--td-panel);color:#f4e7cf;text-decoration:none;display:block;"
 				>
 					<div style="display:flex;align-items:center;gap:8px;margin-bottom:8px;">
 						<span style="width:7px;height:7px;border-radius:50%;background:#e07a55;animation:td-blink 1.6s ease-in-out infinite;"></span>
@@ -178,7 +187,7 @@
 				</a>
 			{/if}
 
-			<div style="padding:2px 12px 14px;display:flex;align-items:center;justify-content:space-between;gap:10px;">
+			<div style="flex:none;padding:2px 12px 14px;display:flex;align-items:center;justify-content:space-between;gap:10px;border-top:1px solid var(--td-border);padding-top:10px;">
 				<span style="font-size:11px;color:var(--td-muted-2);padding-left:10px;">
 					{serverVersion ? `server v${serverVersion} · ` : ''}ui v{__UI_VERSION__}
 				</span>
@@ -217,6 +226,31 @@
 {/if}
 
 <style>
+	/* A visible scrollbar in a 250px sidebar is mostly noise, but it must not be
+	   invisible either — the whole bug was not knowing there was more below.
+	   A thin, muted track appears on hover and when scrolling. */
+	.nav-scroll {
+		scrollbar-width: thin;
+		scrollbar-color: transparent transparent;
+		transition: scrollbar-color 0.2s;
+	}
+	.nav-scroll:hover {
+		scrollbar-color: var(--td-track) transparent;
+	}
+	.nav-scroll::-webkit-scrollbar {
+		width: 8px;
+	}
+	.nav-scroll::-webkit-scrollbar-thumb {
+		background: transparent;
+		border-radius: 999px;
+		border: 2px solid transparent;
+		background-clip: content-box;
+	}
+	.nav-scroll:hover::-webkit-scrollbar-thumb {
+		background: var(--td-track);
+		background-clip: content-box;
+	}
+
 	.navlink {
 		display: flex;
 		align-items: center;

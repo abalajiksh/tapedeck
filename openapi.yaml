@@ -1,0 +1,3392 @@
+openapi: 3.1.0
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Tapedeck HTTP API
+#
+# Hand-written, deliberately. utoipa derives schemas from typed response
+# structs, and this codebase has five of them against 278 hand-built
+# `serde_json::json!` bodies — deriving would degenerate into writing the same
+# YAML inside a macro DSL, scattered across 126 handlers. Revisit if typed
+# response structs ever land.
+#
+# Schema depth is tiered on purpose, because a *wrong* schema is worse than a
+# missing one — a client author trusts it and gets a runtime crash.
+#
+#   Tier 1 (client-facing): auth, listens, stats, loves, notes, now-playing,
+#     chains. Properties derived by reading the handler. Trust these.
+#   Tier 2 (admin, maintenance, settings): path, method, auth and a described
+#     but loose body. `additionalProperties: true` means "not fully mapped",
+#     not "anything goes".
+#
+# `tests::openapi_matches_the_router` walks `.route("…")` literals in both
+# directions: every route must appear here, and every path here must exist in
+# the router. Add an endpoint, add it here, or the build fails.
+# ─────────────────────────────────────────────────────────────────────────────
+
+info:
+  title: Tapedeck
+  version: 0.39.0
+  summary: Self-hosted scrobbler and listening journal.
+  description: |
+    Tapedeck ingests listens, enriches them with MusicBrainz metadata, stores
+    them in SQLite and forwards them to Last.fm / ListenBrainz / Libre.fm. It
+    also records *how* you listened — signal chains, gear, audio quality — which
+    is the part no other scrobbler models.
+
+    ## Three auth mechanisms, and they are not interchangeable
+
+    | | How | Reaches |
+    |---|---|---|
+    | **Session cookie** | `td_session`, set by `POST /api/v1/auth/login` | everything |
+    | **API token** | `Authorization: Token <t>` | `/1/*`, plus whatever its scopes allow |
+    | **Metrics bearer** | `Authorization: Bearer <t>` | `GET /metrics` only |
+
+    ### Token scopes
+
+    `tokens.scopes` is a space- or comma-separated set. Three grants matter, and
+    **none of them implies another**:
+
+    * `submit` — post listens (`POST /1/submit-listens`). Every scrobble client
+      has this; it must not carry the power to delete the history it appends to.
+    * `read` *(since v0.37)* — read your own data on the endpoints marked
+      `read` below.
+    * `write` *(since v0.39)* — change your own data on the endpoints marked
+      `write`.
+
+    `all` grants both `read` and `write`. Matching is exact — a scope of
+    `rewrite` does not grant `write`.
+
+    A valid token that lacks the required scope gets **403, not 401**. It
+    authenticated fine and re-authenticating will not help; a 401 would send a
+    client into a token-refresh loop it cannot win.
+
+    ### What a token can never reach
+
+    Everything under `/admin/`, plus your sources, your forwarding connections,
+    Discogs credentials, data export/backup, the sanitiser and the enrichment
+    jobs. Those are **session-only, permanently**. A leaked token is a bad
+    afternoon; a leaked token that can mint more tokens, read another household
+    member's data, or repoint where your listens are forwarded is a different
+    category. Requests to them with a token get 401.
+
+    ## Getting a token
+
+    Two ways, and neither asks anyone to type a token by hand:
+
+    * **Device-code pairing** — `POST /1/pair/start`, poll `/1/pair/poll` while
+      the user approves the short code in Settings. For clients with no browser.
+    * **Password → token** — post credentials to `POST /api/v1/auth/login`,
+      then mint a named token. This is the phone's flow. A named token appears
+      in Settings and can be revoked when the device is lost; a session cookie
+      expires hard at 7 days with no sliding renewal and cannot be told apart
+      from any other browser.
+
+    ## Conventions
+
+    * Timestamps are **Unix seconds, UTC**, and always the *start* of play.
+    * Errors are `{ "code": <int>, "error": "<message>" }` with a matching HTTP
+      status.
+    * Every user-scoped query is filtered by the caller's own `user_id`. Scopes
+      widen *who may ask*, never *whose data is returned*.
+    * Counting endpoints exclude skipped listens (`skipped = FALSE`).
+
+    ## Instance-specific
+
+    `GET /api/openapi.yaml` serves this document from the running binary, so a
+    client can ask *its own server* what that version supports rather than
+    guessing from a hosted copy.
+
+  license:
+    name: AGPL-3.0-or-later
+  contact:
+    name: Tapedeck
+    url: https://codeberg.org/abksh/tapedeck
+
+servers:
+  - url: /
+    description: The Tapedeck instance serving this document.
+
+tags:
+  - name: Auth
+    description: Login, first-run setup, session state.
+  - name: ListenBrainz
+    description: |
+      ListenBrainz-compatible surface under `/1/`. Shapes follow the LB Core
+      API because clients branch on those exact fields. Two deliberate
+      divergences: these require auth and are scoped to the caller (LB serves
+      them publicly; a self-hosted instance must not), and an invalid token on
+      `validate-token` is `200 {valid:false}`, never 401, because clients read
+      the field.
+  - name: Pairing
+    description: Device-code pairing for clients with no browser.
+  - name: Listens
+    description: The scrobble history — read, edit, delete, search.
+  - name: Statistics
+    description: Aggregations, charts, personality.
+  - name: Library
+    description: Album, artist and entity pages.
+  - name: Loves
+    description: Loved recordings, releases and artists.
+  - name: Notes
+    description: Liner notes — your own writing about records.
+  - name: Sessions
+    description: Contiguous listening, grouped.
+  - name: Chains
+    description: Signal chains, gear, devices and bindings.
+  - name: Shelf
+    description: Vinyl and tape — a shelf you catalogue and sides you play.
+  - name: Genre map
+    description: Every Noise at Once — coverage, colour, trajectory, neighbours.
+  - name: Rediscovery
+    description: Five lists, all built from your own history.
+  - name: Sources
+    description: Where listens are polled from. Session-only — holds credentials.
+  - name: Connections
+    description: Where listens are forwarded. Session-only — holds credentials.
+  - name: Import & export
+    description: Bulk in and out. Session-only.
+  - name: Maintenance
+    description: Enrichment backfills and the metadata sanitiser. Session-only.
+  - name: Settings
+    description: Preferences and artwork.
+  - name: Admin
+    description: Users, tokens, genre-map scrape. Session-only, admin role.
+  - name: Ops
+    description: Health, metrics, log level.
+
+security:
+  - sessionCookie: []
+
+components:
+  securitySchemes:
+    sessionCookie:
+      type: apiKey
+      in: cookie
+      name: td_session
+      description: |
+        Set by `POST /api/v1/auth/login`. `HttpOnly`, `SameSite=Lax`, and
+        `Secure` when the instance can tell the browser used HTTPS (derived
+        from `X-Forwarded-Proto`, and only trusted when `trust_proxy` is set —
+        behind a tunnel the origin sees plain HTTP while the client is on TLS).
+        Expires hard at 7 days with no sliding renewal.
+    apiToken:
+      type: apiKey
+      in: header
+      name: Authorization
+      description: |
+        `Authorization: Token <token>`. What the token reaches depends on its
+        scopes — see the description at the top of this document. Lowercase
+        `token ` is also accepted.
+    metricsBearer:
+      type: http
+      scheme: bearer
+      description: |
+        `Authorization: Bearer $TAPEDECK_METRICS_TOKEN`, for `GET /metrics`
+        only. An admin session also works. Never open.
+
+  parameters:
+    Limit:
+      name: limit
+      in: query
+      schema: { type: integer, minimum: 1, default: 50 }
+      description: Page size.
+    Offset:
+      name: offset
+      in: query
+      schema: { type: integer, minimum: 0, default: 0 }
+      description: Rows to skip.
+    StatsRange:
+      name: range
+      in: query
+      description: Time window. Bucketed in the user's own timezone, not UTC.
+      schema:
+        type: string
+        enum: [d7, month, year, all]
+        default: all
+
+  responses:
+    Unauthorized:
+      description: |
+        No valid session cookie or token. Also returned when a *token* is
+        presented to a session-only endpoint — the endpoint does not accept
+        tokens at all, so the scope is irrelevant.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          example: { code: 401, error: "Authentication required. Log in to access this endpoint." }
+    Forbidden:
+      description: |
+        Authenticated, but not permitted. Either the token lacks the required
+        scope, or the endpoint needs the admin role. Deliberately not a 401 —
+        re-authenticating will not help.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          example: { code: 403, error: "This token does not have the 'write' scope" }
+    NotFound:
+      description: No such resource, or it belongs to another user.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    BadRequest:
+      description: Malformed or rejected input.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+
+  schemas:
+    Error:
+      type: object
+      description: Every error body in the API has this shape.
+      required: [code, error]
+      properties:
+        code:
+          type: integer
+          description: Mirrors the HTTP status.
+        error:
+          type: string
+          description: Human-readable. Not a stable identifier — do not branch on it.
+
+    Ok:
+      type: object
+      properties:
+        success: { type: boolean }
+        message: { type: string }
+
+    AudioQuality:
+      type: object
+      description: |
+        How the audio actually sounded. Every field is optional because most
+        sources report none of it — a plugin or a Jellyfin session reports the
+        most, a bare scrobble client none.
+      properties:
+        format: { type: string, description: 'Container/codec, e.g. FLAC, MP3, DSD.' }
+        bitrate: { type: integer, description: kbps. }
+        sample_rate: { type: integer, description: Hz. }
+        bit_depth: { type: integer }
+        channels: { type: integer }
+        lossless: { type: boolean }
+        dsd_rate: { type: integer }
+        dsd_multiplier: { type: string }
+        dsd_to_pcm_converted:
+          type: boolean
+          description: |
+            Derived from the signal chain, not from telemetry. SACD's DSD layer
+            cannot leave a player over coax or optical, so nothing will ever
+            report this directly.
+        delivery_codec:
+          type: string
+          description: |
+            Set **only** when the audio was genuinely transcoded. `DirectStream`
+            remuxes the container without touching the audio and is not a
+            transcode; nor is a video transcode that left the audio alone.
+            Scoring docks points whenever this is set, so filling it on a direct
+            play quietly penalises the best listens on the system.
+        delivery_bitrate: { type: integer, description: kbps. }
+        transcode_reason: { type: string }
+
+    Listen:
+      type: object
+      description: |
+        A stored listen. Tier 1 — these properties are derived from the
+        handler. Extra keys may appear; ignore what you do not know.
+      properties:
+        id: { type: integer }
+        title: { type: string }
+        artist: { type: string }
+        album: { type: [string, 'null'] }
+        artist_credit:
+          type: [string, 'null']
+          description: |
+            The full credit as submitted, kept when the primary artist was
+            folded out of an `Artist feat. X` string. Nothing is lost by that
+            rewrite.
+        timestamp:
+          type: integer
+          description: Unix seconds, UTC, **start** of play.
+        duration: { type: [integer, 'null'], description: Seconds. }
+        track_number: { type: [integer, 'null'] }
+        source_name: { type: string, description: 'Plex, Jellyfin, Navidrome, an app name, Import…' }
+        source_id: { type: string, description: Dedup key. Unique per user per play. }
+        status:
+          type: string
+          enum: [pending, sent, failed, imported]
+          description: |
+            `pending` is queued for forwarding; `imported` is stored only and
+            will never be forwarded. Both an import and a skip land as
+            `imported` — forwarding either would put a wrong scrobble on a
+            permanent public record.
+        skipped:
+          type: boolean
+          description: |
+            Stored, never counted. Every counting query filters these out.
+            Still occupies its `source_id` so it continues to dedup.
+        mbid_recording: { type: [string, 'null'] }
+        mbid_release: { type: [string, 'null'] }
+        mbid_release_group: { type: [string, 'null'] }
+        mbid_artist: { type: [array, 'null'], items: { type: string } }
+        caa_id:
+          type: [integer, 'null']
+          description: |
+            Cover Art Archive id. **`-1` is a tombstone** meaning "asked, no
+            artwork exists" — treat any non-positive value as no artwork.
+        caa_release_mbid: { type: [string, 'null'] }
+        artwork_url:
+          type: [string, 'null']
+          description: |
+            Empty string is a tombstone, same idea as `caa_id: -1`. This column
+            alone is the artwork backfill's queue.
+        release_year: { type: [integer, 'null'] }
+        language: { type: [string, 'null'] }
+        genres: { type: [array, 'null'], items: { type: string } }
+        chain_id: { type: [integer, 'null'], description: Resolved signal chain. }
+        device_id: { type: [integer, 'null'] }
+        session_id: { type: [integer, 'null'] }
+        quality: { $ref: '#/components/schemas/AudioQuality' }
+
+    SubmitListen:
+      type: object
+      description: One listen in a ListenBrainz-shaped submission.
+      required: [track_metadata]
+      properties:
+        listened_at:
+          type: integer
+          description: |
+            Unix seconds, UTC. Required for `single`/`import`, and must be
+            absent for `playing_now`.
+        track_metadata:
+          type: object
+          required: [artist_name, track_name]
+          properties:
+            artist_name: { type: string }
+            track_name: { type: string }
+            release_name: { type: string }
+            additional_info:
+              type: object
+              description: |
+                LB's free-form bag. Tapedeck reads the standard MBID fields,
+                `duration_ms`/`duration`, `tracknumber`, `submission_client`,
+                and its own `tapedeck_*` extensions.
+              additionalProperties: true
+              properties:
+                recording_mbid: { type: string }
+                release_mbid: { type: string }
+                release_group_mbid: { type: string }
+                artist_mbids: { type: array, items: { type: string } }
+                duration_ms: { type: integer }
+                tracknumber: { type: integer }
+                submission_client: { type: string }
+                tapedeck_chain:
+                  type: string
+                  description: |
+                    Signal chain **by name**. Rung 1 of the four-rung ladder:
+                    explicit name → output-device binding → the submitting
+                    token's `default_chain_id` → the source device's default.
+                tapedeck_quality:
+                  $ref: '#/components/schemas/AudioQuality'
+                tapedeck_skipped:
+                  type: boolean
+                  description: Stored, never counted, never forwarded.
+
+    Chain:
+      type: object
+      properties:
+        id: { type: integer }
+        name: { type: string }
+        icon:
+          type: [string, 'null']
+          description: |
+            A name from the UI's `CHAIN_ICONS` set. Unvalidated on purpose — an
+            unknown value falls back to a generic mark rather than erroring, and
+            rejecting a save because the front end learned a new icon first
+            would be the worse failure.
+        is_default: { type: boolean }
+        total_hours: { type: number }
+        components:
+          type: array
+          items:
+            type: object
+            properties:
+              name:
+                type: string
+                description: Always written, so deleting the gear leaves the chain readable.
+              type: { type: string, description: 'source, dac, amp, headphones, …' }
+              equipment_id:
+                type: [integer, 'null']
+                description: Set when picked from your gear, absent for free text.
+
+    Equipment:
+      type: object
+      properties:
+        id: { type: integer }
+        name: { type: string }
+        type: { type: string }
+        brand: { type: [string, 'null'] }
+        total_hours:
+          type: number
+          description: |
+            Derived — summed from every chain referencing this gear, never
+            accumulated. Free-text chain steps report zero, which is honest.
+
+    NowPlaying:
+      type: object
+      description: |
+        Never persisted. Held in memory only, so a restart correctly shows an
+        empty deck until a source reports again.
+      properties:
+        playing: { type: boolean }
+        position: { type: [integer, 'null'], description: Seconds into the track. }
+        track:
+          oneOf:
+            - $ref: '#/components/schemas/Listen'
+            - type: 'null'
+
+    Note:
+      type: object
+      description: |
+        A liner note. Hangs off **either** an entity **or** a listen, never
+        both — a CHECK constraint enforces it.
+      properties:
+        id: { type: integer }
+        entity_id: { type: [integer, 'null'] }
+        scrobble_id: { type: [integer, 'null'] }
+        body: { type: string, description: Markdown, as stored. }
+        body_html:
+          type: string
+          description: |
+            Rendered and sanitised server-side, with shortcodes resolved. Safe
+            to inject. An unresolved shortcode renders as dotted-underline text
+            (`.td-unresolved`), never an error.
+        visibility:
+          type: string
+          enum: [private, patched, public]
+          description: |
+            Stored, but **every read path is still self-only**. `public` becomes
+            meaningful when the social phase lands, not now.
+        created_at: { type: integer }
+        updated_at: { type: integer }
+
+    Entity:
+      type: object
+      description: |
+        An artist, release or recording you have annotated or loved. MBIDs are
+        an alias, never the key — most of a library is un-enriched and those are
+        exactly the records worth annotating.
+      properties:
+        id: { type: integer }
+        kind: { type: string, enum: [artist, release, recording] }
+        name: { type: string }
+        artist_name: { type: [string, 'null'] }
+        mbid: { type: [string, 'null'] }
+
+    NeighbourGenre:
+      type: object
+      description: |
+        A genre bordering your listening. **`your_artists` and
+        `exemplar_artists` are never both populated** — that separation is the
+        vision rule made structural, so nothing can present an Every Noise
+        exemplar as something the listener owns.
+      properties:
+        name: { type: string }
+        x: { type: number }
+        y: { type: number }
+        color: { type: string }
+        borders: { type: integer, description: How many of your top genres border it. }
+        affinity:
+          type: number
+          description: '`plays / sqrt(rank + 1)`, summed. Weights by your play counts and discounts by Every Noise''s own neighbour rank.'
+        your_plays: { type: integer }
+        your_artists:
+          type: array
+          description: From **your own history**. Empty is what puts a genre in `unexplored`.
+          items:
+            type: object
+            properties:
+              artist: { type: string }
+              plays: { type: integer }
+        exemplar_artists:
+          type: array
+          description: |
+            **Every Noise's exemplars — not your music.** Set only where
+            `your_artists` is empty. Requires a tier-2 scrape; empty otherwise.
+          items: { type: string }
+
+    Love:
+      type: object
+      properties:
+        entity_id: { type: integer }
+        entity_key:
+          type: string
+          description: |
+            `kind|artist|name`, trimmed and lowercased; an artist's `artist`
+            half is empty. The client derives this to fill hearts without one
+            request per row. Must stay in step with the server's `entity_key`.
+        kind: { type: string, enum: [artist, release, recording] }
+        name: { type: string }
+        artist: { type: [string, 'null'] }
+        loved_at: { type: integer }
+
+paths:
+
+  # ── Ops ────────────────────────────────────────────────────────────────────
+  /api/openapi.yaml:
+    get:
+      tags: [Ops]
+      summary: This document.
+      description: |
+        Unauthenticated by design — it describes the shape of the API, not any
+        data, and a client needs to read it *before* it has a credential.
+
+        Served from the binary because it is the one thing a separately hosted
+        docs site cannot do: describe **this** instance at **this** version. For
+        a self-hosted app that beats any version dropdown — ask your own server
+        what it supports rather than guessing.
+      security: []
+      responses:
+        '200':
+          description: The OpenAPI document.
+          content:
+            application/yaml: { schema: { type: string } }
+
+  /health:
+    get:
+      tags: [Ops]
+      summary: Liveness and database reachability.
+      security: []
+      responses:
+        '200':
+          description: OK.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string }
+                  service: { type: string }
+                  database: { type: string }
+                  version: { type: string }
+              example: { status: ok, service: tapedeck, database: ok, version: 0.38.0 }
+
+  /metrics:
+    get:
+      tags: [Ops]
+      summary: Prometheus metrics.
+      description: |
+        Never open — an **admin** session, or `Authorization: Bearer
+        $TAPEDECK_METRICS_TOKEN`. The metrics that matter are the per-job import
+        gauges and `process_resident_memory_bytes` (Linux only), which is what
+        distinguishes a stall from a slowdown from an OOM on a small host.
+      security:
+        - sessionCookie: []
+        - metricsBearer: []
+      responses:
+        '200':
+          description: Prometheus text exposition format.
+          content:
+            text/plain: { schema: { type: string } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /log-level:
+    get:
+      tags: [Ops]
+      summary: Current tracing filter.
+      responses:
+        '200':
+          description: OK.
+          content:
+            application/json:
+              schema: { type: object, properties: { level: { type: string } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+    post:
+      tags: [Ops]
+      summary: Change the tracing filter at runtime.
+      description: Swaps the live `EnvFilter`. No restart, no config edit.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [level]
+              properties:
+                level: { type: string, example: 'tapedeck=debug,info' }
+      responses:
+        '200': { description: Applied., content: { application/json: { schema: { $ref: '#/components/schemas/Ok' } } } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  # ── Auth ───────────────────────────────────────────────────────────────────
+  /api/v1/auth/status:
+    get:
+      tags: [Auth]
+      summary: Whether anyone is signed in, and whether this instance needs setup.
+      description: The SPA's gate. The only unauthenticated read in the API.
+      security: []
+      responses:
+        '200':
+          description: OK.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  authenticated: { type: boolean }
+                  is_admin: { type: boolean }
+                  needs_setup:
+                    type: boolean
+                    description: True until the first admin exists. There is no self-registration.
+
+  /api/v1/auth/setup:
+    post:
+      tags: [Auth]
+      summary: Create the first admin account.
+      description: |
+        First run only — refused once any user exists. Returns a session cookie
+        **and** an API token, the latter shown exactly once.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [username, password]
+              properties:
+                username: { type: string }
+                password: { type: string, minLength: 8 }
+                display_name: { type: string }
+      responses:
+        '200':
+          description: Created. Sets `td_session`.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  user_id: { type: integer }
+                  username: { type: string }
+                  token: { type: string, description: Shown once, never again. }
+                  message: { type: string }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '409': { description: Already set up. }
+
+  /api/v1/auth/login:
+    post:
+      tags: [Auth]
+      summary: Sign in.
+      description: |
+        Sets the `td_session` cookie. Rate limited on repeated failure.
+
+        **This is the mobile flow.** Post credentials once, then mint a named
+        token and store that — the cookie expires hard at 7 days with no sliding
+        renewal, and cannot be revoked per device.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [username, password]
+              properties:
+                username: { type: string }
+                password: { type: string }
+      responses:
+        '200':
+          description: Signed in. Sets `td_session`.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  user_id: { type: integer }
+                  username: { type: string }
+                  is_admin: { type: boolean }
+        '401': { description: Bad credentials, or the account is disabled. }
+        '429': { description: Too many attempts. }
+
+  /api/v1/auth/logout:
+    post:
+      tags: [Auth]
+      summary: Sign out.
+      description: |
+        Clears the session. The clear cookie carries identical attributes to the
+        one that was set — mismatched attributes make logout silently fail.
+      responses:
+        '200': { description: Signed out., content: { application/json: { schema: { $ref: '#/components/schemas/Ok' } } } }
+
+  /api/v1/auth/me:
+    get:
+      tags: [Auth]
+      summary: The signed-in user.
+      responses:
+        '200':
+          description: OK.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  user_id: { type: integer }
+                  username: { type: string }
+                  display_name: { type: [string, 'null'] }
+                  is_admin: { type: boolean }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  # ── ListenBrainz-compatible ────────────────────────────────────────────────
+  /1/submit-listens:
+    post:
+      tags: [ListenBrainz]
+      summary: Submit listens.
+      description: |
+        Accepts a session cookie or any valid token — this is the one endpoint a
+        `submit`-scoped token reaches.
+
+        **`listen_type` decides forwarding**, and getting it wrong rewrites
+        someone's permanent public history. `single` and `playing_now` are live
+        and will be forwarded; `import` is stored only and never forwarded
+        *(since v0.26 — before that, an import was forwarded like a live
+        listen)*.
+
+        Dedup is on `(user_id, source_id, source_name)` plus a fuzzy window, so
+        re-sending the same listen is safe. Max 1000 listens per request.
+      security:
+        - apiToken: []
+        - sessionCookie: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [listen_type, payload]
+              properties:
+                listen_type:
+                  type: string
+                  enum: [single, playing_now, import]
+                payload:
+                  type: array
+                  minItems: 1
+                  maxItems: 1000
+                  items: { $ref: '#/components/schemas/SubmitListen' }
+      responses:
+        '200':
+          description: |
+            Accepted. Per-listen results are reported rather than the whole
+            batch failing — one bad row must not lose the other 999.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, example: ok }
+                  accepted: { type: integer }
+                  duplicates: { type: integer }
+                  rejected:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        index: { type: integer }
+                        reason: { type: string }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /1/validate-token:
+    get:
+      tags: [ListenBrainz]
+      summary: Check a token.
+      description: |
+        An invalid token is **`200 {valid:false}`, never 401** — LB clients read
+        the field, and a 401 sends them into a refresh loop.
+      security:
+        - apiToken: []
+      responses:
+        '200':
+          description: Always 200, valid or not.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  code: { type: integer }
+                  message: { type: string }
+                  valid: { type: boolean }
+                  user_name: { type: [string, 'null'] }
+
+  /1/user/{user}/listens:
+    get:
+      tags: [ListenBrainz]
+      summary: A user's listens, LB-shaped.
+      description: |
+        **Scoped to the caller.** LB serves this publicly; a self-hosted
+        instance must not, so asking for another user's listens is refused.
+      security: [{ apiToken: [] }, { sessionCookie: [] }]
+      parameters:
+        - { name: user, in: path, required: true, schema: { type: string } }
+        - { name: count, in: query, schema: { type: integer, default: 25 } }
+        - { name: min_ts, in: query, schema: { type: integer } }
+        - { name: max_ts, in: query, schema: { type: integer } }
+      responses:
+        '200':
+          description: OK.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  payload:
+                    type: object
+                    properties:
+                      count: { type: integer }
+                      user_id: { type: string }
+                      listens: { type: array, items: { type: object, additionalProperties: true } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /1/user/{user}/playing-now:
+    get:
+      tags: [ListenBrainz]
+      summary: What is on the deck, LB-shaped.
+      security: [{ apiToken: [] }, { sessionCookie: [] }]
+      parameters:
+        - { name: user, in: path, required: true, schema: { type: string } }
+      responses:
+        '200':
+          description: OK. `count` is 0 when nothing is playing.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  payload:
+                    type: object
+                    properties:
+                      count: { type: integer }
+                      playing_now: { type: boolean }
+                      listens: { type: array, items: { type: object, additionalProperties: true } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /1/user/{user}/listen-count:
+    get:
+      tags: [ListenBrainz]
+      summary: Total listens. Excludes skips.
+      security: [{ apiToken: [] }, { sessionCookie: [] }]
+      parameters:
+        - { name: user, in: path, required: true, schema: { type: string } }
+      responses:
+        '200':
+          description: OK.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  payload: { type: object, properties: { count: { type: integer } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /1/user/{user}/services:
+    get:
+      tags: [ListenBrainz]
+      summary: Connected forwarding services.
+      security: [{ apiToken: [] }, { sessionCookie: [] }]
+      parameters:
+        - { name: user, in: path, required: true, schema: { type: string } }
+      responses:
+        '200':
+          description: OK.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  services: { type: array, items: { type: string } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /1/playing-now/delete:
+    post:
+      tags: [ListenBrainz]
+      summary: Clear the caller's now-playing entry.
+      security: [{ apiToken: [] }, { sessionCookie: [] }]
+      responses:
+        '200': { description: Cleared., content: { application/json: { schema: { $ref: '#/components/schemas/Ok' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /1/latest-import:
+    get:
+      tags: [ListenBrainz]
+      summary: Timestamp of the caller's most recent import.
+      security: [{ apiToken: [] }, { sessionCookie: [] }]
+      parameters:
+        - { name: user_name, in: query, schema: { type: string } }
+      responses:
+        '200':
+          description: OK.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  musicbrainz_id: { type: string }
+                  latest_import: { type: integer }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+    post:
+      tags: [ListenBrainz]
+      summary: Record an import high-water mark.
+      security: [{ apiToken: [] }, { sessionCookie: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [ts]
+              properties: { ts: { type: integer } }
+      responses:
+        '200': { description: Stored., content: { application/json: { schema: { $ref: '#/components/schemas/Ok' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  # ── Pairing ────────────────────────────────────────────────────────────────
+  /1/pair/start:
+    post:
+      tags: [Pairing]
+      summary: Begin device-code pairing.
+      description: |
+        Unauthenticated by design — the client has no credential yet. Returns a
+        `device_code` to poll with and a short `user_code` for the human to type
+        into Settings.
+
+        Vocabulary echoes RFC 8628 because client authors have met that shape,
+        but this is **not OAuth**: no client registration, no `client_id`, and
+        the result is an ordinary Tapedeck token.
+
+        The user code is eight characters and therefore guessable, so its safety
+        is structural: a five-minute window, single use in both directions, rate
+        limiting, and approval requiring a signed-in session.
+      security: []
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                client_name: { type: string, description: Shown to the user when approving. Name it per device. }
+                scopes: { type: string, description: 'Space-separated, e.g. "submit read".' }
+      responses:
+        '200':
+          description: Pairing started.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  device_code: { type: string }
+                  user_code: { type: string }
+                  expires_in: { type: integer, description: Seconds. Five minutes. }
+                  interval: { type: integer, description: Minimum seconds between polls. }
+        '429': { description: Rate limited. }
+
+  /1/pair/poll:
+    post:
+      tags: [Pairing]
+      summary: Poll for approval.
+      description: |
+        Returns `authorization_pending` until approved, then the token **once** —
+        it is deleted from the request the moment it is collected. Expired and
+        unknown device codes are reported identically, so polling cannot be used
+        to learn whether a code was ever real.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [device_code]
+              properties: { device_code: { type: string } }
+      responses:
+        '200':
+          description: Approved. The token is in this body and nowhere else.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  token: { type: string }
+                  user_name: { type: string }
+        '400':
+          description: '`authorization_pending`, `expired_token`, or an unknown code.'
+          content:
+            application/json:
+              schema:
+                type: object
+                properties: { error: { type: string, enum: [authorization_pending, expired_token] } }
+        '429': { description: Polling too fast. }
+
+  /api/v1/pair/{user_code}:
+    get:
+      tags: [Pairing]
+      summary: Describe a pending pairing, for the approval screen.
+      description: Requires a signed-in session — this is the browser half.
+      parameters:
+        - { name: user_code, in: path, required: true, schema: { type: string } }
+      responses:
+        '200':
+          description: OK.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  client_name: { type: string }
+                  scopes: { type: string }
+                  can_read: { type: boolean }
+                  approved: { type: boolean }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /api/v1/pair/{user_code}/approve:
+    post:
+      tags: [Pairing]
+      summary: Approve a pairing request.
+      description: |
+        Session-only, and single use — approving twice mints nothing the second
+        time. **The token is never in this response**; it goes to the polling
+        client. A live credential in a second place is how it ends up in a
+        screenshot.
+      parameters:
+        - { name: user_code, in: path, required: true, schema: { type: string } }
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                default_chain_id: { type: [integer, 'null'] }
+      responses:
+        '200': { description: Approved., content: { application/json: { schema: { $ref: '#/components/schemas/Ok' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+
+  # ── Listens ────────────────────────────────────────────────────────────────
+  /api/v1/scrobbles:
+    get:
+      tags: [Listens]
+      summary: The listen history.
+      description: 'Scope: `read` *(since v0.39)*. Newest first. Filterable.'
+      security: [{ sessionCookie: [] }, { apiToken: [read] }]
+      parameters:
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Offset'
+        - { name: artist, in: query, schema: { type: string } }
+        - { name: album, in: query, schema: { type: string } }
+        - { name: track, in: query, schema: { type: string } }
+      responses:
+        '200':
+          description: OK.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  scrobbles: { type: array, items: { $ref: '#/components/schemas/Listen' } }
+                  count: { type: integer, description: Total matching, not the page size. }
+                  limit: { type: integer }
+                  offset: { type: integer }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+    delete:
+      tags: [Listens]
+      summary: Delete the caller's entire history.
+      description: |
+        **Session-only and irreversible.** Deliberately not reachable with a
+        `write` token — this is the one listen operation where a lost phone
+        would be unrecoverable. Clears listen-attached notes first, since
+        foreign keys are enforced.
+      responses:
+        '200': { description: Cleared., content: { application/json: { schema: { $ref: '#/components/schemas/Ok' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /api/v1/scrobbles/{id}:
+    patch:
+      tags: [Listens]
+      summary: Edit a listen.
+      description: 'Scope: `write` *(since v0.39)*. Only the caller''s own rows.'
+      security: [{ sessionCookie: [] }, { apiToken: [write] }]
+      parameters: [{ name: id, in: path, required: true, schema: { type: integer } }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              description: Omitted fields are left alone.
+              properties:
+                title: { type: string }
+                artist: { type: string }
+                album: { type: string }
+                timestamp: { type: integer }
+                chain_id: { type: [integer, 'null'] }
+      responses:
+        '200': { description: Updated., content: { application/json: { schema: { $ref: '#/components/schemas/Ok' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    delete:
+      tags: [Listens]
+      summary: Delete one listen.
+      description: 'Scope: `write` *(since v0.39)*. Clears attached notes first.'
+      security: [{ sessionCookie: [] }, { apiToken: [write] }]
+      parameters: [{ name: id, in: path, required: true, schema: { type: integer } }]
+      responses:
+        '200': { description: Deleted., content: { application/json: { schema: { $ref: '#/components/schemas/Ok' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /api/v1/scrobbles/{id}/annotations:
+    get:
+      tags: [Listens, Notes]
+      summary: Notes and loves attached to one listen.
+      description: 'Scope: `read` *(since v0.39)*.'
+      security: [{ sessionCookie: [] }, { apiToken: [read] }]
+      parameters: [{ name: id, in: path, required: true, schema: { type: integer } }]
+      responses:
+        '200':
+          description: OK.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  note: { oneOf: [{ $ref: '#/components/schemas/Note' }, { type: 'null' }] }
+                  loves: { type: array, items: { $ref: '#/components/schemas/Love' } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /api/v1/scrobbles/bulk-chain:
+    post:
+      tags: [Listens, Chains]
+      summary: Attribute many listens to one signal chain.
+      description: Session-only. Retro-attribution after adding gear.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [chain_id]
+              properties:
+                chain_id: { type: [integer, 'null'] }
+                ids: { type: array, items: { type: integer } }
+                from: { type: integer, description: Unix seconds. }
+                to: { type: integer }
+                source_name: { type: string }
+      responses:
+        '200':
+          description: Applied.
+          content:
+            application/json:
+              schema: { type: object, properties: { updated: { type: integer } } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /api/v1/search:
+    get:
+      tags: [Listens]
+      summary: Search your listens.
+      description: |
+        Session-only. Searches `scrobbles`, not `entities` — searching entities
+        would only find records you had already been to.
+      parameters:
+        - { name: q, in: query, required: true, schema: { type: string } }
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: OK.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  artists: { type: array, items: { type: object, additionalProperties: true } }
+                  albums: { type: array, items: { type: object, additionalProperties: true } }
+                  tracks: { type: array, items: { type: object, additionalProperties: true } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /api/v1/now-playing:
+    get:
+      tags: [Listens]
+      summary: What is on the deck.
+      description: |
+        Scope: `read`. In-memory only. Entries expire on read — past `duration`
+        + 10s, or after 10 minutes when the source reported no duration.
+      security: [{ sessionCookie: [] }, { apiToken: [read] }]
+      responses:
+        '200':
+          description: OK.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/NowPlaying' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  # ── Statistics ─────────────────────────────────────────────────────────────
+  /api/v1/stats/dashboard:
+    get:
+      tags: [Statistics]
+      summary: Dashboard counters.
+      description: |
+        Scope: `read` *(since v0.39)*. "Today" and "this week" are bucketed in
+        the user's own timezone and honour their week-start preference.
+      security: [{ sessionCookie: [] }, { apiToken: [read] }]
+      responses:
+        '200':
+          description: OK.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  today: { type: integer }
+                  this_week: { type: integer }
+                  total: { type: integer }
+                  lossless_pct: { type: number }
+                  top_artist: { type: [string, 'null'] }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /api/v1/stats:
+    get:
+      tags: [Statistics]
+      summary: Ranged statistics.
+      description: |
+        Scope: `read` *(since v0.39)*. Totals, top lists (50 rows each), fidelity
+        mix, decades, a 7×24 listening heatmap, breadth, genres and languages.
+
+        The genre breakdown is a share of **tag mentions, not listens** — one
+        track carries several tags. Never present it as a percentage of plays.
+      security: [{ sessionCookie: [] }, { apiToken: [read] }]
+      parameters: [{ $ref: '#/components/parameters/StatsRange' }]
+      responses:
+        '200':
+          description: OK.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  totals:
+                    type: object
+                    properties:
+                      plays: { type: integer }
+                      artists: { type: integer }
+                      albums: { type: integer }
+                      tracks: { type: integer }
+                      hours: { type: number }
+                      avg_quality: { type: number }
+                      lossless_pct: { type: number }
+                      dsd_pct: { type: number }
+                  top_artists: { type: array, items: { type: object, additionalProperties: true } }
+                  top_albums: { type: array, items: { type: object, additionalProperties: true } }
+                  top_tracks: { type: array, items: { type: object, additionalProperties: true } }
+                  fidelity: { type: array, items: { type: object, additionalProperties: true } }
+                  decades: { type: array, items: { type: object, additionalProperties: true } }
+                  heatmap:
+                    type: array
+                    description: Seven rows of 24. Row 0 is Monday.
+                    items: { type: array, items: { type: integer } }
+                  genres: { type: array, items: { type: object, additionalProperties: true } }
+                  languages: { type: array, items: { type: object, additionalProperties: true } }
+                  breadth:
+                    type: object
+                    description: |
+                      Absent until the genre map is fetched and genres backfilled —
+                      "you play 0 genres" would be a lie about the listening
+                      rather than a statement about the data.
+                    properties:
+                      genres_played: { type: integer }
+                      genres_placed: { type: integer }
+                      effective_genres:
+                        type: number
+                        description: '`exp(H)` — as varied as playing N genres equally.'
+                      reach:
+                        type: [number, 'null']
+                        description: Your spread over the map's own spread, 0–1.
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /api/v1/personality:
+    get:
+      tags: [Statistics]
+      summary: Musical personality — a verdict, traits and loyalty.
+      description: Session-only.
+      parameters: [{ $ref: '#/components/parameters/StatsRange' }]
+      responses:
+        '200':
+          description: OK.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  verdict: { type: string }
+                  traits:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        low: { type: string }
+                        high: { type: string }
+                        score: { type: number, description: 0–100. }
+                        evidence: { type: string }
+                  loyalty: { type: array, items: { type: object, additionalProperties: true } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /api/v1/charts:
+    get:
+      tags: [Statistics]
+      summary: Top charts.
+      description: |
+        Session-only. Note this offers a **different range set** from
+        `/api/v1/stats` — it has `today`. The two answering the same question
+        over different windows is known, and is why the Insights redesign wants
+        one shared range control.
+      parameters:
+        - { name: kind, in: query, schema: { type: string, enum: [artists, albums, tracks], default: artists } }
+        - { name: range, in: query, schema: { type: string, enum: [today, d7, month, year, all], default: all } }
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: OK.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  rows:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        name: { type: string }
+                        sub: { type: [string, 'null'], description: Artist, for an album or track row. }
+                        album: { type: [string, 'null'], description: Present on track rows so a track opens the record it is on. }
+                        plays: { type: integer }
+                        seconds: { type: integer }
+                        artwork_url: { type: [string, 'null'] }
+                        caa_id: { type: [integer, 'null'] }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  # ── Library ────────────────────────────────────────────────────────────────
+  /api/v1/resolve:
+    get:
+      tags: [Library]
+      summary: Resolve names to an entity id.
+      description: |
+        Session-only. **Creates the entity on first visit** — a write on a read
+        path, on purpose. The browser knows names, not ids, so without this
+        every link out of the history would be dead until you happened to
+        annotate the thing it points at.
+      parameters:
+        - { name: kind, in: query, required: true, schema: { type: string, enum: [artist, release, recording] } }
+        - { name: artist, in: query, schema: { type: string } }
+        - { name: name, in: query, required: true, schema: { type: string } }
+      responses:
+        '200':
+          description: OK.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Entity' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /api/v1/albums/{id}:
+    get:
+      tags: [Library]
+      summary: An album page.
+      description: |
+        Session-only. Aggregated over `scrobbles` by name. Track rows carry the
+        **raw quality columns**, not a formatted label — the client formats
+        them, so a server-side copy of that logic cannot drift.
+
+        An entity with **zero plays still renders** rather than 404ing:
+        something annotated once and since deleted from the history is still a
+        real record.
+      parameters: [{ name: id, in: path, required: true, schema: { type: integer } }]
+      responses:
+        '200':
+          description: OK.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  entity: { $ref: '#/components/schemas/Entity' }
+                  plays: { type: integer }
+                  tracks: { type: array, items: { type: object, additionalProperties: true } }
+                  bio: { type: [object, 'null'], additionalProperties: true, description: 'Provider description. Carries `attribution` — Last.fm text is CC BY-SA and the credit must travel with it. Render as text, never as HTML.' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /api/v1/artists/{id}:
+    get:
+      tags: [Library]
+      summary: An artist page.
+      description: Session-only. Same shape and same rules as the album page.
+      parameters: [{ name: id, in: path, required: true, schema: { type: integer } }]
+      responses:
+        '200':
+          description: OK.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  entity: { $ref: '#/components/schemas/Entity' }
+                  plays: { type: integer }
+                  albums: { type: array, items: { type: object, additionalProperties: true } }
+                  tracks: { type: array, items: { type: object, additionalProperties: true } }
+                  bio: { type: [object, 'null'], additionalProperties: true }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /api/v1/entities/{id}:
+    get:
+      tags: [Library]
+      summary: One entity.
+      description: 'Scope: `read` *(since v0.39)*. Needed to render a note''s target.'
+      security: [{ sessionCookie: [] }, { apiToken: [read] }]
+      parameters: [{ name: id, in: path, required: true, schema: { type: integer } }]
+      responses:
+        '200': { description: OK., content: { application/json: { schema: { $ref: '#/components/schemas/Entity' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /api/v1/art/{id}:
+    get:
+      tags: [Library]
+      summary: Cover art for a listen, proxied.
+      description: |
+        Session-only. Proxies the user's own library server, which the browser
+        usually cannot reach and must not hold credentials for. Redirects to a
+        public URL where there is one.
+      parameters: [{ name: id, in: path, required: true, schema: { type: integer } }]
+      responses:
+        '200': { description: Image bytes., content: { 'image/*': { schema: { type: string, format: binary } } } }
+        '302': { description: Redirect to a public artwork URL. }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { description: No artwork. The client falls back to a lettered tile. }
+
+  /api/v1/artists/img/{id}:
+    get:
+      tags: [Library]
+      summary: An artist portrait, proxied.
+      description: Session-only.
+      parameters: [{ name: id, in: path, required: true, schema: { type: integer } }]
+      responses:
+        '200': { description: Image bytes., content: { 'image/*': { schema: { type: string, format: binary } } } }
+        '302': { description: Redirect to a public URL. }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { description: No portrait yet. Retried later — the answer changes when the artist is added to a library. }
+    put:
+      tags: [Library]
+      summary: Override an artist portrait.
+      description: |
+        Session-only. A manual override beats every provider — this is a
+        journal, and whoever keeps it gets the last word.
+      parameters: [{ name: id, in: path, required: true, schema: { type: integer } }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                image_url: { type: [string, 'null'], description: Null clears the override. }
+      responses:
+        '200': { description: Saved., content: { application/json: { schema: { $ref: '#/components/schemas/Ok' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  # ── Loves ──────────────────────────────────────────────────────────────────
+  /api/v1/loves:
+    get:
+      tags: [Loves]
+      summary: Loved entities.
+      description: 'Scope: `read` *(since v0.39)*.'
+      security: [{ sessionCookie: [] }, { apiToken: [read] }]
+      parameters: [{ name: kind, in: query, schema: { type: string, enum: [artist, release, recording] } }]
+      responses:
+        '200':
+          description: OK.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  loves: { type: array, items: { $ref: '#/components/schemas/Love' } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+    post:
+      tags: [Loves]
+      summary: Love or un-love.
+      description: |
+        Scope: `write` *(since v0.39)*.
+
+        Loves attach to **entities, never to a listen** — loving one *playing*
+        of a track is a category error and is rejected.
+
+        A love of a **recording** is mirrored outward (Last.fm `track.love`,
+        ListenBrainz `recording-feedback`); albums and artists stay local
+        because neither service has the concept. ListenBrainz needs a recording
+        MBID, so an un-enriched track is skipped rather than guessed at. The
+        forward is spawned, not awaited — the love is already stored and the UI
+        should not wait on Last.fm.
+      security: [{ sessionCookie: [] }, { apiToken: [write] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [kind, name, loved]
+              properties:
+                kind: { type: string, enum: [artist, release, recording] }
+                name: { type: string }
+                artist: { type: string, description: Required for release and recording. }
+                loved: { type: boolean }
+      responses:
+        '200':
+          description: Stored.
+          content:
+            application/json:
+              schema: { type: object, properties: { entity_id: { type: integer }, loved: { type: boolean } } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /api/v1/loves/keys:
+    get:
+      tags: [Loves]
+      summary: Every loved entity key, as a flat set.
+      description: |
+        Scope: `read` *(since v0.39)*. One request instead of one per history
+        row. Derive a row's key client-side as `kind|artist|name`, trimmed and
+        lowercased, with an artist's `artist` half empty. **If your derivation
+        drifts from the server's, hearts silently stop filling — nothing
+        errors.**
+      security: [{ sessionCookie: [] }, { apiToken: [read] }]
+      responses:
+        '200':
+          description: OK.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  keys: { type: array, items: { type: string }, example: ['recording|aphex twin|xtal', 'artist||burial'] }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /api/v1/loves/pull:
+    post:
+      tags: [Loves]
+      summary: Pull loves from Last.fm / ListenBrainz.
+      description: |
+        Session-only — it uses stored service credentials. Not one code path:
+        ListenBrainz returns only a recording MBID so an un-enriched track
+        cannot be matched, while Last.fm returns names and can fall back to a
+        name match. A love whose track is not in your history is **skipped,
+        never invented** — loves point at entities, and entities are things you
+        actually played.
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties: { service: { type: string, enum: [lastfm, listenbrainz] } }
+      responses:
+        '200':
+          description: Done.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  matched: { type: integer }
+                  skipped: { type: integer }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  # ── Notes ──────────────────────────────────────────────────────────────────
+  /api/v1/notes:
+    get:
+      tags: [Notes]
+      summary: Your liner notes.
+      description: 'Scope: `read` *(since v0.39)*. Self-only, whatever `visibility` says.'
+      security: [{ sessionCookie: [] }, { apiToken: [read] }]
+      parameters:
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Offset'
+      responses:
+        '200':
+          description: OK.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  notes: { type: array, items: { $ref: '#/components/schemas/Note' } }
+                  count: { type: integer }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+    post:
+      tags: [Notes]
+      summary: Create or update a note.
+      description: |
+        Scope: `write` *(since v0.39)*.
+
+        A note hangs off **either** `entity_id` **or** `scrobble_id`, never both.
+        Editing archives the previous body into revisions — but only when the
+        body actually changed, so flipping visibility is not a rewrite.
+
+        The body is Markdown. `[[track:…]]`, `[[album:…]]`, `[[artist:…]]`,
+        `[[track:3]]` and `[[gear:…]]` shortcodes resolve server-side; an
+        unresolved one is never an error.
+      security: [{ sessionCookie: [] }, { apiToken: [write] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [body]
+              properties:
+                entity_id: { type: integer }
+                scrobble_id: { type: integer }
+                body: { type: string }
+                visibility: { type: string, enum: [private, patched, public], default: private }
+      responses:
+        '200': { description: Saved., content: { application/json: { schema: { $ref: '#/components/schemas/Note' } } } }
+        '400': { description: Neither or both of `entity_id` and `scrobble_id`. }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /api/v1/notes/{id}:
+    get:
+      tags: [Notes]
+      summary: One note.
+      description: 'Scope: `read` *(since v0.39)*.'
+      security: [{ sessionCookie: [] }, { apiToken: [read] }]
+      parameters: [{ name: id, in: path, required: true, schema: { type: integer } }]
+      responses:
+        '200': { description: OK., content: { application/json: { schema: { $ref: '#/components/schemas/Note' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    delete:
+      tags: [Notes]
+      summary: Delete a note.
+      description: 'Scope: `write` *(since v0.39)*. Revisions go with it.'
+      security: [{ sessionCookie: [] }, { apiToken: [write] }]
+      parameters: [{ name: id, in: path, required: true, schema: { type: integer } }]
+      responses:
+        '200': { description: Deleted., content: { application/json: { schema: { $ref: '#/components/schemas/Ok' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /api/v1/notes/{id}/revisions:
+    get:
+      tags: [Notes]
+      summary: A note's history.
+      description: |
+        Scope: `read` *(since v0.39)*. Opt-in — the read path serves only the
+        current body. Notes are meant to be kept, and a rewrite five years on
+        should not erase what you thought at the time.
+      security: [{ sessionCookie: [] }, { apiToken: [read] }]
+      parameters: [{ name: id, in: path, required: true, schema: { type: integer } }]
+      responses:
+        '200':
+          description: OK.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  revisions:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        id: { type: integer }
+                        body: { type: string }
+                        archived_at: { type: integer }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /api/v1/notes/for:
+    get:
+      tags: [Notes]
+      summary: The note for a given target, if any.
+      description: 'Scope: `read` *(since v0.39)*.'
+      security: [{ sessionCookie: [] }, { apiToken: [read] }]
+      parameters:
+        - { name: entity_id, in: query, schema: { type: integer } }
+        - { name: scrobble_id, in: query, schema: { type: integer } }
+      responses:
+        '200':
+          description: OK. `note` is null when nothing is written yet.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  note: { oneOf: [{ $ref: '#/components/schemas/Note' }, { type: 'null' }] }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /api/v1/notes/preview:
+    post:
+      tags: [Notes]
+      summary: Render Markdown and resolve shortcodes, without saving.
+      description: |
+        Scope: `write` *(since v0.39)*. A POST that does not save, but **not** a
+        pure read: resolving a shortcode can create the entity it points at, the
+        same write-on-read trade `/api/v1/resolve` makes.
+      security: [{ sessionCookie: [] }, { apiToken: [write] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [body]
+              properties:
+                body: { type: string }
+                entity_id: { type: integer, description: 'Context for positional `[[track:3]]`.' }
+      responses:
+        '200':
+          description: Rendered.
+          content:
+            application/json:
+              schema: { type: object, properties: { body_html: { type: string } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '422': { $ref: '#/components/responses/BadRequest' }
+
+  # ── Sessions ───────────────────────────────────────────────────────────────
+  /api/v1/sessions:
+    get:
+      tags: [Sessions]
+      summary: Listening sessions.
+      description: |
+        Session-only. Contiguous listening with gaps under 30 minutes. A change
+        of submitting token also breaks a session — one token per app is how
+        people organise these, so "fooyin stopped, Pano started" is a different
+        setup even a minute later.
+      parameters:
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Offset'
+      responses:
+        '200':
+          description: OK.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  sessions:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        id: { type: integer }
+                        uuid: { type: string, description: Stable across merges and splits. }
+                        started_at: { type: integer }
+                        ended_at: { type: integer }
+                        track_count: { type: integer }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /api/v1/sessions/{id}:
+    get:
+      tags: [Sessions]
+      summary: One session and its listens.
+      parameters: [{ name: id, in: path, required: true, schema: { type: integer } }]
+      responses:
+        '200':
+          description: OK.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  session: { type: object, additionalProperties: true }
+                  scrobbles: { type: array, items: { $ref: '#/components/schemas/Listen' } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    patch:
+      tags: [Sessions]
+      summary: Rename or annotate a session.
+      parameters: [{ name: id, in: path, required: true, schema: { type: integer } }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                name: { type: [string, 'null'] }
+                note: { type: [string, 'null'] }
+      responses:
+        '200': { description: Updated., content: { application/json: { schema: { $ref: '#/components/schemas/Ok' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /api/v1/sessions/{id}/split:
+    post:
+      tags: [Sessions]
+      summary: Split a session at a listen.
+      description: |
+        Splitting at the *first* listen is a no-op, not an error — it would
+        leave one empty half, which is the session you already had. Aggregates
+        are recomputed from the listens rather than adjusted arithmetically.
+      parameters: [{ name: id, in: path, required: true, schema: { type: integer } }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [scrobble_id]
+              properties:
+                scrobble_id: { type: integer, description: Becomes the first listen of the new session. }
+      responses:
+        '200': { description: Split., content: { application/json: { schema: { type: object, additionalProperties: true } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /api/v1/sessions/merge:
+    post:
+      tags: [Sessions]
+      summary: Merge sessions.
+      description: |
+        Keeps the **earliest** session's identity — its id and uuid are what
+        anything else already refers to. Ownership is checked for every id
+        before anything moves, so a merge naming someone else's session changes
+        nothing rather than half-completing.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [ids]
+              properties:
+                ids: { type: array, minItems: 2, items: { type: integer } }
+      responses:
+        '200': { description: Merged., content: { application/json: { schema: { type: object, additionalProperties: true } } } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /api/v1/sessions/rebuild:
+    post:
+      tags: [Sessions]
+      summary: Regroup every listen into sessions.
+      description: |
+        **Destructive** — it rewrites the column that manual merges and splits
+        live in, discarding them. Exists for histories that predate session
+        linking, and for imports, which bypass the ingest path entirely.
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                gap_minutes: { type: integer, default: 30 }
+      responses:
+        '200':
+          description: Rebuilt.
+          content:
+            application/json:
+              schema: { type: object, properties: { sessions: { type: integer } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  # ── Chains, gear, devices, bindings ────────────────────────────────────────
+  /api/v1/chains:
+    get:
+      tags: [Chains]
+      summary: Signal chains.
+      description: |
+        Scope: `read` *(since v0.37)*. This is what lets a client offer a chain
+        **picker** instead of taking unvalidatable free text for a field that
+        has to match a name exactly.
+      security: [{ sessionCookie: [] }, { apiToken: [read] }]
+      responses:
+        '200':
+          description: OK.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  chains: { type: array, items: { $ref: '#/components/schemas/Chain' } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+    post:
+      tags: [Chains]
+      summary: Create a chain.
+      description: Session-only.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              properties:
+                name: { type: string }
+                icon: { type: string }
+                is_default: { type: boolean }
+                components: { type: array, items: { type: object, additionalProperties: true } }
+      responses:
+        '200': { description: Created., content: { application/json: { schema: { $ref: '#/components/schemas/Chain' } } } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /api/v1/chains/{id}:
+    get:
+      tags: [Chains]
+      summary: One chain.
+      description: 'Scope: `read` *(since v0.37)*.'
+      security: [{ sessionCookie: [] }, { apiToken: [read] }]
+      parameters: [{ name: id, in: path, required: true, schema: { type: integer } }]
+      responses:
+        '200': { description: OK., content: { application/json: { schema: { $ref: '#/components/schemas/Chain' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    patch:
+      tags: [Chains]
+      summary: Update a chain.
+      description: Session-only.
+      parameters: [{ name: id, in: path, required: true, schema: { type: integer } }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, additionalProperties: true }
+      responses:
+        '200': { description: Updated., content: { application/json: { schema: { $ref: '#/components/schemas/Ok' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    delete:
+      tags: [Chains]
+      summary: Delete a chain.
+      description: Session-only. Clears referencing rows first — foreign keys are on.
+      parameters: [{ name: id, in: path, required: true, schema: { type: integer } }]
+      responses:
+        '200': { description: Deleted., content: { application/json: { schema: { $ref: '#/components/schemas/Ok' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /api/v1/equipment:
+    get:
+      tags: [Chains]
+      summary: Your gear.
+      description: 'Scope: `read` *(since v0.37)*. Hours are derived from the chains that use each piece.'
+      security: [{ sessionCookie: [] }, { apiToken: [read] }]
+      responses:
+        '200':
+          description: OK.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  equipment: { type: array, items: { $ref: '#/components/schemas/Equipment' } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+    post:
+      tags: [Chains]
+      summary: Add gear.
+      description: Session-only.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name, type]
+              properties:
+                name: { type: string }
+                type: { type: string }
+                brand: { type: string }
+      responses:
+        '200': { description: Created., content: { application/json: { schema: { $ref: '#/components/schemas/Equipment' } } } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /api/v1/equipment/{id}:
+    patch:
+      tags: [Chains]
+      summary: Update gear.
+      description: Session-only.
+      parameters: [{ name: id, in: path, required: true, schema: { type: integer } }]
+      requestBody:
+        required: true
+        content: { application/json: { schema: { type: object, additionalProperties: true } } }
+      responses:
+        '200': { description: Updated., content: { application/json: { schema: { $ref: '#/components/schemas/Ok' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    delete:
+      tags: [Chains]
+      summary: Delete gear.
+      description: |
+        Session-only. Chains referencing it stay readable — every component
+        keeps a name snapshot alongside its optional `equipment_id`.
+      parameters: [{ name: id, in: path, required: true, schema: { type: integer } }]
+      responses:
+        '200': { description: Deleted., content: { application/json: { schema: { $ref: '#/components/schemas/Ok' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /api/v1/devices:
+    get:
+      tags: [Chains]
+      summary: Devices that have reported listens.
+      description: 'Scope: `read` *(since v0.37)*.'
+      security: [{ sessionCookie: [] }, { apiToken: [read] }]
+      responses:
+        '200':
+          description: OK.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  devices: { type: array, items: { type: object, additionalProperties: true } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /api/v1/devices/{id}:
+    patch:
+      tags: [Chains]
+      summary: Set a device's default chain.
+      description: Session-only. Rung 4 of the chain ladder — the coarsest fallback.
+      parameters: [{ name: id, in: path, required: true, schema: { type: integer } }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties: { chain_id: { type: [integer, 'null'] } }
+      responses:
+        '200': { description: Updated., content: { application/json: { schema: { $ref: '#/components/schemas/Ok' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /api/v1/bindings:
+    get:
+      tags: [Chains]
+      summary: Output-device bindings.
+      description: 'Scope: `read` *(since v0.37)*. Rung 2 of the chain ladder.'
+      security: [{ sessionCookie: [] }, { apiToken: [read] }]
+      responses:
+        '200':
+          description: OK.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  bindings: { type: array, items: { type: object, additionalProperties: true } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+    put:
+      tags: [Chains]
+      summary: Bind an output device name to a chain.
+      description: Session-only.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [output_name, chain_id]
+              properties:
+                output_name: { type: string }
+                chain_id: { type: integer }
+      responses:
+        '200': { description: Saved., content: { application/json: { schema: { $ref: '#/components/schemas/Ok' } } } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /api/v1/bindings/{id}:
+    delete:
+      tags: [Chains]
+      summary: Remove a binding.
+      description: Session-only.
+      parameters: [{ name: id, in: path, required: true, schema: { type: integer } }]
+      responses:
+        '200': { description: Deleted., content: { application/json: { schema: { $ref: '#/components/schemas/Ok' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  # ── Shelf (Vinyl & Tape) ───────────────────────────────────────────────────
+  /api/v1/physical:
+    get:
+      tags: [Shelf]
+      summary: Your shelf.
+      description: Session-only.
+      responses:
+        '200':
+          description: OK.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  releases: { type: array, items: { type: object, additionalProperties: true } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+    post:
+      tags: [Shelf]
+      summary: Add a release to the shelf.
+      description: Session-only. Seed from a barcode lookup, or supply the tracklist yourself.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [artist, title, format]
+              properties:
+                artist: { type: string }
+                title: { type: string }
+                format: { type: string, enum: [vinyl, cassette] }
+                barcode: { type: string }
+                tracks: { type: array, items: { type: object, additionalProperties: true } }
+      responses:
+        '200': { description: Added., content: { application/json: { schema: { type: object, additionalProperties: true } } } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /api/v1/physical/{id}:
+    get:
+      tags: [Shelf]
+      summary: One shelf item, with its sides.
+      parameters: [{ name: id, in: path, required: true, schema: { type: integer } }]
+      responses:
+        '200': { description: OK., content: { application/json: { schema: { type: object, additionalProperties: true } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    delete:
+      tags: [Shelf]
+      summary: Remove a shelf item.
+      parameters: [{ name: id, in: path, required: true, schema: { type: integer } }]
+      responses:
+        '200': { description: Deleted., content: { application/json: { schema: { $ref: '#/components/schemas/Ok' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /api/v1/physical/{id}/tracks:
+    put:
+      tags: [Shelf]
+      summary: Replace the tracklist and side split.
+      description: |
+        Session-only. Sides are **not reliably available from any provider** —
+        MusicBrainz records a vinyl track number as "A1" only when an editor
+        entered one. When there is no explicit side letter the split is guessed
+        by **playing time**, not track count, because a mastering engineer
+        balances sides and a nine-minute closer would otherwise land on the
+        wrong one. It is still a guess, which is why this endpoint exists.
+      parameters: [{ name: id, in: path, required: true, schema: { type: integer } }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [tracks]
+              properties:
+                tracks:
+                  type: array
+                  items:
+                    type: object
+                    properties:
+                      position: { type: string, example: A1 }
+                      title: { type: string }
+                      duration: { type: integer, description: Seconds. }
+      responses:
+        '200': { description: Saved., content: { application/json: { schema: { $ref: '#/components/schemas/Ok' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /api/v1/physical/{id}/play:
+    post:
+      tags: [Shelf]
+      summary: Record a side as played.
+      description: |
+        Session-only. **Writes one listen per track, not one per side** — every
+        counting query in Tapedeck is over listens, so a side-shaped row would
+        be invisible to all of them.
+
+        Timestamps are the one inferred thing here: you observed when the side
+        *started*, so tracks are spaced by their running times. A track of
+        unknown length gets three minutes — wrong but bounded, where stacking
+        them on one instant would break session grouping and the hour-of-day
+        heatmap outright.
+
+        Per-track outcomes from the browser deck are taken as authoritative: a
+        side laid out from a start time can only describe an uninterrupted play.
+        A skipped track is stored, excluded from every count, and never
+        forwarded — and does not accrue gear hours.
+      parameters: [{ name: id, in: path, required: true, schema: { type: integer } }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [side]
+              properties:
+                side: { type: string, example: A }
+                started_at: { type: integer, description: Unix seconds. Defaults to now minus the side's running time. }
+                chain_id: { type: [integer, 'null'] }
+                outcomes:
+                  type: array
+                  description: Per-track results from the deck, when it drove the play.
+                  items:
+                    type: object
+                    properties:
+                      position: { type: string }
+                      started_at: { type: integer }
+                      skipped: { type: boolean }
+      responses:
+        '200':
+          description: Logged.
+          content:
+            application/json:
+              schema: { type: object, properties: { listens: { type: integer } } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /api/v1/physical/lookup:
+    get:
+      tags: [Shelf]
+      summary: Resolve a barcode to a pressing.
+      description: |
+        Session-only. Discogs first when configured — it catalogues *pressings*,
+        so a barcode usually resolves to the exact edition, often with real side
+        letters that MusicBrainz lacks. Falls back to MusicBrainz.
+
+        Barcodes may be sent with or without the printed spacing; the unspaced
+        form a scanner produces matches slightly **more** often.
+      parameters:
+        - { name: barcode, in: query, schema: { type: string } }
+        - { name: q, in: query, schema: { type: string, description: Free text, when there is no barcode. } }
+      responses:
+        '200':
+          description: OK.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  results: { type: array, items: { type: object, additionalProperties: true } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /api/v1/physical/discogs/{id}:
+    get:
+      tags: [Shelf]
+      summary: A Discogs release, with its tracklist positions.
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      responses:
+        '200': { description: OK., content: { application/json: { schema: { type: object, additionalProperties: true } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /api/v1/physical/equipment/{id}/wear:
+    get:
+      tags: [Shelf]
+      summary: Stylus hours or head wear for a piece of gear.
+      description: Derived from `physical_plays`. A duplicate submission is not counted as wear.
+      parameters: [{ name: id, in: path, required: true, schema: { type: integer } }]
+      responses:
+        '200': { description: OK., content: { application/json: { schema: { type: object, additionalProperties: true } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /api/v1/physical/settings/discogs:
+    get:
+      tags: [Shelf, Settings]
+      summary: Whether Discogs is configured.
+      description: Session-only. Never returns the credential itself.
+      responses:
+        '200':
+          description: OK.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  configured: { type: boolean }
+                  shape: { type: [string, 'null'], enum: [token, key_secret, null] }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+    put:
+      tags: [Shelf, Settings]
+      summary: Store a Discogs credential.
+      description: |
+        Session-only. Accepts **either** a personal access token **or** a
+        consumer key/secret pair — either is enough, since Tapedeck only reads
+        the public database. The three-legged OAuth flow is deliberately not
+        implemented: it exists so an app can act *as a user*, and registering an
+        app hands you a key and secret that work directly. Stored encrypted.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                token: { type: string }
+                key: { type: string }
+                secret: { type: string }
+      responses:
+        '200': { description: Saved., content: { application/json: { schema: { $ref: '#/components/schemas/Ok' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /api/v1/physical/settings/discogs/test:
+    post:
+      tags: [Shelf, Settings]
+      summary: Verify the stored Discogs credential.
+      description: |
+        Session-only, and **necessary rather than a nicety**: Discogs does not
+        reject a bad credential. With a bogus key and secret, `/releases/1` and
+        `/database/search` both return a normal 200 with real data, and the
+        rate-limit header reads the *authenticated* 60 — the limit is raised for
+        the presence of an `Authorization` header without checking its contents.
+        `/users/{username}` is the one endpoint that actually verifies, and is
+        what this calls. Without it, a typo is indistinguishable from a working
+        credential.
+      responses:
+        '200':
+          description: Result of the check.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean }
+                  message: { type: string }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  # ── Genre map ──────────────────────────────────────────────────────────────
+  /api/v1/genre-map:
+    get:
+      tags: [Genre map]
+      summary: The map, your genres on it, and your average colour.
+      description: |
+        Session-only. The canvas is 1500 × 22,648 — fifteen times taller than
+        wide — so a client must compress the y axis **in the coordinates**, not
+        with `preserveAspectRatio`, which would squash the circles into ellipses
+        too.
+
+        `colour` is blended in **linear light**, not sRGB; mixing gamma-encoded
+        values drags every user toward the same brown-grey.
+      responses:
+        '200':
+          description: OK.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  map:
+                    type: object
+                    properties:
+                      width: { type: number }
+                      height: { type: number }
+                      points:
+                        type: array
+                        description: '`[name, x, y, colour]` per genre — positional to keep ~6,300 rows small.'
+                        items: { type: array }
+                  mine:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        name: { type: string }
+                        x: { type: number }
+                        y: { type: number }
+                        color: { type: string }
+                        plays: { type: integer }
+                  colour: { type: [string, 'null'], example: '#a18430' }
+                  placed_tags: { type: integer }
+                  unplaced_plays: { type: integer, description: 'Plays on tags with no place on the map — instruments, nationalities, roles.' }
+                  listens_total: { type: integer }
+                  listens_with_genres: { type: integer }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '409': { description: The map has not been fetched yet. Run the scrape in Settings. }
+
+  /api/v1/genre-map/trajectory:
+    get:
+      tags: [Genre map]
+      summary: Where your listening sat, period by period.
+      description: |
+        Session-only. The play-weighted centroid of each period.
+
+        Three honesty constraints, all load-bearing. It is an **artist-mix**
+        trajectory, not a track-level one — every track by an artist carries
+        that artist's genres and sits at the same point. A period under 25
+        placed plays is **omitted, not drawn**, because a centroid from four
+        listens reads as a real movement inside a path. And each period reports
+        its own enrichment coverage, to be drawn faintly below 90% — the genre
+        backfill runs newest-first, so a time-sliced view is the one most
+        distorted by a half-done pass.
+
+        The server picks month or year by how much history there is and says
+        which it used. Buckets are in the user's own timezone.
+      responses:
+        '200':
+          description: OK.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  unit: { type: string, enum: [year, month] }
+                  min_plays: { type: integer }
+                  years:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        year: { type: string }
+                        x: { type: number }
+                        y: { type: number }
+                        plays: { type: integer }
+                        colour: { type: [string, 'null'] }
+                        listens: { type: integer }
+                        enriched: { type: integer }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /api/v1/genre-map/neighbours:
+    get:
+      tags: [Genre map]
+      summary: What sits next to your listening.
+      description: |
+        Session-only. Walks Every Noise's precomputed adjacency, seeded from
+        your top 25 genres.
+
+        **This does not recommend music**, and the response shape is what
+        enforces that. Two artist fields that are never both populated on the
+        same card:
+
+        * `your_artists` — from **your own history**. Only ever set on
+          `next_door`.
+        * `exemplar_artists` — **Every Noise's own exemplars**, for a genre you
+          own nothing in. These name music you do not have. Any client showing
+          them owes the reader that provenance, in words and in styling.
+
+        `exemplar_artists` is empty until a tier-2 scrape has run — a
+        tier-1-only instance has adjacency but no exemplars. Say so rather than
+        rendering bare cards that look like a bug.
+      responses:
+        '200':
+          description: OK.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  seeded_from: { type: integer }
+                  next_door:
+                    type: array
+                    description: Bordering genres you already own music in and underplay. This half leads.
+                    items: { $ref: '#/components/schemas/NeighbourGenre' }
+                  unexplored:
+                    type: array
+                    description: Bordering genres you own nothing in.
+                    items: { $ref: '#/components/schemas/NeighbourGenre' }
+                  opposite:
+                    type: array
+                    description: Furthest from your listening. Suggests nothing by construction.
+                    items: { $ref: '#/components/schemas/NeighbourGenre' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '409': { description: None of your genres are on the map yet. }
+
+  # ── Rediscovery ────────────────────────────────────────────────────────────
+  /api/v1/rediscovery:
+    get:
+      tags: [Rediscovery]
+      summary: Five lists, all built from your own history.
+      description: |
+        Session-only. Nothing here points at music you do not own — that is the
+        design, not an implementation detail.
+
+        "Not lately" is a **parameter, not a constant**: six months is a long
+        gap for a daily listener and no gap at all otherwise. The seasonal list
+        excludes the current year, or it would just be "recently played".
+      parameters:
+        - { name: months, in: query, schema: { type: integer, default: 6 }, description: How long counts as "not lately". }
+      responses:
+        '200':
+          description: OK.
+          content:
+            application/json:
+              schema: { type: object, additionalProperties: true }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /api/v1/rediscovery/gear/{id}:
+    get:
+      tags: [Rediscovery]
+      summary: Favourites never heard on a piece of gear.
+      description: |
+        Session-only. Answered by joining `chain_id` to the chains whose
+        components reference the gear — no per-listen equipment field needed.
+        Restricted to tracks played more than once: the interesting question is
+        how your *favourites* sound on it.
+      parameters: [{ name: id, in: path, required: true, schema: { type: integer } }]
+      responses:
+        '200': { description: OK., content: { application/json: { schema: { type: object, additionalProperties: true } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  # ── Settings ───────────────────────────────────────────────────────────────
+  /api/v1/preferences:
+    get:
+      tags: [Settings]
+      summary: User preferences.
+      description: Session-only.
+      responses:
+        '200':
+          description: OK.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+                properties:
+                  theme: { type: string, enum: [light, dark, system] }
+                  timezone: { type: string, description: 'IANA region, e.g. `Europe/Berlin`.' }
+                  week_start: { type: integer, description: '0 = Sunday.' }
+                  show_artwork: { type: boolean }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+    put:
+      tags: [Settings]
+      summary: Update preferences.
+      description: |
+        Session-only. Omitted keys are left alone.
+
+        `timezone` must be an **IANA region**, not a fixed abbreviation. The
+        region carries the DST rules — `Europe/Berlin` *is* CET in winter and
+        CEST in summer, switching on the right dates by itself, and a region
+        with no summer time never shifts. Storing `CET` would freeze the offset
+        and put half a European year an hour out, silently: listens would still
+        store correctly and only "today", the hour-of-day heatmap and the
+        trajectory buckets would be wrong.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, additionalProperties: true }
+      responses:
+        '200': { description: Saved., content: { application/json: { schema: { $ref: '#/components/schemas/Ok' } } } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  # ── Sources ────────────────────────────────────────────────────────────────
+  /api/v1/sources:
+    get:
+      tags: [Sources]
+      summary: Your configured sources.
+      description: |
+        **Session-only, permanently** — these rows hold credentials. The stored
+        token or password is never returned; `has_token` says whether one is
+        set.
+      responses:
+        '200':
+          description: OK.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  sources:
+                    type: array
+                    items:
+                      type: object
+                      additionalProperties: true
+                      properties:
+                        id: { type: integer }
+                        kind: { type: string, enum: [plex, jellyfin, navidrome] }
+                        url: { type: string }
+                        enabled: { type: boolean }
+                        has_token: { type: boolean }
+                        poll_interval: { type: integer, description: Seconds. }
+                        options: { type: object, additionalProperties: true, description: Per-kind knobs, so a new kind needs no migration. }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+    post:
+      tags: [Sources]
+      summary: Add a source.
+      description: |
+        Session-only. Sources are per user, keyed `(user_id, kind)`. For Plex
+        the token is resolved to a Plex account via plex.tv and the source is
+        filtered to that account, so there is no name-matching — which means
+        saving needs outbound internet even for a LAN Plex.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [kind]
+              properties:
+                kind: { type: string, enum: [plex, jellyfin, navidrome] }
+                url: { type: string }
+                token: { type: string }
+                username: { type: string }
+                password: { type: string }
+                enabled: { type: boolean, default: true }
+                options: { type: object, additionalProperties: true }
+      responses:
+        '200': { description: Created., content: { application/json: { schema: { type: object, additionalProperties: true } } } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /api/v1/sources/{id}:
+    put:
+      tags: [Sources]
+      summary: Update a source.
+      description: Session-only. **An omitted token keeps the stored one** — it is not cleared.
+      parameters: [{ name: id, in: path, required: true, schema: { type: integer } }]
+      requestBody:
+        required: true
+        content: { application/json: { schema: { type: object, additionalProperties: true } } }
+      responses:
+        '200': { description: Updated., content: { application/json: { schema: { $ref: '#/components/schemas/Ok' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    delete:
+      tags: [Sources]
+      summary: Delete a source.
+      parameters: [{ name: id, in: path, required: true, schema: { type: integer } }]
+      responses:
+        '200': { description: Deleted., content: { application/json: { schema: { $ref: '#/components/schemas/Ok' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /api/v1/sources/test:
+    post:
+      tags: [Sources]
+      summary: Test a source's credentials without saving.
+      description: Session-only.
+      requestBody:
+        required: true
+        content: { application/json: { schema: { type: object, additionalProperties: true } } }
+      responses:
+        '200':
+          description: Result.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean }
+                  message: { type: string }
+                  accounts: { type: array, items: { type: object, additionalProperties: true }, description: Account picker options, where the source has them. }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  # ── Connections (forwarding) ───────────────────────────────────────────────
+  /api/v1/connections:
+    get:
+      tags: [Connections]
+      summary: Where your listens are forwarded.
+      description: |
+        **Session-only, permanently** — holds credentials.
+
+        Forwarding is strictly per user. A user with no connections keeps their
+        listens local; there is deliberately **no server-wide fallback**, which
+        previously sent every unconnected user's listens to the operator's own
+        account.
+      responses:
+        '200':
+          description: OK.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  connections:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        service: { type: string, enum: [lastfm, librefm, listenbrainz] }
+                        username: { type: [string, 'null'] }
+                        connected: { type: boolean }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /api/v1/connections/{service}:
+    delete:
+      tags: [Connections]
+      summary: Disconnect a service.
+      description: Session-only.
+      parameters: [{ name: service, in: path, required: true, schema: { type: string, enum: [lastfm, librefm, listenbrainz] } }]
+      responses:
+        '200': { description: Disconnected., content: { application/json: { schema: { $ref: '#/components/schemas/Ok' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /api/v1/connections/lastfm/start:
+    post:
+      tags: [Connections]
+      summary: Begin the Last.fm connect flow.
+      description: Session-only. Returns a URL to send the browser to.
+      responses:
+        '200':
+          description: OK.
+          content:
+            application/json:
+              schema: { type: object, properties: { auth_url: { type: string }, token: { type: string } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /api/v1/connections/lastfm/complete:
+    post:
+      tags: [Connections]
+      summary: Finish the Last.fm connect flow.
+      description: Session-only. Exchanges the approved request token for a session key, stored encrypted.
+      requestBody:
+        required: true
+        content: { application/json: { schema: { type: object, properties: { token: { type: string } } } } }
+      responses:
+        '200': { description: Connected., content: { application/json: { schema: { $ref: '#/components/schemas/Ok' } } } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /api/v1/connections/librefm/start:
+    post:
+      tags: [Connections]
+      summary: Begin the Libre.fm connect flow.
+      description: Session-only. GNU FM implements the same AudioScrobbler auth, so this reuses the Last.fm app credentials.
+      responses:
+        '200':
+          description: OK.
+          content:
+            application/json:
+              schema: { type: object, properties: { auth_url: { type: string }, token: { type: string } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /api/v1/connections/librefm/complete:
+    post:
+      tags: [Connections]
+      summary: Finish the Libre.fm connect flow.
+      description: Session-only.
+      requestBody:
+        required: true
+        content: { application/json: { schema: { type: object, properties: { token: { type: string } } } } }
+      responses:
+        '200': { description: Connected., content: { application/json: { schema: { $ref: '#/components/schemas/Ok' } } } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /api/v1/connections/listenbrainz:
+    put:
+      tags: [Connections]
+      summary: Store a ListenBrainz token.
+      description: |
+        Session-only. Stored encrypted. The endpoint is configurable for
+        self-hosted ListenBrainz instances — that is the one scrobble setting
+        still in the config file rather than the database.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [token]
+              properties: { token: { type: string } }
+      responses:
+        '200': { description: Connected., content: { application/json: { schema: { $ref: '#/components/schemas/Ok' } } } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  # ── Import & export ────────────────────────────────────────────────────────
+  /api/v1/export:
+    get:
+      tags: [Import & export]
+      summary: Export your listens as CSV.
+      description: Session-only.
+      responses:
+        '200': { description: CSV., content: { 'text/csv': { schema: { type: string } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /api/v1/backup:
+    get:
+      tags: [Import & export]
+      summary: Download a database snapshot.
+      description: |
+        **Session-only.** A `VACUUM INTO` snapshot of the whole database — every
+        user's listens, and the encrypted credentials.
+
+        The encryption key deliberately lives **outside** the database, so it
+        does not ride along in this file. That is what the encryption protects
+        against: a leaked backup, not host compromise. Do not describe it as
+        more than that.
+      responses:
+        '200': { description: SQLite file., content: { 'application/octet-stream': { schema: { type: string, format: binary } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /api/v1/import/file:
+    post:
+      tags: [Import & export]
+      summary: Import a file.
+      description: |
+        Session-only. Sniffs the **content**, not the filename — people rename
+        downloads. Accepts a ListenBrainz export zip (JSONL, and its
+        `feedback.jsonl` becomes loves), a CSV, or a Rockbox `.scrobbler.log`.
+
+        A ListenBrainz export carries a full `mbid_mapping`, so those listens
+        skip MusicBrainz enrichment *and* the artwork chain — for a 20k history
+        that is the difference between free and a week of rate-limited lookups.
+
+        **Rockbox `#TZ/UNKNOWN` is refused, not guessed.** DAPs often have no
+        time sync, so their timestamps are local wall-clock seconds; assuming
+        the server's zone would shift a whole device's history by the offset,
+        unrecoverably. Supply `timezone` in that case.
+
+        Imports land as `imported` and are **never forwarded**.
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              properties:
+                file: { type: string, format: binary }
+                timezone: { type: string, description: IANA region. Required for a Rockbox log with an unknown zone. }
+      responses:
+        '200':
+          description: Job started.
+          content:
+            application/json:
+              schema: { type: object, properties: { job_id: { type: string } } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /api/v1/import/listenbrainz:
+    post:
+      tags: [Import & export]
+      summary: Import from a ListenBrainz account.
+      description: |
+        Session-only. Paced deliberately: a 30s timeout, exponential backoff on
+        network errors and 5xx, `429` honoured via `X-RateLimit-Reset-In`, and
+        400ms between pages. **Do not remove the inter-page sleep to speed this
+        up** — hammering is what broke it at ~80k listens.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [username]
+              properties:
+                username: { type: string }
+                token: { type: string }
+      responses:
+        '200': { description: Job started., content: { application/json: { schema: { type: object, properties: { job_id: { type: string } } } } } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /api/v1/import/lastfm:
+    post:
+      tags: [Import & export]
+      summary: Import from a Last.fm account.
+      description: Session-only.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [username]
+              properties: { username: { type: string } }
+      responses:
+        '200': { description: Job started., content: { application/json: { schema: { type: object, properties: { job_id: { type: string } } } } } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /api/v1/import/jobs:
+    get:
+      tags: [Import & export]
+      summary: Jobs running right now.
+      description: |
+        Session-only. Live progress is an **in-memory** registry, so in-flight
+        jobs are lost on restart (the import aborts with them). Finished jobs
+        are persisted — see `/api/v1/import/history`.
+      responses:
+        '200':
+          description: OK.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  jobs: { type: array, items: { type: object, additionalProperties: true } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /api/v1/import/jobs/{job_id}:
+    get:
+      tags: [Import & export]
+      summary: One job's progress.
+      parameters: [{ name: job_id, in: path, required: true, schema: { type: string } }]
+      responses:
+        '200':
+          description: OK.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+                properties:
+                  state: { type: string, enum: [running, done, failed] }
+                  processed: { type: integer }
+                  total: { type: [integer, 'null'] }
+                  imported: { type: integer }
+                  duplicates: { type: integer }
+                  error: { type: [string, 'null'] }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /api/v1/import/history:
+    get:
+      tags: [Import & export]
+      summary: Finished import jobs.
+      description: Session-only. Persisted, so this survives restarts.
+      responses:
+        '200':
+          description: OK.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  jobs: { type: array, items: { type: object, additionalProperties: true } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  # ── Maintenance ────────────────────────────────────────────────────────────
+  /api/v1/artwork/status:
+    get:
+      tags: [Maintenance]
+      summary: Artwork coverage.
+      description: |
+        Session-only. **Numerator and denominator share a population** — both
+        exclude skips. They did not once, so the two were fractions of different
+        wholes.
+      responses:
+        '200':
+          description: OK.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  with_artwork: { type: integer }
+                  total: { type: integer }
+                  pending: { type: integer }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /api/v1/artwork/backfill:
+    post:
+      tags: [Maintenance]
+      summary: Run the artwork backfill now.
+      description: |
+        Session-only. Providers return **URLs, never bytes** — Deezer's terms
+        discourage persisting artwork. The queue keys on `artwork_url` **only**;
+        `caa_id` is written by three other paths, so keying on it silently marks
+        rows done that have no URL.
+      responses:
+        '200': { description: Started., content: { application/json: { schema: { $ref: '#/components/schemas/Ok' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /api/v1/languages/status:
+    get:
+      tags: [Maintenance]
+      summary: Language classification coverage.
+      description: |
+        Session-only. The denominator counts only rows the backfill will
+        actually process — it did not once, so the bar could never reach 100%
+        on any history containing a skip.
+      responses:
+        '200':
+          description: OK.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  classified: { type: integer }
+                  total: { type: integer }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /api/v1/languages/backfill:
+    post:
+      tags: [Maintenance]
+      summary: Run the language backfill now.
+      description: Session-only.
+      responses:
+        '200': { description: Started., content: { application/json: { schema: { $ref: '#/components/schemas/Ok' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /api/v1/sanitize:
+    get:
+      tags: [Maintenance]
+      summary: Preview metadata fixes.
+      description: |
+        Session-only. **Preview-then-apply, never automatic** — and the preview
+        deliberately exposes how weak each guess is, because the operator has to
+        judge it.
+
+        Three passes. *Mixed releases*: one listen out of twelve routinely
+        arrives carrying a compilation's release MBID. The whole ballot is
+        returned, most-claimed first, so "15 releases, plurality of 4" is
+        visible as the guess it is. *Featured credits*: `Artist feat. X` is a
+        different artist to every query in the app; only the explicit
+        `feat.`/`ft.`/`featuring`/`with` forms match, because "Simon &
+        Garfunkel" is a name, not a credit. *Spelling variants*: grouped on the
+        exact string, with `case_only` flagged — a two-stage filter whose second
+        stage was coarser than the first once made every case-only variant
+        invisible.
+      responses:
+        '200':
+          description: The proposed changes, each individually selectable.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  album_edits: { type: array, items: { type: object, additionalProperties: true } }
+                  credit_edits: { type: array, items: { type: object, additionalProperties: true } }
+                  variant_edits: { type: array, items: { type: object, additionalProperties: true } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+    post:
+      tags: [Maintenance]
+      summary: Apply selected metadata fixes.
+      description: |
+        Session-only. Explicit lists select individual edits; the booleans mean
+        "everything in this category". **A non-empty list wins over its
+        boolean** — asking for three edits and getting four hundred would be the
+        worst reading of an ambiguous request.
+
+        The featured-credit target is **derived, never taken from the request**,
+        or this would become "rename any artist to anything". A variant merge is
+        refused unless both spellings normalise to the same key, so merging
+        "Burial" into "Aphex Twin" cannot happen.
+
+        **A spelling merge is not reversible.** The `feat.` fold keeps the
+        original in `artist_credit`; a rename keeps nothing, because both
+        strings name the same artist.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                albums: { type: boolean }
+                credits: { type: boolean }
+                variants: { type: boolean }
+                album_edits: { type: array, items: { type: object, additionalProperties: true } }
+                credit_edits: { type: array, items: { type: object, additionalProperties: true } }
+                variant_edits: { type: array, items: { type: object, additionalProperties: true } }
+      responses:
+        '200':
+          description: Applied.
+          content:
+            application/json:
+              schema: { type: object, additionalProperties: true }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  # ── Admin ──────────────────────────────────────────────────────────────────
+  /admin/users:
+    get:
+      tags: [Admin]
+      summary: List users.
+      description: Session-only, admin role. Never reachable with a token.
+      responses:
+        '200':
+          description: OK.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  users: { type: array, items: { type: object, additionalProperties: true } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+    post:
+      tags: [Admin]
+      summary: Create a user.
+      description: |
+        Session-only, admin role. There is **no self-registration** — this
+        instance is invite-only by design.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [username, password]
+              properties:
+                username: { type: string }
+                password: { type: string }
+                display_name: { type: string }
+                role: { type: string, enum: [user, admin], default: user }
+      responses:
+        '200': { description: Created., content: { application/json: { schema: { type: object, additionalProperties: true } } } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /admin/users/{id}:
+    patch:
+      tags: [Admin]
+      summary: Update a user.
+      description: Session-only, admin role.
+      parameters: [{ name: id, in: path, required: true, schema: { type: integer } }]
+      requestBody:
+        required: true
+        content: { application/json: { schema: { type: object, additionalProperties: true } } }
+      responses:
+        '200': { description: Updated., content: { application/json: { schema: { $ref: '#/components/schemas/Ok' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    delete:
+      tags: [Admin]
+      summary: Delete a user and everything they own.
+      description: |
+        Session-only, admin role. Foreign keys are enforced, so this clears note
+        revisions, then notes, then listens, in that order.
+      parameters: [{ name: id, in: path, required: true, schema: { type: integer } }]
+      responses:
+        '200': { description: Deleted., content: { application/json: { schema: { $ref: '#/components/schemas/Ok' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /admin/tokens:
+    get:
+      tags: [Admin]
+      summary: The caller's API tokens.
+      description: Session-only. Token secrets are never returned after issue.
+      responses:
+        '200':
+          description: OK.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  tokens:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        id: { type: integer }
+                        name: { type: string }
+                        scopes: { type: string }
+                        created_at: { type: integer }
+                        last_used_at: { type: [integer, 'null'] }
+                        default_chain_id: { type: [integer, 'null'] }
+                        default_chain_name: { type: [string, 'null'] }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+    post:
+      tags: [Admin]
+      summary: Mint a token.
+      description: |
+        Session-only. **The secret is in this response and nowhere else.**
+
+        Name it per device — that is what makes revocation meaningful when a
+        phone is lost. `default_chain_id` is rung 3 of the chain ladder: one
+        token per app makes attribution zero-configuration on the client side.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              properties:
+                name: { type: string }
+                scopes:
+                  type: string
+                  default: submit
+                  description: 'Space-separated. `submit`, `read`, `write`, or `all`. None implies another.'
+                default_chain_id: { type: [integer, 'null'] }
+      responses:
+        '200':
+          description: Created.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  id: { type: integer }
+                  token: { type: string, description: Shown once. }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /admin/tokens/{id}:
+    patch:
+      tags: [Admin]
+      summary: Repoint a token's default chain, without re-issuing it.
+      description: |
+        Session-only. Fixing the chain never means re-pasting a token into a
+        client. `default_chain_id` is nullable-and-optional: present-and-null
+        clears it, absent leaves it alone. Any chain id is checked against the
+        owner's own chains.
+      parameters: [{ name: id, in: path, required: true, schema: { type: integer } }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                name: { type: string }
+                default_chain_id: { type: [integer, 'null'] }
+      responses:
+        '200': { description: Updated., content: { application/json: { schema: { $ref: '#/components/schemas/Ok' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    delete:
+      tags: [Admin]
+      summary: Revoke a token.
+      description: Session-only. This is the mitigation for a lost device.
+      parameters: [{ name: id, in: path, required: true, schema: { type: integer } }]
+      responses:
+        '200': { description: Revoked., content: { application/json: { schema: { $ref: '#/components/schemas/Ok' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /admin/tokens/{id}/rotate:
+    post:
+      tags: [Admin]
+      summary: Re-issue a token in place.
+      description: Session-only. Same id, name, scopes and chain; new secret, returned once.
+      parameters: [{ name: id, in: path, required: true, schema: { type: integer } }]
+      responses:
+        '200':
+          description: Rotated.
+          content:
+            application/json:
+              schema: { type: object, properties: { token: { type: string } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /admin/everynoise:
+    get:
+      tags: [Admin, Genre map]
+      summary: Genre-map scrape status.
+      description: Session-only, admin role.
+      responses:
+        '200':
+          description: OK.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+                properties:
+                  genres: { type: integer }
+                  artists: { type: integer }
+                  edges: { type: integer }
+                  running: { type: boolean }
+                  contact: { type: [string, 'null'] }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+    delete:
+      tags: [Admin, Genre map]
+      summary: Drop the scraped genre map.
+      description: |
+        Session-only, admin role. The genre map lives in its **own database**
+        (`EVERYNOISE_DB_PATH`), kept out of `VACUUM INTO` backups — those should
+        hold the user's listening, not 6,300 rows of someone else's reference
+        data.
+      responses:
+        '200': { description: Cleared., content: { application/json: { schema: { $ref: '#/components/schemas/Ok' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /admin/everynoise/contact:
+    put:
+      tags: [Admin, Genre map]
+      summary: Set the admin contact email for the scraper's User-Agent.
+      description: |
+        Session-only, admin role. The scrape **refuses to start without one** —
+        a made-up address is worse than none.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [contact]
+              properties: { contact: { type: string, format: email } }
+      responses:
+        '200': { description: Saved., content: { application/json: { schema: { $ref: '#/components/schemas/Ok' } } } }
+        '400': { description: Not a plausible address. }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /admin/everynoise/scrape:
+    post:
+      tags: [Admin, Genre map]
+      summary: Start a scrape.
+      description: |
+        Session-only, admin role. Runs when an admin asks and **never on a
+        schedule** — Every Noise has been frozen since December 2023, so there
+        is nothing to sync.
+
+        **Tier 1 is one HTTP request** and returns every genre with coordinates
+        and colour; genre-level features cost that alone. **Tier 2 walks ~6,300
+        genre pages at 1 req/s** — about two hours — for exemplar artists and
+        the adjacency graph. Build on tier 1 first.
+
+        A fetch that parses to **zero** genres is treated as a failure rather
+        than written, or a changed page would silently empty the table. Resume
+        is per page, written in the same transaction as the page's contents, so
+        a crash can never mark a page done with nothing in it. A second
+        concurrent start is refused.
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                tier: { type: integer, enum: [1, 2], default: 1 }
+      responses:
+        '200': { description: Started., content: { application/json: { schema: { $ref: '#/components/schemas/Ok' } } } }
+        '400': { description: No admin contact set. }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { description: A scrape is already running. }
+
+  /admin/everynoise/cancel:
+    post:
+      tags: [Admin, Genre map]
+      summary: Cancel a running scrape.
+      description: Session-only, admin role. Progress already written is kept — resume is per page.
+      responses:
+        '200': { description: Cancelled., content: { application/json: { schema: { $ref: '#/components/schemas/Ok' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }

@@ -77,6 +77,60 @@ pub struct ReadAuth {
     pub user: AuthUser,
 }
 
+/// The shared body of `ReadAuth` and `WriteAuth`: session cookie first, then a
+/// bearer-style `Authorization: Token` that must carry `scope`.
+///
+/// Factored out rather than copied because the *rejection* behaviour is the
+/// part worth having in one place — in particular that a valid token missing
+/// the grant is a 403 and never a 401.
+async fn scoped_token_user(
+    parts: &Parts,
+    state: &Arc<super::AppState>,
+    scope: &'static str,
+    granted: fn(&crate::db::TokenAuth) -> bool,
+) -> Result<AuthUser, Rejection> {
+    if let Some(user) = session_user(parts, state).await {
+        return Ok(user);
+    }
+
+    let header = parts.headers.get("authorization").and_then(|v| v.to_str().ok()).unwrap_or("");
+    let token = header
+        .strip_prefix("Token ")
+        .or_else(|| header.strip_prefix("token "))
+        .unwrap_or("")
+        .trim();
+    if token.is_empty() {
+        return Err(unauthorized(
+            "Authentication required. Provide a session cookie or Authorization: Token header.",
+        ));
+    }
+
+    match state.db.validate_token(token).await {
+        Ok(Some(t)) if granted(&t) => Ok(t.user),
+        // A valid token without the grant is 403, not 401: the caller
+        // authenticated fine and re-authenticating will not help. A 401
+        // would send a client into a token-refresh loop it cannot win.
+        Ok(Some(_)) => Err((
+            StatusCode::FORBIDDEN,
+            Json(super::models::ErrorResponse {
+                code: 403,
+                error: format!("This token does not have the '{}' scope", scope),
+            }),
+        )),
+        Ok(None) => Err(unauthorized("Invalid token")),
+        Err(e) => {
+            tracing::error!("Token validation error: {}", e);
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(super::models::ErrorResponse {
+                    code: 500,
+                    error: "Internal server error".into(),
+                }),
+            ))
+        }
+    }
+}
+
 #[axum::async_trait]
 impl FromRequestParts<Arc<super::AppState>> for ReadAuth {
     type Rejection = Rejection;
@@ -85,46 +139,46 @@ impl FromRequestParts<Arc<super::AppState>> for ReadAuth {
         parts: &mut Parts,
         state: &Arc<super::AppState>,
     ) -> Result<Self, Self::Rejection> {
-        if let Some(user) = session_user(parts, state).await {
-            return Ok(ReadAuth { user });
-        }
+        scoped_token_user(parts, state, "read", |t| t.can_read())
+            .await
+            .map(|user| ReadAuth { user })
+    }
+}
 
-        let header = parts.headers.get("authorization").and_then(|v| v.to_str().ok()).unwrap_or("");
-        let token = header
-            .strip_prefix("Token ")
-            .or_else(|| header.strip_prefix("token "))
-            .unwrap_or("")
-            .trim();
-        if !token.is_empty() {
-            return match state.db.validate_token(token).await {
-                Ok(Some(t)) if t.can_read() => Ok(ReadAuth { user: t.user }),
-                // A valid token without the grant is 403, not 401: the caller
-                // authenticated fine and re-authenticating will not help. A 401
-                // would send a client into a token-refresh loop it cannot win.
-                Ok(Some(_)) => Err((
-                    StatusCode::FORBIDDEN,
-                    Json(super::models::ErrorResponse {
-                        code: 403,
-                        error: "This token does not have the 'read' scope".into(),
-                    }),
-                )),
-                Ok(None) => Err(unauthorized("Invalid token")),
-                Err(e) => {
-                    tracing::error!("Token validation error: {}", e);
-                    Err((
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(super::models::ErrorResponse {
-                            code: 500,
-                            error: "Internal server error".into(),
-                        }),
-                    ))
-                }
-            };
-        }
+/// `WriteAuth` accepts a session cookie **or** an `Authorization: Token` header
+/// whose token carries the `write` scope.
+///
+/// It exists because `/api/v1/` was session-only, which meant a paired client
+/// could reach `/1/*` and five GETs and nothing else — no loves, no notes, no
+/// manual listens, no chain edits. Documenting the API without this would have
+/// described a promise the server does not keep.
+///
+/// The rules are `ReadAuth`'s, with one addition that must not be relaxed:
+///
+/// * **`write` is an explicit grant**, never implied by `submit` or by `read`.
+/// * **Only the caller's own data.** Every handler must still scope its queries
+///   and its ownership checks by `user.user_id`. This widens *who may ask*, not
+///   *what may be touched* — a token must not become a way around a check that
+///   a session is subject to.
+/// * **Nothing under `/admin/`, ever.** User management, token issuance, source
+///   credentials and the maintenance jobs stay on session-only `AuthUser`. A
+///   leaked token is a bad afternoon; a leaked token that can mint more tokens
+///   or read another household member's sources is a different category.
+pub struct WriteAuth {
+    pub user: AuthUser,
+}
 
-        Err(unauthorized(
-            "Authentication required. Provide a session cookie or Authorization: Token header.",
-        ))
+#[axum::async_trait]
+impl FromRequestParts<Arc<super::AppState>> for WriteAuth {
+    type Rejection = Rejection;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &Arc<super::AppState>,
+    ) -> Result<Self, Self::Rejection> {
+        scoped_token_user(parts, state, "write", |t| t.can_write())
+            .await
+            .map(|user| WriteAuth { user })
     }
 }
 

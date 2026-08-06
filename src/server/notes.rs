@@ -28,7 +28,7 @@ use serde::Deserialize;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use super::auth::AuthUser;
+use super::auth::{ReadAuth, WriteAuth};
 use super::models::ErrorResponse;
 use super::AppState;
 use crate::db::{Database, EntityRow, NoteRow};
@@ -278,7 +278,7 @@ struct SaveNoteRequest {
 /// one already there. The previous body is archived by the database layer.
 async fn save_note(
     State(state): State<Arc<AppState>>,
-    user: AuthUser,
+    WriteAuth { user }: WriteAuth,
     Json(body): Json<SaveNoteRequest>,
 ) -> impl IntoResponse {
     let visibility = body.visibility.unwrap_or_else(|| "private".into());
@@ -319,7 +319,10 @@ async fn save_note(
 }
 
 /// GET /api/v1/notes — everything this user has written, newest edit first.
-async fn list_notes(State(state): State<Arc<AppState>>, user: AuthUser) -> impl IntoResponse {
+async fn list_notes(
+    State(state): State<Arc<AppState>>,
+    ReadAuth { user }: ReadAuth,
+) -> impl IntoResponse {
     match state.db.list_notes(user.user_id).await {
         Ok(rows) => {
             let mut out = Vec::with_capacity(rows.len());
@@ -335,7 +338,7 @@ async fn list_notes(State(state): State<Arc<AppState>>, user: AuthUser) -> impl 
 /// GET /api/v1/notes/:id
 async fn get_note(
     State(state): State<Arc<AppState>>,
-    user: AuthUser,
+    ReadAuth { user }: ReadAuth,
     Path(id): Path<i64>,
 ) -> impl IntoResponse {
     match state.db.get_note(user.user_id, id).await {
@@ -351,7 +354,7 @@ async fn get_note(
 /// DELETE /api/v1/notes/:id — drops the revisions with it.
 async fn delete_note(
     State(state): State<Arc<AppState>>,
-    user: AuthUser,
+    WriteAuth { user }: WriteAuth,
     Path(id): Path<i64>,
 ) -> impl IntoResponse {
     match state.db.delete_note(user.user_id, id).await {
@@ -366,7 +369,7 @@ async fn delete_note(
 /// GET /api/v1/notes/:id/revisions — earlier bodies, newest first.
 async fn note_revisions(
     State(state): State<Arc<AppState>>,
-    user: AuthUser,
+    ReadAuth { user }: ReadAuth,
     Path(id): Path<i64>,
 ) -> impl IntoResponse {
     match state.db.note_revisions(user.user_id, id).await {
@@ -399,7 +402,7 @@ struct PreviewRequest {
 /// what a shortcode will actually resolve to before you commit to it.
 async fn preview(
     State(state): State<Arc<AppState>>,
-    user: AuthUser,
+    WriteAuth { user }: WriteAuth,
     Json(body): Json<PreviewRequest>,
 ) -> impl IntoResponse {
     // The target only supplies context here; a preview never creates a note,
@@ -458,7 +461,7 @@ struct ForQuery {
 /// the resolved target to open an editor on it.
 async fn note_for(
     State(state): State<Arc<AppState>>,
-    user: AuthUser,
+    ReadAuth { user }: ReadAuth,
     Query(q): Query<ForQuery>,
 ) -> impl IntoResponse {
     let spec = TargetSpec {
@@ -525,7 +528,7 @@ struct LoveRequest {
 /// POST /api/v1/loves — love or un-love an entity.
 async fn set_love(
     State(state): State<Arc<AppState>>,
-    user: AuthUser,
+    WriteAuth { user }: WriteAuth,
     Json(body): Json<LoveRequest>,
 ) -> impl IntoResponse {
     let entity_id = match resolve_target(&state.db, user.user_id, &body.target).await {
@@ -574,7 +577,10 @@ async fn set_love(
 /// lowercased — `Database::entity_key`), so the client fetches this once and
 /// matches locally. Entities are only created when something is annotated or
 /// loved, so this stays small even on a large library.
-async fn love_keys(State(state): State<Arc<AppState>>, user: AuthUser) -> impl IntoResponse {
+async fn love_keys(
+    State(state): State<Arc<AppState>>,
+    ReadAuth { user }: ReadAuth,
+) -> impl IntoResponse {
     match state.db.loved_keys(user.user_id).await {
         Ok(keys) => (StatusCode::OK, Json(serde_json::json!({ "keys": keys }))).into_response(),
         Err(e) => server_error(e),
@@ -582,7 +588,10 @@ async fn love_keys(State(state): State<Arc<AppState>>, user: AuthUser) -> impl I
 }
 
 /// GET /api/v1/loves
-async fn list_loves(State(state): State<Arc<AppState>>, user: AuthUser) -> impl IntoResponse {
+async fn list_loves(
+    State(state): State<Arc<AppState>>,
+    ReadAuth { user }: ReadAuth,
+) -> impl IntoResponse {
     match state.db.list_loves(user.user_id).await {
         Ok(rows) => {
             let out: Vec<_> = rows
@@ -608,7 +617,7 @@ async fn list_loves(State(state): State<Arc<AppState>>, user: AuthUser) -> impl 
 /// writes or loves something.
 async fn listen_annotations(
     State(state): State<Arc<AppState>>,
-    user: AuthUser,
+    ReadAuth { user }: ReadAuth,
     Path(id): Path<i64>,
 ) -> impl IntoResponse {
     let Ok(Some(listen)) = state.db.get_scrobble(user.user_id, id).await else {
@@ -651,7 +660,7 @@ async fn listen_annotations(
 /// GET /api/v1/entities/:id
 async fn get_entity(
     State(state): State<Arc<AppState>>,
-    user: AuthUser,
+    ReadAuth { user }: ReadAuth,
     Path(id): Path<i64>,
 ) -> impl IntoResponse {
     match state.db.get_entity(id).await {

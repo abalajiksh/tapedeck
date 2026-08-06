@@ -6509,9 +6509,28 @@ impl TokenAuth {
     /// silently gain the ability to enumerate the user's gear because the
     /// scopes column happened to exist.
     pub fn can_read(&self) -> bool {
+        self.has_scope("read")
+    }
+
+    /// May this token change the caller's own data?
+    ///
+    /// Same discipline as `can_read`, and for a sharper reason: `write` is the
+    /// scope that lets a paired client edit a listen, love a track or rewrite a
+    /// signal chain. `submit` deliberately does not imply it — posting listens
+    /// is what every scrobble client on the internet does, and it must not
+    /// quietly carry the power to delete the history it is appending to.
+    ///
+    /// `write` does **not** imply `read` either. They are separate grants
+    /// because they are separately dangerous, and a client that needs both asks
+    /// for both.
+    pub fn can_write(&self) -> bool {
+        self.has_scope("write")
+    }
+
+    fn has_scope(&self, want: &str) -> bool {
         self.scopes
             .split(|c: char| c == ',' || c.is_whitespace())
-            .any(|s| matches!(s.trim(), "read" | "all"))
+            .any(|s| s.trim() == want || s.trim() == "all")
     }
 }
 
@@ -6787,6 +6806,45 @@ mod tests {
 
         let reader = db.create_token(uid, "plugin", "submit read", None).await.unwrap();
         assert!(db.validate_token(&reader).await.unwrap().unwrap().can_read());
+    }
+
+    /// The same discipline for `write`, and the pair that matters most: `read`
+    /// and `write` must not imply each other. A phone that may edit a listen is
+    /// a different grant from one that may enumerate the history, and every
+    /// scrobble client in the world holds `submit` — that one must carry
+    /// neither.
+    #[tokio::test]
+    async fn write_is_its_own_grant_and_implies_nothing() {
+        let db = testdb().await;
+        let uid = db.create_user("ash", None, "pw", "user").await.unwrap();
+
+        let submit = db.create_token(uid, "scrobbler", "submit", None).await.unwrap();
+        let t = db.validate_token(&submit).await.unwrap().unwrap();
+        assert!(!t.can_write(), "submit must not imply write");
+        assert!(!t.can_read(), "submit must not imply read");
+
+        // read does not carry write...
+        let reader = db.create_token(uid, "plugin", "submit read", None).await.unwrap();
+        let t = db.validate_token(&reader).await.unwrap().unwrap();
+        assert!(t.can_read());
+        assert!(!t.can_write(), "read must not imply write");
+
+        // ...and write does not carry read.
+        let writer = db.create_token(uid, "phone", "submit write", None).await.unwrap();
+        let t = db.validate_token(&writer).await.unwrap().unwrap();
+        assert!(t.can_write());
+        assert!(!t.can_read(), "write must not imply read");
+
+        // `all` is the one grant that covers both.
+        let every = db.create_token(uid, "trusted", "all", None).await.unwrap();
+        let t = db.validate_token(&every).await.unwrap().unwrap();
+        assert!(t.can_read() && t.can_write());
+
+        // Substrings must not match: `rewrite` is not `write`.
+        let sneaky = db.create_token(uid, "odd", "submit rewrite readonly", None).await.unwrap();
+        let t = db.validate_token(&sneaky).await.unwrap().unwrap();
+        assert!(!t.can_write(), "'rewrite' must not grant write");
+        assert!(!t.can_read(), "'readonly' must not grant read");
     }
 
     /// `save_scrobble` hardcoded `status = 'pending'`, so a listen submitted as
