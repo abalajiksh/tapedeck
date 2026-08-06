@@ -26,8 +26,16 @@ src/.DS_Store
 src/sources/.DS_Store
 src/sinks/.DS_Store
 .idea/
+# SQLite databases and their runtime sidecars. The -wal and -shm files were
+# tracked by accident until v0.41.1: they are pure runtime state, they change on
+# every single write, and a WAL holds listens that have not been checkpointed
+# into the .db yet — so committing one publishes listening data as well as noise.
 scrobbles.db
 tapedeck.db
+everynoise.db
+*.db-wal
+*.db-shm
+*.db-journal
 
 # Credential-encryption key. Never commit, and keep it OUT of database backups —
 # a backup plus this file is the same as storing credentials in the clear.
