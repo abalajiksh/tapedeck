@@ -193,4 +193,31 @@ mod tests {
         assert_eq!(normalise("/api/v1/import/jobs/:job_id"), normalise("/api/v1/import/jobs/{id}"));
         assert_ne!(normalise("/api/v1/loves"), normalise("/api/v1/loves/keys"));
     }
+
+    /// `info.version` has to move by hand, and it didn't: it read 0.41.0 while
+    /// the binary shipped 0.45.0, four releases apart.
+    ///
+    /// That matters more here than a stale number usually would. The whole
+    /// argument for serving the spec *from the binary* is that it describes
+    /// **that** instance at **that** version — a client can ask its own server
+    /// what it supports instead of guessing from a docs site. A version field
+    /// that lies undoes exactly the property the endpoint exists for.
+    ///
+    /// The drift test above only compares paths, so it never noticed. This is
+    /// the cheap half of the guarantee.
+    #[test]
+    fn the_spec_states_the_version_the_binary_actually_is() {
+        let want = env!("CARGO_PKG_VERSION");
+        // First `version:` at two-space indent — that is `info.version`. Any
+        // deeper indent belongs to a schema property called "version".
+        let found = super::OPENAPI_YAML
+            .lines()
+            .find_map(|l| l.strip_prefix("  version:"))
+            .map(str::trim)
+            .expect("openapi.yaml has no info.version");
+        assert_eq!(
+            found, want,
+            "openapi.yaml says {found}, Cargo.toml says {want} — bump the spec too"
+        );
+    }
 }

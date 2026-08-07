@@ -401,6 +401,12 @@
 							<div style="height:10px;border-radius:999px;background:var(--td-track);overflow:hidden;"><div style="width:{l.pct}%;height:100%;background:linear-gradient(90deg,#7a8a5e,#aebf92);border-radius:999px;"></div></div>
 						</div>
 					{/each}
+					<p style="color:var(--td-muted-3);font-size:12px;margin:4px 0 0;">
+						One language per listen, so unlike genres these really are shares of
+						plays. Non-Latin scripts are certain; a Latin-script title is looked up
+						as a work in MusicBrainz and defaults to English when nothing says
+						otherwise.
+					</p>
 				</div>
 			{:else}
 				<p style="color:var(--td-muted-3);font-size:12.5px;margin:0;">Language breakdown fills in as listens are classified (Settings → run enrichment).</p>
@@ -420,8 +426,14 @@
 		display: grid;
 		grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
 		gap: 18px;
-		align-items: start;
 	}
+	/* The two panels hold different numbers of bars and footnotes of different
+	   lengths, so left alone one ends higher than the other and the pair reads
+	   as misaligned. `align-items: start` was what pinned them to their own
+	   content heights; letting the column stretch and the panel fill it means
+	   they match whatever ends up inside. */
+	.breakdowns > div { display: flex; flex-direction: column; min-width: 0; }
+	.breakdowns > div > :global(.panel) { flex: 1; }
 
 	/* One template for the labels and the cells, so they can't drift apart.
 	   The columns are `1fr`, not a fixed cap: capping them left most of the
