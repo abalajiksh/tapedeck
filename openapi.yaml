@@ -26,7 +26,7 @@ openapi: 3.1.0
 
 info:
   title: Tapedeck
-  version: 0.46.0
+  version: 0.47.0
   summary: Self-hosted scrobbler and listening journal.
   description: |
     Tapedeck ingests listens, enriches them with MusicBrainz metadata, stores
@@ -2847,6 +2847,76 @@ paths:
         '404': { $ref: '#/components/responses/NotFound' }
 
   # ── Playlists ──────────────────────────────────────────────────────────────
+  /api/v1/playlist-lab:
+    get:
+      tags: [Playlists]
+      summary: The vector space the Playlist Lab generates from.
+      description: |
+        Session-only. Returns the candidate pool with a position for each track,
+        plus what every axis means.
+
+        **Read `granularity` and `note` before using this.** The space is ten
+        real dimensions, and they come from two different places:
+
+        * **Six are about the music** (`group: sound`), from the Every Noise
+          genre map — `x` (dense/atmospheric ↔ spiky/bouncy), `y` (organic ↔
+          mechanical/electric), the colour's three channels, and how far apart a
+          track's own genres sit.
+        * **Four are about the listener** (`group: habit`) — era, familiarity,
+          hour of day, recency — from their own history.
+
+        These are **not** per-recording audio features. Genres attach to
+        artists, so `granularity` is `artist` and every track by one artist
+        shares its six `sound` coordinates exactly; the `habit` axes are the
+        only thing separating them. Anything describing this as track-level
+        audio similarity is wrong. A client mixing the two groups without
+        weighting will find "similar" quietly means "played at the same hour".
+
+        Values are normalised 0–1 against **the pool's own extremes**, so
+        "newer" means newer than the rest of this collection. A track whose
+        genres have no place on the map is **dropped, not centred** — placing it
+        in the middle would invent a similarity it does not have — and the count
+        comes back as `unplaced`.
+
+        `tracks` is compact — `[title, artist, album, plays, [v0…v9]]` — because
+        on a 3,000-track pool the repeated key names would be most of the
+        payload. Answers `409` when the genre map has not been fetched, when
+        there is no history, or when nothing has been placed yet.
+      parameters:
+        - { name: min_plays, in: query, schema: { type: integer, default: 2, minimum: 1, maximum: 50 }, description: 'Loved tracks bypass this entirely.' }
+        - { name: cap, in: query, schema: { type: integer, default: 3000, minimum: 50, maximum: 10000 } }
+      responses:
+        '200':
+          description: OK.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  dims:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        key: { type: string }
+                        label: { type: string }
+                        low: { type: string, description: What the low end of the axis means. }
+                        high: { type: string }
+                        group: { type: string, enum: [sound, habit] }
+                  tracks:
+                    type: array
+                    description: '`[title, artist, album, plays, vector]` per track.'
+                    items: { type: array }
+                  loved: { type: array, items: { type: integer }, description: Indices into `tracks`. }
+                  pool: { type: integer }
+                  considered: { type: integer, description: Distinct tracks before the pool rules. }
+                  unplaced: { type: integer, description: Dropped for having no placeable genre. }
+                  min_plays: { type: integer }
+                  granularity: { type: string, enum: [artist] }
+                  note: { type: string }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '409': { description: No genre map, no history, or nothing placed yet. }
+
   /api/v1/playlist-targets:
     get:
       tags: [Playlists]

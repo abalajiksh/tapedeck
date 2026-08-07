@@ -797,6 +797,44 @@ export interface Rediscovery {
 	gear: { id: number; name: string; type: string }[];
 }
 
+/** One axis of the Playlist Lab's space.
+ *
+ *  `group` matters: `sound` axes come from the Every Noise genre map (reached
+ *  through the track's artist, so every track by one artist shares them),
+ *  `habit` axes come from your own listening. Mixing them is deliberate and the
+ *  weighting slider is what keeps "similar" from meaning "played at the same
+ *  hour". */
+export interface LabDim {
+	key: string;
+	label: string;
+	low: string;
+	high: string;
+	group: 'sound' | 'habit';
+}
+
+export interface LabTrack {
+	title: string;
+	artist: string;
+	album: string | null;
+	plays: number;
+	vector: number[];
+}
+
+export interface PlaylistLab {
+	dims: LabDim[];
+	tracks: LabTrack[];
+	/** Indices into `tracks` that you have loved. */
+	loved: number[];
+	pool: number;
+	considered: number;
+	/** Tracks dropped because no genre of theirs has a place on the map. */
+	unplaced: number;
+	min_plays: number;
+	/** Always "artist" today — the honest ceiling, stated by the server. */
+	granularity: string;
+	note: string;
+}
+
 /** A server this instance could send a playlist to.
  *
  *  Comes from the user's own enabled sources — there is no separate credential
@@ -1150,6 +1188,35 @@ class TapedeckAPI {
 	}
 	async neverOnGear(equipmentId: number): Promise<{ rows: RediscoveryRow[] }> {
 		return this.get(`/api/v1/rediscovery/gear/${equipmentId}`);
+	}
+
+	// ── Playlist Lab ──
+	async playlistLab(minPlays?: number): Promise<PlaylistLab> {
+		const qs = minPlays ? `?min_plays=${minPlays}` : '';
+		const raw = await this.get<{
+			dims: LabDim[];
+			tracks: [string, string, string | null, number, number[]][];
+			loved: number[];
+			pool: number;
+			considered: number;
+			unplaced: number;
+			min_plays: number;
+			granularity: string;
+			note: string;
+		}>(`/api/v1/playlist-lab${qs}`);
+		// Sent as arrays rather than objects — on a 3,000-track pool the
+		// repeated key names would be most of the payload. Unpacked once here so
+		// nothing downstream has to know the wire shape.
+		return {
+			...raw,
+			tracks: raw.tracks.map(([title, artist, album, plays, vector]) => ({
+				title,
+				artist,
+				album,
+				plays,
+				vector
+			}))
+		};
 	}
 
 	// ── Pushing a generated list to a media server ──

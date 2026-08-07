@@ -12,6 +12,7 @@ mod models;
 mod musicbrainz;
 mod notes;
 mod openapi;
+mod playlist_lab;
 mod playlists;
 mod rockbox;
 mod server;

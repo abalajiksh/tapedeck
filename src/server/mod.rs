@@ -16,6 +16,7 @@ mod notes;
 pub mod now_playing;
 mod pairing;
 pub mod physical;
+mod playlist_lab;
 mod playlists;
 mod preferences;
 pub mod ratelimit;
@@ -101,6 +102,7 @@ pub fn build_app(state: Arc<AppState>) -> Router {
         .merge(physical::create_physical_router())
         .merge(rediscovery::create_rediscovery_router())
         .merge(playlists::create_playlists_router())
+        .merge(playlist_lab::create_playlist_lab_router())
         .merge(everynoise::create_everynoise_router())
         .merge(pairing::create_pairing_router())
         .merge(reports::create_reports_router())

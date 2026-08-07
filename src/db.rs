@@ -2760,6 +2760,47 @@ impl Database {
         .await
     }
 
+    /// Every listen the Playlist Lab needs to build its vector space.
+    ///
+    /// One scan, folded per track in Rust, for the same reason `report_rows`
+    /// is: the hour-of-day axis has to be bucketed in the **user's** timezone
+    /// and SQL here cannot do that, and the genre list is a JSON array that has
+    /// to be joined to the Every Noise map through `genre_key` — which SQLite
+    /// cannot compute either. Grouping in SQL would mean giving up both.
+    ///
+    /// `skipped = FALSE` like every other counting query: a skip says nothing
+    /// about whether you want a track on a playlist.
+    pub async fn playlist_lab_rows(
+        &self,
+        user_id: i64,
+        limit: i64,
+    ) -> Result<Vec<crate::playlist_lab::LabRow>, sqlx::Error> {
+        let rows: Vec<(i64, String, String, Option<String>, Option<String>, Option<i64>)> =
+            sqlx::query_as(
+                "SELECT timestamp, artist, title, album, genres, release_year
+                   FROM scrobbles
+                  WHERE user_id = ? AND skipped = FALSE
+                  ORDER BY timestamp DESC LIMIT ?",
+            )
+            .bind(user_id)
+            .bind(limit)
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(rows
+            .into_iter()
+            .map(|(timestamp, artist, title, album, genres, release_year)| {
+                crate::playlist_lab::LabRow {
+                    timestamp,
+                    artist,
+                    title,
+                    album,
+                    genres,
+                    release_year,
+                }
+            })
+            .collect())
+    }
+
     /// Sides played by hand, for the "off the shelf" block.
     pub async fn physical_plays_in(
         &self,

@@ -399,6 +399,33 @@ fuzzy search result for the wrong artist is discarded rather than added; a
 library that doesn't have everything gets what it has, and the tracks that
 didn't land are named.
 
+### Playlist Lab
+
+Grow a playlist by moving through the space your listening actually lives in.
+Three ways: **similar songs** (nearest neighbours of your seeds), **dimensional
+crawl** (a path traced between two or more seeds, one step at a time) and
+**rollercoaster** (a trajectory that climbs to peaks and dives to lows along
+whichever axis you pick). A phase-space plot shows any two of the ten
+dimensions, with your playlist drawn on it.
+
+**What the ten dimensions are, precisely.** Six come from the Every Noise genre
+map, reached through each track's artist — dense/atmospheric ↔ spiky/bouncy,
+organic ↔ mechanical/electric, the three colour channels (Every Noise encodes
+audio character in them), and how far apart a track's own genres sit. Four come
+from your own listening: era, familiarity, hour of day, recency. A *Judge by*
+slider weights the two halves, because without it "similar" drifts toward
+"played at the same hour".
+
+**This is not a per-recording audio analysis, and nothing here pretends
+otherwise.** Genres attach to artists, so every track by one artist shares its
+six sound coordinates; the listening axes are what separate them. Tracks whose
+genres have no place on the map are dropped rather than parked in the middle,
+and the count is reported. Everything is built from music you already own.
+
+Needs the genre map fetched (Settings → Genre Map — one request) and the genre
+backfill to have run. Finished playlists export as M3U, JSON or plain text, or
+go straight to your Plex, Jellyfin or Navidrome with **Send to…**.
+
 ### Musical Personality
 
 The Statistics screen profiles *how* you listen across five explainable axes —

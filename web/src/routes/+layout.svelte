@@ -30,6 +30,7 @@
 		{ href: '/notes', label: 'Liner Notes', icon: 'notes' },
 		{ href: '/shelf', label: 'The Shelf', icon: 'shelf' },
 		{ href: '/rediscover', label: 'Rediscovery', icon: 'rediscover' },
+		{ href: '/playlists', label: 'Playlist Lab', icon: 'playlists' },
 		{ href: '/map', label: 'Genre Map', icon: 'map' },
 		{ href: '/import', label: 'Import', icon: 'import' },
 		{ href: '/chains', label: 'Signal Chains', icon: 'chains' },
@@ -159,7 +160,8 @@
 					{:else if item.icon === 'reports'}<svg viewBox="0 0 24 24" width="20" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><path d="M6 3h9l4 4v14a1 1 0 0 1-1 1H6a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1z"/><path d="M14 3v5h5"/><path d="M9 13h6"/><path d="M9 17h4"/></svg>
 						{:else if item.icon === 'import'}<svg viewBox="0 0 24 24" width="20" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12"/><path d="M8 11l4 4 4-4"/><path d="M5 21h14"/></svg>
 						{:else if item.icon === 'notes'}<svg viewBox="0 0 24 24" width="20" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><path d="M6 4h9l4 4v12H6z"/><path d="M9 12h7"/><path d="M9 16h5"/></svg>
-						{:else if item.icon === 'map'}<svg viewBox="0 0 24 24" width="20" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><path d="M9 4 3 6.5v13L9 17l6 2.5 6-2.5v-13L15 7z"/><path d="M9 4v13"/><path d="M15 7v12.5"/></svg>
+						{:else if item.icon === 'playlists'}<svg viewBox="0 0 24 24" width="20" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><path d="M5 17.5l5.5-8.5 4 5 4.5-8"/><circle cx="5" cy="17.5" r="1.9" fill="currentColor" stroke="none"/><circle cx="10.5" cy="9" r="1.9" fill="currentColor" stroke="none"/><circle cx="14.5" cy="14" r="1.9" fill="currentColor" stroke="none"/><circle cx="19" cy="6" r="1.9" fill="currentColor" stroke="none"/></svg>
+					{:else if item.icon === 'map'}<svg viewBox="0 0 24 24" width="20" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><path d="M9 4 3 6.5v13L9 17l6 2.5 6-2.5v-13L15 7z"/><path d="M9 4v13"/><path d="M15 7v12.5"/></svg>
 						{:else if item.icon === 'loved'}<svg viewBox="0 0 24 24" width="20" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><path d="M20.8 6.6a5 5 0 0 0-7.3-.5L12 7.6l-1.5-1.5a5 5 0 0 0-7.3 6.8L12 21l8.8-8.1a5 5 0 0 0 0-6.3z"/></svg>
 						{:else if item.icon === 'rediscover'}<svg viewBox="0 0 24 24" width="20" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><path d="M3 5v5h5"/><path d="M4.2 14a8 8 0 1 0 1.3-6.3L3 10"/></svg>
 						{:else if item.icon === 'shelf'}<svg viewBox="0 0 24 24" width="20" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="3"/></svg>
