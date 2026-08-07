@@ -95,6 +95,27 @@ pub struct EntityRow {
     pub created_at: i64,
 }
 
+/// One row on the Loved page: the entity, plus what the user's own history
+/// says about it. Loves span three kinds, so `album` and the artwork columns
+/// are absent for an artist and present for the other two.
+#[derive(Debug, serde::Serialize)]
+pub struct LovedEntity {
+    pub id: i64,
+    pub kind: String,
+    pub name: String,
+    pub artist_name: String,
+    pub mbid: Option<String>,
+    pub loved_at: i64,
+    pub plays: i64,
+    pub last_played: Option<i64>,
+    pub album: Option<String>,
+    pub artwork_url: Option<String>,
+    pub caa_id: Option<i64>,
+    pub caa_release_mbid: Option<String>,
+    pub note_id: Option<i64>,
+    pub note_excerpt: Option<String>,
+}
+
 /// Aggregates behind the album and artist pages (UX 4). These are shapes for
 /// one user's own history, not catalogue facts — `plays` is *your* plays.
 #[derive(Debug, FromRow, serde::Serialize)]
@@ -5492,6 +5513,107 @@ impl Database {
             .into_iter()
             .map(|(id, kind, name, artist_name, mbid, created_at, loved_at)| {
                 (EntityRow { id, kind, name, artist_name, mbid, created_at }, loved_at)
+            })
+            .collect())
+    }
+
+    /// Every love, with what the Loved page needs to render a row: how often
+    /// you have played the thing, when you last did, its artwork, and whether
+    /// there is a liner note on it.
+    ///
+    /// Four queries regardless of how many loves there are, rather than a
+    /// per-row lookup. A love is an *entity* and entities come in three kinds
+    /// that live in different columns of `scrobbles`, so there is one aggregate
+    /// per kind and they are zipped in Rust on the same `entity_key` the loves
+    /// themselves are keyed by — see `Database::entity_key`, and keep the two in
+    /// step or hearts and rows stop matching with nothing to show for it.
+    ///
+    /// The bare `artwork_url` / `caa_id` columns beside `MAX(timestamp)` are
+    /// deliberate: SQLite guarantees those come from the row that produced the
+    /// max, so a row's cover is the one its *most recent* listen carried. That
+    /// is a documented min/max special case, not an accident of grouping.
+    pub async fn loves_detailed(&self, user_id: i64) -> Result<Vec<LovedEntity>, sqlx::Error> {
+        let loves = self.list_loves(user_id).await?;
+        if loves.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        type Agg = (String, i64, i64, Option<String>, Option<i64>, Option<String>, Option<String>);
+
+        // Recordings and releases differ only in which column names the thing.
+        let mut by_key: HashMap<String, (i64, i64, Option<String>, Option<i64>, Option<String>, Option<String>)> =
+            HashMap::new();
+        for (kind, name_col) in [("recording", "title"), ("release", "album")] {
+            let rows: Vec<Agg> = sqlx::query_as(&format!(
+                "SELECT LOWER(TRIM(artist)) || '|' || LOWER(TRIM({name_col})) AS k,
+                        COUNT(*) AS plays, MAX(timestamp) AS last_played,
+                        artwork_url, caa_id, caa_release_mbid, album
+                   FROM scrobbles
+                  WHERE user_id = ? AND skipped = FALSE
+                    AND {name_col} IS NOT NULL AND TRIM({name_col}) != ''
+                  GROUP BY k"
+            ))
+            .bind(user_id)
+            .fetch_all(&self.pool)
+            .await?;
+            for (k, plays, last, art, caa, caa_mbid, album) in rows {
+                by_key.insert(format!("{kind}|{k}"), (plays, last, art, caa, caa_mbid, album));
+            }
+        }
+        let artist_rows: Vec<(String, i64, i64, Option<String>)> = sqlx::query_as(
+            "SELECT LOWER(TRIM(s.artist)) AS k, COUNT(*) AS plays, MAX(s.timestamp) AS last_played,
+                    (SELECT a.image_url FROM artists a WHERE a.name_key = LOWER(TRIM(s.artist)))
+               FROM scrobbles s
+              WHERE s.user_id = ? AND s.skipped = FALSE AND TRIM(s.artist) != ''
+              GROUP BY k",
+        )
+        .bind(user_id)
+        .fetch_all(&self.pool)
+        .await?;
+        for (k, plays, last, image) in artist_rows {
+            by_key.insert(format!("artist||{k}"), (plays, last, image, None, None, None));
+        }
+
+        // Notes are per (user, entity); the excerpt is what the row shows.
+        let note_rows: Vec<(i64, i64, String)> = sqlx::query_as(
+            "SELECT entity_id, id, body_md FROM notes
+              WHERE user_id = ? AND entity_id IS NOT NULL",
+        )
+        .bind(user_id)
+        .fetch_all(&self.pool)
+        .await?;
+        let notes: HashMap<i64, (i64, String)> =
+            note_rows.into_iter().map(|(e, id, body)| (e, (id, body))).collect();
+
+        Ok(loves
+            .into_iter()
+            .map(|(e, loved_at)| {
+                let key = Self::entity_key(&e.kind, &e.artist_name, &e.name);
+                let agg = by_key.get(&key);
+                let note = notes.get(&e.id);
+                LovedEntity {
+                    id: e.id,
+                    kind: e.kind,
+                    name: e.name,
+                    artist_name: e.artist_name,
+                    mbid: e.mbid,
+                    loved_at,
+                    plays: agg.map(|a| a.0).unwrap_or(0),
+                    last_played: agg.map(|a| a.1),
+                    artwork_url: agg.and_then(|a| a.2.clone()).filter(|u| !u.is_empty()),
+                    caa_id: agg.and_then(|a| a.3),
+                    caa_release_mbid: agg.and_then(|a| a.4.clone()),
+                    album: agg.and_then(|a| a.5.clone()),
+                    note_id: note.map(|n| n.0),
+                    note_excerpt: note.map(|n| {
+                        let body = n.1.trim().replace('\n', " ");
+                        if body.chars().count() > 90 {
+                            format!("{}…", body.chars().take(90).collect::<String>())
+                        } else {
+                            body
+                        }
+                    }),
+                }
             })
             .collect())
     }

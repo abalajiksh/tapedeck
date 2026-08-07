@@ -225,6 +225,26 @@ export interface ReportPeriod {
 	} | null;
 }
 
+/** One row on the Loved page: the entity, plus what your own history says
+ *  about it. A love is an entity, and entities come in three kinds — `album`
+ *  and the artwork fields are absent for an artist. */
+export interface LovedRow {
+	/** Narrower than `Entity` on purpose — a loves listing has no use for
+	 *  `created_at`, and sending it would only invite it being read as "when
+	 *  you loved this", which is `loved_at`. */
+	entity: Pick<Entity, 'id' | 'kind' | 'name' | 'artist_name' | 'mbid'>;
+	loved_at: number;
+	plays: number;
+	last_played: number | null;
+	album: string | null;
+	artwork_url: string | null;
+	caa_id: number | null;
+	caa_release_mbid: string | null;
+	note_id: number | null;
+	/** First ~90 characters of the liner note, if there is one. */
+	note_excerpt: string | null;
+}
+
 export interface Reports {
 	unit: 'week' | 'month' | 'year';
 	timezone: string;
@@ -1296,7 +1316,7 @@ class TapedeckAPI {
 		}
 		return this.get(`/api/v1/notes/for?${q}`);
 	}
-	async getLoves(): Promise<{ loves: { entity: Entity; loved_at: number }[] }> {
+	async getLoves(): Promise<{ loves: LovedRow[] }> {
 		return this.get('/api/v1/loves');
 	}
 	/** Identity keys of everything loved, so rows can render a heart without

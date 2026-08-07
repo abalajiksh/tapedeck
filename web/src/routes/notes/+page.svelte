@@ -3,7 +3,7 @@
 	import { page } from '$app/stores';
 	import { goto } from '$app/navigation';
 	import { api } from '$lib/api';
-	import type { Note, NoteTarget, NoteRevision, Entity, Visibility } from '$lib/api';
+	import type { Note, NoteTarget, NoteRevision, Entity, LovedRow, Visibility } from '$lib/api';
 	import { formatDateTime, timeAgo } from '$lib/utils';
 
 	/**
@@ -14,7 +14,7 @@
 	 */
 
 	let notes: Note[] = [];
-	let loves: { entity: Entity; loved_at: number }[] = [];
+	let loves: LovedRow[] = [];
 	let loading = true;
 	let error = '';
 
@@ -56,7 +56,9 @@
 		return { label: 'Untitled', kind: '' };
 	}
 
-	function entityLabel(e: Entity): { label: string; kind: string } {
+	// Takes only what it reads, so it works for both a full `Entity` and the
+	// narrower one a loves listing carries.
+	function entityLabel(e: Pick<Entity, 'kind' | 'name' | 'artist_name'>): { label: string; kind: string } {
 		const kind = e.kind === 'recording' ? 'track' : e.kind === 'release' ? 'album' : 'artist';
 		return { label: e.artist_name ? `${e.name} — ${e.artist_name}` : e.name, kind };
 	}

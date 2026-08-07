@@ -524,6 +524,15 @@ components:
         kind: { type: string, enum: [artist, release, recording] }
         name: { type: string }
         artist: { type: [string, 'null'] }
+        loved_at: { type: integer, description: Unix seconds. }
+        plays: { type: integer, description: 'Your plays of this thing. 0 when the entity exists only because it was annotated.' }
+        last_played: { type: [integer, 'null'] }
+        album: { type: [string, 'null'], description: 'For a recording, the record it sits on. Null for an artist.' }
+        artwork_url: { type: [string, 'null'], description: 'From the most recent listen of it; an artist gets their portrait instead.' }
+        caa_id: { type: [integer, 'null'] }
+        caa_release_mbid: { type: [string, 'null'] }
+        note_id: { type: [integer, 'null'], description: 'The liner note on this entity, if there is one.' }
+        note_excerpt: { type: [string, 'null'], description: 'First ~90 characters of that note.' }
         loved_at: { type: integer }
 
 paths:
@@ -1669,7 +1678,13 @@ paths:
     get:
       tags: [Loves]
       summary: Loved entities.
-      description: 'Scope: `read` *(since v0.39)*.'
+      description: |
+        Scope: `read` *(since v0.39)*.
+
+        Since v0.43 each row carries what the Loved page needs to render it —
+        plays, last played, artwork and the liner note — rather than the bare
+        entity. Four queries regardless of how many loves there are.
+      
       security: [{ sessionCookie: [] }, { apiToken: [read] }]
       parameters: [{ name: kind, in: query, schema: { type: string, enum: [artist, release, recording] } }]
       responses:

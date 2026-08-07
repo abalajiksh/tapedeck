@@ -592,13 +592,28 @@ async fn list_loves(
     State(state): State<Arc<AppState>>,
     ReadAuth { user }: ReadAuth,
 ) -> impl IntoResponse {
-    match state.db.list_loves(user.user_id).await {
+    // `entity` is kept alongside the flattened fields so the shape stays
+    // backwards-compatible for anything already reading it — the Loved page
+    // wants plays, artwork and the note, which the entity row has never had.
+    match state.db.loves_detailed(user.user_id).await {
         Ok(rows) => {
             let out: Vec<_> = rows
                 .into_iter()
-                .map(|(e, loved_at)| {
+                .map(|r| {
                     serde_json::json!({
-                        "entity": e, "loved_at": loved_at,
+                        "entity": {
+                            "id": r.id, "kind": r.kind, "name": r.name,
+                            "artist_name": r.artist_name, "mbid": r.mbid,
+                        },
+                        "loved_at": r.loved_at,
+                        "plays": r.plays,
+                        "last_played": r.last_played,
+                        "album": r.album,
+                        "artwork_url": r.artwork_url,
+                        "caa_id": r.caa_id,
+                        "caa_release_mbid": r.caa_release_mbid,
+                        "note_id": r.note_id,
+                        "note_excerpt": r.note_excerpt,
                     })
                 })
                 .collect();
