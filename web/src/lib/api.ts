@@ -209,6 +209,14 @@ export interface ReportPeriod {
 	sub_labels: string[];
 	/** Shares of **tag mentions**, not of listens — say so wherever shown. */
 	genres: { name: string; pct: number }[];
+	/** The period's three biggest genres plus "other", and each one's share in
+	 *  every sub-bucket. Drawn as stacked bands by the year chapter. The names
+	 *  are fixed across the whole period so the bands keep their identity. */
+	genre_bands: { names: string[]; shares: number[][] };
+	/** Where this period sits among all of *your own* periods by plays, 1 being
+	 *  the busiest. Not a cross-user percentile — see `reports.rs`. */
+	rank: number;
+	rank_of: number;
 	/** Play-weighted average of the period's genre colours. Null until the
 	 *  genre map has been fetched. */
 	colour: string | null;

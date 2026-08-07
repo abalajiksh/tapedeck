@@ -1375,6 +1375,13 @@ paths:
       parameters:
         - { name: unit, in: query, schema: { type: string, enum: [week, month, year], default: month } }
         - { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 60, default: 12 } }
+        - name: offset
+          in: query
+          schema: { type: integer, minimum: 0, default: 0 }
+          description: |
+            Periods to skip, counting back from the newest. The stepper on the
+            Reports page walks this one period at a time. Costs nothing extra —
+            the whole history is folded on every call regardless.
       responses:
         '200':
           description: OK.
@@ -1385,6 +1392,8 @@ paths:
                 properties:
                   unit: { type: string, enum: [week, month, year] }
                   timezone: { type: string, description: The IANA zone the buckets were cut in. }
+                  offset: { type: integer, description: Where this page sits, counting back from the newest. }
+                  total_periods: { type: integer, description: 'How many periods exist at this bucket size — what tells a stepper where the ends are.' }
                   capped:
                     type: boolean
                     description: |
@@ -1397,6 +1406,25 @@ paths:
                       properties:
                         key: { type: string, example: '2026-08' }
                         label: { type: string, example: August 2026 }
+                        rank: { type: integer, description: 'Where this period sits among *the caller''s own* periods by plays, 1 being the busiest. This is what fills the slot the design gave to a cross-user percentile — see the description above for why there is no such thing here.' }
+                        rank_of: { type: integer }
+                        genre_bands:
+                          type: object
+                          description: |
+                            The period's three biggest genres **by name**, fixed
+                            across every sub-bucket, plus `other` as the
+                            remainder. Drawn as stacked bands by the year
+                            chapter. A sub-bucket with no tags at all is all
+                            zeroes rather than 100% `other` — an empty month is
+                            an absence, not a genre.
+
+                            Shares of tag *mentions*, like `genres`.
+                          properties:
+                            names: { type: array, items: { type: string }, maxItems: 3 }
+                            shares:
+                              type: array
+                              description: One row per sub-bucket; each row is the three named shares then `other`.
+                              items: { type: array, items: { type: number } }
                         start: { type: integer }
                         end: { type: integer }
                         plays: { type: integer }

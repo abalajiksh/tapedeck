@@ -184,6 +184,10 @@ struct Bucket {
     clock: [i64; 24],
     sub: Vec<i64>,
     genres: HashMap<String, i64>,
+    /// Genre tag counts per sub-bucket, for the year chapter's band chart.
+    /// Same fan-out as `genres` and therefore the same caveat: a share of tag
+    /// *mentions*, not of listens.
+    sub_genres: Vec<HashMap<String, i64>>,
     chains: HashMap<i64, i64>,
     /// (track key, local day) -> plays, for "on repeat".
     per_day: HashMap<(String, i32), (String, String, i64)>,
@@ -245,6 +249,7 @@ async fn reports(
                 label,
                 start: r.timestamp,
                 sub: vec![0; sub_bucket_count(unit)],
+                sub_genres: vec![HashMap::new(); sub_bucket_count(unit)],
                 ..Default::default()
             }
         });
@@ -257,6 +262,7 @@ async fn reports(
         if si < b.sub.len() {
             b.sub[si] += 1;
         }
+        let sub_index = si.min(b.sub.len().saturating_sub(1));
         b.days.insert(dt.num_days_from_ce());
 
         let akey = r.artist.trim().to_lowercase();
@@ -289,7 +295,10 @@ async fn reports(
                 for t in tags {
                     let t = t.trim().to_lowercase();
                     if !t.is_empty() {
-                        *b.genres.entry(t).or_insert(0) += 1;
+                        *b.genres.entry(t.clone()).or_insert(0) += 1;
+                        if let Some(sg) = b.sub_genres.get_mut(sub_index) {
+                            *sg.entry(t).or_insert(0) += 1;
+                        }
                     }
                 }
             }
@@ -318,6 +327,15 @@ async fn reports(
     order.sort();
     order.reverse();
     let total_periods = order.len();
+
+    // Busiest period first, so a card can say "your 3rd busiest month". Ranked
+    // over *every* period, not the requested page — the page is a window, and a
+    // rank that only counted the window would change as you stepped.
+    let rank_of: HashMap<&String, usize> = {
+        let mut by_plays: Vec<&String> = order.iter().collect();
+        by_plays.sort_by_key(|k| std::cmp::Reverse(buckets[*k].plays));
+        by_plays.into_iter().enumerate().map(|(i, k)| (k, i + 1)).collect()
+    };
     let wanted: Vec<String> = order.iter().skip(offset).take(limit).cloned().collect();
 
     let chains = state.db.get_chains(user.user_id).await.unwrap_or_default();
@@ -412,6 +430,44 @@ async fn reports(
             })
             .collect();
 
+        // Genre share per sub-bucket, for the year chapter's band chart. The
+        // three biggest genres *of the period* are tracked by name across every
+        // bucket and everything else is folded into "other", so the bands stay
+        // the same three colours across the year instead of renaming themselves
+        // month to month — a stacked area whose series change identity partway
+        // along is unreadable.
+        let top_names: Vec<String> = gs.iter().take(3).map(|(n, _)| (*n).clone()).collect();
+        let sub_genres: Vec<serde_json::Value> = b
+            .sub_genres
+            .iter()
+            .map(|counts| {
+                let total: i64 = counts.values().sum();
+                let mut shares: Vec<f64> = top_names
+                    .iter()
+                    .map(|n| {
+                        if total > 0 {
+                            counts.get(n).copied().unwrap_or(0) as f64 / total as f64
+                        } else {
+                            0.0
+                        }
+                    })
+                    .collect();
+                // A bucket with no tags at all is *empty*, not "100% other" —
+                // emitting the remainder there would draw a full-height band
+                // across every month you did not listen in, which reads as a
+                // genre you played rather than as an absence.
+                if total == 0 {
+                    shares.push(0.0);
+                } else {
+                    // "Other" is the remainder rather than its own sum, so the
+                    // bands stack to exactly 1 and never overshoot the plot.
+                    let named: f64 = shares.iter().sum();
+                    shares.push((1.0 - named).max(0.0));
+                }
+                serde_json::json!(shares)
+            })
+            .collect();
+
         // The period's colour, if the genre map has been fetched. Same linear
         // blend the map itself uses, so the two agree.
         let colour = {
@@ -483,6 +539,18 @@ async fn reports(
             "sub": b.sub,
             "sub_labels": sub_labels(unit),
             "genres": genres,
+            // The three biggest genres by name plus "other", and their share in
+            // each sub-bucket. Only the year chapter draws these.
+            "genre_bands": { "names": top_names, "shares": sub_genres },
+            // Where this period sits among *your own* periods by play count,
+            // 1 being the busiest. This is what fills the slot the design gave
+            // to "you out-listened 88% of Tapedeck listeners" — a cross-user
+            // percentile needs other people's listening and, on a private
+            // household instance, quietly reports how much everyone else plays.
+            // A rank against your own history says something comparable and
+            // needs nobody else.
+            "rank": rank_of.get(key).copied().unwrap_or(0),
+            "rank_of": total_periods,
             "colour": colour,
             "on_repeat": on_repeat,
             "crush": crush,
