@@ -54,6 +54,13 @@ pub struct ReportQuery {
     pub unit: Option<String>,
     /// How many periods to return, newest first.
     pub limit: Option<usize>,
+    /// How many periods to skip before that, counting back from the newest.
+    ///
+    /// The stepper on the Reports page asks for one period at a time and walks
+    /// this. Paging costs nothing extra: the handler already folds the *whole*
+    /// history into buckets on every call, so an offset is a slice of work that
+    /// has been done regardless — see `report_rows`.
+    pub offset: Option<usize>,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -194,6 +201,7 @@ async fn reports(
 ) -> impl IntoResponse {
     let unit = Unit::parse(q.unit.as_deref());
     let limit = q.limit.unwrap_or(12).clamp(1, 60);
+    let offset = q.offset.unwrap_or(0);
 
     let rows: Vec<ReportRow> =
         match state.db.report_rows(user.user_id, state.analytics_row_cap).await {
@@ -206,7 +214,10 @@ async fn reports(
     if rows.is_empty() {
         return (
             StatusCode::OK,
-            Json(serde_json::json!({ "unit": unit.as_str(), "periods": [], "timezone": "UTC" })),
+            Json(serde_json::json!({
+                "unit": unit.as_str(), "periods": [], "timezone": "UTC",
+                "offset": 0, "total_periods": 0,
+            })),
         )
             .into_response();
     }
@@ -306,7 +317,8 @@ async fn reports(
     // aside so the oldest card still has a previous period to compare against.
     order.sort();
     order.reverse();
-    let wanted: Vec<String> = order.iter().take(limit).cloned().collect();
+    let total_periods = order.len();
+    let wanted: Vec<String> = order.iter().skip(offset).take(limit).cloned().collect();
 
     let chains = state.db.get_chains(user.user_id).await.unwrap_or_default();
     let chain_name: HashMap<i64, String> =
@@ -318,7 +330,12 @@ async fn reports(
         // The previous period in the *ordered* list, which is the one before it
         // in time — not "the key minus one", which would be wrong across a
         // month with no listening.
-        let prev = order.get(i + 1).and_then(|k| buckets.get(k));
+        //
+        // `i` indexes `wanted`, which starts at `offset` — so the offset has to
+        // come back in here. Without it every paged-to period would be compared
+        // against whatever sat one past the *window*, and "up 14% on July" would
+        // name a real month and the wrong number.
+        let prev = order.get(offset + i + 1).and_then(|k| buckets.get(k));
 
         let top_artist = b.artists.iter().max_by_key(|(_, v)| v.0).map(|(k, v)| {
             // Display the spelling actually used, not the lowercased key.
@@ -487,6 +504,10 @@ async fn reports(
             "unit": unit.as_str(),
             "timezone": tz.name(),
             "periods": periods,
+            // What the stepper needs to know where the ends are: how many
+            // periods exist at this bucket size, and where this page sits.
+            "offset": offset,
+            "total_periods": total_periods,
             // The scan is capped like every other analytics read; say so rather
             // than silently reporting on a truncated history.
             "capped": rows.len() as i64 >= state.analytics_row_cap,

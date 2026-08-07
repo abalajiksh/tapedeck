@@ -830,7 +830,7 @@
 						     either would freeze the offset and shift half the year's
 						     listening. Naming the region and showing it switching is a
 						     shorter answer than a paragraph about it. -->
-						<p style="font-size:12.5px;color:var(--td-muted);margin:-4px 0 0;max-width:62ch;">
+						<p class="tz-note">
 							Currently <strong>{tzFacts.now}</strong> ({tzFacts.offset}).
 							{#if tzFacts.observesDst}
 								This region switches between {tzFacts.standard} and {tzFacts.daylight}, and
@@ -843,7 +843,7 @@
 							{/if}
 						</p>
 					{:else if timezone}
-						<p style="font-size:12.5px;color:var(--td-muted-3);margin:-4px 0 0;">
+						<p class="tz-note" style="color:var(--td-muted-3);">
 							Not a zone this browser recognises — pick one from the list.
 						</p>
 					{/if}
@@ -1587,6 +1587,38 @@
 		   pills, so the active one takes the accent outright. */
 		.nav-item.on { background: var(--td-accent); color: #fbf5ea; }
 		.nav-hint { display: none; }
+	}
+
+	/* The Time section used `.row` / `.row-main` / `.row-title` / `.row-sub`,
+	   which were defined *nowhere* — this is the only place in the app that uses
+	   them. Svelte scopes styles, so they rendered as bare divs: the heading came
+	   out at body size, the explanation ran the full width at full weight, and
+	   the select dropped underneath instead of sitting beside it. Nothing errors
+	   when a class doesn't exist, which is why it survived. */
+	.row {
+		display: flex;
+		align-items: center;
+		justify-content: space-between;
+		gap: 16px;
+		flex-wrap: wrap;
+		background: var(--td-surface2);
+		border: 1px solid var(--td-border);
+		border-radius: 14px;
+		padding: 14px 16px;
+		margin-top: 18px;
+	}
+	.row-main { min-width: 0; flex: 1 1 260px; }
+	.row-title { font-size: 14px; font-weight: 600; margin-bottom: 3px; }
+	.row-sub { font-size: 12.5px; color: var(--td-muted); line-height: 1.45; max-width: 52ch; }
+
+	/* Sat directly under the input on a negative margin, which put it against
+	   the field's bottom edge with no room to breathe. */
+	.tz-note {
+		font-size: 12.5px;
+		color: var(--td-muted);
+		line-height: 1.5;
+		margin: 10px 0 0;
+		max-width: 62ch;
 	}
 
 	.tz-list {
