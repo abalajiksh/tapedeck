@@ -168,6 +168,38 @@ fn side_letter(i: usize) -> String {
     ((b'A' + (i.min(25) as u8)) as char).to_string()
 }
 
+/// Is this medium one you play straight through, rather than one you get up
+/// and flip?
+///
+/// The whole of `assign_sides` exists because a record has a break in it that
+/// nobody reliably records. A disc has no break: it plays start to finish, so
+/// splitting its tracklist by playing time would invent one, and the shelf
+/// would then offer to remind you to flip to a Side B that does not exist.
+/// This is the *smaller* problem the roadmap predicted — real track boundaries
+/// come straight off the disc.
+///
+/// Matched on the medium's own format string rather than on what the user
+/// searched for, because the release is the authority on what it is.
+pub fn is_disc(format: Option<&str>) -> bool {
+    let f = format.unwrap_or("").to_ascii_lowercase();
+    // "cassette" has no "cd" in it and neither does any vinyl spelling, so the
+    // substring test is safe and catches CD-R, Hybrid SACD, Enhanced CD…
+    f.contains("cd") || f.contains("dvd") || f.contains("blu-ray") || f.contains("minidisc")
+}
+
+/// One "side" per disc, numbered — the counterpart of `assign_sides` for media
+/// that have no sides. A single CD is `["1", "1", …]`; a two-disc set numbers
+/// the second disc's tracks `2`.
+pub fn disc_sides(per_disc_counts: &[usize]) -> Vec<String> {
+    let mut out = Vec::new();
+    for (i, n) in per_disc_counts.iter().enumerate() {
+        for _ in 0..*n {
+            out.push((i + 1).to_string());
+        }
+    }
+    out
+}
+
 /// Search MusicBrainz for a pressing.
 ///
 /// `query` is a Lucene expression; the caller composes it so barcode, catalogue
@@ -306,7 +338,12 @@ pub async fn musicbrainz_release(
     let flat: Vec<&Track> = r.media.iter().flat_map(|m| m.tracks.iter()).collect();
     let numbers: Vec<String> = flat.iter().map(|t| t.number.clone().unwrap_or_default()).collect();
     let durations: Vec<Option<i64>> = flat.iter().map(|t| t.length.map(|ms| ms / 1000)).collect();
-    let side_of = assign_sides(&numbers, &durations, media_count * 2);
+    // A disc is numbered by disc, not lettered by side — see `is_disc`.
+    let side_of = if is_disc(format.as_deref()) {
+        disc_sides(&r.media.iter().map(|m| m.tracks.len()).collect::<Vec<_>>())
+    } else {
+        assign_sides(&numbers, &durations, media_count * 2)
+    };
 
     let mut tracks = Vec::with_capacity(flat.len());
     let mut per_side_pos: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
@@ -585,7 +622,13 @@ pub async fn discogs_release(
     let durations: Vec<Option<i64>> =
         real.iter().map(|t| parse_duration(t.duration.as_deref())).collect();
     let sides = r.formats.len().max(1) * 2;
-    let side_of = assign_sides(&numbers, &durations, sides);
+    // Discogs names the medium in `formats[].name`; a disc gets one numbered
+    // side per disc rather than a guessed A/B break.
+    let side_of = if is_disc(r.formats.first().and_then(|f| f.name.as_deref())) {
+        disc_sides(&[real.len()])
+    } else {
+        assign_sides(&numbers, &durations, sides)
+    };
 
     let mut tracks = Vec::with_capacity(real.len());
     let mut per_side_pos: std::collections::HashMap<String, i64> = std::collections::HashMap::new();

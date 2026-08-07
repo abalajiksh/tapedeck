@@ -106,7 +106,7 @@ pub struct LookupQuery {
     pub catalog_number: Option<String>,
     pub artist: Option<String>,
     pub release: Option<String>,
-    /// `vinyl` or `cassette`; narrows the format filter.
+    /// `vinyl`, `cassette`, `cd` or `sacd`; narrows the format filter.
     pub kind: Option<String>,
 }
 
@@ -147,7 +147,11 @@ async fn lookup(
     let format_filter = match q.kind.as_deref() {
         Some("vinyl") => "format:Vinyl",
         Some("cassette") => "format:Cassette",
-        _ => "(format:Vinyl OR format:Cassette)",
+        // SACD is a CD-family format in MusicBrainz and most hybrid discs are
+        // catalogued as both, so asking for either finds the pressing.
+        Some("cd") => "(format:CD OR format:SACD)",
+        Some("sacd") => "(format:SACD OR format:CD)",
+        _ => "(format:Vinyl OR format:Cassette OR format:CD OR format:SACD)",
     };
     let mb_query = if let Some(b) = barcode {
         format!("barcode:{b}")
@@ -220,7 +224,7 @@ async fn list_shelf(
     user: AuthUser,
     Query(q): Query<ShelfQuery>,
 ) -> impl IntoResponse {
-    let kind = q.kind.as_deref().filter(|k| matches!(*k, "vinyl" | "cassette"));
+    let kind = q.kind.as_deref().filter(|k| matches!(*k, "vinyl" | "cassette" | "cd" | "sacd"));
     match state.db.list_physical(user.user_id, kind).await {
         Ok(rows) => (StatusCode::OK, Json(serde_json::json!({ "releases": rows }))).into_response(),
         Err(e) => err(500, e.to_string()),
@@ -260,8 +264,8 @@ async fn add_release(
     user: AuthUser,
     Json(body): Json<NewRelease>,
 ) -> impl IntoResponse {
-    if !matches!(body.kind.as_str(), "vinyl" | "cassette") {
-        return err(400, "kind must be vinyl or cassette");
+    if !matches!(body.kind.as_str(), "vinyl" | "cassette" | "cd" | "sacd") {
+        return err(400, "kind must be vinyl, cassette, cd or sacd");
     }
     if body.artist.trim().is_empty() || body.title.trim().is_empty() {
         return err(400, "An artist and a title are required");
@@ -455,7 +459,12 @@ async fn play_side(
                 None,
                 chain_id,
                 None,
-                Some(if release.kind == "vinyl" { "Vinyl" } else { "Cassette" }),
+                Some(match release.kind.as_str() {
+                    "vinyl" => "Vinyl",
+                    "cd" => "CD",
+                    "sacd" => "SACD",
+                    _ => "Cassette",
+                }),
                 None,
                 // Kept so skip-rate analytics has something real to count, and
                 // filed so nothing else does. This used to be an UPDATE after

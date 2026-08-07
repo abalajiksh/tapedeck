@@ -13,7 +13,7 @@ use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 #[derive(Debug, FromRow, serde::Serialize)]
 pub struct ScrobbleRecord {
@@ -534,7 +534,7 @@ impl Database {
             "CREATE TABLE IF NOT EXISTS physical_releases (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_id INTEGER NOT NULL REFERENCES users(id),
-                kind TEXT NOT NULL CHECK (kind IN ('vinyl', 'cassette')),
+                kind TEXT NOT NULL CHECK (kind IN ('vinyl', 'cassette', 'cd', 'sacd')),
                 artist TEXT NOT NULL, title TEXT NOT NULL,
                 year INTEGER,
                 mbid_release TEXT, discogs_id TEXT, barcode TEXT, catalog_number TEXT,
@@ -1229,6 +1229,68 @@ impl Database {
             let _ = sqlx::query("ALTER TABLE entities ADD COLUMN image_url TEXT")
                 .execute(&self.pool)
                 .await;
+        }
+
+        // Migration: CD and SACD on the shelf.
+        //
+        // `physical_releases.kind` carries a CHECK, and SQLite cannot alter a
+        // constraint in place — the only way is to build the table again and
+        // copy. That is why this one is a whole block rather than an
+        // `ADD COLUMN`, and why it is guarded on the *constraint text* in
+        // `sqlite_master` rather than on a column existing: the column has
+        // always been there, it is what it will accept that changed.
+        //
+        // `physical_plays.release_id` points at this table, so foreign keys are
+        // suspended for the swap — the pool opens with them on. They go back on
+        // immediately after, and the whole thing is one transaction, so a crash
+        // mid-rebuild leaves the old table rather than a half-copied one.
+        let needs_disc_kinds: Option<(String,)> = sqlx::query_as(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'physical_releases'",
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .ok()
+        .flatten();
+        if needs_disc_kinds.is_some_and(|(sql,)| !sql.contains("'sacd'")) {
+            info!("⚙️ Migrating: letting the shelf hold CDs and SACDs...");
+            let _ = sqlx::query("PRAGMA foreign_keys = OFF").execute(&self.pool).await;
+            let rebuild = async {
+                let mut tx = self.pool.begin().await?;
+                sqlx::query(
+                    "CREATE TABLE physical_releases_new (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        user_id INTEGER NOT NULL REFERENCES users(id),
+                        kind TEXT NOT NULL CHECK (kind IN ('vinyl', 'cassette', 'cd', 'sacd')),
+                        artist TEXT NOT NULL, title TEXT NOT NULL,
+                        year INTEGER,
+                        mbid_release TEXT, discogs_id TEXT, barcode TEXT, catalog_number TEXT,
+                        artwork_url TEXT,
+                        tracks TEXT NOT NULL DEFAULT '[]',
+                        notes TEXT,
+                        added_at INTEGER NOT NULL
+                    )",
+                )
+                .execute(&mut *tx)
+                .await?;
+                sqlx::query(
+                    "INSERT INTO physical_releases_new
+                     SELECT id, user_id, kind, artist, title, year, mbid_release, discogs_id,
+                            barcode, catalog_number, artwork_url, tracks, notes, added_at
+                       FROM physical_releases",
+                )
+                .execute(&mut *tx)
+                .await?;
+                sqlx::query("DROP TABLE physical_releases").execute(&mut *tx).await?;
+                sqlx::query("ALTER TABLE physical_releases_new RENAME TO physical_releases")
+                    .execute(&mut *tx)
+                    .await?;
+                tx.commit().await
+            }
+            .await;
+            if let Err(e) = rebuild {
+                warn!("Could not widen the shelf's formats: {}", e);
+            }
+            let _ = sqlx::query("PRAGMA foreign_keys = ON").execute(&self.pool).await;
         }
 
         Ok(())
@@ -5541,8 +5603,10 @@ impl Database {
         type Agg = (String, i64, i64, Option<String>, Option<i64>, Option<String>, Option<String>);
 
         // Recordings and releases differ only in which column names the thing.
-        let mut by_key: HashMap<String, (i64, i64, Option<String>, Option<i64>, Option<String>, Option<String>)> =
-            HashMap::new();
+        let mut by_key: HashMap<
+            String,
+            (i64, i64, Option<String>, Option<i64>, Option<String>, Option<String>),
+        > = HashMap::new();
         for (kind, name_col) in [("recording", "title"), ("release", "album")] {
             let rows: Vec<Agg> = sqlx::query_as(&format!(
                 "SELECT LOWER(TRIM(artist)) || '|' || LOWER(TRIM({name_col})) AS k,

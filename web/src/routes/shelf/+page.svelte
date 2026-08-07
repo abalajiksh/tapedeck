@@ -6,7 +6,20 @@
 
 	// Records and tapes are one screen, not two: the workflow is identical and
 	// most shelves hold both. The filter is a view, not a mode.
-	type Filter = 'all' | 'vinyl' | 'cassette';
+	type Filter = 'all' | 'vinyl' | 'cassette' | 'cd' | 'sacd';
+	type Kind = 'vinyl' | 'cassette' | 'cd' | 'sacd';
+
+	/** A disc has no side to flip — it plays start to finish. Everything that
+	 *  says "Side A" or offers to remind you to turn it over is gated on this. */
+	const isDisc = (k: string) => k === 'cd' || k === 'sacd';
+	const KIND_LABEL: Record<string, string> = {
+		vinyl: 'Vinyl', cassette: 'Cassette', cd: 'CD', sacd: 'SACD'
+	};
+
+	/** What one playable unit of this medium is called. A record and a tape have
+	 *  sides you flip; a disc has none, so calling its tracklist "Side 1" would
+	 *  be describing hardware it doesn't have. */
+	const unit = (k: string) => (isDisc(k) ? 'Disc' : 'Side');
 	let filter: Filter = 'all';
 
 	let shelf: PhysicalRelease[] = [];
@@ -15,7 +28,7 @@
 
 	// ── Adding something ──
 	let adding = false;
-	let lookupKind: 'vinyl' | 'cassette' = 'vinyl';
+	let lookupKind: Kind = 'vinyl';
 	let barcode = '', catno = '', qArtist = '', qRelease = '';
 	let searching = false;
 	let candidates: ReleaseCandidate[] = [];
@@ -58,6 +71,10 @@
 	type Outcome = { position: number; started_at: number; skipped: boolean };
 	type Spinning = {
 		releaseId: number;
+		/** The medium, so the "… is on" banner can name the unit without having
+		 *  the record loaded — you can be on another page when it shows. Absent
+		 *  on a spin started before this field existed, hence the fallback. */
+		kind?: string;
 		side: string;
 		startedAt: number;
 		pausedAt: number | null;
@@ -91,7 +108,7 @@
 		flipPrompt = '';
 		const now = Math.floor(Date.now() / 1000);
 		saveSpinning({
-			releaseId: open.id, side, startedAt: now,
+			releaseId: open.id, kind: open.kind, side, startedAt: now,
 			pausedAt: null, pausedTotal: 0,
 			// The first track starts the moment the needle drops.
 			outcomes: [{ position: sideTracks(side)[0]?.position ?? 1, started_at: now, skipped: false }]
@@ -272,9 +289,9 @@
 			});
 			const sk = r.skipped ?? 0;
 			playMsg = r.listens_added || sk
-				? `Side ${side} — ${r.listens_added} listen${r.listens_added === 1 ? '' : 's'} recorded` +
+				? `${unit(open?.kind ?? 'vinyl')} ${side} — ${r.listens_added} listen${r.listens_added === 1 ? '' : 's'} recorded` +
 					(sk ? `, ${sk} skipped.` : '.')
-				: `Side ${side} was already recorded at that time.`;
+				: `${unit(open?.kind ?? 'vinyl')} ${side} was already recorded at that time.`;
 			// The flip reminder is the whole point of tracking sides: you are
 			// away from the screen while it plays, and the next thing you do is
 			// turn it over.
@@ -324,27 +341,27 @@
 	});
 </script>
 
-<svelte:head><title>Vinyl & Tape — Tapedeck</title></svelte:head>
+<svelte:head><title>The Shelf — Tapedeck</title></svelte:head>
 
 <div style="display:flex;align-items:flex-end;justify-content:space-between;gap:16px;flex-wrap:wrap;margin-bottom:6px;">
 	<div>
-		<h1 class="h-display" style="font-size:34px;margin:0;">Vinyl &amp; Tape</h1>
+		<h1 class="h-display" style="font-size:34px;margin:0;">The Shelf</h1>
 		<p style="margin:6px 0 0;color:var(--td-muted);font-size:15px;">
-			What you own, and what you actually put on. Playing a side records every
-			track on it.
+			Records, tapes and discs you own, and what you actually put on. Playing a
+			side or a disc records every track on it.
 		</p>
 	</div>
 	<button class="btn btn-primary" on:click={() => (adding = !adding)}>
-		{adding ? 'Cancel' : 'Add a record'}
+		{adding ? 'Cancel' : 'Add to the shelf'}
 	</button>
 </div>
 
 {#if adding}
 	<div class="panel" style="border-radius:22px;padding:24px;margin:18px 0;">
 		<div style="display:flex;gap:8px;margin-bottom:16px;">
-			{#each ['vinyl', 'cassette'] as k}
-				<button class="chip" class:on={lookupKind === k} on:click={() => (lookupKind = k as 'vinyl' | 'cassette')}>
-					{k === 'vinyl' ? 'Vinyl' : 'Cassette'}
+			{#each ['vinyl', 'cassette', 'cd', 'sacd'] as k}
+				<button class="chip" class:on={lookupKind === k} on:click={() => (lookupKind = k as Kind)}>
+					{KIND_LABEL[k]}
 				</button>
 			{/each}
 		</div>
@@ -423,7 +440,7 @@
 	<button class="nowon" on:click={() => spinRelease && openRelease(spinRelease)}>
 		<span class="pip"></span>
 		<span style="flex:1;min-width:0;text-align:left;">
-			<strong>Side {spinning.side} is on</strong>
+			<strong>{unit(spinning.kind ?? 'vinyl')} {spinning.side} is on</strong>
 			{#if spinRelease}— {spinRelease.title}{/if}
 			<span style="color:var(--td-muted);font-variant-numeric:tabular-nums;">
 				· {formatDuration(spinElapsed)} / {formatDuration(spinTotal)}
@@ -471,9 +488,9 @@
 {/if}
 
 <div style="display:flex;gap:8px;margin:18px 0;">
-	{#each ['all', 'vinyl', 'cassette'] as f}
+	{#each ['all', 'vinyl', 'cassette', 'cd', 'sacd'] as f}
 		<button class="chip" class:on={filter === f} on:click={() => (filter = f as Filter)}>
-			{f === 'all' ? 'Everything' : f === 'vinyl' ? 'Vinyl' : 'Cassettes'}
+			{f === 'all' ? 'Everything' : f === 'cassette' ? 'Cassettes' : KIND_LABEL[f]}
 		</button>
 	{/each}
 </div>
@@ -501,7 +518,7 @@
 					<div style="font-weight:600;font-size:14.5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">{r.title}</div>
 					<div style="font-size:12.5px;color:var(--td-muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">{r.artist}</div>
 					<div style="font-size:11.5px;color:var(--td-muted-2);margin-top:5px;">
-						{r.kind === 'vinyl' ? '33⅓' : 'Tape'}
+						{r.kind === 'vinyl' ? '33⅓' : r.kind === 'cassette' ? 'Tape' : KIND_LABEL[r.kind] ?? r.kind}
 						{#if r.play_count}
 							· {r.play_count} side{r.play_count === 1 ? '' : 's'} · {formatDuration(r.played_secs)}
 						{:else}
@@ -545,33 +562,75 @@
 			{#if spinHere && spinning}
 				<div class="deck" class:done={spinLeft === 0} class:paused>
 					{#if open.kind === 'vinyl'}
-						<!-- A platter, turning at 33⅓ — one revolution every 1.8s,
-						     which is the real speed rather than a decorative one. -->
-						<svg viewBox="0 0 80 80" width="76" height="76" class="platter" aria-hidden="true">
-							<circle cx="40" cy="40" r="38" fill="#201e1d" />
-							<circle cx="40" cy="40" r="38" fill="none" stroke="var(--td-accent)" stroke-width="1.5" opacity=".5" />
-							{#each [30, 24, 18] as r}
-								<circle cx="40" cy="40" r={r} fill="none" stroke="#3a3532" stroke-width="1" />
-							{/each}
-							<circle cx="40" cy="40" r="13" fill="var(--td-accent)" />
-							<circle cx="40" cy="40" r="2.5" fill="#201e1d" />
-							<!-- The mark that makes the rotation visible at all. -->
-							<rect x="39" y="4" width="2" height="10" rx="1" fill="var(--td-accent-hi, #e8a06a)" />
+						<!-- The deck, drawn as the design has it: a platter turning at
+						     a real 33⅓ — one revolution every 1.8s — and a tonearm that
+						     swings down onto the record when a side starts and lifts
+						     when it stops. The arm is the detail that makes it read as
+						     a turntable rather than a spinning circle. -->
+						<svg viewBox="0 0 150 130" width="132" height="114" class="rig" aria-hidden="true">
+							<g class="platter" style="transform-origin:60px 66px;">
+								<circle cx="60" cy="66" r="54" fill="#16120d" />
+								<circle cx="60" cy="66" r="52" fill="#0d0a07" />
+								{#each [44, 37, 30, 23] as r}
+									<circle cx="60" cy="66" r={r} fill="none" stroke="#241f18" stroke-width="1" />
+								{/each}
+								<circle cx="60" cy="66" r="19" fill="var(--td-accent)" />
+								<circle cx="60" cy="66" r="15" fill="none" stroke="#f4e7cf" stroke-width="1" opacity=".55" />
+								<line x1="60" y1="51" x2="60" y2="58" stroke="#f4e7cf" stroke-width="1.6" stroke-linecap="round" />
+								<circle cx="60" cy="66" r="2.4" fill="#f4e7cf" />
+							</g>
+							<g class="arm" class:down={!paused && spinLeft > 0}>
+								<line x1="131" y1="30" x2="74" y2="48" stroke="#d9ccb0" stroke-width="3.4" stroke-linecap="round" />
+								<line x1="80" y1="46" x2="69" y2="50" stroke="#e9dcc4" stroke-width="5.5" stroke-linecap="round" />
+								<circle cx="68" cy="50.5" r="2.2" fill="var(--td-accent)" />
+								<circle cx="132" cy="29" r="9" fill="#231e18" stroke="#4a4038" stroke-width="1.6" />
+								<circle cx="139" cy="21" r="5" fill="#3a3128" />
+							</g>
+						</svg>
+					{:else if isDisc(open.kind)}
+						<!-- A disc, and it spins far faster than a record: CD transports
+						     run 200–500 rpm, so a decorative 1.8s turn would read as a
+						     slow-motion LP. The sheen is what says "not vinyl" at a
+						     glance, since the silhouette is the same circle. -->
+						<svg viewBox="0 0 120 120" width="104" height="104" aria-hidden="true">
+							<defs>
+								<linearGradient id="td-disc-sheen" x1="0" y1="0" x2="1" y2="1">
+									<stop offset="0" stop-color="#7a8a5e" stop-opacity=".55" />
+									<stop offset="0.45" stop-color="#c67139" stop-opacity=".2" />
+									<stop offset="0.75" stop-color="#8ea3c0" stop-opacity=".45" />
+									<stop offset="1" stop-color="#c67139" stop-opacity=".3" />
+								</linearGradient>
+							</defs>
+							<g class="disc" style="transform-origin:60px 60px;">
+								<circle cx="60" cy="60" r="56" fill="#1a1712" />
+								<circle cx="60" cy="60" r="54" fill="url(#td-disc-sheen)" />
+								<circle cx="60" cy="60" r="54" fill="none" stroke="#3a3128" stroke-width="1" />
+								<circle cx="60" cy="60" r="20" fill="var(--td-surface)" opacity=".85" />
+								<circle cx="60" cy="60" r="20" fill="none" stroke="#3a3128" stroke-width="1" />
+								<circle cx="60" cy="60" r="8" fill="var(--td-panel)" />
+								<!-- The mark that makes the rotation legible at all. -->
+								<rect x="58.6" y="8" width="2.8" height="12" rx="1.4" fill="#f4e7cf" opacity=".7" />
+							</g>
 						</svg>
 					{:else}
-						<!-- Two reels, the take-up one filling as the tape runs. -->
-						<svg viewBox="0 0 100 60" width="92" height="56" aria-hidden="true">
-							<rect x="2" y="6" width="96" height="48" rx="7" fill="#201e1d"
-								stroke="var(--td-accent)" stroke-width="1.5" opacity=".9" />
-							<rect x="18" y="18" width="64" height="24" rx="4" fill="#15130f" />
-							{#each [32, 68] as cx}
-								<g class="reel" style="transform-origin:{cx}px 30px;">
-									<circle cx={cx} cy="30" r="10" fill="none" stroke="#6a6259" stroke-width="2.5" />
-									<circle cx={cx} cy="30" r="4.5" fill="var(--td-accent)" />
-									{#each [0, 60, 120] as a}
-										<rect x={cx - 0.9} y="21" width="1.8" height="7" rx="0.9" fill="#8a8078"
-											style="transform-origin:{cx}px 30px;transform:rotate({a}deg);" />
-									{/each}
+						<!-- Two reels behind the window, both turning — the take-up side
+						     is what a tape actually shows you is happening. -->
+						<svg viewBox="0 0 150 100" width="132" height="88" aria-hidden="true">
+							<rect x="3" y="4" width="144" height="92" rx="13" fill="#1c1712"
+								stroke="var(--td-accent)" stroke-width="1.2" opacity=".95" />
+							<rect x="17" y="12" width="116" height="24" rx="5" fill="#f4e7cf" />
+							<line x1="25" y1="20" x2="125" y2="20" stroke="var(--td-accent)" stroke-width="2.4" opacity=".5" />
+							<line x1="25" y1="28" x2="98" y2="28" stroke="#7a8a5e" stroke-width="2.4" opacity=".45" />
+							<rect x="28" y="44" width="94" height="44" rx="7" fill="#14100b" />
+							<rect x="48" y="59" width="54" height="15" rx="2" fill="#332a20" />
+							{#each [50, 100] as cx}
+								<g class="reel" style="transform-origin:{cx}px 66px;">
+									<circle cx={cx} cy="66" r="15" fill="none" stroke="#e9dcc4" stroke-width="1.8" />
+									<circle cx={cx} cy="66" r="9.5" fill="none" stroke="#7a6f5c" stroke-width="1.4" opacity=".6" />
+									<circle cx={cx} cy="66" r="3.5" fill="#e9dcc4" />
+									<line x1={cx - 15} y1="66" x2={cx + 15} y2="66" stroke="#e9dcc4" stroke-width="1.4" />
+									<line x1={cx - 7.5} y1="53" x2={cx + 7.5} y2="79" stroke="#e9dcc4" stroke-width="1.4" />
+									<line x1={cx - 7.5} y1="79" x2={cx + 7.5} y2="53" stroke="#e9dcc4" stroke-width="1.4" />
 								</g>
 							{/each}
 						</svg>
@@ -579,7 +638,11 @@
 
 					<div style="flex:1;min-width:0;">
 						<div style="font-size:11px;letter-spacing:.16em;text-transform:uppercase;color:#c67139;font-weight:600;">
-							{spinLeft === 0 ? 'Side finished' : paused ? `Side ${spinning.side} paused` : `Side ${spinning.side} playing`}
+							{spinLeft === 0
+								? `${unit(open.kind)} finished`
+								: paused
+									? `${unit(open.kind)} ${spinning.side} paused`
+									: `${unit(open.kind)} ${spinning.side} playing`}
 						</div>
 						<div class="h-display" style="font-size:19px;margin-top:2px;">
 							{nowTrack ? nowTrack.title : open.title}
@@ -646,7 +709,7 @@
 				{#each sides as side}
 					<div class="side">
 						<div style="display:flex;align-items:baseline;justify-content:space-between;gap:10px;">
-							<span class="h-display" style="font-size:17px;">Side {side}</span>
+							<span class="h-display" style="font-size:17px;">{unit(open.kind)} {side}</span>
 							<span style="font-size:12px;color:var(--td-muted-2);">
 								{formatDuration(sideSecs(side))}
 							</span>
@@ -664,7 +727,7 @@
 						<div style="display:flex;gap:6px;margin-top:12px;">
 							<button class="btn btn-primary" style="flex:1;"
 								disabled={playing || !!spinning} on:click={() => startSide(side)}>
-								Start side {side}
+								Start {unit(open.kind).toLowerCase()} {side}
 							</button>
 							<button class="btn btn-secondary" title="Record it now, working the start time back from the running time"
 								disabled={playing || !!spinning} on:click={() => play(side)}>
@@ -775,10 +838,27 @@
 	   the sort of detail this app is for. */
 	.platter { animation: td-spin 1.8s linear infinite; }
 	.deck :global(.reel) { animation: td-spin 2.4s linear infinite; }
+	/* A CD transport runs 200–500 rpm, an order of magnitude past a record.
+	   Drawn at 0.5s a turn: still legible, and unmistakably not vinyl. */
+	.disc { animation: td-spin 0.5s linear infinite; }
 	.deck.done .platter,
 	.deck.done :global(.reel),
+	.deck.done .disc,
 	.deck.paused .platter,
-	.deck.paused :global(.reel) { animation-play-state: paused; }
+	.deck.paused :global(.reel),
+	.deck.paused .disc { animation-play-state: paused; }
+
+	/* The tonearm is the whole reason this reads as a turntable. It rests off
+	   the record and swings down onto it when a side starts — a transform, not
+	   a second drawing, so the two states can't drift apart. */
+	.arm {
+		transform-box: view-box;
+		transform-origin: 132px 29px;
+		transform: rotate(-17deg);
+		transition: transform 0.6s cubic-bezier(0.34, 1.3, 0.5, 1);
+	}
+	.arm.down { transform: rotate(0deg); }
+	.rig { flex: none; }
 	.controls { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 	/* Transport buttons read as a deck's, not as page actions. */
 	.ctl {
@@ -792,7 +872,8 @@
 	.ctl:hover:not(:disabled) { background: var(--td-accent); color: #fff; }
 	.ctl:disabled { opacity: .4; cursor: default; }
 	@media (prefers-reduced-motion: reduce) {
-		.platter, .deck :global(.reel) { animation: none; }
+		.platter, .deck :global(.reel), .disc { animation: none; }
+		.arm { transition: none; }
 	}
 
 	/* The flip reminder is the one thing you look for after walking back to the

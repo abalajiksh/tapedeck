@@ -28,7 +28,7 @@
 		{ href: '/reports', label: 'Reports', icon: 'reports' },
 		{ href: '/loved', label: 'Loved', icon: 'loved' },
 		{ href: '/notes', label: 'Liner Notes', icon: 'notes' },
-		{ href: '/shelf', label: 'Vinyl & Tape', icon: 'shelf' },
+		{ href: '/shelf', label: 'The Shelf', icon: 'shelf' },
 		{ href: '/rediscover', label: 'Rediscovery', icon: 'rediscover' },
 		{ href: '/map', label: 'Genre Map', icon: 'map' },
 		{ href: '/import', label: 'Import', icon: 'import' },
