@@ -18,14 +18,15 @@ openapi: 3.1.0
 #     but loose body. `additionalProperties: true` means "not fully mapped",
 #     not "anything goes".
 #
-# `tests::openapi_matches_the_router` walks `.route("…")` literals in both
+# `tests::the_spec_and_the_router_describe_the_same_api` walks `.route("…")`
+# literals in both
 # directions: every route must appear here, and every path here must exist in
 # the router. Add an endpoint, add it here, or the build fails.
 # ─────────────────────────────────────────────────────────────────────────────
 
 info:
   title: Tapedeck
-  version: 0.41.0
+  version: 0.45.0
   summary: Self-hosted scrobbler and listening journal.
   description: |
     Tapedeck ingests listens, enriches them with MusicBrainz metadata, stores
@@ -134,7 +135,7 @@ tags:
   - name: Chains
     description: Signal chains, gear, devices and bindings.
   - name: Shelf
-    description: Vinyl and tape — a shelf you catalogue and sides you play.
+    description: Records, tapes and discs — a shelf you catalogue and sides you play.
   - name: Genre map
     description: Every Noise at Once — coverage, colour, trajectory, neighbours.
   - name: Rediscovery
@@ -2334,12 +2335,17 @@ paths:
         '401': { $ref: '#/components/responses/Unauthorized' }
         '404': { $ref: '#/components/responses/NotFound' }
 
-  # ── Shelf (Vinyl & Tape) ───────────────────────────────────────────────────
+  # ── Shelf (records, tapes, discs) ──────────────────────────────────────────
   /api/v1/physical:
     get:
       tags: [Shelf]
       summary: Your shelf.
       description: Session-only.
+      parameters:
+        - name: kind
+          in: query
+          schema: { type: string, enum: [vinyl, cassette, cd, sacd] }
+          description: Narrows to one format. Anything else is ignored rather than rejected.
       responses:
         '200':
           description: OK.
@@ -2360,12 +2366,25 @@ paths:
           application/json:
             schema:
               type: object
-              required: [artist, title, format]
+              required: [artist, title, kind]
               properties:
                 artist: { type: string }
                 title: { type: string }
-                format: { type: string, enum: [vinyl, cassette] }
+                kind:
+                  type: string
+                  enum: [vinyl, cassette, cd, sacd]
+                  description: |
+                    The medium. Enforced by a CHECK on the column, so an
+                    unrecognised value is a 400 rather than a stored oddity.
+                    A **disc has no sides**: its tracklist is one numbered unit
+                    per disc, and the UI says "Disc 1" rather than "Side A".
                 barcode: { type: string }
+                catalog_number: { type: string }
+                year: { type: integer }
+                mbid_release: { type: string }
+                discogs_id: { type: string }
+                artwork_url: { type: string }
+                notes: { type: string }
                 tracks: { type: array, items: { type: object, additionalProperties: true } }
       responses:
         '200': { description: Added., content: { application/json: { schema: { type: object, additionalProperties: true } } } }
@@ -2401,6 +2420,12 @@ paths:
         by **playing time**, not track count, because a mastering engineer
         balances sides and a nine-minute closer would otherwise land on the
         wrong one. It is still a guess, which is why this endpoint exists.
+
+        None of that applies to a **disc**. A CD or SACD plays start to finish,
+        so its tracks are numbered one unit per disc with no guessing at all —
+        splitting a CD by playing time would invent a break that is not there.
+        The medium's own format string decides which rule applies, not what was
+        searched for.
       parameters: [{ name: id, in: path, required: true, schema: { type: integer } }]
       requestBody:
         required: true

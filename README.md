@@ -6,8 +6,8 @@ phones, DAPs — enriches it with MusicBrainz metadata and audio quality context
 and stores a complete personal listening history with audiophile-grade analytics.
 
 It also records the listening nothing can report automatically: put a side of
-vinyl on, press start, and every track on it is logged with the pauses and skips
-you actually made.
+vinyl on — or a tape, or a disc — press start, and every track is logged with
+the pauses and skips you actually made.
 
 Single binary. Privacy-first. DSD is first-class.
 
@@ -253,13 +253,18 @@ with:
   page rather than a filtered list.
 - **Liner Notes** — write about a track, a record, an artist, or one particular
   playing; see below.
-- **Vinyl & Tape** — the shelf, and a deck with pause, skip and flip reminders.
+- **The Shelf** — records, tapes and discs, with a deck drawn for whichever is
+  in hand: pause, skip and flip reminders.
+- **Loved** — every heart in one place, across tracks, records and artists.
+- **Reports** — your listening in chapters, one week, month or year at a time.
 - **Rediscovery** — smart collections built from your own history.
 - **Import** — pull from ListenBrainz or Last.fm, upload a `.json`/`.csv` export
   or a Rockbox `.scrobbler.log` with live progress, or paste a single listen.
+- **Genre Map** — your listening placed on Every Noise at Once, with a taste
+  trajectory over time and the regions bordering what you already play.
 - **Signal Chains & Equipment**, plus **Settings** — split into sections
-  (Appearance, Sources, Connections, API Tokens, Data, Sanitiser, Maintenance,
-  About), each deep-linkable as `/settings#sources`.
+  (Appearance, Time, Sources, Connections, API Tokens, Data, Sanitiser,
+  Maintenance, Genre Map, About), each deep-linkable as `/settings#sources`.
 
 ### Liner Notes
 
@@ -290,10 +295,10 @@ Notes carry a visibility (private / patched-in / public) for the coming social
 phase. Today every read path is self-only: nothing is served to another user
 whatever the setting says.
 
-### Vinyl & Cassette
+### The Shelf — records, tapes and discs
 
 A shelf you catalogue and sides you play, for the listening nothing can report
-automatically. Look a pressing up by **barcode**, catalogue number, or artist and
+automatically. Vinyl, cassette, CD and SACD. Look a pressing up by **barcode**, catalogue number, or artist and
 release — MusicBrainz always, Discogs first for a barcode when an admin has
 configured a token, because it catalogues *pressings* and usually lands on the
 exact edition.
@@ -317,6 +322,48 @@ track number as "A1" only when an editor entered one — so Tapedeck splits by
 mastering engineer balances them; splitting by track count would put a
 nine-minute closer on the wrong side of the break. It's a guess, and the
 tracklist is editable.
+
+A **disc is the smaller problem**, and none of that guessing applies: a CD or
+SACD plays start to finish, so its tracks come off the disc as one numbered
+unit and the UI says *Disc 1* rather than *Side A*. Which rule applies is
+decided by the medium's own format string, not by what you searched for. This
+is also why discs are a shelf format rather than a source: no disc player of
+any brand or vintage will tell you the artist and title of what it is playing,
+but the shelf already holds the tracklist — so it works today with no driver at
+all.
+
+The deck is drawn for the medium in hand. A turntable's arm swings down onto
+the record when a side starts and lifts when it stops; a cassette turns both
+reels behind the window; a disc spins at its own much faster rate with a sheen,
+because the silhouette is the same circle as a record. All of it stops dead
+when the deck is paused, and none of it moves under `prefers-reduced-motion`.
+
+### Loved
+
+Every heart in one place — tracks, records *and* artists, since a love in
+Tapedeck attaches to an entity rather than only to a song. Search it, sort by
+when you loved it / most played / title / artist (each sort brings the divider
+it implies), and filter by kind or to the ones carrying a liner note.
+
+A love of a **recording** is mirrored outward to Last.fm and ListenBrainz;
+albums and artists stay local because neither service has the concept. Loves
+you already have on those services can be pulled in from Settings → Connections.
+
+### Reports
+
+Your listening in chapters — one week, month or year at a time, with a stepper
+to walk back through the whole history. The three are genuinely different
+shapes rather than one card resized: a month gets the full treatment (clock,
+genres, on repeat, off the shelf), a week the compact one (seven days make a
+thin hour-of-day distribution, so it isn't drawn), and a year is a bento of
+tiles built around a twelve-month line with the prior year behind it and
+genres as stacked bands.
+
+Everything is folded from **one pass** over the history, bucketed in your own
+timezone. There is no "you out-listened 88% of listeners" — that needs other
+people's listening, and on a household instance it quietly reports how much
+everyone else plays. Where the design put a percentile, Tapedeck ranks the
+period against *your own*: "your 2nd busiest month of 8".
 
 ### Rediscovery
 
@@ -597,192 +644,61 @@ curl -X POST http://localhost:8080/1/submit-listens \
   }'
 ```
 
-## API Reference
+## API
 
-**Auth model.** API tokens (`Authorization: Token td_…`) can do exactly one
-thing: **submit listens** to `/1/submit-listens`. Everything else — reading,
-editing, deleting, and all admin actions — requires a logged-in **session**
-(the `td_session` cookie from the web UI). This is enforced at the extractor
-level, so a leaked device token can only *add* listens, never read or destroy
-your data. The tables below mark `Token` only where tokens are accepted; `Auth`
-means session-only.
+The whole API is described by **`openapi.yaml`** at the repo root, and every
+running instance serves its own copy at:
 
-### Sources & Ingest
-
-| Method | Path | Auth | Description |
-|--------|------|------|-------------|
-| GET | `/api/v1/sources` | Auth | The caller's own polling sources |
-| POST | `/api/v1/sources` | Auth | Add one (`kind` = `plex`/`navidrome`/`jellyfin`) |
-| PUT/DELETE | `/api/v1/sources/:id` | Auth | Update or remove one; an omitted credential keeps the stored one |
-| POST | `/api/v1/sources/test` | Auth | Verify credentials before saving (`kind`) or re-test a stored source (`id`) |
-| GET | `/api/v1/art/:scrobble_id` | Auth | Cover art proxied from the media server that produced the listen |
-| GET | `/api/v1/artists/img/{id}` | Auth | Artist portrait, proxied from your own library |
-| PUT | `/api/v1/artists/img/{id}` | Auth | Set the portrait by hand, or clear it |
-| GET/POST | `/api/v1/sanitize` | Auth | Metadata sanitiser: preview, then apply the edits you ticked |
-| GET | `/api/v1/resolve` | Auth | Name → entity id, creating it on first visit |
-| GET | `/api/v1/artwork/status` | Auth | Cover-art coverage for the caller |
-| POST | `/api/v1/artwork/backfill` | Admin | Resolve missing cover art in the background |
-| GET | `/1/validate-token` | Token | LB token check (`{valid, user_name}`) |
-| POST | `/1/submit-listens` | Token | LB listen submission |
-| GET | `/1/user/:user/listens` | Token | LB listen history (`max_ts`/`min_ts`/`count`) |
-| GET | `/1/user/:user/playing-now` | Token | LB now-playing |
-| GET | `/1/user/:user/listen-count` | Token | LB total listen count |
-| GET | `/1/user/:user/services` | Token | LB connected-services list |
-| POST | `/1/playing-now/delete` | Token | Clear your now-playing |
-| GET/POST | `/1/latest-import` | Token | LB import high-water mark |
-
-### Admin
-
-| Method | Path | Auth | Description |
-|--------|------|------|-------------|
-| GET | `/health` | None | Health check |
-| GET/POST | `/log-level` | None | View/set runtime log level |
-| GET | `/admin/users` | Admin | List users |
-| POST | `/admin/users` | Admin | Create user (returns token) |
-| PATCH | `/admin/users/{id}` | Admin | Change role / reset password |
-| DELETE | `/admin/users/{id}` | Admin | Delete user + all their data |
-| GET | `/admin/tokens` | Session | List your tokens (with their default chain) |
-| POST | `/admin/tokens` | Session | Create new token (`{name, scopes?, default_chain_id?}`) |
-| PATCH | `/admin/tokens/{id}` | Session | Rename or repoint a token (`{name?, default_chain_id?}`) |
-| DELETE | `/admin/tokens/{id}` | Session | Revoke a token |
-
-### Auth
-
-| Method | Path | Auth | Description |
-|--------|------|------|-------------|
-| GET | `/api/v1/auth/status` | None | Whether setup is needed / session is valid |
-| POST | `/api/v1/auth/setup` | None | First-run: create the admin user |
-| POST | `/api/v1/auth/login` | None | Log in, set session cookie |
-| POST | `/api/v1/auth/logout` | Session | Log out |
-| GET | `/api/v1/auth/me` | Auth | Current user info |
-
-### Scrobbles & Stats
-
-| Method | Path | Auth | Description |
-|--------|------|------|-------------|
-| GET | `/api/v1/scrobbles` | Auth | List listens (`limit`, `offset`, `artist`, `album`, `track`, `after`, `before`) |
-| GET | `/api/v1/search` | Auth | Search your own history (`q`, `limit`) — grouped artists / albums / tracks |
-| PATCH | `/api/v1/scrobbles/{id}` | Auth | Edit a listen (metadata, MBID, chain, format) |
-| DELETE | `/api/v1/scrobbles/{id}` | Auth | Delete one listen |
-| DELETE | `/api/v1/scrobbles?confirm=true` | Auth | Clear all listens for the user |
-| GET | `/api/v1/stats/dashboard` | Auth | Dashboard summary counts |
-| GET | `/api/v1/stats?range=` | Auth | Ranged analytics (`week`/`month`/`last30`/`year`/`all`) |
-| GET | `/api/v1/personality?range=` | Auth | Five-axis listening personality + per-artist loyalty |
-| GET | `/api/v1/languages/status` | Auth | Language-classification coverage |
-| POST | `/api/v1/languages/backfill` | Admin | Run a full language-classification pass |
-
-### Preferences, Export & Import
-
-| Method | Path | Auth | Description |
-|--------|------|------|-------------|
-| GET/PUT | `/api/v1/preferences` | Auth | Per-user settings (theme, …) |
-| GET | `/api/v1/export?format=` | Auth | Listen dump — `json` or `csv` |
-| GET | `/api/v1/backup` | Admin | Consistent full-database `.db` snapshot |
-| GET | `/api/v1/connections` | Auth | Your connected scrobble services |
-| PUT | `/api/v1/connections/listenbrainz` | Auth | Connect ListenBrainz (`{token}`) |
-| POST | `/api/v1/connections/lastfm/start` | Auth | Begin Last.fm OAuth → `{auth_url, token}` |
-| POST | `/api/v1/connections/lastfm/complete` | Auth | Finish Last.fm OAuth after approval |
-| POST | `/api/v1/connections/librefm/start` | Auth | Begin Libre.fm OAuth → `{auth_url, token}` |
-| POST | `/api/v1/connections/librefm/complete` | Auth | Finish Libre.fm OAuth after approval |
-| GET | `/api/v1/now-playing` | Auth | What this user is playing right now |
-| DELETE | `/api/v1/connections/{service}` | Auth | Disconnect a service |
-| POST | `/api/v1/import/listenbrainz` | Auth | Import by ListenBrainz username |
-| POST | `/api/v1/import/lastfm` | Auth | Import by Last.fm username |
-| POST | `/api/v1/import/file` | Auth | Import an uploaded `.json`/`.csv`/`.scrobbler.log` (multipart; send `timezone` with a `#TZ/UNKNOWN` log) |
-| GET | `/api/v1/import/jobs/{id}` | Auth | Import job progress |
-| GET | `/api/v1/import/history` | Auth | Recent import jobs |
-
-### Liner Notes & Loves
-
-| Method | Path | Auth | Description |
-|--------|------|------|-------------|
-| GET | `/api/v1/notes` | Auth | Every note the caller has written |
-| POST | `/api/v1/notes` | Auth | Write the note for a target, creating or editing it |
-| GET/DELETE | `/api/v1/notes/{id}` | Auth | One note (with rendered HTML) / delete it and its revisions |
-| GET | `/api/v1/notes/{id}/revisions` | Auth | Earlier versions, newest first |
-| GET | `/api/v1/notes/for` | Auth | The note for a target, if any, plus the resolved target |
-| POST | `/api/v1/notes/preview` | Auth | Render Markdown + shortcodes without saving |
-| GET/POST | `/api/v1/loves` | Auth | List loves / love or un-love an entity |
-| GET | `/api/v1/loves/keys` | Auth | Loved entity keys, so listen rows render a heart without a request each |
-| GET | `/api/v1/albums/{id}` | Auth | Album page — your plays, tracklist, other records by that artist |
-| GET | `/api/v1/artists/{id}` | Auth | Artist page — rank, top albums and tracks, plays by year |
-| GET | `/api/v1/resolve` | Auth | Name → entity id (`kind`, `name`, `artist`), created on first use |
-| GET | `/api/v1/sessions` | Auth | Listening sessions, newest first |
-| GET | `/api/v1/sessions/{id}` | Auth | One session and the listens in it |
-| PATCH | `/api/v1/sessions/{id}` | Auth | Retag the whole sitting (`chain_id`) or name it (`title`) |
-| POST | `/api/v1/sessions/merge` | Auth | Fold sessions together (`{ids}`) — earliest survives |
-| POST | `/api/v1/sessions/{id}/split` | Auth | Cut at a listen (`{at_scrobble_id}`) |
-| POST | `/api/v1/sessions/rebuild` | Auth | Regroup all listens (`{gap_seconds}`) — discards hand edits |
-| GET | `/api/v1/charts` | Auth | Ranked chart (`kind`=artists\|albums\|tracks, `range`, `limit`) |
-| POST | `/api/v1/loves/pull` | Auth | Fetch loved tracks from every connected service |
-| GET | `/metrics` | Admin/Token | Prometheus exposition. Bearer `TAPEDECK_METRICS_TOKEN`, or an **admin** session — every gauge is instance-wide |
-| GET | `/api/v1/sanitize` | Auth | Preview metadata fixes (mixed album releases, featured credits) |
-| POST | `/api/v1/sanitize` | Auth | Apply them — per-edit (`{album_edits, credit_edits, variant_edits}`) or whole-category (`{albums, artists, variants}`) |
-| GET | `/api/v1/entities/{id}` | Auth | An entity with the caller's note and love state |
-| GET | `/api/v1/scrobbles/{id}/annotations` | Auth | Notes and loves around one listen (read-only — creates nothing) |
-
-A note target is one of: `entity_id`, `scrobble_id`, `from_scrobble` + `kind`
-(the track / album / artist *of* that listen, created on demand), or `kind` +
-`name` (+ `artist`) spelled out. `kind` is `track`, `album` or `artist`.
-
-### Vinyl, Cassette & Rediscovery
-
-| Method | Path | Auth | Description |
-|--------|------|------|-------------|
-| GET | `/api/v1/physical` | Auth | The shelf; `?kind=vinyl\|cassette` |
-| POST | `/api/v1/physical` | Auth | Add a record or tape |
-| GET | `/api/v1/physical/{id}` | Auth | One release, with derived play counts |
-| DELETE | `/api/v1/physical/{id}` | Auth | Remove it (listens are kept) |
-| PUT | `/api/v1/physical/{id}/tracks` | Auth | Save a corrected side split |
-| POST | `/api/v1/physical/{id}/play` | Auth | Record a side — one listen per track |
-| GET | `/api/v1/physical/lookup` | Auth | `?barcode=` / `?catalog_number=` / `?artist=&release=` |
-| GET | `/api/v1/physical/discogs/{id}` | Auth | One Discogs release, with tracklist |
-| GET | `/api/v1/physical/equipment/{id}/wear` | Auth | Stylus hours and sides played |
-| GET/PUT | `/api/v1/physical/settings/discogs` | Admin | Discogs token (never returned) |
-| GET | `/api/v1/rediscovery` | Auth | All collections; `?quiet_days=` |
-| GET | `/api/v1/rediscovery/gear/{id}` | Auth | Favourites never played through that gear |
-
-`POST /physical/{id}/play` takes per-track outcomes from the client, which is the
-only thing that saw the pauses and skips:
-
-```json
-{
-  "side": "A",
-  "started_at": 1785858587,
-  "tracks": [
-    { "position": 1, "started_at": 1785858587, "skipped": false },
-    { "position": 2, "started_at": 1785858655, "skipped": true }
-  ]
-}
+```
+GET /api/openapi.yaml
 ```
 
-Omit `tracks` and the running order is derived from `started_at` — which can only
-ever describe an uninterrupted side.
+That endpoint is deliberately unauthenticated — it documents shapes, not data,
+and a client has to read it *before* it has a credential, since the login and
+device-pairing flows are in it. Serving it from the binary is the one thing a
+separately hosted docs site cannot do: it describes **that** instance at **that**
+version, which for a self-hosted app beats any version dropdown.
 
-### Signal Chains & Gear
+A drift test walks every `.route("…")` in the source and compares both
+directions — routed but undocumented, and documented but not routed — so the
+build fails rather than sending you to an endpoint that 404s.
 
-| Method | Path | Auth | Description |
-|--------|------|------|-------------|
-| GET | `/api/v1/chains` | Session | List signal chains |
-| POST | `/api/v1/chains` | Session | Create signal chain |
-| GET | `/api/v1/chains/{id}` | Session | Get chain details |
-| PATCH | `/api/v1/chains/{id}` | Session | Update a chain |
-| DELETE | `/api/v1/chains/{id}` | Session | Delete a chain (unlinks listens, keeps them) |
-| GET | `/api/v1/devices` | Session | List auto-discovered devices |
-| PATCH | `/api/v1/devices/{id}` | Session | Set/clear a device's default chain (`{chain_id}`) |
-| GET | `/api/v1/equipment` | Session | List equipment with usage hours |
-| POST | `/api/v1/equipment` | Session | Register equipment |
-| PATCH | `/api/v1/equipment/{id}` | Session | Update equipment |
-| DELETE | `/api/v1/equipment/{id}` | Session | Delete equipment |
-| GET | `/api/v1/bindings` | Session | List output→chain bindings (mapped + auto-learned) |
-| PUT | `/api/v1/bindings` | Session | Set/clear the chain for an output (`{identifier, chain_id}`) |
-| DELETE | `/api/v1/bindings/{id}` | Session | Forget an output |
-| POST | `/api/v1/scrobbles/bulk-chain` | Auth | Reassign many listens' chain (`{ids, signal_chain_id}`) |
+Endpoint tables used to live here and were removed: a second copy of the API,
+maintained by hand, is a copy that goes stale. The spec is the one to read.
 
-### How a listen gets its chain
+**Auth model.** Two credentials, and they are not interchangeable.
+
+A **session** (the `td_session` cookie from the web UI) can do everything.
+
+An **API token** (`Authorization: Token td_…`) carries explicit scopes, and
+none of them implies another:
+
+| Scope | What it allows |
+|-------|----------------|
+| `submit` | `POST /1/submit-listens` and nothing else. What every scrobble client holds. |
+| `read` | History, stats, loves, notes, now-playing, chains, gear. |
+| `write` | Loves, notes, and editing or deleting a listen. |
+| `all` | `read` + `write`. |
+
+`submit` deliberately does not imply `read`: the token in a scrobble client on
+a phone that gets lost must not be able to read the history it is appending to.
+Matching is exact, so a scope of `rewrite` does not grant `write`.
+
+A valid token missing the needed scope gets **403, not 401** — it authenticated
+fine, and a 401 would send a client into a refresh loop it cannot win.
+
+**Permanently session-only**, whatever scopes a token has: everything under
+`/admin/`, plus sources, service connections, Discogs settings, export and
+backup, the metadata sanitiser, the enrichment jobs, and
+`DELETE /api/v1/scrobbles` (clear everything) — the one listen operation a lost
+phone could make unrecoverable.
+
+## How a listen gets its chain
 
 Attribution happens at the source, but a chain lives downstream — so the server
-resolves the chain in layers (first match wins):
+resolves the chain on a **four-rung ladder**, first match winning. The order
+encodes what each rung *is*: a binding is evidence about this listen, a token is
+a standing statement about one app, a device is the coarsest fallback.
 
 1. **Explicit chain name** — the client sends it in `tapedeck_chain.chain_id`
    (a name); the server looks it up.
@@ -791,7 +707,12 @@ resolves the chain in layers (first match wins):
    …). Every distinct output is **auto-learned** and shown in the UI's *Outputs*
    panel; you map it to a chain **once**, and every future listen through it
    attributes automatically.
-3. **Source-device default** — the machine's default chain, if set.
+3. **The submitting token's default chain** — one token per app ("fooyin",
+   "Pano on Android") is how people actually organise these, so a token can
+   carry a chain and attribution costs the client no configuration at all. It
+   can be repointed later **without re-issuing the token**, so fixing a chain
+   never means pasting a new credential into a player.
+4. **Source-device default** — the machine's default chain, if set.
 
 Once resolved, the chain tags the listen and its session, propagates the chain's
 listening context, and accumulates hours. Ambiguous cases (one output feeding
@@ -811,6 +732,7 @@ src/
 ├── analytics.rs             Listening personality + per-artist loyalty
 ├── language.rs              Script/language classification
 ├── notes.rs                 Liner-note shortcodes + Markdown rendering
+├── openapi.rs               Serves openapi.yaml, plus the router drift test
 ├── rockbox.rs               .scrobbler.log parsing (Audioscrobbler Log 1.1)
 ├── logging.rs               tracing + file output + live log level
 ├── web_assets.rs            serves the embedded SvelteKit SPA
@@ -821,7 +743,7 @@ src/
 │   ├── mod.rs               ArtworkProvider trait + the ordered chain
 │   ├── deezer.rs            Deezer artwork provider
 │   ├── bio.rs               BioProvider chain (Last.fm → TheAudioDB → …)
-│   └── release_lookup.rs    Pressing lookup for vinyl/tape (MusicBrainz, Discogs)
+│   └── release_lookup.rs    Pressing lookup for the shelf (MusicBrainz, Discogs)
 ├── server/
 │   ├── mod.rs               AppState, build_app()
 │   ├── admin.rs             Health + log level endpoints
@@ -843,8 +765,11 @@ src/
 │   ├── chains.rs            Signal chain, device, equipment, binding endpoints
 │   ├── library.rs           Album/artist pages, charts, entity resolve
 │   ├── sessions.rs          Listening sessions: list, merge, split, rebuild
-│   ├── physical.rs          Records and tapes: the shelf, and playing a side
+│   ├── physical.rs          The shelf — records, tapes and discs — and playing one
 │   ├── rediscovery.rs       Smart collections over your own history
+│   ├── reports.rs           Week/month/year chapters, one pass over the history
+│   ├── everynoise.rs        The Every Noise genre map and the genre-map views
+│   ├── pairing.rs           Device-code pairing for browserless clients
 │   ├── loves_pull.rs        Pull loves back from Last.fm / ListenBrainz
 │   └── metrics.rs           Prometheus exposition (admin only)
 ├── sinks/
@@ -856,6 +781,8 @@ src/
     ├── navidrome.rs         Navidrome (native history + Subsonic)
     └── jellyfin.rs          Jellyfin session polling
 
+src/everynoise/              Every Noise map: parse, store, scrape
+openapi.yaml                 The whole API; served at /api/openapi.yaml
 web/                         SvelteKit SPA (built into static/, embedded)
 deploy/                      Sample hardened systemd unit
 ```
@@ -898,6 +825,21 @@ deploy/                      Sample hardened systemd unit
       fresh clone compiles
 - [x] **Prometheus `/metrics`** — admin-only, per-job import gauges
 - [x] **Plex audio quality** from session metadata, plus device → signal chain
+- [x] **Genre map** — Every Noise at Once scraped into its own database, your
+      listening placed on it, plus taste trajectory, neighbourhoods and two
+      parameter-free breadth numbers
+- [x] **Scoped API tokens** — `submit` / `read` / `write` / `all`, none
+      implying another, with `/admin/` and anything destructive permanently
+      session-only
+- [x] **OpenAPI spec** — the whole API in `openapi.yaml`, served by the binary
+      at `/api/openapi.yaml`, with a drift test in both directions
+- [x] **Device-code pairing** — RFC 8628-shaped, for clients that cannot show a
+      browser
+- [x] **Reports** — week, month and year chapters with a stepper through the
+      whole history, each a different layout rather than one card resized
+- [x] **Loved** — every heart in one place, across tracks, records and artists
+- [x] **Discs on the shelf** — CD and SACD alongside vinyl and cassette, with a
+      deck drawn for the medium in hand
 
 ### Next
 
@@ -911,28 +853,42 @@ deploy/                      Sample hardened systemd unit
 - [ ] **Spotify source** — OAuth, `recently-played` backfill. Note its history
       endpoint reports when a track *ended*, while `scrobbles.timestamp` is
       start-of-play everywhere, so the duration has to be subtracted on read
-- [ ] **Listening timeline** — monthly and yearly chapters, milestones,
-      equipment history, "this day in music"
+- [ ] **Network streamers** — one discovery-and-negotiation layer over
+      SSDP/UPnP AVTransport, OpenHome, Google Cast and vendor HTTP APIs, so a
+      streamer works because open protocols are supported rather than because
+      someone wrote a driver for that exact box. A source declares its own blind
+      spots: UPnP cannot see Spotify Connect or AirPlay, and the UI has to say so
+- [ ] **Android app** — browse the history, scan a barcode onto the shelf, and
+      optionally scrobble what the phone is playing. `AudioDeviceInfo` is the one
+      thing only Android can contribute: USB DAC vs Bluetooth vs speaker, straight
+      onto the chain ladder's device rung
+- [ ] **Sharing a chapter as an image** — a Reports card as a PNG for a story
 - [ ] Docker container
 - [ ] Notes: full-text search, tags, and Markdown export for Obsidian/Logseq
-- [ ] Mobile layout: the quality badge crowds the track title on narrow screens
+- [ ] Organising the four analytics screens — Statistics, Top Charts, Reports and
+      the genre map answer overlapping questions with their own period controls
 
 ### Known gaps
 
 Things that look finished and aren't:
 
-- **Discogs lookup is implemented but untested against the live API** — no token
-  was available. The MusicBrainz path is fully verified.
 - **Artist portraits from Navidrome** aren't wired. Plex and Jellyfin are;
   Subsonic can answer it, but an untested path that silently returns nothing is
   worse than a stated gap.
-- **`listen_type: "import"` submitted through the ingest API is still
-  forwarded** to your connected services. The *file* importer marks its rows
-  `imported` and they are skipped; the ingest path has no equivalent yet. Don't
-  build a backfill client against it until that lands.
-- **Token scopes are stored and never enforced.** A token can submit listens but
-  cannot read any `/api/v1/` route, so an external client can't offer a chain
-  picker.
+- **Audio quality is only known for listens a live source reported.** An import
+  from Last.fm or ListenBrainz carries no format at all — on a real 21,000-listen
+  history that is 97% of it — so the fidelity readouts divide by the listens
+  whose format is actually known and say how many that was. Below a quarter
+  coverage they report the coverage instead of a percentage, because a share
+  drawn from a twentieth of your listening is a fact about the twentieth.
+- **Entity pages don't scope by user.** Play counts are correctly the caller's,
+  but an entity's *name* comes from a shared table, so ids can be walked to learn
+  what another household member has annotated. Low severity on an invite-only
+  instance, and parked as a design call because the fix interacts with Phase 6
+  visibility.
+- **The SACD layer isn't recorded.** Stereo and multichannel are genuinely
+  different listens and `AudioQuality.channels` has somewhere to put it, but
+  `physical_plays` has no column for which one you played.
 
 ## Performance
 
