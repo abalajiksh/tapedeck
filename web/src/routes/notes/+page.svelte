@@ -5,6 +5,9 @@
 	import { api } from '$lib/api';
 	import type { Note, NoteTarget, NoteRevision, Entity, LovedRow, Visibility } from '$lib/api';
 	import { formatDateTime, timeAgo } from '$lib/utils';
+	import type { NoteQuery } from '$lib/api';
+	import ShortcodeLegend from '$lib/components/ShortcodeLegend.svelte';
+	import ToTop from '$lib/components/ToTop.svelte';
 
 	/**
 	 * Liner notes. A note is a living document about one thing — a track, a
@@ -14,9 +17,50 @@
 	 */
 
 	let notes: Note[] = [];
+	let total = 0;
 	let loves: LovedRow[] = [];
 	let loading = true;
 	let error = '';
+
+	// ── Finding a note again ──
+	//
+	// A notes collection is a thing that grows: at twenty a flat list is fine and
+	// at two hundred it is a wall, and the whole point of writing these is being
+	// able to come back to them. Filtering is server-side (see
+	// `Database::search_notes`) rather than over an array here, because rendering
+	// one note costs four more queries and narrowing first is the difference
+	// between instant and the slowest screen in the app.
+	let q = '';
+	let kind: NoteQuery['kind'] = '';
+	let sort: NonNullable<NoteQuery['sort']> = 'updated';
+	let searchTimer: ReturnType<typeof setTimeout> | undefined;
+
+	const KINDS: { value: NoteQuery['kind']; label: string }[] = [
+		{ value: '', label: 'All' },
+		{ value: 'recording', label: 'Tracks' },
+		{ value: 'release', label: 'Records' },
+		{ value: 'artist', label: 'Artists' },
+		{ value: 'listen', label: 'Listens' }
+	];
+
+	/** Debounced, so typing a word is one request rather than one per letter. */
+	function onSearch() {
+		clearTimeout(searchTimer);
+		searchTimer = setTimeout(load, 220);
+	}
+
+	function setKind(k: NoteQuery['kind']) {
+		kind = k;
+		load();
+	}
+
+	function clearFilters() {
+		q = '';
+		kind = '';
+		load();
+	}
+
+	$: filtering = q.trim().length > 0 || kind !== '';
 
 	// ── Editor ──
 	let open: Note | null = null;            // the note being edited, if it exists
@@ -65,8 +109,9 @@
 
 	async function load() {
 		try {
-			const [n, l] = await Promise.all([api.getNotes(), api.getLoves()]);
+			const [n, l] = await Promise.all([api.getNotes({ q, kind, sort }), api.getLoves()]);
 			notes = n.notes;
+			total = n.total;
 			loves = l.loves;
 		} catch (e) {
 			error = clean(e);
@@ -239,11 +284,15 @@
 	<div>
 		<h1 class="h-display" style="font-size:38px;margin-bottom:6px;">Liner notes</h1>
 		<p style="margin:0;color:var(--td-muted);font-size:15px;">
-			What you think about a record, kept with it. Markdown, and
-			<code class="chip">[[track:Xtal]]</code> to point at other music.
+			What you think about a record, kept with it.
 		</p>
 	</div>
-	<button class="btn btn-primary" on:click={startNew}>+ New note</button>
+	<div style="display:flex;gap:8px;align-items:center;">
+		<a class="btn btn-secondary" href="/settings#data" title="Export every note as Markdown">
+			Export
+		</a>
+		<button class="btn btn-primary" on:click={startNew}>+ New note</button>
+	</div>
 </div>
 
 {#if error}<div class="panel" style="border-radius:16px;padding:14px 18px;margin-bottom:16px;font-size:13.5px;color:#b2622d;">{error}</div>{/if}
@@ -252,9 +301,43 @@
 	<!-- Everything written, newest edit first -->
 	<div>
 		<div class="panel" style="border-radius:22px;padding:20px;margin-bottom:16px;">
-			<h3 class="h-display" style="font-size:17px;margin:0 0 12px;">Your notes</h3>
+			<div style="display:flex;align-items:baseline;justify-content:space-between;gap:8px;margin-bottom:10px;">
+				<h3 class="h-display" style="font-size:17px;margin:0;">Your notes</h3>
+				<span style="font-size:11.5px;color:var(--td-muted-3);">
+					{filtering ? `${notes.length} of ${total}` : `${total || notes.length}`}
+				</span>
+			</div>
+
+			<div class="search">
+				<svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor"
+					stroke-width="1.6" stroke-linecap="round" aria-hidden="true">
+					<circle cx="7" cy="7" r="4.5" /><path d="m10.5 10.5 3 3" />
+				</svg>
+				<input class="input" type="search" bind:value={q} on:input={onSearch}
+					placeholder="Search your notes" aria-label="Search your notes" />
+			</div>
+
+			<div class="filters">
+				{#each KINDS as k}
+					<button class="fchip" class:on={kind === k.value} on:click={() => setKind(k.value)}>
+						{k.label}
+					</button>
+				{/each}
+				<span style="flex:1;"></span>
+				<select class="input sortsel" bind:value={sort} on:change={load} aria-label="Sort notes">
+					<option value="updated">Recently edited</option>
+					<option value="created">Recently written</option>
+					<option value="title">A–Z</option>
+				</select>
+			</div>
+
 			{#if loading}
 				<div style="display:flex;justify-content:center;padding:14px;"><div class="spin" style="width:18px;height:18px;border:2px solid var(--td-track);border-top-color:var(--td-accent);border-radius:50%;"></div></div>
+			{:else if !notes.length && filtering}
+				<p style="font-size:13px;color:var(--td-muted);margin:0;">
+					Nothing matches that.
+					<button class="linkish" on:click={clearFilters}>Clear the search</button>
+				</p>
 			{:else if !notes.length}
 				<p style="font-size:13px;color:var(--td-muted);margin:0;">
 					Nothing yet. Write one here, or open any listen in History and choose “Liner note”.
@@ -359,12 +442,7 @@
 					on:input={() => (dirty = true)}
 					placeholder="Bought this on a whim in 2011. [[track:3]] is the one that got me — nothing else on it sounds like [[artist:Boards of Canada]]."
 				></textarea>
-				<p style="font-size:11.5px;color:var(--td-muted-3);margin:8px 0 0;">
-					Markdown. <code class="chip">[[track:Xtal]]</code>,
-					<code class="chip">[[track:3]]</code> for the third track of this record,
-					<code class="chip">[[album:…]]</code>, <code class="chip">[[artist:…]]</code>.
-					A reference that matches nothing stays plain text.
-				</p>
+				<div style="margin-top:10px;"><ShortcodeLegend /></div>
 			{/if}
 
 			<div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-top:16px;">
@@ -418,14 +496,19 @@
 			<div style="text-align:center;padding:40px 12px;color:var(--td-muted);">
 				<div style="font-size:34px;margin-bottom:10px;">✍</div>
 				<p style="margin:0 0 4px;font-size:14px;">Pick a note on the left, or start a new one.</p>
-				<p style="margin:0;font-size:12.5px;color:var(--td-muted-3);">
+				<p style="margin:0 0 20px;font-size:12.5px;color:var(--td-muted-3);">
 					Notes can also be written straight from a listen — open one in History and choose
 					“Liner note”.
 				</p>
+				<div style="text-align:left;max-width:520px;margin:0 auto;">
+					<ShortcodeLegend open />
+				</div>
 			</div>
 		{/if}
 	</div>
 </div>
+
+<ToTop />
 
 {#if confirmDelete}
 	<div class="dialog-backdrop" on:click={() => (confirmDelete = false)} on:keydown={() => {}} role="presentation">
@@ -476,7 +559,46 @@
 		font-family: inherit;
 	}
 
-	.chip { background: var(--td-sidebar); padding: 2px 6px; border-radius: 6px; font-size: 12px; }
+	.search { position: relative; margin-bottom: 9px; }
+	.search svg {
+		position: absolute;
+		left: 12px;
+		top: 50%;
+		transform: translateY(-50%);
+		color: var(--td-muted-3);
+		pointer-events: none;
+	}
+	.search :global(input) { padding-left: 32px; }
+
+	.filters { display: flex; gap: 5px; align-items: center; flex-wrap: wrap; margin-bottom: 12px; }
+
+	/* `.chip` on this page is the inline code style, so the filters get their own
+	   class rather than borrowing a name that already means something else. */
+	.fchip {
+		border: 1px solid var(--td-border);
+		background: transparent;
+		cursor: pointer;
+		color: var(--td-muted-2);
+		font: inherit;
+		font-size: 12px;
+		padding: 4px 11px;
+		border-radius: 999px;
+	}
+	.fchip:hover { color: var(--td-text); }
+	.fchip.on { background: var(--td-accent); border-color: var(--td-accent); color: #fbf5ea; }
+
+	.sortsel { width: auto; padding: 4px 8px; font-size: 12px; border-radius: 999px; }
+
+	.linkish {
+		border: none;
+		background: none;
+		padding: 0;
+		font: inherit;
+		color: var(--td-accent);
+		cursor: pointer;
+		text-decoration: underline;
+	}
+
 	.seg-btn { border: 1px solid var(--td-border); background: transparent; cursor: pointer; color: var(--td-nav-fg); font-size: 13px; padding: 7px 16px; border-radius: 999px; font-family: inherit; }
 	.seg-btn.on { background: var(--td-accent); border-color: var(--td-accent); color: #fbf5ea; }
 	.spin { animation: td-spin 0.7s linear infinite; }

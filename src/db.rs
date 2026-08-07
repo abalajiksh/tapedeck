@@ -3717,12 +3717,56 @@ impl Database {
         Ok(result.last_insert_rowid())
     }
 
+    /// Every column of a chain, with `total_hours` **derived from the listens
+    /// that carry it** rather than read from the column of the same name.
+    ///
+    /// `signal_chains.total_hours` was an accumulator, and it was wrong in three
+    /// ways that all look the same from the outside — a chain that has plainly
+    /// been used reading zero:
+    ///
+    /// * **Only `ingest.rs` ever added to it.** A listen polled from Plex,
+    ///   Jellyfin or Navidrome goes through `pipeline.rs`, a side off the shelf
+    ///   through `physical.rs`, and an import through `import.rs` — none of
+    ///   which touched it. So for anyone whose listens come from a media server
+    ///   rather than a scrobble client, chain hours never moved at all.
+    /// * **Assigning a chain was retroactive to nothing.** Binding an output
+    ///   device, pointing a token at a chain, or fixing a listen's chain by hand
+    ///   all change which listens belong to which chain — and an accumulator
+    ///   only ever counted what arrived *after* the change. This is what "I
+    ///   assigned the chain and the hours didn't move" is.
+    /// * **`equipment.total_hours` is derived from this**, so gear inherited
+    ///   every one of those gaps. That column was fixed the same way in v0.20;
+    ///   the level below it was left an accumulator, which is why the fix only
+    ///   half worked.
+    ///
+    /// So the number now comes from the same place every other count in this
+    /// app comes from: the listens. `skipped = FALSE` for the reason it is
+    /// everywhere else — crediting the gear with a track's full running time for
+    /// three seconds of audio is exactly the error that filter exists to stop.
+    ///
+    /// A listen with no `duration` contributes nothing, which is honest and
+    /// matches what the accumulator did (it only ever added when the client sent
+    /// one). The `CAST` is load-bearing for the same reason it is in
+    /// `get_equipment`: SQLite types `SUM()` by what it actually summed, so a
+    /// chain with no listens comes back INTEGER and sqlx refuses to decode it
+    /// into `f64`.
+    const CHAIN_COLUMNS: &'static str = "s.id, s.user_id, s.name, s.description, s.components,
+                s.listening_context, s.icon, s.is_active,
+                CAST(COALESCE((
+                    SELECT SUM(sc.duration) FROM scrobbles sc
+                     WHERE sc.user_id = s.user_id AND sc.chain_id = s.id
+                       AND sc.skipped = FALSE
+                ), 0) AS REAL) / 3600.0 AS total_hours,
+                s.created_at";
+
     pub async fn get_chains(&self, user_id: i64) -> Result<Vec<SignalChain>, sqlx::Error> {
-        let rows: Vec<ChainRow> =
-            sqlx::query_as("SELECT * FROM signal_chains WHERE user_id = ? ORDER BY name ASC")
-                .bind(user_id)
-                .fetch_all(&self.pool)
-                .await?;
+        let rows: Vec<ChainRow> = sqlx::query_as(&format!(
+            "SELECT {} FROM signal_chains s WHERE s.user_id = ? ORDER BY s.name ASC",
+            Self::CHAIN_COLUMNS
+        ))
+        .bind(user_id)
+        .fetch_all(&self.pool)
+        .await?;
         Ok(rows.into_iter().map(|r| r.into()).collect())
     }
 
@@ -3731,26 +3775,15 @@ impl Database {
         user_id: i64,
         chain_id: i64,
     ) -> Result<Option<SignalChain>, sqlx::Error> {
-        let row: Option<ChainRow> =
-            sqlx::query_as("SELECT * FROM signal_chains WHERE id = ? AND user_id = ?")
-                .bind(chain_id)
-                .bind(user_id)
-                .fetch_optional(&self.pool)
-                .await?;
+        let row: Option<ChainRow> = sqlx::query_as(&format!(
+            "SELECT {} FROM signal_chains s WHERE s.id = ? AND s.user_id = ?",
+            Self::CHAIN_COLUMNS
+        ))
+        .bind(chain_id)
+        .bind(user_id)
+        .fetch_optional(&self.pool)
+        .await?;
         Ok(row.map(|r| r.into()))
-    }
-
-    pub async fn update_chain_hours(
-        &self,
-        chain_id: i64,
-        hours_to_add: f64,
-    ) -> Result<(), sqlx::Error> {
-        sqlx::query("UPDATE signal_chains SET total_hours = total_hours + ? WHERE id = ?")
-            .bind(hours_to_add)
-            .bind(chain_id)
-            .execute(&self.pool)
-            .await?;
-        Ok(())
     }
 
     /// Resolve a chain *name* (as sent by clients in `tapedeck_chain.chain_id`)
@@ -5425,10 +5458,85 @@ impl Database {
     }
 
     pub async fn list_notes(&self, user_id: i64) -> Result<Vec<NoteRow>, sqlx::Error> {
-        sqlx::query_as("SELECT * FROM notes WHERE user_id = ? ORDER BY updated_at DESC")
-            .bind(user_id)
-            .fetch_all(&self.pool)
-            .await
+        self.search_notes(user_id, "", "", "updated").await
+    }
+
+    /// Notes matching a query and a kind, in the requested order.
+    ///
+    /// Filtered here rather than in the handler because rendering one note costs
+    /// four more queries (its entity, its listen, whether it's loved, how many
+    /// revisions it has) — so narrowing a few hundred notes to a dozen before
+    /// that loop is the difference between a search being instant and being the
+    /// slowest screen in the app.
+    ///
+    /// `q` matches the note's **body and its subject both**: someone looking for
+    /// what they wrote about Burial means either "the word Burial appears in a
+    /// note" or "this is the Burial note", and being asked which is a worse
+    /// answer than searching both. The joins are `LEFT` because exactly one of
+    /// `entity_id` / `scrobble_id` is ever set.
+    ///
+    /// Case-insensitivity is SQLite's `LIKE`, which folds ASCII only — "BURIAL"
+    /// finds "Burial", but "CŒUR" does not find "Cœur". Doing better means
+    /// carrying a folded column, which is a bigger change than this earns.
+    pub async fn search_notes(
+        &self,
+        user_id: i64,
+        q: &str,
+        kind: &str,
+        sort: &str,
+    ) -> Result<Vec<NoteRow>, sqlx::Error> {
+        let order = match sort {
+            "created" => "n.created_at DESC",
+            // Alphabetical by subject. Notes on a listen have no entity name, so
+            // they sort last rather than under an empty string at the top.
+            "title" => "e.name IS NULL, LOWER(e.name) ASC, n.updated_at DESC",
+            _ => "n.updated_at DESC",
+        };
+        // `kind` is one of the stored entity kinds, or `listen` for a note about
+        // one particular playing. Anything else means "no filter" rather than an
+        // error — a stale bookmark should show everything, not nothing.
+        let kind_clause = match kind {
+            "recording" | "release" | "artist" => "e.kind = ?",
+            "listen" => "n.scrobble_id IS NOT NULL AND ? IS NOT NULL",
+            _ => "? IS NOT NULL",
+        };
+        let kind_bind = match kind {
+            "recording" | "release" | "artist" => kind.to_string(),
+            _ => "1".to_string(),
+        };
+
+        // `%` and `_` are wildcards to LIKE, so a note about "50_50" must not
+        // become a pattern matching everything. Escaped by hand — `str::replace`
+        // has no capture groups, and reaching for a regex to quote three
+        // characters would be its own mistake.
+        let mut escaped = String::with_capacity(q.len());
+        for c in q.trim().chars() {
+            if matches!(c, '\\' | '%' | '_') {
+                escaped.push('\\');
+            }
+            escaped.push(c);
+        }
+        let like = format!("%{escaped}%");
+        let sql = format!(
+            "SELECT n.* FROM notes n
+             LEFT JOIN entities e ON e.id = n.entity_id
+             LEFT JOIN scrobbles s ON s.id = n.scrobble_id
+             WHERE n.user_id = ?
+               AND ({kind_clause})
+               AND (? = ''
+                    OR n.body_md LIKE ? ESCAPE '\\'
+                    OR e.name LIKE ? ESCAPE '\\'
+                    OR e.artist_name LIKE ? ESCAPE '\\'
+                    OR s.title LIKE ? ESCAPE '\\'
+                    OR s.artist LIKE ? ESCAPE '\\')
+             ORDER BY {order}"
+        );
+
+        let mut query = sqlx::query_as(&sql).bind(user_id).bind(kind_bind).bind(q.trim());
+        for _ in 0..5 {
+            query = query.bind(like.clone());
+        }
+        query.fetch_all(&self.pool).await
     }
 
     /// Revisions newest-first, scoped through the note's owner so an id from
@@ -6115,26 +6223,44 @@ impl Database {
     /// Gear with its hours **derived from the chains that use it**.
     ///
     /// The stored `equipment.total_hours` was only ever written at creation, so
-    /// it sat at zero forever while the chains above it accumulated properly —
-    /// a chain reading "1.7h logged" over gear reading "0min" was the visible
-    /// symptom. Now that a chain component carries `equipment_id`, the number is
+    /// it sat at zero forever while the chains above it accumulated — a chain
+    /// reading "1.7h logged" over gear reading "0min" was the visible symptom.
+    /// Now that a chain component carries `equipment_id`, the number is
     /// derivable, and deriving it means it can't drift from the chain's own
-    /// total. `json_each` walks the components blob; gear that predates the
-    /// link (free-text steps) still reports zero, which is honest — nothing
-    /// records what it was attached to.
+    /// total. Gear that predates the link (free-text steps) still reports zero,
+    /// which is honest — nothing records what it was attached to.
+    ///
+    /// Two things about the shape of this, both found later:
+    ///
+    /// * It sums the **derived** chain hours, not `signal_chains.total_hours` —
+    ///   that column is a vestigial accumulator that undercounted every listen
+    ///   not arriving through the ingest API. See `CHAIN_COLUMNS`. Deriving here
+    ///   too is what stops the two levels disagreeing.
+    /// * `EXISTS` rather than a join against `json_each`. A chain that names the
+    ///   same piece of gear at two steps — a preamp used twice, a cable listed
+    ///   either side — matched twice and had its whole running time counted
+    ///   twice. The question is "does this chain use this gear", which is
+    ///   existence, not a row per mention.
+    ///
+    /// The `CAST` is load-bearing: SQLite types `SUM()` by what it actually
+    /// summed, so gear on no chain at all comes back INTEGER through the
+    /// `COALESCE` and sqlx refuses to decode it into `f64`. It shows up the
+    /// moment a user has gear with no hours on it, which is every new install.
     pub async fn get_equipment(&self, user_id: i64) -> Result<Vec<EquipmentRow>, sqlx::Error> {
         sqlx::query_as(
             "SELECT e.id, e.user_id, e.name, e.type, e.brand, e.model,
-                    -- CAST is load-bearing: SQLite types SUM() by what it
-                    -- actually summed, so a chain with 0 hours (or no matching
-                    -- chain at all, hitting the COALESCE) comes back INTEGER and
-                    -- sqlx refuses to decode it into f64. It only shows up once
-                    -- a user has gear with no hours on it, which is every new
-                    -- install.
                     CAST(COALESCE((
-                        SELECT SUM(c.total_hours) FROM signal_chains c, json_each(c.components) j
+                        SELECT SUM((
+                            SELECT COALESCE(SUM(sc.duration), 0) FROM scrobbles sc
+                             WHERE sc.user_id = c.user_id AND sc.chain_id = c.id
+                               AND sc.skipped = FALSE
+                        ) / 3600.0)
+                          FROM signal_chains c
                          WHERE c.user_id = e.user_id
-                           AND json_extract(j.value, '$.equipment_id') = e.id
+                           AND EXISTS (
+                               SELECT 1 FROM json_each(c.components) j
+                                WHERE json_extract(j.value, '$.equipment_id') = e.id
+                           )
                     ), 0) AS REAL) AS total_hours,
                     e.first_used, e.last_used, e.notes
                FROM equipment e
@@ -7747,6 +7873,110 @@ mod tests {
         assert_eq!(rows.iter().filter(|r| r.chain_id == Some(cid)).count(), 1);
     }
 
+    /// Chain and gear hours follow the listens, whenever the listens were
+    /// assigned.
+    ///
+    /// This was an accumulator written at one insert site, which meant three
+    /// things looked identical from the outside — a chain that has plainly been
+    /// used reading zero. Only ingested listens counted (a polled Plex listen
+    /// added nothing), assigning a chain afterwards moved nothing, and
+    /// `equipment.total_hours` derives from this so gear inherited all of it.
+    /// The reported symptom was "assigning signal chains to devices doesn't
+    /// update the usage hours", which is the second of those.
+    #[tokio::test]
+    async fn chain_and_gear_hours_follow_the_listens_however_late_they_are_assigned() {
+        let db = testdb().await;
+        let uid = db.create_user("ash", None, "pw", "admin").await.unwrap();
+
+        let gear =
+            db.upsert_equipment(uid, "Bifrost 2", "dac", Some("Schiit"), None, 0.0).await.unwrap();
+        let cid = db
+            .create_chain(&SignalChain {
+                id: None,
+                user_id: uid,
+                name: "Desktop".into(),
+                description: None,
+                // The same gear at two steps. Joining `json_each` counted the
+                // chain's whole running time once per mention, so a preamp used
+                // twice doubled its own hours.
+                components: vec![
+                    ChainComponent {
+                        component_type: ComponentType::Dac,
+                        name: "Bifrost 2".into(),
+                        detail: None,
+                        equipment_id: Some(gear),
+                    },
+                    ChainComponent {
+                        component_type: ComponentType::Transport,
+                        name: "Bifrost 2".into(),
+                        detail: None,
+                        equipment_id: Some(gear),
+                    },
+                ],
+                listening_context: ListeningContext::Active,
+                icon: None,
+                is_active: true,
+                total_hours: 0.0,
+                created_at: 0,
+            })
+            .await
+            .unwrap();
+
+        // Two hours played, plus a skip of the same length. None of it is
+        // assigned to the chain yet — which is the ordinary case, since a listen
+        // polled from a media server carries no chain until one is bound.
+        for (i, title) in ["a", "b"].iter().enumerate() {
+            let mut p = play(title, "x", 1000 + i as u64);
+            p.duration = Some(3600);
+            db.save_scrobble(uid, &p, None, None, None, None, None, None, ListenDisposition::LIVE)
+                .await
+                .unwrap();
+        }
+        let mut skipped = play("c", "x", 3000);
+        skipped.duration = Some(3600);
+        db.save_scrobble(
+            uid,
+            &skipped,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            ListenDisposition { imported: false, skipped: true },
+        )
+        .await
+        .unwrap();
+
+        let hours = |c: &SignalChain| (c.total_hours * 100.0).round() / 100.0;
+        assert_eq!(hours(&db.get_chain(uid, cid).await.unwrap().unwrap()), 0.0);
+
+        // Now assign them, the way binding an output device or fixing a listen
+        // by hand would. An accumulator counted nothing here; the derivation
+        // picks up every listen that carries the chain.
+        let ids: Vec<i64> = db.get_all_scrobbles(uid).await.unwrap().iter().map(|r| r.id).collect();
+        assert_eq!(ids.len(), 3);
+        db.bulk_set_scrobble_chain(uid, &ids, Some(cid)).await.unwrap();
+
+        let chain = db.get_chain(uid, cid).await.unwrap().unwrap();
+        assert_eq!(hours(&chain), 2.0, "two played hours; the skip is not one of them");
+        assert_eq!(
+            hours(&db.get_chains(uid).await.unwrap()[0]),
+            2.0,
+            "the listing and the single read must agree"
+        );
+
+        // Gear sums its chains, and the doubled component must not double it.
+        let gear_row =
+            db.get_equipment(uid).await.unwrap().into_iter().find(|g| g.id == gear).unwrap();
+        assert_eq!((gear_row.total_hours * 100.0).round() / 100.0, 2.0);
+
+        // Unassigning takes the hours back with it, which an accumulator could
+        // never do.
+        db.bulk_set_scrobble_chain(uid, &ids, None).await.unwrap();
+        assert_eq!(hours(&db.get_chain(uid, cid).await.unwrap().unwrap()), 0.0);
+    }
+
     /// A token per app, each with its own chain, is the whole point of
     /// `default_chain_id` — so validating a token must hand back the chain in
     /// the same breath as the identity, and editing must not re-issue it.
@@ -8444,6 +8674,54 @@ mod tests {
         assert!(db.delete_scrobble(uid, listen.id).await.unwrap());
         assert_eq!(db.list_notes(uid).await.unwrap().len(), 1);
         assert!(db.note_for_entity(uid, e).await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn searching_notes_looks_at_the_body_and_the_subject_both() {
+        let db = testdb().await;
+        let uid = db.create_user("kit", None, "x", "user").await.unwrap();
+        let other = db.create_user("nell", None, "x", "user").await.unwrap();
+
+        let record = db.upsert_entity("release", "Untrue", "Burial", None).await.unwrap();
+        let artist = db.upsert_entity("artist", "Aphex Twin", "", None).await.unwrap();
+        db.upsert_note(uid, Some(record), None, "the rain on this one", "private").await.unwrap();
+        db.upsert_note(uid, Some(artist), None, "everything after Untrue owes this", "private")
+            .await
+            .unwrap();
+        // Someone else's note mentioning the same word must never come back.
+        let theirs = db.upsert_entity("release", "Untrue", "Burial", None).await.unwrap();
+        db.upsert_note(other, Some(theirs), None, "not yours", "private").await.unwrap();
+
+        // The subject matches for one, the body for the other — a search that
+        // only did one of those would find half of what was asked for.
+        let hits = db.search_notes(uid, "untrue", "", "updated").await.unwrap();
+        assert_eq!(hits.len(), 2, "the record by name, the artist by its body");
+
+        let by_body = db.search_notes(uid, "rain", "", "updated").await.unwrap();
+        assert_eq!(by_body.len(), 1);
+        assert_eq!(by_body[0].body_md, "the rain on this one");
+
+        // ASCII case folding is what SQLite's LIKE gives, and it is the case
+        // people actually type.
+        assert_eq!(db.search_notes(uid, "BURIAL", "", "updated").await.unwrap().len(), 1);
+
+        // The kind filter, and an unrecognised one meaning "no filter" rather
+        // than "nothing" — a stale bookmark should not look like an empty
+        // account.
+        assert_eq!(db.search_notes(uid, "", "artist", "updated").await.unwrap().len(), 1);
+        assert_eq!(db.search_notes(uid, "", "release", "updated").await.unwrap().len(), 1);
+        assert_eq!(db.search_notes(uid, "", "listen", "updated").await.unwrap().len(), 0);
+        assert_eq!(db.search_notes(uid, "", "nonsense", "updated").await.unwrap().len(), 2);
+
+        // A wildcard typed into the box is a literal, not a pattern matching
+        // everything.
+        assert_eq!(db.search_notes(uid, "%", "", "updated").await.unwrap().len(), 0);
+        assert_eq!(db.search_notes(uid, "_", "", "updated").await.unwrap().len(), 0);
+
+        // Alphabetical sorts by subject, which is not the same order as by edit.
+        let titled = db.search_notes(uid, "", "", "title").await.unwrap();
+        assert_eq!(titled.len(), 2);
+        assert_eq!(titled[0].entity_id, Some(artist), "Aphex Twin before Untrue");
     }
 
     #[tokio::test]

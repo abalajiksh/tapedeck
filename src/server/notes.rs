@@ -174,6 +174,19 @@ async fn note_context(
     }
 }
 
+/// What a note is *about*, as one line.
+///
+/// The same string names the note in a listing, titles its exported file and is
+/// what a wikilink in another exported note points at — so it is computed once,
+/// here, rather than three times in three shapes.
+fn entity_title(e: &EntityRow) -> String {
+    if e.artist_name.trim().is_empty() {
+        e.name.clone()
+    } else {
+        format!("{} — {}", e.name, e.artist_name)
+    }
+}
+
 /// Markdown → HTML with every shortcode resolved against this user's entities
 /// and listening history.
 async fn render(
@@ -318,18 +331,48 @@ async fn save_note(
     }
 }
 
+#[derive(Deserialize, Default)]
+struct ListQuery {
+    /// Free text, matched against the body *and* the subject.
+    q: Option<String>,
+    /// `recording` / `release` / `artist` / `listen`. Anything else is no
+    /// filter — a stale bookmark should show everything, not nothing.
+    kind: Option<String>,
+    /// `updated` (default), `created` or `title`.
+    sort: Option<String>,
+}
+
 /// GET /api/v1/notes — everything this user has written, newest edit first.
+///
+/// Takes a query and a kind because a notes collection is a thing that grows: at
+/// twenty notes a flat list is fine and at two hundred it is a wall. Both are
+/// applied in SQL rather than here — see `Database::search_notes` for why.
+///
+/// `total` is the unfiltered count, so the UI can say "12 of 240" and a search
+/// returning nothing reads as a search rather than as an empty account.
 async fn list_notes(
     State(state): State<Arc<AppState>>,
     ReadAuth { user }: ReadAuth,
+    Query(q): Query<ListQuery>,
 ) -> impl IntoResponse {
-    match state.db.list_notes(user.user_id).await {
+    let query = q.q.unwrap_or_default();
+    let kind = q.kind.unwrap_or_default();
+    let sort = q.sort.unwrap_or_default();
+
+    match state.db.search_notes(user.user_id, &query, &kind, &sort).await {
         Ok(rows) => {
             let mut out = Vec::with_capacity(rows.len());
             for note in &rows {
                 out.push(note_json(&state.db, user.user_id, note, false).await);
             }
-            (StatusCode::OK, Json(serde_json::json!({ "notes": out }))).into_response()
+            // Only worth a second query when something was actually filtered.
+            let total = if query.trim().is_empty() && kind.is_empty() {
+                out.len()
+            } else {
+                state.db.list_notes(user.user_id).await.map(|r| r.len()).unwrap_or(out.len())
+            };
+            (StatusCode::OK, Json(serde_json::json!({ "notes": out, "total": total })))
+                .into_response()
         }
         Err(e) => server_error(e),
     }
@@ -697,11 +740,298 @@ async fn get_entity(
     }
 }
 
+// ── Export ──
+
+/// Resolutions for an *export*, where the label has to be the exported file's
+/// title rather than the entity's bare name.
+///
+/// `render` can use the short label because it emits an `href` alongside it and
+/// the browser follows that. A wikilink has no href — it resolves by filename —
+/// so "Xtal" would point at a file that does not exist while `Xtal — Aphex
+/// Twin.md` sits beside it. Hence the extra `get_entity` per distinct
+/// shortcode: cheap in an export, and the difference between a vault that links
+/// up and one full of dead ends.
+async fn export_resolutions(
+    db: &Database,
+    user_id: i64,
+    body_md: &str,
+    ctx_artist: Option<&str>,
+    ctx_album: Option<&str>,
+) -> HashMap<(RefKind, String), Resolved> {
+    let mut resolved: HashMap<(RefKind, String), Resolved> = HashMap::new();
+    for code in notes::scan(body_md) {
+        let key = code.key();
+        if resolved.contains_key(&key) {
+            continue;
+        }
+        let Some(entity_kind) = code.kind.entity_kind() else {
+            // Gear has no note file of its own, so the link is to a page named
+            // after the equipment. Dangling until the writer makes one, which is
+            // ordinary in a wiki and better than dropping the reference.
+            if let Ok(Some((_, label))) = db.find_equipment_by_name(user_id, &code.target).await {
+                resolved.insert(key, Resolved { label, href: String::new() });
+            }
+            continue;
+        };
+        let hit = db
+            .resolve_reference(
+                user_id,
+                entity_kind,
+                &code.target,
+                code.position(),
+                ctx_artist,
+                ctx_album,
+            )
+            .await;
+        if let Ok(Some((entity_id, label))) = hit {
+            let title = match db.get_entity(entity_id).await {
+                Ok(Some(e)) => entity_title(&e),
+                _ => label,
+            };
+            resolved.insert(key, Resolved { label: title, href: String::new() });
+        }
+    }
+    resolved
+}
+
+/// YAML frontmatter, which is what Obsidian and Logseq both read.
+///
+/// Quoted and escaped throughout: a record called `Untitled: "Live"` would
+/// otherwise break the block and take the whole file's metadata with it, and
+/// exactly that sort of title is what a liner-notes feature attracts.
+fn yaml(key: &str, value: &str) -> String {
+    format!("{key}: \"{}\"\n", value.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
+fn iso(ts: i64) -> String {
+    chrono::DateTime::from_timestamp(ts, 0)
+        .map(|d| d.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
+        .unwrap_or_default()
+}
+
+/// One note as a standalone Markdown document: frontmatter, then the body with
+/// its shortcodes turned into wikilinks.
+async fn note_document(db: &Database, user_id: i64, note: &NoteRow, title: &str) -> String {
+    let (ctx_artist, ctx_album) = note_context(db, user_id, note).await;
+    let resolutions =
+        export_resolutions(db, user_id, &note.body_md, ctx_artist.as_deref(), ctx_album.as_deref())
+            .await;
+
+    let entity = match note.entity_id {
+        Some(id) => db.get_entity(id).await.ok().flatten(),
+        None => None,
+    };
+
+    let mut out = String::from("---\n");
+    out.push_str(&yaml("title", title));
+    match entity.as_ref() {
+        Some(e) => {
+            // The shortcode spelling, not the stored one: someone reading this
+            // in a vault has met `track`/`album`, not `recording`/`release`.
+            let kind = match e.kind.as_str() {
+                "recording" => "track",
+                "release" => "album",
+                other => other,
+            };
+            out.push_str(&yaml("kind", kind));
+            out.push_str(&yaml("name", &e.name));
+            if !e.artist_name.trim().is_empty() {
+                out.push_str(&yaml("artist", &e.artist_name));
+            }
+            if let Some(mbid) = e.mbid.as_deref().filter(|m| !m.trim().is_empty()) {
+                out.push_str(&yaml("mbid", mbid));
+            }
+            out.push_str(&format!(
+                "loved: {}\n",
+                db.is_loved(user_id, e.id).await.unwrap_or(false)
+            ));
+            out.push_str(&format!("tags: [tapedeck, liner-note, {kind}]\n"));
+        }
+        None => {
+            out.push_str(&yaml("kind", "listen"));
+            if let Some(sid) = note.scrobble_id {
+                if let Ok(Some(s)) = db.get_scrobble(user_id, sid).await {
+                    out.push_str(&yaml("name", &s.title));
+                    out.push_str(&yaml("artist", &s.artist));
+                    if let Some(album) = s.album.as_deref().filter(|a| !a.trim().is_empty()) {
+                        out.push_str(&yaml("album", album));
+                    }
+                    out.push_str(&yaml("played", &iso(s.timestamp)));
+                }
+            }
+            out.push_str("tags: [tapedeck, liner-note, listen]\n");
+        }
+    }
+    out.push_str(&yaml("visibility", &note.visibility));
+    out.push_str(&yaml("created", &iso(note.created_at)));
+    out.push_str(&yaml("updated", &iso(note.updated_at)));
+    out.push_str("---\n\n");
+    out.push_str(&notes::export_markdown(&note.body_md, &resolutions));
+    if !out.ends_with('\n') {
+        out.push('\n');
+    }
+    out
+}
+
+/// What is true of both export shapes. The sentence describing the *shape* is
+/// not in here on purpose — the single-file form claiming "one file per note"
+/// would be a lie printed at the top of the thing it describes.
+const EXPORT_NOTES: &str = "\
+`[[Wikilinks]]` in the text were `[[track:…]]`, `[[album:…]]`, `[[artist:…]]` or
+`[[gear:…]]` shortcodes in Tapedeck, and point at the file for whatever they
+resolved to. A reference that matched nothing is left exactly as it was written
+— it is what you typed, and rewriting it into something else would be a worse
+answer than a dangling link.
+
+Nothing here is a live link back to Tapedeck: this is a copy of your writing,
+readable on its own in ten years' time with no server running.
+";
+
+const ZIP_README_HEAD: &str = "\
+# Liner notes
+
+Exported from Tapedeck. One file per note, with YAML frontmatter that Obsidian
+and Logseq both read.
+
+";
+
+const SINGLE_HEAD: &str = "\
+# Liner notes
+
+Exported from Tapedeck. Every note in one document, a section each. The
+per-note metadata — artist, kind, MBID, dates — is in the folder export
+instead; a dozen frontmatter blocks down one file is noise, and only the first
+would be read as metadata anywhere.
+
+";
+
+#[derive(Deserialize)]
+struct ExportQuery {
+    /// `zip` (default) — one file per note. `md` — everything in one document.
+    format: Option<String>,
+}
+
+/// GET /api/v1/notes/export — every note as Markdown.
+///
+/// Session-only, deliberately. This is the whole of the user's own writing in
+/// one request; `read` on a token is meant for an app showing a note, not for
+/// draining the lot.
+///
+/// Held in memory rather than streamed like `/api/v1/export`: notes are a few
+/// hundred short documents where listens are hundreds of thousands of rows, and
+/// a zip's central directory has to be written after the entries anyway.
+async fn export_notes(
+    State(state): State<Arc<AppState>>,
+    user: super::auth::AuthUser,
+    Query(q): Query<ExportQuery>,
+) -> impl IntoResponse {
+    let single = q.format.as_deref() == Some("md");
+
+    let rows = match state.db.list_notes(user.user_id).await {
+        Ok(r) => r,
+        Err(e) => return server_error(e),
+    };
+
+    // Titles first, and all of them, because a filename has to be unique before
+    // any body is written — a wikilink pointing at "Untitled" when two files
+    // want that name resolves to whichever one the vault saw first.
+    let mut used: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut titled: Vec<(&NoteRow, String, String)> = Vec::with_capacity(rows.len());
+    for note in &rows {
+        let title = match note.entity_id {
+            Some(id) => match state.db.get_entity(id).await {
+                Ok(Some(e)) => entity_title(&e),
+                _ => "Untitled".to_string(),
+            },
+            None => match note.scrobble_id {
+                Some(sid) => match state.db.get_scrobble(user.user_id, sid).await {
+                    Ok(Some(s)) => format!("{} — {} (listen)", s.title, s.artist),
+                    _ => "Untitled listen".to_string(),
+                },
+                None => "Untitled".to_string(),
+            },
+        };
+        let base = notes::export_filename(&title);
+        let mut file = base.clone();
+        let mut n = 2;
+        while !used.insert(file.clone()) {
+            file = format!("{base} ({n})");
+            n += 1;
+        }
+        titled.push((note, title, file));
+    }
+
+    if single {
+        let mut doc = String::from(SINGLE_HEAD);
+        doc.push_str(EXPORT_NOTES);
+        for (note, title, _) in &titled {
+            doc.push_str(&format!("\n\n---\n\n## {title}\n\n"));
+            let body = note_document(&state.db, user.user_id, note, title).await;
+            // The per-file frontmatter would be noise repeated N times inside
+            // one document; only the first block in a Markdown file is metadata
+            // anywhere that reads it.
+            doc.push_str(body.split_once("---\n\n").map(|(_, rest)| rest).unwrap_or(&body));
+        }
+        return (
+            StatusCode::OK,
+            [
+                (axum::http::header::CONTENT_TYPE, "text/markdown; charset=utf-8"),
+                (
+                    axum::http::header::CONTENT_DISPOSITION,
+                    "attachment; filename=\"tapedeck-liner-notes.md\"",
+                ),
+            ],
+            doc,
+        )
+            .into_response();
+    }
+
+    let mut buf = std::io::Cursor::new(Vec::<u8>::new());
+    {
+        use std::io::Write;
+        let mut zip = zip::ZipWriter::new(&mut buf);
+        let opts = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated);
+
+        if zip.start_file("README.md", opts).is_err()
+            || zip.write_all(ZIP_README_HEAD.as_bytes()).is_err()
+            || zip.write_all(EXPORT_NOTES.as_bytes()).is_err()
+        {
+            return err(StatusCode::INTERNAL_SERVER_ERROR, "Could not write the export");
+        }
+        for (note, title, file) in &titled {
+            let doc = note_document(&state.db, user.user_id, note, title).await;
+            if zip.start_file(format!("{file}.md"), opts).is_err()
+                || zip.write_all(doc.as_bytes()).is_err()
+            {
+                return err(StatusCode::INTERNAL_SERVER_ERROR, "Could not write the export");
+            }
+        }
+        if zip.finish().is_err() {
+            return err(StatusCode::INTERNAL_SERVER_ERROR, "Could not close the export");
+        }
+    }
+
+    (
+        StatusCode::OK,
+        [
+            (axum::http::header::CONTENT_TYPE, "application/zip"),
+            (
+                axum::http::header::CONTENT_DISPOSITION,
+                "attachment; filename=\"tapedeck-liner-notes.zip\"",
+            ),
+        ],
+        buf.into_inner(),
+    )
+        .into_response()
+}
+
 pub fn create_notes_router() -> Router<Arc<AppState>> {
     Router::new()
-        // Literal segments first, so neither is read as an `:id`.
+        // Literal segments first, so none is read as an `:id`.
         .route("/api/v1/notes/preview", post(preview))
         .route("/api/v1/notes/for", get(note_for))
+        .route("/api/v1/notes/export", get(export_notes))
         .route("/api/v1/notes", get(list_notes).post(save_note))
         .route("/api/v1/notes/:id", get(get_note).delete(delete_note))
         .route("/api/v1/notes/:id/revisions", get(note_revisions))

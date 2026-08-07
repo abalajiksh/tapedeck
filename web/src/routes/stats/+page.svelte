@@ -183,17 +183,36 @@
 		<div class="panel" style="border-radius:20px;padding:18px 20px;"><div style="font-size:10.5px;letter-spacing:.1em;text-transform:uppercase;color:var(--td-muted-2);margin-bottom:6px;">Avg Quality</div><div class="h-display" style="font-size:30px;line-height:1;">{t.avg_quality}<span style="font-size:16px;color:var(--td-muted-2);">/100</span></div></div>
 		<!-- Both shares are over listens with a known format, and both say so.
 		     Dividing by every play made these a reading of how much of the
-		     history was imported. -->
-		<div class="panel" style="border-radius:20px;padding:18px 20px;">
-			<div style="font-size:10.5px;letter-spacing:.1em;text-transform:uppercase;color:var(--td-muted-2);margin-bottom:6px;">{fidelityLabel(lossless, 'Lossless')}</div>
-			<div class="h-display" style="font-size:30px;line-height:1;color:var(--td-good-fg);">{lossless.value}</div>
-			<div class="fid-sub">{lossless.sub}</div>
-		</div>
-		<div class="panel" style="border-radius:20px;padding:18px 20px;">
-			<div style="font-size:10.5px;letter-spacing:.1em;text-transform:uppercase;color:var(--td-muted-2);margin-bottom:6px;">{dsd.scored ? 'DSD' : 'Fidelity'}</div>
-			<div class="h-display" style="font-size:30px;line-height:1;color:#b2622d;">{dsd.value}</div>
-			<div class="fid-sub">{dsd.sub}</div>
-		</div>
+		     history was imported.
+
+		     Below the coverage floor they collapse to *one* card, and that is
+		     not a tidy-up. `fidelity()` decides to score on `known / total`,
+		     which is a fact about the history rather than about lossless or DSD
+		     — so both cards degraded to the same heading, the same percentage
+		     and the same sentence, and the page showed "FIDELITY 4%" twice
+		     side by side. There is one thing to say, so it is said once. -->
+		{#if lossless.scored}
+			<div class="panel" style="border-radius:20px;padding:18px 20px;">
+				<div style="font-size:10.5px;letter-spacing:.1em;text-transform:uppercase;color:var(--td-muted-2);margin-bottom:6px;">{fidelityLabel(lossless, 'Lossless')}</div>
+				<div class="h-display" style="font-size:30px;line-height:1;color:var(--td-good-fg);">{lossless.value}</div>
+				<div class="fid-sub">{lossless.sub}</div>
+			</div>
+			<div class="panel" style="border-radius:20px;padding:18px 20px;">
+				<div style="font-size:10.5px;letter-spacing:.1em;text-transform:uppercase;color:var(--td-muted-2);margin-bottom:6px;">DSD</div>
+				<div class="h-display" style="font-size:30px;line-height:1;color:#b2622d;">{dsd.value}</div>
+				<div class="fid-sub">{dsd.sub}</div>
+			</div>
+		{:else}
+			<div class="panel" style="border-radius:20px;padding:18px 20px;">
+				<div style="font-size:10.5px;letter-spacing:.1em;text-transform:uppercase;color:var(--td-muted-2);margin-bottom:6px;">Fidelity</div>
+				<div class="h-display" style="font-size:30px;line-height:1;color:var(--td-muted-2);">{lossless.value}</div>
+				<div class="fid-sub">
+					of your listening has a known format — too little to score lossless or DSD.
+					Formats come from a media server or a player that reports them; an imported
+					history carries none.
+				</div>
+			</div>
+		{/if}
 	</div>
 
 	<!-- Top artists / albums / tracks.

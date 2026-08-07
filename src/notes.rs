@@ -219,6 +219,81 @@ pub fn render(src: &str, resolved: &HashMap<(RefKind, String), Resolved>) -> Str
         .to_string()
 }
 
+/// The note as Markdown for a wiki — Obsidian, Logseq, anything reading a
+/// folder of files.
+///
+/// The body is the user's own text and is left alone. The one thing that has to
+/// change is the shortcodes, and the reason is a genuine collision: `[[…]]` is
+/// Tapedeck's reference syntax *and* the wikilink syntax of every tool this
+/// export is aimed at. Dropped in as they stand, `[[track:Xtal]]` becomes a link
+/// to a page called "track:Xtal" in a vault that will never have one.
+///
+/// So a **resolved** shortcode becomes `[[Label]]` — a real wikilink, pointing
+/// at the note file this export gives that entity, or at a page the writer can
+/// go on to create. That is the whole reason to export to a wiki rather than
+/// download a text file.
+///
+/// An **unresolved** one is left exactly as it was typed. It is what the writer
+/// wrote, and the same judgement the HTML renderer makes: a reference that
+/// matches nothing is not an error and must not be rewritten into something
+/// else. It lands in the vault as a dangling link named after the shortcode,
+/// which is honest about what it is.
+pub fn export_markdown(src: &str, resolved: &HashMap<(RefKind, String), Resolved>) -> String {
+    let codes = scan(src);
+    if codes.is_empty() {
+        return src.to_string();
+    }
+
+    let mut out = String::with_capacity(src.len());
+    let mut cursor = 0;
+    for code in codes {
+        out.push_str(&src[cursor..code.span.start]);
+        match resolved.get(&code.key()) {
+            // Through `export_filename`, not the raw label: a wikilink resolves
+            // by *filename*, so the two must be produced by the same rule or
+            // every link in the export dangles. Deriving both from one function
+            // is what makes that impossible to get wrong later.
+            Some(r) => {
+                out.push_str("[[");
+                out.push_str(&export_filename(&r.label));
+                out.push_str("]]");
+            }
+            None => out.push_str(&src[code.span.clone()]),
+        }
+        cursor = code.span.end;
+    }
+    out.push_str(&src[cursor..]);
+    out
+}
+
+/// A note's filename inside the export, without extension.
+///
+/// Wikilinks resolve by filename, so this has to agree with the label
+/// [`export_markdown`] writes — that is why both go through the same character
+/// rules. Slashes especially: `AC/DC` would otherwise be a directory.
+pub fn export_filename(label: &str) -> String {
+    let cleaned: String = label
+        .chars()
+        .map(|c| match c {
+            // Reserved on Windows or meaningful to a wikilink. Replaced rather
+            // than dropped so "AC/DC" stays two syllables.
+            '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' | '[' | ']' | '#' | '^' => ' ',
+            c if c.is_control() => ' ',
+            c => c,
+        })
+        .collect();
+    // Collapse the runs those substitutions leave behind.
+    let cleaned = cleaned.split_whitespace().collect::<Vec<_>>().join(" ");
+    // Long enough for "Album — Artist", short of every filesystem's limit.
+    let cut: String = cleaned.chars().take(120).collect();
+    let cut = cut.trim_end_matches('.').trim().to_string();
+    if cut.is_empty() {
+        "Untitled".into()
+    } else {
+        cut
+    }
+}
+
 /// First line or so of a note, for list views. Shortcodes become their bare
 /// target text — an excerpt is a label, not a place to click through from.
 pub fn excerpt(src: &str, max_chars: usize) -> String {
@@ -359,5 +434,52 @@ mod tests {
         let e = excerpt("## On repeat\n\nThe best is [[track:Xtal]], really", 80);
         assert_eq!(e, "On repeat The best is Xtal, really");
         assert!(excerpt(&"long ".repeat(60), 40).ends_with('…'));
+    }
+
+    // ── Export ──
+
+    #[test]
+    fn a_resolved_ref_exports_as_a_wikilink_and_an_unresolved_one_as_itself() {
+        let map = resolved(&[(RefKind::Track, "3", 9, "Xtal — Aphex Twin")]);
+        let out = export_markdown("Best is [[track:3]], not [[track:Ptolemy]].", &map);
+        assert_eq!(out, "Best is [[Xtal — Aphex Twin]], not [[track:Ptolemy]].");
+    }
+
+    #[test]
+    fn the_wikilink_is_the_filename_the_export_would_write() {
+        // The whole export hangs on these two agreeing: a wikilink resolves by
+        // filename, so a label sanitised one way and a file named another means
+        // every link in the vault dangles.
+        let map = resolved(&[(RefKind::Artist, "AC/DC", 4, "AC/DC")]);
+        let out = export_markdown("Saw [[artist:AC/DC]] once.", &map);
+        assert_eq!(out, format!("Saw [[{}]] once.", export_filename("AC/DC")));
+        assert!(!out.contains('/'), "a slash in a link is a directory in a vault");
+    }
+
+    #[test]
+    fn a_filename_never_escapes_its_folder_or_ends_up_empty() {
+        assert_eq!(export_filename("AC/DC"), "AC DC");
+        assert_eq!(export_filename("../../etc/passwd"), ".. .. etc passwd");
+        assert_eq!(export_filename("Untitled: \"Live\""), "Untitled Live");
+        assert_eq!(export_filename("   "), "Untitled");
+        assert_eq!(export_filename("///"), "Untitled");
+        // Trailing dots are legal here and refused by Windows.
+        assert_eq!(export_filename("Whatever..."), "Whatever");
+        assert!(export_filename(&"x".repeat(400)).chars().count() <= 120);
+    }
+
+    #[test]
+    fn a_body_with_no_shortcodes_is_exported_verbatim() {
+        let src = "Bought this on a whim in 2011.\n\n- side A is the one\n";
+        assert_eq!(export_markdown(src, &HashMap::new()), src);
+    }
+
+    #[test]
+    fn a_gear_ref_exports_as_a_link_too() {
+        let map = resolved(&[(RefKind::Gear, "Bifrost 2", 2, "Schiit Bifrost 2")]);
+        assert_eq!(
+            export_markdown("Heard on the [[gear:Bifrost 2]].", &map),
+            "Heard on the [[Schiit Bifrost 2]]."
+        );
     }
 }

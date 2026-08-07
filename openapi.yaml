@@ -26,7 +26,7 @@ openapi: 3.1.0
 
 info:
   title: Tapedeck
-  version: 0.45.1
+  version: 0.46.0
   summary: Self-hosted scrobbler and listening journal.
   description: |
     Tapedeck ingests listens, enriches them with MusicBrainz metadata, stores
@@ -1183,20 +1183,39 @@ paths:
     post:
       tags: [Listens, Chains]
       summary: Attribute many listens to one signal chain.
-      description: Session-only. Retro-attribution after adding gear.
+      description: |
+        Session-only. Retro-attribution after adding gear — and since v0.46.0
+        the chain's *hours* follow the listens, so doing this moves the usage
+        numbers for listening you already have rather than only for future
+        plays.
+
+        **The field is `signal_chain_id`, and it is required.** This entry
+        documented it as `chain_id` for several releases, alongside three
+        parameters (`from`, `to`, `source_name`) the handler has never accepted
+        — and the mismatch was silently destructive rather than an error: the
+        body deserialised cleanly with the field missing, which meant "clear the
+        chain", so a client following the spec wiped the attribution on every
+        listen in `ids` and got `200 {"updated": N}` back. An absent field is a
+        `400` now.
+
+        Send an explicit `null` to clear. That case is real — it is how the
+        History bulk edit removes a chain — which is why absent and null cannot
+        be collapsed.
       requestBody:
         required: true
         content:
           application/json:
             schema:
               type: object
-              required: [chain_id]
+              required: [ids, signal_chain_id]
               properties:
-                chain_id: { type: [integer, 'null'] }
-                ids: { type: array, items: { type: integer } }
-                from: { type: integer, description: Unix seconds. }
-                to: { type: integer }
-                source_name: { type: string }
+                ids:
+                  type: array
+                  items: { type: integer }
+                  description: The listens to reassign. Scoped to the caller; ids belonging to anyone else match nothing.
+                signal_chain_id:
+                  type: [integer, 'null']
+                  description: The chain to attribute them to. Explicit `null` clears it; omitting the field is an error, not a clear.
       responses:
         '200':
           description: Applied.
@@ -1822,11 +1841,25 @@ paths:
     get:
       tags: [Notes]
       summary: Your liner notes.
-      description: 'Scope: `read` *(since v0.39)*. Self-only, whatever `visibility` says.'
+      description: |
+        Scope: `read` *(since v0.39)*. Self-only, whatever `visibility` says.
+
+        `q` matches the note's **body and its subject both** — someone looking
+        for what they wrote about Burial means either, and asking which is a
+        worse answer than searching both. Case-insensitivity is SQLite's `LIKE`,
+        which folds ASCII only: `BURIAL` finds `Burial`, `CŒUR` does not find
+        `Cœur`.
+
+        `total` is the count **before** filtering, so a search that finds nothing
+        reads as a search rather than as an empty account.
       security: [{ sessionCookie: [] }, { apiToken: [read] }]
       parameters:
-        - $ref: '#/components/parameters/Limit'
-        - $ref: '#/components/parameters/Offset'
+        - { name: q, in: query, schema: { type: string }, description: Free text over the body and the subject. }
+        - name: kind
+          in: query
+          schema: { type: string, enum: [recording, release, artist, listen] }
+          description: Anything unrecognised means no filter — a stale bookmark should show everything, not nothing.
+        - { name: sort, in: query, schema: { type: string, enum: [updated, created, title], default: updated } }
       responses:
         '200':
           description: OK.
@@ -1836,7 +1869,7 @@ paths:
                 type: object
                 properties:
                   notes: { type: array, items: { $ref: '#/components/schemas/Note' } }
-                  count: { type: integer }
+                  total: { type: integer, description: Unfiltered count. }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
     post:
@@ -1924,6 +1957,40 @@ paths:
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
+
+  /api/v1/notes/export:
+    get:
+      tags: [Notes]
+      summary: Every note as Markdown, for Obsidian / Logseq / a folder of files.
+      description: |
+        **Session-only**, unlike the rest of `/notes`. This is the whole of the
+        user's own writing in one request; `read` on a token is meant for an app
+        showing a note, not for draining the lot.
+
+        `format=zip` (default) gives one file per note with YAML frontmatter —
+        `title`, `kind`, `name`, `artist`, `mbid`, `loved`, `visibility`,
+        `created`, `updated`, `tags` — plus a `README.md`. `format=md` gives one
+        document with a section per note.
+
+        **Shortcodes become wikilinks, and only where they resolve.** `[[…]]` is
+        Tapedeck's reference syntax *and* the wikilink syntax of every tool this
+        is aimed at, so `[[track:Xtal]]` left as-is would point at a page called
+        `track:Xtal` that will never exist. A resolved reference becomes
+        `[[Xtal — Aphex Twin]]`, matching that note's own filename by
+        construction. An **unresolved** one is left exactly as written: it is
+        what the writer typed, and the same judgement the HTML renderer makes.
+
+        Filenames are de-duplicated (`Untitled (2)`), so a wikilink can never
+        land on whichever of two files the vault happened to see first.
+      parameters:
+        - { name: format, in: query, schema: { type: string, enum: [zip, md], default: zip } }
+      responses:
+        '200':
+          description: The export.
+          content:
+            application/zip: { schema: { type: string, format: binary } }
+            text/markdown: { schema: { type: string } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
 
   /api/v1/notes/for:
     get:
@@ -2778,6 +2845,112 @@ paths:
         '200': { description: OK., content: { application/json: { schema: { type: object, additionalProperties: true } } } }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '404': { $ref: '#/components/responses/NotFound' }
+
+  # ── Playlists ──────────────────────────────────────────────────────────────
+  /api/v1/playlist-targets:
+    get:
+      tags: [Playlists]
+      summary: Servers a generated list can be sent to.
+      description: |
+        Session-only, and permanently so: pushing spends the credential of a
+        configured source, which puts it on the same side of the line as
+        `/api/v1/sources` — the line API tokens do not cross.
+
+        The targets are the caller's **enabled** sources, filtered to the kinds
+        that can receive a playlist. `protocol` names the wire protocol rather
+        than the product, so a Navidrome source reads as `Subsonic`: the calls
+        are `search3` and `createPlaylist`, which any OpenSubsonic server
+        answers. A kind missing from the list is a source that polls and cannot
+        be written to, not a bug.
+      responses:
+        '200':
+          description: OK.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  targets:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        source_id: { type: integer }
+                        kind: { type: string, enum: [plex, jellyfin, navidrome] }
+                        protocol: { type: string, enum: [Plex, Jellyfin, Subsonic] }
+                        label: { type: string, description: Falls back to the protocol name when the source has none. }
+                        account: { type: string, nullable: true }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /api/v1/playlists:
+    post:
+      tags: [Playlists]
+      summary: Create a playlist on one of your servers from a list of tracks.
+      description: |
+        Session-only — see `/api/v1/playlist-targets`.
+
+        Tapedeck stores **names, not the server's item ids**, for a generated
+        list, so every track is resolved by searching the target and every one of
+        those searches is fuzzy. A hit is checked on artist *and* title before it
+        is used; an exact title beats a `(Remastered)` one, and a hit for a
+        different artist is discarded rather than taken.
+
+        **A partial push is a success, not an error.** A listening history is not
+        the same set as any one library, so `matched` below `requested` is the
+        normal case and `missing` names every track that did not land. The push
+        only fails outright when nothing matched (`404`) or the server refused or
+        could not be reached (`502`) — the two need completely different things
+        from the user, so they are not collapsed.
+
+        Order is preserved; misses drop out. At most 100 tracks, which is a
+        wall-clock bound as much as a politeness one — the searches run in turn
+        against what is often a Raspberry Pi.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [source_id, name, tracks]
+              properties:
+                source_id: { type: integer, description: From `/api/v1/playlist-targets`. }
+                name: { type: string, description: Trimmed, truncated to 120 characters. }
+                tracks:
+                  type: array
+                  maxItems: 100
+                  items:
+                    type: object
+                    required: [title, artist]
+                    properties:
+                      title: { type: string }
+                      artist: { type: string }
+                      album: { type: string, nullable: true, description: A tiebreaker between pressings, never a requirement. }
+      responses:
+        '200':
+          description: Created — possibly with fewer tracks than asked for.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  playlist_id: { type: string, description: 'The server''s own id. Empty when a Subsonic server answered `ok` without one.' }
+                  name: { type: string }
+                  protocol: { type: string }
+                  target: { type: object, additionalProperties: true }
+                  requested: { type: integer }
+                  matched: { type: integer }
+                  missing:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        title: { type: string }
+                        artist: { type: string }
+                        album: { type: string, nullable: true }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { description: No such source, or none of those tracks are on it. }
+        '502': { description: The server refused the playlist or could not be reached. }
 
   # ── Settings ───────────────────────────────────────────────────────────────
   /api/v1/preferences:

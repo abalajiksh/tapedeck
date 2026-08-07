@@ -643,7 +643,34 @@ async fn personality(
 #[derive(Debug, Deserialize)]
 pub struct BulkChain {
     pub ids: Vec<i64>,
-    pub signal_chain_id: Option<i64>, // null clears the chain on those listens
+    /// Which chain to put these listens on. **Present-and-null clears it;
+    /// absent is an error**, which is why this is doubly wrapped.
+    ///
+    /// It was a plain `Option<i64>`, and serde reads a bare `Option` field as
+    /// defaulting to `None` — so a request that merely *misspelled* the key
+    /// deserialised cleanly, cleared the chain off every listen named in `ids`,
+    /// and answered `200 {"updated": 28}`. A typo silently undid the
+    /// attribution it was trying to set, and reported success. `openapi.yaml`
+    /// made that easy to hit: it documented the field as `chain_id`, which is
+    /// exactly the spelling that wipes.
+    ///
+    /// Same shape and same reason as `default_chain_id` on
+    /// `PATCH /admin/tokens/:id` — the difference between "clear this" and
+    /// "leave it alone" has to survive deserialisation.
+    #[serde(default, deserialize_with = "deserialize_some")]
+    pub signal_chain_id: Option<Option<i64>>,
+}
+
+/// Distinguish an absent field from an explicit `null`.
+///
+/// `#[serde(default)]` alone cannot: both arrive as `None`. This is only ever
+/// called when the key is present, so anything it yields is `Some(_)`.
+fn deserialize_some<'de, T, D>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    T: Deserialize<'de>,
+    D: serde::Deserializer<'de>,
+{
+    T::deserialize(deserializer).map(Some)
 }
 
 /// POST /api/v1/scrobbles/bulk-chain — reassign many listens' chain at once
@@ -653,7 +680,23 @@ async fn bulk_set_chain(
     user: AuthUser,
     Json(body): Json<BulkChain>,
 ) -> impl IntoResponse {
-    match state.db.bulk_set_scrobble_chain(user.user_id, &body.ids, body.signal_chain_id).await {
+    // Refused rather than treated as "clear". This endpoint is destructive by
+    // nature — it overwrites the chain on every listen in `ids` — so a body
+    // that doesn't say what to set must not be guessed at.
+    let Some(chain_id) = body.signal_chain_id else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!(ErrorResponse {
+                code: 400,
+                error: "signal_chain_id is required — send a chain id, or an explicit null to \
+                        clear the chain on these listens"
+                    .into()
+            })),
+        )
+            .into_response();
+    };
+
+    match state.db.bulk_set_scrobble_chain(user.user_id, &body.ids, chain_id).await {
         Ok(n) => (StatusCode::OK, Json(serde_json::json!({ "updated": n }))).into_response(),
         Err(e) => server_error(e.to_string()),
     }
@@ -774,4 +817,41 @@ pub fn create_scrobbles_router() -> Router<Arc<AppState>> {
         .route("/api/v1/languages/backfill", axum::routing::post(backfill_languages_now))
         .route("/api/v1/artwork/status", get(artwork_status))
         .route("/api/v1/artwork/backfill", axum::routing::post(backfill_artwork_now))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A destructive endpoint must not read a typo as an instruction.
+    ///
+    /// `bulk-chain` overwrites the chain on every listen in `ids`. With a plain
+    /// `Option<i64>` a body that misspelled the key — `chain_id`, which is what
+    /// `openapi.yaml` used to document — deserialised cleanly to `None`, cleared
+    /// the attribution on all of them, and answered `200 {"updated": N}`. This
+    /// pins the three cases apart at the layer where they were conflated.
+    #[test]
+    fn a_bulk_chain_body_tells_absent_from_null_from_a_value() {
+        let parse = |s: &str| serde_json::from_str::<BulkChain>(s);
+
+        // A number assigns.
+        assert_eq!(
+            parse(r#"{"ids":[1,2],"signal_chain_id":7}"#).unwrap().signal_chain_id,
+            Some(Some(7))
+        );
+
+        // An explicit null clears — which the History bulk edit relies on, so
+        // this is not a case that can be tightened away.
+        assert_eq!(
+            parse(r#"{"ids":[1],"signal_chain_id":null}"#).unwrap().signal_chain_id,
+            Some(None)
+        );
+
+        // Absent is *not* null. The handler turns this into a 400.
+        assert_eq!(parse(r#"{"ids":[1]}"#).unwrap().signal_chain_id, None);
+
+        // The exact shape that used to wipe: the documented-but-wrong spelling.
+        // It is an unknown field, so it lands in the same "absent" bucket.
+        assert_eq!(parse(r#"{"ids":[1,2,3],"chain_id":7}"#).unwrap().signal_chain_id, None);
+    }
 }

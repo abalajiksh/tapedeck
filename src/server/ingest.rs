@@ -449,16 +449,15 @@ pub async fn submit_listens(
                                 .await;
                         }
 
-                        // Accumulate hours on the resolved chain — but not for a
-                        // skip. A skipped track is a few seconds of listening,
-                        // and crediting the gear with its full running time is
-                        // the same error `skipped = FALSE` guards everywhere
-                        // else.
-                        if let Some(cid) = chain_id {
-                            if !disposition.skipped {
-                                let _ = state.db.update_chain_hours(cid, dur as f64 / 3600.0).await;
-                            }
-                        }
+                        // Chain hours used to be accumulated here, and *only*
+                        // here — so a listen polled from Plex, taken off the
+                        // shelf or imported added nothing, and re-assigning a
+                        // chain later moved no hours at all because the count
+                        // had already been banked against whatever the chain was
+                        // at the time. They are derived from the listens now
+                        // (`db::CHAIN_COLUMNS`), which answers all of that and
+                        // keeps the skip rule in one place rather than needing
+                        // it repeated at every insert site.
 
                         info!(
                             "📥 Ingested{}: {} - {} [user: {}, client: {}, quality: {}]",

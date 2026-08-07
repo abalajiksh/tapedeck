@@ -38,6 +38,7 @@
 	let chains: SignalChain[] = [];
 	let loading = true;
 	let listenCount = 0;
+	let noteCount = 0;
 
 	let newTokenName = '';
 	let newTokenChain = ''; // '' = no chain; otherwise the chain id as a string
@@ -608,6 +609,7 @@
 		// doesn't show it, so this failing is not worth surfacing.
 		try { chains = (await api.getChains()).chains; } catch { /* optional */ }
 		try { listenCount = (await api.getDashboardStats()).total; } catch { /* optional */ }
+		try { noteCount = (await api.getNotes()).total; } catch { /* optional */ }
 		try {
 			const prefs = await api.getPreferences();
 			timezone = (prefs.timezone as string) || Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC';
@@ -709,6 +711,25 @@
 			exportMsg = `Exported ${format.toUpperCase()}`;
 			setTimeout(() => (exportMsg = ''), 3000);
 		} catch (e) { exportMsg = 'Export failed'; }
+	}
+
+	/** Every liner note as Markdown.
+	 *
+	 *  Its own control rather than a third format on the listens export: those
+	 *  two are the same rows in two shapes, and this is a different thing
+	 *  entirely — the writing rather than the record of what played. */
+	async function doNotesExport(format: 'zip' | 'md') {
+		try {
+			const blob = await api.notesExportBlob(format);
+			const url = URL.createObjectURL(blob);
+			const a = document.createElement('a');
+			a.href = url;
+			a.download = `tapedeck-liner-notes.${format}`;
+			a.click();
+			URL.revokeObjectURL(url);
+			exportMsg = format === 'zip' ? 'Notes exported as a folder' : 'Notes exported as one file';
+			setTimeout(() => (exportMsg = ''), 3000);
+		} catch (e) { exportMsg = 'Notes export failed'; }
 	}
 
 	async function doBackup() {
@@ -1139,10 +1160,34 @@
 				{#if exportMsg}
 					<div style="margin-top:14px;display:inline-flex;align-items:center;gap:8px;font-size:13px;color:var(--td-good-fg);background:var(--td-good-bg);padding:7px 14px;border-radius:999px;">✓ {exportMsg}</div>
 				{/if}
-				<p style="font-size:12px;color:var(--td-muted-2);margin:14px 0 0;">
+			<p style="font-size:12px;color:var(--td-muted-2);margin:14px 0 0;">
 					The DB backup contains every user's listens and their encrypted credentials — treat it
 					like a password file. The encryption key is kept outside the database and is
 					<em>not</em> in the backup, so a leaked copy alone won't hand over your tokens.
+				</p>
+			</div>
+
+			<div class="panel" style="border-radius:22px;padding:24px;margin-bottom:18px;">
+				<h3 class="h-display" style="font-size:19px;margin-bottom:4px;">Liner notes</h3>
+				<p style="font-size:13px;color:var(--td-muted);margin:0 0 16px;">
+					{noteCount} note{noteCount === 1 ? '' : 's'} written. Take them out as Markdown —
+					for Obsidian, Logseq, or just a folder that still opens in ten years.
+				</p>
+				<div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center;">
+					<button class="btn btn-secondary" disabled={!noteCount} on:click={() => doNotesExport('zip')}>
+						Export as a folder (.zip)
+					</button>
+					<button class="btn btn-secondary" disabled={!noteCount} on:click={() => doNotesExport('md')}>
+						Export as one file (.md)
+					</button>
+				</div>
+				<p style="font-size:12px;color:var(--td-muted-2);margin:14px 0 0;">
+					One file per note, with YAML frontmatter carrying the artist, kind, MBID and dates.
+					Your <code>[[track:…]]</code> references become ordinary
+					<code>[[wikilinks]]</code> pointing at the matching file — Tapedeck's shortcode
+					syntax and Obsidian's link syntax are the same brackets, so they have to be
+					rewritten or every one of them would dangle. A reference that never resolved is
+					left exactly as you wrote it.
 				</p>
 			</div>
 		{/if}

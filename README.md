@@ -114,6 +114,13 @@ Track total hours on each piece of gear. Useful for driver burn-in tracking,
 warranty records, and understanding how your listening habits distribute
 across your equipment.
 
+Hours are **derived from your listens**, not accumulated as they arrive — a chain
+sums the running time of every listen that carries it, and a piece of gear sums
+the chains that name it. So assigning a chain to a device, or fixing a listen's
+chain by hand, moves the hours for listens you already have rather than only for
+future ones. Skips don't count: crediting a pair of headphones with a track's
+full running time for three seconds of audio is not a measurement.
+
 ### Session Grouping
 
 Individual scrobbles are automatically grouped into listening sessions —
@@ -295,6 +302,12 @@ Notes carry a visibility (private / patched-in / public) for the coming social
 phase. Today every read path is self-only: nothing is served to another user
 whatever the setting says.
 
+The notes list is **searchable** across both what you wrote and what you wrote it
+about, filterable by track / record / artist / listen, and sortable by edit, by
+date written or alphabetically. A collapsible legend on the editor covers every
+shortcode, including the two that were previously undiscoverable —
+`[[gear:Bifrost 2]]` and positional `[[track:3]]`.
+
 ### The Shelf — records, tapes and discs
 
 A shelf you catalogue and sides you play, for the listening nothing can report
@@ -377,6 +390,15 @@ deep cuts, the 3 AM club (hour-of-day in *your* timezone), dusty vinyl, and
 `scrobbles.chain_id` was always for: a chain names its components, so the
 question is answerable with no per-listen equipment field at all.
 
+**Send any of them to your server.** Tapedeck has no playback and isn't going to
+grow any, so every collection carries a *Send to…* button that creates the
+playlist on the Plex, Jellyfin or OpenSubsonic/Navidrome server you already
+connected — no extra credential, and the options are exactly the servers you set
+up. Tracks are matched by artist and title and every match is checked, so a
+fuzzy search result for the wrong artist is discarded rather than added; a
+library that doesn't have everything gets what it has, and the tracks that
+didn't land are named.
+
 ### Musical Personality
 
 The Statistics screen profiles *how* you listen across five explainable axes —
@@ -401,6 +423,11 @@ Backfill your history from elsewhere and take it with you:
   deduplicated against existing listens, and are stored so they are never
   re-forwarded to your scrobble sinks.
 - **Export** your entire history as JSON (full dump) or CSV.
+- **Export your liner notes as Markdown** — a folder of one file per note with
+  YAML frontmatter, or a single document. Drop it in an Obsidian or Logseq vault
+  and your `[[track:…]]` references arrive as working `[[wikilinks]]`; a
+  reference that never resolved is left exactly as you wrote it. Nothing in the
+  export needs Tapedeck running to be readable.
 
 ## Architecture
 

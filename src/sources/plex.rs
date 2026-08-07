@@ -813,6 +813,179 @@ impl PlexSource {
             .and_then(|m| m.rating_key))
     }
 
+    /// This server's `machineIdentifier`.
+    ///
+    /// Needed only to build a playlist: Plex takes its contents as a
+    /// `server://<machineIdentifier>/…` URI rather than a list of ids, so a
+    /// playlist cannot be created without asking the server what it calls
+    /// itself. `/identity` is the cheapest endpoint that carries it.
+    pub async fn machine_identifier(
+        &self,
+    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "PascalCase")]
+        struct Resp {
+            media_container: Container,
+        }
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Container {
+            #[serde(default)]
+            machine_identifier: Option<String>,
+        }
+
+        let resp = self
+            .client
+            .get(format!("{}/identity", self.url))
+            .header("X-Plex-Token", &self.token)
+            .header("Accept", "application/json")
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            return Err(format!("Plex identity returned {}", resp.status()).into());
+        }
+        let body: Resp = resp.json().await?;
+        body.media_container
+            .machine_identifier
+            .filter(|s| !s.trim().is_empty())
+            .ok_or_else(|| "Plex did not report a machine identifier".into())
+    }
+
+    /// Tracks matching a free-text query, as candidates for a playlist push.
+    ///
+    /// Same endpoint and the same caution as `find_artist`: `/hubs/search` ranks
+    /// across the whole server and will happily return something else entirely,
+    /// so these are suggestions. `crate::playlists::pick` decides.
+    pub async fn search_tracks(
+        &self,
+        query: &str,
+    ) -> Result<Vec<crate::playlists::Candidate>, Box<dyn std::error::Error + Send + Sync>> {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "PascalCase")]
+        struct Resp {
+            media_container: Container,
+        }
+        #[derive(Deserialize)]
+        struct Container {
+            #[serde(rename = "Hub", default)]
+            hub: Vec<Hub>,
+        }
+        #[derive(Deserialize)]
+        struct Hub {
+            #[serde(rename = "type", default)]
+            kind: Option<String>,
+            #[serde(rename = "Metadata", default)]
+            metadata: Vec<Hit>,
+        }
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Hit {
+            #[serde(default)]
+            title: Option<String>,
+            #[serde(default)]
+            rating_key: Option<String>,
+            /// A track's artist. `originalTitle` is the per-track credit and
+            /// wins where it exists, for the same reason the ingest path keeps
+            /// it: on a compilation `grandparentTitle` is "Various Artists".
+            #[serde(default)]
+            grandparent_title: Option<String>,
+            #[serde(default)]
+            original_title: Option<String>,
+            #[serde(default)]
+            parent_title: Option<String>,
+        }
+
+        let resp = self
+            .client
+            .get(format!("{}/hubs/search", self.url))
+            .query(&[("query", query), ("limit", "20")])
+            .header("X-Plex-Token", &self.token)
+            .header("Accept", "application/json")
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            return Err(format!("Plex search returned {}", resp.status()).into());
+        }
+        let body: Resp = resp.json().await?;
+
+        Ok(body
+            .media_container
+            .hub
+            .into_iter()
+            .filter(|h| h.kind.as_deref() == Some("track"))
+            .flat_map(|h| h.metadata)
+            .filter_map(|m| {
+                Some(crate::playlists::Candidate {
+                    id: m.rating_key?,
+                    title: m.title?,
+                    artist: m
+                        .original_title
+                        .filter(|s| !s.trim().is_empty())
+                        .or(m.grandparent_title)
+                        .unwrap_or_default(),
+                    album: m.parent_title,
+                })
+            })
+            .collect())
+    }
+
+    /// Create an audio playlist holding `rating_keys`, in that order.
+    ///
+    /// `smart=0` matters: a smart playlist stores a *filter* and Plex would
+    /// re-evaluate it, so the fixed list Tapedeck just built would not be what
+    /// the user ends up with.
+    pub async fn create_playlist(
+        &self,
+        title: &str,
+        rating_keys: &[String],
+    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        if rating_keys.is_empty() {
+            return Err("Nothing to put in the playlist".into());
+        }
+        let machine = self.machine_identifier().await?;
+        let uri = format!(
+            "server://{}/com.plexapp.plugins.library/library/metadata/{}",
+            machine,
+            rating_keys.join(",")
+        );
+
+        #[derive(Deserialize)]
+        #[serde(rename_all = "PascalCase")]
+        struct Resp {
+            media_container: Container,
+        }
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Container {
+            #[serde(rename = "Metadata", default)]
+            metadata: Vec<Made>,
+        }
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Made {
+            #[serde(default)]
+            rating_key: Option<String>,
+        }
+
+        let resp = self
+            .client
+            .post(format!("{}/playlists", self.url))
+            .query(&[("type", "audio"), ("title", title), ("smart", "0"), ("uri", uri.as_str())])
+            .header("X-Plex-Token", &self.token)
+            .header("Accept", "application/json")
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            return Err(format!("Plex playlist create returned {}", resp.status()).into());
+        }
+        let body: Resp = resp.json().await?;
+        body.media_container
+            .metadata
+            .into_iter()
+            .find_map(|m| m.rating_key)
+            .ok_or_else(|| "Plex created the playlist but reported no id".into())
+    }
+
     pub async fn fetch_cover_art(
         &self,
         rating_key: &str,

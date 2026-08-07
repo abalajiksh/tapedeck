@@ -499,6 +499,14 @@ export interface ListenAnnotations {
 	artist: Annotation | null;
 }
 
+/** How the notes list is narrowed. `kind` is the stored spelling, not the
+ *  shortcode one, because that is what the server filters on. */
+export interface NoteQuery {
+	q?: string;
+	kind?: '' | 'recording' | 'release' | 'artist' | 'listen';
+	sort?: 'updated' | 'created' | 'title';
+}
+
 export interface NoteRevision {
 	id: number;
 	body_md: string;
@@ -787,6 +795,40 @@ export interface Rediscovery {
 	featured: RediscoveryCollection | null;
 	collections: RediscoveryCollection[];
 	gear: { id: number; name: string; type: string }[];
+}
+
+/** A server this instance could send a playlist to.
+ *
+ *  Comes from the user's own enabled sources — there is no separate credential
+ *  for pushing, so the options are exactly the servers they already set up. */
+export interface PlaylistTarget {
+	source_id: number;
+	kind: string;
+	/** "Plex", "Jellyfin", "Subsonic" — the protocol, which is why a Navidrome
+	 *  source reads as Subsonic: any OpenSubsonic server takes the same calls. */
+	protocol: string;
+	label: string;
+	account: string | null;
+}
+
+/** Names only. Tapedeck stores no server item ids for a generated list, so the
+ *  far end has to be searched — which is why a push can come back partial. */
+export interface PlaylistPushTrack {
+	title: string;
+	artist: string;
+	album?: string | null;
+}
+
+export interface PlaylistPushResult {
+	playlist_id: string;
+	name: string;
+	protocol: string;
+	target: PlaylistTarget;
+	requested: number;
+	matched: number;
+	/** Named rather than counted: "nine of twelve" without saying which three is
+	 *  a number that is just wrong to anyone trying to fix it. */
+	missing: PlaylistPushTrack[];
 }
 
 export interface SanitizePreview {
@@ -1110,6 +1152,18 @@ class TapedeckAPI {
 		return this.get(`/api/v1/rediscovery/gear/${equipmentId}`);
 	}
 
+	// ── Pushing a generated list to a media server ──
+	async playlistTargets(): Promise<{ targets: PlaylistTarget[] }> {
+		return this.get('/api/v1/playlist-targets');
+	}
+	async pushPlaylist(
+		source_id: number,
+		name: string,
+		tracks: PlaylistPushTrack[]
+	): Promise<PlaylistPushResult> {
+		return this.post('/api/v1/playlists', { source_id, name, tracks });
+	}
+
 	// ── Physical media: records and tapes ──
 	async lookupPressing(q: {
 		barcode?: string; catalog_number?: string; artist?: string; release?: string; kind?: string;
@@ -1303,7 +1357,23 @@ class TapedeckAPI {
 	}
 
 	// ── Liner notes & loves ──
-	async getNotes(): Promise<{ notes: Note[] }> { return this.get('/api/v1/notes'); }
+	async getNotes(params?: NoteQuery): Promise<{ notes: Note[]; total: number }> {
+		const p = new URLSearchParams();
+		if (params?.q?.trim()) p.set('q', params.q.trim());
+		if (params?.kind) p.set('kind', params.kind);
+		if (params?.sort && params.sort !== 'updated') p.set('sort', params.sort);
+		const qs = p.toString();
+		return this.get(`/api/v1/notes${qs ? `?${qs}` : ''}`);
+	}
+
+	/** Every note as Markdown — a zip of one file per note, or one document. */
+	async notesExportBlob(format: 'zip' | 'md'): Promise<Blob> {
+		const res = await fetch(`${BASE}/api/v1/notes/export?format=${format}`, {
+			credentials: 'same-origin'
+		});
+		if (!res.ok) throw new Error(`API ${res.status}: ${await res.text()}`);
+		return res.blob();
+	}
 	async getNote(id: number): Promise<Note> { return this.get(`/api/v1/notes/${id}`); }
 	async saveNote(body: NoteTarget & { body_md: string; visibility?: Visibility }): Promise<Note> {
 		return this.post('/api/v1/notes', body);

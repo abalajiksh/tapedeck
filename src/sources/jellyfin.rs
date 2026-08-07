@@ -712,6 +712,137 @@ impl JellyfinSource {
             .map(|i| i.id))
     }
 
+    /// The item id of the account this source is pinned to.
+    ///
+    /// A playlist has an owner on Jellyfin, and an API key minted in the
+    /// dashboard belongs to nobody — so `/Users/Me` is no help and the account
+    /// name the source already carries has to be resolved against `/Users`.
+    /// Without this the playlist would either be refused or land on whichever
+    /// account Jellyfin picked, which on a household server is somebody else's.
+    pub async fn account_id(&self) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        let users = Self::list_accounts(&self.url, &self.api_key).await?;
+        if self.account.trim().is_empty() {
+            return match users.len() {
+                1 => Ok(users.into_iter().next().expect("checked").id),
+                _ => Err("This Jellyfin source has no account set, and the server has several — \
+                          set one before pushing a playlist"
+                    .into()),
+            };
+        }
+        users
+            .into_iter()
+            .find(|u| u.name.eq_ignore_ascii_case(self.account.trim()))
+            .map(|u| u.id)
+            .ok_or_else(|| format!("Jellyfin has no user called {}", self.account).into())
+    }
+
+    /// Tracks matching a free-text query, as candidates for a playlist push.
+    ///
+    /// `searchTerm` is fuzzy on Jellyfin's side — the same caution `find_artist`
+    /// documents — so these are suggestions and `crate::playlists::pick`
+    /// decides.
+    pub async fn search_tracks(
+        &self,
+        query: &str,
+    ) -> Result<Vec<crate::playlists::Candidate>, Box<dyn std::error::Error + Send + Sync>> {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "PascalCase")]
+        struct Resp {
+            #[serde(default)]
+            items: Vec<Item>,
+        }
+        #[derive(Deserialize)]
+        #[serde(rename_all = "PascalCase")]
+        struct Item {
+            id: String,
+            name: String,
+            /// The performing credit. `Artists` is per-track and is what a
+            /// listen's artist was recorded from; `AlbumArtist` is the fallback
+            /// and is "Various Artists" on a compilation.
+            #[serde(default)]
+            artists: Vec<String>,
+            #[serde(default)]
+            album_artist: Option<String>,
+            #[serde(default)]
+            album: Option<String>,
+        }
+
+        let resp = self
+            .client
+            .get(format!("{}/Items", self.url))
+            .query(&[
+                ("searchTerm", query),
+                ("includeItemTypes", "Audio"),
+                ("recursive", "true"),
+                ("limit", "20"),
+                ("fields", "Artists"),
+            ])
+            .header("X-Emby-Token", &self.api_key)
+            .header("Accept", "application/json")
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            return Err(format!("Jellyfin returned {} searching tracks", resp.status()).into());
+        }
+        let body: Resp = resp.json().await?;
+
+        Ok(body
+            .items
+            .into_iter()
+            .map(|i| crate::playlists::Candidate {
+                id: i.id,
+                title: i.name,
+                artist: i
+                    .artists
+                    .into_iter()
+                    .next()
+                    .filter(|s| !s.trim().is_empty())
+                    .or(i.album_artist)
+                    .unwrap_or_default(),
+                album: i.album,
+            })
+            .collect())
+    }
+
+    /// Create an audio playlist holding `ids`, in that order.
+    pub async fn create_playlist(
+        &self,
+        name: &str,
+        ids: &[String],
+    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        if ids.is_empty() {
+            return Err("Nothing to put in the playlist".into());
+        }
+        let user_id = self.account_id().await?;
+
+        #[derive(Deserialize)]
+        #[serde(rename_all = "PascalCase")]
+        struct Made {
+            id: String,
+        }
+
+        // The body, not the query parameters: Jellyfin marks every one of those
+        // deprecated on this endpoint, and they carry the same fields.
+        let resp = self
+            .client
+            .post(format!("{}/Playlists", self.url))
+            .header("X-Emby-Token", &self.api_key)
+            .header("Accept", "application/json")
+            .json(&serde_json::json!({
+                "Name": name,
+                "Ids": ids,
+                "UserId": user_id,
+                "MediaType": "Audio",
+            }))
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            return Err(format!("Jellyfin playlist create returned {}", resp.status()).into());
+        }
+        let made: Made = resp.json().await?;
+        Ok(made.id)
+    }
+
     pub async fn fetch_cover_art(
         &self,
         item_id: &str,

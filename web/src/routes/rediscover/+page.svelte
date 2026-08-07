@@ -4,6 +4,7 @@
 	import { openAlbum, openArtist } from '$lib/entities';
 	import CoverArt from '$lib/components/CoverArt.svelte';
 	import CollectionIcon from '$lib/components/CollectionIcon.svelte';
+	import PushPlaylist from '$lib/components/PushPlaylist.svelte';
 
 	let data: Rediscovery | null = null;
 	let loading = true;
@@ -69,6 +70,16 @@
 	function openRow(r: RediscoveryRow) {
 		if (r.album) return openAlbum(r.artist, r.album);
 		return openArtist(r.artist);
+	}
+
+	/** A collection's rows as a playlist push wants them.
+	 *
+	 *  Names only, which is all these rows have — the push resolves them against
+	 *  whichever server it is sent to. `name` is the track title here; the row
+	 *  shape predates the playlist code and renaming it would touch every
+	 *  Rediscovery query. */
+	function toTracks(rows: RediscoveryRow[]) {
+		return rows.map((r) => ({ title: r.name, artist: r.artist, album: r.album }));
 	}
 
 	/** The accent at low opacity, for the badge behind each icon. */
@@ -139,10 +150,14 @@
 					</span>
 					<span>{data.featured.stat}</span>
 				</div>
-				<button class="btn btn-primary"
-					on:click={() => data?.featured && toggle(data.featured.key)}>
-					{openKey === data.featured.key ? 'Hide' : 'See all'}
-				</button>
+				<div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;">
+					<button class="btn btn-primary"
+						on:click={() => data?.featured && toggle(data.featured.key)}>
+						{openKey === data.featured.key ? 'Hide' : 'See all'}
+					</button>
+					<PushPlaylist tracks={toTracks(data.featured.rows)}
+						title={data.featured.title} accent={data.featured.accent} />
+				</div>
 			</div>
 		</div>
 	{/if}
@@ -180,11 +195,12 @@
 							<span class="tchip">{t.name} · {t.artist}</span>
 						{/each}
 					</div>
-					<div style="display:flex;gap:8px;margin-top:auto;">
+					<div style="display:flex;gap:8px;margin-top:auto;flex-wrap:wrap;">
 						<button class="btn btn-secondary" style="font-size:13px;padding:8px 15px;"
 							aria-expanded={openKey === c.key} on:click={() => toggle(c.key)}>
 							{openKey === c.key ? 'Hide' : `See all ${c.count}`}
 						</button>
+						<PushPlaylist tracks={toTracks(c.rows)} title={c.title} accent={c.accent} compact />
 					</div>
 				{:else}
 					<p style="margin:0;font-size:12.5px;color:var(--td-muted-3);">
@@ -200,7 +216,10 @@
 			style="border-color:{c.accent};box-shadow:0 0 0 3px {tint(c.accent, 0.22)};">
 			<div style="display:flex;justify-content:space-between;align-items:baseline;gap:12px;padding:16px 18px 10px;">
 				<h3 class="h-display" style="font-size:19px;margin:0;">{c.title}</h3>
-				<button class="linkish" on:click={() => (openKey = null)}>Close</button>
+				<span style="display:flex;gap:12px;align-items:center;">
+					<PushPlaylist tracks={toTracks(c.rows)} title={c.title} accent={c.accent} compact />
+					<button class="linkish" on:click={() => (openKey = null)}>Close</button>
+				</span>
 			</div>
 			{#each c.rows as r, i}
 				<button class="row" on:click={() => openRow(r)}>
@@ -234,6 +253,11 @@
 			{#if gearLoading}
 				<p style="font-size:13.5px;color:var(--td-muted);">Checking…</p>
 			{:else if gearId && gearRows.length}
+				<div style="margin-bottom:10px;">
+					<PushPlaylist tracks={toTracks(gearRows)}
+						title={`Never on ${data.gear.find((g) => g.id === gearId)?.name ?? 'this gear'}`}
+						compact />
+				</div>
 				<div class="panel" style="border-radius:20px;overflow:hidden;">
 					{#each gearRows as r, i}
 						<button class="row" on:click={() => openRow(r)}>

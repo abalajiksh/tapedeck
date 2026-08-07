@@ -112,11 +112,44 @@ struct SubsonicResponse {
     error: Option<SubsonicError>,
     #[serde(rename = "nowPlaying", default)]
     now_playing: Option<NowPlayingContainer>,
+    #[serde(rename = "searchResult3", default)]
+    search_result3: Option<SearchResult3>,
+    /// `createPlaylist` answers with the playlist it made. Older Subsonic
+    /// servers answer with a bare `ok` and nothing else, which is why this is
+    /// optional rather than the id being required.
+    #[serde(default)]
+    playlist: Option<SubsonicPlaylist>,
 }
 
 #[derive(Deserialize)]
 struct SubsonicError {
     message: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct SearchResult3 {
+    #[serde(default)]
+    song: Vec<SubsonicSong>,
+}
+
+#[derive(Deserialize)]
+struct SubsonicSong {
+    id: String,
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
+    artist: Option<String>,
+    #[serde(default)]
+    album: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct SubsonicPlaylist {
+    /// Subsonic ids are strings, but a few servers emit playlist ids as bare
+    /// numbers — `serde_json::Value` accepts either and the caller only ever
+    /// echoes it back to the user.
+    #[serde(default)]
+    id: Option<serde_json::Value>,
 }
 
 #[derive(Deserialize)]
@@ -328,10 +361,25 @@ impl NavidromeSource {
         &self,
         endpoint: &str,
     ) -> Result<SubsonicResponse, Box<dyn std::error::Error>> {
+        self.subsonic_get_with(endpoint, &[]).await
+    }
+
+    /// The same call with extra query parameters.
+    ///
+    /// Takes a slice of pairs rather than a map because Subsonic repeats a key
+    /// to pass a list — `createPlaylist` wants one `songId` per track, in order,
+    /// and a map would collapse them to one.
+    async fn subsonic_get_with(
+        &self,
+        endpoint: &str,
+        extra: &[(String, String)],
+    ) -> Result<SubsonicResponse, Box<dyn std::error::Error>> {
+        let mut params = self.subsonic_params();
+        params.extend_from_slice(extra);
         let resp = self
             .client
             .get(format!("{}/rest/{}", self.url, endpoint))
-            .query(&self.subsonic_params())
+            .query(&params)
             .send()
             .await?;
         if !resp.status().is_success() {
@@ -351,6 +399,70 @@ impl NavidromeSource {
 
     async fn subsonic_ping(&self) -> Result<(), Box<dyn std::error::Error>> {
         self.subsonic_get("ping").await.map(|_| ())
+    }
+
+    /// Tracks matching a free-text query, as candidates for a playlist push.
+    ///
+    /// `search3` is OpenSubsonic's own search, so this works against anything
+    /// speaking the protocol and not only Navidrome. Album and artist counts are
+    /// zeroed: this is looking for songs, and asking for the other two costs the
+    /// server work whose results are thrown away.
+    pub async fn search_tracks(
+        &self,
+        query: &str,
+    ) -> Result<Vec<crate::playlists::Candidate>, Box<dyn std::error::Error + Send + Sync>> {
+        let resp = self
+            .subsonic_get_with(
+                "search3",
+                &[
+                    ("query".into(), query.to_string()),
+                    ("songCount".into(), "20".into()),
+                    ("artistCount".into(), "0".into()),
+                    ("albumCount".into(), "0".into()),
+                ],
+            )
+            .await
+            .map_err(stringify)?;
+
+        Ok(resp
+            .search_result3
+            .map(|r| r.song)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|s| crate::playlists::Candidate {
+                id: s.id,
+                title: s.title.unwrap_or_default(),
+                artist: s.artist.unwrap_or_default(),
+                album: s.album,
+            })
+            .collect())
+    }
+
+    /// Create a playlist holding `song_ids`, in that order.
+    pub async fn create_playlist(
+        &self,
+        name: &str,
+        song_ids: &[String],
+    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        if song_ids.is_empty() {
+            return Err("Nothing to put in the playlist".into());
+        }
+        let mut params = vec![("name".to_string(), name.to_string())];
+        params.extend(song_ids.iter().map(|id| ("songId".to_string(), id.clone())));
+
+        let resp = self.subsonic_get_with("createPlaylist", &params).await.map_err(stringify)?;
+
+        // A server that answers a bare `ok` really did create it — the id is
+        // only ever shown back to the user, so reporting "created" without one
+        // beats failing a push that worked.
+        Ok(resp
+            .playlist
+            .and_then(|p| p.id)
+            .map(|v| match v {
+                serde_json::Value::String(s) => s,
+                other => other.to_string(),
+            })
+            .unwrap_or_default())
     }
 
     /// Cover art bytes for one library item.
@@ -453,6 +565,16 @@ impl NavidromeSong {
             caa_release_mbid: None,
         }
     }
+}
+
+/// Re-box a plain error as a `Send + Sync` one.
+///
+/// The Subsonic helpers predate any caller that needed to be held across an
+/// await in a `Send` future, so they return a bare `Box<dyn Error>`. Flattening
+/// to the message keeps the playlist path spawnable without rewriting the
+/// polling code underneath it.
+fn stringify(e: Box<dyn std::error::Error>) -> Box<dyn std::error::Error + Send + Sync> {
+    e.to_string().into()
 }
 
 fn now_secs() -> u64 {

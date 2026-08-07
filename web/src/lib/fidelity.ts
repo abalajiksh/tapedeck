@@ -20,7 +20,17 @@
 export const FIDELITY_FLOOR = 0.25;
 
 export interface Fidelity {
-	/** True when there is enough known-format listening to put a number up. */
+	/**
+	 * True when there is enough known-format listening to put a number up.
+	 *
+	 * Note what this depends on: `known / total`, which is a fact about the
+	 * *history* and not about the thing being measured. So every card on a page
+	 * agrees about `scored`, and when it is false they all degrade to the same
+	 * heading, the same percentage and the same sentence. **Two unscored cards
+	 * side by side are therefore always duplicates** — Statistics shipped
+	 * "FIDELITY 4%" twice for exactly this reason. Collapse them to one rather
+	 * than rendering the pair.
+	 */
 	scored: boolean;
 	/** `"94%"`, or `"3%"` of coverage when not scored. */
 	value: string;
