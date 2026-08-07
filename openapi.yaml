@@ -1256,7 +1256,8 @@ paths:
                   today: { type: integer }
                   this_week: { type: integer }
                   total: { type: integer }
-                  lossless_pct: { type: number }
+                  lossless_pct: { type: number, description: 'Share of listens **whose format is known**, not of `total`. Most of an imported history has no format at all, so dividing by every play measured the import ratio instead.' }
+                  fidelity_known: { type: integer, description: 'The denominator of `lossless_pct`. Clients should report this coverage rather than presenting the share as a fact about the whole history.' }
                   top_artist: { type: [string, 'null'] }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
@@ -1301,8 +1302,9 @@ paths:
                       tracks: { type: integer }
                       hours: { type: number }
                       avg_quality: { type: number }
-                      lossless_pct: { type: number }
-                      dsd_pct: { type: number }
+                      lossless_pct: { type: number, description: 'Share of `fidelity_known`, not of `plays`.' }
+                      dsd_pct: { type: number, description: 'Share of `fidelity_known`, not of `plays`.' }
+                      fidelity_known: { type: integer, description: 'Listens in this window whose format is known — the denominator of the two shares above. The `fidelity` array below is a share of `plays` instead, because it carries an `Unknown` bucket of its own.' }
                   top_artists: { type: array, items: { type: object, additionalProperties: true } }
                   top_albums: { type: array, items: { type: object, additionalProperties: true } }
                   top_tracks: { type: array, items: { type: object, additionalProperties: true } }
@@ -1535,8 +1537,51 @@ paths:
                   plays: { type: integer }
                   tracks: { type: array, items: { type: object, additionalProperties: true } }
                   bio: { type: [object, 'null'], additionalProperties: true, description: 'Provider description. Carries `attribution` — Last.fm text is CC BY-SA and the credit must travel with it. Render as text, never as HTML.' }
+                  artwork_url: { type: [string, 'null'], description: 'The hand-set cover when there is one, otherwise the artwork the newest listen of this album carries.' }
+                  cover_override: { type: boolean, description: 'True when the cover was set by hand. `caa_id` and `caa_release_mbid` are null in that case — the override replaces the derived artwork rather than sitting in front of it.' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '404': { $ref: '#/components/responses/NotFound' }
+
+  /api/v1/albums/{id}/cover:
+    put:
+      tags: [Library]
+      summary: Override an album cover.
+      description: |
+        Session-only. The counterpart of the artist portrait override: an album
+        otherwise wears whatever artwork the newest listen of it happens to
+        carry, which is unfixable when it is the wrong edition's.
+
+        400s when the id is not a **release** entity — an artist's picture has
+        its own endpoint, and two places to set one would leave no rule about
+        which wins. Like every entity write, this is not scoped per user:
+        `entities` is shared.
+      parameters: [{ name: id, in: path, required: true, schema: { type: integer } }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [url]
+              properties:
+                url:
+                  type: string
+                  description: |
+                    An `http(s)://` URL, or a path on this server — `/api/v1/art/{scrobble_id}`
+                    proxies the cover out of the user's own media library. Empty
+                    clears the override and the derived artwork comes back.
+      responses:
+        '200':
+          description: Saved.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  artwork_url: { type: [string, 'null'] }
+        '400': { description: Not a URL. }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { description: No such album, or that entity is not a release. }
 
   /api/v1/artists/{id}:
     get:
@@ -1612,8 +1657,9 @@ paths:
           application/json:
             schema:
               type: object
+              required: [url]
               properties:
-                image_url: { type: [string, 'null'], description: Null clears the override. }
+                url: { type: string, description: 'An `http(s)://` URL or a path on this server. Empty clears the override.' }
       responses:
         '200': { description: Saved., content: { application/json: { schema: { $ref: '#/components/schemas/Ok' } } } }
         '401': { $ref: '#/components/responses/Unauthorized' }

@@ -21,7 +21,7 @@ use axum::{
     extract::{Path, State},
     http::{header, StatusCode},
     response::{IntoResponse, Json, Response},
-    routing::get,
+    routing::{get, put},
     Router,
 };
 use std::sync::Arc;
@@ -210,6 +210,30 @@ pub struct ArtistImageUpdate {
     pub url: String,
 }
 
+/// `Some(None)` clears the picture; the outer `None` is a 400 — that isn't a
+/// URL at all. Relative paths are allowed on purpose: `/api/v1/artists/img/12`
+/// and `/api/v1/art/914` are both this server, and pasting one is how a user
+/// points at their own library through the proxy.
+fn validate_image_url(raw: &str) -> Option<Option<&str>> {
+    let url = raw.trim();
+    if url.is_empty() {
+        return Some(None);
+    }
+    (url.starts_with("http://") || url.starts_with("https://") || url.starts_with('/'))
+        .then_some(Some(url))
+}
+
+fn not_an_image_url() -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(serde_json::json!(ErrorResponse {
+            code: 400,
+            error: "That doesn't look like an image URL".into()
+        })),
+    )
+        .into_response()
+}
+
 /// PUT /api/v1/artists/img/:id — set the portrait by hand.
 ///
 /// Tapedeck is a listening journal, so the operator gets the last word over
@@ -222,20 +246,9 @@ async fn set_artist_image(
     Json(body): Json<ArtistImageUpdate>,
 ) -> Response {
     let _ = &user;
-    let url = body.url.trim();
-    if !url.is_empty()
-        && !(url.starts_with("http://") || url.starts_with("https://") || url.starts_with('/'))
-    {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!(ErrorResponse {
-                code: 400,
-                error: "That doesn't look like an image URL".into()
-            })),
-        )
-            .into_response();
-    }
-    let value = if url.is_empty() { None } else { Some(url) };
+    let Some(value) = validate_image_url(&body.url) else {
+        return not_an_image_url();
+    };
     match state.db.set_artist_image(id, value).await {
         Ok(true) => {
             (StatusCode::OK, Json(serde_json::json!({ "image_url": value }))).into_response()
@@ -249,10 +262,48 @@ async fn set_artist_image(
     }
 }
 
+/// PUT /api/v1/albums/:id/cover — set the album's cover by hand.
+///
+/// The counterpart of the artist override. Without it an album wears whatever
+/// artwork the newest listen of it happens to carry, which is right most of the
+/// time and unfixable when it isn't: a compilation's cover on a single, or the
+/// deluxe edition's when you own the original. The operator gets the last word,
+/// the same rule the artist portrait follows.
+///
+/// The id is an *entity* id, and entities are shared across users with no
+/// `user_id` to scope by — so this is a household-wide edit, like the artist
+/// portrait and the entity table generally. Worth knowing before Phase 6.
+async fn set_album_cover(
+    State(state): State<Arc<AppState>>,
+    user: AuthUser,
+    Path(id): Path<i64>,
+    Json(body): Json<ArtistImageUpdate>,
+) -> Response {
+    let _ = &user;
+    let Some(value) = validate_image_url(&body.url) else {
+        return not_an_image_url();
+    };
+    match state.db.set_entity_image(id, value).await {
+        Ok(true) => {
+            (StatusCode::OK, Json(serde_json::json!({ "artwork_url": value }))).into_response()
+        }
+        // Either there is no such entity or it isn't a release. Both are the
+        // same mistake from the client's side, and an artist picture has its
+        // own endpoint for the reason the query comment gives.
+        Ok(false) => not_found("No such album"),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!(ErrorResponse { code: 500, error: e.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
 pub fn create_artwork_router() -> Router<Arc<AppState>> {
     Router::new()
         .route("/api/v1/art/:id", get(scrobble_art))
         .route("/api/v1/artists/img/:id", get(artist_image).put(set_artist_image))
+        .route("/api/v1/albums/:id/cover", put(set_album_cover))
 }
 
 #[cfg(test)]

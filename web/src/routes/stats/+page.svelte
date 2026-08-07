@@ -4,6 +4,7 @@
 	import CoverArt from '$lib/components/CoverArt.svelte';
 	import BarChart from '$lib/components/BarChart.svelte';
 	import { openAlbum, openArtist } from '$lib/entities';
+	import { fidelity, fidelityLabel } from '$lib/fidelity';
 
 	const ranges: { v: StatsRange; label: string }[] = [
 		{ v: 'week', label: 'Week' },
@@ -167,6 +168,8 @@
 	{/if}
 
 	{@const t = stats.totals}
+	{@const lossless = fidelity(t.lossless_pct, t.fidelity_known, t.plays, 'lossless')}
+	{@const dsd = fidelity(t.dsd_pct, t.fidelity_known, t.plays, 'DSD')}
 	<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:14px;margin-bottom:14px;">
 		{#each [['Total Plays', t.plays], ['Artists', t.artists], ['Albums', t.albums], ['Tracks', t.tracks]] as [label, val]}
 			<div class="panel" style="border-radius:20px;padding:18px 20px;">
@@ -178,8 +181,19 @@
 	<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:14px;margin-bottom:28px;">
 		<div class="panel" style="border-radius:20px;padding:18px 20px;"><div style="font-size:10.5px;letter-spacing:.1em;text-transform:uppercase;color:var(--td-muted-2);margin-bottom:6px;">Hours</div><div class="h-display" style="font-size:30px;line-height:1;">{t.hours}</div></div>
 		<div class="panel" style="border-radius:20px;padding:18px 20px;"><div style="font-size:10.5px;letter-spacing:.1em;text-transform:uppercase;color:var(--td-muted-2);margin-bottom:6px;">Avg Quality</div><div class="h-display" style="font-size:30px;line-height:1;">{t.avg_quality}<span style="font-size:16px;color:var(--td-muted-2);">/100</span></div></div>
-		<div class="panel" style="border-radius:20px;padding:18px 20px;"><div style="font-size:10.5px;letter-spacing:.1em;text-transform:uppercase;color:var(--td-muted-2);margin-bottom:6px;">Lossless</div><div class="h-display" style="font-size:30px;line-height:1;color:var(--td-good-fg);">{t.lossless_pct}%</div></div>
-		<div class="panel" style="border-radius:20px;padding:18px 20px;"><div style="font-size:10.5px;letter-spacing:.1em;text-transform:uppercase;color:var(--td-muted-2);margin-bottom:6px;">DSD</div><div class="h-display" style="font-size:30px;line-height:1;color:#b2622d;">{t.dsd_pct}%</div></div>
+		<!-- Both shares are over listens with a known format, and both say so.
+		     Dividing by every play made these a reading of how much of the
+		     history was imported. -->
+		<div class="panel" style="border-radius:20px;padding:18px 20px;">
+			<div style="font-size:10.5px;letter-spacing:.1em;text-transform:uppercase;color:var(--td-muted-2);margin-bottom:6px;">{fidelityLabel(lossless, 'Lossless')}</div>
+			<div class="h-display" style="font-size:30px;line-height:1;color:var(--td-good-fg);">{lossless.value}</div>
+			<div class="fid-sub">{lossless.sub}</div>
+		</div>
+		<div class="panel" style="border-radius:20px;padding:18px 20px;">
+			<div style="font-size:10.5px;letter-spacing:.1em;text-transform:uppercase;color:var(--td-muted-2);margin-bottom:6px;">{dsd.scored ? 'DSD' : 'Fidelity'}</div>
+			<div class="h-display" style="font-size:30px;line-height:1;color:#b2622d;">{dsd.value}</div>
+			<div class="fid-sub">{dsd.sub}</div>
+		</div>
 	</div>
 
 	<!-- Top artists / albums / tracks.
@@ -396,6 +410,12 @@
 {/if}
 
 <style>
+	/* The line that says what the share is *of*. Small on purpose — it is a
+	   qualifier, not a second number. */
+	.fid-sub {
+		font-size: 11px; line-height: 1.35; color: var(--td-muted-3);
+		margin-top: 6px;
+	}
 	.breakdowns {
 		display: grid;
 		grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));

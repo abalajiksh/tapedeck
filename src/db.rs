@@ -104,7 +104,6 @@ pub struct AlbumSummary {
     pub track_count: i64,
     pub first_heard: Option<i64>,
     pub last_heard: Option<i64>,
-    pub lossless: i64,
     pub year: Option<i32>,
 }
 
@@ -116,7 +115,6 @@ pub struct ArtistSummary {
     pub album_count: i64,
     pub first_heard: Option<i64>,
     pub last_heard: Option<i64>,
-    pub lossless: i64,
 }
 
 /// One distinct track. The quality columns are carried raw so the frontend's
@@ -343,6 +341,41 @@ pub struct Database {
 /// How long after a listen a second report of it is still assumed to be the
 /// same play rather than a repeat. See `fuzzy_exists`.
 const DUPLICATE_WINDOW_SECS: i64 = 60;
+
+/// The population every fidelity readout divides by: listens whose format is
+/// actually known.
+///
+/// `is_lossless` is nullable, and most of a real history has nothing in it —
+/// measured on a 21,390-listen export, **97.4% of rows carry no format at all**,
+/// because an import from Last.fm or ListenBrainz has none to carry. Dividing a
+/// lossless count by *every* play therefore scores "we never knew" as "not
+/// lossless", and the card reports the user's import ratio rather than their
+/// listening: someone who has only ever played FLAC reads 2%.
+///
+/// This is the [paired counts must share a population] rule again, after
+/// `artwork_coverage` and `language_coverage`. The fidelity mix on the
+/// Statistics page already had it right — it calls the unlabelled rows
+/// `Unknown` instead of dropping them — so this constant is that bucket's
+/// complement, and the mix is written in terms of it so the two cannot drift.
+/// `a_fidelity_share_ignores_listens_of_unknown_format` pins them together.
+///
+/// Note a windowed share (last 7 days, say) does **not** fix this: an imported
+/// listen from yesterday still has no format, and a Plex listen from 2019 does.
+/// The period was never the problem.
+///
+/// [paired counts must share a population]: the note in CLAUDE.md under "Skips
+/// leaking into a count is now a three-time bug".
+///
+/// **Every comparison here is NULL-safe, and it has to be.** `format_type =
+/// 'dsd'` against a NULL column is NULL, not false — so in a `WHERE` it behaves
+/// like false and counts correctly, but under the `NOT` the fidelity mix uses
+/// it stays NULL, the branch never fires, and every unlabelled listen lands in
+/// some *other* bucket. The two readouts would then disagree while both looked
+/// reasonable. `COALESCE` is what makes the predicate mean the same thing in
+/// both positions.
+pub const FIDELITY_KNOWN: &str = "(COALESCE(format_type, '') = 'dsd' \
+     OR is_lossless IS NOT NULL \
+     OR COALESCE(codec, '') != '')";
 
 impl Database {
     pub async fn new(database_url: &str, secrets: Arc<SecretBox>) -> Result<Self, sqlx::Error> {
@@ -683,6 +716,7 @@ impl Database {
                 artist_name TEXT NOT NULL DEFAULT '',
                 entity_key TEXT NOT NULL UNIQUE,
                 mbid TEXT,
+                image_url TEXT,
                 created_at INTEGER NOT NULL
             )",
         )
@@ -1162,6 +1196,18 @@ impl Database {
                     .execute(&self.pool)
                     .await;
             }
+        }
+
+        // Migration: a hand-set cover for a release, the counterpart of the
+        // artist portrait override that has existed since v0.21.0. An album's
+        // cover is otherwise whichever artwork the newest listen of it happens
+        // to carry, and there was no way to say "not that one" — which for a
+        // journal is the wrong answer to have no answer to.
+        if !has_column(&self.pool, "entities", "image_url").await {
+            info!("⚙️ Migrating: adding entities.image_url...");
+            let _ = sqlx::query("ALTER TABLE entities ADD COLUMN image_url TEXT")
+                .execute(&self.pool)
+                .await;
         }
 
         Ok(())
@@ -1711,7 +1757,7 @@ impl Database {
     // ════════════════════════════════════════════════════════════
 
     /// Headline numbers for one album: plays, seconds, distinct tracks, first
-    /// and last heard, lossless share, and the newest release year seen.
+    /// and last heard, and the newest release year seen.
     #[allow(clippy::type_complexity)]
     pub async fn album_summary(
         &self,
@@ -1725,7 +1771,6 @@ impl Database {
                     COUNT(DISTINCT LOWER(TRIM(title))) AS track_count,
                     MIN(timestamp) AS first_heard,
                     MAX(timestamp) AS last_heard,
-                    SUM(CASE WHEN is_lossless = TRUE THEN 1 ELSE 0 END) AS lossless,
                     MAX(release_year) AS year
              FROM scrobbles
              WHERE user_id = ? AND skipped = FALSE
@@ -1839,8 +1884,7 @@ impl Database {
                     COUNT(DISTINCT CASE WHEN album IS NOT NULL AND TRIM(album) != ''
                           THEN LOWER(TRIM(album)) END) AS album_count,
                     MIN(timestamp) AS first_heard,
-                    MAX(timestamp) AS last_heard,
-                    SUM(CASE WHEN is_lossless = TRUE THEN 1 ELSE 0 END) AS lossless
+                    MAX(timestamp) AS last_heard
              FROM scrobbles
              WHERE user_id = ? AND skipped = FALSE AND LOWER(TRIM(artist)) = ?",
         )
@@ -1926,6 +1970,23 @@ impl Database {
     }
 
     /// Total non-skipped listens, for "share of your listening".
+    /// How many times this user has played anything by one artist.
+    ///
+    /// Grouped case-insensitively for the same reason `artist_rank` is: "LINKIN
+    /// PARK" and "Linkin Park" are one artist to every chart, so a share
+    /// computed against one spelling would be wrong for the other.
+    pub async fn artist_plays(&self, user_id: i64, artist: &str) -> Result<i64, sqlx::Error> {
+        let (n,): (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM scrobbles
+              WHERE user_id = ? AND skipped = FALSE AND LOWER(TRIM(artist)) = ?",
+        )
+        .bind(user_id)
+        .bind(artist.trim().to_lowercase())
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(n)
+    }
+
     pub async fn total_plays(&self, user_id: i64) -> Result<i64, sqlx::Error> {
         let (n,): (i64,) =
             sqlx::query_as("SELECT COUNT(*) FROM scrobbles WHERE user_id = ? AND skipped = FALSE")
@@ -2973,6 +3034,9 @@ impl Database {
     /// rolled over at 01:00 in CET and 02:00 in CEST, and "this week" was a
     /// rolling 7×86400 window rather than a calendar week starting anywhere in
     /// particular.
+    ///
+    /// The fidelity shares divide by [`FIDELITY_KNOWN`], not by every play —
+    /// see that constant for why.
     pub async fn get_dashboard_stats(
         &self,
         user_id: i64,
@@ -2994,8 +3058,15 @@ impl Database {
                 .await?;
         let lossless_count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM scrobbles WHERE user_id = ? AND skipped = FALSE AND is_lossless = TRUE")
             .bind(user_id).fetch_one(&self.pool).await?;
-        let lossless_pct = if total.0 > 0 {
-            (lossless_count.0 as f64 / total.0 as f64 * 100.0).round() as i64
+        let fidelity_known: (i64,) = sqlx::query_as(&format!(
+            "SELECT COUNT(*) FROM scrobbles
+              WHERE user_id = ? AND skipped = FALSE AND {FIDELITY_KNOWN}"
+        ))
+        .bind(user_id)
+        .fetch_one(&self.pool)
+        .await?;
+        let lossless_pct = if fidelity_known.0 > 0 {
+            (lossless_count.0 as f64 / fidelity_known.0 as f64 * 100.0).round() as i64
         } else {
             0
         };
@@ -3033,6 +3104,10 @@ impl Database {
         Ok(serde_json::json!({
             "today": today.0, "this_week": week.0, "total": total.0,
             "lossless_pct": lossless_pct,
+            // What the share is *of*. The client shows the coverage instead of
+            // the percentage when this is too small a slice to score — a 94%
+            // computed from 558 of 21,390 listens is a fact about the 558.
+            "fidelity_known": fidelity_known.0,
             "top_artist": top_artist.as_ref().map(|(a, _)| a.as_str()).unwrap_or("—"),
             "top_artist_count": top_artist.as_ref().map(|(_, c)| *c).unwrap_or(0),
             "unique_artists": unique_artists.0, "unique_albums": unique_albums.0,
@@ -3296,9 +3371,29 @@ impl Database {
         let dsd: (i64,) = sqlx::query_as(
             "SELECT COUNT(*) FROM scrobbles WHERE user_id = ? AND skipped = FALSE AND (? IS NULL OR timestamp >= ?) AND format_type = 'dsd'"
         ).bind(user_id).bind(after).bind(after).fetch_one(&self.pool).await?;
+        let fidelity_known: (i64,) = sqlx::query_as(&format!(
+            "SELECT COUNT(*) FROM scrobbles
+              WHERE user_id = ? AND skipped = FALSE AND (? IS NULL OR timestamp >= ?)
+                AND {FIDELITY_KNOWN}"
+        ))
+        .bind(user_id)
+        .bind(after)
+        .bind(after)
+        .fetch_one(&self.pool)
+        .await?;
         let pct = |n: i64| {
             if total > 0 {
                 (n as f64 / total as f64 * 100.0).round() as i64
+            } else {
+                0
+            }
+        };
+        // The fidelity shares have their own denominator, and it is not `total`
+        // — see `FIDELITY_KNOWN`. The mix below keeps `pct`, because it carries
+        // an `Unknown` bucket and so really is a share of everything.
+        let fpct = |n: i64| {
+            if fidelity_known.0 > 0 {
+                (n as f64 / fidelity_known.0 as f64 * 100.0).round() as i64
             } else {
                 0
             }
@@ -3375,16 +3470,21 @@ impl Database {
 
         // Fidelity mix, bucketed the way the badges are: DSD > lossless > lossy,
         // with anything unlabelled called out rather than silently dropped.
-        let fidelity_rows: Vec<(String, i64)> = sqlx::query_as(
+        //
+        // `Unknown` is written as the complement of `FIDELITY_KNOWN` rather than
+        // as its own `ELSE`, so this bucket and the shares above are provably
+        // the same split of the same rows. Written the other way round they were
+        // *almost* the same, which is worse than different.
+        let fidelity_rows: Vec<(String, i64)> = sqlx::query_as(&format!(
             "SELECT CASE
+                    WHEN NOT {FIDELITY_KNOWN} THEN 'Unknown'
                     WHEN format_type = 'dsd' THEN 'DSD'
                     WHEN is_lossless = TRUE THEN 'Lossless'
-                    WHEN codec IS NOT NULL AND codec != '' THEN 'Lossy'
-                    ELSE 'Unknown'
+                    ELSE 'Lossy'
                 END AS tier, COUNT(*) as c
              FROM scrobbles WHERE user_id = ? AND skipped = FALSE AND (? IS NULL OR timestamp >= ?)
-             GROUP BY tier ORDER BY c DESC",
-        )
+             GROUP BY tier ORDER BY c DESC"
+        ))
         .bind(user_id)
         .bind(after)
         .bind(after)
@@ -3461,7 +3561,9 @@ impl Database {
                 "plays": total, "hours": (hours * 10.0).round() / 10.0,
                 "artists": artists.0, "albums": albums.0, "tracks": tracks.0,
                 "avg_quality": avg_quality.0.map(|q| (q * 10.0).round() / 10.0).unwrap_or(0.0),
-                "lossless_pct": pct(lossless.0), "dsd_pct": pct(dsd.0),
+                "lossless_pct": fpct(lossless.0), "dsd_pct": fpct(dsd.0),
+                // The two shares above are of this, not of `plays`.
+                "fidelity_known": fidelity_known.0,
             },
             "top_artists": top_artists,
             "top_albums": top_albums,
@@ -4310,6 +4412,42 @@ impl Database {
             .bind(id)
             .execute(&self.pool)
             .await?;
+        Ok(res.rows_affected() > 0)
+    }
+
+    /// A hand-set cover for a release entity, if there is one.
+    ///
+    /// Kept as its own query rather than a field on `EntityRow`: only the album
+    /// page asks, and widening the row would mean touching every one of its
+    /// column lists for a value nothing else reads.
+    pub async fn entity_image(&self, id: i64) -> Result<Option<String>, sqlx::Error> {
+        let row: Option<(Option<String>,)> =
+            sqlx::query_as("SELECT image_url FROM entities WHERE id = ?")
+                .bind(id)
+                .fetch_optional(&self.pool)
+                .await?;
+        Ok(row.and_then(|r| r.0).filter(|u| !u.is_empty()))
+    }
+
+    /// Set or clear a release's cover by hand.
+    ///
+    /// Restricted to `kind = 'release'` at the query. An artist's picture lives
+    /// on the `artists` row — shared by name, and what the library proxy and the
+    /// portrait backfill both address — so letting this write one too would give
+    /// the same artist two places to be pictured from, and no rule about which
+    /// wins. Returns false when the id is not a release, which the handler
+    /// reports rather than silently succeeding.
+    pub async fn set_entity_image(
+        &self,
+        id: i64,
+        image_url: Option<&str>,
+    ) -> Result<bool, sqlx::Error> {
+        let res =
+            sqlx::query("UPDATE entities SET image_url = ? WHERE id = ? AND kind = 'release'")
+                .bind(image_url)
+                .bind(id)
+                .execute(&self.pool)
+                .await?;
         Ok(res.rows_affected() > 0)
     }
 
@@ -8222,5 +8360,118 @@ mod tests {
 
         db.set_love(ann, e, false).await.unwrap();
         assert!(!db.is_loved(ann, e).await.unwrap());
+    }
+
+    /// A fidelity share is of the listens whose format is known, and the mix's
+    /// `Unknown` bucket is exactly the rest.
+    ///
+    /// The bug this pins: `is_lossless` is nullable and an imported listen has
+    /// nothing in it — 97.4% of a real 21,390-listen export carries no format
+    /// at all — so dividing by every play scored "never knew" as "not
+    /// lossless". Someone who has only ever played FLAC read 2%. Nothing
+    /// errored; the number was just a measure of how much history they had
+    /// imported.
+    ///
+    /// It asserts on the *readouts* and on the two agreeing, not on the SQL,
+    /// because the failure mode is a third fidelity query written later beside
+    /// these two — the same reason `a_skip_reaches_no_counting_readout` is
+    /// written the way it is.
+    #[tokio::test]
+    async fn a_fidelity_share_ignores_listens_of_unknown_format() {
+        let db = testdb().await;
+        let uid = db.create_user("fid", None, "pw", "user").await.unwrap();
+        let now = Database::now_secs();
+
+        let flac = AudioQuality {
+            codec: Some("flac".into()),
+            is_lossless: Some(true),
+            format_type: Some("pcm".into()),
+            ..Default::default()
+        };
+        let mp3 = AudioQuality {
+            codec: Some("mp3".into()),
+            is_lossless: Some(false),
+            format_type: Some("pcm".into()),
+            ..Default::default()
+        };
+
+        // Three listens Tapedeck saw the format of: two lossless, one not.
+        // Separately titled and spaced an hour apart so `fuzzy_exists` reads
+        // them as three plays rather than one play reported three times.
+        for (i, q) in [(0i64, &flac), (1, &flac), (2, &mp3)] {
+            let p = play(&format!("Known {i}"), "A", (now - 3600 * (i + 1)) as u64);
+            db.save_scrobble(
+                uid,
+                &p,
+                Some(q),
+                None,
+                None,
+                None,
+                None,
+                None,
+                ListenDisposition::LIVE,
+            )
+            .await
+            .unwrap();
+        }
+        // And ninety-seven with no format at all, which is roughly the ratio a
+        // real imported history has.
+        for i in 0..97i64 {
+            let p = play(&format!("Imported {i}"), "A", (now - 400_000 - 3600 * i) as u64);
+            db.save_scrobble(uid, &p, None, None, None, None, None, None, ListenDisposition::LIVE)
+                .await
+                .unwrap();
+        }
+
+        let dash = db.get_dashboard_stats(uid, chrono_tz::UTC, 1).await.unwrap();
+        assert_eq!(dash["total"], 100);
+        assert_eq!(dash["fidelity_known"], 3);
+        // Two of the three known, not two of a hundred.
+        assert_eq!(dash["lossless_pct"], 67);
+
+        let ranged = db.get_ranged_stats(uid, None, false).await.unwrap();
+        assert_eq!(ranged["totals"]["fidelity_known"], 3);
+        assert_eq!(ranged["totals"]["lossless_pct"], 67);
+
+        // The mix and the share must split the same rows the same way, or the
+        // page contradicts itself: `Unknown` is defined as the complement of
+        // the share's population, so everything else has to add up to it.
+        let mix = ranged["fidelity"].as_array().unwrap();
+        let named = |n: &str| {
+            mix.iter().find(|r| r["name"] == n).map(|r| r["plays"].as_i64().unwrap()).unwrap_or(0)
+        };
+        assert_eq!(named("Unknown"), 97);
+        assert_eq!(named("Lossless") + named("Lossy") + named("DSD"), 3);
+    }
+
+    /// A hand-set cover is for a *release*, and only a release.
+    ///
+    /// An artist's picture lives on the `artists` row — shared by name, and
+    /// what the library proxy and the portrait backfill both address. If this
+    /// query could write an artist entity's `image_url` too, the same artist
+    /// would have two places to be pictured from and no rule about which wins,
+    /// and nothing would error to say so.
+    #[tokio::test]
+    async fn a_cover_override_is_release_only_and_clearable() {
+        let db = testdb().await;
+        let album = db.upsert_entity("release", "Untrue", "Burial", None).await.unwrap();
+        let artist = db.upsert_entity("artist", "Burial", "", None).await.unwrap();
+
+        assert!(db.entity_image(album).await.unwrap().is_none());
+
+        assert!(db.set_entity_image(album, Some("https://example.test/untrue.jpg")).await.unwrap());
+        assert_eq!(
+            db.entity_image(album).await.unwrap().as_deref(),
+            Some("https://example.test/untrue.jpg")
+        );
+
+        // Refused, and reported as refused rather than quietly doing nothing.
+        assert!(!db.set_entity_image(artist, Some("https://example.test/nope.jpg")).await.unwrap());
+        assert!(db.entity_image(artist).await.unwrap().is_none());
+
+        // Clearing restores "no override", which is what puts the cover derived
+        // from the listens back on the page.
+        assert!(db.set_entity_image(album, None).await.unwrap());
+        assert!(db.entity_image(album).await.unwrap().is_none());
     }
 }

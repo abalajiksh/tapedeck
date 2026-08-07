@@ -1,8 +1,9 @@
 <script lang="ts">
-	import { onMount } from 'svelte';
+	import { onMount, tick } from 'svelte';
 	import { api, type Rediscovery, type RediscoveryCollection, type RediscoveryRow } from '$lib/api';
 	import { openAlbum, openArtist } from '$lib/entities';
 	import CoverArt from '$lib/components/CoverArt.svelte';
+	import CollectionIcon from '$lib/components/CollectionIcon.svelte';
 
 	let data: Rediscovery | null = null;
 	let loading = true;
@@ -21,6 +22,20 @@
 	/** Which card is expanded. Collections are summaries first — the two sample
 	 *  tracks are the hook, the full list is a click away. */
 	let openKey: string | null = null;
+	let panel: HTMLElement | null = null;
+
+	/** Open a collection, or close the one that's open.
+	 *
+	 *  The list renders below the whole grid, so with seven cards it can open
+	 *  off-screen — which reads as the button having done nothing. The card
+	 *  keeps its accent outline while its list is up, so it stays obvious which
+	 *  of the seven you're looking at once you're down there. */
+	async function toggle(key: string) {
+		openKey = openKey === key ? null : key;
+		if (!openKey) return;
+		await tick();
+		panel?.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+	}
 
 	let gearId: number | null = null;
 	let gearRows: RediscoveryRow[] = [];
@@ -91,7 +106,10 @@
 	{#if data.featured}
 		<!-- The hero. Its record turns because this is the one thing on the page
 		     asking to be picked up — the rest are a catalogue. -->
-		<div class="hero">
+		<div class="hero" class:open={openKey === data.featured.key}
+			style={openKey === data.featured.key
+				? `box-shadow:0 0 0 3px ${tint(data.featured.accent, 0.4)};`
+				: ''}>
 			<div style="width:120px;height:120px;flex:none;">
 				<svg viewBox="0 0 120 120" style="width:100%;height:auto;display:block;">
 					<circle cx="60" cy="60" r="57" fill="#c67139" opacity=".14" />
@@ -122,7 +140,7 @@
 					<span>{data.featured.stat}</span>
 				</div>
 				<button class="btn btn-primary"
-					on:click={() => (openKey = openKey === data?.featured?.key ? null : (data?.featured?.key ?? null))}>
+					on:click={() => data?.featured && toggle(data.featured.key)}>
 					{openKey === data.featured.key ? 'Hide' : 'See all'}
 				</button>
 			</div>
@@ -133,13 +151,13 @@
 		<!-- The hero is one of these, so it has to come out of the grid — whichever
 		     collection has the most to say was being rendered twice. -->
 		{#each data.collections.filter((c) => c.key !== data?.featured?.key) as c (c.key)}
-			<div class="card" class:empty={!c.count}>
+			<div class="card" class:empty={!c.count} class:open={openKey === c.key}
+				style={openKey === c.key
+					? `border-color:${c.accent};box-shadow:0 0 0 3px ${tint(c.accent, 0.22)};`
+					: ''}>
 				<div style="display:flex;gap:14px;align-items:flex-start;margin-bottom:14px;">
 					<div class="badge" style="background:{tint(c.accent, 0.15)};color:{c.accent};">
-						<svg viewBox="0 0 24 24" width="22" fill="none" stroke="currentColor"
-							stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round">
-							<path d="M3 5v5h5" /><path d="M4.2 14a8 8 0 1 0 1.3-6.3L3 10" />
-						</svg>
+						<CollectionIcon name={c.key} />
 					</div>
 					<div style="flex:1;min-width:0;">
 						<h3 class="h-display" style="font-size:17.5px;margin:0 0 4px;line-height:1.15;">{c.title}</h3>
@@ -164,7 +182,7 @@
 					</div>
 					<div style="display:flex;gap:8px;margin-top:auto;">
 						<button class="btn btn-secondary" style="font-size:13px;padding:8px 15px;"
-							on:click={() => (openKey = openKey === c.key ? null : c.key)}>
+							aria-expanded={openKey === c.key} on:click={() => toggle(c.key)}>
 							{openKey === c.key ? 'Hide' : `See all ${c.count}`}
 						</button>
 					</div>
@@ -178,7 +196,8 @@
 	</div>
 
 	{#each data.collections.filter((c) => c.key === openKey) as c (c.key)}
-		<div class="panel expanded" style="border-color:{c.accent};">
+		<div class="panel expanded" bind:this={panel}
+			style="border-color:{c.accent};box-shadow:0 0 0 3px {tint(c.accent, 0.22)};">
 			<div style="display:flex;justify-content:space-between;align-items:baseline;gap:12px;padding:16px 18px 10px;">
 				<h3 class="h-display" style="font-size:19px;margin:0;">{c.title}</h3>
 				<button class="linkish" on:click={() => (openKey = null)}>Close</button>
@@ -283,6 +302,10 @@
 	/* An empty collection stays on the page rather than vanishing — that it is
 	   empty is information, and a grid that reflows as data arrives is worse. */
 	.card.empty { opacity: 0.62; }
+	/* The open card keeps the accent ring its list is wearing, so the two read
+	   as one thing even with the grid between them. */
+	.card { transition: box-shadow 0.14s ease, border-color 0.14s ease; }
+	@media (prefers-reduced-motion: reduce) { .card { transition: none; } }
 	.badge {
 		display: inline-flex; align-items: center; justify-content: center;
 		width: 44px; height: 44px; flex: none; border-radius: 13px;

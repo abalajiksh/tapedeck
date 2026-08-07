@@ -139,6 +139,9 @@ export interface DashboardStats {
 	today_hours: number;
 	week_hours: number;
 	lossless_pct: number;
+	/** What `lossless_pct` is a share *of* — listens whose format is known, not
+	 *  every play. See `FIDELITY_KNOWN` in `db.rs`. */
+	fidelity_known: number;
 	top_artist: string;
 	top_artist_count: number;
 	unique_artists: number;
@@ -154,6 +157,8 @@ export interface RangedStats {
 	totals: {
 		plays: number; hours: number; artists: number; albums: number; tracks: number;
 		avg_quality: number; lossless_pct: number; dsd_pct: number;
+		/** The denominator of the two shares above — not `plays`. */
+		fidelity_known: number;
 	};
 	top_artists: { name: string; plays: number; hours: number; image_url: string | null }[];
 	top_albums: { name: string; artist: string; plays: number; hours: number }[];
@@ -224,6 +229,11 @@ export interface Reports {
 	unit: 'week' | 'month' | 'year';
 	timezone: string;
 	periods: ReportPeriod[];
+	/** Where this page sits, counting back from the newest period. */
+	offset: number;
+	/** How many periods exist at this bucket size — what tells the stepper
+	 *  where the far end is. */
+	total_periods: number;
 	/** True when the history hit the analytics row cap — the oldest periods are
 	 *  then incomplete and should not be presented as final. */
 	capped?: boolean;
@@ -571,6 +581,9 @@ export interface AlbumView {
 	artwork_url: string | null;
 	caa_id: number | null;
 	caa_release_mbid: string | null;
+	/** True when the cover was set by hand, in which case it replaces the one
+	 *  derived from the listens rather than sitting in front of it. */
+	cover_override: boolean;
 	loved: boolean;
 	bio: BioBlock;
 	stats: StatCard[];
@@ -929,8 +942,12 @@ class TapedeckAPI {
 	}
 
 	/** Period reports, newest first. */
-	async getReports(unit: 'week' | 'month' | 'year' = 'month', limit = 12): Promise<Reports> {
-		return this.get(`/api/v1/reports?unit=${unit}&limit=${limit}`);
+	async getReports(
+		unit: 'week' | 'month' | 'year' = 'month',
+		limit = 12,
+		offset = 0
+	): Promise<Reports> {
+		return this.get(`/api/v1/reports?unit=${unit}&limit=${limit}&offset=${offset}`);
 	}
 
 	async getPersonality(range: StatsRange = 'all'): Promise<Personality> {
@@ -1109,6 +1126,12 @@ class TapedeckAPI {
 	/** Set or clear an artist portrait by hand. Empty clears it. */
 	async setArtistImage(artistRowId: number, url: string): Promise<{ image_url: string | null }> {
 		return this.request('PUT', `/api/v1/artists/img/${artistRowId}`, { url });
+	}
+	/** Set or clear an album cover by hand — takes the *entity* id, the same one
+	 *  the album page is addressed by. Empty restores the cover derived from the
+	 *  listens. */
+	async setAlbumCover(entityId: number, url: string): Promise<{ artwork_url: string | null }> {
+		return this.request('PUT', `/api/v1/albums/${entityId}/cover`, { url });
 	}
 
 	async getDiscogsSetting(): Promise<{

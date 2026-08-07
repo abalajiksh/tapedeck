@@ -16,6 +16,31 @@
 	let error = '';
 	let loveBusy = false;
 
+	// Same override the artist page offers for a portrait. An album otherwise
+	// wears whatever artwork the newest listen of it carries — right most of the
+	// time, and unfixable when it's the compilation's cover or the wrong edition.
+	let editingCover = false;
+	let coverUrl = '';
+	let coverMsg = '';
+
+	async function saveCover(url: string) {
+		if (!album) return;
+		coverMsg = '';
+		try {
+			const r = await api.setAlbumCover(album.id, url);
+			album = { ...album, artwork_url: r.artwork_url, cover_override: !!r.artwork_url };
+			coverUrl = '';
+			editingCover = false;
+			coverMsg = url ? 'Cover updated.' : 'Cover reset.';
+			// Clearing puts the derived cover back, which the server picks — so
+			// the page has to ask again rather than guess at it here.
+			if (!url) await load();
+			setTimeout(() => (coverMsg = ''), 2500);
+		} catch (e) {
+			coverMsg = String(e).replace(/^API \d+: /, '');
+		}
+	}
+
 	$: id = Number($page.params.id);
 
 	// The tracklist bars are relative to the album's own most-played track, not
@@ -122,6 +147,11 @@
 				size={260}
 				radius={22}
 			/>
+			<!-- Quiet until you go looking for it — a correction, not a call to
+			     action. Same treatment as the artist portrait's. -->
+			<button class="pic-edit" on:click={() => (editingCover = !editingCover)}>
+				{album.cover_override ? 'Change cover' : 'Set the cover'}
+			</button>
 		</div>
 		<div style="flex:1;min-width:260px;">
 			<div class="eyebrow">Album</div>
@@ -143,6 +173,27 @@
 			</div>
 		</div>
 	</div>
+
+	{#if editingCover}
+		<div class="panel" style="border-radius:18px;padding:16px;margin-bottom:14px;">
+			<div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center;">
+				<input class="input" style="flex:1;min-width:240px;" bind:value={coverUrl}
+					placeholder="https://… or /api/v1/art/<listen id>">
+				<button class="btn btn-primary" on:click={() => saveCover(coverUrl)}>Save</button>
+				{#if album.cover_override}
+					<button class="btn btn-secondary" on:click={() => saveCover('')}>Reset</button>
+				{/if}
+				<button class="btn btn-secondary" on:click={() => (editingCover = false)}>Cancel</button>
+			</div>
+			<p style="font-size:12.5px;color:var(--td-muted);margin:10px 0 0;">
+				Paste any image URL. Without one, the cover is whichever artwork the
+				newest listen of this record carries — Reset goes back to that.
+			</p>
+		</div>
+	{/if}
+	{#if coverMsg}
+		<p style="font-size:13px;color:var(--td-good-fg);margin:0 0 12px;">{coverMsg}</p>
+	{/if}
 
 	<StatStrip stats={album.stats} />
 
@@ -207,7 +258,16 @@
 		display: flex; gap: 30px; flex-wrap: wrap;
 		align-items: center; margin-bottom: 30px;
 	}
-	.cover { width: 260px; max-width: 100%; flex: none; }
+	.cover {
+		width: 260px; max-width: 100%; flex: none;
+		display: flex; flex-direction: column; gap: 8px; align-items: center;
+	}
+	.pic-edit {
+		border: none; background: none; padding: 0; cursor: pointer;
+		font: inherit; font-size: 12px; color: var(--td-muted-2);
+		text-decoration: underline; text-underline-offset: 3px;
+	}
+	.pic-edit:hover { color: var(--td-accent); }
 	.eyebrow {
 		font-size: 11px; letter-spacing: .16em; text-transform: uppercase;
 		color: #c67139; font-weight: 600; margin-bottom: 8px;

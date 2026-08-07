@@ -163,7 +163,15 @@ async fn album_detail(
     let tracks = state.db.album_tracks(user.user_id, &artist, &album).await.unwrap_or_default();
     let more =
         state.db.artist_albums(user.user_id, &artist, Some(&album), 4).await.unwrap_or_default();
-    let artwork = state.db.album_artwork(user.user_id, &artist, &album).await.ok().flatten();
+    // A hand-set cover beats the derived one outright, including its CAA id —
+    // leaving those in place would have `CoverArt` fall back to the release the
+    // listens claim the moment the chosen URL fails to load, which is exactly
+    // the picture the operator said no to.
+    let override_url = state.db.entity_image(id).await.ok().flatten();
+    let artwork = match &override_url {
+        Some(_) => None,
+        None => state.db.album_artwork(user.user_id, &artist, &album).await.ok().flatten(),
+    };
 
     // The artist gets an entity too, so the header link has somewhere to go.
     let artist_entity_id = state.db.upsert_entity("artist", &artist, "", None).await.ok();
@@ -182,6 +190,19 @@ async fn album_detail(
     // A record with no plays is still a real page — it just has zeroes on it.
     // Falling through to a 404 would be wrong for something you annotated once
     // and then removed the listens for.
+    // The fourth card used to be a lossless share of this record's plays, which
+    // on an imported history is a percentage of nothing: 97% of a real export
+    // carries no format at all, so a record with 25 imported plays read "0%
+    // lossless" — an accusation about a rip Tapedeck never saw. Fidelity is
+    // reported on the dashboard and Statistics now, against the population it
+    // is actually known for (`FIDELITY_KNOWN`), and this slot takes a number
+    // that always has an answer instead.
+    //
+    // Share of the *artist*, mirroring the artist page's share of all
+    // listening: the dark card on both entity pages is now "how much of the
+    // thing one level up is this?".
+    let artist_plays = state.db.artist_plays(user.user_id, &artist).await.unwrap_or(0);
+
     let stats = match &summary {
         Some(s) => {
             let (year, day) = year_and_day(s.first_heard);
@@ -199,9 +220,9 @@ async fn album_detail(
                 stat("Hours", hours(s.seconds), "on the deck".into(), false),
                 stat("First Heard", year, day, false),
                 stat(
-                    "Lossless",
-                    format!("{}%", pct(s.lossless, s.plays)),
-                    "of these plays".into(),
+                    "Share",
+                    format!("{}%", pct(s.plays, artist_plays)),
+                    format!("of your {artist}"),
                     true,
                 ),
             ]
@@ -210,7 +231,7 @@ async fn album_detail(
             stat("Your Plays", "0".into(), "never played".into(), false),
             stat("Hours", "0m".into(), "on the deck".into(), false),
             stat("First Heard", "—".into(), String::new(), false),
-            stat("Lossless", "—".into(), "of these plays".into(), true),
+            stat("Share", "—".into(), format!("of your {artist}"), true),
         ],
     };
 
@@ -230,9 +251,12 @@ async fn album_detail(
             // below, which the client already has.
             "listening_seconds": summary.as_ref().map(|s| s.seconds).unwrap_or(0),
             "plays": summary.as_ref().map(|s| s.plays).unwrap_or(0),
-            "artwork_url": artwork.as_ref().and_then(|a| a.0.clone()),
+            "artwork_url": override_url.clone().or_else(|| artwork.as_ref().and_then(|a| a.0.clone())),
             "caa_id": artwork.as_ref().and_then(|a| a.1),
             "caa_release_mbid": artwork.as_ref().and_then(|a| a.2.clone()),
+            // So the page can offer "reset to the cover from your listens"
+            // rather than only "clear", which would read as "no cover at all".
+            "cover_override": override_url.is_some(),
             "loved": loved,
             "bio": bio,
             "stats": stats,

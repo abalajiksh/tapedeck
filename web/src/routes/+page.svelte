@@ -7,15 +7,22 @@
 	import { formatDuration, qualityLabel, tierTagClass } from '$lib/utils';
 	import { loadLoves, lovedKeys, loveKeyOf, toggleLoveByName } from '$lib/loves';
 	import { openAlbum, openArtist } from '$lib/entities';
+	import { fidelity, fidelityLabel } from '$lib/fidelity';
 
 	let recent: Scrobble[] = [];
 	let loading = true;
 	let connected = false;
 	let today = 0, thisWeek = 0, losslessPct = 0;
+	// The fidelity card needs both halves: the share, and how much listening it
+	// was computed from. Below a quarter coverage it reports the coverage
+	// instead — see `$lib/fidelity`.
+	let fidelityKnown = 0, totalPlays = 0;
 	let todayHours = 0, weekHours = 0;
 
 	// The deck shows what's playing when a source is reporting, and falls back
 	// to the most recent listen otherwise.
+	$: fid = fidelity(losslessPct, fidelityKnown, totalPlays, 'lossless');
+
 	$: live = $deck.playing ? $deck.track : null;
 	$: hero = live ?? recent[0] ?? null;
 	$: heroQ = hero ? qualityLabel(hero) : null;
@@ -57,6 +64,7 @@
 				api.getScrobbles({ limit: 8 })
 			]);
 			today = s.today; thisWeek = s.this_week; losslessPct = s.lossless_pct;
+			fidelityKnown = s.fidelity_known; totalPlays = s.total;
 			todayHours = s.today_hours; weekHours = s.week_hours;
 			recent = r.scrobbles;
 		} catch {
@@ -102,6 +110,7 @@
 			try {
 				const s = await api.getDashboardStats();
 				today = s.today; thisWeek = s.this_week; losslessPct = s.lossless_pct;
+			fidelityKnown = s.fidelity_known; totalPlays = s.total;
 				todayHours = s.today_hours; weekHours = s.week_hours;
 			} catch (e) { console.warn('stats', e); }
 
@@ -226,10 +235,12 @@
 			<div class="h-display" style="font-size:36px;line-height:1;">{thisWeek}</div>
 			<div style="font-size:12.5px;color:var(--td-muted-2);margin-top:6px;">{playsLabel(thisWeek, weekHours)}</div>
 		</div>
+		<!-- Not "of all listens": most of an imported history has no format at
+		     all, so dividing by everything reported the import ratio. -->
 		<div style="background:var(--td-panel);color:#f4e7cf;border-radius:22px;padding:20px 22px;">
-			<div style="font-size:11px;letter-spacing:.12em;text-transform:uppercase;color:#c9a678;margin-bottom:6px;">Lossless</div>
-			<div class="h-display" style="font-size:36px;line-height:1;">{losslessPct}<span style="font-size:20px;">%</span></div>
-			<div style="font-size:12.5px;color:#b3a487;margin-top:6px;">of all listens</div>
+			<div style="font-size:11px;letter-spacing:.12em;text-transform:uppercase;color:#c9a678;margin-bottom:6px;">{fidelityLabel(fid, 'Lossless')}</div>
+			<div class="h-display" style="font-size:36px;line-height:1;">{fid.value}</div>
+			<div style="font-size:12.5px;color:#b3a487;margin-top:6px;line-height:1.35;">{fid.sub}</div>
 		</div>
 		<a class="charts-card" href="/charts">
 			<svg viewBox="0 0 24 24" width="22" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M8 21h8"/><path d="M12 17v4"/><path d="M7 4h10v4a5 5 0 0 1-10 0z"/><path d="M17 5h3v2a3 3 0 0 1-3 3"/><path d="M7 5H4v2a3 3 0 0 0 3 3"/></svg>
