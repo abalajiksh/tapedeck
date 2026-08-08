@@ -95,6 +95,42 @@ pub struct SubmitQuery {
     dry_run: Option<String>,
 }
 
+/// How recent a listen must be for a client trusted with `imports_are_live` to
+/// have it forwarded onward. 24 hours.
+///
+/// The number separates two things that no field in the payload distinguishes:
+/// a *live listen that arrived late* — a laptop that was offline, a client
+/// flushing a queue after a restart — and a *chunk of someone's history*, which
+/// is months or years old. A day is far more than any player's queue needs and
+/// far less than any backfill, and Last.fm accepts scrobbles up to 14 days old
+/// regardless, so nothing inside this window is anomalous to the sink either.
+pub const IMPORT_LIVE_WINDOW_SECS: i64 = 24 * 60 * 60;
+
+/// Whether an `import` submission is being stored only, or relayed onward.
+///
+/// This is the whole of the relay rule and it is one function because the dry
+/// run and the real path must not be able to disagree — a preview that says
+/// "will be forwarded" about a listen that then isn't is worse than no preview.
+///
+/// Two gates, and each covers the other's blind spot. The **token** gate is the
+/// operator saying "this client batches its live scrobbles"; it exists because
+/// nothing in the request can be trusted to say so — `submission_client` is
+/// free text the client picks, and fooyin hardcodes `listen_type: "import"` for
+/// every scrobble it has ever sent, so the wire is genuinely silent on the
+/// question. The **freshness** gate then bounds how wrong that statement can be:
+/// if a client marked live ever does a real backfill, its old timestamps fail
+/// here and the history is not rewritten. Neither gate alone is enough — the
+/// token alone re-opens the exact bug `ListenDisposition` was added to close.
+fn import_is_live(listen_type: &ListenType, timestamp: i64, now: i64, token_is_live: bool) -> bool {
+    if *listen_type != ListenType::Import {
+        return false; // `single` is already live; `playing_now` is never stored.
+    }
+    // A future timestamp is a clock skew, not a backfill, so it is allowed —
+    // but not unboundedly, or a client with a badly wrong clock could park a
+    // scrobble years ahead of everything else on a public record.
+    token_is_live && (now - timestamp) <= IMPORT_LIVE_WINDOW_SECS && (timestamp - now) <= 3600
+}
+
 /// Accepts `1`, `true`, `yes`, and a bare `?dry_run` — a plugin author trying
 /// this by hand shouldn't have to guess which spelling we wanted.
 fn truthy(v: &Option<String>) -> bool {
@@ -110,7 +146,7 @@ fn truthy(v: &Option<String>) -> bool {
 /// POST /1/submit-listens
 pub async fn submit_listens(
     State(state): State<Arc<AppState>>,
-    IngestAuth { user, token_chain_id, token_id }: IngestAuth,
+    IngestAuth { user, token_chain_id, token_id, imports_are_live }: IngestAuth,
     Query(q): Query<SubmitQuery>,
     Json(body): Json<SubmitListensRequest>,
 ) -> impl IntoResponse {
@@ -185,11 +221,34 @@ pub async fn submit_listens(
         let duration = info_ref.and_then(|ai| ai.duration_ms).map(|ms| (ms / 1000) as u64);
         let track_number = info_ref.and_then(|ai| ai.track_number);
 
-        // Pre-populate MBIDs from mbid_mapping
+        // Pre-populate MBIDs. A submitting client puts them in `additional_info`
+        // (that is what the LB submit spec says and what fooyin, Pano and
+        // multi-scrobbler all do); `mbid_mapping` is the read-side shape, which
+        // arrives when something replays an LB export through this endpoint.
+        // Read both, `additional_info` first — it is the client speaking about
+        // the file it just played, where a mapping is LB's own guess.
+        //
+        // Precedence makes blankness dangerous: a client that *sets the key* to
+        // `""` would otherwise outrank a real MBID sitting in the mapping, and
+        // an empty string is worse than a missing one — it satisfies every
+        // `IS NOT NULL` the enrichment backfills queue on, so the row is filed
+        // as identified and never looked up again. `present` is what stops a
+        // key that carries nothing from counting as an answer.
+        let present = |s: &Option<String>| {
+            s.as_ref().map(|v| v.trim()).filter(|v| !v.is_empty()).map(str::to_string)
+        };
         let mbid_mapping = meta.mbid_mapping.as_ref();
-        let mbid_recording = mbid_mapping.and_then(|m| m.recording_mbid.clone());
-        let mbid_release = mbid_mapping.and_then(|m| m.release_mbid.clone());
-        let mbid_artist = mbid_mapping.and_then(|m| m.artist_mbids.clone());
+        let mbid_recording = info_ref
+            .and_then(|ai| present(&ai.recording_mbid))
+            .or_else(|| mbid_mapping.and_then(|m| present(&m.recording_mbid)));
+        let mbid_release = info_ref
+            .and_then(|ai| present(&ai.release_mbid))
+            .or_else(|| mbid_mapping.and_then(|m| present(&m.release_mbid)));
+        let mbid_artist =
+            info_ref.and_then(|ai| ai.artist_mbids.clone()).filter(|v| !v.is_empty()).or_else(
+                || mbid_mapping.and_then(|m| m.artist_mbids.clone()).filter(|v| !v.is_empty()),
+            );
+        let mbid_release_group = info_ref.and_then(|ai| present(&ai.release_group_mbid));
         let caa_id = mbid_mapping.and_then(|m| m.caa_id);
         let caa_release_mbid = mbid_mapping.and_then(|m| m.caa_release_mbid.clone());
 
@@ -206,7 +265,7 @@ pub async fn submit_listens(
             mbid_release,
             mbid_artist,
             artists: None,
-            mbid_release_group: None,
+            mbid_release_group,
             caa_id,
             caa_release_mbid,
         };
@@ -336,7 +395,8 @@ pub async fn submit_listens(
 
         if dry_run {
             let disposition = ListenDisposition {
-                imported: body.listen_type == ListenType::Import,
+                imported: body.listen_type == ListenType::Import
+                    && !import_is_live(&body.listen_type, timestamp, now, imports_are_live),
                 skipped: info_ref.and_then(|ai| ai.skipped).unwrap_or(false),
             };
             // Both dedup rules are read-only, so the preview can answer the
@@ -396,13 +456,19 @@ pub async fn submit_listens(
             }
             ListenType::Single | ListenType::Import => {
                 // What this listen *is*, and therefore whether it is ever
-                // forwarded. `import` is a backfill: the client is telling us
-                // about something that already happened, and pushing that to
-                // Last.fm rewrites a permanent public record. This used to be
-                // hardcoded `'pending'` in `save_scrobble`, so every
+                // forwarded. `import` is a backfill by default: the client is
+                // telling us about something that already happened, and pushing
+                // that to Last.fm rewrites a permanent public record. This used
+                // to be hardcoded `'pending'` in `save_scrobble`, so every
                 // plugin-driven backfill was scrobbled onward as if live.
+                //
+                // `import_is_live` is the narrow exception — a client the
+                // operator has marked as batching its *live* scrobbles, sending
+                // something that happened today. See the function for why both
+                // halves of that are required.
                 let disposition = ListenDisposition {
-                    imported: body.listen_type == ListenType::Import,
+                    imported: body.listen_type == ListenType::Import
+                        && !import_is_live(&body.listen_type, timestamp, now, imports_are_live),
                     skipped: info_ref.and_then(|ai| ai.skipped).unwrap_or(false),
                 };
 
@@ -577,5 +643,63 @@ fn extract_audio_quality(info: Option<&AdditionalInfo>) -> AudioQuality {
         is_transcoded: ta.is_transcoded,
         transcode_reason: ta.transcode_reason.clone(),
         quality_score: None, // computed after
+    }
+}
+
+#[cfg(test)]
+mod relay_tests {
+    use super::*;
+
+    const NOW: i64 = 1_800_000_000;
+    const DAY: i64 = 24 * 60 * 60;
+
+    /// The default, and the one that must never regress: an `import` from a
+    /// client nobody has vouched for is stored and never forwarded, however
+    /// recent it is. This is the whole of `ListenDisposition`'s reason to exist
+    /// — a plugin backfill once rewrote a real Last.fm history.
+    #[test]
+    fn an_untrusted_import_is_never_forwarded_however_fresh() {
+        for age in [0, 60, DAY - 1, DAY * 400] {
+            assert!(
+                !import_is_live(&ListenType::Import, NOW - age, NOW, false),
+                "age {age} forwarded without the token being marked live"
+            );
+        }
+    }
+
+    /// fooyin's shape: `import` for a live scrobble, timestamped at track start,
+    /// submitted seconds later.
+    #[test]
+    fn a_trusted_clients_recent_import_is_relayed() {
+        assert!(import_is_live(&ListenType::Import, NOW - 300, NOW, true));
+        assert!(import_is_live(&ListenType::Import, NOW, NOW, true));
+        // A queue flushed after a few hours offline is still this listening.
+        assert!(import_is_live(&ListenType::Import, NOW - 6 * 3600, NOW, true));
+    }
+
+    /// The rail. Marking a client live is a statement about how it batches, not
+    /// a promise it will never import history — so its old timestamps must
+    /// still fail closed.
+    #[test]
+    fn a_trusted_client_backfilling_history_is_still_not_forwarded() {
+        assert!(!import_is_live(&ListenType::Import, NOW - DAY - 1, NOW, true));
+        assert!(!import_is_live(&ListenType::Import, NOW - DAY * 30, NOW, true));
+        assert!(!import_is_live(&ListenType::Import, NOW - DAY * 3650, NOW, true));
+        // A wildly future timestamp is a broken clock, not a listen; a small
+        // one is ordinary skew between two machines and is allowed.
+        assert!(import_is_live(&ListenType::Import, NOW + 120, NOW, true));
+        assert!(!import_is_live(&ListenType::Import, NOW + DAY * 365, NOW, true));
+    }
+
+    /// The flag only ever *widens* `import`. It must not touch the other two:
+    /// `single` is already forwarded on its own merits and must not start
+    /// depending on this, and `playing_now` is never stored at all.
+    #[test]
+    fn the_relay_switch_changes_nothing_about_the_other_listen_types() {
+        for lt in [ListenType::Single, ListenType::PlayingNow] {
+            for trusted in [true, false] {
+                assert!(!import_is_live(&lt, NOW - 60, NOW, trusted));
+            }
+        }
     }
 }

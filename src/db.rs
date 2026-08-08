@@ -481,7 +481,13 @@ impl Database {
                 created_at INTEGER NOT NULL,
                 last_used_at INTEGER,
                 expires_at INTEGER,
-                default_chain_id INTEGER REFERENCES signal_chains(id)
+                default_chain_id INTEGER REFERENCES signal_chains(id),
+                -- Whether this client's import-type submissions are
+                -- live listens rather than a backfill. Off by default and never
+                -- inferred: turning it on lets a client write to the owner's
+                -- permanent Last.fm/ListenBrainz record, which is not a decision
+                -- to make on their behalf.
+                imports_are_live BOOLEAN DEFAULT FALSE
             )",
         )
         .execute(&self.pool)
@@ -1176,6 +1182,17 @@ impl Database {
             )
             .execute(&self.pool)
             .await;
+        }
+
+        // Migration: whether a token's `import` submissions are live listens.
+        // FALSE for every existing token, deliberately — an upgrade must not
+        // start forwarding anything that wasn't being forwarded yesterday.
+        if !has_column(&self.pool, "tokens", "imports_are_live").await {
+            info!("⚙️ Migrating: adding tokens.imports_are_live...");
+            let _ =
+                sqlx::query("ALTER TABLE tokens ADD COLUMN imports_are_live BOOLEAN DEFAULT FALSE")
+                    .execute(&self.pool)
+                    .await;
         }
 
         // Migration: a chain's icon. Which setup a listen came out of is the
@@ -6528,13 +6545,24 @@ impl Database {
     pub async fn validate_token(&self, token: &str) -> Result<Option<TokenAuth>, sqlx::Error> {
         let token_hash = Self::hash_token(token);
         let now = Self::now_secs();
-        let row: Option<(i64, String, String, i64, Option<i64>, Option<String>)> = sqlx::query_as(
-            "SELECT u.id, u.username, u.role, t.id, t.default_chain_id, t.scopes
+        let row: Option<(i64, String, String, i64, Option<i64>, Option<String>, Option<bool>)> =
+            sqlx::query_as(
+                "SELECT u.id, u.username, u.role, t.id, t.default_chain_id, t.scopes,
+                        t.imports_are_live
              FROM tokens t JOIN users u ON t.user_id = u.id
              WHERE t.token_hash = ? AND (t.expires_at IS NULL OR t.expires_at > ?) AND u.disabled = 0"
-        ).bind(&token_hash).bind(now).fetch_optional(&self.pool).await?;
+            ).bind(&token_hash).bind(now).fetch_optional(&self.pool).await?;
 
-        if let Some((user_id, username, role, token_id, default_chain_id, scopes)) = row {
+        if let Some((
+            user_id,
+            username,
+            role,
+            token_id,
+            default_chain_id,
+            scopes,
+            imports_are_live,
+        )) = row
+        {
             let _ = sqlx::query("UPDATE tokens SET last_used_at = ? WHERE token_hash = ?")
                 .bind(now)
                 .bind(&token_hash)
@@ -6545,6 +6573,7 @@ impl Database {
                 token_id,
                 default_chain_id,
                 scopes: scopes.unwrap_or_default(),
+                imports_are_live: imports_are_live.unwrap_or(false),
             }))
         } else {
             Ok(None)
@@ -6769,7 +6798,10 @@ impl Database {
             return Ok(false);
         };
 
-        let token = self.create_token(user_id, &client_name, &scopes, default_chain_id).await?;
+        // A paired client starts as a backfill source like any other; the
+        // operator flips it live from Settings once they know what it is.
+        let token =
+            self.create_token(user_id, &client_name, &scopes, default_chain_id, false).await?;
         sqlx::query(
             "UPDATE pairing_requests
                 SET user_id = ?, default_chain_id = ?, token = ?, approved_at = ?
@@ -6829,15 +6861,17 @@ impl Database {
         name: &str,
         scopes: &str,
         default_chain_id: Option<i64>,
+        imports_are_live: bool,
     ) -> Result<String, sqlx::Error> {
         use rand::Rng;
         let raw: [u8; 24] = rand::rng().random();
         let token = format!("td_{}", hex::encode(raw));
         let token_hash = Self::hash_token(&token);
         let now = Self::now_secs();
-        sqlx::query("INSERT INTO tokens (user_id, token_hash, name, scopes, created_at, default_chain_id) VALUES (?, ?, ?, ?, ?, ?)")
+        sqlx::query("INSERT INTO tokens (user_id, token_hash, name, scopes, created_at, default_chain_id, imports_are_live) VALUES (?, ?, ?, ?, ?, ?, ?)")
             .bind(user_id).bind(&token_hash).bind(name).bind(scopes).bind(now)
             .bind(default_chain_id)
+            .bind(imports_are_live)
             .execute(&self.pool).await?;
         info!("🔑 Created token '{}' for user_id {}", name, user_id);
         Ok(token)
@@ -6852,12 +6886,15 @@ impl Database {
         token_id: i64,
         name: &str,
         default_chain_id: Option<i64>,
+        imports_are_live: bool,
     ) -> Result<bool, sqlx::Error> {
         let result = sqlx::query(
-            "UPDATE tokens SET name = ?, default_chain_id = ? WHERE id = ? AND user_id = ?",
+            "UPDATE tokens SET name = ?, default_chain_id = ?, imports_are_live = ?
+             WHERE id = ? AND user_id = ?",
         )
         .bind(name)
         .bind(default_chain_id)
+        .bind(imports_are_live)
         .bind(token_id)
         .bind(user_id)
         .execute(&self.pool)
@@ -6913,7 +6950,7 @@ impl Database {
     pub async fn list_tokens(&self, user_id: i64) -> Result<Vec<TokenRecord>, sqlx::Error> {
         sqlx::query_as(
             "SELECT t.id, t.name, t.scopes, t.created_at, t.last_used_at, t.default_chain_id,
-                    c.name AS default_chain_name
+                    t.imports_are_live, c.name AS default_chain_name
              FROM tokens t LEFT JOIN signal_chains c ON c.id = t.default_chain_id
              WHERE t.user_id = ? ORDER BY t.created_at ASC",
         )
@@ -7210,6 +7247,13 @@ pub struct TokenAuth {
     /// tokens existed and, until now, never read — so every token was
     /// effectively `submit`-only by virtue of nothing else accepting one.
     pub scopes: String,
+    /// Whether this client's `listen_type: "import"` means "a live listen,
+    /// batched" rather than "a chunk of history". It is a property of the
+    /// *client*, not of the listen — fooyin hardcodes `import` for every
+    /// scrobble it has ever sent, and nothing in the payload distinguishes that
+    /// from a backfill — so the operator states it once per token, and
+    /// `IMPORT_LIVE_WINDOW_SECS` bounds how far they can be wrong.
+    pub imports_are_live: bool,
 }
 
 impl TokenAuth {
@@ -7253,6 +7297,10 @@ pub struct TokenRecord {
     pub created_at: i64,
     pub last_used_at: Option<i64>,
     pub default_chain_id: Option<i64>,
+    /// Nullable in the column (it was added by migration), but a token that has
+    /// never been told is not live — so it reads as a plain bool out here.
+    #[sqlx(default)]
+    pub imports_are_live: bool,
     /// Joined for display so the token list doesn't need a second round-trip.
     pub default_chain_name: Option<String>,
 }
@@ -7596,10 +7644,10 @@ mod tests {
         let db = testdb().await;
         let uid = db.create_user("ash", None, "pw", "user").await.unwrap();
 
-        let plain = db.create_token(uid, "scrobbler", "submit", None).await.unwrap();
+        let plain = db.create_token(uid, "scrobbler", "submit", None, false).await.unwrap();
         assert!(!db.validate_token(&plain).await.unwrap().unwrap().can_read());
 
-        let reader = db.create_token(uid, "plugin", "submit read", None).await.unwrap();
+        let reader = db.create_token(uid, "plugin", "submit read", None, false).await.unwrap();
         assert!(db.validate_token(&reader).await.unwrap().unwrap().can_read());
     }
 
@@ -7613,30 +7661,31 @@ mod tests {
         let db = testdb().await;
         let uid = db.create_user("ash", None, "pw", "user").await.unwrap();
 
-        let submit = db.create_token(uid, "scrobbler", "submit", None).await.unwrap();
+        let submit = db.create_token(uid, "scrobbler", "submit", None, false).await.unwrap();
         let t = db.validate_token(&submit).await.unwrap().unwrap();
         assert!(!t.can_write(), "submit must not imply write");
         assert!(!t.can_read(), "submit must not imply read");
 
         // read does not carry write...
-        let reader = db.create_token(uid, "plugin", "submit read", None).await.unwrap();
+        let reader = db.create_token(uid, "plugin", "submit read", None, false).await.unwrap();
         let t = db.validate_token(&reader).await.unwrap().unwrap();
         assert!(t.can_read());
         assert!(!t.can_write(), "read must not imply write");
 
         // ...and write does not carry read.
-        let writer = db.create_token(uid, "phone", "submit write", None).await.unwrap();
+        let writer = db.create_token(uid, "phone", "submit write", None, false).await.unwrap();
         let t = db.validate_token(&writer).await.unwrap().unwrap();
         assert!(t.can_write());
         assert!(!t.can_read(), "write must not imply read");
 
         // `all` is the one grant that covers both.
-        let every = db.create_token(uid, "trusted", "all", None).await.unwrap();
+        let every = db.create_token(uid, "trusted", "all", None, false).await.unwrap();
         let t = db.validate_token(&every).await.unwrap().unwrap();
         assert!(t.can_read() && t.can_write());
 
         // Substrings must not match: `rewrite` is not `write`.
-        let sneaky = db.create_token(uid, "odd", "submit rewrite readonly", None).await.unwrap();
+        let sneaky =
+            db.create_token(uid, "odd", "submit rewrite readonly", None, false).await.unwrap();
         let t = db.validate_token(&sneaky).await.unwrap().unwrap();
         assert!(!t.can_write(), "'rewrite' must not grant write");
         assert!(!t.can_read(), "'readonly' must not grant read");
@@ -8388,20 +8437,57 @@ mod tests {
         let desk = db.create_chain(&mk("Desk")).await.unwrap();
         let couch = db.create_chain(&mk("Couch")).await.unwrap();
 
-        let token = db.create_token(uid, "fooyin", "submit", Some(desk)).await.unwrap();
+        let token = db.create_token(uid, "fooyin", "submit", Some(desk), false).await.unwrap();
         assert_eq!(db.validate_token(&token).await.unwrap().unwrap().default_chain_id, Some(desk));
 
         let id = db.list_tokens(uid).await.unwrap()[0].id;
-        assert!(db.update_token(uid, id, "fooyin", Some(couch)).await.unwrap());
+        assert!(db.update_token(uid, id, "fooyin", Some(couch), false).await.unwrap());
         // Same token string, new chain — nothing to re-paste into the client.
         assert_eq!(db.validate_token(&token).await.unwrap().unwrap().default_chain_id, Some(couch));
 
-        assert!(db.update_token(uid, id, "fooyin", None).await.unwrap());
+        assert!(db.update_token(uid, id, "fooyin", None, false).await.unwrap());
         assert_eq!(db.validate_token(&token).await.unwrap().unwrap().default_chain_id, None);
 
         // Someone else's token id is not editable.
         let other = db.create_user("frank", None, "x", "user").await.unwrap();
-        assert!(!db.update_token(other, id, "stolen", Some(desk)).await.unwrap());
+        assert!(!db.update_token(other, id, "stolen", Some(desk), false).await.unwrap());
+    }
+
+    /// The relay switch has to survive the round trip, and — the half worth
+    /// pinning — must be **off** for a token created without mentioning it.
+    /// Every token that existed before this column did reads as not-live, which
+    /// is what stops an upgrade forwarding anything it wasn't forwarding
+    /// yesterday. The rail that bounds it lives in `ingest::import_is_live`.
+    #[tokio::test]
+    async fn a_token_relays_imports_only_once_it_is_told_to() {
+        let db = testdb().await;
+        let uid = db.create_user("gina", None, "x", "user").await.unwrap();
+
+        let quiet = db.create_token(uid, "some plugin", "submit", None, false).await.unwrap();
+        assert!(!db.validate_token(&quiet).await.unwrap().unwrap().imports_are_live);
+
+        let live = db.create_token(uid, "fooyin", "submit", None, true).await.unwrap();
+        assert!(db.validate_token(&live).await.unwrap().unwrap().imports_are_live);
+
+        // Flipped after the fact, without re-issuing — the whole point of
+        // editing a token in place rather than minting a new one.
+        let id =
+            db.list_tokens(uid).await.unwrap().iter().find(|t| t.name == "some plugin").unwrap().id;
+        assert!(db.update_token(uid, id, "some plugin", None, true).await.unwrap());
+        assert!(db.validate_token(&quiet).await.unwrap().unwrap().imports_are_live);
+        assert!(
+            db.list_tokens(uid)
+                .await
+                .unwrap()
+                .iter()
+                .find(|t| t.id == id)
+                .unwrap()
+                .imports_are_live
+        );
+
+        // And back off again.
+        assert!(db.update_token(uid, id, "some plugin", None, false).await.unwrap());
+        assert!(!db.validate_token(&quiet).await.unwrap().unwrap().imports_are_live);
     }
 
     #[tokio::test]
@@ -8409,7 +8495,7 @@ mod tests {
         let db = testdb().await;
         let hash = Database::hash_password("password123").unwrap();
         let uid = db.create_user("carol", None, &hash, "user").await.unwrap();
-        let token = db.create_token(uid, "t", "submit", None).await.unwrap();
+        let token = db.create_token(uid, "t", "submit", None, false).await.unwrap();
         let session = db.create_web_session(uid).await.unwrap();
 
         // enabled: all three work
@@ -8452,7 +8538,7 @@ mod tests {
         )
         .await
         .unwrap();
-        db.create_token(uid, "t", "submit", None).await.unwrap();
+        db.create_token(uid, "t", "submit", None, false).await.unwrap();
         // A connection has an FK to users — deletion must clear it, or the whole
         // cascade rolls back (the bug this guards against).
         db.set_connection(uid, "listenbrainz", r#"{"token":"secret"}"#, Some("dave"))

@@ -42,7 +42,18 @@ pub struct AdditionalInfo {
     /// some clients use `track_number`. A mismatch here is silent — the number
     /// simply goes missing, taking album-playthrough analytics and `[[track:3]]`
     /// with it — so accept both spellings.
-    #[serde(alias = "tracknumber", alias = "trackNumber")]
+    ///
+    /// It also arrives as a **string** as often as a number: `additional_info`
+    /// is free-form in ListenBrainz and a tag read straight off a file is text
+    /// (fooyin sends `"tracknumber": "3"`, and vinyl-style `"A1"` exists too).
+    /// A bare `Option<i32>` failed the whole body rather than this one field —
+    /// serde has no per-field recovery, so axum's `Json` extractor rejected the
+    /// request with a 422 before `submit_listens` ran and *every* listen in the
+    /// batch was lost, with no `rejected` entry to say why. That is why this is
+    /// hand-deserialised: an unusable track number must cost the track number,
+    /// never the listen.
+    #[serde(default, alias = "tracknumber", alias = "trackNumber")]
+    #[serde(deserialize_with = "lenient_track_number")]
     pub track_number: Option<i32>,
     /// The client reporting that this track was skipped rather than played
     /// through. `scrobbles.skipped` has existed since Phase 2 but only Rockbox
@@ -52,11 +63,58 @@ pub struct AdditionalInfo {
     #[serde(default)]
     pub skipped: Option<bool>,
 
+    /// MBIDs as a *submitting* client sends them. `mbid_mapping` is the shape
+    /// ListenBrainz **returns** — it's what the export carries, which is why
+    /// `import.rs` reads it — but on the way in the spec puts these in
+    /// `additional_info`, and that is where every real client (fooyin, Pano,
+    /// multi-scrobbler) writes them. Reading only `mbid_mapping` meant a client
+    /// that had already done the identification paid for a rate-limited
+    /// MusicBrainz lookup anyway, and nothing errored to say so. `openapi.yaml`
+    /// has documented these as read since v0.39.0; now they are.
+    pub recording_mbid: Option<String>,
+    pub release_mbid: Option<String>,
+    pub release_group_mbid: Option<String>,
+    pub artist_mbids: Option<Vec<String>>,
+
     // ── Tapedeck extensions ──
     pub tapedeck_audio: Option<TapedeckAudio>,
     pub tapedeck_device: Option<TapedeckDevice>,
     pub tapedeck_chain: Option<TapedeckChain>,
     pub tapedeck_session: Option<TapedeckSession>,
+}
+
+/// Accepts whatever a client put in `tracknumber` and yields a number or
+/// nothing — never an error. See the field's own note for why an error here is
+/// unaffordable.
+///
+/// `1/12` is a real tag spelling (the disc's total rides along in the same
+/// string), so the part before the slash is taken. `A1` deliberately does not
+/// parse: a vinyl side letter is a *position*, not an index into the release,
+/// and guessing `1` from it would put every side's opener at track one.
+fn lenient_track_number<'de, D>(deserializer: D) -> Result<Option<i32>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Field {
+        Int(i64),
+        Str(String),
+        /// Anything else at all — a float, a bool, an object. Swallowed rather
+        /// than failed, which is the whole point of this function.
+        Other(serde::de::IgnoredAny),
+    }
+
+    Ok(match Option::<Field>::deserialize(deserializer)? {
+        Some(Field::Int(n)) => i32::try_from(n).ok(),
+        Some(Field::Str(s)) => {
+            let s = s.trim();
+            let head = s.split('/').next().unwrap_or(s).trim();
+            head.parse::<i32>().ok()
+        }
+        Some(Field::Other(_)) | None => None,
+    }
+    .filter(|n| *n > 0))
 }
 
 #[derive(Debug, Deserialize)]
@@ -191,4 +249,99 @@ pub struct DryRunListen {
 pub struct ErrorResponse {
     pub code: u16,
     pub error: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The body fooyin's ListenBrainz service actually sends, reduced to the
+    /// fields that decide whether it deserialises. Its `tracknumber` is a
+    /// `QString` — so this arrived as a *string*, the whole body failed, axum
+    /// answered 422 before any handler ran, and every listen in the batch was
+    /// dropped with nothing in `rejected` to explain it. The connection test
+    /// passed throughout, because `validate-token` parses no body.
+    #[test]
+    fn a_client_sending_a_string_track_number_still_submits_its_listens() {
+        let body = r#"{
+          "listen_type": "import",
+          "token": "tapedeck-token",
+          "payload": [{
+            "listened_at": 1754000000,
+            "track_metadata": {
+              "artist_name": "Aphex Twin",
+              "track_name": "Xtal",
+              "release_name": "Selected Ambient Works 85-92",
+              "additional_info": {
+                "duration_ms": 294000,
+                "tracknumber": "1",
+                "recording_mbid": "2f3f0b3f-9d1a-4f9a-8d3e-1c0b5b6a7c8d",
+                "release_mbid": "3a4b5c6d-7e8f-4a0b-9c1d-2e3f4a5b6c7d",
+                "media_player": "fooyin",
+                "submission_client": "fooyin"
+              }
+            }
+          }]
+        }"#;
+
+        let req: SubmitListensRequest = serde_json::from_str(body).expect("fooyin body must parse");
+        assert_eq!(req.listen_type, ListenType::Import);
+
+        let info = req.payload[0].track_metadata.additional_info.as_ref().unwrap();
+        assert_eq!(info.track_number, Some(1));
+        // The other half of the same submission: a client that has already
+        // identified the recording must not be charged a MusicBrainz lookup for
+        // it. These live in `additional_info`, not in `mbid_mapping`.
+        assert_eq!(info.recording_mbid.as_deref(), Some("2f3f0b3f-9d1a-4f9a-8d3e-1c0b5b6a7c8d"));
+        assert_eq!(info.release_mbid.as_deref(), Some("3a4b5c6d-7e8f-4a0b-9c1d-2e3f4a5b6c7d"));
+    }
+
+    /// Every other spelling a tag can carry. The rule is that an unusable track
+    /// number costs the track number and never the listen, so none of these may
+    /// return an error.
+    #[test]
+    fn an_unusable_track_number_costs_the_track_number_and_not_the_listen() {
+        fn parse(raw: &str) -> Option<i32> {
+            let body = format!(
+                r#"{{"artist_name":"A","track_name":"T","additional_info":{{"tracknumber":{raw}}}}}"#
+            );
+            serde_json::from_str::<TrackMetadata>(&body)
+                .expect("a bad track number must never fail the listen")
+                .additional_info
+                .unwrap()
+                .track_number
+        }
+
+        assert_eq!(parse("3"), Some(3));
+        assert_eq!(parse(r#""3""#), Some(3));
+        assert_eq!(parse(r#""  3 ""#), Some(3));
+        // `1/12` carries the disc's total in the same string.
+        assert_eq!(parse(r#""1/12""#), Some(1));
+        // A vinyl side letter is a position, not an index into the release —
+        // reading `1` out of it would put every side's opener at track one.
+        assert_eq!(parse(r#""A1""#), None);
+        assert_eq!(parse(r#""""#), None);
+        assert_eq!(parse("null"), None);
+        assert_eq!(parse("0"), None);
+        assert_eq!(parse("-2"), None);
+        assert_eq!(parse("1.5"), None);
+        assert_eq!(parse("true"), None);
+        assert_eq!(parse(r#"{"n":1}"#), None);
+        // Out of range for i32 rather than malformed — still not worth the batch.
+        assert_eq!(parse("99999999999999"), None);
+    }
+
+    /// `mbid_mapping` is the read-side shape and still has to work: an LB export
+    /// replayed through this endpoint carries one.
+    #[test]
+    fn the_read_side_mbid_mapping_is_still_accepted() {
+        let body = r#"{
+          "artist_name": "A", "track_name": "T",
+          "mbid_mapping": { "recording_mbid": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee", "caa_id": 42 }
+        }"#;
+        let meta: TrackMetadata = serde_json::from_str(body).unwrap();
+        let m = meta.mbid_mapping.unwrap();
+        assert_eq!(m.recording_mbid.as_deref(), Some("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"));
+        assert_eq!(m.caa_id, Some(42));
+    }
 }

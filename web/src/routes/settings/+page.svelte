@@ -47,6 +47,7 @@
 	// business enumerating your gear.
 	let newTokenRead = false;
 	let newTokenWrite = false;
+	let newTokenLiveImports = false;
 
 	// ── Pairing a device ──
 	// For clients with no browser: they show a code, you type it here.
@@ -639,13 +640,15 @@
 		try {
 			const result = await api.createToken(newTokenName.trim(), {
 				scopes: ['submit', newTokenRead && 'read', newTokenWrite && 'write'].filter(Boolean).join(' '),
-				default_chain_id: newTokenChain ? Number(newTokenChain) : null
+				default_chain_id: newTokenChain ? Number(newTokenChain) : null,
+				imports_are_live: newTokenLiveImports
 			});
 			createdToken = result.token;
 			newTokenName = '';
 			newTokenChain = '';
 			newTokenRead = false;
 			newTokenWrite = false;
+			newTokenLiveImports = false;
 			tokens = (await api.getTokens()).tokens;
 		} catch (e) { console.error('Create token failed:', e); }
 		creating = false;
@@ -662,6 +665,19 @@
 		} catch (e) {
 			tokens = tokens.map((x) => (x.id === t.id ? { ...x, default_chain_id: before } : x));
 			alert('Failed to set chain: ' + e);
+		}
+	}
+
+	/** Whether this client's `import` submissions are relayed onward. Optimistic
+	 *  like the chain picker beside it — the row is the only place it is shown. */
+	async function setTokenLiveImports(t: TokenInfo, value: boolean) {
+		const before = t.imports_are_live;
+		tokens = tokens.map((x) => (x.id === t.id ? { ...x, imports_are_live: value } : x));
+		try {
+			await api.updateToken(t.id, { imports_are_live: value });
+		} catch (e) {
+			tokens = tokens.map((x) => (x.id === t.id ? { ...x, imports_are_live: before } : x));
+			alert('Failed to change forwarding: ' + e);
 		}
 	}
 
@@ -1042,6 +1058,10 @@
 										<option value="">— no chain —</option>
 										{#each chains as c}<option value={c.id}>{c.name}</option>{/each}
 									</select>
+									<label style="display:flex;align-items:center;gap:7px;font-size:12.5px;color:var(--td-muted);white-space:nowrap;" title="Some players send every scrobble as listen_type: import. Tick this if this client's listens should be forwarded on to Last.fm and ListenBrainz.">
+										<input type="checkbox" checked={t.imports_are_live} on:change={(e) => setTokenLiveImports(t, e.currentTarget.checked)} style="width:16px;height:16px;accent-color:var(--td-accent);cursor:pointer;">
+										Relay listens
+									</label>
 									<button class="btn btn-secondary" style="font-size:12.5px;" on:click={() => resetToken(t)}>Reset</button>
 									<button class="btn btn-secondary" style="font-size:12.5px;color:#b2622d;" on:click={() => revokeToken(t.id)}>Revoke</button>
 								</div>
@@ -1080,6 +1100,10 @@
 							<input type="checkbox" bind:checked={newTokenWrite} style="width:16px;height:16px;accent-color:var(--td-accent);cursor:pointer;">
 							Allow writing
 						</label>
+						<label style="display:flex;align-items:center;gap:7px;font-size:13px;color:var(--td-muted);white-space:nowrap;">
+							<input type="checkbox" bind:checked={newTokenLiveImports} style="width:16px;height:16px;accent-color:var(--td-accent);cursor:pointer;">
+							Relay listens
+						</label>
 						<button class="btn btn-primary" on:click={createToken} disabled={creating || !newTokenName.trim()}>{creating ? '…' : 'Create'}</button>
 					</div>
 					<p style="font-size:12px;color:var(--td-muted-2);margin:10px 0 0;">
@@ -1087,6 +1111,8 @@
 						A listen that carries its own chain, or arrives through a mapped output, still wins.
 						<br>
 						<strong>Allow reading</strong> additionally lets the app list your chains, devices, gear and what's playing — so it can offer a chain picker instead of asking you to type a name. It can still only read your own data, and can't change anything.
+						<br>
+						<strong>Relay listens</strong> is for players that label every scrobble as an import — fooyin does, and so do others. Tapedeck stores those but doesn't pass them on, because an import normally means a chunk of old history and forwarding that would rewrite your Last.fm. Tick this and the client's listens are forwarded like any other, as long as they happened in the last day; anything older is still stored only, so a genuine backfill from the same app can't overwrite your history. Leave it off for anything importing your past.
 						<br>
 						<strong>Allow writing</strong> lets it edit and delete your listens, and save loves and liner notes. The two are separate grants and neither implies the other, so give an app only what it needs. Neither one reaches your sources, your forwarding connections, an export of your data, or anything under user management — those stay signed-in-browser only. If a device is lost, revoke its token here.
 					</p>

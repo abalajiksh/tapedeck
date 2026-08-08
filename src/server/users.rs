@@ -170,19 +170,20 @@ async fn setup(
     };
 
     // Create a default API token
-    let token = match state.db.create_token(user_id, "default", "submit,read,admin", None).await {
-        Ok(t) => t,
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!(ErrorResponse {
-                    code: 500,
-                    error: format!("Admin created but token failed: {}", e)
-                })),
-            )
-                .into_response()
-        }
-    };
+    let token =
+        match state.db.create_token(user_id, "default", "submit,read,admin", None, false).await {
+            Ok(t) => t,
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!(ErrorResponse {
+                        code: 500,
+                        error: format!("Admin created but token failed: {}", e)
+                    })),
+                )
+                    .into_response()
+            }
+        };
 
     // Log them in (create session)
     let session_token = match state.db.create_web_session(user_id).await {
@@ -411,7 +412,7 @@ async fn create_user(
         }
     };
 
-    let token = match state.db.create_token(user_id, "default", "submit", None).await {
+    let token = match state.db.create_token(user_id, "default", "submit", None, false).await {
         Ok(t) => t,
         Err(e) => {
             return (
@@ -643,6 +644,11 @@ pub struct CreateTokenRequest {
     /// unless the listen carries better evidence. Optional — a token with no
     /// chain behaves exactly as before.
     pub default_chain_id: Option<i64>,
+    /// Whether this client sends `listen_type: "import"` for *live* scrobbles
+    /// rather than for a backfill. Off unless asked for — it is what lets the
+    /// client's listens reach the owner's Last.fm and ListenBrainz.
+    #[serde(default)]
+    pub imports_are_live: bool,
 }
 
 fn default_scopes() -> String {
@@ -689,7 +695,13 @@ async fn create_token(
 
     match state
         .db
-        .create_token(target_user_id, body.name.trim(), &body.scopes, body.default_chain_id)
+        .create_token(
+            target_user_id,
+            body.name.trim(),
+            &body.scopes,
+            body.default_chain_id,
+            body.imports_are_live,
+        )
         .await
     {
         Ok(token) => (
@@ -728,6 +740,11 @@ pub struct UpdateTokenRequest {
     /// tell those apart on a plain `Option`, so this is a nested one.
     #[serde(default, deserialize_with = "double_option")]
     pub default_chain_id: Option<Option<i64>>,
+    /// Absent leaves the setting alone. A plain `Option` is right here — unlike
+    /// `default_chain_id`, a bool has no third "explicitly cleared" state to
+    /// distinguish from absent, so `None` can only mean "not mentioned".
+    #[serde(default)]
+    pub imports_are_live: Option<bool>,
 }
 
 fn double_option<'de, D>(de: D) -> Result<Option<Option<i64>>, D::Error>
@@ -778,6 +795,7 @@ async fn update_token(
         None => existing.name.clone(),
     };
     let chain_id = body.default_chain_id.unwrap_or(existing.default_chain_id);
+    let imports_are_live = body.imports_are_live.unwrap_or(existing.imports_are_live);
 
     if let Some(cid) = chain_id {
         match state.db.get_chain(user.user_id, cid).await {
@@ -786,7 +804,7 @@ async fn update_token(
         }
     }
 
-    match state.db.update_token(user.user_id, token_id, &name, chain_id).await {
+    match state.db.update_token(user.user_id, token_id, &name, chain_id, imports_are_live).await {
         Ok(true) => {
             (StatusCode::OK, Json(serde_json::json!({ "status": "updated" }))).into_response()
         }

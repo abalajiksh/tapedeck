@@ -194,6 +194,10 @@ pub struct IngestAuth {
     /// Which token authenticated, if one did. Sessions are split on it: a
     /// different app almost always means a different setup.
     pub token_id: Option<i64>,
+    /// The operator's standing statement that this client's `import`
+    /// submissions are live listens. **False for a browser session**, which is
+    /// not a scrobble client and has no business relaying a backfill onward.
+    pub imports_are_live: bool,
 }
 
 #[axum::async_trait]
@@ -206,7 +210,12 @@ impl FromRequestParts<Arc<super::AppState>> for IngestAuth {
     ) -> Result<Self, Self::Rejection> {
         // 1. Session cookie (browser).
         if let Some(user) = session_user(parts, state).await {
-            return Ok(IngestAuth { user, token_chain_id: None, token_id: None });
+            return Ok(IngestAuth {
+                user,
+                token_chain_id: None,
+                token_id: None,
+                imports_are_live: false,
+            });
         }
 
         // 2. Authorization: Token (external scrobble clients).
@@ -222,6 +231,7 @@ impl FromRequestParts<Arc<super::AppState>> for IngestAuth {
                     user: t.user,
                     token_chain_id: t.default_chain_id,
                     token_id: Some(t.token_id),
+                    imports_are_live: t.imports_are_live,
                 }),
                 Ok(None) => Err(unauthorized("Invalid token")),
                 Err(e) => {

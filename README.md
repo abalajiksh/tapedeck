@@ -50,6 +50,14 @@ Beyond the LB spec, Tapedeck accepts extended fields for audio quality,
 device identification, signal chain tagging, and session metadata — and reads
 them back in `additional_info`, so a listen round-trips intact.
 
+`additional_info` is free-form in ListenBrainz, and real clients disagree about
+what goes in it, so Tapedeck reads it forgivingly. A track number may be a
+number or a string, `"7"` or `"7/12"`; anything unusable costs the track number
+and never the listen, because a whole batch failing over one cosmetic field is
+the worst possible trade. MusicBrainz IDs are read from where a *submitting*
+client puts them as well as from the `mbid_mapping` an export carries, so a
+client that already identified the recording isn't charged a lookup for it.
+
 ### Adding a listen by hand
 
 Paste one ListenBrainz-shaped listen — or an array, or a whole `submit-listens`
@@ -70,6 +78,16 @@ ever reach accounts the listening user connected themselves — nothing leaks
 between users on a shared instance. Connect nothing and your listens simply stay
 local. Tapedeck ships its own registered Last.fm application key, so there's no
 API registration step.
+
+**Listens marked as an import are stored but not forwarded**, because an import
+normally means a chunk of old history and pushing that onward rewrites a
+permanent public record. Some players label *every* scrobble that way — fooyin
+does — so their listens arrive and go no further, which looks like Tapedeck
+ignoring them. Tick **Relay listens** on that client's token in Settings → API
+Tokens and they are forwarded like any other. Only listens from the last day
+qualify even then, so a genuine backfill from the same app still stays local:
+the setting says how the client labels things, and cannot be used to overwrite
+your history.
 
 ### Signal Chain Intelligence
 
@@ -253,9 +271,14 @@ with:
   renders, with copy-to-clipboard and MusicBrainz links.
 - **Album & artist pages** — aggregations over your own listens, a provider bio
   with its attribution, and a portrait from your library or one you set yourself.
-- **Top Charts** and **Statistics** — timeframe-ranged totals, top artists, and
-  a listening-clock heatmap. First day of the week is a preference (Monday by
-  default; Friday if you think in Last.fm chart weeks).
+- **Top Charts** and **Statistics** — timeframe-ranged totals, top artists,
+  records and tracks side by side, and a listening-clock heatmap. Every figure
+  that is drawn from a narrower population than "everything you played" says
+  so: a lossless share is a fact about the listens whose format is known, and
+  where that is too little of your history the card reports its coverage
+  instead of a number rather than reading as a verdict on your library. First
+  day of the week is a preference (Monday by default; Friday if you think in
+  Last.fm chart weeks).
 - **Search** across everything you've played, resolving to the album or artist
   page rather than a filtered list.
 - **Liner Notes** — write about a track, a record, an artist, or one particular
@@ -265,8 +288,11 @@ with:
 - **Loved** — every heart in one place, across tracks, records and artists.
 - **Reports** — your listening in chapters, one week, month or year at a time.
 - **Rediscovery** — smart collections built from your own history.
-- **Import** — pull from ListenBrainz or Last.fm, upload a `.json`/`.csv` export
-  or a Rockbox `.scrobbler.log` with live progress, or paste a single listen.
+- **Playlist Lab** — build a playlist by sound and habit from a seed you already
+  play, and push it to your own server.
+- **Import** — pull from ListenBrainz or Last.fm, drop in a ListenBrainz or
+  Spotify export `.zip`, upload a `.json`/`.csv` or a Rockbox `.scrobbler.log`
+  with live progress, or paste a single listen.
 - **Genre Map** — your listening placed on Every Noise at Once, with a taste
   trajectory over time and the regions bordering what you already play.
 - **Signal Chains & Equipment**, plus **Settings** — split into sections
@@ -449,6 +475,20 @@ Backfill your history from elsewhere and take it with you:
   `.csv`, or a Rockbox `.scrobbler.log`. Imports run as background jobs, are
   deduplicated against existing listens, and are stored so they are never
   re-forwarded to your scrobble sinks.
+- **Import your Spotify extended streaming history** — the `.zip` from
+  *Download your data*, dropped in whole. Three things in that format are wrong
+  in ways nothing errors on, and Tapedeck corrects all three: its `ts` is when
+  the track **stopped**, so every listen is re-anchored to when it started
+  (importing it raw puts 5% of listens in the wrong hour and breaks dedup
+  against a history you already hold); track lengths are recovered from the
+  plays that ran to the end, filling a duration for ~93% of rows; and Spotify's
+  own `skipped` flag means "didn't reach the end", which over a third of the
+  time is a track you played most of the way through, so disposition is decided
+  by the same threshold every other source uses. Music videos come in with the
+  music; podcasts and audiobooks are dropped and counted rather than silently
+  swallowed. Unlike the ListenBrainz archive this carries no MusicBrainz IDs at
+  all, so a large history has real enrichment work to do afterwards — the
+  Import screen says so rather than letting it look broken.
 - **Export** your entire history as JSON (full dump) or CSV.
 - **Export your liner notes as Markdown** — a folder of one file per note with
   YAML frontmatter, or a single document. Drop it in an Obsidian or Logseq vault
@@ -611,6 +651,19 @@ Lose it and every stored token has to be reconnected.
 4. Token: your `td_xxx` token
 
 This covers all your devices — Walkman, Android phone, desktop Linux via MPRIS.
+
+### Connecting fooyin
+
+1. fooyin → Settings → Integrations → Scrobbling → Services
+2. Add a custom ListenBrainz service
+3. URL: `http://your-server:8080`
+4. Token: your `td_xxx` token
+
+fooyin labels every scrobble it sends as an import, so its listens will arrive
+in Tapedeck but not be forwarded to Last.fm or ListenBrainz until you tick
+**Relay listens** on that token in Settings → API Tokens. Leave it off if
+fooyin is already scrobbling to those services directly, or you'll get each
+listen twice.
 
 ### Managing Users
 
@@ -788,6 +841,9 @@ src/
 ├── notes.rs                 Liner-note shortcodes + Markdown rendering
 ├── openapi.rs               Serves openapi.yaml, plus the router drift test
 ├── rockbox.rs               .scrobbler.log parsing (Audioscrobbler Log 1.1)
+├── spotify.rs               Spotify extended streaming history (pure, tested)
+├── playlist_lab.rs          The ten-axis space a playlist is generated in
+├── playlists.rs             Track matching + the push-to-server target trait
 ├── logging.rs               tracing + file output + live log level
 ├── web_assets.rs            serves the embedded SvelteKit SPA
 ├── engine/
@@ -821,6 +877,8 @@ src/
 │   ├── sessions.rs          Listening sessions: list, merge, split, rebuild
 │   ├── physical.rs          The shelf — records, tapes and discs — and playing one
 │   ├── rediscovery.rs       Smart collections over your own history
+│   ├── playlist_lab.rs      Serves the playlist space for the browser to work in
+│   ├── playlists.rs         Push a generated list to Plex / Jellyfin / Subsonic
 │   ├── reports.rs           Week/month/year chapters, one pass over the history
 │   ├── everynoise.rs        The Every Noise genre map and the genre-map views
 │   ├── pairing.rs           Device-code pairing for browserless clients

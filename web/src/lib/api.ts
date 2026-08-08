@@ -943,6 +943,10 @@ export interface TokenInfo {
 	 *  itself says otherwise. One token per app is the intended use. */
 	default_chain_id: number | null;
 	default_chain_name: string | null;
+	/** Whether this client's `listen_type: "import"` submissions are live
+	 *  listens, and so are forwarded on to Last.fm / ListenBrainz rather than
+	 *  stored only. Some players (fooyin) send `import` for every scrobble. */
+	imports_are_live: boolean;
 }
 
 class TapedeckAPI {
@@ -1511,11 +1515,12 @@ class TapedeckAPI {
 
 	// ── Tokens ──
 	async getTokens(): Promise<{ tokens: TokenInfo[] }> { return this.get('/admin/tokens'); }
-	async createToken(name: string, opts?: { scopes?: string; default_chain_id?: number | null }): Promise<{ token: string; name: string; user_id: number; message: string }> {
+	async createToken(name: string, opts?: { scopes?: string; default_chain_id?: number | null; imports_are_live?: boolean }): Promise<{ token: string; name: string; user_id: number; message: string }> {
 		return this.post('/admin/tokens', {
 			name,
 			scopes: opts?.scopes ?? 'submit',
-			default_chain_id: opts?.default_chain_id ?? null
+			default_chain_id: opts?.default_chain_id ?? null,
+			imports_are_live: opts?.imports_are_live ?? false
 		});
 	}
 	// ── Device-code pairing ──
@@ -1536,7 +1541,7 @@ class TapedeckAPI {
 	}
 
 	/** Rename a token or repoint its chain. The token itself is not re-issued. */
-	async updateToken(id: number, data: { name?: string; default_chain_id?: number | null }): Promise<void> {
+	async updateToken(id: number, data: { name?: string; default_chain_id?: number | null; imports_are_live?: boolean }): Promise<void> {
 		await this.patch(`/admin/tokens/${id}`, data);
 	}
 	async revokeToken(id: number): Promise<void> { await this.del(`/admin/tokens/${id}`); }

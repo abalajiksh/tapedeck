@@ -26,7 +26,7 @@ openapi: 3.1.0
 
 info:
   title: Tapedeck
-  version: 0.48.1
+  version: 0.49.0
   summary: Self-hosted scrobbler and listening journal.
   description: |
     Tapedeck ingests listens, enriches them with MusicBrainz metadata, stores
@@ -375,7 +375,13 @@ components:
                 release_group_mbid: { type: string }
                 artist_mbids: { type: array, items: { type: string } }
                 duration_ms: { type: integer }
-                tracknumber: { type: integer }
+                tracknumber:
+                  type: [integer, string]
+                  description: |
+                    A number, or the string a tag reader hands over — `"7"` and
+                    `"7/12"` both work. Anything that is neither (a vinyl `"A1"`,
+                    a bool, an object) costs the track number only; the listen is
+                    still stored.
                 submission_client: { type: string }
                 tapedeck_chain:
                   type: string
@@ -3688,6 +3694,7 @@ paths:
                         last_used_at: { type: [integer, 'null'] }
                         default_chain_id: { type: [integer, 'null'] }
                         default_chain_name: { type: [string, 'null'] }
+                        imports_are_live: { type: boolean }
         '401': { $ref: '#/components/responses/Unauthorized' }
     post:
       tags: [Admin]
@@ -3712,6 +3719,16 @@ paths:
                   default: submit
                   description: 'Space-separated. `submit`, `read`, `write`, or `all`. None implies another.'
                 default_chain_id: { type: [integer, 'null'] }
+                imports_are_live:
+                  type: boolean
+                  default: false
+                  description: |
+                    Whether this client's `listen_type: "import"` submissions are
+                    live listens rather than a backfill. Some players (fooyin)
+                    label every scrobble `import`; without this their listens are
+                    stored but never forwarded to Last.fm / ListenBrainz. Even
+                    when set, only listens from the last 24h are forwarded, so a
+                    genuine history import from the same client stays local.
       responses:
         '200':
           description: Created.
@@ -3744,6 +3761,9 @@ paths:
               properties:
                 name: { type: string }
                 default_chain_id: { type: [integer, 'null'] }
+                imports_are_live:
+                  type: boolean
+                  description: Absent leaves it alone. See POST for what it does.
       responses:
         '200': { description: Updated., content: { application/json: { schema: { $ref: '#/components/schemas/Ok' } } } }
         '401': { $ref: '#/components/responses/Unauthorized' }
