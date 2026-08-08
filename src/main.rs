@@ -18,6 +18,7 @@ mod rockbox;
 mod server;
 mod sinks;
 mod sources;
+mod spotify;
 mod web_assets;
 
 use std::sync::Arc;

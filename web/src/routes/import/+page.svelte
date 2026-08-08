@@ -109,7 +109,7 @@
 	const tabs: { v: Src; title: string; sub: string }[] = [
 		{ v: 'listenbrainz', title: 'ListenBrainz', sub: 'Pull via username + token' },
 		{ v: 'lastfm', title: 'Last.fm', sub: 'Pull scrobbles by username' },
-		{ v: 'file', title: 'Upload Export', sub: '.zip / .json / .csv / .log' }
+		{ v: 'file', title: 'Upload Export', sub: 'ListenBrainz, Spotify, CSV, Rockbox' }
 	];
 
 	$: running = job?.state === 'running';
@@ -209,9 +209,18 @@
 		<p style="font-size:13px;color:var(--td-muted);margin:0 0 18px;">
 			Drop the <code class="chip">.zip</code> straight from ListenBrainz's “Export your data”
 			— listens <em>and</em> loved tracks come across, with the MusicBrainz IDs already in it, so
-			nothing has to be looked up again. A single <code class="chip">.json</code>/<code class="chip">.jsonl</code>,
+			nothing has to be looked up again. Spotify's <strong>Extended Streaming History</strong>
+			zip works too, and is read as what it is: play lengths recovered from the history itself,
+			anything you barely played filed as a skip, podcasts and audiobooks left out.
+			A single <code class="chip">.json</code>/<code class="chip">.jsonl</code>,
 			a <code class="chip">.csv</code> export, or a Rockbox <code class="chip">.scrobbler.log</code>
 			off your DAP all work too.
+		</p>
+		<p style="font-size:12.5px;color:var(--td-muted-2);margin:-8px 0 18px;">
+			A Spotify export carries no MusicBrainz IDs, so those listens land first and fill in
+			their metadata and artwork slowly afterwards — a large history takes a while to finish
+			enriching. Ask Spotify for it under Privacy Settings → “Extended streaming history”;
+			it arrives by email, and the smaller “Account data” download is <em>not</em> the same file.
 		</p>
 		<label style="display:flex;flex-direction:column;align-items:center;justify-content:center;gap:10px;border:2px dashed rgba(198,113,57,.4);border-radius:18px;padding:34px;cursor:pointer;background:var(--td-surface2);max-width:440px;">
 			<svg viewBox="0 0 24 24" width="30" fill="none" stroke="#c67139" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 16V4"/><path d="M8 8l4-4 4 4"/><path d="M4 20h16"/></svg>

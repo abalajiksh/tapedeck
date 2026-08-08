@@ -449,6 +449,7 @@ impl Database {
                 skipped BOOLEAN NOT NULL DEFAULT FALSE,
                 artwork_url TEXT,
                 source_ref INTEGER,
+                spotify_track_id TEXT,
                 UNIQUE(user_id, source_id, source_name)
             )",
         )
@@ -1082,6 +1083,17 @@ impl Database {
             )
             .execute(&self.pool)
             .await;
+        }
+
+        // Migration: the Spotify track id a listen came in with. Written only by
+        // the Spotify export importer, and read by nothing yet — it is kept
+        // because it is the single external identifier that export carries, and
+        // re-deriving it later would mean asking the user for the zip again.
+        if !has_column(&self.pool, "scrobbles", "spotify_track_id").await {
+            info!("⚙️ Migrating: adding scrobbles.spotify_track_id...");
+            let _ = sqlx::query("ALTER TABLE scrobbles ADD COLUMN spotify_track_id TEXT")
+                .execute(&self.pool)
+                .await;
         }
 
         // Migration: per-source options (library/device filters). `user_sources`
@@ -3410,6 +3422,21 @@ impl Database {
         play: &Play,
         skipped: bool,
     ) -> Result<bool, sqlx::Error> {
+        self.import_listen_detailed(user_id, play, skipped, ImportProvenance::default()).await
+    }
+
+    /// Import a listen, keeping what the export knew about *where* it happened.
+    ///
+    /// Additive over `import_listen_flagged`: every field here is something one
+    /// export format carries and the others don't, so the plain call stays the
+    /// one to use unless you have something to put in these.
+    pub async fn import_listen_detailed(
+        &self,
+        user_id: i64,
+        play: &Play,
+        skipped: bool,
+        provenance: ImportProvenance,
+    ) -> Result<bool, sqlx::Error> {
         if self.exists(user_id, &play.source_id, &play.source_name).await? {
             return Ok(false);
         }
@@ -3422,8 +3449,8 @@ impl Database {
             "INSERT INTO scrobbles (
                 user_id, title, artist, album, timestamp, duration, source_id, source_name, status,
                 mbid_recording, mbid_release, mbid_artist, caa_id, caa_release_mbid,
-                submission_client, track_number, skipped
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'imported', ?, ?, ?, ?, ?, 'import', ?, ?)",
+                submission_client, track_number, skipped, spotify_track_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'imported', ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(user_id)
         .bind(&play.title)
@@ -3438,8 +3465,10 @@ impl Database {
         .bind(&mbid_artist_json)
         .bind(play.caa_id)
         .bind(&play.caa_release_mbid)
+        .bind(provenance.submission_client.as_deref().unwrap_or("import"))
         .bind(play.track_number)
         .bind(skipped)
+        .bind(&provenance.spotify_track_id)
         .execute(&self.pool)
         .await?;
         Ok(true)

@@ -129,6 +129,26 @@ impl ListenDisposition {
     }
 }
 
+/// What an import knew about a listen beyond the listen itself.
+///
+/// Every field is something one export format carries and the others do not, so
+/// this is `Default` and the plain import path fills in none of it. Separate
+/// from `ListenDisposition` on purpose: that struct decides whether a row is
+/// ever forwarded, which is a safety question, and burying provenance in it
+/// would make a field with no consequences share a home with fields that have
+/// permanent ones.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ImportProvenance {
+    /// The app the listen was played in, when the export names it. Falls back
+    /// to `"import"` — what every imported row said before this existed.
+    pub submission_client: Option<String>,
+    /// The bare Spotify track id (no `spotify:track:` prefix), from a Spotify
+    /// Extended Streaming History export. Nothing reads it yet; it is stored
+    /// because it is the only external identifier that export carries and the
+    /// alternative to keeping it is asking for the zip a second time.
+    pub spotify_track_id: Option<String>,
+}
+
 impl AudioQuality {
     /// Note what is deliberately *not* in here: `dsd_to_pcm_converted` and
     /// `source_quality`. Both are stored and both are worth seeing, but the

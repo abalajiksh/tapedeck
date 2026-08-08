@@ -26,7 +26,7 @@ openapi: 3.1.0
 
 info:
   title: Tapedeck
-  version: 0.47.0
+  version: 0.48.0
   summary: Self-hosted scrobbler and listening journal.
   description: |
     Tapedeck ingests listens, enriches them with MusicBrainz metadata, stores
@@ -3313,11 +3313,23 @@ paths:
       description: |
         Session-only. Sniffs the **content**, not the filename — people rename
         downloads. Accepts a ListenBrainz export zip (JSONL, and its
-        `feedback.jsonl` becomes loves), a CSV, or a Rockbox `.scrobbler.log`.
+        `feedback.jsonl` becomes loves), a Spotify Extended Streaming History
+        zip, a CSV, or a Rockbox `.scrobbler.log`. The two zip formats are told
+        apart by their entry names, since both are plain zips.
 
         A ListenBrainz export carries a full `mbid_mapping`, so those listens
         skip MusicBrainz enrichment *and* the artwork chain — for a 20k history
         that is the difference between free and a week of rate-limited lookups.
+        A Spotify export carries no MusicBrainz identifiers at all, so the
+        opposite is true and every distinct track needs a lookup afterwards.
+
+        **A Spotify export's `ts` is when the track stopped**, not when it
+        started, so it is corrected on the way in; each play is filed as a
+        listen or a skip on the same half-the-track threshold the live sources
+        use, rather than on Spotify's own `skipped` field, which records
+        something else. Podcast episodes and audiobook chapters are dropped.
+        Those listens keep `spotify_track_id` and land with `source_name`
+        `spotify`.
 
         **Rockbox `#TZ/UNKNOWN` is refused, not guessed.** DAPs often have no
         time sync, so their timestamps are local wall-clock seconds; assuming

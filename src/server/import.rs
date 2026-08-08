@@ -553,8 +553,8 @@ async fn run_lastfm(
     Ok(())
 }
 
-/// Parse an uploaded backup: a ListenBrainz export (`.zip` or a single
-/// `.json`/`.jsonl`), our own CSV, or a Rockbox `.scrobbler.log`.
+/// Parse an uploaded backup: a ListenBrainz or Spotify export (`.zip` or a
+/// single `.json`/`.jsonl`), our own CSV, or a Rockbox `.scrobbler.log`.
 async fn run_file(
     reg: &ImportRegistry,
     id: &str,
@@ -567,7 +567,16 @@ async fn run_file(
     // Sniff the archive by its magic bytes rather than the filename: people
     // rename downloads, and a mislabelled `.json` that is really a zip should
     // still import rather than fail on the first byte.
+    //
+    // Two archive formats arrive here now, and they are told apart by what is
+    // *inside* rather than by a second magic number — both are plain zips. A
+    // Spotify export is unmistakable from its entry names alone, so that check
+    // is cheap and needs no decompression.
     if bytes.starts_with(b"PK\x03\x04") {
+        let names = zip_entry_names(bytes)?;
+        if crate::spotify::looks_like_export(&names) {
+            return run_spotify_archive(reg, id, db, uid, bytes).await;
+        }
         return run_listenbrainz_archive(reg, id, db, uid, bytes).await;
     }
 
@@ -593,6 +602,132 @@ async fn run_file(
     update(reg, id, |j| {
         j.state = "done".into();
         j.status = format!("Imported {} new listens", j.imported);
+    });
+    Ok(())
+}
+
+/// The entry names of a zip, without decompressing anything.
+///
+/// Used only to decide which archive parser to route to — the central directory
+/// carries the names, so this reads no member bodies.
+fn zip_entry_names(bytes: &[u8]) -> Result<Vec<String>, String> {
+    let reader = std::io::Cursor::new(bytes);
+    let zip = zip::ZipArchive::new(reader).map_err(|e| format!("Unreadable zip: {e}"))?;
+    Ok(zip.file_names().map(str::to_string).collect())
+}
+
+/// A Spotify "Extended Streaming History" archive.
+///
+/// Everything that makes this format treacherous — `ts` being an *end* time,
+/// the track-length table hiding in the `trackdone` rows, Spotify's `skipped`
+/// meaning something other than ours — lives in `crate::spotify`, which is pure
+/// and tested. This half does the walking and the inserting.
+///
+/// The opposite of the ListenBrainz archive in one respect worth knowing: those
+/// listens arrive with MBIDs and cover art and cost nothing afterwards, while
+/// these carry no MusicBrainz identifiers at all, so every distinct track here
+/// is a rate-limited lookup for the enrichment backfill to work through later.
+async fn run_spotify_archive(
+    reg: &ImportRegistry,
+    id: &str,
+    db: &Database,
+    uid: i64,
+    bytes: &[u8],
+) -> Result<(), String> {
+    use std::io::Read;
+
+    let reader = std::io::Cursor::new(bytes);
+    let mut zip = zip::ZipArchive::new(reader).map_err(|e| format!("Unreadable zip: {e}"))?;
+
+    // Read every history file before parsing any of it: the duration table is
+    // built across the whole export, so a track played to the end once in 2023
+    // gives its length to a truncated play of it in 2025.
+    let mut files: Vec<String> = Vec::new();
+    for i in 0..zip.len() {
+        let mut entry = zip.by_index(i).map_err(|e| format!("Unreadable zip entry: {e}"))?;
+        if !entry.is_file() {
+            continue;
+        }
+        let path = entry.name().to_string();
+        // macOS zips carry a __MACOSX shadow tree of AppleDouble files.
+        if path.starts_with("__MACOSX/") || path.contains("/.") || path.starts_with('.') {
+            continue;
+        }
+        if !crate::spotify::is_history_file(&path) {
+            continue;
+        }
+        let mut text = String::new();
+        entry.read_to_string(&mut text).map_err(|e| format!("Could not read {path}: {e}"))?;
+        files.push(text);
+    }
+
+    update(reg, id, |j| j.status = "Reading the export…".into());
+    let parsed = crate::spotify::parse(&files);
+
+    if parsed.entries.is_empty() {
+        return Err("No music listens found in that archive — is it a Spotify \
+                    Extended Streaming History export?"
+            .into());
+    }
+
+    update(reg, id, |j| j.total = Some(parsed.entries.len()));
+
+    let mut skips = 0usize;
+    for e in &parsed.entries {
+        let mut p = play(e.timestamp, e.title.clone(), e.artist.clone(), e.album.clone(), None);
+        // Stable and unique per play. The track id alone would collide on every
+        // repeat, and the timestamp alone on anything played simultaneously on
+        // two devices — which this export does contain.
+        p.source_id = format!("spotify-{}-{}", e.track_id, e.timestamp);
+        p.source_name = "spotify".into();
+        p.duration = e.duration;
+
+        let provenance = crate::models::ImportProvenance {
+            // "Spotify (android)" rather than a bare OS name: the row's client
+            // really was Spotify, and the platform is what distinguishes one of
+            // these listens from another.
+            submission_client: Some(match &e.platform {
+                Some(plat) => format!("Spotify ({plat})"),
+                None => "Spotify".into(),
+            }),
+            spotify_track_id: Some(e.track_id.clone()),
+        };
+
+        let inserted = db
+            .import_listen_detailed(uid, &p, e.skipped, provenance)
+            .await
+            .map_err(|e| e.to_string())?;
+        if inserted && e.skipped {
+            skips += 1;
+        }
+        update(reg, id, |j| {
+            j.fetched += 1;
+            // Skips are stored but are not listens, so they don't inflate the
+            // count — same rule as the Rockbox path.
+            if inserted && !e.skipped {
+                j.imported += 1;
+            }
+        });
+    }
+
+    let (non_music, duplicates, malformed) =
+        (parsed.non_music, parsed.duplicates, parsed.malformed);
+    update(reg, id, |j| {
+        j.state = "done".into();
+        let mut parts = vec![format!("Imported {} new listens from Spotify", j.imported)];
+        if skips > 0 {
+            parts.push(format!("{skips} skips recorded"));
+        }
+        if non_music > 0 {
+            parts.push(format!("{non_music} podcast/audiobook plays ignored"));
+        }
+        if duplicates > 0 {
+            parts.push(format!("{duplicates} duplicate rows collapsed"));
+        }
+        if malformed > 0 {
+            parts.push(format!("{malformed} unreadable rows ignored"));
+        }
+        j.status = parts.join(" · ");
     });
     Ok(())
 }

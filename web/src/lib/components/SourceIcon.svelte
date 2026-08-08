@@ -18,11 +18,11 @@
 	export let size = 15;
 
 	// `source_name` is one of: Plex, jellyfin, navidrome, physical, rockbox,
-	// import, or `ingest:<client>`.
+	// import, spotify, or `ingest:<client>`.
 	$: key = (source ?? '').toLowerCase();
 	$: kind = key.startsWith('ingest:')
 		? 'push'
-		: ['plex', 'jellyfin', 'navidrome', 'physical', 'rockbox', 'import'].includes(key)
+		: ['plex', 'jellyfin', 'navidrome', 'physical', 'rockbox', 'import', 'spotify'].includes(key)
 			? key
 			: 'unknown';
 
@@ -35,9 +35,11 @@
 					? 'Imported from a file'
 					: kind === 'rockbox'
 						? 'Rockbox player'
-						: kind === 'unknown'
-							? (source ?? 'Unknown source')
-							: key.charAt(0).toUpperCase() + key.slice(1);
+						: kind === 'spotify'
+							? (client ?? 'Streamed on Spotify')
+							: kind === 'unknown'
+								? (source ?? 'Unknown source')
+								: key.charAt(0).toUpperCase() + key.slice(1);
 
 	const LETTER: Record<string, string> = { plex: 'P', jellyfin: 'J', navidrome: 'N' };
 </script>
@@ -69,6 +71,18 @@
 		<svg viewBox="0 0 16 16" width={size} height={size} fill="none" stroke="currentColor" stroke-width="1.3">
 			<rect x="4" y="1.2" width="8" height="13.6" rx="1.8" />
 			<line x1="6.8" y1="12.4" x2="9.2" y2="12.4" />
+		</svg>
+	{:else if kind === 'spotify'}
+		<!--
+			A cloud, not the Spotify mark: the same rule as the library servers
+			above, and the distinction worth seeing here is that this listen
+			happened on somebody else's server rather than on the shelf or the
+			LAN. The exact service is in the `title`.
+		-->
+		<svg viewBox="0 0 16 16" width={size} height={size} fill="none" stroke="currentColor"
+			stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round">
+			<path d="M4.4 12.4a2.9 2.9 0 0 1-.3-5.8 4 4 0 0 1 7.7-1 3.2 3.2 0 0 1 .5 6.8z" />
+			<path d="M6.3 8.6a4.6 4.6 0 0 1 3.8.6" />
 		</svg>
 	{:else if kind === 'import'}
 		<!-- Into a tray: history that arrived as a file. -->
