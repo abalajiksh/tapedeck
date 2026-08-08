@@ -3505,6 +3505,13 @@ impl Database {
             "SELECT SUM(duration) FROM scrobbles WHERE user_id = ? AND skipped = FALSE AND (? IS NULL OR timestamp >= ?) AND duration IS NOT NULL"
         ).bind(user_id).bind(after).bind(after).fetch_one(&self.pool).await?;
         let hours = secs.0.unwrap_or(0) as f64 / 3600.0;
+        // Hours is a sum over the listens that *have* a length, so it is a floor
+        // rather than a total — a source that reported no duration contributes
+        // nothing and says nothing. Cheaper to state the coverage than to
+        // pretend a listen of unknown length lasted zero seconds.
+        let duration_known: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM scrobbles WHERE user_id = ? AND skipped = FALSE AND (? IS NULL OR timestamp >= ?) AND duration IS NOT NULL"
+        ).bind(user_id).bind(after).bind(after).fetch_one(&self.pool).await?;
 
         let artists: (i64,) = sqlx::query_as(
             "SELECT COUNT(DISTINCT artist) FROM scrobbles WHERE user_id = ? AND skipped = FALSE AND (? IS NULL OR timestamp >= ?)"
@@ -3517,6 +3524,11 @@ impl Database {
         ).bind(user_id).bind(after).bind(after).fetch_one(&self.pool).await?;
         let avg_quality: (Option<f64>,) = sqlx::query_as(
             "SELECT AVG(quality_score) FROM scrobbles WHERE user_id = ? AND skipped = FALSE AND (? IS NULL OR timestamp >= ?) AND quality_score IS NOT NULL"
+        ).bind(user_id).bind(after).bind(after).fetch_one(&self.pool).await?;
+        // The average's own denominator. Paired counts must share a population,
+        // and this one is *not* `total` — see `quality_known` in the payload.
+        let quality_known: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM scrobbles WHERE user_id = ? AND skipped = FALSE AND (? IS NULL OR timestamp >= ?) AND quality_score IS NOT NULL"
         ).bind(user_id).bind(after).bind(after).fetch_one(&self.pool).await?;
         let lossless: (i64,) = sqlx::query_as(
             "SELECT COUNT(*) FROM scrobbles WHERE user_id = ? AND skipped = FALSE AND (? IS NULL OR timestamp >= ?) AND is_lossless = TRUE"
@@ -3534,6 +3546,52 @@ impl Database {
         .bind(after)
         .fetch_one(&self.pool)
         .await?;
+        // ── The four "shape of the listening" figures ──
+        //
+        // Deliberately *not* filtered to `skipped = FALSE`: this is the one
+        // query in the file whose whole subject is the skips. Everything that
+        // counts listens still filters them out, and `plays` above already did.
+        let skips: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM scrobbles WHERE user_id = ? AND skipped = TRUE AND (? IS NULL OR timestamp >= ?)"
+        ).bind(user_id).bind(after).bind(after).fetch_one(&self.pool).await?;
+
+        // "Since" is a fact about the whole history and is therefore *not*
+        // ranged — asking it of a one-week window would answer with the start
+        // of that window, which is a restatement of the control rather than an
+        // answer. Skips are excluded: the first thing you skipped past is not
+        // the day you started listening.
+        let first_listen: (Option<i64>,) = sqlx::query_as(
+            "SELECT MIN(timestamp) FROM scrobbles WHERE user_id = ? AND skipped = FALSE",
+        )
+        .bind(user_id)
+        .fetch_one(&self.pool)
+        .await?;
+
+        let loves: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM loves WHERE user_id = ?")
+            .bind(user_id)
+            .fetch_one(&self.pool)
+            .await?;
+
+        // Plays per **calendar** day, not per day you happened to listen — 846
+        // plays over five active days reads as 169/day when the month's real
+        // rate is 27. Same trap `reports::avg_daily` documents.
+        //
+        // `range_after` builds rolling windows (`now - 7 days`) rather than
+        // calendar periods, so the span is simply how far back `after` reaches;
+        // all-time measures from the first listen. Both are clamped to at least
+        // a day, or a history a few hours old divides by nearly zero and
+        // reports a spectacular rate.
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let span_secs = match after {
+            Some(a) => now - a,
+            None => first_listen.0.map(|f| now - f).unwrap_or(0),
+        };
+        let days = (span_secs as f64 / 86_400.0).max(1.0);
+        let per_day = if total > 0 { (total as f64 / days * 10.0).round() / 10.0 } else { 0.0 };
+
         let pct = |n: i64| {
             if total > 0 {
                 (n as f64 / total as f64 * 100.0).round() as i64
@@ -3712,11 +3770,25 @@ impl Database {
         Ok(serde_json::json!({
             "totals": {
                 "plays": total, "hours": (hours * 10.0).round() / 10.0,
+                // What that sum is over. A listen with no reported length adds
+                // nothing to it, so the figure is a floor.
+                "duration_known": duration_known.0,
                 "artists": artists.0, "albums": albums.0, "tracks": tracks.0,
                 "avg_quality": avg_quality.0.map(|q| (q * 10.0).round() / 10.0).unwrap_or(0.0),
+                // How many listens that average is actually over. `compute_score`
+                // only runs at ingest and in the Plex/Jellyfin sources, so an
+                // imported listen has no score — the average has the same narrow
+                // population the fidelity shares do, and the card must say so
+                // rather than presenting a figure drawn from 5% of a history as
+                // a fact about all of it.
+                "quality_known": quality_known.0,
                 "lossless_pct": fpct(lossless.0), "dsd_pct": fpct(dsd.0),
                 // The two shares above are of this, not of `plays`.
                 "fidelity_known": fidelity_known.0,
+                "skips": skips.0,
+                "per_day": per_day,
+                "first_listen": first_listen.0,
+                "loves": loves.0,
             },
             "top_artists": top_artists,
             "top_albums": top_albums,
@@ -7324,6 +7396,90 @@ mod tests {
         assert_eq!(art_total, 1, "artwork coverage counts only real listens");
         let (lang_total, _) = db.language_coverage().await.unwrap();
         assert_eq!(lang_total, 1, "language coverage counts only what the backfill will process");
+    }
+
+    /// The Statistics row's four "shape" figures, and the two rules that make
+    /// them mean anything.
+    ///
+    /// `skips` is the one query in this file that deliberately counts skipped
+    /// rows, sitting beside a dozen that must not — so it is exactly the shape
+    /// of query that gets "fixed" by someone adding the usual filter.
+    ///
+    /// `per_day` divides by **calendar** days rather than by days that saw a
+    /// listen. Written the obvious way, a burst of listening in one afternoon
+    /// reports the afternoon's rate as the year's.
+    #[tokio::test]
+    async fn the_shape_figures_count_the_right_populations() {
+        let db = testdb().await;
+        let uid = db.create_user("ash", None, "pw", "user").await.unwrap();
+        let now = Database::now_secs();
+
+        // Ten listens and four skips, all inside one hour a fortnight ago —
+        // a burst, so "per active day" and "per calendar day" disagree loudly.
+        for i in 0..10i64 {
+            let mut p = play(&format!("Track {i}"), "Real Artist", (now - 14 * 86_400 + i) as u64);
+            p.duration = Some(200);
+            p.source_id = format!("listen-{i}");
+            db.save_scrobble(uid, &p, None, None, None, None, None, None, ListenDisposition::LIVE)
+                .await
+                .unwrap();
+        }
+        for i in 0..4i64 {
+            let mut p =
+                play(&format!("Skipped {i}"), "Other", (now - 14 * 86_400 + 100 + i) as u64);
+            p.duration = Some(200);
+            p.source_id = format!("skip-{i}");
+            db.save_scrobble(
+                uid,
+                &p,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                ListenDisposition { imported: false, skipped: true },
+            )
+            .await
+            .unwrap();
+        }
+
+        let all = db.get_ranged_stats(uid, None, false).await.unwrap();
+        let t = &all["totals"];
+
+        assert_eq!(t["plays"].as_i64(), Some(10), "plays still exclude skips");
+        assert_eq!(t["skips"].as_i64(), Some(4), "skips are counted, not filtered away");
+
+        // The listening spans one hour but the history is a fortnight old, so
+        // the honest rate is ten plays over fourteen days, not over one.
+        let per_day = t["per_day"].as_f64().unwrap();
+        assert!(
+            (0.6..0.8).contains(&per_day),
+            "per_day must divide by calendar days, got {per_day} (10 plays / ~14 days ≈ 0.71)"
+        );
+
+        // "Since" is about the whole history and ignores the range control, or
+        // a one-week view answers with the start of that week.
+        let first = t["first_listen"].as_i64().expect("first_listen");
+        let week = db.get_ranged_stats(uid, Some(now - 7 * 86_400), false).await.unwrap();
+        assert_eq!(
+            week["totals"]["first_listen"].as_i64(),
+            Some(first),
+            "first_listen is not ranged"
+        );
+        assert_eq!(week["totals"]["plays"].as_i64(), Some(0), "the burst is outside this week");
+        assert_eq!(week["totals"]["skips"].as_i64(), Some(0), "and so are its skips");
+
+        // The average quality's denominator, which is the thing the card has to
+        // report. Nothing here carried a quality score, so it is zero — and a
+        // card reading "80.6/100" over zero listens is what this prevents.
+        assert_eq!(t["quality_known"].as_i64(), Some(0));
+
+        assert_eq!(t["loves"].as_i64(), Some(0));
+        let e = db.upsert_entity("recording", "Track 1", "Real Artist", None).await.unwrap();
+        db.set_love(uid, e, true).await.unwrap();
+        let after = db.get_ranged_stats(uid, None, false).await.unwrap();
+        assert_eq!(after["totals"]["loves"].as_i64(), Some(1));
     }
 
     /// Three consecutive plays of one track must store three listens.

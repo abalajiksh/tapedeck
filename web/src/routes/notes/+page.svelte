@@ -62,6 +62,35 @@
 
 	$: filtering = q.trim().length > 0 || kind !== '';
 
+	// ── Loved ──
+	//
+	// This rendered the whole set flat, so at a few hundred loves the panel ran
+	// several times the height of everything beside it and the one you wanted
+	// was somewhere in the middle of it. It is a digest now: eight rows, a box
+	// to find the rest, and "See all" expanding into a list that scrolls
+	// *inside* the panel — the same handoff the Statistics top lists use, so
+	// the page never has to be left to answer "did I love this?".
+	//
+	// Filtering is client-side, unlike the notes search above. That is not an
+	// inconsistency: a note costs four more queries to render so narrowing has
+	// to happen in SQL, while loves are a few hundred rows already in hand.
+	// Same call `/loved` makes.
+	let loveQ = '';
+	let lovesOpen = false;
+	const LOVE_PREVIEW = 8;
+
+	$: lovesFound = (() => {
+		const needle = loveQ.trim().toLowerCase();
+		if (!needle) return loves;
+		return loves.filter((l) =>
+			`${l.entity.name} ${l.entity.artist_name ?? ''}`.toLowerCase().includes(needle)
+		);
+	})();
+	/** Searching implies expanded — hiding matches behind "See all" would make
+	 *  the search look broken for anything past the eighth hit. */
+	$: lovesListing = lovesOpen || loveQ.trim() ? lovesFound : lovesFound.slice(0, LOVE_PREVIEW);
+	$: lovesScrolls = lovesListing.length > LOVE_PREVIEW;
+
 	// ── Editor ──
 	let open: Note | null = null;            // the note being edited, if it exists
 	let target: NoteTarget | null = null;    // what it's about
@@ -361,26 +390,10 @@
 			{/if}
 		</div>
 
-		{#if loves.length}
-			<div class="panel" style="border-radius:22px;padding:20px;">
-				<h3 class="h-display" style="font-size:17px;margin:0 0 12px;">Loved</h3>
-				<div style="display:flex;flex-direction:column;gap:4px;">
-					{#each loves as l (l.entity.id)}
-						{@const e = entityLabel(l.entity)}
-						<button class="note-item" on:click={() => openTarget({ entity_id: l.entity.id })}>
-							<div style="display:flex;align-items:baseline;gap:8px;">
-								<span style="color:#b2622d;">♥</span>
-								<span style="font-size:13.5px;">{e.label}</span>
-								<span style="font-size:11px;color:var(--td-muted-3);">{e.kind}</span>
-							</div>
-						</button>
-					{/each}
-				</div>
-			</div>
-		{/if}
 	</div>
 
-	<!-- Editor -->
+	<!-- Editor, and under it whatever the column has room for. -->
+	<div class="rightcol">
 	<div class="panel" style="border-radius:22px;padding:24px;">
 		{#if composing && !target}
 			<h3 class="h-display" style="font-size:18px;margin:0 0 4px;">What is this about?</h3>
@@ -506,6 +519,64 @@
 			</div>
 		{/if}
 	</div>
+
+	<!-- Loved lives here rather than under the notes list: this column ended
+	     early and left a column of empty page beside a list running off the
+	     bottom of it. When a note is open the editor takes the space above and
+	     this drops below it, which is the right order — in view when you are
+	     looking for something, out of the way when you are writing. -->
+	{#if loves.length}
+		<div class="panel" style="border-radius:22px;padding:20px;">
+			<div style="display:flex;align-items:baseline;justify-content:space-between;gap:8px;margin-bottom:10px;">
+				<h3 class="h-display" style="font-size:17px;margin:0;">Loved</h3>
+				<a class="linkish" style="font-size:11.5px;" href="/loved">Open the shelf →</a>
+			</div>
+
+			<div class="search">
+				<svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor"
+					stroke-width="1.6" stroke-linecap="round" aria-hidden="true">
+					<circle cx="7" cy="7" r="4.5" /><path d="m10.5 10.5 3 3" />
+				</svg>
+				<input class="input" type="search" bind:value={loveQ}
+					placeholder="Find something you loved" aria-label="Search loved" />
+			</div>
+
+			{#if !lovesFound.length}
+				<p style="font-size:13px;color:var(--td-muted);margin:0;">
+					Nothing loved matches that.
+					<button class="linkish" on:click={() => (loveQ = '')}>Clear</button>
+				</p>
+			{:else}
+				<div class="loves-list" class:scrolls={lovesScrolls}>
+					{#each lovesListing as l (l.entity.id)}
+						{@const e = entityLabel(l.entity)}
+						<button class="note-item" on:click={() => openTarget({ entity_id: l.entity.id })}>
+							<div style="display:flex;align-items:baseline;gap:8px;">
+								<span style="color:#b2622d;">♥</span>
+								<span style="font-size:13.5px;flex:1;min-width:0;">{e.label}</span>
+								<span style="font-size:11px;color:var(--td-muted-3);flex:none;">{e.kind}</span>
+							</div>
+						</button>
+					{/each}
+				</div>
+
+				<div style="margin-top:10px;font-size:11.5px;color:var(--td-muted-3);">
+					{#if loveQ.trim()}
+						{lovesFound.length} of {loves.length}
+					{:else if lovesOpen}
+						All {loves.length}.
+						<button class="linkish" on:click={() => (lovesOpen = false)}>Show fewer</button>
+					{:else if loves.length > LOVE_PREVIEW}
+						{LOVE_PREVIEW} of {loves.length}.
+						<button class="linkish" on:click={() => (lovesOpen = true)}>See all</button>
+					{:else}
+						{loves.length} loved
+					{/if}
+				</div>
+			{/if}
+		</div>
+	{/if}
+	</div>
 </div>
 
 <ToTop />
@@ -534,6 +605,28 @@
 	}
 	@media (max-width: 860px) {
 		.notes-layout { grid-template-columns: minmax(0, 1fr); }
+	}
+
+	/* The editor and Loved stack in the second column. */
+	.rightcol {
+		display: flex;
+		flex-direction: column;
+		gap: 16px;
+		min-width: 0;
+	}
+
+	/* Past the preview the list scrolls inside its own panel rather than
+	   pushing the page down — the same containment the Statistics top lists
+	   use when "See all" is open. */
+	.loves-list {
+		display: flex;
+		flex-direction: column;
+		gap: 4px;
+	}
+	.loves-list.scrolls {
+		max-height: 340px;
+		overflow-y: auto;
+		padding-right: 4px;
 	}
 
 	.note-item {

@@ -159,6 +159,21 @@ export interface RangedStats {
 		avg_quality: number; lossless_pct: number; dsd_pct: number;
 		/** The denominator of the two shares above — not `plays`. */
 		fidelity_known: number;
+		/** What `avg_quality` is an average *of*. Same narrow population the
+		 *  fidelity shares have: only a live source ever writes a quality
+		 *  score, so an imported history has none. */
+		quality_known: number;
+		/** What `hours` is summed over — a listen of unknown length adds nothing,
+		 *  so the figure is a floor rather than a total. */
+		duration_known: number;
+		/** Skipped plays in the range. The one figure here that counts them. */
+		skips: number;
+		/** Plays per **calendar** day of the range, not per day you listened. */
+		per_day: number;
+		/** Earliest listen, unix seconds. Whole history — never ranged. */
+		first_listen: number | null;
+		/** Loved entities: tracks, records and artists together. */
+		loves: number;
 	};
 	top_artists: { name: string; plays: number; hours: number; image_url: string | null }[];
 	top_albums: { name: string; artist: string; plays: number; hours: number }[];

@@ -46,6 +46,42 @@
 	}
 	$: maxHeat = stats ? Math.max(1, ...stats.heatmap.flat()) : 1;
 
+	// ── The four "shape" cards ──
+	//
+	// Two of them follow the range control and two are facts about the whole
+	// history. That mix is fine as long as each says which it is: a number that
+	// silently ignores the control the user just moved reads as a bug.
+
+	const RANGE_WORD: Record<StatsRange, string> = {
+		week: 'last 7 days',
+		month: 'last 30 days',
+		last30: 'last 30 days',
+		year: 'last year',
+		all: 'whole history'
+	};
+	const rangeLabel = (r: StatsRange) => RANGE_WORD[r] ?? 'range';
+
+	/** Share of *everything played*, so the two counts share a population —
+	 *  `plays` already excludes skips, hence the sum in the denominator. */
+	const skipShare = (skips: number, plays: number) =>
+		plays + skips > 0 ? Math.round((skips / (plays + skips)) * 100) : 0;
+
+	const sinceLabel = (ts: number | null) =>
+		ts
+			? new Date(ts * 1000).toLocaleDateString(undefined, { month: 'short', year: 'numeric' })
+			: '—';
+
+	/** How long that is, in the unit that reads naturally at this distance. */
+	function sinceSub(ts: number | null): string {
+		if (!ts) return 'nothing logged yet';
+		const days = Math.max(0, (Date.now() / 1000 - ts) / 86400);
+		if (days < 60) return `${Math.round(days)} days of listening, all time`;
+		const years = days / 365.25;
+		return years < 1
+			? `${Math.round(days / 30.4)} months of listening, all time`
+			: `${years.toFixed(1)} years of listening, all time`;
+	}
+
 	// Match the quality-badge colours so a tier reads the same everywhere.
 	const fidelityFill = (tier: string) =>
 		({
@@ -170,17 +206,58 @@
 	{@const t = stats.totals}
 	{@const lossless = fidelity(t.lossless_pct, t.fidelity_known, t.plays, 'lossless')}
 	{@const dsd = fidelity(t.dsd_pct, t.fidelity_known, t.plays, 'DSD')}
-	<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:14px;margin-bottom:14px;">
+	<!-- Twelve slots, three rows of four.
+	     `auto-fit` was fine at four cards and stops being fine at twelve: it
+	     packs as many as will fit, so a wide viewport put eight in one line and
+	     the rows stopped lining up. The count is fixed at four and steps down
+	     with the viewport instead. -->
+	<div class="statgrid">
 		{#each [['Total Plays', t.plays], ['Artists', t.artists], ['Albums', t.albums], ['Tracks', t.tracks]] as [label, val]}
-			<div class="panel" style="border-radius:20px;padding:18px 20px;">
-				<div style="font-size:10.5px;letter-spacing:.1em;text-transform:uppercase;color:var(--td-muted-2);margin-bottom:6px;">{label}</div>
-				<div class="h-display" style="font-size:30px;line-height:1;">{val}</div>
+			<div class="panel stat">
+				<div class="stat-k">{label}</div>
+				<div class="h-display stat-v">{val}</div>
 			</div>
 		{/each}
 	</div>
-	<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:14px;margin-bottom:28px;">
-		<div class="panel" style="border-radius:20px;padding:18px 20px;"><div style="font-size:10.5px;letter-spacing:.1em;text-transform:uppercase;color:var(--td-muted-2);margin-bottom:6px;">Hours</div><div class="h-display" style="font-size:30px;line-height:1;">{t.hours}</div></div>
-		<div class="panel" style="border-radius:20px;padding:18px 20px;"><div style="font-size:10.5px;letter-spacing:.1em;text-transform:uppercase;color:var(--td-muted-2);margin-bottom:6px;">Avg Quality</div><div class="h-display" style="font-size:30px;line-height:1;">{t.avg_quality}<span style="font-size:16px;color:var(--td-muted-2);">/100</span></div></div>
+	<div class="statgrid">
+		<div class="panel stat">
+			<div class="stat-k">Hours</div>
+			<div class="h-display stat-v">{t.hours}</div>
+			<div class="fid-sub">
+				{#if t.duration_known < t.plays}
+					from the {t.duration_known.toLocaleString()} of {t.plays.toLocaleString()} listens with a known running time — so a floor, not a total
+				{:else}
+					every listen in this range reported its length
+				{/if}
+			</div>
+		</div>
+		<!-- The average is over listens that *have* a quality score, which only a
+		     live source ever writes — so on an imported history it is drawn from
+		     a sliver and used to say so nowhere at all, sitting next to a card
+		     that confesses exactly the same coverage. It keeps its number,
+		     because the number is true of the listens it covers, and now states
+		     what those are.
+
+		     With *nothing* scored it must not fall back to the number zero: on a
+		     wholly imported history that rendered a confident "0/100", which
+		     reads as a verdict on the listening rather than an absence of data
+		     — precisely the misreading the fidelity cards were fixed for. It
+		     shows the same em dash they do. -->
+		<div class="panel stat">
+			<div class="stat-k">Avg Quality</div>
+			{#if t.quality_known}
+				<div class="h-display stat-v">{t.avg_quality}<span style="font-size:16px;color:var(--td-muted-2);">/100</span></div>
+				<div class="fid-sub">
+					across {t.quality_known.toLocaleString()} of {t.plays.toLocaleString()} listens — the ones whose source reported a format
+				</div>
+			{:else}
+				<div class="h-display stat-v" style="color:var(--td-muted-2);">—</div>
+				<div class="fid-sub">
+					nothing in this range reported a format, so there is nothing to score. The same
+					sources that fill Fidelity fill this.
+				</div>
+			{/if}
+		</div>
 		<!-- Both shares are over listens with a known format, and both say so.
 		     Dividing by every play made these a reading of how much of the
 		     history was imported.
@@ -190,22 +267,26 @@
 		     which is a fact about the history rather than about lossless or DSD
 		     — so both cards degraded to the same heading, the same percentage
 		     and the same sentence, and the page showed "FIDELITY 4%" twice
-		     side by side. There is one thing to say, so it is said once. -->
+		     side by side. There is one thing to say, so it is said once.
+
+		     The survivor then takes both columns rather than leaving a gap. It
+		     is the card with a paragraph in it, so it is the one that wants the
+		     width, and the row stays four wide either way. -->
 		{#if lossless.scored}
-			<div class="panel" style="border-radius:20px;padding:18px 20px;">
-				<div style="font-size:10.5px;letter-spacing:.1em;text-transform:uppercase;color:var(--td-muted-2);margin-bottom:6px;">{fidelityLabel(lossless, 'Lossless')}</div>
-				<div class="h-display" style="font-size:30px;line-height:1;color:var(--td-good-fg);">{lossless.value}</div>
+			<div class="panel stat">
+				<div class="stat-k">{fidelityLabel(lossless, 'Lossless')}</div>
+				<div class="h-display stat-v" style="color:var(--td-good-fg);">{lossless.value}</div>
 				<div class="fid-sub">{lossless.sub}</div>
 			</div>
-			<div class="panel" style="border-radius:20px;padding:18px 20px;">
-				<div style="font-size:10.5px;letter-spacing:.1em;text-transform:uppercase;color:var(--td-muted-2);margin-bottom:6px;">DSD</div>
-				<div class="h-display" style="font-size:30px;line-height:1;color:#b2622d;">{dsd.value}</div>
+			<div class="panel stat">
+				<div class="stat-k">DSD</div>
+				<div class="h-display stat-v" style="color:#b2622d;">{dsd.value}</div>
 				<div class="fid-sub">{dsd.sub}</div>
 			</div>
 		{:else}
-			<div class="panel" style="border-radius:20px;padding:18px 20px;">
-				<div style="font-size:10.5px;letter-spacing:.1em;text-transform:uppercase;color:var(--td-muted-2);margin-bottom:6px;">Fidelity</div>
-				<div class="h-display" style="font-size:30px;line-height:1;color:var(--td-muted-2);">{lossless.value}</div>
+			<div class="panel stat wide">
+				<div class="stat-k">Fidelity</div>
+				<div class="h-display stat-v" style="color:var(--td-muted-2);">{lossless.value}</div>
 				<div class="fid-sub">
 					of your listening has a known format — too little to score lossless or DSD.
 					Formats come from a media server or a player that reports them; an imported
@@ -213,6 +294,38 @@
 				</div>
 			</div>
 		{/if}
+	</div>
+	<!-- The shape of the listening rather than of its metadata: these four are
+	     the only cards here that are always answerable, however a history
+	     arrived. Two follow the range control and two are facts about the whole
+	     history, so those two say so instead of looking like they moved. -->
+	<div class="statgrid" style="margin-bottom:28px;">
+		<div class="panel stat">
+			<div class="stat-k">Per Day</div>
+			<div class="h-display stat-v">{t.per_day}</div>
+			<div class="fid-sub">plays per day across the {rangeLabel(range)}, counting the quiet ones</div>
+		</div>
+		<div class="panel stat">
+			<div class="stat-k">Skipped</div>
+			<div class="h-display stat-v">{t.skips.toLocaleString()}</div>
+			<div class="fid-sub">
+				{#if t.skips}
+					{skipShare(t.skips, t.plays)}% of everything played — stored, never counted
+				{:else}
+					nothing skipped here; only some sources report it at all
+				{/if}
+			</div>
+		</div>
+		<div class="panel stat">
+			<div class="stat-k">Listening Since</div>
+			<div class="h-display stat-v" style="font-size:26px;">{sinceLabel(t.first_listen)}</div>
+			<div class="fid-sub">{sinceSub(t.first_listen)}</div>
+		</div>
+		<a class="panel stat linkcard" href="/loved">
+			<div class="stat-k">Loved</div>
+			<div class="h-display stat-v">{t.loves.toLocaleString()}</div>
+			<div class="fid-sub">tracks, records and artists, all time →</div>
+		</a>
 	</div>
 
 	<!-- Top artists / albums / tracks.
@@ -437,6 +550,43 @@
 <style>
 	/* The line that says what the share is *of*. Small on purpose — it is a
 	   qualifier, not a second number. */
+	/* Four across, stepping down rather than repacking. `auto-fit` would put
+	   eight cards on one line on a wide screen, so the three rows would stop
+	   agreeing with each other. */
+	.statgrid {
+		display: grid;
+		grid-template-columns: repeat(4, minmax(0, 1fr));
+		gap: 14px;
+		margin-bottom: 14px;
+	}
+	.stat {
+		border-radius: 20px;
+		padding: 18px 20px;
+		/* The rows have different amounts of sub-text, so the cards in a row
+		   settle at a common height and the numbers stay on one baseline. */
+		display: flex;
+		flex-direction: column;
+	}
+	.stat-k {
+		font-size: 10.5px; letter-spacing: .1em; text-transform: uppercase;
+		color: var(--td-muted-2); margin-bottom: 6px;
+	}
+	.stat-v { font-size: 30px; line-height: 1; }
+	/* The collapsed fidelity card takes the slot its twin left, keeping the row
+	   four wide — and it is the one with a paragraph to fit. */
+	.wide { grid-column: span 2; }
+	.linkcard {
+		text-decoration: none; color: inherit;
+		transition: border-color .15s ease, transform .15s ease;
+	}
+	.linkcard:hover { border-color: var(--td-accent); transform: translateY(-1px); }
+	@media (max-width: 900px) {
+		.statgrid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+	}
+	@media (max-width: 460px) {
+		.statgrid { grid-template-columns: minmax(0, 1fr); }
+		.wide { grid-column: auto; }
+	}
 	.fid-sub {
 		font-size: 11px; line-height: 1.35; color: var(--td-muted-3);
 		margin-top: 6px;

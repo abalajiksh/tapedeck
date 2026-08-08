@@ -26,7 +26,7 @@ openapi: 3.1.0
 
 info:
   title: Tapedeck
-  version: 0.48.0
+  version: 0.48.1
   summary: Self-hosted scrobbler and listening journal.
   description: |
     Tapedeck ingests listens, enriches them with MusicBrainz metadata, stores
@@ -1334,6 +1334,12 @@ paths:
                       lossless_pct: { type: number, description: 'Share of `fidelity_known`, not of `plays`.' }
                       dsd_pct: { type: number, description: 'Share of `fidelity_known`, not of `plays`.' }
                       fidelity_known: { type: integer, description: 'Listens in this window whose format is known — the denominator of the two shares above. The `fidelity` array below is a share of `plays` instead, because it carries an `Unknown` bucket of its own.' }
+                      quality_known: { type: integer, description: 'Listens `avg_quality` is averaged over. Only a live source ever writes a quality score, so an imported history has none and the average is over the same narrow population the fidelity shares are. Present it with its coverage or not at all; at zero there is no score to show, not a score of zero.' }
+                      duration_known: { type: integer, description: 'Listens `hours` is summed over. A listen whose source reported no length contributes nothing, so `hours` is a floor rather than a total.' }
+                      skips: { type: integer, description: 'Skipped plays in this window. Every other count in this object excludes them; this one is about them. Not every source reports skips, so zero means "nothing told us", not "nothing skipped".' }
+                      per_day: { type: number, description: 'Plays per **calendar** day of the window, including days with no listening. Dividing by active days instead reports a busy afternoon''s rate as the year''s.' }
+                      first_listen: { type: ['integer', 'null'], description: 'Earliest non-skipped listen, unix seconds. A fact about the whole history and therefore **not** ranged — asking it of a one-week window would only restate the window.' }
+                      loves: { type: integer, description: 'Loved entities: tracks, records and artists together. All time, not ranged.' }
                   top_artists: { type: array, items: { type: object, additionalProperties: true } }
                   top_albums: { type: array, items: { type: object, additionalProperties: true } }
                   top_tracks: { type: array, items: { type: object, additionalProperties: true } }
