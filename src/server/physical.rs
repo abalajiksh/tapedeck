@@ -13,8 +13,9 @@
 //! and the equipment wearing out.
 
 use axum::{
-    extract::{Path, Query, State},
-    http::StatusCode,
+    body::Body,
+    extract::{Multipart, Path, Query, State},
+    http::{header, StatusCode},
     response::{IntoResponse, Json},
     routing::{get, post},
     Router,
@@ -25,7 +26,9 @@ use tracing::{info, warn};
 
 use super::auth::AuthUser;
 use super::models::ErrorResponse;
+use super::now_playing::NowPlaying;
 use super::AppState;
+use crate::db::PhysicalImage;
 use crate::metadata::release_lookup::{self, PhysicalTrack};
 use crate::models::{ListenDisposition, Play};
 
@@ -257,6 +260,18 @@ pub struct NewRelease {
     #[serde(default)]
     pub tracks: Vec<PhysicalTrack>,
     pub notes: Option<String>,
+    /// When you bought it, unix seconds. Optional — most of a shelf is
+    /// catalogued long after the fact and guessing would be worse than blank.
+    pub purchased_at: Option<i64>,
+    /// Pull the sleeve, labels and booklet from the Cover Art Archive as part
+    /// of adding it. On by default: it is one request and it is the whole
+    /// reason for shelving from MusicBrainz rather than typing it in.
+    #[serde(default = "yes")]
+    pub fetch_images: bool,
+}
+
+fn yes() -> bool {
+    true
 }
 
 async fn add_release(
@@ -272,7 +287,7 @@ async fn add_release(
     }
     let tracks = serde_json::to_string(&body.tracks).unwrap_or_else(|_| "[]".into());
 
-    match state
+    let id = match state
         .db
         .create_physical(
             user.user_id,
@@ -287,13 +302,96 @@ async fn add_release(
             body.artwork_url.as_deref(),
             &tracks,
             body.notes.as_deref(),
+            body.purchased_at,
         )
         .await
     {
-        Ok(id) => {
-            info!("💿 Added {} to the shelf: {} — {}", body.kind, body.artist, body.title);
-            (StatusCode::CREATED, Json(serde_json::json!({ "id": id }))).into_response()
+        Ok(id) => id,
+        Err(e) => return err(500, e.to_string()),
+    };
+    info!("💿 Added {} to the shelf: {} — {}", body.kind, body.artist, body.title);
+
+    // Awaited rather than spawned, and failing softly. Awaited because the next
+    // thing the user does is open the record, and a gallery that fills in
+    // thirty seconds later reads as broken; softly because a record you own is
+    // still on the shelf whether or not an archive has scans of it.
+    let mut images = 0usize;
+    if body.fetch_images {
+        if let Some(mbid) = body.mbid_release.as_deref() {
+            match store_archive_images(&state, user.user_id, id, mbid).await {
+                Ok(n) => images = n,
+                Err(e) => warn!("Could not fetch cover art for {}: {}", mbid, e),
+            }
         }
+    }
+
+    (StatusCode::CREATED, Json(serde_json::json!({ "id": id, "images": images }))).into_response()
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ReleaseUpdate {
+    /// `Option<Option<_>>` throughout, for the reason `bulk-chain` learned the
+    /// hard way: a bare `Option` reads a *misspelled* key as an explicit null,
+    /// so a typo would clear the field it was trying to set and answer 200.
+    /// Absent leaves it alone; an explicit null clears it.
+    #[serde(default, deserialize_with = "explicit")]
+    pub purchased_at: Option<Option<i64>>,
+    #[serde(default, deserialize_with = "explicit")]
+    pub chain_id: Option<Option<i64>>,
+    #[serde(default, deserialize_with = "explicit")]
+    pub equipment_id: Option<Option<i64>>,
+    #[serde(default, deserialize_with = "explicit")]
+    pub notes: Option<Option<String>>,
+}
+
+/// Keep an explicit `null` distinguishable from an omitted field.
+fn explicit<'de, D, T>(d: D) -> Result<Option<Option<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::Deserialize<'de>,
+{
+    Option::<T>::deserialize(d).map(Some)
+}
+
+/// PATCH /api/v1/physical/:id — the shelf-keeping fields.
+async fn update_release(
+    State(state): State<Arc<AppState>>,
+    user: AuthUser,
+    Path(id): Path<i64>,
+    Json(body): Json<ReleaseUpdate>,
+) -> impl IntoResponse {
+    // A chain or a piece of gear arriving in a body is checked against the
+    // *owner's* rows before it is stored, the same rule ingest follows for a
+    // token's default chain.
+    if let Some(Some(cid)) = body.chain_id {
+        match state.db.get_chain(user.user_id, cid).await {
+            Ok(Some(_)) => {}
+            Ok(None) => return err(400, "No such signal chain"),
+            Err(e) => return err(500, e.to_string()),
+        }
+    }
+    if let Some(Some(eid)) = body.equipment_id {
+        match state.db.get_equipment(user.user_id).await {
+            Ok(gear) if gear.iter().any(|g| g.id == eid) => {}
+            Ok(_) => return err(400, "No such equipment"),
+            Err(e) => return err(500, e.to_string()),
+        }
+    }
+
+    match state
+        .db
+        .update_physical(
+            user.user_id,
+            id,
+            body.purchased_at,
+            body.chain_id,
+            body.equipment_id,
+            body.notes.as_ref().map(|n| n.as_deref()),
+        )
+        .await
+    {
+        Ok(true) => (StatusCode::OK, Json(serde_json::json!({ "status": "ok" }))).into_response(),
+        Ok(false) => err(404, "No such record"),
         Err(e) => err(500, e.to_string()),
     }
 }
@@ -327,10 +425,408 @@ async fn delete_release(
     Path(id): Path<i64>,
 ) -> impl IntoResponse {
     match state.db.delete_physical(user.user_id, id).await {
-        Ok(true) => {
+        Ok(Some(files)) => {
+            // The rows are already gone, so a file that refuses to delete is
+            // litter rather than a failure — reporting a 500 here would say the
+            // record is still on the shelf, which it is not.
+            for f in files {
+                if let Err(e) = tokio::fs::remove_file(state.uploads_dir.join(&f)).await {
+                    warn!("Could not remove the scan at {}: {}", f, e);
+                }
+            }
             (StatusCode::OK, Json(serde_json::json!({ "status": "deleted" }))).into_response()
         }
-        Ok(false) => err(404, "No such record"),
+        Ok(None) => err(404, "No such record"),
+        Err(e) => err(500, e.to_string()),
+    }
+}
+
+// ════════════════════════════════════════════════════════════
+//  Everything else in the sleeve
+// ════════════════════════════════════════════════════════════
+
+/// What the browser is told about one image.
+///
+/// Built by hand rather than serialised straight off the row so that
+/// `file_path` cannot reach the page: an uploaded scan is addressed by a
+/// Tapedeck URL, and the server's own layout is nobody's business. The row type
+/// also skips the field, so this is belt and braces on the thing that matters.
+fn image_payload(img: &PhysicalImage) -> serde_json::Value {
+    let own = format!("/api/v1/physical/images/{}/file", img.id);
+    serde_json::json!({
+        "id": img.id,
+        "release_id": img.release_id,
+        "kind": img.kind,
+        "provider": img.provider,
+        // One field the page renders, whichever provenance it came from.
+        "src": img.url.clone().unwrap_or_else(|| own.clone()),
+        // A remote provider's thumbnail, or the full file for an upload —
+        // scans are the user's own and there is nothing else to serve.
+        "thumb": img.thumb_url.clone().or_else(|| img.url.clone()).unwrap_or(own),
+        "caption": img.caption,
+        "position": img.position,
+        "bytes": img.bytes,
+        "mime": img.mime,
+        "added_at": img.added_at,
+    })
+}
+
+/// GET /api/v1/physical/:id/images
+async fn list_images(
+    State(state): State<Arc<AppState>>,
+    user: AuthUser,
+    Path(id): Path<i64>,
+) -> impl IntoResponse {
+    match state.db.list_physical_images(user.user_id, id).await {
+        Ok(rows) => {
+            let images: Vec<_> = rows.iter().map(image_payload).collect();
+            (StatusCode::OK, Json(serde_json::json!({ "images": images }))).into_response()
+        }
+        Err(e) => err(500, e.to_string()),
+    }
+}
+
+/// Pull everything the Cover Art Archive holds for a release and store it.
+///
+/// Idempotent by the archive's own image id, so re-running this on a release
+/// that has gained a scan adds the one and leaves the other twenty-eight alone.
+/// The error is flattened to a `String` the moment it arrives, and that is not
+/// cosmetic: a `Box<dyn Error>` is not `Send`, and holding one across the
+/// awaits below makes the whole handler futures fail axum's `Handler` bound
+/// with an error message that names neither.
+async fn store_archive_images(
+    state: &AppState,
+    user_id: i64,
+    release_id: i64,
+    mbid: &str,
+) -> Result<usize, String> {
+    let images = release_lookup::cover_art_archive(mbid).await.map_err(|e| e.to_string())?;
+    let mut n = 0;
+    for img in &images {
+        if state
+            .db
+            .add_physical_image(
+                user_id,
+                release_id,
+                &img.kind,
+                "caa",
+                Some(&img.url),
+                img.thumb_url.as_deref(),
+                None,
+                None,
+                None,
+                img.caption.as_deref(),
+                img.position,
+                Some(&img.id),
+            )
+            .await
+            .is_ok()
+        {
+            n += 1;
+        }
+    }
+    Ok(n)
+}
+
+/// POST /api/v1/physical/:id/images/fetch — ask the providers again.
+///
+/// Runs when the user asks rather than on a clock: the archive is not going to
+/// change under a record that has been on a shelf for thirty years, and the one
+/// case that does — an editor uploading the booklet you were missing — is
+/// exactly the case where the user knows and Tapedeck cannot.
+async fn fetch_images(
+    State(state): State<Arc<AppState>>,
+    user: AuthUser,
+    Path(id): Path<i64>,
+) -> impl IntoResponse {
+    let Ok(Some(release)) = state.db.get_physical(user.user_id, id).await else {
+        return err(404, "No such record");
+    };
+
+    let mut added = 0usize;
+    let mut notes: Vec<String> = Vec::new();
+
+    match release.mbid_release.as_deref() {
+        Some(mbid) => match store_archive_images(&state, user.user_id, id, mbid).await {
+            Ok(n) => added += n,
+            Err(e) => notes.push(format!("Cover Art Archive: {e}")),
+        },
+        // Not an error, and worth saying rather than showing an empty gallery:
+        // a record typed in by hand has no MusicBrainz id to ask about.
+        None => notes.push(
+            "This pressing has no MusicBrainz id, so there is nothing to look its sleeve up by. \
+             Uploaded scans still work."
+                .into(),
+        ),
+    }
+
+    // Discogs second and only if configured, because it serves images only to
+    // an authenticated caller and says nothing useful about what they *are* —
+    // "secondary" covers a back cover and a booklet page equally.
+    if let (Some(auth), Some(did)) = (discogs_auth(&state).await, release.discogs_id.as_deref()) {
+        match release_lookup::discogs_images(&auth, did).await.map_err(|e| e.to_string()) {
+            Ok(images) => {
+                for img in &images {
+                    if state
+                        .db
+                        .add_physical_image(
+                            user.user_id,
+                            id,
+                            &img.kind,
+                            "discogs",
+                            Some(&img.url),
+                            img.thumb_url.as_deref(),
+                            None,
+                            None,
+                            None,
+                            None,
+                            // After the archive's, so a gallery holding both
+                            // does not interleave them.
+                            1000 + img.position,
+                            Some(&img.id),
+                        )
+                        .await
+                        .is_ok()
+                    {
+                        added += 1;
+                    }
+                }
+            }
+            Err(e) => notes.push(format!("Discogs: {e}")),
+        }
+    }
+
+    let total = state.db.list_physical_images(user.user_id, id).await.map(|r| r.len()).unwrap_or(0);
+    (StatusCode::OK, Json(serde_json::json!({ "stored": added, "total": total, "notes": notes })))
+        .into_response()
+}
+
+/// The largest a single scan may be. A 600dpi A4 page is a few megabytes; this
+/// leaves room for a gatefold without letting one upload fill the disk.
+const MAX_SCAN_BYTES: usize = 24 * 1024 * 1024;
+
+/// Extension for a declared image type. The list is exhaustive on purpose —
+/// the extension is part of a path this server writes, so it is chosen from a
+/// fixed set here rather than taken from the client's filename.
+fn image_ext(mime: &str) -> Option<&'static str> {
+    match mime.split(';').next().unwrap_or("").trim() {
+        "image/jpeg" | "image/jpg" => Some("jpg"),
+        "image/png" => Some("png"),
+        "image/webp" => Some("webp"),
+        "image/gif" => Some("gif"),
+        "image/avif" => Some("avif"),
+        "image/tiff" => Some("tif"),
+        _ => None,
+    }
+}
+
+/// POST /api/v1/physical/:id/images — upload a scan of your own copy.
+///
+/// The one image source that is not somebody else's database. A pressing
+/// nobody has photographed, a sleeve with your own handwriting on it, the
+/// receipt tucked inside — none of that exists anywhere but here.
+async fn upload_image(
+    State(state): State<Arc<AppState>>,
+    user: AuthUser,
+    Path(id): Path<i64>,
+    mut multipart: Multipart,
+) -> impl IntoResponse {
+    let Ok(Some(_)) = state.db.get_physical(user.user_id, id).await else {
+        return err(404, "No such record");
+    };
+
+    let mut kind = "other".to_string();
+    let mut caption: Option<String> = None;
+    let mut files: Vec<(Vec<u8>, String)> = Vec::new();
+
+    while let Ok(Some(field)) = multipart.next_field().await {
+        match field.name().unwrap_or("") {
+            "kind" => {
+                if let Ok(v) = field.text().await {
+                    let v = v.trim().to_lowercase();
+                    if !v.is_empty() {
+                        kind = v;
+                    }
+                }
+            }
+            "caption" => {
+                caption =
+                    field.text().await.ok().map(|c| c.trim().to_string()).filter(|c| !c.is_empty());
+            }
+            _ => {
+                // The declared type decides the extension, and a filename from
+                // the client never touches the path.
+                let declared = field.content_type().unwrap_or("").to_string();
+                let named = field.file_name().unwrap_or("").to_string();
+                let mime = if image_ext(&declared).is_some() {
+                    declared
+                } else {
+                    mime_guess::from_path(&named).first_raw().unwrap_or("").to_string()
+                };
+                if let Ok(b) = field.bytes().await {
+                    files.push((b.to_vec(), mime));
+                }
+            }
+        }
+    }
+
+    if files.is_empty() {
+        return err(400, "No image in the request");
+    }
+
+    // Where the next one goes. A booklet is uploaded a page at a time, and
+    // appending keeps that order without asking the user to number them.
+    let mut position = state
+        .db
+        .list_physical_images(user.user_id, id)
+        .await
+        .map(|r| r.iter().map(|i| i.position).max().unwrap_or(-1) + 1)
+        .unwrap_or(0);
+
+    let dir = state.uploads_dir.join("shelf").join(user.user_id.to_string()).join(id.to_string());
+    if let Err(e) = tokio::fs::create_dir_all(&dir).await {
+        return err(500, format!("Could not write to the uploads directory: {e}"));
+    }
+
+    let mut stored = Vec::new();
+    for (bytes, mime) in files {
+        if bytes.len() > MAX_SCAN_BYTES {
+            return err(413, "That scan is larger than 24 MB");
+        }
+        let Some(ext) = image_ext(&mime) else {
+            return err(415, "Only JPEG, PNG, WebP, GIF, AVIF and TIFF images can be uploaded");
+        };
+        let name = format!("{}.{}", random_name(), ext);
+        // Stored relative to the uploads directory, so moving that directory
+        // (or restoring it beside a different install) does not orphan a row.
+        let rel = format!("shelf/{}/{}/{}", user.user_id, id, name);
+        if let Err(e) = tokio::fs::write(dir.join(&name), &bytes).await {
+            return err(500, format!("Could not save the scan: {e}"));
+        }
+        match state
+            .db
+            .add_physical_image(
+                user.user_id,
+                id,
+                &kind,
+                "upload",
+                None,
+                None,
+                Some(&rel),
+                Some(&mime),
+                Some(bytes.len() as i64),
+                caption.as_deref(),
+                position,
+                None,
+            )
+            .await
+        {
+            Ok(new_id) => {
+                stored.push(new_id);
+                position += 1;
+            }
+            Err(e) => {
+                // The row is what makes the file reachable, so a file with no
+                // row is unreferenced bytes — clean it up rather than leaving it.
+                let _ = tokio::fs::remove_file(dir.join(&name)).await;
+                return err(500, e.to_string());
+            }
+        }
+    }
+
+    info!("🖼️ Stored {} scan(s) for shelf item {}", stored.len(), id);
+    (StatusCode::CREATED, Json(serde_json::json!({ "ids": stored }))).into_response()
+}
+
+fn random_name() -> String {
+    use rand::Rng;
+    let raw: [u8; 12] = rand::rng().random();
+    raw.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// GET /api/v1/physical/images/:id/file — serve an uploaded scan.
+///
+/// Scoped to the caller by `(id, user_id)`, the same rule the artwork proxy
+/// keeps: these are photographs of someone's own possessions and ids must not
+/// be walkable. Cached hard — a scan never changes once uploaded — but
+/// `private`, because it is per-user and a shared cache holding it would serve
+/// it to the next person through the proxy.
+async fn image_file(
+    State(state): State<Arc<AppState>>,
+    user: AuthUser,
+    Path(id): Path<i64>,
+) -> impl IntoResponse {
+    let Ok(Some(img)) = state.db.get_physical_image(user.user_id, id).await else {
+        return err(404, "No such image");
+    };
+    let Some(rel) = img.file_path else {
+        return err(404, "That image lives at a provider, not on this server");
+    };
+    match tokio::fs::read(state.uploads_dir.join(&rel)).await {
+        Ok(bytes) => (
+            StatusCode::OK,
+            [
+                (
+                    header::CONTENT_TYPE,
+                    img.mime.unwrap_or_else(|| "application/octet-stream".into()),
+                ),
+                (header::CACHE_CONTROL, "private, max-age=31536000, immutable".into()),
+            ],
+            Body::from(bytes),
+        )
+            .into_response(),
+        Err(e) => err(404, format!("The file is gone: {e}")),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ImageUpdate {
+    pub kind: Option<String>,
+    #[serde(default, deserialize_with = "explicit")]
+    pub caption: Option<Option<String>>,
+    pub position: Option<i64>,
+}
+
+/// PATCH /api/v1/physical/images/:id — file it, name it, move it.
+async fn update_image(
+    State(state): State<Arc<AppState>>,
+    user: AuthUser,
+    Path(id): Path<i64>,
+    Json(body): Json<ImageUpdate>,
+) -> impl IntoResponse {
+    let kind = body.kind.as_deref().map(str::trim).filter(|k| !k.is_empty());
+    match state
+        .db
+        .update_physical_image(
+            user.user_id,
+            id,
+            kind,
+            body.caption.as_ref().map(|c| c.as_deref()),
+            body.position,
+        )
+        .await
+    {
+        Ok(true) => (StatusCode::OK, Json(serde_json::json!({ "status": "ok" }))).into_response(),
+        Ok(false) => err(404, "No such image"),
+        Err(e) => err(500, e.to_string()),
+    }
+}
+
+async fn delete_image(
+    State(state): State<Arc<AppState>>,
+    user: AuthUser,
+    Path(id): Path<i64>,
+) -> impl IntoResponse {
+    match state.db.delete_physical_image(user.user_id, id).await {
+        Ok(Some(file)) => {
+            if let Some(f) = file {
+                if let Err(e) = tokio::fs::remove_file(state.uploads_dir.join(&f)).await {
+                    warn!("Could not remove the scan at {}: {}", f, e);
+                }
+            }
+            (StatusCode::OK, Json(serde_json::json!({ "status": "deleted" }))).into_response()
+        }
+        Ok(None) => err(404, "No such image"),
         Err(e) => err(500, e.to_string()),
     }
 }
@@ -414,7 +910,14 @@ async fn play_side(
     // A chain makes this listen attributable the same way any other is. There
     // is no rung below it here: `equipment` carries no default chain (only
     // `devices` do), and a turntable is not a device that submits anything.
-    let chain_id = body.chain_id;
+    //
+    // What there *is* is a rung above the nothing there used to be — the
+    // pressing's own default. A record lives with one turntable, so the deck
+    // asks once and the answer is written back below; without that, every
+    // shelf listen arrived with `chain_id = NULL` and the chain hours of the
+    // gear it plainly ran through never moved.
+    let chain_id = body.chain_id.or(release.chain_id);
+    let equipment_id = body.equipment_id.or(release.equipment_id);
 
     // Outcomes the deck reported, by track position.
     let reported: std::collections::HashMap<i64, &TrackOutcome> =
@@ -459,12 +962,7 @@ async fn play_side(
                 None,
                 chain_id,
                 None,
-                Some(match release.kind.as_str() {
-                    "vinyl" => "Vinyl",
-                    "cd" => "CD",
-                    "sacd" => "SACD",
-                    _ => "Cassette",
-                }),
+                Some(medium_label(&release.kind)),
                 None,
                 // Kept so skip-rate analytics has something real to count, and
                 // filed so nothing else does. This used to be an UPDATE after
@@ -503,12 +1001,38 @@ async fn play_side(
                 start,
                 total,
                 tracks.len() as i64,
-                body.equipment_id,
+                equipment_id,
                 chain_id,
             )
             .await
         {
             warn!("Could not record the side play: {}", e);
+        }
+    }
+
+    // The side is off the deck, whether it ran through or was stopped early.
+    // Without this the registry keeps extrapolating the last track it was told
+    // about and the dashboard shows a record still playing.
+    state.now_playing.clear_user_source(user.user_id, SHELF_SOURCE);
+
+    // Remember what it was played on, so the next side of the same record —
+    // and the next time it comes off the shelf — is pre-filled. Only when the
+    // caller stated something: a play that fell through to the stored default
+    // has nothing new to say.
+    if body.chain_id.is_some() || body.equipment_id.is_some() {
+        if let Err(e) = state
+            .db
+            .update_physical(
+                user.user_id,
+                release.id,
+                None,
+                body.chain_id.map(Some),
+                body.equipment_id.map(Some),
+                None,
+            )
+            .await
+        {
+            warn!("Could not remember what {} is played on: {}", release.title, e);
         }
     }
 
@@ -533,6 +1057,124 @@ async fn play_side(
         })),
     )
         .into_response()
+}
+
+// ════════════════════════════════════════════════════════════
+//  What's on the deck
+// ════════════════════════════════════════════════════════════
+
+/// The name every shelf entry is filed under in the registry, and therefore the
+/// key `clear_user_source` uses. One constant so a stopped side cannot fail to
+/// clear the entry a started side wrote.
+const SHELF_SOURCE: &str = "Shelf";
+
+#[derive(Debug, Deserialize)]
+pub struct DeckState {
+    pub side: String,
+    /// The track's position on the side — the deck knows which one it is
+    /// inside, because it is the thing running the clock.
+    pub position: i64,
+    /// Seconds into that track.
+    #[serde(default)]
+    pub elapsed: u64,
+    /// A paused record is not playing, but it is still on the deck. The entry
+    /// stays and stops advancing, which is what the still platter shows.
+    #[serde(default)]
+    pub paused: bool,
+}
+
+/// POST /api/v1/physical/:id/now-playing — a side is on.
+///
+/// The shelf is the one source where the **browser** is the player: the clock
+/// runs in front of the turntable, in localStorage, and the server cannot
+/// derive a playhead from anything it holds. So the deck pushes, rather than
+/// the engine polling — which is why this endpoint exists at all when Plex,
+/// Jellyfin and Navidrome need nothing of the kind.
+///
+/// Called on every track change, on pause and resume, and on a heartbeat while
+/// a side runs. The heartbeat is not optional: `NowPlaying::is_live` expires an
+/// entry by *running past the end of the track*, so a paused record would drop
+/// off the dashboard one track length after it was paused.
+async fn set_now_playing(
+    State(state): State<Arc<AppState>>,
+    user: AuthUser,
+    Path(id): Path<i64>,
+    Json(body): Json<DeckState>,
+) -> impl IntoResponse {
+    let Ok(Some(release)) = state.db.get_physical(user.user_id, id).await else {
+        return err(404, "No such record");
+    };
+    let all: Vec<PhysicalTrack> = serde_json::from_str(&release.tracks).unwrap_or_default();
+    let side = body.side.trim().to_uppercase();
+    let Some(track) =
+        all.iter().find(|t| t.side.eq_ignore_ascii_case(&side) && t.position == body.position)
+    else {
+        return err(400, "No such track on that side");
+    };
+
+    let play = Play {
+        title: track.title.clone(),
+        artist: track.artist.clone().unwrap_or_else(|| release.artist.clone()),
+        artists: None,
+        album: Some(release.title.clone()),
+        timestamp: 0,
+        duration: track.duration_secs.map(|d| d.max(0) as u64),
+        track_number: Some(track.position as i32),
+        mbid_recording: None,
+        mbid_release: release.mbid_release.clone(),
+        mbid_release_group: None,
+        mbid_artist: None,
+        caa_id: None,
+        caa_release_mbid: None,
+        source_id: format!("physical-{}-{}-np", release.id, side),
+        source_name: "physical".into(),
+    };
+
+    let mut np = NowPlaying::from_play(&play, SHELF_SOURCE, None, body.elapsed);
+    // The medium, which is the only thing resembling a format a turntable can
+    // report — there is no codec here and never will be. Note the listen itself
+    // files the same string under `submission_client` rather than
+    // `listening_context`: "off a CD" describes where it came from, and that is
+    // the column `play_side` has always used.
+    np.listening_context = Some(medium_label(&release.kind).to_string());
+    let changed = state.now_playing.set(user.user_id, np);
+
+    // Only on a real change of track, for the reason the registry returns the
+    // flag at all: Last.fm's and ListenBrainz's now-playing is a one-shot that
+    // expires on its own, so re-sending it on every heartbeat is noise aimed at
+    // someone else's servers. A paused side re-reports the same track, so this
+    // is false for the whole time it stands still.
+    if changed && !body.paused {
+        let sinks =
+            crate::sinks::sinks_for_user(&state.db, user.user_id, &state.listenbrainz_url).await;
+        crate::sinks::submit_now_playing(&sinks, &play).await;
+    }
+
+    (StatusCode::OK, Json(serde_json::json!({ "status": "ok", "changed": changed })))
+        .into_response()
+}
+
+/// DELETE /api/v1/physical/now-playing — nothing is on the deck.
+///
+/// Its own route rather than a field on the one above because it is also what
+/// *cancelling* a side means, and that has no track to name.
+async fn clear_now_playing(
+    State(state): State<Arc<AppState>>,
+    user: AuthUser,
+) -> impl IntoResponse {
+    state.now_playing.clear_user_source(user.user_id, SHELF_SOURCE);
+    (StatusCode::OK, Json(serde_json::json!({ "status": "cleared" }))).into_response()
+}
+
+/// How a medium is written on a listen. One place, because it is written by the
+/// side play, the now-playing push and the export.
+fn medium_label(kind: &str) -> &'static str {
+    match kind {
+        "vinyl" => "Vinyl",
+        "cd" => "CD",
+        "sacd" => "SACD",
+        _ => "Cassette",
+    }
 }
 
 /// GET /api/v1/physical/equipment/:id/wear — hours on a stylus or head.
@@ -671,17 +1313,275 @@ async fn test_discogs(State(state): State<Arc<AppState>>, user: AuthUser) -> imp
     }
 }
 
+// ════════════════════════════════════════════════════════════
+//  Taking the shelf with you
+// ════════════════════════════════════════════════════════════
+
+/// What the zip says about itself.
+const EXPORT_README: &str = "\
+# Your shelf
+
+Everything Tapedeck holds about the objects you own — the pressings, every side
+you have put on, and the gear they ran through.
+
+* `shelf.json` — one entry per pressing: what it is, when you bought it, its
+  tracklist as sides, what it is normally played on, and its scans.
+* `plays.csv` — every side ever played, oldest first, with the gear named.
+* `gear.json` — your equipment and signal chains, with purchase dates.
+* `scans/` — the images **you uploaded**, one directory per pressing.
+
+Scans that live at the Cover Art Archive or Discogs are listed in `shelf.json`
+with their URLs rather than copied in here. They are not yours to redistribute
+and they are still there to fetch; your own scans exist nowhere else, which is
+why those are the ones in the file.
+
+That is also why this export exists separately from the database backup:
+`GET /api/v1/backup` is a snapshot of the database, and uploaded scans are files
+beside it rather than rows inside it. A backup and this export together are the
+whole shelf.
+";
+
+/// GET /api/v1/physical/export — the shelf as a zip.
+///
+/// Built in memory rather than streamed, unlike the listen export: a zip's
+/// central directory is written after the entries anyway, and a shelf is
+/// bounded by how many records fit in a room.
+async fn export_shelf(State(state): State<Arc<AppState>>, user: AuthUser) -> impl IntoResponse {
+    use std::io::Write;
+
+    let uid = user.user_id;
+    let releases = match state.db.list_physical(uid, None).await {
+        Ok(r) => r,
+        Err(e) => return err(500, e.to_string()),
+    };
+    let images = state.db.all_physical_images(uid).await.unwrap_or_default();
+    let plays = state.db.all_physical_plays(uid).await.unwrap_or_default();
+    let gear = state.db.get_equipment(uid).await.unwrap_or_default();
+    let chains = state.db.get_chains(uid).await.unwrap_or_default();
+
+    let mut buf = std::io::Cursor::new(Vec::new());
+    {
+        let mut zip = zip::ZipWriter::new(&mut buf);
+        let opts = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated);
+        // Images are already compressed; deflating a JPEG spends CPU to make it
+        // very slightly bigger.
+        let stored = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+
+        let mut fail = false;
+        let mut write = |zip: &mut zip::ZipWriter<_>, name: String, body: &[u8], o| {
+            if zip.start_file(name, o).is_err() || zip.write_all(body).is_err() {
+                fail = true;
+            }
+        };
+
+        write(&mut zip, "README.md".into(), EXPORT_README.as_bytes(), opts);
+
+        // One entry per pressing, with its tracklist parsed back out of the
+        // stored blob — an export that made the reader parse a JSON string
+        // inside a JSON document would be passing the work on rather than
+        // doing it.
+        let shelf: Vec<serde_json::Value> = releases
+            .iter()
+            .map(|r| {
+                let tracks: serde_json::Value =
+                    serde_json::from_str(&r.tracks).unwrap_or_else(|_| serde_json::json!([]));
+                let mine: Vec<serde_json::Value> = images
+                    .iter()
+                    .filter(|i| i.release_id == r.id)
+                    .map(|i| {
+                        serde_json::json!({
+                            "kind": i.kind,
+                            "provider": i.provider,
+                            "caption": i.caption,
+                            "position": i.position,
+                            // Exactly one of these is meaningful, and which one
+                            // is what `provider` says.
+                            "url": i.url,
+                            "file": i.file_path.as_ref().map(|_| scan_name(r, i)),
+                        })
+                    })
+                    .collect();
+                serde_json::json!({
+                    "kind": r.kind,
+                    "artist": r.artist,
+                    "title": r.title,
+                    "year": r.year,
+                    "mbid_release": r.mbid_release,
+                    "discogs_id": r.discogs_id,
+                    "barcode": r.barcode,
+                    "catalog_number": r.catalog_number,
+                    "purchased_at": r.purchased_at,
+                    "added_at": r.added_at,
+                    "notes": r.notes,
+                    "played_sides": r.play_count,
+                    "played_secs": r.played_secs,
+                    "last_played": r.last_played,
+                    "played_on_chain": chains.iter().find(|c| c.id == r.chain_id).map(|c| c.name.clone()),
+                    "played_on_equipment": gear.iter().find(|g| Some(g.id) == r.equipment_id).map(|g| g.name.clone()),
+                    "tracks": tracks,
+                    "images": mine,
+                })
+            })
+            .collect();
+        write(
+            &mut zip,
+            "shelf.json".into(),
+            serde_json::to_string_pretty(&shelf).unwrap_or_default().as_bytes(),
+            opts,
+        );
+
+        let mut csv_body = String::from(
+            "played_at,artist,title,format,side,tracks,duration_secs,equipment,chain\n",
+        );
+        for p in &plays {
+            csv_body.push_str(&format!(
+                "{},{},{},{},{},{},{},{},{}\n",
+                p.played_at,
+                csv(&p.artist),
+                csv(&p.title),
+                medium_label(&p.kind),
+                csv(&p.side),
+                p.track_count,
+                p.duration_secs,
+                csv(p.equipment_name.as_deref().unwrap_or("")),
+                csv(p.chain_name.as_deref().unwrap_or("")),
+            ));
+        }
+        write(&mut zip, "plays.csv".into(), csv_body.as_bytes(), opts);
+
+        let gear_doc = serde_json::json!({
+            "equipment": gear.iter().map(|g| serde_json::json!({
+                "name": g.name,
+                "type": g.equipment_type,
+                "brand": g.brand,
+                "model": g.model,
+                "purchased_at": g.purchased_at,
+                "first_used": g.first_used,
+                "last_used": g.last_used,
+                // Derived from the listens, not an accumulator — so this is
+                // the same number the app shows rather than a second answer.
+                "hours": (g.total_hours * 10.0).round() / 10.0,
+                "notes": g.notes,
+            })).collect::<Vec<_>>(),
+            "chains": chains.iter().map(|c| serde_json::json!({
+                "name": c.name,
+                "description": c.description,
+                "icon": c.icon,
+                "listening_context": c.listening_context,
+                "components": c.components,
+                "hours": (c.total_hours * 10.0).round() / 10.0,
+            })).collect::<Vec<_>>(),
+        });
+        write(
+            &mut zip,
+            "gear.json".into(),
+            serde_json::to_string_pretty(&gear_doc).unwrap_or_default().as_bytes(),
+            opts,
+        );
+
+        for r in &releases {
+            for img in images.iter().filter(|i| i.release_id == r.id) {
+                let Some(rel) = &img.file_path else { continue };
+                match tokio::fs::read(state.uploads_dir.join(rel)).await {
+                    Ok(bytes) => {
+                        write(&mut zip, format!("scans/{}", scan_name(r, img)), &bytes, stored)
+                    }
+                    // A missing file is not worth failing a whole export over;
+                    // it is already listed in `shelf.json`, so the gap is
+                    // visible rather than silent.
+                    Err(e) => warn!("Scan {} could not be read for export: {}", rel, e),
+                }
+            }
+        }
+
+        if fail || zip.finish().is_err() {
+            return err(500, "Could not build the export");
+        }
+    }
+
+    (
+        StatusCode::OK,
+        [
+            (header::CONTENT_TYPE, "application/zip"),
+            (header::CONTENT_DISPOSITION, "attachment; filename=\"tapedeck-shelf.zip\""),
+        ],
+        buf.into_inner(),
+    )
+        .into_response()
+}
+
+/// Where one scan lands in the zip: `<artist> — <title>/<kind>-<n>.<ext>`.
+///
+/// Named after the record rather than after the row id, because the point of an
+/// export is that it is readable somewhere that has never heard of this
+/// database. The id is still in the stem, so two pressings of the same album
+/// cannot collide.
+fn scan_name(release: &crate::db::PhysicalRelease, img: &PhysicalImage) -> String {
+    let ext = img
+        .file_path
+        .as_ref()
+        .and_then(|p| p.rsplit('.').next())
+        .filter(|e| e.len() <= 5)
+        .unwrap_or("jpg");
+    format!(
+        "{} - {} [{}]/{}-{:02}.{}",
+        safe(&release.artist),
+        safe(&release.title),
+        release.id,
+        safe(&img.kind),
+        img.position + 1,
+        ext
+    )
+}
+
+/// A path segment a filesystem will accept. Replaces rather than drops, so
+/// `AC/DC` reads as `AC DC` rather than `ACDC` — the same rule the liner-note
+/// export's filenames follow.
+fn safe(s: &str) -> String {
+    let cleaned: String = s
+        .chars()
+        .map(|c| if c.is_control() || "/\\:*?\"<>|".contains(c) { ' ' } else { c })
+        .collect();
+    let trimmed = cleaned.trim().trim_end_matches('.').trim().to_string();
+    if trimmed.is_empty() {
+        "Untitled".into()
+    } else {
+        trimmed.chars().take(80).collect()
+    }
+}
+
+/// Minimal RFC-4180 field escaping, matching the listen export's.
+fn csv(s: &str) -> String {
+    if s.contains([',', '"', '\n', '\r']) {
+        format!("\"{}\"", s.replace('"', "\"\""))
+    } else {
+        s.to_string()
+    }
+}
+
 pub fn create_physical_router() -> Router<Arc<AppState>> {
     Router::new()
         // Registered before `/:id` so they aren't swallowed by the
         // parameterised route — axum 0.7 / matchit 0.7 matches in order.
         .route("/api/v1/physical/lookup", get(lookup))
+        .route("/api/v1/physical/export", get(export_shelf))
         .route("/api/v1/physical/discogs/:id", get(discogs_detail))
         .route("/api/v1/physical/equipment/:id/wear", get(equipment_wear))
         .route("/api/v1/physical/settings/discogs", get(get_discogs).put(set_discogs))
         .route("/api/v1/physical/settings/discogs/test", post(test_discogs))
+        .route("/api/v1/physical/now-playing", axum::routing::delete(clear_now_playing))
+        .route(
+            "/api/v1/physical/images/:id",
+            axum::routing::patch(update_image).delete(delete_image),
+        )
+        .route("/api/v1/physical/images/:id/file", get(image_file))
         .route("/api/v1/physical", get(list_shelf).post(add_release))
-        .route("/api/v1/physical/:id", get(get_one).delete(delete_release))
+        .route("/api/v1/physical/:id", get(get_one).patch(update_release).delete(delete_release))
         .route("/api/v1/physical/:id/tracks", axum::routing::put(set_tracks))
         .route("/api/v1/physical/:id/play", post(play_side))
+        .route("/api/v1/physical/:id/now-playing", post(set_now_playing))
+        .route("/api/v1/physical/:id/images", get(list_images).post(upload_image))
+        .route("/api/v1/physical/:id/images/fetch", post(fetch_images))
 }

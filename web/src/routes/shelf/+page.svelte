@@ -1,8 +1,13 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
-	import { api, type PhysicalRelease, type PhysicalTrack, type ReleaseCandidate } from '$lib/api';
-	import { formatDuration, formatDateTime } from '$lib/utils';
+	import {
+		api,
+		type PhysicalRelease, type PhysicalTrack, type ReleaseCandidate,
+		type PhysicalImage, type SignalChain, type Equipment
+	} from '$lib/api';
+	import { formatDuration, formatDateTime, toDateInput, fromDateInput, ownedFor } from '$lib/utils';
 	import CoverArt from '$lib/components/CoverArt.svelte';
+	import ChainIcon from '$lib/components/ChainIcon.svelte';
 
 	// Records and tapes are one screen, not two: the workflow is identical and
 	// most shelves hold both. The filter is a view, not a mode.
@@ -35,6 +40,10 @@
 	let searchNotes: string[] = [];
 	let discogsEnabled = false;
 	let searched = false;
+	/** When you bought it, filled in while adding — the one moment you reliably
+	 *  know, since the alternative is remembering to come back and say. */
+	let buyDate = '';
+	let addedNote = '';
 
 	// ── Playing a side ──
 	//
@@ -54,6 +63,59 @@
 	let playing = false;
 	let flipPrompt = '';
 	let playMsg = '';
+
+	// ── What it was played on ──
+	//
+	// `physical_plays` has carried `chain_id` and `equipment_id` since the shelf
+	// was built and nothing ever sent them, so every side landed unattributed
+	// and the gear it plainly ran through logged no hours. The picker is
+	// pre-filled from the pressing's own default and the answer is written back,
+	// because a record lives with one turntable — asking every time would be
+	// asking the same question forever.
+	let chains: SignalChain[] = [];
+	let gear: Equipment[] = [];
+	let playChain: number | null = null;
+	let playGear: number | null = null;
+	let purchased = '';
+	let savingMeta = false;
+
+	// ── The rest of the sleeve ──
+	let images: PhysicalImage[] = [];
+	let imagesFor: number | null = null;
+	let imagesBusy = false;
+	let imageNote = '';
+	let uploadKind = 'booklet';
+	let lightbox = -1;
+
+	/** Kinds in the order you would meet them holding the object: the cover,
+	 *  round the back, then what is inside. Anything the archive invents that
+	 *  isn't here sorts last rather than being hidden. */
+	const KIND_ORDER = [
+		'front', 'back', 'spine', 'panel', 'obi', 'sticker',
+		'booklet', 'liner', 'medium', 'tray', 'matrix', 'track', 'poster', 'other'
+	];
+	const IMAGE_KIND_LABEL: Record<string, string> = {
+		front: 'Front', back: 'Back', spine: 'Spine', panel: 'Panels', obi: 'Obi strip',
+		sticker: 'Sticker', booklet: 'Booklet', liner: 'Liner notes', medium: 'Label / disc',
+		tray: 'Tray', matrix: 'Matrix & runout', track: 'Track listing', poster: 'Poster',
+		other: 'Other'
+	};
+	const kindLabel = (k: string) =>
+		IMAGE_KIND_LABEL[k] ?? k.charAt(0).toUpperCase() + k.slice(1);
+	const kindRank = (k: string) => {
+		const i = KIND_ORDER.indexOf(k);
+		return i < 0 ? KIND_ORDER.length : i;
+	};
+
+	/** The gallery, grouped and in shelf order. The archive's own ordering is
+	 *  kept *within* a group — it puts a booklet in page order, and no rule
+	 *  invented here beats an editor who had the thing in their hands. */
+	$: gallery = [...new Set(images.map((i) => i.kind))]
+		.sort((a, b) => kindRank(a) - kindRank(b) || a.localeCompare(b))
+		.map((k) => ({ kind: k, items: images.filter((i) => i.kind === k) }));
+	/** Flattened in the same order, so the lightbox's arrows walk the page the
+	 *  way it reads rather than the order rows happen to come back in. */
+	$: flat = gallery.flatMap((g) => g.items);
 
 	/**
 	 * A side in progress.
@@ -100,6 +162,39 @@
 			if (v) localStorage.setItem(SPIN_KEY, JSON.stringify(v));
 			else localStorage.removeItem(SPIN_KEY);
 		} catch { /* private mode — the state is still live in memory */ }
+		// Taking a side off the deck is the one thing that must also reach the
+		// server, and this is the single place it happens — cancel, record and
+		// "already played" all come through here, so none of them can forget.
+		if (!v) void api.clearShelfNowPlaying().catch(() => {});
+	}
+
+	/**
+	 * Tell the server what is on the deck.
+	 *
+	 * The shelf is the only source where the **browser** is the player: the
+	 * clock runs in front of the turntable, in localStorage, and nothing
+	 * server-side can derive a playhead from a stack of rows. So it pushes,
+	 * where Plex and Jellyfin are polled.
+	 *
+	 * Called on every track change, on pause and resume, and on a heartbeat.
+	 * The heartbeat is not decoration: the registry expires an entry by running
+	 * past the end of the track it knows about, so a paused record would drop
+	 * off the dashboard one track length after it was paused.
+	 */
+	async function pushDeck() {
+		if (!spinning || !spinTrack) return;
+		try {
+			await api.shelfNowPlaying(spinning.releaseId, {
+				side: spinning.side,
+				position: spinTrack.position,
+				elapsed: trackElapsed,
+				paused
+			});
+		} catch {
+			// A failed push leaves the deck showing the last thing it was told,
+			// which the next heartbeat corrects. The side itself is unaffected —
+			// the listens are written when it is recorded, not from this.
+		}
 	}
 
 	function startSide(side: string) {
@@ -209,6 +304,35 @@
 	 *  reason — which is exactly what it looked like in testing. */
 	$: spinElsewhere = !!(spinning && !spinHere);
 
+	/** The track the clock is inside, whichever record is on — unlike
+	 *  `nowTrack`, which is scoped to the one being *looked at*. The deck has to
+	 *  keep reporting while you browse the rest of the shelf, so the push reads
+	 *  this one. */
+	$: spinTrack = spinning ? sideTracks(spinning.side, spinRelease)[currentIndex(spinning)] ?? null : null;
+	/** Seconds into the current track, not into the side. */
+	$: trackElapsed = (() => {
+		if (!spinning || !spinTrack) return 0;
+		const list = sideTracks(spinning.side, spinRelease);
+		const before = list
+			.slice(0, currentIndex(spinning))
+			.reduce((n, t) => n + (t.duration_secs ?? 180), 0);
+		return Math.max(0, spinElapsed - before);
+	})();
+
+	// One push per *change*, plus the heartbeat below. Keyed on what the server
+	// actually cares about, so a second of elapsed time does not become a
+	// request — the registry extrapolates position between reports.
+	let lastPush = '';
+	$: {
+		const key = spinning && spinTrack
+			? `${spinning.releaseId}|${spinning.side}|${spinTrack.position}|${paused}`
+			: '';
+		if (key !== lastPush) {
+			lastPush = key;
+			if (key) void pushDeck();
+		}
+	}
+
 	$: sides = [...new Set(openTracks.map((t) => t.side))].sort();
 	$: shown = shelf.filter((r) => filter === 'all' || r.kind === filter);
 
@@ -221,6 +345,13 @@
 			error = String(e).replace(/^API \d+: /, '');
 		}
 		loading = false;
+	}
+
+	async function loadGear() {
+		// Neither is fatal: a shelf with no chains configured still plays sides,
+		// the picker just has nothing to offer.
+		try { chains = (await api.getChains()).chains; } catch { chains = []; }
+		try { gear = (await api.getEquipment()).equipment; } catch { gear = []; }
 	}
 
 	async function search() {
@@ -255,11 +386,21 @@
 			}
 		}
 		try {
-			await api.addPressing({ ...full, kind: lookupKind, tracks: full.tracks ?? [] });
+			const r = await api.addPressing({
+				...full, kind: lookupKind, tracks: full.tracks ?? [],
+				purchased_at: fromDateInput(buyDate)
+			});
 			adding = false;
 			candidates = [];
-			barcode = catno = qArtist = qRelease = '';
+			barcode = catno = qArtist = qRelease = buyDate = '';
 			await load();
+			// Said rather than left to be noticed: pulling twenty-nine images is
+			// most of why shelving from MusicBrainz beats typing it in, and it is
+			// invisible until the record is opened.
+			if (r.images) error = '';
+			addedNote = r.images
+				? `Added, with ${r.images} image${r.images === 1 ? '' : 's'} from the Cover Art Archive.`
+				: 'Added.';
 		} catch (e) {
 			searchNotes = [String(e).replace(/^API \d+: /, '')];
 		}
@@ -269,11 +410,132 @@
 		open = r;
 		playMsg = '';
 		flipPrompt = '';
+		imageNote = '';
+		lightbox = -1;
+		playChain = r.chain_id;
+		playGear = r.equipment_id;
+		purchased = toDateInput(r.purchased_at);
 		try {
 			openTracks = JSON.parse(r.tracks) as PhysicalTrack[];
 		} catch {
 			openTracks = [];
 		}
+		void loadImages(r.id);
+	}
+
+	// ── Scans ──
+
+	async function loadImages(id: number) {
+		// Guarded on the id rather than a boolean: opening a second record while
+		// the first is still loading would otherwise paint its sleeve here.
+		imagesFor = id;
+		images = [];
+		try {
+			const r = await api.pressingImages(id);
+			if (imagesFor === id) images = r.images;
+		} catch (e) {
+			if (imagesFor === id) imageNote = String(e).replace(/^API \d+: /, '');
+		}
+	}
+
+	/** Ask the archive again. Idempotent on the provider's own image id, so this
+	 *  picks up a booklet somebody uploaded since and leaves the rest alone. */
+	async function fetchArt() {
+		if (!open) return;
+		imagesBusy = true;
+		imageNote = '';
+		try {
+			const r = await api.fetchPressingImages(open.id);
+			imageNote = r.notes.length
+				? r.notes.join(' · ')
+				: r.stored
+					? `Found ${r.total} image${r.total === 1 ? '' : 's'}.`
+					: 'Nothing new — you already have everything the archive holds.';
+			await loadImages(open.id);
+			await load();
+		} catch (e) {
+			imageNote = String(e).replace(/^API \d+: /, '');
+		}
+		imagesBusy = false;
+	}
+
+	async function uploadScans(e: Event) {
+		const input = e.currentTarget as HTMLInputElement;
+		const files = Array.from(input.files ?? []);
+		if (!open || !files.length) return;
+		imagesBusy = true;
+		imageNote = '';
+		try {
+			// Sorted by name, because a booklet scanned page by page comes off a
+			// scanner as `page-01.jpg`… and the file picker's own order is the
+			// operating system's business, not page order.
+			files.sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true }));
+			const r = await api.uploadPressingImages(open.id, files, uploadKind);
+			imageNote = `Added ${r.ids.length} scan${r.ids.length === 1 ? '' : 's'}.`;
+			await loadImages(open.id);
+			await load();
+		} catch (err) {
+			imageNote = String(err).replace(/^API \d+: /, '');
+		}
+		imagesBusy = false;
+		input.value = '';
+	}
+
+	async function removeImage(img: PhysicalImage) {
+		if (!open) return;
+		const own = img.provider === 'upload';
+		if (!confirm(own
+			? 'Delete this scan? The file is removed from the server and cannot be recovered.'
+			: 'Remove this image from the shelf? It stays at the provider and can be fetched again.')) return;
+		try {
+			await api.deletePressingImage(img.id);
+			lightbox = -1;
+			await loadImages(open.id);
+			await load();
+		} catch (e) {
+			imageNote = String(e).replace(/^API \d+: /, '');
+		}
+	}
+
+	/** Re-file an image the provider guessed wrong about — Discogs says only
+	 *  "primary" or "secondary", so everything but the cover lands in Other. */
+	async function refile(img: PhysicalImage, kind: string) {
+		if (!open || kind === img.kind) return;
+		try {
+			await api.updatePressingImage(img.id, { kind });
+			await loadImages(open.id);
+		} catch (e) {
+			imageNote = String(e).replace(/^API \d+: /, '');
+		}
+	}
+
+	function lightboxKeys(e: KeyboardEvent) {
+		if (lightbox < 0) return;
+		if (e.key === 'Escape') lightbox = -1;
+		if (e.key === 'ArrowRight') lightbox = (lightbox + 1) % flat.length;
+		if (e.key === 'ArrowLeft') lightbox = (lightbox - 1 + flat.length) % flat.length;
+	}
+
+	// ── Shelf keeping ──
+
+	/** Save the fields that describe the object rather than the music: when you
+	 *  bought it, and what it goes on. */
+	async function saveMeta() {
+		if (!open) return;
+		savingMeta = true;
+		try {
+			await api.updatePressing(open.id, {
+				purchased_at: fromDateInput(purchased),
+				chain_id: playChain,
+				equipment_id: playGear
+			});
+			await load();
+			const fresh = shelf.find((x) => x.id === open?.id);
+			if (fresh) open = fresh;
+		} catch (e) {
+			error = String(e).replace(/^API \d+: /, '');
+		}
+		savingMeta = false;
 	}
 
 	async function play(side: string, startedAt?: number) {
@@ -284,6 +546,11 @@
 			const r = await api.playSide(open.id, {
 				side,
 				started_at: startedAt,
+				// What it ran through. Sent explicitly rather than left to the
+				// stored default so that changing the picker for one side takes
+				// effect on that side, and is remembered for the next.
+				chain_id: playChain,
+				equipment_id: playGear,
 				// Only when this deck ran the side; "already played" has none.
 				tracks: spinning && spinning.releaseId === open.id ? spinning.outcomes : undefined
 			});
@@ -336,8 +603,16 @@
 		// Drives the countdown and the "side is over" prompt. One second is the
 		// right resolution for a twenty-minute side and costs nothing.
 		const tick = setInterval(() => (nowSec = Math.floor(Date.now() / 1000)), 1000);
+		// The heartbeat. Ten seconds against the registry's own ten-second grace
+		// on a finished track, so a paused record never falls off the dashboard
+		// between reports.
+		const beat = setInterval(() => { if (spinning) void pushDeck(); }, 10_000);
 		load();
-		return () => clearInterval(tick);
+		loadGear();
+		return () => {
+			clearInterval(tick);
+			clearInterval(beat);
+		};
 	});
 </script>
 
@@ -351,9 +626,18 @@
 			side or a disc records every track on it.
 		</p>
 	</div>
-	<button class="btn btn-primary" on:click={() => (adding = !adding)}>
-		{adding ? 'Cancel' : 'Add to the shelf'}
-	</button>
+	<div style="display:flex;gap:8px;">
+		<!-- A plain link, not a fetch: the browser downloads a zip far better
+		     than any amount of Blob juggling, and the endpoint is a GET the
+		     session cookie already authenticates. -->
+		<a class="btn btn-secondary" href="/api/v1/physical/export"
+			title="Everything about the objects you own — pressings, sides played, gear, and your own scans">
+			Export the shelf
+		</a>
+		<button class="btn btn-primary" on:click={() => (adding = !adding)}>
+			{adding ? 'Cancel' : 'Add to the shelf'}
+		</button>
+	</div>
 </div>
 
 {#if adding}
@@ -387,6 +671,10 @@
 				<input id="f-rel" class="input" bind:value={qRelease} placeholder="The Wall"
 					on:keydown={(e) => e.key === 'Enter' && search()}>
 			</div>
+			<div class="field">
+				<label for="f-buy">Bought on</label>
+				<input id="f-buy" class="input" type="date" bind:value={buyDate}>
+			</div>
 		</div>
 
 		<div style="display:flex;align-items:center;gap:12px;margin-top:14px;flex-wrap:wrap;">
@@ -407,9 +695,13 @@
 			</p>
 		{/if}
 
-		{#each searchNotes as n}
-			<p style="font-size:13px;color:#b2622d;margin:10px 0 0;">{n}</p>
-		{/each}
+			{#each searchNotes as n}
+				<p style="font-size:13px;color:#b2622d;margin:10px 0 0;">{n}</p>
+			{/each}
+
+			{#if addedNote}
+				<p style="font-size:13px;color:var(--td-good-fg);margin:10px 0 0;">{addedNote}</p>
+			{/if}
 
 		{#if candidates.length}
 			<div style="margin-top:18px;">
@@ -524,6 +816,7 @@
 						{:else}
 							· never played
 						{/if}
+						{#if r.image_count}· {r.image_count} scan{r.image_count === 1 ? '' : 's'}{/if}
 					</div>
 				</div>
 			</button>
@@ -544,6 +837,11 @@
 				{#if open.last_played}
 					<p style="margin:4px 0 0;color:var(--td-muted-2);font-size:12.5px;">
 						Last played {formatDateTime(open.last_played)}
+					</p>
+				{/if}
+				{#if open.purchased_at}
+					<p style="margin:2px 0 0;color:var(--td-muted-2);font-size:12.5px;">
+						Yours for {ownedFor(open.purchased_at)} — bought {formatDateTime(open.purchased_at).split(',')[0]}
 					</p>
 				{/if}
 			</div>
@@ -705,6 +1003,45 @@
 				<p style="font-size:13px;color:var(--td-good-fg);margin:14px 0 0;">{playMsg}</p>
 			{/if}
 
+			<!-- What it goes on, and when it became yours. Both are facts about
+			     the object rather than about the music, so they sit together and
+			     above the sides — the picker decides how the next side is
+			     attributed, which is no use discovered afterwards. -->
+			<div class="keeping">
+				<div class="field" style="flex:1;min-width:190px;">
+					<label for="k-chain" style="display:flex;align-items:center;gap:6px;">
+						<ChainIcon name={chains.find((c) => c.id === playChain)?.icon} size={14} />
+						Played through
+					</label>
+					<select id="k-chain" class="input" bind:value={playChain} on:change={saveMeta}>
+						<option value={null}>— no chain —</option>
+						{#each chains as c}<option value={c.id}>{c.name}</option>{/each}
+					</select>
+				</div>
+				<div class="field" style="flex:1;min-width:190px;">
+					<label for="k-gear">On</label>
+					<select id="k-gear" class="input" bind:value={playGear} on:change={saveMeta}>
+						<option value={null}>— no deck —</option>
+						{#each gear as g}<option value={g.id}>{g.name}{g.brand ? ` — ${g.brand}` : ''}</option>{/each}
+					</select>
+				</div>
+				<div class="field" style="flex:0 0 160px;">
+					<label for="k-buy">Bought on</label>
+					<input id="k-buy" class="input" type="date" bind:value={purchased} on:change={saveMeta}>
+				</div>
+				<div style="font-size:12px;color:var(--td-muted-2);flex:1;min-width:180px;align-self:center;">
+					{#if savingMeta}
+						Saving…
+					{:else if !chains.length}
+						No signal chains yet — add one under Signal Chains and every side
+						you play will be attributed to it.
+					{:else}
+						Remembered for next time. The stylus hours of the deck and the
+						chain's own hours both come from the sides played through it.
+					{/if}
+				</div>
+			</div>
+
 			<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:14px;margin-top:18px;">
 				{#each sides as side}
 					<div class="side">
@@ -745,8 +1082,97 @@
 				the clock.
 			</p>
 		{/if}
+
+		<!-- Outside the tracklist branch on purpose: a pressing nobody has
+		     entered a tracklist for still has a sleeve, and the scans are most of
+		     what makes this feel like the shelf rather than a database of it. -->
+		<div class="scans">
+			<div style="display:flex;align-items:flex-end;justify-content:space-between;gap:12px;flex-wrap:wrap;">
+				<div>
+					<h4 class="h-display" style="font-size:17px;margin:0;">Sleeve &amp; scans</h4>
+					<p style="margin:3px 0 0;color:var(--td-muted);font-size:12.5px;">
+						{images.length
+							? `${images.length} image${images.length === 1 ? '' : 's'} — the archive's, and your own.`
+							: 'Nothing yet. Pull what the Cover Art Archive holds, or scan your own copy.'}
+					</p>
+				</div>
+				<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
+					<select class="input" style="width:auto;padding:7px 10px;font-size:13px;" bind:value={uploadKind}
+						title="What the scans you are about to upload are">
+						{#each KIND_ORDER as k}<option value={k}>{kindLabel(k)}</option>{/each}
+					</select>
+					<label class="btn btn-secondary" style="cursor:pointer;margin:0;">
+						{imagesBusy ? 'Working…' : 'Upload scans'}
+						<input type="file" accept="image/*" multiple on:change={uploadScans}
+							disabled={imagesBusy} style="display:none;">
+					</label>
+					<button class="btn btn-secondary" on:click={fetchArt} disabled={imagesBusy}>
+						{imagesBusy ? '…' : 'Fetch from the archive'}
+					</button>
+				</div>
+			</div>
+
+			{#if imageNote}
+				<p style="font-size:12.5px;color:var(--td-muted);margin:10px 0 0;">{imageNote}</p>
+			{/if}
+
+			{#each gallery as group}
+				<div style="margin-top:16px;">
+					<div style="font-size:11px;letter-spacing:.14em;text-transform:uppercase;color:var(--td-muted-2);font-weight:600;margin-bottom:8px;">
+						{kindLabel(group.kind)}
+						<span style="letter-spacing:0;text-transform:none;font-weight:400;">
+							· {group.items.length}
+						</span>
+					</div>
+					<div class="thumbs">
+						{#each group.items as img}
+							<button class="thumb" on:click={() => (lightbox = flat.indexOf(img))}
+								title={img.caption ?? kindLabel(img.kind)}>
+								<img src={img.thumb} alt={img.caption ?? kindLabel(img.kind)} loading="lazy">
+								{#if img.provider === 'upload'}
+									<!-- Whose scan this is, at a glance. Your own copy and a
+									     stranger's upload of a different pressing are not the
+									     same thing, and only one of them is in this room. -->
+									<span class="mine" title="Your own scan">yours</span>
+								{/if}
+							</button>
+						{/each}
+					</div>
+				</div>
+			{/each}
+		</div>
 	</div>
 {/if}
+
+<!-- The lightbox. A booklet is the one thing here worth looking at full size,
+     and nineteen pages need arrows rather than nineteen round trips. -->
+{#if lightbox >= 0 && flat[lightbox]}
+	<div class="lb" role="presentation" on:click={() => (lightbox = -1)}>
+		<img src={flat[lightbox].src} alt={flat[lightbox].caption ?? kindLabel(flat[lightbox].kind)}
+			on:click|stopPropagation role="presentation">
+		<div class="lb-bar" role="presentation" on:click|stopPropagation>
+			<span style="flex:1;min-width:0;">
+				<strong>{kindLabel(flat[lightbox].kind)}</strong>
+				{#if flat[lightbox].caption}<span style="color:var(--td-muted);"> · {flat[lightbox].caption}</span>{/if}
+				<span style="color:var(--td-muted-2);"> · {lightbox + 1} of {flat.length}</span>
+				<span style="color:var(--td-muted-2);">
+					· {flat[lightbox].provider === 'upload' ? 'your scan' : flat[lightbox].provider === 'caa' ? 'Cover Art Archive' : 'Discogs'}
+				</span>
+			</span>
+			<select class="input" style="width:auto;padding:5px 8px;font-size:12.5px;"
+				value={flat[lightbox].kind}
+				on:change={(e) => refile(flat[lightbox], (e.currentTarget as HTMLSelectElement).value)}>
+				{#each KIND_ORDER as k}<option value={k}>{kindLabel(k)}</option>{/each}
+			</select>
+			<button class="btn btn-secondary" on:click={() => (lightbox = (lightbox - 1 + flat.length) % flat.length)}>←</button>
+			<button class="btn btn-secondary" on:click={() => (lightbox = (lightbox + 1) % flat.length)}>→</button>
+			<button class="btn btn-secondary" on:click={() => removeImage(flat[lightbox])}>Remove</button>
+			<button class="btn btn-secondary" on:click={() => (lightbox = -1)}>Close</button>
+		</div>
+	</div>
+{/if}
+
+<svelte:window on:keydown={lightboxKeys} />
 
 <style>
 	.chip {
@@ -789,6 +1215,89 @@
 		border: 1px solid var(--td-line);
 		border-radius: 14px;
 		padding: 14px;
+	}
+	/* Facts about the object rather than about the music, so they read as a
+	   strip of form rather than as another card. */
+	.keeping {
+		display: flex;
+		gap: 12px;
+		flex-wrap: wrap;
+		align-items: flex-end;
+		margin-top: 18px;
+		padding: 14px;
+		border: 1px solid var(--td-line);
+		border-radius: 14px;
+	}
+
+	.scans {
+		margin-top: 22px;
+		padding-top: 18px;
+		border-top: 1px solid var(--td-line);
+	}
+	/* Fixed rows rather than `auto-fill` alone: a booklet is twenty pages of the
+	   same shape, and letting them size themselves makes a wall of slightly
+	   different rectangles. */
+	.thumbs {
+		display: grid;
+		grid-template-columns: repeat(auto-fill, minmax(94px, 1fr));
+		gap: 10px;
+	}
+	.thumb {
+		position: relative;
+		aspect-ratio: 1;
+		padding: 0;
+		border: 1px solid var(--td-line);
+		border-radius: 10px;
+		overflow: hidden;
+		background: var(--td-panel);
+		cursor: pointer;
+		transition: border-color 0.15s, transform 0.15s;
+	}
+	.thumb:hover { border-color: var(--td-accent); transform: translateY(-1px); }
+	.thumb img { width: 100%; height: 100%; object-fit: cover; display: block; }
+	.mine {
+		position: absolute;
+		left: 5px;
+		bottom: 5px;
+		padding: 1px 6px;
+		border-radius: 999px;
+		font-size: 10px;
+		font-weight: 600;
+		letter-spacing: 0.04em;
+		background: var(--td-accent);
+		color: #fff;
+	}
+
+	.lb {
+		position: fixed;
+		inset: 0;
+		z-index: 60;
+		display: flex;
+		flex-direction: column;
+		align-items: center;
+		justify-content: center;
+		gap: 12px;
+		padding: 24px;
+		background: rgba(0, 0, 0, 0.82);
+	}
+	.lb img {
+		max-width: 100%;
+		/* Room for the bar underneath, or a tall booklet page pushes it off. */
+		max-height: calc(100vh - 130px);
+		object-fit: contain;
+		border-radius: 8px;
+	}
+	.lb-bar {
+		display: flex;
+		gap: 8px;
+		align-items: center;
+		flex-wrap: wrap;
+		max-width: 100%;
+		padding: 10px 14px;
+		border-radius: 14px;
+		background: var(--td-panel);
+		border: 1px solid var(--td-line);
+		font-size: 13px;
 	}
 	/* The deck only moves while a side is actually on — a still platter is the
 	   honest signal that nothing is playing, the same rule the dashboard's reels

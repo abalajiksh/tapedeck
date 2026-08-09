@@ -665,6 +665,224 @@ pub async fn discogs_release(
     }))
 }
 
+// ════════════════════════════════════════════════════════════
+//  Everything else in the sleeve
+// ════════════════════════════════════════════════════════════
+
+/// One image the Cover Art Archive holds for a release.
+///
+/// Distinct from the single `artwork_url` a candidate carries: that is the
+/// cover, and this is *everything else* — the back, the spine, the label, the
+/// obi strip, and every page of the booklet. The archive holds 29 for the
+/// pressing this was built against, 19 of them booklet pages, which is why the
+/// shelf stores rows rather than one more column.
+#[derive(Debug, Clone, Serialize)]
+pub struct ArchiveImage {
+    /// Tapedeck's own vocabulary — see `image_kind`.
+    pub kind: String,
+    /// Full-size. Always present; the archive's `image` field is the file.
+    pub url: String,
+    /// A 250px edge for the gallery grid. Absent on very old uploads that
+    /// predate thumbnail generation, which is why it is optional rather than
+    /// derived from `url` by string surgery.
+    pub thumb_url: Option<String>,
+    /// The editor's own note — "inner left panel", "page 3". Worth keeping:
+    /// nineteen booklet pages are indistinguishable without it.
+    pub caption: Option<String>,
+    /// The archive's image id, as a string. It is a 64-bit number in the JSON
+    /// and there is no arithmetic to do on it, so it is carried as text — which
+    /// is also what makes one storage column serve Discogs' ids too.
+    pub id: String,
+    /// The archive's own ordering, which puts the cover first and the booklet
+    /// in page order. Kept rather than re-sorted: it is editor-curated, and no
+    /// rule invented here would beat it.
+    pub position: i64,
+    /// Whether a MusicBrainz editor has approved the upload.
+    pub approved: bool,
+}
+
+/// The type priority when an image claims several.
+///
+/// The archive lets one file be `["Front", "Sticker"]` (a sealed copy) or
+/// `["Medium", "Matrix/Runout"]` (a label shot that happens to show the
+/// runout), so a first-wins rule files the cover under "sticker". The most
+/// structural description wins instead.
+const KIND_PRIORITY: &[(&str, &str)] = &[
+    ("Front", "front"),
+    ("Back", "back"),
+    ("Booklet", "booklet"),
+    ("Medium", "medium"),
+    ("Tray", "tray"),
+    ("Obi", "obi"),
+    ("Spine", "spine"),
+    ("Liner", "liner"),
+    ("Track", "track"),
+    ("Sticker", "sticker"),
+    ("Poster", "poster"),
+    ("Matrix/Runout", "matrix"),
+];
+
+/// Which of Tapedeck's kinds an archive image is.
+///
+/// An unrecognised type is **slugified rather than dumped into `other`**: the
+/// archive's vocabulary grows — `Panel` is on the very release this was checked
+/// against and is not in any of the documentation — and "inner left panel" is a
+/// more useful shelf heading than "other". Only a type with nothing usable in
+/// it falls all the way through.
+pub fn image_kind(types: &[String]) -> String {
+    for (archive, ours) in KIND_PRIORITY {
+        if types.iter().any(|t| t.eq_ignore_ascii_case(archive)) {
+            return (*ours).to_string();
+        }
+    }
+    types
+        .first()
+        .map(|t| {
+            t.chars()
+                .take_while(|c| c.is_ascii_alphanumeric())
+                .flat_map(|c| c.to_lowercase())
+                .collect::<String>()
+        })
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "other".to_string())
+}
+
+/// Parse a Cover Art Archive index. Split out from the fetch so the shapes can
+/// be pinned against a captured response rather than the live service.
+pub fn parse_cover_art(body: &str) -> Result<Vec<ArchiveImage>, Box<dyn std::error::Error>> {
+    #[derive(Deserialize)]
+    struct Index {
+        #[serde(default)]
+        images: Vec<Img>,
+    }
+    #[derive(Deserialize)]
+    struct Img {
+        #[serde(default)]
+        types: Vec<String>,
+        image: Option<String>,
+        #[serde(default)]
+        thumbnails: std::collections::HashMap<String, String>,
+        #[serde(default)]
+        comment: String,
+        // The archive has served this as a number and as a string across its
+        // lifetime, and a strict type here would fail the whole document — the
+        // same class of bug `lenient_track_number` exists for.
+        id: Option<serde_json::Value>,
+        #[serde(default)]
+        approved: bool,
+    }
+
+    let index: Index = serde_json::from_str(body)?;
+    Ok(index
+        .images
+        .into_iter()
+        .enumerate()
+        .filter_map(|(i, img)| {
+            let url = img.image?;
+            let id = match img.id {
+                Some(serde_json::Value::String(s)) => s,
+                Some(serde_json::Value::Number(n)) => n.to_string(),
+                // No id means nothing to key an update on, so the row would
+                // duplicate on every re-fetch. The URL is unique per file and
+                // stable, which is exactly what is needed.
+                _ => url.clone(),
+            };
+            Some(ArchiveImage {
+                kind: image_kind(&img.types),
+                thumb_url: img
+                    .thumbnails
+                    .get("250")
+                    .or_else(|| img.thumbnails.get("small"))
+                    .or_else(|| img.thumbnails.get("500"))
+                    .cloned(),
+                url,
+                caption: Some(img.comment.trim().to_string()).filter(|c| !c.is_empty()),
+                id,
+                position: i as i64,
+                approved: img.approved,
+            })
+        })
+        .collect())
+}
+
+/// Fetch everything the Cover Art Archive holds for a release MBID.
+///
+/// No credential, no rate limit worth pacing for, and one request per release —
+/// so this runs when the user asks rather than on a backfill clock. A release
+/// with no art at all answers **404**, which is a normal outcome and comes back
+/// as an empty list rather than an error: most pressings have a cover and
+/// nothing else.
+pub async fn cover_art_archive(
+    mbid: &str,
+) -> Result<Vec<ArchiveImage>, Box<dyn std::error::Error>> {
+    let url = format!("https://coverartarchive.org/release/{mbid}");
+    let resp = client()?.get(&url).send().await?;
+    if resp.status() == reqwest::StatusCode::NOT_FOUND {
+        debug!("No cover art archived for {}", mbid);
+        return Ok(Vec::new());
+    }
+    if !resp.status().is_success() {
+        return Err(format!("Cover Art Archive returned {}", resp.status()).into());
+    }
+    parse_cover_art(&resp.text().await?)
+}
+
+/// Every image Discogs holds for a release, in its own order.
+///
+/// Discogs serves images only to an authenticated caller, which is why this
+/// takes the credential and why an instance with none simply gets the archive's
+/// set. Its images carry no per-image id, so the URL is the key.
+pub async fn discogs_images(
+    auth: &DiscogsAuth,
+    id: &str,
+) -> Result<Vec<ArchiveImage>, Box<dyn std::error::Error>> {
+    #[derive(Deserialize)]
+    struct Release {
+        #[serde(default)]
+        images: Vec<Image>,
+    }
+    #[derive(Deserialize)]
+    struct Image {
+        #[serde(rename = "type")]
+        kind: Option<String>,
+        uri: Option<String>,
+        uri150: Option<String>,
+    }
+
+    let url = format!("https://api.discogs.com/releases/{id}");
+    let resp =
+        client()?.get(&url).header(reqwest::header::AUTHORIZATION, auth.header()).send().await?;
+    if !resp.status().is_success() {
+        return Err(format!("Discogs returned {}", resp.status()).into());
+    }
+    let release: Release = resp.json().await?;
+    Ok(release
+        .images
+        .into_iter()
+        .enumerate()
+        .filter_map(|(i, img)| {
+            let url = img.uri?;
+            Some(ArchiveImage {
+                // Discogs says only "primary" or "secondary". Primary is the
+                // cover; secondary could be anything, and claiming to know
+                // which would be inventing a fact — so it is left unsorted and
+                // the user files it if they care.
+                kind: if img.kind.as_deref() == Some("primary") {
+                    "front".to_string()
+                } else {
+                    "other".to_string()
+                },
+                thumb_url: img.uri150,
+                caption: None,
+                id: url.clone(),
+                url,
+                position: i as i64,
+                approved: true,
+            })
+        })
+        .collect())
+}
+
 /// Discogs writes durations as "4:33", and leaves them blank often enough that
 /// a missing one has to be a normal answer rather than a parse failure.
 fn parse_duration(raw: Option<&str>) -> Option<i64> {
@@ -779,5 +997,89 @@ mod tests {
         assert_eq!(parse_duration(Some("")), None);
         assert_eq!(parse_duration(None), None);
         assert_eq!(parse_duration(Some("0:00")), None);
+    }
+
+    /// Five images lifted verbatim out of the live archive's answer for
+    /// `6940fcdf-6e70-4764-8782-18e2c1e600de` on 2026-08-09 — the release that
+    /// prompted this, which carries 29 images of which 19 are booklet pages.
+    /// Chosen for the four shapes that are easy to get wrong rather than for
+    /// coverage: a plain front, a front that is *also* a sticker, a type
+    /// (`Panel`) that appears in no documentation, and a label shot that also
+    /// claims `Matrix/Runout`.
+    const CAA_INDEX: &str = r#"{"images": [
+  {"approved": true, "back": false, "comment": "", "edit": 137479011, "front": true, "id": 43788051983, "image": "https://coverartarchive.org/release/6940fcdf-6e70-4764-8782-18e2c1e600de/43788051983.jpg", "thumbnails": {"1200": "https://coverartarchive.org/release/6940fcdf-6e70-4764-8782-18e2c1e600de/43788051983-1200.jpg", "250": "https://coverartarchive.org/release/6940fcdf-6e70-4764-8782-18e2c1e600de/43788051983-250.jpg", "500": "https://coverartarchive.org/release/6940fcdf-6e70-4764-8782-18e2c1e600de/43788051983-500.jpg", "large": "https://coverartarchive.org/release/6940fcdf-6e70-4764-8782-18e2c1e600de/43788051983-500.jpg", "small": "https://coverartarchive.org/release/6940fcdf-6e70-4764-8782-18e2c1e600de/43788051983-250.jpg"}, "types": ["Front"]},
+  {"approved": true, "back": false, "comment": "", "edit": 137479198, "front": false, "id": 43788065411, "image": "https://coverartarchive.org/release/6940fcdf-6e70-4764-8782-18e2c1e600de/43788065411.jpg", "thumbnails": {"1200": "https://coverartarchive.org/release/6940fcdf-6e70-4764-8782-18e2c1e600de/43788065411-1200.jpg", "250": "https://coverartarchive.org/release/6940fcdf-6e70-4764-8782-18e2c1e600de/43788065411-250.jpg", "500": "https://coverartarchive.org/release/6940fcdf-6e70-4764-8782-18e2c1e600de/43788065411-500.jpg", "large": "https://coverartarchive.org/release/6940fcdf-6e70-4764-8782-18e2c1e600de/43788065411-500.jpg", "small": "https://coverartarchive.org/release/6940fcdf-6e70-4764-8782-18e2c1e600de/43788065411-250.jpg"}, "types": ["Front", "Sticker"]},
+  {"approved": true, "back": false, "comment": "inner left panel", "edit": 137479013, "front": false, "id": 43788052682, "image": "https://coverartarchive.org/release/6940fcdf-6e70-4764-8782-18e2c1e600de/43788052682.jpg", "thumbnails": {"1200": "https://coverartarchive.org/release/6940fcdf-6e70-4764-8782-18e2c1e600de/43788052682-1200.jpg", "250": "https://coverartarchive.org/release/6940fcdf-6e70-4764-8782-18e2c1e600de/43788052682-250.jpg", "500": "https://coverartarchive.org/release/6940fcdf-6e70-4764-8782-18e2c1e600de/43788052682-500.jpg", "large": "https://coverartarchive.org/release/6940fcdf-6e70-4764-8782-18e2c1e600de/43788052682-500.jpg", "small": "https://coverartarchive.org/release/6940fcdf-6e70-4764-8782-18e2c1e600de/43788052682-250.jpg"}, "types": ["Panel"]},
+  {"approved": true, "back": false, "comment": "disc 1: AN92540-01 manufactured by optimal media GmbH", "edit": 137479046, "front": false, "id": 43788054709, "image": "https://coverartarchive.org/release/6940fcdf-6e70-4764-8782-18e2c1e600de/43788054709.jpg", "thumbnails": {"1200": "https://coverartarchive.org/release/6940fcdf-6e70-4764-8782-18e2c1e600de/43788054709-1200.jpg", "250": "https://coverartarchive.org/release/6940fcdf-6e70-4764-8782-18e2c1e600de/43788054709-250.jpg", "500": "https://coverartarchive.org/release/6940fcdf-6e70-4764-8782-18e2c1e600de/43788054709-500.jpg", "large": "https://coverartarchive.org/release/6940fcdf-6e70-4764-8782-18e2c1e600de/43788054709-500.jpg", "small": "https://coverartarchive.org/release/6940fcdf-6e70-4764-8782-18e2c1e600de/43788054709-250.jpg"}, "types": ["Medium", "Matrix/Runout"]},
+  {"approved": true, "back": false, "comment": "page 1 of 20", "edit": 137479075, "front": false, "id": 43788056657, "image": "https://coverartarchive.org/release/6940fcdf-6e70-4764-8782-18e2c1e600de/43788056657.jpg", "thumbnails": {"1200": "https://coverartarchive.org/release/6940fcdf-6e70-4764-8782-18e2c1e600de/43788056657-1200.jpg", "250": "https://coverartarchive.org/release/6940fcdf-6e70-4764-8782-18e2c1e600de/43788056657-250.jpg", "500": "https://coverartarchive.org/release/6940fcdf-6e70-4764-8782-18e2c1e600de/43788056657-500.jpg", "large": "https://coverartarchive.org/release/6940fcdf-6e70-4764-8782-18e2c1e600de/43788056657-500.jpg", "small": "https://coverartarchive.org/release/6940fcdf-6e70-4764-8782-18e2c1e600de/43788056657-250.jpg"}, "types": ["Booklet"]}
+], "release": "https://musicbrainz.org/release/6940fcdf-6e70-4764-8782-18e2c1e600de"}"#;
+
+    #[test]
+    fn a_real_cover_art_index_parses() {
+        let images = parse_cover_art(CAA_INDEX).expect("the archive's own JSON");
+        assert_eq!(images.len(), 5);
+
+        let kinds: Vec<&str> = images.iter().map(|i| i.kind.as_str()).collect();
+        assert_eq!(kinds, vec!["front", "front", "panel", "medium", "booklet"]);
+
+        // A 64-bit id must survive as text. Parsed as an i32 this would
+        // overflow; parsed as a float it would come back as 43788051983.0 and
+        // never match the row it wrote.
+        assert_eq!(images[0].id, "43788051983");
+        assert!(images[0].thumb_url.as_deref().unwrap().ends_with("-250.jpg"));
+
+        // The editor's note is the only thing telling nineteen booklet pages
+        // apart, so it has to survive; an empty one must not become "".
+        assert_eq!(images[0].caption, None);
+        assert_eq!(images[4].caption.as_deref(), Some("page 1 of 20"));
+
+        // The archive's own order is kept — it puts the cover first.
+        assert_eq!(images.iter().map(|i| i.position).collect::<Vec<_>>(), vec![0, 1, 2, 3, 4]);
+    }
+
+    /// The two multi-type cases, stated on their own because a first-wins rule
+    /// passes every other assertion in the test above.
+    #[test]
+    fn the_most_structural_type_wins_when_an_image_claims_several() {
+        assert_eq!(image_kind(&["Front".into(), "Sticker".into()]), "front");
+        assert_eq!(image_kind(&["Sticker".into(), "Front".into()]), "front");
+        assert_eq!(image_kind(&["Medium".into(), "Matrix/Runout".into()]), "medium");
+        assert_eq!(image_kind(&["Matrix/Runout".into()]), "matrix");
+    }
+
+    /// The archive's vocabulary grows — `Panel` is on the release this was
+    /// built against and appears in none of the documentation. An unknown type
+    /// is slugified rather than swallowed into "other", because "inner left
+    /// panel" filed under *panel* is a usable shelf heading and filed under
+    /// *other* is not.
+    #[test]
+    fn an_unknown_type_keeps_its_name() {
+        assert_eq!(image_kind(&["Panel".into()]), "panel");
+        assert_eq!(image_kind(&["Raw/Unedited".into()]), "raw");
+        assert_eq!(image_kind(&[]), "other");
+        assert_eq!(image_kind(&["!!".into()]), "other");
+    }
+
+    /// A release with no art at all is a 404 from the archive and the common
+    /// case for anything obscure, so it must read as "nothing here" rather than
+    /// as a failure. This pins the parse half; the status half is in
+    /// `cover_art_archive`.
+    #[test]
+    fn an_empty_index_is_not_an_error() {
+        assert!(parse_cover_art(r#"{"images": []}"#).unwrap().is_empty());
+        assert!(parse_cover_art("{}").unwrap().is_empty());
+    }
+
+    /// Live, ignored by default like the MusicBrainz lookup beside it.
+    #[tokio::test]
+    #[ignore]
+    async fn caa_live_lookup() {
+        let images = cover_art_archive("6940fcdf-6e70-4764-8782-18e2c1e600de").await.unwrap();
+        assert!(images.len() > 20, "expected the full sleeve, got {}", images.len());
+        assert!(images.iter().any(|i| i.kind == "booklet"));
+        assert_eq!(
+            cover_art_archive("00000000-0000-0000-0000-000000000000").await.unwrap().len(),
+            0
+        );
     }
 }

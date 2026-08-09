@@ -139,6 +139,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ),
         everynoise,
         everynoise_jobs: Default::default(),
+        uploads_dir: std::path::PathBuf::from(&config.database.uploads_dir),
     });
 
     let app = server::build_app(app_state);

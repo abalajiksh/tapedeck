@@ -38,6 +38,45 @@ export function formatDuration(seconds: number | null | undefined): string {
 	return `${m}:${String(s).padStart(2, '0')}`;
 }
 
+/**
+ * A unix timestamp as `YYYY-MM-DD` for an `<input type="date">`.
+ *
+ * Built from the **local** calendar parts rather than `toISOString().slice(0,10)`,
+ * which converts to UTC first — so a purchase stored at 23:00 CET would show as
+ * the day before, and saving without touching the field would then move it.
+ */
+export function toDateInput(ts: number | null | undefined): string {
+	if (ts == null) return '';
+	const d = new Date(ts * 1000);
+	const p = (n: number) => String(n).padStart(2, '0');
+	return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
+}
+
+/** The other direction. Midday local, not midnight: a date with no time in it
+ *  should not be able to land on the previous day under any timezone. */
+export function fromDateInput(value: string): number | null {
+	if (!value) return null;
+	const [y, m, d] = value.split('-').map(Number);
+	if (!y || !m || !d) return null;
+	return Math.floor(new Date(y, m - 1, d, 12, 0, 0).getTime() / 1000);
+}
+
+/**
+ * How long something has been owned, in the coarsest unit that still says
+ * something — "3 years" rather than "3 years, 2 months, 11 days", which is
+ * precision nobody asked for about a date most people are estimating anyway.
+ */
+export function ownedFor(purchasedAt: number | null | undefined): string {
+	if (purchasedAt == null) return '';
+	const days = Math.floor((Date.now() / 1000 - purchasedAt) / 86400);
+	if (days < 0) return 'not yet';
+	if (days < 31) return days <= 1 ? 'new' : `${days} days`;
+	const months = Math.floor(days / 30.44);
+	if (months < 24) return `${months} month${months === 1 ? '' : 's'}`;
+	const years = Math.floor(days / 365.25);
+	return `${years} years`;
+}
+
 /** Format hours to a human-friendly string */
 export function formatHours(hours: number): string {
 	if (hours < 1) return `${Math.round(hours * 60)}min`;

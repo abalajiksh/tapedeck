@@ -23,6 +23,10 @@ trust_proxy = false
 scrobble_db_url = "sqlite:scrobbles.db"
 # Separate SQLite file for the MusicBrainz metadata cache.
 sqlite_path = "./tapedeck.db"
+# Uploaded sleeve and booklet scans. Files beside the database rather than blobs
+# inside it, so `GET /api/v1/backup` does not carry them — back this directory up
+# too, or use `GET /api/v1/physical/export`.
+uploads_dir = "./uploads"
 
 [logging]
 level = "info"

@@ -69,6 +69,9 @@ pub struct AppState {
     pub everynoise: crate::everynoise::store::EveryNoiseStore,
     /// Progress for the one genre-map scrape that may be running.
     pub everynoise_jobs: crate::everynoise::scrape::ScrapeRegistry,
+    /// Where uploaded sleeve and booklet scans live on disk. Outside the
+    /// database on purpose — see `DatabaseConfig::uploads_dir`.
+    pub uploads_dir: std::path::PathBuf,
 }
 
 /// Build the full Axum application.

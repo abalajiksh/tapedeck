@@ -2,7 +2,7 @@
 	import { onMount, tick } from 'svelte';
 	import { api } from '$lib/api';
 	import type { SignalChain, Equipment, ChainComponent, ChainInput, EquipmentInput, Binding, Device } from '$lib/api';
-	import { formatHours, timeAgo } from '$lib/utils';
+	import { formatHours, timeAgo, toDateInput, fromDateInput, ownedFor, formatDateTime } from '$lib/utils';
 	import ChainIcon, { CHAIN_ICONS, CHAIN_ICON_LABELS } from '$lib/components/ChainIcon.svelte';
 
 	let chains: SignalChain[] = [];
@@ -101,6 +101,10 @@
 	let gearOpen = false;
 	let gearId: number | null = null;
 	let gName = '', gType = 'headphones', gBrand = '', gModel = '', gNotes = '';
+	/** When it was bought, as `YYYY-MM-DD`. Distinct from `first_used`, which is
+	 *  when Tapedeck first saw it — most gear is owned well before it is
+	 *  catalogued, and burn-in hours are counted from the purchase. */
+	let gBought = '';
 	let savingGear = false;
 	let confirmGear: Equipment | null = null;
 	// Set when the gear dialog was opened from inside a chain component row, so
@@ -252,10 +256,16 @@
 	// ── equipment editor ──
 	function newGear() {
 		gearId = null; gName = ''; gType = 'headphones'; gBrand = ''; gModel = ''; gNotes = '';
+		gBought = '';
 		gearOpen = true;
 	}
 	function editGear(e: Equipment) {
-		gearId = e.id; gName = e.name; gType = e.equipment_type; gBrand = e.brand ?? ''; gModel = e.model ?? ''; gNotes = '';
+		gearId = e.id; gName = e.name; gType = e.equipment_type; gBrand = e.brand ?? ''; gModel = e.model ?? '';
+		// Read back rather than blanked. The save below writes every field, so a
+		// field this dialog does not load is a field editing the brand silently
+		// erases — which is exactly what an edit did to a note before this.
+		gNotes = e.notes ?? '';
+		gBought = toDateInput(e.purchased_at);
 		gearOpen = true;
 	}
 	function closeGear() { gearOpen = false; gearForComp = null; }
@@ -265,7 +275,9 @@
 		savingGear = true;
 		const data: EquipmentInput = {
 			name: gName.trim(), type: gType,
-			brand: gBrand.trim() || undefined, model: gModel.trim() || undefined, notes: gNotes.trim() || undefined
+			brand: gBrand.trim() || undefined, model: gModel.trim() || undefined,
+			notes: gNotes.trim() || undefined,
+			purchased_at: fromDateInput(gBought)
 		};
 		try {
 			const result = gearId == null ? await api.createEquipment(data) : await api.updateEquipment(gearId, data);
@@ -385,7 +397,7 @@
 	<div class="panel" style="border-radius:22px;overflow:hidden;padding:6px 20px 14px;margin-bottom:34px;">
 		{#if equipment.length}
 			<table class="table">
-				<thead><tr><th>Gear</th><th>Type</th><th>Brand</th><th>In chains</th><th style="text-align:right;">Hours</th><th></th></tr></thead>
+				<thead><tr><th>Gear</th><th>Type</th><th>Brand</th><th>In chains</th><th>Owned</th><th style="text-align:right;">Hours</th><th></th></tr></thead>
 				<tbody>
 					{#each equipment as e (e.id)}
 						<tr id={`gear-${e.id}`} class:highlight={highlightGear === e.id}>
@@ -393,6 +405,9 @@
 							<td style="color:var(--td-muted);">{gearTypeLabel(e.equipment_type)}</td>
 							<td style="color:var(--td-muted);">{e.brand ?? '—'}</td>
 							<td style="color:var(--td-muted);font-size:12.5px;">{chainsUsing(e).map((c) => c.name).join(', ') || '—'}</td>
+							<td style="color:var(--td-muted);font-size:12.5px;" title={e.purchased_at ? formatDateTime(e.purchased_at).split(',')[0] : ''}>
+								{e.purchased_at ? ownedFor(e.purchased_at) : '—'}
+							</td>
 							<td style="text-align:right;color:var(--td-good-fg);font-weight:600;">{formatHours(e.total_hours)}</td>
 							<td style="text-align:right;white-space:nowrap;">
 								<button class="icon-btn" title="Edit" on:click={() => editGear(e)} aria-label="Edit gear">
@@ -484,8 +499,16 @@
 						<select id="cx" class="input" bind:value={cContext}>{#each contexts as ct}<option value={ct}>{ct}</option>{/each}</select>
 					</div>
 					<div style="margin-bottom:14px;">
-						<span style="display:block;font-size:13px;color:var(--td-muted);margin-bottom:7px;">Icon</span>
-						<div style="display:flex;gap:7px;flex-wrap:wrap;">
+						<div style="display:flex;align-items:baseline;justify-content:space-between;gap:10px;margin-bottom:7px;">
+							<span style="font-size:13px;color:var(--td-muted);">Icon</span>
+							<!-- The set is large enough now that a wall of glyphs needs to
+							     say what the hovered-or-chosen one is; a tooltip alone means
+							     hunting. -->
+							<span style="font-size:12px;color:var(--td-muted-2);">
+								{cIcon ? CHAIN_ICON_LABELS[cIcon] ?? cIcon : 'No icon'}
+							</span>
+						</div>
+						<div class="icon-grid">
 							<button type="button" class="icon-pick" class:on={!cIcon} title="No icon"
 								on:click={() => (cIcon = null)}><ChainIcon name={null} size={17} /></button>
 							{#each CHAIN_ICONS as ic}
@@ -552,6 +575,20 @@
 						<div class="field" style="flex:1;min-width:160px;"><label for="gb">Brand</label><input id="gb" class="input" bind:value={gBrand} placeholder="Sennheiser"></div>
 						<div class="field" style="flex:1;min-width:160px;"><label for="gm">Model</label><input id="gm" class="input" bind:value={gModel}></div>
 					</div>
+					<div style="display:flex;gap:12px;flex-wrap:wrap;">
+						<div class="field" style="flex:1;min-width:160px;">
+							<label for="gp">Bought on</label>
+							<input id="gp" class="input" type="date" bind:value={gBought}>
+						</div>
+						<div class="field" style="flex:1;min-width:160px;align-self:flex-end;">
+							<!-- Not the same as "first seen". Gear is usually owned for a
+							     while before anyone catalogues it, and burn-in hours are
+							     counted from the purchase. -->
+							<p style="margin:0 0 9px;font-size:12px;color:var(--td-muted-2);">
+								{gBought ? `Owned ${ownedFor(fromDateInput(gBought))}.` : 'Optional — leave blank if you are guessing.'}
+							</p>
+						</div>
+					</div>
 					<div class="field"><label for="go">Notes</label><input id="go" class="input" bind:value={gNotes}></div>
 				</div>
 			</div>
@@ -595,8 +632,18 @@
 {/if}
 
 <style>
-	/* A row of toggles rather than a dropdown: eight glyphs are quicker to
-	   recognise than to read, which is the entire point of having them. */
+	/* A grid of toggles rather than a dropdown: a glyph is quicker to recognise
+	   than a word to read, which is the entire point of having them. A fixed
+	   column count keeps the families in `CHAIN_ICONS` roughly in rows, and the
+	   cap stops the set pushing the rest of the dialog off a short screen. */
+	.icon-grid {
+		display: grid;
+		grid-template-columns: repeat(auto-fill, minmax(34px, 1fr));
+		gap: 7px;
+		max-height: 168px;
+		overflow-y: auto;
+		padding-right: 2px;
+	}
 	.icon-pick {
 		display: flex; align-items: center; justify-content: center;
 		width: 34px; height: 34px; border-radius: 10px; cursor: pointer;

@@ -32,6 +32,14 @@ pub struct DatabaseConfig {
     /// it in the scrobble database would bloat every backup with data that is
     /// not the user's.
     pub everynoise_path: String,
+    /// Where uploaded sleeve and booklet scans are written.
+    ///
+    /// Files, not blobs, because a booklet is twenty pages and a shelf of a
+    /// hundred records would put gigabytes of image data through every
+    /// `VACUUM INTO` backup. The consequence is the honest one and is stated in
+    /// the UI: `GET /api/v1/backup` does **not** carry them, and the shelf
+    /// export is what does.
+    pub uploads_dir: String,
 }
 
 #[derive(Debug, Clone)]
@@ -114,6 +122,7 @@ struct TomlDatabase {
     sqlite_path: String,
     scrobble_db_url: String,
     everynoise_path: String,
+    uploads_dir: String,
 }
 impl Default for TomlDatabase {
     fn default() -> Self {
@@ -121,6 +130,7 @@ impl Default for TomlDatabase {
             sqlite_path: "./tapedeck.db".into(),
             scrobble_db_url: "sqlite:scrobbles.db?mode=rwc".into(),
             everynoise_path: "sqlite:everynoise.db?mode=rwc".into(),
+            uploads_dir: "./uploads".into(),
         }
     }
 }
@@ -240,6 +250,7 @@ impl Config {
                 sqlite_path: env_or("SQLITE_DB_PATH", t.database.sqlite_path),
                 scrobble_db_url: env_or("DATABASE_URL", t.database.scrobble_db_url),
                 everynoise_path: env_or("EVERYNOISE_DB_PATH", t.database.everynoise_path),
+                uploads_dir: env_or("TAPEDECK_UPLOADS_DIR", t.database.uploads_dir),
             },
             logging: LoggingConfig {
                 level: env_or("RUST_LOG", t.logging.level),

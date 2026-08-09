@@ -340,6 +340,9 @@ export interface EquipmentInput {
 	brand?: string;
 	model?: string;
 	notes?: string;
+	/** When it was bought, unix seconds. Distinct from `first_used`, which is
+	 *  when Tapedeck first saw it. */
+	purchased_at?: number | null;
 }
 
 export interface Connection {
@@ -378,6 +381,8 @@ export interface Equipment {
 	total_hours: number;
 	first_used: number | null;
 	last_used: number | null;
+	notes: string | null;
+	purchased_at: number | null;
 }
 
 /** Live playback state. Field names mirror `Scrobble` so `qualityLabel()` works on it. */
@@ -742,10 +747,34 @@ export interface ReleaseCandidate {
 	tracks: PhysicalTrack[];
 }
 
+/** One scan of a pressing — a sleeve, a label, a booklet page.
+ *
+ *  `src` and `thumb` are built server-side so a stored file path can never
+ *  reach the page: a provider's image is its own URL, an uploaded scan is a
+ *  Tapedeck URL that checks who is asking. */
+export interface PhysicalImage {
+	id: number;
+	release_id: number;
+	/** `front` | `back` | `booklet` | `medium` | `spine` | … Free text, because
+	 *  the Cover Art Archive's vocabulary grows and a scan of something it has
+	 *  no word for is still a scan. */
+	kind: string;
+	provider: 'caa' | 'discogs' | 'upload';
+	src: string;
+	thumb: string;
+	/** The archive editor's own note — "page 3 of 20", "inner left panel".
+	 *  Without it nineteen booklet pages are indistinguishable. */
+	caption: string | null;
+	position: number;
+	bytes: number | null;
+	mime: string | null;
+	added_at: number;
+}
+
 /** A record or tape on the shelf. Counters are derived, never accumulated. */
 export interface PhysicalRelease {
 	id: number;
-	kind: 'vinyl' | 'cassette';
+	kind: 'vinyl' | 'cassette' | 'cd' | 'sacd';
 	artist: string;
 	title: string;
 	year: number | null;
@@ -758,9 +787,17 @@ export interface PhysicalRelease {
 	tracks: string;
 	notes: string | null;
 	added_at: number;
+	/** When you bought it. Null for anything shelved before the field existed,
+	 *  and for anything you would only be guessing at. */
+	purchased_at: number | null;
+	/** What it is normally played on. The deck pre-fills from these and writes
+	 *  the answer back, so a record with one turntable is asked once. */
+	chain_id: number | null;
+	equipment_id: number | null;
 	play_count: number;
 	played_secs: number;
 	last_played: number | null;
+	image_count: number;
 }
 
 export interface PlayResult {
@@ -1267,8 +1304,29 @@ class TapedeckAPI {
 	async getPressing(id: number): Promise<{ release: PhysicalRelease }> {
 		return this.get(`/api/v1/physical/${id}`);
 	}
-	async addPressing(body: Partial<ReleaseCandidate> & { kind: string; tracks: PhysicalTrack[] }) {
-		return this.post<{ id: number }>('/api/v1/physical', body);
+	async addPressing(
+		body: Partial<ReleaseCandidate> & {
+			kind: string; tracks: PhysicalTrack[];
+			purchased_at?: number | null;
+			/** Pull the sleeve, labels and booklet from the Cover Art Archive as
+			 *  part of adding it. Defaults to on server-side. */
+			fetch_images?: boolean;
+		}
+	) {
+		return this.post<{ id: number; images: number }>('/api/v1/physical', body);
+	}
+	/** Edit the shelf-keeping fields. Every one distinguishes absent from null:
+	 *  omit to leave alone, pass `null` to clear. */
+	async updatePressing(
+		id: number,
+		body: {
+			purchased_at?: number | null;
+			chain_id?: number | null;
+			equipment_id?: number | null;
+			notes?: string | null;
+		}
+	) {
+		return this.patch(`/api/v1/physical/${id}`, body);
 	}
 	async setPressingTracks(id: number, tracks: PhysicalTrack[]) {
 		return this.request('PUT', `/api/v1/physical/${id}/tracks`, { tracks });
@@ -1290,6 +1348,62 @@ class TapedeckAPI {
 	}
 	async equipmentWear(id: number): Promise<{ hours: number; sides_played: number }> {
 		return this.get(`/api/v1/physical/equipment/${id}/wear`);
+	}
+
+	// ── The rest of the sleeve ──
+	async pressingImages(id: number): Promise<{ images: PhysicalImage[] }> {
+		return this.get(`/api/v1/physical/${id}/images`);
+	}
+	/** Ask the Cover Art Archive (and Discogs, if configured) again. Idempotent
+	 *  by the provider's own image id, so this adds what is new and leaves the
+	 *  rest alone. */
+	async fetchPressingImages(
+		id: number
+	): Promise<{ stored: number; total: number; notes: string[] }> {
+		return this.post(`/api/v1/physical/${id}/images/fetch`, {});
+	}
+	/** Upload scans of your own copy. `kind` and `caption` apply to all the
+	 *  files in one call, which is what makes uploading a booklet in one go
+	 *  work — they land in page order. */
+	async uploadPressingImages(
+		id: number,
+		files: File[],
+		kind: string,
+		caption?: string
+	): Promise<{ ids: number[] }> {
+		const form = new FormData();
+		form.append('kind', kind);
+		if (caption) form.append('caption', caption);
+		for (const f of files) form.append('file', f);
+		const res = await fetch(`${BASE}/api/v1/physical/${id}/images`, {
+			method: 'POST', credentials: 'same-origin', body: form
+		});
+		if (!res.ok) throw new Error(`API ${res.status}: ${await res.text()}`);
+		return res.json();
+	}
+	async updatePressingImage(
+		imageId: number,
+		body: { kind?: string; caption?: string | null; position?: number }
+	) {
+		return this.patch(`/api/v1/physical/images/${imageId}`, body);
+	}
+	async deletePressingImage(imageId: number) {
+		return this.del(`/api/v1/physical/images/${imageId}`);
+	}
+
+	// ── What's on the deck ──
+	//
+	// The shelf is the one source where the *browser* is the player: the clock
+	// runs in front of the turntable, so nothing server-side can derive a
+	// playhead. It pushes instead.
+	async shelfNowPlaying(
+		id: number,
+		body: { side: string; position: number; elapsed: number; paused: boolean }
+	) {
+		return this.post(`/api/v1/physical/${id}/now-playing`, body);
+	}
+	async clearShelfNowPlaying() {
+		return this.del('/api/v1/physical/now-playing');
 	}
 	/** Set or clear an artist portrait by hand. Empty clears it. */
 	async setArtistImage(artistRowId: number, url: string): Promise<{ image_url: string | null }> {

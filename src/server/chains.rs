@@ -234,6 +234,11 @@ pub struct CreateEquipmentRequest {
     pub brand: Option<String>,
     pub model: Option<String>,
     pub notes: Option<String>,
+    /// When it was bought, unix seconds. Distinct from `first_used`, which is
+    /// when Tapedeck first saw it — gear is usually owned for a while before
+    /// anyone gets round to cataloguing it, and burn-in hours are counted from
+    /// the purchase.
+    pub purchased_at: Option<i64>,
 }
 
 async fn create_equipment(
@@ -250,6 +255,7 @@ async fn create_equipment(
             body.brand.as_deref(),
             body.model.as_deref(),
             0.0,
+            body.purchased_at,
         )
         .await
     {
@@ -295,6 +301,7 @@ async fn update_equipment(
             body.brand.as_deref(),
             body.model.as_deref(),
             body.notes.as_deref(),
+            body.purchased_at,
         )
         .await
     {

@@ -238,12 +238,69 @@ pub struct PhysicalRelease {
     pub tracks: String,
     pub notes: Option<String>,
     pub added_at: i64,
+    /// When you bought it — how long it has been on the shelf, which nothing
+    /// else here can answer. Absent for everything shelved before the column.
+    pub purchased_at: Option<i64>,
+    /// What this normally gets played on. The deck pre-fills from these and
+    /// writes the answer back, so a record with one turntable is asked once.
+    pub chain_id: Option<i64>,
+    pub equipment_id: Option<i64>,
     /// How many sides have been played, and for how long. Derived in the
     /// query rather than kept as a counter, so they cannot drift from the
     /// plays they claim to count.
     pub play_count: i64,
     pub played_secs: i64,
     pub last_played: Option<i64>,
+    /// Sleeves, booklet pages and labels held for this pressing. Derived the
+    /// same way, so a card can say "29 scans" without a second request.
+    pub image_count: i64,
+}
+
+/// One side played, with the gear it ran through resolved to names.
+///
+/// Names rather than ids because this is what leaves the building: an export
+/// that says `equipment_id: 4` is unreadable anywhere except the database it
+/// came from.
+#[derive(Debug, Clone, sqlx::FromRow, serde::Serialize)]
+pub struct PhysicalPlayRow {
+    pub id: i64,
+    pub release_id: i64,
+    pub artist: String,
+    pub title: String,
+    pub kind: String,
+    pub side: String,
+    pub played_at: i64,
+    pub duration_secs: i64,
+    pub track_count: i64,
+    pub equipment_name: Option<String>,
+    pub chain_name: Option<String>,
+}
+
+/// One scan or photograph of a physical release.
+///
+/// Either a remote URL (the Cover Art Archive, Discogs) or a file this server
+/// holds (a scan of the user's own copy). `file_path` is deliberately **not**
+/// serialised: the browser is handed a Tapedeck URL to fetch it through, so a
+/// server path can never reach the page.
+#[derive(Debug, Clone, sqlx::FromRow, serde::Serialize)]
+pub struct PhysicalImage {
+    pub id: i64,
+    pub release_id: i64,
+    /// `front` | `back` | `booklet` | `medium` | `spine` | `tray` | `obi` |
+    /// `sticker` | `poster` | `liner` | `matrix` | `other`.
+    pub kind: String,
+    /// `caa` | `discogs` | `upload`.
+    pub provider: String,
+    pub url: Option<String>,
+    pub thumb_url: Option<String>,
+    #[serde(skip_serializing)]
+    pub file_path: Option<String>,
+    pub mime: Option<String>,
+    pub bytes: Option<i64>,
+    pub caption: Option<String>,
+    pub position: i64,
+    pub remote_id: Option<String>,
+    pub added_at: i64,
 }
 
 /// A configured source, credentials decrypted. `kind` is `plex` | `navidrome` |
@@ -548,8 +605,67 @@ impl Database {
                 artwork_url TEXT,
                 tracks TEXT NOT NULL DEFAULT '[]',
                 notes TEXT,
+                added_at INTEGER NOT NULL,
+                -- When you bought it. A shelf is a thing you accumulate, so how
+                -- long something has been yours is a fact about the shelf that
+                -- nothing else in the database can answer.
+                purchased_at INTEGER,
+                -- What this normally gets played on. A record lives with one
+                -- turntable, so asking every time would be asking the same
+                -- question forever; the deck pre-fills from here and the answer
+                -- is written back.
+                chain_id INTEGER REFERENCES signal_chains(id),
+                equipment_id INTEGER REFERENCES equipment(id)
+            )",
+        )
+        .execute(&self.pool)
+        .await?;
+
+        // Sleeves, booklets, labels, obi strips — the parts of a record you
+        // actually hold. A release has *many* of these (the Cover Art Archive
+        // carries 29 for the pressing this was built against, 19 of them
+        // booklet pages), which is why they are rows rather than a second
+        // `artwork_url` column.
+        //
+        // Two provenances share the table because they answer the same question
+        // and the difference matters only to the reader: `caa`/`discogs` hold a
+        // remote **URL** — the same rule the artwork chain follows, providers
+        // return URLs and never bytes — while `upload` holds a **file on this
+        // server**, because a scan of your own copy exists nowhere else.
+        //
+        // `kind` is free text rather than a CHECK: the archive adds types, and a
+        // scan of something it has no word for is still a scan.
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS physical_images (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL REFERENCES users(id),
+                release_id INTEGER NOT NULL REFERENCES physical_releases(id),
+                kind TEXT NOT NULL DEFAULT 'other',
+                provider TEXT NOT NULL,
+                url TEXT, thumb_url TEXT,
+                file_path TEXT, mime TEXT, bytes INTEGER,
+                caption TEXT,
+                -- Order within the release, which for a booklet is page order.
+                position INTEGER NOT NULL DEFAULT 0,
+                -- The provider's own id, so re-fetching a release updates the
+                -- rows it already has instead of stacking a second copy of
+                -- every page on top of the first.
+                remote_id TEXT,
                 added_at INTEGER NOT NULL
             )",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_physical_images_remote
+                ON physical_images(release_id, provider, remote_id)
+             WHERE remote_id IS NOT NULL",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_physical_images_release
+                ON physical_images(release_id, position)",
         )
         .execute(&self.pool)
         .await?;
@@ -622,6 +738,11 @@ impl Database {
                 brand TEXT, model TEXT,
                 total_hours REAL DEFAULT 0,
                 first_used INTEGER, last_used INTEGER, notes TEXT,
+                -- Distinct from `first_used`, which is when Tapedeck first saw
+                -- it. Gear is usually owned for a while before it is logged,
+                -- and burn-in hours are counted from the purchase, not from the
+                -- day someone got round to typing it in.
+                purchased_at INTEGER,
                 UNIQUE(user_id, name)
             )",
         )
@@ -1320,6 +1441,31 @@ impl Database {
                 warn!("Could not widen the shelf's formats: {}", e);
             }
             let _ = sqlx::query("PRAGMA foreign_keys = ON").execute(&self.pool).await;
+        }
+
+        // Migration: when you bought it, and what it gets played on.
+        //
+        // This has to come **after** the rebuild above, not before: that block
+        // copies an explicit column list into a freshly created table, so any
+        // column added ahead of it would be silently dropped on the one kind of
+        // database that still needs it.
+        if !has_column(&self.pool, "physical_releases", "purchased_at").await {
+            info!("⚙️ Migrating: purchase dates and default gear on the shelf...");
+            for col in &[
+                "purchased_at INTEGER",
+                "chain_id INTEGER REFERENCES signal_chains(id)",
+                "equipment_id INTEGER REFERENCES equipment(id)",
+            ] {
+                let _ = sqlx::query(&format!("ALTER TABLE physical_releases ADD COLUMN {col}"))
+                    .execute(&self.pool)
+                    .await;
+            }
+        }
+        if !has_column(&self.pool, "equipment", "purchased_at").await {
+            info!("⚙️ Migrating: adding equipment.purchased_at...");
+            let _ = sqlx::query("ALTER TABLE equipment ADD COLUMN purchased_at INTEGER")
+                .execute(&self.pool)
+                .await;
         }
 
         Ok(())
@@ -2349,7 +2495,9 @@ impl Database {
                     (SELECT COALESCE(SUM(p.duration_secs), 0) FROM physical_plays p
                       WHERE p.release_id = r.id) AS played_secs,
                     (SELECT MAX(p.played_at) FROM physical_plays p WHERE p.release_id = r.id)
-                      AS last_played
+                      AS last_played,
+                    (SELECT COUNT(*) FROM physical_images i WHERE i.release_id = r.id)
+                      AS image_count
                FROM physical_releases r
               WHERE r.user_id = ? AND (? IS NULL OR r.kind = ?)
               ORDER BY r.artist COLLATE NOCASE, r.title COLLATE NOCASE",
@@ -2372,7 +2520,9 @@ impl Database {
                     (SELECT COALESCE(SUM(p.duration_secs), 0) FROM physical_plays p
                       WHERE p.release_id = r.id) AS played_secs,
                     (SELECT MAX(p.played_at) FROM physical_plays p WHERE p.release_id = r.id)
-                      AS last_played
+                      AS last_played,
+                    (SELECT COUNT(*) FROM physical_images i WHERE i.release_id = r.id)
+                      AS image_count
                FROM physical_releases r WHERE r.user_id = ? AND r.id = ?",
         )
         .bind(user_id)
@@ -2396,12 +2546,13 @@ impl Database {
         artwork_url: Option<&str>,
         tracks_json: &str,
         notes: Option<&str>,
+        purchased_at: Option<i64>,
     ) -> Result<i64, sqlx::Error> {
         let res = sqlx::query(
             "INSERT INTO physical_releases
                 (user_id, kind, artist, title, year, mbid_release, discogs_id, barcode,
-                 catalog_number, artwork_url, tracks, notes, added_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                 catalog_number, artwork_url, tracks, notes, added_at, purchased_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(user_id)
         .bind(kind)
@@ -2416,9 +2567,225 @@ impl Database {
         .bind(tracks_json)
         .bind(notes)
         .bind(Self::now_secs())
+        .bind(purchased_at)
         .execute(&self.pool)
         .await?;
         Ok(res.last_insert_rowid())
+    }
+
+    /// Edit the shelf-keeping fields of a pressing: when it was bought, what it
+    /// is normally played on, and the note beside it.
+    ///
+    /// Every field is `Option<Option<_>>` for the reason
+    /// `POST /scrobbles/bulk-chain` learned the hard way: a bare `Option` cannot
+    /// tell *absent* from *null*, so a typo'd key would read as "clear the
+    /// chain" and quietly wipe an attribution while answering 200. Absent leaves
+    /// the column alone; an explicit null clears it, which is how the picker's
+    /// "—" option works.
+    pub async fn update_physical(
+        &self,
+        user_id: i64,
+        id: i64,
+        purchased_at: Option<Option<i64>>,
+        chain_id: Option<Option<i64>>,
+        equipment_id: Option<Option<i64>>,
+        notes: Option<Option<&str>>,
+    ) -> Result<bool, sqlx::Error> {
+        let mut sets: Vec<&str> = Vec::new();
+        if purchased_at.is_some() {
+            sets.push("purchased_at = ?");
+        }
+        if chain_id.is_some() {
+            sets.push("chain_id = ?");
+        }
+        if equipment_id.is_some() {
+            sets.push("equipment_id = ?");
+        }
+        if notes.is_some() {
+            sets.push("notes = ?");
+        }
+        if sets.is_empty() {
+            // Nothing asked for is not a failure — but it must not report a
+            // 404 either, so confirm the row is the caller's and stop.
+            return Ok(self.get_physical(user_id, id).await?.is_some());
+        }
+        let sql = format!(
+            "UPDATE physical_releases SET {} WHERE user_id = ? AND id = ?",
+            sets.join(", ")
+        );
+        let mut q = sqlx::query(&sql);
+        if let Some(v) = purchased_at {
+            q = q.bind(v);
+        }
+        if let Some(v) = chain_id {
+            q = q.bind(v);
+        }
+        if let Some(v) = equipment_id {
+            q = q.bind(v);
+        }
+        if let Some(v) = notes {
+            q = q.bind(v.map(|s| s.to_string()));
+        }
+        let res = q.bind(user_id).bind(id).execute(&self.pool).await?;
+        Ok(res.rows_affected() > 0)
+    }
+
+    // ── Scans: sleeves, booklets, labels ──
+
+    pub async fn list_physical_images(
+        &self,
+        user_id: i64,
+        release_id: i64,
+    ) -> Result<Vec<PhysicalImage>, sqlx::Error> {
+        sqlx::query_as(
+            "SELECT * FROM physical_images
+              WHERE user_id = ? AND release_id = ?
+              ORDER BY position ASC, id ASC",
+        )
+        .bind(user_id)
+        .bind(release_id)
+        .fetch_all(&self.pool)
+        .await
+    }
+
+    /// One image, scoped to its owner — the guard that stops ids being walked
+    /// to pull somebody else's scans through the file endpoint.
+    pub async fn get_physical_image(
+        &self,
+        user_id: i64,
+        id: i64,
+    ) -> Result<Option<PhysicalImage>, sqlx::Error> {
+        sqlx::query_as("SELECT * FROM physical_images WHERE user_id = ? AND id = ?")
+            .bind(user_id)
+            .bind(id)
+            .fetch_one(&self.pool)
+            .await
+            .map(Some)
+            .or_else(|e| if matches!(e, sqlx::Error::RowNotFound) { Ok(None) } else { Err(e) })
+    }
+
+    /// Store one image. A provider's own id makes this idempotent: re-fetching
+    /// a release updates the rows it already holds rather than stacking a
+    /// second copy of all nineteen booklet pages on top of the first.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn add_physical_image(
+        &self,
+        user_id: i64,
+        release_id: i64,
+        kind: &str,
+        provider: &str,
+        url: Option<&str>,
+        thumb_url: Option<&str>,
+        file_path: Option<&str>,
+        mime: Option<&str>,
+        bytes: Option<i64>,
+        caption: Option<&str>,
+        position: i64,
+        remote_id: Option<&str>,
+    ) -> Result<i64, sqlx::Error> {
+        sqlx::query(
+            "INSERT INTO physical_images
+                (user_id, release_id, kind, provider, url, thumb_url, file_path, mime,
+                 bytes, caption, position, remote_id, added_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             -- The `WHERE` is part of the conflict target, not decoration:
+             -- SQLite matches an upsert against a *partial* unique index only
+             -- when the predicate is repeated here, and rejects the statement
+             -- outright otherwise. It is also what leaves uploads alone — they
+             -- carry no provider id, so two scans of the same page really are
+             -- two scans.
+             ON CONFLICT(release_id, provider, remote_id) WHERE remote_id IS NOT NULL
+             DO UPDATE SET
+                kind = excluded.kind, url = excluded.url, thumb_url = excluded.thumb_url,
+                caption = excluded.caption, position = excluded.position",
+        )
+        .bind(user_id)
+        .bind(release_id)
+        .bind(kind)
+        .bind(provider)
+        .bind(url)
+        .bind(thumb_url)
+        .bind(file_path)
+        .bind(mime)
+        .bind(bytes)
+        .bind(caption)
+        .bind(position)
+        .bind(remote_id)
+        .bind(Self::now_secs())
+        .execute(&self.pool)
+        .await?;
+        // `last_insert_rowid` is meaningless after an upsert that updated, so
+        // the id is read back by the key that decided it.
+        let row: (i64,) = sqlx::query_as(
+            "SELECT id FROM physical_images
+              WHERE release_id = ? AND provider = ?
+                AND (remote_id IS ? OR (remote_id IS NULL AND ? IS NULL))
+              ORDER BY id DESC LIMIT 1",
+        )
+        .bind(release_id)
+        .bind(provider)
+        .bind(remote_id)
+        .bind(remote_id)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(row.0)
+    }
+
+    pub async fn update_physical_image(
+        &self,
+        user_id: i64,
+        id: i64,
+        kind: Option<&str>,
+        caption: Option<Option<&str>>,
+        position: Option<i64>,
+    ) -> Result<bool, sqlx::Error> {
+        let mut sets: Vec<&str> = Vec::new();
+        if kind.is_some() {
+            sets.push("kind = ?");
+        }
+        if caption.is_some() {
+            sets.push("caption = ?");
+        }
+        if position.is_some() {
+            sets.push("position = ?");
+        }
+        if sets.is_empty() {
+            return Ok(self.get_physical_image(user_id, id).await?.is_some());
+        }
+        let sql =
+            format!("UPDATE physical_images SET {} WHERE user_id = ? AND id = ?", sets.join(", "));
+        let mut q = sqlx::query(&sql);
+        if let Some(v) = kind {
+            q = q.bind(v.to_string());
+        }
+        if let Some(v) = caption {
+            q = q.bind(v.map(|s| s.to_string()));
+        }
+        if let Some(v) = position {
+            q = q.bind(v);
+        }
+        let res = q.bind(user_id).bind(id).execute(&self.pool).await?;
+        Ok(res.rows_affected() > 0)
+    }
+
+    /// Delete an image row and hand back the file it was holding, if any, so
+    /// the caller can remove it from disk. The row goes first: a file left
+    /// behind is litter, whereas a row pointing at a file that is gone renders
+    /// as a broken image on the page.
+    pub async fn delete_physical_image(
+        &self,
+        user_id: i64,
+        id: i64,
+    ) -> Result<Option<Option<String>>, sqlx::Error> {
+        let Some(img) = self.get_physical_image(user_id, id).await? else {
+            return Ok(None);
+        };
+        sqlx::query("DELETE FROM physical_images WHERE user_id = ? AND id = ?")
+            .bind(user_id)
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(Some(img.file_path))
     }
 
     /// Replace the stored tracklist — how a hand-corrected side split is saved.
@@ -2438,8 +2805,28 @@ impl Database {
         Ok(res.rows_affected() > 0)
     }
 
-    pub async fn delete_physical(&self, user_id: i64, id: i64) -> Result<bool, sqlx::Error> {
-        // Plays reference the release, and foreign keys are on.
+    /// Remove a pressing. Returns the uploaded scans it was holding so the
+    /// caller can take them off disk — nothing else knows those files exist,
+    /// so skipping this leaves them orphaned forever.
+    pub async fn delete_physical(
+        &self,
+        user_id: i64,
+        id: i64,
+    ) -> Result<Option<Vec<String>>, sqlx::Error> {
+        let files: Vec<(String,)> = sqlx::query_as(
+            "SELECT file_path FROM physical_images
+              WHERE user_id = ? AND release_id = ? AND file_path IS NOT NULL",
+        )
+        .bind(user_id)
+        .bind(id)
+        .fetch_all(&self.pool)
+        .await?;
+        // Plays and images both reference the release, and foreign keys are on.
+        sqlx::query("DELETE FROM physical_images WHERE user_id = ? AND release_id = ?")
+            .bind(user_id)
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
         sqlx::query("DELETE FROM physical_plays WHERE user_id = ? AND release_id = ?")
             .bind(user_id)
             .bind(id)
@@ -2450,7 +2837,7 @@ impl Database {
             .bind(id)
             .execute(&self.pool)
             .await?;
-        Ok(res.rows_affected() > 0)
+        Ok((res.rows_affected() > 0).then(|| files.into_iter().map(|(f,)| f).collect()))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2846,6 +3233,46 @@ impl Database {
         .bind(user_id)
         .bind(from)
         .bind(to)
+        .fetch_all(&self.pool)
+        .await
+    }
+
+    /// Every side ever put on, oldest first — what the shelf export carries.
+    ///
+    /// Ascending because an export is read as a log: a shelf's history is the
+    /// order things were played in, and reversing it to match the history
+    /// screen's newest-first habit would be the wrong shape for a file someone
+    /// keeps.
+    pub async fn all_physical_plays(
+        &self,
+        user_id: i64,
+    ) -> Result<Vec<PhysicalPlayRow>, sqlx::Error> {
+        sqlx::query_as(
+            "SELECT p.id, p.release_id, r.artist, r.title, r.kind, p.side, p.played_at,
+                    p.duration_secs, p.track_count,
+                    e.name AS equipment_name, c.name AS chain_name
+               FROM physical_plays p
+               JOIN physical_releases r ON r.id = p.release_id
+               LEFT JOIN equipment e ON e.id = p.equipment_id
+               LEFT JOIN signal_chains c ON c.id = p.chain_id
+              WHERE p.user_id = ?
+              ORDER BY p.played_at ASC, p.id ASC",
+        )
+        .bind(user_id)
+        .fetch_all(&self.pool)
+        .await
+    }
+
+    /// Every scan the user holds, in release then page order.
+    pub async fn all_physical_images(
+        &self,
+        user_id: i64,
+    ) -> Result<Vec<PhysicalImage>, sqlx::Error> {
+        sqlx::query_as(
+            "SELECT * FROM physical_images WHERE user_id = ?
+              ORDER BY release_id ASC, position ASC, id ASC",
+        )
+        .bind(user_id)
         .fetch_all(&self.pool)
         .await
     }
@@ -6323,6 +6750,7 @@ impl Database {
         brand: Option<&str>,
         model: Option<&str>,
         hours_to_add: f64,
+        purchased_at: Option<i64>,
     ) -> Result<i64, sqlx::Error> {
         let now = Self::now_secs();
         let existing: Option<(i64,)> =
@@ -6342,10 +6770,10 @@ impl Database {
             .await?;
             Ok(id)
         } else {
-            let result = sqlx::query("INSERT INTO equipment (user_id, name, type, brand, model, total_hours, first_used, last_used)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
+            let result = sqlx::query("INSERT INTO equipment (user_id, name, type, brand, model, total_hours, first_used, last_used, purchased_at)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)")
             .bind(user_id).bind(name).bind(equipment_type).bind(brand).bind(model)
-            .bind(hours_to_add).bind(now).bind(now).execute(&self.pool).await?;
+            .bind(hours_to_add).bind(now).bind(now).bind(purchased_at).execute(&self.pool).await?;
             Ok(result.last_insert_rowid())
         }
     }
@@ -6421,7 +6849,7 @@ impl Database {
                                 WHERE json_extract(j.value, '$.equipment_id') = e.id
                            )
                     ), 0) AS REAL) AS total_hours,
-                    e.first_used, e.last_used, e.notes
+                    e.first_used, e.last_used, e.notes, e.purchased_at
                FROM equipment e
               WHERE e.user_id = ?
               ORDER BY total_hours DESC, e.name ASC",
@@ -6441,11 +6869,23 @@ impl Database {
         brand: Option<&str>,
         model: Option<&str>,
         notes: Option<&str>,
+        purchased_at: Option<i64>,
     ) -> Result<bool, sqlx::Error> {
         let res = sqlx::query(
-            "UPDATE equipment SET name = ?, type = ?, brand = ?, model = ?, notes = ? WHERE id = ? AND user_id = ?"
-        ).bind(name).bind(equipment_type).bind(brand).bind(model).bind(notes)
-         .bind(id).bind(user_id).execute(&self.pool).await?;
+            "UPDATE equipment SET name = ?, type = ?, brand = ?, model = ?, notes = ?,
+                    purchased_at = ?
+              WHERE id = ? AND user_id = ?",
+        )
+        .bind(name)
+        .bind(equipment_type)
+        .bind(brand)
+        .bind(model)
+        .bind(notes)
+        .bind(purchased_at)
+        .bind(id)
+        .bind(user_id)
+        .execute(&self.pool)
+        .await?;
         Ok(res.rows_affected() > 0)
     }
 
@@ -6674,6 +7114,14 @@ impl Database {
             "notes",
             "loves",
             "scrobbles",
+            // The shelf goes before `equipment` and `signal_chains`, which both
+            // of these point at — a play records the turntable it ran on, and a
+            // pressing records what it is normally played through. Clearing the
+            // gear first is a foreign-key violation, which with `physical_plays`
+            // absent from this list is what deleting anyone with a shelf did.
+            "physical_images",
+            "physical_plays",
+            "physical_releases",
             "tokens",
             "signal_chains",
             "devices",
@@ -7365,6 +7813,9 @@ pub struct EquipmentRow {
     pub first_used: Option<i64>,
     pub last_used: Option<i64>,
     pub notes: Option<String>,
+    /// When it was bought, as opposed to `first_used`, which is when Tapedeck
+    /// first saw it. Gear is usually owned well before it is catalogued.
+    pub purchased_at: Option<i64>,
 }
 
 #[cfg(test)]
@@ -7396,6 +7847,142 @@ mod tests {
     /// numerator — each time because a new query was written next to filtered
     /// ones and quietly omitted the filter. Nothing errors; a number is simply
     /// wrong. So this asserts on the *readouts* rather than on the SQL, which
+    /// A misspelled key must not be able to wipe an attribution.
+    ///
+    /// This is the fourth place the same shape has come up (`bulk-chain`,
+    /// `default_chain_id`, `unify_album_release`) and the reason is always the
+    /// same: a bare `Option` reads *absent* and *null* as the same thing, so a
+    /// typo in a body reads as "clear this" and answers 200. On the shelf that
+    /// means editing a purchase date silently unassigns the turntable.
+    #[tokio::test]
+    async fn absent_and_null_are_different_things_on_a_shelf_edit() {
+        let db = testdb().await;
+        let uid = db.create_user("ash", None, "pw", "user").await.unwrap();
+        let gear =
+            db.upsert_equipment(uid, "SL-1200", "turntable", None, None, 0.0, None).await.unwrap();
+        let id = db
+            .create_physical(
+                uid,
+                "vinyl",
+                "Burial",
+                "Untrue",
+                Some(2007),
+                None,
+                None,
+                None,
+                None,
+                None,
+                "[]",
+                None,
+                Some(1_700_000_000),
+            )
+            .await
+            .unwrap();
+
+        db.update_physical(uid, id, None, None, Some(Some(gear)), None).await.unwrap();
+        let r = db.get_physical(uid, id).await.unwrap().unwrap();
+        assert_eq!(r.equipment_id, Some(gear));
+        assert_eq!(r.purchased_at, Some(1_700_000_000));
+
+        // Editing one field leaves the others alone. This is the assertion a
+        // bare `Option` fails.
+        db.update_physical(uid, id, Some(Some(1_800_000_000)), None, None, None).await.unwrap();
+        let r = db.get_physical(uid, id).await.unwrap().unwrap();
+        assert_eq!(r.purchased_at, Some(1_800_000_000));
+        assert_eq!(r.equipment_id, Some(gear), "an untouched field must survive an edit");
+
+        // An explicit null still clears — the picker's "— no deck —" needs it,
+        // which is why the distinction has to survive deserialisation rather
+        // than being designed away.
+        db.update_physical(uid, id, None, None, Some(None), None).await.unwrap();
+        assert_eq!(db.get_physical(uid, id).await.unwrap().unwrap().equipment_id, None);
+    }
+
+    /// Re-fetching a sleeve must update what is there, not stack a second copy
+    /// of all nineteen booklet pages on top of the first. The archive's own
+    /// image id is the key that makes that true.
+    #[tokio::test]
+    async fn refetching_a_sleeve_updates_rather_than_duplicates() {
+        let db = testdb().await;
+        let uid = db.create_user("ash", None, "pw", "user").await.unwrap();
+        let id = db
+            .create_physical(
+                uid,
+                "cd",
+                "Ólafur Arnalds",
+                "re:member",
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                "[]",
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        for pass in 0..2 {
+            for (n, kind) in [(0, "front"), (1, "booklet"), (2, "booklet")] {
+                db.add_physical_image(
+                    uid,
+                    id,
+                    kind,
+                    "caa",
+                    Some(&format!("https://coverartarchive.org/x/{n}.jpg")),
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(&format!("page {}", n + pass)),
+                    n,
+                    Some(&format!("{n}")),
+                )
+                .await
+                .unwrap();
+            }
+        }
+        let images = db.list_physical_images(uid, id).await.unwrap();
+        assert_eq!(images.len(), 3, "a second fetch must not duplicate the sleeve");
+        // And it is an update, not a no-op: an editor's corrected caption should
+        // land rather than being discarded as "already have it".
+        assert_eq!(images[0].caption.as_deref(), Some("page 1"));
+
+        // An upload carries no provider id, so two scans of the same page are
+        // two scans — the partial unique index is `WHERE remote_id IS NOT NULL`
+        // for exactly this reason.
+        for _ in 0..2 {
+            db.add_physical_image(
+                uid,
+                id,
+                "booklet",
+                "upload",
+                None,
+                None,
+                Some("shelf/1/1/a.jpg"),
+                Some("image/jpeg"),
+                Some(10),
+                None,
+                9,
+                None,
+            )
+            .await
+            .unwrap();
+        }
+        assert_eq!(db.list_physical_images(uid, id).await.unwrap().len(), 5);
+
+        // The count the shelf card reads comes off the same rows.
+        assert_eq!(db.get_physical(uid, id).await.unwrap().unwrap().image_count, 5);
+
+        // And deleting the pressing hands back the files it was holding, which
+        // is the only thing that knows they exist.
+        let files = db.delete_physical(uid, id).await.unwrap().unwrap();
+        assert_eq!(files, vec!["shelf/1/1/a.jpg".to_string(), "shelf/1/1/a.jpg".to_string()]);
+        assert!(db.list_physical_images(uid, id).await.unwrap().is_empty());
+    }
+
     /// is the only way a future query gets caught too.
     #[tokio::test]
     async fn a_skip_reaches_no_counting_readout() {
@@ -8163,8 +8750,10 @@ mod tests {
         let db = testdb().await;
         let uid = db.create_user("ash", None, "pw", "admin").await.unwrap();
 
-        let gear =
-            db.upsert_equipment(uid, "Bifrost 2", "dac", Some("Schiit"), None, 0.0).await.unwrap();
+        let gear = db
+            .upsert_equipment(uid, "Bifrost 2", "dac", Some("Schiit"), None, 0.0, None)
+            .await
+            .unwrap();
         let cid = db
             .create_chain(&SignalChain {
                 id: None,
