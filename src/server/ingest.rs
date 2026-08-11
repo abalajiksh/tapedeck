@@ -480,6 +480,9 @@ pub async fn submit_listens(
                         quality_opt,
                         device_id,
                         chain_id,
+                        // A scrobble client has no idea which stylus is fitted; a
+                        // variant is set by the shelf or by retagging afterwards.
+                        None,
                         listening_context.as_deref(),
                         Some(submission_client),
                         None, // pushed by a client, not pulled from a configured source

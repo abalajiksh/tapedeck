@@ -26,7 +26,7 @@ openapi: 3.1.0
 
 info:
   title: Tapedeck
-  version: 0.53.0
+  version: 0.54.0
   summary: Self-hosted scrobbler and listening journal.
   description: |
     Tapedeck ingests listens, enriches them with MusicBrainz metadata, stores
@@ -2331,6 +2331,118 @@ paths:
       description: |
         Session-only. Chains referencing it stay readable — every component
         keeps a name snapshot alongside its optional `equipment_id`.
+      parameters: [{ name: id, in: path, required: true, schema: { type: integer } }]
+      responses:
+        '200': { description: Deleted., content: { application/json: { schema: { $ref: '#/components/schemas/Ok' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /api/v1/chains/variants:
+    get:
+      tags: [Chains]
+      summary: Every chain variant the caller owns.
+      description: |
+        Session or a token carrying `read`. A variant is a chain with one step
+        swapped — two cartridges on one turntable, or the same commute on
+        different IEMs. They are one chain and a choice, not two chains.
+
+        Flat rather than nested under each chain, because the page groups them
+        itself and one list beats a request per chain.
+
+        `total_hours` here is the listening that went through *this variant*.
+        A chain's own `total_hours` includes every variant of it, since they all
+        ran through that chain.
+      responses:
+        '200':
+          description: OK.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  variants:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        id: { type: integer }
+                        chain_id: { type: integer }
+                        name: { type: string }
+                        total_hours: { type: number }
+                        overrides:
+                          type: array
+                          items:
+                            type: object
+                            properties:
+                              position:
+                                type: integer
+                                description: |
+                                  Index into the parent chain's `components`. Past the
+                                  end *adds* a step, so a chain that never named a
+                                  cartridge can gain one without being rewritten.
+                              equipment_id: { type: integer, nullable: true }
+                              name: { type: string, nullable: true }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+    post:
+      tags: [Chains]
+      summary: Create a variant.
+      description: |
+        Session-only. Only the steps that *differ* are stored, which is what
+        makes this an override rather than a copy: editing the shared part of a
+        chain updates every variant of it.
+
+        The chain and every piece of gear named must be the caller's.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [chain_id, name]
+              properties:
+                chain_id: { type: integer }
+                name: { type: string, example: Microlinear }
+                overrides:
+                  type: array
+                  items:
+                    type: object
+                    properties:
+                      position: { type: integer }
+                      equipment_id: { type: integer, nullable: true }
+                      name: { type: string, nullable: true }
+      responses:
+        '200': { description: Created., content: { application/json: { schema: { type: object, properties: { id: { type: integer } } } } } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /api/v1/chains/variants/{id}:
+    patch:
+      tags: [Chains]
+      summary: Rename a variant or change what it swaps.
+      description: Session-only. An omitted field is left alone.
+      parameters: [{ name: id, in: path, required: true, schema: { type: integer } }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                name: { type: string }
+                overrides: { type: array, items: { type: object, additionalProperties: true } }
+      responses:
+        '200': { description: Saved., content: { application/json: { schema: { $ref: '#/components/schemas/Ok' } } } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    delete:
+      tags: [Chains]
+      summary: Delete a variant.
+      description: |
+        Session-only. The listens that went through it **keep their chain** and
+        fall back to its base components, which is what a null variant means
+        everywhere else — they are not deleted along with it.
       parameters: [{ name: id, in: path, required: true, schema: { type: integer } }]
       responses:
         '200': { description: Deleted., content: { application/json: { schema: { $ref: '#/components/schemas/Ok' } } } }

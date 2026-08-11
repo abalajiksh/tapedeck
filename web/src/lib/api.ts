@@ -386,6 +386,33 @@ export interface UserProfile {
 	disabled: boolean;
 }
 
+/** One step of a chain, replaced.
+ *
+ *  `position` indexes into the parent chain's `components`. Only the steps that
+ *  differ are stored, so editing the shared part of a chain updates every
+ *  variant of it — which is why two cartridges on one turntable stay one chain.
+ *  A position past the end *adds* a step. */
+export interface VariantOverride {
+	position: number;
+	equipment_id?: number | null;
+	name?: string | null;
+}
+
+/** A chain with one or more steps swapped.
+ *
+ *  `total_hours` is the listening that went through *this variant*, which is a
+ *  different question from the chain's total — a chain's hours include every
+ *  variant of it, since they all ran through the same chain. */
+export interface ChainVariant {
+	id: number;
+	user_id: number;
+	chain_id: number;
+	name: string;
+	overrides: VariantOverride[];
+	created_at: number;
+	total_hours: number;
+}
+
 export interface Equipment {
 	id: number;
 	name: string;
@@ -706,6 +733,9 @@ export interface Session {
 	/** Stable across merges and splits; the id a shared session will carry. */
 	uuid: string | null;
 	title: string | null;
+	/** A note about the sitting itself — distinct from a liner note, which is
+	 *  about a record and hangs off an entity or a single listen. */
+	notes: string | null;
 	started_at: number;
 	ended_at: number | null;
 	track_count: number;
@@ -714,6 +744,10 @@ export interface Session {
 	listening_context: string | null;
 	chain_id: number | null;
 	chain_name: string | null;
+	/** Read off the sitting's listens rather than stored on the session, so it
+	 *  cannot disagree with them. */
+	chain_variant_id: number | null;
+	chain_variant_name: string | null;
 	device_id: number | null;
 	device_name: string | null;
 	token_id: number | null;
@@ -1598,7 +1632,18 @@ class TapedeckAPI {
 	async rebuildSessions(gap_seconds?: number): Promise<{ sessions: number; listens: number }> {
 		return this.post('/api/v1/sessions/rebuild', gap_seconds ? { gap_seconds } : {});
 	}
-	async updateSession(id: number, data: { chain_id?: number | null; title?: string | null }): Promise<{ session: Session }> {
+	async updateSession(
+		id: number,
+		data: {
+			chain_id?: number | null;
+			/** Which variant of that chain — the "I had the other IEMs in"
+			 *  edit. Rewritten whenever `chain_id` is, since a variant belongs
+			 *  to exactly one chain. */
+			chain_variant_id?: number | null;
+			title?: string | null;
+			notes?: string | null;
+		}
+	): Promise<{ session: Session }> {
 		return this.patch(`/api/v1/sessions/${id}`, data);
 	}
 
@@ -1716,6 +1761,25 @@ class TapedeckAPI {
 	}
 	async deleteUser(id: number): Promise<void> {
 		return this.delNoBody(`/admin/users/${id}`);
+	}
+
+	// ── Chain variants ──
+	async getVariants(): Promise<{ variants: ChainVariant[] }> {
+		return this.get('/api/v1/chains/variants');
+	}
+	async createVariant(body: {
+		chain_id: number; name: string; overrides: VariantOverride[];
+	}): Promise<{ id: number }> {
+		return this.post('/api/v1/chains/variants', body);
+	}
+	async updateVariant(
+		id: number,
+		body: { name?: string; overrides?: VariantOverride[] }
+	): Promise<{ status: string }> {
+		return this.patch(`/api/v1/chains/variants/${id}`, body);
+	}
+	async deleteVariant(id: number): Promise<{ status: string }> {
+		return this.del(`/api/v1/chains/variants/${id}`);
 	}
 
 	// ── Your own account ──

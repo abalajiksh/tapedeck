@@ -342,6 +342,10 @@ pub struct ReleaseUpdate {
     pub equipment_id: Option<Option<i64>>,
     #[serde(default, deserialize_with = "explicit")]
     pub notes: Option<Option<String>>,
+    /// The variant of `chain_id` this pressing is normally played on — the
+    /// cartridge you keep fitted for it.
+    #[serde(default, deserialize_with = "explicit")]
+    pub chain_variant_id: Option<Option<i64>>,
     /// Move it to another shelf. A plain `Option` on purpose — a kind has no
     /// "cleared" state, so absent is the only thing `None` can mean.
     ///
@@ -418,6 +422,7 @@ async fn update_release(
             body.equipment_id,
             body.notes.as_ref().map(|n| n.as_deref()),
             kind.as_deref(),
+            body.chain_variant_id,
         )
         .await
     {
@@ -981,6 +986,11 @@ pub struct PlaySide {
     /// about the medium rather than about this request.
     #[serde(default)]
     pub parked_secs: Option<i64>,
+    /// Which variant of the chain was fitted — the cartridge in the headshell.
+    /// The shelf is the one write path that legitimately knows this, because
+    /// you told it when you dropped the needle.
+    #[serde(default)]
+    pub chain_variant_id: Option<i64>,
 }
 
 /// POST /api/v1/physical/:id/play — record a side.
@@ -1042,6 +1052,18 @@ async fn play_side(
     // gear it plainly ran through never moved.
     let chain_id = body.chain_id.or(release.chain_id);
     let equipment_id = body.equipment_id.or(release.equipment_id);
+    // A variant only means anything paired with its own chain, so one naming a
+    // different chain is dropped rather than stored — `equipment_seconds` would
+    // ignore the pairing anyway, and a listen carrying an id nothing resolves
+    // is worse than one carrying none.
+    let variant_id = match (chain_id, body.chain_variant_id.or(release.chain_variant_id)) {
+        (Some(cid), Some(vid)) => match state.db.variant_fits_chain(user.user_id, vid, cid).await {
+            Ok(true) => Some(vid),
+            Ok(false) => None,
+            Err(e) => return err(500, e.to_string()),
+        },
+        _ => None,
+    };
 
     // Outcomes the deck reported, by track position.
     let reported: std::collections::HashMap<i64, &TrackOutcome> =
@@ -1085,6 +1107,9 @@ async fn play_side(
                 None,
                 None,
                 chain_id,
+                // Which cartridge was fitted. The shelf is the one write path that
+                // legitimately knows — you told it when you dropped the needle.
+                variant_id,
                 None,
                 Some(medium_label(&release.kind)),
                 None,
@@ -1177,7 +1202,7 @@ async fn play_side(
     // and the next time it comes off the shelf — is pre-filled. Only when the
     // caller stated something: a play that fell through to the stored default
     // has nothing new to say.
-    if body.chain_id.is_some() || body.equipment_id.is_some() {
+    if body.chain_id.is_some() || body.equipment_id.is_some() || body.chain_variant_id.is_some() {
         if let Err(e) = state
             .db
             .update_physical(
@@ -1188,6 +1213,10 @@ async fn play_side(
                 body.equipment_id.map(Some),
                 None,
                 None,
+                // The cartridge you keep fitted for this record, so the next
+                // side does not ask again. `variant_id` rather than the raw
+                // body: a variant that failed the chain check is not stored.
+                body.chain_variant_id.map(|_| variant_id),
             )
             .await
         {

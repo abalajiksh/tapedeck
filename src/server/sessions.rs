@@ -137,6 +137,14 @@ pub struct UpdateSession {
     pub chain_id: Option<Option<i64>>,
     #[serde(default, deserialize_with = "double_option_str")]
     pub title: Option<Option<String>>,
+    /// Which variant of the chain — "with the microlinear", "on the Hexas".
+    /// Rewritten whenever `chain_id` is, since a variant belongs to one chain.
+    #[serde(default, deserialize_with = "double_option")]
+    pub chain_variant_id: Option<Option<i64>>,
+    /// A note about the sitting. Not a liner note about a record — that is
+    /// `/api/v1/notes`, which hangs off an entity or a single listen.
+    #[serde(default, deserialize_with = "double_option_str")]
+    pub notes: Option<Option<String>>,
 }
 
 fn double_option<'de, D>(de: D) -> Result<Option<Option<i64>>, D::Error>
@@ -172,7 +180,28 @@ async fn update_session(
                 _ => return err(StatusCode::BAD_REQUEST, "Unknown signal chain"),
             }
         }
-        if let Err(e) = state.db.set_session_chain(user.user_id, id, chain).await {
+        // A variant has to belong to the chain it is being paired with, or the
+        // listen resolves to components that were never fitted together.
+        let variant = body.chain_variant_id.flatten();
+        if let (Some(cid), Some(vid)) = (chain, variant) {
+            match state.db.variant_fits_chain(user.user_id, vid, cid).await {
+                Ok(true) => {}
+                Ok(false) => {
+                    return err(StatusCode::BAD_REQUEST, "That variant belongs to another chain")
+                }
+                Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+            }
+        }
+        if variant.is_some() && chain.is_none() {
+            return err(StatusCode::BAD_REQUEST, "A variant needs a chain");
+        }
+        if let Err(e) = state.db.set_session_chain(user.user_id, id, chain, variant).await {
+            return err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
+        }
+    }
+
+    if let Some(notes) = body.notes {
+        if let Err(e) = state.db.set_session_notes(user.user_id, id, notes.as_deref()).await {
             return err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
         }
     }

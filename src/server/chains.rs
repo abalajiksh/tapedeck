@@ -13,6 +13,157 @@ use super::models::ErrorResponse;
 use super::AppState;
 use crate::models::*;
 
+// ── Chain variants ──
+//
+// A chain with one step swapped. Two cartridges on one turntable, or the same
+// commute with different IEMs, are one chain and a choice — not two chains.
+// Modelling them as separate chains is what makes a gear collection produce a
+// page of near-duplicates, and it is also what stops per-component wear from
+// being answerable: "which chain was it" does not tell you what was fitted.
+
+#[derive(Deserialize)]
+pub struct CreateVariantRequest {
+    pub chain_id: i64,
+    pub name: String,
+    #[serde(default)]
+    pub overrides: Vec<VariantOverride>,
+}
+
+#[derive(Deserialize)]
+pub struct UpdateVariantRequest {
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub overrides: Option<Vec<VariantOverride>>,
+}
+
+/// GET /api/v1/chains/variants — every variant the caller owns.
+///
+/// Flat rather than nested under each chain: the page needs them keyed by
+/// chain, and one list it can group beats N requests.
+async fn list_variants(
+    State(state): State<Arc<AppState>>,
+    ReadAuth { user }: ReadAuth,
+) -> impl IntoResponse {
+    match state.db.list_variants(user.user_id).await {
+        Ok(variants) => {
+            (StatusCode::OK, Json(serde_json::json!({ "variants": variants }))).into_response()
+        }
+        Err(e) => internal(e),
+    }
+}
+
+async fn create_variant(
+    State(state): State<Arc<AppState>>,
+    user: AuthUser,
+    Json(body): Json<CreateVariantRequest>,
+) -> impl IntoResponse {
+    if body.name.trim().is_empty() {
+        return bad("A variant needs a name");
+    }
+    // The chain must be the caller's — same rule ingest follows for a token's
+    // default chain, and the only id in this body that names something owned.
+    match state.db.get_chain(user.user_id, body.chain_id).await {
+        Ok(Some(_)) => {}
+        Ok(None) => return bad("No such signal chain"),
+        Err(e) => return internal(e),
+    }
+    if let Err(e) = check_gear(&state, user.user_id, &body.overrides).await {
+        return e;
+    }
+
+    match state
+        .db
+        .create_variant(user.user_id, body.chain_id, body.name.trim(), &body.overrides)
+        .await
+    {
+        Ok(id) => (StatusCode::OK, Json(serde_json::json!({ "id": id }))).into_response(),
+        Err(e) => internal(e),
+    }
+}
+
+async fn update_variant(
+    State(state): State<Arc<AppState>>,
+    user: AuthUser,
+    Path(id): Path<i64>,
+    Json(body): Json<UpdateVariantRequest>,
+) -> impl IntoResponse {
+    if let Some(ref o) = body.overrides {
+        if let Err(e) = check_gear(&state, user.user_id, o).await {
+            return e;
+        }
+    }
+    match state
+        .db
+        .update_variant(user.user_id, id, body.name.as_deref(), body.overrides.as_deref())
+        .await
+    {
+        Ok(true) => (StatusCode::OK, Json(serde_json::json!({ "status": "ok" }))).into_response(),
+        Ok(false) => not_found("No such variant"),
+        Err(e) => internal(e),
+    }
+}
+
+/// DELETE /api/v1/chains/variants/:id
+///
+/// The listens that went through it keep their chain and fall back to its base
+/// components — which is what a null variant means everywhere else — rather
+/// than being deleted along with it.
+async fn delete_variant(
+    State(state): State<Arc<AppState>>,
+    user: AuthUser,
+    Path(id): Path<i64>,
+) -> impl IntoResponse {
+    match state.db.delete_variant(user.user_id, id).await {
+        Ok(true) => {
+            (StatusCode::OK, Json(serde_json::json!({ "status": "deleted" }))).into_response()
+        }
+        Ok(false) => not_found("No such variant"),
+        Err(e) => internal(e),
+    }
+}
+
+/// Every piece of gear named in an override has to be the caller's.
+async fn check_gear(
+    state: &Arc<AppState>,
+    user_id: i64,
+    overrides: &[VariantOverride],
+) -> Result<(), axum::response::Response> {
+    let wanted: Vec<i64> = overrides.iter().filter_map(|o| o.equipment_id).collect();
+    if wanted.is_empty() {
+        return Ok(());
+    }
+    match state.db.get_equipment(user_id).await {
+        Ok(gear) => {
+            if wanted.iter().all(|w| gear.iter().any(|g| g.id == *w)) {
+                Ok(())
+            } else {
+                Err(bad("A variant names equipment that isn't yours"))
+            }
+        }
+        Err(e) => Err(internal(e)),
+    }
+}
+
+fn bad(msg: &str) -> axum::response::Response {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(serde_json::json!(ErrorResponse { code: 400, error: msg.into() })),
+    )
+        .into_response()
+}
+fn not_found(msg: &str) -> axum::response::Response {
+    (StatusCode::NOT_FOUND, Json(serde_json::json!(ErrorResponse { code: 404, error: msg.into() })))
+        .into_response()
+}
+fn internal(e: sqlx::Error) -> axum::response::Response {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(serde_json::json!(ErrorResponse { code: 500, error: e.to_string() })),
+    )
+        .into_response()
+}
+
 // ── Signal Chain endpoints ──
 
 #[derive(Deserialize)]
@@ -412,6 +563,13 @@ pub fn create_gear_router() -> Router<Arc<AppState>> {
     Router::new()
         .route("/api/v1/chains", post(create_chain).get(list_chains))
         .route("/api/v1/chains/:id", get(get_chain).patch(update_chain).delete(delete_chain))
+        // Before "/:id" would be wrong here — "variants" is a distinct literal
+        // segment under /chains, not a chain id, and matchit prefers literals.
+        .route("/api/v1/chains/variants", get(list_variants).post(create_variant))
+        .route(
+            "/api/v1/chains/variants/:id",
+            axum::routing::patch(update_variant).delete(delete_variant),
+        )
         .route("/api/v1/devices", get(list_devices))
         .route("/api/v1/devices/:id", patch(set_device_chain))
         .route("/api/v1/equipment", post(create_equipment).get(list_equipment))

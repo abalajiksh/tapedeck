@@ -1,11 +1,12 @@
 <script lang="ts">
 	import { onMount, tick } from 'svelte';
 	import { api } from '$lib/api';
-	import type { SignalChain, Equipment, ChainComponent, ChainInput, EquipmentInput, Binding, Device } from '$lib/api';
+	import type { SignalChain, Equipment, ChainComponent, ChainInput, EquipmentInput, Binding, Device, ChainVariant } from '$lib/api';
 	import { formatHours, timeAgo, toDateInput, fromDateInput, ownedFor, formatDateTime } from '$lib/utils';
 	import ChainIcon, { CHAIN_ICONS, CHAIN_ICON_LABELS } from '$lib/components/ChainIcon.svelte';
 
 	let chains: SignalChain[] = [];
+	let variants: ChainVariant[] = [];
 	let equipment: Equipment[] = [];
 	let bindings: Binding[] = [];
 	let devices: Device[] = [];
@@ -15,6 +16,104 @@
 	$: unmapped = bindings.filter((b) => b.chain_id == null);
 	$: mapped = bindings.filter((b) => b.chain_id != null);
 	$: chainName = (id: number | null) => chains.find((c) => c.id === id)?.name ?? '—';
+
+	// ── Variants ──
+	//
+	// A chain with one step swapped. Two cartridges on one turntable, or the
+	// same commute on different IEMs, are one chain and a choice — modelling
+	// them as separate chains is what turns a modest gear collection into a page
+	// of near-duplicates, and it is also what makes per-stylus hours
+	// unanswerable, since "which chain" does not say what was fitted.
+	$: variantsFor = (chainId: number | null | undefined) =>
+		variants.filter((v) => v.chain_id === chainId);
+
+	/** The collapsed one-line path: what you scan rather than read. */
+	function pathSummary(c: SignalChain): string {
+		const names = (c.components ?? []).map((s) => s.name);
+		if (!names.length) return 'No steps yet';
+		if (names.length <= 3) return names.join(' → ');
+		return `${names[0]} → … → ${names[names.length - 1]} · ${names.length} steps`;
+	}
+
+	/** What a variant actually changes, for the chip's tooltip. */
+	function overrideSummary(c: SignalChain, v: ChainVariant): string {
+		if (!v.overrides.length) return 'Same as the chain';
+		return v.overrides
+			.map((o) => {
+				const was = c.components?.[o.position]?.name;
+				const now = o.name ?? equipment.find((e) => e.id === o.equipment_id)?.name ?? '—';
+				return was ? `${was} → ${now}` : `+ ${now}`;
+			})
+			.join(', ');
+	}
+
+	// Collapsed by default — the whole point is that the page stops being a wall
+	// of paths. Which ones are open is a fact about this browser, so localStorage
+	// rather than the server.
+	let expanded = new Set<number>();
+	const EXPAND_KEY = 'td-chains-expanded';
+	function toggleChain(id: number | null | undefined) {
+		if (id == null) return;
+		if (expanded.has(id)) expanded.delete(id);
+		else expanded.add(id);
+		expanded = expanded;
+		try { localStorage.setItem(EXPAND_KEY, JSON.stringify([...expanded])); } catch { /* private mode */ }
+	}
+
+	// The variant editor.
+	let vOpen = false;
+	let vChain: SignalChain | null = null;
+	let vId: number | null = null;
+	let vName = '';
+	let vSlot = 0;
+	let vGear: number | null = null;
+	let vErr = '';
+	let vSaving = false;
+
+	function newVariant(c: SignalChain) {
+		vChain = c;
+		vId = null;
+		vName = '';
+		vErr = '';
+		// The last step is the usual thing you swap — headphones, IEMs, a
+		// cartridge at the other end. Not a rule, just the better default.
+		vSlot = Math.max(0, (c.components?.length ?? 1) - 1);
+		vGear = null;
+		vOpen = true;
+	}
+
+	async function saveVariant() {
+		if (!vChain?.id || !vName.trim()) { vErr = 'A variant needs a name.'; return; }
+		if (vGear == null) { vErr = 'Pick the gear that goes in that slot.'; return; }
+		vSaving = true;
+		vErr = '';
+		try {
+			const overrides = [{
+				position: vSlot,
+				equipment_id: vGear,
+				name: equipment.find((e) => e.id === vGear)?.name ?? null
+			}];
+			if (vId == null) await api.createVariant({ chain_id: vChain.id, name: vName.trim(), overrides });
+			else await api.updateVariant(vId, { name: vName.trim(), overrides });
+			vOpen = false;
+			await load();
+		} catch (e) {
+			vErr = String(e).replace(/^API \d+: /, '');
+		}
+		vSaving = false;
+	}
+
+	async function removeVariant(v: ChainVariant) {
+		// The listens keep their chain and fall back to its base components,
+		// which is what a null variant means everywhere — so this is not the
+		// destructive act deleting a chain would be, and needs no confirmation.
+		try {
+			await api.deleteVariant(v.id);
+			await load();
+		} catch (e) {
+			error = String(e).replace(/^API \d+: /, '');
+		}
+	}
 
 	const contexts = ['active', 'active-mobile', 'passive', 'background', 'unknown'];
 	// Values must stay in sync with `ComponentType` in src/models.rs — serde
@@ -50,6 +149,11 @@
 		{ v: 'dap', label: 'DAP / Music player' },
 		{ v: 'transport', label: 'Transport' },
 		{ v: 'turntable', label: 'Turntable' },
+		// A cartridge is not a turntable, and it is the one piece of gear people
+		// own two of for the same deck — which is what chain variants exist for.
+		{ v: 'cartridge', label: 'Cartridge / stylus' },
+		{ v: 'headshell', label: 'Headshell' },
+		{ v: 'phono', label: 'Phono stage' },
 		{ v: 'interface', label: 'Audio interface' },
 		{ v: 'receiver', label: 'Receiver / Amp-DAC' },
 		{ v: 'cable', label: 'Cable' },
@@ -71,6 +175,9 @@
 		dac: 'dac', 'dac-amp': 'dac', interface: 'dac', receiver: 'dac',
 		amp: 'amp', preamp: 'amp',
 		source: 'source', turntable: 'source', phone: 'source',
+		// A cartridge sits at the very start of the path, before anything
+		// amplifies it; a phono stage is the first gain stage after it.
+		cartridge: 'source', headshell: 'source', phono: 'amp',
 		computer: 'source', dap: 'source', other: 'source',
 		transport: 'transport', cable: 'transport'
 	};
@@ -118,8 +225,11 @@
 
 	async function load() {
 		try {
-			const [c, g, b, d] = await Promise.all([api.getChains(), api.getEquipment(), api.getBindings(), api.getDevices()]);
+			const [c, g, b, d, v] = await Promise.all([
+				api.getChains(), api.getEquipment(), api.getBindings(), api.getDevices(), api.getVariants()
+			]);
 			chains = c.chains;
+			variants = v.variants;
 			equipment = g.equipment;
 			bindings = b.bindings;
 			devices = d.devices;
@@ -312,6 +422,10 @@
 	let highlightGear: number | null = null;
 
 	onMount(async () => {
+		try {
+			const raw = localStorage.getItem(EXPAND_KEY);
+			if (raw) expanded = new Set(JSON.parse(raw) as number[]);
+		} catch { /* private mode — everything just starts collapsed */ }
 		const g = new URLSearchParams(window.location.search).get('gear');
 		highlightGear = g ? Number(g) : null;
 		await load();
@@ -363,8 +477,19 @@
 							</button>
 						</div>
 					</div>
+					<!-- Collapsed by default. A shelf of gear turns into a page of
+					     chains, and a full path drawn for every one of them is the
+					     thing that made this screen unreadable — the summary line
+					     is what you scan, the path is what you occasionally check. -->
 					{#if c.components?.length}
-						<div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;">
+						<button class="pathtoggle" on:click={() => toggleChain(c.id)}
+							aria-expanded={expanded.has(c.id)}>
+							<span class="caret" class:open={expanded.has(c.id)}>▸</span>
+							<span>{pathSummary(c)}</span>
+						</button>
+					{/if}
+					{#if c.components?.length && expanded.has(c.id)}
+						<div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;margin-top:10px;">
 							{#each c.components as step, i}
 								<span style="display:inline-flex;flex-direction:column;background:var(--td-surface2);border:1px solid var(--td-border);border-radius:12px;padding:7px 12px;">
 									<span style="font-size:10px;letter-spacing:.08em;text-transform:uppercase;color:var(--td-muted-3);">{compTypeLabel(step.type)}</span>
@@ -377,7 +502,29 @@
 							{/each}
 						</div>
 					{/if}
-					<div style="font-size:12.5px;color:var(--td-muted-2);margin-top:14px;">{formatHours(c.total_hours)} logged on this chain</div>
+
+					<!-- Variants: the same chain with one step swapped. Two
+					     cartridges on one turntable are a choice, not two decks. -->
+					<div class="variants">
+						{#each variantsFor(c.id) as v (v.id)}
+							<span class="vchip" title={overrideSummary(c, v)}>
+								<span>{v.name}</span>
+								<span class="vhrs">{formatHours(v.total_hours)}</span>
+								<button class="vx" title="Delete this variant"
+									aria-label="Delete variant {v.name}" on:click={() => removeVariant(v)}>✕</button>
+							</span>
+						{/each}
+						<button class="vadd" on:click={() => newVariant(c)}>+ variant</button>
+					</div>
+
+					<div style="font-size:12.5px;color:var(--td-muted-2);margin-top:14px;">
+						{formatHours(c.total_hours)} logged on this chain
+						{#if variantsFor(c.id).length}
+							<span title="A chain's hours include every variant of it — they all ran through this chain">
+								· across {variantsFor(c.id).length + 1} setup{variantsFor(c.id).length ? 's' : ''}
+							</span>
+						{/if}
+					</div>
 				</div>
 			{/each}
 		{:else}
@@ -483,6 +630,59 @@
 		{:else}
 			<p style="color:var(--td-muted);font-size:14px;margin:0;">No outputs detected yet. They appear here automatically once a client reports its output device (USB DAC, Bluetooth, headphone jack…).</p>
 		{/if}
+	</div>
+{/if}
+
+<!-- Variant editor: pick a slot, pick what goes in it. Deliberately one slot
+     at a time — the whole reason variants exist is that swapping *one* thing
+     should not mean rebuilding a chain, and a full editor here would just be
+     the chain editor again. -->
+{#if vOpen && vChain}
+	<div class="dialog-backdrop" on:click={() => (vOpen = false)} on:keydown={() => {}} role="presentation">
+		<div class="dialog" style="width:min(520px,100%);" on:click|stopPropagation on:keydown|stopPropagation role="presentation">
+			<div class="dialog-title">{vId == null ? 'New variant' : 'Edit variant'} of {vChain.name}</div>
+			<div class="dialog-body">
+				<div style="display:flex;flex-direction:column;gap:13px;">
+					<div class="field">
+						<label for="vn">Name</label>
+						<input id="vn" class="input" bind:value={vName} placeholder="Microlinear" />
+						<p style="font-size:12px;color:var(--td-muted-2);margin:5px 0 0;">
+							What is different about it — the stylus fitted, the headphones on.
+						</p>
+					</div>
+					<div class="field">
+						<label for="vs">Swap which step</label>
+						<select id="vs" class="input" bind:value={vSlot}>
+							{#each vChain.components ?? [] as step, i}
+								<option value={i}>{compTypeLabel(step.type)} · {step.name}</option>
+							{/each}
+							<option value={(vChain.components ?? []).length}>+ add a step at the end</option>
+						</select>
+					</div>
+					<div class="field">
+						<label for="vg">For</label>
+						<select id="vg" class="input" bind:value={vGear}>
+							<option value={null}>— pick from your gear —</option>
+							{#each equipment as e}
+								<option value={e.id}>{e.name}{e.brand ? ` · ${e.brand}` : ''}</option>
+							{/each}
+						</select>
+						<p style="font-size:12px;color:var(--td-muted-2);margin:5px 0 0;">
+							Listens tagged with this variant credit their hours here instead of
+							whatever the chain names at that step — which is what makes
+							per-stylus wear answerable.
+						</p>
+					</div>
+					{#if vErr}<p style="font-size:13px;color:#b2622d;margin:0;">{vErr}</p>{/if}
+				</div>
+			</div>
+			<div class="dialog-actions">
+				<button class="btn btn-secondary" on:click={() => (vOpen = false)}>Cancel</button>
+				<button class="btn btn-primary" on:click={saveVariant} disabled={vSaving}>
+					{vSaving ? 'Saving…' : 'Save variant'}
+				</button>
+			</div>
+		</div>
 	</div>
 {/if}
 
@@ -654,6 +854,38 @@
 	.icon-pick.on { border-color: var(--td-accent); color: var(--td-accent); background: color-mix(in srgb, var(--td-accent) 10%, transparent); }
 
 	.spin { animation: td-spin 0.7s linear infinite; }
+	/* The collapsed path line. It has to read as a control without becoming a
+	   button — a chain card already has three of those in its corner. */
+	.pathtoggle {
+		display: inline-flex; align-items: center; gap: 7px;
+		background: none; border: 0; padding: 4px 6px; margin-left: -6px;
+		border-radius: 8px; cursor: pointer; text-align: left;
+		color: var(--td-muted); font: inherit; font-size: 13px;
+	}
+	.pathtoggle:hover { background: var(--td-nav-hover); color: var(--td-text); }
+	.caret { display: inline-block; transition: transform 0.14s ease; font-size: 11px; }
+	.caret.open { transform: rotate(90deg); }
+	@media (prefers-reduced-motion: reduce) { .caret { transition: none; } }
+
+	.variants { display: flex; align-items: center; gap: 7px; flex-wrap: wrap; margin-top: 12px; }
+	.vchip {
+		display: inline-flex; align-items: center; gap: 7px;
+		border: 1px solid var(--td-accent); border-radius: 999px;
+		background: color-mix(in srgb, var(--td-accent) 10%, transparent);
+		padding: 4px 6px 4px 12px; font-size: 12.5px;
+	}
+	.vhrs { color: var(--td-muted); font-variant-numeric: tabular-nums; }
+	.vx {
+		background: none; border: 0; cursor: pointer; color: var(--td-muted);
+		font-size: 12px; line-height: 1; padding: 3px 5px; border-radius: 999px;
+	}
+	.vx:hover { color: #b2622d; background: var(--td-nav-hover); }
+	.vadd {
+		background: none; border: 1px dashed var(--td-border); border-radius: 999px;
+		padding: 4px 12px; font-size: 12.5px; color: var(--td-muted); cursor: pointer;
+	}
+	.vadd:hover { border-color: var(--td-accent); color: var(--td-text); }
+
 	.icon-btn {
 		border: none; background: transparent; cursor: pointer; color: var(--td-muted-2);
 		width: 30px; height: 30px; border-radius: 8px; display: inline-flex; align-items: center; justify-content: center;

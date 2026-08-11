@@ -250,6 +250,28 @@ pub struct ChainComponent {
     pub equipment_id: Option<i64>,
 }
 
+/// One step of a chain, replaced.
+///
+/// `position` indexes into the parent chain's `components`. Only the steps that
+/// differ are stored, which is what makes a variant an override rather than a
+/// copy: editing the shared part of a chain updates every variant of it, and
+/// two cartridges on one turntable stay one chain.
+///
+/// A `position` past the end of the base components *adds* a step, so a chain
+/// that never named a cartridge can gain one without being rewritten.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct VariantOverride {
+    pub position: i64,
+    /// The gear fitted at this step. `None` removes the step for this variant —
+    /// a chain run without its amp, say.
+    #[serde(default)]
+    pub equipment_id: Option<i64>,
+    /// Snapshot of the name, for the same reason `ChainComponent` keeps one: a
+    /// deleted gear row leaves the variant readable instead of blank.
+    #[serde(default)]
+    pub name: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ComponentType {

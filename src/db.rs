@@ -245,6 +245,10 @@ pub struct PhysicalRelease {
     /// writes the answer back, so a record with one turntable is asked once.
     pub chain_id: Option<i64>,
     pub equipment_id: Option<i64>,
+    /// Which variant of that chain this pressing is normally played on — the
+    /// cartridge you keep fitted for it. Pre-fills the deck the same way
+    /// `chain_id` does.
+    pub chain_variant_id: Option<i64>,
     /// Where the tape was left. Cassettes only — a record has random access and
     /// no state to remember, so these stay null for every other medium.
     pub parked_side: Option<String>,
@@ -602,6 +606,34 @@ impl Database {
         .execute(&self.pool)
         .await?;
 
+        // A chain with one step swapped.
+        //
+        // Two cartridges on one turntable, or the same commute with a different
+        // pair of IEMs, are not two signal chains — they are one chain and a
+        // choice. Modelling them as separate chains is what made a shelf of
+        // eight chains unreadable: "Commute Phone" and "Summer Commute"
+        // differed by exactly one component, and every gear swap forever adds
+        // another near-duplicate row.
+        //
+        // `overrides` is a JSON array of `{position, equipment_id, name}`, where
+        // `position` indexes into the parent chain's `components`. Only the
+        // steps that differ are stored, so editing the shared part of a chain
+        // updates every variant of it — which is the entire reason this is an
+        // override rather than a copy.
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS chain_variants (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL REFERENCES users(id),
+                chain_id INTEGER NOT NULL REFERENCES signal_chains(id),
+                name TEXT NOT NULL,
+                overrides JSON NOT NULL DEFAULT '[]',
+                created_at INTEGER NOT NULL,
+                UNIQUE(chain_id, name)
+            )",
+        )
+        .execute(&self.pool)
+        .await?;
+
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS devices (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -845,6 +877,9 @@ impl Database {
                 token_id INTEGER REFERENCES tokens(id),
                 uuid TEXT,
                 title TEXT,
+                -- A note about the sitting itself, distinct from a liner note
+                -- about a record, e.g. a first listen on a new cartridge.
+                notes TEXT,
                 updated_at INTEGER
             )",
         )
@@ -1582,6 +1617,42 @@ impl Database {
                     .await;
             }
         }
+        // Migration: which variant of a chain a listen went through.
+        //
+        // Nullable and never backfilled: a listen recorded before variants
+        // existed went through the chain as it was, which is exactly what a
+        // null means here. Guessing a variant for it would invent wear on a
+        // cartridge that may not have been fitted yet.
+        if !has_column(&self.pool, "scrobbles", "chain_variant_id").await {
+            info!("⚙️ Migrating: chain variants...");
+            let _ = sqlx::query(
+                "ALTER TABLE scrobbles ADD COLUMN chain_variant_id INTEGER
+                   REFERENCES chain_variants(id)",
+            )
+            .execute(&self.pool)
+            .await;
+        }
+        if !has_column(&self.pool, "physical_plays", "chain_variant_id").await {
+            let _ = sqlx::query(
+                "ALTER TABLE physical_plays ADD COLUMN chain_variant_id INTEGER
+                   REFERENCES chain_variants(id)",
+            )
+            .execute(&self.pool)
+            .await;
+        }
+        if !has_column(&self.pool, "physical_releases", "chain_variant_id").await {
+            let _ = sqlx::query(
+                "ALTER TABLE physical_releases ADD COLUMN chain_variant_id INTEGER
+                   REFERENCES chain_variants(id)",
+            )
+            .execute(&self.pool)
+            .await;
+        }
+        if !has_column(&self.pool, "sessions", "notes").await {
+            let _ =
+                sqlx::query("ALTER TABLE sessions ADD COLUMN notes TEXT").execute(&self.pool).await;
+        }
+
         if !has_column(&self.pool, "physical_spins", "start_secs").await {
             let _ = sqlx::query(
                 "ALTER TABLE physical_spins ADD COLUMN start_secs INTEGER NOT NULL DEFAULT 0",
@@ -1771,6 +1842,16 @@ impl Database {
         quality: Option<&AudioQuality>,
         device_id: Option<i64>,
         chain_id: Option<i64>,
+        // Which variant of that chain was fitted. Sits immediately beside
+        // `chain_id` because the two only mean anything together: a variant
+        // belongs to exactly one chain, and pairing one with a different chain
+        // resolves to components that were never fitted at the same time.
+        //
+        // Almost always `None` at write time, and that is correct — a scrobble
+        // client has no idea which stylus is in the headshell. The paths that
+        // legitimately know are the shelf (you told it) and retagging a sitting
+        // afterwards.
+        chain_variant_id: Option<i64>,
         listening_context: Option<&str>,
         submission_client: Option<&str>,
         source_ref: Option<i64>,
@@ -1804,13 +1885,13 @@ impl Database {
                 dsd_rate, dsd_multiplier, dsd_to_pcm_converted,
                 delivery_codec, delivery_bitrate, delivery_sample_rate, delivery_bit_depth,
                 is_transcoded, transcode_reason, quality_score,
-                device_id, chain_id, listening_context, submission_client, track_number,
-                source_ref
+                device_id, chain_id, chain_variant_id, listening_context, submission_client,
+                track_number, source_ref
             ) VALUES (
                 ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
                 ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
                 ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                ?, ?, ?, ?, ?, ?, ?, ?, ?
+                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
             )",
         )
         .bind(user_id)
@@ -1850,6 +1931,7 @@ impl Database {
         .bind(q.quality_score)
         .bind(device_id)
         .bind(chain_id)
+        .bind(chain_variant_id)
         .bind(listening_context)
         .bind(submission_client)
         .bind(play.track_number)
@@ -2713,6 +2795,7 @@ impl Database {
         equipment_id: Option<Option<i64>>,
         notes: Option<Option<&str>>,
         kind: Option<&str>,
+        chain_variant_id: Option<Option<i64>>,
     ) -> Result<bool, sqlx::Error> {
         let mut sets: Vec<&str> = Vec::new();
         // A plain `Option` rather than a nested one, unlike everything else
@@ -2729,6 +2812,9 @@ impl Database {
         }
         if equipment_id.is_some() {
             sets.push("equipment_id = ?");
+        }
+        if chain_variant_id.is_some() {
+            sets.push("chain_variant_id = ?");
         }
         if notes.is_some() {
             sets.push("notes = ?");
@@ -2754,6 +2840,9 @@ impl Database {
             q = q.bind(v);
         }
         if let Some(v) = equipment_id {
+            q = q.bind(v);
+        }
+        if let Some(v) = chain_variant_id {
             q = q.bind(v);
         }
         if let Some(v) = notes {
@@ -5846,9 +5935,17 @@ impl Database {
         offset: i64,
     ) -> Result<Vec<SessionRow>, sqlx::Error> {
         sqlx::query_as(
-            "SELECT s.id, s.uuid, s.title, s.started_at, s.ended_at, s.track_count,
+            "SELECT s.id, s.uuid, s.title, s.notes, s.started_at, s.ended_at, s.track_count,
                     s.total_duration, s.avg_quality_score, s.listening_context,
-                    s.chain_id, c.name AS chain_name, s.device_id, d.name AS device_name,
+                    s.chain_id, c.name AS chain_name,
+                    (SELECT sc.chain_variant_id FROM scrobbles sc
+                      WHERE sc.session_id = s.id AND sc.chain_variant_id IS NOT NULL
+                      LIMIT 1) AS chain_variant_id,
+                    (SELECT v.name FROM chain_variants v WHERE v.id = (
+                        SELECT sc.chain_variant_id FROM scrobbles sc
+                         WHERE sc.session_id = s.id AND sc.chain_variant_id IS NOT NULL
+                         LIMIT 1)) AS chain_variant_name,
+                    s.device_id, d.name AS device_name,
                     s.token_id, t.name AS token_name
                FROM sessions s
                LEFT JOIN signal_chains c ON c.id = s.chain_id
@@ -5870,9 +5967,17 @@ impl Database {
         id: i64,
     ) -> Result<Option<SessionRow>, sqlx::Error> {
         sqlx::query_as(
-            "SELECT s.id, s.uuid, s.title, s.started_at, s.ended_at, s.track_count,
+            "SELECT s.id, s.uuid, s.title, s.notes, s.started_at, s.ended_at, s.track_count,
                     s.total_duration, s.avg_quality_score, s.listening_context,
-                    s.chain_id, c.name AS chain_name, s.device_id, d.name AS device_name,
+                    s.chain_id, c.name AS chain_name,
+                    (SELECT sc.chain_variant_id FROM scrobbles sc
+                      WHERE sc.session_id = s.id AND sc.chain_variant_id IS NOT NULL
+                      LIMIT 1) AS chain_variant_id,
+                    (SELECT v.name FROM chain_variants v WHERE v.id = (
+                        SELECT sc.chain_variant_id FROM scrobbles sc
+                         WHERE sc.session_id = s.id AND sc.chain_variant_id IS NOT NULL
+                         LIMIT 1)) AS chain_variant_name,
+                    s.device_id, d.name AS device_name,
                     s.token_id, t.name AS token_name
                FROM sessions s
                LEFT JOIN signal_chains c ON c.id = s.chain_id
@@ -6029,19 +6134,31 @@ impl Database {
     ///
     /// "This whole sitting was on the desk rig" is the edit sessions exist to
     /// make cheap — the alternative is shift-selecting forty rows in history.
+    /// Retag a whole sitting.
+    ///
+    /// `variant_id` is what makes "I had the other IEMs in for this one" a
+    /// one-field edit rather than a second chain — the chain is the same, one
+    /// step of it was different. Setting the chain always rewrites the variant
+    /// too: a variant belongs to one chain, so leaving a stale one behind would
+    /// pair a listen with components that were never fitted, which
+    /// `equipment_seconds` then has to ignore.
     pub async fn set_session_chain(
         &self,
         user_id: i64,
         session_id: i64,
         chain_id: Option<i64>,
+        variant_id: Option<i64>,
     ) -> Result<u64, sqlx::Error> {
-        let res =
-            sqlx::query("UPDATE scrobbles SET chain_id = ? WHERE user_id = ? AND session_id = ?")
-                .bind(chain_id)
-                .bind(user_id)
-                .bind(session_id)
-                .execute(&self.pool)
-                .await?;
+        let res = sqlx::query(
+            "UPDATE scrobbles SET chain_id = ?, chain_variant_id = ?
+              WHERE user_id = ? AND session_id = ?",
+        )
+        .bind(chain_id)
+        .bind(variant_id)
+        .bind(user_id)
+        .bind(session_id)
+        .execute(&self.pool)
+        .await?;
         sqlx::query(
             "UPDATE sessions SET chain_id = ?, updated_at = ? WHERE id = ? AND user_id = ?",
         )
@@ -6055,6 +6172,26 @@ impl Database {
     }
 
     /// Name a session. `None` clears it back to the derived label.
+    /// A note about the sitting itself — distinct from a liner note about a
+    /// record, which is what `notes` is for.
+    pub async fn set_session_notes(
+        &self,
+        user_id: i64,
+        session_id: i64,
+        notes: Option<&str>,
+    ) -> Result<bool, sqlx::Error> {
+        let res = sqlx::query(
+            "UPDATE sessions SET notes = ?, updated_at = ? WHERE id = ? AND user_id = ?",
+        )
+        .bind(notes)
+        .bind(Self::now_secs())
+        .bind(session_id)
+        .bind(user_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(res.rows_affected() > 0)
+    }
+
     pub async fn set_session_title(
         &self,
         user_id: i64,
@@ -7088,30 +7225,255 @@ impl Database {
     /// summed, so gear on no chain at all comes back INTEGER through the
     /// `COALESCE` and sqlx refuses to decode it into `f64`. It shows up the
     /// moment a user has gear with no hours on it, which is every new install.
-    pub async fn get_equipment(&self, user_id: i64) -> Result<Vec<EquipmentRow>, sqlx::Error> {
-        sqlx::query_as(
-            "SELECT e.id, e.user_id, e.name, e.type, e.brand, e.model,
+    // ── Chain variants ──
+
+    pub async fn list_variants(&self, user_id: i64) -> Result<Vec<ChainVariant>, sqlx::Error> {
+        sqlx::query_as::<_, ChainVariantRow>(
+            "SELECT v.id, v.user_id, v.chain_id, v.name, v.overrides, v.created_at,
                     CAST(COALESCE((
-                        SELECT SUM((
-                            SELECT COALESCE(SUM(sc.duration), 0) FROM scrobbles sc
-                             WHERE sc.user_id = c.user_id AND sc.chain_id = c.id
-                               AND sc.skipped = FALSE
-                        ) / 3600.0)
-                          FROM signal_chains c
-                         WHERE c.user_id = e.user_id
-                           AND EXISTS (
-                               SELECT 1 FROM json_each(c.components) j
-                                WHERE json_extract(j.value, '$.equipment_id') = e.id
-                           )
-                    ), 0) AS REAL) AS total_hours,
-                    e.first_used, e.last_used, e.notes, e.purchased_at
-               FROM equipment e
-              WHERE e.user_id = ?
-              ORDER BY total_hours DESC, e.name ASC",
+                        SELECT SUM(sc.duration) FROM scrobbles sc
+                         WHERE sc.user_id = v.user_id AND sc.chain_variant_id = v.id
+                           AND sc.skipped = FALSE
+                    ), 0) AS REAL) / 3600.0 AS total_hours
+               FROM chain_variants v
+              WHERE v.user_id = ?
+              ORDER BY v.chain_id, v.name",
         )
         .bind(user_id)
         .fetch_all(&self.pool)
         .await
+        .map(|rows| rows.into_iter().map(Into::into).collect())
+    }
+
+    pub async fn create_variant(
+        &self,
+        user_id: i64,
+        chain_id: i64,
+        name: &str,
+        overrides: &[VariantOverride],
+    ) -> Result<i64, sqlx::Error> {
+        let json = serde_json::to_string(overrides).unwrap_or_else(|_| "[]".into());
+        let now = chrono::Utc::now().timestamp();
+        let res = sqlx::query(
+            "INSERT INTO chain_variants (user_id, chain_id, name, overrides, created_at)
+             VALUES (?, ?, ?, ?, ?)",
+        )
+        .bind(user_id)
+        .bind(chain_id)
+        .bind(name)
+        .bind(json)
+        .bind(now)
+        .execute(&self.pool)
+        .await?;
+        Ok(res.last_insert_rowid())
+    }
+
+    pub async fn update_variant(
+        &self,
+        user_id: i64,
+        id: i64,
+        name: Option<&str>,
+        overrides: Option<&[VariantOverride]>,
+    ) -> Result<bool, sqlx::Error> {
+        let mut sets: Vec<&str> = Vec::new();
+        if name.is_some() {
+            sets.push("name = ?");
+        }
+        if overrides.is_some() {
+            sets.push("overrides = ?");
+        }
+        if sets.is_empty() {
+            return Ok(true);
+        }
+        let sql =
+            format!("UPDATE chain_variants SET {} WHERE user_id = ? AND id = ?", sets.join(", "));
+        let mut q = sqlx::query(&sql);
+        if let Some(v) = name {
+            q = q.bind(v.to_string());
+        }
+        if let Some(v) = overrides {
+            q = q.bind(serde_json::to_string(v).unwrap_or_else(|_| "[]".into()));
+        }
+        let res = q.bind(user_id).bind(id).execute(&self.pool).await?;
+        Ok(res.rows_affected() > 0)
+    }
+
+    /// Delete a variant, clearing the listens that point at it first.
+    ///
+    /// Those listens keep their `chain_id` — the chain was still what they went
+    /// through — and simply fall back to its base components, which is what a
+    /// null variant already means everywhere. Deleting the row without this is
+    /// a foreign-key violation, the same trap `delete_chain` documents.
+    pub async fn delete_variant(&self, user_id: i64, id: i64) -> Result<bool, sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
+        for table in ["scrobbles", "physical_plays", "physical_releases"] {
+            sqlx::query(&format!(
+                "UPDATE {table} SET chain_variant_id = NULL
+                  WHERE chain_variant_id = ? AND user_id = ?"
+            ))
+            .bind(id)
+            .bind(user_id)
+            .execute(&mut *tx)
+            .await?;
+        }
+        let res = sqlx::query("DELETE FROM chain_variants WHERE user_id = ? AND id = ?")
+            .bind(user_id)
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(res.rows_affected() > 0)
+    }
+
+    /// Is this variant the caller's, and does it belong to that chain?
+    ///
+    /// Both halves matter: a variant naming another chain would resolve to
+    /// components that were never fitted, so `equipment_seconds` ignores such a
+    /// pairing — better to refuse it at the door than store it and silently
+    /// drop it later.
+    pub async fn variant_fits_chain(
+        &self,
+        user_id: i64,
+        variant_id: i64,
+        chain_id: i64,
+    ) -> Result<bool, sqlx::Error> {
+        let row: Option<(i64,)> = sqlx::query_as(
+            "SELECT id FROM chain_variants WHERE id = ? AND user_id = ? AND chain_id = ?",
+        )
+        .bind(variant_id)
+        .bind(user_id)
+        .bind(chain_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.is_some())
+    }
+
+    /// Seconds of listening attributable to each piece of gear.
+    ///
+    /// This used to be one SQL expression: sum the listens of every chain whose
+    /// components name the gear. Variants break that, and breaking it is the
+    /// point — with two cartridges on one turntable, "which chain was it" no
+    /// longer answers "what was fitted". A listen's effective components are
+    /// the chain's, **with that listen's variant applied**, so the question is
+    /// per `(chain, variant)` pair rather than per chain.
+    ///
+    /// Folded in Rust rather than pushed into SQL: chains and variants are tens
+    /// of rows, the grouped scan is one query, and expressing override
+    /// resolution in SQLite would be a `json_each` correlated against a second
+    /// `json_each` — unreadable, and this is the query that decides whether a
+    /// stylus is due for replacement.
+    ///
+    /// Skips are excluded, like every other counting query here.
+    pub async fn equipment_seconds(&self, user_id: i64) -> Result<HashMap<i64, i64>, sqlx::Error> {
+        // Every chain's own components, and every variant's overrides.
+        let chains: Vec<(i64, String)> =
+            sqlx::query_as("SELECT id, components FROM signal_chains WHERE user_id = ?")
+                .bind(user_id)
+                .fetch_all(&self.pool)
+                .await?;
+        let variants: Vec<(i64, i64, String)> =
+            sqlx::query_as("SELECT id, chain_id, overrides FROM chain_variants WHERE user_id = ?")
+                .bind(user_id)
+                .fetch_all(&self.pool)
+                .await?;
+
+        let base: HashMap<i64, Vec<ChainComponent>> = chains
+            .into_iter()
+            .map(|(id, json)| (id, serde_json::from_str(&json).unwrap_or_default()))
+            .collect();
+        let overrides: HashMap<i64, (i64, Vec<VariantOverride>)> = variants
+            .into_iter()
+            .map(|(id, chain_id, json)| {
+                (id, (chain_id, serde_json::from_str(&json).unwrap_or_default()))
+            })
+            .collect();
+
+        let grouped: Vec<(Option<i64>, Option<i64>, Option<i64>)> = sqlx::query_as(
+            "SELECT chain_id, chain_variant_id, SUM(duration)
+               FROM scrobbles
+              WHERE user_id = ? AND skipped = FALSE AND chain_id IS NOT NULL
+              GROUP BY chain_id, chain_variant_id",
+        )
+        .bind(user_id)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut out: HashMap<i64, i64> = HashMap::new();
+        for (chain_id, variant_id, secs) in grouped {
+            let (Some(chain_id), Some(secs)) = (chain_id, secs) else { continue };
+            let Some(components) = base.get(&chain_id) else { continue };
+            // A variant belonging to a different chain is ignored rather than
+            // applied — it can only mean the listen's chain was repointed after
+            // the fact, and applying it would credit gear that was never fitted.
+            let applied = variant_id
+                .and_then(|v| overrides.get(&v))
+                .filter(|(owner, _)| *owner == chain_id)
+                .map(|(_, o)| o.as_slice())
+                .unwrap_or(&[]);
+
+            // One entry per distinct piece of gear: a chain naming the same
+            // thing at two steps must not count its running time twice — the
+            // trap `get_equipment` hit when it used a join instead of EXISTS.
+            let mut fitted: HashSet<i64> = HashSet::new();
+            for (i, c) in components.iter().enumerate() {
+                match applied.iter().find(|o| o.position == i as i64) {
+                    // An override replaces the step, so the gear it replaced
+                    // gets no hours for these listens. That is the whole
+                    // feature: the elliptical stylus does not accrue wear while
+                    // the microlinear is in the headshell.
+                    Some(o) => {
+                        if let Some(id) = o.equipment_id {
+                            fitted.insert(id);
+                        }
+                    }
+                    None => {
+                        if let Some(id) = c.equipment_id {
+                            fitted.insert(id);
+                        }
+                    }
+                }
+            }
+            // An override may also *add* a step the base chain does not have —
+            // a cartridge on a chain that never named one.
+            for o in applied {
+                if o.position as usize >= components.len() {
+                    if let Some(id) = o.equipment_id {
+                        fitted.insert(id);
+                    }
+                }
+            }
+
+            for id in fitted {
+                *out.entry(id).or_insert(0) += secs;
+            }
+        }
+        Ok(out)
+    }
+
+    pub async fn get_equipment(&self, user_id: i64) -> Result<Vec<EquipmentRow>, sqlx::Error> {
+        let seconds = self.equipment_seconds(user_id).await?;
+        let mut rows: Vec<EquipmentRow> = sqlx::query_as(
+            "SELECT e.id, e.user_id, e.name, e.type, e.brand, e.model,
+                    0.0 AS total_hours,
+                    e.first_used, e.last_used, e.notes, e.purchased_at
+               FROM equipment e
+              WHERE e.user_id = ?",
+        )
+        .bind(user_id)
+        .fetch_all(&self.pool)
+        .await?;
+
+        for r in &mut rows {
+            r.total_hours = seconds.get(&r.id).copied().unwrap_or(0) as f64 / 3600.0;
+        }
+        // Same order the SQL produced, kept so the gear table does not reshuffle.
+        rows.sort_by(|a, b| {
+            b.total_hours
+                .partial_cmp(&a.total_hours)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.name.cmp(&b.name))
+        });
+        Ok(rows)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -7892,6 +8254,9 @@ pub struct SessionRow {
     /// Stable across merges and splits, and the id a shared session will carry.
     pub uuid: Option<String>,
     pub title: Option<String>,
+    /// A note about the sitting itself. Distinct from a liner note, which is
+    /// about a record and hangs off an entity or a single listen.
+    pub notes: Option<String>,
     pub started_at: i64,
     pub ended_at: Option<i64>,
     pub track_count: i64,
@@ -7900,6 +8265,11 @@ pub struct SessionRow {
     pub listening_context: Option<String>,
     pub chain_id: Option<i64>,
     pub chain_name: Option<String>,
+    /// Which variant of that chain the sitting's listens carry. Read off the
+    /// listens rather than stored on the session, so it cannot disagree with
+    /// them — the same rule `recompute_session` follows for the aggregates.
+    pub chain_variant_id: Option<i64>,
+    pub chain_variant_name: Option<String>,
     pub device_id: Option<i64>,
     pub device_name: Option<String>,
     pub token_id: Option<i64>,
@@ -8112,6 +8482,48 @@ pub struct TokenRecord {
     pub default_chain_name: Option<String>,
 }
 
+/// A variant as stored, before its overrides are parsed.
+#[derive(Debug, FromRow)]
+pub struct ChainVariantRow {
+    pub id: i64,
+    pub user_id: i64,
+    pub chain_id: i64,
+    pub name: String,
+    pub overrides: String,
+    pub created_at: i64,
+    pub total_hours: f64,
+}
+
+/// A chain with one or more steps swapped.
+///
+/// `total_hours` here is the listening that went through *this variant*, which
+/// is a different question from a chain's total — a chain's hours include every
+/// variant of it, since they all ran through the same chain.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ChainVariant {
+    pub id: i64,
+    pub user_id: i64,
+    pub chain_id: i64,
+    pub name: String,
+    pub overrides: Vec<VariantOverride>,
+    pub created_at: i64,
+    pub total_hours: f64,
+}
+
+impl From<ChainVariantRow> for ChainVariant {
+    fn from(r: ChainVariantRow) -> Self {
+        ChainVariant {
+            id: r.id,
+            user_id: r.user_id,
+            chain_id: r.chain_id,
+            name: r.name,
+            overrides: serde_json::from_str(&r.overrides).unwrap_or_default(),
+            created_at: r.created_at,
+            total_hours: r.total_hours,
+        }
+    }
+}
+
 #[derive(Debug, FromRow)]
 pub struct ChainRow {
     pub id: i64,
@@ -8238,14 +8650,14 @@ mod tests {
             .await
             .unwrap();
 
-        db.update_physical(uid, id, None, None, Some(Some(gear)), None, None).await.unwrap();
+        db.update_physical(uid, id, None, None, Some(Some(gear)), None, None, None).await.unwrap();
         let r = db.get_physical(uid, id).await.unwrap().unwrap();
         assert_eq!(r.equipment_id, Some(gear));
         assert_eq!(r.purchased_at, Some(1_700_000_000));
 
         // Editing one field leaves the others alone. This is the assertion a
         // bare `Option` fails.
-        db.update_physical(uid, id, Some(Some(1_800_000_000)), None, None, None, None)
+        db.update_physical(uid, id, Some(Some(1_800_000_000)), None, None, None, None, None)
             .await
             .unwrap();
         let r = db.get_physical(uid, id).await.unwrap().unwrap();
@@ -8255,7 +8667,7 @@ mod tests {
         // An explicit null still clears — the picker's "— no deck —" needs it,
         // which is why the distinction has to survive deserialisation rather
         // than being designed away.
-        db.update_physical(uid, id, None, None, Some(None), None, None).await.unwrap();
+        db.update_physical(uid, id, None, None, Some(None), None, None, None).await.unwrap();
         assert_eq!(db.get_physical(uid, id).await.unwrap().unwrap().equipment_id, None);
     }
 
@@ -8355,9 +8767,20 @@ mod tests {
         // missing filter would put the skipped artist on top.
         let mut played = play("Played", "Real Artist", (now - 100) as u64);
         played.duration = Some(200);
-        db.save_scrobble(uid, &played, None, None, None, None, None, None, ListenDisposition::LIVE)
-            .await
-            .unwrap();
+        db.save_scrobble(
+            uid,
+            &played,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            ListenDisposition::LIVE,
+        )
+        .await
+        .unwrap();
         for i in 0..5 {
             let mut p = play("Skipped", "Skipped Artist", (now - 3000 - i * 400) as u64);
             p.duration = Some(200);
@@ -8365,6 +8788,7 @@ mod tests {
             db.save_scrobble(
                 uid,
                 &p,
+                None,
                 None,
                 None,
                 None,
@@ -8416,9 +8840,20 @@ mod tests {
             let mut p = play(&format!("Track {i}"), "Real Artist", (now - 14 * 86_400 + i) as u64);
             p.duration = Some(200);
             p.source_id = format!("listen-{i}");
-            db.save_scrobble(uid, &p, None, None, None, None, None, None, ListenDisposition::LIVE)
-                .await
-                .unwrap();
+            db.save_scrobble(
+                uid,
+                &p,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                ListenDisposition::LIVE,
+            )
+            .await
+            .unwrap();
         }
         for i in 0..4i64 {
             let mut p =
@@ -8428,6 +8863,7 @@ mod tests {
             db.save_scrobble(
                 uid,
                 &p,
+                None,
                 None,
                 None,
                 None,
@@ -8507,6 +8943,7 @@ mod tests {
                     None,
                     None,
                     None,
+                    None,
                     ListenDisposition::LIVE
                 )
                 .await
@@ -8526,7 +8963,18 @@ mod tests {
         let mut first = play("Combustible", "Cœur de pirate", 1_700_000_000);
         first.duration = Some(200);
         assert!(db
-            .save_scrobble(1, &first, None, None, None, None, None, None, ListenDisposition::LIVE)
+            .save_scrobble(
+                1,
+                &first,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                ListenDisposition::LIVE
+            )
             .await
             .unwrap());
 
@@ -8539,6 +8987,7 @@ mod tests {
             !db.save_scrobble(
                 1,
                 &echo,
+                None,
                 None,
                 None,
                 None,
@@ -8657,6 +9106,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             ListenDisposition::LIVE,
         )
         .await
@@ -8664,6 +9114,7 @@ mod tests {
         db.save_scrobble(
             1,
             &play("Backfilled", "A", 2000),
+            None,
             None,
             None,
             None,
@@ -8699,6 +9150,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             ListenDisposition::LIVE,
         )
         .await
@@ -8706,6 +9158,7 @@ mod tests {
         db.save_scrobble(
             1,
             &play("Skipped", "A", 2000),
+            None,
             None,
             None,
             None,
@@ -8763,6 +9216,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             ListenDisposition::LIVE,
         )
         .await
@@ -8805,6 +9259,7 @@ mod tests {
                     None,
                     None,
                     None,
+                    None,
                     ListenDisposition::LIVE,
                 )
                 .await
@@ -8841,6 +9296,7 @@ mod tests {
                     None,
                     None,
                     None,
+                    None,
                     ListenDisposition::LIVE,
                 )
                 .await
@@ -8866,6 +9322,7 @@ mod tests {
             db.save_scrobble(
                 1,
                 &play("T", artist, ts),
+                None,
                 None,
                 None,
                 None,
@@ -8912,6 +9369,7 @@ mod tests {
                 db.save_scrobble(
                     1,
                     &p,
+                    None,
                     None,
                     None,
                     None,
@@ -8972,12 +9430,12 @@ mod tests {
         let db = testdb().await;
         let p = play("Teardrop", "Massive Attack", 1000);
         assert!(db
-            .save_scrobble(1, &p, None, None, None, None, None, None, ListenDisposition::LIVE)
+            .save_scrobble(1, &p, None, None, None, None, None, None, None, ListenDisposition::LIVE)
             .await
             .unwrap());
         // same source_id + name → deduped
         assert!(!db
-            .save_scrobble(1, &p, None, None, None, None, None, None, ListenDisposition::LIVE)
+            .save_scrobble(1, &p, None, None, None, None, None, None, None, ListenDisposition::LIVE)
             .await
             .unwrap());
     }
@@ -8988,6 +9446,7 @@ mod tests {
         db.save_scrobble(
             1,
             &play("T", "A", 2000),
+            None,
             None,
             None,
             None,
@@ -9071,6 +9530,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             ListenDisposition::LIVE,
         )
         .await
@@ -9078,6 +9538,7 @@ mod tests {
         db.save_scrobble(
             uid,
             &play("b", "y", 20),
+            None,
             None,
             None,
             None,
@@ -9153,15 +9614,27 @@ mod tests {
         for (i, title) in ["a", "b"].iter().enumerate() {
             let mut p = play(title, "x", 1000 + i as u64);
             p.duration = Some(3600);
-            db.save_scrobble(uid, &p, None, None, None, None, None, None, ListenDisposition::LIVE)
-                .await
-                .unwrap();
+            db.save_scrobble(
+                uid,
+                &p,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                ListenDisposition::LIVE,
+            )
+            .await
+            .unwrap();
         }
         let mut skipped = play("c", "x", 3000);
         skipped.duration = Some(3600);
         db.save_scrobble(
             uid,
             &skipped,
+            None,
             None,
             None,
             None,
@@ -9219,6 +9692,7 @@ mod tests {
             db.save_scrobble(
                 uid,
                 &play(&format!("t{i}"), "A", *ts),
+                None,
                 None,
                 None,
                 None,
@@ -9302,9 +9776,20 @@ mod tests {
             plays.push(p);
         }
         for p in &plays {
-            db.save_scrobble(uid, p, None, None, None, None, None, None, ListenDisposition::LIVE)
-                .await
-                .unwrap();
+            db.save_scrobble(
+                uid,
+                p,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                ListenDisposition::LIVE,
+            )
+            .await
+            .unwrap();
         }
 
         let mixed = db.albums_with_mixed_releases(uid).await.unwrap();
@@ -9346,6 +9831,7 @@ mod tests {
             db.save_scrobble(
                 uid,
                 &play(&format!("t{i}"), artist, 100 + i as u64),
+                None,
                 None,
                 None,
                 None,
@@ -9651,6 +10137,97 @@ mod tests {
         assert_eq!(shelf.iter().find(|r| r.id == tape).unwrap().parked_side, None);
     }
 
+    /// The whole reason variants exist: two cartridges on one turntable, and
+    /// the hours have to land on the one that was actually fitted.
+    ///
+    /// A variant overriding a step means the gear it replaced accrues **no**
+    /// wear for those listens — an elliptical stylus does not wear down while
+    /// the microlinear is in the headshell. Everything else in the chain is
+    /// shared and keeps accruing from both.
+    #[tokio::test]
+    async fn a_variant_moves_the_wear_onto_the_gear_that_was_fitted() {
+        let db = testdb().await;
+        let uid = db.create_user("ashwin", None, "x", "user").await.unwrap();
+
+        let deck =
+            db.upsert_equipment(uid, "LP5X", "turntable", None, None, 0.0, None).await.unwrap();
+        let ell = db
+            .upsert_equipment(uid, "Elliptical", "cartridge", None, None, 0.0, None)
+            .await
+            .unwrap();
+        let micro = db
+            .upsert_equipment(uid, "Microlinear", "cartridge", None, None, 0.0, None)
+            .await
+            .unwrap();
+
+        let chain = db
+            .create_chain(&SignalChain {
+                id: None,
+                user_id: uid,
+                name: "Vinyl".into(),
+                description: None,
+                components: vec![
+                    ChainComponent {
+                        component_type: ComponentType::Source,
+                        name: "LP5X".into(),
+                        detail: None,
+                        equipment_id: Some(deck),
+                    },
+                    ChainComponent {
+                        component_type: ComponentType::Source,
+                        name: "Elliptical".into(),
+                        detail: None,
+                        equipment_id: Some(ell),
+                    },
+                ],
+                listening_context: ListeningContext::Active,
+                icon: None,
+                is_active: true,
+                total_hours: 0.0,
+                created_at: 0,
+            })
+            .await
+            .unwrap();
+
+        let variant = db
+            .create_variant(
+                uid,
+                chain,
+                "Microlinear",
+                &[VariantOverride { position: 1, equipment_id: Some(micro), name: None }],
+            )
+            .await
+            .unwrap();
+
+        // An hour on the base chain, then an hour on the variant.
+        for (i, v) in [(1u64, None), (2u64, Some(variant))] {
+            let mut play = play("t", "a", 1_700_000_000 + i * 10_000);
+            play.duration = Some(3600);
+            play.source_id = format!("s{i}");
+            db.save_scrobble(
+                uid,
+                &play,
+                None,
+                None,
+                Some(chain),
+                v,
+                None,
+                None,
+                None,
+                ListenDisposition { imported: false, skipped: false },
+            )
+            .await
+            .unwrap();
+        }
+
+        let secs = db.equipment_seconds(uid).await.unwrap();
+        // The turntable is in both, so it gets both hours.
+        assert_eq!(secs.get(&deck), Some(&7200), "the deck ran for both");
+        // Each cartridge only for the listens it was fitted for.
+        assert_eq!(secs.get(&ell), Some(&3600), "the elliptical only for its own");
+        assert_eq!(secs.get(&micro), Some(&3600), "the microlinear only for its own");
+    }
+
     #[tokio::test]
     async fn count_active_admins_excludes_disabled() {
         let db = testdb().await;
@@ -9668,6 +10245,7 @@ mod tests {
         db.save_scrobble(
             uid,
             &play("s", "a", 5),
+            None,
             None,
             None,
             None,
@@ -9977,6 +10555,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             Some("Plex"),
             Some(a),
             ListenDisposition::LIVE,
@@ -9986,6 +10565,7 @@ mod tests {
         db.save_scrobble(
             uid,
             &play("From B", "Artist", 200),
+            None,
             None,
             None,
             None,
@@ -10091,6 +10671,7 @@ mod tests {
         db.save_scrobble(
             uid,
             &play("Xtal", "Aphex Twin", 1000),
+            None,
             None,
             None,
             None,
@@ -10207,9 +10788,20 @@ mod tests {
         let mut p = play("Ageispolis", "Aphex Twin", 1000);
         p.album = Some("SAW 85-92".into());
         p.track_number = Some(3);
-        db.save_scrobble(uid, &p, None, None, None, None, None, None, ListenDisposition::LIVE)
-            .await
-            .unwrap();
+        db.save_scrobble(
+            uid,
+            &p,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            ListenDisposition::LIVE,
+        )
+        .await
+        .unwrap();
 
         // A named track with nothing annotated yet still resolves, because the
         // user has actually played it.
@@ -10325,6 +10917,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
                 ListenDisposition::LIVE,
             )
             .await
@@ -10334,9 +10927,20 @@ mod tests {
         // real imported history has.
         for i in 0..97i64 {
             let p = play(&format!("Imported {i}"), "A", (now - 400_000 - 3600 * i) as u64);
-            db.save_scrobble(uid, &p, None, None, None, None, None, None, ListenDisposition::LIVE)
-                .await
-                .unwrap();
+            db.save_scrobble(
+                uid,
+                &p,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                ListenDisposition::LIVE,
+            )
+            .await
+            .unwrap();
         }
 
         let dash = db.get_dashboard_stats(uid, chrono_tz::UTC, 1).await.unwrap();
