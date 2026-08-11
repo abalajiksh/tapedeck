@@ -282,6 +282,32 @@ pub struct PhysicalPlayRow {
 /// holds (a scan of the user's own copy). `file_path` is deliberately **not**
 /// serialised: the browser is handed a Tapedeck URL to fetch it through, so a
 /// server path can never reach the page.
+/// The side currently on a user's deck.
+///
+/// Server-side because the shelf is the one source where the browser is the
+/// player, and "the browser holds the state" turned out to mean "only that
+/// browser knows, and a crash loses it". The clock still runs in the page —
+/// the server holds *what* is on and when it started, which is everything
+/// needed to rebuild the countdown anywhere.
+#[derive(Debug, Clone, sqlx::FromRow, serde::Serialize)]
+pub struct PhysicalSpin {
+    pub user_id: i64,
+    pub release_id: i64,
+    pub side: String,
+    pub started_at: i64,
+    /// Null while running; set to the moment it was paused.
+    pub paused_at: Option<i64>,
+    /// Seconds spent stopped, so elapsed is wall clock minus this. A paused
+    /// record is not playing, and counting it puts every later track late.
+    pub paused_total: i64,
+    /// JSON array of `{position, started_at, skipped}` — written and read
+    /// whole, never queried into.
+    pub outcomes: String,
+    pub chain_id: Option<i64>,
+    pub equipment_id: Option<i64>,
+    pub updated_at: i64,
+}
+
 #[derive(Debug, Clone, sqlx::FromRow, serde::Serialize)]
 pub struct PhysicalImage {
     pub id: i64,
@@ -618,6 +644,42 @@ impl Database {
                 -- is written back.
                 chain_id INTEGER REFERENCES signal_chains(id),
                 equipment_id INTEGER REFERENCES equipment(id)
+            )",
+        )
+        .execute(&self.pool)
+        .await?;
+
+        // What is on the deck right now, as a fact about the *shelf* rather
+        // than about a browser.
+        //
+        // This started in localStorage on the reasoning that a side in progress
+        // is a fact about the machine sitting in front of the turntable. That
+        // is true of where the *clock* runs and false of everything else: a
+        // record is on the platter whichever device you happen to be holding,
+        // so the phone in your pocket could not see it, a second tab disagreed
+        // with the first, and a browser crash lost the side outright with no
+        // way to recover what had already played.
+        //
+        // `user_id` is the PRIMARY KEY, which is the constraint that matters:
+        // one deck per person, because nobody listens to two records at once,
+        // and it makes "resume what I was playing" a single row lookup with no
+        // ambiguity about which spin is the real one.
+        //
+        // `outcomes` is the per-track record the browser accumulates (position,
+        // real start, skipped) and is JSON because it is written and read
+        // whole, never queried into.
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS physical_spins (
+                user_id INTEGER PRIMARY KEY REFERENCES users(id),
+                release_id INTEGER NOT NULL REFERENCES physical_releases(id),
+                side TEXT NOT NULL,
+                started_at INTEGER NOT NULL,
+                paused_at INTEGER,
+                paused_total INTEGER NOT NULL DEFAULT 0,
+                outcomes TEXT NOT NULL DEFAULT '[]',
+                chain_id INTEGER REFERENCES signal_chains(id),
+                equipment_id INTEGER REFERENCES equipment(id),
+                updated_at INTEGER NOT NULL
             )",
         )
         .execute(&self.pool)
@@ -2607,8 +2669,15 @@ impl Database {
         chain_id: Option<Option<i64>>,
         equipment_id: Option<Option<i64>>,
         notes: Option<Option<&str>>,
+        kind: Option<&str>,
     ) -> Result<bool, sqlx::Error> {
         let mut sets: Vec<&str> = Vec::new();
+        // A plain `Option` rather than a nested one, unlike everything else
+        // here: `kind` carries a CHECK constraint and has no "cleared" state to
+        // tell apart from absent, so `None` can only mean "not mentioned".
+        if kind.is_some() {
+            sets.push("kind = ?");
+        }
         if purchased_at.is_some() {
             sets.push("purchased_at = ?");
         }
@@ -2631,6 +2700,10 @@ impl Database {
             sets.join(", ")
         );
         let mut q = sqlx::query(&sql);
+        // Bound in the same order the SET clauses were pushed.
+        if let Some(v) = kind {
+            q = q.bind(v.to_string());
+        }
         if let Some(v) = purchased_at {
             q = q.bind(v);
         }
@@ -2644,6 +2717,76 @@ impl Database {
             q = q.bind(v.map(|s| s.to_string()));
         }
         let res = q.bind(user_id).bind(id).execute(&self.pool).await?;
+        Ok(res.rows_affected() > 0)
+    }
+
+    // ── What is on the deck ──
+
+    /// The side currently on this user's deck, if any.
+    pub async fn get_spin(&self, user_id: i64) -> Result<Option<PhysicalSpin>, sqlx::Error> {
+        sqlx::query_as::<_, PhysicalSpin>("SELECT * FROM physical_spins WHERE user_id = ?")
+            .bind(user_id)
+            .fetch_optional(&self.pool)
+            .await
+    }
+
+    /// Put a side on the deck, or update the one that is on it.
+    ///
+    /// An upsert on `user_id` rather than an insert, because the primary key is
+    /// the whole rule: one deck per person. Starting a second side replaces the
+    /// first rather than erroring, which matches what actually happened in the
+    /// room — you took the record off.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn set_spin(
+        &self,
+        user_id: i64,
+        release_id: i64,
+        side: &str,
+        started_at: i64,
+        paused_at: Option<i64>,
+        paused_total: i64,
+        outcomes_json: &str,
+        chain_id: Option<i64>,
+        equipment_id: Option<i64>,
+    ) -> Result<(), sqlx::Error> {
+        let now = chrono::Utc::now().timestamp();
+        sqlx::query(
+            "INSERT INTO physical_spins
+               (user_id, release_id, side, started_at, paused_at, paused_total,
+                outcomes, chain_id, equipment_id, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT(user_id) DO UPDATE SET
+               release_id = excluded.release_id,
+               side = excluded.side,
+               started_at = excluded.started_at,
+               paused_at = excluded.paused_at,
+               paused_total = excluded.paused_total,
+               outcomes = excluded.outcomes,
+               chain_id = excluded.chain_id,
+               equipment_id = excluded.equipment_id,
+               updated_at = excluded.updated_at",
+        )
+        .bind(user_id)
+        .bind(release_id)
+        .bind(side)
+        .bind(started_at)
+        .bind(paused_at)
+        .bind(paused_total)
+        .bind(outcomes_json)
+        .bind(chain_id)
+        .bind(equipment_id)
+        .bind(now)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Take whatever is on the deck off it.
+    pub async fn clear_spin(&self, user_id: i64) -> Result<bool, sqlx::Error> {
+        let res = sqlx::query("DELETE FROM physical_spins WHERE user_id = ?")
+            .bind(user_id)
+            .execute(&self.pool)
+            .await?;
         Ok(res.rows_affected() > 0)
     }
 
@@ -7222,6 +7365,9 @@ impl Database {
             // absent from this list is what deleting anyone with a shelf did.
             "physical_images",
             "physical_plays",
+            // Points at a release, a chain and a piece of gear, so it clears
+            // before all three — same trap `physical_plays` was missing from.
+            "physical_spins",
             "physical_releases",
             "tokens",
             "signal_chains",
@@ -7997,14 +8143,16 @@ mod tests {
             .await
             .unwrap();
 
-        db.update_physical(uid, id, None, None, Some(Some(gear)), None).await.unwrap();
+        db.update_physical(uid, id, None, None, Some(Some(gear)), None, None).await.unwrap();
         let r = db.get_physical(uid, id).await.unwrap().unwrap();
         assert_eq!(r.equipment_id, Some(gear));
         assert_eq!(r.purchased_at, Some(1_700_000_000));
 
         // Editing one field leaves the others alone. This is the assertion a
         // bare `Option` fails.
-        db.update_physical(uid, id, Some(Some(1_800_000_000)), None, None, None).await.unwrap();
+        db.update_physical(uid, id, Some(Some(1_800_000_000)), None, None, None, None)
+            .await
+            .unwrap();
         let r = db.get_physical(uid, id).await.unwrap().unwrap();
         assert_eq!(r.purchased_at, Some(1_800_000_000));
         assert_eq!(r.equipment_id, Some(gear), "an untouched field must survive an edit");
@@ -8012,7 +8160,7 @@ mod tests {
         // An explicit null still clears — the picker's "— no deck —" needs it,
         // which is why the distinction has to survive deserialisation rather
         // than being designed away.
-        db.update_physical(uid, id, None, None, Some(None), None).await.unwrap();
+        db.update_physical(uid, id, None, None, Some(None), None, None).await.unwrap();
         assert_eq!(db.get_physical(uid, id).await.unwrap().unwrap().equipment_id, None);
     }
 
@@ -9267,6 +9415,85 @@ mod tests {
         let p = db.get_profile(uid).await.unwrap().unwrap();
         assert_eq!(p.bio, None);
         assert_eq!(p.display_name.as_deref(), Some("Colin"));
+    }
+
+    /// One deck per person, enforced by the primary key: putting a second side
+    /// on replaces the first rather than erroring, because that is what
+    /// happened in the room — you took the record off.
+    #[tokio::test]
+    async fn a_user_has_one_deck_and_the_side_on_it_survives() {
+        let db = testdb().await;
+        let uid = db.create_user("colin", None, "x", "user").await.unwrap();
+        let a = db
+            .create_physical(
+                uid, "vinyl", "Burial", "Untrue", None, None, None, None, None, None, "[]", None,
+                None,
+            )
+            .await
+            .unwrap();
+        let b = db
+            .create_physical(
+                uid,
+                "cd",
+                "Aphex Twin",
+                "SAW 85-92",
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                "[]",
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert!(db.get_spin(uid).await.unwrap().is_none(), "an empty deck to start");
+
+        db.set_spin(uid, a, "A", 1_700_000_000, None, 0, "[]", None, None).await.unwrap();
+        let spin = db.get_spin(uid).await.unwrap().expect("a side is on");
+        assert_eq!(spin.release_id, a);
+        assert_eq!(spin.side, "A");
+        assert_eq!(spin.paused_at, None);
+
+        // Pausing keeps the same row rather than opening a second deck.
+        db.set_spin(uid, a, "A", 1_700_000_000, Some(1_700_000_300), 0, "[]", None, None)
+            .await
+            .unwrap();
+        assert_eq!(db.get_spin(uid).await.unwrap().unwrap().paused_at, Some(1_700_000_300));
+
+        // And a different record replaces it outright.
+        db.set_spin(uid, b, "1", 1_700_001_000, None, 12, "[{}]", None, None).await.unwrap();
+        let spin = db.get_spin(uid).await.unwrap().unwrap();
+        assert_eq!(spin.release_id, b);
+        assert_eq!(spin.side, "1");
+        assert_eq!(spin.paused_total, 12);
+
+        assert!(db.clear_spin(uid).await.unwrap());
+        assert!(db.get_spin(uid).await.unwrap().is_none());
+    }
+
+    /// Two people can each have a record on without seeing each other's.
+    #[tokio::test]
+    async fn one_persons_deck_is_not_anothers() {
+        let db = testdb().await;
+        let a = db.create_user("ashwin", None, "x", "admin").await.unwrap();
+        let c = db.create_user("colin", None, "x", "user").await.unwrap();
+        let mine = db
+            .create_physical(
+                a, "vinyl", "Burial", "Untrue", None, None, None, None, None, None, "[]", None,
+                None,
+            )
+            .await
+            .unwrap();
+        db.set_spin(a, mine, "A", 1_700_000_000, None, 0, "[]", None, None).await.unwrap();
+
+        assert!(db.get_spin(a).await.unwrap().is_some());
+        assert!(db.get_spin(c).await.unwrap().is_none());
+        assert!(!db.clear_spin(c).await.unwrap(), "clearing an empty deck changes nothing");
+        assert!(db.get_spin(a).await.unwrap().is_some(), "and leaves the other alone");
     }
 
     #[tokio::test]

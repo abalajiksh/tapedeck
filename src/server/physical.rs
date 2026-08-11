@@ -342,7 +342,21 @@ pub struct ReleaseUpdate {
     pub equipment_id: Option<Option<i64>>,
     #[serde(default, deserialize_with = "explicit")]
     pub notes: Option<Option<String>>,
+    /// Move it to another shelf. A plain `Option` on purpose — a kind has no
+    /// "cleared" state, so absent is the only thing `None` can mean.
+    ///
+    /// Changing this re-derives the tracklist's sides, because what a side *is*
+    /// depends on the medium: a record has a break in it that `assign_sides`
+    /// has to guess, and a disc has none at all. Leaving the old split behind
+    /// would have the shelf offer to remind you to flip a CD.
+    #[serde(default)]
+    pub kind: Option<String>,
 }
+
+/// The shelf's formats. Mirrors the CHECK on `physical_releases.kind` — a value
+/// outside this set is a 400 rather than a constraint violation surfaced as a
+/// 500, and the CHECK stays as the backstop.
+pub const SHELF_KINDS: [&str; 4] = ["vinyl", "cassette", "cd", "sacd"];
 
 /// Keep an explicit `null` distinguishable from an omitted field.
 fn explicit<'de, D, T>(d: D) -> Result<Option<Option<T>>, D::Error>
@@ -378,6 +392,22 @@ async fn update_release(
         }
     }
 
+    let kind = body.kind.as_deref().map(|k| k.trim().to_ascii_lowercase());
+    if let Some(ref k) = kind {
+        if !SHELF_KINDS.contains(&k.as_str()) {
+            return err(400, format!("kind must be one of {}", SHELF_KINDS.join(", ")));
+        }
+    }
+
+    // What the sides were before, so we only rewrite them when the medium
+    // actually changed. Re-splitting a record that is still a record would
+    // discard a hand-edited side break for nothing.
+    let previous_kind = match state.db.get_physical(user.user_id, id).await {
+        Ok(Some(r)) => r.kind,
+        Ok(None) => return err(404, "No such record"),
+        Err(e) => return err(500, e.to_string()),
+    };
+
     match state
         .db
         .update_physical(
@@ -387,13 +417,78 @@ async fn update_release(
             body.chain_id,
             body.equipment_id,
             body.notes.as_ref().map(|n| n.as_deref()),
+            kind.as_deref(),
         )
         .await
     {
-        Ok(true) => (StatusCode::OK, Json(serde_json::json!({ "status": "ok" }))).into_response(),
-        Ok(false) => err(404, "No such record"),
-        Err(e) => err(500, e.to_string()),
+        Ok(true) => {}
+        Ok(false) => return err(404, "No such record"),
+        Err(e) => return err(500, e.to_string()),
     }
+
+    let mut resplit = false;
+    if let Some(ref k) = kind {
+        if *k != previous_kind {
+            match respread_sides(&state, user.user_id, id, k).await {
+                Ok(did) => resplit = did,
+                Err(e) => return err(500, e),
+            }
+        }
+    }
+
+    (StatusCode::OK, Json(serde_json::json!({ "status": "ok", "sides_rewritten": resplit })))
+        .into_response()
+}
+
+/// Re-derive a tracklist's sides after the medium changed.
+///
+/// A disc plays start to finish, so its "sides" are disc numbers; a record or a
+/// tape has a break that `assign_sides` places by playing time. Moving a
+/// release between the two without redoing this leaves A/B lettering on a CD,
+/// which is what makes the shelf offer to remind you to flip it.
+///
+/// The tracks keep their order and their titles — only `side` is rewritten,
+/// because the order is a fact about the release and the split is a property of
+/// the medium.
+async fn respread_sides(
+    state: &Arc<AppState>,
+    user_id: i64,
+    id: i64,
+    kind: &str,
+) -> Result<bool, String> {
+    let Some(release) = state.db.get_physical(user_id, id).await.map_err(|e| e.to_string())? else {
+        return Ok(false);
+    };
+    let mut tracks: Vec<PhysicalTrack> = serde_json::from_str(&release.tracks).unwrap_or_default();
+    if tracks.is_empty() {
+        return Ok(false);
+    }
+
+    // `is_disc` is written against a *format* string; "sacd" and "cd" are the
+    // two shelf kinds it recognises, and both are things you play through.
+    let sides: Vec<String> = if release_lookup::is_disc(Some(kind)) {
+        release_lookup::disc_sides(&[tracks.len()])
+    } else {
+        // Nothing states a side letter here — a tracklist that had one lost it
+        // when it was filed as a disc — so this is the playing-time guess, the
+        // same one the lookup makes. It is editable afterwards.
+        let numbers: Vec<String> = (1..=tracks.len()).map(|n| n.to_string()).collect();
+        let durations: Vec<Option<i64>> = tracks.iter().map(|t| t.duration_secs).collect();
+        release_lookup::assign_sides(&numbers, &durations, 2)
+    };
+
+    // Position restarts within each side, which is what the side letter means.
+    let mut seen: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
+    for (t, side) in tracks.iter_mut().zip(sides) {
+        let n = seen.entry(side.clone()).or_insert(0);
+        *n += 1;
+        t.position = *n;
+        t.side = side;
+    }
+
+    let json = serde_json::to_string(&tracks).map_err(|e| e.to_string())?;
+    state.db.set_physical_tracks(user_id, id, &json).await.map_err(|e| e.to_string())?;
+    Ok(true)
 }
 
 #[derive(Debug, Deserialize)]
@@ -1014,6 +1109,12 @@ async fn play_side(
     // Without this the registry keeps extrapolating the last track it was told
     // about and the dashboard shows a record still playing.
     state.now_playing.clear_user_source(user.user_id, SHELF_SOURCE);
+    // And the stored spin goes with it, or reopening the page on any device
+    // would offer to resume a side that has already been recorded — which is
+    // how the same side gets logged twice.
+    if let Err(e) = state.db.clear_spin(user.user_id).await {
+        warn!("Could not clear the spin after recording a side: {}", e);
+    }
 
     // Remember what it was played on, so the next side of the same record —
     // and the next time it comes off the shelf — is pre-filled. Only when the
@@ -1028,6 +1129,7 @@ async fn play_side(
                 None,
                 body.chain_id.map(Some),
                 body.equipment_id.map(Some),
+                None,
                 None,
             )
             .await
@@ -1162,6 +1264,134 @@ async fn clear_now_playing(
     State(state): State<Arc<AppState>>,
     user: AuthUser,
 ) -> impl IntoResponse {
+    state.now_playing.clear_user_source(user.user_id, SHELF_SOURCE);
+    (StatusCode::OK, Json(serde_json::json!({ "status": "cleared" }))).into_response()
+}
+
+// ═══════════════════════════════════════════════════════════
+//  What is on the deck, as a fact about the shelf
+// ═══════════════════════════════════════════════════════════
+//
+//  The clock still runs in the browser — nothing else can watch a turntable —
+//  but *what is on* and *when it started* live here. That is the difference
+//  between a side that survives a crash and one that does not, and it is what
+//  lets the phone in your pocket see the record that is actually playing.
+
+#[derive(Debug, Deserialize)]
+pub struct SpinUpdate {
+    pub release_id: i64,
+    pub side: String,
+    pub started_at: i64,
+    #[serde(default)]
+    pub paused_at: Option<i64>,
+    #[serde(default)]
+    pub paused_total: i64,
+    #[serde(default)]
+    pub outcomes: Vec<serde_json::Value>,
+    #[serde(default)]
+    pub chain_id: Option<i64>,
+    #[serde(default)]
+    pub equipment_id: Option<i64>,
+}
+
+/// GET /api/v1/physical/spin — the side on the deck, with enough of the record
+/// to draw it without a second request.
+async fn get_spin(State(state): State<Arc<AppState>>, user: AuthUser) -> impl IntoResponse {
+    let spin = match state.db.get_spin(user.user_id).await {
+        Ok(s) => s,
+        Err(e) => return err(500, e.to_string()),
+    };
+    let Some(spin) = spin else {
+        return (StatusCode::OK, Json(serde_json::json!({ "spin": null }))).into_response();
+    };
+
+    // A spin whose record has since been deleted is not a spin. Clearing it
+    // here rather than returning a dangling id keeps the page from having to
+    // reason about a release it cannot fetch.
+    let release = match state.db.get_physical(user.user_id, spin.release_id).await {
+        Ok(Some(r)) => r,
+        Ok(None) => {
+            let _ = state.db.clear_spin(user.user_id).await;
+            return (StatusCode::OK, Json(serde_json::json!({ "spin": null }))).into_response();
+        }
+        Err(e) => return err(500, e.to_string()),
+    };
+
+    let outcomes: serde_json::Value =
+        serde_json::from_str(&spin.outcomes).unwrap_or_else(|_| serde_json::json!([]));
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "spin": {
+                "release_id": spin.release_id,
+                "kind": release.kind,
+                "artist": release.artist,
+                "title": release.title,
+                "artwork_url": release.artwork_url,
+                "mbid_release": release.mbid_release,
+                "side": spin.side,
+                "started_at": spin.started_at,
+                "paused_at": spin.paused_at,
+                "paused_total": spin.paused_total,
+                "outcomes": outcomes,
+                "chain_id": spin.chain_id,
+                "equipment_id": spin.equipment_id,
+                "updated_at": spin.updated_at,
+            }
+        })),
+    )
+        .into_response()
+}
+
+/// PUT /api/v1/physical/spin — put a side on, or update the one that is on.
+///
+/// The whole state every time rather than a patch per field: it is half a dozen
+/// small numbers, it changes only on real events (start, pause, skip, next),
+/// and a partial update would let two devices interleave into a state neither
+/// of them meant.
+async fn put_spin(
+    State(state): State<Arc<AppState>>,
+    user: AuthUser,
+    Json(body): Json<SpinUpdate>,
+) -> impl IntoResponse {
+    // The release must be the caller's — this is the only id in the body that
+    // names something owned.
+    match state.db.get_physical(user.user_id, body.release_id).await {
+        Ok(Some(_)) => {}
+        Ok(None) => return err(404, "No such record"),
+        Err(e) => return err(500, e.to_string()),
+    }
+
+    let outcomes = serde_json::to_string(&body.outcomes).unwrap_or_else(|_| "[]".into());
+    match state
+        .db
+        .set_spin(
+            user.user_id,
+            body.release_id,
+            &body.side,
+            body.started_at,
+            body.paused_at,
+            body.paused_total,
+            &outcomes,
+            body.chain_id,
+            body.equipment_id,
+        )
+        .await
+    {
+        Ok(()) => (StatusCode::OK, Json(serde_json::json!({ "status": "ok" }))).into_response(),
+        Err(e) => err(500, e.to_string()),
+    }
+}
+
+/// DELETE /api/v1/physical/spin — take it off the deck.
+///
+/// Also clears the now-playing entry, so the two cannot disagree: a deck
+/// showing a record that came off twenty minutes ago is the failure the
+/// now-playing design already calls out.
+async fn delete_spin(State(state): State<Arc<AppState>>, user: AuthUser) -> impl IntoResponse {
+    if let Err(e) = state.db.clear_spin(user.user_id).await {
+        return err(500, e.to_string());
+    }
     state.now_playing.clear_user_source(user.user_id, SHELF_SOURCE);
     (StatusCode::OK, Json(serde_json::json!({ "status": "cleared" }))).into_response()
 }
@@ -1572,6 +1802,8 @@ pub fn create_physical_router() -> Router<Arc<AppState>> {
         .route("/api/v1/physical/settings/discogs", get(get_discogs).put(set_discogs))
         .route("/api/v1/physical/settings/discogs/test", post(test_discogs))
         .route("/api/v1/physical/now-playing", axum::routing::delete(clear_now_playing))
+        // Before "/:id", or matchit reads "spin" as a release id.
+        .route("/api/v1/physical/spin", get(get_spin).put(put_spin).delete(delete_spin))
         .route(
             "/api/v1/physical/images/:id",
             axum::routing::patch(update_image).delete(delete_image),

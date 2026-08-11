@@ -187,6 +187,44 @@ pub fn is_disc(format: Option<&str>) -> bool {
     f.contains("cd") || f.contains("dvd") || f.contains("blu-ray") || f.contains("minidisc")
 }
 
+/// What shelf `kind` a medium's own format string describes.
+///
+/// The kind picker in the UI is what the user *thought* they were adding; this
+/// is what the release says it is, and the release is the authority — the same
+/// reasoning `is_disc` already follows for side splitting. Without it a box set
+/// looked up by barcode could be filed as vinyl while its five media all say
+/// `CD`, which is how "Original Album Classics" ended up on the wrong shelf
+/// with 76 tracks and no way to move it.
+///
+/// Returns `None` when the format is missing or is something the shelf has no
+/// kind for (digital media, a format nobody typed) — in which case the user's
+/// own choice stands rather than being overridden by a guess.
+///
+/// **Order matters and is the whole trap: `"sacd"` contains `"cd"`.** So does
+/// `"Hybrid SACD"`. Testing for CD first would file every SACD as a CD and the
+/// mistake would be invisible, because a CD is a plausible thing to own.
+pub fn kind_from_format(format: Option<&str>) -> Option<&'static str> {
+    let f = format?.to_ascii_lowercase();
+    if f.is_empty() {
+        return None;
+    }
+    if f.contains("sacd") {
+        return Some("sacd");
+    }
+    if f.contains("cassette") {
+        return Some("cassette");
+    }
+    // "Vinyl", "12\" Vinyl", "LP", "7\" Single". Checked before the disc test
+    // because a "DVD-Video" is not vinyl but a "Vinyl" never contains "cd".
+    if f.contains("vinyl") || f.contains("lp") || f.contains("shellac") {
+        return Some("vinyl");
+    }
+    if is_disc(Some(&f)) {
+        return Some("cd");
+    }
+    None
+}
+
 /// One "side" per disc, numbered — the counterpart of `assign_sides` for media
 /// that have no sides. A single CD is `["1", "1", …]`; a two-disc set numbers
 /// the second disc's tracks `2`.
@@ -900,6 +938,41 @@ fn parse_duration(raw: Option<&str>) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The format strings MusicBrainz and Discogs actually emit.
+    ///
+    /// `"SACD"` and `"Hybrid SACD"` are the reason this function tests for SACD
+    /// first: both contain the substring `"cd"`, so a naive order files every
+    /// SACD as a CD — a wrong answer that looks entirely reasonable on the
+    /// shelf and would never be questioned.
+    #[test]
+    fn a_medium_declares_its_own_kind() {
+        for (format, want) in [
+            ("CD", Some("cd")),
+            ("Enhanced CD", Some("cd")),
+            ("CD-R", Some("cd")),
+            ("SACD", Some("sacd")),
+            ("Hybrid SACD", Some("sacd")),
+            ("12\" Vinyl", Some("vinyl")),
+            ("Vinyl", Some("vinyl")),
+            ("LP", Some("vinyl")),
+            ("Cassette", Some("cassette")),
+            ("Digital Media", None),
+            ("", None),
+        ] {
+            assert_eq!(kind_from_format(Some(format)), want, "format {format:?}");
+        }
+        assert_eq!(kind_from_format(None), None);
+    }
+
+    /// The real case that prompted this: a five-CD box set filed as vinyl.
+    /// MusicBrainz reports every medium of 940dce49… as `CD`.
+    #[test]
+    fn a_five_cd_box_set_is_not_vinyl() {
+        assert_eq!(kind_from_format(Some("CD")), Some("cd"));
+        // And the shelf must not then try to split it into sides.
+        assert!(is_disc(Some("CD")));
+    }
 
     /// An explicit side letter is an editor stating the answer, so it wins
     /// outright — no guessing on top of known data.

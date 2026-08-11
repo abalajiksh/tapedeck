@@ -786,6 +786,43 @@ export interface PhysicalImage {
 }
 
 /** A record or tape on the shelf. Counters are derived, never accumulated. */
+/** The shelf's formats. Mirrors the CHECK on `physical_releases.kind`. */
+export type ShelfKind = 'vinyl' | 'cassette' | 'cd' | 'sacd';
+
+/** The side currently on the deck, held server-side.
+ *
+ *  The countdown runs in the page, but this is what makes it recoverable: open
+ *  the shelf on another device, or after a crash, and the side is still on. */
+export interface Spin {
+	release_id: number;
+	kind: ShelfKind;
+	artist: string;
+	title: string;
+	artwork_url: string | null;
+	mbid_release: string | null;
+	side: string;
+	started_at: number;
+	/** Null while running. */
+	paused_at: number | null;
+	/** Seconds spent stopped, so elapsed is wall clock minus this. */
+	paused_total: number;
+	outcomes: { position: number; started_at: number; skipped: boolean }[];
+	chain_id: number | null;
+	equipment_id: number | null;
+	updated_at: number;
+}
+
+export interface SpinUpdate {
+	release_id: number;
+	side: string;
+	started_at: number;
+	paused_at?: number | null;
+	paused_total?: number;
+	outcomes?: { position: number; started_at: number; skipped: boolean }[];
+	chain_id?: number | null;
+	equipment_id?: number | null;
+}
+
 export interface PhysicalRelease {
 	id: number;
 	kind: 'vinyl' | 'cassette' | 'cd' | 'sacd';
@@ -1027,6 +1064,10 @@ class TapedeckAPI {
 
 	private async patch<T>(path: string, body?: unknown): Promise<T> {
 		return this.request('PATCH', path, body);
+	}
+
+	private async put<T>(path: string, body?: unknown): Promise<T> {
+		return this.request('PUT', path, body);
 	}
 
 	/** DELETE that tolerates an empty 204 body (the JSON helpers assume a body). */
@@ -1338,8 +1379,12 @@ class TapedeckAPI {
 			chain_id?: number | null;
 			equipment_id?: number | null;
 			notes?: string | null;
+			/** Move it to another shelf. Changing this rewrites the tracklist's
+			 *  sides — a record has a break, a disc has none — so the response
+			 *  reports `sides_rewritten` and the caller should refetch. */
+			kind?: ShelfKind;
 		}
-	) {
+	): Promise<{ status: string; sides_rewritten?: boolean }> {
 		return this.patch(`/api/v1/physical/${id}`, body);
 	}
 	async setPressingTracks(id: number, tracks: PhysicalTrack[]) {
@@ -1418,6 +1463,22 @@ class TapedeckAPI {
 	}
 	async clearShelfNowPlaying() {
 		return this.del('/api/v1/physical/now-playing');
+	}
+
+	// ── The side on the deck, held server-side ──
+	//
+	// The countdown still runs in the page — nothing else can watch a
+	// turntable — but *what is on* and *when it started* live on the server.
+	// That is what lets a second device see the record, and what makes a side
+	// survive the browser crashing.
+	async getSpin(): Promise<{ spin: Spin | null }> {
+		return this.get('/api/v1/physical/spin');
+	}
+	async putSpin(body: SpinUpdate): Promise<{ status: string }> {
+		return this.put('/api/v1/physical/spin', body);
+	}
+	async clearSpin(): Promise<{ status: string }> {
+		return this.del('/api/v1/physical/spin');
 	}
 	/** Set or clear an artist portrait by hand. Empty clears it. */
 	async setArtistImage(artistRowId: number, url: string): Promise<{ image_url: string | null }> {

@@ -26,7 +26,7 @@ openapi: 3.1.0
 
 info:
   title: Tapedeck
-  version: 0.51.0
+  version: 0.52.0
   summary: Self-hosted scrobbler and listening journal.
   description: |
     Tapedeck ingests listens, enriches them with MusicBrainz metadata, stores
@@ -2525,6 +2525,13 @@ paths:
 
         `chain_id` and `equipment_id` are checked against the caller's own rows
         before they are stored.
+
+        `kind` is the exception to the absent/null rule — a format has no
+        "cleared" state, so a plain optional is correct. Changing it **rewrites
+        the tracklist's sides**, because what a side is depends on the medium: a
+        record has a break `assign_sides` has to place by playing time, and a
+        disc has none at all. The response reports `sides_rewritten` so a client
+        knows the tracklist it is holding is stale.
       parameters: [{ name: id, in: path, required: true, schema: { type: integer } }]
       requestBody:
         required: true
@@ -2537,8 +2544,17 @@ paths:
                 chain_id: { type: integer, nullable: true }
                 equipment_id: { type: integer, nullable: true }
                 notes: { type: string, nullable: true }
+                kind: { type: string, enum: [vinyl, cassette, cd, sacd] }
       responses:
-        '200': { description: Saved., content: { application/json: { schema: { $ref: '#/components/schemas/Ok' } } } }
+        '200':
+          description: Saved.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string }
+                  sides_rewritten: { type: boolean }
         '400': { $ref: '#/components/responses/BadRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '404': { $ref: '#/components/responses/NotFound' }
@@ -2900,6 +2916,91 @@ paths:
         is also what *cancelling* a side means and that has no track to name.
         Clears only entries this shelf reported — an idle turntable must not
         wipe a now-playing the user's phone is currently sending over ingest.
+      responses:
+        '200': { description: Cleared., content: { application/json: { schema: { $ref: '#/components/schemas/Ok' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /api/v1/physical/spin:
+    get:
+      tags: [Shelf]
+      summary: The side currently on the deck.
+      description: |
+        Session-only. Returns `{ "spin": null }` when nothing is on.
+
+        The shelf is the one source where the *browser* is the player, so the
+        countdown runs in the page — but what is on and when it started live
+        here. That is what lets a second device see the record, and what makes a
+        side survive a browser crash.
+
+        A spin whose release has since been deleted is cleared and reported as
+        nothing on, rather than returned as a dangling id.
+      responses:
+        '200':
+          description: OK.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  spin:
+                    nullable: true
+                    type: object
+                    properties:
+                      release_id: { type: integer }
+                      kind: { type: string, enum: [vinyl, cassette, cd, sacd] }
+                      artist: { type: string }
+                      title: { type: string }
+                      artwork_url: { type: string, nullable: true }
+                      mbid_release: { type: string, nullable: true }
+                      side: { type: string }
+                      started_at: { type: integer }
+                      paused_at: { type: integer, nullable: true, description: Null while running. }
+                      paused_total: { type: integer, description: Seconds spent stopped. }
+                      outcomes: { type: array, items: { type: object, additionalProperties: true } }
+                      chain_id: { type: integer, nullable: true }
+                      equipment_id: { type: integer, nullable: true }
+                      updated_at: { type: integer }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+    put:
+      tags: [Shelf]
+      summary: Put a side on the deck, or update the one that is on.
+      description: |
+        Session-only. One deck per user — the table's primary key is the user,
+        because nobody listens to two records at once, so starting a second side
+        replaces the first rather than erroring.
+
+        The whole state is sent every time rather than a patch per field: it is
+        half a dozen small numbers, it changes only on real events (start,
+        pause, skip, next track), and a partial update would let two devices
+        interleave into a state neither of them meant.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [release_id, side, started_at]
+              properties:
+                release_id: { type: integer }
+                side: { type: string }
+                started_at: { type: integer }
+                paused_at: { type: integer, nullable: true }
+                paused_total: { type: integer, default: 0 }
+                outcomes: { type: array, items: { type: object, additionalProperties: true } }
+                chain_id: { type: integer, nullable: true }
+                equipment_id: { type: integer, nullable: true }
+      responses:
+        '200': { description: Stored., content: { application/json: { schema: { $ref: '#/components/schemas/Ok' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { description: No such record., content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+    delete:
+      tags: [Shelf]
+      summary: Take the side off the deck.
+      description: |
+        Session-only. Clears the now-playing entry as well, so the two cannot
+        disagree. Recording a side (`POST /api/v1/physical/{id}/play`) clears it
+        too — otherwise reopening the page would offer to resume a side that has
+        already been logged, which is how one gets logged twice.
       responses:
         '200': { description: Cleared., content: { application/json: { schema: { $ref: '#/components/schemas/Ok' } } } }
         '401': { $ref: '#/components/responses/Unauthorized' }
