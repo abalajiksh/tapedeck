@@ -809,6 +809,8 @@ export interface Spin {
 	outcomes: { position: number; started_at: number; skipped: boolean }[];
 	chain_id: number | null;
 	equipment_id: number | null;
+	/** How far into the side the needle went down. */
+	start_secs: number;
 	updated_at: number;
 }
 
@@ -821,6 +823,7 @@ export interface SpinUpdate {
 	outcomes?: { position: number; started_at: number; skipped: boolean }[];
 	chain_id?: number | null;
 	equipment_id?: number | null;
+	start_secs?: number;
 }
 
 export interface PhysicalRelease {
@@ -845,6 +848,10 @@ export interface PhysicalRelease {
 	 *  the answer back, so a record with one turntable is asked once. */
 	chain_id: number | null;
 	equipment_id: number | null;
+	/** Where a tape was left. Cassettes only — a record has random access and no
+	 *  state to remember, so these stay null for every other medium. */
+	parked_side: string | null;
+	parked_secs: number | null;
 	play_count: number;
 	played_secs: number;
 	last_played: number | null;
@@ -1401,6 +1408,15 @@ class TapedeckAPI {
 			/** Per-track outcomes from the deck. The browser ran the clock, so
 			 *  it is the only thing that saw the pauses and the skips. */
 			tracks?: { position: number; started_at: number; skipped: boolean }[];
+			/** The first track that actually played. Without it every track
+			 *  before the needle is recorded as having played — and they must
+			 *  not become skips either, since a track you never reached is not
+			 *  one you skipped. */
+			from_position?: number;
+			/** Where a tape ended up, in seconds into the side. Cassettes only;
+			 *  the server refuses it for anything else, because a record has no
+			 *  such state. Absent means the side ran through and wound on. */
+			parked_secs?: number;
 		}
 	): Promise<PlayResult> {
 		return this.post(`/api/v1/physical/${id}/play`, body);

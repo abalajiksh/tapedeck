@@ -245,6 +245,10 @@ pub struct PhysicalRelease {
     /// writes the answer back, so a record with one turntable is asked once.
     pub chain_id: Option<i64>,
     pub equipment_id: Option<i64>,
+    /// Where the tape was left. Cassettes only — a record has random access and
+    /// no state to remember, so these stay null for every other medium.
+    pub parked_side: Option<String>,
+    pub parked_secs: Option<i64>,
     /// How many sides have been played, and for how long. Derived in the
     /// query rather than kept as a counter, so they cannot drift from the
     /// plays they claim to count.
@@ -305,6 +309,9 @@ pub struct PhysicalSpin {
     pub outcomes: String,
     pub chain_id: Option<i64>,
     pub equipment_id: Option<i64>,
+    /// How far into the side this spin began — non-zero when the needle was
+    /// dropped mid-side or a tape resumed from where it was parked.
+    pub start_secs: i64,
     pub updated_at: i64,
 }
 
@@ -643,7 +650,14 @@ impl Database {
                 -- question forever; the deck pre-fills from here and the answer
                 -- is written back.
                 chain_id INTEGER REFERENCES signal_chains(id),
-                equipment_id INTEGER REFERENCES equipment(id)
+                equipment_id INTEGER REFERENCES equipment(id),
+                -- Where the tape was left. A cassette does not rewind itself:
+                -- stop it halfway and eject, and it is still parked there the
+                -- next time you put it in. That is a fact about the object,
+                -- which is what this shelf is for. Written for cassettes only —
+                -- see `park_tape` for why a record deliberately has no memory.
+                parked_side TEXT,
+                parked_secs INTEGER
             )",
         )
         .execute(&self.pool)
@@ -679,6 +693,11 @@ impl Database {
                 outcomes TEXT NOT NULL DEFAULT '[]',
                 chain_id INTEGER REFERENCES signal_chains(id),
                 equipment_id INTEGER REFERENCES equipment(id),
+                -- How far into the side this spin began. Non-zero when the
+                -- needle was dropped mid-side, or when a tape resumed from
+                -- where it was parked, so the countdown reads a position
+                -- within the side rather than starting from nothing.
+                start_secs INTEGER NOT NULL DEFAULT 0,
                 updated_at INTEGER NOT NULL
             )",
         )
@@ -1545,6 +1564,30 @@ impl Database {
                     .execute(&self.pool)
                     .await;
             }
+        }
+
+        // Migration: where the tape is parked.
+        //
+        // Like every other `physical_releases` column this comes **after** the
+        // disc-kinds rebuild, which copies an explicit column list into a fresh
+        // table — anything added ahead of it is silently dropped on the one kind
+        // of database that still needs the rebuild.
+        //
+        // Cassettes only, on purpose. See `park_tape`.
+        if !has_column(&self.pool, "physical_releases", "parked_side").await {
+            info!("⚙️ Migrating: remembering where a tape was left...");
+            for col in &["parked_side TEXT", "parked_secs INTEGER"] {
+                let _ = sqlx::query(&format!("ALTER TABLE physical_releases ADD COLUMN {col}"))
+                    .execute(&self.pool)
+                    .await;
+            }
+        }
+        if !has_column(&self.pool, "physical_spins", "start_secs").await {
+            let _ = sqlx::query(
+                "ALTER TABLE physical_spins ADD COLUMN start_secs INTEGER NOT NULL DEFAULT 0",
+            )
+            .execute(&self.pool)
+            .await;
         }
 
         Ok(())
@@ -2748,13 +2791,14 @@ impl Database {
         outcomes_json: &str,
         chain_id: Option<i64>,
         equipment_id: Option<i64>,
+        start_secs: i64,
     ) -> Result<(), sqlx::Error> {
         let now = chrono::Utc::now().timestamp();
         sqlx::query(
             "INSERT INTO physical_spins
                (user_id, release_id, side, started_at, paused_at, paused_total,
-                outcomes, chain_id, equipment_id, updated_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                outcomes, chain_id, equipment_id, start_secs, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
              ON CONFLICT(user_id) DO UPDATE SET
                release_id = excluded.release_id,
                side = excluded.side,
@@ -2764,6 +2808,7 @@ impl Database {
                outcomes = excluded.outcomes,
                chain_id = excluded.chain_id,
                equipment_id = excluded.equipment_id,
+               start_secs = excluded.start_secs,
                updated_at = excluded.updated_at",
         )
         .bind(user_id)
@@ -2775,10 +2820,60 @@ impl Database {
         .bind(outcomes_json)
         .bind(chain_id)
         .bind(equipment_id)
+        .bind(start_secs)
         .bind(now)
         .execute(&self.pool)
         .await?;
         Ok(())
+    }
+
+    /// Remember where a tape was left — and refuse to for anything else.
+    ///
+    /// A cassette is sequential. Stop it halfway through side A and eject, and
+    /// the tape is still sitting at that point: put it back in tomorrow, press
+    /// play, and it carries on from there. Nothing else on this shelf works
+    /// that way, and the asymmetry is the design rather than an omission:
+    ///
+    /// * A **record** has random access and no state. You lift the arm and it
+    ///   goes back in its sleeve; there is no "where it was left" to remember,
+    ///   and inventing one would be modelling physics the object does not have.
+    /// * A **disc** is random access too, and every player on earth starts it
+    ///   at track one.
+    ///
+    /// So this writes nothing unless the release is a cassette. The guard is
+    /// here rather than at the call site because it is a fact about the medium,
+    /// and a second caller would otherwise have to remember it.
+    pub async fn park_tape(
+        &self,
+        user_id: i64,
+        release_id: i64,
+        side: &str,
+        secs: i64,
+    ) -> Result<bool, sqlx::Error> {
+        let res = sqlx::query(
+            "UPDATE physical_releases SET parked_side = ?, parked_secs = ?
+               WHERE user_id = ? AND id = ? AND kind = 'cassette'",
+        )
+        .bind(side)
+        .bind(secs.max(0))
+        .bind(user_id)
+        .bind(release_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(res.rows_affected() > 0)
+    }
+
+    /// Wind a tape back to the start.
+    pub async fn rewind_tape(&self, user_id: i64, release_id: i64) -> Result<bool, sqlx::Error> {
+        let res = sqlx::query(
+            "UPDATE physical_releases SET parked_side = NULL, parked_secs = NULL
+               WHERE user_id = ? AND id = ?",
+        )
+        .bind(user_id)
+        .bind(release_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(res.rows_affected() > 0)
     }
 
     /// Take whatever is on the deck off it.
@@ -9452,20 +9547,20 @@ mod tests {
 
         assert!(db.get_spin(uid).await.unwrap().is_none(), "an empty deck to start");
 
-        db.set_spin(uid, a, "A", 1_700_000_000, None, 0, "[]", None, None).await.unwrap();
+        db.set_spin(uid, a, "A", 1_700_000_000, None, 0, "[]", None, None, 0).await.unwrap();
         let spin = db.get_spin(uid).await.unwrap().expect("a side is on");
         assert_eq!(spin.release_id, a);
         assert_eq!(spin.side, "A");
         assert_eq!(spin.paused_at, None);
 
         // Pausing keeps the same row rather than opening a second deck.
-        db.set_spin(uid, a, "A", 1_700_000_000, Some(1_700_000_300), 0, "[]", None, None)
+        db.set_spin(uid, a, "A", 1_700_000_000, Some(1_700_000_300), 0, "[]", None, None, 0)
             .await
             .unwrap();
         assert_eq!(db.get_spin(uid).await.unwrap().unwrap().paused_at, Some(1_700_000_300));
 
         // And a different record replaces it outright.
-        db.set_spin(uid, b, "1", 1_700_001_000, None, 12, "[{}]", None, None).await.unwrap();
+        db.set_spin(uid, b, "1", 1_700_001_000, None, 12, "[{}]", None, None, 0).await.unwrap();
         let spin = db.get_spin(uid).await.unwrap().unwrap();
         assert_eq!(spin.release_id, b);
         assert_eq!(spin.side, "1");
@@ -9488,12 +9583,72 @@ mod tests {
             )
             .await
             .unwrap();
-        db.set_spin(a, mine, "A", 1_700_000_000, None, 0, "[]", None, None).await.unwrap();
+        db.set_spin(a, mine, "A", 1_700_000_000, None, 0, "[]", None, None, 0).await.unwrap();
 
         assert!(db.get_spin(a).await.unwrap().is_some());
         assert!(db.get_spin(c).await.unwrap().is_none());
         assert!(!db.clear_spin(c).await.unwrap(), "clearing an empty deck changes nothing");
         assert!(db.get_spin(a).await.unwrap().is_some(), "and leaves the other alone");
+    }
+
+    /// A tape remembers where it was left; a record has no such state.
+    ///
+    /// The asymmetry is the design, not an omission — a cassette is sequential
+    /// and really is still parked halfway when you put it back in, while a
+    /// record has random access and goes back in its sleeve. Writing a park
+    /// point for vinyl would be modelling physics the object does not have.
+    #[tokio::test]
+    async fn a_tape_remembers_where_it_was_left_and_a_record_does_not() {
+        let db = testdb().await;
+        let uid = db.create_user("colin", None, "x", "user").await.unwrap();
+        let tape = db
+            .create_physical(
+                uid, "cassette", "ABBA", "Gold", None, None, None, None, None, None, "[]", None,
+                None,
+            )
+            .await
+            .unwrap();
+        let record = db
+            .create_physical(
+                uid, "vinyl", "Burial", "Untrue", None, None, None, None, None, None, "[]", None,
+                None,
+            )
+            .await
+            .unwrap();
+        let disc = db
+            .create_physical(
+                uid,
+                "cd",
+                "Radiohead",
+                "Pablo Honey",
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                "[]",
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert!(db.park_tape(uid, tape, "A", 754).await.unwrap(), "a cassette parks");
+        assert!(!db.park_tape(uid, record, "A", 754).await.unwrap(), "a record does not");
+        assert!(!db.park_tape(uid, disc, "1", 754).await.unwrap(), "nor does a disc");
+
+        let shelf = db.list_physical(uid, None).await.unwrap();
+        let got = |id: i64| shelf.iter().find(|r| r.id == id).unwrap();
+        assert_eq!(got(tape).parked_side.as_deref(), Some("A"));
+        assert_eq!(got(tape).parked_secs, Some(754));
+        assert_eq!(got(record).parked_side, None);
+        assert_eq!(got(record).parked_secs, None);
+
+        // Playing it through winds it back to the start.
+        assert!(db.rewind_tape(uid, tape).await.unwrap());
+        let shelf = db.list_physical(uid, None).await.unwrap();
+        assert_eq!(shelf.iter().find(|r| r.id == tape).unwrap().parked_side, None);
     }
 
     #[tokio::test]

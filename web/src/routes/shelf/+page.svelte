@@ -147,6 +147,8 @@
 		startedAt: number;
 		pausedAt: number | null;
 		pausedTotal: number;
+		/** How far into the side the needle went down. */
+		startSecs?: number;
 		outcomes: Outcome[];
 	};
 	let spinning: Spinning | null = null;
@@ -178,6 +180,7 @@
 						startedAt: spin.started_at,
 						pausedAt: spin.paused_at,
 						pausedTotal: spin.paused_total,
+						startSecs: spin.start_secs ?? 0,
 						outcomes: spin.outcomes ?? []
 					}
 				: null;
@@ -213,7 +216,8 @@
 				paused_total: v.pausedTotal,
 				outcomes: v.outcomes,
 				chain_id: playChain,
-				equipment_id: playGear
+				equipment_id: playGear,
+				start_secs: v.startSecs ?? 0
 			})
 			.catch(() => {
 				// The side keeps running locally. The next event rewrites the
@@ -250,18 +254,59 @@
 		}
 	}
 
-	function startSide(side: string) {
+	/**
+	 * Which track a parked tape is sitting at, if this is that side.
+	 *
+	 * Cassettes only, and the server enforces that — a record has random access
+	 * and no state to be in, so it never has a park point to report.
+	 */
+	function parkedAt(r: PhysicalRelease | null, side: string): number | null {
+		if (!r || r.parked_side !== side || r.parked_secs == null) return null;
+		const list = sideTracks(side, r);
+		let acc = 0;
+		for (const t of list) {
+			acc += t.duration_secs ?? 180;
+			if (r.parked_secs < acc) return t.position;
+		}
+		// Parked past the end — the tape ran out. Treat that as the start again
+		// rather than pointing at a track that has already finished.
+		return null;
+	}
+
+	/**
+	 * Drop the needle.
+	 *
+	 * `from` is where on the side it goes down. You do not always start a side
+	 * at its beginning — the needle goes where you put it, and a tape carries on
+	 * from wherever it was stopped — so this is the ordinary case rather than an
+	 * option. Everything before `from` is *not* played and is not recorded, and
+	 * in particular is not recorded as skipped: a track you never reached is not
+	 * a track you skipped, and `scrobbles.skipped` feeds skip-rate analytics.
+	 */
+	function startSide(side: string, from?: number) {
 		if (!open) return;
 		playMsg = '';
 		flipPrompt = '';
 		const now = Math.floor(Date.now() / 1000);
+		const list = sideTracks(side);
+		const first = from ?? list[0]?.position ?? 1;
+		// Where in the side the clock starts, so the countdown reads a position
+		// within the side rather than from zero — the tracks before it exist and
+		// take time, they just were not played this time.
+		const startSecs = list
+			.filter((t) => t.position < first)
+			.reduce((n, t) => n + (t.duration_secs ?? 180), 0);
+		fromPosition = first;
 		saveSpinning({
 			releaseId: open.id, kind: open.kind, side, startedAt: now,
-			pausedAt: null, pausedTotal: 0,
+			pausedAt: null, pausedTotal: 0, startSecs,
 			// The first track starts the moment the needle drops.
-			outcomes: [{ position: sideTracks(side)[0]?.position ?? 1, started_at: now, skipped: false }]
+			outcomes: [{ position: first, started_at: now, skipped: false }]
 		});
 	}
+
+	/** The track the current spin began at, so the play records only from there. */
+	let fromPosition = 1;
 
 	/** Tracks on a side, in order. */
 	function sideTracks(side: string, release?: PhysicalRelease | null): PhysicalTrack[] {
@@ -340,7 +385,8 @@
 	/** Elapsed and remaining for the side currently on. */
 	// Wall clock minus time spent stopped. A paused record is not playing.
 	$: spinElapsed = spinning
-		? Math.max(0, (spinning.pausedAt ?? nowSec) - spinning.startedAt - spinning.pausedTotal)
+		? Math.max(0, (spinning.pausedAt ?? nowSec) - spinning.startedAt - spinning.pausedTotal) +
+			(spinning.startSecs ?? 0)
 		: 0;
 	$: paused = !!spinning?.pausedAt;
 	$: nowTrack = spinning && spinHere ? sideTracks(spinning.side)[currentIndex(spinning)] : null;
@@ -660,6 +706,10 @@
 		if (!open) return;
 		playing = true;
 		playMsg = '';
+		// Did *this* deck run the side, or is this the "already played" path?
+		// Everything the deck observed — outcomes, where it started, where the
+		// tape ended up — is only meaningful in the first case.
+		const ranHere = !!(spinning && spinning.releaseId === open.id);
 		try {
 			const r = await api.playSide(open.id, {
 				side,
@@ -670,7 +720,20 @@
 				chain_id: playChain,
 				equipment_id: playGear,
 				// Only when this deck ran the side; "already played" has none.
-				tracks: spinning && spinning.releaseId === open.id ? spinning.outcomes : undefined
+				tracks: ranHere ? spinning?.outcomes : undefined,
+				// Where the needle went down. Without this every track before it
+				// is recorded as having played.
+				from_position: ranHere ? fromPosition : undefined,
+				// Where the tape ends up. Only when it came off part-way — a side
+				// played to the end has wound through, and the server treats an
+				// absent value as "wind it back". Cassettes only; the server
+				// refuses it for anything else rather than trusting the caller.
+				// `spinElapsed` is already a position *within the side* — it counts
+				// from the start of the side, not from where the needle went
+				// down — so adding `startSecs` again double-counts it and parks
+				// the tape past its own end.
+				parked_secs:
+					ranHere && open.kind === 'cassette' && spinLeft > 0 ? spinElapsed : undefined
 			});
 			const sk = r.skipped ?? 0;
 			playMsg = r.listens_added || sk
@@ -1175,21 +1238,50 @@
 								{formatDuration(sideSecs(side))}
 							</span>
 						</div>
+						<!-- Every track is a start point. You do not always begin a
+						     side at its beginning: the needle goes down where you
+						     put it, and a tape carries on from wherever it was
+						     stopped. Clicking one starts there — and nothing before
+						     it is recorded, since a track you never reached is not
+						     a track you skipped. -->
 						<ol style="margin:10px 0 0;padding-left:18px;">
 							{#each openTracks.filter((t) => t.side === side) as t}
-								<li style="font-size:13px;padding:2px 0;">
-									{t.title}
-									{#if t.duration_secs}
-										<span style="color:var(--td-muted-2);">· {formatDuration(t.duration_secs)}</span>
-									{/if}
+								<li style="font-size:13px;padding:1px 0;">
+									<button class="trk" disabled={playing || !!spinning}
+										title="Start {unit(open.kind).toLowerCase()} {side} from here"
+										on:click={() => startSide(side, t.position)}>
+										<span>{t.title}</span>
+										{#if t.duration_secs}
+											<span style="color:var(--td-muted-2);">· {formatDuration(t.duration_secs)}</span>
+										{/if}
+										{#if parkedAt(open, side) === t.position}
+											<span class="parkpip" title="The tape is sitting here">◂ here</span>
+										{/if}
+									</button>
 								</li>
 							{/each}
 						</ol>
-						<div style="display:flex;gap:6px;margin-top:12px;">
-							<button class="btn btn-primary" style="flex:1;"
-								disabled={playing || !!spinning} on:click={() => startSide(side)}>
-								Start {unit(open.kind).toLowerCase()} {side}
-							</button>
+						<div style="display:flex;gap:6px;margin-top:12px;flex-wrap:wrap;">
+							{#if parkedAt(open, side)}
+								<!-- A cassette is sequential: stop it halfway and eject,
+								     and it is still parked there. So the honest first
+								     offer is to carry on, not to start again. -->
+								<button class="btn btn-primary" style="flex:1;min-width:150px;"
+									disabled={playing || !!spinning}
+									on:click={() => startSide(side, parkedAt(open, side) ?? 1)}>
+									Carry on from track {parkedAt(open, side)}
+								</button>
+								<button class="btn btn-secondary" disabled={playing || !!spinning}
+									title="Wind it back and start the side again"
+									on:click={() => startSide(side, 1)}>
+									From the top
+								</button>
+							{:else}
+								<button class="btn btn-primary" style="flex:1;min-width:150px;"
+									disabled={playing || !!spinning} on:click={() => startSide(side)}>
+									Start {unit(open.kind).toLowerCase()} {side}
+								</button>
+							{/if}
 							<button class="btn btn-secondary" title="Record it now, working the start time back from the running time"
 								disabled={playing || !!spinning} on:click={() => play(side)}>
 								Already played
@@ -1407,6 +1499,23 @@
 		display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
 		margin: 14px 0 2px; padding: 12px 0;
 		border-top: 1px solid var(--td-line); border-bottom: 1px solid var(--td-line);
+	}
+	/* A track is a start point, so it has to look like something you can press —
+	   but a tracklist is a list first and a row of buttons second, so this is a
+	   text button that only declares itself on hover. */
+	.trk {
+		display: inline-flex; align-items: baseline; gap: 5px; flex-wrap: wrap;
+		background: none; border: 0; padding: 1px 4px; margin-left: -4px;
+		border-radius: 6px; cursor: pointer; text-align: left;
+		color: inherit; font: inherit; font-size: 13px;
+	}
+	.trk:hover:not(:disabled) {
+		background: color-mix(in srgb, var(--td-accent) 14%, transparent);
+	}
+	.trk:disabled { cursor: default; }
+	.parkpip {
+		font-size: 11px; color: var(--td-accent);
+		letter-spacing: .04em; white-space: nowrap;
 	}
 	.clearq {
 		position: absolute; right: 8px; top: 50%; transform: translateY(-50%);

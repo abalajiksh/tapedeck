@@ -963,6 +963,24 @@ pub struct PlaySide {
     /// these rows.
     pub equipment_id: Option<i64>,
     pub chain_id: Option<i64>,
+    /// The first track that actually played, when the side did not start at its
+    /// beginning — the needle dropped at track 4, or a tape carried on from
+    /// where it was parked.
+    ///
+    /// This is load-bearing rather than cosmetic. `play_side` writes a listen
+    /// for **every** track on the side, so without it starting at track 4
+    /// silently records tracks 1–3 as having played. They must not be written
+    /// at all — and in particular must not be written as *skips*, because a
+    /// skip means "I heard some of it and moved on" and feeds the skip-rate
+    /// analytics `scrobbles.skipped` exists for. A track you never reached is
+    /// not a track you skipped.
+    #[serde(default)]
+    pub from_position: Option<i64>,
+    /// Where the tape was left when it came off, in seconds into the side.
+    /// Cassettes only — `Database::park_tape` enforces that, since it is a fact
+    /// about the medium rather than about this request.
+    #[serde(default)]
+    pub parked_secs: Option<i64>,
 }
 
 /// POST /api/v1/physical/:id/play — record a side.
@@ -995,6 +1013,17 @@ async fn play_side(
 
     if tracks.is_empty() {
         return err(400, format!("Side {side} has no tracks on it"));
+    }
+
+    // Everything before the needle went down never played. This has to happen
+    // **before** `total`, which feeds both the derived start time and the wear
+    // recorded below — crediting the stylus with a whole side for the half of
+    // it you actually played is the same error `skipped` guards everywhere.
+    if let Some(from) = body.from_position {
+        tracks.retain(|t| t.position >= from);
+        if tracks.is_empty() {
+            return err(400, format!("Side {side} has no track at or after {from}"));
+        }
     }
 
     const ASSUMED_SECS: i64 = 180;
@@ -1079,6 +1108,34 @@ async fn play_side(
         }
         // Only advances the derived clock; a reported track carries its own.
         at = ts + dur;
+    }
+
+    // Where the tape ends up. A cassette does not rewind itself, so stopping
+    // halfway leaves it there — `park_tape` writes nothing for any other
+    // medium, since a record has no such state and inventing one would be
+    // modelling physics the object does not have.
+    //
+    // An explicit `parked_secs` is the deck reporting where it stopped; a side
+    // played to the end winds through and is left at the start of the *other*
+    // side, which is what an absent value with a `next_side` means.
+    if let Some(secs) = body.parked_secs {
+        // A tape cannot be parked past the end of its own side. Clamped here
+        // rather than trusted, because the position is arithmetic done in the
+        // browser and getting it wrong is silent — the first version of this
+        // added the needle-drop offset twice and parked a 12:00 side at 12:14,
+        // which then reads as "the tape ran out" on a side that had four
+        // minutes left. The whole side, not the part that played.
+        let side_secs: i64 = all
+            .iter()
+            .filter(|t| t.side.eq_ignore_ascii_case(&side))
+            .map(|t| t.duration_secs.unwrap_or(ASSUMED_SECS))
+            .sum();
+        let parked = secs.clamp(0, side_secs);
+        if let Err(e) = state.db.park_tape(user.user_id, release.id, &side, parked).await {
+            warn!("Could not remember where the tape was left: {}", e);
+        }
+    } else if let Err(e) = state.db.rewind_tape(user.user_id, release.id).await {
+        warn!("Could not wind the tape back: {}", e);
     }
 
     // Only when something was actually recorded. A duplicate submission — the
@@ -1292,6 +1349,10 @@ pub struct SpinUpdate {
     pub chain_id: Option<i64>,
     #[serde(default)]
     pub equipment_id: Option<i64>,
+    /// How far into the side this spin began — the needle dropped mid-side, or
+    /// a tape resumed from where it was parked.
+    #[serde(default)]
+    pub start_secs: i64,
 }
 
 /// GET /api/v1/physical/spin — the side on the deck, with enough of the record
@@ -1336,6 +1397,7 @@ async fn get_spin(State(state): State<Arc<AppState>>, user: AuthUser) -> impl In
                 "outcomes": outcomes,
                 "chain_id": spin.chain_id,
                 "equipment_id": spin.equipment_id,
+                "start_secs": spin.start_secs,
                 "updated_at": spin.updated_at,
             }
         })),
@@ -1375,6 +1437,7 @@ async fn put_spin(
             &outcomes,
             body.chain_id,
             body.equipment_id,
+            body.start_secs.max(0),
         )
         .await
     {
