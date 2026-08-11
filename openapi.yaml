@@ -26,7 +26,7 @@ openapi: 3.1.0
 
 info:
   title: Tapedeck
-  version: 0.50.0
+  version: 0.51.0
   summary: Self-hosted scrobbler and listening journal.
   description: |
     Tapedeck ingests listens, enriches them with MusicBrainz metadata, stores
@@ -120,6 +120,12 @@ tags:
       the field.
   - name: Pairing
     description: Device-code pairing for clients with no browser.
+  - name: Account
+    description: |
+      Your own account — password, display name, bio, profile picture. Scoped to
+      the caller and never takes an id, unlike the admin routes under
+      `/admin/users`. Session-only: a scrobble client has no business changing
+      the credential it authenticates with.
   - name: Listens
     description: The scrobble history — read, edit, delete, search.
   - name: Statistics
@@ -3960,6 +3966,132 @@ paths:
         '400': { $ref: '#/components/responses/BadRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
+
+  /api/v1/profile:
+    get:
+      tags: [Account]
+      summary: The caller's own account.
+      description: |
+        Session-only. Takes no id — it is always the caller's own account, which
+        is the point: an account created for someone else was previously only
+        changeable by the admin who created it.
+
+        `avatar` is a URL the browser can load. It is either the external URL the
+        user set or `/api/v1/profile/avatar` when a file was uploaded; the path
+        on disk is never returned.
+      responses:
+        '200':
+          description: OK.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  id: { type: integer }
+                  username: { type: string }
+                  display_name: { type: string, nullable: true }
+                  role: { type: string, enum: [admin, user] }
+                  created_at: { type: integer, description: Unix seconds. }
+                  bio: { type: string, nullable: true }
+                  avatar: { type: string, nullable: true }
+                  disabled: { type: boolean }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+    patch:
+      tags: [Account]
+      summary: Change your display name, bio or avatar URL.
+      description: |
+        Session-only. Each field distinguishes absent ("leave alone") from an
+        explicit `null` ("clear"), so a misspelled key cannot silently blank a
+        field it failed to name.
+
+        `avatar_url` must be an `http(s)` URL. A relative value is refused with
+        400 — only the upload endpoint may write a path this server serves.
+        Role, disabled state, username and password are deliberately not here.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                display_name: { type: string, nullable: true, maxLength: 80 }
+                bio: { type: string, nullable: true, maxLength: 500 }
+                avatar_url: { type: string, nullable: true }
+      responses:
+        '200': { description: Updated., content: { application/json: { schema: { $ref: '#/components/schemas/Ok' } } } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /api/v1/profile/password:
+    post:
+      tags: [Account]
+      summary: Change your own password.
+      description: |
+        Session-only. `current_password` is required — the caller already holds
+        a session, so without it an unlocked browser would be enough to lock the
+        real owner out. This is what separates it from the admin reset on
+        `PATCH /admin/users/{id}`.
+
+        On success every existing session for the user is dropped and a new
+        cookie is issued to the caller, so other browsers are logged out but the
+        tab making the request is not.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [current_password, new_password]
+              properties:
+                current_password: { type: string }
+                new_password: { type: string, minLength: 8 }
+      responses:
+        '200': { description: Updated; a fresh session cookie is set., content: { application/json: { schema: { $ref: '#/components/schemas/Ok' } } } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { description: The current password is wrong., content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+
+  /api/v1/profile/avatar:
+    get:
+      tags: [Account]
+      summary: The caller's uploaded profile picture.
+      description: |
+        Session-only and scoped to the caller, like the artwork proxy. Cached
+        `private` — a shared cache holding one would serve it to the next person
+        through the proxy. 404 when the avatar is an external URL rather than an
+        uploaded file.
+      responses:
+        '200': { description: The image bytes., content: { image/*: { schema: { type: string, format: binary } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    post:
+      tags: [Account]
+      summary: Upload a profile picture.
+      description: |
+        Session-only, `multipart/form-data`, 4 MB maximum. The extension comes
+        from the declared content type, never from the client's filename. The
+        picture it replaces is deleted.
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              properties:
+                file: { type: string, format: binary }
+      responses:
+        '200': { description: Stored., content: { application/json: { schema: { type: object, properties: { avatar: { type: string } } } } } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '413': { description: Larger than 4 MB., content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+        '415': { description: Not an image type we store., content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+    delete:
+      tags: [Account]
+      summary: Remove your profile picture.
+      description: Session-only. Falls back to the lettered tile.
+      responses:
+        '200': { description: Removed., content: { application/json: { schema: { $ref: '#/components/schemas/Ok' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
 
   /admin/users/{id}:
     patch:

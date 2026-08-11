@@ -372,6 +372,20 @@ export interface Device {
 	last_seen: number;
 }
 
+/** Your own account. `avatar` is a URL the browser can load directly — either
+ *  the external one you set or the endpoint that serves an uploaded file. The
+ *  path on disk is deliberately never sent. */
+export interface UserProfile {
+	id: number;
+	username: string;
+	display_name: string | null;
+	role: 'admin' | 'user';
+	created_at: number;
+	bio: string | null;
+	avatar: string | null;
+	disabled: boolean;
+}
+
 export interface Equipment {
 	id: number;
 	name: string;
@@ -1625,6 +1639,38 @@ class TapedeckAPI {
 	}
 	async deleteUser(id: number): Promise<void> {
 		return this.delNoBody(`/admin/users/${id}`);
+	}
+
+	// ── Your own account ──
+	//
+	// No id in any of these — they are always the caller's. Session-only on the
+	// server, so a token cannot change the credential it authenticates with.
+	async getProfile(): Promise<UserProfile> {
+		return this.get('/api/v1/profile');
+	}
+	/** Omit a field to leave it alone; pass `null` to clear it. */
+	async updateProfile(body: {
+		display_name?: string | null;
+		bio?: string | null;
+		avatar_url?: string | null;
+	}): Promise<{ status: string }> {
+		return this.patch('/api/v1/profile', body);
+	}
+	/** The current password is required — see the endpoint's own note. */
+	async changePassword(current_password: string, new_password: string): Promise<{ status: string }> {
+		return this.post('/api/v1/profile/password', { current_password, new_password });
+	}
+	async uploadAvatar(file: File): Promise<{ avatar: string }> {
+		const form = new FormData();
+		form.append('file', file);
+		const res = await fetch(`${BASE}/api/v1/profile/avatar`, {
+			method: 'POST', credentials: 'same-origin', body: form
+		});
+		if (!res.ok) throw new Error(`API ${res.status}: ${await res.text()}`);
+		return res.json();
+	}
+	async deleteAvatar(): Promise<{ status: string }> {
+		return this.del('/api/v1/profile/avatar');
 	}
 
 	// ── Tokens ──

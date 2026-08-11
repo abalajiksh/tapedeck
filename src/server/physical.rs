@@ -608,7 +608,7 @@ const MAX_SCAN_BYTES: usize = 24 * 1024 * 1024;
 /// Extension for a declared image type. The list is exhaustive on purpose —
 /// the extension is part of a path this server writes, so it is chosen from a
 /// fixed set here rather than taken from the client's filename.
-fn image_ext(mime: &str) -> Option<&'static str> {
+pub(super) fn image_ext(mime: &str) -> Option<&'static str> {
     match mime.split(';').next().unwrap_or("").trim() {
         "image/jpeg" | "image/jpg" => Some("jpg"),
         "image/png" => Some("png"),
@@ -738,7 +738,7 @@ async fn upload_image(
     (StatusCode::CREATED, Json(serde_json::json!({ "ids": stored }))).into_response()
 }
 
-fn random_name() -> String {
+pub(super) fn random_name() -> String {
     use rand::Rng;
     let raw: [u8; 12] = rand::rng().random();
     raw.iter().map(|b| format!("{b:02x}")).collect()

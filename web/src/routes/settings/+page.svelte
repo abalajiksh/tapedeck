@@ -5,7 +5,7 @@
 	import { formatDateTime } from '$lib/utils';
 	import { theme, setTheme, type ThemeMode } from '$lib/theme';
 	import { showArtwork, setShowArtwork } from '$lib/prefs';
-	import type { Connection, SignalChain } from '$lib/api';
+	import type { Connection, SignalChain, UserProfile } from '$lib/api';
 	import SourcesPanel from '$lib/components/SourcesPanel.svelte';
 
 	const uiVersion = __UI_VERSION__;
@@ -17,6 +17,7 @@
 	// came for is one click away instead of a scroll hunt. The section lives in the
 	// hash so a link like /settings#sources lands where it says it will.
 	const SECTIONS = [
+		{ id: 'account', label: 'Account', hint: 'Password, picture, bio' },
 		{ id: 'appearance', label: 'Appearance', hint: 'Theme and artwork' },
 		{ id: 'time', label: 'Time', hint: 'Timezone and week start' },
 		{ id: 'sources', label: 'Sources', hint: 'Plex, Navidrome, Jellyfin' },
@@ -33,6 +34,103 @@
 		section = id;
 		if (typeof history !== 'undefined') history.replaceState(null, '', `#${id}`);
 	}
+
+	// ── Account ──
+	let profile: UserProfile | null = null;
+	let pDisplayName = '';
+	let pBio = '';
+	let profileMsg = '';
+	let profileErr = '';
+	let savingProfile = false;
+	// Bumped after an upload so the <img> re-requests. The endpoint is a fixed
+	// URL cached `immutable`, so without this a new picture would not appear
+	// until the tab was reloaded.
+	let avatarBust = 0;
+	let avatarBusy = false;
+
+	let curPw = '';
+	let newPw = '';
+	let confirmPw = '';
+	let pwMsg = '';
+	let pwErr = '';
+	let savingPw = false;
+
+	async function loadProfile() {
+		try {
+			profile = await api.getProfile();
+			pDisplayName = profile.display_name ?? '';
+			pBio = profile.bio ?? '';
+		} catch { /* the section shows its own empty state */ }
+	}
+
+	async function saveProfile() {
+		savingProfile = true;
+		profileMsg = ''; profileErr = '';
+		try {
+			// Empty means "clear", which the server also treats as a clear rather
+			// than storing a blank nobody can see to delete.
+			await api.updateProfile({
+				display_name: pDisplayName.trim() || null,
+				bio: pBio.trim() || null
+			});
+			await loadProfile();
+			profileMsg = 'Saved';
+			setTimeout(() => (profileMsg = ''), 2500);
+		} catch (e) {
+			profileErr = e instanceof Error ? e.message : 'Could not save';
+		}
+		savingProfile = false;
+	}
+
+	async function onAvatarPicked(ev: Event) {
+		const input = ev.target as HTMLInputElement;
+		const file = input.files?.[0];
+		if (!file) return;
+		avatarBusy = true;
+		profileErr = '';
+		try {
+			await api.uploadAvatar(file);
+			await loadProfile();
+			avatarBust = Date.now();
+		} catch (e) {
+			profileErr = e instanceof Error ? e.message : 'Could not upload that picture';
+		}
+		avatarBusy = false;
+		input.value = '';
+	}
+
+	async function removeAvatar() {
+		avatarBusy = true;
+		try {
+			await api.deleteAvatar();
+			await loadProfile();
+			avatarBust = Date.now();
+		} catch (e) {
+			profileErr = e instanceof Error ? e.message : 'Could not remove that picture';
+		}
+		avatarBusy = false;
+	}
+
+	async function savePassword() {
+		pwMsg = ''; pwErr = '';
+		if (newPw.length < 8) { pwErr = 'The new password must be at least 8 characters.'; return; }
+		// Checked here as well as on the server, because the server only ever
+		// sees one of the two and cannot catch a typo in the confirmation.
+		if (newPw !== confirmPw) { pwErr = 'The two new passwords do not match.'; return; }
+		savingPw = true;
+		try {
+			await api.changePassword(curPw, newPw);
+			curPw = ''; newPw = ''; confirmPw = '';
+			pwMsg = 'Password changed. Any other browser signed in as you has been signed out.';
+		} catch (e) {
+			const msg = e instanceof Error ? e.message : '';
+			pwErr = msg.includes('403') ? 'That is not your current password.' : (msg || 'Could not change the password');
+		}
+		savingPw = false;
+	}
+
+	/** The lettered tile, same fallback the rest of the app uses for missing art. */
+	$: avatarLetter = (profile?.display_name || profile?.username || '?').trim().charAt(0).toUpperCase();
 
 	let tokens: TokenInfo[] = [];
 	let chains: SignalChain[] = [];
@@ -617,6 +715,7 @@
 			if (typeof prefs.week_start === 'number') weekStart = ((prefs.week_start % 7) + 7) % 7;
 		} catch { timezone = 'UTC'; }
 		try { isAdmin = (await api.me()).is_admin; } catch { /* optional */ }
+		loadProfile();
 		loadArtStatus();
 		loadSanitize();
 		loadDiscogs();
@@ -794,6 +893,105 @@
 	</nav>
 
 	<div class="settings-body">
+		{#if section === 'account'}
+			<div class="panel" style="border-radius:22px;padding:24px;margin-bottom:18px;">
+				<h3 class="h-display" style="font-size:19px;margin-bottom:4px;">Your account</h3>
+				<p style="font-size:13px;color:var(--td-muted);margin:0 0 18px;">
+					{#if profile}
+						Signed in as <strong>{profile.username}</strong>{profile.role === 'admin' ? ' · admin' : ''}.
+					{:else}
+						Your username, picture and password.
+					{/if}
+				</p>
+
+				<div style="display:flex;gap:20px;align-items:flex-start;flex-wrap:wrap;">
+					<div style="display:flex;flex-direction:column;align-items:center;gap:10px;">
+						{#if profile?.avatar}
+							<img
+								src={profile.avatar.startsWith('http') ? profile.avatar : `${profile.avatar}?v=${avatarBust}`}
+								alt="You"
+								style="width:92px;height:92px;border-radius:50%;object-fit:cover;border:1px solid var(--td-border);"
+							/>
+						{:else}
+							<div
+								style="width:92px;height:92px;border-radius:50%;display:flex;align-items:center;justify-content:center;
+								       background:var(--td-sidebar);border:1px solid var(--td-border);font-size:34px;"
+								class="h-display"
+								aria-hidden="true"
+							>{avatarLetter}</div>
+						{/if}
+						<div style="display:flex;gap:8px;">
+							<label class="btn btn-secondary" style="cursor:pointer;font-size:12px;padding:5px 12px;">
+								{avatarBusy ? '…' : 'Change'}
+								<input type="file" accept="image/*" on:change={onAvatarPicked} style="display:none;" disabled={avatarBusy} />
+							</label>
+							{#if profile?.avatar}
+								<button class="btn btn-ghost" style="font-size:12px;padding:5px 12px;" on:click={removeAvatar} disabled={avatarBusy}>Remove</button>
+							{/if}
+						</div>
+					</div>
+
+					<div style="flex:1;min-width:260px;display:flex;flex-direction:column;gap:14px;">
+						<div>
+							<label for="pdn" style="display:block;font-size:13px;margin-bottom:5px;">Display name</label>
+							<input id="pdn" class="input" bind:value={pDisplayName} maxlength="80" placeholder={profile?.username ?? ''} />
+							<p style="font-size:12px;color:var(--td-muted-2);margin:5px 0 0;">Shown instead of your username. Your username itself can only be changed by an admin.</p>
+						</div>
+						<div>
+							<label for="pbio" style="display:block;font-size:13px;margin-bottom:5px;">Bio</label>
+							<textarea id="pbio" class="input" bind:value={pBio} maxlength="500" rows="3"
+								placeholder="What you listen to, what you listen on."
+								style="resize:vertical;font-family:inherit;"></textarea>
+							<p style="font-size:12px;color:var(--td-muted-2);margin:5px 0 0;">{pBio.length}/500</p>
+						</div>
+						<div style="display:flex;gap:10px;align-items:center;">
+							<button class="btn btn-primary" on:click={saveProfile} disabled={savingProfile}>
+								{savingProfile ? 'Saving…' : 'Save'}
+							</button>
+							{#if profileMsg}
+								<span style="font-size:13px;color:var(--td-good-fg);background:var(--td-good-bg);padding:6px 13px;border-radius:999px;">✓ {profileMsg}</span>
+							{/if}
+						</div>
+						{#if profileErr}
+							<p style="font-size:13px;color:#b2622d;margin:0;">{profileErr}</p>
+						{/if}
+					</div>
+				</div>
+			</div>
+
+			<div class="panel" style="border-radius:22px;padding:24px;margin-bottom:18px;">
+				<h3 class="h-display" style="font-size:19px;margin-bottom:4px;">Password</h3>
+				<p style="font-size:13px;color:var(--td-muted);margin:0 0 16px;">
+					Changing this signs out every other browser you are signed in on — but not this one.
+				</p>
+				<div style="display:flex;flex-direction:column;gap:12px;max-width:360px;">
+					<div>
+						<label for="cpw" style="display:block;font-size:13px;margin-bottom:5px;">Current password</label>
+						<input id="cpw" class="input" type="password" autocomplete="current-password" bind:value={curPw} />
+					</div>
+					<div>
+						<label for="npw" style="display:block;font-size:13px;margin-bottom:5px;">New password</label>
+						<input id="npw" class="input" type="password" autocomplete="new-password" bind:value={newPw} />
+					</div>
+					<div>
+						<label for="npw2" style="display:block;font-size:13px;margin-bottom:5px;">Confirm new password</label>
+						<input id="npw2" class="input" type="password" autocomplete="new-password" bind:value={confirmPw} />
+					</div>
+					<div style="display:flex;gap:10px;align-items:center;">
+						<button class="btn btn-primary" on:click={savePassword} disabled={savingPw || !curPw || !newPw}>
+							{savingPw ? 'Changing…' : 'Change password'}
+						</button>
+					</div>
+					{#if pwMsg}
+						<p style="font-size:13px;color:var(--td-good-fg);background:var(--td-good-bg);padding:8px 13px;border-radius:12px;margin:0;">✓ {pwMsg}</p>
+					{/if}
+					{#if pwErr}
+						<p style="font-size:13px;color:#b2622d;margin:0;">{pwErr}</p>
+					{/if}
+				</div>
+			</div>
+		{/if}
+
 		{#if section === 'appearance'}
 			<div class="panel" style="border-radius:22px;padding:24px;margin-bottom:18px;">
 				<h3 class="h-display" style="font-size:19px;margin-bottom:4px;">Appearance</h3>

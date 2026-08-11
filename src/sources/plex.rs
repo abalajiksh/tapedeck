@@ -116,9 +116,15 @@ pub struct PlexTrack {
     pub viewed_at: Option<u64>,
     /// Audio quality extracted from Plex Media/Stream metadata
     pub audio_quality: Option<AudioQuality>,
-    /// Plex account name (from the session's `User` element), used to map the
-    /// listen to the matching Tapedeck user. None for history-derived tracks.
+    /// Plex account name (from the session's `User` element). None for
+    /// history-derived tracks, which carry `plex_account_id` instead.
     pub plex_user: Option<String>,
+    /// Plex account id, present only on history rows. This is the history
+    /// path's half of per-user isolation: `validate_session` gates live
+    /// sessions on the account *name*, and for a long time nothing gated
+    /// history at all, so every play by every member of a Plex Home was
+    /// attributed to whichever user's source row happened to walk it.
+    pub plex_account_id: Option<i64>,
     /// Plex's own id for a *play event*, present only on history rows. It is
     /// the one stable key a re-walked history entry keeps, so it becomes the
     /// `source_id` — the old suffix was the poll's wall clock, which made every
@@ -197,6 +203,7 @@ impl PlexTrack {
             viewed_at: None,
             audio_quality,
             plex_user: s.user.as_ref().and_then(|u| u.title.clone()),
+            plex_account_id: None,
             history_key: None,
             // No machineIdentifier means nothing stable to key a device on, so
             // the listen keeps its old behaviour rather than getting a device
@@ -230,6 +237,7 @@ impl PlexTrack {
             viewed_at: h.viewed_at,
             audio_quality: None,
             plex_user: None,
+            plex_account_id: h.account_id,
             player: None,
         })
     }
@@ -536,6 +544,12 @@ struct HistoryTrack {
     rating_key: Option<String>,
     parent_rating_key: Option<String>,
     grandparent_rating_key: Option<String>,
+    /// Plex's own account id for whoever played this — the *only* thing on a
+    /// history row that says whose listen it was. A live session carries a
+    /// `User` element with a name; a history row carries this number instead,
+    /// and nothing else. Without it the history path cannot tell one member of
+    /// a Plex Home from another. See `accounts_allow`.
+    account_id: Option<i64>,
 }
 
 // ==================== Session Tracking ====================
@@ -556,6 +570,14 @@ struct SessionState {
 #[derive(Debug, Clone, Default)]
 pub struct PlexFilters {
     pub users_allow: Vec<String>,
+    /// `users_allow` resolved to Plex account ids, filled by `initialize`.
+    ///
+    /// It exists because the two endpoints identify a listener differently: a
+    /// session says `User title="Colin"`, a history row says
+    /// `accountID="777942758"` and carries no name at all. One allow-list
+    /// expressed in the name-space of the source config therefore has to be
+    /// translated once, at connect, into the number-space history speaks.
+    pub accounts_allow: Vec<i64>,
     pub users_block: Vec<String>,
     pub devices_allow: Vec<String>,
     pub devices_block: Vec<String>,
@@ -636,7 +658,51 @@ impl PlexSource {
     pub async fn initialize(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         self.libraries = self.fetch_libraries().await?;
         info!("Plex: Loaded {} libraries", self.libraries.len());
+        self.resolve_allowed_accounts().await;
         Ok(())
+    }
+
+    /// Translate `users_allow` (names) into `accounts_allow` (Plex account ids).
+    ///
+    /// Failure here is deliberately **not** fatal and deliberately **not**
+    /// ignored: the live path keys on the name and keeps working, while the
+    /// history path fails closed (see `fetch_history_tracks`). Attributing a
+    /// housemate's listen to the wrong person writes to a permanent public
+    /// record — losing the between-polls catch-up until the operator fixes the
+    /// token is the cheaper of the two failures by a wide margin.
+    async fn resolve_allowed_accounts(&mut self) {
+        if self.filters.users_allow.is_empty() {
+            return;
+        }
+        match Self::list_accounts(&self.url, &self.token).await {
+            Ok(accounts) => {
+                self.filters.accounts_allow = accounts
+                    .iter()
+                    .filter(|a| self.filters.users_allow.contains(&a.name.trim().to_lowercase()))
+                    .map(|a| a.id)
+                    .collect();
+                if self.filters.accounts_allow.is_empty() {
+                    warn!(
+                        "Plex: none of {:?} matched an account on this server ({} known) — \
+                         history-derived plays will be skipped rather than misattributed",
+                        self.filters.users_allow,
+                        accounts.len()
+                    );
+                } else {
+                    info!(
+                        "Plex: history isolated to account id(s) {:?} for {:?}",
+                        self.filters.accounts_allow, self.filters.users_allow
+                    );
+                }
+            }
+            Err(e) => {
+                warn!(
+                    "Plex: could not read /accounts ({}) — history-derived plays will be \
+                     skipped, since there is no way to tell whose they are",
+                    e
+                );
+            }
+        }
     }
 
     /// Which Plex account a token belongs to.
@@ -1125,14 +1191,19 @@ impl PlexSource {
         if now.saturating_sub(self.last_history_at) >= HISTORY_SYNC_INTERVAL_SECS {
             self.last_history_at = now;
             self.recent_scrobbles.retain(|_, at| now.saturating_sub(*at) < HISTORY_SUPPRESS_SECS);
-            if let Ok(history) = self.fetch_history_tracks(0).await {
+            // `.ok()` rather than `if let Ok(..)`: the error type is a bare
+            // `Box<dyn Error>`, which is not `Send`, and binding the whole
+            // Result keeps it alive across the hydrate await below — which is
+            // enough to make the trait method's future non-`Send`.
+            let history = self.fetch_history_tracks(0).await.ok();
+            if let Some(history) = history {
                 let fetched = history.len();
                 // Drop anything the live path already banked. History is the
                 // fallback for plays that finished between polls, not a second
                 // opinion on plays we watched happen — and its rows carry the
                 // album artist and no quality metadata, so letting one through
                 // is a visibly worse duplicate of a row we already have.
-                let fresh: Vec<PlexTrack> = history
+                let mut fresh: Vec<PlexTrack> = history
                     .into_iter()
                     .filter(|t| !self.recent_scrobbles.contains_key(&t.rating_key))
                     .collect();
@@ -1142,6 +1213,12 @@ impl PlexSource {
                     fresh.len(),
                     fetched - fresh.len()
                 );
+                // Only the rows that survive suppression are worth a lookup, and
+                // at a 5s session cadence that is close to nothing — this is the
+                // catch-up path, not the common one.
+                for track in &mut fresh {
+                    self.hydrate_from_library(track).await;
+                }
                 result.ready_to_scrobble.extend(fresh);
             }
         }
@@ -1266,6 +1343,7 @@ impl PlexSource {
                         rating_key: None,
                         parent_rating_key: None,
                         grandparent_rating_key: None,
+                        account_id: None,
                     };
 
                     for attr in e.attributes().flatten() {
@@ -1286,6 +1364,7 @@ impl PlexSource {
                             b"ratingKey" => track.rating_key = Some(val),
                             b"parentRatingKey" => track.parent_rating_key = Some(val),
                             b"grandparentRatingKey" => track.grandparent_rating_key = Some(val),
+                            b"accountID" => track.account_id = val.parse().ok(),
                             _ => {}
                         }
                     }
@@ -1302,6 +1381,60 @@ impl PlexSource {
         }
 
         tracks
+    }
+
+    /// Fill in the duration and audio quality a history row does not carry.
+    ///
+    /// `/status/sessions/history/all` returns *no* `duration` and *no* `Media`
+    /// element — verified against a live 1.42 server: a history row has 19
+    /// attributes and neither is among them. So a listen banked from history
+    /// landed with no running time and no codec, which is the whole of the
+    /// "one track on the album lost its FLAC badge" report: the badge and the
+    /// duration column go blank together, on exactly the tracks the live path
+    /// missed (finished between polls, or the player stopped before the
+    /// halfway gate).
+    ///
+    /// `/library/metadata/<ratingKey>` has both, and it describes the *file*
+    /// rather than a playback session — which is the honest source for this.
+    /// The one thing it cannot know is whether Plex transcoded on the way out;
+    /// that is a property of a session that has already ended, so a
+    /// history-derived listen keeps `is_transcoded` unset rather than claiming
+    /// a direct play it cannot vouch for.
+    async fn hydrate_from_library(&self, track: &mut PlexTrack) {
+        let endpoint = format!("{}/library/metadata/{}", self.url, track.rating_key);
+        let resp = match self
+            .client
+            .get(&endpoint)
+            .header("X-Plex-Token", &self.token)
+            .header("Accept", "application/json")
+            .send()
+            .await
+        {
+            Ok(r) if r.status().is_success() => r,
+            Ok(r) => {
+                debug!("Plex: metadata for {} returned {}", track.rating_key, r.status());
+                return;
+            }
+            Err(e) => {
+                debug!("Plex: metadata for {} failed: {}", track.rating_key, e);
+                return;
+            }
+        };
+
+        let Ok(parsed) = resp.json::<SessionsResponse>().await else {
+            debug!("Plex: metadata for {} did not parse", track.rating_key);
+            return;
+        };
+        let Some(meta) = parsed.media_container.metadata.into_iter().next() else {
+            return;
+        };
+
+        if track.duration.is_none() {
+            track.duration = meta.duration;
+        }
+        if track.audio_quality.is_none() {
+            track.audio_quality = PlexTrack::extract_quality(&meta);
+        }
     }
 
     async fn fetch_history_tracks(
@@ -1326,7 +1459,6 @@ impl PlexSource {
         let text = resp.text().await?;
         let history_tracks = Self::parse_history_xml(&text);
 
-        let mut tracks = Vec::new();
         let seven_days_ago = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -1334,12 +1466,59 @@ impl PlexSource {
             .saturating_sub(7 * 86400);
 
         info!("Processing {} history tracks from Plex", history_tracks.len());
+        let isolated = !self.filters.users_allow.is_empty();
+        Ok(Self::own_history_tracks(
+            history_tracks,
+            isolated,
+            &self.filters.accounts_allow,
+            seven_days_ago,
+        ))
+    }
+
+    /// Keep the history rows that are this source's own, recent, and tracks.
+    ///
+    /// Split out of `fetch_history_tracks` so the ownership rule is testable
+    /// without a server — the same reason `consume_sessions` was split out of
+    /// `fetch_sessions`. It is state-free but it decides whose permanent public
+    /// record a play lands on, which is the worst thing in this codebase to get
+    /// wrong silently.
+    ///
+    /// `isolated` means the source is pinned to a Plex account (which every
+    /// source built by `pipeline::build_source` is). When it is set and
+    /// `accounts_allow` is empty, the allow-list could not be resolved to an
+    /// id — so ownership is unknowable and **everything is dropped**. Banking
+    /// them instead would attribute a housemate's listening to whoever's source
+    /// row happened to walk the history first.
+    fn own_history_tracks(
+        history_tracks: Vec<HistoryTrack>,
+        isolated: bool,
+        accounts_allow: &[i64],
+        oldest_allowed: u64,
+    ) -> Vec<PlexTrack> {
+        if isolated && accounts_allow.is_empty() {
+            warn!(
+                "Plex: skipping {} history rows — the allowed account id is unknown, so \
+                 whose plays these are cannot be established",
+                history_tracks.len()
+            );
+            return Vec::new();
+        }
+
+        let mut tracks = Vec::new();
+        let mut foreign = 0usize;
         for h_track in history_tracks {
             if h_track.media_type.as_deref() != Some("track") {
                 continue;
             }
+            // A row with no `accountID` at all is unowned, not ours. Same rule
+            // as an id belonging to someone else — an absent field must not be
+            // the one gap that reopens this.
+            if isolated && !h_track.account_id.is_some_and(|id| accounts_allow.contains(&id)) {
+                foreign += 1;
+                continue;
+            }
             if let Some(ts) = h_track.viewed_at {
-                if ts < seven_days_ago {
+                if ts < oldest_allowed {
                     debug!("Skipping old history track (viewed_at: {})", ts);
                     continue;
                 }
@@ -1348,7 +1527,10 @@ impl PlexSource {
                 tracks.push(track);
             }
         }
-        Ok(tracks)
+        if foreign > 0 {
+            debug!("Plex: {} history row(s) belonged to another account", foreign);
+        }
+        tracks
     }
 
     fn validate_session(&self, session: &SessionMetadata) -> Option<String> {
@@ -1440,6 +1622,7 @@ mod tests {
             viewed_at: None,
             audio_quality: None,
             plex_user: None,
+            plex_account_id: None,
             history_key: None,
             player: None,
         }
@@ -1745,5 +1928,106 @@ mod tests {
             m.thumb.clone().or_else(|| m.parent_thumb.clone()).as_deref(),
             Some("/library/metadata/55820/thumb/17")
         );
+    }
+
+    /// Two rows captured from a live Plex 1.42 server on 2026-08-11: one played
+    /// by the server owner (`accountID="1"`) and one by a Plex Home member
+    /// (`accountID="777942758"`). Both are real; the second is the play that
+    /// was being attributed to the wrong person.
+    ///
+    /// Note what is *not* in either row: no `duration`, no `Media` element, and
+    /// no user name anywhere. That is the whole reason both bugs existed.
+    const REAL_HISTORY_XML: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<MediaContainer size="2">
+<Track historyKey="/status/sessions/history/14747" key="/library/metadata/155345" ratingKey="155345" librarySectionID="3" title="Bom diggy diggy" parentTitle="Sonu Ke Titu Ki Sweety" grandparentTitle="Various Artists" type="track" index="4" parentIndex="1" viewedAt="1786478964" accountID="1" deviceID="90" />
+<Track historyKey="/status/sessions/history/14317" key="/library/metadata/109501" ratingKey="109501" librarySectionID="3" title="Shape of You" parentTitle="&#247;" grandparentTitle="Ed Sheeran" type="track" index="4" parentIndex="1" viewedAt="1786300696" accountID="777942758" deviceID="86" />
+</MediaContainer>"#;
+
+    #[test]
+    fn a_history_row_carries_the_account_that_played_it() {
+        let rows = PlexSource::parse_history_xml(REAL_HISTORY_XML);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].account_id, Some(1));
+        assert_eq!(rows[1].account_id, Some(777_942_758));
+        // The fields that make a history-derived listen worse than a live one.
+        assert_eq!(rows[1].duration, None);
+        assert_eq!(rows[1].title.as_deref(), Some("Shape of You"));
+    }
+
+    /// The bug this exists to stop: a Plex Home member's play landing in
+    /// somebody else's history. Both people poll the same server with their own
+    /// token, so without this each one's history walk returns the other's plays
+    /// and both accounts end up with both.
+    #[test]
+    fn another_home_members_play_is_not_mine() {
+        let rows = PlexSource::parse_history_xml(REAL_HISTORY_XML);
+        let mine = PlexSource::own_history_tracks(rows, true, &[1], 0);
+        assert_eq!(mine.len(), 1);
+        assert_eq!(mine[0].title, "Bom diggy diggy");
+        assert_eq!(mine[0].plex_account_id, Some(1));
+    }
+
+    /// …and the mirror image, from the other member's source row.
+    #[test]
+    fn my_play_is_not_another_home_members() {
+        let rows = PlexSource::parse_history_xml(REAL_HISTORY_XML);
+        let theirs = PlexSource::own_history_tracks(rows, true, &[777_942_758], 0);
+        assert_eq!(theirs.len(), 1);
+        assert_eq!(theirs[0].title, "Shape of You");
+    }
+
+    /// An unresolved allow-list fails closed. Losing the between-polls catch-up
+    /// is recoverable; writing a housemate's listen to someone's public
+    /// scrobble history is not.
+    #[test]
+    fn an_unresolvable_account_banks_nothing_rather_than_guessing() {
+        let rows = PlexSource::parse_history_xml(REAL_HISTORY_XML);
+        assert!(PlexSource::own_history_tracks(rows, true, &[], 0).is_empty());
+    }
+
+    /// A row with no `accountID` is unowned, not ours — an absent field must
+    /// not be the gap that reopens the leak.
+    #[test]
+    fn a_row_with_no_account_is_not_claimed() {
+        let xml = r#"<MediaContainer size="1">
+<Track ratingKey="1" title="Xtal" grandparentTitle="Aphex Twin" type="track" viewedAt="1786478964" />
+</MediaContainer>"#;
+        let rows = PlexSource::parse_history_xml(xml);
+        assert_eq!(rows[0].account_id, None);
+        assert!(PlexSource::own_history_tracks(rows, true, &[1], 0).is_empty());
+    }
+
+    /// A source with no allow-list at all keeps the old unfiltered behaviour,
+    /// so a single-user install is not broken by the isolation.
+    #[test]
+    fn an_unisolated_source_still_walks_the_whole_history() {
+        let rows = PlexSource::parse_history_xml(REAL_HISTORY_XML);
+        assert_eq!(PlexSource::own_history_tracks(rows, false, &[], 0).len(), 2);
+    }
+
+    /// The FLAC-badge drop. A history row has no `Media`, so the listen landed
+    /// with no codec *and* no running time — the two blanks always arrive
+    /// together, which is what the screenshots showed. `/library/metadata/:id`
+    /// is where both live; this pins that the response shape parses and that
+    /// `extract_quality` reads it. Body captured from the live server for
+    /// ratingKey 109501, the same track as the history row above.
+    #[test]
+    fn library_metadata_supplies_what_a_history_row_lacks() {
+        let body = r#"{"MediaContainer":{"Metadata":[{
+            "ratingKey":"109501","type":"track","title":"Shape of You","duration":233720,
+            "Media":[{"bitrate":1637,"audioCodec":"flac","audioChannels":2,"container":"flac",
+              "Part":[{"container":"flac","Stream":[
+                {"streamType":2,"codec":"flac","bitrate":1637,"samplingRate":44100,"bitDepth":24,"channels":2}
+              ]}]}]
+        }]}}"#;
+        let parsed: SessionsResponse = serde_json::from_str(body).unwrap();
+        let meta = parsed.media_container.metadata.into_iter().next().unwrap();
+        assert_eq!(meta.duration, Some(233_720));
+
+        let q = PlexTrack::extract_quality(&meta).expect("quality from library metadata");
+        assert_eq!(q.codec.as_deref(), Some("flac"));
+        assert_eq!(q.is_lossless, Some(true));
+        assert_eq!(q.sample_rate, Some(44_100));
+        assert_eq!(q.bit_depth, Some(24));
     }
 }

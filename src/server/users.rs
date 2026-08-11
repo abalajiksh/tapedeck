@@ -1,5 +1,5 @@
 use axum::{
-    extract::{ConnectInfo, Path, State},
+    extract::{ConnectInfo, Multipart, Path, State},
     http::{header, HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Json},
     routing::{get, post},
@@ -8,6 +8,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 use std::sync::Arc;
+use tracing::warn;
 
 use super::auth::AuthUser;
 use super::models::ErrorResponse;
@@ -928,6 +929,377 @@ async fn set_log_level(
 }
 
 // ═══════════════════════════════════════════════════════════
+//  Your own account
+// ═══════════════════════════════════════════════════════════
+//
+//  Everything here is scoped to `user.user_id` and takes no id in the path.
+//  That is the whole point: until this existed, an account created for someone
+//  else could only ever be changed *by the admin who created it* — the owner
+//  could not set their own password, which is a security gap rather than a
+//  missing nicety. These are session-only (`AuthUser`, not `WriteAuth`): a
+//  scrobble client has no business changing the credential it authenticates
+//  with.
+
+/// The biggest avatar we will store. Far smaller than a booklet scan
+/// (`MAX_SCAN_BYTES`, 24 MB) because this is one small square shown at 40px,
+/// and the limit is the only thing standing between the uploads directory and
+/// someone's 40-megapixel camera roll.
+const MAX_AVATAR_BYTES: usize = 4 * 1024 * 1024;
+
+/// Turn the stored `avatar_url` into something the browser can actually load.
+///
+/// An avatar is either an external URL the user pasted or a file this server
+/// holds, and the browser must not learn which path on disk the second one is
+/// — same rule the shelf's `file_path` follows. So a stored relative path
+/// becomes the endpoint that serves it and the raw value never leaves.
+fn avatar_src(stored: Option<&str>) -> Option<String> {
+    let v = stored?.trim();
+    if v.is_empty() {
+        return None;
+    }
+    if v.starts_with("http://") || v.starts_with("https://") {
+        Some(v.to_string())
+    } else {
+        Some("/api/v1/profile/avatar".to_string())
+    }
+}
+
+/// GET /api/v1/profile — your own account.
+async fn get_profile(State(state): State<Arc<AppState>>, user: AuthUser) -> impl IntoResponse {
+    match state.db.get_profile(user.user_id).await {
+        Ok(Some(p)) => {
+            let mut body = serde_json::json!(p);
+            let src = avatar_src(p.avatar_url.as_deref());
+            if let Some(obj) = body.as_object_mut() {
+                // The path on disk is replaced, not accompanied.
+                obj.remove("avatar_url");
+                obj.insert("avatar".into(), serde_json::json!(src));
+            }
+            (StatusCode::OK, Json(body)).into_response()
+        }
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!(ErrorResponse { code: 404, error: "No such user".into() })),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!(ErrorResponse { code: 500, error: e.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct UpdateProfileRequest {
+    /// Present-and-null clears; absent leaves alone. See `update_profile`.
+    #[serde(default, deserialize_with = "double_option_str")]
+    pub display_name: Option<Option<String>>,
+    #[serde(default, deserialize_with = "double_option_str")]
+    pub bio: Option<Option<String>>,
+    #[serde(default, deserialize_with = "double_option_str")]
+    pub avatar_url: Option<Option<String>>,
+}
+
+fn double_option_str<'de, D>(de: D) -> Result<Option<Option<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<String>::deserialize(de).map(Some)
+}
+
+/// How long a bio may be.
+///
+/// A bound rather than a free-for-all because this is the one piece of user
+/// text that Phase 6 will show to *other people*, and an unbounded column that
+/// has already been filled is far harder to put a limit on later.
+const MAX_BIO_LEN: usize = 500;
+const MAX_DISPLAY_NAME_LEN: usize = 80;
+
+/// PATCH /api/v1/profile — change your display name, bio or avatar.
+async fn patch_profile(
+    State(state): State<Arc<AppState>>,
+    user: AuthUser,
+    Json(body): Json<UpdateProfileRequest>,
+) -> impl IntoResponse {
+    let too_long = |what: &str, max: usize| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!(ErrorResponse {
+                code: 400,
+                error: format!("{} must be {} characters or fewer", what, max),
+            })),
+        )
+            .into_response()
+    };
+
+    // Trim, and treat an all-whitespace value as a clear rather than storing a
+    // blank that renders as an empty line nobody can see to delete.
+    let clean = |v: Option<Option<String>>| -> Option<Option<String>> {
+        v.map(|inner| inner.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()))
+    };
+    let display_name = clean(body.display_name);
+    let bio = clean(body.bio);
+    let avatar_url = clean(body.avatar_url);
+
+    if let Some(Some(ref s)) = display_name {
+        if s.chars().count() > MAX_DISPLAY_NAME_LEN {
+            return too_long("Display name", MAX_DISPLAY_NAME_LEN);
+        }
+    }
+    if let Some(Some(ref s)) = bio {
+        if s.chars().count() > MAX_BIO_LEN {
+            return too_long("Bio", MAX_BIO_LEN);
+        }
+    }
+    // The column holds either an external URL or a path this server wrote, and
+    // only the upload handler may produce the second kind. Without this, a
+    // client could set `avatar_url` to any relative path and have
+    // `serve_avatar` read it back out of the uploads directory — including
+    // another user's scans, which are laid out under a predictable
+    // `shelf/<user>/<release>/` and are meant to be scoped by user id.
+    if let Some(Some(ref s)) = avatar_url {
+        if !(s.starts_with("http://") || s.starts_with("https://")) {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!(ErrorResponse {
+                    code: 400,
+                    error: "avatar_url must be an http(s) URL — upload a file to \
+                            /api/v1/profile/avatar instead"
+                        .into()
+                })),
+            )
+                .into_response();
+        }
+    }
+
+    match state.db.update_profile(user.user_id, display_name, bio, avatar_url).await {
+        Ok(_) => (StatusCode::OK, Json(serde_json::json!({ "status": "updated" }))).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!(ErrorResponse { code: 500, error: e.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct ChangePasswordRequest {
+    pub current_password: String,
+    pub new_password: String,
+}
+
+/// POST /api/v1/profile/password — change your own password.
+///
+/// The current password is **required**, which is what separates this from the
+/// admin reset on `PATCH /admin/users/:id`. The caller already holds a valid
+/// session, so without that check an unlocked browser is enough to lock the
+/// real owner out of their own account.
+///
+/// Every other session is dropped on success. A password change is usually a
+/// response to "someone else may have this", and leaving the other sessions
+/// alive would defeat the reason for making it.
+async fn change_password(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    user: AuthUser,
+    Json(body): Json<ChangePasswordRequest>,
+) -> impl IntoResponse {
+    if body.new_password.chars().count() < 8 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!(ErrorResponse {
+                code: 400,
+                error: "Password must be at least 8 characters".into()
+            })),
+        )
+            .into_response();
+    }
+
+    if !state.db.check_user_password(user.user_id, &body.current_password).await {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!(ErrorResponse {
+                code: 403,
+                error: "Current password is incorrect".into()
+            })),
+        )
+            .into_response();
+    }
+
+    let hash = match Database::hash_password(&body.new_password) {
+        Ok(h) => h,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!(ErrorResponse { code: 500, error: e })),
+            )
+                .into_response()
+        }
+    };
+    if let Err(e) = state.db.update_user_password(user.user_id, &hash).await {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!(ErrorResponse { code: 500, error: e.to_string() })),
+        )
+            .into_response();
+    }
+
+    // Every existing session goes, including the one making this request — so
+    // a fresh one is issued straight back, or the user would be logged out of
+    // the very tab they changed their password in.
+    if let Err(e) = state.db.clear_user_sessions(user.user_id).await {
+        warn!("Could not clear sessions after a password change: {}", e);
+    }
+
+    let secure = cookie_is_secure(&headers, state.trust_proxy);
+    match state.db.create_web_session(user.user_id).await {
+        Ok(token) => {
+            let mut out =
+                (StatusCode::OK, Json(serde_json::json!({ "status": "updated" }))).into_response();
+            out.headers_mut().insert(header::SET_COOKIE, session_set_cookie(&token, secure));
+            out
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!(ErrorResponse { code: 500, error: e.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
+/// POST /api/v1/profile/avatar — upload a profile picture.
+///
+/// The path written into `avatar_url` is produced here and never accepted from
+/// a request, which is what `patch_profile` refuses a relative value for.
+async fn upload_avatar(
+    State(state): State<Arc<AppState>>,
+    user: AuthUser,
+    mut multipart: Multipart,
+) -> impl IntoResponse {
+    let bad = |code: StatusCode, msg: &str| {
+        (code, Json(serde_json::json!(ErrorResponse { code: code.as_u16(), error: msg.into() })))
+            .into_response()
+    };
+
+    let mut file: Option<(Vec<u8>, String)> = None;
+    while let Ok(Some(field)) = multipart.next_field().await {
+        // The declared content type decides the extension; a filename from the
+        // client never reaches the path we write.
+        let declared = field.content_type().unwrap_or("").to_string();
+        let named = field.file_name().unwrap_or("").to_string();
+        let mime = if super::physical::image_ext(&declared).is_some() {
+            declared
+        } else {
+            mime_guess::from_path(&named).first_raw().unwrap_or("").to_string()
+        };
+        if let Ok(b) = field.bytes().await {
+            file = Some((b.to_vec(), mime));
+            break;
+        }
+    }
+
+    let Some((bytes, mime)) = file else {
+        return bad(StatusCode::BAD_REQUEST, "No image in the request");
+    };
+    if bytes.len() > MAX_AVATAR_BYTES {
+        return bad(StatusCode::PAYLOAD_TOO_LARGE, "That picture is larger than 4 MB");
+    }
+    let Some(ext) = super::physical::image_ext(&mime) else {
+        return bad(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "Only JPEG, PNG, WebP, GIF, AVIF and TIFF images can be uploaded",
+        );
+    };
+
+    let dir = state.uploads_dir.join("avatars").join(user.user_id.to_string());
+    if let Err(e) = tokio::fs::create_dir_all(&dir).await {
+        warn!("avatar: could not create {}: {}", dir.display(), e);
+        return bad(StatusCode::INTERNAL_SERVER_ERROR, "Could not write to the uploads directory");
+    }
+
+    // A fresh random name each time rather than a fixed one, so the immutable
+    // cache header on `serve_avatar` stays honest — a replaced picture is a new
+    // URL, not the same URL with different bytes behind it.
+    let name = format!("{}.{}", super::physical::random_name(), ext);
+    let rel = format!("avatars/{}/{}", user.user_id, name);
+    if let Err(e) = tokio::fs::write(dir.join(&name), &bytes).await {
+        warn!("avatar: could not save: {}", e);
+        return bad(StatusCode::INTERNAL_SERVER_ERROR, "Could not save the picture");
+    }
+
+    // The one it replaces, so a user swapping their picture ten times leaves
+    // one file rather than ten.
+    let previous =
+        state.db.get_profile(user.user_id).await.ok().flatten().and_then(|p| p.avatar_url);
+
+    if let Err(e) = state.db.update_profile(user.user_id, None, None, Some(Some(rel))).await {
+        return bad(StatusCode::INTERNAL_SERVER_ERROR, &format!("Could not save: {e}"));
+    }
+    if let Some(old) = previous {
+        if !old.starts_with("http") {
+            let _ = tokio::fs::remove_file(state.uploads_dir.join(&old)).await;
+        }
+    }
+
+    (StatusCode::OK, Json(serde_json::json!({ "avatar": "/api/v1/profile/avatar" })))
+        .into_response()
+}
+
+/// GET /api/v1/profile/avatar — the caller's own uploaded picture.
+///
+/// Scoped to the session like the artwork proxy, and cached `private`: a shared
+/// cache holding one would hand it to the next person through the proxy.
+async fn serve_avatar(State(state): State<Arc<AppState>>, user: AuthUser) -> impl IntoResponse {
+    let stored = state.db.get_profile(user.user_id).await.ok().flatten().and_then(|p| p.avatar_url);
+    let Some(rel) = stored.filter(|s| !s.starts_with("http")) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!(ErrorResponse { code: 404, error: "No picture".into() })),
+        )
+            .into_response();
+    };
+    match tokio::fs::read(state.uploads_dir.join(&rel)).await {
+        Ok(bytes) => (
+            StatusCode::OK,
+            [
+                (
+                    header::CONTENT_TYPE,
+                    mime_guess::from_path(&rel).first_raw().unwrap_or("application/octet-stream"),
+                ),
+                (header::CACHE_CONTROL, "private, max-age=31536000, immutable"),
+            ],
+            axum::body::Body::from(bytes),
+        )
+            .into_response(),
+        Err(_) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!(ErrorResponse { code: 404, error: "The file is gone".into() })),
+        )
+            .into_response(),
+    }
+}
+
+/// DELETE /api/v1/profile/avatar — go back to the lettered tile.
+async fn delete_avatar(State(state): State<Arc<AppState>>, user: AuthUser) -> impl IntoResponse {
+    let previous =
+        state.db.get_profile(user.user_id).await.ok().flatten().and_then(|p| p.avatar_url);
+    if let Err(e) = state.db.update_profile(user.user_id, None, None, Some(None)).await {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!(ErrorResponse { code: 500, error: e.to_string() })),
+        )
+            .into_response();
+    }
+    if let Some(old) = previous {
+        if !old.starts_with("http") {
+            let _ = tokio::fs::remove_file(state.uploads_dir.join(&old)).await;
+        }
+    }
+    (StatusCode::OK, Json(serde_json::json!({ "status": "removed" }))).into_response()
+}
+
+// ═══════════════════════════════════════════════════════════
 //  Routers
 // ═══════════════════════════════════════════════════════════
 
@@ -950,5 +1322,12 @@ pub fn create_user_management_router() -> Router<Arc<AppState>> {
         .route("/admin/tokens", post(create_token).get(list_tokens))
         .route("/admin/tokens/:id", patch(update_token).delete(revoke_token))
         .route("/admin/tokens/:id/rotate", post(rotate_token))
+        // Your own account. No id in the path — these are always the caller's.
+        .route("/api/v1/profile", get(get_profile).patch(patch_profile))
+        .route("/api/v1/profile/password", post(change_password))
+        .route(
+            "/api/v1/profile/avatar",
+            get(serve_avatar).post(upload_avatar).delete(delete_avatar),
+        )
         .route("/log-level", get(get_log_level).post(set_log_level))
 }

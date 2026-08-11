@@ -522,7 +522,9 @@ impl Database {
                 role TEXT NOT NULL DEFAULT 'user',
                 created_at INTEGER NOT NULL,
                 settings JSON DEFAULT '{}',
-                disabled INTEGER NOT NULL DEFAULT 0
+                disabled INTEGER NOT NULL DEFAULT 0,
+                avatar_url TEXT,
+                bio TEXT
             )",
         )
         .execute(&self.pool)
@@ -1466,6 +1468,21 @@ impl Database {
             let _ = sqlx::query("ALTER TABLE equipment ADD COLUMN purchased_at INTEGER")
                 .execute(&self.pool)
                 .await;
+        }
+
+        // Migration: a user's own profile.
+        //
+        // `avatar_url` is a URL rather than a blob for the same reason the
+        // shelf's scans are files on disk — but unlike a booklet an avatar is
+        // one small image, so an uploaded one is stored under the uploads dir
+        // and this column holds the path that serves it.
+        if !has_column(&self.pool, "users", "avatar_url").await {
+            info!("⚙️ Migrating: adding user profiles...");
+            for col in &["avatar_url TEXT", "bio TEXT"] {
+                let _ = sqlx::query(&format!("ALTER TABLE users ADD COLUMN {col}"))
+                    .execute(&self.pool)
+                    .await;
+            }
         }
 
         Ok(())
@@ -7096,6 +7113,90 @@ impl Database {
         Ok(res.rows_affected() > 0)
     }
 
+    /// Drop every browser session a user holds.
+    ///
+    /// Called on a password change: that is normally a reaction to "someone
+    /// else may have access", and a new password that leaves the old sessions
+    /// logged in does not actually take anything away from them.
+    pub async fn clear_user_sessions(&self, id: i64) -> Result<u64, sqlx::Error> {
+        let res = sqlx::query("DELETE FROM web_sessions WHERE user_id = ?")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(res.rows_affected())
+    }
+
+    /// A user's own profile, for the account screen.
+    pub async fn get_profile(&self, id: i64) -> Result<Option<UserProfile>, sqlx::Error> {
+        sqlx::query_as::<_, UserProfile>(
+            "SELECT id, username, display_name, role, created_at, avatar_url, bio, disabled
+               FROM users WHERE id = ?",
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await
+    }
+
+    /// Update the parts of a profile the owner controls.
+    ///
+    /// Each field is `Option<Option<..>>` for the reason recorded against
+    /// `bulk-chain` and `default_chain_id`: on an endpoint where a field
+    /// chooses between "change this" and "leave it alone", a bare `Option`
+    /// cannot tell absent from null, and a misspelled key silently clears
+    /// whatever it failed to name. Absent leaves alone; explicit null clears.
+    ///
+    /// Note what is *not* here: `role`, `disabled`, `username` and
+    /// `password_hash`. Those are either admin decisions or need the current
+    /// password, and neither belongs on the same call as a bio.
+    pub async fn update_profile(
+        &self,
+        id: i64,
+        display_name: Option<Option<String>>,
+        bio: Option<Option<String>>,
+        avatar_url: Option<Option<String>>,
+    ) -> Result<bool, sqlx::Error> {
+        let mut changed = false;
+        if let Some(v) = display_name {
+            sqlx::query("UPDATE users SET display_name = ? WHERE id = ?")
+                .bind(v)
+                .bind(id)
+                .execute(&self.pool)
+                .await?;
+            changed = true;
+        }
+        if let Some(v) = bio {
+            sqlx::query("UPDATE users SET bio = ? WHERE id = ?")
+                .bind(v)
+                .bind(id)
+                .execute(&self.pool)
+                .await?;
+            changed = true;
+        }
+        if let Some(v) = avatar_url {
+            sqlx::query("UPDATE users SET avatar_url = ? WHERE id = ?")
+                .bind(v)
+                .bind(id)
+                .execute(&self.pool)
+                .await?;
+            changed = true;
+        }
+        Ok(changed)
+    }
+
+    /// Verify a password against the stored hash for one user.
+    ///
+    /// This is what makes "change my password" different from an admin reset:
+    /// the caller already holds a session, so without it a borrowed browser is
+    /// enough to lock the owner out of their own account.
+    pub async fn check_user_password(&self, id: i64, password: &str) -> bool {
+        let row: Result<(String,), _> =
+            sqlx::query_as("SELECT password_hash FROM users WHERE id = ? AND disabled = 0")
+                .bind(id)
+                .fetch_one(&self.pool)
+                .await;
+        matches!(row, Ok((hash,)) if Self::verify_password(password, &hash))
+    }
+
     /// Delete a user and everything they own, in one transaction. Every listen,
     /// token, chain, device, session, binding, and import record scoped to the
     /// user is removed first so foreign keys stay consistent.
@@ -7419,6 +7520,23 @@ pub struct UserRecord {
     pub display_name: Option<String>,
     pub role: String,
     pub created_at: i64,
+    pub disabled: bool,
+}
+
+/// A user's own account, as they see it on the profile screen.
+///
+/// Deliberately not `UserRecord` with two fields bolted on: that one is the
+/// admin's view of *another* account and is rendered in a list, while this is
+/// the owner's view of their own and carries the parts only they can set.
+#[derive(Debug, FromRow, serde::Serialize)]
+pub struct UserProfile {
+    pub id: i64,
+    pub username: String,
+    pub display_name: Option<String>,
+    pub role: String,
+    pub created_at: i64,
+    pub avatar_url: Option<String>,
+    pub bio: Option<String>,
     pub disabled: bool,
 }
 
@@ -9098,6 +9216,57 @@ mod tests {
         assert!(db.authenticate("carol", "password123").await.unwrap().is_none());
         assert!(db.validate_token(&token).await.unwrap().is_none());
         assert!(db.validate_session(&session).await.unwrap().is_none());
+    }
+
+    /// A user must be able to change the password on an account somebody else
+    /// created for them, and must not be able to do it without proving they
+    /// know the current one.
+    #[tokio::test]
+    async fn a_user_can_change_their_own_password_but_only_with_the_old_one() {
+        let db = testdb().await;
+        let hash = Database::hash_password("original-pw").unwrap();
+        let uid = db.create_user("colin", None, &hash, "user").await.unwrap();
+
+        assert!(db.check_user_password(uid, "original-pw").await);
+        assert!(!db.check_user_password(uid, "not-the-password").await);
+
+        let next = Database::hash_password("a-better-one").unwrap();
+        assert!(db.update_user_password(uid, &next).await.unwrap());
+        assert!(db.authenticate("colin", "a-better-one").await.unwrap().is_some());
+        assert!(db.authenticate("colin", "original-pw").await.unwrap().is_none());
+    }
+
+    /// Changing a password is normally a reaction to "someone else may have
+    /// this", so the sessions opened with the old one must not survive it.
+    #[tokio::test]
+    async fn changing_a_password_drops_the_sessions_opened_with_the_old_one() {
+        let db = testdb().await;
+        let hash = Database::hash_password("original-pw").unwrap();
+        let uid = db.create_user("colin", None, &hash, "user").await.unwrap();
+        let elsewhere = db.create_web_session(uid).await.unwrap();
+        assert!(db.validate_session(&elsewhere).await.unwrap().is_some());
+
+        db.clear_user_sessions(uid).await.unwrap();
+        assert!(db.validate_session(&elsewhere).await.unwrap().is_none());
+    }
+
+    /// A profile field distinguishes "leave alone" from "clear", so a request
+    /// naming one field cannot blank the others.
+    #[tokio::test]
+    async fn a_profile_edit_touches_only_the_fields_it_names() {
+        let db = testdb().await;
+        let uid = db.create_user("colin", Some("Colin"), "x", "user").await.unwrap();
+        db.update_profile(uid, None, Some(Some("Collects tape.".into())), None).await.unwrap();
+
+        let p = db.get_profile(uid).await.unwrap().unwrap();
+        assert_eq!(p.bio.as_deref(), Some("Collects tape."));
+        assert_eq!(p.display_name.as_deref(), Some("Colin"), "an unnamed field must survive");
+
+        // Explicit null clears, and still leaves the rest alone.
+        db.update_profile(uid, None, Some(None), None).await.unwrap();
+        let p = db.get_profile(uid).await.unwrap().unwrap();
+        assert_eq!(p.bio, None);
+        assert_eq!(p.display_name.as_deref(), Some("Colin"));
     }
 
     #[tokio::test]

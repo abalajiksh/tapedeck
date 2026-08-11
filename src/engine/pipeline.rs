@@ -206,6 +206,9 @@ impl ScrobbleEngine {
                     // The allow-list *is* the isolation. Empty would mean
                     // "everyone on the server", which is what we're moving away from.
                     users_allow: vec![account.to_lowercase()],
+                    // Resolved from the name by `initialize`; the history
+                    // endpoint identifies a listener by id and never by name.
+                    accounts_allow: Vec::new(),
                     users_block: Vec::new(),
                     libraries_allow: cfg.option_list("libraries_allow"),
                     libraries_block: cfg.option_list("libraries_block"),
