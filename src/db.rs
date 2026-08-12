@@ -1120,27 +1120,32 @@ impl Database {
         .execute(&self.pool)
         .await?;
 
-        // Every chart and rediscovery list groups by the *folded* name, not the
-        // stored one, so the plain `(user_id, artist)` index above cannot serve
-        // them — the plan falls back to `USE TEMP B-TREE FOR GROUP BY` and
-        // sorts the whole history. These are expression indexes on exactly the
-        // keys those queries group by, partial on `skipped = FALSE` because
-        // every counting query filters it.
+        // **Deliberately no expression indexes on the folded name.** Three were
+        // added in v0.56.0 — `(user_id, LOWER(TRIM(artist)))` and the
+        // title/album pairs — because they take a bare `GROUP BY
+        // LOWER(TRIM(artist))` from ~50ms to under 10ms on a laptop, and the
+        // plan stops saying `USE TEMP B-TREE FOR GROUP BY`. They were removed
+        // in v0.59.0 after measuring on the hardware that runs this.
         //
-        // Measured on a 49k-listen history: the artist grouping goes from ~50ms
-        // to under 10ms and the plan drops the temp B-tree, for about 2.7 MB.
-        for ix in [
-            "CREATE INDEX IF NOT EXISTS idx_scrobbles_artist_key
-               ON scrobbles(user_id, LOWER(TRIM(artist))) WHERE skipped = FALSE",
-            "CREATE INDEX IF NOT EXISTS idx_scrobbles_track_key
-               ON scrobbles(user_id, LOWER(TRIM(title)), LOWER(TRIM(artist)))
-             WHERE skipped = FALSE",
-            "CREATE INDEX IF NOT EXISTS idx_scrobbles_album_key
-               ON scrobbles(user_id, LOWER(TRIM(album)), LOWER(TRIM(artist)))
-             WHERE skipped = FALSE",
-        ] {
-            sqlx::query(ix).execute(&self.pool).await?;
-        }
+        // On a Raspberry Pi with the database on an SD card they were a **net
+        // loss**: Statistics went 3.9s → 6.4s, dashboard 0.85s → 1.26s, and
+        // adding `ANALYZE` recovered almost none of it. The reason is a cost
+        // model that does not know this storage: an index scan means a rowid
+        // lookup per row, which is *random* I/O, while the full scan it
+        // replaced is sequential. For a query that touches most rows and reads
+        // several columns — which every analytics query here does — sequential
+        // wins by more than the sort costs.
+        //
+        // The lesson worth keeping is not "indexes are bad". It is that this
+        // application's reads are **whole-history aggregations on slow
+        // sequential storage**, which is close to the opposite of the
+        // point-lookup workload an index is for. `idx_scrobbles_user_time`
+        // earns its place because it also supplies an *order* the queries want;
+        // an index that only supplies a grouping key does not.
+        //
+        // Before adding one here, measure on the Pi — `temp/measure-tapedeck.sh`
+        // — and compare `EXPLAIN QUERY PLAN` either side. A laptop cannot see
+        // this cost at all.
 
         // A note is a living document: one per user per target, edited in place.
         // Exactly one of entity_id / scrobble_id is set — a note about a record
@@ -1745,6 +1750,31 @@ impl Database {
         if !has_column(&self.pool, "sessions", "notes").await {
             let _ =
                 sqlx::query("ALTER TABLE sessions ADD COLUMN notes TEXT").execute(&self.pool).await;
+        }
+
+        // Migration: remove the expression indexes v0.56.0 added.
+        //
+        // Measured a net loss on the target hardware — see the note in `init`.
+        // Dropped rather than left in place, because the planner will keep
+        // choosing them: they exist, they look selective, and the cost model
+        // has no idea the storage is an SD card.
+        for ix in ["idx_scrobbles_artist_key", "idx_scrobbles_track_key", "idx_scrobbles_album_key"]
+        {
+            let present: Option<(i64,)> = sqlx::query_as(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = ?",
+            )
+            .bind(ix)
+            .fetch_optional(&self.pool)
+            .await
+            .ok()
+            .flatten();
+            if present.map(|(n,)| n) == Some(1) {
+                info!("⚙️ Migrating: dropping {} — a net loss on slow storage", ix);
+                let _ =
+                    sqlx::query(&format!("DROP INDEX IF EXISTS {ix}")).execute(&self.pool).await;
+                // The statistics describe indexes that no longer exist.
+                let _ = sqlx::query("ANALYZE").execute(&self.pool).await;
+            }
         }
 
         if !has_column(&self.pool, "artists", "landscape_url").await {

@@ -1,7 +1,7 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
 	import { api } from '$lib/api';
-	import type { Scrobble, SignalChain } from '$lib/api';
+	import type { Scrobble, SignalChain , ChainVariant } from '$lib/api';
 	import ScrobbleRow from '$lib/components/ScrobbleRow.svelte';
 	import InspectListen from '$lib/components/InspectListen.svelte';
 	import { loadLoves, lovedKeys, loveKey, toggleLove } from '$lib/loves';
@@ -11,6 +11,8 @@
 
 	let scrobbles: Scrobble[] = [];
 	let chains: SignalChain[] = [];
+	/** Chain variants, so a sitting can name which setup it was. */
+	let variants: ChainVariant[] = [];
 	// Keyed by id for the row glyph — a listen carries a chain_id, not a chain.
 	$: chainsById = Object.fromEntries(chains.map((c) => [c.id, { name: c.name, icon: c.icon }]));
 	let filter = '';
@@ -201,6 +203,9 @@
 		};
 		loadLoves();
 		try { chains = (await api.getChains()).chains; } catch { /* optional */ }
+		// Optional in the same way: an instance with no variants simply shows no
+		// variant picker on a session card.
+		try { variants = (await api.getVariants()).variants; } catch { /* optional */ }
 		load(true);
 	});
 </script>
@@ -279,6 +284,7 @@
 			<SessionCard
 				session={sess}
 				{chains}
+				{variants}
 				selectable={mergeMode}
 				selected={mergePick.has(sess.id)}
 				on:toggle={(e) => toggleMergePick(e.detail)}

@@ -1,11 +1,14 @@
 <script lang="ts">
-	import { api, type Session, type Scrobble, type SignalChain } from '$lib/api';
+	import { api, type Session, type Scrobble, type SignalChain, type ChainVariant } from '$lib/api';
 	import { formatDuration, timeAgo } from '$lib/utils';
 	import ScrobbleRow from './ScrobbleRow.svelte';
 	import { createEventDispatcher } from 'svelte';
 
 	export let session: Session;
 	export let chains: SignalChain[] = [];
+	/** Variants of those chains, so a sitting can say *which* setup it was —
+	 *  the same chain with the other IEMs in, or the other cartridge fitted. */
+	export let variants: ChainVariant[] = [];
 	/** Selection is for merging — several sittings folded into one. */
 	export let selectable = false;
 	export let selected = false;
@@ -30,6 +33,58 @@
 			} catch { /* leave it closed-empty rather than erroring the page */ }
 			loadingRows = false;
 		}
+	}
+
+	// ── Naming a sitting, and writing about it ──
+	//
+	// A session is the closest thing this app has to "an evening", and the two
+	// things you want to say about one are what it *was* and what happened. The
+	// name is not a liner note: a liner note is about a record and lives on an
+	// entity, while this is about the sitting.
+	let editing = false;
+	let draftTitle = '';
+	let draftNotes = '';
+
+	function startEdit() {
+		draftTitle = session.title ?? '';
+		draftNotes = session.notes ?? '';
+		editing = true;
+	}
+
+	async function saveMeta() {
+		busy = true;
+		try {
+			// Empty means cleared, which the endpoint distinguishes from absent —
+			// so a name can actually be removed rather than only replaced.
+			const r = await api.updateSession(session.id, {
+				title: draftTitle.trim() || null,
+				notes: draftNotes.trim() || null
+			});
+			session = r.session;
+			editing = false;
+			dispatch('changed');
+		} catch (e) { alert('Failed to save: ' + e); }
+		busy = false;
+	}
+
+	/** Variants belong to one chain, so the picker only offers this one's. */
+	$: ownVariants = variants.filter((v) => v.chain_id === session.chain_id);
+
+	async function setVariant(value: string) {
+		busy = true;
+		try {
+			// The chain goes with it: a variant belongs to exactly one chain, and
+			// the endpoint rewrites both together for that reason.
+			const r = await api.updateSession(session.id, {
+				chain_id: session.chain_id,
+				chain_variant_id: value ? Number(value) : null
+			});
+			session = r.session;
+			scrobbles = [];
+			if (open) scrobbles = (await api.getSession(session.id)).scrobbles;
+			dispatch('changed');
+		} catch (e) { alert('Failed to set the variant: ' + e); }
+		busy = false;
 	}
 
 	async function setChain(value: string) {
@@ -85,7 +140,10 @@
 				<span class="meta">
 					{session.track_count} track{session.track_count === 1 ? '' : 's'}
 					· {formatDuration(elapsed)}
-					{#if session.chain_name}· {session.chain_name}{/if}
+					{#if session.chain_name}
+						· {session.chain_name}{#if session.chain_variant_name} ({session.chain_variant_name}){/if}
+					{/if}
+					{#if session.notes}· <span class="hasnote" title={session.notes}>noted</span>{/if}
 					{#if quality}· {quality}/100{/if}
 					{#if session.token_name}· {session.token_name}{/if}
 				</span>
@@ -103,16 +161,62 @@
 					<option value="">— no chain —</option>
 					{#each chains as c}<option value={c.id}>{c.name}</option>{/each}
 				</select>
+				{#if ownVariants.length}
+					<!-- One field rather than a second chain. Two cartridges on one
+					     turntable, or the same commute on the other IEMs, are the
+					     same path with one step swapped — and this is what makes
+					     the hours land on the gear that was actually fitted. -->
+					<select class="input" style="width:auto;min-width:150px;font-size:12.5px;"
+						value={session.chain_variant_id ?? ''} disabled={busy}
+						on:change={(e) => setVariant(e.currentTarget.value)}
+						aria-label="Which variant of that chain">
+						<option value="">— as the chain is —</option>
+						{#each ownVariants as v}<option value={v.id}>{v.name}</option>{/each}
+					</select>
+				{/if}
 				<span style="font-size:12px;color:var(--td-muted-3);">
 					Retags every listen in this sitting.
 				</span>
 				<span style="flex:1;"></span>
+				<button class="btn btn-ghost" style="font-size:12.5px;" on:click={startEdit}>
+					{session.title || session.notes ? 'Edit note' : 'Name it…'}
+				</button>
 				{#if scrobbles.length > 1}
 					<button class="btn btn-ghost" style="font-size:12.5px;" on:click={() => (splitting = !splitting)}>
 						{splitting ? 'Cancel split' : 'Split…'}
 					</button>
 				{/if}
 			</div>
+
+			{#if editing}
+				<div class="edit">
+					<div class="field">
+						<label for="sn-{session.id}">What this sitting was</label>
+						<input id="sn-{session.id}" class="input" bind:value={draftTitle}
+							maxlength="120" placeholder="Sunday morning, new cartridge" />
+					</div>
+					<div class="field">
+						<label for="sx-{session.id}">Notes</label>
+						<textarea id="sx-{session.id}" class="input" rows="3" bind:value={draftNotes}
+							placeholder="First listen on the microlinear. Bass is tighter."
+							style="resize:vertical;font-family:inherit;"></textarea>
+						<p class="hint">
+							About the sitting, not about a record — what you thought of the
+							record itself belongs in Liner Notes.
+						</p>
+					</div>
+					<div style="display:flex;gap:8px;">
+						<button class="btn btn-primary" style="font-size:12.5px;" on:click={saveMeta} disabled={busy}>
+							{busy ? 'Saving…' : 'Save'}
+						</button>
+						<button class="btn btn-secondary" style="font-size:12.5px;" on:click={() => (editing = false)}>
+							Cancel
+						</button>
+					</div>
+				</div>
+			{:else if session.notes}
+				<p class="note">{session.notes}</p>
+			{/if}
 
 			{#if splitting}
 				<p class="hint">Pick the track that starts the second session.</p>
@@ -137,6 +241,22 @@
 </div>
 
 <style>
+	.hasnote { color: var(--td-accent); }
+	.edit {
+		display: flex; flex-direction: column; gap: 12px;
+		padding: 14px; margin: 4px 0 12px;
+		border: 1px solid var(--td-line); border-radius: 14px;
+		background: var(--td-surface2, var(--td-panel2));
+	}
+	.edit .field { display: flex; flex-direction: column; gap: 5px; }
+	.edit label { font-size: 12.5px; color: var(--td-muted); }
+	.hint { font-size: 12px; color: var(--td-muted-3); margin: 0; }
+	.note {
+		margin: 4px 0 12px; padding: 10px 14px;
+		border-left: 2px solid var(--td-accent); border-radius: 0 8px 8px 0;
+		background: var(--td-surface2, var(--td-panel2));
+		font-size: 13px; color: var(--td-text); white-space: pre-wrap;
+	}
 	.card {
 		background: var(--td-surface);
 		border: 1px solid var(--td-border);

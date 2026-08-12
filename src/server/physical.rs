@@ -260,6 +260,12 @@ pub struct NewRelease {
     #[serde(default)]
     pub tracks: Vec<PhysicalTrack>,
     pub notes: Option<String>,
+    /// The medium the *release* declares — `"CD"`, `"12\" Vinyl"`, `"Hybrid
+    /// SACD"` — as the lookup returned it. When present it **overrides `kind`**,
+    /// because `kind` is what the user picked before anyone looked at the
+    /// record and this is what the record says it is. See `settled_kind`.
+    #[serde(default)]
+    pub format: Option<String>,
     /// When you bought it, unix seconds. Optional — most of a shelf is
     /// catalogued long after the fact and guessing would be worse than blank.
     pub purchased_at: Option<i64>,
@@ -287,11 +293,27 @@ async fn add_release(
     }
     let tracks = serde_json::to_string(&body.tracks).unwrap_or_else(|_| "[]".into());
 
+    // What shelf it really goes on.
+    //
+    // The picker is what the user thought they were adding, chosen *before*
+    // anyone looked at the record; `format` is what the release says it is, and
+    // the release is the authority — the same reasoning `is_disc` already
+    // follows for side splitting. A five-CD box set looked up by barcode could
+    // otherwise be filed as vinyl with 76 tracks split into two sides, which is
+    // exactly how one was.
+    //
+    // Silent when they agree, which is nearly always. When they disagree the
+    // response says so, because quietly overriding what someone picked is its
+    // own kind of wrong — they can move it back with the same picker.
+    let declared = release_lookup::kind_from_format(body.format.as_deref());
+    let kind = declared.unwrap_or(body.kind.as_str());
+    let corrected = declared.filter(|k| *k != body.kind.as_str());
+
     let id = match state
         .db
         .create_physical(
             user.user_id,
-            &body.kind,
+            kind,
             body.artist.trim(),
             body.title.trim(),
             body.year,
@@ -309,7 +331,10 @@ async fn add_release(
         Ok(id) => id,
         Err(e) => return err(500, e.to_string()),
     };
-    info!("💿 Added {} to the shelf: {} — {}", body.kind, body.artist, body.title);
+    info!("💿 Added {} to the shelf: {} — {}", kind, body.artist, body.title);
+    if let Some(k) = corrected {
+        info!("   (filed as {k} rather than {} — the release says so)", body.kind);
+    }
 
     // Awaited rather than spawned, and failing softly. Awaited because the next
     // thing the user does is open the record, and a gallery that fills in
@@ -325,7 +350,19 @@ async fn add_release(
         }
     }
 
-    (StatusCode::CREATED, Json(serde_json::json!({ "id": id, "images": images }))).into_response()
+    (
+        StatusCode::CREATED,
+        Json(serde_json::json!({
+            "id": id,
+            "images": images,
+            "kind": kind,
+            // Only when it differs from what was asked for, so a client can say
+            // "filed as CD — the release says so" rather than silently landing
+            // it somewhere else.
+            "corrected_from": corrected.map(|_| body.kind.clone()),
+        })),
+    )
+        .into_response()
 }
 
 #[derive(Debug, Deserialize)]
