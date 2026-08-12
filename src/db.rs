@@ -522,7 +522,57 @@ impl Database {
         db.init().await?;
         db.migrate().await?;
         db.encrypt_legacy_credentials().await?;
+        db.plan_stats().await;
         Ok(db)
+    }
+
+    /// Give the query planner something to plan with.
+    ///
+    /// **This is not a nicety — without it the indexes are a net loss.** Added
+    /// after the expression indexes shipped and made three endpoints *slower*
+    /// on the real host: Statistics 3.9 → 6.4s, Reports 1.76 → 2.3s, dashboard
+    /// 0.85 → 1.2s, while Rediscovery went 122s → 2.7s.
+    ///
+    /// The cause is visible in the plan and is hardware-independent. With no
+    /// statistics SQLite guesses at selectivity, and it guessed that the new
+    /// narrow `(user_id, LOWER(TRIM(artist)))` index served *everything* — so
+    /// `report_rows`, which only wants every row in timestamp order, walked the
+    /// **artist** index instead, paid a rowid lookup per row for the six columns
+    /// it needed, and then sorted the result by timestamp. Two costs added where
+    /// `idx_scrobbles_user_time` had been giving it the right order for free.
+    /// On an SD card, 49k random reads is the whole regression.
+    ///
+    /// After `ANALYZE` the planner picks `idx_scrobbles_user_time` for that scan
+    /// with no sort at all, and still picks the expression index for the
+    /// groupings that genuinely want it.
+    ///
+    /// `PRAGMA optimize` is the maintained form — SQLite's own recommendation,
+    /// it re-analyses only what has drifted — but it does nothing on a database
+    /// that has never been analysed, so the first run is explicit. Measured at
+    /// 64ms for `ANALYZE` on a 49k-listen history and 7ms for `optimize`
+    /// thereafter; neither is worth deferring or making conditional on a flag.
+    ///
+    /// Failure is logged and ignored: stale statistics make queries slower,
+    /// never wrong, and that is not a reason to refuse to start.
+    async fn plan_stats(&self) {
+        let analysed: Option<(i64,)> = sqlx::query_as(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'sqlite_stat1'",
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .ok()
+        .flatten();
+
+        if analysed.map(|(n,)| n) == Some(0) {
+            info!("⚙️ Analysing the database so the query planner has statistics...");
+            if let Err(e) = sqlx::query("ANALYZE").execute(&self.pool).await {
+                warn!("Could not analyse the database: {}", e);
+                return;
+            }
+        }
+        if let Err(e) = sqlx::query("PRAGMA optimize").execute(&self.pool).await {
+            warn!("Could not run PRAGMA optimize: {}", e);
+        }
     }
 
     async fn init(&self) -> Result<(), sqlx::Error> {
@@ -975,7 +1025,15 @@ impl Database {
                 name TEXT NOT NULL,
                 name_key TEXT NOT NULL UNIQUE,
                 mbid TEXT,
+                -- The square one: a portrait, used wherever an artist appears
+                -- in a list or beside a listen.
                 image_url TEXT,
+                -- The wide one. A Reports chapter gives its top artist a whole
+                -- tile, and a square crop either pillarboxes or loses the head;
+                -- a giant initial was the placeholder standing in for this.
+                -- Kept as its own column rather than a crop of the portrait,
+                -- because the two are different photographs, not two framings.
+                landscape_url TEXT,
                 genres TEXT,
                 updated_at INTEGER NOT NULL DEFAULT 0
             )",
@@ -1687,6 +1745,13 @@ impl Database {
         if !has_column(&self.pool, "sessions", "notes").await {
             let _ =
                 sqlx::query("ALTER TABLE sessions ADD COLUMN notes TEXT").execute(&self.pool).await;
+        }
+
+        if !has_column(&self.pool, "artists", "landscape_url").await {
+            info!("⚙️ Migrating: a wide image for an artist...");
+            let _ = sqlx::query("ALTER TABLE artists ADD COLUMN landscape_url TEXT")
+                .execute(&self.pool)
+                .await;
         }
 
         if !has_column(&self.pool, "physical_spins", "start_secs").await {
@@ -5545,6 +5610,51 @@ impl Database {
             .execute(&self.pool)
             .await?;
         Ok(res.rows_affected() > 0)
+    }
+
+    /// Set or clear an artist's **wide** image.
+    ///
+    /// Its own column and its own setter rather than a second argument to the
+    /// one above, because the two are set independently: a portrait usually
+    /// arrives from the library or a provider, while a landscape is almost
+    /// always chosen by hand — nothing Tapedeck can reach supplies one.
+    pub async fn set_artist_landscape(
+        &self,
+        id: i64,
+        url: Option<&str>,
+    ) -> Result<bool, sqlx::Error> {
+        let res = sqlx::query("UPDATE artists SET landscape_url = ?, updated_at = ? WHERE id = ?")
+            .bind(url)
+            .bind(Self::now_secs())
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(res.rows_affected() > 0)
+    }
+
+    /// A wide image for each of these artists, keyed by folded name.
+    ///
+    /// Reports asks for its chapters' top artists in one go rather than one
+    /// request per card — there are twelve of them on a year page.
+    pub async fn artist_landscapes(
+        &self,
+        names: &[String],
+    ) -> Result<HashMap<String, String>, sqlx::Error> {
+        if names.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let keys: Vec<String> = names.iter().map(|n| normalise_artist(n)).collect();
+        let placeholders = vec!["?"; keys.len()].join(",");
+        let sql = format!(
+            "SELECT name_key, landscape_url FROM artists
+              WHERE name_key IN ({placeholders}) AND landscape_url IS NOT NULL
+                AND TRIM(landscape_url) != ''"
+        );
+        let mut q = sqlx::query_as::<_, (String, String)>(&sql);
+        for k in &keys {
+            q = q.bind(k);
+        }
+        Ok(q.fetch_all(&self.pool).await?.into_iter().collect())
     }
 
     /// A hand-set cover for a release entity, if there is one.

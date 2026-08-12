@@ -213,7 +213,14 @@ export interface ReportPeriod {
 	albums: number;
 	tracks: number;
 	new_artists: number;
-	top_artist: { name: string; plays: number; hours: number } | null;
+	top_artist: {
+		name: string;
+		plays: number;
+		hours: number;
+		/** Set by hand on the artist page; absent for most, which is why the
+		 *  chapter card keeps its big initial as the design. */
+		landscape_url?: string | null;
+	} | null;
 	top_album: { name: string; artist: string; plays: number } | null;
 	top_track: { title: string; artist: string; plays: number } | null;
 	/** 24 counts, bucketed in your own timezone. */
@@ -695,6 +702,10 @@ export interface ArtistView {
 	/** Portrait: from the metadata chain, from the user's own library through
 	 *  the proxy, or set by hand. Null means the lettered tile. */
 	image_url: string | null;
+	/** The wide one, for tiles that give an artist the whole frame — the
+	 *  Reports chapter card. A different photograph from the portrait, never a
+	 *  crop of it, and only ever set by hand. */
+	landscape_url: string | null;
 	/** The `artists` row this name maps to — keyed by name and shared, unlike
 	 *  `id` which is this user's entity. Addresses the portrait proxy and the
 	 *  manual override. */
@@ -1533,6 +1544,17 @@ class TapedeckAPI {
 	/** Set or clear an artist portrait by hand. Empty clears it. */
 	async setArtistImage(artistRowId: number, url: string): Promise<{ image_url: string | null }> {
 		return this.request('PUT', `/api/v1/artists/img/${artistRowId}`, { url });
+	}
+	/** Set or clear an artist's **wide** image by hand. Empty clears it.
+	 *
+	 *  A different photograph from the portrait, not a crop of it: the Reports
+	 *  chapter tile is 16/11, where a square either pillarboxes or loses the
+	 *  head. Nothing supplies these automatically, so it is always a choice. */
+	async setArtistLandscape(
+		artistRowId: number,
+		url: string
+	): Promise<{ landscape_url: string | null }> {
+		return this.request('PUT', `/api/v1/artists/landscape/${artistRowId}`, { url });
 	}
 	/** Set or clear an album cover by hand — takes the *entity* id, the same one
 	 *  the album page is addressed by. Empty restores the cover derived from the

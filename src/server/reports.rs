@@ -618,6 +618,38 @@ async fn reports(
         }));
     }
 
+    // Wide images for the artists that head a chapter.
+    //
+    // One query for the whole page rather than one per card — a year view has
+    // twelve of them. Asked for *after* the periods are built, since only then
+    // is it known which artists actually won; the alternative is fetching an
+    // image for every artist in the history to use twelve.
+    //
+    // A missing one is normal and not a gap to fill: nothing Tapedeck can reach
+    // supplies a landscape, so it is there only if the user chose one. The card
+    // falls back to the initial, which is the design rather than a placeholder
+    // for a photo that never arrives.
+    let top_names: Vec<String> = periods
+        .iter()
+        .filter_map(|p| p.get("top_artist")?.get("name")?.as_str().map(str::to_string))
+        .collect();
+    let landscapes = state.db.artist_landscapes(&top_names).await.unwrap_or_default();
+    for p in &mut periods {
+        let Some(name) = p
+            .get("top_artist")
+            .and_then(|a| a.get("name"))
+            .and_then(|n| n.as_str())
+            .map(str::to_string)
+        else {
+            continue;
+        };
+        if let Some(url) = landscapes.get(&crate::db::normalise_artist(&name)) {
+            if let Some(a) = p.get_mut("top_artist").and_then(|a| a.as_object_mut()) {
+                a.insert("landscape_url".into(), serde_json::json!(url));
+            }
+        }
+    }
+
     (
         StatusCode::OK,
         Json(serde_json::json!({

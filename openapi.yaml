@@ -26,7 +26,7 @@ openapi: 3.1.0
 
 info:
   title: Tapedeck
-  version: 0.57.0
+  version: 0.58.0
   summary: Self-hosted scrobbler and listening journal.
   description: |
     Tapedeck ingests listens, enriches them with MusicBrainz metadata, stores
@@ -1707,6 +1707,38 @@ paths:
         '302': { description: Redirect to a public artwork URL. }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '404': { description: No artwork. The client falls back to a lettered tile. }
+
+  /api/v1/artists/landscape/{id}:
+    put:
+      tags: [Library]
+      summary: Set or clear an artist's wide image.
+      description: |
+        Session-only. Takes the **artist row id** (`artist_row_id` on the artist
+        page), not the entity id — the `artists` row is keyed by name and shared
+        across users, which is what the portrait proxy addresses too.
+
+        A different photograph from the portrait rather than a crop of it: the
+        Reports chapter tile is 16/11, where a square either pillarboxes or
+        crops the head off. Nothing Tapedeck can reach supplies a landscape, so
+        it is present only where the user chose one, and a chapter with none
+        keeps the enormous faint initial — that is the design, not a placeholder.
+
+        An empty string clears it.
+      parameters: [{ name: id, in: path, required: true, schema: { type: integer } }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [url]
+              properties:
+                url: { type: string, description: An http(s) image URL, or empty to clear. }
+      responses:
+        '200': { description: Saved., content: { application/json: { schema: { type: object, properties: { landscape_url: { type: string, nullable: true } } } } } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
 
   /api/v1/artists/img/{id}:
     get:

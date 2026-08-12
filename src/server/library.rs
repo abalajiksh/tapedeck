@@ -302,6 +302,15 @@ async fn artist_detail(
         .unwrap_or_default()
         .into_values()
         .next();
+    // The wide one, for the Reports chapter tile. Nothing supplies it
+    // automatically, so it is present only where the user chose one.
+    let landscape_url = state
+        .db
+        .artist_landscapes(std::slice::from_ref(&name))
+        .await
+        .unwrap_or_default()
+        .into_values()
+        .next();
     // The `artists` row is a different thing from this entity — it is keyed by
     // name and shared across users — and it is what the portrait proxy and the
     // manual override address. Created on demand so the override is always
@@ -358,6 +367,7 @@ async fn artist_detail(
             "name": name,
             "mbid": entity.mbid,
             "image_url": image_url,
+            "landscape_url": landscape_url,
             "artist_row_id": artist_row_id,
             "rank": rank,
             "artist_total": artist_total,

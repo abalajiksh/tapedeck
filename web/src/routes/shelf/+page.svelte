@@ -5,7 +5,7 @@
 		type PhysicalRelease, type PhysicalTrack, type ReleaseCandidate,
 		type PhysicalImage, type SignalChain, type Equipment, type Spin
 	} from '$lib/api';
-	import { formatDuration, formatDateTime, toDateInput, fromDateInput, ownedFor } from '$lib/utils';
+	import { formatDuration, formatDateTime, toDateInput, fromDateInput, ownedFor, formatHours } from '$lib/utils';
 	import CoverArt from '$lib/components/CoverArt.svelte';
 	import ChainIcon from '$lib/components/ChainIcon.svelte';
 
@@ -468,6 +468,25 @@
 		}
 		loading = false;
 	}
+
+	// ── What the shelf is wearing out ──
+	//
+	// A stylus is a consumable: it has a life measured in hours and it is the
+	// one part of a turntable you are expected to replace. Since v0.54.0 those
+	// hours are derived per *component* — a chain variant moves them onto the
+	// cartridge that was actually fitted — so the number is finally answerable,
+	// and the design file has always had a bar for it.
+	//
+	// Only wear items appear. A DAC does not wear out, and a row of gear that
+	// never needs replacing would bury the one thing that does.
+	const WEAR_TYPES = ['cartridge', 'headshell', 'turntable', 'tape-deck', 'transport'];
+	/** Rough service life in hours, for the ones with a published figure.
+	 *  Conservative on purpose — a bar that says "replace me" early is a
+	 *  nuisance, one that says it late has already damaged records. */
+	const WEAR_LIFE: Record<string, number> = { cartridge: 1000, headshell: 1000 };
+	$: wearItems = gear
+		.filter((g) => WEAR_TYPES.includes(g.equipment_type) && g.total_hours > 0)
+		.sort((a, b) => b.total_hours - a.total_hours);
 
 	async function loadGear() {
 		// Neither is fatal: a shelf with no chains configured still plays sides,
@@ -1087,6 +1106,35 @@
 	</div>
 {/if}
 
+<!-- The wear bar. A stylus is a consumable with a life in hours, and it is the
+     one part of the setup you are expected to replace — so the shelf says how
+     much is on it. Hidden entirely when there is nothing to wear out, rather
+     than showing an empty strip. -->
+{#if wearItems.length}
+	<div class="wear">
+		<span class="wearlabel">Hours on</span>
+		{#each wearItems as g (g.id)}
+			{@const life = WEAR_LIFE[g.equipment_type]}
+			{@const pct = life ? Math.min(100, (g.total_hours / life) * 100) : 0}
+			<a class="wearitem" href="/chains?gear={g.id}"
+				title={life
+					? `${g.name} — ${g.total_hours.toFixed(1)} of about ${life} hours`
+					: `${g.name} — ${g.total_hours.toFixed(1)} hours`}>
+				<span class="wearname">{g.name}</span>
+				<span class="wearhrs">{formatHours(g.total_hours)}</span>
+				{#if life}
+					<!-- Only where a service life is actually published. A bar with an
+					     invented denominator would be the grid-size mistake again:
+					     confident-looking and meaning nothing. -->
+					<span class="wearbar" aria-hidden="true">
+						<span class="wearfill" class:due={pct >= 90} style="width:{pct}%"></span>
+					</span>
+				{/if}
+			</a>
+		{/each}
+	</div>
+{/if}
+
 <div style="display:flex;gap:8px;margin:18px 0;flex-wrap:wrap;align-items:center;">
 	{#each ['all', 'vinyl', 'cassette', 'cd', 'sacd'] as f}
 		<button class="chip" class:on={filter === f} on:click={() => (filter = f as Filter)}>
@@ -1518,6 +1566,33 @@
 		font-size: 11px; color: var(--td-accent);
 		letter-spacing: .04em; white-space: nowrap;
 	}
+	.wear {
+		display: flex; align-items: center; gap: 14px; flex-wrap: wrap;
+		margin: 16px 0 0; padding: 11px 16px;
+		border: 1px solid var(--td-line); border-radius: 14px;
+		background: var(--td-panel);
+	}
+	.wearlabel {
+		font-size: 11px; letter-spacing: .14em; text-transform: uppercase;
+		color: var(--td-muted-2); font-weight: 600;
+	}
+	.wearitem {
+		display: inline-flex; align-items: center; gap: 8px;
+		color: inherit; text-decoration: none; font-size: 13px;
+	}
+	.wearitem:hover .wearname { color: var(--td-accent); }
+	.wearname { font-weight: 600; }
+	.wearhrs { color: var(--td-muted); font-variant-numeric: tabular-nums; }
+	.wearbar {
+		width: 54px; height: 5px; border-radius: 999px;
+		background: var(--td-track); overflow: hidden;
+	}
+	.wearfill {
+		display: block; height: 100%; border-radius: 999px;
+		background: linear-gradient(90deg, var(--td-accent-2), var(--td-accent));
+	}
+	/* Past ninety per cent of a published life, the bar stops being decorative. */
+	.wearfill.due { background: #b2622d; }
 	.clearq {
 		position: absolute; right: 8px; top: 50%; transform: translateY(-50%);
 		background: none; border: 0; cursor: pointer; font-size: 17px; line-height: 1;

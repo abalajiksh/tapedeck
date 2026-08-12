@@ -262,6 +262,40 @@ async fn set_artist_image(
     }
 }
 
+/// PUT /api/v1/artists/landscape/:id — set the **wide** image by hand.
+///
+/// A separate route rather than a field on the one above, because the two are
+/// set independently and from different places: a portrait usually arrives from
+/// the user's own library or a provider, while nothing Tapedeck can reach
+/// supplies a landscape — it is always chosen by hand. They are also different
+/// *photographs* rather than two crops, which is why there are two columns.
+///
+/// Used by a Reports chapter, which gives its top artist a whole tile; a square
+/// portrait there either pillarboxes or crops the head off, and the giant
+/// initial that stood in for it was a placeholder, not a design.
+async fn set_artist_landscape(
+    State(state): State<Arc<AppState>>,
+    user: AuthUser,
+    Path(id): Path<i64>,
+    Json(body): Json<ArtistImageUpdate>,
+) -> Response {
+    let _ = &user;
+    let Some(value) = validate_image_url(&body.url) else {
+        return not_an_image_url();
+    };
+    match state.db.set_artist_landscape(id, value).await {
+        Ok(true) => {
+            (StatusCode::OK, Json(serde_json::json!({ "landscape_url": value }))).into_response()
+        }
+        Ok(false) => not_found("No such artist"),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!(ErrorResponse { code: 500, error: e.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
 /// PUT /api/v1/albums/:id/cover — set the album's cover by hand.
 ///
 /// The counterpart of the artist override. Without it an album wears whatever
@@ -303,6 +337,7 @@ pub fn create_artwork_router() -> Router<Arc<AppState>> {
     Router::new()
         .route("/api/v1/art/:id", get(scrobble_art))
         .route("/api/v1/artists/img/:id", get(artist_image).put(set_artist_image))
+        .route("/api/v1/artists/landscape/:id", axum::routing::put(set_artist_landscape))
         .route("/api/v1/albums/:id/cover", put(set_album_cover))
 }
 

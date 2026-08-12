@@ -19,6 +19,22 @@
 	 *  Tracked rather than removing the node, so the edit control survives. */
 	let imgFailed = false;
 
+	let wideUrl = '';
+
+	async function saveWide(url: string) {
+		if (!artist?.artist_row_id) return;
+		picMsg = '';
+		try {
+			const r = await api.setArtistLandscape(artist.artist_row_id, url);
+			artist = { ...artist, landscape_url: r.landscape_url };
+			wideUrl = '';
+			picMsg = url ? 'Wide picture updated.' : 'Wide picture cleared.';
+			setTimeout(() => (picMsg = ''), 2500);
+		} catch (e) {
+			picMsg = String(e).replace(/^API \d+: /, '');
+		}
+	}
+
 	async function savePicture(url: string) {
 		if (!artist?.artist_row_id) return;
 		picMsg = '';
@@ -186,6 +202,26 @@
 				use <code>/api/v1/artists/img/{artist.artist_row_id}</code> — Tapedeck
 				fetches it server-side, since the browser can't reach your media server.
 			</p>
+
+			<!-- The wide one. Its own field rather than a crop of the portrait,
+			     because a 16/11 tile and a square photo are different pictures —
+			     cropping one to the other either pillarboxes or loses the head. -->
+			<div style="margin-top:16px;padding-top:14px;border-top:1px solid var(--td-line);">
+				<label for="wide" style="display:block;font-size:13px;margin-bottom:6px;">
+					Wide picture
+				</label>
+				<div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center;">
+					<input id="wide" class="input" style="flex:1;min-width:240px;" bind:value={wideUrl}
+						placeholder="https://… a landscape photo">
+					<button class="btn btn-primary" on:click={() => saveWide(wideUrl)}>Save</button>
+					<button class="btn btn-secondary" on:click={() => saveWide('')}>Clear</button>
+				</div>
+				<p style="font-size:12.5px;color:var(--td-muted);margin:10px 0 0;">
+					Used where an artist gets a whole tile — the top-artist card in a
+					Reports chapter. Nothing fetches these automatically, so a chapter
+					without one keeps the big initial.
+				</p>
+			</div>
 		</div>
 	{/if}
 	{#if picMsg}
