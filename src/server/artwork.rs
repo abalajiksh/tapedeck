@@ -29,7 +29,7 @@ use std::sync::Arc;
 use super::auth::AuthUser;
 use super::models::ErrorResponse;
 use super::AppState;
-use crate::sources::{JellyfinSource, NavidromeSource, PlexFilters, PlexSource};
+use crate::sources::{MediaBrowserSource, NavidromeSource, PlexFilters, PlexSource};
 
 fn not_found(msg: &str) -> Response {
     (StatusCode::NOT_FOUND, Json(serde_json::json!(ErrorResponse { code: 404, error: msg.into() })))
@@ -102,7 +102,7 @@ async fn scrobble_art(
             let Some(key) = source.credential("api_key") else {
                 return not_found("Jellyfin API key is missing");
             };
-            JellyfinSource::new(source.url.clone(), key, String::new())
+            MediaBrowserSource::jellyfin(source.url.clone(), key, String::new())
                 .fetch_cover_art(&item_id)
                 .await
         }
@@ -160,7 +160,7 @@ async fn artist_image_from_library(
             }
             "jellyfin" => {
                 let key = source.credential("api_key")?;
-                let jf = JellyfinSource::new(source.url.clone(), key, String::new());
+                let jf = MediaBrowserSource::jellyfin(source.url.clone(), key, String::new());
                 match jf.find_artist(name).await {
                     Ok(Some(id)) => jf.fetch_cover_art(&id).await.ok(),
                     _ => None,

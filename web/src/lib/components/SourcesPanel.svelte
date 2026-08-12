@@ -12,7 +12,11 @@
 	 * and leaving the field blank keeps it.
 	 */
 
-	type Kind = 'plex' | 'navidrome' | 'jellyfin';
+	type Kind = 'plex' | 'navidrome' | 'jellyfin' | 'emby' | 'roon';
+
+	/** Jellyfin and Emby are one protocol with a prefix on it, so every place
+	 *  that branches on "needs an API key and an account picker" means both. */
+	const isMediaBrowser = (k: string | undefined) => k === 'jellyfin' || k === 'emby';
 
 	const KINDS: { v: Kind; label: string; blurb: string }[] = [
 		{
@@ -29,6 +33,16 @@
 			v: 'jellyfin',
 			label: 'Jellyfin',
 			blurb: 'Watches your sessions and records what you finish. Mint a key under Dashboard → API Keys. Jellyfin keeps no play history, so listens start from when you connect.'
+		},
+		{
+			v: 'emby',
+			label: 'Emby',
+			blurb: 'The same protocol Jellyfin forked from, so it works the same way — mint a key under Dashboard → API Keys. Not yet tested against a real Emby server: if listens arrive without a codec or a signal chain, that is the reason.'
+		},
+		{
+			v: 'roon',
+			label: 'Roon',
+			blurb: 'Watches your Roon zones, which is the only way to see RAAT playback. Enter your Core’s address, then approve Tapedeck in Roon → Settings → Extensions. Roon’s API exposes no signal path and no MusicBrainz IDs, so these listens carry less detail than a Plex or Jellyfin one. Not yet tested against a real Core.'
 		}
 	];
 
@@ -105,7 +119,7 @@
 	function secretPayload(d: Draft) {
 		if (!d.secret.trim()) return {};
 		if (d.kind === 'plex') return { token: d.secret.trim() };
-		if (d.kind === 'jellyfin') return { api_key: d.secret.trim() };
+		if (isMediaBrowser(d.kind)) return { api_key: d.secret.trim() };
 		return { password: d.secret };
 	}
 
@@ -128,7 +142,7 @@
 			url: d.url.trim(),
 			...(d.kind === 'navidrome' ? { username: d.username.trim() } : {}),
 			...(d.kind === 'plex' && d.plexAccount.trim() ? { plex_account: d.plexAccount.trim() } : {}),
-			...(d.kind === 'jellyfin' && d.plexAccount.trim()
+			...(isMediaBrowser(d.kind) && d.plexAccount.trim()
 				? { jellyfin_account: d.plexAccount.trim() }
 				: {}),
 			...secretPayload(d),
@@ -185,7 +199,10 @@
 
 	const kindLabel = (k: string) => KINDS.find((x) => x.v === k)?.label ?? k;
 	const secretLabel = (k: Kind) =>
-		k === 'plex' ? 'X-Plex-Token' : k === 'jellyfin' ? 'API key' : 'Password';
+		k === 'plex' ? 'X-Plex-Token' : isMediaBrowser(k) ? 'API key' : 'Password';
+	/** Roon issues its own token once you approve the extension in Roon itself,
+	 *  so there is nothing for the user to paste. */
+	const needsSecret = (k: Kind) => k !== 'roon';
 
 	$: draftKind = draft?.kind;
 	$: draftBlurb = KINDS.find((k) => k.v === draftKind)?.blurb ?? '';
@@ -271,7 +288,7 @@
 				<div class="field" style="flex:2;min-width:220px;">
 					<label for="src-url">Server URL</label>
 					<input id="src-url" class="input" bind:value={draft.url}
-						placeholder={draft.kind === 'navidrome' ? 'http://192.168.1.10:4533' : draft.kind === 'jellyfin' ? 'http://192.168.1.10:8096' : 'http://192.168.1.10:32400'}>
+						placeholder={draft.kind === 'navidrome' ? 'http://192.168.1.10:4533' : isMediaBrowser(draft.kind) ? 'http://192.168.1.10:8096' : draft.kind === 'roon' ? '192.168.1.10:9330' : 'http://192.168.1.10:32400'}>
 				</div>
 			</div>
 
@@ -282,15 +299,25 @@
 						<input id="src-user" class="input" bind:value={draft.username} placeholder="ashwin">
 					</div>
 				{/if}
-				<div class="field" style="flex:1;min-width:180px;">
-					<label for="src-secret">
-						{secretLabel(draft.kind)}
-						{#if draft.hasSecret}<span style="color:var(--td-good-fg);">· stored</span>{/if}
-					</label>
-					<input id="src-secret" class="input" type="password" bind:value={draft.secret}
-						placeholder={draft.hasSecret ? 'Leave blank to keep' : `Your ${secretLabel(draft.kind)}`}>
-				</div>
+				{#if needsSecret(draft.kind)}
+					<div class="field" style="flex:1;min-width:180px;">
+						<label for="src-secret">
+							{secretLabel(draft.kind)}
+							{#if draft.hasSecret}<span style="color:var(--td-good-fg);">· stored</span>{/if}
+						</label>
+						<input id="src-secret" class="input" type="password" bind:value={draft.secret}
+							placeholder={draft.hasSecret ? 'Leave blank to keep' : `Your ${secretLabel(draft.kind)}`}>
+					</div>
+				{/if}
 			</div>
+
+				{#if draft.kind === 'roon'}
+					<p style="font-size:12.5px;color:var(--td-muted-2);margin:10px 0 0;">
+						Roon issues its own credential, so there is nothing to paste here. Save this,
+						then open <strong>Roon → Settings → Extensions</strong> and enable
+						<strong>Tapedeck</strong>. It connects by itself once you do — no restart.
+					</p>
+				{/if}
 
 			{#if draft.kind === 'navidrome'}
 				<p style="font-size:12.5px;color:var(--td-muted-2);margin:10px 0 0;">
@@ -334,7 +361,7 @@
 						{#if test.account_error}
 							<div style="color:#b2622d;margin-top:6px;">✗ Could not identify the account: {test.account_error}</div>
 						{/if}
-						{#if draft && (draft.kind === 'plex' || draft.kind === 'jellyfin') && test.accounts && (test.accounts.length > 1 || (draft.kind === 'jellyfin' && !test.account))}
+						{#if draft && (draft.kind === 'plex' || isMediaBrowser(draft.kind)) && test.accounts && (test.accounts.length > 1 || (isMediaBrowser(draft.kind) && !test.account))}
 							<div class="field" style="margin-top:12px;max-width:340px;">
 								<label for="f-plexacct">Scrobble which {kindLabel(draft.kind)} account?</label>
 								<select id="f-plexacct" class="input" bind:value={draft.plexAccount}>
@@ -344,9 +371,10 @@
 									{/each}
 								</select>
 								<p style="color:var(--td-muted);font-size:12px;margin-top:6px;">
-									{#if draft.kind === 'jellyfin' && !test.account}
-										A Jellyfin API key isn't tied to a user, so the server can't say whose
-										listens these are — pick the account to record.
+									{#if isMediaBrowser(draft.kind) && !test.account}
+										{kindLabel(draft.kind)} API keys minted in the dashboard aren't tied to a
+										user, so the server can't say whose listens these are — pick the account
+										to record.
 									{:else}
 										Only this account's sessions are recorded. Pick a different one when
 										the credential is the server owner's but the listening isn't.

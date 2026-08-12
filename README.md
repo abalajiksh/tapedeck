@@ -1,7 +1,7 @@
 # 📼 Tapedeck
 
 A self-hosted music intelligence hub written in Rust. Tapedeck ingests scrobble
-data from any source — Plex, Navidrome, Jellyfin, Pano Scrobbler, web browsers,
+data from any source — Plex, Navidrome, Jellyfin, Emby, Roon, Pano Scrobbler, web browsers,
 phones, DAPs — enriches it with MusicBrainz metadata and audio quality context,
 and stores a complete personal listening history with audiophile-grade analytics.
 
@@ -228,12 +228,45 @@ Tapedeck asks which timezone the device was set to rather than guessing. Assumin
 the server's zone would shift the whole device's history by the offset, and it
 can't be recovered afterwards.
 
-### Plex and Jellyfin
+### Plex, Jellyfin and Emby
 
-Both are polled directly — no webhooks, no Plex Pass — with accurate scrobble
+All three are polled directly — no webhooks, no Plex Pass — with accurate scrobble
 thresholds (50% played or 4 minutes) and live Now Playing on the dashboard.
 Jellyfin keeps no play history of its own, so its listens start from when you
-connect; Plex is the same.
+connect; Plex and Emby are the same.
+
+**Emby is untested.** Jellyfin is a 2018 fork of Emby, so they are one protocol
+with a `/emby/` prefix on it and Tapedeck drives both from one client. But Emby
+has developed independently for seven years, and this source has never run
+against a real Emby server — it is built from a working third-party reference
+and Emby's published API docs. The fields at risk fail *silently* rather than
+erroring: if Emby spells them differently you get listens with no codec, no
+device (and therefore no signal chain) and no MusicBrainz IDs, with nothing in
+the log to say so. If you run Emby, that is what to check first, and a captured
+`/emby/Sessions` response is what would close it for good.
+
+### Roon
+
+Roon is a source of its own rather than a network-streamer driver: one Core owns
+many zones, which makes it server-shaped like Plex. It is the only way to see
+**RAAT** playback, which no other protocol exposes.
+
+Two things to know before relying on it. **Roon's extension API carries no
+signal path** — the Lossless / High Quality / Enhanced verdict and every stage
+behind it stay inside Roon's own client, so those listens resolve their chain
+from the endpoint's default like any other. And it carries **no MusicBrainz IDs
+and no structured metadata**, only rendered display strings, so a Roon listen
+holds *less* detail than a Plex or Jellyfin one and pays for a metadata lookup
+it could have skipped. That is the opposite of what most people expect, and it
+is a limit of the API rather than something Tapedeck can work around.
+
+Setup has one step nothing else does: after saving the source, open **Roon →
+Settings → Extensions** and enable Tapedeck. Roon issues its own credential at
+that point, so there is nothing to paste; Tapedeck connects by itself once you
+approve, with no restart.
+
+**Roon is also untested** — built against the `roon-api` crate's declared types
+and Roon's own vendored API docs, never run against a real Core.
 
 **Sources belong to a user, not to the server.** Each person connects their own
 Plex token or Jellyfin API key in Settings → Sources; Tapedeck resolves it to a
@@ -537,7 +570,7 @@ Backfill your history from elsewhere and take it with you:
 
 - Rust toolchain (1.75+)
 - [Bun](https://bun.sh) (to build the embedded web UI)
-- A Plex, Navidrome or Jellyfin server (optional — the ingest API works standalone)
+- A Plex, Navidrome, Jellyfin, Emby or Roon server (optional — the ingest API works standalone)
 - A ListenBrainz / Last.fm / Libre.fm account (optional — connected per user in the UI)
 
 ### Build

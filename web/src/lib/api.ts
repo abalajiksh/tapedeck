@@ -33,7 +33,7 @@ export interface Scrobble {
 	chain_id: number | null;
 	listening_context: string | null;
 	submission_client: string | null;
-	/** Which code path produced it: Plex, jellyfin, navidrome, physical,
+	/** Which code path produced it: Plex, jellyfin, emby, navidrome, physical,
 	 *  rockbox, import, or `ingest:<client>`. */
 	source_name: string | null;
 	mbid_recording: string | null;

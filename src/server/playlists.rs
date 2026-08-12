@@ -41,7 +41,7 @@ use super::models::ErrorResponse;
 use super::AppState;
 use crate::db::UserSource;
 use crate::playlists::{self, PlaylistTarget, PlaylistTrack};
-use crate::sources::{JellyfinSource, NavidromeSource, PlexFilters, PlexSource};
+use crate::sources::{MediaBrowserSource, NavidromeSource, PlexFilters, PlexSource};
 
 /// How many tracks one push may carry.
 ///
@@ -89,7 +89,7 @@ fn build_target(source: &UserSource) -> Result<Box<dyn PlaylistTarget>, String> 
         }
         "jellyfin" => {
             let key = source.credential("api_key").ok_or("Jellyfin API key is missing")?;
-            Ok(Box::new(JellyfinSource::new(
+            Ok(Box::new(MediaBrowserSource::jellyfin(
                 source.url.clone(),
                 key,
                 source.remote_account.clone().unwrap_or_default(),

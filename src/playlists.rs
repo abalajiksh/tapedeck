@@ -188,7 +188,7 @@ impl PlaylistTarget for crate::sources::PlexSource {
 }
 
 #[async_trait]
-impl PlaylistTarget for crate::sources::JellyfinSource {
+impl PlaylistTarget for crate::sources::MediaBrowserSource {
     async fn search_tracks(&self, want: &PlaylistTrack) -> Result<Vec<Candidate>, String> {
         Self::search_tracks(self, &search_query(want)).await.map_err(|e| e.to_string())
     }

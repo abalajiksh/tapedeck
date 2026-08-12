@@ -31,11 +31,21 @@ use super::auth::AuthUser;
 use super::models::ErrorResponse;
 use super::AppState;
 use crate::db::UserSource;
-use crate::sources::{JellyfinSource, NavidromeSource, PlexFilters, PlexSource};
+use crate::sources::{Flavour, MediaBrowserSource, NavidromeSource, PlexFilters, PlexSource};
+
+/// Jellyfin and Emby are one protocol with a prefix on it, so the two kinds
+/// share every code path here and differ only by this.
+fn media_browser_flavour(kind: &str) -> Option<Flavour> {
+    match kind {
+        "jellyfin" => Some(Flavour::Jellyfin),
+        "emby" => Some(Flavour::Emby),
+        _ => None,
+    }
+}
 
 /// Kinds we can actually build. Kept explicit so a typo'd path can't create a
 /// row the engine will never poll.
-const KINDS: [&str; 3] = ["plex", "navidrome", "jellyfin"];
+const KINDS: [&str; 5] = ["plex", "navidrome", "jellyfin", "emby", "roon"];
 
 fn err(code: u16, msg: impl Into<String>) -> axum::response::Response {
     let status = StatusCode::from_u16(code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
@@ -159,7 +169,8 @@ async fn resolve_save(
     let complete = match kind {
         "plex" => !url.is_empty() && !token.is_empty(),
         "navidrome" => !url.is_empty() && !nd_user.is_empty() && !nd_pass.is_empty(),
-        "jellyfin" => !url.is_empty() && !jf_key.is_empty(),
+        "jellyfin" | "emby" => !url.is_empty() && !jf_key.is_empty(),
+        "roon" => !url.is_empty(),
         _ => false,
     };
     if enabled && !complete {
@@ -170,6 +181,8 @@ async fn resolve_save(
                     "A server URL, username and password are required to enable Navidrome"
                 }
                 "jellyfin" => "A server URL and API key are required to enable Jellyfin",
+                "emby" => "A server URL and API key are required to enable Emby",
+                "roon" => "The address of your Roon Core is required to enable Roon",
                 _ => "A server URL and token are required to enable Plex",
             },
         ));
@@ -237,7 +250,10 @@ async fn resolve_save(
                 serde_json::json!({ "token": token }).to_string()
             }
         }
-        "jellyfin" => {
+        k @ ("jellyfin" | "emby") => {
+            // Unwrap is safe: the arm pattern is the same set the helper knows.
+            let flavour = media_browser_flavour(k).expect("arm matches the flavour map");
+            let label = flavour.label();
             let changed = current.map(|c| c.url != url).unwrap_or(true)
                 || current.and_then(|c| c.credential("api_key")).as_deref()
                     != Some(jf_key.as_str())
@@ -245,7 +261,7 @@ async fn resolve_save(
             let chosen = body.jellyfin_account.take().filter(|a| !a.trim().is_empty());
             if let Some(chosen) = chosen {
                 if complete {
-                    match JellyfinSource::list_accounts(&url, &jf_key).await {
+                    match MediaBrowserSource::list_accounts(flavour, &url, &jf_key).await {
                         Ok(accounts) => match accounts
                             .iter()
                             .find(|a| a.name.eq_ignore_ascii_case(chosen.trim()))
@@ -256,7 +272,7 @@ async fn resolve_save(
                                 return Err(err(
                                     400,
                                     format!(
-                                        "No Jellyfin account called \"{}\" on that server. \
+                                        "No {label} account called \"{}\" on that server. \
                                          Tapedeck would scrobble nothing.",
                                         chosen.trim()
                                     ),
@@ -264,18 +280,18 @@ async fn resolve_save(
                             }
                         },
                         Err(e) => {
-                            return Err(err(400, format!("Could not list Jellyfin accounts: {e}")))
+                            return Err(err(400, format!("Could not list {label} accounts: {e}")))
                         }
                     }
                 }
             } else if complete && changed {
-                match JellyfinSource::resolve_account(&url, &jf_key).await {
+                match MediaBrowserSource::resolve_account(flavour, &url, &jf_key).await {
                     Ok(name) => remote_account = Some(name),
                     Err(e) => {
                         return Err(err(
                             400,
                             format!(
-                                "Could not confirm which Jellyfin account that key belongs to: {e}"
+                                "Could not confirm which {label} account that key belongs to: {e}"
                             ),
                         ))
                     }
@@ -287,6 +303,12 @@ async fn resolve_save(
                 serde_json::json!({ "api_key": jf_key }).to_string()
             }
         }
+        // Roon issues its own credential, and only after the user approves
+        // the extension in Roon Settings → Extensions. So there is nothing to
+        // validate here and nothing to store yet: the engine writes the pairing
+        // token back itself once the handshake succeeds. Whatever is already
+        // stored is preserved — clearing it would un-pair a working source.
+        "roon" => current.map(|c| c.credentials.clone()).unwrap_or_default(),
         _ => {
             if complete && enabled {
                 let mut probe = NavidromeSource::new(url.clone(), nd_user.clone(), nd_pass.clone());
@@ -483,15 +505,17 @@ async fn test_source(
     };
 
     match kind.as_str() {
-        "jellyfin" => {
+        k @ ("jellyfin" | "emby") => {
+            let flavour = media_browser_flavour(k).expect("arm matches the flavour map");
             let key = cred(body.api_key.clone(), "api_key");
             if url.is_empty() || key.is_empty() {
                 return err(400, "Enter a server URL and API key first");
             }
             // Listed first: with a dashboard API key `resolve_account` cannot
             // answer on its own, and the list is what the picker needs anyway.
-            let accounts = JellyfinSource::list_accounts(&url, &key).await.unwrap_or_default();
-            match JellyfinSource::resolve_account(&url, &key).await {
+            let accounts =
+                MediaBrowserSource::list_accounts(flavour, &url, &key).await.unwrap_or_default();
+            match MediaBrowserSource::resolve_account(flavour, &url, &key).await {
                 Ok(name) => (
                     StatusCode::OK,
                     Json(serde_json::json!({

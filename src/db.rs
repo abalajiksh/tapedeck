@@ -7177,6 +7177,59 @@ impl Database {
         Ok(())
     }
 
+    /// Merge one key into a source's sealed credential blob, leaving the rest
+    /// alone.
+    ///
+    /// Exists for credentials the *remote* issues rather than the user: Roon
+    /// hands back a pairing token when the extension is approved, and may
+    /// reissue it, so the engine has to write one back mid-poll. Everything
+    /// else in `user_sources.credentials` is typed by a person into a form and
+    /// goes through `update_source`.
+    ///
+    /// **`updated_at` is deliberately untouched**, for the same reason
+    /// `record_source_poll` leaves it alone: it is the change stamp
+    /// `reconcile_sources` watches, so bumping it here would make the engine
+    /// tear down and rebuild the source — re-running the Roon handshake — on
+    /// every tick that persisted a token.
+    pub async fn set_source_credential(
+        &self,
+        id: i64,
+        key: &str,
+        value: &str,
+    ) -> Result<(), sqlx::Error> {
+        let stored: Option<String> =
+            sqlx::query_scalar("SELECT credentials FROM user_sources WHERE id = ?")
+                .bind(id)
+                .fetch_optional(&self.pool)
+                .await?
+                .flatten();
+
+        let plain = match stored {
+            Some(s) if !s.is_empty() => self.unseal(&s).unwrap_or_default(),
+            _ => String::new(),
+        };
+        let mut bag: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_str(&plain).unwrap_or_default();
+        bag.insert(key.to_string(), serde_json::Value::String(value.to_string()));
+
+        let sealed = self.seal(&serde_json::Value::Object(bag).to_string());
+        // `seal` returns empty rather than plaintext when encryption fails.
+        // Writing that would silently wipe the source's other credentials, so
+        // the write is skipped and the in-memory token stays usable until the
+        // next restart.
+        if sealed.is_empty() {
+            return Err(sqlx::Error::Protocol(
+                "refusing to store an unencryptable credential".into(),
+            ));
+        }
+        sqlx::query("UPDATE user_sources SET credentials = ? WHERE id = ?")
+            .bind(sealed)
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
     // ════════════════════════════════════════════════════════════
     //  Plex source settings (legacy server-wide row, migrated away)
     // ════════════════════════════════════════════════════════════

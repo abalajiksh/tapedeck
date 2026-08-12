@@ -17,12 +17,12 @@
 	export let client: string | null = null;
 	export let size = 15;
 
-	// `source_name` is one of: Plex, jellyfin, navidrome, physical, rockbox,
-	// import, spotify, or `ingest:<client>`.
+	// `source_name` is one of: Plex, jellyfin, emby, roon, navidrome, physical,
+	// rockbox, import, spotify, or `ingest:<client>`.
 	$: key = (source ?? '').toLowerCase();
 	$: kind = key.startsWith('ingest:')
 		? 'push'
-		: ['plex', 'jellyfin', 'navidrome', 'physical', 'rockbox', 'import', 'spotify'].includes(key)
+		: ['plex', 'jellyfin', 'emby', 'roon', 'navidrome', 'physical', 'rockbox', 'import', 'spotify'].includes(key)
 			? key
 			: 'unknown';
 
@@ -41,7 +41,7 @@
 								? (source ?? 'Unknown source')
 								: key.charAt(0).toUpperCase() + key.slice(1);
 
-	const LETTER: Record<string, string> = { plex: 'P', jellyfin: 'J', navidrome: 'N' };
+	const LETTER: Record<string, string> = { plex: 'P', jellyfin: 'J', emby: 'E', navidrome: 'N', roon: 'R' };
 </script>
 
 <span class="si" title={label} aria-label={label} role="img" style="width:{size}px;height:{size}px;">

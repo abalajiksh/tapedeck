@@ -9,7 +9,9 @@ use crate::models::ListenDisposition;
 use crate::musicbrainz::MusicBrainzClient;
 use crate::server::now_playing::{NowPlaying, NowPlayingRegistry};
 use crate::sinks;
-use crate::sources::{JellyfinSource, MusicSource, NavidromeSource, PlexFilters, PlexSource};
+use crate::sources::{
+    MediaBrowserSource, MusicSource, NavidromeSource, PlexFilters, PlexSource, RoonSource,
+};
 
 use super::enrichment::enrich_play;
 
@@ -33,6 +35,15 @@ pub struct ScrobbleEngine {
     /// Artwork lookup chain, cheapest first. Built once — each provider holds a
     /// pooled HTTP client.
     artwork_providers: Vec<Box<dyn crate::metadata::ArtworkProvider>>,
+    /// Rung by a push-shaped source that has something new to say, so the tick
+    /// happens sooner than the interval.
+    ///
+    /// Only Roon uses it today. It is engine-level rather than Roon-specific
+    /// because the *state* still comes from a poll — the bell only shortens the
+    /// wait, so any future push source gets the same benefit without a second
+    /// mechanism. A missed notify costs latency and nothing else, which is what
+    /// makes it safe to treat as a hint.
+    wake: Arc<tokio::sync::Notify>,
 }
 
 /// A built, polling source and the bookkeeping the engine needs around it.
@@ -65,7 +76,7 @@ struct ActiveSource {
 /// user who wants it snappier can raise it per source in the UI.
 fn default_interval_secs(kind: &str) -> i64 {
     match kind {
-        "plex" | "jellyfin" => 5,
+        "plex" | "jellyfin" | "emby" | "roon" => 5,
         _ => 30,
     }
 }
@@ -83,6 +94,8 @@ fn source_label(kind: &str) -> &'static str {
         "plex" => "Plex",
         "navidrome" => "Navidrome",
         "jellyfin" => "Jellyfin",
+        "emby" => "Emby",
+        "roon" => "Roon",
         _ => "unknown",
     }
 }
@@ -107,6 +120,7 @@ impl ScrobbleEngine {
             now_playing,
             listenbrainz_url,
             artwork_providers: vec![Box::new(crate::metadata::deezer::DeezerProvider::new())],
+            wake: Arc::new(tokio::sync::Notify::new()),
         }
     }
 
@@ -232,15 +246,52 @@ impl ScrobbleEngine {
                 }
                 Ok(Box::new(nd))
             }
-            "jellyfin" => {
-                let key = cfg.credential("api_key").ok_or("no Jellyfin API key stored")?;
-                let account = cfg
-                    .remote_account
-                    .clone()
-                    .ok_or("Jellyfin account not resolved — reconnect the source")?;
-                let mut jf = JellyfinSource::new(cfg.url.clone(), key, account);
-                jf.initialize().await?;
-                Ok(Box::new(jf))
+            // One protocol with a prefix on it — see `sources::mediabrowser`.
+            // The account filter is the whole of the isolation for both: a
+            // shared server must not leak one housemate's listens onto another.
+            kind @ ("jellyfin" | "emby") => {
+                let emby = kind == "emby";
+                let label = if emby { "Emby" } else { "Jellyfin" };
+                let key = cfg
+                    .credential("api_key")
+                    .ok_or_else(|| format!("no {label} API key stored"))?;
+                let account = cfg.remote_account.clone().ok_or_else(|| {
+                    format!("{label} account not resolved — reconnect the source")
+                })?;
+                let mut mb = if emby {
+                    MediaBrowserSource::emby(cfg.url.clone(), key, account)
+                } else {
+                    MediaBrowserSource::jellyfin(cfg.url.clone(), key, account)
+                };
+                mb.initialize().await?;
+                Ok(Box::new(mb))
+            }
+            "roon" => {
+                // No URL to type — SOOD finds the Core — but a host may be set
+                // when discovery is blocked across subnets, which is common
+                // enough on a VLANed home network to be worth allowing.
+                let host = if cfg.url.trim().is_empty() {
+                    return Err("no Roon Core address — discovery is not wired yet".into());
+                } else {
+                    cfg.url.trim().trim_start_matches("http://").to_string()
+                };
+                let (host, port) = match host.rsplit_once(':') {
+                    Some((h, p)) => (h.to_string(), p.parse::<u16>().ok()),
+                    None => (host, None),
+                };
+                let mut roon = crate::sources::RoonSource::new(
+                    host,
+                    port,
+                    cfg.credential("pairing").as_deref(),
+                    cfg.option_list("zones_allow"),
+                    self.wake.clone(),
+                )?;
+                // A first run legitimately fails here: Roon will not talk to an
+                // extension the user has not approved in Settings → Extensions.
+                // The engine retries every tick, so approval is picked up
+                // without anyone restarting anything.
+                roon.initialize().await?;
+                Ok(Box::new(roon))
             }
             other => Err(format!("unknown source kind: {other}").into()),
         }
@@ -277,8 +328,13 @@ impl ScrobbleEngine {
                 break;
             }
 
+            // The bell only ever shortens this wait. A source that rings it
+            // still has its state read by the ordinary poll on the next tick,
+            // so a dropped or spurious notify is a latency change and never a
+            // correctness one.
             tokio::select! {
                 _ = sleep(self.poll_interval) => {}
+                _ = self.wake.notified() => {}
                 _ = shutdown.changed() => {}
             }
         }
@@ -399,10 +455,16 @@ impl ScrobbleEngine {
         }
     }
 
-    /// Poll one Jellyfin source. Session-shaped like Plex — there is no history
-    /// endpoint to backfill from, so everything comes from what's playing now.
+    /// Poll one Jellyfin **or Emby** source — they are one protocol, so one
+    /// poller. Session-shaped like Plex: neither records listens natively, so
+    /// there is no history endpoint to backfill from and everything comes from
+    /// what is playing now.
+    ///
+    /// The label is read off the source's own flavour rather than hardcoded, so
+    /// the now-playing registry key and every log line name the server actually
+    /// being polled — otherwise an Emby tick would clear a Jellyfin deck entry.
     #[allow(clippy::too_many_arguments)]
-    async fn poll_jellyfin(
+    async fn poll_media_browser(
         &mut self,
         i: usize,
         db: &Arc<Database>,
@@ -411,14 +473,16 @@ impl ScrobbleEngine {
         now_playing: &NowPlayingRegistry,
     ) {
         let (row_id, user_id) = (self.sources[i].row_id, self.sources[i].user_id);
-        let Some(jf) = self.sources[i].source.as_any_mut().downcast_mut::<JellyfinSource>() else {
+        let Some(jf) = self.sources[i].source.as_any_mut().downcast_mut::<MediaBrowserSource>()
+        else {
             return;
         };
+        let label = jf.flavour().label();
 
         let sessions = match jf.fetch_sessions().await {
             Ok(s) => {
                 if self.sources[i].error_logged {
-                    info!("✅ Jellyfin recovered for user {}", user_id);
+                    info!("✅ {} recovered for user {}", label, user_id);
                     self.sources[i].error_logged = false;
                 }
                 let _ = db.record_source_poll(row_id, None).await;
@@ -427,10 +491,10 @@ impl ScrobbleEngine {
             Err(e) => {
                 let msg = e.to_string();
                 if !self.sources[i].error_logged {
-                    error!("Jellyfin fetch failed for user {}: {}", user_id, msg);
+                    error!("{} fetch failed for user {}: {}", label, user_id, msg);
                     self.sources[i].error_logged = true;
                 } else {
-                    debug!("Jellyfin still failing for user {}: {}", user_id, msg);
+                    debug!("{} still failing for user {}: {}", label, user_id, msg);
                 }
                 let _ = db.record_source_poll(row_id, Some(&msg)).await;
                 return;
@@ -438,14 +502,14 @@ impl ScrobbleEngine {
         };
 
         if sessions.now_playing.is_empty() {
-            now_playing.clear_user_source(user_id, "Jellyfin");
+            now_playing.clear_user_source(user_id, label);
         }
 
         for track in &sessions.now_playing {
             let mut play = track.play.clone();
             let changed = now_playing.set(
                 user_id,
-                NowPlaying::from_play(&play, "Jellyfin", track.quality.as_ref(), track.position),
+                NowPlaying::from_play(&play, label, track.quality.as_ref(), track.position),
             );
             if changed {
                 if play.mbid_recording.is_none() {
@@ -491,7 +555,7 @@ impl ScrobbleEngine {
                         (Some(dev), chain)
                     }
                     Err(e) => {
-                        warn!("Could not record Jellyfin client as a device: {}", e);
+                        warn!("Could not record {} client as a device: {}", label, e);
                         (None, None)
                     }
                 },
@@ -517,7 +581,7 @@ impl ScrobbleEngine {
                     chain_id,
                     None,
                     listening_context.as_deref(),
-                    Some("Jellyfin"),
+                    Some(label),
                     Some(row_id),
                     ListenDisposition::LIVE,
                 )
@@ -525,6 +589,160 @@ impl ScrobbleEngine {
             {
                 Ok(true) => {
                     info!("📥 Queued for user {}: {} - {}", user_id, play.artist, play.title)
+                }
+                Ok(false) => {}
+                Err(e) => error!("Database error: {}", e),
+            }
+        }
+    }
+
+    /// Poll one Roon source.
+    ///
+    /// Session-shaped like Plex, Jellyfin and Emby — Roon's transport API has
+    /// no history — but with two differences worth knowing:
+    ///
+    /// * **The pairing token can change under us.** Roon issues one when the
+    ///   user approves the extension, and may reissue it. It is written back
+    ///   only when it actually changed, so this is not a row rewrite every
+    ///   tick.
+    /// * **A Roon listen has no MBIDs at all**, so enrichment always runs. That
+    ///   is the honest cost of the source, not something to work around.
+    #[allow(clippy::too_many_arguments)]
+    async fn poll_roon(
+        &mut self,
+        i: usize,
+        db: &Arc<Database>,
+        mb_client: &Arc<MusicBrainzClient>,
+        lb_url: &str,
+        now_playing: &NowPlayingRegistry,
+    ) {
+        let (row_id, user_id) = (self.sources[i].row_id, self.sources[i].user_id);
+        let Some(roon) = self.sources[i].source.as_any_mut().downcast_mut::<RoonSource>() else {
+            return;
+        };
+
+        let zones = match roon.fetch_zones().await {
+            Ok(z) => {
+                if self.sources[i].error_logged {
+                    info!("✅ Roon recovered for user {}", user_id);
+                    self.sources[i].error_logged = false;
+                }
+                let _ = db.record_source_poll(row_id, None).await;
+                z
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                if !self.sources[i].error_logged {
+                    error!("Roon fetch failed for user {}: {}", user_id, msg);
+                    self.sources[i].error_logged = true;
+                } else {
+                    debug!("Roon still failing for user {}: {}", user_id, msg);
+                }
+                let _ = db.record_source_poll(row_id, Some(&msg)).await;
+                return;
+            }
+        };
+
+        // Only when Roon actually issued a new one — see `take_if_changed`.
+        if let Some(state) = self.sources[i]
+            .source
+            .as_any_mut()
+            .downcast_mut::<RoonSource>()
+            .and_then(|r| r.take_pairing_state())
+        {
+            if let Err(e) = db.set_source_credential(row_id, "pairing", &state).await {
+                warn!("Could not persist the Roon pairing token: {}", e);
+            }
+        }
+
+        if zones.now_playing.is_empty() {
+            now_playing.clear_user_source(user_id, "Roon");
+        }
+
+        for track in &zones.now_playing {
+            let mut play = track.play.clone();
+            let changed = now_playing
+                .set(user_id, NowPlaying::from_play(&play, "Roon", None, track.position));
+            if changed {
+                if play.mbid_recording.is_none() {
+                    let album = play.album.clone();
+                    enrich_play(mb_client, &mut play, album.as_deref()).await;
+                }
+                let sinks = sinks::sinks_for_user(db, user_id, lb_url).await;
+                sinks::submit_now_playing(&sinks, &play).await;
+            }
+        }
+
+        for track in zones.ready_to_scrobble {
+            // A Core has several zones and the listen only says which endpoint
+            // it went to, so the zone is what makes a log line locatable.
+            let zone_id = track.zone_id;
+            let mut play = track.play;
+            let dupe =
+                db.exists(user_id, &play.source_id, &play.source_name).await.unwrap_or(false)
+                    || db.fuzzy_exists(user_id, &play).await.unwrap_or(false);
+            if dupe {
+                continue;
+            }
+            if play.mbid_recording.is_none() {
+                let album = play.album.clone();
+                enrich_play(mb_client, &mut play, album.as_deref()).await;
+            }
+
+            // The zone's output is the device, which is the only rung of the
+            // chain ladder a Roon listen can reach — there is no token and no
+            // signal path. Without it every Roon listen would land with no
+            // chain, the bug Plex had before v0.22.0.
+            let (device_id, chain_id) = match &track.output {
+                Some(o) => match db
+                    .upsert_device(user_id, &o.machine_id, o.name.as_deref(), None, Some("Roon"))
+                    .await
+                {
+                    Ok(dev) => {
+                        let chain = db.get_device_default_chain(user_id, dev).await.ok().flatten();
+                        (Some(dev), chain)
+                    }
+                    Err(e) => {
+                        warn!("Could not record the Roon endpoint as a device: {}", e);
+                        (None, None)
+                    }
+                },
+                None => (None, None),
+            };
+
+            let listening_context = match chain_id {
+                Some(cid) => db
+                    .get_chain(user_id, cid)
+                    .await
+                    .ok()
+                    .flatten()
+                    .map(|c| c.listening_context.as_str().to_string()),
+                None => None,
+            };
+
+            match db
+                .save_scrobble(
+                    user_id,
+                    &play,
+                    // Roon reports no format, sample rate or bit depth — the
+                    // signal path is a client feature and is not in the API.
+                    // Better unset than asserted on no evidence.
+                    None,
+                    device_id,
+                    chain_id,
+                    None,
+                    listening_context.as_deref(),
+                    Some("Roon"),
+                    Some(row_id),
+                    ListenDisposition::LIVE,
+                )
+                .await
+            {
+                Ok(true) => {
+                    info!(
+                        "📥 Queued for user {} from Roon zone {}: {} - {}",
+                        user_id, zone_id, play.artist, play.title
+                    )
                 }
                 Ok(false) => {}
                 Err(e) => error!("Database error: {}", e),
@@ -542,19 +760,27 @@ impl ScrobbleEngine {
         let now = now_secs();
 
         for i in 0..self.sources.len() {
-            if self.sources[i].next_poll_at > now {
+            // A push-shaped source that has been told something changed is
+            // polled now; everything else waits for its interval. `take_wakeup`
+            // consumes the flag, so one notification cannot poll forever.
+            let rung = self.sources[i].source.take_wakeup();
+            if self.sources[i].next_poll_at > now && !rung {
                 continue;
             }
             self.sources[i].next_poll_at = now + self.sources[i].poll_interval;
 
             let (row_id, user_id) = (self.sources[i].row_id, self.sources[i].user_id);
 
-            if self.sources[i].kind == "jellyfin" {
-                self.poll_jellyfin(i, &db, &mb_client, &lb_url, &now_playing).await;
+            if matches!(self.sources[i].kind.as_str(), "jellyfin" | "emby") {
+                self.poll_media_browser(i, &db, &mb_client, &lb_url, &now_playing).await;
                 continue;
             }
             if self.sources[i].kind == "navidrome" {
                 self.poll_navidrome(i, &db, &mb_client, &lb_url, &now_playing).await;
+                continue;
+            }
+            if self.sources[i].kind == "roon" {
+                self.poll_roon(i, &db, &mb_client, &lb_url, &now_playing).await;
                 continue;
             }
 
@@ -828,7 +1054,7 @@ impl ScrobbleEngine {
                 }
                 "jellyfin" => {
                     let Some(key) = source.credential("api_key") else { continue };
-                    let jf = JellyfinSource::new(source.url.clone(), key, String::new());
+                    let jf = MediaBrowserSource::jellyfin(source.url.clone(), key, String::new());
                     if matches!(jf.find_artist(name).await, Ok(Some(_))) {
                         return true;
                     }
