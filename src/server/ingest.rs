@@ -10,7 +10,7 @@ use tracing::{debug, error, info, warn};
 
 use super::auth::IngestAuth;
 use super::models::*;
-use super::now_playing::NowPlaying;
+use super::now_playing::{NowPlaying, Progress};
 use super::AppState;
 use crate::engine::enrichment::enrich_play;
 use crate::models::{AudioQuality, ListenDisposition, Play};
@@ -133,6 +133,36 @@ fn import_is_live(listen_type: &ListenType, timestamp: i64, now: i64, token_is_l
 
 /// Accepts `1`, `true`, `yes`, and a bare `?dry_run` — a plugin author trying
 /// this by hand shouldn't have to guess which spelling we wanted.
+/// Everyone a submission credits, or `None` when it names only one.
+///
+/// Two sources, and the order matters. `additional_info.artist_names` is
+/// ListenBrainz's own structured field and is believed outright. Failing that,
+/// a **semicolon-separated** `artist_name` is unpacked: `;` is the multi-value
+/// separator in Vorbis comments and ID3, it is the separator Tapedeck's own
+/// `artist_credit` already uses, and it is what a tagged classical library
+/// actually contains — "Bach; Hilary Hahn".
+///
+/// Nothing else is split, and that restraint is the whole safety of it. `&` and
+/// `,` appear inside real names — "Simon & Garfunkel", "Earth, Wind & Fire" —
+/// so splitting on them would invent artists who do not exist and scatter one
+/// band's listening across three chart rows. The sanitiser refuses to touch
+/// those forms for exactly the same reason.
+fn submitted_artists(artist_name: &str, info: Option<&AdditionalInfo>) -> Option<Vec<String>> {
+    if let Some(names) = info.and_then(|i| i.artist_names.as_ref()) {
+        let cleaned: Vec<String> =
+            names.iter().map(|n| n.trim().to_string()).filter(|n| !n.is_empty()).collect();
+        if cleaned.len() > 1 {
+            return Some(cleaned);
+        }
+    }
+
+    let split: Vec<String> =
+        artist_name.split(';').map(|n| n.trim().to_string()).filter(|n| !n.is_empty()).collect();
+    // One name is not a credit list. Leaving it `None` keeps `artist_credit`
+    // unwritten, which is the existing rule for a single-artist listen.
+    (split.len() > 1).then_some(split)
+}
+
 fn truthy(v: &Option<String>) -> bool {
     match v {
         Some(s) => {
@@ -264,7 +294,7 @@ pub async fn submit_listens(
             mbid_recording,
             mbid_release,
             mbid_artist,
-            artists: None,
+            artists: submitted_artists(&meta.artist_name, info_ref),
             mbid_release_group,
             caa_id,
             caa_release_mbid,
@@ -443,7 +473,13 @@ pub async fn submit_listens(
                 // Feed the deck. Clients submit `playing_now` at track start
                 // and carry no position, so we start at 0 and let the registry
                 // extrapolate from `duration`.
-                let mut np = NowPlaying::from_play(&play, "ingest", quality_opt, 0);
+                // `playing_now` carries no position and never will — the
+                // ListenBrainz submission format has no field for one. So this
+                // is wall-clock from the moment the client told us, which is
+                // right until the listener pauses or seeks and wrong from then
+                // on. It is marked as an estimate rather than dressed up as a
+                // playhead; the deck draws the difference.
+                let mut np = NowPlaying::from_play(&play, "ingest", quality_opt, Progress::Unknown);
                 np.listening_context = listening_context.clone();
                 state.now_playing.set(user.user_id, np);
 

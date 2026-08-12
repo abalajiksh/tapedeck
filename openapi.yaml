@@ -26,7 +26,7 @@ openapi: 3.1.0
 
 info:
   title: Tapedeck
-  version: 0.60.0
+  version: 0.61.0
   summary: Self-hosted scrobbler and listening journal.
   description: |
     Tapedeck ingests listens, enriches them with MusicBrainz metadata, stores
@@ -448,21 +448,51 @@ components:
         empty deck until a source reports again.
       properties:
         playing: { type: boolean }
-        position: { type: [integer, 'null'], description: Seconds into the track. }
+        position:
+          type: [integer, 'null']
+          description: |
+            Seconds into the track. Read `track.position_known` before
+            presenting this as a readout — for a source with no playhead it is
+            the server's own wall-clock arithmetic, not a measurement.
         track:
           oneOf:
             - $ref: '#/components/schemas/Listen'
             - type: 'null'
+          description: |
+            Carries the `Listen` quality fields plus `progress`, `updated_at`,
+            `source`, `listening_context` and `position_known`. The last of
+            those is **false** when nothing reported a playhead: a ListenBrainz
+            `playing_now` has no position field in the format, and Subsonic's
+            `getNowPlaying` answers `minutesAgo`. Plex, Jellyfin, Emby, Roon and
+            the shelf all report a real one.
 
     Note:
       type: object
       description: |
-        A liner note. Hangs off **either** an entity **or** a listen, never
-        both — a CHECK constraint enforces it.
+        A liner note. Hangs off **exactly one** of an entity, a listen, or a
+        report period — a CHECK constraint enforces it.
+
+        The three answer different questions: what you think of a record, what
+        one particular playing of it was like, and what a week or a month of
+        listening was like.
+
+        A period target is a `<unit>:<key>` string using the same key the
+        Reports page names its own periods with (`month:2026-08`,
+        `week:2026-W32`, `year:2026`). It is text rather than a foreign key
+        because a period is not a row anywhere — reports are folded out of the
+        history on every request. Report weeks deliberately ignore the user's
+        week-start preference, which is what makes the key stable enough to
+        write a note against.
       properties:
         id: { type: integer }
         entity_id: { type: [integer, 'null'] }
         scrobble_id: { type: [integer, 'null'] }
+        period:
+          type: [object, 'null']
+          description: Echoed back split, since naming a period needs its unit.
+          properties:
+            unit: { type: string, enum: [week, month, year] }
+            key: { type: string, description: '`2026`, `2026-08` or `2026-W32`.' }
         body: { type: string, description: Markdown, as stored. }
         body_html:
           type: string
@@ -1617,6 +1647,58 @@ paths:
         '401': { $ref: '#/components/responses/Unauthorized' }
         '404': { $ref: '#/components/responses/NotFound' }
 
+  /api/v1/albums/{id}/tracklist:
+    get:
+      tags: [Library]
+      summary: The record's own tracklist, including tracks never played.
+      description: |
+        Session-only. Everything else on the album page is aggregated from
+        listens, so a record played twice renders as a two-track record. This
+        asks MusicBrainz what is actually on it.
+
+        **Nothing is stored.** The caller matches these against the plays it
+        already holds; writing a tracklist into `scrobbles` would invent listens
+        that never happened. It is a separate call rather than part of
+        `/api/v1/albums/{id}` because it costs a rate-limited request to an
+        external service and the page must render without one.
+
+        The release is chosen in order: the entity's own MBID, then the release
+        MBID a **plurality** of the album's listens claim (a tagger works per
+        track, so one listen in twelve routinely carries a compilation's), then
+        a search, which is a guess.
+
+        **404 is a normal answer** — a great deal of any real library is not in
+        MusicBrainz, and those are exactly the records worth keeping.
+      parameters: [{ name: id, in: path, required: true, schema: { type: integer } }]
+      responses:
+        '200':
+          description: OK.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  source: { type: string, description: Which lookup answered. }
+                  mbid_release: { type: [string, 'null'] }
+                  title: { type: string }
+                  artist: { type: string }
+                  year: { type: [integer, 'null'] }
+                  format: { type: [string, 'null'] }
+                  tracks:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        side: { type: string, description: '"A", "B", … A disc comes back as one side.' }
+                        position: { type: integer }
+                        title: { type: string }
+                        artist: { type: [string, 'null'], description: Set only where the release credits the track to somebody other than the record's artist. }
+                        duration_secs: { type: [integer, 'null'] }
+        '400': { description: That entity is not an album. }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { description: No matching release, or no such album. }
+        '502': { description: MusicBrainz could not be reached. }
+
   /api/v1/albums/{id}/cover:
     put:
       tags: [Library]
@@ -1907,7 +1989,7 @@ paths:
         - { name: q, in: query, schema: { type: string }, description: Free text over the body and the subject. }
         - name: kind
           in: query
-          schema: { type: string, enum: [recording, release, artist, listen] }
+          schema: { type: string, enum: [recording, release, artist, listen, period] }
           description: Anything unrecognised means no filter — a stale bookmark should show everything, not nothing.
         - { name: sort, in: query, schema: { type: string, enum: [updated, created, title], default: updated } }
       responses:
@@ -1928,9 +2010,16 @@ paths:
       description: |
         Scope: `write` *(since v0.39)*.
 
-        A note hangs off **either** `entity_id` **or** `scrobble_id`, never both.
-        Editing archives the previous body into revisions — but only when the
-        body actually changed, so flipping visibility is not a rewrite.
+        A note hangs off **exactly one** target: `entity_id`, `scrobble_id`, or
+        the `period_unit` + `period_key` pair. Editing archives the previous
+        body into revisions — but only when the body actually changed, so
+        flipping visibility is not a rewrite.
+
+        A **period** target names a week, a month or a year exactly as the
+        Reports page does. The key is validated against the shapes
+        `reports::period_of` produces and anything else is a 400 — the key is
+        the note's identity, so one that page cannot reproduce files a note its
+        author can never find again.
 
         The body is Markdown. `[[track:…]]`, `[[album:…]]`, `[[artist:…]]`,
         `[[track:3]]` and `[[gear:…]]` shortcodes resolve server-side; an
@@ -1946,11 +2035,13 @@ paths:
               properties:
                 entity_id: { type: integer }
                 scrobble_id: { type: integer }
+                period_unit: { type: string, enum: [week, month, year], description: With `period_key`. Both or neither. }
+                period_key: { type: string, description: '`2026`, `2026-08` or `2026-W32` — exactly as Reports names it.' }
                 body: { type: string }
                 visibility: { type: string, enum: [private, patched, public], default: private }
       responses:
         '200': { description: Saved., content: { application/json: { schema: { $ref: '#/components/schemas/Note' } } } }
-        '400': { description: Neither or both of `entity_id` and `scrobble_id`. }
+        '400': { description: No target named, or a period key Reports would not produce. }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
 
@@ -2051,6 +2142,8 @@ paths:
       parameters:
         - { name: entity_id, in: query, schema: { type: integer } }
         - { name: scrobble_id, in: query, schema: { type: integer } }
+        - { name: period_unit, in: query, schema: { type: string, enum: [week, month, year] }, description: With `period_key`. }
+        - { name: period_key, in: query, schema: { type: string }, description: '`2026`, `2026-08` or `2026-W32`.' }
       responses:
         '200':
           description: OK. `note` is null when nothing is written yet.

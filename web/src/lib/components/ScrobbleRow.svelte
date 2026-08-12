@@ -1,6 +1,6 @@
 <script lang="ts">
 	import type { Scrobble } from '$lib/api';
-	import { qualityLabel, tierTagClass, formatDuration, timeAgo } from '$lib/utils';
+	import { qualityLabel, tierTagClass, mediumLabel, formatDuration, timeAgo } from '$lib/utils';
 	import CoverArt from './CoverArt.svelte';
 	import SourceIcon from './SourceIcon.svelte';
 	import ChainIcon from './ChainIcon.svelte';
@@ -25,6 +25,10 @@
 	const dispatch = createEventDispatcher<{ menu: Scrobble; toggle: Scrobble }>();
 
 	$: q = qualityLabel(scrobble);
+	// A side of vinyl has no codec, so the fidelity badge is empty for one and the
+	// slot sat blank — a record and an unlabelled import looked the same. The two
+	// never both apply: a listen either came off an object or out of a file.
+	$: medium = mediumLabel(scrobble);
 	$: seed = scrobble.artist || scrobble.title || '?';
 	$: time = new Date(scrobble.timestamp * 1000).toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' });
 
@@ -63,7 +67,8 @@
 			     viewports move it down here so the title keeps the whole first
 			     line. Rendering it twice and letting CSS choose is what avoids a
 			     resize listener for something that is purely a layout question. -->
-			{#if q.text}<span class="{tierTagClass(q.tier)} qtag-inline">{q.text}</span>{/if}
+			{#if medium}<span class="tag tag-medium qtag-inline">{medium}</span>
+			{:else if q.text}<span class="{tierTagClass(q.tier)} qtag-inline">{q.text}</span>{/if}
 		</div>
 	</div>
 	{#if showLove && !selectable}
@@ -80,7 +85,8 @@
 			</svg>
 		</button>
 	{/if}
-	{#if q.text}<span class="{tierTagClass(q.tier)} qtag-row">{q.text}</span>{/if}
+	{#if medium}<span class="tag tag-medium qtag-row">{medium}</span>
+	{:else if q.text}<span class="{tierTagClass(q.tier)} qtag-row">{q.text}</span>{/if}
 	<span class="dur">{formatDuration(scrobble.duration)}</span>
 	<span class="when">{showMenu ? time : timeAgo(scrobble.timestamp)}</span>
 	{#if showMenu && !selectable}

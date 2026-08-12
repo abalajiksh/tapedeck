@@ -174,10 +174,83 @@ pub struct NoteRow {
     pub user_id: i64,
     pub entity_id: Option<i64>,
     pub scrobble_id: Option<i64>,
+    /// `<unit>:<key>` — `month:2026-08`, `week:2026-W32`, `year:2026`. See
+    /// [`NoteTarget::Period`].
+    pub period_key: Option<String>,
     pub body_md: String,
     pub visibility: String,
     pub created_at: i64,
     pub updated_at: i64,
+}
+
+/// What a note is about. Exactly one, which a CHECK on `notes` enforces.
+///
+/// An enum rather than three `Option` arguments on `upsert_note`, because three
+/// nullable parameters where exactly one may be set is precisely the shape that
+/// lets a caller pass none of them and find out from a constraint violation at
+/// runtime. This makes the impossible states unwritable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NoteTarget {
+    /// A record, an artist or a recording.
+    Entity(i64),
+    /// One particular playing of something — "heard this on the train at 2am"
+    /// is a different thing from what you think of the record.
+    Listen(i64),
+    /// A week, a month or a year of listening: `<unit>:<key>`, matching
+    /// `reports::period_of`.
+    ///
+    /// A string rather than a foreign key because a period is not a row
+    /// anywhere — reports are folded out of the history on every request, so
+    /// there is nothing to point at. Build it with [`Self::period`], which is
+    /// what stops an unparseable key reaching the table.
+    Period(String),
+}
+
+impl NoteTarget {
+    /// The three units a report is bucketed by, matching `reports::Unit`.
+    pub const PERIOD_UNITS: [&'static str; 3] = ["week", "month", "year"];
+
+    /// A period target from a unit and one of `period_of`'s keys, validated.
+    ///
+    /// Validated at the door rather than trusted, because this key is the note's
+    /// *identity*: a note filed under a malformed key is not findable again by
+    /// the page that wrote it, and would look to its author like the note had
+    /// silently failed to save. The shapes are exactly the three `period_of`
+    /// produces — `2026`, `2026-08`, `2026-W32`.
+    pub fn period(unit: &str, key: &str) -> Option<Self> {
+        let unit = unit.trim().to_lowercase();
+        let key = key.trim();
+        if !Self::PERIOD_UNITS.contains(&unit.as_str()) {
+            return None;
+        }
+        let shaped = match unit.as_str() {
+            "year" => key.len() == 4 && key.bytes().all(|b| b.is_ascii_digit()),
+            "month" => {
+                let (y, m) = key.split_once('-')?;
+                y.len() == 4
+                    && m.len() == 2
+                    && y.bytes().chain(m.bytes()).all(|b| b.is_ascii_digit())
+                    && (1..=12).contains(&m.parse::<u32>().ok()?)
+            }
+            _ => {
+                let (y, w) = key.split_once("-W")?;
+                y.len() == 4
+                    && w.len() == 2
+                    && y.bytes().chain(w.bytes()).all(|b| b.is_ascii_digit())
+                    // ISO weeks run to 53 in a long year.
+                    && (1..=53).contains(&w.parse::<u32>().ok()?)
+            }
+        };
+        shaped.then(|| Self::Period(format!("{unit}:{key}")))
+    }
+
+    fn columns(&self) -> (Option<i64>, Option<i64>, Option<&str>) {
+        match self {
+            Self::Entity(id) => (Some(*id), None, None),
+            Self::Listen(id) => (None, Some(*id), None),
+            Self::Period(key) => (None, None, Some(key.as_str())),
+        }
+    }
 }
 
 #[derive(Debug, FromRow, serde::Serialize)]
@@ -262,6 +335,15 @@ pub struct PhysicalRelease {
     /// Sleeves, booklet pages and labels held for this pressing. Derived the
     /// same way, so a card can say "29 scans" without a second request.
     pub image_count: i64,
+    /// The front sleeve, when this pressing has one — so a shelf card wears the
+    /// cover of the object rather than a lettered tile.
+    ///
+    /// `artwork_url` is what the *lookup* returned, and it is frequently empty:
+    /// Discogs and MusicBrainz both answer plenty of releases without one, and
+    /// nothing back-fills it. Meanwhile the add already pulls the Cover Art
+    /// Archive into `physical_images`, so the sleeve was sitting one table away
+    /// the whole time and the card was drawing a letter over it.
+    pub cover_thumb: Option<String>,
 }
 
 /// One side played, with the gear it ran through resolved to names.
@@ -456,6 +538,74 @@ pub struct Database {
 /// How long after a listen a second report of it is still assumed to be the
 /// same play rather than a repeat. See `fuzzy_exists`.
 const DUPLICATE_WINDOW_SECS: i64 = 60;
+
+/// How many listen ids one `UPDATE … WHERE id IN (…)` carries during a session
+/// rebuild. Comfortably under SQLite's parameter limit, and large enough that a
+/// 49k-listen history is about a hundred statements rather than 49,000.
+const SESSION_LINK_CHUNK: usize = 500;
+
+/// How many listens one transaction of the artist-credit backfill covers.
+///
+/// This runs at startup on an existing database, so the trade is between
+/// holding a write lock and paying a commit: a few thousand rows per commit
+/// keeps a 49k-listen history to a couple of dozen commits without blocking
+/// anything for long.
+const CREDIT_BACKFILL_CHUNK: i64 = 2_000;
+
+/// "this listen credits this artist" — the fan-out predicate, in one place.
+///
+/// Takes one bind: the folded artist key. Requires the outer query to alias
+/// `scrobbles` as `s`.
+///
+/// `EXISTS` rather than a join, and that is a correctness rule rather than a
+/// style one: a join multiplies the outer row by its matching credits, so
+/// `COUNT(*)` would stop meaning listens the moment anything matched twice.
+/// It is the same trap `get_equipment` hit when a chain naming one piece of
+/// gear at two steps counted its whole running time twice.
+///
+/// **Where this is deliberately not used**: anything scoped to an *album*
+/// (`artist` + `album` together) identifies a record, and a record's artist is
+/// its primary — fanning out there would fold Hilary Hahn's own albums into
+/// Bach's. Nor the sanitiser, which operates on the stored column by design,
+/// nor `entity_key`, since a love points at one artist.
+pub const CREDITS_ARTIST: &str = "EXISTS (SELECT 1 FROM scrobble_artists sa \
+     WHERE sa.scrobble_id = s.id AND sa.artist_key = ?)";
+
+/// Everyone credited on a listen, primary first, de-duplicated by key.
+///
+/// The primary is always `play.artist` — the name the rest of the row is
+/// written with — so a query that fans out over the credits and one that reads
+/// `scrobbles.artist` cannot disagree about who the record is by. Anything else
+/// in `play.artists` follows.
+///
+/// MBIDs are positional in `play.mbid_artist`, which is how MusicBrainz and
+/// ListenBrainz both send them, so they are zipped by index and simply run out
+/// when there are fewer of them than names.
+pub fn credited_artists(play: &Play) -> Vec<(String, Option<String>)> {
+    let mut names: Vec<String> = Vec::new();
+    let mut push = |n: &str| {
+        let n = n.trim();
+        if n.is_empty() {
+            return;
+        }
+        let key = Database::artist_key(n);
+        if !names.iter().any(|existing| Database::artist_key(existing) == key) {
+            names.push(n.to_string());
+        }
+    };
+
+    push(&play.artist);
+    for extra in play.artists.iter().flatten() {
+        push(extra);
+    }
+
+    let mbids = play.mbid_artist.as_deref().unwrap_or(&[]);
+    names
+        .into_iter()
+        .enumerate()
+        .map(|(i, name)| (name, mbids.get(i).filter(|m| !m.trim().is_empty()).cloned()))
+        .collect()
+}
 
 /// The population every fidelity readout divides by: listens whose format is
 /// actually known.
@@ -1147,20 +1297,82 @@ impl Database {
         // — and compare `EXPLAIN QUERY PLAN` either side. A laptop cannot see
         // this cost at all.
 
+        // ── Who played it ────────────────────────────────────────────────
+        //
+        // `scrobbles.artist` holds **one** name, and every chart in this
+        // application groups by it — so a performer got no credit anywhere. Play
+        // "Hilary Hahn plays Bach" and Bach takes the listen; Hilary Hahn was
+        // written into `artist_credit` as text and counted by nothing. Same for
+        // Pascal Rogé on Debussy, and for every soloist, conductor and ensemble
+        // in a classical library. `artist_credit` was read in exactly one place
+        // — the Various Artists fallback in Reports.
+        //
+        // One row per credited artist per listen. The primary is `position = 0`
+        // and is the same name `scrobbles.artist` holds, so a query that fans
+        // out over this table and one that does not still agree about who the
+        // record is by.
+        //
+        // `artist_key` is `LOWER(TRIM(name))` — **the same fold the charts and
+        // `entity_key` already use**, deliberately not `normalise_artist`. That
+        // one answers "same performer?" for the sanitiser's review preview,
+        // where over-folding invents a merge; this has to agree with the keys
+        // hearts and entities are stored under or the two silently disagree
+        // about who an artist is. There is no third normaliser here.
+        //
+        // The primary key is `(scrobble_id, artist_key)`, so a listen crediting
+        // the same artist twice — which real tags do, "Bach; J.S. Bach" — counts
+        // once. Same rule as the `fitted` set in `equipment_seconds`.
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS scrobble_artists (
+                scrobble_id INTEGER NOT NULL REFERENCES scrobbles(id),
+                artist_key TEXT NOT NULL,
+                name TEXT NOT NULL,
+                position INTEGER NOT NULL DEFAULT 0,
+                mbid TEXT,
+                PRIMARY KEY (scrobble_id, artist_key)
+            ) WITHOUT ROWID",
+        )
+        .execute(&self.pool)
+        .await?;
+        // Unlike the expression indexes the note above rejects, this one is for
+        // a **point lookup** — "every listen crediting this artist", which is
+        // what an artist page asks — and without it that question is a full scan
+        // of the join table per visit. It is the workload an index is actually
+        // for. The whole-history direction (top artists) still scans, which is
+        // correct on this storage.
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_scrobble_artists_key
+                 ON scrobble_artists(artist_key, scrobble_id)",
+        )
+        .execute(&self.pool)
+        .await?;
+
         // A note is a living document: one per user per target, edited in place.
-        // Exactly one of entity_id / scrobble_id is set — a note about a record
-        // and a note about one particular playing of it are different things.
+        // Exactly one of entity_id / scrobble_id / period_key is set. A note
+        // about a record, a note about one particular playing of it, and a note
+        // about the month you spent listening to it are three different things.
+        //
+        // `period_key` is `<unit>:<key>` — `month:2026-08`, `week:2026-W32`,
+        // `year:2026` — the same key `reports::period_of` builds. It is a text
+        // key rather than a foreign key because a period is not a row anywhere:
+        // reports are folded from the history on every request, so there is
+        // nothing to point at. That key is stable by construction, which is
+        // what makes it safe to write down — including for weeks, which
+        // deliberately ignore the user's week-start preference so a named
+        // period cannot change shape under a note about it.
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS notes (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_id INTEGER NOT NULL REFERENCES users(id),
                 entity_id INTEGER REFERENCES entities(id),
                 scrobble_id INTEGER REFERENCES scrobbles(id),
+                period_key TEXT,
                 body_md TEXT NOT NULL,
                 visibility TEXT NOT NULL DEFAULT 'private',
                 created_at INTEGER NOT NULL,
                 updated_at INTEGER NOT NULL,
-                CHECK ((entity_id IS NULL) <> (scrobble_id IS NULL))
+                CHECK ((entity_id IS NOT NULL) + (scrobble_id IS NOT NULL)
+                       + (period_key IS NOT NULL) = 1)
             )",
         )
         .execute(&self.pool)
@@ -1170,6 +1382,8 @@ impl Database {
         sqlx::query("CREATE UNIQUE INDEX IF NOT EXISTS idx_notes_user_entity ON notes(user_id, entity_id) WHERE entity_id IS NOT NULL")
             .execute(&self.pool).await?;
         sqlx::query("CREATE UNIQUE INDEX IF NOT EXISTS idx_notes_user_scrobble ON notes(user_id, scrobble_id) WHERE scrobble_id IS NOT NULL")
+            .execute(&self.pool).await?;
+        sqlx::query("CREATE UNIQUE INDEX IF NOT EXISTS idx_notes_user_period ON notes(user_id, period_key) WHERE period_key IS NOT NULL")
             .execute(&self.pool).await?;
 
         // Every edit keeps what was there before. These are meant to be kept for
@@ -1685,6 +1899,115 @@ impl Database {
                 .await;
         }
 
+        // Migration: give every listen already stored its artist credits.
+        //
+        // Backfilled rather than left to new listens only, because the whole
+        // point is a history that already exists — "does Hilary Hahn get credit
+        // for the Bach I played last year" has to be yes, or the feature reads
+        // as broken for everybody except new users.
+        //
+        // Two sources, in this order: the primary from `scrobbles.artist`, and
+        // anyone else out of `artist_credit`, which has been collecting the
+        // performers since v0.17.0 and being read by almost nothing. So an
+        // existing database has the data already — it was only ever the join
+        // that was missing.
+        //
+        // Guarded on the table being *empty* rather than on a column existing:
+        // the table is created by `init()` on every start, so `has_column`
+        // would say yes immediately and skip the backfill forever.
+        let credits_done: Option<(i64,)> =
+            sqlx::query_as("SELECT COUNT(*) FROM (SELECT 1 FROM scrobble_artists LIMIT 1)")
+                .fetch_optional(&self.pool)
+                .await
+                .ok()
+                .flatten();
+        let any_listens: Option<(i64,)> =
+            sqlx::query_as("SELECT COUNT(*) FROM (SELECT 1 FROM scrobbles LIMIT 1)")
+                .fetch_optional(&self.pool)
+                .await
+                .ok()
+                .flatten();
+        if credits_done.map(|(n,)| n) == Some(0) && any_listens.map(|(n,)| n) == Some(1) {
+            info!("⚙️ Migrating: crediting every performer on the listens already stored...");
+            if let Err(e) = self.backfill_scrobble_artists().await {
+                // Not fatal. Charts fall back to the primary artist, which is
+                // exactly what they did before this table existed, so a failed
+                // backfill loses a feature rather than breaking the app.
+                warn!("Could not backfill artist credits: {}", e);
+            }
+        }
+
+        // Migration: a note can hang off a report period.
+        //
+        // The second CHECK rebuild in this file, and for the same reason as the
+        // shelf's: `notes` enforces "exactly one target" with a constraint, and
+        // SQLite cannot alter one in place. Guarded on the constraint text, not
+        // on the column — a `period_key` added by `ADD COLUMN` would sit under
+        // the *old* CHECK, which reads `(entity_id IS NULL) <> (scrobble_id IS
+        // NULL)` and would reject every period note as having no target at all.
+        //
+        // `note_revisions.note_id` references this table, so foreign keys come
+        // off for the swap and the whole thing is one transaction. Note the
+        // insert names its columns on both sides: the new table has one more,
+        // and a bare `INSERT INTO … SELECT *` would shift `body_md` into it.
+        let notes_sql: Option<(String,)> =
+            sqlx::query_as("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'notes'")
+                .fetch_optional(&self.pool)
+                .await
+                .ok()
+                .flatten();
+        if notes_sql.is_some_and(|(sql,)| !sql.contains("period_key")) {
+            info!("⚙️ Migrating: letting a liner note hang off a report period...");
+            let _ = sqlx::query("PRAGMA foreign_keys = OFF").execute(&self.pool).await;
+            let rebuild = async {
+                let mut tx = self.pool.begin().await?;
+                sqlx::query(
+                    "CREATE TABLE notes_new (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        user_id INTEGER NOT NULL REFERENCES users(id),
+                        entity_id INTEGER REFERENCES entities(id),
+                        scrobble_id INTEGER REFERENCES scrobbles(id),
+                        period_key TEXT,
+                        body_md TEXT NOT NULL,
+                        visibility TEXT NOT NULL DEFAULT 'private',
+                        created_at INTEGER NOT NULL,
+                        updated_at INTEGER NOT NULL,
+                        CHECK ((entity_id IS NOT NULL) + (scrobble_id IS NOT NULL)
+                               + (period_key IS NOT NULL) = 1)
+                    )",
+                )
+                .execute(&mut *tx)
+                .await?;
+                sqlx::query(
+                    "INSERT INTO notes_new
+                            (id, user_id, entity_id, scrobble_id, body_md,
+                             visibility, created_at, updated_at)
+                     SELECT  id, user_id, entity_id, scrobble_id, body_md,
+                             visibility, created_at, updated_at
+                       FROM notes",
+                )
+                .execute(&mut *tx)
+                .await?;
+                sqlx::query("DROP TABLE notes").execute(&mut *tx).await?;
+                sqlx::query("ALTER TABLE notes_new RENAME TO notes").execute(&mut *tx).await?;
+                // Dropped with the old table, so they are rebuilt here rather
+                // than left to `init()` — which has already run by now.
+                for idx in &[
+                    "CREATE UNIQUE INDEX IF NOT EXISTS idx_notes_user_entity ON notes(user_id, entity_id) WHERE entity_id IS NOT NULL",
+                    "CREATE UNIQUE INDEX IF NOT EXISTS idx_notes_user_scrobble ON notes(user_id, scrobble_id) WHERE scrobble_id IS NOT NULL",
+                    "CREATE UNIQUE INDEX IF NOT EXISTS idx_notes_user_period ON notes(user_id, period_key) WHERE period_key IS NOT NULL",
+                ] {
+                    sqlx::query(idx).execute(&mut *tx).await?;
+                }
+                tx.commit().await
+            }
+            .await;
+            if let Err(e) = rebuild {
+                warn!("Could not widen what a liner note can be about: {}", e);
+            }
+            let _ = sqlx::query("PRAGMA foreign_keys = ON").execute(&self.pool).await;
+        }
+
         // Migration: a user's own profile.
         //
         // `avatar_url` is a URL rather than a blob for the same reason the
@@ -2069,7 +2392,60 @@ impl Database {
         .bind(source_ref)
         .execute(&self.pool)
         .await?;
+
+        // Who actually played it. Written here rather than at each source,
+        // because there are six write paths and a source that forgot would
+        // produce a listen whose performers are simply absent from every chart
+        // — with nothing erroring to say so, which is how the credit was lost
+        // in the first place.
+        self.link_scrobble_artists(user_id, &play.source_id, &play.source_name, play).await?;
+
         Ok(true)
+    }
+
+    /// Record every artist credited on a listen, primary first.
+    ///
+    /// Looks the row back up by its `(user_id, source_id, source_name)` unique
+    /// key rather than taking a `last_insert_rowid()`: the insert above is
+    /// `INSERT OR IGNORE`-shaped in effect (dedup has already run), and reading
+    /// the key that is guaranteed unique is what keeps this correct if the
+    /// insert ever becomes an upsert.
+    async fn link_scrobble_artists(
+        &self,
+        user_id: i64,
+        source_id: &str,
+        source_name: &str,
+        play: &Play,
+    ) -> Result<(), sqlx::Error> {
+        let row: Option<(i64,)> = sqlx::query_as(
+            "SELECT id FROM scrobbles WHERE user_id = ? AND source_id = ? AND source_name = ?",
+        )
+        .bind(user_id)
+        .bind(source_id)
+        .bind(source_name)
+        .fetch_optional(&self.pool)
+        .await?;
+        let Some((scrobble_id,)) = row else {
+            return Ok(());
+        };
+
+        for (position, (name, mbid)) in credited_artists(play).into_iter().enumerate() {
+            // `OR IGNORE` rather than a check: the primary key already says one
+            // row per artist per listen, and a tag crediting somebody twice is
+            // a real thing rather than an error worth failing a listen over.
+            sqlx::query(
+                "INSERT OR IGNORE INTO scrobble_artists (scrobble_id, artist_key, name, position, mbid)
+                 VALUES (?, ?, ?, ?, ?)",
+            )
+            .bind(scrobble_id)
+            .bind(Database::artist_key(&name))
+            .bind(&name)
+            .bind(position as i64)
+            .bind(mbid)
+            .execute(&self.pool)
+            .await?;
+        }
+        Ok(())
     }
 
     pub async fn exists(
@@ -2444,17 +2820,17 @@ impl Database {
         exclude: Option<&str>,
         limit: i64,
     ) -> Result<Vec<AlbumAggregate>, sqlx::Error> {
-        sqlx::query_as(
+        sqlx::query_as(&format!(
             "SELECT album AS name, COUNT(*) AS plays, MAX(release_year) AS year,
                     MAX(artwork_url) AS artwork_url, MAX(caa_id) AS caa_id,
                     MAX(caa_release_mbid) AS caa_release_mbid
-             FROM scrobbles
-             WHERE user_id = ? AND skipped = FALSE AND LOWER(TRIM(artist)) = ?
+             FROM scrobbles s
+             WHERE user_id = ? AND skipped = FALSE AND {CREDITS_ARTIST}
                AND album IS NOT NULL AND TRIM(album) != ''
                AND (? IS NULL OR LOWER(TRIM(album)) != ?)
              GROUP BY LOWER(TRIM(album))
-             ORDER BY plays DESC LIMIT ?",
-        )
+             ORDER BY plays DESC LIMIT ?"
+        ))
         .bind(user_id)
         .bind(artist.trim().to_lowercase())
         .bind(exclude.map(|e| e.trim().to_lowercase()))
@@ -2470,7 +2846,7 @@ impl Database {
         user_id: i64,
         artist: &str,
     ) -> Result<Option<ArtistSummary>, sqlx::Error> {
-        let row: Option<ArtistSummary> = sqlx::query_as(
+        let row: Option<ArtistSummary> = sqlx::query_as(&format!(
             "SELECT COUNT(*) AS plays,
                     COALESCE(SUM(duration), 0) AS seconds,
                     COUNT(DISTINCT LOWER(TRIM(title))) AS track_count,
@@ -2478,9 +2854,9 @@ impl Database {
                           THEN LOWER(TRIM(album)) END) AS album_count,
                     MIN(timestamp) AS first_heard,
                     MAX(timestamp) AS last_heard
-             FROM scrobbles
-             WHERE user_id = ? AND skipped = FALSE AND LOWER(TRIM(artist)) = ?",
-        )
+             FROM scrobbles s
+             WHERE user_id = ? AND skipped = FALSE AND {CREDITS_ARTIST}"
+        ))
         .bind(user_id)
         .bind(artist.trim().to_lowercase())
         .fetch_optional(&self.pool)
@@ -2493,10 +2869,15 @@ impl Database {
     pub async fn artist_rank(&self, user_id: i64, artist: &str) -> Result<(i64, i64), sqlx::Error> {
         // Ranking groups case-insensitively on purpose: "LINKIN PARK" and
         // "Linkin Park" are one artist to the charts, so they must be one here.
+        // Over the credits, not over `scrobbles.artist` — a performer who is
+        // never the primary would otherwise have no rank at all, and the total
+        // would be a count of record artists rather than of artists heard.
         let rows: Vec<(String, i64)> = sqlx::query_as(
-            "SELECT artist, COUNT(*) AS plays FROM scrobbles
-             WHERE user_id = ? AND skipped = FALSE
-             GROUP BY LOWER(TRIM(artist)) ORDER BY plays DESC",
+            "SELECT sa.artist_key, COUNT(*) AS plays
+               FROM scrobble_artists sa
+               JOIN scrobbles s ON s.id = sa.scrobble_id
+              WHERE s.user_id = ? AND s.skipped = FALSE
+              GROUP BY sa.artist_key ORDER BY plays DESC",
         )
         .bind(user_id)
         .fetch_all(&self.pool)
@@ -2517,7 +2898,7 @@ impl Database {
         artist: &str,
         limit: i64,
     ) -> Result<Vec<TrackAggregate>, sqlx::Error> {
-        sqlx::query_as(
+        sqlx::query_as(&format!(
             "SELECT title,
                     COUNT(*) AS plays,
                     MAX(duration) AS duration,
@@ -2530,11 +2911,11 @@ impl Database {
                     MAX(dsd_multiplier) AS dsd_multiplier,
                     MAX(delivery_codec) AS delivery_codec,
                     MAX(is_lossless) AS is_lossless
-             FROM scrobbles
-             WHERE user_id = ? AND skipped = FALSE AND LOWER(TRIM(artist)) = ?
+             FROM scrobbles s
+             WHERE user_id = ? AND skipped = FALSE AND {CREDITS_ARTIST}
              GROUP BY LOWER(TRIM(title))
-             ORDER BY plays DESC LIMIT ?",
-        )
+             ORDER BY plays DESC LIMIT ?"
+        ))
         .bind(user_id)
         .bind(artist.trim().to_lowercase())
         .bind(limit)
@@ -2550,12 +2931,12 @@ impl Database {
         user_id: i64,
         artist: &str,
     ) -> Result<Vec<(String, i64)>, sqlx::Error> {
-        sqlx::query_as(
+        sqlx::query_as(&format!(
             "SELECT strftime('%Y', timestamp, 'unixepoch') AS year, COUNT(*) AS plays
-             FROM scrobbles
-             WHERE user_id = ? AND skipped = FALSE AND LOWER(TRIM(artist)) = ?
-             GROUP BY year ORDER BY year ASC",
-        )
+             FROM scrobbles s
+             WHERE user_id = ? AND skipped = FALSE AND {CREDITS_ARTIST}
+             GROUP BY year ORDER BY year ASC"
+        ))
         .bind(user_id)
         .bind(artist.trim().to_lowercase())
         .fetch_all(&self.pool)
@@ -2569,10 +2950,10 @@ impl Database {
     /// PARK" and "Linkin Park" are one artist to every chart, so a share
     /// computed against one spelling would be wrong for the other.
     pub async fn artist_plays(&self, user_id: i64, artist: &str) -> Result<i64, sqlx::Error> {
-        let (n,): (i64,) = sqlx::query_as(
-            "SELECT COUNT(*) FROM scrobbles
-              WHERE user_id = ? AND skipped = FALSE AND LOWER(TRIM(artist)) = ?",
-        )
+        let (n,): (i64,) = sqlx::query_as(&format!(
+            "SELECT COUNT(*) FROM scrobbles s
+              WHERE user_id = ? AND skipped = FALSE AND {CREDITS_ARTIST}"
+        ))
         .bind(user_id)
         .bind(artist.trim().to_lowercase())
         .fetch_one(&self.pool)
@@ -2628,6 +3009,37 @@ impl Database {
     /// Albums where the listens disagree about which release they are.
     ///
     /// Returns (artist, album, total plays, distinct release MBIDs, the winning
+    /// The release MBID the most listens of this album claim, if any do.
+    ///
+    /// A plurality rather than a lookup because a tagger works per *track*, so
+    /// one listen out of twelve routinely carries a compilation's MBID — the
+    /// exact split `albums_with_mixed_releases` exists to clean up. Anything
+    /// wanting "which record is this" should ask the listens, not the first row
+    /// it happens to find.
+    pub async fn album_release_mbid(
+        &self,
+        user_id: i64,
+        artist: &str,
+        album: &str,
+    ) -> Result<Option<String>, sqlx::Error> {
+        let row: Option<(String,)> = sqlx::query_as(
+            "SELECT mbid_release
+               FROM scrobbles
+              WHERE user_id = ? AND LOWER(TRIM(artist)) = LOWER(TRIM(?))
+                AND LOWER(TRIM(album)) = LOWER(TRIM(?))
+                AND mbid_release IS NOT NULL AND TRIM(mbid_release) != ''
+              GROUP BY mbid_release
+              ORDER BY COUNT(*) DESC
+              LIMIT 1",
+        )
+        .bind(user_id)
+        .bind(artist)
+        .bind(album)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|(m,)| m))
+    }
+
     /// MBID, how many rows carry it).
     pub async fn albums_with_mixed_releases(
         &self,
@@ -2832,7 +3244,21 @@ impl Database {
                     (SELECT MAX(p.played_at) FROM physical_plays p WHERE p.release_id = r.id)
                       AS last_played,
                     (SELECT COUNT(*) FROM physical_images i WHERE i.release_id = r.id)
-                      AS image_count
+                      AS image_count,
+                    -- The front sleeve, built exactly the way `image_payload`
+                    -- builds one so a card and the gallery cannot disagree
+                    -- about which file that is.
+                    --
+                    -- Ordered so the user's *own* scan wins over a provider's:
+                    -- an upload has a `file_path` and is a photograph of the
+                    -- copy actually in the room, which is the same reason the
+                    -- gallery badges an upload as the user's own.
+                    (SELECT COALESCE(i.thumb_url, i.url,
+                                     '/api/v1/physical/images/' || i.id || '/file')
+                       FROM physical_images i
+                      WHERE i.release_id = r.id AND i.kind = 'front'
+                      ORDER BY (i.file_path IS NULL), i.position, i.id
+                      LIMIT 1) AS cover_thumb
                FROM physical_releases r
               WHERE r.user_id = ? AND (? IS NULL OR r.kind = ?)
               ORDER BY r.artist COLLATE NOCASE, r.title COLLATE NOCASE",
@@ -2857,7 +3283,21 @@ impl Database {
                     (SELECT MAX(p.played_at) FROM physical_plays p WHERE p.release_id = r.id)
                       AS last_played,
                     (SELECT COUNT(*) FROM physical_images i WHERE i.release_id = r.id)
-                      AS image_count
+                      AS image_count,
+                    -- The front sleeve, built exactly the way `image_payload`
+                    -- builds one so a card and the gallery cannot disagree
+                    -- about which file that is.
+                    --
+                    -- Ordered so the user's *own* scan wins over a provider's:
+                    -- an upload has a `file_path` and is a photograph of the
+                    -- copy actually in the room, which is the same reason the
+                    -- gallery badges an upload as the user's own.
+                    (SELECT COALESCE(i.thumb_url, i.url,
+                                     '/api/v1/physical/images/' || i.id || '/file')
+                       FROM physical_images i
+                      WHERE i.release_id = r.id AND i.kind = 'front'
+                      ORDER BY (i.file_path IS NULL), i.position, i.id
+                      LIMIT 1) AS cover_thumb
                FROM physical_releases r WHERE r.user_id = ? AND r.id = ?",
         )
         .bind(user_id)
@@ -4245,6 +4685,7 @@ impl Database {
     /// itself hang off an entity and are untouched.
     pub async fn delete_scrobble(&self, user_id: i64, id: i64) -> Result<bool, sqlx::Error> {
         self.delete_notes_for_scrobbles(user_id, Some(id)).await?;
+        self.delete_artists_for_scrobbles(user_id, Some(id)).await?;
         let res = sqlx::query("DELETE FROM scrobbles WHERE id = ? AND user_id = ?")
             .bind(id)
             .bind(user_id)
@@ -4256,11 +4697,47 @@ impl Database {
     /// Delete ALL listens for the user. Returns the number removed.
     pub async fn clear_scrobbles(&self, user_id: i64) -> Result<u64, sqlx::Error> {
         self.delete_notes_for_scrobbles(user_id, None).await?;
+        self.delete_artists_for_scrobbles(user_id, None).await?;
         let res = sqlx::query("DELETE FROM scrobbles WHERE user_id = ?")
             .bind(user_id)
             .execute(&self.pool)
             .await?;
         Ok(res.rows_affected())
+    }
+
+    /// Clear the credit rows for one listen, or for every listen this user has.
+    ///
+    /// The pool opens with `foreign_keys(true)`, so `scrobble_artists.scrobble_id`
+    /// makes this mandatory before any listen is deleted — exactly the rule
+    /// listen-attached notes already follow. The `delete_user_cascades_their_data`
+    /// test caught this the moment the table was added, which is what it is for.
+    async fn delete_artists_for_scrobbles(
+        &self,
+        user_id: i64,
+        id: Option<i64>,
+    ) -> Result<(), sqlx::Error> {
+        match id {
+            Some(id) => {
+                sqlx::query(
+                    "DELETE FROM scrobble_artists WHERE scrobble_id IN
+                         (SELECT id FROM scrobbles WHERE id = ? AND user_id = ?)",
+                )
+                .bind(id)
+                .bind(user_id)
+                .execute(&self.pool)
+                .await?;
+            }
+            None => {
+                sqlx::query(
+                    "DELETE FROM scrobble_artists WHERE scrobble_id IN
+                         (SELECT id FROM scrobbles WHERE user_id = ?)",
+                )
+                .bind(user_id)
+                .execute(&self.pool)
+                .await?;
+            }
+        }
+        Ok(())
     }
 
     /// Clear listen-attached notes (and their revisions) for one listen, or for
@@ -4390,6 +4867,16 @@ impl Database {
         .bind(&provenance.spotify_track_id)
         .execute(&self.pool)
         .await?;
+
+        // An import writes its own INSERT rather than going through
+        // `save_scrobble`, so it has to link its credits itself. Missing this
+        // does not degrade gracefully: a listen with no row in
+        // `scrobble_artists` is invisible to every artist page and every chart,
+        // because those fan out over that table now. The startup backfill only
+        // covers what was already stored, so an import run *after* the upgrade
+        // would produce listens that simply do not appear anywhere.
+        self.link_scrobble_artists(user_id, &play.source_id, &play.source_name, play).await?;
+
         Ok(true)
     }
 
@@ -4529,10 +5016,15 @@ impl Database {
             }
         };
 
+        // Over the credits, exactly as `chart()` does. These two answer the
+        // same question on two screens, and the whole reason the handoff
+        // between them exists is that they must not disagree.
         let top_rows: Vec<(String, i64, Option<i64>)> = sqlx::query_as(&format!(
-            "SELECT artist, COUNT(*) as plays, SUM(duration) as secs
-             FROM scrobbles WHERE user_id = ? AND skipped = FALSE AND (? IS NULL OR timestamp >= ?)
-             GROUP BY artist ORDER BY {} LIMIT 50",
+            "SELECT MAX(sa.name) AS artist, COUNT(*) as plays, SUM(s.duration) as secs
+             FROM scrobble_artists sa
+             JOIN scrobbles s ON s.id = sa.scrobble_id
+             WHERE s.user_id = ? AND s.skipped = FALSE AND (? IS NULL OR s.timestamp >= ?)
+             GROUP BY sa.artist_key ORDER BY {} LIMIT 50",
             order
         ))
         .bind(user_id)
@@ -4737,6 +5229,36 @@ impl Database {
             .filter(|v| v.is_object())
             .unwrap_or_else(|| serde_json::json!({}));
         Ok(json)
+    }
+
+    /// Every user's scrobble threshold, in one query.
+    ///
+    /// One query for everybody rather than one per user: the engine refreshes
+    /// this on a clock of its own and would otherwise be doing a lookup per user
+    /// per tick to read two numbers that almost never change. Users who have
+    /// never touched the setting are simply absent — the caller falls back to
+    /// the default, so this returns nothing at all on a fresh instance.
+    pub async fn scrobble_thresholds(
+        &self,
+    ) -> Result<HashMap<i64, crate::models::ScrobbleThreshold>, sqlx::Error> {
+        let rows: Vec<(i64, Option<String>)> =
+            sqlx::query_as("SELECT id, settings FROM users WHERE settings IS NOT NULL")
+                .fetch_all(&self.pool)
+                .await?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|(id, settings)| {
+                let json = serde_json::from_str::<serde_json::Value>(&settings?).ok()?;
+                // Only users who actually set one, so the default stays the
+                // single source of truth for everybody else.
+                if json.get("scrobble_threshold_percent").is_none()
+                    && json.get("scrobble_threshold_secs").is_none()
+                {
+                    return None;
+                }
+                Some((id, crate::models::ScrobbleThreshold::from_prefs(&json)))
+            })
+            .collect())
     }
 
     /// Shallow-merge `patch` into the user's stored preferences and persist.
@@ -5193,7 +5715,17 @@ impl Database {
 
     /// Case- and padding-insensitive key, so "Aphex Twin" and "aphex twin " are
     /// one artist rather than two rows that each learn half the metadata.
-    fn artist_key(name: &str) -> String {
+    ///
+    /// The same fold `entity_key` uses and the same one the charts' bare
+    /// `LOWER(TRIM(artist))` performs, which is what lets a chart row, a heart
+    /// and a `scrobble_artists` row agree about who an artist is.
+    ///
+    /// Deliberately **not** `normalise_artist`. That one strips punctuation and
+    /// accents to answer "are these two spellings the same performer?" for the
+    /// sanitiser's review preview, where a false pairing costs one line in a
+    /// preview. Here a wrong fold silently merges two artists' listening, so it
+    /// stays conservative. Two normalisers exist; there is no third.
+    pub fn artist_key(name: &str) -> String {
         name.trim().to_lowercase()
     }
 
@@ -6055,6 +6587,85 @@ impl Database {
         Ok(true)
     }
 
+    /// Fill `scrobble_artists` from the listens already stored.
+    ///
+    /// Batched into one transaction per chunk for the reason
+    /// `rebuild_sessions` is: a per-row round trip over a 49k-listen history is
+    /// ~50,000 commits, which on a Pi with the database on an SD card is
+    /// minutes rather than seconds — and this one runs at **startup**, where
+    /// that is the difference between a restart and an outage.
+    pub async fn backfill_scrobble_artists(&self) -> Result<u64, sqlx::Error> {
+        let mut done = 0u64;
+        let mut after = 0i64;
+
+        loop {
+            let rows: Vec<(i64, String, Option<String>, Option<String>)> = sqlx::query_as(
+                "SELECT id, artist, artist_credit, mbid_artist
+                   FROM scrobbles WHERE id > ? ORDER BY id LIMIT ?",
+            )
+            .bind(after)
+            .bind(CREDIT_BACKFILL_CHUNK)
+            .fetch_all(&self.pool)
+            .await?;
+            if rows.is_empty() {
+                break;
+            }
+
+            let mut tx = self.pool.begin().await?;
+            for (id, artist, credit, mbid_json) in &rows {
+                after = *id;
+                // `artist_credit` is everyone credited joined with "; ", primary
+                // first — the shape `save_scrobble` and `fold_artist_credit`
+                // both write. Splitting it back out is reading our own format,
+                // not guessing at a tag: a name containing a semicolon would
+                // already have been mangled on the way in.
+                let mut names: Vec<String> = vec![artist.clone()];
+                if let Some(c) = credit {
+                    names.extend(c.split(';').map(|n| n.trim().to_string()));
+                }
+                let mbids: Vec<String> = mbid_json
+                    .as_deref()
+                    .and_then(|j| serde_json::from_str::<Vec<String>>(j).ok())
+                    .unwrap_or_default();
+
+                let mut seen: Vec<String> = Vec::new();
+                for name in names {
+                    let name = name.trim();
+                    if name.is_empty() {
+                        continue;
+                    }
+                    let key = Database::artist_key(name);
+                    if seen.contains(&key) {
+                        continue;
+                    }
+                    let position = seen.len() as i64;
+                    seen.push(key.clone());
+                    sqlx::query(
+                        "INSERT OR IGNORE INTO scrobble_artists
+                             (scrobble_id, artist_key, name, position, mbid)
+                         VALUES (?, ?, ?, ?, ?)",
+                    )
+                    .bind(id)
+                    .bind(&key)
+                    .bind(name)
+                    .bind(position)
+                    .bind(mbids.get(position as usize))
+                    .execute(&mut *tx)
+                    .await?;
+                }
+                done += 1;
+            }
+            tx.commit().await?;
+
+            if rows.len() < CREDIT_BACKFILL_CHUNK as usize {
+                break;
+            }
+        }
+
+        info!("🎻 Credited the performers on {} listens", done);
+        Ok(done)
+    }
+
     /// Rebuild every session for one user from their listens.
     ///
     /// Needed because `assign_session` maintained the session rows while nothing
@@ -6070,17 +6681,6 @@ impl Database {
         user_id: i64,
         gap_seconds: i64,
     ) -> Result<(u64, u64), sqlx::Error> {
-        // Clear the link first — the foreign key means sessions can't go while
-        // anything still points at them.
-        sqlx::query("UPDATE scrobbles SET session_id = NULL WHERE user_id = ?")
-            .bind(user_id)
-            .execute(&self.pool)
-            .await?;
-        sqlx::query("DELETE FROM sessions WHERE user_id = ?")
-            .bind(user_id)
-            .execute(&self.pool)
-            .await?;
-
         // Ordered walk. Only the gap is available here: a listen doesn't record
         // which token submitted it, so the token-change rule that `assign_session`
         // applies live can't be reconstructed after the fact.
@@ -6102,52 +6702,126 @@ impl Database {
         .fetch_all(&self.pool)
         .await?;
 
-        let mut sessions = 0u64;
-        let mut linked = 0u64;
-        let mut current: Option<i64> = None;
+        // Grouped in Rust first, written afterwards. The previous version did a
+        // round trip *per listen* — an INSERT at each boundary, an `UPDATE
+        // scrobbles SET session_id` for every single row, and a two-statement
+        // `recompute_session` per session, every one of them its own
+        // autocommitted transaction.
+        //
+        // That is ~50,000 separate commits on a 49k-listen history. On an NVMe
+        // laptop it is a couple of seconds and looks fine; on a Pi with the
+        // database on an SD card each commit is a WAL write and the whole thing
+        // ran past Cloudflare's 100s origin timeout, so the request died with a
+        // 524 while the rebuild carried on in the background. Same blind spot
+        // that hid the Rediscovery quadratic: the cost is storage latency
+        // multiplied by statement count, and the dev machine hides both.
+        struct Pending {
+            device_id: Option<i64>,
+            chain_id: Option<i64>,
+            context: Option<String>,
+            started_at: i64,
+            ended_at: i64,
+            total_duration: i64,
+            /// Summed and counted rather than averaged as we go, because
+            /// `AVG(quality_score)` ignores NULLs and most listens have none —
+            /// treating those as zero would score an imported history at nearly
+            /// nothing.
+            quality_sum: f64,
+            quality_n: i64,
+            listens: Vec<i64>,
+        }
+
+        let mut groups: Vec<Pending> = Vec::new();
         let mut prev_end = i64::MIN;
 
         for (id, ts, dur, device_id, chain_id, quality, context) in rows {
-            let start_new = current.is_none() || ts - prev_end > gap_seconds;
-            if start_new {
-                if let Some(sid) = current {
-                    self.recompute_session(sid).await?;
+            if groups.is_empty() || ts - prev_end > gap_seconds {
+                groups.push(Pending {
+                    device_id,
+                    chain_id,
+                    context,
+                    started_at: ts,
+                    ended_at: ts,
+                    total_duration: 0,
+                    quality_sum: 0.0,
+                    quality_n: 0,
+                    listens: Vec::new(),
+                });
+            }
+            // Safe: the branch above guarantees there is one.
+            let g = groups.last_mut().expect("a session was just started");
+            let d = dur.unwrap_or(0);
+            g.ended_at = g.ended_at.max(ts + d);
+            g.total_duration += d;
+            if let Some(q) = quality {
+                g.quality_sum += q;
+                g.quality_n += 1;
+            }
+            g.listens.push(id);
+            prev_end = ts + d;
+        }
+
+        let sessions = groups.len() as u64;
+        let linked: u64 = groups.iter().map(|g| g.listens.len() as u64).sum();
+
+        // One transaction for the whole rebuild. This is a destructive
+        // regroup — every listen loses its session before any of them gets a
+        // new one — so a crash halfway through used to leave a history with no
+        // sessions at all and no way to tell that had happened.
+        let mut tx = self.pool.begin().await?;
+
+        // Clear the link first — the foreign key means sessions can't go while
+        // anything still points at them.
+        sqlx::query("UPDATE scrobbles SET session_id = NULL WHERE user_id = ?")
+            .bind(user_id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM sessions WHERE user_id = ?")
+            .bind(user_id)
+            .execute(&mut *tx)
+            .await?;
+
+        let now = Self::now_secs();
+        for g in &groups {
+            let res = sqlx::query(
+                "INSERT INTO sessions (user_id, device_id, chain_id, started_at, ended_at,
+                    track_count, total_duration, avg_quality_score, listening_context,
+                    uuid, updated_at)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(user_id)
+            .bind(g.device_id)
+            .bind(g.chain_id)
+            .bind(g.started_at)
+            .bind(g.ended_at)
+            .bind(g.listens.len() as i64)
+            .bind(g.total_duration)
+            .bind((g.quality_n > 0).then(|| g.quality_sum / g.quality_n as f64))
+            .bind(g.context.clone().unwrap_or_else(|| "unknown".into()))
+            .bind(new_uuid())
+            .bind(now)
+            .execute(&mut *tx)
+            .await?;
+            let sid = res.last_insert_rowid();
+
+            // Chunked rather than one statement per listen. The cap is well
+            // under SQLite's parameter limit and keeps a long session from
+            // building a statement thousands of placeholders wide.
+            for chunk in g.listens.chunks(SESSION_LINK_CHUNK) {
+                let placeholders =
+                    std::iter::repeat_n("?", chunk.len()).collect::<Vec<_>>().join(",");
+                let sql = format!(
+                    "UPDATE scrobbles SET session_id = ? WHERE user_id = ? AND id IN ({placeholders})"
+                );
+                let mut q = sqlx::query(&sql).bind(sid).bind(user_id);
+                for id in chunk {
+                    q = q.bind(id);
                 }
-                let res = sqlx::query(
-                    "INSERT INTO sessions (user_id, device_id, chain_id, started_at, ended_at,
-                        track_count, total_duration, avg_quality_score, listening_context,
-                        uuid, updated_at)
-                     VALUES (?, ?, ?, ?, ?, 0, 0, ?, ?, ?, ?)",
-                )
-                .bind(user_id)
-                .bind(device_id)
-                .bind(chain_id)
-                .bind(ts)
-                .bind(ts)
-                .bind(quality)
-                .bind(context.clone().unwrap_or_else(|| "unknown".into()))
-                .bind(new_uuid())
-                .bind(Self::now_secs())
-                .execute(&self.pool)
-                .await?;
-                current = Some(res.last_insert_rowid());
-                sessions += 1;
+                q.execute(&mut *tx).await?;
             }
-
-            if let Some(sid) = current {
-                sqlx::query("UPDATE scrobbles SET session_id = ? WHERE id = ?")
-                    .bind(sid)
-                    .bind(id)
-                    .execute(&self.pool)
-                    .await?;
-                linked += 1;
-            }
-            prev_end = ts + dur.unwrap_or(0);
         }
 
-        if let Some(sid) = current {
-            self.recompute_session(sid).await?;
-        }
+        tx.commit().await?;
         info!("🧵 Rebuilt {} sessions across {} listens for user {}", sessions, linked, user_id);
         Ok((sessions, linked))
     }
@@ -6485,13 +7159,21 @@ impl Database {
                 )
             }
             _ => {
+                // Over `scrobble_artists`, so a performer is on the chart at
+                // all: "Hilary Hahn plays Bach" credits both, where grouping by
+                // `scrobbles.artist` gave the listen to Bach alone.
+                //
+                // `MAX(sa.name)` picks a spelling to display, since the key is
+                // folded — the same trade every other grouping here makes.
                 format!(
-                    "SELECT artist AS name, NULL AS sub, NULL AS album, COUNT(*) AS plays,
-                        COALESCE(SUM(duration), 0) AS seconds,
+                    "SELECT MAX(sa.name) AS name, NULL AS sub, NULL AS album, COUNT(*) AS plays,
+                        COALESCE(SUM(s.duration), 0) AS seconds,
                         NULL AS artwork_url, NULL AS caa_id, NULL AS caa_release_mbid
-                 FROM scrobbles
-                 WHERE user_id = ? AND skipped = FALSE AND (? IS NULL OR timestamp >= ?)
-                 GROUP BY LOWER(TRIM(artist))
+                 FROM scrobble_artists sa
+                 JOIN scrobbles s ON s.id = sa.scrobble_id
+                 WHERE s.user_id = ? AND s.skipped = FALSE
+                   AND (? IS NULL OR s.timestamp >= ?)
+                 GROUP BY sa.artist_key
                  ORDER BY {order} LIMIT ?"
                 )
             }
@@ -6590,17 +7272,17 @@ impl Database {
     pub async fn upsert_note(
         &self,
         user_id: i64,
-        entity_id: Option<i64>,
-        scrobble_id: Option<i64>,
+        target: &NoteTarget,
         body_md: &str,
         visibility: &str,
     ) -> Result<i64, sqlx::Error> {
         let now = Self::now_secs();
-        let existing = match (entity_id, scrobble_id) {
-            (Some(e), _) => self.note_for_entity(user_id, e).await?,
-            (_, Some(s)) => self.note_for_scrobble(user_id, s).await?,
-            _ => None,
+        let existing = match target {
+            NoteTarget::Entity(e) => self.note_for_entity(user_id, *e).await?,
+            NoteTarget::Listen(s) => self.note_for_scrobble(user_id, *s).await?,
+            NoteTarget::Period(k) => self.note_for_period(user_id, k).await?,
         };
+        let (entity_id, scrobble_id, period_key) = target.columns();
 
         if let Some(note) = existing {
             if note.body_md != body_md {
@@ -6620,13 +7302,27 @@ impl Database {
         }
 
         let result = sqlx::query(
-            "INSERT INTO notes (user_id, entity_id, scrobble_id, body_md, visibility, created_at, updated_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?)"
+            "INSERT INTO notes (user_id, entity_id, scrobble_id, period_key, body_md, visibility, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
         )
-        .bind(user_id).bind(entity_id).bind(scrobble_id).bind(body_md).bind(visibility)
+        .bind(user_id).bind(entity_id).bind(scrobble_id).bind(period_key)
+        .bind(body_md).bind(visibility)
         .bind(now).bind(now)
         .execute(&self.pool).await?;
         Ok(result.last_insert_rowid())
+    }
+
+    /// The note about a week, a month or a year, if there is one.
+    pub async fn note_for_period(
+        &self,
+        user_id: i64,
+        period_key: &str,
+    ) -> Result<Option<NoteRow>, sqlx::Error> {
+        sqlx::query_as("SELECT * FROM notes WHERE user_id = ? AND period_key = ?")
+            .bind(user_id)
+            .bind(period_key)
+            .fetch_optional(&self.pool)
+            .await
     }
 
     pub async fn get_note(&self, user_id: i64, id: i64) -> Result<Option<NoteRow>, sqlx::Error> {
@@ -6677,7 +7373,9 @@ impl Database {
     /// what they wrote about Burial means either "the word Burial appears in a
     /// note" or "this is the Burial note", and being asked which is a worse
     /// answer than searching both. The joins are `LEFT` because exactly one of
-    /// `entity_id` / `scrobble_id` is ever set.
+    /// `entity_id` / `scrobble_id` / `period_key` is ever set — and a note about
+    /// a period has neither join to offer, so its own key is what `q` matches
+    /// against, which is what makes "2026-08" find August's note.
     ///
     /// Case-insensitivity is SQLite's `LIKE`, which folds ASCII only — "BURIAL"
     /// finds "Burial", but "CŒUR" does not find "Cœur". Doing better means
@@ -6693,7 +7391,11 @@ impl Database {
             "created" => "n.created_at DESC",
             // Alphabetical by subject. Notes on a listen have no entity name, so
             // they sort last rather than under an empty string at the top.
-            "title" => "e.name IS NULL, LOWER(e.name) ASC, n.updated_at DESC",
+            // Alphabetical by subject. A note on a listen or a period has no
+            // entity name, so it sorts last rather than under an empty string
+            // at the top; period notes then fall together by their own key,
+            // which is chronological because the key was built to sort.
+            "title" => "e.name IS NULL, LOWER(e.name) ASC, n.period_key ASC, n.updated_at DESC",
             _ => "n.updated_at DESC",
         };
         // `kind` is one of the stored entity kinds, or `listen` for a note about
@@ -6702,6 +7404,7 @@ impl Database {
         let kind_clause = match kind {
             "recording" | "release" | "artist" => "e.kind = ?",
             "listen" => "n.scrobble_id IS NOT NULL AND ? IS NOT NULL",
+            "period" => "n.period_key IS NOT NULL AND ? IS NOT NULL",
             _ => "? IS NOT NULL",
         };
         let kind_bind = match kind {
@@ -6732,12 +7435,13 @@ impl Database {
                     OR e.name LIKE ? ESCAPE '\\'
                     OR e.artist_name LIKE ? ESCAPE '\\'
                     OR s.title LIKE ? ESCAPE '\\'
-                    OR s.artist LIKE ? ESCAPE '\\')
+                    OR s.artist LIKE ? ESCAPE '\\'
+                    OR n.period_key LIKE ? ESCAPE '\\')
              ORDER BY {order}"
         );
 
         let mut query = sqlx::query_as(&sql).bind(user_id).bind(kind_bind).bind(q.trim());
-        for _ in 0..5 {
+        for _ in 0..6 {
             query = query.bind(like.clone());
         }
         query.fetch_all(&self.pool).await
@@ -8086,6 +8790,16 @@ impl Database {
         // metadata and stay; the loves and notes that pointed at them go.
         sqlx::query(
             "DELETE FROM note_revisions WHERE note_id IN (SELECT id FROM notes WHERE user_id = ?)",
+        )
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+        // Credits point at listens, so they go before them — the same rule as
+        // the notes above, and the one the loop below cannot express because
+        // this table has no `user_id` of its own.
+        sqlx::query(
+            "DELETE FROM scrobble_artists WHERE scrobble_id IN
+                 (SELECT id FROM scrobbles WHERE user_id = ?)",
         )
         .bind(id)
         .execute(&mut *tx)
@@ -9965,6 +10679,95 @@ mod tests {
     /// Merge and split rewrite `session_id` across rows and then rebuild the
     /// aggregates from what's left — the failure worth designing out is a
     /// session whose counts disagree with its own listens.
+    /// A rebuild has to produce the same aggregates the per-session recompute
+    /// did, because it no longer calls it: the walk now folds every session in
+    /// Rust and writes it once, which is what took a 49k-listen rebuild from
+    /// ~50,000 autocommitted round trips down to one transaction. On the dev
+    /// machine the old version merely looked slow; on a Pi with the database on
+    /// an SD card it ran past a reverse proxy's 100s timeout and the request
+    /// died with a 524 while the rebuild carried on unseen.
+    ///
+    /// The quality average is the part whose mechanics changed and the part
+    /// most easily got wrong: `AVG(quality_score)` ignores NULLs, and most
+    /// listens have none, so summing over every row and dividing by the row
+    /// count would score an imported history at nearly zero.
+    #[tokio::test]
+    async fn a_rebuild_groups_by_the_gap_and_keeps_the_aggregates_honest() {
+        let db = testdb().await;
+        let uid = db.create_user("ida", None, "x", "user").await.unwrap();
+
+        // Three listens close together, then a long gap, then two more.
+        // Durations and scores are deliberately uneven, and two listens carry
+        // no score at all.
+        let listens: [(u64, u64, Option<f64>); 5] = [
+            (1_000, 180, Some(80.0)),
+            (1_200, 180, None),
+            (1_400, 200, Some(60.0)),
+            (10_000, 240, None),
+            (10_300, 120, Some(90.0)),
+        ];
+        for (i, (ts, dur, score)) in listens.iter().enumerate() {
+            let mut p = play(&format!("t{i}"), "A", *ts);
+            p.duration = Some(*dur);
+            let quality = AudioQuality { quality_score: *score, ..Default::default() };
+            db.save_scrobble(
+                uid,
+                &p,
+                Some(&quality),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                ListenDisposition::LIVE,
+            )
+            .await
+            .unwrap();
+        }
+
+        let (sessions, linked) = db.rebuild_sessions(uid, 1800).await.unwrap();
+        assert_eq!(sessions, 2, "the two-and-a-half-hour gap makes two sittings");
+        assert_eq!(linked, 5, "every listen belongs to one of them");
+
+        let rows = db.list_sessions(uid, 50, 0).await.unwrap();
+        assert_eq!(rows.len(), 2);
+        // `list_sessions` is newest first.
+        let (early, late) = (&rows[1], &rows[0]);
+
+        assert_eq!(early.track_count, 3);
+        assert_eq!(early.started_at, 1_000);
+        assert_eq!(early.ended_at, Some(1_600), "the last listen's start plus its length");
+        assert_eq!(early.total_duration, 560);
+        assert_eq!(late.track_count, 2);
+        assert_eq!(late.total_duration, 360);
+
+        // 80 and 60 averaged over the *two* listens that had a score, not over
+        // all three.
+        let early_q = early.avg_quality_score.expect("two of the three were scored");
+        assert!((early_q - 70.0).abs() < 0.001, "expected 70, got {early_q}");
+        let late_q = late.avg_quality_score.expect("one of the two was scored");
+        assert!((late_q - 90.0).abs() < 0.001, "expected 90, got {late_q}");
+
+        // Every listen actually carries its link — the bug `rebuild_sessions`
+        // was written to fix in the first place was sessions with track counts
+        // and no contents.
+        let linked_rows: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM scrobbles WHERE user_id = ? AND session_id IS NOT NULL",
+        )
+        .bind(uid)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(linked_rows.0, 5);
+
+        // Idempotent: running it again regroups to the same shape rather than
+        // stacking a second set of sessions on top.
+        let (again, _) = db.rebuild_sessions(uid, 1800).await.unwrap();
+        assert_eq!(again, 2);
+        assert_eq!(db.list_sessions(uid, 50, 0).await.unwrap().len(), 2);
+    }
+
     #[tokio::test]
     async fn sessions_merge_and_split_and_keep_their_aggregates_honest() {
         let db = testdb().await;
@@ -10999,8 +11802,10 @@ mod tests {
         let uid = db.create_user("ann", None, "x", "user").await.unwrap();
         let e = db.upsert_entity("release", "SAW 85-92", "Aphex Twin", None).await.unwrap();
 
-        let id = db.upsert_note(uid, Some(e), None, "first thoughts", "private").await.unwrap();
-        let again = db.upsert_note(uid, Some(e), None, "second thoughts", "public").await.unwrap();
+        let id =
+            db.upsert_note(uid, &NoteTarget::Entity(e), "first thoughts", "private").await.unwrap();
+        let again =
+            db.upsert_note(uid, &NoteTarget::Entity(e), "second thoughts", "public").await.unwrap();
 
         // One note per target — the second write edits rather than stacks.
         assert_eq!(id, again);
@@ -11015,8 +11820,226 @@ mod tests {
         assert_eq!(revs[0].body_md, "first thoughts");
 
         // Changing only the visibility is not a rewrite.
-        db.upsert_note(uid, Some(e), None, "second thoughts", "private").await.unwrap();
+        db.upsert_note(uid, &NoteTarget::Entity(e), "second thoughts", "private").await.unwrap();
         assert_eq!(db.note_revisions(uid, id).await.unwrap().len(), 1);
+    }
+
+    /// A week, a month or a year is the third thing a note can be about, and
+    /// the CHECK on `notes` is what keeps the three from being confused for one
+    /// another. The key is the note's *identity*, so a malformed one has to be
+    /// refused at the door rather than stored — a note filed under a key the
+    /// Reports page cannot produce is a note its author can never find again,
+    /// which looks from the outside like a save that silently did nothing.
+    /// The whole point: a performer gets credit.
+    ///
+    /// Play "Hilary Hahn plays Bach" and both of them have played it. Before
+    /// `scrobble_artists`, every chart in the application grouped by the single
+    /// `scrobbles.artist` column, so Bach took the listen and Hilary Hahn was
+    /// written into `artist_credit` as text that exactly one query read.
+    ///
+    /// Asserts on the *readouts* rather than on the SQL, for the same reason
+    /// `a_skip_reaches_no_counting_readout` does: that is the only form that
+    /// catches a query written later.
+    #[tokio::test]
+    async fn a_performer_is_credited_alongside_the_composer() {
+        let db = testdb().await;
+        let uid = db.create_user("kit", None, "x", "user").await.unwrap();
+
+        // Three violin sonatas, credited to both. Plus one listen of something
+        // else, so "share of your listening" has a denominator worth dividing.
+        for (i, ts) in [1_000u64, 2_000, 3_000].iter().enumerate() {
+            let mut p = play(&format!("Partita {i}"), "Johann Sebastian Bach", *ts);
+            p.album = Some("Bach: Violin Concertos".into());
+            p.duration = Some(300);
+            p.artists = Some(vec!["Johann Sebastian Bach".into(), "Hilary Hahn".into()]);
+            db.save_scrobble(
+                uid,
+                &p,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                ListenDisposition::LIVE,
+            )
+            .await
+            .unwrap();
+        }
+        let mut other = play("Xtal", "Aphex Twin", 9_000);
+        other.duration = Some(300);
+        db.save_scrobble(
+            uid,
+            &other,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            ListenDisposition::LIVE,
+        )
+        .await
+        .unwrap();
+
+        // The artist page, for somebody who is never the primary.
+        let hh = db.artist_summary(uid, "Hilary Hahn").await.unwrap().expect("she has a page");
+        assert_eq!(hh.plays, 3, "every sonata she played counts as hers");
+        assert_eq!(db.artist_plays(uid, "Hilary Hahn").await.unwrap(), 3);
+        assert_eq!(db.artist_top_tracks(uid, "Hilary Hahn", 10).await.unwrap().len(), 3);
+        assert_eq!(db.artist_albums(uid, "Hilary Hahn", None, 10).await.unwrap().len(), 1);
+        assert_eq!(
+            db.artist_trend(uid, "Hilary Hahn").await.unwrap().iter().map(|(_, n)| n).sum::<i64>(),
+            3
+        );
+
+        // And the composer keeps his, undiminished — this adds a credit rather
+        // than moving one.
+        assert_eq!(db.artist_plays(uid, "Johann Sebastian Bach").await.unwrap(), 3);
+
+        // The chart lists both, and `COUNT(*)` still means listens: a listen
+        // crediting two artists must not count as two plays for either of them.
+        let chart = db.chart(uid, "artists", None, 10, false).await.unwrap();
+        let by_name = |n: &str| chart.iter().find(|r| r.name.eq_ignore_ascii_case(n));
+        let bach = by_name("Johann Sebastian Bach").expect("Bach charts");
+        let hahn = by_name("Hilary Hahn").expect("Hilary Hahn charts");
+        assert_eq!(bach.plays, 3);
+        assert_eq!(hahn.plays, 3);
+        assert_eq!(by_name("Aphex Twin").unwrap().plays, 1);
+
+        // Ranked among artists *heard*, not among record artists.
+        let (rank, total) = db.artist_rank(uid, "Hilary Hahn").await.unwrap();
+        assert!(rank > 0, "a performer has a rank at all");
+        assert_eq!(total, 3, "Bach, Hilary Hahn and Aphex Twin");
+
+        // An album is still the record's own, not the soloist's: fanning out
+        // there would fold her albums into his.
+        let album = db
+            .album_summary(uid, "Johann Sebastian Bach", "Bach: Violin Concertos")
+            .await
+            .unwrap()
+            .expect("the record");
+        assert_eq!(album.plays, 3);
+    }
+
+    /// Every path that writes a listen has to link its credits, and an import
+    /// is the one that does not go through `save_scrobble`.
+    ///
+    /// This does not degrade gracefully. A listen with no row in
+    /// `scrobble_artists` is invisible to every artist page and every chart,
+    /// because those fan out over that table — and the startup backfill only
+    /// covers what was already stored, so an import run after the upgrade would
+    /// produce listens that appear nowhere at all.
+    #[tokio::test]
+    async fn an_imported_listen_is_credited_too() {
+        let db = testdb().await;
+        let uid = db.create_user("mira", None, "x", "user").await.unwrap();
+
+        let mut p = play("Gymnopédie No. 1", "Erik Satie", 1_000);
+        p.artists = Some(vec!["Erik Satie".into(), "Aldo Ciccolini".into()]);
+        db.import_listen_flagged(uid, &p, false).await.unwrap();
+
+        assert_eq!(db.artist_plays(uid, "Erik Satie").await.unwrap(), 1);
+        assert_eq!(db.artist_plays(uid, "Aldo Ciccolini").await.unwrap(), 1);
+        assert!(db.artist_summary(uid, "Aldo Ciccolini").await.unwrap().is_some());
+
+        // And it reaches the chart, which is the readout that would silently
+        // have been short a listen.
+        let chart = db.chart(uid, "artists", None, 10, false).await.unwrap();
+        assert!(chart.iter().any(|r| r.name == "Erik Satie"));
+    }
+
+    /// The credit has been collected in `artist_credit` since v0.17.0 and read
+    /// by almost nothing, so an existing history already holds the answer — the
+    /// join was all that was missing. A backfill that only worked for new
+    /// listens would read as broken for everybody except a new user.
+    #[tokio::test]
+    async fn the_backfill_credits_a_history_that_already_exists() {
+        let db = testdb().await;
+        let uid = db.create_user("lena", None, "x", "user").await.unwrap();
+
+        let mut p = play("Clair de lune", "Claude Debussy", 1_000);
+        p.artists = Some(vec!["Claude Debussy".into(), "Pascal Rogé".into()]);
+        db.save_scrobble(
+            uid,
+            &p,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            ListenDisposition::LIVE,
+        )
+        .await
+        .unwrap();
+
+        // Wind it back to the state a pre-v0.61 database is in: the credit
+        // string is there, the join rows are not.
+        sqlx::query("DELETE FROM scrobble_artists").execute(&db.pool).await.unwrap();
+        assert_eq!(db.artist_plays(uid, "Pascal Rogé").await.unwrap(), 0);
+
+        db.backfill_scrobble_artists().await.unwrap();
+
+        assert_eq!(db.artist_plays(uid, "Pascal Rogé").await.unwrap(), 1);
+        assert_eq!(db.artist_plays(uid, "Claude Debussy").await.unwrap(), 1);
+
+        // Idempotent — it runs at startup, and a second pass must not double
+        // anybody's listening.
+        db.backfill_scrobble_artists().await.unwrap();
+        assert_eq!(db.artist_plays(uid, "Pascal Rogé").await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_period_is_the_third_thing_a_note_can_be_about() {
+        let db = testdb().await;
+        let uid = db.create_user("juno", None, "x", "user").await.unwrap();
+
+        let august = NoteTarget::period("month", "2026-08").expect("a real month");
+        let id = db.upsert_note(uid, &august, "the month of Untrue", "private").await.unwrap();
+
+        let found = db.note_for_period(uid, "month:2026-08").await.unwrap().expect("stored");
+        assert_eq!(found.id, id);
+        assert_eq!(found.body_md, "the month of Untrue");
+        assert!(found.entity_id.is_none() && found.scrobble_id.is_none());
+
+        // One note per period per user: the second write edits the first.
+        db.upsert_note(uid, &august, "the month of Untrue, mostly", "private").await.unwrap();
+        assert_eq!(db.list_notes(uid).await.unwrap().len(), 1);
+        assert_eq!(db.note_revisions(uid, id).await.unwrap().len(), 1, "the edit was archived");
+
+        // The three units do not collide, even where their keys could be read
+        // as one another.
+        let year = NoteTarget::period("year", "2026").expect("a real year");
+        db.upsert_note(uid, &year, "the year of it", "private").await.unwrap();
+        let week = NoteTarget::period("week", "2026-W32").expect("a real week");
+        db.upsert_note(uid, &week, "that week", "private").await.unwrap();
+        assert_eq!(db.list_notes(uid).await.unwrap().len(), 3);
+
+        // Its own key is searchable, which is what a note with no entity and no
+        // listen has to be found by.
+        let hits = db.search_notes(uid, "2026-W32", "", "updated").await.unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].period_key.as_deref(), Some("week:2026-W32"));
+
+        // And the kind filter separates them from records and listens.
+        assert_eq!(db.search_notes(uid, "", "period", "updated").await.unwrap().len(), 3);
+        assert_eq!(db.search_notes(uid, "", "release", "updated").await.unwrap().len(), 0);
+
+        // Shapes Reports does not produce are refused rather than stored.
+        for (unit, key) in [
+            ("month", "2026-13"), // no such month
+            ("month", "2026-8"),  // unpadded
+            ("week", "2026-W54"), // past the longest ISO year
+            ("week", "2026-32"),  // missing the W
+            ("year", "26"),       // not four digits
+            ("decade", "2020"),   // not a unit Reports has
+        ] {
+            assert!(NoteTarget::period(unit, key).is_none(), "{unit} {key} should not be a period");
+        }
     }
 
     #[tokio::test]
@@ -11044,8 +12067,8 @@ mod tests {
             .remove(0);
         let e = db.upsert_entity("recording", "Xtal", "Aphex Twin", None).await.unwrap();
 
-        db.upsert_note(uid, Some(e), None, "about the record", "private").await.unwrap();
-        db.upsert_note(uid, None, Some(listen.id), "heard this on the train", "private")
+        db.upsert_note(uid, &NoteTarget::Entity(e), "about the record", "private").await.unwrap();
+        db.upsert_note(uid, &NoteTarget::Listen(listen.id), "heard this on the train", "private")
             .await
             .unwrap();
 
@@ -11072,13 +12095,20 @@ mod tests {
 
         let record = db.upsert_entity("release", "Untrue", "Burial", None).await.unwrap();
         let artist = db.upsert_entity("artist", "Aphex Twin", "", None).await.unwrap();
-        db.upsert_note(uid, Some(record), None, "the rain on this one", "private").await.unwrap();
-        db.upsert_note(uid, Some(artist), None, "everything after Untrue owes this", "private")
+        db.upsert_note(uid, &NoteTarget::Entity(record), "the rain on this one", "private")
             .await
             .unwrap();
+        db.upsert_note(
+            uid,
+            &NoteTarget::Entity(artist),
+            "everything after Untrue owes this",
+            "private",
+        )
+        .await
+        .unwrap();
         // Someone else's note mentioning the same word must never come back.
         let theirs = db.upsert_entity("release", "Untrue", "Burial", None).await.unwrap();
-        db.upsert_note(other, Some(theirs), None, "not yours", "private").await.unwrap();
+        db.upsert_note(other, &NoteTarget::Entity(theirs), "not yours", "private").await.unwrap();
 
         // The subject matches for one, the body for the other — a search that
         // only did one of those would find half of what was asked for.
@@ -11119,8 +12149,8 @@ mod tests {
         let bob = db.create_user("bob2", None, "x", "user").await.unwrap();
         let e = db.upsert_entity("artist", "Aphex Twin", "", None).await.unwrap();
 
-        let id = db.upsert_note(ann, Some(e), None, "mine", "public").await.unwrap();
-        db.upsert_note(ann, Some(e), None, "mine, edited", "public").await.unwrap();
+        let id = db.upsert_note(ann, &NoteTarget::Entity(e), "mine", "public").await.unwrap();
+        db.upsert_note(ann, &NoteTarget::Entity(e), "mine, edited", "public").await.unwrap();
 
         // Even a `public` note isn't served to anyone else yet — patches don't
         // exist, so every read path is still self-only.
@@ -11131,7 +12161,7 @@ mod tests {
         assert!(db.get_note(ann, id).await.unwrap().is_some());
 
         // Both users can annotate the same entity without colliding.
-        let bobs = db.upsert_note(bob, Some(e), None, "his", "private").await.unwrap();
+        let bobs = db.upsert_note(bob, &NoteTarget::Entity(e), "his", "private").await.unwrap();
         assert_ne!(id, bobs);
     }
 

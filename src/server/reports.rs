@@ -87,6 +87,37 @@ impl Unit {
     }
 }
 
+/// Every artist a row credits, folded, primary first.
+///
+/// `artist_credit` is everyone credited joined with `"; "` — the shape
+/// `save_scrobble` and `fold_artist_credit` both write — so splitting it is
+/// reading our own format rather than guessing at a tag.
+///
+/// The primary comes in already decided by the caller, because on a compilation
+/// it is *not* `scrobbles.artist`: that column holds the "Various Artists"
+/// placeholder and the real performer is the first of the credit. The
+/// placeholder is dropped wherever it appears here for the same reason — it is
+/// a filing convention, and letting it into the tally puts it back on top of
+/// every superlative it was removed from in v0.57.0.
+fn credited_names(primary: &str, credit: Option<&str>) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut push = |n: &str| {
+        let n = n.trim();
+        if n.is_empty() || crate::db::is_various_artists(n) {
+            return;
+        }
+        let key = n.to_lowercase();
+        if !out.contains(&key) {
+            out.push(key);
+        }
+    };
+    push(primary);
+    for name in credit.into_iter().flat_map(|c| c.split(';')) {
+        push(name);
+    }
+    out
+}
+
 /// The period a local datetime falls in, as a sortable key and a label.
 ///
 /// Weeks start on Monday. That is deliberately *not* the user's week-start
@@ -289,9 +320,22 @@ async fn reports(
             &r.artist
         };
         let akey = performer.trim().to_lowercase();
-        let e = b.artists.entry(akey.clone()).or_insert((0, 0));
-        e.0 += 1;
-        e.1 += r.duration.unwrap_or(0).max(0);
+
+        // Everyone credited, not only the one whose name the row carries.
+        // "Hilary Hahn plays Bach" is a listen for both of them, and a report
+        // that named only Bach would disagree with the charts and the artist
+        // page, which fan out over `scrobble_artists`. Same question, three
+        // screens, one answer.
+        //
+        // The tally fans out; **everything keyed on `akey` below does not** —
+        // an album belongs to one artist, and the crush is about the artist a
+        // record introduced you to. Those are facts about the primary.
+        let seconds = r.duration.unwrap_or(0).max(0);
+        for name in credited_names(performer, r.artist_credit.as_deref()) {
+            let e = b.artists.entry(name).or_insert((0, 0));
+            e.0 += 1;
+            e.1 += seconds;
+        }
 
         if let Some(al) = r.album.as_deref().filter(|a| !a.trim().is_empty()) {
             let k = format!("{}|{}", akey, al.trim().to_lowercase());
@@ -407,11 +451,15 @@ async fn reports(
                         if r.artist.trim().to_lowercase() == *k {
                             return Some(r.artist.trim().to_string());
                         }
+                        // Every credited name, not just the first: the key may
+                        // belong to a performer who is never the primary, and
+                        // the fallback would print the folded key instead.
                         r.artist_credit
                             .as_deref()
-                            .and_then(|c| c.split(';').next())
+                            .into_iter()
+                            .flat_map(|c| c.split(';'))
                             .map(str::trim)
-                            .filter(|c| c.to_lowercase() == *k)
+                            .find(|c| c.to_lowercase() == *k)
                             .map(str::to_string)
                     })
                     .unwrap_or_else(|| k.clone());

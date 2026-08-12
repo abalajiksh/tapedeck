@@ -14,6 +14,29 @@ use super::auth::ReadAuth;
 use super::AppState;
 use crate::models::{AudioQuality, Play};
 
+/// Where the playhead is, and — the half that was missing — whether anything
+/// actually knows.
+///
+/// Plex reports `view_offset`, Jellyfin/Emby `PositionTicks`, Roon
+/// `seek_position`, and the shelf ran the clock itself. Those are measurements.
+/// A ListenBrainz-style client submits `playing_now` **once at track start and
+/// carries no position at all**, and Subsonic's `getNowPlaying` answers
+/// `minutesAgo` rather than a playhead — for both of those the only thing
+/// available is wall-clock since we were told, which is right until the listener
+/// pauses, seeks, or was already halfway through when we first heard about it.
+///
+/// Both used to arrive as a bare `0` and be presented as a readout, so a paused
+/// fooyin drew a confident and completely wrong position. The registry still
+/// counts an unknown position forward — that is what expires the entry — but it
+/// says so, and the deck draws it as an estimate rather than a measurement.
+#[derive(Clone, Copy, Debug)]
+pub enum Progress {
+    /// Seconds in, from something that can see the playhead.
+    Known(u64),
+    /// No playhead exists for this source. The number is our own arithmetic.
+    Unknown,
+}
+
 /// Nothing here is persisted: "now playing" is live state, so a restart
 /// correctly shows an empty deck until a source reports again.
 #[derive(Clone, Debug, Serialize)]
@@ -26,6 +49,10 @@ pub struct NowPlaying {
     /// Playback position in seconds **as of `updated_at`**. The client
     /// extrapolates from there between polls rather than us ticking every second.
     pub progress: u64,
+    /// False when `progress` is wall-clock arithmetic rather than a reported
+    /// playhead — see `Progress`. The deck reads this to decide whether it is
+    /// showing a position or a guess.
+    pub position_known: bool,
     pub updated_at: i64,
     /// Which source reported this — also the key the pipeline clears by.
     pub source: String,
@@ -46,14 +73,18 @@ impl NowPlaying {
         play: &Play,
         source: &str,
         quality: Option<&AudioQuality>,
-        progress: u64,
+        progress: Progress,
     ) -> Self {
         Self {
             title: play.title.clone(),
             artist: play.artist.clone(),
             album: play.album.clone(),
             duration: play.duration,
-            progress,
+            progress: match progress {
+                Progress::Known(p) => p,
+                Progress::Unknown => 0,
+            },
+            position_known: matches!(progress, Progress::Known(_)),
             updated_at: now_secs(),
             source: source.to_string(),
             listening_context: None,
@@ -90,6 +121,16 @@ fn now_secs() -> i64 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64
 }
 
+/// How far a freshly reported playhead may sit *behind* our own extrapolation
+/// before we believe it rather than treating it as a stale report.
+///
+/// Sized against Plex, which is the worst of them: the offset in `/status/sessions`
+/// is whatever the player last uploaded on its own timeline cadence, so a few
+/// seconds of lag is normal and is not the listener doing anything. Deliberately
+/// well under the shortest deliberate seek anyone makes — a rewind bigger than
+/// this passes straight through.
+const MAX_PLAYHEAD_LAG_SECS: u64 = 12;
+
 /// In-memory "what's playing right now", keyed by user. Shared by the HTTP
 /// handlers and the poll engine, so it lives behind its own `Arc` rather than
 /// inside `AppState` (the engine never sees `AppState`).
@@ -107,13 +148,35 @@ impl NowPlayingRegistry {
     /// about it: their now-playing is a one-shot that expires on its own after
     /// the track's duration, so re-sending is pure noise aimed at someone
     /// else's servers. Callers forward on `true` only.
-    pub fn set(&self, user_id: i64, np: NowPlaying) -> bool {
+    pub fn set(&self, user_id: i64, mut np: NowPlaying) -> bool {
         let Ok(mut map) = self.0.write() else {
             return false;
         };
-        let changed = map.get(&user_id).is_none_or(|prev| {
+        let previous = map.get(&user_id);
+        let changed = previous.is_none_or(|prev| {
             prev.title != np.title || prev.artist != np.artist || prev.album != np.album
         });
+
+        // A reported playhead is not the same thing as the current playhead.
+        // Plex's `view_offset` is whatever its client last uploaded, which lags
+        // the music by a few seconds and lands unevenly — so every engine tick
+        // handed us a position *behind* the one we had already extrapolated to,
+        // the deck snapped back, then walked forward again until the next tick.
+        // That sawtooth is what "it keeps going backward and forward" is.
+        //
+        // So a small backward step is treated as the report being stale rather
+        // than the music having moved, and we hold our own count. A step bigger
+        // than the lag is a real seek or a restart and is believed — which is
+        // also what keeps a track put on repeat from being pinned at the end.
+        if !changed {
+            if let Some(prev) = previous {
+                let ours = prev.position_at(np.updated_at);
+                if np.progress < ours && ours - np.progress <= MAX_PLAYHEAD_LAG_SECS {
+                    np.progress = ours;
+                }
+            }
+        }
+
         map.insert(user_id, np);
         changed
     }
@@ -196,6 +259,7 @@ mod tests {
             album: Some("Selected Ambient Works 85-92".into()),
             duration: Some(300),
             progress: 0,
+            position_known: true,
             updated_at: now_secs(),
             source: source.into(),
             listening_context: None,
@@ -244,5 +308,74 @@ mod tests {
 
         let (_, position) = reg.get(1).expect("still playing");
         assert!(position >= 120, "expected the newer playhead, got {position}");
+    }
+
+    /// The sawtooth. Plex uploads its playhead on its own cadence, so an engine
+    /// tick routinely reports a position a few seconds behind where the music
+    /// actually is — and the deck, which had already extrapolated past it,
+    /// jumped backwards every time. A stale report must not move the playhead
+    /// back.
+    #[test]
+    fn a_lagging_report_does_not_drag_the_playhead_backwards() {
+        let reg = NowPlayingRegistry::default();
+
+        let mut first = np("Xtal", "Plex");
+        first.progress = 100;
+        reg.set(1, first);
+
+        // The same track re-reported a little behind: Plex's client had not
+        // uploaded the intervening seconds yet.
+        let mut lagging = np("Xtal", "Plex");
+        lagging.progress = 95;
+        reg.set(1, lagging);
+
+        let (_, position) = reg.get(1).expect("still playing");
+        assert!(position >= 100, "playhead went backwards to {position}");
+    }
+
+    /// The other half of the same rule, and the reason it is a tolerance rather
+    /// than a floor: a real rewind — scrubbing back, or putting the track on
+    /// again — has to be believed, or the deck pins itself at the far end of a
+    /// track that has started over.
+    #[test]
+    fn a_real_rewind_is_believed() {
+        let reg = NowPlayingRegistry::default();
+
+        let mut first = np("Xtal", "Plex");
+        first.progress = 200;
+        reg.set(1, first);
+
+        let mut rewound = np("Xtal", "Plex");
+        rewound.progress = 3;
+        reg.set(1, rewound);
+
+        let (_, position) = reg.get(1).expect("still playing");
+        assert!(position < 20, "expected the rewind to land, got {position}");
+    }
+
+    /// A source that cannot see a playhead must not be presented as if it can.
+    /// fooyin submits `playing_now` once at track start with no position in the
+    /// format at all, and Subsonic answers `minutesAgo` — both used to arrive as
+    /// a bare `0` and be drawn as a readout, so a paused player showed a
+    /// confident and completely wrong position.
+    #[test]
+    fn a_source_with_no_playhead_says_so() {
+        let mut play = Play::new(
+            "Giorgio by Moroder".into(),
+            "Daft Punk".into(),
+            0,
+            "np".into(),
+            "ingest".into(),
+        );
+        play.album = Some("Random Access Memories".into());
+        play.duration = Some(544);
+
+        let guessed = NowPlaying::from_play(&play, "ingest", None, Progress::Unknown);
+        assert!(!guessed.position_known);
+        assert_eq!(guessed.progress, 0);
+
+        let measured = NowPlaying::from_play(&play, "Plex", None, Progress::Known(44));
+        assert!(measured.position_known);
+        assert_eq!(measured.progress, 44);
     }
 }

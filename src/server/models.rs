@@ -76,11 +76,50 @@ pub struct AdditionalInfo {
     pub release_group_mbid: Option<String>,
     pub artist_mbids: Option<Vec<String>>,
 
+    /// Every artist credited, where the client sends them separately.
+    ///
+    /// ListenBrainz's own field, and the only structured way a submission can
+    /// say "this is Bach *and* Hilary Hahn". Without it a classical listen is
+    /// one string and the performer is unrecoverable — which is what it was:
+    /// ingest hardcoded `artists: None` and threw the credit away even when it
+    /// was there to read.
+    ///
+    /// Typed loosely on purpose. This lives in `additional_info`, which has no
+    /// schema and where one strict field costs the **whole submission** — the
+    /// trap `lenient_track_number` exists for. Anything that is not an array of
+    /// strings is ignored rather than fatal.
+    #[serde(default, deserialize_with = "lenient_string_list")]
+    pub artist_names: Option<Vec<String>>,
+
     // ── Tapedeck extensions ──
     pub tapedeck_audio: Option<TapedeckAudio>,
     pub tapedeck_device: Option<TapedeckDevice>,
     pub tapedeck_chain: Option<TapedeckChain>,
     pub tapedeck_session: Option<TapedeckSession>,
+}
+
+/// Accepts an array of strings and yields nothing for anything else.
+///
+/// Same rule as `lenient_track_number` and for the same reason: this field
+/// lives in `additional_info`, which ListenBrainz imposes no schema on, and a
+/// strict type there fails the entire submission with a 422 before the handler
+/// ever runs. A bad field costs the field, never the listen.
+fn lenient_string_list<'de, D>(deserializer: D) -> Result<Option<Vec<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Field {
+        List(Vec<String>),
+        /// A bare string, a number, an object — anything at all.
+        Other(serde::de::IgnoredAny),
+    }
+
+    Ok(match Option::<Field>::deserialize(deserializer)? {
+        Some(Field::List(v)) => Some(v),
+        Some(Field::Other(_)) | None => None,
+    })
 }
 
 /// Accepts whatever a client put in `tracknumber` and yields a number or

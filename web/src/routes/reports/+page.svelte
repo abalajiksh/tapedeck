@@ -19,6 +19,7 @@
 	import WeekChapter from '$lib/components/reports/WeekChapter.svelte';
 	import MonthChapter from '$lib/components/reports/MonthChapter.svelte';
 	import YearChapter from '$lib/components/reports/YearChapter.svelte';
+	import PeriodNote from '$lib/components/reports/PeriodNote.svelte';
 
 	const UNITS: { k: 'week' | 'month' | 'year'; label: string }[] = [
 		{ k: 'week', label: 'Week' },
@@ -211,6 +212,14 @@
 					</svelte:fragment>
 				</MonthChapter>
 			{/if}
+		{/key}
+
+		<!-- Below the chapter, not inside one of the three layouts: a note is the
+		     same thing whichever unit is on screen, and putting it in each layout
+		     would be three copies free to drift. Keyed on the period so stepping
+		     to another one cannot leave the previous note's editor open over it. -->
+		{#key `${unit}:${period.key}`}
+			<PeriodNote {unit} periodKey={period.key} label={period.label} />
 		{/key}
 	{/if}
 

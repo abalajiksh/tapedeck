@@ -34,6 +34,22 @@ pub trait MusicSource: Send + Sync {
     fn take_wakeup(&mut self) -> bool {
         false
     }
+
+    /// Adopt the owning user's scrobble threshold — how much of a track has to
+    /// play before it is banked.
+    ///
+    /// The third defaulted trait method, and it follows the same rule as the
+    /// first two: *any* session-shaped source has this concept, so it belongs on
+    /// the trait rather than behind an `Any` downcast, and the default is a
+    /// no-op for the sources that genuinely do not — a history walk is reading
+    /// plays somebody else's software already decided were plays, and has no
+    /// threshold of its own to apply.
+    ///
+    /// A setter rather than a constructor argument because the setting changes
+    /// under a source that is already running, and rebuilding it to carry two
+    /// numbers would throw away the per-session state machine that knows what
+    /// has already been banked — which would re-scrobble whatever was mid-track.
+    fn set_scrobble_threshold(&mut self, _threshold: crate::models::ScrobbleThreshold) {}
 }
 
 /// Jellyfin and Emby share one client — they are one protocol with a prefix on

@@ -528,6 +528,10 @@ impl crate::sources::MusicSource for RoonSource {
         "Roon"
     }
 
+    fn set_scrobble_threshold(&mut self, threshold: crate::models::ScrobbleThreshold) {
+        self.tracker.set_threshold(threshold);
+    }
+
     fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
         self
     }

@@ -20,6 +20,15 @@ export const deck = writable<DeckState>(EMPTY);
 // hundred bytes, so this is close to free, and it was the last stretch of the
 // delay between pressing play and the deck showing it.
 const POLL_MS = 3_000;
+
+// How far the server's playhead may differ from our own count before we snap to
+// it. The server already refuses to move backwards on a stale report, but the
+// two clocks still disagree by a second either way — and snapping every 3s to
+// settle a one-second argument is visible as a stutter in a bar that is
+// otherwise moving smoothly. Anything larger than this is a real seek, a track
+// change or a long stall, and should land immediately.
+const DRIFT_TOLERANCE_SECS = 2;
+
 let watchers = 0;
 let pollTimer: ReturnType<typeof setInterval> | null = null;
 let tickTimer: ReturnType<typeof setInterval> | null = null;
@@ -27,11 +36,24 @@ let tickTimer: ReturnType<typeof setInterval> | null = null;
 async function poll() {
 	try {
 		const s = await api.getNowPlaying();
-		deck.set(
-			s.playing && s.track
-				? { playing: true, track: s.track, position: s.position ?? 0 }
-				: EMPTY
-		);
+		if (!s.playing || !s.track) {
+			deck.set(EMPTY);
+			return;
+		}
+		const track = s.track;
+		const reported = s.position ?? 0;
+		deck.update((d) => {
+			const sameTrack =
+				d.playing && d.track?.title === track.title && d.track?.artist === track.artist;
+			// Keep our own count while the server agrees to within a second or
+			// two — see DRIFT_TOLERANCE_SECS. A different track always takes the
+			// server's number, since ours belongs to the previous one.
+			const position =
+				sameTrack && Math.abs(reported - d.position) <= DRIFT_TOLERANCE_SECS
+					? d.position
+					: reported;
+			return { playing: true, track, position };
+		});
 	} catch {
 		// A failed poll (offline, session expired) just leaves the deck as-is
 		// rather than flickering it empty; the next poll corrects it.

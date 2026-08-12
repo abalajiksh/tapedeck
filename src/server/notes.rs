@@ -31,7 +31,7 @@ use std::sync::Arc;
 use super::auth::{ReadAuth, WriteAuth};
 use super::models::ErrorResponse;
 use super::AppState;
-use crate::db::{Database, EntityRow, NoteRow};
+use crate::db::{Database, EntityRow, NoteRow, NoteTarget};
 use crate::notes::{self, RefKind, Resolved};
 
 const VISIBILITIES: [&str; 3] = ["private", "patched", "public"];
@@ -53,21 +53,21 @@ fn server_error(e: sqlx::Error) -> axum::response::Response {
 ///   created on demand. This is how the UI turns a row in the history into
 ///   something annotatable without the browser having to know entity ids.
 /// * `kind` + `name` (+ `artist`) — spelled out.
+/// * `period_unit` + `period_key` — a week, a month or a year of listening,
+///   named exactly as the Reports page names it.
 #[derive(Debug, Deserialize, Default)]
 pub struct TargetSpec {
     pub entity_id: Option<i64>,
     pub scrobble_id: Option<i64>,
+    /// `week` / `month` / `year`, alongside `period_key`. Both or neither.
+    pub period_unit: Option<String>,
+    /// One of `reports::period_of`'s keys — `2026`, `2026-08`, `2026-W32`.
+    pub period_key: Option<String>,
     pub from_scrobble: Option<i64>,
     pub kind: Option<String>,
     pub name: Option<String>,
     pub artist: Option<String>,
     pub mbid: Option<String>,
-}
-
-/// A note target after resolution: an entity id, or a listen id.
-enum Target {
-    Entity(i64),
-    Listen(i64),
 }
 
 /// Accepts the shortcode spelling (`track`/`album`) as well as the stored one
@@ -81,10 +81,14 @@ fn entity_kind(raw: &str) -> Option<&'static str> {
 /// Turn a spec into a concrete target, creating the entity if that's what was
 /// asked for. Returns a message rather than an id when the spec doesn't name
 /// anything resolvable.
-async fn resolve_target(db: &Database, user_id: i64, spec: &TargetSpec) -> Result<Target, String> {
+async fn resolve_target(
+    db: &Database,
+    user_id: i64,
+    spec: &TargetSpec,
+) -> Result<NoteTarget, String> {
     if let Some(id) = spec.entity_id {
         return match db.get_entity(id).await {
-            Ok(Some(_)) => Ok(Target::Entity(id)),
+            Ok(Some(_)) => Ok(NoteTarget::Entity(id)),
             Ok(None) => Err("No such entity".into()),
             Err(e) => Err(e.to_string()),
         };
@@ -92,10 +96,20 @@ async fn resolve_target(db: &Database, user_id: i64, spec: &TargetSpec) -> Resul
 
     if let Some(id) = spec.scrobble_id {
         return match db.get_scrobble(user_id, id).await {
-            Ok(Some(_)) => Ok(Target::Listen(id)),
+            Ok(Some(_)) => Ok(NoteTarget::Listen(id)),
             Ok(None) => Err("No such listen".into()),
             Err(e) => Err(e.to_string()),
         };
+    }
+
+    // A period is not an entity and never becomes one: there is no row to
+    // create, because a report is folded out of the history on every request.
+    // Validated rather than trusted — the key *is* the note's identity, so a
+    // malformed one files a note the page that wrote it can never find again,
+    // which reads to its author as a save that silently did nothing.
+    if let (Some(unit), Some(key)) = (spec.period_unit.as_deref(), spec.period_key.as_deref()) {
+        return NoteTarget::period(unit, key)
+            .ok_or_else(|| format!("Not a period Reports names: {unit} {key}"));
     }
 
     let kind = spec
@@ -129,7 +143,7 @@ async fn resolve_target(db: &Database, user_id: i64, spec: &TargetSpec) -> Resul
             .upsert_entity(kind, &name, &artist, mbid.as_deref())
             .await
             .map_err(|e| e.to_string())?;
-        return Ok(Target::Entity(id));
+        return Ok(NoteTarget::Entity(id));
     }
 
     let name =
@@ -141,7 +155,7 @@ async fn resolve_target(db: &Database, user_id: i64, spec: &TargetSpec) -> Resul
         .upsert_entity(kind, name, artist, spec.mbid.as_deref())
         .await
         .map_err(|e| e.to_string())?;
-    Ok(Target::Entity(id))
+    Ok(NoteTarget::Entity(id))
 }
 
 /// Artist and album in scope for a note's shortcodes, so `[[track:3]]` and a
@@ -257,6 +271,15 @@ async fn note_json(
     };
     let revisions = db.note_revisions(user_id, note.id).await.map(|r| r.len()).unwrap_or(0);
 
+    // Split back into the pair the caller asked with, rather than handed back
+    // as the stored `month:2026-08` — the Notes list has to name the period, and
+    // formatting "2026-08" as "August 2026" needs to know which of the three it
+    // is without parsing the key's shape a second time.
+    let period = note.period_key.as_deref().map(|key| {
+        let (unit, k) = key.split_once(':').unwrap_or(("", key));
+        serde_json::json!({ "unit": unit, "key": k })
+    });
+
     let mut out = serde_json::json!({
         "id": note.id,
         "body_md": note.body_md,
@@ -266,6 +289,7 @@ async fn note_json(
         "updated_at": note.updated_at,
         "entity": entity,
         "listen": listen,
+        "period": period,
         "loved": loved,
         "revisions": revisions,
     });
@@ -309,16 +333,7 @@ async fn save_note(
         Ok(t) => t,
         Err(msg) => return err(StatusCode::BAD_REQUEST, msg),
     };
-    let (entity_id, scrobble_id) = match target {
-        Target::Entity(id) => (Some(id), None),
-        Target::Listen(id) => (None, Some(id)),
-    };
-
-    match state
-        .db
-        .upsert_note(user.user_id, entity_id, scrobble_id, &body.body_md, &visibility)
-        .await
-    {
+    match state.db.upsert_note(user.user_id, &target, &body.body_md, &visibility).await {
         Ok(id) => match state.db.get_note(user.user_id, id).await {
             Ok(Some(note)) => {
                 (StatusCode::OK, Json(note_json(&state.db, user.user_id, &note, true).await))
@@ -452,12 +467,13 @@ async fn preview(
     // and an unresolvable target just means no album/artist in scope.
     let (ctx_artist, ctx_album) = match resolve_target(&state.db, user.user_id, &body.target).await
     {
-        Ok(Target::Entity(id)) => {
+        Ok(NoteTarget::Entity(id)) => {
             let stub = NoteRow {
                 id: 0,
                 user_id: user.user_id,
                 entity_id: Some(id),
                 scrobble_id: None,
+                period_key: None,
                 body_md: String::new(),
                 visibility: "private".into(),
                 created_at: 0,
@@ -465,12 +481,13 @@ async fn preview(
             };
             note_context(&state.db, user.user_id, &stub).await
         }
-        Ok(Target::Listen(id)) => {
+        Ok(NoteTarget::Listen(id)) => {
             let stub = NoteRow {
                 id: 0,
                 user_id: user.user_id,
                 entity_id: None,
                 scrobble_id: Some(id),
+                period_key: None,
                 body_md: String::new(),
                 visibility: "private".into(),
                 created_at: 0,
@@ -478,7 +495,11 @@ async fn preview(
             };
             note_context(&state.db, user.user_id, &stub).await
         }
-        Err(_) => (None, None),
+        // A period has no record in scope, so a bare `[[album:…]]` in it has
+        // nothing to be relative *to* — which is right: a month is not about
+        // one record. Named shortcodes still resolve; only the positional
+        // `[[track:3]]` loses its meaning, and it renders as plain text.
+        Ok(NoteTarget::Period(_)) | Err(_) => (None, None),
     };
 
     let html =
@@ -491,6 +512,8 @@ async fn preview(
 struct ForQuery {
     entity_id: Option<i64>,
     scrobble_id: Option<i64>,
+    period_unit: Option<String>,
+    period_key: Option<String>,
     from_scrobble: Option<i64>,
     kind: Option<String>,
     name: Option<String>,
@@ -510,6 +533,8 @@ async fn note_for(
     let spec = TargetSpec {
         entity_id: q.entity_id,
         scrobble_id: q.scrobble_id,
+        period_unit: q.period_unit,
+        period_key: q.period_key,
         from_scrobble: q.from_scrobble,
         kind: q.kind,
         name: q.name,
@@ -522,7 +547,7 @@ async fn note_for(
     };
 
     let (note, target_json, loved) = match target {
-        Target::Entity(id) => {
+        NoteTarget::Entity(id) => {
             let entity = state.db.get_entity(id).await.ok().flatten();
             let loved = state.db.is_loved(user.user_id, id).await.unwrap_or(false);
             (
@@ -531,12 +556,22 @@ async fn note_for(
                 loved,
             )
         }
-        Target::Listen(id) => {
+        NoteTarget::Listen(id) => {
             let listen = state.db.get_scrobble(user.user_id, id).await.ok().flatten()
                 .map(|s| serde_json::json!({ "id": s.id, "title": s.title, "artist": s.artist, "album": s.album, "timestamp": s.timestamp }));
             (
                 state.db.note_for_scrobble(user.user_id, id).await,
                 serde_json::json!({ "listen": listen }),
+                false,
+            )
+        }
+        NoteTarget::Period(ref key) => {
+            // The key is echoed back split rather than raw, because that is how
+            // the caller asked for it and how Reports names its own periods.
+            let (unit, k) = key.split_once(':').unwrap_or(("", key.as_str()));
+            (
+                state.db.note_for_period(user.user_id, key).await,
+                serde_json::json!({ "period": { "unit": unit, "key": k } }),
                 false,
             )
         }
@@ -575,13 +610,21 @@ async fn set_love(
     Json(body): Json<LoveRequest>,
 ) -> impl IntoResponse {
     let entity_id = match resolve_target(&state.db, user.user_id, &body.target).await {
-        Ok(Target::Entity(id)) => id,
+        Ok(NoteTarget::Entity(id)) => id,
         // A love is about the record, not about one playing of it — pointing at
         // a listen is a category error rather than something to guess through.
-        Ok(Target::Listen(_)) => {
+        Ok(NoteTarget::Listen(_)) => {
             return err(
                 StatusCode::BAD_REQUEST,
                 "Love a track, album or artist — not a single listen",
+            )
+        }
+        // Same category error one step further out: a love points at a thing,
+        // and a month is not a thing you own.
+        Ok(NoteTarget::Period(_)) => {
+            return err(
+                StatusCode::BAD_REQUEST,
+                "Love a track, album or artist — not a period of listening",
             )
         }
         Err(msg) => return err(StatusCode::BAD_REQUEST, msg),
@@ -803,6 +846,42 @@ fn yaml(key: &str, value: &str) -> String {
     format!("{key}: \"{}\"\n", value.replace('\\', "\\\\").replace('"', "\\\""))
 }
 
+/// A period note's human title — "August 2026", "Week 2026-W32", "2026".
+///
+/// A month is spelled out because "2026-08" reads as a code rather than a
+/// title, and this ends up as a filename in somebody's vault. A week keeps its
+/// ISO key: turning it into a date range here would be a second implementation
+/// of `reports::period_of`'s label, free to disagree with the one the Reports
+/// page shows above the very note being exported.
+fn period_title(period_key: &str) -> String {
+    let (unit, key) = period_key.split_once(':').unwrap_or(("", period_key));
+    match unit {
+        "month" => match key.split_once('-') {
+            Some((y, m)) => {
+                let name = match m.parse::<u32>() {
+                    Ok(1) => "January",
+                    Ok(2) => "February",
+                    Ok(3) => "March",
+                    Ok(4) => "April",
+                    Ok(5) => "May",
+                    Ok(6) => "June",
+                    Ok(7) => "July",
+                    Ok(8) => "August",
+                    Ok(9) => "September",
+                    Ok(10) => "October",
+                    Ok(11) => "November",
+                    Ok(12) => "December",
+                    _ => return key.to_string(),
+                };
+                format!("{name} {y}")
+            }
+            None => key.to_string(),
+        },
+        "week" => format!("Week {key}"),
+        _ => key.to_string(),
+    }
+}
+
 fn iso(ts: i64) -> String {
     chrono::DateTime::from_timestamp(ts, 0)
         .map(|d| d.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
@@ -846,6 +925,16 @@ async fn note_document(db: &Database, user_id: i64, note: &NoteRow, title: &str)
                 db.is_loved(user_id, e.id).await.unwrap_or(false)
             ));
             out.push_str(&format!("tags: [tapedeck, liner-note, {kind}]\n"));
+        }
+        // A note about a period, which has no entity and no listen. Checked
+        // before the listen branch's assumption that `None` means one — that
+        // assumption was true when there were only two kinds of target.
+        None if note.period_key.is_some() => {
+            let key = note.period_key.as_deref().unwrap_or_default();
+            let (unit, k) = key.split_once(':').unwrap_or(("period", key));
+            out.push_str(&yaml("kind", unit));
+            out.push_str(&yaml("period", k));
+            out.push_str(&format!("tags: [tapedeck, liner-note, {unit}]\n"));
         }
         None => {
             out.push_str(&yaml("kind", "listen"));
@@ -943,12 +1032,13 @@ async fn export_notes(
                 Ok(Some(e)) => entity_title(&e),
                 _ => "Untitled".to_string(),
             },
-            None => match note.scrobble_id {
-                Some(sid) => match state.db.get_scrobble(user.user_id, sid).await {
+            None => match (&note.scrobble_id, &note.period_key) {
+                (Some(sid), _) => match state.db.get_scrobble(user.user_id, *sid).await {
                     Ok(Some(s)) => format!("{} — {} (listen)", s.title, s.artist),
                     _ => "Untitled listen".to_string(),
                 },
-                None => "Untitled".to_string(),
+                (_, Some(key)) => period_title(key),
+                _ => "Untitled".to_string(),
             },
         };
         let base = notes::export_filename(&title);

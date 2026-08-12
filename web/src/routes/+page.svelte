@@ -4,7 +4,7 @@
 	import type { Scrobble } from '$lib/api';
 	import ScrobbleRow from '$lib/components/ScrobbleRow.svelte';
 	import { deck, watchNowPlaying } from '$lib/nowplaying';
-	import { formatDuration, qualityLabel, tierTagClass } from '$lib/utils';
+	import { formatDuration, qualityLabel, tierTagClass, mediumLabel } from '$lib/utils';
 	import { loadLoves, lovedKeys, loveKeyOf, toggleLoveByName } from '$lib/loves';
 	import { openAlbum, openArtist } from '$lib/entities';
 	import { fidelity, fidelityLabel } from '$lib/fidelity';
@@ -26,9 +26,21 @@
 	$: live = $deck.playing ? $deck.track : null;
 	$: hero = live ?? recent[0] ?? null;
 	$: heroQ = hero ? qualityLabel(hero) : null;
+	// Same rule as the history row: an object gets named, a file gets its codec,
+	// and the two are never both true.
+	$: heroMedium = hero ? mediumLabel(hero) : null;
 	$: progressPct = live?.duration ? Math.min(100, ($deck.position / live.duration) * 100) : 0;
 	// A tape counter is just a position readout — four digits, like the real thing.
 	$: counter = String(Math.floor($deck.position) % 10000).padStart(4, '0');
+
+	// Whether the number under the bar is a measurement or our own arithmetic.
+	// Plex, Jellyfin, Roon and the shelf report a real playhead; a scrobble
+	// client submitting `playing_now` has no position in the format to send, and
+	// Subsonic answers "minutes ago" — for those this is time since we were
+	// told, and a pause or a seek makes it arbitrarily wrong. It is drawn as an
+	// estimate rather than corrected, because there is nothing to correct it
+	// with: the source genuinely does not know.
+	$: estimated = !!live && live.position_known === false;
 
 	// 14 bars, staggered so the meter doesn't pulse in unison.
 	const vuBars = Array.from({ length: 14 }, (_, i) => ({
@@ -187,8 +199,9 @@
 				</p>
 
 				<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;{live ? 'margin-bottom:16px;' : ''}">
-					{#if heroQ?.text}<span class={tierTagClass(heroQ.tier)}>{heroQ.text}</span>{/if}
-					{#if hero.listening_context}<span class="tag tag-neutral">{hero.listening_context}</span>{/if}
+					{#if heroMedium}<span class="tag tag-medium">{heroMedium}</span>
+					{:else if heroQ?.text}<span class={tierTagClass(heroQ.tier)}>{heroQ.text}</span>{/if}
+					{#if hero.listening_context && !heroMedium}<span class="tag tag-neutral">{hero.listening_context}</span>{/if}
 					{#if live}
 						<div style="display:flex;align-items:flex-end;gap:3px;height:34px;margin-left:4px;">
 							{#each vuBars as bar}
@@ -199,13 +212,18 @@
 				</div>
 
 				{#if live}
-					<div style="height:8px;border-radius:999px;background:var(--td-track);overflow:hidden;margin-bottom:8px;">
+					<div class="bar" class:est={estimated} style="height:8px;border-radius:999px;background:var(--td-track);overflow:hidden;margin-bottom:8px;">
 						<div style="height:100%;width:{progressPct}%;border-radius:999px;background:linear-gradient(90deg,var(--td-accent-2),var(--td-accent-hi));transition:width .9s linear;"></div>
 					</div>
 					<div style="display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;">
 						<div style="display:flex;align-items:center;gap:14px;flex-wrap:wrap;">
-							<div style="font-variant-numeric:tabular-nums;font-size:13.5px;color:var(--td-muted);">
-								{formatDuration($deck.position)}{live.duration ? ` / ${formatDuration(live.duration)}` : ''}
+							<div
+								style="font-variant-numeric:tabular-nums;font-size:13.5px;color:var(--td-muted);{estimated ? 'cursor:help;' : ''}"
+								title={estimated
+									? 'This player reports no playhead, so the position is time since the track was submitted — pausing or seeking makes it wrong.'
+									: ''}
+							>
+								{estimated ? '≈ ' : ''}{formatDuration($deck.position)}{live.duration ? ` / ${formatDuration(live.duration)}` : ''}
 							</div>
 							<button class="btn btn-secondary" on:click={flip} title="Cosmetic — flips the side label" style="font-size:12.5px;padding:6px 14px;gap:7px;">
 								<svg viewBox="0 0 24 24" width="15" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12a9 9 0 0 1 15-6.7L21 8"/><path d="M21 12a9 9 0 0 1-15 6.7L3 16"/></svg>Flip · Side {side}
@@ -266,6 +284,12 @@
 {/if}
 
 <style>
+	/* A bar drawn from a position nobody reported. Faded rather than hidden —
+	   the track really is playing and the length really is known, so removing
+	   it would say less than showing it hesitantly does. */
+	.bar.est { opacity: .5; }
+	.bar.est > :global(div) { background: var(--td-muted-3) !important; }
+
 	/* Unlike the history row's heart, this one is always visible: the deck has
 	   no hover affordance to reveal it and it's the primary action on the card. */
 	.deck-heart {

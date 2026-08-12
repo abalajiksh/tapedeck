@@ -1,5 +1,7 @@
 <script lang="ts">
 	import { onMount, tick } from 'svelte';
+	import { slide } from 'svelte/transition';
+	import { cubicOut } from 'svelte/easing';
 	import {
 		api,
 		type PhysicalRelease, type PhysicalTrack, type ReleaseCandidate,
@@ -549,6 +551,49 @@
 
 	let panelEl: HTMLElement | null = null;
 
+	// ── Where the detail slots in ──
+	// The panel spans a whole grid row and is inserted after the last card of the
+	// row the open one is in, so the cards above it never reflow and the ones
+	// below simply move down. That needs the *actual* column count, which
+	// `auto-fill` + `minmax(260px, 1fr)` settles at layout time — so it is read
+	// off the computed grid rather than re-derived from the viewport width,
+	// which would be a second copy of the same rule, free to disagree.
+	/** Honoured for the slot's unroll the same way the deck's animations are —
+	 *  a transition duration is the one thing a CSS media query cannot reach. */
+	const reducedMotion =
+		typeof window !== 'undefined' &&
+		window.matchMedia?.('(prefers-reduced-motion: reduce)').matches;
+
+	let gridEl: HTMLElement | null = null;
+	let cols = 1;
+	let gridObserver: ResizeObserver | null = null;
+
+	function measureCols() {
+		if (!gridEl) return;
+		const template = getComputedStyle(gridEl).gridTemplateColumns;
+		const n = template ? template.split(' ').filter(Boolean).length : 0;
+		// `none` before first layout, and on a browser without a computed
+		// template. One column is the safe reading: the panel lands directly
+		// under the card, which is where it belongs in a single-column layout
+		// and is merely early in any other.
+		cols = Math.max(1, n);
+	}
+
+	// The grid element only exists once there is something to show, and a filter
+	// that empties the shelf destroys it — so this re-attaches rather than
+	// measuring once at mount.
+	$: if (gridEl && !gridObserver && typeof ResizeObserver !== 'undefined') {
+		gridObserver = new ResizeObserver(measureCols);
+		gridObserver.observe(gridEl);
+		measureCols();
+	}
+
+	$: openIndex = open ? shown.findIndex((r) => r.id === open?.id) : -1;
+	/** Index of the card the panel follows — the end of the open card's row, or
+	 *  the last card when that row is short. */
+	$: slotAfter =
+		openIndex < 0 ? -1 : Math.min(shown.length - 1, (Math.floor(openIndex / cols) + 1) * cols - 1);
+
 	async function openRelease(r: PhysicalRelease) {
 		open = r;
 		playMsg = '';
@@ -564,9 +609,10 @@
 			openTracks = [];
 		}
 		void loadImages(r.id);
-		// The panel is above the grid, but on a long shelf you can still be
-		// scrolled well past it — so bring it to you rather than leaving the
-		// click looking inert.
+		// The panel opens right under its own row now, so this is only for the
+		// case where the row itself is near the bottom of the viewport and the
+		// detail would unroll off-screen. `nearest` is what keeps it from
+		// yanking a card that is already comfortably in view.
 		await tick();
 		panelEl?.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
 	}
@@ -818,6 +864,7 @@
 			clearInterval(tick);
 			clearInterval(beat);
 			window.removeEventListener('focus', refocus);
+			gridObserver?.disconnect();
 		};
 	});
 </script>
@@ -1161,253 +1208,6 @@
 	<p style="color:#b2622d;font-size:14px;">{error}</p>
 {/if}
 
-{#if open}
-	<!-- The open record sits **above** the grid, not after it. With thirty
-	     records the panel opened somewhere off the bottom of the page, so
-	     clicking a card looked like it had done nothing at all — the same
-	     complaint Rediscovery's "See all" had, and the same fix: keep it in
-	     reach, ring the card it belongs to, and scroll it into view. -->
-	<div class="panel open-panel" bind:this={panelEl}
-		style="border-radius:22px;padding:24px;margin:20px 0;">
-		<div style="display:flex;justify-content:space-between;gap:16px;flex-wrap:wrap;align-items:flex-start;">
-			<div>
-				<h3 class="h-display" style="font-size:21px;margin:0;">{open.title}</h3>
-				<p style="margin:4px 0 0;color:var(--td-muted);font-size:14px;">
-					{open.artist}{open.year ? ` · ${open.year}` : ''}
-					{open.catalog_number ? ` · ${open.catalog_number}` : ''}
-					{open.barcode ? ` · ${open.barcode}` : ''}
-				</p>
-				{#if open.last_played}
-					<p style="margin:4px 0 0;color:var(--td-muted-2);font-size:12.5px;">
-						Last played {formatDateTime(open.last_played)}
-					</p>
-				{/if}
-				{#if open.purchased_at}
-					<p style="margin:2px 0 0;color:var(--td-muted-2);font-size:12.5px;">
-						Yours for {ownedFor(open.purchased_at)} — bought {formatDateTime(open.purchased_at).split(',')[0]}
-					</p>
-				{/if}
-			</div>
-			<div style="display:flex;gap:8px;">
-				<button class="btn btn-secondary" on:click={() => (open = null)}>Close</button>
-				<button class="btn btn-secondary" on:click={() => open && remove(open)}>Remove</button>
-			</div>
-		</div>
-
-		<!-- Which shelf it is on. Filed by the picker when it was added, which is
-		     a guess about the object made before anyone looked at it — so it has
-		     to be changeable, and changing it re-splits the tracklist. -->
-		<div class="kindrow">
-			<span style="font-size:11px;letter-spacing:.14em;text-transform:uppercase;color:var(--td-muted-2);font-weight:600;">
-				Filed as
-			</span>
-			{#each ['vinyl', 'cassette', 'cd', 'sacd'] as k}
-				<button class="chip" class:on={open.kind === k} disabled={changingKind}
-					on:click={() => changeKind(k as Kind)}>{KIND_LABEL[k]}</button>
-			{/each}
-			{#if changingKind}<span style="font-size:12.5px;color:var(--td-muted);">Moving…</span>{/if}
-			<span style="flex:1;"></span>
-			<span style="font-size:12px;color:var(--td-muted-2);">
-				{isDisc(open.kind)
-					? 'Plays straight through — no sides.'
-					: 'Split into sides you flip.'}
-			</span>
-		</div>
-
-		{#if !openTracks.length}
-			<p style="font-size:13.5px;color:var(--td-muted);margin:16px 0 0;">
-				No tracklist stored for this one, so there is nothing to record. Re-add it
-				from a lookup that has one.
-			</p>
-		{:else}
-
-			{#if flipPrompt}
-				<div class="flip">
-					<span style="font-size:20px;">↻</span>
-					<div>
-						<div style="font-weight:600;font-size:14.5px;">Flip it — side {flipPrompt} is next</div>
-						<div style="font-size:12.5px;color:var(--td-muted);">
-							{formatDuration(sideSecs(flipPrompt))} on that side.
-						</div>
-					</div>
-					<button class="btn btn-primary" style="margin-left:auto;" disabled={playing}
-						on:click={() => play(flipPrompt)}>Play side {flipPrompt}</button>
-				</div>
-			{/if}
-
-			{#if playMsg}
-				<p style="font-size:13px;color:var(--td-good-fg);margin:14px 0 0;">{playMsg}</p>
-			{/if}
-
-			<!-- What it goes on, and when it became yours. Both are facts about
-			     the object rather than about the music, so they sit together and
-			     above the sides — the picker decides how the next side is
-			     attributed, which is no use discovered afterwards. -->
-			<div class="keeping">
-				<div class="field" style="flex:1;min-width:190px;">
-					<label for="k-chain" style="display:flex;align-items:center;gap:6px;">
-						<ChainIcon name={chains.find((c) => c.id === playChain)?.icon} size={14} />
-						Played through
-					</label>
-					<select id="k-chain" class="input" bind:value={playChain} on:change={saveMeta}>
-						<option value={null}>— no chain —</option>
-						{#each chains as c}<option value={c.id}>{c.name}</option>{/each}
-					</select>
-				</div>
-				<div class="field" style="flex:1;min-width:190px;">
-					<label for="k-gear">On</label>
-					<select id="k-gear" class="input" bind:value={playGear} on:change={saveMeta}>
-						<option value={null}>— no deck —</option>
-						{#each gear as g}<option value={g.id}>{g.name}{g.brand ? ` — ${g.brand}` : ''}</option>{/each}
-					</select>
-				</div>
-				<div class="field" style="flex:0 0 160px;">
-					<label for="k-buy">Bought on</label>
-					<input id="k-buy" class="input" type="date" bind:value={purchased} on:change={saveMeta}>
-				</div>
-				<div style="font-size:12px;color:var(--td-muted-2);flex:1;min-width:180px;align-self:center;">
-					{#if savingMeta}
-						Saving…
-					{:else if !chains.length}
-						No signal chains yet — add one under Signal Chains and every side
-						you play will be attributed to it.
-					{:else}
-						Remembered for next time. The stylus hours of the deck and the
-						chain's own hours both come from the sides played through it.
-					{/if}
-				</div>
-			</div>
-
-			<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:14px;margin-top:18px;">
-				{#each sides as side}
-					<div class="side">
-						<div style="display:flex;align-items:baseline;justify-content:space-between;gap:10px;">
-							<span class="h-display" style="font-size:17px;">{unit(open.kind)} {side}</span>
-							<span style="font-size:12px;color:var(--td-muted-2);">
-								{formatDuration(sideSecs(side))}
-							</span>
-						</div>
-						<!-- Every track is a start point. You do not always begin a
-						     side at its beginning: the needle goes down where you
-						     put it, and a tape carries on from wherever it was
-						     stopped. Clicking one starts there — and nothing before
-						     it is recorded, since a track you never reached is not
-						     a track you skipped. -->
-						<ol style="margin:10px 0 0;padding-left:18px;">
-							{#each openTracks.filter((t) => t.side === side) as t}
-								<li style="font-size:13px;padding:1px 0;">
-									<button class="trk" disabled={playing || !!spinning}
-										title="Start {unit(open.kind).toLowerCase()} {side} from here"
-										on:click={() => startSide(side, t.position)}>
-										<span>{t.title}</span>
-										{#if t.duration_secs}
-											<span style="color:var(--td-muted-2);">· {formatDuration(t.duration_secs)}</span>
-										{/if}
-										{#if parkedAt(open, side) === t.position}
-											<span class="parkpip" title="The tape is sitting here">◂ here</span>
-										{/if}
-									</button>
-								</li>
-							{/each}
-						</ol>
-						<div style="display:flex;gap:6px;margin-top:12px;flex-wrap:wrap;">
-							{#if parkedAt(open, side)}
-								<!-- A cassette is sequential: stop it halfway and eject,
-								     and it is still parked there. So the honest first
-								     offer is to carry on, not to start again. -->
-								<button class="btn btn-primary" style="flex:1;min-width:150px;"
-									disabled={playing || !!spinning}
-									on:click={() => startSide(side, parkedAt(open, side) ?? 1)}>
-									Carry on from track {parkedAt(open, side)}
-								</button>
-								<button class="btn btn-secondary" disabled={playing || !!spinning}
-									title="Wind it back and start the side again"
-									on:click={() => startSide(side, 1)}>
-									From the top
-								</button>
-							{:else}
-								<button class="btn btn-primary" style="flex:1;min-width:150px;"
-									disabled={playing || !!spinning} on:click={() => startSide(side)}>
-									Start {unit(open.kind).toLowerCase()} {side}
-								</button>
-							{/if}
-							<button class="btn btn-secondary" title="Record it now, working the start time back from the running time"
-								disabled={playing || !!spinning} on:click={() => play(side)}>
-								Already played
-							</button>
-						</div>
-					</div>
-				{/each}
-			</div>
-
-			<p style="font-size:12px;color:var(--td-muted-2);margin:16px 0 0;">
-				<strong>Start</strong> when you drop the needle and the start time is the
-				real one. <strong>Already played</strong> works it backwards from the
-				running time instead — the order and the gaps are right, but no one saw
-				the clock.
-			</p>
-		{/if}
-
-		<!-- Outside the tracklist branch on purpose: a pressing nobody has
-		     entered a tracklist for still has a sleeve, and the scans are most of
-		     what makes this feel like the shelf rather than a database of it. -->
-		<div class="scans">
-			<div style="display:flex;align-items:flex-end;justify-content:space-between;gap:12px;flex-wrap:wrap;">
-				<div>
-					<h4 class="h-display" style="font-size:17px;margin:0;">Sleeve &amp; scans</h4>
-					<p style="margin:3px 0 0;color:var(--td-muted);font-size:12.5px;">
-						{images.length
-							? `${images.length} image${images.length === 1 ? '' : 's'} — the archive's, and your own.`
-							: 'Nothing yet. Pull what the Cover Art Archive holds, or scan your own copy.'}
-					</p>
-				</div>
-				<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
-					<select class="input" style="width:auto;padding:7px 10px;font-size:13px;" bind:value={uploadKind}
-						title="What the scans you are about to upload are">
-						{#each KIND_ORDER as k}<option value={k}>{kindLabel(k)}</option>{/each}
-					</select>
-					<label class="btn btn-secondary" style="cursor:pointer;margin:0;">
-						{imagesBusy ? 'Working…' : 'Upload scans'}
-						<input type="file" accept="image/*" multiple on:change={uploadScans}
-							disabled={imagesBusy} style="display:none;">
-					</label>
-					<button class="btn btn-secondary" on:click={fetchArt} disabled={imagesBusy}>
-						{imagesBusy ? '…' : 'Fetch from the archive'}
-					</button>
-				</div>
-			</div>
-
-			{#if imageNote}
-				<p style="font-size:12.5px;color:var(--td-muted);margin:10px 0 0;">{imageNote}</p>
-			{/if}
-
-			{#each gallery as group}
-				<div style="margin-top:16px;">
-					<div style="font-size:11px;letter-spacing:.14em;text-transform:uppercase;color:var(--td-muted-2);font-weight:600;margin-bottom:8px;">
-						{kindLabel(group.kind)}
-						<span style="letter-spacing:0;text-transform:none;font-weight:400;">
-							· {group.items.length}
-						</span>
-					</div>
-					<div class="thumbs">
-						{#each group.items as img}
-							<button class="thumb" on:click={() => (lightbox = flat.indexOf(img))}
-								title={img.caption ?? kindLabel(img.kind)}>
-								<img src={img.thumb} alt={img.caption ?? kindLabel(img.kind)} loading="lazy">
-								{#if img.provider === 'upload'}
-									<!-- Whose scan this is, at a glance. Your own copy and a
-									     stranger's upload of a different pressing are not the
-									     same thing, and only one of them is in this room. -->
-									<span class="mine" title="Your own scan">yours</span>
-								{/if}
-							</button>
-						{/each}
-					</div>
-				</div>
-			{/each}
-		</div>
-	</div>
-{/if}
 
 <!-- The lightbox. A booklet is the one thing here worth looking at full size,
      and nineteen pages need arrows rather than nineteen round trips. -->
@@ -1457,10 +1257,25 @@
 		{/if}
 	</div>
 {:else}
-	<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:14px;">
-		{#each shown as r (r.id)}
+	<!-- The open record's detail slots into the grid **between the row it was
+	     clicked in and the next one**, rather than opening somewhere else on the
+	     page. A panel above the grid meant the eye had to leave the card to find
+	     out what clicking it did; here the thing you clicked stays put, keeps its
+	     ring, and the detail unrolls directly beneath it.
+	
+	     Which card ends that row depends on how many columns the grid actually
+	     has, and `auto-fill` + `minmax` decides that at layout time — so it is
+	     measured off the computed style rather than recalculated from the
+	     breakpoint, which would be a second copy of the same rule free to
+	     disagree with the first. -->
+	<div class="shelf-grid" bind:this={gridEl}>
+		{#each shown as r, i (r.id)}
 			<button class="card" on:click={() => openRelease(r)} class:open={open?.id === r.id}>
-				<CoverArt url={r.artwork_url} caaId={null} releaseMbid={r.mbid_release}
+				<!-- The pressing's own front scan first: `artwork_url` is only what
+				     the barcode lookup returned, and it is empty for most of a
+				     shelf, while the Cover Art Archive pull at add time has been
+				     filling `physical_images` all along. -->
+				<CoverArt url={r.cover_thumb ?? r.artwork_url} caaId={null} releaseMbid={r.mbid_release}
 					seed={`${r.artist} ${r.title}`} size={54} radius={r.kind === 'vinyl' ? 999 : 8} />
 				<div style="flex:1;min-width:0;text-align:left;">
 					<div style="font-weight:600;font-size:14.5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">{r.title}</div>
@@ -1476,12 +1291,271 @@
 					</div>
 				</div>
 			</button>
+			{#if open && i === slotAfter}
+				<div class="slot" transition:slide={{ duration: reducedMotion ? 0 : 260, easing: cubicOut }}>
+			<div class="panel open-panel" bind:this={panelEl}
+				style="border-radius:22px;padding:24px;margin:20px 0;">
+				<div style="display:flex;justify-content:space-between;gap:16px;flex-wrap:wrap;align-items:flex-start;">
+					<div>
+						<h3 class="h-display" style="font-size:21px;margin:0;">{open.title}</h3>
+						<p style="margin:4px 0 0;color:var(--td-muted);font-size:14px;">
+							{open.artist}{open.year ? ` · ${open.year}` : ''}
+							{open.catalog_number ? ` · ${open.catalog_number}` : ''}
+							{open.barcode ? ` · ${open.barcode}` : ''}
+						</p>
+						{#if open.last_played}
+							<p style="margin:4px 0 0;color:var(--td-muted-2);font-size:12.5px;">
+								Last played {formatDateTime(open.last_played)}
+							</p>
+						{/if}
+						{#if open.purchased_at}
+							<p style="margin:2px 0 0;color:var(--td-muted-2);font-size:12.5px;">
+								Yours for {ownedFor(open.purchased_at)} — bought {formatDateTime(open.purchased_at).split(',')[0]}
+							</p>
+						{/if}
+					</div>
+					<div style="display:flex;gap:8px;">
+						<button class="btn btn-secondary" on:click={() => (open = null)}>Close</button>
+						<button class="btn btn-secondary" on:click={() => open && remove(open)}>Remove</button>
+					</div>
+				</div>
+
+				<!-- Which shelf it is on. Filed by the picker when it was added, which is
+				     a guess about the object made before anyone looked at it — so it has
+				     to be changeable, and changing it re-splits the tracklist. -->
+				<div class="kindrow">
+					<span style="font-size:11px;letter-spacing:.14em;text-transform:uppercase;color:var(--td-muted-2);font-weight:600;">
+						Filed as
+					</span>
+					{#each ['vinyl', 'cassette', 'cd', 'sacd'] as k}
+						<button class="chip" class:on={open.kind === k} disabled={changingKind}
+							on:click={() => changeKind(k as Kind)}>{KIND_LABEL[k]}</button>
+					{/each}
+					{#if changingKind}<span style="font-size:12.5px;color:var(--td-muted);">Moving…</span>{/if}
+					<span style="flex:1;"></span>
+					<span style="font-size:12px;color:var(--td-muted-2);">
+						{isDisc(open.kind)
+							? 'Plays straight through — no sides.'
+							: 'Split into sides you flip.'}
+					</span>
+				</div>
+
+				{#if !openTracks.length}
+					<p style="font-size:13.5px;color:var(--td-muted);margin:16px 0 0;">
+						No tracklist stored for this one, so there is nothing to record. Re-add it
+						from a lookup that has one.
+					</p>
+				{:else}
+
+					{#if flipPrompt}
+						<div class="flip">
+							<span style="font-size:20px;">↻</span>
+							<div>
+								<div style="font-weight:600;font-size:14.5px;">Flip it — side {flipPrompt} is next</div>
+								<div style="font-size:12.5px;color:var(--td-muted);">
+									{formatDuration(sideSecs(flipPrompt))} on that side.
+								</div>
+							</div>
+							<button class="btn btn-primary" style="margin-left:auto;" disabled={playing}
+								on:click={() => play(flipPrompt)}>Play side {flipPrompt}</button>
+						</div>
+					{/if}
+
+					{#if playMsg}
+						<p style="font-size:13px;color:var(--td-good-fg);margin:14px 0 0;">{playMsg}</p>
+					{/if}
+
+					<!-- What it goes on, and when it became yours. Both are facts about
+					     the object rather than about the music, so they sit together and
+					     above the sides — the picker decides how the next side is
+					     attributed, which is no use discovered afterwards. -->
+					<div class="keeping">
+						<div class="field" style="flex:1;min-width:190px;">
+							<label for="k-chain" style="display:flex;align-items:center;gap:6px;">
+								<ChainIcon name={chains.find((c) => c.id === playChain)?.icon} size={14} />
+								Played through
+							</label>
+							<select id="k-chain" class="input" bind:value={playChain} on:change={saveMeta}>
+								<option value={null}>— no chain —</option>
+								{#each chains as c}<option value={c.id}>{c.name}</option>{/each}
+							</select>
+						</div>
+						<div class="field" style="flex:1;min-width:190px;">
+							<label for="k-gear">On</label>
+							<select id="k-gear" class="input" bind:value={playGear} on:change={saveMeta}>
+								<option value={null}>— no deck —</option>
+								{#each gear as g}<option value={g.id}>{g.name}{g.brand ? ` — ${g.brand}` : ''}</option>{/each}
+							</select>
+						</div>
+						<div class="field" style="flex:0 0 160px;">
+							<label for="k-buy">Bought on</label>
+							<input id="k-buy" class="input" type="date" bind:value={purchased} on:change={saveMeta}>
+						</div>
+						<div style="font-size:12px;color:var(--td-muted-2);flex:1;min-width:180px;align-self:center;">
+							{#if savingMeta}
+								Saving…
+							{:else if !chains.length}
+								No signal chains yet — add one under Signal Chains and every side
+								you play will be attributed to it.
+							{:else}
+								Remembered for next time. The stylus hours of the deck and the
+								chain's own hours both come from the sides played through it.
+							{/if}
+						</div>
+					</div>
+
+					<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:14px;margin-top:18px;">
+						{#each sides as side}
+							<div class="side">
+								<div style="display:flex;align-items:baseline;justify-content:space-between;gap:10px;">
+									<span class="h-display" style="font-size:17px;">{unit(open.kind)} {side}</span>
+									<span style="font-size:12px;color:var(--td-muted-2);">
+										{formatDuration(sideSecs(side))}
+									</span>
+								</div>
+								<!-- Every track is a start point. You do not always begin a
+								     side at its beginning: the needle goes down where you
+								     put it, and a tape carries on from wherever it was
+								     stopped. Clicking one starts there — and nothing before
+								     it is recorded, since a track you never reached is not
+								     a track you skipped. -->
+								<ol style="margin:10px 0 0;padding-left:18px;">
+									{#each openTracks.filter((t) => t.side === side) as t}
+										<li style="font-size:13px;padding:1px 0;">
+											<button class="trk" disabled={playing || !!spinning}
+												title="Start {unit(open.kind).toLowerCase()} {side} from here"
+												on:click={() => startSide(side, t.position)}>
+												<span>{t.title}</span>
+												{#if t.duration_secs}
+													<span style="color:var(--td-muted-2);">· {formatDuration(t.duration_secs)}</span>
+												{/if}
+												{#if parkedAt(open, side) === t.position}
+													<span class="parkpip" title="The tape is sitting here">◂ here</span>
+												{/if}
+											</button>
+										</li>
+									{/each}
+								</ol>
+								<div style="display:flex;gap:6px;margin-top:12px;flex-wrap:wrap;">
+									{#if parkedAt(open, side)}
+										<!-- A cassette is sequential: stop it halfway and eject,
+										     and it is still parked there. So the honest first
+										     offer is to carry on, not to start again. -->
+										<button class="btn btn-primary" style="flex:1;min-width:150px;"
+											disabled={playing || !!spinning}
+											on:click={() => startSide(side, parkedAt(open, side) ?? 1)}>
+											Carry on from track {parkedAt(open, side)}
+										</button>
+										<button class="btn btn-secondary" disabled={playing || !!spinning}
+											title="Wind it back and start the side again"
+											on:click={() => startSide(side, 1)}>
+											From the top
+										</button>
+									{:else}
+										<button class="btn btn-primary" style="flex:1;min-width:150px;"
+											disabled={playing || !!spinning} on:click={() => startSide(side)}>
+											Start {unit(open.kind).toLowerCase()} {side}
+										</button>
+									{/if}
+									<button class="btn btn-secondary" title="Record it now, working the start time back from the running time"
+										disabled={playing || !!spinning} on:click={() => play(side)}>
+										Already played
+									</button>
+								</div>
+							</div>
+						{/each}
+					</div>
+
+					<p style="font-size:12px;color:var(--td-muted-2);margin:16px 0 0;">
+						<strong>Start</strong> when you drop the needle and the start time is the
+						real one. <strong>Already played</strong> works it backwards from the
+						running time instead — the order and the gaps are right, but no one saw
+						the clock.
+					</p>
+				{/if}
+
+				<!-- Outside the tracklist branch on purpose: a pressing nobody has
+				     entered a tracklist for still has a sleeve, and the scans are most of
+				     what makes this feel like the shelf rather than a database of it. -->
+				<div class="scans">
+					<div style="display:flex;align-items:flex-end;justify-content:space-between;gap:12px;flex-wrap:wrap;">
+						<div>
+							<h4 class="h-display" style="font-size:17px;margin:0;">Sleeve &amp; scans</h4>
+							<p style="margin:3px 0 0;color:var(--td-muted);font-size:12.5px;">
+								{images.length
+									? `${images.length} image${images.length === 1 ? '' : 's'} — the archive's, and your own.`
+									: 'Nothing yet. Pull what the Cover Art Archive holds, or scan your own copy.'}
+							</p>
+						</div>
+						<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
+							<select class="input" style="width:auto;padding:7px 10px;font-size:13px;" bind:value={uploadKind}
+								title="What the scans you are about to upload are">
+								{#each KIND_ORDER as k}<option value={k}>{kindLabel(k)}</option>{/each}
+							</select>
+							<label class="btn btn-secondary" style="cursor:pointer;margin:0;">
+								{imagesBusy ? 'Working…' : 'Upload scans'}
+								<input type="file" accept="image/*" multiple on:change={uploadScans}
+									disabled={imagesBusy} style="display:none;">
+							</label>
+							<button class="btn btn-secondary" on:click={fetchArt} disabled={imagesBusy}>
+								{imagesBusy ? '…' : 'Fetch from the archive'}
+							</button>
+						</div>
+					</div>
+
+					{#if imageNote}
+						<p style="font-size:12.5px;color:var(--td-muted);margin:10px 0 0;">{imageNote}</p>
+					{/if}
+
+					{#each gallery as group}
+						<div style="margin-top:16px;">
+							<div style="font-size:11px;letter-spacing:.14em;text-transform:uppercase;color:var(--td-muted-2);font-weight:600;margin-bottom:8px;">
+								{kindLabel(group.kind)}
+								<span style="letter-spacing:0;text-transform:none;font-weight:400;">
+									· {group.items.length}
+								</span>
+							</div>
+							<div class="thumbs">
+								{#each group.items as img}
+									<button class="thumb" on:click={() => (lightbox = flat.indexOf(img))}
+										title={img.caption ?? kindLabel(img.kind)}>
+										<img src={img.thumb} alt={img.caption ?? kindLabel(img.kind)} loading="lazy">
+										{#if img.provider === 'upload'}
+											<!-- Whose scan this is, at a glance. Your own copy and a
+											     stranger's upload of a different pressing are not the
+											     same thing, and only one of them is in this room. -->
+											<span class="mine" title="Your own scan">yours</span>
+										{/if}
+									</button>
+								{/each}
+							</div>
+						</div>
+					{/each}
+				</div>
+			</div>
+				</div>
+			{/if}
 		{/each}
 	</div>
 {/if}
 
 
 <style>
+	.shelf-grid {
+		display: grid;
+		grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+		gap: 14px;
+	}
+
+	/* The detail takes the whole row it was slotted into, so the cards above it
+	   keep their positions and only the ones below move down. `min-width: 0` is
+	   load-bearing in a grid: without it a wide child (the scan strip, a long
+	   tracklist) sets the column's minimum and stretches the whole shelf. */
+	.slot { grid-column: 1 / -1; min-width: 0; }
+	/* The panel carries its own `margin: 20px 0`; inside a gapped grid row that
+	   would read as a gap and a half. */
+	.slot > :global(.panel) { margin: 6px 0 !important; }
+
 	.chip {
 		border: 1px solid var(--td-line);
 		background: transparent;

@@ -2,7 +2,7 @@
 	import { onMount, onDestroy } from 'svelte';
 	import { api } from '$lib/api';
 	import type { TokenInfo } from '$lib/api';
-	import { formatDateTime } from '$lib/utils';
+	import { formatDateTime, formatDuration } from '$lib/utils';
 	import { theme, setTheme, type ThemeMode } from '$lib/theme';
 	import { showArtwork, setShowArtwork } from '$lib/prefs';
 	import type { Connection, SignalChain, UserProfile } from '$lib/api';
@@ -20,6 +20,7 @@
 		{ id: 'account', label: 'Account', hint: 'Password, picture, bio' },
 		{ id: 'appearance', label: 'Appearance', hint: 'Theme and artwork' },
 		{ id: 'time', label: 'Time', hint: 'Timezone and week start' },
+		{ id: 'scrobbling', label: 'Scrobbling', hint: 'When a listen counts' },
 		{ id: 'sources', label: 'Sources', hint: 'Plex, Navidrome, Jellyfin' },
 		{ id: 'connections', label: 'Connections', hint: 'Where listens are forwarded' },
 		{ id: 'tokens', label: 'API Tokens', hint: 'Scrobble clients' },
@@ -391,6 +392,47 @@
 	let weekStart = 1;
 	let weekSaved = false;
 
+	// ── Scrobble threshold ──
+	// The defaults every source used to hardcode. Held as the numbers the
+	// sliders show; `null` would mean "not yet loaded" and the sliders have to
+	// start somewhere, so the defaults double as the initial value and as what
+	// Reset returns to.
+	const THRESHOLD_DEFAULT_PERCENT = 50;
+	const THRESHOLD_DEFAULT_SECS = 240;
+	let thresholdPercent = THRESHOLD_DEFAULT_PERCENT;
+	let thresholdSecs = THRESHOLD_DEFAULT_SECS;
+	let thresholdSaved = false;
+	let thresholdSaving = false;
+	/** True while the sliders sit exactly on what every source did before this
+	 *  setting existed — which is worth saying, so nobody has to remember it. */
+	$: thresholdIsDefault =
+		thresholdPercent === THRESHOLD_DEFAULT_PERCENT && thresholdSecs === THRESHOLD_DEFAULT_SECS;
+
+	/** What the current pair means for one real track length, which is far
+	 *  easier to judge than two abstract numbers. */
+	function thresholdFor(trackSecs: number): number {
+		return Math.min(Math.round(trackSecs * (thresholdPercent / 100)), thresholdSecs);
+	}
+
+	async function saveThreshold() {
+		thresholdSaving = true;
+		try {
+			await api.putPreferences({
+				scrobble_threshold_percent: thresholdPercent,
+				scrobble_threshold_secs: thresholdSecs
+			});
+			thresholdSaved = true;
+			setTimeout(() => (thresholdSaved = false), 2500);
+		} catch { /* the sliders keep what was typed; nothing was lost */ }
+		thresholdSaving = false;
+	}
+
+	function resetThreshold() {
+		thresholdPercent = THRESHOLD_DEFAULT_PERCENT;
+		thresholdSecs = THRESHOLD_DEFAULT_SECS;
+		saveThreshold();
+	}
+
 	// language enrichment
 	let isAdmin = false;
 	let langStatus: { total: number; resolved: number; pending: number } | null = null;
@@ -747,6 +789,10 @@
 			const prefs = await api.getPreferences();
 			timezone = (prefs.timezone as string) || Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC';
 			if (typeof prefs.week_start === 'number') weekStart = ((prefs.week_start % 7) + 7) % 7;
+			if (typeof prefs.scrobble_threshold_percent === 'number')
+				thresholdPercent = Math.min(100, Math.max(5, Math.round(prefs.scrobble_threshold_percent)));
+			if (typeof prefs.scrobble_threshold_secs === 'number')
+				thresholdSecs = Math.min(3600, Math.max(10, Math.round(prefs.scrobble_threshold_secs)));
 		} catch { timezone = 'UTC'; }
 		try { isAdmin = (await api.me()).is_admin; } catch { /* optional */ }
 		loadProfile();
@@ -1136,6 +1182,68 @@
 						</div>
 					</div>
 				</div>
+			</div>
+		{/if}
+
+		{#if section === 'scrobbling'}
+			<div class="panel" style="border-radius:22px;padding:24px;margin-bottom:18px;">
+				<h3 class="h-display" style="font-size:19px;margin-bottom:4px;">When a listen counts</h3>
+				<p style="font-size:13px;color:var(--td-muted);margin:0 0 6px;max-width:64ch;">
+					A track is banked once <strong>either</strong> of these is reached — whichever comes
+					first. The defaults are Last.fm's convention, which suits a three-minute song and
+					suits a forty-minute raga rather less.
+				</p>
+				<p style="font-size:12.5px;color:var(--td-muted-3);margin:0 0 18px;max-width:64ch;">
+					Applies to sources that watch playback as it happens — Plex, Jellyfin, Emby and
+					Roon. A scrobble client decides for itself and tells Tapedeck the answer, and an
+					import is reading listens somebody else already counted.
+				</p>
+
+				<div class="row">
+					<div class="row-main">
+						<div class="row-title">Share of the track — {thresholdPercent}%</div>
+						<div class="row-sub">
+							What makes a short track count at all. At 100% only a track played to the end
+							is banked.
+						</div>
+					</div>
+					<input type="range" class="slider" min="5" max="100" step="5"
+						bind:value={thresholdPercent} on:change={saveThreshold}
+						aria-label="Share of the track that must play">
+				</div>
+
+				<div class="row">
+					<div class="row-main">
+						<div class="row-title">Or after — {formatDuration(thresholdSecs)}</div>
+						<div class="row-sub">
+							What stops a long piece needing half of itself first. Also the only rule
+							available when a source reports no track length at all.
+						</div>
+					</div>
+					<input type="range" class="slider" min="30" max="1200" step="30"
+						bind:value={thresholdSecs} on:change={saveThreshold}
+						aria-label="Seconds after which a track counts regardless">
+				</div>
+
+				<!-- Two abstract numbers are hard to judge; three real records are not. -->
+				<div class="examples">
+					<div class="ex"><span>A 3:00 song</span><strong>{formatDuration(thresholdFor(180))}</strong></div>
+					<div class="ex"><span>A 9:04 track</span><strong>{formatDuration(thresholdFor(544))}</strong></div>
+					<div class="ex"><span>A 40:00 raga</span><strong>{formatDuration(thresholdFor(2400))}</strong></div>
+				</div>
+
+				<div style="display:flex;gap:10px;align-items:center;margin-top:16px;flex-wrap:wrap;">
+					<button class="btn btn-secondary" on:click={resetThreshold} disabled={thresholdIsDefault || thresholdSaving}>
+						Back to the defaults
+					</button>
+					{#if thresholdSaved}<span style="color:var(--td-good-fg);font-size:13px;">✓ Saved</span>
+					{:else if thresholdIsDefault}<span style="color:var(--td-muted-3);font-size:13px;">Currently the standard 50% or 4:00.</span>{/if}
+				</div>
+
+				<p style="font-size:12px;color:var(--td-muted-3);margin:14px 0 0;max-width:64ch;">
+					A change reaches the running sources within a minute. Anything already past the
+					old threshold has been banked and stays banked.
+				</p>
 			</div>
 		{/if}
 
@@ -1961,6 +2069,21 @@
 	.row-main { min-width: 0; flex: 1 1 260px; }
 	.row-title { font-size: 14px; font-weight: 600; margin-bottom: 3px; }
 	.row-sub { font-size: 12.5px; color: var(--td-muted); line-height: 1.45; max-width: 52ch; }
+
+	/* Sized to sit in the same slot the `.row` selects and buttons use, so the
+	   Scrobbling rows line up with the Time ones above them. */
+	.slider { width: 200px; max-width: 100%; accent-color: var(--td-accent); cursor: pointer; }
+
+	.examples {
+		display: flex; gap: 10px; flex-wrap: wrap; margin-top: 18px;
+		padding-top: 16px; border-top: 1px solid var(--td-border);
+	}
+	.ex {
+		display: flex; flex-direction: column; gap: 3px;
+		padding: 10px 14px; border-radius: 12px; background: var(--td-surface2); min-width: 118px;
+	}
+	.ex span { font-size: 11.5px; color: var(--td-muted); }
+	.ex strong { font-size: 16px; font-variant-numeric: tabular-nums; }
 
 	/* Sat directly under the input on a negative margin, which put it against
 	   the field's bottom edge with no room to breathe. */

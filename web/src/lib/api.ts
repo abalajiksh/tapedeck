@@ -440,6 +440,13 @@ export interface NowPlayingTrack {
 	album: string | null;
 	duration: number | null;
 	progress: number;
+	/**
+	 * False when the source cannot see a playhead and `progress` is the
+	 * server's own wall-clock arithmetic — a ListenBrainz `playing_now` carries
+	 * no position in the format at all, and Subsonic reports `minutesAgo`. Draw
+	 * those as an estimate; a pause or a seek makes them arbitrarily wrong.
+	 */
+	position_known: boolean;
 	updated_at: number;
 	source: string;
 	listening_context: string | null;
@@ -534,6 +541,18 @@ export interface NoteTarget {
 	name?: string;
 	artist?: string;
 	mbid?: string;
+	/** A week, a month or a year of listening. Both of these or neither — the
+	 *  key alone is ambiguous, since Reports names periods per unit. */
+	period_unit?: 'week' | 'month' | 'year';
+	/** Exactly as Reports names it: `2026`, `2026-08`, `2026-W32`. */
+	period_key?: string;
+}
+
+/** The period a note is about, echoed back split rather than as the stored
+ *  `month:2026-08` — naming it needs to know which of the three units it is. */
+export interface NotePeriod {
+	unit: string;
+	key: string;
 }
 
 export interface Note {
@@ -547,6 +566,9 @@ export interface Note {
 	updated_at: number;
 	entity: Entity | null;
 	listen: NoteListen | null;
+	/** Set when the note is about a report period rather than a record or a
+	 *  listen. Exactly one of `entity` / `listen` / `period` is ever present. */
+	period: NotePeriod | null;
 	loved: boolean;
 	revisions: number;
 }
@@ -571,7 +593,7 @@ export interface ListenAnnotations {
  *  shortcode one, because that is what the server filters on. */
 export interface NoteQuery {
 	q?: string;
-	kind?: '' | 'recording' | 'release' | 'artist' | 'listen';
+	kind?: '' | 'recording' | 'release' | 'artist' | 'listen' | 'period';
 	sort?: 'updated' | 'created' | 'title';
 }
 
@@ -693,6 +715,36 @@ export interface AlbumView {
 	stats: StatCard[];
 	tracks: TrackAggregate[];
 	more: AlbumAggregate[];
+}
+
+/** One track of a record's own tracklist, as the lookup reports it. */
+export interface TracklistTrack {
+	/** "A", "B", … A CD comes back as a single side. */
+	side: string;
+	position: number;
+	title: string;
+	/** Set where the release credits the track to somebody other than the
+	 *  record's artist — a compilation, or a guest. */
+	artist: string | null;
+	duration_secs: number | null;
+}
+
+/**
+ * A record's own tracklist, pulled from MusicBrainz on request.
+ *
+ * Deliberately not part of `AlbumView`: it costs a rate-limited call to an
+ * external service, and it is never stored — the page matches it against the
+ * plays it already holds, because writing a tracklist into the history would be
+ * inventing listens that never happened.
+ */
+export interface AlbumTracklist {
+	source: string;
+	mbid_release: string | null;
+	title: string;
+	artist: string;
+	year: number | null;
+	format: string | null;
+	tracks: TracklistTrack[];
 }
 
 export interface ArtistView {
@@ -901,6 +953,10 @@ export interface PhysicalRelease {
 	played_secs: number;
 	last_played: number | null;
 	image_count: number;
+	/** The front sleeve out of this pressing's own scans. Prefer it over
+	 *  `artwork_url`, which is only whatever the barcode lookup happened to
+	 *  return and is empty for a great many releases. */
+	cover_thumb: string | null;
 }
 
 export interface PlayResult {
@@ -1682,6 +1738,10 @@ class TapedeckAPI {
 	// ── Album & artist pages ──
 	async getAlbum(id: number): Promise<AlbumView> { return this.get(`/api/v1/albums/${id}`); }
 	async getArtist(id: number): Promise<ArtistView> { return this.get(`/api/v1/artists/${id}`); }
+	/** The record as MusicBrainz has it, including tracks never played. 404s when
+	 *  MusicBrainz has no matching release, which is normal for a great deal of a
+	 *  real library and is not an error worth shouting about. */
+	async getAlbumTracklist(id: number): Promise<AlbumTracklist> { return this.get(`/api/v1/albums/${id}/tracklist`); }
 	/** Name → entity id, creating it on first use. See `$lib/entities`. */
 	async resolveEntity(kind: 'album' | 'artist' | 'track', name: string, artist?: string): Promise<{ id: number; kind: string }> {
 		const q = new URLSearchParams({ kind, name });
@@ -1745,7 +1805,7 @@ class TapedeckAPI {
 		return this.post('/api/v1/notes/preview', body);
 	}
 	/** The note for a target, if any — plus the resolved target itself. */
-	async noteFor(target: NoteTarget): Promise<{ note: Note | null; target: { entity?: Entity | null; listen?: NoteListen | null }; loved: boolean }> {
+	async noteFor(target: NoteTarget): Promise<{ note: Note | null; target: { entity?: Entity | null; listen?: NoteListen | null; period?: NotePeriod | null }; loved: boolean }> {
 		const q = new URLSearchParams();
 		for (const [k, v] of Object.entries(target)) {
 			if (v !== undefined && v !== null) q.set(k, String(v));

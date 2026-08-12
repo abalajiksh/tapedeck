@@ -129,6 +129,71 @@ impl ListenDisposition {
     }
 }
 
+/// When a listen counts — how much of a track has to play before it is banked.
+///
+/// The default is Last.fm's convention and the number every session-shaped
+/// source here has always hardcoded: **half the track, or four minutes,
+/// whichever comes first**. That is a convention, not a fact, and it fits a
+/// three-minute pop song far better than it fits a forty-minute raga, a
+/// nineteen-minute side-long piece, or a ninety-second hardcore track — which is
+/// why it is a per-user setting rather than a constant.
+///
+/// Both halves are kept, and "whichever comes first" is the whole point of
+/// having two: the fraction is what makes a short track count, and the flat
+/// number is what stops a long one needing twenty minutes before it exists.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ScrobbleThreshold {
+    /// Share of the track that must have played, 0.0–1.0.
+    pub fraction: f64,
+    /// Seconds after which it counts regardless of the fraction. Also the only
+    /// rule available when the source reported no duration.
+    pub after_secs: u64,
+}
+
+impl Default for ScrobbleThreshold {
+    fn default() -> Self {
+        Self { fraction: Self::DEFAULT_FRACTION, after_secs: Self::DEFAULT_AFTER_SECS }
+    }
+}
+
+impl ScrobbleThreshold {
+    pub const DEFAULT_FRACTION: f64 = 0.5;
+    pub const DEFAULT_AFTER_SECS: u64 = 240;
+
+    /// Read the user's stored preferences, clamped.
+    ///
+    /// Clamped rather than validated-and-rejected because this is read on the
+    /// poll path, where there is nobody to report an error to — and the floors
+    /// are doing real work. A fraction of zero would bank a listen the instant a
+    /// track appeared in a session list, including one the listener skipped past
+    /// in a second, and it would do it to their permanent public Last.fm record.
+    pub fn from_prefs(prefs: &serde_json::Value) -> Self {
+        let percent = prefs.get("scrobble_threshold_percent").and_then(|v| v.as_f64());
+        let secs = prefs.get("scrobble_threshold_secs").and_then(|v| v.as_u64());
+        Self {
+            fraction: percent
+                .map(|p| (p / 100.0).clamp(0.05, 1.0))
+                .unwrap_or(Self::DEFAULT_FRACTION),
+            after_secs: secs.map(|s| s.clamp(10, 3600)).unwrap_or(Self::DEFAULT_AFTER_SECS),
+        }
+    }
+
+    /// Has this playhead earned the listen?
+    ///
+    /// One implementation shared by every source, so the case that used to be
+    /// easy to get wrong — a source reporting no duration, where the fraction is
+    /// unanswerable and only the flat number applies — cannot diverge between
+    /// them.
+    pub fn reached(&self, position_secs: u64, duration_secs: Option<u64>) -> bool {
+        match duration_secs {
+            Some(d) if d > 0 => {
+                position_secs as f64 >= d as f64 * self.fraction || position_secs >= self.after_secs
+            }
+            _ => position_secs >= self.after_secs,
+        }
+    }
+}
+
 /// What an import knew about a listen beyond the listen itself.
 ///
 /// Every field is something one export format carries and the others do not, so
@@ -318,3 +383,77 @@ impl ListeningContext {
 
 // Device, Equipment, and ListeningSession rows are read back as ad-hoc tuples
 // or the DeviceRow/EquipmentRow types in db.rs — no shared model struct needed.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The two halves are an OR, and both directions matter: the fraction is
+    /// what lets a ninety-second track count at all, and the flat number is what
+    /// stops a nineteen-minute side needing nine and a half minutes first.
+    #[test]
+    fn either_half_of_the_threshold_is_enough() {
+        let t = ScrobbleThreshold::default();
+
+        assert!(!t.reached(40, Some(180)), "40s of a 3:00 track is not half of it");
+        assert!(t.reached(90, Some(180)), "half of a 3:00 track counts");
+
+        // 20 minutes long, so half is ten — but four minutes is the other rule.
+        assert!(t.reached(240, Some(1200)));
+        assert!(!t.reached(239, Some(1200)));
+    }
+
+    /// A source that reported no duration leaves the fraction unanswerable, so
+    /// only the flat number applies. This lived separately in each source
+    /// before; it lives here now so the four cannot diverge.
+    #[test]
+    fn with_no_duration_only_the_flat_rule_applies() {
+        let t = ScrobbleThreshold::default();
+        assert!(!t.reached(239, None));
+        assert!(t.reached(240, None));
+        assert!(t.reached(240, Some(0)), "a zero duration is no duration");
+    }
+
+    /// The listener's numbers, not ours.
+    #[test]
+    fn a_configured_threshold_is_the_one_that_applies() {
+        let prefs = serde_json::json!({
+            "scrobble_threshold_percent": 80,
+            "scrobble_threshold_secs": 600
+        });
+        let t = ScrobbleThreshold::from_prefs(&prefs);
+
+        assert!(!t.reached(90, Some(180)), "half is no longer enough");
+        assert!(t.reached(144, Some(180)), "80% is");
+        assert!(!t.reached(240, Some(3600)), "and four minutes no longer is");
+    }
+
+    /// Read on the poll path, where there is nobody to hand an error to — so a
+    /// nonsense value is clamped rather than rejected. The floor is load-bearing
+    /// rather than tidy: a fraction of zero would bank a listen the instant a
+    /// track appeared in a session list, and forward it to somebody's permanent
+    /// public record.
+    #[test]
+    fn a_nonsense_threshold_is_clamped_not_obeyed() {
+        let zero = ScrobbleThreshold::from_prefs(&serde_json::json!({
+            "scrobble_threshold_percent": 0,
+            "scrobble_threshold_secs": 0
+        }));
+        assert!(!zero.reached(0, Some(300)), "nothing counts at zero seconds played");
+        assert!(zero.fraction >= 0.05);
+        assert!(zero.after_secs >= 10);
+
+        let silly = ScrobbleThreshold::from_prefs(&serde_json::json!({
+            "scrobble_threshold_percent": 5000,
+            "scrobble_threshold_secs": 999_999
+        }));
+        assert_eq!(silly.fraction, 1.0, "at most the whole track");
+        assert_eq!(silly.after_secs, 3600);
+
+        // An empty settings object is the overwhelmingly common case.
+        assert_eq!(
+            ScrobbleThreshold::from_prefs(&serde_json::json!({})),
+            ScrobbleThreshold::default()
+        );
+    }
+}

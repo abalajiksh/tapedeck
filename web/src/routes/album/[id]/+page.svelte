@@ -2,10 +2,10 @@
 	import { onMount } from 'svelte';
 	import { page } from '$app/stores';
 	import { api } from '$lib/api';
-	import type { AlbumView } from '$lib/api';
+	import type { AlbumView, AlbumTracklist, TracklistTrack } from '$lib/api';
 	import { formatDuration, qualityLabel, tierTagClass } from '$lib/utils';
 	import { openArtist } from '$lib/entities';
-	import { lovedKeys } from '$lib/loves';
+	import { lovedKeys, loveKeyOf, toggleLoveByName } from '$lib/loves';
 	import CoverArt from '$lib/components/CoverArt.svelte';
 	import StatStrip from '$lib/components/StatStrip.svelte';
 	import BioCard from '$lib/components/BioCard.svelte';
@@ -70,6 +70,96 @@
 		const m = Math.round(seconds / 60);
 		return m >= 60 ? `${Math.floor(m / 60)}h ${m % 60}m` : `${m} min`;
 	}
+
+	// ── The record's own tracklist ──
+	// Everything else on this page is built from listens, which means a record
+	// you have played twice renders as a two-track record. Pulling the real
+	// tracklist is what turns the page from a picture of your listening into a
+	// picture of the object — so it is opt-in, costs a rate-limited call to
+	// MusicBrainz, and is never stored: writing these into `scrobbles` would be
+	// inventing listens that never happened.
+	let full: AlbumTracklist | null = null;
+	let fullLoading = false;
+	let fullError = '';
+	let showFull = false;
+
+	async function loadTracklist() {
+		if (!album || fullLoading) return;
+		if (full) { showFull = !showFull; return; }
+		fullLoading = true;
+		fullError = '';
+		try {
+			full = await api.getAlbumTracklist(album.id);
+			showFull = true;
+		} catch (e) {
+			fullError = String(e).replace(/^API \d+: /, '');
+		}
+		fullLoading = false;
+	}
+
+	/** Light fold for matching a played title against the record's own. Not
+	 *  `normalise_artist`'s aggression — that answers "same performer?", where
+	 *  over-folding invents a merge. Here a miss only costs a row appearing as
+	 *  unplayed, so punctuation and case are folded and nothing else. */
+	function titleKey(t: string): string {
+		return t.trim().toLowerCase().replace(/[^\p{L}\p{N}]+/gu, '');
+	}
+
+	interface Row {
+		title: string;
+		artist: string;
+		position: number | null;
+		side: string | null;
+		duration: number | null;
+		plays: number;
+		/** Present only for tracks you have actually played — it carries the
+		 *  quality columns the badge is built from. */
+		played: AlbumView['tracks'][number] | null;
+	}
+
+	/** The record's running order, with your plays attached to the tracks that
+	 *  have any. A played track the lookup does not list is kept and appended:
+	 *  it is evidence of something you actually heard, and MusicBrainz being
+	 *  short a bonus track is not a reason to hide it. */
+	function mergeTracklist(listed: TracklistTrack[], played: AlbumView['tracks']): Row[] {
+		const byKey = new Map(played.map((t) => [titleKey(t.title), t]));
+		const claimed = new Set<string>();
+
+		const rows: Row[] = listed.map((t) => {
+			const key = titleKey(t.title);
+			const hit = byKey.get(key);
+			if (hit) claimed.add(key);
+			return {
+				title: t.title,
+				artist: t.artist ?? album?.artist ?? '',
+				position: t.position,
+				side: t.side,
+				duration: hit?.duration ?? t.duration_secs ?? null,
+				plays: hit?.plays ?? 0,
+				played: hit ?? null
+			};
+		});
+
+		for (const t of played) {
+			if (claimed.has(titleKey(t.title))) continue;
+			rows.push({
+				title: t.title,
+				artist: album?.artist ?? '',
+				position: t.track_number ?? null,
+				side: null,
+				duration: t.duration ?? null,
+				plays: t.plays,
+				played: t
+			});
+		}
+		return rows;
+	}
+
+	$: fullRows = full && showFull ? mergeTracklist(full.tracks, album?.tracks ?? []) : [];
+	$: unplayedCount = fullRows.filter((r) => !r.plays).length;
+	/** Sides only mean something on a record pressed with them — a CD comes back
+	 *  as one side and labelling every row "A" would be noise. */
+	$: showSides = new Set(fullRows.map((r) => r.side).filter(Boolean)).size > 1;
 
 	// The love state lives in the shared store so a heart toggled here matches
 	// the one on the history rows without either refetching.
@@ -199,23 +289,78 @@
 
 	<BioCard bio={album.bio} heading="About this release" />
 
-	{#if album.tracks.length}
-		<div class="sec-head">
-			<h3 class="h-display" style="font-size:20px;margin:0;">Tracks</h3>
-			<div style="display:inline-flex;background:var(--td-sidebar);border-radius:999px;padding:3px;gap:2px;">
-				<button class="seg-btn" class:on={sort === 'plays'} on:click={() => (sort = 'plays')}>By plays</button>
-				<button class="seg-btn" class:on={sort === 'sequence'} on:click={() => (sort = 'sequence')}>Track order</button>
-			</div>
+	<div class="sec-head">
+		<h3 class="h-display" style="font-size:20px;margin:0;">Tracks</h3>
+		<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
+			{#if !showFull && album.tracks.length}
+				<div style="display:inline-flex;background:var(--td-sidebar);border-radius:999px;padding:3px;gap:2px;">
+					<button class="seg-btn" class:on={sort === 'plays'} on:click={() => (sort = 'plays')}>By plays</button>
+					<button class="seg-btn" class:on={sort === 'sequence'} on:click={() => (sort = 'sequence')}>Track order</button>
+				</div>
+			{/if}
+			<!-- Opt-in, because it is a call to somebody else's rate-limited
+			     server. Once pulled it is held for the life of the page, so the
+			     button becomes a plain toggle. -->
+			<button class="btn btn-secondary" style="font-size:12.5px;" on:click={loadTracklist} disabled={fullLoading}>
+				{#if fullLoading}Looking it up…
+				{:else if !full}Whole record
+				{:else if showFull}Only what I've played
+				{:else}Whole record{/if}
+			</button>
 		</div>
+	</div>
+
+	{#if fullError}
+		<p style="font-size:13px;color:var(--td-muted);margin:0 0 12px;">{fullError}</p>
+	{/if}
+
+	{#if showFull && full}
+		<p style="font-size:12.5px;color:var(--td-muted);margin:0 0 10px;">
+			The record as MusicBrainz has it{full.year ? `, ${full.year}` : ''}{full.format ? ` · ${full.format}` : ''}
+			{#if unplayedCount} — {unplayedCount} track{unplayedCount === 1 ? '' : 's'} you haven't played{/if}.
+			Nothing here is stored as a listen.
+		</p>
+		<div class="panel" style="border-radius:22px;overflow:hidden;">
+			{#each fullRows as r}
+				{@const q = r.played ? qualityLabel(r.played) : null}
+				{@const key = loveKeyOf('track', r.artist, r.title)}
+				{@const isLoved = key ? $lovedKeys.has(key) : false}
+				<div class="track" class:unplayed={!r.plays}>
+					<span class="n">{showSides && r.side ? `${r.side}${r.position ?? ''}` : (r.position ?? '—')}</span>
+					<div style="flex:1;min-width:0;">
+						<div class="t-title">{r.title}</div>
+						<div class="bar"><div class="fill" style="width:{topPlays ? (r.plays / topPlays) * 100 : 0}%"></div></div>
+					</div>
+					<button class="t-love" class:on={isLoved}
+						on:click={() => toggleLoveByName('track', r.artist, r.title)}
+						aria-pressed={isLoved} aria-label={isLoved ? 'Remove love' : 'Love this track'}
+						title={isLoved ? 'Loved — click to remove' : 'Love this track'}>
+						<svg viewBox="0 0 24 24" width="15" fill={isLoved ? 'currentColor' : 'none'} stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.8 4.6a5.5 5.5 0 0 0-7.8 0L12 5.7l-1-1.1a5.5 5.5 0 0 0-7.8 7.8l1.1 1L12 21l7.7-7.6 1.1-1a5.5 5.5 0 0 0 0-7.8z"/></svg>
+					</button>
+					{#if q?.text}<span class={tierTagClass(q.tier)} style="flex:none;">{q.text}</span>{/if}
+					<span class="plays">{r.plays || '—'}</span>
+					<span class="dur">{formatDuration(r.duration)}</span>
+				</div>
+			{/each}
+		</div>
+	{:else if album.tracks.length}
 		<div class="panel" style="border-radius:22px;overflow:hidden;">
 			{#each tracks as t, i}
 				{@const q = qualityLabel(t)}
+				{@const key = loveKeyOf('track', album.artist, t.title)}
+				{@const isLoved = key ? $lovedKeys.has(key) : false}
 				<div class="track">
 					<span class="n">{sort === 'sequence' ? (t.track_number ?? '—') : i + 1}</span>
 					<div style="flex:1;min-width:0;">
 						<div class="t-title">{t.title}</div>
 						<div class="bar"><div class="fill" style="width:{topPlays ? (t.plays / topPlays) * 100 : 0}%"></div></div>
 					</div>
+					<button class="t-love" class:on={isLoved}
+						on:click={() => album && toggleLoveByName('track', album.artist, t.title)}
+						aria-pressed={isLoved} aria-label={isLoved ? 'Remove love' : 'Love this track'}
+						title={isLoved ? 'Loved — click to remove' : 'Love this track'}>
+						<svg viewBox="0 0 24 24" width="15" fill={isLoved ? 'currentColor' : 'none'} stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.8 4.6a5.5 5.5 0 0 0-7.8 0L12 5.7l-1-1.1a5.5 5.5 0 0 0-7.8 7.8l1.1 1L12 21l7.7-7.6 1.1-1a5.5 5.5 0 0 0 0-7.8z"/></svg>
+					</button>
 					{#if q.text}<span class={tierTagClass(q.tier)} style="flex:none;">{q.text}</span>{/if}
 					<span class="plays">{t.plays}</span>
 					<span class="dur">{formatDuration(t.duration)}</span>
@@ -224,7 +369,7 @@
 		</div>
 	{:else}
 		<div class="panel" style="border-radius:22px;padding:36px;text-align:center;color:var(--td-muted);">
-			No listens of this record yet.
+			No listens of this record yet — pull the whole record to see what's on it.
 		</div>
 	{/if}
 
@@ -303,6 +448,25 @@
 		padding: 12px 18px; border-bottom: 1px solid var(--td-border);
 	}
 	.track:last-child { border-bottom: none; }
+	/* A track on the record you have never played. Dimmed rather than hidden or
+	   badged — it is part of the object, and the whole reason for pulling the
+	   tracklist is to see the shape of what you have been skipping. */
+	.track.unplayed { opacity: .55; }
+	.track.unplayed .t-title { font-weight: 500; }
+
+	/* Revealed on hover like the history row's, not always-on like the deck's:
+	   there are a dozen of these on a page and a column of filled outlines would
+	   read as decoration. Always visible once loved, and always visible on touch,
+	   where there is no hover to reveal it. */
+	.t-love {
+		flex: none; border: none; background: transparent; padding: 4px; cursor: pointer;
+		color: var(--td-muted-3); border-radius: 8px; display: flex;
+		opacity: 0; transition: opacity .15s, color .15s, transform .15s;
+	}
+	.track:hover .t-love, .t-love:focus-visible, .t-love.on { opacity: 1; }
+	.t-love.on { color: #c67139; }
+	.t-love:hover { color: #b2622d; transform: scale(1.1); }
+	@media (hover: none) { .t-love { opacity: 1; } }
 	.n {
 		width: 26px; flex: none; text-align: center;
 		font-variant-numeric: tabular-nums; font-size: 13px; color: var(--td-muted-3);

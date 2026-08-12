@@ -7,7 +7,7 @@ use tracing::{debug, error, info, warn};
 use crate::db::Database;
 use crate::models::ListenDisposition;
 use crate::musicbrainz::MusicBrainzClient;
-use crate::server::now_playing::{NowPlaying, NowPlayingRegistry};
+use crate::server::now_playing::{NowPlaying, NowPlayingRegistry, Progress};
 use crate::sinks;
 use crate::sources::{
     MediaBrowserSource, MusicSource, NavidromeSource, PlexFilters, PlexSource, RoonSource,
@@ -28,6 +28,8 @@ pub struct ScrobbleEngine {
     poll_interval: Duration,
     /// Next wall-clock second the enrichment backfills may run.
     next_backfill_at: i64,
+    /// Next wall-clock second the per-user scrobble thresholds are re-read.
+    next_threshold_refresh_at: i64,
     /// ListenBrainz endpoint (self-hosted instances override the default).
     listenbrainz_url: String,
     /// Shared with the HTTP layer so the dashboard deck reflects Plex sessions.
@@ -87,6 +89,19 @@ fn default_interval_secs(kind: &str) -> i64 {
 /// cost.
 const BACKFILL_INTERVAL_SECS: i64 = 60;
 
+/// How often the per-user scrobble thresholds are re-read from preferences.
+///
+/// On a clock of its own for the same reason the backfills are: the tick is 5s
+/// because that is what makes the deck feel live, and a setting two numbers wide
+/// that changes about once in the life of an install has no business being read
+/// twelve times a minute per user. The visible cost is that moving the slider
+/// takes effect on the next minute rather than the next second, which is well
+/// inside the length of the track it would apply to.
+///
+/// It is applied to the *running* source rather than rebuilding it — see
+/// `MusicSource::set_scrobble_threshold` for why that matters.
+const THRESHOLD_REFRESH_SECS: i64 = 60;
+
 /// `user_sources.kind` → the label the now-playing registry stores. They differ
 /// because the registry's label is user-visible and predates the kind column.
 fn source_label(kind: &str) -> &'static str {
@@ -117,10 +132,40 @@ impl ScrobbleEngine {
             mb_client,
             poll_interval: Duration::from_secs(5),
             next_backfill_at: 0,
+            // Zero so the first tick reads them, rather than every source
+            // running a minute on the default before the owner's setting lands.
+            next_threshold_refresh_at: 0,
             now_playing,
             listenbrainz_url,
             artwork_providers: vec![Box::new(crate::metadata::deezer::DeezerProvider::new())],
             wake: Arc::new(tokio::sync::Notify::new()),
+        }
+    }
+
+    /// Push each user's scrobble threshold down into their running sources.
+    ///
+    /// Pushed rather than pulled because the decision lives inside the source's
+    /// state machine — `SessionTracker::observe` and Plex's equivalent are what
+    /// know whether this pass has already been banked, and they answer in the
+    /// same breath as deciding whether it should be. Handing them the number is
+    /// the only way to change the rule without moving that logic out.
+    ///
+    /// A source whose owner has never touched the setting is told the default
+    /// explicitly, so turning the setting *back* to standard applies as
+    /// immediately as setting it did.
+    async fn apply_scrobble_thresholds(&mut self) {
+        let configured = match self.db.scrobble_thresholds().await {
+            Ok(map) => map,
+            Err(e) => {
+                // Leave every source on whatever it already holds. A failed read
+                // must not quietly reset everybody to the default mid-track.
+                error!("Failed to read scrobble thresholds: {}", e);
+                return;
+            }
+        };
+        for active in &mut self.sources {
+            let threshold = configured.get(&active.user_id).copied().unwrap_or_default();
+            active.source.set_scrobble_threshold(threshold);
         }
     }
 
@@ -131,6 +176,7 @@ impl ScrobbleEngine {
     /// first tried gets picked up when it comes back. One code path for startup
     /// and for later edits.
     async fn reconcile_sources(&mut self) {
+        let mut added = false;
         let configured = match self.db.list_enabled_sources().await {
             Ok(v) => v,
             Err(e) => {
@@ -183,6 +229,7 @@ impl ScrobbleEngine {
                         poll_interval: interval,
                         error_logged: false,
                     });
+                    added = true;
                 }
                 Err(e) => {
                     // Not added, so the next tick retries. Record it so the
@@ -195,6 +242,13 @@ impl ScrobbleEngine {
                     let _ = self.db.record_source_poll(cfg.id, Some(&msg)).await;
                 }
             }
+        }
+
+        // A source built between refreshes would otherwise run on the default
+        // for up to a minute — which is a whole track, and exactly the track
+        // somebody who just changed the setting is testing it with.
+        if added {
+            self.apply_scrobble_thresholds().await;
         }
     }
 
@@ -380,8 +434,12 @@ impl ScrobbleEngine {
                     // Deck first, network second: the registry needs nothing
                     // from MusicBrainz, so enriching before writing it just
                     // spent a rate-limited round trip on the user's latency.
-                    let changed = now_playing
-                        .set(user_id, NowPlaying::from_play(&play, "Navidrome", None, 0));
+                    let changed = now_playing.set(
+                        user_id,
+                        // Subsonic's `getNowPlaying` answers `minutesAgo`,
+                        // not a playhead — there is nothing here to report.
+                        NowPlaying::from_play(&play, "Navidrome", None, Progress::Unknown),
+                    );
                     if changed {
                         let album = play.album.clone();
                         enrich_play(mb_client, &mut play, album.as_deref()).await;
@@ -509,7 +567,12 @@ impl ScrobbleEngine {
             let mut play = track.play.clone();
             let changed = now_playing.set(
                 user_id,
-                NowPlaying::from_play(&play, label, track.quality.as_ref(), track.position),
+                NowPlaying::from_play(
+                    &play,
+                    label,
+                    track.quality.as_ref(),
+                    Progress::Known(track.position),
+                ),
             );
             if changed {
                 if play.mbid_recording.is_none() {
@@ -661,8 +724,10 @@ impl ScrobbleEngine {
 
         for track in &zones.now_playing {
             let mut play = track.play.clone();
-            let changed = now_playing
-                .set(user_id, NowPlaying::from_play(&play, "Roon", None, track.position));
+            let changed = now_playing.set(
+                user_id,
+                NowPlaying::from_play(&play, "Roon", None, Progress::Known(track.position)),
+            );
             if changed {
                 if play.mbid_recording.is_none() {
                     let album = play.album.clone();
@@ -843,7 +908,7 @@ impl ScrobbleEngine {
                         &play,
                         "Plex",
                         plex_track.audio_quality.as_ref(),
-                        progress,
+                        Progress::Known(progress),
                     ),
                 );
 
@@ -960,6 +1025,12 @@ impl ScrobbleEngine {
         // every scrobble client does, and `delivered_sinks` stops a retry from
         // sending it twice.
         self.flush_pending().await;
+
+        // Likewise on its own clock — see THRESHOLD_REFRESH_SECS.
+        if now >= self.next_threshold_refresh_at {
+            self.next_threshold_refresh_at = now_secs() + THRESHOLD_REFRESH_SECS;
+            self.apply_scrobble_thresholds().await;
+        }
 
         // On their own clock, not the tick's. The tick is short so the deck is
         // live; these are rate-limited lookups whose budgets were sized for a

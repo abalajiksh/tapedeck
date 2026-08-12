@@ -471,10 +471,91 @@ async fn resolve(
     }
 }
 
+// ── GET /api/v1/albums/:id/tracklist ──
+
+/// The record's *own* tracklist, from MusicBrainz — including the tracks you
+/// have never played.
+///
+/// The album page is otherwise built entirely from listens, which means a record
+/// you have played twice shows two tracks and looks like a two-track record.
+/// That is honest about the listening and useless as a picture of the object.
+///
+/// Deliberately **not** merged into `album_detail`: this costs a rate-limited
+/// call to somebody else's server, and the page has to render instantly and
+/// without one. It is behind a button for the same reason the Cover Art Archive
+/// pull is — an explicit ask, not a page load.
+///
+/// Nothing is stored. The response is the record as MusicBrainz has it, and the
+/// browser matches it against the plays it already holds; writing a tracklist
+/// into `scrobbles` would be inventing listens that never happened.
+async fn album_tracklist(
+    State(state): State<Arc<AppState>>,
+    user: AuthUser,
+    Path(id): Path<i64>,
+) -> impl IntoResponse {
+    let entity = match state.db.get_entity(id).await {
+        Ok(Some(e)) if e.kind == "release" => e,
+        Ok(Some(_)) => return err(StatusCode::BAD_REQUEST, "That entity is not an album"),
+        Ok(None) => return not_found("Album"),
+        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    };
+    let (album, artist) = (entity.name.clone(), entity.artist_name.clone());
+
+    // The entity's own MBID first — it is the one somebody may have set by
+    // hand. Then whichever release the listens mostly claim, which is what a
+    // tagged library gives for free. Only then a search, which is a guess.
+    let mbid = match entity.mbid.clone() {
+        Some(m) if !m.trim().is_empty() => Some(m),
+        _ => state.db.album_release_mbid(user.user_id, &artist, &album).await.unwrap_or(None),
+    };
+
+    let candidate = match mbid {
+        Some(m) => match crate::metadata::release_lookup::musicbrainz_release(&m).await {
+            Ok(found) => found,
+            Err(e) => return err(StatusCode::BAD_GATEWAY, format!("MusicBrainz: {e}")),
+        },
+        None => {
+            // `artist:"…" AND release:"…"` rather than a bare string: the
+            // unquoted form matches the words anywhere and cheerfully returns a
+            // different record by a different artist.
+            let query = format!("artist:\"{}\" AND release:\"{}\"", artist, album);
+            match crate::metadata::release_lookup::musicbrainz_search(&query, 1).await {
+                Ok(mut hits) => hits.drain(..).next(),
+                Err(e) => return err(StatusCode::BAD_GATEWAY, format!("MusicBrainz: {e}")),
+            }
+        }
+    };
+
+    let Some(candidate) = candidate else {
+        // Not an error: plenty of a real library is not in MusicBrainz, and
+        // those are exactly the records this app exists to keep. 404 with a
+        // sentence rather than a 500 with a stack of nothing.
+        return err(StatusCode::NOT_FOUND, "MusicBrainz has no release matching this record");
+    };
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "source": candidate.source,
+            "mbid_release": candidate.mbid_release,
+            "title": candidate.title,
+            "artist": candidate.artist,
+            "year": candidate.year,
+            "format": candidate.format,
+            // `side` and `position` come straight from the lookup. A CD is one
+            // side, a double LP four — the shelf's own splitter decided that,
+            // and the page shows whatever it says rather than re-deriving it.
+            "tracks": candidate.tracks,
+        })),
+    )
+        .into_response()
+}
+
 pub fn create_library_router() -> Router<Arc<AppState>> {
     Router::new()
         .route("/api/v1/resolve", get(resolve))
         .route("/api/v1/charts", get(charts))
         .route("/api/v1/albums/:id", get(album_detail))
+        .route("/api/v1/albums/:id/tracklist", get(album_tracklist))
         .route("/api/v1/artists/:id", get(artist_detail))
 }

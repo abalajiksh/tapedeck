@@ -1,4 +1,4 @@
-use crate::models::{AudioQuality, Play};
+use crate::models::{AudioQuality, Play, ScrobbleThreshold};
 use crate::sources::MusicSource;
 use async_trait::async_trait;
 use reqwest::Client;
@@ -609,6 +609,11 @@ pub struct PlexSource {
     /// keys on the artist, which is the very field that differs. The result was
     /// two rows per play, one with quality metadata and one without.
     recent_scrobbles: HashMap<String, u64>,
+    /// When a listen counts, per the owner of this source. Plex keeps its own
+    /// copy of the state machine rather than using `SessionTracker`, so it needs
+    /// its own copy of the threshold too — but the *decision* is one shared
+    /// method, so the two cannot drift.
+    threshold: ScrobbleThreshold,
 }
 
 /// How often the Plex history endpoint is walked, independent of how often
@@ -652,7 +657,16 @@ impl PlexSource {
             libraries: Vec::new(),
             last_history_at: 0,
             recent_scrobbles: HashMap::new(),
+            threshold: ScrobbleThreshold::default(),
         }
+    }
+
+    /// Adopt the owner's scrobble threshold. Same reasoning as
+    /// `SessionTracker::set_threshold`: the setting can change under a source
+    /// that is already running, and rebuilding the source to carry a number
+    /// would discard the per-session state that decides what has been banked.
+    pub fn set_threshold(&mut self, threshold: ScrobbleThreshold) {
+        self.threshold = threshold;
     }
 
     pub async fn initialize(&mut self) -> Result<(), Box<dyn std::error::Error>> {
@@ -1253,6 +1267,10 @@ impl PlexSource {
             }
         }
 
+        // Copied out before the entry below borrows `self` mutably. It is
+        // `Copy`, so this is two numbers, not a clone of anything.
+        let threshold = self.threshold;
+
         let (should_scrobble, needs_np) = {
             let state =
                 self.session_states.entry(session_key.clone()).or_insert_with(|| SessionState {
@@ -1283,11 +1301,12 @@ impl PlexSource {
             }
             state.last_offset = view_offset;
 
-            let pct =
-                if duration > 0 { (view_offset as f64 / duration as f64) * 100.0 } else { 0.0 };
+            // Plex works in milliseconds throughout; the threshold works in
+            // seconds, like every other source.
             let seconds = view_offset / 1000;
+            let length = (duration > 0).then_some(duration / 1000);
 
-            let ready = !state.scrobbled && (pct >= 50.0 || seconds >= 240);
+            let ready = !state.scrobbled && threshold.reached(seconds, length);
             // Whether we've already banked the scrobble says nothing about
             // what's on the deck. Gating now-playing on `!scrobbled` meant a
             // track stopped being reported the moment it passed the halfway
@@ -1591,6 +1610,9 @@ impl PlexSource {
 impl MusicSource for PlexSource {
     fn name(&self) -> &str {
         "Plex"
+    }
+    fn set_scrobble_threshold(&mut self, threshold: crate::models::ScrobbleThreshold) {
+        self.threshold = threshold;
     }
     fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
         self

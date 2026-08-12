@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { onMount } from 'svelte';
+	import { onMount, onDestroy } from 'svelte';
 	import { api } from '$lib/api';
 	import type { Scrobble, SignalChain , ChainVariant } from '$lib/api';
 	import ScrobbleRow from '$lib/components/ScrobbleRow.svelte';
@@ -159,6 +159,52 @@
 		filterTimer = setTimeout(() => load(true), 300);
 	}
 
+	// ── Keeping up with what's playing ──
+	// This page used to load once and never again, so leaving it open through an
+	// album meant watching a list that had stopped being the history. It pulls
+	// the newest page back and merges, rather than reloading: a reload would
+	// throw away everything paged in and put the reader back at the top.
+	const REFRESH_MS = 20_000;
+	let refreshTimer: ReturnType<typeof setInterval> | null = null;
+	const onWake = () => { if (!document.hidden) refreshHead(); };
+
+	/** Refreshing under an open dialog or a half-finished bulk edit moves the
+	 *  thing being acted on. None of these last long, and the next tick catches
+	 *  up the moment they're closed. */
+	$: refreshPaused =
+		selectMode || mergeMode || !!editing || !!confirmDelete || !!inspecting || !!menuFor;
+
+	async function refreshHead() {
+		if (refreshPaused || loading || (typeof document !== 'undefined' && document.hidden)) return;
+		try {
+			const res = await api.getScrobbles({
+				limit: PAGE,
+				offset: 0,
+				artist: filter || scope.artist || undefined,
+				album: scope.album,
+				track: scope.track
+			});
+			const known = new Set(scrobbles.map((s) => s.id));
+			const fresh = res.scrobbles.filter((s) => !known.has(s.id));
+			if (!fresh.length) return;
+			// Sorted rather than prepended: a listen added by hand carries its own
+			// timestamp and can legitimately land in the middle of what's already
+			// loaded, and groupByDay walks the list in order — an out-of-order row
+			// would split its day into two headings.
+			scrobbles = [...fresh, ...scrobbles].sort(
+				(a, b) => b.timestamp - a.timestamp || b.id - a.id
+			);
+			// `offset` is a row offset into the server's own ordering, so rows that
+			// appeared above the window shift it. Without this, "load more" would
+			// re-serve the last `fresh.length` rows it already gave us.
+			offset += fresh.length;
+			if (groupBy === 'session') loadSessions();
+		} catch {
+			// Same call the deck poll makes: a failed refresh leaves what's on
+			// screen alone rather than flickering it, and the next tick corrects.
+		}
+	}
+
 	function openEdit(s: Scrobble) {
 		menuFor = null;
 		editing = s;
@@ -206,7 +252,24 @@
 		// Optional in the same way: an instance with no variants simply shows no
 		// variant picker on a session card.
 		try { variants = (await api.getVariants()).variants; } catch { /* optional */ }
-		load(true);
+		await load(true);
+
+		refreshTimer = setInterval(refreshHead, REFRESH_MS);
+		// Coming back to the tab is the moment the list is most obviously stale,
+		// and the interval skipped its ticks while it was hidden anyway — a
+		// backgrounded tab must not poll for an hour.
+		document.addEventListener('visibilitychange', onWake);
+		window.addEventListener('focus', onWake);
+	});
+
+	// Not a `return` out of `onMount` above: that only registers a teardown when
+	// the callback is synchronous, and this one is `async` — Svelte gets a
+	// Promise and ignores it, so the interval would outlive the page.
+	onDestroy(() => {
+		if (refreshTimer) clearInterval(refreshTimer);
+		if (typeof document === 'undefined') return;
+		document.removeEventListener('visibilitychange', onWake);
+		window.removeEventListener('focus', onWake);
 	});
 </script>
 

@@ -90,6 +90,13 @@
   .tag-accent-2 { background: #e1eecc; color: #3d472b; }
   .tag-neutral { background: #f9f4ed; color: #474238; }
   .tag-outline { border-color: var(--td-accent); color: var(--td-accent); }
+  /* A medium — Vinyl, Cassette, CD, SACD. Deliberately *not* one of the
+     fidelity colours: those sit on a scale and this does not. It says what the
+     thing was, and ranks nothing against anything. */
+  .tag-medium {
+    border-color: color-mix(in srgb, var(--td-muted) 45%, transparent);
+    color: var(--td-muted); letter-spacing: .06em;
+  }
   :root[data-theme="dark"] .tag { color: var(--td-text); border-color: rgba(244,231,207,.16); }
   :root[data-theme="dark"] .tag-accent { background: rgba(198,113,57,.24); color: #eab488; }
   :root[data-theme="dark"] .tag-accent-2 { background: rgba(122,138,94,.24); color: #bacb9b; }

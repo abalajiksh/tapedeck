@@ -33,15 +33,10 @@ use std::collections::HashMap;
 use std::time::Duration;
 use tracing::debug;
 
-use crate::models::{AudioQuality, Play};
+use crate::models::{AudioQuality, Play, ScrobbleThreshold};
 
 /// .NET ticks per second — both servers report positions and durations in these.
 pub(crate) const TICKS_PER_SECOND: u64 = 10_000_000;
-
-/// Scrobble once half the track has played, or after four minutes, whichever
-/// comes first. Matches the Plex source and the Last.fm convention.
-const SCROBBLE_FRACTION: f64 = 0.5;
-const SCROBBLE_AFTER_SECS: u64 = 240;
 
 /// How far the playhead must jump backwards before it counts as the track
 /// starting over rather than the user scrubbing.
@@ -122,6 +117,11 @@ pub struct MediaBrowserSource {
 #[derive(Debug, Default)]
 pub struct SessionTracker {
     seen: HashMap<String, SessionProgress>,
+    /// When a listen counts. Its own field rather than a constant because it is
+    /// the listener's call — see `ScrobbleThreshold`. `Default` is the
+    /// convention every source used to hardcode, so a tracker built and never
+    /// told anything behaves exactly as it always did.
+    threshold: ScrobbleThreshold,
 }
 
 #[derive(Debug, Clone)]
@@ -135,6 +135,14 @@ struct SessionProgress {
 impl SessionTracker {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Adopt the owner's threshold. Called by the engine rather than at
+    /// construction: the setting can change under a source that is already
+    /// running, and rebuilding the source to carry a number would throw away
+    /// the state machine this struct exists to hold.
+    pub fn set_threshold(&mut self, threshold: ScrobbleThreshold) {
+        self.threshold = threshold;
     }
 
     /// Record where a session is, and answer whether this pass just crossed the
@@ -184,14 +192,7 @@ impl SessionTracker {
         }
         entry.last_position = position;
 
-        let past_threshold = !paused
-            && match duration {
-                Some(d) if d > 0 => {
-                    position as f64 >= d as f64 * SCROBBLE_FRACTION
-                        || position >= SCROBBLE_AFTER_SECS
-                }
-                _ => position >= SCROBBLE_AFTER_SECS,
-            };
+        let past_threshold = !paused && self.threshold.reached(position, duration);
 
         if past_threshold && !entry.scrobbled {
             entry.scrobbled = true;
@@ -1057,6 +1058,10 @@ impl MediaBrowserSource {
 impl crate::sources::MusicSource for MediaBrowserSource {
     fn name(&self) -> &str {
         self.flavour.label()
+    }
+
+    fn set_scrobble_threshold(&mut self, threshold: crate::models::ScrobbleThreshold) {
+        self.tracker.set_threshold(threshold);
     }
 
     fn as_any_mut(&mut self) -> &mut dyn std::any::Any {

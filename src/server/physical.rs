@@ -26,7 +26,7 @@ use tracing::{info, warn};
 
 use super::auth::AuthUser;
 use super::models::ErrorResponse;
-use super::now_playing::NowPlaying;
+use super::now_playing::{NowPlaying, Progress};
 use super::AppState;
 use crate::db::PhysicalImage;
 use crate::metadata::release_lookup::{self, PhysicalTrack};
@@ -1355,7 +1355,9 @@ async fn set_now_playing(
         source_name: "physical".into(),
     };
 
-    let mut np = NowPlaying::from_play(&play, SHELF_SOURCE, None, body.elapsed);
+    // The browser sitting in front of the turntable ran the clock, so
+    // unlike every other push source this really is a measured position.
+    let mut np = NowPlaying::from_play(&play, SHELF_SOURCE, None, Progress::Known(body.elapsed));
     // The medium, which is the only thing resembling a format a turntable can
     // report — there is no codec here and never will be. Note the listen itself
     // files the same string under `submission_client` rather than

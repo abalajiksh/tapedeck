@@ -84,6 +84,36 @@ export function formatHours(hours: number): string {
 	return `${Math.round(hours)}h`;
 }
 
+/**
+ * The four media the shelf writes, exactly as `physical.rs::medium_label()`
+ * spells them. Matching against a fixed set rather than trusting the field is
+ * the whole safety of this: `submission_client` is free text every other source
+ * fills with whatever the client calls itself, and nothing is going to name
+ * itself "Vinyl".
+ */
+const MEDIA = ['Vinyl', 'Cassette', 'CD', 'SACD'] as const;
+
+/**
+ * The badge for a listen that came off an object rather than a file.
+ *
+ * A record has no codec and never will, so `qualityLabel` returns nothing for
+ * one and the badge slot sat empty — a side of vinyl and an unlabelled import
+ * looked identical in the history. This says what the thing *was*. It carries
+ * no tier on purpose: a medium is a fact, not a position on a scale, which is
+ * the same reason it is styled apart from the fidelity tags.
+ *
+ * Reads both spellings because the two paths differ and always have: a stored
+ * listen files the medium under `submission_client`, while the deck's
+ * now-playing entry carries it as `listening_context`.
+ */
+export function mediumLabel(x: {
+	submission_client?: string | null;
+	listening_context?: string | null;
+}): string | null {
+	const claimed = (x.submission_client ?? x.listening_context ?? '').trim();
+	return MEDIA.find((m) => m.toLowerCase() === claimed.toLowerCase()) ?? null;
+}
+
 /** Build a quality badge label from scrobble data */
 export function qualityLabel(scrobble: {
 	format_type?: string | null;

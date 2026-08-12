@@ -3,7 +3,7 @@
 	import { page } from '$app/stores';
 	import { goto } from '$app/navigation';
 	import { api } from '$lib/api';
-	import type { Note, NoteTarget, NoteRevision, Entity, LovedRow, Visibility } from '$lib/api';
+	import type { Note, NoteTarget, NoteRevision, NotePeriod, Entity, LovedRow, Visibility } from '$lib/api';
 	import { formatDateTime, timeAgo } from '$lib/utils';
 	import type { NoteQuery } from '$lib/api';
 	import ShortcodeLegend from '$lib/components/ShortcodeLegend.svelte';
@@ -40,7 +40,8 @@
 		{ value: 'recording', label: 'Tracks' },
 		{ value: 'release', label: 'Records' },
 		{ value: 'artist', label: 'Artists' },
-		{ value: 'listen', label: 'Listens' }
+		{ value: 'listen', label: 'Listens' },
+		{ value: 'period', label: 'Periods' }
 	];
 
 	/** Debounced, so typing a word is one request rather than one per letter. */
@@ -126,7 +127,22 @@
 				kind: `listen · ${formatDateTime(note.listen.timestamp)}`
 			};
 		}
+		if (note.period) return { label: periodLabel(note.period), kind: note.period.unit };
 		return { label: 'Untitled', kind: '' };
+	}
+
+	/** "2026-08" → "August 2026". A week keeps its ISO key: turning it into a
+	 *  date range here would be a second implementation of `period_of`'s label,
+	 *  free to disagree with the one Reports shows. */
+	function periodLabel(p: NotePeriod): string {
+		if (p.unit === 'month') {
+			const [y, m] = p.key.split('-');
+			const name = new Date(Number(y), Number(m) - 1, 1).toLocaleDateString('en-GB', {
+				month: 'long'
+			});
+			return `${name} ${y}`;
+		}
+		return p.key;
 	}
 
 	// Takes only what it reads, so it works for both a full `Entity` and the
@@ -189,7 +205,15 @@
 	}
 
 	function openNote(note: Note) {
-		openTarget(note.entity ? { entity_id: note.entity.id } : { scrobble_id: note.listen!.id });
+		if (note.entity) return openTarget({ entity_id: note.entity.id });
+		if (note.listen) return openTarget({ scrobble_id: note.listen.id });
+		// A period note is edited where it was written — the chapter it is about
+		// is the context that makes it worth reading, and this page has none of
+		// it. Same reasoning as a listen note opening against its listen.
+		if (note.period) {
+			const at = note.period.unit;
+			window.location.href = `/reports?unit=${at}`;
+		}
 	}
 
 	function closeEditor() {
