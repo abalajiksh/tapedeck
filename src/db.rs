@@ -3545,7 +3545,7 @@ impl Database {
         limit: i64,
     ) -> Result<Vec<ReportRow>, sqlx::Error> {
         sqlx::query_as(
-            "SELECT timestamp, artist, title, album, duration, genres, chain_id
+            "SELECT timestamp, artist, artist_credit, title, album, duration, genres, chain_id
              FROM scrobbles
              WHERE user_id = ? AND skipped = FALSE
              ORDER BY timestamp ASC LIMIT ?",
@@ -8489,6 +8489,11 @@ pub enum PairingPoll {
 pub struct ReportRow {
     pub timestamp: i64,
     pub artist: String,
+    /// Everyone credited on the track, when that differs from the record's
+    /// artist. On a compilation the `artist` column is the placeholder
+    /// "Various Artists" and this is where the real performer is — which is
+    /// what lets a report name someone rather than a filing convention.
+    pub artist_credit: Option<String>,
     pub title: String,
     pub album: Option<String>,
     pub duration: Option<i64>,
@@ -10312,6 +10317,77 @@ mod tests {
         // Each cartridge only for the listens it was fitted for.
         assert_eq!(secs.get(&ell), Some(&3600), "the elliptical only for its own");
         assert_eq!(secs.get(&micro), Some(&3600), "the microlinear only for its own");
+    }
+
+    /// "Various Artists" is a filing convention, not a performer.
+    ///
+    /// Every track of every compilation credits it, so it wins any superlative
+    /// by construction on a shelf with compilations on it — which is how a
+    /// month's report came to be headed by a string that says nothing about
+    /// that month. The real name is in `artist_credit`, which is what v0.22.1
+    /// kept it for.
+    #[tokio::test]
+    async fn a_compilation_credits_the_performer_not_the_placeholder() {
+        let db = testdb().await;
+        let uid = db.create_user("ashwin", None, "x", "user").await.unwrap();
+
+        // Three compilation tracks by one performer, and two by someone real.
+        for (i, credit) in [Some("Punch"), Some("Punch"), Some("Punch")].iter().enumerate() {
+            let mut p = play("t", "Various Artists", 1_700_000_000 + i as u64 * 100);
+            p.source_id = format!("va{i}");
+            // Two names, because `artist_credit` is only written when the
+            // source named more than one — a single artist needs no credit.
+            p.artists = credit.map(|c| vec![c.to_string(), "Kim Na Young".into()]);
+            db.save_scrobble(
+                uid,
+                &p,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                ListenDisposition { imported: false, skipped: false },
+            )
+            .await
+            .unwrap();
+        }
+        for i in 0..2 {
+            let mut p = play("u", "Burial", 1_700_100_000 + i as u64 * 100);
+            p.source_id = format!("b{i}");
+            db.save_scrobble(
+                uid,
+                &p,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                ListenDisposition { imported: false, skipped: false },
+            )
+            .await
+            .unwrap();
+        }
+
+        let rows = db.report_rows(uid, 1000).await.unwrap();
+        assert_eq!(rows.len(), 5);
+        // The credit survives the round trip — without it there is nothing to
+        // prefer, and the whole fix has no input.
+        let va: Vec<_> = rows.iter().filter(|r| is_various_artists(&r.artist)).collect();
+        assert_eq!(va.len(), 3);
+        assert!(
+            va.iter().all(|r| r.artist_credit.as_deref() == Some("Punch; Kim Na Young")),
+            "the performer has to reach the report, or there is nothing to credit"
+        );
+        // The primary is what a report counts — the whole joined credit would
+        // be its own key and no more useful than the placeholder it replaced.
+        assert_eq!(
+            va[0].artist_credit.as_deref().and_then(|c| c.split(';').next()).map(str::trim),
+            Some("Punch")
+        );
     }
 
     #[tokio::test]

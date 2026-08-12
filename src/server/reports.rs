@@ -265,7 +265,30 @@ async fn reports(
         let sub_index = si.min(b.sub.len().saturating_sub(1));
         b.days.insert(dt.num_days_from_ce());
 
-        let akey = r.artist.trim().to_lowercase();
+        // Who actually played it.
+        //
+        // On a compilation the `artist` column is "Various Artists" — a filing
+        // convention, not a performer — and the real name is in `artist_credit`,
+        // which is exactly what v0.22.1 kept it for. Preferring it here means a
+        // compilation track counts towards the person who played it rather than
+        // piling up under a placeholder that then wins every superlative on the
+        // page. Falls back to `artist` when there is no credit, which is the
+        // overwhelmingly common case.
+        // `artist_credit` is everyone credited, joined with "; " and the
+        // primary first — the shape `save_scrobble` and `fold_artist_credit`
+        // both write. The primary is the one to count; the whole joined string
+        // would be its own key and no more useful than the placeholder.
+        let performer = if crate::db::is_various_artists(&r.artist) {
+            r.artist_credit
+                .as_deref()
+                .and_then(|c| c.split(';').next())
+                .map(str::trim)
+                .filter(|c| !c.is_empty() && !crate::db::is_various_artists(c))
+                .unwrap_or(&r.artist)
+        } else {
+            &r.artist
+        };
+        let akey = performer.trim().to_lowercase();
         let e = b.artists.entry(akey.clone()).or_insert((0, 0));
         e.0 += 1;
         e.1 += r.duration.unwrap_or(0).max(0);
@@ -355,20 +378,49 @@ async fn reports(
         // name a real month and the wrong number.
         let prev = order.get(offset + i + 1).and_then(|k| buckets.get(k));
 
-        let top_artist = b.artists.iter().max_by_key(|(_, v)| v.0).map(|(k, v)| {
-            // Display the spelling actually used, not the lowercased key.
-            let display = rows
-                .iter()
-                .rev()
-                .find(|r| r.artist.trim().to_lowercase() == *k)
-                .map(|r| r.artist.clone())
-                .unwrap_or_else(|| k.clone());
-            serde_json::json!({
-                "name": display,
-                "plays": v.0,
-                "hours": (v.1 as f64 / 3600.0 * 10.0).round() / 10.0,
-            })
-        });
+        // "Various Artists" is not an artist. It is a filing convention meaning
+        // *look at the track*, which is why `is_various_artists` already guards
+        // the Plex source and the sanitiser — and why a month headed "your top
+        // artist was Various Artists" says nothing about that month. It wins
+        // easily on a shelf with compilations on it, because every track of
+        // every compilation credits it.
+        //
+        // Excluded from the *superlative* only. The plays are still real
+        // listening and still count towards the totals, the artist tally and
+        // everything else; what they cannot do is name the month.
+        let top_artist = b
+            .artists
+            .iter()
+            .filter(|(k, _)| !crate::db::is_various_artists(k))
+            .max_by_key(|(_, v)| v.0)
+            .map(|(k, v)| {
+                // Display the spelling actually used, not the lowercased key —
+                // the trap `top_album` hit once and shipped as "epitone project".
+                //
+                // Both columns are checked, because the key may have come from
+                // `artist_credit` on a compilation track, in which case no row's
+                // `artist` matches it and the fallback would print the folded key.
+                let display = rows
+                    .iter()
+                    .rev()
+                    .find_map(|r| {
+                        if r.artist.trim().to_lowercase() == *k {
+                            return Some(r.artist.trim().to_string());
+                        }
+                        r.artist_credit
+                            .as_deref()
+                            .and_then(|c| c.split(';').next())
+                            .map(str::trim)
+                            .filter(|c| c.to_lowercase() == *k)
+                            .map(str::to_string)
+                    })
+                    .unwrap_or_else(|| k.clone());
+                serde_json::json!({
+                    "name": display,
+                    "plays": v.0,
+                    "hours": (v.1 as f64 / 3600.0 * 10.0).round() / 10.0,
+                })
+            });
         let top_album = b.albums.iter().max_by_key(|(_, v)| v.1).map(|(k, v)| {
             // The key is lowercased for grouping; show the spelling that was
             // actually submitted, or the card reads "epitone project".
