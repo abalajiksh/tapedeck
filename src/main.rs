@@ -72,7 +72,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // ── Scrobble database ──
     info!("📦 Initializing scrobble database at {}", config.database.scrobble_db_url);
-    let db = Arc::new(Database::new(&config.database.scrobble_db_url, secrets.clone()).await?);
+    // Logged before it is propagated, because propagating it out of `main` only
+    // reaches stderr — and under systemd the app's own log file is the thing
+    // anyone actually reads. v0.61.0 crash-looped 297 times on a failed
+    // migration and the log simply stopped mid-sequence with no error in it,
+    // which is a far worse thing to be handed than the error itself.
+    let db = Arc::new(
+        Database::new(&config.database.scrobble_db_url, secrets.clone()).await.inspect_err(
+            |e| {
+                error!("❌ Could not open the scrobble database: {e}");
+                error!("   Startup cannot continue. This is usually a migration that fails on an existing database.");
+            },
+        )?,
+    );
 
     // Any import left 'running' by a previous process died with it — record that.
     match db.mark_running_imports_interrupted().await {

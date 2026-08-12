@@ -1383,8 +1383,6 @@ impl Database {
             .execute(&self.pool).await?;
         sqlx::query("CREATE UNIQUE INDEX IF NOT EXISTS idx_notes_user_scrobble ON notes(user_id, scrobble_id) WHERE scrobble_id IS NOT NULL")
             .execute(&self.pool).await?;
-        sqlx::query("CREATE UNIQUE INDEX IF NOT EXISTS idx_notes_user_period ON notes(user_id, period_key) WHERE period_key IS NOT NULL")
-            .execute(&self.pool).await?;
 
         // Every edit keeps what was there before. These are meant to be kept for
         // years; a rewrite in 2031 shouldn't erase what you thought in 2026.
@@ -2007,6 +2005,20 @@ impl Database {
             }
             let _ = sqlx::query("PRAGMA foreign_keys = ON").execute(&self.pool).await;
         }
+
+        // Deliberately here rather than in `init()` alongside the other two note
+        // indexes, and this is the trap: `init()` runs *before* `migrate()`, so
+        // on an existing database `period_key` does not exist yet and creating
+        // an index on it fails — and `init()` propagates with `?`, so the whole
+        // process exits and systemd restarts it forever. Shipped exactly that
+        // way in v0.61.0; `an_existing_database_opens_and_gains_period_notes`
+        // is the check that was missing.
+        //
+        // A fresh database gets the column from `init()`, a migrated one from
+        // the block above, so by this line it always exists.
+        sqlx::query("CREATE UNIQUE INDEX IF NOT EXISTS idx_notes_user_period ON notes(user_id, period_key) WHERE period_key IS NOT NULL")
+            .execute(&self.pool)
+            .await?;
 
         // Migration: a user's own profile.
         //
@@ -11922,6 +11934,79 @@ mod tests {
             .unwrap()
             .expect("the record");
         assert_eq!(album.plays, 3);
+    }
+
+    /// Opening a database that an *older* Tapedeck wrote.
+    ///
+    /// Every test above starts from `Database::new` on an empty file, which
+    /// takes the `init()` path and never exercises `migrate()` against a real
+    /// prior schema — so a migration that cannot run on an existing database
+    /// passes the whole suite and fails on every install that has data in it.
+    /// v0.61.0 shipped exactly that: an index on `notes(period_key)` in
+    /// `init()`, which runs *before* `migrate()` adds the column, propagating
+    /// with `?` so the process exited and systemd restarted it forever.
+    #[tokio::test]
+    async fn an_existing_database_opens_and_gains_period_notes() {
+        let n = N.fetch_add(1, Ordering::SeqCst);
+        let path = std::env::temp_dir().join(format!("td-old-{}-{}.db", std::process::id(), n));
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{}", path.display(), suffix));
+        }
+
+        // The pre-v0.61.0 shape of every table the notes migration touches,
+        // including the CHECK that the rebuild exists to widen.
+        {
+            let pool = sqlx::SqlitePool::connect(&format!("sqlite:{}?mode=rwc", path.display()))
+                .await
+                .unwrap();
+            for ddl in [
+                "CREATE TABLE users (id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT NOT NULL,
+                     email TEXT, password_hash TEXT NOT NULL, role TEXT NOT NULL DEFAULT 'user',
+                     created_at INTEGER NOT NULL DEFAULT 0, settings TEXT)",
+                "CREATE TABLE entities (id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT NOT NULL,
+                     name TEXT NOT NULL, artist_name TEXT NOT NULL DEFAULT '', mbid TEXT)",
+                "CREATE TABLE scrobbles (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER,
+                     title TEXT NOT NULL, artist TEXT NOT NULL, timestamp INTEGER NOT NULL,
+                     source_id TEXT NOT NULL, source_name TEXT NOT NULL)",
+                "CREATE TABLE notes (
+                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                     user_id INTEGER NOT NULL REFERENCES users(id),
+                     entity_id INTEGER REFERENCES entities(id),
+                     scrobble_id INTEGER REFERENCES scrobbles(id),
+                     body_md TEXT NOT NULL,
+                     visibility TEXT NOT NULL DEFAULT 'private',
+                     created_at INTEGER NOT NULL,
+                     updated_at INTEGER NOT NULL,
+                     CHECK ((entity_id IS NULL) <> (scrobble_id IS NULL)))",
+                "CREATE TABLE note_revisions (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                     note_id INTEGER NOT NULL REFERENCES notes(id), body_md TEXT NOT NULL,
+                     created_at INTEGER NOT NULL)",
+                "INSERT INTO users (id, username, password_hash) VALUES (1, 'ashwin', 'x')",
+                "INSERT INTO entities (id, kind, name) VALUES (1, 'release', 'Untrue')",
+                "INSERT INTO notes (user_id, entity_id, body_md, visibility, created_at, updated_at)
+                     VALUES (1, 1, 'what I thought in 2026', 'private', 100, 100)",
+            ] {
+                sqlx::query(ddl).execute(&pool).await.unwrap();
+            }
+            pool.close().await;
+        }
+
+        // The whole point: this is what systemd was running in a loop.
+        let db =
+            Database::new(&format!("sqlite:{}", path.display()), Arc::new(SecretBox::test_key()))
+                .await
+                .expect("an existing database must open");
+
+        // The note that was already there survived the table rebuild.
+        let kept = db.note_for_entity(1, 1).await.unwrap().expect("the old note is still there");
+        assert_eq!(kept.body_md, "what I thought in 2026");
+        assert!(kept.period_key.is_none());
+
+        // And the thing the migration was for actually works afterwards.
+        let target = NoteTarget::period("month", "2026-08").unwrap();
+        db.upsert_note(1, &target, "the month Bach took over", "private").await.unwrap();
+        let found = db.note_for_period(1, "month:2026-08").await.unwrap().expect("period note");
+        assert_eq!(found.body_md, "the month Bach took over");
     }
 
     /// Every path that writes a listen has to link its credits, and an import
