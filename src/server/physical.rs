@@ -1663,6 +1663,437 @@ beside it rather than rows inside it. A backup and this export together are the
 whole shelf.
 ";
 
+/// POST /api/v1/physical/import — put a shelf back.
+///
+/// The counterpart of the export above, and deliberately **not** a database
+/// restore. It brings back the objects: pressings, their tracklists, the gear,
+/// the sides you played, and your own scans.
+///
+/// What it cannot bring back is the *listening* — a shelf export holds no
+/// `scrobbles`, so the listens a side generated are not in the file and the
+/// chain hours derived from them stay where they are. That is stated in the
+/// response rather than papered over, because a shelf that came back with its
+/// play counts but no listens would make two screens disagree.
+///
+/// **Everything is matched before it is inserted**, so importing the same zip
+/// twice changes nothing the second time. That matters more here than for a
+/// listens import: a duplicated pressing is a visible mess on a page you look
+/// at, and there is no dedup elsewhere that would catch it.
+async fn import_shelf(
+    State(state): State<Arc<AppState>>,
+    user: AuthUser,
+    mut multipart: Multipart,
+) -> impl IntoResponse {
+    let mut body: Option<Vec<u8>> = None;
+    while let Ok(Some(field)) = multipart.next_field().await {
+        if let Ok(b) = field.bytes().await {
+            if !b.is_empty() {
+                body = Some(b.to_vec());
+                break;
+            }
+        }
+    }
+    let Some(body) = body else { return err(400, "No file in the request") };
+    if body.len() > MAX_IMPORT_BYTES {
+        return err(413, "That archive is larger than 256 MB");
+    }
+
+    let reader = std::io::Cursor::new(body);
+    let mut zip = match zip::ZipArchive::new(reader) {
+        Ok(z) => z,
+        Err(e) => return err(400, format!("That is not a zip archive: {e}")),
+    };
+
+    // Read the manifest first — nothing is written until it parses, so a
+    // truncated or unrelated zip fails before it has half-populated a shelf.
+    let shelf: Vec<serde_json::Value> = {
+        let Ok(mut f) = zip.by_name("shelf.json") else {
+            return err(400, "No shelf.json in that archive — is it a Tapedeck shelf export?");
+        };
+        let mut text = String::new();
+        use std::io::Read;
+        if f.read_to_string(&mut text).is_err() {
+            return err(400, "shelf.json could not be read");
+        }
+        match serde_json::from_str(&text) {
+            Ok(v) => v,
+            Err(e) => return err(400, format!("shelf.json is not valid JSON: {e}")),
+        }
+    };
+
+    let mut report = ImportReport::default();
+
+    // ── Gear first: a pressing names its chain and deck by *name*, so they
+    // have to exist before the releases that point at them.
+    if let Ok(mut f) = zip.by_name("gear.json") {
+        use std::io::Read;
+        let mut text = String::new();
+        if f.read_to_string(&mut text).is_ok() {
+            if let Ok(doc) = serde_json::from_str::<serde_json::Value>(&text) {
+                for g in doc.get("equipment").and_then(|v| v.as_array()).into_iter().flatten() {
+                    let Some(name) = g.get("name").and_then(|v| v.as_str()) else { continue };
+                    let kind = g.get("type").and_then(|v| v.as_str()).unwrap_or("other");
+                    // `upsert_equipment` matches on the name, so re-importing
+                    // updates rather than duplicating. `hours` is deliberately
+                    // not restored: it is derived from the listens, and writing
+                    // it here would be a second answer that drifts.
+                    match state
+                        .db
+                        .upsert_equipment(
+                            user.user_id,
+                            name,
+                            kind,
+                            g.get("brand").and_then(|v| v.as_str()),
+                            g.get("model").and_then(|v| v.as_str()),
+                            0.0,
+                            g.get("purchased_at").and_then(|v| v.as_i64()),
+                        )
+                        .await
+                    {
+                        Ok(_) => report.gear += 1,
+                        Err(e) => warn!("shelf import: gear {name}: {e}"),
+                    }
+                }
+            }
+        }
+    }
+
+    let gear = state.db.get_equipment(user.user_id).await.unwrap_or_default();
+    let chains = state.db.get_chains(user.user_id).await.unwrap_or_default();
+    // Chains are **matched, never created** — the same rule `[[gear:…]]`
+    // follows. A chain is something you build step by step; conjuring an empty
+    // one from a name in a file would produce a chain with no components that
+    // silently attributes listens to nothing.
+    let chain_by_name = |n: Option<&str>| {
+        n.and_then(|n| chains.iter().find(|c| c.name.eq_ignore_ascii_case(n))).and_then(|c| c.id)
+    };
+    let gear_by_name = |n: Option<&str>| {
+        n.and_then(|n| gear.iter().find(|g| g.name.eq_ignore_ascii_case(n))).map(|g| g.id)
+    };
+
+    let existing = state.db.list_physical(user.user_id, None).await.unwrap_or_default();
+
+    for entry in &shelf {
+        let (Some(artist), Some(title), Some(kind)) = (
+            entry.get("artist").and_then(|v| v.as_str()),
+            entry.get("title").and_then(|v| v.as_str()),
+            entry.get("kind").and_then(|v| v.as_str()),
+        ) else {
+            report.skipped += 1;
+            continue;
+        };
+        if !SHELF_KINDS.contains(&kind) {
+            report.skipped += 1;
+            continue;
+        }
+
+        // Already on the shelf? A barcode or an MBID identifies a *pressing*
+        // exactly; without either, the artist, title and medium together are
+        // the best available key — two copies of the same record on the same
+        // shelf is a thing that happens, but importing the same file twice is
+        // far more likely than owning a duplicate.
+        let barcode = entry.get("barcode").and_then(|v| v.as_str());
+        let mbid = entry.get("mbid_release").and_then(|v| v.as_str());
+        let already = existing.iter().find(|r| {
+            (barcode.is_some() && r.barcode.as_deref() == barcode)
+                || (mbid.is_some() && r.mbid_release.as_deref() == mbid)
+                || (r.kind == kind
+                    && r.artist.eq_ignore_ascii_case(artist)
+                    && r.title.eq_ignore_ascii_case(title))
+        });
+        if already.is_some() {
+            report.already += 1;
+            continue;
+        }
+
+        let tracks = entry
+            .get("tracks")
+            .map(|t| serde_json::to_string(t).unwrap_or_else(|_| "[]".into()))
+            .unwrap_or_else(|| "[]".into());
+
+        let id = match state
+            .db
+            .create_physical(
+                user.user_id,
+                kind,
+                artist,
+                title,
+                entry.get("year").and_then(|v| v.as_i64()),
+                mbid,
+                entry.get("discogs_id").and_then(|v| v.as_str()),
+                barcode,
+                entry.get("catalog_number").and_then(|v| v.as_str()),
+                None,
+                &tracks,
+                entry.get("notes").and_then(|v| v.as_str()),
+                entry.get("purchased_at").and_then(|v| v.as_i64()),
+            )
+            .await
+        {
+            Ok(id) => id,
+            Err(e) => {
+                warn!("shelf import: {artist} — {title}: {e}");
+                report.skipped += 1;
+                continue;
+            }
+        };
+        report.releases += 1;
+
+        // What it is normally played on, resolved from the names the export
+        // wrote. Missing either is normal — the chain may not exist here.
+        let chain = chain_by_name(entry.get("played_on_chain").and_then(|v| v.as_str()));
+        let deck = gear_by_name(entry.get("played_on_equipment").and_then(|v| v.as_str()));
+        if chain.is_some() || deck.is_some() {
+            let _ = state
+                .db
+                .update_physical(
+                    user.user_id,
+                    id,
+                    None,
+                    chain.map(Some),
+                    deck.map(Some),
+                    None,
+                    None,
+                    None,
+                )
+                .await;
+        }
+
+        // Images. A provider image is a URL the archive still serves, so it
+        // comes back as a row pointing at it; an upload is a file in the zip
+        // and has to be written back to disk before the row means anything.
+        for img in entry.get("images").and_then(|v| v.as_array()).into_iter().flatten() {
+            let ikind = img.get("kind").and_then(|v| v.as_str()).unwrap_or("other");
+            let provider = img.get("provider").and_then(|v| v.as_str()).unwrap_or("upload");
+            let caption = img.get("caption").and_then(|v| v.as_str());
+            let position = img.get("position").and_then(|v| v.as_i64()).unwrap_or(0);
+
+            if let Some(url) = img.get("url").and_then(|v| v.as_str()) {
+                let _ = state
+                    .db
+                    .add_physical_image(
+                        user.user_id,
+                        id,
+                        ikind,
+                        provider,
+                        Some(url),
+                        None,
+                        None,
+                        None,
+                        None,
+                        caption,
+                        position,
+                        None,
+                    )
+                    .await;
+                report.images += 1;
+                continue;
+            }
+
+            let Some(name) = img.get("file").and_then(|v| v.as_str()) else { continue };
+            let entry_name = format!("scans/{name}");
+            let bytes = {
+                use std::io::Read;
+                match zip.by_name(&entry_name) {
+                    Ok(mut f) => {
+                        let mut b = Vec::new();
+                        if f.read_to_end(&mut b).is_ok() {
+                            Some(b)
+                        } else {
+                            None
+                        }
+                    }
+                    Err(_) => None,
+                }
+            };
+            let Some(bytes) = bytes else {
+                report.missing_scans += 1;
+                continue;
+            };
+            if bytes.len() > MAX_SCAN_BYTES {
+                report.missing_scans += 1;
+                continue;
+            }
+            // The extension comes from the stored name, but the *path* is built
+            // here — a filename out of an archive never reaches the filesystem,
+            // the same rule the upload handler follows for a client's filename.
+            let ext = std::path::Path::new(name)
+                .extension()
+                .and_then(|e| e.to_str())
+                .filter(|e| e.len() <= 5 && e.chars().all(|c| c.is_ascii_alphanumeric()))
+                .unwrap_or("jpg")
+                .to_ascii_lowercase();
+            let dir =
+                state.uploads_dir.join("shelf").join(user.user_id.to_string()).join(id.to_string());
+            if tokio::fs::create_dir_all(&dir).await.is_err() {
+                report.missing_scans += 1;
+                continue;
+            }
+            let fname = format!("{}.{}", random_name(), ext);
+            let rel = format!("shelf/{}/{}/{}", user.user_id, id, fname);
+            if tokio::fs::write(dir.join(&fname), &bytes).await.is_err() {
+                report.missing_scans += 1;
+                continue;
+            }
+            let mime = mime_guess::from_path(&fname).first_raw().unwrap_or("image/jpeg");
+            let _ = state
+                .db
+                .add_physical_image(
+                    user.user_id,
+                    id,
+                    ikind,
+                    "upload",
+                    None,
+                    None,
+                    Some(&rel),
+                    Some(mime),
+                    Some(bytes.len() as i64),
+                    caption,
+                    position,
+                    None,
+                )
+                .await;
+            report.images += 1;
+        }
+
+        // The sides played. `plays.csv` is keyed by artist and title rather
+        // than by id, so it is matched back here while this pressing is the one
+        // in hand — which also means a play whose pressing was skipped as a
+        // duplicate is not re-added against the wrong row.
+        report.plays += restore_plays(&state, user.user_id, id, artist, title, &mut zip).await;
+    }
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "releases": report.releases,
+            "already_on_the_shelf": report.already,
+            "skipped": report.skipped,
+            "gear": report.gear,
+            "images": report.images,
+            "missing_scans": report.missing_scans,
+            "plays": report.plays,
+            // Said plainly rather than left to be discovered: the listens a
+            // side generated live in `scrobbles`, which a shelf export does not
+            // carry. Chain hours are derived from those, so they do not return
+            // with the objects.
+            "note": concat!(
+                "Pressings, gear, scans and sides are back. The listens those sides ",
+                "generated are not in a shelf export — restore a database backup for ",
+                "the history and the chain hours derived from it."
+            ),
+        })),
+    )
+        .into_response()
+}
+
+/// The biggest shelf archive we will read. A hundred records with booklets is
+/// large; a quarter of a gigabyte is somebody's photo library.
+const MAX_IMPORT_BYTES: usize = 256 * 1024 * 1024;
+
+#[derive(Default)]
+struct ImportReport {
+    releases: usize,
+    already: usize,
+    skipped: usize,
+    gear: usize,
+    images: usize,
+    missing_scans: usize,
+    plays: usize,
+}
+
+/// Put back the sides played for one pressing, from `plays.csv`.
+///
+/// Returns how many were written. Anything unparseable is skipped rather than
+/// failing the import — a shelf coming back matters more than one malformed
+/// row, and the count in the response says how many landed.
+async fn restore_plays<R: std::io::Read + std::io::Seek>(
+    state: &Arc<AppState>,
+    user_id: i64,
+    release_id: i64,
+    artist: &str,
+    title: &str,
+    zip: &mut zip::ZipArchive<R>,
+) -> usize {
+    use std::io::Read;
+    let mut text = String::new();
+    let Ok(mut f) = zip.by_name("plays.csv") else { return 0 };
+    if f.read_to_string(&mut text).is_err() {
+        return 0;
+    }
+
+    let existing = state.db.plays_for_release(user_id, release_id).await.unwrap_or_default();
+    let mut written = 0;
+    for line in text.lines().skip(1) {
+        let cols = parse_csv_row(line);
+        if cols.len() < 7 {
+            continue;
+        }
+        let (Ok(played_at), Some(row_artist), Some(row_title)) =
+            (cols[0].parse::<i64>(), cols.get(1), cols.get(2))
+        else {
+            continue;
+        };
+        if !row_artist.eq_ignore_ascii_case(artist) || !row_title.eq_ignore_ascii_case(title) {
+            continue;
+        }
+        let side = cols[4].clone();
+        // Re-importing the same file must not double the wear on a stylus.
+        if existing
+            .iter()
+            .any(|(s, at): &(String, i64)| *at == played_at && s.eq_ignore_ascii_case(&side))
+        {
+            continue;
+        }
+        let tracks = cols[5].parse::<i64>().unwrap_or(0);
+        let secs = cols[6].parse::<i64>().unwrap_or(0);
+        let deck = cols.get(7).filter(|v| !v.is_empty());
+        let chain = cols.get(8).filter(|v| !v.is_empty());
+        let gear_id = match deck {
+            Some(n) => {
+                state.db.find_equipment_by_name(user_id, n).await.unwrap_or(None).map(|(id, _)| id)
+            }
+            None => None,
+        };
+        let chain_id = match chain {
+            Some(n) => state.db.get_chain_by_name(user_id, n).await.unwrap_or(None),
+            None => None,
+        };
+        if state
+            .db
+            .record_physical_play(
+                user_id, release_id, &side, played_at, secs, tracks, gear_id, chain_id,
+            )
+            .await
+            .is_ok()
+        {
+            written += 1;
+        }
+    }
+    written
+}
+
+/// Split one CSV row, honouring the quoting the export writes.
+fn parse_csv_row(line: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut chars = line.chars().peekable();
+    let mut quoted = false;
+    while let Some(c) = chars.next() {
+        match c {
+            '"' if quoted && chars.peek() == Some(&'"') => {
+                cur.push('"');
+                chars.next();
+            }
+            '"' => quoted = !quoted,
+            ',' if !quoted => out.push(std::mem::take(&mut cur)),
+            _ => cur.push(c),
+        }
+    }
+    out.push(cur);
+    out
+}
+
 /// GET /api/v1/physical/export — the shelf as a zip.
 ///
 /// Built in memory rather than streamed, unlike the listen export: a zip's
@@ -1889,6 +2320,7 @@ pub fn create_physical_router() -> Router<Arc<AppState>> {
         // parameterised route — axum 0.7 / matchit 0.7 matches in order.
         .route("/api/v1/physical/lookup", get(lookup))
         .route("/api/v1/physical/export", get(export_shelf))
+        .route("/api/v1/physical/import", post(import_shelf))
         .route("/api/v1/physical/discogs/:id", get(discogs_detail))
         .route("/api/v1/physical/equipment/:id/wear", get(equipment_wear))
         .route("/api/v1/physical/settings/discogs", get(get_discogs).put(set_discogs))

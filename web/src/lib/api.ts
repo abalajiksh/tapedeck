@@ -1763,6 +1763,25 @@ class TapedeckAPI {
 		return this.delNoBody(`/admin/users/${id}`);
 	}
 
+	/** Put a shelf back from an export.
+	 *
+	 *  Not a database restore: it brings back the *objects*. The listens those
+	 *  sides generated are not in a shelf export, so chain hours do not return
+	 *  with them — the response says so. Matched before inserting, so importing
+	 *  the same archive twice changes nothing the second time. */
+	async importShelf(file: File): Promise<{
+		releases: number; already_on_the_shelf: number; skipped: number;
+		gear: number; images: number; missing_scans: number; plays: number; note: string;
+	}> {
+		const form = new FormData();
+		form.append('file', file);
+		const res = await fetch(`${BASE}/api/v1/physical/import`, {
+			method: 'POST', credentials: 'same-origin', body: form
+		});
+		if (!res.ok) throw new Error(`API ${res.status}: ${await res.text()}`);
+		return res.json();
+	}
+
 	// ── Chain variants ──
 	async getVariants(): Promise<{ variants: ChainVariant[] }> {
 		return this.get('/api/v1/chains/variants');

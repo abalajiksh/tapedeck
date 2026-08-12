@@ -26,7 +26,7 @@ openapi: 3.1.0
 
 info:
   title: Tapedeck
-  version: 0.54.0
+  version: 0.55.0
   summary: Self-hosted scrobbler and listening journal.
   description: |
     Tapedeck ingests listens, enriches them with MusicBrainz metadata, stores
@@ -3062,6 +3062,63 @@ paths:
       responses:
         '200': { description: Cleared., content: { application/json: { schema: { $ref: '#/components/schemas/Ok' } } } }
         '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /api/v1/physical/import:
+    post:
+      tags: [Shelf]
+      summary: Put a shelf back from an export.
+      description: |
+        Session-only, `multipart/form-data`, 256 MB maximum. The counterpart of
+        `GET /api/v1/physical/export`, and deliberately **not** a database
+        restore: it brings back the *objects* — pressings, tracklists, gear,
+        the sides played, and your own scans.
+
+        What it cannot bring back is the **listening**. A shelf export holds no
+        `scrobbles`, so the listens a side generated are not in the file, and
+        the chain hours derived from them do not return with the objects. The
+        response says so rather than leaving it to be discovered.
+
+        **Everything is matched before it is inserted**, so importing the same
+        archive twice changes nothing the second time. A pressing is matched on
+        its barcode or release MBID when it has one, and otherwise on artist,
+        title and medium together; a side played is matched on its side and
+        timestamp, so re-importing cannot double the wear on a stylus.
+
+        Signal chains are **matched by name, never created** — the same rule
+        `[[gear:…]]` follows. A chain is something you build step by step, and
+        conjuring an empty one from a name in a file would silently attribute
+        listens to a chain with no components. Gear *is* created, since a piece
+        of equipment is fully described by the file.
+
+        Nothing is written until `shelf.json` parses, so an unrelated or
+        truncated zip fails before it has half-populated a shelf.
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              properties:
+                file: { type: string, format: binary }
+      responses:
+        '200':
+          description: Imported.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  releases: { type: integer, description: Pressings added. }
+                  already_on_the_shelf: { type: integer, description: Matched an existing pressing and left alone. }
+                  skipped: { type: integer, description: Entries that could not be read. }
+                  gear: { type: integer }
+                  images: { type: integer }
+                  missing_scans: { type: integer, description: Listed in the manifest but absent from the archive. }
+                  plays: { type: integer, description: Sides played, restored. }
+                  note: { type: string, description: What a shelf export cannot carry. }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '413': { description: Larger than 256 MB., content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
 
   /api/v1/physical/spin:
     get:

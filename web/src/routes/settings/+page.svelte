@@ -35,6 +35,40 @@
 		if (typeof history !== 'undefined') history.replaceState(null, '', `#${id}`);
 	}
 
+	// ── The shelf, in and out ──
+	let shelfImporting = false;
+	let shelfMsg = '';
+	let shelfErr = '';
+
+	async function onShelfImport(ev: Event) {
+		const input = ev.target as HTMLInputElement;
+		const file = input.files?.[0];
+		if (!file) return;
+		shelfImporting = true;
+		shelfMsg = '';
+		shelfErr = '';
+		try {
+			const r = await api.importShelf(file);
+			// Every count is reported, including the ones that are zero on a
+			// second import — "nothing happened" is the answer that tells you it
+			// matched rather than that it failed.
+			const bits = [
+				`${r.releases} added`,
+				r.already_on_the_shelf ? `${r.already_on_the_shelf} already on the shelf` : '',
+				r.plays ? `${r.plays} side${r.plays === 1 ? '' : 's'} played` : '',
+				r.images ? `${r.images} scan${r.images === 1 ? '' : 's'}` : '',
+				r.gear ? `${r.gear} piece${r.gear === 1 ? '' : 's'} of gear` : '',
+				r.missing_scans ? `${r.missing_scans} scan${r.missing_scans === 1 ? '' : 's'} missing from the archive` : '',
+				r.skipped ? `${r.skipped} entr${r.skipped === 1 ? 'y' : 'ies'} unreadable` : ''
+			].filter(Boolean);
+			shelfMsg = `${bits.join(' · ')}. ${r.note}`;
+		} catch (e) {
+			shelfErr = String(e).replace(/^API \d+: /, '');
+		}
+		shelfImporting = false;
+		input.value = '';
+	}
+
 	// ── Account ──
 	let profile: UserProfile | null = null;
 	let pDisplayName = '';
@@ -1412,6 +1446,54 @@
 					syntax and Obsidian's link syntax are the same brackets, so they have to be
 					rewritten or every one of them would dangle. A reference that never resolved is
 					left exactly as you wrote it.
+				</p>
+			</div>
+
+			<!-- Listens keep their own page rather than being inlined here: an
+			     import is a long-running job with progress and a history, which
+			     is a screen rather than a button. The pointer is what makes this
+			     section the one index of everything in and out. -->
+			<div class="panel" style="border-radius:22px;padding:24px;margin-bottom:18px;">
+				<h3 class="h-display" style="font-size:19px;margin-bottom:4px;">Listens</h3>
+				<p style="font-size:13px;color:var(--td-muted);margin:0 0 16px;">
+					Bring in a history from ListenBrainz, Last.fm, Spotify or a Rockbox
+					player. Large imports run as a job you can watch.
+				</p>
+				<a class="btn btn-secondary" href="/import">Import listens →</a>
+			</div>
+
+			<!-- The shelf. Its export used to live only on the shelf page and its
+			     import did not exist at all — so "how do I get my collection out
+			     and back" had two different answers in two different places. Every
+			     way in and out of Tapedeck is here now. -->
+			<div class="panel" style="border-radius:22px;padding:24px;margin-bottom:18px;">
+				<h3 class="h-display" style="font-size:19px;margin-bottom:4px;">The shelf</h3>
+				<p style="font-size:13px;color:var(--td-muted);margin:0 0 16px;">
+					Your pressings, the sides you have played, the gear, and the scans you
+					uploaded — as a zip.
+				</p>
+				<div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center;">
+					<a class="btn btn-secondary" href="/api/v1/physical/export">Export the shelf</a>
+					<label class="btn btn-secondary" style="cursor:pointer;">
+						{shelfImporting ? 'Importing…' : 'Import a shelf'}
+						<input type="file" accept=".zip,application/zip" style="display:none;"
+							disabled={shelfImporting} on:change={onShelfImport} />
+					</label>
+				</div>
+				{#if shelfMsg}
+					<p style="font-size:13px;color:var(--td-good-fg);background:var(--td-good-bg);padding:9px 14px;border-radius:12px;margin:14px 0 0;">
+						{shelfMsg}
+					</p>
+				{/if}
+				{#if shelfErr}
+					<p style="font-size:13px;color:#b2622d;margin:14px 0 0;">{shelfErr}</p>
+				{/if}
+				<p style="font-size:12px;color:var(--td-muted-2);margin:14px 0 0;">
+					An import brings back the <em>objects</em>. The listens those sides
+					generated are not in a shelf export — they live in the database, so
+					restore a backup for the history and the chain hours derived from it.
+					Everything is matched before it is added, so importing the same archive
+					twice changes nothing the second time.
 				</p>
 			</div>
 		{/if}

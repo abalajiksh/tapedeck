@@ -4718,6 +4718,25 @@ impl Database {
 
     /// Resolve a chain *name* (as sent by clients in `tapedeck_chain.chain_id`)
     /// to its id for this user. Case-insensitive.
+    /// Every side played of one pressing, as `(side, played_at)`.
+    ///
+    /// The key a shelf import dedups on: re-importing the same archive must not
+    /// double the wear recorded against a stylus.
+    pub async fn plays_for_release(
+        &self,
+        user_id: i64,
+        release_id: i64,
+    ) -> Result<Vec<(String, i64)>, sqlx::Error> {
+        sqlx::query_as(
+            "SELECT side, played_at FROM physical_plays
+              WHERE user_id = ? AND release_id = ?",
+        )
+        .bind(user_id)
+        .bind(release_id)
+        .fetch_all(&self.pool)
+        .await
+    }
+
     pub async fn get_chain_by_name(
         &self,
         user_id: i64,

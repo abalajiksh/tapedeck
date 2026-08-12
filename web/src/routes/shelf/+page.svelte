@@ -814,12 +814,13 @@
 		</p>
 	</div>
 	<div style="display:flex;gap:8px;">
-		<!-- A plain link, not a fetch: the browser downloads a zip far better
-		     than any amount of Blob juggling, and the endpoint is a GET the
-		     session cookie already authenticates. -->
-		<a class="btn btn-secondary" href="/api/v1/physical/export"
-			title="Everything about the objects you own — pressings, sides played, gear, and your own scans">
-			Export the shelf
+		<!-- Export and import both live in Settings → Data now. Having the way
+		     *out* of the shelf on this page and the way *in* nowhere at all was
+		     the inconsistency; a link keeps it discoverable from here without
+		     being a second copy of the controls. -->
+		<a class="btn btn-secondary" href="/settings#data"
+			title="Export or import the shelf — pressings, sides played, gear, and your own scans">
+			Export &amp; import
 		</a>
 		<button class="btn btn-primary" on:click={() => (adding = !adding)}>
 			{adding ? 'Cancel' : 'Add to the shelf'}
