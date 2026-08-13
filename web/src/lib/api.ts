@@ -350,6 +350,13 @@ export interface EquipmentInput {
 	/** When it was bought, unix seconds. Distinct from `first_used`, which is
 	 *  when Tapedeck first saw it. */
 	purchased_at?: number | null;
+	/** Why it is not in a chain — `new`, `spare` or `lent`. Accepted on update
+	 *  only; the create endpoint has no field for it, since gear is tagged from
+	 *  the "Not in a chain yet" table once it exists.
+	 *
+	 *  Note the update endpoint is a whole-record replace, so every caller has
+	 *  to send this back or tagging a spare clears it. */
+	status?: string | null;
 }
 
 export interface Connection {
@@ -431,6 +438,9 @@ export interface Equipment {
 	last_used: number | null;
 	notes: string | null;
 	purchased_at: number | null;
+	/** `new`, `spare` or `lent`, or null when nothing has been said. Only ever
+	 *  meaningful for gear no chain names. */
+	status: string | null;
 }
 
 /** Live playback state. Field names mirror `Scrobble` so `qualityLabel()` works on it. */

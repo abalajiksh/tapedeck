@@ -436,11 +436,32 @@ async fn list_equipment(
     }
 }
 
+/// The update body is deliberately its own type rather than a reuse of
+/// `CreateEquipmentRequest`: `status` is settable here and not at creation
+/// (gear is tagged from the "Not in a chain yet" table, once it exists), and a
+/// shared struct would mean POST accepting a field it silently threw away.
+///
+/// Every field is written unconditionally — this endpoint is a whole-record
+/// replace, not a partial patch, which is why an omitted `brand` has always
+/// cleared the brand. Clients must send the full record back.
+#[derive(Deserialize)]
+pub struct UpdateEquipmentRequest {
+    pub name: String,
+    #[serde(rename = "type")]
+    pub equipment_type: String,
+    pub brand: Option<String>,
+    pub model: Option<String>,
+    pub notes: Option<String>,
+    pub purchased_at: Option<i64>,
+    /// Why it is not in a chain: `new`, `spare`, `lent`. Absent clears it.
+    pub status: Option<String>,
+}
+
 async fn update_equipment(
     State(state): State<Arc<AppState>>,
     user: AuthUser,
     Path(id): Path<i64>,
-    Json(body): Json<CreateEquipmentRequest>,
+    Json(body): Json<UpdateEquipmentRequest>,
 ) -> impl IntoResponse {
     match state
         .db
@@ -453,6 +474,7 @@ async fn update_equipment(
             body.model.as_deref(),
             body.notes.as_deref(),
             body.purchased_at,
+            body.status.as_deref(),
         )
         .await
     {

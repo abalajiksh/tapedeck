@@ -28,6 +28,12 @@
 @keyframes td-spin { to { transform: rotate(360deg); } }
 @keyframes td-vu { from { transform: scaleY(.22); } to { transform: scaleY(1); } }
 @keyframes td-blink { 0%,100% { opacity:1; } 50% { opacity:.25; } }
+/* Panels that arrive from the edge — the Signal Chains detail drawer, and
+   anything else that slides in over the page. Global rather than per-component
+   because a @keyframes declared inside a Svelte <style> is scoped along with
+   everything else, so the animation silently never runs. */
+@keyframes td-slide-in { from { transform: translateX(100%); } to { transform: translateX(0); } }
+@keyframes td-fade-in { from { opacity: 0; } to { opacity: 1; } }
 
 @layer base {
   html, body { background: var(--td-bg); color: var(--td-text); }

@@ -26,7 +26,7 @@ openapi: 3.1.0
 
 info:
   title: Tapedeck
-  version: 0.61.1
+  version: 0.62.0
   summary: Self-hosted scrobbler and listening journal.
   description: |
     Tapedeck ingests listens, enriches them with MusicBrainz metadata, stores
@@ -435,6 +435,13 @@ components:
         name: { type: string }
         type: { type: string }
         brand: { type: [string, 'null'] }
+        status:
+          type: [string, 'null']
+          description: |
+            Why this piece is not in a chain — `new`, `spare` or `lent`. Set
+            from the Signal Chains page's "Not in a chain yet" table; null is
+            the usual state and means nothing has been said. Free text: the UI
+            owns the vocabulary.
         total_hours:
           type: number
           description: |
@@ -2441,11 +2448,28 @@ paths:
     patch:
       tags: [Chains]
       summary: Update gear.
-      description: Session-only.
+      description: |
+        Session-only. A **whole-record replace**, not a partial patch — every
+        field is written, so an omitted `brand` clears the brand. Send the full
+        record back.
       parameters: [{ name: id, in: path, required: true, schema: { type: integer } }]
       requestBody:
         required: true
-        content: { application/json: { schema: { type: object, additionalProperties: true } } }
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name, type]
+              properties:
+                name: { type: string }
+                type: { type: string }
+                brand: { type: [string, 'null'] }
+                model: { type: [string, 'null'] }
+                notes: { type: [string, 'null'] }
+                purchased_at: { type: [integer, 'null'] }
+                status:
+                  type: [string, 'null']
+                  description: '`new`, `spare` or `lent`. Not accepted on create.'
       responses:
         '200': { description: Updated., content: { application/json: { schema: { $ref: '#/components/schemas/Ok' } } } }
         '401': { $ref: '#/components/responses/Unauthorized' }

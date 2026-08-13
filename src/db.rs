@@ -1072,6 +1072,12 @@ impl Database {
                 -- and burn-in hours are counted from the purchase, not from the
                 -- day someone got round to typing it in.
                 purchased_at INTEGER,
+                -- Why a piece of gear is not in a chain: 'new', 'spare',
+                -- 'lent'. Free text rather than a CHECK, for the reason
+                -- `equipment_type` is — the UI owns the vocabulary, and a
+                -- constraint here would mean a rebuild to add a word. NULL is
+                -- the usual state and means nothing has been said.
+                status TEXT,
                 UNIQUE(user_id, name)
             )",
         )
@@ -1893,6 +1899,12 @@ impl Database {
         if !has_column(&self.pool, "equipment", "purchased_at").await {
             info!("⚙️ Migrating: adding equipment.purchased_at...");
             let _ = sqlx::query("ALTER TABLE equipment ADD COLUMN purchased_at INTEGER")
+                .execute(&self.pool)
+                .await;
+        }
+        if !has_column(&self.pool, "equipment", "status").await {
+            info!("⚙️ Migrating: adding equipment.status...");
+            let _ = sqlx::query("ALTER TABLE equipment ADD COLUMN status TEXT")
                 .execute(&self.pool)
                 .await;
         }
@@ -8450,7 +8462,7 @@ impl Database {
         let mut rows: Vec<EquipmentRow> = sqlx::query_as(
             "SELECT e.id, e.user_id, e.name, e.type, e.brand, e.model,
                     0.0 AS total_hours,
-                    e.first_used, e.last_used, e.notes, e.purchased_at
+                    e.first_used, e.last_used, e.notes, e.purchased_at, e.status
                FROM equipment e
               WHERE e.user_id = ?",
         )
@@ -8482,10 +8494,11 @@ impl Database {
         model: Option<&str>,
         notes: Option<&str>,
         purchased_at: Option<i64>,
+        status: Option<&str>,
     ) -> Result<bool, sqlx::Error> {
         let res = sqlx::query(
             "UPDATE equipment SET name = ?, type = ?, brand = ?, model = ?, notes = ?,
-                    purchased_at = ?
+                    purchased_at = ?, status = ?
               WHERE id = ? AND user_id = ?",
         )
         .bind(name)
@@ -8494,6 +8507,7 @@ impl Database {
         .bind(model)
         .bind(notes)
         .bind(purchased_at)
+        .bind(status)
         .bind(id)
         .bind(user_id)
         .execute(&self.pool)
@@ -9597,6 +9611,10 @@ pub struct EquipmentRow {
     /// When it was bought, as opposed to `first_used`, which is when Tapedeck
     /// first saw it. Gear is usually owned well before it is catalogued.
     pub purchased_at: Option<i64>,
+    /// Why this piece is not in a chain — `new`, `spare`, `lent`. Only ever
+    /// meaningful for gear no chain names; the Signal Chains page shows it in
+    /// the "Not in a chain yet" table and nowhere else.
+    pub status: Option<String>,
 }
 
 #[cfg(test)]
@@ -12007,6 +12025,71 @@ mod tests {
         db.upsert_note(1, &target, "the month Bach took over", "private").await.unwrap();
         let found = db.note_for_period(1, "month:2026-08").await.unwrap().expect("period note");
         assert_eq!(found.body_md, "the month Bach took over");
+    }
+
+    /// The same check for `equipment.status`, and for the same reason: every
+    /// other test in this file starts from an empty file, which takes the
+    /// `init()` path and never exercises `migrate()` against a real prior
+    /// schema. A column added only to `init()` opens fine here and crash-loops
+    /// on every database that already exists.
+    #[tokio::test]
+    async fn an_existing_database_gains_the_gear_status_column() {
+        let n = N.fetch_add(1, Ordering::SeqCst);
+        let path = std::env::temp_dir().join(format!("td-oldgear-{}-{}.db", std::process::id(), n));
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{}", path.display(), suffix));
+        }
+
+        // The pre-status shape, with a row already in it.
+        {
+            let pool = sqlx::SqlitePool::connect(&format!("sqlite:{}?mode=rwc", path.display()))
+                .await
+                .unwrap();
+            for ddl in [
+                "CREATE TABLE users (id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT NOT NULL,
+                     email TEXT, password_hash TEXT NOT NULL, role TEXT NOT NULL DEFAULT 'user',
+                     created_at INTEGER NOT NULL DEFAULT 0, settings TEXT)",
+                "CREATE TABLE equipment (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                     user_id INTEGER NOT NULL REFERENCES users(id),
+                     name TEXT NOT NULL, type TEXT NOT NULL, brand TEXT, model TEXT,
+                     total_hours REAL DEFAULT 0, first_used INTEGER, last_used INTEGER,
+                     notes TEXT, purchased_at INTEGER, UNIQUE(user_id, name))",
+                "INSERT INTO users (id, username, password_hash) VALUES (1, 'ashwin', 'x')",
+                "INSERT INTO equipment (user_id, name, type, brand, notes)
+                     VALUES (1, 'HD 650', 'headphones', 'Sennheiser', 'the good pads')",
+            ] {
+                sqlx::query(ddl).execute(&pool).await.unwrap();
+            }
+            pool.close().await;
+        }
+
+        let db =
+            Database::new(&format!("sqlite:{}", path.display()), Arc::new(SecretBox::test_key()))
+                .await
+                .expect("an existing database must open");
+
+        let gear = db.get_equipment(1).await.unwrap();
+        assert_eq!(gear.len(), 1);
+        assert_eq!(gear[0].name, "HD 650");
+        assert!(gear[0].status.is_none(), "nothing has been said about it yet");
+
+        // And the column is writable, which is the half the migration is for.
+        db.update_equipment(
+            1,
+            gear[0].id,
+            "HD 650",
+            "headphones",
+            Some("Sennheiser"),
+            None,
+            Some("the good pads"),
+            None,
+            Some("spare"),
+        )
+        .await
+        .unwrap();
+        let after = db.get_equipment(1).await.unwrap();
+        assert_eq!(after[0].status.as_deref(), Some("spare"));
+        assert_eq!(after[0].notes.as_deref(), Some("the good pads"));
     }
 
     /// Every path that writes a listen has to link its credits, and an import
