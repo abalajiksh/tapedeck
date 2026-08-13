@@ -120,6 +120,11 @@ pub fn ok(id: Option<Value>, era: Era, mut result: Value) -> Value {
     json!({ "jsonrpc": "2.0", "id": id, "result": result })
 }
 
+/// The `_meta` version, which is the *only* thing that makes a request modern.
+fn meta_version(params: &Value) -> Option<&str> {
+    params.pointer("/_meta/io.modelcontextprotocol~1protocolVersion").and_then(Value::as_str)
+}
+
 /// Resolve which protocol version a request is speaking.
 ///
 /// Three sources in priority order, and the fallback is the interesting one:
@@ -128,9 +133,7 @@ pub fn ok(id: Option<Value>, era: Era, mut result: Value) -> Value {
 /// the header. Rejecting those instead would break every 2025-03-26 client for
 /// the sake of strictness about a revision they could not have known about.
 fn resolve_version(method: &str, params: &Value, header: Option<&str>) -> String {
-    if let Some(v) =
-        params.pointer("/_meta/io.modelcontextprotocol~1protocolVersion").and_then(Value::as_str)
-    {
+    if let Some(v) = meta_version(params) {
         return v.to_string();
     }
     // `initialize` states its version in the body, not in `_meta`.
@@ -143,6 +146,40 @@ fn resolve_version(method: &str, params: &Value, header: Option<&str>) -> String
         return h.to_string();
     }
     "2025-03-26".to_string()
+}
+
+/// Which era a request is actually speaking — and **the version string alone
+/// cannot answer this.**
+///
+/// `MCP-Protocol-Version` has existed since `2025-06-18` and carries the
+/// *negotiated* version, so a legacy client that negotiated `2026-07-28` sends
+/// that header while still speaking the handshake dialect: no `_meta`, no
+/// `Mcp-Method`, no `Mcp-Name`. Deciding on the version alone put every one of
+/// its requests through modern header validation and answered `400 -32020` to
+/// all of them — a connector that authenticated perfectly and then reported
+/// having no tools, because `tools/list` never got a chance to run.
+///
+/// So the era is decided by **what the request actually carries**:
+///
+/// * `initialize` is a legacy method by definition. A modern client never sends
+///   one, and the spec says a dual-era server selects its behaviour from how the
+///   client opens. A client that asks for `2026-07-28` *in an `initialize`* is
+///   telling us the newest version it knows, not the dialect it is speaking.
+/// * Otherwise, modern **iff** the request carries `_meta` naming a modern
+///   version. That field is the thing the mirrored headers mirror, so its
+///   presence is exactly the condition under which validating them is
+///   meaningful.
+///
+/// The failure mode this replaces was silent in the worst way: every individual
+/// piece behaved as designed, and the client simply looked empty.
+fn resolve_era(method: &str, params: &Value, version: &str) -> Era {
+    if method == "initialize" {
+        return Era::Legacy;
+    }
+    match meta_version(params) {
+        Some(_) => Era::of(version),
+        None => Era::Legacy,
+    }
 }
 
 /// Decode the `=?base64?…?=` sentinel the spec defines for header values that
@@ -185,7 +222,7 @@ pub fn parse(body: &[u8], header: impl Fn(&str) -> Option<String>) -> Result<Rpc
 
     let version_header = header("mcp-protocol-version");
     let version = resolve_version(&method, &params, version_header.as_deref());
-    let era = Era::of(&version);
+    let era = resolve_era(&method, &params, &version);
 
     if !SUPPORTED_VERSIONS.contains(&version.as_str()) {
         return Err(RpcError::new(
@@ -234,9 +271,11 @@ fn validate_headers(
 
     match header("mcp-method") {
         None => return Err(mismatch("Missing required header: Mcp-Method".into())),
-        Some(h) if h != method => return Err(mismatch(format!(
+        Some(h) if h != method => {
+            return Err(mismatch(format!(
             "Header mismatch: Mcp-Method header value '{h}' does not match body value '{method}'"
-        ))),
+        )))
+        }
         _ => {}
     }
 
@@ -308,6 +347,53 @@ mod tests {
         .unwrap();
         assert_eq!(req.era, Era::Legacy);
         assert_eq!(req.version, "2025-06-18");
+    }
+
+    #[test]
+    fn a_legacy_client_asking_for_the_newest_version_is_still_a_legacy_client() {
+        // The bug this pins cost a working connector. A client that negotiated
+        // `2026-07-28` through an `initialize` handshake still speaks the
+        // handshake dialect — no `_meta`, no `Mcp-Method` — and deciding the era
+        // from the version string alone put every one of its requests through
+        // modern header validation and answered `400 -32020` to all of them.
+        let req = parse(
+            &body(json!({
+                "jsonrpc": "2.0", "id": 1, "method": "initialize",
+                "params": { "protocolVersion": "2026-07-28", "capabilities": {} }
+            })),
+            modern_headers(&[]),
+        )
+        .expect("initialize must never be subject to header validation");
+        assert_eq!(req.era, Era::Legacy, "initialize is a legacy method by definition");
+    }
+
+    #[test]
+    fn the_negotiated_version_header_alone_does_not_make_a_request_modern() {
+        // `MCP-Protocol-Version` has existed since 2025-06-18 and carries the
+        // *negotiated* version, so its presence says nothing about which dialect
+        // the body is written in. Only `_meta` does.
+        let req = parse(
+            &body(json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/list" })),
+            modern_headers(&[("mcp-protocol-version", "2026-07-28")]),
+        )
+        .expect("a legacy tools/list must not need the mirrored headers");
+        assert_eq!(req.era, Era::Legacy);
+        assert_eq!(req.version, "2026-07-28");
+    }
+
+    #[test]
+    fn carrying_meta_is_what_opts_a_request_into_header_validation() {
+        // The other direction: a request that *does* carry `_meta` is held to
+        // the mirroring rules, because `_meta` is the thing the headers mirror.
+        let err = parse(
+            &body(json!({
+                "jsonrpc": "2.0", "id": 3, "method": "tools/list",
+                "params": { "_meta": { "io.modelcontextprotocol/protocolVersion": "2026-07-28" } }
+            })),
+            modern_headers(&[("mcp-protocol-version", "2026-07-28")]),
+        )
+        .unwrap_err();
+        assert_eq!(err.code, HEADER_MISMATCH, "missing Mcp-Method must still be caught");
     }
 
     #[test]

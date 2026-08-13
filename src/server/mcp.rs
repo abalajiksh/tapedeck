@@ -95,23 +95,83 @@ fn unauthorized(state: &AppState, headers: &HeaderMap, msg: &str) -> Response {
     resp
 }
 
-/// The DNS-rebinding guard the transport spec requires.
+/// The DNS-rebinding guard the transport spec requires — narrowed to the case
+/// it actually protects.
 ///
-/// A non-browser client sends no `Origin` at all, which is the common case and
-/// is allowed. A browser page on some other site *would* send one, and that is
-/// exactly the attack: a page at `evil.example` reaching a Tapedeck on the
-/// user's LAN. So a present `Origin` must name the same host the request was
-/// addressed to.
+/// The attack is specific: a page at `evil.example` resolves a hostname it
+/// controls to a **private address**, so the victim's own browser reaches an MCP
+/// server on their LAN that the attacker cannot route to. A cross-origin
+/// `Origin` header is what gives that away.
+///
+/// The first version of this refused *any* cross-origin request, and that was
+/// wrong in a way that cost a working connector: a hosted assistant whose HTTP
+/// stack sets `Origin: https://claude.ai` was refused `403` before it ever
+/// authenticated — which reads to the user as "this connector has no tools",
+/// because the refusal lands on `tools/list` rather than on the sign-in.
+///
+/// Two things make the narrower rule safe. **Every request here needs a bearer
+/// credential**, and a page in someone's browser cannot obtain one — it is not
+/// in a cookie, so the browser never attaches it. And **no CORS headers are ever
+/// sent**, so a cross-origin page could not read a response even if one came
+/// back. The credential is the real defence; this is belt-and-braces over the
+/// one shape where a request could reach a host the attacker otherwise cannot.
+///
+/// So: same origin is fine, a `null` origin is refused, and a cross-origin
+/// request is refused **only when it is addressed to a private or loopback
+/// host** — which is DNS rebinding and nothing else.
 fn origin_is_acceptable(headers: &HeaderMap) -> bool {
     let Some(origin) = headers.get("origin").and_then(|v| v.to_str().ok()) else {
+        // No Origin at all: every non-browser MCP client, i.e. almost all.
         return true;
     };
-    // Some clients send the literal `null` origin for a sandboxed context.
+    // A sandboxed or opaque context. Nothing legitimate here sends this.
     if origin == "null" {
         return false;
     }
+
     let host = headers.get("host").and_then(|v| v.to_str().ok()).unwrap_or("");
-    origin.split("://").nth(1).map(|o| o.eq_ignore_ascii_case(host)).unwrap_or(false)
+    let origin_host = origin.split("://").nth(1).unwrap_or("");
+    if origin_host.eq_ignore_ascii_case(host) {
+        return true;
+    }
+
+    // Cross-origin. Only a private target has the rebinding shape.
+    !is_private_host(host)
+}
+
+/// Whether a `Host` names something only reachable from inside the network.
+///
+/// Deliberately a string test rather than a parsed address: `Host` is a name as
+/// often as an address, and `.local` or a bare hostname is exactly what a
+/// rebinding attack would target. Anything not recognisably private is treated
+/// as public, which is the safe direction — a public host is one the attacker
+/// could reach directly anyway, so rebinding buys them nothing there.
+fn is_private_host(host: &str) -> bool {
+    let host = host.split(':').next().unwrap_or("").trim().to_ascii_lowercase();
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    if host.is_empty() {
+        return true;
+    }
+    if host == "localhost"
+        || host == "::1"
+        || host.ends_with(".local")
+        || host.ends_with(".localhost")
+    {
+        return true;
+    }
+    if host.starts_with("127.") || host.starts_with("10.") || host.starts_with("192.168.") {
+        return true;
+    }
+    // 172.16.0.0/12 — the range that gets written wrong, so it is spelled out.
+    if let Some(rest) = host.strip_prefix("172.") {
+        if let Some(second) = rest.split('.').next().and_then(|o| o.parse::<u8>().ok()) {
+            if (16..=31).contains(&second) {
+                return true;
+            }
+        }
+    }
+    // A bare hostname with no dot in it is a LAN name.
+    !host.contains('.')
 }
 
 /// `POST /mcp`
@@ -386,16 +446,47 @@ mod tests {
     #[test]
     fn a_page_on_another_site_cannot_reach_a_lan_instance() {
         // The DNS-rebinding attack the transport spec requires guarding
-        // against: a page at evil.example resolving a name to 192.168.x.x.
-        assert!(!origin_is_acceptable(&headers(&[
-            ("host", "tapedeck.local:8080"),
-            ("origin", "https://evil.example"),
-        ])));
-        // A sandboxed context sends a literal null and is not same-origin.
+        // against: a page at evil.example resolving a name to a private host.
+        for host in ["tapedeck.local:8080", "192.168.1.40:8080", "127.0.0.1:8080", "pi:8080"] {
+            assert!(
+                !origin_is_acceptable(&headers(&[
+                    ("host", host),
+                    ("origin", "https://evil.example")
+                ])),
+                "cross-origin request to private host {host} should be refused"
+            );
+        }
+        // A sandboxed context sends a literal null and is never legitimate.
         assert!(!origin_is_acceptable(&headers(&[
             ("host", "tapedeck.local:8080"),
             ("origin", "null"),
         ])));
+    }
+
+    #[test]
+    fn a_hosted_assistant_reaching_a_public_instance_is_allowed() {
+        // What the first version got wrong, and it cost a working connector: a
+        // hosted client whose HTTP stack sets an Origin was refused 403 before
+        // it ever authenticated, which reads as "this connector has no tools".
+        // Rebinding cannot reach a public host that the caller could simply
+        // fetch directly, and every request needs a bearer credential a browser
+        // page cannot hold.
+        assert!(origin_is_acceptable(&headers(&[
+            ("host", "tapedeck.example.com"),
+            ("origin", "https://claude.ai"),
+        ])));
+    }
+
+    #[test]
+    fn the_private_ranges_are_the_ones_people_write_wrong() {
+        assert!(is_private_host("172.16.0.5"));
+        assert!(is_private_host("172.31.255.1"));
+        // Just outside 172.16.0.0/12 — public, and a naive `starts_with("172.")`
+        // would have called both of these private.
+        assert!(!is_private_host("172.15.0.1"));
+        assert!(!is_private_host("172.32.0.1"));
+        assert!(is_private_host("[::1]:8080"));
+        assert!(!is_private_host("tapedeck.example.com"));
     }
 
     #[test]
