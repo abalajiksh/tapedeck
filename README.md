@@ -784,6 +784,47 @@ curl -X POST http://localhost:8080/1/submit-listens \
   }'
 ```
 
+## Ask a chatbot about your listening
+
+Tapedeck speaks the **Model Context Protocol**, so an AI assistant — running on
+your own machine or hosted — can read your history and hand playlists back. The
+server runs for every user on the instance, and reaches nobody's data until that
+person authorises a connection.
+
+**Two ways in.** For a local client, mint a credential in Settings → AI
+Connections and point it at `https://your-tapedeck/mcp`. For a hosted one, give
+it the same address and approve the OAuth request when it appears.
+
+**You choose what it can see.** Six grants, all off by default:
+
+| Grant | What it allows |
+|---|---|
+| `listening:read` | History, statistics, reports, sessions, the genre map |
+| `library:read` | Gear, signal chains, the shelf, loves, **liner notes** |
+| `playlists:write` | Save playlists into Tapedeck for you to review |
+| `playlists:push` | Send them on to your media server |
+| `loves:write` | Love and unlove |
+| `notes:write` | Write liner notes, recorded as written by that connection |
+
+Your statistics and your journal are separate grants on purpose.
+
+**Twenty-three tools**, all of them the same queries the web UI uses. The one to
+know about is `listening_profile`: it reports how much of your history carries
+each kind of metadata, and the assistant is told to call it first. That is what
+stops "4% lossless" being said about a history where the format is simply
+unknown for 97% of the listens — the number that would otherwise measure your
+import rather than your listening.
+
+A playlist an assistant builds is **saved into Tapedeck first**, on the
+Playlists page, and reaches a media server only when you send it. Every call any
+connection makes is recorded — which tool, when, with what, and how many rows
+came back — and a connection can be revoked at any time.
+
+Tapedeck also tells the assistant what *not* to do: never suggest music you do
+not own, never quote a share without its population, and never treat a genre
+position as finer than it is (genres attach to artists, so every track by an
+artist sits at the same point).
+
 ## API
 
 The whole API is described by **`openapi.yaml`** at the repo root, and every

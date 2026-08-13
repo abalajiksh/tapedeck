@@ -304,16 +304,16 @@ async fn note_json(
 // ── Handlers ──
 
 #[derive(Deserialize)]
-struct SaveNoteRequest {
+pub struct SaveNoteRequest {
     #[serde(flatten)]
-    target: TargetSpec,
-    body_md: String,
-    visibility: Option<String>,
+    pub target: TargetSpec,
+    pub body_md: String,
+    pub visibility: Option<String>,
 }
 
 /// POST /api/v1/notes — write the note for a target, creating it or editing the
 /// one already there. The previous body is archived by the database layer.
-async fn save_note(
+pub async fn save_note(
     State(state): State<Arc<AppState>>,
     WriteAuth { user }: WriteAuth,
     Json(body): Json<SaveNoteRequest>,
@@ -347,14 +347,14 @@ async fn save_note(
 }
 
 #[derive(Deserialize, Default)]
-struct ListQuery {
+pub struct ListQuery {
     /// Free text, matched against the body *and* the subject.
-    q: Option<String>,
+    pub q: Option<String>,
     /// `recording` / `release` / `artist` / `listen`. Anything else is no
     /// filter — a stale bookmark should show everything, not nothing.
-    kind: Option<String>,
+    pub kind: Option<String>,
     /// `updated` (default), `created` or `title`.
-    sort: Option<String>,
+    pub sort: Option<String>,
 }
 
 /// GET /api/v1/notes — everything this user has written, newest edit first.
@@ -365,7 +365,7 @@ struct ListQuery {
 ///
 /// `total` is the unfiltered count, so the UI can say "12 of 240" and a search
 /// returning nothing reads as a search rather than as an empty account.
-async fn list_notes(
+pub async fn list_notes(
     State(state): State<Arc<AppState>>,
     ReadAuth { user }: ReadAuth,
     Query(q): Query<ListQuery>,
@@ -596,15 +596,15 @@ async fn note_for(
 }
 
 #[derive(Deserialize)]
-struct LoveRequest {
+pub struct LoveRequest {
     #[serde(flatten)]
-    target: TargetSpec,
+    pub target: TargetSpec,
     /// Omitted means "love it"; pass false to un-love.
-    loved: Option<bool>,
+    pub loved: Option<bool>,
 }
 
 /// POST /api/v1/loves — love or un-love an entity.
-async fn set_love(
+pub async fn set_love(
     State(state): State<Arc<AppState>>,
     WriteAuth { user }: WriteAuth,
     Json(body): Json<LoveRequest>,
@@ -674,7 +674,7 @@ async fn love_keys(
 }
 
 /// GET /api/v1/loves
-async fn list_loves(
+pub async fn list_loves(
     State(state): State<Arc<AppState>>,
     ReadAuth { user }: ReadAuth,
 ) -> impl IntoResponse {

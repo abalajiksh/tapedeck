@@ -1460,6 +1460,202 @@ impl Database {
         .execute(&self.pool)
         .await?;
 
+        self.init_mcp().await?;
+        self.init_saved_playlists().await?;
+
+        Ok(())
+    }
+
+    /// The MCP surface's own tables.
+    ///
+    /// **An MCP connection is deliberately not a row in `tokens`.** It is a
+    /// standing grant to a third-party AI service, which is a different kind of
+    /// object from "a token I pasted into fooyin", and three differences make
+    /// sharing the table wrong rather than merely untidy:
+    ///
+    /// * `tokens.scopes` treats `all` as granting everything, so adding an
+    ///   `mcp` grant there would hand every existing `all` token the power to
+    ///   talk to a chatbot — a capability its owner never approved. Existing
+    ///   credentials must not gain reach from an upgrade.
+    /// * An OAuth-minted credential **expires and refreshes**. `tokens` has no
+    ///   concept of either, and bolting one on would put expiry logic in the
+    ///   path every scrobble client authenticates through.
+    /// * Revoking "the chatbot I connected last month" should not mean reading
+    ///   past six players in the same list.
+    async fn init_mcp(&self) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS mcp_connections (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL REFERENCES users(id),
+                -- What the user sees on the connections screen: 'Claude
+                -- Desktop', 'claude.ai', 'my local agent'.
+                name TEXT NOT NULL,
+                -- Hashed like every other bearer secret in this file.
+                token_hash TEXT NOT NULL UNIQUE,
+                -- Space-separated grants from `mcp::scopes::ALL`. Never 'all':
+                -- the consent screen names what it is granting, and a wildcard
+                -- cannot be named.
+                scopes TEXT NOT NULL DEFAULT '',
+                -- Which OAuth client the grant came through, when it did.
+                -- Null for a connection minted from Settings by hand.
+                client_id TEXT,
+                created_at INTEGER NOT NULL,
+                last_used_at INTEGER,
+                -- OAuth access tokens expire; one created by hand does not.
+                expires_at INTEGER,
+                refresh_hash TEXT UNIQUE,
+                revoked_at INTEGER
+            )",
+        )
+        .execute(&self.pool)
+        .await?;
+
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_mcp_connections_user
+             ON mcp_connections(user_id)",
+        )
+        .execute(&self.pool)
+        .await?;
+
+        // Every call, kept. This is what makes "I connected a chatbot to my
+        // listening history" reviewable rather than a matter of trust: the user
+        // can see which tool ran, when, with what, and how much data left the
+        // building. `rows` is the last of those and the one worth having — a
+        // tool that answered with 12 rows and a tool that answered with 20,000
+        // are different events however identical the call looks.
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS mcp_audit (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                connection_id INTEGER REFERENCES mcp_connections(id),
+                user_id INTEGER NOT NULL,
+                at INTEGER NOT NULL,
+                method TEXT NOT NULL,
+                tool TEXT,
+                args TEXT,
+                ok INTEGER NOT NULL,
+                rows_returned INTEGER,
+                ms INTEGER
+            )",
+        )
+        .execute(&self.pool)
+        .await?;
+
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_mcp_audit_user_at
+             ON mcp_audit(user_id, at DESC)",
+        )
+        .execute(&self.pool)
+        .await?;
+
+        // Registered OAuth clients. `redirect_uris` and `grant_types` are JSON
+        // arrays; `secret_hash` is null for a public client, which is what
+        // every MCP client is (PKCE, no back channel).
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS oauth_clients (
+                client_id TEXT PRIMARY KEY,
+                secret_hash TEXT,
+                client_name TEXT NOT NULL DEFAULT '',
+                redirect_uris TEXT NOT NULL DEFAULT '[]',
+                grant_types TEXT NOT NULL DEFAULT '[\"authorization_code\"]',
+                -- A client registered through RFC 7591 is anonymous; one
+                -- identified by a Client ID Metadata Document is its own URL.
+                registered_by_url INTEGER NOT NULL DEFAULT 0,
+                created_at INTEGER NOT NULL
+            )",
+        )
+        .execute(&self.pool)
+        .await?;
+
+        // Authorization codes. Single use, short lived, and bound to both the
+        // PKCE challenge and the RFC 8707 resource the client asked for — the
+        // audience the minted credential is then pinned to.
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS oauth_codes (
+                code_hash TEXT PRIMARY KEY,
+                client_id TEXT NOT NULL,
+                user_id INTEGER NOT NULL REFERENCES users(id),
+                redirect_uri TEXT NOT NULL,
+                scopes TEXT NOT NULL DEFAULT '',
+                code_challenge TEXT NOT NULL,
+                code_challenge_method TEXT NOT NULL DEFAULT 'S256',
+                resource TEXT,
+                created_at INTEGER NOT NULL,
+                expires_at INTEGER NOT NULL
+            )",
+        )
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    /// Playlists that live in Tapedeck rather than on a media server.
+    ///
+    /// Tapedeck has never had a playlist object — every list it builds
+    /// (Rediscovery, the genre map, Playlist Lab) is computed on the way to
+    /// being pushed somewhere else. A list an LLM hands back is the first one
+    /// that has to survive the request that made it: nobody has looked at it
+    /// yet, and the whole point of storing it is that somebody does before it
+    /// reaches the household's Plex.
+    async fn init_saved_playlists(&self) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS playlists (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL REFERENCES users(id),
+                name TEXT NOT NULL,
+                description TEXT,
+                -- Who made it: 'user', or the MCP connection's name. A list a
+                -- chatbot wrote must stay distinguishable from one you built,
+                -- for the same reason a note does.
+                origin TEXT NOT NULL DEFAULT 'user',
+                connection_id INTEGER REFERENCES mcp_connections(id),
+                -- Caller-supplied, so a retrying agent updates its playlist
+                -- instead of leaving five copies.
+                idempotency_key TEXT,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                pushed_at INTEGER,
+                pushed_to TEXT
+            )",
+        )
+        .execute(&self.pool)
+        .await?;
+
+        sqlx::query(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_playlists_idempotency
+             ON playlists(user_id, idempotency_key)
+             WHERE idempotency_key IS NOT NULL",
+        )
+        .execute(&self.pool)
+        .await?;
+
+        // Names, not ids. A generated list is titles and artists — the same
+        // shape `playlists::pick` resolves against a real library at push time,
+        // and the only shape that survives the user not owning the track on
+        // every server they have.
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS playlist_tracks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                playlist_id INTEGER NOT NULL REFERENCES playlists(id),
+                position INTEGER NOT NULL,
+                title TEXT NOT NULL,
+                artist TEXT NOT NULL,
+                album TEXT,
+                -- Why this track is here, in the words of whatever chose it.
+                -- Optional, and never generated by Tapedeck itself.
+                note TEXT
+            )",
+        )
+        .execute(&self.pool)
+        .await?;
+
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_playlist_tracks_playlist
+             ON playlist_tracks(playlist_id, position)",
+        )
+        .execute(&self.pool)
+        .await?;
+
         Ok(())
     }
 
@@ -8601,7 +8797,7 @@ impl Database {
         format!("{:x}", hasher.finalize())
     }
 
-    fn now_secs() -> i64 {
+    pub fn now_secs() -> i64 {
         std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64
     }
 
@@ -8830,10 +9026,27 @@ impl Database {
         .bind(id)
         .execute(&mut *tx)
         .await?;
+        // Playlist tracks point at playlists and have no `user_id` of their
+        // own, so they cannot go in the loop below — the same shape as
+        // `scrobble_artists` above, and the same reason.
+        sqlx::query(
+            "DELETE FROM playlist_tracks WHERE playlist_id IN
+                 (SELECT id FROM playlists WHERE user_id = ?)",
+        )
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
         for table in [
             "notes",
             "loves",
             "scrobbles",
+            // The MCP tables clear before `users`, and in this order: audit
+            // rows and playlists both reference a connection, so the
+            // connection cannot go first.
+            "mcp_audit",
+            "playlists",
+            "mcp_connections",
+            "oauth_codes",
             // The shelf goes before `equipment` and `signal_chains`, which both
             // of these point at — a play records the turntable it ran on, and a
             // pressing records what it is normally played through. Clearing the
@@ -9128,6 +9341,580 @@ impl Database {
         .bind(user_id)
         .fetch_all(&self.pool)
         .await
+    }
+
+    /// The shape of a history, and how much of it carries each kind of
+    /// metadata.
+    ///
+    /// This exists for one reader — the MCP surface's `listening_profile`, the
+    /// tool a model is told to call before it says anything with a number in
+    /// it — and it is the single most useful query on that surface. Not because
+    /// the totals are interesting, but because **the coverage figures are the
+    /// only thing standing between a sparse column and a confident sentence
+    /// about it.**
+    ///
+    /// The lesson is v0.41.2's, arriving somewhere it can be spoken aloud.
+    /// Format is known for 2.6% of a real imported history, so a lossless share
+    /// computed over every play was reporting the import ratio while looking
+    /// like a verdict on the listening. A card can be made to confess that; a
+    /// chatbot cannot be, unless it is handed the denominator.
+    ///
+    /// Every count here shares one population — `skipped = FALSE`, the rule
+    /// every counting query in this file follows — so the fractions are
+    /// fractions of the same whole. Paired counts that do not share a
+    /// population is the bug this codebase has now found five times.
+    pub async fn listening_coverage(&self, user_id: i64) -> Result<ListeningCoverage, sqlx::Error> {
+        let row: ListeningCoverage = sqlx::query_as(&format!(
+            "SELECT
+                COUNT(*) AS plays,
+                COUNT(DISTINCT LOWER(TRIM(artist))) AS artists,
+                COUNT(DISTINCT LOWER(TRIM(album))) AS albums,
+                MIN(timestamp) AS first_listen,
+                MAX(timestamp) AS last_listen,
+                SUM(CASE WHEN mbid_recording IS NOT NULL AND mbid_recording != ''
+                         THEN 1 ELSE 0 END) AS with_mbid,
+                SUM(CASE WHEN {fidelity} THEN 1 ELSE 0 END) AS with_format,
+                SUM(CASE WHEN duration IS NOT NULL THEN 1 ELSE 0 END) AS with_duration,
+                SUM(CASE WHEN chain_id IS NOT NULL THEN 1 ELSE 0 END) AS with_chain,
+                SUM(CASE WHEN quality_score IS NOT NULL THEN 1 ELSE 0 END) AS with_quality
+             FROM scrobbles WHERE user_id = ? AND skipped = FALSE",
+            fidelity = FIDELITY_KNOWN
+        ))
+        .bind(user_id)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(row)
+    }
+
+    /// Genre coverage is a separate query because genres live on the *artist*,
+    /// not the listen — which is also the reason a genre position is
+    /// artist-level and the MCP instructions say so.
+    pub async fn genre_coverage(&self, user_id: i64) -> Result<(i64, i64), sqlx::Error> {
+        let row: (i64, i64) = sqlx::query_as(
+            "SELECT
+                COUNT(*),
+                SUM(CASE WHEN a.genres IS NOT NULL AND a.genres != '[]' THEN 1 ELSE 0 END)
+             FROM (SELECT DISTINCT LOWER(TRIM(artist)) AS k FROM scrobbles
+                   WHERE user_id = ? AND skipped = FALSE) s
+             LEFT JOIN artists a ON LOWER(TRIM(a.name)) = s.k",
+        )
+        .bind(user_id)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(row)
+    }
+
+    /// Where the listens came from, biggest first. The honest answer to "is
+    /// this history imported or observed?", which decides how much of the rest
+    /// of the profile can be trusted.
+    pub async fn source_breakdown(&self, user_id: i64) -> Result<Vec<(String, i64)>, sqlx::Error> {
+        sqlx::query_as(
+            "SELECT source_name, COUNT(*) AS plays FROM scrobbles
+             WHERE user_id = ? AND skipped = FALSE
+             GROUP BY source_name ORDER BY plays DESC",
+        )
+        .bind(user_id)
+        .fetch_all(&self.pool)
+        .await
+    }
+
+    // ════════════════════════════════════════════════════════
+    //  MCP connections
+    // ════════════════════════════════════════════════════════
+
+    /// Mint a connection. Returns the bearer secret and, when the grant came
+    /// through OAuth, a refresh secret — both plaintext, both returned exactly
+    /// once and stored only as hashes.
+    ///
+    /// `ttl_secs` is `None` for a connection created by hand in Settings: it is
+    /// a credential the user pasted somewhere and expiring it silently would
+    /// break their client on a random Tuesday for no security gain they asked
+    /// for. An OAuth grant expires, because the client can refresh it without
+    /// anybody being present.
+    pub async fn create_mcp_connection(
+        &self,
+        user_id: i64,
+        name: &str,
+        scopes: &str,
+        client_id: Option<&str>,
+        ttl_secs: Option<i64>,
+    ) -> Result<McpCredential, sqlx::Error> {
+        use rand::Rng;
+        let raw: [u8; 32] = rand::rng().random();
+        let token = format!("tdmcp_{}", hex::encode(raw));
+        let now = Self::now_secs();
+
+        // Only an OAuth grant gets a refresh secret. A pasted credential has
+        // nothing to refresh *to* — it never expires — and issuing one would
+        // be a second live secret for the same access with no use for it.
+        let refresh = ttl_secs.map(|_| {
+            let raw: [u8; 32] = rand::rng().random();
+            format!("tdmcpr_{}", hex::encode(raw))
+        });
+
+        let id: (i64,) = sqlx::query_as(
+            "INSERT INTO mcp_connections
+                (user_id, name, token_hash, scopes, client_id, created_at, expires_at, refresh_hash)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
+        )
+        .bind(user_id)
+        .bind(name)
+        .bind(Self::hash_token(&token))
+        .bind(scopes)
+        .bind(client_id)
+        .bind(now)
+        .bind(ttl_secs.map(|t| now + t))
+        .bind(refresh.as_deref().map(Self::hash_token))
+        .fetch_one(&self.pool)
+        .await?;
+
+        info!("🤖 MCP connection '{}' created for user_id {} [{}]", name, user_id, scopes);
+        Ok(McpCredential { id: id.0, token, refresh, expires_in: ttl_secs })
+    }
+
+    /// Resolve a bearer secret to its connection, or `None`.
+    ///
+    /// Expiry and revocation are checked **here** rather than by the caller, so
+    /// there is one place a dead credential can be let through. `last_used_at`
+    /// is written on every successful call — it is the column the connections
+    /// screen reads to answer "is this thing still talking to me?".
+    pub async fn validate_mcp_token(&self, token: &str) -> Result<Option<McpAuth>, sqlx::Error> {
+        let hash = Self::hash_token(token);
+        let now = Self::now_secs();
+        let row: Option<(i64, i64, String, String, String, bool, Option<i64>, Option<i64>)> =
+            sqlx::query_as(
+                "SELECT c.id, u.id, u.username, u.role, c.scopes, u.disabled,
+                        c.expires_at, c.revoked_at
+                 FROM mcp_connections c JOIN users u ON u.id = c.user_id
+                 WHERE c.token_hash = ?",
+            )
+            .bind(&hash)
+            .fetch_optional(&self.pool)
+            .await?;
+
+        let Some((id, user_id, username, role, scopes, disabled, expires_at, revoked_at)) = row
+        else {
+            return Ok(None);
+        };
+        if disabled || revoked_at.is_some() || expires_at.is_some_and(|e| e <= now) {
+            return Ok(None);
+        }
+
+        sqlx::query("UPDATE mcp_connections SET last_used_at = ? WHERE id = ?")
+            .bind(now)
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+
+        Ok(Some(McpAuth {
+            connection_id: id,
+            user: AuthUser { user_id, username, is_admin: role == "admin" },
+            scopes,
+        }))
+    }
+
+    /// Exchange a refresh secret for a fresh pair, rotating both.
+    ///
+    /// The old access secret dies with the swap, which is the point: a leaked
+    /// access token stops working as soon as the legitimate client refreshes.
+    pub async fn refresh_mcp_connection(
+        &self,
+        refresh_token: &str,
+        ttl_secs: i64,
+    ) -> Result<Option<McpCredential>, sqlx::Error> {
+        use rand::Rng;
+        let row: Option<(i64,)> = sqlx::query_as(
+            "SELECT id FROM mcp_connections WHERE refresh_hash = ? AND revoked_at IS NULL",
+        )
+        .bind(Self::hash_token(refresh_token))
+        .fetch_optional(&self.pool)
+        .await?;
+        let Some((id,)) = row else { return Ok(None) };
+
+        let raw: [u8; 32] = rand::rng().random();
+        let token = format!("tdmcp_{}", hex::encode(raw));
+        let raw: [u8; 32] = rand::rng().random();
+        let refresh = format!("tdmcpr_{}", hex::encode(raw));
+        let now = Self::now_secs();
+
+        sqlx::query(
+            "UPDATE mcp_connections SET token_hash = ?, refresh_hash = ?, expires_at = ?
+             WHERE id = ?",
+        )
+        .bind(Self::hash_token(&token))
+        .bind(Self::hash_token(&refresh))
+        .bind(now + ttl_secs)
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(Some(McpCredential { id, token, refresh: Some(refresh), expires_in: Some(ttl_secs) }))
+    }
+
+    pub async fn list_mcp_connections(
+        &self,
+        user_id: i64,
+    ) -> Result<Vec<McpConnectionRecord>, sqlx::Error> {
+        sqlx::query_as(
+            "SELECT id, name, scopes, client_id, created_at, last_used_at, expires_at,
+                    (SELECT COUNT(*) FROM mcp_audit a WHERE a.connection_id = c.id) AS calls
+             FROM mcp_connections c
+             WHERE user_id = ? AND revoked_at IS NULL
+             ORDER BY created_at DESC",
+        )
+        .bind(user_id)
+        .fetch_all(&self.pool)
+        .await
+    }
+
+    /// Revoke rather than delete, so the audit rows keep pointing at something
+    /// with a name. "Which chatbot read my history in March" is a question that
+    /// outlives the connection, and a dangling id cannot answer it.
+    pub async fn revoke_mcp_connection(&self, user_id: i64, id: i64) -> Result<bool, sqlx::Error> {
+        let res = sqlx::query(
+            "UPDATE mcp_connections SET revoked_at = ?, token_hash = 'revoked:' || id,
+                    refresh_hash = NULL
+             WHERE id = ? AND user_id = ? AND revoked_at IS NULL",
+        )
+        .bind(Self::now_secs())
+        .bind(id)
+        .bind(user_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(res.rows_affected() > 0)
+    }
+
+    /// Record one call. Deliberately infallible from the caller's point of
+    /// view — an audit write that fails must not fail the request that was
+    /// otherwise fine, and the error is logged rather than propagated.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn log_mcp_call(
+        &self,
+        connection_id: Option<i64>,
+        user_id: i64,
+        method: &str,
+        tool: Option<&str>,
+        args: Option<&str>,
+        ok: bool,
+        rows_returned: Option<i64>,
+        ms: i64,
+    ) {
+        // Arguments are truncated rather than stored whole: this is a record of
+        // what was asked, not a copy of it, and a tool call carrying a long
+        // free-text argument should not turn the audit table into the largest
+        // thing in the database.
+        let args = args.map(|a| a.chars().take(500).collect::<String>());
+        let res = sqlx::query(
+            "INSERT INTO mcp_audit
+                (connection_id, user_id, at, method, tool, args, ok, rows_returned, ms)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(connection_id)
+        .bind(user_id)
+        .bind(Self::now_secs())
+        .bind(method)
+        .bind(tool)
+        .bind(args)
+        .bind(ok)
+        .bind(rows_returned)
+        .bind(ms)
+        .execute(&self.pool)
+        .await;
+        if let Err(e) = res {
+            tracing::error!("MCP audit write failed: {}", e);
+        }
+    }
+
+    pub async fn list_mcp_audit(
+        &self,
+        user_id: i64,
+        limit: i64,
+    ) -> Result<Vec<McpAuditRow>, sqlx::Error> {
+        sqlx::query_as(
+            "SELECT a.id, a.at, a.method, a.tool, a.args, a.ok, a.rows_returned, a.ms,
+                    c.name AS connection_name
+             FROM mcp_audit a LEFT JOIN mcp_connections c ON c.id = a.connection_id
+             WHERE a.user_id = ? ORDER BY a.at DESC, a.id DESC LIMIT ?",
+        )
+        .bind(user_id)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+    }
+
+    /// How many calls this connection has made since `since`. The budget check
+    /// — one indexed count, run before the tool rather than after.
+    pub async fn mcp_calls_since(&self, connection_id: i64, since: i64) -> i64 {
+        let row: Result<(i64,), _> =
+            sqlx::query_as("SELECT COUNT(*) FROM mcp_audit WHERE connection_id = ? AND at >= ?")
+                .bind(connection_id)
+                .bind(since)
+                .fetch_one(&self.pool)
+                .await;
+        row.map(|r| r.0).unwrap_or(0)
+    }
+
+    // ════════════════════════════════════════════════════════
+    //  OAuth 2.1
+    // ════════════════════════════════════════════════════════
+
+    pub async fn register_oauth_client(
+        &self,
+        client_id: &str,
+        client_name: &str,
+        redirect_uris: &str,
+        registered_by_url: bool,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "INSERT INTO oauth_clients
+                (client_id, client_name, redirect_uris, registered_by_url, created_at)
+             VALUES (?, ?, ?, ?, ?)
+             ON CONFLICT(client_id) DO UPDATE SET
+                client_name = excluded.client_name,
+                redirect_uris = excluded.redirect_uris",
+        )
+        .bind(client_id)
+        .bind(client_name)
+        .bind(redirect_uris)
+        .bind(registered_by_url)
+        .bind(Self::now_secs())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn get_oauth_client(
+        &self,
+        client_id: &str,
+    ) -> Result<Option<OAuthClient>, sqlx::Error> {
+        sqlx::query_as(
+            "SELECT client_id, client_name, redirect_uris, registered_by_url
+             FROM oauth_clients WHERE client_id = ?",
+        )
+        .bind(client_id)
+        .fetch_optional(&self.pool)
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_oauth_code(
+        &self,
+        client_id: &str,
+        user_id: i64,
+        redirect_uri: &str,
+        scopes: &str,
+        code_challenge: &str,
+        resource: Option<&str>,
+        ttl_secs: i64,
+    ) -> Result<String, sqlx::Error> {
+        use rand::Rng;
+        let raw: [u8; 32] = rand::rng().random();
+        let code = hex::encode(raw);
+        let now = Self::now_secs();
+        sqlx::query(
+            "INSERT INTO oauth_codes
+                (code_hash, client_id, user_id, redirect_uri, scopes, code_challenge,
+                 resource, created_at, expires_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(Self::hash_token(&code))
+        .bind(client_id)
+        .bind(user_id)
+        .bind(redirect_uri)
+        .bind(scopes)
+        .bind(code_challenge)
+        .bind(resource)
+        .bind(now)
+        .bind(now + ttl_secs)
+        .execute(&self.pool)
+        .await?;
+        Ok(code)
+    }
+
+    /// Take an authorization code, deleting it in the same statement.
+    ///
+    /// `DELETE … RETURNING` rather than select-then-delete: two statements
+    /// would let two simultaneous redemptions of one code both see it, which is
+    /// exactly the replay a single-use code exists to stop.
+    pub async fn consume_oauth_code(&self, code: &str) -> Result<Option<OAuthCode>, sqlx::Error> {
+        let row: Option<OAuthCode> = sqlx::query_as(
+            "DELETE FROM oauth_codes WHERE code_hash = ?
+             RETURNING client_id, user_id, redirect_uri, scopes, code_challenge,
+                       resource, expires_at",
+        )
+        .bind(Self::hash_token(code))
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.filter(|c| c.expires_at > Self::now_secs()))
+    }
+
+    pub async fn purge_expired_oauth_codes(&self) -> Result<(), sqlx::Error> {
+        sqlx::query("DELETE FROM oauth_codes WHERE expires_at < ?")
+            .bind(Self::now_secs())
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    // ════════════════════════════════════════════════════════
+    //  Saved playlists
+    // ════════════════════════════════════════════════════════
+
+    /// Save a playlist, replacing one with the same idempotency key.
+    ///
+    /// The replace is what makes a retrying agent safe: a network blip between
+    /// "created" and "the client heard about it" would otherwise leave a second
+    /// copy every time, and an agent that retries three times leaves three.
+    pub async fn save_playlist(
+        &self,
+        user_id: i64,
+        name: &str,
+        description: Option<&str>,
+        origin: &str,
+        connection_id: Option<i64>,
+        idempotency_key: Option<&str>,
+        tracks: &[SavedPlaylistTrack],
+    ) -> Result<(i64, bool), sqlx::Error> {
+        let now = Self::now_secs();
+        let mut tx = self.pool.begin().await?;
+
+        let existing: Option<(i64,)> = match idempotency_key {
+            Some(key) => {
+                sqlx::query_as("SELECT id FROM playlists WHERE user_id = ? AND idempotency_key = ?")
+                    .bind(user_id)
+                    .bind(key)
+                    .fetch_optional(&mut *tx)
+                    .await?
+            }
+            None => None,
+        };
+
+        let (id, replaced) = match existing {
+            Some((id,)) => {
+                sqlx::query(
+                    "UPDATE playlists SET name = ?, description = ?, updated_at = ? WHERE id = ?",
+                )
+                .bind(name)
+                .bind(description)
+                .bind(now)
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
+                sqlx::query("DELETE FROM playlist_tracks WHERE playlist_id = ?")
+                    .bind(id)
+                    .execute(&mut *tx)
+                    .await?;
+                (id, true)
+            }
+            None => {
+                let row: (i64,) = sqlx::query_as(
+                    "INSERT INTO playlists
+                        (user_id, name, description, origin, connection_id, idempotency_key,
+                         created_at, updated_at)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
+                )
+                .bind(user_id)
+                .bind(name)
+                .bind(description)
+                .bind(origin)
+                .bind(connection_id)
+                .bind(idempotency_key)
+                .bind(now)
+                .bind(now)
+                .fetch_one(&mut *tx)
+                .await?;
+                (row.0, false)
+            }
+        };
+
+        for (i, t) in tracks.iter().enumerate() {
+            sqlx::query(
+                "INSERT INTO playlist_tracks (playlist_id, position, title, artist, album, note)
+                 VALUES (?, ?, ?, ?, ?, ?)",
+            )
+            .bind(id)
+            .bind(i as i64)
+            .bind(&t.title)
+            .bind(&t.artist)
+            .bind(&t.album)
+            .bind(&t.note)
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        tx.commit().await?;
+        Ok((id, replaced))
+    }
+
+    pub async fn list_playlists(
+        &self,
+        user_id: i64,
+    ) -> Result<Vec<SavedPlaylistRecord>, sqlx::Error> {
+        sqlx::query_as(
+            "SELECT p.id, p.name, p.description, p.origin, p.created_at, p.updated_at,
+                    p.pushed_at, p.pushed_to, c.name AS connection_name,
+                    (SELECT COUNT(*) FROM playlist_tracks t WHERE t.playlist_id = p.id) AS tracks
+             FROM playlists p LEFT JOIN mcp_connections c ON c.id = p.connection_id
+             WHERE p.user_id = ? ORDER BY p.updated_at DESC",
+        )
+        .bind(user_id)
+        .fetch_all(&self.pool)
+        .await
+    }
+
+    pub async fn playlist_tracks(
+        &self,
+        user_id: i64,
+        playlist_id: i64,
+    ) -> Result<Vec<SavedPlaylistTrack>, sqlx::Error> {
+        sqlx::query_as(
+            "SELECT t.title, t.artist, t.album, t.note
+             FROM playlist_tracks t JOIN playlists p ON p.id = t.playlist_id
+             WHERE t.playlist_id = ? AND p.user_id = ? ORDER BY t.position ASC",
+        )
+        .bind(playlist_id)
+        .bind(user_id)
+        .fetch_all(&self.pool)
+        .await
+    }
+
+    pub async fn delete_playlist(&self, user_id: i64, id: i64) -> Result<bool, sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
+        // Tracks reference the playlist and foreign keys are on, so they go
+        // first — the same rule `delete_chain` follows.
+        sqlx::query(
+            "DELETE FROM playlist_tracks WHERE playlist_id IN
+                (SELECT id FROM playlists WHERE id = ? AND user_id = ?)",
+        )
+        .bind(id)
+        .bind(user_id)
+        .execute(&mut *tx)
+        .await?;
+        let res = sqlx::query("DELETE FROM playlists WHERE id = ? AND user_id = ?")
+            .bind(id)
+            .bind(user_id)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(res.rows_affected() > 0)
+    }
+
+    pub async fn mark_playlist_pushed(
+        &self,
+        user_id: i64,
+        id: i64,
+        target: &str,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "UPDATE playlists SET pushed_at = ?, pushed_to = ? WHERE id = ? AND user_id = ?",
+        )
+        .bind(Self::now_secs())
+        .bind(target)
+        .bind(id)
+        .bind(user_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
     }
 }
 
@@ -9504,6 +10291,132 @@ pub struct TokenRecord {
     pub imports_are_live: bool,
     /// Joined for display so the token list doesn't need a second round-trip.
     pub default_chain_name: Option<String>,
+}
+
+/// How big a history is and how much of it is actually populated.
+///
+/// Every `with_*` count is over the same population as `plays`, so they divide
+/// into it directly. Nullable because a history with no listens at all has no
+/// first or last one — `0` would be a date in 1970 and a model would say so.
+#[derive(Debug, FromRow, serde::Serialize)]
+pub struct ListeningCoverage {
+    pub plays: i64,
+    pub artists: i64,
+    pub albums: i64,
+    pub first_listen: Option<i64>,
+    pub last_listen: Option<i64>,
+    pub with_mbid: i64,
+    pub with_format: i64,
+    pub with_duration: i64,
+    pub with_chain: i64,
+    pub with_quality: i64,
+}
+
+/// A freshly minted MCP credential. Plaintext, returned once, stored hashed.
+pub struct McpCredential {
+    pub id: i64,
+    pub token: String,
+    /// Only ever set for an OAuth grant — see `create_mcp_connection`.
+    pub refresh: Option<String>,
+    pub expires_in: Option<i64>,
+}
+
+/// An authenticated MCP caller: which connection, whose data, what it may do.
+///
+/// The scope check lives on this type rather than in each tool for the reason
+/// `TokenAuth::can_read` does — a grant that has to be remembered at 20 call
+/// sites is a grant that will be forgotten at one of them.
+#[derive(Debug, Clone)]
+pub struct McpAuth {
+    pub connection_id: i64,
+    pub user: AuthUser,
+    pub scopes: String,
+}
+
+impl McpAuth {
+    /// Exact-token match, and **no wildcard**.
+    ///
+    /// `TokenAuth::has_scope` accepts `all`; this deliberately does not. An MCP
+    /// consent screen names the things it is granting so the user can read
+    /// them, and "everything, including whatever gets added later" is not
+    /// something a person can meaningfully consent to. Splitting on both commas
+    /// and whitespace mirrors the token parser, so an operator who writes the
+    /// column by hand gets the same behaviour in both places.
+    pub fn has_scope(&self, want: &str) -> bool {
+        self.scopes.split(|c: char| c == ',' || c.is_whitespace()).any(|s| s.trim() == want)
+    }
+}
+
+#[derive(Debug, FromRow, serde::Serialize)]
+pub struct McpConnectionRecord {
+    pub id: i64,
+    pub name: String,
+    pub scopes: String,
+    pub client_id: Option<String>,
+    pub created_at: i64,
+    pub last_used_at: Option<i64>,
+    pub expires_at: Option<i64>,
+    pub calls: i64,
+}
+
+#[derive(Debug, FromRow, serde::Serialize)]
+pub struct McpAuditRow {
+    pub id: i64,
+    pub at: i64,
+    pub method: String,
+    pub tool: Option<String>,
+    pub args: Option<String>,
+    pub ok: bool,
+    pub rows_returned: Option<i64>,
+    pub ms: Option<i64>,
+    /// Null once the connection has been deleted outright rather than revoked —
+    /// which nothing does, but the join has to allow for it.
+    pub connection_name: Option<String>,
+}
+
+#[derive(Debug, FromRow)]
+pub struct OAuthClient {
+    pub client_id: String,
+    pub client_name: String,
+    /// A JSON array, kept as text — this is read once per authorization and
+    /// parsed there rather than being a shape the database has to know.
+    pub redirect_uris: String,
+    pub registered_by_url: bool,
+}
+
+#[derive(Debug, FromRow)]
+pub struct OAuthCode {
+    pub client_id: String,
+    pub user_id: i64,
+    pub redirect_uri: String,
+    pub scopes: String,
+    pub code_challenge: String,
+    pub resource: Option<String>,
+    pub expires_at: i64,
+}
+
+#[derive(Debug, Clone, FromRow, serde::Serialize, serde::Deserialize)]
+pub struct SavedPlaylistTrack {
+    pub title: String,
+    pub artist: String,
+    pub album: Option<String>,
+    /// Why this track is here, in the words of whatever chose it. Never
+    /// generated by Tapedeck.
+    pub note: Option<String>,
+}
+
+#[derive(Debug, FromRow, serde::Serialize)]
+pub struct SavedPlaylistRecord {
+    pub id: i64,
+    pub name: String,
+    pub description: Option<String>,
+    pub origin: String,
+    pub created_at: i64,
+    pub updated_at: i64,
+    pub pushed_at: Option<i64>,
+    pub pushed_to: Option<String>,
+    pub connection_name: Option<String>,
+    pub tracks: i64,
 }
 
 /// A variant as stored, before its overrides are parsed.

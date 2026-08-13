@@ -7,11 +7,22 @@
 	let error = '';
 	let loading = false;
 
+	/// Where to land after signing in.
+	///
+	/// Only a same-site path is honoured — a `next` of `https://evil.example`
+	/// would turn the login page into an open redirect, and one that arrives
+	/// after a successful login is the most credible kind.
+	function nextPath(): string {
+		const next = new URLSearchParams(window.location.search).get('next');
+		if (next && next.startsWith('/') && !next.startsWith('//')) return next;
+		return '/';
+	}
+
 	onMount(async () => {
 		try {
 			const status = await api.authStatus();
 			if (status.needs_setup) return (window.location.href = '/setup');
-			if (status.authenticated) return (window.location.href = '/');
+			if (status.authenticated) return (window.location.href = nextPath());
 		} catch { /* proceed to login form */ }
 	});
 
@@ -20,7 +31,7 @@
 		loading = true;
 		try {
 			await api.login(username, password);
-			window.location.href = '/';
+			window.location.href = nextPath();
 		} catch (e) {
 			error = String(e).includes('401') ? 'Invalid username or password' : 'Connection error';
 		}

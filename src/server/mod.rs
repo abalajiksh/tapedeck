@@ -1,29 +1,31 @@
 mod admin;
 mod artwork;
 pub mod auth;
-mod chains;
+pub mod chains;
 mod connections;
-mod everynoise;
+pub mod everynoise;
 mod export;
 pub mod import;
 pub mod ingest;
 mod lb_api;
-mod library;
+pub mod library;
 mod loves_pull;
+pub mod mcp;
 mod metrics;
 pub mod models;
-mod notes;
+pub mod notes;
 pub mod now_playing;
+pub mod oauth;
 mod pairing;
 pub mod physical;
 mod playlist_lab;
-mod playlists;
+pub mod playlists;
 mod preferences;
 pub mod ratelimit;
 pub mod rediscovery;
 pub mod reports;
 pub mod scrobbles;
-mod sessions;
+pub mod sessions;
 mod sources;
 mod users;
 
@@ -109,6 +111,8 @@ pub fn build_app(state: Arc<AppState>) -> Router {
         .merge(everynoise::create_everynoise_router())
         .merge(pairing::create_pairing_router())
         .merge(reports::create_reports_router())
+        .merge(mcp::create_mcp_router())
+        .merge(oauth::create_oauth_router())
         // The spec describes *this* instance at *this* version — the one
         // thing a separately hosted docs site cannot do.
         .route("/api/openapi.yaml", axum::routing::get(crate::openapi::spec))

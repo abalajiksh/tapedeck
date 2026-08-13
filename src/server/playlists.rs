@@ -124,16 +124,27 @@ fn target_view(s: &UserSource, protocol: &str) -> serde_json::Value {
 /// the user has said they don't want Tapedeck talking to it, and writing a
 /// playlist is talking to it.
 async fn list_targets(State(state): State<Arc<AppState>>, user: AuthUser) -> impl IntoResponse {
-    match state.db.list_sources_for_user(user.user_id).await {
-        Ok(rows) => {
-            let targets: Vec<_> = rows
-                .iter()
-                .filter(|s| s.enabled)
-                .filter_map(|s| protocol_for(&s.kind).map(|p| target_view(s, p)))
-                .collect();
-            (StatusCode::OK, Json(serde_json::json!({ "targets": targets }))).into_response()
+    let targets = targets_for(&state, user.user_id).await;
+    (StatusCode::OK, Json(serde_json::json!({ "targets": targets }))).into_response()
+}
+
+/// The push targets for one user, as JSON.
+///
+/// Split out of the handler so the MCP surface offers exactly the same list.
+/// An empty vec is a normal answer — plenty of instances have no writable
+/// source at all — and both callers say so rather than showing a button or a
+/// tool that cannot work.
+pub async fn targets_for(state: &AppState, user_id: i64) -> Vec<serde_json::Value> {
+    match state.db.list_sources_for_user(user_id).await {
+        Ok(rows) => rows
+            .iter()
+            .filter(|s| s.enabled)
+            .filter_map(|s| protocol_for(&s.kind).map(|p| target_view(s, p)))
+            .collect(),
+        Err(e) => {
+            warn!("Listing playlist targets failed: {e}");
+            Vec::new()
         }
-        Err(e) => err(500, e.to_string()),
     }
 }
 
@@ -151,48 +162,87 @@ async fn push(
     user: AuthUser,
     Json(body): Json<PushRequest>,
 ) -> impl IntoResponse {
-    let name = body.name.trim();
+    match push_tracks(&state, user.user_id, body.source_id, &body.name, &body.tracks).await {
+        Ok(value) => (StatusCode::OK, Json(value)).into_response(),
+        Err(PushError { code, message }) => err(code, message),
+    }
+}
+
+/// A push that could not go, with the status the HTTP layer should use.
+///
+/// The code matters and is not decoration: `404` is "none of this is in your
+/// library" and `502` is "your server stopped answering". They need completely
+/// different things from the user, and collapsing them into one failure is what
+/// makes a push feel broken when it merely found nothing.
+pub struct PushError {
+    pub code: u16,
+    pub message: String,
+}
+
+impl From<PushError> for String {
+    fn from(e: PushError) -> String {
+        e.message
+    }
+}
+
+/// Resolve every track against one server and create the playlist from what was
+/// found.
+///
+/// Shared by the HTTP endpoint and the MCP `push_playlist` tool. The rule this
+/// exists to keep in one place is the partial result: a listening history is not
+/// the same set as any one library, so `matched < requested` is the normal case
+/// and **every track that did not land is named**. Sending nine of twelve and
+/// calling it done is the failure this codebase keeps finding in other forms.
+pub async fn push_tracks(
+    state: &AppState,
+    user_id: i64,
+    source_id: i64,
+    name: &str,
+    tracks: &[PlaylistTrack],
+) -> Result<serde_json::Value, PushError> {
+    let fail = |code: u16, message: String| PushError { code, message };
+
+    let name = name.trim();
     if name.is_empty() {
-        return err(400, "A playlist needs a name");
+        return Err(fail(400, "A playlist needs a name".into()));
     }
     // Long enough for "Tapedeck · Forgotten Favourites · March 2026", short
     // enough that no server truncates it into something unrecognisable.
     let name: String = name.chars().take(120).collect();
 
-    if body.tracks.is_empty() {
-        return err(400, "A playlist needs at least one track");
+    if tracks.is_empty() {
+        return Err(fail(400, "A playlist needs at least one track".into()));
     }
-    if body.tracks.len() > MAX_TRACKS {
-        return err(400, format!("That's more than {MAX_TRACKS} tracks"));
+    if tracks.len() > MAX_TRACKS {
+        return Err(fail(400, format!("That's more than {MAX_TRACKS} tracks")));
     }
 
     // Scoped before anything else: sources are per user, and an id from someone
     // else's row would push through their credentials.
-    let source = match state.db.get_source(user.user_id, body.source_id).await {
+    let source = match state.db.get_source(user_id, source_id).await {
         Ok(Some(s)) => s,
-        Ok(None) => return err(404, "No such source"),
-        Err(e) => return err(500, e.to_string()),
+        Ok(None) => return Err(fail(404, "No such source".into())),
+        Err(e) => return Err(fail(500, e.to_string())),
     };
     if !source.enabled {
-        return err(400, "That source is switched off");
+        return Err(fail(400, "That source is switched off".into()));
     }
     let Some(protocol) = protocol_for(&source.kind) else {
-        return err(400, format!("A {} source cannot receive a playlist", source.kind));
+        return Err(fail(400, format!("A {} source cannot receive a playlist", source.kind)));
     };
     let target = match build_target(&source) {
         Ok(t) => t,
-        Err(msg) => return err(400, msg),
+        Err(msg) => return Err(fail(400, msg)),
     };
-
     // Sequential on purpose, for the same reason the Rediscovery queries are:
     // this is someone's Raspberry Pi, and firing a hundred searches at it at
     // once is how a push turns into a timeout. It also keeps the order the
     // caller asked for, which is the order the playlist ends up in.
-    let mut ids: Vec<String> = Vec::with_capacity(body.tracks.len());
+    let mut ids: Vec<String> = Vec::with_capacity(tracks.len());
     let mut missing: Vec<&PlaylistTrack> = Vec::new();
     let mut search_error: Option<String> = None;
 
-    for want in &body.tracks {
+    for want in tracks {
         match target.search_tracks(want).await {
             Ok(candidates) => match playlists::pick(want, &candidates) {
                 Some(id) => ids.push(id),
@@ -217,39 +267,171 @@ async fn push(
     if ids.is_empty() {
         // Distinguish "your server said no" from "none of this is in your
         // library" — they need completely different things from the user.
-        return match search_error {
-            Some(e) => err(502, format!("{protocol} could not be reached: {e}")),
-            None => err(
-                404,
-                format!("None of those {} tracks are on this {protocol}", body.tracks.len()),
-            ),
-        };
+        return Err(match search_error {
+            Some(e) => fail(502, format!("{protocol} could not be reached: {e}")),
+            None => {
+                fail(404, format!("None of those {} tracks are on this {protocol}", tracks.len()))
+            }
+        });
     }
 
     match target.create_playlist(&name, &ids).await {
         Ok(playlist_id) => {
-            info!(
-                "📀 Pushed \"{}\" to {} — {}/{} tracks",
-                name,
-                protocol,
-                ids.len(),
-                body.tracks.len()
-            );
-            (
-                StatusCode::OK,
-                Json(serde_json::json!({
-                    "playlist_id": playlist_id,
-                    "name": name,
-                    "protocol": protocol,
-                    "target": target_view(&source, protocol),
-                    "requested": body.tracks.len(),
-                    "matched": ids.len(),
-                    "missing": missing_json,
-                })),
-            )
+            info!("📀 Pushed \"{}\" to {} — {}/{} tracks", name, protocol, ids.len(), tracks.len());
+            Ok(serde_json::json!({
+                "playlist_id": playlist_id,
+                "name": name,
+                "protocol": protocol,
+                "target": target_view(&source, protocol),
+                "requested": tracks.len(),
+                "matched": ids.len(),
+                "missing": missing_json,
+            }))
+        }
+        Err(e) => Err(fail(502, format!("{protocol} refused the playlist: {e}"))),
+    }
+}
+
+// ════════════════════════════════════════════════════════════
+//  Playlists that live in Tapedeck
+// ════════════════════════════════════════════════════════════
+//
+// Until now every list this application built went straight out to a media
+// server, because every one of them was computed on demand and could be
+// computed again. A list handed back by a chatbot is the first that cannot: it
+// is the product of a conversation, nobody has looked at it yet, and the point
+// of storing it is that somebody does before it reaches the household's Plex.
+
+/// GET /api/v1/saved-playlists
+async fn list_saved(State(state): State<Arc<AppState>>, user: AuthUser) -> impl IntoResponse {
+    match state.db.list_playlists(user.user_id).await {
+        Ok(rows) => {
+            (StatusCode::OK, Json(serde_json::json!({ "playlists": rows }))).into_response()
+        }
+        Err(e) => err(500, e.to_string()),
+    }
+}
+
+/// GET /api/v1/saved-playlists/:id
+async fn get_saved(
+    State(state): State<Arc<AppState>>,
+    user: AuthUser,
+    axum::extract::Path(id): axum::extract::Path<i64>,
+) -> impl IntoResponse {
+    let Ok(all) = state.db.list_playlists(user.user_id).await else {
+        return err(500, "Could not read playlists");
+    };
+    let Some(meta) = all.into_iter().find(|p| p.id == id) else {
+        return err(404, "No such playlist");
+    };
+    match state.db.playlist_tracks(user.user_id, id).await {
+        Ok(tracks) => {
+            (StatusCode::OK, Json(serde_json::json!({ "playlist": meta, "tracks": tracks })))
                 .into_response()
         }
-        Err(e) => err(502, format!("{protocol} refused the playlist: {e}")),
+        Err(e) => err(500, e.to_string()),
+    }
+}
+
+#[derive(Deserialize)]
+struct SavePlaylistRequest {
+    name: String,
+    description: Option<String>,
+    tracks: Vec<crate::db::SavedPlaylistTrack>,
+}
+
+/// POST /api/v1/saved-playlists
+async fn save_saved(
+    State(state): State<Arc<AppState>>,
+    user: AuthUser,
+    Json(body): Json<SavePlaylistRequest>,
+) -> impl IntoResponse {
+    let name = body.name.trim();
+    if name.is_empty() {
+        return err(400, "A playlist needs a name");
+    }
+    if body.tracks.is_empty() {
+        return err(400, "A playlist needs at least one track");
+    }
+    // `origin: "user"` — this one they built themselves, which is what the
+    // playlists page distinguishes from one a connection wrote.
+    match state
+        .db
+        .save_playlist(
+            user.user_id,
+            name,
+            body.description.as_deref(),
+            "user",
+            None,
+            None,
+            &body.tracks,
+        )
+        .await
+    {
+        Ok((id, _)) => (StatusCode::OK, Json(serde_json::json!({ "id": id }))).into_response(),
+        Err(e) => err(500, e.to_string()),
+    }
+}
+
+/// DELETE /api/v1/saved-playlists/:id
+async fn delete_saved(
+    State(state): State<Arc<AppState>>,
+    user: AuthUser,
+    axum::extract::Path(id): axum::extract::Path<i64>,
+) -> impl IntoResponse {
+    match state.db.delete_playlist(user.user_id, id).await {
+        Ok(true) => (StatusCode::OK, Json(serde_json::json!({ "deleted": true }))).into_response(),
+        Ok(false) => err(404, "No such playlist"),
+        Err(e) => err(500, e.to_string()),
+    }
+}
+
+#[derive(Deserialize)]
+struct PushSavedRequest {
+    source_id: i64,
+}
+
+/// POST /api/v1/saved-playlists/:id/push — send a stored playlist onward.
+///
+/// The review step the whole design turns on: a list an LLM wrote is saved
+/// first and reaches a media server only when the person whose server it is
+/// says so.
+async fn push_saved(
+    State(state): State<Arc<AppState>>,
+    user: AuthUser,
+    axum::extract::Path(id): axum::extract::Path<i64>,
+    Json(body): Json<PushSavedRequest>,
+) -> impl IntoResponse {
+    let Ok(all) = state.db.list_playlists(user.user_id).await else {
+        return err(500, "Could not read playlists");
+    };
+    let Some(meta) = all.into_iter().find(|p| p.id == id) else {
+        return err(404, "No such playlist");
+    };
+    let tracks = match state.db.playlist_tracks(user.user_id, id).await {
+        Ok(t) => t,
+        Err(e) => return err(500, e.to_string()),
+    };
+    let wanted: Vec<PlaylistTrack> = tracks
+        .iter()
+        .map(|t| PlaylistTrack {
+            title: t.title.clone(),
+            artist: t.artist.clone(),
+            album: t.album.clone(),
+        })
+        .collect();
+
+    match push_tracks(&state, user.user_id, body.source_id, &meta.name, &wanted).await {
+        Ok(value) => {
+            let target = value
+                .get("protocol")
+                .and_then(|v| v.as_str())
+                .unwrap_or("media server")
+                .to_string();
+            let _ = state.db.mark_playlist_pushed(user.user_id, id, &target).await;
+            (StatusCode::OK, Json(value)).into_response()
+        }
+        Err(PushError { code, message }) => err(code, message),
     }
 }
 
@@ -257,4 +439,7 @@ pub fn create_playlists_router() -> Router<Arc<AppState>> {
     Router::new()
         .route("/api/v1/playlist-targets", get(list_targets))
         .route("/api/v1/playlists", post(push))
+        .route("/api/v1/saved-playlists", get(list_saved).post(save_saved))
+        .route("/api/v1/saved-playlists/:id", get(get_saved).delete(delete_saved))
+        .route("/api/v1/saved-playlists/:id/push", post(push_saved))
 }

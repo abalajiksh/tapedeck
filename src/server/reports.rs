@@ -229,7 +229,7 @@ struct Bucket {
 }
 
 /// GET /api/v1/reports
-async fn reports(
+pub async fn reports(
     State(state): State<Arc<AppState>>,
     ReadAuth { user }: ReadAuth,
     Query(q): Query<ReportQuery>,

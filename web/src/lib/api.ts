@@ -1962,6 +1962,115 @@ class TapedeckAPI {
 	async rotateToken(id: number): Promise<{ token: string; message: string }> {
 		return this.post(`/admin/tokens/${id}/rotate`, {});
 	}
+
+	// ── MCP: connections to AI assistants ──
+	//
+	// Deliberately separate from tokens. A token is something you paste into a
+	// player you run; a connection is a standing grant to somebody else's
+	// service, it carries different grants, and it can expire. Sharing a screen
+	// would mean reading past six scrobble clients to revoke a chatbot.
+	async getMcpConnections(): Promise<{
+		connections: McpConnection[];
+		endpoint: string;
+		scopes: { scope: string; description: string }[];
+	}> {
+		return this.get('/api/v1/mcp/connections');
+	}
+	/** The credential is in this response and nowhere else, ever again. */
+	async createMcpConnection(name: string, scopes: string): Promise<{
+		id: number; name: string; scopes: string; token: string;
+	}> {
+		return this.post('/api/v1/mcp/connections', { name, scopes });
+	}
+	async revokeMcpConnection(id: number): Promise<void> {
+		await this.del(`/api/v1/mcp/connections/${id}`);
+	}
+	async getMcpAudit(): Promise<{ calls: McpAuditCall[] }> {
+		return this.get('/api/v1/mcp/audit');
+	}
+
+	// ── OAuth consent ──
+	async getAuthorizeInfo(params: URLSearchParams): Promise<AuthorizeInfo> {
+		return this.get(`/api/v1/oauth/authorize-info?${params.toString()}`);
+	}
+	async approveAuthorization(body: Record<string, string | null>): Promise<{ redirect_to: string }> {
+		return this.post('/api/v1/oauth/approve', body);
+	}
+
+	// ── Saved playlists ──
+	async getSavedPlaylists(): Promise<{ playlists: SavedPlaylist[] }> {
+		return this.get('/api/v1/saved-playlists');
+	}
+	async getSavedPlaylist(id: number): Promise<{ playlist: SavedPlaylist; tracks: SavedTrack[] }> {
+		return this.get(`/api/v1/saved-playlists/${id}`);
+	}
+	async deleteSavedPlaylist(id: number): Promise<void> {
+		await this.del(`/api/v1/saved-playlists/${id}`);
+	}
+	/** Send a stored playlist onward. A partial match is the normal outcome. */
+	async pushSavedPlaylist(id: number, sourceId: number): Promise<{
+		matched: number; requested: number; protocol: string;
+		missing: { title: string; artist: string }[];
+	}> {
+		return this.post(`/api/v1/saved-playlists/${id}/push`, { source_id: sourceId });
+	}
+}
+
+export interface McpConnection {
+	id: number;
+	name: string;
+	scopes: string;
+	client_id: string | null;
+	created_at: number;
+	last_used_at: number | null;
+	/** Null for a connection created by hand — those do not expire. */
+	expires_at: number | null;
+	calls: number;
+}
+
+export interface McpAuditCall {
+	id: number;
+	at: number;
+	method: string;
+	tool: string | null;
+	args: string | null;
+	ok: boolean;
+	/** How much data left the building. Null where the answer was not a list. */
+	rows_returned: number | null;
+	ms: number | null;
+	connection_name: string | null;
+}
+
+export interface AuthorizeInfo {
+	client_name: string;
+	client_id: string;
+	/** Whether the client identified itself with a fetchable URL, or merely
+	 *  registered a name it chose for itself. */
+	verified: boolean;
+	redirect_uri: string;
+	scopes: { scope: string; description: string }[];
+}
+
+export interface SavedPlaylist {
+	id: number;
+	name: string;
+	description: string | null;
+	/** `user`, or the name of the connection that wrote it. */
+	origin: string;
+	created_at: number;
+	updated_at: number;
+	pushed_at: number | null;
+	pushed_to: string | null;
+	connection_name: string | null;
+	tracks: number;
+}
+
+export interface SavedTrack {
+	title: string;
+	artist: string;
+	album: string | null;
+	/** Why this track is here, in the words of whatever chose it. */
+	note: string | null;
 }
 
 export const api = new TapedeckAPI();

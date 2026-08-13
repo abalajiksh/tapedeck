@@ -74,7 +74,7 @@ fn plural(n: usize, one: &str, many: &str) -> String {
 }
 
 /// GET /api/v1/rediscovery
-async fn rediscover(
+pub async fn rediscover(
     State(state): State<Arc<AppState>>,
     user: AuthUser,
     Query(q): Query<RediscoverQuery>,

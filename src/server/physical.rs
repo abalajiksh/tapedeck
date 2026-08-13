@@ -222,7 +222,7 @@ pub struct ShelfQuery {
     pub kind: Option<String>,
 }
 
-async fn list_shelf(
+pub async fn list_shelf(
     State(state): State<Arc<AppState>>,
     user: AuthUser,
     Query(q): Query<ShelfQuery>,

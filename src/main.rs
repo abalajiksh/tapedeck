@@ -7,6 +7,7 @@ mod enrich;
 mod everynoise;
 mod language;
 mod logging;
+mod mcp;
 mod metadata;
 mod models;
 mod musicbrainz;

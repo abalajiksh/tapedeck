@@ -19,8 +19,16 @@ struct Assets;
 /// Path prefixes owned by the API. These must never fall through to the SPA —
 /// returning `index.html` for a mistyped API path hands the browser a 200 with
 /// an HTML body that `res.json()` then chokes on.
-const API_PREFIXES: [&str; 3] = ["api/", "1/", "admin/"];
-const API_EXACT: [&str; 3] = ["health", "log-level", "metrics"];
+///
+/// `oauth/` and `.well-known/` are here for a sharper reason than a typo: an
+/// MCP client discovering this server *expects* a 404 when it is not an OAuth
+/// authorization server, and hands it the SPA shell instead would have it try
+/// to `JSON.parse` an HTML document and report the instance as broken rather
+/// than as unconfigured.
+const API_PREFIXES: [&str; 5] = ["api/", "1/", "admin/", "oauth/", ".well-known/"];
+/// `mcp` is exact, not a prefix — `/mcp` is the endpoint and there is nothing
+/// beneath it.
+const API_EXACT: [&str; 4] = ["health", "log-level", "metrics", "mcp"];
 
 fn is_api_path(path: &str) -> bool {
     API_PREFIXES.iter().any(|p| path.starts_with(p)) || API_EXACT.contains(&path)

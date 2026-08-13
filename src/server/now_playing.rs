@@ -226,7 +226,7 @@ impl NowPlayingRegistry {
 }
 
 /// GET /api/v1/now-playing → `{ playing, track?, position? }`
-async fn now_playing(
+pub async fn now_playing(
     State(state): State<Arc<AppState>>,
     ReadAuth { user }: ReadAuth,
 ) -> impl IntoResponse {

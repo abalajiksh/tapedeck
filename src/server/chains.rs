@@ -223,7 +223,7 @@ async fn create_chain(
     }
 }
 
-async fn list_chains(
+pub async fn list_chains(
     State(state): State<Arc<AppState>>,
     ReadAuth { user }: ReadAuth,
 ) -> impl IntoResponse {
@@ -420,7 +420,7 @@ async fn create_equipment(
     }
 }
 
-async fn list_equipment(
+pub async fn list_equipment(
     State(state): State<Arc<AppState>>,
     ReadAuth { user }: ReadAuth,
 ) -> impl IntoResponse {

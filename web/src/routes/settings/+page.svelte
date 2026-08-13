@@ -1,5 +1,6 @@
 <script lang="ts">
 	import { onMount, onDestroy } from 'svelte';
+	import type { McpConnection, McpAuditCall } from '$lib/api';
 	import { api } from '$lib/api';
 	import type { TokenInfo } from '$lib/api';
 	import { formatDateTime, formatDuration } from '$lib/utils';
@@ -24,6 +25,7 @@
 		{ id: 'sources', label: 'Sources', hint: 'Plex, Navidrome, Jellyfin' },
 		{ id: 'connections', label: 'Connections', hint: 'Where listens are forwarded' },
 		{ id: 'tokens', label: 'API Tokens', hint: 'Scrobble clients' },
+		{ id: 'ai', label: 'AI Connections', hint: 'Chatbots that can read your listening' },
 		{ id: 'data', label: 'Data', hint: 'Export, backup, wipe' },
 		{ id: 'sanitiser', label: 'Sanitiser', hint: 'Fix split albums, artists and credits' },
 		{ id: 'maintenance', label: 'Maintenance', hint: 'Enrichment and health' },
@@ -769,6 +771,69 @@
 		if (SECTIONS.some((s) => s.id === h)) section = h;
 	}
 
+	// ── AI connections (MCP) ──
+	//
+	// Loaded when the section is first opened rather than on mount: this is one
+	// of a dozen sections and most visits never come here.
+	$: if (section === 'ai' && !mcpEndpoint && !mcpLoading) loadMcp();
+
+	let mcpConnections: McpConnection[] = [];
+	let mcpEndpoint = '';
+	let mcpScopeCatalogue: { scope: string; description: string }[] = [];
+	let mcpAudit: McpAuditCall[] = [];
+	let mcpAuditOpen = false;
+	let mcpLoading = false;
+	let newMcpName = '';
+	// Off by default, every one of them. A grant has to be asked for — the same
+	// discipline the token scopes follow.
+	let newMcpScopes = new Set<string>(['listening:read']);
+	let createdMcpToken = '';
+	let mcpCopied = false;
+
+	async function loadMcp() {
+		mcpLoading = true;
+		try {
+			const r = await api.getMcpConnections();
+			mcpConnections = r.connections;
+			mcpEndpoint = r.endpoint;
+			mcpScopeCatalogue = r.scopes;
+		} catch (e) { console.error(e); }
+		mcpLoading = false;
+	}
+
+	async function loadMcpAudit() {
+		mcpAuditOpen = !mcpAuditOpen;
+		if (!mcpAuditOpen) return;
+		try { mcpAudit = (await api.getMcpAudit()).calls; } catch (e) { console.error(e); }
+	}
+
+	function toggleMcpScope(scope: string) {
+		if (newMcpScopes.has(scope)) newMcpScopes.delete(scope);
+		else newMcpScopes.add(scope);
+		newMcpScopes = newMcpScopes;
+	}
+
+	async function createMcp() {
+		if (!newMcpName.trim() || !newMcpScopes.size) return;
+		try {
+			const r = await api.createMcpConnection(newMcpName.trim(), [...newMcpScopes].join(' '));
+			createdMcpToken = r.token;
+			mcpCopied = false;
+			newMcpName = '';
+			await loadMcp();
+		} catch (e) { alert(e instanceof Error ? e.message : 'Could not create the connection'); }
+	}
+
+	async function revokeMcp(c: McpConnection) {
+		if (!confirm(`Revoke \u201c${c.name}\u201d? It stops working immediately.`)) return;
+		try { await api.revokeMcpConnection(c.id); await loadMcp(); } catch (e) { console.error(e); }
+	}
+
+	function copyMcpToken() {
+		navigator.clipboard.writeText(createdMcpToken);
+		mcpCopied = true;
+	}
+
 	onMount(async () => {
 		sectionFromHash();
 		// A hash-only navigation (a link from elsewhere in the SPA, or Back after
@@ -1509,6 +1574,127 @@
 					<li>URL: <code class="chip">{origin}</code></li>
 					<li>Token: one of your <code class="chip">td_…</code> tokens above</li>
 				</ol>
+			</div>
+		{/if}
+
+		{#if section === 'ai'}
+			<div class="panel" style="border-radius:22px;padding:24px;margin-bottom:18px;">
+				<h3 class="h-display" style="font-size:19px;margin-bottom:4px;">AI Connections</h3>
+				<p style="font-size:13px;color:var(--td-muted);margin:0 0 4px;">
+					Tapedeck speaks the Model Context Protocol, so a chatbot can read your listening and hand playlists back.
+					Nothing reaches your data until you authorise it here.
+				</p>
+				<p style="font-size:12.5px;color:var(--td-muted-2);margin:0 0 16px;">
+					Endpoint: <code class="chip">{mcpEndpoint}</code>
+				</p>
+
+				{#if mcpLoading}
+					<div style="display:flex;justify-content:center;padding:16px;"><div class="spin" style="width:18px;height:18px;border:2px solid var(--td-track);border-top-color:var(--td-accent);border-radius:50%;"></div></div>
+				{:else}
+					{#if mcpConnections.length}
+						<div style="display:flex;flex-direction:column;gap:8px;margin-bottom:16px;">
+							{#each mcpConnections as c (c.id)}
+								<div style="display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;background:var(--td-surface2);border:1px solid var(--td-border);border-radius:14px;padding:12px 16px;">
+									<div style="min-width:0;flex:1;">
+										<div>
+											<span style="font-weight:600;font-size:14px;">{c.name}</span>
+											{#if c.client_id}<span style="font-size:10px;letter-spacing:.08em;text-transform:uppercase;color:var(--td-muted-3);margin-left:6px;">via OAuth</span>{/if}
+										</div>
+										<div style="display:flex;gap:5px;flex-wrap:wrap;margin-top:5px;">
+											{#each c.scopes.split(' ').filter(Boolean) as sc}
+												<span class="chip" style="font-size:10.5px;">{sc}</span>
+											{/each}
+										</div>
+										<div style="font-size:12px;color:var(--td-muted-2);margin-top:6px;">
+											Added {formatDateTime(c.created_at)} ·
+											{c.last_used_at ? `last used ${formatDateTime(c.last_used_at)}` : 'never used'} ·
+											{c.calls} call{c.calls === 1 ? '' : 's'}
+											{#if c.expires_at} · expires {formatDateTime(c.expires_at)}{/if}
+										</div>
+									</div>
+									<button class="btn btn-secondary" style="font-size:12.5px;color:#b2622d;" on:click={() => revokeMcp(c)}>Revoke</button>
+								</div>
+							{/each}
+						</div>
+					{:else}
+						<p style="font-size:13px;color:var(--td-muted-2);margin:0 0 16px;">No assistant is connected.</p>
+					{/if}
+
+					{#if createdMcpToken}
+						<div style="background:var(--td-panel);border-radius:16px;padding:16px;margin-bottom:16px;">
+							<div style="font-size:10.5px;letter-spacing:.1em;text-transform:uppercase;color:#e0a06a;margin-bottom:8px;">Copy it now — it won't be shown again</div>
+							<div style="display:flex;gap:8px;align-items:center;">
+								<code style="flex:1;background:var(--td-panel2);color:#a9c48a;border-radius:10px;padding:10px 12px;font-size:13px;word-break:break-all;">{createdMcpToken}</code>
+								<button class="btn btn-primary" on:click={copyMcpToken}>{mcpCopied ? '✓ Copied' : 'Copy'}</button>
+							</div>
+							<p style="font-size:12px;color:var(--td-muted-2);margin:10px 0 0;">
+								Point the client at <code class="chip">{mcpEndpoint}</code> and send it as
+								<code class="chip">Authorization: Bearer …</code>
+							</p>
+						</div>
+					{/if}
+
+					<div style="border-top:1px solid var(--td-border);padding-top:16px;">
+						<div style="font-size:10.5px;letter-spacing:.1em;text-transform:uppercase;color:var(--td-muted-3);margin-bottom:10px;">Connect a local client</div>
+						<input class="input" style="width:100%;margin-bottom:12px;" bind:value={newMcpName} placeholder="What is it? (e.g. Claude Desktop, my agent)">
+						<div style="display:flex;flex-direction:column;gap:7px;margin-bottom:14px;">
+							{#each mcpScopeCatalogue as sc}
+								<label style="display:flex;align-items:flex-start;gap:9px;font-size:13px;color:var(--td-nav-fg);cursor:pointer;">
+									<input type="checkbox" checked={newMcpScopes.has(sc.scope)} on:change={() => toggleMcpScope(sc.scope)} style="width:16px;height:16px;margin-top:1px;accent-color:var(--td-accent);cursor:pointer;">
+									<span>{sc.description}</span>
+								</label>
+							{/each}
+						</div>
+						<button class="btn btn-primary" disabled={!newMcpName.trim() || !newMcpScopes.size} on:click={createMcp}>Create connection</button>
+						<p style="font-size:12px;color:var(--td-muted-2);margin:12px 0 0;">
+							A hosted assistant (claude.ai and the like) connects through OAuth instead — give it the endpoint above and
+							approve the request when it appears. Either way, every call is recorded below.
+						</p>
+					</div>
+				{/if}
+			</div>
+
+			<div class="panel" style="border-radius:22px;padding:24px;margin-bottom:18px;">
+				<div style="display:flex;align-items:center;justify-content:space-between;gap:12px;">
+					<div>
+						<h3 class="h-display" style="font-size:19px;margin-bottom:4px;">Activity</h3>
+						<p style="font-size:13px;color:var(--td-muted);margin:0;">Every call an assistant has made, and how much came back.</p>
+					</div>
+					<button class="btn btn-secondary" on:click={loadMcpAudit}>{mcpAuditOpen ? 'Hide' : 'Show'}</button>
+				</div>
+				{#if mcpAuditOpen}
+					{#if mcpAudit.length}
+						<div class="tablewrap" style="margin-top:16px;overflow-x:auto;">
+							<table style="width:100%;border-collapse:collapse;font-size:12.5px;">
+								<thead>
+									<tr style="text-align:left;color:var(--td-muted-3);font-size:10.5px;letter-spacing:.08em;text-transform:uppercase;">
+										<th style="padding:6px 10px 6px 0;">When</th>
+										<th style="padding:6px 10px;">Connection</th>
+										<th style="padding:6px 10px;">Tool</th>
+										<th style="padding:6px 10px;">Rows</th>
+										<th style="padding:6px 0 6px 10px;">Time</th>
+									</tr>
+								</thead>
+								<tbody>
+									{#each mcpAudit as a (a.id)}
+										<tr style="border-top:1px solid var(--td-border);">
+											<td style="padding:7px 10px 7px 0;color:var(--td-muted-2);white-space:nowrap;">{formatDateTime(a.at)}</td>
+											<td style="padding:7px 10px;">{a.connection_name ?? '—'}</td>
+											<td style="padding:7px 10px;">
+												<code class="chip" style="font-size:10.5px;">{a.tool ?? a.method}</code>
+												{#if !a.ok}<span style="color:#b2622d;margin-left:6px;">failed</span>{/if}
+											</td>
+											<td style="padding:7px 10px;color:var(--td-muted-2);">{a.rows_returned ?? '—'}</td>
+											<td style="padding:7px 0 7px 10px;color:var(--td-muted-2);white-space:nowrap;">{a.ms ?? '—'}ms</td>
+										</tr>
+									{/each}
+								</tbody>
+							</table>
+						</div>
+					{:else}
+						<p style="font-size:13px;color:var(--td-muted-2);margin:16px 0 0;">Nothing yet.</p>
+					{/if}
+				{/if}
 			</div>
 		{/if}
 

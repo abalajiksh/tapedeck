@@ -24,7 +24,7 @@ pub struct ScrobblesQuery {
 }
 
 /// GET /api/v1/scrobbles
-async fn list_scrobbles(
+pub async fn list_scrobbles(
     State(state): State<Arc<AppState>>,
     ReadAuth { user }: ReadAuth,
     Query(params): Query<ScrobblesQuery>,
@@ -77,7 +77,7 @@ pub struct SearchQuery {
 ///
 /// Scoped to `user.user_id` like every other read: on a shared instance one
 /// person's library is not searchable by another.
-async fn search(
+pub async fn search(
     State(state): State<Arc<AppState>>,
     user: AuthUser,
     Query(params): Query<SearchQuery>,
@@ -406,7 +406,7 @@ async fn sanitize_apply(
 }
 
 /// GET /api/v1/stats/dashboard
-async fn dashboard_stats(
+pub async fn dashboard_stats(
     State(state): State<Arc<AppState>>,
     ReadAuth { user }: ReadAuth,
 ) -> impl IntoResponse {
@@ -589,7 +589,7 @@ fn to_listen_rows(
 }
 
 /// GET /api/v1/stats?range=week|month|last30|year|all — ranged analytics.
-async fn ranged_stats(
+pub async fn ranged_stats(
     State(state): State<Arc<AppState>>,
     ReadAuth { user }: ReadAuth,
     Query(q): Query<StatsQuery>,

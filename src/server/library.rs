@@ -142,7 +142,7 @@ async fn bio_for(
 
 // ── GET /api/v1/albums/:id ──
 
-async fn album_detail(
+pub async fn album_detail(
     State(state): State<Arc<AppState>>,
     user: AuthUser,
     Path(id): Path<i64>,
@@ -269,7 +269,7 @@ async fn album_detail(
 
 // ── GET /api/v1/artists/:id ──
 
-async fn artist_detail(
+pub async fn artist_detail(
     State(state): State<Arc<AppState>>,
     user: AuthUser,
     Path(id): Path<i64>,
@@ -401,7 +401,7 @@ pub struct ChartQuery {
 
 /// Ranked chart over one window. The Statistics page shows the head of these
 /// three lists; this serves the whole thing for the dedicated charts screen.
-async fn charts(
+pub async fn charts(
     State(state): State<Arc<AppState>>,
     user: AuthUser,
     Query(q): Query<ChartQuery>,
@@ -443,7 +443,7 @@ pub struct ResolveQuery {
 /// Name → entity id, creating the entity if this is the first time anyone has
 /// pointed at it. Lets a history row link to `/album/<id>` without the browser
 /// knowing any ids.
-async fn resolve(
+pub async fn resolve(
     State(state): State<Arc<AppState>>,
     // Unused, and required anyway: `entities` is a shared table with no
     // `user_id`, so there is nothing here to scope — but this endpoint *writes*,

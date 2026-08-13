@@ -41,7 +41,7 @@ pub struct ListQuery {
 }
 
 /// GET /api/v1/sessions
-async fn list_sessions(
+pub async fn list_sessions(
     State(state): State<Arc<AppState>>,
     user: AuthUser,
     Query(q): Query<ListQuery>,

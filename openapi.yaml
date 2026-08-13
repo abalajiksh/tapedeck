@@ -26,7 +26,7 @@ openapi: 3.1.0
 
 info:
   title: Tapedeck
-  version: 0.62.0
+  version: 0.63.0
   summary: Self-hosted scrobbler and listening journal.
   description: |
     Tapedeck ingests listens, enriches them with MusicBrainz metadata, stores
@@ -158,6 +158,28 @@ tags:
     description: Preferences and artwork.
   - name: Admin
     description: Users, tokens, genre-map scrape. Session-only, admin role.
+  - name: MCP
+    description: |
+      The Model Context Protocol surface — one endpoint that lets an AI
+      assistant read this user's listening and hand playlists back. Runs for
+      every user, reaches nobody's data until they authorise a connection.
+
+      **Dual-era.** Revision `2026-07-28` is stateless with per-request `_meta`
+      and mirrored headers; `2025-11-25` and earlier open with an `initialize`
+      handshake. Both are served on the same endpoint.
+
+      Credentials live in `mcp_connections`, **not** in `tokens` — an MCP grant
+      is a standing permission given to somebody else's service, `tokens.scopes`
+      treats `all` as a wildcard, and an OAuth credential expires and refreshes.
+  - name: OAuth
+    description: |
+      An OAuth 2.1 authorization server, scoped to one job: letting a hosted
+      assistant obtain an MCP credential. PKCE `S256` only, public clients only,
+      exact `redirect_uri` matching, single-use codes.
+  - name: Playlists
+    description: |
+      Playlists that live in Tapedeck, reviewed before they reach a media
+      server, plus the direct push that has always existed.
   - name: Ops
     description: Health, metrics, log level.
 
@@ -166,6 +188,18 @@ security:
 
 components:
   securitySchemes:
+    mcpBearer:
+      type: http
+      scheme: bearer
+      description: |
+        An MCP connection credential, from Settings → AI Connections or from the
+        OAuth flow. Checked against `mcp_connections` — **not** against
+        `tokens`, which is a separate credential store for scrobble clients.
+
+        Used by `POST /mcp` and nothing else. A 401 from that endpoint carries
+        `WWW-Authenticate` with a `resource_metadata` pointer, which is how a
+        client discovers the authorization server.
+
     sessionCookie:
       type: apiKey
       in: cookie
@@ -584,6 +618,79 @@ components:
         note_id: { type: [integer, 'null'], description: 'The liner note on this entity, if there is one.' }
         note_excerpt: { type: [string, 'null'], description: 'First ~90 characters of that note.' }
         loved_at: { type: integer }
+
+    McpConnection:
+      type: object
+      description: |
+        A standing grant to an AI assistant. Deliberately not a row in `tokens`:
+        `tokens.scopes` treats `all` as a wildcard (so an existing token would
+        gain this reach from an upgrade), an OAuth credential expires and
+        refreshes where a token does not, and revoking "the assistant I
+        connected last month" should not mean reading past six players.
+      properties:
+        id: { type: integer }
+        name: { type: string }
+        scopes:
+          type: string
+          description: |
+            Space-separated. **No wildcard** — a consent screen names what it is
+            granting, and "everything, including whatever is added later" is not
+            something a person can consent to.
+        client_id: { type: [string, 'null'], description: 'Set when the grant came through OAuth.' }
+        created_at: { type: integer }
+        last_used_at: { type: [integer, 'null'] }
+        expires_at:
+          type: [integer, 'null']
+          description: Null for a connection created by hand — those do not expire.
+        calls: { type: integer, description: How many calls it has made, ever. }
+
+    McpAuditCall:
+      type: object
+      properties:
+        id: { type: integer }
+        at: { type: integer }
+        method: { type: string, description: 'The JSON-RPC method — `tools/call`, `resources/read`.' }
+        tool: { type: [string, 'null'], description: 'The tool, resource URI or prompt name.' }
+        args: { type: [string, 'null'], description: 'The arguments, truncated to 500 characters. A record of what was asked, not a copy of it.' }
+        ok: { type: boolean }
+        rows_returned:
+          type: [integer, 'null']
+          description: |
+            How much data left the building. Null where the answer was not a
+            list. The interesting column — a tool that answered with 12 rows and
+            one that answered with 20,000 are different events however identical
+            the call looks.
+        ms: { type: [integer, 'null'] }
+        connection_name: { type: [string, 'null'] }
+
+    SavedPlaylist:
+      type: object
+      properties:
+        id: { type: integer }
+        name: { type: string }
+        description: { type: [string, 'null'] }
+        origin:
+          type: string
+          description: '`user`, or the name of the MCP connection that wrote it.'
+        created_at: { type: integer }
+        updated_at: { type: integer }
+        pushed_at: { type: [integer, 'null'] }
+        pushed_to: { type: [string, 'null'] }
+        connection_name: { type: [string, 'null'] }
+        tracks: { type: integer }
+
+    SavedPlaylistTrack:
+      type: object
+      description: |
+        Names, not ids. This is the shape `playlists::pick` resolves against a
+        real library at push time, and the only shape that survives the user not
+        owning the track on every server they have.
+      required: [title, artist]
+      properties:
+        title: { type: string }
+        artist: { type: string }
+        album: { type: [string, 'null'], description: 'A tiebreaker at push time, never a requirement.' }
+        note: { type: [string, 'null'], description: 'Why this track is here, in the words of whatever chose it. Never generated by Tapedeck.' }
 
 paths:
 
@@ -4798,3 +4905,520 @@ paths:
         '200': { description: Cancelled., content: { application/json: { schema: { $ref: '#/components/schemas/Ok' } } } }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # MCP — the Model Context Protocol surface
+  # ───────────────────────────────────────────────────────────────────────────
+
+  /mcp:
+    post:
+      tags: [MCP]
+      summary: The MCP endpoint (JSON-RPC over Streamable HTTP).
+      description: |
+        One endpoint carrying the whole protocol. **Not a REST resource** — the
+        body is a JSON-RPC 2.0 request and the method decides what happens, so
+        this entry documents the transport rather than a payload.
+
+        **Authentication is `Authorization: Bearer <credential>`**, where the
+        credential comes from Settings → AI Connections or from the OAuth flow.
+        A 401 carries `WWW-Authenticate` with a `resource_metadata` pointer, and
+        that pointer is how a client discovers the authorization server.
+
+        **Dual-era.** A request carrying
+        `params._meta["io.modelcontextprotocol/protocolVersion"]` of
+        `2026-07-28` is served statelessly and **must** mirror `Mcp-Method`,
+        `Mcp-Name` and `MCP-Protocol-Version` into headers matching the body —
+        a mismatch is `400` with JSON-RPC `-32020`. A request opening with
+        `initialize` selects legacy semantics (`2025-11-25` and earlier) and is
+        not subject to header validation. No session id is ever minted: this
+        server is stateless on both eras.
+
+        Methods: `initialize`, `server/discover`, `ping`, `tools/list`,
+        `tools/call`, `resources/list`, `resources/templates/list`,
+        `resources/read`, `prompts/list`, `prompts/get`, `logging/setLevel`,
+        and any `notifications/*` (accepted, `202`, no body).
+
+        Unknown method is `404` **and** JSON-RPC `-32601` together — the body is
+        what distinguishes this from the `404` a legacy HTTP+SSE server returns
+        for a path it does not host.
+
+        Rate limited to 600 calls an hour per connection. Every call is written
+        to the audit log.
+      security:
+        - mcpBearer: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [jsonrpc, method]
+              properties:
+                jsonrpc: { type: string, enum: ['2.0'] }
+                id:
+                  description: Absent for a notification, which is answered `202`.
+                  oneOf: [{ type: string }, { type: integer }]
+                method: { type: string, example: tools/call }
+                params: { type: object, additionalProperties: true }
+              additionalProperties: false
+      responses:
+        '200':
+          description: A JSON-RPC response.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  jsonrpc: { type: string }
+                  id: { }
+                  result: { type: object, additionalProperties: true }
+                  error: { type: object, additionalProperties: true }
+        '202': { description: A notification was accepted. No body. }
+        '400': { description: 'Malformed, header/body mismatch (-32020), or unsupported protocol version (-32022).' }
+        '401': { description: Missing or invalid credential. Carries `WWW-Authenticate`. }
+        '403': { description: 'Cross-origin request, or a tool the connection was not granted. Carries `WWW-Authenticate` with `error="insufficient_scope"`.' }
+        '404': { description: 'Unknown method (-32601) or unknown tool.' }
+        '429': { description: The connection's hourly call budget is spent. }
+    get:
+      tags: [MCP]
+      summary: Not allowed.
+      description: |
+        The standalone SSE stream belonged to the 2025 revisions and is not part
+        of this one. `405` is what the spec tells a modern transport to answer,
+        and it is what a dual-era client reads as "use POST".
+      responses:
+        '405': { description: Method not allowed. }
+    delete:
+      tags: [MCP]
+      summary: Not allowed.
+      description: Session termination belonged to the 2025 revisions; there is no session to delete.
+      responses:
+        '405': { description: Method not allowed. }
+
+  /api/v1/mcp/connections:
+    get:
+      tags: [MCP]
+      summary: Your AI connections.
+      description: |
+        Session-only. Also returns this instance's MCP endpoint address, derived
+        from the request the way the pairing verification URI is, and the full
+        grant catalogue with the sentence shown for each on the consent screen.
+      responses:
+        '200':
+          description: The connections.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  endpoint: { type: string, format: uri }
+                  scopes:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        scope: { type: string }
+                        description: { type: string }
+                  connections:
+                    type: array
+                    items: { $ref: '#/components/schemas/McpConnection' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+    post:
+      tags: [MCP]
+      summary: Mint a connection by hand, for a local client.
+      description: |
+        Session-only. **The credential is in this response and nowhere else,
+        ever again** — only its hash is stored.
+
+        A connection created here does not expire: it is something the user
+        pasted into a client themselves, there is nothing for it to refresh
+        against, and expiring it would break their setup for no gain they asked
+        for. An OAuth grant is the one that expires.
+
+        Unrecognised grants are dropped rather than stored, so a client cannot
+        invent one by asking for it. There is no wildcard.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                name: { type: string, example: Claude Desktop }
+                scopes:
+                  type: string
+                  description: Space- or comma-separated.
+                  example: listening:read library:read
+      responses:
+        '200':
+          description: Created.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  id: { type: integer }
+                  name: { type: string }
+                  scopes: { type: string }
+                  token: { type: string, description: Shown once. }
+        '400': { description: No recognised grant was requested. }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /api/v1/mcp/connections/{id}:
+    delete:
+      tags: [MCP]
+      summary: Revoke a connection.
+      description: |
+        Session-only. Revoked rather than deleted, so the audit rows keep
+        pointing at something with a name — "which assistant read my history in
+        March" outlives the connection.
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: integer } }
+      responses:
+        '200': { description: Revoked., content: { application/json: { schema: { $ref: '#/components/schemas/Ok' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { description: No such connection. }
+
+  /api/v1/mcp/audit:
+    get:
+      tags: [MCP]
+      summary: What the assistants have been doing.
+      description: |
+        Session-only. Every call: which connection, which tool, with what
+        arguments (truncated), whether it worked, **how many rows came back**,
+        and how long it took. The row count is the interesting one — a tool that
+        answered with 12 rows and one that answered with 20,000 are different
+        events however identical the call looks.
+      responses:
+        '200':
+          description: The most recent 200 calls.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  calls:
+                    type: array
+                    items: { $ref: '#/components/schemas/McpAuditCall' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # OAuth 2.1
+  # ───────────────────────────────────────────────────────────────────────────
+
+  /.well-known/oauth-protected-resource:
+    get:
+      tags: [OAuth]
+      summary: RFC 9728 protected resource metadata.
+      description: |
+        Unauthenticated. The document a client is pointed at by
+        `WWW-Authenticate` on a 401 from `/mcp`, and the first step of the whole
+        flow. `scopes_supported` names the *minimal* set for basic
+        functionality — a client asks for more through a step-up rather than
+        being nudged into requesting everything at once.
+      security: []
+      responses:
+        '200': { description: The metadata document., content: { application/json: { schema: { type: object, additionalProperties: true } } } }
+
+  /.well-known/oauth-authorization-server:
+    get:
+      tags: [OAuth]
+      summary: RFC 8414 authorization server metadata.
+      description: |
+        Unauthenticated. Advertises `S256` as the only PKCE method — `plain` is
+        in RFC 7636 and provides no protection against the code interception
+        PKCE exists for — and `authorization_response_iss_parameter_supported`,
+        because this server emits `iss` (RFC 9207) and a strict client will not
+        check it otherwise.
+      security: []
+      responses:
+        '200': { description: The metadata document., content: { application/json: { schema: { type: object, additionalProperties: true } } } }
+
+  /oauth/register:
+    post:
+      tags: [OAuth]
+      summary: RFC 7591 dynamic client registration.
+      description: |
+        Unauthenticated by design: this hands out an identifier and nothing
+        else. Every client is public, there is no secret, and possession of a
+        `client_id` gets you as far as an authorization request that a logged-in
+        human then has to approve by hand.
+
+        `redirect_uris` must be https, a loopback http address, or a private-use
+        scheme. Plain http anywhere else would put an authorization code on the
+        network in the clear.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [redirect_uris]
+              properties:
+                client_name: { type: string }
+                redirect_uris: { type: array, items: { type: string, format: uri } }
+      responses:
+        '201': { description: Registered., content: { application/json: { schema: { type: object, additionalProperties: true } } } }
+        '400': { description: A redirect_uri was missing or not acceptable. }
+
+  /oauth/authorize:
+    get:
+      tags: [OAuth]
+      summary: The authorization endpoint.
+      description: |
+        Unauthenticated at this step. Validates the request and **redirects to
+        the SPA consent screen** at `/authorize` carrying the parameters; it
+        does not render HTML, because this application serves one `index.html`
+        and a server-rendered consent page would be the only thing that could
+        drift from the app's own styling.
+
+        Failures concerning the redirect target itself are reported directly
+        rather than bounced off it — an unvalidated `redirect_uri` is an open
+        redirect and must not be used to deliver its own error. `redirect_uri`
+        is matched **exactly** against one the client registered; a prefix match
+        here would hand somebody else an authorization code.
+
+        PKCE is required and `code_challenge_method` must be `S256`.
+      security: []
+      parameters:
+        - { name: client_id, in: query, required: true, schema: { type: string } }
+        - { name: redirect_uri, in: query, required: true, schema: { type: string } }
+        - { name: response_type, in: query, required: true, schema: { type: string, enum: [code] } }
+        - { name: code_challenge, in: query, required: true, schema: { type: string } }
+        - { name: code_challenge_method, in: query, schema: { type: string, enum: [S256] } }
+        - { name: scope, in: query, schema: { type: string } }
+        - { name: state, in: query, schema: { type: string } }
+        - { name: resource, in: query, schema: { type: string }, description: 'RFC 8707. Validated as naming this instance, not merely recorded.' }
+      responses:
+        '303': { description: To the consent screen, or back to the client with an error. }
+        '400': { description: Unknown client, or a redirect_uri that does not match its registration. }
+
+  /oauth/token:
+    post:
+      tags: [OAuth]
+      summary: Exchange a code, or refresh.
+      description: |
+        Unauthenticated (public clients, `token_endpoint_auth_method: none`);
+        form-encoded, as the RFC requires. Grants: `authorization_code` and
+        `refresh_token`.
+
+        The code is **single use**, taken with `DELETE … RETURNING` so two
+        simultaneous redemptions cannot both succeed. It is bound to the client,
+        the redirect, the PKCE challenge and the resource — every one of those
+        is re-checked here.
+
+        A refresh **rotates both secrets**, so a leaked access token stops
+        working as soon as the legitimate client refreshes. Access credentials
+        live 24 hours.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/x-www-form-urlencoded:
+            schema:
+              type: object
+              required: [grant_type]
+              properties:
+                grant_type: { type: string, enum: [authorization_code, refresh_token] }
+                code: { type: string }
+                code_verifier: { type: string, description: 43–128 characters, per RFC 7636. }
+                redirect_uri: { type: string }
+                client_id: { type: string }
+                refresh_token: { type: string }
+                resource: { type: string }
+      responses:
+        '200':
+          description: A credential. Never cached.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  access_token: { type: string }
+                  token_type: { type: string, enum: [Bearer] }
+                  expires_in: { type: integer }
+                  refresh_token: { type: string }
+                  scope: { type: string }
+        '400': { description: 'invalid_grant, invalid_request, invalid_target or unsupported_grant_type.' }
+
+  /api/v1/oauth/authorize-info:
+    get:
+      tags: [OAuth]
+      summary: What the consent screen puts in front of the user.
+      description: |
+        Session-only. Scope **descriptions** travel with it rather than raw
+        scope strings — `listening:read` is not something a person can consent
+        to. `verified` says whether the client identified itself with a
+        fetchable URL or merely registered a name it chose for itself; the
+        consent screen warns on the latter.
+      parameters:
+        - { name: client_id, in: query, required: true, schema: { type: string } }
+        - { name: redirect_uri, in: query, required: true, schema: { type: string } }
+        - { name: scope, in: query, schema: { type: string } }
+      responses:
+        '200': { description: The request, in the user's terms., content: { application/json: { schema: { type: object, additionalProperties: true } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { description: Unknown client. }
+
+  /api/v1/oauth/approve:
+    post:
+      tags: [OAuth]
+      summary: The user said yes.
+      description: |
+        **Session-only, and that is the load-bearing part of the whole flow**:
+        minting a credential requires a logged-in human on this instance.
+        Everything before this point is a request; this is the consent.
+
+        `redirect_uri` is re-checked here rather than trusted from the browser —
+        this handler is reachable directly. The `resource` must name this
+        server, or RFC 8707's audience binding would record an audience and
+        enforce nothing. The response carries `iss` (RFC 9207) in the redirect.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [client_id, redirect_uri, code_challenge]
+              properties:
+                client_id: { type: string }
+                redirect_uri: { type: string }
+                code_challenge: { type: string }
+                scope: { type: string, nullable: true }
+                state: { type: string, nullable: true }
+                resource: { type: string, nullable: true }
+      responses:
+        '200':
+          description: Where to send the browser next.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties: { redirect_to: { type: string, format: uri } }
+        '400': { description: 'invalid_client, invalid_request or invalid_target.' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # Saved playlists
+  # ───────────────────────────────────────────────────────────────────────────
+
+  /api/v1/saved-playlists:
+    get:
+      tags: [Playlists]
+      summary: Playlists kept in Tapedeck.
+      description: |
+        Session-only. `origin` is `user` for one you built, or the name of the
+        MCP connection that wrote it — a list an assistant produced stays
+        distinguishable from one you made, the same provenance rule notes
+        follow.
+      responses:
+        '200':
+          description: The playlists.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  playlists:
+                    type: array
+                    items: { $ref: '#/components/schemas/SavedPlaylist' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+    post:
+      tags: [Playlists]
+      summary: Save a playlist.
+      description: |
+        Session-only. Tracks are **names, not file paths** — Tapedeck stores no
+        server item ids for a generated list and resolves them against the real
+        library at push time.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name, tracks]
+              properties:
+                name: { type: string }
+                description: { type: string, nullable: true }
+                tracks:
+                  type: array
+                  items: { $ref: '#/components/schemas/SavedPlaylistTrack' }
+      responses:
+        '200': { description: Saved., content: { application/json: { schema: { type: object, properties: { id: { type: integer } } } } } }
+        '400': { description: No name, or no tracks. }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /api/v1/saved-playlists/{id}:
+    get:
+      tags: [Playlists]
+      summary: One playlist and its tracks.
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: integer } }
+      responses:
+        '200':
+          description: The playlist.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  playlist: { $ref: '#/components/schemas/SavedPlaylist' }
+                  tracks:
+                    type: array
+                    items: { $ref: '#/components/schemas/SavedPlaylistTrack' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { description: No such playlist. }
+    delete:
+      tags: [Playlists]
+      summary: Delete a playlist.
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: integer } }
+      responses:
+        '200': { description: Deleted., content: { application/json: { schema: { $ref: '#/components/schemas/Ok' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { description: No such playlist. }
+
+  /api/v1/saved-playlists/{id}/push:
+    post:
+      tags: [Playlists]
+      summary: Send a stored playlist to a media server.
+      description: |
+        Session-only — pushing spends the credential of a configured source,
+        which is the line `WriteAuth` deliberately does not cross.
+
+        **This is the review step the MCP design turns on**: a list an assistant
+        built is saved first and reaches a media server only when the person
+        whose server it is says so.
+
+        A partial match is the normal outcome — a listening history is not the
+        same set as any one library — and every track that did not land is
+        named. `404` means nothing matched; `502` means the server could not be
+        reached. They need completely different things from the user.
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: integer } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [source_id]
+              properties: { source_id: { type: integer } }
+      responses:
+        '200':
+          description: Sent, wholly or partly.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  playlist_id: { type: string }
+                  protocol: { type: string }
+                  requested: { type: integer }
+                  matched: { type: integer }
+                  missing: { type: array, items: { $ref: '#/components/schemas/SavedPlaylistTrack' } }
+        '400': { description: The source is off, or cannot receive a playlist. }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { description: No such playlist, or none of the tracks are on that server. }
+        '502': { description: The server could not be reached, or refused the playlist. }

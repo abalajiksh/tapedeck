@@ -16,7 +16,10 @@
 
 	// Check path immediately (before onMount) so public pages don't flash a spinner
 	const path = typeof window !== 'undefined' ? window.location.pathname : '/';
-	const isPublic = path === '/login' || path === '/setup';
+	// `/authorize` is public *to the layout gate only* — the OAuth consent page
+	// gates itself. Letting the gate hard-redirect would throw away the query
+	// string the whole authorization request lives in.
+	const isPublic = path === '/login' || path === '/setup' || path === '/authorize';
 	if (isPublic) state = 'public';
 
 	const nav = [
@@ -30,6 +33,7 @@
 		{ href: '/notes', label: 'Liner Notes', icon: 'notes' },
 		{ href: '/shelf', label: 'The Shelf', icon: 'shelf' },
 		{ href: '/rediscover', label: 'Rediscovery', icon: 'rediscover' },
+		{ href: '/playlists/saved', label: 'Playlists', icon: 'playlists' },
 		{ href: '/playlists', label: 'Playlist Lab', icon: 'playlists' },
 		{ href: '/map', label: 'Genre Map', icon: 'map' },
 		{ href: '/import', label: 'Import', icon: 'import' },
@@ -39,7 +43,14 @@
 
 	$: current = $page.url.pathname;
 	function isActive(href: string) {
-		return href === '/' ? current === '/' : current.startsWith(href);
+		if (href === '/') return current === '/';
+		// Match on a segment boundary, and let a more specific entry win. Adding
+		// /playlists/saved beside /playlists otherwise lights both, and a bare
+		// `startsWith` would also match /chartsomething against /charts.
+		const onPath = (h: string) => current === h || current.startsWith(h + '/');
+		if (nav.some((n) => n.href !== href && n.href.startsWith(href + '/') && onPath(n.href)))
+			return false;
+		return onPath(href);
 	}
 
 	function toggleTheme() {
