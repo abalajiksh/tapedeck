@@ -1557,7 +1557,7 @@
 	.slot > :global(.panel) { margin: 6px 0 !important; }
 
 	.chip {
-		border: 1px solid var(--td-line);
+		border: 1px solid var(--td-border);
 		background: transparent;
 		color: var(--td-muted);
 		border-radius: 999px;
@@ -1577,7 +1577,7 @@
 		align-items: center;
 		padding: 14px;
 		border-radius: 16px;
-		border: 1px solid var(--td-line);
+		border: 1px solid var(--td-border);
 		background: var(--td-panel);
 		cursor: pointer;
 		text-align: left;
@@ -1621,7 +1621,7 @@
 	.kindrow {
 		display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
 		margin: 14px 0 2px; padding: 12px 0;
-		border-top: 1px solid var(--td-line); border-bottom: 1px solid var(--td-line);
+		border-top: 1px solid var(--td-border); border-bottom: 1px solid var(--td-border);
 	}
 	/* A track is a start point, so it has to look like something you can press —
 	   but a tracklist is a list first and a row of buttons second, so this is a
@@ -1643,7 +1643,7 @@
 	.wear {
 		display: flex; align-items: center; gap: 14px; flex-wrap: wrap;
 		margin: 16px 0 0; padding: 11px 16px;
-		border: 1px solid var(--td-line); border-radius: 14px;
+		border: 1px solid var(--td-border); border-radius: 14px;
 		background: var(--td-panel);
 	}
 	.wearlabel {
@@ -1678,10 +1678,10 @@
 		gap: 12px;
 		align-items: center;
 		padding: 12px 0;
-		border-top: 1px solid var(--td-line);
+		border-top: 1px solid var(--td-border);
 	}
 	.side {
-		border: 1px solid var(--td-line);
+		border: 1px solid var(--td-border);
 		border-radius: 14px;
 		padding: 14px;
 	}
@@ -1694,14 +1694,14 @@
 		align-items: flex-end;
 		margin-top: 18px;
 		padding: 14px;
-		border: 1px solid var(--td-line);
+		border: 1px solid var(--td-border);
 		border-radius: 14px;
 	}
 
 	.scans {
 		margin-top: 22px;
 		padding-top: 18px;
-		border-top: 1px solid var(--td-line);
+		border-top: 1px solid var(--td-border);
 	}
 	/* Fixed rows rather than `auto-fill` alone: a booklet is twenty pages of the
 	   same shape, and letting them size themselves makes a wall of slightly
@@ -1715,7 +1715,7 @@
 		position: relative;
 		aspect-ratio: 1;
 		padding: 0;
-		border: 1px solid var(--td-line);
+		border: 1px solid var(--td-border);
 		border-radius: 10px;
 		overflow: hidden;
 		background: var(--td-panel);
@@ -1765,7 +1765,7 @@
 		padding: 10px 14px;
 		border-radius: 14px;
 		background: var(--td-panel);
-		border: 1px solid var(--td-line);
+		border: 1px solid var(--td-border);
 		font-size: 13px;
 	}
 	/* The deck only moves while a side is actually on — a still platter is the
@@ -1787,7 +1787,7 @@
 	.idle {
 		display: flex; align-items: center; gap: 20px; flex-wrap: wrap;
 		margin-top: 18px; padding: 18px 20px;
-		border: 1px dashed var(--td-line); border-radius: 18px;
+		border: 1px dashed var(--td-border); border-radius: 18px;
 	}
 	/* 33⅓ rpm is one turn per 1.8s. Using the real speed costs nothing and is
 	   the sort of detail this app is for. */

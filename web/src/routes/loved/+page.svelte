@@ -344,7 +344,7 @@
 	.seg-btn.on { background: var(--td-accent); color: #fbf5ea; }
 	.chips { display: flex; gap: 7px; flex-wrap: wrap; }
 	.chip {
-		border: 1px solid var(--td-line); background: transparent; color: var(--td-muted);
+		border: 1px solid var(--td-border); background: transparent; color: var(--td-muted);
 		border-radius: 999px; padding: 6px 13px; font-size: 12.5px; font-weight: 600;
 		cursor: pointer; font-family: inherit;
 	}

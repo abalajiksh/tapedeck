@@ -309,7 +309,7 @@
 					{manualParsed.listens.length} listen{manualParsed.listens.length === 1 ? '' : 's'} ready
 				</div>
 				{#each manualParsed.listens.slice(0, 5) as l}
-					<div style="display:flex;gap:10px;align-items:baseline;font-size:13.5px;padding:5px 0;border-top:1px solid var(--td-line);">
+					<div style="display:flex;gap:10px;align-items:baseline;font-size:13.5px;padding:5px 0;border-top:1px solid var(--td-border);">
 						<span style="font-weight:600;">{l.title}</span>
 						<span style="color:var(--td-muted);flex:1;min-width:0;">
 							{l.artist}{l.album ? ` — ${l.album}` : ''}

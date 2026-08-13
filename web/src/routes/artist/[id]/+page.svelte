@@ -206,7 +206,7 @@
 			<!-- The wide one. Its own field rather than a crop of the portrait,
 			     because a 16/11 tile and a square photo are different pictures —
 			     cropping one to the other either pillarboxes or loses the head. -->
-			<div style="margin-top:16px;padding-top:14px;border-top:1px solid var(--td-line);">
+			<div style="margin-top:16px;padding-top:14px;border-top:1px solid var(--td-border);">
 				<label for="wide" style="display:block;font-size:13px;margin-bottom:6px;">
 					Wide picture
 				</label>

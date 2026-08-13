@@ -245,7 +245,7 @@
 	.edit {
 		display: flex; flex-direction: column; gap: 12px;
 		padding: 14px; margin: 4px 0 12px;
-		border: 1px solid var(--td-line); border-radius: 14px;
+		border: 1px solid var(--td-border); border-radius: 14px;
 		background: var(--td-surface2, var(--td-panel2));
 	}
 	.edit .field { display: flex; flex-direction: column; gap: 5px; }

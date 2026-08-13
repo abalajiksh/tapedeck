@@ -317,7 +317,7 @@
 	}
 	.card {
 		background: var(--td-surface, var(--td-panel));
-		border: 1px solid var(--td-border, var(--td-line));
+		border: 1px solid var(--td-border);
 		border-radius: 22px;
 		padding: 20px;
 		display: flex;
@@ -337,14 +337,14 @@
 	.tchip {
 		display: inline-flex; align-items: center; max-width: 100%;
 		background: var(--td-surface2, var(--td-panel2));
-		border: 1px solid var(--td-border, var(--td-line));
+		border: 1px solid var(--td-border);
 		border-radius: 999px; padding: 5px 11px; font-size: 12px;
 		color: var(--td-nav-fg, inherit);
 		white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 	}
 	.expanded { border-radius: 20px; overflow: hidden; margin-top: 18px; border-width: 1px; border-style: solid; }
 	.chip {
-		border: 1px solid var(--td-line); background: transparent; color: var(--td-muted);
+		border: 1px solid var(--td-border); background: transparent; color: var(--td-muted);
 		border-radius: 999px; padding: 6px 14px; font-size: 12.5px; font-weight: 600; cursor: pointer;
 	}
 	.chip.on { background: var(--td-accent); border-color: var(--td-accent); color: #fff; }
@@ -361,6 +361,6 @@
 	.nm { display: block; font-size: 14px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 	.sb { display: block; font-size: 12.5px; color: var(--td-muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 	.meta { font-size: 12.5px; color: var(--td-muted-2); flex: none; font-variant-numeric: tabular-nums; }
-	.sep { height: 1px; background: var(--td-line); margin: 0 16px; }
+	.sep { height: 1px; background: var(--td-border); margin: 0 16px; }
 	@media (max-width: 520px) { .meta { display: none; } }
 </style>
