@@ -198,6 +198,35 @@ mod tests {
     }
 
     #[test]
+    fn the_default_grant_alone_cannot_reach_the_journal_or_any_write() {
+        // This is why the consent screen offers *every* grant rather than
+        // echoing the client's request. A client picks its scopes from
+        // `scopes_supported` or the `WWW-Authenticate` challenge, both of which
+        // name `DEFAULT` on purpose — and since `tools/list` is filtered by
+        // grant, it never sees a tool it lacks the scope for, never calls one,
+        // never gets `insufficient_scope`, and never runs the step-up that
+        // would widen the grant. Showing only the request made everything below
+        // unreachable through OAuth entirely.
+        //
+        // If someone later "simplifies" the consent screen back to listing what
+        // was asked for, this test is the note explaining why not.
+        assert_eq!(scopes::DEFAULT, scopes::LISTENING_READ);
+        for locked in [
+            scopes::LIBRARY_READ,
+            scopes::PLAYLISTS_WRITE,
+            scopes::PLAYLISTS_PUSH,
+            scopes::LOVES_WRITE,
+            scopes::NOTES_WRITE,
+        ] {
+            assert_ne!(
+                scopes::DEFAULT,
+                locked,
+                "'{locked}' must be reachable only by the user ticking it"
+            );
+        }
+    }
+
+    #[test]
     fn the_latest_version_is_the_first_supported_one() {
         // The discover result advertises `SUPPORTED_VERSIONS`; a client picks
         // from it. If these two disagreed the server would name a preferred

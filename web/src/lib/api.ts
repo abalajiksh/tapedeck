@@ -2048,7 +2048,12 @@ export interface AuthorizeInfo {
 	 *  registered a name it chose for itself. */
 	verified: boolean;
 	redirect_uri: string;
-	scopes: { scope: string; description: string }[];
+	/** Every grant this server defines, with the ones the client asked for
+	 *  pre-selected. All six are offered so the user can widen the request —
+	 *  a client can only ever ask for the minimal scope, so showing just its
+	 *  request made the rest unreachable through OAuth. */
+	scopes: { scope: string; description: string; requested: boolean }[];
+	requested: string;
 }
 
 export interface SavedPlaylist {

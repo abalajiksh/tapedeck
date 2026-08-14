@@ -19,6 +19,19 @@
 	let working = false;
 	let params: URLSearchParams;
 
+	// What the user has decided to grant. Seeded from what the client asked
+	// for, but every grant is on offer — a client can only ever request the
+	// minimal scope, so showing it its own request back made everything else
+	// unreachable through OAuth. The client requests; the person whose
+	// listening it is decides.
+	let chosen = new Set<string>();
+
+	function toggle(scope: string) {
+		if (chosen.has(scope)) chosen.delete(scope);
+		else chosen.add(scope);
+		chosen = chosen;
+	}
+
 	onMount(async () => {
 		params = new URLSearchParams(window.location.search);
 
@@ -36,6 +49,7 @@
 
 		try {
 			info = await api.getAuthorizeInfo(params);
+			chosen = new Set(info.scopes.filter((s) => s.requested).map((s) => s.scope));
 		} catch (e) {
 			error = e instanceof Error ? e.message : 'That authorization request is not valid.';
 		}
@@ -49,7 +63,8 @@
 				client_id: params.get('client_id') ?? '',
 				redirect_uri: params.get('redirect_uri') ?? '',
 				code_challenge: params.get('code_challenge') ?? '',
-				scope: params.get('scope'),
+				// The user's decision, not the client's request.
+				scope: [...chosen].join(' '),
 				state: params.get('state'),
 				resource: params.get('resource')
 			});
@@ -99,13 +114,21 @@
 			{/if}
 
 			<div class="grants">
-				<div class="eyebrow">It will be able to</div>
-				<ul>
-					{#each info.scopes as s}
-						<li>{s.description}</li>
-					{/each}
-				</ul>
+				<div class="eyebrow">Choose what it can do</div>
+				{#each info.scopes as s}
+					<label class="grant">
+						<input type="checkbox" checked={chosen.has(s.scope)} on:change={() => toggle(s.scope)}>
+						<span>
+							{s.description}
+							{#if s.requested}<em>asked for</em>{/if}
+						</span>
+					</label>
+				{/each}
 			</div>
+			<p class="note">
+				{info.client_name} asked for the ticked items. You can give it more or less —
+				it is told what it actually received.
+			</p>
 
 			<p class="note">
 				You can revoke this at any time in Settings → AI Connections, where every call it
@@ -114,7 +137,7 @@
 
 			<div class="actions">
 				<button class="btn btn-secondary" on:click={deny} disabled={working}>Deny</button>
-				<button class="btn btn-primary" on:click={approve} disabled={working}>
+				<button class="btn btn-primary" on:click={approve} disabled={working || !chosen.size}>
 					{working ? 'Authorizing…' : 'Approve'}
 				</button>
 			</div>
@@ -172,16 +195,31 @@
 		padding: 16px;
 		margin-bottom: 16px;
 	}
-	.grants ul {
-		margin: 0;
-		padding-left: 20px;
+	.grant {
 		display: flex;
-		flex-direction: column;
-		gap: 7px;
-	}
-	.grants li {
+		align-items: flex-start;
+		gap: 10px;
 		font-size: 13.5px;
 		color: var(--td-nav-fg);
+		padding: 7px 0;
+		cursor: pointer;
+	}
+	.grant input {
+		width: 16px;
+		height: 16px;
+		margin-top: 1px;
+		accent-color: var(--td-accent);
+		cursor: pointer;
+		flex: none;
+	}
+	.grant em {
+		font-style: normal;
+		font-size: 10px;
+		letter-spacing: 0.07em;
+		text-transform: uppercase;
+		color: var(--td-muted-3);
+		margin-left: 6px;
+		white-space: nowrap;
 	}
 	.note {
 		font-size: 12px;

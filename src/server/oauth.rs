@@ -330,14 +330,32 @@ async fn authorize_info(
     };
 
     let requested = scopes::sanitise(q.scope.as_deref().unwrap_or(scopes::DEFAULT));
-    let granted = if requested.is_empty() { scopes::DEFAULT.to_string() } else { requested };
-    let detail: Vec<_> = granted
-        .split_whitespace()
-        .filter_map(|s| {
-            scopes::ALL
-                .iter()
-                .find(|(name, _)| *name == s)
-                .map(|(name, desc)| serde_json::json!({ "scope": name, "description": desc }))
+    let requested = if requested.is_empty() { scopes::DEFAULT.to_string() } else { requested };
+
+    // **Every** grant is offered, with the requested ones pre-selected — not
+    // just the ones the client asked for.
+    //
+    // Showing only the request produced a deadlock nobody could get out of.
+    // A client picks its scopes from `scopes_supported` or from the
+    // `WWW-Authenticate` challenge, both of which name the minimal grant on
+    // purpose; `tools/list` is then filtered by what was granted, so the client
+    // never sees a tool it lacks the scope for, never calls one, never gets the
+    // `insufficient_scope` refusal, and never runs the step-up that would widen
+    // the grant. The journal, playlists, loves and notes were unreachable
+    // through OAuth entirely — reachable only by minting a connection by hand.
+    //
+    // The fix is to put the decision where it belongs. A client *requests*;
+    // the person whose listening it is *decides*. OAuth has always allowed
+    // granting something other than what was asked for, and the token response
+    // carries `scope` so the client learns what it actually got.
+    let detail: Vec<_> = scopes::ALL
+        .iter()
+        .map(|(name, desc)| {
+            serde_json::json!({
+                "scope": name,
+                "description": desc,
+                "requested": requested.split_whitespace().any(|r| r == *name),
+            })
         })
         .collect();
 
@@ -350,6 +368,7 @@ async fn authorize_info(
         "verified": client.registered_by_url,
         "redirect_uri": q.redirect_uri,
         "scopes": detail,
+        "requested": requested,
     }))
     .into_response()
 }
@@ -407,6 +426,9 @@ async fn approve(
         }
     }
 
+    // What the *user* ticked, not what the client asked for. `sanitise` still
+    // drops anything this server does not define, so the browser cannot invent
+    // a grant either — but within the six that exist, the choice is theirs.
     let granted = scopes::sanitise(body.scope.as_deref().unwrap_or(scopes::DEFAULT));
     let granted = if granted.is_empty() { scopes::DEFAULT.to_string() } else { granted };
 
