@@ -60,6 +60,10 @@ pub struct AppState {
     pub analytics_row_cap: i64,
     /// Only trust `X-Forwarded-For` for the client IP when behind a known proxy.
     pub trust_proxy: bool,
+    /// What this instance is reached at from outside, when the operator has
+    /// said. Empty means `server::mcp::public_origin` derives it. Published as
+    /// the OAuth issuer, so a wrong value breaks the whole flow.
+    pub public_url: String,
     /// When this process started serving, for the uptime metric.
     pub started_at: std::time::Instant,
     /// Description providers, in preference order. Built once — each holds an

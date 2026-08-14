@@ -49,22 +49,56 @@ pub fn resource_metadata_url(state: &AppState, headers: &HeaderMap) -> String {
     format!("{}/.well-known/oauth-protected-resource", public_origin(state, headers))
 }
 
+/// The address this instance is reached at from outside.
+///
+/// **This is published as the OAuth issuer and as every endpoint URL, so
+/// getting the scheme wrong breaks the whole flow rather than looking untidy.**
+/// An authorization server advertising `http://` is one a conformant client
+/// refuses — and the refusal lands during discovery, which presents to the user
+/// as a connector that authenticated and then had no tools.
+///
+/// Three sources, in order:
+///
+/// 1. **`PUBLIC_URL`, if the operator set it.** The only one that is not a
+///    guess. Behind a tunnel the origin is handed plain HTTP on an internal
+///    name and cannot possibly derive the public address; this is where they
+///    say it.
+/// 2. **The forwarded headers, when `trust_proxy` says there is a proxy to
+///    believe.** Same rule `cookie_is_secure` follows.
+/// 3. **The `Host` header, with the scheme inferred from it.** This is the
+///    fallback that used to assume `http` unconditionally, and on a
+///    Cloudflare-tunnelled instance with `trust_proxy` unset that made every
+///    published URL plaintext. A *public* hostname reached in 2026 is behind
+///    TLS essentially without exception, so it is assumed to be — while a
+///    loopback or LAN host stays `http`, because a plain-HTTP LAN deployment is
+///    a real and supported thing.
+///
+/// The inference in (3) is a default, not a claim. An operator whose public
+/// instance really is plain HTTP, or whose internal name looks public, sets
+/// `PUBLIC_URL` and the guessing stops.
 pub fn public_origin(state: &AppState, headers: &HeaderMap) -> String {
+    if !state.public_url.is_empty() {
+        return state.public_url.clone();
+    }
+
     let get = |name: &str| headers.get(name).and_then(|v| v.to_str().ok());
     let first = |v: &str| v.split(',').next().unwrap_or("").trim().to_string();
+
+    let host = state
+        .trust_proxy
+        .then(|| get("x-forwarded-host").map(first))
+        .flatten()
+        .or_else(|| get("host").map(str::to_string))
+        .filter(|h| !h.is_empty())
+        .unwrap_or_else(|| "localhost".into());
 
     let scheme = state
         .trust_proxy
         .then(|| get("x-forwarded-proto").map(first))
         .flatten()
         .filter(|s| s == "http" || s == "https")
-        .unwrap_or_else(|| "http".into());
-    let host = state
-        .trust_proxy
-        .then(|| get("x-forwarded-host").map(first))
-        .flatten()
-        .or_else(|| get("host").map(str::to_string))
-        .unwrap_or_else(|| "localhost".into());
+        .unwrap_or_else(|| if is_private_host(&host) { "http".into() } else { "https".into() });
+
     format!("{scheme}://{host}")
 }
 
@@ -475,6 +509,37 @@ mod tests {
             ("host", "tapedeck.example.com"),
             ("origin", "https://claude.ai"),
         ])));
+    }
+
+    #[test]
+    fn a_public_host_is_assumed_to_be_behind_tls() {
+        // The bug this pins was live on a real instance: behind Cloudflare with
+        // trust_proxy unset, every published OAuth URL came out `http://` — the
+        // issuer, the authorization endpoint, the token endpoint. A conformant
+        // client refuses a plaintext authorization server, and the refusal lands
+        // during discovery, which the user sees as a connector with no tools.
+        assert_eq!(scheme_for("tapedeck.example.com"), "https");
+        assert_eq!(scheme_for("tapedeck.insightsintoinfinite.com"), "https");
+    }
+
+    #[test]
+    fn a_lan_deployment_stays_on_plain_http() {
+        // A plain-HTTP LAN instance is real and supported; assuming TLS there
+        // would break it exactly as assuming plaintext broke the tunnelled one.
+        for host in ["localhost:8080", "192.168.1.40:8080", "127.0.0.1:8099", "pi", "nas.local"] {
+            assert_eq!(scheme_for(host), "http", "{host} should stay on http");
+        }
+    }
+
+    /// What `public_origin` would choose for a `Host`, with no `PUBLIC_URL` set
+    /// and no proxy trusted — the fallback branch, which is the one that was
+    /// wrong.
+    fn scheme_for(host: &str) -> &'static str {
+        if is_private_host(host) {
+            "http"
+        } else {
+            "https"
+        }
     }
 
     #[test]

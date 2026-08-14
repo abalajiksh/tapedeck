@@ -21,6 +21,20 @@ pub struct ServerConfig {
     pub port: u16,
     pub host: String,
     pub trust_proxy: bool,
+    /// The address this instance is reached at from outside, when it differs
+    /// from what the origin can see — `https://tapedeck.example.com`.
+    ///
+    /// Everything else in this file is something the server can determine or
+    /// default sensibly. This it genuinely cannot: behind a tunnel or a reverse
+    /// proxy the origin is handed plain HTTP on some internal name, and the
+    /// only party who knows the public address is the operator.
+    ///
+    /// It matters far more than it looks. The OAuth metadata documents publish
+    /// this as the issuer and as every endpoint URL, and an authorization
+    /// server that advertises `http://` is one a conformant client will refuse
+    /// outright — which presents as a connector that mysteriously has no tools.
+    /// Empty means "work it out", which `server::mcp::public_origin` then does.
+    pub public_url: String,
 }
 
 #[derive(Debug, Clone)]
@@ -103,6 +117,7 @@ struct TomlServer {
     port: u16,
     host: String,
     trust_proxy: bool,
+    public_url: String,
     secret_key_path: String,
 }
 impl Default for TomlServer {
@@ -111,6 +126,7 @@ impl Default for TomlServer {
             port: 8080,
             host: "0.0.0.0".into(),
             trust_proxy: false,
+            public_url: String::new(),
             secret_key_path: "./tapedeck.key".into(),
         }
     }
@@ -245,6 +261,10 @@ impl Config {
                 port: env_or_parse("PORT", env_or_parse("ADMIN_PORT", t.server.port)),
                 host: env_or("HOST", t.server.host),
                 trust_proxy: env_or_bool("TRUST_PROXY", t.server.trust_proxy),
+                public_url: env_or("PUBLIC_URL", t.server.public_url)
+                    .trim()
+                    .trim_end_matches('/')
+                    .to_string(),
             },
             database: DatabaseConfig {
                 sqlite_path: env_or("SQLITE_DB_PATH", t.database.sqlite_path),

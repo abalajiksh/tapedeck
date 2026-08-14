@@ -18,6 +18,17 @@ host = "0.0.0.0"
 # trusted for client IPs, which the login rate limiter keys on.
 trust_proxy = false
 
+# What this instance is reached at from outside, if that differs from what the
+# server itself can see — behind Cloudflare Tunnel, nginx or any reverse proxy.
+#
+# Worth setting if you use the MCP surface. It is published as the OAuth issuer
+# and as every endpoint URL, and an authorization server advertising http://
+# is one a hosted assistant will refuse — which shows up as a connector that
+# signs in and then has no tools. Left empty, the server infers it: forwarded
+# headers when trust_proxy is on, otherwise the Host header with https assumed
+# for a public hostname and http for a LAN one.
+# public_url = "https://tapedeck.example.com" 
+
 [database]
 # Listens and all app state.
 scrobble_db_url = "sqlite:scrobbles.db"
