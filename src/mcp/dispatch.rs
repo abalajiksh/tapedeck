@@ -38,6 +38,21 @@ impl Trace {
     fn plain(ok: bool) -> Self {
         Trace { tool: None, args: None, ok, rows: None }
     }
+
+    /// A successful enumeration, recording **how many things it listed**.
+    ///
+    /// `tools/list` used to record nothing, and that turned out to be the one
+    /// gap that mattered: when a real connector reported having no tools, the
+    /// audit log could say the call had happened and succeeded but not whether
+    /// the answer was twenty-three tools or an empty array. Those are opposite
+    /// diagnoses — one is the client's problem and the other is this server's —
+    /// and telling them apart needed a reconnect and a code change.
+    ///
+    /// The row count was already described as the interesting column. It was
+    /// only being filled in for tool calls.
+    fn listed(n: usize) -> Self {
+        Trace { tool: None, args: None, ok: true, rows: Some(n as i64) }
+    }
 }
 
 pub async fn handle(state: &Arc<AppState>, auth: &McpAuth, req: &RpcRequest) -> (Outcome, Trace) {
@@ -95,7 +110,8 @@ pub async fn handle(state: &Arc<AppState>, auth: &McpAuth, req: &RpcRequest) -> 
         // ── Tools ──
         "tools/list" => {
             let list: Vec<Value> = tools::visible(auth).iter().map(|t| t.to_json()).collect();
-            (reply(json!({ "tools": list })), Trace::plain(true))
+            let n = list.len();
+            (reply(json!({ "tools": list })), Trace::listed(n))
         }
 
         "tools/call" => {
@@ -172,10 +188,14 @@ pub async fn handle(state: &Arc<AppState>, auth: &McpAuth, req: &RpcRequest) -> 
 
         // ── Resources ──
         "resources/list" => {
-            (reply(json!({ "resources": resources::list(auth) })), Trace::plain(true))
+            let list = resources::list(auth);
+            let n = list.len();
+            (reply(json!({ "resources": list })), Trace::listed(n))
         }
         "resources/templates/list" => {
-            (reply(json!({ "resourceTemplates": resources::templates(auth) })), Trace::plain(true))
+            let list = resources::templates(auth);
+            let n = list.len();
+            (reply(json!({ "resourceTemplates": list })), Trace::listed(n))
         }
         "resources/read" => {
             let Some(uri) = req.param_str("uri") else {
@@ -202,7 +222,11 @@ pub async fn handle(state: &Arc<AppState>, auth: &McpAuth, req: &RpcRequest) -> 
         }
 
         // ── Prompts ──
-        "prompts/list" => (reply(json!({ "prompts": prompts::list(auth) })), Trace::plain(true)),
+        "prompts/list" => {
+            let list = prompts::list(auth);
+            let n = list.len();
+            (reply(json!({ "prompts": list })), Trace::listed(n))
+        }
         "prompts/get" => {
             let Some(name) = req.param_str("name") else {
                 return (

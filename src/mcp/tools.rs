@@ -80,12 +80,19 @@ fn obj(props: Vec<(&str, Value)>, required: &[&str]) -> Value {
     for (k, v) in props {
         map.insert(k.to_string(), v);
     }
-    json!({
+    let mut schema = json!({
         "type": "object",
         "properties": Value::Object(map),
-        "required": required,
         "additionalProperties": false,
-    })
+    });
+    // Omitted rather than emitted empty. `"required": []` says nothing that
+    // absence does not, and a validator with draft-04 heritage treats an empty
+    // array here as invalid — which would take the whole tool out of a strict
+    // client's list rather than complaining about it.
+    if !required.is_empty() {
+        schema["required"] = json!(required);
+    }
+    schema
 }
 
 /// A tool that takes nothing. `additionalProperties: false` is the spec's
@@ -1211,6 +1218,39 @@ mod tests {
                 "tool '{}' has the wrong readOnlyHint",
                 t.name
             );
+        }
+    }
+
+    #[test]
+    fn a_schema_with_no_required_arguments_omits_the_key() {
+        // `"required": []` is noise, and a validator with draft-04 heritage
+        // rejects it — which excludes the tool from a strict client's list
+        // rather than reporting anything.
+        let s = obj(vec![("limit", int_arg("n"))], &[]);
+        assert!(s.get("required").is_none());
+        let s = obj(vec![("name", str_arg("who"))], &["name"]);
+        assert_eq!(s["required"][0], "name");
+    }
+
+    #[test]
+    fn every_tool_input_schema_is_a_valid_object_schema() {
+        // A malformed schema on one tool takes that tool out of the list
+        // silently, which is indistinguishable from the server not offering it.
+        for t in catalogue() {
+            assert_eq!(t.schema["type"], "object", "tool '{}' schema is not an object", t.name);
+            if let Some(req) = t.schema.get("required") {
+                let arr = req.as_array().expect("required must be an array");
+                assert!(!arr.is_empty(), "tool '{}' emits an empty required array", t.name);
+                let props = t.schema["properties"].as_object().expect("properties");
+                for r in arr {
+                    let key = r.as_str().unwrap();
+                    assert!(
+                        props.contains_key(key),
+                        "tool '{}' requires '{key}', which is not in its properties",
+                        t.name
+                    );
+                }
+            }
         }
     }
 
