@@ -2001,7 +2001,7 @@ class TapedeckAPI {
 	async getSavedPlaylists(): Promise<{ playlists: SavedPlaylist[] }> {
 		return this.get('/api/v1/saved-playlists');
 	}
-	async getSavedPlaylist(id: number): Promise<{ playlist: SavedPlaylist; tracks: SavedTrack[] }> {
+	async getSavedPlaylist(id: number): Promise<{ playlist: SavedPlaylist; tracks: PlaylistTrackView[] }> {
 		return this.get(`/api/v1/saved-playlists/${id}`);
 	}
 	async deleteSavedPlaylist(id: number): Promise<void> {
@@ -2101,6 +2101,18 @@ export interface CrateEntry {
 	 *  not stored — it is the only way a suggestion can be scored. */
 	first_played_at: number | null;
 	plays: number;
+}
+
+/// A playlist track with what the history already knows about it — the artwork
+/// and play count that make this page look like the rest of the application
+/// rather than a text file beside Rediscovery's sleeves.
+export interface PlaylistTrackView extends SavedTrack {
+	/** Plays in your history. 0 for something you have never played, which is a
+	 *  normal outcome — it keeps its lettered tile. */
+	plays: number;
+	artwork_url: string | null;
+	caa_id: number | null;
+	caa_release_mbid: string | null;
 }
 
 export interface SavedTrack {

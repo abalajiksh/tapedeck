@@ -324,7 +324,10 @@ async fn get_saved(
     let Some(meta) = all.into_iter().find(|p| p.id == id) else {
         return err(404, "No such playlist");
     };
-    match state.db.playlist_tracks(user.user_id, id).await {
+    // Enriched with the artwork and play counts the history already holds, so
+    // this page reads like the rest of the application rather than like a text
+    // file sitting next to Rediscovery's sleeves.
+    match state.db.playlist_tracks_detailed(user.user_id, id).await {
         Ok(tracks) => {
             (StatusCode::OK, Json(serde_json::json!({ "playlist": meta, "tracks": tracks })))
                 .into_response()
