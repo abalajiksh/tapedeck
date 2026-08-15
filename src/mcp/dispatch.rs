@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use serde_json::{json, Value};
 
-use super::protocol::{self, RpcError, RpcRequest};
+use super::protocol::{self, CacheScope, RpcError, RpcRequest};
 use super::tools::ToolFailure;
 use super::{prompts, resources, tools};
 use crate::db::McpAuth;
@@ -55,10 +55,27 @@ impl Trace {
     }
 }
 
+/// How long the compiled-in sets may be treated as fresh. They change only when
+/// the binary does — but a *grant* can be revoked at any time, and the lists are
+/// filtered by grant, so this is minutes rather than hours.
+const LIST_TTL_MS: u64 = 300_000;
+
+/// Discovery carries nothing user-specific and changes only on deploy.
+const DISCOVER_TTL_MS: u64 = 3_600_000;
+
 pub async fn handle(state: &Arc<AppState>, auth: &McpAuth, req: &RpcRequest) -> (Outcome, Trace) {
     let id = req.id.clone();
     let era = req.era;
     let reply = |v: Value| Outcome::Reply(protocol::ok(id.clone(), era, v));
+    // The three list methods vary by the caller's grants, so their results must
+    // never be served to anyone else — see `protocol::with_cache`.
+    let listing = |v: Value| {
+        Outcome::Reply(protocol::ok(
+            id.clone(),
+            era,
+            protocol::with_cache(v, era, LIST_TTL_MS, CacheScope::Private),
+        ))
+    };
 
     match req.method.as_str() {
         // ── Lifecycle ──
@@ -80,12 +97,21 @@ pub async fn handle(state: &Arc<AppState>, auth: &McpAuth, req: &RpcRequest) -> 
         // Modern discovery. `supportedVersions` is what lets a client that
         // guessed wrong retry with something this server actually speaks.
         "server/discover" => (
-            reply(json!({
-                "supportedVersions": super::SUPPORTED_VERSIONS,
-                "capabilities": capabilities(),
-                "instructions": super::instructions(),
-                "_meta": { "io.modelcontextprotocol/serverInfo": server_info() },
-            })),
+            Outcome::Reply(protocol::ok(
+                id.clone(),
+                era,
+                protocol::with_cache(
+                    json!({
+                        "supportedVersions": super::SUPPORTED_VERSIONS,
+                        "capabilities": capabilities(),
+                        "instructions": super::instructions(),
+                        "_meta": { "io.modelcontextprotocol/serverInfo": server_info() },
+                    }),
+                    era,
+                    DISCOVER_TTL_MS,
+                    CacheScope::Public,
+                ),
+            )),
             Trace::plain(true),
         ),
 
@@ -111,7 +137,7 @@ pub async fn handle(state: &Arc<AppState>, auth: &McpAuth, req: &RpcRequest) -> 
         "tools/list" => {
             let list: Vec<Value> = tools::visible(auth).iter().map(|t| t.to_json()).collect();
             let n = list.len();
-            (reply(json!({ "tools": list })), Trace::listed(n))
+            (listing(json!({ "tools": list })), Trace::listed(n))
         }
 
         "tools/call" => {
@@ -190,12 +216,12 @@ pub async fn handle(state: &Arc<AppState>, auth: &McpAuth, req: &RpcRequest) -> 
         "resources/list" => {
             let list = resources::list(auth);
             let n = list.len();
-            (reply(json!({ "resources": list })), Trace::listed(n))
+            (listing(json!({ "resources": list })), Trace::listed(n))
         }
         "resources/templates/list" => {
             let list = resources::templates(auth);
             let n = list.len();
-            (reply(json!({ "resourceTemplates": list })), Trace::listed(n))
+            (listing(json!({ "resourceTemplates": list })), Trace::listed(n))
         }
         "resources/read" => {
             let Some(uri) = req.param_str("uri") else {
@@ -206,7 +232,8 @@ pub async fn handle(state: &Arc<AppState>, auth: &McpAuth, req: &RpcRequest) -> 
             };
             match resources::read(state, auth, uri).await {
                 Ok(contents) => (
-                    reply(json!({ "contents": contents })),
+                    // A note or a shelf entry is as user-specific as it gets.
+                    listing(json!({ "contents": contents })),
                     Trace {
                         tool: Some(uri.to_string()),
                         args: None,
@@ -225,7 +252,7 @@ pub async fn handle(state: &Arc<AppState>, auth: &McpAuth, req: &RpcRequest) -> 
         "prompts/list" => {
             let list = prompts::list(auth);
             let n = list.len();
-            (reply(json!({ "prompts": list })), Trace::listed(n))
+            (listing(json!({ "prompts": list })), Trace::listed(n))
         }
         "prompts/get" => {
             let Some(name) = req.param_str("name") else {

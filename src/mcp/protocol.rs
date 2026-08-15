@@ -120,6 +120,56 @@ pub fn ok(id: Option<Value>, era: Era, mut result: Value) -> Value {
     json!({ "jsonrpc": "2.0", "id": id, "result": result })
 }
 
+/// Stamp the SEP-2549 caching fields onto a result.
+///
+/// `ttlMs` and `cacheScope` are **required** on cacheable results in
+/// `2026-07-28` — required in the strict sense, as non-`Option` fields in the
+/// schema — and omitting them is what made a real connector report having no
+/// tools. The client fetched `tools/list`, got twenty-three of them, failed to
+/// deserialise the envelope because two required fields were missing, and was
+/// left with none. Nothing errored anywhere: the server logged a successful
+/// call returning 23 rows, and the user was told the connector was empty.
+///
+/// **`cacheScope` is a correctness decision here, not a performance one.**
+/// `public` means any client or intermediary may cache the response and serve
+/// it *to any user*. The three list methods are filtered by the caller's
+/// grants, so their results are specific to one connection and must be
+/// `private` — a shared cache serving one person's tool list to another would
+/// leak which grants they hold. `server/discover` carries nothing
+/// user-specific, so it is genuinely public.
+///
+/// Modern-only, for the same reason `resultType` is: these fields do not exist
+/// in the older revisions, and a strict legacy client can reject an envelope
+/// carrying keys its schema does not know.
+pub fn with_cache(mut result: Value, era: Era, ttl_ms: u64, scope: CacheScope) -> Value {
+    if era == Era::Modern {
+        if let Some(obj) = result.as_object_mut() {
+            obj.insert("ttlMs".into(), json!(ttl_ms));
+            obj.insert("cacheScope".into(), json!(scope.as_str()));
+        }
+    }
+    result
+}
+
+/// Who may cache a result. See [`with_cache`] — the distinction is about who
+/// may be served the cached copy, not about how long it lives.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CacheScope {
+    /// Nothing user-specific in it.
+    Public,
+    /// Varies by the caller's authorization, so it must never be shared.
+    Private,
+}
+
+impl CacheScope {
+    fn as_str(self) -> &'static str {
+        match self {
+            CacheScope::Public => "public",
+            CacheScope::Private => "private",
+        }
+    }
+}
+
 /// The `_meta` version, which is the *only* thing that makes a request modern.
 fn meta_version(params: &Value) -> Option<&str> {
     params.pointer("/_meta/io.modelcontextprotocol~1protocolVersion").and_then(Value::as_str)
@@ -488,6 +538,37 @@ mod tests {
             parse(&body(json!([{ "jsonrpc": "2.0", "method": "ping" }])), modern_headers(&[]))
                 .unwrap_err();
         assert_eq!(err.code, INVALID_REQUEST);
+    }
+
+    #[test]
+    fn a_cacheable_modern_result_carries_the_fields_the_schema_requires() {
+        // `ttlMs` and `cacheScope` are non-Option in the 2026-07-28 schema.
+        // Omitting them made a real connector deserialise `tools/list`, fail on
+        // the missing fields, and report having no tools — while the server
+        // logged a successful call that returned 23 of them.
+        let r = with_cache(json!({ "tools": [] }), Era::Modern, 300_000, CacheScope::Private);
+        assert_eq!(r["ttlMs"], 300_000);
+        assert_eq!(r["cacheScope"], "private");
+    }
+
+    #[test]
+    fn a_legacy_result_carries_no_caching_fields() {
+        // They do not exist in the older revisions, and a strict legacy client
+        // can reject an envelope carrying keys its schema does not know — the
+        // same reasoning that keeps `resultType` modern-only.
+        let r = with_cache(json!({ "tools": [] }), Era::Legacy, 300_000, CacheScope::Private);
+        assert!(r.get("ttlMs").is_none());
+        assert!(r.get("cacheScope").is_none());
+    }
+
+    #[test]
+    fn a_grant_filtered_list_is_never_publicly_cacheable() {
+        // `public` lets an intermediary serve the response to *any* user. The
+        // list methods are filtered by the caller's grants, so a shared cache
+        // would hand one person's tool list — and therefore which grants they
+        // hold — to somebody else.
+        assert_eq!(CacheScope::Private.as_str(), "private");
+        assert_eq!(CacheScope::Public.as_str(), "public");
     }
 
     #[test]
