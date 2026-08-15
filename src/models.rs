@@ -214,7 +214,104 @@ pub struct ImportProvenance {
     pub spotify_track_id: Option<String>,
 }
 
+/// Does this codec string name a DSD stream?
+///
+/// **Not an equality test, and that is the whole point.** Plex and
+/// Jellyfin/Emby both asked `codec == "dsd"`, but both are quoting ffmpeg, and
+/// ffmpeg names the four bit-orderings separately: `dsd_lsbf`, `dsd_msbf` and
+/// their `_planar` variants. So a real SACD rip arrived as `dsd_lsbf_planar`,
+/// missed the test, and was filed as PCM — *and* as lossy, because the lossless
+/// list was an equality test on the same string. `compute_score` then took the
+/// bitrate branch and scored it **60**, which is what a 320 kbps MP3 gets.
+///
+/// Measured on a real history: this was the entire "Lossy" bucket on a library
+/// whose owner plays DSD deliberately.
+///
+/// `dst` is DSD's own lossless compression — what is actually written on an
+/// SACD — so it belongs to the same family.
+pub fn codec_is_dsd(codec: &str) -> bool {
+    let c = codec.trim().to_lowercase();
+    c.starts_with("dsd") || c == "dst"
+}
+
+/// Does this codec string name a lossless format?
+///
+/// One list, shared. There used to be two and they disagreed: Plex's omitted
+/// `ape` and `wavpack`, so the same file was lossless from one server and lossy
+/// from the other — a difference in the *reporter*, presented as a fact about
+/// the music.
+pub fn codec_is_lossless(codec: &str) -> bool {
+    let c = codec.trim().to_lowercase();
+    // ffmpeg spells PCM per sample format — `pcm_s16le`, `pcm_s24be` — so this
+    // is a prefix test for exactly the reason the DSD one is.
+    codec_is_dsd(&c)
+        || c.starts_with("pcm")
+        || matches!(
+            c.as_str(),
+            "flac"
+                | "alac"
+                | "wav"
+                | "wave"
+                | "aiff"
+                | "aif"
+                | "ape"
+                | "wavpack"
+                | "wv"
+                | "tta"
+                | "tak"
+                | "mlp"
+                | "truehd"
+        )
+}
+
+/// DSD64 / DSD128 / … from the sample rate a server reported.
+///
+/// **Two forms arrive and both have to be read.** DSD64's true rate is
+/// 2,822,400 Hz (44,100 × 64), but Plex reports **352,800** for the same file —
+/// the rate in bytes rather than in bits, i.e. the true rate over eight.
+///
+/// They are told apart by magnitude, and the threshold is a property of the
+/// formats rather than a number picked to make the arithmetic work: no PCM
+/// sample rate reaches 1 MHz (768 kHz is the highest anything supports), and no
+/// DSD rate falls below 2.8 MHz. So a DSD stream quoting a figure under 1 MHz
+/// is quoting the byte form, and there is nothing else it could be.
+///
+/// Returns `None` rather than guessing when the result is not a real DSD
+/// multiple — `compute_score` has a fallback for an unknown multiplier, and an
+/// invented one would be worse than the fallback.
+pub fn dsd_multiplier_from_rate(sample_rate: i64) -> Option<i16> {
+    if sample_rate <= 0 {
+        return None;
+    }
+    let bits = if sample_rate < 1_000_000 { sample_rate * 8 } else { sample_rate };
+    let multiple = bits / 44_100;
+    if bits % 44_100 != 0 {
+        return None;
+    }
+    matches!(multiple, 64 | 128 | 256 | 512 | 1024).then_some(multiple as i16)
+}
+
 impl AudioQuality {
+    /// Fill `format_type`, `is_lossless`, and the DSD rate fields from the
+    /// codec and sample rate a source reported.
+    ///
+    /// Shared so the two session-shaped sources cannot answer differently about
+    /// the same file; see `codec_is_dsd` for what they used to get wrong.
+    pub fn classify_codec(&mut self) {
+        let codec = self.codec.clone().unwrap_or_default();
+        let dsd = codec_is_dsd(&codec);
+        self.format_type = Some(if dsd { "dsd" } else { "pcm" }.to_string());
+        self.is_lossless = Some(codec_is_lossless(&codec));
+        if dsd {
+            if let Some(sr) = self.sample_rate {
+                if let Some(m) = dsd_multiplier_from_rate(sr as i64) {
+                    self.dsd_multiplier = Some(m);
+                    self.dsd_rate = Some(m as i64 * 44_100);
+                }
+            }
+        }
+    }
+
     /// Note what is deliberately *not* in here: `dsd_to_pcm_converted` and
     /// `source_quality`. Both are stored and both are worth seeing, but the
     /// score is written once at ingest and never recomputed, so folding a new
@@ -387,6 +484,70 @@ impl ListeningContext {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The bug this exists for: ffmpeg names the four DSD bit-orderings
+    /// separately, so an equality test on `"dsd"` missed every real file and
+    /// filed an SACD rip as lossy PCM scoring 60.
+    #[test]
+    fn every_spelling_ffmpeg_uses_for_dsd_is_recognised() {
+        for c in
+            ["dsd", "dsd_lsbf", "dsd_msbf", "dsd_lsbf_planar", "dsd_msbf_planar", "DSD_MSBF", "dst"]
+        {
+            assert!(codec_is_dsd(c), "{c} is DSD");
+            assert!(codec_is_lossless(c), "{c} is not lossy");
+        }
+        for c in ["mp3", "aac", "opus", "vorbis", "flac"] {
+            assert!(!codec_is_dsd(c), "{c} is not DSD");
+        }
+    }
+
+    /// PCM has the same shape of problem — ffmpeg spells it per sample format,
+    /// so `pcm_s24le` would have failed an equality test on `"pcm"` and been
+    /// scored as a lossy file too.
+    #[test]
+    fn the_lossless_list_is_shared_and_covers_both_servers() {
+        for c in ["flac", "alac", "wav", "aiff", "ape", "wavpack", "pcm", "pcm_s16le", "pcm_s24be"]
+        {
+            assert!(codec_is_lossless(c), "{c} is lossless");
+        }
+        for c in ["mp3", "aac", "opus", "vorbis", "wma", "ac3"] {
+            assert!(!codec_is_lossless(c), "{c} is lossy");
+        }
+    }
+
+    /// Both forms of the rate arrive: Plex quotes DSD64 as 352,800 (bytes) and
+    /// the true rate is 2,822,400 (bits). Anything that is not a real DSD
+    /// multiple is left unset rather than guessed at.
+    #[test]
+    fn a_dsd_rate_is_read_in_either_form() {
+        assert_eq!(dsd_multiplier_from_rate(352_800), Some(64));
+        assert_eq!(dsd_multiplier_from_rate(2_822_400), Some(64));
+        assert_eq!(dsd_multiplier_from_rate(705_600), Some(128));
+        assert_eq!(dsd_multiplier_from_rate(5_644_800), Some(128));
+        assert_eq!(dsd_multiplier_from_rate(11_289_600), Some(256));
+        assert_eq!(dsd_multiplier_from_rate(44_100), None);
+        assert_eq!(dsd_multiplier_from_rate(96_000), None);
+        assert_eq!(dsd_multiplier_from_rate(0), None);
+    }
+
+    /// The whole path, on the bytes a real Plex session reported for a DSF:
+    /// what used to score 60 as lossy PCM is DSD64 and scores 92.
+    #[test]
+    fn a_real_dsf_session_is_scored_as_dsd_not_as_a_320k_mp3() {
+        let mut q = AudioQuality {
+            codec: Some("dsd_lsbf_planar".into()),
+            container: Some("dsf".into()),
+            sample_rate: Some(352_800),
+            ..Default::default()
+        };
+        q.classify_codec();
+        q.compute_score();
+        assert_eq!(q.format_type.as_deref(), Some("dsd"));
+        assert_eq!(q.is_lossless, Some(true));
+        assert_eq!(q.dsd_multiplier, Some(64));
+        assert_eq!(q.dsd_rate, Some(2_822_400));
+        assert_eq!(q.quality_score, Some(92.0));
+    }
 
     /// The two halves are an OR, and both directions matter: the fraction is
     /// what lets a ninety-second track count at all, and the flat number is what

@@ -261,11 +261,6 @@ impl PlexTrack {
         let bit_depth = audio_stream.and_then(|s| s.bit_depth);
         let channels = audio_stream.and_then(|s| s.channels).or(media.audio_channels);
 
-        let codec_lower = codec.as_deref().unwrap_or("").to_lowercase();
-        let is_lossless =
-            matches!(codec_lower.as_str(), "flac" | "alac" | "wav" | "aiff" | "dsd" | "pcm");
-        let format_type = if codec_lower == "dsd" { "dsd" } else { "pcm" };
-
         let container = media.container.clone();
 
         let (is_transcoded, delivery_codec, delivery_bitrate, transcode_reason) =
@@ -289,14 +284,12 @@ impl PlexTrack {
         }
 
         let mut quality = AudioQuality {
-            format_type: Some(format_type.to_string()),
             codec,
             bitrate,
             sample_rate,
             bit_depth: bit_depth.map(|b| b as i16),
             channels: channels.map(|c| c as i16),
             container,
-            is_lossless: Some(is_lossless),
             delivery_codec,
             delivery_bitrate,
             is_transcoded,
@@ -304,6 +297,7 @@ impl PlexTrack {
             ..Default::default()
         };
 
+        quality.classify_codec();
         quality.compute_score();
         Some(quality)
     }

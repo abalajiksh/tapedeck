@@ -743,12 +743,6 @@ impl MediaBrowserSource {
             t.eq_ignore_ascii_case("Audio")
         })?;
 
-        let codec_lower = audio.codec.as_deref().unwrap_or("").to_lowercase();
-        let is_lossless = matches!(
-            codec_lower.as_str(),
-            "flac" | "alac" | "wav" | "aiff" | "ape" | "wavpack" | "pcm" | "dsd"
-        );
-
         // `PlayMethod` is the authority; `TranscodingInfo` merely describes a
         // transcode that is running. Note `IsAudioDirect` — a video transcode
         // can leave the audio untouched, and calling that a transcoded listen
@@ -769,18 +763,17 @@ impl MediaBrowserSource {
             .map(|r| r.join(", "));
 
         let mut q = AudioQuality {
-            format_type: Some(if codec_lower == "dsd" { "dsd" } else { "pcm" }.to_string()),
             codec: audio.codec.clone(),
             bitrate: audio.bit_rate,
             sample_rate: audio.sample_rate,
             bit_depth: audio.bit_depth.map(|b| b as i16),
             channels: audio.channels.map(|c| c as i16),
             container: item.container.clone(),
-            is_lossless: Some(is_lossless),
             is_transcoded: Some(is_transcoded),
             transcode_reason,
             ..Default::default()
         };
+        q.classify_codec();
 
         // Only describe the delivery side when it really is a different thing
         // from the source, or `delivery_codec` would claim a Bluetooth-style

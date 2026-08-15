@@ -2213,6 +2213,31 @@ impl Database {
             }
         }
 
+        // Migration: re-file the DSD listens that were stored as lossy PCM.
+        //
+        // Both session sources tested `codec == "dsd"` where ffmpeg says
+        // `dsd_lsbf_planar`, so every DSD listen ever polled was written with
+        // `format_type = 'pcm'`, `is_lossless = 0` and a score of 60 — see
+        // `models::codec_is_dsd`. Fixing the classifier only helps listens
+        // recorded *after* it, because `quality_score` is written once at ingest
+        // and never recomputed, so without this pass the reported symptom (a
+        // "Lossy" bucket made entirely of SACD rips) never goes away.
+        //
+        // This is deliberately **not** the general rescore that
+        // `AudioQuality::compute_score`'s doc comment warns against. That
+        // warning is about changing the scoring *formula*, which would make
+        // listens either side of the change incomparable. Here the formula is
+        // untouched and the input was misparsed: these rows are being given the
+        // score they should always have had.
+        //
+        // No marker is needed to make it run once. The `WHERE` matches only
+        // rows that are still misclassified, so a second run selects nothing.
+        if let Err(e) = self.reclassify_dsd_listens().await {
+            // Not fatal: the rows stay as they were, which is exactly the state
+            // every release before this one shipped.
+            warn!("Could not re-file misclassified DSD listens: {}", e);
+        }
+
         // Migration: a note can hang off a report period.
         //
         // The second CHECK rebuild in this file, and for the same reason as the
@@ -2779,19 +2804,74 @@ impl Database {
             .map(|d| (d as i64 * 4 / 5).clamp(20, DUPLICATE_WINDOW_SECS))
             .unwrap_or(DUPLICATE_WINDOW_SECS);
         let timestamp = play.timestamp as i64;
-        let count: (i64,) = sqlx::query_as(
-            "SELECT COUNT(*) FROM scrobbles WHERE user_id = ? AND title = ? AND artist = ?
-             AND timestamp BETWEEN ? - ? AND ? + ?",
-        )
-        .bind(user_id)
-        .bind(&play.title)
-        .bind(&play.artist)
-        .bind(timestamp)
-        .bind(window)
-        .bind(timestamp)
-        .bind(window)
-        .fetch_one(&self.pool)
-        .await?;
+        // **The artist is not a reliable join key, and requiring it to match
+        // exactly is what let Plex double-scrobble compilations.**
+        //
+        // Plex has two paths into this function and they identify the performer
+        // differently: the live path takes the *track* artist (`originalTitle`)
+        // and the history walk takes the *album* artist. On a normal record
+        // those agree. On a compilation the album artist is "Various Artists",
+        // so the same listen arrived one second apart as "Jon Pardi" and as
+        // "Various Artists", neither row could see the other, and both were
+        // banked. Measured on a real history: "Close To Me" from one OST stood
+        // at 75 plays under its singer and 21 under the placeholder, which is
+        // also why Various Artists read as the nominal top artist.
+        //
+        // So a row in the window is the same listen when the titles match and
+        // the artists are not *known* to be different. Three ways to be sure:
+        //
+        //   1. the artists fold to the same key — `LOWER(TRIM(…))`, the same
+        //      fold `artist_key` and the charts use, so "System of a Down" and
+        //      "System of A Down" stop being two listens as well;
+        //   2. either side is a Various Artists placeholder, which per
+        //      `is_various_artists` means *look at the track* and carries no
+        //      performer information at all — comparing it to a real name is
+        //      comparing against a null;
+        //   3. both carry the same recording MBID, which settles it outright
+        //      whatever the two servers chose to call the performer.
+        //
+        // What this deliberately does **not** do is drop the artist entirely.
+        // Two different songs sharing a title within the same minute is rare
+        // but real (two covers back to back), and silently swallowing the
+        // second is a listen lost off a permanent record.
+        //
+        // `LOWER(TRIM(...))` in a `WHERE` normally means an unindexable scan —
+        // the shape that made Rediscovery quadratic. It is safe here because
+        // `user_id` and the timestamp range are tested first and
+        // `idx_scrobbles_user_time` serves them, so the fold only ever runs
+        // over the handful of rows inside a two-minute slice of one user's
+        // history.
+        let placeholders = VARIOUS_ARTISTS_KEYS.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
+        let sql = format!(
+            "SELECT COUNT(*) FROM scrobbles
+              WHERE user_id = ?
+                AND timestamp BETWEEN ? - ? AND ? + ?
+                AND LOWER(TRIM(title)) = LOWER(TRIM(?))
+                AND (
+                      LOWER(TRIM(artist)) = LOWER(TRIM(?))
+                   OR LOWER(TRIM(artist)) IN ({ph})
+                   OR ? IN ({ph})
+                   OR (? IS NOT NULL AND mbid_recording = ?)
+                )",
+            ph = placeholders
+        );
+        let mut q = sqlx::query_as::<_, (i64,)>(&sql)
+            .bind(user_id)
+            .bind(timestamp)
+            .bind(window)
+            .bind(timestamp)
+            .bind(window)
+            .bind(&play.title)
+            .bind(&play.artist);
+        for k in VARIOUS_ARTISTS_KEYS {
+            q = q.bind(*k);
+        }
+        q = q.bind(play.artist.trim().to_lowercase());
+        for k in VARIOUS_ARTISTS_KEYS {
+            q = q.bind(*k);
+        }
+        let count: (i64,) =
+            q.bind(&play.mbid_recording).bind(&play.mbid_recording).fetch_one(&self.pool).await?;
         Ok(count.0 > 0)
     }
 
@@ -6877,6 +6957,89 @@ impl Database {
         Ok(true)
     }
 
+    /// Re-file listens whose codec names a DSD stream but which were stored as
+    /// lossy PCM, and give them the score they should always have had.
+    ///
+    /// Returns how many rows were corrected. Idempotent by construction: the
+    /// `WHERE` selects only rows that are still wrong.
+    ///
+    /// The rescore goes through `AudioQuality::compute_score` rather than being
+    /// expressed in SQL, because a second copy of that formula in a `CASE` is
+    /// free to drift from the real one — and this is the query that decides
+    /// what the fidelity readouts say.
+    pub async fn reclassify_dsd_listens(&self) -> Result<u64, sqlx::Error> {
+        // `codec LIKE 'dsd%'` is the cheap half of `codec_is_dsd`; `dst` is
+        // named explicitly. The container is *not* consulted — a DSF holding
+        // PCM would be a lie, and the codec is the authority either way.
+        let rows: Vec<(
+            i64,
+            String,
+            Option<i32>,
+            Option<i32>,
+            Option<i16>,
+            Option<bool>,
+            Option<String>,
+            Option<i32>,
+        )> = sqlx::query_as(
+            "SELECT id, codec, sample_rate, bitrate, bit_depth, is_transcoded,
+                        delivery_codec, delivery_bitrate
+                   FROM scrobbles
+                  WHERE (LOWER(codec) LIKE 'dsd%' OR LOWER(codec) = 'dst')
+                    AND COALESCE(format_type, '') <> 'dsd'",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        if rows.is_empty() {
+            return Ok(0);
+        }
+        info!("⚙️ Migrating: re-filing {} DSD listens stored as lossy PCM...", rows.len());
+
+        let mut tx = self.pool.begin().await?;
+        let mut done = 0u64;
+        for (
+            id,
+            codec,
+            sample_rate,
+            bitrate,
+            bit_depth,
+            is_transcoded,
+            delivery_codec,
+            delivery_bitrate,
+        ) in rows
+        {
+            let mut q = AudioQuality {
+                codec: Some(codec),
+                sample_rate,
+                bitrate,
+                bit_depth,
+                is_transcoded,
+                delivery_codec,
+                delivery_bitrate,
+                ..Default::default()
+            };
+            q.classify_codec();
+            q.compute_score();
+            sqlx::query(
+                "UPDATE scrobbles
+                    SET format_type = ?, is_lossless = ?, dsd_rate = COALESCE(?, dsd_rate),
+                        dsd_multiplier = COALESCE(?, dsd_multiplier), quality_score = ?
+                  WHERE id = ?",
+            )
+            .bind(&q.format_type)
+            .bind(q.is_lossless)
+            .bind(q.dsd_rate)
+            .bind(q.dsd_multiplier)
+            .bind(q.quality_score)
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+            done += 1;
+        }
+        tx.commit().await?;
+        Ok(done)
+    }
+
     /// Fill `scrobble_artists` from the listens already stored.
     ///
     /// Batched into one transaction per chunk for the reason
@@ -10441,17 +10604,25 @@ fn new_uuid() -> String {
     hex::encode(raw)
 }
 
+/// Every spelling of the "no single artist" placeholder, already folded to the
+/// `LOWER(TRIM(…))` form so it can be compared in Rust or bound into SQL.
+///
+/// A constant rather than a list inline in `is_various_artists`, because
+/// `fuzzy_exists` has to ask the same question in SQL — and two copies of this
+/// list would be free to disagree about which listens are duplicates.
+pub const VARIOUS_ARTISTS_KEYS: &[&str] =
+    &["various artists", "various artist", "various", "va", "verschiedene interpreten"];
+
 /// A "no single artist" placeholder, not an artist.
 ///
 /// Shared with the Plex source, which must not record a compilation's tracks
 /// under it. Here it keeps the sanitiser from folding real performers onto a
 /// placeholder: "Various Artists" is on every track of a compilation, so it
-/// wins the breadth test outright.
+/// wins the breadth test outright. `fuzzy_exists` reads it the other way round
+/// — as the absence of a performer, which is why it cannot be trusted to tell
+/// two listens apart.
 pub fn is_various_artists(name: &str) -> bool {
-    matches!(
-        name.trim().to_lowercase().as_str(),
-        "various artists" | "various artist" | "various" | "va" | "verschiedene interpreten"
-    )
+    VARIOUS_ARTISTS_KEYS.contains(&name.trim().to_lowercase().as_str())
 }
 
 /// Collapse an artist name to its identity for duplicate detection.
@@ -11351,6 +11522,202 @@ mod tests {
             "a re-report within the lag window is the same listen"
         );
         assert_eq!(db.listen_count_and_latest(1).await.unwrap().0, 1);
+    }
+
+    /// The Plex compilation double-scrobble: the live path banks the *track*
+    /// artist and the history walk banks the *album* artist, so the same listen
+    /// arrived seconds apart under two names and neither row could see the
+    /// other.
+    ///
+    /// This is what put "Various Artists" at the top of a real history's artist
+    /// chart, so the assertion is on the listen count rather than on the SQL —
+    /// it is the count that was wrong.
+    #[tokio::test]
+    async fn a_compilation_reported_under_two_names_is_still_one_listen() {
+        let db = testdb().await;
+        let mut live = play("Wherever I May Roam", "Jon Pardi", 1_700_000_000);
+        live.duration = Some(300);
+        assert!(db
+            .save_scrobble(
+                1,
+                &live,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                ListenDisposition::LIVE
+            )
+            .await
+            .unwrap());
+
+        // One second later, off `/status/sessions/history/all`, which carries
+        // the album artist and no track artist at all.
+        let mut hist = play("Wherever I May Roam", "Various Artists", 1_700_000_001);
+        hist.duration = Some(300);
+        hist.source_id = "plex-hist-15194".into();
+        assert!(
+            !db.save_scrobble(
+                1,
+                &hist,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                ListenDisposition::LIVE
+            )
+            .await
+            .unwrap(),
+            "the placeholder carries no performer, so it cannot make this a second listen"
+        );
+        assert_eq!(db.listen_count_and_latest(1).await.unwrap().0, 1);
+    }
+
+    /// The placeholder is treated as *unknown*, never as a wildcard that
+    /// swallows anything nearby. Two genuinely different songs sharing a title
+    /// inside the window — two covers back to back — are two listens, and
+    /// losing one of those is a listen gone off a permanent record.
+    #[tokio::test]
+    async fn two_different_songs_sharing_a_title_stay_two_listens() {
+        let db = testdb().await;
+        let mut first = play("Hallelujah", "Jeff Buckley", 1_700_000_000);
+        first.duration = Some(120);
+        assert!(db
+            .save_scrobble(
+                1,
+                &first,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                ListenDisposition::LIVE
+            )
+            .await
+            .unwrap());
+
+        let mut second = play("Hallelujah", "k.d. lang", 1_700_000_030);
+        second.duration = Some(120);
+        second.source_id = "plex-999-scrobble-1700000030".into();
+        assert!(
+            db.save_scrobble(
+                1,
+                &second,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                ListenDisposition::LIVE
+            )
+            .await
+            .unwrap(),
+            "two named artists that differ are two listens, however close together"
+        );
+        assert_eq!(db.listen_count_and_latest(1).await.unwrap().0, 2);
+    }
+
+    /// A recording MBID settles it whatever the two servers called the
+    /// performer — the composer-vs-singer case, where neither side is the
+    /// Various Artists placeholder.
+    #[tokio::test]
+    async fn a_shared_recording_mbid_collapses_two_spellings() {
+        let db = testdb().await;
+        let mbid = "b1a9c0de-0000-4000-8000-000000000001";
+        let mut live = play("Ennodu Nee Irundhaal", "Sid Sriram", 1_700_000_000);
+        live.duration = Some(300);
+        live.mbid_recording = Some(mbid.into());
+        assert!(db
+            .save_scrobble(
+                1,
+                &live,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                ListenDisposition::LIVE
+            )
+            .await
+            .unwrap());
+
+        let mut hist = play("Ennodu Nee Irundhaal", "A.R. Rahman", 1_700_000_004);
+        hist.duration = Some(300);
+        hist.source_id = "plex-hist-4242".into();
+        hist.mbid_recording = Some(mbid.into());
+        assert!(
+            !db.save_scrobble(
+                1,
+                &hist,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                ListenDisposition::LIVE
+            )
+            .await
+            .unwrap(),
+            "same recording, same moment — one listen"
+        );
+        assert_eq!(db.listen_count_and_latest(1).await.unwrap().0, 1);
+    }
+
+    /// Every DSD listen polled before v0.65.0 was written as lossy PCM with a
+    /// score of 60. The classifier fix alone does not touch them, because
+    /// `quality_score` is written once at ingest — so this pass is the only
+    /// thing that makes the reported symptom go away.
+    ///
+    /// Also pins that it is idempotent: a second run must correct nothing.
+    #[tokio::test]
+    async fn the_dsd_listens_stored_as_lossy_are_re_filed_once() {
+        let db = testdb().await;
+        let mut p = play("Speak to Me", "Pink Floyd", 1_700_000_000);
+        p.duration = Some(90);
+        db.save_scrobble(1, &p, None, None, None, None, None, None, None, ListenDisposition::LIVE)
+            .await
+            .unwrap();
+
+        // Exactly what a Plex DSF session used to land as.
+        sqlx::query(
+            "UPDATE scrobbles SET codec = 'dsd_lsbf_planar', container = 'dsf',
+                    sample_rate = 352800, format_type = 'pcm', is_lossless = 0,
+                    quality_score = 60.0",
+        )
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+        assert_eq!(db.reclassify_dsd_listens().await.unwrap(), 1);
+        let (ft, lossless, mult, score): (String, bool, Option<i64>, f64) = sqlx::query_as(
+            "SELECT format_type, is_lossless, dsd_multiplier, quality_score FROM scrobbles",
+        )
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(ft, "dsd");
+        assert!(lossless, "a DSD stream is not lossy");
+        assert_eq!(mult, Some(64), "352800 is DSD64 quoted in bytes");
+        assert_eq!(score, 92.0);
+
+        assert_eq!(
+            db.reclassify_dsd_listens().await.unwrap(),
+            0,
+            "the WHERE selects only rows still misclassified, so a second run is a no-op"
+        );
     }
 
     /// A pairing code mints exactly one token and hands it over exactly once.
