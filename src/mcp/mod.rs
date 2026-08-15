@@ -40,6 +40,8 @@
 //! and add to it, and it may not manage the instance or drain it.
 
 pub mod dispatch;
+#[cfg(test)]
+mod drift;
 pub mod prompts;
 pub mod protocol;
 pub mod resources;
