@@ -32,6 +32,7 @@
 		{ href: '/loved', label: 'Loved', icon: 'loved' },
 		{ href: '/notes', label: 'Liner Notes', icon: 'notes' },
 		{ href: '/shelf', label: 'The Shelf', icon: 'shelf' },
+		{ href: '/crate', label: 'The Crate', icon: 'shelf' },
 		{ href: '/rediscover', label: 'Rediscovery', icon: 'rediscover' },
 		{ href: '/playlists/saved', label: 'Playlists', icon: 'playlists' },
 		{ href: '/playlists', label: 'Playlist Lab', icon: 'playlists' },

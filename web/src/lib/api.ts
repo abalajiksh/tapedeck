@@ -2008,6 +2008,17 @@ class TapedeckAPI {
 		await this.del(`/api/v1/saved-playlists/${id}`);
 	}
 	/** Send a stored playlist onward. A partial match is the normal outcome. */
+	// ── The Crate ──
+	async getCrate(): Promise<{ crate: CrateEntry[]; open: number; landed: number }> {
+		return this.get('/api/v1/crate');
+	}
+	async setCrateStatus(id: number, status: 'open' | 'acquired' | 'dismissed'): Promise<void> {
+		await this.patch(`/api/v1/crate/${id}`, { status });
+	}
+	async deleteCrateEntry(id: number): Promise<void> {
+		await this.del(`/api/v1/crate/${id}`);
+	}
+
 	async pushSavedPlaylist(id: number, sourceId: number): Promise<{
 		matched: number; requested: number; protocol: string;
 		missing: { title: string; artist: string }[];
@@ -2068,6 +2079,28 @@ export interface SavedPlaylist {
 	pushed_to: string | null;
 	connection_name: string | null;
 	tracks: number;
+}
+
+export interface CrateEntry {
+	id: number;
+	kind: 'artist' | 'album' | 'track';
+	artist: string;
+	/** Album or track title. Null for an artist. */
+	name: string | null;
+	mbid: string | null;
+	reason: string | null;
+	/** What in your own listening prompted the suggestion. Required at the door
+	 *  — a recommendation with no grounding in your history is not one. */
+	because: string | null;
+	/** `user`, or the name of the connection that suggested it. */
+	origin: string;
+	status: 'open' | 'acquired' | 'dismissed';
+	created_at: number;
+	acted_at: number | null;
+	/** When this first turned up in your listening. Derived from the history,
+	 *  not stored — it is the only way a suggestion can be scored. */
+	first_played_at: number | null;
+	plays: number;
 }
 
 export interface SavedTrack {

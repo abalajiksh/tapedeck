@@ -502,6 +502,41 @@ ListenBrainz if they are connected.",
             ),
         },
         ToolDef {
+            name: "crate",
+            title: "The crate",
+            description:
+                "What is already in their crate — records and artists somebody has suggested that they do not own. READ THIS BEFORE SUGGESTING ANYTHING, so you do not repeat a suggestion they have already been given or already dismissed. Each entry says who suggested it and whether it has since turned up in their listening.",
+            scope: scopes::LIBRARY_READ,
+            read_only: true,
+            schema: no_args(),
+        },
+        ToolDef {
+            name: "add_to_crate",
+            title: "Add to the crate",
+            description:
+                "Put a record, album or artist they do NOT own into their crate — the one place music outside their collection belongs. It is recorded as a suggestion with your name on it, on a page they visit deliberately; it never appears in their listening history or statistics.
+
+`because` is REQUIRED and must name something in THEIR OWN listening that prompted this — an artist they play, a genre in their map, a period in their history. A suggestion with no grounding in their history will be refused.
+
+Anything already in their history is also refused, with the play count: that is not a suggestion, it is rediscovery, and the `rediscovery` tool is what covers it. Call `crate` first to avoid repeating yourself.",
+            scope: scopes::CRATE_WRITE,
+            read_only: false,
+            schema: obj(
+                vec![
+                    ("kind", enum_arg("What is being suggested", &["artist", "album", "track"])),
+                    ("artist", str_arg("The artist's name")),
+                    ("name", str_arg("Album or track title. Omit for an artist.")),
+                    ("mbid", str_arg("MusicBrainz id, if you are confident of it")),
+                    ("reason", str_arg("Why they would like it, in your words")),
+                    (
+                        "because",
+                        str_arg("REQUIRED: what in their own listening prompted this"),
+                    ),
+                ],
+                &["kind", "artist", "because"],
+            ),
+        },
+        ToolDef {
             name: "write_note",
             title: "Write a liner note",
             description:
@@ -846,6 +881,22 @@ pub async fn call(
         "playlist_targets" => return playlist_targets(state, auth).await,
         "push_playlist" => return push_playlist(state, auth, args).await,
 
+        "crate" => {
+            let entries = state
+                .db
+                .list_crate(auth.user.user_id)
+                .await
+                .map_err(|e| ToolFailure::Execution(e.to_string()))?;
+            let landed = entries.iter().filter(|e| e.first_played_at.is_some()).count();
+            json!({
+                "crate": entries,
+                "landed": landed,
+                "note": "`first_played_at` is when this turned up in their listening — the only place a suggestion can be scored. Entries with a status of 'dismissed' were turned down; do not suggest those again.",
+            })
+        }
+
+        "add_to_crate" => return add_to_crate(state, auth, args).await,
+
         "set_love" => {
             let kind = require(args, "kind")?;
             let body = crate::server::notes::LoveRequest {
@@ -1091,6 +1142,64 @@ async fn push_playlist(
     Ok(ToolOutcome::new(result))
 }
 
+/// `add_to_crate` — the one tool that may name music the user does not own.
+///
+/// It shares `crate_shelf::file` with the HTTP endpoint rather than validating
+/// separately, so the two guards that make this safe — grounding required, and
+/// anything already in the history refused — cannot hold on one path and not
+/// the other.
+async fn add_to_crate(
+    state: &Arc<AppState>,
+    auth: &McpAuth,
+    args: &Value,
+) -> Result<ToolOutcome, ToolFailure> {
+    let rec = crate::db::NewRecommendation {
+        kind: require(args, "kind")?,
+        artist: require(args, "artist")?,
+        name: arg_str(args, "name"),
+        mbid: arg_str(args, "mbid"),
+        reason: arg_str(args, "reason"),
+        because: arg_str(args, "because"),
+    };
+
+    // The connection's own name is the origin, so the crate page can say which
+    // assistant suggested what — and, once enough of them have, which one was
+    // right. Same provenance rule notes and playlists follow.
+    let origin = state
+        .db
+        .list_mcp_connections(auth.user.user_id)
+        .await
+        .ok()
+        .and_then(|c| c.into_iter().find(|c| c.id == auth.connection_id).map(|c| c.name))
+        .unwrap_or_else(|| "MCP".to_string());
+
+    match crate::server::crate_shelf::file(
+        state,
+        auth.user.user_id,
+        &rec,
+        &origin,
+        Some(auth.connection_id),
+    )
+    .await
+    {
+        Ok((id, created)) => Ok(ToolOutcome {
+            value: json!({
+                "id": id,
+                "created": created,
+                "status": if created {
+                    "Added to their crate. It is a suggestion on a page they visit — it has not been added to their listening history and does not count as anything they own."
+                } else {
+                    "That was already in their crate; the reason has been updated rather than a second card created."
+                },
+            }),
+            rows: Some(1),
+        }),
+        Err(refusal) => {
+            Err(ToolFailure::Execution(refusal.message(&rec.artist, rec.name.as_deref())))
+        }
+    }
+}
+
 async fn write_note(
     state: &Arc<AppState>,
     auth: &McpAuth,
@@ -1193,7 +1302,7 @@ mod tests {
     fn read_grants_never_imply_write_grants() {
         let both = auth("listening:read library:read");
         let names: Vec<&str> = visible(&both).iter().map(|t| t.name).collect();
-        for writer in ["save_playlist", "push_playlist", "set_love", "write_note"] {
+        for writer in ["save_playlist", "push_playlist", "set_love", "write_note", "add_to_crate"] {
             assert!(!names.contains(&writer), "'{writer}' leaked into a read-only grant");
         }
     }
@@ -1211,14 +1320,34 @@ mod tests {
     fn the_write_tools_are_not_marked_read_only() {
         // `readOnlyHint` is what a client puts a confirmation prompt behind.
         for t in catalogue() {
-            let expected_write =
-                matches!(t.name, "save_playlist" | "push_playlist" | "set_love" | "write_note");
+            let expected_write = matches!(
+                t.name,
+                "save_playlist" | "push_playlist" | "set_love" | "write_note" | "add_to_crate"
+            );
             assert_eq!(
                 t.read_only, !expected_write,
                 "tool '{}' has the wrong readOnlyHint",
                 t.name
             );
         }
+    }
+
+    #[test]
+    fn the_crate_is_the_only_tool_that_may_name_unowned_music() {
+        // The vision rule survives as a boundary rather than a prohibition:
+        // exactly one tool writes music the user does not have, it needs its
+        // own grant, and it is not reachable from any read scope. If a second
+        // tool ever gains that power, this is the test that should have to
+        // change deliberately.
+        let writers: Vec<&str> =
+            catalogue().iter().filter(|t| t.scope == scopes::CRATE_WRITE).map(|t| t.name).collect();
+        assert_eq!(writers, vec!["add_to_crate"]);
+
+        // And reading the crate is a library read, not a crate grant — seeing
+        // what has been suggested must not require the power to suggest.
+        let reader = catalogue().into_iter().find(|t| t.name == "crate").unwrap();
+        assert_eq!(reader.scope, scopes::LIBRARY_READ);
+        assert!(reader.read_only);
     }
 
     #[test]

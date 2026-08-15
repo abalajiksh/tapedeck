@@ -1462,6 +1462,7 @@ impl Database {
 
         self.init_mcp().await?;
         self.init_saved_playlists().await?;
+        self.init_crate().await?;
 
         Ok(())
     }
@@ -1582,6 +1583,75 @@ impl Database {
                 created_at INTEGER NOT NULL,
                 expires_at INTEGER NOT NULL
             )",
+        )
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    /// The Crate — things somebody told you about that you do not own yet.
+    ///
+    /// **Tapedeck does not recommend. It records recommendations made to you.**
+    /// That distinction is the whole reason this table is allowed to exist next
+    /// to a vision rule that says nothing here points at music the user does
+    /// not have. The rule governs what Tapedeck *generates*; this stores what an
+    /// assistant, or later a person, said — the same relationship liner notes
+    /// have to the user's own writing.
+    ///
+    /// So the shape enforces two things. `origin` is general rather than
+    /// MCP-specific, because a tip from a friend in Phase 6 is the same row.
+    /// And `because` is not optional decoration: it is what in the user's own
+    /// history prompted the suggestion, which is the vision doc's pipeline —
+    /// analytics, then candidate selection, then explanation — held to at the
+    /// schema rather than in a prompt.
+    ///
+    /// `first_played_at` is deliberately **not** a column. It is derived from
+    /// the listens on read, for the reason chain hours and gear hours are: an
+    /// accumulator that nothing recomputes drifts from the thing it summarises,
+    /// and this codebase has now found that bug at three different levels.
+    async fn init_crate(&self) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS recommendations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL REFERENCES users(id),
+                kind TEXT NOT NULL CHECK (kind IN ('artist','album','track')),
+                artist TEXT NOT NULL,
+                -- The album or track title. Null for an artist, whose name is
+                -- already in `artist` — the same rule `entities` follows.
+                name TEXT,
+                mbid TEXT,
+                -- Why, in the recommender's own words.
+                reason TEXT,
+                -- What in *this user's* listening prompted it. Required by the
+                -- tool: a suggestion with no grounding is free association.
+                because TEXT,
+                -- 'user', or the name of the connection that wrote it.
+                origin TEXT NOT NULL DEFAULT 'user',
+                connection_id INTEGER REFERENCES mcp_connections(id),
+                status TEXT NOT NULL DEFAULT 'open'
+                    CHECK (status IN ('open','acquired','dismissed')),
+                created_at INTEGER NOT NULL,
+                acted_at INTEGER
+            )",
+        )
+        .execute(&self.pool)
+        .await?;
+
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_recommendations_user
+             ON recommendations(user_id, status, created_at DESC)",
+        )
+        .execute(&self.pool)
+        .await?;
+
+        // One row per thing, per user. A second assistant suggesting the same
+        // record should not produce a duplicate card — the interesting fact is
+        // that two of them did, which the UI can show from the audit trail
+        // rather than by stacking rows.
+        sqlx::query(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_recommendations_target
+             ON recommendations(user_id, kind, LOWER(TRIM(artist)), LOWER(TRIM(COALESCE(name,''))))",
         )
         .execute(&self.pool)
         .await?;
@@ -9045,6 +9115,8 @@ impl Database {
             // connection cannot go first.
             "mcp_audit",
             "playlists",
+            // References mcp_connections, so it clears before them.
+            "recommendations",
             "mcp_connections",
             "oauth_codes",
             // The shelf goes before `equipment` and `signal_chains`, which both
@@ -9757,6 +9829,208 @@ impl Database {
     }
 
     // ════════════════════════════════════════════════════════
+    //  The Crate
+    // ════════════════════════════════════════════════════════
+
+    /// Add something to the crate, or update what is already there.
+    ///
+    /// Returns whether the row was new. A second recommender naming the same
+    /// record updates the reason rather than stacking a duplicate card — the
+    /// unique index is on the *target*, not on who suggested it.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn add_recommendation(
+        &self,
+        user_id: i64,
+        rec: &NewRecommendation,
+        origin: &str,
+        connection_id: Option<i64>,
+    ) -> Result<(i64, bool), sqlx::Error> {
+        let now = Self::now_secs();
+        let existing: Option<(i64,)> = sqlx::query_as(
+            "SELECT id FROM recommendations
+             WHERE user_id = ? AND kind = ? AND LOWER(TRIM(artist)) = ?
+               AND LOWER(TRIM(COALESCE(name,''))) = ?",
+        )
+        .bind(user_id)
+        .bind(&rec.kind)
+        .bind(Self::artist_key(&rec.artist))
+        .bind(Self::artist_key(rec.name.as_deref().unwrap_or("")))
+        .fetch_optional(&self.pool)
+        .await?;
+
+        if let Some((id,)) = existing {
+            sqlx::query(
+                "UPDATE recommendations SET reason = ?, because = ?, origin = ?,
+                        connection_id = ?, mbid = COALESCE(?, mbid)
+                 WHERE id = ?",
+            )
+            .bind(&rec.reason)
+            .bind(&rec.because)
+            .bind(origin)
+            .bind(connection_id)
+            .bind(&rec.mbid)
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+            return Ok((id, false));
+        }
+
+        let row: (i64,) = sqlx::query_as(
+            "INSERT INTO recommendations
+                (user_id, kind, artist, name, mbid, reason, because, origin,
+                 connection_id, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
+        )
+        .bind(user_id)
+        .bind(&rec.kind)
+        .bind(&rec.artist)
+        .bind(&rec.name)
+        .bind(&rec.mbid)
+        .bind(&rec.reason)
+        .bind(&rec.because)
+        .bind(origin)
+        .bind(connection_id)
+        .bind(now)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok((row.0, true))
+    }
+
+    /// The crate, with each entry's first listen derived from the history.
+    ///
+    /// **The derivation is one bounded scan, not a subquery per row.** A
+    /// correlated subquery whose join key is `LOWER(TRIM(artist))` can never be
+    /// indexed, so it is a full scan *per crate entry* by construction — which
+    /// is exactly the quadratic that made Rediscovery take two minutes on the
+    /// real host. Here the crate's own artist keys are collected first and used
+    /// as an `IN` filter, so the history is walked once and returns only rows
+    /// that could possibly match.
+    pub async fn list_crate(&self, user_id: i64) -> Result<Vec<CrateEntry>, sqlx::Error> {
+        let rows: Vec<RecommendationRow> = sqlx::query_as(
+            "SELECT r.id, r.kind, r.artist, r.name, r.mbid, r.reason, r.because,
+                    r.origin, r.status, r.created_at, r.acted_at
+             FROM recommendations r
+             WHERE r.user_id = ? ORDER BY r.created_at DESC",
+        )
+        .bind(user_id)
+        .fetch_all(&self.pool)
+        .await?;
+
+        if rows.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let keys: Vec<String> = rows
+            .iter()
+            .map(|r| Self::artist_key(&r.artist))
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        let placeholders = vec!["?"; keys.len()].join(",");
+        let sql = format!(
+            "SELECT LOWER(TRIM(artist)) AS ak,
+                    LOWER(TRIM(COALESCE(album,''))) AS bk,
+                    LOWER(TRIM(title)) AS tk,
+                    MIN(timestamp) AS first_at,
+                    COUNT(*) AS plays
+             FROM scrobbles
+             WHERE user_id = ? AND skipped = FALSE AND LOWER(TRIM(artist)) IN ({placeholders})
+             GROUP BY ak, bk, tk"
+        );
+        let mut q = sqlx::query_as::<_, (String, String, String, i64, i64)>(&sql).bind(user_id);
+        for k in &keys {
+            q = q.bind(k);
+        }
+        let heard = q.fetch_all(&self.pool).await?;
+
+        let out = rows
+            .into_iter()
+            .map(|r| {
+                let ak = Self::artist_key(&r.artist);
+                let nk = Self::artist_key(r.name.as_deref().unwrap_or(""));
+                // Fold the track-level scan up to whatever granularity this
+                // entry is about.
+                let matches = heard.iter().filter(|(a, b, t, _, _)| {
+                    *a == ak
+                        && match r.kind.as_str() {
+                            "album" => *b == nk,
+                            "track" => *t == nk,
+                            _ => true,
+                        }
+                });
+                let mut first: Option<i64> = None;
+                let mut plays = 0i64;
+                for (_, _, _, at, n) in matches {
+                    first = Some(first.map_or(*at, |f: i64| f.min(*at)));
+                    plays += n;
+                }
+                CrateEntry { rec: r, first_played_at: first, plays }
+            })
+            .collect();
+        Ok(out)
+    }
+
+    /// Whether the user already has this, and how much. The guard that stops a
+    /// "recommendation" of a record with 43 plays — that is not a tip, it is
+    /// Rediscovery, and the tool says so rather than filing it.
+    pub async fn already_heard(
+        &self,
+        user_id: i64,
+        kind: &str,
+        artist: &str,
+        name: Option<&str>,
+    ) -> Result<i64, sqlx::Error> {
+        let ak = Self::artist_key(artist);
+        let nk = Self::artist_key(name.unwrap_or(""));
+        let sql = match kind {
+            "album" => {
+                "SELECT COUNT(*) FROM scrobbles WHERE user_id = ? AND skipped = FALSE \
+                        AND LOWER(TRIM(artist)) = ? AND LOWER(TRIM(COALESCE(album,''))) = ?"
+            }
+            "track" => {
+                "SELECT COUNT(*) FROM scrobbles WHERE user_id = ? AND skipped = FALSE \
+                        AND LOWER(TRIM(artist)) = ? AND LOWER(TRIM(title)) = ?"
+            }
+            _ => {
+                "SELECT COUNT(*) FROM scrobbles WHERE user_id = ? AND skipped = FALSE \
+                  AND LOWER(TRIM(artist)) = ?"
+            }
+        };
+        let mut q = sqlx::query_as::<_, (i64,)>(sql).bind(user_id).bind(&ak);
+        if kind == "album" || kind == "track" {
+            q = q.bind(&nk);
+        }
+        Ok(q.fetch_one(&self.pool).await?.0)
+    }
+
+    pub async fn set_recommendation_status(
+        &self,
+        user_id: i64,
+        id: i64,
+        status: &str,
+    ) -> Result<bool, sqlx::Error> {
+        let res = sqlx::query(
+            "UPDATE recommendations SET status = ?, acted_at = ? WHERE id = ? AND user_id = ?",
+        )
+        .bind(status)
+        .bind(Self::now_secs())
+        .bind(id)
+        .bind(user_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(res.rows_affected() > 0)
+    }
+
+    pub async fn delete_recommendation(&self, user_id: i64, id: i64) -> Result<bool, sqlx::Error> {
+        let res = sqlx::query("DELETE FROM recommendations WHERE id = ? AND user_id = ?")
+            .bind(id)
+            .bind(user_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(res.rows_affected() > 0)
+    }
+
+    // ════════════════════════════════════════════════════════
     //  Saved playlists
     // ════════════════════════════════════════════════════════
 
@@ -10310,6 +10584,51 @@ pub struct ListeningCoverage {
     pub with_duration: i64,
     pub with_chain: i64,
     pub with_quality: i64,
+}
+
+/// Something to put in the crate.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct NewRecommendation {
+    /// `artist`, `album` or `track`.
+    pub kind: String,
+    pub artist: String,
+    /// The album or track title. `None` for an artist.
+    pub name: Option<String>,
+    pub mbid: Option<String>,
+    pub reason: Option<String>,
+    /// What in the user's own listening prompted this.
+    pub because: Option<String>,
+}
+
+#[derive(Debug, FromRow, serde::Serialize)]
+pub struct RecommendationRow {
+    pub id: i64,
+    pub kind: String,
+    pub artist: String,
+    pub name: Option<String>,
+    pub mbid: Option<String>,
+    pub reason: Option<String>,
+    pub because: Option<String>,
+    /// `user`, or the name of the connection that suggested it.
+    pub origin: String,
+    pub status: String,
+    pub created_at: i64,
+    pub acted_at: Option<i64>,
+}
+
+/// A crate entry with the bit only Tapedeck can supply: whether the
+/// recommendation actually landed.
+///
+/// A recommendation is a *prediction*, and a scrobbler is the only thing in the
+/// room that can score it. `first_played_at` is derived from the listens rather
+/// than stored, so it cannot drift from them.
+#[derive(Debug, serde::Serialize)]
+pub struct CrateEntry {
+    #[serde(flatten)]
+    pub rec: RecommendationRow,
+    /// When this first turned up in the history, if it ever did.
+    pub first_played_at: Option<i64>,
+    pub plays: i64,
 }
 
 /// A freshly minted MCP credential. Plaintext, returned once, stored hashed.

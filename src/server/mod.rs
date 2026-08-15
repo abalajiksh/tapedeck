@@ -3,6 +3,7 @@ mod artwork;
 pub mod auth;
 pub mod chains;
 mod connections;
+pub mod crate_shelf;
 pub mod everynoise;
 mod export;
 pub mod import;
@@ -115,6 +116,7 @@ pub fn build_app(state: Arc<AppState>) -> Router {
         .merge(everynoise::create_everynoise_router())
         .merge(pairing::create_pairing_router())
         .merge(reports::create_reports_router())
+        .merge(crate_shelf::create_crate_router())
         .merge(mcp::create_mcp_router())
         .merge(oauth::create_oauth_router())
         // The spec describes *this* instance at *this* version — the one

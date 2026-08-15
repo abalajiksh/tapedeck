@@ -133,6 +133,25 @@ do not push it to a server unless I ask."
             },
         },
         PromptDef {
+            name: "what_should_i_look_into",
+            title: "What should I look into?",
+            description:
+                "Music I don't own yet, grounded in what I actually listen to, saved to my crate.",
+            scope: scopes::CRATE_WRITE,
+            args: &[("angle", "Anything to steer it — a mood, a decade, an artist", false)],
+            body: |a| {
+                let angle = arg(a, "angle", "");
+                let line = if angle.is_empty() {
+                    String::new()
+                } else {
+                    format!(" Steer it towards: {angle}.")
+                };
+                format!(
+                    "Suggest some music I do not own yet.{line}\n\nGround it in my actual listening first — `listening_profile`, then `top_charts` and `genre_neighbours`, whose `unexplored` list is bordering territory I own nothing in. Read `crate` before you suggest anything, so you do not repeat something I have already been given or already turned down.\n\nFor each one, call `add_to_crate` with a `reason` and a `because`. The `because` must name something in MY history — an artist I play, a genre I sit next to, a period of my listening. Anything I already own will be refused, which is correct: that is rediscovery, not a suggestion.\n\nFive or six at most, each one distinct. I would rather have a few I will actually chase than a list I skim."
+                )
+            },
+        },
+        PromptDef {
             name: "how_am_i_listening",
             title: "How am I listening?",
             description: "The gear side: chains, hours, what is wearing out, and what I have \

@@ -26,7 +26,7 @@ openapi: 3.1.0
 
 info:
   title: Tapedeck
-  version: 0.63.5
+  version: 0.64.0
   summary: Self-hosted scrobbler and listening journal.
   description: |
     Tapedeck ingests listens, enriches them with MusicBrainz metadata, stores
@@ -180,6 +180,17 @@ tags:
     description: |
       Playlists that live in Tapedeck, reviewed before they reach a media
       server, plus the direct push that has always existed.
+  - name: Crate
+    description: |
+      Records and artists somebody suggested that you do not own — the one place
+      in Tapedeck that names music outside the collection.
+
+      **Tapedeck does not recommend; it records recommendations made to you.**
+      The vision rule governs what Tapedeck *generates* (Rediscovery is built
+      entirely from your own history and stays that way); this stores what an
+      assistant said, the way notes store what you wrote. It is its own table,
+      its own endpoints and its own page, and never appears in a history or
+      statistics readout.
   - name: Ops
     description: Health, metrics, log level.
 
@@ -678,6 +689,45 @@ components:
         pushed_to: { type: [string, 'null'] }
         connection_name: { type: [string, 'null'] }
         tracks: { type: integer }
+
+    NewCrateEntry:
+      type: object
+      required: [kind, artist, because]
+      properties:
+        kind: { type: string, enum: [artist, album, track] }
+        artist: { type: string }
+        name: { type: [string, 'null'], description: 'Album or track title. Omitted for an artist, whose name is already in `artist`.' }
+        mbid: { type: [string, 'null'] }
+        reason: { type: [string, 'null'], description: Why you would like it, in the suggester's words. }
+        because:
+          type: string
+          description: |
+            **Required.** What in *your own* listening prompted the suggestion.
+            A recommendation with no grounding in the history is free
+            association, and is refused.
+
+    CrateEntry:
+      type: object
+      properties:
+        id: { type: integer }
+        kind: { type: string, enum: [artist, album, track] }
+        artist: { type: string }
+        name: { type: [string, 'null'] }
+        mbid: { type: [string, 'null'] }
+        reason: { type: [string, 'null'] }
+        because: { type: [string, 'null'] }
+        origin: { type: string, description: '`user`, or the name of the connection that suggested it.' }
+        status: { type: string, enum: [open, acquired, dismissed] }
+        created_at: { type: integer }
+        acted_at: { type: [integer, 'null'] }
+        first_played_at:
+          type: [integer, 'null']
+          description: |
+            When this first turned up in the listening history, if it ever did.
+            **Derived from the listens, not stored** — the same rule chain and
+            gear hours follow, because an accumulator nothing recomputes drifts
+            from what it summarises.
+        plays: { type: integer }
 
     SavedPlaylistTrack:
       type: object
@@ -5422,3 +5472,93 @@ paths:
         '401': { $ref: '#/components/responses/Unauthorized' }
         '404': { description: No such playlist, or none of the tracks are on that server. }
         '502': { description: The server could not be reached, or refused the playlist. }
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # The Crate
+  # ───────────────────────────────────────────────────────────────────────────
+
+  /api/v1/crate:
+    get:
+      tags: [Crate]
+      summary: Things somebody suggested that you do not own.
+      description: |
+        Session-only. Each entry carries **`first_played_at`**, derived from the
+        listens rather than stored — whether the suggestion actually landed.
+        That is the thing only a scrobbler can answer, and it is what makes this
+        more than a wantlist: a recommendation is a prediction, and Tapedeck is
+        the only party that can score it.
+
+        `landed` counts how many entries have since turned up in the history.
+      responses:
+        '200':
+          description: The crate.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  open: { type: integer }
+                  landed: { type: integer, description: How many suggestions were actually played. }
+                  crate:
+                    type: array
+                    items: { $ref: '#/components/schemas/CrateEntry' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+    post:
+      tags: [Crate]
+      summary: Add something to the crate.
+      description: |
+        Session-only for this endpoint; an assistant uses the MCP `add_to_crate`
+        tool, which shares the same validation.
+
+        Two refusals, both deliberate. **`because` is required** — what in your
+        own listening prompted this — which is the vision doc's pipeline
+        (analytics, candidate selection, explanation) enforced at the door
+        rather than asked for in a prompt. And **anything already in the
+        history is refused with its play count**: that is not a suggestion, it
+        is rediscovery, and letting it through would turn the crate into a
+        worse copy of a screen that already exists.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/NewCrateEntry' }
+      responses:
+        '200':
+          description: Filed. `created` is false when it was already there and the reason was updated.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties: { id: { type: integer }, created: { type: boolean } }
+        '400': { description: 'Missing grounding, malformed, or already in the history.' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /api/v1/crate/{id}:
+    patch:
+      tags: [Crate]
+      summary: Mark an entry acquired, dismissed, or open again.
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: integer } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [status]
+              properties:
+                status: { type: string, enum: [open, acquired, dismissed] }
+      responses:
+        '200': { description: Updated., content: { application/json: { schema: { $ref: '#/components/schemas/Ok' } } } }
+        '400': { description: Unknown status. }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { description: No such entry. }
+    delete:
+      tags: [Crate]
+      summary: Remove an entry.
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: integer } }
+      responses:
+        '200': { description: Removed., content: { application/json: { schema: { $ref: '#/components/schemas/Ok' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { description: No such entry. }

@@ -76,6 +76,7 @@ pub mod scopes {
     pub const PLAYLISTS_PUSH: &str = "playlists:push";
     pub const LOVES_WRITE: &str = "loves:write";
     pub const NOTES_WRITE: &str = "notes:write";
+    pub const CRATE_WRITE: &str = "crate:write";
 
     /// Every grant, with the sentence the consent screen shows for it. Written
     /// from the user's side of the transaction — what the connection will be
@@ -87,6 +88,7 @@ pub mod scopes {
         (PLAYLISTS_PUSH, "Send playlists straight to your media server"),
         (LOVES_WRITE, "Love and unlove tracks, albums and artists"),
         (NOTES_WRITE, "Write liner notes, marked as written by this connection"),
+        (CRATE_WRITE, "Add records and artists to your crate for you to look into"),
     ];
 
     /// What a connection gets when nothing is chosen: read the listening, and
@@ -147,10 +149,14 @@ not about the listening. Say the population or do not say the number.\n\
 3. SKIPS ARE STORED BUT NEVER COUNTED. Every listen figure already excludes \
 them. Do not add them back in.\n\
 \n\
-4. DO NOT RECOMMEND MUSIC THEY DO NOT HAVE. This is a journal of a collection, \
-not a shop. Build playlists and suggestions from their own history and shelf. \
-Where a tool returns names from an outside source — `genre_neighbours` labels \
-these `exemplar_artists` — say plainly that those are not theirs.\n\
+4. MUSIC THEY DO NOT OWN GOES IN THE CRATE AND NOWHERE ELSE. Playlists, \
+answers about their listening, and anything you present as *theirs* must come \
+from their own history — this is a journal of a collection, not a shop. If you \
+want to suggest something they do not have, that is what `add_to_crate` is for: \
+it is recorded as a suggestion, with your name on it, on a page they visit \
+deliberately. Never pad an answer about their listening with things they do not \
+have, and where a tool returns names from an outside source — `genre_neighbours` \
+labels these `exemplar_artists` — say plainly that those are not theirs.\n\
 \n\
 5. GENRE POSITIONS ARE ARTIST-LEVEL. Genres attach to artists, so every track by \
 one artist sits at exactly the same point on the map and in the playlist space. \
