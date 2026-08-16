@@ -29,12 +29,36 @@ use crate::models::{AudioQuality, Play};
 /// fooyin drew a confident and completely wrong position. The registry still
 /// counts an unknown position forward — that is what expires the entry — but it
 /// says so, and the deck draws it as an estimate rather than a measurement.
+/// A third state exists because "measured" and "measured *just now*" are not the
+/// same claim, and only one of them may overrule our own arithmetic.
+///
+/// Every **polled** source reports what its player last uploaded on the player's
+/// own cadence, so its number is a few seconds behind the music through no
+/// fault of anyone's — that lag is what `MAX_PLAYHEAD_LAG_SECS` exists to
+/// absorb. A **pushing** client sends the playhead at the moment it was true,
+/// so it has no lag to absorb and the guard could only ever suppress a genuine
+/// seek. A measurement taken now beats arithmetic; a measurement taken at an
+/// unknown moment in the last few seconds does not.
 #[derive(Clone, Copy, Debug)]
 pub enum Progress {
-    /// Seconds in, from something that can see the playhead.
-    Known(u64),
+    /// Seconds in, measured by the player and pushed the instant it was true.
+    /// Believed outright, backwards steps included — a client that says the
+    /// listener seeked back really is the authority on that.
+    Exact(u64),
+    /// Seconds in as of whenever this source last heard from its player. True
+    /// of every polled source.
+    Reported(u64),
     /// No playhead exists for this source. The number is our own arithmetic.
     Unknown,
+}
+
+impl Progress {
+    fn seconds(self) -> u64 {
+        match self {
+            Progress::Exact(p) | Progress::Reported(p) => p,
+            Progress::Unknown => 0,
+        }
+    }
 }
 
 /// Nothing here is persisted: "now playing" is live state, so a restart
@@ -53,6 +77,23 @@ pub struct NowPlaying {
     /// playhead — see `Progress`. The deck reads this to decide whether it is
     /// showing a position or a guess.
     pub position_known: bool,
+    /// Whether the playhead was measured at the instant it was sent, and may
+    /// therefore overrule our own extrapolation in either direction. Internal
+    /// staleness policy rather than anything about the listen, so it stays off
+    /// the wire: the deck already distinguishes a measurement from a guess with
+    /// `position_known`, and both kinds of measurement draw the same.
+    #[serde(skip)]
+    pub position_exact: bool,
+    /// The listener has paused. Only a pushing client can know this — a poll
+    /// that simply stops arriving is indistinguishable from a client that
+    /// crashed — so it is false for every polled source.
+    ///
+    /// Load-bearing rather than decorative: `position_at` counts forward from
+    /// `updated_at`, so without this a paused track's position runs away while
+    /// `position_known` asserts it is a measurement. That is the "confident and
+    /// completely wrong position" this type was introduced to stop, made worse
+    /// by now being stated with confidence.
+    pub paused: bool,
     pub updated_at: i64,
     /// Which source reported this — also the key the pipeline clears by.
     pub source: String,
@@ -80,11 +121,10 @@ impl NowPlaying {
             artist: play.artist.clone(),
             album: play.album.clone(),
             duration: play.duration,
-            progress: match progress {
-                Progress::Known(p) => p,
-                Progress::Unknown => 0,
-            },
-            position_known: matches!(progress, Progress::Known(_)),
+            progress: progress.seconds(),
+            position_known: !matches!(progress, Progress::Unknown),
+            position_exact: matches!(progress, Progress::Exact(_)),
+            paused: false,
             updated_at: now_secs(),
             source: source.to_string(),
             listening_context: None,
@@ -100,7 +140,14 @@ impl NowPlaying {
     }
 
     /// Where playback would be by `now`, assuming it kept running.
+    ///
+    /// A paused track is not running, so it stays exactly where it was told to
+    /// stop. Counting a pause forward is what made a paused deck drift to the
+    /// end of a track nobody was playing.
     fn position_at(&self, now: i64) -> u64 {
+        if self.paused {
+            return self.progress;
+        }
         self.progress + (now - self.updated_at).max(0) as u64
     }
 
@@ -109,9 +156,14 @@ impl NowPlaying {
     /// sends `playing_now` once at track start. So expire by *running off the
     /// end of the track* when we know its length, and fall back to a flat
     /// timeout when we don't.
+    ///
+    /// A paused entry can never run off the end — that is the whole point of
+    /// `position_at` holding it still — so it takes the flat timeout too.
+    /// Otherwise a client that paused once and then went away would leave the
+    /// deck asserting a paused record forever.
     fn is_live(&self, now: i64) -> bool {
         match self.duration {
-            Some(d) if d > 0 => self.position_at(now) < d + 10,
+            Some(d) if d > 0 && !self.paused => self.position_at(now) < d + 10,
             _ => now - self.updated_at < 600,
         }
     }
@@ -168,7 +220,14 @@ impl NowPlayingRegistry {
         // than the music having moved, and we hold our own count. A step bigger
         // than the lag is a real seek or a restart and is believed — which is
         // also what keeps a track put on repeat from being pinned at the end.
-        if !changed {
+        //
+        // None of that applies to a client that measured the playhead at the
+        // moment it sent it. It has no upload cadence to lag behind, so a
+        // backward step from one is the listener seeking and nothing else —
+        // holding our own count there would suppress the very thing the client
+        // is better placed than us to know. A measurement taken now beats
+        // arithmetic; see `Progress`.
+        if !changed && !np.position_exact {
             if let Some(prev) = previous {
                 let ours = prev.position_at(np.updated_at);
                 if np.progress < ours && ours - np.progress <= MAX_PLAYHEAD_LAG_SECS {
@@ -260,6 +319,11 @@ mod tests {
             duration: Some(300),
             progress: 0,
             position_known: true,
+            // The polled shape, which is what these tests are about — a report
+            // that may lag. `position_exact` is set per-test where a pushing
+            // client is what is being exercised.
+            position_exact: false,
+            paused: false,
             updated_at: now_secs(),
             source: source.into(),
             listening_context: None,
@@ -374,8 +438,80 @@ mod tests {
         assert!(!guessed.position_known);
         assert_eq!(guessed.progress, 0);
 
-        let measured = NowPlaying::from_play(&play, "Plex", None, Progress::Known(44));
+        let measured = NowPlaying::from_play(&play, "Plex", None, Progress::Reported(44));
         assert!(measured.position_known);
         assert_eq!(measured.progress, 44);
+
+        // Both kinds of measurement are a measurement to the deck; the
+        // difference between them is only about whose number wins a
+        // disagreement, which is `set`'s business and not the browser's.
+        let pushed = NowPlaying::from_play(&play, "ingest", None, Progress::Exact(44));
+        assert!(pushed.position_known);
+        assert!(pushed.position_exact);
+        assert!(!measured.position_exact);
+    }
+
+    /// The other side of `a_lagging_report_does_not_drag_the_playhead_backwards`,
+    /// and the reason `Progress` grew a third state. That guard absorbs the
+    /// upload lag a *polled* source cannot help; a client that measured the
+    /// playhead at the instant it sent it has no such lag, so the same backward
+    /// step is the listener seeking and must be believed. Suppressing it would
+    /// have the server overrule the only party that can actually see the player.
+    #[test]
+    fn a_pushed_playhead_outranks_our_own_arithmetic_in_both_directions() {
+        let reg = NowPlayingRegistry::default();
+
+        let mut first = np("Xtal", "ingest");
+        first.progress = 100;
+        first.position_exact = true;
+        reg.set(1, first);
+
+        // Five seconds back — well inside MAX_PLAYHEAD_LAG_SECS, so a polled
+        // source would have this held at 100.
+        let mut seeked = np("Xtal", "ingest");
+        seeked.progress = 95;
+        seeked.position_exact = true;
+        reg.set(1, seeked);
+
+        let (_, position) = reg.get(1).expect("still playing");
+        assert!(position < 100, "a measured seek was suppressed as lag: {position}");
+    }
+
+    /// A paused track stays where it stopped. Without this the position counts
+    /// forward from `updated_at` regardless, so a paused deck walks to the end
+    /// of a record nobody is playing — while `position_known` asserts the whole
+    /// way that it is a measurement rather than a guess.
+    #[test]
+    fn a_paused_deck_does_not_run_away() {
+        let reg = NowPlayingRegistry::default();
+
+        let mut paused = np("Xtal", "ingest");
+        paused.progress = 90;
+        paused.paused = true;
+        paused.position_exact = true;
+        // Reported a minute ago and not heard from since.
+        paused.updated_at = now_secs() - 60;
+        reg.set(1, paused);
+
+        let (track, position) = reg.get(1).expect("a paused record is still on the deck");
+        assert!(track.paused);
+        assert_eq!(position, 90, "a pause counted forward to {position}");
+    }
+
+    /// …but not forever. `is_live` expires an entry by running it past the end
+    /// of the track, and a paused entry never gets there — so without the flat
+    /// timeout a client that paused once and then went away would leave the deck
+    /// asserting a paused record indefinitely.
+    #[test]
+    fn a_pause_nobody_ever_resumed_still_expires() {
+        let reg = NowPlayingRegistry::default();
+
+        let mut abandoned = np("Xtal", "ingest");
+        abandoned.progress = 30;
+        abandoned.paused = true;
+        abandoned.updated_at = now_secs() - 601;
+        reg.set(1, abandoned);
+
+        assert!(reg.get(1).is_none(), "a pause held the deck past its timeout");
     }
 }

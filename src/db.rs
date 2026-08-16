@@ -59,6 +59,14 @@ pub struct ScrobbleRecord {
     pub track_number: Option<i32>,
     pub artwork_url: Option<String>,
     pub source_ref: Option<i64>,
+    /// How much of the track was actually heard, in milliseconds, paused time
+    /// excluded. Only a pushing client can report this, so it is null for
+    /// everything polled and everything imported.
+    pub listened_ms: Option<i64>,
+    /// Whether shuffle chose this track rather than the listener.
+    pub is_shuffle: Option<bool>,
+    /// What it was played from, in the client's own words.
+    pub queue_source: Option<String>,
     #[serde(default)]
     pub delivered_sinks: Option<String>,
 }
@@ -758,6 +766,9 @@ impl Database {
                 artwork_url TEXT,
                 source_ref INTEGER,
                 spotify_track_id TEXT,
+                listened_ms INTEGER,
+                is_shuffle BOOLEAN,
+                queue_source TEXT,
                 UNIQUE(user_id, source_id, source_name)
             )",
         )
@@ -2430,6 +2441,37 @@ impl Database {
             .await;
         }
 
+        // Migration: what a pushing client can say about *how* a track played.
+        //
+        // `listened_ms` is what makes `skipped` mean anything. The flag has
+        // existed since Phase 2 and could only ever say *that* a track was cut
+        // short, never how far in — so "skipped three seconds in" and "skipped
+        // with thirty seconds left" were stored identically, and those are
+        // opposite behaviours.
+        //
+        // `is_shuffle` and `queue_source` are the surviving half of
+        // `TapedeckSession`, which was deserialised on every submission and read
+        // by nothing. They answer what did I put on deliberately versus what did
+        // shuffle hand me, which no other column in this schema can.
+        //
+        // All three are nullable with no default, and that is the honest shape:
+        // nothing before this release recorded them, and no source but a pushing
+        // client can. A zero would read as "heard none of it".
+        //
+        // Deliberately **not indexed**. Nothing queries by them yet, and this
+        // app's reads are whole-history aggregations on slow sequential storage
+        // where an index that only supplies a grouping key measured as a net
+        // loss (v0.59.0). Also note there is no index on them in `init()`, which
+        // is the ordering trap that crash-looped v0.61.0.
+        if !has_column(&self.pool, "scrobbles", "listened_ms").await {
+            info!("⚙️ Migrating: recording how much of a track was actually heard...");
+            for col in &["listened_ms INTEGER", "is_shuffle BOOLEAN", "queue_source TEXT"] {
+                let _ = sqlx::query(&format!("ALTER TABLE scrobbles ADD COLUMN {col}"))
+                    .execute(&self.pool)
+                    .await;
+            }
+        }
+
         Ok(())
     }
 
@@ -2716,6 +2758,57 @@ impl Database {
         self.link_scrobble_artists(user_id, &play.source_id, &play.source_name, play).await?;
 
         Ok(true)
+    }
+
+    /// Record what a pushing client observed about how the track played.
+    ///
+    /// A follow-up write rather than three more arguments on `save_scrobble`,
+    /// and both halves of that are deliberate.
+    ///
+    /// `save_scrobble` has 53 call sites. Threading positional `Option`s
+    /// through all of them is the edit this codebase has already got wrong
+    /// once — a variant id landed in `source_ref`'s slot, compiled cleanly
+    /// because both are `Option<i64>`, and silently did nothing. Three more
+    /// nullable parameters of three different types is the same trap with more
+    /// surface.
+    ///
+    /// The usual objection to insert-then-update is the one `physical.rs` hit:
+    /// a row that is briefly `'pending'` can be caught mid-flight by a flush
+    /// tick and forwarded. That objection does not reach here, and the reason
+    /// is exactly why these fields live apart from [`ListenDisposition`] —
+    /// nothing reads them, nothing forwards on them, and no tick is racing for
+    /// them. They are a note about the listen, not a decision about it.
+    ///
+    /// Keyed on `(user_id, source_id, source_name)`, the unique key
+    /// `link_scrobble_artists` already uses, rather than a
+    /// `last_insert_rowid()`.
+    pub async fn set_listen_playback(
+        &self,
+        user_id: i64,
+        source_id: &str,
+        source_name: &str,
+        report: &PlaybackReport,
+    ) -> Result<(), sqlx::Error> {
+        if report.is_empty() {
+            return Ok(());
+        }
+        // COALESCE so a client that sends one field does not blank the others.
+        sqlx::query(
+            "UPDATE scrobbles SET
+                listened_ms  = COALESCE(?, listened_ms),
+                is_shuffle   = COALESCE(?, is_shuffle),
+                queue_source = COALESCE(?, queue_source)
+             WHERE user_id = ? AND source_id = ? AND source_name = ?",
+        )
+        .bind(report.listened_ms)
+        .bind(report.is_shuffle)
+        .bind(report.queue_source.as_deref())
+        .bind(user_id)
+        .bind(source_id)
+        .bind(source_name)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
     }
 
     /// Record every artist credited on a listen, primary first.
@@ -10793,6 +10886,24 @@ impl TokenAuth {
             .split(|c: char| c == ',' || c.is_whitespace())
             .any(|s| s.trim() == want || s.trim() == "all")
     }
+
+    /// Every grant this token actually carries, `all` expanded.
+    ///
+    /// Backs the introspection on `/1/validate-token`, so that a client can
+    /// show its user what their token may do instead of finding out from a 403
+    /// mid-use.
+    ///
+    /// Derived by asking `has_scope` rather than by parsing `scopes` a second
+    /// time, and that is the whole point of it being here: a hand-written
+    /// expansion would be a second answer to "what does this token grant",
+    /// free to drift from the one the extractors enforce. Reporting `write` to
+    /// a client that is then refused it is worse than reporting nothing.
+    pub fn granted_scopes(&self) -> Vec<&'static str> {
+        Self::SCOPES.iter().copied().filter(|s| self.has_scope(s)).collect()
+    }
+
+    /// The grants that exist. `all` is a wildcard over these, not one of them.
+    const SCOPES: [&'static str; 3] = ["submit", "read", "write"];
 }
 
 #[derive(Debug, FromRow, serde::Serialize)]
@@ -13641,6 +13752,142 @@ mod tests {
             .unwrap()
             .expect("the record");
         assert_eq!(album.plays, 3);
+    }
+
+    /// What a pushing client observed survives the round trip and reaches the
+    /// wire, and a client that says nothing costs nothing.
+    ///
+    /// The reaching-the-wire half is the one worth pinning. These columns are
+    /// only useful if they come back out, and `ScrobbleRecord` is what
+    /// `/api/v1/scrobbles` serialises — a column added to the table but not to
+    /// that struct is written, stored, and invisible forever, with nothing
+    /// erroring to say so.
+    #[tokio::test]
+    async fn what_a_client_saw_of_the_playing_round_trips() {
+        let db = testdb().await;
+        let p = play("Xtal", "Aphex Twin", 1_700_000_000);
+        assert!(db
+            .save_scrobble(1, &p, None, None, None, None, None, None, None, ListenDisposition::LIVE)
+            .await
+            .unwrap());
+
+        // A listen nobody reported this about stays null — not zero, which
+        // would read as "heard none of it".
+        let before = db.get_recent_scrobbles(1, 10, 0, None, None, None, None, None).await.unwrap();
+        assert_eq!(before[0].listened_ms, None);
+        assert_eq!(before[0].is_shuffle, None);
+        assert_eq!(before[0].queue_source, None);
+
+        db.set_listen_playback(
+            1,
+            &p.source_id,
+            &p.source_name,
+            &PlaybackReport {
+                listened_ms: Some(3200),
+                is_shuffle: Some(true),
+                queue_source: Some("Late night".into()),
+            },
+        )
+        .await
+        .unwrap();
+
+        let after = db.get_recent_scrobbles(1, 10, 0, None, None, None, None, None).await.unwrap();
+        assert_eq!(after[0].listened_ms, Some(3200));
+        assert_eq!(after[0].is_shuffle, Some(true));
+        assert_eq!(after[0].queue_source.as_deref(), Some("Late night"));
+
+        // A later report naming one field must not blank the other two —
+        // that is what the COALESCE is for.
+        db.set_listen_playback(
+            1,
+            &p.source_id,
+            &p.source_name,
+            &PlaybackReport { listened_ms: Some(9000), ..Default::default() },
+        )
+        .await
+        .unwrap();
+        let again = db.get_recent_scrobbles(1, 10, 0, None, None, None, None, None).await.unwrap();
+        assert_eq!(again[0].listened_ms, Some(9000));
+        assert_eq!(
+            again[0].queue_source.as_deref(),
+            Some("Late night"),
+            "a partial report blanked the rest"
+        );
+
+        // An empty report issues no statement at all, which is what keeps this
+        // free for every client that reports none of it.
+        db.set_listen_playback(1, &p.source_id, &p.source_name, &PlaybackReport::default())
+            .await
+            .unwrap();
+    }
+
+    /// The same check `an_existing_database_opens_and_gains_period_notes`
+    /// exists for, aimed at the three columns this release adds. Every other
+    /// test here starts from an empty file and therefore never runs `migrate()`
+    /// against a real prior schema, which is exactly how a migration that
+    /// cannot run on an existing database passes the whole suite.
+    #[tokio::test]
+    async fn an_existing_database_gains_the_playback_columns() {
+        let n = N.fetch_add(1, Ordering::SeqCst);
+        let path = std::env::temp_dir().join(format!("td-oldplay-{}-{}.db", std::process::id(), n));
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{}", path.display(), suffix));
+        }
+
+        // A `scrobbles` table with a listen in it and none of the new columns.
+        {
+            let pool = sqlx::SqlitePool::connect(&format!("sqlite:{}?mode=rwc", path.display()))
+                .await
+                .unwrap();
+            for ddl in [
+                // The v0.65 shape, minus only the three columns this release
+                // adds. Everything `migrate()` fills in on its own is left out
+                // so those paths run too.
+                "CREATE TABLE scrobbles (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER,
+                     title TEXT NOT NULL, artist TEXT NOT NULL, artist_credit TEXT,
+                     album TEXT, timestamp INTEGER NOT NULL, duration INTEGER,
+                     source_id TEXT NOT NULL, source_name TEXT NOT NULL,
+                     status TEXT NOT NULL DEFAULT 'pending',
+                     skipped BOOLEAN NOT NULL DEFAULT FALSE,
+                     caa_id INTEGER, caa_release_mbid TEXT,
+                     language TEXT, genres TEXT, release_year INTEGER,
+                     artwork_url TEXT, source_ref INTEGER, spotify_track_id TEXT,
+                     container TEXT, source_quality TEXT,
+                     dsd_to_pcm_converted BOOLEAN,
+                     delivery_sample_rate INTEGER, delivery_bit_depth INTEGER,
+                     chain_variant_id INTEGER,
+                     UNIQUE(user_id, source_id, source_name))",
+                "INSERT INTO scrobbles (user_id, title, artist, timestamp, source_id, source_name)
+                     VALUES (1, 'Xtal', 'Aphex Twin', 1700000000, 'old-1', 'test')",
+            ] {
+                sqlx::query(ddl).execute(&pool).await.unwrap();
+            }
+            pool.close().await;
+        }
+
+        let db =
+            Database::new(&format!("sqlite:{}", path.display()), Arc::new(SecretBox::test_key()))
+                .await
+                .expect("an existing database must open");
+
+        // The listen that was already there is untouched and readable — which
+        // also proves `SELECT *` still maps onto `ScrobbleRecord`.
+        let rows = db.get_recent_scrobbles(1, 10, 0, None, None, None, None, None).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].title, "Xtal");
+        assert_eq!(rows[0].listened_ms, None, "an old listen cannot have reported this");
+
+        // And the columns the migration was for actually work afterwards.
+        db.set_listen_playback(
+            1,
+            "old-1",
+            "test",
+            &PlaybackReport { listened_ms: Some(1500), ..Default::default() },
+        )
+        .await
+        .unwrap();
+        let rows = db.get_recent_scrobbles(1, 10, 0, None, None, None, None, None).await.unwrap();
+        assert_eq!(rows[0].listened_ms, Some(1500));
     }
 
     /// Opening a database that an *older* Tapedeck wrote.

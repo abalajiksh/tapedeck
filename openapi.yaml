@@ -26,7 +26,7 @@ openapi: 3.1.0
 
 info:
   title: Tapedeck
-  version: 0.65.0
+  version: 0.66.0
   summary: Self-hosted scrobbler and listening journal.
   description: |
     Tapedeck ingests listens, enriches them with MusicBrainz metadata, stores
@@ -305,78 +305,117 @@ components:
         success: { type: boolean }
         message: { type: string }
 
-    AudioQuality:
+    TapedeckAudio:
       type: object
       description: |
-        How the audio actually sounded. Every field is optional because most
-        sources report none of it — a plugin or a Jellyfin session reports the
-        most, a bare scrobble client none.
+        How the audio actually sounded, as a **submitting client** reports it in
+        `additional_info.tapedeck_audio`. Every field is optional; a plugin that
+        can see its decoder reports most, a bare scrobble client none.
+
+        This is the write-side shape. A stored listen carries the same
+        information **flat** on the `Listen` object rather than nested — see
+        there.
       properties:
-        format: { type: string, description: 'Container/codec, e.g. FLAC, MP3, DSD.' }
+        format_type:
+          type: string
+          description: '`pcm`, `dsd`, or `mqa`. Not the codec.'
+        codec:
+          type: string
+          description: |
+            The codec as your decoder names it — `flac`, `mp3`, `dsd_lsbf_planar`.
+            Tapedeck matches DSD and PCM by **prefix**, so ffmpeg's per-ordering
+            and per-sample-format spellings all classify correctly.
         bitrate: { type: integer, description: kbps. }
         sample_rate: { type: integer, description: Hz. }
         bit_depth: { type: integer }
         channels: { type: integer }
-        lossless: { type: boolean }
-        dsd_rate: { type: integer }
-        dsd_multiplier: { type: string }
+        container: { type: string, description: 'The file container, e.g. `ogg`, `m4a`.' }
+        is_lossless: { type: boolean }
+        source_quality:
+          type: string
+          description: What the source claims to be, where that differs from what was measured.
+        dsd_rate: { type: integer, description: Hz. }
+        dsd_multiplier:
+          type: integer
+          description: |
+            64, 128, 256… Derived from `dsd_rate` when absent, and left unset
+            rather than guessed when the rate is not a real DSD multiple.
         dsd_to_pcm_converted:
           type: boolean
           description: |
-            Derived from the signal chain, not from telemetry. SACD's DSD layer
-            cannot leave a player over coax or optical, so nothing will ever
-            report this directly.
+            Usually derived from the signal chain rather than reported. SACD's
+            DSD layer cannot leave a player over coax or optical, so nothing
+            downstream will ever tell you this directly.
+        is_transcoded: { type: boolean }
         delivery_codec:
           type: string
           description: |
-            Set **only** when the audio was genuinely transcoded. `DirectStream`
-            remuxes the container without touching the audio and is not a
-            transcode; nor is a video transcode that left the audio alone.
-            Scoring docks points whenever this is set, so filling it on a direct
-            play quietly penalises the best listens on the system.
+            Set **only** when the audio was genuinely transcoded. Remuxing a
+            container without touching the audio is not a transcode, nor is a
+            video transcode that left the audio alone. Scoring docks points
+            whenever this is set, so filling it on a direct play quietly
+            penalises the best listens on the system.
         delivery_bitrate: { type: integer, description: kbps. }
+        delivery_sample_rate: { type: integer, description: Hz. }
+        delivery_bit_depth: { type: integer }
         transcode_reason: { type: string }
 
     Listen:
       type: object
       description: |
-        A stored listen. Tier 1 — these properties are derived from the
-        handler. Extra keys may appear; ignore what you do not know.
+        A stored listen, exactly as `ScrobbleRecord` serialises it. The quality
+        columns are **flat**, not nested under a `quality` object — the frontend
+        reads them raw so its own `qualityLabel()` produces the same tag
+        everywhere, and a server-side copy of that logic would drift.
+
+        Extra keys may appear; ignore what you do not know.
       properties:
         id: { type: integer }
+        user_id: { type: integer }
         title: { type: string }
-        artist: { type: string }
-        album: { type: [string, 'null'] }
-        artist_credit:
-          type: [string, 'null']
+        artist:
+          type: string
           description: |
-            The full credit as submitted, kept when the primary artist was
-            folded out of an `Artist feat. X` string. Nothing is lost by that
-            rewrite.
+            The primary artist. Everyone credited lives in `scrobble_artists`
+            and is what the artist pages and charts aggregate over, so a listen
+            crediting a soloist appears under both names there while this field
+            still names the one the record is filed under.
+        album: { type: [string, 'null'] }
         timestamp:
           type: integer
           description: Unix seconds, UTC, **start** of play.
         duration: { type: [integer, 'null'], description: Seconds. }
         track_number: { type: [integer, 'null'] }
-        source_name: { type: string, description: 'Plex, Jellyfin, Navidrome, an app name, Import…' }
+        source_name: { type: string, description: 'Plex, Jellyfin, Navidrome, `ingest:<client>`, Import…' }
         source_id: { type: string, description: Dedup key. Unique per user per play. }
+        source_ref: { type: [integer, 'null'], description: The `user_sources` row this was polled from. }
         status:
           type: string
-          enum: [pending, sent, failed, imported]
+          enum: [pending, synced, imported]
           description: |
-            `pending` is queued for forwarding; `imported` is stored only and
-            will never be forwarded. Both an import and a skip land as
-            `imported` — forwarding either would put a wrong scrobble on a
-            permanent public record.
-        skipped:
-          type: boolean
+            `pending` is queued for forwarding, `synced` has been forwarded, and
+            `imported` is stored only and will never be forwarded. Both an
+            import and a skip land as `imported` — forwarding either would put a
+            wrong scrobble on a permanent public record.
+
+            There is no `sent` and no `failed`; those were documented and never
+            written. A delivery that fails stays `pending` and is retried, and
+            which sinks it has already reached is in `delivered_sinks` — that is
+            what stops a partial failure double-scrobbling.
+        delivered_sinks:
+          type: [string, 'null']
           description: |
-            Stored, never counted. Every counting query filters these out.
-            Still occupies its `source_id` so it continues to dedup.
+            JSON array of the sinks this has already reached, so a retry only
+            hits the ones that have not. A string, not an array.
+        submission_client: { type: [string, 'null'] }
+        listening_context: { type: [string, 'null'], description: From the resolved chain. }
         mbid_recording: { type: [string, 'null'] }
         mbid_release: { type: [string, 'null'] }
-        mbid_release_group: { type: [string, 'null'] }
-        mbid_artist: { type: [array, 'null'], items: { type: string } }
+        mbid_artist:
+          type: [string, 'null']
+          description: |
+            A **JSON-encoded array**, not an array — the column stores what was
+            written to it. Parse it before use.
         caa_id:
           type: [integer, 'null']
           description: |
@@ -388,13 +427,279 @@ components:
           description: |
             Empty string is a tombstone, same idea as `caa_id: -1`. This column
             alone is the artwork backfill's queue.
-        release_year: { type: [integer, 'null'] }
-        language: { type: [string, 'null'] }
-        genres: { type: [array, 'null'], items: { type: string } }
-        chain_id: { type: [integer, 'null'], description: Resolved signal chain. }
         device_id: { type: [integer, 'null'] }
+        chain_id: { type: [integer, 'null'], description: Resolved signal chain. }
         session_id: { type: [integer, 'null'] }
-        quality: { $ref: '#/components/schemas/AudioQuality' }
+
+        # ── How it sounded. Flat, and null for most of any real history:
+        # these are only ever written by ingest and the session-shaped sources,
+        # so an imported listen carries none of them. Any share computed over
+        # them is a share of *that* population, not of the listening.
+        format_type: { type: [string, 'null'], description: '`pcm`, `dsd`, `mqa`.' }
+        codec: { type: [string, 'null'] }
+        bitrate: { type: [integer, 'null'], description: kbps. }
+        sample_rate: { type: [integer, 'null'], description: Hz. }
+        bit_depth: { type: [integer, 'null'] }
+        channels: { type: [integer, 'null'] }
+        container: { type: [string, 'null'] }
+        source_quality: { type: [string, 'null'] }
+        is_lossless: { type: [boolean, 'null'] }
+        dsd_rate: { type: [integer, 'null'], description: Hz. }
+        dsd_multiplier: { type: [integer, 'null'] }
+        dsd_to_pcm_converted: { type: [boolean, 'null'] }
+        delivery_codec: { type: [string, 'null'], description: Set only on a genuine transcode. }
+        delivery_bitrate: { type: [integer, 'null'], description: kbps. }
+        delivery_sample_rate: { type: [integer, 'null'], description: Hz. }
+        delivery_bit_depth: { type: [integer, 'null'] }
+        is_transcoded: { type: [boolean, 'null'] }
+        transcode_reason: { type: [string, 'null'] }
+        quality_score:
+          type: [number, 'null']
+          description: |
+            0–100, computed once at ingest and never recomputed. Null for
+            anything imported, so an average over it has the same narrow
+            population as the fields above.
+
+        # ── What a pushing client saw of the playing itself. Null everywhere
+        # else: a poll can report a playhead but not how much was heard.
+        listened_ms:
+          type: [integer, 'null']
+          description: |
+            Milliseconds actually heard, paused time excluded. What `skipped`
+            cannot express — "cut short three seconds in" and "cut short with
+            thirty seconds left" are opposite behaviours.
+        is_shuffle: { type: [boolean, 'null'], description: Shuffle chose this, not the listener. }
+        queue_source: { type: [string, 'null'], description: "What it played from, in the client's own words." }
+
+    NowPlayingTrack:
+      type: object
+      description: |
+        What is on the deck. **Not a `Listen`** — nothing here is persisted, so
+        there is no id, no timestamp, no status and no `source_id`. It carries
+        the quality fields a source could report plus the playhead.
+      properties:
+        title: { type: string }
+        artist: { type: string }
+        album: { type: [string, 'null'] }
+        duration: { type: [integer, 'null'], description: Seconds. }
+        progress:
+          type: integer
+          description: |
+            Seconds in **as of `updated_at`**. Extrapolate from there rather
+            than expecting a tick per second — but see `position_known` first,
+            and stop extrapolating when `paused`.
+        position_known:
+          type: boolean
+          description: |
+            **False when `progress` is the server's own wall-clock arithmetic
+            rather than a reported playhead.** A ListenBrainz `playing_now` has
+            no position field in the format and Subsonic answers `minutesAgo`,
+            so for those there is nothing to report and the number is a guess.
+            Draw it as one. Plex, Jellyfin, Emby, Roon and the shelf report a
+            real playhead, and so does any client sending `tapedeck_playback`.
+        paused:
+          type: boolean
+          description: |
+            Only a pushing client can know this — a poll that stops arriving is
+            indistinguishable from a client that crashed — so it is false for
+            every polled source. A paused entry holds its position rather than
+            counting forward, and expires after ten minutes of silence.
+        updated_at: { type: integer, description: Unix seconds when this was last reported. }
+        source: { type: string, description: 'Plex, Roon, `ingest`, `physical`…' }
+        listening_context: { type: [string, 'null'] }
+        format_type: { type: [string, 'null'] }
+        codec: { type: [string, 'null'] }
+        bit_depth: { type: [integer, 'null'] }
+        sample_rate: { type: [integer, 'null'] }
+        dsd_multiplier: { type: [integer, 'null'] }
+        dsd_to_pcm_converted: { type: [boolean, 'null'] }
+        delivery_codec: { type: [string, 'null'] }
+        is_lossless: { type: [boolean, 'null'] }
+
+    SubmitListensResponse:
+      type: object
+      description: |
+        Everything past `status` is a Tapedeck extension and purely additive —
+        ListenBrainz clients branch on `status` alone, so the extra keys cannot
+        break them. They exist because a batch submit was otherwise
+        all-or-nothing from the client's side: "ok" said nothing about which
+        listens were stored, which were already held, and which were malformed.
+      properties:
+        status: { type: string, example: ok }
+        accepted: { type: integer, description: Newly stored. }
+        duplicate:
+          type: integer
+          description: |
+            **Singular.** Recognised as already held, by `source_id` or by the
+            fuzzy window. Not an error — a client resending after a dropped
+            connection is the normal way this happens. But a client whose every
+            listen comes back here has a bug, which is why it is counted apart
+            from `accepted` rather than folded in.
+        rejected:
+          type: array
+          description: |
+            Could not be stored and **must not be retried** — malformed client
+            data, so resending changes nothing. Always present, empty when
+            nothing was rejected; an absent key would be ambiguous.
+          items: { $ref: '#/components/schemas/RejectedListen' }
+
+    RejectedListen:
+      type: object
+      properties:
+        index: { type: integer, description: Index into the submitted `payload`. }
+        reason: { type: string }
+
+    DryRunResponse:
+      type: object
+      description: The reply to `?dry_run` — what *would* have happened.
+      properties:
+        status: { type: string, example: ok }
+        dry_run: { type: boolean, enum: [true] }
+        listens:
+          type: array
+          items: { $ref: '#/components/schemas/DryRunListen' }
+        rejected:
+          type: array
+          items: { $ref: '#/components/schemas/RejectedListen' }
+
+    DryRunListen:
+      type: object
+      description: One listen's resolved state, computed and thrown away.
+      properties:
+        index: { type: integer, description: Index into the submitted `payload`. }
+        artist: { type: string }
+        title: { type: string }
+        album: { type: [string, 'null'] }
+        timestamp: { type: integer }
+        quality_score:
+          type: [number, 'null']
+          description: |
+            What your `tapedeck_audio` fields scored, 0–100 — the main thing
+            worth getting right and otherwise invisible.
+        chain_id: { type: [integer, 'null'] }
+        chain_name: { type: [string, 'null'] }
+        chain_source:
+          type: string
+          enum: [explicit, output_binding, token_default, device_default, none]
+          description: |
+            **Which rung of the ladder won.** The single most useful field here:
+            a chain arriving from the wrong rung looks identical to one arriving
+            from the right one, so without this a misconfiguration is invisible
+            until someone reads their history months later.
+        device_id: { type: [integer, 'null'] }
+        listening_context: { type: [string, 'null'] }
+        status_if_stored:
+          type: string
+          enum: [pending, imported]
+          description: |
+            `pending` will be forwarded onward; `imported` is stored only. The
+            distinction a backfill has to get right, answered before it is too
+            late to change.
+        skipped: { type: boolean }
+        duplicate:
+          type: boolean
+          description: Whether dedup would have swallowed it, checked read-only against the real rules.
+
+    TapedeckPlayback:
+      type: object
+      description: |
+        Where the playhead is, from a client that can actually see it.
+
+        The ListenBrainz submission format carries no position, so a
+        `playing_now` without this is wall-clock arithmetic from the moment you
+        spoke — right until the listener pauses or seeks, wrong from then on,
+        and reported as an estimate (`position_known: false`) rather than dressed
+        up as a measurement. Send this and the deck shows a real position.
+
+        A playhead sent here is believed **outright**, including a step
+        backwards: a polled source's report may lag its player by a few seconds
+        and is smoothed for it, but a client measuring at the instant it sends
+        has no such lag, so a backward step is the listener seeking and you are
+        the authority on that.
+      properties:
+        position_ms:
+          type: [integer, string]
+          description: Exact playhead at the moment of submission.
+        state:
+          type: string
+          enum: [playing, paused]
+          description: |
+            Anything other than `paused` is read as playing, which is the safe
+            way to fall: a wrongly-paused deck freezes and reads as broken.
+
+            **Send `paused` when the listener pauses.** Without it the position
+            counts forward through the pause while `position_known` asserts it
+            is a measurement — a confident and completely wrong readout. A
+            paused entry holds still and expires after ten minutes of silence,
+            so a heartbeat keeps it alive and stopping altogether clears it.
+
+    TapedeckDevice:
+      type: object
+      description: |
+        What was playing it. Resolves to a `devices` row, which is rung 4 of the
+        chain ladder — without it a listen from a client with no token default
+        and no output binding gets no signal chain at all.
+      properties:
+        machine_id:
+          type: string
+          description: |
+            **The key.** Stable per installation and never the display name,
+            which the user edits — keying on a name re-registers the device as a
+            new one the moment it is renamed. Nothing is recorded without this.
+        player_name: { type: string }
+        player_version: { type: string }
+        platform: { type: string }
+        output_device:
+          type: string
+          description: |
+            What the audio came out of. Recorded whether or not it is mapped, so
+            the UI can offer unmapped ones for one-tap assignment, and it drives
+            rung 2 of the chain ladder.
+        output_type: { type: string }
+        interface: { type: string, description: 'USB, Bluetooth, analog… Preferred over `output_type`.' }
+
+    TapedeckChain:
+      type: object
+      description: |
+        Signal chain, rung 1 of the four-rung ladder: explicit name →
+        output-device binding → the submitting token's `default_chain_id` → the
+        source device's default. An unknown name resolves to no chain rather
+        than erroring.
+
+        Note this is an **object**. It was documented as a bare string until
+        v0.66.0 and never was one.
+      properties:
+        chain_id:
+          type: string
+          description: |
+            The chain's **name**, despite the field being called `chain_id` —
+            a client knows what the user called it, not its row id. Use
+            `?dry_run=1` to check it resolves.
+        components:
+          type: array
+          items: { type: string }
+          description: Accepted and not yet stored.
+
+    TapedeckSession:
+      type: object
+      description: |
+        What the client was doing when the track came up — specifically, whether
+        the listener chose it.
+
+        Two fields, where five were once accepted. The other three were
+        deserialised and read by nothing, which is worse than absent: it costs a
+        client author real work and returns silence. `volume_level` describes a
+        slider rather than a listen, `skip_count` is derived from the listens
+        themselves and does not reset when a client restarts, and a repeat that
+        actually happened is already visible as two listens.
+      properties:
+        is_shuffle: { type: boolean, description: Shuffle chose this track rather than the listener. }
+        queue_source:
+          type: string
+          description: |
+            What it was played from — a playlist name, an album, a queue, radio.
+            Free text: it is your vocabulary for your own containers and there
+            is no shared one to normalise against.
 
     SubmitListen:
       type: object
@@ -434,17 +739,46 @@ components:
                     a bool, an object) costs the track number only; the listen is
                     still stored.
                 submission_client: { type: string }
-                tapedeck_chain:
-                  type: string
+                artist_names:
+                  type: array
+                  items: { type: string }
                   description: |
-                    Signal chain **by name**. Rung 1 of the four-rung ladder:
-                    explicit name → output-device binding → the submitting
-                    token's `default_chain_id` → the source device's default.
-                tapedeck_quality:
-                  $ref: '#/components/schemas/AudioQuality'
-                tapedeck_skipped:
+                    Everyone credited, where the client can separate them — the
+                    only structured way to say "Bach *and* Hilary Hahn". All of
+                    them are recorded and the artist pages and charts aggregate
+                    over every one, so a soloist appears under their own name
+                    rather than vanishing into the composer's.
+
+                    Failing this, a **semicolon-separated** `artist_name` is
+                    split on `;` and nothing else. `&` and `,` appear inside
+                    real names — "Simon & Garfunkel", "Earth, Wind & Fire" — so
+                    splitting on those would invent artists who do not exist.
+                skipped:
                   type: boolean
-                  description: Stored, never counted, never forwarded.
+                  description: |
+                    The track was skipped rather than played through. Stored,
+                    excluded from every count, and **never forwarded** — a
+                    forwarded skip is a wrong scrobble on a permanent record.
+                    Top level of `additional_info`; there is no
+                    `tapedeck_skipped`.
+                listened_ms:
+                  type: [integer, string]
+                  description: |
+                    How much of the track was actually heard, in milliseconds,
+                    with paused time excluded. This is what makes `skipped`
+                    worth having: a bool cannot separate "skipped three seconds
+                    in" from "skipped with thirty seconds left", and those are
+                    opposite behaviours.
+                tapedeck_playback:
+                  $ref: '#/components/schemas/TapedeckPlayback'
+                tapedeck_audio:
+                  $ref: '#/components/schemas/TapedeckAudio'
+                tapedeck_device:
+                  $ref: '#/components/schemas/TapedeckDevice'
+                tapedeck_chain:
+                  $ref: '#/components/schemas/TapedeckChain'
+                tapedeck_session:
+                  $ref: '#/components/schemas/TapedeckSession'
 
     Chain:
       type: object
@@ -508,15 +842,8 @@ components:
             the server's own wall-clock arithmetic, not a measurement.
         track:
           oneOf:
-            - $ref: '#/components/schemas/Listen'
+            - $ref: '#/components/schemas/NowPlayingTrack'
             - type: 'null'
-          description: |
-            Carries the `Listen` quality fields plus `progress`, `updated_at`,
-            `source`, `listening_context` and `position_known`. The last of
-            those is **false** when nothing reported a playhead: a ListenBrainz
-            `playing_now` has no position field in the format, and Subsonic's
-            `getNowPlaying` answers `minutesAgo`. Plex, Jellyfin, Emby, Roon and
-            the shelf all report a real one.
 
     Note:
       type: object
@@ -961,15 +1288,55 @@ paths:
 
         **`listen_type` decides forwarding**, and getting it wrong rewrites
         someone's permanent public history. `single` and `playing_now` are live
-        and will be forwarded; `import` is stored only and never forwarded
-        *(since v0.26 — before that, an import was forwarded like a live
-        listen)*.
+        and will be forwarded.
+
+        `import` is stored only and **not** forwarded *(since v0.26 — before
+        that, an import was forwarded like a live listen)* — unless the token
+        used to submit it is marked **`imports_are_live`**, which exists because
+        some players label every scrobble `import` and nothing on the wire
+        distinguishes that from a backfill. Even then two gates apply and both
+        must pass:
+
+        * the listen is **no more than 24h old**, so a genuine history import
+          from the same client still stays local; and
+        * its timestamp is **no more than 1h in the future**, so ordinary clock
+          skew is tolerated but a broken clock cannot park a scrobble years
+          ahead of everything else.
+
+        The flag is per token and invisible from the client side, which is why
+        `GET /1/validate-token` reports it — read it there rather than guessing
+        from whether listens appear at the far end.
 
         Dedup is on `(user_id, source_id, source_name)` plus a fuzzy window, so
         re-sending the same listen is safe. Max 1000 listens per request.
+
+        `additional_info` is free-form and **no field in it can fail a
+        submission**: an unusable value costs that field and the listen is still
+        stored. Unknown keys are ignored.
       security:
         - apiToken: []
         - sessionCookie: []
+      parameters:
+        - name: dry_run
+          in: query
+          required: false
+          schema: { type: string }
+          description: |
+            Resolve everything, **store nothing and forward nothing**, and
+            report what would have happened. `1`, `true`, `yes`, `on` and a bare
+            `?dry_run` all count.
+
+            This is the endpoint to point a client at while it is being set up:
+            it names the winning rung of the chain ladder, the quality score
+            your fields produced, whether the listen would be forwarded or
+            stored only, and whether dedup would swallow it — none of which is
+            visible from a successful submit. The preview and the real path
+            share one implementation, so it cannot promise something the real
+            path would not do.
+
+            Note it is genuinely read-only: a dry run looks a device up rather
+            than upserting it, because asking what would happen must not itself
+            be a listen.
       requestBody:
         required: true
         content:
@@ -989,33 +1356,50 @@ paths:
       responses:
         '200':
           description: |
-            Accepted. Per-listen results are reported rather than the whole
-            batch failing — one bad row must not lose the other 999.
+            Accepted, or — with `?dry_run` — resolved and discarded. Per-listen
+            results are reported rather than the whole batch failing: one bad
+            row must not lose the other 999.
           content:
             application/json:
               schema:
-                type: object
-                properties:
-                  status: { type: string, example: ok }
-                  accepted: { type: integer }
-                  duplicates: { type: integer }
-                  rejected:
-                    type: array
-                    items:
-                      type: object
-                      properties:
-                        index: { type: integer }
-                        reason: { type: string }
+                oneOf:
+                  - $ref: '#/components/schemas/SubmitListensResponse'
+                  - $ref: '#/components/schemas/DryRunResponse'
         '400': { $ref: '#/components/responses/BadRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
+        '503':
+          description: |
+            One or more listens could not be stored. **Retryable** — resend the
+            batch; dedup makes that safe. Distinct from `rejected`, which is the
+            do-not-retry list.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
 
   /1/validate-token:
     get:
       tags: [ListenBrainz]
-      summary: Check a token.
+      summary: Check a token, and ask what it may do.
       description: |
         An invalid token is **`200 {valid:false}`, never 401** — LB clients read
         the field, and a 401 sends them into a refresh loop.
+
+        The token may arrive in the `Authorization` header **or** as `?token=`.
+
+        Everything past `user_name` is Tapedeck introspection, and it is
+        additive: real ListenBrainz clients branch on `valid` alone, so the
+        extra keys cannot break them, and putting them here rather than on a
+        second endpoint costs no extra round trip. They let a settings screen
+        say what this token can do instead of choosing between hiding features
+        that might work and offering features that 403 at the moment of use.
+
+        They appear **only when `valid` is true.** This endpoint answers whoever
+        asks, so reporting the build beside `valid: false` would hand it to
+        anyone guessing at tokens.
+
+        Note this reports the grants themselves, never any of the user's data.
+        It widens nothing: `submit` still reaches only this endpoint and
+        `submit-listens`.
       security:
         - apiToken: []
       responses:
@@ -1030,6 +1414,33 @@ paths:
                   message: { type: string }
                   valid: { type: boolean }
                   user_name: { type: [string, 'null'] }
+                  scopes:
+                    type: array
+                    items: { type: string, enum: [submit, read, write] }
+                    description: |
+                      As granted, with `all` expanded. Valid only when `valid`.
+                      Matching is exact and **none implies another** — `submit`
+                      does not carry `read`, and `write` does not carry `read`.
+                  default_chain_id:
+                    type: [integer, 'null']
+                    description: |
+                      Rung 3 of the chain ladder. Show the user which chain
+                      their listens will be attributed to rather than leaving
+                      them to find out from their history.
+                  imports_are_live:
+                    type: boolean
+                    description: |
+                      Whether this token's `listen_type: "import"` submissions
+                      are relayed onward — see `POST /1/submit-listens` for the
+                      two gates that still apply. Invisible from the client side
+                      and silent in its absence, which matters most for players
+                      that label every scrobble `import`.
+                  server_version:
+                    type: string
+                    description: |
+                      So a client shipped against one version can tell which
+                      extensions this instance understands without parsing this
+                      document to find out.
 
   /1/user/{user}/listens:
     get:

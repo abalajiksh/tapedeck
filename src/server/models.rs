@@ -35,8 +35,14 @@ pub struct TrackMetadata {
 
 #[derive(Debug, Deserialize, Default)]
 pub struct AdditionalInfo {
+    #[serde(default, deserialize_with = "lenient")]
     pub submission_client: Option<String>,
+    #[serde(default, deserialize_with = "lenient")]
     pub submission_client_version: Option<String>,
+    /// Lenient because this is the field CLAUDE.md named as the obvious
+    /// next casualty of a strict type in this bag — it escaped only because
+    /// fooyin happens to send it as a number.
+    #[serde(default, deserialize_with = "lenient_millis")]
     pub duration_ms: Option<i64>,
     /// ListenBrainz spells this `tracknumber`; Tapedeck's own submissions and
     /// some clients use `track_number`. A mismatch here is silent — the number
@@ -63,6 +69,23 @@ pub struct AdditionalInfo {
     #[serde(default)]
     pub skipped: Option<bool>,
 
+    /// How much of the track was actually heard, in milliseconds, with paused
+    /// time excluded.
+    ///
+    /// `skipped` is a bool, and a bool cannot tell "skipped three seconds in"
+    /// from "skipped with thirty seconds left" — opposite listening behaviours
+    /// filed identically. Until a pushing client sends this there is nothing in
+    /// the system that could distinguish them: `skipped` had no live source at
+    /// all beyond Rockbox imports and the shelf transport.
+    ///
+    /// Lenient for the same reason as `track_number`: this lives in
+    /// `additional_info`, and a strict type in that bag fails the **whole
+    /// submission** with a 422 before the handler runs. `duration_ms` was named
+    /// as the next field likely to be bitten by that; this is a new one in the
+    /// same position, so it does not get to repeat the mistake.
+    #[serde(default, deserialize_with = "lenient_millis")]
+    pub listened_ms: Option<i64>,
+
     /// MBIDs as a *submitting* client sends them. `mbid_mapping` is the shape
     /// ListenBrainz **returns** — it's what the export carries, which is why
     /// `import.rs` reads it — but on the way in the spec puts these in
@@ -71,9 +94,13 @@ pub struct AdditionalInfo {
     /// that had already done the identification paid for a rate-limited
     /// MusicBrainz lookup anyway, and nothing errored to say so. `openapi.yaml`
     /// has documented these as read since v0.39.0; now they are.
+    #[serde(default, deserialize_with = "lenient")]
     pub recording_mbid: Option<String>,
+    #[serde(default, deserialize_with = "lenient")]
     pub release_mbid: Option<String>,
+    #[serde(default, deserialize_with = "lenient")]
     pub release_group_mbid: Option<String>,
+    #[serde(default, deserialize_with = "lenient_string_list")]
     pub artist_mbids: Option<Vec<String>>,
 
     /// Every artist credited, where the client sends them separately.
@@ -92,10 +119,40 @@ pub struct AdditionalInfo {
     pub artist_names: Option<Vec<String>>,
 
     // ── Tapedeck extensions ──
+    #[serde(default, deserialize_with = "lenient")]
     pub tapedeck_audio: Option<TapedeckAudio>,
+    #[serde(default, deserialize_with = "lenient")]
     pub tapedeck_device: Option<TapedeckDevice>,
+    #[serde(default, deserialize_with = "lenient")]
     pub tapedeck_chain: Option<TapedeckChain>,
+    #[serde(default, deserialize_with = "lenient")]
     pub tapedeck_session: Option<TapedeckSession>,
+    #[serde(default, deserialize_with = "lenient")]
+    pub tapedeck_playback: Option<TapedeckPlayback>,
+}
+
+/// Accepts whatever a client put in a milliseconds field and yields a
+/// non-negative number or nothing — never an error. Same contract and same
+/// reasoning as [`lenient_track_number`].
+fn lenient_millis<'de, D>(deserializer: D) -> Result<Option<i64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Field {
+        Int(i64),
+        /// Some tag readers hand milliseconds over as text.
+        Str(String),
+        Other(serde::de::IgnoredAny),
+    }
+
+    Ok(match Option::<Field>::deserialize(deserializer)? {
+        Some(Field::Int(n)) => Some(n),
+        Some(Field::Str(s)) => s.trim().parse::<i64>().ok(),
+        Some(Field::Other(_)) | None => None,
+    }
+    .filter(|n| *n >= 0))
 }
 
 /// Accepts an array of strings and yields nothing for anything else.
@@ -208,13 +265,108 @@ pub struct TapedeckChain {
     pub components: Option<Vec<String>>,
 }
 
+/// What the client was doing when the track came up.
+///
+/// Deliberately two fields where there were five. The struct existed since the
+/// extensions were first sketched and **nothing anywhere read it** — it was
+/// deserialised on every submission and dropped, so a client filling it in got
+/// silence with no error to say so. Half-present is the worst of the available
+/// states: it costs a client author real work and returns nothing.
+///
+/// The two kept are the two that answer a question nothing else in Tapedeck
+/// can: *what did I put on deliberately, and what did shuffle hand me?* The
+/// three dropped could not. `volume_level` at the moment of submission says
+/// nothing about a listen — it is a fact about a slider, and one sample of it
+/// at that. `skip_count` is per-session state the server derives from the
+/// listens themselves, and better, since it does not reset when a client
+/// restarts. `is_repeat` is a mode rather than an event: a repeat that actually
+/// happened is already visible as two listens of the same track.
+///
+/// A dropped field costs nothing to reinstate if a use for it appears. Storing
+/// one nothing reads is how this struct got here.
 #[derive(Debug, Deserialize)]
 pub struct TapedeckSession {
+    /// Whether shuffle chose this track rather than the listener.
     pub is_shuffle: Option<bool>,
-    pub is_repeat: Option<bool>,
+    /// What it was played from — a playlist name, an album, a queue, radio.
+    /// Free text: it is the client's own vocabulary for its own containers, and
+    /// there is no shared one to normalise it against.
+    #[serde(default, deserialize_with = "lenient")]
     pub queue_source: Option<String>,
-    pub skip_count: Option<i32>,
-    pub volume_level: Option<f32>,
+}
+
+/// Where the playhead is, from a client that can actually see it.
+///
+/// `playing_now` carries no position — the ListenBrainz submission format has
+/// no field for one — so a pushed now-playing was wall-clock arithmetic from
+/// the moment the client spoke, and a paused player drew a confident and
+/// completely wrong position. [`Progress`](super::now_playing::Progress) has
+/// modelled the difference between a measurement and a guess for a while; this
+/// is the missing half, the way for a client to supply the measurement.
+///
+/// Both fields are lenient, because this rides in `additional_info` where a
+/// strict type costs the entire submission.
+#[derive(Debug, Deserialize)]
+pub struct TapedeckPlayback {
+    /// Exact playhead at the instant of submission, in milliseconds.
+    #[serde(default, deserialize_with = "lenient_millis")]
+    pub position_ms: Option<i64>,
+    /// `playing` or `paused`. Anything else is read as playing, which is the
+    /// safe default: a wrongly-paused deck freezes and looks broken, where a
+    /// wrongly-playing one is merely the behaviour of every other source.
+    ///
+    /// Lenient like everything else in this bag. A bare `Option<String>` here
+    /// is a *strict* type — a client sending a number or an object for `state`
+    /// would fail the whole submission with a 422 before the handler ran, and
+    /// take every listen in the batch with it. Caught by
+    /// `only_an_explicit_pause_pauses_the_deck`, which is the exact shape of
+    /// the fooyin bug arriving in a new field.
+    #[serde(default, deserialize_with = "lenient")]
+    pub state: Option<String>,
+}
+
+/// Accepts a value of the expected type and yields nothing for anything else.
+/// The [`lenient_track_number`] contract, generic.
+///
+/// This is the general form of a rule this file states three times: nothing in
+/// `additional_info` may be strict, because ListenBrainz imposes no schema on
+/// that bag and serde has no per-field recovery — one wrongly-typed key and
+/// axum's `Json` extractor rejects the body with a 422 before the handler runs,
+/// losing every listen in the batch with no `rejected` entry to say why. The
+/// client then retries the same doomed request forever while its connection
+/// test keeps passing, because `validate-token` parses no body.
+///
+/// On a nested extension object this costs the whole object rather than one
+/// field, which is still the right trade: an unreadable `tapedeck_audio` should
+/// lose the audio detail, not the listen it describes.
+fn lenient<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Field<T> {
+        Value(T),
+        Other(serde::de::IgnoredAny),
+    }
+
+    Ok(match Option::<Field<T>>::deserialize(deserializer)? {
+        Some(Field::Value(v)) => Some(v),
+        Some(Field::Other(_)) | None => None,
+    })
+}
+
+impl TapedeckPlayback {
+    /// Whether the listener has paused. Only an explicit `paused` counts.
+    pub fn is_paused(&self) -> bool {
+        self.state.as_deref().map(str::trim).is_some_and(|s| s.eq_ignore_ascii_case("paused"))
+    }
+
+    /// The playhead in whole seconds, when one was sent.
+    pub fn position_secs(&self) -> Option<u64> {
+        self.position_ms.map(|ms| (ms / 1000) as u64)
+    }
 }
 
 // ── Response types ──
@@ -368,6 +520,136 @@ mod tests {
         assert_eq!(parse(r#"{"n":1}"#), None);
         // Out of range for i32 rather than malformed — still not worth the batch.
         assert_eq!(parse("99999999999999"), None);
+    }
+
+    /// The playhead, the pause, how much was heard, and what handed the track
+    /// over — everything a pushing client can say that a poll cannot.
+    #[test]
+    fn a_pushing_client_can_report_the_playhead_and_what_it_was_playing_from() {
+        let body = r#"{
+          "artist_name": "Aphex Twin", "track_name": "Xtal",
+          "additional_info": {
+            "listened_ms": 3200,
+            "tapedeck_playback": { "position_ms": 84210, "state": "paused" },
+            "tapedeck_session": { "is_shuffle": true, "queue_source": "Late night" }
+          }
+        }"#;
+        let info = serde_json::from_str::<TrackMetadata>(body).unwrap().additional_info.unwrap();
+
+        assert_eq!(info.listened_ms, Some(3200));
+
+        let pb = info.tapedeck_playback.unwrap();
+        // Seconds, because that is what `Progress` and the deck deal in.
+        assert_eq!(pb.position_secs(), Some(84));
+        assert!(pb.is_paused());
+
+        let s = info.tapedeck_session.unwrap();
+        assert_eq!(s.is_shuffle, Some(true));
+        assert_eq!(s.queue_source.as_deref(), Some("Late night"));
+    }
+
+    /// Only an explicit `paused` pauses the deck. A wrongly-paused deck freezes
+    /// and reads as broken; a wrongly-playing one behaves like every other
+    /// source, so an unrecognised state falls the safe way.
+    #[test]
+    fn only_an_explicit_pause_pauses_the_deck() {
+        fn paused(state: &str) -> bool {
+            let body = format!(
+                r#"{{"artist_name":"A","track_name":"T","additional_info":{{"tapedeck_playback":{{"state":{state}}}}}}}"#
+            );
+            serde_json::from_str::<TrackMetadata>(&body)
+                .expect("a playback state must never fail the listen")
+                .additional_info
+                .unwrap()
+                .tapedeck_playback
+                .unwrap()
+                .is_paused()
+        }
+
+        assert!(paused(r#""paused""#));
+        assert!(paused(r#""Paused""#));
+        assert!(paused(r#"" paused ""#));
+        assert!(!paused(r#""playing""#));
+        assert!(!paused(r#""stopped""#));
+        assert!(!paused(r#""""#));
+        assert!(!paused("null"));
+        assert!(!paused("42"));
+    }
+
+    /// Both new millisecond fields ride in `additional_info`, which has no
+    /// schema and where a strict type costs the **entire submission** — serde
+    /// has no per-field recovery, so axum's `Json` extractor rejects the body
+    /// with a 422 before any handler runs and every listen in the batch is lost
+    /// with nothing in `rejected` to explain it. That is the fooyin bug, and a
+    /// new field in the same bag does not get to repeat it.
+    #[test]
+    fn an_unusable_millisecond_field_costs_the_field_and_not_the_listen() {
+        fn parse(raw: &str) -> Option<i64> {
+            let body = format!(
+                r#"{{"artist_name":"A","track_name":"T","additional_info":{{"listened_ms":{raw}}}}}"#
+            );
+            serde_json::from_str::<TrackMetadata>(&body)
+                .expect("a bad listened_ms must never fail the listen")
+                .additional_info
+                .unwrap()
+                .listened_ms
+        }
+
+        assert_eq!(parse("3200"), Some(3200));
+        assert_eq!(parse(r#""3200""#), Some(3200));
+        assert_eq!(parse(r#""  3200 ""#), Some(3200));
+        assert_eq!(parse("0"), Some(0));
+        // Not a length. Silently dropped rather than stored as nonsense.
+        assert_eq!(parse("-1"), None);
+        assert_eq!(parse(r#""about a minute""#), None);
+        assert_eq!(parse("1.5"), None);
+        assert_eq!(parse("true"), None);
+        assert_eq!(parse(r#"{"ms":10}"#), None);
+        assert_eq!(parse("null"), None);
+    }
+
+    /// The general form of the rule, across the whole bag rather than one
+    /// field. `additional_info` has no schema, so **every** typed key in it is
+    /// a 422 waiting for a client that spells it differently — and a 422 here
+    /// costs the entire batch, silently, forever, while the connection test
+    /// keeps reporting success.
+    ///
+    /// `duration_ms` is the one CLAUDE.md named as the obvious next casualty;
+    /// it escaped only because fooyin happens to send a number. The nested
+    /// extension objects are the same bug with more surface: a client sending
+    /// `"tapedeck_audio": "flac"` should lose its audio detail, not its music.
+    #[test]
+    fn a_wrongly_typed_extension_costs_the_extension_and_not_the_listen() {
+        let body = r#"{
+          "artist_name": "Aphex Twin", "track_name": "Xtal",
+          "additional_info": {
+            "duration_ms": "294000",
+            "submission_client": 12345,
+            "recording_mbid": { "id": "nope" },
+            "tapedeck_audio": "flac",
+            "tapedeck_device": [],
+            "tapedeck_chain": "Desk",
+            "tapedeck_session": 7,
+            "tapedeck_playback": "playing",
+            "listened_ms": "12000"
+          }
+        }"#;
+        let info = serde_json::from_str::<TrackMetadata>(body)
+            .expect("a bagful of wrong types must never fail the listen")
+            .additional_info
+            .unwrap();
+
+        // The readable ones survive…
+        assert_eq!(info.duration_ms, Some(294_000));
+        assert_eq!(info.listened_ms, Some(12_000));
+        // …and every unreadable one costs itself alone.
+        assert_eq!(info.submission_client, None);
+        assert_eq!(info.recording_mbid, None);
+        assert!(info.tapedeck_audio.is_none());
+        assert!(info.tapedeck_device.is_none());
+        assert!(info.tapedeck_chain.is_none());
+        assert!(info.tapedeck_session.is_none());
+        assert!(info.tapedeck_playback.is_none());
     }
 
     /// `mbid_mapping` is the read-side shape and still has to work: an LB export

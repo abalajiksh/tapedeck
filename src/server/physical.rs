@@ -1357,7 +1357,12 @@ async fn set_now_playing(
 
     // The browser sitting in front of the turntable ran the clock, so
     // unlike every other push source this really is a measured position.
-    let mut np = NowPlaying::from_play(&play, SHELF_SOURCE, None, Progress::Known(body.elapsed));
+    let mut np = NowPlaying::from_play(&play, SHELF_SOURCE, None, Progress::Exact(body.elapsed));
+    // `DeckState::paused` says the entry "stays and stops advancing", and until
+    // the registry learned about pause only the first half was true: the
+    // position counted forward regardless and the 10s heartbeat was the only
+    // thing dragging it back to the truth. It really stops now.
+    np.paused = body.paused;
     // The medium, which is the only thing resembling a format a turntable can
     // report — there is no codec here and never will be. Note the listen itself
     // files the same string under `submission_client` rather than

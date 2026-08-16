@@ -13,7 +13,7 @@ use super::models::*;
 use super::now_playing::{NowPlaying, Progress};
 use super::AppState;
 use crate::engine::enrichment::enrich_play;
-use crate::models::{AudioQuality, ListenDisposition, Play};
+use crate::models::{AudioQuality, ListenDisposition, Play, PlaybackReport};
 
 #[derive(Deserialize)]
 pub struct TokenQuery {
@@ -28,6 +28,23 @@ pub struct TokenQuery {
 /// `?token=` query parameter, and an invalid token is reported as HTTP 200 with
 /// `valid: false` — not a 401. Clients branch on that field, so returning an
 /// auth error here makes them report a server fault instead of a bad token.
+///
+/// **The Tapedeck keys past `user_name` are introspection**, and they exist
+/// because a client had no way to learn what its own token may do. Without them
+/// a settings screen has two bad options — hide features that might work, or
+/// offer features that 403 at the moment of use — in a screen whose entire job
+/// is telling the user their setup is right. Extending this endpoint rather
+/// than adding a second one is deliberate: real ListenBrainz clients branch on
+/// `valid` alone, so extra keys cannot break them, and it costs no round trip.
+///
+/// They appear **only on the valid branch**. This endpoint answers whoever
+/// asks, so returning the server version beside `valid: false` would report the
+/// build to anyone who guessed at a token. A caller holding a real token is
+/// already inside; a caller without one learns nothing.
+///
+/// Note this reports what the token *may* do, never any of the user's data —
+/// the scope grants themselves, not what they unlock. It widens no boundary:
+/// `submit` still reaches nothing but this endpoint and `submit-listens`.
 pub async fn validate_token(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -63,6 +80,22 @@ pub async fn validate_token(
                 "message": "Token valid.",
                 "valid": true,
                 "user_name": t.user.username,
+
+                // ── Tapedeck introspection; see this function's note. ──
+                "scopes": t.granted_scopes(),
+                // Rung 3 of the four-rung chain ladder. A client can show which
+                // chain its listens will be attributed to, and say so rather
+                // than leaving the user to discover it from the history.
+                "default_chain_id": t.default_chain_id,
+                // Whether this client's `listen_type: "import"` is relayed
+                // onward. Invisible from the client side and silent in its
+                // absence, which matters most for the players that hardcode
+                // `import` for every scrobble they send.
+                "imports_are_live": t.imports_are_live,
+                // So a plugin shipped against one version can tell which
+                // extensions this instance understands without parsing 5.5k
+                // lines of OpenAPI to find out.
+                "server_version": env!("CARGO_PKG_VERSION"),
             })),
         )
             .into_response(),
@@ -470,24 +503,60 @@ pub async fn submit_listens(
                     play.artist, play.title, user.username
                 );
 
-                // Feed the deck. Clients submit `playing_now` at track start
-                // and carry no position, so we start at 0 and let the registry
-                // extrapolate from `duration`.
-                // `playing_now` carries no position and never will — the
-                // ListenBrainz submission format has no field for one. So this
-                // is wall-clock from the moment the client told us, which is
-                // right until the listener pauses or seeks and wrong from then
-                // on. It is marked as an estimate rather than dressed up as a
-                // playhead; the deck draws the difference.
-                let mut np = NowPlaying::from_play(&play, "ingest", quality_opt, Progress::Unknown);
+                // Feed the deck.
+                //
+                // The ListenBrainz submission format carries no position, so a
+                // generic client's `playing_now` is wall-clock from the moment
+                // it spoke — right until the listener pauses or seeks, wrong
+                // from then on. That stays `Progress::Unknown` and is drawn as
+                // the estimate it is.
+                //
+                // `tapedeck_playback` is the way out of that for a client that
+                // can actually see its playhead. It is `Exact` rather than
+                // `Reported`: a pushing client measures at the instant it
+                // sends, so it has no upload lag to absorb and the registry's
+                // staleness guard must not hold its own count against it — a
+                // backward step from this source is the listener seeking.
+                let playback = info_ref.and_then(|ai| ai.tapedeck_playback.as_ref());
+                let progress = match playback.and_then(|p| p.position_secs()) {
+                    Some(secs) => Progress::Exact(secs),
+                    None => Progress::Unknown,
+                };
+                let mut np = NowPlaying::from_play(&play, "ingest", quality_opt, progress);
+                // Without this the position counts forward through a pause and
+                // `position_known` asserts it is a measurement — the "confident
+                // and completely wrong position" made worse by being stated
+                // with confidence. Pause is not decoration on this feature.
+                np.paused = playback.is_some_and(|p| p.is_paused());
                 np.listening_context = listening_context.clone();
-                state.now_playing.set(user.user_id, np);
+                let paused = np.paused;
+                let changed = state.now_playing.set(user.user_id, np);
 
-                // Forward to the submitting user's own connected accounts only.
-                let user_sinks =
-                    crate::sinks::sinks_for_user(&state.db, user.user_id, &state.listenbrainz_url)
-                        .await;
-                crate::sinks::submit_now_playing(&user_sinks, &play).await;
+                // Forward to the submitting user's own connected accounts only,
+                // and only on a real change of track.
+                //
+                // This used to forward unconditionally, which was harmless while
+                // the only thing a client could say was "a new track started" —
+                // one submission per track, so every call was a change anyway.
+                // A position field invites the heartbeat that makes it useful,
+                // and an unconditional forward would then aim a request at
+                // Last.fm and ListenBrainz every few seconds for the whole
+                // length of every track. Their now-playing is a one-shot that
+                // expires on its own after the track's duration, so re-sending
+                // is pure noise at someone else's servers — the reason
+                // `NowPlayingRegistry::set` returns this flag at all.
+                //
+                // A paused deck is not now-playing either, and the same gate is
+                // what the shelf's own heartbeat uses.
+                if changed && !paused {
+                    let user_sinks = crate::sinks::sinks_for_user(
+                        &state.db,
+                        user.user_id,
+                        &state.listenbrainz_url,
+                    )
+                    .await;
+                    crate::sinks::submit_now_playing(&user_sinks, &play).await;
+                }
                 accepted += 1;
             }
             ListenType::Single | ListenType::Import => {
@@ -527,6 +596,38 @@ pub async fn submit_listens(
                     .await
                 {
                     Ok(true) => {
+                        // What the client saw of the playing itself. Written
+                        // separately, and skipped entirely when the client said
+                        // none of it — which is every client until one is built
+                        // for this — so it costs no statement per listen in the
+                        // ordinary case. See `set_listen_playback` for why it is
+                        // not three more arguments on `save_scrobble`.
+                        let session_info = info_ref.and_then(|ai| ai.tapedeck_session.as_ref());
+                        let report = PlaybackReport {
+                            listened_ms: info_ref.and_then(|ai| ai.listened_ms),
+                            is_shuffle: session_info.and_then(|s| s.is_shuffle),
+                            queue_source: session_info
+                                .and_then(|s| s.queue_source.as_ref())
+                                .map(|s| s.trim().to_string())
+                                .filter(|s| !s.is_empty()),
+                        };
+                        if let Err(e) = state
+                            .db
+                            .set_listen_playback(
+                                user.user_id,
+                                &play.source_id,
+                                &play.source_name,
+                                &report,
+                            )
+                            .await
+                        {
+                            // The listen is stored and correct; this is a note
+                            // about it. Losing the note must not fail the
+                            // submission and have the client resend a listen we
+                            // already hold.
+                            debug!("Could not record playback detail: {}", e);
+                        }
+
                         // Assign to a session, and — the part that was missing —
                         // point the listen back at it. `assign_session` has
                         // maintained `sessions.track_count` since Phase 2 while

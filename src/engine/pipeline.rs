@@ -571,7 +571,7 @@ impl ScrobbleEngine {
                     &play,
                     label,
                     track.quality.as_ref(),
-                    Progress::Known(track.position),
+                    Progress::Reported(track.position),
                 ),
             );
             if changed {
@@ -726,7 +726,7 @@ impl ScrobbleEngine {
             let mut play = track.play.clone();
             let changed = now_playing.set(
                 user_id,
-                NowPlaying::from_play(&play, "Roon", None, Progress::Known(track.position)),
+                NowPlaying::from_play(&play, "Roon", None, Progress::Reported(track.position)),
             );
             if changed {
                 if play.mbid_recording.is_none() {
@@ -908,7 +908,7 @@ impl ScrobbleEngine {
                         &play,
                         "Plex",
                         plex_track.audio_quality.as_ref(),
-                        Progress::Known(progress),
+                        Progress::Reported(progress),
                     ),
                 );
 

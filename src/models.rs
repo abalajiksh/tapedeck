@@ -129,6 +129,40 @@ impl ListenDisposition {
     }
 }
 
+/// What a pushing client observed about *how* a track played, as opposed to
+/// what it was.
+///
+/// Deliberately **not** folded into [`ListenDisposition`], for the reason
+/// `ImportProvenance` is not either: that struct decides whether a row is ever
+/// forwarded to someone's permanent public record, and fields with no
+/// consequences should not share a home with fields whose consequences are
+/// irreversible. Nothing here changes what happens to the listen.
+///
+/// Every field is null for every source that cannot see it, which today is all
+/// of them but a pushing client — a poll can report a playhead but not how much
+/// of it the listener actually heard, and an import carries neither.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PlaybackReport {
+    /// Milliseconds actually heard, paused time excluded. The half `skipped`
+    /// could never express: a bool cannot separate "cut short three seconds in"
+    /// from "cut short with thirty seconds left".
+    pub listened_ms: Option<i64>,
+    /// Whether shuffle chose the track rather than the listener.
+    pub is_shuffle: Option<bool>,
+    /// What it was played from, in the client's own vocabulary.
+    pub queue_source: Option<String>,
+}
+
+impl PlaybackReport {
+    /// Whether the client said anything at all. Callers use this to skip the
+    /// write entirely, so a submission that reports none of this — which is
+    /// every client in existence until one is built for it — costs no extra
+    /// statement per listen.
+    pub fn is_empty(&self) -> bool {
+        self.listened_ms.is_none() && self.is_shuffle.is_none() && self.queue_source.is_none()
+    }
+}
+
 /// When a listen counts — how much of a track has to play before it is banked.
 ///
 /// The default is Last.fm's convention and the number every session-shaped
