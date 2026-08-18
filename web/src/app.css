@@ -118,10 +118,20 @@
   .table td { padding: 9px; border-bottom: 1px solid color-mix(in srgb, var(--td-text) 8%, transparent); }
   .table tbody tr:hover { background: color-mix(in srgb, var(--td-text) 4%, transparent); }
 
-  /* — dialog — */
+  /* — dialog —
+     A modal is the topmost layer in the app, above every drawer, menu and
+     sticky bar, because it is the thing being answered right now.
+
+     It used to sit at 70, below the Signal Chains drawer at 80/81 — the one
+     surface in the whole app above it. So opening Edit or Delete *from* that
+     drawer rendered the dialog behind it, dimmed and unreachable: the page
+     looked frozen, with the confirm buttons visible but covered. Nothing
+     errored, and it only happened on that one page.
+
+     Anything added above this from now on is a bug, not a layer. */
   .dialog-backdrop {
     position: fixed; inset: 0; display: grid; place-items: center; padding: 18px;
-    background: rgba(30,27,22,.5); z-index: 70;
+    background: rgba(30,27,22,.5); z-index: 90;
   }
   .dialog {
     width: min(440px, 100%); display: flex; flex-direction: column; gap: 14px;

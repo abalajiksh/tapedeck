@@ -676,11 +676,18 @@
 		</div>
 	</div>
 
-	<!-- The nudge. Devices lead because every submitted listen goes through one,
-	     where an output only exists if a client bothered to report it — so an
-	     unassigned device is silently losing attribution right now, and an
-	     unmapped output is a thing to tidy. One line either way; two stacked
-	     banners is the clutter this page is being rescued from. -->
+	<!-- The nudges.
+	     v0.62.0 allowed exactly **one** of these, on the reasoning that two
+	     stacked banners are the clutter this page was being rescued from. That
+	     was wrong in a way only real use showed: an unmapped device you never
+	     intend to map is permanent, so it starved the queue behind it and the
+	     duplicate-chain prompt — added in v0.67.0 — was never once visible on
+	     the instance that had near-duplicate chains to fold.
+
+	     A nudge nobody can reach is worse than a second thin line. So the two
+	     that describe *data being lost or split right now* both show; the
+	     output one, which is only ever a tidy-up, still waits for both to
+	     clear. Two lines maximum. -->
 	{#if unmappedDevices.length}
 		<button class="nudge" aria-label="Review devices with no default chain" on:click={() => (secTab = 'devices')}>
 			<svg viewBox="0 0 24 24" width="17" fill="none" stroke="var(--td-accent)" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" style="flex:none;"><circle cx="12" cy="12" r="9"/><path d="M12 8h.01M11 12h1v4h1"/></svg>
@@ -690,11 +697,10 @@
 			</span>
 			<span class="nudge-cta">Review →</span>
 		</button>
-	{:else if dupes.length}
-		<!-- Two chains that are the same rig split their hours across two rows
-		     that cannot be compared, which is wrong *now* rather than wrong for
-		     future listens — but a device with no chain is losing attribution
-		     outright, so it still leads. -->
+	{/if}
+	<!-- Two chains that are the same rig split their hours across two rows that
+	     cannot be compared — wrong *now*, not merely wrong for future listens. -->
+	{#if dupes.length}
 		<button class="nudge" aria-label="Fold near-duplicate chains together"
 			on:click={() => {
 				const d = dupes[0];
@@ -709,7 +715,8 @@
 			</span>
 			<span class="nudge-cta">Fold →</span>
 		</button>
-	{:else if unmapped.length}
+	{/if}
+	{#if unmapped.length && !unmappedDevices.length && !dupes.length}
 		<button class="nudge" aria-label="Review unmapped outputs" on:click={() => (secTab = 'outputs')}>
 			<svg viewBox="0 0 24 24" width="17" fill="none" stroke="var(--td-accent)" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" style="flex:none;"><circle cx="12" cy="12" r="9"/><path d="M12 8h.01M11 12h1v4h1"/></svg>
 			<span style="flex:1;font-size:13.5px;">
