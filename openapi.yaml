@@ -26,7 +26,7 @@ openapi: 3.1.0
 
 info:
   title: Tapedeck
-  version: 0.66.0
+  version: 0.67.0
   summary: Self-hosted scrobbler and listening journal.
   description: |
     Tapedeck ingests listens, enriches them with MusicBrainz metadata, stores
@@ -3132,6 +3132,152 @@ paths:
         '200': { description: Created., content: { application/json: { schema: { type: object, properties: { id: { type: integer } } } } } }
         '400': { $ref: '#/components/responses/BadRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /api/v1/chains/duplicates:
+    get:
+      tags: [Chains]
+      summary: Chains that look like the same rig, and what folding one would do.
+      description: |
+        Session-only. The discovery half of the fold below, and the same
+        preview-then-apply shape the metadata sanitiser uses: this reports, it
+        never acts.
+
+        A pair is reported when the two chains disagree on at most two steps.
+        `distance` is how many — `0` is the same wiring under two names, `1` is
+        the swapped-box case (the same commute on different IEMs) that variants
+        exist for. Past two they are simply different rigs, and a variant
+        overriding half a chain is a copy wearing an override's clothes.
+
+        The chain with **more listening** is reported as the base, since it
+        keeps its id and fewer rows move — but the fold takes an explicit
+        direction, so this is a suggestion rather than the decision.
+      responses:
+        '200':
+          description: OK.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  duplicates:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        base_chain_id: { type: integer }
+                        base_name: { type: string }
+                        base_hours: { type: number }
+                        fold_chain_id: { type: integer }
+                        fold_name: { type: string }
+                        fold_hours: { type: number }
+                        distance:
+                          type: integer
+                          description: How many steps disagree. 0 is identical wiring.
+                        overrides:
+                          type: array
+                          description: |
+                            What the folded chain becomes as a variant of the base —
+                            derived from the two chains, so it credits the gear the
+                            folded chain actually named.
+                          items:
+                            type: object
+                            properties:
+                              position: { type: integer }
+                              equipment_id: { type: integer, nullable: true }
+                              name: { type: string, nullable: true }
+                        matching_variant:
+                          type: array
+                          nullable: true
+                          description: |
+                            `[id, name]` of a variant of the base that is *already*
+                            wired the way the duplicate is — the state someone is in
+                            when they built the variant and found the old chain still
+                            sitting in the list beside it. Null when there is none.
+                          items: {}
+                        fold_blocked_by_variants:
+                          type: boolean
+                          description: |
+                            This chain carries variants of its own, so it cannot be
+                            the side that folds. Surfaced here rather than left for
+                            the fold to refuse after it has been picked.
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /api/v1/chains/{id}/fold:
+    post:
+      tags: [Chains]
+      summary: Fold this chain into another as a variant of it.
+      description: |
+        Session-only. **Not reversible.**
+
+        Every listen, side, session, binding, device default and token default
+        of this chain is repointed at `into_chain_id` carrying the variant, and
+        this chain is then deleted. Because gear hours resolve per
+        `(chain, variant)` pair, the moved listening lands on the gear that was
+        actually fitted — which is what makes two near-duplicate chains' hours
+        add up instead of sitting in two rows that cannot be compared.
+
+        Send **either** `variant_id` (a variant of the target chain you already
+        built) **or** `variant_name` (derive a new one from the difference
+        between the two chains). Sending both, or neither, is a 400: on an
+        endpoint that cannot be undone, "use the one I built" and "make me
+        another" must not be the same request with a typo between them.
+
+        Refused with a 400 naming the reason when: the chain is folded into
+        itself, the variant belongs to a different chain (it would resolve to
+        components never fitted together), the name is already taken on the
+        target, or **this chain carries variants of its own** — their positions
+        index into components the fold replaces, and re-deriving them would be a
+        guess about which box was fitted.
+      parameters: [{ name: id, in: path, required: true, schema: { type: integer } }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [into_chain_id]
+              properties:
+                into_chain_id:
+                  type: integer
+                  description: The chain to keep. This one becomes a variant of it.
+                variant_id:
+                  type: integer
+                  description: A variant of the target chain that already exists.
+                variant_name:
+                  type: string
+                  description: |
+                    Name for a variant derived from the two chains' components.
+                  example: Summer
+      responses:
+        '200':
+          description: Folded. The counts are what actually moved.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  variant_id: { type: integer }
+                  variant_name: { type: string }
+                  variant_created:
+                    type: boolean
+                    description: False when it landed on a variant that already existed.
+                  listens: { type: integer }
+                  sides:
+                    type: integer
+                    description: Sides played off the shelf.
+                  sessions: { type: integer }
+                  releases:
+                    type: integer
+                    description: Records on the shelf that named this chain.
+                  devices: { type: integer }
+                  bindings: { type: integer }
+                  tokens: { type: integer }
+        # Refused, with the reason in the body — a foreign variant, a name
+        # already taken, a chain folded into itself, or one carrying variants
+        # of its own.
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
 
   /api/v1/chains/variants/{id}:
     patch:

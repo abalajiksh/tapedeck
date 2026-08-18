@@ -1,7 +1,7 @@
 <script lang="ts">
 	import { onMount, tick } from 'svelte';
 	import { api } from '$lib/api';
-	import type { SignalChain, Equipment, ChainComponent, ChainInput, EquipmentInput, Binding, Device, ChainVariant } from '$lib/api';
+	import type { SignalChain, Equipment, ChainComponent, ChainInput, EquipmentInput, Binding, Device, ChainVariant, FoldSuggestion } from '$lib/api';
 	import { formatHours, timeAgo, toDateInput, fromDateInput, ownedFor, formatDateTime } from '$lib/utils';
 	import ChainIcon, { CHAIN_ICONS, CHAIN_ICON_LABELS } from '$lib/components/ChainIcon.svelte';
 
@@ -147,6 +147,111 @@
 		}
 	}
 
+	// ── Folding a near-duplicate chain in ──
+	//
+	// Variants shipped forward-looking: build one, and listens tagged with it
+	// from then on credit the gear fitted. But the case they were designed
+	// against already existed as two chains — the same commute with different
+	// IEMs — each holding real hours. Creating the variant did nothing to the
+	// duplicate: it kept its own listens, its own total, and its own row on the
+	// page whose whole complaint was near-duplicate rows.
+	//
+	// So the fold moves the listening across and deletes the chain, and the
+	// hours that were split across two rows that could not be compared add up
+	// on one.
+	let dupes: FoldSuggestion[] = [];
+
+	let fOpen = false;
+	let fInto: SignalChain | null = null;      // the chain being kept
+	let fFrom: number | null = null;           // the chain folding into it
+	// Either a variant that exists, or a name to derive one from — never both,
+	// which is why this is one control with a sentinel rather than two fields
+	// that can disagree.
+	let fVariant: number | 'new' = 'new';
+	let fName = '';
+	let fErr = '';
+	let fBusy = false;
+	let fDone: string | null = null;
+
+	/** Chains that could fold into this one: everything else the user owns,
+	 *  nearest wiring first, and never one carrying variants of its own. */
+	$: foldable = (into: SignalChain | null) =>
+		into?.id == null
+			? []
+			: chains
+					.filter((c) => c.id !== into.id && !variants.some((v) => v.chain_id === c.id))
+					.map((c) => ({
+						chain: c,
+						// `distance` comes from the server for the pairs it
+						// considers near-duplicates; anything else is simply a
+						// different rig and sorts last.
+						dupe: dupes.find(
+							(d) =>
+								(d.base_chain_id === into.id && d.fold_chain_id === c.id) ||
+								(d.fold_chain_id === into.id && d.base_chain_id === c.id)
+						)
+					}))
+					.sort((a, b) => (a.dupe?.distance ?? 99) - (b.dupe?.distance ?? 99));
+
+	function openFold(into: SignalChain, from?: number) {
+		fInto = into;
+		fErr = '';
+		fDone = null;
+		const options = foldable(into);
+		fFrom = from ?? options[0]?.chain.id ?? null;
+		pickFoldDefaults();
+		fOpen = true;
+	}
+
+	/** Preselect the variant they already built for this pairing, if there is
+	 *  one — that is the whole state this feature exists to resolve, and
+	 *  offering to create a second variant wired identically would be the wrong
+	 *  default in exactly the case that matters. */
+	function pickFoldDefaults() {
+		const d = dupes.find(
+			(x) => x.base_chain_id === fInto?.id && x.fold_chain_id === fFrom
+		);
+		if (d?.matching_variant) {
+			fVariant = d.matching_variant[0];
+			fName = '';
+		} else {
+			fVariant = 'new';
+			fName = chains.find((c) => c.id === fFrom)?.name ?? '';
+		}
+	}
+
+	async function doFold() {
+		if (fFrom == null || fInto?.id == null) { fErr = 'Pick a chain to fold in.'; return; }
+		if (fVariant === 'new' && !fName.trim()) { fErr = 'Name the variant it becomes.'; return; }
+		fBusy = true;
+		fErr = '';
+		try {
+			const r = await api.foldChain(fFrom, {
+				into_chain_id: fInto.id,
+				...(fVariant === 'new' ? { variant_name: fName.trim() } : { variant_id: fVariant })
+			});
+			// Said rather than assumed: a fold that moved no listens is a real
+			// outcome (an unused duplicate), and reporting "done" for both
+			// hides the difference.
+			fDone =
+				`Folded into “${fInto.name}” as “${r.variant_name}”. ` +
+				(r.listens
+					? `${r.listens} listen${r.listens > 1 ? 's' : ''} moved` +
+					  (r.sides ? `, ${r.sides} side${r.sides > 1 ? 's' : ''}` : '') +
+					  (r.devices || r.tokens || r.bindings
+							? `, and ${r.devices + r.tokens + r.bindings} attribution rule${
+									r.devices + r.tokens + r.bindings > 1 ? 's' : ''
+							  }`
+							: '') +
+					  '.'
+					: 'It had no listening of its own.');
+			await load();
+		} catch (e) {
+			fErr = String(e).replace(/^API \d+: /, '');
+		}
+		fBusy = false;
+	}
+
 	const contexts = ['active', 'active-mobile', 'passive', 'background', 'unknown'];
 	// Values must stay in sync with `ComponentType` in src/models.rs — serde
 	// rejects anything else with a 422, so an extra option here is a broken save.
@@ -273,11 +378,13 @@
 
 	async function load() {
 		try {
-			const [c, g, b, d, v] = await Promise.all([
-				api.getChains(), api.getEquipment(), api.getBindings(), api.getDevices(), api.getVariants()
+			const [c, g, b, d, v, dup] = await Promise.all([
+				api.getChains(), api.getEquipment(), api.getBindings(), api.getDevices(), api.getVariants(),
+				api.getChainDuplicates()
 			]);
 			chains = c.chains;
 			variants = v.variants;
+			dupes = dup.duplicates;
 			equipment = g.equipment;
 			bindings = b.bindings;
 			devices = d.devices;
@@ -582,6 +689,25 @@
 				listens through {unmappedDevices.length > 1 ? 'them' : 'it'} won’t be attributed.
 			</span>
 			<span class="nudge-cta">Review →</span>
+		</button>
+	{:else if dupes.length}
+		<!-- Two chains that are the same rig split their hours across two rows
+		     that cannot be compared, which is wrong *now* rather than wrong for
+		     future listens — but a device with no chain is losing attribution
+		     outright, so it still leads. -->
+		<button class="nudge" aria-label="Fold near-duplicate chains together"
+			on:click={() => {
+				const d = dupes[0];
+				const into = chains.find((c) => c.id === d.base_chain_id);
+				if (into) openFold(into, d.fold_chain_id);
+			}}>
+			<svg viewBox="0 0 24 24" width="17" fill="none" stroke="var(--td-accent)" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" style="flex:none;"><path d="M8 3v6l-4 3 4 3v6M16 3v6l4 3-4 3v6"/></svg>
+			<span style="flex:1;font-size:13.5px;">
+				{dupes.length === 1 ? '“' + dupes[0].fold_name + '” is' : dupes.length + ' chains are'}
+				near-{dupes.length === 1 ? 'identical to “' + dupes[0].base_name + '”' : 'duplicates of another'} —
+				fold {dupes.length === 1 ? 'it' : 'them'} in as {dupes.length === 1 ? 'a variant' : 'variants'} and the hours add up.
+			</span>
+			<span class="nudge-cta">Fold →</span>
 		</button>
 	{:else if unmapped.length}
 		<button class="nudge" aria-label="Review unmapped outputs" on:click={() => (secTab = 'outputs')}>
@@ -892,7 +1018,18 @@
 					and its hours land on the gear that was actually fitted.
 				</p>
 			{/each}
-			<button class="vadd" on:click={() => openChain && newVariant(openChain)}>+ variant</button>
+			<div style="display:flex;gap:8px;flex-wrap:wrap;">
+				<button class="vadd" on:click={() => openChain && newVariant(openChain)}>+ variant</button>
+				<!-- The other way to get a variant: an existing chain that is
+				     really this one wired differently. Only offered when there
+				     is something to fold. -->
+				{#if openChain && foldable(openChain).length}
+					<button class="vadd" on:click={() => openChain && openFold(openChain)}
+						title="Move another chain's listening onto this one as a variant">
+						⤵ fold a chain in
+					</button>
+				{/if}
+			</div>
 
 			{#if devices.some((d) => d.default_chain_id === openChain?.id) || bindings.some((b) => b.chain_id === openChain?.id)}
 				<div class="drawer-label" style="margin-top:26px;">Attributing to this chain</div>
@@ -971,6 +1108,87 @@
 				<button class="btn btn-primary" on:click={saveVariant} disabled={vSaving}>
 					{vSaving ? 'Saving…' : 'Save variant'}
 				</button>
+			</div>
+		</div>
+	</div>
+{/if}
+
+<!-- Fold dialog.
+     Two chains that are the same rig with one box swapped are one chain and a
+     choice — but saying so after the fact has to *move the listening*, or the
+     hours stay split across a row that no longer exists in the user's head.
+     Not reversible, and the dialog says so rather than burying it. -->
+{#if fOpen && fInto}
+	<div class="dialog-backdrop" on:click={() => (fOpen = false)} on:keydown={() => {}} role="presentation">
+		<div class="dialog" style="width:min(560px,100%);" on:click|stopPropagation on:keydown|stopPropagation role="presentation">
+			<div class="dialog-title">Fold a chain into “{fInto.name}”</div>
+			<div class="dialog-body">
+				{#if fDone}
+					<p style="font-size:13.5px;margin:0;">{fDone}</p>
+				{:else}
+					<div style="display:flex;flex-direction:column;gap:13px;">
+						<div class="field">
+							<label for="ff">Which chain is really this one?</label>
+							<select id="ff" class="input" bind:value={fFrom} on:change={pickFoldDefaults}>
+								{#each foldable(fInto) as o}
+									<option value={o.chain.id}>
+										{o.chain.name}{o.dupe
+											? o.dupe.distance === 0
+												? ' — identical wiring'
+												: ` — ${o.dupe.distance} step${o.dupe.distance > 1 ? 's' : ''} differ${o.dupe.distance > 1 ? '' : 's'}`
+											: ''}{o.chain.total_hours > 0 ? ` · ${formatHours(o.chain.total_hours)}` : ''}
+									</option>
+								{/each}
+							</select>
+							<p style="font-size:12px;color:var(--td-muted-2);margin:5px 0 0;">
+								Its listening moves onto “{fInto.name}” and the chain itself is deleted.
+								A chain carrying variants of its own can’t fold — its overrides point at
+								steps this would replace.
+							</p>
+						</div>
+						<div class="field">
+							<label for="fv">Logged as</label>
+							<select id="fv" class="input" bind:value={fVariant}>
+								<option value="new">— a new variant —</option>
+								{#each variantsFor(fInto.id) as v}
+									<option value={v.id}>{v.name}</option>
+								{/each}
+							</select>
+							{#if fVariant === 'new'}
+								<input class="input" style="margin-top:8px;" bind:value={fName} placeholder="Summer" />
+								<p style="font-size:12px;color:var(--td-muted-2);margin:5px 0 0;">
+									What it swaps is worked out from the two chains, so the moved hours
+									credit the gear that chain actually named — not this one’s.
+								</p>
+							{:else}
+								<p style="font-size:12px;color:var(--td-muted-2);margin:5px 0 0;">
+									The moved listens credit whatever this variant swaps in. Pick the one
+									that matches how that chain was wired.
+								</p>
+							{/if}
+						</div>
+						<p style="font-size:12.5px;color:var(--td-muted-2);margin:0;border-left:2px solid var(--td-muted-3);padding-left:10px;">
+							Not reversible. The listens keep everything else — only which chain and
+							variant they went through changes.
+						</p>
+						{#if fErr}<p style="font-size:13px;color:#b2622d;margin:0;">{fErr}</p>{/if}
+					</div>
+				{/if}
+			</div>
+			<div class="dialog-actions">
+				<!-- The drawer is opened on the way out rather than alongside the
+				     result: both are overlays, and raising the drawer while the
+				     dialog still holds the "what moved" line buries the one
+				     thing worth reading. -->
+				<button class="btn btn-secondary"
+					on:click={() => { const keep = fDone ? fInto?.id ?? null : null; fOpen = false; if (keep != null) openChainId = keep; }}>
+					{fDone ? 'Close' : 'Cancel'}
+				</button>
+				{#if !fDone}
+					<button class="btn btn-primary" on:click={doFold} disabled={fBusy || fFrom == null}>
+						{fBusy ? 'Folding…' : 'Fold in'}
+					</button>
+				{/if}
 			</div>
 		</div>
 	</div>

@@ -5923,30 +5923,73 @@ impl Database {
     /// Delete a chain, first unlinking (not deleting) anything that references
     /// it — listens and sessions keep their data with `chain_id` cleared. Done
     /// in a transaction so we never leave dangling FKs (sqlx enables them).
+    ///
+    /// **Ten tables carry a chain reference and this used to clear four**, so
+    /// deleting a chain that a token pointed at, or that a record on the shelf
+    /// named, or that had a *variant*, failed outright with a foreign-key
+    /// violation. The variant case is the one that bit: `chain_variants.chain_id`
+    /// is `NOT NULL`, so the moment anyone set up the feature v0.54.0 shipped,
+    /// the chain it belonged to became undeletable — and the error surfaces as a
+    /// 500 with nothing saying which reference is in the way.
+    ///
+    /// Variants are **deleted** rather than unlinked, unlike everything else
+    /// here: a variant is a set of overrides indexed into a chain's components,
+    /// so without that chain it is not a degraded row, it is a meaningless one.
+    /// The listens that pointed at those variants keep their own data and lose
+    /// only the variant, which is what a null variant already means everywhere.
     pub async fn delete_chain(&self, user_id: i64, chain_id: i64) -> Result<bool, sqlx::Error> {
+        // Ownership is settled **first**, so everything below can clear by chain
+        // id alone. That matters for `pairing_requests`, whose `user_id` is
+        // nullable — scoping its clear by user would skip exactly the rows that
+        // then block the delete.
+        let owned: Option<(i64,)> =
+            sqlx::query_as("SELECT id FROM signal_chains WHERE id = ? AND user_id = ?")
+                .bind(chain_id)
+                .bind(user_id)
+                .fetch_optional(&self.pool)
+                .await?;
+        if owned.is_none() {
+            return Ok(false);
+        }
+
         let mut tx = self.pool.begin().await?;
-        sqlx::query("UPDATE scrobbles SET chain_id = NULL WHERE chain_id = ? AND user_id = ?")
+
+        // Anything pointing at a *variant* of this chain has to let go before
+        // the variants themselves can be deleted.
+        for table in ["scrobbles", "physical_plays", "physical_releases"] {
+            sqlx::query(&format!(
+                "UPDATE {table} SET chain_variant_id = NULL
+                  WHERE chain_variant_id IN
+                        (SELECT id FROM chain_variants WHERE chain_id = ?)"
+            ))
             .bind(chain_id)
-            .bind(user_id)
             .execute(&mut *tx)
             .await?;
-        sqlx::query("UPDATE sessions SET chain_id = NULL WHERE chain_id = ? AND user_id = ?")
+        }
+        sqlx::query("DELETE FROM chain_variants WHERE chain_id = ?")
             .bind(chain_id)
-            .bind(user_id)
             .execute(&mut *tx)
             .await?;
-        sqlx::query(
-            "UPDATE devices SET default_chain_id = NULL WHERE default_chain_id = ? AND user_id = ?",
-        )
-        .bind(chain_id)
-        .bind(user_id)
-        .execute(&mut *tx)
-        .await?;
-        sqlx::query("UPDATE chain_bindings SET chain_id = NULL WHERE chain_id = ? AND user_id = ?")
-            .bind(chain_id)
-            .bind(user_id)
-            .execute(&mut *tx)
-            .await?;
+
+        // Everything that merely *names* the chain keeps its row and loses the
+        // reference.
+        for (table, column) in [
+            ("scrobbles", "chain_id"),
+            ("sessions", "chain_id"),
+            ("devices", "default_chain_id"),
+            ("chain_bindings", "chain_id"),
+            ("tokens", "default_chain_id"),
+            ("physical_plays", "chain_id"),
+            ("physical_releases", "chain_id"),
+            ("physical_spins", "chain_id"),
+            ("pairing_requests", "default_chain_id"),
+        ] {
+            sqlx::query(&format!("UPDATE {table} SET {column} = NULL WHERE {column} = ?"))
+                .bind(chain_id)
+                .execute(&mut *tx)
+                .await?;
+        }
+
         let res = sqlx::query("DELETE FROM signal_chains WHERE id = ? AND user_id = ?")
             .bind(chain_id)
             .bind(user_id)
@@ -8877,6 +8920,332 @@ impl Database {
         Ok(row.is_some())
     }
 
+    /// Fold one chain into another as a variant of it, moving its listening
+    /// with it.
+    ///
+    /// **This is the half v0.54.0 left out.** Variants shipped as a
+    /// forward-looking feature: you build one, and listens tagged with it from
+    /// then on credit the gear that was fitted. But the case the feature was
+    /// *measured* against already existed as two chains — "Commute Phone"
+    /// (Xperia → HD 569) and "Summer Commute" (Xperia → Hexa), differing by one
+    /// box, each holding real hours. Creating the variant did nothing to them:
+    /// the duplicate chain kept its own listens, its own total, and its own row
+    /// on a page whose whole complaint was near-duplicate rows. So the one
+    /// situation variants were designed for was the one they could not resolve.
+    ///
+    /// Every listen, side, session and binding of `from_chain_id` is repointed
+    /// at `into_chain_id` carrying `variant_id`, and the source chain is then
+    /// deleted. `equipment_seconds` resolves the overrides per `(chain,
+    /// variant)` pair, so the moved hours land on the gear that was actually
+    /// fitted — which is what makes the two totals add up instead of sitting in
+    /// two rows that cannot be compared.
+    ///
+    /// Four rules, all load-bearing:
+    ///
+    /// * **A chain with its own variants is refused.** Their `position`s index
+    ///   into the source chain's components, and those are about to stop being
+    ///   the base. Re-deriving them against the target is possible and would be
+    ///   a *guess* about which box was fitted — the one thing this whole
+    ///   feature exists to stop guessing at.
+    /// * **The variant must belong to the target chain.** The same rule
+    ///   `variant_fits_chain` enforces at the door, for the same reason: a
+    ///   variant paired with another chain resolves to components that were
+    ///   never fitted together, and `equipment_seconds` would ignore it —
+    ///   silently crediting the base gear for every listen just moved.
+    /// * **Sessions carry no variant**, by design: a session's variant is read
+    ///   off its listens, so moving the listens moves it and the two cannot
+    ///   disagree.
+    /// * **A device default, a token default and a binding carry no variant
+    ///   either** — they are standing statements about a *chain*, and there is
+    ///   no slot for which stylus is in the headshell. They follow the chain.
+    ///
+    /// Not reversible. The caller says so before running it.
+    pub async fn fold_chain_into_variant(
+        &self,
+        user_id: i64,
+        from_chain_id: i64,
+        into_chain_id: i64,
+        variant: FoldTarget<'_>,
+    ) -> Result<Result<FoldOutcome, String>, sqlx::Error> {
+        if from_chain_id == into_chain_id {
+            return Ok(Err("A chain cannot be folded into itself".into()));
+        }
+
+        let from = self.get_chain(user_id, from_chain_id).await?;
+        let into = self.get_chain(user_id, into_chain_id).await?;
+        let (Some(from), Some(into)) = (from, into) else {
+            return Ok(Err("No such chain".into()));
+        };
+
+        // Its variants index into components that are about to stop being the
+        // base. Refused rather than re-derived.
+        let own: Vec<(i64,)> =
+            sqlx::query_as("SELECT id FROM chain_variants WHERE chain_id = ? AND user_id = ?")
+                .bind(from_chain_id)
+                .bind(user_id)
+                .fetch_all(&self.pool)
+                .await?;
+        if !own.is_empty() {
+            return Ok(Err(format!(
+                "\"{}\" has {} variant(s) of its own. Their overrides index into its components, \
+                 which folding replaces — delete them first, or fold the other way round.",
+                from.name,
+                own.len()
+            )));
+        }
+
+        let mut tx = self.pool.begin().await?;
+        let now = Self::now_secs();
+
+        let (variant_id, variant_name, created) = match variant {
+            FoldTarget::Existing(id) => {
+                let row: Option<(i64, String)> = sqlx::query_as(
+                    "SELECT id, name FROM chain_variants
+                      WHERE id = ? AND user_id = ? AND chain_id = ?",
+                )
+                .bind(id)
+                .bind(user_id)
+                .bind(into_chain_id)
+                .fetch_optional(&mut *tx)
+                .await?;
+                match row {
+                    Some((id, name)) => (id, name, false),
+                    None => {
+                        return Ok(Err(
+                            "That variant isn't one of the chain you're folding into".into()
+                        ))
+                    }
+                }
+            }
+            // Derived from the two chains, never from the request: the whole
+            // point is that the moved listens credit the gear the source chain
+            // actually named.
+            FoldTarget::New(name) => {
+                let name = name.trim();
+                if name.is_empty() {
+                    return Ok(Err("The new variant needs a name".into()));
+                }
+                let overrides = crate::models::derive_overrides(&into.components, &from.components);
+                let json = serde_json::to_string(&overrides).unwrap_or_else(|_| "[]".into());
+                let res = sqlx::query(
+                    "INSERT INTO chain_variants (user_id, chain_id, name, overrides, created_at)
+                     VALUES (?, ?, ?, ?, ?)",
+                )
+                .bind(user_id)
+                .bind(into_chain_id)
+                .bind(name)
+                .bind(json)
+                .bind(now)
+                .execute(&mut *tx)
+                .await;
+                match res {
+                    Ok(r) => (r.last_insert_rowid(), name.to_string(), true),
+                    // `UNIQUE(chain_id, name)`, so this is the ordinary
+                    // collision rather than a fault.
+                    Err(sqlx::Error::Database(e)) if e.is_unique_violation() => {
+                        return Ok(Err(format!(
+                            "\"{}\" already has a variant called \"{name}\"",
+                            into.name
+                        )))
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+        };
+
+        let mut out = FoldOutcome {
+            variant_id,
+            variant_name,
+            variant_created: created,
+            ..Default::default()
+        };
+
+        // The listening, which is the whole point: chain *and* variant, so the
+        // hours resolve against the gear that was fitted.
+        for (table, slot) in [
+            ("scrobbles", &mut out.listens),
+            ("physical_plays", &mut out.sides),
+            ("physical_releases", &mut out.releases),
+        ] {
+            let res = sqlx::query(&format!(
+                "UPDATE {table} SET chain_id = ?, chain_variant_id = ?
+                  WHERE chain_id = ? AND user_id = ?"
+            ))
+            .bind(into_chain_id)
+            .bind(variant_id)
+            .bind(from_chain_id)
+            .bind(user_id)
+            .execute(&mut *tx)
+            .await?;
+            *slot = res.rows_affected();
+        }
+
+        // Everything that names a chain and has no variant slot. A session's
+        // variant is read off its listens, which have just moved.
+        for (table, column, slot) in [
+            ("sessions", "chain_id", &mut out.sessions),
+            ("devices", "default_chain_id", &mut out.devices),
+            ("chain_bindings", "chain_id", &mut out.bindings),
+            ("tokens", "default_chain_id", &mut out.tokens),
+        ] {
+            let res = sqlx::query(&format!(
+                "UPDATE {table} SET {column} = ? WHERE {column} = ? AND user_id = ?"
+            ))
+            .bind(into_chain_id)
+            .bind(from_chain_id)
+            .bind(user_id)
+            .execute(&mut *tx)
+            .await?;
+            *slot = res.rows_affected();
+        }
+
+        // No counts reported for these two: a spin is the deck as it is right
+        // now and a pairing request is a credential in flight. Both still have
+        // to let go before the source chain can be deleted.
+        for (table, column) in
+            [("physical_spins", "chain_id"), ("pairing_requests", "default_chain_id")]
+        {
+            sqlx::query(&format!("UPDATE {table} SET {column} = ? WHERE {column} = ?"))
+                .bind(into_chain_id)
+                .bind(from_chain_id)
+                .execute(&mut *tx)
+                .await?;
+        }
+
+        sqlx::query("DELETE FROM signal_chains WHERE id = ? AND user_id = ?")
+            .bind(from_chain_id)
+            .bind(user_id)
+            .execute(&mut *tx)
+            .await?;
+
+        tx.commit().await?;
+        Ok(Ok(out))
+    }
+
+    /// Chains that differ from another of the caller's by only a step or two.
+    ///
+    /// The discovery half of the fold, and the same shape the sanitiser uses:
+    /// this reports, it never acts. `distance` is how many steps disagree, so 0
+    /// is the same rig under two names and 1 is the swapped-box case the whole
+    /// feature exists for.
+    ///
+    /// Ordered so the chain with **more listening** is the base and the smaller
+    /// one folds into it. That is only a suggestion — the endpoint takes an
+    /// explicit direction — but it is the right default: the base keeps its id,
+    /// and repointing the smaller side moves fewer rows.
+    pub async fn near_duplicate_chains(
+        &self,
+        user_id: i64,
+    ) -> Result<Vec<FoldSuggestion>, sqlx::Error> {
+        // Deliberately **not** `get_chains` + `list_variants`, which is what
+        // this was first written as. Both derive hours with a correlated
+        // subquery per row, and the join key is `chain_id`, which no index
+        // serves — so that version cost one full scan of the history per chain
+        // *and* per variant, and the page already pays for one set of those in
+        // `get_chains`. On a Pi with the database on an SD card that is the
+        // difference this codebase has been caught by twice: no individual
+        // statement is slow, there are simply far too many of them.
+        //
+        // Components and overrides need no scan at all, and the hours come from
+        // one grouped pass — the shape `equipment_seconds` already uses.
+        let rows: Vec<(i64, String, String)> =
+            sqlx::query_as("SELECT id, name, components FROM signal_chains WHERE user_id = ?")
+                .bind(user_id)
+                .fetch_all(&self.pool)
+                .await?;
+        let variant_rows: Vec<(i64, i64, String, String)> = sqlx::query_as(
+            "SELECT id, chain_id, name, overrides FROM chain_variants WHERE user_id = ?",
+        )
+        .bind(user_id)
+        .fetch_all(&self.pool)
+        .await?;
+        let totals: Vec<(Option<i64>, Option<i64>)> = sqlx::query_as(
+            "SELECT chain_id, SUM(duration) FROM scrobbles
+              WHERE user_id = ? AND skipped = FALSE AND chain_id IS NOT NULL
+              GROUP BY chain_id",
+        )
+        .bind(user_id)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let hours: HashMap<i64, f64> = totals
+            .into_iter()
+            .filter_map(|(c, s)| Some((c?, s.unwrap_or(0) as f64 / 3600.0)))
+            .collect();
+        struct Chain {
+            id: i64,
+            name: String,
+            components: Vec<ChainComponent>,
+            hours: f64,
+        }
+        let chains: Vec<Chain> = rows
+            .into_iter()
+            .map(|(id, name, json)| Chain {
+                id,
+                name,
+                components: serde_json::from_str(&json).unwrap_or_default(),
+                hours: hours.get(&id).copied().unwrap_or(0.0),
+            })
+            .collect();
+        let variants: Vec<(i64, i64, String, Vec<VariantOverride>)> = variant_rows
+            .into_iter()
+            .map(|(id, chain_id, name, json)| {
+                (id, chain_id, name, serde_json::from_str(&json).unwrap_or_default())
+            })
+            .collect();
+
+        let mut out: Vec<FoldSuggestion> = Vec::new();
+        for (i, a) in chains.iter().enumerate() {
+            for b in chains.iter().skip(i + 1) {
+                let (a_id, b_id) = (a.id, b.id);
+                let distance = crate::models::chain_distance(&a.components, &b.components);
+                // Two steps is where "a near-duplicate" stops being a useful
+                // description — past that they are simply different rigs, and a
+                // variant that overrides half the chain is a copy wearing an
+                // override's clothes.
+                if distance > 2 {
+                    continue;
+                }
+                // The bigger history is the base: it keeps its id, and fewer
+                // rows move.
+                let (base, dupe, base_id, dupe_id) =
+                    if a.hours >= b.hours { (a, b, a_id, b_id) } else { (b, a, b_id, a_id) };
+                // A chain carrying variants of its own cannot be the one that
+                // folds — say so here rather than letting the fold refuse it
+                // after the user has picked it.
+                let dupe_has_variants = variants.iter().any(|(_, chain, _, _)| *chain == dupe_id);
+                let overrides = crate::models::derive_overrides(&base.components, &dupe.components);
+                out.push(FoldSuggestion {
+                    base_chain_id: base_id,
+                    base_name: base.name.clone(),
+                    base_hours: base.hours,
+                    fold_chain_id: dupe_id,
+                    fold_name: dupe.name.clone(),
+                    fold_hours: dupe.hours,
+                    distance: distance as i64,
+                    overrides: overrides.clone(),
+                    // A variant of the base that already wires it the way the
+                    // duplicate does — which is exactly the state someone is in
+                    // when they set variants up and found the old chain still
+                    // sitting there.
+                    matching_variant: variants
+                        .iter()
+                        .find(|(_, chain, _, o)| *chain == base_id && *o == overrides)
+                        .map(|(id, _, name, _)| (*id, name.clone())),
+                    fold_blocked_by_variants: dupe_has_variants,
+                });
+            }
+        }
+        out.sort_by(|x, y| {
+            x.distance.cmp(&y.distance).then(
+                (y.base_hours + y.fold_hours)
+                    .partial_cmp(&(x.base_hours + x.fold_hours))
+                    .unwrap_or(std::cmp::Ordering::Equal),
+            )
+        });
+        Ok(out)
+    }
+
     /// Seconds of listening attributable to each piece of gear.
     ///
     /// This used to be one SQL expression: sum the listens of every chain whose
@@ -11127,6 +11496,65 @@ pub struct ChainVariantRow {
 /// `total_hours` here is the listening that went through *this variant*, which
 /// is a different question from a chain's total — a chain's hours include every
 /// variant of it, since they all ran through the same chain.
+
+/// What a fold moved, so the caller can say it rather than claim success.
+///
+/// Reported per table because they are different kinds of thing: listens
+/// are the hours, a token or a device default is *future* attribution, and
+/// a record on the shelf is the turntable it lives with.
+#[derive(Debug, Default, Clone, serde::Serialize)]
+pub struct FoldOutcome {
+    pub variant_id: i64,
+    pub variant_name: String,
+    pub variant_created: bool,
+    pub listens: u64,
+    pub sides: u64,
+    pub sessions: u64,
+    pub releases: u64,
+    pub devices: u64,
+    pub bindings: u64,
+    pub tokens: u64,
+}
+
+/// Which variant a fold lands on: one that already exists, or one to derive.
+///
+/// A borrow rather than an owned name so the handler can hand its request
+/// straight through — and two cases rather than an `Option<i64>` because
+/// "create one called this" and "use that one" are different intents, not a
+/// present-or-absent field.
+#[derive(Debug, Clone, Copy)]
+pub enum FoldTarget<'a> {
+    Existing(i64),
+    New(&'a str),
+}
+
+/// One pair of chains that look like the same rig, and what folding would do.
+///
+/// Reported, never acted on — the same preview-then-apply discipline the
+/// metadata sanitiser follows, and for the same reason: a fold is not
+/// reversible, and a plurality of one step is a weak signal the operator should
+/// see before agreeing to it.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct FoldSuggestion {
+    pub base_chain_id: i64,
+    pub base_name: String,
+    pub base_hours: f64,
+    pub fold_chain_id: i64,
+    pub fold_name: String,
+    pub fold_hours: f64,
+    /// How many steps disagree. 0 is the same wiring under two names.
+    pub distance: i64,
+    /// What the folded chain becomes as a variant of the base.
+    pub overrides: Vec<VariantOverride>,
+    /// A variant of the base that is *already* wired this way — the state
+    /// someone is in when they built the variant and found the old chain still
+    /// sitting in the list beside it.
+    pub matching_variant: Option<(i64, String)>,
+    /// This one carries variants of its own, so it cannot be the side that
+    /// folds. Surfaced here rather than left for the fold to refuse.
+    pub fold_blocked_by_variants: bool,
+}
+
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ChainVariant {
     pub id: i64,
@@ -14482,5 +14910,328 @@ mod tests {
         // from the listens back on the page.
         assert!(db.set_entity_image(album, None).await.unwrap());
         assert!(db.entity_image(album).await.unwrap().is_none());
+    }
+    /// Build a chain of `(name, equipment_id)` steps.
+    async fn chain_of(db: &Database, uid: i64, name: &str, steps: &[(&str, i64)]) -> i64 {
+        db.create_chain(&SignalChain {
+            id: None,
+            user_id: uid,
+            name: name.into(),
+            description: None,
+            components: steps
+                .iter()
+                .map(|(n, g)| ChainComponent {
+                    component_type: ComponentType::Transducer,
+                    name: (*n).into(),
+                    detail: None,
+                    equipment_id: Some(*g),
+                })
+                .collect(),
+            listening_context: ListeningContext::Active,
+            icon: None,
+            is_active: true,
+            total_hours: 0.0,
+            created_at: 0,
+        })
+        .await
+        .unwrap()
+    }
+
+    /// An hour of listening on a chain.
+    async fn hour_on(db: &Database, uid: i64, chain: i64, ts: u64) {
+        let mut p = play(&format!("t{ts}"), "x", ts);
+        p.duration = Some(3600);
+        db.save_scrobble(
+            uid,
+            &p,
+            None,
+            None,
+            Some(chain),
+            None,
+            None,
+            None,
+            None,
+            ListenDisposition::LIVE,
+        )
+        .await
+        .unwrap();
+    }
+
+    /// The complaint this exists for: two chains differing by one box, each
+    /// holding real hours, with no way to add them up.
+    ///
+    /// After the fold there is **one** chain with a variant, the listening is
+    /// all on it, and — the part that matters — the gear hours resolve against
+    /// what was actually fitted. The shared phone gets both hours; each pair of
+    /// IEMs gets only its own.
+    #[tokio::test]
+    async fn folding_a_near_duplicate_chain_adds_its_hours_up() {
+        let db = testdb().await;
+        let uid = db.create_user("ash", None, "pw", "user").await.unwrap();
+
+        let phone = db.upsert_equipment(uid, "Xperia", "dap", None, None, 0.0, None).await.unwrap();
+        let hd569 =
+            db.upsert_equipment(uid, "HD 569", "headphones", None, None, 0.0, None).await.unwrap();
+        let hexa = db.upsert_equipment(uid, "Hexa", "iem", None, None, 0.0, None).await.unwrap();
+
+        let commute =
+            chain_of(&db, uid, "Commute Phone", &[("Xperia", phone), ("HD 569", hd569)]).await;
+        let summer =
+            chain_of(&db, uid, "Summer Commute", &[("Xperia", phone), ("Hexa", hexa)]).await;
+
+        hour_on(&db, uid, commute, 1_000).await;
+        hour_on(&db, uid, commute, 2_000).await;
+        hour_on(&db, uid, summer, 3_000).await;
+
+        // Before: two rows, and the phone's hours split across them with no
+        // way to see that it is one phone.
+        let secs = db.equipment_seconds(uid).await.unwrap();
+        assert_eq!(secs.get(&phone), Some(&10_800), "3h through the phone either way");
+        assert_eq!(secs.get(&hd569), Some(&7_200));
+        assert_eq!(secs.get(&hexa), Some(&3_600));
+        assert_eq!(db.get_chains(uid).await.unwrap().len(), 2);
+
+        let out = db
+            .fold_chain_into_variant(uid, summer, commute, FoldTarget::New("Hexa"))
+            .await
+            .unwrap()
+            .expect("the fold is allowed");
+
+        assert!(out.variant_created);
+        assert_eq!(out.listens, 1, "the duplicate's listening moved");
+
+        // One chain now, and it carries the whole three hours.
+        let chains = db.get_chains(uid).await.unwrap();
+        assert_eq!(chains.len(), 1, "the near-duplicate is gone");
+        assert_eq!(chains[0].id, Some(commute));
+        assert!(
+            (chains[0].total_hours - 3.0).abs() < 1e-6,
+            "hours added up: {:?}",
+            chains[0].total_hours
+        );
+
+        // And the gear still reads correctly: the swap really was a swap, so
+        // the HD 569 accrues nothing while the Hexa is in.
+        let secs = db.equipment_seconds(uid).await.unwrap();
+        assert_eq!(secs.get(&phone), Some(&10_800), "the phone was in the path throughout");
+        assert_eq!(secs.get(&hd569), Some(&7_200), "no wear while the other IEMs were in");
+        assert_eq!(secs.get(&hexa), Some(&3_600));
+
+        // The variant carries its own share, which is what makes the two
+        // readable side by side instead of as two unrelated chains.
+        let variants = db.list_variants(uid).await.unwrap();
+        assert_eq!(variants.len(), 1);
+        assert_eq!(variants[0].name, "Hexa");
+        assert!((variants[0].total_hours - 1.0).abs() < 1e-6);
+    }
+
+    /// Folding onto a variant the user built themselves is the case they are
+    /// actually in — the variant already exists beside the chain it duplicates.
+    ///
+    /// Also pins the two refusals that keep a fold from crediting gear that was
+    /// never fitted: a variant belonging to some other chain, and folding a
+    /// chain into itself.
+    #[tokio::test]
+    async fn a_fold_lands_on_an_existing_variant_and_refuses_a_foreign_one() {
+        let db = testdb().await;
+        let uid = db.create_user("ash", None, "pw", "user").await.unwrap();
+        let phone = db.upsert_equipment(uid, "Xperia", "dap", None, None, 0.0, None).await.unwrap();
+        let hd569 =
+            db.upsert_equipment(uid, "HD 569", "headphones", None, None, 0.0, None).await.unwrap();
+        let hexa = db.upsert_equipment(uid, "Hexa", "iem", None, None, 0.0, None).await.unwrap();
+
+        let commute =
+            chain_of(&db, uid, "Commute Phone", &[("Xperia", phone), ("HD 569", hd569)]).await;
+        let summer =
+            chain_of(&db, uid, "Summer Commute", &[("Xperia", phone), ("Hexa", hexa)]).await;
+        let desk = chain_of(&db, uid, "Desk", &[("Xperia", phone)]).await;
+
+        // The variant they already built on the chain they mean to keep.
+        let v = db
+            .create_variant(
+                uid,
+                commute,
+                "Summer",
+                &[VariantOverride {
+                    position: 1,
+                    equipment_id: Some(hexa),
+                    name: Some("Hexa".into()),
+                }],
+            )
+            .await
+            .unwrap();
+        // A variant of a *different* chain, to be refused.
+        let foreign = db.create_variant(uid, desk, "Elsewhere", &[]).await.unwrap();
+
+        hour_on(&db, uid, summer, 1_000).await;
+
+        assert!(db
+            .fold_chain_into_variant(uid, summer, commute, FoldTarget::Existing(foreign))
+            .await
+            .unwrap()
+            .is_err());
+        assert!(
+            db.fold_chain_into_variant(uid, summer, summer, FoldTarget::New("x"))
+                .await
+                .unwrap()
+                .is_err(),
+            "a chain cannot be folded into itself"
+        );
+        // Neither refusal moved anything.
+        assert_eq!(db.get_chains(uid).await.unwrap().len(), 3);
+
+        let out = db
+            .fold_chain_into_variant(uid, summer, commute, FoldTarget::Existing(v))
+            .await
+            .unwrap()
+            .expect("their own variant of the target chain");
+        assert!(!out.variant_created, "it reused the variant they built");
+        assert_eq!(out.variant_id, v);
+        assert_eq!(out.listens, 1);
+
+        // The hour landed on the Hexa, via the variant they wired.
+        let secs = db.equipment_seconds(uid).await.unwrap();
+        assert_eq!(secs.get(&hexa), Some(&3_600));
+        assert_eq!(secs.get(&hd569), None, "the base transducer was not fitted");
+    }
+
+    /// A chain carrying variants of its own cannot be the side that folds:
+    /// their `position`s index into components that folding replaces, so
+    /// re-deriving them would be a guess about which box was fitted.
+    ///
+    /// Refused rather than guessed — and `near_duplicate_chains` says so up
+    /// front, so the choice is never offered in the first place.
+    #[tokio::test]
+    async fn a_chain_with_its_own_variants_is_refused_and_flagged_before_it_is_offered() {
+        let db = testdb().await;
+        let uid = db.create_user("ash", None, "pw", "user").await.unwrap();
+        let phone = db.upsert_equipment(uid, "Xperia", "dap", None, None, 0.0, None).await.unwrap();
+        let hd569 =
+            db.upsert_equipment(uid, "HD 569", "headphones", None, None, 0.0, None).await.unwrap();
+        let hexa = db.upsert_equipment(uid, "Hexa", "iem", None, None, 0.0, None).await.unwrap();
+
+        let commute =
+            chain_of(&db, uid, "Commute Phone", &[("Xperia", phone), ("HD 569", hd569)]).await;
+        let summer =
+            chain_of(&db, uid, "Summer Commute", &[("Xperia", phone), ("Hexa", hexa)]).await;
+
+        // The *smaller* chain is the one carrying a variant, so the suggestion
+        // would otherwise pick it as the side to fold.
+        db.create_variant(uid, summer, "Its own", &[]).await.unwrap();
+        hour_on(&db, uid, commute, 1_000).await;
+
+        let err = db
+            .fold_chain_into_variant(uid, summer, commute, FoldTarget::New("Hexa"))
+            .await
+            .unwrap()
+            .expect_err("refused");
+        assert!(err.contains("variant"), "the message says why: {err}");
+        assert_eq!(db.get_chains(uid).await.unwrap().len(), 2, "nothing moved");
+
+        let s = db.near_duplicate_chains(uid).await.unwrap();
+        assert_eq!(s.len(), 1);
+        assert_eq!(s[0].distance, 1, "one box differs");
+        assert_eq!(s[0].base_chain_id, commute, "the bigger history is the base");
+        assert_eq!(s[0].fold_chain_id, summer);
+        assert!(s[0].fold_blocked_by_variants, "flagged before it is offered");
+    }
+
+    /// The state that prompted all of this: the variant is built, and the old
+    /// chain is still sitting in the list beside it. The suggestion has to
+    /// *recognise* that variant rather than offer to create a second one
+    /// wired identically.
+    #[tokio::test]
+    async fn a_variant_that_already_wires_it_that_way_is_recognised() {
+        let db = testdb().await;
+        let uid = db.create_user("ash", None, "pw", "user").await.unwrap();
+        let phone = db.upsert_equipment(uid, "Xperia", "dap", None, None, 0.0, None).await.unwrap();
+        let hd569 =
+            db.upsert_equipment(uid, "HD 569", "headphones", None, None, 0.0, None).await.unwrap();
+        let hexa = db.upsert_equipment(uid, "Hexa", "iem", None, None, 0.0, None).await.unwrap();
+
+        let commute =
+            chain_of(&db, uid, "Commute Phone", &[("Xperia", phone), ("HD 569", hd569)]).await;
+        let summer =
+            chain_of(&db, uid, "Summer Commute", &[("Xperia", phone), ("Hexa", hexa)]).await;
+        hour_on(&db, uid, commute, 1_000).await;
+
+        // No variant yet: nothing to recognise.
+        let s = db.near_duplicate_chains(uid).await.unwrap();
+        assert!(s[0].matching_variant.is_none());
+        assert_eq!(s[0].overrides.len(), 1, "what it would become");
+
+        let v = db
+            .create_variant(
+                uid,
+                commute,
+                "Summer",
+                &[VariantOverride {
+                    position: 1,
+                    equipment_id: Some(hexa),
+                    name: Some("Hexa".into()),
+                }],
+            )
+            .await
+            .unwrap();
+
+        let s = db.near_duplicate_chains(uid).await.unwrap();
+        assert_eq!(
+            s[0].matching_variant.as_ref().map(|(id, n)| (*id, n.as_str())),
+            Some((v, "Summer")),
+            "the variant they already built is the one to fold onto"
+        );
+        assert!(!s[0].fold_blocked_by_variants, "a variant on the *base* does not block");
+    }
+
+    /// Deleting a chain that has a variant used to fail outright with a foreign
+    /// key violation — `chain_variants.chain_id` is NOT NULL, and `delete_chain`
+    /// cleared four of the ten tables that reference a chain. So the moment
+    /// anyone used the feature v0.54.0 shipped, that chain became undeletable,
+    /// and the error surfaced as a 500 naming nothing.
+    ///
+    /// The other five references are pinned here too, because each one is the
+    /// same bug waiting and none of them errors until someone happens to own
+    /// that combination.
+    #[tokio::test]
+    async fn a_chain_can_be_deleted_whatever_still_points_at_it() {
+        let db = testdb().await;
+        let uid = db.create_user("ash", None, "pw", "user").await.unwrap();
+        let hexa = db.upsert_equipment(uid, "Hexa", "iem", None, None, 0.0, None).await.unwrap();
+        let cid = chain_of(&db, uid, "Commute Phone", &[("Hexa", hexa)]).await;
+
+        let v = db.create_variant(uid, cid, "Summer", &[]).await.unwrap();
+        hour_on(&db, uid, cid, 1_000).await;
+        // A token pointing at it, and a record on the shelf that lives with it.
+        db.create_token(uid, "phone", "submit", Some(cid), false).await.unwrap();
+        let rid = db
+            .create_physical(
+                uid,
+                "vinyl",
+                "Burial",
+                "Untrue",
+                Some(2007),
+                None,
+                None,
+                None,
+                None,
+                None,
+                "[]",
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        db.update_physical(uid, rid, None, Some(Some(cid)), None, None, None, None).await.unwrap();
+
+        assert!(db.delete_chain(uid, cid).await.unwrap(), "it deletes");
+        assert!(db.get_chain(uid, cid).await.unwrap().is_none());
+        // The variant went with it — overrides indexed into components that no
+        // longer exist are not a degraded row, they are a meaningless one.
+        assert!(db.list_variants(uid).await.unwrap().iter().all(|x| x.id != v));
+        // The listening survives, having lost only the attribution.
+        assert_eq!(
+            db.get_recent_scrobbles(uid, 10, 0, None, None, None, None, None).await.unwrap().len(),
+            1
+        );
     }
 }

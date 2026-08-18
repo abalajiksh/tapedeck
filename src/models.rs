@@ -512,12 +512,150 @@ impl ListeningContext {
     }
 }
 
+/// Do these two steps name the same thing?
+///
+/// Keyed on `equipment_id` when both sides have one — that is the identity the
+/// hours are attributed against, and two rows of gear with the same name are
+/// still two rows. Only when neither side is linked to a piece of gear does
+/// this fall back to the free-text name, folded the way every other name
+/// comparison in this codebase folds one.
+///
+/// A linked step and a free-text step are deliberately **never** equal, even
+/// when the text matches: one credits an equipment row and the other credits
+/// nothing, so treating them as the same step would fold a chain that logs
+/// hours into one that does not.
+pub fn component_matches(a: &ChainComponent, b: &ChainComponent) -> bool {
+    match (a.equipment_id, b.equipment_id) {
+        (Some(x), Some(y)) => x == y,
+        (None, None) => a.name.trim().eq_ignore_ascii_case(b.name.trim()),
+        _ => false,
+    }
+}
+
+/// The overrides that turn `base`'s components into `target`'s.
+///
+/// This is what makes an existing near-duplicate chain foldable into a variant
+/// rather than only offering variants to chains built from today on. Every
+/// position where the two disagree becomes one override, and the three cases
+/// the override format already supports line up exactly with the three ways two
+/// chains can differ:
+///
+/// * **Replaced** — both have a step at this position and they differ.
+/// * **Added** — `target` is longer, and a `position` past the end of the base
+///   components adds a step (which `equipment_seconds` handles explicitly).
+/// * **Removed** — `target` is shorter, so the trailing positions get an
+///   override with no `equipment_id`, which is what removing a step means.
+///
+/// Positions the two agree on emit nothing, which is the whole point of an
+/// override: editing the shared part of a chain must keep updating every
+/// variant of it.
+pub fn derive_overrides(
+    base: &[ChainComponent],
+    target: &[ChainComponent],
+) -> Vec<VariantOverride> {
+    let mut out = Vec::new();
+    for i in 0..base.len().max(target.len()) {
+        match (base.get(i), target.get(i)) {
+            (Some(b), Some(t)) if component_matches(b, t) => {}
+            (_, Some(t)) => out.push(VariantOverride {
+                position: i as i64,
+                equipment_id: t.equipment_id,
+                name: Some(t.name.clone()),
+            }),
+            // The base runs on past the end of the target: this variant does
+            // without those steps.
+            (Some(_), None) => {
+                out.push(VariantOverride { position: i as i64, equipment_id: None, name: None })
+            }
+            (None, None) => {}
+        }
+    }
+    out
+}
+
+/// How many steps two chains disagree on — 0 when they are the same wiring.
+///
+/// Used only to rank and filter the fold suggestions; it decides what gets
+/// offered, never what gets written.
+pub fn chain_distance(a: &[ChainComponent], b: &[ChainComponent]) -> usize {
+    (0..a.len().max(b.len()))
+        .filter(|&i| match (a.get(i), b.get(i)) {
+            (Some(x), Some(y)) => !component_matches(x, y),
+            _ => true,
+        })
+        .count()
+}
+
 // Device, Equipment, and ListeningSession rows are read back as ad-hoc tuples
 // or the DeviceRow/EquipmentRow types in db.rs — no shared model struct needed.
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn step(name: &str, gear: Option<i64>) -> ChainComponent {
+        ChainComponent {
+            component_type: ComponentType::Transducer,
+            name: name.into(),
+            detail: None,
+            equipment_id: gear,
+        }
+    }
+
+    /// The case the whole fold exists for, and the one measured on the real
+    /// page: two chains that differ by exactly one box.
+    #[test]
+    fn one_swapped_step_derives_one_override() {
+        let commute = [step("Xperia", Some(1)), step("HD 569", Some(2))];
+        let summer = [step("Xperia", Some(1)), step("Hexa", Some(3))];
+
+        assert_eq!(chain_distance(&commute, &summer), 1);
+        let o = derive_overrides(&commute, &summer);
+        assert_eq!(o.len(), 1, "only the step that differs is stored");
+        assert_eq!(o[0].position, 1);
+        assert_eq!(o[0].equipment_id, Some(3));
+        assert_eq!(o[0].name.as_deref(), Some("Hexa"));
+    }
+
+    /// Identical wiring produces no overrides at all. A variant with an empty
+    /// override list is the same rig under a second name, which is exactly what
+    /// folding a pure duplicate should leave behind.
+    #[test]
+    fn identical_chains_derive_nothing() {
+        let a = [step("Xperia", Some(1)), step("HD 569", Some(2))];
+        let b = [step("Xperia", Some(1)), step("HD 569", Some(2))];
+        assert_eq!(chain_distance(&a, &b), 0);
+        assert!(derive_overrides(&a, &b).is_empty());
+    }
+
+    /// A longer target adds a step, a shorter one removes it. Both are
+    /// representable, and `equipment_seconds` reads both — a `position` past
+    /// the end adds, and an override with no `equipment_id` credits nothing.
+    #[test]
+    fn a_longer_or_shorter_chain_is_still_representable() {
+        let base = [step("Xperia", Some(1))];
+        let longer = [step("Xperia", Some(1)), step("Hexa", Some(3))];
+        let added = derive_overrides(&base, &longer);
+        assert_eq!(added.len(), 1);
+        assert_eq!(added[0].position, 1, "past the end of the base — this adds a step");
+        assert_eq!(added[0].equipment_id, Some(3));
+
+        let removed = derive_overrides(&longer, &base);
+        assert_eq!(removed.len(), 1);
+        assert_eq!(removed[0].position, 1);
+        assert_eq!(removed[0].equipment_id, None, "no gear at this step — it is dropped");
+    }
+
+    /// A step linked to a piece of gear and a free-text step that happens to
+    /// spell the same words are **not** the same step. One accrues hours
+    /// against an equipment row and the other accrues none, so folding them
+    /// together would silently stop crediting the gear.
+    #[test]
+    fn a_linked_step_never_matches_a_free_text_one() {
+        assert!(!component_matches(&step("Hexa", Some(3)), &step("Hexa", None)));
+        assert!(component_matches(&step("hexa", None), &step("Hexa ", None)));
+        assert!(!component_matches(&step("Hexa", Some(3)), &step("Hexa", Some(4))));
+    }
 
     /// The bug this exists for: ffmpeg names the four DSD bit-orderings
     /// separately, so an equality test on `"dsd"` missed every real file and

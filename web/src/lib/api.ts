@@ -427,6 +427,48 @@ export interface ChainVariant {
 	total_hours: number;
 }
 
+/** Two chains that look like the same rig, and what folding one into the other
+ *  would do.
+ *
+ *  Reported, never acted on — a fold is not reversible, so the pair, the
+ *  distance and the overrides are all shown before anything is agreed to. */
+export interface FoldSuggestion {
+	base_chain_id: number;
+	base_name: string;
+	base_hours: number;
+	fold_chain_id: number;
+	fold_name: string;
+	fold_hours: number;
+	/** How many steps disagree. 0 is the same wiring under two names, 1 is the
+	 *  swapped-box case variants exist for. */
+	distance: number;
+	/** What the folded chain becomes as a variant of the base. */
+	overrides: VariantOverride[];
+	/** `[id, name]` of a variant of the base that is already wired this way —
+	 *  which is the state you are in when you built the variant and the old
+	 *  chain is still sitting in the list beside it. */
+	matching_variant: [number, string] | null;
+	/** This one carries variants of its own, so it cannot be the side that
+	 *  folds — their positions index into components the fold replaces. */
+	fold_blocked_by_variants: boolean;
+}
+
+/** What a fold actually moved. Reported per table because they are different
+ *  kinds of thing: listens are the hours, a token or device default is *future*
+ *  attribution, and a release is the turntable a record lives with. */
+export interface FoldOutcome {
+	variant_id: number;
+	variant_name: string;
+	variant_created: boolean;
+	listens: number;
+	sides: number;
+	sessions: number;
+	releases: number;
+	devices: number;
+	bindings: number;
+	tokens: number;
+}
+
 export interface Equipment {
 	id: number;
 	name: string;
@@ -1891,6 +1933,23 @@ class TapedeckAPI {
 	}
 	async deleteVariant(id: number): Promise<{ status: string }> {
 		return this.del(`/api/v1/chains/variants/${id}`);
+	}
+
+	/** Chains that look like the same rig. Reports, never acts. */
+	async getChainDuplicates(): Promise<{ duplicates: FoldSuggestion[] }> {
+		return this.get('/api/v1/chains/duplicates');
+	}
+	/** Fold `id` into `into_chain_id` as a variant, moving its listening with
+	 *  it and deleting it. Not reversible.
+	 *
+	 *  `variant_id` lands on a variant that already exists; `variant_name`
+	 *  derives a new one from the difference between the two chains. One or the
+	 *  other — never both, and never neither. */
+	async foldChain(
+		id: number,
+		body: { into_chain_id: number; variant_id?: number; variant_name?: string }
+	): Promise<FoldOutcome> {
+		return this.post(`/api/v1/chains/${id}/fold`, body);
 	}
 
 	// ── Your own account ──

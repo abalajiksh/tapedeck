@@ -11,6 +11,7 @@ use std::sync::Arc;
 use super::auth::{AuthUser, ReadAuth};
 use super::models::ErrorResponse;
 use super::AppState;
+use crate::db::FoldTarget;
 use crate::models::*;
 
 // ── Chain variants ──
@@ -119,6 +120,71 @@ async fn delete_variant(
             (StatusCode::OK, Json(serde_json::json!({ "status": "deleted" }))).into_response()
         }
         Ok(false) => not_found("No such variant"),
+        Err(e) => internal(e),
+    }
+}
+
+/// What a fold request has to say. Deliberately not one nullable field.
+///
+/// `variant_id` (land on one that exists) and `variant_name` (derive a new one
+/// from the two chains) are different intents, and a single nullable field
+/// would make "use the variant I built" and "make me another one" the same
+/// request with a typo between them — on an endpoint that is not reversible.
+#[derive(Deserialize)]
+pub struct FoldRequest {
+    pub into_chain_id: i64,
+    #[serde(default)]
+    pub variant_id: Option<i64>,
+    #[serde(default)]
+    pub variant_name: Option<String>,
+}
+
+/// GET /api/v1/chains/duplicates — chains that look like the same rig.
+///
+/// The discovery half of the fold and the same shape the metadata sanitiser
+/// uses: it reports what it would do and changes nothing. A fold is not
+/// reversible, so the operator sees the pair, the distance and what the variant
+/// would override before agreeing to any of it.
+async fn list_duplicates(State(state): State<Arc<AppState>>, user: AuthUser) -> impl IntoResponse {
+    match state.db.near_duplicate_chains(user.user_id).await {
+        Ok(pairs) => {
+            (StatusCode::OK, Json(serde_json::json!({ "duplicates": pairs }))).into_response()
+        }
+        Err(e) => internal(e),
+    }
+}
+
+/// POST /api/v1/chains/:id/fold — fold this chain into another as a variant.
+///
+/// The listening moves with it and this chain is deleted, so the hours that
+/// were split across two near-duplicate rows add up on one — and, because
+/// `equipment_seconds` resolves overrides per `(chain, variant)` pair, they land
+/// on the gear that was actually fitted rather than on the base chain's.
+///
+/// Session-only, like every other write here. Not reversible; the UI says so.
+async fn fold_chain(
+    State(state): State<Arc<AppState>>,
+    user: AuthUser,
+    Path(id): Path<i64>,
+    Json(body): Json<FoldRequest>,
+) -> impl IntoResponse {
+    let target = match (body.variant_id, body.variant_name.as_deref()) {
+        (Some(_), Some(_)) => {
+            return bad("Send variant_id or variant_name, not both — one picks a variant you already built, the other derives a new one")
+        }
+        (Some(v), None) => FoldTarget::Existing(v),
+        (None, Some(n)) => FoldTarget::New(n),
+        (None, None) => {
+            return bad("Which variant should this chain become? Send variant_id to use one you already built, or variant_name to derive a new one")
+        }
+    };
+
+    match state.db.fold_chain_into_variant(user.user_id, id, body.into_chain_id, target).await {
+        // The refusals are all things the operator can act on — a variant of
+        // the wrong chain, a name already taken, a chain carrying variants of
+        // its own — so they are 400s naming the reason rather than a 500.
+        Ok(Err(why)) => bad(&why),
+        Ok(Ok(out)) => (StatusCode::OK, Json(serde_json::json!(out))).into_response(),
         Err(e) => internal(e),
     }
 }
@@ -592,6 +658,10 @@ pub fn create_gear_router() -> Router<Arc<AppState>> {
             "/api/v1/chains/variants/:id",
             axum::routing::patch(update_variant).delete(delete_variant),
         )
+        // Same reasoning as "variants" above: a literal segment under /chains,
+        // which matchit prefers over "/:id".
+        .route("/api/v1/chains/duplicates", get(list_duplicates))
+        .route("/api/v1/chains/:id/fold", post(fold_chain))
         .route("/api/v1/devices", get(list_devices))
         .route("/api/v1/devices/:id", patch(set_device_chain))
         .route("/api/v1/equipment", post(create_equipment).get(list_equipment))
