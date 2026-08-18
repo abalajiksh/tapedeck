@@ -311,9 +311,24 @@
 	let fromPosition = 1;
 
 	/** Tracks on a side, in order. */
+	/**
+	 * The tracks on one side.
+	 *
+	 * Omitting `release` means the open panel. Passing one that could not be
+	 * resolved — `null`, which is what the deck holds before the shelf list
+	 * has arrived — returns **nothing** rather than falling back to
+	 * `openTracks`. That fallback meant the deck could label its current
+	 * track from whichever *other* record happened to be expanded below it,
+	 * and the caller has no way to tell a real answer from a borrowed one.
+	 * Empty lets the deck show the record's title instead, which is honest.
+	 */
 	function sideTracks(side: string, release?: PhysicalRelease | null): PhysicalTrack[] {
-		let list = openTracks;
-		if (release && release.id !== open?.id) {
+		let list: PhysicalTrack[];
+		if (release === undefined || release?.id === open?.id) {
+			list = openTracks;
+		} else if (release === null) {
+			list = [];
+		} else {
 			try { list = JSON.parse(release.tracks) as PhysicalTrack[]; } catch { list = []; }
 		}
 		return list.filter((t) => t.side === side).sort((a, b) => a.position - b.position);
@@ -767,23 +782,51 @@
 		changingKind = false;
 	}
 
-	async function play(side: string, startedAt?: number) {
-		if (!open) return;
+	/**
+	 * Record a side.
+	 *
+	 * `releaseId` names the record being acted on. The deck is a band at the
+	 * top of the page and is visible whichever panel is expanded below it — or
+	 * none at all, which is every first paint after a reload. This used to read
+	 * `open` regardless, which broke two ways and both silently:
+	 *
+	 * * **No panel open** — it returned at the first line, so pressing Record
+	 *   when a side finished did nothing whatsoever. Reopening the record, or
+	 *   reloading the page, made the same click work, which is what made it
+	 *   look intermittent.
+	 * * **A different record's panel open** — worse: it posted the side to
+	 *   *that* record instead, writing the listens onto something that was
+	 *   never played, and with none of the deck's observations attached.
+	 */
+	async function play(side: string, startedAt?: number, releaseId?: number) {
+		const id = releaseId ?? open?.id;
+		if (id == null) return;
+		// The record itself, which may not be the open one — and may not be in the
+		// shelf list yet on a first paint, hence the spin's own description.
+		const rel = shelf.find((x) => x.id === id) ?? (open?.id === id ? open : null);
+		const kind = rel?.kind ?? (spinning?.releaseId === id ? spinMeta?.kind : null) ?? 'vinyl';
+		const isOpenOne = open?.id === id;
 		playing = true;
 		playMsg = '';
 		// Did *this* deck run the side, or is this the "already played" path?
 		// Everything the deck observed — outcomes, where it started, where the
 		// tape ended up — is only meaningful in the first case.
-		const ranHere = !!(spinning && spinning.releaseId === open.id);
+		const ranHere = !!(spinning && spinning.releaseId === id);
 		try {
-			const r = await api.playSide(open.id, {
+			const r = await api.playSide(id, {
 				side,
 				started_at: startedAt,
 				// What it ran through. Sent explicitly rather than left to the
 				// stored default so that changing the picker for one side takes
 				// effect on that side, and is remembered for the next.
-				chain_id: playChain,
-				equipment_id: playGear,
+				//
+				// Only when the pickers belong to *this* record: they are loaded
+				// when a panel opens, so sending them from the deck with another
+				// record expanded would attribute the side to that one's chain.
+				// Omitted, the server falls back to the pressing's own default,
+				// which is the right answer anyway.
+				chain_id: isOpenOne ? playChain : undefined,
+				equipment_id: isOpenOne ? playGear : undefined,
 				// Only when this deck ran the side; "already played" has none.
 				tracks: ranHere ? spinning?.outcomes : undefined,
 				// Where the needle went down. Without this every track before it
@@ -798,11 +841,11 @@
 				// down — so adding `startSecs` again double-counts it and parks
 				// the tape past its own end.
 				parked_secs:
-					ranHere && open.kind === 'cassette' && spinLeft > 0 ? spinElapsed : undefined
+					ranHere && kind === 'cassette' && spinLeft > 0 ? spinElapsed : undefined
 			});
 			const sk = r.skipped ?? 0;
 			playMsg = r.listens_added || sk
-				? `${unit(open?.kind ?? 'vinyl')} ${side} — ${r.listens_added} listen${r.listens_added === 1 ? '' : 's'} recorded` +
+				? `${unit(kind)} ${side} — ${r.listens_added} listen${r.listens_added === 1 ? '' : 's'} recorded` +
 					(sk ? `, ${sk} skipped.` : '.')
 				: `${unit(open?.kind ?? 'vinyl')} ${side} was already recorded at that time.`;
 			// The flip reminder is the whole point of tracking sides: you are
@@ -1112,7 +1155,7 @@
 				<svg viewBox="0 0 24 24" width="18" fill="currentColor"><path d="M5 5l10 7-10 7z"/><rect x="16" y="5" width="3" height="14" rx="1"/></svg>
 			</button>
 			<button class="btn btn-primary" disabled={playing}
-				on:click={() => spinning && play(spinning.side, spinning.startedAt)}>
+				on:click={() => spinning && play(spinning.side, spinning.startedAt, spinning.releaseId)}>
 				{playing ? '…' : spinLeft === 0 ? 'Record it' : 'Stop & record'}
 			</button>
 			<button class="btn btn-secondary" on:click={() => saveSpinning(null)}>Cancel</button>
