@@ -26,7 +26,7 @@ openapi: 3.1.0
 
 info:
   title: Tapedeck
-  version: 0.70.3
+  version: 0.70.4
   summary: Self-hosted scrobbler and listening journal.
   description: |
     Tapedeck ingests listens, enriches them with MusicBrainz metadata, stores
@@ -826,6 +826,28 @@ components:
           description: |
             Derived — summed from every chain referencing this gear, never
             accumulated. Free-text chain steps report zero, which is honest.
+        sources:
+          type: array
+          description: |
+            *(since v0.70.4)* What `total_hours` is made of, largest first.
+            A total is a sum and a sum is not checkable on its own — and with a
+            chain **variant** in play the listening genuinely arrives through a
+            chain whose own components do not name this gear, which is when a
+            bare figure stops being verifiable. These are the same per-`(chain,
+            variant)` seconds the hours are derived from, kept rather than
+            discarded, so the parts always add to the whole.
+
+            Empty for gear nothing has logged time through.
+          items:
+            type: object
+            properties:
+              chain_id: { type: integer }
+              chain_name: { type: string }
+              variant_id:
+                type: [integer, 'null']
+                description: Set when the gear was fitted as a *variant* of that chain.
+              variant_name: { type: [string, 'null'] }
+              hours: { type: number }
 
     NowPlaying:
       type: object

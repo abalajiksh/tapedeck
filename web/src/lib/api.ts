@@ -473,6 +473,22 @@ export interface FoldOutcome {
 	tokens: number;
 }
 
+/** Where one piece of gear's hours came from.
+ *
+ *  A total is a sum, and a sum is not checkable — with a variant in play the
+ *  listening genuinely arrives from more than one chain, so "4h" is a number
+ *  you either believe or you don't. */
+export interface GearHours {
+	chain_id: number;
+	chain_name: string;
+	/** Set when it was fitted as a *variant* of that chain — the case this
+	 *  exists for, since that is when gear earns hours through a chain whose
+	 *  own components do not name it. */
+	variant_id: number | null;
+	variant_name: string | null;
+	hours: number;
+}
+
 export interface Equipment {
 	id: number;
 	name: string;
@@ -487,6 +503,9 @@ export interface Equipment {
 	/** `new`, `spare` or `lent`, or null when nothing has been said. Only ever
 	 *  meaningful for gear no chain names. */
 	status: string | null;
+	/** Which chains and variants `total_hours` is made of, largest first. Empty
+	 *  for gear nothing has logged time through. */
+	sources: GearHours[];
 }
 
 /** Live playback state. Field names mirror `Scrobble` so `qualityLabel()` works on it. */

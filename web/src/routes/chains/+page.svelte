@@ -625,6 +625,10 @@
 	// than dropping you at the top of a long page with nothing to look at.
 	let highlightGear: number | null = null;
 
+	// Which gear row is showing where its hours came from. One at a time — the
+	// question is "is this number right", asked of one piece at a time.
+	let openGearHours: number | null = null;
+
 	onMount(async () => {
 		const g = new URLSearchParams(window.location.search).get('gear');
 		highlightGear = g ? Number(g) : null;
@@ -806,7 +810,20 @@
 									<td style="color:var(--td-muted);font-size:12.5px;" title={e.purchased_at ? formatDateTime(e.purchased_at).split(',')[0] : ''}>
 										{e.purchased_at ? ownedFor(e.purchased_at) : '—'}
 									</td>
-									<td style="text-align:right;font-variant-numeric:tabular-nums;font-weight:600;color:{e.total_hours > 0 ? 'var(--td-good-fg)' : 'var(--td-muted-3)'};">{formatHours(e.total_hours)}</td>
+									<td style="text-align:right;font-variant-numeric:tabular-nums;font-weight:600;color:{e.total_hours > 0 ? 'var(--td-good-fg)' : 'var(--td-muted-3)'};">
+										<!-- Derived from listens through possibly several chains, so it is a
+											     claim rather than a reading. Click it to see the addition. -->
+										{#if e.sources?.length}
+											<button class="hrs-btn" aria-expanded={openGearHours === e.id}
+												aria-label="Where {e.name}'s hours came from"
+												on:click={() => (openGearHours = openGearHours === e.id ? null : e.id)}>
+												{formatHours(e.total_hours)}
+												<span class="hrs-caret" class:on={openGearHours === e.id}>▾</span>
+											</button>
+										{:else}
+											{formatHours(e.total_hours)}
+										{/if}
+									</td>
 									<td style="text-align:right;white-space:nowrap;">
 										<button class="icon-btn" title="Edit" on:click={() => editGear(e)} aria-label="Edit gear">
 											<svg viewBox="0 0 24 24" width="15" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4z"/></svg>
@@ -816,6 +833,23 @@
 										</button>
 									</td>
 								</tr>
+								{#if openGearHours === e.id && e.sources?.length}
+									<tr class="hrs-row">
+										<td colspan="7">
+											<div class="hrs-head">Where these hours came from</div>
+											{#each e.sources as src}
+												<div class="hrs-line">
+													<span class="hrs-what">{src.chain_name}{#if src.variant_name}<span class="hrs-var">· {src.variant_name}</span>{/if}</span>
+													<span class="hrs-amt">{formatHours(src.hours)}</span>
+												</div>
+											{/each}
+											<div class="hrs-line hrs-total">
+												<span class="hrs-what">Total</span>
+												<span class="hrs-amt">{formatHours(e.total_hours)}</span>
+											</div>
+										</td>
+									</tr>
+								{/if}
 							{/each}
 						</tbody>
 					</table>
@@ -1399,6 +1433,41 @@
 		border-radius: 999px; padding: 2px 9px; white-space: nowrap;
 	}
 	.cend { flex: 0 0 auto; display: flex; align-items: center; gap: 14px; }
+	/* — where a gear total came from —
+	   The figure is derived from listens across possibly several chains, so it
+	   reads as a claim. This turns it into an addition you can check. */
+	.hrs-btn {
+		background: none; border: 0; padding: 0; cursor: pointer; font: inherit;
+		color: inherit; display: inline-flex; align-items: center; gap: 5px;
+	}
+	.hrs-btn:hover { text-decoration: underline; }
+	.hrs-caret {
+		font-size: 9px; color: var(--td-muted-3); transition: transform .15s ease;
+	}
+	.hrs-caret.on { transform: rotate(180deg); }
+	.hrs-row td {
+		padding: 10px 14px 14px 14px;
+		background: color-mix(in srgb, var(--td-text) 3%, transparent);
+	}
+	.hrs-head {
+		font-size: 11px; letter-spacing: .08em; text-transform: uppercase;
+		color: var(--td-muted-2); margin-bottom: 7px;
+	}
+	.hrs-line {
+		display: flex; justify-content: space-between; gap: 16px;
+		font-size: 13px; padding: 3px 0;
+	}
+	.hrs-what { color: var(--td-muted); min-width: 0; }
+	/* The gap is a margin, not a leading space in the markup — Svelte trims
+	   whitespace at an element boundary, so the space was silently dropped and
+	   it rendered as "Commute Phone· Summer". */
+	.hrs-var { color: var(--td-accent); margin-left: 5px; }
+	.hrs-amt { font-variant-numeric: tabular-nums; white-space: nowrap; }
+	.hrs-total {
+		margin-top: 5px; padding-top: 7px; font-weight: 600;
+		border-top: 1px solid var(--td-muted-3);
+	}
+
 	.chrs { font-variant-numeric: tabular-nums; font-weight: 600; font-size: 14px; white-space: nowrap; color: var(--td-good-fg); }
 	.chrs.zero { color: var(--td-muted-3); }
 	@media (max-width: 720px) {

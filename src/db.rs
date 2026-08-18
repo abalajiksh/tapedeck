@@ -9704,7 +9704,11 @@ impl Database {
     /// stylus is due for replacement.
     ///
     /// Skips are excluded, like every other counting query here.
-    pub async fn equipment_seconds(&self, user_id: i64) -> Result<HashMap<i64, i64>, sqlx::Error> {
+    #[allow(clippy::type_complexity)]
+    pub async fn equipment_seconds(
+        &self,
+        user_id: i64,
+    ) -> Result<(HashMap<i64, i64>, HashMap<(i64, i64, Option<i64>), i64>), sqlx::Error> {
         // Every chain's own components, and every variant's overrides.
         let chains: Vec<(i64, String)> =
             sqlx::query_as("SELECT id, components FROM signal_chains WHERE user_id = ?")
@@ -9739,6 +9743,10 @@ impl Database {
         .await?;
 
         let mut out: HashMap<i64, i64> = HashMap::new();
+        // The same walk, remembered rather than only summed: `(gear, chain,
+        // variant) -> seconds`. A total is not checkable on its own, and with a
+        // variant in play the hours genuinely arrive from more than one chain.
+        let mut split: HashMap<(i64, i64, Option<i64>), i64> = HashMap::new();
         for (chain_id, variant_id, secs) in grouped {
             let (Some(chain_id), Some(secs)) = (chain_id, secs) else { continue };
             let Some(components) = base.get(&chain_id) else { continue };
@@ -9785,13 +9793,18 @@ impl Database {
 
             for id in fitted {
                 *out.entry(id).or_insert(0) += secs;
+                // Keyed on the variant *as applied*, so a variant paired with
+                // the wrong chain — which the `filter` above already refuses to
+                // apply — is not reported as a source either.
+                let applied_variant = (!applied.is_empty()).then_some(variant_id).flatten();
+                *split.entry((id, chain_id, applied_variant)).or_insert(0) += secs;
             }
         }
-        Ok(out)
+        Ok((out, split))
     }
 
     pub async fn get_equipment(&self, user_id: i64) -> Result<Vec<EquipmentRow>, sqlx::Error> {
-        let seconds = self.equipment_seconds(user_id).await?;
+        let (seconds, split) = self.equipment_seconds(user_id).await?;
         let mut rows: Vec<EquipmentRow> = sqlx::query_as(
             "SELECT e.id, e.user_id, e.name, e.type, e.brand, e.model,
                     0.0 AS total_hours,
@@ -9803,8 +9816,48 @@ impl Database {
         .fetch_all(&self.pool)
         .await?;
 
+        // Names for the breakdown, so a source reads "Commute Phone / Summer"
+        // rather than a pair of ids. Two small tables, fetched once.
+        let chain_names: HashMap<i64, String> =
+            sqlx::query_as("SELECT id, name FROM signal_chains WHERE user_id = ?")
+                .bind(user_id)
+                .fetch_all(&self.pool)
+                .await?
+                .into_iter()
+                .collect();
+        let variant_names: HashMap<i64, String> =
+            sqlx::query_as("SELECT id, name FROM chain_variants WHERE user_id = ?")
+                .bind(user_id)
+                .fetch_all(&self.pool)
+                .await?
+                .into_iter()
+                .collect();
+
         for r in &mut rows {
             r.total_hours = seconds.get(&r.id).copied().unwrap_or(0) as f64 / 3600.0;
+            let mut sources: Vec<GearHours> = split
+                .iter()
+                .filter(|((gear, _, _), _)| *gear == r.id)
+                .filter_map(|((_, chain, variant), secs)| {
+                    Some(GearHours {
+                        chain_id: *chain,
+                        chain_name: chain_names.get(chain)?.clone(),
+                        variant_id: *variant,
+                        variant_name: variant.and_then(|v| variant_names.get(&v).cloned()),
+                        hours: *secs as f64 / 3600.0,
+                    })
+                })
+                .collect();
+            // Largest first, then by name so the order is stable between loads
+            // rather than following the hash map's.
+            sources.sort_by(|a, b| {
+                b.hours
+                    .partial_cmp(&a.hours)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| a.chain_name.cmp(&b.chain_name))
+                    .then_with(|| a.variant_name.cmp(&b.variant_name))
+            });
+            r.sources = sources;
         }
         // Same order the SQL produced, kept so the gear table does not reshuffle.
         rows.sort_by(|a, b| {
@@ -12099,6 +12152,25 @@ pub struct DeviceRow {
     pub total_listens: i64,
 }
 
+/// Where one piece of gear's hours came from.
+///
+/// The gear total is a sum and a sum is not checkable — "Hexa: 1.9h" is a
+/// number you either believe or you do not, and with a variant in play the
+/// listening genuinely arrives from more than one chain. This is the same
+/// arithmetic `equipment_seconds` already does internally, kept instead of
+/// thrown away, so the total can be read as the addition it is.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct GearHours {
+    pub chain_id: i64,
+    pub chain_name: String,
+    /// Set when the listening went through a *variant* of that chain — which is
+    /// the case the breakdown exists for, since that is when one piece of gear
+    /// accrues hours through a chain that does not name it.
+    pub variant_id: Option<i64>,
+    pub variant_name: Option<String>,
+    pub hours: f64,
+}
+
 #[derive(Debug, FromRow, serde::Serialize)]
 pub struct EquipmentRow {
     pub id: i64,
@@ -12115,6 +12187,10 @@ pub struct EquipmentRow {
     /// When it was bought, as opposed to `first_used`, which is when Tapedeck
     /// first saw it. Gear is usually owned well before it is catalogued.
     pub purchased_at: Option<i64>,
+    /// Which chains and variants those hours came from, largest first. Empty
+    /// for gear nothing has logged time through.
+    #[sqlx(skip)]
+    pub sources: Vec<GearHours>,
     /// Why this piece is not in a chain — `new`, `spare`, `lent`. Only ever
     /// meaningful for gear no chain names; the Signal Chains page shows it in
     /// the "Not in a chain yet" table and nowhere else.
@@ -14037,7 +14113,7 @@ mod tests {
             .unwrap();
         }
 
-        let secs = db.equipment_seconds(uid).await.unwrap();
+        let (secs, _) = db.equipment_seconds(uid).await.unwrap();
         // The turntable is in both, so it gets both hours.
         assert_eq!(secs.get(&deck), Some(&7200), "the deck ran for both");
         // Each cartridge only for the listens it was fitted for.
@@ -15457,7 +15533,7 @@ mod tests {
 
         // Before: two rows, and the phone's hours split across them with no
         // way to see that it is one phone.
-        let secs = db.equipment_seconds(uid).await.unwrap();
+        let (secs, _) = db.equipment_seconds(uid).await.unwrap();
         assert_eq!(secs.get(&phone), Some(&10_800), "3h through the phone either way");
         assert_eq!(secs.get(&hd569), Some(&7_200));
         assert_eq!(secs.get(&hexa), Some(&3_600));
@@ -15484,7 +15560,7 @@ mod tests {
 
         // And the gear still reads correctly: the swap really was a swap, so
         // the HD 569 accrues nothing while the Hexa is in.
-        let secs = db.equipment_seconds(uid).await.unwrap();
+        let (secs, _) = db.equipment_seconds(uid).await.unwrap();
         assert_eq!(secs.get(&phone), Some(&10_800), "the phone was in the path throughout");
         assert_eq!(secs.get(&hd569), Some(&7_200), "no wear while the other IEMs were in");
         assert_eq!(secs.get(&hexa), Some(&3_600));
@@ -15562,7 +15638,7 @@ mod tests {
         assert_eq!(out.listens, 1);
 
         // The hour landed on the Hexa, via the variant they wired.
-        let secs = db.equipment_seconds(uid).await.unwrap();
+        let (secs, _) = db.equipment_seconds(uid).await.unwrap();
         assert_eq!(secs.get(&hexa), Some(&3_600));
         assert_eq!(secs.get(&hd569), None, "the base transducer was not fitted");
     }
@@ -16149,5 +16225,113 @@ mod tests {
         assert_eq!(other.len(), 1);
         assert_eq!(other[0].chain_variant_id, None, "no variant, and not someone else's");
         assert_eq!(other[0].chain_variant_name, None);
+    }
+    /// A gear total has to be readable as the addition it is.
+    ///
+    /// Reported as "I think the total hours added up for using the Hexa with my
+    /// Xperia, but there is no way of knowing it" — the number was right and
+    /// unverifiable, which for derived arithmetic is most of the way to being
+    /// useless. The breakdown is the same walk `equipment_seconds` already did
+    /// and threw away.
+    ///
+    /// Asserts the parts sum to the whole, because a breakdown that disagrees
+    /// with the figure above it is worse than none.
+    #[tokio::test]
+    async fn a_gear_total_breaks_down_into_the_chains_that_earned_it() {
+        let db = testdb().await;
+        let uid = db.create_user("ash", None, "pw", "user").await.unwrap();
+        let phone = db.upsert_equipment(uid, "Xperia", "dap", None, None, 0.0, None).await.unwrap();
+        let hd =
+            db.upsert_equipment(uid, "HD 569", "headphones", None, None, 0.0, None).await.unwrap();
+        let hexa = db.upsert_equipment(uid, "Hexa", "iem", None, None, 0.0, None).await.unwrap();
+
+        // One chain with a Hexa variant, and a second chain naming the Hexa
+        // outright — so the Hexa earns hours two different ways, which is
+        // exactly when a bare total stops being checkable.
+        let commute =
+            chain_of(&db, uid, "Commute Phone", &[("Xperia", phone), ("HD 569", hd)]).await;
+        let summer =
+            chain_of(&db, uid, "Summer Commute", &[("Xperia", phone), ("Hexa", hexa)]).await;
+        let v = db
+            .create_variant(
+                uid,
+                commute,
+                "Summer",
+                &[VariantOverride {
+                    position: 1,
+                    equipment_id: Some(hexa),
+                    name: Some("Hexa".into()),
+                }],
+            )
+            .await
+            .unwrap();
+
+        // 2h base chain, 1h through its variant, 3h through the other chain.
+        for (i, (chain, variant)) in [
+            (commute, None),
+            (commute, None),
+            (commute, Some(v)),
+            (summer, None),
+            (summer, None),
+            (summer, None),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut p = play(&format!("t{i}"), "Burial", 1_750_000_000 + i as u64 * 4000);
+            p.duration = Some(3600);
+            db.save_scrobble(
+                uid,
+                &p,
+                None,
+                None,
+                Some(chain),
+                variant,
+                None,
+                None,
+                None,
+                ListenDisposition::LIVE,
+            )
+            .await
+            .unwrap();
+        }
+
+        let gear = db.get_equipment(uid).await.unwrap();
+        let find = |id: i64| gear.iter().find(|g| g.id == id).unwrap();
+
+        // The Hexa: one hour through the variant, three through its own chain.
+        let h = find(hexa);
+        assert!((h.total_hours - 4.0).abs() < 1e-6, "{}", h.total_hours);
+        let summed: f64 = h.sources.iter().map(|s| s.hours).sum();
+        assert!((summed - h.total_hours).abs() < 1e-6, "the parts add to the whole");
+        assert_eq!(h.sources.len(), 2, "two chains earned it");
+        assert_eq!(h.sources[0].chain_name, "Summer Commute", "largest first");
+        assert!((h.sources[0].hours - 3.0).abs() < 1e-6);
+        assert_eq!(h.sources[0].variant_name, None, "its own chain names it directly");
+        assert_eq!(h.sources[1].chain_name, "Commute Phone");
+        assert_eq!(
+            h.sources[1].variant_name.as_deref(),
+            Some("Summer"),
+            "and it says which setup, or the row cannot be checked against the chain"
+        );
+
+        // The HD 569 accrues nothing while the Hexa is fitted — the whole point
+        // of a variant — so its breakdown shows only the base chain.
+        let d = find(hd);
+        assert!((d.total_hours - 2.0).abs() < 1e-6, "{}", d.total_hours);
+        assert_eq!(d.sources.len(), 1);
+        assert_eq!(d.sources[0].variant_name, None);
+
+        // The phone was in the path throughout, from both chains.
+        let x = find(phone);
+        assert!((x.total_hours - 6.0).abs() < 1e-6, "{}", x.total_hours);
+        let summed: f64 = x.sources.iter().map(|s| s.hours).sum();
+        assert!((summed - x.total_hours).abs() < 1e-6);
+
+        // Gear nothing has logged through says so with an empty list rather
+        // than a missing field.
+        let spare = db.upsert_equipment(uid, "Spare", "dac", None, None, 0.0, None).await.unwrap();
+        let gear = db.get_equipment(uid).await.unwrap();
+        assert!(gear.iter().find(|g| g.id == spare).unwrap().sources.is_empty());
     }
 }
