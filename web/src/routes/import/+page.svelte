@@ -271,6 +271,16 @@
 				<svg viewBox="0 0 24 24" width="20" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><path d="M5 13l4 4L19 7"/></svg></span>
 			<div>
 				<div style="font-weight:600;font-size:15px;color:var(--td-good-fg);">Imported {job?.imported} new listens from {job?.source}</div>
+				<!-- A re-import of a history you already hold correctly inserts
+				     nothing, and "0 new listens" alone read as though the whole
+				     job had been pointless when it had in fact filled in a great
+				     deal. Silent when there was nothing to fill. -->
+				{#if job?.enriched}
+					<div style="font-size:12.5px;color:var(--td-good-fg);margin-top:2px;">
+						Filled in missing details on {job.enriched} listen{job.enriched === 1 ? '' : 's'} you
+						already had — album, length, MusicBrainz ids, cover art. Nothing already there was changed.
+					</div>
+				{/if}
 				<div style="font-size:12.5px;color:var(--td-good-fg);margin-top:2px;">Deduplicated against your existing history ({job?.fetched} scanned).</div>
 			</div>
 		</div>

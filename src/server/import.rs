@@ -23,7 +23,7 @@ use tracing::warn;
 use super::auth::AuthUser;
 use super::models::ErrorResponse;
 use super::AppState;
-use crate::db::Database;
+use crate::db::{Database, ImportOutcome};
 use crate::models::Play;
 
 pub type ImportRegistry = Arc<Mutex<HashMap<String, ImportJob>>>;
@@ -35,10 +35,15 @@ pub struct ImportJob {
     pub user_id: i64, // owner (not serialized to clients)
     #[serde(skip)]
     pub db_id: i64, // row in import_jobs (persisted for durable history)
-    pub source: String,       // "listenbrainz" | "lastfm" | "file"
-    pub state: String,        // "running" | "done" | "error"
-    pub fetched: usize,       // listens pulled from the source
-    pub imported: usize,      // new rows actually inserted (post-dedup)
+    pub source: String,  // "listenbrainz" | "lastfm" | "file"
+    pub state: String,   // "running" | "done" | "error"
+    pub fetched: usize,  // listens pulled from the source
+    pub imported: usize, // new rows actually inserted (post-dedup)
+    /// Listens already held that the incoming copy taught something to — an
+    /// MBID, a duration, a cover-art id. Counted apart from `imported` because
+    /// "0 new listens" reads as "nothing happened", and on a re-import of a
+    /// history you already hold, a great deal just did.
+    pub enriched: usize,
     pub total: Option<usize>, // known upper bound, when the source reports one
     pub status: String,       // human message / error detail
     pub date: i64,            // started, unix seconds
@@ -69,6 +74,7 @@ async fn start(reg: &ImportRegistry, db: &Database, source: &str, user_id: i64) 
         state: "running".into(),
         fetched: 0,
         imported: 0,
+        enriched: 0,
         total: None,
         status: "started".into(),
         date: chrono_now(),
@@ -88,6 +94,28 @@ async fn persist_job(reg: &ImportRegistry, id: &str, db: &Database) {
             .finish_import_job(j.db_id, &j.state, j.fetched as i64, j.imported as i64, &j.status)
             .await;
     }
+}
+
+/// What a finished job says it did.
+///
+/// Enrichment is reported *beside* the insert count rather than folded into it:
+/// re-importing a history you already hold correctly inserts nothing, and
+/// "Imported 0 new listens" read as though the whole job had been pointless
+/// when it had in fact filled in MBIDs, durations and cover ids on hundreds of
+/// rows. Silent when nothing was enriched, so an ordinary first import reads
+/// exactly as it did before.
+fn imported_line(imported: usize, enriched: usize, whence: &str) -> String {
+    let mut out = format!("Imported {imported} new listen{}", if imported == 1 { "" } else { "s" });
+    if !whence.is_empty() {
+        out.push_str(whence);
+    }
+    if enriched > 0 {
+        out.push_str(&format!(
+            "; filled in metadata on {enriched} listen{} already held",
+            if enriched == 1 { "" } else { "s" }
+        ));
+    }
+    out
 }
 
 fn chrono_now() -> i64 {
@@ -445,13 +473,16 @@ async fn run_listenbrainz(
             }
             let album = tm["release_name"].as_str().map(str::to_string);
             let mbid = tm["mbid_mapping"]["recording_mbid"].as_str().map(str::to_string);
-            let inserted = db
+            let outcome = db
                 .import_listen(uid, &play(ts, title, artist, album, mbid))
                 .await
                 .map_err(|e| e.to_string())?;
             update(reg, id, |j| {
                 j.fetched += 1;
-                if inserted {
+                if outcome == ImportOutcome::Enriched {
+                    j.enriched += 1;
+                }
+                if outcome == ImportOutcome::Inserted {
                     j.imported += 1;
                 }
             });
@@ -472,7 +503,7 @@ async fn run_listenbrainz(
     }
     update(reg, id, |j| {
         j.state = "done".into();
-        j.status = format!("Imported {} new listens", j.imported);
+        j.status = imported_line(j.imported, j.enriched, "");
     });
     Ok(())
 }
@@ -530,13 +561,16 @@ async fn run_lastfm(
             }
             let album = t["album"]["#text"].as_str().filter(|s| !s.is_empty()).map(str::to_string);
             let mbid = t["mbid"].as_str().filter(|s| !s.is_empty()).map(str::to_string);
-            let inserted = db
+            let outcome = db
                 .import_listen(uid, &play(ts, title, artist, album, mbid))
                 .await
                 .map_err(|e| e.to_string())?;
             update(reg, id, |j| {
                 j.fetched += 1;
-                if inserted {
+                if outcome == ImportOutcome::Enriched {
+                    j.enriched += 1;
+                }
+                if outcome == ImportOutcome::Inserted {
                     j.imported += 1;
                 }
             });
@@ -548,7 +582,7 @@ async fn run_lastfm(
     }
     update(reg, id, |j| {
         j.state = "done".into();
-        j.status = format!("Imported {} new listens", j.imported);
+        j.status = imported_line(j.imported, j.enriched, "");
     });
     Ok(())
 }
@@ -591,17 +625,20 @@ async fn run_file(
     let plays: Vec<Play> = if is_csv { parse_csv(&text) } else { parse_listens(&text)? };
     update(reg, id, |j| j.total = Some(plays.len()));
     for p in &plays {
-        let inserted = db.import_listen(uid, p).await.map_err(|e| e.to_string())?;
+        let outcome = db.import_listen(uid, p).await.map_err(|e| e.to_string())?;
         update(reg, id, |j| {
             j.fetched += 1;
-            if inserted {
+            if outcome == ImportOutcome::Enriched {
+                j.enriched += 1;
+            }
+            if outcome == ImportOutcome::Inserted {
                 j.imported += 1;
             }
         });
     }
     update(reg, id, |j| {
         j.state = "done".into();
-        j.status = format!("Imported {} new listens", j.imported);
+        j.status = imported_line(j.imported, j.enriched, "");
     });
     Ok(())
 }
@@ -693,15 +730,19 @@ async fn run_spotify_archive(
             spotify_track_id: Some(e.track_id.clone()),
         };
 
-        let inserted = db
+        let outcome = db
             .import_listen_detailed(uid, &p, e.skipped, provenance)
             .await
             .map_err(|e| e.to_string())?;
+        let inserted = outcome == ImportOutcome::Inserted;
         if inserted && e.skipped {
             skips += 1;
         }
         update(reg, id, |j| {
             j.fetched += 1;
+            if outcome == ImportOutcome::Enriched {
+                j.enriched += 1;
+            }
             // Skips are stored but are not listens, so they don't inflate the
             // count — same rule as the Rockbox path.
             if inserted && !e.skipped {
@@ -714,7 +755,7 @@ async fn run_spotify_archive(
         (parsed.non_music, parsed.duplicates, parsed.malformed);
     update(reg, id, |j| {
         j.state = "done".into();
-        let mut parts = vec![format!("Imported {} new listens from Spotify", j.imported)];
+        let mut parts = vec![imported_line(j.imported, j.enriched, " from Spotify")];
         if skips > 0 {
             parts.push(format!("{skips} skips recorded"));
         }
@@ -795,10 +836,13 @@ async fn run_listenbrainz_archive(
     update(reg, id, |j| j.total = Some(plays.len()));
 
     for p in &plays {
-        let inserted = db.import_listen(uid, p).await.map_err(|e| e.to_string())?;
+        let outcome = db.import_listen(uid, p).await.map_err(|e| e.to_string())?;
         update(reg, id, |j| {
             j.fetched += 1;
-            if inserted {
+            if outcome == ImportOutcome::Enriched {
+                j.enriched += 1;
+            }
+            if outcome == ImportOutcome::Inserted {
                 j.imported += 1;
             }
         });
@@ -808,11 +852,10 @@ async fn run_listenbrainz_archive(
 
     update(reg, id, |j| {
         j.state = "done".into();
-        let mut parts = vec![format!(
-            "Imported {} new listens from {} file{}",
+        let mut parts = vec![imported_line(
             j.imported,
-            listen_files,
-            if listen_files == 1 { "" } else { "s" }
+            j.enriched,
+            &format!(" from {listen_files} file{}", if listen_files == 1 { "" } else { "s" }),
         )];
         if loved > 0 {
             parts.push(format!("{loved} loved tracks"));
@@ -900,13 +943,17 @@ async fn run_scrobbler_log(
             caa_id: None,
             caa_release_mbid: None,
         };
-        let inserted =
+        let outcome =
             db.import_listen_flagged(uid, &p, e.skipped).await.map_err(|e| e.to_string())?;
+        let inserted = outcome == ImportOutcome::Inserted;
         if inserted && e.skipped {
             skips += 1;
         }
         update(reg, id, |j| {
             j.fetched += 1;
+            if outcome == ImportOutcome::Enriched {
+                j.enriched += 1;
+            }
             // Skips are stored but are not listens, so they don't inflate the count.
             if inserted && !e.skipped {
                 j.imported += 1;
@@ -918,7 +965,7 @@ async fn run_scrobbler_log(
     let malformed = parsed.malformed;
     update(reg, id, |j| {
         j.state = "done".into();
-        let mut parts = vec![format!("Imported {} new listens from {}", j.imported, client)];
+        let mut parts = vec![imported_line(j.imported, j.enriched, &format!(" from {client}"))];
         if skips > 0 {
             parts.push(format!("{skips} skips recorded"));
         }

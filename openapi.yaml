@@ -26,7 +26,7 @@ openapi: 3.1.0
 
 info:
   title: Tapedeck
-  version: 0.69.0
+  version: 0.70.0
   summary: Self-hosted scrobbler and listening journal.
   description: |
     Tapedeck ingests listens, enriches them with MusicBrainz metadata, stores
@@ -5059,12 +5059,31 @@ paths:
                 type: object
                 additionalProperties: true
                 properties:
-                  state: { type: string, enum: [running, done, failed] }
-                  processed: { type: integer }
+                  job_id: { type: string }
+                  source: { type: string, enum: [listenbrainz, lastfm, file] }
+                  state: { type: string, enum: [running, done, error, interrupted] }
+                  fetched:
+                    type: integer
+                    description: Listens read from the source, before dedup.
+                  imported:
+                    type: integer
+                    description: New rows actually inserted.
+                  enriched:
+                    type: integer
+                    description: |
+                      *(since v0.70)* Listens already held that the incoming copy
+                      taught something to — an MBID, a duration, a cover-art id, a
+                      track number. A duplicate is no longer dropped whole: fields
+                      that are **blank** are filled from it, and fields that are
+                      already populated are never touched. Counted apart from
+                      `imported` because a re-import of a history you already hold
+                      correctly inserts nothing, and `imported: 0` alone read as
+                      though the job had done nothing at all.
                   total: { type: [integer, 'null'] }
-                  imported: { type: integer }
-                  duplicates: { type: integer }
-                  error: { type: [string, 'null'] }
+                  status:
+                    type: string
+                    description: Human-readable summary; also carries the error detail when `state` is `error`.
+                  date: { type: integer, description: Started, unix seconds. }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '404': { $ref: '#/components/responses/NotFound' }
 

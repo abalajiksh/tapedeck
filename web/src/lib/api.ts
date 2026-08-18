@@ -306,6 +306,10 @@ export interface Personality {
 export interface ImportJob {
 	job_id: string; source: string; state: 'running' | 'done' | 'error';
 	fetched: number; imported: number; total: number | null; status: string; date: number;
+	/** Listens already held that the incoming copy filled something in on — an
+	 *  MBID, a duration, a cover-art id. A duplicate is no longer dropped
+	 *  whole: blank fields are filled from it, populated ones never touched. */
+	enriched?: number;
 }
 
 export interface ImportRecord {

@@ -2905,10 +2905,26 @@ impl Database {
         source_id: &str,
         source_name: &str,
     ) -> Result<bool, sqlx::Error> {
-        let count: (i64,) = sqlx::query_as(
-            "SELECT COUNT(*) FROM scrobbles WHERE user_id = ? AND source_id = ? AND source_name = ?"
-        ).bind(user_id).bind(source_id).bind(source_name).fetch_one(&self.pool).await?;
-        Ok(count.0 > 0)
+        Ok(self.existing_id(user_id, source_id, source_name).await?.is_some())
+    }
+
+    /// The same question, answered with the row so a caller can do something
+    /// with what is already there. `exists` is the bool form.
+    pub async fn existing_id(
+        &self,
+        user_id: i64,
+        source_id: &str,
+        source_name: &str,
+    ) -> Result<Option<i64>, sqlx::Error> {
+        let hit: Option<(i64,)> = sqlx::query_as(
+            "SELECT id FROM scrobbles WHERE user_id = ? AND source_id = ? AND source_name = ?",
+        )
+        .bind(user_id)
+        .bind(source_id)
+        .bind(source_name)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(hit.map(|(id,)| id))
     }
 
     /// Has this play already been recorded under a different `source_id`?
@@ -2924,7 +2940,11 @@ impl Database {
     ///
     /// Unknown duration falls back to a conservative minute: better a rare
     /// duplicate than a silently dropped listen.
-    pub async fn fuzzy_exists(&self, user_id: i64, play: &Play) -> Result<bool, sqlx::Error> {
+    pub async fn fuzzy_existing_id(
+        &self,
+        user_id: i64,
+        play: &Play,
+    ) -> Result<Option<i64>, sqlx::Error> {
         // A duplicate is a *reporting lag* phenomenon and is therefore roughly
         // constant: the same play arriving from a second code path lands within
         // seconds (measured across a 21k-listen export: 0-51s, median 3s). A
@@ -2979,7 +2999,7 @@ impl Database {
         // history.
         let placeholders = VARIOUS_ARTISTS_KEYS.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
         let sql = format!(
-            "SELECT COUNT(*) FROM scrobbles
+            "SELECT id FROM scrobbles
               WHERE user_id = ?
                 AND timestamp BETWEEN ? - ? AND ? + ?
                 AND LOWER(TRIM(title)) = LOWER(TRIM(?))
@@ -2988,7 +3008,8 @@ impl Database {
                    OR LOWER(TRIM(artist)) IN ({ph})
                    OR ? IN ({ph})
                    OR (? IS NOT NULL AND mbid_recording = ?)
-                )",
+                )
+              ORDER BY id LIMIT 1",
             ph = placeholders
         );
         let mut q = sqlx::query_as::<_, (i64,)>(&sql)
@@ -3006,9 +3027,17 @@ impl Database {
         for k in VARIOUS_ARTISTS_KEYS {
             q = q.bind(*k);
         }
-        let count: (i64,) =
-            q.bind(&play.mbid_recording).bind(&play.mbid_recording).fetch_one(&self.pool).await?;
-        Ok(count.0 > 0)
+        let hit: Option<(i64,)> = q
+            .bind(&play.mbid_recording)
+            .bind(&play.mbid_recording)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(hit.map(|(id,)| id))
+    }
+
+    /// The bool form, for the callers that only need to know *whether*.
+    pub async fn fuzzy_exists(&self, user_id: i64, play: &Play) -> Result<bool, sqlx::Error> {
+        Ok(self.fuzzy_existing_id(user_id, play).await?.is_some())
     }
 
     pub async fn get_pending_scrobbles(&self) -> Result<Vec<PendingScrobble>, sqlx::Error> {
@@ -5308,7 +5337,11 @@ impl Database {
     /// but inserted as `imported` (not `pending`) so the outbound sink engine
     /// never re-scrobbles a back-fill to Last.fm/ListenBrainz. Returns true if
     /// a new row was inserted.
-    pub async fn import_listen(&self, user_id: i64, play: &Play) -> Result<bool, sqlx::Error> {
+    pub async fn import_listen(
+        &self,
+        user_id: i64,
+        play: &Play,
+    ) -> Result<ImportOutcome, sqlx::Error> {
         self.import_listen_flagged(user_id, play, false).await
     }
 
@@ -5323,8 +5356,167 @@ impl Database {
         user_id: i64,
         play: &Play,
         skipped: bool,
-    ) -> Result<bool, sqlx::Error> {
+    ) -> Result<ImportOutcome, sqlx::Error> {
         self.import_listen_detailed(user_id, play, skipped, ImportProvenance::default()).await
+    }
+
+    /// Fill in what an already-held listen never knew, from a duplicate copy of
+    /// it that knew more.
+    ///
+    /// An import used to drop a duplicate whole, which threw away every field
+    /// the incoming copy carried. A ListenBrainz archive holds a full
+    /// `mbid_mapping`, so re-importing a history you already have discarded
+    /// free, authoritative metadata — and the enrichment backfill then went and
+    /// bought it again through a rate-limited MusicBrainz search whose ranking
+    /// is, by this codebase's own measurement, not even stable. Measured on a
+    /// bare listen: the export's recording id was dropped and enrichment
+    /// resolved a *different* one.
+    ///
+    /// **Only ever fills a blank; never overwrites.** That is what keeps an
+    /// import from being able to rewrite history you already trust, which is the
+    /// property that made dropping duplicates safe in the first place. Artist
+    /// and title are not touchable at all — they are the identity the row was
+    /// matched on.
+    ///
+    /// `caa_id = -1` counts as blank. It is the tombstone meaning "asked the
+    /// Cover Art Archive, nothing there", and an import that carries a real id
+    /// is precisely the answer that tombstone was standing in for. `artwork_url
+    /// = ''` is the same idea but no import format carries one, so there is
+    /// nothing to fill it with.
+    ///
+    /// Returns whether anything actually changed, so the caller can report
+    /// enrichment separately from a plain duplicate.
+    async fn enrich_existing(
+        &self,
+        id: i64,
+        play: &Play,
+        provenance: &ImportProvenance,
+    ) -> Result<bool, sqlx::Error> {
+        // Nothing to give: skip the read entirely. A Rockbox log carries no
+        // MBIDs at all, so on that path this costs one comparison per listen
+        // rather than a query.
+        let incoming_mbid_artist = play
+            .mbid_artist
+            .as_ref()
+            .filter(|a| !a.is_empty())
+            .map(|a| serde_json::to_string(a).unwrap_or_else(|_| "[]".into()));
+        let has_anything = play.album.as_deref().is_some_and(|a| !a.trim().is_empty())
+            || play.duration.is_some()
+            || play.mbid_recording.is_some()
+            || play.mbid_release.is_some()
+            || incoming_mbid_artist.is_some()
+            || play.caa_id.is_some()
+            || play.caa_release_mbid.is_some()
+            || play.track_number.is_some()
+            || provenance.spotify_track_id.is_some();
+        if !has_anything {
+            return Ok(false);
+        }
+
+        let Some(row) = sqlx::query_as::<_, SparseColumns>(
+            "SELECT album, duration, mbid_recording, mbid_release, mbid_artist,
+                    caa_id, caa_release_mbid, track_number, spotify_track_id
+               FROM scrobbles WHERE id = ?",
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?
+        else {
+            return Ok(false);
+        };
+
+        let mut sets: Vec<&str> = Vec::new();
+        let blank = |s: &Option<String>| s.as_deref().map(str::trim).unwrap_or("").is_empty();
+
+        let album = play
+            .album
+            .as_deref()
+            .map(str::trim)
+            .filter(|a| !a.is_empty())
+            .filter(|_| blank(&row.album));
+        if album.is_some() {
+            sets.push("album = ?");
+        }
+        let duration = play.duration.filter(|_| row.duration.is_none()).map(|d| d as i64);
+        if duration.is_some() {
+            sets.push("duration = ?");
+        }
+        let rec = play.mbid_recording.as_deref().filter(|_| blank(&row.mbid_recording));
+        if rec.is_some() {
+            sets.push("mbid_recording = ?");
+        }
+        let rel = play.mbid_release.as_deref().filter(|_| blank(&row.mbid_release));
+        if rel.is_some() {
+            sets.push("mbid_release = ?");
+        }
+        let art = incoming_mbid_artist.filter(|_| {
+            // "[]" is a stored empty list, which knows no more than NULL does.
+            row.mbid_artist
+                .as_deref()
+                .map(str::trim)
+                .unwrap_or("")
+                .trim_matches(['[', ']', ' '])
+                .is_empty()
+        });
+        if art.is_some() {
+            sets.push("mbid_artist = ?");
+        }
+        // -1 is the "nothing in the archive" tombstone, which a real id supersedes.
+        let caa = play.caa_id.filter(|_| row.caa_id.is_none_or(|c| c <= 0));
+        if caa.is_some() {
+            sets.push("caa_id = ?");
+        }
+        let caa_rel = play.caa_release_mbid.as_deref().filter(|_| blank(&row.caa_release_mbid));
+        if caa_rel.is_some() {
+            sets.push("caa_release_mbid = ?");
+        }
+        let track = play.track_number.filter(|_| row.track_number.is_none());
+        if track.is_some() {
+            sets.push("track_number = ?");
+        }
+        let spotify =
+            provenance.spotify_track_id.as_deref().filter(|_| blank(&row.spotify_track_id));
+        if spotify.is_some() {
+            sets.push("spotify_track_id = ?");
+        }
+
+        // Everything it had, we had. One comparison and no write — which is the
+        // common case on a re-import and must not cost a statement.
+        if sets.is_empty() {
+            return Ok(false);
+        }
+
+        let sql = format!("UPDATE scrobbles SET {} WHERE id = ?", sets.join(", "));
+        let mut q = sqlx::query(&sql);
+        if let Some(v) = album {
+            q = q.bind(v.to_string());
+        }
+        if let Some(v) = duration {
+            q = q.bind(v);
+        }
+        if let Some(v) = rec {
+            q = q.bind(v.to_string());
+        }
+        if let Some(v) = rel {
+            q = q.bind(v.to_string());
+        }
+        if let Some(v) = art {
+            q = q.bind(v);
+        }
+        if let Some(v) = caa {
+            q = q.bind(v);
+        }
+        if let Some(v) = caa_rel {
+            q = q.bind(v.to_string());
+        }
+        if let Some(v) = track {
+            q = q.bind(v);
+        }
+        if let Some(v) = spotify {
+            q = q.bind(v.to_string());
+        }
+        q.bind(id).execute(&self.pool).await?;
+        Ok(true)
     }
 
     /// Import a listen, keeping what the export knew about *where* it happened.
@@ -5338,12 +5530,22 @@ impl Database {
         play: &Play,
         skipped: bool,
         provenance: ImportProvenance,
-    ) -> Result<bool, sqlx::Error> {
-        if self.exists(user_id, &play.source_id, &play.source_name).await? {
-            return Ok(false);
-        }
-        if self.fuzzy_exists(user_id, play).await? {
-            return Ok(false);
+    ) -> Result<ImportOutcome, sqlx::Error> {
+        // A duplicate is no longer the end of it. The incoming copy may know
+        // things the stored one never did — a ListenBrainz archive carries a
+        // full `mbid_mapping` — and dropping it whole meant the enrichment
+        // backfill later bought the same facts through a rate-limited search.
+        // Nothing is ever overwritten; see `enrich_existing`.
+        let held = match self.existing_id(user_id, &play.source_id, &play.source_name).await? {
+            Some(id) => Some(id),
+            None => self.fuzzy_existing_id(user_id, play).await?,
+        };
+        if let Some(id) = held {
+            return Ok(if self.enrich_existing(id, play, &provenance).await? {
+                ImportOutcome::Enriched
+            } else {
+                ImportOutcome::Duplicate
+            });
         }
         let mbid_artist_json =
             play.mbid_artist.as_ref().map(|arr| serde_json::to_string(arr).unwrap());
@@ -5383,7 +5585,7 @@ impl Database {
         // would produce listens that simply do not appear anywhere.
         self.link_scrobble_artists(user_id, &play.source_id, &play.source_name, play).await?;
 
-        Ok(true)
+        Ok(ImportOutcome::Inserted)
     }
 
     // ════════════════════════════════════════════════════════════
@@ -11316,6 +11518,36 @@ pub fn is_various_artists(name: &str) -> bool {
 /// the wrong face. Accent folding is safe there because an accent has never
 /// distinguished two different artists; it is the same person, spelled by a
 /// tagger who couldn't be bothered.
+/// What an import did with one listen.
+///
+/// Three outcomes rather than a bool, because "already had it" and "already had
+/// it and learned something from it" are different events and the job reports
+/// them separately — `imported: 0` used to read as "nothing happened" when a
+/// re-import had in fact filled in a great deal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImportOutcome {
+    /// A new listen.
+    Inserted,
+    /// Already held, and the incoming copy knew things this one did not.
+    Enriched,
+    /// Already held, with nothing to add.
+    Duplicate,
+}
+
+/// The sparse columns an import can fill in, as they stand on the stored row.
+#[derive(Debug, sqlx::FromRow)]
+struct SparseColumns {
+    album: Option<String>,
+    duration: Option<i64>,
+    mbid_recording: Option<String>,
+    mbid_release: Option<String>,
+    mbid_artist: Option<String>,
+    caa_id: Option<i64>,
+    caa_release_mbid: Option<String>,
+    track_number: Option<i64>,
+    spotify_track_id: Option<String>,
+}
+
 pub fn normalise_artist(s: &str) -> String {
     use unicode_normalization::UnicodeNormalization;
     s.chars()
@@ -15657,5 +15889,133 @@ mod tests {
             .unwrap();
         assert_eq!(again, 1, "resolved to the earliest of the two, deterministically");
         assert!(db.is_loved(uid, again).await.unwrap());
+    }
+    /// A re-import used to throw away everything the incoming copy knew.
+    ///
+    /// The stored listen is bare — the way a simple scrobble client reports one
+    /// — and the archive carries a full mapping. Dropping the duplicate whole
+    /// meant that metadata was lost and the enrichment backfill then bought the
+    /// same facts back through a rate-limited MusicBrainz search.
+    #[tokio::test]
+    async fn a_duplicate_import_fills_in_what_the_stored_listen_never_knew() {
+        let db = testdb().await;
+        let uid = db.create_user("ash", None, "pw", "user").await.unwrap();
+
+        // Bare: no album, no duration, no ids.
+        let mut bare = play("Archangel", "Burial", 1_750_000_000);
+        assert_eq!(db.import_listen(uid, &bare).await.unwrap(), ImportOutcome::Inserted);
+
+        // The same listen, as an export describes it.
+        bare.source_id = "somewhere-else".into();
+        let mut rich = bare.clone();
+        rich.album = Some("Untrue".into());
+        rich.duration = Some(230);
+        rich.track_number = Some(2);
+        rich.mbid_recording = Some("216ccc30-7b3a-440d-8e6f-1ad304507b87".into());
+        rich.mbid_release = Some("4c010fec-e436-4583-a2c8-067b1e15462c".into());
+        rich.mbid_artist = Some(vec!["9ddce51c-2b75-4b3e-ac8c-1db09e7c89c6".into()]);
+        rich.caa_id = Some(43_788_051_983);
+        rich.caa_release_mbid = Some("4c010fec-e436-4583-a2c8-067b1e15462c".into());
+
+        assert_eq!(
+            db.import_listen(uid, &rich).await.unwrap(),
+            ImportOutcome::Enriched,
+            "recognised as already held, and it had something to add"
+        );
+
+        let rows = db.get_recent_scrobbles(uid, 10, 0, None, None, None, None, None).await.unwrap();
+        assert_eq!(rows.len(), 1, "still one listen — nothing was duplicated");
+        let r = &rows[0];
+        assert_eq!(r.album.as_deref(), Some("Untrue"));
+        assert_eq!(r.duration, Some(230));
+        assert_eq!(r.track_number, Some(2));
+        assert_eq!(r.mbid_recording.as_deref(), Some("216ccc30-7b3a-440d-8e6f-1ad304507b87"));
+        assert_eq!(r.caa_id, Some(43_788_051_983));
+
+        // Running it a second time has nothing left to do, and must not cost a
+        // write per row on a re-import of a whole history.
+        assert_eq!(db.import_listen(uid, &rich).await.unwrap(), ImportOutcome::Duplicate);
+    }
+
+    /// **Only ever fills a blank.** An import must not be able to rewrite
+    /// history you already trust — that is the property which made dropping
+    /// duplicates safe, and it has to survive them being merged instead.
+    #[tokio::test]
+    async fn an_import_can_never_overwrite_what_is_already_there() {
+        let db = testdb().await;
+        let uid = db.create_user("ash", None, "pw", "user").await.unwrap();
+
+        let mut held = play("Archangel", "Burial", 1_750_000_000);
+        held.album = Some("Untrue".into());
+        held.duration = Some(230);
+        held.track_number = Some(2);
+        held.mbid_recording = Some("the-one-we-already-had".into());
+        held.caa_id = Some(111);
+        db.import_listen(uid, &held).await.unwrap();
+
+        let mut other = held.clone();
+        other.source_id = "elsewhere".into();
+        other.album = Some("A Different Album".into());
+        other.duration = Some(999);
+        other.track_number = Some(9);
+        other.mbid_recording = Some("a-different-recording".into());
+        other.caa_id = Some(222);
+
+        assert_eq!(
+            db.import_listen(uid, &other).await.unwrap(),
+            ImportOutcome::Duplicate,
+            "nothing to add — every field was already populated"
+        );
+
+        let r =
+            &db.get_recent_scrobbles(uid, 10, 0, None, None, None, None, None).await.unwrap()[0];
+        assert_eq!(r.album.as_deref(), Some("Untrue"));
+        assert_eq!(r.duration, Some(230));
+        assert_eq!(r.track_number, Some(2));
+        assert_eq!(r.mbid_recording.as_deref(), Some("the-one-we-already-had"));
+        assert_eq!(r.caa_id, Some(111));
+    }
+
+    /// `caa_id = -1` is the "asked the Cover Art Archive, nothing there"
+    /// tombstone, so it is a blank rather than an answer — an import carrying a
+    /// real id is exactly what it was standing in for. Getting this wrong is
+    /// invisible: the row keeps its lettered tile forever.
+    #[tokio::test]
+    async fn a_cover_art_tombstone_counts_as_blank() {
+        let db = testdb().await;
+        let uid = db.create_user("ash", None, "pw", "user").await.unwrap();
+
+        let mut held = play("Archangel", "Burial", 1_750_000_000);
+        held.caa_id = Some(-1);
+        db.import_listen(uid, &held).await.unwrap();
+
+        let mut rich = held.clone();
+        rich.source_id = "elsewhere".into();
+        rich.caa_id = Some(43_788_051_983);
+        assert_eq!(db.import_listen(uid, &rich).await.unwrap(), ImportOutcome::Enriched);
+
+        let r =
+            &db.get_recent_scrobbles(uid, 10, 0, None, None, None, None, None).await.unwrap()[0];
+        assert_eq!(r.caa_id, Some(43_788_051_983), "a real id supersedes the tombstone");
+    }
+
+    /// An import that knows nothing extra must cost no read and no write.
+    ///
+    /// A Rockbox log carries no MBIDs at all, so on a re-import of one this is
+    /// every single row — and a query per row is the shape that made a session
+    /// rebuild time out on the real host.
+    #[tokio::test]
+    async fn a_duplicate_with_nothing_to_add_is_still_just_a_duplicate() {
+        let db = testdb().await;
+        let uid = db.create_user("ash", None, "pw", "user").await.unwrap();
+
+        let mut p = play("Archangel", "Burial", 1_750_000_000);
+        db.import_listen(uid, &p).await.unwrap();
+        p.source_id = "elsewhere".into();
+        assert_eq!(db.import_listen(uid, &p).await.unwrap(), ImportOutcome::Duplicate);
+        assert_eq!(
+            db.get_recent_scrobbles(uid, 10, 0, None, None, None, None, None).await.unwrap().len(),
+            1
+        );
     }
 }
