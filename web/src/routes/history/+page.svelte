@@ -4,7 +4,7 @@
 	import type { Scrobble, SignalChain , ChainVariant } from '$lib/api';
 	import ScrobbleRow from '$lib/components/ScrobbleRow.svelte';
 	import InspectListen from '$lib/components/InspectListen.svelte';
-	import { loadLoves, lovedKeys, loveKey, toggleLove } from '$lib/loves';
+	import { loadLoves, lovedKeys, isLoved, toggleLove } from '$lib/loves';
 	import SessionCard from '$lib/components/SessionCard.svelte';
 	import ToTop from '$lib/components/ToTop.svelte';
 	import type { Session } from '$lib/api';
@@ -397,11 +397,13 @@
 		<!-- The bare heart on the row means the track; album and artist are
 		     explicit here, where there's room to say which. -->
 		{#each [{ k: 'album', label: 'album' }, { k: 'artist', label: 'artist' }] as t}
-			{@const key = menuFor && loveKey(menuFor, t.k as 'album' | 'artist')}
-			{#if key}
+			{@const isOn = !!menuFor && isLoved($lovedKeys, menuFor, t.k as 'album' | 'artist')}
+			<!-- A listen with no album has no album to love. Previously implied by
+			     `loveKey` returning null; said outright now. -->
+			{#if t.k === 'artist' || menuFor?.album}
 				<button class="menu-item" on:click={() => { if (menuFor) toggleLove(menuFor, t.k as 'album' | 'artist'); menuFor = null; }}>
-					<svg viewBox="0 0 24 24" width="16" fill={$lovedKeys.has(key) ? 'currentColor' : 'none'} stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.8 4.6a5.5 5.5 0 0 0-7.8 0L12 5.7l-1-1.1a5.5 5.5 0 0 0-7.8 7.8l1.1 1L12 21l7.7-7.6 1.1-1a5.5 5.5 0 0 0 0-7.8z"/></svg>
-					{$lovedKeys.has(key) ? `Un-love ${t.label}` : `Love ${t.label}`}
+					<svg viewBox="0 0 24 24" width="16" fill={isOn ? 'currentColor' : 'none'} stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.8 4.6a5.5 5.5 0 0 0-7.8 0L12 5.7l-1-1.1a5.5 5.5 0 0 0-7.8 7.8l1.1 1L12 21l7.7-7.6 1.1-1a5.5 5.5 0 0 0 0-7.8z"/></svg>
+					{isOn ? `Un-love ${t.label}` : `Love ${t.label}`}
 				</button>
 			{/if}
 		{/each}

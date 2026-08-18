@@ -5,7 +5,7 @@
 	import ScrobbleRow from '$lib/components/ScrobbleRow.svelte';
 	import { deck, watchNowPlaying } from '$lib/nowplaying';
 	import { formatDuration, qualityLabel, tierTagClass, mediumLabel } from '$lib/utils';
-	import { loadLoves, lovedKeys, loveKeyOf, toggleLoveByName } from '$lib/loves';
+	import { loadLoves, lovedKeys, isLovedNamed, toggleLoveByName } from '$lib/loves';
 	import { openAlbum, openArtist } from '$lib/entities';
 	import { fidelity, fidelityLabel } from '$lib/fidelity';
 
@@ -99,8 +99,7 @@
 		if (album) void openAlbum(artist, album);
 	}
 
-	$: heroTrackKey = hero ? loveKeyOf('track', hero.artist, hero.title) : null;
-	$: heroLoved = heroTrackKey ? $lovedKeys.has(heroTrackKey) : false;
+	$: heroLoved = hero ? isLovedNamed($lovedKeys, 'track', hero.artist, hero.title) : false;
 	let lastKey: string | null = null;
 	$: if (!loading && nowKey !== lastKey) {
 		// The scrobble lands when the *previous* track ends, which the source

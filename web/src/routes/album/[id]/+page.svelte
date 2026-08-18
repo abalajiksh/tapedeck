@@ -5,7 +5,7 @@
 	import type { AlbumView, AlbumTracklist, TracklistTrack } from '$lib/api';
 	import { formatDuration, qualityLabel, tierTagClass } from '$lib/utils';
 	import { openArtist } from '$lib/entities';
-	import { lovedKeys, loveKeyOf, toggleLoveByName } from '$lib/loves';
+	import { lovedKeys, isLovedNamed, toggleLoveByName } from '$lib/loves';
 	import CoverArt from '$lib/components/CoverArt.svelte';
 	import StatStrip from '$lib/components/StatStrip.svelte';
 	import BioCard from '$lib/components/BioCard.svelte';
@@ -187,7 +187,7 @@
 	// The love state lives in the shared store so a heart toggled here matches
 	// the one on the history rows without either refetching.
 	$: albumKey = album ? `release|${album.artist.trim().toLowerCase()}|${album.title.trim().toLowerCase()}` : '';
-	$: loved = albumKey ? $lovedKeys.has(albumKey) : false;
+	$: loved = album ? isLovedNamed($lovedKeys, 'album', album.artist, album.title) : false;
 
 	async function toggleLove() {
 		if (!album || loveBusy) return;
@@ -358,8 +358,7 @@
 		<div class="panel" style="border-radius:22px;overflow:hidden;">
 			{#each fullRows as r}
 				{@const q = r.played ? qualityLabel(r.played) : null}
-				{@const key = loveKeyOf('track', r.artist, r.title)}
-				{@const isLoved = key ? $lovedKeys.has(key) : false}
+				{@const isLoved = isLovedNamed($lovedKeys, 'track', r.artist, r.title)}
 				<div class="track" class:unplayed={!r.plays}>
 					<span class="n">{showSides && r.side ? `${r.side}${r.position ?? ''}` : (r.position ?? '—')}</span>
 					<div style="flex:1;min-width:0;">
@@ -382,8 +381,7 @@
 		<div class="panel" style="border-radius:22px;overflow:hidden;">
 			{#each tracks as t, i}
 				{@const q = qualityLabel(t)}
-				{@const key = loveKeyOf('track', album.artist, t.title)}
-				{@const isLoved = key ? $lovedKeys.has(key) : false}
+				{@const isLoved = isLovedNamed($lovedKeys, 'track', album.artist, t.title)}
 				<div class="track">
 					<span class="n">{sort === 'sequence' ? (t.track_number ?? '—') : i + 1}</span>
 					<div style="flex:1;min-width:0;">

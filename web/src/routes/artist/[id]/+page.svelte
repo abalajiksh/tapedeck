@@ -5,7 +5,7 @@
 	import type { ArtistView } from '$lib/api';
 	import { formatDuration, qualityLabel, tierTagClass } from '$lib/utils';
 	import { openAlbum } from '$lib/entities';
-	import { lovedKeys } from '$lib/loves';
+	import { lovedKeys, isLovedNamed } from '$lib/loves';
 	import StatStrip from '$lib/components/StatStrip.svelte';
 	import BioCard from '$lib/components/BioCard.svelte';
 	import BarChart from '$lib/components/BarChart.svelte';
@@ -89,7 +89,7 @@
 	// An artist entity's key carries an empty artist half — the name *is* the
 	// artist. Matches `Database::entity_key`.
 	$: artistKey = artist ? `artist||${artist.name.trim().toLowerCase()}` : '';
-	$: loved = artistKey ? $lovedKeys.has(artistKey) : false;
+	$: loved = artist ? isLovedNamed($lovedKeys, 'artist', artist.name, artist.name) : false;
 
 	async function toggleLove() {
 		if (!artist || loveBusy) return;

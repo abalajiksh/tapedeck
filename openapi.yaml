@@ -26,7 +26,7 @@ openapi: 3.1.0
 
 info:
   title: Tapedeck
-  version: 0.68.0
+  version: 0.69.0
   summary: Self-hosted scrobbler and listening journal.
   description: |
     Tapedeck ingests listens, enriches them with MusicBrainz metadata, stores
@@ -2602,10 +2602,26 @@ paths:
       summary: Every loved entity key, as a flat set.
       description: |
         Scope: `read` *(since v0.39)*. One request instead of one per history
-        row. Derive a row's key client-side as `kind|artist|name`, trimmed and
-        lowercased, with an artist's `artist` half empty. **If your derivation
-        drifts from the server's, hearts silently stop filling — nothing
-        errors.**
+        row.
+
+        Since v0.69 a love is published in **up to three forms**, and a row is
+        loved if *any* key it can derive is in the set. Two players rarely spell
+        one song identically — Plex files a listen under the record's artist
+        while a scrobble client reports what the player displayed — so an exact
+        match alone left the heart empty on the same track from another source.
+
+        * `kind|artist|name` — trimmed and lowercased, an artist's `artist` half
+          empty. The exact key, as before.
+        * `kind|artist|name` **folded** — accents, ligatures and all punctuation
+          removed, and the primary taken from an explicit `feat.` credit. Note a
+          trailing title qualifier is *not* removed: "Archangel" and "Archangel
+          (Remastered)" stay apart.
+        * `mbid:<kind>:<mbid>` — present when the entity has a MusicBrainz id.
+          The strongest of the three; a listen row carries a recording id.
+
+        **If your derivation drifts from the server's, hearts silently stop
+        filling — nothing errors.** The folded form is pinned character for
+        character by `the_folded_key_is_exactly_what_the_client_must_reproduce`.
       security: [{ sessionCookie: [] }, { apiToken: [read] }]
       responses:
         '200':

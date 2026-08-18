@@ -5,7 +5,7 @@
 	import SourceIcon from './SourceIcon.svelte';
 	import ChainIcon from './ChainIcon.svelte';
 	import { createEventDispatcher } from 'svelte';
-	import { lovedKeys, loveKey, toggleLove } from '$lib/loves';
+	import { lovedKeys, isLoved, toggleLove } from '$lib/loves';
 	import { openAlbum, openArtist } from '$lib/entities';
 
 	export let scrobble: Scrobble;
@@ -34,8 +34,9 @@
 
 	// The bare heart means the *song*, matching Last.fm and ListenBrainz.
 	// Album and artist stay in the row menu, where the distinction is explicit.
-	$: trackKey = loveKey(scrobble, 'track');
-	$: loved = trackKey ? $lovedKeys.has(trackKey) : false;
+	// Any form the row can be recognised by — the same song from another player
+	// spells its artist differently, so an exact match alone left the heart empty.
+	$: loved = isLoved($lovedKeys, scrobble, 'track');
 </script>
 
 <div class="row" style="border-bottom:1px solid var(--td-border);{selected ? 'background:color-mix(in srgb, var(--td-accent) 8%, transparent);' : ''}">

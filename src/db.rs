@@ -1221,6 +1221,11 @@ impl Database {
                 name TEXT NOT NULL,
                 artist_name TEXT NOT NULL DEFAULT '',
                 entity_key TEXT NOT NULL UNIQUE,
+                -- The forgiving key. Deliberately **not** UNIQUE: the whole
+                -- reason it exists is that entities already exist which fold
+                -- together, and a unique index would refuse to create it on
+                -- exactly the databases that need it. See `Database::match_key`.
+                match_key TEXT,
                 mbid TEXT,
                 image_url TEXT,
                 created_at INTEGER NOT NULL
@@ -2371,6 +2376,44 @@ impl Database {
         // existed went through the chain as it was, which is exactly what a
         // null means here. Guessing a variant for it would invent wear on a
         // cartridge that may not have been fitted yet.
+        // Migration: the forgiving entity key.
+        //
+        // Backfilled rather than left null, because it is what makes a love
+        // recognised across two spellings and an existing database is precisely
+        // the one holding the split entities. The index is **not** unique — see
+        // the column comment.
+        if !has_column(&self.pool, "entities", "match_key").await {
+            info!("⚙️ Migrating: forgiving entity keys...");
+            let _ = sqlx::query("ALTER TABLE entities ADD COLUMN match_key TEXT")
+                .execute(&self.pool)
+                .await;
+            let rows: Vec<(i64, String, String, String)> =
+                sqlx::query_as("SELECT id, kind, artist_name, name FROM entities")
+                    .fetch_all(&self.pool)
+                    .await
+                    .unwrap_or_default();
+            let mut tx = self.pool.begin().await?;
+            for (id, kind, artist, name) in &rows {
+                let _ = sqlx::query("UPDATE entities SET match_key = ? WHERE id = ?")
+                    .bind(Self::match_key(kind, artist, name))
+                    .bind(id)
+                    .execute(&mut *tx)
+                    .await;
+            }
+            tx.commit().await?;
+            info!("⚙️ Migrated {} entities.", rows.len());
+        }
+        // Outside the guard and `IF NOT EXISTS`, for the reason v0.61.1 records:
+        // anything in `init()` that references a migrated column fails on every
+        // existing database, so it belongs here — after the column is certain to
+        // be there on both paths.
+        let _ = sqlx::query("CREATE INDEX IF NOT EXISTS idx_entities_match ON entities(match_key)")
+            .execute(&self.pool)
+            .await;
+        let _ = sqlx::query("CREATE INDEX IF NOT EXISTS idx_entities_mbid ON entities(kind, mbid)")
+            .execute(&self.pool)
+            .await;
+
         if !has_column(&self.pool, "scrobbles", "chain_variant_id").await {
             info!("⚙️ Migrating: chain variants...");
             let _ = sqlx::query(
@@ -6858,6 +6901,47 @@ impl Database {
         )
     }
 
+    /// The *forgiving* identity of an entity — what makes a love survive being
+    /// played from somewhere else.
+    ///
+    /// `entity_key` is an exact match on the lowercased strings, which is right
+    /// for storage and wrong for recognition: two sources describing the same
+    /// song rarely spell it identically. Plex files a listen under the record's
+    /// artist (`grandparentTitle`) while a scrobble client reports what the
+    /// player displays, so anything with a feature or a collaboration arrives
+    /// under two names — and an apostrophe, an accent or a ligature does the
+    /// same. Loving a track in one place then left the heart empty in the other,
+    /// with nothing erroring.
+    ///
+    /// Built from the two normalisers this codebase already has rather than a
+    /// third: `normalise_artist` folds punctuation, accents and the ligatures
+    /// Unicode does not decompose, and `split_featured` takes the primary of an
+    /// explicit `feat.` credit. Both are already trusted to decide "are these
+    /// two spellings of one name?" — the sanitiser asks it to group candidates
+    /// for review, and this asks it to fill a heart. Neither rewrites data.
+    ///
+    /// **The title is folded but never *shortened*.** `normalise_artist` runs
+    /// over it, so punctuation stops mattering, but a trailing qualifier is
+    /// left alone: "Archangel" and "Archangel (Remastered)" stay apart, because
+    /// a remaster genuinely may be a different recording and MusicBrainz ids
+    /// tell them apart correctly. Folding them together is a further decision
+    /// than this one.
+    pub fn match_key(kind: &str, artist_name: &str, name: &str) -> String {
+        let artist = split_featured(artist_name).unwrap_or_else(|| artist_name.to_string());
+        format!(
+            "{}|{}|{}",
+            kind.trim().to_lowercase(),
+            normalise_artist(&artist),
+            normalise_artist(name)
+        )
+    }
+
+    /// The key a *loved* entity is recognised by when its MusicBrainz id is
+    /// known. Its own namespace so it can never collide with a folded key.
+    pub fn mbid_key(kind: &str, mbid: &str) -> String {
+        format!("mbid:{}:{}", kind.trim().to_lowercase(), mbid.trim().to_lowercase())
+    }
+
     /// The three things a note or a love can point at. Callers validate against
     /// this before writing — the column is a plain TEXT.
     pub const ENTITY_KINDS: [&'static str; 3] = ["recording", "release", "artist"];
@@ -6873,24 +6957,99 @@ impl Database {
         mbid: Option<&str>,
     ) -> Result<i64, sqlx::Error> {
         let key = Self::entity_key(kind, artist_name, name);
-        sqlx::query(
-            "INSERT INTO entities (kind, name, artist_name, entity_key, mbid, created_at)
-             VALUES (?, ?, ?, ?, ?, ?)
-             ON CONFLICT(entity_key) DO UPDATE SET mbid = COALESCE(excluded.mbid, entities.mbid)",
-        )
-        .bind(kind.trim().to_lowercase())
-        .bind(name.trim())
-        .bind(artist_name.trim())
-        .bind(&key)
-        .bind(mbid)
-        .bind(Self::now_secs())
-        .execute(&self.pool)
-        .await?;
+        let folded = Self::match_key(kind, artist_name, name);
+        let kind_lc = kind.trim().to_lowercase();
 
-        let (id,): (i64,) = sqlx::query_as("SELECT id FROM entities WHERE entity_key = ?")
-            .bind(&key)
-            .fetch_one(&self.pool)
-            .await?;
+        // Three ways to recognise something that already exists, tried in
+        // descending order of certainty. Only if none of them finds anything is
+        // a new entity created — which is what stops one song becoming two
+        // because two players spell its artist differently.
+        //
+        // 1. The exact key. Unchanged, and still the UNIQUE column.
+        // 2. Its **MusicBrainz id**. This is the authority on what a recording
+        //    is, and it was already stored on every entity and never once read
+        //    back: a Plex listen and a scrobble-client listen of the same track
+        //    carried the identical recording id and still became two rows with
+        //    two separate loves.
+        // 3. The folded key, for everything with no id — which is most of a real
+        //    library, and all of a listen a scrobble client never enriched.
+        //
+        // Ordered by id so the answer is stable: a database that already holds
+        // two rows folding together keeps resolving to the first one made,
+        // rather than moving between them as rows are added.
+        let existing: Option<(i64,)> =
+            sqlx::query_as("SELECT id FROM entities WHERE entity_key = ?")
+                .bind(&key)
+                .fetch_optional(&self.pool)
+                .await?;
+        let existing =
+            match existing {
+                Some(hit) => Some(hit),
+                None => match mbid.map(str::trim).filter(|m| !m.is_empty()) {
+                    Some(m) => sqlx::query_as(
+                        "SELECT id FROM entities WHERE kind = ? AND mbid = ? ORDER BY id LIMIT 1",
+                    )
+                    .bind(&kind_lc)
+                    .bind(m)
+                    .fetch_optional(&self.pool)
+                    .await?,
+                    None => None,
+                },
+            };
+        let existing =
+            match existing {
+                Some(hit) => Some(hit),
+                None => sqlx::query_as(
+                    "SELECT id FROM entities WHERE kind = ? AND match_key = ? ORDER BY id LIMIT 1",
+                )
+                .bind(&kind_lc)
+                .bind(&folded)
+                .fetch_optional(&self.pool)
+                .await?,
+            };
+
+        let id = match existing {
+            Some((id,)) => {
+                // Never overwrite what is there — the row keeps the spelling it
+                // was created with, and only gains an id it did not have.
+                // `COALESCE` for the same reason the insert used it: a later
+                // lookup that finds nothing must not erase one we already had.
+                let _ = sqlx::query(
+                    "UPDATE entities SET mbid = COALESCE(mbid, ?),
+                            match_key = COALESCE(match_key, ?) WHERE id = ?",
+                )
+                .bind(mbid)
+                .bind(&folded)
+                .bind(id)
+                .execute(&self.pool)
+                .await;
+                id
+            }
+            None => {
+                sqlx::query(
+                    "INSERT INTO entities
+                        (kind, name, artist_name, entity_key, match_key, mbid, created_at)
+                     VALUES (?, ?, ?, ?, ?, ?, ?)
+                     ON CONFLICT(entity_key) DO UPDATE SET
+                        mbid = COALESCE(excluded.mbid, entities.mbid),
+                        match_key = COALESCE(excluded.match_key, entities.match_key)",
+                )
+                .bind(&kind_lc)
+                .bind(name.trim())
+                .bind(artist_name.trim())
+                .bind(&key)
+                .bind(&folded)
+                .bind(mbid)
+                .bind(Self::now_secs())
+                .execute(&self.pool)
+                .await?;
+                let (id,): (i64,) = sqlx::query_as("SELECT id FROM entities WHERE entity_key = ?")
+                    .bind(&key)
+                    .fetch_one(&self.pool)
+                    .await?;
+                id
+            }
+        };
 
         if let Some(mbid) = mbid.filter(|m| !m.trim().is_empty()) {
             let _ = sqlx::query(
@@ -8161,15 +8320,41 @@ impl Database {
     /// client can derive a listen's key without a round-trip. `entity_key` is
     /// stored, so this is a plain column read rather than a recomputation that
     /// could drift from it.
+    /// Every way a loved entity can be recognised on a listen row.
+    ///
+    /// Up to three per love rather than one: the exact key it was stored under,
+    /// the folded key (so a different spelling of the same name still fills the
+    /// heart), and an `mbid:` key when the entity has a MusicBrainz id. The
+    /// client holds the union and asks whether *any* of a row's candidates is
+    /// in it.
+    ///
+    /// More than one form is what makes this work across sources at all: Plex
+    /// files a listen under the record's artist and a scrobble client reports
+    /// what the player showed, so the exact key alone matched only when the two
+    /// happened to agree.
     pub async fn loved_keys(&self, user_id: i64) -> Result<Vec<String>, sqlx::Error> {
-        let rows: Vec<(String,)> = sqlx::query_as(
-            "SELECT e.entity_key FROM loves l JOIN entities e ON e.id = l.entity_id
-             WHERE l.user_id = ?",
+        let rows: Vec<(String, Option<String>, String, Option<String>)> = sqlx::query_as(
+            "SELECT e.entity_key, e.match_key, e.kind, e.mbid
+               FROM loves l JOIN entities e ON e.id = l.entity_id
+              WHERE l.user_id = ?",
         )
         .bind(user_id)
         .fetch_all(&self.pool)
         .await?;
-        Ok(rows.into_iter().map(|(k,)| k).collect())
+
+        let mut keys: Vec<String> = Vec::with_capacity(rows.len() * 3);
+        for (exact, folded, kind, mbid) in rows {
+            keys.push(exact);
+            if let Some(f) = folded.filter(|f| !f.is_empty()) {
+                keys.push(f);
+            }
+            if let Some(m) = mbid.map(|m| m.trim().to_string()).filter(|m| !m.is_empty()) {
+                keys.push(Self::mbid_key(&kind, &m));
+            }
+        }
+        keys.sort();
+        keys.dedup();
+        Ok(keys)
     }
 
     pub async fn is_loved(&self, user_id: i64, entity_id: i64) -> Result<bool, sqlx::Error> {
@@ -15249,5 +15434,228 @@ mod tests {
             db.get_recent_scrobbles(uid, 10, 0, None, None, None, None, None).await.unwrap().len(),
             1
         );
+    }
+    /// The reported bug, end to end: a track loved from a Plex listen and then
+    /// played through a scrobble client, which names its artist differently.
+    ///
+    /// Plex files a listen under the **record's** artist (`grandparentTitle`)
+    /// while a client reports what the player displayed, so anything with a
+    /// feature arrives under two names. The love used to land on one of them and
+    /// the heart stayed empty on the other, with nothing erroring.
+    #[tokio::test]
+    async fn a_love_survives_the_same_song_arriving_from_another_source() {
+        let db = testdb().await;
+        let uid = db.create_user("ash", None, "pw", "user").await.unwrap();
+        const MBID: &str = "b1a9c0e9-d987-4042-ae91-78d6a3267d69";
+
+        // Loved from the Plex-shaped listen.
+        let plex = db.upsert_entity("recording", "Archangel", "Burial", Some(MBID)).await.unwrap();
+        db.set_love(uid, plex, true).await.unwrap();
+
+        // The same recording, as a scrobble client names it. Same MusicBrainz
+        // id — which was on both rows all along and never once read back.
+        let client = db
+            .upsert_entity("recording", "Archangel", "Burial feat. Someone", Some(MBID))
+            .await
+            .unwrap();
+        assert_eq!(client, plex, "one recording is one entity, whatever it was called");
+        assert!(db.is_loved(uid, client).await.unwrap(), "the heart is filled from either source");
+
+        // And with no MusicBrainz id anywhere, which is most of a real library:
+        // the folded key still recognises it.
+        let bare = db
+            .upsert_entity("recording", "Archangel", "Burial  feat. Someone", None)
+            .await
+            .unwrap();
+        assert_eq!(bare, plex);
+    }
+
+    /// The spellings two players disagree about. Every one of these is the same
+    /// song, and every one of them used to be a separate entity with its own
+    /// love.
+    ///
+    /// Built from the two normalisers this codebase already has rather than a
+    /// third — `normalise_artist` for punctuation, accents and ligatures, and
+    /// `split_featured` for the credit.
+    #[tokio::test]
+    async fn the_ways_two_players_spell_one_song_all_fold_together() {
+        let db = testdb().await;
+        let uid = db.create_user("ash", None, "pw", "user").await.unwrap();
+
+        let base =
+            db.upsert_entity("recording", "Don't Look Back", "Cœur de pirate", None).await.unwrap();
+        db.set_love(uid, base, true).await.unwrap();
+
+        for (artist, title, why) in [
+            ("Coeur de pirate", "Don't Look Back", "ligature expanded"),
+            ("Cœur de pirate", "Don’t Look Back", "curly apostrophe"),
+            ("cœur de pirate", "DON'T LOOK BACK", "case"),
+            ("Cœur de pirate feat. Someone", "Don't Look Back", "featured credit"),
+            ("  Cœur de pirate  ", " Don't Look Back ", "whitespace"),
+        ] {
+            let id = db.upsert_entity("recording", title, artist, None).await.unwrap();
+            assert_eq!(id, base, "{why}: {artist} — {title}");
+            assert!(db.is_loved(uid, id).await.unwrap(), "{why}");
+        }
+    }
+
+    /// Folding must not merge things that are genuinely different, or a heart
+    /// becomes a lie in the other direction.
+    ///
+    /// A remaster is the deliberate omission: the title is folded but never
+    /// *shortened*, so a trailing qualifier still separates two recordings —
+    /// they may really be different, and MusicBrainz ids tell them apart
+    /// correctly. Merging those is a further decision than this one.
+    #[tokio::test]
+    async fn folding_stops_short_of_merging_different_songs() {
+        let db = testdb().await;
+
+        let a = db.upsert_entity("recording", "Archangel", "Burial", None).await.unwrap();
+        for (artist, title) in [
+            ("Burial", "Archangel (Remastered)"),
+            ("Burial", "Archangel - Radio Edit"),
+            ("Burial", "Arcangel"),
+            ("Four Tet", "Archangel"),
+            // `&` and `,` are names, not credits — the rule `split_featured`
+            // already keeps.
+            ("Simon & Garfunkel", "Archangel"),
+            ("Simon and Garfunkel", "Archangel"),
+        ] {
+            assert_ne!(
+                db.upsert_entity("recording", title, artist, None).await.unwrap(),
+                a,
+                "{artist} — {title} is not the same recording"
+            );
+        }
+    }
+
+    /// A love is published in every form a row could recognise it by, because
+    /// the client holds this set and matches locally — one request rather than
+    /// one per listen.
+    #[tokio::test]
+    async fn a_love_is_published_in_every_form_a_row_can_match() {
+        let db = testdb().await;
+        let uid = db.create_user("ash", None, "pw", "user").await.unwrap();
+        const MBID: &str = "b1a9c0e9-d987-4042-ae91-78d6a3267d69";
+        let id = db
+            .upsert_entity("recording", "Don't Look Back", "Cœur de pirate", Some(MBID))
+            .await
+            .unwrap();
+        db.set_love(uid, id, true).await.unwrap();
+
+        let keys = db.loved_keys(uid).await.unwrap();
+        assert!(keys.contains(&"recording|cœur de pirate|don't look back".to_string()), "{keys:?}");
+        assert!(keys.contains(&"recording|coeurdepirate|dontlookback".to_string()), "{keys:?}");
+        assert!(keys.contains(&format!("mbid:recording:{MBID}")), "{keys:?}");
+    }
+
+    /// The strings `web/src/lib/loves.ts` has to produce, character for
+    /// character.
+    ///
+    /// The client folds a listen row itself — asking the server per row would be
+    /// one request per listen — so the two implementations have to agree, and if
+    /// they drift the hearts silently stop filling. This pins the Rust side of
+    /// that contract so a change here is visible; the mirror is listed in the
+    /// same order in that file.
+    #[test]
+    fn the_folded_key_is_exactly_what_the_client_must_reproduce() {
+        for (kind, artist, name, want) in [
+            ("recording", "Burial", "Archangel", "recording|burial|archangel"),
+            ("recording", "Burial feat. Someone", "Archangel", "recording|burial|archangel"),
+            (
+                "recording",
+                "Cœur de pirate",
+                "Don’t Look Back",
+                "recording|coeurdepirate|dontlookback",
+            ),
+            ("recording", "Beyoncé", "Halo", "recording|beyonce|halo"),
+            ("release", "A.R. Rahman", "Roja", "release|arrahman|roja"),
+            ("artist", "", "Simon & Garfunkel", "artist||simongarfunkel"),
+            ("recording", "Sigur Rós", "Hoppípolla", "recording|sigurros|hoppipolla"),
+        ] {
+            assert_eq!(Database::match_key(kind, artist, name), want, "{artist} — {name}");
+        }
+        assert_eq!(
+            Database::mbid_key("recording", "B1A9C0E9-D987-4042-AE91-78D6A3267D69"),
+            "mbid:recording:b1a9c0e9-d987-4042-ae91-78d6a3267d69"
+        );
+    }
+
+    /// An existing database has entities with no `match_key`, and it is the one
+    /// that needs it most — the split loves this release exists to reunite are
+    /// already sitting in it.
+    ///
+    /// The same check `an_existing_database_opens_and_gains_period_notes` exists
+    /// for. Every other test starts from an empty file and so never runs
+    /// `migrate()` against a real prior schema, which is precisely how a
+    /// migration that cannot run on an existing database passes the whole suite
+    /// (v0.61.1).
+    #[tokio::test]
+    async fn an_existing_database_gains_the_forgiving_entity_key() {
+        let n = N.fetch_add(1, Ordering::SeqCst);
+        let path = std::env::temp_dir().join(format!("td-oldent-{}-{}.db", std::process::id(), n));
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{}", path.display(), suffix));
+        }
+
+        // The pre-v0.69 `entities` shape: no `match_key`, and two rows that are
+        // the same recording under two spellings — the reported bug, already in
+        // the database.
+        {
+            let pool = sqlx::SqlitePool::connect(&format!("sqlite:{}?mode=rwc", path.display()))
+                .await
+                .unwrap();
+            for ddl in [
+                "CREATE TABLE entities (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                     kind TEXT NOT NULL, name TEXT NOT NULL,
+                     artist_name TEXT NOT NULL DEFAULT '',
+                     entity_key TEXT NOT NULL UNIQUE, mbid TEXT, image_url TEXT,
+                     created_at INTEGER NOT NULL)",
+                "INSERT INTO entities (kind, name, artist_name, entity_key, created_at)
+                     VALUES ('recording','Archangel','Burial','recording|burial|archangel',1)",
+                "INSERT INTO entities (kind, name, artist_name, entity_key, created_at)
+                     VALUES ('recording','Archangel','Burial feat. Someone',
+                             'recording|burial feat. someone|archangel',1)",
+            ] {
+                sqlx::query(ddl).execute(&pool).await.unwrap();
+            }
+            pool.close().await;
+        }
+
+        let db =
+            Database::new(&format!("sqlite:{}", path.display()), Arc::new(SecretBox::test_key()))
+                .await
+                .expect("an existing database must open");
+
+        // Backfilled, not left null — the rows that were already there are the
+        // ones the fold has to recognise.
+        let keys: Vec<(i64, Option<String>)> =
+            sqlx::query_as("SELECT id, match_key FROM entities ORDER BY id")
+                .fetch_all(&db.pool)
+                .await
+                .unwrap();
+        assert_eq!(keys.len(), 2);
+        for (id, k) in &keys {
+            assert_eq!(
+                k.as_deref(),
+                Some("recording|burial|archangel"),
+                "entity {id} folds to the same key"
+            );
+        }
+
+        // The index is non-unique on purpose: both rows above carry the same
+        // folded key, so a unique one would refuse to be created on exactly the
+        // databases that need it.
+        let uid = db.create_user("ash", None, "pw", "user").await.unwrap();
+        db.set_love(uid, 1, true).await.unwrap();
+
+        // A third spelling now resolves onto the *first* row rather than making
+        // a fourth, and inherits its love.
+        let again = db
+            .upsert_entity("recording", "Archangel", "BURIAL  FEAT. SOMEONE", None)
+            .await
+            .unwrap();
+        assert_eq!(again, 1, "resolved to the earliest of the two, deterministically");
+        assert!(db.is_loved(uid, again).await.unwrap());
     }
 }
