@@ -1671,6 +1671,37 @@ class TapedeckAPI {
 		return this.request('PUT', `/api/v1/albums/${entityId}/cover`, { url });
 	}
 
+	/** Upload a picture instead of pasting a URL.
+	 *
+	 *  The three overrides above cover a picture that is already somewhere on
+	 *  the web. A photograph of a record you own, or a band shot that exists
+	 *  only on your disk, had no route in at all — and "host it somewhere
+	 *  first" is not an answer for a self-hosted journal.
+	 *
+	 *  These replace the override exactly as a pasted URL does, and the file
+	 *  the new one supersedes is deleted server-side. */
+	async uploadArtistImage(artistRowId: number, file: File): Promise<{ image_url: string }> {
+		return this.uploadArt(`/api/v1/artists/img/${artistRowId}/upload`, file);
+	}
+	async uploadArtistLandscape(
+		artistRowId: number,
+		file: File
+	): Promise<{ landscape_url: string }> {
+		return this.uploadArt(`/api/v1/artists/landscape/${artistRowId}/upload`, file);
+	}
+	async uploadAlbumCover(entityId: number, file: File): Promise<{ artwork_url: string }> {
+		return this.uploadArt(`/api/v1/albums/${entityId}/cover/upload`, file);
+	}
+	private async uploadArt(path: string, file: File) {
+		const form = new FormData();
+		form.append('file', file);
+		const res = await fetch(`${BASE}${path}`, {
+			method: 'POST', credentials: 'same-origin', body: form
+		});
+		if (!res.ok) throw new Error(`API ${res.status}: ${await res.text()}`);
+		return res.json();
+	}
+
 	async getDiscogsSetting(): Promise<{
 		configured: boolean;
 		from_env: boolean;

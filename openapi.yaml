@@ -26,7 +26,7 @@ openapi: 3.1.0
 
 info:
   title: Tapedeck
-  version: 0.67.0
+  version: 0.68.0
   summary: Self-hosted scrobbler and listening journal.
   description: |
     Tapedeck ingests listens, enriches them with MusicBrainz metadata, stores
@@ -2427,6 +2427,111 @@ paths:
       responses:
         '200': { description: Saved., content: { application/json: { schema: { $ref: '#/components/schemas/Ok' } } } }
         '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /api/v1/artists/img/{id}/upload:
+    post:
+      tags: [Library]
+      summary: Upload an artist portrait.
+      description: |
+        Session-only. The counterpart of the `PUT` above, for a picture that is
+        on your disk rather than already somewhere on the web.
+
+        The extension is taken from the **declared content type**, never from
+        the filename — the path is one this server writes. The stored name is
+        random, so the served URL is `immutable`-cacheable and a replaced
+        picture is a new URL rather than the same URL with new bytes.
+
+        Replaces the override exactly as a pasted URL does, and the file it
+        supersedes is deleted. `artists` carries no user column, so this is an
+        **instance-wide** edit.
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              properties:
+                file: { type: string, format: binary }
+      responses:
+        '200': { description: 'Saved. The body carries the new URL, which is a path on this server.', content: { application/json: { schema: { type: object, properties: { image_url: { type: string } } } } } }
+        # No image in the request.
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '413': { description: Larger than 8 MB. }
+        '415': { description: 'Not an image type this server stores (JPEG, PNG, WebP, GIF, AVIF, TIFF).' }
+
+  /api/v1/artists/landscape/{id}/upload:
+    post:
+      tags: [Library]
+      summary: Upload an artist's wide picture.
+      description: |
+        Session-only. Same rules as the portrait upload.
+
+        This is the one image override nothing can fill automatically — no
+        provider Tapedeck reaches supplies a landscape — so before this it was a
+        URL or the big initial.
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              properties:
+                file: { type: string, format: binary }
+      responses:
+        '200': { description: 'Saved. The body carries the new URL, which is a path on this server.', content: { application/json: { schema: { type: object, properties: { landscape_url: { type: string } } } } } }
+        # No image in the request.
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '413': { description: Larger than 8 MB. }
+        '415': { description: 'Not an image type this server stores (JPEG, PNG, WebP, GIF, AVIF, TIFF).' }
+
+  /api/v1/albums/{id}/cover/upload:
+    post:
+      tags: [Library]
+      summary: Upload an album cover.
+      description: |
+        Session-only. Same rules as the artist uploads. Takes an **entity** id.
+
+        Replaces the derived cover the way the `PUT` does, so the page still
+        offers *Reset* (back to whatever the listens carry) rather than *Clear*.
+        Entities are shared, so this is an **instance-wide** edit.
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              properties:
+                file: { type: string, format: binary }
+      responses:
+        '200': { description: 'Saved. The body carries the new URL, which is a path on this server.', content: { application/json: { schema: { type: object, properties: { artwork_url: { type: string } } } } } }
+        # No image in the request.
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '413': { description: Larger than 8 MB. }
+        '415': { description: 'Not an image type this server stores (JPEG, PNG, WebP, GIF, AVIF, TIFF).' }
+
+  /api/v1/art/upload/{name}:
+    get:
+      tags: [Library]
+      summary: Serve an uploaded picture.
+      description: |
+        Session-only. Cached `private, immutable` — the name is random per
+        upload, so the bytes behind a given URL never change.
+
+        `name` is **validated, not trusted**: it must be exactly the 24 hex
+        characters this server generates plus a known image extension. The
+        override columns accept any `/`-prefixed string, so a route that read a
+        path out of one would serve arbitrary files from the uploads directory.
+      parameters: [{ name: name, in: path, required: true, schema: { type: string }, example: 0123456789abcdef01234567.jpg }]
+      responses:
+        '200': { description: Image bytes., content: { 'image/*': { schema: { type: string, format: binary } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { description: 'No such picture, or the file is no longer on this server.' }
 
   # ── Loves ──────────────────────────────────────────────────────────────────
   /api/v1/loves:

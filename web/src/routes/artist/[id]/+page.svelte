@@ -35,6 +35,35 @@
 		}
 	}
 
+	/** Upload rather than paste. Same override, different way in — a picture on
+	 *  your own disk had no route before this. */
+	let picBusy = false;
+	async function uploadPicture(e: Event, wide: boolean) {
+		const input = e.target as HTMLInputElement;
+		const file = input.files?.[0];
+		if (!file || !artist?.artist_row_id) return;
+		picBusy = true;
+		picMsg = '';
+		try {
+			if (wide) {
+				const r = await api.uploadArtistLandscape(artist.artist_row_id, file);
+				artist = { ...artist, landscape_url: r.landscape_url };
+				picMsg = 'Wide picture uploaded.';
+			} else {
+				const r = await api.uploadArtistImage(artist.artist_row_id, file);
+				artist = { ...artist, image_url: r.image_url };
+				imgFailed = false;
+				picMsg = 'Picture uploaded.';
+			}
+			setTimeout(() => (picMsg = ''), 2500);
+		} catch (err) {
+			picMsg = String(err).replace(/^API \d+: /, '');
+		}
+		picBusy = false;
+		// Cleared so re-picking the same file fires `change` again.
+		input.value = '';
+	}
+
 	async function savePicture(url: string) {
 		if (!artist?.artist_row_id) return;
 		picMsg = '';
@@ -194,13 +223,24 @@
 				<input class="input" style="flex:1;min-width:240px;" bind:value={picUrl}
 					placeholder="https://… or /api/v1/artists/img/{artist.artist_row_id}">
 				<button class="btn btn-primary" on:click={() => savePicture(picUrl)}>Save</button>
+				<label class="btn btn-secondary" style="cursor:pointer;">
+					{picBusy ? 'Uploading…' : 'Upload…'}
+					<input type="file" accept="image/*" hidden disabled={picBusy}
+						on:change={(e) => uploadPicture(e, false)} />
+				</label>
 				<button class="btn btn-secondary" on:click={() => savePicture('')}>Clear</button>
 				<button class="btn btn-secondary" on:click={() => (editingPic = false)}>Cancel</button>
 			</div>
 			<p style="font-size:12.5px;color:var(--td-muted);margin:10px 0 0;">
-				Paste any image URL. To use the picture from your own Plex or Jellyfin,
+				Paste any image URL, or <strong>Upload…</strong> a file from this device
+				(up to 8&nbsp;MB). To use the picture from your own Plex or Jellyfin,
 				use <code>/api/v1/artists/img/{artist.artist_row_id}</code> — Tapedeck
 				fetches it server-side, since the browser can't reach your media server.
+			</p>
+			<!-- Said plainly rather than left to be discovered: `artists` has no
+			     user column, so this is not a per-account preference. -->
+			<p style="font-size:12.5px;color:var(--td-muted-2);margin:8px 0 0;">
+				Artist pictures are shared by everyone on this instance.
 			</p>
 
 			<!-- The wide one. Its own field rather than a crop of the portrait,
@@ -214,6 +254,11 @@
 					<input id="wide" class="input" style="flex:1;min-width:240px;" bind:value={wideUrl}
 						placeholder="https://… a landscape photo">
 					<button class="btn btn-primary" on:click={() => saveWide(wideUrl)}>Save</button>
+					<label class="btn btn-secondary" style="cursor:pointer;">
+						{picBusy ? 'Uploading…' : 'Upload…'}
+						<input type="file" accept="image/*" hidden disabled={picBusy}
+							on:change={(e) => uploadPicture(e, true)} />
+					</label>
 					<button class="btn btn-secondary" on:click={() => saveWide('')}>Clear</button>
 				</div>
 				<p style="font-size:12.5px;color:var(--td-muted);margin:10px 0 0;">

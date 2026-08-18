@@ -6660,6 +6660,22 @@ impl Database {
         Ok(row)
     }
 
+    /// Both of an artist's pictures, for the upload path.
+    ///
+    /// `artist_by_id` returns the portrait beside the name and nothing else, so
+    /// replacing the landscape had no way to learn what it was replacing —
+    /// which is what deletes the file a new upload supersedes. Without it a
+    /// user swapping a picture ten times leaves ten files on disk.
+    pub async fn artist_picture_urls(
+        &self,
+        id: i64,
+    ) -> Result<Option<(Option<String>, Option<String>)>, sqlx::Error> {
+        sqlx::query_as("SELECT image_url, landscape_url FROM artists WHERE id = ?")
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await
+    }
+
     /// Set or clear an artist portrait.
     ///
     /// Unlike `upsert_artist` this *overwrites*, including with NULL — it backs

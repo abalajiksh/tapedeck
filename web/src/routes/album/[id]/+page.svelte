@@ -23,6 +23,29 @@
 	let coverUrl = '';
 	let coverMsg = '';
 
+	/** Upload rather than paste — the same override, reached from a file on
+	 *  this device. Replaces the derived cover exactly as a URL does, so Reset
+	 *  still means "back to whatever the listens carry". */
+	let coverBusy = false;
+	async function uploadCover(e: Event) {
+		const input = e.target as HTMLInputElement;
+		const file = input.files?.[0];
+		if (!file || !album) return;
+		coverBusy = true;
+		coverMsg = '';
+		try {
+			const r = await api.uploadAlbumCover(album.id, file);
+			album = { ...album, artwork_url: r.artwork_url, cover_override: true };
+			coverMsg = 'Cover uploaded.';
+			setTimeout(() => (coverMsg = ''), 2500);
+		} catch (err) {
+			coverMsg = String(err).replace(/^API \d+: /, '');
+		}
+		coverBusy = false;
+		// Cleared so re-picking the same file fires `change` again.
+		input.value = '';
+	}
+
 	async function saveCover(url: string) {
 		if (!album) return;
 		coverMsg = '';
@@ -270,14 +293,26 @@
 				<input class="input" style="flex:1;min-width:240px;" bind:value={coverUrl}
 					placeholder="https://… or /api/v1/art/<listen id>">
 				<button class="btn btn-primary" on:click={() => saveCover(coverUrl)}>Save</button>
+				<label class="btn btn-secondary" style="cursor:pointer;">
+					{coverBusy ? 'Uploading…' : 'Upload…'}
+					<input type="file" accept="image/*" hidden disabled={coverBusy}
+						on:change={uploadCover} />
+				</label>
 				{#if album.cover_override}
 					<button class="btn btn-secondary" on:click={() => saveCover('')}>Reset</button>
 				{/if}
 				<button class="btn btn-secondary" on:click={() => (editingCover = false)}>Cancel</button>
 			</div>
 			<p style="font-size:12.5px;color:var(--td-muted);margin:10px 0 0;">
-				Paste any image URL. Without one, the cover is whichever artwork the
-				newest listen of this record carries — Reset goes back to that.
+				Paste any image URL, or <strong>Upload…</strong> a file from this device
+				(up to 8&nbsp;MB) — a photograph of your own copy, say. Without one, the
+				cover is whichever artwork the newest listen of this record carries, and
+				Reset goes back to that.
+			</p>
+			<!-- Entities carry no user column, so this is not a per-account
+			     preference. Said rather than left to be found out. -->
+			<p style="font-size:12.5px;color:var(--td-muted-2);margin:8px 0 0;">
+				Album covers are shared by everyone on this instance.
 			</p>
 		</div>
 	{/if}
