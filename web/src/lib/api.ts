@@ -1794,8 +1794,22 @@ class TapedeckAPI {
 		return this.post(`/api/v1/sessions/${id}/split`, { at_scrobble_id });
 	}
 	/** Regroup every listen from scratch. Discards manual merges and splits. */
-	async rebuildSessions(gap_seconds?: number): Promise<{ sessions: number; listens: number }> {
+	/** Start a regroup. Returns a job id to poll — the work runs in the
+	 *  background because on a real history it ran past a reverse proxy's
+	 *  origin timeout, and the browser got a 524 while the rebuild carried on
+	 *  unseen. A 409 means one is already running and carries its id. */
+	async rebuildSessions(gap_seconds?: number): Promise<{ job_id: string; state: string }> {
 		return this.post('/api/v1/sessions/rebuild', gap_seconds ? { gap_seconds } : {});
+	}
+	async rebuildStatus(jobId: string): Promise<{
+		job_id: string;
+		state: 'running' | 'done' | 'error';
+		sessions: number;
+		listens: number;
+		status: string;
+		started_at: number;
+	}> {
+		return this.get(`/api/v1/sessions/rebuild/${jobId}`);
 	}
 	async updateSession(
 		id: number,

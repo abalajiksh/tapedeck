@@ -52,6 +52,12 @@ pub struct AppState {
     pub listenbrainz_url: String,
     /// In-memory registry of running/finished import jobs.
     pub imports: import::ImportRegistry,
+    /// In-memory registry of running/finished session rebuilds.
+    ///
+    /// Separate from `imports` rather than folded into it: an import job
+    /// carries a source, a fetch count and an enrichment count, none of which
+    /// mean anything here, and a shared struct would be mostly-null for both.
+    pub rebuilds: sessions::RebuildRegistry,
     /// Live "now playing" per user. Shared with the poll engine, which writes
     /// it from Plex sessions; `ingest` writes it from `playing_now` submissions.
     pub now_playing: now_playing::NowPlayingRegistry,

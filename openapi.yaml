@@ -26,7 +26,7 @@ openapi: 3.1.0
 
 info:
   title: Tapedeck
-  version: 0.70.1
+  version: 0.70.2
   summary: Self-hosted scrobbler and listening journal.
   description: |
     Tapedeck ingests listens, enriches them with MusicBrainz metadata, stores
@@ -2998,25 +2998,90 @@ paths:
   /api/v1/sessions/rebuild:
     post:
       tags: [Sessions]
-      summary: Regroup every listen into sessions.
+      summary: Start a regroup of every listen into sessions.
       description: |
-        **Destructive** — it rewrites the column that manual merges and splits
-        live in, discarding them. Exists for histories that predate session
-        linking, and for imports, which bypass the ingest path entirely.
+        Session-only. **Destructive** — it rewrites the column that manual
+        merges and splits live in, discarding them. Exists for histories that
+        predate session linking, and for imports, which bypass the ingest path
+        entirely.
+
+        *(since v0.70.2)* Runs in the **background** and answers `202` with a
+        `job_id`; poll `/api/v1/sessions/rebuild/{job_id}`. It used to do the
+        work inline, and on a real history that ran past a reverse proxy's
+        origin timeout — the browser got a 524 while the rebuild carried on
+        unseen, which is worse than failing outright for something destructive.
+
+        One rebuild per user at a time. A second request while one is running is
+        a **409** carrying the running `job_id`, so a client can attach to it
+        rather than starting a second pass that would clear the first's work
+        halfway through.
       requestBody:
         content:
           application/json:
             schema:
               type: object
               properties:
-                gap_minutes: { type: integer, default: 30 }
+                gap_seconds:
+                  type: integer
+                  default: 1800
+                  description: |
+                    Gap that starts a new session. Clamped to 60…86400. The live
+                    assigner uses 1800; this is the only place that guess can be
+                    reconsidered.
       responses:
-        '200':
-          description: Rebuilt.
+        '202':
+          description: Started.
           content:
             application/json:
-              schema: { type: object, properties: { sessions: { type: integer } } }
+              schema:
+                type: object
+                properties:
+                  job_id: { type: string }
+                  state: { type: string, enum: [running] }
+        '409':
+          description: A rebuild is already running; the body carries its `job_id`.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  code: { type: integer }
+                  error: { type: string }
+                  job_id: { type: string }
         '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /api/v1/sessions/rebuild/{job_id}:
+    get:
+      tags: [Sessions]
+      summary: How a running regroup is going.
+      description: |
+        Session-only, and scoped to the caller — an unknown id and someone
+        else's are the same 404, so polling cannot be used to learn that a job
+        exists.
+
+        The registry is in memory, so a job is lost if the process restarts.
+        That is safe rather than merely tolerable: the rebuild is one
+        transaction, so a process that dies mid-pass rolls back instead of
+        leaving half a regrouping behind — only the progress report is lost.
+      parameters: [{ name: job_id, in: path, required: true, schema: { type: string } }]
+      responses:
+        '200':
+          description: OK.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  job_id: { type: string }
+                  state: { type: string, enum: [running, done, error] }
+                  sessions:
+                    type: integer
+                    description: Sessions written. Only meaningful once `state` is `done`.
+                  listens: { type: integer }
+                  status: { type: string, description: Human-readable summary, or the error detail. }
+                  started_at: { type: integer }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
 
   # ── Chains, gear, devices, bindings ────────────────────────────────────────
   /api/v1/chains:

@@ -22,8 +22,9 @@ use axum::{
     routing::{get, post},
     Router,
 };
-use serde::Deserialize;
-use std::sync::Arc;
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 use super::auth::AuthUser;
 use super::models::ErrorResponse;
@@ -226,24 +227,170 @@ pub struct RebuildRequest {
     pub gap_seconds: Option<i64>,
 }
 
-/// POST /api/v1/sessions/rebuild — regroup every listen from scratch.
+// ── Rebuilding in the background ──
+//
+// A rebuild rewrites `session_id` on every listen the user has, inside one
+// transaction so a crash cannot leave a history with no sessions at all. On the
+// real host that ran past **100 seconds**, which is Cloudflare's origin timeout:
+// the browser got a 524 while the rebuild carried on unseen, which is worse
+// than failing — a destructive regroup half-visible, with no way to tell
+// whether it finished.
+//
+// So the request starts the work and returns an id, and the page polls. Same
+// shape as an import, and for the same reason.
+//
+// The registry is in memory and a running job is lost on restart, exactly like
+// an import's. That is acceptable here for the reason it is there: the *work*
+// is one transaction, so a process that dies mid-rebuild rolls back rather than
+// leaving half a regrouping behind. Only the progress report is lost.
+
+/// One rebuild, as it runs.
+#[derive(Clone, Serialize)]
+pub struct RebuildJob {
+    pub job_id: String,
+    #[serde(skip)]
+    pub user_id: i64,
+    /// `running` | `done` | `error`
+    pub state: String,
+    /// Sessions written. Only meaningful once `state` is `done`.
+    pub sessions: u64,
+    pub listens: u64,
+    pub status: String,
+    pub started_at: i64,
+}
+
+pub type RebuildRegistry = Arc<Mutex<HashMap<String, RebuildJob>>>;
+
+fn now_secs() -> i64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs()
+        as i64
+}
+
+/// POST /api/v1/sessions/rebuild — start a regroup and return its id.
 ///
 /// **Discards manual merges and splits**, because they live in the same column
 /// this rewrites. It exists because sessions were never linked to their listens
-/// until now, and because an imported history bypasses the ingest path that
+/// until v0.42, and because an imported history bypasses the ingest path that
 /// would have grouped it.
+///
+/// Answers **202** with a `job_id` rather than doing the work inline; poll
+/// `/api/v1/sessions/rebuild/:job_id` for the outcome.
 async fn rebuild(
     State(state): State<Arc<AppState>>,
     user: AuthUser,
     Json(body): Json<RebuildRequest>,
 ) -> impl IntoResponse {
     let gap = body.gap_seconds.unwrap_or(1800).clamp(60, 24 * 3600);
-    match state.db.rebuild_sessions(user.user_id, gap).await {
-        Ok((sessions, listens)) => {
-            (StatusCode::OK, Json(serde_json::json!({ "sessions": sessions, "listens": listens })))
-                .into_response()
+
+    let job_id = {
+        use rand::Rng;
+        hex::encode(rand::rng().random::<[u8; 8]>())
+    };
+
+    // One at a time per user, decided under a **single** lock acquisition.
+    //
+    // Checking and then inserting in two separate acquisitions is a race, and
+    // not a theoretical one: a rebuild here runs for minutes, so the way to hit
+    // it is to click the button twice. Two concurrent rebuilds would each clear
+    // the other's work halfway through, and this is destructive — the column it
+    // rewrites is where manual merges and splits live.
+    //
+    // Reported as 409 carrying the running job's id, so the page attaches to
+    // the one already going rather than reporting a failure for work that is
+    // very much in progress.
+    let claimed = {
+        let Ok(mut m) = state.rebuilds.lock() else {
+            return err(StatusCode::INTERNAL_SERVER_ERROR, "Could not read the rebuild registry");
+        };
+        match m.values().find(|j| j.user_id == user.user_id && j.state == "running") {
+            Some(running) => Err(running.job_id.clone()),
+            None => {
+                // Finished jobs of this user's are dropped as a new one starts,
+                // so the registry cannot grow without bound.
+                m.retain(|_, j| j.state == "running" || j.user_id != user.user_id);
+                m.insert(
+                    job_id.clone(),
+                    RebuildJob {
+                        job_id: job_id.clone(),
+                        user_id: user.user_id,
+                        state: "running".into(),
+                        sessions: 0,
+                        listens: 0,
+                        status: "Regrouping your listens…".into(),
+                        started_at: now_secs(),
+                    },
+                );
+                Ok(())
+            }
         }
-        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    };
+    if let Err(running) = claimed {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "code": 409,
+                "error": "A rebuild is already running",
+                "job_id": running,
+            })),
+        )
+            .into_response();
+    }
+
+    let (db, reg, uid, id) =
+        (state.db.clone(), state.rebuilds.clone(), user.user_id, job_id.clone());
+    tokio::spawn(async move {
+        let outcome = db.rebuild_sessions(uid, gap).await;
+        if let Ok(mut m) = reg.lock() {
+            if let Some(j) = m.get_mut(&id) {
+                match outcome {
+                    Ok((sessions, listens)) => {
+                        j.state = "done".into();
+                        j.sessions = sessions;
+                        j.listens = listens;
+                        j.status = format!(
+                            "Regrouped {listens} listen{} into {sessions} session{}",
+                            if listens == 1 { "" } else { "s" },
+                            if sessions == 1 { "" } else { "s" }
+                        );
+                    }
+                    Err(e) => {
+                        j.state = "error".into();
+                        j.status = e.to_string();
+                    }
+                }
+            }
+        }
+    });
+
+    (StatusCode::ACCEPTED, Json(serde_json::json!({ "job_id": job_id, "state": "running" })))
+        .into_response()
+}
+
+/// GET /api/v1/sessions/rebuild/:job_id — how the regroup is going.
+///
+/// Scoped to the caller: a job id is short and this is the only thing that
+/// stops one household member watching another's. An unknown id and someone
+/// else's are the same 404, so polling cannot be used to learn that a job
+/// exists.
+async fn rebuild_status(
+    State(state): State<Arc<AppState>>,
+    user: AuthUser,
+    Path(job_id): Path<String>,
+) -> impl IntoResponse {
+    let job = state
+        .rebuilds
+        .lock()
+        .ok()
+        .and_then(|m| m.get(&job_id).cloned())
+        .filter(|j| j.user_id == user.user_id);
+    match job {
+        Some(j) => (StatusCode::OK, Json(serde_json::json!(j))).into_response(),
+        // Also what a restart mid-rebuild looks like, which is why the message
+        // says so rather than only "not found".
+        None => err(
+            StatusCode::NOT_FOUND,
+            "No such rebuild — it may have finished before this process restarted",
+        ),
     }
 }
 
@@ -253,6 +400,8 @@ pub fn create_sessions_router() -> Router<Arc<AppState>> {
         // sibling, but the order is kept explicit the way `sources.rs` does it.
         .route("/api/v1/sessions/merge", post(merge))
         .route("/api/v1/sessions/rebuild", post(rebuild))
+        // A literal segment deeper than "/:id", so matchit tells them apart.
+        .route("/api/v1/sessions/rebuild/:job_id", get(rebuild_status))
         .route("/api/v1/sessions", get(list_sessions))
         .route("/api/v1/sessions/:id", get(get_session).patch(update_session))
         .route("/api/v1/sessions/:id/split", post(split))

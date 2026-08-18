@@ -134,6 +134,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         log_handle: log_handle.clone(),
         listenbrainz_url: config.listenbrainz_url.clone(),
         imports: Default::default(),
+        rebuilds: Default::default(),
         now_playing: now_playing.clone(),
         login_limiter: Arc::new(server::ratelimit::RateLimiter::new(
             8,

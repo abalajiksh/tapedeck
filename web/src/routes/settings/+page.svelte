@@ -283,12 +283,50 @@
 	async function rebuildSessions() {
 		if (!confirm('Regroup every listen into sessions?\n\nThis discards any sessions you have merged or split by hand.')) return;
 		rebuildingSessions = true;
-		sessionMsg = '';
+		sessionMsg = 'Regrouping your listens…';
 		try {
-			const r = await api.rebuildSessions(Math.max(1, sessionGapMinutes) * 60);
-			sessionMsg = `Grouped ${r.listens.toLocaleString()} listens into ${r.sessions.toLocaleString()} sessions.`;
+			const { job_id } = await api.rebuildSessions(Math.max(1, sessionGapMinutes) * 60);
+			await followRebuild(job_id);
 		} catch (e) {
-			sessionMsg = 'Failed: ' + String(e).replace(/^API \d+: /, '');
+			// A 409 carries the id of the rebuild already running, so attach to
+			// that one rather than reporting a failure for work in progress.
+			const running = String(e).match(/"job_id"\s*:\s*"([0-9a-f]+)"/);
+			if (running) {
+				sessionMsg = 'A rebuild was already running — following it.';
+				await followRebuild(running[1]);
+			} else {
+				sessionMsg = 'Failed: ' + String(e).replace(/^API \d+: /, '');
+				rebuildingSessions = false;
+			}
+		}
+	}
+
+	/** Poll until it finishes.
+	 *
+	 *  Every two seconds: the whole point is that this can run for minutes, and
+	 *  a tighter poll would be one more writer competing with the rebuild for
+	 *  the same database. */
+	async function followRebuild(jobId: string) {
+		for (;;) {
+			await new Promise((r) => setTimeout(r, 2000));
+			try {
+				const s = await api.rebuildStatus(jobId);
+				if (s.state === 'running') {
+					const mins = Math.floor((Date.now() / 1000 - s.started_at) / 60);
+					sessionMsg = mins
+						? `Regrouping your listens… (${mins} min so far)`
+						: 'Regrouping your listens…';
+					continue;
+				}
+				sessionMsg = s.state === 'done' ? s.status : 'Failed: ' + s.status;
+				break;
+			} catch (e) {
+				// The job is gone — the process restarted mid-rebuild, which
+				// rolls the whole transaction back rather than leaving half a
+				// regrouping behind.
+				sessionMsg = 'Lost track of the rebuild: ' + String(e).replace(/^API \d+: /, '');
+				break;
+			}
 		}
 		rebuildingSessions = false;
 	}
