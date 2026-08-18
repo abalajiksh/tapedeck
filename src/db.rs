@@ -2407,6 +2407,29 @@ impl Database {
         // anything in `init()` that references a migrated column fails on every
         // existing database, so it belongs here — after the column is certain to
         // be there on both paths.
+        // **`scrobbles.session_id` had no index, and four queries look listens up
+        // by it.** The worst is `list_sessions`, which runs a correlated
+        // subquery per session row — so opening the History page's session view
+        // was one full scan of the whole history *per session shown*. Measured
+        // on the real host: a single `list_sessions` call took **630 seconds**,
+        // holding one of the pool's five connections for ten and a half minutes
+        // while every other request queued behind it. That is the quadratic
+        // shape this codebase has now hit three times.
+        //
+        // A point lookup — "the listens in this session" — is exactly the
+        // workload an index is for, which is the distinction v0.59.0 drew when
+        // it dropped the *expression* indexes: those replaced sequential scans
+        // for whole-history aggregations and lost. This one replaces a full
+        // scan with a seek.
+        //
+        // Partial, because most rows have no session and there is no query that
+        // wants the NULLs.
+        let _ = sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_scrobbles_session
+                 ON scrobbles(session_id) WHERE session_id IS NOT NULL",
+        )
+        .execute(&self.pool)
+        .await;
         let _ = sqlx::query("CREATE INDEX IF NOT EXISTS idx_entities_match ON entities(match_key)")
             .execute(&self.pool)
             .await;
@@ -7804,19 +7827,26 @@ impl Database {
             "SELECT s.id, s.uuid, s.title, s.notes, s.started_at, s.ended_at, s.track_count,
                     s.total_duration, s.avg_quality_score, s.listening_context,
                     s.chain_id, c.name AS chain_name,
-                    (SELECT sc.chain_variant_id FROM scrobbles sc
-                      WHERE sc.session_id = s.id AND sc.chain_variant_id IS NOT NULL
-                      LIMIT 1) AS chain_variant_id,
-                    (SELECT v.name FROM chain_variants v WHERE v.id = (
-                        SELECT sc.chain_variant_id FROM scrobbles sc
-                         WHERE sc.session_id = s.id AND sc.chain_variant_id IS NOT NULL
-                         LIMIT 1)) AS chain_variant_name,
+                    -- One correlated subquery, not three. The variant *name*
+                    -- used to re-nest the id lookup inside itself, so every
+                    -- session row scanned `scrobbles` twice over to answer one
+                    -- question; joining `chain_variants` on the id instead asks
+                    -- it once. With `idx_scrobbles_session` that one is a seek.
+                    sv.chain_variant_id AS chain_variant_id,
+                    v.name AS chain_variant_name,
                     s.device_id, d.name AS device_name,
                     s.token_id, t.name AS token_name
                FROM sessions s
                LEFT JOIN signal_chains c ON c.id = s.chain_id
                LEFT JOIN devices d ON d.id = s.device_id
                LEFT JOIN tokens t ON t.id = s.token_id
+               LEFT JOIN (
+                    SELECT session_id, MIN(chain_variant_id) AS chain_variant_id
+                      FROM scrobbles
+                     WHERE chain_variant_id IS NOT NULL AND session_id IS NOT NULL
+                     GROUP BY session_id
+               ) sv ON sv.session_id = s.id
+               LEFT JOIN chain_variants v ON v.id = sv.chain_variant_id
               WHERE s.user_id = ? AND s.track_count > 0
               ORDER BY s.started_at DESC LIMIT ? OFFSET ?",
         )
@@ -7836,20 +7866,29 @@ impl Database {
             "SELECT s.id, s.uuid, s.title, s.notes, s.started_at, s.ended_at, s.track_count,
                     s.total_duration, s.avg_quality_score, s.listening_context,
                     s.chain_id, c.name AS chain_name,
-                    (SELECT sc.chain_variant_id FROM scrobbles sc
-                      WHERE sc.session_id = s.id AND sc.chain_variant_id IS NOT NULL
-                      LIMIT 1) AS chain_variant_id,
-                    (SELECT v.name FROM chain_variants v WHERE v.id = (
-                        SELECT sc.chain_variant_id FROM scrobbles sc
-                         WHERE sc.session_id = s.id AND sc.chain_variant_id IS NOT NULL
-                         LIMIT 1)) AS chain_variant_name,
+                    -- One correlated subquery, not three. The variant *name*
+                    -- used to re-nest the id lookup inside itself, so every
+                    -- session row scanned `scrobbles` twice over to answer one
+                    -- question; joining `chain_variants` on the id instead asks
+                    -- it once. With `idx_scrobbles_session` that one is a seek.
+                    sv.chain_variant_id AS chain_variant_id,
+                    v.name AS chain_variant_name,
                     s.device_id, d.name AS device_name,
                     s.token_id, t.name AS token_name
                FROM sessions s
                LEFT JOIN signal_chains c ON c.id = s.chain_id
                LEFT JOIN devices d ON d.id = s.device_id
                LEFT JOIN tokens t ON t.id = s.token_id
-              WHERE s.user_id = ? AND s.id = ?",
+               -- One row, so this is a seek on `idx_scrobbles_session` rather
+               -- than the grouped pass `list_sessions` uses — that one answers
+               -- for a whole page at once, this one for a single session.
+               LEFT JOIN (
+                    SELECT MIN(chain_variant_id) AS chain_variant_id
+                      FROM scrobbles
+                     WHERE session_id = ?2 AND chain_variant_id IS NOT NULL
+               ) sv
+               LEFT JOIN chain_variants v ON v.id = sv.chain_variant_id
+              WHERE s.user_id = ?1 AND s.id = ?2",
         )
         .bind(user_id)
         .bind(id)
@@ -16017,5 +16056,98 @@ mod tests {
             db.get_recent_scrobbles(uid, 10, 0, None, None, None, None, None).await.unwrap().len(),
             1
         );
+    }
+    /// The session list still reports which variant was fitted, after the
+    /// query that answers it was rewritten.
+    ///
+    /// It used to run a correlated subquery per session row — and the *name*
+    /// re-nested the id lookup inside itself, so one question cost two full
+    /// scans of the whole history per row. With no index on
+    /// `scrobbles.session_id` that was a measured **630 seconds** on the real
+    /// host, holding one of five pool connections for ten minutes while every
+    /// other request queued.
+    ///
+    /// A wrong join here returns NULL rather than erroring, so the session card
+    /// would simply stop saying which IEMs were in. Hence asserting on the
+    /// value rather than on the plan.
+    #[tokio::test]
+    async fn a_session_still_reports_the_variant_that_was_fitted() {
+        let db = testdb().await;
+        let uid = db.create_user("ash", None, "pw", "user").await.unwrap();
+        let gear = db.upsert_equipment(uid, "Hexa", "iem", None, None, 0.0, None).await.unwrap();
+        let cid = chain_of(&db, uid, "Commute", &[("Xperia", gear)]).await;
+        let vid = db
+            .create_variant(
+                uid,
+                cid,
+                "Summer",
+                &[VariantOverride {
+                    position: 0,
+                    equipment_id: Some(gear),
+                    name: Some("Hexa".into()),
+                }],
+            )
+            .await
+            .unwrap();
+
+        for i in 0..3u64 {
+            let mut p = play(&format!("t{i}"), "Burial", 1_750_000_000 + i * 300);
+            p.duration = Some(200);
+            db.save_scrobble(
+                uid,
+                &p,
+                None,
+                None,
+                Some(cid),
+                Some(vid),
+                None,
+                None,
+                None,
+                ListenDisposition::LIVE,
+            )
+            .await
+            .unwrap();
+        }
+        db.rebuild_sessions(uid, 1800).await.unwrap();
+
+        let listed = db.list_sessions(uid, 20, 0).await.unwrap();
+        assert_eq!(listed.len(), 1, "one sitting");
+        assert_eq!(listed[0].chain_variant_id, Some(vid));
+        assert_eq!(
+            listed[0].chain_variant_name.as_deref(),
+            Some("Summer"),
+            "the name comes back, not just the id"
+        );
+
+        // The single-session query answers the same way — it takes a different
+        // shape (a seek rather than a grouped pass) and could disagree.
+        let one = db.get_session(uid, listed[0].id).await.unwrap().expect("the session");
+        assert_eq!(one.chain_variant_id, Some(vid));
+        assert_eq!(one.chain_variant_name.as_deref(), Some("Summer"));
+
+        // A sitting with no variant reports none rather than borrowing another
+        // session's — the failure a badly-scoped join would produce.
+        let uid2 = db.create_user("bo", None, "pw", "user").await.unwrap();
+        let mut p = play("solo", "Burial", 1_750_100_000);
+        p.duration = Some(200);
+        db.save_scrobble(
+            uid2,
+            &p,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            ListenDisposition::LIVE,
+        )
+        .await
+        .unwrap();
+        db.rebuild_sessions(uid2, 1800).await.unwrap();
+        let other = db.list_sessions(uid2, 20, 0).await.unwrap();
+        assert_eq!(other.len(), 1);
+        assert_eq!(other[0].chain_variant_id, None, "no variant, and not someone else's");
+        assert_eq!(other[0].chain_variant_name, None);
     }
 }
