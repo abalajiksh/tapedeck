@@ -518,6 +518,20 @@
 	 *  Conservative on purpose — a bar that says "replace me" early is a
 	 *  nuisance, one that says it late has already damaged records. */
 	const WEAR_LIFE: Record<string, number> = { cartridge: 1000, headshell: 1000 };
+	/** What the thing is, under its own name. The card is headed by the name you
+	 *  gave the gear — with two cartridges on one deck that is the only half
+	 *  that tells them apart — so the category goes in the subtitle. */
+	const WEAR_LABEL: Record<string, string> = {
+		cartridge: 'Cartridge & stylus',
+		headshell: 'Headshell',
+		turntable: 'Turntable',
+		'tape-deck': 'Tape deck',
+		transport: 'Transport'
+	};
+	/** What the hours are hours *of*. Only a cartridge has a stylus; a deck or a
+	 *  transport wears in its own way and calling its total "stylus hours" would
+	 *  be describing a part it doesn't have. */
+	const WEAR_METER: Record<string, string> = { cartridge: 'Stylus hours' };
 	$: wearItems = gear
 		.filter((g) => WEAR_TYPES.includes(g.equipment_type) && g.total_hours > 0)
 		.sort((a, b) => b.total_hours - a.total_hours);
@@ -1243,28 +1257,58 @@
 	</div>
 {/if}
 
-<!-- The wear bar. A stylus is a consumable with a life in hours, and it is the
-     one part of the setup you are expected to replace — so the shelf says how
-     much is on it. Hidden entirely when there is nothing to wear out, rather
-     than showing an empty strip. -->
+<!-- What the setup is wearing out. A stylus is a consumable with a life in
+     hours and it is the one part of the setup you are expected to replace, so
+     the shelf says how much is on it.
+
+     A card each rather than the one-line strip this used to be: the strip put
+     the number this page exists to surface in 13px beside a 54px bar, which is
+     smaller than any of the records it sits above. Hidden entirely when there
+     is nothing to wear out, rather than showing an empty card. -->
 {#if wearItems.length}
-	<div class="wear">
-		<span class="wearlabel">Hours on</span>
+	<div class="wearcards">
 		{#each wearItems as g (g.id)}
 			{@const life = WEAR_LIFE[g.equipment_type]}
 			{@const pct = life ? Math.min(100, (g.total_hours / life) * 100) : 0}
-			<a class="wearitem" href="/chains?gear={g.id}"
-				title={life
+			{@const due = pct >= 90}
+			{@const left = life ? Math.max(0, Math.round(life - g.total_hours)) : 0}
+			{@const made = [g.brand, g.model].filter(Boolean).join(' ')}
+			<a class="wearcard" href="/chains?gear={g.id}"
+				aria-label={life
 					? `${g.name} — ${g.total_hours.toFixed(1)} of about ${life} hours`
-					: `${g.name} — ${g.total_hours.toFixed(1)} hours`}>
-				<span class="wearname">{g.name}</span>
-				<span class="wearhrs">{formatHours(g.total_hours)}</span>
+					: `${g.name} — ${g.total_hours.toFixed(1)} hours`}
+				title="What this has played, and everything it's in">
+				<div class="wearhead">
+					<div style="min-width:0;">
+						<h3 class="h-display wearname">{g.name}</h3>
+						<p class="wearsub">{WEAR_LABEL[g.equipment_type] ?? g.equipment_type}{made ? ` · ${made}` : ''}</p>
+					</div>
+					{#if life}
+						<!-- Only where a service life is actually published — see the bar
+						     below for why. -->
+						<span class="tag {due ? 'tag-accent' : 'tag-accent-2'}">
+							{due ? 'Due for replacement' : `~${left.toLocaleString()} hrs to replacement`}
+						</span>
+					{/if}
+				</div>
+				<div class="wearrow">
+					<span>{WEAR_METER[g.equipment_type] ?? 'Hours played'}</span>
+					<span class="wearcount">
+						{#if life}
+							{g.total_hours < 10
+								? g.total_hours.toFixed(1)
+								: Math.round(g.total_hours).toLocaleString()} / {life.toLocaleString()} hrs
+						{:else}
+							{formatHours(g.total_hours)}
+						{/if}
+					</span>
+				</div>
 				{#if life}
-					<!-- Only where a service life is actually published. A bar with an
-					     invented denominator would be the grid-size mistake again:
+					<!-- Drawn only where a service life is actually published. A bar with
+					     an invented denominator would be the grid-size mistake again:
 					     confident-looking and meaning nothing. -->
-					<span class="wearbar" aria-hidden="true">
-						<span class="wearfill" class:due={pct >= 90} style="width:{pct}%"></span>
+					<span class="weartrack" aria-hidden="true">
+						<span class="wearfill" class:due style="width:{pct}%"></span>
 					</span>
 				{/if}
 			</a>
@@ -1689,6 +1733,14 @@
 		border-color: var(--td-accent);
 		color: #fff;
 	}
+	/* `--td-surface`, never `--td-panel`.
+	   `--td-panel` is the *dark* card and it is dark in **both** themes — it is
+	   the tone the Rediscovery hero and the Statistics proportional card use,
+	   and every one of those restates a light text colour to go with it
+	   (`color:#f4e7cf`). Used here it went unnoticed in dark mode, where a card
+	   darker than the page still reads as a card, and in light mode it painted
+	   black cards on a cream page with `--td-text` — which is *also* dark —
+	   printing the record's title in near-black on near-black. */
 	.card {
 		display: flex;
 		gap: 12px;
@@ -1696,7 +1748,7 @@
 		padding: 14px;
 		border-radius: 16px;
 		border: 1px solid var(--td-border);
-		background: var(--td-panel);
+		background: var(--td-surface);
 		cursor: pointer;
 		text-align: left;
 		transition: border-color 0.15s, transform 0.15s;
@@ -1717,16 +1769,19 @@
 	/* The hero deck. The design draws this big — it is the one thing on the page
 	   that is happening *now*, and at the old inline size it read as a row in a
 	   list. Full width at the top, with the platter given room to be a platter. */
+	/* The element is `class="deck deck-hero"` and `.deck` is declared *below*
+	   this with the same specificity, so `.deck` wins every property the two
+	   share; what survives from here is the `> svg` size and the mobile
+	   stacking. The dark `--td-panel` gradient this block used to carry
+	   therefore never painted at all. It is gone rather than left sitting here,
+	   because it reads as live and the text over it is `--td-text` — anyone
+	   "fixing" the order would ship exactly the dark-on-dark in light mode that
+	   the rest of this pass removes. */
 	.deck-hero {
 		margin: 18px 0 4px;
 		padding: 22px 24px;
 		gap: 22px;
 		border-radius: 22px;
-		background: linear-gradient(
-			135deg,
-			color-mix(in srgb, var(--td-accent) 9%, var(--td-panel)),
-			var(--td-panel) 62%
-		);
 	}
 	/* 1.45x the inline size. Large enough that the tonearm swinging down and the
 	   reels turning are legible from across a room, which is where you are when
@@ -1758,25 +1813,42 @@
 		font-size: 11px; color: var(--td-accent);
 		letter-spacing: .04em; white-space: nowrap;
 	}
-	.wear {
-		display: flex; align-items: center; gap: 14px; flex-wrap: wrap;
-		margin: 16px 0 0; padding: 11px 16px;
-		border: 1px solid var(--td-border); border-radius: 14px;
-		background: var(--td-panel);
+	/* One card per wearing part, laid out like every other card on this page —
+	   `--td-surface`, never `--td-panel`, for the reason spelled out on `.card`.
+	   `auto-fit` is right here and not on the shelf grid: there are one or two
+	   of these, so a single card taking the full width is the design rather than
+	   a row that fell short. */
+	.wearcards {
+		display: grid;
+		grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+		gap: 14px;
+		margin: 16px 0 0;
 	}
-	.wearlabel {
-		font-size: 11px; letter-spacing: .14em; text-transform: uppercase;
-		color: var(--td-muted-2); font-weight: 600;
+	.wearcard {
+		display: block;
+		padding: 22px 24px;
+		border: 1px solid var(--td-border);
+		border-radius: 22px;
+		background: var(--td-surface);
+		color: inherit;
+		text-decoration: none;
+		transition: border-color 0.15s;
 	}
-	.wearitem {
-		display: inline-flex; align-items: center; gap: 8px;
-		color: inherit; text-decoration: none; font-size: 13px;
+	.wearcard:hover { border-color: var(--td-accent); }
+	.wearhead {
+		display: flex; align-items: flex-start; justify-content: space-between;
+		gap: 14px; flex-wrap: wrap; margin-bottom: 16px;
 	}
-	.wearitem:hover .wearname { color: var(--td-accent); }
-	.wearname { font-weight: 600; }
-	.wearhrs { color: var(--td-muted); font-variant-numeric: tabular-nums; }
-	.wearbar {
-		width: 54px; height: 5px; border-radius: 999px;
+	.wearname { font-size: 19px; margin: 0 0 4px; }
+	.wearcard:hover .wearname { color: var(--td-accent); }
+	.wearsub { font-size: 13px; color: var(--td-muted); margin: 0; }
+	.wearrow {
+		display: flex; align-items: center; justify-content: space-between;
+		gap: 12px; margin-bottom: 8px; font-size: 13px; color: var(--td-muted-2);
+	}
+	.wearcount { font-variant-numeric: tabular-nums; color: var(--td-text); }
+	.weartrack {
+		display: block; height: 10px; border-radius: 999px;
 		background: var(--td-track); overflow: hidden;
 	}
 	.wearfill {
@@ -1854,7 +1926,9 @@
 		border: 1px solid var(--td-border);
 		border-radius: 10px;
 		overflow: hidden;
-		background: var(--td-panel);
+		/* Only ever seen while the scan itself is loading, so it wants to read as
+		   an empty tile rather than as a hole cut in the page. */
+		background: var(--td-surface2);
 		cursor: pointer;
 		transition: border-color 0.15s, transform 0.15s;
 	}
@@ -1900,7 +1974,11 @@
 		max-width: 100%;
 		padding: 10px 14px;
 		border-radius: 14px;
-		background: var(--td-panel);
+		/* The scrim behind it is black in both themes, but this bar carries
+		   `--td-text` and a row of `.btn-secondary`s — all of which follow the
+		   *theme*, not the scrim. On the surface they are readable either way;
+		   on `--td-panel` the whole toolbar went dark-on-dark in light mode. */
+		background: var(--td-surface);
 		border: 1px solid var(--td-border);
 		font-size: 13px;
 	}
