@@ -1,5 +1,6 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
+	import { syncUrl } from '$lib/url';
 	import { api } from '$lib/api';
 	import type { ChartRow, ChartKind, ChartRange } from '$lib/api';
 	import { openAlbum, openArtist } from '$lib/entities';
@@ -62,7 +63,7 @@
 		}
 		loading = false;
 		// Linkable: a chart you're looking at should survive a reload.
-		history.replaceState(null, '', `/charts?kind=${kind}&range=${range}&metric=${metric}`);
+		syncUrl(`/charts?kind=${kind}&range=${range}&metric=${metric}`);
 	}
 
 	function setKind(k: ChartKind) { kind = k; load(); }

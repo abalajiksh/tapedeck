@@ -1,5 +1,6 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
+	import { syncUrl } from '$lib/url';
 	import { api } from '$lib/api';
 	import type { SearchResults } from '$lib/api';
 	import { openAlbum, openArtist } from '$lib/entities';
@@ -26,7 +27,7 @@
 		if (!term) {
 			results = null;
 			searched = false;
-			history.replaceState(null, '', '/search');
+			syncUrl('/search');
 			return;
 		}
 		searching = true;
@@ -35,7 +36,7 @@
 			searched = true;
 			// Keep the query in the URL so a search is linkable and survives a
 			// reload — the same reason history carries its scope there.
-			history.replaceState(null, '', `/search?q=${encodeURIComponent(term)}`);
+			syncUrl(`/search?q=${encodeURIComponent(term)}`);
 		} catch (e) {
 			console.warn('search', e);
 		}

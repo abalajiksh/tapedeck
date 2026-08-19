@@ -1,5 +1,6 @@
 <script lang="ts">
 	import { onMount, onDestroy } from 'svelte';
+	import { syncUrl } from '$lib/url';
 	import type { McpConnection, McpAuditCall } from '$lib/api';
 	import { api } from '$lib/api';
 	import type { TokenInfo } from '$lib/api';
@@ -35,7 +36,7 @@
 	let section = 'appearance';
 	function go(id: string) {
 		section = id;
-		if (typeof history !== 'undefined') history.replaceState(null, '', `#${id}`);
+		syncUrl(`#${id}`);
 	}
 
 	// ── The shelf, in and out ──

@@ -1,5 +1,6 @@
 <script lang="ts">
 	import { onMount, onDestroy } from 'svelte';
+	import { syncUrl } from '$lib/url';
 	import { api } from '$lib/api';
 	import type { Scrobble, SignalChain , ChainVariant } from '$lib/api';
 	import ScrobbleRow from '$lib/components/ScrobbleRow.svelte';
@@ -72,7 +73,7 @@
 
 	function clearScope() {
 		scope = {};
-		history.replaceState(null, '', '/history');
+		syncUrl('/history');
 		load(true);
 	}
 

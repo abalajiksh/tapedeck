@@ -12,6 +12,7 @@
 	 * nothing here points at music you don't own.
 	 */
 	import { onMount } from 'svelte';
+	import { syncUrl } from '$lib/url';
 	import { api } from '$lib/api';
 	import type { Reports, ReportPeriod } from '$lib/api';
 	import { openArtist, openAlbum } from '$lib/entities';
@@ -50,7 +51,7 @@
 		if (hit) {
 			data = hit;
 			error = '';
-			syncUrl();
+			updateUrl();
 			return;
 		}
 		loading = true;
@@ -65,11 +66,11 @@
 			error = String(e).replace(/^API \d+: /, '');
 		}
 		loading = false;
-		syncUrl();
+		updateUrl();
 	}
 
-	function syncUrl() {
-		history.replaceState(null, '', `/reports?unit=${unit}${idx ? `&at=${idx}` : ''}`);
+	function updateUrl() {
+		syncUrl(`/reports?unit=${unit}${idx ? `&at=${idx}` : ''}`);
 	}
 
 	function setUnit(u: 'week' | 'month' | 'year') {
