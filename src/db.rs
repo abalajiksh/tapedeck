@@ -374,6 +374,19 @@ pub struct PhysicalPlayRow {
     pub chain_name: Option<String>,
 }
 
+/// One side of a pressing, and what it has been through.
+///
+/// Every field is derived from `physical_plays` on read — see `side_plays`.
+#[derive(Debug, Clone, sqlx::FromRow, serde::Serialize)]
+pub struct SidePlays {
+    /// As it was recorded: "A", "B", or a disc number.
+    pub side: String,
+    pub plays: i64,
+    /// Running time of what actually played, summed over every play.
+    pub secs: i64,
+    pub last_played: Option<i64>,
+}
+
 /// One scan or photograph of a physical release.
 ///
 /// Either a remote URL (the Cover Art Archive, Discogs) or a file this server
@@ -4342,6 +4355,45 @@ impl Database {
         .execute(&self.pool)
         .await?;
         Ok(res.last_insert_rowid())
+    }
+
+    /// How often each side has been played, and for how long.
+    ///
+    /// Derived from `physical_plays` rather than kept as a counter, the same
+    /// rule chain hours, gear hours and the release's own totals follow: a
+    /// number that is incremented can drift from the events it claims to count
+    /// and there is no way to tell afterwards which of the two is wrong. It
+    /// also means deleting a side play takes its wear back, which an
+    /// accumulator could never do.
+    ///
+    /// `secs` is the running time of the tracks that actually played — the
+    /// same figure the stylus is charged for, so a side started at track four
+    /// counts four tracks' worth and not the whole side. It is nominal, not
+    /// wall clock: nothing here knows how long you left the arm parked between
+    /// tracks.
+    ///
+    /// Returns only sides that have been played. A side with no plays is the
+    /// interesting case and it is the *caller* that knows the tracklist, so
+    /// zero-filling belongs there.
+    pub async fn side_plays(
+        &self,
+        user_id: i64,
+        release_id: i64,
+    ) -> Result<Vec<SidePlays>, sqlx::Error> {
+        sqlx::query_as(
+            "SELECT side,
+                    COUNT(*) AS plays,
+                    COALESCE(SUM(duration_secs), 0) AS secs,
+                    MAX(played_at) AS last_played
+               FROM physical_plays
+              WHERE user_id = ? AND release_id = ?
+              GROUP BY side
+              ORDER BY side",
+        )
+        .bind(user_id)
+        .bind(release_id)
+        .fetch_all(&self.pool)
+        .await
     }
 
     /// Hours on a stylus or tape head, summed from the sides actually played
@@ -12277,6 +12329,72 @@ mod tests {
         // than being designed away.
         db.update_physical(uid, id, None, None, Some(None), None, None, None).await.unwrap();
         assert_eq!(db.get_physical(uid, id).await.unwrap().unwrap().equipment_id, None);
+    }
+
+    /// A side's plays and its hours are derived from the plays themselves, so
+    /// they cannot drift from them and un-recording a side takes its wear back.
+    ///
+    /// The zero case is the one worth pinning: a side nobody has turned over
+    /// is *absent* from this, not a row of zeros, because the tracklist is what
+    /// knows a side exists. The caller fills those in — and if this ever starts
+    /// zero-filling on its own, the page would draw every side twice.
+    #[tokio::test]
+    async fn a_side_reports_the_plays_it_actually_had() {
+        let db = testdb().await;
+        let uid = db.create_user("ash", None, "pw", "user").await.unwrap();
+        let id = db
+            .create_physical(
+                uid,
+                "vinyl",
+                "Pink Floyd",
+                "The Dark Side of the Moon",
+                Some(1973),
+                None,
+                None,
+                None,
+                None,
+                None,
+                "[]",
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        // Side A twice, side B once, and a half side — started partway, so it
+        // is charged for what played rather than for the whole side.
+        db.record_physical_play(uid, id, "A", 1_700_000_000, 1_200, 5, None, None).await.unwrap();
+        db.record_physical_play(uid, id, "A", 1_700_100_000, 1_200, 5, None, None).await.unwrap();
+        db.record_physical_play(uid, id, "B", 1_700_200_000, 900, 4, None, None).await.unwrap();
+        let half =
+            db.record_physical_play(uid, id, "B", 1_700_300_000, 400, 2, None, None).await.unwrap();
+
+        let sides = db.side_plays(uid, id).await.unwrap();
+        assert_eq!(sides.len(), 2, "only sides that were played, and one row each");
+        assert_eq!(sides[0].side, "A");
+        assert_eq!((sides[0].plays, sides[0].secs), (2, 2_400));
+        assert_eq!(sides[0].last_played, Some(1_700_100_000));
+        assert_eq!(sides[1].side, "B");
+        assert_eq!(
+            (sides[1].plays, sides[1].secs),
+            (2, 1_300),
+            "a side started partway counts the part that played"
+        );
+
+        // Derived, not accumulated: removing a play takes its time back. A
+        // counter could not do this, which is the whole reason for the rule.
+        sqlx::query("DELETE FROM physical_plays WHERE id = ?")
+            .bind(half)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        let sides = db.side_plays(uid, id).await.unwrap();
+        assert_eq!((sides[1].plays, sides[1].secs), (1, 900));
+        assert_eq!(sides[1].last_played, Some(1_700_200_000));
+
+        // Somebody else's shelf is not in here.
+        let other = db.create_user("sam", None, "pw", "user").await.unwrap();
+        assert!(db.side_plays(other, id).await.unwrap().is_empty());
     }
 
     /// Re-fetching a sleeve must update what is there, not stack a second copy

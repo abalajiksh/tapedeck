@@ -26,7 +26,7 @@ openapi: 3.1.0
 
 info:
   title: Tapedeck
-  version: 0.70.6
+  version: 0.70.7
   summary: Self-hosted scrobbler and listening journal.
   description: |
     Tapedeck ingests listens, enriches them with MusicBrainz metadata, stores
@@ -3898,6 +3898,48 @@ paths:
                 properties:
                   results: { type: array, items: { type: object, additionalProperties: true } }
         '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /api/v1/physical/{id}/sides:
+    get:
+      tags: [Shelf]
+      summary: How often each side has been played, and for how long.
+      description: |
+        Session-only. A record has a side you reach for and a side you rarely
+        turn over, and the release's own totals cannot say which is which.
+
+        Everything here is derived from the sides played on read — never a
+        counter — so it cannot drift from the plays it counts, and deleting a
+        play takes its wear back with it. `secs` is the running time of the
+        tracks that actually played, which is the same figure the stylus is
+        charged for: a side started at track four counts four tracks' worth.
+        It is nominal rather than wall clock.
+
+        **Only sides with plays are returned.** A side that has never been
+        played is not an entry with zeros — the caller holds the tracklist and
+        fills those in. That also means a side may appear that is not on the
+        tracklist at all: re-filing a release rewrites its sides (a vinyl A/B
+        becomes a CD's 1) while its plays keep the label they were recorded
+        with, and dropping those would leave the sides summing to less than the
+        release total with nothing to say why.
+      parameters: [{ name: id, in: path, required: true, schema: { type: integer } }]
+      responses:
+        '200':
+          description: OK.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  sides:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        side: { type: string, description: As recorded — "A", "B", or a disc number. }
+                        plays: { type: integer }
+                        secs: { type: integer, description: Running time played, summed over every play. }
+                        last_played: { type: integer, nullable: true, description: Unix seconds. }
+        '404': { description: No such record. }
 
   /api/v1/physical/{id}/images:
     get:

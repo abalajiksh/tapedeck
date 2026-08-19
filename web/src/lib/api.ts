@@ -957,6 +957,23 @@ export interface PhysicalImage {
 	added_at: number;
 }
 
+/** What one side of a pressing has been through.
+ *
+ *  Derived from the sides played, never accumulated — the same rule the
+ *  release's own totals and every gear hour follow.
+ *
+ *  Only sides that have actually been played come back. A side nobody has
+ *  turned over is absent rather than a row of zeros, because the tracklist is
+ *  what knows a side exists; the page fills those in. */
+export interface SidePlays {
+	/** As recorded — "A", "B", or a disc number. */
+	side: string;
+	plays: number;
+	/** Running time of what actually played, summed. Nominal, not wall clock. */
+	secs: number;
+	last_played: number | null;
+}
+
 /** A record or tape on the shelf. Counters are derived, never accumulated. */
 /** The shelf's formats. Mirrors the CHECK on `physical_releases.kind`. */
 export type ShelfKind = 'vinyl' | 'cassette' | 'cd' | 'sacd';
@@ -1599,6 +1616,11 @@ class TapedeckAPI {
 	}
 	async equipmentWear(id: number): Promise<{ hours: number; sides_played: number }> {
 		return this.get(`/api/v1/physical/equipment/${id}/wear`);
+	}
+
+	/** How often each side has been played, and for how long. */
+	async sidePlays(id: number): Promise<{ sides: SidePlays[] }> {
+		return this.get(`/api/v1/physical/${id}/sides`);
 	}
 
 	// ── The rest of the sleeve ──

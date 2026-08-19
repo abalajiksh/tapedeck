@@ -608,6 +608,38 @@ fn image_payload(img: &PhysicalImage) -> serde_json::Value {
     })
 }
 
+/// GET /api/v1/physical/:id/sides — how often each side has been played.
+///
+/// A shelf item's totals answer "how much has this record been played"; this
+/// answers the question the object actually raises, which is that a record has
+/// a side you reach for and a side you rarely turn over.
+///
+/// Reports only the sides that have plays. The page holds the tracklist and
+/// zero-fills from it, which is what lets a side that has never been played
+/// say so — and it is also how a side recorded under a *different* label shows
+/// up: re-filing a release rewrites its sides (a vinyl A/B becomes a CD's 1),
+/// and the plays keep the letter they were recorded with. Dropping those here
+/// would leave the sides summing to less than the release's own total with
+/// nothing to say why.
+async fn side_plays(
+    State(state): State<Arc<AppState>>,
+    user: AuthUser,
+    Path(id): Path<i64>,
+) -> impl IntoResponse {
+    // Ownership before the stats: scoping the query alone would answer an
+    // empty list for somebody else's record, which reads as "never played"
+    // rather than as "not yours".
+    match state.db.get_physical(user.user_id, id).await {
+        Ok(None) => return err(404, "No such record"),
+        Err(e) => return err(500, e.to_string()),
+        Ok(Some(_)) => {}
+    }
+    match state.db.side_plays(user.user_id, id).await {
+        Ok(sides) => (StatusCode::OK, Json(serde_json::json!({ "sides": sides }))).into_response(),
+        Err(e) => err(500, e.to_string()),
+    }
+}
+
 /// GET /api/v1/physical/:id/images
 async fn list_images(
     State(state): State<Arc<AppState>>,
@@ -2382,6 +2414,7 @@ pub fn create_physical_router() -> Router<Arc<AppState>> {
         .route("/api/v1/physical/:id/tracks", axum::routing::put(set_tracks))
         .route("/api/v1/physical/:id/play", post(play_side))
         .route("/api/v1/physical/:id/now-playing", post(set_now_playing))
+        .route("/api/v1/physical/:id/sides", get(side_plays))
         .route("/api/v1/physical/:id/images", get(list_images).post(upload_image))
         .route("/api/v1/physical/:id/images/fetch", post(fetch_images))
 }

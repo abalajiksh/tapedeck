@@ -5,9 +5,9 @@
 	import {
 		api,
 		type PhysicalRelease, type PhysicalTrack, type ReleaseCandidate,
-		type PhysicalImage, type SignalChain, type Equipment, type Spin
+		type PhysicalImage, type SignalChain, type Equipment, type Spin, type SidePlays
 	} from '$lib/api';
-	import { formatDuration, formatDateTime, toDateInput, fromDateInput, ownedFor, formatHours } from '$lib/utils';
+	import { formatDuration, formatDateTime, timeAgo, toDateInput, fromDateInput, ownedFor, formatHours } from '$lib/utils';
 	import CoverArt from '$lib/components/CoverArt.svelte';
 	import ChainIcon from '$lib/components/ChainIcon.svelte';
 
@@ -86,6 +86,14 @@
 	let playGear: number | null = null;
 	let purchased = '';
 	let savingMeta = false;
+
+	// ── What each side has been through ──
+	//
+	// A record has a side you reach for and a side you rarely turn over, and
+	// the release's own total cannot tell you which is which. Derived on the
+	// server from the sides played, so it can never drift from them.
+	let sideStats: Record<string, SidePlays> = {};
+	let sideStatsFor: number | null = null;
 
 	// ── The rest of the sleeve ──
 	let images: PhysicalImage[] = [];
@@ -458,6 +466,15 @@
 	}
 
 	$: sides = [...new Set(openTracks.map((t) => t.side))].sort();
+	/** Sides that carry plays but are not on the tracklist any more.
+	 *
+	 *  Re-filing a release rewrites its sides — a vinyl's A/B becomes a CD's 1 —
+	 *  while the plays keep the label they were recorded under. Hiding those
+	 *  would leave the sides adding up to less than the record's own total with
+	 *  nothing to say why, which is the paired-counts trap in a new place. */
+	$: strandedSides = Object.values(sideStats)
+		.filter((x) => !sides.some((sd) => sd.toUpperCase() === x.side.toUpperCase()))
+		.sort((a, b) => a.side.localeCompare(b.side));
 	/** Matched over artist, title, catalogue number and barcode — the four
 	 *  things you would have in your hand looking for a record. Accent-folded
 	 *  so "Coeur" finds "Cœur", the same fold `normalise_artist` makes on the
@@ -624,6 +641,7 @@
 			openTracks = [];
 		}
 		void loadImages(r.id);
+		void loadSides(r.id);
 		// The panel opens right under its own row now, so this is only for the
 		// case where the row itself is near the bottom of the viewport and the
 		// detail would unroll off-screen. `nearest` is what keeps it from
@@ -633,6 +651,29 @@
 	}
 
 	// ── Scans ──
+
+	/** How often each side of this pressing has been played.
+	 *
+	 *  Only the sides with plays come back — a side nobody has turned over is
+	 *  absent rather than zeroed, because the tracklist is what knows a side
+	 *  exists. Keyed for lookup, so the card can zero-fill it itself.
+	 *
+	 *  Guarded on the id for the same reason `loadImages` is: opening a second
+	 *  record while the first is still in flight would otherwise paint the
+	 *  first record's plays onto it. */
+	async function loadSides(id: number) {
+		sideStatsFor = id;
+		sideStats = {};
+		try {
+			const r = await api.sidePlays(id);
+			if (sideStatsFor !== id) return;
+			sideStats = Object.fromEntries(r.sides.map((x) => [x.side.toUpperCase(), x]));
+		} catch (e) {
+			// Not worth a message of its own: the panel still plays sides, it
+			// just cannot say how often they have been played.
+			console.warn('side plays', e);
+		}
+	}
 
 	async function loadImages(id: number) {
 		// Guarded on the id rather than a boolean: opening a second record while
@@ -856,6 +897,12 @@
 			await load();
 			const fresh = shelf.find((x) => x.id === open?.id);
 			if (fresh) open = fresh;
+			// The side count is the thing that just changed, and it is derived
+			// server-side — so it is re-read rather than incremented here, or the
+			// panel and the database become two answers to one question. Keyed on
+			// `id`, because the deck can record a side while a *different*
+			// record's panel is the one expanded.
+			if (sideStatsFor === id) await loadSides(id);
 		} catch (e) {
 			playMsg = String(e).replace(/^API \d+: /, '');
 		}
@@ -1456,6 +1503,22 @@
 										{formatDuration(sideSecs(side))}
 									</span>
 								</div>
+								<!-- What this side has been through, as opposed to how long it
+								     runs. Two sides of one record are played wildly unevenly and
+								     the record's own total cannot show that. Derived server-side
+								     from the plays, so it cannot drift from them — and a side
+								     nobody has turned over says so rather than showing zeros,
+								     which is the fact worth seeing. -->
+								{#if sideStats[side.toUpperCase()]}
+									{@const st = sideStats[side.toUpperCase()]}
+									<div class="sideplays">
+										<strong>{st.plays}</strong> play{st.plays === 1 ? '' : 's'}
+										· {formatDuration(st.secs)} played
+										{#if st.last_played}· last {timeAgo(st.last_played)}{/if}
+									</div>
+								{:else}
+									<div class="sideplays none">Never played</div>
+								{/if}
 								<!-- Every track is a start point. You do not always begin a
 								     side at its beginning: the needle goes down where you
 								     put it, and a tape carries on from wherever it was
@@ -1508,6 +1571,18 @@
 							</div>
 						{/each}
 					</div>
+
+					{#if strandedSides.length}
+						<!-- Plays recorded under a side this pressing no longer has, which
+						     is what re-filing it does. Shown rather than dropped, so the
+						     sides still add up to the record's total. -->
+						<p style="font-size:12px;color:var(--td-muted-2);margin:14px 0 0;">
+							Also played as
+							{#each strandedSides as x, i}{i ? ', ' : ''}<strong>{x.side}</strong>
+								({x.plays} · {formatDuration(x.secs)}){/each}
+							— recorded before this was filed as {KIND_LABEL[open.kind]}.
+						</p>
+					{/if}
 
 					<p style="font-size:12px;color:var(--td-muted-2);margin:16px 0 0;">
 						<strong>Start</strong> when you drop the needle and the start time is the
@@ -1727,6 +1802,24 @@
 		border: 1px solid var(--td-border);
 		border-radius: 14px;
 		padding: 14px;
+	}
+	/* What the side has been through, directly under its name — the count is
+	   the reason this line exists, so it carries the weight and the rest of it
+	   stays quiet. */
+	.sideplays {
+		font-size: 12px;
+		color: var(--td-muted-2);
+		margin-top: 4px;
+	}
+	.sideplays strong {
+		color: var(--td-text);
+		font-variant-numeric: tabular-nums;
+	}
+	/* A side nobody has turned over. Said plainly rather than as "0 plays",
+	   which reads as a measurement of something. */
+	.sideplays.none {
+		color: var(--td-muted-3);
+		font-style: italic;
 	}
 	/* Facts about the object rather than about the music, so they read as a
 	   strip of form rather than as another card. */
