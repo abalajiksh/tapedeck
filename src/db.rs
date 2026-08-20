@@ -560,6 +560,33 @@ pub struct Database {
 /// same play rather than a repeat. See `fuzzy_exists`.
 const DUPLICATE_WINDOW_SECS: i64 = 60;
 
+/// How far either side of a skip to look for the tracks that bracketed it.
+///
+/// Generous, because the neighbours are what make a skip legible — "it did not
+/// sit between these two" — and a gap of a few minutes is still the same
+/// sitting. Anything genuinely unrelated is filtered out by there being no
+/// listen in the window at all, which reports as `None` rather than reaching.
+const SKIP_CONTEXT_WINDOW_SECS: i64 = 1800;
+
+/// One skipped listen, with what bracketed it.
+#[derive(Debug, Clone)]
+pub struct SkipRow {
+    pub id: i64,
+    pub title: String,
+    pub artist: String,
+    pub album: Option<String>,
+    pub timestamp: i64,
+    pub duration: Option<i64>,
+    /// How far in they got. `None` when nothing measured a playhead — a
+    /// submitting client that reports no position — and it stays `None` rather
+    /// than being filled with wall-clock arithmetic.
+    pub listened_ms: Option<i64>,
+    pub source: String,
+    pub chain: Option<String>,
+    pub before: Option<(String, String)>,
+    pub after: Option<(String, String)>,
+}
+
 /// How many listen ids one `UPDATE … WHERE id IN (…)` carries during a session
 /// rebuild. Comfortably under SQLite's parameter limit, and large enough that a
 /// 49k-listen history is about a hundred statements rather than 49,000.
@@ -7595,6 +7622,135 @@ impl Database {
         Ok(())
     }
 
+    /// The skips, with what was playing either side of each one.
+    ///
+    /// The second-most-useful column here is `listened_ms` and the most useful
+    /// is the **context**: bailing out is a judgement about a track *in a
+    /// sequence*, and "what came before and after" is the only part of that
+    /// this application can honestly record. Why somebody skipped is not
+    /// derivable and is not guessed at anywhere.
+    ///
+    /// **Two queries regardless of how many skips are asked for.** The obvious
+    /// shape — a correlated subquery per row for the previous and next listen —
+    /// is the quadratic that made Rediscovery take two minutes on the real
+    /// host, and it cannot be indexed because the join key is a comparison
+    /// against each row's own timestamp. Instead the neighbours for the whole
+    /// page are fetched in one bounded range scan and matched in Rust, which is
+    /// the same pattern `list_crate` and `playlist_tracks_detailed` use.
+    pub async fn skips(
+        &self,
+        user_id: i64,
+        limit: i64,
+        offset: i64,
+    ) -> Result<(i64, Vec<SkipRow>), sqlx::Error> {
+        let (total,): (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM scrobbles WHERE user_id = ? AND skipped = TRUE")
+                .bind(user_id)
+                .fetch_one(&self.pool)
+                .await?;
+
+        let rows: Vec<(
+            i64,
+            String,
+            String,
+            Option<String>,
+            i64,
+            Option<i64>,
+            Option<i64>,
+            String,
+            Option<String>,
+        )> = sqlx::query_as(
+            "SELECT s.id, s.title, s.artist, s.album, s.timestamp, s.duration,
+                        s.listened_ms, s.source_name, c.name
+                   FROM scrobbles s
+                   LEFT JOIN signal_chains c ON c.id = s.chain_id
+                  WHERE s.user_id = ? AND s.skipped = TRUE
+                  ORDER BY s.timestamp DESC
+                  LIMIT ? OFFSET ?",
+        )
+        .bind(user_id)
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(&self.pool)
+        .await?;
+
+        if rows.is_empty() {
+            return Ok((total, Vec::new()));
+        }
+
+        // One range scan covering every skip on this page, widened enough to
+        // catch the track either side of each. `idx_scrobbles_user_time` serves
+        // it, so this is a seek and a short walk rather than a scan.
+        let oldest = rows.iter().map(|r| r.4).min().unwrap_or(0) - SKIP_CONTEXT_WINDOW_SECS;
+        let newest = rows.iter().map(|r| r.4).max().unwrap_or(0) + SKIP_CONTEXT_WINDOW_SECS;
+        let neighbours: Vec<(i64, String, String)> = sqlx::query_as(
+            "SELECT timestamp, title, artist FROM scrobbles
+              WHERE user_id = ? AND skipped = FALSE AND timestamp BETWEEN ? AND ?
+              ORDER BY timestamp ASC",
+        )
+        .bind(user_id)
+        .bind(oldest)
+        .bind(newest)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let out = rows
+            .into_iter()
+            .map(|(id, title, artist, album, timestamp, duration, listened_ms, source, chain)| {
+                // Nearest real listen either side. A skip at the very start or
+                // end of a sitting legitimately has none, and `None` is the
+                // honest answer rather than reaching further for something
+                // unrelated.
+                let before = neighbours
+                    .iter()
+                    .filter(|(ts, _, _)| *ts < timestamp)
+                    .next_back()
+                    .map(|(_, t, a)| (t.clone(), a.clone()));
+                let after = neighbours
+                    .iter()
+                    .find(|(ts, _, _)| *ts > timestamp)
+                    .map(|(_, t, a)| (t.clone(), a.clone()));
+                SkipRow {
+                    id,
+                    title,
+                    artist,
+                    album,
+                    timestamp,
+                    duration,
+                    listened_ms,
+                    source,
+                    chain,
+                    before,
+                    after,
+                }
+            })
+            .collect();
+        Ok((total, out))
+    }
+
+    /// What gets skipped most, by track.
+    ///
+    /// Its own query because a page of recent skips cannot answer it, and the
+    /// question a person actually has ("what do I keep bailing on?") is about
+    /// the whole history.
+    pub async fn most_skipped(
+        &self,
+        user_id: i64,
+        limit: i64,
+    ) -> Result<Vec<(String, String, i64)>, sqlx::Error> {
+        sqlx::query_as(
+            "SELECT title, artist, COUNT(*) AS n FROM scrobbles
+              WHERE user_id = ? AND skipped = TRUE
+              GROUP BY LOWER(TRIM(title)), LOWER(TRIM(artist))
+              ORDER BY n DESC, title ASC
+              LIMIT ?",
+        )
+        .bind(user_id)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+    }
+
     /// Recalculate a session's aggregates from the listens that point at it.
     ///
     /// Deletes the session outright when nothing points at it any more, which
@@ -12475,6 +12631,99 @@ mod tests {
                 "an aggregation must not be lured onto the partial index, got: {p}"
             );
         }
+    }
+
+    /// A skip reports what bracketed it, which is the whole point of the row.
+    ///
+    /// Bailing out is a judgement about a track *in a sequence*, so the
+    /// neighbours are the only context this application can honestly record —
+    /// and they come from one bounded range scan rather than a subquery per
+    /// row, which is the quadratic shape recorded three times in this file.
+    #[tokio::test]
+    async fn a_skip_carries_what_played_either_side_of_it() {
+        let db = testdb().await;
+        let uid = db.create_user("ash", None, "pw", "user").await.unwrap();
+        let base = Database::now_secs() as u64 - 10_000;
+
+        for (title, offset, skipped) in
+            [("Archangel", 0u64, false), ("Near Dark", 300, true), ("Endorphin", 600, false)]
+        {
+            let mut p = play(title, "Burial", base + offset);
+            p.duration = Some(240);
+            db.save_scrobble(
+                uid,
+                &p,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                ListenDisposition { imported: false, skipped },
+            )
+            .await
+            .unwrap();
+            if skipped {
+                let report = PlaybackReport { listened_ms: Some(30_000), ..Default::default() };
+                db.set_listen_playback(uid, &p.source_id, &p.source_name, &report).await.unwrap();
+            }
+        }
+
+        let (total, rows) = db.skips(uid, 25, 0).await.unwrap();
+        assert_eq!(total, 1, "only the skip is in here");
+        assert_eq!(rows.len(), 1);
+        let s = &rows[0];
+        assert_eq!(s.title, "Near Dark");
+        assert_eq!(s.listened_ms, Some(30_000));
+        assert_eq!(
+            s.before.as_ref().map(|(t, _)| t.as_str()),
+            Some("Archangel"),
+            "the track it did not sit after"
+        );
+        assert_eq!(
+            s.after.as_ref().map(|(t, _)| t.as_str()),
+            Some("Endorphin"),
+            "and the one that followed it"
+        );
+
+        // The whole-history question a page of recent skips cannot answer.
+        let most = db.most_skipped(uid, 10).await.unwrap();
+        assert_eq!(most.len(), 1);
+        assert_eq!(most[0].0, "Near Dark");
+        assert_eq!(most[0].2, 1);
+    }
+
+    /// A skip at the edge of a sitting has no neighbour, and says so.
+    ///
+    /// `None` rather than reaching further for something unrelated — a track
+    /// from yesterday is not what this one failed to sit between.
+    #[tokio::test]
+    async fn a_skip_with_nothing_around_it_reports_no_context() {
+        let db = testdb().await;
+        let uid = db.create_user("ash", None, "pw", "user").await.unwrap();
+        let mut p = play("Near Dark", "Burial", Database::now_secs() as u64 - 100);
+        p.duration = Some(240);
+        db.save_scrobble(
+            uid,
+            &p,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            ListenDisposition { imported: false, skipped: true },
+        )
+        .await
+        .unwrap();
+
+        let (_, rows) = db.skips(uid, 25, 0).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].before.is_none());
+        assert!(rows[0].after.is_none());
+        assert!(rows[0].listened_ms.is_none(), "nothing measured a playhead here");
     }
 
     /// A skip written by a live source is stored, measured, and never sent.

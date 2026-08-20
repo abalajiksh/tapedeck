@@ -271,6 +271,29 @@ the aggregates. This is the unit a person actually remembers listening in.",
             ),
         },
         ToolDef {
+            name: "skips",
+            title: "Skipped tracks",
+            description: "Tracks they started and bailed out of, newest first, with **what was \
+playing either side of each one** and how far in they got. Skips are stored but excluded from \
+every listening figure, so they appear in no other tool here.\n\n\
+`listened_fraction` is present only when both the playhead and the running time were known — a \
+polled server reports both, a submitting client often reports neither, and it is null rather \
+than estimated. \n\n\
+**The reason for a skip is not in this data and must not be invented.** Nothing recorded here \
+distinguishes 'wrong song for the moment' from 'never liked it' from 'phone rang'. What you may \
+do is describe the pattern — which tracks, how far in, what bracketed them, which gear, what \
+hour — and ask. If they tell you why, that belongs in a note on the listen, not in a guess.",
+            scope: scopes::LISTENING_READ,
+            read_only: true,
+            schema: obj(
+                vec![
+                    ("limit", int_arg("Skips to return, 1-100 (default 25)")),
+                    ("offset", int_arg("Skips to skip over")),
+                ],
+                &[],
+            ),
+        },
+        ToolDef {
             name: "now_playing",
             title: "Now playing",
             description:
@@ -788,6 +811,17 @@ pub async fn call(
                 crate::server::sessions::list_sessions(st(), user(), Query(q))
                     .await
                     .into_response(),
+            )
+            .await?
+        }
+
+        "skips" => {
+            let q = crate::server::scrobbles::SkipsQuery {
+                limit: Some(arg_i64(args, "limit").unwrap_or(25).clamp(1, 100)),
+                offset: arg_i64(args, "offset"),
+            };
+            handler_json(
+                crate::server::scrobbles::list_skips(st(), user(), Query(q)).await.into_response(),
             )
             .await?
         }

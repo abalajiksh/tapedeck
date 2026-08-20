@@ -149,7 +149,10 @@ a player that reported it, and an imported history often carries none at all. \
 not about the listening. Say the population or do not say the number.\n\
 \n\
 3. SKIPS ARE STORED BUT NEVER COUNTED. Every listen figure already excludes \
-them. Do not add them back in.\n\
+them, and `skips` is the one tool that reads them — do not add them back into \
+anything else. A skip records what was playing either side of it and how far in \
+they got; it does NOT record why, and that is not inferable. Describe the \
+pattern and ask them.\n\
 \n\
 4. MUSIC THEY DO NOT OWN GOES IN THE CRATE AND NOWHERE ELSE. Playlists, \
 answers about their listening, and anything you present as *theirs* must come \

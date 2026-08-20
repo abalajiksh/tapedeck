@@ -26,7 +26,7 @@ openapi: 3.1.0
 
 info:
   title: Tapedeck
-  version: 0.71.0
+  version: 0.72.0
   summary: Self-hosted scrobbler and listening journal.
   description: |
     Tapedeck ingests listens, enriches them with MusicBrainz metadata, stores
@@ -1885,6 +1885,57 @@ paths:
                   artists: { type: array, items: { type: object, additionalProperties: true } }
                   albums: { type: array, items: { type: object, additionalProperties: true } }
                   tracks: { type: array, items: { type: object, additionalProperties: true } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /api/v1/skips:
+    get:
+      tags: [Listens]
+      summary: Tracks you bailed out of.
+      description: |
+        Session-only. Skips are stored but excluded from every listening figure,
+        so this is the only place they are readable.
+
+        `listened_ms` is how far in the listener got, and is **null** when
+        nothing measured a playhead — a polled server reports one, a submitting
+        client often does not. `listened_fraction` is derived only when both the
+        playhead and the running time are known, rather than estimated.
+
+        `played_before` / `played_after` are the nearest real listens either
+        side, which is the only context this application can honestly record for
+        a skip. Both are null for a skip at the edge of a sitting. Nothing here
+        says *why* a track was skipped and nothing should infer it.
+      parameters:
+        - $ref: '#/components/parameters/Limit'
+        - { name: offset, in: query, schema: { type: integer } }
+      responses:
+        '200':
+          description: OK.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  total: { type: integer, description: Skips in the whole history. }
+                  skips:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        id: { type: integer }
+                        title: { type: string }
+                        artist: { type: string }
+                        album: { type: string, nullable: true }
+                        timestamp: { type: integer }
+                        duration: { type: integer, nullable: true }
+                        listened_ms: { type: integer, nullable: true }
+                        listened_fraction: { type: number, nullable: true }
+                        source: { type: string }
+                        chain: { type: string, nullable: true }
+                        played_before: { type: object, nullable: true, additionalProperties: true }
+                        played_after: { type: object, nullable: true, additionalProperties: true }
+                  most_skipped:
+                    type: array
+                    items: { type: object, additionalProperties: true }
         '401': { $ref: '#/components/responses/Unauthorized' }
 
   /api/v1/now-playing:

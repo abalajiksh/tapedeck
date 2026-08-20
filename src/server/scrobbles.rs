@@ -73,6 +73,90 @@ pub struct SearchQuery {
     pub limit: Option<i64>,
 }
 
+#[derive(serde::Deserialize)]
+pub struct SkipsQuery {
+    pub limit: Option<i64>,
+    pub offset: Option<i64>,
+}
+
+/// GET /api/v1/skips — the tracks this user bailed out of, with context.
+///
+/// Skips are stored and excluded from every count, which until now meant there
+/// was nowhere at all to look at them. The interesting columns are how far in
+/// the listener got and **what was playing either side** — bailing out is a
+/// judgement about a track in a sequence, and the neighbours are the only part
+/// of that this application can honestly record.
+///
+/// It does **not** say why, and nothing here should ever guess: the reasons a
+/// person gives ("it killed the mood", "not today") are not derivable from a
+/// timestamp. A liner note attaches to a listen and is where a stated reason
+/// belongs.
+pub async fn list_skips(
+    State(state): State<Arc<AppState>>,
+    user: AuthUser,
+    Query(params): Query<SkipsQuery>,
+) -> impl IntoResponse {
+    let limit = params.limit.unwrap_or(25).clamp(1, 100);
+    let offset = params.offset.unwrap_or(0).max(0);
+
+    let (total, rows) = match state.db.skips(user.user_id, limit, offset).await {
+        Ok(v) => v,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!(ErrorResponse {
+                    code: 500,
+                    error: format!("Failed to fetch skips: {}", e)
+                })),
+            )
+                .into_response();
+        }
+    };
+    let most = state.db.most_skipped(user.user_id, 10).await.unwrap_or_default();
+
+    let skips: Vec<_> = rows
+        .into_iter()
+        .map(|s| {
+            // Only when both halves are known. A fraction built from a missing
+            // playhead or a missing running time would be a guess wearing a
+            // percentage, which is the fidelity-card mistake in a new place.
+            let fraction = match (s.listened_ms, s.duration) {
+                (Some(ms), Some(d)) if d > 0 => Some((ms as f64 / 1000.0) / d as f64),
+                _ => None,
+            };
+            serde_json::json!({
+                "id": s.id,
+                "title": s.title,
+                "artist": s.artist,
+                "album": s.album,
+                "timestamp": s.timestamp,
+                "duration": s.duration,
+                "listened_ms": s.listened_ms,
+                "listened_fraction": fraction,
+                "source": s.source,
+                "chain": s.chain,
+                "played_before": s.before.map(|(t, a)| serde_json::json!({"title": t, "artist": a})),
+                "played_after": s.after.map(|(t, a)| serde_json::json!({"title": t, "artist": a})),
+            })
+        })
+        .collect();
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "total": total,
+            "skips": skips,
+            "most_skipped": most
+                .into_iter()
+                .map(|(title, artist, n)| {
+                    serde_json::json!({"title": title, "artist": artist, "skips": n})
+                })
+                .collect::<Vec<_>>(),
+        })),
+    )
+        .into_response()
+}
+
 /// GET /api/v1/search?q= — grouped matches from the caller's own history.
 ///
 /// Scoped to `user.user_id` like every other read: on a shared instance one
@@ -809,6 +893,7 @@ pub fn create_scrobbles_router() -> Router<Arc<AppState>> {
         .route("/api/v1/scrobbles/bulk-chain", axum::routing::post(bulk_set_chain))
         .route("/api/v1/scrobbles/:id", patch(update_scrobble).delete(delete_scrobble))
         .route("/api/v1/search", get(search))
+        .route("/api/v1/skips", get(list_skips))
         .route("/api/v1/sanitize", get(sanitize_preview).post(sanitize_apply))
         .route("/api/v1/stats/dashboard", get(dashboard_stats))
         .route("/api/v1/stats", get(ranged_stats))
