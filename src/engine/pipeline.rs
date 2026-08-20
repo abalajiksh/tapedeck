@@ -5,7 +5,7 @@ use tokio::time::sleep;
 use tracing::{debug, error, info, warn};
 
 use crate::db::Database;
-use crate::models::ListenDisposition;
+use crate::models::{ListenDisposition, Play, PlaybackReport};
 use crate::musicbrainz::MusicBrainzClient;
 use crate::server::now_playing::{NowPlaying, NowPlayingRegistry, Progress};
 use crate::sinks;
@@ -14,6 +14,104 @@ use crate::sources::{
 };
 
 use super::enrichment::enrich_play;
+
+/// How long a displaced ingest track waits before it is written off as a skip.
+///
+/// This is the whole mechanism for the submitting path: a client may announce
+/// the next track before sending the scrobble for the last one, so the verdict
+/// has to stay revocable long enough for that scrobble to land and cancel it.
+/// Generous on purpose — a skip written in error sits on a permanent record,
+/// while a skip written a minute late costs nothing at all.
+const SKIP_GRACE_SECS: i64 = 90;
+
+/// Write a track that was playing and got replaced before it ever counted.
+///
+/// A skip is the one thing a session-shaped source can say about how a listen
+/// *ended*; everything else in this file is about one beginning. Three
+/// deliberate differences from banking a real listen:
+///
+/// * **No enrichment.** There is no point spending a rate-limited MusicBrainz
+///   lookup on a track the listener just rejected, which is the rule the
+///   enrichment backfills already follow by filtering `skipped = FALSE`.
+/// * **`listened_ms` is written**, because that is the half that makes the flag
+///   mean anything: bailing three seconds in and bailing with thirty seconds
+///   left are opposite behaviours and the bool stores them identically.
+/// * **The device and chain still resolve.** Which gear a track was rejected on
+///   is exactly the kind of thing this application exists to record, and a skip
+///   accrues no chain hours anyway — `CHAIN_COLUMNS` filters them out.
+#[allow(clippy::too_many_arguments)]
+async fn bank_skip(
+    db: &Database,
+    user_id: i64,
+    play: &Play,
+    // `None` when nothing measured a playhead — an ingest client that reports
+    // no position. The row still records *that* it was skipped; it just does
+    // not claim to know how far in, which is better than storing wall-clock
+    // arithmetic as though it were a measurement.
+    listened_secs: Option<u64>,
+    device_id: Option<i64>,
+    chain_id: Option<i64>,
+    listening_context: Option<&str>,
+    label: &str,
+    row_id: i64,
+) {
+    // Like-for-like against stored skips only, so a skip cannot be confused
+    // with a real listen of the same track in either direction.
+    let dupe = db.exists(user_id, &play.source_id, &play.source_name).await.unwrap_or(false)
+        || db.fuzzy_exists(user_id, play, true).await.unwrap_or(false);
+    if dupe {
+        return;
+    }
+    let disposition = ListenDisposition { imported: false, skipped: true };
+    match db
+        .save_scrobble(
+            user_id,
+            play,
+            None,
+            device_id,
+            chain_id,
+            None,
+            listening_context,
+            Some(label),
+            Some(row_id),
+            disposition,
+        )
+        .await
+    {
+        Ok(true) => {
+            // A follow-up write rather than another argument on `save_scrobble`,
+            // which has 53 call sites and a documented history of positional
+            // arguments landing in the wrong slot. The usual objection to
+            // insert-then-update does not reach here: a skipped row is filed
+            // `'imported'` from the first statement, so no flush tick can catch
+            // it half-written and forward it.
+            let report = PlaybackReport {
+                listened_ms: listened_secs.map(|s| s as i64 * 1000),
+                ..Default::default()
+            };
+            if !report.is_empty() {
+                if let Err(e) = db
+                    .set_listen_playback(user_id, &play.source_id, &play.source_name, &report)
+                    .await
+                {
+                    warn!("Could not record how far into the skipped track we got: {}", e);
+                }
+            }
+            match listened_secs {
+                Some(s) => info!(
+                    "⏭️  Skipped for user {}: {} - {} ({}s in)",
+                    user_id, play.artist, play.title, s
+                ),
+                None => info!(
+                    "⏭️  Skipped for user {}: {} - {} (position not reported)",
+                    user_id, play.artist, play.title
+                ),
+            }
+        }
+        Ok(false) => {}
+        Err(e) => error!("Database error recording a skip: {}", e),
+    }
+}
 
 pub struct ScrobbleEngine {
     /// Live sources, one per (user, kind) row in `user_sources`. Reconciled at
@@ -153,6 +251,47 @@ impl ScrobbleEngine {
     /// A source whose owner has never touched the setting is told the default
     /// explicitly, so turning the setting *back* to standard applies as
     /// immediately as setting it did.
+    /// Write off the ingest tracks whose grace period has run out.
+    ///
+    /// The threshold decides, and it is the **listener's own** — the same
+    /// number their sources use, so "what counts as played" has one answer
+    /// across the application rather than one per code path.
+    ///
+    /// A track that got past it is *not* a skip even though nothing banked it:
+    /// that is a client which reports now-playing and never scrobbles, and
+    /// filing its whole history as skips would be a fact about the client
+    /// rather than about the listening.
+    async fn resolve_pending_skips(&self) {
+        let due = self.now_playing.take_due_skips(now_secs(), SKIP_GRACE_SECS);
+        if due.is_empty() {
+            return;
+        }
+        let thresholds = self.db.scrobble_thresholds().await.unwrap_or_default();
+        for (user_id, pending) in due {
+            let threshold = thresholds.get(&user_id).copied().unwrap_or_default();
+            if threshold.reached(pending.bound_secs, pending.duration) {
+                continue;
+            }
+            bank_skip(
+                &self.db,
+                user_id,
+                &pending.play,
+                // `listened_secs` is `None` when the client never reported a
+                // playhead. The decision above still used the wall-clock bound,
+                // because a bound is enough to answer "did this get far enough
+                // to count"; storing it as `listened_ms` would state arithmetic
+                // as a measurement, which is what `Progress` exists to prevent.
+                pending.listened_secs,
+                None,
+                None,
+                None,
+                "ingest",
+                0,
+            )
+            .await;
+        }
+    }
+
     async fn apply_scrobble_thresholds(&mut self) {
         let configured = match self.db.scrobble_thresholds().await {
             Ok(map) => map,
@@ -467,7 +606,7 @@ impl ScrobbleEngine {
                         .exists(user_id, &play.source_id, &play.source_name)
                         .await
                         .unwrap_or(false)
-                        || db.fuzzy_exists(user_id, &play).await.unwrap_or(false);
+                        || db.fuzzy_exists(user_id, &play, false).await.unwrap_or(false);
                     if dupe {
                         continue;
                     }
@@ -588,7 +727,7 @@ impl ScrobbleEngine {
             let mut play = track.play;
             let dupe =
                 db.exists(user_id, &play.source_id, &play.source_name).await.unwrap_or(false)
-                    || db.fuzzy_exists(user_id, &play).await.unwrap_or(false);
+                    || db.fuzzy_exists(user_id, &play, false).await.unwrap_or(false);
             if dupe {
                 continue;
             }
@@ -656,6 +795,51 @@ impl ScrobbleEngine {
                 Ok(false) => {}
                 Err(e) => error!("Database error: {}", e),
             }
+        }
+
+        // Tracks the listener moved on from before they ever counted. Same
+        // session, so the same client and therefore the same chain.
+        for track in sessions.skipped {
+            let (device_id, chain_id) = match &track.player {
+                Some(p) => match db
+                    .upsert_device(
+                        user_id,
+                        &p.machine_id,
+                        p.name.as_deref(),
+                        p.platform.as_deref(),
+                        p.product.as_deref(),
+                    )
+                    .await
+                {
+                    Ok(dev) => {
+                        let chain = db.get_device_default_chain(user_id, dev).await.ok().flatten();
+                        (Some(dev), chain)
+                    }
+                    Err(_) => (None, None),
+                },
+                None => (None, None),
+            };
+            let listening_context = match chain_id {
+                Some(cid) => db
+                    .get_chain(user_id, cid)
+                    .await
+                    .ok()
+                    .flatten()
+                    .map(|c| c.listening_context.as_str().to_string()),
+                None => None,
+            };
+            bank_skip(
+                db,
+                user_id,
+                &track.play,
+                Some(track.position),
+                device_id,
+                chain_id,
+                listening_context.as_deref(),
+                label,
+                row_id,
+            )
+            .await;
         }
     }
 
@@ -745,7 +929,7 @@ impl ScrobbleEngine {
             let mut play = track.play;
             let dupe =
                 db.exists(user_id, &play.source_id, &play.source_name).await.unwrap_or(false)
-                    || db.fuzzy_exists(user_id, &play).await.unwrap_or(false);
+                    || db.fuzzy_exists(user_id, &play, false).await.unwrap_or(false);
             if dupe {
                 continue;
             }
@@ -812,6 +996,44 @@ impl ScrobbleEngine {
                 Ok(false) => {}
                 Err(e) => error!("Database error: {}", e),
             }
+        }
+
+        // Zones the listener moved on from before the track ever counted.
+        for track in zones.skipped {
+            let (device_id, chain_id) = match &track.output {
+                Some(o) => match db
+                    .upsert_device(user_id, &o.machine_id, o.name.as_deref(), None, Some("Roon"))
+                    .await
+                {
+                    Ok(dev) => {
+                        let chain = db.get_device_default_chain(user_id, dev).await.ok().flatten();
+                        (Some(dev), chain)
+                    }
+                    Err(_) => (None, None),
+                },
+                None => (None, None),
+            };
+            let listening_context = match chain_id {
+                Some(cid) => db
+                    .get_chain(user_id, cid)
+                    .await
+                    .ok()
+                    .flatten()
+                    .map(|c| c.listening_context.as_str().to_string()),
+                None => None,
+            };
+            bank_skip(
+                db,
+                user_id,
+                &track.play,
+                Some(track.position),
+                device_id,
+                chain_id,
+                listening_context.as_deref(),
+                "Roon",
+                row_id,
+            )
+            .await;
         }
     }
 
@@ -936,7 +1158,7 @@ impl ScrobbleEngine {
                 // MusicBrainz call.
                 let already_exists =
                     db.exists(user_id, &play.source_id, &play.source_name).await.unwrap_or(false)
-                        || db.fuzzy_exists(user_id, &play).await.unwrap_or(false);
+                        || db.fuzzy_exists(user_id, &play, false).await.unwrap_or(false);
                 if already_exists {
                     debug!("Skipping already-scrobbled: {} - {}", play.artist, play.title);
                     continue;
@@ -1016,6 +1238,59 @@ impl ScrobbleEngine {
                     Err(e) => error!("Database error: {}", e),
                 }
             }
+
+            // Tracks the listener moved on from before they ever counted.
+            // Plex keeps its own copy of the session state machine, so this
+            // mirrors the Jellyfin and Roon loops rather than sharing one.
+            for plex_track in session_result.skipped {
+                let listened_secs = plex_track.view_offset.unwrap_or(0) / 1000;
+                // The suffix carries the time, or skipping the same track
+                // twice would produce one `plex-<rk>-skip` both times and
+                // `exists` would drop the second permanently — the constant
+                // `source_id` bug Jellyfin repeats had before v0.30.0.
+                let play = plex_track.to_play(&format!("skip-{}", now_secs()));
+                let (device_id, chain_id) = match &plex_track.player {
+                    Some(p) => match db
+                        .upsert_device(
+                            user_id,
+                            &p.machine_id,
+                            p.name.as_deref(),
+                            p.platform.as_deref(),
+                            p.product.as_deref(),
+                        )
+                        .await
+                    {
+                        Ok(dev) => {
+                            let chain =
+                                db.get_device_default_chain(user_id, dev).await.ok().flatten();
+                            (Some(dev), chain)
+                        }
+                        Err(_) => (None, None),
+                    },
+                    None => (None, None),
+                };
+                let listening_context = match chain_id {
+                    Some(cid) => db
+                        .get_chain(user_id, cid)
+                        .await
+                        .ok()
+                        .flatten()
+                        .map(|c| c.listening_context.as_str().to_string()),
+                    None => None,
+                };
+                bank_skip(
+                    &db,
+                    user_id,
+                    &play,
+                    Some(listened_secs),
+                    device_id,
+                    chain_id,
+                    listening_context.as_deref(),
+                    "Plex",
+                    row_id,
+                )
+                .await;
+            }
         }
 
         // Deliberately not gated on "is anything playing". Now that a track is
@@ -1025,6 +1300,11 @@ impl ScrobbleEngine {
         // every scrobble client does, and `delivered_sinks` stops a retry from
         // sending it twice.
         self.flush_pending().await;
+
+        // Tracks that left a pushing client's deck with nothing banked for
+        // them. Polled sources report their own skips directly from the session
+        // state machine; this is only for clients that submit.
+        self.resolve_pending_skips().await;
 
         // Likewise on its own clock — see THRESHOLD_REFRESH_SECS.
         if now >= self.next_threshold_refresh_at {

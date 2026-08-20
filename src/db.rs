@@ -2817,7 +2817,7 @@ impl Database {
         if self.exists(user_id, &play.source_id, &play.source_name).await? {
             return Ok(false);
         }
-        if self.fuzzy_exists(user_id, play).await? {
+        if self.fuzzy_exists(user_id, play, disposition.skipped).await? {
             debug!("Skipping duplicate play (fuzzy match): {} - {}", play.artist, play.title);
             return Ok(false);
         }
@@ -3043,10 +3043,29 @@ impl Database {
     ///
     /// Unknown duration falls back to a conservative minute: better a rare
     /// duplicate than a silently dropped listen.
+    /// `skipped` is the **incoming** row's disposition, and a candidate only
+    /// matches one of the same kind.
+    ///
+    /// Skips used to be rare and historical — Rockbox and Spotify imports, and
+    /// the shelf — so "no skip filter here" was right and is recorded as a rule
+    /// above `exists`. Live sources write them now, which introduces a pair
+    /// that must not be confused: a skip and a real play of the same track,
+    /// close together. Matching across the two breaks in both directions.
+    ///
+    /// Dropping the filter entirely would let a stored skip swallow a genuine
+    /// listen — skip a two-minute track ten seconds in, start it again and let
+    /// it run, and the real listen lands inside the same 60-second window and
+    /// is silently discarded off a permanent record. Filtering skips out
+    /// entirely breaks the other way: re-running a Spotify import relies on
+    /// this to dedup its skips, and that history carried 5,630 of them.
+    ///
+    /// So it matches like for like. An incoming skip sees stored skips, an
+    /// incoming listen sees stored listens, and neither can erase the other.
     pub async fn fuzzy_existing_id(
         &self,
         user_id: i64,
         play: &Play,
+        skipped: bool,
     ) -> Result<Option<i64>, sqlx::Error> {
         // A duplicate is a *reporting lag* phenomenon and is therefore roughly
         // constant: the same play arriving from a second code path lands within
@@ -3104,6 +3123,7 @@ impl Database {
         let sql = format!(
             "SELECT id FROM scrobbles
               WHERE user_id = ?
+                AND skipped = ?
                 AND timestamp BETWEEN ? - ? AND ? + ?
                 AND LOWER(TRIM(title)) = LOWER(TRIM(?))
                 AND (
@@ -3117,6 +3137,7 @@ impl Database {
         );
         let mut q = sqlx::query_as::<_, (i64,)>(&sql)
             .bind(user_id)
+            .bind(skipped)
             .bind(timestamp)
             .bind(window)
             .bind(timestamp)
@@ -3139,8 +3160,13 @@ impl Database {
     }
 
     /// The bool form, for the callers that only need to know *whether*.
-    pub async fn fuzzy_exists(&self, user_id: i64, play: &Play) -> Result<bool, sqlx::Error> {
-        Ok(self.fuzzy_existing_id(user_id, play).await?.is_some())
+    pub async fn fuzzy_exists(
+        &self,
+        user_id: i64,
+        play: &Play,
+        skipped: bool,
+    ) -> Result<bool, sqlx::Error> {
+        Ok(self.fuzzy_existing_id(user_id, play, skipped).await?.is_some())
     }
 
     pub async fn get_pending_scrobbles(&self) -> Result<Vec<PendingScrobble>, sqlx::Error> {
@@ -5680,7 +5706,7 @@ impl Database {
         // Nothing is ever overwritten; see `enrich_existing`.
         let held = match self.existing_id(user_id, &play.source_id, &play.source_name).await? {
             Some(id) => Some(id),
-            None => self.fuzzy_existing_id(user_id, play).await?,
+            None => self.fuzzy_existing_id(user_id, play, skipped).await?,
         };
         if let Some(id) = held {
             return Ok(if self.enrich_existing(id, play, &provenance).await? {
@@ -12449,6 +12475,72 @@ mod tests {
                 "an aggregation must not be lured onto the partial index, got: {p}"
             );
         }
+    }
+
+    /// A skip written by a live source is stored, measured, and never sent.
+    ///
+    /// Skips used to arrive only from imports and the shelf; Plex, Jellyfin,
+    /// Emby, Roon and a submitting client all write them now, which makes the
+    /// three properties below load-bearing rather than theoretical. The one
+    /// that would be worst to get wrong is the forwarding: a skip pushed to
+    /// Last.fm is a listen on someone's permanent public record that never
+    /// happened.
+    #[tokio::test]
+    async fn a_live_skip_is_measured_stored_and_never_forwarded() {
+        let db = testdb().await;
+        let uid = db.create_user("ash", None, "pw", "user").await.unwrap();
+        let now = Database::now_secs();
+
+        let mut p = play("Archangel", "Burial", (now - 60) as u64);
+        p.duration = Some(240);
+        assert!(db
+            .save_scrobble(
+                uid,
+                &p,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                ListenDisposition { imported: false, skipped: true },
+            )
+            .await
+            .unwrap());
+
+        // How far in they got — the half a bool could never express.
+        let report = PlaybackReport { listened_ms: Some(12_000), ..Default::default() };
+        db.set_listen_playback(uid, &p.source_id, &p.source_name, &report).await.unwrap();
+
+        let stored: ScrobbleRecord =
+            sqlx::query_as("SELECT * FROM scrobbles WHERE user_id = ? AND title = ?")
+                .bind(uid)
+                .bind("Archangel")
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        // `ScrobbleRecord` does not carry the flag, so ask the column.
+        let (is_skipped,): (bool,) = sqlx::query_as("SELECT skipped FROM scrobbles WHERE id = ?")
+            .bind(stored.id)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert!(is_skipped, "stored as a skip");
+        assert_eq!(stored.listened_ms, Some(12_000), "and it says how far in");
+        assert_eq!(stored.status, "imported", "never queued for a sink");
+        assert!(stored.session_id.is_none(), "a skip is not part of a sitting");
+
+        // The flush loop only ever picks up `'pending'`, so this is the
+        // property that keeps it off a permanent public record.
+        let pending = db.get_pending_scrobbles().await.unwrap();
+        assert!(
+            !pending.iter().any(|s| s.play.title == "Archangel"),
+            "a skip must never be forwarded"
+        );
+
+        // And it still does not count.
+        assert_eq!(db.listen_count_and_latest(uid).await.unwrap().0, 0);
     }
 
     /// A skip must not reach *any* readout that counts listens.

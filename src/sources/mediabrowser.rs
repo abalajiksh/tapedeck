@@ -130,6 +130,37 @@ struct SessionProgress {
     scrobbled: bool,
     /// Last playhead seen, so a track starting over can be told from a seek.
     last_position: u64,
+    /// Enough of the outgoing track to write a listen for it once it is
+    /// displaced. Held because the *caller* cannot supply it at that moment:
+    /// by the time a session reports a new item, the old item's metadata is
+    /// gone from the payload, and the tracker is the only thing that still
+    /// knows what was playing a poll ago.
+    play: Play,
+}
+
+/// A track that was playing and was replaced before it ever counted.
+///
+/// This is a **skip**, and it is the one thing a polled source can say about
+/// how a listen ended. Everything else here is about a listen beginning.
+#[derive(Debug, Clone)]
+pub struct Abandoned {
+    pub play: Play,
+    /// How far in the listener got, in seconds. Real, not inferred: it is the
+    /// last playhead the server reported for that item.
+    ///
+    /// No `duration` beside it on purpose: the threshold decision has already
+    /// been made here, so a running time downstream would only be there to look
+    /// informative.
+    pub listened_secs: u64,
+}
+
+/// What one pass of a session says.
+#[derive(Debug, Clone, Default)]
+pub struct Observed {
+    /// This pass just crossed the threshold — bank the listen.
+    pub ready: bool,
+    /// Something else started before this one ever crossed.
+    pub abandoned: Option<Abandoned>,
 }
 
 impl SessionTracker {
@@ -161,31 +192,50 @@ impl SessionTracker {
     ///    nothing to undo.
     /// 3. **A paused track never crosses.** It is still "now playing" for the
     ///    deck, but its position is not advancing.
+    ///
+    /// It also reports the track this one *replaced*, when that track never
+    /// crossed the threshold — see [`Abandoned`]. The information was always
+    /// here and was discarded one line later: at the item-change branch the
+    /// entry still holds the outgoing item, whether it was ever banked, and how
+    /// far into it the listener got.
     pub fn observe(
         &mut self,
         session_id: &str,
         item_id: &str,
-        item_name: &str,
+        play: &Play,
         position: u64,
         duration: Option<u64>,
         paused: bool,
-    ) -> bool {
+    ) -> Observed {
         let entry = self.seen.entry(session_id.to_string()).or_insert_with(|| SessionProgress {
             item_id: item_id.to_string(),
             scrobbled: false,
             last_position: position,
+            play: play.clone(),
         });
 
+        let mut out = Observed::default();
+
         if entry.item_id != item_id {
+            // The outgoing track never counted, and something else is playing
+            // now — so the listener moved on from it deliberately. A track that
+            // *did* cross is already banked and is simply over.
+            if !entry.scrobbled {
+                out.abandoned = Some(Abandoned {
+                    play: entry.play.clone(),
+                    listened_secs: entry.last_position,
+                });
+            }
             entry.item_id = item_id.to_string();
             entry.scrobbled = false;
+            entry.play = play.clone();
         } else if entry.last_position > position
             && entry.last_position - position >= REPEAT_REWIND_SECS
         {
             if entry.scrobbled {
                 debug!(
                     "Playhead rewound in session {} ({}s -> {}s): '{}' started over",
-                    session_id, entry.last_position, position, item_name
+                    session_id, entry.last_position, position, play.title
                 );
             }
             entry.scrobbled = false;
@@ -196,13 +246,20 @@ impl SessionTracker {
 
         if past_threshold && !entry.scrobbled {
             entry.scrobbled = true;
-            return true;
+            out.ready = true;
         }
-        false
+        out
     }
 
     /// Forget sessions that have gone away, so the map doesn't grow forever and
     /// a returning session starts clean.
+    ///
+    /// **A session that disappears is deliberately not a skip.** An item change
+    /// is evidence — something else started playing, so the listener moved on.
+    /// A session simply ending is not: the player was closed, the listener
+    /// walked away, the network blinked, the poll missed. Writing those as
+    /// skips would file "went to bed" as a judgement about a record, and a
+    /// skip is meant to mean something.
     pub fn retain_live(&mut self, live: &[String]) {
         self.seen.retain(|id, _| live.contains(id));
     }
@@ -394,6 +451,10 @@ pub struct MediaBrowserTrack {
 pub struct MediaBrowserSessions {
     pub now_playing: Vec<MediaBrowserTrack>,
     pub ready_to_scrobble: Vec<MediaBrowserTrack>,
+    /// Tracks replaced before they ever counted. `position` is how far in the
+    /// listener got, which is the whole point — bailing three seconds in and
+    /// bailing thirty seconds from the end are opposite behaviours.
+    pub skipped: Vec<MediaBrowserTrack>,
 }
 
 fn now_secs() -> u64 {
@@ -637,7 +698,32 @@ impl MediaBrowserSource {
             // position isn't advancing, so it shouldn't cross the threshold.
             let paused = session.play_state.as_ref().and_then(|p| p.is_paused).unwrap_or(false);
 
-            if self.tracker.observe(&session.id, &item.id, &item.name, position, duration, paused) {
+            let observed = self.tracker.observe(
+                &session.id,
+                &item.id,
+                &track.play,
+                position,
+                duration,
+                paused,
+            );
+
+            // The track this one replaced, if it never counted. It played on
+            // this same session, so it carries this session's player — which is
+            // what gives a skip a device and therefore a signal chain.
+            if let Some(gone) = observed.abandoned {
+                let mut skipped = track.clone();
+                skipped.play = gone.play;
+                skipped.position = gone.listened_secs;
+                // Its own id, or `exists` would treat the skip and a later real
+                // play of the same track as one row.
+                skipped.play.source_id = format!("{}-skip-{}", skipped.play.source_id, now_secs());
+                // Deliberately not carried over: `quality` describes the item
+                // now playing, not the one that just went.
+                skipped.quality = None;
+                result.skipped.push(skipped);
+            }
+
+            if observed.ready {
                 // The banked copy gets a source_id unique to *this pass*. The
                 // now-playing copy keeps the stable one, which is what the deck
                 // wants. Without this the id was `<kind>-<item>-<device>` —
@@ -1175,6 +1261,13 @@ mod tests {
 
     // ---- The state machine, which is flavour-independent ------------------
 
+    /// A minimal `Play` for driving the tracker. Only the identity fields
+    /// matter here — the tracker keys on the `item_id` it is handed, and holds
+    /// the play only so it can give it back when the track is displaced.
+    fn named(title: &str) -> Play {
+        Play::new(title.into(), "Test Artist".into(), 1_700_000_000, "src".into(), "test".into())
+    }
+
     /// Playing one track three times on repeat must bank three listens.
     ///
     /// This is the bug Plex had until v0.13.3 and Jellyfin still had after it:
@@ -1189,11 +1282,78 @@ mod tests {
         let mut banked = 0;
         for pass in 0..3 {
             for secs in [3u64, 120, 195] {
-                if t.observe("sess-1", "item-1", "Combustible", secs, Some(200), false) {
+                if t.observe("sess-1", "item-1", &named("Combustible"), secs, Some(200), false)
+                    .ready
+                {
                     banked += 1;
                 }
             }
             assert_eq!(banked, pass + 1, "pass {pass} should have banked exactly one");
+        }
+    }
+
+    /// A track replaced before it ever counted is a skip, and says how far in.
+    ///
+    /// This is the one thing a polled source can say about how a listen
+    /// *ended*; everything else in this tracker is about one beginning. The
+    /// information was always here and was thrown away one line later.
+    #[test]
+    fn a_track_replaced_before_it_counted_is_reported_as_skipped() {
+        let mut t = SessionTracker::new();
+        // Twelve seconds into the first track, then something else starts.
+        t.observe("sess-1", "item-1", &named("Archangel"), 5, Some(200), false);
+        t.observe("sess-1", "item-1", &named("Archangel"), 12, Some(200), false);
+        let o = t.observe("sess-1", "item-2", &named("Near Dark"), 0, Some(200), false);
+
+        let gone = o.abandoned.expect("the displaced track should be reported");
+        assert_eq!(gone.play.title, "Archangel");
+        assert_eq!(gone.listened_secs, 12, "how far in is the whole point");
+        assert!(!o.ready);
+    }
+
+    /// A track that *did* cross the threshold is simply over, not skipped.
+    ///
+    /// Without this every completed track in a queue would be filed as a skip
+    /// the moment the next one started — which is every track anyone ever
+    /// plays, and would make the flag meaningless.
+    #[test]
+    fn a_track_that_counted_is_not_also_a_skip() {
+        let mut t = SessionTracker::new();
+        assert!(t.observe("sess-1", "item-1", &named("Archangel"), 195, Some(200), false).ready);
+        let o = t.observe("sess-1", "item-2", &named("Near Dark"), 0, Some(200), false);
+        assert!(o.abandoned.is_none(), "a banked listen is over, not abandoned");
+    }
+
+    /// A session going away is not evidence of anything.
+    ///
+    /// An item change means something else started, so the listener moved on.
+    /// A session ending means the player closed, or they walked away, or the
+    /// network blinked. Filing that as a skip would record "went to bed" as a
+    /// judgement about a record.
+    #[test]
+    fn a_session_that_disappears_is_not_a_skip() {
+        let mut t = SessionTracker::new();
+        t.observe("sess-1", "item-1", &named("Archangel"), 12, Some(200), false);
+        t.retain_live(&[]);
+        // Nothing to report, and the slate is clean for a returning session.
+        let o = t.observe("sess-1", "item-1", &named("Archangel"), 3, Some(200), false);
+        assert!(o.abandoned.is_none());
+    }
+
+    /// A track put on repeat is not skipping itself.
+    ///
+    /// The repeat path resets `scrobbled` through the *rewind* branch, not the
+    /// item-change branch, so it must never produce an abandoned track — a
+    /// listener who loves a song enough to loop it would otherwise accrue a
+    /// skip per pass.
+    #[test]
+    fn a_looped_track_never_reports_a_skip() {
+        let mut t = SessionTracker::new();
+        for _ in 0..3 {
+            for secs in [3u64, 120, 195] {
+                let o = t.observe("sess-1", "item-1", &named("Archangel"), secs, Some(200), false);
+                assert!(o.abandoned.is_none(), "a repeat is not a skip");
+            }
         }
     }
 
@@ -1204,7 +1364,7 @@ mod tests {
         let mut t = SessionTracker::new();
         let mut banked = 0;
         for secs in [120u64, 115, 118, 160, 195] {
-            if t.observe("sess-1", "item-1", "Combustible", secs, Some(200), false) {
+            if t.observe("sess-1", "item-1", &named("Combustible"), secs, Some(200), false).ready {
                 banked += 1;
             }
         }
@@ -1218,7 +1378,7 @@ mod tests {
         let mut t = SessionTracker::new();
         let mut banked = 0;
         for secs in [40u64, 5, 60, 110, 195] {
-            if t.observe("sess-1", "item-1", "Combustible", secs, Some(200), false) {
+            if t.observe("sess-1", "item-1", &named("Combustible"), secs, Some(200), false).ready {
                 banked += 1;
             }
         }
@@ -1233,7 +1393,7 @@ mod tests {
         let mut banked = 0;
         for item in ["a", "b", "c"] {
             for secs in [3u64, 120] {
-                if t.observe("sess-1", item, "track", secs, Some(200), false) {
+                if t.observe("sess-1", item, &named("track"), secs, Some(200), false).ready {
                     banked += 1;
                 }
             }
@@ -1246,9 +1406,9 @@ mod tests {
     #[test]
     fn a_paused_track_never_crosses_the_threshold() {
         let mut t = SessionTracker::new();
-        assert!(!t.observe("sess-1", "item-1", "track", 195, Some(200), true));
+        assert!(!t.observe("sess-1", "item-1", &named("track"), 195, Some(200), true).ready);
         // …and resuming past it still banks exactly once.
-        assert!(t.observe("sess-1", "item-1", "track", 196, Some(200), false));
+        assert!(t.observe("sess-1", "item-1", &named("track"), 196, Some(200), false).ready);
     }
 
     /// A source that reports no duration falls back to the four-minute rule
@@ -1256,8 +1416,8 @@ mod tests {
     #[test]
     fn an_unknown_duration_falls_back_to_four_minutes() {
         let mut t = SessionTracker::new();
-        assert!(!t.observe("s", "i", "track", 239, None, false));
-        assert!(t.observe("s", "i", "track", 240, None, false));
+        assert!(!t.observe("s", "i", &named("track"), 239, None, false).ready);
+        assert!(t.observe("s", "i", &named("track"), 240, None, false).ready);
     }
 
     /// A session that goes away is forgotten, so a returning one starts clean
@@ -1265,9 +1425,9 @@ mod tests {
     #[test]
     fn a_departed_session_is_forgotten() {
         let mut t = SessionTracker::new();
-        assert!(t.observe("sess-1", "item-1", "track", 195, Some(200), false));
+        assert!(t.observe("sess-1", "item-1", &named("track"), 195, Some(200), false).ready);
         t.retain_live(&[]);
         // Same session and item returning is a fresh play, not a suppressed one.
-        assert!(t.observe("sess-1", "item-1", "track", 195, Some(200), false));
+        assert!(t.observe("sess-1", "item-1", &named("track"), 195, Some(200), false).ready);
     }
 }

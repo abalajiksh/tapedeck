@@ -107,6 +107,34 @@ pub struct NowPlaying {
     pub dsd_to_pcm_converted: Option<bool>,
     pub delivery_codec: Option<String>,
     pub is_lossless: Option<bool>,
+    /// Whether a real listen for this track has been submitted.
+    ///
+    /// Off the wire — it says nothing about what is playing, only about what we
+    /// have already banked. It exists to tell a **skip** from a track that
+    /// simply finished: a client that scrobbles at end-of-track sends the
+    /// listen and *then* announces the next one, so without this every
+    /// completed track would look abandoned the moment its successor arrived.
+    #[serde(skip)]
+    pub banked: bool,
+}
+
+/// A track that was on the deck and was replaced before anything banked it.
+///
+/// Held rather than written immediately because a submitting client can send
+/// the scrobble for a track either side of announcing the next one — both
+/// orderings are legal and both happen in the wild. Resolving on a delay is
+/// what lets a late scrobble cancel it.
+#[derive(Debug, Clone)]
+pub struct PendingSkip {
+    pub play: Play,
+    /// Where the deck had got to. `None` when the client never reported a
+    /// playhead, in which case the bound below is wall-clock since it announced
+    /// the track — good enough to *decide* with, never good enough to store.
+    pub listened_secs: Option<u64>,
+    /// The figure the decision is made on, measured or not.
+    pub bound_secs: u64,
+    pub duration: Option<u64>,
+    pub displaced_at: i64,
 }
 
 impl NowPlaying {
@@ -125,6 +153,7 @@ impl NowPlaying {
             position_known: !matches!(progress, Progress::Unknown),
             position_exact: matches!(progress, Progress::Exact(_)),
             paused: false,
+            banked: false,
             updated_at: now_secs(),
             source: source.to_string(),
             listening_context: None,
@@ -137,6 +166,31 @@ impl NowPlaying {
             delivery_codec: quality.and_then(|q| q.delivery_codec.clone()),
             is_lossless: quality.and_then(|q| q.is_lossless),
         }
+    }
+
+    /// Rebuild a listen from what the deck was told, for writing a skip.
+    ///
+    /// The timestamp is when the track **started**, not when it was displaced.
+    /// `scrobbles.timestamp` is start-of-play everywhere in this application —
+    /// history, sessions, the 30-minute session gap, every ranged query — and a
+    /// skip filed at its end time would sit a track length late in all of them.
+    /// That is the same trap the Spotify export's `ts` carries.
+    pub fn to_play(&self) -> Play {
+        let started = (self.updated_at - self.progress as i64).max(0);
+        // Unique per skip: the start second alone would collide for two tracks
+        // announced in the same second, and a constant id would let `exists`
+        // drop every skip after the first permanently.
+        let source_id = format!("ingest-skip-{}-{}-{}", started, self.artist, self.title);
+        let mut play = Play::new(
+            self.title.clone(),
+            self.artist.clone(),
+            started as u64,
+            source_id,
+            "ingest".into(),
+        );
+        play.album = self.album.clone();
+        play.duration = self.duration;
+        play
     }
 
     /// Where playback would be by `now`, assuming it kept running.
@@ -186,8 +240,14 @@ const MAX_PLAYHEAD_LAG_SECS: u64 = 12;
 /// In-memory "what's playing right now", keyed by user. Shared by the HTTP
 /// handlers and the poll engine, so it lives behind its own `Arc` rather than
 /// inside `AppState` (the engine never sees `AppState`).
+/// Skips awaiting a verdict, and the deck itself. Two locks rather than one
+/// struct because they are taken independently and the deck is read on every
+/// browser poll.
 #[derive(Clone, Default)]
-pub struct NowPlayingRegistry(Arc<RwLock<HashMap<i64, NowPlaying>>>);
+pub struct NowPlayingRegistry(
+    Arc<RwLock<HashMap<i64, NowPlaying>>>,
+    Arc<RwLock<Vec<(i64, PendingSkip)>>>,
+);
 
 impl NowPlayingRegistry {
     /// Record what this user is playing. Returns **true when the track itself
@@ -236,8 +296,82 @@ impl NowPlayingRegistry {
             }
         }
 
+        // A track leaving the deck with nothing banked for it is a skip —
+        // **but only for a pushing source**. A polled source's own state
+        // machine sees the item change directly and reports it with a real
+        // playhead (`SessionTracker::observe`), so recording it here as well
+        // would file every Plex and Jellyfin skip twice.
+        if changed && np.source == "ingest" {
+            if let Some(prev) = previous {
+                if !prev.banked {
+                    let bound = prev.position_at(np.updated_at);
+                    if let Ok(mut pending) = self.1.write() {
+                        pending.push((
+                            user_id,
+                            PendingSkip {
+                                play: prev.to_play(),
+                                // Only a reported playhead is worth storing.
+                                // Wall-clock arithmetic is a bound, and writing
+                                // it into `listened_ms` would state a guess as a
+                                // measurement — the exact thing `Progress` was
+                                // introduced to stop.
+                                listened_secs: prev.position_known.then_some(bound),
+                                bound_secs: bound,
+                                duration: prev.duration,
+                                displaced_at: np.updated_at,
+                            },
+                        ));
+                    }
+                }
+            }
+        }
+
         map.insert(user_id, np);
         changed
+    }
+
+    /// Note that a real listen for what is on the deck has been submitted.
+    ///
+    /// Called when a listen is stored, so the track it describes is not later
+    /// mistaken for one the listener walked out on. Matching is on the same
+    /// three fields `set` compares, so it agrees with what counts as a change.
+    pub fn mark_banked(&self, user_id: i64, title: &str, artist: &str) {
+        if let Ok(mut map) = self.0.write() {
+            if let Some(np) = map.get_mut(&user_id) {
+                if np.title == title && np.artist == artist {
+                    np.banked = true;
+                }
+            }
+        }
+    }
+
+    /// Withdraw a pending skip because its listen turned up after all.
+    ///
+    /// The other half of `mark_banked`, and it is needed because the two
+    /// orderings are both legal: a client may announce the next track before
+    /// sending the scrobble for the last one, in which case the displacement
+    /// has already been recorded by the time the listen arrives.
+    pub fn cancel_pending_skip(&self, user_id: i64, title: &str, artist: &str) {
+        if let Ok(mut pending) = self.1.write() {
+            pending.retain(|(uid, p)| {
+                !(*uid == user_id && p.play.title == title && p.play.artist == artist)
+            });
+        }
+    }
+
+    /// Take the skips that have waited out the grace period.
+    ///
+    /// The delay is the whole mechanism: it is how long a late scrobble has to
+    /// arrive and cancel the verdict. Removed as they are taken, so a caller
+    /// that fails to write one loses a skip rather than writing it forever.
+    pub fn take_due_skips(&self, now: i64, grace_secs: i64) -> Vec<(i64, PendingSkip)> {
+        let Ok(mut pending) = self.1.write() else {
+            return Vec::new();
+        };
+        let (due, waiting) =
+            pending.drain(..).partition(|(_, p)| now - p.displaced_at >= grace_secs);
+        *pending = waiting;
+        due
     }
 
     /// Drop every entry reported by `source`. The poll engine calls this when a
@@ -311,6 +445,92 @@ pub fn create_now_playing_router() -> Router<Arc<AppState>> {
 mod tests {
     use super::*;
 
+    /// A track pushed off the deck with nothing banked for it is a skip.
+    #[test]
+    fn displacing_an_unbanked_ingest_track_queues_a_skip() {
+        let reg = NowPlayingRegistry::default();
+        let mut first = np("Xtal", "ingest");
+        first.progress = 20;
+        reg.set(1, first);
+        reg.set(1, np("Ageispolis", "ingest"));
+
+        let due = reg.take_due_skips(now_secs() as i64 + 1000, 90);
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].1.play.title, "Xtal");
+        assert_eq!(due[0].1.listened_secs, Some(20));
+    }
+
+    /// A track whose listen was submitted is finished, not abandoned.
+    ///
+    /// A client that scrobbles at end-of-track sends the listen and *then*
+    /// announces the next one. Without `mark_banked` every completed track in
+    /// everyone's history would be filed as a skip.
+    #[test]
+    fn a_banked_track_is_not_a_skip_when_the_next_one_starts() {
+        let reg = NowPlayingRegistry::default();
+        reg.set(1, np("Xtal", "ingest"));
+        reg.mark_banked(1, "Xtal", "Aphex Twin");
+        reg.set(1, np("Ageispolis", "ingest"));
+
+        assert!(reg.take_due_skips(now_secs() as i64 + 1000, 90).is_empty());
+    }
+
+    /// The other ordering: the scrobble arrives *after* the next track was
+    /// announced. Both are legal, so both have to be survivable.
+    #[test]
+    fn a_late_scrobble_withdraws_the_skip() {
+        let reg = NowPlayingRegistry::default();
+        reg.set(1, np("Xtal", "ingest"));
+        reg.set(1, np("Ageispolis", "ingest"));
+        // ... and only now does the listen for the first one turn up.
+        reg.cancel_pending_skip(1, "Xtal", "Aphex Twin");
+
+        assert!(reg.take_due_skips(now_secs() as i64 + 1000, 90).is_empty());
+    }
+
+    /// The grace period is the mechanism, so it has to actually hold them back.
+    #[test]
+    fn a_skip_waits_out_its_grace_period() {
+        let reg = NowPlayingRegistry::default();
+        reg.set(1, np("Xtal", "ingest"));
+        reg.set(1, np("Ageispolis", "ingest"));
+
+        let now = now_secs() as i64;
+        assert!(reg.take_due_skips(now, 90).is_empty(), "not yet — a scrobble may still arrive");
+        assert_eq!(reg.take_due_skips(now + 90, 90).len(), 1);
+        // Taken means taken: a second pass must not write it again.
+        assert!(reg.take_due_skips(now + 1000, 90).is_empty());
+    }
+
+    /// A polled source must not produce skips here.
+    ///
+    /// Plex, Jellyfin, Emby and Roon see the item change in their own session
+    /// state machine and report it there with a real playhead. Recording it
+    /// again on displacement would file every one of their skips twice.
+    #[test]
+    fn a_polled_source_does_not_queue_skips_here() {
+        let reg = NowPlayingRegistry::default();
+        reg.set(1, np("Xtal", "Plex"));
+        reg.set(1, np("Ageispolis", "Plex"));
+
+        assert!(reg.take_due_skips(now_secs() as i64 + 1000, 90).is_empty());
+    }
+
+    /// A skip is stamped when the track *started*, like every other listen.
+    ///
+    /// `scrobbles.timestamp` is start-of-play throughout this application, so a
+    /// skip filed at its displacement time would sit a track length late in the
+    /// history, the session gap and every ranged query.
+    #[test]
+    fn a_skip_is_timestamped_at_the_start_of_the_track() {
+        let mut entry = np("Xtal", "ingest");
+        entry.progress = 45;
+        let play = entry.to_play();
+        assert_eq!(play.timestamp, (entry.updated_at - 45) as u64);
+        assert_eq!(play.album.as_deref(), Some("Selected Ambient Works 85-92"));
+        assert_eq!(play.duration, Some(300));
+    }
+
     fn np(title: &str, source: &str) -> NowPlaying {
         NowPlaying {
             title: title.into(),
@@ -324,6 +544,7 @@ mod tests {
             // client is what is being exercised.
             position_exact: false,
             paused: false,
+            banked: false,
             updated_at: now_secs(),
             source: source.into(),
             listening_context: None,

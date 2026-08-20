@@ -169,6 +169,8 @@ pub struct RoonTrack {
 pub struct RoonZones {
     pub now_playing: Vec<RoonTrack>,
     pub ready_to_scrobble: Vec<RoonTrack>,
+    /// Tracks replaced before they ever counted; `position` is how far in.
+    pub skipped: Vec<RoonTrack>,
 }
 
 pub struct RoonSource {
@@ -422,14 +424,21 @@ impl RoonSource {
             // Roon has no item id, so the tracker's identity key is the track
             // itself — see `source_key`.
             let key = Self::source_key(&track.play);
-            if self.tracker.observe(
-                &zone.zone_id,
-                &key,
-                &track.play.title,
-                position,
-                duration,
-                paused,
-            ) {
+            let observed =
+                self.tracker.observe(&zone.zone_id, &key, &track.play, position, duration, paused);
+
+            // Replaced before it ever counted — a skip, on this same zone and
+            // therefore this same endpoint.
+            if let Some(gone) = observed.abandoned {
+                let mut skipped = track.clone();
+                skipped.play = gone.play;
+                skipped.position = gone.listened_secs;
+                skipped.play.source_id =
+                    format!("{}-skip-{}", Self::source_key(&skipped.play), now_secs());
+                result.skipped.push(skipped);
+            }
+
+            if observed.ready {
                 let mut banked = track.clone();
                 banked.play.source_id = format!("{}-scrobble-{}", key, now_secs());
                 result.ready_to_scrobble.push(banked);

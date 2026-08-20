@@ -553,6 +553,11 @@ struct SessionState {
     rating_key: String,
     last_seen: u64,
     scrobbled: bool,
+    /// The track itself, so the one that just got displaced can be written as a
+    /// skip. Held here because by the time Plex reports a new `ratingKey` the
+    /// old item is gone from the payload — this map is the only thing that
+    /// still knows what was playing a poll ago.
+    track: PlexTrack,
     /// Previous playhead, in ms. A track on repeat keeps the same `sessionKey`
     /// *and* the same `ratingKey`, so the only evidence that it started over is
     /// the playhead jumping backwards — see `process_live_track`.
@@ -630,6 +635,9 @@ const HISTORY_SUPPRESS_SECS: u64 = 30 * 60;
 pub struct SessionResult {
     pub now_playing: Vec<PlexTrack>,
     pub ready_to_scrobble: Vec<PlexTrack>,
+    /// Tracks replaced before they ever counted. `view_offset` is how far in
+    /// the listener got, which is the half that makes a skip mean anything.
+    pub skipped: Vec<PlexTrack>,
 }
 
 impl PlexSource {
@@ -1257,6 +1265,16 @@ impl PlexSource {
                     "Track changed in session {}: {} -> {}",
                     session_key, state.rating_key, rating_key
                 );
+                // Replaced before it ever counted: the listener moved on from
+                // it deliberately. A track that *did* cross is already banked
+                // and is simply over. Same rule as `SessionTracker`, which the
+                // other session sources share — this is Plex's own copy of that
+                // state machine, so it needs its own copy of the rule.
+                if !state.scrobbled {
+                    let mut gone = state.track.clone();
+                    gone.view_offset = Some(state.last_offset);
+                    result.skipped.push(gone);
+                }
                 self.session_states.remove(&session_key);
             }
         }
@@ -1272,8 +1290,10 @@ impl PlexSource {
                     last_seen: now,
                     scrobbled: false,
                     last_offset: view_offset,
+                    track: track.clone(),
                 });
             state.last_seen = now;
+            state.track = track.clone();
 
             // A track on repeat is invisible to the `rating_key` check above:
             // Plex keeps the same session *and* the same item, so `scrobbled`
@@ -1642,6 +1662,53 @@ mod tests {
             history_key: None,
             player: None,
         }
+    }
+
+    /// A track dropped before it counted is a skip, and says how far in.
+    ///
+    /// Plex keeps its own copy of the session state machine rather than using
+    /// `SessionTracker`, so it needs its own copy of this rule — and its own
+    /// test, because the two can drift without anything erroring.
+    #[tokio::test]
+    async fn a_track_dropped_before_the_threshold_is_recorded_as_a_skip() {
+        let mut src = PlexSource::new("http://localhost:32400".into(), "t".into());
+
+        // Twenty seconds into a five-minute track, then the listener moves on.
+        let mut r = SessionResult::default();
+        src.process_live_track(track(20_000), true, &mut r).await;
+        assert!(r.skipped.is_empty(), "nothing has been displaced yet");
+
+        let mut next = track(0);
+        next.rating_key = "rk2".into();
+        next.title = "Ageispolis".into();
+        let mut r = SessionResult::default();
+        src.process_live_track(next, true, &mut r).await;
+
+        assert_eq!(r.skipped.len(), 1, "the displaced track is a skip");
+        assert_eq!(r.skipped[0].title, "Xtal");
+        assert_eq!(
+            r.skipped[0].view_offset,
+            Some(20_000),
+            "how far in they got, not where the new track is"
+        );
+        assert!(r.ready_to_scrobble.is_empty());
+    }
+
+    /// A track that crossed the threshold is over, not skipped — otherwise
+    /// every completed track in a queue would be filed as one.
+    #[tokio::test]
+    async fn a_banked_plex_track_is_not_also_a_skip() {
+        let mut src = PlexSource::new("http://localhost:32400".into(), "t".into());
+
+        let mut r = SessionResult::default();
+        src.process_live_track(track(160_000), true, &mut r).await;
+        assert_eq!(r.ready_to_scrobble.len(), 1);
+
+        let mut next = track(0);
+        next.rating_key = "rk2".into();
+        let mut r = SessionResult::default();
+        src.process_live_track(next, true, &mut r).await;
+        assert!(r.skipped.is_empty(), "a banked listen is over, not abandoned");
     }
 
     /// The deck must keep reporting a track after it has been banked for

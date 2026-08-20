@@ -465,11 +465,13 @@ pub async fn submit_listens(
             // Both dedup rules are read-only, so the preview can answer the
             // question a client most often has — "will this be swallowed?" —
             // rather than making them submit and find out.
-            let duplicate =
-                matches!(
-                    state.db.exists(user.user_id, &play.source_id, &play.source_name).await,
-                    Ok(true)
-                ) || matches!(state.db.fuzzy_exists(user.user_id, &play).await, Ok(true));
+            let duplicate = matches!(
+                state.db.exists(user.user_id, &play.source_id, &play.source_name).await,
+                Ok(true)
+            ) || matches!(
+                state.db.fuzzy_exists(user.user_id, &play, disposition.skipped).await,
+                Ok(true)
+            );
 
             previews.push(DryRunListen {
                 index,
@@ -596,6 +598,22 @@ pub async fn submit_listens(
                     .await
                 {
                     Ok(true) => {
+                        // This track is accounted for, so it is not one the
+                        // listener walked out on. Both halves are needed
+                        // because a client may send the scrobble either side of
+                        // announcing the next track, and both orderings are
+                        // legal: `mark_banked` covers the scrobble arriving
+                        // first, `cancel_pending_skip` the displacement having
+                        // already been recorded.
+                        if !disposition.skipped {
+                            state.now_playing.mark_banked(user.user_id, &play.title, &play.artist);
+                            state.now_playing.cancel_pending_skip(
+                                user.user_id,
+                                &play.title,
+                                &play.artist,
+                            );
+                        }
+
                         // What the client saw of the playing itself. Written
                         // separately, and skipped entirely when the client said
                         // none of it — which is every client until one is built
@@ -633,26 +651,42 @@ pub async fn submit_listens(
                         // maintained `sessions.track_count` since Phase 2 while
                         // every `scrobbles.session_id` stayed NULL, so the
                         // sessions existed but had no contents.
+                        //
+                        // **A skip is not part of a session**, and this was the
+                        // one path that put one there. `rebuild_sessions`
+                        // filters `skipped = FALSE`, so a client-submitted skip
+                        // got a `session_id` here and silently lost it at the
+                        // next rebuild — the session's `track_count` and
+                        // `total_duration` disagreeing with themselves either
+                        // side of that. It mattered little while skips arrived
+                        // only from imports, which never take this path; live
+                        // sources write them now.
                         let dur = play.duration.unwrap_or(180) as i64;
-                        if let Ok(session_id) = state
-                            .db
-                            .assign_session(
-                                user.user_id,
-                                timestamp,
-                                dur,
-                                device_id,
-                                chain_id,
-                                quality.quality_score,
-                                listening_context.as_deref().unwrap_or("unknown"),
-                                1800,
-                                token_id,
-                            )
-                            .await
-                        {
-                            let _ = state
+                        if !disposition.skipped {
+                            if let Ok(session_id) = state
                                 .db
-                                .link_scrobble_session(user.user_id, &play.source_id, session_id)
-                                .await;
+                                .assign_session(
+                                    user.user_id,
+                                    timestamp,
+                                    dur,
+                                    device_id,
+                                    chain_id,
+                                    quality.quality_score,
+                                    listening_context.as_deref().unwrap_or("unknown"),
+                                    1800,
+                                    token_id,
+                                )
+                                .await
+                            {
+                                let _ = state
+                                    .db
+                                    .link_scrobble_session(
+                                        user.user_id,
+                                        &play.source_id,
+                                        session_id,
+                                    )
+                                    .await;
+                            }
                         }
 
                         // Chain hours used to be accumulated here, and *only*
