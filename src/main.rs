@@ -20,6 +20,7 @@ mod server;
 mod sinks;
 mod sources;
 mod spotify;
+mod tidal;
 mod web_assets;
 
 use std::sync::Arc;

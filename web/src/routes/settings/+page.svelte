@@ -766,6 +766,47 @@
 			const r = await api.getConnections();
 			connections = r.connections;
 		} catch { /* optional */ }
+		try {
+			const t = await api.tidalStatus();
+			tidalConfigured = t.configured;
+			tidalConnected = t.connected;
+		} catch { /* optional */ }
+	}
+
+	// TIDAL. `configured` is the instance's app registration, `connected` this
+	// user's account — an instance with no client id cannot offer the button at
+	// all, which is a different thing from nobody having linked an account yet.
+	let tidalConfigured = false;
+	let tidalConnected = false;
+	let tidalBusy = false;
+	let tidalError = '';
+
+	async function connectTidal() {
+		tidalError = '';
+		tidalBusy = true;
+		try {
+			const { authorize_url } = await api.tidalConnect();
+			// A new tab rather than a redirect, so the settings page keeps its
+			// state — the same shape the Last.fm connect flow uses.
+			window.open(authorize_url, '_blank', 'noopener');
+		} catch (e) {
+			tidalError = e instanceof Error ? e.message : String(e);
+		} finally {
+			tidalBusy = false;
+		}
+	}
+
+	async function disconnectTidal() {
+		tidalError = '';
+		tidalBusy = true;
+		try {
+			await api.tidalDisconnect();
+			tidalConnected = false;
+		} catch (e) {
+			tidalError = e instanceof Error ? e.message : String(e);
+		} finally {
+			tidalBusy = false;
+		}
 	}
 	async function connectLB() {
 		connError = '';
@@ -1356,6 +1397,44 @@
 		{/if}
 
 		{#if section === 'connections'}
+			<div class="panel" style="border-radius:22px;padding:24px;margin-bottom:18px;">
+				<h3 class="h-display" style="font-size:19px;margin-bottom:4px;">TIDAL</h3>
+				<p style="font-size:13px;color:var(--td-muted);margin:0 0 14px;">
+					Somewhere to send a playlist. Tapedeck matches each track against
+					TIDAL's catalogue and creates the playlist on your account —
+					<strong>unlisted</strong>, never public. It does not read your TIDAL
+					listening, and nothing is forwarded here.
+				</p>
+				{#if !tidalConfigured}
+					<p style="font-size:12.5px;color:var(--td-muted-2);margin:0;">
+						Not configured on this server. Register an app at
+						<code>developer.tidal.com</code>, add
+						<code>{origin}/api/v1/tidal/callback</code> as a redirect URI, and set
+						<code>TAPEDECK_TIDAL_CLIENT_ID</code> and
+						<code>TAPEDECK_TIDAL_CLIENT_SECRET</code>.
+					</p>
+				{:else}
+					<div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;">
+						{#if tidalConnected}
+							<span style="font-size:13px;color:var(--td-accent);">Connected</span>
+							<button class="btn btn-secondary" on:click={disconnectTidal} disabled={tidalBusy}>
+								Disconnect
+							</button>
+						{:else}
+							<button class="btn btn-secondary" on:click={connectTidal} disabled={tidalBusy}>
+								{tidalBusy ? 'Opening…' : 'Connect TIDAL'}
+							</button>
+							<span style="font-size:12.5px;color:var(--td-muted-2);">
+								Opens TIDAL in a new tab. Come back here when it sends you back.
+							</span>
+						{/if}
+					</div>
+					{#if tidalError}
+						<p style="font-size:12.5px;color:var(--td-love);margin:10px 0 0;">{tidalError}</p>
+					{/if}
+				{/if}
+			</div>
+
 			{#if isAdmin}
 				<div class="panel" style="border-radius:22px;padding:24px;margin-bottom:18px;">
 					<h3 class="h-display" style="font-size:19px;margin-bottom:4px;">Discogs</h3>

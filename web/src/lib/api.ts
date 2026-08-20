@@ -1442,6 +1442,22 @@ class TapedeckAPI {
 		return this.post(`/api/v1/connections/${service}/complete`, { token });
 	}
 
+	/**
+	 * TIDAL is connected over OAuth rather than with a pasted token, so this is
+	 * two steps: ask for the URL, open it, and the server's callback finishes
+	 * the job. `configured` is about the instance (has the operator registered
+	 * an app?), `connected` about this user.
+	 */
+	async tidalStatus(): Promise<{ configured: boolean; connected: boolean }> {
+		return this.get('/api/v1/tidal/status');
+	}
+	async tidalConnect(): Promise<{ authorize_url: string }> {
+		return this.post('/api/v1/tidal/connect');
+	}
+	async tidalDisconnect(): Promise<{ disconnected: boolean }> {
+		return this.request('DELETE', '/api/v1/tidal/disconnect');
+	}
+
 	// ── Import ──
 	async importListenBrainz(username: string, token?: string): Promise<{ job_id: string }> {
 		return this.post('/api/v1/import/listenbrainz', { username, token });

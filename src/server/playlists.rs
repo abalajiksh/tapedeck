@@ -106,6 +106,16 @@ fn build_target(source: &UserSource) -> Result<Box<dyn PlaylistTarget>, String> 
     }
 }
 
+/// How a TIDAL target is addressed.
+///
+/// Every other target is a row in `user_sources` and is named by its id. TIDAL
+/// is a *connection*, not a source — no URL, an expiring credential, and
+/// write-only — so it has no such row. A reserved negative id lets it share the
+/// existing `source_id` shape rather than making the endpoint, the MCP tool,
+/// the spec and the UI all learn a second way to name a target. Row ids come
+/// from `AUTOINCREMENT` and are always positive, so this can never collide.
+pub const TIDAL_TARGET_ID: i64 = -1;
+
 fn target_view(s: &UserSource, protocol: &str) -> serde_json::Value {
     serde_json::json!({
         "source_id": s.id,
@@ -135,7 +145,7 @@ async fn list_targets(State(state): State<Arc<AppState>>, user: AuthUser) -> imp
 /// source at all — and both callers say so rather than showing a button or a
 /// tool that cannot work.
 pub async fn targets_for(state: &AppState, user_id: i64) -> Vec<serde_json::Value> {
-    match state.db.list_sources_for_user(user_id).await {
+    let mut targets: Vec<serde_json::Value> = match state.db.list_sources_for_user(user_id).await {
         Ok(rows) => rows
             .iter()
             .filter(|s| s.enabled)
@@ -145,7 +155,22 @@ pub async fn targets_for(state: &AppState, user_id: i64) -> Vec<serde_json::Valu
             warn!("Listing playlist targets failed: {e}");
             Vec::new()
         }
+    };
+
+    // Offered only when the account is actually connected — the same call the
+    // rest of this list makes. A button that cannot work is worse than no
+    // button, which is why the endpoint returns an empty list rather than a
+    // disabled entry.
+    if crate::server::tidal::credentials(state, user_id).await.is_some() {
+        targets.push(serde_json::json!({
+            "source_id": TIDAL_TARGET_ID,
+            "kind": "tidal",
+            "protocol": "TIDAL",
+            "label": "TIDAL",
+            "account": null,
+        }));
     }
+    targets
 }
 
 #[derive(Deserialize)]
@@ -217,22 +242,54 @@ pub async fn push_tracks(
         return Err(fail(400, format!("That's more than {MAX_TRACKS} tracks")));
     }
 
-    // Scoped before anything else: sources are per user, and an id from someone
-    // else's row would push through their credentials.
-    let source = match state.db.get_source(user_id, source_id).await {
-        Ok(Some(s)) => s,
-        Ok(None) => return Err(fail(404, "No such source".into())),
-        Err(e) => return Err(fail(500, e.to_string())),
-    };
-    if !source.enabled {
-        return Err(fail(400, "That source is switched off".into()));
-    }
-    let Some(protocol) = protocol_for(&source.kind) else {
-        return Err(fail(400, format!("A {} source cannot receive a playlist", source.kind)));
-    };
-    let target = match build_target(&source) {
-        Ok(t) => t,
-        Err(msg) => return Err(fail(400, msg)),
+    // TIDAL is a connection rather than a source, so it is resolved before the
+    // `user_sources` lookup that every other target goes through. Held as an
+    // `Arc` as well as a trait object because a push can outlive its access
+    // token, and the refreshed pair has to be persisted afterwards.
+    let mut tidal_handle: Option<std::sync::Arc<crate::tidal::TidalClient>> = None;
+    // Built inside whichever branch resolves the target, so the response can
+    // describe it without the source row being in scope afterwards.
+    let mut target_desc = serde_json::json!({
+        "source_id": TIDAL_TARGET_ID,
+        "kind": "tidal",
+        "protocol": "TIDAL",
+        "label": "TIDAL",
+        "account": null,
+    });
+    let (protocol, target): (&str, Box<dyn playlists::PlaylistTarget>) = if source_id
+        == TIDAL_TARGET_ID
+    {
+        let Some(app) = crate::tidal::TidalApp::from_env() else {
+            return Err(fail(501, "TIDAL is not configured on this instance".into()));
+        };
+        let Some(creds) = crate::server::tidal::credentials(state, user_id).await else {
+            return Err(fail(400, "No TIDAL account is connected".into()));
+        };
+        let client = crate::tidal::TidalClient::new(app, creds)
+            .map_err(|e| fail(500, e))
+            .map(std::sync::Arc::new)?;
+        tidal_handle = Some(client.clone());
+        ("TIDAL", Box::new(client))
+    } else {
+        // Scoped before anything else: sources are per user, and an id from
+        // someone else's row would push through their credentials.
+        let source = match state.db.get_source(user_id, source_id).await {
+            Ok(Some(s)) => s,
+            Ok(None) => return Err(fail(404, "No such source".into())),
+            Err(e) => return Err(fail(500, e.to_string())),
+        };
+        if !source.enabled {
+            return Err(fail(400, "That source is switched off".into()));
+        }
+        let Some(protocol) = protocol_for(&source.kind) else {
+            return Err(fail(400, format!("A {} source cannot receive a playlist", source.kind)));
+        };
+        let target = match build_target(&source) {
+            Ok(t) => t,
+            Err(msg) => return Err(fail(400, msg)),
+        };
+        target_desc = target_view(&source, protocol);
+        (protocol, target)
     };
     // Sequential on purpose, for the same reason the Rediscovery queries are:
     // this is someone's Raspberry Pi, and firing a hundred searches at it at
@@ -252,7 +309,7 @@ pub async fn push_tracks(
                 // One failed search is a miss; a server that has stopped
                 // answering is a failed push. Remember the first reason so the
                 // caller gets it rather than "nothing matched".
-                warn!("Playlist push: search failed on {}: {e}", source.url);
+                warn!("Playlist push: search failed on {protocol}: {e}");
                 search_error.get_or_insert(e);
                 missing.push(want);
             }
@@ -275,14 +332,30 @@ pub async fn push_tracks(
         });
     }
 
-    match target.create_playlist(&name, &ids).await {
+    let created = target.create_playlist(&name, &ids).await;
+
+    // A push makes one request per track, so a token can legitimately expire
+    // partway through one. The client refreshes itself and hands the new pair
+    // back here, because it cannot write to the database — `Database` owns the
+    // encryption and ciphertext never leaves `db.rs`. Persisted whether or not
+    // the playlist itself succeeded: the old token is dead either way, and
+    // dropping the new one would make the next push fail for no reason.
+    if let Some(handle) = tidal_handle {
+        if let Some(fresh) = handle.take_refreshed() {
+            if let Err(e) = crate::server::tidal::store(state, user_id, &fresh, None).await {
+                warn!("Could not persist the refreshed TIDAL token: {e}");
+            }
+        }
+    }
+
+    match created {
         Ok(playlist_id) => {
             info!("📀 Pushed \"{}\" to {} — {}/{} tracks", name, protocol, ids.len(), tracks.len());
             Ok(serde_json::json!({
                 "playlist_id": playlist_id,
                 "name": name,
                 "protocol": protocol,
-                "target": target_view(&source, protocol),
+                "target": target_desc,
                 "requested": tracks.len(),
                 "matched": ids.len(),
                 "missing": missing_json,

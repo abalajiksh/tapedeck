@@ -26,7 +26,7 @@ openapi: 3.1.0
 
 info:
   title: Tapedeck
-  version: 0.72.0
+  version: 0.73.0
   summary: Self-hosted scrobbler and listening journal.
   description: |
     Tapedeck ingests listens, enriches them with MusicBrainz metadata, stores
@@ -1885,6 +1885,88 @@ paths:
                   artists: { type: array, items: { type: object, additionalProperties: true } }
                   albums: { type: array, items: { type: object, additionalProperties: true } }
                   tracks: { type: array, items: { type: object, additionalProperties: true } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /api/v1/tidal/status:
+    get:
+      tags: [Connections]
+      summary: Whether TIDAL is configured and connected.
+      description: |
+        Session-only. `configured` is about the *instance* — whether the
+        operator registered an app at developer.tidal.com and set
+        `TAPEDECK_TIDAL_CLIENT_ID` — and `connected` is about this user. They are
+        separate because an instance that cannot offer the button at all is a
+        different thing from an account nobody has linked yet.
+      responses:
+        '200':
+          description: OK.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  configured: { type: boolean }
+                  connected: { type: boolean }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /api/v1/tidal/connect:
+    post:
+      tags: [Connections]
+      summary: Begin connecting a TIDAL account.
+      description: |
+        Session-only. Returns the URL to open. Authorization Code + PKCE with
+        `S256`; the verifier is held in memory for ten minutes and the `state`
+        token is single-use.
+
+        Scopes asked for are the minimum a push needs — `playlists.write`,
+        `playlists.read`, `search.read`, `user.read` — and no `collection.*` or
+        `playback`.
+      responses:
+        '200':
+          description: OK.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  authorize_url: { type: string }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '501': { description: TIDAL is not configured on this instance. }
+
+  /api/v1/tidal/callback:
+    get:
+      tags: [Connections]
+      summary: Where TIDAL sends the browser back.
+      description: |
+        **Takes no session.** The owner comes from the single-use `state` token
+        minted at connect time, which is also the CSRF protection; requiring a
+        cookie here would additionally depend on it surviving a cross-site
+        navigation from `login.tidal.com`. Redirects to Settings either way —
+        the user declining is a normal outcome, not an error.
+      parameters:
+        - { name: code, in: query, schema: { type: string } }
+        - { name: state, in: query, schema: { type: string } }
+        - { name: error, in: query, schema: { type: string } }
+        - { name: error_description, in: query, schema: { type: string } }
+      responses:
+        '303': { description: Back to Settings. }
+        '400': { description: The sign-in expired, was already used, or carried no code. }
+        '502': { description: TIDAL refused the token exchange. }
+
+  /api/v1/tidal/disconnect:
+    delete:
+      tags: [Connections]
+      summary: Forget the connected TIDAL account.
+      description: Session-only.
+      responses:
+        '200':
+          description: OK.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  disconnected: { type: boolean }
         '401': { $ref: '#/components/responses/Unauthorized' }
 
   /api/v1/skips:

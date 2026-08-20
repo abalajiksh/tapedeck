@@ -28,6 +28,7 @@ pub mod reports;
 pub mod scrobbles;
 pub mod sessions;
 mod sources;
+pub mod tidal;
 mod users;
 
 use std::sync::Arc;
@@ -125,6 +126,7 @@ pub fn build_app(state: Arc<AppState>) -> Router {
         .merge(crate_shelf::create_crate_router())
         .merge(mcp::create_mcp_router())
         .merge(oauth::create_oauth_router())
+        .merge(tidal::create_tidal_router())
         // The spec describes *this* instance at *this* version — the one
         // thing a separately hosted docs site cannot do.
         .route("/api/openapi.yaml", axum::routing::get(crate::openapi::spec))
