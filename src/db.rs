@@ -6564,6 +6564,21 @@ impl Database {
         Ok(res.rows_affected() > 0)
     }
 
+    /// Drop every user's connection to one service.
+    ///
+    /// Used when the operator changes an app registration: the stored access and
+    /// refresh tokens were issued *by the old app* and mean nothing to a new
+    /// one, so leaving them would offer people a connection that silently fails
+    /// on next use. Deliberately server-wide and not scoped to a user — the
+    /// registration it invalidates is server-wide too.
+    pub async fn delete_connections_for_service(&self, service: &str) -> Result<u64, sqlx::Error> {
+        let res = sqlx::query("DELETE FROM user_connections WHERE service = ?")
+            .bind(service)
+            .execute(&self.pool)
+            .await?;
+        Ok(res.rows_affected())
+    }
+
     /// Public-facing list: service + connected account only, never credentials.
     pub async fn list_connections(
         &self,

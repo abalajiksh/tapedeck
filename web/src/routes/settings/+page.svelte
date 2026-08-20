@@ -771,6 +771,7 @@
 			tidalConfigured = t.configured;
 			tidalConnected = t.connected;
 		} catch { /* optional */ }
+		await loadTidalSettings();
 	}
 
 	// TIDAL. `configured` is the instance's app registration, `connected` this
@@ -780,6 +781,68 @@
 	let tidalConnected = false;
 	let tidalBusy = false;
 	let tidalError = '';
+	// The server-wide registration (admin). The credential is never sent back,
+	// so these start empty and a placeholder says whether one is stored.
+	let tidalStored = false;
+	let tidalHasSecret = false;
+	let tidalFromEnv = false;
+	let tidalRedirect = '';
+	let tidalClientId = '';
+	let tidalClientSecret = '';
+	let tidalSaving = false;
+	let tidalSaved = '';
+
+	async function loadTidalSettings() {
+		if (!isAdmin) return;
+		try {
+			const t = await api.tidalSettings();
+			tidalStored = t.stored;
+			tidalHasSecret = t.has_secret;
+			tidalFromEnv = t.from_env;
+			tidalRedirect = t.redirect_uri;
+		} catch { /* optional */ }
+	}
+
+	async function saveTidalApp() {
+		tidalError = '';
+		tidalSaved = '';
+		tidalSaving = true;
+		try {
+			// Only send what was typed: an untouched field must not clear the
+			// stored value it is standing in for.
+			const body: { client_id?: string; client_secret?: string } = {};
+			if (tidalClientId.trim() || !tidalStored) body.client_id = tidalClientId.trim();
+			if (tidalClientSecret.trim()) body.client_secret = tidalClientSecret.trim();
+			const r = await api.setTidalSettings(body);
+			tidalConfigured = r.configured;
+			tidalClientId = '';
+			tidalClientSecret = '';
+			tidalSaved = 'Saved.';
+			await loadTidalSettings();
+			await loadConnections();
+		} catch (e) {
+			tidalError = e instanceof Error ? e.message : String(e);
+		} finally {
+			tidalSaving = false;
+		}
+	}
+
+	async function clearTidalApp() {
+		tidalError = '';
+		tidalSaving = true;
+		try {
+			await api.setTidalSettings({ client_id: '', client_secret: '' });
+			tidalClientId = '';
+			tidalClientSecret = '';
+			tidalSaved = 'Cleared.';
+			await loadTidalSettings();
+			await loadConnections();
+		} catch (e) {
+			tidalError = e instanceof Error ? e.message : String(e);
+		} finally {
+			tidalSaving = false;
+		}
+	}
 
 	async function connectTidal() {
 		tidalError = '';
@@ -1405,13 +1468,54 @@
 					<strong>unlisted</strong>, never public. It does not read your TIDAL
 					listening, and nothing is forwarded here.
 				</p>
+				{#if isAdmin}
+					<!-- The registration is the server's, not this user's: everyone on
+					     the instance connects their own account through the one app. -->
+					<div style="border:1px solid var(--td-border);border-radius:14px;padding:14px;margin-bottom:14px;">
+						<p style="font-size:12.5px;color:var(--td-muted);margin:0 0 10px;">
+							<strong>Server setup.</strong> Register an app at
+							<code>developer.tidal.com</code> and add this exact redirect URI:
+						</p>
+						<p style="font-size:12px;margin:0 0 12px;">
+							<code>{tidalRedirect || origin + '/api/v1/tidal/callback'}</code>
+						</p>
+						<div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;">
+							<input class="input" type="text" bind:value={tidalClientId} style="max-width:220px;"
+								placeholder={tidalStored ? '••••••  (client id stored)' : 'Client ID'}>
+							<input class="input" type="password" bind:value={tidalClientSecret} style="max-width:220px;"
+								placeholder={tidalHasSecret ? '••••••  (secret stored)' : 'Client secret'}>
+							<button class="btn btn-secondary" on:click={saveTidalApp} disabled={tidalSaving}>
+								{tidalSaving ? 'Saving…' : 'Save'}
+							</button>
+							{#if tidalStored}
+								<button class="btn btn-secondary" on:click={clearTidalApp} disabled={tidalSaving}>
+									Clear
+								</button>
+							{/if}
+						</div>
+						{#if tidalSaved}
+							<p style="font-size:12.5px;color:var(--td-accent);margin:10px 0 0;">{tidalSaved}</p>
+						{/if}
+						{#if tidalFromEnv && !tidalStored}
+							<p style="font-size:12.5px;color:var(--td-muted-2);margin:10px 0 0;">
+								Currently using the client id from the environment. Saving one here
+								takes precedence over it.
+							</p>
+						{/if}
+						{#if tidalStored}
+							<p style="font-size:12.5px;color:var(--td-muted-2);margin:10px 0 0;">
+								Changing the client id disconnects every account on this instance —
+								tokens issued by the old app do not work with a new one.
+							</p>
+						{/if}
+					</div>
+				{/if}
+
 				{#if !tidalConfigured}
 					<p style="font-size:12.5px;color:var(--td-muted-2);margin:0;">
-						Not configured on this server. Register an app at
-						<code>developer.tidal.com</code>, add
-						<code>{origin}/api/v1/tidal/callback</code> as a redirect URI, and set
-						<code>TAPEDECK_TIDAL_CLIENT_ID</code> and
-						<code>TAPEDECK_TIDAL_CLIENT_SECRET</code>.
+						{isAdmin
+							? 'Add a client ID above to switch this on.'
+							: 'Not configured on this server yet — an admin needs to register an app first.'}
 					</p>
 				{:else}
 					<div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;">

@@ -1457,6 +1457,22 @@ class TapedeckAPI {
 	async tidalDisconnect(): Promise<{ disconnected: boolean }> {
 		return this.request('DELETE', '/api/v1/tidal/disconnect');
 	}
+	/** Admin: the server-wide app registration. Never returns the credential. */
+	async tidalSettings(): Promise<{
+		configured: boolean;
+		stored: boolean;
+		has_secret: boolean;
+		from_env: boolean;
+		redirect_uri: string;
+	}> {
+		return this.get('/api/v1/tidal/settings');
+	}
+	async setTidalSettings(body: {
+		client_id?: string;
+		client_secret?: string;
+	}): Promise<{ configured: boolean }> {
+		return this.request('PUT', '/api/v1/tidal/settings', body);
+	}
 
 	// ── Import ──
 	async importListenBrainz(username: string, token?: string): Promise<{ job_id: string }> {

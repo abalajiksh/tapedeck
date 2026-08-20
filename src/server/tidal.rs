@@ -74,12 +74,12 @@ fn redirect_uri(state: &AppState, headers: &HeaderMap) -> String {
     format!("{}/api/v1/tidal/callback", super::mcp::public_origin(state, headers))
 }
 
-fn app_or_err() -> Result<TidalApp, Box<axum::response::Response>> {
-    TidalApp::from_env().ok_or_else(|| {
+async fn app_or_err(state: &AppState) -> Result<TidalApp, Box<axum::response::Response>> {
+    TidalApp::resolve(&state.db).await.ok_or_else(|| {
         Box::new(err(
             501,
             "TIDAL is not configured on this instance — set TAPEDECK_TIDAL_CLIENT_ID and \
-             TAPEDECK_TIDAL_CLIENT_SECRET from an app registered at developer.tidal.com",
+             secret in Settings → Connections, from an app registered at developer.tidal.com",
         ))
     })
 }
@@ -94,7 +94,7 @@ async fn status(
     State(state): State<std::sync::Arc<AppState>>,
     user: AuthUser,
 ) -> impl IntoResponse {
-    let configured = TidalApp::from_env().is_some();
+    let configured = TidalApp::resolve(&state.db).await.is_some();
     let connected = state
         .db
         .list_connections(user.user_id)
@@ -115,7 +115,7 @@ async fn connect(
     user: AuthUser,
     headers: HeaderMap,
 ) -> impl IntoResponse {
-    let app = match app_or_err() {
+    let app = match app_or_err(&state).await {
         Ok(a) => a,
         Err(r) => return *r,
     };
@@ -186,7 +186,7 @@ async fn callback(
         return err(400, "That TIDAL sign-in took too long — start again");
     }
 
-    let app = match app_or_err() {
+    let app = match app_or_err(&state).await {
         Ok(a) => a,
         Err(r) => return *r,
     };
@@ -240,10 +240,110 @@ pub async fn credentials(state: &AppState, user_id: i64) -> Option<TidalCredenti
         .and_then(|(_, blob)| serde_json::from_str(&blob).ok())
 }
 
+// ════════════════════════════════════════════════════════════
+//  The app registration (admin, server-wide)
+// ════════════════════════════════════════════════════════════
+
+/// GET /api/v1/tidal/settings — is a registration configured, and from where?
+///
+/// Never returns the credential itself, the same rule source credentials and
+/// the Discogs pair follow. `stored` and `from_env` are reported separately so
+/// the screen can say which one is in effect rather than leaving an operator
+/// wondering why the value they exported is being ignored.
+async fn get_settings(
+    State(state): State<std::sync::Arc<AppState>>,
+    user: AuthUser,
+) -> impl IntoResponse {
+    if !user.is_admin {
+        return err(403, "Admin only");
+    }
+    let from_env = TidalApp::from_env().is_some();
+    let stored = state
+        .db
+        .get_app_setting(tidal::CLIENT_ID_KEY)
+        .await
+        .unwrap_or(None)
+        .is_some_and(|v| !v.trim().is_empty());
+    let has_secret = state
+        .db
+        .get_app_setting(tidal::CLIENT_SECRET_KEY)
+        .await
+        .unwrap_or(None)
+        .is_some_and(|v| !v.trim().is_empty());
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "configured": stored || from_env,
+            "stored": stored,
+            "has_secret": stored && has_secret,
+            "from_env": from_env,
+            // The exact string TIDAL must have registered. Derived here rather
+            // than assembled in the browser so there is one answer, and it is
+            // the same one the flow will actually send.
+            "redirect_uri": format!("{}/api/v1/tidal/callback", state.public_url.trim_end_matches('/')),
+        })),
+    )
+        .into_response()
+}
+
+#[derive(Deserialize)]
+pub struct SettingsUpdate {
+    #[serde(default)]
+    pub client_id: Option<String>,
+    #[serde(default)]
+    pub client_secret: Option<String>,
+}
+
+/// PUT /api/v1/tidal/settings — store the registration.
+///
+/// Each field is written only when present, so saving one does not silently
+/// wipe the other — the rule the Discogs pair already follows. Clearing is an
+/// explicit empty string.
+///
+/// **Changing the registration disconnects every account**, and that is not
+/// tidiness: the stored access and refresh tokens were issued *by the old app*
+/// and are meaningless to a new one, so leaving them would offer people a
+/// connection that silently fails on the next push.
+async fn set_settings(
+    State(state): State<std::sync::Arc<AppState>>,
+    user: AuthUser,
+    Json(body): Json<SettingsUpdate>,
+) -> impl IntoResponse {
+    if !user.is_admin {
+        return err(403, "Admin only");
+    }
+    let before = state.db.get_app_setting(tidal::CLIENT_ID_KEY).await.unwrap_or(None);
+
+    for (key, value) in
+        [(tidal::CLIENT_ID_KEY, &body.client_id), (tidal::CLIENT_SECRET_KEY, &body.client_secret)]
+    {
+        if let Some(v) = value {
+            if let Err(e) = state.db.set_app_setting(key, v.trim()).await {
+                return err(500, e.to_string());
+            }
+        }
+    }
+
+    let after = state.db.get_app_setting(tidal::CLIENT_ID_KEY).await.unwrap_or(None);
+    if before != after {
+        match state.db.delete_connections_for_service(tidal::SERVICE).await {
+            Ok(n) if n > 0 => {
+                info!("TIDAL registration changed — dropped {n} now-invalid connection(s)")
+            }
+            Ok(_) => {}
+            Err(e) => warn!("Could not clear stale TIDAL connections: {e}"),
+        }
+    }
+
+    let configured = TidalApp::resolve(&state.db).await.is_some();
+    (StatusCode::OK, Json(serde_json::json!({ "configured": configured }))).into_response()
+}
+
 pub fn create_tidal_router() -> Router<std::sync::Arc<AppState>> {
     Router::new()
         .route("/api/v1/tidal/status", get(status))
         .route("/api/v1/tidal/connect", post(connect))
         .route("/api/v1/tidal/callback", get(callback))
         .route("/api/v1/tidal/disconnect", axum::routing::delete(disconnect))
+        .route("/api/v1/tidal/settings", get(get_settings).put(set_settings))
 }

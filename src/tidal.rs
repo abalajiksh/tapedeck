@@ -99,7 +99,35 @@ pub struct TidalApp {
     pub client_secret: Option<String>,
 }
 
+/// Where the stored registration lives. Encrypted at rest by `set_app_setting`
+/// like every other credential this application replays, and server-wide rather
+/// than per-user: it is the *operator's* app registration, and every user of the
+/// instance connects their own account through it.
+pub const CLIENT_ID_KEY: &str = "tidal_client_id";
+pub const CLIENT_SECRET_KEY: &str = "tidal_client_secret";
+
 impl TidalApp {
+    /// The registration as configured in Settings, falling back to the
+    /// environment.
+    ///
+    /// **Stored wins over environment**, which is the order Discogs already
+    /// uses: what somebody typed into this instance's own settings screen is a
+    /// more deliberate statement than a variable inherited from a shell.
+    pub async fn resolve(db: &crate::db::Database) -> Option<Self> {
+        let stored_id =
+            db.get_app_setting(CLIENT_ID_KEY).await.ok().flatten().filter(|v| !v.trim().is_empty());
+        if let Some(id) = stored_id {
+            let secret = db
+                .get_app_setting(CLIENT_SECRET_KEY)
+                .await
+                .ok()
+                .flatten()
+                .filter(|v| !v.trim().is_empty());
+            return Some(Self { client_id: id.trim().to_string(), client_secret: secret });
+        }
+        Self::from_env()
+    }
+
     /// Resolution order mirrors Discogs: the house-style name first, then the
     /// bare names TIDAL's own portal uses, which is what people already have
     /// exported when they come to configure this.

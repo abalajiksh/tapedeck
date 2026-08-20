@@ -1887,6 +1887,66 @@ paths:
                   tracks: { type: array, items: { type: object, additionalProperties: true } }
         '401': { $ref: '#/components/responses/Unauthorized' }
 
+  /api/v1/tidal/settings:
+    get:
+      tags: [Connections]
+      summary: The TIDAL app registration for this server.
+      description: |
+        **Admin only.** Never returns the credential itself, the same rule the
+        Discogs pair and every source credential follow. `stored` and `from_env`
+        are reported separately so the screen can say which is in effect rather
+        than leaving an operator wondering why an exported variable is being
+        ignored — a stored value wins.
+
+        `redirect_uri` is the exact string TIDAL must have registered, derived
+        from `PUBLIC_URL` so it is the same one the flow will actually send.
+      responses:
+        '200':
+          description: OK.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  configured: { type: boolean }
+                  stored: { type: boolean }
+                  has_secret: { type: boolean }
+                  from_env: { type: boolean }
+                  redirect_uri: { type: string }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { description: Admin only. }
+    put:
+      tags: [Connections]
+      summary: Store the TIDAL app registration.
+      description: |
+        **Admin only.** Each field is written only when present, so saving one
+        does not wipe the other; clearing is an explicit empty string. Stored
+        encrypted at rest.
+
+        **Changing the client id disconnects every account on the instance** —
+        the stored tokens were issued by the old app and are meaningless to a
+        new one, so keeping them would offer a connection that fails on the next
+        push.
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                client_id: { type: string }
+                client_secret: { type: string }
+      responses:
+        '200':
+          description: OK.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  configured: { type: boolean }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { description: Admin only. }
+
   /api/v1/tidal/status:
     get:
       tags: [Connections]

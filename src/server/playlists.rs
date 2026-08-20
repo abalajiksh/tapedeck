@@ -259,7 +259,7 @@ pub async fn push_tracks(
     let (protocol, target): (&str, Box<dyn playlists::PlaylistTarget>) = if source_id
         == TIDAL_TARGET_ID
     {
-        let Some(app) = crate::tidal::TidalApp::from_env() else {
+        let Some(app) = crate::tidal::TidalApp::resolve(&state.db).await else {
             return Err(fail(501, "TIDAL is not configured on this instance".into()));
         };
         let Some(creds) = crate::server::tidal::credentials(state, user_id).await else {
