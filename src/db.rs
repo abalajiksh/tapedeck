@@ -1305,7 +1305,12 @@ impl Database {
         .execute(&self.pool)
         .await?;
 
-        // **Deliberately no expression indexes on the folded name.** Three were
+        // **Almost no expression indexes on the folded name** — the single
+        // exception is `idx_scrobbles_album_release`, which lives in
+        // `migrate()` because it names a migrated column, and carries the
+        // argument for why it is not a repeat of what follows.
+        //
+        // Three were
         // added in v0.56.0 — `(user_id, LOWER(TRIM(artist)))` and the
         // title/album pairs — because they take a bare `GROUP BY
         // LOWER(TRIM(artist))` from ~50ms to under 10ms on a laptop, and the
@@ -2440,6 +2445,68 @@ impl Database {
         let _ = sqlx::query(
             "CREATE INDEX IF NOT EXISTS idx_scrobbles_session
                  ON scrobbles(session_id) WHERE session_id IS NOT NULL",
+        )
+        .execute(&self.pool)
+        .await;
+        // ── The album page's "whole record" button, and the one expression
+        //    index in this file ──────────────────────────────────────────────
+        //
+        // `album_release_mbid` asks which release a plurality of the listens
+        // claim, folding **both** names in its `WHERE`. That is the
+        // `LOWER(TRIM(` shape recorded three times above, and with nothing able
+        // to serve it the plan was `SEARCH … USING INDEX idx_scrobbles_user_time
+        // (user_id=?)` plus two temp B-trees — a walk of every row the user
+        // has, with a rowid lookup each. On a single-user instance that is the
+        // entire history. Measured on a seeded 50,000-listen database:
+        // **400,247 VDBE steps** per call.
+        //
+        // Reported 2026-08-20: the first click returned Cloudflare's own 502
+        // and the second worked. Nothing was cached at the app level — the
+        // handler stores nothing on purpose — so what was warm the second time
+        // was the OS page cache. A cold pass over the whole history off an SD
+        // card ran past the tunnel's patience; a warm one did not.
+        //
+        // This is the exception to the v0.59.0 note rather than a repeat of it,
+        // for the reason `idx_scrobbles_session` above is: it is a **point
+        // lookup** — one artist, one album, a handful of rows — which that note
+        // names as the workload an index is actually for. Those three lost
+        // because they meant a rowid lookup *per row across the whole history*;
+        // this one seeks straight to one record. 400,247 steps → **37**.
+        //
+        // `mbid_release` is the fourth column so the index *can* cover the
+        // query, but do not lean on that: SQLite 3.51 reports `USING COVERING
+        // INDEX` and the **3.44.0 bundled by libsqlite3-sys 0.27 does not**,
+        // taking the rowid lookups instead. 41 steps against 37 — with the seek
+        // there is almost nothing left to look up. The seek is the fix.
+        //
+        // **`WHERE mbid_release IS NOT NULL` is load-bearing, not a size
+        // trim.** Without it this becomes a net loss exactly as v0.59.0
+        // describes: the planner finds it selective and `top artists` and `top
+        // albums` flip from a sequential `SCAN` to `SEARCH … USING INDEX
+        // (user_id=?)`, a non-covering walk of everything with the random I/O
+        // that costs on this hardware. Verified by building it both ways and
+        // diffing `EXPLAIN QUERY PLAN` over five representative queries — the
+        // partial form leaves every other plan byte-identical, the plain form
+        // changes two. A partial index is only usable when the query's `WHERE`
+        // implies the index's, and no aggregation here filters on
+        // `mbid_release`, so the predicate is what confines this to its one
+        // caller.
+        //
+        // In `migrate()` and not `init()` because it names `mbid_release`, and
+        // `init()` runs first: on a database predating that column the whole
+        // `CREATE INDEX` fails and takes startup with it. That is the v0.61.1
+        // trap — *anything in `init()` referencing a migrated column has the
+        // same ordering problem as the column* — and it was caught here by
+        // `an_existing_database_gains_the_playback_columns`, which is what that
+        // test exists for.
+        //
+        // ~3.2 MB on 50,000 listens. **Still to be confirmed on the Pi**
+        // (`temp/measure-tapedeck.sh`): the step count is hardware-independent
+        // evidence and a laptop's clock is not.
+        let _ = sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_scrobbles_album_release
+                 ON scrobbles(user_id, LOWER(TRIM(artist)), LOWER(TRIM(album)), mbid_release)
+                WHERE mbid_release IS NOT NULL AND TRIM(mbid_release) != ''",
         )
         .execute(&self.pool)
         .await;
@@ -12269,6 +12336,119 @@ mod tests {
 
     fn play(title: &str, artist: &str, ts: u64) -> Play {
         Play::new(title.into(), artist.into(), ts, format!("src-{ts}"), "test".into())
+    }
+
+    /// The album page's "whole record" button must not scan the whole history.
+    ///
+    /// `album_release_mbid` folds both names in its `WHERE`, which no ordinary
+    /// index can serve — so before `idx_scrobbles_album_release` the plan was a
+    /// full pass over every listen the user has. On a Pi with the database on
+    /// an SD card the first click ran long enough for the tunnel to answer
+    /// Cloudflare's own 502, while the second, with the pages warm, was fine.
+    ///
+    /// Asserted on the **plan**, not on a timing, because the timing is a fact
+    /// about the machine running the test and the plan is not — the rule
+    /// v0.58.0 arrived at after a laptop failed to reproduce a Pi regression.
+    /// Nothing about the answer changes when the index is dropped, so a test
+    /// phrased only about the result would keep passing while the endpoint went
+    /// back to being unusable.
+    #[tokio::test]
+    async fn the_whole_record_lookup_seeks_instead_of_scanning() {
+        let db = testdb().await;
+        let uid = db.create_user("ash", None, "pw", "user").await.unwrap();
+        let now = Database::now_secs() as u64;
+
+        // Three listens claiming one release and two claiming another, so the
+        // answer is a plurality rather than whatever happens to come first.
+        for (i, mbid) in ["rel-a", "rel-a", "rel-a", "rel-b", "rel-b"].iter().enumerate() {
+            let mut p = play("Archangel", "Burial", now - 1000 + i as u64);
+            p.album = Some("Untrue".into());
+            p.mbid_release = Some((*mbid).into());
+            db.save_scrobble(
+                uid,
+                &p,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                ListenDisposition::LIVE,
+            )
+            .await
+            .unwrap();
+        }
+
+        // A listen with no release MBID at all is outside the partial index,
+        // and must not become the answer.
+        let mut bare = play("Archangel", "Burial", now - 10);
+        bare.album = Some("Untrue".into());
+        db.save_scrobble(
+            uid,
+            &bare,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            ListenDisposition::LIVE,
+        )
+        .await
+        .unwrap();
+
+        // The spelling is folded, so the caller's casing is not the stored one.
+        let got = db.album_release_mbid(uid, "  burial ", "UNTRUE").await.unwrap();
+        assert_eq!(got.as_deref(), Some("rel-a"), "the plurality release wins");
+
+        async fn plan(db: &Database, sql: &str) -> String {
+            let rows: Vec<(i64, i64, i64, String)> =
+                sqlx::query_as(&format!("EXPLAIN QUERY PLAN {sql}"))
+                    .fetch_all(&db.pool)
+                    .await
+                    .unwrap();
+            rows.into_iter().map(|r| r.3).collect::<Vec<_>>().join(" | ")
+        }
+
+        // The fix itself: a **seek**, not a scan. Deliberately not asserting on
+        // the word "COVERING" — SQLite 3.51 says it and the 3.44 bundled into
+        // the binary does not, and the difference is 41 steps against 37. What
+        // must never come back is `SCAN scrobbles`.
+        let p = plan(
+            &db,
+            "SELECT mbid_release FROM scrobbles
+              WHERE user_id = 1 AND LOWER(TRIM(artist)) = LOWER(TRIM('Burial'))
+                AND LOWER(TRIM(album)) = LOWER(TRIM('Untrue'))
+                AND mbid_release IS NOT NULL AND TRIM(mbid_release) != ''
+              GROUP BY mbid_release ORDER BY COUNT(*) DESC LIMIT 1",
+        )
+        .await;
+        assert!(
+            p.contains("SEARCH scrobbles USING") && p.contains("idx_scrobbles_album_release"),
+            "the whole-record lookup should seek idx_scrobbles_album_release, got: {p}"
+        );
+        assert!(!p.contains("SCAN scrobbles"), "it must not scan the history, got: {p}");
+
+        // And the half that keeps it from becoming v0.59.0 all over again: the
+        // partial predicate must keep this index away from the whole-history
+        // aggregations, which want a sequential scan on slow storage. If the
+        // `WHERE mbid_release IS NOT NULL` is ever dropped, the planner takes
+        // it for these too and Statistics gets slower on the hardware that
+        // actually runs this.
+        for agg in [
+            "SELECT LOWER(TRIM(artist)), COUNT(*) FROM scrobbles
+              WHERE user_id = 1 AND skipped = FALSE GROUP BY 1 ORDER BY 2 DESC LIMIT 50",
+            "SELECT LOWER(TRIM(artist)), LOWER(TRIM(album)), COUNT(*) FROM scrobbles
+              WHERE user_id = 1 AND skipped = FALSE GROUP BY 1, 2 ORDER BY 3 DESC LIMIT 50",
+        ] {
+            let p = plan(&db, agg).await;
+            assert!(
+                !p.contains("idx_scrobbles_album_release"),
+                "an aggregation must not be lured onto the partial index, got: {p}"
+            );
+        }
     }
 
     /// A skip must not reach *any* readout that counts listens.
