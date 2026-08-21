@@ -392,8 +392,29 @@ Sides are not reliably available from any provider — MusicBrainz records a vin
 track number as "A1" only when an editor entered one — so Tapedeck splits by
 **playing time** when it has to. A side holds around twenty minutes and a
 mastering engineer balances them; splitting by track count would put a
-nine-minute closer on the wrong side of the break. It's a guess, and the
-tracklist is editable.
+nine-minute closer on the wrong side of the break. A multi-disc set is split
+**one record at a time**, by each disc's own running time, so a double LP whose
+first record runs long does not have side C opening with tracks that are
+physically on disc 1 — and the panel groups its sides under *Record 1* and
+*Record 2*.
+
+**Running times are often missing, and Tapedeck says so rather than guessing.**
+Discogs frequently lists none, and a tracklist of blanks used to be filled in at
+three minutes a track and the sum shown as a side length — so an 18:00 side
+"finished" while the record was still playing. Now a side with unknown running
+times shows no length and no progress bar, the platter keeps turning, and its
+listens carry no duration, so they add nothing to your gear hours rather than a
+made-up figure. **Find running times** looks the pressing up by barcode, matches
+tracks by title (not by position — what comes back is usually a different
+pressing), shows you what it found beside what you have, and writes only when
+you accept. Applying corrects the tracklist, the listens already recorded, and
+the wear those plays banked. A running time you already have is never
+overwritten.
+
+You can also play **just one track**: drop the needle on a single song and
+nothing after it is recorded. It still counts as wear — the needle was in the
+groove — and it is marked partial, so it does not read as a whole side you never
+played.
 
 A **disc is the smaller problem**, and none of that guessing applies: a CD or
 SACD plays start to finish, so its tracks come off the disc as one numbered
@@ -825,6 +846,46 @@ not own, never quote a share without its population, and never treat a genre
 position as finer than it is (genres attach to artists, so every track by an
 artist sits at the same point).
 
+**Tested against**: a **Claude Pro** subscription (hosted, over OAuth) and
+**Mistral Chat on the free tier**. Both drive the same endpoint — one after the
+`initialize` handshake the older revisions use, one on the stateless 2026-07-28
+shape — which is the pair the dual-era handling exists for. Any other client
+speaking MCP should work; none has been tried.
+
+## What you're listening to, on your own site
+
+Everything else in Tapedeck answers only to you. There is one exception, and it
+is off until you switch it on: **`GET /public/np/<username>`** returns whatever
+is on your deck right now, with no credential.
+
+It exists because a static site renders long before anyone visits it, so a live
+"now playing" badge has to be fetched from the *reader's* browser — where none of
+your credentials can safely go.
+
+Settings → **Sharing** turns it on and decides what it carries. Title, artist and
+record are the whole of it by default; the cover, how far in you are, the audio
+format and the signal chain are four separate switches, each off until you say
+otherwise. A progress bar tells people when you paused, and a chain says what is
+in your listening room, so they are four decisions rather than one.
+
+Two things it will not do. It **never reads your history** — the deck is one
+track held in memory, and there is no route from it to a listen, a count, a note
+or a love. And a username that does not exist and one that has not published
+return the *same* 404, so nobody can use it to find out who has an account on
+your instance.
+
+A **Hugo shortcode** ships in `integrations/hugo/`. Drop it in your site and:
+
+```
+{{< tapedeck-now-playing src="https://tapedeck.example.com/public/np/you" >}}
+```
+
+It degrades to nothing — a server that is down, a deck with nothing on it, a
+mistyped name all render an empty element rather than a broken box on your
+homepage. An estimated playhead is drawn faded rather than as a confident bar,
+because a scrobble client that reports no position is guessed at rather than
+measured, and that distinction should survive onto your website.
+
 ## API
 
 The whole API is described by **`openapi.yaml`** at the repo root, and every
@@ -1026,6 +1087,26 @@ deploy/                      Sample hardened systemd unit
 - [x] **Loved** — every heart in one place, across tracks, records and artists
 - [x] **Discs on the shelf** — CD and SACD alongside vinyl and cassette, with a
       deck drawn for the medium in hand
+- [x] **Playlist Lab and pushing playlists out** — build a list from your own
+      history, then send it to Plex, Jellyfin, Emby, Subsonic/Navidrome or
+      TIDAL. A partial match is normal and every track that did not land is
+      named. **TIDAL's write half is unverified** — sign-in, search and the
+      token refresh are confirmed against the live API, but creating a playlist
+      needs a completed user sign-in and the two `POST` shapes are still the
+      ones TIDAL's spec declares rather than ones observed working
+- [x] **Chain variants** — one chain with a step swapped, so two cartridges on
+      one turntable each accrue their own hours and the other wears nothing
+- [x] **Your own account** — change your own password (the current one is
+      required), display name, bio and picture, without an admin
+- [x] **MCP server** — an AI assistant can read your listening and hand
+      playlists back, over six grants that are all off by default
+- [x] **The Crate** — records somebody *else* suggested, kept apart from
+      everything you own, each with what in your own listening prompted it and
+      whether you ever played it
+- [x] **Skips are readable** — stored from live sources as well as imports, with
+      what played either side of them
+- [x] **Public now-playing** — one opt-in address, four separate field switches,
+      and a Hugo shortcode for your own site
 
 ### Next
 
@@ -1050,7 +1131,10 @@ deploy/                      Sample hardened systemd unit
       onto the chain ladder's device rung
 - [ ] **Sharing a chapter as an image** — a Reports card as a PNG for a story
 - [ ] Docker container
-- [ ] Notes: full-text search, tags, and Markdown export for Obsidian/Logseq
+- [ ] Notes: **tags**. Full-text search and Markdown export for Obsidian/Logseq
+      already shipped
+- [ ] **Typing a track's running time in by hand** — a pressing MusicBrainz does
+      not have stays unknown, because nothing in the UI writes a tracklist
 - [ ] Organising the four analytics screens — Statistics, Top Charts, Reports and
       the genre map answer overlapping questions with their own period controls
 
@@ -1075,6 +1159,23 @@ Things that look finished and aren't:
 - **The SACD layer isn't recorded.** Stereo and multichannel are genuinely
   different listens and `AudioQuality.channels` has somewhere to put it, but
   `physical_plays` has no column for which one you played.
+- **A running time can't be typed in.** Tapedeck will go and look one up — by
+  barcode, matched on titles, previewed before it writes anything — but if no
+  pressing anywhere has it, the tracklist stays unknown. `PUT
+  /api/v1/physical/:id/tracks` exists and nothing in the UI calls it. A side with
+  no running times shows no length and no progress bar rather than inventing
+  one, and its listens carry no duration, so they add nothing to your gear hours
+  until the numbers arrive.
+- **Where a side's tracks fell in time can't be corrected after the fact.** A
+  side recorded before v0.74.1 laid its tracks out end to end from the start
+  time, so one played across an interruption sits on top of whatever you
+  listened to in between. Only the start was ever stored, so there is nothing to
+  reconstruct the real spacing from. New plays stamp each track as it starts, and
+  `physical_plays.recorded_at` now keeps the other end.
+- **Sides may be split by track count.** When a lookup returns no durations,
+  `assign_sides` splits by number of tracks instead of playing time, which can
+  put the break in the wrong place. Filling the running times in afterwards does
+  not move it; re-filing the record through the medium picker does.
 
 ## Performance
 
