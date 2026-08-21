@@ -7,7 +7,7 @@
 	import { formatDateTime, formatDuration } from '$lib/utils';
 	import { theme, setTheme, type ThemeMode } from '$lib/theme';
 	import { showArtwork, setShowArtwork } from '$lib/prefs';
-	import type { Connection, SignalChain, UserProfile } from '$lib/api';
+	import type { Connection, SignalChain, UserProfile, PublishSwitch } from '$lib/api';
 	import SourcesPanel from '$lib/components/SourcesPanel.svelte';
 
 	const uiVersion = __UI_VERSION__;
@@ -20,6 +20,7 @@
 	// hash so a link like /settings#sources lands where it says it will.
 	const SECTIONS = [
 		{ id: 'account', label: 'Account', hint: 'Password, picture, bio' },
+		{ id: 'sharing', label: 'Sharing', hint: 'Your public now-playing' },
 		{ id: 'appearance', label: 'Appearance', hint: 'Theme and artwork' },
 		{ id: 'time', label: 'Time', hint: 'Timezone and week start' },
 		{ id: 'scrobbling', label: 'Scrobbling', hint: 'When a listen counts' },
@@ -914,11 +915,102 @@
 		if (SECTIONS.some((s) => s.id === h)) section = h;
 	}
 
+	// ── Sharing: the one thing here that leaves the instance ──
+	//
+	// Every other read path in Tapedeck is self-only. This screen is where that
+	// stops being true, so it is written to make the disclosure legible rather
+	// than to make it convenient: the master switch and the four field toggles
+	// are separate answers, and the page states in words what each one puts on
+	// the internet.
+	let publish: PublishSwitch | null = null;
+	let publishLoading = false;
+	let publishSaving = false;
+	let publishSaved = false;
+	let publishCopied = '';
+
+	// The vocabulary is the server's (`known_fields`); this is only the prose
+	// for it. A field the server grows without a line here still renders — with
+	// its bare name — rather than silently vanishing from the screen while being
+	// published, which is the failure that would matter.
+	const FIELD_COPY: Record<string, { label: string; sub: string }> = {
+		artwork: {
+			label: 'Cover art',
+			sub: 'The sleeve of whatever is on, resolved from your own listens. Nothing is uploaded — it is a link to the same art the album page shows.'
+		},
+		position: {
+			label: 'How far in',
+			sub: 'Lets a widget draw a progress bar. It also shows the moment you pause, and how far into a track you are.'
+		},
+		fidelity: {
+			label: 'Format',
+			sub: 'Codec, bit depth, sample rate, lossless. Most listens carry none of this; the ones that do say something about your library.'
+		},
+		gear: {
+			label: 'Signal chain',
+			sub: 'What the listen ran through. Only ever set for a scrobble client or a side off the shelf — a polled listen omits it rather than naming a fallback.'
+		}
+	};
+
+	async function loadPublish() {
+		publishLoading = true;
+		try {
+			publish = await api.getPublicNowPlaying();
+		} catch {
+			/* the section shows its own empty state */
+		} finally {
+			publishLoading = false;
+		}
+	}
+
+	async function savePublish(enabled: boolean, fields: string[]) {
+		if (!publish) return;
+		publishSaving = true;
+		publishSaved = false;
+		try {
+			publish = await api.setPublicNowPlaying({ enabled, fields });
+			publishSaved = true;
+			setTimeout(() => (publishSaved = false), 2200);
+		} catch (e) {
+			alert(e instanceof Error ? e.message : 'Could not save');
+			// Re-read rather than keeping the optimistic value: what is public
+			// is the one setting on this page that must not be guessed at.
+			await loadPublish();
+		} finally {
+			publishSaving = false;
+		}
+	}
+
+	function toggleField(name: string, on: boolean) {
+		if (!publish) return;
+		const next = on
+			? [...publish.fields, name]
+			: publish.fields.filter((f) => f !== name);
+		savePublish(publish.enabled, next);
+	}
+
+	$: publicUrl = publish ? origin + publish.path : '';
+
+	// The Hugo half. Handed over as text rather than described, because the one
+	// thing a shortcode has to get exactly right is the URL, and retyping it is
+	// where that goes wrong.
+	$: hugoShortcode = `{{< tapedeck-now-playing src="${publicUrl}" >}}`;
+
+	async function copyPublish(what: string, text: string) {
+		try {
+			await navigator.clipboard.writeText(text);
+			publishCopied = what;
+			setTimeout(() => (publishCopied = ''), 1600);
+		} catch {
+			/* clipboard refused — the value is on screen and selectable */
+		}
+	}
+
 	// ── AI connections (MCP) ──
 	//
 	// Loaded when the section is first opened rather than on mount: this is one
 	// of a dozen sections and most visits never come here.
 	$: if (section === 'ai' && !mcpEndpoint && !mcpLoading) loadMcp();
+	$: if (section === 'sharing' && !publish && !publishLoading) loadPublish();
 
 	let mcpConnections: McpConnection[] = [];
 	let mcpEndpoint = '';
@@ -1277,6 +1369,105 @@
 						<p style="font-size:13px;color:#b2622d;margin:0;">{pwErr}</p>
 					{/if}
 				</div>
+			</div>
+		{/if}
+
+		{#if section === 'sharing'}
+			<div class="panel" style="border-radius:22px;padding:24px;margin-bottom:18px;">
+				<h3 class="h-display" style="font-size:19px;margin-bottom:4px;">Public now-playing</h3>
+				<p style="font-size:13px;color:var(--td-muted);margin:0 0 6px;max-width:64ch;">
+					Everything else in Tapedeck is yours alone — every page, every API route, every
+					number. This is the one address that answers without a password, so that a widget
+					on your own website can show what is on the deck right now.
+				</p>
+				<p style="font-size:12.5px;color:var(--td-muted-3);margin:0 0 18px;max-width:64ch;">
+					It publishes <strong>one track</strong> and never your history. There is no route
+					from here to a listen, a count, a note or a love.
+				</p>
+
+				{#if publishLoading && !publish}
+					<p style="font-size:13px;color:var(--td-muted-3);">Loading…</p>
+				{:else if !publish}
+					<p style="font-size:13px;color:var(--td-muted-3);">Couldn't load this setting.</p>
+				{:else}
+					<div class="row">
+						<div class="row-main">
+							<div class="row-title">Publish my now-playing</div>
+							<div class="row-sub">
+								Anyone who knows your username can read it. The address is
+								<code>/public/np/{publish.path.split('/').pop()}</code>, so treat it as
+								genuinely public rather than merely unlisted.
+							</div>
+						</div>
+						<label style="display:flex;align-items:center;gap:8px;cursor:pointer;font-size:14px;white-space:nowrap;">
+							<input type="checkbox" checked={publish.enabled} disabled={publishSaving}
+								on:change={(e) => savePublish(e.currentTarget.checked, publish?.fields ?? [])}
+								style="width:16px;height:16px;accent-color:var(--td-accent);cursor:pointer;">
+							{publish.enabled ? 'On' : 'Off'}
+						</label>
+					</div>
+
+					{#if publish.enabled}
+						<div style="margin-top:18px;padding-top:18px;border-top:1px solid var(--td-border);">
+							<div style="font-size:14px;font-weight:600;margin-bottom:2px;">What it carries</div>
+							<p style="font-size:12.5px;color:var(--td-muted);margin:0 0 12px;max-width:64ch;">
+								The track, the artist and the record are always included — that is what
+								publishing means. Everything below is a separate answer, and each one is
+								off until you say otherwise.
+							</p>
+
+							{#each publish.known_fields as f}
+								<div class="row">
+									<div class="row-main">
+										<div class="row-title">{FIELD_COPY[f]?.label ?? f}</div>
+										<div class="row-sub">{FIELD_COPY[f]?.sub ?? ''}</div>
+									</div>
+									<label style="display:flex;align-items:center;gap:8px;cursor:pointer;font-size:13px;white-space:nowrap;">
+										<input type="checkbox" checked={publish.fields.includes(f)}
+											disabled={publishSaving}
+											on:change={(e) => toggleField(f, e.currentTarget.checked)}
+											style="width:16px;height:16px;accent-color:var(--td-accent);cursor:pointer;">
+										{publish.fields.includes(f) ? 'Public' : 'Private'}
+									</label>
+								</div>
+							{/each}
+						</div>
+
+						<div style="margin-top:18px;padding-top:18px;border-top:1px solid var(--td-border);">
+							<div style="font-size:14px;font-weight:600;margin-bottom:8px;">Your address</div>
+							<div class="copyrow">
+								<code>{publicUrl}</code>
+								<button class="btn btn-secondary" style="font-size:12.5px;"
+									on:click={() => copyPublish('url', publicUrl)}>
+									{publishCopied === 'url' ? '✓ Copied' : 'Copy'}
+								</button>
+							</div>
+							<p style="font-size:12px;color:var(--td-muted-3);margin:8px 0 0;max-width:64ch;">
+								Sends <code>Access-Control-Allow-Origin: *</code>, so a page on any domain
+								can read it. A username that doesn't exist and one that doesn't publish
+								both answer 404 — nobody can use this to find out who has an account here.
+							</p>
+
+							<div style="font-size:14px;font-weight:600;margin:18px 0 8px;">On a Hugo site</div>
+							<div class="copyrow">
+								<code>{hugoShortcode}</code>
+								<button class="btn btn-secondary" style="font-size:12.5px;"
+									on:click={() => copyPublish('hugo', hugoShortcode)}>
+									{publishCopied === 'hugo' ? '✓ Copied' : 'Copy'}
+								</button>
+							</div>
+							<p style="font-size:12px;color:var(--td-muted-3);margin:8px 0 0;max-width:64ch;">
+								Needs <code>layouts/shortcodes/tapedeck-now-playing.html</code> in your
+								site — it ships with Tapedeck under <code>integrations/hugo/</code>.
+							</p>
+						</div>
+					{/if}
+
+					<div style="display:flex;gap:10px;align-items:center;margin-top:16px;">
+						{#if publishSaved}<span style="color:var(--td-good-fg);font-size:13px;">✓ Saved</span>
+						{:else if !publish.enabled}<span style="color:var(--td-muted-3);font-size:13px;">Nothing is public.</span>{/if}
+					</div>
+				{/if}
 			</div>
 		{/if}
 
@@ -1690,7 +1881,7 @@
 										Relay listens
 									</label>
 									<button class="btn btn-secondary" style="font-size:12.5px;" on:click={() => resetToken(t)}>Reset</button>
-									<button class="btn btn-secondary" style="font-size:12.5px;color:#b2622d;" on:click={() => revokeToken(t.id)}>Revoke</button>
+									<button class="btn btn-danger" style="font-size:12.5px;" on:click={() => revokeToken(t.id)}>Revoke</button>
 								</div>
 							{/each}
 						</div>
@@ -2477,6 +2668,27 @@
 	.row-main { min-width: 0; flex: 1 1 260px; }
 	.row-title { font-size: 14px; font-weight: 600; margin-bottom: 3px; }
 	.row-sub { font-size: 12.5px; color: var(--td-muted); line-height: 1.45; max-width: 52ch; }
+
+	/* An address you are meant to copy, not read. `min-width: 0` on the code is
+	   load-bearing: a flex item defaults to `min-width: auto`, so a long URL
+	   would refuse to shrink and push the Copy button off the panel instead of
+	   scrolling inside its own box. */
+	.copyrow {
+		display: flex;
+		align-items: center;
+		gap: 10px;
+		background: var(--td-surface2);
+		border: 1px solid var(--td-border);
+		border-radius: 12px;
+		padding: 10px 12px;
+	}
+	.copyrow code {
+		flex: 1 1 auto;
+		min-width: 0;
+		overflow-x: auto;
+		white-space: nowrap;
+		font-size: 12.5px;
+	}
 
 	/* Sized to sit in the same slot the `.row` selects and buttons use, so the
 	   Scrobbling rows line up with the Time ones above them. */

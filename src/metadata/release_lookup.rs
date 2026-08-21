@@ -72,6 +72,14 @@ pub struct PhysicalTrack {
     pub title: String,
     pub artist: Option<String>,
     pub duration_secs: Option<i64>,
+    /// Which physical disc of the set this track is on, from 1.
+    ///
+    /// Needs no migration: the tracklist is a JSON blob in
+    /// `physical_releases.tracks`, so a record catalogued before this existed
+    /// parses with `None` — which is honest. It means "nobody recorded which
+    /// disc", not "disc 1", and the panel groups only when it actually knows.
+    #[serde(default)]
+    pub disc: Option<i64>,
 }
 
 /// A candidate pressing.
@@ -166,6 +174,51 @@ pub fn assign_sides(numbers: &[String], durations: &[Option<i64>], sides: usize)
 
 fn side_letter(i: usize) -> String {
     ((b'A' + (i.min(25) as u8)) as char).to_string()
+}
+
+/// Where a side letter sits in the alphabet. The inverse of `side_letter`.
+fn letter_index(s: &str) -> usize {
+    s.trim()
+        .chars()
+        .next()
+        .filter(|c| c.is_ascii_alphabetic())
+        .map_or(0, |c| (c.to_ascii_uppercase() as u8 - b'A') as usize)
+}
+
+/// Split a multi-disc release into sides **one disc at a time**.
+///
+/// `assign_sides` on its own is given the whole release flattened, and splits
+/// it into `media_count * 2` sides of even playing time. That is right for a
+/// single LP and quietly wrong for an unbalanced set: a 2-LP where the first
+/// record runs 46 minutes and the second 22 gets four sides of 17, so side C
+/// opens with tracks that are physically on disc 1. Nothing errors — the
+/// tracklist simply describes an object that does not exist, and the shelf then
+/// tells you to flip to a side that is not there.
+///
+/// MusicBrainz already says which medium each track came off; the caller used
+/// to discard it in a `flat_map`. Given it back, each disc is split into its own
+/// two sides by *its own* running time, which is what physically happened, and
+/// the letters continue across discs (disc 2 is C and D).
+///
+/// A disc whose tracks carry real side letters keeps them and is **not**
+/// offset — `C1`…`D5` is already absolute. That is per disc rather than
+/// per release, because a set can have one medium an editor lettered and
+/// another they numbered.
+pub fn assign_sides_by_disc(per_disc: &[(Vec<String>, Vec<Option<i64>>)]) -> Vec<String> {
+    let mut out = Vec::new();
+    for (i, (numbers, durations)) in per_disc.iter().enumerate() {
+        let lettered = !numbers.is_empty()
+            && numbers
+                .iter()
+                .all(|n| n.trim().chars().next().is_some_and(|c| c.is_ascii_alphabetic()));
+        let sides = assign_sides(numbers, durations, 2);
+        if lettered {
+            out.extend(sides);
+        } else {
+            out.extend(sides.iter().map(|s| side_letter(letter_index(s) + i * 2)));
+        }
+    }
+    out
 }
 
 /// Is this medium one you play straight through, rather than one you get up
@@ -370,17 +423,34 @@ pub async fn musicbrainz_release(
         .collect::<String>();
     let format = r.media.first().and_then(|m| m.format.clone());
 
-    // A double LP is four sides, so the side count comes from the number of
-    // media rather than being assumed to be two.
-    let media_count = r.media.len().max(1);
+    // Which disc each track came off. This used to be discarded by a `flat_map`
+    // straight into `assign_sides`, which then split the *whole release* into
+    // even sides — fine for one LP, and wrong for an unbalanced set, where a
+    // side letter would be printed over tracks that are on the other record.
+    // MusicBrainz tells us; there is no reason to throw it away.
     let flat: Vec<&Track> = r.media.iter().flat_map(|m| m.tracks.iter()).collect();
-    let numbers: Vec<String> = flat.iter().map(|t| t.number.clone().unwrap_or_default()).collect();
     let durations: Vec<Option<i64>> = flat.iter().map(|t| t.length.map(|ms| ms / 1000)).collect();
+    let disc_of: Vec<i64> = r
+        .media
+        .iter()
+        .enumerate()
+        .flat_map(|(i, m)| std::iter::repeat_n(i as i64 + 1, m.tracks.len()))
+        .collect();
     // A disc is numbered by disc, not lettered by side — see `is_disc`.
     let side_of = if is_disc(format.as_deref()) {
         disc_sides(&r.media.iter().map(|m| m.tracks.len()).collect::<Vec<_>>())
     } else {
-        assign_sides(&numbers, &durations, media_count * 2)
+        let per_disc: Vec<(Vec<String>, Vec<Option<i64>>)> = r
+            .media
+            .iter()
+            .map(|m| {
+                (
+                    m.tracks.iter().map(|t| t.number.clone().unwrap_or_default()).collect(),
+                    m.tracks.iter().map(|t| t.length.map(|ms| ms / 1000)).collect(),
+                )
+            })
+            .collect();
+        assign_sides_by_disc(&per_disc)
     };
 
     let mut tracks = Vec::with_capacity(flat.len());
@@ -395,6 +465,7 @@ pub async fn musicbrainz_release(
             title: t.title.clone().unwrap_or_else(|| "Untitled".into()),
             artist: None,
             duration_secs: durations[i],
+            disc: disc_of.get(i).copied(),
         });
     }
 
@@ -680,6 +751,10 @@ pub async fn discogs_release(
             title: t.title.clone().unwrap_or_else(|| "Untitled".into()),
             artist: None,
             duration_secs: durations[i],
+            // Discogs' tracklist is flat and names no medium per track, so
+            // there is nothing to record here. `None` says that, rather than
+            // claiming disc 1.
+            disc: None,
         });
     }
 
@@ -1026,6 +1101,77 @@ mod tests {
         for want in ["A", "B", "C", "D"] {
             assert!(sides.iter().any(|s| s == want), "side {want} missing");
         }
+    }
+
+    /// An unbalanced double LP must break where the *records* break.
+    ///
+    /// This is the bug the whole-release split had: flattened, a 46-minute
+    /// first record and a 22-minute second come to 68 minutes, so four even
+    /// sides are 17 minutes each and side C opens with tracks that are
+    /// physically on disc 1. Nothing errors — the tracklist just describes an
+    /// object that does not exist, and the shelf then offers to remind you to
+    /// flip to a side that is not there.
+    ///
+    /// Asserted by counting how many of the first record's tracks escaped onto
+    /// a second-record side, because that is the symptom rather than any
+    /// particular letter.
+    #[test]
+    fn an_unbalanced_double_lp_breaks_where_the_records_do() {
+        // Disc 1: six 7:40 tracks (46:00). Disc 2: three 7:20 tracks (22:00).
+        let d1: Vec<String> = (1..=6).map(|i| i.to_string()).collect();
+        let d2: Vec<String> = (1..=3).map(|i| i.to_string()).collect();
+        let per_disc = vec![(d1.clone(), vec![Some(460); 6]), (d2.clone(), vec![Some(440); 3])];
+
+        let sides = assign_sides_by_disc(&per_disc);
+        assert_eq!(sides.len(), 9);
+
+        // The first record is sides A and B; the second is C and D. Nothing
+        // from disc 1 may land on C or D, which is precisely what the
+        // whole-release split got wrong.
+        let (first, second) = sides.split_at(6);
+        assert!(
+            first.iter().all(|s| s == "A" || s == "B"),
+            "disc 1 spilled onto the second record: {first:?}"
+        );
+        assert!(
+            second.iter().all(|s| s == "C" || s == "D"),
+            "disc 2 was lettered as though it were the first record: {second:?}"
+        );
+
+        // And the old behaviour really did get it wrong, so this test would
+        // pass for the wrong reason if that ever stopped being true.
+        let flat: Vec<String> = d1.iter().chain(d2.iter()).cloned().collect();
+        let mut flat_durations = vec![Some(460); 6];
+        flat_durations.extend(vec![Some(440); 3]);
+        let whole = assign_sides(&flat, &flat_durations, 4);
+        assert!(
+            whole[..6].iter().any(|s| s == "C" || s == "D"),
+            "the flat split was expected to spill disc 1 onto the second record"
+        );
+    }
+
+    /// A disc an editor actually lettered keeps its letters and is **not**
+    /// shifted along. `C1`…`D4` is already absolute, and offsetting it would
+    /// push a correctly-described second record onto sides E and F.
+    #[test]
+    fn a_lettered_disc_is_not_offset_again() {
+        let per_disc = vec![
+            (vec!["A1".into(), "A2".into(), "B1".into(), "B2".into()], vec![Some(300); 4]),
+            (vec!["C1".into(), "C2".into(), "D1".into(), "D2".into()], vec![Some(300); 4]),
+        ];
+        assert_eq!(assign_sides_by_disc(&per_disc), vec!["A", "A", "B", "B", "C", "C", "D", "D"]);
+    }
+
+    /// A single LP has to come out exactly as it always did — this change is
+    /// about multi-disc sets and must be invisible to everything else.
+    #[test]
+    fn one_record_is_unchanged_by_the_per_disc_split() {
+        let numbers: Vec<String> = (1..=8).map(|i| i.to_string()).collect();
+        let durations = vec![Some(300); 8];
+        assert_eq!(
+            assign_sides_by_disc(&[(numbers.clone(), durations.clone())]),
+            assign_sides(&numbers, &durations, 2)
+        );
     }
 
     /// No durations anywhere is normal on Discogs, and must still produce

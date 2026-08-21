@@ -22,6 +22,7 @@ pub mod physical;
 mod playlist_lab;
 pub mod playlists;
 mod preferences;
+pub mod public_np;
 pub mod ratelimit;
 pub mod rediscovery;
 pub mod reports;
@@ -106,6 +107,7 @@ pub fn build_app(state: Arc<AppState>) -> Router {
         .merge(scrobbles_router)
         .merge(preferences::create_preferences_router())
         .merge(now_playing::create_now_playing_router())
+        .merge(public_np::create_public_router())
         .merge(artwork::create_artwork_router())
         .merge(sources::create_sources_router())
         .merge(export::create_export_router())

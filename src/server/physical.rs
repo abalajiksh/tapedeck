@@ -1401,6 +1401,15 @@ async fn set_now_playing(
     // `listening_context`: "off a CD" describes where it came from, and that is
     // the column `play_side` has always used.
     np.listening_context = Some(medium_label(&release.kind).to_string());
+    // A record lives with one turntable, which is why the pressing remembers
+    // its chain rather than being asked every time — so the deck can say what
+    // this side is running through. One indexed lookup on a heartbeat that
+    // already does several, and it is the only rung a shelf listen ever uses.
+    if let Some(cid) = release.chain_id {
+        if let Ok(Some(chain)) = state.db.get_chain(user.user_id, cid).await {
+            np.chain_name = Some(chain.name);
+        }
+    }
     let changed = state.now_playing.set(user.user_id, np);
 
     // Only on a real change of track, for the reason the registry returns the

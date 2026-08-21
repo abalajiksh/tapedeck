@@ -589,6 +589,93 @@ pub fn chain_distance(a: &[ChainComponent], b: &[ChainComponent]) -> usize {
 // Device, Equipment, and ListeningSession rows are read back as ad-hoc tuples
 // or the DeviceRow/EquipmentRow types in db.rs — no shared model struct needed.
 
+// ── The publish switch ──
+
+/// Which parts of a now-playing entry a user has agreed to make public.
+///
+/// Everything else in this application is self-only, so the public endpoint is
+/// the one place where a field leaving the instance is a decision rather than a
+/// consequence. That decision is per field, not per endpoint: title, artist and
+/// album are the whole of the base payload, and each richer thing — the cover,
+/// how far in you are, what the file was, which chain it ran through — is its
+/// own answer.
+///
+/// **Absent means off.** A JSON array that is missing, null, malformed or names
+/// something this build has never heard of yields a struct of `false`, so the
+/// failure mode of a corrupt value is publishing *less* than intended rather
+/// than more. That direction is not arbitrary: a lost toggle costs a widget a
+/// line, and a gained one puts something on the internet nobody asked to put
+/// there.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PublicNpFields {
+    /// A cover image URL for whatever is on the deck.
+    pub artwork: bool,
+    /// Position and duration, which is what lets a widget draw a progress bar —
+    /// and also what reveals a pause and how far into a track someone is.
+    pub position: bool,
+    /// Codec, bit depth, sample rate, lossless/DSD.
+    pub fidelity: bool,
+    /// The signal chain the listen is attributed to.
+    pub gear: bool,
+}
+
+impl PublicNpFields {
+    /// The whole vocabulary. Anything outside it is ignored on the way in, so a
+    /// value written by a newer build cannot silently grant a field an older one
+    /// does not know how to withhold.
+    pub const KNOWN: [&'static str; 4] = ["artwork", "position", "fidelity", "gear"];
+
+    /// Parse the stored JSON array. Any failure is "nothing extra is public".
+    pub fn from_json(raw: Option<&str>) -> Self {
+        let Some(raw) = raw else { return Self::default() };
+        let Ok(serde_json::Value::Array(items)) = serde_json::from_str(raw) else {
+            return Self::default();
+        };
+        let has = |name: &str| items.iter().any(|v| v.as_str() == Some(name));
+        Self {
+            artwork: has("artwork"),
+            position: has("position"),
+            fidelity: has("fidelity"),
+            gear: has("gear"),
+        }
+    }
+
+    /// Serialise back to the stored form, in `KNOWN` order.
+    pub fn to_json(self) -> String {
+        let names: Vec<&str> = Self::KNOWN.iter().copied().filter(|n| self.has(n)).collect();
+        serde_json::to_string(&names).unwrap_or_else(|_| "[]".into())
+    }
+
+    pub fn has(self, name: &str) -> bool {
+        match name {
+            "artwork" => self.artwork,
+            "position" => self.position,
+            "fidelity" => self.fidelity,
+            "gear" => self.gear,
+            _ => false,
+        }
+    }
+
+    /// Build from whatever a request body offered, keeping only known names.
+    pub fn from_names<I, S>(names: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        let mut out = Self::default();
+        for n in names {
+            match n.as_ref() {
+                "artwork" => out.artwork = true,
+                "position" => out.position = true,
+                "fidelity" => out.fidelity = true,
+                "gear" => out.gear = true,
+                _ => {}
+            }
+        }
+        out
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -788,5 +875,36 @@ mod tests {
             ScrobbleThreshold::from_prefs(&serde_json::json!({})),
             ScrobbleThreshold::default()
         );
+    }
+
+    /// The publish switch has to fail in the direction that publishes *less*.
+    ///
+    /// A lost toggle costs a widget a line. A gained one puts something on the
+    /// internet nobody asked to put there, and there is no taking it back once
+    /// a reader has seen it — so every unreadable value is "nothing extra",
+    /// including the ones that look like near-misses.
+    #[test]
+    fn an_unreadable_publish_setting_grants_nothing() {
+        for raw in [
+            None,                              // never set
+            Some(""),                          // written empty
+            Some("null"),                      // valid JSON, wrong shape
+            Some("{\"artwork\":true}"),        // an object, not an array
+            Some("[\"artwork\""),              // truncated
+            Some("[\"ARTWORK\"]"),             // right word, wrong case
+            Some("[\"listens\",\"history\"]"), // names this build has never heard of
+        ] {
+            assert_eq!(
+                PublicNpFields::from_json(raw),
+                PublicNpFields::default(),
+                "{raw:?} must grant nothing"
+            );
+        }
+
+        // And the round trip is stable, in `KNOWN` order rather than whatever
+        // order a client happened to send.
+        let picked = PublicNpFields::from_names(["gear", "artwork", "nonsense"]);
+        assert_eq!(picked.to_json(), r#"["artwork","gear"]"#);
+        assert_eq!(PublicNpFields::from_json(Some(&picked.to_json())), picked);
     }
 }

@@ -1,0 +1,173 @@
+{{/*
+  Tapedeck — now playing.
+
+  Drop this file in your site as
+  layouts/shortcodes/tapedeck-now-playing.html, then in any page:
+
+      {{< tapedeck-now-playing src="https://tapedeck.example.com/public/np/you" >}}
+
+  Parameters
+    src       required. Your public address, from Settings → Sharing.
+    interval  optional, seconds between polls. Default 20.
+    title     optional heading. Pass title="" for none.
+    compact   optional "true" — one line, no cover, no bar.
+
+  The endpoint is public and CORS-open by design, so this runs entirely in the
+  reader's browser and your site needs no build-time secret and no proxy.
+
+  It degrades to nothing. A server that is down, a 404, a deck with nothing on
+  it — all of them render an empty element rather than an error, because a
+  personal site should not grow a broken box when a Raspberry Pi reboots.
+*/}}
+
+{{- $src := .Get "src" -}}
+{{- if not $src -}}
+  {{- errorf "tapedeck-now-playing: `src` is required — the public address from Settings → Sharing (%s)" .Position -}}
+{{- end -}}
+{{- $interval := int (default 20 (.Get "interval")) -}}
+{{- $heading := cond (isset .Params "title") (.Get "title") "Now playing" -}}
+{{- $compact := eq (.Get "compact") "true" -}}
+{{- $id := printf "tdnp-%d" .Ordinal -}}
+
+{{/* Emitted once per page however many times the shortcode is used. */}}
+{{- if not (.Page.Scratch.Get "tapedeckNowPlayingAssets") -}}
+{{- .Page.Scratch.Set "tapedeckNowPlayingAssets" true -}}
+<style>
+.tdnp{display:none;font:inherit;line-height:1.4}
+.tdnp[data-on]{display:block}
+.tdnp-h{font-size:.75rem;letter-spacing:.08em;text-transform:uppercase;opacity:.6;margin:0 0 .5rem}
+.tdnp-row{display:flex;align-items:center;gap:.75rem}
+.tdnp-art{flex:none;width:56px;height:56px;border-radius:6px;object-fit:cover;background:currentColor;opacity:.08}
+.tdnp-art[src]{opacity:1;background:none}
+.tdnp-txt{min-width:0;flex:1 1 auto}
+.tdnp-title{font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.tdnp-artist{opacity:.75;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.tdnp-album{opacity:.55;font-size:.875em;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.tdnp-meta{display:flex;gap:.5rem;flex-wrap:wrap;margin-top:.3rem;font-size:.72em;opacity:.6}
+.tdnp-tag{border:1px solid currentColor;border-radius:999px;padding:.05em .5em;opacity:.8}
+.tdnp-bar{height:3px;border-radius:999px;background:currentColor;opacity:.15;margin-top:.5rem;overflow:hidden}
+.tdnp-fill{display:block;height:100%;border-radius:999px;background:currentColor;opacity:1;width:0}
+/* An estimated playhead is drawn as an estimate. Tapedeck distinguishes a
+   measured position from wall-clock arithmetic, and a widget that renders a
+   guess as a confident bar throws that distinction away where nobody can see
+   the caveat. */
+.tdnp-bar[data-estimate] .tdnp-fill{opacity:.45}
+.tdnp-paused .tdnp-fill{opacity:.35}
+.tdnp[data-compact] .tdnp-art,.tdnp[data-compact] .tdnp-album,
+.tdnp[data-compact] .tdnp-bar,.tdnp[data-compact] .tdnp-meta{display:none}
+.tdnp[data-compact] .tdnp-title::after{content:" — "}
+.tdnp[data-compact] .tdnp-title,.tdnp[data-compact] .tdnp-artist{display:inline;white-space:normal}
+@media (prefers-reduced-motion:no-preference){.tdnp-fill{transition:width .9s linear}}
+</style>
+<script>
+(function () {
+  // Text is written with textContent throughout. The payload comes from your
+  // own server, but it is still remote JSON being placed into your page, and
+  // "it's my server" is exactly the assumption that makes an injection bug
+  // survive for years.
+  function put(el, sel, text) {
+    var n = el.querySelector(sel);
+    n.textContent = text == null ? '' : String(text);
+    n.hidden = !text;
+  }
+  function mmss(s) {
+    s = Math.max(0, Math.floor(s));
+    return Math.floor(s / 60) + ':' + String(s % 60).padStart(2, '0');
+  }
+
+  window.tapedeckNowPlaying = function (id, src, intervalSecs) {
+    var el = document.getElementById(id);
+    if (!el) return;
+    var timer = null, tick = null, state = null, at = 0;
+
+    function paint() {
+      if (!state || !state.playing) { el.removeAttribute('data-on'); return; }
+      el.setAttribute('data-on', '');
+      put(el, '.tdnp-title', state.title);
+      put(el, '.tdnp-artist', state.artist);
+      put(el, '.tdnp-album', state.album);
+
+      var art = el.querySelector('.tdnp-art');
+      if (state.artwork) { art.src = state.artwork; art.alt = state.album || ''; }
+      else { art.removeAttribute('src'); art.alt = ''; }
+
+      var tags = el.querySelector('.tdnp-meta');
+      tags.textContent = '';
+      var q = state.quality || {};
+      // Format is known for a small share of most histories, so this is drawn
+      // only when it is actually there rather than as a permanent "unknown".
+      var fidelity = q.codec
+        ? q.codec.toUpperCase() + (q.bit_depth && q.sample_rate
+            ? ' ' + q.bit_depth + '/' + (q.sample_rate / 1000) : '')
+        : null;
+      [fidelity, state.chain, state.context].forEach(function (t) {
+        if (!t) return;
+        var s = document.createElement('span');
+        s.className = 'tdnp-tag';
+        s.textContent = t;
+        tags.appendChild(s);
+      });
+
+      var bar = el.querySelector('.tdnp-bar');
+      var known = typeof state.position === 'number' && state.duration > 0;
+      bar.hidden = !known;
+      el.classList.toggle('tdnp-paused', !!state.paused);
+      if (known) {
+        if (state.position_known) bar.removeAttribute('data-estimate');
+        else bar.setAttribute('data-estimate', '');
+        // Counted forward from the moment of the fetch, and held still while
+        // paused — the server's own rule. Without that a paused deck walks to
+        // the end of a track nobody is playing.
+        var pos = state.paused ? state.position
+          : state.position + (Date.now() - at) / 1000;
+        pos = Math.min(pos, state.duration);
+        el.querySelector('.tdnp-fill').style.width =
+          (100 * pos / state.duration).toFixed(2) + '%';
+        bar.setAttribute('aria-label', mmss(pos) + ' of ' + mmss(state.duration));
+      }
+    }
+
+    function load() {
+      fetch(src, { credentials: 'omit', cache: 'no-store' })
+        .then(function (r) { return r.ok ? r.json() : null; })
+        .then(function (d) { state = d; at = Date.now(); paint(); })
+        // A network failure leaves whatever was last shown rather than blanking
+        // it: the far more likely cause is a flaky connection, not a stopped
+        // record, and flickering to empty and back reads as broken.
+        .catch(function () {});
+    }
+
+    function start() {
+      if (timer) return;
+      load();
+      timer = setInterval(load, Math.max(5, intervalSecs) * 1000);
+      tick = setInterval(paint, 1000);
+    }
+    function stop() {
+      clearInterval(timer); clearInterval(tick); timer = tick = null;
+    }
+
+    // Nobody watches a background tab, and the origin is usually a Pi.
+    document.addEventListener('visibilitychange', function () {
+      document.hidden ? stop() : start();
+    });
+    start();
+  };
+})();
+</script>
+{{- end -}}
+
+<div class="tdnp" id="{{ $id }}"{{ if $compact }} data-compact{{ end }}>
+  {{- with $heading }}<p class="tdnp-h">{{ . }}</p>{{ end }}
+  <div class="tdnp-row">
+    <img class="tdnp-art" alt="" width="56" height="56">
+    <div class="tdnp-txt">
+      <div class="tdnp-title"></div>
+      <div class="tdnp-artist"></div>
+      <div class="tdnp-album"></div>
+      <div class="tdnp-meta"></div>
+      <div class="tdnp-bar" role="img" hidden><span class="tdnp-fill"></span></div>
+    </div>
+  </div>
+</div>
+<script>tapedeckNowPlaying({{ $id }}, {{ $src }}, {{ $interval }});</script>

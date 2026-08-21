@@ -171,9 +171,18 @@ pub struct AlbumAggregate {
     pub name: String,
     pub plays: i64,
     pub year: Option<i32>,
+    /// Filled from `cover_pick` after the query, never selected directly —
+    /// see [`COVER_PICK`] for why the three must come from one listen.
+    #[sqlx(default)]
     pub artwork_url: Option<String>,
+    #[sqlx(default)]
     pub caa_id: Option<i64>,
+    #[sqlx(default)]
     pub caa_release_mbid: Option<String>,
+    /// The packed pick, unpacked by `resolve_cover` before the row is served.
+    #[serde(skip)]
+    #[sqlx(default)]
+    pub cover_pick: Option<String>,
 }
 
 #[derive(Debug, Clone, FromRow, serde::Serialize)]
@@ -292,9 +301,18 @@ pub struct RediscoveryRow {
     pub album: Option<String>,
     pub plays: i64,
     pub last_played: Option<i64>,
+    /// Filled from `cover_pick` after the query, never selected directly —
+    /// see [`COVER_PICK`] for why the three must come from one listen.
+    #[sqlx(default)]
     pub artwork_url: Option<String>,
+    #[sqlx(default)]
     pub caa_id: Option<i64>,
+    #[sqlx(default)]
     pub caa_release_mbid: Option<String>,
+    /// The packed pick, unpacked by `resolve_cover` before the row is served.
+    #[serde(skip)]
+    #[sqlx(default)]
+    pub cover_pick: Option<String>,
 }
 
 /// A record or tape you own.
@@ -619,6 +637,101 @@ const CREDIT_BACKFILL_CHUNK: i64 = 2_000;
 pub const CREDITS_ARTIST: &str = "EXISTS (SELECT 1 FROM scrobble_artists sa \
      WHERE sa.scrobble_id = s.id AND sa.artist_key = ?)";
 
+/// The cover for a grouped row, taken from **one listen**.
+///
+/// A listen's artwork is three columns — `artwork_url`, and the
+/// `caa_id`/`caa_release_mbid` pair a client turns into a Cover Art Archive
+/// link — and they only mean anything *together*. Every grouped query used to
+/// select them as three independent `MAX()`es, which is three separate
+/// questions asked of the same group and answered by whichever row won each
+/// one.
+///
+/// That is not theoretical. Reported 2026-08-21 against a Cœur de pirate record
+/// whose Top Charts card wore a *5-CD compilation's* sleeve while the album page
+/// showed the right one. The chart row read:
+///
+/// ```text
+/// caa_id            44286336686   → belongs to release 9e5838c1 (the album)
+/// caa_release_mbid  ead839e9-…    → a different release (the compilation)
+/// artwork_url       …/ead839e9-…/32013642354-250.jpg   → a third combination
+/// ```
+///
+/// `MAX()` on text is **lexicographic**, and `"ead839e9…" > "9e5838c1…"` because
+/// `e` > `9`, so the compilation won the string comparison while `MAX(caa_id)`
+/// independently picked the real album's id. Nothing errors; the group simply
+/// held listens of more than one release — a track that also appears on a
+/// compilation is the ordinary way that happens — and the answer was assembled
+/// from whichever row won each column.
+///
+/// So the pick is made **once**, over a packed string whose first field is a
+/// zero-padded timestamp. Lexicographic max over that is the newest row, and
+/// because it is a single value the three columns cannot come from different
+/// listens however the group is shaped.
+///
+/// Two properties worth keeping. It considers **only rows that actually have
+/// artwork**, so an album whose most recent listen arrived from an import with
+/// no cover keeps the one an earlier listen carried — the same semantics
+/// `album_artwork` gets from its `WHERE`, which is why the chart and the album
+/// page now agree. And the separator is `CHAR(31)`, the ASCII unit separator,
+/// which cannot occur in a URL or an MBID.
+///
+/// Twelve queries share it. That is the point: a per-query fix would have left
+/// the next grouped listing free to get it wrong again.
+pub const COVER_PICK: &str = "MAX(CASE WHEN (artwork_url IS NOT NULL AND artwork_url != '') \
+        OR caa_id > 0 \
+     THEN printf('%012d', timestamp) || CHAR(31) || COALESCE(artwork_url, '') || CHAR(31) \
+          || COALESCE(caa_id, 0) || CHAR(31) || COALESCE(caa_release_mbid, '') END)";
+
+/// Gives a row type the `resolve_cover` step every grouped listing owes its
+/// caller. A macro rather than a trait because there is nothing polymorphic
+/// here — three identical structs, and the point is that none of them can be
+/// served without unpacking.
+macro_rules! resolves_cover {
+    ($t:ty) => {
+        impl $t {
+            fn resolve_cover(&mut self) {
+                let c = Cover::parse(self.cover_pick.take().as_deref());
+                self.artwork_url = c.artwork_url;
+                self.caa_id = c.caa_id;
+                self.caa_release_mbid = c.caa_release_mbid;
+            }
+        }
+    };
+}
+resolves_cover!(ChartRow);
+resolves_cover!(RediscoveryRow);
+resolves_cover!(AlbumAggregate);
+
+/// The three artwork columns of one listen, unpacked from [`COVER_PICK`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Cover {
+    pub artwork_url: Option<String>,
+    pub caa_id: Option<i64>,
+    pub caa_release_mbid: Option<String>,
+}
+
+impl Cover {
+    /// Unpack a `cover_pick`. Anything unreadable is "no cover", which renders
+    /// the lettered tile — the one outcome that is never *wrong*, only plain.
+    pub fn parse(packed: Option<&str>) -> Self {
+        let Some(packed) = packed else { return Self::default() };
+        let mut parts = packed.split('\u{1f}');
+        // Field 0 is the timestamp the pick was made on; it has done its job.
+        let _ = parts.next();
+        let url = parts.next().unwrap_or_default();
+        let caa_id: i64 = parts.next().unwrap_or_default().parse().unwrap_or(0);
+        let mbid = parts.next().unwrap_or_default();
+        Self {
+            artwork_url: (!url.is_empty()).then(|| url.to_string()),
+            // `-1` is the "asked, nobody has one" tombstone and 0 is the
+            // packed absence, so anything non-positive is no artwork — the
+            // rule `coverArtUrl` applies on the other side.
+            caa_id: (caa_id > 0).then_some(caa_id),
+            caa_release_mbid: (!mbid.is_empty()).then(|| mbid.to_string()),
+        }
+    }
+}
+
 /// Everyone credited on a listen, primary first, de-duplicated by key.
 ///
 /// The primary is always `play.artist` — the name the rest of the row is
@@ -826,7 +939,16 @@ impl Database {
                 settings JSON DEFAULT '{}',
                 disabled INTEGER NOT NULL DEFAULT 0,
                 avatar_url TEXT,
-                bio TEXT
+                bio TEXT,
+                -- The one deliberately public read path in this application.
+                -- Off by default and never inferred: everything else here is
+                -- self-only, so publishing has to be an act, not a default.
+                public_now_playing INTEGER NOT NULL DEFAULT 0,
+                -- Which *extra* fields the publish switch carries, as a JSON
+                -- array drawn from `PublicNpFields::KNOWN`. Title, artist and
+                -- album are the whole of the base payload; everything richer
+                -- than that is opted into one field at a time.
+                public_np_fields TEXT
             )",
         )
         .execute(&self.pool)
@@ -2399,6 +2521,24 @@ impl Database {
             }
         }
 
+        // Migration: the publish switch for now-playing.
+        //
+        // Both columns default to "not published" for every account that
+        // already exists, which is the only safe reading of an upgrade: nobody
+        // consented to a public page by installing a new binary. `NOT NULL
+        // DEFAULT 0` gives existing rows the off state without a backfill.
+        if !has_column(&self.pool, "users", "public_now_playing").await {
+            info!("⚙️ Migrating: adding the public now-playing switch...");
+            let _ = sqlx::query(
+                "ALTER TABLE users ADD COLUMN public_now_playing INTEGER NOT NULL DEFAULT 0",
+            )
+            .execute(&self.pool)
+            .await;
+            let _ = sqlx::query("ALTER TABLE users ADD COLUMN public_np_fields TEXT")
+                .execute(&self.pool)
+                .await;
+        }
+
         // Migration: where the tape is parked.
         //
         // Like every other `physical_releases` column this comes **after** the
@@ -2714,6 +2854,68 @@ impl Database {
                 .fetch_optional(&self.pool)
                 .await?;
         Ok(row.map(|(id,)| id))
+    }
+
+    /// Resolve a username to a *published* deck, or nothing.
+    ///
+    /// **An unknown username and a user who has not published are the same
+    /// answer, deliberately.** This is the one unauthenticated read path in the
+    /// application, so anything that distinguishes the two turns it into a
+    /// membership oracle for a private, invite-only instance — type names at it
+    /// and learn who has an account here. It is the rule
+    /// `server::pairing` already follows for expired versus unknown device
+    /// codes, arriving in the one other place it matters.
+    ///
+    /// A disabled account never publishes, whatever its switch says.
+    pub async fn public_np_target(
+        &self,
+        username: &str,
+    ) -> Result<Option<(i64, Option<String>, PublicNpFields)>, sqlx::Error> {
+        let row: Option<(i64, Option<String>, Option<String>)> = sqlx::query_as(
+            "SELECT id, display_name, public_np_fields
+               FROM users
+              WHERE LOWER(username) = LOWER(?)
+                AND public_now_playing = 1
+                AND disabled = 0",
+        )
+        .bind(username)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|(id, name, fields)| (id, name, PublicNpFields::from_json(fields.as_deref()))))
+    }
+
+    /// The owner's own view of their publish switch.
+    pub async fn get_public_np_settings(
+        &self,
+        user_id: i64,
+    ) -> Result<(bool, PublicNpFields), sqlx::Error> {
+        let row: Option<(i64, Option<String>)> =
+            sqlx::query_as("SELECT public_now_playing, public_np_fields FROM users WHERE id = ?")
+                .bind(user_id)
+                .fetch_optional(&self.pool)
+                .await?;
+        Ok(match row {
+            Some((on, fields)) => (on != 0, PublicNpFields::from_json(fields.as_deref())),
+            None => (false, PublicNpFields::default()),
+        })
+    }
+
+    /// Write the publish switch. Both halves always move together: a request
+    /// that turns publishing on without saying which fields it wants gets the
+    /// base payload, never the last set somebody ticked and turned off.
+    pub async fn set_public_np_settings(
+        &self,
+        user_id: i64,
+        enabled: bool,
+        fields: PublicNpFields,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query("UPDATE users SET public_now_playing = ?, public_np_fields = ? WHERE id = ?")
+            .bind(i64::from(enabled))
+            .bind(fields.to_json())
+            .bind(user_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
     }
 
     /// Update the password for user_id=1 during setup.
@@ -3511,10 +3713,9 @@ impl Database {
         exclude: Option<&str>,
         limit: i64,
     ) -> Result<Vec<AlbumAggregate>, sqlx::Error> {
-        sqlx::query_as(&format!(
+        let mut rows: Vec<AlbumAggregate> = sqlx::query_as(&format!(
             "SELECT album AS name, COUNT(*) AS plays, MAX(release_year) AS year,
-                    MAX(artwork_url) AS artwork_url, MAX(caa_id) AS caa_id,
-                    MAX(caa_release_mbid) AS caa_release_mbid
+                    {COVER_PICK} AS cover_pick
              FROM scrobbles s
              WHERE user_id = ? AND skipped = FALSE AND {CREDITS_ARTIST}
                AND album IS NOT NULL AND TRIM(album) != ''
@@ -3528,7 +3729,9 @@ impl Database {
         .bind(exclude.map(|e| e.trim().to_lowercase()))
         .bind(limit)
         .fetch_all(&self.pool)
-        .await
+        .await?;
+        rows.iter_mut().for_each(|r| r.resolve_cover());
+        Ok(rows)
     }
 
     /// Headline numbers for one artist, plus their share of everything.
@@ -6747,23 +6950,24 @@ impl Database {
         quiet_since: i64,
         limit: i64,
     ) -> Result<Vec<RediscoveryRow>, sqlx::Error> {
-        sqlx::query_as(
+        let mut rows: Vec<RediscoveryRow> = sqlx::query_as(&format!(
             "SELECT title AS name, artist, MAX(album) AS album, COUNT(*) AS plays,
                     MAX(timestamp) AS last_played,
-                    MAX(artwork_url) AS artwork_url, MAX(caa_id) AS caa_id,
-                    MAX(caa_release_mbid) AS caa_release_mbid
+                    {COVER_PICK} AS cover_pick
                FROM scrobbles
               WHERE user_id = ? AND skipped = FALSE
               GROUP BY LOWER(TRIM(title)), LOWER(TRIM(artist))
              HAVING COUNT(*) >= 3 AND MAX(timestamp) < ?
               ORDER BY COUNT(*) DESC, MAX(timestamp) ASC
-              LIMIT ?",
-        )
+              LIMIT ?"
+        ))
         .bind(user_id)
         .bind(quiet_since)
         .bind(limit)
         .fetch_all(&self.pool)
-        .await
+        .await?;
+        rows.iter_mut().for_each(|r| r.resolve_cover());
+        Ok(rows)
     }
 
     /// Loved, but hardly ever played.
@@ -6794,16 +6998,14 @@ impl Database {
         //
         // No index can rescue the old shape — `LOWER(TRIM(title))` is not a
         // column — so this is the fix rather than a tuning question.
-        sqlx::query_as(
+        let mut rows: Vec<RediscoveryRow> = sqlx::query_as(&format!(
             "WITH played AS (
                  SELECT LOWER(TRIM(title)) AS k_title,
                         LOWER(TRIM(artist)) AS k_artist,
                         MAX(album) AS album,
                         COUNT(*) AS plays,
                         MAX(timestamp) AS last_played,
-                        MAX(artwork_url) AS artwork_url,
-                        MAX(caa_id) AS caa_id,
-                        MAX(caa_release_mbid) AS caa_release_mbid
+                        {COVER_PICK} AS cover_pick
                    FROM scrobbles
                   WHERE user_id = ? AND skipped = FALSE
                   GROUP BY 1, 2
@@ -6824,13 +7026,15 @@ impl Database {
                      AND p.k_artist = LOWER(TRIM(e.artist_name))
               WHERE l.user_id = ? AND e.kind = 'recording'
               ORDER BY plays ASC, l.created_at DESC
-              LIMIT ?",
-        )
+              LIMIT ?"
+        ))
         .bind(user_id)
         .bind(user_id)
         .bind(limit)
         .fetch_all(&self.pool)
-        .await
+        .await?;
+        rows.iter_mut().for_each(|r| r.resolve_cover());
+        Ok(rows)
     }
 
     /// Played exactly once, and long enough ago to have been forgotten.
@@ -6844,23 +7048,24 @@ impl Database {
         before: i64,
         limit: i64,
     ) -> Result<Vec<RediscoveryRow>, sqlx::Error> {
-        sqlx::query_as(
+        let mut rows: Vec<RediscoveryRow> = sqlx::query_as(&format!(
             "SELECT title AS name, artist, MAX(album) AS album, COUNT(*) AS plays,
                     MAX(timestamp) AS last_played,
-                    MAX(artwork_url) AS artwork_url, MAX(caa_id) AS caa_id,
-                    MAX(caa_release_mbid) AS caa_release_mbid
+                    {COVER_PICK} AS cover_pick
                FROM scrobbles
               WHERE user_id = ? AND skipped = FALSE
               GROUP BY LOWER(TRIM(title)), LOWER(TRIM(artist))
              HAVING COUNT(*) = 1 AND MAX(timestamp) < ?
               ORDER BY MAX(timestamp) DESC
-              LIMIT ?",
-        )
+              LIMIT ?"
+        ))
         .bind(user_id)
         .bind(before)
         .bind(limit)
         .fetch_all(&self.pool)
-        .await
+        .await?;
+        rows.iter_mut().for_each(|r| r.resolve_cover());
+        Ok(rows)
     }
 
     /// What you were playing this time of year, in years gone by.
@@ -6874,11 +7079,10 @@ impl Database {
         user_id: i64,
         limit: i64,
     ) -> Result<Vec<RediscoveryRow>, sqlx::Error> {
-        sqlx::query_as(
+        let mut rows: Vec<RediscoveryRow> = sqlx::query_as(&format!(
             "SELECT title AS name, artist, MAX(album) AS album, COUNT(*) AS plays,
                     MAX(timestamp) AS last_played,
-                    MAX(artwork_url) AS artwork_url, MAX(caa_id) AS caa_id,
-                    MAX(caa_release_mbid) AS caa_release_mbid
+                    {COVER_PICK} AS cover_pick
                FROM scrobbles
               WHERE user_id = ? AND skipped = FALSE
                 AND STRFTIME('%Y', timestamp, 'unixepoch') <> STRFTIME('%Y', 'now')
@@ -6888,12 +7092,14 @@ impl Database {
                     ) <= 21
               GROUP BY LOWER(TRIM(title)), LOWER(TRIM(artist))
               ORDER BY COUNT(*) DESC
-              LIMIT ?",
-        )
+              LIMIT ?"
+        ))
         .bind(user_id)
         .bind(limit)
         .fetch_all(&self.pool)
-        .await
+        .await?;
+        rows.iter_mut().for_each(|r| r.resolve_cover());
+        Ok(rows)
     }
 
     /// Records and tapes that haven't left the shelf.
@@ -6941,11 +7147,10 @@ impl Database {
         tz_offset_secs: i64,
         limit: i64,
     ) -> Result<Vec<RediscoveryRow>, sqlx::Error> {
-        sqlx::query_as(
+        let mut rows: Vec<RediscoveryRow> = sqlx::query_as(&format!(
             "SELECT title AS name, artist, MAX(album) AS album, COUNT(*) AS plays,
                     MAX(timestamp) AS last_played,
-                    MAX(artwork_url) AS artwork_url, MAX(caa_id) AS caa_id,
-                    MAX(caa_release_mbid) AS caa_release_mbid
+                    {COVER_PICK} AS cover_pick
                FROM scrobbles
               WHERE user_id = ? AND skipped = FALSE
               GROUP BY LOWER(TRIM(title)), LOWER(TRIM(artist))
@@ -6957,14 +7162,16 @@ impl Database {
                            THEN 1 ELSE 0 END
                     ) * 1.0 / COUNT(*) >= 0.7
               ORDER BY COUNT(*) DESC
-              LIMIT ?",
-        )
+              LIMIT ?"
+        ))
         .bind(user_id)
         .bind(tz_offset_secs)
         .bind(tz_offset_secs)
         .bind(limit)
         .fetch_all(&self.pool)
-        .await
+        .await?;
+        rows.iter_mut().for_each(|r| r.resolve_cover());
+        Ok(rows)
     }
 
     /// Album tracks you play that are never the single.
@@ -6977,11 +7184,10 @@ impl Database {
         user_id: i64,
         limit: i64,
     ) -> Result<Vec<RediscoveryRow>, sqlx::Error> {
-        sqlx::query_as(
+        let mut rows: Vec<RediscoveryRow> = sqlx::query_as(&format!(
             "SELECT title AS name, artist, MAX(album) AS album, COUNT(*) AS plays,
                     MAX(timestamp) AS last_played,
-                    MAX(artwork_url) AS artwork_url, MAX(caa_id) AS caa_id,
-                    MAX(caa_release_mbid) AS caa_release_mbid
+                    {COVER_PICK} AS cover_pick
                FROM scrobbles
               WHERE user_id = ? AND skipped = FALSE
                 AND track_number IS NOT NULL AND track_number >= 6
@@ -6989,12 +7195,14 @@ impl Database {
               GROUP BY LOWER(TRIM(title)), LOWER(TRIM(artist))
              HAVING COUNT(*) >= 3
               ORDER BY COUNT(*) DESC
-              LIMIT ?",
-        )
+              LIMIT ?"
+        ))
         .bind(user_id)
         .bind(limit)
         .fetch_all(&self.pool)
-        .await
+        .await?;
+        rows.iter_mut().for_each(|r| r.resolve_cover());
+        Ok(rows)
     }
 
     /// Things you like that have never been through a given piece of gear.
@@ -7010,11 +7218,10 @@ impl Database {
         equipment_id: i64,
         limit: i64,
     ) -> Result<Vec<RediscoveryRow>, sqlx::Error> {
-        sqlx::query_as(
+        let mut rows: Vec<RediscoveryRow> = sqlx::query_as(&format!(
             "SELECT title AS name, artist, MAX(album) AS album, COUNT(*) AS plays,
                     MAX(timestamp) AS last_played,
-                    MAX(artwork_url) AS artwork_url, MAX(caa_id) AS caa_id,
-                    MAX(caa_release_mbid) AS caa_release_mbid
+                    {COVER_PICK} AS cover_pick
                FROM scrobbles s
               WHERE s.user_id = ? AND s.skipped = FALSE
                 AND NOT EXISTS (
@@ -7031,13 +7238,15 @@ impl Database {
               GROUP BY LOWER(TRIM(s.title)), LOWER(TRIM(s.artist))
              HAVING COUNT(*) > 1
               ORDER BY COUNT(*) DESC
-              LIMIT ?",
-        )
+              LIMIT ?"
+        ))
         .bind(user_id)
         .bind(equipment_id)
         .bind(limit)
         .fetch_all(&self.pool)
-        .await
+        .await?;
+        rows.iter_mut().for_each(|r| r.resolve_cover());
+        Ok(rows)
     }
 
     /// The `artists` row id for a name, creating the row if it's new.
@@ -8458,8 +8667,7 @@ impl Database {
                 format!(
                     "SELECT album AS name, artist AS sub, NULL AS album, COUNT(*) AS plays,
                         COALESCE(SUM(duration), 0) AS seconds,
-                        MAX(artwork_url) AS artwork_url, MAX(caa_id) AS caa_id,
-                        MAX(caa_release_mbid) AS caa_release_mbid
+                        {COVER_PICK} AS cover_pick
                  FROM scrobbles
                  WHERE user_id = ? AND skipped = FALSE AND (? IS NULL OR timestamp >= ?)
                    AND album IS NOT NULL AND TRIM(album) != ''
@@ -8471,8 +8679,7 @@ impl Database {
                 format!(
                     "SELECT title AS name, artist AS sub, MAX(album) AS album, COUNT(*) AS plays,
                         COALESCE(SUM(duration), 0) AS seconds,
-                        MAX(artwork_url) AS artwork_url, MAX(caa_id) AS caa_id,
-                        MAX(caa_release_mbid) AS caa_release_mbid
+                        {COVER_PICK} AS cover_pick
                  FROM scrobbles
                  WHERE user_id = ? AND skipped = FALSE AND (? IS NULL OR timestamp >= ?)
                  GROUP BY LOWER(TRIM(title)), LOWER(TRIM(artist))
@@ -8489,7 +8696,7 @@ impl Database {
                 format!(
                     "SELECT MAX(sa.name) AS name, NULL AS sub, NULL AS album, COUNT(*) AS plays,
                         COALESCE(SUM(s.duration), 0) AS seconds,
-                        NULL AS artwork_url, NULL AS caa_id, NULL AS caa_release_mbid
+                        NULL AS cover_pick
                  FROM scrobble_artists sa
                  JOIN scrobbles s ON s.id = sa.scrobble_id
                  WHERE s.user_id = ? AND s.skipped = FALSE
@@ -8506,6 +8713,7 @@ impl Database {
             .bind(limit)
             .fetch_all(&self.pool)
             .await?;
+        rows.iter_mut().for_each(|r| r.resolve_cover());
 
         // An artist's portrait doesn't live on `scrobbles` — a listen carries
         // its *cover*, which is the album's. It lives on `artists`, filled by
@@ -11624,18 +11832,12 @@ impl Database {
         let sql = format!(
             "SELECT LOWER(TRIM(artist)) AS ak, LOWER(TRIM(title)) AS tk,
                     COUNT(*) AS plays,
-                    MAX(artwork_url) AS artwork_url,
-                    MAX(caa_id) AS caa_id,
-                    MAX(caa_release_mbid) AS caa_release_mbid
+                    {COVER_PICK} AS cover_pick
              FROM scrobbles
              WHERE user_id = ? AND skipped = FALSE AND LOWER(TRIM(artist)) IN ({placeholders})
              GROUP BY ak, tk"
         );
-        let mut q = sqlx::query_as::<
-            _,
-            (String, String, i64, Option<String>, Option<i64>, Option<String>),
-        >(&sql)
-        .bind(user_id);
+        let mut q = sqlx::query_as::<_, (String, String, i64, Option<String>)>(&sql).bind(user_id);
         for k in &keys {
             q = q.bind(k);
         }
@@ -11646,15 +11848,16 @@ impl Database {
             .map(|t| {
                 let ak = Self::artist_key(&t.artist);
                 let tk = Self::artist_key(&t.title);
-                let hit = heard.iter().find(|(a, k, _, _, _, _)| *a == ak && *k == tk);
+                let hit = heard.iter().find(|(a, k, _, _)| *a == ak && *k == tk);
+                let cover = Cover::parse(hit.and_then(|h| h.3.as_deref()));
                 PlaylistTrackView {
                     // A track the user has never played is a normal outcome —
                     // it keeps its lettered tile and no count, rather than
                     // being hidden or marked as a problem.
                     plays: hit.map(|h| h.2).unwrap_or(0),
-                    artwork_url: hit.and_then(|h| h.3.clone()),
-                    caa_id: hit.and_then(|h| h.4),
-                    caa_release_mbid: hit.and_then(|h| h.5.clone()),
+                    artwork_url: cover.artwork_url,
+                    caa_id: cover.caa_id,
+                    caa_release_mbid: cover.caa_release_mbid,
                     track: t,
                 }
             })
@@ -11743,9 +11946,18 @@ pub struct ChartRow {
     pub album: Option<String>,
     pub plays: i64,
     pub seconds: i64,
+    /// Filled from `cover_pick` after the query, never selected directly —
+    /// see [`COVER_PICK`] for why the three must come from one listen.
+    #[sqlx(default)]
     pub artwork_url: Option<String>,
+    #[sqlx(default)]
     pub caa_id: Option<i64>,
+    #[sqlx(default)]
     pub caa_release_mbid: Option<String>,
+    /// The packed pick, unpacked by `resolve_cover` before the row is served.
+    #[serde(skip)]
+    #[sqlx(default)]
+    pub cover_pick: Option<String>,
 }
 
 /// A cached description. `bio IS NULL` means every provider was asked and none
@@ -12533,6 +12745,218 @@ mod tests {
 
     fn play(title: &str, artist: &str, ts: u64) -> Play {
         Play::new(title.into(), artist.into(), ts, format!("src-{ts}"), "test".into())
+    }
+
+    /// A grouped row's cover has to come from **one listen**.
+    ///
+    /// Reported 2026-08-21: a Cœur de pirate record wore a 5-CD compilation's
+    /// sleeve on Top Charts while the album page showed the right one. The
+    /// group held listens of two releases — ordinary, since one of its tracks
+    /// also appears on that compilation — and the three artwork columns were
+    /// three independent `MAX()`es, so each was answered by whichever row won
+    /// its own comparison.
+    ///
+    /// The numbers below are the real ones, and they are chosen so the old
+    /// query is *wrong in every column at once*: `MAX(artwork_url)` and
+    /// `MAX(caa_release_mbid)` both pick the compilation, because `MAX` on text
+    /// is lexicographic and `"ead839e9…" > "9e5838c1…"`, while `MAX(caa_id)`
+    /// picks the album, because its id is numerically larger. A test built on
+    /// tidier values would pass against the bug.
+    #[tokio::test]
+    async fn a_grouped_cover_comes_from_one_listen() {
+        let db = testdb().await;
+        let uid = db.create_user("ash", None, "pw", "user").await.unwrap();
+        let now = Database::now_secs() as u64;
+
+        const ALBUM: &str = "en cas de tempête, ce jardin sera fermé.";
+        const RIGHT_MBID: &str = "9e5838c1-f4ef-4948-95a0-b201d64f33cb";
+        const RIGHT_CAA: i64 = 44_286_336_686;
+        const COMP_MBID: &str = "ead839e9-66cb-4ecf-a5e0-bc3a1a0691e2";
+        const COMP_CAA: i64 = 32_013_642_354;
+
+        // The compilation-tagged listen is older; the album's own is newest.
+        for (title, ts, mbid, caa) in [
+            ("Dans la nuit (feat. Loud)", now - 5_000, COMP_MBID, COMP_CAA),
+            ("Combustible", now - 100, RIGHT_MBID, RIGHT_CAA),
+        ] {
+            let mut p = play(title, "Cœur de pirate", ts);
+            p.album = Some(ALBUM.into());
+            p.caa_id = Some(caa);
+            p.caa_release_mbid = Some(mbid.into());
+            let source_id = p.source_id.clone();
+            db.save_scrobble(
+                uid,
+                &p,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                ListenDisposition::LIVE,
+            )
+            .await
+            .unwrap();
+            // `artwork_url` is written by the backfill rather than at insert,
+            // so it is set here the way the chain would.
+            sqlx::query("UPDATE scrobbles SET artwork_url = ? WHERE user_id = ? AND source_id = ?")
+                .bind(format!("https://coverartarchive.org/release/{mbid}/{caa}-250.jpg"))
+                .bind(uid)
+                .bind(&source_id)
+                .execute(&db.pool)
+                .await
+                .unwrap();
+        }
+
+        let rows = db.chart(uid, "albums", None, 10, false).await.unwrap();
+        let row = rows.iter().find(|r| r.name == ALBUM).expect("the album charted");
+
+        assert_eq!(row.plays, 2, "both listens still count — a cover fix, not a filter");
+        assert_eq!(
+            row.caa_release_mbid.as_deref(),
+            Some(RIGHT_MBID),
+            "the release must be the newest listen's, not the lexicographic max"
+        );
+        assert_eq!(row.caa_id, Some(RIGHT_CAA));
+        assert_eq!(
+            row.artwork_url.as_deref(),
+            Some(
+                format!("https://coverartarchive.org/release/{RIGHT_MBID}/{RIGHT_CAA}-250.jpg")
+                    .as_str()
+            ),
+            "and all three have to name the same release"
+        );
+
+        // The old query really was incoherent on this exact data — asserted so
+        // the test cannot start passing for the wrong reason if the fixture
+        // drifts to values where three independent maxes happen to agree.
+        let (old_url, old_caa, old_mbid): (Option<String>, Option<i64>, Option<String>) =
+            sqlx::query_as(
+                "SELECT MAX(artwork_url), MAX(caa_id), MAX(caa_release_mbid)
+                   FROM scrobbles WHERE user_id = ? AND album = ?",
+            )
+            .bind(uid)
+            .bind(ALBUM)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(old_caa, Some(RIGHT_CAA), "the old MAX picked the album's id…");
+        assert_eq!(old_mbid.as_deref(), Some(COMP_MBID), "…the compilation's release…");
+        assert!(old_url.unwrap().contains(COMP_MBID), "…and the compilation's cover");
+
+        // The album page is the surface that was always right. The point of the
+        // fix is that the two now agree, not merely that the chart moved.
+        let (page_url, page_caa, page_mbid) =
+            db.album_artwork(uid, "Cœur de pirate", ALBUM).await.unwrap().expect("a cover");
+        assert_eq!(page_mbid.as_deref(), row.caa_release_mbid.as_deref());
+        assert_eq!(page_caa, row.caa_id);
+        assert_eq!(page_url.as_deref(), row.artwork_url.as_deref());
+    }
+
+    /// A listen with no cover must not blank a group that has one.
+    ///
+    /// The naive "take the newest row" would: an import carries no artwork at
+    /// all, and one arriving today would drop the sleeve off a record played
+    /// for years. The pick only ever considers rows that actually have
+    /// artwork — the same semantics `album_artwork` gets from its `WHERE`.
+    #[tokio::test]
+    async fn a_coverless_listen_does_not_blank_the_group() {
+        let db = testdb().await;
+        let uid = db.create_user("ash", None, "pw", "user").await.unwrap();
+        let now = Database::now_secs() as u64;
+
+        for (title, ts, art) in [
+            ("Archangel", now - 9_000, true),
+            // Newer, and carrying nothing — the shape an import lands in.
+            ("Near Dark", now - 10, false),
+        ] {
+            let mut p = play(title, "Burial", ts);
+            p.album = Some("Untrue".into());
+            if art {
+                p.caa_id = Some(123_456);
+                p.caa_release_mbid = Some("11111111-1111-1111-1111-111111111111".into());
+            }
+            let source_id = p.source_id.clone();
+            db.save_scrobble(
+                uid,
+                &p,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                ListenDisposition::LIVE,
+            )
+            .await
+            .unwrap();
+            if art {
+                sqlx::query(
+                    "UPDATE scrobbles SET artwork_url = ? WHERE user_id = ? AND source_id = ?",
+                )
+                .bind("https://example.invalid/untrue.jpg")
+                .bind(uid)
+                .bind(&source_id)
+                .execute(&db.pool)
+                .await
+                .unwrap();
+            }
+        }
+
+        let rows = db.chart(uid, "albums", None, 10, false).await.unwrap();
+        let row = rows.iter().find(|r| r.name == "Untrue").expect("charted");
+        assert_eq!(row.plays, 2);
+        assert_eq!(row.artwork_url.as_deref(), Some("https://example.invalid/untrue.jpg"));
+        assert_eq!(row.caa_id, Some(123_456));
+    }
+
+    /// The one unauthenticated route on the instance must not become a
+    /// membership oracle.
+    ///
+    /// A username that does not exist and one that has not published have to be
+    /// indistinguishable, or a stranger can type names at a private,
+    /// invite-only server and learn who has an account on it. Phrased about the
+    /// *answer* rather than about the SQL, because a later rewrite that splits
+    /// the two cases apart would be a correct-looking query and a leak.
+    #[tokio::test]
+    async fn an_unknown_user_and_an_unpublished_one_are_the_same_answer() {
+        let db = testdb().await;
+        let quiet = db.create_user("quiet", None, "pw", "user").await.unwrap();
+        let loud = db.create_user("loud", None, "pw", "user").await.unwrap();
+
+        // Nobody publishes until they say so — including accounts that predate
+        // the column, which is what the `NOT NULL DEFAULT 0` is for.
+        assert!(db.public_np_target("quiet").await.unwrap().is_none());
+        assert!(
+            db.public_np_target("nobody-here").await.unwrap().is_none(),
+            "an unknown username answers exactly as an unpublished one does"
+        );
+
+        db.set_public_np_settings(loud, true, PublicNpFields::from_names(["position"]))
+            .await
+            .unwrap();
+        let (id, _, fields) = db.public_np_target("LOUD").await.unwrap().expect("published");
+        assert_eq!(id, loud, "matched case-insensitively, like every other username lookup");
+        assert!(fields.position);
+        assert!(!fields.artwork, "one tick grants one field");
+
+        // Turning it off is immediate and total, and it does not have to also
+        // clear the ticks: the master switch is what the public route reads.
+        db.set_public_np_settings(loud, false, fields).await.unwrap();
+        assert!(db.public_np_target("loud").await.unwrap().is_none());
+
+        // A disabled account never publishes, whatever its own switch says —
+        // an admin turning someone off must not leave a public page running.
+        db.set_public_np_settings(quiet, true, PublicNpFields::default()).await.unwrap();
+        assert!(db.public_np_target("quiet").await.unwrap().is_some());
+        sqlx::query("UPDATE users SET disabled = 1 WHERE id = ?")
+            .bind(quiet)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        assert!(db.public_np_target("quiet").await.unwrap().is_none());
     }
 
     /// The album page's "whole record" button must not scan the whole history.

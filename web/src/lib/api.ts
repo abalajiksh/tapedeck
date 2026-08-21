@@ -345,6 +345,21 @@ export interface ChainInput {
 	icon?: string | null;
 }
 
+/**
+ * The owner's own view of their public now-playing switch.
+ *
+ * `known_fields` comes from the server rather than being hardcoded here, so a
+ * build that learns a fifth disclosure renders its toggle without a frontend
+ * change — and, more to the point, so this screen can never offer a switch the
+ * server would silently ignore.
+ */
+export interface PublishSwitch {
+	enabled: boolean;
+	fields: string[];
+	known_fields: string[];
+	path: string;
+}
+
 export interface EquipmentInput {
 	name: string;
 	type: string;
@@ -915,6 +930,14 @@ export interface PhysicalTrack {
 	title: string;
 	artist?: string | null;
 	duration_secs?: number | null;
+	/**
+	 * Which physical disc of the set this is on, from 1. Absent for anything
+	 * catalogued before Tapedeck kept it, and for Discogs lookups, whose
+	 * tracklist is flat and names no medium — so it means "not recorded",
+	 * never "disc 1". Anything sending a tracklist back must carry it through,
+	 * or re-saving a box set silently forgets its shape.
+	 */
+	disc?: number | null;
 }
 
 /** A candidate pressing from MusicBrainz or Discogs. */
@@ -1467,6 +1490,21 @@ class TapedeckAPI {
 	}> {
 		return this.get('/api/v1/tidal/settings');
 	}
+	// ── The publish switch for now-playing ──
+	//
+	// Session-only on the server: a token gets 401, because a scrobble client
+	// has no business deciding that its owner's listening is public.
+	async getPublicNowPlaying(): Promise<PublishSwitch> {
+		return this.get('/api/v1/profile/public-now-playing');
+	}
+
+	async setPublicNowPlaying(body: {
+		enabled: boolean;
+		fields: string[];
+	}): Promise<PublishSwitch> {
+		return this.request('PUT', '/api/v1/profile/public-now-playing', body);
+	}
+
 	async setTidalSettings(body: {
 		client_id?: string;
 		client_secret?: string;

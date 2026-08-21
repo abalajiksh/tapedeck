@@ -27,6 +27,10 @@
 	 *  sides you flip; a disc has none, so calling its tracklist "Side 1" would
 	 *  be describing hardware it doesn't have. */
 	const unit = (k: string) => (isDisc(k) ? 'Disc' : 'Side');
+	/** What you hold, as opposed to what you play. A double LP is two *records*
+	 *  of two sides each, so the grouping heading cannot reuse `unit` — that
+	 *  would title a group of sides A and B "Side 1". */
+	const carrier = (k: string) => (k === 'cassette' ? 'Tape' : 'Record');
 	let filter: Filter = 'all';
 	/** Free-text filter over the shelf. Client-side, like `/loved`: a shelf is
 	 *  hundreds of rows at most and they are already in hand, so a query
@@ -466,6 +470,30 @@
 	}
 
 	$: sides = [...new Set(openTracks.map((t) => t.side))].sort();
+
+	/** Which disc each side belongs to, where the pressing recorded it. */
+	$: discOfSide = new Map<string, number | null>(
+		sides.map((sd) => [sd, openTracks.find((t) => t.side === sd)?.disc ?? null])
+	);
+
+	/**
+	 *  Whether to head the sides with which record they are on.
+	 *
+	 *  Two refusals, and both are the honest answer rather than tidiness. A
+	 *  pressing catalogued before Tapedeck kept the disc has `null` on every
+	 *  track, and a partially-known set would have the heading assert something
+	 *  for some sides and not others — so it groups only when *every* side knows.
+	 *  And a single record needs no heading: "Disc 1" over one LP is a label
+	 *  with nothing to distinguish it from.
+	 */
+	$: groupByDisc =
+		!!open &&
+		// A disc's "side" *is* its disc number, so a heading here would repeat
+		// the card underneath it word for word.
+		!isDisc(open.kind) &&
+		sides.length > 0 &&
+		sides.every((sd) => discOfSide.get(sd) != null) &&
+		new Set(sides.map((sd) => discOfSide.get(sd))).size > 1;
 	/** Sides that carry plays but are not on the tracklist any more.
 	 *
 	 *  Re-filing a release rewrites its sides — a vinyl's A/B becomes a CD's 1 —
@@ -1365,7 +1393,7 @@
 			</select>
 			<button class="btn btn-secondary" on:click={() => (lightbox = (lightbox - 1 + flat.length) % flat.length)}>←</button>
 			<button class="btn btn-secondary" on:click={() => (lightbox = (lightbox + 1) % flat.length)}>→</button>
-			<button class="btn btn-secondary" on:click={() => removeImage(flat[lightbox])}>Remove</button>
+			<button class="btn btn-danger" on:click={() => removeImage(flat[lightbox])}>Remove</button>
 			<button class="btn btn-secondary" on:click={() => (lightbox = -1)}>Close</button>
 		</div>
 	</div>
@@ -1416,8 +1444,17 @@
 					<div style="font-size:12.5px;color:var(--td-muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">{r.artist}</div>
 					<div style="font-size:11.5px;color:var(--td-muted-2);margin-top:5px;">
 						{r.kind === 'vinyl' ? '33⅓' : r.kind === 'cassette' ? 'Tape' : KIND_LABEL[r.kind] ?? r.kind}
+						<!-- `play_count` counts **side plays**, not the sides the object
+						     has — it is `COUNT(*)` over `physical_plays`. Written as
+						     "13 sides" it read as a fact about the record, which for a
+						     2-LP set is exactly the number a reader would expect to see
+						     and therefore believe: 4 sides looks like two discs. The past
+						     participle is what makes it an event count. Kept per side
+						     rather than collapsed to "played 13 times", because thirteen
+						     sides is not thirteen playings of the record. -->
 						{#if r.play_count}
-							· {r.play_count} side{r.play_count === 1 ? '' : 's'} · {formatDuration(r.played_secs)}
+							· {r.play_count} {unit(r.kind).toLowerCase()}{r.play_count === 1 ? '' : 's'} played
+							· {formatDuration(r.played_secs)}
 						{:else}
 							· never played
 						{/if}
@@ -1449,8 +1486,12 @@
 						{/if}
 					</div>
 					<div style="display:flex;gap:8px;">
+						<!-- Two identical pills, one of which deletes the record, is a
+						     coin toss the first time you meet it. `Remove` is destructive
+						     and now looks it; `Close` stays neutral because it is the safe
+						     one and should read as the default. -->
 						<button class="btn btn-secondary" on:click={() => (open = null)}>Close</button>
-						<button class="btn btn-secondary" on:click={() => open && remove(open)}>Remove</button>
+						<button class="btn btn-danger" on:click={() => open && remove(open)}>Remove</button>
 					</div>
 				</div>
 
@@ -1539,7 +1580,13 @@
 					</div>
 
 					<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:14px;margin-top:18px;">
-						{#each sides as side}
+						{#each sides as side, i}
+							<!-- A full-width heading rather than a second grid, so the side
+							     cards keep one `auto-fit` track list and cannot end up sized
+							     differently from each other per disc. -->
+							{#if groupByDisc && (i === 0 || discOfSide.get(side) !== discOfSide.get(sides[i - 1]))}
+								<div class="disc-head">{carrier(open.kind)} {discOfSide.get(side)}</div>
+							{/if}
 							<div class="side">
 								<div style="display:flex;align-items:baseline;justify-content:space-between;gap:10px;">
 									<span class="h-display" style="font-size:17px;">{unit(open.kind)} {side}</span>
@@ -1905,6 +1952,19 @@
 		border: 1px solid var(--td-border);
 		border-radius: 14px;
 	}
+
+	/* Spans the whole grid so the sides below it start a fresh row — which is
+	   what makes it read as a heading over them rather than a card beside
+	   them. */
+	.disc-head {
+		grid-column: 1 / -1;
+		font-size: 12px;
+		letter-spacing: .09em;
+		text-transform: uppercase;
+		color: var(--td-muted-2);
+		margin-top: 4px;
+	}
+	.disc-head:first-child { margin-top: 0; }
 
 	.scans {
 		margin-top: 22px;

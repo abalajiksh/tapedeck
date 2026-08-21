@@ -245,7 +245,7 @@
 							<span style="font-size:12px;color:var(--td-muted-3);">{timeAgo(s.last_polled_at)}</span>
 						{/if}
 						<button class="btn btn-secondary" style="font-size:12.5px;padding:6px 14px;" on:click={() => edit(s)}>Edit</button>
-						<button class="btn btn-secondary" style="font-size:12.5px;padding:6px 14px;color:#b2622d;" on:click={() => (confirmDelete = s)}>Remove</button>
+						<button class="btn btn-danger" style="font-size:12.5px;padding:6px 14px;" on:click={() => (confirmDelete = s)}>Remove</button>
 					</div>
 					{#if s.last_error}
 						<p style="font-size:12px;color:#b2622d;margin:-4px 0 0 22px;font-family:monospace;word-break:break-word;">{s.last_error}</p>

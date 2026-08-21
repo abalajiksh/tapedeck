@@ -25,7 +25,13 @@ struct Assets;
 /// authorization server, and hands it the SPA shell instead would have it try
 /// to `JSON.parse` an HTML document and report the instance as broken rather
 /// than as unconfigured.
-const API_PREFIXES: [&str; 5] = ["api/", "1/", "admin/", "oauth/", ".well-known/"];
+///
+/// `public/` is here for a third reason again: it is the one namespace a
+/// *stranger* types, from a widget on somebody else's website. A mistyped
+/// username has to come back as the module's own JSON 404 — which is the same
+/// answer an unpublished deck gets, deliberately — rather than as 200 and an
+/// HTML shell that the fetch on that page would try to parse.
+const API_PREFIXES: [&str; 6] = ["api/", "1/", "admin/", "oauth/", ".well-known/", "public/"];
 /// `mcp` is exact, not a prefix — `/mcp` is the endpoint and there is nothing
 /// beneath it.
 const API_EXACT: [&str; 4] = ["health", "log-level", "metrics", "mcp"];

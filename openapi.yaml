@@ -26,7 +26,7 @@ openapi: 3.1.0
 
 info:
   title: Tapedeck
-  version: 0.73.0
+  version: 0.74.0
   summary: Self-hosted scrobbler and listening journal.
   description: |
     Tapedeck ingests listens, enriches them with MusicBrainz metadata, stores
@@ -866,6 +866,75 @@ components:
           oneOf:
             - $ref: '#/components/schemas/NowPlayingTrack'
             - type: 'null'
+
+    PublishSwitch:
+      type: object
+      description: The caller's own view of their public now-playing setting.
+      properties:
+        enabled: { type: boolean }
+        fields:
+          type: array
+          description: The extra disclosures currently granted, in canonical order.
+          items: { type: string, enum: [artwork, position, fidelity, gear] }
+        known_fields:
+          type: array
+          description: |
+            Every field this build knows how to publish. A client should render
+            the toggles from this rather than a hardcoded list, so the two
+            cannot drift.
+          items: { type: string }
+        path:
+          type: string
+          description: 'The public address, e.g. `/public/np/ashwin`. Built server-side so a settings screen cannot assemble a different one.'
+
+    PublicNowPlaying:
+      type: object
+      description: |
+        The public payload. Only `playing`, `user` and `name` are always
+        present; `title`/`artist`/`album` appear whenever something is playing,
+        and everything below that appears only if its owner opted into it.
+
+        An absent field means "not published" **or** "the source did not know" —
+        the two are not distinguished, and a client must not infer either.
+      properties:
+        playing: { type: boolean }
+        user: { type: string, description: The username as asked for. }
+        name: { type: [string, 'null'], description: Display name, when set. }
+        title: { type: string }
+        artist: { type: string }
+        album: { type: [string, 'null'] }
+        artwork:
+          type: string
+          description: 'Opt-in (`artwork`). A cover URL, resolved at most once per track.'
+        position:
+          type: integer
+          description: 'Opt-in (`position`). Seconds in. Read `position_known` before drawing this as a measurement.'
+        duration: { type: [integer, 'null'], description: 'Opt-in (`position`).' }
+        position_known:
+          type: boolean
+          description: 'Opt-in (`position`). False when the number is the server''s own wall-clock arithmetic rather than a reported playhead.'
+        paused: { type: boolean, description: 'Opt-in (`position`). Only a pushing source can know this.' }
+        quality:
+          type: object
+          description: 'Opt-in (`fidelity`). Every member may be null — most of a history has no format at all.'
+          properties:
+            format: { type: [string, 'null'] }
+            codec: { type: [string, 'null'] }
+            bit_depth: { type: [integer, 'null'] }
+            sample_rate: { type: [integer, 'null'] }
+            dsd_multiplier: { type: [integer, 'null'] }
+            lossless: { type: [boolean, 'null'] }
+        chain:
+          type: string
+          description: |
+            Opt-in (`gear`). The signal chain, and **only where the source
+            actually chose one** — an ingest submission or a side off the shelf.
+            A polled listen falls through to the device default, the coarsest
+            rung of the ladder, and omits this rather than dressing a fallback
+            up as a decision.
+        context:
+          type: string
+          description: 'Opt-in (`gear`). The listening context, or the medium for a shelf play.'
 
     Note:
       type: object
@@ -2096,6 +2165,94 @@ paths:
               schema: { $ref: '#/components/schemas/NowPlaying' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
+
+  /api/v1/profile/public-now-playing:
+    get:
+      tags: [Listens]
+      summary: The caller's publish switch for now-playing.
+      description: |
+        **Session-only.** A token gets 401 — the endpoint does not accept one at
+        all, so scopes never enter into it. A scrobble client has no business
+        deciding that its owner's listening is public.
+      security: [{ sessionCookie: [] }]
+      responses:
+        '200':
+          description: OK.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PublishSwitch' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+    put:
+      tags: [Listens]
+      summary: Turn public now-playing on or off.
+      description: |
+        **Session-only.** `enabled` is required — a body that merely misspelled
+        the key must not be read as an answer either way, because getting this
+        one wrong is published rather than merely wrong.
+
+        `fields` names the *extra* disclosures beyond title/artist/album.
+        Unknown names are dropped rather than rejected, so a newer client cannot
+        make an older server fail; it can only fail to grant something.
+        Omitting `fields` while enabling publishes the base payload alone.
+      security: [{ sessionCookie: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [enabled]
+              properties:
+                enabled: { type: boolean }
+                fields:
+                  type: array
+                  items: { type: string, enum: [artwork, position, fidelity, gear] }
+      responses:
+        '200':
+          description: OK.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PublishSwitch' }
+        '400': { description: '`enabled` was absent.' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  # ── The one public read path ────────────────────────────────────────────────
+  /public/np/{username}:
+    get:
+      tags: [Listens]
+      summary: What this person is listening to, if they publish it.
+      description: |
+        **Unauthenticated, and the only route on the instance that is.** It
+        exists because a static site renders long before anyone visits it, so a
+        live now-playing widget must be fetched from the reader's browser, where
+        no credential of the owner's can safely go.
+
+        Sends `Access-Control-Allow-Origin: *` and
+        `Cache-Control: public, max-age=5`. A `GET` with no custom headers is a
+        CORS simple request, so there is no preflight and no `OPTIONS`.
+
+        **A username that does not exist and one that has not published return
+        the same 404.** Anything that told them apart would make this a
+        membership oracle for a private, invite-only instance.
+
+        Everything past `title`/`artist`/`album` appears only if its owner
+        ticked it — see the publish switch above. An absent field means "not
+        published" or "not known"; the two are deliberately not distinguished.
+      security: []
+      parameters:
+        - name: username
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: |
+            The person publishes. `playing` is false when the deck is empty.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PublicNowPlaying' }
+        '404':
+          description: No such user, or they do not publish. Identical answers.
 
   # ── Statistics ─────────────────────────────────────────────────────────────
   /api/v1/stats/dashboard:

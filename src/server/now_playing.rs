@@ -98,6 +98,16 @@ pub struct NowPlaying {
     /// Which source reported this — also the key the pipeline clears by.
     pub source: String,
     pub listening_context: Option<String>,
+    /// The signal chain this listen is attributed to, where the writer already
+    /// knew it.
+    ///
+    /// Filled by the two sources for which a chain is a *deliberate statement*
+    /// rather than a fallback: an ingest submission resolves one through the
+    /// four-rung ladder, and a side off the shelf runs through the turntable
+    /// the pressing remembers. A polled source falls through to the device's
+    /// default — the coarsest rung — and does not set this, so the public
+    /// payload omits the field rather than naming a chain nobody chose.
+    pub chain_name: Option<String>,
     // Quality fields, named to match the frontend's `qualityLabel()` shape.
     pub format_type: Option<String>,
     pub codec: Option<String>,
@@ -107,6 +117,22 @@ pub struct NowPlaying {
     pub dsd_to_pcm_converted: Option<bool>,
     pub delivery_codec: Option<String>,
     pub is_lossless: Option<bool>,
+    /// A cover for what is on the deck, resolved lazily and at most once per
+    /// track.
+    ///
+    /// Deliberately not filled by whoever writes the entry: the deck in the SPA
+    /// has never drawn one, so paying for a lookup on the hot path would be a
+    /// cost with no reader. The public endpoint is the first thing that wants
+    /// it, so it resolves on first ask and hands the answer back through
+    /// `set_artwork` — one query per track rather than one per request, which
+    /// on an unauthenticated route is the difference that matters.
+    pub artwork_url: Option<String>,
+    /// Whether the lookup above has been *attempted*. A track nobody has a
+    /// cover for must not be re-asked on every poll of every widget, so a
+    /// resolved `None` is a tombstone — the same discipline as `caa_id = -1`
+    /// and `artwork_url = ''` in the backfills.
+    #[serde(skip)]
+    pub artwork_resolved: bool,
     /// Whether a real listen for this track has been submitted.
     ///
     /// Off the wire — it says nothing about what is playing, only about what we
@@ -154,9 +180,12 @@ impl NowPlaying {
             position_exact: matches!(progress, Progress::Exact(_)),
             paused: false,
             banked: false,
+            artwork_url: None,
+            artwork_resolved: false,
             updated_at: now_secs(),
             source: source.to_string(),
             listening_context: None,
+            chain_name: None,
             format_type: quality.and_then(|q| q.format_type.clone()),
             codec: quality.and_then(|q| q.codec.clone()),
             bit_depth: quality.and_then(|q| q.bit_depth),
@@ -340,6 +369,23 @@ impl NowPlayingRegistry {
             if let Some(np) = map.get_mut(&user_id) {
                 if np.title == title && np.artist == artist {
                     np.banked = true;
+                }
+            }
+        }
+    }
+
+    /// Record the cover that was resolved for what is on the deck.
+    ///
+    /// `None` is a real answer and is stored as one — see `artwork_resolved`.
+    /// Guarded on the title and artist still matching for the same reason
+    /// `mark_banked` is: a lookup started for one track must not land on its
+    /// successor if the listener moved on while it was in flight.
+    pub fn set_artwork(&self, user_id: i64, title: &str, artist: &str, url: Option<String>) {
+        if let Ok(mut map) = self.0.write() {
+            if let Some(np) = map.get_mut(&user_id) {
+                if np.title == title && np.artist == artist {
+                    np.artwork_url = url;
+                    np.artwork_resolved = true;
                 }
             }
         }
@@ -545,9 +591,12 @@ mod tests {
             position_exact: false,
             paused: false,
             banked: false,
+            artwork_url: None,
+            artwork_resolved: false,
             updated_at: now_secs(),
             source: source.into(),
             listening_context: None,
+            chain_name: None,
             format_type: None,
             codec: None,
             bit_depth: None,

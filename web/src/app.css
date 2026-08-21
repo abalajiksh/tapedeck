@@ -12,6 +12,10 @@
   --td-text:#201e1d; --td-muted:#7a7060; --td-muted-2:#8a8172; --td-muted-3:#9a8f7d;
   --td-nav-fg:#5c5347; --td-nav-hover:#ece0c6;
   --td-good-bg:#e1eecc; --td-good-fg:#56633f;
+  /* Destructive. Deliberately a red rather than the rust accent: `#b2622d` was
+     doing this job in a dozen inline styles, and it is also `.btn-primary:hover`
+     and the love heart — so it reads as "accent", not "careful". */
+  --td-bad-bg:#f7e0e2; --td-bad-fg:#9d2f43;
   --td-border:rgba(32,30,29,.08); --td-topbar:rgba(245,234,216,.92);
   /* accents are theme-independent */
   --td-accent:#c67139; --td-accent-hi:#e07a55; --td-accent-2:#7a8a5e;
@@ -22,6 +26,7 @@
   --td-text:#f3e9d6; --td-muted:#ab9c85; --td-muted-2:#9a8c74; --td-muted-3:#8a7d68;
   --td-nav-fg:#c3b39a; --td-nav-hover:#2c241c;
   --td-good-bg:rgba(122,138,94,.22); --td-good-fg:#aebf92;
+  --td-bad-bg:rgba(235,111,146,.16); --td-bad-fg:#eb6f92;
   --td-border:rgba(244,231,207,.12); --td-topbar:rgba(23,18,14,.92);
 }
 
@@ -67,6 +72,14 @@
   .btn-secondary { border-color: var(--td-border); background: var(--td-surface2); }
   :root[data-theme="dark"] .btn-secondary { background: rgba(244,231,207,.08); color: var(--td-text); }
   .btn-secondary:hover { background: color-mix(in srgb, var(--td-text) 7%, transparent); }
+  /* A destructive action must not look like the neutral one beside it.
+     "Close" and "Remove" sat side by side as two identical pills on the shelf,
+     which is a coin toss the first time you meet it — and one of the two
+     outcomes deletes a record. Tinted fill *and* red text *and* a red border,
+     because colour alone is not a signal everyone receives. */
+  .btn-danger { border-color: color-mix(in srgb, var(--td-bad-fg) 38%, transparent);
+    background: var(--td-bad-bg); color: var(--td-bad-fg); }
+  .btn-danger:hover { background: color-mix(in srgb, var(--td-bad-fg) 18%, transparent); }
   .btn-ghost { color: var(--td-accent); padding-inline: 6px; }
   .btn-ghost:hover { background: color-mix(in srgb, var(--td-accent) 10%, transparent); }
   .btn-icon { width: 36px; height: 36px; padding: 0; }

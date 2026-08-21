@@ -531,6 +531,11 @@ pub async fn submit_listens(
                 // with confidence. Pause is not decoration on this feature.
                 np.paused = playback.is_some_and(|p| p.is_paused());
                 np.listening_context = listening_context.clone();
+                // The chain the ladder actually picked for this listen. Free
+                // here — it was resolved above to attribute the scrobble — and
+                // it is the only rung that represents a decision the listener
+                // made rather than a fallback.
+                np.chain_name = chain_name.clone();
                 let paused = np.paused;
                 let changed = state.now_playing.set(user.user_id, np);
 
