@@ -1142,7 +1142,16 @@ async fn play_side(
     let mut skipped_count = 0usize;
     let mut at = start;
     for t in &tracks {
-        let dur = t.duration_secs.unwrap_or(ASSUMED_SECS);
+        // Two different numbers that used to be one. `spacing` is the bounded
+        // guess the derived clock walks on, which is what `ASSUMED_SECS` was
+        // always for — "wrong but bounded" beats stacking a side on one
+        // instant. The listen's own `duration` is a *measurement*, and there is
+        // none: writing three minutes there put an invented figure into every
+        // hours readout in the application, including the stylus wear this
+        // shelf exists to track. A record whose lookup returned no durations —
+        // Discogs often has none — was quietly under-counting the cartridge.
+        let spacing = t.duration_secs.unwrap_or(ASSUMED_SECS);
+        let dur = t.duration_secs.filter(|d| *d > 0).map(|d| d as u64);
         // The deck's own timing wins wherever it reported any — it ran the
         // clock, so it is the only thing that saw the pauses.
         let outcome = reported.get(&t.position);
@@ -1154,7 +1163,7 @@ async fn play_side(
             artists: None,
             album: Some(release.title.clone()),
             timestamp: ts.max(0) as u64,
-            duration: Some(dur.max(0) as u64),
+            duration: dur,
             track_number: Some(t.position as i32),
             mbid_recording: None,
             mbid_release: release.mbid_release.clone(),
@@ -1201,7 +1210,7 @@ async fn play_side(
             Err(e) => warn!("Could not store a physical listen: {}", e),
         }
         // Only advances the derived clock; a reported track carries its own.
-        at = ts + dur;
+        at = ts + spacing;
     }
 
     // Where the tape ends up. A cassette does not rewind itself, so stopping

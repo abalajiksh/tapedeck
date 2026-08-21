@@ -411,6 +411,47 @@
 		});
 	}
 
+	/**
+	 * Stamp the moment each track actually started.
+	 *
+	 * `play_side` prefers a reported time over its own sequential layout, and
+	 * says so — "it ran the clock, so it is the only thing that saw the pauses".
+	 * The deck never told it. Outcomes were appended in exactly two places, on
+	 * Start (track one) and on Skip, so an ordinary side reported one real time
+	 * and the server laid the rest out end to end from it.
+	 *
+	 * That is what backfills a side across a gap: start side A, listen to two
+	 * tracks, go out for three hours, come back and finish it, and every track
+	 * after the first is recorded as though it played immediately after the one
+	 * before — on top of whatever you listened to while you were out. Pausing
+	 * did not help, because `pausedTotal` only ever moved the *display*.
+	 *
+	 * Stamped as each track becomes current, so a pause simply means the next
+	 * stamp happens later. Idempotent by position, which is what stops the tick
+	 * rewriting a track's start every second and what makes it safe when the
+	 * skip path has already recorded one.
+	 */
+	function noteCurrentTrack() {
+		if (!spinning || spinning.pausedAt) return;
+		const list = sideTracks(spinning.side, spinRelease);
+		const cur = list[currentIndex(spinning)];
+		if (!cur) return;
+		if (spinning.outcomes.some((o) => o.position === cur.position)) return;
+		saveSpinning({
+			...spinning,
+			outcomes: [
+				...spinning.outcomes,
+				{ position: cur.position, started_at: nowSec, skipped: false }
+			]
+		});
+	}
+	// `nowSec` is named in the statement itself, not merely read inside the
+	// function: a Svelte reactive block depends on what it *syntactically*
+	// references, so tracking it through a call never happens. Written the
+	// obvious way first, this fired once per side and stamped only track one —
+	// which looks exactly like the bug it was meant to fix.
+	$: if (nowSec && spinning && !paused) noteCurrentTrack();
+
 	/** Elapsed and remaining for the side currently on. */
 	// Wall clock minus time spent stopped. A paused record is not playing.
 	$: spinElapsed = spinning
@@ -423,6 +464,26 @@
 	$: spinTotal = spinning ? sideSecs(spinning.side, spinRelease) : 0;
 	$: spinLeft = Math.max(0, spinTotal - spinElapsed);
 	$: spinPct = spinTotal ? Math.min(100, (spinElapsed / spinTotal) * 100) : 0;
+	/**
+	 *  Whether the side's running time is a fact or a placeholder.
+	 *
+	 *  `sideSecs` falls back to three minutes a track, which is fine for
+	 *  *spacing* timestamps and is not a length. Fallen came off Discogs with
+	 *  `duration_secs: null` on every track, so its six-track side A totalled
+	 *  6 × 180 = exactly 18:00 — and the deck then announced the side finished,
+	 *  stopped the platter and lifted the arm while Tourniquet was still
+	 *  playing. Four assertions, all resting on a number nobody measured.
+	 *
+	 *  One unknown track is enough to make the total unknown: the sum is only
+	 *  as good as its worst term.
+	 */
+	$: spinLengthKnown = spinning
+		? sideTracks(spinning.side, spinRelease).every((t) => t.duration_secs != null)
+		: false;
+	/** The side is over *and we can say so*. The deck never observes the end of
+	 *  a record — only the person does, which is what Record it is for — so
+	 *  without a real running time this stays false and nothing is claimed. */
+	$: spinOver = spinLengthKnown && spinLeft === 0;
 	/** Is the side that's on the one belonging to the record being shown? */
 	$: spinHere = !!(spinning && open && spinning.releaseId === open.id);
 	/** The record that's on, whichever one it is. */
@@ -1125,7 +1186,7 @@
      objects — the platter sitting still is also the honest signal that
      nothing is playing, which is the rule the dashboard's reels follow. -->
 {#if spinning && deckRelease}
-	<div class="deck deck-hero" class:done={spinLeft === 0} class:paused>
+	<div class="deck deck-hero" class:done={spinOver} class:paused>
 		{#if deckRelease.kind === 'vinyl'}
 			<!-- The deck, drawn as the design has it: a platter turning at
 			     a real 33⅓ — one revolution every 1.8s — and a tonearm that
@@ -1144,7 +1205,7 @@
 					<line x1="60" y1="51" x2="60" y2="58" stroke="#f4e7cf" stroke-width="1.6" stroke-linecap="round" />
 					<circle cx="60" cy="66" r="2.4" fill="#f4e7cf" />
 				</g>
-				<g class="arm" class:down={!paused && spinLeft > 0}>
+				<g class="arm" class:down={!paused && !spinOver}>
 					<line x1="131" y1="30" x2="74" y2="48" stroke="#d9ccb0" stroke-width="3.4" stroke-linecap="round" />
 					<line x1="80" y1="46" x2="69" y2="50" stroke="#e9dcc4" stroke-width="5.5" stroke-linecap="round" />
 					<circle cx="68" cy="50.5" r="2.2" fill="var(--td-accent)" />
@@ -1203,7 +1264,7 @@
 
 		<div style="flex:1;min-width:0;">
 			<div style="font-size:11px;letter-spacing:.16em;text-transform:uppercase;color:#c67139;font-weight:600;">
-				{spinLeft === 0
+				{spinOver
 					? `${unit(deckRelease.kind)} finished`
 					: paused
 						? `${unit(deckRelease.kind)} ${spinning.side} paused`
@@ -1218,12 +1279,22 @@
 				</div>
 			{/if}
 			<div style="font-variant-numeric:tabular-nums;font-size:13px;color:var(--td-muted);margin-top:4px;">
-				{formatDuration(spinElapsed)} / {formatDuration(spinTotal)}
-				{#if spinLeft > 0}· {formatDuration(spinLeft)} left{/if}
+				<!-- A denominator we do not have is worse than none: it is what
+				     made 18:00 look like this record's side A. -->
+				{formatDuration(spinElapsed)}
+				{#if spinLengthKnown}
+					/ {formatDuration(spinTotal)}{#if spinLeft > 0} · {formatDuration(spinLeft)} left{/if}
+				{:else}
+					· length unknown
+				{/if}
 			</div>
-			<div style="height:6px;border-radius:999px;background:var(--td-track);overflow:hidden;margin-top:8px;">
-				<div style="height:100%;width:{spinPct}%;border-radius:999px;background:linear-gradient(90deg,var(--td-accent-2),var(--td-accent-hi));transition:width 1s linear;"></div>
-			</div>
+			<!-- No bar without a real length — a progress bar is a claim about
+			     how much is left, and there is nothing to be a fraction of. -->
+			{#if spinLengthKnown}
+				<div style="height:6px;border-radius:999px;background:var(--td-track);overflow:hidden;margin-top:8px;">
+					<div style="height:100%;width:{spinPct}%;border-radius:999px;background:linear-gradient(90deg,var(--td-accent-2),var(--td-accent-hi));transition:width 1s linear;"></div>
+				</div>
+			{/if}
 		</div>
 
 		<div class="controls">
@@ -1245,7 +1316,7 @@
 			</button>
 			<button class="btn btn-primary" disabled={playing}
 				on:click={() => spinning && play(spinning.side, spinning.startedAt, spinning.releaseId)}>
-				{playing ? '…' : spinLeft === 0 ? 'Record it' : 'Stop & record'}
+				{playing ? '…' : spinOver ? 'Record it' : 'Stop & record'}
 			</button>
 			<button class="btn btn-secondary" on:click={() => saveSpinning(null)}>Cancel</button>
 		</div>
