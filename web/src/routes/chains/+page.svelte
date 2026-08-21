@@ -114,6 +114,31 @@
 		vOpen = true;
 	}
 
+	/**
+	 *  Open the editor on a variant that already exists.
+	 *
+	 *  `saveVariant` has always handled the update — `vId != null` calls
+	 *  `api.updateVariant`, and the dialog even titles itself "Edit variant" for
+	 *  it. Nothing ever set `vId`, so that branch and that title could not be
+	 *  reached: the only way to change a variant was to delete it and build it
+	 *  again, which takes its hours with it. Reported after folding two chains
+	 *  together, because a fold *creates* a variant and there was then no way
+	 *  back into it.
+	 *
+	 *  The editor holds one override, so it opens on the variant's first — which
+	 *  is the only one anything in this UI can create.
+	 */
+	function editVariant(c: SignalChain, v: ChainVariant) {
+		vChain = c;
+		vId = v.id;
+		vName = v.name;
+		vErr = '';
+		const first = v.overrides?.[0];
+		vSlot = first?.position ?? Math.max(0, (c.components?.length ?? 1) - 1);
+		vGear = first?.equipment_id ?? null;
+		vOpen = true;
+	}
+
 	async function saveVariant() {
 		if (!vChain?.id || !vName.trim()) { vErr = 'A variant needs a name.'; return; }
 		if (vGear == null) { vErr = 'Pick the gear that goes in that slot.'; return; }
@@ -1049,6 +1074,9 @@
 					<span style="font-size:14px;min-width:0;">{v.name}</span>
 					<span style="display:flex;align-items:center;gap:6px;flex:none;">
 						<span style="font-size:12.5px;color:var(--td-muted-2);font-variant-numeric:tabular-nums;">{formatHours(v.total_hours)}</span>
+						<button class="icon-btn" style="width:26px;height:26px;" title="Edit this variant"
+							aria-label="Edit variant {v.name}"
+							on:click={() => openChain && editVariant(openChain, v)}>✎</button>
 						<button class="icon-btn danger" style="width:26px;height:26px;" title="Delete this variant"
 							aria-label="Delete variant {v.name}" on:click={() => removeVariant(v)}>✕</button>
 					</span>

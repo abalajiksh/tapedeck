@@ -1770,7 +1770,7 @@
 							</select>
 						</div>
 						<div class="field" style="flex:1;min-width:190px;">
-							<label for="k-gear">On</label>
+							<label for="k-gear" title="Noted against the play and exported; hours come from the chain">On (noted only)</label>
 							<select id="k-gear" class="input" bind:value={playGear} on:change={saveMeta}>
 								<option value={null}>— no deck —</option>
 								{#each gear as g}<option value={g.id}>{g.name}{g.brand ? ` — ${g.brand}` : ''}</option>{/each}
@@ -1787,8 +1787,18 @@
 								No signal chains yet — add one under Signal Chains and every side
 								you play will be attributed to it.
 							{:else}
-								Remembered for next time. The stylus hours of the deck and the
-								chain's own hours both come from the sides played through it.
+								<!-- The old wording credited the deck picker with the stylus
+								     hours, which it does not produce: gear hours are derived
+								     from the *chain's components*, so the cartridge accrues
+								     time because the chain names it. `physical_plays.equipment_id`
+								     is read in exactly one place — the shelf export. Saying so
+								     is better than implying a number comes from a field that
+								     never touches it. -->
+								Remembered for next time. <strong>Played through</strong> is what
+								counts: every side is attributed to that chain, and each piece of
+								gear in it — the cartridge included — takes its hours from there.
+								<strong>On</strong> is noted against the play and appears in the
+								shelf export; it does not add hours of its own.
 							{/if}
 						</div>
 					</div>
