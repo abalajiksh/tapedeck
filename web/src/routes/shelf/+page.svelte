@@ -5,7 +5,8 @@
 	import {
 		api,
 		type PhysicalRelease, type PhysicalTrack, type ReleaseCandidate,
-		type PhysicalImage, type SignalChain, type Equipment, type Spin, type SidePlays
+		type PhysicalImage, type SignalChain, type Equipment, type Spin, type SidePlays,
+		type DurationPreview, type DurationProposal
 	} from '$lib/api';
 	import { formatDuration, formatDateTime, timeAgo, toDateInput, fromDateInput, ownedFor, formatHours } from '$lib/utils';
 	import CoverArt from '$lib/components/CoverArt.svelte';
@@ -215,6 +216,7 @@
 	function saveSpinning(v: Spinning | null) {
 		spinning = v;
 		if (!v) {
+			toPosition = null;
 			spinMeta = null;
 			// Clears the stored spin *and* the now-playing entry, so the two
 			// cannot disagree about what is on.
@@ -297,10 +299,11 @@
 	 * in particular is not recorded as skipped: a track you never reached is not
 	 * a track you skipped, and `scrobbles.skipped` feeds skip-rate analytics.
 	 */
-	function startSide(side: string, from?: number) {
+	function startSide(side: string, from?: number, only = false) {
 		if (!open) return;
 		playMsg = '';
 		flipPrompt = '';
+		toPosition = only ? (from ?? null) : null;
 		const now = Math.floor(Date.now() / 1000);
 		const list = sideTracks(side);
 		const first = from ?? list[0]?.position ?? 1;
@@ -321,6 +324,9 @@
 
 	/** The track the current spin began at, so the play records only from there. */
 	let fromPosition = 1;
+	/** The track it ends at, when you dropped the needle on one song rather than
+	 *  putting a side on. `null` means "to the end", which is the usual case. */
+	let toPosition: number | null = null;
 
 	/** Tracks on a side, in order. */
 	/**
@@ -452,6 +458,97 @@
 	// which looks exactly like the bug it was meant to fix.
 	$: if (nowSec && spinning && !paused) noteCurrentTrack();
 
+	// ── Running times a lookup never supplied ──
+	//
+	// Discogs frequently lists no durations, and the whole tracklist then comes
+	// back with `duration_secs: null`. That used to be invisible: the deck
+	// filled in three minutes a track and presented the sum as a length. It is
+	// visible now, and fixable.
+	let durPreview: DurationPreview | null = null;
+	let durBusy = false;
+	let durNote = '';
+
+	/** Tracks on the open record with no running time. */
+	$: missingDurations = openTracks.filter((t) => t.duration_secs == null).length;
+
+	async function fetchDurations() {
+		if (!open) return;
+		durBusy = true;
+		durNote = '';
+		durPreview = null;
+		try {
+			const p = await api.previewDurations(open.id);
+			if (p.complete) {
+				durNote = 'Every track already has a running time.';
+			} else if (!p.source || !p.durations.some((d) => d.proposed != null)) {
+				durNote = p.note ?? 'Nothing with running times was found for this record.';
+			} else {
+				durPreview = p;
+			}
+		} catch (e) {
+			durNote = e instanceof Error ? e.message : 'Could not look that up';
+		} finally {
+			durBusy = false;
+		}
+	}
+
+	async function applyDurations() {
+		if (!open || !durPreview) return;
+		durBusy = true;
+		try {
+			const r = await api.applyDurations(open.id, durPreview.durations);
+			durPreview = null;
+			durNote = `${r.filled} running time${r.filled === 1 ? '' : 's'} filled in` +
+				(r.listens_updated ? `, ${r.listens_updated} listen${r.listens_updated === 1 ? '' : 's'} corrected.` : '.');
+			// The tracklist and every derived total just changed, and both are
+			// server-side — so they are re-read rather than patched here.
+			await load();
+			const fresh = shelf.find((x) => x.id === open?.id);
+			if (fresh) {
+				open = fresh;
+				openTracks = JSON.parse(fresh.tracks);
+			}
+		} catch (e) {
+			durNote = e instanceof Error ? e.message : 'Could not apply that';
+		} finally {
+			durBusy = false;
+		}
+	}
+
+	/** Total of a side in a proposal, counting what it would become. */
+	function proposedSideSecs(side: string): number {
+		return (durPreview?.durations ?? [])
+			.filter((d) => d.side === side)
+			.reduce((n, d) => n + (d.proposed ?? d.current ?? 0), 0);
+	}
+
+	/**
+	 *  Each side's running time, or `null` where the pressing does not know it.
+	 *
+	 *  Two bugs in one line, both of which `{formatDuration(sideSecs(side))}`
+	 *  had. It was **stale**: a template expression re-runs when the variables
+	 *  it *names* change, and `sideSecs` reads `openTracks` inside its own body,
+	 *  so filling the running times in updated every track row and left the
+	 *  heading reading the old total until a reload. The same trap that made
+	 *  `noteCurrentTrack` fire once per side. And it was **untrue**: `sideSecs`
+	 *  substitutes three minutes a track, so a side nobody has durations for
+	 *  announced a length anyway — which is exactly what put `18:00` on the deck.
+	 *
+	 *  Naming `openTracks` here is what makes it reactive; returning `null`
+	 *  rather than a sum is what stops it inventing one.
+	 */
+	$: sideTotals = new Map<string, number | null>(
+		[...new Set(openTracks.map((t) => t.side))].map((sd) => {
+			const on = openTracks.filter((t) => t.side === sd);
+			return [
+				sd,
+				on.every((t) => t.duration_secs != null)
+					? on.reduce((n, t) => n + (t.duration_secs ?? 0), 0)
+					: null
+			];
+		})
+	);
+
 	/** Elapsed and remaining for the side currently on. */
 	// Wall clock minus time spent stopped. A paused record is not playing.
 	$: spinElapsed = spinning
@@ -461,7 +558,21 @@
 	$: paused = !!spinning?.pausedAt;
 	$: nowTrack = spinning && spinHere ? sideTracks(spinning.side)[currentIndex(spinning)] : null;
 	$: skippedSoFar = spinning?.outcomes.filter((o) => o.skipped).length ?? 0;
-	$: spinTotal = spinning ? sideSecs(spinning.side, spinRelease) : 0;
+	/**
+	 *  The tracks this play covers, as an *end mark within the side*.
+	 *
+	 *  `spinElapsed` counts from the start of the side rather than from the
+	 *  needle drop — `startSecs` carries the tracks before it — so the deck's
+	 *  total has to be measured the same way: everything up to and including
+	 *  the last track that will be recorded. A one-song play therefore ends
+	 *  where that song ends, not where the side does.
+	 */
+	$: spinCovered = spinning
+		? sideTracks(spinning.side, spinRelease).filter(
+				(t) => toPosition == null || t.position <= toPosition
+			)
+		: [];
+	$: spinTotal = spinCovered.reduce((n, t) => n + (t.duration_secs ?? 180), 0);
 	$: spinLeft = Math.max(0, spinTotal - spinElapsed);
 	$: spinPct = spinTotal ? Math.min(100, (spinElapsed / spinTotal) * 100) : 0;
 	/**
@@ -477,9 +588,8 @@
 	 *  One unknown track is enough to make the total unknown: the sum is only
 	 *  as good as its worst term.
 	 */
-	$: spinLengthKnown = spinning
-		? sideTracks(spinning.side, spinRelease).every((t) => t.duration_secs != null)
-		: false;
+	$: spinLengthKnown =
+		spinCovered.length > 0 && spinCovered.every((t) => t.duration_secs != null);
 	/** The side is over *and we can say so*. The deck never observes the end of
 	 *  a record — only the person does, which is what Record it is for — so
 	 *  without a real running time this stays false and nothing is claimed. */
@@ -976,6 +1086,11 @@
 				// Where the needle went down. Without this every track before it
 				// is recorded as having played.
 				from_position: ranHere ? fromPosition : undefined,
+				// Where the needle came up, when it was one song rather than a
+				// side. Everything after it is left unwritten for the reason
+				// everything before `from_position` is — a track nobody reached
+				// is not a track they skipped.
+				to_position: ranHere ? (toPosition ?? undefined) : undefined,
 				// Where the tape ends up. Only when it came off part-way — a side
 				// played to the end has wound through, and the server treats an
 				// absent value as "wind it back". Cassettes only; the server
@@ -1599,7 +1714,9 @@
 							<div>
 								<div style="font-weight:600;font-size:14.5px;">Flip it — side {flipPrompt} is next</div>
 								<div style="font-size:12.5px;color:var(--td-muted);">
-									{formatDuration(sideSecs(flipPrompt))} on that side.
+									{sideTotals.get(flipPrompt) != null
+										? `${formatDuration(sideTotals.get(flipPrompt) ?? 0)} on that side.`
+										: 'Running time unknown for that side.'}
 								</div>
 							</div>
 							<button class="btn btn-primary" style="margin-left:auto;" disabled={playing}
@@ -1650,6 +1767,78 @@
 						</div>
 					</div>
 
+					<!-- A record whose lookup returned no running times used to be
+					     invisible: the deck filled in three minutes a track and showed
+					     the sum as a length. It says so now, because the consequence is
+					     not cosmetic — a side with no running time cannot show a length,
+					     and its listens carry no duration, so it contributes nothing to
+					     the stylus and chain hours below. -->
+					{#if missingDurations > 0}
+						<div class="durwarn">
+							<div style="flex:1;min-width:0;">
+								<div style="font-weight:600;font-size:13.5px;">
+									No running times for {missingDurations} of {openTracks.length} tracks
+								</div>
+								<div style="font-size:12.5px;color:var(--td-muted);margin-top:2px;max-width:60ch;">
+									Whoever catalogued this pressing listed none — Discogs often
+									doesn't. Without them the deck can't show a side length, and
+									these listens add nothing to the hours on your gear.
+								</div>
+							</div>
+							<button class="btn btn-secondary" on:click={fetchDurations} disabled={durBusy}>
+								{durBusy ? 'Looking…' : 'Find running times'}
+							</button>
+						</div>
+					{/if}
+					{#if durNote}
+						<p style="font-size:12.5px;color:var(--td-muted);margin:10px 0 0;">{durNote}</p>
+					{/if}
+
+					{#if durPreview && durPreview.source}
+						<!-- Shown before anything is written, and the apply sends these
+						     rows straight back rather than searching again: a preview
+						     that applies something else is worse than no preview. The
+						     pressing is named because it is probably *not* the one on
+						     the shelf — this is a search, and a wrong match is the thing
+						     you are being asked to catch. -->
+						<div class="durprev">
+							<div style="font-size:12.5px;color:var(--td-muted);margin-bottom:10px;">
+								From <strong>{durPreview.source.title}</strong> — {durPreview.source.artist}{durPreview.source.year ? ` · ${durPreview.source.year}` : ''}{durPreview.source.format ? ` · ${durPreview.source.format}` : ''}{durPreview.source.country ? ` · ${durPreview.source.country}` : ''}.
+								Matched by title, so check it is the same record.
+							</div>
+							{#each sides as side}
+								<div class="durside">
+									<div class="durhead">
+										<span>{unit(open.kind)} {side}</span>
+										<span>{formatDuration(proposedSideSecs(side))}</span>
+									</div>
+									{#each durPreview.durations.filter((d) => d.side === side) as d}
+										<div class="durrow">
+											<span class="durtitle">{d.position}. {d.title}</span>
+											<span class="durval" class:missed={d.proposed == null && d.current == null}>
+												{#if d.current != null}
+													{formatDuration(d.current)}
+												{:else if d.proposed != null}
+													→ {formatDuration(d.proposed)}
+												{:else}
+													no match
+												{/if}
+											</span>
+										</div>
+									{/each}
+								</div>
+							{/each}
+							<div style="display:flex;gap:10px;margin-top:14px;flex-wrap:wrap;">
+								<button class="btn btn-primary" on:click={applyDurations} disabled={durBusy}>
+									{durBusy ? '…' : 'Apply'}
+								</button>
+								<button class="btn btn-secondary" on:click={() => (durPreview = null)}>
+									Not this pressing
+								</button>
+							</div>
+						</div>
+					{/if}
+
 					<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:14px;margin-top:18px;">
 						{#each sides as side, i}
 							<!-- A full-width heading rather than a second grid, so the side
@@ -1662,7 +1851,9 @@
 								<div style="display:flex;align-items:baseline;justify-content:space-between;gap:10px;">
 									<span class="h-display" style="font-size:17px;">{unit(open.kind)} {side}</span>
 									<span style="font-size:12px;color:var(--td-muted-2);">
-										{formatDuration(sideSecs(side))}
+										{sideTotals.get(side) != null
+											? formatDuration(sideTotals.get(side) ?? 0)
+											: '—'}
 									</span>
 								</div>
 								<!-- What this side has been through, as opposed to how long it
@@ -1690,17 +1881,26 @@
 								<ol style="margin:10px 0 0;padding-left:18px;">
 									{#each openTracks.filter((t) => t.side === side) as t}
 										<li style="font-size:13px;padding:1px 0;">
-											<button class="trk" disabled={playing || !!spinning}
-												title="Start {unit(open.kind).toLowerCase()} {side} from here"
-												on:click={() => startSide(side, t.position)}>
-												<span>{t.title}</span>
-												{#if t.duration_secs}
-													<span style="color:var(--td-muted-2);">· {formatDuration(t.duration_secs)}</span>
-												{/if}
-												{#if parkedAt(open, side) === t.position}
-													<span class="parkpip" title="The tape is sitting here">◂ here</span>
-												{/if}
-											</button>
+											<span class="trkrow">
+												<button class="trk" disabled={playing || !!spinning}
+													title="Start {unit(open.kind).toLowerCase()} {side} from here and play on"
+													on:click={() => startSide(side, t.position)}>
+													<span>{t.title}</span>
+													{#if t.duration_secs}
+														<span style="color:var(--td-muted-2);">· {formatDuration(t.duration_secs)}</span>
+													{/if}
+													{#if parkedAt(open, side) === t.position}
+														<span class="parkpip" title="The tape is sitting here">◂ here</span>
+													{/if}
+												</button>
+												<!-- The other half of dropping a needle: sometimes you
+												     put one song on and lift it again. Nothing after it
+												     is written, so the side is charged for the one track
+												     that played and `track_count` marks it partial. -->
+												<button class="trkone" disabled={playing || !!spinning}
+													title="Play only {t.title}"
+													on:click={() => startSide(side, t.position, true)}>just this</button>
+											</span>
 										</li>
 									{/each}
 								</ol>
@@ -2027,6 +2227,43 @@
 	/* Spans the whole grid so the sides below it start a fresh row — which is
 	   what makes it read as a heading over them rather than a card beside
 	   them. */
+	.trkrow { display: flex; align-items: baseline; gap: 8px; min-width: 0; }
+	.trkrow .trk { min-width: 0; }
+	/* Quiet until the row is under the pointer: every track carries one, and a
+	   column of live-looking buttons would compete with the track names. */
+	.trkone {
+		flex: none; font: inherit; font-size: 11.5px; cursor: pointer;
+		background: none; border: 1px solid var(--td-border); border-radius: 999px;
+		padding: 1px 8px; color: var(--td-muted-3); opacity: 0; transition: opacity .12s;
+	}
+	.trkrow:hover .trkone, .trkone:focus-visible { opacity: 1; }
+	.trkone:hover { color: var(--td-accent); border-color: var(--td-accent); }
+	.trkone:disabled { cursor: not-allowed; }
+	@media (hover: none) { .trkone { opacity: 1; } }
+
+	.durwarn {
+		display: flex; align-items: center; gap: 14px; flex-wrap: wrap;
+		background: var(--td-surface2); border: 1px solid var(--td-border);
+		border-radius: 14px; padding: 14px 16px; margin-top: 18px;
+	}
+	.durprev {
+		background: var(--td-surface2); border: 1px solid var(--td-border);
+		border-radius: 14px; padding: 14px 16px; margin-top: 12px;
+	}
+	.durside { margin-bottom: 12px; }
+	.durhead {
+		display: flex; justify-content: space-between; font-size: 12px;
+		letter-spacing: .08em; text-transform: uppercase; color: var(--td-muted-2);
+		padding-bottom: 5px; border-bottom: 1px solid var(--td-border);
+	}
+	.durrow {
+		display: flex; justify-content: space-between; gap: 12px;
+		font-size: 13px; padding: 4px 0;
+	}
+	.durtitle { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+	.durval { font-variant-numeric: tabular-nums; flex: none; color: var(--td-accent); }
+	.durval.missed { color: var(--td-muted-3); font-style: italic; }
+
 	.disc-head {
 		grid-column: 1 / -1;
 		font-size: 12px;

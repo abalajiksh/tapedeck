@@ -26,7 +26,7 @@ openapi: 3.1.0
 
 info:
   title: Tapedeck
-  version: 0.74.1
+  version: 0.75.0
   summary: Self-hosted scrobbler and listening journal.
   description: |
     Tapedeck ingests listens, enriches them with MusicBrainz metadata, stores
@@ -4103,6 +4103,118 @@ paths:
         '200': { description: Deleted., content: { application/json: { schema: { $ref: '#/components/schemas/Ok' } } } }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '404': { $ref: '#/components/responses/NotFound' }
+
+  /api/v1/physical/{id}/durations:
+    get:
+      tags: [Shelf]
+      summary: What another pressing says this record's tracks run.
+      description: |
+        **Preview only — nothing is written.** Session-only.
+
+        Exists because a record catalogued from Discogs often has no running
+        times at all, which used to leave the deck showing three minutes a track
+        as though it were a length. The lookup is a *search* (MusicBrainz id if
+        the record has one, else barcode, else artist and title), so whatever
+        comes back is a **different pressing** and may be ordered differently or
+        carry bonus tracks — tracks are therefore matched by title, never by
+        position.
+
+        `complete: true` means every track already has a duration and there is
+        nothing to do. An empty `durations` with a null `source` means nothing
+        with running times was found, which is a normal answer.
+      security: [{ sessionCookie: [] }]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: integer }
+      responses:
+        '200':
+          description: OK.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  complete: { type: boolean }
+                  source:
+                    type: [object, 'null']
+                    description: The pressing the running times came from.
+                    additionalProperties: true
+                  durations:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        side: { type: string }
+                        position: { type: integer }
+                        title: { type: string }
+                        current: { type: [integer, 'null'], description: What the shelf holds now. }
+                        proposed: { type: [integer, 'null'], description: 'Null where nothing matched — never a guess.' }
+        '400': { description: That record has no tracklist. }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { description: No such record. }
+    post:
+      tags: [Shelf]
+      summary: Write the running times that were previewed.
+      description: |
+        Session-only. Takes the proposals **back** rather than searching again,
+        so what lands is what was on the screen — a preview that applies
+        something else is worse than no preview.
+
+        Only fills a duration the record does not already have: one that was
+        typed in, or that an earlier lookup got right, is never overwritten by a
+        later fetch.
+
+        The listens already recorded from those sides are given the same figures,
+        because every hours readout derives from `scrobbles.duration`. Their
+        **timestamps are not touched** — `physical_plays` records when a side
+        started and nothing about when it ended, so where the tracks fell is
+        unrecoverable, and re-spacing them would assume the side ran
+        uninterrupted.
+      security: [{ sessionCookie: [] }]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: integer }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [durations]
+              properties:
+                durations:
+                  type: array
+                  items:
+                    type: object
+                    properties:
+                      side: { type: string }
+                      position: { type: integer }
+                      title: { type: string }
+                      current: { type: [integer, 'null'] }
+                      proposed: { type: [integer, 'null'] }
+      responses:
+        '200':
+          description: OK.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  filled: { type: integer, description: Tracks that gained a duration. }
+                  listens_updated: { type: integer, description: Listens already recorded that were corrected. }
+                  plays_recomputed:
+                    type: integer
+                    description: |
+                      Side plays whose recorded wear was brought back in line.
+                      **Whole-side plays only** — a partial play records how
+                      many tracks ran but never which, so its wear cannot be
+                      reconstructed and is left alone rather than inflated.
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { description: No such record. }
 
   /api/v1/physical/{id}/tracks:
     put:

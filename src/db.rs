@@ -1186,7 +1186,16 @@ impl Database {
                 duration_secs INTEGER NOT NULL DEFAULT 0,
                 track_count INTEGER NOT NULL DEFAULT 0,
                 equipment_id INTEGER REFERENCES equipment(id),
-                chain_id INTEGER REFERENCES signal_chains(id)
+                chain_id INTEGER REFERENCES signal_chains(id),
+                -- When the play was *written*, as opposed to when the side
+                -- started. The pair is the only record of how long the record
+                -- was actually on: `played_at` alone cannot say whether a side
+                -- ran straight through or was left half-played over an
+                -- afternoon, which is what made a set of listens land on top of
+                -- everything else heard in between. Nullable, because for every
+                -- play recorded before this column there is no answer, and
+                -- inventing one would be the same mistake again.
+                recorded_at INTEGER
             )",
         )
         .execute(&self.pool)
@@ -2527,6 +2536,13 @@ impl Database {
         // already exists, which is the only safe reading of an upgrade: nobody
         // consented to a public page by installing a new binary. `NOT NULL
         // DEFAULT 0` gives existing rows the off state without a backfill.
+        if !has_column(&self.pool, "physical_plays", "recorded_at").await {
+            info!("⚙️ Migrating: remembering when a side play was written...");
+            let _ = sqlx::query("ALTER TABLE physical_plays ADD COLUMN recorded_at INTEGER")
+                .execute(&self.pool)
+                .await;
+        }
+
         if !has_column(&self.pool, "users", "public_now_playing").await {
             info!("⚙️ Migrating: adding the public now-playing switch...");
             let _ = sqlx::query(
@@ -4598,6 +4614,88 @@ impl Database {
     }
 
     /// Replace the stored tracklist — how a hand-corrected side split is saved.
+    /// Give the listens already recorded from a side the durations their tracks
+    /// were finally found to have.
+    ///
+    /// A shelf listen banked before the tracklist had durations stored NULL (or,
+    /// before v0.74.1, a three-minute placeholder), so the record's chain and
+    /// stylus hours were missing or invented. Once the real running times
+    /// arrive, the listens are the only place the correction has to land —
+    /// every hours figure in the application derives from `scrobbles.duration`.
+    ///
+    /// **Timestamps are deliberately not touched.** `physical_plays` records
+    /// when a side *started* and nothing about when it ended, so where the
+    /// tracks actually fell is unrecoverable; re-spacing them from the start
+    /// would assume the side ran uninterrupted, which is precisely the case
+    /// that produced the wrong data in the first place.
+    ///
+    /// Keyed on `source_id`, which `play_side` builds as
+    /// `physical-<release>-<side>-<start>-<position>`. That is exact: it names
+    /// this pressing, this side and this track, so it cannot reach a listen of
+    /// another record that happens to share a title.
+    pub async fn set_physical_listen_durations(
+        &self,
+        user_id: i64,
+        release_id: i64,
+        updates: &[(String, i64, i64)],
+    ) -> Result<u64, sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
+        let mut touched = 0u64;
+        for (side, position, secs) in updates {
+            if *secs <= 0 {
+                continue;
+            }
+            let pattern = format!("physical-{release_id}-{side}-%-{position}");
+            let r = sqlx::query(
+                "UPDATE scrobbles SET duration = ?
+                  WHERE user_id = ? AND source_name = 'physical' AND source_id LIKE ?",
+            )
+            .bind(secs)
+            .bind(user_id)
+            .bind(&pattern)
+            .execute(&mut *tx)
+            .await?;
+            touched += r.rows_affected();
+        }
+        tx.commit().await?;
+        Ok(touched)
+    }
+
+    /// Bring a side's recorded *wear* back in line with its real running time.
+    ///
+    /// `physical_plays.duration_secs` is what the side card and the release
+    /// total read, and it was banked from the same placeholder the listens
+    /// were — so correcting the listens alone leaves the shelf saying one thing
+    /// and the hours another.
+    ///
+    /// **Only whole-side plays are touched.** `track_count` is the one thing
+    /// distinguishing a side that ran through from a needle dropped on a single
+    /// song, and a partial play's wear is a subset nothing here can reconstruct:
+    /// the row records how many tracks played, never which. Rewriting those from
+    /// the full side would charge the stylus for music it did not play, which is
+    /// the error this whole pass exists to remove.
+    pub async fn recompute_side_play_wear(
+        &self,
+        user_id: i64,
+        release_id: i64,
+        side: &str,
+        full_track_count: i64,
+        side_secs: i64,
+    ) -> Result<u64, sqlx::Error> {
+        let r = sqlx::query(
+            "UPDATE physical_plays SET duration_secs = ?
+              WHERE user_id = ? AND release_id = ? AND side = ? AND track_count = ?",
+        )
+        .bind(side_secs)
+        .bind(user_id)
+        .bind(release_id)
+        .bind(side)
+        .bind(full_track_count)
+        .execute(&self.pool)
+        .await?;
+        Ok(r.rows_affected())
+    }
+
     pub async fn set_physical_tracks(
         &self,
         user_id: i64,
@@ -4664,8 +4762,8 @@ impl Database {
         let res = sqlx::query(
             "INSERT INTO physical_plays
                 (user_id, release_id, side, played_at, duration_secs, track_count,
-                 equipment_id, chain_id)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                 equipment_id, chain_id, recorded_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(user_id)
         .bind(release_id)
@@ -4675,6 +4773,7 @@ impl Database {
         .bind(track_count)
         .bind(equipment_id)
         .bind(chain_id)
+        .bind(Self::now_secs())
         .execute(&self.pool)
         .await?;
         Ok(res.last_insert_rowid())

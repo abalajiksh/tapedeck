@@ -86,7 +86,7 @@ pub trait PlaylistTarget: Send + Sync {
 /// as an entire title stays as it is, and `Untitled (Alva Noto)` keeps its
 /// stem. Leading brackets are left alone because a title that opens with one
 /// usually means it.
-fn without_qualifier(title: &str) -> &str {
+pub fn without_qualifier(title: &str) -> &str {
     let mut s = title.trim();
     loop {
         let Some(open) = s.rfind(['(', '[']) else { return s };

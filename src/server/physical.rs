@@ -20,7 +20,7 @@ use axum::{
     routing::{get, post},
     Router,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tracing::{info, warn};
 
@@ -556,6 +556,225 @@ async fn set_tracks(
     }
 }
 
+/// One track's proposed running time, as previewed and as applied.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct DurationProposal {
+    pub side: String,
+    pub position: i64,
+    pub title: String,
+    /// What the shelf holds now. `None` is the case this exists for.
+    pub current: Option<i64>,
+    /// What the looked-up pressing says. `None` where nothing matched.
+    pub proposed: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ApplyDurations {
+    pub durations: Vec<DurationProposal>,
+}
+
+/// GET /api/v1/physical/:id/durations — what another pressing says the tracks run.
+///
+/// **Preview only.** Nothing is written, and the apply below takes back exactly
+/// what was shown rather than searching again — a preview that says one thing
+/// and applies another is worse than no preview, which is the rule the metadata
+/// sanitiser already follows. It matters more here than usual: a wrong duration
+/// is invisible the moment it is stored, and there is no way afterwards to tell
+/// which figures were guessed.
+///
+/// The lookup is a **search**, not a join. A record catalogued from Discogs
+/// often carries no MusicBrainz id at all — Fallen does not — so the barcode is
+/// the key, and whatever comes back is a *different pressing* that may be
+/// ordered differently or carry bonus tracks. `match_durations` therefore
+/// matches on titles; see its own note for why position matching is wrong.
+async fn preview_durations(
+    State(state): State<Arc<AppState>>,
+    user: AuthUser,
+    Path(id): Path<i64>,
+) -> impl IntoResponse {
+    let Ok(Some(release)) = state.db.get_physical(user.user_id, id).await else {
+        return err(404, "No such record");
+    };
+    let stored: Vec<PhysicalTrack> = serde_json::from_str(&release.tracks).unwrap_or_default();
+    if stored.is_empty() {
+        return err(400, "That record has no tracklist to fill in");
+    }
+    if stored.iter().all(|t| t.duration_secs.is_some()) {
+        return (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "complete": true,
+                "durations": [],
+                "source": serde_json::Value::Null,
+            })),
+        )
+            .into_response();
+    }
+
+    // Best key first. An MBID names the pressing outright; a barcode names the
+    // edition; artist and title are a last resort and the most likely to find
+    // somebody else's reissue.
+    // Errors are **not** folded into "nothing found". MusicBrainz rate-limits
+    // an unauthenticated caller readily, and reporting that as an empty result
+    // sends somebody hunting for running times that are right there — the
+    // mistake `musicbrainz_search` warns about in its own body, made one layer
+    // up. A 502 says the lookup failed; an empty list says it succeeded and had
+    // nothing.
+    let lookup = if let Some(mbid) = release.mbid_release.as_deref().filter(|m| !m.is_empty()) {
+        release_lookup::musicbrainz_release(mbid).await.map(|c| c.into_iter().collect::<Vec<_>>())
+    } else if let Some(bc) = release.barcode.as_deref().filter(|b| !b.trim().is_empty()) {
+        let q = format!("barcode:{}", bc.replace([' ', '-'], ""));
+        release_lookup::musicbrainz_search(&q, 3).await
+    } else {
+        let q = format!(
+            "artist:\"{}\" AND release:\"{}\"",
+            release.artist.replace('"', ""),
+            release.title.replace('"', "")
+        );
+        release_lookup::musicbrainz_search(&q, 3).await
+    };
+    let found = match lookup {
+        Ok(v) => v,
+        Err(e) => return err(502, format!("MusicBrainz: {e}")),
+    };
+
+    // The first candidate that actually carries running times. A pressing with
+    // none is no more use than the one on the shelf.
+    let Some(source) =
+        found.into_iter().find(|c| c.tracks.iter().any(|t| t.duration_secs.is_some()))
+    else {
+        return (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "complete": false,
+                "durations": [],
+                "source": serde_json::Value::Null,
+                "note": "Nothing with running times was found for this record.",
+            })),
+        )
+            .into_response();
+    };
+
+    let matched = release_lookup::match_durations(&stored, &source.tracks);
+    let durations: Vec<DurationProposal> = stored
+        .iter()
+        .zip(matched)
+        .map(|(t, proposed)| DurationProposal {
+            side: t.side.clone(),
+            position: t.position,
+            title: t.title.clone(),
+            current: t.duration_secs,
+            proposed,
+        })
+        .collect();
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "complete": false,
+            "durations": durations,
+            "source": {
+                "title": source.title,
+                "artist": source.artist,
+                "year": source.year,
+                "format": source.format,
+                "country": source.country,
+                "mbid_release": source.mbid_release,
+            },
+        })),
+    )
+        .into_response()
+}
+
+/// POST /api/v1/physical/:id/durations — write the running times that were shown.
+///
+/// Takes the proposals back rather than re-running the search, so what lands is
+/// what was on the screen. Only fills a duration the shelf does **not** already
+/// have: a running time somebody typed in, or one an earlier lookup got right,
+/// is not something a later fetch may quietly overwrite.
+///
+/// Then the listens already recorded from those sides are given the same
+/// figures, because every hours readout in the application derives from
+/// `scrobbles.duration` — filling the tracklist alone would leave the shelf
+/// saying one thing and the stylus meter another.
+async fn apply_durations(
+    State(state): State<Arc<AppState>>,
+    user: AuthUser,
+    Path(id): Path<i64>,
+    Json(body): Json<ApplyDurations>,
+) -> impl IntoResponse {
+    let Ok(Some(release)) = state.db.get_physical(user.user_id, id).await else {
+        return err(404, "No such record");
+    };
+    let mut tracks: Vec<PhysicalTrack> = serde_json::from_str(&release.tracks).unwrap_or_default();
+
+    let mut filled = 0usize;
+    let mut listen_updates: Vec<(String, i64, i64)> = Vec::new();
+    for p in &body.durations {
+        let Some(secs) = p.proposed.filter(|s| *s > 0) else { continue };
+        let Some(t) = tracks
+            .iter_mut()
+            .find(|t| t.position == p.position && t.side.eq_ignore_ascii_case(&p.side))
+        else {
+            continue;
+        };
+        if t.duration_secs.is_some() {
+            continue;
+        }
+        t.duration_secs = Some(secs);
+        filled += 1;
+        listen_updates.push((t.side.clone(), t.position, secs));
+    }
+
+    // Only writes when something changed, but the reconciliation below runs
+    // either way: a record whose tracklist was filled in before the wear was
+    // being corrected would otherwise have no way back into line.
+    if filled > 0 {
+        let json = serde_json::to_string(&tracks).unwrap_or_else(|_| "[]".into());
+        if let Err(e) = state.db.set_physical_tracks(user.user_id, id, &json).await {
+            return err(500, e.to_string());
+        }
+    }
+    let listens =
+        match state.db.set_physical_listen_durations(user.user_id, id, &listen_updates).await {
+            Ok(n) => n,
+            Err(e) => {
+                warn!("Filled the tracklist but could not correct its listens: {}", e);
+                0
+            }
+        };
+
+    // And the wear those sides recorded, which reads from `physical_plays`
+    // rather than the listens — correcting one and not the other would leave
+    // the side card and the stylus meter disagreeing about the same play.
+    let mut sides_touched = 0u64;
+    for side in tracks.iter().map(|t| t.side.clone()).collect::<std::collections::BTreeSet<_>>() {
+        let on: Vec<&PhysicalTrack> = tracks.iter().filter(|t| t.side == side).collect();
+        if !on.iter().all(|t| t.duration_secs.is_some()) {
+            continue;
+        }
+        let secs: i64 = on.iter().filter_map(|t| t.duration_secs).sum();
+        match state
+            .db
+            .recompute_side_play_wear(user.user_id, id, &side, on.len() as i64, secs)
+            .await
+        {
+            Ok(n) => sides_touched += n,
+            Err(e) => warn!("Could not recompute the wear on side {}: {}", side, e),
+        }
+    }
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "filled": filled,
+            "listens_updated": listens,
+            "plays_recomputed": sides_touched,
+        })),
+    )
+        .into_response()
+}
+
 async fn delete_release(
     State(state): State<Arc<AppState>>,
     user: AuthUser,
@@ -1037,6 +1256,19 @@ pub struct PlaySide {
     /// these rows.
     pub equipment_id: Option<i64>,
     pub chain_id: Option<i64>,
+    /// The last track that played, when the side was not run to its end —
+    /// dropping the needle on one song and lifting it again.
+    ///
+    /// With `from_position` this selects a range, and the two being equal is a
+    /// single track. Everything after it is left unwritten for the same reason
+    /// everything before `from_position` is: a track nobody reached is not a
+    /// track they skipped, and filing it as one would put noise into the single
+    /// query in `db.rs` whose subject *is* the skipped rows.
+    ///
+    /// The play still counts as wear — the needle really was in the groove —
+    /// and `track_count` is what tells it apart from a whole side afterwards,
+    /// which is why no new column was needed.
+    pub to_position: Option<i64>,
     /// The first track that actually played, when the side did not start at its
     /// beginning — the needle dropped at track 4, or a tape carried on from
     /// where it was parked.
@@ -1102,6 +1334,12 @@ async fn play_side(
         tracks.retain(|t| t.position >= from);
         if tracks.is_empty() {
             return err(400, format!("Side {side} has no track at or after {from}"));
+        }
+    }
+    if let Some(to) = body.to_position {
+        tracks.retain(|t| t.position <= to);
+        if tracks.is_empty() {
+            return err(400, format!("Side {side} has no track at or before {to}"));
         }
     }
 
@@ -1309,7 +1547,17 @@ async fn play_side(
     let mut sides: Vec<String> = all.iter().map(|t| t.side.to_uppercase()).collect();
     sides.sort();
     sides.dedup();
-    let next = sides.iter().position(|s| *s == side).map(|i| sides[(i + 1) % sides.len()].clone());
+    // Only when the side actually ran to its end. Lifting the needle after one
+    // song and being told to turn the record over is the reminder firing on
+    // something that did not happen — the flip prompt is for a side that has
+    // just run out, which is the whole reason it exists.
+    let ran_out = tracks.last().map(|t| t.position)
+        == all.iter().filter(|t| t.side.eq_ignore_ascii_case(&side)).map(|t| t.position).max();
+    let next = ran_out
+        .then(|| {
+            sides.iter().position(|s| *s == side).map(|i| sides[(i + 1) % sides.len()].clone())
+        })
+        .flatten();
 
     (
         StatusCode::OK,
@@ -2430,6 +2678,7 @@ pub fn create_physical_router() -> Router<Arc<AppState>> {
         .route("/api/v1/physical", get(list_shelf).post(add_release))
         .route("/api/v1/physical/:id", get(get_one).patch(update_release).delete(delete_release))
         .route("/api/v1/physical/:id/tracks", axum::routing::put(set_tracks))
+        .route("/api/v1/physical/:id/durations", get(preview_durations).post(apply_durations))
         .route("/api/v1/physical/:id/play", post(play_side))
         .route("/api/v1/physical/:id/now-playing", post(set_now_playing))
         .route("/api/v1/physical/:id/sides", get(side_plays))

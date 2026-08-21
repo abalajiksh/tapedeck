@@ -291,6 +291,59 @@ pub fn disc_sides(per_disc_counts: &[usize]) -> Vec<String> {
     out
 }
 
+/// Match a fetched tracklist onto the one already on the shelf, by title.
+///
+/// The point of this function is that **position matching is wrong**. A record
+/// on the shelf has no durations because the source that catalogued it had
+/// none — Discogs frequently does — so the fix is to look the release up
+/// somewhere else, and "somewhere else" is a *different pressing*: it may carry
+/// bonus tracks, run to a different number of media, or order a side
+/// differently. Lining the two lists up by index would silently assign one
+/// track's running time to another, which is the same class of invisible error
+/// as the placeholder durations this exists to replace.
+///
+/// So titles decide, using the fold `playlists::pick` already applies to the
+/// same question — `db::normalise_artist` for punctuation and accents, then a
+/// second pass with any trailing bracketed qualifier removed, so a shelf's
+/// "Haunted" matches a MusicBrainz "Haunted (Album Version)". That fold is not
+/// a third normaliser: it is the existing one asked about a different field.
+///
+/// Matching is **one-to-one** and in stored order. A release with two tracks of
+/// the same name — a reprise, a hidden track — gives its first unclaimed copy
+/// to the first asker rather than the same duration to both.
+///
+/// Returns one entry per stored track, `None` where nothing matched. A caller
+/// must show that to somebody before writing it: a wrong duration is invisible
+/// once stored, and re-deriving which ones were guessed is impossible.
+pub fn match_durations(stored: &[PhysicalTrack], found: &[PhysicalTrack]) -> Vec<Option<i64>> {
+    let fold = |t: &str| crate::db::normalise_artist(t);
+    let stem = |t: &str| crate::db::normalise_artist(crate::playlists::without_qualifier(t));
+
+    let mut claimed = vec![false; found.len()];
+    let mut out = Vec::with_capacity(stored.len());
+
+    for t in stored {
+        // Exact fold first, so a qualifier-stripped near-match can never beat a
+        // title that agrees outright.
+        let exact = found.iter().enumerate().position(|(i, f)| {
+            !claimed[i] && f.duration_secs.is_some() && fold(&f.title) == fold(&t.title)
+        });
+        let hit = exact.or_else(|| {
+            found.iter().enumerate().position(|(i, f)| {
+                !claimed[i] && f.duration_secs.is_some() && stem(&f.title) == stem(&t.title)
+            })
+        });
+        match hit {
+            Some(i) => {
+                claimed[i] = true;
+                out.push(found[i].duration_secs);
+            }
+            None => out.push(None),
+        }
+    }
+    out
+}
+
 /// Search MusicBrainz for a pressing.
 ///
 /// `query` is a Lucene expression; the caller composes it so barcode, catalogue
@@ -1101,6 +1154,84 @@ mod tests {
         for want in ["A", "B", "C", "D"] {
             assert!(sides.iter().any(|s| s == want), "side {want} missing");
         }
+    }
+
+    fn t(side: &str, pos: i64, title: &str, secs: Option<i64>) -> PhysicalTrack {
+        PhysicalTrack {
+            side: side.into(),
+            position: pos,
+            title: title.into(),
+            artist: None,
+            duration_secs: secs,
+            disc: None,
+        }
+    }
+
+    /// Durations are matched by title, never by position.
+    ///
+    /// The whole reason to look a release up again is that the source which
+    /// catalogued it had no durations — so the answer comes from a *different*
+    /// pressing, which may carry a bonus track or order a side differently.
+    /// Lining the lists up by index would hand one track's running time to
+    /// another, invisibly.
+    #[test]
+    fn durations_are_matched_by_title_not_by_position() {
+        let shelf = [
+            t("A", 1, "Going Under", None),
+            t("A", 2, "Bring Me To Life", None),
+            t("A", 3, "Tourniquet", None),
+        ];
+        // The found pressing opens with a track the shelf copy does not have,
+        // so every index is shifted by one.
+        let found = [
+            t("A", 1, "Intro", Some(60)),
+            t("A", 2, "Going Under", Some(214)),
+            t("A", 3, "Bring Me To Life", Some(236)),
+            t("A", 4, "Tourniquet", Some(278)),
+        ];
+        assert_eq!(
+            match_durations(&shelf, &found),
+            vec![Some(214), Some(236), Some(278)],
+            "a shifted tracklist must not shift the durations with it"
+        );
+    }
+
+    /// A trailing qualifier is a labelling difference, not a different song —
+    /// but it must never beat a title that agrees outright.
+    #[test]
+    fn a_qualifier_is_matched_through_but_never_preferred() {
+        let shelf = [t("A", 1, "Haunted", None), t("A", 2, "My Immortal", None)];
+        let found = [
+            t("A", 1, "My Immortal (Band Version)", Some(263)),
+            t("A", 2, "Haunted", Some(247)),
+            // The exact title exists further down; it has to win over the
+            // qualifier-stripped match above it.
+            t("A", 3, "My Immortal", Some(255)),
+        ];
+        assert_eq!(match_durations(&shelf, &found), vec![Some(247), Some(255)]);
+    }
+
+    /// Two tracks of one name — a reprise — must not both take the same entry,
+    /// and a track nothing matches comes back unknown rather than guessed.
+    #[test]
+    fn one_found_track_is_claimed_once_and_a_miss_stays_unknown() {
+        let shelf = [
+            t("A", 1, "Whisper", None),
+            t("A", 2, "Whisper", None),
+            t("A", 3, "Not On That Pressing", None),
+        ];
+        let found = [t("A", 1, "Whisper", Some(320)), t("A", 2, "Whisper", Some(99))];
+        assert_eq!(match_durations(&shelf, &found), vec![Some(320), Some(99), None]);
+    }
+
+    /// A found track with no duration of its own is no answer at all — it must
+    /// be skipped rather than claimed, or it would block the real match behind
+    /// it and report a miss.
+    #[test]
+    fn a_durationless_match_does_not_claim_the_slot() {
+        let shelf = [t("A", 1, "Imaginary", None)];
+        let found = [t("A", 1, "Imaginary", None), t("B", 1, "Imaginary", Some(275))];
+        assert_eq!(match_durations(&shelf, &found), vec![Some(275)]);
     }
 
     /// An unbalanced double LP must break where the *records* break.

@@ -924,6 +924,24 @@ export interface MixedAlbum {
 }
 
 /** One track on a physical side. */
+export interface DurationProposal {
+	side: string;
+	position: number;
+	title: string;
+	/** What the shelf holds now — null is the case this exists for. */
+	current: number | null;
+	/** What the looked-up pressing says. Null where nothing matched, never a guess. */
+	proposed: number | null;
+}
+
+export interface DurationPreview {
+	/** Every track already has a duration; there is nothing to do. */
+	complete: boolean;
+	source: { title: string; artist: string; year?: number | null; format?: string | null; country?: string | null } | null;
+	durations: DurationProposal[];
+	note?: string;
+}
+
 export interface PhysicalTrack {
 	side: string;
 	position: number;
@@ -1657,6 +1675,19 @@ class TapedeckAPI {
 	): Promise<{ status: string; sides_rewritten?: boolean }> {
 		return this.patch(`/api/v1/physical/${id}`, body);
 	}
+	/** What another pressing says this record's tracks run. Preview only. */
+	async previewDurations(id: number): Promise<DurationPreview> {
+		return this.get(`/api/v1/physical/${id}/durations`);
+	}
+
+	/** Write back exactly what the preview showed. */
+	async applyDurations(
+		id: number,
+		durations: DurationProposal[]
+	): Promise<{ filled: number; listens_updated: number }> {
+		return this.post(`/api/v1/physical/${id}/durations`, { durations });
+	}
+
 	async setPressingTracks(id: number, tracks: PhysicalTrack[]) {
 		return this.request('PUT', `/api/v1/physical/${id}/tracks`, { tracks });
 	}
@@ -1676,6 +1707,8 @@ class TapedeckAPI {
 			 *  not become skips either, since a track you never reached is not
 			 *  one you skipped. */
 			from_position?: number;
+		/** Last track played — with `from_position`, a range; equal, one track. */
+		to_position?: number;
 			/** Where a tape ended up, in seconds into the side. Cassettes only;
 			 *  the server refuses it for anything else, because a record has no
 			 *  such state. Absent means the side ran through and wound on. */
