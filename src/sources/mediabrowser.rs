@@ -790,6 +790,7 @@ impl MediaBrowserSource {
                 .and_then(|p| p.musicbrainz_release_group.clone()),
             caa_id: None,
             caa_release_mbid: None,
+            isrc: None,
         }
     }
 

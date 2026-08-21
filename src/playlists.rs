@@ -43,6 +43,14 @@ pub struct PlaylistTrack {
     pub artist: String,
     #[serde(default)]
     pub album: Option<String>,
+    /// The recording's ISRC, where the history has one.
+    ///
+    /// The only identifier that crosses from a listening history into a
+    /// streaming catalogue, so a target that can look one up needs no name
+    /// matching at all — which is the whole game, because every miss below is a
+    /// name that did not agree.
+    #[serde(default)]
+    pub isrc: Option<String>,
 }
 
 /// A track the far end offered in answer to a search.
@@ -112,8 +120,25 @@ fn score(want: &PlaylistTrack, c: &Candidate) -> Option<u32> {
     // `db::artist_matches` rather than a comparison written here — the codebase
     // has exactly one answer to "same performer?" and adding a second is how the
     // sanitiser and the portrait matcher came to disagree about ligatures.
-    if !crate::db::artist_matches(&c.artist, &want.artist) {
-        return None;
+    // The gate, in two tiers. An outright match is what it always was; the
+    // second exists because a *credit* is not a different performer.
+    //
+    // `artist_matches` compares whole folded strings, so a history holding
+    // "Low Roar feat. Jófríður Ákadóttir" against a library holding "Low Roar"
+    // fails it — and the track is sitting right there. `split_featured` is
+    // already the codebase's answer to that shape (the sanitiser uses it), and
+    // it is deliberately narrow: only the explicit `feat.`/`ft.`/`featuring`/
+    // `with` forms, never `&` or `,`, because "Simon & Garfunkel" is a name.
+    //
+    // Ranked below an exact match rather than merged with it, so a library that
+    // holds both the solo and the collaboration still returns the one asked
+    // for. Losing points here is what makes that ordering hold.
+    let artist_exact = crate::db::artist_matches(&c.artist, &want.artist);
+    if !artist_exact {
+        let primary = |a: &str| crate::db::split_featured(a).unwrap_or_else(|| a.to_string());
+        if !crate::db::artist_matches(&primary(&c.artist), &primary(&want.artist)) {
+            return None;
+        }
     }
 
     // The same normaliser does duty for the title. This is not a second notion
@@ -136,6 +161,12 @@ fn score(want: &PlaylistTrack, c: &Candidate) -> Option<u32> {
         return None;
     };
 
+    // A credit-folded artist is a weaker answer than one that agreed outright,
+    // and has to lose to it.
+    if !artist_exact {
+        points -= 20;
+    }
+
     // Album agreement breaks the tie between three pressings of one track. Never
     // a requirement — see the note on `PlaylistTrack::album`.
     if let (Some(a), Some(b)) = (want.album.as_deref(), c.album.as_deref()) {
@@ -144,6 +175,62 @@ fn score(want: &PlaylistTrack, c: &Candidate) -> Option<u32> {
         }
     }
     Some(points)
+}
+
+/// Why a track did not land.
+///
+/// The push used to report only *which* tracks missed, and those are two
+/// completely different faults wearing the same face: a server that returned
+/// nothing for the query has a search problem, and a server that returned the
+/// right song and had it refused has a *matching* problem. Reported as
+/// "12 didn't land" they are indistinguishable, and there is no way to tell
+/// from outside which one to go and fix.
+///
+/// `ArtistMismatch` carries what the server actually offered, because that is
+/// the fact that settles it in one glance: asked for "Bones" by
+/// "Low Roar feat. Jófríður Ákadóttir" and offered "Low Roar" says exactly
+/// what is wrong, where a bare miss says nothing.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(tag = "reason", rename_all = "snake_case")]
+pub enum Miss {
+    /// The search itself failed — the server is unwell, not unhelpful.
+    SearchFailed,
+    /// The server answered, with nothing.
+    NoCandidates,
+    /// It offered tracks, none by this artist.
+    ArtistMismatch { offered: Vec<String> },
+    /// The artist agreed and no title did.
+    TitleMismatch { offered: Vec<String> },
+}
+
+/// Work out which of those it was. Only called when `pick` returned nothing.
+pub fn explain(want: &PlaylistTrack, candidates: &[Candidate]) -> Miss {
+    if candidates.is_empty() {
+        return Miss::NoCandidates;
+    }
+    let by_artist: Vec<&Candidate> =
+        candidates.iter().filter(|c| crate::db::artist_matches(&c.artist, &want.artist)).collect();
+    // De-duplicated and capped: this goes in an error message a person reads,
+    // not a log. Five names is enough to see the pattern.
+    let names = |list: &[&Candidate], field: fn(&Candidate) -> String| {
+        let mut seen: Vec<String> = Vec::new();
+        for c in list {
+            let v = field(c);
+            if !v.is_empty() && !seen.iter().any(|s| s.eq_ignore_ascii_case(&v)) {
+                seen.push(v);
+            }
+            if seen.len() == 5 {
+                break;
+            }
+        }
+        seen
+    };
+    if by_artist.is_empty() {
+        let all: Vec<&Candidate> = candidates.iter().collect();
+        Miss::ArtistMismatch { offered: names(&all, |c| c.artist.clone()) }
+    } else {
+        Miss::TitleMismatch { offered: names(&by_artist, |c| c.title.clone()) }
+    }
 }
 
 /// The server's id for `want`, or `None` if nothing offered is actually it.
@@ -167,7 +254,13 @@ pub fn pick(want: &PlaylistTrack, candidates: &[Candidate]) -> Option<String> {
 /// query carrying "(Remastered 2008)", while a server holding the remaster
 /// still matches the stem.
 pub fn search_query(want: &PlaylistTrack) -> String {
-    format!("{} {}", without_qualifier(&want.title), want.artist).trim().to_string()
+    // The **primary** artist, for the same reason the qualifier is dropped from
+    // the title: a library filed under "Low Roar" will not answer a query
+    // carrying "Low Roar feat. Jófríður Ákadóttir", and the extra words are the
+    // half least likely to be spelled the same at both ends. `score` still sees
+    // the full credit and prefers an exact match on it.
+    let artist = crate::db::split_featured(&want.artist).unwrap_or_else(|| want.artist.clone());
+    format!("{} {}", without_qualifier(&want.title), artist).trim().to_string()
 }
 
 // ── The three targets ──
@@ -221,7 +314,89 @@ mod tests {
     }
 
     fn want(title: &str, artist: &str) -> PlaylistTrack {
-        PlaylistTrack { title: title.into(), artist: artist.into(), album: None }
+        PlaylistTrack { title: title.into(), artist: artist.into(), album: None, isrc: None }
+    }
+
+    /// A featured credit is not a different performer, and refusing it loses a
+    /// track that is sitting right there.
+    ///
+    /// `artist_matches` compares whole folded strings, so the history's
+    /// "Low Roar feat. Jófríður Ákadóttir" never equalled a library's
+    /// "Low Roar" and the hard gate threw it out. This is the real pairing from
+    /// a real history.
+    #[test]
+    fn a_featured_credit_still_finds_the_primary_artist() {
+        let w = want("Bones", "Low Roar feat. Jófríður Ákadóttir");
+        let c = [cand("77", "Bones", "Low Roar", None)];
+        assert_eq!(pick(&w, &c), Some("77".into()), "the credit must not refuse the artist");
+
+        // And the other way round: the library carries the credit, the history
+        // does not.
+        let w2 = want("Bones", "Low Roar");
+        let c2 = [cand("78", "Bones", "Low Roar feat. Jófríður Ákadóttir", None)];
+        assert_eq!(pick(&w2, &c2), Some("78".into()));
+    }
+
+    /// The relaxation must not outrank an outright match. A library holding
+    /// both the solo track and the collaboration has to return the one asked
+    /// for.
+    #[test]
+    fn an_exact_artist_beats_a_credit_folded_one() {
+        let w = want("Bones", "Low Roar");
+        let c = [
+            cand("credit", "Bones", "Low Roar feat. Jófríður Ákadóttir", None),
+            cand("exact", "Bones", "Low Roar", None),
+        ];
+        assert_eq!(pick(&w, &c), Some("exact".into()));
+    }
+
+    /// Two different bands are still two different bands. The fold is narrow on
+    /// purpose — `&` and `,` are names, not credits.
+    #[test]
+    fn folding_a_credit_does_not_merge_unrelated_artists() {
+        let w = want("Archangel", "Burial");
+        let c = [cand("x", "Archangel", "Four Tet", None)];
+        assert_eq!(pick(&w, &c), None);
+
+        let w2 = want("The Boxer", "Simon & Garfunkel");
+        let c2 = [cand("y", "The Boxer", "Simon", None)];
+        assert_eq!(pick(&w2, &c2), None, "an ampersand is a name, never a credit");
+    }
+
+    /// A miss has to say which kind it was: nothing came back, the artist was
+    /// wrong, or the artist was right and no title matched. Reported as a bare
+    /// miss they are indistinguishable, and they need completely different
+    /// fixes.
+    #[test]
+    fn a_miss_says_which_kind_it_was() {
+        let w = want("Xtal", "Aphex Twin");
+        assert_eq!(explain(&w, &[]), Miss::NoCandidates);
+
+        let wrong = [cand("1", "Xtal", "Arkells", None), cand("2", "Xtal", "Arkells", None)];
+        assert_eq!(
+            explain(&w, &wrong),
+            Miss::ArtistMismatch { offered: vec!["Arkells".into()] },
+            "de-duplicated: this goes in a message a person reads"
+        );
+
+        let right_artist = [cand("3", "Ageispolis", "Aphex Twin", None)];
+        assert_eq!(
+            explain(&w, &right_artist),
+            Miss::TitleMismatch { offered: vec!["Ageispolis".into()] }
+        );
+    }
+
+    /// The query drops the credit too. A server whose search engine is given
+    /// three extra words it has never seen returns nothing, and then the gate
+    /// never gets a chance.
+    #[test]
+    fn the_search_asks_for_the_primary_artist() {
+        assert_eq!(
+            search_query(&want("Bones", "Low Roar feat. Jófríður Ákadóttir")),
+            "Bones Low Roar"
+        );
+        // A qualifier on the title goes as well, which is the existing rule.
+        assert_eq!(search_query(&want("Xtal (Remastered 2008)", "Aphex Twin")), "Xtal Aphex Twin");
     }
 
     #[test]

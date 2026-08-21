@@ -32,6 +32,7 @@ pub struct ScrobbleRecord {
     pub mbid_artist: Option<String>,
     pub caa_id: Option<i64>,
     pub caa_release_mbid: Option<String>,
+    pub isrc: Option<String>,
     pub format_type: Option<String>,
     pub codec: Option<String>,
     pub bitrate: Option<i32>,
@@ -898,6 +899,12 @@ impl Database {
                 status TEXT NOT NULL DEFAULT 'pending',
                 mbid_recording TEXT, mbid_release TEXT, mbid_artist TEXT,
                 caa_id INTEGER, caa_release_mbid TEXT,
+                -- The recording's International Standard Recording Code. The
+                -- only identifier that survives crossing between a library, a
+                -- streaming catalogue and MusicBrainz, so it is what lets a
+                -- playlist push ask for a track *exactly* rather than searching
+                -- by name and hoping the spellings agree.
+                isrc TEXT,
                 format_type TEXT, codec TEXT, bitrate INTEGER,
                 sample_rate INTEGER, bit_depth INTEGER, channels INTEGER,
                 container TEXT, source_quality TEXT,
@@ -2536,6 +2543,16 @@ impl Database {
         // already exists, which is the only safe reading of an upgrade: nobody
         // consented to a public page by installing a new binary. `NOT NULL
         // DEFAULT 0` gives existing rows the off state without a backfill.
+        // The one identifier that crosses between a library, a streaming
+        // catalogue and MusicBrainz. Filled by ingest when a client sends one
+        // and by `backfill_isrc` otherwise; read by the playlist push, which is
+        // the only thing that can use an exact key instead of a name.
+        if !has_column(&self.pool, "scrobbles", "isrc").await {
+            info!("⚙️ Migrating: adding scrobbles.isrc...");
+            let _ =
+                sqlx::query("ALTER TABLE scrobbles ADD COLUMN isrc TEXT").execute(&self.pool).await;
+        }
+
         if !has_column(&self.pool, "physical_plays", "recorded_at").await {
             info!("⚙️ Migrating: remembering when a side play was written...");
             let _ = sqlx::query("ALTER TABLE physical_plays ADD COLUMN recorded_at INTEGER")
@@ -3081,7 +3098,7 @@ impl Database {
             "INSERT INTO scrobbles (
                 user_id, title, artist, artist_credit, album, timestamp, duration,
                 source_id, source_name, status, skipped,
-                mbid_recording, mbid_release, mbid_artist, caa_id, caa_release_mbid,
+                mbid_recording, mbid_release, mbid_artist, caa_id, caa_release_mbid, isrc,
                 format_type, codec, bitrate, sample_rate, bit_depth, channels,
                 container, source_quality, is_lossless,
                 dsd_rate, dsd_multiplier, dsd_to_pcm_converted,
@@ -3093,7 +3110,7 @@ impl Database {
                 ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
                 ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
                 ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
             )",
         )
         .bind(user_id)
@@ -3112,6 +3129,7 @@ impl Database {
         .bind(&mbid_artist_json)
         .bind(play.caa_id)
         .bind(&play.caa_release_mbid)
+        .bind(&play.isrc)
         .bind(&q.format_type)
         .bind(&q.codec)
         .bind(q.bitrate)
@@ -3451,6 +3469,7 @@ impl Database {
                         mbid_release_group: None,
                         caa_id: r.caa_id,
                         caa_release_mbid: r.caa_release_mbid,
+                        isrc: r.isrc,
                     },
                 }
             })
@@ -5441,6 +5460,107 @@ impl Database {
 
     /// Listens with an MBID but no resolved release year yet. Rows without an
     /// MBID are skipped: there's nothing to look them up with.
+    /// The ISRCs the history holds for a set of tracks, keyed by folded
+    /// title and artist.
+    ///
+    /// **One bounded scan, never a lookup per track.** A correlated subquery
+    /// keyed on `LOWER(TRIM(...))` cannot use an index, so it is a full pass per
+    /// row by construction — the quadratic that made Rediscovery take two
+    /// minutes on the real host. The tracks' own artist keys become an `IN`
+    /// filter instead, so the history is walked once and returns only rows that
+    /// could match. Same shape as `list_crate` and `playlist_tracks_detailed`.
+    ///
+    /// The tombstone is excluded: `isrc = ''` means "asked, and this recording
+    /// has none", which is not an ISRC to hand a streaming service.
+    pub async fn isrc_map(
+        &self,
+        user_id: i64,
+        tracks: &[(String, String)],
+    ) -> Result<HashMap<(String, String), String>, sqlx::Error> {
+        if tracks.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let keys: Vec<String> = tracks
+            .iter()
+            .map(|(_, artist)| Self::artist_key(artist))
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        let placeholders = vec!["?"; keys.len()].join(",");
+        let sql = format!(
+            "SELECT LOWER(TRIM(title)), LOWER(TRIM(artist)), isrc
+               FROM scrobbles
+              WHERE user_id = ? AND isrc IS NOT NULL AND isrc != ''
+                AND LOWER(TRIM(artist)) IN ({placeholders})
+              GROUP BY 1, 2"
+        );
+        let mut q = sqlx::query_as::<_, (String, String, String)>(&sql).bind(user_id);
+        for k in &keys {
+            q = q.bind(k);
+        }
+        Ok(q.fetch_all(&self.pool).await?.into_iter().map(|(t, a, i)| ((t, a), i)).collect())
+    }
+
+    /// Listens with no ISRC yet.
+    ///
+    /// `''` is the tombstone — "asked MusicBrainz, this recording has none" —
+    /// so a track nobody has an ISRC for is not re-asked forever. Same
+    /// discipline as `artwork_url = ''`, `caa_id = -1` and the language pass.
+    ///
+    /// **Grouped by recording**, because a track played fifty times is fifty
+    /// rows sharing one recording and one ISRC — asking per row would spend
+    /// fifty rate-limited lookups on one answer. Newest first, since the tracks
+    /// somebody is likely to put on a playlist this week are the ones they have
+    /// been playing.
+    ///
+    /// Only listens MusicBrainz has already identified. Without a recording
+    /// MBID there is nothing to look up, and a name search is what the other
+    /// backfills already do — this pass collects them once they have one.
+    pub async fn scrobbles_needing_isrc(
+        &self,
+        limit: i64,
+    ) -> Result<Vec<(String, String, String)>, sqlx::Error> {
+        sqlx::query_as(
+            "SELECT mbid_recording, title, artist FROM scrobbles
+              WHERE isrc IS NULL AND skipped = FALSE
+                AND mbid_recording IS NOT NULL AND TRIM(mbid_recording) != ''
+              GROUP BY mbid_recording
+              ORDER BY MAX(timestamp) DESC
+              LIMIT ?",
+        )
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+    }
+
+    /// Write an ISRC onto every listen of the same recording, not just the row
+    /// that prompted the lookup.
+    ///
+    /// A track played fifty times is fifty rows, and they all share one
+    /// recording — so resolving it once and writing it once would leave
+    /// forty-nine of them queued for a rate-limited lookup that can only return
+    /// the same answer. Matched on the folded title and artist, which is how
+    /// every other grouping in this file decides two rows are the same track.
+    pub async fn set_scrobble_isrc(
+        &self,
+        title: &str,
+        artist: &str,
+        isrc: &str,
+    ) -> Result<u64, sqlx::Error> {
+        let r = sqlx::query(
+            "UPDATE scrobbles SET isrc = ?
+              WHERE isrc IS NULL
+                AND LOWER(TRIM(title)) = LOWER(TRIM(?))
+                AND LOWER(TRIM(artist)) = LOWER(TRIM(?))",
+        )
+        .bind(isrc)
+        .bind(title)
+        .bind(artist)
+        .execute(&self.pool)
+        .await?;
+        Ok(r.rows_affected())
+    }
+
     pub async fn scrobbles_needing_release_year(
         &self,
         limit: i64,
@@ -6059,9 +6179,9 @@ impl Database {
         sqlx::query(
             "INSERT INTO scrobbles (
                 user_id, title, artist, album, timestamp, duration, source_id, source_name, status,
-                mbid_recording, mbid_release, mbid_artist, caa_id, caa_release_mbid,
+                mbid_recording, mbid_release, mbid_artist, caa_id, caa_release_mbid, isrc,
                 submission_client, track_number, skipped, spotify_track_id
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'imported', ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'imported', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(user_id)
         .bind(&play.title)
@@ -6076,6 +6196,7 @@ impl Database {
         .bind(&mbid_artist_json)
         .bind(play.caa_id)
         .bind(&play.caa_release_mbid)
+        .bind(&play.isrc)
         .bind(provenance.submission_client.as_deref().unwrap_or("import"))
         .bind(play.track_number)
         .bind(skipped)

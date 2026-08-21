@@ -337,9 +337,78 @@ fn included_of<'a>(
         .unwrap_or_default()
 }
 
+impl TidalClient {
+    /// Every track TIDAL stocks for one ISRC.
+    ///
+    /// `GET /tracks?filter[isrc]=` is an exact lookup — the only one any
+    /// playlist target here offers. A recording issued in several territories
+    /// can come back more than once; they are the same performance, so any of
+    /// them is the right answer and `pick` chooses on the usual ranking.
+    ///
+    /// The artist is resolved through `included` exactly as the search does,
+    /// because `pick` gates hard on it and a candidate with an empty artist
+    /// would be refused by the very thing this exists to bypass.
+    async fn tracks_by_isrc(&self, isrc: &str) -> Result<Vec<Candidate>, String> {
+        let url = format!(
+            "{API_BASE}/tracks?filter%5Bisrc%5D={}&countryCode={}&include=artists",
+            urlencoding(isrc),
+            self.creds.country_code()
+        );
+        let doc = self.get(&url).await?;
+        let artists = included_of(&doc, "artists");
+        let mut out = Vec::new();
+        for track in doc.get("data").and_then(|v| v.as_array()).into_iter().flatten() {
+            let Some(id) = track.get("id").and_then(|v| v.as_str()) else { continue };
+            let attrs = track.get("attributes").cloned().unwrap_or_default();
+            let title = attrs.get("title").and_then(|v| v.as_str()).unwrap_or_default().to_string();
+            let artist = track
+                .get("relationships")
+                .and_then(|r| r.get("artists"))
+                .and_then(|a| a.get("data"))
+                .and_then(|d| d.as_array())
+                .and_then(|arr| arr.first())
+                .and_then(|a| a.get("id"))
+                .and_then(|i| i.as_str())
+                .and_then(|id| artists.get(id))
+                .and_then(|a| a.get("attributes"))
+                .and_then(|a| a.get("name"))
+                .and_then(|n| n.as_str())
+                .unwrap_or_default()
+                .to_string();
+            out.push(Candidate { id: id.to_string(), title, artist, album: None });
+        }
+        Ok(out)
+    }
+}
+
 #[async_trait::async_trait]
 impl PlaylistTarget for TidalClient {
     async fn search_tracks(&self, want: &PlaylistTrack) -> Result<Vec<Candidate>, String> {
+        // **An ISRC is an exact answer, so ask with it first.**
+        //
+        // Every miss a playlist push produces is ultimately a name that did not
+        // agree — a feat. credit on one side, a remaster suffix on the other, a
+        // compilation filed under Various Artists. TIDAL is the one target that
+        // can be asked a question with no names in it at all: `filter[isrc]`
+        // names the *recording*, so there is nothing left to spell differently.
+        //
+        // It falls through to the search when the history has no ISRC for the
+        // track, or when TIDAL does not stock that recording — a miss here is
+        // ordinary, not a failure, and the name search may still find a
+        // different issue of the same song.
+        if let Some(isrc) = want.isrc.as_deref().filter(|s| !s.trim().is_empty()) {
+            match self.tracks_by_isrc(isrc).await {
+                Ok(hits) if !hits.is_empty() => {
+                    debug!("TIDAL ISRC {} matched {} track(s)", isrc, hits.len());
+                    return Ok(hits);
+                }
+                Ok(_) => {}
+                // A failed ISRC lookup must not lose the track: fall back to
+                // the search rather than reporting a miss.
+                Err(e) => debug!("TIDAL ISRC lookup for {} failed: {}", isrc, e),
+            }
+        }
+
         // Artist *and* title, because a bare title buries the right hit on a
         // catalogue this size — the same reasoning the media-server targets use.
         let query = format!("{} {}", want.artist, want.title);
@@ -534,6 +603,8 @@ mod tests {
                 title: "Windowlicker".into(),
                 artist: "Aphex Twin".into(),
                 album: None,
+
+                isrc: None,
             })
             .await
             .expect("search should succeed");

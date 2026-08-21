@@ -1331,6 +1331,15 @@ impl ScrobbleEngine {
             // so on an already-enriched history this resolves entirely out of
             // the cache and spends none of its budget.
             crate::enrich::backfill_genres(&self.db, &self.mb_client, 50, 8).await;
+
+            // And ISRCs, off that same call — the recording search asks
+            // `inc=isrcs` now, so an already-enriched history resolves these
+            // from the cache without spending any of the budget. It is the only
+            // identifier a playlist push can hand a streaming service instead of
+            // a name, so it is worth having before somebody needs it rather than
+            // fetching a hundred of them while they wait.
+            crate::enrich::backfill_isrc(&self.db, &self.mb_client, 50, 8).await;
+
             crate::enrich::backfill_artwork(
                 &self.db,
                 &self.mb_client,

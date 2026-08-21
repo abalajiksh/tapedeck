@@ -44,6 +44,17 @@ pub struct AdditionalInfo {
     /// fooyin happens to send it as a number.
     #[serde(default, deserialize_with = "lenient_millis")]
     pub duration_ms: Option<i64>,
+    /// The recording's ISRC, when the client knows it — a tag read off the file
+    /// usually does. Worth taking because it is the one identifier that
+    /// survives crossing between a library, a streaming catalogue and
+    /// MusicBrainz, so a listen that arrives with one never needs the
+    /// rate-limited lookup that would otherwise find it.
+    ///
+    /// Lenient like everything else in this bag: `additional_info` has no schema
+    /// and a strict type here would cost the whole submission rather than the
+    /// field.
+    #[serde(default, deserialize_with = "lenient")]
+    pub isrc: Option<String>,
     /// ListenBrainz spells this `tracknumber`; Tapedeck's own submissions and
     /// some clients use `track_number`. A mismatch here is silent — the number
     /// simply goes missing, taking album-playthrough analytics and `[[track:3]]`

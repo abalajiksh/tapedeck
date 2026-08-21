@@ -152,6 +152,7 @@ fn play(
         mbid_release_group: None,
         caa_id: None,
         caa_release_mbid: None,
+        isrc: None,
     }
 }
 
@@ -942,6 +943,7 @@ async fn run_scrobbler_log(
             mbid_release_group: None,
             caa_id: None,
             caa_release_mbid: None,
+            isrc: None,
         };
         let outcome =
             db.import_listen_flagged(uid, &p, e.skipped).await.map_err(|e| e.to_string())?;

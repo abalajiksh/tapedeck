@@ -101,6 +101,61 @@ pub async fn backfill_release_years(
     done
 }
 
+/// Fill in the ISRC for listens that have none.
+///
+/// Keyed on the **recording MBID**, so this only reaches listens MusicBrainz has
+/// already identified — 90% of a real history, and the ones a playlist push is
+/// most likely to want. A listen with no recording MBID is left alone rather
+/// than name-searched: the other backfills already resolve those, and this pass
+/// will pick them up once they have one.
+///
+/// One request per *recording*, not per listen, and cached — so a track played
+/// fifty times costs one lookup and one write that covers all fifty rows.
+///
+/// `''` is written when MusicBrainz has no ISRC for the recording, which is a
+/// real answer and a common one. Without that tombstone the row would be
+/// re-queued forever against a rate-limited service.
+///
+/// One resolution updates **every** listen of the same track, because a song
+/// played fifty times is fifty rows sharing one recording and one ISRC.
+pub async fn backfill_isrc(
+    db: &Database,
+    mb: &MusicBrainzClient,
+    batch: i64,
+    mb_budget: i64,
+) -> usize {
+    let rows = match db.scrobbles_needing_isrc(batch).await {
+        Ok(r) => r,
+        Err(_) => return 0,
+    };
+    let mut done = 0usize;
+    let mut budget = mb_budget;
+
+    for (mbid, title, artist) in rows {
+        if budget <= 0 {
+            break;
+        }
+        budget -= 1;
+
+        let isrc = match mb.fetch_recording_isrcs(&mbid).await {
+            // The first is as good as any: several ISRCs on one recording are
+            // the same performance issued in different territories, and each
+            // one identifies it.
+            Ok(list) => list.first().cloned().unwrap_or_default(),
+            // A failed request is not an answer. Leaving the row NULL means it
+            // is asked again next pass, where writing the tombstone would
+            // retire it permanently on the strength of a network blip.
+            Err(_) => continue,
+        };
+        if let Ok(n) = db.set_scrobble_isrc(&title, &artist, &isrc).await {
+            if n > 0 {
+                done += 1;
+            }
+        }
+    }
+    done
+}
+
 /// Fill in genres for listens that have none.
 ///
 /// Costs nothing new: `fetch_metadata` has always returned genres and the cache

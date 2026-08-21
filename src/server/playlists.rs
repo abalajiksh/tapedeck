@@ -291,19 +291,46 @@ pub async fn push_tracks(
         target_desc = target_view(&source, protocol);
         (protocol, target)
     };
+    // The ISRCs the history holds for these tracks, in one bounded pass. Every
+    // miss below is ultimately a name that did not agree, and an ISRC is the
+    // one key that sidesteps names entirely — so it is worth resolving even
+    // though only some targets can use it.
+    let isrcs = {
+        let pairs: Vec<(String, String)> =
+            tracks.iter().map(|t| (t.title.clone(), t.artist.clone())).collect();
+        state.db.isrc_map(user_id, &pairs).await.unwrap_or_default()
+    };
+    let with_isrc: Vec<PlaylistTrack> = tracks
+        .iter()
+        .map(|t| {
+            let mut t = t.clone();
+            if t.isrc.is_none() {
+                let key = (t.title.trim().to_lowercase(), t.artist.trim().to_lowercase());
+                t.isrc = isrcs.get(&key).cloned();
+            }
+            t
+        })
+        .collect();
+    let tracks: &[PlaylistTrack] = &with_isrc;
+
     // Sequential on purpose, for the same reason the Rediscovery queries are:
     // this is someone's Raspberry Pi, and firing a hundred searches at it at
     // once is how a push turns into a timeout. It also keeps the order the
     // caller asked for, which is the order the playlist ends up in.
     let mut ids: Vec<String> = Vec::with_capacity(tracks.len());
-    let mut missing: Vec<&PlaylistTrack> = Vec::new();
+    let mut missing: Vec<(&PlaylistTrack, playlists::Miss)> = Vec::new();
     let mut search_error: Option<String> = None;
 
     for want in tracks {
         match target.search_tracks(want).await {
             Ok(candidates) => match playlists::pick(want, &candidates) {
                 Some(id) => ids.push(id),
-                None => missing.push(want),
+                // **Why** it missed, not just that it did. A server that
+                // returned nothing has a search problem; one that returned the
+                // right song and had it refused has a matching problem. Both
+                // used to read as the same bare miss, which is no help at all
+                // to whoever has to go and fix it.
+                None => missing.push((want, playlists::explain(want, &candidates))),
             },
             Err(e) => {
                 // One failed search is a miss; a server that has stopped
@@ -311,14 +338,24 @@ pub async fn push_tracks(
                 // caller gets it rather than "nothing matched".
                 warn!("Playlist push: search failed on {protocol}: {e}");
                 search_error.get_or_insert(e);
-                missing.push(want);
+                missing.push((want, playlists::Miss::SearchFailed));
             }
         }
     }
 
     let missing_json: Vec<_> = missing
         .iter()
-        .map(|t| serde_json::json!({ "title": t.title, "artist": t.artist, "album": t.album }))
+        .map(|(t, why)| {
+            let mut o = serde_json::json!({
+                "title": t.title, "artist": t.artist, "album": t.album,
+            });
+            if let (Some(obj), Ok(serde_json::Value::Object(w))) =
+                (o.as_object_mut(), serde_json::to_value(why))
+            {
+                obj.extend(w);
+            }
+            o
+        })
         .collect();
 
     if ids.is_empty() {
@@ -494,6 +531,9 @@ async fn push_saved(
             title: t.title.clone(),
             artist: t.artist.clone(),
             album: t.album.clone(),
+            // Resolved centrally in `push_tracks`, so every caller gets it and
+            // none has to know where an ISRC lives.
+            isrc: None,
         })
         .collect();
 

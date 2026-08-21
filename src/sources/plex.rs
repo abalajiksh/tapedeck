@@ -382,6 +382,7 @@ impl PlexTrack {
             mbid_recording: None,
             caa_id: None,
             caa_release_mbid: None,
+            isrc: None,
             source_id,
             source_name: "Plex".to_string(),
         }

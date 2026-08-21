@@ -1151,6 +1151,9 @@ async fn push_playlist(
             title: t.title.clone(),
             artist: t.artist.clone(),
             album: t.album.clone(),
+            // Resolved centrally in `push_tracks`, so every caller gets it and
+            // none has to know where an ISRC lives.
+            isrc: None,
         })
         .collect();
 

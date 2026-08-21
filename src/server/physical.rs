@@ -1457,6 +1457,7 @@ async fn play_side(
             mbid_artist: None,
             caa_id: None,
             caa_release_mbid: None,
+            isrc: None,
             // Stable per side play, so pressing the button twice by accident
             // is caught by the same dedup every other source relies on.
             source_id: format!("physical-{}-{}-{}-{}", release.id, side, start, t.position),
@@ -1689,6 +1690,7 @@ async fn set_now_playing(
         mbid_artist: None,
         caa_id: None,
         caa_release_mbid: None,
+        isrc: None,
         source_id: format!("physical-{}-{}-np", release.id, side),
         source_name: "physical".into(),
     };

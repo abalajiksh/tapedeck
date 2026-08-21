@@ -29,6 +29,10 @@ pub struct Play {
     pub mbid_release_group: Option<String>,
     pub caa_id: Option<i64>,
     pub caa_release_mbid: Option<String>,
+    /// The recording's ISRC, when anything knew it. The only identifier that
+    /// crosses between a library, a streaming catalogue and MusicBrainz, which
+    /// is what makes it worth carrying on a listen at all.
+    pub isrc: Option<String>,
 }
 
 impl Play {
@@ -55,6 +59,7 @@ impl Play {
             mbid_release_group: None,
             caa_id: None,
             caa_release_mbid: None,
+            isrc: None,
         }
     }
 }

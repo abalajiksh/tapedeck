@@ -331,6 +331,15 @@ pub async fn submit_listens(
             mbid_release_group,
             caa_id,
             caa_release_mbid,
+            // Taken straight from the bag when the client knew it. A tag read
+            // off a file usually carries one, and a listen that arrives with an
+            // ISRC never needs the rate-limited lookup `backfill_isrc` would
+            // otherwise spend on it.
+            isrc: info_ref
+                .and_then(|ai| ai.isrc.as_deref())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_uppercase),
         };
 
         // MusicBrainz enrichment is NOT done inline for stored listens — it's a

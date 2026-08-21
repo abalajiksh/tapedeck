@@ -506,6 +506,7 @@ impl RoonSource {
             artists: None,
             caa_id: None,
             caa_release_mbid: None,
+            isrc: None,
         };
         play.source_id = format!("{}-{}", Self::source_key(&play), zone.zone_id);
         play

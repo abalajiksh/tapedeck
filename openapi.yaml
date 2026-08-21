@@ -26,7 +26,7 @@ openapi: 3.1.0
 
 info:
   title: Tapedeck
-  version: 0.75.2
+  version: 0.76.0
   summary: Self-hosted scrobbler and listening journal.
   description: |
     Tapedeck ingests listens, enriches them with MusicBrainz metadata, stores
@@ -5243,12 +5243,36 @@ paths:
                   matched: { type: integer }
                   missing:
                     type: array
+                    description: |
+                      Every track that did not land, and **why**. A partial
+                      match is the normal outcome — a listening history is not
+                      the same set as any one library — and the reason is what
+                      distinguishes a search problem from a matching one.
                     items:
                       type: object
                       properties:
                         title: { type: string }
                         artist: { type: string }
                         album: { type: string, nullable: true }
+                        reason:
+                          type: string
+                          enum: [search_failed, no_candidates, artist_mismatch, title_mismatch]
+                          description: |
+                            `no_candidates` — the server answered with nothing;
+                            its search did not find the track for that query.
+                            `artist_mismatch` — it offered tracks, none by this
+                            artist. `title_mismatch` — the artist agreed and no
+                            title did. `search_failed` — the request itself
+                            failed.
+                        offered:
+                          type: array
+                          items: { type: string }
+                          description: |
+                            What the server actually returned, de-duplicated and
+                            capped at five — artist names for `artist_mismatch`,
+                            titles for `title_mismatch`. This is the field that
+                            settles it at a glance: asked for one spelling and
+                            offered another says exactly what is wrong.
         '400': { $ref: '#/components/responses/BadRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '404': { description: No such source, or none of those tracks are on it. }

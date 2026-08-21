@@ -1135,6 +1135,10 @@ deploy/                      Sample hardened systemd unit
       already shipped
 - [ ] **Typing a track's running time in by hand** — a pressing MusicBrainz does
       not have stays unknown, because nothing in the UI writes a tracklist
+- [ ] **Why Plex loses tracks on a playlist push** — the push now reports the
+      reason for every miss (nothing found / wrong artist / wrong title, with
+      what the server actually offered), which is what a diagnosis needs. The
+      diagnosis itself is still to do
 - [ ] Organising the four analytics screens — Statistics, Top Charts, Reports and
       the genre map answer overlapping questions with their own period controls
 

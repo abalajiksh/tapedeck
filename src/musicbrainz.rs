@@ -497,6 +497,18 @@ impl MusicBrainzClient {
             CREATE INDEX IF NOT EXISTS idx_mb_cache_mbid
             ON musicbrainz_cache(track_mbid, artist_mbid);
 
+            -- ISRCs are keyed by recording and come from the **lookup**
+            -- endpoint, not the search: `inc=` is silently ignored on
+            -- `/recording?query=`, so asking there returns nothing and a
+            -- backfill built on it would tombstone every track as "no ISRC"
+            -- without ever really asking. Same shape as the language cache
+            -- below, and for the same reason.
+            CREATE TABLE IF NOT EXISTS mb_isrc_cache (
+                recording_mbid TEXT PRIMARY KEY,
+                isrcs TEXT,             -- JSON array; '[]' = looked up, none
+                fetched_at INTEGER NOT NULL
+            );
+
             CREATE TABLE IF NOT EXISTS mb_language_cache (
                 recording_mbid TEXT PRIMARY KEY,
                 language TEXT,          -- NULL/'' = looked up, none found
@@ -579,6 +591,69 @@ impl MusicBrainzClient {
         tags.sort_by(|a, b| b.0.cmp(&a.0));
         tags.dedup_by(|a, b| a.1 == b.1);
         Ok(tags.into_iter().take(6).map(|(_, n)| n).collect())
+    }
+
+    /// Every ISRC MusicBrainz holds for a recording.
+    ///
+    /// **The lookup endpoint, not the search.** `inc=` is silently ignored on
+    /// `/recording?query=`: the response simply has no `isrcs` key and parses
+    /// perfectly, so a backfill built on the search writes "this recording has
+    /// no ISRC" for everything without ever having asked. That was caught by
+    /// checking a track that demonstrably has one, and it is the same shape as
+    /// every other silent-field bug in this codebase — nothing errors, the
+    /// answer is just always empty.
+    ///
+    /// Keyed and cached by recording MBID, so a track played fifty times costs
+    /// one request. `[]` is stored when there genuinely is none, which is a
+    /// common and legitimate answer — the tombstone that stops it being asked
+    /// forever against a rate-limited service.
+    pub async fn fetch_recording_isrcs(&self, recording_mbid: &str) -> Result<Vec<String>> {
+        let cached: Option<(Option<String>,)> =
+            sqlx::query_as("SELECT isrcs FROM mb_isrc_cache WHERE recording_mbid = ?")
+                .bind(recording_mbid)
+                .fetch_optional(&self.sqlite_pool)
+                .await
+                .unwrap_or(None);
+        if let Some((raw,)) = cached {
+            return Ok(raw
+                .as_deref()
+                .and_then(|j| serde_json::from_str::<Vec<String>>(j).ok())
+                .unwrap_or_default());
+        }
+
+        self.rate_limiter.acquire().await;
+        let url = format!(
+            "{}/recording/{}?inc=isrcs&fmt=json",
+            self.config.api_base_url.trim_end_matches('/'),
+            recording_mbid
+        );
+        #[derive(Deserialize)]
+        struct Resp {
+            #[serde(default)]
+            isrcs: Vec<String>,
+        }
+        let resp =
+            self.http_client.get(&url).header("User-Agent", &self.config.user_agent).send().await?;
+        if !resp.status().is_success() {
+            return Err(anyhow!("MusicBrainz API error: {}", resp.status()));
+        }
+        let found: Resp = resp.json().await?;
+        // Normalised here so nothing downstream has to: an ISRC is defined
+        // uppercase and clients send it either way.
+        let isrcs: Vec<String> =
+            found.isrcs.iter().map(|s| s.trim().to_uppercase()).filter(|s| !s.is_empty()).collect();
+
+        let _ = sqlx::query(
+            "INSERT OR REPLACE INTO mb_isrc_cache (recording_mbid, isrcs, fetched_at)
+             VALUES (?, ?, ?)",
+        )
+        .bind(recording_mbid)
+        .bind(serde_json::to_string(&isrcs).unwrap_or_else(|_| "[]".into()))
+        .bind(chrono::Utc::now().timestamp())
+        .execute(&self.sqlite_pool)
+        .await;
+
+        Ok(isrcs)
     }
 
     pub async fn fetch_recording_language(&self, recording_mbid: &str) -> Result<Option<String>> {

@@ -56,6 +56,10 @@ pub struct NavidromeSong {
     pub duration: Option<u64>,
     pub track_number: Option<i32>,
     pub mbid: Option<String>,
+    /// Straight off the file's tags, via OpenSubsonic. Free and exact, so a
+    /// listen carrying one never needs the rate-limited lookup that would
+    /// otherwise find it.
+    pub isrc: Option<String>,
 }
 
 // ── Native API wire types ──
@@ -95,6 +99,21 @@ struct NativeSong {
         alias = "musicBrainzId"
     )]
     mbz_recording_id: Option<String>,
+    /// The recording's ISRC, straight off the file's tags.
+    ///
+    /// **The best source Tapedeck has for one.** Picard writes ISRC into the
+    /// tag when it stamps a file, and OpenSubsonic surfaces it on the song — so
+    /// a Navidrome listen can carry an exact, free identifier that no
+    /// rate-limited MusicBrainz lookup was needed for. It is the user's own
+    /// library answering, which is the rule `metadata/` already follows for
+    /// artwork and portraits.
+    ///
+    /// **An array**, per the OpenSubsonic schema: a recording issued across
+    /// territories carries several, and any of them identifies it. Older
+    /// servers send nothing at all, hence `default` — and Plex and Jellyfin
+    /// expose no ISRC field whatsoever, so this is the only source of its kind.
+    #[serde(default)]
+    isrc: Vec<String>,
 }
 
 // ── Subsonic wire types ──
@@ -331,6 +350,14 @@ impl NavidromeSource {
                         duration: (s.duration > 0.0).then_some(s.duration as u64),
                         track_number: s.track_number.filter(|n| *n > 0),
                         mbid: s.mbz_recording_id.filter(|m| !m.is_empty()),
+                        // First of the array: several ISRCs on one recording
+                        // are the same performance issued across territories,
+                        // and each identifies it.
+                        isrc: s
+                            .isrc
+                            .into_iter()
+                            .map(|v| v.trim().to_uppercase())
+                            .find(|v| !v.is_empty()),
                     },
                 )
             })
@@ -533,6 +560,7 @@ impl NavidromeSource {
                         mbid_release_group: None,
                         caa_id: None,
                         caa_release_mbid: None,
+                        isrc: None,
                     },
                     username: e.username,
                     minutes_ago,
@@ -563,6 +591,7 @@ impl NavidromeSong {
             mbid_release_group: None,
             caa_id: None,
             caa_release_mbid: None,
+            isrc: self.isrc.clone(),
         }
     }
 }
@@ -618,6 +647,7 @@ mod tests {
             duration: Some(293),
             track_number: Some(1),
             mbid: Some("mbid-xtal".into()),
+            isrc: None,
         }
     }
 
@@ -670,6 +700,27 @@ mod tests {
                 .unwrap_or_else(|e| panic!("{key} failed to parse: {e}"));
             assert_eq!(song.mbz_recording_id.as_deref(), Some("mb-123"), "{key} did not map");
         }
+    }
+
+    /// Picard writes the ISRC into the tag and OpenSubsonic surfaces it, so a
+    /// Navidrome listen can carry an exact identifier that cost nothing.
+    ///
+    /// It is an **array** in the schema, which is the shape a reasonable parser
+    /// gets wrong — a bare `Option<String>` would fail the whole song rather
+    /// than the field. Pinned against the spec's own example.
+    #[test]
+    fn a_song_carries_the_isrc_from_its_tags() {
+        let song: NativeSong = serde_json::from_str(
+            r#"{"id":"1","title":"Polar expedition","artist":"A","album":"B",
+                "isrc":["USSM18300073","DELV42300297"]}"#,
+        )
+        .expect("parses");
+        assert_eq!(song.isrc, vec!["USSM18300073", "DELV42300297"]);
+
+        // A server that predates the field sends nothing, which is not an error.
+        let older: NativeSong =
+            serde_json::from_str(r#"{"id":"1","title":"t","artist":"a"}"#).expect("parses");
+        assert!(older.isrc.is_empty());
     }
 
     #[test]
