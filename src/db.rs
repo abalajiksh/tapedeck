@@ -4277,6 +4277,7 @@ impl Database {
         notes: Option<Option<&str>>,
         kind: Option<&str>,
         chain_variant_id: Option<Option<i64>>,
+        mbid_release: Option<Option<&str>>,
     ) -> Result<bool, sqlx::Error> {
         let mut sets: Vec<&str> = Vec::new();
         // A plain `Option` rather than a nested one, unlike everything else
@@ -4299,6 +4300,12 @@ impl Database {
         }
         if notes.is_some() {
             sets.push("notes = ?");
+        }
+        // Typed in by hand when no lookup found the pressing. It also makes the
+        // running-time lookup a single request instead of a search, which is
+        // the difference between answering and being cut off by a proxy.
+        if mbid_release.is_some() {
+            sets.push("mbid_release = ?");
         }
         if sets.is_empty() {
             // Nothing asked for is not a failure — but it must not report a
@@ -4327,6 +4334,9 @@ impl Database {
             q = q.bind(v);
         }
         if let Some(v) = notes {
+            q = q.bind(v.map(|s| s.to_string()));
+        }
+        if let Some(v) = mbid_release {
             q = q.bind(v.map(|s| s.to_string()));
         }
         let res = q.bind(user_id).bind(id).execute(&self.pool).await?;
@@ -13369,14 +13379,16 @@ mod tests {
             .await
             .unwrap();
 
-        db.update_physical(uid, id, None, None, Some(Some(gear)), None, None, None).await.unwrap();
+        db.update_physical(uid, id, None, None, Some(Some(gear)), None, None, None, None)
+            .await
+            .unwrap();
         let r = db.get_physical(uid, id).await.unwrap().unwrap();
         assert_eq!(r.equipment_id, Some(gear));
         assert_eq!(r.purchased_at, Some(1_700_000_000));
 
         // Editing one field leaves the others alone. This is the assertion a
         // bare `Option` fails.
-        db.update_physical(uid, id, Some(Some(1_800_000_000)), None, None, None, None, None)
+        db.update_physical(uid, id, Some(Some(1_800_000_000)), None, None, None, None, None, None)
             .await
             .unwrap();
         let r = db.get_physical(uid, id).await.unwrap().unwrap();
@@ -13386,7 +13398,7 @@ mod tests {
         // An explicit null still clears — the picker's "— no deck —" needs it,
         // which is why the distinction has to survive deserialisation rather
         // than being designed away.
-        db.update_physical(uid, id, None, None, Some(None), None, None, None).await.unwrap();
+        db.update_physical(uid, id, None, None, Some(None), None, None, None, None).await.unwrap();
         assert_eq!(db.get_physical(uid, id).await.unwrap().unwrap().equipment_id, None);
     }
 
@@ -16946,7 +16958,9 @@ mod tests {
             )
             .await
             .unwrap();
-        db.update_physical(uid, rid, None, Some(Some(cid)), None, None, None, None).await.unwrap();
+        db.update_physical(uid, rid, None, Some(Some(cid)), None, None, None, None, None)
+            .await
+            .unwrap();
 
         assert!(db.delete_chain(uid, cid).await.unwrap(), "it deletes");
         assert!(db.get_chain(uid, cid).await.unwrap().is_none());

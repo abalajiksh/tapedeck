@@ -464,12 +464,38 @@
 	// back with `duration_secs: null`. That used to be invisible: the deck
 	// filled in three minutes a track and presented the sum as a length. It is
 	// visible now, and fixable.
+	/** Typed into the panel when no lookup can find the pressing. */
+	let mbidDraft = '';
+	let mbidBusy = false;
+
 	let durPreview: DurationPreview | null = null;
 	let durBusy = false;
 	let durNote = '';
 
 	/** Tracks on the open record with no running time. */
 	$: missingDurations = openTracks.filter((t) => t.duration_secs == null).length;
+	$: mbidDraft = open?.mbid_release ?? '';
+
+	async function saveMbid() {
+		if (!open) return;
+		const v = mbidDraft.trim();
+		mbidBusy = true;
+		durNote = '';
+		try {
+			await api.updatePressing(open.id, { mbid_release: v || null });
+			await load();
+			const fresh = shelf.find((x) => x.id === open?.id);
+			if (fresh) open = fresh;
+			// With an id the lookup is one request against a known release
+			// rather than a search, so it is worth going straight on.
+			if (v) await fetchDurations();
+			else durNote = 'Release ID cleared.';
+		} catch (e) {
+			durNote = e instanceof Error ? e.message : 'Could not save that';
+		} finally {
+			mbidBusy = false;
+		}
+	}
 
 	async function fetchDurations() {
 		if (!open) return;
@@ -1794,6 +1820,28 @@
 						<p style="font-size:12.5px;color:var(--td-muted);margin:10px 0 0;">{durNote}</p>
 					{/if}
 
+					<!-- Shown whenever a running time is missing, because the usual
+					     reason a search fails is that the barcode finds nothing and
+					     the name finds somebody else's reissue. Pasting the release
+					     id settles it — and makes the lookup one request rather than
+					     a search, which is also what stops it being cut off. -->
+					{#if missingDurations > 0}
+						<div class="mbidrow">
+							<label for="mbid-{open.id}">MusicBrainz release ID</label>
+							<input id="mbid-{open.id}" class="input" bind:value={mbidDraft}
+								placeholder="7cd9e846-1616-4585-a164-2e24afc368ae"
+								disabled={mbidBusy} />
+							<button class="btn btn-secondary" on:click={saveMbid}
+								disabled={mbidBusy || mbidDraft.trim() === (open.mbid_release ?? '')}>
+								{mbidBusy ? 'Saving…' : 'Save & look up'}
+							</button>
+						</div>
+						<p style="font-size:12px;color:var(--td-muted-3);margin:6px 0 0;max-width:64ch;">
+							Find the exact pressing on musicbrainz.org and paste the id from
+							its address. Stored on the record, so every later lookup uses it.
+						</p>
+					{/if}
+
 					{#if durPreview && durPreview.source}
 						<!-- Shown before anything is written, and the apply sends these
 						     rows straight back rather than searching again: a preview
@@ -2240,6 +2288,12 @@
 	.trkone:hover { color: var(--td-accent); border-color: var(--td-accent); }
 	.trkone:disabled { cursor: not-allowed; }
 	@media (hover: none) { .trkone { opacity: 1; } }
+
+	.mbidrow {
+		display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-top: 12px;
+	}
+	.mbidrow label { font-size: 12.5px; color: var(--td-muted); flex: none; }
+	.mbidrow .input { flex: 1 1 280px; min-width: 0; font-size: 12.5px; }
 
 	.durwarn {
 		display: flex; align-items: center; gap: 14px; flex-wrap: wrap;

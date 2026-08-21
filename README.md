@@ -1160,9 +1160,10 @@ Things that look finished and aren't:
   different listens and `AudioQuality.channels` has somewhere to put it, but
   `physical_plays` has no column for which one you played.
 - **A running time can't be typed in.** Tapedeck will go and look one up — by
-  barcode, matched on titles, previewed before it writes anything — but if no
-  pressing anywhere has it, the tracklist stays unknown. `PUT
-  /api/v1/physical/:id/tracks` exists and nothing in the UI calls it. A side with
+  MusicBrainz release ID if you paste one, else by barcode, matched on titles and
+  previewed before it writes anything — but if no pressing anywhere has the
+  figures, the tracklist stays unknown. `PUT /api/v1/physical/:id/tracks` exists
+  and nothing in the UI calls it. A side with
   no running times shows no length and no progress bar rather than inventing
   one, and its listens carry no duration, so they add nothing to your gear hours
   until the numbers arrive.

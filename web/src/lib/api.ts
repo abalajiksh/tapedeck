@@ -937,6 +937,9 @@ export interface DurationProposal {
 export interface DurationPreview {
 	/** Every track already has a duration; there is nothing to do. */
 	complete: boolean;
+	/** The lookup could not be made — busy, throttled or too slow. Distinct from
+	 *  an empty result, which means it was asked and there is nothing. */
+	unavailable?: boolean;
 	source: { title: string; artist: string; year?: number | null; format?: string | null; country?: string | null } | null;
 	durations: DurationProposal[];
 	note?: string;
@@ -1671,6 +1674,9 @@ class TapedeckAPI {
 			 *  sides — a record has a break, a disc has none — so the response
 			 *  reports `sides_rewritten` and the caller should refetch. */
 			kind?: ShelfKind;
+			/** The MusicBrainz release this pressing is, typed in by hand. Also
+			 *  the cheapest running-time lookup — one request, no search. */
+			mbid_release?: string | null;
 		}
 	): Promise<{ status: string; sides_rewritten?: boolean }> {
 		return this.patch(`/api/v1/physical/${id}`, body);

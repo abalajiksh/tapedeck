@@ -392,6 +392,15 @@ pub struct ReleaseUpdate {
     /// would have the shelf offer to remind you to flip a CD.
     #[serde(default)]
     pub kind: Option<String>,
+    /// The MusicBrainz release this pressing is, typed in by hand.
+    ///
+    /// Worth having for its own sake — a record catalogued from Discogs carries
+    /// no MusicBrainz id at all — and it is also the cheapest way to ask for
+    /// running times: with one, the lookup is a single request against a known
+    /// release rather than a search that may walk several candidates and be cut
+    /// off by a proxy before it answers.
+    #[serde(default, deserialize_with = "explicit")]
+    pub mbid_release: Option<Option<String>>,
 }
 
 /// The shelf's formats. Mirrors the CHECK on `physical_releases.kind` — a value
@@ -460,6 +469,7 @@ async fn update_release(
             body.notes.as_ref().map(|n| n.as_deref()),
             kind.as_deref(),
             body.chain_variant_id,
+            body.mbid_release.as_ref().map(|m| m.as_deref()),
         )
         .await
     {
@@ -556,6 +566,14 @@ async fn set_tracks(
     }
 }
 
+/// How long the running-time lookup may take before this endpoint gives up and
+/// says so itself.
+///
+/// Chosen to sit well inside any reverse proxy's patience rather than to be
+/// generous: the worst thing this endpoint can do is fail to answer, because
+/// then the proxy answers instead and its 502 says nothing about running times.
+const LOOKUP_DEADLINE: std::time::Duration = std::time::Duration::from_secs(20);
+
 /// One track's proposed running time, as previewed and as applied.
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct DurationProposal {
@@ -611,48 +629,78 @@ async fn preview_durations(
             .into_response();
     }
 
-    // Best key first. An MBID names the pressing outright; a barcode names the
-    // edition; artist and title are a last resort and the most likely to find
-    // somebody else's reissue.
-    // Errors are **not** folded into "nothing found". MusicBrainz rate-limits
-    // an unauthenticated caller readily, and reporting that as an empty result
-    // sends somebody hunting for running times that are right there — the
-    // mistake `musicbrainz_search` warns about in its own body, made one layer
-    // up. A 502 says the lookup failed; an empty list says it succeeded and had
-    // nothing.
-    let lookup = if let Some(mbid) = release.mbid_release.as_deref().filter(|m| !m.is_empty()) {
-        release_lookup::musicbrainz_release(mbid).await.map(|c| c.into_iter().collect::<Vec<_>>())
-    } else if let Some(bc) = release.barcode.as_deref().filter(|b| !b.trim().is_empty()) {
-        let q = format!("barcode:{}", bc.replace([' ', '-'], ""));
-        release_lookup::musicbrainz_search(&q, 3).await
-    } else {
-        let q = format!(
-            "artist:\"{}\" AND release:\"{}\"",
-            release.artist.replace('"', ""),
-            release.title.replace('"', "")
-        );
-        release_lookup::musicbrainz_search(&q, 3).await
-    };
-    let found = match lookup {
-        Ok(v) => v,
-        Err(e) => return err(502, format!("MusicBrainz: {e}")),
+    // **This endpoint answers within its own deadline, always.**
+    //
+    // It reaches a third party over the network, and MusicBrainz is slow at
+    // unpredictable moments. Held open long enough, the request stops being a
+    // slow response and becomes *no response*: the reverse proxy in front of the
+    // instance gives up and serves its own 502, which is unreadable HTML with
+    // nothing in it about running times. That is what got reported, and it is
+    // the third time here that a request outliving a proxy has been mistaken for
+    // a fault in the thing it was asking about.
+    //
+    // Best key first, and each is cheaper than the last resort. An MBID names
+    // the pressing outright and is one request. A barcode names the edition, so
+    // there is exactly one answer worth fetching. Only the name search may walk
+    // further, and it stops at the first pressing that can actually answer.
+    let lookup = async {
+        if let Some(mbid) = release.mbid_release.as_deref().filter(|m| !m.trim().is_empty()) {
+            release_lookup::musicbrainz_release(mbid).await
+        } else if let Some(bc) = release.barcode.as_deref().filter(|b| !b.trim().is_empty()) {
+            let q = format!("barcode:{}", bc.replace([' ', '-'], ""));
+            release_lookup::musicbrainz_first_with_durations(&q, 1).await
+        } else {
+            let q = format!(
+                "artist:\"{}\" AND release:\"{}\"",
+                release.artist.replace('"', ""),
+                release.title.replace('"', "")
+            );
+            release_lookup::musicbrainz_first_with_durations(&q, 3).await
+        }
     };
 
-    // The first candidate that actually carries running times. A pressing with
-    // none is no more use than the one on the shelf.
-    let Some(source) =
-        found.into_iter().find(|c| c.tracks.iter().any(|t| t.duration_secs.is_some()))
-    else {
-        return (
+    // An upstream that is busy or slow is a **normal outcome of asking**, not a
+    // failure of this server — so it comes back 200 with `unavailable` set,
+    // rather than as a 5xx a proxy is free to replace with its own error page.
+    // The distinction still travels: "asked, and there is nothing" and "could
+    // not ask" remain different answers, carried in the body where nothing
+    // between here and the browser can eat them.
+    let unavailable = |note: String| {
+        (
             StatusCode::OK,
             Json(serde_json::json!({
                 "complete": false,
                 "durations": [],
                 "source": serde_json::Value::Null,
-                "note": "Nothing with running times was found for this record.",
+                "unavailable": true,
+                "note": note,
             })),
         )
-            .into_response();
+            .into_response()
+    };
+
+    let source = match tokio::time::timeout(LOOKUP_DEADLINE, lookup).await {
+        Ok(Ok(Some(c))) => c,
+        Ok(Ok(None)) => {
+            return (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "complete": false,
+                    "durations": [],
+                    "source": serde_json::Value::Null,
+                    "note": "Nothing with running times was found for this record.",
+                })),
+            )
+                .into_response();
+        }
+        Ok(Err(e)) => return unavailable(format!("MusicBrainz: {e}")),
+        Err(_) => {
+            return unavailable(
+                "MusicBrainz didn't answer in time. It throttles hard at busy \
+                 moments — try again in a minute."
+                    .into(),
+            )
+        }
     };
 
     let matched = release_lookup::match_durations(&stored, &source.tracks);
@@ -1533,6 +1581,7 @@ async fn play_side(
                 // side does not ask again. `variant_id` rather than the raw
                 // body: a variant that failed the chain check is not stored.
                 body.chain_variant_id.map(|_| variant_id),
+                None,
             )
             .await
         {
@@ -2194,6 +2243,7 @@ async fn import_shelf(
                     None,
                     chain.map(Some),
                     deck.map(Some),
+                    None,
                     None,
                     None,
                     None,

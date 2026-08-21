@@ -26,7 +26,7 @@ openapi: 3.1.0
 
 info:
   title: Tapedeck
-  version: 0.75.0
+  version: 0.75.1
   summary: Self-hosted scrobbler and listening journal.
   description: |
     Tapedeck ingests listens, enriches them with MusicBrainz metadata, stores
@@ -4137,6 +4137,18 @@ paths:
                 type: object
                 properties:
                   complete: { type: boolean }
+                  unavailable:
+                    type: boolean
+                    description: |
+                      The lookup could not be made — MusicBrainz was busy,
+                      throttling, or did not answer inside this endpoint's own
+                      20-second deadline. **Still a 200**, deliberately: an
+                      upstream being slow is a normal outcome of asking rather
+                      than a fault of this server, and a 5xx here is
+                      indistinguishable from the reverse proxy's own once it
+                      reaches a browser. Distinct from an empty `durations` with
+                      no `unavailable`, which means the lookup succeeded and
+                      there is nothing.
                   source:
                     type: [object, 'null']
                     description: The pressing the running times came from.

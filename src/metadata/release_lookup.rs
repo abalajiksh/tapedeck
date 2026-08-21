@@ -291,6 +291,77 @@ pub fn disc_sides(per_disc_counts: &[usize]) -> Vec<String> {
     out
 }
 
+/// The first pressing a search turns up that actually carries running times.
+///
+/// `musicbrainz_search` fetches **every** candidate before returning, pacing
+/// itself at 1.1s between each because the search index carries no tracklist.
+/// That is right when the caller is going to show somebody a list to choose
+/// from, and wrong when it only wants the first usable answer: at three
+/// candidates it is four requests and two sleeps, each request able to sit for
+/// the client's full 15-second timeout, so a slow spell at MusicBrainz turns
+/// into a request held open for the best part of a minute.
+///
+/// Behind a reverse proxy that is not a slow response, it is **no response** —
+/// the tunnel gives up and serves its own 502, which is what got reported. So
+/// this stops at the first candidate with durations on it. A barcode should be
+/// asked with `limit = 1` in any case: it identifies an edition, so there is one
+/// answer and the second and third fetches are a minute spent on nothing.
+pub async fn musicbrainz_first_with_durations(
+    query: &str,
+    limit: usize,
+) -> Result<Option<ReleaseCandidate>, Box<dyn std::error::Error + Send + Sync>> {
+    #[derive(Deserialize)]
+    struct SearchResp {
+        #[serde(default)]
+        releases: Vec<SearchRelease>,
+    }
+    #[derive(Deserialize)]
+    struct SearchRelease {
+        id: String,
+    }
+
+    let http = client()?;
+    let resp = http
+        .get("https://musicbrainz.org/ws/2/release/")
+        .query(&[("query", query), ("fmt", "json"), ("limit", &limit.to_string())])
+        .send()
+        .await?;
+    if resp.status() == reqwest::StatusCode::SERVICE_UNAVAILABLE {
+        return Err("MusicBrainz is rate limiting us — try again in a moment".into());
+    }
+    if !resp.status().is_success() {
+        return Err(format!("MusicBrainz returned {}", resp.status()).into());
+    }
+    let found: SearchResp = resp.json().await?;
+
+    let mut last_err = None;
+    let mut tried = 0usize;
+    for r in found.releases.into_iter().take(limit.min(3)) {
+        if tried > 0 {
+            tokio::time::sleep(Duration::from_millis(1100)).await;
+        }
+        tried += 1;
+        match musicbrainz_release(&r.id).await {
+            // The whole point: stop as soon as one can answer the question.
+            Ok(Some(c)) if c.tracks.iter().any(|t| t.duration_secs.is_some()) => {
+                return Ok(Some(c));
+            }
+            Ok(_) => {}
+            Err(e) => {
+                debug!("MusicBrainz release {} failed: {}", r.id, e);
+                last_err = Some(e);
+            }
+        }
+    }
+    // Every candidate failing is not "nothing found" — it is usually the rate
+    // limiter, and saying "no running times exist" would send somebody hunting
+    // for figures that are right there.
+    match last_err {
+        Some(e) if tried > 0 => Err(e),
+        _ => Ok(None),
+    }
+}
+
 /// Match a fetched tracklist onto the one already on the shelf, by title.
 ///
 /// The point of this function is that **position matching is wrong**. A record
