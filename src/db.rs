@@ -994,6 +994,15 @@ impl Database {
                 is_active BOOLEAN DEFAULT TRUE,
                 total_hours REAL DEFAULT 0,
                 created_at INTEGER NOT NULL,
+                -- Phase 6: the sharing unit is the chain, not the listen.
+                --
+                -- Off by default, and it is what decides whether a listen ever
+                -- reaches the Reel, the instance figures or an outbox. There is
+                -- no per-listen override and there should not be one: this is a
+                -- standing decision about *how you listen*, which is a thing
+                -- somebody can hold in their head, where a choice per play is
+                -- not. It is the reason private-by-default is not also useless.
+                shared BOOLEAN NOT NULL DEFAULT FALSE,
                 UNIQUE(user_id, name)
             )",
         )
@@ -1925,6 +1934,207 @@ impl Database {
         .execute(&self.pool)
         .await?;
 
+        self.init_patch().await?;
+
+        Ok(())
+    }
+
+    /// Phase 6 — Patch, and the actor side of Phase 8.
+    ///
+    /// Split into its own function because it is a coherent subsystem rather
+    /// than more of the same, and because it is the only schema in this file
+    /// whose rows **another server will hold copies of**. That is the whole
+    /// reason the stable ids here are not an afterthought: a listen can be
+    /// re-derived, and an id another instance already stored cannot.
+    ///
+    /// Local-first is the shipping order. Everything here serves from day one;
+    /// outbound delivery stays dark until Patch works inside one instance.
+    async fn init_patch(&self) -> Result<(), sqlx::Error> {
+        // One row per local user, holding the half of an identity that faces
+        // outward. Deliberately *not* columns on `users`: the private key is a
+        // credential, and `users` is the row every authentication query in this
+        // application selects.
+        //
+        // `uri` is stored rather than derived on read. It is derived from
+        // `PUBLIC_URL` and the username at creation, but the moment a remote
+        // server holds it, it is a fact about the past — recomputing it from
+        // today's config would silently rename an actor other people follow.
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS actors (
+                user_id INTEGER PRIMARY KEY REFERENCES users(id),
+                uri TEXT NOT NULL UNIQUE,
+                -- PEM. The private half goes through `Database::seal` like every
+                -- other replayed secret, so ciphertext never leaves db.rs.
+                public_key TEXT NOT NULL,
+                private_key TEXT NOT NULL,
+                -- When this identity first left the building: the first
+                -- accepted patch, or the first signed activity, whichever came
+                -- first. Non-null means the username is frozen.
+                --
+                -- The obvious rule -- 'renameable while the deck is private' --
+                -- is wrong here, because following happens *while* private: a
+                -- private deck holds patches in the inbox for approval, so a
+                -- user can have followers and never be public. Renaming after
+                -- this point breaks the identity on every server holding it.
+                -- ActivityPub's way out is `Move` + `alsoKnownAs`; that is a
+                -- deliberate migration and it is not built.
+                frozen_at INTEGER,
+                created_at INTEGER NOT NULL
+            )",
+        )
+        .execute(&self.pool)
+        .await?;
+
+        // Everyone we have resolved who is not us. Cached rather than fetched
+        // per request -- an actor document is the key material a signature is
+        // checked against, and re-fetching it per inbox delivery would make
+        // every remote server's availability our own.
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS remote_actors (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                uri TEXT NOT NULL UNIQUE,
+                -- 'ash@deck.example', as WebFinger resolves it. Display only:
+                -- `uri` is the identity, and a handle can be reused after a
+                -- `Move` where a URI cannot.
+                handle TEXT,
+                name TEXT,
+                inbox TEXT NOT NULL,
+                -- A shared inbox is one POST for every follower on that host.
+                -- Optional, and the only reason delivery to a large instance is
+                -- not one request per person.
+                shared_inbox TEXT,
+                public_key TEXT,
+                icon_url TEXT,
+                fetched_at INTEGER NOT NULL
+            )",
+        )
+        .execute(&self.pool)
+        .await?;
+
+        // A patch is a follow edge, and it carries state because an
+        // ActivityPub follow is a request that needs an explicit Accept -- one
+        // of the four things recorded as must-not-defer since 2026-07-30.
+        //
+        // Either end may be local or remote, which is why there are four
+        // columns and not two. The CHECKs are what stop a row that names both
+        // or neither: exactly one side of each end is set, always.
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS patches (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                uuid TEXT NOT NULL UNIQUE,
+                follower_user_id INTEGER REFERENCES users(id),
+                follower_actor_id INTEGER REFERENCES remote_actors(id),
+                target_user_id INTEGER REFERENCES users(id),
+                target_actor_id INTEGER REFERENCES remote_actors(id),
+                -- pending | accepted | rejected. Never a boolean: a rejected
+                -- patch and a patch nobody has looked at are different things,
+                -- and only one of them should be offered again.
+                state TEXT NOT NULL DEFAULT 'pending',
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                CHECK ((follower_user_id IS NULL) <> (follower_actor_id IS NULL)),
+                CHECK ((target_user_id IS NULL) <> (target_actor_id IS NULL))
+            )",
+        )
+        .execute(&self.pool)
+        .await?;
+
+        // One edge per pair, whichever shape the ends take. Two partial indexes
+        // rather than one, because a UNIQUE over four mostly-null columns
+        // treats every NULL as distinct and would enforce nothing at all.
+        sqlx::query(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_patches_local_pair
+             ON patches(follower_user_id, target_user_id)
+             WHERE follower_user_id IS NOT NULL AND target_user_id IS NOT NULL",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_patches_remote_out
+             ON patches(follower_user_id, target_actor_id)
+             WHERE follower_user_id IS NOT NULL AND target_actor_id IS NOT NULL",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_patches_remote_in
+             ON patches(follower_actor_id, target_user_id)
+             WHERE follower_actor_id IS NOT NULL AND target_user_id IS NOT NULL",
+        )
+        .execute(&self.pool)
+        .await?;
+
+        // Every social action, with a stable id and a timestamp.
+        //
+        // The verb is settled and frozen: a listen is a `Create` wrapping a
+        // `td:Listen` object, so a server that understands nothing renders the
+        // content line and one that understands `td:` gets the chain and the
+        // format. There is no picker -- three vocabularies would mean three
+        // things to maintain and a migration path between them for a decision
+        // made once.
+        //
+        // `payload` is the JSON-LD **as signed**, kept rather than rebuilt.
+        // Rebuilding it later would produce a different document once anything
+        // upstream of it changes, and a signature is over bytes.
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS activities (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                uuid TEXT NOT NULL UNIQUE,
+                user_id INTEGER NOT NULL REFERENCES users(id),
+                -- Create | Follow | Accept | Reject | Undo | Delete | Like
+                kind TEXT NOT NULL,
+                -- 'td:Listen', 'Note', 'td:Dub'. Null for the bare verbs.
+                object_type TEXT,
+                -- The local row this is about, as 'scrobble:41822'. Kept so a
+                -- delete can find the activity that announced the thing being
+                -- deleted -- and note the ordering that forces: the Delete is
+                -- emitted while the row still exists, because it carries its id.
+                object_ref TEXT,
+                payload TEXT NOT NULL,
+                published INTEGER NOT NULL,
+                -- public | patched | private. The enum from the first
+                -- migration, never a boolean.
+                visibility TEXT NOT NULL DEFAULT 'private'
+            )",
+        )
+        .execute(&self.pool)
+        .await?;
+
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_activities_user_published
+             ON activities(user_id, published)",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_activities_object ON activities(object_ref)")
+            .execute(&self.pool)
+            .await?;
+
+        // Delivery is per recipient, for the reason `delivered_sinks` is per
+        // scrobble: one inbox being down must not redeliver to the twenty that
+        // already took it. Retries only touch rows that are not yet 'sent'.
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS activity_deliveries (
+                activity_id INTEGER NOT NULL REFERENCES activities(id),
+                actor_id INTEGER NOT NULL REFERENCES remote_actors(id),
+                -- pending | sent | failed
+                state TEXT NOT NULL DEFAULT 'pending',
+                attempts INTEGER NOT NULL DEFAULT 0,
+                last_error TEXT,
+                delivered_at INTEGER,
+                PRIMARY KEY (activity_id, actor_id)
+            )",
+        )
+        .execute(&self.pool)
+        .await?;
+
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_activity_deliveries_pending
+             ON activity_deliveries(state, attempts) WHERE state <> 'sent'",
+        )
+        .execute(&self.pool)
+        .await?;
+
         Ok(())
     }
 
@@ -2224,6 +2434,19 @@ impl Database {
             let _ = sqlx::query("ALTER TABLE signal_chains ADD COLUMN icon TEXT")
                 .execute(&self.pool)
                 .await;
+        }
+
+        // Migration: Phase 6's sharing switch. FALSE for every chain that
+        // existed before the column, which is the only safe direction — nobody
+        // consents to publishing their listening by upgrading a binary. Same
+        // rule `users.public_now_playing` follows.
+        if !has_column(&self.pool, "signal_chains", "shared").await {
+            info!("⚙️ Migrating: adding signal_chains.shared...");
+            let _ = sqlx::query(
+                "ALTER TABLE signal_chains ADD COLUMN shared BOOLEAN NOT NULL DEFAULT FALSE",
+            )
+            .execute(&self.pool)
+            .await;
         }
 
         // Migration: artist-level genres. A genre is a property of an artist far
@@ -16174,6 +16397,93 @@ mod tests {
         .unwrap();
         let rows = db.get_recent_scrobbles(1, 10, 0, None, None, None, None, None).await.unwrap();
         assert_eq!(rows[0].listened_ms, Some(1500));
+    }
+
+    /// An existing database gains the Patch schema and the sharing switch.
+    ///
+    /// Two things this pins, and both are the v0.61.1 trap in waiting.
+    /// `signal_chains.shared` is a migrated column, so anything in `init()`
+    /// that *references* it — an index, a partial index, a view — fails on
+    /// every database that has data in it while passing on a fresh one. And
+    /// the Patch tables are created in `init()` with `IF NOT EXISTS`, which is
+    /// only safe because they are wholly new: none of them may ever come to
+    /// depend on a column `migrate()` adds.
+    ///
+    /// The default is the half worth asserting. `shared` must come back
+    /// **false** for a chain that predates the column: nobody consents to
+    /// publishing their listening by upgrading a binary.
+    #[tokio::test]
+    async fn an_existing_database_gains_the_patch_schema() {
+        let n = N.fetch_add(1, Ordering::SeqCst);
+        let path =
+            std::env::temp_dir().join(format!("td-oldpatch-{}-{}.db", std::process::id(), n));
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{}", path.display(), suffix));
+        }
+
+        // A chain from before any of this existed, with hours on it.
+        {
+            let pool = sqlx::SqlitePool::connect(&format!("sqlite:{}?mode=rwc", path.display()))
+                .await
+                .unwrap();
+            for ddl in [
+                "CREATE TABLE users (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                     username TEXT UNIQUE NOT NULL, display_name TEXT,
+                     password_hash TEXT NOT NULL, role TEXT NOT NULL DEFAULT 'user',
+                     created_at INTEGER NOT NULL)",
+                "INSERT INTO users (id, username, password_hash, created_at)
+                     VALUES (1, 'ash', 'x', 1700000000)",
+                "CREATE TABLE signal_chains (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                     user_id INTEGER NOT NULL REFERENCES users(id),
+                     name TEXT NOT NULL, description TEXT,
+                     components JSON NOT NULL DEFAULT '[]',
+                     listening_context TEXT NOT NULL DEFAULT 'unknown',
+                     is_active BOOLEAN DEFAULT TRUE, total_hours REAL DEFAULT 0,
+                     created_at INTEGER NOT NULL, UNIQUE(user_id, name))",
+                "INSERT INTO signal_chains (user_id, name, created_at)
+                     VALUES (1, 'Desk Reference', 1700000000)",
+            ] {
+                sqlx::query(ddl).execute(&pool).await.unwrap();
+            }
+            pool.close().await;
+        }
+
+        let db =
+            Database::new(&format!("sqlite:{}", path.display()), Arc::new(SecretBox::test_key()))
+                .await
+                .expect("an existing database must open");
+
+        // The chain that was already there kept its name and is **not** shared.
+        let (name, shared): (String, bool) =
+            sqlx::query_as("SELECT name, shared FROM signal_chains WHERE user_id = 1")
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert_eq!(name, "Desk Reference");
+        assert!(!shared, "a chain that predates the column must not be published by an upgrade");
+
+        // And every Patch table is there to be written to.
+        for table in ["actors", "remote_actors", "patches", "activities", "activity_deliveries"] {
+            let (n,): (i64,) = sqlx::query_as(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?",
+            )
+            .bind(table)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+            assert_eq!(n, 1, "{} must exist on a migrated database", table);
+        }
+
+        // A patch with both ends named on one side is refused by the CHECK,
+        // which is what stops an edge that means two different things at once.
+        let bad = sqlx::query(
+            "INSERT INTO patches (uuid, follower_user_id, follower_actor_id, target_user_id,
+                                  state, created_at, updated_at)
+             VALUES ('u1', 1, 1, 1, 'pending', 1, 1)",
+        )
+        .execute(&db.pool)
+        .await;
+        assert!(bad.is_err(), "a patch cannot have a local and a remote follower");
     }
 
     /// Opening a database that an *older* Tapedeck wrote.
