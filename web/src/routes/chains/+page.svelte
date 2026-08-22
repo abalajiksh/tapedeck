@@ -86,25 +86,102 @@
 	$: loggingCount = chains.filter((c) => c.total_hours > 0).length;
 	$: totalChainHours = chains.reduce((a, c) => a + c.total_hours, 0);
 
+	// ── The setups overview ──
+	//
+	// One picture of a chain and every variant of it, read-only. A variant is
+	// stored as *only what differs*, which is what makes editing one cheap and
+	// what makes the arrangement hard to hold in your head once there are three
+	// of them: the drawer can tell you a variant swaps the cartridge, and not
+	// what the whole shelf of possibilities looks like at once.
+	//
+	// It is a grid rather than a canvas, and that is not a compromise — a chain
+	// is a *line* (`components` is an array), so the only branching there can be
+	// is at a known position. Columns are positions, rows are setups, and the
+	// top row is the chain itself: the standard. A variant's row shows its
+	// overrides and passes everything else through, which means a variant that
+	// swaps **two** boxes reads as one row with two changes rather than as two
+	// separate things — the shape today's editor cannot create but the schema
+	// has always allowed.
+	let overviewOpen = false;
+
+	/** How many columns the picture needs: the chain's own steps, plus any
+	 *  position a variant adds past the end. */
+	function overviewSlots(c: SignalChain, vs: ChainVariant[]): number {
+		const base = c.components?.length ?? 0;
+		return vs.reduce(
+			(n, v) => v.overrides.reduce((m, o) => Math.max(m, o.position + 1), n),
+			base
+		);
+	}
+
+	/** What a variant puts at one position — `null` where the chain's own step
+	 *  passes straight through, which is most of them. */
+	function overrideAt(v: ChainVariant, i: number) {
+		return v.overrides.find((o) => o.position === i) ?? null;
+	}
+
+	/** The name a cell shows for an override. The stored snapshot wins over the
+	 *  gear table for the reason `ChainComponent.name` is written at all: gear
+	 *  can be deleted, and a row that goes blank is worse than one that is out
+	 *  of date. */
+	function overrideName(o: { equipment_id?: number | null; name?: string | null }): string {
+		return o.name ?? equipment.find((e) => e.id === o.equipment_id)?.name ?? '—';
+	}
+
 	function onKey(e: KeyboardEvent) {
 		if (e.key === 'Escape') {
-			if (openChainId != null) openChainId = null;
+			// Innermost first, or Escape closes the drawer out from under the
+			// overlay sitting on top of it.
+			if (overviewOpen) overviewOpen = false;
+			else if (openChainId != null) openChainId = null;
 		}
 	}
 
-	// The variant editor.
+	// The variant editor, which is also the swap editor.
+	//
+	// `vMode` is what makes a node in the path clickable. Swapping a box has two
+	// honest meanings and the old dialog could only say one of them: *this chain
+	// is wired differently now* (replace the step), or *this is the other stylus
+	// I sometimes fit* (a variant). They are not the same claim about the past —
+	// replacing rewrites what every listen through this chain is taken to have
+	// run through, where a variant leaves them alone — so the choice is on the
+	// dialog rather than inferred, and `variant` is the default because it is
+	// the non-destructive one.
 	let vOpen = false;
 	let vChain: SignalChain | null = null;
 	let vId: number | null = null;
+	let vMode: 'variant' | 'chain' = 'variant';
 	let vName = '';
 	let vSlot = 0;
 	let vGear: number | null = null;
 	let vErr = '';
 	let vSaving = false;
 
+	/**
+	 * Click a node in the path.
+	 *
+	 * v0.62.0 fixed *browsing* — cards became rows and a drawer — and left
+	 * *editing* as the form dialog it always was. These are different screens
+	 * and only the first was ever touched, which is why the editor still asked
+	 * you to find a step in a list of selects rather than pointing at the one on
+	 * screen. The path in the drawer is already drawn; this makes it the thing
+	 * you act on.
+	 */
+	function openSwap(c: SignalChain, i: number) {
+		vChain = c;
+		vId = null;
+		vMode = 'variant';
+		vName = '';
+		vErr = '';
+		vSlot = i;
+		vGear = c.components?.[i]?.equipment_id ?? null;
+		vOpen = true;
+	}
+
 	function newVariant(c: SignalChain) {
 		vChain = c;
 		vId = null;
+		vMode = 'variant';
 		vName = '';
 		vErr = '';
 		// The last step is the usual thing you swap — headphones, IEMs, a
@@ -131,6 +208,11 @@
 	function editVariant(c: SignalChain, v: ChainVariant) {
 		vChain = c;
 		vId = v.id;
+		// Editing an existing variant is never a chain rewrite: the variant is
+		// the thing being opened, and offering to redirect the save onto the
+		// chain instead would be a different, destructive operation wearing the
+		// same button.
+		vMode = 'variant';
 		vName = v.name;
 		vErr = '';
 		const first = v.overrides?.[0];
@@ -140,8 +222,12 @@
 	}
 
 	async function saveVariant() {
-		if (!vChain?.id || !vName.trim()) { vErr = 'A variant needs a name.'; return; }
+		if (!vChain?.id) return;
 		if (vGear == null) { vErr = 'Pick the gear that goes in that slot.'; return; }
+		// Replacing a step in the chain needs no name — the chain already has
+		// one. Only a variant is a new thing that has to be called something.
+		if (vMode === 'chain') return replaceStep();
+		if (!vName.trim()) { vErr = 'A variant needs a name.'; return; }
 		vSaving = true;
 		vErr = '';
 		try {
@@ -152,6 +238,61 @@
 			}];
 			if (vId == null) await api.createVariant({ chain_id: vChain.id, name: vName.trim(), overrides });
 			else await api.updateVariant(vId, { name: vName.trim(), overrides });
+			vOpen = false;
+			await load();
+		} catch (e) {
+			vErr = String(e).replace(/^API \d+: /, '');
+		}
+		vSaving = false;
+	}
+
+	/**
+	 * Rewire the chain itself, rather than recording a variant of it.
+	 *
+	 * The consequence to be clear about, and the dialog says it: this is
+	 * **retroactive**. Chain hours are derived from the listens
+	 * (`db::CHAIN_COLUMNS`), so replacing a step moves every hour ever logged
+	 * through this chain onto the new box — including the ones that ran through
+	 * the old one. That is right when you sold the amp and the chain is simply
+	 * different now, and wrong when you swap between two you still own, which is
+	 * what a variant is for.
+	 *
+	 * A step past the end appends, matching what `chain_variants` allows: a
+	 * chain that never named a cartridge can gain one without being rewritten.
+	 */
+	async function replaceStep() {
+		const c = vChain;
+		if (!c || vGear == null) return;
+		const g = equipment.find((e) => e.id === vGear);
+		if (!g) { vErr = 'That gear is no longer in your equipment.'; return; }
+		vSaving = true;
+		vErr = '';
+		try {
+			const comps = (c.components ?? []).map((x) => ({ ...x }));
+			const was = comps[vSlot];
+			const step: ChainComponent = {
+				// The slot's own type wins where there is a slot: it is what the
+				// chain says this position *is*, and the gear type is only a
+				// guess at it. A new step at the end has no slot to ask.
+				type: was?.type ?? componentTypeForGear[g.equipment_type] ?? 'transducer',
+				name: g.name,
+				// The detail described the box that was here, not the position —
+				// "Ortofon 2M Red" under a step now naming an Audio-Technica is
+				// worse than nothing, and nothing errors. Kept only when the gear
+				// did not actually change, which is the case where the user opened
+				// the swap and picked what was already there.
+				detail: was?.equipment_id === g.id ? (was?.detail ?? null) : null,
+				equipment_id: g.id
+			};
+			if (vSlot < comps.length) comps[vSlot] = step;
+			else comps.push(step);
+			await api.updateChain(c.id, {
+				name: c.name,
+				description: c.description || undefined,
+				listening_context: c.listening_context,
+				icon: c.icon,
+				components: comps
+			});
 			vOpen = false;
 			await load();
 		} catch (e) {
@@ -1051,14 +1192,23 @@
 								<span class="pdot" style="background:{roleColour(step.type)};box-shadow:0 0 0 4px color-mix(in srgb, {roleColour(step.type)} 16%, transparent);"></span>
 								{#if i < openChain.components.length - 1}<span class="pconn"></span>{/if}
 							</div>
-							<div style="padding-bottom:10px;min-width:0;">
+							<!-- The node is the control. The path was already drawn here and
+							     was the one thing on the screen that named the step you want
+							     to change, while the editor asked you to find it again in a
+							     select. `aria-label` because the visible content is a role,
+							     a name and a marker in nested divs, which reads as a
+							     paragraph rather than as what the button does. -->
+							<button class="pstep" on:click={() => openChain && openSwap(openChain, i)}
+								title="Swap this step — as a variant, or in the chain itself"
+								aria-label="Swap {step.name}">
 								<div class="prole">{roleLabel(step)}</div>
 								<div style="font-size:15.5px;font-weight:600;margin-top:1px;display:flex;align-items:center;gap:6px;">
 									{step.name}
 									{#if step.equipment_id != null}<span title="From your equipment" style="color:var(--td-accent);font-size:10px;">●</span>{/if}
+									<span class="pswap" aria-hidden="true">swap</span>
 								</div>
 								{#if step.detail}<div style="font-size:12.5px;color:var(--td-muted-2);">{step.detail}</div>{/if}
-							</div>
+							</button>
 						</div>
 					{/each}
 				</div>
@@ -1089,6 +1239,15 @@
 			{/each}
 			<div style="display:flex;gap:8px;flex-wrap:wrap;">
 				<button class="vadd" on:click={() => openChain && newVariant(openChain)}>+ variant</button>
+				<!-- Only offered where there is something to compare. With no
+				     variants the path above this *is* the overview, and a button
+				     opening a picture of one line is a button that does nothing. -->
+				{#if openChain && variantsFor(openChain.id).length}
+					<button class="vadd" on:click={() => (overviewOpen = true)}
+						title="See the chain and every variant of it side by side">
+						⛓ see all setups
+					</button>
+				{/if}
 				<!-- The other way to get a variant: an existing chain that is
 				     really this one wired differently. Only offered when there
 				     is something to fold. -->
@@ -1133,19 +1292,135 @@
      at a time — the whole reason variants exist is that swapping *one* thing
      should not mean rebuilding a chain, and a full editor here would just be
      the chain editor again. -->
+<!-- ── The setups overview ──
+     Read-only on purpose: editing lives on the nodes in the drawer, and a
+     picture that also edits would be two interactions competing over the same
+     click. This one answers "what have I actually got set up here". -->
+{#if overviewOpen && openChain}
+	{@const vs = variantsFor(openChain.id)}
+	{@const slots = overviewSlots(openChain, vs)}
+	<div class="dialog-backdrop" on:click={() => (overviewOpen = false)} on:keydown={() => {}} role="presentation">
+		<div class="dialog ov" style="width:min(980px,100%);" on:click|stopPropagation on:keydown|stopPropagation role="presentation">
+			<div class="dialog-title">{openChain.name} — every setup</div>
+			<div class="dialog-body">
+				<p class="ov-intro">
+					The top line is the chain as it stands. Each row below swaps only what it
+					says it swaps and passes the rest through, so the hours land on the box
+					that was actually fitted.
+				</p>
+				<!-- Scrolls in its own container. A long chain must not make the
+				     page scroll sideways — the rule the equipment table already
+				     had to learn. -->
+				<div class="ov-wrap">
+					<!-- The names stay put while the path scrolls. `position:sticky`
+					     was the obvious way and it does not work here: a grid item's
+					     containing block is its own grid area, so a sticky label can
+					     only travel within its own 170px column — it scrolls away
+					     looking exactly like no sticky at all. So the labels are a
+					     separate column outside the scroller, and the two are kept in
+					     step by a fixed row height rather than by hoping the content
+					     matches. -->
+					<div class="ov-labels">
+						<div class="ov-side ov-std">
+							<div class="ov-name">Standard</div>
+							<div class="ov-sub">{formatHours(openChain.total_hours)}</div>
+						</div>
+						{#each vs as v (v.id)}
+							<div class="ov-side">
+								<div class="ov-name">{v.name}</div>
+								<div class="ov-sub">{formatHours(v.total_hours)}</div>
+							</div>
+						{/each}
+					</div>
+					<div class="ov-scroll">
+					<div class="ov-grid" style="grid-template-columns:repeat({slots}, minmax(150px, 1fr));">
+						{#each Array(slots) as _, i}
+							{@const step = openChain.components?.[i]}
+							<div class="ov-cell">
+								{#if step}
+									<div class="ov-node" style="border-color:{roleColour(step.type)};">
+										<span class="ov-dot" style="background:{roleColour(step.type)};"></span>
+										<span class="ov-role">{roleLabel(step)}</span>
+										<span class="ov-label">{step.name}</span>
+									</div>
+								{:else}
+									<!-- A position only a variant reaches: the chain itself
+									     has nothing here, which is a real state and not a
+									     gap to fill in. -->
+									<div class="ov-none">nothing here</div>
+								{/if}
+							</div>
+						{/each}
+
+						{#each vs as v (v.id)}
+							{#each Array(slots) as _, i}
+								{@const o = overrideAt(v, i)}
+								{@const step = openChain.components?.[i]}
+								<div class="ov-cell">
+									{#if o}
+										<div class="ov-node ov-swap">
+											<span class="ov-dot" style="background:var(--td-accent);"></span>
+											<span class="ov-role">{step ? 'swapped' : 'added'}</span>
+											<span class="ov-label">{overrideName(o)}</span>
+										</div>
+									{:else}
+										<!-- Passed through. Drawn as the line it is rather
+										     than as a repeat of the standard's node: the
+										     row would then read as a whole second chain,
+										     which is exactly what a variant is not. -->
+										<div class="ov-thru" aria-label="same as the chain"></div>
+									{/if}
+								</div>
+							{/each}
+						{/each}
+					</div>
+					</div>
+				</div>
+			</div>
+			<div class="dialog-actions">
+				<button class="btn btn-secondary" on:click={() => (overviewOpen = false)}>Close</button>
+			</div>
+		</div>
+	</div>
+{/if}
+
 {#if vOpen && vChain}
 	<div class="dialog-backdrop" on:click={() => (vOpen = false)} on:keydown={() => {}} role="presentation">
 		<div class="dialog" style="width:min(520px,100%);" on:click|stopPropagation on:keydown|stopPropagation role="presentation">
-			<div class="dialog-title">{vId == null ? 'New variant' : 'Edit variant'} of {vChain.name}</div>
+			<div class="dialog-title">
+				{vId == null ? (vMode === 'chain' ? 'Swap a step in' : 'New variant of') : 'Edit variant of'}
+				{vChain.name}
+			</div>
 			<div class="dialog-body">
 				<div style="display:flex;flex-direction:column;gap:13px;">
-					<div class="field">
-						<label for="vn">Name</label>
-						<input id="vn" class="input" bind:value={vName} placeholder="Microlinear" />
-						<p style="font-size:12px;color:var(--td-muted-2);margin:5px 0 0;">
-							What is different about it — the stylus fitted, the headphones on.
-						</p>
-					</div>
+					<!-- The two meanings of swapping a box, stated rather than
+					     guessed at. Only offered when creating: editing an
+					     existing variant is about that variant, and redirecting
+					     the save onto the chain would be a different and
+					     destructive operation behind the same button. -->
+					{#if vId == null}
+						<div class="vmode">
+							<button class="vmode-btn" class:on={vMode === 'variant'}
+								on:click={() => (vMode = 'variant')}>
+								<span class="vmode-t">Save as a variant</span>
+								<span class="vmode-s">Both stay yours. Hours split between them.</span>
+							</button>
+							<button class="vmode-btn" class:on={vMode === 'chain'}
+								on:click={() => (vMode = 'chain')}>
+								<span class="vmode-t">Replace it in the chain</span>
+								<span class="vmode-s">The chain is simply wired this way now.</span>
+							</button>
+						</div>
+					{/if}
+					{#if vMode === 'variant'}
+						<div class="field">
+							<label for="vn">Name</label>
+							<input id="vn" class="input" bind:value={vName} placeholder="Microlinear" />
+							<p style="font-size:12px;color:var(--td-muted-2);margin:5px 0 0;">
+								What is different about it — the stylus fitted, the headphones on.
+							</p>
+						</div>
+					{/if}
 					<div class="field">
 						<label for="vs">Swap which step</label>
 						<select id="vs" class="input" bind:value={vSlot}>
@@ -1163,11 +1438,24 @@
 								<option value={e.id}>{e.name}{e.brand ? ` · ${e.brand}` : ''}</option>
 							{/each}
 						</select>
-						<p style="font-size:12px;color:var(--td-muted-2);margin:5px 0 0;">
-							Listens tagged with this variant credit their hours here instead of
-							whatever the chain names at that step — which is what makes
-							per-stylus wear answerable.
-						</p>
+						{#if vMode === 'variant'}
+							<p style="font-size:12px;color:var(--td-muted-2);margin:5px 0 0;">
+								Listens tagged with this variant credit their hours here instead of
+								whatever the chain names at that step — which is what makes
+								per-stylus wear answerable.
+							</p>
+						{:else}
+							<!-- Said plainly because it cannot be seen. Chain hours are
+							     derived from the listens, so rewiring the chain moves
+							     every hour ever logged through it onto the new box —
+							     including the ones that ran through the old one. -->
+							<p style="font-size:12px;color:var(--td-muted-2);margin:5px 0 0;">
+								This is retroactive: hours are worked out from the listens, so
+								every hour already logged through this chain moves onto the new
+								box. Right when you replaced the old one for good — use a
+								variant if you still swap between them.
+							</p>
+						{/if}
 					</div>
 					{#if vErr}<p style="font-size:13px;color:#b2622d;margin:0;">{vErr}</p>{/if}
 				</div>
@@ -1175,7 +1463,7 @@
 			<div class="dialog-actions">
 				<button class="btn btn-secondary" on:click={() => (vOpen = false)}>Cancel</button>
 				<button class="btn btn-primary" on:click={saveVariant} disabled={vSaving}>
-					{vSaving ? 'Saving…' : 'Save variant'}
+					{vSaving ? 'Saving…' : vMode === 'chain' ? 'Replace in the chain' : 'Save variant'}
 				</button>
 			</div>
 		</div>
@@ -1560,6 +1848,113 @@
 		font-size: 12px; font-family: inherit; cursor: pointer;
 	}
 	.tagsel.tagged { font-weight: 600; }
+
+	/* ── The node as a control ──
+	   A step is a button now, so it has to stop looking like one: no chrome
+	   until it is pointed at, since a column of framed buttons would undo the
+	   thing v0.62.0 was for. `text-align:left` because a button centres its
+	   content and the path reads as a list. */
+	.pstep {
+		border: none;
+		background: transparent;
+		font: inherit;
+		color: inherit;
+		text-align: left;
+		padding: 0 8px 10px;
+		margin: 0 0 0 -8px;
+		border-radius: 10px;
+		min-width: 0;
+		cursor: pointer;
+		display: block;
+		width: 100%;
+	}
+	.pstep:hover, .pstep:focus-visible { background: var(--td-surface2); }
+	.pswap {
+		font-size: 10.5px;
+		letter-spacing: .1em;
+		text-transform: uppercase;
+		color: var(--td-muted-3);
+		opacity: 0;
+		transition: opacity .12s;
+	}
+	.pstep:hover .pswap, .pstep:focus-visible .pswap { opacity: 1; }
+	@media (prefers-reduced-motion: reduce) { .pswap { transition: none; } }
+
+	/* ── The two meanings of a swap ── */
+	.vmode { display: flex; gap: 8px; flex-wrap: wrap; }
+	.vmode-btn {
+		flex: 1 1 200px;
+		display: flex;
+		flex-direction: column;
+		gap: 2px;
+		text-align: left;
+		padding: 10px 12px;
+		border-radius: 12px;
+		border: 1px solid var(--td-border);
+		background: var(--td-surface2);
+		color: inherit;
+		font: inherit;
+		cursor: pointer;
+	}
+	.vmode-btn.on { border-color: var(--td-accent); background: color-mix(in srgb, var(--td-accent) 10%, transparent); }
+	.vmode-t { font-size: 13.5px; font-weight: 600; }
+	.vmode-s { font-size: 11.5px; color: var(--td-muted-2); }
+
+	/* ── The setups overview ── */
+	.ov-intro { font-size: 13px; color: var(--td-muted); margin: 0 0 16px; max-width: 66ch; text-wrap: pretty; }
+	/* Wide content scrolls inside its own box; the page body never does.
+	   `min-width:0` in both places is the load-bearing half and it is not
+	   obvious: a grid column floor of 150px makes the grid's min-content wider
+	   than the dialog, that contribution propagates up through the block to the
+	   flex item, and a flex item's default `min-width:auto` refuses to shrink
+	   below it — so `width:min(980px,100%)` was quietly losing and the dialog
+	   grew past the viewport instead of scrolling inside itself. Found by
+	   opening it, not by any check. */
+	.dialog.ov { min-width: 0; }
+	/* One row height for both columns, which is what keeps the names lined up
+	   with the setups they name. Deriving it from the content instead would put
+	   the two columns in separate formatting contexts and let them drift the
+	   moment a gear name wrapped. */
+	.ov-wrap { display: flex; gap: 12px; --ov-row: 64px; }
+	.ov-labels { flex: none; width: 150px; display: flex; flex-direction: column; gap: 10px; }
+	.ov-scroll { overflow-x: auto; min-width: 0; flex: 1; padding-bottom: 4px; }
+	.ov-grid { display: grid; gap: 10px; }
+	.ov-side {
+		height: var(--ov-row);
+		display: flex;
+		flex-direction: column;
+		justify-content: center;
+		min-width: 0;
+	}
+	/* Clamped rather than allowed to wrap freely: the row height is fixed, so a
+	   long name would otherwise be cut off mid-letter with nothing to say so. */
+	.ov-name { font-size: 14px; font-weight: 600; overflow-wrap: anywhere; overflow: hidden; display: -webkit-box; -webkit-line-clamp: 2; line-clamp: 2; -webkit-box-orient: vertical; }
+	.ov-std .ov-name { font-family: 'Caprasimo', serif; font-weight: 400; }
+	.ov-sub { font-size: 12px; color: var(--td-muted-2); font-variant-numeric: tabular-nums; }
+	.ov-cell { height: var(--ov-row); display: flex; align-items: center; min-width: 0; }
+	.ov-node {
+		display: flex;
+		flex-direction: column;
+		justify-content: center;
+		gap: 1px;
+		width: 100%;
+		height: 100%;
+		min-width: 0;
+		padding: 0 11px;
+		border-radius: 12px;
+		border: 1px solid var(--td-border);
+		border-left-width: 3px;
+		background: var(--td-surface2);
+	}
+	.ov-swap { border-color: var(--td-accent); background: color-mix(in srgb, var(--td-accent) 9%, transparent); }
+	.ov-dot { width: 7px; height: 7px; border-radius: 50%; }
+	.ov-role { font-size: 10px; letter-spacing: .1em; text-transform: uppercase; color: var(--td-muted-3); }
+	.ov-label { font-size: 13.5px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+	/* Passed through: the line the signal takes when this row changes nothing
+	   here. Deliberately not a repeat of the standard's node — the row would
+	   then read as a whole second chain. */
+	.ov-thru { width: 100%; height: 2px; border-radius: 2px; background: var(--td-muted-3); opacity: .3; }
+	.ov-none { font-size: 12px; color: var(--td-muted-3); font-style: italic; }
 
 	/* ── Chain drawer ── */
 	.drawer-back {
