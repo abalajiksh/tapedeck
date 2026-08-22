@@ -7,7 +7,13 @@
 	import { formatDateTime, formatDuration } from '$lib/utils';
 	import { theme, setTheme, type ThemeMode } from '$lib/theme';
 	import { showArtwork, setShowArtwork } from '$lib/prefs';
-	import type { Connection, SignalChain, UserProfile, PublishSwitch } from '$lib/api';
+	import type {
+		Connection,
+		SignalChain,
+		UserProfile,
+		PublishSwitch,
+		FederationSwitch
+	} from '$lib/api';
 	import SourcesPanel from '$lib/components/SourcesPanel.svelte';
 
 	const uiVersion = __UI_VERSION__;
@@ -20,7 +26,7 @@
 	// hash so a link like /settings#sources lands where it says it will.
 	const SECTIONS = [
 		{ id: 'account', label: 'Account', hint: 'Password, picture, bio' },
-		{ id: 'sharing', label: 'Sharing', hint: 'Your public now-playing' },
+		{ id: 'sharing', label: 'Sharing', hint: 'Now-playing, and being findable' },
 		{ id: 'appearance', label: 'Appearance', hint: 'Theme and artwork' },
 		{ id: 'time', label: 'Time', hint: 'Timezone and week start' },
 		{ id: 'scrobbling', label: 'Scrobbling', hint: 'When a listen counts' },
@@ -980,6 +986,55 @@
 		}
 	};
 
+	// ── Patch: whether this deck can be found at all ──
+	//
+	// Deliberately a **second** switch on this page rather than a field of the
+	// one above, because it answers a different question: that one decides
+	// whether a stranger can read what is on the deck, this one decides whether
+	// the person can be found and patched into. In this design following happens
+	// *while* private — a private deck holds patches in the inbox for approval —
+	// so somebody can be discoverable and unreadable at the same time, and
+	// collapsing the two would make that state unreachable.
+	let federation: FederationSwitch | null = null;
+	let federationLoading = false;
+	let federationSaving = false;
+	let federationCopied = '';
+
+	async function loadFederation() {
+		federationLoading = true;
+		try {
+			federation = await api.getFederation();
+		} catch {
+			/* the section shows its own empty state */
+		} finally {
+			federationLoading = false;
+		}
+	}
+
+	async function saveFederation(enabled: boolean) {
+		federationSaving = true;
+		try {
+			federation = await api.setFederation(enabled);
+		} catch (e) {
+			alert(e instanceof Error ? e.message : 'Could not save');
+			// Re-read rather than keeping the optimistic value, for the same reason
+			// the switch above does: what is published must not be guessed at.
+			await loadFederation();
+		} finally {
+			federationSaving = false;
+		}
+	}
+
+	async function copyPatch(text: string, which: string) {
+		try {
+			await navigator.clipboard.writeText(text);
+			federationCopied = which;
+			setTimeout(() => (federationCopied = ''), 1600);
+		} catch {
+			/* a browser that refuses the clipboard is not an error worth a dialog */
+		}
+	}
+
 	async function loadPublish() {
 		publishLoading = true;
 		try {
@@ -1040,6 +1095,7 @@
 	// of a dozen sections and most visits never come here.
 	$: if (section === 'ai' && !mcpEndpoint && !mcpLoading) loadMcp();
 	$: if (section === 'sharing' && !publish && !publishLoading) loadPublish();
+	$: if (section === 'sharing' && !federation && !federationLoading) loadFederation();
 
 	let mcpConnections: McpConnection[] = [];
 	let mcpEndpoint = '';
@@ -1497,6 +1553,101 @@
 						{#if publishSaved}<span style="color:var(--td-good-fg);font-size:13px;">✓ Saved</span>
 						{:else if !publish.enabled}<span style="color:var(--td-muted-3);font-size:13px;">Nothing is public.</span>{/if}
 					</div>
+				{/if}
+			</div>
+
+			<!--
+				A second panel, not a field of the one above. The two answer
+				different questions and the copy has to carry that, or this page
+				reads as one feature built twice: the switch above decides
+				whether a stranger can *read* the deck, this one decides whether
+				the person can be *found*. Following happens while private here,
+				so being discoverable and being readable are genuinely separate
+				states and folding them would make one of them unreachable.
+			-->
+			<div class="panel" style="border-radius:22px;padding:24px;margin-bottom:18px;">
+				<h3 class="h-display" style="font-size:19px;margin-bottom:4px;">Patch — being findable</h3>
+				<p style="font-size:13px;color:var(--td-muted);margin:0 0 6px;max-width:64ch;">
+					A different question from the switch above. That one decides whether anyone can
+					<em>read</em> what is on your deck. This one decides whether you can be
+					<em>found</em> — whether someone on Mastodon or another Tapedeck can look up your
+					handle and ask to patch into your deck.
+				</p>
+				<p style="font-size:12.5px;color:var(--td-muted-3);margin:0 0 18px;max-width:64ch;">
+					Being findable does not publish your listening. A patch is a
+					<strong>request</strong> that waits for you to say yes, so your deck stays private
+					whether or not anyone is following it. Nothing is sent out to other servers yet —
+					this is the half that answers when they ask.
+				</p>
+
+				{#if federationLoading && !federation}
+					<p style="font-size:13px;color:var(--td-muted-3);">Loading…</p>
+				{:else if !federation}
+					<p style="font-size:13px;color:var(--td-muted-3);">Couldn't load this setting.</p>
+				{:else}
+					<div class="row">
+						<div class="row-main">
+							<div class="row-title">Let other servers find me</div>
+							<div class="row-sub">
+								Publishes your handle, display name, bio and profile picture to anyone who
+								asks for them, and gives this account a signing key. Off until you say
+								otherwise — a username that hasn't switched this on answers exactly like
+								one that doesn't exist.
+							</div>
+						</div>
+						<label style="display:flex;align-items:center;gap:8px;cursor:pointer;font-size:14px;white-space:nowrap;">
+							<input type="checkbox" checked={federation.enabled} disabled={federationSaving}
+								on:change={(e) => saveFederation(e.currentTarget.checked)}
+								style="width:16px;height:16px;accent-color:var(--td-accent);cursor:pointer;">
+							{federationSaving ? 'Saving…' : federation.enabled ? 'On' : 'Off'}
+						</label>
+					</div>
+
+					{#if federation.enabled}
+						<div style="margin-top:18px;padding-top:18px;border-top:1px solid var(--td-border);">
+							<div style="font-size:14px;font-weight:600;margin-bottom:8px;">Your handle</div>
+							<div class="copyrow">
+								<code>{federation.handle}</code>
+								<button class="btn btn-secondary" style="font-size:12.5px;"
+									on:click={() => copyPatch(federation?.handle ?? '', 'handle')}>
+									{federationCopied === 'handle' ? '✓ Copied' : 'Copy'}
+								</button>
+							</div>
+							<p style="font-size:12px;color:var(--td-muted-3);margin:8px 0 0;max-width:64ch;">
+								This is what someone types into another server's search box.
+							</p>
+
+							{#if federation.actor}
+								<div style="font-size:14px;font-weight:600;margin:18px 0 8px;">Your actor</div>
+								<div class="copyrow">
+									<code>{federation.actor}</code>
+									<button class="btn btn-secondary" style="font-size:12.5px;"
+										on:click={() => copyPatch(federation?.actor ?? '', 'actor')}>
+										{federationCopied === 'actor' ? '✓ Copied' : 'Copy'}
+									</button>
+								</div>
+								<p style="font-size:12px;color:var(--td-muted-3);margin:8px 0 0;max-width:64ch;">
+									The address other servers store for you. It is fixed at this value now,
+									even if the instance's public URL changes later — to anyone holding it,
+									a change wouldn't be a rename, it would be you disappearing and a
+									stranger arriving.
+								</p>
+							{/if}
+
+							{#if federation.frozen_at}
+								<p style="font-size:12px;color:var(--td-muted-3);margin:14px 0 0;max-width:64ch;">
+									Your username is now fixed: another server is holding this identity, so
+									renaming would break it for them.
+								</p>
+							{/if}
+						</div>
+					{:else}
+						<p style="font-size:12.5px;color:var(--td-muted-3);margin-top:14px;max-width:64ch;">
+							Nobody can find you. Turning this on creates a signing key for this account —
+							switching it off later stops answering but keeps the key, so anyone who
+							already patched in still recognises you if you come back.
+						</p>
+					{/if}
 				{/if}
 			</div>
 		{/if}

@@ -360,6 +360,22 @@ export interface PublishSwitch {
 	path: string;
 }
 
+/**
+ * Whether this account answers to the rest of the fediverse.
+ *
+ * `actor` is null until a keypair has been minted, which happens the moment the
+ * switch goes on — `would_be` is what it will become, shown as a preview rather
+ * than asserted as an address. `frozen_at` is non-null once the username is
+ * load-bearing for another server and must not be renamed.
+ */
+export interface FederationSwitch {
+	enabled: boolean;
+	handle: string;
+	actor: string | null;
+	would_be: string;
+	frozen_at: number | null;
+}
+
 export interface EquipmentInput {
 	name: string;
 	type: string;
@@ -1540,6 +1556,23 @@ class TapedeckAPI {
 	}> {
 		return this.get('/api/v1/tidal/settings');
 	}
+	// ── Patch: whether this deck answers to the fediverse at all ──
+	//
+	// A **different question** from the now-playing switch above, and the two
+	// must not be folded together: that one decides whether strangers can read
+	// what is on the deck, this one decides whether the person can be *found*
+	// and patched into. Following happens while private in this design, so a
+	// deck can be discoverable and unreadable at the same time.
+	//
+	// Session-only on the server, same as the switch above: a token gets 401.
+	async getFederation(): Promise<FederationSwitch> {
+		return this.get('/api/v1/profile/federation');
+	}
+
+	async setFederation(enabled: boolean): Promise<FederationSwitch> {
+		return this.request('PUT', '/api/v1/profile/federation', { enabled });
+	}
+
 	// ── The publish switch for now-playing ──
 	//
 	// Session-only on the server: a token gets 401, because a scrobble client

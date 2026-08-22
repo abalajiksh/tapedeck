@@ -26,7 +26,7 @@ openapi: 3.1.0
 
 info:
   title: Tapedeck
-  version: 0.77.0
+  version: 0.78.0
   summary: Self-hosted scrobbler and listening journal.
   description: |
     Tapedeck ingests listens, enriches them with MusicBrainz metadata, stores
@@ -120,6 +120,19 @@ tags:
       the field.
   - name: Pairing
     description: Device-code pairing for clients with no browser.
+  - name: Patch
+    description: |
+      ActivityPub, as far as it goes. Four unauthenticated endpoints that let
+      another server find out who somebody here is and say something to them.
+
+      **Nothing is delivered outbound yet.** This is the local half of Phase 6,
+      shipped first on purpose: the identity these endpoints publish is the one
+      thing other people's databases end up holding copies of, and a copy cannot
+      be corrected later.
+
+      Every one of these is off until a user switches federation on, and an
+      account that has not is indistinguishable from one that does not exist —
+      the same rule the public now-playing widget and device pairing follow.
   - name: Account
     description: |
       Your own account — password, display name, bio, profile picture. Scoped to
@@ -2253,6 +2266,241 @@ paths:
               schema: { $ref: '#/components/schemas/PublicNowPlaying' }
         '404':
           description: No such user, or they do not publish. Identical answers.
+
+
+  # ── Patch (ActivityPub) ────────────────────────────────────────────────────
+  /api/v1/profile/federation:
+    get:
+      tags: [Patch]
+      summary: Whether your deck answers to the fediverse.
+      description: |
+        Your own switch. Reports `enabled`, the `handle` other people would
+        type, the `actor` URI once a keypair has been minted (`null` before
+        that), the `would_be` URI it will get, and `frozen_at` — non-null once
+        the username is load-bearing for another server.
+
+        Reading this **does not mint a keypair**. Opening a settings page is not
+        a decision to federate.
+      security: [{ sessionCookie: [] }]
+      responses:
+        '200':
+          description: The switch and the identity it publishes.
+          content:
+            application/json:
+              schema: { type: object, additionalProperties: true }
+        '401': { description: Not signed in. Tokens are not accepted here at all. }
+    put:
+      tags: [Patch]
+      summary: Turn discoverability on or off.
+      description: |
+        **Session-only, permanently.** A token is held by a scrobble client, and
+        no scrobble client has business deciding that its owner is findable on
+        the fediverse — so a token gets 401 and scopes never enter into it, the
+        same line `/api/v1/sources` and the password endpoints sit on.
+
+        Switching on mints the RSA-2048 keypair then and there, so the screen
+        can show the real actor URI rather than a promise.
+
+        Switching off stops answering and **deletes nothing**. Destroying the
+        keypair would destroy the identity: anyone already patched in holds a
+        key that would never verify again, and switching back on would present
+        them with a stranger wearing the same name.
+
+        `enabled` is required. A body that merely misspelled the key is a 400,
+        never a default — this is the one switch where guessing wrong publishes
+        something.
+      security: [{ sessionCookie: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [enabled]
+              properties:
+                enabled: { type: boolean }
+      responses:
+        '200':
+          description: The switch as it now stands.
+          content:
+            application/json:
+              schema: { type: object, additionalProperties: true }
+        '400': { description: '`enabled` was absent.' }
+        '401': { description: Not signed in. Tokens are not accepted here at all. }
+
+  /users/{name}:
+    get:
+      tags: [Patch]
+      summary: The actor document for a deck.
+      description: |
+        **Content-negotiated.** A caller whose `Accept` names
+        `application/activity+json` or `application/ld+json` gets the actor
+        document, served as `application/activity+json` — a server handed plain
+        `application/json` is entitled to treat it as untyped JSON, with the
+        result that the actor "does not exist" while this returns 200. Anything
+        else that names `text/html` gets the SPA shell, because it is a person.
+        A bare `*/*` gets the document.
+
+        The document carries `publicKey`, `inbox`, `outbox`,
+        `preferredUsername`, `name`, `type: Person` and
+        `manuallyApprovesFollowers: true` — private by default, stated to the
+        network rather than only enforced at home.
+
+        **Three things are deliberately absent**, because advertising an
+        endpoint that 404s is worse than not having it: `endpoints.sharedInbox`
+        (there is no `POST /inbox`), and the `followers` / `following`
+        collections (Step 2 serves those, when `patches` rows exist to fill
+        them).
+
+        The `id` is written once, when the keypair is minted, and never
+        re-derived from today's `PUBLIC_URL` — recomputing it would silently
+        rename an actor that remote servers have cached.
+      security: []
+      parameters:
+        - name: name
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: |
+            The actor document, or the SPA shell for a browser.
+          content:
+            application/activity+json:
+              schema: { type: object, additionalProperties: true }
+        '404':
+          description: |
+            No such user, or they have not switched federation on. Identical
+            answers — anything that told them apart would make this a membership
+            oracle for a private, invite-only instance.
+
+  /users/{name}/outbox:
+    get:
+      tags: [Patch]
+      summary: An actor's public activities.
+      description: |
+        An `OrderedCollection`, **empty until outbound delivery exists** and
+        served anyway: remote servers probe an outbox to decide whether an actor
+        is real, and a 404 here reads as a broken actor rather than a quiet one.
+
+        Only activities stored `visibility = 'public'` appear. That filter is in
+        the query rather than in the handler because this collection is fetched
+        with no credential at all — a private or patched-in activity reaching it
+        is published to the internet, and nothing downstream would notice.
+
+        No `first` / `next` paging yet. An empty collection has no page to point
+        at, and inventing one would advertise a third endpoint that does not
+        exist; paging arrives with delivery.
+      security: []
+      parameters:
+        - name: name
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: An OrderedCollection with `totalItems` and `orderedItems`.
+          content:
+            application/activity+json:
+              schema: { type: object, additionalProperties: true }
+        '404':
+          description: No such user, or not discoverable. Identical answers.
+
+  /users/{name}/inbox:
+    post:
+      tags: [Patch]
+      summary: Accept a signed delivery.
+      description: |
+        Verifies an HTTP signature and files the activity. **Nothing acts on
+        what arrives yet** — Step 2 is what turns a pending `Follow` into a
+        patch.
+
+        Requires a draft-cavage `Signature:` header, `rsa-sha256`. The signature
+        must cover `(request-target)`, `host` and `date`, plus `digest` whenever
+        there is a body — checked *before* any cryptography, because a signature
+        that verifies over the wrong set of headers is worse than none: it looks
+        like it proved something. `Date` must be within five minutes.
+
+        The signing key is fetched from the actor the `keyId` names and cached.
+        A signature that fails against a cached key triggers exactly one
+        refetch, which is what makes key rotation survivable.
+
+        **The signature says who sent this; the activity's `actor` says who
+        wrote it.** A delivery where they disagree is refused rather than filed
+        under either — that disagreement is how an impersonated `Follow` or
+        `Delete` gets in.
+
+        An activity with no `id` is refused: it could not be deduplicated,
+        referred to by a later `Undo`, or checked against a redelivery.
+
+        `GET` and `DELETE` here are 405 — both belonged to older revisions of
+        the protocol.
+      security: []
+      parameters:
+        - name: name
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/activity+json:
+            schema:
+              type: object
+              additionalProperties: true
+              required: [id, type, actor]
+      responses:
+        '202':
+          description: |
+            Filed. Also the answer to a redelivery — senders retry, and
+            reporting a duplicate as an error is what makes one retry harder.
+        '400':
+          description: Not JSON, or the activity names no `actor` or no `id`.
+        '401':
+          description: |
+            Unsigned, stale, badly covered, the digest does not match the body,
+            the signature does not verify, or the signing key does not belong to
+            the actor the activity is attributed to. The message says which.
+        '404':
+          description: No such user, or not discoverable. Identical answers.
+
+  /.well-known/webfinger:
+    get:
+      tags: [Patch]
+      summary: Resolve a handle to an actor.
+      description: |
+        RFC 7033. The entry point for the whole protocol — it is what somebody
+        typing a handle into another server's search box hits first. Served as
+        `application/jrd+json`.
+
+        `resource` is accepted as `acct:ash@host`, a bare `ash@host`,
+        `@ash@host`, or the actor URI itself; clients send all of these, and
+        refusing the unfashionable ones makes the instance undiscoverable from
+        software that is otherwise fine.
+
+        A missing or unreadable `resource` is a **400** — the caller asked
+        wrong. A well-formed one naming a host that is not ours, or a person we
+        do not publish, is a **404**. Only the second is a fact about our users,
+        which is why the two statuses are drawn apart here and never within the
+        404.
+      security: []
+      parameters:
+        - name: resource
+          in: query
+          required: true
+          schema: { type: string }
+          example: acct:ash@deck.example
+      responses:
+        '200':
+          description: A JRD with a `self` link to the actor document.
+          content:
+            application/jrd+json:
+              schema: { type: object, additionalProperties: true }
+        '400':
+          description: No `resource`, or one that names no actor.
+        '404':
+          description: |
+            Another host, or somebody we do not publish. Identical answers.
 
   # ── Statistics ─────────────────────────────────────────────────────────────
   /api/v1/stats/dashboard:

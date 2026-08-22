@@ -965,7 +965,23 @@ impl Database {
                 -- array drawn from `PublicNpFields::KNOWN`. Title, artist and
                 -- album are the whole of the base payload; everything richer
                 -- than that is opted into one field at a time.
-                public_np_fields TEXT
+                public_np_fields TEXT,
+                -- Whether this account answers to the rest of the fediverse at
+                -- all: an actor document, a WebFinger record, an inbox that
+                -- takes deliveries.
+                --
+                -- Off by default and off for every account that predates the
+                -- column, for the reason `public_now_playing` is: serving an
+                -- actor publishes a handle, a display name, a bio and an avatar
+                -- to any stranger who asks, and nobody consents to that by
+                -- their operator upgrading a binary. Ashwin's call, 2026-08-22.
+                --
+                -- Note this is *not* the same question as whether the deck is
+                -- public. It is the question of whether the person can be found
+                -- and patched into at all -- following happens while private in
+                -- this design, so being discoverable and being readable are two
+                -- switches and always will be.
+                federation_enabled INTEGER NOT NULL DEFAULT 0
             )",
         )
         .execute(&self.pool)
@@ -2349,6 +2365,50 @@ impl Database {
         .execute(&self.pool)
         .await?;
 
+        // What other servers have said to us, kept apart from what we have
+        // said.
+        //
+        // The obvious economy is to reuse `activities` with a direction flag,
+        // and it is wrong: `activities.user_id` is the *author*, and the outbox
+        // serves that table filtered only by visibility. An inbound activity
+        // filed there would be one `WHERE` clause away from this server
+        // publishing a stranger's activity as its user's own -- and it would
+        // look completely reasonable in review. Two tables make that
+        // impossible rather than merely unlikely, which is the same call the
+        // Crate's separate table makes about unowned music.
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS inbox_activities (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                -- Whose inbox it arrived at.
+                user_id INTEGER NOT NULL REFERENCES users(id),
+                -- Who sent it, verified -- not who it claimed to be from. This
+                -- row exists only after a signature checked out.
+                actor_id INTEGER NOT NULL REFERENCES remote_actors(id),
+                -- The activity's own id on the sending server. UNIQUE, because
+                -- senders retry: a redelivery is the same activity, and acting
+                -- on one Follow twice is how one follower becomes two.
+                activity_uri TEXT NOT NULL UNIQUE,
+                kind TEXT,
+                object_ref TEXT,
+                -- Kept as received. A signature is over bytes, and rebuilding
+                -- this later would produce a different document.
+                payload TEXT NOT NULL,
+                received_at INTEGER NOT NULL,
+                -- pending | handled | ignored. Nothing acts on these yet; Step
+                -- 2 is what turns a pending Follow into a `patches` row.
+                state TEXT NOT NULL DEFAULT 'pending'
+            )",
+        )
+        .execute(&self.pool)
+        .await?;
+
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_inbox_activities_user
+             ON inbox_activities(user_id, received_at)",
+        )
+        .execute(&self.pool)
+        .await?;
+
         Ok(())
     }
 
@@ -2654,6 +2714,16 @@ impl Database {
         // existed before the column, which is the only safe direction — nobody
         // consents to publishing their listening by upgrading a binary. Same
         // rule `users.public_now_playing` follows.
+        // Patch: an existing account is not published by an upgrade.
+        if !has_column(&self.pool, "users", "federation_enabled").await {
+            info!("⚙️ Migrating: adding users.federation_enabled...");
+            let _ = sqlx::query(
+                "ALTER TABLE users ADD COLUMN federation_enabled INTEGER NOT NULL DEFAULT 0",
+            )
+            .execute(&self.pool)
+            .await;
+        }
+
         if !has_column(&self.pool, "signal_chains", "shared").await {
             info!("⚙️ Migrating: adding signal_chains.shared...");
             let _ = sqlx::query(
@@ -12685,11 +12755,372 @@ impl Database {
         .await?;
         Ok(())
     }
+
+    // ════════════════════════════════════════════════════════════
+    //  Patch — the actor layer (Phase 6, Step 1)
+    // ════════════════════════════════════════════════════════════
+
+    /// The outward-facing half of a local user's identity, minted on first need.
+    ///
+    /// **Lazy rather than in a migration**, so an instance that never federates
+    /// never pays for a keypair it will not use — and RSA-2048 generation is
+    /// slow enough that doing it for every account at startup would be felt.
+    ///
+    /// `uri` is written **once, here**, and read from the column ever after.
+    /// Deriving it on read from today's `PUBLIC_URL` would silently rename an
+    /// actor the moment the operator changed a config value — and a rename is
+    /// not a rename to anyone else, it is the old actor vanishing and a
+    /// stranger appearing.
+    ///
+    /// The race is handled rather than assumed away: two concurrent callers
+    /// both generate a keypair, one wins the `INSERT`, and **both re-read**.
+    /// Returning the loser's key would be worse than an error — it would sign
+    /// with a key that was never published, so every signature would verify
+    /// against nothing while looking perfectly well-formed.
+    pub async fn actor_for_user(&self, user_id: i64, origin: &str) -> Result<Actor, sqlx::Error> {
+        if let Some(actor) = self.load_actor(user_id).await? {
+            return Ok(actor);
+        }
+
+        let username: String = sqlx::query_scalar("SELECT username FROM users WHERE id = ?")
+            .bind(user_id)
+            .fetch_optional(&self.pool)
+            .await?
+            .ok_or(sqlx::Error::RowNotFound)?;
+
+        // CPU-bound for a noticeable fraction of a second. Holding an async
+        // worker for that is what makes one request look like a hung server.
+        // The error is flattened to a String *inside* the closure: a boxed
+        // `dyn Error` is not `Send`, so it cannot cross the task boundary.
+        let keys = tokio::task::spawn_blocking(|| {
+            crate::patch::keys::generate().map_err(|e| e.to_string())
+        })
+        .await
+        .map_err(|e| sqlx::Error::Protocol(format!("keygen task failed: {e}")))?
+        .map_err(|e| sqlx::Error::Protocol(format!("could not generate a keypair: {e}")))?;
+
+        let uri = crate::patch::actor::uri_for(origin, &username);
+
+        sqlx::query(
+            "INSERT OR IGNORE INTO actors (user_id, uri, public_key, private_key, created_at)
+             VALUES (?, ?, ?, ?, ?)",
+        )
+        .bind(user_id)
+        .bind(&uri)
+        .bind(&keys.public_pem)
+        // Sealed like every other replayed secret, so ciphertext never leaves
+        // this file.
+        .bind(self.seal(&keys.private_pem))
+        .bind(Self::now_secs())
+        .execute(&self.pool)
+        .await?;
+
+        self.load_actor(user_id).await?.ok_or(sqlx::Error::RowNotFound)
+    }
+
+    /// Resolve a username to a user **who is willing to be found**.
+    ///
+    /// A user who has not switched federation on, a disabled account, and a
+    /// username that was never real all come back as `None` — one answer,
+    /// deliberately. These are the only unauthenticated read paths on the
+    /// instance besides the now-playing widget, and they take the same rule:
+    /// anything that tells "no such person" apart from "that person is not
+    /// published" turns a private, invite-only server into a membership oracle
+    /// that anyone can type names at.
+    ///
+    /// `an_undiscoverable_actor_and_an_unknown_one_are_the_same_answer` is
+    /// phrased about the *answer* rather than about this query, because a later
+    /// rewrite that splits the cases is a perfectly reasonable-looking change
+    /// and a leak.
+    ///
+    /// Returning the id rather than the actor is what makes the keypair lazy:
+    /// the caller mints one through `actor_for_user` if this account has never
+    /// needed one. That means a stranger's fetch can trigger a keygen — bounded
+    /// at one per federating account, ever, and only for names that are real
+    /// and published.
+    pub async fn discoverable_user_id(&self, username: &str) -> Result<Option<i64>, sqlx::Error> {
+        sqlx::query_scalar(
+            "SELECT id FROM users
+              WHERE username = ? COLLATE NOCASE AND federation_enabled = 1 AND disabled = 0",
+        )
+        .bind(username)
+        .fetch_optional(&self.pool)
+        .await
+    }
+
+    /// The stored actor for a user, if one has ever been minted — **without
+    /// minting one**.
+    ///
+    /// The distinction from `actor_for_user` is the whole reason this is
+    /// public: opening a settings page is not a decision to federate, and a
+    /// read path that quietly generates an identity is a read path that has
+    /// side effects nobody asked for.
+    pub async fn stored_actor(&self, user_id: i64) -> Result<Option<Actor>, sqlx::Error> {
+        self.load_actor(user_id).await
+    }
+
+    /// The stored actor for a user, unsealed. `None` when no keypair has been
+    /// minted yet.
+    async fn load_actor(&self, user_id: i64) -> Result<Option<Actor>, sqlx::Error> {
+        let row: Option<ActorRow> = sqlx::query_as(
+            "SELECT a.user_id, u.username, a.uri, a.public_key, a.private_key, a.frozen_at,
+                    u.display_name, u.bio, u.avatar_url, u.federation_enabled
+               FROM actors a JOIN users u ON u.id = a.user_id
+              WHERE a.user_id = ?",
+        )
+        .bind(user_id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(row.map(|r| Actor {
+            private_key: self.unseal(&r.private_key).unwrap_or_default(),
+            user_id: r.user_id,
+            username: r.username,
+            uri: r.uri,
+            public_key: r.public_key,
+            frozen_at: r.frozen_at,
+            display_name: r.display_name,
+            bio: r.bio,
+            avatar_url: r.avatar_url,
+            federation_enabled: r.federation_enabled != 0,
+        }))
+    }
+
+    /// Whether this user's deck answers to strangers at all.
+    pub async fn set_federation_enabled(&self, user_id: i64, on: bool) -> Result<(), sqlx::Error> {
+        sqlx::query("UPDATE users SET federation_enabled = ? WHERE id = ?")
+            .bind(if on { 1 } else { 0 })
+            .bind(user_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Mark the moment this identity left the building.
+    ///
+    /// Set on the **first accepted patch or the first signed activity,
+    /// whichever comes first** — not on going public, because in this design
+    /// following happens *while* private: a private deck holds patches in the
+    /// inbox for approval, so somebody can have ten followers and never be
+    /// public. Idempotent: the first stamp is the true one, and re-stamping
+    /// would move a date that other servers' copies are dated against.
+    pub async fn freeze_actor_username(&self, user_id: i64) -> Result<(), sqlx::Error> {
+        sqlx::query("UPDATE actors SET frozen_at = ? WHERE user_id = ? AND frozen_at IS NULL")
+            .bind(Self::now_secs())
+            .bind(user_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Is this user's username now load-bearing for somebody else?
+    ///
+    /// **Nothing calls this yet, and that is a gap rather than a design.**
+    /// There is no rename path anywhere in this application — only first-run
+    /// setup ever writes `users.username` — so the freeze has nothing to guard.
+    /// It is here so that whoever adds an admin rename inherits the refusal
+    /// instead of having to know it was needed: a rename after this point is
+    /// not a rename to any server holding the actor, it is a deletion and a
+    /// stranger. ActivityPub's answer is `Move` + `alsoKnownAs`, which is a
+    /// deliberate migration and is not built.
+    pub async fn username_is_frozen(&self, user_id: i64) -> Result<bool, sqlx::Error> {
+        let frozen: Option<Option<i64>> =
+            sqlx::query_scalar("SELECT frozen_at FROM actors WHERE user_id = ?")
+                .bind(user_id)
+                .fetch_optional(&self.pool)
+                .await?;
+        Ok(matches!(frozen, Some(Some(_))))
+    }
+
+    /// Store or refresh what we know about somebody else's actor.
+    ///
+    /// Cached rather than fetched per delivery, because an actor document is
+    /// the key material a signature is checked against — re-fetching it on
+    /// every inbox POST would make every remote server's availability our own,
+    /// and would hand anyone who can reach our inbox a way to make us issue
+    /// outbound requests.
+    pub async fn upsert_remote_actor(
+        &self,
+        uri: &str,
+        handle: Option<&str>,
+        name: Option<&str>,
+        inbox: &str,
+        shared_inbox: Option<&str>,
+        public_key: Option<&str>,
+        icon_url: Option<&str>,
+    ) -> Result<RemoteActor, sqlx::Error> {
+        sqlx::query(
+            "INSERT INTO remote_actors (uri, handle, name, inbox, shared_inbox, public_key,
+                                        icon_url, fetched_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT(uri) DO UPDATE SET
+                handle = excluded.handle,
+                name = excluded.name,
+                inbox = excluded.inbox,
+                shared_inbox = excluded.shared_inbox,
+                public_key = excluded.public_key,
+                icon_url = excluded.icon_url,
+                fetched_at = excluded.fetched_at",
+        )
+        .bind(uri)
+        .bind(handle)
+        .bind(name)
+        .bind(inbox)
+        .bind(shared_inbox)
+        .bind(public_key)
+        .bind(icon_url)
+        .bind(Self::now_secs())
+        .execute(&self.pool)
+        .await?;
+
+        self.remote_actor_by_uri(uri).await?.ok_or(sqlx::Error::RowNotFound)
+    }
+
+    pub async fn remote_actor_by_uri(&self, uri: &str) -> Result<Option<RemoteActor>, sqlx::Error> {
+        sqlx::query_as(
+            "SELECT id, uri, handle, name, inbox, shared_inbox, public_key, icon_url, fetched_at
+               FROM remote_actors WHERE uri = ?",
+        )
+        .bind(uri)
+        .fetch_optional(&self.pool)
+        .await
+    }
+
+    /// File a verified inbound activity.
+    ///
+    /// **A different table from `activities`, and that is a guarantee rather
+    /// than tidiness.** `activities.user_id` is the *author*, and the outbox
+    /// serves that table — so an inbound activity stored there would be one
+    /// `WHERE` clause away from this server publishing a stranger's activity as
+    /// its user's own. Keeping them apart makes that structurally impossible,
+    /// the same way the Crate's separate table keeps unowned music out of every
+    /// count.
+    ///
+    /// Returns whether this was new. A redelivery is the *same* activity —
+    /// senders retry, and acting on a Follow twice is how one follower becomes
+    /// two — so `activity_uri` is unique and a repeat is a no-op, not an error.
+    pub async fn record_inbox_activity(
+        &self,
+        user_id: i64,
+        actor_id: i64,
+        activity_uri: &str,
+        kind: Option<&str>,
+        object_ref: Option<&str>,
+        payload: &str,
+    ) -> Result<bool, sqlx::Error> {
+        let result = sqlx::query(
+            "INSERT OR IGNORE INTO inbox_activities
+                (user_id, actor_id, activity_uri, kind, object_ref, payload, received_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(user_id)
+        .bind(actor_id)
+        .bind(activity_uri)
+        .bind(kind)
+        .bind(object_ref)
+        .bind(payload)
+        .bind(Self::now_secs())
+        .execute(&self.pool)
+        .await?;
+
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// What this user's outbox publishes.
+    ///
+    /// **`visibility = 'public'` is the whole of the access control here**, and
+    /// it is in the query rather than in the handler because an outbox is
+    /// fetched by strangers with no credential: a private or patched-in
+    /// activity reaching this collection is published to the internet, and
+    /// nothing downstream would notice. Empty until delivery exists — the shape
+    /// is served from day one because remote servers probe it to decide whether
+    /// an actor is real.
+    pub async fn public_outbox(
+        &self,
+        user_id: i64,
+        limit: i64,
+    ) -> Result<(i64, Vec<String>), sqlx::Error> {
+        let total: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM activities WHERE user_id = ? AND visibility = 'public'",
+        )
+        .bind(user_id)
+        .fetch_one(&self.pool)
+        .await?;
+
+        let items: Vec<String> = sqlx::query_scalar(
+            "SELECT payload FROM activities
+              WHERE user_id = ? AND visibility = 'public'
+              ORDER BY published DESC LIMIT ?",
+        )
+        .bind(user_id)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok((total, items))
+    }
 }
 
 // ════════════════════════════════════════════════════════════
 //  Row types
 // ════════════════════════════════════════════════════════════
+
+/// A local user's outward-facing identity, with the private key unsealed.
+///
+/// **Deliberately not `Serialize`.** Every other row type in this file derives
+/// it, and this one must not: `private_key` is the whole of the identity, and a
+/// struct that can be handed to `Json(...)` is one refactor away from being
+/// handed to `Json(...)`. The handlers build their responses from
+/// `patch::actor::document`, which takes only the public half.
+#[derive(Debug, Clone)]
+pub struct Actor {
+    pub user_id: i64,
+    pub username: String,
+    /// Written once at creation. Never re-derived — see `actor_for_user`.
+    pub uri: String,
+    /// SPKI PEM, as published in the actor document.
+    pub public_key: String,
+    /// PKCS#8 PEM, plaintext. Sealed in the column it came from.
+    pub private_key: String,
+    /// Non-null once the username is load-bearing for another server.
+    pub frozen_at: Option<i64>,
+    pub display_name: Option<String>,
+    pub bio: Option<String>,
+    pub avatar_url: Option<String>,
+    pub federation_enabled: bool,
+}
+
+/// The stored shape, before unsealing. Private to this file so no caller can
+/// get hold of a ciphertext and treat it as a key.
+#[derive(Debug, FromRow)]
+struct ActorRow {
+    user_id: i64,
+    username: String,
+    uri: String,
+    public_key: String,
+    private_key: String,
+    frozen_at: Option<i64>,
+    display_name: Option<String>,
+    bio: Option<String>,
+    avatar_url: Option<String>,
+    federation_enabled: i64,
+}
+
+/// Somebody else's actor, as we last fetched it.
+#[derive(Debug, Clone, FromRow, serde::Serialize)]
+pub struct RemoteActor {
+    pub id: i64,
+    pub uri: String,
+    /// `ash@deck.example`. Display only — `uri` is the identity, because a
+    /// handle can be reused after a `Move` where a URI cannot.
+    pub handle: Option<String>,
+    pub name: Option<String>,
+    pub inbox: String,
+    pub shared_inbox: Option<String>,
+    pub public_key: Option<String>,
+    pub icon_url: Option<String>,
+    pub fetched_at: i64,
+}
 
 #[derive(Debug, FromRow, serde::Serialize)]
 pub struct UserRecord {
@@ -16998,8 +17429,29 @@ mod tests {
         assert_eq!(name, "Desk Reference");
         assert!(!shared, "a chain that predates the column must not be published by an upgrade");
 
+        // Nobody is published by an upgrade. This is the half that only a
+        // migrated database can prove: on a fresh one the column comes from
+        // `init()` and its default is never tested against a row that already
+        // existed.
+        let (published,): (i64,) =
+            sqlx::query_as("SELECT federation_enabled FROM users WHERE id = 1")
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            published, 0,
+            "an account that predates the column must not become discoverable by an upgrade"
+        );
+
         // And every Patch table is there to be written to.
-        for table in ["actors", "remote_actors", "patches", "activities", "activity_deliveries"] {
+        for table in [
+            "actors",
+            "remote_actors",
+            "patches",
+            "activities",
+            "activity_deliveries",
+            "inbox_activities",
+        ] {
             let (n,): (i64,) = sqlx::query_as(
                 "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?",
             )
@@ -17020,6 +17472,278 @@ mod tests {
         .execute(&db.pool)
         .await;
         assert!(bad.is_err(), "a patch cannot have a local and a remote follower");
+    }
+
+    // ── Patch: the actor layer ───────────────────────────────
+
+    /// The identity is minted once and then it is a fact about the past.
+    ///
+    /// The trap this pins is the reason `actors.uri` is a stored column rather
+    /// than something derived on read: the origin an actor was minted under is
+    /// the address remote servers have cached, so recomputing it from today's
+    /// `PUBLIC_URL` would silently rename an actor other people follow — and to
+    /// them a rename is not a rename, it is the old actor vanishing and a
+    /// stranger appearing.
+    #[tokio::test]
+    async fn an_actor_is_minted_once_and_keeps_the_uri_it_was_minted_with() {
+        let db = testdb().await;
+        let uid = db.create_user("ash", None, "pw", "user").await.unwrap();
+
+        let first = db.actor_for_user(uid, "https://deck.example").await.unwrap();
+        assert_eq!(first.uri, "https://deck.example/users/ash");
+        assert!(first.public_key.starts_with("-----BEGIN PUBLIC KEY-----"));
+        assert!(
+            first.private_key.starts_with("-----BEGIN PRIVATE KEY-----"),
+            "unsealed on the way out"
+        );
+        assert!(first.frozen_at.is_none(), "a fresh identity has not left the building");
+
+        // The operator changes PUBLIC_URL. The actor does not move.
+        let again = db.actor_for_user(uid, "https://somewhere-else.example").await.unwrap();
+        assert_eq!(again.uri, first.uri, "the URI is written once, never re-derived");
+        assert_eq!(again.public_key, first.public_key, "and the key is not regenerated");
+        assert_eq!(again.private_key, first.private_key);
+    }
+
+    /// The private half is a credential and goes through `seal` like every
+    /// other replayed secret, so ciphertext never leaves this file. Read
+    /// straight off the column to prove it — going through `actor_for_user`
+    /// would only prove the round trip works.
+    #[tokio::test]
+    async fn the_private_key_is_sealed_in_the_column() {
+        let db = testdb().await;
+        let uid = db.create_user("ash", None, "pw", "user").await.unwrap();
+        let actor = db.actor_for_user(uid, "https://deck.example").await.unwrap();
+
+        let stored: String = sqlx::query_scalar("SELECT private_key FROM actors WHERE user_id = ?")
+            .bind(uid)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+
+        assert!(stored.starts_with("tdenc:v1:"), "the key at rest is ciphertext");
+        assert!(!stored.contains("BEGIN PRIVATE KEY"), "and no part of the PEM survives in it");
+        assert_ne!(stored, actor.private_key);
+
+        // The published half is *not* sealed: it is published.
+        let public: String = sqlx::query_scalar("SELECT public_key FROM actors WHERE user_id = ?")
+            .bind(uid)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(public, actor.public_key);
+    }
+
+    /// **Phrased about the answer, not about the query.**
+    ///
+    /// These are the only unauthenticated read paths on the instance besides
+    /// the now-playing widget, so anything that tells "no such person" apart
+    /// from "that person is not published" turns a private, invite-only server
+    /// into a membership oracle. A later rewrite that splits the two cases
+    /// apart is a reasonable-looking change and a leak, which is why the
+    /// assertion is that the three outcomes are *equal* rather than that each
+    /// is `None`.
+    #[tokio::test]
+    async fn an_undiscoverable_actor_and_an_unknown_one_are_the_same_answer() {
+        let db = testdb().await;
+        let quiet = db.create_user("ash", None, "pw", "user").await.unwrap();
+        let gone = db.create_user("kim", None, "pw", "user").await.unwrap();
+        db.set_federation_enabled(gone, true).await.unwrap();
+        sqlx::query("UPDATE users SET disabled = 1 WHERE id = ?")
+            .bind(gone)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+
+        let unknown = db.discoverable_user_id("nobody-here").await.unwrap();
+        let not_published = db.discoverable_user_id("ash").await.unwrap();
+        let disabled = db.discoverable_user_id("kim").await.unwrap();
+
+        assert_eq!(not_published, unknown, "an account that has not switched federation on must be indistinguishable from one that does not exist");
+        assert_eq!(disabled, unknown, "and so must a disabled one");
+
+        // And the switch really is the only thing standing between them.
+        db.set_federation_enabled(quiet, true).await.unwrap();
+        assert_eq!(db.discoverable_user_id("ash").await.unwrap(), Some(quiet));
+        // Case-insensitive, because a handle typed into another server's search
+        // box arrives however the person typed it.
+        assert_eq!(db.discoverable_user_id("ASH").await.unwrap(), Some(quiet));
+    }
+
+    /// Nobody is published by their operator upgrading a binary.
+    #[tokio::test]
+    async fn federation_is_off_until_someone_turns_it_on() {
+        let db = testdb().await;
+        let uid = db.create_user("ash", None, "pw", "user").await.unwrap();
+
+        let on: i64 = sqlx::query_scalar("SELECT federation_enabled FROM users WHERE id = ?")
+            .bind(uid)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(on, 0, "a new account is not discoverable");
+        assert_eq!(db.discoverable_user_id("ash").await.unwrap(), None);
+
+        db.set_federation_enabled(uid, true).await.unwrap();
+        assert_eq!(db.discoverable_user_id("ash").await.unwrap(), Some(uid));
+        db.set_federation_enabled(uid, false).await.unwrap();
+        assert_eq!(db.discoverable_user_id("ash").await.unwrap(), None, "and it can be taken back");
+    }
+
+    /// The first stamp is the true one. Re-stamping would move a date that
+    /// other servers' copies of this identity are dated against.
+    #[tokio::test]
+    async fn the_username_freeze_records_the_first_moment_and_not_the_latest() {
+        let db = testdb().await;
+        let uid = db.create_user("ash", None, "pw", "user").await.unwrap();
+        db.actor_for_user(uid, "https://deck.example").await.unwrap();
+
+        assert!(!db.username_is_frozen(uid).await.unwrap());
+
+        db.freeze_actor_username(uid).await.unwrap();
+        assert!(db.username_is_frozen(uid).await.unwrap());
+        let first: Option<i64> =
+            sqlx::query_scalar("SELECT frozen_at FROM actors WHERE user_id = ?")
+                .bind(uid)
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+
+        db.freeze_actor_username(uid).await.unwrap();
+        let after: Option<i64> =
+            sqlx::query_scalar("SELECT frozen_at FROM actors WHERE user_id = ?")
+                .bind(uid)
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert_eq!(after, first, "freezing twice must not move the date");
+
+        // A user with no actor at all is not frozen, and asking does not error.
+        let other = db.create_user("kim", None, "pw", "user").await.unwrap();
+        assert!(!db.username_is_frozen(other).await.unwrap());
+    }
+
+    /// Senders retry. A redelivery is the *same* activity, and acting on one
+    /// Follow twice is how one follower becomes two — so the second arrival is
+    /// a no-op rather than a second row or an error.
+    #[tokio::test]
+    async fn a_redelivered_activity_is_filed_once() {
+        let db = testdb().await;
+        let uid = db.create_user("ash", None, "pw", "user").await.unwrap();
+        let remote = db
+            .upsert_remote_actor(
+                "https://them.example/users/kim",
+                Some("kim@them.example"),
+                Some("Kim"),
+                "https://them.example/users/kim/inbox",
+                None,
+                Some("-----BEGIN PUBLIC KEY-----\nx\n-----END PUBLIC KEY-----\n"),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let file = || {
+            db.record_inbox_activity(
+                uid,
+                remote.id,
+                "https://them.example/activities/1",
+                Some("Follow"),
+                Some("https://deck.example/users/ash"),
+                r#"{"type":"Follow"}"#,
+            )
+        };
+
+        assert!(file().await.unwrap(), "the first delivery is new");
+        assert!(!file().await.unwrap(), "a redelivery is not");
+
+        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM inbox_activities")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(n, 1);
+    }
+
+    /// Re-fetching an actor updates it; it does not accumulate copies. The
+    /// interesting half is the key: this is the path a rotation arrives on, and
+    /// leaving the old key would make the peer permanently unable to talk to us.
+    #[tokio::test]
+    async fn refetching_an_actor_updates_it_including_the_key() {
+        let db = testdb().await;
+        let put = |key: &'static str, name: &'static str| {
+            db.upsert_remote_actor(
+                "https://them.example/users/kim",
+                Some("kim@them.example"),
+                Some(name),
+                "https://them.example/users/kim/inbox",
+                Some("https://them.example/inbox"),
+                Some(key),
+                None,
+            )
+        };
+
+        let first = put("KEY-ONE", "Kim").await.unwrap();
+        let second = put("KEY-TWO", "Kim Renamed").await.unwrap();
+
+        assert_eq!(first.id, second.id, "one row per actor URI");
+        assert_eq!(
+            second.public_key.as_deref(),
+            Some("KEY-TWO"),
+            "a rotated key replaces the old one"
+        );
+        assert_eq!(second.name.as_deref(), Some("Kim Renamed"));
+        assert_eq!(second.shared_inbox.as_deref(), Some("https://them.example/inbox"));
+
+        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM remote_actors")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(n, 1);
+    }
+
+    /// **An outbox is fetched by strangers with no credential**, so the
+    /// visibility filter is the whole of the access control — and it is in the
+    /// query rather than in the handler because nothing downstream would notice
+    /// a private activity arriving in a public collection.
+    #[tokio::test]
+    async fn an_outbox_publishes_only_what_is_public() {
+        let db = testdb().await;
+        let uid = db.create_user("ash", None, "pw", "user").await.unwrap();
+        let other = db.create_user("kim", None, "pw", "user").await.unwrap();
+
+        for (owner, uuid, visibility, published) in [
+            (uid, "a-public", "public", 300),
+            (uid, "a-patched", "patched", 200),
+            (uid, "a-private", "private", 100),
+            (other, "somebody-elses", "public", 400),
+        ] {
+            sqlx::query(
+                "INSERT INTO activities (uuid, user_id, kind, payload, published, visibility)
+                 VALUES (?, ?, 'Create', ?, ?, ?)",
+            )
+            .bind(uuid)
+            .bind(owner)
+            .bind(format!(r#"{{"id":"{uuid}"}}"#))
+            .bind(published)
+            .bind(visibility)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        }
+
+        let (total, items) = db.public_outbox(uid, 40).await.unwrap();
+        assert_eq!(total, 1, "patched-in and private activities are not published");
+        assert_eq!(items.len(), 1);
+        assert!(items[0].contains("a-public"));
+        assert!(
+            !items.iter().any(|i| i.contains("somebody-elses")),
+            "and neither is anyone else's"
+        );
+
+        // Newest first, and empty is a normal state rather than an error.
+        assert_eq!(db.public_outbox(other, 40).await.unwrap().0, 1);
+        let nobody = db.create_user("sam", None, "pw", "user").await.unwrap();
+        assert_eq!(db.public_outbox(nobody, 40).await.unwrap(), (0, vec![]));
     }
 
     /// Opening a database that an *older* Tapedeck wrote.

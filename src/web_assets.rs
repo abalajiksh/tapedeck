@@ -83,7 +83,7 @@ pub async fn spa_fallback(uri: Uri) -> Response {
 }
 
 /// The SPA shell — SvelteKit takes over routing from here.
-fn serve_index() -> Response {
+pub(crate) fn serve_index() -> Response {
     match Assets::get("index.html") {
         Some(index) => (
             StatusCode::OK,

@@ -180,7 +180,7 @@ fn origin_is_acceptable(headers: &HeaderMap) -> bool {
 /// rebinding attack would target. Anything not recognisably private is treated
 /// as public, which is the safe direction — a public host is one the attacker
 /// could reach directly anyway, so rebinding buys them nothing there.
-fn is_private_host(host: &str) -> bool {
+pub(crate) fn is_private_host(host: &str) -> bool {
     let host = host.split(':').next().unwrap_or("").trim().to_ascii_lowercase();
     let host = host.trim_start_matches('[').trim_end_matches(']');
     if host.is_empty() {
@@ -196,10 +196,28 @@ fn is_private_host(host: &str) -> bool {
     if host.starts_with("127.") || host.starts_with("10.") || host.starts_with("192.168.") {
         return true;
     }
+    // Link-local. **169.254.169.254 is the cloud metadata endpoint**, which is
+    // the single most valuable target of a server-side request forgery — and it
+    // was missing here until the Patch inbox needed this same helper to decide
+    // what a stranger's `keyId` may point at. It was only ever blocked by that
+    // caller's separate insistence on `https`, which is a second line of
+    // defence and not a guard.
+    if host.starts_with("169.254.") {
+        return true;
+    }
     // 172.16.0.0/12 — the range that gets written wrong, so it is spelled out.
     if let Some(rest) = host.strip_prefix("172.") {
         if let Some(second) = rest.split('.').next().and_then(|o| o.parse::<u8>().ok()) {
             if (16..=31).contains(&second) {
+                return true;
+            }
+        }
+    }
+    // 100.64.0.0/10 — carrier-grade NAT, and what Tailscale hands out, so on a
+    // self-hosted box this is very often the LAN.
+    if let Some(rest) = host.strip_prefix("100.") {
+        if let Some(second) = rest.split('.').next().and_then(|o| o.parse::<u8>().ok()) {
+            if (64..=127).contains(&second) {
                 return true;
             }
         }
@@ -552,6 +570,19 @@ mod tests {
         assert!(!is_private_host("172.32.0.1"));
         assert!(is_private_host("[::1]:8080"));
         assert!(!is_private_host("tapedeck.example.com"));
+
+        // Link-local, and the cloud metadata endpoint in particular. This is
+        // the highest-value target of a server-side request forgery, and the
+        // Patch inbox reaches this helper with a host a *stranger* chose.
+        assert!(is_private_host("169.254.169.254"));
+        assert!(is_private_host("169.254.0.1"));
+        assert!(!is_private_host("169.255.0.1"), "only 169.254/16 is link-local");
+
+        // Carrier-grade NAT — what Tailscale hands out, so often the real LAN.
+        assert!(is_private_host("100.64.0.1"));
+        assert!(is_private_host("100.127.255.254"));
+        assert!(!is_private_host("100.63.0.1"));
+        assert!(!is_private_host("100.128.0.1"));
     }
 
     #[test]

@@ -18,6 +18,7 @@ pub mod notes;
 pub mod now_playing;
 pub mod oauth;
 mod pairing;
+pub mod patch;
 pub mod physical;
 mod playlist_lab;
 pub mod playlists;
@@ -124,6 +125,7 @@ pub fn build_app(state: Arc<AppState>) -> Router {
         .merge(playlist_lab::create_playlist_lab_router())
         .merge(everynoise::create_everynoise_router())
         .merge(pairing::create_pairing_router())
+        .merge(patch::create_patch_router())
         .merge(reports::create_reports_router())
         .merge(crate_shelf::create_crate_router())
         .merge(mcp::create_mcp_router())

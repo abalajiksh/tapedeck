@@ -1112,11 +1112,20 @@ deploy/                      Sample hardened systemd unit
 
 - [ ] **Patch (social)** — follow other users on the instance ("patch into
       someone's deck"), with follow state, stable actor URIs, and an activity
-      log designed so federation later isn't a migration
-- [ ] **ActivityPub** — actor endpoints, WebFinger, inbox/outbox, HTTP
-      signatures. Open question first: ActivityStreams has no verb for
-      "listened to a track", so the vocabulary has to be settled before the
-      social schema freezes
+      log designed so federation later isn't a migration. **In progress:** the
+      identity layer is built — every account can have an ActivityPub actor,
+      WebFinger record, outbox and signature-verifying inbox, opt-in per user
+      under Settings → Sharing and off by default. What remains is the follow
+      state, the approval inbox, and the per-chain switch that decides which
+      listens are shareable at all
+- [ ] **ActivityPub delivery** — sending activities out to other servers. The
+      vocabulary question is settled: a listen is a `Create` wrapping a
+      `td:Listen`, so a server that understands nothing renders "Listened to
+      Teardrop by Massive Attack" while one that understands `td:` also gets the
+      signal chain and the format. Actor endpoints, WebFinger and HTTP
+      signatures serve today; nothing is sent outbound yet, which is the
+      deliberate order — the identity other servers cache has to be right
+      before anyone holds a copy of it
 - [ ] **Spotify source** — OAuth, `recently-played` backfill. Note its history
       endpoint reports when a track *ended*, while `scrobbles.timestamp` is
       start-of-play everywhere, so the duration has to be subtracted on read

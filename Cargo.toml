@@ -1,6 +1,6 @@
 [package]
 name = "tapedeck"
-version = "0.77.0"
+version = "0.78.0"
 edition = "2021"
 # Builds the SvelteKit UI into static/ before rustc runs, so `cargo build` is
 # the whole build and a fresh clone compiles. See build.rs.
@@ -70,3 +70,4 @@ ammonia = "4.1.4"
 zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
 unicode-normalization = "0.1.25"
 roon-api = "0.5.3"
+rsa = { version = "0.9", features = ["sha2"] }

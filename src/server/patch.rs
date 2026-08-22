@@ -1,0 +1,733 @@
+//! Patch — the actor layer (Phase 6, Step 1).
+//!
+//! Four unauthenticated endpoints that let another server find out who somebody
+//! here is, and say something to them. Nothing is delivered outbound and there
+//! is no UI: **local-first is the shipping order**, because the identity these
+//! endpoints publish is the one thing in Phase 6 that other people's databases
+//! end up holding copies of, and a copy cannot be corrected later.
+//!
+//! Everything is off until a user turns it on (`users.federation_enabled`,
+//! Ashwin's call 2026-08-22), and an account that has not is indistinguishable
+//! from one that does not exist — the membership-oracle rule `public_np` and
+//! `pairing` already follow.
+//!
+//! The rules about *believing* a request live in `crate::patch::signatures` and
+//! are pure. What is here is the impure half: resolving a key over the network,
+//! the cache in front of that, and the shapes of the four responses.
+
+use axum::{
+    body::Bytes,
+    extract::{Path, Query, State},
+    http::{header, HeaderMap, StatusCode},
+    response::{IntoResponse, Response},
+    routing::{get, post},
+    Json, Router,
+};
+use serde::Deserialize;
+use serde_json::Value;
+use std::sync::Arc;
+use std::time::Duration;
+use tracing::{debug, info, warn};
+
+use super::mcp::{is_private_host, public_origin};
+use super::models::ErrorResponse;
+use super::AppState;
+use crate::db::Actor;
+use crate::patch::{actor as doc, signatures};
+
+/// A whole inbox request's budget for reaching a third party, not one HTTP
+/// call's. **The handler's own deadline**, which is the rule this codebase
+/// arrived at three times over: N times a per-request timeout is what actually
+/// reaches the reverse proxy, and a request that outlives the proxy is answered
+/// by the proxy's error page instead of by ours.
+const FETCH_DEADLINE: Duration = Duration::from_secs(10);
+
+/// One call inside that budget. Two fetches at most happen — the cached key
+/// failing, then one refetch — so this leaves room for both.
+const FETCH_TIMEOUT: Duration = Duration::from_secs(4);
+
+/// An actor document is a page of JSON. Anything larger is either a mistake or
+/// somebody feeding us a stream, and we are reading it because a stranger asked
+/// us to.
+const MAX_ACTOR_BYTES: usize = 256 * 1024;
+
+/// How long a cached key is used without asking again. A key that has rotated
+/// is *also* caught by the refetch-on-failure path below, so this is about
+/// staleness rather than correctness — the failure path is what makes rotation
+/// survivable, and this only stops us noticing a week late.
+const ACTOR_CACHE_SECS: i64 = 7 * 24 * 3600;
+
+pub fn create_patch_router() -> Router<Arc<AppState>> {
+    Router::new()
+        .route("/users/:name", get(actor_document))
+        .route("/users/:name/outbox", get(outbox))
+        // Registered `post` only, so a GET here is a 405 from axum rather than
+        // something this file has to remember to write.
+        .route("/users/:name/inbox", post(inbox))
+        .route("/.well-known/webfinger", get(webfinger))
+        .route("/api/v1/profile/federation", get(get_federation).put(put_federation))
+}
+
+// ── the switch ───────────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct FederationRequest {
+    /// **Not `Option<bool>` with a default.** A body that merely misspelled the
+    /// key must not be read as an answer either way — this is the
+    /// `bulk-chain` rule, in the one place where guessing wrong is *published*.
+    enabled: Option<bool>,
+}
+
+/// What the owner sees about their own switch.
+///
+/// Reports the handle and the actor URI so the settings screen can show what
+/// other people would actually type, rather than leaving them to assemble it.
+/// The URI comes from the stored actor once one exists, and is otherwise the
+/// one that *would* be minted — a preview, and it says so by being absent from
+/// the `actor` field until it is real.
+fn federation_body(actor: Option<&Actor>, username: &str, origin: &str, on: bool) -> Value {
+    // **The handle's host comes from the stored actor when there is one, not
+    // from today's origin.** Found by looking at the page: an instance whose
+    // `PUBLIC_URL` had changed since the keypair was minted showed
+    // `@ash@127.0.0.1:8791` above an actor at `deck.example` — two addresses,
+    // disagreeing, with the one drawn larger being the one that does not work.
+    // The actor URI is the address other servers actually hold, so the handle
+    // has to be derived from it; today's origin is only the preview shown
+    // before anything has been minted.
+    let host = actor
+        .and_then(|a| a.uri.split("://").nth(1).and_then(|rest| rest.split('/').next()))
+        .map(str::to_string)
+        .unwrap_or_else(|| origin.split("://").nth(1).unwrap_or_default().to_string());
+
+    serde_json::json!({
+        "enabled": on,
+        "handle": format!("@{username}@{host}"),
+        // Null until a keypair has been minted, which happens the first time
+        // somebody asks. Shown as a preview rather than asserted as an address.
+        "actor": actor.map(|a| a.uri.clone()),
+        "would_be": doc::uri_for(origin, username),
+        // Once this is set the username is load-bearing for another server and
+        // must not be renamed.
+        "frozen_at": actor.and_then(|a| a.frozen_at),
+    })
+}
+
+async fn get_federation(
+    State(state): State<Arc<AppState>>,
+    user: super::auth::AuthUser,
+    headers: HeaderMap,
+) -> Response {
+    let origin = public_origin(&state, &headers);
+    let on = state.db.discoverable_user_id(&user.username).await.ok().flatten().is_some();
+    // Deliberately does **not** mint a keypair: looking at a settings page is
+    // not a decision to federate.
+    let actor = state.db.stored_actor(user.user_id).await.ok().flatten();
+    (StatusCode::OK, Json(federation_body(actor.as_ref(), &user.username, &origin, on)))
+        .into_response()
+}
+
+/// Turn discoverability on or off.
+///
+/// **Session-only, and permanently.** A token is held by a scrobble client, and
+/// no scrobble client has business deciding that its owner is findable on the
+/// fediverse. Same line `/api/v1/sources`, the password endpoints and the
+/// now-playing switch sit on: `AuthUser`, so a token gets 401 and the question
+/// of scopes never arises.
+///
+/// Switching **on** mints the keypair then and there rather than leaving it to
+/// the first stranger's fetch. It costs a moment on a screen where somebody is
+/// waiting anyway, and it means the settings page can show the real actor URI
+/// immediately instead of a promise.
+///
+/// Switching **off** stops answering and deletes nothing. The keypair stays,
+/// because destroying it is destroying the identity: anyone who has already
+/// patched in holds a key that would never verify again, and turning the switch
+/// back on would present them with a stranger wearing the same name.
+async fn put_federation(
+    State(state): State<Arc<AppState>>,
+    user: super::auth::AuthUser,
+    headers: HeaderMap,
+    Json(body): Json<FederationRequest>,
+) -> Response {
+    let Some(enabled) = body.enabled else {
+        return refused(
+            StatusCode::BAD_REQUEST,
+            "`enabled` is required — say true or false explicitly.",
+        );
+    };
+
+    let origin = public_origin(&state, &headers);
+
+    if let Err(e) = state.db.set_federation_enabled(user.user_id, enabled).await {
+        warn!("📡 could not set federation for {}: {e}", user.username);
+        return refused(StatusCode::INTERNAL_SERVER_ERROR, "Could not save that");
+    }
+
+    let actor = if enabled {
+        match state.db.actor_for_user(user.user_id, &origin).await {
+            Ok(a) => {
+                info!("📡 {} is now discoverable as {}", user.username, a.uri);
+                Some(a)
+            }
+            Err(e) => {
+                warn!("📡 could not mint an actor for {}: {e}", user.username);
+                return refused(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Could not create an identity for this account",
+                );
+            }
+        }
+    } else {
+        info!("📡 {} is no longer discoverable", user.username);
+        state.db.stored_actor(user.user_id).await.ok().flatten()
+    };
+
+    (StatusCode::OK, Json(federation_body(actor.as_ref(), &user.username, &origin, enabled)))
+        .into_response()
+}
+
+// ── responses ────────────────────────────────────────────────
+
+/// JSON-LD, served as JSON-LD.
+///
+/// A server handed `application/json` here is entitled to treat the document as
+/// untyped JSON rather than as an actor, and several do — with the result that
+/// the actor "does not exist" while this server returns 200 and logs a success.
+fn ld(content_type: &str, body: Value) -> Response {
+    (
+        StatusCode::OK,
+        [
+            (header::CONTENT_TYPE, content_type),
+            // These are fetched by strangers and are per-actor, not per-caller.
+            (header::CACHE_CONTROL, "public, max-age=300"),
+        ],
+        Json(body),
+    )
+        .into_response()
+}
+
+/// The one 404, used for every "not here" in this file.
+///
+/// Written once so the shapes cannot drift apart: an unknown username, a user
+/// who has not switched federation on and a disabled account must be the same
+/// answer down to the byte, or the difference between them is readable from
+/// outside.
+fn nope() -> Response {
+    (StatusCode::NOT_FOUND, Json(ErrorResponse { code: 404, error: "No such actor".into() }))
+        .into_response()
+}
+
+fn refused(status: StatusCode, message: impl Into<String>) -> Response {
+    (status, Json(ErrorResponse { code: status.as_u16(), error: message.into() })).into_response()
+}
+
+/// Does this caller want the app or the document?
+///
+/// A browser navigating here sends `text/html,…` and should get the SPA; a
+/// remote server sends `application/activity+json` or `application/ld+json` and
+/// must get the document. Anything else — `*/*` from curl, an absent header —
+/// gets the document, because there is no `/users/:name` page in the app yet
+/// and JSON is the useful answer to a bare probe.
+///
+/// The activity types are checked **first**: a client that sends both (and some
+/// do, listing `text/html` as a low-priority fallback) is a server, not a
+/// browser.
+fn wants_html(headers: &HeaderMap) -> bool {
+    let accept = headers
+        .get(header::ACCEPT)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+
+    if accept.contains("activity+json") || accept.contains("ld+json") {
+        return false;
+    }
+    accept.contains("text/html")
+}
+
+// ── GET /users/:name ─────────────────────────────────────────
+
+async fn actor_document(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    if wants_html(&headers) {
+        // The person, not a server. There is no deck page yet, so this is the
+        // app's own 404 rather than ours — which is the right one to show a
+        // human and the wrong one to show a machine.
+        return crate::web_assets::serve_index();
+    }
+
+    let Some(actor) = resolve_local(&state, &name, &headers).await else {
+        return nope();
+    };
+
+    ld(
+        doc::ACTIVITY_JSON,
+        doc::document(
+            &actor.uri,
+            &actor.username,
+            actor.display_name.as_deref(),
+            actor.bio.as_deref(),
+            actor.avatar_url.as_deref(),
+            &actor.public_key,
+        ),
+    )
+}
+
+// ── GET /users/:name/outbox ──────────────────────────────────
+
+/// Empty until delivery exists, and served anyway.
+///
+/// Remote servers probe an outbox to decide whether an actor is worth
+/// following, and a 404 here reads as a broken actor rather than a quiet one.
+/// The access control is in the query — `visibility = 'public'` — because this
+/// collection is fetched with no credential at all.
+async fn outbox(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    let Some(actor) = resolve_local(&state, &name, &headers).await else {
+        return nope();
+    };
+
+    let (total, payloads) = match state.db.public_outbox(actor.user_id, 40).await {
+        Ok(v) => v,
+        Err(e) => {
+            warn!("📡 outbox for {}: {e}", actor.uri);
+            return refused(StatusCode::INTERNAL_SERVER_ERROR, "Could not read the outbox");
+        }
+    };
+
+    // Each row is the JSON-LD **as signed**. Reparsed rather than rebuilt: a
+    // row that will not parse is a bug worth seeing as a gap in the collection
+    // rather than as a 500 that hides the other thirty-nine.
+    let items: Vec<Value> = payloads.iter().filter_map(|p| serde_json::from_str(p).ok()).collect();
+
+    ld(doc::ACTIVITY_JSON, doc::outbox(&actor.uri, total, items))
+}
+
+// ── GET /.well-known/webfinger ───────────────────────────────
+
+#[derive(Deserialize)]
+struct WebfingerQuery {
+    resource: Option<String>,
+}
+
+/// The entry point for the whole protocol: it is what somebody typing a handle
+/// into another server's search box hits first.
+async fn webfinger(
+    State(state): State<Arc<AppState>>,
+    Query(q): Query<WebfingerQuery>,
+    headers: HeaderMap,
+) -> Response {
+    // A missing or malformed `resource` is the caller's mistake and gets a 400.
+    // A well-formed one naming somebody we do not publish is a 404 — the same
+    // 404 an unknown name gets. The two statuses draw the line between "you
+    // asked wrong" and "there is nobody here", and only the second one is a
+    // fact about our users.
+    let Some(resource) = q.resource.as_deref().filter(|r| !r.trim().is_empty()) else {
+        return refused(StatusCode::BAD_REQUEST, "A `resource` parameter is required");
+    };
+    let Some((username, host)) = doc::parse_resource(resource) else {
+        return refused(StatusCode::BAD_REQUEST, "Could not read that `resource`");
+    };
+
+    let origin = public_origin(&state, &headers);
+    let our_host = origin.split("://").nth(1).unwrap_or_default();
+
+    // A resource on somebody else's host is not ours to answer, and answering
+    // it anyway would make this server claim actors it does not host.
+    if !host.eq_ignore_ascii_case(our_host) {
+        return nope();
+    }
+
+    let Some(actor) = resolve_local(&state, &username, &headers).await else {
+        return nope();
+    };
+
+    ld(doc::JRD_JSON, doc::webfinger(&format!("{}@{}", actor.username, our_host), &actor.uri))
+}
+
+// ── POST /users/:name/inbox ──────────────────────────────────
+
+/// Take a delivery, having established that it is really from who it says.
+///
+/// Nothing acts on what arrives yet — Step 2 is what turns a pending `Follow`
+/// into a `patches` row. What this does is the part that cannot be added later
+/// without a gap in the record: verify, and file.
+async fn inbox(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let Some(actor) = resolve_local(&state, &name, &headers).await else {
+        return nope();
+    };
+
+    let Some(sig) =
+        headers.get("signature").and_then(|v| v.to_str().ok()).and_then(signatures::parse)
+    else {
+        return refused(StatusCode::UNAUTHORIZED, signatures::Refusal::NoSignature.to_string());
+    };
+
+    // The key's URI is the actor's URI with the fragment cut off. Everything
+    // this request is believed to be rests on the document at that address.
+    let key_owner = sig.key_id.split('#').next().unwrap_or_default().to_string();
+    if key_owner.is_empty() {
+        return refused(StatusCode::UNAUTHORIZED, "The signature names no key");
+    }
+
+    let deadline = tokio::time::Instant::now() + FETCH_DEADLINE;
+    let Some(remote) = resolve_remote_actor(&state, &key_owner, deadline, false).await else {
+        return refused(StatusCode::UNAUTHORIZED, "Could not fetch the actor the signature names");
+    };
+
+    let path_and_query = format!("/users/{name}/inbox");
+    let lookup = |want: &str| headers.get(want).and_then(|v| v.to_str().ok()).map(str::to_string);
+    let now = chrono::Utc::now().timestamp();
+
+    let mut verified = remote.public_key.as_deref().map(|pem| {
+        signatures::verify_inbound("POST", &path_and_query, &body, now, lookup, pem, &sig)
+    });
+
+    // **A key that has rotated fails exactly like a forgery**, so one refetch
+    // is what stops a peer becoming permanently unable to talk to us after they
+    // rotate — a failure that would look like our bug and be invisible in their
+    // logs. Only on `BadSignature`, and only once: a stale clock or a thin
+    // coverage set is not going to be fixed by asking again, and retrying those
+    // would turn any malformed request into an outbound fetch.
+    if matches!(verified, Some(Err(signatures::Refusal::BadSignature)) | None) {
+        if let Some(fresh) = resolve_remote_actor(&state, &key_owner, deadline, true).await {
+            if let Some(pem) = fresh.public_key.as_deref() {
+                verified = Some(signatures::verify_inbound(
+                    "POST",
+                    &path_and_query,
+                    &body,
+                    now,
+                    lookup,
+                    pem,
+                    &sig,
+                ));
+            }
+        }
+    }
+
+    match verified {
+        Some(Ok(())) => {}
+        Some(Err(refusal)) => {
+            debug!("📡 inbox {}: refused — {refusal}", actor.uri);
+            return refused(StatusCode::UNAUTHORIZED, refusal.to_string());
+        }
+        None => {
+            return refused(
+                StatusCode::UNAUTHORIZED,
+                "That actor publishes no key we can check against",
+            )
+        }
+    }
+
+    let Ok(payload) = serde_json::from_slice::<Value>(&body) else {
+        return refused(StatusCode::BAD_REQUEST, "The body is not JSON");
+    };
+
+    // **The signature says who *sent* this; `actor` claims who *wrote* it.**
+    // They are different claims, and a delivery where they disagree is one
+    // server relaying an activity attributed to somebody on another server —
+    // which is how an impersonated Follow or Delete gets in. Filing it under
+    // the sender would be wrong and filing it under the claim would be worse,
+    // so it is refused.
+    let claimed = payload.get("actor").and_then(as_uri);
+    match claimed {
+        Some(a) if a == remote.uri => {}
+        Some(a) => {
+            warn!("📡 inbox {}: signed by {} but attributed to {a}", actor.uri, remote.uri);
+            return refused(
+                StatusCode::UNAUTHORIZED,
+                "The signing key does not belong to the actor this activity is attributed to",
+            );
+        }
+        None => return refused(StatusCode::BAD_REQUEST, "The activity names no actor"),
+    }
+
+    // An activity with no `id` cannot be deduplicated, cannot be referred to by
+    // a later `Undo` or `Delete`, and cannot be checked against a redelivery.
+    // Minting one here would paper over all three.
+    let Some(activity_uri) = payload.get("id").and_then(as_uri) else {
+        return refused(StatusCode::BAD_REQUEST, "The activity has no `id`");
+    };
+
+    let kind = payload.get("type").and_then(|v| v.as_str());
+    let object_ref = payload.get("object").and_then(as_uri);
+
+    match state
+        .db
+        .record_inbox_activity(
+            actor.user_id,
+            remote.id,
+            &activity_uri,
+            kind,
+            object_ref.as_deref(),
+            &String::from_utf8_lossy(&body),
+        )
+        .await
+    {
+        // A redelivery is the *same* activity — senders retry — so this is 202
+        // either way. Reporting a duplicate as an error is what makes a sender
+        // retry harder.
+        Ok(fresh) => {
+            if fresh {
+                info!(
+                    "📡 {} → {}: {} from {}",
+                    kind.unwrap_or("activity"),
+                    actor.username,
+                    activity_uri,
+                    remote.uri
+                );
+            }
+            StatusCode::ACCEPTED.into_response()
+        }
+        Err(e) => {
+            warn!("📡 inbox {}: could not file — {e}", actor.uri);
+            refused(StatusCode::INTERNAL_SERVER_ERROR, "Could not file that activity")
+        }
+    }
+}
+
+/// ActivityStreams lets an object be a bare URI string *or* an embedded object
+/// with an `id`. Both are on the wire and reading only the first is how a
+/// perfectly ordinary `Undo` arrives looking malformed.
+fn as_uri(v: &Value) -> Option<String> {
+    v.as_str()
+        .map(str::to_string)
+        .or_else(|| v.get("id").and_then(|i| i.as_str()).map(str::to_string))
+        .filter(|s| !s.is_empty())
+}
+
+// ── resolution ───────────────────────────────────────────────
+
+/// The local actor for a username, minted on first need.
+///
+/// One helper for all four endpoints, so the discoverability rule is applied in
+/// one place rather than remembered four times.
+async fn resolve_local(state: &Arc<AppState>, name: &str, headers: &HeaderMap) -> Option<Actor> {
+    let user_id = state.db.discoverable_user_id(name).await.ok().flatten()?;
+    let origin = public_origin(state, headers);
+
+    match state.db.actor_for_user(user_id, &origin).await {
+        Ok(actor) => Some(actor),
+        Err(e) => {
+            warn!("📡 could not mint an actor for {name}: {e}");
+            None
+        }
+    }
+}
+
+fn http() -> &'static reqwest::Client {
+    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .timeout(FETCH_TIMEOUT)
+            // A redirect chain is somebody else's server telling us where to
+            // look. Two hops is enough for a host that has moved and few enough
+            // that it cannot be walked somewhere interesting.
+            .redirect(reqwest::redirect::Policy::limited(2))
+            .user_agent(concat!("Tapedeck/", env!("CARGO_PKG_VERSION")))
+            .build()
+            .unwrap_or_default()
+    })
+}
+
+/// Find a remote actor, from cache or from their server.
+///
+/// `force` skips the cache — used only for the single refetch after a signature
+/// failed, which is what makes key rotation survivable.
+async fn resolve_remote_actor(
+    state: &Arc<AppState>,
+    uri: &str,
+    deadline: tokio::time::Instant,
+    force: bool,
+) -> Option<crate::db::RemoteActor> {
+    if !force {
+        if let Ok(Some(cached)) = state.db.remote_actor_by_uri(uri).await {
+            let fresh = chrono::Utc::now().timestamp() - cached.fetched_at < ACTOR_CACHE_SECS;
+            if fresh && cached.public_key.is_some() {
+                return Some(cached);
+            }
+        }
+    }
+
+    let fetched = fetch_actor(uri, deadline).await?;
+
+    let inbox = fetched.get("inbox").and_then(as_uri)?;
+    let shared = fetched.get("endpoints").and_then(|e| e.get("sharedInbox")).and_then(as_uri);
+    let key = fetched.get("publicKey").and_then(|k| k.get("publicKeyPem")).and_then(|v| v.as_str());
+    let name = fetched.get("name").and_then(|v| v.as_str());
+    let icon = fetched.get("icon").and_then(|i| i.get("url")).and_then(|v| v.as_str());
+
+    // `preferredUsername` plus the host the document actually came from — never
+    // a `handle` the document claims, which is not the document's to assert.
+    let handle = fetched
+        .get("preferredUsername")
+        .and_then(|v| v.as_str())
+        .and_then(|u| host_of(uri).map(|h| format!("{u}@{h}")));
+
+    state
+        .db
+        .upsert_remote_actor(uri, handle.as_deref(), name, &inbox, shared.as_deref(), key, icon)
+        .await
+        .ok()
+}
+
+fn host_of(url: &str) -> Option<String> {
+    let rest = url.strip_prefix("https://").or_else(|| url.strip_prefix("http://"))?;
+    let host = rest.split('/').next()?;
+    (!host.is_empty()).then(|| host.to_string())
+}
+
+/// Fetch an actor document from a URL a **stranger chose**.
+///
+/// That is the whole hazard: the `keyId` on an unauthenticated POST decides
+/// what this server connects to, which is a server-side request forgery in
+/// exactly the shape they are usually found in. Three guards:
+///
+/// * **Absolute `https` only.** A scheme-relative or `http` URL is refused
+///   outright — an actor document is key material and fetching it in the clear
+///   means whoever is on the path chooses the key.
+/// * **No private or loopback hosts**, via the same `is_private_host` the MCP
+///   origin check uses. This is what stops `keyId` being pointed at
+///   `http://127.0.0.1:8080/admin/...` or at a cloud metadata endpoint.
+/// * **A size cap and the caller's deadline**, so neither a slow server nor an
+///   endless one can hold a request open past the reverse proxy in front of us.
+async fn fetch_actor(uri: &str, deadline: tokio::time::Instant) -> Option<Value> {
+    let Some(host) = uri.strip_prefix("https://").and_then(|_| host_of(uri)) else {
+        debug!("📡 refusing to fetch a non-https actor: {uri}");
+        return None;
+    };
+    if is_private_host(&host) {
+        warn!("📡 refusing to fetch an actor on a private host: {uri}");
+        return None;
+    }
+
+    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+    if remaining.is_zero() {
+        return None;
+    }
+
+    let request = http()
+        .get(uri)
+        .header(header::ACCEPT, "application/activity+json, application/ld+json")
+        .send();
+
+    let response = match tokio::time::timeout(remaining, request).await {
+        Ok(Ok(r)) if r.status().is_success() => r,
+        Ok(Ok(r)) => {
+            debug!("📡 actor fetch {uri}: HTTP {}", r.status());
+            return None;
+        }
+        Ok(Err(e)) => {
+            debug!("📡 actor fetch {uri}: {e}");
+            return None;
+        }
+        Err(_) => {
+            debug!("📡 actor fetch {uri}: out of time");
+            return None;
+        }
+    };
+
+    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+    let body = tokio::time::timeout(remaining, response.bytes()).await.ok()?.ok()?;
+    if body.len() > MAX_ACTOR_BYTES {
+        warn!("📡 actor document at {uri} is {} bytes; refusing", body.len());
+        return None;
+    }
+
+    serde_json::from_slice(&body).ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A server that lists `text/html` as a fallback is still a server. Getting
+    /// this backwards serves the app's HTML shell to a remote instance, which
+    /// reads as an actor that does not exist.
+    #[test]
+    fn a_server_gets_the_document_and_a_browser_gets_the_app() {
+        let accept = |v: &str| {
+            let mut h = HeaderMap::new();
+            h.insert(header::ACCEPT, v.parse().unwrap());
+            h
+        };
+
+        assert!(!wants_html(&accept("application/activity+json")));
+        assert!(!wants_html(&accept(
+            "application/ld+json; profile=\"https://www.w3.org/ns/activitystreams\""
+        )));
+        assert!(!wants_html(&accept("application/activity+json, text/html;q=0.1")));
+
+        assert!(wants_html(&accept(
+            "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+        )));
+
+        // A bare probe gets the document: there is no `/users/:name` page yet,
+        // and JSON is the useful answer to curl.
+        assert!(!wants_html(&accept("*/*")));
+        assert!(!wants_html(&HeaderMap::new()));
+    }
+
+    /// An object is a bare URI or an embedded object, and both are ordinary.
+    #[test]
+    fn an_object_is_read_in_either_shape() {
+        assert_eq!(as_uri(&serde_json::json!("https://h/a/1")), Some("https://h/a/1".into()));
+        assert_eq!(
+            as_uri(&serde_json::json!({"id": "https://h/a/1", "type": "Follow"})),
+            Some("https://h/a/1".into())
+        );
+        assert_eq!(as_uri(&serde_json::json!({"type": "Follow"})), None);
+        assert_eq!(as_uri(&serde_json::json!("")), None);
+        assert_eq!(as_uri(&serde_json::json!(null)), None);
+    }
+
+    #[test]
+    fn a_host_is_read_off_a_url() {
+        assert_eq!(host_of("https://deck.example/users/ash"), Some("deck.example".into()));
+        assert_eq!(host_of("https://deck.example"), Some("deck.example".into()));
+        assert_eq!(host_of("ftp://deck.example/x"), None);
+    }
+
+    /// The `keyId` on an unauthenticated POST decides what this server
+    /// connects to. Every one of these is a request forgery that must not
+    /// leave the box, and each is refused before any socket is opened.
+    #[tokio::test]
+    async fn an_actor_fetch_will_not_be_pointed_at_our_own_network() {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        for hostile in [
+            "http://127.0.0.1:8080/admin/users",
+            "https://127.0.0.1/users/ash",
+            "https://localhost/users/ash",
+            "https://10.0.0.4/users/ash",
+            "https://192.168.1.9/users/ash",
+            "https://172.16.4.4/users/ash",
+            // The cloud metadata endpoint — the highest-value target of the
+            // whole class, and the reason `is_private_host` gained 169.254/16.
+            "https://169.254.169.254/latest/meta-data",
+            "https://100.79.1.2/users/ash",
+            "https://[::1]/users/ash",
+            "https://nas/users/ash",
+            "https://pi.local/users/ash",
+            "http://deck.example/users/ash",
+            "file:///etc/passwd",
+            "/users/ash",
+            "",
+        ] {
+            assert!(
+                fetch_actor(hostile, deadline).await.is_none(),
+                "must refuse to fetch {hostile}"
+            );
+        }
+    }
+}

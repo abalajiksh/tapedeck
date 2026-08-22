@@ -2047,6 +2047,7 @@ dependencies = [
  "pkcs1",
  "pkcs8",
  "rand_core 0.6.4",
+ "sha2",
  "signature",
  "spki",
  "subtle",
@@ -2707,7 +2708,7 @@ dependencies = [
 
 [[package]]
 name = "tapedeck"
-version = "0.77.0"
+version = "0.78.0"
 dependencies = [
  "ammonia",
  "anyhow",
@@ -2728,6 +2729,7 @@ dependencies = [
  "rand 0.9.3",
  "reqwest",
  "roon-api",
+ "rsa",
  "rust-embed",
  "serde",
  "serde_json",
