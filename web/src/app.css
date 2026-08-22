@@ -146,9 +146,17 @@
     position: fixed; inset: 0; display: grid; place-items: center; padding: 18px;
     background: rgba(30,27,22,.5); z-index: 90;
   }
+  /* `color` beside `background`, always. A dialog is a surface of its own, and
+     it is rendered wherever the component that opens it happens to live — which
+     for the playlist push is inside Rediscovery's `.hero`, a dark card that sets
+     a light text colour. Inheriting that put cream text on a cream dialog in
+     light mode, while looking perfectly deliberate in dark. Same shape as the
+     shelf's `--td-panel` bug: a background stated and a text colour left to
+     chance reads correctly in exactly one theme. */
   .dialog {
     width: min(440px, 100%); display: flex; flex-direction: column; gap: 14px;
     padding: 22px; border-radius: 26px; background: var(--td-surface);
+    color: var(--td-text);
     box-shadow: 0 12px 32px rgba(46,43,37,.22);
   }
   .dialog-title { font-family: 'Caprasimo', serif; font-size: 20px; }

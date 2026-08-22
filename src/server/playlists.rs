@@ -34,7 +34,7 @@ use axum::{
 };
 use serde::Deserialize;
 use std::sync::Arc;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use super::auth::AuthUser;
 use super::models::ErrorResponse;
@@ -321,10 +321,47 @@ pub async fn push_tracks(
     let mut missing: Vec<(&PlaylistTrack, playlists::Miss)> = Vec::new();
     let mut search_error: Option<String> = None;
 
+    let mut from_cache = 0usize;
+
     for want in tracks {
+        // **The cheapest search is the one not made.** A re-push of a list
+        // where most tracks already resolved should cost almost nothing, which
+        // is the difference between the second push of an evening working and
+        // being throttled into reporting real tracks as absent.
+        if let Ok(Some(id)) =
+            state.db.playlist_match(user_id, source_id, &want.artist, &want.title).await
+        {
+            ids.push(id);
+            from_cache += 1;
+            continue;
+        }
         match target.search_tracks(want).await {
             Ok(candidates) => match playlists::pick(want, &candidates) {
-                Some(id) => ids.push(id),
+                Some(id) => {
+                    // Remembered as a guess: `manual` is reserved for a person
+                    // choosing from the candidates, and must not be overwritten
+                    // by whatever the matcher decides next time.
+                    let label = candidates
+                        .iter()
+                        .find(|c| c.id == id)
+                        .map(|c| format!("{} — {}", c.title, c.artist));
+                    if let Err(e) = state
+                        .db
+                        .remember_playlist_match(
+                            user_id,
+                            source_id,
+                            &want.artist,
+                            &want.title,
+                            &id,
+                            label.as_deref(),
+                            false,
+                        )
+                        .await
+                    {
+                        debug!("Could not remember a playlist match: {e}");
+                    }
+                    ids.push(id);
+                }
                 // **Why** it missed, not just that it did. A server that
                 // returned nothing has a search problem; one that returned the
                 // right song and had it refused has a matching problem. Both
@@ -437,6 +474,10 @@ pub async fn push_tracks(
                 "target": target_desc,
                 "requested": tracks.len(),
                 "matched": ids.len(),
+                // How much of that was answered without asking the far end.
+                // Worth reporting rather than hiding: on a re-push it should be
+                // nearly everything, and if it is not, the cache is not working.
+                "from_cache": from_cache,
                 "missing": missing_json,
                 // So a caller can tell "I made you one" from "I rewrote the one
                 // you already had", which are different things to say to
@@ -604,4 +645,78 @@ pub fn create_playlists_router() -> Router<Arc<AppState>> {
         .route("/api/v1/saved-playlists", get(list_saved).post(save_saved))
         .route("/api/v1/saved-playlists/:id", get(get_saved).delete(delete_saved))
         .route("/api/v1/saved-playlists/:id/push", post(push_saved))
+        .route("/api/v1/playlist-matches", post(set_match).delete(clear_match))
+}
+
+/// A track the search got wrong, and which of its candidates it really is.
+#[derive(serde::Deserialize)]
+pub struct MatchRequest {
+    pub source_id: i64,
+    pub artist: String,
+    pub title: String,
+    /// The far end's id, taken from the `offered` list a push reported. Absent
+    /// on the `DELETE`, which forgets the mapping instead.
+    #[serde(default)]
+    pub remote_id: Option<String>,
+    /// What the far end calls it, so the mapping can be shown back as something
+    /// a person recognises rather than an opaque id.
+    #[serde(default)]
+    pub remote_label: Option<String>,
+}
+
+/// Pin a track to one of the candidates the far end offered.
+///
+/// **This is what makes the resolution cache self-improving.** A push reports
+/// every miss with the candidates that were offered — which is how SE SO NEON,
+/// Kim Jong Wan and Lee Moon Sae were found — and until now that list was a
+/// dead end you read and then went and fixed by hand somewhere else. Choosing
+/// from it writes a `manual` entry, which never expires and is never overwritten
+/// by a later automatic guess: somebody looked at the candidates and settled it,
+/// and a search that already got it wrong once must not be given another vote.
+///
+/// Session-only, like the push it serves.
+async fn set_match(
+    State(state): State<Arc<AppState>>,
+    user: AuthUser,
+    Json(body): Json<MatchRequest>,
+) -> impl IntoResponse {
+    let Some(remote_id) = body.remote_id.as_deref().map(str::trim).filter(|s| !s.is_empty()) else {
+        return err(400, "A match needs the id of the track it resolves to");
+    };
+    if body.artist.trim().is_empty() || body.title.trim().is_empty() {
+        return err(400, "A match needs the artist and title it is a match for");
+    }
+    match state
+        .db
+        .remember_playlist_match(
+            user.user_id,
+            body.source_id,
+            &body.artist,
+            &body.title,
+            remote_id,
+            body.remote_label.as_deref(),
+            true,
+        )
+        .await
+    {
+        Ok(()) => Json(serde_json::json!({ "status": "matched" })).into_response(),
+        Err(e) => err(500, e.to_string()),
+    }
+}
+
+/// Forget a mapping — the pick was wrong, or the far end has changed. The next
+/// push searches for it again from scratch.
+async fn clear_match(
+    State(state): State<Arc<AppState>>,
+    user: AuthUser,
+    Json(body): Json<MatchRequest>,
+) -> impl IntoResponse {
+    match state
+        .db
+        .forget_playlist_match(user.user_id, body.source_id, &body.artist, &body.title)
+        .await
+    {
+        Ok(()) => Json(serde_json::json!({ "status": "cleared" })).into_response(),
+        Err(e) => err(500, e.to_string()),
+    }
 }

@@ -26,7 +26,7 @@ openapi: 3.1.0
 
 info:
   title: Tapedeck
-  version: 0.76.3
+  version: 0.76.4
   summary: Self-hosted scrobbler and listening journal.
   description: |
     Tapedeck ingests listens, enriches them with MusicBrainz metadata, stores
@@ -5266,17 +5266,94 @@ paths:
                             failed.
                         offered:
                           type: array
-                          items: { type: string }
                           description: |
-                            What the server actually returned, de-duplicated and
-                            capped at five — artist names for `artist_mismatch`,
-                            titles for `title_mismatch`. This is the field that
-                            settles it at a glance: asked for one spelling and
-                            offered another says exactly what is wrong.
+                            What the server actually returned, de-duplicated on
+                            the label and capped at five — artist names for
+                            `artist_mismatch`, titles for `title_mismatch`. This
+                            is the field that settles it at a glance: asked for
+                            one spelling and offered another says exactly what is
+                            wrong.
+
+                            Each entry carries the far end's own `id`, so a
+                            candidate can be **chosen** rather than only read:
+                            POST it to `/api/v1/playlist-matches` and every later
+                            push of that track uses it.
+                          items:
+                            type: object
+                            properties:
+                              id:
+                                type: string
+                                description: |
+                                  The far end's id for this track. Opaque — it
+                                  only ever goes back to the server that made it.
+                              label: { type: string }
         '400': { $ref: '#/components/responses/BadRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '404': { description: No such source, or none of those tracks are on it. }
         '502': { description: The server refused the playlist or could not be reached. }
+
+  /api/v1/playlist-matches:
+    post:
+      tags: [Playlists]
+      summary: Pin a track to one of the candidates a push offered.
+      description: |
+        Session-only, like the push it serves.
+
+        A push reports every miss with the candidates the far end offered.
+        Until this existed that list was a dead end — plausible names you could
+        read and not act on. Choosing one records a **manual** resolution, which
+        never expires and is never overwritten by a later automatic guess: a
+        person read the candidates and settled it, and a search that already got
+        it wrong once does not get another vote.
+
+        This is also what makes the resolution cache self-improving. Every
+        successful match is remembered, so a re-push costs almost no searches at
+        all — which matters because the far end meters them.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [source_id, artist, title, remote_id]
+              properties:
+                source_id:
+                  type: integer
+                  description: The target this resolution is for. `-1` is TIDAL.
+                artist: { type: string }
+                title: { type: string }
+                remote_id:
+                  type: string
+                  description: An `id` from a miss's `offered` list.
+                remote_label:
+                  type: string
+                  nullable: true
+                  description: What the far end calls it, kept so the mapping can be shown back.
+      responses:
+        '200': { description: Recorded. }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+    delete:
+      tags: [Playlists]
+      summary: Forget a resolution.
+      description: |
+        Session-only. The pick was wrong, or the far end has changed what it
+        holds; the next push searches for the track again from scratch. Takes
+        the same body without `remote_id`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [source_id, artist, title]
+              properties:
+                source_id: { type: integer }
+                artist: { type: string }
+                title: { type: string }
+      responses:
+        '200': { description: Forgotten. }
+        '401': { $ref: '#/components/responses/Unauthorized' }
 
   # ── Settings ───────────────────────────────────────────────────────────────
   /api/v1/preferences:

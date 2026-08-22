@@ -216,9 +216,26 @@ pub enum Miss {
     /// The server answered, with nothing.
     NoCandidates,
     /// It offered tracks, none by this artist.
-    ArtistMismatch { offered: Vec<String> },
+    ArtistMismatch { offered: Vec<Offered> },
     /// The artist agreed and no title did.
-    TitleMismatch { offered: Vec<String> },
+    TitleMismatch { offered: Vec<Offered> },
+}
+
+/// One track the far end offered, in the shape a reader *and* a reconciliation
+/// screen can both use.
+///
+/// It used to be a bare `Vec<String>` of names — enough to see what went wrong
+/// and useless for doing anything about it, because pinning a track to one of
+/// these needs the far end's **id** and the list did not carry one. Reading a
+/// list of plausible titles you cannot act on is the definition of a dead end.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct Offered {
+    /// The far end's own id, which is what `POST /api/v1/playlist-matches`
+    /// takes. Opaque here; it only ever goes back to the server that made it.
+    pub id: String,
+    /// What to show. The artist for an artist mismatch, the title for a title
+    /// mismatch — whichever half is the thing that disagreed.
+    pub label: String,
 }
 
 /// Work out which of those it was. Only called when `pick` returned nothing.
@@ -228,14 +245,17 @@ pub fn explain(want: &PlaylistTrack, candidates: &[Candidate]) -> Miss {
     }
     let by_artist: Vec<&Candidate> =
         candidates.iter().filter(|c| crate::db::artist_matches(&c.artist, &want.artist)).collect();
-    // De-duplicated and capped: this goes in an error message a person reads,
-    // not a log. Five names is enough to see the pattern.
+    // De-duplicated on the label and capped: this goes in front of a person, not
+    // into a log, and five is enough to see the pattern. De-duplicating on the
+    // *label* rather than the id is deliberate — three pressings of one song all
+    // read "Xtal", and offering it three times says nothing new — but each entry
+    // keeps a real id, so any of them can be chosen.
     let names = |list: &[&Candidate], field: fn(&Candidate) -> String| {
-        let mut seen: Vec<String> = Vec::new();
+        let mut seen: Vec<Offered> = Vec::new();
         for c in list {
-            let v = field(c);
-            if !v.is_empty() && !seen.iter().any(|s| s.eq_ignore_ascii_case(&v)) {
-                seen.push(v);
+            let label = field(c);
+            if !label.is_empty() && !seen.iter().any(|o| o.label.eq_ignore_ascii_case(&label)) {
+                seen.push(Offered { id: c.id.clone(), label });
             }
             if seen.len() == 5 {
                 break;
@@ -393,14 +413,22 @@ mod tests {
         let wrong = [cand("1", "Xtal", "Arkells", None), cand("2", "Xtal", "Arkells", None)];
         assert_eq!(
             explain(&w, &wrong),
-            Miss::ArtistMismatch { offered: vec!["Arkells".into()] },
+            Miss::ArtistMismatch {
+                // De-duplicated on the label — this goes in front of a person —
+                // but the entry that survives keeps a **real id**, which is what
+                // lets somebody pin the track to it instead of only reading
+                // about it.
+                offered: vec![Offered { id: "1".into(), label: "Arkells".into() }]
+            },
             "de-duplicated: this goes in a message a person reads"
         );
 
         let right_artist = [cand("3", "Ageispolis", "Aphex Twin", None)];
         assert_eq!(
             explain(&w, &right_artist),
-            Miss::TitleMismatch { offered: vec!["Ageispolis".into()] }
+            Miss::TitleMismatch {
+                offered: vec![Offered { id: "3".into(), label: "Ageispolis".into() }]
+            }
         );
     }
 

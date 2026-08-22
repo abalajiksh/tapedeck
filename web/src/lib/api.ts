@@ -1202,6 +1202,13 @@ export interface PlaylistPushTrack {
 	title: string;
 	artist: string;
 	album?: string | null;
+	/** Which kind of miss it was. A server that returned nothing has a search
+	 *  problem; one that returned the right song and had it refused has a
+	 *  matching problem, and they need different things from the user. */
+	reason?: 'search_failed' | 'no_candidates' | 'artist_mismatch' | 'title_mismatch';
+	/** What the far end offered instead, each with its own id — so a candidate
+	 *  can be *chosen* rather than only read. */
+	offered?: { id: string; label: string }[];
 }
 
 export interface PlaylistPushResult {
@@ -1214,6 +1221,12 @@ export interface PlaylistPushResult {
 	/** Named rather than counted: "nine of twelve" without saying which three is
 	 *  a number that is just wrong to anyone trying to fix it. */
 	missing: PlaylistPushTrack[];
+	/** How many tracks were answered from the resolution cache rather than by
+	 *  asking the far end. On a re-push this should be nearly everything. */
+	from_cache?: number;
+	/** Whether this rewrote the playlist a previous push made, or made a new
+	 *  one — different things to say to somebody looking at their library. */
+	updated_existing?: boolean;
 }
 
 export interface SanitizePreview {
@@ -1631,6 +1644,19 @@ class TapedeckAPI {
 		tracks: PlaylistPushTrack[]
 	): Promise<PlaylistPushResult> {
 		return this.post('/api/v1/playlists', { source_id, name, tracks });
+	}
+
+	/** Pin a track to one of the candidates a push offered. Recorded as a
+	 *  *manual* resolution: it never expires, and a later automatic guess will
+	 *  not overwrite it. */
+	async setPlaylistMatch(body: {
+		source_id: number;
+		artist: string;
+		title: string;
+		remote_id: string;
+		remote_label?: string;
+	}): Promise<{ status: string }> {
+		return this.post('/api/v1/playlist-matches', body);
 	}
 
 	// ── Physical media: records and tapes ──

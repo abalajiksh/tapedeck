@@ -34,6 +34,40 @@
 	let pushing = false;
 	let result: PlaylistPushResult | null = null;
 	let error = '';
+	/** Which misses have been settled by hand this session, keyed
+	 *  `artist\u0000title`. Local rather than re-fetched: the push result is a
+	 *  report of what happened, and re-running it to see one row change would
+	 *  cost the far end another thirty searches. */
+	let pinned = new Set<string>();
+	let pinning = '';
+	const missKey = (m: { artist: string; title: string }) => `${m.artist}\u0000${m.title}`;
+
+	/**
+	 * Take the far end at its word about one track.
+	 *
+	 * The candidates were always in the response and were always a dead end —
+	 * plausible names you could read and then go and fix somewhere else. This
+	 * records a *manual* resolution, which never expires and which no later
+	 * automatic guess overwrites, so the next push gets it right without being
+	 * asked again.
+	 */
+	async function pin(m: PlaylistPushTrack, cand: { id: string; label: string }) {
+		if (chosen == null) return;
+		pinning = missKey(m) + cand.id;
+		try {
+			await api.setPlaylistMatch({
+				source_id: chosen,
+				artist: m.artist,
+				title: m.title,
+				remote_id: cand.id,
+				remote_label: cand.label
+			});
+			pinned = new Set(pinned).add(missKey(m));
+		} catch (e) {
+			error = clean(e);
+		}
+		pinning = '';
+	}
 
 	const clean = (e: unknown) => String(e).replace(/^API \d+: /, '');
 
@@ -108,7 +142,32 @@
 						</p>
 						<ul class="missing">
 							{#each result.missing as m}
-								<li>{m.title} <span style="color:var(--td-muted-3);">— {m.artist}</span></li>
+								<li>
+									<span>{m.title} <span style="color:var(--td-muted-3);">— {m.artist}</span></span>
+									<!-- What the far end offered instead. This used to be
+									     printed and nothing more, which is how a list of
+									     plausible titles becomes something you read and
+									     then go and fix by hand elsewhere. Picking one
+									     settles it permanently. -->
+									{#if m.offered?.length}
+										{#if pinned.has(missKey(m))}
+											<span class="pinned">✓ set — the next push will use it</span>
+										{:else}
+											<span class="cands">
+												<span class="cands-lead">
+													{m.reason === 'artist_mismatch' ? 'it offered' : 'it has'}
+												</span>
+												{#each m.offered as c}
+													<button class="cand" disabled={!!pinning}
+														title="Use this for {m.title} from now on"
+														on:click={() => pin(m, c)}>
+														{pinning === missKey(m) + c.id ? '…' : c.label}
+													</button>
+												{/each}
+											</span>
+										{/if}
+									{/if}
+								</li>
 							{/each}
 						</ul>
 					{/if}
@@ -209,5 +268,24 @@
 		max-height: 180px;
 		overflow-y: auto;
 	}
-	.missing li { margin-bottom: 2px; }
+	.missing li { margin-bottom: 7px; }
+	/* The candidates read as a continuation of the row rather than as a control
+	   panel under it — there can be five per miss and several misses, and a
+	   grid of buttons would bury the list they are annotating. */
+	.cands { display: block; margin-top: 2px; }
+	.cands-lead { font-size: 11.5px; color: var(--td-muted-3); margin-right: 4px; }
+	.cand {
+		font: inherit;
+		font-size: 12px;
+		cursor: pointer;
+		border: 1px dashed var(--td-muted-3);
+		background: transparent;
+		color: var(--td-accent);
+		border-radius: 999px;
+		padding: 1px 9px;
+		margin: 2px 4px 0 0;
+	}
+	.cand:hover:not(:disabled) { background: color-mix(in srgb, var(--td-accent) 12%, transparent); }
+	.cand:disabled { opacity: .5; cursor: default; }
+	.pinned { display: block; margin-top: 2px; font-size: 11.5px; color: var(--td-good-fg); }
 </style>

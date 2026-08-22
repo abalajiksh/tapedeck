@@ -1959,8 +1959,142 @@ impl Database {
         .execute(&self.pool)
         .await?;
 
+        // Which track on the far end a name resolved to, last time.
+        //
+        // A push is one search per track and the far end meters them, so the
+        // cheapest search is the one not made: on a re-push of a 30-track list
+        // where 24 matched, only the 6 that missed need asking about again.
+        // That alone would have prevented the incident this exists for — three
+        // pushes in quick succession, the second and third throttled into
+        // reporting real tracks as absent.
+        //
+        // Keyed on the same fold `playlists::pick` matches with, so a hit here
+        // and a match there cannot disagree about whether two spellings are the
+        // same track.
+        //
+        // **Misses are deliberately not cached.** A catalogue gains tracks, and
+        // remembering "not on TIDAL" would make that permanent for a listener
+        // who would never find out why. The win is on hits and that is enough.
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS playlist_matches (
+                user_id INTEGER NOT NULL REFERENCES users(id),
+                source_id INTEGER NOT NULL,
+                artist_key TEXT NOT NULL,
+                title_key TEXT NOT NULL,
+                remote_id TEXT NOT NULL,
+                -- What the far end calls it, so a reconciliation screen can
+                -- show what was actually chosen rather than just an opaque id.
+                remote_label TEXT,
+                -- 'auto' — this is what the search found and the matcher
+                -- accepted. 'manual' — a person picked it from the candidates
+                -- offered. The two expire differently; see `playlist_match`.
+                origin TEXT NOT NULL DEFAULT 'auto',
+                resolved_at INTEGER NOT NULL,
+                PRIMARY KEY (user_id, source_id, artist_key, title_key)
+            )",
+        )
+        .execute(&self.pool)
+        .await?;
+
         self.init_patch().await?;
 
+        Ok(())
+    }
+
+    /// How long an automatic resolution is trusted.
+    ///
+    /// Long, because a catalogue's id for a track it already has does not
+    /// change often — but not forever, because a track can be pulled and a
+    /// cached id would then be added to every future playlist and rejected by
+    /// the far end with nothing saying why.
+    pub const MATCH_TTL_SECS: i64 = 60 * 60 * 24 * 60;
+
+    /// The far end's id for this track, if a previous push resolved it.
+    ///
+    /// **A hand-picked match never expires.** Somebody looked at the candidates
+    /// and said which one it was; re-asking a search that already got it wrong
+    /// once would throw that away on a timer. An automatic one is only a
+    /// remembered guess and gets `MATCH_TTL_SECS`.
+    pub async fn playlist_match(
+        &self,
+        user_id: i64,
+        source_id: i64,
+        artist: &str,
+        title: &str,
+    ) -> Result<Option<String>, sqlx::Error> {
+        let row: Option<(String, String, i64)> = sqlx::query_as(
+            "SELECT remote_id, origin, resolved_at FROM playlist_matches
+              WHERE user_id = ? AND source_id = ? AND artist_key = ? AND title_key = ?",
+        )
+        .bind(user_id)
+        .bind(source_id)
+        .bind(normalise_artist(artist))
+        .bind(normalise_artist(title))
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.and_then(|(id, origin, at)| {
+            let fresh = origin == "manual" || Self::now_secs() - at < Self::MATCH_TTL_SECS;
+            fresh.then_some(id)
+        }))
+    }
+
+    /// Forget a mapping, so the next push searches for it again. The pick was
+    /// wrong, or the far end has changed what it holds.
+    pub async fn forget_playlist_match(
+        &self,
+        user_id: i64,
+        source_id: i64,
+        artist: &str,
+        title: &str,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "DELETE FROM playlist_matches
+              WHERE user_id = ? AND source_id = ? AND artist_key = ? AND title_key = ?",
+        )
+        .bind(user_id)
+        .bind(source_id)
+        .bind(normalise_artist(artist))
+        .bind(normalise_artist(title))
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Remember what this name resolved to. A manual pick replaces an automatic
+    /// one; an automatic one **never** overwrites a manual one, or the next
+    /// push would quietly undo the correction somebody just made.
+    pub async fn remember_playlist_match(
+        &self,
+        user_id: i64,
+        source_id: i64,
+        artist: &str,
+        title: &str,
+        remote_id: &str,
+        remote_label: Option<&str>,
+        manual: bool,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "INSERT INTO playlist_matches
+                 (user_id, source_id, artist_key, title_key, remote_id, remote_label,
+                  origin, resolved_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT(user_id, source_id, artist_key, title_key) DO UPDATE SET
+                 remote_id    = excluded.remote_id,
+                 remote_label = excluded.remote_label,
+                 origin       = excluded.origin,
+                 resolved_at  = excluded.resolved_at
+             WHERE excluded.origin = 'manual' OR playlist_matches.origin = 'auto'",
+        )
+        .bind(user_id)
+        .bind(source_id)
+        .bind(normalise_artist(artist))
+        .bind(normalise_artist(title))
+        .bind(remote_id)
+        .bind(remote_label)
+        .bind(if manual { "manual" } else { "auto" })
+        .bind(Self::now_secs())
+        .execute(&self.pool)
+        .await?;
         Ok(())
     }
 
@@ -16472,6 +16606,88 @@ mod tests {
         .unwrap();
         let rows = db.get_recent_scrobbles(1, 10, 0, None, None, None, None, None).await.unwrap();
         assert_eq!(rows[0].listened_ms, Some(1500));
+    }
+
+    /// The resolution cache, and the one rule that makes it worth having.
+    ///
+    /// A push is one search per track and the far end meters them, so a
+    /// re-push should cost almost nothing. But the half that has to hold is
+    /// **a hand-picked match outranking a guess**: somebody read the candidates
+    /// and settled it, and the search that already got it wrong once must not
+    /// be given another vote on the next push.
+    #[tokio::test]
+    async fn a_hand_picked_match_outlives_every_guess_after_it() {
+        let db = testdb().await;
+        let uid = db.create_user("ash", None, "pw", "user").await.unwrap();
+        let get = |a: &'static str, t: &'static str| db.playlist_match(uid, -1, a, t);
+
+        assert_eq!(get("SE SO NEON", "A Long Dream").await.unwrap(), None);
+
+        // What the matcher found. Remembered, so the next push does not ask.
+        db.remember_playlist_match(uid, -1, "SE SO NEON", "A Long Dream", "t-1", None, false)
+            .await
+            .unwrap();
+        assert_eq!(get("SE SO NEON", "A Long Dream").await.unwrap().as_deref(), Some("t-1"));
+
+        // The same fold `playlists::pick` matches with, so a cache hit and a
+        // match cannot disagree about whether two spellings are one track.
+        assert_eq!(get("se so neon", "a  long dream").await.unwrap().as_deref(), Some("t-1"));
+
+        // A person corrects it from the offered candidates.
+        db.remember_playlist_match(uid, -1, "SE SO NEON", "A Long Dream", "t-2", Some("x"), true)
+            .await
+            .unwrap();
+        assert_eq!(get("SE SO NEON", "A Long Dream").await.unwrap().as_deref(), Some("t-2"));
+
+        // …and the next push's guess must not quietly undo it.
+        db.remember_playlist_match(uid, -1, "SE SO NEON", "A Long Dream", "t-3", None, false)
+            .await
+            .unwrap();
+        assert_eq!(
+            get("SE SO NEON", "A Long Dream").await.unwrap().as_deref(),
+            Some("t-2"),
+            "an automatic guess overwrote a hand-picked match"
+        );
+
+        // Forgetting it sends the next push back to searching.
+        db.forget_playlist_match(uid, -1, "SE SO NEON", "A Long Dream").await.unwrap();
+        assert_eq!(get("SE SO NEON", "A Long Dream").await.unwrap(), None);
+    }
+
+    /// A guess goes stale; a decision does not.
+    ///
+    /// A catalogue can pull a track, and a cached id would then be added to
+    /// every future playlist and rejected by the far end with nothing saying
+    /// why — so an automatic entry expires. A hand-picked one does not, because
+    /// re-asking a search that was already corrected throws the correction away
+    /// on a timer.
+    #[tokio::test]
+    async fn a_guess_goes_stale_and_a_decision_does_not() {
+        let db = testdb().await;
+        let uid = db.create_user("ash", None, "pw", "user").await.unwrap();
+        let long_ago = Database::now_secs() - Database::MATCH_TTL_SECS - 1;
+
+        for (artist, origin) in [("Guessed", "auto"), ("Chosen", "manual")] {
+            sqlx::query(
+                "INSERT INTO playlist_matches
+                     (user_id, source_id, artist_key, title_key, remote_id, origin, resolved_at)
+                 VALUES (?, -1, ?, ?, 'old', ?, ?)",
+            )
+            .bind(uid)
+            .bind(normalise_artist(artist))
+            .bind(normalise_artist("Song"))
+            .bind(origin)
+            .bind(long_ago)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        }
+
+        assert_eq!(db.playlist_match(uid, -1, "Guessed", "Song").await.unwrap(), None);
+        assert_eq!(
+            db.playlist_match(uid, -1, "Chosen", "Song").await.unwrap().as_deref(),
+            Some("old")
+        );
     }
 
     /// A re-push rewrites the playlist it made last time.
