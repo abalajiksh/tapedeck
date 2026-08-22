@@ -1735,18 +1735,37 @@
 				{:else}
 
 					{#if flipPrompt}
+						<!-- The reminder offers the same two things a side row does, in the
+						     same words. It used to carry one button reading "Play side B"
+						     wired to `play` — which *records* a side as already played, so
+						     turning the record over and pressing it banked the whole side
+						     without the deck ever starting. Two actions that differ this
+						     much cannot share a verb. -->
 						<div class="flip">
-							<span style="font-size:20px;">↻</span>
+							<span style="font-size:20px;">{isDisc(open.kind) ? '→' : '↻'}</span>
 							<div>
-								<div style="font-weight:600;font-size:14.5px;">Flip it — side {flipPrompt} is next</div>
+								<div style="font-weight:600;font-size:14.5px;">
+									{isDisc(open.kind)
+										? `Next up — ${unit(open.kind).toLowerCase()} ${flipPrompt}`
+										: `Flip it — side ${flipPrompt} is next`}
+								</div>
 								<div style="font-size:12.5px;color:var(--td-muted);">
 									{sideTotals.get(flipPrompt) != null
-										? `${formatDuration(sideTotals.get(flipPrompt) ?? 0)} on that side.`
-										: 'Running time unknown for that side.'}
+										? `${formatDuration(sideTotals.get(flipPrompt) ?? 0)} on that ${unit(open.kind).toLowerCase()}.`
+										: `Running time unknown for that ${unit(open.kind).toLowerCase()}.`}
 								</div>
 							</div>
-							<button class="btn btn-primary" style="margin-left:auto;" disabled={playing}
-								on:click={() => play(flipPrompt)}>Play side {flipPrompt}</button>
+							<div style="display:flex;gap:6px;margin-left:auto;flex-wrap:wrap;">
+								<button class="btn btn-primary" disabled={playing || !!spinning}
+									on:click={() => startSide(flipPrompt)}>
+									Start {unit(open.kind).toLowerCase()} {flipPrompt}
+								</button>
+								<button class="btn btn-secondary"
+									title="Record it now, working the start time back from the running time"
+									disabled={playing || !!spinning} on:click={() => play(flipPrompt)}>
+									Already played
+								</button>
+							</div>
 						</div>
 					{/if}
 
