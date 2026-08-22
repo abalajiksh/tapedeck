@@ -1934,8 +1934,78 @@ impl Database {
         .execute(&self.pool)
         .await?;
 
+        // Which remote playlist a push owns.
+        //
+        // Keyed on the **name**, not on a local playlist id, because most of
+        // what gets pushed has no local id at all: a Rediscovery collection is
+        // computed on demand, and the name is the only stable thing about it —
+        // and it is also what identifies the playlist on the far end, since
+        // that is what the playlist is called there. Re-pushing "Dusty Vinyl"
+        // therefore rewrites the same remote playlist, which is what anyone
+        // pressing the button twice expects.
+        //
+        // `source_id` is part of the key so the same list pushed to Plex and to
+        // TIDAL remembers both, and `-1` is the reserved TIDAL target.
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS pushed_playlists (
+                user_id INTEGER NOT NULL REFERENCES users(id),
+                source_id INTEGER NOT NULL,
+                name_key TEXT NOT NULL,
+                remote_id TEXT NOT NULL,
+                pushed_at INTEGER NOT NULL,
+                PRIMARY KEY (user_id, source_id, name_key)
+            )",
+        )
+        .execute(&self.pool)
+        .await?;
+
         self.init_patch().await?;
 
+        Ok(())
+    }
+
+    /// The remote playlist a previous push of this name created, if any.
+    pub async fn pushed_playlist(
+        &self,
+        user_id: i64,
+        source_id: i64,
+        name: &str,
+    ) -> Result<Option<String>, sqlx::Error> {
+        let row: Option<(String,)> = sqlx::query_as(
+            "SELECT remote_id FROM pushed_playlists
+              WHERE user_id = ? AND source_id = ? AND name_key = ?",
+        )
+        .bind(user_id)
+        .bind(source_id)
+        .bind(name.trim().to_lowercase())
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|r| r.0))
+    }
+
+    /// Remember which remote playlist this push owns, replacing whatever was
+    /// remembered before — a stale id that the far end has deleted must not
+    /// outlive the playlist that replaced it.
+    pub async fn remember_pushed_playlist(
+        &self,
+        user_id: i64,
+        source_id: i64,
+        name: &str,
+        remote_id: &str,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "INSERT INTO pushed_playlists (user_id, source_id, name_key, remote_id, pushed_at)
+             VALUES (?, ?, ?, ?, ?)
+             ON CONFLICT(user_id, source_id, name_key)
+             DO UPDATE SET remote_id = excluded.remote_id, pushed_at = excluded.pushed_at",
+        )
+        .bind(user_id)
+        .bind(source_id)
+        .bind(name.trim().to_lowercase())
+        .bind(remote_id)
+        .bind(Self::now_secs())
+        .execute(&self.pool)
+        .await?;
         Ok(())
     }
 
@@ -11542,6 +11612,10 @@ impl Database {
                 MAX(timestamp) AS last_listen,
                 SUM(CASE WHEN mbid_recording IS NOT NULL AND mbid_recording != ''
                          THEN 1 ELSE 0 END) AS with_mbid,
+                -- The empty string is the tombstone -- asked, and this
+                -- recording has none -- so it is not coverage. Counting it
+                -- would report a track nobody can look up as identified.
+                SUM(CASE WHEN isrc IS NOT NULL AND isrc != '' THEN 1 ELSE 0 END) AS with_isrc,
                 SUM(CASE WHEN {fidelity} THEN 1 ELSE 0 END) AS with_format,
                 SUM(CASE WHEN duration IS NOT NULL THEN 1 ELSE 0 END) AS with_duration,
                 SUM(CASE WHEN chain_id IS NOT NULL THEN 1 ELSE 0 END) AS with_chain,
@@ -12810,6 +12884,7 @@ pub struct ListeningCoverage {
     pub first_listen: Option<i64>,
     pub last_listen: Option<i64>,
     pub with_mbid: i64,
+    pub with_isrc: i64,
     pub with_format: i64,
     pub with_duration: i64,
     pub with_chain: i64,
@@ -16397,6 +16472,48 @@ mod tests {
         .unwrap();
         let rows = db.get_recent_scrobbles(1, 10, 0, None, None, None, None, None).await.unwrap();
         assert_eq!(rows[0].listened_ms, Some(1500));
+    }
+
+    /// A re-push rewrites the playlist it made last time.
+    ///
+    /// Keyed on the **name** rather than a local playlist id, because most of
+    /// what gets pushed has none — a Rediscovery collection is computed on
+    /// demand. Three pushes of one list used to make three playlists on the far
+    /// end, cleaned up by hand.
+    #[tokio::test]
+    async fn a_second_push_of_one_name_owns_the_same_remote_playlist() {
+        let db = testdb().await;
+        let uid = db.create_user("ash", None, "pw", "user").await.unwrap();
+
+        assert_eq!(db.pushed_playlist(uid, -1, "Dusty Vinyl").await.unwrap(), None);
+
+        db.remember_pushed_playlist(uid, -1, "Dusty Vinyl", "tidal-abc").await.unwrap();
+        assert_eq!(
+            db.pushed_playlist(uid, -1, "Dusty Vinyl").await.unwrap().as_deref(),
+            Some("tidal-abc")
+        );
+        // The name is matched the way a person types it, not byte for byte.
+        assert_eq!(
+            db.pushed_playlist(uid, -1, "  dusty vinyl ").await.unwrap().as_deref(),
+            Some("tidal-abc")
+        );
+
+        // The same list sent to a different target remembers its own, or
+        // pushing to Plex would rewrite the TIDAL one.
+        assert_eq!(db.pushed_playlist(uid, 7, "Dusty Vinyl").await.unwrap(), None);
+        db.remember_pushed_playlist(uid, 7, "Dusty Vinyl", "plex-99").await.unwrap();
+        assert_eq!(
+            db.pushed_playlist(uid, -1, "Dusty Vinyl").await.unwrap().as_deref(),
+            Some("tidal-abc")
+        );
+
+        // A playlist deleted on the far end and remade must not leave the old
+        // id behind — the mapping is replaced, never accumulated.
+        db.remember_pushed_playlist(uid, -1, "Dusty Vinyl", "tidal-xyz").await.unwrap();
+        assert_eq!(
+            db.pushed_playlist(uid, -1, "Dusty Vinyl").await.unwrap().as_deref(),
+            Some("tidal-xyz")
+        );
     }
 
     /// An existing database gains the Patch schema and the sharing switch.

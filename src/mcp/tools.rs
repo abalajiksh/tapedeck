@@ -1001,6 +1001,21 @@ async fn profile(state: &Arc<AppState>, auth: &McpAuth) -> Result<ToolOutcome, T
     named beside them, which is often smaller than the whole history. These are the \
     populations. Quote a figure with its coverage or do not quote it.",
             "musicbrainz_id": { "listens": cov.with_mbid, "percent": pct(cov.with_mbid) },
+            // Reported because its absence misled a reader badly once: an
+            // analysis of a failing playlist push concluded that ISRC matching
+            // needed building, when it was already built and simply had no data
+            // to work with. A coverage figure nobody can see is one nobody can
+            // reason about.
+            //
+            // The ceiling is the MusicBrainz figure above it, not the whole
+            // history: an ISRC is looked up *by recording MBID*, so a listen
+            // without one can never gain an ISRC by this route however long the
+            // backfill runs.
+            "isrc": {
+                "listens": cov.with_isrc,
+                "percent": pct(cov.with_isrc),
+                "why": "Looked up from a recording MBID, so listens without one can never gain an ISRC this way. It fills in slowly in the background; a playlist push falls back to matching on names until it does."
+            },
             "audio_format": {
                 "listens": cov.with_format,
                 "percent": pct(cov.with_format),

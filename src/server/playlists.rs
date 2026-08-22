@@ -369,7 +369,35 @@ pub async fn push_tracks(
         });
     }
 
-    let created = target.create_playlist(&name, &ids).await;
+    // **Update in place where we made it before.**
+    //
+    // Pushing the same list three times used to make three playlists on the far
+    // end, cleaned up by hand — and a retrying agent is exactly the caller that
+    // does that. `save_playlist` has been idempotent since v0.63.0 through its
+    // `idempotency_key`; this is the same property for the push.
+    //
+    // A target that cannot rewrite a playlist answers `Ok(false)` and falls
+    // through to creating one, which is also what happens when the remembered
+    // playlist has been deleted on the far end. An `Err` is different and is
+    // **not** papered over by creating a second playlist: the list was found and
+    // the rewrite went wrong, so there is a playlist out there in a state the
+    // user needs told about rather than a duplicate sitting beside it.
+    let remembered = state.db.pushed_playlist(user_id, source_id, &name).await.unwrap_or(None);
+    let rewritten: Option<Result<String, String>> = match remembered.as_deref() {
+        Some(existing) => match target.replace_playlist(existing, &ids).await {
+            Ok(true) => Some(Ok(existing.to_string())),
+            // "I cannot rewrite", or the remembered playlist is gone. Both mean
+            // fall through and make one.
+            Ok(false) => None,
+            Err(e) => Some(Err(e)),
+        },
+        None => None,
+    };
+    let reused = matches!(rewritten, Some(Ok(_)));
+    let created = match rewritten {
+        Some(outcome) => outcome,
+        None => target.create_playlist(&name, &ids).await,
+    };
 
     // A push makes one request per track, so a token can legitimately expire
     // partway through one. The client refreshes itself and hands the new pair
@@ -387,7 +415,21 @@ pub async fn push_tracks(
 
     match created {
         Ok(playlist_id) => {
-            info!("📀 Pushed \"{}\" to {} — {}/{} tracks", name, protocol, ids.len(), tracks.len());
+            info!(
+                "📀 {} \"{}\" on {} — {}/{} tracks",
+                if reused { "Updated" } else { "Pushed" },
+                name,
+                protocol,
+                ids.len(),
+                tracks.len()
+            );
+            // Remembered whether it was made now or reused, so a playlist the
+            // user renamed on the far end does not strand the mapping.
+            if let Err(e) =
+                state.db.remember_pushed_playlist(user_id, source_id, &name, &playlist_id).await
+            {
+                warn!("Could not remember the pushed playlist: {e}");
+            }
             Ok(serde_json::json!({
                 "playlist_id": playlist_id,
                 "name": name,
@@ -396,6 +438,10 @@ pub async fn push_tracks(
                 "requested": tracks.len(),
                 "matched": ids.len(),
                 "missing": missing_json,
+                // So a caller can tell "I made you one" from "I rewrote the one
+                // you already had", which are different things to say to
+                // somebody looking at their library.
+                "updated_existing": reused,
             }))
         }
         Err(e) => Err(fail(502, format!("{protocol} refused the playlist: {e}"))),

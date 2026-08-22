@@ -86,6 +86,24 @@ pub trait PlaylistTarget: Send + Sync {
 
     /// Create the playlist and return the server's id for it.
     async fn create_playlist(&self, name: &str, ids: &[String]) -> Result<String, String>;
+
+    /// Rewrite a playlist this instance created earlier, in place.
+    ///
+    /// Defaulted to "I cannot", the way `ScrobbleSink::update_now_playing` is
+    /// defaulted to a no-op: a target that has no way to replace a playlist's
+    /// contents should fall back to creating a new one rather than being made
+    /// to implement something its API does not offer. `Ok(false)` means exactly
+    /// that, and is not a failure — an `Err` is, and means the playlist was
+    /// found and the rewrite went wrong, which the caller must not paper over
+    /// by creating a second one.
+    ///
+    /// **Why this exists at all.** Pushing the same list three times made three
+    /// playlists, cleaned up by hand. `save_playlist` has been idempotent since
+    /// v0.63.0 through its `idempotency_key`; pushing was not, and a retrying
+    /// agent is exactly the caller that would notice.
+    async fn replace_playlist(&self, _remote_id: &str, _ids: &[String]) -> Result<bool, String> {
+        Ok(false)
+    }
 }
 
 /// Strip trailing bracketed qualifiers: `Xtal (Remastered 2008)` → `Xtal`.

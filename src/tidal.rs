@@ -278,32 +278,174 @@ impl TidalClient {
     }
 
     async fn get(&self, url: &str) -> Result<serde_json::Value, String> {
-        let token = self.token().await?;
-        let resp = self
-            .client
-            .get(url)
-            .bearer_auth(token)
-            .header("accept", "application/vnd.api+json")
-            .send()
-            .await
-            .map_err(|e| format!("TIDAL request failed: {e}"))?;
-        read_json(resp).await
+        self.send_with_retry(|token| {
+            self.client.get(url).bearer_auth(token).header("accept", "application/vnd.api+json")
+        })
+        .await
     }
 
     async fn post(&self, url: &str, body: serde_json::Value) -> Result<serde_json::Value, String> {
-        let token = self.token().await?;
-        let resp = self
-            .client
-            .post(url)
-            .bearer_auth(token)
-            .header("accept", "application/vnd.api+json")
-            .header("content-type", "application/vnd.api+json")
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| format!("TIDAL request failed: {e}"))?;
-        read_json(resp).await
+        self.send_with_retry(|token| {
+            self.client
+                .post(url)
+                .bearer_auth(token)
+                .header("accept", "application/vnd.api+json")
+                .header("content-type", "application/vnd.api+json")
+                .json(&body)
+        })
+        .await
     }
+
+    /// DELETE with a body, which JSON:API relationships require — the items to
+    /// remove are named in the payload rather than in the path.
+    async fn delete(
+        &self,
+        url: &str,
+        body: serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        self.send_with_retry(|token| {
+            self.client
+                .delete(url)
+                .bearer_auth(token)
+                .header("accept", "application/vnd.api+json")
+                .header("content-type", "application/vnd.api+json")
+                .json(&body)
+        })
+        .await
+    }
+
+    /// Send a request, waiting out a throttle rather than reporting it as a
+    /// miss.
+    ///
+    /// **Why this exists.** A push is one search per track, issued in turn, and
+    /// TIDAL meters them. Without a retry the first throttled request became a
+    /// `search_failed` — which reads, in the push result, as "that track is not
+    /// on TIDAL". Three consecutive pushes of one 30-track playlist matched 24,
+    /// then 17, then 17, with tracks that had resolved on the first run failing
+    /// on the third *with byte-identical input*. Nothing was wrong with the
+    /// names; the requests never arrived.
+    ///
+    /// **The wait is taken from the response wherever the response offers
+    /// one.** `Retry-After` (seconds, or an HTTP date) and `X-RateLimit-Reset`
+    /// / `X-RateLimit-Reset-In` are read first, and the exponential fallback is
+    /// only for a server that says nothing — guessing when you have been told
+    /// is how a client ends up hammering a service that asked it politely to
+    /// wait. Same order `lb_get_page` uses for ListenBrainz; do not invent a
+    /// third backoff.
+    ///
+    /// **Only a throttle or a server fault is retried.** A 4xx that is not 429
+    /// is an answer — a bad query, a revoked token — and retrying it three
+    /// times just spends the budget that the *next* track needed.
+    ///
+    /// The whole ladder is bounded by `MAX_ATTEMPTS` and by `MAX_WAIT`, because
+    /// this runs inside a request handler: a push that never returns is
+    /// answered by whatever proxy is in front of it, and that answer says
+    /// nothing about the playlist. The trap recorded three times over.
+    async fn send_with_retry(
+        &self,
+        build: impl Fn(String) -> reqwest::RequestBuilder,
+    ) -> Result<serde_json::Value, String> {
+        let mut attempt = 0u32;
+        loop {
+            let token = self.token().await?;
+            let resp = build(token).send().await;
+            let resp = match resp {
+                Ok(r) => r,
+                // A transport error is worth one more try for the same reason a
+                // 5xx is: nothing was decided.
+                Err(e) if attempt + 1 < MAX_ATTEMPTS => {
+                    attempt += 1;
+                    let wait = backoff(attempt);
+                    warn!("TIDAL request failed ({e}); retrying in {:?}", wait);
+                    tokio::time::sleep(wait).await;
+                    continue;
+                }
+                Err(e) => return Err(format!("TIDAL request failed: {e}")),
+            };
+
+            let status = resp.status();
+            let retryable = status.as_u16() == 429 || status.is_server_error();
+            if !retryable || attempt + 1 >= MAX_ATTEMPTS {
+                if retryable {
+                    // Said out loud, because this is the one outcome that used
+                    // to be silently indistinguishable from "not in the
+                    // catalogue".
+                    warn!(
+                        "TIDAL still throttling after {} attempts ({}); giving up on this request",
+                        MAX_ATTEMPTS, status
+                    );
+                }
+                return read_json(resp).await;
+            }
+
+            attempt += 1;
+            let advised = advised_wait(resp.headers());
+            let wait = advised.unwrap_or_else(|| backoff(attempt));
+            // Logged at warn with the headers as the server sent them: whether
+            // TIDAL actually publishes rate-limit headers was an open question
+            // when this was written, inferred from the shape of three pushes
+            // rather than observed. One throttled push answers it.
+            warn!(
+                "TIDAL returned {} (attempt {}/{}); rate-limit headers: {:?}; waiting {:?}",
+                status,
+                attempt,
+                MAX_ATTEMPTS,
+                rate_limit_headers(resp.headers()),
+                wait
+            );
+            tokio::time::sleep(wait).await;
+        }
+    }
+}
+
+/// How many times one request may be sent before its failure is reported.
+const MAX_ATTEMPTS: u32 = 4;
+/// The longest any single wait may be, however long the server asks for. A
+/// push runs inside a request handler; see `send_with_retry`.
+const MAX_WAIT: Duration = Duration::from_secs(8);
+
+/// Exponential, with jitter. The jitter is not decoration: a push issues its
+/// searches in turn, so without it every retry after a throttle lands on the
+/// same schedule and arrives together.
+fn backoff(attempt: u32) -> Duration {
+    let base = Duration::from_millis(400 * 2u64.pow(attempt.min(5)));
+    let base = base.min(MAX_WAIT);
+    let jitter = rand::random::<u64>() % 250;
+    base + Duration::from_millis(jitter)
+}
+
+/// What the server asked us to wait, if it said.
+///
+/// `Retry-After` is seconds or an HTTP date (RFC 9110); only the seconds form is
+/// read, because the date form needs a clock agreement this is not worth having
+/// — an unparsed value falls through to the exponential ladder rather than
+/// being treated as zero.
+fn advised_wait(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
+    for name in ["retry-after", "x-ratelimit-reset-in", "x-ratelimit-reset"] {
+        if let Some(secs) = headers
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.trim().parse::<u64>().ok())
+        {
+            // A reset *timestamp* rather than a duration would be an absurd
+            // number of seconds to sleep for; treat anything past the cap as
+            // the cap and let the attempt limit end it.
+            return Some(Duration::from_secs(secs).min(MAX_WAIT));
+        }
+    }
+    None
+}
+
+/// Every rate-limit header the response carried, for the log line.
+fn rate_limit_headers(headers: &reqwest::header::HeaderMap) -> Vec<(String, String)> {
+    headers
+        .iter()
+        .filter(|(k, _)| {
+            let k = k.as_str();
+            k == "retry-after" || k.starts_with("x-ratelimit") || k.starts_with("ratelimit")
+        })
+        .map(|(k, v)| (k.as_str().to_string(), v.to_str().unwrap_or("<binary>").to_string()))
+        .collect()
 }
 
 async fn read_json(resp: reqwest::Response) -> Result<serde_json::Value, String> {
@@ -502,6 +644,79 @@ impl PlaylistTarget for TidalClient {
         }
         Ok(playlist_id)
     }
+
+    /// Empty the playlist and refill it.
+    ///
+    /// TIDAL has no "set the items to exactly this" call. `PATCH` on the items
+    /// relationship is a **reorder** — capped at 20 and taking positions in its
+    /// `meta` — so the only way to replace the contents is to remove what is
+    /// there and add the new set.
+    ///
+    /// **Removing an item needs two ids, not one.** The payload wants the
+    /// track's `id` *and* a `meta.itemId`, which is the handle for that
+    /// track's place in this playlist — the same track added twice is two
+    /// items. Those only come from reading the relationship first, which is why
+    /// this starts with a GET.
+    ///
+    /// A playlist that has been deleted on TIDAL's side answers 404, and that
+    /// is reported as **not replaced** rather than as an error: the remembered
+    /// id is simply stale, and the honest recovery is to create a new playlist
+    /// and remember that one instead.
+    async fn replace_playlist(&self, remote_id: &str, ids: &[String]) -> Result<bool, String> {
+        let country = self.creds.country_code();
+        let items_url =
+            format!("{API_BASE}/playlists/{remote_id}/relationships/items?countryCode={country}");
+
+        let existing = match self.get(&items_url).await {
+            Ok(doc) => doc,
+            // Gone, renamed, or never ours. Not a failure — the caller falls
+            // back to creating one.
+            Err(e) if e.contains("404") => {
+                debug!("TIDAL playlist {} is gone; a new one will be made", remote_id);
+                return Ok(false);
+            }
+            Err(e) => return Err(e),
+        };
+
+        let removals: Vec<serde_json::Value> = existing
+            .get("data")
+            .and_then(|d| d.as_array())
+            .into_iter()
+            .flatten()
+            .filter_map(|item| {
+                let id = item.get("id")?.as_str()?;
+                let kind = item.get("type").and_then(|t| t.as_str()).unwrap_or("tracks");
+                // Without `itemId` the removal is rejected outright, so an item
+                // that does not carry one is skipped rather than sent in a
+                // shape the API will refuse for the whole batch.
+                let item_id =
+                    item.get("meta").and_then(|m| m.get("itemId")).and_then(|v| v.as_str())?;
+                Some(serde_json::json!({
+                    "id": id,
+                    "type": kind,
+                    "meta": { "itemId": item_id }
+                }))
+            })
+            .collect();
+
+        for chunk in removals.chunks(ITEMS_PER_REQUEST) {
+            self.delete(&items_url, serde_json::json!({ "data": chunk }))
+                .await
+                .map_err(|e| format!("Could not clear the playlist before refilling it: {e}"))?;
+        }
+
+        for chunk in ids.chunks(ITEMS_PER_REQUEST) {
+            let data: Vec<_> =
+                chunk.iter().map(|id| serde_json::json!({ "id": id, "type": "tracks" })).collect();
+            self.post(&items_url, serde_json::json!({ "data": data })).await.map_err(|e| {
+                // Worse than a short new playlist: the old contents are already
+                // gone. Said plainly rather than reported as a success.
+                warn!("TIDAL playlist {} was emptied but not refilled: {}", remote_id, e);
+                format!("Emptied the playlist but could not add every track back: {e}")
+            })?;
+        }
+        Ok(true)
+    }
 }
 
 /// So a push can hold a handle for persisting refreshed tokens while also
@@ -513,6 +728,10 @@ impl PlaylistTarget for std::sync::Arc<TidalClient> {
     }
     async fn create_playlist(&self, name: &str, ids: &[String]) -> Result<String, String> {
         (**self).create_playlist(name, ids).await
+    }
+
+    async fn replace_playlist(&self, remote_id: &str, ids: &[String]) -> Result<bool, String> {
+        (**self).replace_playlist(remote_id, ids).await
     }
 }
 
@@ -535,6 +754,65 @@ pub fn urlencoding(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The server's own advice beats the guess, and an unreadable one falls
+    /// through rather than being read as "wait zero".
+    #[test]
+    fn a_throttle_is_waited_out_for_as_long_as_the_server_asks() {
+        use reqwest::header::{HeaderMap, HeaderValue};
+        let hdr = |name: &'static str, value: &str| {
+            let mut h = HeaderMap::new();
+            h.insert(name, HeaderValue::from_str(value).unwrap());
+            h
+        };
+
+        assert_eq!(advised_wait(&hdr("retry-after", "3")), Some(Duration::from_secs(3)));
+        assert_eq!(advised_wait(&hdr("x-ratelimit-reset-in", "2")), Some(Duration::from_secs(2)));
+        // Capped: this runs inside a request handler, so however long the
+        // server asks for, the push still has to answer before a proxy does.
+        assert_eq!(advised_wait(&hdr("retry-after", "600")), Some(MAX_WAIT));
+        // The HTTP-date form of Retry-After is deliberately not parsed. It must
+        // read as "no advice" and use the ladder — never as zero, which would
+        // retry instantly into the throttle that just rejected us.
+        assert_eq!(advised_wait(&hdr("retry-after", "Wed, 21 Oct 2026 07:28:00 GMT")), None);
+        assert_eq!(advised_wait(&HeaderMap::new()), None);
+    }
+
+    /// Bounded and jittered. The jitter matters because a push issues its
+    /// searches in turn: without it every retry after one throttle lands on the
+    /// same schedule and arrives together.
+    #[test]
+    fn the_backoff_grows_but_stays_inside_the_handler_budget() {
+        let one = backoff(1);
+        let three = backoff(3);
+        assert!(one >= Duration::from_millis(800) && one < Duration::from_millis(1100));
+        assert!(three > one);
+        for attempt in 1..=10 {
+            assert!(
+                backoff(attempt) <= MAX_WAIT + Duration::from_millis(250),
+                "attempt {attempt} would outlast the handler"
+            );
+        }
+        // Four attempts of at most MAX_WAIT each is the worst one request can
+        // cost, and a push is many requests — so this is what keeps the whole
+        // push inside a proxy's patience.
+        assert_eq!(MAX_ATTEMPTS, 4);
+    }
+
+    /// What the log line reports. This is the half that answers, on the next
+    /// real throttle, whether TIDAL publishes rate-limit headers at all — which
+    /// was inferred from the shape of three pushes rather than observed.
+    #[test]
+    fn every_rate_limit_header_reaches_the_log() {
+        use reqwest::header::{HeaderMap, HeaderValue};
+        let mut h = HeaderMap::new();
+        h.insert("x-ratelimit-remaining", HeaderValue::from_static("0"));
+        h.insert("retry-after", HeaderValue::from_static("5"));
+        h.insert("content-type", HeaderValue::from_static("application/json"));
+        let found = rate_limit_headers(&h);
+        assert_eq!(found.len(), 2, "only the rate-limit ones, and both of them: {found:?}");
+        assert!(found.iter().any(|(k, v)| k == "retry-after" && v == "5"));
+    }
 
     #[test]
     fn a_query_is_encoded_so_an_ampersand_cannot_truncate_it() {
