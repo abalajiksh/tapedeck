@@ -824,6 +824,78 @@ async fn backfill_languages_now(
     (StatusCode::ACCEPTED, Json(serde_json::json!({ "status": "started" }))).into_response()
 }
 
+/// GET /api/v1/mbids/status — how much of this user's history MusicBrainz has
+/// identified at recording level.
+///
+/// Three numbers, not two. `unmatched` is the distinct tracks MusicBrainz was
+/// asked about and had nothing for — real listening simply not in their
+/// database — and it is reported because without it a progress bar that stops
+/// short reads as a stall rather than as an answer.
+async fn mbid_status(State(state): State<Arc<AppState>>, user: AuthUser) -> impl IntoResponse {
+    let (total, resolved) = match state.db.recording_mbid_coverage(user.user_id).await {
+        Ok(v) => v,
+        Err(e) => return server_error(e.to_string()),
+    };
+
+    // Folded in Rust because the two halves live in **different database
+    // files**: the listens are in `DATABASE_URL`, and the MusicBrainz negative
+    // cache is in `SQLITE_DB_PATH`. A join would not merely be slow — the table
+    // is not in that database at all, and a query against it fails rather than
+    // returning nothing, which is how a first version of this reported a
+    // confident zero.
+    let unmatched = match state.db.unresolved_track_keys(user.user_id).await {
+        Ok(keys) if !keys.is_empty() => {
+            let asked = state.mb_client.negative_track_keys().await;
+            keys.into_iter().filter(|k| asked.contains(k)).count() as i64
+        }
+        _ => 0,
+    };
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "total": total,
+            "resolved": resolved,
+            "pending": total - resolved,
+            "unmatched_tracks": unmatched,
+        })),
+    )
+        .into_response()
+}
+
+/// POST /api/v1/mbids/backfill — admin: resolve missing recording MBIDs in the
+/// background.
+///
+/// This is the pass that unblocks the others: the ISRC, work-language and
+/// release-year lookups all key off a recording MBID, and an imported listen
+/// never had one because only `flush_pending` ever wrote the column.
+///
+/// Bounded per iteration rather than let loose, because every miss is a
+/// rate-limited MusicBrainz search — and it stops as soon as a pass resolves
+/// nothing, which on a history where the rest is genuinely unknown is the
+/// honest end rather than a loop.
+async fn backfill_mbids_now(
+    State(state): State<Arc<AppState>>,
+    user: AuthUser,
+) -> impl IntoResponse {
+    if !user.is_admin {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!(ErrorResponse { code: 403, error: "Admin only".into() })),
+        )
+            .into_response();
+    }
+    let (db, mb) = (state.db.clone(), state.mb_client.clone());
+    tokio::spawn(async move {
+        loop {
+            if crate::enrich::backfill_recording_mbids(&db, &mb, 50, 50).await == 0 {
+                break;
+            }
+        }
+    });
+    (StatusCode::ACCEPTED, Json(serde_json::json!({ "status": "started" }))).into_response()
+}
+
 /// GET /api/v1/artwork/status — cover-art coverage for the calling user.
 async fn artwork_status(State(state): State<Arc<AppState>>, user: AuthUser) -> impl IntoResponse {
     match state.db.artwork_coverage(user.user_id).await {
@@ -900,6 +972,8 @@ pub fn create_scrobbles_router() -> Router<Arc<AppState>> {
         .route("/api/v1/personality", get(personality))
         .route("/api/v1/languages/status", get(language_status))
         .route("/api/v1/languages/backfill", axum::routing::post(backfill_languages_now))
+        .route("/api/v1/mbids/status", get(mbid_status))
+        .route("/api/v1/mbids/backfill", axum::routing::post(backfill_mbids_now))
         .route("/api/v1/artwork/status", get(artwork_status))
         .route("/api/v1/artwork/backfill", axum::routing::post(backfill_artwork_now))
 }

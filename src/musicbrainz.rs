@@ -107,6 +107,31 @@ impl MusicBrainzClient {
     }
 
     /// Main entry point - fetches metadata with 3-tier strategy
+    /// Track/artist pairs this client has already asked about and found
+    /// nothing for, while that answer is still current.
+    ///
+    /// **Lives here because the cache does.** `musicbrainz_cache` is in the
+    /// client's own database — `SQLITE_DB_PATH`, default `./tapedeck.db` —
+    /// which is a *different file* from the listens (`DATABASE_URL`,
+    /// `scrobbles.db`). A query in `db.rs` joining `scrobbles` to this table
+    /// cannot work and does not fail loudly: the table simply is not there.
+    ///
+    /// Returned as a set for the caller to fold against its own rows, which is
+    /// the only shape a two-database question has.
+    pub async fn negative_track_keys(&self) -> std::collections::HashSet<(String, String)> {
+        let cutoff = chrono::Utc::now().timestamp() - NEGATIVE_CACHE_TTL_SECS;
+        let rows: Vec<(String, String)> = sqlx::query_as(
+            "SELECT LOWER(TRIM(track_title)), LOWER(TRIM(artist_name))
+               FROM musicbrainz_cache
+              WHERE track_mbid IS NULL AND fetched_at > ?",
+        )
+        .bind(cutoff)
+        .fetch_all(&self.sqlite_pool)
+        .await
+        .unwrap_or_default();
+        rows.into_iter().collect()
+    }
+
     pub async fn fetch_metadata(
         &self,
         track_title: &str,

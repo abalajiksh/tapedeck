@@ -1430,6 +1430,22 @@ class TapedeckAPI {
 		return this.get(`/api/v1/personality?range=${range}`);
 	}
 
+	/** How much of the history MusicBrainz has identified at recording level.
+	 *  `unmatched_tracks` are counted in `pending` and will never resolve —
+	 *  reported separately so a bar that stops short reads as an answer rather
+	 *  than a stall. */
+	async getMbidStatus(): Promise<{
+		total: number;
+		resolved: number;
+		pending: number;
+		unmatched_tracks: number;
+	}> {
+		return this.get('/api/v1/mbids/status');
+	}
+	async backfillMbids(): Promise<{ status: string }> {
+		return this.post('/api/v1/mbids/backfill');
+	}
+
 	async getArtworkStatus(): Promise<{ total: number; resolved: number; pending: number }> {
 		return this.get('/api/v1/artwork/status');
 	}

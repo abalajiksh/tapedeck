@@ -13,7 +13,9 @@
 use crate::db::Database;
 use crate::language::{script_language, DEFAULT_LANGUAGE};
 use crate::metadata::ArtworkProvider;
+use crate::models::Play;
 use crate::musicbrainz::MusicBrainzClient;
+use tracing::debug;
 
 /// Classify up to `batch` un-languaged listens, using at most `mb_budget`
 /// MusicBrainz lookups. Returns how many were classified this call. Rows that
@@ -118,6 +120,109 @@ pub async fn backfill_release_years(
 ///
 /// One resolution updates **every** listen of the same track, because a song
 /// played fifty times is fifty rows sharing one recording and one ISRC.
+/// Give imported listens a recording MBID.
+///
+/// **The gap this closes.** A recording MBID is written in one place —
+/// `pipeline::flush_pending` — and that only ever sees `status = 'pending'`
+/// listens on their way to a sink. An imported listen is `'imported'`, so it
+/// never got one, and nothing else wrote the column. On a 92%-imported history
+/// that left most of the listening with no MBID *permanently* — and every other
+/// backfill that keys off a recording (ISRC, work-language, release year) is
+/// therefore excluded from it. This is the one that unblocks the others, which
+/// is why it should run before them rather than beside them.
+///
+/// **A wrong MBID is worse than none, so a match is checked.** `fetch_metadata`
+/// searches by name with `limit=1` against a ranking MusicBrainz does not
+/// promise is stable — the trap already recorded for recording-level tags. An
+/// unchecked result would write a confident wrong id onto every play of the
+/// track and then poison the ISRC and language lookups downstream, none of
+/// which would error. So the answer has to *agree* with the question:
+/// `artist_matches` on the artist, and the same fold on the title after the
+/// trailing qualifier is stripped, since a search for "Xtal" legitimately
+/// answers "Xtal (Remastered)".
+///
+/// A miss costs nothing twice: `fetch_metadata` keeps its own negative cache,
+/// and `tracks_needing_recording_mbid` reads it so a batch is not spent on
+/// tracks that have already been asked about.
+pub async fn backfill_recording_mbids(
+    db: &Database,
+    mb: &MusicBrainzClient,
+    batch: i64,
+    mb_budget: i64,
+) -> usize {
+    // Over-fetch, then drop the ones already asked about. That filter cannot
+    // be a SQL join: `musicbrainz_cache` lives in the *client's* database
+    // (`SQLITE_DB_PATH`), not the one holding the listens, so the two sets can
+    // only meet in Rust. Without it every batch would be spent re-asking the
+    // tracks MusicBrainz has already said it does not have, and the ones it
+    // could answer would never come up.
+    let rows = match db.tracks_needing_recording_mbid(batch * 4).await {
+        Ok(r) => r,
+        Err(_) => return 0,
+    };
+    if rows.is_empty() {
+        return 0;
+    }
+    let asked = mb.negative_track_keys().await;
+    let rows: Vec<_> = rows
+        .into_iter()
+        .filter(|(t, a, _)| !asked.contains(&(t.trim().to_lowercase(), a.trim().to_lowercase())))
+        .take(batch as usize)
+        .collect();
+
+    let mut done = 0usize;
+    let mut budget = mb_budget;
+
+    for (title, artist, album) in rows {
+        if budget == 0 {
+            break;
+        }
+        budget -= 1;
+        // A carrier for the lookup, not a listen: nothing here is ever stored
+        // as a play. `enrich_play` reads the title and artist and writes the
+        // ids back onto it.
+        let mut play =
+            Play::new(title.clone(), artist.clone(), 0, String::new(), "mbid-backfill".to_string());
+        if !crate::engine::enrichment::enrich_play(mb, &mut play, album.as_deref()).await {
+            continue;
+        }
+        let Some(found) = play.mbid_recording.as_deref() else { continue };
+        if found.trim().is_empty() {
+            continue;
+        }
+        if !answers_the_question(&title, &artist, &play) {
+            debug!(
+                "MBID backfill: refused {} — {} (MusicBrainz answered a different track)",
+                artist, title
+            );
+            continue;
+        }
+        match db.set_recording_mbid_for_track(&title, &artist, &play).await {
+            Ok(n) if n > 0 => done += 1,
+            _ => {}
+        }
+    }
+    done
+}
+
+/// Does the answer describe the track that was asked about?
+///
+/// The gate is on the *names MusicBrainz returned*, which on a fresh lookup are
+/// its own canonical spellings rather than the query. `artist_matches` is the
+/// codebase's single answer to "same performer?"; the title is folded with
+/// `normalise_artist`, which is the same question asked of a different field —
+/// the reuse `playlists::pick` already makes — and the trailing qualifier is
+/// stripped because a search for "Xtal" answering "Xtal (Remastered 2008)" is
+/// the *right* recording under a longer name.
+fn answers_the_question(title: &str, artist: &str, play: &Play) -> bool {
+    if !crate::db::artist_matches(&play.artist, artist) {
+        return false;
+    }
+    let fold = |t: &str| crate::db::normalise_artist(crate::playlists::without_qualifier(t));
+    let (want, got) = (fold(title), fold(&play.title));
+    !want.is_empty() && (want == got || got.starts_with(&want) || want.starts_with(&got))
+}
+
 pub async fn backfill_isrc(
     db: &Database,
     mb: &MusicBrainzClient,
@@ -317,4 +422,54 @@ pub async fn backfill_artwork(
 
 fn caa_url(release_mbid: &str, caa_id: i64) -> String {
     format!("https://coverartarchive.org/release/{release_mbid}/{caa_id}-250.jpg")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn answered(title: &str, artist: &str) -> Play {
+        let mut p = Play::new(title.into(), artist.into(), 0, String::new(), "t".into());
+        p.mbid_recording = Some("some-mbid".into());
+        p
+    }
+
+    /// The gate on what the MBID backfill is allowed to write.
+    ///
+    /// `fetch_metadata` searches by name with `limit=1` against a ranking
+    /// MusicBrainz does not promise is stable. Accepting whatever comes back
+    /// would write a confident wrong id onto **every play** of a track and then
+    /// poison the ISRC and work-language lookups that key off it — none of
+    /// which would error. The answer has to agree with the question.
+    #[test]
+    fn a_backfilled_mbid_has_to_answer_the_question_that_was_asked() {
+        // The ordinary case.
+        assert!(answers_the_question("Xtal", "Aphex Twin", &answered("Xtal", "Aphex Twin")));
+
+        // A longer name for the same recording is the *right* answer: a search
+        // for "Xtal" legitimately comes back with the remaster.
+        assert!(answers_the_question(
+            "Xtal",
+            "Aphex Twin",
+            &answered("Xtal (Remastered 2008)", "Aphex Twin")
+        ));
+
+        // Spelling and punctuation fold, the way they do everywhere else.
+        assert!(answers_the_question(
+            "Coeur de pirate",
+            "Coeur de pirate",
+            &answered("Cœur de pirate", "Cœur de pirate")
+        ));
+
+        // A different song by the right artist is the failure that matters —
+        // it looks entirely plausible and is wrong on every play of the track.
+        assert!(!answers_the_question("Xtal", "Aphex Twin", &answered("Ageispolis", "Aphex Twin")));
+
+        // And a different artist, which is what a fuzzy search returns when it
+        // has nothing: the trap `find_artist` already documents.
+        assert!(!answers_the_question("Xtal", "Aphex Twin", &answered("Xtal", "Arkells")));
+
+        // Nothing to compare against is a refusal, not a pass.
+        assert!(!answers_the_question("", "Aphex Twin", &answered("Xtal", "Aphex Twin")));
+    }
 }

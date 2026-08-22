@@ -26,7 +26,7 @@ openapi: 3.1.0
 
 info:
   title: Tapedeck
-  version: 0.76.4
+  version: 0.77.0
   summary: Self-hosted scrobbler and listening journal.
   description: |
     Tapedeck ingests listens, enriches them with MusicBrainz metadata, stores
@@ -5808,6 +5808,65 @@ paths:
         '401': { $ref: '#/components/responses/Unauthorized' }
 
   # ── Maintenance ────────────────────────────────────────────────────────────
+  /api/v1/mbids/status:
+    get:
+      tags: [Maintenance]
+      summary: MusicBrainz recording coverage.
+      description: |
+        Session-only.
+
+        A recording MBID is written by `flush_pending` alone, which only ever
+        sees listens on their way to a sink — so an **imported** listen never got
+        one, and nothing else writes the column. On a mostly-imported history
+        that leaves most of the listening unidentified, and with it excluded from
+        every backfill that keys off a recording: ISRC, work-language, release
+        year.
+
+        `unmatched_tracks` is the reason this reports three numbers instead of
+        two. It counts distinct tracks MusicBrainz was **asked about and had
+        nothing for** — real listening simply not in their database. Without it a
+        bar that stops short reads as a stall rather than as an answer.
+      responses:
+        '200':
+          description: OK.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  total: { type: integer, description: Listens, skips excluded. }
+                  resolved: { type: integer }
+                  pending: { type: integer }
+                  unmatched_tracks:
+                    type: integer
+                    description: |
+                      Distinct tracks already looked up with no result. These are
+                      counted in `pending` and will not resolve.
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /api/v1/mbids/backfill:
+    post:
+      tags: [Maintenance]
+      summary: Resolve missing recording MBIDs now.
+      description: |
+        Session-only, **admin only**. Runs in the background; poll
+        `/api/v1/mbids/status` for progress.
+
+        This is the pass that unblocks the others, so it is worth running before
+        the ISRC or language backfills on a history that came from an import.
+
+        A name search can be wrong, and a wrong MBID is worse than none — it
+        would be written onto every play of the track and then poison the ISRC
+        and language lookups downstream, with nothing erroring. So a result is
+        only accepted when it **agrees with the question**: the artist matches,
+        and the title matches once a trailing qualifier is stripped. Misses are
+        negative-cached, so a track already asked about is not asked again while
+        that answer is current.
+      responses:
+        '202': { description: Started. }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { description: Admin only. }
+
   /api/v1/artwork/status:
     get:
       tags: [Maintenance]

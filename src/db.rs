@@ -611,6 +611,16 @@ pub struct SkipRow {
 /// 49k-listen history is about a hundred statements rather than 49,000.
 const SESSION_LINK_CHUNK: usize = 500;
 
+/// How long `musicbrainz_cache`'s "asked, nothing there" answer is trusted.
+///
+/// Mirrors `NEGATIVE_CACHE_TTL_SECS` in `musicbrainz.rs`, which is the client's
+/// own rule — this is the queue reading the same answer so it does not spend
+/// every batch on tracks the client would refuse to look up anyway. Kept as a
+/// separate constant rather than reaching across the module because it is a
+/// *policy* about the queue, and a queue that skipped for longer than the
+/// client caches would leave tracks unasked forever.
+const MB_NEGATIVE_TTL_SECS: i64 = 7 * 24 * 3600;
+
 /// How many listens one transaction of the artist-credit backfill covers.
 ///
 /// This runs at startup on an existing database, so the trade is between
@@ -5926,6 +5936,118 @@ impl Database {
             q = q.bind(k);
         }
         Ok(q.fetch_all(&self.pool).await?.into_iter().map(|(t, a, i)| ((t, a), i)).collect())
+    }
+
+    /// Distinct tracks with no recording MBID, newest first.
+    ///
+    /// **Why this queue exists at all.** A recording MBID is written in exactly
+    /// one place — `pipeline::flush_pending`, which processes `status =
+    /// 'pending'`. An **imported** listen is `status = 'imported'` and never
+    /// becomes pending, so it never reached `enrich_play` and never got one.
+    /// Nothing else in this file writes the column. On a history that is 92%
+    /// imported that left 57% of listens with no MBID *permanently*, and with
+    /// it no ISRC, no work-language and no release-year lookup — every backfill
+    /// that keys off a recording was quietly excluded from most of the history.
+    ///
+    /// Grouped by track, because a song played fifty times is fifty rows and
+    /// one answer. `album` comes along as a hint for the search, taken from one
+    /// of those rows: the same thing `flush_pending` passes.
+    ///
+    /// **Already-asked tracks are filtered by the caller, not here.** The
+    /// negative cache belongs to `MusicBrainzClient` and lives in a *different
+    /// database file* (`SQLITE_DB_PATH`, not `DATABASE_URL`), so a join to it
+    /// from this file is not merely slow — the table is not there. That is why
+    /// this over-fetches and `backfill_recording_mbids` does the filtering.
+    pub async fn tracks_needing_recording_mbid(
+        &self,
+        limit: i64,
+    ) -> Result<Vec<(String, String, Option<String>)>, sqlx::Error> {
+        sqlx::query_as(
+            "SELECT title, artist, MAX(album) FROM scrobbles
+              WHERE mbid_recording IS NULL AND skipped = FALSE
+              GROUP BY LOWER(TRIM(title)), LOWER(TRIM(artist))
+              ORDER BY MAX(timestamp) DESC
+              LIMIT ?",
+        )
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+    }
+
+    /// The distinct tracks this user has no recording MBID for.
+    ///
+    /// Folded keys, so the caller can intersect them with the MusicBrainz
+    /// client's negative cache — which is in another database and can only be
+    /// joined in Rust.
+    pub async fn unresolved_track_keys(
+        &self,
+        user_id: i64,
+    ) -> Result<Vec<(String, String)>, sqlx::Error> {
+        sqlx::query_as(
+            "SELECT LOWER(TRIM(title)), LOWER(TRIM(artist)) FROM scrobbles
+              WHERE user_id = ? AND mbid_recording IS NULL AND skipped = FALSE
+              GROUP BY 1, 2",
+        )
+        .bind(user_id)
+        .fetch_all(&self.pool)
+        .await
+    }
+
+    /// Write a resolved recording onto every listen of that track.
+    ///
+    /// Keyed on the folded name pair rather than on ids, because that is what
+    /// the lookup was made with — and it means one rate-limited request settles
+    /// all fifty plays at once. Only fills columns that are **empty**: a listen
+    /// that already carried an MBID from an import's `mbid_mapping` knows
+    /// better than a name search does.
+    pub async fn set_recording_mbid_for_track(
+        &self,
+        title: &str,
+        artist: &str,
+        play: &Play,
+    ) -> Result<u64, sqlx::Error> {
+        let artists_json =
+            play.mbid_artist.as_ref().map(|a| serde_json::to_string(a).unwrap_or_default());
+        let r = sqlx::query(
+            "UPDATE scrobbles SET
+                 mbid_recording   = COALESCE(mbid_recording, ?),
+                 mbid_release     = COALESCE(mbid_release, ?),
+                 mbid_artist      = COALESCE(mbid_artist, ?),
+                 caa_id           = COALESCE(caa_id, ?),
+                 caa_release_mbid = COALESCE(caa_release_mbid, ?)
+              WHERE mbid_recording IS NULL
+                AND LOWER(TRIM(title)) = ? AND LOWER(TRIM(artist)) = ?",
+        )
+        .bind(&play.mbid_recording)
+        .bind(&play.mbid_release)
+        .bind(&artists_json)
+        .bind(play.caa_id)
+        .bind(&play.caa_release_mbid)
+        .bind(title.trim().to_lowercase())
+        .bind(artist.trim().to_lowercase())
+        .execute(&self.pool)
+        .await?;
+        Ok(r.rows_affected())
+    }
+
+    /// How much of a history MusicBrainz has identified at recording level.
+    ///
+    /// Two numbers here. The third the readout wants — how many of the rest
+    /// have already been asked about and come back empty — needs the client's
+    /// negative cache, which is in a different database file, so it is folded
+    /// in the handler from `unresolved_track_keys` and
+    /// `MusicBrainzClient::negative_track_keys`.
+    pub async fn recording_mbid_coverage(&self, user_id: i64) -> Result<(i64, i64), sqlx::Error> {
+        sqlx::query_as(
+            "SELECT COUNT(*),
+                    COALESCE(SUM(CASE WHEN mbid_recording IS NOT NULL
+                                       AND TRIM(mbid_recording) != ''
+                                      THEN 1 ELSE 0 END), 0)
+               FROM scrobbles WHERE user_id = ? AND skipped = FALSE",
+        )
+        .bind(user_id)
+        .fetch_one(&self.pool)
+        .await
     }
 
     /// Listens with no ISRC yet.
@@ -16606,6 +16728,87 @@ mod tests {
         .unwrap();
         let rows = db.get_recent_scrobbles(1, 10, 0, None, None, None, None, None).await.unwrap();
         assert_eq!(rows[0].listened_ms, Some(1500));
+    }
+
+    /// The MBID queue asks once per track, not once per play.
+    ///
+    /// A song played fifty times is fifty rows and **one** answer, and this is
+    /// a rate-limited lookup — asking per row would spend a whole batch on one
+    /// track. Also pins that an imported listen is in the queue at all, which
+    /// is the gap this exists for: only `flush_pending` ever wrote a recording
+    /// MBID, and it never sees a listen that arrived as `'imported'`.
+    #[tokio::test]
+    async fn the_mbid_queue_asks_once_per_track_and_includes_imports() {
+        let db = testdb().await;
+        let uid = db.create_user("ash", None, "pw", "user").await.unwrap();
+        let now = Database::now_secs() as u64;
+
+        for i in 0..5 {
+            let mut p = Play::new(
+                "Xtal".into(),
+                "Aphex Twin".into(),
+                now - i * 300,
+                format!("s-{i}"),
+                "import".into(),
+            );
+            p.album = Some("Selected Ambient Works 85-92".into());
+            db.save_scrobble(
+                uid,
+                &p,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                ListenDisposition { imported: true, skipped: false },
+            )
+            .await
+            .unwrap();
+        }
+        // A track that already has one must not be queued again.
+        let mut known =
+            Play::new("Ageispolis".into(), "Aphex Twin".into(), now, "k".into(), "import".into());
+        known.mbid_recording = Some("already-known".into());
+        db.save_scrobble(
+            uid,
+            &known,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            ListenDisposition { imported: true, skipped: false },
+        )
+        .await
+        .unwrap();
+
+        let queue = db.tracks_needing_recording_mbid(50).await.unwrap();
+        assert_eq!(queue.len(), 1, "five plays of one track are one question: {queue:?}");
+        assert_eq!(queue[0].0, "Xtal");
+        assert_eq!(
+            queue[0].2.as_deref(),
+            Some("Selected Ambient Works 85-92"),
+            "album rides along as a search hint"
+        );
+
+        // Coverage counts *listens*, and the population excludes nothing but skips.
+        let (total, resolved) = db.recording_mbid_coverage(uid).await.unwrap();
+        assert_eq!((total, resolved), (6, 1));
+
+        // Resolving it once settles every play of it.
+        let mut found =
+            Play::new("Xtal".into(), "Aphex Twin".into(), now, String::new(), "mb".into());
+        found.mbid_recording = Some("the-recording".into());
+        let n = db.set_recording_mbid_for_track("Xtal", "Aphex Twin", &found).await.unwrap();
+        assert_eq!(n, 5, "one lookup, five listens");
+
+        let (total, resolved) = db.recording_mbid_coverage(uid).await.unwrap();
+        assert_eq!((total, resolved), (6, 6));
+        assert!(db.tracks_needing_recording_mbid(50).await.unwrap().is_empty());
     }
 
     /// The resolution cache, and the one rule that makes it worth having.

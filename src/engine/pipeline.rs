@@ -1327,6 +1327,15 @@ impl ScrobbleEngine {
             // cache hits are free, so the budget only bounds real API calls.
             crate::enrich::backfill_release_years(&self.db, &self.mb_client, 50, 8).await;
 
+            // **First, because everything below keys off what it produces.**
+            // A recording MBID is otherwise only ever written by
+            // `flush_pending`, which sees `status = 'pending'` listens alone —
+            // so an imported listen never got one, and the ISRC and
+            // work-language passes below it were structurally excluded from
+            // most of a mostly-imported history. Given its own budget rather
+            // than sharing, because it is the pass that unblocks the others.
+            crate::enrich::backfill_recording_mbids(&self.db, &self.mb_client, 25, 8).await;
+
             // Genres come off the same `fetch_metadata` call the two above use,
             // so on an already-enriched history this resolves entirely out of
             // the cache and spends none of its budget.

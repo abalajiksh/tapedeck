@@ -499,6 +499,35 @@
 			}, 2000);
 		} catch (e) { enriching = false; alert(String(e).replace(/^API \d+: /, '')); }
 	}
+	// MusicBrainz recordings — the pass the others key off. An imported listen
+	// never got a recording MBID, because only `flush_pending` ever wrote one.
+	let mbidStatus: {
+		total: number; resolved: number; pending: number; unmatched_tracks: number;
+	} | null = null;
+	let fetchingMbids = false;
+	let mbidPoll: ReturnType<typeof setInterval> | null = null;
+	async function loadMbidStatus() {
+		try { mbidStatus = await api.getMbidStatus(); } catch { /* optional */ }
+	}
+	async function runMbidBackfill() {
+		fetchingMbids = true;
+		try {
+			await api.backfillMbids();
+			mbidPoll = setInterval(async () => {
+				const prev = mbidStatus?.pending ?? -1;
+				await loadMbidStatus();
+				// Stops on a pass that resolved nothing, which on a history whose
+				// remainder MusicBrainz genuinely does not have is the end rather
+				// than a stall — `unmatched_tracks` is what says so on screen.
+				if (mbidStatus && (mbidStatus.pending === 0 || mbidStatus.pending === prev)) {
+					if (mbidPoll) clearInterval(mbidPoll);
+					mbidPoll = null;
+					fetchingMbids = false;
+				}
+			}, 2500);
+		} catch (e) { fetchingMbids = false; alert(String(e).replace(/^API \d+: /, '')); }
+	}
+
 	// artwork
 	let artStatus: { total: number; resolved: number; pending: number } | null = null;
 	let fetchingArt = false;
@@ -1096,6 +1125,7 @@
 		} catch { timezone = 'UTC'; }
 		try { isAdmin = (await api.me()).is_admin; } catch { /* optional */ }
 		loadProfile();
+		loadMbidStatus();
 		loadArtStatus();
 		loadSanitize();
 		loadDiscogs();
@@ -2378,6 +2408,50 @@
 				</p>
 				{#if sessionMsg}
 					<p style="font-size:13px;color:var(--td-good-fg);margin:12px 0 0;">{sessionMsg}</p>
+				{/if}
+			</div>
+
+			<!-- Above Album Art on purpose: this is the pass the others key off.
+			     The ISRC, work-language and release-year lookups all need a
+			     recording MBID, and an imported listen never had one. -->
+			<div class="panel" style="border-radius:22px;padding:24px;margin-bottom:18px;">
+				<h3 class="h-display" style="font-size:19px;margin-bottom:4px;">MusicBrainz Recordings</h3>
+				<p style="font-size:13px;color:var(--td-muted);margin:0 0 16px;max-width:66ch;">
+					Identifying a listen's <em>recording</em> is what unlocks the rest — its ISRC, the
+					language it is sung in, its release year. Listens that arrived from a scrobble
+					client got one on the way out; <strong>imported listens never did</strong>, so on a
+					history that came from an export most of it is unidentified until this runs.
+				</p>
+				{#if mbidStatus}
+					<div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;">
+						<div style="flex:1;min-width:180px;">
+							<div style="height:8px;border-radius:999px;background:var(--td-track);overflow:hidden;">
+								<div style="height:100%;width:{mbidStatus.total ? (mbidStatus.resolved / mbidStatus.total) * 100 : 0}%;background:linear-gradient(90deg,var(--td-accent-2),var(--td-accent));border-radius:999px;transition:width .4s;"></div>
+							</div>
+							<div style="font-size:12.5px;color:var(--td-muted-2);margin-top:6px;">
+								{mbidStatus.resolved} / {mbidStatus.total} listens identified
+								<!-- Said plainly, because otherwise a bar that stops short
+								     looks like a stall rather than an answer. -->
+								{#if mbidStatus.unmatched_tracks > 0}
+									· {mbidStatus.unmatched_tracks} track{mbidStatus.unmatched_tracks === 1 ? '' : 's'}
+									MusicBrainz doesn't have
+								{/if}
+							</div>
+						</div>
+						{#if isAdmin}
+							<button class="btn btn-secondary" on:click={runMbidBackfill} disabled={fetchingMbids || mbidStatus.pending === 0}>
+								{fetchingMbids ? 'Identifying…' : mbidStatus.pending === 0 ? 'All identified' : 'Identify the rest'}
+							</button>
+						{/if}
+					</div>
+					{#if fetchingMbids}
+						<p style="font-size:12px;color:var(--td-muted-3);margin:10px 0 0;">
+							One rate-limited lookup per track, so a large history takes hours rather than
+							minutes. You can leave this page — it keeps going.
+						</p>
+					{/if}
+				{:else}
+					<p style="font-size:13px;color:var(--td-muted-3);margin:0;">No status available.</p>
 				{/if}
 			</div>
 
