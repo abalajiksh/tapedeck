@@ -19,7 +19,8 @@
 		SpoolView,
 		SpoolCapture,
 		HandedSitting,
-		HandedSittingDetail
+		HandedSittingDetail,
+		SignalChain
 	} from '$lib/api';
 	import CoverArt from '$lib/components/CoverArt.svelte';
 	import ChainIcon from '$lib/components/ChainIcon.svelte';
@@ -207,6 +208,37 @@
 	// inferred from an empty capture list, which would be indistinguishable
 	// from "nothing has played yet".
 	let mySharedChains = 0;
+	// The full list, so the Decks tab can offer the switch. **One state, two
+	// places** is real rather than aspirational because this and the Signal
+	// Chains drawer both call `PUT /api/v1/patch/chains/:id/shared` — flipping
+	// it here and reloading that page shows the same answer.
+	let myChains: SignalChain[] = [];
+	let sharingChain: number | null = null;
+
+	async function setShared(chain: SignalChain, on: boolean) {
+		if (chain.shared === on) return;
+		sharingChain = chain.id;
+		try {
+			await api.setChainShared(chain.id, on);
+			myChains = myChains.map((c) => (c.id === chain.id ? { ...c, shared: on } : c));
+			mySharedChains = myChains.filter((c) => c.shared).length;
+			// What the Reel shows changes with it, so it is re-read rather than
+			// left describing the previous setting.
+			await loadReel();
+		} catch (e) {
+			alert(e instanceof Error ? e.message : 'Could not save');
+			// Re-read rather than keeping the optimistic value: what is published
+			// is not something to guess at. The same call the chains page makes.
+			try {
+				myChains = (await api.getChains()).chains;
+				mySharedChains = myChains.filter((c) => c.shared).length;
+			} catch {
+				/* leave the row as it was */
+			}
+		} finally {
+			sharingChain = null;
+		}
+	}
 
 	$: pendingCaptures = captures.filter((c) => c.state === 'pending');
 	$: openDubs = dubs.filter((d) => d.status === 'open');
@@ -358,7 +390,8 @@
 		if (tab === 'instance') void loadInstance();
 		await Promise.all([loadDecks(), loadReel(), loadSpool(), loadDubs(), loadSittings()]);
 		try {
-			mySharedChains = (await api.getChains()).chains.filter((c) => c.shared).length;
+			myChains = (await api.getChains()).chains;
+			mySharedChains = myChains.filter((c) => c.shared).length;
 		} catch {
 			/* the warning simply does not show */
 		}
@@ -1010,6 +1043,77 @@
 		<div class="panel note">Loading…</div>
 	{/if}
 {:else if tab === 'decks'}
+	<!--
+		What your deck publishes. **One state, two places**: this and the drawer
+		on Signal Chains both call `PUT /api/v1/patch/chains/:id/shared`, so
+		flipping it in either is the same flip.
+
+		The design draws a knob switch; this uses the `Private | Shared`
+		segmented pair the chains page settled on, because a switch labelled with
+		its own state is the ambiguity that pair was built to remove — and having
+		the two places disagree about how the same decision *looks* is its own
+		kind of confusing.
+	-->
+	<div class="panel publish">
+		<div class="pubhead">
+			<div>
+				<h2 class="h-display sech" style="margin:0 0 4px;">What your deck publishes</h2>
+				<p class="esub" style="margin:0;max-width:56ch;">
+					Per chain, off by default. The same switch sits in each chain's drawer on
+					<a href="/chains">Signal Chains</a> — one state, two places.
+				</p>
+			</div>
+			<span class="tag" class:tag-on={mySharedChains > 0}>
+				{mySharedChains} of {myChains.length} shared
+			</span>
+		</div>
+
+		{#if myChains.length}
+			<div class="pubgrid">
+				{#each myChains as c (c.id)}
+					<div class="pubrow">
+						<div class="ldots" title={(c.components ?? []).map((x) => x.name).join(' → ')}>
+							{#each (c.components ?? []).slice(0, 4) as st}
+								<span class="dot" style="background:{roleColour(st.type)};"></span>
+							{/each}
+						</div>
+						<div style="flex:1;min-width:0;">
+							<div class="pubname">{c.name}</div>
+							<div class="pubsub">
+								{c.total_hours >= 1
+									? `${c.total_hours.toFixed(1)}h logged`
+									: c.total_hours > 0
+										? `${Math.round(c.total_hours * 60)}min logged`
+										: 'nothing logged yet'}
+							</div>
+						</div>
+						<div class="seg pubseg" role="group" aria-label="Who hears {c.name}">
+							<button
+								class="seg-btn"
+								class:on={!c.shared}
+								aria-pressed={!c.shared}
+								disabled={sharingChain === c.id}
+								on:click={() => setShared(c, false)}
+							>Private</button>
+							<button
+								class="seg-btn"
+								class:on={c.shared}
+								aria-pressed={c.shared}
+								disabled={sharingChain === c.id}
+								on:click={() => setShared(c, true)}
+							>Shared</button>
+						</div>
+					</div>
+				{/each}
+			</div>
+		{:else}
+			<div class="esub">
+				You have no chains yet. <a href="/chains">Build one</a> — a chain is what makes a
+				listen here a Tapedeck listen rather than a sentence.
+			</div>
+		{/if}
+	</div>
+
 	<div class="grid">
 		<div>
 			<div class="secbar">
@@ -1702,6 +1806,52 @@
 		border-left: 3px solid var(--td-accent);
 		border-radius: 0 12px 12px 0;
 		padding: 9px 12px;
+	}
+
+	/* — what your deck publishes — */
+	.publish { border-radius: 24px; padding: 22px; margin-bottom: 26px; }
+	.pubhead {
+		display: flex;
+		align-items: flex-start;
+		justify-content: space-between;
+		gap: 16px;
+		flex-wrap: wrap;
+		margin-bottom: 16px;
+	}
+	.pubhead .tag { flex: none; }
+	.pubhead .tag-on {
+		background: var(--td-good-bg);
+		color: var(--td-good-fg);
+		border-color: transparent;
+	}
+	.pubgrid {
+		display: grid;
+		grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+		gap: 8px;
+	}
+	.pubrow {
+		display: flex;
+		align-items: center;
+		gap: 12px;
+		padding: 11px 14px;
+		border-radius: 16px;
+		background: var(--td-surface2);
+		min-width: 0;
+	}
+	.pubname {
+		font-size: 13.5px;
+		font-weight: 600;
+		white-space: nowrap;
+		overflow: hidden;
+		text-overflow: ellipsis;
+	}
+	.pubsub { font-size: 11.5px; color: var(--td-muted-3); }
+	.pubseg { flex: none; }
+	.pubseg .seg-btn { font-size: 12px; padding: 6px 12px; }
+	.pubseg .seg-btn:disabled { opacity: .6; cursor: default; }
+	@media (max-width: 520px) {
+		.pubrow { flex-wrap: wrap; }
+		.pubseg { margin-left: auto; }
 	}
 
 	/* — collective hours — */
