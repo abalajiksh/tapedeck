@@ -95,6 +95,7 @@ pub fn create_patch_router() -> Router<Arc<AppState>> {
         .route("/api/v1/patch/spool/:uuid/join", post(join_spool))
         .route("/api/v1/patch/spool/:uuid/end", post(end_spool))
         .route("/api/v1/patch/captures", post(settle_captures))
+        .route("/api/v1/patch/inbox-count", get(inbox_count))
         .route("/api/v1/patch/sittings", get(sittings).post(hand_over))
         .route("/api/v1/patch/sittings/:uuid", get(sitting).delete(withdraw_sitting))
         .route("/api/v1/patch/sittings/:uuid/seen", post(mark_seen))
@@ -385,10 +386,21 @@ struct SinceQuery {
 }
 
 /// `GET /api/v1/patch/artists` — artists across the decks you patched into.
-async fn artists(State(state): State<Arc<AppState>>, user: super::auth::AuthUser) -> Response {
-    match state.db.patch_artists(user.user_id, 120).await {
+///
+/// `days` bounds the window the ranking is computed over; absent is all time.
+/// Server-side because the query cuts to the top N by plays, so narrowing in
+/// the browser would rank a week among artists chosen by their all-time totals
+/// — a list that looks right and is not.
+async fn artists(
+    State(state): State<Arc<AppState>>,
+    user: super::auth::AuthUser,
+    Query(q): Query<SinceQuery>,
+) -> Response {
+    let since = q.days.filter(|d| *d > 0).map(|d| chrono::Utc::now().timestamp() - d * 86_400);
+    match state.db.patch_artists(user.user_id, 120, since).await {
         Ok(artists) => {
-            (StatusCode::OK, Json(serde_json::json!({ "artists": artists }))).into_response()
+            (StatusCode::OK, Json(serde_json::json!({ "artists": artists, "days": q.days })))
+                .into_response()
         }
         Err(e) => {
             warn!("📡 patch artists: {e}");
@@ -612,6 +624,24 @@ struct HandOverBody {
     /// record, so guessing from an absent field is the one thing this must not
     /// do — the rule `bulk-chain` learned the expensive way.
     kind: Option<String>,
+}
+
+/// `GET /api/v1/patch/inbox-count` — one number, for the sidebar badge.
+///
+/// Its own endpoint rather than the sidebar assembling the four lists: that
+/// would be four requests on every page load, for a number, against a pool of
+/// five connections.
+async fn inbox_count(State(state): State<Arc<AppState>>, user: super::auth::AuthUser) -> Response {
+    match state.db.patch_inbox_count(user.user_id).await {
+        Ok(n) => (StatusCode::OK, Json(serde_json::json!({ "waiting": n }))).into_response(),
+        Err(e) => {
+            warn!("📡 inbox count: {e}");
+            // Zero rather than an error: a badge is decoration, and a page that
+            // cannot render its sidebar because a count failed is worse than a
+            // page with no badge on it.
+            (StatusCode::OK, Json(serde_json::json!({ "waiting": 0 }))).into_response()
+        }
+    }
 }
 
 /// `GET /api/v1/patch/sittings` — sittings other people have handed you.

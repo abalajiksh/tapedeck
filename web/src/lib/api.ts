@@ -378,6 +378,12 @@ export interface PatchArtist {
 	decks: number;
 	who: string | null;
 	last_played: number | null;
+	/** When they first appeared in the shared history — what "newest arrival"
+	 *  sorts on. */
+	first_played: number | null;
+	/** Their own tag, from the cache the genre map fills. Null for anyone
+	 *  MusicBrainz has not tagged — a normal state, drawn as nothing. */
+	genre: string | null;
 	/** Your own plays. **The overlap is which artists, never a score.** */
 	mine: number;
 }
@@ -1818,8 +1824,12 @@ class TapedeckAPI {
 		return this.request('PUT', `/api/v1/patch/chains/${chainId}/shared`, { shared });
 	}
 
-	async getPatchArtists(): Promise<{ artists: PatchArtist[] }> {
-		return this.get('/api/v1/patch/artists');
+	/** `days` bounds the window the ranking is computed over — omit for all
+	 *  time. Server-side, because the query cuts to the top N by plays and
+	 *  narrowing here would rank a week among artists chosen on all-time
+	 *  totals. */
+	async getPatchArtists(days?: number): Promise<{ artists: PatchArtist[] }> {
+		return this.get(`/api/v1/patch/artists${days ? `?days=${days}` : ''}`);
 	}
 
 	async getPatchDiscover(): Promise<{ decks: DiscoverDeck[] }> {
@@ -1869,6 +1879,13 @@ class TapedeckAPI {
 		return this.request('POST', `/api/v1/patch/spool/${encodeURIComponent(uuid)}/join`, {
 			accept
 		});
+	}
+
+	/** One number for the sidebar badge — see the endpoint's note on why it is
+	 *  not four requests. Never throws in practice: the server answers 0 rather
+	 *  than an error, because a badge is decoration. */
+	async getPatchInboxCount(): Promise<{ waiting: number }> {
+		return this.get('/api/v1/patch/inbox-count');
 	}
 
 	async getSittings(): Promise<{ sittings: HandedSitting[] }> {

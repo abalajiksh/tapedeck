@@ -26,7 +26,7 @@ openapi: 3.1.0
 
 info:
   title: Tapedeck
-  version: 0.84.1
+  version: 0.85.0
   summary: Self-hosted scrobbler and listening journal.
   description: |
     Tapedeck ingests listens, enriches them with MusicBrainz metadata, stores
@@ -2865,10 +2865,21 @@ paths:
         `mine` is your own plays of that artist: **the overlap is reported as
         which artists, never as a similarity score.** A score invites a ranking
         of people, which is not what this is for.
+
+        `days` bounds the window the ranking is computed over; absent is all
+        time. **Server-side on purpose**: the query cuts to the top N by plays,
+        so narrowing in the client would rank a week among artists chosen on
+        their all-time totals — a list that looks right and is not.
+
+        `genre` is the artist's own first tag from the cache the genre map
+        fills, and is null for anyone MusicBrainz has not tagged. `first_played`
+        is when they first appeared in the shared history.
       security: [{ sessionCookie: [] }]
+      parameters:
+        - { name: days, in: query, schema: { type: integer }, description: Days back to rank over. Omit for all time. }
       responses:
         '200':
-          description: Artists with plays, decks, who, and your own overlap.
+          description: Artists with plays, decks, who, genre, and your own overlap.
           content:
             application/json:
               schema: { type: object, additionalProperties: true }
@@ -3013,6 +3024,34 @@ paths:
           content:
             application/json:
               schema: { type: object, additionalProperties: true }
+        '401': { description: Not signed in. }
+
+  /api/v1/patch/inbox-count:
+    get:
+      tags: [Patch]
+      summary: How many things are waiting on you in Patch.
+      description: |
+        One number, for the sidebar badge: patches awaiting a yes, unsettled
+        Shared Spool captures, open dubs, and sittings passed to you but not
+        opened.
+
+        Its own endpoint rather than the sidebar assembling the four lists —
+        that would be four requests on every page load, for a number, against a
+        pool of five connections.
+
+        **Answers `0` rather than an error** if the count cannot be read. A
+        badge is decoration, and a page that fails to render its sidebar
+        because a count failed is worse than one with no badge on it.
+      security: [{ sessionCookie: [] }]
+      responses:
+        '200':
+          description: The count.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  waiting: { type: integer }
         '401': { description: Not signed in. }
 
   /api/v1/patch/sittings:

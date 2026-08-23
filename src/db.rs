@@ -13911,29 +13911,58 @@ impl Database {
     ///
     /// **Two bounded scans folded in Rust**, not a subquery per artist. See
     /// `my_artist_plays` for why, and what the other shape cost.
+    /// `since` bounds the window the ranking is computed over — `None` is all
+    /// time. It has to be a *server* parameter rather than a filter applied to
+    /// what came back: the query returns the top `limit` by plays, so narrowing
+    /// afterwards would rank the last 7 days among artists chosen by their
+    /// all-time totals.
     pub async fn patch_artists(
         &self,
         user_id: i64,
         limit: i64,
+        since: Option<i64>,
     ) -> Result<Vec<PatchArtist>, sqlx::Error> {
         let mut artists: Vec<PatchArtist> = sqlx::query_as(&format!(
             "SELECT s.artist AS name, COUNT(*) AS plays, \
                     COUNT(DISTINCT s.user_id) AS decks, \
                     GROUP_CONCAT(DISTINCT u.username) AS who, \
-                    MAX(s.timestamp) AS last_played, 0 AS mine \
-               {} \
+                    MAX(s.timestamp) AS last_played, \
+                    MIN(s.timestamp) AS first_played, 0 AS mine, \
+                    NULL AS genre \
+               {} AND (?2 IS NULL OR s.timestamp >= ?2) \
             GROUP BY LOWER(TRIM(s.artist)) \
-            ORDER BY plays DESC LIMIT ?",
+            ORDER BY plays DESC LIMIT ?3",
             Self::SHARED_LISTENS
         ))
         .bind(user_id)
+        .bind(since)
         .bind(limit)
         .fetch_all(&self.pool)
         .await?;
 
         let mine = self.my_artist_plays(user_id).await?;
+        // One grouped read for every genre, folded in Rust — never a lookup per
+        // card, which is the quadratic this codebase keeps finding. `artists`
+        // is the tag cache the genre map already fills, so this costs nothing
+        // beyond the scan.
+        let mut genres: HashMap<String, String> = HashMap::new();
+        let rows: Vec<(String, Option<String>)> =
+            sqlx::query_as("SELECT name, genres FROM artists WHERE genres IS NOT NULL")
+                .fetch_all(&self.pool)
+                .await?;
+        for (name, raw) in rows {
+            if let Some(first) = raw
+                .as_deref()
+                .and_then(|r| serde_json::from_str::<Vec<String>>(r).ok())
+                .and_then(|v| v.into_iter().next())
+            {
+                genres.insert(name.trim().to_lowercase(), first);
+            }
+        }
         for a in &mut artists {
-            a.mine = mine.get(&a.name.trim().to_lowercase()).copied().unwrap_or(0);
+            let key = a.name.trim().to_lowercase();
+            a.mine = mine.get(&key).copied().unwrap_or(0);
+            a.genre = genres.get(&key).cloned();
         }
         Ok(artists)
     }
@@ -14148,7 +14177,8 @@ impl Database {
             "SELECT s.artist AS name, COUNT(*) AS plays, \
                     COUNT(DISTINCT s.user_id) AS decks, \
                     GROUP_CONCAT(DISTINCT (SELECT username FROM users WHERE id = s.user_id)) AS who, \
-                    MAX(s.timestamp) AS last_played, 0 AS mine \
+                    MAX(s.timestamp) AS last_played, \
+                    MIN(s.timestamp) AS first_played, 0 AS mine, NULL AS genre \
                {SHARED} AND s.timestamp >= ? \
             GROUP BY LOWER(TRIM(s.artist)) ORDER BY plays DESC LIMIT 8"
         ))
@@ -14765,6 +14795,33 @@ impl Database {
             .execute(&self.pool)
             .await?;
         Ok(res.rows_affected() > 0)
+    }
+
+    /// How many things are waiting on this person in Patch.
+    ///
+    /// **One round trip**, because the sidebar asks on every page and four
+    /// requests for one number would be four connections out of a pool of
+    /// five. The Patch page itself derives the same number from the four lists
+    /// it has already loaded rather than calling this — two readers, one
+    /// meaning, and the page's version is free where the sidebar's cannot be.
+    ///
+    /// Each term is the same population its own screen shows: a patch waiting
+    /// on a yes, a capture nobody has settled, a dub still open, and a sitting
+    /// passed on but not yet opened.
+    pub async fn patch_inbox_count(&self, user_id: i64) -> Result<i64, sqlx::Error> {
+        sqlx::query_scalar(
+            "SELECT (SELECT COUNT(*) FROM patches
+                      WHERE target_user_id = ?1 AND state = 'pending')
+                  + (SELECT COUNT(*) FROM spool_captures
+                      WHERE user_id = ?1 AND state = 'pending')
+                  + (SELECT COUNT(*) FROM recommendations
+                      WHERE user_id = ?1 AND from_user_id IS NOT NULL AND status = 'open')
+                  + (SELECT COUNT(*) FROM shared_sessions
+                      WHERE to_user_id = ?1 AND seen_at IS NULL)",
+        )
+        .bind(user_id)
+        .fetch_one(&self.pool)
+        .await
     }
 
     /// Sittings handed to this person, newest first.
@@ -15426,10 +15483,18 @@ pub struct PatchArtist {
     /// Comma-joined usernames, for the little avatar stack on the card.
     pub who: Option<String>,
     pub last_played: Option<i64>,
+    /// When this artist first appeared in the shared history — what "newest
+    /// arrival" sorts on.
+    pub first_played: Option<i64>,
     /// **The reader's own plays of this artist — the overlap.** Shown as
     /// *which artists* rather than as a similarity score: a score invites a
     /// ranking of people, which is not what this is for.
     pub mine: i64,
+    /// The artist's own tags, from `artists.genres` — the same cache the genre
+    /// map reads, so this costs no lookup. Absent for anyone MusicBrainz has
+    /// not tagged, which is a normal state and draws nothing rather than a
+    /// placeholder.
+    pub genre: Option<String>,
 }
 
 /// One chain a deck publishes.
@@ -20736,7 +20801,7 @@ mod tests {
         // My own history — never published, only counted as overlap.
         listen(&db, me, None, "Risingson", "Massive Attack", 1_760_000_400).await;
 
-        let artists = db.patch_artists(me, 20).await.unwrap();
+        let artists = db.patch_artists(me, 20, None).await.unwrap();
         let ma = artists.iter().find(|a| a.name == "Massive Attack").expect("massive attack");
         assert_eq!(ma.plays, 2, "their plays through a shared chain");
         assert_eq!(ma.mine, 1, "and mine, which is the overlap");
@@ -20791,7 +20856,7 @@ mod tests {
         .unwrap();
 
         let names: Vec<String> =
-            db.patch_artists(me, 50).await.unwrap().into_iter().map(|a| a.name).collect();
+            db.patch_artists(me, 50, None).await.unwrap().into_iter().map(|a| a.name).collect();
         assert_eq!(names, ["Public Artist"], "artists tab");
 
         let deck = db.deck_view(me, "kim").await.unwrap().expect("the deck");
@@ -21804,7 +21869,7 @@ mod tests {
         // Mine, spelled differently — the fold is the point.
         listen(&db, me, None, "Risingson", "  massive attack ", 1_760_000_300).await;
 
-        let artists = db.patch_artists(me, 50).await.unwrap();
+        let artists = db.patch_artists(me, 50, None).await.unwrap();
         let ma = artists.iter().find(|a| a.name == "Massive Attack").expect("massive attack");
         assert_eq!(ma.mine, 1, "case and spacing must not stop the overlap being found");
         assert_eq!(artists.iter().find(|a| a.name == "Neu!").unwrap().mine, 0);

@@ -24,6 +24,7 @@
 	import CoverArt from '$lib/components/CoverArt.svelte';
 	import ChainIcon from '$lib/components/ChainIcon.svelte';
 	import { syncUrl } from '$lib/url';
+	import { openArtist } from '$lib/entities';
 
 	type Tab = 'reel' | 'artists' | 'decks' | 'discover' | 'instance' | 'inbox';
 	let tab: Tab = 'reel';
@@ -52,6 +53,65 @@
 	// makes about its dozen sections.
 	let artists: PatchArtist[] = [];
 	let artistsLoaded = false;
+	type ArtistSort = 'plays' | 'az' | 'new' | 'cold' | 'common';
+	let artistSort: ArtistSort = 'plays';
+	/** Null is all time. */
+	let artistDays: number | null = 30;
+	const SORTS: { key: ArtistSort; label: string }[] = [
+		{ key: 'plays', label: 'Most played' },
+		{ key: 'az', label: 'A – Z' },
+		{ key: 'new', label: 'Newest arrival' },
+		{ key: 'cold', label: 'Cold storage' },
+		{ key: 'common', label: 'In common' }
+	];
+	const RANGES: { days: number | null; label: string }[] = [
+		{ days: 7, label: '7 days' },
+		{ days: 30, label: '30 days' },
+		{ days: 365, label: '12 months' },
+		{ days: null, label: 'All time' }
+	];
+	const RANGE_LABEL: Record<number, string> = {
+		7: 'Ranked by plays in the last 7 days.',
+		30: 'Ranked by plays in the last 30 days.',
+		365: 'Ranked by plays in the last 12 months.',
+		0: 'Ranked by plays, all time.'
+	};
+
+	// Reordering a set already in hand — see the note in the markup for why the
+	// range is a server parameter and this is not.
+	$: sortedArtists = (() => {
+		const a = [...artists];
+		switch (artistSort) {
+			case 'az':
+				return a.sort((x, y) => x.name.localeCompare(y.name));
+			case 'new':
+				return a.sort((x, y) => (y.first_played ?? 0) - (x.first_played ?? 0));
+			// Longest since anybody played them. Nulls sort as "never", which is
+			// the coldest thing there is.
+			case 'cold':
+				return a.sort((x, y) => (x.last_played ?? 0) - (y.last_played ?? 0));
+			// Artists you both play, the ones you don't dropped rather than
+			// merely sorted down — "in common" is a filter, not an ordering.
+			case 'common':
+				return a.filter((x) => x.mine > 0).sort((x, y) => y.mine - x.mine);
+			default:
+				return a.sort((x, y) => y.plays - x.plays);
+		}
+	})();
+
+	async function setArtistDays(days: number | null) {
+		artistDays = days;
+		await loadArtists();
+	}
+
+	/** A stable colour per artist, so a card is recognisable without a picture.
+	 *  Hue from the name, not from anything about the music — it is an aid to
+	 *  finding the card again, and must not read as a claim about a genre. */
+	function artistTint(name: string, solid = false): string {
+		let h = 0;
+		for (let i = 0; i < name.length; i++) h = (h * 31 + name.charCodeAt(i)) % 360;
+		return solid ? `hsl(${h} 42% 52%)` : `hsl(${h} 34% 26%)`;
+	}
 	let discoverDecks: DiscoverDeck[] = [];
 	let discoverLoaded = false;
 	let pulse: InstancePulse | null = null;
@@ -135,7 +195,7 @@
 	async function loadArtists() {
 		artistsLoaded = true;
 		try {
-			artists = (await api.getPatchArtists()).artists;
+			artists = (await api.getPatchArtists(artistDays ?? undefined)).artists;
 		} catch (e) {
 			error = e instanceof Error ? e.message : 'Could not load';
 		}
@@ -652,28 +712,73 @@
 		to private. <a href="/chains">Choose what your deck publishes</a>.
 	</p>
 {:else if tab === 'artists'}
-	<h2 class="h-display sech">Artists</h2>
+	<div class="secbar">
+		<h2 class="h-display sech">Artists</h2>
+		<span class="seccount">{artists.length}</span>
+		<span style="flex:1;"></span>
+		<span class="rankedby">{RANGE_LABEL[artistDays ?? 0]}</span>
+	</div>
 	<p class="sub">
 		Across the decks you've patched into, from the chains they share. The number beside a card
 		is <strong>your own plays</strong> — the overlap is shown as which artists, never as a
 		score.
 	</p>
+
+	<!--
+		Sort is client-side and the range is not, and the asymmetry is the point:
+		the range decides *which* artists come back (the query cuts to the top N
+		by plays), so narrowing here would rank a week among artists chosen on
+		all-time totals. Reordering a set already in hand is free and exact.
+	-->
+	<div class="chiprow">
+		{#each SORTS as srt}
+			<button class="chip" class:on={artistSort === srt.key} on:click={() => (artistSort = srt.key)}>
+				{srt.label}
+			</button>
+		{/each}
+	</div>
+	<div class="seg rangeseg">
+		{#each RANGES as r}
+			<button class="seg-btn" class:on={artistDays === r.days} on:click={() => setArtistDays(r.days)}>
+				{r.label}
+			</button>
+		{/each}
+	</div>
+
 	{#if artists.length}
 		<div class="agrid">
-			{#each artists as a (a.name)}
-				<div class="acard" class:both={a.mine > 0}>
+			{#each sortedArtists as a (a.name)}
+				<!--
+					A card is a link now. "I cannot click the artist to see the
+					stats" — and it went nowhere because it was a `<div>`. Through
+					`openArtist`, never a bare href: the row knows a name and the
+					entity may not exist yet, so it resolves first.
+				-->
+				<button
+					class="acard"
+					class:both={a.mine > 0}
+					on:click={() => openArtist(a.name)}
+					aria-label="Open {a.name}"
+				>
 					<div class="atop">
-						<span class="amono">{a.name.slice(0, 2).toUpperCase()}</span>
-						<span class="aname">{a.name}</span>
+						<span class="amono" style="background:{artistTint(a.name)};">{a.name.slice(0, 2).toUpperCase()}</span>
+						<div style="min-width:0;flex:1;">
+							<div class="aname">{a.name}</div>
+							{#if a.genre}<div class="agenre">{a.genre}</div>{/if}
+						</div>
 					</div>
 					<div class="abar">
-						<div style="width:{Math.min(100, (a.plays / (artists[0]?.plays || 1)) * 100)}%"></div>
+						<div style="width:{Math.min(100, (a.plays / (sortedArtists[0]?.plays || 1)) * 100)}%;background:{artistTint(a.name, true)};"></div>
 					</div>
 					<div class="ameta">
-						<span>{a.plays} there{#if a.mine} · {a.mine} yours{/if}</span>
-						<span class="awho">{(a.who ?? '').split(',').slice(0, 3).join(' ')}</span>
+						<span>{a.plays} play{a.plays === 1 ? '' : 's'}{#if a.mine} · {a.mine} yours{/if}</span>
+						<span class="awho">
+							{#each (a.who ?? '').split(',').filter(Boolean).slice(0, 3) as w}
+								<span class="wchip" title={w}>{w.slice(0, 2).toUpperCase()}</span>
+							{/each}
+						</span>
 					</div>
-				</div>
+				</button>
 			{/each}
 		</div>
 	{:else}
@@ -1578,20 +1683,71 @@
 		grid-template-columns: repeat(auto-fill, minmax(210px, 1fr));
 		gap: 12px;
 	}
+	/* A button now, so it needs the reset a `div` did not: buttons inherit
+	   neither the page font nor its colour, and centre their text. */
 	.acard {
 		background: var(--td-surface);
 		border: 1px solid var(--td-border);
 		border-radius: 18px;
 		padding: 14px 16px;
+		width: 100%;
+		text-align: left;
+		font-family: inherit;
+		color: var(--td-text);
+		cursor: pointer;
+		transition: border-color .12s ease, transform .12s ease;
+	}
+	.acard:hover { border-color: var(--td-muted-3); transform: translateY(-1px); }
+	@media (prefers-reduced-motion: reduce) {
+		.acard { transition: none; }
+		.acard:hover { transform: none; }
+	}
+	.agenre {
+		font-size: 12px;
+		color: var(--td-muted-2);
+		white-space: nowrap;
+		overflow: hidden;
+		text-overflow: ellipsis;
+		margin-top: 1px;
+	}
+	.rankedby { font-size: 12.5px; color: var(--td-muted-2); }
+	.chiprow { display: flex; gap: 8px; flex-wrap: wrap; margin: 4px 0 10px; }
+	.chip {
+		border: 1.5px solid var(--td-border);
+		background: transparent;
+		color: var(--td-text);
+		font-family: inherit;
+		font-size: 13px;
+		padding: 7px 15px;
+		border-radius: 999px;
+		cursor: pointer;
+	}
+	.chip:hover { border-color: var(--td-muted-3); }
+	.chip.on {
+		border-color: var(--td-accent);
+		background: color-mix(in srgb, var(--td-accent) 12%, transparent);
+	}
+	.rangeseg { margin-bottom: 18px; }
+	/* Which decks play them, as initials rather than a run of usernames. */
+	.wchip {
+		display: inline-flex;
+		align-items: center;
+		justify-content: center;
+		width: 20px;
+		height: 20px;
+		border-radius: 50%;
+		background: var(--td-surface2);
+		color: var(--td-muted-2);
+		font: 700 9.5px ui-monospace, SFMono-Regular, Menlo, monospace;
+		margin-left: 3px;
 	}
 	.acard.both { border-color: color-mix(in srgb, var(--td-accent-2) 42%, transparent); }
 	.atop { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; min-width: 0; }
 	.amono {
-		width: 32px;
-		height: 32px;
-		border-radius: 10px;
-		background: var(--td-surface2);
-		color: var(--td-muted-2);
+		width: 38px;
+		height: 38px;
+		border-radius: 12px;
+		color: #f4e7cf;
 		display: flex;
 		align-items: center;
 		justify-content: center;

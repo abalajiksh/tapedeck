@@ -34,7 +34,7 @@
 		{ href: '/shelf', label: 'The Shelf', icon: 'shelf' },
 		{ href: '/crate', label: 'The Crate', icon: 'crate' },
 		{ href: '/rediscover', label: 'Rediscovery', icon: 'rediscover' },
-		{ href: '/patch', label: 'Patch', icon: 'patch' },
+		{ href: '/patch', label: 'Patch', icon: 'patch', badge: 'patch' },
 		{ href: '/playlists/saved', label: 'Playlists', icon: 'playlists' },
 		{ href: '/playlists', label: 'Playlist Lab', icon: 'playlists' },
 		{ href: '/map', label: 'Genre Map', icon: 'map' },
@@ -43,7 +43,25 @@
 		{ href: '/settings', label: 'Settings', icon: 'settings' }
 	];
 
+	// What is waiting on you in Patch. One request, refreshed when the tab comes
+	// back and when you navigate — a poll would be a request per interval on
+	// every page for a number that changes when somebody else does something.
+	let patchWaiting = 0;
+	async function refreshPatchBadge() {
+		try {
+			patchWaiting = (await api.getPatchInboxCount()).waiting;
+		} catch {
+			/* a badge is decoration; a failure simply leaves it off */
+		}
+	}
+
 	$: current = $page.url.pathname;
+	// Re-read on navigation and on focus. Settling something in the inbox is the
+	// moment the badge is most obviously stale, and leaving the Patch page is
+	// what follows it — so the two triggers between them cover it without a
+	// timer running on every screen. Guarded on `state` so it does not fire
+	// before the session is known.
+	$: if (state === 'authenticated' && current) void refreshPatchBadge();
 	function isActive(href: string) {
 		if (href === '/') return current === '/';
 		// Match on a segment boundary, and let a more specific entry win. Adding
@@ -72,6 +90,11 @@
 		// The sidebar card polls alongside whatever the page does; the store
 		// reference-counts so this and the dashboard share one request.
 		const stopDeck = watchNowPlaying();
+		const onFocus = () => {
+			if (!document.hidden && state === 'authenticated') void refreshPatchBadge();
+		};
+		document.addEventListener('visibilitychange', onFocus);
+		window.addEventListener('focus', onFocus);
 
 		(async () => {
 			try {
@@ -88,6 +111,7 @@
 				} catch { /* footer just shows the UI version */ }
 
 				initPrefs();
+				void refreshPatchBadge();
 
 				// Record the browser timezone once, so analytics use local time.
 				try {
@@ -103,7 +127,14 @@
 			}
 		})();
 
-		return stopDeck;
+		// Both listeners cleared with the deck watcher. `onMount` here is
+		// synchronous, so returning a teardown really works — unlike the async
+		// one on the Patch page, which had to use `onDestroy`.
+		return () => {
+			stopDeck();
+			document.removeEventListener('visibilitychange', onFocus);
+			window.removeEventListener('focus', onFocus);
+		};
 	});
 </script>
 
@@ -184,6 +215,9 @@
 						{:else}<svg viewBox="0 0 24 24" width="20" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><line x1="4" y1="8" x2="20" y2="8"/><circle cx="15" cy="8" r="2.4" fill="var(--td-sidebar)"/><line x1="4" y1="16" x2="20" y2="16"/><circle cx="9" cy="16" r="2.4" fill="var(--td-sidebar)"/></svg>
 						{/if}
 						{item.label}
+						{#if item.badge === 'patch' && patchWaiting > 0}
+							<span class="navbadge" aria-label="{patchWaiting} waiting on you">{patchWaiting}</span>
+						{/if}
 					</a>
 				{/each}
 				{#if isAdmin}
@@ -270,6 +304,25 @@
 	.nav-scroll:hover::-webkit-scrollbar-thumb {
 		background: var(--td-track);
 		background-clip: content-box;
+	}
+
+	/* Pushed to the end of the row rather than sitting after the word: the nav
+	   is a column of varying label lengths, so a badge that follows the text
+	   lands at a different x on every line. */
+	.navbadge {
+		margin-left: auto;
+		flex: none;
+		min-width: 20px;
+		height: 20px;
+		padding: 0 6px;
+		border-radius: 999px;
+		background: var(--td-accent);
+		color: #fbf5ea;
+		font-size: 11.5px;
+		font-weight: 700;
+		line-height: 20px;
+		text-align: center;
+		font-variant-numeric: tabular-nums;
 	}
 
 	.navlink {
