@@ -480,6 +480,20 @@ export interface SpoolView {
 	captured: number;
 }
 
+/** A deck on this instance that plays a given artist. */
+export interface ArtistDeck {
+	user_id: number;
+	username: string;
+	display_name: string | null;
+	avatar_url: string | null;
+	actor_uri: string | null;
+	/** Their plays, **through shared chains only**. */
+	plays: number;
+	/** Whether you already have an accepted patch, either direction — which
+	 *  decides whether their deck can be opened or has to be asked for. */
+	patched: boolean;
+}
+
 /** A deck you're patched into, playing something right now.
  *
  *  Gated by exactly the rule the Reel uses — an accepted patch and a **shared
@@ -1920,6 +1934,18 @@ class TapedeckAPI {
 	/** One number for the sidebar badge — see the endpoint's note on why it is
 	 *  not four requests. Never throws in practice: the server answers 0 rather
 	 *  than an error, because a badge is decoration. */
+	/** Who else on this instance plays an artist, and which of your own chains
+	 *  you hear them on.
+	 *
+	 *  Instance-wide rather than narrowed by your patches — the same reversal
+	 *  the Instance tab makes, on the same reasoning: the per-chain switch is
+	 *  the consent, and switching it on is giving it. */
+	async getPatchArtistContext(
+		name: string
+	): Promise<{ decks: ArtistDeck[]; chains: { name: string; plays: number }[] }> {
+		return this.get(`/api/v1/patch/artist?name=${encodeURIComponent(name)}`);
+	}
+
 	/** Decks playing right now — accepted patch, shared chain. */
 	async getPatchLive(): Promise<{ live: LiveDeck[] }> {
 		return this.get('/api/v1/patch/live');

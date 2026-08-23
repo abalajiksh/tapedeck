@@ -85,6 +85,21 @@ pub struct ScrobbleRecord {
     pub delivered_sinks: Option<String>,
 }
 
+/// A deck on this instance that plays a given artist.
+#[derive(Debug, FromRow, serde::Serialize)]
+pub struct ArtistDeck {
+    pub user_id: i64,
+    pub username: String,
+    pub display_name: Option<String>,
+    pub avatar_url: Option<String>,
+    pub actor_uri: Option<String>,
+    /// Their plays of this artist, through shared chains only.
+    pub plays: i64,
+    /// Whether you already have an accepted patch with them, either direction.
+    /// Decides whether their deck can be opened or has to be asked for.
+    pub patched: bool,
+}
+
 /// A deck you are patched into, without any of its listening.
 #[derive(Debug, FromRow, serde::Serialize)]
 pub struct DeckPeer {
@@ -14877,6 +14892,69 @@ impl Database {
         Ok(res.rows_affected() > 0)
     }
 
+    /// Who else on this instance plays a given artist, and which of your own
+    /// chains you hear them on.
+    ///
+    /// **Instance-wide rather than narrowed by your patches**, the same
+    /// deliberate reversal the Instance tab makes and for the same reason: the
+    /// rule that stops a deck exposing somebody's listening without consent is
+    /// the per-chain switch, and switching it on *is* that consent. Shared
+    /// chains only, and it stays inside the instance.
+    ///
+    /// `patched` says whether you already have an accepted patch with them, so
+    /// the screen can offer to open their deck or to ask — rather than a button
+    /// that 404s, since `deck_view` needs a patch.
+    ///
+    /// Two grouped scans, never a lookup per row: the folded artist key is a
+    /// function of a column and can never be indexed, which is the quadratic
+    /// this codebase keeps finding.
+    pub async fn patch_artist_context(
+        &self,
+        user_id: i64,
+        artist: &str,
+    ) -> Result<(Vec<ArtistDeck>, Vec<ChainTally>), sqlx::Error> {
+        let key = artist.trim().to_lowercase();
+
+        let decks: Vec<ArtistDeck> = sqlx::query_as(
+            "SELECT u.id AS user_id, u.username, u.display_name, u.avatar_url,
+                    a.uri AS actor_uri, COUNT(*) AS plays,
+                    EXISTS (SELECT 1 FROM patches p
+                             WHERE p.state = 'accepted'
+                               AND ((p.follower_user_id = ?1 AND p.target_user_id = u.id)
+                                 OR (p.follower_user_id = u.id AND p.target_user_id = ?1)))
+                      AS patched
+               FROM scrobbles s
+               JOIN signal_chains c ON c.id = s.chain_id AND c.shared = 1
+               JOIN users u ON u.id = s.user_id
+               LEFT JOIN actors a ON a.user_id = u.id
+              WHERE s.skipped = FALSE
+                AND LOWER(TRIM(s.artist)) = ?2
+                AND s.user_id <> ?1
+                AND u.disabled = 0
+              GROUP BY u.id ORDER BY plays DESC LIMIT 12",
+        )
+        .bind(user_id)
+        .bind(&key)
+        .fetch_all(&self.pool)
+        .await?;
+
+        // **Your own** chains for this artist — no sharing question, it is your
+        // listening. Not filtered on `shared`: what you heard them on is a fact
+        // about your setup rather than a publication.
+        let chains: Vec<(String, i64)> = sqlx::query_as(
+            "SELECT c.name, COUNT(*) AS plays
+               FROM scrobbles s JOIN signal_chains c ON c.id = s.chain_id
+              WHERE s.user_id = ? AND s.skipped = FALSE AND LOWER(TRIM(s.artist)) = ?
+              GROUP BY c.id ORDER BY plays DESC LIMIT 6",
+        )
+        .bind(user_id)
+        .bind(&key)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok((decks, chains.into_iter().map(|(name, plays)| ChainTally { name, plays }).collect()))
+    }
+
     /// The decks this person has an accepted patch into.
     ///
     /// Just the people — no listens — because the live strip reads what they
@@ -21082,6 +21160,69 @@ mod tests {
         // opening it without them.
         assert!(db.start_spool(me, None, &[them, stranger]).await.is_err());
         assert!(db.active_spool(me).await.unwrap().is_none());
+    }
+
+    /// "Who else here plays them" is instance-wide, shared-chain only, and
+    /// says whether you can open their deck.
+    ///
+    /// The instance-wide part is the deliberate reversal the Instance tab
+    /// makes, so the thing worth pinning is the *limiter*: an unshared chain
+    /// contributes nothing, however much of the artist it holds.
+    #[tokio::test]
+    async fn who_else_plays_them_counts_shared_chains_only() {
+        let db = testdb().await;
+        let (me, them, shared) = patched_pair(&db).await;
+        let stranger = db.create_user("sam", None, "pw", "user").await.unwrap();
+        async fn chain(db: &Database, uid: i64, name: &str, shared: bool) -> i64 {
+            let id = sqlx::query_scalar::<_, i64>(
+                "INSERT INTO signal_chains (user_id, name, created_at) VALUES (?, ?, ?) \
+                 RETURNING id",
+            )
+            .bind(uid)
+            .bind(name)
+            .bind(Database::now_secs())
+            .fetch_all(&db.pool)
+            .await
+            .unwrap()[0];
+            if shared {
+                db.set_chain_shared(uid, id, true).await.unwrap();
+            }
+            id
+        }
+        let sam_open = chain(&db, stranger, "Sam open", true).await;
+        let sam_shut = chain(&db, stranger, "Sam shut", false).await;
+        let mine = chain(&db, me, "Mine", false).await;
+
+        listen(&db, them, Some(shared), "Angel", "Massive Attack", 1_760_000_100).await;
+        listen(&db, stranger, Some(sam_open), "Angel", "Massive Attack", 1_760_000_200).await;
+        // Three more from a chain Sam does not share — none of them may count.
+        for t in 0..3 {
+            listen(&db, stranger, Some(sam_shut), "Teardrop", "Massive Attack", 1_760_000_300 + t)
+                .await;
+        }
+        listen(&db, me, Some(mine), "Angel", "Massive Attack", 1_760_000_400).await;
+
+        let (decks, chains) = db.patch_artist_context(me, "Massive Attack").await.unwrap();
+
+        // Instance-wide: Sam appears without a patch. But only their shared
+        // chain's single play counts, not the three behind the private one.
+        let sam = decks.iter().find(|d| d.username == "sam").expect("instance-wide");
+        assert_eq!(sam.plays, 1, "an unshared chain contributes nothing");
+        assert!(!sam.patched, "and the screen must know it cannot open that deck");
+
+        let kim = decks.iter().find(|d| d.username == "kim").expect("the deck I am patched with");
+        assert_eq!(kim.plays, 1);
+        assert!(kim.patched);
+
+        // Never yourself — the panel is *who else*.
+        assert!(!decks.iter().any(|d| d.user_id == me));
+
+        // And your own chains are your own listening, so a private one still
+        // counts: what you heard them on is a fact about your setup rather than
+        // a publication.
+        assert_eq!(chains.len(), 1);
+        assert_eq!(chains[0].name, "Mine");
+        assert_eq!(chains[0].plays, 1);
     }
 
     /// Searching the Reel narrows it and **never widens it**.

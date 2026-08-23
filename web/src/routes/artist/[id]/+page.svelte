@@ -3,6 +3,7 @@
 	import { page } from '$app/stores';
 	import { api } from '$lib/api';
 	import DubDialog from '$lib/components/DubDialog.svelte';
+	import type { ArtistDeck } from '$lib/api';
 	let dubOpen = false;
 	import type { ArtistView } from '$lib/api';
 	import { formatDuration, qualityLabel, tierTagClass } from '$lib/utils';
@@ -114,11 +115,45 @@
 		loveBusy = false;
 	}
 
+	// Who else on this instance plays them, and which of your own chains you
+	// hear them on. Loaded after the artist rather than beside it: the name is
+	// what it keys on, and a failure here must not take the page down — an
+	// instance with nobody else on it simply has no panel.
+	let otherDecks: ArtistDeck[] = [];
+	let myChains: { name: string; plays: number }[] = [];
+
+	async function loadPatchContext(name: string) {
+		otherDecks = [];
+		myChains = [];
+		asked = new Set();
+		try {
+			const r = await api.getPatchArtistContext(name);
+			otherDecks = r.decks;
+			myChains = r.chains;
+		} catch {
+			/* the panels simply do not render */
+		}
+	}
+
+	// Tracked beside the rows rather than folded onto them: `patched` is the
+	// server's answer and stays the server's, and a patch is *pending* until
+	// they say yes — writing `patched: true` here would claim it was accepted.
+	let asked = new Set<string>();
+	async function askPatch(username: string) {
+		try {
+			await api.requestPatch(username);
+			asked = new Set([...asked, username]);
+		} catch (e) {
+			alert(e instanceof Error ? e.message : 'Could not ask');
+		}
+	}
+
 	async function load() {
 		loading = true;
 		error = '';
 		try {
 			artist = await api.getArtist(id);
+			void loadPatchContext(artist.name);
 		} catch (e) {
 			error = e instanceof Error ? e.message : 'Could not load this artist';
 		}
@@ -290,6 +325,68 @@
 		<div style="margin-bottom:14px;"><BarChart bars={artist.trend} /></div>
 	{/if}
 
+	<!--
+		The Patch half of the design's artist screen. Not a separate page: its
+		stats are the ones this page already computes, and a second copy would
+		drift — so only the part that is genuinely about *other decks* is new.
+	-->
+	{#if otherDecks.length || myChains.length}
+		<div class="pcols">
+			{#if otherDecks.length}
+				<div class="panel pcard">
+					<h3 class="h-display" style="font-size:19px;margin:0 0 4px;">Who else here plays them</h3>
+					<p class="psub">From decks on this instance with shared chains.</p>
+					{#each otherDecks as d (d.user_id)}
+						<div class="prow2">
+							<span class="pav">
+								{#if d.avatar_url}<img src={d.avatar_url} alt="" />{:else}{(d.display_name || d.username).slice(0, 2).toUpperCase()}{/if}
+							</span>
+							<div style="min-width:0;flex:1;">
+								<div class="pname2">{d.display_name || d.username}</div>
+								<div class="pmeta2">
+									{d.plays} play{d.plays === 1 ? '' : 's'}
+									{#if d.patched}· patched{/if}
+								</div>
+							</div>
+							<!--
+								A patch is what makes a deck readable, so the button
+								says which of the two situations this is rather than
+								offering a link that would 404.
+							-->
+							{#if d.patched}
+								<a class="btn btn-secondary pbtn" href="/users/{d.username}">Open deck</a>
+							{:else if asked.has(d.username)}
+								<span class="tag">Asked</span>
+							{:else}
+								<button class="btn btn-secondary pbtn" on:click={() => askPatch(d.username)}>
+									Ask to patch
+								</button>
+							{/if}
+						</div>
+					{/each}
+				</div>
+			{/if}
+
+			{#if myChains.length}
+				<div class="panel pcard">
+					<h3 class="h-display" style="font-size:19px;margin:0 0 4px;">Chains you hear them on</h3>
+					<p class="psub">Your own listening — every chain, shared or not.</p>
+					{#each myChains as c (c.name)}
+						<div class="crow">
+							<div style="flex:1;min-width:0;">
+								<div class="pname2">{c.name}</div>
+								<div class="cbar">
+									<div style="width:{Math.min(100, (c.plays / (myChains[0]?.plays || 1)) * 100)}%"></div>
+								</div>
+							</div>
+							<span class="pmeta2">{c.plays}</span>
+						</div>
+					{/each}
+				</div>
+			{/if}
+		</div>
+	{/if}
+
 	{#if artist.albums.length}
 		<h3 class="h-display" style="font-size:20px;margin:0 0 12px;">Top albums</h3>
 		<div class="grid" style="margin-bottom:30px;">
@@ -330,6 +427,36 @@
 {/if}
 
 <style>
+	.pcols {
+		display: grid;
+		grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+		gap: 18px;
+		margin-bottom: 30px;
+	}
+	.pcard { border-radius: 22px; padding: 20px; }
+	.psub { margin: 0 0 14px; font-size: 12.5px; color: var(--td-muted-2); }
+	.prow2, .crow { display: flex; align-items: center; gap: 11px; padding: 9px 0; min-width: 0; }
+	.prow2 + .prow2, .crow + .crow { border-top: 1px solid var(--td-border); }
+	.pav {
+		width: 34px;
+		height: 34px;
+		border-radius: 50%;
+		background: var(--td-surface2);
+		color: var(--td-muted-2);
+		display: flex;
+		align-items: center;
+		justify-content: center;
+		font: 700 11px ui-monospace, SFMono-Regular, Menlo, monospace;
+		flex: none;
+		overflow: hidden;
+	}
+	.pav img { width: 100%; height: 100%; object-fit: cover; }
+	.pname2 { font-size: 13.5px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+	.pmeta2 { font-size: 12px; color: var(--td-muted-2); font-variant-numeric: tabular-nums; }
+	.pbtn { font-size: 12.5px; padding: 7px 14px; white-space: nowrap; flex: none; text-decoration: none; }
+	.cbar { height: 5px; border-radius: 999px; background: var(--td-track); overflow: hidden; margin-top: 5px; }
+	.cbar > div { height: 100%; border-radius: 999px; background: linear-gradient(90deg, var(--td-accent-2), var(--td-accent)); }
+
 	.spin {
 		width: 22px; height: 22px; border: 2px solid var(--td-track);
 		border-top-color: var(--td-accent); border-radius: 50%;

@@ -95,6 +95,7 @@ pub fn create_patch_router() -> Router<Arc<AppState>> {
         .route("/api/v1/patch/spool/:uuid/join", post(join_spool))
         .route("/api/v1/patch/spool/:uuid/end", post(end_spool))
         .route("/api/v1/patch/captures", post(settle_captures))
+        .route("/api/v1/patch/artist", get(artist_context))
         .route("/api/v1/patch/live", get(live))
         .route("/api/v1/patch/inbox-count", get(inbox_count))
         .route("/api/v1/patch/sittings", get(sittings).post(hand_over))
@@ -636,6 +637,44 @@ struct HandOverBody {
     /// record, so guessing from an absent field is the one thing this must not
     /// do — the rule `bulk-chain` learned the expensive way.
     kind: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ArtistQuery {
+    name: Option<String>,
+}
+
+/// `GET /api/v1/patch/artist?name=` — who else here plays them, and which of
+/// your own chains you hear them on.
+///
+/// **Instance-wide rather than narrowed by your patches**, the same deliberate
+/// reversal the Instance tab makes: the rule that stops a deck exposing
+/// somebody's listening without consent is the per-chain switch, and switching
+/// it on *is* that consent. Shared chains only, and it stays inside the
+/// instance.
+///
+/// Sits beside the ordinary artist page rather than replacing it. The design
+/// draws a whole artist screen inside Patch, but its stats are the same ones
+/// `/artist/:id` already computes, and a second copy would drift — this is only
+/// the half that is genuinely about other decks.
+async fn artist_context(
+    State(state): State<Arc<AppState>>,
+    user: super::auth::AuthUser,
+    Query(q): Query<ArtistQuery>,
+) -> Response {
+    let Some(name) = q.name.as_deref().map(str::trim).filter(|s| !s.is_empty()) else {
+        return refused(StatusCode::BAD_REQUEST, "`name` is required");
+    };
+    match state.db.patch_artist_context(user.user_id, name).await {
+        Ok((decks, chains)) => {
+            (StatusCode::OK, Json(serde_json::json!({ "decks": decks, "chains": chains })))
+                .into_response()
+        }
+        Err(e) => {
+            warn!("📡 patch artist: {e}");
+            refused(StatusCode::INTERNAL_SERVER_ERROR, "Could not read that")
+        }
+    }
 }
 
 /// `GET /api/v1/patch/live` — the decks you are patched into that are playing

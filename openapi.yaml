@@ -26,7 +26,7 @@ openapi: 3.1.0
 
 info:
   title: Tapedeck
-  version: 0.88.0
+  version: 0.89.0
   summary: Self-hosted scrobbler and listening journal.
   description: |
     Tapedeck ingests listens, enriches them with MusicBrainz metadata, stores
@@ -3024,6 +3024,42 @@ paths:
           content:
             application/json:
               schema: { type: object, additionalProperties: true }
+        '401': { description: Not signed in. }
+
+  /api/v1/patch/artist:
+    get:
+      tags: [Patch]
+      summary: Who else here plays an artist, and which of your chains you hear them on.
+      description: |
+        The Patch half of an artist page. **Not a separate artist screen**: the
+        design draws one inside Patch, but its statistics are the ones
+        `/api/v1/artists/{id}` already computes and a second copy would drift.
+        This is only the part that is genuinely about *other decks*.
+
+        `decks` is **instance-wide rather than narrowed by your patches** — the
+        same deliberate reversal the Instance tab makes, on the same reasoning:
+        the rule that stops a deck exposing somebody's listening without consent
+        is the per-chain switch, and switching it on *is* that consent. Shared
+        chains only, and it stays inside the instance. `plays` therefore counts
+        a deck's listens through shared chains and nothing else.
+
+        `patched` says whether an accepted patch already exists in either
+        direction, so a screen can offer to open the deck or to ask — rather
+        than a link that 404s, since reading a deck needs a patch.
+
+        `chains` is **your own** listening of that artist, grouped by chain, and
+        is deliberately *not* filtered on `shared`: what you heard them on is a
+        fact about your setup rather than a publication.
+      security: [{ sessionCookie: [] }]
+      parameters:
+        - { name: name, in: query, required: true, schema: { type: string } }
+      responses:
+        '200':
+          description: The decks, and your own chains.
+          content:
+            application/json:
+              schema: { type: object, additionalProperties: true }
+        '400': { description: name was missing. }
         '401': { description: Not signed in. }
 
   /api/v1/patch/live:
