@@ -27,6 +27,7 @@
 	import ChainIcon from '$lib/components/ChainIcon.svelte';
 	import { syncUrl } from '$lib/url';
 	import { openArtist } from '$lib/entities';
+	import { lovedKeys, isLovedNamed, toggleLoveByName, loadLoves } from '$lib/loves';
 
 	type Tab = 'reel' | 'artists' | 'decks' | 'discover' | 'instance' | 'inbox';
 	let tab: Tab = 'reel';
@@ -47,6 +48,26 @@
 	let next: number | null = null;
 	let loading = true;
 	let reelLoading = false;
+	// Both server-side — the Reel is keyset-paged, so filtering the loaded page
+	// would silently search only what has been scrolled to and say nothing
+	// about it, which looks exactly like a search that found nothing.
+	let reelQ = '';
+	let reelDeck: string | null = null;
+	let reelTimer: ReturnType<typeof setTimeout>;
+	/**
+	 * Which Reel request is the current one.
+	 *
+	 * Two controls now fire loads, and they race: clearing the search and then
+	 * picking a deck sent both, and the *earlier* one answered last and
+	 * overwrote the list — leaving rows on screen that did not match the
+	 * controls above them. Caught by driving the page rather than by any check,
+	 * because both requests were correct and only their order was not.
+	 *
+	 * A sequence number rather than an AbortController: the older response is
+	 * already on its way and may well be useful to the HTTP cache; what must not
+	 * happen is it being *applied*.
+	 */
+	let reelSeq = 0;
 	let busy: string | null = null;
 	let error = '';
 
@@ -383,15 +404,26 @@
 	}
 
 	async function loadReel(more = false) {
+		const seq = ++reelSeq;
 		reelLoading = true;
 		try {
-			const page = await api.getReel({ limit: 40, before: more ? (next ?? undefined) : undefined });
+			const page = await api.getReel({
+				limit: 40,
+				before: more ? (next ?? undefined) : undefined,
+				q: reelQ.trim() || undefined,
+				deck: reelDeck ?? undefined
+			});
+			// A response for filters that have since changed is dropped rather
+			// than drawn. Without this the list can end up disagreeing with the
+			// controls, which reads as the filter not working.
+			if (seq !== reelSeq) return;
 			listens = more ? [...listens, ...page.listens] : page.listens;
 			next = page.next;
 		} catch (e) {
+			if (seq !== reelSeq) return;
 			error = e instanceof Error ? e.message : 'Could not load the Reel';
 		} finally {
-			reelLoading = false;
+			if (seq === reelSeq) reelLoading = false;
 		}
 	}
 
@@ -407,7 +439,11 @@
 			loadSpool(),
 			loadDubs(),
 			loadSittings(),
-			loadLive()
+			loadLive(),
+			// The heart on a Reel row reads this store, so it has to be filled
+			// before the rows draw or every one of them starts empty and fills
+			// in a moment later.
+			loadLoves()
 		]);
 		try {
 			myChains = (await api.getChains()).chains;
@@ -636,6 +672,26 @@
 		return out;
 	})();
 
+	function onReelQ() {
+		clearTimeout(reelTimer);
+		reelTimer = setTimeout(() => loadReel(), 300);
+	}
+
+	function pickDeck(username: string | null) {
+		reelDeck = reelDeck === username ? null : username;
+		void loadReel();
+	}
+
+	/** `@user@host`, from **their** actor rather than today's origin. */
+	function handleOf(l: ReelListen): string | null {
+		if (!l.actor_uri) return null;
+		try {
+			return `@${l.username}@${new URL(l.actor_uri).host}`;
+		} catch {
+			return null;
+		}
+	}
+
 	function steps(l: ReelListen): { name: string; type: string }[] {
 		try {
 			return JSON.parse(l.chain_components ?? '[]');
@@ -853,6 +909,40 @@
 			</div>
 		</div>
 	{:else}
+		<!--
+			Search and the deck chips. Both hit the server: the Reel is
+			keyset-paged, so narrowing what has already loaded would search only
+			what you happened to have scrolled to — and say nothing about it,
+			which reads exactly like a search that found nothing.
+		-->
+		<div class="reelctl">
+			<div class="reelsearch">
+				<svg viewBox="0 0 24 24" width="16" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" aria-hidden="true">
+					<circle cx="11" cy="11" r="7" /><path d="M16.5 16.5L21 21" />
+				</svg>
+				<input
+					class="input"
+					bind:value={reelQ}
+					on:input={onReelQ}
+					placeholder="Search track, artist, chain or deck"
+					aria-label="Search the Reel"
+				/>
+			</div>
+			{#if accepted.length > 1}
+				<div class="deckchips">
+					<button class="chip" class:on={!reelDeck} on:click={() => pickDeck(null)}>All</button>
+					{#each accepted as p (p.username)}
+						<button
+							class="chip"
+							class:on={reelDeck === p.username}
+							title={p.display_name || p.username}
+							on:click={() => pickDeck(p.username)}
+						>{(p.display_name || p.username).slice(0, 2).toUpperCase()}</button>
+					{/each}
+				</div>
+			{/if}
+		</div>
+
 		<div class="feed">
 			{#each days as day}
 				<div>
@@ -864,20 +954,34 @@
 					<div class="listrows">
 						{#each day.rows as l (l.id)}
 							<div class="lrow">
+								<!--
+									The deck's avatar, not the sleeve. The Reel's
+									organising principle is *whose* — the design puts
+									the person first, and `avatar_url` had been in
+									this payload since v0.80.0 drawn nowhere.
+								-->
+								<a class="ravatar" href="/users/{l.username}" title={l.display_name || l.username}>
+									{#if l.avatar_url}
+										<img src={l.avatar_url} alt="" />
+									{:else}
+										{(l.display_name || l.username).slice(0, 2).toUpperCase()}
+									{/if}
+								</a>
 								<CoverArt
 									url={l.artwork_url}
 									caaId={l.caa_id}
 									releaseMbid={l.caa_release_mbid}
 									seed={l.album || l.artist}
-									size={38}
+									size={32}
 								/>
 								<div class="lmain">
 									<div class="ltop">
 										<span class="ltitle">{l.title}</span>
-										<span class="lartist">{l.artist}</span>
+										<button class="xref lartist" on:click={() => openArtist(l.artist)}>{l.artist}</button>
 									</div>
 									<div class="lsub">
-										<span class="lwho">{l.display_name || l.username}</span>
+										<a class="lwho" href="/users/{l.username}">{l.display_name || l.username}</a>
+										{#if handleOf(l)}<span class="rhandle">{handleOf(l)}</span>{/if}
 										<span class="lchain">
 											<ChainIcon name={l.chain_icon} size={13} title={l.chain_name} />
 											{l.chain_name}
@@ -891,6 +995,22 @@
 								</div>
 								{#if badge(l)}<span class="tag">{badge(l)}</span>{/if}
 								<span class="lago">{ago(l.timestamp)}</span>
+								<!--
+									Loving somebody else's listen loves the *track*, into
+									your own loves — it does nothing to their deck. The
+									key is derived from artist and title, so it works
+									without the listen being yours.
+								-->
+								<button
+									class="rlove"
+									class:on={isLovedNamed($lovedKeys, 'track', l.artist, l.title)}
+									title={isLovedNamed($lovedKeys, 'track', l.artist, l.title)
+										? 'Loved — click to remove'
+										: 'Love this track'}
+									on:click={() => toggleLoveByName('track', l.artist, l.title)}
+								>
+									<svg viewBox="0 0 24 24" width="15" fill={isLovedNamed($lovedKeys, 'track', l.artist, l.title) ? 'currentColor' : 'none'} stroke="currentColor" stroke-width="2.3" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20.3l-1.35-1.2C5.9 14.85 3 12.2 3 8.9 3 6.3 5 4.3 7.5 4.3c1.6 0 3.2.8 4.5 2.6 1.3-1.8 2.9-2.6 4.5-2.6C19 4.3 21 6.3 21 8.9c0 3.3-2.9 5.95-7.65 10.2z"/></svg>
+								</button>
 							</div>
 						{/each}
 					</div>
@@ -1928,6 +2048,71 @@
 		border-left: 3px solid var(--td-accent);
 		border-radius: 0 12px 12px 0;
 		padding: 9px 12px;
+	}
+
+	/* — reel controls — */
+	.reelctl {
+		display: flex;
+		gap: 10px;
+		flex-wrap: wrap;
+		align-items: center;
+		margin-bottom: 16px;
+	}
+	.reelsearch { position: relative; flex: 1; min-width: 240px; max-width: 380px; }
+	.reelsearch svg {
+		position: absolute;
+		left: 15px;
+		top: 50%;
+		transform: translateY(-50%);
+		color: var(--td-muted-3);
+		pointer-events: none;
+	}
+	.reelsearch .input { width: 100%; padding-left: 40px; }
+	.deckchips { display: flex; gap: 6px; flex-wrap: wrap; }
+
+	/* — reel row — */
+	.ravatar {
+		width: 34px;
+		height: 34px;
+		border-radius: 50%;
+		background: var(--td-surface2);
+		color: var(--td-muted-2);
+		display: flex;
+		align-items: center;
+		justify-content: center;
+		font: 700 11px ui-monospace, SFMono-Regular, Menlo, monospace;
+		flex: none;
+		overflow: hidden;
+		text-decoration: none;
+	}
+	.ravatar img { width: 100%; height: 100%; object-fit: cover; }
+	.rhandle {
+		font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+		font-size: 11px;
+		color: var(--td-muted-3);
+		white-space: nowrap;
+		overflow: hidden;
+		text-overflow: ellipsis;
+	}
+	.lsub .lwho { text-decoration: none; color: var(--td-muted-2); }
+	.lsub .lwho:hover { text-decoration: underline; }
+	.rlove {
+		border: none;
+		background: transparent;
+		color: var(--td-muted-3);
+		cursor: pointer;
+		padding: 5px;
+		border-radius: 9px;
+		display: flex;
+		flex: none;
+	}
+	.rlove:hover { color: var(--td-accent); }
+	.rlove.on { color: #b2622d; }
+	@media (max-width: 640px) {
+		/* The sleeve goes before the person does: at this width the row is
+		   already carrying an avatar, and two circles crowd the title. */
+		.lrow :global(.cover) { display: none; }
+		.rhandle { display: none; }
 	}
 
 	/* — rolling now — */

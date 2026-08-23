@@ -612,6 +612,11 @@ export interface ReelListen {
 	username: string;
 	display_name: string | null;
 	avatar_url: string | null;
+	/** Their actor URI, or null when they haven't switched federation on.
+	 *  The handle is derived from **this**, never from today's origin — a deck
+	 *  with no actor has no published address, and showing one would invent
+	 *  something that resolves nowhere. */
+	actor_uri: string | null;
 	/** The chain is the point of the Reel — it is what makes a Tapedeck listen
 	 *  a Tapedeck listen rather than a sentence. */
 	chain_name: string;
@@ -1970,10 +1975,23 @@ class TapedeckAPI {
 		return this.request('POST', '/api/v1/patch/captures', { ids, accept });
 	}
 
-	async getReel(params: { limit?: number; before?: number } = {}): Promise<ReelPage> {
+	async getReel(
+		params: {
+			limit?: number;
+			before?: number;
+			/** Narrows on track, artist, album, chain or deck. **Server-side**:
+			 *  the Reel is keyset-paged, so filtering the loaded page would
+			 *  silently search only what has been scrolled to. */
+			q?: string;
+			/** One deck's username. */
+			deck?: string;
+		} = {}
+	): Promise<ReelPage> {
 		const q = new URLSearchParams();
 		if (params.limit != null) q.set('limit', String(params.limit));
 		if (params.before != null) q.set('before', String(params.before));
+		if (params.q) q.set('q', params.q);
+		if (params.deck) q.set('deck', params.deck);
 		const qs = q.toString();
 		return this.get(`/api/v1/patch/reel${qs ? `?${qs}` : ''}`);
 	}

@@ -140,6 +140,15 @@ struct ReelQuery {
     /// top while it is being read, and an offset would repeat or skip rows as
     /// it shifted underneath.
     before: Option<i64>,
+    /// Narrows on track, artist, album, chain or deck.
+    ///
+    /// **Server-side**, because the Reel is keyset-paged: a filter applied to
+    /// the loaded page would silently search only what has been scrolled to and
+    /// say nothing about it — which looks exactly like a search that found
+    /// nothing.
+    q: Option<String>,
+    /// One deck's username, for the filter chips.
+    deck: Option<String>,
 }
 
 /// `GET /api/v1/patch/decks` — everyone on the instance, and where you stand
@@ -360,7 +369,9 @@ async fn reel(
     Query(q): Query<ReelQuery>,
 ) -> Response {
     let limit = q.limit.unwrap_or(40).clamp(1, 200);
-    match state.db.reel(user.user_id, limit, q.before).await {
+    let needle = q.q.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    let deck = q.deck.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    match state.db.reel(user.user_id, limit, q.before, needle, deck).await {
         Ok(listens) => {
             // `next` is the oldest timestamp returned, so the client pages by
             // keyset. `None` when the page was short, which is how it knows to

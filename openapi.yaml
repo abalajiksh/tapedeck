@@ -26,7 +26,7 @@ openapi: 3.1.0
 
 info:
   title: Tapedeck
-  version: 0.87.0
+  version: 0.88.0
   summary: Self-hosted scrobbler and listening journal.
   description: |
     Tapedeck ingests listens, enriches them with MusicBrainz metadata, stores
@@ -3384,6 +3384,25 @@ paths:
         They deliberately do not carry the source id, the delivery state or the
         session, which are nobody else's business.
       security: [{ sessionCookie: [] }]
+      parameters:
+        - { name: limit, in: query, schema: { type: integer } }
+        - { name: before, in: query, schema: { type: integer }, description: Keyset cursor — listens strictly older than this timestamp. }
+        - name: q
+          in: query
+          schema: { type: string }
+          description: |
+            Narrows on track, artist, album, chain name or deck. **Server-side
+            on purpose**: the Reel is keyset-paged, so filtering the loaded page
+            would search only what had been scrolled to and say nothing about
+            it, which reads exactly like a search that found nothing.
+
+            A wildcard typed into the box is a **literal** — `%` and `_` are
+            escaped, the rule the notes search already follows.
+
+            It only ever narrows. The four clauses that decide what the Reel may
+            publish are unaffected, so no query reaches a chain its owner does
+            not share.
+        - { name: deck, in: query, schema: { type: string }, description: One deck's username, for the filter chips. }
       parameters:
         - name: limit
           in: query

@@ -13821,32 +13821,70 @@ impl Database {
     /// It is deliberately **not** scoped by `user_id = ?` the way every other
     /// read is; that is the relaxation Phase 6 exists to make, and it is
     /// narrowed by the patch and the chain instead.
+    /// `q` narrows on track, artist, album, chain or deck; `deck` pins it to one
+    /// username. **Both server-side**, because the Reel is keyset-paged — a
+    /// filter applied to the loaded page would silently search only what has
+    /// been scrolled to, and say nothing about it.
     pub async fn reel(
         &self,
         user_id: i64,
         limit: i64,
         before: Option<i64>,
+        q: Option<&str>,
+        deck: Option<&str>,
     ) -> Result<Vec<ReelListen>, sqlx::Error> {
+        // A wildcard typed into the box is a literal, the rule `search_notes`
+        // already follows. `str::replace` has no capture groups, and reaching
+        // for a regex to quote three characters would be its own mistake.
+        let needle = q.map(|raw| {
+            format!(
+                "%{}%",
+                raw.trim()
+                    .to_lowercase()
+                    .replace('\\', "\\\\")
+                    .replace('%', "\\%")
+                    .replace('_', "\\_")
+            )
+        });
         sqlx::query_as(
             "SELECT s.id, s.timestamp, s.title, s.artist, s.album,
                     s.artwork_url, s.caa_id, s.caa_release_mbid,
                     s.format_type, s.codec, s.bitrate, s.sample_rate, s.bit_depth, s.is_lossless,
                     s.submission_client,
                     u.id AS user_id, u.username, u.display_name, u.avatar_url,
+                    a.uri AS actor_uri,
                     c.name AS chain_name, c.icon AS chain_icon, c.components AS chain_components
                FROM scrobbles s
                JOIN signal_chains c ON c.id = s.chain_id AND c.shared = 1
                JOIN users u ON u.id = s.user_id
                JOIN patches p ON p.target_user_id = s.user_id
+               LEFT JOIN actors a ON a.user_id = u.id
               WHERE p.follower_user_id = ? AND p.state = 'accepted'
                 AND s.skipped = FALSE
                 AND (? IS NULL OR s.timestamp < ?)
+                AND (? IS NULL OR u.username = ?)
+                AND (? IS NULL OR
+                     LOWER(s.title) LIKE ? ESCAPE '\\' OR
+                     LOWER(s.artist) LIKE ? ESCAPE '\\' OR
+                     LOWER(COALESCE(s.album, '')) LIKE ? ESCAPE '\\' OR
+                     LOWER(c.name) LIKE ? ESCAPE '\\' OR
+                     LOWER(u.username) LIKE ? ESCAPE '\\' OR
+                     LOWER(COALESCE(u.display_name, '')) LIKE ? ESCAPE '\\')
               ORDER BY s.timestamp DESC
               LIMIT ?",
         )
         .bind(user_id)
         .bind(before)
         .bind(before)
+        .bind(deck)
+        .bind(deck)
+        .bind(&needle)
+        .bind(&needle)
+        .bind(&needle)
+        .bind(&needle)
+        .bind(&needle)
+        .bind(&needle)
+        .bind(&needle)
         .bind(limit)
         .fetch_all(&self.pool)
         .await
@@ -15543,6 +15581,16 @@ pub struct ReelListen {
     pub username: String,
     pub display_name: Option<String>,
     pub avatar_url: Option<String>,
+    /// This deck's actor URI, or null when they have not switched federation
+    /// on.
+    ///
+    /// The **handle is derived from this**, never from today's origin — the bug
+    /// v0.78.0 found on the settings page, where a handle built from the
+    /// current host sat beside a stored actor that disagreed with it, and the
+    /// larger of the two was the one that did not work. A deck with no actor
+    /// has no published address, and the row shows none rather than inventing
+    /// one that resolves nowhere.
+    pub actor_uri: Option<String>,
     /// The chain is the whole point of the Reel: it is what makes a Tapedeck
     /// listen a Tapedeck listen rather than a sentence.
     pub chain_name: String,
@@ -20427,16 +20475,16 @@ mod tests {
         db.set_chain_shared(them, chain, true).await.unwrap();
 
         // No patch at all.
-        assert!(db.reel(me, 40, None).await.unwrap().is_empty());
+        assert!(db.reel(me, 40, None, None, None).await.unwrap().is_empty());
 
         let uuid = db.request_patch(me, them).await.unwrap();
         assert!(
-            db.reel(me, 40, None).await.unwrap().is_empty(),
+            db.reel(me, 40, None, None, None).await.unwrap().is_empty(),
             "a pending patch reads nothing — that is what makes it a request"
         );
 
         assert!(db.settle_patch(&uuid, them, true).await.unwrap());
-        let reel = db.reel(me, 40, None).await.unwrap();
+        let reel = db.reel(me, 40, None, None, None).await.unwrap();
         assert_eq!(reel.len(), 1);
         assert_eq!(reel[0].title, "Teardrop");
         assert_eq!(reel[0].username, "kim");
@@ -20444,7 +20492,7 @@ mod tests {
 
         // And withdrawing takes it away again.
         assert!(db.unpatch(me, them).await.unwrap());
-        assert!(db.reel(me, 40, None).await.unwrap().is_empty());
+        assert!(db.reel(me, 40, None, None, None).await.unwrap().is_empty());
     }
 
     /// **The sharing unit is the chain.** A patch into a deck that publishes
@@ -20486,19 +20534,19 @@ mod tests {
         db.settle_patch(&uuid, them, true).await.unwrap();
 
         assert!(
-            db.reel(me, 40, None).await.unwrap().is_empty(),
+            db.reel(me, 40, None, None, None).await.unwrap().is_empty(),
             "nothing is shared until a chain is switched on, even with the patch accepted"
         );
 
         db.set_chain_shared(them, shared, true).await.unwrap();
-        let reel = db.reel(me, 40, None).await.unwrap();
+        let reel = db.reel(me, 40, None, None, None).await.unwrap();
         assert_eq!(reel.len(), 1, "only the shared chain's listen");
         assert_eq!(reel[0].title, "Teardrop");
 
         // Switching it back off takes it out again — the switch is the whole
         // control, and it works in both directions.
         db.set_chain_shared(them, shared, false).await.unwrap();
-        assert!(db.reel(me, 40, None).await.unwrap().is_empty());
+        assert!(db.reel(me, 40, None, None, None).await.unwrap().is_empty());
     }
 
     /// **A listen with no chain is never shared**, and this is the clause most
@@ -20554,7 +20602,7 @@ mod tests {
         db.settle_patch(&uuid, them, true).await.unwrap();
 
         let titles: Vec<_> =
-            db.reel(me, 40, None).await.unwrap().into_iter().map(|r| r.title).collect();
+            db.reel(me, 40, None, None, None).await.unwrap().into_iter().map(|r| r.title).collect();
         assert_eq!(titles, ["Teardrop"], "no chain means not shared; a skip is never published");
     }
 
@@ -21034,6 +21082,61 @@ mod tests {
         // opening it without them.
         assert!(db.start_spool(me, None, &[them, stranger]).await.is_err());
         assert!(db.active_spool(me).await.unwrap().is_none());
+    }
+
+    /// Searching the Reel narrows it and **never widens it**.
+    ///
+    /// The filters are extra `AND`s on a query whose four narrowing clauses are
+    /// the whole of what makes the Reel safe, so the thing worth asserting is
+    /// that a search cannot reach past them — a listen through an unshared
+    /// chain must stay invisible however precisely it is asked for by name.
+    #[tokio::test]
+    async fn searching_the_reel_narrows_it_and_never_widens_it() {
+        let db = testdb().await;
+        let (me, them, shared) = patched_pair(&db).await;
+        let private = sqlx::query_scalar::<_, i64>(
+            "INSERT INTO signal_chains (user_id, name, created_at) VALUES (?, 'Private', ?) \
+             RETURNING id",
+        )
+        .bind(them)
+        .bind(Database::now_secs())
+        .fetch_all(&db.pool)
+        .await
+        .unwrap()[0];
+
+        listen(&db, them, Some(shared), "Ascension Day", "Talk Talk", 1_760_000_100).await;
+        listen(&db, them, Some(shared), "Spoon", "Can", 1_760_000_200).await;
+        listen(&db, them, Some(private), "Hidden", "Talk Talk", 1_760_000_300).await;
+
+        let titles =
+            |v: Vec<ReelListen>| -> Vec<String> { v.into_iter().map(|r| r.title).collect() };
+
+        assert_eq!(
+            titles(db.reel(me, 40, None, None, None).await.unwrap()).len(),
+            2,
+            "the unshared listen is not on the Reel to begin with"
+        );
+
+        // By track, by artist, by chain, by deck — all narrow.
+        assert_eq!(titles(db.reel(me, 40, None, Some("spoon"), None).await.unwrap()), ["Spoon"]);
+        assert_eq!(
+            titles(db.reel(me, 40, None, Some("talk talk"), None).await.unwrap()),
+            ["Ascension Day"]
+        );
+        assert_eq!(titles(db.reel(me, 40, None, Some("study"), None).await.unwrap()).len(), 2);
+        assert_eq!(titles(db.reel(me, 40, None, None, Some("kim")).await.unwrap()).len(), 2);
+        assert!(titles(db.reel(me, 40, None, None, Some("nobody")).await.unwrap()).is_empty());
+
+        // **The one that matters.** Naming the unshared listen exactly still
+        // finds nothing: a search is an extra narrowing, never a way past the
+        // four clauses that decide what the Reel may publish.
+        assert!(
+            titles(db.reel(me, 40, None, Some("Hidden"), None).await.unwrap()).is_empty(),
+            "a search must not reach a chain its owner does not share"
+        );
+
+        // And a wildcard typed into the box is a literal, not a match-all.
+        assert!(titles(db.reel(me, 40, None, Some("%"), None).await.unwrap()).is_empty());
     }
 
     /// A live deck is gated on the same shared chain a banked listen is.
