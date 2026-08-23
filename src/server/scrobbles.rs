@@ -21,6 +21,12 @@ pub struct ScrobblesQuery {
     pub track: Option<String>,
     pub after: Option<i64>,
     pub before: Option<i64>,
+    /// `1` for listening marked as heard in company, `0` for the rest.
+    ///
+    /// Absent means no filter, which is the only sensible default: a listen
+    /// nobody marked is *unmarked*, not proven solitary, and quietly excluding
+    /// unmarked listening from a history page would hide most of it.
+    pub social: Option<bool>,
 }
 
 /// GET /api/v1/scrobbles
@@ -43,6 +49,7 @@ pub async fn list_scrobbles(
             params.track.as_deref(),
             params.after,
             params.before,
+            params.social,
         )
         .await
     {
@@ -828,6 +835,51 @@ async fn bulk_set_chain(
     }
 }
 
+/// The body of `POST /api/v1/scrobbles/bulk-company`.
+#[derive(Debug, Deserialize)]
+pub struct BulkCompany {
+    pub ids: Vec<i64>,
+    /// Who these listens were heard with, or an explicit `null` to unmark them.
+    ///
+    /// `Option<Option<String>>` for the reason `signal_chain_id` above is: this
+    /// overwrites the field on every listen in `ids`, so a body that merely
+    /// misspelled the key must not deserialise into "clear it". Absent is a
+    /// 400.
+    #[serde(default, deserialize_with = "deserialize_some")]
+    pub company: Option<Option<String>>,
+}
+
+/// POST /api/v1/scrobbles/bulk-company — mark many listens as heard in company.
+///
+/// **Marking is retroactive by design.** Nobody stops mid-record to note who is
+/// in the room; they think of it afterwards, which is why this takes a set of
+/// listens rather than being a field at ingest. A Shared Spool fills the same
+/// column in automatically — this is for the far commoner case of somebody on
+/// the sofa who has no account on this instance.
+async fn bulk_set_company(
+    State(state): State<Arc<AppState>>,
+    user: AuthUser,
+    Json(body): Json<BulkCompany>,
+) -> impl IntoResponse {
+    let Some(company) = body.company else {
+        return bad_request(
+            "company is required — send who you were listening with, or an explicit null to unmark these listens",
+        );
+    };
+    // Trimmed, and an empty string means the same as null rather than becoming
+    // a listen marked as heard with nobody — which would count as social in
+    // every readout while naming no one.
+    let company = company.map(|c| c.trim().to_string()).filter(|c| !c.is_empty());
+    if company.as_deref().is_some_and(|c| c.chars().count() > 200) {
+        return bad_request("company is too long — 200 characters at most");
+    }
+
+    match state.db.bulk_set_scrobble_company(user.user_id, &body.ids, company.as_deref()).await {
+        Ok(n) => (StatusCode::OK, Json(serde_json::json!({ "updated": n }))).into_response(),
+        Err(e) => server_error(e.to_string()),
+    }
+}
+
 fn bad_request(msg: &str) -> axum::response::Response {
     (
         StatusCode::BAD_REQUEST,
@@ -1013,6 +1065,7 @@ pub fn create_scrobbles_router() -> Router<Arc<AppState>> {
     Router::new()
         .route("/api/v1/scrobbles", get(list_scrobbles).delete(clear_scrobbles))
         .route("/api/v1/scrobbles/bulk-chain", axum::routing::post(bulk_set_chain))
+        .route("/api/v1/scrobbles/bulk-company", axum::routing::post(bulk_set_company))
         .route("/api/v1/scrobbles/:id", patch(update_scrobble).delete(delete_scrobble))
         .route("/api/v1/search", get(search))
         .route("/api/v1/skips", get(list_skips))

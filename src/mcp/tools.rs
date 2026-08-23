@@ -144,7 +144,10 @@ any question involving a number.",
             description:
                 "Individual listens, newest first, optionally filtered by artist, album, track \
 or a time window. Returns the rows plus how many matched in total, so a capped result is \
-visibly a slice. Skips are excluded, as everywhere.",
+visibly a slice. Skips are excluded, as everywhere. `social` narrows to listening the \
+person marked as heard in company (or away from it) — note an unmarked listen means \
+nobody recorded who was there, never that they were definitely alone, so do not report \
+a share of solitary listening from it.",
             scope: scopes::LISTENING_READ,
             read_only: true,
             schema: obj(
@@ -154,6 +157,13 @@ visibly a slice. Skips are excluded, as everywhere.",
                     ("track", str_arg("Filter to this track title")),
                     ("after", int_arg("Only listens at or after this Unix timestamp")),
                     ("before", int_arg("Only listens at or before this Unix timestamp")),
+                    (
+                        "social",
+                        bool_arg(
+                            "true for listens marked as heard in company, false for the rest. \
+Omit for everything.",
+                        ),
+                    ),
                     ("limit", int_arg("Rows to return, 1-200 (default 50)")),
                     ("offset", int_arg("Rows to skip, for paging")),
                 ],
@@ -738,6 +748,7 @@ pub async fn call(
                 track: arg_str(args, "track"),
                 after: arg_i64(args, "after"),
                 before: arg_i64(args, "before"),
+                social: arg_bool(args, "social"),
             };
             handler_json(
                 crate::server::scrobbles::list_scrobbles(st(), read(), Query(q))

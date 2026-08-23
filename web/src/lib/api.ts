@@ -7,6 +7,11 @@ export interface Scrobble {
 	title: string;
 	artist: string;
 	album: string | null;
+	/** Who this was heard with, or null for not marked. Null means nobody
+	 *  recorded it — never that they were definitely alone. */
+	company: string | null;
+	/** The Shared Spool this belonged to, when it came from a sitting. */
+	joint_session_id: string | null;
 	timestamp: number;
 	duration: number | null;
 	status: string;
@@ -464,6 +469,49 @@ export interface SpoolView {
 	my_state: string;
 	members: SpoolMember[];
 	captured: number;
+}
+
+/** A sitting somebody handed you. **A document, never captures** — it enters
+ *  no history, count or chart of yours, so there is nothing to accept. */
+export interface HandedSitting {
+	uuid: string;
+	session_uuid: string;
+	note: string | null;
+	created_at: number;
+	seen_at: number | null;
+	from_username: string;
+	from_display_name: string | null;
+	title: string | null;
+	started_at: number | null;
+	ended_at: number | null;
+}
+
+export interface HandedListen {
+	title: string;
+	artist: string;
+	album: string | null;
+	timestamp: number;
+	duration: number | null;
+	artwork_url: string | null;
+	caa_id: number | null;
+	caa_release_mbid: string | null;
+	chain_name: string | null;
+}
+
+export interface HandedSittingDetail {
+	uuid: string;
+	note: string | null;
+	from_username: string;
+	from_display_name: string | null;
+	title: string | null;
+	started_at: number;
+	ended_at: number | null;
+	listens: HandedListen[];
+	/** Listens not shown because they ran through chains the owner doesn't
+	 *  share. Stated rather than silently dropped. */
+	omitted: number;
+	/** The sitting was regrouped out of existence since it was handed over. */
+	gone: boolean;
 }
 
 /** A play from somebody else's deck. **Not a listen** until accepted. */
@@ -1589,6 +1637,9 @@ class TapedeckAPI {
 	async getScrobbles(params?: {
 		limit?: number; offset?: number; artist?: string;
 		album?: string; track?: string; after?: number; before?: number;
+		/** true for listening marked as heard in company, false for the rest.
+		 *  Omit for everything — an unmarked listen is unmarked, not solitary. */
+		social?: boolean;
 	}): Promise<{ scrobbles: Scrobble[]; count: number }> {
 		const query = new URLSearchParams();
 		if (params?.limit) query.set('limit', String(params.limit));
@@ -1598,6 +1649,9 @@ class TapedeckAPI {
 		if (params?.track) query.set('track', params.track);
 		if (params?.after) query.set('after', String(params.after));
 		if (params?.before) query.set('before', String(params.before));
+		// Explicitly against undefined: `social: false` is a real filter and a
+		// truthiness test would drop it.
+		if (params?.social !== undefined) query.set('social', String(params.social));
 		const qs = query.toString();
 		return this.get(`/api/v1/scrobbles${qs ? '?' + qs : ''}`);
 	}
@@ -1815,6 +1869,44 @@ class TapedeckAPI {
 		return this.request('POST', `/api/v1/patch/spool/${encodeURIComponent(uuid)}/join`, {
 			accept
 		});
+	}
+
+	async getSittings(): Promise<{ sittings: HandedSitting[] }> {
+		return this.get('/api/v1/patch/sittings');
+	}
+
+	async getSitting(uuid: string): Promise<HandedSittingDetail> {
+		return this.get(`/api/v1/patch/sittings/${encodeURIComponent(uuid)}`);
+	}
+
+	/**
+	 * Pass a past sitting to somebody. **Two different gestures, and `kind` is
+	 * required** — the server refuses to guess, because they write different
+	 * things to another person's permanent record.
+	 *
+	 * `spool` — they were in the room and neither of you started a sitting. The
+	 * plays arrive as ordinary captures and enter their history when they
+	 * accept, exactly as a live Shared Spool would have.
+	 *
+	 * `recommendation` — they were not there. A document of what you played;
+	 * nothing enters their history.
+	 */
+	async handOverSitting(body: {
+		session: string;
+		to: string;
+		kind: 'spool' | 'recommendation';
+		note?: string;
+	}): Promise<{ kind: string; uuid: string; offered?: number; withheld?: number }> {
+		return this.post('/api/v1/patch/sittings', body);
+	}
+
+	async withdrawSitting(uuid: string): Promise<{ withdrawn: boolean }> {
+		return this.request('DELETE', `/api/v1/patch/sittings/${encodeURIComponent(uuid)}`);
+	}
+
+	/** Not an accept — it wrote nothing. Just stops showing in the inbox. */
+	async markSittingSeen(uuid: string): Promise<{ seen: boolean }> {
+		return this.post(`/api/v1/patch/sittings/${encodeURIComponent(uuid)}/seen`, {});
 	}
 
 	async endSpool(uuid: string): Promise<{ ended: boolean }> {
@@ -2379,6 +2471,14 @@ class TapedeckAPI {
 		chain_variant_id: number | null = null
 	): Promise<{ updated: number }> {
 		return this.post('/api/v1/scrobbles/bulk-chain', { ids, signal_chain_id, chain_variant_id });
+	}
+
+	/** Mark listens as heard in company, or pass null to unmark them.
+	 *
+	 *  `company` is always sent — the server refuses an absent field rather
+	 *  than reading it as "clear", so a typo cannot silently unmark a history. */
+	async bulkSetCompany(ids: number[], company: string | null): Promise<{ updated: number }> {
+		return this.post('/api/v1/scrobbles/bulk-company', { ids, company });
 	}
 
 	/** Make a setup the chain, and the chain a setup. A relabelling: what was

@@ -26,7 +26,7 @@ openapi: 3.1.0
 
 info:
   title: Tapedeck
-  version: 0.81.0
+  version: 0.84.0
   summary: Self-hosted scrobbler and listening journal.
   description: |
     Tapedeck ingests listens, enriches them with MusicBrainz metadata, stores
@@ -394,6 +394,24 @@ components:
             crediting a soloist appears under both names there while this field
             still names the one the record is filed under.
         album: { type: [string, 'null'] }
+        company:
+          type: [string, 'null']
+          description: |
+            Who this was heard with, as names. Filled automatically for a
+            listen that happened inside a Shared Spool, and by hand via
+            `POST /api/v1/scrobbles/bulk-company` otherwise.
+
+            **`null` means unmarked, not alone.** Nobody recorded who was
+            there — which is true of every listen predating the field. Counting
+            marked listens is exact; reporting a *share* of listening that was
+            solitary is not, and would be a fact about how much has been marked.
+        joint_session_id:
+          type: [string, 'null']
+          description: |
+            The Shared Spool this listen belonged to, as the spool's uuid. A
+            joint listen is N rows across N decks sharing this — never one row
+            with several owners. Only a sitting ever sets it; a hand edit
+            cannot, because only a sitting can know it.
         timestamp:
           type: integer
           description: Unix seconds, UTC, **start** of play.
@@ -1817,6 +1835,18 @@ paths:
         - { name: artist, in: query, schema: { type: string } }
         - { name: album, in: query, schema: { type: string } }
         - { name: track, in: query, schema: { type: string } }
+        - { name: after, in: query, schema: { type: integer }, description: Only listens at or after this Unix timestamp. }
+        - { name: before, in: query, schema: { type: integer }, description: Only listens at or before this Unix timestamp. }
+        - name: social
+          in: query
+          schema: { type: boolean }
+          description: |
+            `true` for listens marked as heard in company, `false` for the
+            rest. **Omit for everything** — and note the two halves are not
+            "with people" and "alone": an unmarked listen means nobody
+            recorded who was there, never that the listener was definitely
+            alone. Most of any history predates the marking existing, so a
+            share of solitary listening cannot be derived from this.
       responses:
         '200':
           description: OK.
@@ -1922,6 +1952,62 @@ paths:
                   loves: { type: array, items: { $ref: '#/components/schemas/Love' } }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
+
+  /api/v1/scrobbles/bulk-company:
+    post:
+      tags: [Listens]
+      summary: Mark many listens as heard in company.
+      description: |
+        Session-only. Records **who you were listening with**, on the listens
+        themselves.
+
+        Marking is retroactive by design: nobody stops mid-record to note who
+        is in the room. A Shared Spool fills the same column in automatically
+        from its joined members; this is for the commoner case of somebody in
+        the room who has no account on this instance, which is why it is free
+        text rather than a list of users.
+
+        **It is stored on the listen and not on the session**, which is not a
+        preference — `POST /api/v1/sessions/rebuild` deletes every session row
+        and re-inserts it, so anything held there is erased by a regroup with
+        nothing to say so.
+
+        `company` is required. Send an explicit `null` to unmark; an absent
+        field is a `400`, for the reason `signal_chain_id` on
+        `/api/v1/scrobbles/bulk-chain` is — this overwrites the field on every
+        listen in `ids`, so a misspelled key must not deserialise into "clear
+        it". An empty or whitespace-only string is treated as `null` rather
+        than becoming a listen marked as heard with nobody.
+
+        This never writes `joint_session_id`. That column says *this exact play
+        happened on several decks at once*, which only a Shared Spool can know.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [ids, company]
+              properties:
+                ids:
+                  type: array
+                  items: { type: integer }
+                  description: The listens to mark. Scoped to the caller; ids belonging to anyone else match nothing.
+                company:
+                  type: [string, 'null']
+                  maxLength: 200
+                  description: Who they were heard with. Explicit `null` unmarks; omitting the field is an error, not an unmark.
+      responses:
+        '200':
+          description: How many listens were changed.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  updated: { type: integer }
+        '400': { description: company was absent, or longer than 200 characters. }
+        '401': { description: Not signed in. }
 
   /api/v1/scrobbles/bulk-chain:
     post:
@@ -2929,6 +3015,143 @@ paths:
               schema: { type: object, additionalProperties: true }
         '401': { description: Not signed in. }
 
+  /api/v1/patch/sittings:
+    get:
+      tags: [Patch]
+      summary: Sittings other people have handed you.
+      security: [{ sessionCookie: [] }]
+      responses:
+        '200':
+          description: Newest first. `seen_at` is null for ones you have not opened.
+          content:
+            application/json:
+              schema: { type: object, additionalProperties: true }
+        '401': { description: Not signed in. }
+    post:
+      tags: [Patch]
+      summary: Pass a past sitting to somebody you are patched with.
+      description: |
+        **Two different gestures, and `kind` chooses between them. There is no
+        default** — they write different things to another person's permanent
+        record, so an absent field is a `400` rather than a guess.
+
+        `kind: "spool"` — **the Shared Spool neither of you started.** They were
+        in the room; you just forgot to press the button. The sitting is
+        reconstructed, its plays are offered as ordinary `spool_captures`, and
+        they **enter the recipient's history** when accepted — arriving in the
+        same inbox section and on the same accept a live sitting uses. Returns
+        `offered` and `withheld`. Idempotent: doing it again offers nothing new,
+        and naming a second person adds them to the same reconstructed sitting
+        rather than minting a parallel one.
+
+        `kind: "recommendation"` — **they were not there.** They get a
+        *document* rendered from your listens, which enters no history, count or
+        chart of theirs. `note` applies to this kind only; a set of captures has
+        nowhere to carry a sentence. Handing the same sitting to the same person
+        again updates the note rather than duplicating it.
+
+        You must be patched with them in either direction, and the sitting must
+        be yours.
+
+        **Both kinds pass on only listens through shared chains** — a sitting
+        made late captures exactly what one made on time would have, and this
+        phase has one switch for publishing rather than two. What is withheld is
+        counted either way (`withheld` here, `omitted` on the document), never
+        silently dropped. Unlike a live sitting there is a recovery: share the
+        chain and do it again.
+      security: [{ sessionCookie: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [session, to, kind]
+              properties:
+                session: { type: string, description: "The sitting's uuid, from GET /api/v1/sessions." }
+                to: { type: string, description: Username of the deck to pass it to. }
+                kind:
+                  type: string
+                  enum: [spool, recommendation]
+                  description: |
+                    `spool` reconstructs the sitting and offers its plays as
+                    captures, which reach their history on accept.
+                    `recommendation` renders a document that reaches nothing.
+                    Required — there is no safe default between the two.
+                note:
+                  type: string
+                  maxLength: 500
+                  description: Why you are passing it on. `recommendation` only; ignored for `spool`.
+      responses:
+        '200': { description: "For `spool`: the sitting's uuid plus `offered` and `withheld`. For `recommendation`: the document's uuid." }
+        '400': { description: session, to or kind was missing, kind was not one of the two, or the note was too long. }
+        '401': { description: Not signed in. }
+        '403': { description: That deck is not patched with you. }
+        '404': { description: No such deck, or no sitting of yours with that id. }
+
+  /api/v1/patch/sittings/{uuid}:
+    get:
+      tags: [Patch]
+      summary: A handed-over sitting, as a document.
+      description: |
+        Readable by the recipient **or** by whoever handed it over, so you can
+        see what you actually passed on, holes included. Any other caller gets
+        the same 404 a nonexistent id does — the alternative would confirm a
+        uuid is real to somebody it does not concern.
+
+        Rendered **live** rather than snapshotted: un-sharing a chain, or
+        regrouping the sitting, really does change what the recipient sees.
+        That is correct while both ends are on one instance, where the document
+        is served from the owner's own database on every read. It has to become
+        a snapshot when this federates, because bytes already on somebody
+        else's server cannot be recalled.
+
+        `omitted` is how many listens in the sitting are not being shown
+        because they ran through chains the owner does not share. `gone` means
+        the sitting has since been regrouped out of existence — an honest empty
+        document rather than a broken link.
+      security: [{ sessionCookie: [] }]
+      parameters:
+        - { name: uuid, in: path, required: true, schema: { type: string } }
+      responses:
+        '200':
+          description: The document.
+          content:
+            application/json:
+              schema: { type: object, additionalProperties: true }
+        '401': { description: Not signed in. }
+        '404': { description: No sitting with that id, or not yours to read. }
+    delete:
+      tags: [Patch]
+      summary: Withdraw a sitting you handed over.
+      description: |
+        A real withdrawal, unlike un-patching: nothing was ever copied, so
+        removing the row removes the access. That stops being true once this
+        federates.
+      security: [{ sessionCookie: [] }]
+      parameters:
+        - { name: uuid, in: path, required: true, schema: { type: string } }
+      responses:
+        '200': { description: Withdrawn. }
+        '401': { description: Not signed in. }
+        '404': { description: No sitting of yours with that id. }
+
+  /api/v1/patch/sittings/{uuid}/seen:
+    post:
+      tags: [Patch]
+      summary: Clear a handed-over sitting from your inbox.
+      description: |
+        **Not an accept.** A handed-over sitting writes nothing to a history,
+        so there is nothing to consent to — only a notification to stop
+        showing. Contrast `/api/v1/patch/captures`, where accepting really does
+        put a play into your listening.
+      security: [{ sessionCookie: [] }]
+      parameters:
+        - { name: uuid, in: path, required: true, schema: { type: string } }
+      responses:
+        '200': { description: Whether it had not already been seen. }
+        '401': { description: Not signed in. }
+
   /api/v1/patch/spool:
     get:
       tags: [Patch]
@@ -2955,6 +3178,12 @@ paths:
 
         One running sitting per host, enforced by a partial unique index rather
         than by a check this handler could race, so a second start is a 409.
+
+        **You may only invite a deck you are patched with**, in either
+        direction — an invitation puts a banner on somebody's Patch page, so
+        being able to aim one at a stranger would be a way to reach them
+        without their consent. One stranger in `with` refuses the whole
+        sitting rather than opening it without them.
       security: [{ sessionCookie: [] }]
       requestBody:
         required: true
@@ -2971,6 +3200,7 @@ paths:
       responses:
         '200': { description: The sitting's uuid. }
         '401': { description: Not signed in. }
+        '403': { description: One of the named decks is not patched with you. Nothing was started. }
         '404': { description: One of the named decks does not exist. }
         '409': { description: You already have a sitting running. }
 

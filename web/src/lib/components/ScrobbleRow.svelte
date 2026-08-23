@@ -70,6 +70,24 @@
 			     resize listener for something that is purely a layout question. -->
 			{#if medium}<span class="tag tag-medium qtag-inline">{medium}</span>
 			{:else if q.text}<span class="{tierTagClass(q.tier)} qtag-inline">{q.text}</span>{/if}
+			<!--
+				Who it was heard with. On the subline beside the source and chain
+				icons, never on the title line — that line was only just rescued
+				from being crushed on mobile.
+			-->
+			{#if scrobble.company}
+				<span
+					class="withwho"
+					title={scrobble.joint_session_id
+						? `Heard in a Shared Spool with ${scrobble.company}`
+						: `Heard with ${scrobble.company}`}
+				>
+					<svg viewBox="0 0 24 24" width="11" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" aria-hidden="true">
+						<circle cx="8" cy="12" r="4.4" /><circle cx="16" cy="12" r="4.4" />
+					</svg>
+					{scrobble.company}
+				</span>
+			{/if}
 		</div>
 	</div>
 	{#if showLove && !selectable}
@@ -98,6 +116,22 @@
 </div>
 
 <style>
+	/* Deliberately quiet: it is context, not a rating. The same accent the
+	   spool glyph uses elsewhere, at the subline's own size. */
+	.withwho {
+		display: inline-flex;
+		align-items: center;
+		gap: 4px;
+		flex: none;
+		max-width: 22ch;
+		overflow: hidden;
+		white-space: nowrap;
+		text-overflow: ellipsis;
+		color: var(--td-accent);
+		font-size: 11.5px;
+	}
+	.withwho svg { flex: none; }
+
 	.row {
 		display: flex;
 		align-items: center;

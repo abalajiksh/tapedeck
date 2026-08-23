@@ -202,7 +202,7 @@ async fn user_listens(
 
     let rows = match state
         .db
-        .get_recent_scrobbles(user_id, count, 0, None, None, None, after, before)
+        .get_recent_scrobbles(user_id, count, 0, None, None, None, after, before, None)
         .await
     {
         Ok(r) => r,

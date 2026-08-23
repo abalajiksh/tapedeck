@@ -1,15 +1,11 @@
 <script lang="ts">
-	// Patch — Phase 6, Step 2.
+	// Patch — Phase 6.
 	//
-	// Three of the design's six tabs. Reel, Decks and Inbox are what patches and
-	// the per-chain switch make answerable; Artists, Discover and Instance are
-	// Step 3, along with Dubs and Shared Spools. They are deliberately absent
-	// rather than stubbed — a tab that renders an empty state forever reads as a
-	// broken feature, where a tab that is not there yet reads as a roadmap.
+	// All six of the design's tabs, plus Dubs and Shared Spools.
 	//
 	// Everything here is **local**: both ends of every patch are accounts on this
-	// instance, so nothing is signed and nothing is delivered. The remote half
-	// arrives with Step 3.
+	// instance, so nothing is signed and nothing is delivered. Outbound delivery
+	// is the whole of what is left of the phase.
 	import { onMount, onDestroy } from 'svelte';
 	import { api } from '$lib/api';
 	import type {
@@ -21,7 +17,9 @@
 		FederationOps,
 		Dub,
 		SpoolView,
-		SpoolCapture
+		SpoolCapture,
+		HandedSitting,
+		HandedSittingDetail
 	} from '$lib/api';
 	import CoverArt from '$lib/components/CoverArt.svelte';
 	import ChainIcon from '$lib/components/ChainIcon.svelte';
@@ -69,9 +67,36 @@
 	let spool: SpoolView | null = null;
 	let captures: SpoolCapture[] = [];
 	let dubs: Dub[] = [];
+	// Sittings somebody passed on. Loaded with the rest rather than on the tab,
+	// because the inbox count on the tab strip has to include them.
+	let sittings: HandedSitting[] = [];
+	let openedSitting: HandedSittingDetail | null = null;
 	let spoolPicked: Record<string, boolean> = {};
 	let spoolTitle = '';
 	let showSpoolDialog = false;
+
+	// Ticks the elapsed clock on the running banner. Assigned only while a
+	// sitting is open, and the assignment is what re-renders — so an idle page
+	// pays for a timer callback and nothing else.
+	let nowSec = Math.floor(Date.now() / 1000);
+
+	// Who you can sit with: a deck you are patched with, **in either
+	// direction** — the rule a dub follows, for the reason a dub follows it
+	// (an invitation puts a banner on somebody's screen). `start_spool`
+	// enforces it, so a list built any wider here would only produce a 403 at
+	// the moment of asking.
+	$: spoolCandidates = (() => {
+		const out = new Map<string, PatchPeer>();
+		for (const p of [...following, ...followers]) {
+			if (p.state === 'accepted') out.set(p.username, p);
+		}
+		return [...out.values()].sort((a, b) =>
+			(a.display_name || a.username).localeCompare(b.display_name || b.username)
+		);
+	})();
+	$: spoolPickedCount = Object.values(spoolPicked).filter(Boolean).length;
+	// Names `nowSec`, which is what makes it tick.
+	$: spoolClock = spool ? clock(spool.started_at, nowSec) : '';
 
 	// A sitting captures only from shared chains, so a host who publishes
 	// nothing passes nothing on. Read from the chains endpoint rather than
@@ -81,9 +106,11 @@
 
 	$: pendingCaptures = captures.filter((c) => c.state === 'pending');
 	$: openDubs = dubs.filter((d) => d.status === 'open');
+	$: unseenSittings = sittings.filter((h) => !h.seen_at);
 	// One number on the tab. Three kinds of thing wait in that inbox and a
 	// person does not care which until they open it.
-	$: inboxCount = pending.length + pendingCaptures.length + openDubs.length;
+	$: inboxCount =
+		pending.length + pendingCaptures.length + openDubs.length + unseenSittings.length;
 
 	// Waiting on *you*. The inbox count is the one number that should pull
 	// someone to a tab they were not going to open.
@@ -153,6 +180,51 @@
 		}
 	}
 
+	async function loadSittings() {
+		try {
+			sittings = (await api.getSittings()).sittings;
+		} catch {
+			/* the section simply does not render */
+		}
+	}
+
+	/**
+	 * Open the document, and mark it seen in the same gesture.
+	 *
+	 * Marking on *open* rather than behind a second button because there is
+	 * nothing to decide — it wrote nothing to a history, so "seen" is the whole
+	 * of the state. Dismiss exists for the case where you do not want to read
+	 * it now and do not want it nagging.
+	 */
+	async function openSitting(h: HandedSitting) {
+		busy = h.uuid;
+		try {
+			openedSitting = await api.getSitting(h.uuid);
+			await api.markSittingSeen(h.uuid);
+			sittings = sittings.map((x) =>
+				x.uuid === h.uuid ? { ...x, seen_at: Math.floor(Date.now() / 1000) } : x
+			);
+		} catch (e) {
+			alert(e instanceof Error ? e.message : 'Could not open that');
+		} finally {
+			busy = null;
+		}
+	}
+
+	async function dismissSitting(h: HandedSitting) {
+		busy = h.uuid;
+		try {
+			await api.markSittingSeen(h.uuid);
+			sittings = sittings.map((x) =>
+				x.uuid === h.uuid ? { ...x, seen_at: Math.floor(Date.now() / 1000) } : x
+			);
+		} catch (e) {
+			alert(e instanceof Error ? e.message : 'Could not save that');
+		} finally {
+			busy = null;
+		}
+	}
+
 	async function loadDubs() {
 		try {
 			dubs = (await api.getDubs()).dubs;
@@ -180,7 +252,7 @@
 		if (tab === 'artists') void loadArtists();
 		if (tab === 'discover') void loadDiscover();
 		if (tab === 'instance') void loadInstance();
-		await Promise.all([loadDecks(), loadReel(), loadSpool(), loadDubs()]);
+		await Promise.all([loadDecks(), loadReel(), loadSpool(), loadDubs(), loadSittings()]);
 		try {
 			mySharedChains = (await api.getChains()).chains.filter((c) => c.shared).length;
 		} catch {
@@ -198,10 +270,20 @@
 		timer = setInterval(() => {
 			if (spool) void loadSpool();
 		}, 15000);
+		// The elapsed clock. Separate from the poll because it is a second a
+		// tick rather than fifteen, and it assigns only while a sitting is
+		// open — an idle page re-renders nothing.
+		tick = setInterval(() => {
+			if (spool) nowSec = Math.floor(Date.now() / 1000);
+		}, 1000);
 	});
 
 	let timer: ReturnType<typeof setInterval> | undefined;
-	onDestroy(() => clearInterval(timer));
+	let tick: ReturnType<typeof setInterval> | undefined;
+	onDestroy(() => {
+		clearInterval(timer);
+		clearInterval(tick);
+	});
 
 	function go(t: Tab) {
 		tab = t;
@@ -251,6 +333,27 @@
 		} finally {
 			busy = null;
 		}
+	}
+
+	function openSpool() {
+		spoolTitle = '';
+		spoolPicked = {};
+		showSpoolDialog = true;
+	}
+
+	// `now` is a **parameter**, and that is load-bearing. A Svelte template
+	// expression re-runs when the variables it *names* change; it does not
+	// trace them through a call — so `{clock(spool.started_at)}` reading
+	// `nowSec` from the closure renders once and sits there, which is what a
+	// stuck 0:00 looked like on screen. Taking it as an argument forces the
+	// caller to name it, so `spoolClock` below cannot be written the wrong
+	// way. Same trap as `noteCurrentTrack` and `sideTotals` on the shelf.
+	function clock(from: number, now: number): string {
+		const s = Math.max(0, now - from);
+		const h = Math.floor(s / 3600);
+		const m = Math.floor((s % 3600) / 60);
+		return h ? `${h}:${String(m).padStart(2, '0')}:${String(s % 60).padStart(2, '0')}`
+			: `${m}:${String(s % 60).padStart(2, '0')}`;
 	}
 
 	async function startSpool() {
@@ -380,6 +483,20 @@
 		<h1 class="h-display">Patch</h1>
 		<p class="sub">Patch into another deck and hear what it's running.</p>
 	</div>
+	<!--
+		Only when there is somebody to sit with and nothing already running.
+		One sitting per host is a partial unique index, so offering the button
+		during one would be offering a 409 — and with no accepted patch there
+		is nobody the server would let you invite.
+	-->
+	{#if !loading && !spool && spoolCandidates.length}
+		<button class="btn btn-secondary start-spool" on:click={openSpool}>
+			<svg viewBox="0 0 24 24" width="16" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" aria-hidden="true">
+				<circle cx="8" cy="12" r="4.4" /><circle cx="16" cy="12" r="4.4" />
+			</svg>
+			Start a Shared Spool
+		</button>
+	{/if}
 </div>
 
 <div class="seg">
@@ -423,6 +540,13 @@
 					<a href="/chains">Share one</a> to change that.
 				</div>
 			{/if}
+		</div>
+		<div class="sclock">
+			<div class="ctime">{spoolClock}</div>
+			<div class="csub">
+				{spool.captured}
+				{spool.captured === 1 ? 'play' : 'plays'} offered to you
+			</div>
 		</div>
 		<div class="sacts">
 			{#if spool.my_state === 'invited'}
@@ -778,8 +902,46 @@
 		</div>
 	</div>
 {:else}
-	{#if pendingCaptures.length}
+	<!--
+		Sittings somebody passed on. **A fourth kind of thing in this inbox, and
+		the only one with nothing to decide** — it writes nothing to a history,
+		so "Open" and "Dismiss" is the whole of it. A capture below needs
+		accepting because accepting really does put a play into your listening;
+		this does not, and the two must not be made to look alike.
+	-->
+	{#if unseenSittings.length}
 		<div class="secbar">
+			<h2 class="h-display sech">Sittings passed to you</h2>
+			<span class="seccount">{unseenSittings.length}</span>
+		</div>
+		<p class="sub" style="margin-top:0;">
+			An evening somebody wants you to hear about. It is a record of what they played —
+			<strong>none of it enters your history</strong>, so there is nothing to accept.
+		</p>
+		<div class="panel rows">
+			{#each unseenSittings as h (h.uuid)}
+				<div class="prow">
+					<span class="avatar small">{h.from_username.slice(0, 2).toUpperCase()}</span>
+					<div class="pmain">
+						<div class="pname">{h.title || 'A sitting'}</div>
+						<div class="phandle">
+							from @{h.from_username}{#if h.started_at} · {new Date(h.started_at * 1000).toLocaleDateString(undefined, { day: 'numeric', month: 'long' })}{/if}
+						</div>
+						{#if h.note}<div class="dbecause">“{h.note}”</div>{/if}
+					</div>
+					<div class="pacts">
+						<button class="btn btn-primary" on:click={() => openSitting(h)}>Open</button>
+						<button class="btn btn-secondary" disabled={busy === h.uuid} on:click={() => dismissSitting(h)}>
+							Dismiss
+						</button>
+					</div>
+				</div>
+			{/each}
+		</div>
+	{/if}
+
+	{#if pendingCaptures.length}
+		<div class="secbar" style="margin-top:26px;">
 			<h2 class="h-display sech">Spool handoffs</h2>
 			<span class="seccount">{pendingCaptures.length}</span>
 		</div>
@@ -901,8 +1063,194 @@
 	</p>
 {/if}
 
+<!--
+	The handed-over sitting itself. A document: what they played, in order.
+	Nothing here is a listen of the reader's, which is why it draws rows by hand
+	rather than reusing `ScrobbleRow` — that component carries a love heart and a
+	row menu, both of which act on *your own* history and would be acting on
+	somebody else's listening here.
+-->
+{#if openedSitting}
+	<div
+		class="dialog-backdrop"
+		on:click={() => (openedSitting = null)}
+		on:keydown={() => {}}
+		role="presentation"
+	>
+		<div
+			class="dialog sitting-doc"
+			on:click|stopPropagation
+			on:keydown|stopPropagation
+			role="presentation"
+		>
+			<div class="dialog-title">{openedSitting.title || 'A sitting'}</div>
+			<div class="dialog-body" style="min-width:0;">
+				<p class="shead">
+					{openedSitting.from_display_name || openedSitting.from_username}
+					{#if openedSitting.started_at}
+						· {new Date(openedSitting.started_at * 1000).toLocaleString(undefined, {
+							weekday: 'long',
+							day: 'numeric',
+							month: 'long',
+							hour: '2-digit',
+							minute: '2-digit'
+						})}
+					{/if}
+				</p>
+				{#if openedSitting.note}
+					<div class="dbecause" style="margin-bottom:14px;">“{openedSitting.note}”</div>
+				{/if}
+
+				{#if openedSitting.gone}
+					<p class="sub" style="margin:0;">
+						They have since regrouped their sessions, so this sitting no longer exists as
+						one. Nothing was lost on their side — the listens are still theirs.
+					</p>
+				{:else if !openedSitting.listens.length}
+					<p class="sub" style="margin:0;">
+						Nothing in this sitting ran through a chain they share, so there is nothing to
+						show. Sharing is per chain and off by default.
+					</p>
+				{:else}
+					<div class="slist">
+						{#each openedSitting.listens as l, i (i)}
+							<div class="slrow">
+								<CoverArt
+									url={l.artwork_url}
+									caaId={l.caa_id}
+									releaseMbid={l.caa_release_mbid}
+									seed={l.artist}
+								/>
+								<div style="flex:1;min-width:0;">
+									<div class="sltitle">{l.title}</div>
+									<div class="slsub">
+										{l.artist}{l.album ? ` — ${l.album}` : ''}
+										{#if l.chain_name}<span class="slchain">{l.chain_name}</span>{/if}
+									</div>
+								</div>
+								<span class="sltime">
+									{new Date(l.timestamp * 1000).toLocaleTimeString(undefined, {
+										hour: '2-digit',
+										minute: '2-digit'
+									})}
+								</span>
+							</div>
+						{/each}
+					</div>
+				{/if}
+
+				<!--
+					Stated, never a silent difference. A document with invisible
+					holes misrepresents the evening and the reader could not tell.
+				-->
+				{#if openedSitting.omitted > 0}
+					<p class="somitted">
+						{openedSitting.omitted}
+						{openedSitting.omitted === 1 ? 'listen is' : 'listens are'} not shown — they ran
+						through chains they don't share.
+					</p>
+				{/if}
+			</div>
+			<div class="dialog-actions">
+				<button class="btn btn-secondary" on:click={() => (openedSitting = null)}>Close</button>
+			</div>
+		</div>
+	</div>
+{/if}
+
+<!--
+	Start a Shared Spool.
+
+	Two fields the design draws are deliberately absent rather than drawn and
+	ignored. Its **chain picker** would be a second way to decide what a sitting
+	publishes, and there is exactly one — the per-chain shared switch — which
+	this must not quietly acquire an override for. Its **length** ("1 hour",
+	"until I end it") has nothing behind it: `spools` has no `ends_at`, so the
+	control would set a limit nothing enforces. Both are cheap to add once
+	they mean something; a control that does nothing is not.
+-->
+{#if showSpoolDialog}
+	<div
+		class="dialog-backdrop"
+		on:click={() => (showSpoolDialog = false)}
+		on:keydown={() => {}}
+		role="presentation"
+	>
+		<div class="dialog" on:click|stopPropagation on:keydown|stopPropagation role="presentation">
+			<div class="dialog-title">Start a Shared Spool</div>
+			<div class="dialog-body">
+				<p style="margin:0 0 15px;text-wrap:pretty;">
+					Every deck keeps recording its own plays. What yours captures lands in the others'
+					inboxes to confirm — nothing writes straight into a history.
+				</p>
+
+				<!--
+					The moment to say this is here, not after an empty inbox: a
+					host who shares no chain captures nothing at all.
+				-->
+				{#if !mySharedChains}
+					<div class="dwarn">
+						You share no chains, so nothing you play would be passed on.
+						<a href="/chains">Share one first</a>.
+					</div>
+				{/if}
+
+				<div class="field" style="margin-bottom:14px;">
+					<label for="sp-title">Call it something <span style="opacity:.6">(optional)</span></label>
+					<input
+						id="sp-title"
+						class="input"
+						bind:value={spoolTitle}
+						placeholder="Sunday listening"
+						maxlength="80"
+					/>
+				</div>
+
+				<div class="field">
+					<label for="sp-with">Spool with</label>
+					<div class="picklist" id="sp-with">
+						{#each spoolCandidates as p (p.username)}
+							<label class="pick" class:on={spoolPicked[p.username]}>
+								<input type="checkbox" bind:checked={spoolPicked[p.username]} />
+								<span class="avatar small">{p.username.slice(0, 2).toUpperCase()}</span>
+								<span class="pickname">
+									{p.display_name || p.username}
+									<span class="pickhandle">@{p.username}</span>
+								</span>
+							</label>
+						{/each}
+					</div>
+					<div class="pickfoot">
+						{spoolPickedCount > 1
+							? `${spoolPickedCount} decks — every side confirms its own captures`
+							: 'Pick one deck, or several for a group sitting'}
+					</div>
+				</div>
+			</div>
+			<div class="dialog-actions">
+				<button class="btn btn-secondary" on:click={() => (showSpoolDialog = false)}>Cancel</button>
+				<button
+					class="btn btn-primary"
+					disabled={busy === 'spool' || spoolPickedCount === 0}
+					on:click={startSpool}
+				>
+					{busy === 'spool' ? 'Sending…' : 'Send invitation'}
+				</button>
+			</div>
+		</div>
+	</div>
+{/if}
+
 <style>
-	.head { margin-bottom: 14px; }
+	.head {
+		margin-bottom: 14px;
+		display: flex;
+		align-items: flex-start;
+		justify-content: space-between;
+		gap: 16px;
+		flex-wrap: wrap;
+	}
+	.start-spool { display: inline-flex; align-items: center; gap: 8px; white-space: nowrap; }
 	h1 { font-size: 30px; margin: 0 0 4px; }
 	.sub { margin: 0 0 16px; font-size: 13.5px; color: var(--td-muted); max-width: 64ch; }
 
@@ -1115,6 +1463,112 @@
 	}
 	.spulse span:last-child { background: var(--td-accent-2); animation-delay: 0.4s; }
 	.spool.invited .spulse span { animation: none; }
+	/* The clock and what the sitting has offered. Both were already in the
+	   payload — `started_at` and `captured` — and drawn nowhere. */
+	.spool .sclock { text-align: right; flex: none; }
+	.spool .ctime {
+		font-variant-numeric: tabular-nums;
+		font-size: 21px;
+		letter-spacing: .06em;
+		color: #f4e7cf;
+	}
+	.spool .csub { font-size: 11.5px; color: #9a8c72; margin-top: 2px; }
+
+	/* — a handed-over sitting — */
+	.sitting-doc { width: min(560px, 100%); min-width: 0; }
+	.shead { margin: 0 0 12px; font-size: 13px; color: var(--td-muted); }
+	.slist {
+		display: flex;
+		flex-direction: column;
+		max-height: 46vh;
+		overflow-y: auto;
+		border: 1px solid var(--td-border);
+		border-radius: 14px;
+	}
+	.slrow {
+		display: flex;
+		align-items: center;
+		gap: 11px;
+		padding: 9px 11px;
+		min-width: 0;
+	}
+	.slrow + .slrow { border-top: 1px solid var(--td-border); }
+	.sltitle {
+		font-size: 13.5px;
+		font-weight: 600;
+		white-space: nowrap;
+		overflow: hidden;
+		text-overflow: ellipsis;
+	}
+	.slsub {
+		font-size: 12px;
+		color: var(--td-muted-2);
+		white-space: nowrap;
+		overflow: hidden;
+		text-overflow: ellipsis;
+	}
+	.slchain { color: var(--td-accent); margin-left: 7px; }
+	.sltime {
+		flex: none;
+		font-size: 12px;
+		color: var(--td-muted-3);
+		font-variant-numeric: tabular-nums;
+	}
+	.somitted {
+		margin: 12px 0 0;
+		font-size: 12.5px;
+		color: var(--td-text);
+		background: color-mix(in srgb, var(--td-accent) 10%, transparent);
+		border-left: 3px solid var(--td-accent);
+		border-radius: 0 12px 12px 0;
+		padding: 9px 12px;
+	}
+
+	/* — the start dialog — */
+	/* Deliberately *not* `--td-bad-*`. That pair is the destructive red, and
+	   this is a consequence worth knowing rather than a dangerous act — using
+	   it here would blunt the one signal that means "careful". Body text stays
+	   `--td-text` and the accent marks the edge, so it reads in both themes by
+	   construction rather than by a colour pairing invented for one. */
+	.dwarn {
+		font-size: 12.5px;
+		color: var(--td-text);
+		background: color-mix(in srgb, var(--td-accent) 10%, transparent);
+		border-left: 3px solid var(--td-accent);
+		border-radius: 0 12px 12px 0;
+		padding: 9px 12px;
+		margin-bottom: 14px;
+	}
+	.dwarn a { color: var(--td-accent); text-decoration: underline; }
+	.picklist {
+		display: flex;
+		flex-direction: column;
+		gap: 4px;
+		max-height: 232px;
+		overflow-y: auto;
+		border: 1px solid var(--td-border);
+		border-radius: 14px;
+		padding: 6px;
+	}
+	.pick {
+		display: flex;
+		align-items: center;
+		gap: 10px;
+		padding: 7px 9px;
+		border-radius: 10px;
+		cursor: pointer;
+		font-size: 13.5px;
+	}
+	.pick:hover { background: var(--td-surface2); }
+	.pick.on { background: rgba(198, 113, 57, .12); }
+	.pick input { accent-color: var(--td-accent); width: 15px; height: 15px; flex: none; }
+	.pickname { display: flex; flex-direction: column; line-height: 1.3; min-width: 0; }
+	.pickhandle { font-size: 11.5px; color: var(--td-muted-2); }
+	.pickfoot { font-size: 12px; color: var(--td-muted-2); margin-top: 7px; }
+
+	@media (max-width: 560px) {
+		.spool .sclock { text-align: left; }
+	}
 	@media (prefers-reduced-motion: reduce) {
 		.spulse span { animation: none; }
 	}

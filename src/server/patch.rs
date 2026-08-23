@@ -95,6 +95,9 @@ pub fn create_patch_router() -> Router<Arc<AppState>> {
         .route("/api/v1/patch/spool/:uuid/join", post(join_spool))
         .route("/api/v1/patch/spool/:uuid/end", post(end_spool))
         .route("/api/v1/patch/captures", post(settle_captures))
+        .route("/api/v1/patch/sittings", get(sittings).post(hand_over))
+        .route("/api/v1/patch/sittings/:uuid", get(sitting).delete(withdraw_sitting))
+        .route("/api/v1/patch/sittings/:uuid/seen", post(mark_seen))
 }
 
 // ── Step 2: patches, the inbox, and the Reel ─────────────────
@@ -589,6 +592,173 @@ struct SettleCapturesBody {
     accept: Option<bool>,
 }
 
+#[derive(Deserialize)]
+struct HandOverBody {
+    /// The sitting's uuid, from `GET /api/v1/sessions`.
+    session: Option<String>,
+    /// The username to hand it to.
+    to: Option<String>,
+    note: Option<String>,
+    /// **Which of the two gestures this is, and it is required.**
+    ///
+    /// `spool` — they were in the room and neither of you started a sitting.
+    /// The plays are offered as ordinary captures and enter their history when
+    /// they accept, exactly as a live Shared Spool would have.
+    ///
+    /// `recommendation` — they were not there. They get a document of what you
+    /// played, and nothing enters their history.
+    ///
+    /// No default. The two write different things to somebody else's permanent
+    /// record, so guessing from an absent field is the one thing this must not
+    /// do — the rule `bulk-chain` learned the expensive way.
+    kind: Option<String>,
+}
+
+/// `GET /api/v1/patch/sittings` — sittings other people have handed you.
+async fn sittings(State(state): State<Arc<AppState>>, user: super::auth::AuthUser) -> Response {
+    match state.db.sittings_for(user.user_id).await {
+        Ok(v) => (StatusCode::OK, Json(serde_json::json!({ "sittings": v }))).into_response(),
+        Err(e) => {
+            warn!("📡 sittings: {e}");
+            refused(StatusCode::INTERNAL_SERVER_ERROR, "Could not read those")
+        }
+    }
+}
+
+/// `POST /api/v1/patch/sittings` — hand one of your sittings to somebody.
+///
+/// **This copies nothing.** The recipient gets a document rendered from your
+/// listens, which enters no history of theirs — they were not in the room, and
+/// writing plays onto somebody's permanent record when they demonstrably did
+/// not hear them is the error `ListenDisposition` exists to prevent.
+async fn hand_over(
+    State(state): State<Arc<AppState>>,
+    user: super::auth::AuthUser,
+    Json(body): Json<HandOverBody>,
+) -> Response {
+    let Some(session) = body.session.as_deref().map(str::trim).filter(|s| !s.is_empty()) else {
+        return refused(StatusCode::BAD_REQUEST, "`session` is required");
+    };
+    let Some(to) = body.to.as_deref().map(str::trim).filter(|s| !s.is_empty()) else {
+        return refused(StatusCode::BAD_REQUEST, "`to` is required — name a deck to hand it to");
+    };
+    let note = body.note.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    if note.is_some_and(|n| n.chars().count() > 500) {
+        return refused(StatusCode::BAD_REQUEST, "That note is too long — 500 characters at most");
+    }
+    let kind = match body.kind.as_deref() {
+        Some("spool") | Some("recommendation") => body.kind.as_deref().unwrap(),
+        _ => {
+            return refused(
+                StatusCode::BAD_REQUEST,
+                "`kind` is required — \"spool\" if they were listening with you and the plays \
+                 should reach their history, \"recommendation\" if they were not there and this \
+                 is just something to look at.",
+            )
+        }
+    };
+
+    let to_id = match state.db.patchable_user_id(to).await {
+        Ok(Some(id)) => id,
+        Ok(None) => return refused(StatusCode::NOT_FOUND, "No such deck on this instance"),
+        Err(e) => {
+            warn!("📡 hand over: {e}");
+            return refused(StatusCode::INTERNAL_SERVER_ERROR, "Could not look that deck up");
+        }
+    };
+
+    let result = if kind == "spool" {
+        state.db.retro_spool_from_session(user.user_id, session, to_id).await.map(
+            |(uuid, offered, withheld)| {
+                info!(
+                    "📡 {} reconstructed a sitting for {} — {offered} offered, {withheld} withheld",
+                    user.username, to
+                );
+                serde_json::json!({
+                    "kind": "spool", "uuid": uuid,
+                    "offered": offered, "withheld": withheld,
+                })
+            },
+        )
+    } else {
+        state.db.hand_over_session(user.user_id, session, to_id, note).await.map(|uuid| {
+            info!("📡 {} passed a sitting to {}", user.username, to);
+            serde_json::json!({ "kind": "recommendation", "uuid": uuid })
+        })
+    };
+
+    match result {
+        Ok(body) => (StatusCode::OK, Json(body)).into_response(),
+        Err(sqlx::Error::Protocol(msg)) => refused(StatusCode::FORBIDDEN, msg),
+        Err(sqlx::Error::RowNotFound) => {
+            refused(StatusCode::NOT_FOUND, "No sitting of yours with that id")
+        }
+        Err(e) => {
+            warn!("📡 hand over: {e}");
+            refused(StatusCode::INTERNAL_SERVER_ERROR, "Could not hand that over")
+        }
+    }
+}
+
+/// `GET /api/v1/patch/sittings/:uuid` — the document.
+async fn sitting(
+    State(state): State<Arc<AppState>>,
+    user: super::auth::AuthUser,
+    Path(uuid): Path<String>,
+) -> Response {
+    match state.db.handed_sitting(&uuid, user.user_id).await {
+        Ok(Some(d)) => (StatusCode::OK, Json(d)).into_response(),
+        // Not yours to read and does not exist are the same answer, or the
+        // first would confirm a uuid is real to somebody it does not concern.
+        Ok(None) => refused(StatusCode::NOT_FOUND, "No sitting with that id"),
+        Err(e) => {
+            warn!("📡 sitting: {e}");
+            refused(StatusCode::INTERNAL_SERVER_ERROR, "Could not read that")
+        }
+    }
+}
+
+/// `DELETE /api/v1/patch/sittings/:uuid` — withdraw one you handed over.
+///
+/// A real withdrawal, unlike un-patching: nothing was ever copied, so removing
+/// the row removes the access. That stops being true the moment this
+/// federates, which is why the storage note says the remote case must be a
+/// snapshot.
+async fn withdraw_sitting(
+    State(state): State<Arc<AppState>>,
+    user: super::auth::AuthUser,
+    Path(uuid): Path<String>,
+) -> Response {
+    match state.db.withdraw_session(&uuid, user.user_id).await {
+        Ok(true) => {
+            (StatusCode::OK, Json(serde_json::json!({ "withdrawn": true }))).into_response()
+        }
+        Ok(false) => refused(StatusCode::NOT_FOUND, "No sitting of yours with that id"),
+        Err(e) => {
+            warn!("📡 withdraw sitting: {e}");
+            refused(StatusCode::INTERNAL_SERVER_ERROR, "Could not withdraw that")
+        }
+    }
+}
+
+/// `POST /api/v1/patch/sittings/:uuid/seen` — clear it from the inbox.
+///
+/// Not an accept. A handed-over sitting writes nothing to a history, so there
+/// is nothing to consent to — only a notification to stop showing.
+async fn mark_seen(
+    State(state): State<Arc<AppState>>,
+    user: super::auth::AuthUser,
+    Path(uuid): Path<String>,
+) -> Response {
+    match state.db.mark_sitting_seen(&uuid, user.user_id).await {
+        Ok(seen) => (StatusCode::OK, Json(serde_json::json!({ "seen": seen }))).into_response(),
+        Err(e) => {
+            warn!("📡 sitting seen: {e}");
+            refused(StatusCode::INTERNAL_SERVER_ERROR, "Could not save that")
+        }
+    }
+}
+
 /// `GET /api/v1/patch/spool` — the sitting you are in, and what it has offered.
 async fn spool(State(state): State<Arc<AppState>>, user: super::auth::AuthUser) -> Response {
     // Sequential — see `decks`. Two connections for one request against a pool
@@ -634,6 +804,10 @@ async fn start_spool(
             info!("📡 {} started a spool with {} others", user.username, ids.len());
             (StatusCode::OK, Json(serde_json::json!({ "uuid": uuid }))).into_response()
         }
+        // Inviting somebody you are not patched with. The guard is in `db`, so
+        // this arm reports it rather than deciding it — the same shape `dub`
+        // uses for the identical rule.
+        Err(sqlx::Error::Protocol(msg)) => refused(StatusCode::FORBIDDEN, msg),
         // The partial unique index, not a check this handler races.
         Err(e) if e.to_string().contains("UNIQUE") => {
             refused(StatusCode::CONFLICT, "You already have a sitting running")

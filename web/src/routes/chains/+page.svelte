@@ -1249,18 +1249,40 @@
 			     how you listen, not a property of the wiring. -->
 			<div class="share-row">
 				<div style="min-width:0;">
-					<div style="font-size:14px;font-weight:600;">Share this chain</div>
+					<div style="font-size:14px;font-weight:600;">Who hears this chain</div>
 					<div style="font-size:12.5px;color:var(--td-muted);line-height:1.45;max-width:46ch;">
-						Listens through it reach the Reel of anyone patched into your deck.
-						Off by default, and the only thing that publishes a listen — there
-						is no per-listen setting.
+						<strong>Private</strong> is the default and means nobody but you.
+						<strong>Shared</strong> means listens through it reach the Reel of anyone
+						patched into your deck — and it is the only thing that publishes a
+						listen, so there is no per-listen setting.
 					</div>
 				</div>
-				<label class="share-toggle">
-					<input type="checkbox" checked={openChain.shared} disabled={sharingChain === openChain.id}
-						on:change={(e) => openChain && toggleShared(openChain, e.currentTarget.checked)}>
-					{openChain.shared ? 'Shared' : 'Private'}
-				</label>
+				<!--
+					A segmented pair, not a checkbox. The checkbox was labelled with
+					the *current state* ("Private" when unshared), and a checkbox
+					label conventionally says what ticking it does — so "☐ Private"
+					read as "tick to make private", which is the opposite of what it
+					did. Two segments cannot be misread: the lit one is the state.
+				-->
+				<div class="seg share-seg" role="group" aria-label="Who hears this chain">
+					<button
+						class="seg-btn"
+						class:on={!openChain.shared}
+						aria-pressed={!openChain.shared}
+						disabled={sharingChain === openChain.id}
+						on:click={() => openChain?.shared && toggleShared(openChain, false)}
+					>Private</button>
+					<button
+						class="seg-btn"
+						class:on={openChain.shared}
+						aria-pressed={openChain.shared}
+						disabled={sharingChain === openChain.id}
+						on:click={() => openChain && !openChain.shared && toggleShared(openChain, true)}
+					>Shared</button>
+					<!-- Each guard means clicking the segment that is already lit
+					     does nothing, rather than spending a PUT to set the state
+					     it is already in. -->
+				</div>
 			</div>
 
 			<div class="drawer-label">Signal path</div>
@@ -1863,21 +1885,9 @@
 		border-radius: 16px;
 		background: var(--td-surface2);
 	}
-	.share-toggle {
-		display: flex;
-		align-items: center;
-		gap: 8px;
-		font-size: 13.5px;
-		font-weight: 600;
-		white-space: nowrap;
-		cursor: pointer;
-	}
-	.share-toggle input {
-		width: 16px;
-		height: 16px;
-		accent-color: var(--td-accent);
-		cursor: pointer;
-	}
+	.share-seg { flex: none; align-self: flex-start; }
+	.share-seg .seg-btn { font-size: 12.5px; }
+	.share-seg .seg-btn:disabled { opacity: .6; cursor: default; }
 	.cend { flex: 0 0 auto; display: flex; align-items: center; gap: 14px; }
 	/* — where a gear total came from —
 	   The figure is derived from listens across possibly several chains, so it

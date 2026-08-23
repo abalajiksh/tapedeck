@@ -89,6 +89,11 @@
 	let selectMode = false;
 	let selected = new Set<number>();
 	let bulkChain = '';
+	let bulkCompany = '';
+	// null = everything. The third state is load-bearing: an unmarked listen is
+	// unmarked, not proven solitary, so "everything" cannot be spelled as
+	// "solo + social".
+	let socialFilter: boolean | null = null;
 	/** Which setup of that chain. A variant belongs to exactly one chain, so
 	 *  this resets whenever the chain does. */
 	let bulkVariant = '';
@@ -99,7 +104,39 @@
 		else selected.add(s.id);
 		selected = selected; // trigger reactivity
 	}
-	function exitSelect() { selectMode = false; selected = new Set(); bulkChain = ''; bulkVariant = ''; }
+	function exitSelect() {
+		selectMode = false;
+		selected = new Set();
+		bulkChain = '';
+		bulkVariant = '';
+		bulkCompany = '';
+	}
+
+	/**
+	 * Mark the selected listens as heard in company.
+	 *
+	 * Its own action rather than a field on the chain Apply, and that is not
+	 * fussiness: the chain picker's empty option *means* "clear the chain", so
+	 * one Apply covering both fields could not tell "leave the company alone"
+	 * from "unmark it". That is the same absent-versus-null distinction the
+	 * endpoint refuses to guess at, appearing in the UI.
+	 */
+	async function applyBulkCompany(clear = false) {
+		if (!selected.size) return;
+		const who = clear ? null : bulkCompany.trim();
+		if (!clear && !who) return;
+		saving = true;
+		try {
+			await api.bulkSetCompany([...selected], who);
+			scrobbles = scrobbles.map((s) =>
+				selected.has(s.id) ? { ...s, company: who } : s
+			);
+			exitSelect();
+		} catch (e) {
+			alert('Could not save that: ' + e);
+		}
+		saving = false;
+	}
 
 	async function applyBulkChain() {
 		if (!selected.size) return;
@@ -159,13 +196,40 @@
 				// narrow by album or track instead.
 				artist: filter || scope.artist || undefined,
 				album: scope.album,
-				track: scope.track
+				track: scope.track,
+				social: socialFilter ?? undefined
 			});
 			scrobbles = reset ? res.scrobbles : [...scrobbles, ...res.scrobbles];
 			offset += res.scrobbles.length;
 			hasMore = res.scrobbles.length === PAGE;
 		} catch (e) { console.warn('history', e); }
 		loading = false;
+	}
+
+	// Decks this person is patched with, so a sitting can be handed over. Loaded
+	// once for the page rather than per card, and a failure simply hides the
+	// button — being unable to reach the Patch endpoints is not a reason for the
+	// History page to show an error.
+	let peers: { username: string; display_name: string | null }[] = [];
+	async function loadPeers() {
+		try {
+			const d = await api.getPatchDecks();
+			const out = new Map<string, { username: string; display_name: string | null }>();
+			for (const p of [...d.following, ...d.followers]) {
+				if (p.state === 'accepted')
+					out.set(p.username, { username: p.username, display_name: p.display_name });
+			}
+			peers = [...out.values()].sort((a, b) =>
+				(a.display_name || a.username).localeCompare(b.display_name || b.username)
+			);
+		} catch {
+			/* no button, which is the right outcome when there is nobody */
+		}
+	}
+
+	function setSocial(v: boolean | null) {
+		socialFilter = v;
+		void load(true);
 	}
 
 	let filterTimer: ReturnType<typeof setTimeout>;
@@ -197,7 +261,8 @@
 				offset: 0,
 				artist: filter || scope.artist || undefined,
 				album: scope.album,
-				track: scope.track
+				track: scope.track,
+				social: socialFilter ?? undefined
 			});
 			const known = new Set(scrobbles.map((s) => s.id));
 			const fresh = res.scrobbles.filter((s) => !known.has(s.id));
@@ -274,6 +339,7 @@
 		// Optional in the same way: an instance with no variants simply shows no
 		// variant picker on a session card.
 		try { variants = (await api.getVariants()).variants; } catch { /* optional */ }
+		void loadPeers();
 		await load(true);
 
 		refreshTimer = setInterval(refreshHead, REFRESH_MS);
@@ -319,6 +385,17 @@
 			<button class="btn btn-secondary" on:click={() => (selectMode = true)}>Select</button>
 		{/if}
 		{#if groupBy === 'day'}
+			<!--
+				Three states, not two. "Everything" is not "alone plus in
+				company": a listen nobody marked is *unmarked*, and most of any
+				history predates the marking existing — so collapsing this to a
+				pair would quietly claim every old listen was solitary.
+			-->
+			<div style="display:inline-flex;background:var(--td-sidebar);border-radius:999px;padding:3px;gap:2px;">
+				<button class="seg-btn" class:on={socialFilter === null} on:click={() => setSocial(null)}>All</button>
+				<button class="seg-btn" class:on={socialFilter === true} on:click={() => setSocial(true)}>With others</button>
+				<button class="seg-btn" class:on={socialFilter === false} on:click={() => setSocial(false)}>Unmarked</button>
+			</div>
 			<input class="input" style="width:200px;" bind:value={filter} on:input={onFilter} placeholder="Filter by artist…">
 		{/if}
 	</div>
@@ -352,6 +429,22 @@
 			</select>
 		{/if}
 		<button class="btn btn-primary" on:click={applyBulkChain} disabled={!selectedCount || saving}>{saving ? 'Applying…' : 'Apply'}</button>
+		<div style="flex-basis:100%;height:0;"></div>
+		<span style="font-size:13px;color:var(--td-muted);">Heard with:</span>
+		<input
+			class="input"
+			style="width:auto;min-width:200px;flex:1;"
+			bind:value={bulkCompany}
+			maxlength="200"
+			placeholder="Kim, and whoever else was there"
+			on:keydown={(e) => e.key === 'Enter' && applyBulkCompany()}
+		/>
+		<button class="btn btn-primary" on:click={() => applyBulkCompany()} disabled={!selectedCount || saving || !bulkCompany.trim()}>
+			Mark
+		</button>
+		<button class="btn btn-secondary" on:click={() => applyBulkCompany(true)} disabled={!selectedCount || saving}>
+			Unmark
+		</button>
 	</div>
 {/if}
 
@@ -377,6 +470,7 @@
 				session={sess}
 				{chains}
 				{variants}
+				{peers}
 				selectable={mergeMode}
 				selected={mergePick.has(sess.id)}
 				on:toggle={(e) => toggleMergePick(e.detail)}

@@ -52,7 +52,7 @@ async fn export(
                 }
                 Phase::Rows(off) => {
                     let page = db
-                        .get_recent_scrobbles(uid, PAGE, off, None, None, None, None, None)
+                        .get_recent_scrobbles(uid, PAGE, off, None, None, None, None, None, None)
                         .await
                         .unwrap_or_default();
                     if page.is_empty() {
