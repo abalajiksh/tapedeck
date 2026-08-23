@@ -80,6 +80,33 @@
 	// the whole list would otherwise reload under an open drawer.
 	let sharingChain: number | null = null;
 
+	/// Make a variant the chain, and the chain a variant.
+	///
+	/// `confirm`, not `prompt` — this page and the rest of the app use dialogs
+	/// and `confirm`, and `prompt` would be the only one in the codebase. The
+	/// setup the chain is demoted to needs a name, so it takes the chain's own,
+	/// which is what somebody would call it after the fact; the ✎ beside it
+	/// renames it in one click if they want something else.
+	///
+	/// Worth confirming even though nothing is destroyed: it rewrites the chain
+	/// everything else on this page is described in terms of, and the reassuring
+	/// half — that no hours move — is not guessable from the button.
+	async function promote(chain: SignalChain, v: ChainVariant) {
+		const ok = confirm(
+			`Make “${v.name}” the chain itself?\n\n` +
+				`“${chain.name}” as it stands now becomes a setup, keeping that name. ` +
+				`Nothing about what was fitted for any listen changes and no gear's hours move — ` +
+				`it is a relabelling.`
+		);
+		if (!ok) return;
+		try {
+			await api.promoteVariant(v.id, chain.name);
+			await load();
+		} catch (e) {
+			alert(e instanceof Error ? e.message : 'Could not do that');
+		}
+	}
+
 	async function toggleShared(chain: SignalChain, on: boolean) {
 		sharingChain = chain.id;
 		try {
@@ -1280,6 +1307,13 @@
 					<span style="font-size:14px;min-width:0;">{v.name}</span>
 					<span style="display:flex;align-items:center;gap:6px;flex:none;">
 						<span style="font-size:12.5px;color:var(--td-muted-2);font-variant-numeric:tabular-nums;">{formatHours(v.total_hours)}</span>
+						<!-- The common case this exists for: the variant is the one
+						     actually in use most of the time, so it should be what the
+						     chain *is*. A relabelling — nothing about what was fitted
+						     for any listen changes, and neither do anyone's hours. -->
+						<button class="icon-btn" style="width:26px;height:26px;" title="Make this the chain"
+							aria-label="Make {v.name} the chain"
+							on:click={() => openChain && promote(openChain, v)}>★</button>
 						<button class="icon-btn" style="width:26px;height:26px;" title="Edit this variant"
 							aria-label="Edit variant {v.name}"
 							on:click={() => openChain && editVariant(openChain, v)}>✎</button>

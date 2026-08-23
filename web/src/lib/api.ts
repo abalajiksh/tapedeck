@@ -31,6 +31,8 @@ export interface Scrobble {
 	delivery_bit_depth: number | null;
 	quality_score: number | null;
 	chain_id: number | null;
+	/** Which setup of that chain was fitted, when one was named. */
+	chain_variant_id: number | null;
 	listening_context: string | null;
 	submission_client: string | null;
 	/** Which code path produced it: Plex, jellyfin, emby, navidrome, physical,
@@ -2371,8 +2373,18 @@ class TapedeckAPI {
 	async deleteBinding(id: number): Promise<void> { return this.delNoBody(`/api/v1/bindings/${id}`); }
 
 	// ── Bulk chain reassignment (History) ──
-	async bulkSetChain(ids: number[], signal_chain_id: number | null): Promise<{ updated: number }> {
-		return this.post('/api/v1/scrobbles/bulk-chain', { ids, signal_chain_id });
+	async bulkSetChain(
+		ids: number[],
+		signal_chain_id: number | null,
+		chain_variant_id: number | null = null
+	): Promise<{ updated: number }> {
+		return this.post('/api/v1/scrobbles/bulk-chain', { ids, signal_chain_id, chain_variant_id });
+	}
+
+	/** Make a setup the chain, and the chain a setup. A relabelling: what was
+	 *  fitted for any listen, and every piece of gear's hours, are unchanged. */
+	async promoteVariant(id: number, name?: string): Promise<{ old_base_variant_id: number }> {
+		return this.post(`/api/v1/chains/variants/${id}/promote`, { name });
 	}
 
 	// ── Liner notes & loves ──

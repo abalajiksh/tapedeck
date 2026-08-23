@@ -81,7 +81,7 @@
 	let menuFor: Scrobble | null = null;
 	let inspecting: Scrobble | null = null;
 	let editing: Scrobble | null = null;
-	let edit = { title: '', artist: '', album: '', mbid_recording: '', signal_chain_id: 0, format_type: '' };
+	let edit = { title: '', artist: '', album: '', mbid_recording: '', signal_chain_id: 0, chain_variant_id: 0, format_type: '' };
 	let confirmDelete: Scrobble | null = null;
 	let saving = false;
 
@@ -89,6 +89,9 @@
 	let selectMode = false;
 	let selected = new Set<number>();
 	let bulkChain = '';
+	/** Which setup of that chain. A variant belongs to exactly one chain, so
+	 *  this resets whenever the chain does. */
+	let bulkVariant = '';
 	$: selectedCount = selected.size;
 
 	function toggleSelect(s: Scrobble) {
@@ -96,20 +99,31 @@
 		else selected.add(s.id);
 		selected = selected; // trigger reactivity
 	}
-	function exitSelect() { selectMode = false; selected = new Set(); bulkChain = ''; }
+	function exitSelect() { selectMode = false; selected = new Set(); bulkChain = ''; bulkVariant = ''; }
 
 	async function applyBulkChain() {
 		if (!selected.size) return;
 		const cid = bulkChain ? Number(bulkChain) : null;
+		const vid = cid && bulkVariant ? Number(bulkVariant) : null;
 		saving = true;
 		try {
-			await api.bulkSetChain([...selected], cid);
+			await api.bulkSetChain([...selected], cid, vid);
 			const chain = cid; // scrobbles carry chain_id
-			scrobbles = scrobbles.map((s) => (selected.has(s.id) ? { ...s, chain_id: chain } : s));
+			scrobbles = scrobbles.map((s) =>
+				selected.has(s.id) ? { ...s, chain_id: chain, chain_variant_id: vid } : s
+			);
 			exitSelect();
 		} catch (e) { alert('Bulk update failed: ' + e); }
 		saving = false;
 	}
+
+	/** A variant belongs to exactly one chain, so each picker offers only that
+	 *  chain's — and clears itself when the chain changes underneath it. */
+	$: bulkVariants = variants.filter((v) => v.chain_id === Number(bulkChain));
+	$: if (bulkChain !== undefined && !bulkVariants.some((v) => String(v.id) === bulkVariant))
+		bulkVariant = '';
+	$: editVariants = variants.filter((v) => v.chain_id === edit.signal_chain_id);
+	$: if (!editVariants.some((v) => v.id === edit.chain_variant_id)) edit.chain_variant_id = 0;
 
 	$: groups = groupByDay(scrobbles);
 
@@ -212,7 +226,8 @@
 		edit = {
 			title: s.title, artist: s.artist, album: s.album ?? '',
 			mbid_recording: s.mbid_recording ?? '',
-			signal_chain_id: 0, format_type: s.format_type ?? ''
+			signal_chain_id: s.chain_id ?? 0, chain_variant_id: s.chain_variant_id ?? 0,
+			format_type: s.format_type ?? ''
 		};
 	}
 
@@ -224,7 +239,13 @@
 				title: edit.title, artist: edit.artist, album: edit.album,
 				mbid_recording: edit.mbid_recording, format_type: edit.format_type
 			};
-			if (edit.signal_chain_id) changes.signal_chain_id = edit.signal_chain_id;
+			if (edit.signal_chain_id) {
+				changes.signal_chain_id = edit.signal_chain_id;
+				// Sent alongside, never on its own: the server rewrites the setup
+				// whenever the chain is set, so leaving it out here is how you say
+				// "no particular setup" rather than "leave it".
+				if (edit.chain_variant_id) changes.chain_variant_id = edit.chain_variant_id;
+			}
 			const updated = await api.patchScrobble(editing.id, changes);
 			scrobbles = scrobbles.map((x) => (x.id === updated.id ? updated : x));
 			editing = null;
@@ -323,6 +344,13 @@
 			<option value="">— clear chain —</option>
 			{#each chains as c}<option value={c.id}>{c.name}</option>{/each}
 		</select>
+		{#if bulkVariants.length}
+			<select class="input" style="width:auto;min-width:150px;" bind:value={bulkVariant}
+				aria-label="Which setup of that chain">
+				<option value="">— as the chain is —</option>
+				{#each bulkVariants as v}<option value={v.id}>{v.name}</option>{/each}
+			</select>
+		{/if}
 		<button class="btn btn-primary" on:click={applyBulkChain} disabled={!selectedCount || saving}>{saving ? 'Applying…' : 'Apply'}</button>
 	</div>
 {/if}
@@ -443,6 +471,18 @@
 								{#each chains as c}<option value={c.id}>{c.name}</option>{/each}
 							</select>
 						</div>
+						{#if editVariants.length}
+							<!-- Only appears once the chosen chain has setups. Two
+							     cartridges on one turntable are the same path with one
+							     step swapped, and this is what makes the hours land on
+							     the one that was actually fitted. -->
+							<div class="field" style="flex:1;min-width:180px;"><label for="ev">Setup</label>
+								<select id="ev" class="input" bind:value={edit.chain_variant_id}>
+									<option value={0}>— as the chain is —</option>
+									{#each editVariants as v}<option value={v.id}>{v.name}</option>{/each}
+								</select>
+							</div>
+						{/if}
 						<div class="field" style="flex:1;min-width:180px;"><label for="ef">Format label</label><input id="ef" class="input" bind:value={edit.format_type} placeholder="e.g. flac, dsd, aac"></div>
 					</div>
 				</div>

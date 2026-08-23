@@ -923,3 +923,237 @@ mod tests {
         assert_eq!(PublicNpFields::from_json(Some(&picked.to_json())), picked);
     }
 }
+
+// ── Promoting a variant to be the chain itself ────────────────
+//
+// "Two cartridges on one turntable, and the one I actually use is the variant."
+// Making that the chain and demoting the old base to a variant is a
+// *relabelling*: which gear was fitted for any given listen must not change,
+// and neither must anybody's hours.
+//
+// That is harder than it looks, and the reason is the other variants. An
+// override is `{position, equipment_id}` **relative to the base**, so a variant
+// that swaps position 2 means "the base, but with X at 2". Change the base and
+// that sentence now names different gear at position 1 — silently, with hours
+// moving to a box that was never fitted. So promotion resolves every variant to
+// an absolute list of steps *first*, and re-expresses each one against the new
+// base afterwards.
+
+/// Apply a variant's overrides to a chain's components.
+///
+/// Mirrors `equipment_seconds`' own loop exactly, which is what makes the
+/// promotion below a relabelling rather than a change — if the two ever
+/// disagree about what a variant means, hours move.
+///
+/// * An override at a position that exists **replaces** that step, keeping the
+///   slot's `type`: the slot is what the chain says this position *is*, and the
+///   gear type is only a guess at it. Same rule the swap dialog follows.
+/// * An override past the end **adds** a step.
+/// * An override with no `equipment_id` **removes** the step. Nothing in the UI
+///   creates one, and `promote_variant` refuses to promote a variant that has
+///   one — see there.
+pub fn resolve_variant(
+    base: &[ChainComponent],
+    overrides: &[VariantOverride],
+) -> Vec<ChainComponent> {
+    let mut out: Vec<ChainComponent> = Vec::new();
+
+    for (i, c) in base.iter().enumerate() {
+        match overrides.iter().find(|o| o.position == i as i64) {
+            Some(o) => {
+                if o.equipment_id.is_none() && o.name.is_none() {
+                    // Removed for this variant: the step is simply not there.
+                    continue;
+                }
+                out.push(ChainComponent {
+                    component_type: c.component_type.clone(),
+                    name: o.name.clone().unwrap_or_else(|| c.name.clone()),
+                    // The detail described the box that *was* here, not the
+                    // position — keeping it under different gear is worse than
+                    // nothing, and nothing errors.
+                    detail: if o.equipment_id == c.equipment_id { c.detail.clone() } else { None },
+                    equipment_id: o.equipment_id,
+                });
+            }
+            None => out.push(c.clone()),
+        }
+    }
+
+    // Additions, in position order so two of them keep their relative order.
+    let mut added: Vec<&VariantOverride> =
+        overrides.iter().filter(|o| o.position as usize >= base.len()).collect();
+    added.sort_by_key(|o| o.position);
+    for o in added {
+        if o.equipment_id.is_none() && o.name.is_none() {
+            continue;
+        }
+        out.push(ChainComponent {
+            // A step the base never had has no slot to ask. `Transducer` is
+            // the same fallback the swap dialog uses for an added step, and the
+            // caller corrects it from the gear's own type where it knows one.
+            component_type: ComponentType::Transducer,
+            name: o.name.clone().unwrap_or_default(),
+            detail: None,
+            equipment_id: o.equipment_id,
+        });
+    }
+
+    out
+}
+
+/// Express an absolute list of steps as overrides against a base.
+///
+/// The inverse of `resolve_variant`, and the half that makes promotion safe: a
+/// variant's *meaning* is recomputed against the new base so it names the same
+/// gear it always did.
+///
+/// Two steps are the same when they name the same equipment row — or, for a
+/// free-text step that names no gear at all, the same text. Comparing whole
+/// components would emit an override for a changed `detail`, which is not a
+/// change of what was fitted.
+pub fn overrides_against(
+    base: &[ChainComponent],
+    resolved: &[ChainComponent],
+) -> Vec<VariantOverride> {
+    let same = |a: &ChainComponent, b: &ChainComponent| match (a.equipment_id, b.equipment_id) {
+        (Some(x), Some(y)) => x == y,
+        (None, None) => a.name == b.name,
+        _ => false,
+    };
+
+    let mut out = Vec::new();
+    for i in 0..base.len().max(resolved.len()) {
+        match (base.get(i), resolved.get(i)) {
+            (Some(b), Some(r)) if same(b, r) => {}
+            (_, Some(r)) => out.push(VariantOverride {
+                position: i as i64,
+                equipment_id: r.equipment_id,
+                name: Some(r.name.clone()),
+            }),
+            // The new base has a step this variant does not: it has to say so,
+            // or the variant would silently inherit gear it never used.
+            (Some(_), None) => {
+                out.push(VariantOverride { position: i as i64, equipment_id: None, name: None })
+            }
+            (None, None) => {}
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod variant_promotion_tests {
+    use super::*;
+
+    fn step(name: &str, id: Option<i64>) -> ChainComponent {
+        ChainComponent {
+            component_type: ComponentType::Transducer,
+            name: name.into(),
+            detail: None,
+            equipment_id: id,
+        }
+    }
+
+    fn over(pos: i64, name: &str, id: i64) -> VariantOverride {
+        VariantOverride { position: pos, equipment_id: Some(id), name: Some(name.into()) }
+    }
+
+    #[test]
+    fn an_override_replaces_a_step_and_keeps_the_slot_s_type() {
+        let base = vec![step("Node", Some(1)), step("2M Red", Some(2))];
+        let got = resolve_variant(&base, &[over(1, "Microlinear", 3)]);
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].name, "Node");
+        assert_eq!(got[1].name, "Microlinear");
+        assert_eq!(got[1].equipment_id, Some(3));
+        assert_eq!(
+            got[1].component_type, base[1].component_type,
+            "the slot says what the position is"
+        );
+    }
+
+    #[test]
+    fn an_override_past_the_end_adds_a_step() {
+        let base = vec![step("Node", Some(1))];
+        let got = resolve_variant(&base, &[over(1, "Cartridge", 9)]);
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[1].name, "Cartridge");
+    }
+
+    /// The round trip, which is the whole safety argument: resolve a variant,
+    /// re-express it against the *same* base, and get the overrides back.
+    #[test]
+    fn resolving_and_re_expressing_is_a_round_trip() {
+        let base = vec![step("Node", Some(1)), step("2M Red", Some(2)), step("LS50", Some(4))];
+        let overrides = vec![over(1, "Microlinear", 3)];
+        let resolved = resolve_variant(&base, &overrides);
+        assert_eq!(overrides_against(&base, &resolved), overrides);
+    }
+
+    /// **The trap promotion exists to avoid.**
+    ///
+    /// Chain: Node → 2M Red → LS50. Variant A swaps the cartridge, variant B
+    /// swaps the speakers. Promote A, and B's override — "position 2 is
+    /// Harbeth" — now sits on a base whose position 1 is the Microlinear. B
+    /// used to mean *2M Red* + Harbeth; naively it would now mean *Microlinear*
+    /// + Harbeth, and the 2M Red's hours would move to a stylus that was never
+    /// in the headshell.
+    #[test]
+    fn promoting_one_variant_does_not_change_what_another_means() {
+        let base = vec![step("Node", Some(1)), step("2M Red", Some(2)), step("LS50", Some(4))];
+        let a = vec![over(1, "Microlinear", 3)];
+        let b = vec![over(2, "Harbeth", 5)];
+
+        // What B meant before.
+        let b_before = resolve_variant(&base, &b);
+        assert_eq!(
+            b_before.iter().map(|c| c.equipment_id).collect::<Vec<_>>(),
+            [Some(1), Some(2), Some(5)]
+        );
+
+        // A becomes the chain.
+        let new_base = resolve_variant(&base, &a);
+        // B, re-expressed.
+        let b_after_overrides = overrides_against(&new_base, &b_before);
+        let b_after = resolve_variant(&new_base, &b_after_overrides);
+
+        assert_eq!(
+            b_after.iter().map(|c| c.equipment_id).collect::<Vec<_>>(),
+            b_before.iter().map(|c| c.equipment_id).collect::<Vec<_>>(),
+            "B must still name the gear it always named"
+        );
+        // And it had to grow an override to say so.
+        assert!(
+            b_after_overrides.iter().any(|o| o.position == 1 && o.equipment_id == Some(2)),
+            "B now has to pin the cartridge it was relying on the base for"
+        );
+    }
+
+    /// The old base becomes a variant that restores it, and means what the base
+    /// meant.
+    #[test]
+    fn the_old_base_survives_as_a_variant() {
+        let base = vec![step("Node", Some(1)), step("2M Red", Some(2))];
+        let new_base = resolve_variant(&base, &[over(1, "Microlinear", 3)]);
+
+        let old = overrides_against(&new_base, &base);
+        assert_eq!(old, vec![over(1, "2M Red", 2)]);
+        assert_eq!(
+            resolve_variant(&new_base, &old).iter().map(|c| c.equipment_id).collect::<Vec<_>>(),
+            base.iter().map(|c| c.equipment_id).collect::<Vec<_>>()
+        );
+    }
+
+    /// A variant with fewer steps than the new base has to say so, or it would
+    /// silently inherit gear it never used.
+    #[test]
+    fn a_shorter_variant_pins_the_step_it_does_not_have() {
+        let base = vec![step("Node", Some(1))];
+        let new_base = vec![step("Node", Some(1)), step("Cartridge", Some(9))];
+        let o = overrides_against(&new_base, &base);
+        assert_eq!(o.len(), 1);
+        assert_eq!(o[0].position, 1);
+        assert_eq!(o[0].equipment_id, None, "the added step is removed for this variant");
+        assert_eq!(resolve_variant(&new_base, &o).len(), 1);
+    }
+}

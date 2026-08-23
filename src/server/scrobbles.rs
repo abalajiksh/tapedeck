@@ -520,6 +520,10 @@ pub struct UpdateScrobble {
     /// for the release you actually meant.
     pub mbid_release: Option<String>,
     pub signal_chain_id: Option<i64>,
+    /// Which setup of that chain was fitted. Only meaningful alongside
+    /// `signal_chain_id`, and written whenever that is — see
+    /// `Database::update_scrobble`.
+    pub chain_variant_id: Option<i64>,
     pub listening_context: Option<String>,
     pub format_type: Option<String>,
     pub codec: Option<String>,
@@ -532,6 +536,19 @@ async fn update_scrobble(
     Path(id): Path<i64>,
     Json(body): Json<UpdateScrobble>,
 ) -> impl IntoResponse {
+    // A variant belongs to exactly one chain; pairing it with another resolves
+    // to components never fitted at the same time.
+    if let Some(variant) = body.chain_variant_id {
+        let Some(chain) = body.signal_chain_id else {
+            return bad_request("chain_variant_id needs a signal_chain_id to belong to");
+        };
+        match state.db.variant_fits_chain(user.user_id, variant, chain).await {
+            Ok(true) => {}
+            Ok(false) => return bad_request("That setup belongs to a different chain"),
+            Err(e) => return server_error(e.to_string()),
+        }
+    }
+
     let updated = state
         .db
         .update_scrobble(
@@ -543,6 +560,7 @@ async fn update_scrobble(
             body.mbid_recording.as_deref(),
             body.mbid_release.as_deref(),
             body.signal_chain_id,
+            body.chain_variant_id,
             body.listening_context.as_deref(),
             body.format_type.as_deref(),
             body.codec.as_deref(),
@@ -743,6 +761,12 @@ pub struct BulkChain {
     /// "leave it alone" has to survive deserialisation.
     #[serde(default, deserialize_with = "deserialize_some")]
     pub signal_chain_id: Option<Option<i64>>,
+    /// Which setup of that chain was fitted. Absent means none — and it is
+    /// **written either way**, never left alone: a listen moved from chain A to
+    /// chain B must not keep a variant belonging to A, which would pair it with
+    /// components that were never fitted together.
+    #[serde(default)]
+    pub chain_variant_id: Option<i64>,
 }
 
 /// Distinguish an absent field from an explicit `null`.
@@ -780,10 +804,36 @@ async fn bulk_set_chain(
             .into_response();
     };
 
-    match state.db.bulk_set_scrobble_chain(user.user_id, &body.ids, chain_id).await {
+    // A variant belongs to exactly one chain. Pairing it with another resolves
+    // to components that were never fitted at the same time, so it is refused
+    // at the door rather than stored and quietly ignored by `equipment_seconds`.
+    if let Some(variant) = body.chain_variant_id {
+        let Some(chain) = chain_id else {
+            return bad_request("chain_variant_id needs a signal_chain_id to belong to");
+        };
+        match state.db.variant_fits_chain(user.user_id, variant, chain).await {
+            Ok(true) => {}
+            Ok(false) => return bad_request("That setup belongs to a different chain"),
+            Err(e) => return server_error(e.to_string()),
+        }
+    }
+
+    match state
+        .db
+        .bulk_set_scrobble_chain(user.user_id, &body.ids, chain_id, body.chain_variant_id)
+        .await
+    {
         Ok(n) => (StatusCode::OK, Json(serde_json::json!({ "updated": n }))).into_response(),
         Err(e) => server_error(e.to_string()),
     }
+}
+
+fn bad_request(msg: &str) -> axum::response::Response {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(serde_json::json!(ErrorResponse { code: 400, error: msg.into() })),
+    )
+        .into_response()
 }
 
 /// GET /api/v1/languages/status — instance-wide classification coverage.

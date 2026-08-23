@@ -26,7 +26,7 @@ openapi: 3.1.0
 
 info:
   title: Tapedeck
-  version: 0.80.0
+  version: 0.81.0
   summary: Self-hosted scrobbler and listening journal.
   description: |
     Tapedeck ingests listens, enriches them with MusicBrainz metadata, stores
@@ -1856,13 +1856,36 @@ paths:
           application/json:
             schema:
               type: object
-              description: Omitted fields are left alone.
+              description: |
+                Omitted fields are left alone.
+
+                **This schema was wrong for several releases** and is corrected
+                here: it documented `chain_id` and `timestamp`, neither of which
+                this handler has ever accepted — the chain is `signal_chain_id`,
+                and a listen's timestamp is not editable. Same class of drift as
+                the one that made `bulk-chain` silently destructive, and the
+                path-drift test does not catch it because it only compares
+                paths.
               properties:
                 title: { type: string }
                 artist: { type: string }
                 album: { type: string }
-                timestamp: { type: integer }
-                chain_id: { type: [integer, 'null'] }
+                mbid_recording: { type: string }
+                mbid_release:
+                  type: string
+                  description: Also clears the resolved artwork, so the cover is re-fetched for the release you actually meant.
+                signal_chain_id: { type: integer }
+                chain_variant_id:
+                  type: integer
+                  description: |
+                    Which setup of that chain was fitted. Only meaningful
+                    alongside `signal_chain_id`, and the variant is **rewritten
+                    whenever the chain is set** — a listen moved between chains
+                    never keeps a setup belonging to the old one. Must belong to
+                    `signal_chain_id`, or `400`.
+                listening_context: { type: string }
+                format_type: { type: string }
+                codec: { type: string }
       responses:
         '200': { description: Updated., content: { application/json: { schema: { $ref: '#/components/schemas/Ok' } } } }
         '401': { $ref: '#/components/responses/Unauthorized' }
@@ -1937,6 +1960,15 @@ paths:
                 signal_chain_id:
                   type: [integer, 'null']
                   description: The chain to attribute them to. Explicit `null` clears it; omitting the field is an error, not a clear.
+                chain_variant_id:
+                  type: [integer, 'null']
+                  description: |
+                    Which setup of that chain was fitted — two cartridges on one
+                    turntable, the other IEMs on the same commute. Optional, and
+                    **written either way**: a listen moved from one chain to
+                    another never keeps a setup belonging to the old one, which
+                    would pair it with components that were never fitted
+                    together. Must belong to `signal_chain_id`, or `400`.
       responses:
         '200':
           description: Applied.
@@ -4644,6 +4676,59 @@ paths:
         '400': { $ref: '#/components/responses/BadRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '404': { $ref: '#/components/responses/NotFound' }
+
+  /api/v1/chains/variants/{id}/promote:
+    post:
+      tags: [Chains]
+      summary: Make this setup the chain, and the chain a setup.
+      description: |
+        For the common case where the variant is the one you actually use — the
+        other cartridge is in the headshell most of the time, so it should be
+        what the chain *is*.
+
+        **A relabelling, not a change.** What was fitted for any given listen is
+        identical afterwards, and so is every piece of gear's hours.
+
+        That is harder than it looks, and it is the whole of this endpoint. An
+        override is `{position, equipment_id}` **relative to the base**, so
+        another variant that swaps position 2 means "the base, but with X at 2"
+        — change the base and that sentence names different gear at position 1,
+        silently, with hours landing on a box that was never fitted. So every
+        variant is resolved to an absolute list of steps first and re-expressed
+        against the new base afterwards. Listens follow: those on the chain move
+        to the new setup that restores it, and those on the promoted setup move
+        to the chain.
+
+        `name` is what to call the setup the chain is demoted to — the old base
+        has no name of its own, because it *was* the chain. Defaults to
+        "Previous setup".
+
+        **Refuses a setup that removes a step** (400): removal shifts every
+        later position, so promoting one would change what every other setup's
+        overrides point at. Nothing in the UI creates such a setup.
+      security: [{ sessionCookie: [] }]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: integer }
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                name: { type: string, nullable: true }
+      responses:
+        '200':
+          description: The promoted setup, and the id of the one the chain became.
+          content:
+            application/json:
+              schema: { type: object, additionalProperties: true }
+        '400': { description: That setup removes a step, or has none. }
+        '401': { description: Not signed in. }
+        '404': { description: No such setup. }
 
   /api/v1/chains/variants/{id}:
     patch:

@@ -145,11 +145,30 @@ struct ReelQuery {
 /// have the UI stitch three lists back together and invent the states in
 /// between.
 async fn decks(State(state): State<Arc<AppState>>, user: super::auth::AuthUser) -> Response {
-    let (all, out, inbound) = match tokio::try_join!(
-        state.db.patchable_decks(user.user_id),
-        state.db.patches_out(user.user_id),
-        state.db.patches_in(user.user_id),
-    ) {
+    // **Sequential, not `try_join!`.** Running them concurrently takes three
+    // pool connections for one request, and the pool has five — so two
+    // simultaneous callers can hold two each and wait forever for a third.
+    // Concurrency buys nothing here anyway: it is one SQLite file and three
+    // fast reads.
+    //
+    // An amplifier in the 2026-08-23 outage rather than its cause — the cause
+    // was three quadratic queries — but it is exactly the shape that turns
+    // pressure into deadlock, and there is no reason to keep it.
+    let all = match state.db.patchable_decks(user.user_id).await {
+        Ok(v) => v,
+        Err(e) => {
+            warn!("📡 patch decks for {}: {e}", user.username);
+            return refused(StatusCode::INTERNAL_SERVER_ERROR, "Could not read the decks");
+        }
+    };
+    let out = match state.db.patches_out(user.user_id).await {
+        Ok(v) => v,
+        Err(e) => {
+            warn!("📡 patch decks for {}: {e}", user.username);
+            return refused(StatusCode::INTERNAL_SERVER_ERROR, "Could not read the decks");
+        }
+    };
+    let inbound = match state.db.patches_in(user.user_id).await {
         Ok(v) => v,
         Err(e) => {
             warn!("📡 patch decks for {}: {e}", user.username);
@@ -572,10 +591,16 @@ struct SettleCapturesBody {
 
 /// `GET /api/v1/patch/spool` — the sitting you are in, and what it has offered.
 async fn spool(State(state): State<Arc<AppState>>, user: super::auth::AuthUser) -> Response {
-    let (active, captures) = match tokio::try_join!(
-        state.db.active_spool(user.user_id),
-        state.db.spool_captures(user.user_id)
-    ) {
+    // Sequential — see `decks`. Two connections for one request against a pool
+    // of five is pressure nobody is buying anything with.
+    let active = match state.db.active_spool(user.user_id).await {
+        Ok(v) => v,
+        Err(e) => {
+            warn!("📡 spool: {e}");
+            return refused(StatusCode::INTERNAL_SERVER_ERROR, "Could not read that");
+        }
+    };
+    let captures = match state.db.spool_captures(user.user_id).await {
         Ok(v) => v,
         Err(e) => {
             warn!("📡 spool: {e}");

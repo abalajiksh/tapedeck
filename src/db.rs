@@ -54,6 +54,11 @@ pub struct ScrobbleRecord {
     pub quality_score: Option<f64>,
     pub device_id: Option<i64>,
     pub chain_id: Option<i64>,
+    /// Which setup of that chain was fitted. Exposed so the History edit dialog
+    /// can preselect it — without this the picker could offer setups but never
+    /// show which one a listen is already on, and every edit would silently
+    /// look like a change.
+    pub chain_variant_id: Option<i64>,
     pub session_id: Option<i64>,
     pub listening_context: Option<String>,
     pub submission_client: Option<String>,
@@ -6552,6 +6557,7 @@ impl Database {
         mbid_recording: Option<&str>,
         mbid_release: Option<&str>,
         chain_id: Option<i64>,
+        chain_variant_id: Option<i64>,
         listening_context: Option<&str>,
         format_type: Option<&str>,
         codec: Option<&str>,
@@ -6570,6 +6576,15 @@ impl Database {
                 mbid_recording = COALESCE(?, mbid_recording),
                 mbid_release = COALESCE(?, mbid_release),
                 chain_id = COALESCE(?, chain_id),
+                -- **Not `COALESCE`.** The variant is rewritten whenever the
+                -- chain is set, including to nothing: a listen moved from chain
+                -- A to chain B must not keep a variant belonging to A, which
+                -- would pair it with components that were never fitted
+                -- together. `equipment_seconds` ignores such a pairing, so the
+                -- hours stayed right and only the displayed setup was wrong —
+                -- which is the kind of wrongness nobody notices. Sessions have
+                -- rewritten both together since v0.54.0; listens did not.
+                chain_variant_id = CASE WHEN ? IS NOT NULL THEN ? ELSE chain_variant_id END,
                 listening_context = COALESCE(?, listening_context),
                 format_type = COALESCE(?, format_type),
                 codec = COALESCE(?, codec),
@@ -6584,6 +6599,8 @@ impl Database {
         .bind(mbid_recording)
         .bind(mbid_release)
         .bind(chain_id)
+        .bind(chain_id)
+        .bind(chain_variant_id)
         .bind(listening_context)
         .bind(format_type)
         .bind(codec)
@@ -10579,26 +10596,37 @@ impl Database {
     }
 
     /// Bulk-reassign the chain for a set of listens (History bulk edit).
+    /// Retag a batch of listens with a chain — **and always with a variant**,
+    /// even when that variant is `None`.
+    ///
+    /// Writing the chain and leaving `chain_variant_id` alone is the bug this
+    /// signature exists to stop: a listen moved from chain A to chain B would
+    /// keep a variant belonging to A, pairing it with components that were
+    /// never fitted together. `equipment_seconds` ignores a mismatched pairing,
+    /// so the *hours* stayed right and only the displayed setup was wrong —
+    /// which is exactly the kind of wrongness nobody notices. Sessions have
+    /// rewritten both together since v0.54.0; listens did not.
+    ///
+    /// The caller checks that the variant belongs to the chain before calling.
     pub async fn bulk_set_scrobble_chain(
         &self,
         user_id: i64,
         ids: &[i64],
         chain_id: Option<i64>,
+        variant_id: Option<i64>,
     ) -> Result<u64, sqlx::Error> {
         if ids.is_empty() {
             return Ok(0);
         }
-        let placeholders = vec!["?"; ids.len()].join(",");
+        let placeholders = std::iter::repeat("?").take(ids.len()).collect::<Vec<_>>().join(",");
         let sql = format!(
-            "UPDATE scrobbles SET chain_id = ? WHERE user_id = ? AND id IN ({})",
-            placeholders
+            "UPDATE scrobbles SET chain_id = ?, chain_variant_id = ? WHERE user_id = ? AND id IN ({placeholders})"
         );
-        let mut q = sqlx::query(&sql).bind(chain_id).bind(user_id);
+        let mut q = sqlx::query(&sql).bind(chain_id).bind(variant_id).bind(user_id);
         for id in ids {
             q = q.bind(id);
         }
-        let res = q.execute(&self.pool).await?;
-        Ok(res.rows_affected())
+        Ok(q.execute(&self.pool).await?.rows_affected())
     }
 
     // ════════════════════════════════════════════════════════════
@@ -13578,11 +13606,33 @@ impl Database {
     /// reader cannot quietly publish more than the Reel does.
     ///
     /// `?` binds the reader's own user id.
-    const SHARED_LISTENS: &'static str = "FROM scrobbles s \
+    pub(crate) const SHARED_LISTENS: &'static str = "FROM scrobbles s \
          JOIN signal_chains c ON c.id = s.chain_id AND c.shared = 1 \
          JOIN users u ON u.id = s.user_id \
          JOIN patches p ON p.target_user_id = s.user_id \
         WHERE p.follower_user_id = ? AND p.state = 'accepted' AND s.skipped = FALSE";
+
+    /// The folded artist keys this user plays, with their own counts.
+    ///
+    /// **One grouped scan, never a subquery per row.** This exists because the
+    /// first version of `patch_artists` asked `COUNT(*) … WHERE
+    /// LOWER(TRIM(m.artist)) = LOWER(TRIM(s.artist))` *per artist* — a join key
+    /// that is a function of a column, which no index can serve, so it is a
+    /// full scan of the whole history per outer row. That is the quadratic this
+    /// codebase has now found four times, and in production it exhausted the
+    /// connection pool and took the instance down. See the incident note in
+    /// CLAUDE.md.
+    async fn my_artist_plays(&self, user_id: i64) -> Result<HashMap<String, i64>, sqlx::Error> {
+        let rows: Vec<(String, i64)> = sqlx::query_as(
+            "SELECT LOWER(TRIM(artist)), COUNT(*) FROM scrobbles
+              WHERE user_id = ? AND skipped = FALSE
+              GROUP BY LOWER(TRIM(artist))",
+        )
+        .bind(user_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().collect())
+    }
 
     /// Artists across the decks this user has patched into.
     ///
@@ -13590,31 +13640,34 @@ impl Database {
     /// and it is shown as *which artists* rather than as a similarity score —
     /// the design's own rule, and the honest one, because a score invites a
     /// ranking of people.
+    ///
+    /// **Two bounded scans folded in Rust**, not a subquery per artist. See
+    /// `my_artist_plays` for why, and what the other shape cost.
     pub async fn patch_artists(
         &self,
         user_id: i64,
         limit: i64,
     ) -> Result<Vec<PatchArtist>, sqlx::Error> {
-        sqlx::query_as(&format!(
+        let mut artists: Vec<PatchArtist> = sqlx::query_as(&format!(
             "SELECT s.artist AS name, COUNT(*) AS plays, \
                     COUNT(DISTINCT s.user_id) AS decks, \
                     GROUP_CONCAT(DISTINCT u.username) AS who, \
-                    MAX(s.timestamp) AS last_played, \
-                    COALESCE(( \
-                        SELECT COUNT(*) FROM scrobbles m \
-                         WHERE m.user_id = ? AND m.skipped = FALSE \
-                           AND LOWER(TRIM(m.artist)) = LOWER(TRIM(s.artist)) \
-                    ), 0) AS mine \
+                    MAX(s.timestamp) AS last_played, 0 AS mine \
                {} \
             GROUP BY LOWER(TRIM(s.artist)) \
             ORDER BY plays DESC LIMIT ?",
             Self::SHARED_LISTENS
         ))
         .bind(user_id)
-        .bind(user_id)
         .bind(limit)
         .fetch_all(&self.pool)
-        .await
+        .await?;
+
+        let mine = self.my_artist_plays(user_id).await?;
+        for a in &mut artists {
+            a.mine = mine.get(&a.name.trim().to_lowercase()).copied().unwrap_or(0);
+        }
+        Ok(artists)
     }
 
     /// One deck, as the person patched into it may see it.
@@ -13663,24 +13716,29 @@ impl Database {
         .fetch_all(&self.pool)
         .await?;
 
-        // What you both play, from their shared chains and the viewer's whole
-        // history. Overlap only — no score, no ranking of people.
-        let both: Vec<String> = sqlx::query_scalar(
-            "SELECT s.artist FROM scrobbles s
+        // What you both play. Overlap only — no score, no ranking of people.
+        //
+        // **Two grouped scans intersected in Rust**, not an `EXISTS` correlated
+        // on `LOWER(TRIM(artist))`: that join key is a function of a column, so
+        // no index can serve it and it becomes a full scan of the viewer's
+        // history *per artist of theirs*. See `my_artist_plays`.
+        let theirs: Vec<(String, String)> = sqlx::query_as(
+            "SELECT s.artist, LOWER(TRIM(s.artist)) FROM scrobbles s
                JOIN signal_chains c ON c.id = s.chain_id AND c.shared = 1
               WHERE s.user_id = ? AND s.skipped = FALSE
-                AND EXISTS (
-                    SELECT 1 FROM scrobbles m
-                     WHERE m.user_id = ? AND m.skipped = FALSE
-                       AND LOWER(TRIM(m.artist)) = LOWER(TRIM(s.artist))
-                )
               GROUP BY LOWER(TRIM(s.artist))
-              ORDER BY COUNT(*) DESC LIMIT 12",
+              ORDER BY COUNT(*) DESC",
         )
         .bind(id)
-        .bind(viewer_id)
         .fetch_all(&self.pool)
         .await?;
+        let mine = self.my_artist_plays(viewer_id).await?;
+        let both: Vec<String> = theirs
+            .into_iter()
+            .filter(|(_, key)| mine.contains_key(key))
+            .map(|(name, _)| name)
+            .take(12)
+            .collect();
 
         let listens: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM scrobbles s
@@ -13718,38 +13776,61 @@ impl Database {
     /// **Overlap is computed against their *shared* chains only**, so this
     /// cannot become a way to learn what somebody plays privately by watching
     /// the suggestion list change.
+    ///
+    /// **Three bounded scans folded in Rust.** The first version asked, per
+    /// user, for their shared artists with an inner `EXISTS` over the viewer's
+    /// whole history keyed on `LOWER(TRIM(artist))` — a full scan inside a full
+    /// scan, per row. On the real instance that exhausted the connection pool
+    /// within a minute of the first patch being accepted and took everything
+    /// down with it. See the incident note in CLAUDE.md.
     pub async fn discover_decks(&self, user_id: i64) -> Result<Vec<DiscoverDeck>, sqlx::Error> {
-        sqlx::query_as(
+        let mut decks: Vec<DiscoverDeck> = sqlx::query_as(
             "SELECT u.id AS user_id, u.username, u.display_name, u.bio, u.avatar_url,
                     u.created_at,
                     (SELECT COUNT(*) FROM signal_chains c
                       WHERE c.user_id = u.id AND c.shared = 1) AS shared_chains,
                     (SELECT state FROM patches p
                       WHERE p.follower_user_id = ? AND p.target_user_id = u.id) AS state,
-                    COALESCE((
-                        SELECT GROUP_CONCAT(x.artist, char(31)) FROM (
-                            SELECT s.artist
-                              FROM scrobbles s
-                              JOIN signal_chains c ON c.id = s.chain_id AND c.shared = 1
-                             WHERE s.user_id = u.id AND s.skipped = FALSE
-                               AND EXISTS (
-                                   SELECT 1 FROM scrobbles m
-                                    WHERE m.user_id = ? AND m.skipped = FALSE
-                                      AND LOWER(TRIM(m.artist)) = LOWER(TRIM(s.artist))
-                               )
-                             GROUP BY LOWER(TRIM(s.artist))
-                             ORDER BY COUNT(*) DESC LIMIT 6
-                        ) x
-                    ), '') AS overlap
+                    '' AS overlap
                FROM users u
               WHERE u.id <> ? AND u.disabled = 0
               ORDER BY u.created_at DESC",
         )
         .bind(user_id)
         .bind(user_id)
-        .bind(user_id)
         .fetch_all(&self.pool)
-        .await
+        .await?;
+
+        // Every deck's shared artists, in one pass over the shared listens.
+        let shared: Vec<(i64, String, String, i64)> = sqlx::query_as(
+            "SELECT s.user_id, s.artist, LOWER(TRIM(s.artist)), COUNT(*) AS plays
+               FROM scrobbles s
+               JOIN signal_chains c ON c.id = s.chain_id AND c.shared = 1
+              WHERE s.skipped = FALSE
+              GROUP BY s.user_id, LOWER(TRIM(s.artist))
+              ORDER BY plays DESC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mine = self.my_artist_plays(user_id).await?;
+        let mut by_user: HashMap<i64, Vec<String>> = HashMap::new();
+        for (uid, name, key, _) in shared {
+            if uid == user_id || !mine.contains_key(&key) {
+                continue;
+            }
+            let entry = by_user.entry(uid).or_default();
+            if entry.len() < 6 {
+                entry.push(name);
+            }
+        }
+
+        for d in &mut decks {
+            if let Some(names) = by_user.remove(&d.user_id) {
+                d.overlap = names.join("\u{1f}");
+            }
+        }
+        Ok(decks)
     }
 
     /// What the instance has been playing, over shared chains only.
@@ -14294,6 +14375,159 @@ impl Database {
             settled += 1;
         }
         Ok(settled)
+    }
+
+    /// Make a variant the chain itself, and the chain a variant.
+    ///
+    /// **A relabelling, not a change.** Which gear was fitted for any given
+    /// listen is identical afterwards, and so is every piece of equipment's
+    /// hours — `promoting_a_variant_moves_no_hours` asserts exactly that by
+    /// comparing `equipment_seconds` either side.
+    ///
+    /// That is the whole difficulty, and it is not obvious. An override is
+    /// `{position, equipment_id}` **relative to the base**, so a second variant
+    /// that swaps position 2 means "the base, but with X at 2" — change the
+    /// base and that sentence names different gear at position 1, silently,
+    /// with hours landing on a box that was never fitted. So every variant is
+    /// resolved to an absolute list of steps *first* and re-expressed against
+    /// the new base afterwards.
+    ///
+    /// Four things move, in an order that matters:
+    ///
+    /// 1. The old base becomes a variant, so listens that were on the chain
+    ///    itself keep meaning what they meant.
+    /// 2. Every *other* variant is re-expressed.
+    /// 3. Listens, side-plays and shelf records with **no** variant are pointed
+    ///    at the new old-base variant, and those on the promoted one are
+    ///    pointed at nothing. In that order — the reverse would catch the rows
+    ///    it had just written.
+    /// 4. The chain's components become the promoted variant's, and the
+    ///    promoted variant row is deleted.
+    ///
+    /// **Refuses a variant that removes a step.** Removal shifts every later
+    /// position, so promoting one would change what every other variant's
+    /// overrides point at. Nothing in the UI creates one — the swap dialog
+    /// always picks gear — so this costs nothing today and is a refusal rather
+    /// than a silent wrong answer if that ever changes.
+    pub async fn promote_variant(
+        &self,
+        user_id: i64,
+        variant_id: i64,
+        old_base_name: &str,
+    ) -> Result<i64, sqlx::Error> {
+        let variants = self.list_variants(user_id).await?;
+        let Some(promoted) = variants.iter().find(|v| v.id == variant_id) else {
+            return Err(sqlx::Error::RowNotFound);
+        };
+        let chain_id = promoted.chain_id;
+
+        let chains = self.get_chains(user_id).await?;
+        let Some(chain) = chains.iter().find(|c| c.id == Some(chain_id)) else {
+            return Err(sqlx::Error::RowNotFound);
+        };
+        let base = chain.components.clone();
+
+        if promoted.overrides.iter().any(|o| {
+            o.equipment_id.is_none() && o.name.is_none() && (o.position as usize) < base.len()
+        }) {
+            return Err(sqlx::Error::Protocol(
+                "that setup removes a step, which cannot become the chain: every other setup's \
+                 positions would shift"
+                    .into(),
+            ));
+        }
+
+        let new_base = crate::models::resolve_variant(&base, &promoted.overrides);
+        if new_base.is_empty() {
+            return Err(sqlx::Error::Protocol("that setup has no steps".into()));
+        }
+
+        // Resolved *before* anything is written, against the base as it stands.
+        let siblings: Vec<(i64, Vec<crate::models::ChainComponent>)> = variants
+            .iter()
+            .filter(|v| v.chain_id == chain_id && v.id != variant_id)
+            .map(|v| (v.id, crate::models::resolve_variant(&base, &v.overrides)))
+            .collect();
+
+        let now = Self::now_secs();
+        let mut tx = self.pool.begin().await?;
+
+        // 1. The old base, as a variant that restores it.
+        let old_overrides = crate::models::overrides_against(&new_base, &base);
+        let old_json = serde_json::to_string(&old_overrides).unwrap_or_else(|_| "[]".into());
+        sqlx::query(
+            "INSERT INTO chain_variants (user_id, chain_id, name, overrides, created_at)
+             VALUES (?, ?, ?, ?, ?)",
+        )
+        .bind(user_id)
+        .bind(chain_id)
+        .bind(old_base_name)
+        .bind(&old_json)
+        .bind(now)
+        .execute(&mut *tx)
+        .await?;
+        let old_variant_id: i64 = sqlx::query_scalar(
+            "SELECT id FROM chain_variants WHERE user_id = ? AND chain_id = ? AND created_at = ?
+              ORDER BY id DESC LIMIT 1",
+        )
+        .bind(user_id)
+        .bind(chain_id)
+        .bind(now)
+        .fetch_one(&mut *tx)
+        .await?;
+
+        // 2. Every other variant, re-expressed so it names the gear it always
+        //    named.
+        for (id, resolved) in &siblings {
+            let json =
+                serde_json::to_string(&crate::models::overrides_against(&new_base, resolved))
+                    .unwrap_or_else(|_| "[]".into());
+            sqlx::query("UPDATE chain_variants SET overrides = ? WHERE id = ? AND user_id = ?")
+                .bind(json)
+                .bind(id)
+                .bind(user_id)
+                .execute(&mut *tx)
+                .await?;
+        }
+
+        // 3. Repoint what was recorded. **Null first**, or the second statement
+        //    would catch the rows the first just wrote.
+        for table in ["scrobbles", "physical_plays", "physical_releases"] {
+            sqlx::query(&format!(
+                "UPDATE {table} SET chain_variant_id = ?
+                  WHERE user_id = ? AND chain_id = ? AND chain_variant_id IS NULL"
+            ))
+            .bind(old_variant_id)
+            .bind(user_id)
+            .bind(chain_id)
+            .execute(&mut *tx)
+            .await?;
+            sqlx::query(&format!(
+                "UPDATE {table} SET chain_variant_id = NULL
+                  WHERE user_id = ? AND chain_variant_id = ?"
+            ))
+            .bind(user_id)
+            .bind(variant_id)
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        // 4. The chain becomes what the variant described, and the variant row
+        //    goes — it is the chain now.
+        sqlx::query("UPDATE signal_chains SET components = ? WHERE id = ? AND user_id = ?")
+            .bind(serde_json::to_string(&new_base).unwrap_or_else(|_| "[]".into()))
+            .bind(chain_id)
+            .bind(user_id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM chain_variants WHERE id = ? AND user_id = ?")
+            .bind(variant_id)
+            .bind(user_id)
+            .execute(&mut *tx)
+            .await?;
+
+        tx.commit().await?;
+        Ok(old_variant_id)
     }
 }
 
@@ -17111,7 +17345,7 @@ mod tests {
         .unwrap();
         let ids: Vec<i64> = db.get_all_scrobbles(uid).await.unwrap().iter().map(|r| r.id).collect();
 
-        let n = db.bulk_set_scrobble_chain(uid, &ids[..1], Some(cid)).await.unwrap();
+        let n = db.bulk_set_scrobble_chain(uid, &ids[..1], Some(cid), None).await.unwrap();
         assert_eq!(n, 1);
         let rows = db.get_all_scrobbles(uid).await.unwrap();
         assert_eq!(rows.iter().filter(|r| r.chain_id == Some(cid)).count(), 1);
@@ -17215,7 +17449,7 @@ mod tests {
         // picks up every listen that carries the chain.
         let ids: Vec<i64> = db.get_all_scrobbles(uid).await.unwrap().iter().map(|r| r.id).collect();
         assert_eq!(ids.len(), 3);
-        db.bulk_set_scrobble_chain(uid, &ids, Some(cid)).await.unwrap();
+        db.bulk_set_scrobble_chain(uid, &ids, Some(cid), None).await.unwrap();
 
         let chain = db.get_chain(uid, cid).await.unwrap().unwrap();
         assert_eq!(hours(&chain), 2.0, "two played hours; the skip is not one of them");
@@ -17232,7 +17466,7 @@ mod tests {
 
         // Unassigning takes the hours back with it, which an accumulator could
         // never do.
-        db.bulk_set_scrobble_chain(uid, &ids, None).await.unwrap();
+        db.bulk_set_scrobble_chain(uid, &ids, None, None).await.unwrap();
         assert_eq!(hours(&db.get_chain(uid, cid).await.unwrap().unwrap()), 0.0);
     }
 
@@ -19996,6 +20230,406 @@ mod tests {
 
         // And now a second one is fine.
         assert!(db.start_spool(them, Some("Two"), &[me]).await.is_ok());
+    }
+
+    /// **Promotion is a relabelling, and this is how you know.**
+    ///
+    /// Every piece of gear's hours are compared either side. If the other
+    /// variants were not re-expressed against the new base, the 2M Red's hours
+    /// would move to the Microlinear — a stylus that was never in the headshell
+    /// for those listens — and nothing would error.
+    #[tokio::test]
+    async fn promoting_a_variant_moves_no_hours() {
+        let db = testdb().await;
+        let uid = db.create_user("ash", None, "pw", "user").await.unwrap();
+
+        // Four boxes: a source, two cartridges, two sets of speakers.
+        let mut gear = std::collections::HashMap::new();
+        for (name, kind) in [
+            ("Node", "streamer"),
+            ("2M Red", "cartridge"),
+            ("Microlinear", "cartridge"),
+            ("LS50", "speakers"),
+            ("Harbeth", "speakers"),
+        ] {
+            let id: i64 = sqlx::query_scalar(
+                "INSERT INTO equipment (user_id, name, type) VALUES (?, ?, ?) RETURNING id",
+            )
+            .bind(uid)
+            .bind(name)
+            .bind(kind)
+            .fetch_all(&db.pool)
+            .await
+            .unwrap()[0];
+            gear.insert(name, id);
+        }
+        let g = |n: &str| *gear.get(n).unwrap();
+
+        let comp = |name: &str, id: i64| ChainComponent {
+            component_type: ComponentType::Transducer,
+            name: name.into(),
+            detail: None,
+            equipment_id: Some(id),
+        };
+
+        let chain_id = db
+            .create_chain(&SignalChain {
+                id: None,
+                user_id: uid,
+                name: "Vinyl".into(),
+                description: None,
+                components: vec![
+                    comp("Node", g("Node")),
+                    comp("2M Red", g("2M Red")),
+                    comp("LS50", g("LS50")),
+                ],
+                listening_context: ListeningContext::Unknown,
+                icon: None,
+                is_active: true,
+                shared: false,
+                total_hours: 0.0,
+                created_at: 0,
+            })
+            .await
+            .unwrap();
+
+        let micro = db
+            .create_variant(
+                uid,
+                chain_id,
+                "Microlinear",
+                &[VariantOverride {
+                    position: 1,
+                    equipment_id: Some(g("Microlinear")),
+                    name: Some("Microlinear".into()),
+                }],
+            )
+            .await
+            .unwrap();
+        let harbeth = db
+            .create_variant(
+                uid,
+                chain_id,
+                "Harbeths",
+                &[VariantOverride {
+                    position: 2,
+                    equipment_id: Some(g("Harbeth")),
+                    name: Some("Harbeth".into()),
+                }],
+            )
+            .await
+            .unwrap();
+
+        // An hour on each of the three setups.
+        for (i, variant) in [None, Some(micro), Some(harbeth)].into_iter().enumerate() {
+            let mut p = play(&format!("t{i}"), "Burial", 1_760_000_000 + i as u64 * 10_000);
+            p.duration = Some(3600);
+            db.save_scrobble(
+                uid,
+                &p,
+                None,
+                None,
+                Some(chain_id),
+                variant,
+                None,
+                None,
+                None,
+                ListenDisposition::LIVE,
+            )
+            .await
+            .unwrap();
+        }
+
+        let before = db.equipment_seconds(uid).await.unwrap().0;
+        assert_eq!(before.get(&g("2M Red")), Some(&7200), "base + Harbeths ran the 2M Red");
+        assert_eq!(before.get(&g("Microlinear")), Some(&3600));
+        assert_eq!(before.get(&g("LS50")), Some(&7200));
+        assert_eq!(before.get(&g("Harbeth")), Some(&3600));
+        assert_eq!(before.get(&g("Node")), Some(&10800), "every setup ran the Node");
+
+        db.promote_variant(uid, micro, "2M Red days").await.unwrap();
+
+        let after = db.equipment_seconds(uid).await.unwrap().0;
+        assert_eq!(after, before, "promotion must not move a single second");
+
+        // And the chain really did change.
+        let chain =
+            db.get_chains(uid).await.unwrap().into_iter().find(|c| c.id == Some(chain_id)).unwrap();
+        assert_eq!(
+            chain.components.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(),
+            ["Node", "Microlinear", "LS50"]
+        );
+
+        // The promoted variant is gone — it is the chain now — and the old base
+        // is a variant that restores it.
+        let variants = db.list_variants(uid).await.unwrap();
+        assert!(!variants.iter().any(|v| v.id == micro), "the promoted setup is the chain");
+        let old = variants.iter().find(|v| v.name == "2M Red days").expect("the old base");
+        assert_eq!(old.overrides.len(), 1);
+        assert_eq!(old.overrides[0].position, 1);
+        assert_eq!(old.overrides[0].equipment_id, Some(g("2M Red")));
+
+        // **The other variant had to grow an override**, or it would have
+        // silently inherited the Microlinear.
+        let h = variants.iter().find(|v| v.id == harbeth).expect("the Harbeths");
+        assert!(
+            h.overrides.iter().any(|o| o.position == 1 && o.equipment_id == Some(g("2M Red"))),
+            "the Harbeths setup must now pin the cartridge it was relying on the base for"
+        );
+    }
+
+    /// The listens move with it: what was on the chain is now on the old-base
+    /// variant, and what was on the promoted variant is now on the chain.
+    #[tokio::test]
+    async fn promoting_repoints_the_listens_both_ways() {
+        let db = testdb().await;
+        let uid = db.create_user("ash", None, "pw", "user").await.unwrap();
+        let chain_id = db
+            .create_chain(&SignalChain {
+                id: None,
+                user_id: uid,
+                name: "Desk".into(),
+                description: None,
+                components: vec![ChainComponent {
+                    component_type: ComponentType::Transducer,
+                    name: "HD 650".into(),
+                    detail: None,
+                    equipment_id: None,
+                }],
+                listening_context: ListeningContext::Unknown,
+                icon: None,
+                is_active: true,
+                shared: false,
+                total_hours: 0.0,
+                created_at: 0,
+            })
+            .await
+            .unwrap();
+        let v = db
+            .create_variant(
+                uid,
+                chain_id,
+                "Hexa",
+                &[VariantOverride { position: 0, equipment_id: None, name: Some("Hexa".into()) }],
+            )
+            .await
+            .unwrap();
+
+        for (i, variant) in [None, Some(v)].into_iter().enumerate() {
+            let p = play(&format!("t{i}"), "Burial", 1_760_000_000 + i as u64 * 10_000);
+            db.save_scrobble(
+                uid,
+                &p,
+                None,
+                None,
+                Some(chain_id),
+                variant,
+                None,
+                None,
+                None,
+                ListenDisposition::LIVE,
+            )
+            .await
+            .unwrap();
+        }
+
+        let old_id = db.promote_variant(uid, v, "HD 650").await.unwrap();
+
+        let rows: Vec<(String, Option<i64>)> = sqlx::query_as(
+            "SELECT title, chain_variant_id FROM scrobbles WHERE user_id = ? ORDER BY title",
+        )
+        .bind(uid)
+        .fetch_all(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(rows[0].1, Some(old_id), "the listen that was on the chain is on the old base");
+        assert_eq!(rows[1].1, None, "and the one on the promoted setup is now on the chain");
+    }
+
+    /// Retagging a listen's chain must rewrite its variant, or the listen keeps
+    /// a setup belonging to a chain it is no longer on — components that were
+    /// never fitted together. `equipment_seconds` ignores such a pairing, so
+    /// the hours stay right and only the displayed setup is wrong, which is the
+    /// kind of wrongness nobody notices.
+    #[tokio::test]
+    async fn retagging_a_listen_s_chain_does_not_leave_a_stale_setup() {
+        let db = testdb().await;
+        let uid = db.create_user("ash", None, "pw", "user").await.unwrap();
+
+        let mk = |name: &str| SignalChain {
+            id: None,
+            user_id: uid,
+            name: name.into(),
+            description: None,
+            components: vec![ChainComponent {
+                component_type: ComponentType::Transducer,
+                name: "Cans".into(),
+                detail: None,
+                equipment_id: None,
+            }],
+            listening_context: ListeningContext::Unknown,
+            icon: None,
+            is_active: true,
+            shared: false,
+            total_hours: 0.0,
+            created_at: 0,
+        };
+        let a = db.create_chain(&mk("A")).await.unwrap();
+        let b = db.create_chain(&mk("B")).await.unwrap();
+        let va = db
+            .create_variant(
+                uid,
+                a,
+                "A's setup",
+                &[VariantOverride { position: 0, equipment_id: None, name: Some("Other".into()) }],
+            )
+            .await
+            .unwrap();
+
+        let p = play("t", "Burial", 1_760_000_000);
+        db.save_scrobble(
+            uid,
+            &p,
+            None,
+            None,
+            Some(a),
+            Some(va),
+            None,
+            None,
+            None,
+            ListenDisposition::LIVE,
+        )
+        .await
+        .unwrap();
+        let id: i64 = sqlx::query_scalar("SELECT id FROM scrobbles WHERE user_id = ?")
+            .bind(uid)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+
+        // Move it to chain B, naming no setup.
+        db.update_scrobble(uid, id, None, None, None, None, None, Some(b), None, None, None, None)
+            .await
+            .unwrap();
+        let variant: Option<i64> =
+            sqlx::query_scalar("SELECT chain_variant_id FROM scrobbles WHERE id = ?")
+                .bind(id)
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert_eq!(variant, None, "A's setup must not survive a move to chain B");
+
+        // The bulk path has to do the same.
+        db.bulk_set_scrobble_chain(uid, &[id], Some(a), Some(va)).await.unwrap();
+        db.bulk_set_scrobble_chain(uid, &[id], Some(b), None).await.unwrap();
+        let variant: Option<i64> =
+            sqlx::query_scalar("SELECT chain_variant_id FROM scrobbles WHERE id = ?")
+                .bind(id)
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert_eq!(variant, None, "and neither may it survive a bulk retag");
+    }
+
+    /// **The Patch screens must not scan the history once per row.**
+    ///
+    /// Written after v0.80.0 took the real instance down. `patch_artists`,
+    /// `discover_decks` and `deck_view` each asked, per outer row, for a count
+    /// or an `EXISTS` keyed on `LOWER(TRIM(artist))` — a join key that is a
+    /// function of a column, which no index can serve, so each one is a full
+    /// scan of the whole history *per artist* or *per user*. On a laptop with
+    /// three listens they were instant. On a 50,000-listen instance they held a
+    /// pool connection for minutes, and once every connection was held the
+    /// whole application stopped: sessions could not be validated, the engine
+    /// could not read its sources, and `auth_status` reported the instance as
+    /// having no users at all.
+    ///
+    /// This asserts on the **query plan**, which is hardware-independent, where
+    /// a timing is not — the rule v0.58.0 arrived at. One `SCAN scrobbles` is
+    /// the honest cost of a grouped aggregation; two or more means something is
+    /// being re-scanned per row.
+    #[tokio::test]
+    async fn the_patch_screens_scan_the_history_once() {
+        let db = testdb().await;
+        let (me, them, chain) = patched_pair(&db).await;
+        listen(&db, them, Some(chain), "Teardrop", "Massive Attack", 1_760_000_100).await;
+        listen(&db, me, None, "Risingson", "Massive Attack", 1_760_000_200).await;
+
+        // The three queries as the handlers issue them, by plan.
+        let plans: Vec<(&str, String)> = vec![
+            (
+                "patch_artists",
+                format!(
+                    "SELECT s.artist, COUNT(*) {} GROUP BY LOWER(TRIM(s.artist)) LIMIT 50",
+                    Database::SHARED_LISTENS
+                ),
+            ),
+            (
+                "my_artist_plays",
+                "SELECT LOWER(TRIM(artist)), COUNT(*) FROM scrobbles
+                   WHERE user_id = ? AND skipped = FALSE GROUP BY LOWER(TRIM(artist))"
+                    .into(),
+            ),
+            (
+                "discover overlap",
+                "SELECT s.user_id, s.artist, COUNT(*) FROM scrobbles s
+                   JOIN signal_chains c ON c.id = s.chain_id AND c.shared = 1
+                  WHERE s.skipped = FALSE GROUP BY s.user_id, LOWER(TRIM(s.artist))"
+                    .into(),
+            ),
+        ];
+
+        for (name, sql) in plans {
+            let rows: Vec<(i64, i64, i64, String)> =
+                sqlx::query_as(&format!("EXPLAIN QUERY PLAN {sql}"))
+                    .bind(me)
+                    .bind(me)
+                    .fetch_all(&db.pool)
+                    .await
+                    .unwrap_or_default();
+            let plan: Vec<String> = rows.into_iter().map(|r| r.3).collect();
+            let scans = plan.iter().filter(|l| l.contains("SCAN scrobbles")).count();
+            assert!(
+                scans <= 1,
+                "{name} scans `scrobbles` {scans} times — a correlated subquery keyed on a \
+                 function of a column is a full scan per row, which is what took the instance \
+                 down. Plan:\n{}",
+                plan.join("\n")
+            );
+            assert!(
+                !plan.iter().any(|l| l.contains("CORRELATED")),
+                "{name} has a correlated subquery. Plan:\n{}",
+                plan.join("\n")
+            );
+        }
+    }
+
+    /// The overlap has to keep *working*, not just be fast — the rewrite folds
+    /// two grouped scans in Rust instead of asking SQLite, and a fold that
+    /// silently matches nothing would look exactly like "you have nothing in
+    /// common".
+    #[tokio::test]
+    async fn the_overlap_still_finds_what_you_both_play() {
+        let db = testdb().await;
+        let (me, them, chain) = patched_pair(&db).await;
+
+        listen(&db, them, Some(chain), "Teardrop", "Massive Attack", 1_760_000_100).await;
+        listen(&db, them, Some(chain), "Hallogallo", "Neu!", 1_760_000_200).await;
+        // Mine, spelled differently — the fold is the point.
+        listen(&db, me, None, "Risingson", "  massive attack ", 1_760_000_300).await;
+
+        let artists = db.patch_artists(me, 50).await.unwrap();
+        let ma = artists.iter().find(|a| a.name == "Massive Attack").expect("massive attack");
+        assert_eq!(ma.mine, 1, "case and spacing must not stop the overlap being found");
+        assert_eq!(artists.iter().find(|a| a.name == "Neu!").unwrap().mine, 0);
+
+        let deck = db.deck_view(me, "kim").await.unwrap().expect("deck");
+        assert_eq!(deck.both_play, ["Massive Attack"]);
+
+        let decks = db.discover_decks(me).await.unwrap();
+        let kim = decks.iter().find(|d| d.username == "kim").expect("kim");
+        assert_eq!(kim.overlap, "Massive Attack");
+        assert!(!decks.iter().any(|d| d.user_id == me), "you are not a deck to discover");
     }
 
     /// Opening a database that an *older* Tapedeck wrote.

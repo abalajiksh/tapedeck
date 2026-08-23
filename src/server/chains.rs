@@ -41,6 +41,61 @@ pub struct UpdateVariantRequest {
 /// GET /api/v1/chains/variants — every variant the caller owns.
 ///
 /// Flat rather than nested under each chain: the page needs them keyed by
+#[derive(Deserialize)]
+struct PromoteVariant {
+    /// What to call the setup the chain is being demoted to. The old base has
+    /// no name of its own — it *was* the chain — so one has to be supplied.
+    name: Option<String>,
+}
+
+/// POST /api/v1/chains/variants/:id/promote — make this setup the chain, and
+/// the chain a setup.
+///
+/// **A relabelling, not a change.** What was fitted for any given listen is
+/// identical afterwards and so is every piece of gear's hours; the work is in
+/// re-expressing the *other* variants, whose overrides are relative to a base
+/// that is about to move under them. See `Database::promote_variant`.
+async fn promote_variant(
+    State(state): State<Arc<AppState>>,
+    user: AuthUser,
+    Path(id): Path<i64>,
+    Json(body): Json<PromoteVariant>,
+) -> impl IntoResponse {
+    let name = body
+        .name
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("Previous setup")
+        .to_string();
+
+    match state.db.promote_variant(user.user_id, id, &name).await {
+        Ok(old_id) => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "promoted": id, "old_base_variant_id": old_id })),
+        )
+            .into_response(),
+        Err(sqlx::Error::RowNotFound) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!(ErrorResponse { code: 404, error: "No such setup".into() })),
+        )
+            .into_response(),
+        // The one refusal worth its own message: a variant that *removes* a
+        // step cannot become the chain, because every later position would
+        // shift under every other variant.
+        Err(sqlx::Error::Protocol(msg)) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!(ErrorResponse { code: 400, error: msg })),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!(ErrorResponse { code: 500, error: e.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
 /// chain, and one list it can group beats N requests.
 async fn list_variants(
     State(state): State<Arc<AppState>>,
@@ -662,6 +717,7 @@ pub fn create_gear_router() -> Router<Arc<AppState>> {
             "/api/v1/chains/variants/:id",
             axum::routing::patch(update_variant).delete(delete_variant),
         )
+        .route("/api/v1/chains/variants/:id/promote", post(promote_variant))
         // Same reasoning as "variants" above: a literal segment under /chains,
         // which matchit prefers over "/:id".
         .route("/api/v1/chains/duplicates", get(list_duplicates))

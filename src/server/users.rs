@@ -80,7 +80,25 @@ fn session_clear_cookie(secure: bool) -> HeaderValue {
 
 /// GET /api/v1/auth/status — unauthenticated, returns setup + auth state
 async fn auth_status(State(state): State<Arc<AppState>>, headers: HeaderMap) -> impl IntoResponse {
-    let needs_setup = state.db.needs_setup().await.unwrap_or(true);
+    // **`unwrap_or(false)`, and this is the whole of a production incident.**
+    //
+    // It was `unwrap_or(true)`: when the database could not be asked, this
+    // reported *"this instance has no users — create an admin account"*. That is
+    // a failure to read being published as a fact about the data, and it is the
+    // single most alarming thing this application can say. On 2026-08-23 a
+    // connection-pool exhaustion made every query time out, and every member of
+    // a live instance was shown a first-run setup screen with their years of
+    // listening apparently gone. Nothing was gone; the app simply could not
+    // count.
+    //
+    // Failing *closed* is the safe direction here, and it is the opposite of
+    // what one assumes: an instance wrongly told "setup is done" shows a login
+    // box, which is recoverable and true five seconds later. An instance
+    // wrongly told "there are no users" tells its owner their data is gone.
+    //
+    // Same family as the fidelity cards — "we could not measure" rendered as a
+    // measurement — except this one says it about the whole instance.
+    let needs_setup = state.db.needs_setup().await.unwrap_or(false);
 
     let session_user = if let Some(session_token) =
         headers.get("cookie").and_then(|v| v.to_str().ok()).and_then(|c| {
