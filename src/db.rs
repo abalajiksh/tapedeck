@@ -9406,15 +9406,53 @@ impl Database {
             Option<i64>,
             Option<f64>,
             Option<String>,
+            Option<i64>,
         )> = sqlx::query_as(
             "SELECT id, timestamp, duration, device_id, chain_id, quality_score,
-                        listening_context
+                        listening_context, session_id
                    FROM scrobbles WHERE user_id = ? AND skipped = FALSE
                   ORDER BY timestamp ASC",
         )
         .bind(user_id)
         .fetch_all(&self.pool)
         .await?;
+
+        // **What a sitting is called, and the id other people hold, survive a
+        // regroup.**
+        //
+        // This used to mint a fresh `new_uuid()` for every group and carry
+        // neither `title` nor `notes`, so a rebuild silently erased every name
+        // and note anybody had written — and, since v0.83.0, broke every
+        // handed-over sitting, because `sessions.uuid` is what a hand-over
+        // points at and the whole reason that column is documented as stable
+        // across merges and splits.
+        //
+        // A sitting is identified by the listen it opens with. Where a regroup
+        // produces a group starting on the same listen, it *is* that sitting
+        // and keeps its identity; anything else is new. That rule falls out the
+        // same way `merge_sessions` already resolves this — the earliest
+        // session's identity is the one that survives — so a larger gap folding
+        // two sittings together keeps the first one's name, and a smaller gap
+        // splitting one keeps it on the opening half.
+        let mut first_listen_of: HashMap<i64, i64> = HashMap::new();
+        for (id, _, _, _, _, _, _, session_id) in &rows {
+            if let Some(sid) = session_id {
+                first_listen_of.entry(*sid).or_insert(*id);
+            }
+        }
+        let prior: Vec<(i64, Option<String>, Option<String>, Option<String>)> =
+            sqlx::query_as("SELECT id, uuid, title, notes FROM sessions WHERE user_id = ?")
+                .bind(user_id)
+                .fetch_all(&self.pool)
+                .await?;
+        // Keyed by the opening listen, which is what a group can be matched on.
+        let mut identity: HashMap<i64, (Option<String>, Option<String>, Option<String>)> =
+            HashMap::new();
+        for (sid, uuid, title, notes) in prior {
+            if let Some(first) = first_listen_of.get(&sid) {
+                identity.insert(*first, (uuid, title, notes));
+            }
+        }
 
         // Grouped in Rust first, written afterwards. The previous version did a
         // round trip *per listen* — an INSERT at each boundary, an `UPDATE
@@ -9448,7 +9486,7 @@ impl Database {
         let mut groups: Vec<Pending> = Vec::new();
         let mut prev_end = i64::MIN;
 
-        for (id, ts, dur, device_id, chain_id, quality, context) in rows {
+        for (id, ts, dur, device_id, chain_id, quality, context, _) in rows {
             if groups.is_empty() || ts - prev_end > gap_seconds {
                 groups.push(Pending {
                     device_id,
@@ -9497,11 +9535,19 @@ impl Database {
 
         let now = Self::now_secs();
         for g in &groups {
+            // The sitting this group opens with, if it is one we already had.
+            // A group whose first listen matches nothing is genuinely new and
+            // gets a fresh identity.
+            let carried = g.listens.first().and_then(|first| identity.get(first));
+            let (uuid, title, notes) = match carried {
+                Some((u, t, n)) => (u.clone().unwrap_or_else(new_uuid), t.clone(), n.clone()),
+                None => (new_uuid(), None, None),
+            };
             let res = sqlx::query(
                 "INSERT INTO sessions (user_id, device_id, chain_id, started_at, ended_at,
                     track_count, total_duration, avg_quality_score, listening_context,
-                    uuid, updated_at)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    uuid, title, notes, updated_at)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             )
             .bind(user_id)
             .bind(g.device_id)
@@ -9512,7 +9558,9 @@ impl Database {
             .bind(g.total_duration)
             .bind((g.quality_n > 0).then(|| g.quality_sum / g.quality_n as f64))
             .bind(g.context.clone().unwrap_or_else(|| "unknown".into()))
-            .bind(new_uuid())
+            .bind(uuid)
+            .bind(title)
+            .bind(notes)
             .bind(now)
             .execute(&mut *tx)
             .await?;
@@ -20840,6 +20888,75 @@ mod tests {
         // opening it without them.
         assert!(db.start_spool(me, None, &[them, stranger]).await.is_err());
         assert!(db.active_spool(me).await.unwrap().is_none());
+    }
+
+    /// A regroup keeps what a sitting was called, what was written about it,
+    /// and **the id other people hold**.
+    ///
+    /// The rebuild used to mint a fresh uuid per group and carry neither title
+    /// nor notes, so it silently erased every name anybody had written — and
+    /// since hand-overs point at `sessions.uuid`, it broke those too. Asserted
+    /// through a hand-over rather than only on the column, because that is the
+    /// consequence somebody would actually notice.
+    #[tokio::test]
+    async fn a_regroup_keeps_what_a_sitting_was_called_and_the_id_others_hold() {
+        let db = testdb().await;
+        let (me, them, chain) = patched_pair(&db).await;
+
+        listen(&db, them, Some(chain), "One", "Talk Talk", 1_760_000_100).await;
+        listen(&db, them, Some(chain), "Two", "Talk Talk", 1_760_000_200).await;
+        // A second sitting, hours later, so the gap really separates them.
+        listen(&db, them, Some(chain), "Later", "Bark Psychosis", 1_760_090_000).await;
+        db.rebuild_sessions(them, 1800).await.unwrap();
+
+        let before: Vec<(i64, String)> =
+            sqlx::query_as("SELECT id, uuid FROM sessions WHERE user_id = ? ORDER BY started_at")
+                .bind(them)
+                .fetch_all(&db.pool)
+                .await
+                .unwrap();
+        assert_eq!(before.len(), 2);
+        let (first_id, first_uuid) = before[0].clone();
+
+        db.set_session_title(them, first_id, Some("Sunday morning")).await.unwrap();
+        db.set_session_notes(them, first_id, Some("new cartridge")).await.unwrap();
+        let handed =
+            db.hand_over_session(them, &first_uuid, me, Some("have a look")).await.unwrap();
+        assert_eq!(db.handed_sitting(&handed, me).await.unwrap().unwrap().listens.len(), 2);
+
+        // The thing that used to wipe all of it.
+        db.rebuild_sessions(them, 1800).await.unwrap();
+
+        let after: Vec<(String, Option<String>, Option<String>)> = sqlx::query_as(
+            "SELECT uuid, title, notes FROM sessions WHERE user_id = ? ORDER BY started_at",
+        )
+        .bind(them)
+        .fetch_all(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(after.len(), 2);
+        assert_eq!(after[0].0, first_uuid, "the id other people hold survives a regroup");
+        assert_eq!(after[0].1.as_deref(), Some("Sunday morning"));
+        assert_eq!(after[0].2.as_deref(), Some("new cartridge"));
+
+        // And the hand-over still resolves, rather than reading as a sitting
+        // that has been regrouped out of existence.
+        let doc = db.handed_sitting(&handed, me).await.unwrap().unwrap();
+        assert!(!doc.gone, "a regroup must not break a sitting somebody was handed");
+        assert_eq!(doc.listens.len(), 2);
+
+        // A widened gap folds the two together: the earliest one's identity is
+        // what survives, the same rule `merge_sessions` follows.
+        db.rebuild_sessions(them, 200_000).await.unwrap();
+        let folded: Vec<(String, Option<String>)> =
+            sqlx::query_as("SELECT uuid, title FROM sessions WHERE user_id = ?")
+                .bind(them)
+                .fetch_all(&db.pool)
+                .await
+                .unwrap();
+        assert_eq!(folded.len(), 1);
+        assert_eq!(folded[0].0, first_uuid);
+        assert_eq!(folded[0].1.as_deref(), Some("Sunday morning"));
     }
 
     /// **The spool you forgot to start.** The other gesture entirely.

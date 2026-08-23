@@ -34,6 +34,23 @@ use crate::sources::MusicSource;
 
 const SUBSONIC_API_VERSION: &str = "1.16.1";
 
+/// Where the next history walk starts.
+///
+/// Pure and separate from the request for the reason `consume_sessions` is:
+/// this decides whether a listen is ever seen at all, and a rule like that has
+/// to be testable without a server. See `fetch_new_plays` for why it rewinds.
+fn resume_point(last_submission: u64, last_checked: u64) -> u64 {
+    last_submission.max(last_checked).saturating_sub(HISTORY_SLACK_SECS)
+}
+
+/// How far the history cursor is rewound on every poll.
+///
+/// Generous on purpose: the cost of overlapping is rows the dedup throws away,
+/// and the cost of not overlapping is a listen nobody ever sees again. Well
+/// clear of any plausible disagreement between Tapedeck's clock and the
+/// server's, and small enough that a poll still reads one page.
+const HISTORY_SLACK_SECS: u64 = 300;
+
 pub struct NavidromeSource {
     url: String,
     username: String,
@@ -223,6 +240,8 @@ impl NavidromeSource {
     }
 
     /// Resume from a known high-water mark so a restart doesn't re-walk history.
+    ///
+    /// See `fetch_new_plays` for why the mark is rewound rather than used as-is.
     pub fn resume_from(&mut self, submission_time: u64) {
         self.last_submission = submission_time;
     }
@@ -624,7 +643,23 @@ impl MusicSource for NavidromeSource {
         &mut self,
         last_checked: u64,
     ) -> Result<Vec<Play>, Box<dyn std::error::Error>> {
-        let from = self.last_submission.max(last_checked);
+        // **Rewound, not resumed exactly.** Asking from the newest thing we
+        // have seen loses anything that lands on or just under that boundary
+        // between two polls: `last_checked` is Tapedeck's wall clock while
+        // `submission_time` is Navidrome's, so they need not agree, and two
+        // scrobbles inside one second are ordinary. A miss here is silent —
+        // the listen is simply never fetched again, because the mark has
+        // already moved past it.
+        //
+        // Overlapping instead is free, and provably so rather than hopefully:
+        // `to_play` derives `source_id` from `(submission_time, media_file_id)`
+        // and nothing else, so re-reading a row yields the identical id and
+        // `save_scrobble`'s uniqueness absorbs it —
+        // `source_id_separates_repeat_plays_of_one_track` pins exactly that.
+        //
+        // The same trade rocksky's jetstream consumer makes on reconnect, for
+        // the same reason: prefer a few redundant rows to a silent hole.
+        let from = resume_point(self.last_submission, last_checked);
         match self.fetch_scrobbles(from).await {
             Ok(plays) => Ok(plays),
             Err(e) => {
@@ -649,6 +684,28 @@ mod tests {
             mbid: Some("mbid-xtal".into()),
             isrc: None,
         }
+    }
+
+    /// The cursor rewinds, and never underflows past the epoch.
+    ///
+    /// Phrased about the *hole* rather than the arithmetic: a scrobble landing
+    /// on the boundary between two polls used to be skipped for good, because
+    /// the mark had already moved past it and nothing looks back.
+    #[test]
+    fn the_history_cursor_looks_back_far_enough_to_close_the_gap() {
+        // The later of the two marks is what leads, then it steps back.
+        assert_eq!(resume_point(1_000_000, 900_000), 1_000_000 - HISTORY_SLACK_SECS);
+        assert_eq!(resume_point(900_000, 1_000_000), 1_000_000 - HISTORY_SLACK_SECS);
+
+        // A listen submitted at the exact moment of the previous poll — the one
+        // that used to vanish — is inside the window now.
+        let polled_at = 1_700_000_000;
+        assert!(resume_point(polled_at, polled_at) < polled_at);
+
+        // And a fresh source with no marks asks for everything rather than
+        // wrapping around to the end of time.
+        assert_eq!(resume_point(0, 0), 0);
+        assert_eq!(resume_point(0, 60), 0);
     }
 
     #[test]
