@@ -14582,6 +14582,7 @@ impl Database {
 
         Ok(Some(SpoolView {
             uuid,
+            viewer_id: user_id,
             title,
             started_at,
             host_user_id,
@@ -15819,6 +15820,10 @@ pub struct SpoolMember {
 #[derive(Debug, serde::Serialize)]
 pub struct SpoolView {
     pub uuid: String,
+    /// Who is asking. The members list includes the caller, and a screen saying
+    /// "with Noor and Tobias" has to leave the reader out of it — `hosting`
+    /// cannot do that, since it only identifies one of the two cases.
+    pub viewer_id: i64,
     pub title: Option<String>,
     pub started_at: i64,
     pub host_user_id: i64,

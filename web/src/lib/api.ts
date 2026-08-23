@@ -471,6 +471,9 @@ export interface SpoolMember {
 
 export interface SpoolView {
 	uuid: string;
+	/** Who is asking. `members` includes you, and a line saying "with Noor and
+	 *  Tobias" has to leave you out of it. */
+	viewer_id: number;
 	title: string | null;
 	started_at: number;
 	host_user_id: number;

@@ -18,6 +18,7 @@
 		Dub,
 		SpoolView,
 		SpoolCapture,
+		SpoolMember,
 		HandedSitting,
 		HandedSittingDetail,
 		SignalChain,
@@ -267,6 +268,61 @@
 	}
 
 	$: pendingCaptures = captures.filter((c) => c.state === 'pending');
+
+	// Grouped by the sitting they came from, newest evening first. A capture on
+	// its own is a track with no context; what makes it answerable is *which
+	// evening* and *whose deck*.
+	$: captureSittings = (() => {
+		const by = new Map<string, { uuid: string; title: string; from: string; when: string; rows: SpoolCapture[] }>();
+		for (const c of pendingCaptures) {
+			let g = by.get(c.spool_uuid);
+			if (!g) {
+				g = {
+					uuid: c.spool_uuid,
+					title: c.spool_title || 'A sitting',
+					from: c.from_display_name || c.from_username,
+					when: '',
+					rows: []
+				};
+				by.set(c.spool_uuid, g);
+			}
+			g.rows.push(c);
+		}
+		for (const g of by.values()) {
+			g.rows.sort((a, b) => a.played_at - b.played_at);
+			const first = g.rows[0]?.played_at;
+			const last = g.rows[g.rows.length - 1]?.played_at;
+			const d = new Date(first * 1000);
+			const t = (x: number) =>
+				new Date(x * 1000).toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' });
+			g.when = `${d.toLocaleDateString(undefined, { weekday: 'short', day: 'numeric', month: 'short' })} · ${t(first)} – ${t(last)} · from ${g.from}`;
+		}
+		return [...by.values()].sort((a, b) => b.rows[0].played_at - a.rows[0].played_at);
+	})();
+
+	// Everything starts ticked: the common answer to "you were in the room for
+	// these" is yes, so the work should be un-ticking the odd one rather than
+	// ticking all twelve.
+	//
+	// **Exclusions are the state, and `picked` is derived from them.** The
+	// obvious version keeps the ticked set and tops it up in a reactive block —
+	// but that block has to *read* `picked` to preserve what was un-ticked and
+	// *assign* it to adopt new captures, which is a self-referencing cycle:
+	// un-ticking a row re-ticked itself on the next run. Storing what was
+	// removed has no such cycle, and it also survives the 15s capture poll
+	// without the reader's choices being reset under them.
+	let unpicked = new Set<number>();
+	$: picked = new Set(pendingCaptures.map((c) => c.id).filter((id) => !unpicked.has(id)));
+
+	function togglePick(id: number) {
+		const next = new Set(unpicked);
+		if (next.has(id)) next.delete(id);
+		else next.add(id);
+		unpicked = next;
+	}
+
+	const pickedIn = (sit: { rows: SpoolCapture[] }) =>
+		sit.rows.filter((c) => picked.has(c.id)).map((c) => c.id);
 	$: openDubs = dubs.filter((d) => d.status === 'open');
 	$: unseenSittings = sittings.filter((h) => !h.seen_at);
 	// One number on the tab. Three kinds of thing wait in that inbox and a
@@ -570,6 +626,22 @@
 	// stuck 0:00 looked like on screen. Taking it as an argument forces the
 	// caller to name it, so `spoolClock` below cannot be written the wrong
 	// way. Same trap as `noteCurrentTrack` and `sideTotals` on the shelf.
+	/** Everyone in the sitting but you. */
+	const others = (sp: SpoolView): SpoolMember[] =>
+		sp.members.filter((m) => m.state === 'joined' && m.user_id !== sp.viewer_id);
+
+	/** "with Noor and Tobias" — the design's main line, and the honest one: a
+	 *  sitting is who is in it. */
+	function withLabel(sp: SpoolView): string {
+		const names = others(sp).map((m) => m.display_name || m.username);
+		if (!names.length) return sp.hosting ? 'no one yet' : 'just you so far';
+		if (names.length === 1) return `with ${names[0]}`;
+		const last = names[names.length - 1];
+		return `with ${names.slice(0, -1).join(', ')} and ${last}`;
+	}
+
+	const invitedCount = (sp: SpoolView) => sp.members.filter((m) => m.state === 'invited').length;
+
 	function clock(from: number, now: number): string {
 		const s = Math.max(0, now - from);
 		const h = Math.floor(s / 3600);
@@ -779,20 +851,30 @@
 -->
 {#if spool}
 	<div class="spool" class:invited={spool.my_state === 'invited'}>
+		<!--
+			The people first, then the pulse. The design leads with an avatar
+			stack and "with Noor and Tobias" — a sitting is *who you are in a
+			room with*, and the name you gave it is the secondary fact.
+		-->
+		{#if others(spool).length}
+			<div class="savatars">
+				{#each others(spool).slice(0, 4) as m (m.user_id)}
+					<span class="sav" title={m.display_name || m.username}>
+						{(m.display_name || m.username).slice(0, 2).toUpperCase()}
+					</span>
+				{/each}
+			</div>
+		{/if}
 		<div class="spulse"><span></span><span></span></div>
 		<div class="smain">
 			<div class="slabel">
 				{spool.my_state === 'invited' ? 'You were asked into a Shared Spool' : 'Shared Spool running'}
 			</div>
-			<div class="stitle">{spool.title || 'A sitting'}</div>
+			<div class="stitle">{withLabel(spool)}</div>
 			<div class="smembers">
-				{spool.members
-					.filter((m) => m.state === 'joined')
-					.map((m) => m.display_name || m.username)
-					.join(', ')}
-				{#if spool.members.some((m) => m.state === 'invited')}
-					· {spool.members.filter((m) => m.state === 'invited').length} invited
-				{/if}
+				{#if spool.title}{spool.title}{/if}
+				{#if spool.title && invitedCount(spool)} · {/if}
+				{#if invitedCount(spool)}{invitedCount(spool)} invited{/if}
 			</div>
 			<!--
 				A sitting does not bypass the sharing switch, so a host who
@@ -1476,34 +1558,64 @@
 			<strong>Nothing enters your history until you accept it</strong> — and what you accept
 			is stored only here, never forwarded on to Last.fm or ListenBrainz.
 		</p>
-		<div class="panel rows">
-			{#each pendingCaptures as c (c.id)}
-				<div class="prow">
-					<span class="avatar small">{c.from_username.slice(0, 2).toUpperCase()}</span>
-					<div class="pmain">
-						<div class="pname">{c.title}</div>
-						<div class="pmeta">{c.artist}{#if c.album} · {c.album}{/if}</div>
-						<div class="phandle">from @{c.from_username} · {c.spool_title || 'a sitting'}</div>
+		<!--
+			**One card per sitting**, per the design. A flat list loses the thing
+			that makes a capture make sense — which evening it came from and
+			whose deck played it — and it forces a decision per row where the
+			real decision is usually "that evening, yes".
+
+			Ticking rather than Keep/Skip per row for the same reason: the
+			endpoint has always taken a set of ids, and the common case is
+			several at once.
+		-->
+		{#each captureSittings as sit (sit.uuid)}
+			<div class="panel sitcard">
+				<div class="sithead">
+					<span class="avatar small">{sit.from.slice(0, 2).toUpperCase()}</span>
+					<div style="flex:1;min-width:200px;">
+						<div class="sittitle">{sit.title}</div>
+						<div class="sitwhen">{sit.when}</div>
 					</div>
-					<div class="pacts">
-						<button class="btn btn-primary" disabled={busy === 'captures'}
-							on:click={() => settleCaptures([c.id], true)}>Keep</button>
-						<button class="btn btn-secondary" disabled={busy === 'captures'}
-							on:click={() => settleCaptures([c.id], false)}>Skip</button>
-					</div>
+					<span class="tag">{sit.rows.length} pending</span>
 				</div>
-			{/each}
-		</div>
-		<div class="bulk">
-			<button class="btn btn-primary" disabled={busy === 'captures'}
-				on:click={() => settleCaptures(pendingCaptures.map((c) => c.id), true)}>
-				Keep all {pendingCaptures.length}
-			</button>
-			<button class="btn btn-secondary" disabled={busy === 'captures'}
-				on:click={() => settleCaptures(pendingCaptures.map((c) => c.id), false)}>
-				Decline the rest
-			</button>
-		</div>
+
+				<div class="sittracks">
+					{#each sit.rows as c (c.id)}
+						<label class="sittrack" class:on={picked.has(c.id)}>
+							<input
+								type="checkbox"
+								checked={picked.has(c.id)}
+								on:change={() => togglePick(c.id)}
+								aria-label="Keep {c.title}"
+							/>
+							<div style="flex:1;min-width:0;">
+								<div class="pname">{c.title}</div>
+								<div class="pmeta">{c.artist}{#if c.album} · {c.album}{/if}</div>
+							</div>
+							<span class="sitat">{new Date(c.played_at * 1000).toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' })}</span>
+						</label>
+					{/each}
+				</div>
+
+				<div class="bulk">
+					<button
+						class="btn btn-primary"
+						disabled={busy === 'captures' || !pickedIn(sit).length}
+						on:click={() => settleCaptures(pickedIn(sit), true)}
+					>
+						Accept {pickedIn(sit).length} play{pickedIn(sit).length === 1 ? '' : 's'}
+					</button>
+					<button class="btn btn-secondary" disabled={busy === 'captures'}
+						on:click={() => settleCaptures(sit.rows.map((c) => c.id), false)}>
+						Decline the rest
+					</button>
+					<span class="esub" style="margin:0;">
+						Accepted plays land in your history credited to {sit.from}'s deck — and are
+						never forwarded on.
+					</span>
+				</div>
+			</div>
+		{/each}
 	{/if}
 
 	{#if openDubs.length}
@@ -2244,6 +2356,54 @@
 		.pubrow { flex-wrap: wrap; }
 		.pubseg { margin-left: auto; }
 	}
+
+	/* — spool captures, one card per sitting — */
+	.sitcard { border-radius: 22px; padding: 18px 20px; margin-bottom: 14px; }
+	.sithead {
+		display: flex;
+		align-items: center;
+		gap: 12px;
+		flex-wrap: wrap;
+		margin-bottom: 14px;
+	}
+	.sittitle { font-size: 15px; font-weight: 600; }
+	.sitwhen { font-size: 12.5px; color: var(--td-muted-2); margin-top: 2px; }
+	.sittracks { display: flex; flex-direction: column; gap: 5px; margin-bottom: 14px; }
+	.sittrack {
+		display: flex;
+		align-items: center;
+		gap: 11px;
+		padding: 8px 11px;
+		border-radius: 13px;
+		background: var(--td-surface2);
+		cursor: pointer;
+		min-width: 0;
+	}
+	.sittrack.on { background: color-mix(in srgb, var(--td-accent) 11%, transparent); }
+	.sittrack input { width: 16px; height: 16px; accent-color: var(--td-accent); flex: none; cursor: pointer; }
+	.sitat {
+		flex: none;
+		font-size: 12px;
+		color: var(--td-muted-3);
+		font-variant-numeric: tabular-nums;
+	}
+
+	/* The avatar stack on the running banner — the people first, which is what
+	   a sitting is. */
+	.savatars { display: flex; flex: none; }
+	.savatars .sav {
+		width: 34px;
+		height: 34px;
+		border-radius: 50%;
+		background: var(--td-panel2);
+		color: #f4e7cf;
+		display: flex;
+		align-items: center;
+		justify-content: center;
+		font: 700 11px ui-monospace, SFMono-Regular, Menlo, monospace;
+		border: 2px solid var(--td-panel);
+	}
+	.savatars .sav + .sav { margin-left: -11px; }
 
 	/* — collective hours — */
 	.hbars {
