@@ -14186,6 +14186,13 @@ impl Database {
         .fetch_all(&self.pool)
         .await?;
 
+        let artists_heard: i64 = sqlx::query_scalar(&format!(
+            "SELECT COUNT(DISTINCT LOWER(TRIM(s.artist))) {SHARED} AND s.timestamp >= ?"
+        ))
+        .bind(since)
+        .fetch_one(&self.pool)
+        .await?;
+
         let chains: Vec<(String, i64)> = sqlx::query_as(&format!(
             "SELECT c.name, COUNT(*) AS plays {SHARED} AND s.timestamp >= ? \
               GROUP BY c.id ORDER BY plays DESC LIMIT 6"
@@ -14211,6 +14218,7 @@ impl Database {
             shared_chains,
             listens,
             hours,
+            artists_heard,
             artists,
             chains: chains.into_iter().map(|(name, plays)| ChainTally { name, plays }).collect(),
             daily: daily.into_iter().map(|(at, hours)| DailyHour { at, hours }).collect(),
@@ -15568,6 +15576,10 @@ pub struct InstancePulse {
     pub shared_chains: i64,
     pub listens: i64,
     pub hours: f64,
+    /// Distinct artists heard across shared chains in the window. **Not
+    /// `artists.len()`** — that list is cut to the top 8 for the panel, so
+    /// counting it would report 8 forever.
+    pub artists_heard: i64,
     pub artists: Vec<PatchArtist>,
     pub chains: Vec<ChainTally>,
     pub daily: Vec<DailyHour>,

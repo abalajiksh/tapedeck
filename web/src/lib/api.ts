@@ -430,6 +430,9 @@ export interface InstancePulse {
 	shared_chains: number;
 	listens: number;
 	hours: number;
+	/** Distinct artists heard in the window. **Not `artists.length`** — that
+	 *  list is cut to the top 8 for the panel. */
+	artists_heard: number;
 	artists: PatchArtist[];
 	chains: { name: string; plays: number }[];
 	/** Raw (timestamp, hours) pairs — the day boundary is the reader's. */

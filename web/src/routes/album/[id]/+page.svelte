@@ -2,6 +2,8 @@
 	import { onMount } from 'svelte';
 	import { page } from '$app/stores';
 	import { api } from '$lib/api';
+	import DubDialog from '$lib/components/DubDialog.svelte';
+	let dubOpen = false;
 	import type { AlbumView, AlbumTracklist, TracklistTrack } from '$lib/api';
 	import { formatDuration, qualityLabel, tierTagClass } from '$lib/utils';
 	import { openArtist } from '$lib/entities';
@@ -283,6 +285,12 @@
 				</button>
 				<a class="btn btn-secondary" style="font-size:12.5px;text-decoration:none;"
 					href={`/notes?entity=${album.id}`}>Liner notes</a>
+				<!-- Passing a record to somebody. The endpoint has existed since
+				     v0.80.0 with nothing calling it, so dubs could be received and
+				     never sent. -->
+				<button class="btn btn-secondary" style="font-size:12.5px;" on:click={() => (dubOpen = true)}>
+					Dub to a deck
+				</button>
 			</div>
 		</div>
 	</div>
@@ -417,6 +425,10 @@
 			{/each}
 		</div>
 	{/if}
+{/if}
+
+{#if album}
+	<DubDialog bind:open={dubOpen} kind="album" artist={album.artist} name={album.title} />
 {/if}
 
 <style>

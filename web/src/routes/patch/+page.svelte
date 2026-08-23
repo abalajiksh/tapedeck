@@ -119,6 +119,50 @@
 	let ops: FederationOps | null = null;
 	let vocab: { verb: string; object: string; namespace: string; frozen: boolean } | null = null;
 	let instanceLoaded = false;
+
+	/**
+	 * The daily series, bucketed into the **reader's** days.
+	 *
+	 * The server sends raw `(timestamp, hours)` pairs precisely because the day
+	 * boundary is not something it can know — the trap the genre-map trajectory
+	 * already documents. A listen at 00:30 CET belongs to the new day, and only
+	 * the browser is holding that answer.
+	 *
+	 * Days with nothing in them are kept rather than dropped: a bar chart with
+	 * the quiet days missing reads as continuous listening.
+	 */
+	$: dayBars = (() => {
+		if (!pulse) return [];
+		const byDay = new Map<string, number>();
+		const dayKey = (d: Date) =>
+			`${d.getFullYear()}-${d.getMonth() + 1}-${d.getDate()}`;
+		const today = new Date();
+		today.setHours(0, 0, 0, 0);
+		for (let i = pulseDays - 1; i >= 0; i--) {
+			const d = new Date(today);
+			d.setDate(d.getDate() - i);
+			byDay.set(dayKey(d), 0);
+		}
+		for (const p of pulse.daily) {
+			const k = dayKey(new Date(p.at * 1000));
+			if (byDay.has(k)) byDay.set(k, (byDay.get(k) ?? 0) + p.hours);
+		}
+		return [...byDay.entries()].map(([key, hours]) => {
+			const [y, m, d] = key.split('-').map(Number);
+			const date = new Date(y, m - 1, d);
+			return {
+				key,
+				hours,
+				// A weekday reads at seven days and becomes a repeating smear at
+				// thirty, where the date is what tells the bars apart.
+				label:
+					pulseDays <= 7
+						? date.toLocaleDateString(undefined, { weekday: 'short' })
+						: date.toLocaleDateString(undefined, { day: 'numeric' })
+			};
+		});
+	})();
+	$: peakHours = dayBars.reduce((m, b) => Math.max(m, b.hours), 0);
 	let isAdmin = false;
 
 	// The sitting, and what it has offered. Polled while one is running, because
@@ -863,7 +907,7 @@
 		</div>
 
 		<div class="tiles">
-			{#each [['Listens', pulse.listens.toLocaleString(), 'through shared chains'], ['Hours', pulse.hours.toFixed(1), 'where a length was known'], ['Shared chains', String(pulse.shared_chains), 'across all decks'], ['Publishing', `${pulse.publishing}/${pulse.decks}`, 'decks sharing anything']] as [label, value, sub]}
+			{#each [['Decks', String(pulse.decks), `${pulse.publishing} with shared chains`], [`Listens · ${pulseDays}d`, pulse.listens.toLocaleString(), 'across shared chains'], ['Collective hours', `${pulse.hours.toFixed(0)}h`, `last ${pulseDays} days`], ['Artists heard', pulse.artists_heard.toLocaleString(), `${pulse.shared_chains} shared chains`]] as [label, value, sub]}
 				<div class="tile">
 					<div class="tlabel">{label}</div>
 					<div class="tvalue">{value}</div>
@@ -888,7 +932,38 @@
 				{/each}
 			</div>
 			<div class="panel icard">
-				<h3 class="h-display" style="font-size:18px;margin:0 0 4px;">Most-shared chains</h3>
+				<!--
+					`pulse.daily` has been computed, sent and drawn nowhere since
+					v0.80.0 — the third thing in this feature that shipped as live
+					data with no reader.
+
+					Bucketed **here** rather than server-side, because the day
+					boundary belongs to the reader's timezone and the server does
+					not know it: the payload is raw (timestamp, hours) pairs for
+					exactly that reason.
+				-->
+				<h3 class="h-display" style="font-size:18px;margin:0 0 4px;">Collective hours</h3>
+				<p class="esub" style="margin-bottom:14px;">Last {pulseDays} days, all decks.</p>
+				{#if dayBars.length}
+					<div class="hbars">
+						{#each dayBars as b (b.key)}
+							<div class="hbcol">
+								<span class="hbval">{b.hours >= 1 ? `${Math.round(b.hours)}h` : ''}</span>
+								<div
+									class="hbar"
+									class:top={b.hours === peakHours && peakHours > 0}
+									style="height:{peakHours > 0 ? Math.max(4, (b.hours / peakHours) * 100) : 4}%"
+									title="{b.label}: {b.hours.toFixed(1)}h"
+								></div>
+								<span class="hblabel">{b.label}</span>
+							</div>
+						{/each}
+					</div>
+				{:else}
+					<div class="esub">Nothing with a known length has played in this window.</div>
+				{/if}
+
+				<h3 class="h-display" style="font-size:18px;margin:22px 0 4px;">Most-shared chains</h3>
 				<p class="esub" style="margin-bottom:14px;">By listens, not by hours.</p>
 				<div class="chips">
 					{#each pulse.chains as c}<span class="chip neutral">{c.name} · {c.plays}</span>{:else}
@@ -1627,6 +1702,40 @@
 		border-left: 3px solid var(--td-accent);
 		border-radius: 0 12px 12px 0;
 		padding: 9px 12px;
+	}
+
+	/* — collective hours — */
+	.hbars {
+		display: flex;
+		align-items: flex-end;
+		gap: 5px;
+		height: 148px;
+		margin-bottom: 4px;
+	}
+	.hbcol {
+		flex: 1;
+		min-width: 0;
+		display: flex;
+		flex-direction: column;
+		align-items: center;
+		justify-content: flex-end;
+		height: 100%;
+		gap: 5px;
+	}
+	.hbval { font-size: 11px; color: var(--td-muted-2); font-variant-numeric: tabular-nums; }
+	.hbar {
+		width: 100%;
+		border-radius: 7px 7px 3px 3px;
+		background: color-mix(in srgb, var(--td-accent) 42%, transparent);
+		min-height: 4px;
+	}
+	/* The busiest day, so the shape has somewhere to land. */
+	.hbar.top { background: var(--td-accent); }
+	.hblabel {
+		font-size: 11px;
+		color: var(--td-muted-3);
+		white-space: nowrap;
+		overflow: hidden;
 	}
 
 	/* — the start dialog — */
