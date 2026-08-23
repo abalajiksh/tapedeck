@@ -230,6 +230,49 @@
 	// Names `nowSec`, which is what makes it tick.
 	$: spoolClock = spool ? clock(spool.started_at, nowSec) : '';
 
+	// Your own handle and how open your deck is. Two switches, and the pill has
+	// to be honest about both — see `deckState` for why it is not just
+	// "private".
+	let myHandle = '';
+	let federating = false;
+	let npPublic = false;
+
+	async function loadMe() {
+		try {
+			const f = await api.getFederation();
+			// Only when there is an actor. `handle` is a *preview* built from
+			// today's origin until a keypair is minted, and showing an address
+			// that resolves nowhere is the bug v0.78.0 found on the settings
+			// page.
+			myHandle = f.actor ? f.handle : '';
+			federating = f.enabled;
+		} catch {
+			/* the header simply shows no handle */
+		}
+		try {
+			npPublic = (await api.getPublicNowPlaying()).enabled;
+		} catch {
+			/* likewise */
+		}
+	}
+
+	/**
+	 * What the pill says.
+	 *
+	 * The design has a static "Deck is private", which is true of a fresh
+	 * instance and quietly wrong the moment either switch is on. They answer
+	 * different questions — being *findable* and being *readable* — and both
+	 * are off by default, so the honest pill names whichever is on rather than
+	 * asserting privacy the instance may no longer have.
+	 */
+	$: deckState = !federating && !npPublic
+		? { label: 'Deck is private', open: false }
+		: federating && npPublic
+			? { label: 'Discoverable · deck readable', open: true }
+			: federating
+				? { label: 'Discoverable', open: true }
+				: { label: 'Now playing is public', open: true };
+
 	// A sitting captures only from shared chains, so a host who publishes
 	// nothing passes nothing on. Read from the chains endpoint rather than
 	// inferred from an empty capture list, which would be indistinguishable
@@ -496,6 +539,7 @@
 			loadDubs(),
 			loadSittings(),
 			loadLive(),
+			loadMe(),
 			// The heart on a Reel row reads this store, so it has to be filled
 			// before the rows draw or every one of them starts empty and fills
 			// in a moment later.
@@ -820,6 +864,15 @@
 		<h1 class="h-display">Patch</h1>
 		<p class="sub">Patch into another deck and hear what it's running.</p>
 	</div>
+	<div class="headright">
+		<div class="whoami">
+			{#if myHandle}<span class="myhandle">{myHandle}</span>{/if}
+			<!-- Links to where it is changed, rather than being a label that
+			     leaves you hunting for the switch. -->
+			<a class="tag deckpill" class:open={deckState.open} href="/settings#sharing">
+				{deckState.label}
+			</a>
+		</div>
 	<!--
 		Only when there is somebody to sit with and nothing already running.
 		One sitting per host is a partial unique index, so offering the button
@@ -834,6 +887,7 @@
 			Start a Shared Spool
 		</button>
 	{/if}
+	</div>
 </div>
 
 <div class="seg">
@@ -1889,6 +1943,19 @@
 		flex-wrap: wrap;
 	}
 	.start-spool { display: inline-flex; align-items: center; gap: 8px; white-space: nowrap; }
+	.headright { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; justify-content: flex-end; }
+	.whoami { display: flex; align-items: center; gap: 9px; flex-wrap: wrap; }
+	.myhandle {
+		font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+		font-size: 12.5px;
+		color: var(--td-muted-2);
+	}
+	.deckpill { text-decoration: none; white-space: nowrap; }
+	.deckpill.open {
+		background: color-mix(in srgb, var(--td-accent) 12%, transparent);
+		border-color: color-mix(in srgb, var(--td-accent) 38%, transparent);
+		color: var(--td-accent);
+	}
 	h1 { font-size: 30px; margin: 0 0 4px; }
 	.sub { margin: 0 0 16px; font-size: 13.5px; color: var(--td-muted); max-width: 64ch; }
 
