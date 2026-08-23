@@ -545,6 +545,9 @@ pub async fn submit_listens(
                 // it is the only rung that represents a decision the listener
                 // made rather than a fallback.
                 np.chain_name = chain_name.clone();
+                // The key as well as the name: Patch's live strip gates on the
+                // chain being shared, and a name is not a key.
+                np.chain_id = chain_id;
                 let paused = np.paused;
                 let changed = state.now_playing.set(user.user_id, np);
 

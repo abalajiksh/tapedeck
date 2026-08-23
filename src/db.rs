@@ -85,6 +85,15 @@ pub struct ScrobbleRecord {
     pub delivered_sinks: Option<String>,
 }
 
+/// A deck you are patched into, without any of its listening.
+#[derive(Debug, FromRow, serde::Serialize)]
+pub struct DeckPeer {
+    pub user_id: i64,
+    pub username: String,
+    pub display_name: Option<String>,
+    pub avatar_url: Option<String>,
+}
+
 /// A sitting somebody handed you, as it appears in the inbox.
 #[derive(Debug, FromRow, serde::Serialize)]
 pub struct HandedSitting {
@@ -7722,6 +7731,31 @@ impl Database {
         Ok(row.and_then(|(c,)| c))
     }
 
+    /// The chain a device defaults to, looked up by the **key the source
+    /// reports** rather than by our row id.
+    ///
+    /// Exists so a *now-playing* entry can carry the chain its eventual listen
+    /// will be attributed to, which is what lets Patch apply the shared-chain
+    /// rule to a live deck. The scrobble path resolves the same thing through
+    /// `upsert_device`, and that is a **write** — fine once per banked listen,
+    /// wrong every five seconds for something still playing. This one only
+    /// reads: a device that has never been seen simply has no chain yet, which
+    /// is the honest answer for a source we have not banked anything from.
+    pub async fn device_chain_by_key(
+        &self,
+        user_id: i64,
+        machine_id: &str,
+    ) -> Result<Option<i64>, sqlx::Error> {
+        let row: Option<(Option<i64>,)> = sqlx::query_as(
+            "SELECT default_chain_id FROM devices WHERE user_id = ? AND machine_id = ?",
+        )
+        .bind(user_id)
+        .bind(machine_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.and_then(|(c,)| c))
+    }
+
     /// Point a source device at a chain (or clear it with `None`).
     pub async fn set_device_default_chain(
         &self,
@@ -14805,6 +14839,41 @@ impl Database {
         Ok(res.rows_affected() > 0)
     }
 
+    /// The decks this person has an accepted patch into.
+    ///
+    /// Just the people — no listens — because the live strip reads what they
+    /// are playing from the in-memory registry rather than from the history.
+    pub async fn accepted_patch_targets(&self, user_id: i64) -> Result<Vec<DeckPeer>, sqlx::Error> {
+        sqlx::query_as(
+            "SELECT u.id AS user_id, u.username, u.display_name, u.avatar_url
+               FROM patches p JOIN users u ON u.id = p.target_user_id
+              WHERE p.follower_user_id = ? AND p.state = 'accepted'
+              ORDER BY u.username",
+        )
+        .bind(user_id)
+        .fetch_all(&self.pool)
+        .await
+    }
+
+    /// That chain's name, **only if its owner shares it**.
+    ///
+    /// Returns the name rather than a boolean so one round trip answers both
+    /// "may this be shown" and "what is it called" — and so a caller cannot
+    /// accidentally show the name of a chain it did not check.
+    pub async fn chain_if_shared(
+        &self,
+        user_id: i64,
+        chain_id: i64,
+    ) -> Result<Option<String>, sqlx::Error> {
+        sqlx::query_scalar(
+            "SELECT name FROM signal_chains WHERE id = ? AND user_id = ? AND shared = 1",
+        )
+        .bind(chain_id)
+        .bind(user_id)
+        .fetch_optional(&self.pool)
+        .await
+    }
+
     /// How many things are waiting on this person in Patch.
     ///
     /// **One round trip**, because the sidebar asks on every page and four
@@ -20965,6 +21034,44 @@ mod tests {
         // opening it without them.
         assert!(db.start_spool(me, None, &[them, stranger]).await.is_err());
         assert!(db.active_spool(me).await.unwrap().is_none());
+    }
+
+    /// A live deck is gated on the same shared chain a banked listen is.
+    ///
+    /// `chain_if_shared` is the whole gate for Patch's live strip, and it
+    /// returns the *name* rather than a boolean so one round trip answers both
+    /// questions — which is also what stops a caller showing the name of a
+    /// chain it never checked.
+    #[tokio::test]
+    async fn a_live_deck_is_gated_on_the_same_shared_chain_a_listen_is() {
+        let db = testdb().await;
+        let (me, them, shared) = patched_pair(&db).await;
+        let private = sqlx::query_scalar::<_, i64>(
+            "INSERT INTO signal_chains (user_id, name, created_at) VALUES (?, 'Private', ?) \
+             RETURNING id",
+        )
+        .bind(them)
+        .bind(Database::now_secs())
+        .fetch_all(&db.pool)
+        .await
+        .unwrap()[0];
+
+        assert_eq!(db.chain_if_shared(them, shared).await.unwrap().as_deref(), Some("Study"));
+        assert!(
+            db.chain_if_shared(them, private).await.unwrap().is_none(),
+            "unshared shows nothing"
+        );
+        // Somebody else's chain is not yours to publish, whatever its switch says.
+        assert!(db.chain_if_shared(me, shared).await.unwrap().is_none(), "scoped by owner");
+
+        // And the strip only ever looks at decks you actually patched into.
+        let peers = db.accepted_patch_targets(me).await.unwrap();
+        assert_eq!(peers.len(), 1);
+        assert_eq!(peers[0].username, "kim");
+        assert!(
+            db.accepted_patch_targets(them).await.unwrap().is_empty(),
+            "a patch has a direction"
+        );
     }
 
     /// A regroup keeps what a sitting was called, what was written about it,

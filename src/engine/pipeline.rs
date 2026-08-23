@@ -704,15 +704,25 @@ impl ScrobbleEngine {
 
         for track in &sessions.now_playing {
             let mut play = track.play.clone();
-            let changed = now_playing.set(
-                user_id,
-                NowPlaying::from_play(
-                    &play,
-                    label,
-                    track.quality.as_ref(),
-                    Progress::Reported(track.position),
-                ),
+            let mut np = NowPlaying::from_play(
+                &play,
+                label,
+                track.quality.as_ref(),
+                Progress::Reported(track.position),
             );
+            // The chain this listen *will* be attributed to, resolved the way
+            // the scrobble branch below resolves it — so Patch's live strip can
+            // apply the same shared-chain rule the Reel does, rather than a
+            // second rule invented for live entries.
+            //
+            // Read-only (`device_chain_by_key`, not `upsert_device`): creating
+            // a device row is right once per banked listen and wrong every five
+            // seconds for something still playing.
+            np.chain_id = match &track.player {
+                Some(p) => db.device_chain_by_key(user_id, &p.machine_id).await.ok().flatten(),
+                None => None,
+            };
+            let changed = now_playing.set(user_id, np);
             if changed {
                 if play.mbid_recording.is_none() {
                     let album = play.album.clone();
@@ -908,10 +918,15 @@ impl ScrobbleEngine {
 
         for track in &zones.now_playing {
             let mut play = track.play.clone();
-            let changed = now_playing.set(
-                user_id,
-                NowPlaying::from_play(&play, "Roon", None, Progress::Reported(track.position)),
-            );
+            let mut np =
+                NowPlaying::from_play(&play, "Roon", None, Progress::Reported(track.position));
+            // Roon's endpoint is the device — the only rung of the ladder a
+            // Roon listen ever reaches.
+            np.chain_id = match &track.output {
+                Some(o) => db.device_chain_by_key(user_id, &o.machine_id).await.ok().flatten(),
+                None => None,
+            };
+            let changed = now_playing.set(user_id, np);
             if changed {
                 if play.mbid_recording.is_none() {
                     let album = play.album.clone();
@@ -1124,15 +1139,21 @@ impl ScrobbleEngine {
                 // trip that the registry has no use for — only the sink payload
                 // does — so doing it first put a network wait between the user
                 // pressing play and the deck showing anything.
-                let changed = now_playing.set(
-                    user_id,
-                    NowPlaying::from_play(
-                        &play,
-                        "Plex",
-                        plex_track.audio_quality.as_ref(),
-                        Progress::Reported(progress),
-                    ),
+                let mut np = NowPlaying::from_play(
+                    &play,
+                    "Plex",
+                    plex_track.audio_quality.as_ref(),
+                    Progress::Reported(progress),
                 );
+                // See the note on the Jellyfin/Emby writer: the live entry
+                // carries the chain its eventual listen will get, resolved
+                // read-only, so Patch can apply one sharing rule rather than
+                // two.
+                np.chain_id = match &plex_track.player {
+                    Some(p) => db.device_chain_by_key(user_id, &p.machine_id).await.ok().flatten(),
+                    None => None,
+                };
+                let changed = now_playing.set(user_id, np);
 
                 if changed {
                     enrich_play(&mb_client, &mut play, plex_track.album.as_deref()).await;

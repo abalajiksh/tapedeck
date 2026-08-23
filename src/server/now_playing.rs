@@ -108,6 +108,19 @@ pub struct NowPlaying {
     /// default — the coarsest rung — and does not set this, so the public
     /// payload omits the field rather than naming a chain nobody chose.
     pub chain_name: Option<String>,
+    /// The chain this listen will be attributed to, resolved the way its
+    /// eventual scrobble will resolve it.
+    ///
+    /// **Internal, and `skip`ped off the wire on purpose.** It is a *gate
+    /// input* rather than anything about the listen: Patch's live strip has to
+    /// apply the same shared-chain rule the Reel does, and `chain_name` cannot
+    /// carry it — a name is not a key, and a polled source sets no name at all
+    /// because its chain is the device's default rather than a choice.
+    ///
+    /// Nothing about the deck's own readout changes, which is why the field
+    /// does not appear in `/api/v1/now-playing`.
+    #[serde(skip)]
+    pub chain_id: Option<i64>,
     // Quality fields, named to match the frontend's `qualityLabel()` shape.
     pub format_type: Option<String>,
     pub codec: Option<String>,
@@ -186,6 +199,7 @@ impl NowPlaying {
             source: source.to_string(),
             listening_context: None,
             chain_name: None,
+            chain_id: None,
             format_type: quality.and_then(|q| q.format_type.clone()),
             codec: quality.and_then(|q| q.codec.clone()),
             bit_depth: quality.and_then(|q| q.bit_depth),
@@ -597,6 +611,7 @@ mod tests {
             source: source.into(),
             listening_context: None,
             chain_name: None,
+            chain_id: None,
             format_type: None,
             codec: None,
             bit_depth: None,

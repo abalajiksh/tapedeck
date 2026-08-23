@@ -26,7 +26,7 @@ openapi: 3.1.0
 
 info:
   title: Tapedeck
-  version: 0.86.1
+  version: 0.87.0
   summary: Self-hosted scrobbler and listening journal.
   description: |
     Tapedeck ingests listens, enriches them with MusicBrainz metadata, stores
@@ -3021,6 +3021,43 @@ paths:
       responses:
         '200':
           description: Dubs, open ones first.
+          content:
+            application/json:
+              schema: { type: object, additionalProperties: true }
+        '401': { description: Not signed in. }
+
+  /api/v1/patch/live:
+    get:
+      tags: [Patch]
+      summary: Decks you're patched into that are playing something right now.
+      description: |
+        **Gated by exactly the rule the Reel uses** — an accepted patch, and the
+        listen running through a chain its owner switched to **shared**. A live
+        entry that could not be checked never appears, which is why `chain_name`
+        is always present on a row here.
+
+        That gate is what `NowPlaying.chain_id` exists for. A name could not do
+        it — a name is not a key, and a polled source sets no chain name at all,
+        because its chain is the device's default rather than a choice.
+
+        The alternative was relaxing the rule for live entries so an unshared
+        chain would still show a track and a playhead. Rejected for the reason
+        the Shared Spool's capture rule was: it would be a **second way a listen
+        becomes visible** while the settings page explains one, and somebody
+        could hand over a chain they had deliberately kept private just by
+        pressing play.
+
+        Read from the in-memory now-playing registry, so it costs no history
+        query — one chain lookup per live deck. Nothing is persisted, so a
+        restart correctly shows an empty strip until a source reports again.
+
+        `position_known` is false when the position is wall-clock arithmetic
+        rather than a reported playhead; draw it as an estimate, never as a
+        measurement.
+      security: [{ sessionCookie: [] }]
+      responses:
+        '200':
+          description: The decks currently playing, and what they are on.
           content:
             application/json:
               schema: { type: object, additionalProperties: true }

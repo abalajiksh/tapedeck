@@ -480,6 +480,34 @@ export interface SpoolView {
 	captured: number;
 }
 
+/** A deck you're patched into, playing something right now.
+ *
+ *  Gated by exactly the rule the Reel uses — an accepted patch and a **shared
+ *  chain** — which is why `chain_name` is always present here: an entry that
+ *  could not be checked never reaches this list. */
+export interface LiveDeck {
+	user_id: number;
+	username: string;
+	display_name: string | null;
+	avatar_url: string | null;
+	title: string;
+	artist: string;
+	album: string | null;
+	duration: number | null;
+	position: number;
+	/** False when the position is wall-clock arithmetic rather than a reported
+	 *  playhead. Drawn as an estimate, never as a measurement. */
+	position_known: boolean;
+	paused: boolean;
+	chain_name: string;
+	artwork_url: string | null;
+	format_type: string | null;
+	codec: string | null;
+	bit_depth: number | null;
+	sample_rate: number | null;
+	is_lossless: boolean | null;
+}
+
 /** A sitting somebody handed you. **A document, never captures** — it enters
  *  no history, count or chart of yours, so there is nothing to accept. */
 export interface HandedSitting {
@@ -1887,6 +1915,11 @@ class TapedeckAPI {
 	/** One number for the sidebar badge — see the endpoint's note on why it is
 	 *  not four requests. Never throws in practice: the server answers 0 rather
 	 *  than an error, because a badge is decoration. */
+	/** Decks playing right now — accepted patch, shared chain. */
+	async getPatchLive(): Promise<{ live: LiveDeck[] }> {
+		return this.get('/api/v1/patch/live');
+	}
+
 	async getPatchInboxCount(): Promise<{ waiting: number }> {
 		return this.get('/api/v1/patch/inbox-count');
 	}

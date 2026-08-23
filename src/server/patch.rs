@@ -95,6 +95,7 @@ pub fn create_patch_router() -> Router<Arc<AppState>> {
         .route("/api/v1/patch/spool/:uuid/join", post(join_spool))
         .route("/api/v1/patch/spool/:uuid/end", post(end_spool))
         .route("/api/v1/patch/captures", post(settle_captures))
+        .route("/api/v1/patch/live", get(live))
         .route("/api/v1/patch/inbox-count", get(inbox_count))
         .route("/api/v1/patch/sittings", get(sittings).post(hand_over))
         .route("/api/v1/patch/sittings/:uuid", get(sitting).delete(withdraw_sitting))
@@ -624,6 +625,75 @@ struct HandOverBody {
     /// record, so guessing from an absent field is the one thing this must not
     /// do — the rule `bulk-chain` learned the expensive way.
     kind: Option<String>,
+}
+
+/// `GET /api/v1/patch/live` — the decks you are patched into that are playing
+/// something right now.
+///
+/// **Gated by exactly the rule the Reel uses**, and that is the whole reason
+/// `NowPlaying` grew a `chain_id`: a live entry has to be checked against a
+/// *shared chain*, and `chain_name` could not do it — a name is not a key, and
+/// a polled source sets no name at all because its chain is the device's
+/// default rather than a choice.
+///
+/// The alternative was relaxing the rule for live entries, so an unshared chain
+/// would still show a track and a playhead. It was rejected for the reason the
+/// Spool's capture rule was: it would be a **second way a listen becomes
+/// visible** while the settings page explains one, and somebody could hand over
+/// a chain they had deliberately kept private just by pressing play.
+///
+/// Reads the in-memory registry, so it costs no history query — one chain
+/// lookup per live deck, which on a household instance is a handful.
+async fn live(State(state): State<Arc<AppState>>, user: super::auth::AuthUser) -> Response {
+    let peers = match state.db.accepted_patch_targets(user.user_id).await {
+        Ok(v) => v,
+        Err(e) => {
+            warn!("📡 live: {e}");
+            return refused(StatusCode::INTERNAL_SERVER_ERROR, "Could not read that");
+        }
+    };
+
+    let mut out = Vec::new();
+    for p in peers {
+        let Some((np, position)) = state.now_playing.get(p.user_id) else {
+            continue;
+        };
+        // No chain is no sharing — the default has to be exclusion, the same
+        // call `reel` makes by joining rather than left-joining.
+        let Some(chain_id) = np.chain_id else {
+            continue;
+        };
+        match state.db.chain_if_shared(p.user_id, chain_id).await {
+            Ok(Some(chain_name)) => out.push(serde_json::json!({
+                "user_id": p.user_id,
+                "username": p.username,
+                "display_name": p.display_name,
+                "avatar_url": p.avatar_url,
+                "title": np.title,
+                "artist": np.artist,
+                "album": np.album,
+                "duration": np.duration,
+                "position": position,
+                // The deck already distinguishes a measurement from a guess and
+                // so should this: drawing an extrapolation as a playhead is the
+                // "confident and completely wrong position" `Progress` exists
+                // to stop.
+                "position_known": np.position_known,
+                "paused": np.paused,
+                "chain_name": chain_name,
+                "artwork_url": np.artwork_url,
+                "format_type": np.format_type,
+                "codec": np.codec,
+                "bit_depth": np.bit_depth,
+                "sample_rate": np.sample_rate,
+                "is_lossless": np.is_lossless,
+            })),
+            Ok(None) => {}
+            Err(e) => warn!("📡 live: {e}"),
+        }
+    }
+
+    (StatusCode::OK, Json(serde_json::json!({ "live": out }))).into_response()
 }
 
 /// `GET /api/v1/patch/inbox-count` — one number, for the sidebar badge.

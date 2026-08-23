@@ -1716,6 +1716,7 @@ async fn set_now_playing(
     if let Some(cid) = release.chain_id {
         if let Ok(Some(chain)) = state.db.get_chain(user.user_id, cid).await {
             np.chain_name = Some(chain.name);
+            np.chain_id = chain.id;
         }
     }
     let changed = state.now_playing.set(user.user_id, np);

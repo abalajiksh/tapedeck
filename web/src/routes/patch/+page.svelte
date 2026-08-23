@@ -20,7 +20,8 @@
 		SpoolCapture,
 		HandedSitting,
 		HandedSittingDetail,
-		SignalChain
+		SignalChain,
+		LiveDeck
 	} from '$lib/api';
 	import CoverArt from '$lib/components/CoverArt.svelte';
 	import ChainIcon from '$lib/components/ChainIcon.svelte';
@@ -172,6 +173,10 @@
 	let spool: SpoolView | null = null;
 	let captures: SpoolCapture[] = [];
 	let dubs: Dub[] = [];
+	// Decks playing right now. Read from the in-memory registry rather than the
+	// history, so it costs no scan — and gated on the same shared chain the Reel
+	// is, which is what `NowPlaying.chain_id` was added for.
+	let live: LiveDeck[] = [];
 	// Sittings somebody passed on. Loaded with the rest rather than on the tab,
 	// because the inbox count on the tab strip has to include them.
 	let sittings: HandedSitting[] = [];
@@ -316,6 +321,14 @@
 		}
 	}
 
+	async function loadLive() {
+		try {
+			live = (await api.getPatchLive()).live;
+		} catch {
+			/* the strip simply does not render */
+		}
+	}
+
 	async function loadSittings() {
 		try {
 			sittings = (await api.getSittings()).sittings;
@@ -388,7 +401,14 @@
 		if (tab === 'artists') void loadArtists();
 		if (tab === 'discover') void loadDiscover();
 		if (tab === 'instance') void loadInstance();
-		await Promise.all([loadDecks(), loadReel(), loadSpool(), loadDubs(), loadSittings()]);
+		await Promise.all([
+			loadDecks(),
+			loadReel(),
+			loadSpool(),
+			loadDubs(),
+			loadSittings(),
+			loadLive()
+		]);
 		try {
 			myChains = (await api.getChains()).chains;
 			mySharedChains = myChains.filter((c) => c.shared).length;
@@ -412,15 +432,44 @@
 		// open — an idle page re-renders nothing.
 		tick = setInterval(() => {
 			if (spool) nowSec = Math.floor(Date.now() / 1000);
+			// The strip's bars are extrapolated between polls, the same way the
+			// dashboard deck does it — otherwise a progress bar only moves every
+			// few seconds and reads as stuck.
+			if (live.length) livesSec = Math.floor(Date.now() / 1000);
 		}, 1000);
+		// Only on the Reel, where the strip is drawn. Somebody reading the
+		// Instance tab does not need the registry polled at them.
+		liveTimer = setInterval(() => {
+			if (tab === 'reel') void loadLive();
+		}, LIVE_POLL_MS);
 	});
 
+	const LIVE_POLL_MS = 10_000;
+	let livesSec = Math.floor(Date.now() / 1000);
 	let timer: ReturnType<typeof setInterval> | undefined;
 	let tick: ReturnType<typeof setInterval> | undefined;
+	let liveTimer: ReturnType<typeof setInterval> | undefined;
 	onDestroy(() => {
 		clearInterval(timer);
 		clearInterval(tick);
+		clearInterval(liveTimer);
 	});
+
+	/**
+	 * Where the bar is *now*, extrapolated from the last poll.
+	 *
+	 * `livesSec` is named in the expression rather than read inside a helper,
+	 * which is the Svelte trap this file has now hit three times: a template
+	 * expression re-runs when the variables it *names* change and does not
+	 * trace them through a call.
+	 */
+	function livePos(l: LiveDeck, now: number): number {
+		if (l.paused) return l.position;
+		const at = l.position + Math.max(0, now - liveReadAt);
+		return l.duration ? Math.min(at, l.duration) : at;
+	}
+	let liveReadAt = Math.floor(Date.now() / 1000);
+	$: if (live) liveReadAt = Math.floor(Date.now() / 1000);
 
 	function go(t: Tab) {
 		tab = t;
@@ -603,6 +652,29 @@
 	};
 	const roleColour = (t: string) => ROLE_COLOURS[t] ?? 'var(--td-muted-3)';
 
+	/** `mm:ss`, or `h:mm:ss` past an hour. */
+	function clockOf(secs: number): string {
+		const s = Math.max(0, Math.floor(secs));
+		const h = Math.floor(s / 3600);
+		const m = Math.floor((s % 3600) / 60);
+		const r = String(s % 60).padStart(2, '0');
+		return h ? `${h}:${String(m).padStart(2, '0')}:${r}` : `${m}:${r}`;
+	}
+
+	function liveClock(l: LiveDeck, now: number): string {
+		const at = clockOf(livePos(l, now));
+		const head = l.position_known ? at : `≈${at}`;
+		return l.duration ? `${head} / ${clockOf(l.duration)}` : head;
+	}
+
+	function liveBadge(l: LiveDeck): string {
+		if (l.format_type === 'dsd') return 'DSD';
+		if (l.is_lossless && l.sample_rate && l.bit_depth)
+			return `${(l.codec ?? 'FLAC').toUpperCase()} ${l.bit_depth}/${Math.round(l.sample_rate / 1000)}`;
+		if (l.is_lossless) return (l.codec ?? 'Lossless').toUpperCase();
+		return '';
+	}
+
 	function badge(l: ReelListen) {
 		if (l.format_type === 'dsd') return 'DSD';
 		if (l.is_lossless && l.sample_rate && l.bit_depth)
@@ -712,6 +784,56 @@
 {#if loading}
 	<div class="panel note">Loading…</div>
 {:else if tab === 'reel'}
+	<!--
+		Rolling now. Only decks with an accepted patch playing through a **shared
+		chain** — the same gate the Reel below uses, applied to a live entry
+		because `NowPlaying` carries the chain its listen will get.
+	-->
+	{#if live.length}
+		<div class="livehead">
+			<span class="livedot"></span>
+			<h2 class="h-display sech" style="margin:0;">Rolling now</h2>
+			<span class="esub">{live.length} {live.length === 1 ? 'deck' : 'decks'} live</span>
+		</div>
+		<div class="livegrid">
+			{#each live as l (l.user_id)}
+				<div class="livecard">
+					<div class="livetop">
+						<span class="avatar small">{(l.display_name || l.username).slice(0, 2).toUpperCase()}</span>
+						<div style="min-width:0;flex:1;">
+							<a class="livename" href="/users/{l.username}">{l.display_name || l.username}</a>
+							<div class="phandle">@{l.username}</div>
+						</div>
+						{#if l.paused}
+							<span class="tag">Paused</span>
+						{:else}
+							<!-- Bars rather than a dot: a still deck and a playing one
+							     should not look the same at a glance. -->
+							<span class="vu" aria-hidden="true">
+								{#each [0, 1, 2, 3, 4] as i}<span style="animation-delay:{i * 0.12}s"></span>{/each}
+							</span>
+						{/if}
+					</div>
+					<div class="livetitle">{l.title}</div>
+					<div class="liveartist">{l.artist}{l.album ? ` — ${l.album}` : ''}</div>
+					<div class="livebar" class:guess={!l.position_known}>
+						<div style="width:{l.duration ? Math.min(100, (livePos(l, livesSec) / l.duration) * 100) : 0}%"></div>
+					</div>
+					<div class="livefoot">
+						<span class="tag">{l.chain_name}</span>
+						{#if liveBadge(l)}<span class="tag">{liveBadge(l)}</span>{/if}
+						<!-- Built in one expression rather than with an inline
+						     `{#if}`: Svelte trims the whitespace around a block, so
+						     the separator came out as "3:16/ 5:48". An estimate is
+						     also marked as one — presenting wall-clock arithmetic as
+						     a playhead is the mistake `Progress` exists to stop. -->
+						<span class="livetime">{liveClock(l, livesSec)}</span>
+					</div>
+				</div>
+			{/each}
+		</div>
+	{/if}
+
 	{#if !accepted.length}
 		<div class="panel empty">
 			<div class="h-display" style="font-size:19px;margin-bottom:6px;">Nothing on the Reel yet</div>
@@ -1806,6 +1928,90 @@
 		border-left: 3px solid var(--td-accent);
 		border-radius: 0 12px 12px 0;
 		padding: 9px 12px;
+	}
+
+	/* — rolling now — */
+	.livehead { display: flex; align-items: center; gap: 10px; margin-bottom: 12px; }
+	.livedot {
+		width: 8px;
+		height: 8px;
+		border-radius: 50%;
+		background: var(--td-accent-hi);
+		animation: td-blink 1.6s ease-in-out infinite;
+	}
+	@keyframes td-blink { 0%, 100% { opacity: 1; } 50% { opacity: .25; } }
+	.livegrid {
+		display: grid;
+		grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+		gap: 14px;
+		margin-bottom: 26px;
+	}
+	.livecard {
+		background: var(--td-surface);
+		border: 1px solid var(--td-border);
+		border-radius: 22px;
+		padding: 16px 18px;
+		min-width: 0;
+	}
+	.livetop { display: flex; align-items: center; gap: 12px; margin-bottom: 12px; min-width: 0; }
+	.livename {
+		font-size: 13.5px;
+		font-weight: 600;
+		color: var(--td-text);
+		text-decoration: none;
+	}
+	.livename:hover { text-decoration: underline; }
+	.livetitle {
+		font-size: 15px;
+		font-weight: 600;
+		white-space: nowrap;
+		overflow: hidden;
+		text-overflow: ellipsis;
+	}
+	.liveartist {
+		font-size: 13px;
+		color: var(--td-muted);
+		margin-bottom: 12px;
+		white-space: nowrap;
+		overflow: hidden;
+		text-overflow: ellipsis;
+	}
+	.livebar {
+		height: 6px;
+		border-radius: 999px;
+		background: var(--td-track);
+		overflow: hidden;
+		margin-bottom: 10px;
+	}
+	.livebar > div {
+		height: 100%;
+		border-radius: 999px;
+		background: linear-gradient(90deg, var(--td-accent-2), var(--td-accent));
+	}
+	/* An extrapolated position is drawn as one. */
+	.livebar.guess > div { opacity: .45; }
+	.livefoot { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+	.livetime {
+		margin-left: auto;
+		font-size: 12px;
+		color: var(--td-muted-3);
+		font-variant-numeric: tabular-nums;
+	}
+	.vu { display: flex; align-items: flex-end; gap: 2.5px; height: 18px; flex: none; }
+	.vu span {
+		width: 3px;
+		border-radius: 2px;
+		background: var(--td-accent);
+		height: 40%;
+		animation: td-vu 1.1s ease-in-out infinite;
+	}
+	@keyframes td-vu {
+		0%, 100% { height: 30%; }
+		50% { height: 100%; }
+	}
+	@media (prefers-reduced-motion: reduce) {
+		.livedot, .vu span { animation: none; }
+		.vu span { height: 70%; }
 	}
 
 	/* — what your deck publishes — */
