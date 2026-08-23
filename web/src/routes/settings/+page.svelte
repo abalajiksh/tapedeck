@@ -787,6 +787,15 @@
 
 	// connections
 	let connections: Connection[] = [];
+	// Whether a play accepted out of a Shared Spool reaches the services above.
+	// A *state*, so it is drawn as a segmented pair rather than a checkbox — a
+	// checkbox label has to say what ticking does, and "Forward spool listens"
+	// beside a box that is already the answer is the ambiguity the
+	// Private | Shared pair was built to remove.
+	let spoolForward = false;
+	let spoolWindowDays = 14;
+	let spoolForwardBusy = false;
+	let spoolForwardErr = '';
 	let lbToken = '';
 	let lbBusy = false;
 	// Last.fm and Libre.fm share the same approve-then-finish flow, so their
@@ -797,10 +806,31 @@
 	let connError = '';
 	$: conn = (svc: string) => connections.find((c) => c.service === svc) ?? null;
 
+	async function setSpoolForward(on: boolean) {
+		// Clicking the lit segment is a no-op rather than a PUT setting the
+		// state it is already in — the rule the Private | Shared pair follows.
+		if (on === spoolForward || spoolForwardBusy) return;
+		spoolForwardBusy = true;
+		spoolForwardErr = '';
+		try {
+			const r = await api.setSpoolForwarding(on);
+			spoolForward = r.enabled;
+		} catch (e) {
+			spoolForwardErr = e instanceof Error ? e.message : 'Could not save that';
+		} finally {
+			spoolForwardBusy = false;
+		}
+	}
+
 	async function loadConnections() {
 		try {
 			const r = await api.getConnections();
 			connections = r.connections;
+		} catch { /* optional */ }
+		try {
+			const f = await api.getSpoolForwarding();
+			spoolForward = f.enabled;
+			spoolWindowDays = f.window_days;
 		} catch { /* optional */ }
 		try {
 			const t = await api.tidalStatus();
@@ -1974,6 +2004,36 @@
 				{#if connError}<div style="font-size:13px;color:#b2622d;margin-bottom:12px;">{connError}</div>{/if}
 
 				{#if connections.length}
+					<!--
+						Shown only when there is somewhere to forward *to*. With no
+						connections it is a control with no effect, which reads as a
+						setting that does not work — the same call the Pull loves row
+						below already makes.
+					-->
+					<div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;padding:12px 14px;margin-bottom:14px;background:var(--td-surface2);border:1px solid var(--td-border);border-radius:14px;">
+						<div style="flex:1;min-width:220px;">
+							<div style="font-weight:600;font-size:14px;">Plays from a Shared Spool</div>
+							<div style="font-size:12.5px;color:var(--td-muted-2);margin-top:2px;">
+								When you accept a play someone else's deck captured for you, this
+								decides whether it reaches the services above. You were in the room
+								and you accepted it one play at a time — but it is still someone
+								else's turntable writing to your public record, so it is off until
+								you say otherwise. Anything older than {spoolWindowDays} days is kept
+								here whatever this says, so handing over an old evening can't rewrite
+								your history.
+							</div>
+							{#if spoolForwardErr}
+								<div style="font-size:12.5px;color:#b2622d;margin-top:6px;">{spoolForwardErr}</div>
+							{/if}
+						</div>
+						<div style="display:flex;background:var(--td-sidebar);border-radius:999px;padding:4px;gap:2px;">
+							<button class="seg-btn" class:on={!spoolForward} disabled={spoolForwardBusy}
+								on:click={() => setSpoolForward(false)}>Kept here</button>
+							<button class="seg-btn" class:on={spoolForward} disabled={spoolForwardBusy}
+								on:click={() => setSpoolForward(true)}>Forwarded on</button>
+						</div>
+					</div>
+
 					<div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;padding:12px 14px;margin-bottom:14px;background:var(--td-surface2);border:1px solid var(--td-border);border-radius:14px;">
 						<div style="flex:1;min-width:180px;">
 							<div style="font-weight:600;font-size:14px;">Pull loved tracks</div>

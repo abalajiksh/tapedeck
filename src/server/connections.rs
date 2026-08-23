@@ -20,6 +20,64 @@ use super::auth::AuthUser;
 use super::models::ErrorResponse;
 use super::AppState;
 
+/// The switch deciding whether plays accepted out of a Shared Spool are relayed
+/// on to this user's connections, or stored here only.
+///
+/// It lives beside the connections rather than with the rest of Patch because
+/// this is the question "what do my connected services receive", and the answer
+/// is only meaningful next to the list of them.
+#[derive(Deserialize)]
+struct SpoolForwardingRequest {
+    /// **Not `Option<bool>` with a default**, and the `Option` here is only so
+    /// an absent key can be told from an explicit `false`. A body that merely
+    /// misspelled the key must not be read as an answer either way — the
+    /// `bulk-chain` rule, in another place where guessing wrong writes to
+    /// somebody's permanent public record.
+    enabled: Option<bool>,
+}
+
+/// GET /api/v1/connections/spool-forwarding — the switch, and the window that
+/// bounds it.
+///
+/// `window_days` is reported rather than left for the screen to hardcode: it is
+/// a rule about what will actually be relayed, and a second copy of it in the
+/// UI would be free to drift from the one enforced.
+async fn get_spool_forwarding(
+    State(state): State<Arc<AppState>>,
+    user: AuthUser,
+) -> impl IntoResponse {
+    match state.db.forward_spool_listens(user.user_id).await {
+        Ok(on) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "enabled": on,
+                "window_days": crate::db::SPOOL_FORWARD_WINDOW_SECS / 86_400,
+            })),
+        )
+            .into_response(),
+        Err(e) => err(500, e.to_string()),
+    }
+}
+
+/// PUT /api/v1/connections/spool-forwarding — set it.
+///
+/// **Session-only, and it takes no token**, the line every switch that decides
+/// an outward-facing write sits on: a scrobble client has no business deciding
+/// that somebody else's deck may write to its owner's public history.
+async fn put_spool_forwarding(
+    State(state): State<Arc<AppState>>,
+    user: AuthUser,
+    Json(body): Json<SpoolForwardingRequest>,
+) -> impl IntoResponse {
+    let Some(enabled) = body.enabled else {
+        return err(400, "`enabled` is required — say true or false explicitly.");
+    };
+    match state.db.set_forward_spool_listens(user.user_id, enabled).await {
+        Ok(()) => (StatusCode::OK, Json(serde_json::json!({ "enabled": enabled }))).into_response(),
+        Err(e) => err(500, e.to_string()),
+    }
+}
+
 fn err(code: u16, msg: impl Into<String>) -> axum::response::Response {
     let code_status = StatusCode::from_u16(code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
     (code_status, Json(serde_json::json!(ErrorResponse { code, error: msg.into() })))
@@ -305,6 +363,13 @@ pub fn create_connections_router() -> Router<Arc<AppState>> {
     use axum::routing::{delete, post, put};
     Router::new()
         .route("/api/v1/connections", get(list_connections))
+        // Before `/:service`, or matchit resolves this against the delete
+        // route's parameter. A literal wins over a parameter in axum 0.7, but
+        // reading it in this order is what makes that obvious.
+        .route(
+            "/api/v1/connections/spool-forwarding",
+            get(get_spool_forwarding).put(put_spool_forwarding),
+        )
         .route("/api/v1/connections/:service", delete(disconnect))
         .route("/api/v1/connections/listenbrainz", put(connect_listenbrainz))
         .route("/api/v1/connections/lastfm/start", post(lastfm_start))

@@ -476,6 +476,10 @@ export interface SpoolView {
 	viewer_id: number;
 	title: string | null;
 	started_at: number;
+	/** Null while it is running. An **ended** sitting still arrives here when
+	 *  you were invited and never answered — an invitation is outstanding until
+	 *  it is answered, and the host closing the room does not answer it. */
+	ended_at: number | null;
 	host_user_id: number;
 	hosting: boolean;
 	my_state: string;
@@ -1920,6 +1924,18 @@ class TapedeckAPI {
 		return this.get('/api/v1/patch/dubs');
 	}
 
+	/** Whether accepted Shared Spool plays reach this user's scrobble services.
+	 *  `window_days` is the freshness bound that applies even when it is on —
+	 *  read from the server rather than hardcoded, so a screen cannot promise
+	 *  something the relay rule would then refuse. */
+	async getSpoolForwarding(): Promise<{ enabled: boolean; window_days: number }> {
+		return this.get('/api/v1/connections/spool-forwarding');
+	}
+
+	async setSpoolForwarding(enabled: boolean): Promise<{ enabled: boolean }> {
+		return this.request('PUT', '/api/v1/connections/spool-forwarding', { enabled });
+	}
+
 	async getSpool(): Promise<{ spool: SpoolView | null; captures: SpoolCapture[] }> {
 		return this.get('/api/v1/patch/spool');
 	}
@@ -1928,7 +1944,10 @@ class TapedeckAPI {
 		return this.request('POST', '/api/v1/patch/spool', body);
 	}
 
-	async joinSpool(uuid: string, accept: boolean): Promise<{ state: string }> {
+	/** Answering an invitation. `offered` is the backlog joining has just put
+	 *  in your inbox — for a sitting that ended before you answered, that is
+	 *  the whole of it. */
+	async joinSpool(uuid: string, accept: boolean): Promise<{ state: string; offered: number }> {
 		return this.request('POST', `/api/v1/patch/spool/${encodeURIComponent(uuid)}/join`, {
 			accept
 		});
@@ -2000,7 +2019,13 @@ class TapedeckAPI {
 		return this.request('POST', `/api/v1/patch/spool/${encodeURIComponent(uuid)}/end`, {});
 	}
 
-	async settleCaptures(ids: number[], accept: boolean): Promise<{ settled: number }> {
+	/** `forwarded` is how many of the settled plays will be relayed onward. Not
+	 *  derivable from `settled` — it turns on the user's switch *and* on each
+	 *  play being inside the freshness window. */
+	async settleCaptures(
+		ids: number[],
+		accept: boolean
+	): Promise<{ settled: number; forwarded: number }> {
 		return this.request('POST', '/api/v1/patch/captures', { ids, accept });
 	}
 

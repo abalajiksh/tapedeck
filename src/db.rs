@@ -1088,7 +1088,23 @@ impl Database {
                 -- and patched into at all -- following happens while private in
                 -- this design, so being discoverable and being readable are two
                 -- switches and always will be.
-                federation_enabled INTEGER NOT NULL DEFAULT 0
+                federation_enabled INTEGER NOT NULL DEFAULT 0,
+                -- Whether a play accepted out of a Shared Spool is forwarded on
+                -- to this account's Last.fm / ListenBrainz, or stored here
+                -- only.
+                --
+                -- Off by default and off for every account that predates the
+                -- column, for the reason the two switches above are: turning it
+                -- on writes to somebody's permanent public record, and nobody
+                -- consents to that by their operator upgrading a binary.
+                --
+                -- It is a *user* setting rather than a per-connection one
+                -- because the question is about the listening, not about any
+                -- one service: either somebody else's deck playing a record you
+                -- were in the room for counts as your listen or it does not,
+                -- and that answer cannot differ between Last.fm and
+                -- ListenBrainz without meaning two different things at once.
+                forward_spool_listens INTEGER NOT NULL DEFAULT 0
             )",
         )
         .execute(&self.pool)
@@ -3415,6 +3431,15 @@ impl Database {
             let _ = sqlx::query("ALTER TABLE users ADD COLUMN public_np_fields TEXT")
                 .execute(&self.pool)
                 .await;
+        }
+
+        if !has_column(&self.pool, "users", "forward_spool_listens").await {
+            info!("⚙️ Migrating: adding the Shared Spool forwarding switch...");
+            let _ = sqlx::query(
+                "ALTER TABLE users ADD COLUMN forward_spool_listens INTEGER NOT NULL DEFAULT 0",
+            )
+            .execute(&self.pool)
+            .await;
         }
 
         // Migration: where the tape is parked.
@@ -14509,24 +14534,164 @@ impl Database {
     }
 
     /// Join or leave a sitting you were invited to.
+    ///
+    /// Returns `None` when there is no invitation of yours with that id, and
+    /// `Some(offered)` otherwise — the number of plays the sitting had already
+    /// held that joining has now put in your inbox.
+    ///
+    /// **An ended sitting can still be joined, and that is the point.** The
+    /// obvious rule — you may only answer while the room is open — reads as
+    /// tidy and is wrong in the common case: the host closes the sitting when
+    /// the evening is over, which is exactly when the person who forgot to
+    /// press Join finally looks at their screen. Refusing them there throws
+    /// away an evening that really happened, and there is no recovery, because
+    /// the invitation is gone too.
+    ///
+    /// Nothing is weakened by allowing it. The invitation is the host's
+    /// assertion that you were in the room and the join is yours; neither is
+    /// made more or less true by the room having closed since. And joining
+    /// still decides nothing on its own — every play arrives as a capture you
+    /// have to accept, which is the invariant a live sitting rests on.
     pub async fn set_spool_membership(
         &self,
         uuid: &str,
         user_id: i64,
         state: &str,
-    ) -> Result<bool, sqlx::Error> {
+    ) -> Result<Option<i64>, sqlx::Error> {
+        let Some(spool_id): Option<i64> =
+            sqlx::query_scalar("SELECT id FROM spools WHERE uuid = ?")
+                .bind(uuid)
+                .fetch_optional(&self.pool)
+                .await?
+        else {
+            return Ok(None);
+        };
+
         let res = sqlx::query(
             "UPDATE spool_members SET state = ?, joined_at = COALESCE(joined_at, ?)
-              WHERE user_id = ?
-                AND spool_id = (SELECT id FROM spools WHERE uuid = ? AND ended_at IS NULL)",
+              WHERE user_id = ? AND spool_id = ?",
         )
         .bind(state)
         .bind(Self::now_secs())
         .bind(user_id)
-        .bind(uuid)
+        .bind(spool_id)
         .execute(&self.pool)
         .await?;
-        Ok(res.rows_affected() > 0)
+        if res.rows_affected() == 0 {
+            return Ok(None);
+        }
+
+        if state != "joined" {
+            return Ok(Some(0));
+        }
+        Ok(Some(self.offer_spool_backlog(spool_id, uuid, user_id).await?))
+    }
+
+    /// Offer the plays a sitting has already held to somebody who has just
+    /// joined it.
+    ///
+    /// Without this, joining is only ever "from now on" — and for a sitting
+    /// the host has already ended, "from now on" is nothing at all. The
+    /// invitation would be answerable and answering it would do nothing, which
+    /// is a worse failure than refusing the join outright because it looks like
+    /// it worked.
+    ///
+    /// Reads the sitting back out of the **listens** rather than out of a
+    /// record of what was offered, because there is no such record: a capture
+    /// is only ever written for somebody who had already joined. The listens
+    /// carry `joint_session_id`, which `capture_into_spool` stamps on every
+    /// play made by a member in the room — so they *are* the sitting.
+    ///
+    /// Three rules, all of them the ones a live capture already follows:
+    ///
+    /// * **The chain must be shared.** `joint_session_id` is stamped *before*
+    ///   the chain gate — deliberately, since nobody but the owner reads it —
+    ///   so a listen through a private chain is in this set and must not be
+    ///   offered. Re-applied here by joining `signal_chains`, the same way
+    ///   `retro_spool_from_session` does. Dropping that join would publish
+    ///   every private-chain listen of the evening while looking like a
+    ///   simplification.
+    /// * **Only members who were actually in the room**, so a listen stamped
+    ///   with this uuid by somebody who has since left is not re-published by
+    ///   a third person joining.
+    /// * **Nothing already offered in *any* sitting**, settled or not — the
+    ///   v0.84.0 rule. `spool_captures`' uniqueness is per spool and cannot see
+    ///   a sibling, and a live sitting can cover the same plays as a
+    ///   reconstruction of the same evening.
+    ///
+    /// The company snapshot is the room **as it stands now** rather than per
+    /// play, because per-play membership is not recorded. That is honest for
+    /// the case this exists for — somebody who was there the whole time and
+    /// only pressed the button late — and approximate for a genuine mid-sitting
+    /// arrival, which is the rarer one.
+    ///
+    /// Deliberately **does not** rewrite anybody else's listens. A late join
+    /// says what the joiner heard; it is not standing to edit another deck's
+    /// record of who was in the room at the time.
+    async fn offer_spool_backlog(
+        &self,
+        spool_id: i64,
+        uuid: &str,
+        user_id: i64,
+    ) -> Result<i64, sqlx::Error> {
+        let present: Vec<(i64, String)> = sqlx::query_as(
+            "SELECT m.user_id, COALESCE(u.display_name, u.username)
+               FROM spool_members m JOIN users u ON u.id = m.user_id
+              WHERE m.spool_id = ? AND m.state = 'joined'
+              ORDER BY u.username",
+        )
+        .bind(spool_id)
+        .fetch_all(&self.pool)
+        .await?;
+        let names: Vec<&str> =
+            present.iter().filter(|(id, _)| *id != user_id).map(|(_, n)| n.as_str()).collect();
+        let company = (!names.is_empty()).then(|| names.join(", "));
+
+        let plays: Vec<(i64, String, String, Option<String>, Option<i64>, i64)> = sqlx::query_as(
+            "SELECT s.user_id, s.title, s.artist, s.album, s.duration, s.timestamp
+               FROM scrobbles s
+               JOIN signal_chains c ON c.id = s.chain_id AND c.shared = 1
+              WHERE s.joint_session_id = ? AND s.user_id != ? AND s.skipped = FALSE
+                AND s.user_id IN (
+                      SELECT user_id FROM spool_members
+                       WHERE spool_id = ? AND state = 'joined')
+              ORDER BY s.timestamp",
+        )
+        .bind(uuid)
+        .bind(user_id)
+        .bind(spool_id)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut offered = 0i64;
+        for (from, title, artist, album, duration, played_at) in &plays {
+            let res = sqlx::query(
+                "INSERT INTO spool_captures
+                    (spool_id, user_id, from_user_id, title, artist, album, duration, played_at,
+                     company)
+                 SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?
+                  WHERE NOT EXISTS (
+                        SELECT 1 FROM spool_captures
+                         WHERE user_id = ? AND played_at = ? AND title = ?
+                  )",
+            )
+            .bind(spool_id)
+            .bind(user_id)
+            .bind(from)
+            .bind(title)
+            .bind(artist)
+            .bind(album)
+            .bind(duration)
+            .bind(played_at)
+            .bind(&company)
+            .bind(user_id)
+            .bind(played_at)
+            .bind(title)
+            .execute(&self.pool)
+            .await?;
+            offered += res.rows_affected() as i64;
+        }
+        Ok(offered)
     }
 
     /// End a sitting. **The host's only.**
@@ -14546,22 +14711,35 @@ impl Database {
         Ok(res.rows_affected() > 0)
     }
 
-    /// The sitting this user is in, if any — hosting or attending.
+    /// The sitting this user is in, if any — hosting or attending — **or an
+    /// invitation they have not answered yet.**
+    ///
+    /// The second half is why an ended sitting is in scope. An invitation is
+    /// outstanding until it is answered, and the host closing the room does not
+    /// answer it; dropping it at that moment is what made "I forgot to press
+    /// Join" unrecoverable, because the banner carrying the only way back in
+    /// disappeared along with the sitting. Saying "No thanks" is what dismisses
+    /// it, which is the correct way for an invitation to go away.
+    ///
+    /// A running sitting still wins, so somebody with a stale invitation and a
+    /// live room sees the live one.
     pub async fn active_spool(&self, user_id: i64) -> Result<Option<SpoolView>, sqlx::Error> {
-        let Some(row): Option<(i64, String, i64, Option<String>, i64, String)> = sqlx::query_as(
-            "SELECT sp.id, sp.uuid, sp.host_user_id, sp.title, sp.started_at, m.state
-               FROM spools sp
-               JOIN spool_members m ON m.spool_id = sp.id AND m.user_id = ?
-              WHERE sp.ended_at IS NULL
-              ORDER BY sp.started_at DESC LIMIT 1",
-        )
-        .bind(user_id)
-        .fetch_optional(&self.pool)
-        .await?
+        let Some(row): Option<(i64, String, i64, Option<String>, i64, Option<i64>, String)> =
+            sqlx::query_as(
+                "SELECT sp.id, sp.uuid, sp.host_user_id, sp.title, sp.started_at, sp.ended_at,
+                        m.state
+                   FROM spools sp
+                   JOIN spool_members m ON m.spool_id = sp.id AND m.user_id = ?
+                  WHERE sp.ended_at IS NULL OR m.state = 'invited'
+                  ORDER BY sp.ended_at IS NULL DESC, sp.started_at DESC LIMIT 1",
+            )
+            .bind(user_id)
+            .fetch_optional(&self.pool)
+            .await?
         else {
             return Ok(None);
         };
-        let (id, uuid, host_user_id, title, started_at, my_state) = row;
+        let (id, uuid, host_user_id, title, started_at, ended_at, my_state) = row;
 
         let members: Vec<SpoolMember> = sqlx::query_as(
             "SELECT u.id AS user_id, u.username, u.display_name, m.state
@@ -14585,6 +14763,7 @@ impl Database {
             viewer_id: user_id,
             title,
             started_at,
+            ended_at,
             host_user_id,
             hosting: host_user_id == user_id,
             my_state,
@@ -15321,20 +15500,34 @@ impl Database {
     /// per capture and explicit.
     ///
     /// Accepting writes a real scrobble carrying the spool's `joint_session_id`
-    /// — the N-rows-one-per-listener shape decided on 2026-08-02. It goes in as
-    /// `imported`, so it is **never forwarded** to Last.fm or ListenBrainz:
-    /// somebody else's deck played it, and pushing it onto your permanent
-    /// public record is a decision this feature has no standing to make on your
-    /// behalf.
+    /// — the N-rows-one-per-listener shape decided on 2026-08-02.
+    ///
+    /// **Whether it is forwarded on to Last.fm and ListenBrainz is the user's
+    /// own setting**, `users.forward_spool_listens`, off by default. It shipped
+    /// as never-forwarded, and the reason given was that pushing somebody
+    /// else's play onto your permanent public record is not a decision this
+    /// feature has standing to make for you. That reasoning was right about the
+    /// *default* and wrong to stop there: you were in the room, you heard the
+    /// record, and you pressed Accept on that particular play — which is a
+    /// clearer statement of intent than most things this application forwards
+    /// without asking. So it asks once, in Settings, rather than deciding
+    /// forever. Ashwin's call, 2026-08-23.
+    ///
+    /// Returns `(settled, forwarded)` — the second is how many of those the
+    /// flush loop will now pick up, which is the half the screen has to be able
+    /// to say out loud.
     pub async fn settle_captures(
         &self,
         user_id: i64,
         ids: &[i64],
         accept: bool,
-    ) -> Result<i64, sqlx::Error> {
+    ) -> Result<(i64, i64), sqlx::Error> {
         if ids.is_empty() {
-            return Ok(0);
+            return Ok((0, 0));
         }
+        // Read once for the batch rather than per capture: it is one person's
+        // standing answer, and it cannot change halfway through a click.
+        let forwarding = accept && self.forward_spool_listens(user_id).await?;
         let placeholders = std::iter::repeat("?").take(ids.len()).collect::<Vec<_>>().join(",");
 
         let sql = format!(
@@ -15355,6 +15548,8 @@ impl Database {
         let rows = q.fetch_all(&self.pool).await?;
 
         let mut settled = 0;
+        let mut forwarded = 0;
+        let now = Self::now_secs();
         for (id, title, artist, album, duration, played_at, spool_uuid, company) in rows {
             if accept {
                 let mut play = Play::new(
@@ -15366,7 +15561,14 @@ impl Database {
                 );
                 play.album = album;
                 play.duration = duration.map(|d| d as u64);
-                // `imported`, so `flush_pending` never picks it up.
+                // `imported` files it as already-delivered, so `flush_pending`
+                // leaves it alone; the freshness gate is what keeps a
+                // reconstructed evening from rewriting a public history even
+                // when the switch is on.
+                let relay = forwarding && spool_forward_is_live(played_at, now);
+                if relay {
+                    forwarded += 1;
+                }
                 self.save_scrobble(
                     user_id,
                     &play,
@@ -15377,7 +15579,7 @@ impl Database {
                     None,
                     Some("Shared Spool"),
                     None,
-                    ListenDisposition { imported: true, skipped: false },
+                    ListenDisposition { imported: !relay, skipped: false },
                 )
                 .await?;
                 // The same two stamps the other deck's own copy got. Company
@@ -15406,7 +15608,31 @@ impl Database {
             .await?;
             settled += 1;
         }
-        Ok(settled)
+        Ok((settled, forwarded))
+    }
+
+    /// Whether this account wants accepted Shared Spool plays relayed onward.
+    pub async fn forward_spool_listens(&self, user_id: i64) -> Result<bool, sqlx::Error> {
+        let on: Option<i64> =
+            sqlx::query_scalar("SELECT forward_spool_listens FROM users WHERE id = ?")
+                .bind(user_id)
+                .fetch_optional(&self.pool)
+                .await?;
+        Ok(on.unwrap_or(0) != 0)
+    }
+
+    /// Set it.
+    pub async fn set_forward_spool_listens(
+        &self,
+        user_id: i64,
+        on: bool,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query("UPDATE users SET forward_spool_listens = ? WHERE id = ?")
+            .bind(i64::from(on))
+            .bind(user_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
     }
 
     /// Make a variant the chain itself, and the chain a variant.
@@ -15826,6 +16052,12 @@ pub struct SpoolView {
     pub viewer_id: i64,
     pub title: Option<String>,
     pub started_at: i64,
+    /// Null while it is running. An **ended** sitting still reaches this view
+    /// when the caller was invited and never answered — an invitation you can
+    /// no longer see is one you can no longer honour, and forgetting to press
+    /// Join before the host closed the room is the ordinary case rather than
+    /// the odd one.
+    pub ended_at: Option<i64>,
     pub host_user_id: i64,
     pub hosting: bool,
     /// The *caller's* membership: `invited` until they join.
@@ -16046,6 +16278,42 @@ pub struct SessionRow {
 /// to be unique across instances and never parsed. It exists so a session keeps
 /// one identity through merges, splits and (later) being handed to someone
 /// else's Tapedeck.
+/// How recent a Shared Spool play must be for accepting it to relay it onward.
+/// Fourteen days.
+///
+/// **The number is Last.fm's, not one picked to feel about right.** That is
+/// their own limit on how old a scrobble may be, so nothing inside this window
+/// is anomalous to the sink and nothing outside it would land properly anyway.
+/// Having a real anchor matters here for the reason a grid-size-dependent
+/// breadth metric was rejected elsewhere: a threshold somebody invented, sitting
+/// in front of an irreversible write to a public record, is a confident-looking
+/// way of deciding nothing.
+///
+/// It is much wider than [`crate::server::ingest::IMPORT_LIVE_WINDOW_SECS`],
+/// deliberately. That one bounds the lag between a play and a client flushing
+/// its queue, which is hours. This one bounds the lag between a play and a
+/// **person opening their inbox and pressing Accept**, which is legitimately
+/// days — the whole design is that a capture waits until its owner answers it.
+pub const SPOOL_FORWARD_WINDOW_SECS: i64 = 14 * 24 * 60 * 60;
+
+/// Whether an accepted capture is fresh enough to relay.
+///
+/// The switch and this gate cover each other's blind spot, exactly as the token
+/// and freshness gates do in `ingest::import_is_live`. The **switch** is the
+/// person saying "plays I accept out of a sitting are my listens"; nothing else
+/// can say it, since a capture looks identical whether it came from tonight or
+/// from a sitting reconstructed out of 2019. The **window** then bounds how
+/// wrong that statement can be: `retro_spool_from_session` can offer an evening
+/// of any age, and `offer_spool_backlog` can hand over a sitting whose
+/// invitation went unanswered for a month, so without it one Accept could
+/// rewrite a year of somebody's public history in a single click.
+///
+/// A future timestamp is clock skew rather than a backfill and is allowed, but
+/// only to an hour — the same bound and the same reason as the ingest rule.
+pub fn spool_forward_is_live(played_at: i64, now: i64) -> bool {
+    (now - played_at) <= SPOOL_FORWARD_WINDOW_SECS && (played_at - now) <= 3600
+}
+
 fn new_uuid() -> String {
     use rand::Rng;
     let raw: [u8; 16] = rand::rng().random();
@@ -21445,7 +21713,7 @@ mod tests {
             .unwrap();
         assert_eq!(before, 0);
 
-        assert_eq!(db.settle_captures(me, &[caps[0].id], true).await.unwrap(), 1);
+        assert_eq!(db.settle_captures(me, &[caps[0].id], true).await.unwrap(), (1, 0));
         let landed: Vec<(String, String, Option<String>, Option<String>)> = sqlx::query_as(
             "SELECT title, status, joint_session_id, company FROM scrobbles WHERE user_id = ?",
         )
@@ -21488,7 +21756,7 @@ mod tests {
         let (me, them, chain) = patched_pair(&db).await;
 
         let live = db.start_spool(them, None, &[me]).await.unwrap();
-        assert!(db.set_spool_membership(&live, me, "joined").await.unwrap());
+        assert!(db.set_spool_membership(&live, me, "joined").await.unwrap().is_some());
         listen(&db, them, Some(chain), "Both", "Talk Talk", 1_760_000_100).await;
         assert_eq!(db.spool_captures(me).await.unwrap().len(), 1, "the live sitting offered it");
 
@@ -21608,7 +21876,7 @@ mod tests {
         .unwrap()[0];
 
         let spool = db.start_spool(them, None, &[me]).await.unwrap();
-        assert!(db.set_spool_membership(&spool, me, "joined").await.unwrap());
+        assert!(db.set_spool_membership(&spool, me, "joined").await.unwrap().is_some());
 
         listen(&db, them, Some(private), "Unshared", "Talk Talk", 1_760_000_100).await;
         listen(&db, them, Some(chain), "Shared", "Talk Talk", 1_760_000_200).await;
@@ -21710,12 +21978,24 @@ mod tests {
         listen(&db, them, Some(chain), "Before", "Massive Attack", 1_760_000_100).await;
         assert!(db.spool_captures(me).await.unwrap().is_empty(), "an invitation is not attendance");
 
-        assert!(db.set_spool_membership(&spool, me, "joined").await.unwrap());
+        // **Joining offers the sitting's backlog, not only what follows.**
+        // This assertion used to be the other way round, and that was the bug
+        // behind "I forgot to press Join and lost the evening": nothing on the
+        // wire distinguishes somebody who was in the room all along and only
+        // answered late — which is the common case, and the whole of it when
+        // the sitting has already ended — from somebody who genuinely walked in
+        // partway. Offering the earlier plays costs the second person a decline
+        // and gives the first person their evening back; withholding them gave
+        // the first person nothing and no way to ask again.
+        //
+        // The invariant is untouched: nothing was offered until the yes, and
+        // nothing enters a history until each play is accepted on its own.
+        assert_eq!(db.set_spool_membership(&spool, me, "joined").await.unwrap(), Some(1));
         listen(&db, them, Some(chain), "During", "Massive Attack", 1_760_000_200).await;
 
         let caps = db.spool_captures(me).await.unwrap();
-        assert_eq!(caps.len(), 1);
-        assert_eq!(caps[0].title, "During");
+        let titles: Vec<&str> = caps.iter().map(|c| c.title.as_str()).collect();
+        assert_eq!(titles, ["During", "Before"], "newest first, and the backlog is in it");
         assert_eq!(caps[0].from_username, "kim");
         assert_eq!(caps[0].state, "pending");
 
@@ -21727,7 +22007,7 @@ mod tests {
             .unwrap();
         assert_eq!(mine, 0, "a capture is an offer, not a listen");
 
-        assert_eq!(db.settle_captures(me, &[caps[0].id], true).await.unwrap(), 1);
+        assert_eq!(db.settle_captures(me, &[caps[0].id], true).await.unwrap(), (1, 0));
 
         let landed: Vec<(String, String, Option<String>)> = sqlx::query_as(
             "SELECT title, status, joint_session_id FROM scrobbles WHERE user_id = ?",
@@ -21759,7 +22039,7 @@ mod tests {
         assert_eq!(hosts.as_deref(), Some(spool.as_str()));
 
         // Settling twice does nothing, and declining leaves no listen.
-        assert_eq!(db.settle_captures(me, &[caps[0].id], true).await.unwrap(), 0);
+        assert_eq!(db.settle_captures(me, &[caps[0].id], true).await.unwrap(), (0, 0));
     }
 
     /// An import must not fan out. A backfill is not a sitting, and twenty
@@ -21794,6 +22074,171 @@ mod tests {
             db.spool_captures(me).await.unwrap().is_empty(),
             "neither an imported listen nor a skip is offered to the room"
         );
+    }
+
+    /// **Forgetting to press Join does not lose the evening.**
+    ///
+    /// Reported by Ashwin: somebody was invited, never answered, and the host
+    /// ended the sitting — at which point the invitation vanished off their
+    /// screen and the plays were gone with it. Three separate refusals were
+    /// stacked on top of each other, so this asserts on the *outcome a person
+    /// gets* rather than on any one of them: the invitation is still there, it
+    /// can still be answered, and answering it offers what the sitting held.
+    ///
+    /// The shared-chain limiter is asserted in the same test on purpose. A
+    /// backlog read out of `joint_session_id` sees the private-chain listens
+    /// too — that column is stamped before the gate — so the fix is only
+    /// correct if joining late publishes no more than joining on time would
+    /// have, and a version of this test that only counted rows would pass
+    /// against a backfill that leaked every one of them.
+    #[tokio::test]
+    async fn an_unanswered_invitation_outlives_the_sitting_and_still_carries_its_plays() {
+        let db = testdb().await;
+        let (me, them, shared) = patched_pair(&db).await;
+        let private = sqlx::query_scalar::<_, i64>(
+            "INSERT INTO signal_chains (user_id, name, created_at) VALUES (?, 'Bedroom', ?) RETURNING id",
+        )
+        .bind(them)
+        .bind(Database::now_secs())
+        .fetch_all(&db.pool)
+        .await
+        .unwrap()[0];
+
+        let spool = db.start_spool(them, Some("Sunday"), &[me]).await.unwrap();
+
+        // The whole evening plays out with the guest never having answered, so
+        // not one capture is written for them as it happens.
+        listen(&db, them, Some(shared), "Shared", "Talk Talk", 1_760_000_100).await;
+        listen(&db, them, Some(private), "Private", "Talk Talk", 1_760_000_200).await;
+        listen(&db, them, None, "Chainless", "Talk Talk", 1_760_000_300).await;
+        assert!(db.spool_captures(me).await.unwrap().is_empty(), "nothing offered before joining");
+
+        assert!(db.end_spool(&spool, them).await.unwrap());
+
+        // The invitation survives the room closing, because closing it is not
+        // an answer.
+        let view = db.active_spool(me).await.unwrap().expect("the invitation is still there");
+        assert_eq!(view.uuid, spool);
+        assert_eq!(view.my_state, "invited");
+        assert!(view.ended_at.is_some(), "and the screen can tell it is over");
+
+        // And answering it now is what it always should have been.
+        assert_eq!(
+            db.set_spool_membership(&spool, me, "joined").await.unwrap(),
+            Some(1),
+            "joining late offers the sitting's plays, and only the shareable ones"
+        );
+        let titles: Vec<String> =
+            db.spool_captures(me).await.unwrap().into_iter().map(|c| c.title).collect();
+        assert_eq!(titles, ["Shared"], "a private chain is no more published late than on time");
+
+        // Answered, so it stops asking.
+        assert!(db.active_spool(me).await.unwrap().is_none());
+
+        // Joining twice does not offer the same play twice — the rule
+        // `retro_spool_from_session` already carries, which this shares.
+        assert_eq!(db.set_spool_membership(&spool, me, "joined").await.unwrap(), Some(0));
+        assert_eq!(db.spool_captures(me).await.unwrap().len(), 1);
+    }
+
+    /// **A play out of a sitting is forwarded only if its owner asked for it,
+    /// and only if it is recent.**
+    ///
+    /// Both gates, in one test, because each covers the other's blind spot and
+    /// a version asserting only the switch would pass against a build that
+    /// relayed a sitting reconstructed out of 2019 — one Accept rewriting a
+    /// year of somebody's public Last.fm history, which is not recoverable.
+    ///
+    /// Phrased about `status`, which is the thing that actually decides:
+    /// `flush_pending` reads `'pending'` and nothing else, so this asserts on
+    /// what the flush loop will pick up rather than on the flag that led there.
+    #[tokio::test]
+    async fn a_spool_play_is_forwarded_only_if_asked_for_and_only_if_recent() {
+        let db = testdb().await;
+        let (me, them, chain) = patched_pair(&db).await;
+        let spool = db.start_spool(them, None, &[me]).await.unwrap();
+        db.set_spool_membership(&spool, me, "joined").await.unwrap();
+
+        let status_of = |title: &'static str| {
+            let db = &db;
+            async move {
+                sqlx::query_scalar::<_, String>(
+                    "SELECT status FROM scrobbles WHERE user_id = ? AND title = ?",
+                )
+                .bind(me)
+                .bind(title)
+                .fetch_one(&db.pool)
+                .await
+                .unwrap()
+            }
+        };
+        // Each play gets its own second: `listen` derives its `source_id` from
+        // (user, timestamp), so two at the same instant are one listen as far
+        // as `exists` is concerned — which reads as the capture never having
+        // been made.
+        let offer = |title: &'static str, at: i64| {
+            let db = &db;
+            async move {
+                listen(db, them, Some(chain), title, "Talk Talk", at as u64).await;
+                let caps = db.spool_captures(me).await.unwrap();
+                caps.iter().find(|c| c.title == title).expect("offered").id
+            }
+        };
+
+        let now = Database::now_secs();
+
+        // Off by default: it shipped never-forwarded, and an upgrade must not
+        // start writing to somebody's public record on its own.
+        assert!(!db.forward_spool_listens(me).await.unwrap());
+        let a = offer("Default off", now - 60).await;
+        assert_eq!(db.settle_captures(me, &[a], true).await.unwrap(), (1, 0));
+        assert_eq!(status_of("Default off").await, "imported");
+
+        db.set_forward_spool_listens(me, true).await.unwrap();
+
+        // On, and tonight: relayed.
+        let b = offer("Tonight", now - 120).await;
+        assert_eq!(db.settle_captures(me, &[b], true).await.unwrap(), (1, 1));
+        assert_eq!(status_of("Tonight").await, "pending");
+
+        // On, but a sitting reconstructed out of years ago: stored, never
+        // relayed. This is the gate that stops one click rewriting a history.
+        let c = offer("Long ago", now - 400 * 86_400).await;
+        assert_eq!(db.settle_captures(me, &[c], true).await.unwrap(), (1, 0));
+        assert_eq!(status_of("Long ago").await, "imported");
+
+        // And a clock running badly fast is not a way past it.
+        let d = offer("Next year", now + 400 * 86_400).await;
+        assert_eq!(db.settle_captures(me, &[d], true).await.unwrap(), (1, 0));
+        assert_eq!(status_of("Next year").await, "imported");
+    }
+
+    /// The window is what separates a sitting from a reconstruction, so its
+    /// edges are pinned rather than left to the constant nobody re-reads.
+    #[test]
+    fn the_spool_forward_window_admits_a_late_accept_and_refuses_a_backfill() {
+        let now = 1_760_000_000;
+        assert!(spool_forward_is_live(now, now), "tonight");
+        assert!(spool_forward_is_live(now - 13 * 86_400, now), "an inbox nobody opened for a week");
+        assert!(!spool_forward_is_live(now - 15 * 86_400, now), "past what Last.fm would take");
+        assert!(
+            spool_forward_is_live(now + 600, now),
+            "ten minutes of clock skew is not a backfill"
+        );
+        assert!(!spool_forward_is_live(now + 7200, now), "two hours ahead is a broken clock");
+    }
+
+    /// Declining is what makes an invitation go away.
+    #[tokio::test]
+    async fn no_thanks_dismisses_an_invitation_for_good() {
+        let db = testdb().await;
+        let (me, them, _) = patched_pair(&db).await;
+        let spool = db.start_spool(them, None, &[me]).await.unwrap();
+        assert!(db.end_spool(&spool, them).await.unwrap());
+
+        assert!(db.active_spool(me).await.unwrap().is_some());
+        assert_eq!(db.set_spool_membership(&spool, me, "left").await.unwrap(), Some(0));
+        assert!(db.active_spool(me).await.unwrap().is_none());
     }
 
     /// **A sitting does not bypass the sharing switch.**

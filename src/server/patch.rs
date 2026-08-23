@@ -970,6 +970,12 @@ async fn start_spool(
 }
 
 /// `POST /api/v1/patch/spool/:uuid/join` — accept an invitation, or leave.
+///
+/// **An invitation to a sitting the host has already ended is still
+/// answerable**, and joining one offers the plays it already held — see
+/// `set_spool_membership`. The room closing is not an answer, and the common
+/// reason somebody has not joined by then is that they forgot to press the
+/// button, not that they were never there.
 async fn join_spool(
     State(state): State<Arc<AppState>>,
     user: super::auth::AuthUser,
@@ -984,12 +990,15 @@ async fn join_spool(
     };
     let state_name = if join { "joined" } else { "left" };
     match state.db.set_spool_membership(&uuid, user.user_id, state_name).await {
-        Ok(true) => {
-            (StatusCode::OK, Json(serde_json::json!({ "state": state_name }))).into_response()
+        // `offered` is the backlog joining has just put in their inbox, which
+        // for a sitting that ended before they answered is the whole of it. The
+        // screen says so rather than leaving a join that plainly did something
+        // looking like a join that did nothing.
+        Ok(Some(offered)) => {
+            (StatusCode::OK, Json(serde_json::json!({ "state": state_name, "offered": offered })))
+                .into_response()
         }
-        Ok(false) => {
-            refused(StatusCode::NOT_FOUND, "No running sitting you were invited to with that id")
-        }
+        Ok(None) => refused(StatusCode::NOT_FOUND, "No sitting you were invited to with that id"),
         Err(e) => {
             warn!("📡 spool join: {e}");
             refused(StatusCode::INTERNAL_SERVER_ERROR, "Could not save that")
@@ -1037,7 +1046,16 @@ async fn settle_captures(
     }
 
     match state.db.settle_captures(user.user_id, &ids, accept).await {
-        Ok(n) => (StatusCode::OK, Json(serde_json::json!({ "settled": n }))).into_response(),
+        // `forwarded` is how many of those the flush loop will relay onward,
+        // which is not derivable from `settled` — it turns on a user setting
+        // *and* on each play being inside the freshness window. A screen that
+        // could not say it would be leaving the reader to guess whether a click
+        // just wrote to their public Last.fm history.
+        Ok((settled, forwarded)) => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "settled": settled, "forwarded": forwarded })),
+        )
+            .into_response(),
         Err(e) => {
             warn!("📡 settling captures: {e}");
             refused(StatusCode::INTERNAL_SERVER_ERROR, "Could not save that")

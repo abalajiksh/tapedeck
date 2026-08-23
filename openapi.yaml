@@ -26,7 +26,7 @@ openapi: 3.1.0
 
 info:
   title: Tapedeck
-  version: 0.90.1
+  version: 0.90.2
   summary: Self-hosted scrobbler and listening journal.
   description: |
     Tapedeck ingests listens, enriches them with MusicBrainz metadata, stores
@@ -3272,6 +3272,12 @@ paths:
         `spool` is null when you are not in one. `captures` are plays from other
         people's decks waiting on you — **they are not listens**, and enter no
         history, count or chart until accepted.
+
+        `spool` also carries an **invitation you have not answered yet, even
+        when the sitting has ended** — `ended_at` is non-null in that case. An
+        invitation is outstanding until it is answered, and the host closing
+        the room is not an answer. A running sitting wins over a stale
+        invitation.
       security: [{ sessionCookie: [] }]
       responses:
         '200':
@@ -3324,6 +3330,18 @@ paths:
         `accept: true` joins, `false` leaves. Required — an absent field is a
         400, never a default, because joining is what starts plays being
         captured onto your deck.
+
+        **A sitting the host has already ended can still be joined**, and doing
+        so offers the plays it already held — the response's `offered` says how
+        many. Forgetting to press Join before the room closed is the ordinary
+        case, not the odd one, and refusing it there would throw away an
+        evening with no way to ask for it again. Nothing is weakened: joining
+        still decides nothing on its own, since every play arrives as a capture
+        you have to accept.
+
+        Only plays through the player's **shared** chains are offered, exactly
+        as for a live sitting, and nothing already offered to you in any
+        sitting is offered twice.
       security: [{ sessionCookie: [] }]
       parameters:
         - name: uuid
@@ -3340,10 +3358,22 @@ paths:
               properties:
                 accept: { type: boolean }
       responses:
-        '200': { description: Your membership as it now stands. }
+        '200':
+          description: Your membership as it now stands, and the backlog joining offered you.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  state: { type: string, enum: [joined, left] }
+                  offered:
+                    type: integer
+                    description: >-
+                      Plays the sitting had already held that are now in your
+                      inbox. Always 0 when leaving.
         '400': { description: '`accept` was absent.' }
         '401': { description: Not signed in. }
-        '404': { description: No running sitting you were invited to with that id. }
+        '404': { description: No sitting you were invited to with that id. }
 
   /api/v1/patch/spool/{uuid}/end:
     post:
@@ -3374,10 +3404,14 @@ paths:
         standing setting.
 
         Accepted plays land carrying the sitting's `joint_session_id` — the
-        N-rows-one-per-listener shape decided on 2026-08-02 — and land as
-        `imported`, so they are **never forwarded** to Last.fm or ListenBrainz.
-        Somebody else's deck played it, and putting it on your permanent public
-        record is not a decision this feature has standing to make for you.
+        N-rows-one-per-listener shape decided on 2026-08-02.
+
+        **Whether they are forwarded on to Last.fm and ListenBrainz is the
+        user's own setting** — `GET|PUT /api/v1/connections/spool-forwarding`,
+        off by default — bounded by a freshness window so an evening
+        reconstructed out of years ago is stored and never relayed. `forwarded`
+        in the response says how many of the settled plays the flush loop will
+        actually pick up; it is not derivable from `settled`.
 
         Both `ids` and `accept` are required.
       security: [{ sessionCookie: [] }]
@@ -3394,7 +3428,15 @@ paths:
                   items: { type: integer }
                 accept: { type: boolean }
       responses:
-        '200': { description: How many were settled. }
+        '200':
+          description: How many were settled, and how many of those will be relayed.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  settled: { type: integer }
+                  forwarded: { type: integer }
         '400': { description: '`ids` or `accept` was absent.' }
         '401': { description: Not signed in. }
 
@@ -6783,6 +6825,59 @@ paths:
                         username: { type: [string, 'null'] }
                         connected: { type: boolean }
         '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /api/v1/connections/spool-forwarding:
+    get:
+      tags: [Connections]
+      summary: Whether accepted Shared Spool plays are forwarded onward.
+      description: |
+        `enabled` is the switch; `window_days` is the freshness bound that
+        applies even when it is on, reported rather than hardcoded in a client
+        so the two cannot disagree about what will actually be relayed.
+      security: [{ sessionCookie: [] }]
+      responses:
+        '200':
+          description: The switch and its window.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  enabled: { type: boolean }
+                  window_days: { type: integer }
+        '401': { description: Not signed in. }
+    put:
+      tags: [Connections]
+      summary: Set it.
+      description: |
+        **Off by default, and off for every account that predates it.** Turning
+        it on means a play somebody else's deck made — which you were in the
+        room for, and accepted one at a time — is relayed to your Last.fm and
+        ListenBrainz like any listen of your own.
+
+        A play older than `window_days` is stored and never relayed even with
+        the switch on. `retro_spool_from_session` can offer an evening of any
+        age and an unanswered invitation can be joined a month later, so
+        without that bound a single Accept could rewrite a year of a public
+        history.
+
+        **Session-only; a token gets 401 and scopes never enter into it.** A
+        scrobble client has no business deciding that another deck may write to
+        its owner's public record.
+      security: [{ sessionCookie: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [enabled]
+              properties:
+                enabled: { type: boolean }
+      responses:
+        '200': { description: The switch as it now stands. }
+        '400': { description: '`enabled` was absent.' }
+        '401': { description: Not signed in. }
 
   /api/v1/connections/{service}:
     delete:

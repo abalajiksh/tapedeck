@@ -71,6 +71,8 @@
 	let reelSeq = 0;
 	let busy: string | null = null;
 	let error = '';
+	/** Something that worked and left nothing on screen to show for it. */
+	let notice = '';
 
 	// Loaded when their tab is first opened rather than on mount: six tabs, and
 	// most visits never leave the first one. The same call the Settings screen
@@ -228,7 +230,29 @@
 	})();
 	$: spoolPickedCount = Object.values(spoolPicked).filter(Boolean).length;
 	// Names `nowSec`, which is what makes it tick.
-	$: spoolClock = spool ? clock(spool.started_at, nowSec) : '';
+	// A sitting that has ended does not have a running clock, and drawing a
+	// ticking one would say it is still going. It gets the **date** instead:
+	// the question about an invitation you never answered is *which evening was
+	// this*, and a span answers a question nobody asked — it also reads 0:00
+	// for a room that was closed straight after it opened. How long it ran
+	// moves to the subline, where it is a detail rather than the headline.
+	//
+	// `nowSec` is still *named* in the expression for a live sitting, which is
+	// what makes it tick; see the note above `clock`.
+	$: spoolClock = spool
+		? spool.ended_at
+			? new Date(spool.started_at * 1000).toLocaleDateString(undefined, {
+					day: 'numeric',
+					month: 'short'
+				})
+			: clock(spool.started_at, nowSec)
+		: '';
+	$: spoolRan =
+		spool && spool.ended_at
+			? spool.ended_at - spool.started_at < 60
+				? 'it ran briefly'
+				: `it ran for ${clock(spool.started_at, spool.ended_at)}`
+			: '';
 
 	// Your own handle and how open your deck is. Two switches, and the pill has
 	// to be honest about both — see `deckState` for why it is not just
@@ -431,6 +455,25 @@
 		}
 	}
 
+	/** The user's own answer to "do these reach my scrobble services". Read
+	 *  here because the inbox states it in words right above the Accept button,
+	 *  and a claim that is hardcoded is one that goes quietly false the moment
+	 *  somebody flips the switch. */
+	let forwardSpool = false;
+	let forwardWindowDays = 14;
+
+	async function loadForwarding() {
+		try {
+			const r = await api.getSpoolForwarding();
+			forwardSpool = r.enabled;
+			forwardWindowDays = r.window_days;
+		} catch {
+			// A failed read must not claim the safer answer any more than the
+			// riskier one, so it leaves the default alone and the copy simply
+			// says less.
+		}
+	}
+
 	async function loadSpool() {
 		try {
 			const r = await api.getSpool();
@@ -536,6 +579,7 @@
 			loadDecks(),
 			loadReel(),
 			loadSpool(),
+			loadForwarding(),
 			loadDubs(),
 			loadSittings(),
 			loadLive(),
@@ -712,10 +756,22 @@
 
 	async function answerSpool(accept: boolean) {
 		if (!spool) return;
+		const wasOver = !!spool.ended_at;
 		busy = 'spool';
 		try {
-			await api.joinSpool(spool.uuid, accept);
+			const r = await api.joinSpool(spool.uuid, accept);
 			await loadSpool();
+			// Joining answers the invitation, so the banner goes — which for a
+			// sitting that had already ended leaves the screen looking as if
+			// nothing happened. Say where the plays went, and only for the case
+			// that needs it: a live sitting keeps its banner and its counter.
+			if (accept && wasOver) {
+				notice = r.offered
+					? r.offered === 1
+						? '1 play from that sitting is waiting in your inbox.'
+						: `${r.offered} plays from that sitting are waiting in your inbox.`
+					: 'Joined. That sitting had nothing to pass on — the plays ran through chains the host does not share.';
+			}
 		} catch (e) {
 			alert(e instanceof Error ? e.message : 'Could not save');
 		} finally {
@@ -740,7 +796,18 @@
 		if (!ids.length) return;
 		busy = 'captures';
 		try {
-			await api.settleCaptures(ids, accept);
+			const r = await api.settleCaptures(ids, accept);
+			// Only when something was actually relayed. Accepting writes to a
+			// permanent public record in that case, and a click that does so
+			// silently is the one thing this switch exists to stop being a
+			// surprise. Saying it every time — including when nothing was
+			// forwarded — would make it noise nobody reads.
+			if (accept && r.forwarded) {
+				notice =
+					r.forwarded === r.settled
+						? `Kept, and forwarded on to your scrobble services.`
+						: `Kept. ${r.forwarded} of ${r.settled} were forwarded on — the rest were older than ${forwardWindowDays} days.`;
+			}
 			await Promise.all([loadSpool(), loadReel()]);
 		} catch (e) {
 			alert(e instanceof Error ? e.message : 'Could not save');
@@ -904,7 +971,7 @@
 	feeding it never sees it.
 -->
 {#if spool}
-	<div class="spool" class:invited={spool.my_state === 'invited'}>
+	<div class="spool" class:invited={spool.my_state === 'invited'} class:over={!!spool.ended_at}>
 		<!--
 			The people first, then the pulse. The design leads with an avatar
 			stack and "with Noor and Tobias" — a sitting is *who you are in a
@@ -919,10 +986,17 @@
 				{/each}
 			</div>
 		{/if}
-		<div class="spulse"><span></span><span></span></div>
+		<!-- The pulse says "happening now", so an ended sitting does not get one. -->
+		{#if !spool.ended_at}
+			<div class="spulse"><span></span><span></span></div>
+		{/if}
 		<div class="smain">
 			<div class="slabel">
-				{spool.my_state === 'invited' ? 'You were asked into a Shared Spool' : 'Shared Spool running'}
+				{spool.ended_at
+					? 'You were asked into a Shared Spool that has since ended'
+					: spool.my_state === 'invited'
+						? 'You were asked into a Shared Spool'
+						: 'Shared Spool running'}
 			</div>
 			<div class="stitle">{withLabel(spool)}</div>
 			<div class="smembers">
@@ -935,6 +1009,17 @@
 				publishes no chain captures nothing — and that has to be said
 				here rather than discovered from an empty inbox.
 			-->
+			<!--
+				The reported bug in one line. With the room closed, "Join" reads
+				as though it can only be pointless — so the banner says what it
+				actually does, which is hand over the evening it held.
+			-->
+			{#if spool.ended_at && spool.my_state === 'invited'}
+				<div class="swarn">
+					Joining still works. It puts the plays from that sitting in your
+					inbox, and each one is yours to keep or drop.
+				</div>
+			{/if}
 			{#if spool.hosting && !mySharedChains}
 				<div class="swarn">
 					You share no chains, so nothing you play is being passed on.
@@ -945,8 +1030,8 @@
 		<div class="sclock">
 			<div class="ctime">{spoolClock}</div>
 			<div class="csub">
-				{spool.captured}
-				{spool.captured === 1 ? 'play' : 'plays'} offered to you
+				{#if spool.ended_at}{spoolRan}{:else}{spool.captured}
+					{spool.captured === 1 ? 'play' : 'plays'} offered to you{/if}
 			</div>
 		</div>
 		<div class="sacts">
@@ -971,6 +1056,13 @@
 
 {#if error}
 	<div class="panel note">{error}</div>
+{/if}
+
+{#if notice}
+	<div class="panel note said">
+		{notice}
+		<button class="linkish" on:click={() => (notice = '')}>Dismiss</button>
+	</div>
 {/if}
 
 {#if loading}
@@ -1609,8 +1701,15 @@
 		</div>
 		<p class="sub" style="margin-top:0;">
 			Plays captured on someone else's deck while you were in a Shared Spool.
-			<strong>Nothing enters your history until you accept it</strong> — and what you accept
-			is stored only here, never forwarded on to Last.fm or ListenBrainz.
+			<strong>Nothing enters your history until you accept it</strong> —
+			{#if forwardSpool}
+				and what you accept is forwarded on to Last.fm and ListenBrainz like your own
+				listens, unless it is more than {forwardWindowDays} days old.
+				<a href="/settings#connections">Change that</a>.
+			{:else}
+				and what you accept is stored only here, never forwarded on to Last.fm or
+				ListenBrainz. <a href="/settings#connections">Change that</a>.
+			{/if}
 		</p>
 		<!--
 			**One card per sitting**, per the design. A flat list loses the thing
@@ -2168,6 +2267,26 @@
 	}
 	.spulse span:last-child { background: var(--td-accent-2); animation-delay: 0.4s; }
 	.spool.invited .spulse span { animation: none; }
+	/* An ended sitting still shows when the invitation was never answered, and
+	   it must not read as one that is happening. No pulse, and a dashed edge —
+	   the same "this is not live" cue the unowned genre cards use. */
+	.spool.over {
+		background: none;
+		border: 1px dashed var(--td-muted-3);
+		color: var(--td-text);
+	}
+	.spool.over .slabel { color: var(--td-muted); }
+	.spool.over .stitle,
+	.spool.over .ctime { color: var(--td-text); }
+	.spool.over .smembers,
+	.spool.over .csub { color: var(--td-muted); }
+	/* `.swarn` is a warm cream meant to sit on the dark panel. On the ended
+	   card there is no dark panel, so it has to be re-stated against the
+	   page — the `--td-panel` trap, which is a text colour left to chance
+	   reading correctly in exactly one theme. */
+	.spool.over .swarn { color: var(--td-muted-2); }
+	.spool.over .swarn a { color: var(--td-accent); }
+	.spool.over .sav { background: var(--td-surface2); color: var(--td-text); }
 	/* The clock and what the sitting has offered. Both were already in the
 	   payload — `started_at` and `captured` — and drawn nowhere. */
 	.spool .sclock { text-align: right; flex: none; }
@@ -2178,6 +2297,19 @@
 		color: #f4e7cf;
 	}
 	.spool .csub { font-size: 11.5px; color: #9a8c72; margin-top: 2px; }
+	/* A date is not a clock face and should not be set like one. */
+	.spool.over .ctime { font-size: 16px; letter-spacing: 0; }
+	.note.said { display: flex; align-items: center; gap: 12px; justify-content: space-between; }
+	.linkish {
+		background: none;
+		border: 0;
+		padding: 0;
+		font: inherit;
+		color: var(--td-accent);
+		cursor: pointer;
+		text-decoration: underline;
+		flex: none;
+	}
 
 	/* — a handed-over sitting — */
 	.sitting-doc { width: min(560px, 100%); min-width: 0; }
