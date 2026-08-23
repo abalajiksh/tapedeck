@@ -364,6 +364,121 @@ export interface PublishSwitch {
 	path: string;
 }
 
+/** An artist seen across the decks you've patched into. */
+export interface PatchArtist {
+	name: string;
+	plays: number;
+	decks: number;
+	who: string | null;
+	last_played: number | null;
+	/** Your own plays. **The overlap is which artists, never a score.** */
+	mine: number;
+}
+
+export interface DeckChain {
+	name: string;
+	icon: string | null;
+	components: string;
+	hours: number;
+}
+
+/** Somebody else's deck, seen through an accepted patch. */
+export interface DeckView {
+	user_id: number;
+	username: string;
+	display_name: string | null;
+	bio: string | null;
+	avatar_url: string | null;
+	created_at: number;
+	/** Listens through their **shared** chains — not their history. */
+	listens: number;
+	chains: DeckChain[];
+	both_play: string[];
+	/** Null when they have no ActivityPub identity, which is a normal state. */
+	actor: string | null;
+}
+
+export interface DiscoverDeck {
+	user_id: number;
+	username: string;
+	display_name: string | null;
+	bio: string | null;
+	avatar_url: string | null;
+	created_at: number;
+	shared_chains: number;
+	state: string | null;
+	/** Unit-separated (\x1f) artists you both play. */
+	overlap: string;
+}
+
+export interface InstancePulse {
+	decks: number;
+	publishing: number;
+	shared_chains: number;
+	listens: number;
+	hours: number;
+	artists: PatchArtist[];
+	chains: { name: string; plays: number }[];
+	/** Raw (timestamp, hours) pairs — the day boundary is the reader's. */
+	daily: { at: number; hours: number }[];
+}
+
+export interface FederationOps {
+	identities: number;
+	published: number;
+	frozen: number;
+	remote_actors: number;
+	inbox_activities: number;
+	deliveries: number;
+}
+
+/** A record somebody handed you. */
+export interface Dub {
+	id: number;
+	kind: string;
+	artist: string;
+	name: string | null;
+	reason: string | null;
+	because: string | null;
+	status: string;
+	created_at: number;
+	from_username: string;
+	from_display_name: string | null;
+}
+
+export interface SpoolMember {
+	user_id: number;
+	username: string;
+	display_name: string | null;
+	state: string;
+}
+
+export interface SpoolView {
+	uuid: string;
+	title: string | null;
+	started_at: number;
+	host_user_id: number;
+	hosting: boolean;
+	my_state: string;
+	members: SpoolMember[];
+	captured: number;
+}
+
+/** A play from somebody else's deck. **Not a listen** until accepted. */
+export interface SpoolCapture {
+	id: number;
+	title: string;
+	artist: string;
+	album: string | null;
+	duration: number | null;
+	played_at: number;
+	state: string;
+	from_username: string;
+	from_display_name: string | null;
+	spool_uuid: string;
+	spool_title: string | null;
+}
+
 /** The other end of a patch — or a deck nobody has asked about yet. */
 export interface PatchPeer {
 	/** The patch's own id. Null when no edge exists — which is what tells
@@ -1645,6 +1760,67 @@ class TapedeckAPI {
 	/** The same endpoint the chain drawer calls — one state, two places. */
 	async setChainShared(chainId: number, shared: boolean): Promise<{ shared: boolean }> {
 		return this.request('PUT', `/api/v1/patch/chains/${chainId}/shared`, { shared });
+	}
+
+	async getPatchArtists(): Promise<{ artists: PatchArtist[] }> {
+		return this.get('/api/v1/patch/artists');
+	}
+
+	async getPatchDiscover(): Promise<{ decks: DiscoverDeck[] }> {
+		return this.get('/api/v1/patch/discover');
+	}
+
+	async getPatchInstance(days = 7): Promise<{ days: number; pulse: InstancePulse }> {
+		return this.get(`/api/v1/patch/instance?days=${days}`);
+	}
+
+	async getPatchOps(): Promise<{
+		ops: FederationOps;
+		vocabulary: { verb: string; object: string; namespace: string; frozen: boolean };
+		delivery: boolean;
+	}> {
+		return this.get('/api/v1/patch/ops');
+	}
+
+	async getDeck(username: string): Promise<DeckView> {
+		return this.get(`/api/v1/patch/deck/${encodeURIComponent(username)}`);
+	}
+
+	async dub(body: {
+		to: string;
+		kind: string;
+		artist: string;
+		name?: string | null;
+		reason?: string | null;
+		because: string;
+	}): Promise<{ id: number }> {
+		return this.request('POST', '/api/v1/patch/dub', body);
+	}
+
+	async getDubs(): Promise<{ dubs: Dub[] }> {
+		return this.get('/api/v1/patch/dubs');
+	}
+
+	async getSpool(): Promise<{ spool: SpoolView | null; captures: SpoolCapture[] }> {
+		return this.get('/api/v1/patch/spool');
+	}
+
+	async startSpool(body: { title?: string | null; with: string[] }): Promise<{ uuid: string }> {
+		return this.request('POST', '/api/v1/patch/spool', body);
+	}
+
+	async joinSpool(uuid: string, accept: boolean): Promise<{ state: string }> {
+		return this.request('POST', `/api/v1/patch/spool/${encodeURIComponent(uuid)}/join`, {
+			accept
+		});
+	}
+
+	async endSpool(uuid: string): Promise<{ ended: boolean }> {
+		return this.request('POST', `/api/v1/patch/spool/${encodeURIComponent(uuid)}/end`, {});
+	}
+
+	async settleCaptures(ids: number[], accept: boolean): Promise<{ settled: number }> {
+		return this.request('POST', '/api/v1/patch/captures', { ids, accept });
 	}
 
 	async getReel(params: { limit?: number; before?: number } = {}): Promise<ReelPage> {

@@ -1110,14 +1110,23 @@ deploy/                      Sample hardened systemd unit
 
 ### Next
 
-- [ ] **Patch (social)** — **works inside one instance.** Patch into another
+- [x] **Patch (social)** — **works inside one instance.** Patch into another
       deck on your server, approve or decline the ones pointed at you, and see
-      what they've been playing on The Reel. Sharing is **per signal chain and
-      off by default** — a listen reaches the Reel because the chain it ran
-      through was switched on, and there is no per-listen setting. Every account
-      can also have an ActivityPub actor, WebFinger record, outbox and
-      signature-verifying inbox, opt-in and off by default. What remains is the
-      rest of the screens and sending anything to other servers
+      what they've been playing on The Reel. Browse the artists you have in
+      common, open somebody's deck, and see what the whole instance is playing.
+      Pass a record to someone as a **Dub**, or listen together in a **Shared
+      Spool** — where plays from their deck wait in your inbox and enter no
+      history until you accept them.
+
+      Sharing is **per signal chain and off by default**. A listen becomes
+      visible because the chain it ran through was switched on; there is no
+      per-listen setting, and nothing — not the Reel, not the instance figures,
+      not a Shared Spool — works around that.
+- [ ] **Federating outward** — every account can already have an ActivityPub
+      actor, a WebFinger record, an outbox and an inbox that verifies HTTP
+      signatures, all opt-in and off by default. What remains is *sending*:
+      signing activities out to other servers so a deck elsewhere can be patched
+      into
 - [ ] **ActivityPub delivery** — sending activities out to other servers. The
       vocabulary question is settled: a listen is a `Create` wrapping a
       `td:Listen`, so a server that understands nothing renders "Listened to

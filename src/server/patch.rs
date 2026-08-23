@@ -79,7 +79,22 @@ pub fn create_patch_router() -> Router<Arc<AppState>> {
         // reading this list.
         .route("/api/v1/patch/requests/:uuid/settle", post(settle))
         .route("/api/v1/patch/chains/:id/shared", axum::routing::put(set_shared))
-        .route("/api/v1/patch/deck/:username", axum::routing::delete(withdraw))
+        // One registration, two methods. Two `.route()` calls on the same path
+        // panic at startup rather than failing to compile.
+        .route("/api/v1/patch/deck/:username", get(deck).delete(withdraw))
+        // Step 3 — the screens.
+        .route("/api/v1/patch/artists", get(artists))
+        .route("/api/v1/patch/discover", get(discover))
+        .route("/api/v1/patch/instance", get(instance))
+        .route("/api/v1/patch/ops", get(ops))
+        // Dubs.
+        .route("/api/v1/patch/dub", post(dub))
+        .route("/api/v1/patch/dubs", get(dubs))
+        // Shared Spools.
+        .route("/api/v1/patch/spool", get(spool).post(start_spool))
+        .route("/api/v1/patch/spool/:uuid/join", post(join_spool))
+        .route("/api/v1/patch/spool/:uuid/end", post(end_spool))
+        .route("/api/v1/patch/captures", post(settle_captures))
 }
 
 // ── Step 2: patches, the inbox, and the Reel ─────────────────
@@ -335,6 +350,348 @@ async fn reel(
         Err(e) => {
             warn!("📡 reel for {}: {e}", user.username);
             refused(StatusCode::INTERNAL_SERVER_ERROR, "Could not read the Reel")
+        }
+    }
+}
+
+// ── Step 3: the screens, Dubs and Spools ─────────────────────
+
+#[derive(Deserialize)]
+struct SinceQuery {
+    /// Days back. The Instance tab's only control.
+    days: Option<i64>,
+}
+
+/// `GET /api/v1/patch/artists` — artists across the decks you patched into.
+async fn artists(State(state): State<Arc<AppState>>, user: super::auth::AuthUser) -> Response {
+    match state.db.patch_artists(user.user_id, 120).await {
+        Ok(artists) => {
+            (StatusCode::OK, Json(serde_json::json!({ "artists": artists }))).into_response()
+        }
+        Err(e) => {
+            warn!("📡 patch artists: {e}");
+            refused(StatusCode::INTERNAL_SERVER_ERROR, "Could not read that")
+        }
+    }
+}
+
+/// `GET /api/v1/patch/discover` — everyone here, and what you have in common.
+async fn discover(State(state): State<Arc<AppState>>, user: super::auth::AuthUser) -> Response {
+    match state.db.discover_decks(user.user_id).await {
+        Ok(decks) => (StatusCode::OK, Json(serde_json::json!({ "decks": decks }))).into_response(),
+        Err(e) => {
+            warn!("📡 patch discover: {e}");
+            refused(StatusCode::INTERNAL_SERVER_ERROR, "Could not read that")
+        }
+    }
+}
+
+/// `GET /api/v1/patch/instance` — what this instance has been playing.
+///
+/// **Not narrowed by the caller's patches**, unlike everything else on this
+/// router. The Reel answers "what have the decks I follow played"; this answers
+/// "what is this instance listening to", which is a fact about the people who
+/// chose to publish a chain and is the same for everyone who asks.
+async fn instance(
+    State(state): State<Arc<AppState>>,
+    _user: super::auth::AuthUser,
+    Query(q): Query<SinceQuery>,
+) -> Response {
+    let days = q.days.unwrap_or(7).clamp(1, 365);
+    let since = chrono::Utc::now().timestamp() - days * 86_400;
+    match state.db.instance_pulse(since).await {
+        Ok(pulse) => (StatusCode::OK, Json(serde_json::json!({ "days": days, "pulse": pulse })))
+            .into_response(),
+        Err(e) => {
+            warn!("📡 instance pulse: {e}");
+            refused(StatusCode::INTERNAL_SERVER_ERROR, "Could not read that")
+        }
+    }
+}
+
+/// `GET /api/v1/patch/ops` — the admin Operations panel.
+///
+/// Reports **only what is recorded**. The design lists signature failures;
+/// refusals go through `tracing` and are counted nowhere, and a tile showing an
+/// invented number would be worse than one that is honest about where to look.
+async fn ops(State(state): State<Arc<AppState>>, user: super::auth::AuthUser) -> Response {
+    if !user.is_admin {
+        return refused(StatusCode::FORBIDDEN, "Admins only");
+    }
+    match state.db.federation_ops().await {
+        Ok(ops) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "ops": ops,
+                // Read-only, deliberately. The design offers a picker with a
+                // Freeze control; three vocabularies would mean three things to
+                // maintain and a migration path between them for a decision
+                // made once, so the verb is compiled in and this only reports
+                // it.
+                "vocabulary": {
+                    "verb": "Create",
+                    "object": "td:Listen",
+                    "namespace": crate::patch::actor::TD_NS,
+                    "frozen": true,
+                },
+                "delivery": false,
+            })),
+        )
+            .into_response(),
+        Err(e) => {
+            warn!("📡 federation ops: {e}");
+            refused(StatusCode::INTERNAL_SERVER_ERROR, "Could not read that")
+        }
+    }
+}
+
+/// `GET /api/v1/patch/deck/:username` — one deck, through an accepted patch.
+async fn deck(
+    State(state): State<Arc<AppState>>,
+    user: super::auth::AuthUser,
+    Path(username): Path<String>,
+) -> Response {
+    match state.db.deck_view(user.user_id, &username).await {
+        // A deck that does not exist and one you are not patched into are the
+        // same answer — the rule the whole of Patch follows.
+        Ok(None) => refused(StatusCode::NOT_FOUND, "No such deck, or you are not patched into it"),
+        Ok(Some(deck)) => (StatusCode::OK, Json(deck)).into_response(),
+        Err(e) => {
+            warn!("📡 deck view: {e}");
+            refused(StatusCode::INTERNAL_SERVER_ERROR, "Could not read that deck")
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct DubBody {
+    to: String,
+    kind: String,
+    artist: String,
+    name: Option<String>,
+    mbid: Option<String>,
+    reason: Option<String>,
+    because: Option<String>,
+}
+
+/// `POST /api/v1/patch/dub` — pass a record to someone.
+///
+/// Goes through `crate_shelf::file`'s own guards where it can: `because` is
+/// required, and a record already in their history is refused with the play
+/// count. "You already have this" is Rediscovery under another name, and the
+/// count is the half that tells the sender something.
+async fn dub(
+    State(state): State<Arc<AppState>>,
+    user: super::auth::AuthUser,
+    Json(body): Json<DubBody>,
+) -> Response {
+    if !matches!(body.kind.as_str(), "artist" | "album" | "track") {
+        return refused(StatusCode::BAD_REQUEST, "kind must be artist, album or track");
+    }
+    let Some(because) = body.because.as_deref().map(str::trim).filter(|s| !s.is_empty()) else {
+        return refused(
+            StatusCode::BAD_REQUEST,
+            "`because` is required — say what in their listening prompted this.",
+        );
+    };
+
+    let to = match state.db.patchable_user_id(&body.to).await {
+        Ok(Some(id)) => id,
+        Ok(None) => return refused(StatusCode::NOT_FOUND, "No such deck on this instance"),
+        Err(e) => {
+            warn!("📡 dub: {e}");
+            return refused(StatusCode::INTERNAL_SERVER_ERROR, "Could not look that deck up");
+        }
+    };
+    if to == user.user_id {
+        return refused(StatusCode::BAD_REQUEST, "Dub it to somebody else");
+    }
+
+    // Already theirs? The crate's rule, applied to a person's suggestion.
+    match state.db.already_heard(to, &body.kind, &body.artist, body.name.as_deref()).await {
+        Ok(plays) if plays > 0 => {
+            return refused(
+                StatusCode::CONFLICT,
+                format!(
+                    "They already have that — {plays} {}. Dub them something they don't.",
+                    if plays == 1 { "play" } else { "plays" }
+                ),
+            )
+        }
+        Ok(_) => {}
+        Err(e) => {
+            warn!("📡 dub: {e}");
+            return refused(StatusCode::INTERNAL_SERVER_ERROR, "Could not check their history");
+        }
+    }
+
+    let rec = crate::db::NewRecommendation {
+        kind: body.kind.clone(),
+        artist: body.artist.clone(),
+        name: body.name,
+        mbid: body.mbid,
+        reason: body.reason,
+        because: Some(because.to_string()),
+    };
+    match state.db.dub(user.user_id, to, &rec, &user.username).await {
+        Ok(id) => {
+            info!("📡 {} dubbed {} to {}", user.username, rec.artist, body.to);
+            (StatusCode::OK, Json(serde_json::json!({ "id": id }))).into_response()
+        }
+        Err(sqlx::Error::Protocol(msg)) => refused(StatusCode::FORBIDDEN, msg),
+        Err(e) => {
+            warn!("📡 dub: {e}");
+            refused(StatusCode::INTERNAL_SERVER_ERROR, "Could not record that")
+        }
+    }
+}
+
+/// `GET /api/v1/patch/dubs` — records people handed you.
+async fn dubs(State(state): State<Arc<AppState>>, user: super::auth::AuthUser) -> Response {
+    match state.db.dubs_for(user.user_id).await {
+        Ok(dubs) => (StatusCode::OK, Json(serde_json::json!({ "dubs": dubs }))).into_response(),
+        Err(e) => {
+            warn!("📡 dubs: {e}");
+            refused(StatusCode::INTERNAL_SERVER_ERROR, "Could not read that")
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct SpoolBody {
+    title: Option<String>,
+    /// Usernames to invite.
+    with: Option<Vec<String>>,
+}
+
+#[derive(Deserialize)]
+struct SettleCapturesBody {
+    ids: Option<Vec<i64>>,
+    accept: Option<bool>,
+}
+
+/// `GET /api/v1/patch/spool` — the sitting you are in, and what it has offered.
+async fn spool(State(state): State<Arc<AppState>>, user: super::auth::AuthUser) -> Response {
+    let (active, captures) = match tokio::try_join!(
+        state.db.active_spool(user.user_id),
+        state.db.spool_captures(user.user_id)
+    ) {
+        Ok(v) => v,
+        Err(e) => {
+            warn!("📡 spool: {e}");
+            return refused(StatusCode::INTERNAL_SERVER_ERROR, "Could not read that");
+        }
+    };
+    (StatusCode::OK, Json(serde_json::json!({ "spool": active, "captures": captures })))
+        .into_response()
+}
+
+/// `POST /api/v1/patch/spool` — open a sitting.
+async fn start_spool(
+    State(state): State<Arc<AppState>>,
+    user: super::auth::AuthUser,
+    Json(body): Json<SpoolBody>,
+) -> Response {
+    let mut ids = Vec::new();
+    for name in body.with.unwrap_or_default() {
+        match state.db.patchable_user_id(&name).await {
+            Ok(Some(id)) => ids.push(id),
+            Ok(None) => return refused(StatusCode::NOT_FOUND, format!("No deck called {name}")),
+            Err(e) => {
+                warn!("📡 spool start: {e}");
+                return refused(StatusCode::INTERNAL_SERVER_ERROR, "Could not look that deck up");
+            }
+        }
+    }
+
+    match state.db.start_spool(user.user_id, body.title.as_deref(), &ids).await {
+        Ok(uuid) => {
+            info!("📡 {} started a spool with {} others", user.username, ids.len());
+            (StatusCode::OK, Json(serde_json::json!({ "uuid": uuid }))).into_response()
+        }
+        // The partial unique index, not a check this handler races.
+        Err(e) if e.to_string().contains("UNIQUE") => {
+            refused(StatusCode::CONFLICT, "You already have a sitting running")
+        }
+        Err(e) => {
+            warn!("📡 spool start: {e}");
+            refused(StatusCode::INTERNAL_SERVER_ERROR, "Could not start that")
+        }
+    }
+}
+
+/// `POST /api/v1/patch/spool/:uuid/join` — accept an invitation, or leave.
+async fn join_spool(
+    State(state): State<Arc<AppState>>,
+    user: super::auth::AuthUser,
+    Path(uuid): Path<String>,
+    Json(body): Json<SettleBody>,
+) -> Response {
+    let Some(join) = body.accept else {
+        return refused(
+            StatusCode::BAD_REQUEST,
+            "`accept` is required — say true or false explicitly.",
+        );
+    };
+    let state_name = if join { "joined" } else { "left" };
+    match state.db.set_spool_membership(&uuid, user.user_id, state_name).await {
+        Ok(true) => {
+            (StatusCode::OK, Json(serde_json::json!({ "state": state_name }))).into_response()
+        }
+        Ok(false) => {
+            refused(StatusCode::NOT_FOUND, "No running sitting you were invited to with that id")
+        }
+        Err(e) => {
+            warn!("📡 spool join: {e}");
+            refused(StatusCode::INTERNAL_SERVER_ERROR, "Could not save that")
+        }
+    }
+}
+
+/// `POST /api/v1/patch/spool/:uuid/end` — close it. The host's only.
+async fn end_spool(
+    State(state): State<Arc<AppState>>,
+    user: super::auth::AuthUser,
+    Path(uuid): Path<String>,
+) -> Response {
+    match state.db.end_spool(&uuid, user.user_id).await {
+        Ok(true) => (StatusCode::OK, Json(serde_json::json!({ "ended": true }))).into_response(),
+        Ok(false) => refused(StatusCode::NOT_FOUND, "No running sitting of yours with that id"),
+        Err(e) => {
+            warn!("📡 spool end: {e}");
+            refused(StatusCode::INTERNAL_SERVER_ERROR, "Could not save that")
+        }
+    }
+}
+
+/// `POST /api/v1/patch/captures` — accept or decline what a sitting offered.
+///
+/// **The only path by which another deck can write a listen into your
+/// history**, which is why it is explicit and per capture. Accepted plays land
+/// as `imported`, so they are never forwarded onward: somebody else's deck
+/// played it, and putting it on your permanent public record is not a decision
+/// this feature has standing to make for you.
+async fn settle_captures(
+    State(state): State<Arc<AppState>>,
+    user: super::auth::AuthUser,
+    Json(body): Json<SettleCapturesBody>,
+) -> Response {
+    let Some(accept) = body.accept else {
+        return refused(
+            StatusCode::BAD_REQUEST,
+            "`accept` is required — say true or false explicitly.",
+        );
+    };
+    let ids = body.ids.unwrap_or_default();
+    if ids.is_empty() {
+        return refused(StatusCode::BAD_REQUEST, "`ids` is required — name the captures.");
+    }
+
+    match state.db.settle_captures(user.user_id, &ids, accept).await {
+        Ok(n) => (StatusCode::OK, Json(serde_json::json!({ "settled": n }))).into_response(),
+        Err(e) => {
+            warn!("📡 settling captures: {e}");
+            refused(StatusCode::INTERNAL_SERVER_ERROR, "Could not save that")
         }
     }
 }

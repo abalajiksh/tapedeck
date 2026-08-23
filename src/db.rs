@@ -939,6 +939,11 @@ impl Database {
                 listened_ms INTEGER,
                 is_shuffle BOOLEAN,
                 queue_source TEXT,
+                -- The Shared Spool this listen belonged to, as the spool's
+                -- uuid. A joint listen is N rows sharing this, one per
+                -- listener — never one row with several owners, because every
+                -- query here scopes by `user_id`.
+                joint_session_id TEXT,
                 UNIQUE(user_id, source_id, source_name)
             )",
         )
@@ -2409,6 +2414,96 @@ impl Database {
         .execute(&self.pool)
         .await?;
 
+        // ── Shared Spools ──
+        //
+        // A sitting several people are in at once. The decision from
+        // 2026-08-02 stands and decides the shape: a joint listen is **N rows
+        // sharing a `joint_session_id`, one per listener** — not one row with N
+        // owners. Every query in this codebase scopes by `user_id` and
+        // `delivered_sinks` is per scrobble; one row with several owners would
+        // mean revisiting all of it. The consequence to keep in mind is that a
+        // joint listen really is duplicated storage, and each copy forwards to
+        // its own owner's services — which is correct, because each listener
+        // really did listen.
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS spools (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                uuid TEXT NOT NULL UNIQUE,
+                -- Whose deck is playing. Captures flow outward from here.
+                host_user_id INTEGER NOT NULL REFERENCES users(id),
+                title TEXT,
+                started_at INTEGER NOT NULL,
+                -- Null while it is running. One running spool per host, which
+                -- the partial index below enforces rather than the handler.
+                ended_at INTEGER
+            )",
+        )
+        .execute(&self.pool)
+        .await?;
+
+        // Nobody hosts two sittings at once, and saying so here means no
+        // handler has to remember it.
+        sqlx::query(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_spools_one_running
+             ON spools(host_user_id) WHERE ended_at IS NULL",
+        )
+        .execute(&self.pool)
+        .await?;
+
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS spool_members (
+                spool_id INTEGER NOT NULL REFERENCES spools(id),
+                user_id INTEGER NOT NULL REFERENCES users(id),
+                -- invited | joined | left. An invitation is not attendance:
+                -- captures are only made for members who actually joined.
+                state TEXT NOT NULL DEFAULT 'invited',
+                joined_at INTEGER,
+                PRIMARY KEY (spool_id, user_id)
+            )",
+        )
+        .execute(&self.pool)
+        .await?;
+
+        // What somebody else's deck played while you were in the room.
+        //
+        // **Nothing here is a listen.** A capture is an offer, and it enters no
+        // history until its owner accepts it — the rule the design adds to the
+        // 2026-08-02 decision, and the reason this is a table of its own rather
+        // than rows in `scrobbles` with a flag. A flag would put unaccepted
+        // plays one forgotten `WHERE` away from every count in the
+        // application; a separate table makes that impossible, the same call
+        // the Crate and `inbox_activities` both make.
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS spool_captures (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                spool_id INTEGER NOT NULL REFERENCES spools(id),
+                -- Whose inbox it is waiting in.
+                user_id INTEGER NOT NULL REFERENCES users(id),
+                -- Whose deck actually played it.
+                from_user_id INTEGER NOT NULL REFERENCES users(id),
+                title TEXT NOT NULL,
+                artist TEXT NOT NULL,
+                album TEXT,
+                duration INTEGER,
+                played_at INTEGER NOT NULL,
+                -- pending | accepted | declined
+                state TEXT NOT NULL DEFAULT 'pending',
+                settled_at INTEGER,
+                -- One offer per person per play. A host whose deck re-reports a
+                -- listen must not fill somebody's inbox with copies.
+                UNIQUE (user_id, spool_id, played_at, title)
+            )",
+        )
+        .execute(&self.pool)
+        .await?;
+
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_spool_captures_pending
+             ON spool_captures(user_id, state, played_at)",
+        )
+        .execute(&self.pool)
+        .await?;
+
         Ok(())
     }
 
@@ -2714,6 +2809,34 @@ impl Database {
         // existed before the column, which is the only safe direction — nobody
         // consents to publishing their listening by upgrading a binary. Same
         // rule `users.public_now_playing` follows.
+        // Patch: a dub is a crate row that came from a *person*.
+        //
+        // `origin` already carries a name, but it is free text shared with
+        // model connections — so the person is a real reference rather than a
+        // string somebody could spell two ways. Deliberately not a second
+        // table: a dub *is* a crate entry, and it lands on the page the user
+        // already visits for records they are still flipping through.
+        if !has_column(&self.pool, "recommendations", "from_user_id").await {
+            info!("⚙️ Migrating: adding recommendations.from_user_id...");
+            let _ = sqlx::query(
+                "ALTER TABLE recommendations ADD COLUMN from_user_id INTEGER REFERENCES users(id)",
+            )
+            .execute(&self.pool)
+            .await;
+        }
+
+        // Patch: which sitting a joint listen belonged to.
+        //
+        // The uuid of the spool, not its row id — it is the identity that
+        // survives being handed to another instance, the same reason
+        // `sessions.uuid` exists.
+        if !has_column(&self.pool, "scrobbles", "joint_session_id").await {
+            info!("⚙️ Migrating: adding scrobbles.joint_session_id...");
+            let _ = sqlx::query("ALTER TABLE scrobbles ADD COLUMN joint_session_id TEXT")
+                .execute(&self.pool)
+                .await;
+        }
+
         // Patch: an existing account is not published by an upgrade.
         if !has_column(&self.pool, "users", "federation_enabled").await {
             info!("⚙️ Migrating: adding users.federation_enabled...");
@@ -3672,6 +3795,22 @@ impl Database {
         // — with nothing erroring to say so, which is how the credit was lost
         // in the first place.
         self.link_scrobble_artists(user_id, &play.source_id, &play.source_name, play).await?;
+
+        // Offer it to anyone else in the sitting, if there is one.
+        //
+        // **Live and unskipped only**, and the guard is here rather than inside
+        // `capture_into_spool` so the cost is visible at the call site: an
+        // import must not fan out, or twenty thousand backfilled rows become
+        // twenty thousand offers in somebody's inbox — a backfill is not a
+        // sitting. A skip is not offered either, for the reason a skip is never
+        // counted anywhere else.
+        //
+        // Costs one indexed lookup returning no rows when nothing is running,
+        // which is almost always. That is affordable per *live* listen — a
+        // handful an hour — and would not be per imported one.
+        if !disposition.imported && !disposition.skipped {
+            self.capture_into_spool(user_id, play, chain_id).await?;
+        }
 
         Ok(true)
     }
@@ -13425,6 +13564,737 @@ impl Database {
         };
         sqlx::query_scalar(sql).bind(user_id).fetch_one(&self.pool).await
     }
+
+    // ════════════════════════════════════════════════════════════
+    //  Patch — the screens, Dubs and Spools (Phase 6, Step 3)
+    // ════════════════════════════════════════════════════════════
+
+    /// Every listen this user is entitled to see from other decks.
+    ///
+    /// The Reel's `FROM` and `WHERE`, factored out because the Artists tab, the
+    /// Instance figures and a deck page all have to narrow the *same* way. Four
+    /// clauses, and none may be relaxed: an accepted patch, a shared chain, a
+    /// listen that **has** a chain, and no skips. Written once so a second
+    /// reader cannot quietly publish more than the Reel does.
+    ///
+    /// `?` binds the reader's own user id.
+    const SHARED_LISTENS: &'static str = "FROM scrobbles s \
+         JOIN signal_chains c ON c.id = s.chain_id AND c.shared = 1 \
+         JOIN users u ON u.id = s.user_id \
+         JOIN patches p ON p.target_user_id = s.user_id \
+        WHERE p.follower_user_id = ? AND p.state = 'accepted' AND s.skipped = FALSE";
+
+    /// Artists across the decks this user has patched into.
+    ///
+    /// `mine` is what makes the tab worth opening: the overlap is the finding,
+    /// and it is shown as *which artists* rather than as a similarity score —
+    /// the design's own rule, and the honest one, because a score invites a
+    /// ranking of people.
+    pub async fn patch_artists(
+        &self,
+        user_id: i64,
+        limit: i64,
+    ) -> Result<Vec<PatchArtist>, sqlx::Error> {
+        sqlx::query_as(&format!(
+            "SELECT s.artist AS name, COUNT(*) AS plays, \
+                    COUNT(DISTINCT s.user_id) AS decks, \
+                    GROUP_CONCAT(DISTINCT u.username) AS who, \
+                    MAX(s.timestamp) AS last_played, \
+                    COALESCE(( \
+                        SELECT COUNT(*) FROM scrobbles m \
+                         WHERE m.user_id = ? AND m.skipped = FALSE \
+                           AND LOWER(TRIM(m.artist)) = LOWER(TRIM(s.artist)) \
+                    ), 0) AS mine \
+               {} \
+            GROUP BY LOWER(TRIM(s.artist)) \
+            ORDER BY plays DESC LIMIT ?",
+            Self::SHARED_LISTENS
+        ))
+        .bind(user_id)
+        .bind(user_id)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+    }
+
+    /// One deck, as the person patched into it may see it.
+    ///
+    /// Returns `None` unless there is an accepted patch — the check is in the
+    /// query rather than the handler, for the reason every other Phase 6 scope
+    /// check is.
+    pub async fn deck_view(
+        &self,
+        viewer_id: i64,
+        username: &str,
+    ) -> Result<Option<DeckView>, sqlx::Error> {
+        let Some(row): Option<(i64, String, Option<String>, Option<String>, Option<String>, i64)> =
+            sqlx::query_as(
+                "SELECT u.id, u.username, u.display_name, u.bio, u.avatar_url, u.created_at
+                   FROM users u
+                   JOIN patches p ON p.target_user_id = u.id
+                  WHERE u.username = ? COLLATE NOCASE
+                    AND p.follower_user_id = ? AND p.state = 'accepted'
+                    AND u.disabled = 0",
+            )
+            .bind(username)
+            .bind(viewer_id)
+            .fetch_optional(&self.pool)
+            .await?
+        else {
+            return Ok(None);
+        };
+
+        let (id, username, display_name, bio, avatar_url, created_at) = row;
+
+        // Only the chains they publish. An unshared chain is not theirs to be
+        // asked about, and listing it would say what they own without saying
+        // what they played — which is worse than saying nothing.
+        let chains: Vec<DeckChain> = sqlx::query_as(
+            "SELECT c.name, c.icon, c.components,
+                    CAST(COALESCE((
+                        SELECT SUM(sc.duration) FROM scrobbles sc
+                         WHERE sc.chain_id = c.id AND sc.skipped = FALSE
+                    ), 0) AS REAL) / 3600.0 AS hours
+               FROM signal_chains c
+              WHERE c.user_id = ? AND c.shared = 1
+              ORDER BY hours DESC",
+        )
+        .bind(id)
+        .fetch_all(&self.pool)
+        .await?;
+
+        // What you both play, from their shared chains and the viewer's whole
+        // history. Overlap only — no score, no ranking of people.
+        let both: Vec<String> = sqlx::query_scalar(
+            "SELECT s.artist FROM scrobbles s
+               JOIN signal_chains c ON c.id = s.chain_id AND c.shared = 1
+              WHERE s.user_id = ? AND s.skipped = FALSE
+                AND EXISTS (
+                    SELECT 1 FROM scrobbles m
+                     WHERE m.user_id = ? AND m.skipped = FALSE
+                       AND LOWER(TRIM(m.artist)) = LOWER(TRIM(s.artist))
+                )
+              GROUP BY LOWER(TRIM(s.artist))
+              ORDER BY COUNT(*) DESC LIMIT 12",
+        )
+        .bind(id)
+        .bind(viewer_id)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let listens: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM scrobbles s
+               JOIN signal_chains c ON c.id = s.chain_id AND c.shared = 1
+              WHERE s.user_id = ? AND s.skipped = FALSE",
+        )
+        .bind(id)
+        .fetch_one(&self.pool)
+        .await?;
+
+        // The actor endpoints, if they have an identity at all. `None` is a
+        // normal state — federation is opt-in — and the page says so rather
+        // than printing URLs that would 404.
+        let actor: Option<String> = sqlx::query_scalar("SELECT uri FROM actors WHERE user_id = ?")
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await?;
+
+        Ok(Some(DeckView {
+            user_id: id,
+            username,
+            display_name,
+            bio,
+            avatar_url,
+            created_at,
+            listens,
+            chains,
+            both_play: both,
+            actor,
+        }))
+    }
+
+    /// Everyone on the instance, with what the viewer has in common with them.
+    ///
+    /// **Overlap is computed against their *shared* chains only**, so this
+    /// cannot become a way to learn what somebody plays privately by watching
+    /// the suggestion list change.
+    pub async fn discover_decks(&self, user_id: i64) -> Result<Vec<DiscoverDeck>, sqlx::Error> {
+        sqlx::query_as(
+            "SELECT u.id AS user_id, u.username, u.display_name, u.bio, u.avatar_url,
+                    u.created_at,
+                    (SELECT COUNT(*) FROM signal_chains c
+                      WHERE c.user_id = u.id AND c.shared = 1) AS shared_chains,
+                    (SELECT state FROM patches p
+                      WHERE p.follower_user_id = ? AND p.target_user_id = u.id) AS state,
+                    COALESCE((
+                        SELECT GROUP_CONCAT(x.artist, char(31)) FROM (
+                            SELECT s.artist
+                              FROM scrobbles s
+                              JOIN signal_chains c ON c.id = s.chain_id AND c.shared = 1
+                             WHERE s.user_id = u.id AND s.skipped = FALSE
+                               AND EXISTS (
+                                   SELECT 1 FROM scrobbles m
+                                    WHERE m.user_id = ? AND m.skipped = FALSE
+                                      AND LOWER(TRIM(m.artist)) = LOWER(TRIM(s.artist))
+                               )
+                             GROUP BY LOWER(TRIM(s.artist))
+                             ORDER BY COUNT(*) DESC LIMIT 6
+                        ) x
+                    ), '') AS overlap
+               FROM users u
+              WHERE u.id <> ? AND u.disabled = 0
+              ORDER BY u.created_at DESC",
+        )
+        .bind(user_id)
+        .bind(user_id)
+        .bind(user_id)
+        .fetch_all(&self.pool)
+        .await
+    }
+
+    /// What the instance has been playing, over shared chains only.
+    ///
+    /// **A deliberate reversal of the Reports decision that there is no
+    /// cross-user percentile**, and recorded as one rather than left to look
+    /// like nobody noticed. That rule existed to stop the instance exposing how
+    /// much other members play without their consent; a per-chain opt-in *is*
+    /// that consent. The limiter is load-bearing: shared chains only, and it
+    /// stays inside the instance.
+    ///
+    /// Note this is **not** narrowed by the caller's patches. The Reel answers
+    /// "what have the decks I follow played"; this answers "what is this
+    /// instance listening to", which is a fact about the people who chose to
+    /// publish a chain, and is the same for everyone who asks.
+    pub async fn instance_pulse(&self, since: i64) -> Result<InstancePulse, sqlx::Error> {
+        const SHARED: &str = "FROM scrobbles s \
+             JOIN signal_chains c ON c.id = s.chain_id AND c.shared = 1 \
+            WHERE s.skipped = FALSE";
+
+        let decks: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users WHERE disabled = 0")
+            .fetch_one(&self.pool)
+            .await?;
+        let publishing: i64 = sqlx::query_scalar(
+            "SELECT COUNT(DISTINCT user_id) FROM signal_chains WHERE shared = 1",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        let shared_chains: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM signal_chains WHERE shared = 1")
+                .fetch_one(&self.pool)
+                .await?;
+
+        let listens: i64 =
+            sqlx::query_scalar(&format!("SELECT COUNT(*) {SHARED} AND s.timestamp >= ?"))
+                .bind(since)
+                .fetch_one(&self.pool)
+                .await?;
+        let hours: f64 = sqlx::query_scalar(&format!(
+            "SELECT CAST(COALESCE(SUM(s.duration), 0) AS REAL) / 3600.0 {SHARED} AND s.timestamp >= ?"
+        ))
+        .bind(since)
+        .fetch_one(&self.pool)
+        .await?;
+
+        let artists: Vec<PatchArtist> = sqlx::query_as(&format!(
+            "SELECT s.artist AS name, COUNT(*) AS plays, \
+                    COUNT(DISTINCT s.user_id) AS decks, \
+                    GROUP_CONCAT(DISTINCT (SELECT username FROM users WHERE id = s.user_id)) AS who, \
+                    MAX(s.timestamp) AS last_played, 0 AS mine \
+               {SHARED} AND s.timestamp >= ? \
+            GROUP BY LOWER(TRIM(s.artist)) ORDER BY plays DESC LIMIT 8"
+        ))
+        .bind(since)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let chains: Vec<(String, i64)> = sqlx::query_as(&format!(
+            "SELECT c.name, COUNT(*) AS plays {SHARED} AND s.timestamp >= ? \
+              GROUP BY c.id ORDER BY plays DESC LIMIT 6"
+        ))
+        .bind(since)
+        .fetch_all(&self.pool)
+        .await?;
+
+        // Per day, oldest first, as raw (day, hours) — bucketed here by UTC
+        // day and re-bucketed by the caller's timezone would be wrong, so the
+        // *timestamps* go out and the client draws them. Seven numbers.
+        let daily: Vec<(i64, f64)> = sqlx::query_as(&format!(
+            "SELECT s.timestamp, CAST(COALESCE(s.duration, 0) AS REAL) / 3600.0 \
+               {SHARED} AND s.timestamp >= ?"
+        ))
+        .bind(since)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(InstancePulse {
+            decks,
+            publishing,
+            shared_chains,
+            listens,
+            hours,
+            artists,
+            chains: chains.into_iter().map(|(name, plays)| ChainTally { name, plays }).collect(),
+            daily: daily.into_iter().map(|(at, hours)| DailyHour { at, hours }).collect(),
+        })
+    }
+
+    /// What an admin needs to see about federation.
+    ///
+    /// Deliberately reports **only what is recorded**. The design's Operations
+    /// panel lists signature failures; refusals are logged through `tracing`
+    /// and counted nowhere, and inventing a number for a tile would be worse
+    /// than an empty one — so the screen says where to look instead.
+    pub async fn federation_ops(&self) -> Result<FederationOps, sqlx::Error> {
+        let one = |sql: &'static str| async move {
+            sqlx::query_scalar::<_, i64>(sql).fetch_one(&self.pool).await
+        };
+        Ok(FederationOps {
+            identities: one("SELECT COUNT(*) FROM actors").await?,
+            published: one("SELECT COUNT(*) FROM users WHERE federation_enabled = 1").await?,
+            frozen: one("SELECT COUNT(*) FROM actors WHERE frozen_at IS NOT NULL").await?,
+            remote_actors: one("SELECT COUNT(*) FROM remote_actors").await?,
+            inbox_activities: one("SELECT COUNT(*) FROM inbox_activities").await?,
+            deliveries: one("SELECT COUNT(*) FROM activity_deliveries").await?,
+        })
+    }
+
+    // ── Dubs: a record passed hand to hand ──
+
+    /// Pass a record to someone you are patched with.
+    ///
+    /// **A dub is a crate entry that came from a person, not a second table.**
+    /// It lands on the page they already visit for records they are still
+    /// flipping through, and it is scored the same way — `first_played_at` is
+    /// derived from their listens, so "you suggested 12 records and they played
+    /// 5" falls out with nothing to accumulate.
+    ///
+    /// Two guards, and they are the crate's own:
+    ///
+    /// * **`because` is required.** What in *their* listening prompted this.
+    ///   Without it a dub is free association, which is the thing the crate
+    ///   exists not to be.
+    /// * **A record already in their history is refused, with the play count.**
+    ///   "You already have this" is Rediscovery under another name, and the
+    ///   count is the half that tells the sender something.
+    ///
+    /// The relationship is checked in both directions being *either* — a dub
+    /// travels along a patch, and it is enough that one of you let the other
+    /// in. Dubbing at a stranger would be a way to put text on somebody's
+    /// screen without their consent.
+    pub async fn dub(
+        &self,
+        from_user_id: i64,
+        to_user_id: i64,
+        rec: &NewRecommendation,
+        from_username: &str,
+    ) -> Result<i64, sqlx::Error> {
+        let connected: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM patches
+              WHERE state = 'accepted'
+                AND ((follower_user_id = ? AND target_user_id = ?)
+                  OR (follower_user_id = ? AND target_user_id = ?))",
+        )
+        .bind(from_user_id)
+        .bind(to_user_id)
+        .bind(to_user_id)
+        .bind(from_user_id)
+        .fetch_one(&self.pool)
+        .await?;
+        if connected == 0 {
+            return Err(sqlx::Error::Protocol("not patched with that deck".into()));
+        }
+
+        let now = Self::now_secs();
+        // `fetch_all`, never `fetch_one` — see `create_mcp_connection`.
+        let row: Vec<(i64,)> = sqlx::query_as(
+            "INSERT INTO recommendations
+                (user_id, kind, artist, name, mbid, reason, because, origin,
+                 from_user_id, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
+        )
+        .bind(to_user_id)
+        .bind(&rec.kind)
+        .bind(&rec.artist)
+        .bind(&rec.name)
+        .bind(&rec.mbid)
+        .bind(&rec.reason)
+        .bind(&rec.because)
+        .bind(from_username)
+        .bind(from_user_id)
+        .bind(now)
+        .fetch_all(&self.pool)
+        .await?;
+
+        row.first().map(|r| r.0).ok_or(sqlx::Error::RowNotFound)
+    }
+
+    /// Dubs waiting on this user — crate entries a person put there.
+    ///
+    /// `from_user_id IS NOT NULL` is the whole filter: it is what separates a
+    /// record a friend handed you from one a model suggested, on a page that
+    /// deliberately holds both.
+    pub async fn dubs_for(&self, user_id: i64) -> Result<Vec<Dub>, sqlx::Error> {
+        sqlx::query_as(
+            "SELECT r.id, r.kind, r.artist, r.name, r.reason, r.because, r.status,
+                    r.created_at, u.username AS from_username, u.display_name AS from_display_name
+               FROM recommendations r
+               JOIN users u ON u.id = r.from_user_id
+              WHERE r.user_id = ? AND r.from_user_id IS NOT NULL
+              ORDER BY r.status = 'open' DESC, r.created_at DESC",
+        )
+        .bind(user_id)
+        .fetch_all(&self.pool)
+        .await
+    }
+
+    // ── Shared Spools ──
+
+    /// Open a sitting and invite people to it.
+    ///
+    /// One running spool per host, enforced by a partial unique index rather
+    /// than by this function — so a second start is an error from the database
+    /// rather than a race between two checks.
+    pub async fn start_spool(
+        &self,
+        host_user_id: i64,
+        title: Option<&str>,
+        with: &[i64],
+    ) -> Result<String, sqlx::Error> {
+        let uuid = new_uuid();
+        let now = Self::now_secs();
+        let mut tx = self.pool.begin().await?;
+
+        sqlx::query(
+            "INSERT INTO spools (uuid, host_user_id, title, started_at) VALUES (?, ?, ?, ?)",
+        )
+        .bind(&uuid)
+        .bind(host_user_id)
+        .bind(title)
+        .bind(now)
+        .execute(&mut *tx)
+        .await?;
+
+        let spool_id: i64 = sqlx::query_scalar("SELECT id FROM spools WHERE uuid = ?")
+            .bind(&uuid)
+            .fetch_one(&mut *tx)
+            .await?;
+
+        // The host is a member and is already in the room — everyone else is
+        // invited, because a spool must not start capturing onto somebody's
+        // deck before they have said yes to being in it.
+        sqlx::query(
+            "INSERT INTO spool_members (spool_id, user_id, state, joined_at) VALUES (?, ?, 'joined', ?)",
+        )
+        .bind(spool_id)
+        .bind(host_user_id)
+        .bind(now)
+        .execute(&mut *tx)
+        .await?;
+
+        for &uid in with {
+            if uid == host_user_id {
+                continue;
+            }
+            sqlx::query("INSERT OR IGNORE INTO spool_members (spool_id, user_id) VALUES (?, ?)")
+                .bind(spool_id)
+                .bind(uid)
+                .execute(&mut *tx)
+                .await?;
+        }
+
+        tx.commit().await?;
+        Ok(uuid)
+    }
+
+    /// Join or leave a sitting you were invited to.
+    pub async fn set_spool_membership(
+        &self,
+        uuid: &str,
+        user_id: i64,
+        state: &str,
+    ) -> Result<bool, sqlx::Error> {
+        let res = sqlx::query(
+            "UPDATE spool_members SET state = ?, joined_at = COALESCE(joined_at, ?)
+              WHERE user_id = ?
+                AND spool_id = (SELECT id FROM spools WHERE uuid = ? AND ended_at IS NULL)",
+        )
+        .bind(state)
+        .bind(Self::now_secs())
+        .bind(user_id)
+        .bind(uuid)
+        .execute(&self.pool)
+        .await?;
+        Ok(res.rows_affected() > 0)
+    }
+
+    /// End a sitting. **The host's only.**
+    ///
+    /// Captures already made are untouched: they are offers somebody has not
+    /// answered yet, and ending the room does not withdraw what was played in
+    /// it.
+    pub async fn end_spool(&self, uuid: &str, host_user_id: i64) -> Result<bool, sqlx::Error> {
+        let res = sqlx::query(
+            "UPDATE spools SET ended_at = ? WHERE uuid = ? AND host_user_id = ? AND ended_at IS NULL",
+        )
+        .bind(Self::now_secs())
+        .bind(uuid)
+        .bind(host_user_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(res.rows_affected() > 0)
+    }
+
+    /// The sitting this user is in, if any — hosting or attending.
+    pub async fn active_spool(&self, user_id: i64) -> Result<Option<SpoolView>, sqlx::Error> {
+        let Some(row): Option<(i64, String, i64, Option<String>, i64, String)> = sqlx::query_as(
+            "SELECT sp.id, sp.uuid, sp.host_user_id, sp.title, sp.started_at, m.state
+               FROM spools sp
+               JOIN spool_members m ON m.spool_id = sp.id AND m.user_id = ?
+              WHERE sp.ended_at IS NULL
+              ORDER BY sp.started_at DESC LIMIT 1",
+        )
+        .bind(user_id)
+        .fetch_optional(&self.pool)
+        .await?
+        else {
+            return Ok(None);
+        };
+        let (id, uuid, host_user_id, title, started_at, my_state) = row;
+
+        let members: Vec<SpoolMember> = sqlx::query_as(
+            "SELECT u.id AS user_id, u.username, u.display_name, m.state
+               FROM spool_members m JOIN users u ON u.id = m.user_id
+              WHERE m.spool_id = ? ORDER BY m.state = 'joined' DESC, u.username",
+        )
+        .bind(id)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let captured: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM spool_captures WHERE spool_id = ? AND user_id = ?",
+        )
+        .bind(id)
+        .bind(user_id)
+        .fetch_one(&self.pool)
+        .await?;
+
+        Ok(Some(SpoolView {
+            uuid,
+            title,
+            started_at,
+            host_user_id,
+            hosting: host_user_id == user_id,
+            my_state,
+            members,
+            captured,
+        }))
+    }
+
+    /// Offer a listen to everyone else in the host's running spool.
+    ///
+    /// Called from `save_scrobble` for **live, unskipped** listens only. An
+    /// import must not fan out — twenty thousand rows would put twenty thousand
+    /// offers in somebody's inbox, and a backfill is not a sitting.
+    ///
+    /// **The chain must be shared, exactly as for the Reel.** The other reading
+    /// was considered and rejected: a spool is a bounded event both people
+    /// opted into, so "everyone in the room gets the plays" is defensible and
+    /// is probably what a user expects. But the rule this phase is built on
+    /// says a listen through an unshared chain is *not published, not counted
+    /// and not delivered*, with no per-listen override — and a capture is
+    /// publishing. Allowing it here would mean two ways a listen becomes
+    /// visible while the settings page explains only one, and it would let
+    /// somebody start a sitting and quietly hand over a chain they had
+    /// deliberately kept private.
+    ///
+    /// The consequence is real and has to be surfaced rather than discovered: a
+    /// host with no shared chain captures nothing, and the screen says so.
+    ///
+    /// Cheap when nothing is running: one indexed lookup that returns no rows.
+    async fn capture_into_spool(
+        &self,
+        user_id: i64,
+        play: &Play,
+        chain_id: Option<i64>,
+    ) -> Result<(), sqlx::Error> {
+        // No chain is no sharing — the default has to be exclusion, the same
+        // call `reel` makes by joining rather than left-joining.
+        let Some(chain_id) = chain_id else {
+            return Ok(());
+        };
+        let shared: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM signal_chains WHERE id = ? AND user_id = ? AND shared = 1",
+        )
+        .bind(chain_id)
+        .bind(user_id)
+        .fetch_one(&self.pool)
+        .await?;
+        if shared == 0 {
+            return Ok(());
+        }
+
+        let Some((spool_id, uuid)): Option<(i64, String)> = sqlx::query_as(
+            "SELECT sp.id, sp.uuid FROM spools sp
+               JOIN spool_members m ON m.spool_id = sp.id AND m.user_id = ? AND m.state = 'joined'
+              WHERE sp.ended_at IS NULL LIMIT 1",
+        )
+        .bind(user_id)
+        .fetch_optional(&self.pool)
+        .await?
+        else {
+            return Ok(());
+        };
+
+        // Stamp the host's own listen with the sitting it belonged to. The
+        // other copies get the same uuid when they are accepted, which is what
+        // makes them one joint listen rather than several coincidences.
+        sqlx::query(
+            "UPDATE scrobbles SET joint_session_id = ?
+              WHERE user_id = ? AND source_id = ? AND source_name = ?",
+        )
+        .bind(&uuid)
+        .bind(user_id)
+        .bind(&play.source_id)
+        .bind(&play.source_name)
+        .execute(&self.pool)
+        .await?;
+
+        // Everyone who actually joined. An invitation is not attendance.
+        let others: Vec<i64> = sqlx::query_scalar(
+            "SELECT user_id FROM spool_members
+              WHERE spool_id = ? AND user_id <> ? AND state = 'joined'",
+        )
+        .bind(spool_id)
+        .bind(user_id)
+        .fetch_all(&self.pool)
+        .await?;
+
+        for other in others {
+            sqlx::query(
+                "INSERT OR IGNORE INTO spool_captures
+                    (spool_id, user_id, from_user_id, title, artist, album, duration, played_at)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(spool_id)
+            .bind(other)
+            .bind(user_id)
+            .bind(&play.title)
+            .bind(&play.artist)
+            .bind(&play.album)
+            .bind(play.duration.map(|d| d as i64))
+            .bind(play.timestamp as i64)
+            .execute(&self.pool)
+            .await?;
+        }
+
+        Ok(())
+    }
+
+    /// Captures waiting on this user.
+    pub async fn spool_captures(&self, user_id: i64) -> Result<Vec<SpoolCapture>, sqlx::Error> {
+        sqlx::query_as(
+            "SELECT cap.id, cap.title, cap.artist, cap.album, cap.duration, cap.played_at,
+                    cap.state, u.username AS from_username, u.display_name AS from_display_name,
+                    sp.uuid AS spool_uuid, sp.title AS spool_title
+               FROM spool_captures cap
+               JOIN users u ON u.id = cap.from_user_id
+               JOIN spools sp ON sp.id = cap.spool_id
+              WHERE cap.user_id = ?
+              ORDER BY cap.state = 'pending' DESC, cap.played_at DESC
+              LIMIT 200",
+        )
+        .bind(user_id)
+        .fetch_all(&self.pool)
+        .await
+    }
+
+    /// Accept or decline captures. **This is the only path by which somebody
+    /// else's deck can write a listen into your history**, which is why it is
+    /// per capture and explicit.
+    ///
+    /// Accepting writes a real scrobble carrying the spool's `joint_session_id`
+    /// — the N-rows-one-per-listener shape decided on 2026-08-02. It goes in as
+    /// `imported`, so it is **never forwarded** to Last.fm or ListenBrainz:
+    /// somebody else's deck played it, and pushing it onto your permanent
+    /// public record is a decision this feature has no standing to make on your
+    /// behalf.
+    pub async fn settle_captures(
+        &self,
+        user_id: i64,
+        ids: &[i64],
+        accept: bool,
+    ) -> Result<i64, sqlx::Error> {
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        let placeholders = std::iter::repeat("?").take(ids.len()).collect::<Vec<_>>().join(",");
+
+        let sql = format!(
+            "SELECT cap.id, cap.title, cap.artist, cap.album, cap.duration, cap.played_at,
+                    sp.uuid
+               FROM spool_captures cap JOIN spools sp ON sp.id = cap.spool_id
+              WHERE cap.user_id = ? AND cap.state = 'pending'
+                AND cap.id IN ({placeholders})"
+        );
+        let mut q = sqlx::query_as::<
+            _,
+            (i64, String, String, Option<String>, Option<i64>, i64, String),
+        >(&sql)
+        .bind(user_id);
+        for id in ids {
+            q = q.bind(id);
+        }
+        let rows = q.fetch_all(&self.pool).await?;
+
+        let mut settled = 0;
+        for (id, title, artist, album, duration, played_at, spool_uuid) in rows {
+            if accept {
+                let mut play = Play::new(
+                    title,
+                    artist,
+                    played_at as u64,
+                    format!("spool-{spool_uuid}-{id}"),
+                    "Shared Spool".into(),
+                );
+                play.album = album;
+                play.duration = duration.map(|d| d as u64);
+                // `imported`, so `flush_pending` never picks it up.
+                self.save_scrobble(
+                    user_id,
+                    &play,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some("Shared Spool"),
+                    None,
+                    ListenDisposition { imported: true, skipped: false },
+                )
+                .await?;
+                sqlx::query(
+                    "UPDATE scrobbles SET joint_session_id = ?
+                      WHERE user_id = ? AND source_id = ? AND source_name = 'Shared Spool'",
+                )
+                .bind(&spool_uuid)
+                .bind(user_id)
+                .bind(format!("spool-{spool_uuid}-{id}"))
+                .execute(&self.pool)
+                .await?;
+            }
+            sqlx::query(
+                "UPDATE spool_captures SET state = ?, settled_at = ? WHERE id = ? AND user_id = ?",
+            )
+            .bind(if accept { "accepted" } else { "declined" })
+            .bind(Self::now_secs())
+            .bind(id)
+            .bind(user_id)
+            .execute(&self.pool)
+            .await?;
+            settled += 1;
+        }
+        Ok(settled)
+    }
 }
 
 // ════════════════════════════════════════════════════════════
@@ -13529,6 +14399,168 @@ pub struct ReelListen {
     pub chain_name: String,
     pub chain_icon: Option<String>,
     pub chain_components: Option<String>,
+}
+
+/// An artist seen across the decks a user is patched into.
+#[derive(Debug, FromRow, serde::Serialize)]
+pub struct PatchArtist {
+    pub name: String,
+    pub plays: i64,
+    /// How many decks play them.
+    pub decks: i64,
+    /// Comma-joined usernames, for the little avatar stack on the card.
+    pub who: Option<String>,
+    pub last_played: Option<i64>,
+    /// **The reader's own plays of this artist — the overlap.** Shown as
+    /// *which artists* rather than as a similarity score: a score invites a
+    /// ranking of people, which is not what this is for.
+    pub mine: i64,
+}
+
+/// One chain a deck publishes.
+#[derive(Debug, FromRow, serde::Serialize)]
+pub struct DeckChain {
+    pub name: String,
+    pub icon: Option<String>,
+    pub components: String,
+    pub hours: f64,
+}
+
+/// Somebody else's deck, as the person patched into it may see it.
+#[derive(Debug, serde::Serialize)]
+pub struct DeckView {
+    pub user_id: i64,
+    pub username: String,
+    pub display_name: Option<String>,
+    pub bio: Option<String>,
+    pub avatar_url: Option<String>,
+    pub created_at: i64,
+    /// Listens through their **shared** chains. Not their history.
+    pub listens: i64,
+    pub chains: Vec<DeckChain>,
+    /// Overlap only — no score.
+    pub both_play: Vec<String>,
+    /// Their actor URI, when they have an identity at all. `None` is a normal
+    /// state, because federation is opt-in, and the page says so rather than
+    /// printing endpoints that would 404.
+    pub actor: Option<String>,
+}
+
+/// A deck on the instance, with what the viewer has in common with it.
+#[derive(Debug, FromRow, serde::Serialize)]
+pub struct DiscoverDeck {
+    pub user_id: i64,
+    pub username: String,
+    pub display_name: Option<String>,
+    pub bio: Option<String>,
+    pub avatar_url: Option<String>,
+    pub created_at: i64,
+    pub shared_chains: i64,
+    /// `pending` | `accepted` | `rejected`, or `None` if never asked.
+    pub state: Option<String>,
+    /// Artists you both play, unit-separated. **Computed against their shared
+    /// chains only**, so this cannot become a way to learn what somebody plays
+    /// privately by watching the list change.
+    pub overlap: String,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct ChainTally {
+    pub name: String,
+    pub plays: i64,
+}
+
+/// One listen's contribution to a day's hours. Sent as raw timestamps rather
+/// than pre-bucketed, because the day boundary belongs to the *reader's*
+/// timezone and the server does not know it here.
+#[derive(Debug, serde::Serialize)]
+pub struct DailyHour {
+    pub at: i64,
+    pub hours: f64,
+}
+
+/// What the instance has been playing, over shared chains only.
+#[derive(Debug, serde::Serialize)]
+pub struct InstancePulse {
+    pub decks: i64,
+    /// How many of them publish at least one chain.
+    pub publishing: i64,
+    pub shared_chains: i64,
+    pub listens: i64,
+    pub hours: f64,
+    pub artists: Vec<PatchArtist>,
+    pub chains: Vec<ChainTally>,
+    pub daily: Vec<DailyHour>,
+}
+
+/// The admin Operations panel. Only what is actually recorded.
+#[derive(Debug, serde::Serialize)]
+pub struct FederationOps {
+    pub identities: i64,
+    pub published: i64,
+    pub frozen: i64,
+    pub remote_actors: i64,
+    pub inbox_activities: i64,
+    pub deliveries: i64,
+}
+
+/// A record somebody handed you.
+#[derive(Debug, FromRow, serde::Serialize)]
+pub struct Dub {
+    pub id: i64,
+    pub kind: String,
+    pub artist: String,
+    pub name: Option<String>,
+    pub reason: Option<String>,
+    pub because: Option<String>,
+    pub status: String,
+    pub created_at: i64,
+    pub from_username: String,
+    pub from_display_name: Option<String>,
+}
+
+#[derive(Debug, FromRow, serde::Serialize)]
+pub struct SpoolMember {
+    pub user_id: i64,
+    pub username: String,
+    pub display_name: Option<String>,
+    /// invited | joined | left.
+    pub state: String,
+}
+
+/// A sitting several people are in at once.
+#[derive(Debug, serde::Serialize)]
+pub struct SpoolView {
+    pub uuid: String,
+    pub title: Option<String>,
+    pub started_at: i64,
+    pub host_user_id: i64,
+    pub hosting: bool,
+    /// The *caller's* membership: `invited` until they join.
+    pub my_state: String,
+    pub members: Vec<SpoolMember>,
+    /// How many offers this sitting has put in the caller's inbox.
+    pub captured: i64,
+}
+
+/// A play from somebody else's deck, waiting to be accepted.
+///
+/// **Not a listen.** It enters no history, no count and no chart until its
+/// owner says yes — which is why it lives in its own table rather than in
+/// `scrobbles` behind a flag.
+#[derive(Debug, FromRow, serde::Serialize)]
+pub struct SpoolCapture {
+    pub id: i64,
+    pub title: String,
+    pub artist: String,
+    pub album: Option<String>,
+    pub duration: Option<i64>,
+    pub played_at: i64,
+    pub state: String,
+    pub from_username: String,
+    pub from_display_name: Option<String>,
+    pub spool_uuid: String,
+    pub spool_title: Option<String>,
 }
 
 /// Somebody else's actor, as we last fetched it.
@@ -18624,6 +19656,346 @@ mod tests {
             missing.len(),
             missing
         );
+    }
+
+    // ── Patch: Step 3 ────────────────────────────────────────
+
+    /// Two decks, patched, with one shared chain each.
+    async fn patched_pair(db: &Database) -> (i64, i64, i64) {
+        let me = db.create_user("ash", None, "pw", "user").await.unwrap();
+        let them = db.create_user("kim", None, "pw", "user").await.unwrap();
+        let chain = sqlx::query_scalar::<_, i64>(
+            "INSERT INTO signal_chains (user_id, name, created_at) VALUES (?, 'Study', ?) RETURNING id",
+        )
+        .bind(them)
+        .bind(Database::now_secs())
+        .fetch_all(&db.pool)
+        .await
+        .unwrap()[0];
+        db.set_chain_shared(them, chain, true).await.unwrap();
+        let uuid = db.request_patch(me, them).await.unwrap();
+        db.settle_patch(&uuid, them, true).await.unwrap();
+        (me, them, chain)
+    }
+
+    async fn listen(
+        db: &Database,
+        uid: i64,
+        chain: Option<i64>,
+        title: &str,
+        artist: &str,
+        ts: u64,
+    ) {
+        let p = Play::new(title.into(), artist.into(), ts, format!("s-{uid}-{ts}"), "test".into());
+        db.save_scrobble(
+            uid,
+            &p,
+            None,
+            None,
+            chain,
+            None,
+            None,
+            None,
+            None,
+            ListenDisposition::LIVE,
+        )
+        .await
+        .unwrap();
+    }
+
+    /// The Artists tab, and the thing that makes it worth opening: the overlap
+    /// is reported as *your own plays of that artist*, not as a score.
+    #[tokio::test]
+    async fn the_artists_tab_shows_overlap_rather_than_a_score() {
+        let db = testdb().await;
+        let (me, them, chain) = patched_pair(&db).await;
+
+        listen(&db, them, Some(chain), "Teardrop", "Massive Attack", 1_760_000_100).await;
+        listen(&db, them, Some(chain), "Angel", "Massive Attack", 1_760_000_200).await;
+        listen(&db, them, Some(chain), "Hallogallo", "Neu!", 1_760_000_300).await;
+        // My own history — never published, only counted as overlap.
+        listen(&db, me, None, "Risingson", "Massive Attack", 1_760_000_400).await;
+
+        let artists = db.patch_artists(me, 20).await.unwrap();
+        let ma = artists.iter().find(|a| a.name == "Massive Attack").expect("massive attack");
+        assert_eq!(ma.plays, 2, "their plays through a shared chain");
+        assert_eq!(ma.mine, 1, "and mine, which is the overlap");
+        assert_eq!(ma.decks, 1);
+        assert_eq!(ma.who.as_deref(), Some("kim"));
+
+        let neu = artists.iter().find(|a| a.name == "Neu!").expect("neu");
+        assert_eq!(neu.mine, 0, "an artist only they play still appears, with no overlap");
+    }
+
+    /// Every Step 3 reader narrows exactly like the Reel. A listen through an
+    /// unshared chain, one with no chain, and a skip are invisible to all of
+    /// them — and that has to be asserted on the *readouts*, because a filter
+    /// omitted from one query is the shape this codebase keeps finding.
+    #[tokio::test]
+    async fn nothing_unshared_reaches_any_of_the_step_three_screens() {
+        let db = testdb().await;
+        let (me, them, chain) = patched_pair(&db).await;
+
+        let private = sqlx::query_scalar::<_, i64>(
+            "INSERT INTO signal_chains (user_id, name, created_at) VALUES (?, 'Bedroom', ?) RETURNING id",
+        )
+        .bind(them)
+        .bind(Database::now_secs())
+        .fetch_all(&db.pool)
+        .await
+        .unwrap()[0];
+
+        listen(&db, them, Some(chain), "Shared", "Public Artist", 1_760_000_100).await;
+        listen(&db, them, Some(private), "Hidden", "Private Artist", 1_760_000_200).await;
+        listen(&db, them, None, "Orphan", "Chainless Artist", 1_760_000_300).await;
+        let skip = Play::new(
+            "Bailed".into(),
+            "Skipped Artist".into(),
+            1_760_000_400,
+            "sk-1".into(),
+            "test".into(),
+        );
+        db.save_scrobble(
+            them,
+            &skip,
+            None,
+            None,
+            Some(chain),
+            None,
+            None,
+            None,
+            None,
+            ListenDisposition { imported: false, skipped: true },
+        )
+        .await
+        .unwrap();
+
+        let names: Vec<String> =
+            db.patch_artists(me, 50).await.unwrap().into_iter().map(|a| a.name).collect();
+        assert_eq!(names, ["Public Artist"], "artists tab");
+
+        let deck = db.deck_view(me, "kim").await.unwrap().expect("the deck");
+        assert_eq!(deck.listens, 1, "deck page counts only shared listens");
+        assert_eq!(deck.chains.len(), 1, "and lists only shared chains");
+        assert_eq!(deck.chains[0].name, "Study");
+
+        let pulse = db.instance_pulse(0).await.unwrap();
+        let pulse_names: Vec<String> = pulse.artists.iter().map(|a| a.name.clone()).collect();
+        assert_eq!(pulse_names, ["Public Artist"], "instance figures");
+        assert_eq!(pulse.listens, 1);
+    }
+
+    /// A deck page is readable only through an accepted patch, and the check
+    /// is in the query rather than the handler.
+    #[tokio::test]
+    async fn a_deck_page_needs_an_accepted_patch() {
+        let db = testdb().await;
+        let (me, them, _) = patched_pair(&db).await;
+        let stranger = db.create_user("sam", None, "pw", "user").await.unwrap();
+
+        assert!(db.deck_view(me, "kim").await.unwrap().is_some());
+        assert!(db.deck_view(stranger, "kim").await.unwrap().is_none(), "no patch, no page");
+
+        // Withdrawing closes it again.
+        db.unpatch(me, them).await.unwrap();
+        assert!(db.deck_view(me, "kim").await.unwrap().is_none());
+    }
+
+    /// A dub is a crate row that came from a person, and it carries the two
+    /// guards the crate already has.
+    #[tokio::test]
+    async fn a_dub_travels_along_a_patch_and_keeps_the_crate_s_guards() {
+        let db = testdb().await;
+        let (me, them, _) = patched_pair(&db).await;
+        let stranger = db.create_user("sam", None, "pw", "user").await.unwrap();
+
+        let rec = NewRecommendation {
+            kind: "album".into(),
+            artist: "Talk Talk".into(),
+            name: Some("Laughing Stock".into()),
+            mbid: None,
+            reason: Some("the one to start with".into()),
+            because: Some("you play a lot of Bark Psychosis".into()),
+        };
+
+        // Not patched with a stranger.
+        assert!(db.dub(them, stranger, &rec, "kim").await.is_err());
+
+        // Along the patch, either direction.
+        let id = db.dub(them, me, &rec, "kim").await.unwrap();
+        assert!(id > 0);
+
+        let dubs = db.dubs_for(me).await.unwrap();
+        assert_eq!(dubs.len(), 1);
+        assert_eq!(dubs[0].from_username, "kim");
+        assert_eq!(dubs[0].artist, "Talk Talk");
+        assert_eq!(dubs[0].because.as_deref(), Some("you play a lot of Bark Psychosis"));
+
+        // It is a crate row, on the page they already visit — not a second
+        // table and not a second page.
+        let crate_rows = db.list_crate(me).await.unwrap();
+        assert_eq!(crate_rows.len(), 1);
+        assert_eq!(crate_rows[0].rec.artist, "Talk Talk");
+
+        // And a model suggestion is still distinguishable from a person's.
+        assert!(db.dubs_for(them).await.unwrap().is_empty());
+    }
+
+    /// The whole sitting: start, join, play, offer, accept.
+    ///
+    /// **Nothing enters a history until it is accepted** — the rule that makes
+    /// captures a separate table rather than rows in `scrobbles` behind a flag.
+    #[tokio::test]
+    async fn a_spool_offers_plays_and_nothing_lands_until_it_is_accepted() {
+        let db = testdb().await;
+        let (me, them, chain) = patched_pair(&db).await;
+
+        let spool = db.start_spool(them, Some("Sunday listening"), &[me]).await.unwrap();
+
+        // Invited, not joined: a sitting must not write onto somebody's deck
+        // before they have said they are in it.
+        listen(&db, them, Some(chain), "Before", "Massive Attack", 1_760_000_100).await;
+        assert!(db.spool_captures(me).await.unwrap().is_empty(), "an invitation is not attendance");
+
+        assert!(db.set_spool_membership(&spool, me, "joined").await.unwrap());
+        listen(&db, them, Some(chain), "During", "Massive Attack", 1_760_000_200).await;
+
+        let caps = db.spool_captures(me).await.unwrap();
+        assert_eq!(caps.len(), 1);
+        assert_eq!(caps[0].title, "During");
+        assert_eq!(caps[0].from_username, "kim");
+        assert_eq!(caps[0].state, "pending");
+
+        // Still nothing in my history.
+        let mine: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM scrobbles WHERE user_id = ?")
+            .bind(me)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(mine, 0, "a capture is an offer, not a listen");
+
+        assert_eq!(db.settle_captures(me, &[caps[0].id], true).await.unwrap(), 1);
+
+        let landed: Vec<(String, String, Option<String>)> = sqlx::query_as(
+            "SELECT title, status, joint_session_id FROM scrobbles WHERE user_id = ?",
+        )
+        .bind(me)
+        .fetch_all(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(landed.len(), 1);
+        assert_eq!(landed[0].0, "During");
+        assert_eq!(
+            landed[0].1, "imported",
+            "somebody else's deck played it — it must never be forwarded to a public record"
+        );
+        assert_eq!(
+            landed[0].2.as_deref(),
+            Some(spool.as_str()),
+            "N rows sharing one joint_session_id is what makes it a joint listen"
+        );
+
+        // The host's own copy carries the same sitting.
+        let hosts: Option<String> = sqlx::query_scalar(
+            "SELECT joint_session_id FROM scrobbles WHERE user_id = ? AND title = 'During'",
+        )
+        .bind(them)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(hosts.as_deref(), Some(spool.as_str()));
+
+        // Settling twice does nothing, and declining leaves no listen.
+        assert_eq!(db.settle_captures(me, &[caps[0].id], true).await.unwrap(), 0);
+    }
+
+    /// An import must not fan out. A backfill is not a sitting, and twenty
+    /// thousand rows would become twenty thousand offers.
+    #[tokio::test]
+    async fn an_import_and_a_skip_are_never_captured() {
+        let db = testdb().await;
+        let (me, them, chain) = patched_pair(&db).await;
+        let spool = db.start_spool(them, None, &[me]).await.unwrap();
+        db.set_spool_membership(&spool, me, "joined").await.unwrap();
+
+        for (i, disp) in [
+            ListenDisposition { imported: true, skipped: false },
+            ListenDisposition { imported: false, skipped: true },
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let p = Play::new(
+                format!("T{i}"),
+                "Massive Attack".into(),
+                1_760_000_100 + i as u64,
+                format!("x-{i}"),
+                "test".into(),
+            );
+            db.save_scrobble(them, &p, None, None, Some(chain), None, None, None, None, disp)
+                .await
+                .unwrap();
+        }
+
+        assert!(
+            db.spool_captures(me).await.unwrap().is_empty(),
+            "neither an imported listen nor a skip is offered to the room"
+        );
+    }
+
+    /// **A sitting does not bypass the sharing switch.**
+    ///
+    /// The other reading is defensible — a spool is a bounded event both people
+    /// opted into — and it was rejected: the rule this phase rests on is that a
+    /// listen through an unshared chain is not published, not counted and not
+    /// delivered, with no per-listen override. A capture is publishing, and
+    /// allowing it here would let somebody start a sitting and hand over a
+    /// chain they had deliberately kept private.
+    #[tokio::test]
+    async fn a_sitting_captures_only_from_shared_chains() {
+        let db = testdb().await;
+        let (me, them, shared) = patched_pair(&db).await;
+        let private = sqlx::query_scalar::<_, i64>(
+            "INSERT INTO signal_chains (user_id, name, created_at) VALUES (?, 'Bedroom', ?) RETURNING id",
+        )
+        .bind(them)
+        .bind(Database::now_secs())
+        .fetch_all(&db.pool)
+        .await
+        .unwrap()[0];
+
+        let spool = db.start_spool(them, None, &[me]).await.unwrap();
+        db.set_spool_membership(&spool, me, "joined").await.unwrap();
+
+        listen(&db, them, Some(private), "Private", "Talk Talk", 1_760_000_100).await;
+        listen(&db, them, None, "Chainless", "Talk Talk", 1_760_000_200).await;
+        listen(&db, them, Some(shared), "Shared", "Talk Talk", 1_760_000_300).await;
+
+        let titles: Vec<String> =
+            db.spool_captures(me).await.unwrap().into_iter().map(|c| c.title).collect();
+        assert_eq!(
+            titles,
+            ["Shared"],
+            "an unshared chain and a chainless listen are not offered to the room either"
+        );
+    }
+
+    /// One running sitting per host, enforced by the index rather than by a
+    /// check somebody could race.
+    #[tokio::test]
+    async fn a_deck_hosts_one_sitting_at_a_time() {
+        let db = testdb().await;
+        let (me, them, _) = patched_pair(&db).await;
+
+        let first = db.start_spool(them, Some("One"), &[me]).await.unwrap();
+        assert!(db.start_spool(them, Some("Two"), &[me]).await.is_err(), "two rooms at once");
+
+        assert!(db.end_spool(&first, me).await.unwrap() == false, "only the host may end it");
+        assert!(db.end_spool(&first, them).await.unwrap());
+        assert!(db.active_spool(them).await.unwrap().is_none());
+
+        // And now a second one is fine.
+        assert!(db.start_spool(them, Some("Two"), &[me]).await.is_ok());
     }
 
     /// Opening a database that an *older* Tapedeck wrote.

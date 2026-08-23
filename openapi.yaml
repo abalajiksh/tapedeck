@@ -26,7 +26,7 @@ openapi: 3.1.0
 
 info:
   title: Tapedeck
-  version: 0.79.0
+  version: 0.80.0
   summary: Self-hosted scrobbler and listening journal.
   description: |
     Tapedeck ingests listens, enriches them with MusicBrainz metadata, stores
@@ -2733,6 +2733,296 @@ paths:
         '400': { description: '`shared` was absent.' }
         '401': { description: Not signed in. }
         '404': { description: No such chain of yours. }
+
+  /api/v1/patch/artists:
+    get:
+      tags: [Patch]
+      summary: Artists across the decks you've patched into.
+      description: |
+        Narrowed exactly like the Reel — accepted patch, shared chain, the
+        listen has a chain, no skips — because `Database::SHARED_LISTENS` is one
+        fragment every Patch reader shares. A filter omitted from one of them is
+        the shape this codebase keeps finding.
+
+        `mine` is your own plays of that artist: **the overlap is reported as
+        which artists, never as a similarity score.** A score invites a ranking
+        of people, which is not what this is for.
+      security: [{ sessionCookie: [] }]
+      responses:
+        '200':
+          description: Artists with plays, decks, who, and your own overlap.
+          content:
+            application/json:
+              schema: { type: object, additionalProperties: true }
+        '401': { description: Not signed in. Tokens are not accepted here at all. }
+
+  /api/v1/patch/discover:
+    get:
+      tags: [Patch]
+      summary: Everyone on the instance, and what you have in common.
+      description: |
+        `overlap` is artists you both play, unit-separated (`\x1f`), and it is
+        computed against **their shared chains only** — so this cannot become a
+        way to learn what somebody plays privately by watching the list change.
+
+        `state` is your patch with them (`pending` / `accepted` / `rejected`) or
+        null if you have never asked.
+      security: [{ sessionCookie: [] }]
+      responses:
+        '200':
+          description: Decks, newest first.
+          content:
+            application/json:
+              schema: { type: object, additionalProperties: true }
+        '401': { description: Not signed in. }
+
+  /api/v1/patch/instance:
+    get:
+      tags: [Patch]
+      summary: What this instance has been playing.
+      description: |
+        Over **shared chains only**, across all decks — and deliberately *not*
+        narrowed by your own patches: the Reel answers "what have the decks I
+        follow played", this answers "what is this instance listening to", which
+        is a fact about the people who chose to publish a chain and reads the
+        same for everyone.
+
+        A considered reversal of the Reports rule that there is no cross-user
+        figure. That rule existed to stop the instance exposing how much other
+        members play without their consent; a per-chain opt-in **is** that
+        consent. It stays inside the instance.
+
+        `daily` is raw `(timestamp, hours)` pairs rather than pre-bucketed days,
+        because the day boundary belongs to the reader's timezone and the server
+        does not know it here.
+      security: [{ sessionCookie: [] }]
+      parameters:
+        - name: days
+          in: query
+          schema: { type: integer, default: 7, minimum: 1, maximum: 365 }
+      responses:
+        '200':
+          description: Decks, listens, hours, top artists, chains and daily hours.
+          content:
+            application/json:
+              schema: { type: object, additionalProperties: true }
+        '401': { description: Not signed in. }
+
+  /api/v1/patch/ops:
+    get:
+      tags: [Patch]
+      summary: The federation Operations panel. Admin only.
+      description: |
+        Reports **only what is recorded**: identities minted, accounts
+        published, usernames frozen, remote actors cached, inbox activities
+        received, deliveries attempted.
+
+        Signature refusals are logged through `tracing` and counted nowhere, so
+        there is no tile for them — an invented number would be worse than an
+        honest absence, and the screen says where to look instead.
+
+        `vocabulary` is read-only. The design offers a picker with a Freeze
+        control; three vocabularies would mean three things to maintain and a
+        migration path between them for a decision made once, so the verb is
+        compiled in and this only reports it.
+      security: [{ sessionCookie: [] }]
+      responses:
+        '200':
+          description: Counters, the frozen vocabulary, and whether delivery is on.
+          content:
+            application/json:
+              schema: { type: object, additionalProperties: true }
+        '401': { description: Not signed in. }
+        '403': { description: Not an admin. }
+
+  /api/v1/patch/dub:
+    post:
+      tags: [Patch]
+      summary: Pass a record to someone.
+      description: |
+        **A dub is a crate entry that came from a person** — not a second table
+        and not a second page. It lands on the Crate, which is the page they
+        already visit for records they are still flipping through, and it is
+        scored the same way: `first_played_at` is derived from their listens, so
+        "you dubbed 12 and they played 5" falls out with nothing accumulated.
+
+        Three guards, two of them the Crate's own:
+
+        * **You must be patched with them**, in either direction. Dubbing at a
+          stranger would be a way to put text on somebody's screen without their
+          consent.
+        * **`because` is required** — what in *their* listening prompted this. A
+          suggestion with no grounding is free association.
+        * **A record already in their history is refused**, with the play count.
+          "You already have this" is Rediscovery under another name, and the
+          count is the half that tells the sender something.
+      security: [{ sessionCookie: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [to, kind, artist, because]
+              properties:
+                to: { type: string }
+                kind: { type: string, enum: [artist, album, track] }
+                artist: { type: string }
+                name: { type: string, nullable: true }
+                mbid: { type: string, nullable: true }
+                reason: { type: string, nullable: true }
+                because: { type: string }
+      responses:
+        '200': { description: Filed in their crate. }
+        '400': { description: Missing `because`, a bad `kind`, or dubbing to yourself. }
+        '401': { description: Not signed in. }
+        '403': { description: You are not patched with that deck. }
+        '404': { description: No such deck on this instance. }
+        '409': { description: They already have it. The message carries the play count. }
+
+  /api/v1/patch/dubs:
+    get:
+      tags: [Patch]
+      summary: Records people handed you.
+      description: |
+        Crate entries whose origin is a person rather than a model —
+        `from_user_id IS NOT NULL` is the whole filter, on a page that
+        deliberately holds both kinds.
+      security: [{ sessionCookie: [] }]
+      responses:
+        '200':
+          description: Dubs, open ones first.
+          content:
+            application/json:
+              schema: { type: object, additionalProperties: true }
+        '401': { description: Not signed in. }
+
+  /api/v1/patch/spool:
+    get:
+      tags: [Patch]
+      summary: The sitting you are in, and what it has offered you.
+      description: |
+        `spool` is null when you are not in one. `captures` are plays from other
+        people's decks waiting on you — **they are not listens**, and enter no
+        history, count or chart until accepted.
+      security: [{ sessionCookie: [] }]
+      responses:
+        '200':
+          description: The sitting and its captures.
+          content:
+            application/json:
+              schema: { type: object, additionalProperties: true }
+        '401': { description: Not signed in. }
+    post:
+      tags: [Patch]
+      summary: Open a Shared Spool.
+      description: |
+        A sitting several people are in at once. You are in it immediately;
+        everyone named in `with` is **invited**, and an invitation is not
+        attendance — nothing is captured onto their deck until they join.
+
+        One running sitting per host, enforced by a partial unique index rather
+        than by a check this handler could race, so a second start is a 409.
+      security: [{ sessionCookie: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                title: { type: string, nullable: true }
+                with:
+                  type: array
+                  items: { type: string }
+                  description: Usernames to invite.
+      responses:
+        '200': { description: The sitting's uuid. }
+        '401': { description: Not signed in. }
+        '404': { description: One of the named decks does not exist. }
+        '409': { description: You already have a sitting running. }
+
+  /api/v1/patch/spool/{uuid}/join:
+    post:
+      tags: [Patch]
+      summary: Accept an invitation to a sitting, or leave one.
+      description: |
+        `accept: true` joins, `false` leaves. Required — an absent field is a
+        400, never a default, because joining is what starts plays being
+        captured onto your deck.
+      security: [{ sessionCookie: [] }]
+      parameters:
+        - name: uuid
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [accept]
+              properties:
+                accept: { type: boolean }
+      responses:
+        '200': { description: Your membership as it now stands. }
+        '400': { description: '`accept` was absent.' }
+        '401': { description: Not signed in. }
+        '404': { description: No running sitting you were invited to with that id. }
+
+  /api/v1/patch/spool/{uuid}/end:
+    post:
+      tags: [Patch]
+      summary: Close a sitting. The host's only.
+      description: |
+        Captures already made are untouched — they are offers nobody has
+        answered yet, and ending the room does not withdraw what was played in
+        it.
+      security: [{ sessionCookie: [] }]
+      parameters:
+        - name: uuid
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200': { description: Ended. }
+        '401': { description: Not signed in. }
+        '404': { description: No running sitting of yours with that id. }
+
+  /api/v1/patch/captures:
+    post:
+      tags: [Patch]
+      summary: Accept or decline plays a sitting captured for you.
+      description: |
+        **The only path by which another deck can write a listen into your
+        history**, which is why it is explicit and per capture rather than a
+        standing setting.
+
+        Accepted plays land carrying the sitting's `joint_session_id` — the
+        N-rows-one-per-listener shape decided on 2026-08-02 — and land as
+        `imported`, so they are **never forwarded** to Last.fm or ListenBrainz.
+        Somebody else's deck played it, and putting it on your permanent public
+        record is not a decision this feature has standing to make for you.
+
+        Both `ids` and `accept` are required.
+      security: [{ sessionCookie: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [ids, accept]
+              properties:
+                ids:
+                  type: array
+                  items: { type: integer }
+                accept: { type: boolean }
+      responses:
+        '200': { description: How many were settled. }
+        '400': { description: '`ids` or `accept` was absent.' }
+        '401': { description: Not signed in. }
 
   /api/v1/patch/reel:
     get:
