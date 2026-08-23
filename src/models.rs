@@ -432,6 +432,16 @@ pub struct SignalChain {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub icon: Option<String>,
     pub is_active: bool,
+    /// Whether listens through this chain reach the Reel of anyone patched into
+    /// its owner.
+    ///
+    /// **The sharing unit is the chain, and this is the only switch there is.**
+    /// There is no per-listen visibility and there should not be one: it makes
+    /// "what am I publishing?" answerable by looking at a list of chains you
+    /// already understand, and it makes the decision a standing one about *how
+    /// you listen* rather than a choice to make per play.
+    #[serde(default)]
+    pub shared: bool,
     pub total_hours: f64,
     pub created_at: i64,
 }

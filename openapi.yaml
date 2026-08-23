@@ -26,7 +26,7 @@ openapi: 3.1.0
 
 info:
   title: Tapedeck
-  version: 0.78.0
+  version: 0.79.0
   summary: Self-hosted scrobbler and listening journal.
   description: |
     Tapedeck ingests listens, enriches them with MusicBrainz metadata, stores
@@ -2464,6 +2464,56 @@ paths:
         '404':
           description: No such user, or not discoverable. Identical answers.
 
+  /users/{name}/followers:
+    get:
+      tags: [Patch]
+      summary: How many decks have patched into this one.
+      description: |
+        **The count, not the roster.** ActivityStreams allows a collection to
+        state its size without enumerating it, and that is the right default
+        here: who somebody has accepted is a fact about *other people*, and this
+        endpoint answers to anyone at all. Remote software uses `totalItems`;
+        the list is what would leak the shape of a household.
+
+        Served — and therefore advertised in the actor document — as of Step 2.
+        It was deliberately absent before that, because advertising an endpoint
+        that 404s is worse than not having one.
+      security: []
+      parameters:
+        - name: name
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: An OrderedCollection carrying `totalItems` and no items.
+          content:
+            application/activity+json:
+              schema: { type: object, additionalProperties: true }
+        '404':
+          description: No such user, or not discoverable. Identical answers.
+
+  /users/{name}/following:
+    get:
+      tags: [Patch]
+      summary: How many decks this one has patched into.
+      description: |
+        The mirror of `/followers`, and the same rule: `totalItems` only.
+      security: []
+      parameters:
+        - name: name
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: An OrderedCollection carrying `totalItems` and no items.
+          content:
+            application/activity+json:
+              schema: { type: object, additionalProperties: true }
+        '404':
+          description: No such user, or not discoverable. Identical answers.
+
   /.well-known/webfinger:
     get:
       tags: [Patch]
@@ -2501,6 +2551,226 @@ paths:
         '404':
           description: |
             Another host, or somebody we do not publish. Identical answers.
+
+  # ── Patch: patches, the inbox and the Reel ─────────────────────────────────
+  #
+  # Local-only: both ends of every patch here are rows in `users`, so no
+  # signature is involved and nothing is delivered outbound. Session-only, all
+  # of it — a token is held by a scrobble client, and no scrobble client has
+  # business approving who may read its owner's listening.
+  /api/v1/patch/decks:
+    get:
+      tags: [Patch]
+      summary: Everyone on the instance, and where you stand with them.
+      description: |
+        Returns `decks` (everyone but you, and not disabled), `following` (the
+        patches you have made or asked for) and `followers` (the ones pointed at
+        you, pending and settled).
+
+        One call rather than three, because the screen shows one list of people
+        with a different button each — patched, pending, or not asked. Splitting
+        it would have the client stitch three lists back together and invent the
+        states in between. A peer with a null `uuid` and `state` is one nobody
+        has asked about.
+
+        `shared_chains` is how many chains that person publishes. **Zero is the
+        interesting case**: a patch into a deck sharing nothing is accepted and
+        reads empty, which is correct and needs saying on screen rather than
+        looking broken.
+      security: [{ sessionCookie: [] }]
+      responses:
+        '200':
+          description: The three lists.
+          content:
+            application/json:
+              schema: { type: object, additionalProperties: true }
+        '401': { description: Not signed in. Tokens are not accepted here at all. }
+
+  /api/v1/patch:
+    post:
+      tags: [Patch]
+      summary: Ask to patch into a deck.
+      description: |
+        **A patch is a request, not a subscription.** It lands `pending` and
+        appears in the target's inbox; nothing is shared until they say yes.
+
+        Idempotent in the direction that matters: asking twice does not mint a
+        second edge, and asking again does **not** disturb a patch that has
+        already been accepted. Asking again after a rejection *does* reopen it —
+        a rejection is not a block, and this design has no block yet.
+
+        Not gated on the target having switched federation on: that switch is
+        about the wider fediverse, and members of a private invite-only instance
+        already know each other exist. What protects a deck here is that the
+        patch needs approval and that a chain publishes nothing until its owner
+        shares it.
+      security: [{ sessionCookie: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [username]
+              properties:
+                username: { type: string }
+      responses:
+        '200':
+          description: The patch's `uuid` and its `state` as it now stands.
+          content:
+            application/json:
+              schema: { type: object, additionalProperties: true }
+        '400': { description: A deck cannot patch into itself. }
+        '401': { description: Not signed in. }
+        '404': { description: No such deck on this instance. }
+
+  /api/v1/patch/requests/{uuid}/settle:
+    post:
+      tags: [Patch]
+      summary: Say yes or no to a patch request.
+      description: |
+        Only the **target** of a patch may settle it, and that check lives in
+        the query's `WHERE` rather than in the handler — this is the one
+        operation that widens who may read somebody's listening, and an
+        authorisation check that lives in a handler is one a second handler can
+        forget.
+
+        A patch that is not yours, one that does not exist, and one already
+        settled are the same 404 on purpose: anything else would confirm that a
+        given patch id is real to somebody it does not concern.
+
+        Accepting **freezes the target's username** — from that point the
+        identity is load-bearing for another party, and a rename would be a
+        deletion and a stranger rather than a rename.
+
+        `accept` is required. A body that merely misspelled the key must not be
+        read as an answer, and here the two answers are "let them read my
+        listening" and "no".
+      security: [{ sessionCookie: [] }]
+      parameters:
+        - name: uuid
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [accept]
+              properties:
+                accept: { type: boolean }
+      responses:
+        '200':
+          description: The new state, `accepted` or `rejected`.
+          content:
+            application/json:
+              schema: { type: object, additionalProperties: true }
+        '400': { description: '`accept` was absent.' }
+        '401': { description: Not signed in. }
+        '404': { description: No patch request waiting on you with that id. }
+
+  /api/v1/patch/deck/{username}:
+    delete:
+      tags: [Patch]
+      summary: Stop patching into a deck.
+      description: |
+        The follower's own operation. Takes a username rather than the patch's
+        uuid, because that is what the row on the screen knows.
+
+        **No sweep of anything already delivered**, deliberately: those listens
+        were shared at the time under a switch their owner set, and a
+        retroactive sweep would promise an unpatching that the protocol cannot
+        actually deliver.
+      security: [{ sessionCookie: [] }]
+      parameters:
+        - name: username
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200': { description: Unpatched. }
+        '401': { description: Not signed in. }
+        '404': { description: No such deck, or you were not patched into it. }
+
+  /api/v1/patch/chains/{id}/shared:
+    put:
+      tags: [Patch]
+      summary: Publish a signal chain to the people patched into you, or stop.
+      description: |
+        **The sharing unit is the chain, and this is the only switch there is.**
+        A listen reaches the Reel because the chain it ran through was switched
+        on by its owner — there is no per-listen override and there should not
+        be one. It makes "what am I publishing?" answerable by looking at a list
+        of chains you already understand, and it makes the decision a standing
+        one about *how you listen* rather than a choice to make per play.
+
+        Off for every chain by default, including every chain that predates the
+        column.
+
+        The Signal Chains page calls this same endpoint, which is what makes
+        "one state, two places" true rather than aspirational.
+
+        `shared` is required; an absent field is a 400, never a default.
+      security: [{ sessionCookie: [] }]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: integer }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [shared]
+              properties:
+                shared: { type: boolean }
+      responses:
+        '200': { description: The switch as it now stands. }
+        '400': { description: '`shared` was absent.' }
+        '401': { description: Not signed in. }
+        '404': { description: No such chain of yours. }
+
+  /api/v1/patch/reel:
+    get:
+      tags: [Patch]
+      summary: What the decks you patched into have been playing.
+      description: |
+        **The one read in this application that returns another user's
+        listens**, and every narrowing is in the query rather than the handler:
+        the patch must be `accepted`, the listen's chain must be `shared`, the
+        listen must have a chain at all, and skips are excluded.
+
+        A listen with no chain is never shared — nobody switched anything on for
+        it, so the default is exclusion.
+
+        Paged by keyset on `before`, not by offset: the Reel grows from the top
+        while it is being read, and an offset would repeat or skip rows as it
+        shifted underneath. `next` is null when the page was short.
+
+        Rows carry the chain — its name, icon and components — because that is
+        what makes a Tapedeck listen a Tapedeck listen rather than a sentence.
+        They deliberately do not carry the source id, the delivery state or the
+        session, which are nobody else's business.
+      security: [{ sessionCookie: [] }]
+      parameters:
+        - name: limit
+          in: query
+          schema: { type: integer, default: 40, maximum: 200 }
+        - name: before
+          in: query
+          description: Unix seconds; return listens older than this.
+          schema: { type: integer }
+      responses:
+        '200':
+          description: '`listens` and a `next` cursor.'
+          content:
+            application/json:
+              schema: { type: object, additionalProperties: true }
+        '401': { description: Not signed in. Tokens are not accepted here at all. }
 
   # ── Statistics ─────────────────────────────────────────────────────────────
   /api/v1/stats/dashboard:

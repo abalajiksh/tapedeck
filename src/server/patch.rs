@@ -64,8 +64,279 @@ pub fn create_patch_router() -> Router<Arc<AppState>> {
         // Registered `post` only, so a GET here is a 405 from axum rather than
         // something this file has to remember to write.
         .route("/users/:name/inbox", post(inbox))
+        .route("/users/:name/followers", get(followers))
+        .route("/users/:name/following", get(following))
         .route("/.well-known/webfinger", get(webfinger))
         .route("/api/v1/profile/federation", get(get_federation).put(put_federation))
+        // Step 2 — local Patch. Session-only, all of it.
+        .route("/api/v1/patch/decks", get(decks))
+        .route("/api/v1/patch/reel", get(reel))
+        .route("/api/v1/patch", post(request))
+        // `requests/:uuid` rather than `:uuid`, so every route under
+        // `/api/v1/patch/` has a **literal** fourth segment. A parameter there
+        // would sit beside `decks`, `reel` and `chains`, and matchit resolves
+        // that ambiguity by its own rules rather than by anything obvious from
+        // reading this list.
+        .route("/api/v1/patch/requests/:uuid/settle", post(settle))
+        .route("/api/v1/patch/chains/:id/shared", axum::routing::put(set_shared))
+        .route("/api/v1/patch/deck/:username", axum::routing::delete(withdraw))
+}
+
+// ── Step 2: patches, the inbox, and the Reel ─────────────────
+//
+// Local-only. Both ends of every patch here are rows in `users`, so no
+// signature is involved and nothing is delivered — the remote half arrives with
+// outbound delivery in Step 3, and `patches` already has the columns for it.
+//
+// **Session-only, all of it.** A token is held by a scrobble client, and no
+// scrobble client has business approving who may read its owner's listening.
+// Same line `/api/v1/sources`, the password endpoints and the two sharing
+// switches sit on: `AuthUser`, so a token gets 401 and scopes never arise.
+
+#[derive(Deserialize)]
+struct PatchRequestBody {
+    /// Who to patch into. A username rather than an id, because that is what
+    /// the person typed and what a remote handle will resolve to in Step 3.
+    username: String,
+}
+
+#[derive(Deserialize)]
+struct SettleBody {
+    /// **Required, not an `Option<bool>` with a default.** A body that merely
+    /// misspelled the key must not be read as an answer — and here the two
+    /// answers are "let them read my listening" and "no".
+    accept: Option<bool>,
+}
+
+#[derive(Deserialize)]
+struct SharedBody {
+    shared: Option<bool>,
+}
+
+#[derive(Deserialize)]
+struct ReelQuery {
+    limit: Option<i64>,
+    /// Keyset paging on the timestamp. Not an offset: the Reel grows from the
+    /// top while it is being read, and an offset would repeat or skip rows as
+    /// it shifted underneath.
+    before: Option<i64>,
+}
+
+/// `GET /api/v1/patch/decks` — everyone on the instance, and where you stand
+/// with them.
+///
+/// One call rather than three, because the screen shows one list of people with
+/// a different button each: patched, pending, or not asked. Splitting it would
+/// have the UI stitch three lists back together and invent the states in
+/// between.
+async fn decks(State(state): State<Arc<AppState>>, user: super::auth::AuthUser) -> Response {
+    let (all, out, inbound) = match tokio::try_join!(
+        state.db.patchable_decks(user.user_id),
+        state.db.patches_out(user.user_id),
+        state.db.patches_in(user.user_id),
+    ) {
+        Ok(v) => v,
+        Err(e) => {
+            warn!("📡 patch decks for {}: {e}", user.username);
+            return refused(StatusCode::INTERNAL_SERVER_ERROR, "Could not read the decks");
+        }
+    };
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "decks": all,
+            "following": out,
+            // Everything pointed at this user, pending and settled. The inbox
+            // filters to `pending` itself rather than being served a
+            // pre-filtered list, so "who is patched into me" and "who is
+            // waiting" cannot disagree about the same row.
+            "followers": inbound,
+        })),
+    )
+        .into_response()
+}
+
+/// `POST /api/v1/patch` — ask to patch into a deck.
+async fn request(
+    State(state): State<Arc<AppState>>,
+    user: super::auth::AuthUser,
+    Json(body): Json<PatchRequestBody>,
+) -> Response {
+    let target = match state.db.patchable_user_id(&body.username).await {
+        Ok(Some(id)) => id,
+        Ok(None) => return refused(StatusCode::NOT_FOUND, "No such deck on this instance"),
+        Err(e) => {
+            warn!("📡 patch request: {e}");
+            return refused(StatusCode::INTERNAL_SERVER_ERROR, "Could not look that deck up");
+        }
+    };
+
+    if target == user.user_id {
+        return refused(StatusCode::BAD_REQUEST, "A deck cannot patch into itself");
+    }
+
+    match state.db.request_patch(user.user_id, target).await {
+        Ok(uuid) => {
+            info!("📡 {} asked to patch into {}", user.username, body.username);
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "uuid": uuid,
+                    // The state is read back rather than assumed: an existing
+                    // accepted patch is left alone by `request_patch`, so
+                    // reporting "pending" here would be a lie about a patch
+                    // that is already live.
+                    "state": state
+                        .db
+                        .patches_out(user.user_id)
+                        .await
+                        .ok()
+                        .and_then(|v| v.into_iter().find(|p| p.user_id == target))
+                        .and_then(|p| p.state)
+                        .unwrap_or_else(|| "pending".into()),
+                })),
+            )
+                .into_response()
+        }
+        Err(e) => {
+            warn!("📡 patch request: {e}");
+            refused(StatusCode::INTERNAL_SERVER_ERROR, "Could not record that")
+        }
+    }
+}
+
+/// `POST /api/v1/patch/:uuid/settle` — say yes or no.
+///
+/// Authorisation is inside `settle_patch`'s `WHERE`, not here — see its own
+/// note. This handler only reports what happened.
+async fn settle(
+    State(state): State<Arc<AppState>>,
+    user: super::auth::AuthUser,
+    Path(uuid): Path<String>,
+    Json(body): Json<SettleBody>,
+) -> Response {
+    let Some(accept) = body.accept else {
+        return refused(
+            StatusCode::BAD_REQUEST,
+            "`accept` is required — say true or false explicitly.",
+        );
+    };
+
+    match state.db.settle_patch(&uuid, user.user_id, accept).await {
+        // A patch that is not theirs, does not exist, or has already been
+        // settled are one answer on purpose: the first would otherwise
+        // confirm that a given patch id is real to somebody it does not
+        // concern.
+        Ok(false) => refused(StatusCode::NOT_FOUND, "No patch request waiting on you with that id"),
+        Ok(true) => {
+            info!("📡 {} {} a patch", user.username, if accept { "accepted" } else { "declined" });
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({ "state": if accept { "accepted" } else { "rejected" } })),
+            )
+                .into_response()
+        }
+        Err(e) => {
+            warn!("📡 settling a patch: {e}");
+            refused(StatusCode::INTERNAL_SERVER_ERROR, "Could not save that")
+        }
+    }
+}
+
+/// `DELETE /api/v1/patch/:username` — stop patching into someone.
+///
+/// The follower's own operation, and it takes a username rather than the
+/// patch's uuid because that is what the row on the screen knows. Deliberately
+/// **no sweep** of anything already delivered: those listens were shared at the
+/// time under a switch their owner set, and a retroactive sweep would promise
+/// an unpatching that the protocol cannot deliver.
+async fn withdraw(
+    State(state): State<Arc<AppState>>,
+    user: super::auth::AuthUser,
+    Path(username): Path<String>,
+) -> Response {
+    let target = match state.db.patchable_user_id(&username).await {
+        Ok(Some(id)) => id,
+        Ok(None) => return refused(StatusCode::NOT_FOUND, "No such deck on this instance"),
+        Err(e) => {
+            warn!("📡 unpatch: {e}");
+            return refused(StatusCode::INTERNAL_SERVER_ERROR, "Could not look that deck up");
+        }
+    };
+
+    match state.db.unpatch(user.user_id, target).await {
+        Ok(true) => {
+            (StatusCode::OK, Json(serde_json::json!({ "unpatched": true }))).into_response()
+        }
+        Ok(false) => refused(StatusCode::NOT_FOUND, "You are not patched into that deck"),
+        Err(e) => {
+            warn!("📡 unpatch: {e}");
+            refused(StatusCode::INTERNAL_SERVER_ERROR, "Could not save that")
+        }
+    }
+}
+
+/// `PUT /api/v1/patch/chains/:id/shared` — publish a chain, or stop.
+///
+/// **The sharing unit is the chain, and this is the only switch there is.** It
+/// lives here rather than on the chains router because it is a Patch decision
+/// rather than a piece of gear configuration — but the Signal Chains page calls
+/// exactly this endpoint, which is what makes "one state, two places" true
+/// rather than aspirational.
+async fn set_shared(
+    State(state): State<Arc<AppState>>,
+    user: super::auth::AuthUser,
+    Path(chain_id): Path<i64>,
+    Json(body): Json<SharedBody>,
+) -> Response {
+    let Some(shared) = body.shared else {
+        return refused(
+            StatusCode::BAD_REQUEST,
+            "`shared` is required — say true or false explicitly.",
+        );
+    };
+
+    match state.db.set_chain_shared(user.user_id, chain_id, shared).await {
+        Ok(true) => {
+            info!("📡 {} {} a chain", user.username, if shared { "shared" } else { "unshared" });
+            (StatusCode::OK, Json(serde_json::json!({ "shared": shared }))).into_response()
+        }
+        Ok(false) => refused(StatusCode::NOT_FOUND, "No such chain"),
+        Err(e) => {
+            warn!("📡 sharing a chain: {e}");
+            refused(StatusCode::INTERNAL_SERVER_ERROR, "Could not save that")
+        }
+    }
+}
+
+/// `GET /api/v1/patch/reel` — what the decks you patched into have been playing.
+///
+/// The one read in this application that returns another user's listens. Every
+/// narrowing is in `Database::reel`'s query rather than here, deliberately: a
+/// filter applied in a handler is one a second handler can forget.
+async fn reel(
+    State(state): State<Arc<AppState>>,
+    user: super::auth::AuthUser,
+    Query(q): Query<ReelQuery>,
+) -> Response {
+    let limit = q.limit.unwrap_or(40).clamp(1, 200);
+    match state.db.reel(user.user_id, limit, q.before).await {
+        Ok(listens) => {
+            // `next` is the oldest timestamp returned, so the client pages by
+            // keyset. `None` when the page was short, which is how it knows to
+            // stop rather than asking again forever.
+            let next = (listens.len() as i64 == limit)
+                .then(|| listens.last().map(|l| l.timestamp))
+                .flatten();
+            (StatusCode::OK, Json(serde_json::json!({ "listens": listens, "next": next })))
+                .into_response()
+        }
+        Err(e) => {
+            warn!("📡 reel for {}: {e}", user.username);
+            refused(StatusCode::INTERNAL_SERVER_ERROR, "Could not read the Reel")
+        }
+    }
 }
 
 // ── the switch ───────────────────────────────────────────────
@@ -307,6 +578,62 @@ async fn outbox(
     let items: Vec<Value> = payloads.iter().filter_map(|p| serde_json::from_str(p).ok()).collect();
 
     ld(doc::ACTIVITY_JSON, doc::outbox(&actor.uri, total, items))
+}
+
+// ── GET /users/:name/followers | /following ──────────────────
+
+/// Who has patched into this deck, and who it has patched into.
+///
+/// **The count, not the roster.** ActivityPub allows a collection to state its
+/// size without enumerating it, and that is the right default for a private
+/// invite-only instance: who somebody has accepted is a fact about *other
+/// people*, and this endpoint answers to anyone at all. Remote software uses
+/// the number; the list is what would leak the shape of a household.
+///
+/// Both are served now rather than left out, because the actor document
+/// advertises them — and advertising an endpoint that 404s is the thing Step 1
+/// deliberately would not do.
+async fn followers(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    collection(state, name, headers, true).await
+}
+
+async fn following(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    collection(state, name, headers, false).await
+}
+
+async fn collection(
+    state: Arc<AppState>,
+    name: String,
+    headers: HeaderMap,
+    followers: bool,
+) -> Response {
+    let Some(actor) = resolve_local(&state, &name, &headers).await else {
+        return nope();
+    };
+
+    let total = match state.db.patch_count(actor.user_id, followers).await {
+        Ok(n) => n,
+        Err(e) => {
+            warn!("📡 collection for {}: {e}", actor.uri);
+            return refused(StatusCode::INTERNAL_SERVER_ERROR, "Could not read that collection");
+        }
+    };
+
+    let id =
+        if followers { doc::followers_uri(&actor.uri) } else { doc::following_uri(&actor.uri) };
+    // Empty `items`: only the count leaves. `actor_collection` omits
+    // `orderedItems` entirely rather than serving an empty array, which would
+    // read as "this deck has followers and will not say who" — a different and
+    // less honest claim than not enumerating at all.
+    ld(doc::ACTIVITY_JSON, doc::actor_collection(&id, total, vec![]))
 }
 
 // ── GET /.well-known/webfinger ───────────────────────────────

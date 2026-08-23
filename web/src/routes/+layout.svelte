@@ -34,6 +34,7 @@
 		{ href: '/shelf', label: 'The Shelf', icon: 'shelf' },
 		{ href: '/crate', label: 'The Crate', icon: 'crate' },
 		{ href: '/rediscover', label: 'Rediscovery', icon: 'rediscover' },
+		{ href: '/patch', label: 'Patch', icon: 'patch' },
 		{ href: '/playlists/saved', label: 'Playlists', icon: 'playlists' },
 		{ href: '/playlists', label: 'Playlist Lab', icon: 'playlists' },
 		{ href: '/map', label: 'Genre Map', icon: 'map' },
@@ -175,6 +176,7 @@
 						{:else if item.icon === 'playlists'}<svg viewBox="0 0 24 24" width="20" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><path d="M5 17.5l5.5-8.5 4 5 4.5-8"/><circle cx="5" cy="17.5" r="1.9" fill="currentColor" stroke="none"/><circle cx="10.5" cy="9" r="1.9" fill="currentColor" stroke="none"/><circle cx="14.5" cy="14" r="1.9" fill="currentColor" stroke="none"/><circle cx="19" cy="6" r="1.9" fill="currentColor" stroke="none"/></svg>
 					{:else if item.icon === 'map'}<svg viewBox="0 0 24 24" width="20" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><path d="M9 4 3 6.5v13L9 17l6 2.5 6-2.5v-13L15 7z"/><path d="M9 4v13"/><path d="M15 7v12.5"/></svg>
 						{:else if item.icon === 'loved'}<svg viewBox="0 0 24 24" width="20" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><path d="M20.8 6.6a5 5 0 0 0-7.3-.5L12 7.6l-1.5-1.5a5 5 0 0 0-7.3 6.8L12 21l8.8-8.1a5 5 0 0 0 0-6.3z"/></svg>
+						{:else if item.icon === 'patch'}<svg viewBox="0 0 24 24" width="20" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><circle cx="8" cy="12" r="4.4"/><circle cx="16" cy="12" r="4.4"/></svg>
 						{:else if item.icon === 'rediscover'}<svg viewBox="0 0 24 24" width="20" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><path d="M3 5v5h5"/><path d="M4.2 14a8 8 0 1 0 1.3-6.3L3 10"/></svg>
 						{:else if item.icon === 'shelf'}<svg viewBox="0 0 24 24" width="20" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="3"/></svg>
 						{:else if item.icon === 'crate'}<svg viewBox="0 0 24 24" width="20" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="7" width="18" height="12.6" rx="1.5"/><path d="M7.6 10.6v5.6"/><path d="M11.4 10.6v5.6"/><path d="M16.6 11l-2.2 5.2"/></svg>

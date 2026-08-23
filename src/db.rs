@@ -7289,7 +7289,7 @@ impl Database {
     /// chain with no listens comes back INTEGER and sqlx refuses to decode it
     /// into `f64`.
     const CHAIN_COLUMNS: &'static str = "s.id, s.user_id, s.name, s.description, s.components,
-                s.listening_context, s.icon, s.is_active,
+                s.listening_context, s.icon, s.is_active, s.shared,
                 CAST(COALESCE((
                     SELECT SUM(sc.duration) FROM scrobbles sc
                      WHERE sc.user_id = s.user_id AND sc.chain_id = s.id
@@ -7405,6 +7405,11 @@ impl Database {
     ) -> Result<bool, sqlx::Error> {
         let components_json = serde_json::to_string(components).unwrap_or_else(|_| "[]".into());
         let res = sqlx::query(
+            // `shared` is deliberately absent. This is a whole-record replace
+            // of everything the editor owns, and sharing is not the editor's —
+            // it is switched from the chain drawer or Patch → Decks. Adding it
+            // here would un-publish a chain as a side effect of renaming it,
+            // which is the shape that silently erased gear notes in v0.50.0.
             "UPDATE signal_chains SET name = ?, description = ?, components = ?, listening_context = ?, icon = ?
              WHERE id = ? AND user_id = ?"
         ).bind(name).bind(description).bind(&components_json).bind(listening_context).bind(icon)
@@ -12000,6 +12005,23 @@ impl Database {
     /// break their client on a random Tuesday for no security gain they asked
     /// for. An OAuth grant expires, because the client can refresh it without
     /// anybody being present.
+    ///
+    /// **`fetch_all`, not `fetch_one` — and that is a correctness fix, not a
+    /// style choice.** sqlx steps a statement only as far as the rows the
+    /// caller asks for, so `fetch_one` on an `INSERT … RETURNING` stops at the
+    /// first row and never reaches `SQLITE_DONE`. The implicit write
+    /// transaction then stays open until that pooled connection happens to run
+    /// something else — and until it does, **the row is invisible to every
+    /// other connection in the pool**.
+    ///
+    /// Measured, not theorised: 226 of 300 inserts were missing from a read
+    /// issued immediately afterwards. `fetch_all` and plain `execute` both lost
+    /// none. Nothing is *lost* — the write commits when that connection is next
+    /// used — but "create it, then read it back" is exactly the shape that
+    /// misses, which for a freshly minted token means a client's first request
+    /// getting a spurious 401.
+    ///
+    /// `a_row_written_with_returning_is_visible_immediately` pins it.
     pub async fn create_mcp_connection(
         &self,
         user_id: i64,
@@ -12021,7 +12043,7 @@ impl Database {
             format!("tdmcpr_{}", hex::encode(raw))
         });
 
-        let id: (i64,) = sqlx::query_as(
+        let id: Vec<(i64,)> = sqlx::query_as(
             "INSERT INTO mcp_connections
                 (user_id, name, token_hash, scopes, client_id, created_at, expires_at, refresh_hash)
              VALUES (?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
@@ -12034,11 +12056,12 @@ impl Database {
         .bind(now)
         .bind(ttl_secs.map(|t| now + t))
         .bind(refresh.as_deref().map(Self::hash_token))
-        .fetch_one(&self.pool)
+        .fetch_all(&self.pool)
         .await?;
 
         info!("🤖 MCP connection '{}' created for user_id {} [{}]", name, user_id, scopes);
-        Ok(McpCredential { id: id.0, token, refresh, expires_in: ttl_secs })
+        let id = id.first().map(|r| r.0).ok_or(sqlx::Error::RowNotFound)?;
+        Ok(McpCredential { id, token, refresh, expires_in: ttl_secs })
     }
 
     /// Resolve a bearer secret to its connection, or `None`.
@@ -12305,16 +12328,26 @@ impl Database {
     /// `DELETE … RETURNING` rather than select-then-delete: two statements
     /// would let two simultaneous redemptions of one code both see it, which is
     /// exactly the replay a single-use code exists to stop.
+    ///
+    /// **`fetch_all`, not `fetch_optional`**, and here the reason is the
+    /// security property rather than a stale read. `fetch_optional` stops after
+    /// the first row and never steps the statement to `SQLITE_DONE`, so the
+    /// delete's implicit transaction stays open until that pooled connection is
+    /// next used — and until then the code row is still there for another
+    /// connection to find. The single-use guarantee this function exists for
+    /// would be resting on SQLite's write locking and on the timing of an
+    /// unrelated query, rather than on the delete having happened. See
+    /// `create_mcp_connection` for the measurement.
     pub async fn consume_oauth_code(&self, code: &str) -> Result<Option<OAuthCode>, sqlx::Error> {
-        let row: Option<OAuthCode> = sqlx::query_as(
+        let rows: Vec<OAuthCode> = sqlx::query_as(
             "DELETE FROM oauth_codes WHERE code_hash = ?
              RETURNING client_id, user_id, redirect_uri, scopes, code_challenge,
                        resource, expires_at",
         )
         .bind(Self::hash_token(code))
-        .fetch_optional(&self.pool)
+        .fetch_all(&self.pool)
         .await?;
-        Ok(row.filter(|c| c.expires_at > Self::now_secs()))
+        Ok(rows.into_iter().next().filter(|c| c.expires_at > Self::now_secs()))
     }
 
     pub async fn purge_expired_oauth_codes(&self) -> Result<(), sqlx::Error> {
@@ -12372,7 +12405,9 @@ impl Database {
             return Ok((id, false));
         }
 
-        let row: (i64,) = sqlx::query_as(
+        // `fetch_all` — see `create_mcp_connection`. `fetch_one` here would
+        // leave the row invisible to the next read on another pool connection.
+        let row: Vec<(i64,)> = sqlx::query_as(
             "INSERT INTO recommendations
                 (user_id, kind, artist, name, mbid, reason, because, origin,
                  connection_id, created_at)
@@ -12388,9 +12423,9 @@ impl Database {
         .bind(origin)
         .bind(connection_id)
         .bind(now)
-        .fetch_one(&self.pool)
+        .fetch_all(&self.pool)
         .await?;
-        Ok((row.0, true))
+        Ok((row.first().map(|r| r.0).ok_or(sqlx::Error::RowNotFound)?, true))
     }
 
     /// The crate, with each entry's first listen derived from the history.
@@ -12815,7 +12850,36 @@ impl Database {
         .execute(&self.pool)
         .await?;
 
+        // **A deck that already has followers is frozen the moment it gains an
+        // identity.** Without this the rule would depend on an unrelated
+        // switch: `freeze_actor_username` writes to `actors`, so accepting a
+        // patch before ever enabling federation recorded nothing, and the
+        // username would then look renameable to whoever added a rename path.
+        // Consistency matters more than the saved query — it is one read, once
+        // per account ever.
+        //
+        // Note the *sharpest* trigger is narrower than this and does not exist
+        // yet: what truly makes a rename unsurvivable is a **remote** follower
+        // holding the actor URI, or an activity signed and delivered outbound.
+        // Both are Step 3. Freezing on a local accept is the conservative side
+        // of that line, and refusing a rename that would have been safe is the
+        // cheaper mistake.
+        if self.has_accepted_patch(user_id).await? {
+            self.freeze_actor_username(user_id).await?;
+        }
+
         self.load_actor(user_id).await?.ok_or(sqlx::Error::RowNotFound)
+    }
+
+    /// Has anybody been let in to this deck?
+    async fn has_accepted_patch(&self, user_id: i64) -> Result<bool, sqlx::Error> {
+        let n: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM patches WHERE target_user_id = ? AND state = 'accepted'",
+        )
+        .bind(user_id)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(n > 0)
     }
 
     /// Resolve a username to a user **who is willing to be found**.
@@ -13059,6 +13123,308 @@ impl Database {
 
         Ok((total, items))
     }
+
+    // ════════════════════════════════════════════════════════════
+    //  Patch — patches and the Reel (Phase 6, Step 2)
+    // ════════════════════════════════════════════════════════════
+
+    /// Resolve a username to a deck that can be patched into.
+    ///
+    /// Excludes disabled accounts, which `get_user_id_by_username` does not —
+    /// that one is used by paths where a disabled user is still a real user
+    /// whose rows exist. Here a disabled account is not a deck, and offering a
+    /// patch into one would produce an edge that can never be approved.
+    ///
+    /// Deliberately **not** gated on `federation_enabled`: that switch decides
+    /// whether the wider fediverse can find you, and members of a private,
+    /// invite-only instance already know each other exist. What protects a deck
+    /// locally is that a patch needs approval and a chain publishes nothing
+    /// until its owner shares it.
+    pub async fn patchable_user_id(&self, username: &str) -> Result<Option<i64>, sqlx::Error> {
+        sqlx::query_scalar(
+            "SELECT id FROM users WHERE username = ? COLLATE NOCASE AND disabled = 0",
+        )
+        .bind(username)
+        .fetch_optional(&self.pool)
+        .await
+    }
+
+    /// Ask to patch into someone's deck.
+    ///
+    /// **A patch is a request, not a subscription** — that is the whole reason
+    /// `state` exists and is not a boolean. It lands `pending` and shows up in
+    /// the target's inbox; nothing is shared until they say yes.
+    ///
+    /// Idempotent in the direction that matters: asking twice does not mint a
+    /// second edge or reset an accepted one. Asking again after a **rejection**
+    /// does put it back to pending — a rejection is not a block, and this
+    /// design has no block. That is a real consequence rather than an
+    /// oversight: it means somebody can ask repeatedly, and on a private
+    /// invite-only instance of people who know each other that is the right
+    /// trade. Blocking is the missing feature, and this is where it attaches.
+    pub async fn request_patch(
+        &self,
+        follower_user_id: i64,
+        target_user_id: i64,
+    ) -> Result<String, sqlx::Error> {
+        if follower_user_id == target_user_id {
+            return Err(sqlx::Error::Protocol("a deck cannot patch into itself".into()));
+        }
+
+        let now = Self::now_secs();
+        let uuid = new_uuid();
+
+        // `DO UPDATE` rather than `DO NOTHING`, so a re-request after a
+        // rejection reopens it — but an **accepted** patch is left alone, or
+        // asking again would quietly un-approve a patch its target had already
+        // said yes to.
+        sqlx::query(
+            "INSERT INTO patches (uuid, follower_user_id, target_user_id, state, created_at, updated_at)
+             VALUES (?, ?, ?, 'pending', ?, ?)
+             -- The index this conflicts against is **partial**, and SQLite
+             -- rejects an ON CONFLICT target that does not repeat the
+             -- predicate — the trap `physical_images` already documents. It
+             -- fails at runtime, not at build time, because every query here
+             -- is a runtime string.
+             ON CONFLICT(follower_user_id, target_user_id)
+               WHERE follower_user_id IS NOT NULL AND target_user_id IS NOT NULL
+               DO UPDATE SET state = 'pending', updated_at = excluded.updated_at
+               WHERE patches.state <> 'accepted'",
+        )
+        .bind(&uuid)
+        .bind(follower_user_id)
+        .bind(target_user_id)
+        .bind(now)
+        .bind(now)
+        .execute(&self.pool)
+        .await?;
+
+        sqlx::query_scalar(
+            "SELECT uuid FROM patches WHERE follower_user_id = ? AND target_user_id = ?",
+        )
+        .bind(follower_user_id)
+        .bind(target_user_id)
+        .fetch_one(&self.pool)
+        .await
+    }
+
+    /// Say yes or no to a patch request.
+    ///
+    /// **Scoped to the target on the way in.** `target_user_id` is in the
+    /// `WHERE`, not checked by the caller, because this is the one operation in
+    /// Phase 6 that widens who may read somebody's listening — and an
+    /// authorisation check that lives in a handler is one a second handler can
+    /// forget. A patch naming somebody else changes nothing and reports so.
+    ///
+    /// Accepting **freezes the target's username**: from here their identity is
+    /// load-bearing for another party, and a rename would be a deletion and a
+    /// stranger rather than a rename. That trigger is why `frozen_at` exists,
+    /// and it is here rather than in the handler for the same reason the scope
+    /// is.
+    pub async fn settle_patch(
+        &self,
+        uuid: &str,
+        target_user_id: i64,
+        accept: bool,
+    ) -> Result<bool, sqlx::Error> {
+        let state = if accept { "accepted" } else { "rejected" };
+
+        let result = sqlx::query(
+            "UPDATE patches SET state = ?, updated_at = ?
+              WHERE uuid = ? AND target_user_id = ? AND state = 'pending'",
+        )
+        .bind(state)
+        .bind(Self::now_secs())
+        .bind(uuid)
+        .bind(target_user_id)
+        .execute(&self.pool)
+        .await?;
+
+        let settled = result.rows_affected() > 0;
+        if settled && accept {
+            self.freeze_actor_username(target_user_id).await?;
+        }
+        Ok(settled)
+    }
+
+    /// Withdraw a patch you made.
+    ///
+    /// The **follower's** operation, and it deletes rather than setting a
+    /// state: un-patching is not a decision anybody needs to remember, unlike a
+    /// rejection, which is the target saying no and worth keeping.
+    ///
+    /// Deliberately no sweep of anything already delivered. Phase 6's rule:
+    /// those listens were shared at the time under a switch their owner set,
+    /// and a retroactive sweep would promise an unpatching the protocol cannot
+    /// actually deliver.
+    pub async fn unpatch(
+        &self,
+        follower_user_id: i64,
+        target_user_id: i64,
+    ) -> Result<bool, sqlx::Error> {
+        let result =
+            sqlx::query("DELETE FROM patches WHERE follower_user_id = ? AND target_user_id = ?")
+                .bind(follower_user_id)
+                .bind(target_user_id)
+                .execute(&self.pool)
+                .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// Everyone this user has patched into, or asked to.
+    pub async fn patches_out(&self, user_id: i64) -> Result<Vec<PatchPeer>, sqlx::Error> {
+        sqlx::query_as(&format!(
+            "SELECT p.uuid, p.state, p.created_at, {}
+               FROM patches p JOIN users u ON u.id = p.target_user_id
+              WHERE p.follower_user_id = ?
+              ORDER BY u.username COLLATE NOCASE",
+            Self::PATCH_PEER_COLUMNS
+        ))
+        .bind(user_id)
+        .fetch_all(&self.pool)
+        .await
+    }
+
+    /// Everyone who has patched into this user, or asked to.
+    ///
+    /// `pending` rows are included: this is what the inbox reads, and the
+    /// distinction is `state`.
+    pub async fn patches_in(&self, user_id: i64) -> Result<Vec<PatchPeer>, sqlx::Error> {
+        sqlx::query_as(&format!(
+            "SELECT p.uuid, p.state, p.created_at, {}
+               FROM patches p JOIN users u ON u.id = p.follower_user_id
+              WHERE p.target_user_id = ?
+              ORDER BY p.state = 'pending' DESC, p.created_at DESC",
+            Self::PATCH_PEER_COLUMNS
+        ))
+        .bind(user_id)
+        .fetch_all(&self.pool)
+        .await
+    }
+
+    /// The other end of a patch, as both directions need it. One list so the
+    /// two cannot drift into describing a person differently.
+    const PATCH_PEER_COLUMNS: &'static str = "u.id AS user_id, u.username, u.display_name, \
+         u.bio, u.avatar_url, \
+         (SELECT COUNT(*) FROM signal_chains c \
+           WHERE c.user_id = u.id AND c.shared = 1) AS shared_chains";
+
+    /// Turn a chain's sharing on or off.
+    ///
+    /// **The sharing unit is the chain, and this is the only switch there is.**
+    /// A listen reaches the Reel because the chain it ran through was switched
+    /// to shared by its owner — there is no per-listen override and there
+    /// should not be one. It makes "what am I publishing?" answerable by
+    /// looking at a list of chains you already understand, and it makes the
+    /// decision a standing one about *how you listen* rather than a choice to
+    /// make per play.
+    pub async fn set_chain_shared(
+        &self,
+        user_id: i64,
+        chain_id: i64,
+        shared: bool,
+    ) -> Result<bool, sqlx::Error> {
+        let result =
+            sqlx::query("UPDATE signal_chains SET shared = ? WHERE id = ? AND user_id = ?")
+                .bind(shared)
+                .bind(chain_id)
+                .bind(user_id)
+                .execute(&self.pool)
+                .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// The Reel: what the decks this user has patched into have been playing.
+    ///
+    /// **This is the one query in the application that reads another user's
+    /// listens**, so every clause in it is load-bearing and none should be
+    /// relaxed without saying why:
+    ///
+    /// * **`state = 'accepted'`** — a pending or rejected patch reads nothing.
+    /// * **`c.shared = 1`** — the chain's owner switched it on.
+    /// * **`s.chain_id` is joined, not left-joined.** A listen with no chain is
+    ///   never shared: nobody switched anything on for it, so the *default* has
+    ///   to be exclusion. A `LEFT JOIN` here would publish every unattributed
+    ///   listen on the instance, and it would look like a tidy-up.
+    /// * **`skipped = FALSE`** — a skip is stored and never counted, and it is
+    ///   certainly not something to show other people.
+    ///
+    /// It is deliberately **not** scoped by `user_id = ?` the way every other
+    /// read is; that is the relaxation Phase 6 exists to make, and it is
+    /// narrowed by the patch and the chain instead.
+    pub async fn reel(
+        &self,
+        user_id: i64,
+        limit: i64,
+        before: Option<i64>,
+    ) -> Result<Vec<ReelListen>, sqlx::Error> {
+        sqlx::query_as(
+            "SELECT s.id, s.timestamp, s.title, s.artist, s.album,
+                    s.artwork_url, s.caa_id, s.caa_release_mbid,
+                    s.format_type, s.codec, s.bitrate, s.sample_rate, s.bit_depth, s.is_lossless,
+                    s.submission_client,
+                    u.id AS user_id, u.username, u.display_name, u.avatar_url,
+                    c.name AS chain_name, c.icon AS chain_icon, c.components AS chain_components
+               FROM scrobbles s
+               JOIN signal_chains c ON c.id = s.chain_id AND c.shared = 1
+               JOIN users u ON u.id = s.user_id
+               JOIN patches p ON p.target_user_id = s.user_id
+              WHERE p.follower_user_id = ? AND p.state = 'accepted'
+                AND s.skipped = FALSE
+                AND (? IS NULL OR s.timestamp < ?)
+              ORDER BY s.timestamp DESC
+              LIMIT ?",
+        )
+        .bind(user_id)
+        .bind(before)
+        .bind(before)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+    }
+
+    /// Decks on this instance that this user could patch into.
+    ///
+    /// Everyone but themselves and the disabled. **Not gated on
+    /// `federation_enabled`**, which is a deliberate separation: that switch
+    /// decides whether the wider fediverse can find you, and members of a
+    /// private invite-only instance already know each other exist. What
+    /// protects a deck here is that a patch needs approval and that a chain
+    /// publishes nothing until its owner shares it.
+    pub async fn patchable_decks(&self, user_id: i64) -> Result<Vec<PatchPeer>, sqlx::Error> {
+        sqlx::query_as(&format!(
+            "SELECT NULL AS uuid, NULL AS state, NULL AS created_at, {}
+               FROM users u
+              WHERE u.id <> ? AND u.disabled = 0
+              ORDER BY u.username COLLATE NOCASE",
+            Self::PATCH_PEER_COLUMNS
+        ))
+        .bind(user_id)
+        .fetch_all(&self.pool)
+        .await
+    }
+
+    /// How many accepted patches point at this user, or away from them — the
+    /// `totalItems` of the `followers` / `following` collections.
+    ///
+    /// **Counts patches, not actors.** The obvious implementation joins
+    /// `actors` to get each end's URI and counts those, and it is wrong: a
+    /// local follower who has never switched federation on has no actor row, so
+    /// a deck with one follower reported `0`. That makes the number a fact
+    /// about who happens to have enabled federation rather than about
+    /// followers, which is meaningless to the remote software that reads it.
+    ///
+    /// Only the **count** is ever served. The roster is what would leak the
+    /// shape of a household, and a count is what the protocol actually uses —
+    /// see `server::patch::collection`.
+    pub async fn patch_count(&self, user_id: i64, followers: bool) -> Result<i64, sqlx::Error> {
+        let sql = if followers {
+            "SELECT COUNT(*) FROM patches WHERE target_user_id = ? AND state = 'accepted'"
+        } else {
+            "SELECT COUNT(*) FROM patches WHERE follower_user_id = ? AND state = 'accepted'"
+        };
+        sqlx::query_scalar(sql).bind(user_id).fetch_one(&self.pool).await
+    }
 }
 
 // ════════════════════════════════════════════════════════════
@@ -13104,6 +13470,65 @@ struct ActorRow {
     bio: Option<String>,
     avatar_url: Option<String>,
     federation_enabled: i64,
+}
+
+/// The other end of a patch — or a deck that could become one.
+///
+/// One type for three lists (out, in, and everyone patchable) so the three
+/// cannot drift into describing a person differently. `uuid` and `state` are
+/// null for a deck nobody has asked about yet, which is what tells "not
+/// patched" apart from "asked and waiting".
+#[derive(Debug, FromRow, serde::Serialize)]
+pub struct PatchPeer {
+    /// The patch's own id, `None` when no edge exists yet.
+    pub uuid: Option<String>,
+    /// pending | accepted | rejected, or `None` for no edge.
+    pub state: Option<String>,
+    pub created_at: Option<i64>,
+    pub user_id: i64,
+    pub username: String,
+    pub display_name: Option<String>,
+    pub bio: Option<String>,
+    pub avatar_url: Option<String>,
+    /// How many chains this person publishes. **Zero is the interesting case**:
+    /// a patch into a deck sharing nothing is accepted and reads empty, which
+    /// is correct and needs saying on screen rather than looking broken.
+    pub shared_chains: i64,
+}
+
+/// A listen on somebody else's deck, reaching this user through a patch.
+///
+/// Deliberately **not** `ScrobbleRecord`. That type is the shape of the
+/// caller's own history and carries things nobody else is entitled to — the
+/// source id, the delivery state, the chain id, the session. This one carries
+/// what a Reel row draws and nothing more, so a field cannot leak by being
+/// added to a struct somebody else also serialises.
+#[derive(Debug, FromRow, serde::Serialize)]
+pub struct ReelListen {
+    pub id: i64,
+    pub timestamp: i64,
+    pub title: String,
+    pub artist: String,
+    pub album: Option<String>,
+    pub artwork_url: Option<String>,
+    pub caa_id: Option<i64>,
+    pub caa_release_mbid: Option<String>,
+    pub format_type: Option<String>,
+    pub codec: Option<String>,
+    pub bitrate: Option<i64>,
+    pub sample_rate: Option<i64>,
+    pub bit_depth: Option<i64>,
+    pub is_lossless: Option<bool>,
+    pub submission_client: Option<String>,
+    pub user_id: i64,
+    pub username: String,
+    pub display_name: Option<String>,
+    pub avatar_url: Option<String>,
+    /// The chain is the whole point of the Reel: it is what makes a Tapedeck
+    /// listen a Tapedeck listen rather than a sentence.
+    pub chain_name: String,
+    pub chain_icon: Option<String>,
+    pub chain_components: Option<String>,
 }
 
 /// Somebody else's actor, as we last fetched it.
@@ -13858,6 +14283,7 @@ pub struct ChainRow {
     pub listening_context: String,
     pub icon: Option<String>,
     pub is_active: bool,
+    pub shared: bool,
     pub total_hours: f64,
     pub created_at: i64,
 }
@@ -13874,6 +14300,7 @@ impl From<ChainRow> for SignalChain {
             listening_context: ListeningContext::from_str_loose(&r.listening_context),
             icon: r.icon,
             is_active: r.is_active,
+            shared: r.shared,
             total_hours: r.total_hours,
             created_at: r.created_at,
         }
@@ -15585,6 +16012,7 @@ mod tests {
             listening_context: ListeningContext::Active,
             icon: None,
             is_active: true,
+            shared: false,
             total_hours: 0.0,
             created_at: 0,
         };
@@ -15615,6 +16043,7 @@ mod tests {
                 listening_context: ListeningContext::Active,
                 icon: None,
                 is_active: true,
+                shared: false,
                 total_hours: 0.0,
                 created_at: 0,
             })
@@ -15701,6 +16130,7 @@ mod tests {
                 listening_context: ListeningContext::Active,
                 icon: None,
                 is_active: true,
+                shared: false,
                 total_hours: 0.0,
                 created_at: 0,
             })
@@ -16055,6 +16485,7 @@ mod tests {
             listening_context: ListeningContext::Active,
             icon: None,
             is_active: true,
+            shared: false,
             total_hours: 0.0,
             created_at: 0,
         };
@@ -16371,6 +16802,7 @@ mod tests {
                 listening_context: ListeningContext::Active,
                 icon: None,
                 is_active: true,
+                shared: false,
                 total_hours: 0.0,
                 created_at: 0,
             })
@@ -17746,6 +18178,454 @@ mod tests {
         assert_eq!(db.public_outbox(nobody, 40).await.unwrap(), (0, vec![]));
     }
 
+    // ── Patch: patches and the Reel ──────────────────────────
+
+    /// Helper: a user with one chain, and a listen through it.
+    async fn deck_with_listen(
+        db: &Database,
+        name: &str,
+        chain: &str,
+        title: &str,
+        ts: u64,
+    ) -> (i64, i64) {
+        let uid = db.create_user(name, None, "pw", "user").await.unwrap();
+        let chain_id = sqlx::query_scalar::<_, i64>(
+            "INSERT INTO signal_chains (user_id, name, created_at) VALUES (?, ?, ?) RETURNING id",
+        )
+        .bind(uid)
+        .bind(chain)
+        .bind(Database::now_secs())
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+
+        let p = play(title, "Massive Attack", ts);
+        db.save_scrobble(
+            uid,
+            &p,
+            None,
+            None,
+            Some(chain_id),
+            None,
+            None,
+            None,
+            None,
+            ListenDisposition::LIVE,
+        )
+        .await
+        .unwrap();
+        (uid, chain_id)
+    }
+
+    /// The whole request → accept → read cycle, and the states it passes
+    /// through. **A patch is a request, not a subscription**, so a pending one
+    /// must read nothing at all.
+    #[tokio::test]
+    async fn a_patch_reads_nothing_until_it_is_accepted() {
+        let db = testdb().await;
+        let (them, chain) =
+            deck_with_listen(&db, "kim", "Study Chain", "Teardrop", 1_760_000_000).await;
+        let me = db.create_user("ash", None, "pw", "user").await.unwrap();
+        db.set_chain_shared(them, chain, true).await.unwrap();
+
+        // No patch at all.
+        assert!(db.reel(me, 40, None).await.unwrap().is_empty());
+
+        let uuid = db.request_patch(me, them).await.unwrap();
+        assert!(
+            db.reel(me, 40, None).await.unwrap().is_empty(),
+            "a pending patch reads nothing — that is what makes it a request"
+        );
+
+        assert!(db.settle_patch(&uuid, them, true).await.unwrap());
+        let reel = db.reel(me, 40, None).await.unwrap();
+        assert_eq!(reel.len(), 1);
+        assert_eq!(reel[0].title, "Teardrop");
+        assert_eq!(reel[0].username, "kim");
+        assert_eq!(reel[0].chain_name, "Study Chain", "the chain is the point of the Reel");
+
+        // And withdrawing takes it away again.
+        assert!(db.unpatch(me, them).await.unwrap());
+        assert!(db.reel(me, 40, None).await.unwrap().is_empty());
+    }
+
+    /// **The sharing unit is the chain.** A patch into a deck that publishes
+    /// nothing is accepted and reads empty, which is correct — and a listen
+    /// through an unshared chain never appears however friendly the patch.
+    #[tokio::test]
+    async fn only_a_shared_chain_reaches_the_reel() {
+        let db = testdb().await;
+        let (them, shared) =
+            deck_with_listen(&db, "kim", "Study Chain", "Teardrop", 1_760_000_100).await;
+        let me = db.create_user("ash", None, "pw", "user").await.unwrap();
+
+        // A second chain on the same deck, left private.
+        let private = sqlx::query_scalar::<_, i64>(
+            "INSERT INTO signal_chains (user_id, name, created_at) VALUES (?, 'Bedroom', ?) RETURNING id",
+        )
+        .bind(them)
+        .bind(Database::now_secs())
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        let p = play("Angel", "Massive Attack", 1_760_000_200);
+        db.save_scrobble(
+            them,
+            &p,
+            None,
+            None,
+            Some(private),
+            None,
+            None,
+            None,
+            None,
+            ListenDisposition::LIVE,
+        )
+        .await
+        .unwrap();
+
+        let uuid = db.request_patch(me, them).await.unwrap();
+        db.settle_patch(&uuid, them, true).await.unwrap();
+
+        assert!(
+            db.reel(me, 40, None).await.unwrap().is_empty(),
+            "nothing is shared until a chain is switched on, even with the patch accepted"
+        );
+
+        db.set_chain_shared(them, shared, true).await.unwrap();
+        let reel = db.reel(me, 40, None).await.unwrap();
+        assert_eq!(reel.len(), 1, "only the shared chain's listen");
+        assert_eq!(reel[0].title, "Teardrop");
+
+        // Switching it back off takes it out again — the switch is the whole
+        // control, and it works in both directions.
+        db.set_chain_shared(them, shared, false).await.unwrap();
+        assert!(db.reel(me, 40, None).await.unwrap().is_empty());
+    }
+
+    /// **A listen with no chain is never shared**, and this is the clause most
+    /// likely to be "tidied" into a LEFT JOIN by somebody wondering why
+    /// unattributed listens are missing. The default has to be exclusion:
+    /// nobody switched anything on for a listen that ran through nothing.
+    ///
+    /// A skip is not shown either — stored, never counted, and certainly not
+    /// published to another person.
+    #[tokio::test]
+    async fn a_chainless_listen_and_a_skip_never_reach_the_reel() {
+        let db = testdb().await;
+        let (them, chain) =
+            deck_with_listen(&db, "kim", "Study Chain", "Teardrop", 1_760_000_000).await;
+        let me = db.create_user("ash", None, "pw", "user").await.unwrap();
+        db.set_chain_shared(them, chain, true).await.unwrap();
+
+        // No chain at all.
+        let orphan = play("Unattributed", "Massive Attack", 1_760_000_300);
+        db.save_scrobble(
+            them,
+            &orphan,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            ListenDisposition::LIVE,
+        )
+        .await
+        .unwrap();
+
+        // A skip, through the shared chain.
+        let skipped = play("Bailed On", "Massive Attack", 1_760_000_400);
+        db.save_scrobble(
+            them,
+            &skipped,
+            None,
+            None,
+            Some(chain),
+            None,
+            None,
+            None,
+            None,
+            ListenDisposition { imported: false, skipped: true },
+        )
+        .await
+        .unwrap();
+
+        let uuid = db.request_patch(me, them).await.unwrap();
+        db.settle_patch(&uuid, them, true).await.unwrap();
+
+        let titles: Vec<_> =
+            db.reel(me, 40, None).await.unwrap().into_iter().map(|r| r.title).collect();
+        assert_eq!(titles, ["Teardrop"], "no chain means not shared; a skip is never published");
+    }
+
+    /// Asking twice must not mint a second edge or disturb an accepted one —
+    /// and this is the test that catches the partial-index `ON CONFLICT`,
+    /// which is a runtime failure that compiles perfectly.
+    #[tokio::test]
+    async fn asking_again_neither_duplicates_nor_un_approves() {
+        let db = testdb().await;
+        let me = db.create_user("ash", None, "pw", "user").await.unwrap();
+        let them = db.create_user("kim", None, "pw", "user").await.unwrap();
+
+        let first = db.request_patch(me, them).await.unwrap();
+        let again = db.request_patch(me, them).await.unwrap();
+        assert_eq!(first, again, "one edge per pair, whoever asks how often");
+
+        db.settle_patch(&first, them, true).await.unwrap();
+        db.request_patch(me, them).await.unwrap();
+        let state: String = sqlx::query_scalar("SELECT state FROM patches WHERE uuid = ?")
+            .bind(&first)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            state, "accepted",
+            "asking again must not un-approve a patch already said yes to"
+        );
+
+        let n: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM patches").fetch_one(&db.pool).await.unwrap();
+        assert_eq!(n, 1);
+    }
+
+    /// **Only the target may settle a patch**, and the check is in the `WHERE`
+    /// rather than in the handler — this is the one operation that widens who
+    /// may read somebody's listening, and an authorisation check that lives in
+    /// a handler is one a second handler can forget.
+    #[tokio::test]
+    async fn only_the_target_can_accept_a_patch() {
+        let db = testdb().await;
+        let me = db.create_user("ash", None, "pw", "user").await.unwrap();
+        let them = db.create_user("kim", None, "pw", "user").await.unwrap();
+        let bystander = db.create_user("sam", None, "pw", "user").await.unwrap();
+
+        let uuid = db.request_patch(me, them).await.unwrap();
+
+        assert!(
+            !db.settle_patch(&uuid, bystander, true).await.unwrap(),
+            "a stranger cannot approve it"
+        );
+        assert!(
+            !db.settle_patch(&uuid, me, true).await.unwrap(),
+            "and neither can the person who asked"
+        );
+
+        let state: String = sqlx::query_scalar("SELECT state FROM patches WHERE uuid = ?")
+            .bind(&uuid)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(state, "pending", "nothing moved");
+
+        assert!(db.settle_patch(&uuid, them, true).await.unwrap());
+        assert!(!db.settle_patch(&uuid, them, false).await.unwrap(), "and it settles once");
+    }
+
+    /// Accepting is the moment the identity becomes load-bearing for somebody
+    /// else, which is the trigger `frozen_at` exists for — *not* going public,
+    /// because in this design following happens while private.
+    #[tokio::test]
+    async fn the_first_accepted_patch_freezes_the_username() {
+        let db = testdb().await;
+        let me = db.create_user("ash", None, "pw", "user").await.unwrap();
+        let them = db.create_user("kim", None, "pw", "user").await.unwrap();
+        db.actor_for_user(them, "https://deck.example").await.unwrap();
+
+        let uuid = db.request_patch(me, them).await.unwrap();
+        assert!(!db.username_is_frozen(them).await.unwrap(), "a request is not a commitment");
+
+        db.settle_patch(&uuid, them, true).await.unwrap();
+        assert!(db.username_is_frozen(them).await.unwrap());
+
+        // And a deck that gains its identity *after* being patched into is
+        // frozen at that moment — otherwise the rule would depend on the
+        // unrelated question of when they switched federation on.
+        let late = db.create_user("bo", None, "pw", "user").await.unwrap();
+        let yes = db.request_patch(me, late).await.unwrap();
+        db.settle_patch(&yes, late, true).await.unwrap();
+        assert!(!db.username_is_frozen(late).await.unwrap(), "no actor yet, nothing to freeze");
+        db.actor_for_user(late, "https://deck.example").await.unwrap();
+        assert!(
+            db.username_is_frozen(late).await.unwrap(),
+            "an identity minted for a deck that already has followers is born frozen"
+        );
+
+        // Rejecting does not freeze: nobody ended up holding the identity.
+        let other = db.create_user("sam", None, "pw", "user").await.unwrap();
+        db.actor_for_user(other, "https://deck.example").await.unwrap();
+        let no = db.request_patch(me, other).await.unwrap();
+        db.settle_patch(&no, other, false).await.unwrap();
+        assert!(!db.username_is_frozen(other).await.unwrap());
+    }
+
+    /// Both directions of the list, and the shape that tells "not patched"
+    /// apart from "asked and waiting".
+    #[tokio::test]
+    async fn the_two_lists_describe_the_same_people_the_same_way() {
+        let db = testdb().await;
+        let me = db.create_user("ash", None, "pw", "user").await.unwrap();
+        let them = db.create_user("kim", None, "pw", "user").await.unwrap();
+        let uuid = db.request_patch(me, them).await.unwrap();
+
+        let out = db.patches_out(me).await.unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].username, "kim");
+        assert_eq!(out[0].state.as_deref(), Some("pending"));
+
+        let inbound = db.patches_in(them).await.unwrap();
+        assert_eq!(inbound.len(), 1);
+        assert_eq!(inbound[0].username, "ash");
+        assert_eq!(inbound[0].state.as_deref(), Some("pending"));
+        assert_eq!(inbound[0].uuid.as_deref(), Some(uuid.as_str()));
+
+        // A deck nobody has asked about carries no edge at all, which is what
+        // the UI reads to offer "Patch in" rather than "Pending".
+        let decks = db.patchable_decks(me).await.unwrap();
+        assert!(decks.iter().all(|d| d.username != "ash"), "you cannot patch into yourself");
+        let kim = decks.iter().find(|d| d.username == "kim").expect("kim is patchable");
+        assert!(kim.uuid.is_none() && kim.state.is_none());
+    }
+
+    /// A deck cannot patch into itself, and the refusal is at the door rather
+    /// than left to a UNIQUE constraint to notice.
+    #[tokio::test]
+    async fn a_deck_cannot_patch_into_itself() {
+        let db = testdb().await;
+        let me = db.create_user("ash", None, "pw", "user").await.unwrap();
+        assert!(db.request_patch(me, me).await.is_err());
+    }
+
+    /// What the actor's collections count.
+    ///
+    /// **Accepted patches, not actors.** The obvious version joins `actors` to
+    /// collect each end's URI and counts those — and a local follower who never
+    /// switched federation on has no actor row, so a deck with a follower
+    /// reported zero. That would make the number a fact about who enabled
+    /// federation rather than about followers, which is meaningless to the
+    /// remote software that reads it. Caught on a running instance, not here.
+    #[tokio::test]
+    async fn the_actor_collections_count_patches_rather_than_identities() {
+        let db = testdb().await;
+        let me = db.create_user("ash", None, "pw", "user").await.unwrap();
+        let them = db.create_user("kim", None, "pw", "user").await.unwrap();
+        let quiet = db.create_user("sam", None, "pw", "user").await.unwrap();
+        db.actor_for_user(them, "https://deck.example").await.unwrap();
+        // Neither `me` nor `quiet` has an actor, on purpose.
+
+        let a = db.request_patch(me, them).await.unwrap();
+        db.settle_patch(&a, them, true).await.unwrap();
+        let b = db.request_patch(quiet, them).await.unwrap();
+        db.settle_patch(&b, them, true).await.unwrap();
+        // A third, left pending.
+        db.request_patch(me, quiet).await.unwrap();
+
+        assert_eq!(
+            db.patch_count(them, true).await.unwrap(),
+            2,
+            "both followers count, whether or not they have an identity of their own"
+        );
+        assert_eq!(db.patch_count(me, false).await.unwrap(), 1, "the pending one is not following");
+        assert_eq!(db.patch_count(quiet, true).await.unwrap(), 0, "pending is not accepted");
+    }
+
+    /// Editing a chain must not un-publish it.
+    ///
+    /// `update_chain` is a whole-record replace of everything the editor owns,
+    /// and sharing is not the editor's — it is switched from the drawer or from
+    /// Patch → Decks. Adding `shared` to that statement would take a chain off
+    /// the Reel as a side effect of renaming it, which is exactly the shape
+    /// that silently erased gear notes in v0.50.0. Nothing errors; a chain just
+    /// stops publishing.
+    #[tokio::test]
+    async fn renaming_a_chain_does_not_unshare_it() {
+        let db = testdb().await;
+        let uid = db.create_user("ash", None, "pw", "user").await.unwrap();
+        let chain_id = sqlx::query_scalar::<_, i64>(
+            "INSERT INTO signal_chains (user_id, name, created_at) VALUES (?, 'Desk', ?) RETURNING id",
+        )
+        .bind(uid)
+        .bind(Database::now_secs())
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+
+        db.set_chain_shared(uid, chain_id, true).await.unwrap();
+        db.update_chain(uid, chain_id, "Desk Reference", None, &[], "focused", None).await.unwrap();
+
+        let chains = db.get_chains(uid).await.unwrap();
+        let c = chains.iter().find(|c| c.id == Some(chain_id)).expect("the chain");
+        assert_eq!(c.name, "Desk Reference");
+        assert!(c.shared, "renaming a chain must not take it off the Reel");
+
+        // And a brand new chain publishes nothing. Through the real API rather
+        // than a raw INSERT: `create_chain` is the path a user takes, and a raw
+        // `INSERT … RETURNING` consumed with `fetch_one` is invisible to the
+        // read that follows it — which is how this test found the pool
+        // visibility bug in the first place.
+        let fresh = db
+            .create_chain(&SignalChain {
+                id: None,
+                user_id: uid,
+                name: "New".into(),
+                description: None,
+                components: vec![],
+                listening_context: ListeningContext::Unknown,
+                icon: None,
+                is_active: true,
+                shared: false,
+                total_hours: 0.0,
+                created_at: 0,
+            })
+            .await
+            .unwrap();
+        let chains = db.get_chains(uid).await.unwrap();
+        assert!(!chains.iter().find(|c| c.id == Some(fresh)).unwrap().shared);
+    }
+
+    /// **A row written with `RETURNING` must be visible to the next read.**
+    ///
+    /// sqlx steps a statement only as far as the rows the caller asks for, so
+    /// `fetch_one` / `fetch_optional` on an `INSERT … RETURNING` stops at the
+    /// first row and never reaches `SQLITE_DONE`. The implicit write
+    /// transaction stays open until that pooled connection is next used, and
+    /// until then the row is invisible to every *other* connection in the pool.
+    ///
+    /// Measured before the fix: **226 of 300** inserts were missing from a read
+    /// issued immediately afterwards. Nothing is lost — it commits when that
+    /// connection is reused — but "create it, then read it back" is exactly the
+    /// shape that misses, and for a freshly minted credential that is a
+    /// client's first request getting a spurious 401.
+    ///
+    /// This is phrased about *visibility* rather than about which method is
+    /// called, so a future `RETURNING` written the tempting way fails here
+    /// rather than becoming an intermittent bug somebody chases on the Pi.
+    #[tokio::test]
+    async fn a_row_written_with_returning_is_visible_immediately() {
+        let db = testdb().await;
+        let uid = db.create_user("ash", None, "pw", "user").await.unwrap();
+
+        // Interleaved on purpose: the read has to land on a *different* pool
+        // connection than the write for this to bite, and alternating is what
+        // makes that happen.
+        let mut missing = Vec::new();
+        for i in 0..40 {
+            let name = format!("con{i}");
+            let cred =
+                db.create_mcp_connection(uid, &name, "listening:read", None, None).await.unwrap();
+            if db.validate_mcp_token(&cred.token).await.unwrap().is_none() {
+                missing.push(name);
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "{} of 40 credentials could not be used immediately after being minted: {:?}",
+            missing.len(),
+            missing
+        );
+    }
+
     /// Opening a database that an *older* Tapedeck wrote.
     ///
     /// Every test above starts from `Database::new` on an empty file, which
@@ -18358,6 +19238,7 @@ mod tests {
             listening_context: ListeningContext::Active,
             icon: None,
             is_active: true,
+            shared: false,
             total_hours: 0.0,
             created_at: 0,
         })

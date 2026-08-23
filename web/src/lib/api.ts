@@ -325,6 +325,10 @@ export interface SignalChain {
 	/** A glyph name from ChainIcon's set; unknown or absent renders generic. */
 	icon?: string | null;
 	is_active: boolean;
+	/** Whether listens through this chain reach the Reel of anyone patched into
+	 *  you. **The only sharing switch there is** — there is no per-listen
+	 *  visibility. Off by default, including for every chain that predates it. */
+	shared: boolean;
 	total_hours: number;
 }
 
@@ -358,6 +362,65 @@ export interface PublishSwitch {
 	fields: string[];
 	known_fields: string[];
 	path: string;
+}
+
+/** The other end of a patch — or a deck nobody has asked about yet. */
+export interface PatchPeer {
+	/** The patch's own id. Null when no edge exists — which is what tells
+	 *  "not patched" apart from "asked and waiting". */
+	uuid: string | null;
+	/** `pending` | `accepted` | `rejected`, or null for no edge. */
+	state: string | null;
+	created_at: number | null;
+	user_id: number;
+	username: string;
+	display_name: string | null;
+	bio: string | null;
+	avatar_url: string | null;
+	/** How many chains this person publishes. **Zero is the interesting case**:
+	 *  a patch into a deck sharing nothing is accepted and reads empty, which is
+	 *  correct and needs saying rather than looking broken. */
+	shared_chains: number;
+}
+
+export interface PatchDecks {
+	decks: PatchPeer[];
+	following: PatchPeer[];
+	followers: PatchPeer[];
+}
+
+/** A listen on someone else's deck, reaching you through a patch. */
+export interface ReelListen {
+	id: number;
+	timestamp: number;
+	title: string;
+	artist: string;
+	album: string | null;
+	artwork_url: string | null;
+	caa_id: number | null;
+	caa_release_mbid: string | null;
+	format_type: string | null;
+	codec: string | null;
+	bitrate: number | null;
+	sample_rate: number | null;
+	bit_depth: number | null;
+	is_lossless: boolean | null;
+	submission_client: string | null;
+	user_id: number;
+	username: string;
+	display_name: string | null;
+	avatar_url: string | null;
+	/** The chain is the point of the Reel — it is what makes a Tapedeck listen
+	 *  a Tapedeck listen rather than a sentence. */
+	chain_name: string;
+	chain_icon: string | null;
+	chain_components: string | null;
+}
+
+export interface ReelPage {
+	listens: ReelListen[];
+	/** Keyset cursor: pass as `before`. Null when the page was short. */
+	next: number | null;
 }
 
 /**
@@ -1556,6 +1619,42 @@ class TapedeckAPI {
 	}> {
 		return this.get('/api/v1/tidal/settings');
 	}
+	// ── Patch: patches, the inbox and the Reel ──
+	//
+	// Session-only on the server, all of it: a token is held by a scrobble
+	// client, and no scrobble client has business approving who may read its
+	// owner's listening.
+	async getPatchDecks(): Promise<PatchDecks> {
+		return this.get('/api/v1/patch/decks');
+	}
+
+	async requestPatch(username: string): Promise<{ uuid: string; state: string }> {
+		return this.request('POST', '/api/v1/patch', { username });
+	}
+
+	async settlePatch(uuid: string, accept: boolean): Promise<{ state: string }> {
+		return this.request('POST', `/api/v1/patch/requests/${encodeURIComponent(uuid)}/settle`, {
+			accept
+		});
+	}
+
+	async unpatch(username: string): Promise<{ unpatched: boolean }> {
+		return this.request('DELETE', `/api/v1/patch/deck/${encodeURIComponent(username)}`);
+	}
+
+	/** The same endpoint the chain drawer calls — one state, two places. */
+	async setChainShared(chainId: number, shared: boolean): Promise<{ shared: boolean }> {
+		return this.request('PUT', `/api/v1/patch/chains/${chainId}/shared`, { shared });
+	}
+
+	async getReel(params: { limit?: number; before?: number } = {}): Promise<ReelPage> {
+		const q = new URLSearchParams();
+		if (params.limit != null) q.set('limit', String(params.limit));
+		if (params.before != null) q.set('before', String(params.before));
+		const qs = q.toString();
+		return this.get(`/api/v1/patch/reel${qs ? `?${qs}` : ''}`);
+	}
+
 	// ── Patch: whether this deck answers to the fediverse at all ──
 	//
 	// A **different question** from the now-playing switch above, and the two

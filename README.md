@@ -1110,14 +1110,14 @@ deploy/                      Sample hardened systemd unit
 
 ### Next
 
-- [ ] **Patch (social)** — follow other users on the instance ("patch into
-      someone's deck"), with follow state, stable actor URIs, and an activity
-      log designed so federation later isn't a migration. **In progress:** the
-      identity layer is built — every account can have an ActivityPub actor,
-      WebFinger record, outbox and signature-verifying inbox, opt-in per user
-      under Settings → Sharing and off by default. What remains is the follow
-      state, the approval inbox, and the per-chain switch that decides which
-      listens are shareable at all
+- [ ] **Patch (social)** — **works inside one instance.** Patch into another
+      deck on your server, approve or decline the ones pointed at you, and see
+      what they've been playing on The Reel. Sharing is **per signal chain and
+      off by default** — a listen reaches the Reel because the chain it ran
+      through was switched on, and there is no per-listen setting. Every account
+      can also have an ActivityPub actor, WebFinger record, outbox and
+      signature-verifying inbox, opt-in and off by default. What remains is the
+      rest of the screens and sending anything to other servers
 - [ ] **ActivityPub delivery** — sending activities out to other servers. The
       vocabulary question is settled: a listen is a `Create` wrapping a
       `td:Listen`, so a server that understands nothing renders "Listened to

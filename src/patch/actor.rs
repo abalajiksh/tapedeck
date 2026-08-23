@@ -69,20 +69,28 @@ pub fn outbox_uri(actor_uri: &str) -> String {
     format!("{actor_uri}/outbox")
 }
 
+pub fn followers_uri(actor_uri: &str) -> String {
+    format!("{actor_uri}/followers")
+}
+
+pub fn following_uri(actor_uri: &str) -> String {
+    format!("{actor_uri}/following")
+}
+
 /// What a deck looks like to a server that has never heard of Tapedeck.
 ///
-/// Three deliberate omissions, each because advertising an endpoint this
-/// server does not serve is worse than not having it — the same call
+/// Two deliberate omissions, each because advertising an endpoint this server
+/// does not serve is worse than not having it — the same call
 /// `listChanged: false` makes on the MCP surface:
 ///
 /// * **No `endpoints.sharedInbox`.** There is no `POST /inbox`. A sender that
 ///   believed the advertisement would batch every recipient on this host into
 ///   one delivery and have all of them 404.
-/// * **No `followers` / `following` collections.** Both are optional in
-///   ActivityPub, and neither is served yet. They arrive with Step 2, where
-///   `patches` rows exist to fill them.
 /// * **No `published`.** The account's creation date is a fact about the
 ///   person, and this document is fetched by strangers.
+///
+/// `followers` and `following` **are** advertised as of Step 2, because they
+/// are served now. They were absent in Step 1 for exactly the reason above.
 pub fn document(
     actor_uri: &str,
     username: &str,
@@ -102,6 +110,8 @@ pub fn document(
         "url": actor_uri,
         "inbox": inbox_uri(actor_uri),
         "outbox": outbox_uri(actor_uri),
+        "followers": followers_uri(actor_uri),
+        "following": following_uri(actor_uri),
         // Private by default is the instance's whole posture, and this is where
         // a remote server learns it: a follow is a request, not a subscription.
         "manuallyApprovesFollowers": true,
@@ -129,6 +139,31 @@ pub fn document(
         map.insert("icon".into(), json!({ "type": "Image", "url": icon }));
     }
 
+    doc
+}
+
+/// A collection of actor URIs — `followers` and `following`.
+///
+/// **`totalItems` and nothing else by default.** ActivityPub allows a
+/// collection to state its size without enumerating it, and that is the right
+/// default here: who a private deck has accepted is a fact about *other*
+/// people, published to anyone who asks. The count is what remote software
+/// actually uses; the list is what would leak a household's shape.
+///
+/// `items` is threaded through so Step 3 can decide to enumerate for an
+/// authorised reader without a second builder.
+pub fn actor_collection(id: &str, total: i64, items: Vec<Value>) -> Value {
+    let mut doc = json!({
+        "@context": context(),
+        "id": id,
+        "type": "OrderedCollection",
+        "totalItems": total,
+    });
+    if !items.is_empty() {
+        doc.as_object_mut()
+            .expect("built as an object")
+            .insert("orderedItems".into(), json!(items));
+    }
     doc
 }
 
@@ -261,8 +296,30 @@ mod tests {
     fn nothing_unserved_is_advertised() {
         let doc = document("https://deck.example/users/ash", "ash", None, None, None, PEM);
         assert!(doc.get("endpoints").is_none(), "no sharedInbox until POST /inbox exists");
-        assert!(doc.get("followers").is_none(), "no followers collection until Step 2 serves one");
-        assert!(doc.get("following").is_none());
+
+        // These *are* served as of Step 2, so they are advertised. They were
+        // absent before that for the same reason `sharedInbox` still is.
+        assert_eq!(doc["followers"], "https://deck.example/users/ash/followers");
+        assert_eq!(doc["following"], "https://deck.example/users/ash/following");
+    }
+
+    /// Who a private deck has accepted is a fact about *other* people, and
+    /// this document answers to anyone. The count is what remote software
+    /// uses; the list is what would leak a household's shape.
+    #[test]
+    fn a_follower_collection_states_its_size_without_naming_anyone() {
+        let c = actor_collection("https://deck.example/users/ash/followers", 3, vec![]);
+        assert_eq!(c["type"], "OrderedCollection");
+        assert_eq!(c["totalItems"], 3);
+        assert!(c.get("orderedItems").is_none(), "a count, not a roster");
+
+        // The enumerating form exists for Step 3 to use behind authorisation.
+        let named = actor_collection(
+            "https://deck.example/users/ash/following",
+            1,
+            vec![json!("https://them.example/users/kim")],
+        );
+        assert_eq!(named["orderedItems"][0], "https://them.example/users/kim");
     }
 
     #[test]

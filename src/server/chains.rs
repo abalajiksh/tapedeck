@@ -260,6 +260,10 @@ async fn create_chain(
         listening_context: body.listening_context,
         icon: body.icon.clone(),
         is_active: true,
+        // A new chain publishes nothing. Sharing is switched on deliberately,
+        // from the chain drawer or Patch → Decks, and never as a side effect of
+        // creating something.
+        shared: false,
         total_hours: 0.0,
         created_at: 0, // set by db
     };

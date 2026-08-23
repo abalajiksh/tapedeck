@@ -72,6 +72,29 @@
 		return compTypeLabel(step.type);
 	}
 
+	// ── Sharing a chain ──
+	//
+	// **One state, two places.** This calls the same endpoint Patch → Decks
+	// does, so the two screens cannot drift into disagreeing about what a deck
+	// publishes. The chain object is patched in place rather than re-fetched:
+	// the whole list would otherwise reload under an open drawer.
+	let sharingChain: number | null = null;
+
+	async function toggleShared(chain: SignalChain, on: boolean) {
+		sharingChain = chain.id;
+		try {
+			await api.setChainShared(chain.id, on);
+			chains = chains.map((c) => (c.id === chain.id ? { ...c, shared: on } : c));
+		} catch (e) {
+			alert(e instanceof Error ? e.message : 'Could not save');
+			// Re-read rather than keeping the optimistic value: what is published
+			// is not something to guess at.
+			chains = (await api.getChains()).chains;
+		} finally {
+			sharingChain = null;
+		}
+	}
+
 	// ── The chain drawer ──
 	//
 	// Held as an id rather than the object: `load()` replaces every row, and a
@@ -932,6 +955,18 @@
 								{variantsFor(c.id).length + 1} setups
 							</span>
 						{/if}
+						<!-- An indicator, not a switch. `.crow` is itself a <button>,
+						     and a nested interactive element is invalid markup that
+						     browsers resolve however they like. The design puts the
+						     switch on the row; the row here cannot hold one, so the
+						     row *shows* the state and the switch lives one click away
+						     in the drawer — which is where v0.62.0 moved everything
+						     else the card used to carry. -->
+						{#if c.shared}
+							<span class="shared-pill" title="Listens through this chain reach the Reel of anyone patched into you">
+								Shared
+							</span>
+						{/if}
 					</div>
 					<div class="cend">
 						<span class="chrs" class:zero={c.total_hours <= 0}>{formatHours(c.total_hours)}</span>
@@ -1178,6 +1213,27 @@
 					{formatHours(openChain.total_hours)} logged on this chain
 				</span>
 				<span class={ctxClass(openChain.listening_context)}>{openChain.listening_context}</span>
+			</div>
+
+			<!-- The sharing switch. **The same state as Patch → Decks** — one
+			     state, two places — because both call
+			     `PUT /api/v1/patch/chains/:id/shared`. It is here rather than
+			     buried in the editor because it is a standing decision about
+			     how you listen, not a property of the wiring. -->
+			<div class="share-row">
+				<div style="min-width:0;">
+					<div style="font-size:14px;font-weight:600;">Share this chain</div>
+					<div style="font-size:12.5px;color:var(--td-muted);line-height:1.45;max-width:46ch;">
+						Listens through it reach the Reel of anyone patched into your deck.
+						Off by default, and the only thing that publishes a listen — there
+						is no per-listen setting.
+					</div>
+				</div>
+				<label class="share-toggle">
+					<input type="checkbox" checked={openChain.shared} disabled={sharingChain === openChain.id}
+						on:change={(e) => openChain && toggleShared(openChain, e.currentTarget.checked)}>
+					{openChain.shared ? 'Shared' : 'Private'}
+				</label>
 			</div>
 
 			<div class="drawer-label">Signal path</div>
@@ -1747,6 +1803,46 @@
 		display: inline-flex; align-items: center; font-size: 11px; color: var(--td-muted-2);
 		background: var(--td-surface2); border: 1px solid var(--td-border);
 		border-radius: 999px; padding: 2px 9px; white-space: nowrap;
+	}
+
+	/* An indicator on the row, a switch in the drawer — see the markup note.
+	   Green rather than accent: accent is "this is selected", and a chain that
+	   publishes to other people is a state, not a selection. */
+	.shared-pill {
+		font-size: 11px;
+		font-weight: 600;
+		padding: 2px 8px;
+		border-radius: 999px;
+		background: var(--td-good-bg);
+		color: var(--td-good-fg);
+		white-space: nowrap;
+		flex: none;
+	}
+	.share-row {
+		display: flex;
+		align-items: center;
+		justify-content: space-between;
+		gap: 16px;
+		flex-wrap: wrap;
+		padding: 14px 16px;
+		margin-bottom: 20px;
+		border-radius: 16px;
+		background: var(--td-surface2);
+	}
+	.share-toggle {
+		display: flex;
+		align-items: center;
+		gap: 8px;
+		font-size: 13.5px;
+		font-weight: 600;
+		white-space: nowrap;
+		cursor: pointer;
+	}
+	.share-toggle input {
+		width: 16px;
+		height: 16px;
+		accent-color: var(--td-accent);
+		cursor: pointer;
 	}
 	.cend { flex: 0 0 auto; display: flex; align-items: center; gap: 14px; }
 	/* — where a gear total came from —
