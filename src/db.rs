@@ -3887,6 +3887,20 @@ impl Database {
     }
 
     /// Validate a session token from a cookie. Returns AuthUser if valid.
+    /// How stale an activity stamp may get before it is worth a write.
+    ///
+    /// **Every authenticated request used to issue one**, which on a page whose
+    /// deck polls every three seconds is twenty writes a minute per open tab —
+    /// each taking SQLite's write lock, and each turning a read request into a
+    /// write one. Thirty-three of them queued behind the stuck query in the
+    /// v0.70.1 incident, where they were read as a symptom; they were also an
+    /// amplifier, since each holds a pool connection while it waits.
+    ///
+    /// Five minutes is far finer than anything that reads these needs: nothing
+    /// reads `web_sessions.last_active_at` at all, and `tokens.last_used_at`
+    /// is shown in Settings as a relative time.
+    const ACTIVITY_STAMP_INTERVAL_SECS: i64 = 300;
+
     pub async fn validate_session(
         &self,
         session_token: &str,
@@ -3894,8 +3908,10 @@ impl Database {
         let session_hash = Self::hash_session(session_token);
         let now = Self::now_secs();
 
-        let row: Option<(i64, i64, String, String)> = sqlx::query_as(
-            "SELECT ws.id, u.id, u.username, u.role FROM web_sessions ws
+        // The stamp comes back with the row it lives on, so deciding whether
+        // to write costs nothing.
+        let row: Option<(i64, i64, String, String, i64)> = sqlx::query_as(
+            "SELECT ws.id, u.id, u.username, u.role, ws.last_active_at FROM web_sessions ws
              JOIN users u ON ws.user_id = u.id
              WHERE ws.session_hash = ? AND ws.expires_at > ? AND u.disabled = 0",
         )
@@ -3904,13 +3920,17 @@ impl Database {
         .fetch_optional(&self.pool)
         .await?;
 
-        if let Some((session_id, user_id, username, role)) = row {
-            // Update last_active_at
-            let _ = sqlx::query("UPDATE web_sessions SET last_active_at = ? WHERE id = ?")
-                .bind(now)
-                .bind(session_id)
-                .execute(&self.pool)
-                .await;
+        if let Some((session_id, user_id, username, role, last_active)) = row {
+            // Skipped entirely rather than made conditional in SQL: an `UPDATE`
+            // that matches no rows still opens a write transaction, so the only
+            // way not to pay for it is not to issue it.
+            if now - last_active >= Self::ACTIVITY_STAMP_INTERVAL_SECS {
+                let _ = sqlx::query("UPDATE web_sessions SET last_active_at = ? WHERE id = ?")
+                    .bind(now)
+                    .bind(session_id)
+                    .execute(&self.pool)
+                    .await;
+            }
             Ok(Some(AuthUser { user_id, username, is_admin: role == "admin" }))
         } else {
             Ok(None)
@@ -11939,13 +11959,26 @@ impl Database {
     pub async fn validate_token(&self, token: &str) -> Result<Option<TokenAuth>, sqlx::Error> {
         let token_hash = Self::hash_token(token);
         let now = Self::now_secs();
-        let row: Option<(i64, String, String, i64, Option<i64>, Option<String>, Option<bool>)> =
-            sqlx::query_as(
-                "SELECT u.id, u.username, u.role, t.id, t.default_chain_id, t.scopes,
-                        t.imports_are_live
+        #[allow(clippy::type_complexity)]
+        let row: Option<(
+            i64,
+            String,
+            String,
+            i64,
+            Option<i64>,
+            Option<String>,
+            Option<bool>,
+            Option<i64>,
+        )> = sqlx::query_as(
+            "SELECT u.id, u.username, u.role, t.id, t.default_chain_id, t.scopes,
+                        t.imports_are_live, t.last_used_at
              FROM tokens t JOIN users u ON t.user_id = u.id
              WHERE t.token_hash = ? AND (t.expires_at IS NULL OR t.expires_at > ?) AND u.disabled = 0"
-            ).bind(&token_hash).bind(now).fetch_optional(&self.pool).await?;
+        )
+        .bind(&token_hash)
+        .bind(now)
+        .fetch_optional(&self.pool)
+        .await?;
 
         if let Some((
             user_id,
@@ -11955,13 +11988,20 @@ impl Database {
             default_chain_id,
             scopes,
             imports_are_live,
+            last_used,
         )) = row
         {
-            let _ = sqlx::query("UPDATE tokens SET last_used_at = ? WHERE token_hash = ?")
-                .bind(now)
-                .bind(&token_hash)
-                .execute(&self.pool)
-                .await;
+            // Same throttle as the session stamp. Settings shows this as a
+            // relative time ("2 hours ago"), so five minutes of slack costs the
+            // reader nothing — and a scrobble client submitting every few
+            // minutes stops taking the write lock for it every time.
+            if last_used.is_none_or(|t| now - t >= Self::ACTIVITY_STAMP_INTERVAL_SECS) {
+                let _ = sqlx::query("UPDATE tokens SET last_used_at = ? WHERE token_hash = ?")
+                    .bind(now)
+                    .bind(&token_hash)
+                    .execute(&self.pool)
+                    .await;
+            }
             Ok(Some(TokenAuth {
                 user: AuthUser { user_id, username, is_admin: role == "admin" },
                 token_id,
@@ -17247,6 +17287,71 @@ mod tests {
                 plan.join("\n")
             );
         }
+    }
+
+    /// Authenticating does not write to the database every time.
+    ///
+    /// It used to. `validate_session` stamped `last_active_at` on **every**
+    /// authenticated request, and with the deck polling every three seconds
+    /// that is twenty writes a minute per open tab — each taking SQLite's write
+    /// lock, and each turning a read request into a write one. Thirty-three of
+    /// them queued behind the stuck query in the v0.70.1 incident, recorded
+    /// there as a symptom when they were also an amplifier.
+    ///
+    /// Asserted through `validate_session` itself rather than on the constant,
+    /// because what matters is that repeated authentication leaves the stamp
+    /// alone — and that it still moves once the interval has passed, or this
+    /// would be "we stopped recording it" wearing a performance fix's clothes.
+    #[tokio::test]
+    async fn authenticating_does_not_write_on_every_request() {
+        let db = testdb().await;
+        let uid = db.create_user("ash", None, "pw", "user").await.unwrap();
+        let token = db.create_web_session(uid).await.unwrap();
+
+        let stamp = || {
+            let pool = db.pool.clone();
+            async move {
+                sqlx::query_as::<_, (i64,)>("SELECT last_active_at FROM web_sessions")
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap()
+                    .0
+            }
+        };
+
+        // Backdate it so the first call is due, then let it write.
+        let before = Database::now_secs() - Database::ACTIVITY_STAMP_INTERVAL_SECS - 1;
+        sqlx::query("UPDATE web_sessions SET last_active_at = ?")
+            .bind(before)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        assert!(db.validate_session(&token).await.unwrap().is_some());
+        let after_due = stamp().await;
+        assert!(after_due > before, "a stamp older than the interval must still be refreshed");
+
+        // Now the half that matters, and it needs a *distinguishable* fresh
+        // stamp: setting it to `now` would be rewritten as `now`, so writing
+        // every time and not writing at all look identical inside one test run.
+        // Five seconds ago is fresh by any reading of the interval and is not a
+        // value an unconditional write could produce.
+        let fresh = Database::now_secs() - 5;
+        sqlx::query("UPDATE web_sessions SET last_active_at = ?")
+            .bind(fresh)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+
+        // Twenty requests — a minute of the deck polling one tab.
+        for _ in 0..20 {
+            assert!(db.validate_session(&token).await.unwrap().is_some());
+        }
+        assert_eq!(
+            stamp().await,
+            fresh,
+            "a fresh stamp was rewritten — that is a write, and the write lock, on every \
+             authenticated request"
+        );
     }
 
     #[tokio::test]
