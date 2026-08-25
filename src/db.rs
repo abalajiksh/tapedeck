@@ -6721,26 +6721,64 @@ impl Database {
         let today_start = crate::analytics::local_day_start(now, tz);
         let week_start = crate::analytics::local_week_start(now, tz, week_start_day);
 
-        let today: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM scrobbles WHERE user_id = ? AND skipped = FALSE AND timestamp >= ?")
-            .bind(user_id).bind(today_start).fetch_one(&self.pool).await?;
-        let week: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM scrobbles WHERE user_id = ? AND skipped = FALSE AND timestamp >= ?")
-            .bind(user_id).bind(week_start).fetch_one(&self.pool).await?;
-        let total: (i64,) =
-            sqlx::query_as("SELECT COUNT(*) FROM scrobbles WHERE user_id = ? AND skipped = FALSE")
-                .bind(user_id)
-                .fetch_one(&self.pool)
-                .await?;
-        let lossless_count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM scrobbles WHERE user_id = ? AND skipped = FALSE AND is_lossless = TRUE")
-            .bind(user_id).fetch_one(&self.pool).await?;
-        let fidelity_known: (i64,) = sqlx::query_as(&format!(
-            "SELECT COUNT(*) FROM scrobbles
-              WHERE user_id = ? AND skipped = FALSE AND {FIDELITY_KNOWN}"
-        ))
+        // ── One scan of the history, not seven ────────────────────────────
+        //
+        // This is the most-loaded page in the application, and it used to issue
+        // **thirteen** queries of which **seven** scanned the user's whole
+        // history: the total, the two fidelity counts, the running time, the
+        // quality average, and three `COUNT(DISTINCT)`s that each built a temp
+        // B-tree over every row — one of them concatenating two strings per row
+        // to do it. On a Pi with the database on an SD card that is the exact
+        // profile of the incidents in v0.58.0 and v0.70.1.
+        //
+        // Conditional aggregates give the same numbers from one pass. Each
+        // preserves its predicate exactly: `SUM(CASE WHEN … THEN 1 ELSE 0 END)`
+        // matches `COUNT(*) … WHERE`, and `SUM`/`AVG` already ignore NULLs, so
+        // dropping the `IS NOT NULL` filters changes nothing.
+        //
+        // Over **zero rows every `SUM` and `AVG` is NULL**, including the ones
+        // standing in for counts — hence the `Option`s. A fresh account reading
+        // `null` where it used to read `0` is the one way this could regress.
+        let whole: (i64, Option<i64>, Option<i64>, Option<i64>, Option<f64>) =
+            sqlx::query_as(&format!(
+                "SELECT COUNT(*),
+                        SUM(CASE WHEN is_lossless = TRUE THEN 1 ELSE 0 END),
+                        SUM(CASE WHEN {FIDELITY_KNOWN} THEN 1 ELSE 0 END),
+                        SUM(duration),
+                        AVG(quality_score)
+                   FROM scrobbles WHERE user_id = ? AND skipped = FALSE"
+            ))
+            .bind(user_id)
+            .fetch_one(&self.pool)
+            .await?;
+        let (total, lossless_count, fidelity_known, total_duration, avg_quality) =
+            (whole.0, whole.1.unwrap_or(0), whole.2.unwrap_or(0), whole.3.unwrap_or(0), whole.4);
+
+        // Today and this week from one indexed range rather than four. Today is
+        // inside this week, but the floor is the smaller of the two anyway —
+        // the alternative is a silent hole on whichever boundary is wrong.
+        let floor = week_start.min(today_start);
+        let recent: (Option<i64>, Option<i64>, Option<i64>, Option<i64>) = sqlx::query_as(
+            "SELECT SUM(CASE WHEN timestamp >= ?2 THEN 1 ELSE 0 END),
+                    SUM(CASE WHEN timestamp >= ?3 THEN 1 ELSE 0 END),
+                    SUM(CASE WHEN timestamp >= ?2 THEN duration END),
+                    SUM(CASE WHEN timestamp >= ?3 THEN duration END)
+               FROM scrobbles
+              WHERE user_id = ?1 AND skipped = FALSE AND timestamp >= ?4",
+        )
         .bind(user_id)
+        .bind(today_start)
+        .bind(week_start)
+        .bind(floor)
         .fetch_one(&self.pool)
         .await?;
-        let lossless_pct = if fidelity_known.0 > 0 {
-            (lossless_count.0 as f64 / fidelity_known.0 as f64 * 100.0).round() as i64
+        let today = recent.0.unwrap_or(0);
+        let week = recent.1.unwrap_or(0);
+        let today_hours = recent.2.unwrap_or(0) as f64 / 3600.0;
+        let week_hours = recent.3.unwrap_or(0) as f64 / 3600.0;
+
+        let lossless_pct = if fidelity_known > 0 {
+            (lossless_count as f64 / fidelity_known as f64 * 100.0).round() as i64
         } else {
             0
         };
@@ -6753,43 +6791,21 @@ impl Database {
         .bind(now - 30 * 86400)
         .fetch_optional(&self.pool)
         .await?;
-        let unique_artists: (i64,) = sqlx::query_as(
-            "SELECT COUNT(DISTINCT artist) FROM scrobbles WHERE user_id = ? AND skipped = FALSE",
-        )
-        .bind(user_id)
-        .fetch_one(&self.pool)
-        .await?;
-        let unique_albums: (i64,) = sqlx::query_as("SELECT COUNT(DISTINCT album) FROM scrobbles WHERE user_id = ? AND skipped = FALSE AND album IS NOT NULL")
-            .bind(user_id).fetch_one(&self.pool).await?;
-        let unique_tracks: (i64,) = sqlx::query_as("SELECT COUNT(DISTINCT title || '|' || artist) FROM scrobbles WHERE user_id = ? AND skipped = FALSE")
-            .bind(user_id).fetch_one(&self.pool).await?;
-        let total_duration: (Option<i64>,) = sqlx::query_as("SELECT SUM(duration) FROM scrobbles WHERE user_id = ? AND skipped = FALSE AND duration IS NOT NULL")
-            .bind(user_id).fetch_one(&self.pool).await?;
-        let total_hours = total_duration.0.unwrap_or(0) as f64 / 3600.0;
-        let today_duration: (Option<i64>,) = sqlx::query_as("SELECT SUM(duration) FROM scrobbles WHERE user_id = ? AND skipped = FALSE AND timestamp >= ? AND duration IS NOT NULL")
-            .bind(user_id).bind(today_start).fetch_one(&self.pool).await?;
-        let week_duration: (Option<i64>,) = sqlx::query_as("SELECT SUM(duration) FROM scrobbles WHERE user_id = ? AND skipped = FALSE AND timestamp >= ? AND duration IS NOT NULL")
-            .bind(user_id).bind(week_start).fetch_one(&self.pool).await?;
-        let today_hours = today_duration.0.unwrap_or(0) as f64 / 3600.0;
-        let week_hours = week_duration.0.unwrap_or(0) as f64 / 3600.0;
-        let avg_quality: (Option<f64>,) = sqlx::query_as("SELECT AVG(quality_score) FROM scrobbles WHERE user_id = ? AND skipped = FALSE AND quality_score IS NOT NULL")
-            .bind(user_id).fetch_one(&self.pool).await?;
+        let total_hours = total_duration as f64 / 3600.0;
 
         Ok(serde_json::json!({
-            "today": today.0, "this_week": week.0, "total": total.0,
+            "today": today, "this_week": week, "total": total,
             "lossless_pct": lossless_pct,
             // What the share is *of*. The client shows the coverage instead of
             // the percentage when this is too small a slice to score — a 94%
             // computed from 558 of 21,390 listens is a fact about the 558.
-            "fidelity_known": fidelity_known.0,
+            "fidelity_known": fidelity_known,
             "top_artist": top_artist.as_ref().map(|(a, _)| a.as_str()).unwrap_or("—"),
             "top_artist_count": top_artist.as_ref().map(|(_, c)| *c).unwrap_or(0),
-            "unique_artists": unique_artists.0, "unique_albums": unique_albums.0,
-            "unique_tracks": unique_tracks.0,
             "total_hours": (total_hours * 10.0).round() / 10.0,
             "today_hours": (today_hours * 10.0).round() / 10.0,
             "week_hours": (week_hours * 10.0).round() / 10.0,
-            "avg_quality": avg_quality.0.map(|q| (q * 10.0).round() / 10.0).unwrap_or(0.0),
+            "avg_quality": avg_quality.map(|q| (q * 10.0).round() / 10.0).unwrap_or(0.0),
         }))
     }
 
@@ -17035,6 +17051,204 @@ mod tests {
     /// is lexicographic and `"ead839e9…" > "9e5838c1…"`, while `MAX(caa_id)`
     /// picks the album, because its id is numerically larger. A test built on
     /// tidier values would pass against the bug.
+    /// The dashboard's folded aggregates answer exactly what the thirteen
+    /// separate queries did.
+    ///
+    /// Written against the **old SQL run side by side**, not against numbers
+    /// typed out by hand: this collapsed seven whole-history scans into one,
+    /// and a faster query that answers differently is not a fix. Every
+    /// predicate here is one the conditional aggregates had to reproduce —
+    /// nulls in `duration` and `quality_score`, a skip that must not count, and
+    /// listens either side of both the day and the week boundary.
+    #[tokio::test]
+    async fn the_dashboard_folds_its_scans_without_changing_the_answers() {
+        let db = testdb().await;
+        let uid = db.create_user("ash", None, "pw", "user").await.unwrap();
+        let tz = chrono_tz::Europe::Berlin;
+        let now = Database::now_secs();
+        let today_start = crate::analytics::local_day_start(now, tz);
+        let week_start = crate::analytics::local_week_start(now, tz, 1);
+
+        // A history spanning both boundaries, with the awkward rows in it: a
+        // listen with no duration, one with no quality score, and a skip.
+        let rows: [(&str, &str, i64, Option<i64>, Option<i64>, bool); 6] = [
+            ("Aphex Twin", "Xtal", today_start + 60, Some(300), Some(90), false),
+            ("Aphex Twin", "Xtal", today_start + 120, None, Some(70), false),
+            ("Burial", "Archangel", week_start + 60, Some(240), None, false),
+            ("Burial", "Archangel", week_start - 86_400, Some(240), Some(50), false),
+            ("Massive Attack", "Teardrop", now - 400 * 86_400, Some(330), Some(60), false),
+            // Skipped: excluded from every one of these figures.
+            ("Massive Attack", "Angel", today_start + 300, Some(370), Some(99), true),
+        ];
+        for (i, (artist, title, ts, dur, q, skipped)) in rows.iter().enumerate() {
+            sqlx::query(
+                "INSERT INTO scrobbles
+                   (user_id, title, artist, album, timestamp, duration, source_id, source_name,
+                    status, skipped, quality_score, is_lossless, codec)
+                 VALUES (?, ?, ?, 'an album', ?, ?, ?, 'test', 'synced', ?, ?, ?, ?)",
+            )
+            .bind(uid)
+            .bind(title)
+            .bind(artist)
+            .bind(ts)
+            .bind(dur)
+            .bind(format!("s{i}"))
+            .bind(skipped)
+            .bind(q)
+            .bind(i % 2 == 0)
+            .bind(if i % 3 == 0 { "flac" } else { "" })
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        }
+
+        let got = db.get_dashboard_stats(uid, tz, 1).await.unwrap();
+
+        // The originals, run verbatim.
+        let one = |sql: &'static str| {
+            let pool = db.pool.clone();
+            async move {
+                sqlx::query_as::<_, (Option<i64>,)>(sql)
+                    .bind(uid)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap()
+                    .0
+                    .unwrap_or(0)
+            }
+        };
+        let ranged = |sql: &'static str, floor: i64| {
+            let pool = db.pool.clone();
+            async move {
+                sqlx::query_as::<_, (Option<i64>,)>(sql)
+                    .bind(uid)
+                    .bind(floor)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap()
+                    .0
+                    .unwrap_or(0)
+            }
+        };
+
+        assert_eq!(
+            got["total"].as_i64().unwrap(),
+            one("SELECT COUNT(*) FROM scrobbles WHERE user_id = ? AND skipped = FALSE").await
+        );
+        assert_eq!(
+            got["fidelity_known"].as_i64().unwrap(),
+            one(concat!(
+                "SELECT COUNT(*) FROM scrobbles WHERE user_id = ? AND skipped = FALSE AND ",
+                "(COALESCE(format_type, '') = 'dsd' OR is_lossless IS NOT NULL ",
+                "OR COALESCE(codec, '') != '')"
+            ))
+            .await
+        );
+        assert_eq!(
+            got["today"].as_i64().unwrap(),
+            ranged(
+                "SELECT COUNT(*) FROM scrobbles
+                  WHERE user_id = ? AND skipped = FALSE AND timestamp >= ?",
+                today_start
+            )
+            .await
+        );
+        assert_eq!(
+            got["this_week"].as_i64().unwrap(),
+            ranged(
+                "SELECT COUNT(*) FROM scrobbles
+                  WHERE user_id = ? AND skipped = FALSE AND timestamp >= ?",
+                week_start
+            )
+            .await
+        );
+
+        let secs = one("SELECT SUM(duration) FROM scrobbles
+              WHERE user_id = ? AND skipped = FALSE AND duration IS NOT NULL")
+        .await;
+        assert_eq!(
+            got["total_hours"].as_f64().unwrap(),
+            (secs as f64 / 3600.0 * 10.0).round() / 10.0
+        );
+        let today_secs = ranged(
+            "SELECT SUM(duration) FROM scrobbles
+              WHERE user_id = ? AND skipped = FALSE AND timestamp >= ? AND duration IS NOT NULL",
+            today_start,
+        )
+        .await;
+        assert_eq!(
+            got["today_hours"].as_f64().unwrap(),
+            (today_secs as f64 / 3600.0 * 10.0).round() / 10.0
+        );
+
+        // The skip is the one that is easiest to lose in a rewrite: it is the
+        // busiest listen in the fixture on every axis.
+        assert_eq!(got["total"].as_i64().unwrap(), 5, "the skip counts nowhere");
+        assert_eq!(got["today"].as_i64().unwrap(), 2);
+        assert!(got["avg_quality"].as_f64().unwrap() > 0.0, "nulls are skipped, not zeroed");
+
+        // Dropped deliberately: three `COUNT(DISTINCT)` scans that nothing
+        // rendered and that Statistics already shows against a range control.
+        for gone in ["unique_artists", "unique_albums", "unique_tracks"] {
+            assert!(got.get(gone).is_none(), "{gone} should not be computed any more");
+        }
+    }
+
+    /// And it does it in one pass, which the equivalence test above cannot see.
+    ///
+    /// The plan is the hardware-independent evidence — this project's own rule,
+    /// after v0.58.0 found a regression a laptop clock could not. Splitting
+    /// these back into separate queries would keep every number correct and
+    /// quietly restore seven whole-history scans to the busiest page in the
+    /// application, which is how v0.70.1 became an outage rather than a slow
+    /// screen.
+    #[tokio::test]
+    async fn the_dashboard_reads_the_history_once_and_builds_no_temp_btree() {
+        let db = testdb().await;
+        let uid = db.create_user("ash", None, "pw", "user").await.unwrap();
+
+        let whole = format!(
+            "SELECT COUNT(*),
+                    SUM(CASE WHEN is_lossless = TRUE THEN 1 ELSE 0 END),
+                    SUM(CASE WHEN {FIDELITY_KNOWN} THEN 1 ELSE 0 END),
+                    SUM(duration),
+                    AVG(quality_score)
+               FROM scrobbles WHERE user_id = ? AND skipped = FALSE"
+        );
+        let recent = "SELECT SUM(CASE WHEN timestamp >= ?2 THEN 1 ELSE 0 END),
+                             SUM(CASE WHEN timestamp >= ?3 THEN duration END)
+                        FROM scrobbles
+                       WHERE user_id = ?1 AND skipped = FALSE AND timestamp >= ?4"
+            .to_string();
+
+        for (name, sql, binds) in
+            [("whole history", whole, 1usize), ("today and this week", recent, 4)]
+        {
+            let explain = format!("EXPLAIN QUERY PLAN {sql}");
+            let mut q = sqlx::query_as::<_, (i64, i64, i64, String)>(&explain);
+            for _ in 0..binds {
+                q = q.bind(uid);
+            }
+            let plan: Vec<String> =
+                q.fetch_all(&db.pool).await.unwrap().into_iter().map(|r| r.3).collect();
+
+            // A `SEARCH … USING INDEX` is the wanted shape; a bare `SCAN` is
+            // not, and neither is a sort structure built over every row.
+            assert!(
+                !plan.iter().any(|l| l.contains("TEMP B-TREE")),
+                "the {name} read builds a temp B-tree — that is what the three dropped \
+                 COUNT(DISTINCT) queries did, over the whole history, per dashboard load. \
+                 Plan:\n{}",
+                plan.join("\n")
+            );
+            assert!(
+                plan.iter().any(|l| l.contains("USING INDEX") || l.contains("USING COVERING")),
+                "the {name} read is not using an index at all. Plan:\n{}",
+                plan.join("\n")
+            );
+        }
+    }
+
     #[tokio::test]
     async fn a_grouped_cover_comes_from_one_listen() {
         let db = testdb().await;

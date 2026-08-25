@@ -26,7 +26,7 @@ openapi: 3.1.0
 
 info:
   title: Tapedeck
-  version: 0.91.2
+  version: 0.92.0
   summary: Self-hosted scrobbler and listening journal.
   description: |
     Tapedeck ingests listens, enriches them with MusicBrainz metadata, stores
@@ -3505,6 +3505,14 @@ paths:
       description: |
         Scope: `read` *(since v0.39)*. "Today" and "this week" are bucketed in
         the user's own timezone and honour their week-start preference.
+
+
+        Deliberately **does not** carry distinct artist, album or track counts.
+        It used to compute all three, each a `COUNT(DISTINCT)` building a temp
+        B-tree over the whole history, on the most-loaded page in the
+        application — and nothing rendered any of them. `GET /api/v1/stats`
+        answers the same question against a range control, which is where it
+        belongs.
       security: [{ sessionCookie: [] }, { apiToken: [read] }]
       responses:
         '200':
@@ -3519,7 +3527,12 @@ paths:
                   total: { type: integer }
                   lossless_pct: { type: number, description: 'Share of listens **whose format is known**, not of `total`. Most of an imported history has no format at all, so dividing by every play measured the import ratio instead.' }
                   fidelity_known: { type: integer, description: 'The denominator of `lossless_pct`. Clients should report this coverage rather than presenting the share as a fact about the whole history.' }
-                  top_artist: { type: [string, 'null'] }
+                  top_artist: { type: [string, 'null'], description: 'Most played over the last 30 days, or "—".' }
+                  top_artist_count: { type: integer, description: 'Their plays in that window. Rides along with `top_artist` from one query.' }
+                  total_hours: { type: number, description: 'A **floor**: a listen whose source reported no length contributes nothing.' }
+                  today_hours: { type: number }
+                  week_hours: { type: number }
+                  avg_quality: { type: number, description: 'Over listens that have a score at all — ingest, Plex and Jellyfin only. `0` where nothing is scored, which an imported history is.' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
 
