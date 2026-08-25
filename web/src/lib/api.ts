@@ -116,6 +116,64 @@ export interface GenreTrajectory {
 }
 
 /** State of the local copy of the Every Noise genre map, and any running scrape. */
+export interface SinkHealth {
+	name: string;
+	failures: number;
+	total_failures: number;
+	total_successes: number;
+	last_ok: number | null;
+	last_failure: number | null;
+	last_error: string | null;
+	/** Set while the breaker is open and this service is being skipped outright. */
+	skipping_for: number | null;
+}
+
+export interface SourceHealth {
+	id: number;
+	user_id: number;
+	username: string;
+	kind: string;
+	label: string;
+	enabled: boolean;
+	poll_interval_secs: number | null;
+	last_polled_at: number | null;
+	last_error: string | null;
+}
+
+export interface OpsStatus {
+	version: string;
+	uptime_secs: number;
+	logs_enabled: boolean;
+	tick: {
+		interval_secs: number;
+		ticks: number;
+		last_started: number | null;
+		last_duration_ms: number;
+		longest_ms: number;
+		overruns: number;
+		deferred_listens: number;
+		/** The tick is taking longer than its own interval — sources and the deck are that late. */
+		behind: boolean;
+	};
+	sinks: SinkHealth[];
+	sources: SourceHealth[];
+}
+
+export interface LogFile {
+	name: string;
+	bytes: number;
+}
+
+export interface LogTail {
+	file: string;
+	files: string[];
+	/** What the filter found, against `shown` — so a capped tail cannot read as the whole answer. */
+	matched: number;
+	shown: number;
+	truncated: boolean;
+	lines: string[];
+}
+
 export interface EveryNoiseStatus {
 	summary: {
 		genres: number;
@@ -2460,6 +2518,40 @@ class TapedeckAPI {
 	/** The whole genre map, and where the caller's listening sits on it. */
 	async getGenreMap(): Promise<GenreMap> {
 		return this.get('/api/v1/genre-map');
+	}
+
+	// ── Operations (admin) ──
+	//
+	// Instance-wide health, and the log. Admin- and session-only server-side:
+	// a log carries usernames, source labels and request paths, so an API token
+	// cannot reach any of this.
+	async getOps(): Promise<OpsStatus> {
+		return this.get('/admin/ops');
+	}
+	async getLogFiles(): Promise<{ files: LogFile[] }> {
+		return this.get('/admin/logs/files');
+	}
+	async getLogTail(opts: {
+		lines?: number;
+		level?: string;
+		q?: string;
+		file?: string;
+	} = {}): Promise<LogTail> {
+		const p = new URLSearchParams();
+		if (opts.lines) p.set('lines', String(opts.lines));
+		if (opts.level) p.set('level', opts.level);
+		if (opts.q) p.set('q', opts.q);
+		if (opts.file) p.set('file', opts.file);
+		const qs = p.toString();
+		return this.get(`/admin/logs${qs ? `?${qs}` : ''}`);
+	}
+	/// The download is a plain link rather than a fetch — the file is served as
+	/// an attachment and the browser is better at saving one than we are.
+	logDownloadUrl(file?: string): string {
+		return `/admin/logs/download${file ? `?file=${encodeURIComponent(file)}` : ''}`;
+	}
+	async restartServer(): Promise<{ status: string; note: string }> {
+		return this.post('/admin/restart');
 	}
 
 	// ── Every Noise genre map (admin) ──

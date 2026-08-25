@@ -26,7 +26,7 @@ openapi: 3.1.0
 
 info:
   title: Tapedeck
-  version: 0.90.2
+  version: 0.91.0
   summary: Self-hosted scrobbler and listening journal.
   description: |
     Tapedeck ingests listens, enriches them with MusicBrainz metadata, stores
@@ -7667,6 +7667,183 @@ paths:
         '401': { $ref: '#/components/responses/Unauthorized' }
         '404': { $ref: '#/components/responses/NotFound' }
 
+  /admin/ops:
+    get:
+      tags: [Admin, Operations]
+      summary: Engine, sink and source health for this instance.
+      description: >
+        Session-only, admin role — instance-wide, and the source rows are not
+        scoped to the caller. One request rather than several because the
+        Operations screen polls it while open.
+
+
+        `tick.behind` is the number that matters: a tick taking longer than its
+        own `interval_secs` means source polling and the deck are that late.
+        `sinks[].skipping_for` is set while a service's breaker is open and it
+        is being skipped outright. Neither credentials nor source URLs are
+        returned.
+      responses:
+        '200':
+          description: OK.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+                properties:
+                  version: { type: string }
+                  uptime_secs: { type: integer }
+                  logs_enabled: { type: boolean }
+                  tick:
+                    type: object
+                    additionalProperties: true
+                    properties:
+                      interval_secs: { type: integer }
+                      ticks: { type: integer }
+                      last_started: { type: [integer, 'null'] }
+                      last_duration_ms: { type: integer }
+                      longest_ms: { type: integer }
+                      overruns: { type: integer }
+                      deferred_listens: { type: integer }
+                      behind: { type: boolean }
+                  sinks:
+                    type: array
+                    items:
+                      type: object
+                      additionalProperties: true
+                      properties:
+                        name: { type: string }
+                        failures: { type: integer }
+                        total_failures: { type: integer }
+                        total_successes: { type: integer }
+                        last_ok: { type: [integer, 'null'] }
+                        last_failure: { type: [integer, 'null'] }
+                        last_error: { type: [string, 'null'] }
+                        skipping_for: { type: [integer, 'null'] }
+                  sources:
+                    type: array
+                    items:
+                      type: object
+                      additionalProperties: true
+                      properties:
+                        id: { type: integer }
+                        user_id: { type: integer }
+                        username: { type: string }
+                        kind: { type: string }
+                        label: { type: string }
+                        enabled: { type: boolean }
+                        poll_interval_secs: { type: [integer, 'null'] }
+                        last_polled_at: { type: [integer, 'null'] }
+                        last_error: { type: [string, 'null'] }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /admin/logs:
+    get:
+      tags: [Admin, Operations]
+      summary: The tail of a log file, filtered.
+      description: >
+        Session-only, admin role. A log carries usernames, source labels and
+        request paths, so this is deliberately unreachable with an API token —
+        the endpoint does not accept one, so scopes never enter into it.
+
+
+        `level` means "this and worse", so `warn` includes errors. `matched` is
+        what the filter found against `shown`, so a capped tail cannot be
+        mistaken for the whole answer.
+      parameters:
+        - { name: lines, in: query, schema: { type: integer, default: 300, maximum: 2000 } }
+        - { name: level, in: query, schema: { type: string, enum: [error, warn, info, debug] } }
+        - { name: q, in: query, schema: { type: string }, description: Substring filter, applied after the level. }
+        - { name: file, in: query, schema: { type: string }, description: One of the names from /admin/logs/files. Anything else is a 404. }
+      responses:
+        '200':
+          description: OK.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+                properties:
+                  file: { type: string }
+                  files: { type: array, items: { type: string } }
+                  matched: { type: integer }
+                  shown: { type: integer }
+                  truncated: { type: boolean }
+                  lines: { type: array, items: { type: string } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { description: File logging is off, or no such file. }
+  /admin/logs/files:
+    get:
+      tags: [Admin, Operations]
+      summary: The log files this instance is holding, newest first.
+      description: >
+        Session-only, admin role. Seven daily files are kept. These names are
+        the only values `file` accepts elsewhere — a request names one of
+        these, never a path.
+      responses:
+        '200':
+          description: OK.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+                properties:
+                  files:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        name: { type: string }
+                        bytes: { type: integer }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { description: File logging is off on this instance. }
+  /admin/logs/download:
+    get:
+      tags: [Admin, Operations]
+      summary: Download one log file whole.
+      description: Session-only, admin role. Served `private, no-store`.
+      parameters:
+        - { name: file, in: query, schema: { type: string }, description: One of the names from /admin/logs/files. Defaults to today's. }
+      responses:
+        '200':
+          description: The file.
+          content:
+            text/plain:
+              schema: { type: string }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { description: File logging is off, or no such file. }
+  /admin/restart:
+    post:
+      tags: [Admin, Operations]
+      summary: Drain and stop, so a supervisor restarts the process.
+      description: >
+        Session-only, admin role. In-flight requests drain and the engine
+        finishes its current tick before the process exits, so this cannot cut
+        a write in half — it is gentler than the kill an operator reaches for
+        otherwise.
+
+
+        The process exits **non-zero** (75, `EX_TEMPFAIL`) deliberately: the
+        supplied systemd unit is `Restart=on-failure`, so a clean exit would
+        stop the service instead of restarting it. On a host with nothing
+        supervising the process, this is a stop.
+      responses:
+        '202':
+          description: Accepted; the drain has started.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+                properties:
+                  status: { type: string }
+                  note: { type: string }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
   /admin/everynoise:
     get:
       tags: [Admin, Genre map]

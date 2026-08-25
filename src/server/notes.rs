@@ -643,7 +643,13 @@ pub async fn set_love(
                 let (artist, title, mbid, uid) =
                     (e.artist_name.clone(), e.name.clone(), e.mbid.clone(), user.user_id);
                 tokio::spawn(async move {
-                    let sinks = crate::sinks::sinks_for_user(&db, uid, &url).await;
+                    // Tolerating a failed read here is deliberate and stated:
+                    // the love is already stored, and unlike a scrobble it is
+                    // idempotent and re-assertable, so a missed mirror is fixed
+                    // by the next toggle. Only the scrobble flush may not
+                    // treat this as an empty answer.
+                    let sinks =
+                        crate::sinks::sinks_for_user(&db, uid, &url).await.unwrap_or_default();
                     crate::sinks::submit_love(&sinks, &artist, &title, mbid.as_deref(), loved)
                         .await;
                 });

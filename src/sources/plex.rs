@@ -620,6 +620,16 @@ pub struct PlexSource {
 /// sessions are read.
 const HISTORY_SYNC_INTERVAL_SECS: u64 = 60;
 
+/// Rows per request on the history walk. Plex's own default, and the value this
+/// asked for as a hard `limit` before it learned to page.
+const HISTORY_PAGE_SIZE: usize = 50;
+
+/// Ceiling on one walk, so a server with a pathological history cannot make a
+/// single tick unbounded — the mistake this whole area is being fixed for. At
+/// the 7-day window this is far more listening than anyone does; reaching it
+/// says so in the log rather than truncating in silence.
+const HISTORY_MAX_ROWS: usize = 2_000;
+
 /// How far the playhead must jump backwards before it counts as the track
 /// starting over rather than the user scrubbing. Plex reports `viewOffset` a
 /// few seconds coarse, and a repeat always lands near zero, so this only has to
@@ -1471,27 +1481,29 @@ impl PlexSource {
         }
     }
 
+    /// Walk `/status/sessions/history/all` newest-first until it reaches
+    /// something older than the window, then stop.
+    ///
+    /// **It used to ask for one page of 50 and stop there**, which is fine at a
+    /// 60-second cadence and silently wrong after any gap: this walk exists to
+    /// catch plays that finished between polls, and it was structurally
+    /// incapable of catching more than fifty of them. On 2026-08-24 the tick
+    /// stretched to 45–92 minutes and this page came back saturated at exactly
+    /// fifty rows twenty-eight times — within roughly 2× of losing listens
+    /// outright, with nothing anywhere saying so.
+    ///
+    /// Paging costs nothing in the ordinary case: at a healthy cadence the
+    /// first page already reaches past the window at its bottom, so the loop
+    /// stops after one request exactly as before. It spends more only when
+    /// there is more to find, which is the case it exists for. Overlap is free
+    /// — `source_id` is derived from the row, so `save_scrobble`'s uniqueness
+    /// absorbs a row seen twice. Prefer a few redundant rows to a silent hole,
+    /// which is the rule `navidrome::resume_point` already follows.
     async fn fetch_history_tracks(
         &mut self,
         _min_timestamp: u64,
     ) -> Result<Vec<PlexTrack>, Box<dyn std::error::Error>> {
         let endpoint = format!("{}/status/sessions/history/all", self.url);
-        let resp = self
-            .client
-            .get(&endpoint)
-            .query(&[("sort", "viewedAt:desc"), ("limit", "50")])
-            .header("X-Plex-Token", &self.token)
-            .header("Accept", "application/xml")
-            .send()
-            .await?;
-
-        if !resp.status().is_success() {
-            warn!("History fetch failed: HTTP {}", resp.status());
-            return Ok(Vec::new());
-        }
-
-        let text = resp.text().await?;
-        let history_tracks = Self::parse_history_xml(&text);
 
         let seven_days_ago = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -1499,7 +1511,50 @@ impl PlexSource {
             .as_secs()
             .saturating_sub(7 * 86400);
 
-        info!("Processing {} history tracks from Plex", history_tracks.len());
+        let mut history_tracks: Vec<HistoryTrack> = Vec::new();
+        let mut start = 0usize;
+        let mut pages = 0usize;
+        loop {
+            let resp = self
+                .client
+                .get(&endpoint)
+                .query(&[("sort", "viewedAt:desc")])
+                // Plex pages with these two headers rather than with `limit`.
+                .header("X-Plex-Container-Start", start.to_string())
+                .header("X-Plex-Container-Size", HISTORY_PAGE_SIZE.to_string())
+                .header("X-Plex-Token", &self.token)
+                .header("Accept", "application/xml")
+                .send()
+                .await?;
+
+            if !resp.status().is_success() {
+                warn!("History fetch failed: HTTP {}", resp.status());
+                // Whatever earlier pages produced is still good — returning it
+                // beats throwing the walk away because page four timed out.
+                break;
+            }
+
+            let text = resp.text().await?;
+            let page = Self::parse_history_xml(&text);
+            let got = page.len();
+            pages += 1;
+            let more = Self::wants_another_page(&page, seven_days_ago, start + got);
+            history_tracks.extend(page);
+
+            if !more {
+                if start + got >= HISTORY_MAX_ROWS {
+                    warn!(
+                        "Plex history walk stopped at its {}-row ceiling without reaching the \
+                         7-day edge — anything older is not being caught up",
+                        HISTORY_MAX_ROWS
+                    );
+                }
+                break;
+            }
+            start += got;
+        }
+
+        info!("Processing {} history tracks from Plex ({} page(s))", history_tracks.len(), pages);
         let isolated = !self.filters.users_allow.is_empty();
         Ok(Self::own_history_tracks(
             history_tracks,
@@ -1507,6 +1562,36 @@ impl PlexSource {
             &self.filters.accounts_allow,
             seven_days_ago,
         ))
+    }
+
+    /// Is another page of history worth asking for?
+    ///
+    /// Split out and pure for the reason `own_history_tracks` and
+    /// `consume_sessions` are: it decides whether a listen is ever seen at all,
+    /// and a rule like that must be testable without a server. The old code had
+    /// no rule — it asked for fifty rows and stopped — so the answer to "did we
+    /// catch everything?" was "only if fewer than fifty things happened", and
+    /// nothing ever said which.
+    ///
+    /// Three ways to stop, and each is a different fact:
+    ///
+    /// * **A short page** is the end of the server's history. Nothing left.
+    /// * **A page reaching past the window** is the end of what is wanted. Rows
+    ///   come back `viewedAt:desc`, so once one predates the floor every row
+    ///   after it does too.
+    /// * **The ceiling** is the safety net, and the only one that is a *loss* —
+    ///   so it is the only one the caller logs about.
+    fn wants_another_page(page: &[HistoryTrack], window_floor: u64, rows_so_far: usize) -> bool {
+        if page.len() < HISTORY_PAGE_SIZE {
+            return false;
+        }
+        if rows_so_far >= HISTORY_MAX_ROWS {
+            return false;
+        }
+        // A row with no `viewedAt` cannot place itself in time, so it is not
+        // evidence that the edge has been reached — erring towards one more
+        // request rather than towards a silent hole.
+        !page.iter().filter_map(|t| t.viewed_at).any(|v| v < window_floor)
     }
 
     /// Keep the history rows that are this source's own, recent, and tracks.
@@ -1663,6 +1748,81 @@ mod tests {
             history_key: None,
             player: None,
         }
+    }
+
+    fn hrow(viewed_at: Option<u64>) -> HistoryTrack {
+        HistoryTrack {
+            media_type: Some("track".into()),
+            viewed_at,
+            history_key: None,
+            title: Some("Xtal".into()),
+            artist: Some("Aphex Twin".into()),
+            album: None,
+            track_artist: None,
+            duration: None,
+            rating_key: Some("rk1".into()),
+            parent_rating_key: None,
+            grandparent_rating_key: None,
+            account_id: Some(1),
+        }
+    }
+
+    const DAY: u64 = 86_400;
+    /// An arbitrary window floor, standing in for "seven days ago".
+    const FLOOR: u64 = 1_000_000;
+
+    /// The case reported on 2026-08-24, and the reason this paginates at all.
+    ///
+    /// The tick had stretched to 45–92 minutes, so a catch-up legitimately had
+    /// ~70 plays waiting. One page of fifty came back **full**, which the old
+    /// code read as "done" — the other twenty were never asked for and nothing
+    /// anywhere said so. A saturated page still inside the window means there
+    /// is more behind it.
+    #[test]
+    fn a_full_page_inside_the_window_is_not_the_end_of_the_backfill() {
+        let page: Vec<HistoryTrack> =
+            (0..HISTORY_PAGE_SIZE).map(|i| hrow(Some(FLOOR + DAY + i as u64))).collect();
+        assert!(
+            PlexSource::wants_another_page(&page, FLOOR, page.len()),
+            "fifty rows all inside the window means there are probably more"
+        );
+    }
+
+    /// And the ordinary case must stay one request: at a healthy cadence the
+    /// first page already reaches past the window, so paging costs nothing.
+    #[test]
+    fn a_page_reaching_past_the_window_stops_the_walk() {
+        let mut page: Vec<HistoryTrack> =
+            (0..HISTORY_PAGE_SIZE - 1).map(|i| hrow(Some(FLOOR + DAY + i as u64))).collect();
+        page.push(hrow(Some(FLOOR - 1))); // older than the floor
+        assert!(!PlexSource::wants_another_page(&page, FLOOR, page.len()));
+    }
+
+    /// A short page is the end of the server's history, whatever its dates.
+    #[test]
+    fn a_short_page_is_the_end_of_the_history() {
+        let page: Vec<HistoryTrack> = (0..3).map(|i| hrow(Some(FLOOR + DAY + i as u64))).collect();
+        assert!(!PlexSource::wants_another_page(&page, FLOOR, page.len()));
+    }
+
+    /// The ceiling bounds one walk, so a pathological history cannot make a
+    /// single tick unbounded — the failure this whole area is being fixed for.
+    #[test]
+    fn the_walk_has_a_ceiling_so_one_tick_cannot_run_away() {
+        let page: Vec<HistoryTrack> =
+            (0..HISTORY_PAGE_SIZE).map(|i| hrow(Some(FLOOR + DAY + i as u64))).collect();
+        assert!(!PlexSource::wants_another_page(&page, FLOOR, HISTORY_MAX_ROWS));
+    }
+
+    /// A row with no `viewedAt` cannot place itself in time, so it is not
+    /// evidence that the edge was reached. Erring towards one more request
+    /// beats erring towards a silent hole — the rule `resume_point` follows.
+    #[test]
+    fn a_row_with_no_timestamp_does_not_end_the_walk() {
+        let mut page: Vec<HistoryTrack> =
+            (0..HISTORY_PAGE_SIZE - 1).map(|i| hrow(Some(FLOOR + DAY + i as u64))).collect();
+        page.push(hrow(None));
+        assert!(PlexSource::wants_another_page(&page, FLOOR, page.len()));
     }
 
     /// A track dropped before it counted is a skip, and says how far in.

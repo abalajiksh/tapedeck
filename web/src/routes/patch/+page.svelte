@@ -1452,12 +1452,22 @@
 						{#each dayBars as b (b.key)}
 							<div class="hbcol">
 								<span class="hbval">{b.hours >= 1 ? `${Math.round(b.hours)}h` : ''}</span>
-								<div
-									class="hbar"
-									class:top={b.hours === peakHours && peakHours > 0}
-									style="height:{peakHours > 0 ? Math.max(4, (b.hours / peakHours) * 100) : 4}%"
-									title="{b.label}: {b.hours.toFixed(1)}h"
-								></div>
+								<!--
+									The bar is measured against a track of its own rather than
+									against the column. As a direct flex child of a fixed-height
+									column that also holds two labels, `flex-shrink` clamped every
+									bar over ~76% of the peak to the same height — so 9h, 10h and
+									11h all drew at exactly 112px and the chart went flat at the
+									top, worst of all for the peak that defines the scale.
+								-->
+								<div class="hbtrack">
+									<div
+										class="hbar"
+										class:top={b.hours === peakHours && peakHours > 0}
+										style="height:{peakHours > 0 ? Math.max(4, (b.hours / peakHours) * 100) : 4}%"
+										title="{b.label}: {b.hours.toFixed(1)}h"
+									></div>
+								</div>
 								<span class="hblabel">{b.label}</span>
 							</div>
 						{/each}
@@ -2622,9 +2632,17 @@
 		height: 100%;
 		gap: 5px;
 	}
-	.hbval { font-size: 11px; color: var(--td-muted-2); font-variant-numeric: tabular-nums; }
+	.hbval {
+		font-size: 11px; color: var(--td-muted-2);
+		font-variant-numeric: tabular-nums; flex: none;
+	}
+	/* The bar's scale. Its height is whatever the column has left once the two
+	   labels have taken theirs, so a percentage on the bar inside it means what
+	   it says — which it did not while the bar was the flex item being shrunk. */
+	.hbtrack { flex: 1 1 auto; min-height: 0; width: 100%; position: relative; }
 	.hbar {
-		width: 100%;
+		position: absolute;
+		left: 0; right: 0; bottom: 0;
 		border-radius: 7px 7px 3px 3px;
 		background: color-mix(in srgb, var(--td-accent) 42%, transparent);
 		min-height: 4px;
@@ -2632,6 +2650,7 @@
 	/* The busiest day, so the shape has somewhere to land. */
 	.hbar.top { background: var(--td-accent); }
 	.hblabel {
+		flex: none;
 		font-size: 11px;
 		color: var(--td-muted-3);
 		white-space: nowrap;

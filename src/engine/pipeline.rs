@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::time::sleep;
 use tracing::{debug, error, info, warn};
 
@@ -23,6 +23,15 @@ use super::enrichment::enrich_play;
 /// Generous on purpose — a skip written in error sits on a permanent record,
 /// while a skip written a minute late costs nothing at all.
 const SKIP_GRACE_SECS: i64 = 90;
+
+/// Longest a single MusicBrainz lookup may hold the flush.
+///
+/// Deliberately well under the flush budget: this is the one call in the loop
+/// that can be slow without anything being wrong (the client is rate limited to
+/// one request a second and its own timeout is thirty), and it is the one whose
+/// result is optional. A listen forwards fine with no MBID and the backfill
+/// fills it in later, off the tick entirely.
+const ENRICH_BUDGET: Duration = Duration::from_secs(4);
 
 /// Write a track that was playing and got replaced before it ever counted.
 ///
@@ -57,10 +66,13 @@ async fn bank_skip(
 ) {
     // Like-for-like against stored skips only, so a skip cannot be confused
     // with a real listen of the same track in either direction.
-    let dupe = db.exists(user_id, &play.source_id, &play.source_name).await.unwrap_or(false)
-        || db.fuzzy_exists(user_id, play, true).await.unwrap_or(false);
-    if dupe {
-        return;
+    match already_banked(db, user_id, play, true).await {
+        Ok(true) => return,
+        Ok(false) => {}
+        Err(e) => {
+            warn!("Could not check for a duplicate skip ({}) — not banking it this pass", e);
+            return;
+        }
     }
     let disposition = ListenDisposition { imported: false, skipped: true };
     match db
@@ -111,6 +123,36 @@ async fn bank_skip(
         Ok(false) => {}
         Err(e) => error!("Database error recording a skip: {}", e),
     }
+}
+
+/// Has this listen already been banked?
+///
+/// Three answers, not two — the third is the point. Both halves used to be
+/// `.unwrap_or(false)`, so a busy database answered *"no, this is new"* and the
+/// caller banked a second copy. The two halves fail differently and only one of
+/// them was ever safe:
+///
+/// * `exists` is backstopped by `UNIQUE(user_id, source_id, source_name)`, so
+///   the worst a wrong answer costs is a refused insert.
+/// * `fuzzy_exists` has **no constraint behind it**. It is the only thing
+///   catching the live/history double-report — the class of bug v0.13.3 and
+///   v0.65.0 were both about — so failing open here writes a duplicate listen
+///   that nothing will ever reconcile, and `flush_pending` then forwards it to
+///   the user's permanent public record.
+///
+/// So the error propagates and the caller skips this pass. Nothing is lost: the
+/// play is still in the session or the history walk, and the next tick asks
+/// again. A late listen is recoverable; a duplicate on Last.fm is not.
+async fn already_banked(
+    db: &Database,
+    user_id: i64,
+    play: &Play,
+    like_for_like_skip: bool,
+) -> Result<bool, sqlx::Error> {
+    if db.exists(user_id, &play.source_id, &play.source_name).await? {
+        return Ok(true);
+    }
+    db.fuzzy_exists(user_id, play, like_for_like_skip).await
 }
 
 pub struct ScrobbleEngine {
@@ -499,10 +541,18 @@ impl ScrobbleEngine {
         use std::panic::AssertUnwindSafe;
 
         info!("🎵 Starting scrobble loop with prioritized MusicBrainz metadata enrichment...");
+        crate::engine::health::set_interval(self.poll_interval);
         loop {
             if *shutdown.borrow() {
                 break;
             }
+
+            // Timed so Settings → Operations can say whether the engine is
+            // keeping its own schedule. A tick longer than its interval is the
+            // one number that would have made 2026-08-24 visible from inside
+            // the running application rather than from 3 MB of log over SSH.
+            let tick_at = Instant::now();
+            crate::engine::health::tick_started();
 
             // Isolate each tick: a panic here would otherwise kill the engine
             // task while the HTTP server keeps running, silently stopping all
@@ -514,6 +564,14 @@ impl ScrobbleEngine {
                     .or_else(|| p.downcast_ref::<String>().cloned())
                     .unwrap_or_else(|| "unknown panic".into());
                 error!("💥 Scrobble tick panicked (recovered): {}", msg);
+            }
+            crate::engine::health::tick_finished(tick_at.elapsed());
+            if tick_at.elapsed() > self.poll_interval {
+                debug!(
+                    "Tick took {:?} against a {:?} interval — sources and the deck are that late",
+                    tick_at.elapsed(),
+                    self.poll_interval
+                );
             }
 
             // A completed tick reached a clean boundary — stop now if asked.
@@ -582,7 +640,8 @@ impl ScrobbleEngine {
                     if changed {
                         let album = play.album.clone();
                         enrich_play(mb_client, &mut play, album.as_deref()).await;
-                        let sinks = sinks::sinks_for_user(db, user_id, lb_url).await;
+                        let sinks =
+                            sinks::sinks_for_user(db, user_id, lb_url).await.unwrap_or_default();
                         sinks::submit_now_playing(&sinks, &play).await;
                     }
                 }
@@ -602,11 +661,17 @@ impl ScrobbleEngine {
                     info!("📀 {} Navidrome listen(s) for user {}", plays.len(), user_id);
                 }
                 for mut play in plays {
-                    let dupe = db
-                        .exists(user_id, &play.source_id, &play.source_name)
-                        .await
-                        .unwrap_or(false)
-                        || db.fuzzy_exists(user_id, &play, false).await.unwrap_or(false);
+                    let dupe = match already_banked(db, user_id, &play, false).await {
+                        Ok(d) => d,
+                        Err(e) => {
+                            warn!(
+                                "Could not check for a duplicate ({}) — leaving it for the \
+                                 next tick",
+                                e
+                            );
+                            continue;
+                        }
+                    };
                     if dupe {
                         continue;
                     }
@@ -728,16 +793,20 @@ impl ScrobbleEngine {
                     let album = play.album.clone();
                     enrich_play(mb_client, &mut play, album.as_deref()).await;
                 }
-                let sinks = sinks::sinks_for_user(db, user_id, lb_url).await;
+                let sinks = sinks::sinks_for_user(db, user_id, lb_url).await.unwrap_or_default();
                 sinks::submit_now_playing(&sinks, &play).await;
             }
         }
 
         for track in sessions.ready_to_scrobble {
             let mut play = track.play;
-            let dupe =
-                db.exists(user_id, &play.source_id, &play.source_name).await.unwrap_or(false)
-                    || db.fuzzy_exists(user_id, &play, false).await.unwrap_or(false);
+            let dupe = match already_banked(db, user_id, &play, false).await {
+                Ok(d) => d,
+                Err(e) => {
+                    warn!("Could not check for a duplicate ({}) — leaving it for the next tick", e);
+                    continue;
+                }
+            };
             if dupe {
                 continue;
             }
@@ -932,7 +1001,7 @@ impl ScrobbleEngine {
                     let album = play.album.clone();
                     enrich_play(mb_client, &mut play, album.as_deref()).await;
                 }
-                let sinks = sinks::sinks_for_user(db, user_id, lb_url).await;
+                let sinks = sinks::sinks_for_user(db, user_id, lb_url).await.unwrap_or_default();
                 sinks::submit_now_playing(&sinks, &play).await;
             }
         }
@@ -942,9 +1011,13 @@ impl ScrobbleEngine {
             // it went to, so the zone is what makes a log line locatable.
             let zone_id = track.zone_id;
             let mut play = track.play;
-            let dupe =
-                db.exists(user_id, &play.source_id, &play.source_name).await.unwrap_or(false)
-                    || db.fuzzy_exists(user_id, &play, false).await.unwrap_or(false);
+            let dupe = match already_banked(db, user_id, &play, false).await {
+                Ok(d) => d,
+                Err(e) => {
+                    warn!("Could not check for a duplicate ({}) — leaving it for the next tick", e);
+                    continue;
+                }
+            };
             if dupe {
                 continue;
             }
@@ -1157,7 +1230,8 @@ impl ScrobbleEngine {
 
                 if changed {
                     enrich_play(&mb_client, &mut play, plex_track.album.as_deref()).await;
-                    let user_sinks = sinks::sinks_for_user(&db, user_id, &lb_url).await;
+                    let user_sinks =
+                        sinks::sinks_for_user(&db, user_id, &lb_url).await.unwrap_or_default();
                     sinks::submit_now_playing(&user_sinks, &play).await;
                 }
             }
@@ -1177,9 +1251,16 @@ impl ScrobbleEngine {
 
                 // Dedup before enrichment, so a duplicate doesn't cost a
                 // MusicBrainz call.
-                let already_exists =
-                    db.exists(user_id, &play.source_id, &play.source_name).await.unwrap_or(false)
-                        || db.fuzzy_exists(user_id, &play, false).await.unwrap_or(false);
+                let already_exists = match already_banked(&db, user_id, &play, false).await {
+                    Ok(d) => d,
+                    Err(e) => {
+                        warn!(
+                            "Could not check for a duplicate ({}) — leaving it for the next tick",
+                            e
+                        );
+                        continue;
+                    }
+                };
                 if already_exists {
                     debug!("Skipping already-scrobbled: {} - {}", play.artist, play.title);
                     continue;
@@ -1455,7 +1536,20 @@ impl ScrobbleEngine {
         false
     }
 
+    /// Forward everything still `pending`, **bounded against the tick**.
+    ///
+    /// This is awaited inline at the tail of `run_tick`, so however long it
+    /// takes is how late every source poll and every deck update is. That was
+    /// only theoretical until 2026-08-24, when one unreachable upstream turned
+    /// a 5-second tick into 45–92 minutes and the deck went dark for a day.
+    ///
+    /// So it now stops at [`Self::flush_budget`] and leaves the rest
+    /// `pending` for the next tick. Nothing is lost by stopping early: that is
+    /// the queue's normal state, and `delivered_sinks` already means a retry
+    /// cannot double-send a listen a partial flush did deliver. Being late is
+    /// recoverable; being stopped is not.
     async fn flush_pending(&mut self) {
+        let deadline = Instant::now() + self.flush_budget();
         let pending = match self.db.get_pending_scrobbles().await {
             Ok(p) => p,
             Err(e) => {
@@ -1476,16 +1570,73 @@ impl ScrobbleEngine {
             by_user.entry(ps.user_id).or_default().push(ps);
         }
 
+        let mut ran_out = 0usize;
         for (uid, items) in by_user {
+            if Instant::now() >= deadline {
+                ran_out += items.len();
+                continue;
+            }
             // Rebuilt each flush (fresh reqwest client) — fine at self-host
             // volume; cache per user if throughput ever matters.
-            let targets = sinks::sinks_for_user(&self.db, uid, &self.listenbrainz_url).await;
+            //
+            // A failed read here is **not** an empty connection list, and the
+            // difference is the whole reason this returns a `Result`: `enabled`
+            // would come back empty, the all-delivered test below would be
+            // vacuously true, and the listen would be marked `synced` having
+            // been sent nowhere — permanently, and logged as a success. Skip
+            // the user; the row stays `pending` and next tick tries again.
+            let targets = match sinks::sinks_for_user(&self.db, uid, &self.listenbrainz_url).await {
+                Ok(t) => t,
+                Err(e) => {
+                    error!(
+                        "Could not read connections for user {} ({}) — leaving {} listen(s) \
+                         pending rather than marking them sent",
+                        uid,
+                        e,
+                        items.len()
+                    );
+                    continue;
+                }
+            };
             let enabled: Vec<String> = targets.iter().map(|s| s.name().to_string()).collect();
 
             for mut ps in items {
+                if Instant::now() >= deadline {
+                    ran_out += 1;
+                    continue;
+                }
                 if ps.play.mbid_recording.is_none() {
                     let album_hint = ps.play.album.clone();
-                    enrich_play(&self.mb_client, &mut ps.play, album_hint.as_deref()).await;
+                    // **Bounded, because enrichment is opportunistic and the
+                    // sink call after it is not.**
+                    //
+                    // The deadline above limits how many listens are *started*,
+                    // not how long one takes — and a rate-limited MusicBrainz
+                    // lookup with a 30s client timeout is easily the longest
+                    // thing in this loop. Measured against a dead sink: a tick
+                    // that should have been bounded at 10s ran to 41, and all
+                    // of the excess was one lookup.
+                    //
+                    // It is also the exact compounding that made 2026-08-24
+                    // worse than it had to be: MusicBrainz and ListenBrainz are
+                    // both MetaBrainz, both were unreachable, and every pending
+                    // listen paid for each of them in turn.
+                    //
+                    // Giving up costs nothing — the listen forwards perfectly
+                    // well without an MBID, and `backfill_recording_mbids`
+                    // exists to fill it in later, off the tick.
+                    let enriched = tokio::time::timeout(
+                        ENRICH_BUDGET.min(deadline.saturating_duration_since(Instant::now())),
+                        enrich_play(&self.mb_client, &mut ps.play, album_hint.as_deref()),
+                    )
+                    .await;
+                    if enriched.is_err() {
+                        debug!(
+                            "Enrichment for {} - {} outran the flush budget — forwarding \
+                             unenriched and leaving it to the backfill",
+                            ps.play.artist, ps.play.title
+                        );
+                    }
                     // Persist the resolved MBIDs so language/analytics can use them.
                     if ps.play.mbid_recording.is_some() {
                         if let Err(e) = self.db.update_scrobble_enrichment(ps.id, &ps.play).await {
@@ -1501,14 +1652,19 @@ impl ScrobbleEngine {
                     if ps.delivered.contains(&name) {
                         continue;
                     }
-                    match sink.scrobble(&[ps.play.clone()]).await {
+                    // Through the breaker, so a service already known to be
+                    // down costs nothing rather than a full retry budget per
+                    // listen — the 978-listens-×-66s arithmetic that took the
+                    // engine out. A skipped sink returns `Err`, which is right:
+                    // nothing was delivered, so the row stays pending.
+                    match sinks::guarded(&name, sink.scrobble(&[ps.play.clone()])).await {
                         Ok(_) => {
                             ps.delivered.push(name.clone());
                             if let Err(e) = self.db.mark_sink_delivered(ps.id, &name).await {
                                 error!("Failed to record delivery to {}: {}", name, e);
                             }
                         }
-                        Err(e) => error!("Failed to send to {}: {}", name, e),
+                        Err(e) => debug!("Did not send to {}: {}", name, e),
                     }
                 }
 
@@ -1523,5 +1679,24 @@ impl ScrobbleEngine {
                 }
             }
         }
+
+        if ran_out > 0 {
+            crate::engine::health::deferred(ran_out);
+            info!(
+                "⏳ Flush hit its {}s budget — {} listen(s) still pending, picked up next tick",
+                self.flush_budget().as_secs(),
+                ran_out
+            );
+        }
+    }
+
+    /// How long the flush may hold the tick.
+    ///
+    /// Twice the poll interval: long enough that a healthy flush is never cut
+    /// short (a successful submission is one request), short enough that a sick
+    /// one delays the deck by seconds rather than by hours. Floored so a very
+    /// fast tick cannot starve forwarding entirely.
+    fn flush_budget(&self) -> Duration {
+        (self.poll_interval * 2).max(Duration::from_secs(10))
     }
 }

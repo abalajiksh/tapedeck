@@ -70,7 +70,14 @@ impl LastFmSink {
         let user_agent = format!("{}/{}", app_name, app_version);
 
         let client =
-            Client::builder().user_agent(user_agent).build().unwrap_or_else(|_| Client::new());
+            // A timeout, for the reason ListenBrainz's client grew one: this
+            // call is awaited inline on the engine tick, and without one a hung
+            // connection is bounded only by the OS.
+            Client::builder()
+                .timeout(std::time::Duration::from_secs(30))
+                .user_agent(user_agent)
+                .build()
+                .unwrap_or_else(|_| Client::new());
 
         Self {
             api_key,

@@ -374,8 +374,11 @@ pub async fn reports(
         if seen_artists.insert(akey.clone()) {
             *b.new_artists.entry(akey.clone()).or_insert(0) += 1;
             b.first_seen_at.insert(akey.clone(), r.timestamp);
-        } else if b.new_artists.contains_key(&akey) {
-            *b.new_artists.get_mut(&akey).unwrap() += 1;
+        } else if let Some(n) = b.new_artists.get_mut(&akey) {
+            // `Entry`-shaped rather than `contains_key` + `get_mut().unwrap()`:
+            // correct as written and one edit to the condition away from
+            // panicking a whole report request.
+            *n += 1;
         }
 
         running_total += 1;

@@ -1,7 +1,13 @@
 <script lang="ts">
 	import { onMount, onDestroy } from 'svelte';
 	import { syncUrl } from '$lib/url';
-	import type { McpConnection, McpAuditCall } from '$lib/api';
+	import type {
+		McpConnection,
+		McpAuditCall,
+		OpsStatus,
+		LogTail,
+		SourceHealth
+	} from '$lib/api';
 	import { api } from '$lib/api';
 	import type { TokenInfo } from '$lib/api';
 	import { formatDateTime, formatDuration } from '$lib/utils';
@@ -38,6 +44,7 @@
 		{ id: 'sanitiser', label: 'Sanitiser', hint: 'Fix split albums, artists and credits' },
 		{ id: 'maintenance', label: 'Maintenance', hint: 'Enrichment and health' },
 		{ id: 'genremap', label: 'Genre Map', hint: 'Every Noise at Once' },
+		{ id: 'ops', label: 'Operations', hint: 'Engine, sinks, logs', admin: true },
 		{ id: 'about', label: 'About', hint: 'Version, sign out' }
 	];
 	let section = 'appearance';
@@ -483,6 +490,122 @@
 
 	// language enrichment
 	let isAdmin = false;
+
+	// ── Operations ──
+	//
+	// Built after 2026-08-24, when one unreachable upstream stalled the engine
+	// tick from five seconds to ninety minutes: Plex stopped being polled, the
+	// deck went dark, and none of that was visible from inside the application.
+	// The diagnosis needed SSH and 3 MB of log; the only tool to hand was a
+	// force restart, three times.
+	let ops: OpsStatus | null = null;
+	let opsErr = '';
+	let logTail: LogTail | null = null;
+	let logLevel = 'info';
+	let logQuery = '';
+	let logFile = '';
+	let logLines = 300;
+	let logBusy = false;
+	let restarting = false;
+	let opsTimer: ReturnType<typeof setInterval> | null = null;
+
+	async function loadOps() {
+		try {
+			ops = await api.getOps();
+			opsErr = '';
+		} catch (e) {
+			opsErr = e instanceof Error ? e.message : String(e);
+		}
+	}
+
+	async function loadLog() {
+		if (!ops?.logs_enabled) return;
+		logBusy = true;
+		try {
+			logTail = await api.getLogTail({
+				lines: logLines,
+				level: logLevel,
+				q: logQuery || undefined,
+				file: logFile || undefined
+			});
+			if (!logFile) logFile = logTail.file;
+		} catch (e) {
+			opsErr = e instanceof Error ? e.message : String(e);
+		} finally {
+			logBusy = false;
+		}
+	}
+
+	// Polled only while the section is open, and stopped when it is not: this
+	// page is the one an admin opens *because* the instance is struggling, so it
+	// must not be another thing asking it for work every few seconds.
+	$: if (section === 'ops' && isAdmin) {
+		if (!opsTimer) {
+			loadOps().then(loadLog);
+			opsTimer = setInterval(loadOps, 5000);
+		}
+	} else if (opsTimer) {
+		clearInterval(opsTimer);
+		opsTimer = null;
+	}
+	onDestroy(() => {
+		if (opsTimer) clearInterval(opsTimer);
+	});
+
+	async function doRestart() {
+		if (
+			!confirm(
+				'Restart Tapedeck?\n\nIn-flight requests finish and the engine completes its ' +
+					'current tick first, so nothing is cut in half. It comes back only if something ' +
+					'is supervising the process — under the supplied systemd unit it does.'
+			)
+		)
+			return;
+		restarting = true;
+		try {
+			await api.restartServer();
+		} catch (e) {
+			// A dropped connection here is the restart working, not failing.
+			console.warn('restart', e);
+		}
+	}
+
+	/** Seconds, as something readable. Ages here run from ms to hours. */
+	function ago(ts: number | null | undefined, now: number): string {
+		if (!ts) return 'never';
+		const d = Math.max(0, now - ts);
+		if (d < 60) return `${d}s ago`;
+		if (d < 3600) return `${Math.round(d / 60)}m ago`;
+		if (d < 86400) return `${Math.round(d / 3600)}h ago`;
+		return `${Math.round(d / 86400)}d ago`;
+	}
+
+	function dur(ms: number): string {
+		if (ms < 1000) return `${ms}ms`;
+		if (ms < 60000) return `${(ms / 1000).toFixed(1)}s`;
+		return `${Math.round(ms / 60000)}m`;
+	}
+
+	/**
+	 * Is a source overdue relative to *its own* interval?
+	 *
+	 * The comparison that matters, and the one nobody could make on 2026-08-24:
+	 * "last polled 78 minutes ago" is unremarkable for a 30-minute source and is
+	 * the whole incident for a 5-second one. Three intervals of slack, so an
+	 * ordinary jitter is not drawn as a fault.
+	 */
+	function sourceLate(src: SourceHealth, now: number): boolean {
+		if (!src.enabled) return false;
+		const iv = src.poll_interval_secs || 30;
+		if (!src.last_polled_at) return true;
+		return now - src.last_polled_at > Math.max(iv * 3, 60);
+	}
+
+	// Ticks so the ages above re-render. Named in the template that uses it,
+	// because a reactive expression does not trace a variable through a call.
+	let nowSec = Math.floor(Date.now() / 1000);
+	setInterval(() => (nowSec = Math.floor(Date.now() / 1000)), 1000);
+
 	let langStatus: { total: number; resolved: number; pending: number } | null = null;
 	let enriching = false;
 	let langPoll: ReturnType<typeof setInterval> | null = null;
@@ -1380,7 +1503,7 @@
 
 <div class="settings-layout">
 	<nav class="settings-nav" aria-label="Settings sections">
-		{#each SECTIONS as s}
+		{#each SECTIONS.filter((s) => !s.admin || isAdmin) as s}
 			<button class="nav-item" class:on={section === s.id} on:click={() => go(s.id)}>
 				<span class="nav-label">{s.label}</span>
 				<span class="nav-hint">{s.hint}</span>
@@ -2721,6 +2844,233 @@
 			</div>
 		{/if}
 
+		{#if section === 'ops'}
+			{#if !isAdmin}
+				<div class="panel" style="border-radius:22px;padding:24px;">
+					<p style="font-size:13px;color:var(--td-muted);margin:0;">Admin only.</p>
+				</div>
+			{:else}
+				{#if opsErr}
+					<div class="panel" style="border-radius:22px;padding:16px 20px;margin-bottom:18px;">
+						<p style="font-size:13px;color:var(--td-bad-fg);margin:0;">{opsErr}</p>
+					</div>
+				{/if}
+
+				<!-- The engine, first. A tick that cannot keep its own schedule is the
+				     one number that says this instance is in trouble whatever the
+				     cause, and on 2026-08-24 it was true all day and visible nowhere. -->
+				<div class="panel" style="border-radius:22px;padding:24px;margin-bottom:18px;">
+					<div style="display:flex;align-items:baseline;justify-content:space-between;gap:12px;flex-wrap:wrap;">
+						<h3 class="h-display" style="font-size:19px;margin:0 0 4px;">The engine</h3>
+						{#if ops}
+							<span class="opspill" class:bad={ops.tick.behind} class:good={!ops.tick.behind}>
+								{ops.tick.behind ? 'Behind schedule' : 'Keeping up'}
+							</span>
+						{/if}
+					</div>
+					<p style="font-size:13px;color:var(--td-muted);margin:0 0 16px;">
+						One poll tick reads every due source, updates the deck, and forwards whatever is
+						waiting. A tick longer than its own interval means sources and the deck are that
+						late — which is what every &ldquo;Plex isn't syncing&rdquo; report has turned out to be.
+					</p>
+					{#if ops}
+						<div class="opsgrid">
+							{#each [
+								['Interval', `${ops.tick.interval_secs}s`, 'how often it should run'],
+								['Last tick', dur(ops.tick.last_duration_ms), ago(ops.tick.last_started, nowSec)],
+								['Worst tick', dur(ops.tick.longest_ms), `${ops.tick.overruns} overrun${ops.tick.overruns === 1 ? '' : 's'}`],
+								['Uptime', dur(ops.uptime_secs * 1000), `v${ops.version}`]
+							] as [label, value, sub]}
+								<div class="opstile">
+									<div class="opslabel">{label}</div>
+									<div class="opsvalue">{value}</div>
+									<div class="opssub">{sub}</div>
+								</div>
+							{/each}
+						</div>
+						{#if ops.tick.deferred_listens > 0}
+							<p style="font-size:12.5px;color:var(--td-muted-2);margin:14px 0 0;">
+								{ops.tick.deferred_listens} listen{ops.tick.deferred_listens === 1 ? '' : 's'} have been
+								held over by the flush budget since this process started. Nothing is lost — they
+								stay pending and go out on a later tick — but it means forwarding is running behind,
+								which usually means a service below is unhappy.
+							</p>
+						{/if}
+					{:else}
+						<p style="font-size:13px;color:var(--td-muted-3);margin:0;">Loading…</p>
+					{/if}
+				</div>
+
+				<!-- Sources: last poll against each one's own interval. -->
+				<div class="panel" style="border-radius:22px;padding:24px;margin-bottom:18px;">
+					<h3 class="h-display" style="font-size:19px;margin-bottom:4px;">Sources</h3>
+					<p style="font-size:13px;color:var(--td-muted);margin:0 0 16px;">
+						Every source on this instance, and when it was last read. Late is measured against
+						each source's own interval, since thirty minutes is normal for one and an outage
+						for another.
+					</p>
+					{#if ops && ops.sources.length}
+						<div class="opsrows">
+							{#each ops.sources as src (src.id)}
+								<div class="opsrow">
+									<div style="min-width:0;">
+										<div class="opsname">
+											{src.label || src.kind}
+											<span class="opsdim">· {src.username}</span>
+										</div>
+										<div class="opssub">
+											{#if !src.enabled}
+												Switched off
+											{:else}
+												polled {ago(src.last_polled_at, nowSec)} · every {src.poll_interval_secs ?? 30}s
+											{/if}
+											{#if src.last_error}<span class="opserr">· {src.last_error}</span>{/if}
+										</div>
+									</div>
+									<span
+										class="opspill"
+										class:bad={sourceLate(src, nowSec)}
+										class:good={src.enabled && !sourceLate(src, nowSec)}
+									>
+										{!src.enabled ? 'Off' : sourceLate(src, nowSec) ? 'Overdue' : 'OK'}
+									</span>
+								</div>
+							{/each}
+						</div>
+					{:else if ops}
+						<p style="font-size:13px;color:var(--td-muted-3);margin:0;">No sources configured.</p>
+					{/if}
+				</div>
+
+				<!-- Sinks, with the breaker's state. -->
+				<div class="panel" style="border-radius:22px;padding:24px;margin-bottom:18px;">
+					<h3 class="h-display" style="font-size:19px;margin-bottom:4px;">Forwarding</h3>
+					<p style="font-size:13px;color:var(--td-muted);margin:0 0 16px;">
+						Services this instance has spoken to since it started. When one fails repeatedly it
+						is skipped for a while rather than retried per listen — that is what stops a
+						single service's outage from holding up the engine.
+					</p>
+					{#if ops && ops.sinks.length}
+						<div class="opsrows">
+							{#each ops.sinks as sink (sink.name)}
+								<div class="opsrow">
+									<div style="min-width:0;">
+										<div class="opsname">{sink.name}</div>
+										<div class="opssub">
+											last accepted {ago(sink.last_ok, nowSec)}
+											· {sink.total_successes} sent, {sink.total_failures} failed
+										</div>
+										{#if sink.last_error}
+											<!-- Once, verbatim. The alternative is what the log did on
+											     2026-08-24: 6,096 copies of one sentence. -->
+											<div class="opserr">{sink.last_error}</div>
+										{/if}
+									</div>
+									<span
+										class="opspill"
+										class:bad={sink.skipping_for != null}
+										class:warn={sink.skipping_for == null && sink.failures > 0}
+										class:good={sink.skipping_for == null && sink.failures === 0}
+									>
+										{sink.skipping_for != null
+											? `Skipping ${sink.skipping_for}s`
+											: sink.failures > 0
+												? `${sink.failures} failing`
+												: 'OK'}
+									</span>
+								</div>
+							{/each}
+						</div>
+					{:else if ops}
+						<p style="font-size:13px;color:var(--td-muted-3);margin:0;">
+							Nothing has been forwarded yet this run. A service appears here the first time
+							something is sent to it.
+						</p>
+					{/if}
+				</div>
+
+				<!-- The log. -->
+				<div class="panel" style="border-radius:22px;padding:24px;margin-bottom:18px;">
+					<h3 class="h-display" style="font-size:19px;margin-bottom:4px;">Log</h3>
+					<p style="font-size:13px;color:var(--td-muted);margin:0 0 16px;">
+						Seven days are kept. A level means that and worse, so <strong>Warnings</strong>
+						includes errors.
+					</p>
+					{#if ops && !ops.logs_enabled}
+						<p style="font-size:13px;color:var(--td-muted-3);margin:0;">
+							File logging is switched off on this instance, so there is nothing to show here.
+						</p>
+					{:else}
+						<div class="logbar">
+							<select class="input" bind:value={logLevel} on:change={loadLog} aria-label="Level">
+								<option value="">Everything</option>
+								<option value="info">Info and worse</option>
+								<option value="warn">Warnings and errors</option>
+								<option value="error">Errors only</option>
+							</select>
+							{#if logTail && logTail.files.length > 1}
+								<select class="input" bind:value={logFile} on:change={loadLog} aria-label="Day">
+									{#each logTail.files as f}<option value={f}>{f}</option>{/each}
+								</select>
+							{/if}
+							<input
+								class="input"
+								placeholder="Filter…"
+								bind:value={logQuery}
+								on:keydown={(e) => e.key === 'Enter' && loadLog()}
+								style="flex:1;min-width:140px;"
+							/>
+							<button class="btn btn-secondary" on:click={loadLog} disabled={logBusy}>
+								{logBusy ? '…' : 'Refresh'}
+							</button>
+							<a class="btn btn-secondary" href={api.logDownloadUrl(logFile || undefined)} download>
+								Download
+							</a>
+						</div>
+						{#if logTail}
+							<div class="logview">
+								{#each logTail.lines as line}
+									<div
+										class="logline"
+										class:err={line.includes(' ERROR ')}
+										class:warn={line.includes(' WARN ')}
+									>{line}</div>
+								{:else}
+									<div class="logline" style="opacity:.6;">Nothing matched.</div>
+								{/each}
+							</div>
+							<p style="font-size:12px;color:var(--td-muted-3);margin:8px 0 0;">
+								<!-- What the filter found against what is shown, so a capped tail
+								     cannot be mistaken for the whole answer. -->
+								Showing the last {logTail.shown} of {logTail.matched} matching line{logTail.matched === 1 ? '' : 's'}
+								in {logTail.file}.{logTail.truncated ? ' Download the file for the rest.' : ''}
+							</p>
+						{/if}
+					{/if}
+				</div>
+
+				<!-- Restart, last and visually apart: it is the destructive one. -->
+				<div class="panel" style="border-radius:22px;padding:24px;margin-bottom:18px;">
+					<h3 class="h-display" style="font-size:19px;margin-bottom:4px;">Restart</h3>
+					<p style="font-size:13px;color:var(--td-muted);margin:0 0 16px;">
+						In-flight requests finish and the engine completes its current tick before the
+						process stops, so nothing is cut in half — gentler than killing it from a shell.
+						It comes back only if something is supervising the process; under the systemd unit
+						in <code>deploy/</code> it does.
+					</p>
+					<button class="btn btn-danger" on:click={doRestart} disabled={restarting}>
+						{restarting ? 'Draining…' : 'Restart Tapedeck'}
+					</button>
+					{#if restarting}
+						<p style="font-size:12.5px;color:var(--td-muted-2);margin:12px 0 0;">
+							Draining. This page will fail to reach the server for a few seconds — reload once
+							it is back.
+						</p>
+					{/if}
+				</div>
+			{/if}
+		{/if}
+
 		{#if section === 'genremap'}
 			<div class="panel" style="border-radius:22px;padding:24px;margin-bottom:18px;">
 				<h3 class="h-display" style="font-size:19px;margin-bottom:4px;">Every Noise at Once</h3>
@@ -3036,4 +3386,100 @@
 	.seg-btn { border: none; background: transparent; cursor: pointer; color: var(--td-nav-fg); font-size: 13px; padding: 7px 14px; border-radius: 999px; font-family: inherit; }
 	.seg-btn.on { background: var(--td-accent); color: #fbf5ea; }
 	.chip { background: var(--td-sidebar); padding: 2px 6px; border-radius: 6px; font-size: 12px; }
+	/* — Operations —
+	   `--td-surface`, never `--td-panel`: the latter is the *dark card* in both
+	   themes, and using it without also restating the text colours reads
+	   correctly in exactly one of them (the v0.70.8 trap). */
+	.opsgrid {
+		display: grid;
+		grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+		gap: 12px;
+	}
+	.opstile {
+		background: var(--td-surface);
+		border: 1px solid var(--td-border);
+		border-radius: 14px;
+		padding: 14px 16px;
+	}
+	.opslabel {
+		font-size: 11px;
+		letter-spacing: .09em;
+		text-transform: uppercase;
+		color: var(--td-muted-2);
+	}
+	.opsvalue {
+		font-size: 22px;
+		font-weight: 700;
+		font-variant-numeric: tabular-nums;
+		color: var(--td-text);
+		margin-top: 2px;
+	}
+	.opssub {
+		font-size: 12px;
+		color: var(--td-muted-2);
+		margin-top: 2px;
+	}
+	.opsrows { display: flex; flex-direction: column; gap: 10px; }
+	.opsrow {
+		display: flex;
+		align-items: center;
+		justify-content: space-between;
+		gap: 14px;
+		background: var(--td-surface);
+		border: 1px solid var(--td-border);
+		border-radius: 14px;
+		padding: 12px 16px;
+	}
+	.opsname { font-size: 14px; font-weight: 600; color: var(--td-text); }
+	.opsdim { font-weight: 400; color: var(--td-muted-2); }
+	.opserr {
+		font-size: 12px;
+		color: var(--td-bad-fg);
+		margin-top: 3px;
+		overflow-wrap: anywhere;
+	}
+	.opspill {
+		flex: none;
+		font-size: 11.5px;
+		font-weight: 600;
+		letter-spacing: .03em;
+		border-radius: 999px;
+		padding: 3px 10px;
+		white-space: nowrap;
+		background: var(--td-surface2);
+		color: var(--td-muted-2);
+	}
+	.opspill.good { background: var(--td-good-bg); color: var(--td-good-fg); }
+	.opspill.bad { background: var(--td-bad-bg); color: var(--td-bad-fg); }
+	.opspill.warn {
+		background: color-mix(in srgb, var(--td-accent) 16%, transparent);
+		color: var(--td-accent);
+	}
+
+	.logbar {
+		display: flex;
+		gap: 10px;
+		flex-wrap: wrap;
+		align-items: center;
+		margin-bottom: 12px;
+	}
+	.logview {
+		background: var(--td-surface2);
+		border: 1px solid var(--td-border);
+		border-radius: 14px;
+		padding: 10px 12px;
+		max-height: 460px;
+		/* Both axes scroll *inside* the box: a log line is arbitrarily long and
+		   must not make the settings page scroll sideways. */
+		overflow: auto;
+	}
+	.logline {
+		font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+		font-size: 11.5px;
+		line-height: 1.55;
+		white-space: pre;
+		color: var(--td-muted);
+	}
+	.logline.warn { color: var(--td-accent); }
+	.logline.err { color: var(--td-bad-fg); }
 </style>

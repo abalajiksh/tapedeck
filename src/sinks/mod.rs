@@ -1,5 +1,7 @@
+mod health;
 mod lastfm;
 mod listenbrainz;
+pub use health::health;
 pub use lastfm::{LastFmSink, LASTFM_API_KEY, LASTFM_SECRET};
 pub use listenbrainz::ListenBrainzSink;
 
@@ -53,16 +55,42 @@ pub trait ScrobbleSink: Any + Send + Sync {
 /// nothing gets an empty vec and their listens stay local. Used by both the
 /// HTTP layer (now-playing on ingest) and the poll engine (scrobble flush,
 /// now-playing from Plex), so the rule can't drift between them.
+///
+/// **Returns a `Result`, and the flush path must not paper over it.** This read
+/// used to be `.unwrap_or_default()`, which made a transient `SQLITE_BUSY`
+/// indistinguishable from "this user has connected nothing" — and in
+/// `flush_pending` the consequence was not a skipped tick but a permanent one:
+/// `enabled` came back empty, `enabled.iter().all(...)` was vacuously true, the
+/// row was marked `synced`, and the listen was never forwarded to anything,
+/// logged as a success. A caller that genuinely tolerates an empty answer (a
+/// now-playing update, superseded within seconds) may say so explicitly; the
+/// scrobble flush may not.
 pub async fn sinks_for_user(
     db: &Database,
     user_id: i64,
     listenbrainz_url: &str,
-) -> Vec<Box<dyn ScrobbleSink>> {
-    let conns = db.get_connections_for_forwarding(user_id).await.unwrap_or_default();
+) -> Result<Vec<Box<dyn ScrobbleSink>>, sqlx::Error> {
+    let conns = db.get_connections_for_forwarding(user_id).await?;
     let mut sinks: Vec<Box<dyn ScrobbleSink>> = Vec::new();
 
     for (service, creds_json) in conns {
-        let creds: serde_json::Value = serde_json::from_str(&creds_json).unwrap_or_default();
+        // A blob that will not parse is a broken connection, not an absent one.
+        // `unwrap_or_default()` here turned it into `Value::Null`, so the sink
+        // was quietly dropped from the user's list with nothing said — the same
+        // failed-read-as-absence shape as the read above.
+        let creds: serde_json::Value = match serde_json::from_str(&creds_json) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::error!(
+                    "Stored {} credentials for user {} will not parse ({}) — \
+                     that service is not being forwarded to",
+                    service,
+                    user_id,
+                    e
+                );
+                continue;
+            }
+        };
         match service.as_str() {
             "listenbrainz" => {
                 if let Some(t) = creds["token"].as_str() {
@@ -94,14 +122,43 @@ pub async fn sinks_for_user(
             _ => {}
         }
     }
-    sinks
+    Ok(sinks)
+}
+
+/// Call one sink, with the breaker in front of it and the outcome recorded.
+///
+/// Every outbound call goes through here so that "is this service down?" has
+/// one answer, kept in one place — see [`health`]. A skipped call is reported
+/// as an error to the caller, which is right: nothing was delivered, so a
+/// scrobble must stay `pending` rather than be counted as sent.
+pub async fn guarded<F, T>(name: &str, call: F) -> Result<T, Box<dyn std::error::Error>>
+where
+    F: std::future::Future<Output = Result<T, Box<dyn std::error::Error>>>,
+{
+    if let Some(left) = health().skip_for(name) {
+        return Err(format!("{} is being skipped for another {}s", name, left.as_secs()).into());
+    }
+    match call.await {
+        Ok(v) => {
+            health().record_ok(name);
+            Ok(v)
+        }
+        Err(e) => {
+            health().record_failure(name, &e.to_string());
+            Err(e)
+        }
+    }
 }
 
 /// Forward a now-playing update to every one of a user's sinks.
 pub async fn submit_now_playing(sinks: &[Box<dyn ScrobbleSink>], play: &Play) {
     for sink in sinks {
-        if let Err(e) = sink.update_now_playing(play).await {
-            tracing::error!("Failed to forward now playing to {}: {}", sink.name(), e);
+        // Through the breaker like everything else. Now-playing is the call
+        // made most often — once per track change, per user — so a dead service
+        // costs the most here, and it is the least worth waiting for: the next
+        // track supersedes it regardless.
+        if let Err(e) = guarded(sink.name(), sink.update_now_playing(play)).await {
+            tracing::debug!("Did not forward now playing to {}: {}", sink.name(), e);
         }
     }
 }
@@ -120,7 +177,7 @@ pub async fn submit_love(
     loved: bool,
 ) {
     for sink in sinks {
-        if let Err(e) = sink.set_loved(artist, title, mbid, loved).await {
+        if let Err(e) = guarded(sink.name(), sink.set_loved(artist, title, mbid, loved)).await {
             tracing::error!("Failed to forward love to {}: {}", sink.name(), e);
         }
     }

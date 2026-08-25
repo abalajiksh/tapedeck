@@ -18,6 +18,15 @@ pub struct RateLimiter {
     window: Duration,
 }
 
+/// Entries above which a write sweeps expired keys.
+///
+/// The map only ever forgot a key when that same key was asked about again, so
+/// an attacker rotating source addresses grew it without bound — every failed
+/// guess from a fresh address was a permanent allocation. Sweeping on write is
+/// enough: entries are only created there, and the sweep is O(n) over a map
+/// that is a handful of rows in every legitimate deployment.
+const SWEEP_ABOVE: usize = 1_024;
+
 impl RateLimiter {
     pub fn new(max_failures: u32, window: Duration) -> Self {
         Self { inner: Mutex::new(HashMap::new()), max_failures, window }
@@ -25,7 +34,7 @@ impl RateLimiter {
 
     /// If the key is currently blocked, returns `Some(retry_after_seconds)`.
     pub fn blocked_for(&self, key: &str) -> Option<u64> {
-        let mut map = self.inner.lock().unwrap();
+        let mut map = self.lock();
         if let Some(a) = map.get(key) {
             let elapsed = a.window_start.elapsed();
             if elapsed >= self.window {
@@ -38,7 +47,11 @@ impl RateLimiter {
     }
 
     pub fn record_failure(&self, key: &str) {
-        let mut map = self.inner.lock().unwrap();
+        let mut map = self.lock();
+        if map.len() > SWEEP_ABOVE {
+            let window = self.window;
+            map.retain(|_, a| a.window_start.elapsed() < window);
+        }
         let a = map
             .entry(key.to_string())
             .or_insert(Attempt { failures: 0, window_start: Instant::now() });
@@ -50,7 +63,19 @@ impl RateLimiter {
     }
 
     pub fn reset(&self, key: &str) {
-        self.inner.lock().unwrap().remove(key);
+        self.lock().remove(key);
+    }
+
+    /// Lock, recovering from poisoning rather than propagating it.
+    ///
+    /// `.lock().unwrap()` meant that one panic anywhere in a critical section
+    /// would poison this mutex permanently and every subsequent login attempt
+    /// on the instance would panic with it. Nothing in these sections can
+    /// realistically panic, so this is cheap insurance rather than a fix — but
+    /// the failure it guards against is "nobody can log in until the process is
+    /// restarted", which is not a proportionate answer to a throttling table.
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, Attempt>> {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner())
     }
 }
 

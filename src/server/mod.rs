@@ -17,6 +17,7 @@ pub mod models;
 pub mod notes;
 pub mod now_playing;
 pub mod oauth;
+pub mod ops;
 mod pairing;
 pub mod patch;
 pub mod physical;
@@ -88,6 +89,11 @@ pub struct AppState {
     /// Where uploaded sleeve and booklet scans live on disk. Outside the
     /// database on purpose — see `DatabaseConfig::uploads_dir`.
     pub uploads_dir: std::path::PathBuf,
+    /// Directory holding the rolling log files, or empty when file logging is
+    /// off. Read by Settings → Operations; the alternative to knowing it here
+    /// is telling an admin to go and find it over SSH, which is the situation
+    /// that panel exists to end.
+    pub log_dir: String,
 }
 
 /// Build the full Axum application.
@@ -118,6 +124,7 @@ pub fn build_app(state: Arc<AppState>) -> Router {
         .merge(library::create_library_router())
         .merge(loves_pull::create_loves_pull_router())
         .merge(metrics::create_metrics_router())
+        .merge(ops::create_ops_router())
         .merge(sessions::create_sessions_router())
         .merge(physical::create_physical_router())
         .merge(rediscovery::create_rediscovery_router())

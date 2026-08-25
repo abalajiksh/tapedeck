@@ -156,6 +156,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ),
         everynoise,
         everynoise_jobs: Default::default(),
+        log_dir: if config.logging.file_enabled {
+            config.logging.dir.clone()
+        } else {
+            // Empty rather than the configured path, so Operations says "file
+            // logging is off" instead of "no files yet" — two different things
+            // an admin would act on differently.
+            String::new()
+        },
         uploads_dir: std::path::PathBuf::from(&config.database.uploads_dir),
     });
 
@@ -198,6 +206,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ScrobbleEngine::new(db, mb_client, now_playing, config.listenbrainz_url.clone());
     engine.run(shutdown_rx).await;
     let _ = server_task.await;
+
+    // An operator-requested restart exits **non-zero**, and that is
+    // load-bearing rather than cosmetic: `deploy/tapedeck-user.service` is
+    // `Restart=on-failure`, so a clean exit would stop the service and the
+    // Restart button would be a very convincing off switch. Everything above
+    // has already drained, so nothing is cut short by this.
+    if server::ops::restart_requested() {
+        info!(
+            "🔁 Drained — exiting {} so the supervisor restarts us",
+            server::ops::RESTART_EXIT_CODE
+        );
+        std::process::exit(server::ops::RESTART_EXIT_CODE);
+    }
+
     info!("👋 Shut down cleanly");
     Ok(())
 }
@@ -322,6 +344,13 @@ async fn shutdown_signal() {
     let ctrl_c = async {
         let _ = signal::ctrl_c().await;
     };
+    // An admin pressing Restart is a third way to arrive here, and it goes
+    // through the *same* drain as a signal rather than exiting on the spot —
+    // the point of the button is that it is gentler than the SIGKILL somebody
+    // reaches for otherwise, not faster.
+    let requested = async {
+        server::ops::restart_notify().notified().await;
+    };
     #[cfg(unix)]
     let terminate = async {
         if let Ok(mut s) = signal::unix::signal(signal::unix::SignalKind::terminate()) {
@@ -333,6 +362,7 @@ async fn shutdown_signal() {
     tokio::select! {
         _ = ctrl_c => {},
         _ = terminate => {},
+        _ = requested => {},
     }
     info!("🛑 Shutdown signal received, draining…");
 }

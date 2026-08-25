@@ -1916,7 +1916,12 @@
 						</div>
 					{/if}
 
-					<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:14px;margin-top:18px;">
+					<!-- `align-items:start` so a side box is the height of its own side.
+					     A grid row stretches by default, so side B of a record whose side A
+					     runs one track longer was drawn to A's height with the gap left dead
+					     under its buttons — and on a two-record set with a three-track side D
+					     that gap was most of the card. -->
+					<div class="sidegrid">
 						{#each sides as side, i}
 							<!-- A full-width heading rather than a second grid, so the side
 							     cards keep one `auto-fit` track list and cannot end up sized
@@ -2347,6 +2352,13 @@
 	.durval { font-variant-numeric: tabular-nums; flex: none; color: var(--td-accent); }
 	.durval.missed { color: var(--td-muted-3); font-style: italic; }
 
+	.sidegrid {
+		display: grid;
+		grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+		align-items: start;
+		gap: 14px;
+		margin-top: 18px;
+	}
 	.disc-head {
 		grid-column: 1 / -1;
 		font-size: 12px;

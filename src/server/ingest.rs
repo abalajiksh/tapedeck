@@ -568,12 +568,16 @@ pub async fn submit_listens(
                 // A paused deck is not now-playing either, and the same gate is
                 // what the shelf's own heartbeat uses.
                 if changed && !paused {
+                    // A failed read costs one now-playing update, which the
+                    // next track supersedes within minutes — so an empty answer
+                    // is tolerable here in a way it is not on the flush path.
                     let user_sinks = crate::sinks::sinks_for_user(
                         &state.db,
                         user.user_id,
                         &state.listenbrainz_url,
                     )
-                    .await;
+                    .await
+                    .unwrap_or_default();
                     crate::sinks::submit_now_playing(&user_sinks, &play).await;
                 }
                 accepted += 1;

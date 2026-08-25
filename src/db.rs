@@ -552,6 +552,21 @@ pub struct PhysicalImage {
     pub added_at: i64,
 }
 
+/// One source's liveness, with nothing secret in it — see
+/// [`Database::source_health`].
+#[derive(Debug, Clone, serde::Serialize, sqlx::FromRow)]
+pub struct SourceHealth {
+    pub id: i64,
+    pub user_id: i64,
+    pub username: String,
+    pub kind: String,
+    pub label: String,
+    pub enabled: bool,
+    pub poll_interval_secs: Option<i64>,
+    pub last_polled_at: Option<i64>,
+    pub last_error: Option<String>,
+}
+
 /// A configured source, credentials decrypted. `kind` is `plex` | `navidrome` |
 /// `jellyfin`; `credentials` is a per-kind JSON blob (Plex: `{"token":…}`).
 #[derive(Debug, Clone)]
@@ -10619,6 +10634,30 @@ impl Database {
         .fetch_all(&self.pool)
         .await?;
         Ok(rows.into_iter().filter_map(|r| self.hydrate_source(r)).collect())
+    }
+
+    /// Every source on the instance and when it was last polled, for
+    /// Settings → Operations.
+    ///
+    /// Instance-wide and therefore admin-only at the handler — this is the one
+    /// source query not scoped by `user_id`, because "is anything on this box
+    /// polling?" is not a question any one account can answer. Deliberately
+    /// selects **no credentials and no URL**: the readout needs to say which
+    /// source and how late it is, and nothing more.
+    ///
+    /// Everything here was already being written by `record_source_poll`; only
+    /// the reading was missing. On 2026-08-24 "Plex last polled 78 minutes ago"
+    /// against a 5-second interval was true all day and visible nowhere.
+    pub async fn source_health(&self) -> Result<Vec<SourceHealth>, sqlx::Error> {
+        sqlx::query_as(
+            "SELECT s.id, s.user_id, COALESCE(u.username, '') AS username, s.kind, s.label,
+                    s.enabled, s.poll_interval_secs, s.last_polled_at, s.last_error
+             FROM user_sources s
+             LEFT JOIN users u ON u.id = s.user_id
+             ORDER BY s.user_id, s.kind",
+        )
+        .fetch_all(&self.pool)
+        .await
     }
 
     /// One source by id, scoped to its owner so an id from another user is a

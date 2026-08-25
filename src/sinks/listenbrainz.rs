@@ -6,6 +6,29 @@ use serde_json::json;
 use tokio::time::{sleep, Duration};
 use tracing::{debug, error, info, warn};
 
+/// Ceiling on one request. Without it a hung connection is bounded only by the
+/// OS, and this call is awaited inline on the engine tick.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Attempts after a **rate limit**. ListenBrainz tells us when to come back, so
+/// waiting is both cheap and the polite thing to do.
+const RATE_LIMIT_RETRIES: u32 = 3;
+
+/// Attempts after a **network error** — deliberately far fewer.
+///
+/// These were the same number (5, with 2/4/8/16/32s backoff) until 2026-08-24,
+/// and conflating them is what turned an upstream outage into a dead deck: a
+/// service that cannot be reached at all will not be reachable 62 seconds
+/// later either, and the tick is 5 seconds long. One quick retry covers a
+/// dropped connection; anything worse is the breaker's business, and the
+/// listen simply stays `pending` for the next tick.
+const NETWORK_RETRIES: u32 = 1;
+
+/// No single wait may exceed this, whatever a header asks for. A service is
+/// free to say "come back in an hour"; this call is not free to sit on the
+/// engine tick for one.
+const MAX_WAIT: u64 = 20;
+
 pub struct ListenBrainzSink {
     base_url: String,
     token: String,
@@ -20,7 +43,15 @@ impl ListenBrainzSink {
         Self {
             base_url: base_url.trim_end_matches('/').to_string(),
             token: sanitized_token,
-            client: Client::new(),
+            // `Client::new()` has **no timeout at all**, which is how a single
+            // unreachable host held the engine tick open on 2026-08-24. Thirty
+            // seconds is the figure `lb_get_page` already uses against the same
+            // service on the import path; there is no reason for two.
+            client: Client::builder()
+                .timeout(REQUEST_TIMEOUT)
+                .user_agent(concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION")))
+                .build()
+                .unwrap_or_else(|_| Client::new()),
         }
     }
 
@@ -135,7 +166,6 @@ impl ListenBrainzSink {
         let auth_header_value = format!("Token {}", self.token);
 
         let mut retries = 0;
-        const MAX_RETRIES: u32 = 1;
 
         loop {
             let resp = self
@@ -153,7 +183,10 @@ impl ListenBrainzSink {
                         debug!("✅ Now playing submitted: {} - {}", play.artist, play.title);
                         return Ok(());
                     } else if response.status() == 429 {
-                        if retries >= MAX_RETRIES {
+                        // One retry only. Now-playing is superseded by the next
+                        // track anyway, so a queued stale one is worth less
+                        // than the tick time it costs.
+                        if retries >= 1 {
                             let error_text = response.text().await.unwrap_or_default();
                             error!("Now playing rate limited (gave up): {}", error_text);
                             return Ok(());
@@ -163,7 +196,8 @@ impl ListenBrainzSink {
                             .get("X-RateLimit-Reset-In")
                             .and_then(|h| h.to_str().ok())
                             .and_then(|s| s.parse::<u64>().ok())
-                            .unwrap_or(2);
+                            .unwrap_or(2)
+                            .min(MAX_WAIT);
                         debug!("Rate limited on now playing, waiting {}s", retry_after);
                         sleep(Duration::from_secs(retry_after + 1)).await;
                         retries += 1;
@@ -175,8 +209,11 @@ impl ListenBrainzSink {
                     }
                 }
                 Err(e) => {
-                    error!("Network error sending now playing: {}", e);
-                    return Ok(());
+                    // Reported rather than swallowed: `sinks::guarded` is what
+                    // opens the breaker, and it can only count what it is told.
+                    // The caller still treats a failed now-playing as
+                    // non-fatal — it just no longer looks like a success.
+                    return Err(format!("Network error sending now playing: {}", e).into());
                 }
             }
         }
@@ -272,17 +309,15 @@ impl ScrobbleSink for ListenBrainzSink {
 
             let auth_header_value = format!("Token {}", self.token);
 
-            let mut retries = 0;
-            const MAX_RETRIES: u32 = 5;
+            // Two budgets, not one — see the constants. A rate limit is worth
+            // waiting out; an unreachable host is not, and treating them alike
+            // is what cost the engine ~18 hours of sleeping on 2026-08-24.
+            let mut rate_limit_retries = 0;
+            let mut network_retries = 0;
             let mut backoff = 2;
 
             loop {
-                debug!(
-                    "Submitting chunk of {} plays (attempt {}/{})",
-                    chunk.len(),
-                    retries + 1,
-                    MAX_RETRIES
-                );
+                debug!("Submitting chunk of {} plays to ListenBrainz", chunk.len());
 
                 let resp = self
                     .client
@@ -314,14 +349,18 @@ impl ScrobbleSink for ListenBrainzSink {
                                 .and_then(|h| h.to_str().ok())
                                 .unwrap_or("?");
 
-                            let wait_time = reset_in.unwrap_or(backoff);
+                            // Capped: the service may legitimately ask for a
+                            // long wait, but this is awaited on the engine tick,
+                            // so a longer one is left for the flush deadline to
+                            // abandon and pick up again next tick.
+                            let wait_time = reset_in.unwrap_or(backoff).min(MAX_WAIT);
 
                             warn!("ListenBrainz rate limit exceeded (remaining: {}). Waiting {}s before retry...", remaining, wait_time);
 
                             sleep(Duration::from_secs(wait_time + 1)).await;
 
-                            retries += 1;
-                            if retries > MAX_RETRIES {
+                            rate_limit_retries += 1;
+                            if rate_limit_retries > RATE_LIMIT_RETRIES {
                                 let error_text = response.text().await.unwrap_or_default();
                                 error!(
                                     "Max retries exceeded for ListenBrainz. Last error: {}",
@@ -349,13 +388,18 @@ impl ScrobbleSink for ListenBrainzSink {
                         }
                     }
                     Err(e) => {
-                        error!("Network error sending to ListenBrainz: {}", e);
-                        retries += 1;
-                        if retries > MAX_RETRIES {
+                        network_retries += 1;
+                        if network_retries > NETWORK_RETRIES {
+                            // Logged at debug because `sinks::guarded` reports
+                            // this once when the breaker opens, and the one
+                            // thing it must not do is write a line per listen:
+                            // on 2026-08-24 this exact `error!` produced 6,096
+                            // of the day's 7,317 error lines — one fact,
+                            // repeated until nothing else could be found.
+                            debug!("Network error sending to ListenBrainz: {}", e);
                             return Err(format!("Network error after retries: {}", e).into());
                         }
-                        sleep(Duration::from_secs(backoff)).await;
-                        backoff *= 2;
+                        sleep(Duration::from_secs(2)).await;
                         continue;
                     }
                 }
