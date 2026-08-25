@@ -2313,6 +2313,27 @@ class TapedeckAPI {
 		return this.get(`/api/v1/physical/${id}/durations`);
 	}
 
+	/**
+	 * Replace the tracklist — and, with it, the running times.
+	 *
+	 * The counterpart of `applyDurations` for the case no provider can answer:
+	 * a pressing MusicBrainz does not have stays unknown for ever otherwise,
+	 * which means the deck shows no length and its listens contribute nothing
+	 * to gear hours. The server corrects the listens and the recorded wear
+	 * alongside, so all three cannot disagree.
+	 */
+	async setPhysicalTracks(
+		id: number,
+		tracks: PhysicalTrack[]
+	): Promise<{
+		status: string;
+		changed: number;
+		listens_updated: number;
+		plays_recomputed: number;
+	}> {
+		return this.request('PUT', `/api/v1/physical/${id}/tracks`, { tracks });
+	}
+
 	/** Write back exactly what the preview showed. */
 	async applyDurations(
 		id: number,

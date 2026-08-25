@@ -495,6 +495,90 @@
 
 	let durPreview: DurationPreview | null = null;
 	let durBusy = false;
+
+	// ── Running times, typed in ──
+	//
+	// The remainder of v0.75.0's lookup: that covers everything MusicBrainz
+	// knows, and a pressing it does not have had no way in at all — `PUT
+	// /physical/:id/tracks` existed from the start and nothing called it. The
+	// consequence is not cosmetic: the deck shows no length for the side, and
+	// `scrobbles.duration` stays null so those listens add nothing to the chain
+	// and gear hours the shelf exists to track.
+	let editingTimes = false;
+	let timeEdits: Record<string, string> = {};
+	let timeBusy = false;
+	let timeErr = '';
+
+	function startTimeEdit() {
+		timeErr = '';
+		timeEdits = Object.fromEntries(
+			openTracks.map((t) => [
+				`${t.side}|${t.position}`,
+				t.duration_secs != null ? formatDuration(t.duration_secs) : ''
+			])
+		);
+		editingTimes = true;
+	}
+
+	/**
+	 * `4:38`, `4.38`, or a bare count of seconds.
+	 *
+	 * Returns `undefined` for blank — which means "still unknown" and is a real
+	 * answer, not a zero. Anything else unparseable is `null`, so the caller can
+	 * refuse it rather than silently storing a figure the person did not type:
+	 * this number ends up on the listens and on the stylus meter.
+	 */
+	function parseTime(raw: string): number | undefined | null {
+		const v = (raw ?? '').trim();
+		if (!v) return undefined;
+		const m = v.match(/^(\d+)\s*[:.]\s*(\d{1,2})$/);
+		if (m) {
+			const secs = Number(m[2]);
+			if (secs > 59) return null;
+			return Number(m[1]) * 60 + secs;
+		}
+		if (/^\d+$/.test(v)) {
+			const n = Number(v);
+			return n > 0 ? n : null;
+		}
+		return null;
+	}
+
+	async function saveTimeEdit() {
+		if (!open) return;
+		timeErr = '';
+		const next: PhysicalTrack[] = [];
+		for (const t of openTracks) {
+			const parsed = parseTime(timeEdits[`${t.side}|${t.position}`] ?? '');
+			if (parsed === null) {
+				timeErr = `"${timeEdits[`${t.side}|${t.position}`]}" isn't a running time — try 4:38.`;
+				return;
+			}
+			next.push({ ...t, duration_secs: parsed ?? null });
+		}
+		timeBusy = true;
+		try {
+			const r = await api.setPhysicalTracks(open.id, next);
+			openTracks = next;
+			editingTimes = false;
+			// Says what it touched beyond the tracklist, because correcting
+			// listens and recorded wear is the half that is invisible from here.
+			durNote =
+				`Saved. ${r.changed} running time${r.changed === 1 ? '' : 's'} changed` +
+				(r.listens_updated ? `, ${r.listens_updated} listen${r.listens_updated === 1 ? '' : 's'} corrected` : '') +
+				(r.plays_recomputed ? `, ${r.plays_recomputed} side play${r.plays_recomputed === 1 ? '' : 's'} re-measured` : '') +
+				'.';
+			// The shelf carries the tracklist, so it has to be re-read or the
+			// deck and the side cards keep the old lengths.
+			await load();
+			const fresh = shelf.find((x) => x.id === open?.id);
+			if (fresh) open = fresh;
+		} catch (e) {
+			timeErr = e instanceof Error ? e.message : String(e);
+		} finally {
+			timeBusy = false;
+		}
+	}
 	let durNote = '';
 
 	/** Tracks on the open record with no running time. */
@@ -1889,9 +1973,59 @@
 									these listens add nothing to the hours on your gear.
 								</div>
 							</div>
-							<button class="btn btn-secondary" on:click={fetchDurations} disabled={durBusy}>
-								{durBusy ? 'Looking…' : 'Find running times'}
-							</button>
+							<div style="display:flex;gap:8px;flex-wrap:wrap;">
+								<button class="btn btn-secondary" on:click={fetchDurations} disabled={durBusy}>
+									{durBusy ? 'Looking…' : 'Find running times'}
+								</button>
+								<!-- The remainder, and until now there was none: a pressing no
+								     provider has stays unknown for ever, so the deck shows no
+								     length and its listens never reach the hours on the gear.
+								     `PUT /physical/:id/tracks` has existed since the shelf was
+								     built and nothing called it. -->
+								<button class="btn btn-secondary" on:click={startTimeEdit}>
+									Type them in
+								</button>
+							</div>
+						</div>
+					{/if}
+					{#if editingTimes}
+						<div class="durprev">
+							<div style="font-weight:600;font-size:13.5px;margin-bottom:2px;">
+								Running times, off the sleeve
+							</div>
+							<p style="font-size:12.5px;color:var(--td-muted);margin:0 0 12px;max-width:64ch;">
+								Minutes and seconds, as printed — <code>4:38</code>, or just the
+								seconds. Leave one blank to say it is still unknown. Saving
+								corrects the listens already recorded from these sides and the
+								wear on whatever played them, so the three cannot disagree.
+							</p>
+							{#each [...new Set(openTracks.map((t) => t.side))] as sd}
+								<div class="durgroup">
+									<div class="durside">{unit(open.kind)} {sd}</div>
+									{#each openTracks.filter((t) => t.side === sd) as t}
+										<label class="durrow">
+											<span class="durtitle">{t.position}. {t.title}</span>
+											<input
+												class="input timein"
+												inputmode="numeric"
+												placeholder="—"
+												bind:value={timeEdits[`${t.side}|${t.position}`]}
+											/>
+										</label>
+									{/each}
+								</div>
+							{/each}
+							{#if timeErr}
+								<p style="font-size:12.5px;color:var(--td-bad-fg);margin:10px 0 0;">{timeErr}</p>
+							{/if}
+							<div style="display:flex;gap:10px;margin-top:14px;flex-wrap:wrap;">
+								<button class="btn btn-primary" on:click={saveTimeEdit} disabled={timeBusy}>
+									{timeBusy ? 'Saving…' : 'Save running times'}
+								</button>
+								<button class="btn btn-secondary" on:click={() => (editingTimes = false)}>
+									Cancel
+								</button>
+							</div>
 						</div>
 					{/if}
 					{#if durNote}
@@ -2400,6 +2534,23 @@
 	.durtitle { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 	.durval { font-variant-numeric: tabular-nums; flex: none; color: var(--td-accent); }
 	.durval.missed { color: var(--td-muted-3); font-style: italic; }
+
+	/* The typed-in editor. `.durside` is the preview's side heading and carries
+	   only a margin, so the label styling lives here rather than being borrowed
+	   — the trap where a class is used in one place and defined in none.
+	   `.durrow` is reused deliberately: the same rows, one with a value and one
+	   with a field to put one in. */
+	.durgroup + .durgroup { margin-top: 14px; }
+	.durgroup .durside {
+		font-size: 12px; letter-spacing: .08em; text-transform: uppercase;
+		color: var(--td-muted-2); padding-bottom: 5px;
+		border-bottom: 1px solid var(--td-border); margin-bottom: 6px;
+	}
+	.durgroup .durrow { align-items: center; cursor: text; }
+	.timein {
+		flex: none; width: 82px; text-align: right; font-size: 13px;
+		padding: 4px 8px; font-variant-numeric: tabular-nums;
+	}
 
 	.sidegrid {
 		display: grid;

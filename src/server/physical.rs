@@ -558,12 +558,114 @@ async fn set_tracks(
     Path(id): Path<i64>,
     Json(body): Json<TracksUpdate>,
 ) -> impl IntoResponse {
+    let Ok(Some(release)) = state.db.get_physical(user.user_id, id).await else {
+        return err(404, "No such record");
+    };
+
+    // A whole-record replace of the one thing that makes a side playable, so
+    // the obviously-wrong bodies are refused rather than stored. An empty list
+    // is the sharpest: it would leave a record on the shelf that cannot be
+    // played and offers no way back, and nothing legitimately asks for it.
+    if body.tracks.is_empty() {
+        return err(400, "A tracklist cannot be empty — re-add the record instead");
+    }
+    let mut seen = std::collections::HashSet::new();
+    for t in &body.tracks {
+        if !seen.insert((t.side.to_ascii_uppercase(), t.position)) {
+            return err(400, format!("Two tracks share side {} position {}", t.side, t.position));
+        }
+        if t.duration_secs.is_some_and(|d| d <= 0) {
+            return err(400, format!("'{}' has a running time of zero or less", t.title));
+        }
+    }
+
+    // What actually changed, so the listens already recorded from these sides
+    // can be corrected with it. **Every** difference counts here, including one
+    // that overwrites a stored value — the opposite of `apply_durations`, and
+    // deliberately: there the source is another pressing and a hand-typed
+    // figure must survive it, here the source *is* the person, and refusing
+    // their correction would make the field pointless.
+    let before: Vec<PhysicalTrack> = serde_json::from_str(&release.tracks).unwrap_or_default();
+    let listen_updates: Vec<(String, i64, i64)> = body
+        .tracks
+        .iter()
+        .filter_map(|t| {
+            let secs = t.duration_secs?;
+            let was = before
+                .iter()
+                .find(|b| b.position == t.position && b.side.eq_ignore_ascii_case(&t.side))
+                .and_then(|b| b.duration_secs);
+            (was != Some(secs)).then(|| (t.side.clone(), t.position, secs))
+        })
+        .collect();
+
     let json = serde_json::to_string(&body.tracks).unwrap_or_else(|_| "[]".into());
     match state.db.set_physical_tracks(user.user_id, id, &json).await {
-        Ok(true) => (StatusCode::OK, Json(serde_json::json!({ "status": "ok" }))).into_response(),
-        Ok(false) => err(404, "No such record"),
-        Err(e) => err(500, e.to_string()),
+        Ok(true) => {}
+        Ok(false) => return err(404, "No such record"),
+        Err(e) => return err(500, e.to_string()),
     }
+
+    // The half that makes this worth having. A running time typed in here is
+    // not decoration: `scrobbles.duration` is what every hours readout sums and
+    // `physical_plays.duration_secs` is what the stylus meter reads, and until
+    // v0.75.0 nothing corrected either — so a record whose durations arrived
+    // late contributed nothing to gear hours for ever.
+    let (listens, sides_touched) =
+        reconcile_durations(&state, user.user_id, id, &body.tracks, &listen_updates).await;
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "status": "ok",
+            "changed": listen_updates.len(),
+            "listens_updated": listens,
+            "plays_recomputed": sides_touched,
+        })),
+    )
+        .into_response()
+}
+
+/// Push corrected running times through to the listens and the recorded wear.
+///
+/// Shared by the lookup's apply path and by a hand edit, because correcting one
+/// and not the other leaves the side card and the stylus meter disagreeing
+/// about the same play — and two copies of that rule would drift.
+///
+/// Neither failure is fatal to the caller: the tracklist is already saved and
+/// correct, and a reconciliation that could not run is recoverable by editing
+/// again, where a 500 would suggest the edit itself had not landed.
+async fn reconcile_durations(
+    state: &AppState,
+    user_id: i64,
+    id: i64,
+    tracks: &[PhysicalTrack],
+    listen_updates: &[(String, i64, i64)],
+) -> (u64, u64) {
+    let listens = match state.db.set_physical_listen_durations(user_id, id, listen_updates).await {
+        Ok(n) => n,
+        Err(e) => {
+            warn!("Saved the tracklist but could not correct its listens: {}", e);
+            0
+        }
+    };
+
+    // Whole-side plays only: a partial records how many tracks ran and never
+    // which, so its wear cannot be reconstructed and is left alone rather than
+    // inflated.
+    let mut sides_touched = 0u64;
+    for side in tracks.iter().map(|t| t.side.clone()).collect::<std::collections::BTreeSet<_>>() {
+        let on: Vec<&PhysicalTrack> = tracks.iter().filter(|t| t.side == side).collect();
+        if !on.iter().all(|t| t.duration_secs.is_some()) {
+            continue;
+        }
+        let secs: i64 = on.iter().filter_map(|t| t.duration_secs).sum();
+        match state.db.recompute_side_play_wear(user_id, id, &side, on.len() as i64, secs).await {
+            Ok(n) => sides_touched += n,
+            Err(e) => warn!("Could not recompute the wear on side {}: {}", side, e),
+        }
+    }
+    (listens, sides_touched)
 }
 
 /// How long the running-time lookup may take before this endpoint gives up and
@@ -783,34 +885,12 @@ async fn apply_durations(
             return err(500, e.to_string());
         }
     }
-    let listens =
-        match state.db.set_physical_listen_durations(user.user_id, id, &listen_updates).await {
-            Ok(n) => n,
-            Err(e) => {
-                warn!("Filled the tracklist but could not correct its listens: {}", e);
-                0
-            }
-        };
-
-    // And the wear those sides recorded, which reads from `physical_plays`
-    // rather than the listens — correcting one and not the other would leave
-    // the side card and the stylus meter disagreeing about the same play.
-    let mut sides_touched = 0u64;
-    for side in tracks.iter().map(|t| t.side.clone()).collect::<std::collections::BTreeSet<_>>() {
-        let on: Vec<&PhysicalTrack> = tracks.iter().filter(|t| t.side == side).collect();
-        if !on.iter().all(|t| t.duration_secs.is_some()) {
-            continue;
-        }
-        let secs: i64 = on.iter().filter_map(|t| t.duration_secs).sum();
-        match state
-            .db
-            .recompute_side_play_wear(user.user_id, id, &side, on.len() as i64, secs)
-            .await
-        {
-            Ok(n) => sides_touched += n,
-            Err(e) => warn!("Could not recompute the wear on side {}: {}", side, e),
-        }
-    }
+    // The listens and the recorded wear, through the same path a hand edit
+    // takes — see `reconcile_durations`. It runs even when nothing was filled:
+    // a record whose tracklist was completed before the wear was being
+    // corrected would otherwise have no way back into line.
+    let (listens, sides_touched) =
+        reconcile_durations(&state, user.user_id, id, &tracks, &listen_updates).await;
 
     (
         StatusCode::OK,

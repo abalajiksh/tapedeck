@@ -26,7 +26,7 @@ openapi: 3.1.0
 
 info:
   title: Tapedeck
-  version: 0.91.1
+  version: 0.91.2
   summary: Self-hosted scrobbler and listening journal.
   description: |
     Tapedeck ingests listens, enriches them with MusicBrainz metadata, stores
@@ -5541,6 +5541,21 @@ paths:
         splitting a CD by playing time would invent a break that is not there.
         The medium's own format string decides which rule applies, not what was
         searched for.
+
+
+        **It is also how a running time is typed in**, which for a pressing no
+        provider carries is the only way one is ever known. That is not
+        cosmetic: `scrobbles.duration` is what every hours readout sums and
+        `physical_plays.duration_secs` is what the stylus meter reads, so this
+        corrects **both** alongside the tracklist rather than leaving three
+        answers free to disagree. Whole-side plays only — a partial records how
+        many tracks ran and never which, so its wear cannot be reconstructed.
+
+
+        Unlike `POST /durations`, a value here **overwrites** a stored one. That
+        is the whole difference between the two: there the source is another
+        pressing and a hand-typed figure must survive it, here the source is the
+        person, and refusing their correction would make the field pointless.
       parameters: [{ name: id, in: path, required: true, schema: { type: integer } }]
       requestBody:
         required: true
@@ -5552,14 +5567,36 @@ paths:
               properties:
                 tracks:
                   type: array
+                  minItems: 1
                   items:
                     type: object
+                    required: [side, position, title]
                     properties:
-                      position: { type: string, example: A1 }
+                      side: { type: string, example: A, description: Side letter, or the disc number for a CD/SACD. }
+                      position: { type: integer, example: 1, description: Track number within the release. }
                       title: { type: string }
-                      duration: { type: integer, description: Seconds. }
+                      artist: { type: [string, 'null'] }
+                      duration_secs:
+                        type: [integer, 'null']
+                        description: >
+                          Seconds. Null means "still unknown", which is a real
+                          answer and not a zero — a side with any unknown track
+                          reports no running time rather than an invented sum.
+                      disc: { type: [integer, 'null'], description: Which physical disc of a set, from 1. }
       responses:
-        '200': { description: Saved., content: { application/json: { schema: { $ref: '#/components/schemas/Ok' } } } }
+        '200':
+          description: Saved.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+                properties:
+                  status: { type: string }
+                  changed: { type: integer, description: Running times that differ from what was stored. }
+                  listens_updated: { type: integer }
+                  plays_recomputed: { type: integer }
+        '400': { description: Empty tracklist, a duplicated side and position, or a running time of zero or less. }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '404': { $ref: '#/components/responses/NotFound' }
 
