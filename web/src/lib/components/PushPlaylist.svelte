@@ -130,11 +130,47 @@
 					{result.matched === result.requested ? 'Sent' : 'Sent, partly'}
 				</div>
 				<div class="dialog-body" style="color:var(--td-nav-fg);">
+					<!-- Two sentences, not one with a swapped verb: somebody looking at
+					     their library needs to know whether they now have one of these
+					     or two, and "rewrote the one you already had" is the whole
+					     point of v0.76.3. The server has said which since then and
+					     nothing here read it. -->
 					<p style="margin:0 0 10px;">
-						<strong>{result.matched}</strong> of {result.requested}
-						track{result.requested === 1 ? '' : 's'} landed on {result.target.label} as
-						“{result.name}”.
+						{#if result.updated_existing}
+							<strong>{result.matched}</strong> of {result.requested}
+							track{result.requested === 1 ? '' : 's'} rewrote “{result.name}”, the
+							playlist the last push left on {result.target.label} — you still have
+							one of it, not two.
+						{:else}
+							<strong>{result.matched}</strong> of {result.requested}
+							track{result.requested === 1 ? '' : 's'} landed on {result.target.label}
+							as “{result.name}”.
+						{/if}
 					</p>
+					<!-- What the resolution cache saved.
+					     v0.76.4 built it after three pushes of one playlist matched 24,
+					     then 17, then 17 — the far end throttling, and every push asking
+					     it the same questions again. Its own note says: "if it is not
+					     nearly everything on a second push then the cache is not working
+					     and nobody would otherwise find out." Nobody could: the number
+					     was in the response and drawn nowhere. -->
+					{#if result.from_cache != null && result.matched > 0}
+						<p style="margin:0 0 10px;font-size:12.5px;color:var(--td-muted);">
+							{#if result.from_cache === 0}
+								Every one was looked up fresh — the first push of a list always is.
+							{:else if result.from_cache === result.matched}
+								<!-- The good case, and the one worth naming plainly: a re-push
+								     of an unchanged list should ask the far end nothing at
+								     all. "only asked about 0" is the same fact read badly. -->
+								All of them came from what the last push learned, so
+								{result.target.label} was not asked about any of them.
+							{:else}
+								{result.from_cache} of them came from what the last push learned,
+								so {result.target.label} was asked about
+								{result.matched - result.from_cache}.
+							{/if}
+						</p>
+					{/if}
 					{#if result.missing.length}
 						<p style="margin:0 0 6px;font-size:13px;color:var(--td-muted);">
 							Not in that library — these are in your history but not on this server, or

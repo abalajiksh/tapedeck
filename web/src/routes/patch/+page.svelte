@@ -9,6 +9,7 @@
 	import { onMount, onDestroy } from 'svelte';
 	import { api } from '$lib/api';
 	import type {
+		SentSitting,
 		PatchPeer,
 		ReelListen,
 		PatchArtist,
@@ -204,6 +205,16 @@
 	// Sittings somebody passed on. Loaded with the rest rather than on the tab,
 	// because the inbox count on the tab strip has to include them.
 	let sittings: HandedSitting[] = [];
+	/**
+	 * What you have handed over.
+	 *
+	 * Nothing listed these, which is why `withdrawSitting` shipped with no
+	 * caller: you could pass an evening on and never see it again, so there was
+	 * nowhere to take one back from.
+	 *
+	 * Kept out of the inbox badge on purpose — these are not waiting on you.
+	 */
+	let sentSittings: SentSitting[] = [];
 	let openedSitting: HandedSittingDetail | null = null;
 	let spoolPicked: Record<string, boolean> = {};
 	let spoolTitle = '';
@@ -495,6 +506,7 @@
 	async function loadSittings() {
 		try {
 			sittings = (await api.getSittings()).sittings;
+			sentSittings = (await api.getSentSittings()).sittings;
 		} catch {
 			/* the section simply does not render */
 		}
@@ -518,6 +530,55 @@
 			);
 		} catch (e) {
 			alert(e instanceof Error ? e.message : 'Could not open that');
+		} finally {
+			busy = null;
+		}
+	}
+
+	/**
+	 * Take a handed-over sitting back.
+	 *
+	 * Genuinely undoes it: the document is rendered from *your* database on
+	 * every read, so removing the row is the whole of it — the divergence from
+	 * "no delete sweep on un-patching" that Phase 6 already records, and it
+	 * holds only because nothing has been copied anywhere. When this federates
+	 * it becomes a `Delete` to send rather than a row to remove.
+	 */
+	/**
+	 * Read back one you sent.
+	 *
+	 * Its own function rather than `openSitting`, which also marks the thing
+	 * **seen** — that is the recipient's state, and looking at your own copy is
+	 * not them reading it. `handed_sitting` already lets either end read it, so
+	 * this is the same request without the side effect.
+	 */
+	async function viewSentSitting(h: SentSitting) {
+		busy = h.uuid;
+		try {
+			openedSitting = await api.getSitting(h.uuid);
+		} catch (e) {
+			alert(e instanceof Error ? e.message : 'Could not open that');
+		} finally {
+			busy = null;
+		}
+	}
+
+	async function withdrawSitting(h: SentSitting) {
+		const who = h.to_display_name || `@${h.to_username}`;
+		if (
+			!confirm(
+				h.seen_at
+					? `Take "${h.title || 'this sitting'}" back from ${who}?\n\nThey have already read it — this only stops them opening it again.`
+					: `Take "${h.title || 'this sitting'}" back from ${who}?\n\nThey have not opened it yet, so it will simply disappear.`
+			)
+		)
+			return;
+		busy = h.uuid;
+		try {
+			await api.withdrawSitting(h.uuid);
+			sentSittings = sentSittings.filter((x) => x.uuid !== h.uuid);
+		} catch (e) {
+			alert(e instanceof Error ? e.message : 'Could not withdraw that');
 		} finally {
 			busy = null;
 		}
@@ -1689,7 +1750,7 @@
 					<div class="pmain">
 						<div class="pname">{h.title || 'A sitting'}</div>
 						<div class="phandle">
-							from @{h.from_username}{#if h.started_at} · {new Date(h.started_at * 1000).toLocaleDateString(undefined, { day: 'numeric', month: 'long' })}{/if}
+							from @{h.from_username}{' '}{#if h.started_at}· {new Date(h.started_at * 1000).toLocaleDateString(undefined, { day: 'numeric', month: 'long' })}{/if}
 						</div>
 						{#if h.note}<div class="dbecause">“{h.note}”</div>{/if}
 					</div>
@@ -1697,6 +1758,49 @@
 						<button class="btn btn-primary" on:click={() => openSitting(h)}>Open</button>
 						<button class="btn btn-secondary" disabled={busy === h.uuid} on:click={() => dismissSitting(h)}>
 							Dismiss
+						</button>
+					</div>
+				</div>
+			{/each}
+		</div>
+	{/if}
+
+	<!-- What you passed on. Not part of the inbox count — none of it is
+	     waiting on you — but it belongs on the same tab, because "an evening
+	     somebody sent me" and "an evening I sent" are the same object seen from
+	     either end. -->
+	{#if sentSittings.length}
+		<div class="secbar" style="margin-top:26px;">
+			<h2 class="h-display sech">Sittings you passed on</h2>
+			<span class="seccount">{sentSittings.length}</span>
+		</div>
+		<p class="sub" style="margin-top:0;">
+			Each one is rendered from your listens every time it is opened, so this really does
+			take it back — and un-sharing a chain really does remove those plays from it.
+		</p>
+		<div class="panel rows">
+			{#each sentSittings as h (h.uuid)}
+				<div class="prow">
+					<span class="avatar small">{h.to_username.slice(0, 2).toUpperCase()}</span>
+					<div class="pmain">
+						<div class="pname">{h.title || 'A sitting'}</div>
+						<div class="phandle">
+							to @{h.to_username}{' '}{#if h.started_at}· {new Date(h.started_at * 1000).toLocaleDateString(undefined, { day: 'numeric', month: 'long' })}{/if}
+							<!-- Whether they have read it, because taking back something
+							     already read is a different act from taking back something
+							     nobody saw — and only one of them is really undone. -->
+							· {h.seen_at ? 'read' : 'not opened yet'}
+						</div>
+						{#if h.note}<div class="dbecause">“{h.note}”</div>{/if}
+					</div>
+					<div class="pacts">
+						<button class="btn btn-secondary" disabled={busy === h.uuid}
+							on:click={() => viewSentSitting(h)}>
+							View
+						</button>
+						<button class="btn btn-danger" disabled={busy === h.uuid}
+							on:click={() => withdrawSitting(h)}>
+							{busy === h.uuid ? '…' : 'Withdraw'}
 						</button>
 					</div>
 				</div>

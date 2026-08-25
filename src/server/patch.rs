@@ -99,6 +99,9 @@ pub fn create_patch_router() -> Router<Arc<AppState>> {
         .route("/api/v1/patch/live", get(live))
         .route("/api/v1/patch/inbox-count", get(inbox_count))
         .route("/api/v1/patch/sittings", get(sittings).post(hand_over))
+        // Before the `:uuid` route: matchit prefers a static segment, but
+        // stating the order makes that independent of it.
+        .route("/api/v1/patch/sittings/sent", get(sittings_sent))
         .route("/api/v1/patch/sittings/:uuid", get(sitting).delete(withdraw_sitting))
         .route("/api/v1/patch/sittings/:uuid/seen", post(mark_seen))
 }
@@ -770,6 +773,23 @@ async fn sittings(State(state): State<Arc<AppState>>, user: super::auth::AuthUse
         Ok(v) => (StatusCode::OK, Json(serde_json::json!({ "sittings": v }))).into_response(),
         Err(e) => {
             warn!("📡 sittings: {e}");
+            refused(StatusCode::INTERNAL_SERVER_ERROR, "Could not read those")
+        }
+    }
+}
+
+/// `GET /api/v1/patch/sittings/sent` — sittings you have passed on.
+///
+/// Its absence is why `withdraw_sitting` had no caller: you could hand one over
+/// and never see it again, so there was nowhere to take one back from.
+async fn sittings_sent(
+    State(state): State<Arc<AppState>>,
+    user: super::auth::AuthUser,
+) -> Response {
+    match state.db.sittings_sent(user.user_id).await {
+        Ok(v) => (StatusCode::OK, Json(serde_json::json!({ "sittings": v }))).into_response(),
+        Err(e) => {
+            warn!("📡 sittings sent: {e}");
             refused(StatusCode::INTERNAL_SERVER_ERROR, "Could not read those")
         }
     }

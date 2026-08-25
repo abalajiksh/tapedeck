@@ -26,7 +26,7 @@ openapi: 3.1.0
 
 info:
   title: Tapedeck
-  version: 0.92.1
+  version: 0.92.2
   summary: Self-hosted scrobbler and listening journal.
   description: |
     Tapedeck ingests listens, enriches them with MusicBrainz metadata, stores
@@ -3127,6 +3127,45 @@ paths:
                   waiting: { type: integer }
         '401': { description: Not signed in. }
 
+  /api/v1/patch/sittings/sent:
+    get:
+      tags: [Patch]
+      summary: Sittings you have passed on, and whether they have been read.
+      description: >
+        Session-only. The counterpart of `GET /api/v1/patch/sittings`, which
+        lists only what was passed *to* you — without this a hand-over could be
+        sent and never seen again, so there was nowhere to withdraw one from.
+
+
+        **Only documents appear here.** A reconstruction (`kind: "spool"`)
+        writes real captures into the other person's inbox and no
+        `shared_sessions` row, so there is nothing to take back — those are
+        plays they accept or decline for themselves.
+      responses:
+        '200':
+          description: OK.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  sittings:
+                    type: array
+                    items:
+                      type: object
+                      additionalProperties: true
+                      properties:
+                        uuid: { type: string }
+                        session_uuid: { type: string }
+                        note: { type: [string, 'null'] }
+                        created_at: { type: integer }
+                        seen_at: { type: [integer, 'null'], description: 'When they opened it. Null is still unread.' }
+                        to_username: { type: string }
+                        to_display_name: { type: [string, 'null'] }
+                        title: { type: [string, 'null'], description: 'Null when the sitting has since been regrouped out of existence.' }
+                        started_at: { type: [integer, 'null'] }
+                        ended_at: { type: [integer, 'null'] }
+        '401': { $ref: '#/components/responses/Unauthorized' }
   /api/v1/patch/sittings:
     get:
       tags: [Patch]

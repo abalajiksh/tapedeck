@@ -126,6 +126,29 @@ pub struct HandedSitting {
     pub ended_at: Option<i64>,
 }
 
+/// One sitting **you** passed on, for the sender's own list.
+///
+/// A separate type from [`HandedSitting`] rather than a nullable-both-ways
+/// version of it: the recipient's row is about who sent it, this one is about
+/// who got it, and a struct carrying `from_*` and `to_*` with one half always
+/// null is how a reader ends up showing the wrong name.
+#[derive(Debug, FromRow, serde::Serialize)]
+pub struct SentSitting {
+    pub uuid: String,
+    pub session_uuid: String,
+    pub note: Option<String>,
+    pub created_at: i64,
+    /// When they opened it. `None` means it is still unread — which is the
+    /// difference between withdrawing something nobody saw and taking back
+    /// something already read, and the screen says which.
+    pub seen_at: Option<i64>,
+    pub to_username: String,
+    pub to_display_name: Option<String>,
+    pub title: Option<String>,
+    pub started_at: Option<i64>,
+    pub ended_at: Option<i64>,
+}
+
 /// One listen inside a handed-over sitting. **Not a listen of the reader's** —
 /// this enters no history, count or chart, which is why it is its own type
 /// rather than a `ScrobbleRecord`.
@@ -15302,6 +15325,32 @@ impl Database {
                JOIN users u ON u.id = ss.from_user_id
                LEFT JOIN sessions se ON se.uuid = ss.session_uuid
               WHERE ss.to_user_id = ?
+              ORDER BY ss.created_at DESC",
+        )
+        .bind(user_id)
+        .fetch_all(&self.pool)
+        .await
+    }
+
+    /// What you have passed on, and whether it has been read.
+    ///
+    /// The counterpart of [`Self::sittings_for`], and its absence is why
+    /// `withdraw_session` had no caller: a hand-over could be sent and never
+    /// listed, so there was no screen from which to take one back.
+    ///
+    /// **Only documents appear here.** A reconstructed spool writes real
+    /// captures into the other person's inbox and no `shared_sessions` row, so
+    /// there is nothing to withdraw — which is correct rather than an omission:
+    /// those are plays they accept or decline for themselves.
+    pub async fn sittings_sent(&self, user_id: i64) -> Result<Vec<SentSitting>, sqlx::Error> {
+        sqlx::query_as(
+            "SELECT ss.uuid, ss.session_uuid, ss.note, ss.created_at, ss.seen_at,
+                    u.username AS to_username, u.display_name AS to_display_name,
+                    se.title, se.started_at, se.ended_at
+               FROM shared_sessions ss
+               JOIN users u ON u.id = ss.to_user_id
+               LEFT JOIN sessions se ON se.uuid = ss.session_uuid
+              WHERE ss.from_user_id = ?
               ORDER BY ss.created_at DESC",
         )
         .bind(user_id)

@@ -589,6 +589,21 @@ export interface LiveDeck {
 
 /** A sitting somebody handed you. **A document, never captures** — it enters
  *  no history, count or chart of yours, so there is nothing to accept. */
+/** One sitting **you** passed on — see `getSentSittings`. */
+export interface SentSitting {
+	uuid: string;
+	session_uuid: string;
+	note: string | null;
+	created_at: number;
+	/** When they opened it. `null` is still unread. */
+	seen_at: number | null;
+	to_username: string;
+	to_display_name: string | null;
+	title: string | null;
+	started_at: number | null;
+	ended_at: number | null;
+}
+
 export interface HandedSitting {
 	uuid: string;
 	session_uuid: string;
@@ -2064,6 +2079,15 @@ class TapedeckAPI {
 		return this.post('/api/v1/patch/sittings', body);
 	}
 
+	/**
+	 * What you have passed on, and whether it has been read.
+	 *
+	 * Only documents appear — a reconstructed spool writes captures into the
+	 * other person's inbox and nothing here, so there is nothing to take back.
+	 */
+	async getSentSittings(): Promise<{ sittings: SentSitting[] }> {
+		return this.get('/api/v1/patch/sittings/sent');
+	}
 	async withdrawSitting(uuid: string): Promise<{ withdrawn: boolean }> {
 		return this.request('DELETE', `/api/v1/patch/sittings/${encodeURIComponent(uuid)}`);
 	}
