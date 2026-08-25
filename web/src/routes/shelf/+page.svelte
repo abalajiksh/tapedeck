@@ -74,7 +74,16 @@
 	let open: PhysicalRelease | null = null;
 	let openTracks: PhysicalTrack[] = [];
 	let playing = false;
-	let flipPrompt = '';
+	/**
+	 * The side to turn the record over to, and *which* record.
+	 *
+	 * A bare side letter was enough while this only ever rendered inside the
+	 * open panel — and that was the bug: since v0.52.0 the deck is page-level,
+	 * so recording a side with nothing expanded set a reminder nobody could see,
+	 * and `openRelease` then cleared it on the way in. Carrying the release lets
+	 * it render beside the deck, where the person actually is.
+	 */
+	let flip: { release: PhysicalRelease; side: string } | null = null;
 	let playMsg = '';
 
 	// ── What it was played on ──
@@ -299,13 +308,29 @@
 	 * in particular is not recorded as skipped: a track you never reached is not
 	 * a track you skipped, and `scrobbles.skipped` feeds skip-rate analytics.
 	 */
-	function startSide(side: string, from?: number, only = false) {
-		if (!open) return;
+	/**
+	 * Drop the needle.
+	 *
+	 * Takes the release rather than reading `open`, which it used to begin with
+	 * `if (!open) return;`. Since v0.52.0 the deck is a page-level band and
+	 * recording a side with nothing expanded is the *common* path, so anything
+	 * gated on a panel being open is unreachable exactly when it is most wanted
+	 * — the shape that had already made the Record button (v0.70.5) and the
+	 * Spool dialog (v0.82.0) dead code. Omitting it still means the open panel,
+	 * so every existing caller is unchanged.
+	 */
+	function startSide(
+		side: string,
+		from?: number,
+		only = false,
+		release: PhysicalRelease | null = open
+	) {
+		if (!release) return;
 		playMsg = '';
-		flipPrompt = '';
+		flip = null;
 		toPosition = only ? (from ?? null) : null;
 		const now = Math.floor(Date.now() / 1000);
-		const list = sideTracks(side);
+		const list = sideTracks(side, release);
 		const first = from ?? list[0]?.position ?? 1;
 		// Where in the side the clock starts, so the countdown reads a position
 		// within the side rather than from zero — the tracks before it exist and
@@ -315,7 +340,7 @@
 			.reduce((n, t) => n + (t.duration_secs ?? 180), 0);
 		fromPosition = first;
 		saveSpinning({
-			releaseId: open.id, kind: open.kind, side, startedAt: now,
+			releaseId: release.id, kind: release.kind, side, startedAt: now,
 			pausedAt: null, pausedTotal: 0, startSecs,
 			// The first track starts the moment the needle drops.
 			outcomes: [{ position: first, started_at: now, skipped: false }]
@@ -868,7 +893,6 @@
 	async function openRelease(r: PhysicalRelease) {
 		open = r;
 		playMsg = '';
-		flipPrompt = '';
 		imageNote = '';
 		lightbox = -1;
 		playChain = r.chain_id;
@@ -1136,7 +1160,11 @@
 			// The flip reminder is the whole point of tracking sides: you are
 			// away from the screen while it plays, and the next thing you do is
 			// turn it over.
-			flipPrompt = r.next_side ?? '';
+			// Carries the record, not just the letter — see `flip`. `load()` above
+		// has just refreshed the shelf, so the row is there; falling back to the
+		// open panel covers the first paint.
+		const flipOn = shelf.find((x) => x.id === id) ?? (open?.id === id ? open : null);
+		flip = r.next_side && flipOn ? { release: flipOn, side: r.next_side } : null;
 			saveSpinning(null);
 			await load();
 			const fresh = shelf.find((x) => x.id === open?.id);
@@ -1497,6 +1525,61 @@
 	</div>
 {/if}
 
+<!-- Turn it over.
+     
+     Beside the deck rather than inside the open panel, which is where it used
+     to live and why nobody ever saw it: since v0.52.0 the deck is a page-level
+     band, so the common way to record a side is with nothing expanded — and
+     `openRelease` then cleared the reminder on the way in, so even opening the
+     record put it out of reach. Same family as the Record button (v0.70.5) and
+     the Spool dialog (v0.82.0): working code with no way to it.
+
+     It offers the same two things a side row does, in the same words. It used
+     to carry one button reading "Play side B" wired to `play`, which *records*
+     a side as already played — so turning the record over and pressing it
+     banked the whole side without the deck ever starting. Two actions that
+     differ this much cannot share a verb. -->
+{#if flip && !spinning}
+	{@const f = flip}
+	{@const nextTracks = sideTracks(f.side, f.release)}
+	{@const nextSecs = nextTracks.length && nextTracks.every((t) => t.duration_secs != null)
+		? nextTracks.reduce((n, t) => n + (t.duration_secs ?? 0), 0)
+		: null}
+	<div class="flip">
+		<span style="font-size:20px;">{isDisc(f.release.kind) ? '→' : '↻'}</span>
+		<div style="min-width:0;">
+			<div style="font-weight:600;font-size:14.5px;">
+				{isDisc(f.release.kind)
+					? `Next up — ${unit(f.release.kind).toLowerCase()} ${f.side}`
+					: `Flip it — side ${f.side} is next`}
+			</div>
+			<div style="font-size:12.5px;color:var(--td-muted);">
+				<!-- Which record, because the deck is page-level and there may be
+				     nothing else on screen saying so. -->
+				{f.release.artist} — {f.release.title}
+				{#if nextSecs != null}
+					· {formatDuration(nextSecs)} on that {unit(f.release.kind).toLowerCase()}
+				{/if}
+			</div>
+		</div>
+		<div style="display:flex;gap:6px;margin-left:auto;flex-wrap:wrap;">
+			<button class="btn btn-primary" disabled={playing || !!spinning}
+				on:click={() => startSide(f.side, undefined, false, f.release)}>
+				Start {unit(f.release.kind).toLowerCase()} {f.side}
+			</button>
+			<button class="btn btn-secondary"
+				title="Record it now, working the start time back from the running time"
+				disabled={playing || !!spinning}
+				on:click={() => play(f.side, undefined, f.release.id)}>
+				Already played
+			</button>
+			<!-- Dismissing is the honest way for a reminder to end: you did not
+			     turn it over, and it should not sit there implying you did. -->
+			<button class="btn btn-secondary" on:click={() => (flip = null)}>Not now</button>
+		</div>
+	</div>
+{/if}
+
 <!-- What the setup is wearing out. A stylus is a consumable with a life in
      hours and it is the one part of the setup you are expected to replace, so
      the shelf says how much is on it.
@@ -1734,40 +1817,6 @@
 					</p>
 				{:else}
 
-					{#if flipPrompt}
-						<!-- The reminder offers the same two things a side row does, in the
-						     same words. It used to carry one button reading "Play side B"
-						     wired to `play` — which *records* a side as already played, so
-						     turning the record over and pressing it banked the whole side
-						     without the deck ever starting. Two actions that differ this
-						     much cannot share a verb. -->
-						<div class="flip">
-							<span style="font-size:20px;">{isDisc(open.kind) ? '→' : '↻'}</span>
-							<div>
-								<div style="font-weight:600;font-size:14.5px;">
-									{isDisc(open.kind)
-										? `Next up — ${unit(open.kind).toLowerCase()} ${flipPrompt}`
-										: `Flip it — side ${flipPrompt} is next`}
-								</div>
-								<div style="font-size:12.5px;color:var(--td-muted);">
-									{sideTotals.get(flipPrompt) != null
-										? `${formatDuration(sideTotals.get(flipPrompt) ?? 0)} on that ${unit(open.kind).toLowerCase()}.`
-										: `Running time unknown for that ${unit(open.kind).toLowerCase()}.`}
-								</div>
-							</div>
-							<div style="display:flex;gap:6px;margin-left:auto;flex-wrap:wrap;">
-								<button class="btn btn-primary" disabled={playing || !!spinning}
-									on:click={() => startSide(flipPrompt)}>
-									Start {unit(open.kind).toLowerCase()} {flipPrompt}
-								</button>
-								<button class="btn btn-secondary"
-									title="Record it now, working the start time back from the running time"
-									disabled={playing || !!spinning} on:click={() => play(flipPrompt)}>
-									Already played
-								</button>
-							</div>
-						</div>
-					{/if}
 
 					{#if playMsg}
 						<p style="font-size:13px;color:var(--td-good-fg);margin:14px 0 0;">{playMsg}</p>

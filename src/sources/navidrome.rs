@@ -49,6 +49,18 @@ fn resume_point(last_submission: u64, last_checked: u64) -> u64 {
 /// and the cost of not overlapping is a listen nobody ever sees again. Well
 /// clear of any plausible disagreement between Tapedeck's clock and the
 /// server's, and small enough that a poll still reads one page.
+/// Rows per request when walking history, and a ceiling on one walk so a first
+/// run against a long history cannot make a single poll unbounded.
+const HISTORY_PAGE_SIZE: usize = 5_000;
+const HISTORY_MAX_ROWS: usize = 100_000;
+
+/// Tracks per request when caching the library.
+const SONG_PAGE_SIZE: usize = 5_000;
+
+/// Ceiling on one catalogue load. Generous — a library past this is unusual —
+/// but bounded, because this runs inside a poll tick.
+const SONG_MAX_ROWS: usize = 500_000;
+
 const HISTORY_SLACK_SECS: u64 = 300;
 
 pub struct NavidromeSource {
@@ -322,13 +334,47 @@ impl NavidromeSource {
         &mut self,
         from: u64,
     ) -> Result<Vec<Play>, Box<dyn std::error::Error>> {
-        let resp = self
-            .native_get(
-                "/api/scrobble/",
-                &[("from", from.to_string()), ("_start", "0".into()), ("_end", "10000".into())],
-            )
-            .await?;
-        let rows: Vec<NativeScrobble> = resp.json().await?;
+        // Paged, because a single `_end=10000` is only safe under an ordering
+        // Navidrome does not promise. If its history comes back **newest
+        // first**, one capped request advances `last_submission` to the very
+        // newest row and everything behind the cap is skipped for good — a
+        // first run against years of history losing most of it, silently. If it
+        // comes back oldest first the cap self-paces and nothing is lost. Under
+        // either ordering, reading until a short page is correct.
+        //
+        // It costs one extra request in steady state and nothing at all in the
+        // common case, since `resume_point` already keeps each poll's window
+        // small.
+        let mut rows: Vec<NativeScrobble> = Vec::new();
+        let mut start = 0usize;
+        loop {
+            let resp = self
+                .native_get(
+                    "/api/scrobble/",
+                    &[
+                        ("from", from.to_string()),
+                        ("_start", start.to_string()),
+                        ("_end", (start + HISTORY_PAGE_SIZE).to_string()),
+                    ],
+                )
+                .await?;
+            let page: Vec<NativeScrobble> = resp.json().await?;
+            let got = page.len();
+            rows.extend(page);
+            if got < HISTORY_PAGE_SIZE {
+                break;
+            }
+            start += got;
+            if start >= HISTORY_MAX_ROWS {
+                warn!(
+                    "Navidrome history walk stopped at its {}-row ceiling — the rest will be \
+                     picked up on the next poll if the server orders oldest-first, and not at \
+                     all if it does not",
+                    HISTORY_MAX_ROWS
+                );
+                break;
+            }
+        }
         if rows.is_empty() {
             return Ok(Vec::new());
         }
@@ -343,7 +389,16 @@ impl NavidromeSource {
         for row in rows {
             newest = newest.max(row.submission_time);
             let Some(song) = self.songs.get(&row.media_file_id) else {
-                debug!("Navidrome scrobble references unknown song {}", row.media_file_id);
+                // A listen is being **dropped** here, not merely degraded — so
+                // this is a warning. After a full catalogue load an unknown id
+                // means the track has been removed from the library since it
+                // was played, which is real and rare; before the pagination fix
+                // it just meant the library was bigger than one request.
+                warn!(
+                    "Navidrome play of unknown track {} — not banking it, since there is \
+                     nothing to bank",
+                    row.media_file_id
+                );
                 continue;
             };
             plays.push(song.to_play(row.submission_time, &row.media_file_id));
@@ -352,11 +407,50 @@ impl NavidromeSource {
         Ok(plays)
     }
 
+    /// Cache the library, a page at a time.
+    ///
+    /// **It used to ask for `_end=100000` in one request**, which is two
+    /// separate problems on a library bigger than that. The obvious one is that
+    /// the tail is missing. The one that actually costs listens is what happens
+    /// next: `fetch_scrobbles` looks a play's `media_file_id` up in this map and
+    /// **`continue`s past anything it cannot find** — so a truncated catalogue
+    /// does not degrade a listen's metadata, it drops the listen entirely, at
+    /// `debug!`, permanently.
+    ///
+    /// It is also a single response holding an entire music library, parsed in
+    /// one go on a Raspberry Pi. Pages are a fixed size and appended, so peak
+    /// memory is one page rather than the whole thing twice.
     async fn load_songs(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        let resp = self
-            .native_get("/api/song", &[("_start", "0".into()), ("_end", "100000".into())])
-            .await?;
-        let songs: Vec<NativeSong> = resp.json().await?;
+        let mut songs: Vec<NativeSong> = Vec::new();
+        let mut start = 0usize;
+        loop {
+            let resp = self
+                .native_get(
+                    "/api/song",
+                    &[
+                        ("_start", start.to_string()),
+                        ("_end", (start + SONG_PAGE_SIZE).to_string()),
+                    ],
+                )
+                .await?;
+            let page: Vec<NativeSong> = resp.json().await?;
+            let got = page.len();
+            songs.extend(page);
+            if got < SONG_PAGE_SIZE {
+                break;
+            }
+            start += got;
+            if start >= SONG_MAX_ROWS {
+                // Said out loud, because the consequence is dropped listens
+                // rather than a cosmetic gap.
+                warn!(
+                    "Navidrome library exceeds {} tracks — plays of anything past that will \
+                     not be recognised and will be skipped",
+                    SONG_MAX_ROWS
+                );
+                break;
+            }
+        }
         self.songs = songs
             .into_iter()
             .map(|s| {

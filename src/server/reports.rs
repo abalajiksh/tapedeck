@@ -259,138 +259,28 @@ pub async fn reports(
 
     let tz = crate::server::scrobbles::user_tz_for(&state, user.user_id).await;
 
-    // ── One pass ──────────────────────────────────────────────────────────
-    let mut buckets: HashMap<String, Bucket> = HashMap::new();
-    let mut order: Vec<String> = Vec::new();
-    // First-ever sighting of an artist, across the whole history. Because the
-    // scan is ascending, the first time we see a name is the real first time.
-    let mut seen_artists: HashSet<String> = HashSet::new();
-    let mut running_total: i64 = 0;
-    // Round-number listens, attributed to whichever period crossed them.
-    let mut milestones: HashMap<String, Vec<String>> = HashMap::new();
+    // Taken before the rows move: the response says whether the scan hit the
+    // analytics cap, and that is a fact about what was read rather than about
+    // what the fold produced.
+    let scanned = rows.len() as i64;
 
-    for r in &rows {
-        let dt = tz.from_utc_datetime(
-            &DateTime::from_timestamp(r.timestamp, 0).unwrap_or_default().naive_utc(),
-        );
-        let (key, label) = period_of(dt, unit);
-        let b = buckets.entry(key.clone()).or_insert_with(|| {
-            order.push(key.clone());
-            Bucket {
-                label,
-                start: r.timestamp,
-                sub: vec![0; sub_bucket_count(unit)],
-                sub_genres: vec![HashMap::new(); sub_bucket_count(unit)],
-                ..Default::default()
-            }
-        });
-
-        b.plays += 1;
-        b.end = r.timestamp;
-        b.seconds += r.duration.unwrap_or(0).max(0);
-        b.clock[dt.hour() as usize] += 1;
-        let (si, _) = sub_bucket(dt, unit);
-        if si < b.sub.len() {
-            b.sub[si] += 1;
+    // ── One pass, off the async worker ─────────────────────────────────────
+    //
+    // The fold walks the **whole history** and builds a dense map per period.
+    // It is ordinary synchronous work, and doing it in an async handler pins a
+    // tokio worker for its full duration — one of four on a Pi — so several
+    // concurrent report requests can starve everything else the runtime has to
+    // do, including the poll tick and health checks.
+    //
+    // `rows` and `tz` are not read again after this, so the whole thing moves.
+    let folded = match tokio::task::spawn_blocking(move || fold_periods(rows, tz, unit)).await {
+        Ok(f) => f,
+        Err(e) => {
+            tracing::error!("Report fold panicked: {}", e);
+            return err(500, "Could not build your report");
         }
-        let sub_index = si.min(b.sub.len().saturating_sub(1));
-        b.days.insert(dt.num_days_from_ce());
-
-        // Who actually played it.
-        //
-        // On a compilation the `artist` column is "Various Artists" — a filing
-        // convention, not a performer — and the real name is in `artist_credit`,
-        // which is exactly what v0.22.1 kept it for. Preferring it here means a
-        // compilation track counts towards the person who played it rather than
-        // piling up under a placeholder that then wins every superlative on the
-        // page. Falls back to `artist` when there is no credit, which is the
-        // overwhelmingly common case.
-        // `artist_credit` is everyone credited, joined with "; " and the
-        // primary first — the shape `save_scrobble` and `fold_artist_credit`
-        // both write. The primary is the one to count; the whole joined string
-        // would be its own key and no more useful than the placeholder.
-        let performer = if crate::db::is_various_artists(&r.artist) {
-            r.artist_credit
-                .as_deref()
-                .and_then(|c| c.split(';').next())
-                .map(str::trim)
-                .filter(|c| !c.is_empty() && !crate::db::is_various_artists(c))
-                .unwrap_or(&r.artist)
-        } else {
-            &r.artist
-        };
-        let akey = performer.trim().to_lowercase();
-
-        // Everyone credited, not only the one whose name the row carries.
-        // "Hilary Hahn plays Bach" is a listen for both of them, and a report
-        // that named only Bach would disagree with the charts and the artist
-        // page, which fan out over `scrobble_artists`. Same question, three
-        // screens, one answer.
-        //
-        // The tally fans out; **everything keyed on `akey` below does not** —
-        // an album belongs to one artist, and the crush is about the artist a
-        // record introduced you to. Those are facts about the primary.
-        let seconds = r.duration.unwrap_or(0).max(0);
-        for name in credited_names(performer, r.artist_credit.as_deref()) {
-            let e = b.artists.entry(name).or_insert((0, 0));
-            e.0 += 1;
-            e.1 += seconds;
-        }
-
-        if let Some(al) = r.album.as_deref().filter(|a| !a.trim().is_empty()) {
-            let k = format!("{}|{}", akey, al.trim().to_lowercase());
-            let e = b.albums.entry(k).or_insert((al.trim().to_string(), 0));
-            e.1 += 1;
-        }
-
-        let tkey = format!("{}|{}", akey, r.title.trim().to_lowercase());
-        let e = b.tracks.entry(tkey.clone()).or_insert((r.title.clone(), r.artist.clone(), 0));
-        e.2 += 1;
-
-        let day = dt.num_days_from_ce();
-        let e = b.per_day.entry((tkey, day)).or_insert((r.title.clone(), r.artist.clone(), 0));
-        e.2 += 1;
-
-        if let Some(cid) = r.chain_id {
-            *b.chains.entry(cid).or_insert(0) += 1;
-        }
-
-        // A track carries several tags; each is counted once. This is a share
-        // of *tag mentions*, not of listens, and every consumer must say so.
-        if let Some(g) = r.genres.as_deref() {
-            if let Ok(tags) = serde_json::from_str::<Vec<String>>(g) {
-                for t in tags {
-                    let t = t.trim().to_lowercase();
-                    if !t.is_empty() {
-                        *b.genres.entry(t.clone()).or_insert(0) += 1;
-                        if let Some(sg) = b.sub_genres.get_mut(sub_index) {
-                            *sg.entry(t).or_insert(0) += 1;
-                        }
-                    }
-                }
-            }
-        }
-
-        if seen_artists.insert(akey.clone()) {
-            *b.new_artists.entry(akey.clone()).or_insert(0) += 1;
-            b.first_seen_at.insert(akey.clone(), r.timestamp);
-        } else if let Some(n) = b.new_artists.get_mut(&akey) {
-            // `Entry`-shaped rather than `contains_key` + `get_mut().unwrap()`:
-            // correct as written and one edit to the condition away from
-            // panicking a whole report request.
-            *n += 1;
-        }
-
-        running_total += 1;
-        for step in [1000, 5000, 10_000, 20_000, 25_000, 50_000, 100_000] {
-            if running_total == step {
-                milestones
-                    .entry(key.clone())
-                    .or_default()
-                    .push(format!("{}th listen", thousands(step)));
-            }
-        }
-    }
+    };
+    let Folded { buckets, mut order, milestones, display } = folded;
 
     // Newest first, and only as many as were asked for — plus one extra kept
     // aside so the oldest card still has a previous period to compare against.
@@ -447,25 +337,10 @@ pub async fn reports(
                 // Both columns are checked, because the key may have come from
                 // `artist_credit` on a compilation track, in which case no row's
                 // `artist` matches it and the fallback would print the folded key.
-                let display = rows
-                    .iter()
-                    .rev()
-                    .find_map(|r| {
-                        if r.artist.trim().to_lowercase() == *k {
-                            return Some(r.artist.trim().to_string());
-                        }
-                        // Every credited name, not just the first: the key may
-                        // belong to a performer who is never the primary, and
-                        // the fallback would print the folded key instead.
-                        r.artist_credit
-                            .as_deref()
-                            .into_iter()
-                            .flat_map(|c| c.split(';'))
-                            .map(str::trim)
-                            .find(|c| c.to_lowercase() == *k)
-                            .map(str::to_string)
-                    })
-                    .unwrap_or_else(|| k.clone());
+                // The latest spelling seen, which is what the reverse scan
+                // this replaced was picking.
+                let display =
+                    display.get(k).map(|(_, last)| last.clone()).unwrap_or_else(|| k.clone());
                 serde_json::json!({
                     "name": display,
                     "plays": v.0,
@@ -476,12 +351,8 @@ pub async fn reports(
             // The key is lowercased for grouping; show the spelling that was
             // actually submitted, or the card reads "epitone project".
             let akey = k.split('|').next().unwrap_or("");
-            let artist = rows
-                .iter()
-                .rev()
-                .find(|r| r.artist.trim().to_lowercase() == akey)
-                .map(|r| r.artist.clone())
-                .unwrap_or_else(|| akey.to_string());
+            let artist =
+                display.get(akey).map(|(_, last)| last.clone()).unwrap_or_else(|| akey.to_string());
             serde_json::json!({ "name": v.0, "artist": artist, "plays": v.1 })
         });
         let top_track = b
@@ -507,11 +378,11 @@ pub async fn reports(
             .and(b.new_artists.iter().max_by_key(|(_, p)| **p))
             .filter(|(_, p)| **p >= 5)
             .map(|(k, p)| {
-                let display = rows
-                    .iter()
-                    .find(|r| r.artist.trim().to_lowercase() == *k)
-                    .map(|r| r.artist.clone())
-                    .unwrap_or_else(|| k.clone());
+                // The *first* spelling here, not the latest — the forward scan
+                // this replaces took the oldest, and a crush is about how an
+                // artist first appeared.
+                let display =
+                    display.get(k).map(|(first, _)| first.clone()).unwrap_or_else(|| k.clone());
                 serde_json::json!({
                     "name": display,
                     "plays": p,
@@ -713,7 +584,7 @@ pub async fn reports(
             "total_periods": total_periods,
             // The scan is capped like every other analytics read; say so rather
             // than silently reporting on a truncated history.
-            "capped": rows.len() as i64 >= state.analytics_row_cap,
+            "capped": scanned >= state.analytics_row_cap,
         })),
     )
         .into_response()
@@ -811,6 +682,84 @@ pub fn create_reports_router() -> Router<Arc<AppState>> {
 mod tests {
     use super::*;
 
+    fn row(ts: i64, artist: &str, credit: Option<&str>, album: &str) -> crate::db::ReportRow {
+        crate::db::ReportRow {
+            timestamp: ts,
+            artist: artist.into(),
+            artist_credit: credit.map(str::to_string),
+            title: "a track".into(),
+            album: Some(album.into()),
+            duration: Some(240),
+            genres: None,
+            chain_id: None,
+        }
+    }
+
+    /// The superlatives print the spelling somebody actually submitted, and the
+    /// three of them do not agree about *which* one — the top artist and top
+    /// album take the newest, the crush takes the oldest. That used to fall out
+    /// of scanning `rows` forwards or backwards per period; the fold records
+    /// both ends so the same answers survive the scan being removed.
+    #[test]
+    fn the_fold_keeps_both_ends_of_every_spelling() {
+        let mut m = HashMap::new();
+        note_spelling(&mut m, "linkin park", "LINKIN PARK");
+        note_spelling(&mut m, "linkin park", "Linkin Park");
+        assert_eq!(m["linkin park"], ("LINKIN PARK".to_string(), "Linkin Park".to_string()));
+        // An empty spelling is not a spelling — it must not become the answer a
+        // card prints.
+        note_spelling(&mut m, "linkin park", "");
+        assert_eq!(m["linkin park"].1, "Linkin Park");
+    }
+
+    /// A performer who is only ever a *credit* still gets a real name.
+    ///
+    /// On a compilation `artist` is the placeholder and the performer is in
+    /// `artist_credit` (v0.22.1, v0.57.0). Two of the three lookups this
+    /// replaced consulted `artist` alone, so such a key fell back to printing
+    /// the lowercased grouping key — which is the "epitone project" bug wearing
+    /// different clothes.
+    #[test]
+    fn a_performer_who_is_only_ever_credited_is_still_named() {
+        let rows = vec![
+            row(
+                1_700_000_000,
+                "Various Artists",
+                Some("Punch; Kim Na Young"),
+                "Do You Like Brahms?",
+            ),
+            row(
+                1_700_003_600,
+                "Various Artists",
+                Some("Punch; Kim Na Young"),
+                "Do You Like Brahms?",
+            ),
+        ];
+        let f = fold_periods(rows, Tz::UTC, Unit::Month);
+        assert_eq!(f.display.get("punch").map(|(_, l)| l.as_str()), Some("Punch"));
+        assert_eq!(f.display.get("kim na young").map(|(_, l)| l.as_str()), Some("Kim Na Young"));
+        // And the placeholder is recorded too — it is a real string on the row.
+        // What it must not do is *win* a superlative, which the handler filters.
+        assert!(f.display.contains_key("various artists"));
+    }
+
+    /// The fold is the whole of the pass: one period here, with its plays and
+    /// its ordering. It runs on `spawn_blocking`, so it has to be a plain
+    /// function over rows — this is the guard that it stayed one.
+    #[test]
+    fn the_fold_buckets_by_period_in_the_readers_timezone() {
+        let rows = vec![
+            // 2023-12-31 23:30 UTC is already 2024-01-01 in CET, the trap the
+            // trajectory buckets already document.
+            row(1_704_065_400, "Burial", None, "Untrue"),
+            row(1_704_100_000, "Burial", None, "Untrue"),
+        ];
+        let f = fold_periods(rows, Tz::Europe__Berlin, Unit::Month);
+        assert_eq!(f.order.len(), 1, "both listens are the same local month");
+        assert!(f.order[0].starts_with("2024-01"), "got {}", f.order[0]);
+        assert_eq!(f.buckets[&f.order[0]].plays, 2);
+    }
+
     fn at(tz: Tz, y: i32, m: u32, d: u32, h: u32) -> DateTime<Tz> {
         tz.with_ymd_and_hms(y, m, d, h, 0, 0).unwrap()
     }
@@ -854,4 +803,189 @@ mod tests {
         assert_eq!(thousands(20_000), "20,000");
         assert_eq!(thousands(100_000), "100,000");
     }
+}
+
+/// What one pass over the history leaves behind.
+struct Folded {
+    buckets: HashMap<String, Bucket>,
+    /// Folded artist key → the spellings actually submitted, as
+    /// `(first seen, last seen)`.
+    ///
+    /// Built here because the fold is already walking every row. The three
+    /// superlatives below used to recover this by re-scanning `rows` **per
+    /// period** — a scan of the whole history for each card on the page, which
+    /// is the correlated-scan shape this codebase keeps finding. It also kept
+    /// `rows` alive past the fold, which is what stopped the whole pass moving
+    /// off the async worker.
+    ///
+    /// Both ends are kept because the three callers genuinely disagreed: the
+    /// top artist and top album took the newest spelling and the crush took the
+    /// oldest, and quietly unifying them would change what a card says.
+    display: HashMap<String, (String, String)>,
+    /// Period keys in the order they were first seen — i.e. ascending, since
+    /// `report_rows` is the one listing query that scans oldest-first.
+    order: Vec<String>,
+    milestones: HashMap<String, Vec<String>>,
+}
+
+/// Remember a spelling for a folded key, keeping the first and the latest.
+fn note_spelling(map: &mut HashMap<String, (String, String)>, key: &str, spelling: &str) {
+    if spelling.is_empty() {
+        return;
+    }
+    match map.get_mut(key) {
+        Some(e) => e.1 = spelling.to_string(),
+        None => {
+            map.insert(key.to_string(), (spelling.to_string(), spelling.to_string()));
+        }
+    }
+}
+
+/// Bucket every listen into its period, in the reader's timezone.
+///
+/// Split out so it can run on [`tokio::task::spawn_blocking`] — see the call
+/// site — and because a pure function over a slice of rows is testable, where a
+/// hundred and thirty lines inside a handler is not.
+fn fold_periods(rows: Vec<ReportRow>, tz: Tz, unit: Unit) -> Folded {
+    let mut buckets: HashMap<String, Bucket> = HashMap::new();
+    let mut order: Vec<String> = Vec::new();
+    // First-ever sighting of an artist, across the whole history. Because the
+    // scan is ascending, the first time we see a name is the real first time.
+    let mut seen_artists: HashSet<String> = HashSet::new();
+    let mut running_total: i64 = 0;
+    // Round-number listens, attributed to whichever period crossed them.
+    let mut milestones: HashMap<String, Vec<String>> = HashMap::new();
+    let mut display: HashMap<String, (String, String)> = HashMap::new();
+
+    for r in &rows {
+        // The submitted spellings, for the superlatives. Credits are recorded
+        // too, not only the row's own `artist`: a key can belong to a performer
+        // who is never the primary, and without this the card falls back to
+        // printing the lowercased grouping key.
+        note_spelling(&mut display, &r.artist.trim().to_lowercase(), r.artist.trim());
+        for c in r.artist_credit.as_deref().into_iter().flat_map(|c| c.split(';')).map(str::trim) {
+            note_spelling(&mut display, &c.to_lowercase(), c);
+        }
+        let dt = tz.from_utc_datetime(
+            &DateTime::from_timestamp(r.timestamp, 0).unwrap_or_default().naive_utc(),
+        );
+        let (key, label) = period_of(dt, unit);
+        let b = buckets.entry(key.clone()).or_insert_with(|| {
+            order.push(key.clone());
+            Bucket {
+                label,
+                start: r.timestamp,
+                sub: vec![0; sub_bucket_count(unit)],
+                sub_genres: vec![HashMap::new(); sub_bucket_count(unit)],
+                ..Default::default()
+            }
+        });
+
+        b.plays += 1;
+        b.end = r.timestamp;
+        b.seconds += r.duration.unwrap_or(0).max(0);
+        b.clock[dt.hour() as usize] += 1;
+        let (si, _) = sub_bucket(dt, unit);
+        if si < b.sub.len() {
+            b.sub[si] += 1;
+        }
+        let sub_index = si.min(b.sub.len().saturating_sub(1));
+        b.days.insert(dt.num_days_from_ce());
+
+        // Who actually played it.
+        //
+        // On a compilation the `artist` column is "Various Artists" — a filing
+        // convention, not a performer — and the real name is in `artist_credit`,
+        // which is exactly what v0.22.1 kept it for. Preferring it here means a
+        // compilation track counts towards the person who played it rather than
+        // piling up under a placeholder that then wins every superlative on the
+        // page. Falls back to `artist` when there is no credit, which is the
+        // overwhelmingly common case.
+        // `artist_credit` is everyone credited, joined with "; " and the
+        // primary first — the shape `save_scrobble` and `fold_artist_credit`
+        // both write. The primary is the one to count; the whole joined string
+        // would be its own key and no more useful than the placeholder.
+        let performer = if crate::db::is_various_artists(&r.artist) {
+            r.artist_credit
+                .as_deref()
+                .and_then(|c| c.split(';').next())
+                .map(str::trim)
+                .filter(|c| !c.is_empty() && !crate::db::is_various_artists(c))
+                .unwrap_or(&r.artist)
+        } else {
+            &r.artist
+        };
+        let akey = performer.trim().to_lowercase();
+
+        // Everyone credited, not only the one whose name the row carries.
+        // "Hilary Hahn plays Bach" is a listen for both of them, and a report
+        // that named only Bach would disagree with the charts and the artist
+        // page, which fan out over `scrobble_artists`. Same question, three
+        // screens, one answer.
+        //
+        // The tally fans out; **everything keyed on `akey` below does not** —
+        // an album belongs to one artist, and the crush is about the artist a
+        // record introduced you to. Those are facts about the primary.
+        let seconds = r.duration.unwrap_or(0).max(0);
+        for name in credited_names(performer, r.artist_credit.as_deref()) {
+            let e = b.artists.entry(name).or_insert((0, 0));
+            e.0 += 1;
+            e.1 += seconds;
+        }
+
+        if let Some(al) = r.album.as_deref().filter(|a| !a.trim().is_empty()) {
+            let k = format!("{}|{}", akey, al.trim().to_lowercase());
+            let e = b.albums.entry(k).or_insert((al.trim().to_string(), 0));
+            e.1 += 1;
+        }
+
+        let tkey = format!("{}|{}", akey, r.title.trim().to_lowercase());
+        let e = b.tracks.entry(tkey.clone()).or_insert((r.title.clone(), r.artist.clone(), 0));
+        e.2 += 1;
+
+        let day = dt.num_days_from_ce();
+        let e = b.per_day.entry((tkey, day)).or_insert((r.title.clone(), r.artist.clone(), 0));
+        e.2 += 1;
+
+        if let Some(cid) = r.chain_id {
+            *b.chains.entry(cid).or_insert(0) += 1;
+        }
+
+        // A track carries several tags; each is counted once. This is a share
+        // of *tag mentions*, not of listens, and every consumer must say so.
+        if let Some(g) = r.genres.as_deref() {
+            if let Ok(tags) = serde_json::from_str::<Vec<String>>(g) {
+                for t in tags {
+                    let t = t.trim().to_lowercase();
+                    if !t.is_empty() {
+                        *b.genres.entry(t.clone()).or_insert(0) += 1;
+                        if let Some(sg) = b.sub_genres.get_mut(sub_index) {
+                            *sg.entry(t).or_insert(0) += 1;
+                        }
+                    }
+                }
+            }
+        }
+
+        if seen_artists.insert(akey.clone()) {
+            *b.new_artists.entry(akey.clone()).or_insert(0) += 1;
+            b.first_seen_at.insert(akey.clone(), r.timestamp);
+        } else if let Some(n) = b.new_artists.get_mut(&akey) {
+            // `Entry`-shaped rather than `contains_key` + `get_mut().unwrap()`:
+            // correct as written and one edit to the condition away from
+            // panicking a whole report request.
+            *n += 1;
+        }
+
+        running_total += 1;
+        for step in [1000, 5000, 10_000, 20_000, 25_000, 50_000, 100_000] {
+            if running_total == step {
+                milestones
+                    .entry(key.clone())
+                    .or_default()
+                    .push(format!("{}th listen", thousands(step)));
+            }
+        }
+    }
+    Folded { buckets, order, milestones, display }
 }
