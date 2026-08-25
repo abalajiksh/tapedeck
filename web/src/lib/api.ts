@@ -2313,6 +2313,14 @@ class TapedeckAPI {
 		return this.get(`/api/v1/physical/${id}/durations`);
 	}
 
+	/** Write back exactly what the preview showed. */
+	async applyDurations(
+		id: number,
+		durations: DurationProposal[]
+	): Promise<{ filled: number; listens_updated: number }> {
+		return this.post(`/api/v1/physical/${id}/durations`, { durations });
+	}
+
 	/**
 	 * Replace the tracklist — and, with it, the running times.
 	 *
@@ -2322,7 +2330,7 @@ class TapedeckAPI {
 	 * to gear hours. The server corrects the listens and the recorded wear
 	 * alongside, so all three cannot disagree.
 	 */
-	async setPhysicalTracks(
+	async setPressingTracks(
 		id: number,
 		tracks: PhysicalTrack[]
 	): Promise<{
@@ -2331,18 +2339,6 @@ class TapedeckAPI {
 		listens_updated: number;
 		plays_recomputed: number;
 	}> {
-		return this.request('PUT', `/api/v1/physical/${id}/tracks`, { tracks });
-	}
-
-	/** Write back exactly what the preview showed. */
-	async applyDurations(
-		id: number,
-		durations: DurationProposal[]
-	): Promise<{ filled: number; listens_updated: number }> {
-		return this.post(`/api/v1/physical/${id}/durations`, { durations });
-	}
-
-	async setPressingTracks(id: number, tracks: PhysicalTrack[]) {
 		return this.request('PUT', `/api/v1/physical/${id}/tracks`, { tracks });
 	}
 	async deletePressing(id: number) {

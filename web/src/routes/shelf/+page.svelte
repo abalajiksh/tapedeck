@@ -558,7 +558,7 @@
 		}
 		timeBusy = true;
 		try {
-			const r = await api.setPhysicalTracks(open.id, next);
+			const r = await api.setPressingTracks(open.id, next);
 			openTracks = next;
 			editingTimes = false;
 			// Says what it touched beyond the tracklist, because correcting
