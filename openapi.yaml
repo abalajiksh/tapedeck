@@ -26,7 +26,7 @@ openapi: 3.1.0
 
 info:
   title: Tapedeck
-  version: 0.97.0
+  version: 0.98.0
   summary: Self-hosted scrobbler and listening journal.
   description: |
     Tapedeck ingests listens, enriches them with MusicBrainz metadata, stores
@@ -7421,6 +7421,48 @@ paths:
         '401': { $ref: '#/components/responses/Unauthorized' }
 
   # ── Maintenance ────────────────────────────────────────────────────────────
+  /api/v1/lyrics/status:
+    get:
+      tags: [Maintenance]
+      summary: How far the lyric language pass has got.
+      description: |
+        Scope: session only.
+
+        Tapedeck fetches lyrics from [LRCLIB](https://lrclib.net) for one
+        reason: **the language a transliterated title cannot give.** Script
+        detection settles any non-Latin title with certainty and gives up on
+        Latin text, so a romanised title falls through to `English/Other`, which
+        is a shrug rather than a measurement and is most of a real
+        transliterated history. The lyric is where that title's own script went.
+
+        Lyrics are stored in the MusicBrainz cache database rather than in the
+        listening database, so `GET /api/v1/backup` does **not** carry them —
+        they are third-party copyrighted text, not the user's listening.
+
+        `instrumental` is counted separately because it is a real answer: a
+        track with no words has no language, and folding it into "found" would
+        report a finished lookup as an unfinished one.
+      security: [{ sessionCookie: [] }]
+      responses:
+        '200':
+          description: OK.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  available:
+                    type: boolean
+                    description: False when the cache could not be opened — a degraded state, not an error.
+                  asked: { type: integer, description: Tracks LRCLIB has been asked about. }
+                  with_lyrics: { type: integer }
+                  instrumental: { type: integer, description: 'Tracks LRCLIB records as having no words. An answer, not a gap.' }
+                  unresolved:
+                    type: integer
+                    description: |
+                      Tracks whose language is still unknown or `English/Other`
+                      — what the pass has left to try.
+
   /api/v1/mbids/status:
     get:
       tags: [Maintenance]

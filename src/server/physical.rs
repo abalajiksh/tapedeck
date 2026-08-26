@@ -269,6 +269,14 @@ pub struct NewRelease {
     /// When you bought it, unix seconds. Optional — most of a shelf is
     /// catalogued long after the fact and guessing would be worse than blank.
     pub purchased_at: Option<i64>,
+    /// How it came to be yours — `new`, `used`, `gift` or `inherited`.
+    /// Optional, and absent means nobody said: a shelf catalogued before this
+    /// existed must not be retroactively claimed as bought new.
+    pub acquired_as: Option<String>,
+    /// Where from — the shop, the record fair, the person who gave it to you.
+    /// Free text, because that is the half that makes a thrift find a story
+    /// rather than a flag.
+    pub acquired_from: Option<String>,
     /// Pull the sleeve, labels and booklet from the Cover Art Archive as part
     /// of adding it. On by default: it is one request and it is the whole
     /// reason for shelving from MusicBrainz rather than typing it in.
@@ -325,6 +333,8 @@ async fn add_release(
             &tracks,
             body.notes.as_deref(),
             body.purchased_at,
+            body.acquired_as.as_deref(),
+            body.acquired_from.as_deref(),
         )
         .await
     {
@@ -373,6 +383,12 @@ pub struct ReleaseUpdate {
     /// Absent leaves it alone; an explicit null clears it.
     #[serde(default, deserialize_with = "explicit")]
     pub purchased_at: Option<Option<i64>>,
+    /// Both clearable: a wrong answer is worse than a blank, and "I don't
+    /// actually remember" is a real thing to want to say afterwards.
+    #[serde(default, deserialize_with = "explicit")]
+    pub acquired_as: Option<Option<String>>,
+    #[serde(default, deserialize_with = "explicit")]
+    pub acquired_from: Option<Option<String>>,
     #[serde(default, deserialize_with = "explicit")]
     pub chain_id: Option<Option<i64>>,
     #[serde(default, deserialize_with = "explicit")]
@@ -470,6 +486,8 @@ async fn update_release(
             kind.as_deref(),
             body.chain_variant_id,
             body.mbid_release.as_ref().map(|m| m.as_deref()),
+            body.acquired_as.as_ref().map(|v| v.as_deref()),
+            body.acquired_from.as_ref().map(|v| v.as_deref()),
         )
         .await
     {
@@ -1643,6 +1661,26 @@ async fn play_side(
         warn!("Could not clear the spin after recording a side: {}", e);
     }
 
+    // The sleeve, onto every listen this record has produced.
+    //
+    // Written here rather than left to `backfill_artwork`, which resolves a
+    // listen by asking a provider about (artist, title, album) — and a provider
+    // answers per *song*, so one side of a record came back with a different
+    // cover per track, several of them compilations. The shelf is holding the
+    // object; there is nothing to look up.
+    match state.db.physical_cover(user.user_id, release.id).await {
+        Ok(Some(cover)) => {
+            if let Err(e) = state.db.set_physical_artwork(user.user_id, release.id, &cover).await {
+                warn!("Could not stamp the sleeve on {}'s listens: {}", release.title, e);
+            }
+        }
+        // No cover yet is a normal state — a pressing typed in by hand, or one
+        // the archive had nothing for. The listens keep the lettered tile,
+        // which is honest, rather than a provider's guess per track.
+        Ok(None) => {}
+        Err(e) => warn!("Could not read the sleeve for {}: {}", release.title, e),
+    }
+
     // Remember what it was played on, so the next side of the same record —
     // and the next time it comes off the shelf — is pre-filled. Only when the
     // caller stated something: a play that fell through to the stored default
@@ -1662,6 +1700,8 @@ async fn play_side(
                 // side does not ask again. `variant_id` rather than the raw
                 // body: a variant that failed the chain check is not stored.
                 body.chain_variant_id.map(|_| variant_id),
+                None,
+                None,
                 None,
             )
             .await
@@ -2304,6 +2344,8 @@ async fn import_shelf(
                 &tracks,
                 entry.get("notes").and_then(|v| v.as_str()),
                 entry.get("purchased_at").and_then(|v| v.as_i64()),
+                entry.get("acquired_as").and_then(|v| v.as_str()),
+                entry.get("acquired_from").and_then(|v| v.as_str()),
             )
             .await
         {
@@ -2329,6 +2371,8 @@ async fn import_shelf(
                     None,
                     chain.map(Some),
                     deck.map(Some),
+                    None,
+                    None,
                     None,
                     None,
                     None,
@@ -2644,6 +2688,11 @@ async fn export_shelf(State(state): State<Arc<AppState>>, user: AuthUser) -> imp
                     "barcode": r.barcode,
                     "catalog_number": r.catalog_number,
                     "purchased_at": r.purchased_at,
+                    // Carried so a round trip does not lose them — the import
+                    // reads both back, which is what makes the export a backup
+                    // of the shelf rather than most of one.
+                    "acquired_as": r.acquired_as,
+                    "acquired_from": r.acquired_from,
                     "added_at": r.added_at,
                     "notes": r.notes,
                     "played_sides": r.play_count,

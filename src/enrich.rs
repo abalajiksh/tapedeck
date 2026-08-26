@@ -36,7 +36,7 @@ pub async fn backfill_languages(
     for (id, title, album, mbid) in rows {
         // Tier 1: script detection (instant, non-Latin).
         if let Some(lang) = script_language(&title, album.as_deref()) {
-            if db.set_scrobble_language(id, lang).await.is_ok() {
+            if db.set_scrobble_language(id, lang, "script").await.is_ok() {
                 done += 1;
             }
             continue;
@@ -51,15 +51,97 @@ pub async fn backfill_languages(
                     .ok()
                     .flatten()
                     .unwrap_or_else(|| DEFAULT_LANGUAGE.to_string());
-                if db.set_scrobble_language(id, &lang).await.is_ok() {
+                if db.set_scrobble_language(id, &lang, "work").await.is_ok() {
                     done += 1;
                 }
             }
             Some(_) => { /* has an MBID but budget spent — leave for the next pass */ }
             None => {
-                if db.set_scrobble_language(id, DEFAULT_LANGUAGE).await.is_ok() {
+                if db.set_scrobble_language(id, DEFAULT_LANGUAGE, "default").await.is_ok() {
                     done += 1;
                 }
+            }
+        }
+    }
+    done
+}
+
+/// Ask LRCLIB about tracks whose language is still unresolved, and take the
+/// answer from the script of the lyric.
+///
+/// **The tier between MusicBrainz's work language and the shrug.** `script_language`
+/// settles any title written in a non-Latin script and gives up on Latin text,
+/// so a *transliterated* title falls all the way through to `DEFAULT_LANGUAGE`
+/// — 45% of a real listening window, drawn on the page next to real categories.
+/// The lyric is where that title's own script went.
+///
+/// Three things this returns that nothing else could:
+///
+/// * **A language for a romanised title.** Measured against the live API:
+///   "Heize — Star", romanised in both fields, comes back 504 Hangul characters
+///   to 69 Latin.
+/// * **`Instrumental` as a real answer.** A track with no words has no
+///   language, which the vocabulary could not previously say — every listen was
+///   either classified or shrugged at.
+/// * **Nothing at all, honestly.** A Latin lyric leaves the row exactly as it
+///   was rather than asserting English, because telling French from English is
+///   a different problem needing a different tool.
+///
+/// Budgeted per track rather than per listen: a lyric is a property of the
+/// song, so a track played fifty times is one request. A 429 **stops the pass**
+/// — the docs say a client that ignores `Retry-After` may be banned, and that
+/// would cost every Tapedeck instance the feature rather than only this one.
+pub async fn backfill_lyrics(
+    db: &Database,
+    lyrics: &crate::lyrics::LyricsClient,
+    budget: i64,
+) -> usize {
+    use crate::lyrics::Found;
+
+    // More candidates than budget, because most of the head of this queue is
+    // already cached — a miss is remembered, and re-reading it costs no request.
+    let candidates = match db.tracks_wanting_language(budget * 20).await {
+        Ok(c) => c,
+        Err(_) => return 0,
+    };
+
+    let mut spent = 0i64;
+    let mut done = 0usize;
+    for (title, artist, album, duration, _plays) in candidates {
+        let found = match lyrics.cached(&artist, &title).await {
+            Some(f) => f,
+            None => {
+                if spent >= budget {
+                    break;
+                }
+                spent += 1;
+                match lyrics.fetch(&artist, &title, album.as_deref(), duration).await {
+                    Ok(f) => f,
+                    Err(crate::lyrics::LyricsError::RateLimited(secs)) => {
+                        // Stop, rather than sleep through it holding the budget
+                        // open. The next tick is a minute away.
+                        tracing::warn!("🎤 LRCLIB asked us to wait {secs}s — pausing lyrics until the next pass");
+                        break;
+                    }
+                    Err(e) => {
+                        tracing::debug!("🎤 lyrics lookup failed for {artist} — {title}: {e}");
+                        continue;
+                    }
+                }
+            }
+        };
+
+        let language = match &found {
+            Found::Instrumental => Some(crate::language::INSTRUMENTAL.to_string()),
+            Found::Lyrics { language, .. } => language.clone(),
+            Found::Missing => None,
+        };
+        // No language is not a failure and not a reason to write anything: the
+        // row keeps whatever it had, and the MusicBrainz tier or the default
+        // still gets its turn.
+        if let Some(lang) = language {
+            if db.set_track_language(&artist, &title, &lang, "lyrics").await.is_ok() {
+                done += 1;
             }
         }
     }

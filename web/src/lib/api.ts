@@ -1513,6 +1513,13 @@ export interface PhysicalRelease {
 	/** When you bought it. Null for anything shelved before the field existed,
 	 *  and for anything you would only be guessing at. */
 	purchased_at: number | null;
+	/** How it came to be yours — `new`, `used`, `gift`, `inherited`. Null means
+	 *  nobody said, never "new": a shelf catalogued before the field existed
+	 *  must not be retroactively claimed as bought new. */
+	acquired_as: string | null;
+	/** Where from — the shop, the fair, the person. Free text, because that is
+	 *  the half that makes a thrift find a story rather than a flag. */
+	acquired_from: string | null;
 	/** What it is normally played on. The deck pre-fills from these and writes
 	 *  the answer back, so a record with one turntable is asked once. */
 	chain_id: number | null;
@@ -2368,6 +2375,8 @@ class TapedeckAPI {
 		body: Partial<ReleaseCandidate> & {
 			kind: string; tracks: PhysicalTrack[];
 			purchased_at?: number | null;
+			acquired_as?: string | null;
+			acquired_from?: string | null;
 			/** Pull the sleeve, labels and booklet from the Cover Art Archive as
 			 *  part of adding it. Defaults to on server-side. */
 			fetch_images?: boolean;
@@ -2391,6 +2400,10 @@ class TapedeckAPI {
 			/** The MusicBrainz release this pressing is, typed in by hand. Also
 			 *  the cheapest running-time lookup — one request, no search. */
 			mbid_release?: string | null;
+			/** How it came to be yours, and from where. Both clearable — a wrong
+			 *  answer is worse than a blank. */
+			acquired_as?: string | null;
+			acquired_from?: string | null;
 		}
 	): Promise<{ status: string; sides_rewritten?: boolean }> {
 		return this.patch(`/api/v1/physical/${id}`, body);

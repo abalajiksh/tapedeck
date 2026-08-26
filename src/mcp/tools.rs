@@ -405,6 +405,23 @@ the user said outright rather than something inferred from a play count.",
             schema: no_args(),
         },
         ToolDef {
+            name: "lyrics",
+            title: "The words to a track they have played",
+            description:
+                "The lyrics Tapedeck has cached for one track, from LRCLIB. THIS IS SOMEBODY ELSE'S COPYRIGHTED TEXT, not the user's writing and not Tapedeck's: quote from it sparingly and never reproduce a whole lyric. It is here so you can talk about a song they actually played — what it is about, a line they asked after, what language it is in. Returns nothing at all for a track nobody has fetched yet, for one LRCLIB has never heard of, and for an instrumental, which is a real answer rather than a gap.",
+            scope: scopes::LIBRARY_READ,
+            read_only: true,
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "artist": str_arg("Artist name, as they play it"),
+                    "title": str_arg("Track title"),
+                },
+                "required": ["artist", "title"],
+                "additionalProperties": false
+            }),
+        },
+        ToolDef {
             name: "liner_notes",
             title: "Liner notes",
             description:
@@ -895,6 +912,38 @@ pub async fn call(
         "loves" => {
             handler_json(crate::server::notes::list_loves(st(), read()).await.into_response())
                 .await?
+        }
+
+        "lyrics" => {
+            let artist = require(args, "artist")?;
+            let title = require(args, "title")?;
+            let Some(lyrics) = state.lyrics.clone() else {
+                return Err(ToolFailure::Execution(
+                    "This instance has no lyrics cache — the store could not be opened".into(),
+                ));
+            };
+            // Only what is already stored. A tool call must not reach out to
+            // LRCLIB: that would let an assistant drive an unbounded number of
+            // requests at a free service Tapedeck has asked to be considerate
+            // of, and the backfill is what paces that.
+            match lyrics.cached(&artist, &title).await {
+                Some(crate::lyrics::Found::Lyrics { plain, synced, language }) => json!({
+                    "artist": artist, "title": title,
+                    "language": language,
+                    "plain": plain,
+                    "synced": synced,
+                    "note": "Third-party copyrighted text via LRCLIB. Quote sparingly; do not reproduce in full.",
+                }),
+                Some(crate::lyrics::Found::Instrumental) => json!({
+                    "artist": artist, "title": title,
+                    "instrumental": true,
+                    "why": "LRCLIB records this track as having no words. That is an answer, not a missing lookup.",
+                }),
+                Some(crate::lyrics::Found::Missing) | None => json!({
+                    "artist": artist, "title": title,
+                    "why": "Nothing stored for this track — either LRCLIB has never had it, or the backfill has not reached it yet. It fetches a few tracks a minute, biggest first.",
+                }),
+            }
         }
 
         "liner_notes" => {

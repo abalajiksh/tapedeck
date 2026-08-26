@@ -470,6 +470,13 @@ pub struct PhysicalRelease {
     /// When you bought it — how long it has been on the shelf, which nothing
     /// else here can answer. Absent for everything shelved before the column.
     pub purchased_at: Option<i64>,
+    /// How it came to be yours — `new`, `used`, `gift`, `inherited`. `None`
+    /// means nobody said, never "new": an existing shelf must not be
+    /// retroactively claimed as bought new.
+    pub acquired_as: Option<String>,
+    /// Where from — the shop, the fair, the person. Free text, because that is
+    /// what makes a thrift find a story rather than a flag.
+    pub acquired_from: Option<String>,
     /// What this normally gets played on. The deck pre-fills from these and
     /// writes the answer back, so a record with one turntable is asked once.
     pub chain_id: Option<i64>,
@@ -1085,6 +1092,13 @@ impl Database {
                 delivered_sinks TEXT NOT NULL DEFAULT '[]',
                 track_number INTEGER,
                 language TEXT,
+                -- Where that language came from: 'script' (the title's own
+                -- script, certain), 'lyrics' (the script of the lyric, which
+                -- resolves a transliterated title), 'work' (MusicBrainz's
+                -- editorial work language) or 'default' (a shrug). Different
+                -- measurements of the same thing, and a breakdown that mixed
+                -- them silently would be reporting two populations as one.
+                language_source TEXT,
                 genres TEXT,
                 release_year INTEGER,
                 skipped BOOLEAN NOT NULL DEFAULT FALSE,
@@ -1301,6 +1315,16 @@ impl Database {
                 -- long something has been yours is a fact about the shelf that
                 -- nothing else in the database can answer.
                 purchased_at INTEGER,
+                -- How it came to be yours: 'new', 'used', 'gift', 'inherited'.
+                -- Nullable, and null means nobody said — never 'new', because
+                -- an existing shelf must not be retroactively claimed as bought
+                -- new. Deliberately *not* condition grading (M/NM/VG+): that
+                -- describes the object's wear rather than where it came from,
+                -- and it is the field people abandon filling in.
+                acquired_as TEXT,
+                -- The shop, the fair, the person. Free text, because that is
+                -- what makes a thrift find a story rather than a flag.
+                acquired_from TEXT,
                 -- What this normally gets played on. A record lives with one
                 -- turntable, so asking every time would be asking the same
                 -- question forever; the deck pre-fills from here and the answer
@@ -3161,6 +3185,48 @@ impl Database {
             )
             .execute(&self.pool)
             .await;
+        }
+
+        // A side played before the shelf stamped its own sleeve got a cover per
+        // *track* from a provider — eleven tracks off one record, eleven
+        // different covers. Nothing was lost, so this simply rewrites them to
+        // the sleeve the shelf is holding.
+        //
+        // Marker-guarded rather than run every start: it is a write per
+        // release, and after the first pass there is nothing to do.
+        if self.get_app_setting("physical_artwork_repaired").await.ok().flatten().is_none() {
+            let releases: Vec<(i64, i64)> =
+                sqlx::query_as("SELECT id, user_id FROM physical_releases")
+                    .fetch_all(&self.pool)
+                    .await
+                    .unwrap_or_default();
+            let mut fixed = 0u64;
+            for (id, user_id) in releases {
+                if let Ok(Some(cover)) = self.physical_cover(user_id, id).await {
+                    fixed += self.set_physical_artwork(user_id, id, &cover).await.unwrap_or(0);
+                }
+            }
+            if fixed > 0 {
+                info!("⚙️ Migrating: put {fixed} shelf listen(s) back on their own sleeve...");
+            }
+            let _ = self.set_app_setting("physical_artwork_repaired", "1").await;
+        }
+
+        for (col, ty) in [("acquired_as", "TEXT"), ("acquired_from", "TEXT")] {
+            if !has_column(&self.pool, "physical_releases", col).await {
+                info!("⚙️ Migrating: adding physical_releases.{col}...");
+                let _ =
+                    sqlx::query(&format!("ALTER TABLE physical_releases ADD COLUMN {col} {ty}"))
+                        .execute(&self.pool)
+                        .await;
+            }
+        }
+
+        if !has_column(&self.pool, "scrobbles", "language_source").await {
+            info!("⚙️ Migrating: adding scrobbles.language_source...");
+            let _ = sqlx::query("ALTER TABLE scrobbles ADD COLUMN language_source TEXT")
+                .execute(&self.pool)
+                .await;
         }
 
         // The placeholder used to be credited like a performer, so an existing
@@ -5270,12 +5336,15 @@ impl Database {
         tracks_json: &str,
         notes: Option<&str>,
         purchased_at: Option<i64>,
+        acquired_as: Option<&str>,
+        acquired_from: Option<&str>,
     ) -> Result<i64, sqlx::Error> {
         let res = sqlx::query(
             "INSERT INTO physical_releases
                 (user_id, kind, artist, title, year, mbid_release, discogs_id, barcode,
-                 catalog_number, artwork_url, tracks, notes, added_at, purchased_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                 catalog_number, artwork_url, tracks, notes, added_at, purchased_at,
+                 acquired_as, acquired_from)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(user_id)
         .bind(kind)
@@ -5291,6 +5360,8 @@ impl Database {
         .bind(notes)
         .bind(Self::now_secs())
         .bind(purchased_at)
+        .bind(acquired_as)
+        .bind(acquired_from)
         .execute(&self.pool)
         .await?;
         Ok(res.last_insert_rowid())
@@ -5316,6 +5387,8 @@ impl Database {
         kind: Option<&str>,
         chain_variant_id: Option<Option<i64>>,
         mbid_release: Option<Option<&str>>,
+        acquired_as: Option<Option<&str>>,
+        acquired_from: Option<Option<&str>>,
     ) -> Result<bool, sqlx::Error> {
         let mut sets: Vec<&str> = Vec::new();
         // A plain `Option` rather than a nested one, unlike everything else
@@ -5344,6 +5417,15 @@ impl Database {
         // the difference between answering and being cut off by a proxy.
         if mbid_release.is_some() {
             sets.push("mbid_release = ?");
+        }
+        // How it came to be yours, and from where. Both clearable: a wrong
+        // answer is worse than a blank, and "I actually don't remember" is a
+        // real thing to want to say afterwards.
+        if acquired_as.is_some() {
+            sets.push("acquired_as = ?");
+        }
+        if acquired_from.is_some() {
+            sets.push("acquired_from = ?");
         }
         if sets.is_empty() {
             // Nothing asked for is not a failure — but it must not report a
@@ -5375,6 +5457,12 @@ impl Database {
             q = q.bind(v.map(|s| s.to_string()));
         }
         if let Some(v) = mbid_release {
+            q = q.bind(v.map(|s| s.to_string()));
+        }
+        if let Some(v) = acquired_as {
+            q = q.bind(v.map(|s| s.to_string()));
+        }
+        if let Some(v) = acquired_from {
             q = q.bind(v.map(|s| s.to_string()));
         }
         let res = q.bind(user_id).bind(id).execute(&self.pool).await?;
@@ -5891,6 +5979,74 @@ impl Database {
     // ── Server-wide settings ──
 
     /// Read an admin-set server setting, decrypted.
+    /// Stamp a pressing's own sleeve onto every listen it has ever produced.
+    ///
+    /// **A record has one cover, and the shelf is holding it.** A side written
+    /// by `play_side` used to go in with no artwork at all, so
+    /// `backfill_artwork` resolved each listen the way it resolves any other —
+    /// by asking a provider about (artist, title, album) — and a provider
+    /// answers per *song*. Eleven tracks off one side of *The Wall* came back
+    /// with eleven different covers, several of them compilations the record
+    /// has nothing to do with.
+    ///
+    /// That is the "your own library beats any provider" rule, in the one place
+    /// where it is not even a preference: the object is on the shelf, the
+    /// sleeve is the sleeve, and no lookup can be more right than that.
+    ///
+    /// Matched on the `source_id` prefix, which `play_side` builds
+    /// deterministically as `physical-<release>-<side>-<start>-<position>`, so
+    /// this reaches sides played before the cover was known as well as the one
+    /// just recorded.
+    pub async fn set_physical_artwork(
+        &self,
+        user_id: i64,
+        release_id: i64,
+        cover: &str,
+    ) -> Result<u64, sqlx::Error> {
+        let r = sqlx::query(
+            "UPDATE scrobbles SET artwork_url = ?, caa_id = NULL, caa_release_mbid = NULL
+              WHERE user_id = ? AND source_name = 'physical'
+                AND source_id LIKE 'physical-' || ? || '-%'
+                AND COALESCE(artwork_url, '') != ?",
+        )
+        .bind(cover)
+        .bind(user_id)
+        .bind(release_id)
+        .bind(cover)
+        .execute(&self.pool)
+        .await?;
+        Ok(r.rows_affected())
+    }
+
+    /// The sleeve a pressing should stamp on its listens: the user's own scan
+    /// if they uploaded one, else whatever the lookup found.
+    ///
+    /// The same order `cover_thumb` uses on the shelf itself — an upload is a
+    /// photograph of the copy actually in the room — so a listen and the record
+    /// it came off cannot show different covers.
+    pub async fn physical_cover(
+        &self,
+        user_id: i64,
+        release_id: i64,
+    ) -> Result<Option<String>, sqlx::Error> {
+        let row: Option<(Option<String>,)> = sqlx::query_as(
+            "SELECT COALESCE(
+                      (SELECT COALESCE(i.thumb_url, i.url,
+                                       '/api/v1/physical/images/' || i.id || '/file')
+                         FROM physical_images i
+                        WHERE i.release_id = r.id AND i.kind = 'front'
+                        ORDER BY (i.file_path IS NULL), i.position, i.id
+                        LIMIT 1),
+                      r.artwork_url)
+               FROM physical_releases r WHERE r.user_id = ? AND r.id = ?",
+        )
+        .bind(user_id)
+        .bind(release_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.and_then(|r| r.0).filter(|s| !s.trim().is_empty()))
+    }
+
     pub async fn get_app_setting(&self, key: &str) -> Result<Option<String>, sqlx::Error> {
         let row: Option<(String,)> = sqlx::query_as("SELECT value FROM app_settings WHERE key = ?")
             .bind(key)
@@ -6310,9 +6466,88 @@ impl Database {
         .await
     }
 
-    pub async fn set_scrobble_language(&self, id: i64, language: &str) -> Result<(), sqlx::Error> {
-        sqlx::query("UPDATE scrobbles SET language = ? WHERE id = ?")
+    /// Tracks whose language is unresolved, biggest first — the queue the
+    /// lyrics pass works through.
+    ///
+    /// **Grouped by track rather than by listen**, which is the whole reason
+    /// this is a separate query from `scrobbles_needing_language`. A lyric is a
+    /// property of the song, so a track played fifty times is *one*
+    /// rate-limited request; asking per listen would spend the budget fifty
+    /// times over on an answer that cannot differ.
+    ///
+    /// "Unresolved" includes `DEFAULT_LANGUAGE`, which is the point: that value
+    /// is a shrug rather than a measurement, and it is 45% of a real window.
+    /// A row that already carries a real language is left alone.
+    ///
+    /// The duration is the **mode** rather than the max — LRCLIB matches within
+    /// ±2s, so the length most of the plays agree on is the one most likely to
+    /// find the record, where a single mis-tagged listen could push a max out
+    /// of range.
+    pub async fn tracks_wanting_language(
+        &self,
+        limit: i64,
+    ) -> Result<Vec<(String, String, Option<String>, Option<i64>, i64)>, sqlx::Error> {
+        sqlx::query_as(&format!(
+            "SELECT title, artist, MAX(album) AS album,
+                    (SELECT duration FROM scrobbles d
+                      WHERE LOWER(TRIM(d.title)) = LOWER(TRIM(s.title))
+                        AND LOWER(TRIM(d.artist)) = LOWER(TRIM(s.artist))
+                        AND d.duration IS NOT NULL
+                      GROUP BY d.duration ORDER BY COUNT(*) DESC LIMIT 1) AS duration,
+                    COUNT(*) AS plays
+               FROM scrobbles s
+              WHERE skipped = FALSE
+                AND (language IS NULL OR language = '{}')
+                AND TRIM(title) != '' AND TRIM(artist) != ''
+                AND LOWER(TRIM(artist)) {NOT_VARIOUS}
+              GROUP BY LOWER(TRIM(title)), LOWER(TRIM(artist))
+              ORDER BY plays DESC LIMIT ?",
+            crate::language::DEFAULT_LANGUAGE
+        ))
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+    }
+
+    /// Write a language onto every listen of one track, saying where it came
+    /// from.
+    ///
+    /// `source` is not decoration. A language read off a lyric's script and one
+    /// taken from MusicBrainz's work record are **different measurements** of
+    /// the same thing, and a breakdown that mixed them without saying so would
+    /// be reporting two populations as one — the trap the fidelity cards
+    /// already cost this codebase once.
+    pub async fn set_track_language(
+        &self,
+        artist: &str,
+        title: &str,
+        language: &str,
+        source: &str,
+    ) -> Result<u64, sqlx::Error> {
+        let r = sqlx::query(
+            "UPDATE scrobbles SET language = ?, language_source = ?
+              WHERE LOWER(TRIM(artist)) = ? AND LOWER(TRIM(title)) = ? AND skipped = FALSE",
+        )
+        .bind(language)
+        .bind(source)
+        .bind(artist.trim().to_lowercase())
+        .bind(title.trim().to_lowercase())
+        .execute(&self.pool)
+        .await?;
+        Ok(r.rows_affected())
+    }
+
+    /// `source` says which of the three ways this was decided — see
+    /// `set_track_language`.
+    pub async fn set_scrobble_language(
+        &self,
+        id: i64,
+        language: &str,
+        source: &str,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query("UPDATE scrobbles SET language = ?, language_source = ? WHERE id = ?")
             .bind(language)
+            .bind(source)
             .bind(id)
             .execute(&self.pool)
             .await?;
@@ -18146,22 +18381,48 @@ mod tests {
                 "[]",
                 None,
                 Some(1_700_000_000),
+                None,
+                None,
             )
             .await
             .unwrap();
 
-        db.update_physical(uid, id, None, None, Some(Some(gear)), None, None, None, None)
-            .await
-            .unwrap();
+        db.update_physical(
+            uid,
+            id,
+            None,
+            None,
+            Some(Some(gear)),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
         let r = db.get_physical(uid, id).await.unwrap().unwrap();
         assert_eq!(r.equipment_id, Some(gear));
         assert_eq!(r.purchased_at, Some(1_700_000_000));
 
         // Editing one field leaves the others alone. This is the assertion a
         // bare `Option` fails.
-        db.update_physical(uid, id, Some(Some(1_800_000_000)), None, None, None, None, None, None)
-            .await
-            .unwrap();
+        db.update_physical(
+            uid,
+            id,
+            Some(Some(1_800_000_000)),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
         let r = db.get_physical(uid, id).await.unwrap().unwrap();
         assert_eq!(r.purchased_at, Some(1_800_000_000));
         assert_eq!(r.equipment_id, Some(gear), "an untouched field must survive an edit");
@@ -18169,10 +18430,119 @@ mod tests {
         // An explicit null still clears — the picker's "— no deck —" needs it,
         // which is why the distinction has to survive deserialisation rather
         // than being designed away.
-        db.update_physical(uid, id, None, None, Some(None), None, None, None, None).await.unwrap();
+        db.update_physical(uid, id, None, None, Some(None), None, None, None, None, None, None)
+            .await
+            .unwrap();
         assert_eq!(db.get_physical(uid, id).await.unwrap().unwrap().equipment_id, None);
     }
 
+    /// Every track off one record shows that record's sleeve.
+    ///
+    /// A side used to go in with no artwork, so `backfill_artwork` resolved
+    /// each listen the way it resolves any other — by asking a provider about
+    /// (artist, title, album) — and a provider answers per *song*. Eleven
+    /// tracks off one side of *The Wall* came back with eleven different
+    /// covers, several of them compilations. The shelf is holding the object;
+    /// there is nothing to look up.
+    ///
+    /// Asserted on the listens rather than on the update, because the failure
+    /// is one cover per track and only a readout can see that.
+    #[tokio::test]
+    async fn every_track_off_one_record_wears_that_record_s_sleeve() {
+        let db = testdb().await;
+        let uid = db.create_user("ash", None, "pw", "user").await.unwrap();
+        let id = db
+            .create_physical(
+                uid,
+                "vinyl",
+                "Pink Floyd",
+                "The Wall",
+                Some(1979),
+                None,
+                None,
+                None,
+                None,
+                Some("https://example.test/the-wall.jpg"),
+                "[]",
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        // Four tracks off one side, each having been given a different cover by
+        // a provider — which is exactly the reported state.
+        for (i, wrong) in ["a.jpg", "b.jpg", "c.jpg", "d.jpg"].iter().enumerate() {
+            let mut p = play(&format!("Track {i}"), "Pink Floyd", 1_760_000_000 + i as u64);
+            p.album = Some("The Wall".into());
+            p.source_id = format!("physical-{id}-A-1760000000-{}", i + 1);
+            p.source_name = "physical".into();
+            db.save_scrobble(
+                uid,
+                &p,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                ListenDisposition::LIVE,
+            )
+            .await
+            .unwrap();
+            sqlx::query("UPDATE scrobbles SET artwork_url = ? WHERE user_id = ? AND source_id = ?")
+                .bind(format!("https://provider.test/{wrong}"))
+                .bind(uid)
+                .bind(&p.source_id)
+                .execute(&db.pool)
+                .await
+                .unwrap();
+        }
+
+        let cover = db.physical_cover(uid, id).await.unwrap().expect("the pressing has a sleeve");
+        assert_eq!(cover, "https://example.test/the-wall.jpg");
+        let n = db.set_physical_artwork(uid, id, &cover).await.unwrap();
+        assert_eq!(n, 4, "every listen of the record, not only the newest side");
+
+        let covers: Vec<Option<String>> = sqlx::query_scalar(
+            "SELECT artwork_url FROM scrobbles WHERE user_id = ? AND source_name = 'physical'",
+        )
+        .bind(uid)
+        .fetch_all(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(covers.len(), 4);
+        assert!(
+            covers.iter().all(|c| c.as_deref() == Some(cover.as_str())),
+            "one record, one cover — got {covers:?}"
+        );
+
+        // Idempotent: nothing to change is not a write.
+        assert_eq!(db.set_physical_artwork(uid, id, &cover).await.unwrap(), 0);
+
+        // And a listen from anywhere else is not touched.
+        let mut other = play("Elsewhere", "Pink Floyd", 1_760_009_999);
+        other.source_id = "plex-99-1760009999".into();
+        other.source_name = "Plex".into();
+        db.save_scrobble(
+            uid,
+            &other,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            ListenDisposition::LIVE,
+        )
+        .await
+        .unwrap();
+        assert_eq!(db.set_physical_artwork(uid, id, &cover).await.unwrap(), 0);
+    }
     /// A side's plays and its hours are derived from the plays themselves, so
     /// they cannot drift from them and un-recording a side takes its wear back.
     ///
@@ -18197,6 +18567,8 @@ mod tests {
                 None,
                 None,
                 "[]",
+                None,
+                None,
                 None,
                 None,
             )
@@ -18259,6 +18631,8 @@ mod tests {
                 None,
                 None,
                 "[]",
+                None,
+                None,
                 None,
                 None,
             )
@@ -20024,7 +20398,7 @@ mod tests {
         let a = db
             .create_physical(
                 uid, "vinyl", "Burial", "Untrue", None, None, None, None, None, None, "[]", None,
-                None,
+                None, None, None,
             )
             .await
             .unwrap();
@@ -20041,6 +20415,8 @@ mod tests {
                 None,
                 None,
                 "[]",
+                None,
+                None,
                 None,
                 None,
             )
@@ -20081,7 +20457,7 @@ mod tests {
         let mine = db
             .create_physical(
                 a, "vinyl", "Burial", "Untrue", None, None, None, None, None, None, "[]", None,
-                None,
+                None, None, None,
             )
             .await
             .unwrap();
@@ -20106,14 +20482,14 @@ mod tests {
         let tape = db
             .create_physical(
                 uid, "cassette", "ABBA", "Gold", None, None, None, None, None, None, "[]", None,
-                None,
+                None, None, None,
             )
             .await
             .unwrap();
         let record = db
             .create_physical(
                 uid, "vinyl", "Burial", "Untrue", None, None, None, None, None, None, "[]", None,
-                None,
+                None, None, None,
             )
             .await
             .unwrap();
@@ -20130,6 +20506,8 @@ mod tests {
                 None,
                 None,
                 "[]",
+                None,
+                None,
                 None,
                 None,
             )
@@ -24562,12 +24940,26 @@ mod tests {
                 "[]",
                 None,
                 None,
+                None,
+                None,
             )
             .await
             .unwrap();
-        db.update_physical(uid, rid, None, Some(Some(cid)), None, None, None, None, None)
-            .await
-            .unwrap();
+        db.update_physical(
+            uid,
+            rid,
+            None,
+            Some(Some(cid)),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
 
         assert!(db.delete_chain(uid, cid).await.unwrap(), "it deletes");
         assert!(db.get_chain(uid, cid).await.unwrap().is_none());

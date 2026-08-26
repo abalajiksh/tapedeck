@@ -177,6 +177,10 @@ pub struct ScrobbleEngine {
     /// Artwork lookup chain, cheapest first. Built once — each provider holds a
     /// pooled HTTP client.
     artwork_providers: Vec<Box<dyn crate::metadata::ArtworkProvider>>,
+    /// LRCLIB, for the language tier that reads a lyric's script. `None` when
+    /// the cache database could not be opened, which is a degraded state rather
+    /// than a fatal one — every other backfill still runs.
+    lyrics: Option<Arc<crate::lyrics::LyricsClient>>,
     /// Rung by a push-shaped source that has something new to say, so the tick
     /// happens sooner than the interval.
     ///
@@ -278,8 +282,17 @@ impl ScrobbleEngine {
             now_playing,
             listenbrainz_url,
             artwork_providers: vec![Box::new(crate::metadata::deezer::DeezerProvider::new())],
+            lyrics: None,
             wake: Arc::new(tokio::sync::Notify::new()),
         }
+    }
+
+    /// Hand the engine a lyrics client. Separate from `new` because the cache
+    /// database may fail to open and that must not stop the engine — the
+    /// language tier is the only thing lost, and `None` simply skips it.
+    pub fn with_lyrics(mut self, lyrics: Arc<crate::lyrics::LyricsClient>) -> Self {
+        self.lyrics = Some(lyrics);
+        self
     }
 
     /// Push each user's scrobble threshold down into their running sources.
@@ -1450,6 +1463,15 @@ impl ScrobbleEngine {
             // a name, so it is worth having before somebody needs it rather than
             // fetching a hundred of them while they wait.
             crate::enrich::backfill_isrc(&self.db, &self.mb_client, 50, 8).await;
+
+            // Lyrics, for the language a transliterated title cannot give.
+            // A small budget: this is one request per *track* rather than per
+            // listen, and LRCLIB is a free service that asks callers to be
+            // considerate — the docs' words, and it has no API key to ration
+            // with, so the rationing is ours to do.
+            if let Some(lyrics) = self.lyrics.clone() {
+                crate::enrich::backfill_lyrics(&self.db, &lyrics, 8).await;
+            }
 
             crate::enrich::backfill_artwork(
                 &self.db,

@@ -52,6 +52,10 @@ use crate::web_assets;
 pub struct AppState {
     pub db: Arc<Database>,
     pub mb_client: Arc<MusicBrainzClient>,
+    /// The LRCLIB cache, when it could be opened. `None` degrades to "no
+    /// lyrics stored" rather than failing a request — the same normal state a
+    /// missing Discogs token or Apple Music token is.
+    pub lyrics: Option<Arc<crate::lyrics::LyricsClient>>,
     pub log_handle: LogLevelHandle,
     /// ListenBrainz endpoint (self-hosted instances override the default).
     pub listenbrainz_url: String,

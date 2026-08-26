@@ -99,6 +99,18 @@
 	let playChain: number | null = null;
 	let playGear: number | null = null;
 	let purchased = '';
+	/** How it came to be yours. Deliberately **not** condition grading (M/NM/VG+)
+	 *  — that describes the object's wear rather than where it came from, and it
+	 *  is the field people abandon filling in. Blank is a real state and the
+	 *  default: nobody said. */
+	const ACQUIRED_AS = [
+		{ k: 'new', label: 'Bought new' },
+		{ k: 'used', label: 'Bought used' },
+		{ k: 'gift', label: 'A gift' },
+		{ k: 'inherited', label: 'Inherited' }
+	];
+	let acquiredAs = '';
+	let acquiredFrom = '';
 	let savingMeta = false;
 
 	// ── What each side has been through ──
@@ -792,10 +804,23 @@
 	 *  the mistake stays visible.
 	 */
 	$: ownedLine = (() => {
-		if (!open?.purchased_at) return '';
+		if (!open) return '';
+		// How it came to be yours reads as part of the sentence rather than as a
+		// badge: "bought used from Oxfam, 22 Aug 2026" is the story, and a
+		// coloured pill saying USED is not.
+		const how = ACQUIRED_AS.find((a) => a.k === open?.acquired_as)?.label.toLowerCase();
+		const where = open.acquired_from?.trim();
+		if (!open.purchased_at) {
+			// No date is not no story: a gift from someone is worth saying on its
+			// own, and inventing a date to hang it on would be worse.
+			if (!how && !where) return '';
+			const opener = how ? how[0].toUpperCase() + how.slice(1) : 'Acquired';
+			return [opener, where && `from ${where}`].filter(Boolean).join(' ');
+		}
 		const held = ownedFor(open.purchased_at);
-		const bought = `bought ${formatDateTime(open.purchased_at).split(',')[0]}`;
-		return held ? `Yours for ${held} — ${bought}` : bought;
+		const when = formatDateTime(open.purchased_at).split(',')[0];
+		const bought = [how ?? 'bought', where && `from ${where}`].filter(Boolean).join(' ');
+		return held ? `Yours for ${held} — ${bought}, ${when}` : `${bought}, ${when}`;
 	})();
 
 	/**
@@ -1029,6 +1054,8 @@
 		playChain = r.chain_id;
 		playGear = r.equipment_id;
 		purchased = toDateInput(r.purchased_at);
+		acquiredAs = r.acquired_as ?? '';
+		acquiredFrom = r.acquired_from ?? '';
 		try {
 			openTracks = JSON.parse(r.tracks) as PhysicalTrack[];
 		} catch {
@@ -1171,7 +1198,12 @@
 			await api.updatePressing(open.id, {
 				purchased_at: fromDateInput(purchased),
 				chain_id: playChain,
-				equipment_id: playGear
+				equipment_id: playGear,
+				// Empty is a real answer — "I don't actually remember" — so it
+				// clears rather than being skipped. Both fields are nullable and
+				// null means nobody said, never "new".
+				acquired_as: acquiredAs || null,
+				acquired_from: acquiredFrom.trim() || null
 			});
 			await load();
 			const fresh = shelf.find((x) => x.id === open?.id);
@@ -1978,6 +2010,26 @@
 						<div class="field" style="flex:0 0 160px;">
 							<label for="k-buy">Bought on</label>
 							<input id="k-buy" class="input" type="date" bind:value={purchased} on:change={saveMeta}>
+						</div>
+						<div class="field" style="flex:0 0 150px;">
+							<label for="k-how">How you got it</label>
+							<select id="k-how" class="input" bind:value={acquiredAs} on:change={saveMeta}>
+								<!-- Blank is the default and stays the default: a shelf
+								     catalogued before this existed must not be claimed as
+								     bought new. -->
+								<option value="">— not said —</option>
+								{#each ACQUIRED_AS as a}<option value={a.k}>{a.label}</option>{/each}
+							</select>
+						</div>
+						<div class="field" style="flex:1;min-width:180px;">
+							<label for="k-where">Where from</label>
+							<input
+								id="k-where"
+								class="input"
+								placeholder="a shop, a fair, a person"
+								bind:value={acquiredFrom}
+								on:change={saveMeta}
+							>
 						</div>
 						<div style="font-size:12px;color:var(--td-muted-2);flex:1;min-width:180px;align-self:center;">
 							{#if savingMeta}

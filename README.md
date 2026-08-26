@@ -422,6 +422,24 @@ provider recorded it, so a set catalogued from Discogs — whose tracklist names
 no medium — groups just the same. A single record gets no heading, because
 "Record 1" over one LP distinguishes it from nothing.
 
+**How it came to be yours** is recorded too — bought new, bought used, a gift,
+inherited — with a free-text note of where from, because "Oxfam on Byres Road"
+is what makes a thrift find a story rather than a flag. Both are optional and
+blank means nobody said, never "new": a shelf catalogued before the field
+existed is not retroactively claimed as bought new. It reads as a sentence —
+*"Yours for 12 months — bought used from Oxfam on Byres Road, 22 Aug 2025"* —
+and both travel in the shelf export.
+
+Deliberately **not** condition grading (M/NM/VG+): that describes the object's
+wear rather than where it came from, and it is the field people abandon filling
+in.
+
+**Every track of a record wears that record's sleeve.** A side used to go in
+with no artwork, so the artwork chain resolved each listen by asking a provider
+about the song — and a provider answers per song, so one side came back with a
+different cover per track. The shelf is holding the object; there is nothing to
+look up.
+
 **Running times are often missing, and Tapedeck says so rather than guessing.**
 Discogs frequently lists none, and a tracklist of blanks used to be filled in at
 three minutes a track and the sum shown as a side length — so an 18:00 side
@@ -572,6 +590,41 @@ and the count is reported. Everything is built from music you already own.
 Needs the genre map fetched (Settings → Genre Map — one request) and the genre
 backfill to have run. Finished playlists export as M3U, JSON or plain text, or
 go straight to your Plex, Jellyfin or Navidrome with **Send to…**.
+
+### Lyrics, for the language a title cannot give
+
+Tapedeck fetches lyrics from [LRCLIB](https://lrclib.net) — no key, no account —
+for one reason: **script detection settles any non-Latin title and gives up on a
+romanised one.** "Bam Haneul-ui Jeo Byeolcheoreom" is Latin characters, so it
+falls through to *English/Other*, which is a shrug rather than a measurement.
+The lyric is where that title's own script went, and a romanised Korean track
+comes back overwhelmingly in Hangul.
+
+Three outcomes, all of them real answers:
+
+- **A language**, from the script the lyric is mostly written in — by weight,
+  not by presence, because one quoted foreign name in a thousand characters
+  should not decide a song's language.
+- **Instrumental**, when LRCLIB records the track as having no words. A track
+  with no words has no language, which the vocabulary could not previously say.
+- **Nothing**, for a Latin lyric. It does not guess French: telling Latin
+  languages apart needs a statistical detector, and asserting a language nothing
+  measured is the mistake the fidelity cards were fixed for.
+
+Every listen records **where its language came from** — the title's script, the
+lyric's, MusicBrainz's work record, or the default — so a breakdown never mixes
+two measurements and calls them one.
+
+**They are cached, never redistributed.** Lyrics are third-party copyrighted
+text, so they live in the metadata cache database rather than the listening one:
+`GET /api/v1/backup` is a snapshot of *your listening*, and it does not carry
+them. Nor does the shelf export, the public now-playing endpoint or Patch. There
+is no lyrics screen yet; a connected AI assistant can read them under
+`library:read`, which is the one reader.
+
+LRCLIB is free and asks callers to be considerate, so Tapedeck identifies
+itself, honours `Retry-After`, and fetches a few tracks a minute — one request
+per *track*, not per listen.
 
 ### "Various Artists" is not an artist
 
@@ -1064,6 +1117,7 @@ src/
 ├── enrich.rs                Background backfills (MBIDs, ISRC, language, art)
 ├── analytics.rs             Listening personality + per-artist loyalty
 ├── language.rs              Script/language classification
+├── lyrics.rs                LRCLIB client + lyrics cache (language by script)
 ├── notes.rs                 Liner-note shortcodes + Markdown rendering
 ├── openapi.rs               Serves openapi.yaml, plus the router drift test
 ├── rockbox.rs               .scrobbler.log parsing (Audioscrobbler Log 1.1)
@@ -1214,6 +1268,8 @@ deploy/                      Sample hardened systemd unit
       whether you ever played it
 - [x] **Skips are readable** — stored from live sources as well as imports, with
       what played either side of them
+- [x] **Lyrics** — fetched from LRCLIB and cached outside the backup, for the
+      language a romanised title cannot give; instrumental is a real answer
 - [x] **Public now-playing** — one opt-in address, four separate field switches,
       and a Hugo shortcode for your own site
 - [x] **A chapter as an image** — a month as a story, square or wide card,

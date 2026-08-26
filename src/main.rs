@@ -7,6 +7,7 @@ mod enrich;
 mod everynoise;
 mod language;
 mod logging;
+mod lyrics;
 mod mcp;
 mod metadata;
 mod models;
@@ -130,10 +131,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let everynoise =
         crate::everynoise::store::EveryNoiseStore::open(&config.database.everynoise_path).await?;
 
+    // ── Lyrics ──
+    // In the MusicBrainz cache database, not in `scrobbles.db`: third-party
+    // copyrighted text, and `GET /api/v1/backup` is a `VACUUM INTO` of the
+    // listening database — which should carry the user's history rather than a
+    // cache of somebody else's words. That placement is how "never
+    // redistributed" is enforced, instead of a rule each export has to remember.
+    //
+    // Failing to open it costs the lyric language tier and nothing else, so it
+    // is a warning rather than a startup failure.
+    let lyrics = match crate::lyrics::LyricsClient::new(sqlite_pool.clone()).await {
+        Ok(l) => {
+            info!("🎤 Lyrics cache ready (LRCLIB)");
+            Some(Arc::new(l))
+        }
+        Err(e) => {
+            warn!("🎤 Lyrics cache unavailable, language will fall back: {e}");
+            None
+        }
+    };
+
     // ── HTTP server ──
     let app_state = Arc::new(server::AppState {
         db: db.clone(),
         mb_client: mb_client.clone(),
+        lyrics: lyrics.clone(),
         log_handle: log_handle.clone(),
         listenbrainz_url: config.listenbrainz_url.clone(),
         imports: Default::default(),
@@ -205,6 +227,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // committed writes are durable (WAL) and pending scrobbles resume on restart.
     let mut engine =
         ScrobbleEngine::new(db, mb_client, now_playing, config.listenbrainz_url.clone());
+
+    if let Some(l) = lyrics.clone() {
+        engine = engine.with_lyrics(l);
+    }
     engine.run(shutdown_rx).await;
     let _ = server_task.await;
 

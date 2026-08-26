@@ -933,6 +933,43 @@ async fn backfill_languages_now(
 /// asked about and had nothing for — real listening simply not in their
 /// database — and it is reported because without it a progress bar that stops
 /// short reads as a stall rather than as an answer.
+/// GET /api/v1/lyrics/status — how far the lyric language pass has got.
+///
+/// Reports what it is *for* rather than a lyric count: the pass exists to empty
+/// the `English/Other` bucket, which is a shrug rather than a measurement and
+/// is most of a transliterated history. `unresolved` is what is left to try.
+///
+/// `instrumental` is reported separately because it is a real answer — a track
+/// with no words has no language — and folding it into "found" would present a
+/// finished lookup as an unfinished one.
+async fn lyrics_status(State(state): State<Arc<AppState>>, user: AuthUser) -> impl IntoResponse {
+    let unresolved = state.db.tracks_wanting_language(100_000).await.map(|v| v.len()).unwrap_or(0);
+    let Some(lyrics) = state.lyrics.clone() else {
+        return (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "available": false,
+                "why": "The lyrics cache could not be opened, so the language pass is skipped.",
+                "unresolved": unresolved,
+            })),
+        )
+            .into_response();
+    };
+    let (asked, with_lyrics, instrumental) = lyrics.coverage().await;
+    let _ = user;
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "available": true,
+            "asked": asked,
+            "with_lyrics": with_lyrics,
+            "instrumental": instrumental,
+            "unresolved": unresolved,
+        })),
+    )
+        .into_response()
+}
+
 async fn mbid_status(State(state): State<Arc<AppState>>, user: AuthUser) -> impl IntoResponse {
     let (total, resolved) = match state.db.recording_mbid_coverage(user.user_id).await {
         Ok(v) => v,
@@ -1075,6 +1112,7 @@ pub fn create_scrobbles_router() -> Router<Arc<AppState>> {
         .route("/api/v1/personality", get(personality))
         .route("/api/v1/languages/status", get(language_status))
         .route("/api/v1/languages/backfill", axum::routing::post(backfill_languages_now))
+        .route("/api/v1/lyrics/status", get(lyrics_status))
         .route("/api/v1/mbids/status", get(mbid_status))
         .route("/api/v1/mbids/backfill", axum::routing::post(backfill_mbids_now))
         .route("/api/v1/artwork/status", get(artwork_status))
