@@ -166,7 +166,14 @@ Built to be trusted as your system of record:
 - **At-least-once forwarding, no double-scrobbles.** Each pending listen tracks
   which sinks have accepted it; a retry only re-sends to the sinks that haven't,
   so a flaky Last.fm won't get duplicate scrobbles when ListenBrainz was down.
-  Both sinks retry with backoff.
+- **One dead service cannot stall the rest.** Retries are budgeted separately
+  for "rate-limited" and "unreachable" — a host that cannot be reached will not
+  be reachable sixty seconds later — and after three consecutive failures a
+  service is skipped until a single probe finds it back. The flush is bounded
+  against the poll tick, so an outage at Last.fm costs some latency and never
+  the deck, the poll loop or your session. Settings → **Operations** shows the
+  tick, each source's last poll, which services are being skipped and why, and
+  tails the log.
 - **Graceful, data-safe shutdown.** On `SIGTERM` the HTTP server drains in-flight
   requests, then the poll engine finishes its current tick and exits — no work is
   cut mid-write. Even a hard `SIGKILL` can't corrupt the DB (WAL + atomic writes);
@@ -219,9 +226,12 @@ stored credential.
 Upload a `.scrobbler.log` straight off a Rockbox player. Track numbers, lengths
 and any MusicBrainz IDs the player recorded all come across.
 
-Skips (`S` rows) are **kept but never counted** — excluded from listen counts,
-analytics and forwarding, so they can power skip-rate analytics later without
-ever becoming a wrong scrobble on Last.fm.
+Skips (`S` rows) are **kept but never counted** — excluded from every listen
+count, every chart and every forward, so one can never become a wrong scrobble
+on a permanent record. They are not discarded, though: skips have their own
+readout, showing what played either side of a bail-out and how far in you got,
+and live sources record them too now rather than only imports. What is *not*
+recorded is the reason, because nothing on the wire carries one.
 
 If the log's header says `#TZ/UNKNOWN` — normal for a player with no time sync —
 Tapedeck asks which timezone the device was set to rather than guessing. Assuming
@@ -230,10 +240,16 @@ can't be recovered afterwards.
 
 ### Plex, Jellyfin and Emby
 
-All three are polled directly — no webhooks, no Plex Pass — with accurate scrobble
-thresholds (50% played or 4 minutes) and live Now Playing on the dashboard.
-Jellyfin keeps no play history of its own, so its listens start from when you
-connect; Plex and Emby are the same.
+All three are polled directly — no webhooks, no Plex Pass — with live Now
+Playing on the dashboard and a scrobble threshold that is **yours**: half the
+track or four minutes by default, changed in Settings → Scrobbling and pushed to
+running sources without a restart.
+
+**Plex also keeps a play history, and Tapedeck walks it.** That catches plays
+that finished between polls, and it pages back rather than reading one screenful
+— a source that has been unreachable for an hour catches up instead of losing
+the gap. Jellyfin and Emby keep no history a scrobbler can read, so their listens
+start from when you connect.
 
 **Emby is untested.** Jellyfin is a 2018 fork of Emby, so they are one protocol
 with a `/emby/` prefix on it and Tapedeck drives both from one client. But Emby
@@ -328,9 +344,14 @@ with:
   with live progress, or paste a single listen.
 - **Genre Map** — your listening placed on Every Noise at Once, with a taste
   trajectory over time and the regions bordering what you already play.
+- **Patch** — the people on your instance: who you follow, what they're
+  playing, records passed hand to hand and sittings listened to together.
+- **The Crate** — records somebody else suggested, kept well away from your own.
+- **Playlists** — the ones an assistant or the Lab saved, ready to send on.
 - **Signal Chains & Equipment**, plus **Settings** — split into sections
-  (Appearance, Time, Sources, Connections, API Tokens, Data, Sanitiser,
-  Maintenance, Genre Map, About), each deep-linkable as `/settings#sources`.
+  (Account, Sharing, Appearance, Time, Scrobbling, Sources, Connections, API
+  Tokens, AI Connections, Data, Sanitiser, Maintenance, Genre Map, Operations,
+  About), each deep-linkable as `/settings#sources`.
 
 ### Liner Notes
 
@@ -442,13 +463,40 @@ A love of a **recording** is mirrored outward to Last.fm and ListenBrainz;
 albums and artists stay local because neither service has the concept. Loves
 you already have on those services can be pulled in from Settings → Connections.
 
+### Patch — the other decks on your instance
+
+Everything else in Tapedeck is yours alone. Patch is the part that isn't: patch
+into another deck on your server and their listening appears on **The Reel**,
+alongside the artists you have in common, what the whole instance is playing,
+and a page for each deck. A patch waits for a yes — a private deck holds
+requests in an inbox — so being followed and being readable are separate states.
+
+**Two switches, both off, and neither is per listen.** Share a *chain* and
+anyone patched with you sees what ran through it; or open your deck to the
+people you have already accepted, which is what a patch is. Instance-wide
+figures stay chain-gated whichever you use, because those reach people you never
+approved.
+
+Pass a record to someone as a **Dub** — it lands in their Crate with your reason
+attached, never in their history — or listen together in a **Shared Spool**,
+where plays from one deck wait in the other's inbox and enter no history until
+each is accepted. A sitting you both forgot to start can be reconstructed
+afterwards from the listens themselves. A listen heard in company is *marked* as
+such, and "unmarked" is never read as "alone": the History filter has three
+states rather than two, because most listening predates the column.
+
+**Nothing federates yet.** The actor endpoints, WebFinger and signature
+verification all serve; delivery outward is the remaining work.
+
 ### Reports
 
 Your listening in chapters — one week, month or year at a time, with a stepper
 to walk back through the whole history. The three are genuinely different
 shapes rather than one card resized: a month gets the full treatment (clock,
-genres, on repeat, off the shelf), a week the compact one (seven days make a
-thin hour-of-day distribution, so it isn't drawn), and a year is a bento of
+genres, on repeat, off the shelf, what you listened *through*, who you listened
+*with*, and a five-axis shape of the month held against how your months usually
+look), a week the compact one (seven days make a thin hour-of-day distribution,
+so it isn't drawn), and a year is a bento of
 tiles built around a twelve-month line with the prior year behind it and
 genres as stacked bands.
 
@@ -576,7 +624,8 @@ Backfill your history from elsewhere and take it with you:
 │  ┌───────────────────────┐   ┌──────────────────┐   ┌────────┐ │
 │  │ Poll Sources          │   │  Ingest API      │   │ Import │ │
 │  │ (Plex/Navidrome/      │   │  (LB-compatible) │   │ (LB/fm/│ │
-│  │  Jellyfin, per user)  │   │                  │   │ files) │ │
+│  │  Jellyfin/Emby/Roon,  │   │                  │   │ files) │ │
+│  │  per user)            │   │                  │   │        │ │
 │  └───────────┬───────────┘   └────────┬─────────┘   └───┬────┘ │
 │              └────────────────────────┼─────────────────┘      │
 │                                       ▼                        │
@@ -605,7 +654,7 @@ Backfill your history from elsewhere and take it with you:
 
 ### Prerequisites
 
-- Rust toolchain (1.75+)
+- Rust toolchain (1.85+ — the SVG renderer behind report images sets the floor)
 - [Bun](https://bun.sh) (to build the embedded web UI)
 - A Plex, Navidrome, Jellyfin, Emby or Roon server (optional — the ingest API works standalone)
 - A ListenBrainz / Last.fm / Libre.fm account (optional — connected per user in the UI)
@@ -666,7 +715,7 @@ RUST_LOG=info
 LOG_DIR=./logs
 
 # ── MusicBrainz ──
-MUSICBRAINZ_USER_AGENT=Tapedeck/0.25.0 ( your-email@example.com )
+MUSICBRAINZ_USER_AGENT=Tapedeck/0.96.0 ( your-email@example.com )
 MUSICBRAINZ_RATE_LIMIT=1
 
 # ── ListenBrainz endpoint (only for a self-hosted instance) ──
@@ -832,20 +881,24 @@ person authorises a connection.
 Connections and point it at `https://your-tapedeck/mcp`. For a hosted one, give
 it the same address and approve the OAuth request when it appears.
 
-**You choose what it can see.** Six grants, all off by default:
+**You choose what it can see.** Seven grants, all off by default:
 
 | Grant | What it allows |
 |---|---|
-| `listening:read` | History, statistics, reports, sessions, the genre map |
-| `library:read` | Gear, signal chains, the shelf, loves, **liner notes** |
+| `listening:read` | History, statistics, reports, sessions, skips, the genre map |
+| `library:read` | Gear, signal chains, the shelf, loves, the Crate, **liner notes** |
 | `playlists:write` | Save playlists into Tapedeck for you to review |
 | `playlists:push` | Send them on to your media server |
 | `loves:write` | Love and unlove |
 | `notes:write` | Write liner notes, recorded as written by that connection |
+| `crate:write` | Suggest a record you don't own — into the Crate and nowhere else |
 
-Your statistics and your journal are separate grants on purpose.
+Your statistics and your journal are separate grants on purpose. So is
+`crate:write`: it is the *only* tool allowed to name music you do not own, and
+what it writes lands on a page you visit deliberately rather than mixed into
+anything you played.
 
-**Twenty-three tools**, all of them the same queries the web UI uses. The one to
+**Twenty-six tools**, all of them the same queries the web UI uses. The one to
 know about is `listening_profile`: it reports how much of your history carries
 each kind of metadata, and the assistant is told to call it first. That is what
 stops "4% lossless" being said about a history where the format is simply
@@ -857,10 +910,11 @@ Playlists page, and reaches a media server only when you send it. Every call any
 connection makes is recorded — which tool, when, with what, and how many rows
 came back — and a connection can be revoked at any time.
 
-Tapedeck also tells the assistant what *not* to do: never suggest music you do
-not own, never quote a share without its population, and never treat a genre
-position as finer than it is (genres attach to artists, so every track by an
-artist sits at the same point).
+Tapedeck also tells the assistant what *not* to do: never pad an answer about
+your listening with music you do not own (a suggestion goes in the Crate, with
+its name on it, or nowhere), never quote a share without its population, and
+never treat a genre position as finer than it is (genres attach to artists, so
+every track by an artist sits at the same point).
 
 **Tested against**: a **Claude Pro** subscription (hosted, over OAuth) and
 **Mistral Chat on the free tier**. Both drive the same endpoint — one after the
@@ -986,13 +1040,14 @@ src/
 ├── db.rs                    SQLite: all tables, migrations, every query
 ├── crypto.rs                XChaCha20-Poly1305 credential encryption at rest
 ├── musicbrainz.rs           3-tier metadata client
-├── enrich.rs                Background backfills (language, release year, artwork)
+├── enrich.rs                Background backfills (MBIDs, ISRC, language, art)
 ├── analytics.rs             Listening personality + per-artist loyalty
 ├── language.rs              Script/language classification
 ├── notes.rs                 Liner-note shortcodes + Markdown rendering
 ├── openapi.rs               Serves openapi.yaml, plus the router drift test
 ├── rockbox.rs               .scrobbler.log parsing (Audioscrobbler Log 1.1)
 ├── spotify.rs               Spotify extended streaming history (pure, tested)
+├── tidal.rs                 TIDAL as a playlist target (PKCE + the write half)
 ├── playlist_lab.rs          The ten-axis space a playlist is generated in
 ├── playlists.rs             Track matching + the push-to-server target trait
 ├── logging.rs               tracing + file output + live log level
@@ -1005,47 +1060,64 @@ src/
 │   ├── deezer.rs            Deezer artwork provider
 │   ├── bio.rs               BioProvider chain (Last.fm → TheAudioDB → …)
 │   └── release_lookup.rs    Pressing lookup for the shelf (MusicBrainz, Discogs)
+├── patch/                   Actor documents, keypairs, HTTP signatures
+├── mcp/                     Model Context Protocol: dispatch, tools, prompts
+├── report_image/            A report chapter drawn as a PNG (fonts, SVG, layout)
 ├── server/
 │   ├── mod.rs               AppState, build_app()
 │   ├── admin.rs             Health + log level endpoints
-│   ├── auth.rs              Session/token auth extractor
+│   ├── auth.rs              Session/token auth extractors (read / write / MCP)
 │   ├── ingest.rs            /1/submit-listens, /1/validate-token
 │   ├── lb_api.rs            The read side of the ListenBrainz Core API
 │   ├── models.rs            Request/response types + Tapedeck extensions
-│   ├── users.rs             Auth, user + token management
-│   ├── scrobbles.rs         Listen list/edit/delete + stats endpoints
+│   ├── users.rs             Auth, user + token management, your own account
+│   ├── scrobbles.rs         Listen list/edit/delete, stats, skips
 │   ├── notes.rs             Liner notes, loves, entities
 │   ├── sources.rs           Per-user media sources (CRUD + test)
 │   ├── artwork.rs           Cover-art proxy for library-sourced listens
 │   ├── connections.rs       Last.fm / Libre.fm / ListenBrainz connect flows
 │   ├── now_playing.rs       In-memory now-playing registry
-│   ├── preferences.rs       Per-user settings (theme, timezone, …)
+│   ├── public_np.rs         The one unauthenticated read: /public/np/:user
+│   ├── preferences.rs       Per-user settings (theme, timezone, threshold, …)
 │   ├── export.rs            JSON/CSV export + full DB backup
 │   ├── import.rs            ListenBrainz/Last.fm/file import + jobs
 │   ├── ratelimit.rs         Login throttle
-│   ├── chains.rs            Signal chain, device, equipment, binding endpoints
+│   ├── chains.rs            Signal chain, variant, device, equipment endpoints
 │   ├── library.rs           Album/artist pages, charts, entity resolve
 │   ├── sessions.rs          Listening sessions: list, merge, split, rebuild
 │   ├── physical.rs          The shelf — records, tapes and discs — and playing one
 │   ├── rediscovery.rs       Smart collections over your own history
+│   ├── crate_shelf.rs       The Crate: records somebody else suggested
+│   ├── patch.rs             Patch, the Reel, Dubs, Shared Spools, actor endpoints
 │   ├── playlist_lab.rs      Serves the playlist space for the browser to work in
 │   ├── playlists.rs         Push a generated list to Plex / Jellyfin / Subsonic
+│   ├── tidal.rs             TIDAL app registration + per-user OAuth connect
 │   ├── reports.rs           Week/month/year chapters, one pass over the history
+│   ├── report_image.rs      GET /api/v1/reports/image
 │   ├── everynoise.rs        The Every Noise genre map and the genre-map views
 │   ├── pairing.rs           Device-code pairing for browserless clients
+│   ├── oauth.rs             OAuth 2.1 + PKCE for hosted MCP clients
+│   ├── mcp.rs               The /mcp endpoint and its connection management
 │   ├── loves_pull.rs        Pull loves back from Last.fm / ListenBrainz
+│   ├── ops.rs               Operations: engine, sources, forwarding, the log
 │   └── metrics.rs           Prometheus exposition (admin only)
 ├── sinks/
 │   ├── mod.rs               sinks_for_user() — the only place sinks are built
+│   ├── health.rs            Per-service circuit breaker
 │   ├── lastfm.rs            Last.fm sink (also drives Libre.fm)
 │   └── listenbrainz.rs      ListenBrainz scrobble + now-playing sink
 └── sources/
-    ├── plex.rs              Plex polling source
+    ├── plex.rs              Plex sessions + history walk
     ├── navidrome.rs         Navidrome (native history + Subsonic)
-    └── jellyfin.rs          Jellyfin session polling
+    ├── mediabrowser.rs      The shared Jellyfin/Emby client + session tracker
+    ├── jellyfin.rs          Jellyfin's own tests
+    ├── emby.rs              Emby's own tests
+    └── roon.rs              Roon Core (zone subscription + poll)
 
 src/everynoise/              Every Noise map: parse, store, scrape
+assets/fonts/                Figtree + Caprasimo, embedded for report images
 openapi.yaml                 The whole API; served at /api/openapi.yaml
+integrations/hugo/           Now-playing shortcode for a static site
 web/                         SvelteKit SPA (built into static/, embedded)
 deploy/                      Sample hardened systemd unit
 ```
@@ -1123,6 +1195,9 @@ deploy/                      Sample hardened systemd unit
       what played either side of them
 - [x] **Public now-playing** — one opt-in address, four separate field switches,
       and a Hugo shortcode for your own site
+- [x] **A chapter as an image** — a month as a story, square or wide card,
+      drawn on the server so a phone app asks for one rather than
+      reimplementing the layout
 
 ### Next
 
@@ -1134,23 +1209,23 @@ deploy/                      Sample hardened systemd unit
       Spool** — where plays from their deck wait in your inbox and enter no
       history until you accept them.
 
-      Sharing is **per signal chain and off by default**. A listen becomes
-      visible because the chain it ran through was switched on; there is no
-      per-listen setting, and nothing — not the Reel, not the instance figures,
-      not a Shared Spool — works around that.
-- [ ] **Federating outward** — every account can already have an ActivityPub
+      **Two switches, both off by default, and neither is per listen.** Either
+      a chain is shared — anyone patched with you sees what ran through it — or
+      you open your deck to the people you have accepted, which is the decision
+      a patch already is. Instance-wide figures and Shared Spool captures stay
+      **chain-gated** whichever you use: those reach people you never approved,
+      or write onto somebody else's history, and a per-chain opt-in is the only
+      consent that covers them.
+- [ ] **Federating outward.** Every account can already have an ActivityPub
       actor, a WebFinger record, an outbox and an inbox that verifies HTTP
-      signatures, all opt-in and off by default. What remains is *sending*:
-      signing activities out to other servers so a deck elsewhere can be patched
-      into
-- [ ] **ActivityPub delivery** — sending activities out to other servers. The
-      vocabulary question is settled: a listen is a `Create` wrapping a
+      signatures — all opt-in and off by default. What remains is *sending*.
+      The vocabulary is settled and frozen: a listen is a `Create` wrapping a
       `td:Listen`, so a server that understands nothing renders "Listened to
       Teardrop by Massive Attack" while one that understands `td:` also gets the
-      signal chain and the format. Actor endpoints, WebFinger and HTTP
-      signatures serve today; nothing is sent outbound yet, which is the
-      deliberate order — the identity other servers cache has to be right
-      before anyone holds a copy of it
+      signal chain and the format. Nothing is delivered outbound yet, and that
+      order is deliberate — the identity other servers cache has to be right
+      before anyone holds a copy of it, and blocking has to exist before a
+      stranger can knock
 - [ ] **Spotify source** — OAuth, `recently-played` backfill. Note its history
       endpoint reports when a track *ended*, while `scrobbles.timestamp` is
       start-of-play everywhere, so the duration has to be subtracted on read
@@ -1163,12 +1238,9 @@ deploy/                      Sample hardened systemd unit
       optionally scrobble what the phone is playing. `AudioDeviceInfo` is the one
       thing only Android can contribute: USB DAC vs Bluetooth vs speaker, straight
       onto the chain ladder's device rung
-- [ ] **Sharing a chapter as an image** — a Reports card as a PNG for a story
 - [ ] Docker container
 - [ ] Notes: **tags**. Full-text search and Markdown export for Obsidian/Logseq
       already shipped
-- [ ] **Typing a track's running time in by hand** — a pressing MusicBrainz does
-      not have stays unknown, because nothing in the UI writes a tracklist
 - [ ] **Why Plex loses tracks on a playlist push** — the push now reports the
       reason for every miss (nothing found / wrong artist / wrong title, with
       what the server actually offered), which is what a diagnosis needs. The
@@ -1197,14 +1269,12 @@ Things that look finished and aren't:
 - **The SACD layer isn't recorded.** Stereo and multichannel are genuinely
   different listens and `AudioQuality.channels` has somewhere to put it, but
   `physical_plays` has no column for which one you played.
-- **A running time can't be typed in.** Tapedeck will go and look one up — by
-  MusicBrainz release ID if you paste one, else by barcode, matched on titles and
-  previewed before it writes anything — but if no pressing anywhere has the
-  figures, the tracklist stays unknown. `PUT /api/v1/physical/:id/tracks` exists
-  and nothing in the UI calls it. A side with
-  no running times shows no length and no progress bar rather than inventing
-  one, and its listens carry no duration, so they add nothing to your gear hours
-  until the numbers arrive.
+- **Running times can be missing, and a side then reports no length.** Tapedeck
+  looks them up — by MusicBrainz release ID if you paste one, else by barcode,
+  matched on titles and previewed before it writes anything — and you can type
+  them in by hand when no pressing anywhere has them. Until they exist the side
+  shows no length and no progress bar rather than inventing one, and its listens
+  carry no duration, so they add nothing to your gear hours.
 - **Where a side's tracks fell in time can't be corrected after the fact.** A
   side recorded before v0.74.1 laid its tracks out end to end from the start
   time, so one played across an interruption sits on top of whatever you
@@ -1231,7 +1301,7 @@ Things that look finished and aren't:
 ```bash
 cargo fmt
 cargo clippy
-cargo test          # 119 tests
+cargo test          # 565 tests
 ```
 
 `static/` is gitignored but baked into the binary; `build.rs` builds it, so a
@@ -1256,4 +1326,9 @@ See LICENSE file for details.
 - [ListenBrainz](https://listenbrainz.org) — open scrobble protocol
 - [Cover Art Archive](https://coverartarchive.org) and [Deezer](https://developers.deezer.com) — artwork
 - [Navidrome](https://www.navidrome.org), [Jellyfin](https://jellyfin.org) and [Rockbox](https://www.rockbox.org) — the other places listens come from
+- [Every Noise at Once](https://everynoise.com) — Glenn McDonald's map of the
+  genre space, which the Genre Map and Playlist Lab are both built on
+- [Discogs](https://www.discogs.com) — pressing-level release data for the shelf
+- [Figtree](https://github.com/erikdkennedy/figtree) and
+  [Caprasimo](https://github.com/vv-monsalve/Caprasimo) — the typefaces, OFL 1.1
 - Built with Rust's async ecosystem (tokio, axum, sqlx, reqwest)
