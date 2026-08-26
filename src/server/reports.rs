@@ -193,6 +193,14 @@ fn sub_bucket(dt: DateTime<Tz>, unit: Unit) -> (usize, String) {
     }
 }
 
+/// How many sub-buckets a period is drawn in.
+///
+/// Worth knowing before reaching for another distribution chart: a **month is
+/// five**, not thirty. `genre_bands` is emitted for every unit and is drawn
+/// only on the year, and that is deliberate — twelve points show a mix moving,
+/// five sit under a ranked list that already says the same thing better. The
+/// design's own argument against giving the week a genre split ("seven days
+/// make a thin genre split") applies to a month at five just as well.
 fn sub_bucket_count(unit: Unit) -> usize {
     match unit {
         Unit::Week => 7,
