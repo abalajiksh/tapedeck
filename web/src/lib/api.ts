@@ -313,6 +313,33 @@ export interface ReportPeriod {
 	crush: { name: string; plays: number; since: number } | null;
 	shelf: { sides: number; rows: { title: string; artist: string; side: string; spins: number }[] };
 	top_chain: string | null;
+	/** What you listened *through* — the pillar no other card on the page can
+	 *  show, since every other one is about *what* played.
+	 *
+	 *  `unattributed` and `no_duration` are stated rather than folded away: on
+	 *  most histories the first is nearly everything, and the hours are a
+	 *  **floor** without the second. A panel that hid them would read as a
+	 *  complete account of the period instead of an account of the part of it
+	 *  somebody attributed. */
+	gear: {
+		chains: { name: string; icon: string | null; plays: number; hours: number }[];
+		items: { name: string; type: string; plays: number; hours: number }[];
+		unattributed: number;
+		no_duration: number;
+	};
+	/** Listens **marked** as heard with somebody.
+	 *
+	 *  Marked, not "social": `company` is null on everything nobody has tagged,
+	 *  which is almost all listening, so reading null as "alone" would be
+	 *  answering "how much of this was *recorded* as social" while appearing to
+	 *  answer "how much of this *was*". `of_plays` is the denominator, and it
+	 *  travels so nothing can present a share without saying what of. */
+	company: {
+		marked_plays: number;
+		marked_hours: number;
+		of_plays: number;
+		people: { name: string; plays: number }[];
+	};
 	milestones: string[];
 	prev: {
 		label: string; plays: number; hours: number; avg_daily: number;

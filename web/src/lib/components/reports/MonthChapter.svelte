@@ -11,7 +11,7 @@
 	import ArtistHero from './ArtistHero.svelte';
 	import FeatureCard from './FeatureCard.svelte';
 	import CrushBand from './CrushBand.svelte';
-	import { nf, delta, deltaText } from './bits';
+	import { nf, delta, deltaText, barPct } from './bits';
 
 	export let p: ReportPeriod;
 	export let onShare: (() => void) | null = null;
@@ -178,6 +178,78 @@
 		</div>
 	{/if}
 
+	<!-- What you listened *through*. Every other card on this page is about
+	     what played; this is the only one about how, which is the pillar the
+	     rest of the application is built on. -->
+	{#if p.gear.chains.length}
+		<h3 class="sec h-display">Through what</h3>
+		<div class="two-up">
+			<div class="tile">
+				<div class="k" style="margin-bottom:10px;">Chains</div>
+				{#each p.gear.chains.slice(0, 6) as c}
+					<div class="gearrow">
+						<span class="gname">{c.name}</span>
+						<span class="gbar"><span style="width:{barPct(c.hours, p.gear.chains[0].hours)}%"></span></span>
+						<span class="gval">{c.hours >= 0.1 ? `${c.hours}h` : `${c.plays}×`}</span>
+					</div>
+				{/each}
+			</div>
+			{#if p.gear.items.length}
+				<div class="tile">
+					<div class="k" style="margin-bottom:10px;">Gear</div>
+					{#each p.gear.items.slice(0, 6) as g}
+						<div class="gearrow">
+							<span class="gname">{g.name} <span class="muted">· {g.type}</span></span>
+							<span class="gbar"><span style="width:{barPct(g.hours, p.gear.items[0].hours)}%"></span></span>
+							<span class="gval">{g.hours >= 0.1 ? `${g.hours}h` : `${g.plays}×`}</span>
+						</div>
+					{/each}
+				</div>
+			{/if}
+		</div>
+		<!-- Said rather than implied. Most listens on most histories carry no
+		     chain, and hours are a floor while any source reports no length —
+		     a panel that hid both would read as a complete account. -->
+		{#if p.gear.unattributed > 0 || p.gear.no_duration > 0}
+			<p class="caveat">
+				{#if p.gear.unattributed > 0}
+					{p.gear.unattributed.toLocaleString()} of {p.plays.toLocaleString()} listens
+					this month ran through nothing anybody recorded, so they are not here.
+				{/if}
+				{#if p.gear.no_duration > 0}
+					{p.gear.no_duration.toLocaleString()} more reported no length, so these hours
+					are a floor.
+				{/if}
+			</p>
+		{/if}
+	{/if}
+
+	<!-- Who you heard it with. **Counted, never a share** — `company` is null
+	     on everything nobody has tagged, so a percentage here would be about
+	     how the listening was recorded rather than about the listening. -->
+	{#if p.company.marked_plays > 0}
+		<h3 class="sec h-display">In company</h3>
+		<div class="tile">
+			<div class="cn" style="margin-bottom:10px;">
+				<span class="h-display" style="font-size:28px;">
+					{p.company.marked_plays.toLocaleString()}
+				</span>
+				<span class="cu">
+					of {p.company.of_plays.toLocaleString()} listens are marked as heard with
+					somebody{p.company.marked_hours >= 0.1 ? ` · ${p.company.marked_hours}h` : ''}
+				</span>
+			</div>
+			<div class="who">
+				{#each p.company.people as w}
+					<span class="wchip">{w.name} <span class="muted">{w.plays}</span></span>
+				{/each}
+			</div>
+			<p class="caveat" style="margin-top:10px;">
+				Only what has been marked — nothing here says the rest was spent alone.
+			</p>
+		</div>
+	{/if}
+
 	<slot name="footer" />
 </article>
 
@@ -236,6 +308,38 @@
 		color: var(--td-muted-2); margin-bottom: 8px;
 	}
 	.chain { font-weight: 700; font-size: 14.5px; line-height: 1.5; }
+	.gearrow {
+		display: grid;
+		grid-template-columns: minmax(0, 1fr) 64px auto;
+		align-items: center;
+		gap: 10px;
+		font-size: 13px;
+		margin-bottom: 7px;
+	}
+	.gname { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+	.gbar { height: 5px; border-radius: 999px; background: var(--td-track); overflow: hidden; }
+	.gbar > span {
+		display: block;
+		height: 100%;
+		border-radius: 999px;
+		background: linear-gradient(90deg, var(--td-accent-2), var(--td-accent));
+	}
+	.gval { font-variant-numeric: tabular-nums; color: var(--td-muted-2); }
+	.who { display: flex; flex-wrap: wrap; gap: 7px; }
+	.wchip {
+		font-size: 12.5px;
+		padding: 3px 10px;
+		border-radius: 999px;
+		background: var(--td-surface2);
+		border: 1px solid var(--td-border);
+	}
+	.caveat {
+		font-size: 12px;
+		color: var(--td-muted-3);
+		margin: 10px 0 0;
+		max-width: 66ch;
+		line-height: 1.5;
+	}
 	.shelf-row { display: flex; justify-content: space-between; gap: 10px; font-size: 13px; margin-bottom: 7px; }
 	@media (max-width: 760px) {
 		.feature-grid, .two-up, .counts { grid-template-columns: 1fr; }

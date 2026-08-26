@@ -26,7 +26,7 @@ openapi: 3.1.0
 
 info:
   title: Tapedeck
-  version: 0.93.0
+  version: 0.94.0
   summary: Self-hosted scrobbler and listening journal.
   description: |
     Tapedeck ingests listens, enriches them with MusicBrainz metadata, stores
@@ -3824,6 +3824,32 @@ paths:
                         crush: { type: [object, 'null'], description: Most-played artist never played before. Absent for the oldest period. }
                         shelf: { type: object, additionalProperties: true }
                         top_chain: { type: [string, 'null'] }
+                  gear:
+                    type: object
+                    additionalProperties: true
+                    description: >
+                      What the period was listened *through*. `unattributed` and
+                      `no_duration` are stated rather than folded away: on most
+                      histories the first is nearly everything, and the hours
+                      are a floor without the second.
+                    properties:
+                      chains: { type: array, items: { type: object, additionalProperties: true } }
+                      items: { type: array, items: { type: object, additionalProperties: true } }
+                      unattributed: { type: integer, description: 'Listens with no chain at all.' }
+                      no_duration: { type: integer, description: 'Chained listens whose source reported no length.' }
+                  company:
+                    type: object
+                    additionalProperties: true
+                    description: >
+                      Listens **marked** as heard with somebody. `company` is
+                      null on everything nobody has tagged, so `of_plays`
+                      travels as the denominator — never present a bare share,
+                      and never read the complement as "alone".
+                    properties:
+                      marked_plays: { type: integer }
+                      marked_hours: { type: number }
+                      of_plays: { type: integer }
+                      people: { type: array, items: { type: object, additionalProperties: true } }
                         milestones: { type: array, items: { type: string } }
                         prev: { type: [object, 'null'], additionalProperties: true, description: The period before, for deltas. }
         '401': { $ref: '#/components/responses/Unauthorized' }

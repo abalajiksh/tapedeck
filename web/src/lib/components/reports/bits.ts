@@ -23,3 +23,19 @@ export function ordinal(n: number): string {
 	const v = n % 100;
 	return n + (s[(v - 20) % 10] ?? s[v] ?? s[0]);
 }
+
+/**
+ * A bar's width as a share of the biggest in its list.
+ *
+ * Guards the two cases a naive `a / b * 100` gets wrong, and both are ordinary
+ * here rather than edge cases: **every value zero** — a period whose listens
+ * all came from sources that reported no length, where the hours are a floor of
+ * nothing — and a leading value of zero, which would divide by it. Both draw
+ * empty rather than `NaN%`, which the browser silently treats as no width and
+ * which therefore looks identical to a real zero until somebody wonders why the
+ * top row has no bar.
+ */
+export function barPct(value: number, max: number): number {
+	if (!(max > 0) || !(value > 0)) return 0;
+	return Math.max(2, Math.min(100, (value / max) * 100));
+}

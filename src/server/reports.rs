@@ -219,7 +219,26 @@ struct Bucket {
     /// Same fan-out as `genres` and therefore the same caveat: a share of tag
     /// *mentions*, not of listens.
     sub_genres: Vec<HashMap<String, i64>>,
-    chains: HashMap<i64, i64>,
+    /// chain id -> (plays, seconds). Seconds as well as plays because "what
+    /// did I listen *through*" is a question about time, and a chain used for
+    /// three long records is not the one used for thirty short tracks.
+    chains: HashMap<i64, (i64, i64)>,
+    /// Listens whose duration nobody reported. The gear hours are a **floor**
+    /// without them, and the card says so rather than implying a total.
+    chain_seconds_unknown: i64,
+    /// Listens with no chain at all. Named rather than folded away: on most
+    /// histories this is nearly everything, and a gear panel that quietly
+    /// ignored it would look like a complete account of the period.
+    chainless: i64,
+    /// Listens **marked** as heard with somebody, and who.
+    ///
+    /// Marked, not "social" — `company` is null on everything nobody has
+    /// tagged, which is almost all listening, and reading null as "alone"
+    /// is the fidelity-card mistake exactly. `plays` above is the denominator
+    /// the payload carries so nothing can present a share without it.
+    company_plays: i64,
+    company_seconds: i64,
+    company_people: HashMap<String, i64>,
     /// (track key, local day) -> plays, for "on repeat".
     per_day: HashMap<(String, i32), (String, String, i64)>,
     /// Artists whose very first listen anywhere falls inside this period.
@@ -301,6 +320,10 @@ pub async fn reports(
     let chains = state.db.get_chains(user.user_id).await.unwrap_or_default();
     let chain_name: HashMap<i64, String> =
         chains.iter().filter_map(|c| c.id.map(|id| (id, c.name.clone()))).collect();
+    // The chains themselves, for the gear panel — it needs the icon and the
+    // components, not only the name.
+    let chain_by_id: HashMap<i64, &crate::models::SignalChain> =
+        chains.iter().filter_map(|c| c.id.map(|id| (id, c))).collect();
 
     let mut periods = Vec::new();
     for (i, key) in wanted.iter().enumerate() {
@@ -469,8 +492,90 @@ pub async fn reports(
         let top_chain = b
             .chains
             .iter()
-            .max_by_key(|(_, n)| **n)
+            .max_by_key(|(_, (n, _))| *n)
             .and_then(|(cid, _)| chain_name.get(cid).cloned());
+
+        // ── What you listened *through* ──────────────────────────────────
+        //
+        // The pillar the rest of this page cannot show: every other card is
+        // about *what* played, and this is the only one about how. Hours rather
+        // than plays alone, because a chain used for three long records is not
+        // the one used for thirty short tracks.
+        let mut chain_rows: Vec<(&crate::models::SignalChain, i64, i64)> = b
+            .chains
+            .iter()
+            .filter_map(|(cid, (plays, secs))| chain_by_id.get(cid).map(|c| (*c, *plays, *secs)))
+            .collect();
+        chain_rows.sort_by(|a, z| z.2.cmp(&a.2).then(z.1.cmp(&a.1)));
+
+        // The gear behind those chains. **A set per chain**, because a chain
+        // naming the same piece at two steps must not be charged twice for the
+        // same hour — the trap `get_equipment` hit once with a `json_each`
+        // join. Keyed on the equipment row where the step was picked from the
+        // user's gear, and on the name where it was typed.
+        let mut gear: HashMap<String, (String, String, i64, i64)> = HashMap::new();
+        for (chain, plays, secs) in &chain_rows {
+            let mut seen: HashSet<String> = HashSet::new();
+            for step in &chain.components {
+                let key = step
+                    .equipment_id
+                    .map(|i| format!("e{i}"))
+                    .unwrap_or_else(|| step.name.trim().to_lowercase());
+                if key.is_empty() || !seen.insert(key.clone()) {
+                    continue;
+                }
+                let e = gear.entry(key).or_insert_with(|| {
+                    (step.name.clone(), format!("{:?}", step.component_type).to_lowercase(), 0, 0)
+                });
+                e.2 += plays;
+                e.3 += secs;
+            }
+        }
+        let mut gear_rows: Vec<_> = gear.into_values().collect();
+        gear_rows.sort_by(|a, z| z.3.cmp(&a.3).then(z.2.cmp(&a.2)));
+
+        let gear_json = serde_json::json!({
+            "chains": chain_rows.iter().map(|(c, plays, secs)| serde_json::json!({
+                "name": c.name,
+                "icon": c.icon,
+                "plays": plays,
+                "hours": (*secs as f64 / 3600.0 * 10.0).round() / 10.0,
+            })).collect::<Vec<_>>(),
+            "items": gear_rows.iter().take(8).map(|(name, kind, plays, secs)| serde_json::json!({
+                "name": name,
+                "type": kind,
+                "plays": plays,
+                "hours": (*secs as f64 / 3600.0 * 10.0).round() / 10.0,
+            })).collect::<Vec<_>>(),
+            // Both stated, never implied. Most listens on most histories have
+            // no chain, and a panel that folded those away would read as a
+            // complete account of the period rather than of the part of it
+            // anybody attributed.
+            "unattributed": b.chainless,
+            // The hours are a **floor**: a listen whose source reported no
+            // length contributes plays but no time, the same confession
+            // `total_hours` makes on the dashboard.
+            "no_duration": b.chain_seconds_unknown,
+        });
+
+        // ── Who you heard it with ────────────────────────────────────────
+        //
+        // **Marked, never "social".** `company` is null on everything nobody
+        // has tagged, which is almost all listening — so `plays` travels beside
+        // it as the denominator, and nothing here presents a share. Reading
+        // null as "alone" is the fidelity-card mistake exactly: a number that
+        // looks like it is about listening and is actually about how the
+        // listening was recorded.
+        let mut people: Vec<(&String, &i64)> = b.company_people.iter().collect();
+        people.sort_by(|a, z| z.1.cmp(a.1).then(a.0.cmp(z.0)));
+        let company_json = serde_json::json!({
+            "marked_plays": b.company_plays,
+            "marked_hours": (b.company_seconds as f64 / 3600.0 * 10.0).round() / 10.0,
+            "of_plays": b.plays,
+            "people": people.iter().take(8).map(|(name, plays)| serde_json::json!({
+                "name": name, "plays": plays,
+            })).collect::<Vec<_>>(),
+        });
 
         // Calendar days, not days you happened to play something. Dividing by
         // listening days answers "how much on the days you listened", which is
@@ -535,6 +640,8 @@ pub async fn reports(
                 })).collect::<Vec<_>>(),
             },
             "top_chain": top_chain,
+            "gear": gear_json,
+            "company": company_json,
             "milestones": milestones.get(key).cloned().unwrap_or_default(),
             "prev": prev_json,
         }));
@@ -692,7 +799,105 @@ mod tests {
             duration: Some(240),
             genres: None,
             chain_id: None,
+            company: None,
         }
+    }
+
+    /// Gear hours charge a chain once per piece, however often it names one.
+    ///
+    /// A chain can legitimately list the same box at two steps — a
+    /// preamp/amp pair from one integrated unit, a cable back through the same
+    /// interface — and charging it twice for the same hour is the trap
+    /// `get_equipment` hit once with a `json_each` join, where a chain naming
+    /// the same gear at two steps counted its whole running time twice.
+    #[test]
+    fn a_chain_charges_each_piece_of_gear_once_however_often_it_names_it() {
+        use crate::models::{ChainComponent, ComponentType};
+        let dup = |name: &str, t: ComponentType| ChainComponent {
+            component_type: t,
+            name: name.into(),
+            detail: None,
+            equipment_id: None,
+        };
+        // The fold the emit does, in miniature.
+        let components =
+            vec![dup("Bifrost", ComponentType::Dac), dup("Bifrost", ComponentType::Amp)];
+        let mut seen = std::collections::HashSet::new();
+        let mut charged = 0;
+        for step in &components {
+            if seen.insert(step.name.trim().to_lowercase()) {
+                charged += 1;
+            }
+        }
+        assert_eq!(charged, 1, "one box, one charge — not one per step naming it");
+    }
+
+    /// Company is **counted**, never turned into a share here.
+    ///
+    /// `company` is null on everything nobody has tagged, which is almost all
+    /// listening. A bare percentage would therefore be answering "how much of
+    /// this was *recorded* as social" while appearing to answer "how much of
+    /// this *was* social" — the fidelity-card failure exactly, and the reason
+    /// the History filter is three states rather than two.
+    ///
+    /// So the payload carries `marked_plays` **and** `of_plays`, and this pins
+    /// that the denominator travels: without it a client can only guess, and
+    /// the guess is always the wrong one.
+    #[test]
+    fn the_company_figure_carries_what_it_is_a_figure_of() {
+        let rows = vec![
+            {
+                let mut r = row(1_700_000_000, "Burial", None, "Untrue");
+                r.company = Some("noor, tobias".into());
+                r
+            },
+            {
+                let mut r = row(1_700_000_100, "Burial", None, "Untrue");
+                r.company = Some("noor".into());
+                r
+            },
+            // Unmarked. Not "alone" — nobody has said either way.
+            row(1_700_000_200, "Aphex Twin", None, "SAW"),
+        ];
+        let f = fold_periods(rows, Tz::UTC, Unit::Month);
+        let b = &f.buckets[&f.order[0]];
+        assert_eq!(b.company_plays, 2, "only what is marked");
+        assert_eq!(b.plays, 3, "and the whole period, so a share is answerable honestly");
+        assert_eq!(b.company_people.get("noor"), Some(&2));
+        assert_eq!(b.company_people.get("tobias"), Some(&1), "the comma splits into people");
+        assert!(
+            !b.company_people.contains_key("noor, tobias"),
+            "one oddly named person is what not splitting looks like"
+        );
+    }
+
+    /// A listen with no chain is counted as such rather than folded away.
+    ///
+    /// On most histories this is nearly everything — a gear panel that quietly
+    /// ignored it would read as a complete account of the period instead of an
+    /// account of the part somebody attributed. Same for a listen whose source
+    /// reported no length: the hours are a floor and the card says so.
+    #[test]
+    fn the_gear_panel_says_what_it_cannot_account_for() {
+        let rows = vec![
+            {
+                let mut r = row(1_700_000_000, "Burial", None, "Untrue");
+                r.chain_id = Some(7);
+                r
+            },
+            {
+                let mut r = row(1_700_000_100, "Burial", None, "Untrue");
+                r.chain_id = Some(7);
+                r.duration = None;
+                r
+            },
+            row(1_700_000_200, "Aphex Twin", None, "SAW"),
+        ];
+        let f = fold_periods(rows, Tz::UTC, Unit::Month);
+        let b = &f.buckets[&f.order[0]];
+        assert_eq!(b.chains.get(&7), Some(&(2, 240)), "two plays, one of them timed");
+        assert_eq!(b.chain_seconds_unknown, 1, "and the untimed one is admitted");
+        assert_eq!(b.chainless, 1, "as is the one that ran through nothing");
     }
 
     /// The superlatives print the spelling somebody actually submitted, and the
@@ -948,7 +1153,24 @@ fn fold_periods(rows: Vec<ReportRow>, tz: Tz, unit: Unit) -> Folded {
         e.2 += 1;
 
         if let Some(cid) = r.chain_id {
-            *b.chains.entry(cid).or_insert(0) += 1;
+            let e = b.chains.entry(cid).or_insert((0, 0));
+            e.0 += 1;
+            match r.duration {
+                Some(d) if d > 0 => e.1 += d,
+                _ => b.chain_seconds_unknown += 1,
+            }
+        } else {
+            b.chainless += 1;
+        }
+
+        // Who it was heard with. Split on the comma the writer joins with, so
+        // "noor F, tobias F" is two people rather than one oddly named one.
+        if let Some(with) = r.company.as_deref().map(str::trim).filter(|c| !c.is_empty()) {
+            b.company_plays += 1;
+            b.company_seconds += r.duration.unwrap_or(0).max(0);
+            for name in with.split(',').map(str::trim).filter(|n| !n.is_empty()) {
+                *b.company_people.entry(name.to_string()).or_insert(0) += 1;
+            }
         }
 
         // A track carries several tags; each is counted once. This is a share

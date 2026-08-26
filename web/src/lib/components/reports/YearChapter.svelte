@@ -13,7 +13,7 @@
 	import { openAlbum, openArtist } from '$lib/entities';
 	import MonthLine from './MonthLine.svelte';
 	import GenreBands from './GenreBands.svelte';
-	import { nf, delta, deltaText, ordinal } from './bits';
+	import { nf, delta, deltaText, ordinal, barPct } from './bits';
 
 	export let p: ReportPeriod;
 	export let onShare: (() => void) | null = null;
@@ -124,6 +124,53 @@
 			</div>
 		{/if}
 	</section>
+
+	<!-- Through what. A year is the span on which gear actually changes, so
+	     this is the chapter where it says the most. -->
+	{#if p.gear.chains.length}
+		<section class="tile span3">
+			<div class="k">Heard through</div>
+			{#each p.gear.chains.slice(0, 5) as c}
+				<div class="gearrow">
+					<span class="gname">{c.name}</span>
+					<span class="gbar"><span style="width:{barPct(c.hours, p.gear.chains[0].hours)}%"></span></span>
+					<span class="gval">{c.hours >= 0.1 ? `${c.hours}h` : `${nf(c.plays)}×`}</span>
+				</div>
+			{/each}
+			{#if p.gear.unattributed > 0}
+				<p class="caveat">
+					{nf(p.gear.unattributed)} listens ran through nothing recorded and are not here.
+				</p>
+			{/if}
+		</section>
+	{/if}
+
+	{#if p.gear.items.length}
+		<section class="tile span3">
+			<div class="k">On what</div>
+			{#each p.gear.items.slice(0, 5) as g}
+				<div class="gearrow">
+					<span class="gname">{g.name}</span>
+					<span class="gbar"><span style="width:{barPct(g.hours, p.gear.items[0].hours)}%"></span></span>
+					<span class="gval">{g.hours >= 0.1 ? `${g.hours}h` : `${nf(g.plays)}×`}</span>
+				</div>
+			{/each}
+		</section>
+	{/if}
+
+	<!-- Counted, never a share. Nothing here claims the rest was solitary. -->
+	{#if p.company.marked_plays > 0}
+		<section class="tile span2">
+			<div class="k">In company</div>
+			<div class="disc">
+				<span class="h-display dn">{nf(p.company.marked_plays)}</span>
+				<span class="du">listens marked as heard with somebody, of {nf(p.company.of_plays)}</span>
+			</div>
+			<div class="miles">
+				{#each p.company.people.slice(0, 6) as w}<span class="milestone">{w.name}</span>{/each}
+			</div>
+		</section>
+	{/if}
 </div>
 
 {#if onShare}
@@ -136,7 +183,30 @@
 
 <style>
 	.bento { display: grid; grid-template-columns: repeat(6, 1fr); gap: 14px; }
+	.gearrow {
+		display: grid;
+		grid-template-columns: minmax(0, 1fr) 56px auto;
+		align-items: center;
+		gap: 9px;
+		font-size: 13px;
+		margin-top: 7px;
+	}
+	.gname { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+	.gbar { height: 5px; border-radius: 999px; background: var(--td-track); overflow: hidden; }
+	.gbar > span {
+		display: block;
+		height: 100%;
+		border-radius: 999px;
+		background: linear-gradient(90deg, var(--td-accent-2), var(--td-accent));
+	}
+	.gval { font-variant-numeric: tabular-nums; color: var(--td-muted-2); }
+	.caveat { font-size: 11.5px; color: var(--td-muted-3); margin: 10px 0 0; line-height: 1.5; }
 	.span2 { grid-column: span 2; }
+	/* Half the grid. Two of these make a row, which is what the gear pair
+	   wants — and it has to be *declared*: a `span3` used and defined nowhere
+	   renders one column wide with nothing erroring and `svelte-check` clean,
+	   the trap v0.42.0 recorded. */
+	.span3 { grid-column: span 3; }
 	.span4 { grid-column: span 4; }
 	.tile {
 		background: var(--td-surface); border: 1px solid var(--td-border);
@@ -212,6 +282,6 @@
 	   their aspect because they are viewBox-scaled SVG. */
 	@media (max-width: 900px) {
 		.bento { grid-template-columns: 1fr; }
-		.span2, .span4 { grid-column: span 1; }
+		.span2, .span3, .span4 { grid-column: span 1; }
 	}
 </style>

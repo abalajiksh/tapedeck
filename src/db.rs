@@ -6125,7 +6125,8 @@ impl Database {
         limit: i64,
     ) -> Result<Vec<ReportRow>, sqlx::Error> {
         sqlx::query_as(
-            "SELECT timestamp, artist, artist_credit, title, album, duration, genres, chain_id
+            "SELECT timestamp, artist, artist_credit, title, album, duration, genres, chain_id,
+                    company
              FROM scrobbles
              WHERE user_id = ? AND skipped = FALSE
              ORDER BY timestamp ASC LIMIT ?",
@@ -16792,6 +16793,14 @@ pub struct ReportRow {
     /// that listen has been enriched.
     pub genres: Option<String>,
     pub chain_id: Option<i64>,
+    /// Who this was heard with, as free text — a comma-joined list of names.
+    ///
+    /// **`None` means unmarked, and it must never be read as "alone".** Only a
+    /// Shared Spool and a hand edit ever set it, so a report that presented a
+    /// bare share would be answering "how much of this was recorded as social"
+    /// while appearing to answer "how much of this was social". Anything using
+    /// it states what has been marked — see `Bucket::company_plays`.
+    pub company: Option<String>,
 }
 
 /// What an API token resolves to. The id is carried because a session is now

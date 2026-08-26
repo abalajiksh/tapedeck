@@ -73,6 +73,30 @@
 		<CrushBand crush={p.crush} unit="week" compact />
 	{/if}
 
+	<!-- One line, not a panel. A week's gear split is two or three chains and
+	     the design's whole argument for this chapter is that seven days do not
+	     support the distributions a month does — so this says which, and how
+	     much, and stops. Company rides on the same line for the same reason. -->
+	{#if p.gear.chains.length || p.company.marked_plays > 0}
+		<div class="through">
+			{#if p.gear.chains.length}
+				<span class="tk">Through</span>
+				{#each p.gear.chains.slice(0, 3) as c, i}
+					<span class="tv">{i ? ' · ' : ''}{c.name}
+						<span class="tm">{c.hours >= 0.1 ? `${c.hours}h` : `${nf(c.plays)}×`}</span>
+					</span>
+				{/each}
+			{/if}
+			{#if p.company.marked_plays > 0}
+				<span class="tk" style="margin-left:14px;">With</span>
+				<span class="tv">
+					{p.company.people.map((w) => w.name).slice(0, 3).join(', ') || 'somebody'}
+					<span class="tm">{nf(p.company.marked_plays)} marked</span>
+				</span>
+			{/if}
+		</div>
+	{/if}
+
 	<slot name="footer" />
 </article>
 
@@ -88,5 +112,16 @@
 		background: var(--td-good-bg); color: var(--td-good-fg);
 		font-size: 12px; font-weight: 600; border-radius: 999px; padding: 5px 12px;
 	}
+	.through {
+		display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px;
+		font-size: 13px; margin-top: 18px; padding-top: 16px;
+		border-top: 1px solid var(--td-border);
+	}
+	.tk {
+		font-size: 11px; letter-spacing: .09em; text-transform: uppercase;
+		color: var(--td-muted-2);
+	}
+	.tv { color: var(--td-text); }
+	.tm { color: var(--td-muted-3); font-variant-numeric: tabular-nums; }
 	@media (max-width: 760px) { .feature-grid { grid-template-columns: 1fr; } }
 </style>

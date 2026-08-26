@@ -435,11 +435,18 @@ pub struct SignalChain {
     /// Whether listens through this chain reach the Reel of anyone patched into
     /// its owner.
     ///
-    /// **The sharing unit is the chain, and this is the only switch there is.**
-    /// There is no per-listen visibility and there should not be one: it makes
-    /// "what am I publishing?" answerable by looking at a list of chains you
-    /// already understand, and it makes the decision a standing one about *how
-    /// you listen* rather than a choice to make per play.
+    /// **No longer the sharing unit** (v0.93.0). It was, and the argument for
+    /// it was that "what am I publishing?" is answerable by looking at a list
+    /// of chains you already understand. What that missed is that a chain is a
+    /// *gear configuration*, and using one as an access-control list is an odd
+    /// proxy for consent — a patch is a decision about a person, which is what
+    /// consent is.
+    ///
+    /// So `users.share_all_with_patched` decides whether a patched deck sees
+    /// every listen, and this now decides two narrower things: whether the
+    /// chain may be **named** to them (unshared reads "Private signal chain"),
+    /// and whether its listens reach the parts that have no patch behind them —
+    /// the Instance tab, Discover, and Shared Spool captures.
     #[serde(default)]
     pub shared: bool,
     pub total_hours: f64,
