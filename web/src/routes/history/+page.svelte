@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { goto } from '$app/navigation';
 	import { onMount, onDestroy } from 'svelte';
 	import { syncUrl } from '$lib/url';
 	import { api } from '$lib/api';
@@ -285,6 +286,19 @@
 		}
 	}
 
+	/** Open the lyric reader for a listen.
+	 *
+	 *  Offered on every listen rather than only where lyrics are held: knowing
+	 *  which have them would be a lookup per row, and the reader's own empty
+	 *  state says plainly that the backfill fetches a few tracks a minute,
+	 *  most-played first. A page that explains itself beats a menu item that
+	 *  silently isn't there. */
+	function readWords(s: Scrobble) {
+		menuFor = null;
+		const q = new URLSearchParams({ artist: s.artist, title: s.title });
+		goto(`/lyrics?${q}`);
+	}
+
 	function openEdit(s: Scrobble) {
 		menuFor = null;
 		editing = s;
@@ -530,6 +544,12 @@
 				</button>
 			{/if}
 		{/each}
+		<!-- The reader was reachable from a resolved [[line:…]] chip and nowhere
+		     else — and to write one you need a line number, which you get by
+		     opening the reader. A closed loop, which is the shipped-switched-off
+		     pattern with an extra step. This is the way in. -->
+		<button class="menu-item" on:click={() => menuFor && readWords(menuFor)}>
+			<svg viewBox="0 0 24 24" width="16" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M4 6h10M4 12h16M4 18h7"/></svg>Read the words</button>
 		<button class="menu-item" on:click={() => menuFor && openEdit(menuFor)}>
 			<svg viewBox="0 0 24 24" width="16" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4z"/></svg>Edit details</button>
 		<button class="menu-item" on:click={() => { inspecting = menuFor; menuFor = null; }}>

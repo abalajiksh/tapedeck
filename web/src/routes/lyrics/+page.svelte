@@ -186,6 +186,32 @@
 		color: var(--td-muted);
 		letter-spacing: 0.06em;
 	}
+	/* Repeated here, the way Reports and Settings both repeat it: Svelte scopes
+	   styles per component, so a class defined elsewhere renders as nothing at
+	   all — the trap v0.42.0 records, and this toggle hit it. Matching the
+	   existing definition matters more than deduplicating it. */
+	.seg {
+		display: inline-flex;
+		gap: 2px;
+		padding: 3px;
+		border-radius: 999px;
+		background: var(--td-surface2);
+		border: 1px solid var(--td-border);
+	}
+	.seg-btn {
+		border: none;
+		background: none;
+		cursor: pointer;
+		padding: 6px 14px;
+		border-radius: 999px;
+		font: inherit;
+		font-size: 13px;
+		color: var(--td-muted);
+	}
+	.seg-btn.on {
+		background: var(--td-accent);
+		color: #fbf5ea;
+	}
 	.pad { padding: 22px; border-radius: 22px; }
 	.muted { color: var(--td-muted); }
 	.bad { color: var(--td-bad-fg); }
