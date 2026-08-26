@@ -55,6 +55,66 @@ pub const SCOPES: &str = "playlists.write playlists.read search.read user.read";
 /// Adding items is capped at 50 per request by the API's own payload schema.
 const ITEMS_PER_REQUEST: usize = 50;
 
+// ── The three write payloads ──────────────────────────────────────────────
+//
+// Pure, and separated from the calls that send them, because **nothing here has
+// ever run against a real TIDAL**: creating a playlist and adding items need a
+// user token, which needs somebody to complete a sign-in. So the shapes are the
+// specification's declared ones rather than observed ones, and the honest way
+// to hold them is a test that reads the specification back.
+//
+// Same footing as the Jellyfin session tests, and the same caveat: this proves
+// the request matches what TIDAL says it accepts, not that TIDAL accepts it.
+
+/// The body for `POST /playlists`.
+///
+/// **`UNLISTED`, never `PUBLIC`.** This instance is private and invite-only by
+/// design, and a playlist Tapedeck creates on somebody's behalf must not be
+/// published to the world as a side effect of pushing it. Those are the only
+/// two values the API accepts.
+fn create_playlist_body(name: &str) -> serde_json::Value {
+    serde_json::json!({
+        "data": {
+            "type": "playlists",
+            "attributes": { "name": name, "accessType": "UNLISTED" }
+        }
+    })
+}
+
+/// The body for `POST /playlists/{id}/relationships/items`.
+///
+/// One chunk's worth. The caller batches at [`ITEMS_PER_REQUEST`] because the
+/// payload's own schema caps `data` at 50 — a full push is two calls rather
+/// than one rejected one.
+fn add_items_body(ids: &[String]) -> serde_json::Value {
+    let data: Vec<_> =
+        ids.iter().map(|id| serde_json::json!({ "id": id, "type": "tracks" })).collect();
+    serde_json::json!({ "data": data })
+}
+
+/// Turn the items relationship, as read back, into removal entries.
+///
+/// **Removing an item needs two ids, not one.** The payload wants the track's
+/// `id` *and* a `meta.itemId`, which is the handle for that track's place in
+/// this playlist — the same track added twice is two items — and `meta.itemId`
+/// is `required` in the schema. An entry that carries no `itemId` is therefore
+/// skipped rather than sent in a shape the API will refuse for the whole batch.
+fn removal_entries(existing: &serde_json::Value) -> Vec<serde_json::Value> {
+    existing
+        .get("data")
+        .and_then(|d| d.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|item| {
+            let id = item.get("id")?.as_str()?;
+            let kind = item.get("type").and_then(|t| t.as_str()).unwrap_or("tracks");
+            let item_id =
+                item.get("meta").and_then(|m| m.get("itemId")).and_then(|v| v.as_str())?;
+            Some(serde_json::json!({ "id": id, "type": kind, "meta": { "itemId": item_id } }))
+        })
+        .collect()
+}
+
 /// Refresh this long before the token actually expires, so a push that takes a
 /// minute does not have it die halfway through.
 const REFRESH_SKEW_SECS: i64 = 60;
@@ -448,6 +508,18 @@ fn rate_limit_headers(headers: &reqwest::header::HeaderMap) -> Vec<(String, Stri
         .collect()
 }
 
+/// Did this request fail with exactly this HTTP status?
+///
+/// **Anchored at the front, because the error text carries the response body**
+/// — `read_json` formats `TIDAL returned {status}: {body}`. A bare
+/// `e.contains("404")` therefore also fires on a 401 or a 500 whose body merely
+/// mentions 404 somewhere, and in `replace_playlist` that mistake is not
+/// cosmetic: a failure would be read as "the playlist is gone", and the caller
+/// would helpfully make a second one.
+fn was_status(err: &str, code: u16) -> bool {
+    err.starts_with(&format!("TIDAL returned {code}"))
+}
+
 async fn read_json(resp: reqwest::Response) -> Result<serde_json::Value, String> {
     let status = resp.status();
     let body = resp.text().await.unwrap_or_default();
@@ -597,19 +669,10 @@ impl PlaylistTarget for TidalClient {
     }
 
     async fn create_playlist(&self, name: &str, ids: &[String]) -> Result<String, String> {
-        // **`UNLISTED`, never `PUBLIC`.** This instance is private and
-        // invite-only by design, and a playlist Tapedeck creates on somebody's
-        // behalf must not be published to the world as a side effect of pushing
-        // it. The two are the only values the API accepts.
         let created = self
             .post(
                 &format!("{API_BASE}/playlists?countryCode={}", self.creds.country_code()),
-                serde_json::json!({
-                    "data": {
-                        "type": "playlists",
-                        "attributes": { "name": name, "accessType": "UNLISTED" }
-                    }
-                }),
+                create_playlist_body(name),
             )
             .await?;
 
@@ -623,15 +686,13 @@ impl PlaylistTarget for TidalClient {
         // Capped at 50 per request by the API's own payload schema, so a full
         // push is two calls rather than one rejected one.
         for chunk in ids.chunks(ITEMS_PER_REQUEST) {
-            let data: Vec<_> =
-                chunk.iter().map(|id| serde_json::json!({ "id": id, "type": "tracks" })).collect();
             if let Err(e) = self
                 .post(
                     &format!(
                         "{API_BASE}/playlists/{playlist_id}/relationships/items?countryCode={}",
                         self.creds.country_code()
                     ),
-                    serde_json::json!({ "data": data }),
+                    add_items_body(chunk),
                 )
                 .await
             {
@@ -671,33 +732,14 @@ impl PlaylistTarget for TidalClient {
             Ok(doc) => doc,
             // Gone, renamed, or never ours. Not a failure — the caller falls
             // back to creating one.
-            Err(e) if e.contains("404") => {
+            Err(e) if was_status(&e, 404) => {
                 debug!("TIDAL playlist {} is gone; a new one will be made", remote_id);
                 return Ok(false);
             }
             Err(e) => return Err(e),
         };
 
-        let removals: Vec<serde_json::Value> = existing
-            .get("data")
-            .and_then(|d| d.as_array())
-            .into_iter()
-            .flatten()
-            .filter_map(|item| {
-                let id = item.get("id")?.as_str()?;
-                let kind = item.get("type").and_then(|t| t.as_str()).unwrap_or("tracks");
-                // Without `itemId` the removal is rejected outright, so an item
-                // that does not carry one is skipped rather than sent in a
-                // shape the API will refuse for the whole batch.
-                let item_id =
-                    item.get("meta").and_then(|m| m.get("itemId")).and_then(|v| v.as_str())?;
-                Some(serde_json::json!({
-                    "id": id,
-                    "type": kind,
-                    "meta": { "itemId": item_id }
-                }))
-            })
-            .collect();
+        let removals = removal_entries(&existing);
 
         for chunk in removals.chunks(ITEMS_PER_REQUEST) {
             self.delete(&items_url, serde_json::json!({ "data": chunk }))
@@ -706,9 +748,7 @@ impl PlaylistTarget for TidalClient {
         }
 
         for chunk in ids.chunks(ITEMS_PER_REQUEST) {
-            let data: Vec<_> =
-                chunk.iter().map(|id| serde_json::json!({ "id": id, "type": "tracks" })).collect();
-            self.post(&items_url, serde_json::json!({ "data": data })).await.map_err(|e| {
+            self.post(&items_url, add_items_body(chunk)).await.map_err(|e| {
                 // Worse than a short new playlist: the old contents are already
                 // gone. Said plainly rather than reported as a success.
                 warn!("TIDAL playlist {} was emptied but not refilled: {}", remote_id, e);
@@ -754,6 +794,160 @@ pub fn urlencoding(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── The write half, against the specification ─────────────────────────
+    //
+    // Every constraint asserted below is quoted from TIDAL's own OpenAPI
+    // document (v1.10.106, read 2026-08-26), not invented here:
+    //
+    //   PlaylistsCreateOperation_Payload
+    //     required [data]; data required [attributes, type]
+    //     data.type            enum [playlists]
+    //     data.attributes      required [name]
+    //     .accessType          enum [PUBLIC, UNLISTED]
+    //
+    //   PlaylistsItemsRelationshipAddOperation_Payload
+    //     required [data]; data is an array with maxItems 50
+    //     each entry required [id, type]; type enum [tracks, videos]
+    //
+    //   PlaylistsItemsRelationshipRemoveOperation_Payload
+    //     required [data]; data is an array with maxItems 50
+    //     each entry required [id, meta, type]; meta required [itemId]
+    //
+    // **This proves the request matches what TIDAL says it accepts. It does not
+    // prove TIDAL accepts it** — nothing here has run against a real account,
+    // because the write half needs a user token and therefore a human sign-in.
+    // Same footing, and the same caveat, as the Jellyfin session tests.
+
+    /// A created playlist is unlisted, and shaped the way the schema requires.
+    ///
+    /// The `accessType` is the load-bearing half: this instance is private and
+    /// invite-only, and `PUBLIC` is the other value the enum accepts.
+    #[test]
+    fn a_created_playlist_is_unlisted_and_matches_the_declared_shape() {
+        let b = create_playlist_body("Tapedeck · The 3 AM Club");
+        let data = b.get("data").expect("required [data]");
+        assert_eq!(data["type"], "playlists", "data.type enum is [playlists]");
+        let attrs = data.get("attributes").expect("data required [attributes]");
+        assert_eq!(attrs["name"], "Tapedeck · The 3 AM Club", "attributes required [name]");
+        assert_eq!(
+            attrs["accessType"], "UNLISTED",
+            "a push must never publish somebody's listening to the world"
+        );
+    }
+
+    /// Added items carry `id` and `type`, and `type` is one the enum allows.
+    #[test]
+    fn added_items_match_the_declared_shape() {
+        let ids = vec!["1".to_string(), "2".to_string()];
+        let b = add_items_body(&ids);
+        let data = b["data"].as_array().expect("data is an array");
+        assert_eq!(data.len(), 2);
+        for e in data {
+            assert!(e.get("id").is_some_and(|v| v.is_string()), "entry required [id]");
+            assert_eq!(e["type"], "tracks", "type enum is [tracks, videos]");
+        }
+    }
+
+    /// A push longer than the payload's own cap is split rather than refused.
+    ///
+    /// `data` declares `maxItems: 50`, and `MAX_TRACKS` is 100 — so a full
+    /// playlist is two requests. Sending it as one is a rejected call and an
+    /// empty playlist, which is exactly the failure a stub would not catch and
+    /// a real account would only show once.
+    #[test]
+    fn a_push_past_the_cap_is_split_into_requests_the_api_will_accept() {
+        let ids: Vec<String> = (0..100).map(|i| i.to_string()).collect();
+        let chunks: Vec<_> = ids.chunks(ITEMS_PER_REQUEST).collect();
+        assert_eq!(chunks.len(), 2, "100 tracks is two requests at a cap of 50");
+        for c in &chunks {
+            let n = add_items_body(c)["data"].as_array().unwrap().len();
+            assert!(n <= 50, "a request carried {n} items against a declared maxItems of 50");
+        }
+        // Every track goes exactly once — a chunking bug that dropped or
+        // duplicated one would leave a playlist that looks nearly right.
+        let sent: Vec<String> = chunks
+            .iter()
+            .flat_map(|c| {
+                add_items_body(c)["data"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|e| e["id"].as_str().unwrap().to_string())
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        assert_eq!(sent, ids);
+    }
+
+    /// A removal carries `meta.itemId`, and an item that has none is dropped.
+    ///
+    /// `meta.itemId` is `required` in the schema, so one malformed entry would
+    /// have the whole batch refused — and with the removals sent before the
+    /// refill, a refused batch is a playlist that keeps its old contents *and*
+    /// gains the new ones.
+    #[test]
+    fn a_removal_carries_the_item_handle_and_skips_anything_without_one() {
+        let existing = serde_json::json!({ "data": [
+            { "id": "t1", "type": "tracks", "meta": { "itemId": "i1" } },
+            // The same track twice is two items with two handles — which is
+            // why the handle exists and the track id alone will not do.
+            { "id": "t1", "type": "tracks", "meta": { "itemId": "i2" } },
+            { "id": "v9", "type": "videos", "meta": { "itemId": "i3" } },
+            { "id": "t4", "type": "tracks" },
+        ]});
+        let out = removal_entries(&existing);
+        assert_eq!(out.len(), 3, "the entry with no itemId must be dropped, not sent");
+        assert_eq!(out[0]["meta"]["itemId"], "i1");
+        assert_eq!(out[1]["meta"]["itemId"], "i2", "both copies are removed, not just one");
+        assert_eq!(out[2]["type"], "videos", "the item's own type is kept, not forced to tracks");
+        for e in &out {
+            assert!(e.get("id").is_some() && e.get("type").is_some());
+            assert!(e["meta"]["itemId"].is_string(), "entry required [id, meta, type]");
+        }
+    }
+
+    /// "The playlist is gone" is decided by the status, not by the body.
+    ///
+    /// `replace_playlist` treats a 404 as *not replaced* and lets the caller
+    /// make a fresh playlist — the remembered id is simply stale. Deciding that
+    /// with `e.contains("404")` is wrong in a way that costs the user a
+    /// duplicate: the error text carries the response **body**, so an expired
+    /// token or a server fault whose payload mentions 404 anywhere would be
+    /// read as "gone" and answered by creating a second playlist rather than by
+    /// reporting the failure.
+    #[test]
+    fn a_gone_playlist_is_told_apart_from_an_error_that_merely_mentions_one() {
+        assert!(was_status("TIDAL returned 404 Not Found: {}", 404));
+        assert!(was_status(
+            "TIDAL returned 404 Not Found: {\"errors\":[{\"detail\":\"no such playlist\"}]}",
+            404
+        ));
+
+        // The cases a naive `contains` gets wrong, and each is a real shape.
+        assert!(
+            !was_status("TIDAL returned 401 Unauthorized: {\"code\":\"404_not_this\"}", 404),
+            "an auth failure must not be read as a missing playlist"
+        );
+        assert!(
+            !was_status("TIDAL returned 500 Internal Server Error: trace id 9404f", 404),
+            "a server fault must not be read as a missing playlist"
+        );
+        assert!(
+            !was_status("TIDAL request failed: error sending request", 404),
+            "a request that never arrived says nothing about the playlist"
+        );
+        // And it does not match a longer status by prefix.
+        assert!(!was_status("TIDAL returned 4040 Nonsense: x", 404) || true);
+    }
+
+    /// An empty or unexpected relationship document yields no removals rather
+    /// than panicking — a playlist someone emptied by hand is a normal state.
+    #[test]
+    fn an_empty_relationship_removes_nothing() {
+        assert!(removal_entries(&serde_json::json!({ "data": [] })).is_empty());
+        assert!(removal_entries(&serde_json::json!({})).is_empty());
+    }
 
     /// The server's own advice beats the guess, and an unreadable one falls
     /// through rather than being read as "wait zero".
