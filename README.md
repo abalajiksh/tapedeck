@@ -417,7 +417,10 @@ nine-minute closer on the wrong side of the break. A multi-disc set is split
 **one record at a time**, by each disc's own running time, so a double LP whose
 first record runs long does not have side C opening with tracks that are
 physically on disc 1 — and the panel groups its sides under *Record 1* and
-*Record 2*.
+*Record 2*. Which record a side is on is read off the side letter when no
+provider recorded it, so a set catalogued from Discogs — whose tracklist names
+no medium — groups just the same. A single record gets no heading, because
+"Record 1" over one LP distinguishes it from nothing.
 
 **Running times are often missing, and Tapedeck says so rather than guessing.**
 Discogs frequently lists none, and a tracklist of blanks used to be filled in at
