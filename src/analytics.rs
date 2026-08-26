@@ -95,7 +95,7 @@ fn jaccard(a: &HashSet<String>, b: &HashSet<String>) -> f64 {
 
 fn top_n_artists(rows: &[&ListenRow], n: usize) -> HashSet<String> {
     let mut c: HashMap<&str, i64> = HashMap::new();
-    for r in rows {
+    for r in rows.iter().filter(|r| !crate::db::is_various_artists(&r.artist)) {
         *c.entry(r.artist.as_str()).or_default() += 1;
     }
     let mut v: Vec<_> = c.into_iter().collect();
@@ -116,8 +116,14 @@ pub fn compute_personality(rows: &[ListenRow], tz: Tz) -> Personality {
     let total_f = total as f64;
 
     // ── Adventurer ↔ Loyalist: artist spread ──
+    //
+    // The placeholder is not an artist, so it cannot be one of the many you
+    // range across nor one of the few you return to — it is a compilation
+    // nobody resolved. Excluded from the artist-shaped axes only: the plays
+    // themselves still count towards `total`, the replay axis and the clock,
+    // because they are real listening. See `db::NOT_VARIOUS`.
     let mut artist_counts: HashMap<&str, i64> = HashMap::new();
-    for r in rows {
+    for r in rows.iter().filter(|r| !crate::db::is_various_artists(&r.artist)) {
         *artist_counts.entry(r.artist.as_str()).or_default() += 1;
     }
     let n_artists = artist_counts.len();
@@ -275,7 +281,7 @@ fn compute_loyalty(rows: &[ListenRow], tz: Tz) -> Vec<LoyalArtist> {
     let full_span = (max_day - min_day + 1).max(1) as f64;
 
     let mut by_artist: HashMap<&str, Vec<i64>> = HashMap::new();
-    for r in rows {
+    for r in rows.iter().filter(|r| !crate::db::is_various_artists(&r.artist)) {
         by_artist.entry(r.artist.as_str()).or_default().push(local_day(r.ts, tz));
     }
 

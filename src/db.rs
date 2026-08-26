@@ -901,7 +901,18 @@ pub fn credited_artists(play: &Play) -> Vec<(String, Option<String>)> {
     let mut names: Vec<String> = Vec::new();
     let mut push = |n: &str| {
         let n = n.trim();
-        if n.is_empty() {
+        // **The placeholder is not a credit.** "Various Artists" is a filing
+        // convention meaning *look at the track* — unresolved metadata, not a
+        // performer — so it never becomes a row in `scrobble_artists`, and the
+        // readouts that group over that table (Top Charts, the ranged stats,
+        // `artist_rank`) are clean at the source rather than each remembering
+        // to filter.
+        //
+        // The consequence is deliberate: a compilation listen carrying no real
+        // credit belongs to **no artist at all**. That is the honest answer —
+        // nobody recorded who played it — and it costs nothing, because every
+        // count is made of the listen's own row rather than of its credits.
+        if n.is_empty() || is_various_artists(n) {
             return;
         }
         let key = Database::artist_key(n);
@@ -3152,6 +3163,29 @@ impl Database {
             .await;
         }
 
+        // The placeholder used to be credited like a performer, so an existing
+        // history holds `scrobble_artists` rows for it — and those are what put
+        // "Various Artists" third on Top Charts. `credited_artists` no longer
+        // writes them; this clears the ones already there.
+        //
+        // Read first, delete only if there is something to delete: this runs on
+        // every start, and an unconditional DELETE would take the write lock
+        // each time to do nothing. The read is a seek on
+        // `idx_scrobble_artists_key`.
+        let stale: Option<(i64,)> = sqlx::query_as(&format!(
+            "SELECT 1 FROM scrobble_artists WHERE artist_key {IS_VARIOUS} LIMIT 1"
+        ))
+        .fetch_optional(&self.pool)
+        .await
+        .unwrap_or(None);
+        if stale.is_some() {
+            info!("⚙️ Migrating: dropping 'Various Artists' credits — it is a filing convention, not a performer...");
+            let _ =
+                sqlx::query(&format!("DELETE FROM scrobble_artists WHERE artist_key {IS_VARIOUS}"))
+                    .execute(&self.pool)
+                    .await;
+        }
+
         if !has_column(&self.pool, "signal_chains", "shared").await {
             info!("⚙️ Migrating: adding signal_chains.shared...");
             let _ = sqlx::query(
@@ -4591,11 +4625,12 @@ impl Database {
             return Ok((Vec::new(), Vec::new(), Vec::new()));
         }
 
-        let artists: Vec<(String, i64)> = sqlx::query_as(
+        let artists: Vec<(String, i64)> = sqlx::query_as(&format!(
             "SELECT artist, COUNT(*) AS plays FROM scrobbles
              WHERE user_id = ? AND skipped = FALSE AND LOWER(artist) LIKE '%' || ? || '%'
-             GROUP BY LOWER(artist) ORDER BY plays DESC LIMIT ?",
-        )
+               AND LOWER(TRIM(artist)) {NOT_VARIOUS}
+             GROUP BY LOWER(artist) ORDER BY plays DESC LIMIT ?"
+        ))
         .bind(user_id)
         .bind(&needle)
         .bind(limit)
@@ -6862,11 +6897,12 @@ impl Database {
         } else {
             0
         };
-        let top_artist: Option<(String, i64)> = sqlx::query_as(
+        let top_artist: Option<(String, i64)> = sqlx::query_as(&format!(
             "SELECT artist, COUNT(*) as cnt FROM scrobbles
               WHERE user_id = ? AND skipped = FALSE AND timestamp >= ?
-              GROUP BY artist ORDER BY cnt DESC LIMIT 1",
-        )
+                AND LOWER(TRIM(artist)) {NOT_VARIOUS}
+              GROUP BY artist ORDER BY cnt DESC LIMIT 1"
+        ))
         .bind(user_id)
         .bind(now - 30 * 86400)
         .fetch_optional(&self.pool)
@@ -8836,16 +8872,17 @@ impl Database {
         user_id: i64,
         limit: i64,
     ) -> Result<Vec<String>, sqlx::Error> {
-        let rows: Vec<(String,)> = sqlx::query_as(
+        let rows: Vec<(String,)> = sqlx::query_as(&format!(
             "SELECT s.artist FROM scrobbles s
               LEFT JOIN artists a ON a.name_key = LOWER(TRIM(s.artist))
               WHERE s.user_id = ? AND s.skipped = FALSE
                 AND TRIM(s.artist) != ''
+                AND LOWER(TRIM(s.artist)) {NOT_VARIOUS}
                 AND (a.image_url IS NULL)
               GROUP BY LOWER(TRIM(s.artist))
               ORDER BY COUNT(*) DESC
-              LIMIT ?",
-        )
+              LIMIT ?"
+        ))
         .bind(user_id)
         .bind(limit)
         .fetch_all(&self.pool)
@@ -14209,11 +14246,12 @@ impl Database {
     /// connection pool and took the instance down. See the incident note in
     /// CLAUDE.md.
     async fn my_artist_plays(&self, user_id: i64) -> Result<HashMap<String, i64>, sqlx::Error> {
-        let rows: Vec<(String, i64)> = sqlx::query_as(
+        let rows: Vec<(String, i64)> = sqlx::query_as(&format!(
             "SELECT LOWER(TRIM(artist)), COUNT(*) FROM scrobbles
               WHERE user_id = ? AND skipped = FALSE
-              GROUP BY LOWER(TRIM(artist))",
-        )
+                AND LOWER(TRIM(artist)) {NOT_VARIOUS}
+              GROUP BY LOWER(TRIM(artist))"
+        ))
         .bind(user_id)
         .fetch_all(&self.pool)
         .await?;
@@ -14248,6 +14286,7 @@ impl Database {
                     MIN(s.timestamp) AS first_played, 0 AS mine, \
                     NULL AS genre \
                {} AND (?2 IS NULL OR s.timestamp >= ?2) \
+                AND LOWER(TRIM(s.artist)) {NOT_VARIOUS} \
             GROUP BY LOWER(TRIM(s.artist)) \
             ORDER BY plays DESC LIMIT ?3",
             Self::PATCH_VISIBLE_LISTENS
@@ -14337,15 +14376,16 @@ impl Database {
         // on `LOWER(TRIM(artist))`: that join key is a function of a column, so
         // no index can serve it and it becomes a full scan of the viewer's
         // history *per artist of theirs*. See `my_artist_plays`.
-        let theirs: Vec<(String, String)> = sqlx::query_as(
+        let theirs: Vec<(String, String)> = sqlx::query_as(&format!(
             "SELECT s.artist, LOWER(TRIM(s.artist)) FROM scrobbles s
                JOIN users u ON u.id = s.user_id
                LEFT JOIN signal_chains c ON c.id = s.chain_id
               WHERE s.user_id = ? AND s.skipped = FALSE
                 AND (u.share_all_with_patched = 1 OR c.shared = 1)
+                AND LOWER(TRIM(s.artist)) {NOT_VARIOUS}
               GROUP BY LOWER(TRIM(s.artist))
-              ORDER BY COUNT(*) DESC",
-        )
+              ORDER BY COUNT(*) DESC"
+        ))
         .bind(id)
         .fetch_all(&self.pool)
         .await?;
@@ -14502,6 +14542,7 @@ impl Database {
                     MAX(s.timestamp) AS last_played, \
                     MIN(s.timestamp) AS first_played, 0 AS mine, NULL AS genre \
                {SHARED} AND s.timestamp >= ? \
+                AND LOWER(TRIM(s.artist)) {NOT_VARIOUS} \
             GROUP BY LOWER(TRIM(s.artist)) ORDER BY plays DESC LIMIT 8"
         ))
         .bind(since)
@@ -16637,6 +16678,32 @@ fn new_uuid() -> String {
 pub const VARIOUS_ARTISTS_KEYS: &[&str] =
     &["various artists", "various artist", "various", "va", "verschiedene interpreten"];
 
+/// The `WHERE` fragment that keeps the placeholder out of an artist-shaped
+/// readout.
+///
+/// Appended to a column already folded to the artist key
+/// (`sa.artist_key {NOT_VARIOUS}`) or to an expression folded the same way
+/// (`LOWER(TRIM(s.artist)) {NOT_VARIOUS}`). Inlining the keys as literals is
+/// safe because they are a compile-time constant with no quote in them, which
+/// `the_sql_guard_lists_exactly_the_names_the_rust_one_knows` pins along with
+/// the fact that it lists *all* of them.
+///
+/// **A guard on the rows, never on the totals.** Every one of these plays is
+/// real listening and still counts in the play total, the hours, the heatmap
+/// and its session. What it must not do is occupy a slot that means "an artist
+/// you listen to". Excluding it from a *count of listens* would be the
+/// paired-counts trap in reverse.
+pub const NOT_VARIOUS: &str =
+    "NOT IN ('various artists','various artist','various','va','verschiedene interpreten')";
+
+/// The same test the other way round, for the one place that wants the
+/// placeholder rows rather than everything else — the migration that clears
+/// them. Spelled out rather than written as `NOT (… {NOT_VARIOUS})`, because a
+/// double negative on a `DELETE` is the wrong place to be clever.
+/// `the_sql_guard_lists_exactly_the_names_the_rust_one_knows` pins both.
+pub const IS_VARIOUS: &str =
+    "IN ('various artists','various artist','various','va','verschiedene interpreten')";
+
 /// A "no single artist" placeholder, not an artist.
 ///
 /// Shared with the Plex source, which must not record a compilation's tracks
@@ -18255,6 +18322,165 @@ mod tests {
         let files = db.delete_physical(uid, id).await.unwrap().unwrap();
         assert_eq!(files, vec!["shelf/1/1/a.jpg".to_string(), "shelf/1/1/a.jpg".to_string()]);
         assert!(db.list_physical_images(uid, id).await.unwrap().is_empty());
+    }
+
+    /// The SQL guard and the Rust one cannot drift.
+    ///
+    /// Two copies of the same list is exactly how `fuzzy_exists` and
+    /// `is_various_artists` would come to disagree about which listens are
+    /// duplicates, so the fragments are checked against the constant they are
+    /// written from — including that they list *all* of it, which is what a
+    /// later addition to `VARIOUS_ARTISTS_KEYS` would otherwise silently miss.
+    #[tokio::test]
+    async fn the_sql_guard_lists_exactly_the_names_the_rust_one_knows() {
+        for frag in [NOT_VARIOUS, IS_VARIOUS] {
+            let inner = frag.split_once('(').unwrap().1.trim_end_matches(')');
+            let listed: Vec<&str> = inner.split(',').map(|k| k.trim().trim_matches('\'')).collect();
+            assert_eq!(listed, VARIOUS_ARTISTS_KEYS, "{frag} has drifted from the constant");
+        }
+        // Inlined as literals rather than bound, so a key carrying a quote
+        // would end the string and change the statement.
+        for k in VARIOUS_ARTISTS_KEYS {
+            assert!(!k.contains('\''), "{k:?} cannot be inlined into SQL");
+            assert_eq!(*k, k.trim().to_lowercase(), "{k:?} must already be folded");
+        }
+    }
+
+    /// "Various Artists" is a filing convention, not a performer — so it
+    /// reaches no readout shaped like an artist, anywhere.
+    ///
+    /// Asserted on the **readouts** rather than on the SQL, because that is the
+    /// only form that catches a query written later. It was third on Top Charts
+    /// with 170 plays when this was reported, and it had been excluded from the
+    /// Reports superlative since v0.57.0 — one screen fixed at a time is how it
+    /// survived on the others.
+    ///
+    /// The second half is the half that keeps this honest: the plays are real
+    /// listening and **still count**. Dropping them from the totals would be
+    /// the paired-counts trap in reverse — a play total that silently omits
+    /// part of the history is worse than a chart row nobody wanted.
+    #[tokio::test]
+    async fn the_placeholder_reaches_no_artist_shaped_readout() {
+        let db = testdb().await;
+        // Two decks from the start, so the Patch readouts below have somebody
+        // to be about without a second "ash".
+        let (uid, them, chain) = patched_pair(&db).await;
+        let now = Database::now_secs();
+
+        // Enough compilation plays to win every artist ranking outright, and
+        // one real artist to prove the readouts are not simply empty.
+        for i in 0..12 {
+            let mut p = play(&format!("Comp {i}"), "Various Artists", (now - 100 - i * 60) as u64);
+            p.duration = Some(200);
+            p.source_id = format!("va-{i}");
+            db.save_scrobble(
+                uid,
+                &p,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                ListenDisposition::LIVE,
+            )
+            .await
+            .unwrap();
+        }
+        for i in 0..3 {
+            let mut p = play(&format!("Song {i}"), "Burial", (now - 2000 - i * 60) as u64);
+            p.duration = Some(200);
+            p.source_id = format!("real-{i}");
+            db.save_scrobble(
+                uid,
+                &p,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                ListenDisposition::LIVE,
+            )
+            .await
+            .unwrap();
+        }
+
+        let names =
+            |rows: Vec<ChartRow>| -> Vec<String> { rows.into_iter().map(|r| r.name).collect() };
+        let va = |v: &[String]| v.iter().any(|n| is_various_artists(n));
+
+        // ── Top Charts ──
+        let chart = names(db.chart(uid, "artists", None, 50, false).await.unwrap());
+        assert!(!va(&chart), "Top Charts: {chart:?}");
+        assert!(chart.iter().any(|n| n == "Burial"), "a real artist still charts");
+
+        // ── Statistics ──
+        let ranged = db.get_ranged_stats(uid, None, false).await.unwrap();
+        let top: Vec<String> = ranged["top_artists"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|a| a["name"].as_str().map(str::to_string))
+            .collect();
+        assert!(!va(&top), "Statistics: {top:?}");
+        assert!(top.iter().any(|n| n == "Burial"), "a real artist still ranks");
+
+        // ── Dashboard ──
+        let dash = db.get_dashboard_stats(uid, chrono_tz::UTC, 1).await.unwrap();
+        let dash_top = dash["top_artist"].as_str().map(str::to_string);
+        assert!(!dash_top.as_deref().is_some_and(is_various_artists), "Dashboard: {dash_top:?}");
+
+        // ── Search ──
+        let (found, _, _) = db.search_library(uid, "various", 20).await.unwrap();
+        let found: Vec<String> = found.into_iter().map(|a| a.0).collect();
+        assert!(!va(&found), "Search: {found:?}");
+
+        // ── The portrait backfill, which would spend a lookup on it ──
+        let wanted = db.artists_without_images(uid, 20).await.unwrap();
+        assert!(!va(&wanted), "portrait queue: {wanted:?}");
+
+        // ── And the plays are still every bit as real ──
+        assert_eq!(db.listen_count_and_latest(uid).await.unwrap().0, 15, "every play counts");
+        assert_eq!(dash["total"], 15, "the dashboard total is the whole history");
+
+        // ── Patch: another deck's artists, and who you both play ──
+        //
+        // Same fragment as the four above, but asserted separately because
+        // "one screen fixed at a time" is exactly how the placeholder survived
+        // on Top Charts after the Reports superlative had already dropped it.
+        let me = uid;
+        for i in 0..6 {
+            listen(
+                &db,
+                them,
+                Some(chain),
+                &format!("Comp {i}"),
+                "Various Artists",
+                1_760_000_100 + i,
+            )
+            .await;
+        }
+        listen(&db, them, Some(chain), "Archangel", "Burial", 1_760_000_300).await;
+        // The viewer plays the placeholder too, so an overlap query with no
+        // guard would report it as something they have in common.
+        listen(&db, me, Some(chain), "Mine", "Various Artists", 1_760_000_400).await;
+        listen(&db, me, Some(chain), "Shell", "Burial", 1_760_000_500).await;
+
+        let tab: Vec<String> =
+            db.patch_artists(me, 50, None).await.unwrap().into_iter().map(|a| a.name).collect();
+        assert!(!va(&tab), "Patch artists: {tab:?}");
+        assert!(tab.iter().any(|n| n == "Burial"), "a real artist still appears");
+
+        let deck = db.deck_view(me, "kim").await.unwrap().expect("deck");
+        assert!(!va(&deck.both_play), "you both play: {:?}", deck.both_play);
+        assert!(deck.both_play.iter().any(|n| n == "Burial"), "a real overlap survives");
+
+        let pulse = db.instance_pulse(0).await.unwrap();
+        let heard: Vec<String> = pulse.artists.into_iter().map(|a| a.name).collect();
+        assert!(!va(&heard), "instance pulse: {heard:?}");
     }
 
     /// is the only way a future query gets caught too.

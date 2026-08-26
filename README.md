@@ -573,6 +573,24 @@ Needs the genre map fetched (Settings → Genre Map — one request) and the gen
 backfill to have run. Finished playlists export as M3U, JSON or plain text, or
 go straight to your Plex, Jellyfin or Navidrome with **Send to…**.
 
+### "Various Artists" is not an artist
+
+It is a filing convention meaning *look at the track* — unresolved metadata —
+so it never appears as an artist anywhere: not on Top Charts, not in Statistics,
+not on the dashboard, not in search, not in a report, not on a Patch screen.
+Where a compilation names the real performer in its credits, that person is
+counted instead; where it names nobody, the listen simply belongs to no artist,
+which is the honest answer.
+
+**The plays still count.** They are in your play total, your hours, the heatmap
+and their session, exactly as they were — a history of 50 plays that is mostly
+compilations reads *50 plays, 1 artist*, and both numbers are true. Dropping the
+listens instead would make the totals quietly wrong, which is worse than a chart
+row nobody wanted.
+
+The one place it is deliberately still visible is the **metadata sanitiser**,
+whose job is folding real performers away from it.
+
 ### Musical Personality
 
 The Statistics screen profiles *how* you listen across five explainable axes —
