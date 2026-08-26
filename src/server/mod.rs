@@ -27,6 +27,7 @@ mod preferences;
 pub mod public_np;
 pub mod ratelimit;
 pub mod rediscovery;
+pub mod report_image;
 pub mod reports;
 pub mod scrobbles;
 pub mod sessions;
@@ -134,6 +135,7 @@ pub fn build_app(state: Arc<AppState>) -> Router {
         .merge(pairing::create_pairing_router())
         .merge(patch::create_patch_router())
         .merge(reports::create_reports_router())
+        .merge(report_image::create_report_image_router())
         .merge(crate_shelf::create_crate_router())
         .merge(mcp::create_mcp_router())
         .merge(oauth::create_oauth_router())

@@ -1,0 +1,234 @@
+//! `GET /api/v1/reports/image` — a report chapter as a PNG.
+//!
+//! **Rendered here rather than in the browser**, which is the decision this
+//! endpoint exists to express: a share image is a deliverable, and an Android
+//! or iOS client should ask for one instead of reimplementing a layout, a type
+//! scale and a palette that would then be free to drift from the web's. See
+//! `crate::report_image` for the rendering itself.
+//!
+//! Two things it deliberately does not do. It **computes nothing**: the numbers
+//! come from `reports()`, called the way the MCP tools call handlers, so there
+//! is one implementation of the fold and a share cannot disagree with the
+//! chapter it was shared from. And it makes **no network call**, because the
+//! card draws no remote artwork — which is what keeps it free of the deadline
+//! every other outbound-from-a-handler path in this codebase has had to grow.
+
+use std::sync::Arc;
+
+use axum::extract::{Query, State};
+use axum::http::{header, StatusCode};
+use axum::response::IntoResponse;
+use axum::routing::get;
+use axum::{Json, Router};
+use serde::Deserialize;
+
+use crate::report_image::{self, Card, Size, Theme};
+use crate::server::auth::ReadAuth;
+use crate::server::models::ErrorResponse;
+use crate::server::AppState;
+
+/// The largest report page we will read back out of the handler.
+const MAX_REPORT_BYTES: usize = 8 * 1024 * 1024;
+
+fn err(code: u16, msg: &str) -> axum::response::Response {
+    let status = StatusCode::from_u16(code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    (status, Json(serde_json::json!(ErrorResponse { code, error: msg.into() }))).into_response()
+}
+
+#[derive(Deserialize)]
+pub struct ImageQuery {
+    /// Which bucket. Only `month` is drawn today — see `unsupported`.
+    pub unit: Option<String>,
+    /// How many periods back from the newest, matching the Reports stepper.
+    pub offset: Option<usize>,
+    /// `story` (default), `square` or `wide`.
+    pub size: Option<String>,
+    /// `dark` (default) or `light`. **Asked at export time, not inherited** — a
+    /// share lands on somebody else's feed rather than inside the app, so the
+    /// reader's own theme preference is not the question being answered.
+    pub theme: Option<String>,
+    /// `png` (default) or `svg`. The SVG is the same document the PNG is
+    /// rasterised from: smaller, sharp at any size, and something a native
+    /// client can draw itself. It is *not* a second renderer — if the two ever
+    /// disagreed it would be because one of them was not this one.
+    pub format: Option<String>,
+}
+
+/// The units this endpoint can draw.
+///
+/// A week and a year want different compositions rather than the month's at a
+/// different size — the reason Reports has three chapter components and not one
+/// — so asking for one is a **400 naming what is available** rather than a
+/// month card wearing a year's label, which is the answer that would be wrong
+/// while looking right.
+fn unsupported(unit: &str) -> bool {
+    !matches!(unit, "month")
+}
+
+pub async fn report_image(
+    State(state): State<Arc<AppState>>,
+    auth: ReadAuth,
+    Query(q): Query<ImageQuery>,
+) -> impl IntoResponse {
+    let unit = q.unit.clone().unwrap_or_else(|| "month".into());
+    if unsupported(&unit) {
+        return err(400, "Only a month can be drawn as an image so far — pass unit=month");
+    }
+    let Some(size) = Size::parse(q.size.as_deref()) else {
+        return err(400, "size must be story, square or wide");
+    };
+    let theme = Theme::parse(q.theme.as_deref());
+    let svg_only = matches!(q.format.as_deref(), Some("svg"));
+    if !matches!(q.format.as_deref(), None | Some("png") | Some("svg")) {
+        return err(400, "format must be png or svg");
+    }
+    let offset = q.offset.unwrap_or(0);
+
+    // One period, from the handler that owns the arithmetic. `limit=1` is not
+    // an optimisation — the fold walks the whole history whatever is asked for
+    // — it is so the page cannot be misread for the period.
+    let rq = crate::server::reports::ReportQuery {
+        unit: Some(unit.clone()),
+        offset: Some(offset),
+        limit: Some(1),
+    };
+    let resp = crate::server::reports::reports(State(state.clone()), auth, Query(rq))
+        .await
+        .into_response();
+    let status = resp.status();
+    let bytes = match axum::body::to_bytes(resp.into_body(), MAX_REPORT_BYTES).await {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::error!("Report body for the image could not be read: {e}");
+            return err(500, "Could not read your listening");
+        }
+    };
+    if !status.is_success() {
+        // The report's own message, rather than one invented here.
+        return (status, bytes).into_response();
+    }
+    let page: serde_json::Value = match serde_json::from_slice(&bytes) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::error!("Report body for the image did not parse: {e}");
+            return err(500, "Could not read your listening");
+        }
+    };
+
+    let Some(period) = page.get("periods").and_then(|p| p.get(0)) else {
+        // A real answer, not a failure: an offset past the end of a history, or
+        // an instance with nothing in it yet.
+        return err(404, "There is no report for that period yet");
+    };
+    let card = Card::from_period(period);
+
+    // **Off the async worker.** A 1080×1920 pixmap is ~8 MB of RGBA and
+    // rasterising it in the handler pins a tokio worker — one of four on a Pi —
+    // which is the mistake the report fold itself had to be moved off.
+    let rendered =
+        match tokio::task::spawn_blocking(move || report_image::render(&card, size, theme)).await {
+            Ok(Ok(r)) => r,
+            Ok(Err(e)) => {
+                tracing::error!("Report image could not be drawn: {e}");
+                return err(500, "Could not draw the image");
+            }
+            Err(e) => {
+                tracing::error!("Report image render panicked: {e}");
+                return err(500, "Could not draw the image");
+            }
+        };
+
+    let stem = format!(
+        "tapedeck-{}-{}-{}",
+        slug(period.get("key").and_then(serde_json::Value::as_str).unwrap_or(&unit)),
+        size.as_str(),
+        theme.as_str()
+    );
+
+    // Whether the *embedded* faces could draw everything on the card. Not an
+    // error and not a reason to withhold the image: the host's own fonts sit
+    // behind ours and may well cover it. It is here so a client can say "this
+    // may not render your Korean titles" instead of the user finding out from
+    // the picture — the discipline a source declaring its blind spots follows.
+    let coverage = if rendered.fully_covered { "full" } else { "partial" };
+
+    let (body, mime, ext) = if svg_only {
+        (rendered.svg.into_bytes(), "image/svg+xml; charset=utf-8", "svg")
+    } else {
+        (rendered.png, "image/png", "png")
+    };
+
+    (
+        StatusCode::OK,
+        [
+            (header::CONTENT_TYPE, mime.to_string()),
+            // The image is one person's listening. `private` keeps it out of
+            // any shared cache the way the artwork proxy's responses are.
+            (header::CACHE_CONTROL, "private, max-age=300".to_string()),
+            (header::CONTENT_DISPOSITION, format!("inline; filename=\"{stem}.{ext}\"")),
+            (header::HeaderName::from_static("x-tapedeck-glyph-coverage"), coverage.to_string()),
+        ],
+        body,
+    )
+        .into_response()
+}
+
+/// A period key reduced to something safe in a filename.
+///
+/// The key reaches a `Content-Disposition` header, so anything that is not a
+/// letter, a digit or a dash is dropped rather than escaped — a quote or a
+/// newline in there is header injection, and there is nothing in a period key
+/// worth keeping that this removes.
+fn slug(s: &str) -> String {
+    let out: String = s
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect::<String>()
+        .trim_matches('-')
+        .to_string();
+    if out.is_empty() {
+        "report".into()
+    } else {
+        out.chars().take(40).collect()
+    }
+}
+
+pub fn create_report_image_router() -> Router<Arc<AppState>> {
+    Router::new().route("/api/v1/reports/image", get(report_image))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A week and a year are refused rather than drawn as a month.
+    ///
+    /// The three chapters are three compositions in the app for a reason — a
+    /// week has no clock and no genre split — so drawing a month's card and
+    /// labelling it "Week 34" would be an answer that is wrong while looking
+    /// entirely right.
+    #[test]
+    fn only_the_shape_that_has_been_drawn_is_offered() {
+        assert!(!unsupported("month"));
+        for u in ["week", "year", "decade", ""] {
+            assert!(unsupported(u), "{u} has no composition yet");
+        }
+    }
+
+    /// The period key lands in a response header, so it is reduced rather than
+    /// escaped.
+    #[test]
+    fn a_period_key_cannot_carry_anything_into_a_header() {
+        assert_eq!(slug("2026-08"), "2026-08");
+        assert_eq!(slug("2026-W34"), "2026-W34");
+        for bad in ["\"; x=\"", "a\r\nSet-Cookie: b", "../../etc/passwd"] {
+            let out = slug(bad);
+            assert!(
+                out.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'),
+                "{bad:?} reduced to {out:?}"
+            );
+        }
+        assert_eq!(slug("---"), "report");
+        assert!(slug(&"x".repeat(200)).len() <= 40);
+    }
+}

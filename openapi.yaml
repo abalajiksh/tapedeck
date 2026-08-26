@@ -26,7 +26,7 @@ openapi: 3.1.0
 
 info:
   title: Tapedeck
-  version: 0.95.1
+  version: 0.96.0
   summary: Self-hosted scrobbler and listening journal.
   description: |
     Tapedeck ingests listens, enriches them with MusicBrainz metadata, stores
@@ -3855,6 +3855,93 @@ paths:
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
 
+  /api/v1/reports/image:
+    get:
+      tags: [Statistics]
+      summary: A report chapter as a shareable PNG, rendered on the server.
+      description: |
+        Scope: `read` *(since v0.96)*.
+
+        **Rendered on the server on purpose.** A share image is a deliverable
+        rather than a view: a native client asks for one instead of
+        reimplementing a layout, a type scale and a palette that would then be
+        free to drift from the web's. The fonts are embedded in the binary and
+        no artwork is fetched, so the same period produces the same bytes on any
+        host.
+
+        It **computes nothing**. Every figure comes from `GET /api/v1/reports`
+        with the same `unit` and `offset`, so a share cannot disagree with the
+        chapter it was shared from — including the rule that the only
+        comparison on the card is against the caller's *own* periods.
+
+        The card is a **composition, not a screenshot of the chapter**: a
+        headline, the top artist and record, the counts, and then whatever of
+        the genres, the repeats and the crush fits the shape. A section that
+        would not fit is left out whole rather than clipped, so a thin month
+        draws fewer sections rather than empty headings.
+
+        Only `unit=month` is drawn so far. A week and a year are separate
+        compositions in the app — a week has no clock and no genre split — so
+        asking for one is a 400 rather than a month card wearing a year's label.
+      security: [{ sessionCookie: [] }, { apiToken: [read] }]
+      parameters:
+        - name: unit
+          in: query
+          schema: { type: string, enum: [month], default: month }
+          description: Only `month` has a composition yet; anything else is a 400.
+        - name: offset
+          in: query
+          schema: { type: integer, minimum: 0, default: 0 }
+          description: Periods back from the newest, matching the Reports stepper.
+        - name: size
+          in: query
+          schema: { type: string, enum: [story, square, wide], default: story }
+          description: |
+            `story` 1080×1920, `square` 1080×1080, `wide` 1600×900. Not one
+            layout scaled — a square holds about half of what a story does.
+        - name: theme
+          in: query
+          schema: { type: string, enum: [dark, light], default: dark }
+          description: |
+            **Asked at export time rather than inherited.** A share lands on
+            somebody else's feed rather than inside the app, so the caller's own
+            theme preference is not the question being answered. An unrecognised
+            value is `dark`, not an error — this is presentation, and refusing to
+            render over a misspelling is worse than rendering the default.
+        - name: format
+          in: query
+          schema: { type: string, enum: [png, svg], default: png }
+          description: |
+            `svg` returns the same document the PNG is rasterised from — smaller,
+            sharp at any size, and something a native client can draw itself. It
+            is not a second renderer.
+      responses:
+        '200':
+          description: |
+            The image. `Cache-Control` is `private`: it is one person's
+            listening, and a shared cache must not hold it.
+          headers:
+            X-Tapedeck-Glyph-Coverage:
+              schema: { type: string, enum: [full, partial] }
+              description: |
+                `partial` means a string on the card contains a character the
+                **embedded** faces cannot draw — Hangul, CJK, Cyrillic. Not a
+                failure and not a reason to withhold the image: the host's own
+                fonts sit behind ours and may cover it. It is here so a client
+                can warn rather than let the user find out from the picture.
+          content:
+            image/png:
+              schema: { type: string, format: binary }
+            image/svg+xml:
+              schema: { type: string }
+        '400':
+          description: An unsupported unit, size or format.
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+        '404':
+          description: |
+            No report for that period — an offset past the end of the history,
+            or an instance with nothing in it yet. A real answer, not a failure.
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
   /api/v1/personality:
     get:
       tags: [Statistics]

@@ -935,7 +935,9 @@ fn sub_labels(unit: Unit) -> Vec<String> {
     }
 }
 
-fn thousands(n: i64) -> String {
+/// `4182` → `4,182`. Shared with the share image, so a card cannot group a
+/// number differently from the chapter it was rendered from.
+pub fn thousands(n: i64) -> String {
     let s = n.to_string();
     let mut out = String::new();
     for (i, c) in s.chars().enumerate() {

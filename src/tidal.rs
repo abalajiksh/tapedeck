@@ -517,7 +517,13 @@ fn rate_limit_headers(headers: &reqwest::header::HeaderMap) -> Vec<(String, Stri
 /// cosmetic: a failure would be read as "the playlist is gone", and the caller
 /// would helpfully make a second one.
 fn was_status(err: &str, code: u16) -> bool {
-    err.starts_with(&format!("TIDAL returned {code}"))
+    // The digit boundary matters: a bare `starts_with` reads "TIDAL returned
+    // 4040" as a 404. `read_json` formats the status through `Display`, which
+    // is "404 Not Found" for a known code and a bare "499" for one it does not
+    // recognise — so the prefix is followed by a space, a colon, or nothing,
+    // and never by another digit.
+    let Some(rest) = err.strip_prefix(&format!("TIDAL returned {code}")) else { return false };
+    !rest.starts_with(|c: char| c.is_ascii_digit())
 }
 
 async fn read_json(resp: reqwest::Response) -> Result<serde_json::Value, String> {
@@ -937,8 +943,15 @@ mod tests {
             !was_status("TIDAL request failed: error sending request", 404),
             "a request that never arrived says nothing about the playlist"
         );
-        // And it does not match a longer status by prefix.
-        assert!(!was_status("TIDAL returned 4040 Nonsense: x", 404) || true);
+        // And it does not match a longer status by prefix. This assertion
+        // shipped as `|| true`, which made it always pass over a match that was
+        // genuinely wrong — a guard that cannot fail is a decoration.
+        assert!(
+            !was_status("TIDAL returned 4040 Nonsense: x", 404),
+            "a four-digit status must not be read as a 404"
+        );
+        // A status with no reason phrase is still matched.
+        assert!(was_status("TIDAL returned 404: gone", 404));
     }
 
     /// An empty or unexpected relationship document yields no removals rather

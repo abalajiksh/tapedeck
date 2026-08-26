@@ -16,6 +16,7 @@ mod openapi;
 mod patch;
 mod playlist_lab;
 mod playlists;
+mod report_image;
 mod rockbox;
 mod server;
 mod sinks;

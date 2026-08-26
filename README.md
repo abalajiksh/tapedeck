@@ -458,6 +458,22 @@ people's listening, and on a household instance it quietly reports how much
 everyone else plays. Where the design put a percentile, Tapedeck ranks the
 period against *your own*: "your 2nd busiest month of 8".
 
+**A month can be shared as an image**, and it is drawn on the server — story,
+square or wide, in whichever look you pick at export time. That is a deliberate
+choice rather than an implementation detail: the fonts are embedded in the
+binary and nothing is fetched, so the same month produces the same picture from
+any client, and a phone app asks `GET /api/v1/reports/image` instead of
+reimplementing a layout that would drift from this one. The card is its own
+composition rather than a screenshot of the chapter, it uses the period's own
+blended colour, and a section with nothing to say is left out rather than drawn
+empty.
+
+Tapedeck ships Latin faces (Figtree and Caprasimo, ~104 KB, OFL). If your
+listening has Hangul, CJK or Cyrillic in it, the render falls back to whatever
+fonts the *server* has installed and says so in a response header — so a card
+with a Korean title will look right on a machine with `fonts-noto-cjk` and come
+out as boxes on one without it.
+
 ### Rediscovery
 
 Smart collections built entirely from your own history. Nothing here recommends

@@ -21,6 +21,7 @@
 	import MonthChapter from '$lib/components/reports/MonthChapter.svelte';
 	import YearChapter from '$lib/components/reports/YearChapter.svelte';
 	import PeriodNote from '$lib/components/reports/PeriodNote.svelte';
+	import ShareChapter from '$lib/components/reports/ShareChapter.svelte';
 
 	const UNITS: { k: 'week' | 'month' | 'year'; label: string }[] = [
 		{ k: 'week', label: 'Week' },
@@ -39,6 +40,10 @@
 	 *  by unit and offset; cleared when the unit changes since the buckets are
 	 *  a different shape. */
 	let cache = new Map<string, Reports>();
+
+	/** The export dialog. The image itself is drawn on the server — see
+	 *  `ShareChapter` — so nothing here lays anything out. */
+	let sharing = false;
 
 	$: total = data?.total_periods ?? 0;
 	$: canOlder = idx + 1 < total;
@@ -206,7 +211,7 @@
 					</svelte:fragment>
 				</WeekChapter>
 			{:else}
-				<MonthChapter p={period} onShare={null}>
+				<MonthChapter p={period} onShare={() => (sharing = true)}>
 					<svelte:fragment slot="blurb">{blurb(period)}</svelte:fragment>
 					<svelte:fragment slot="footer">
 						<div class="chapter-foot"><p class="foot-note">{footNote}</p></div>
@@ -222,6 +227,12 @@
 		{#key `${unit}:${period.key}`}
 			<PeriodNote {unit} periodKey={period.key} label={period.label} />
 		{/key}
+
+		<!-- Only the month offers the button — a week and a year are separate
+		     compositions on the server and are not drawn yet, and a control whose
+		     only job is to explain that it does nothing is one to leave out. The
+		     dialog still checks, since the unit can change while it is open. -->
+		<ShareChapter {unit} offset={idx} label={period.label} bind:open={sharing} />
 	{/if}
 
 	<ToTop />
