@@ -1762,7 +1762,9 @@
 							     while before anyone catalogues it, and burn-in hours are
 							     counted from the purchase. -->
 							<p style="margin:0 0 9px;font-size:12px;color:var(--td-muted-2);">
-								{gBought ? `Owned ${ownedFor(fromDateInput(gBought))}.` : 'Optional — leave blank if you are guessing.'}
+								{gBought && ownedFor(fromDateInput(gBought))
+									? `Owned for ${ownedFor(fromDateInput(gBought))}.`
+									: 'Optional — leave blank if you are guessing.'}
 							</p>
 						</div>
 					</div>

@@ -778,19 +778,66 @@
 	$: sides = [...new Set(openTracks.map((t) => t.side))].sort();
 
 	/** Which disc each side belongs to, where the pressing recorded it. */
+	/**
+	 *  "Yours for 3 days — bought 22 Aug 2026", built as one string.
+	 *
+	 *  Assembled here rather than out of `{#if}` fragments in the markup: Svelte
+	 *  trims the whitespace at the end of a text node before a block closes, so
+	 *  the version that read `… — {/if}bought` rendered "—bought". Cheap to miss
+	 *  and only visible on the page.
+	 *
+	 *  The "yours for" half is dropped whole when there is no duration to state
+	 *  — a purchase date in the future, which is a typo — rather than printing
+	 *  the preposition with nothing after it. The date itself still shows, so
+	 *  the mistake stays visible.
+	 */
+	$: ownedLine = (() => {
+		if (!open?.purchased_at) return '';
+		const held = ownedFor(open.purchased_at);
+		const bought = `bought ${formatDateTime(open.purchased_at).split(',')[0]}`;
+		return held ? `Yours for ${held} — ${bought}` : bought;
+	})();
+
+	/**
+	 *  Which record a lettered side is on, when nobody recorded it.
+	 *
+	 *  A/B is record one, C/D record two, E/F record three — that is what a side
+	 *  letter *means*, and it is the same fact as "which sleeve do I pick up".
+	 *  Deriving it rather than depending on a provider having written it down is
+	 *  what makes a Discogs-sourced set group: MusicBrainz names the medium each
+	 *  track came off, Discogs' tracklist does not, so a double LP looked up by
+	 *  barcode — which is the path Discogs wins — arrived with four correct side
+	 *  letters and no idea they were two records.
+	 *
+	 *  Anything that is not a single letter returns null and simply does not
+	 *  group: a re-filed record whose sides became `1`…`4` knows nothing about
+	 *  discs, and saying so is better than guessing.
+	 */
+	function discFromSide(side: string): number | null {
+		const s = side.trim().toUpperCase();
+		if (!/^[A-Z]$/.test(s)) return null;
+		return Math.floor((s.charCodeAt(0) - 65) / 2) + 1;
+	}
+
+	/**
+	 *  A recorded disc wins over the derived one. MusicBrainz knows the real
+	 *  media structure, and a set whose sides do not run two-to-a-record — a
+	 *  bonus 7", an etched side — is exactly the case the letter rule gets
+	 *  wrong and the provider gets right.
+	 */
 	$: discOfSide = new Map<string, number | null>(
-		sides.map((sd) => [sd, openTracks.find((t) => t.side === sd)?.disc ?? null])
+		sides.map((sd) => [sd, openTracks.find((t) => t.side === sd)?.disc ?? discFromSide(sd)])
 	);
 
 	/**
 	 *  Whether to head the sides with which record they are on.
 	 *
 	 *  Two refusals, and both are the honest answer rather than tidiness. A
-	 *  pressing catalogued before Tapedeck kept the disc has `null` on every
-	 *  track, and a partially-known set would have the heading assert something
-	 *  for some sides and not others — so it groups only when *every* side knows.
-	 *  And a single record needs no heading: "Disc 1" over one LP is a label
-	 *  with nothing to distinguish it from.
+	 *  partially-known set would have the heading assert something for some
+	 *  sides and not others — so it groups only when *every* side knows, whether
+	 *  that is because the provider said so or because the side is a letter. And
+	 *  a single record needs no heading: "Record 1" over one LP is a label with
+	 *  nothing to distinguish it from.
 	 */
 	$: groupByDisc =
 		!!open &&
@@ -1858,9 +1905,9 @@
 								Last played {formatDateTime(open.last_played)}
 							</p>
 						{/if}
-						{#if open.purchased_at}
+						{#if ownedLine}
 							<p style="margin:2px 0 0;color:var(--td-muted-2);font-size:12.5px;">
-								Yours for {ownedFor(open.purchased_at)} — bought {formatDateTime(open.purchased_at).split(',')[0]}
+								{ownedLine}
 							</p>
 						{/if}
 					</div>

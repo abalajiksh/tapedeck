@@ -66,11 +66,26 @@ export function fromDateInput(value: string): number | null {
  * something — "3 years" rather than "3 years, 2 months, 11 days", which is
  * precision nobody asked for about a date most people are estimating anyway.
  */
+/**
+ * How long something has been owned, as a phrase that reads after "for".
+ *
+ * It used to answer `'new'` for the first day and `'not yet'` for a date in the
+ * future — a *state* where every caller wanted a *duration*, so a record bought
+ * this morning read "Yours for new" and a mistyped date read "Yours for not
+ * yet". Nothing errored; the sentence was just nonsense on exactly the day
+ * somebody adds a record.
+ *
+ * An unknown or future date returns `''`, and the callers drop the clause
+ * rather than printing half of it. The purchase date itself is shown beside
+ * this everywhere it appears, so a date in the future is still visible.
+ */
 export function ownedFor(purchasedAt: number | null | undefined): string {
 	if (purchasedAt == null) return '';
 	const days = Math.floor((Date.now() / 1000 - purchasedAt) / 86400);
-	if (days < 0) return 'not yet';
-	if (days < 31) return days <= 1 ? 'new' : `${days} days`;
+	if (days < 0) return '';
+	if (days === 0) return 'less than a day';
+	if (days === 1) return 'a day';
+	if (days < 31) return `${days} days`;
 	const months = Math.floor(days / 30.44);
 	if (months < 24) return `${months} month${months === 1 ? '' : 's'}`;
 	const years = Math.floor(days / 365.25);
