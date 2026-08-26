@@ -340,6 +340,25 @@ export interface ReportPeriod {
 		of_plays: number;
 		people: { name: string; plays: number }[];
 	};
+	/** The period's shape, as five numbers between 0 and 1, against the same
+	 *  five for the reader's own usual.
+	 *
+	 *  **Every axis is answerable from a time, an artist, a title and an album**
+	 *  — deliberately, because the tempting axes (signal chain, format,
+	 *  attention) are unknown for most of a real history, so a shape drawn from
+	 *  them would picture how the listening was *recorded* while looking like a
+	 *  picture of the listening. Those live in `gear`, where a panel can state
+	 *  its own coverage; a radar cannot legibly carry five denominators.
+	 *
+	 *  `usual` is the mean of the reader's own periods — never a comparison
+	 *  against other people. `usual_periods` says how many it rests on, so a
+	 *  baseline of one is not drawn as though it were a habit. */
+	fingerprint: {
+		axes: string[];
+		you: number[];
+		usual: number[];
+		usual_periods: number;
+	};
 	milestones: string[];
 	prev: {
 		label: string; plays: number; hours: number; avg_daily: number;

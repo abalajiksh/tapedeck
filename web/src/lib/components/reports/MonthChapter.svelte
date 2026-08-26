@@ -6,6 +6,7 @@
 	import { openAlbum, openArtist } from '$lib/entities';
 	import PeriodBars from '$lib/components/charts/PeriodBars.svelte';
 	import ListeningClock from '$lib/components/charts/ListeningClock.svelte';
+	import Fingerprint from '$lib/components/charts/Fingerprint.svelte';
 	import ChapterHead from './ChapterHead.svelte';
 	import TrendTrio from './TrendTrio.svelte';
 	import ArtistHero from './ArtistHero.svelte';
@@ -15,6 +16,15 @@
 
 	export let p: ReportPeriod;
 	export let onShare: (() => void) | null = null;
+
+	/** One line each, because a radar with unexplained axes is decoration. */
+	const AXIS_COPY: Record<string, string> = {
+		Variety: 'how many different artists, rather than a few on rotation',
+		Repeat: 'how much of it was hearing something again',
+		Discovery: 'how many of the artists you had never played before',
+		Spread: 'how evenly it fell across the hours of the day',
+		Runs: 'how much was three or more in a row from one record'
+	};
 
 	$: counts = [
 		{ n: p.artists, unit: 'artists', before: p.prev?.artists },
@@ -178,6 +188,37 @@
 		</div>
 	{/if}
 
+	<!-- The shape of the month, against the shape of your months. Beside the
+	     clock because both answer "what was this period *like*" rather than
+	     "what was in it" — and the comparison is to your own history, never to
+	     other people. -->
+	<h3 class="sec h-display">The shape of it</h3>
+	<div class="two-up">
+		<div class="tile">
+			<Fingerprint
+				axes={p.fingerprint.axes}
+				you={p.fingerprint.you}
+				usual={p.fingerprint.usual}
+				usualPeriods={p.fingerprint.usual_periods}
+			/>
+		</div>
+		<div class="tile">
+			<div class="k" style="margin-bottom:10px;">What the axes mean</div>
+			{#each p.fingerprint.axes as a, i}
+				<div class="axrow">
+					<span class="axn">{a}</span>
+					<span class="axd">{AXIS_COPY[a] ?? ''}</span>
+					<span class="axv">{Math.round(p.fingerprint.you[i] * 100)}</span>
+				</div>
+			{/each}
+			<p class="caveat">
+				Each is a share, out of 100, of what it could be — not a score. They come
+				from times, artists, titles and albums, so every listen counts towards
+				them whatever else it carries.
+			</p>
+		</div>
+	</div>
+
 	<!-- What you listened *through*. Every other card on this page is about
 	     what played; this is the only one about how, which is the pillar the
 	     rest of the application is built on. -->
@@ -325,6 +366,22 @@
 		background: linear-gradient(90deg, var(--td-accent-2), var(--td-accent));
 	}
 	.gval { font-variant-numeric: tabular-nums; color: var(--td-muted-2); }
+	.axrow {
+		display: grid;
+		grid-template-columns: 78px minmax(0, 1fr) 32px;
+		gap: 8px;
+		align-items: baseline;
+		font-size: 12.5px;
+		margin-bottom: 8px;
+	}
+	.axn { font-weight: 600; }
+	.axd { color: var(--td-muted-2); line-height: 1.45; }
+	.axv {
+		text-align: right;
+		font-variant-numeric: tabular-nums;
+		color: var(--td-accent);
+		font-weight: 700;
+	}
 	.who { display: flex; flex-wrap: wrap; gap: 7px; }
 	.wchip {
 		font-size: 12.5px;

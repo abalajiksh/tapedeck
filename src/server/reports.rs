@@ -201,6 +201,98 @@ fn sub_bucket_count(unit: Unit) -> usize {
     }
 }
 
+/// Below this a period is left out of the "usually" average.
+///
+/// The same reasoning the genre trajectory's own floor carries: a shape from a
+/// handful of listens is a fact about a handful of listens, and inside an
+/// average it reads as a habit. It does not stop such a period being *drawn* —
+/// only from distorting what it is drawn against.
+const MIN_PLAYS_FOR_SHAPE: i64 = 20;
+
+/// The five axes, in the order the radar draws them.
+pub const FINGERPRINT_AXES: [&str; 5] = ["Variety", "Repeat", "Discovery", "Spread", "Runs"];
+
+/// A period's shape, as five numbers between 0 and 1.
+///
+/// **Every axis is answerable from `timestamp`, `artist`, `title` and `album`
+/// alone**, and that is the whole of why these five and not others. The
+/// tempting axes are the Tapedeck-only ones — signal chain, format, attention —
+/// and each of those is *unknown* for most of a real history: a shape drawn
+/// from them would be a picture of how the listening was **recorded** wearing
+/// the clothes of a picture of the listening, which is the fidelity-card
+/// failure exactly. Those live in "Through what" instead, where a panel can
+/// state its own coverage; a radar cannot legibly carry five different
+/// denominators.
+///
+/// **Compared against the reader's own history, never against other people.**
+/// The Last.fm chart this borrows its form from plots you against a "global
+/// average"; the equivalent here needs other members' listening and quietly
+/// exposes how much they play — the rule Reports settled in v0.41.0 when it
+/// refused the cross-user percentile and used a rank against your own periods
+/// instead. So the second shape is *you, usually*.
+///
+/// Each axis is a ratio with no dial on it except [`RUN_LEN`], for the reason
+/// the breadth metric records: a number dominated by a parameter somebody
+/// invented is a confident-looking way of saying nothing.
+fn fingerprint(b: &Bucket) -> [f64; 5] {
+    let plays = b.plays.max(0) as f64;
+    if plays <= 0.0 {
+        return [0.0; 5];
+    }
+
+    // Variety — effective artists as a share of plays, via `exp(H)`. 1.0 is a
+    // different artist every time; low is a few on heavy rotation. The same
+    // measure the genre breadth uses, and parameter-free for the same reason.
+    let h: f64 = b
+        .artists
+        .values()
+        .map(|(n, _)| *n as f64 / plays)
+        .filter(|p| *p > 0.0)
+        .map(|p| -p * p.ln())
+        .sum();
+    let variety = (h.exp() / plays).clamp(0.0, 1.0);
+
+    // Repeat — how much of the period was hearing something again.
+    let repeat = (1.0 - (b.tracks.len() as f64 / plays)).clamp(0.0, 1.0);
+
+    // Discovery — of the artists played, how many were new *anywhere*, not
+    // merely new to this period. `new_artists` is keyed on the first sighting
+    // across the whole history, which is what makes it mean anything.
+    let discovery = if b.artists.is_empty() {
+        0.0
+    } else {
+        (b.new_artists.len() as f64 / b.artists.len() as f64).clamp(0.0, 1.0)
+    };
+
+    // Spread — how evenly the listening falls across the hours of the day,
+    // as a share of the most even it could be. Bucketed in the reader's own
+    // timezone upstream, so this is not quietly UTC.
+    let ch: f64 =
+        b.clock.iter().map(|n| *n as f64 / plays).filter(|p| *p > 0.0).map(|p| -p * p.ln()).sum();
+    // `.max(0.0)` as well as the clamp: a period entirely inside one hour has
+    // an entropy of `-1 * ln(1)`, which is **negative zero** — `clamp` keeps
+    // it and the axis then renders as "-0". Harmless arithmetically, and it
+    // reads as a bug, which for a number nobody can check by eye is the same
+    // thing as being one.
+    let spread = (ch / 24f64.ln()).clamp(0.0, 1.0).max(0.0);
+
+    // Runs — the share of plays inside a run of one album. The "did you put a
+    // record on, or did you shuffle" axis, and the one nothing else here says.
+    let runs = (b.run_plays as f64 / plays).clamp(0.0, 1.0);
+
+    [variety, repeat, discovery, spread, runs]
+}
+
+/// How many consecutive listens from one album make a *run*.
+///
+/// A stated parameter, and the only one in the fingerprint — the rest are
+/// ratios with no dial on them, for the reason the breadth metric records: a
+/// number dominated by a value somebody invented is a confident-looking way of
+/// saying nothing. Three is the smallest count that is not an accident: two in
+/// a row happens on shuffle often enough to mean little, and a side of vinyl or
+/// an album played through is many more than three.
+const RUN_LEN: i64 = 3;
+
 /// Everything accumulated for one period while scanning.
 #[derive(Default)]
 struct Bucket {
@@ -239,6 +331,12 @@ struct Bucket {
     company_plays: i64,
     company_seconds: i64,
     company_people: HashMap<String, i64>,
+    /// Plays that fall inside a run of [`RUN_LEN`] or more consecutive listens
+    /// from one album — the "did you put a record on, or shuffle" axis.
+    run_plays: i64,
+    /// Transient, for the ascending scan that computes the above.
+    run_album: Option<String>,
+    run_len: i64,
     /// (track key, local day) -> plays, for "on repeat".
     per_day: HashMap<(String, i32), (String, String, i64)>,
     /// Artists whose very first listen anywhere falls inside this period.
@@ -300,6 +398,54 @@ pub async fn reports(
         }
     };
     let Folded { buckets, mut order, milestones, display } = folded;
+
+    // "You, usually" — the shape every period is held against.
+    //
+    // **The mean of the period shapes, not one shape over the whole history**,
+    // and the difference is not cosmetic. `variety` is `exp(H) / plays`, which
+    // shrinks as plays grow: a whole-history figure would sit systematically
+    // below any single month's, so *every* card would report itself as more
+    // varied than usual. `discovery` is worse — over the whole history every
+    // artist is new exactly once, so it would be pinned at 1.0 and every period
+    // would look like a drought. Averaging the periods compares like with like.
+    //
+    // Periods with almost nothing in them are left out for the reason the genre
+    // trajectory omits them: a shape from four listens is a fact about four
+    // listens, and inside an average it reads as a habit.
+    // Two periods are left out of the average, each for its own reason.
+    //
+    // A **thin** one, because a shape from a handful of listens is a fact about
+    // a handful of listens and inside an average it reads as a habit — the
+    // floor the genre trajectory already carries.
+    //
+    // The **oldest** one, for the reason `crush` is omitted there: the history
+    // begins inside it, so every artist in it is new by construction and its
+    // `discovery` is pinned at 1.0. That is a fact about where the records
+    // start, not about the listener, and in the baseline it would make every
+    // later period read as a discovery drought — the same bias averaging the
+    // periods was chosen to avoid.
+    //
+    // `order` is still ascending here; it is reversed below.
+    let oldest = order.first().cloned();
+    let (usual, usual_periods): ([f64; 5], usize) = {
+        let shapes: Vec<[f64; 5]> = buckets
+            .iter()
+            .filter(|(k, b)| b.plays >= MIN_PLAYS_FOR_SHAPE && Some(*k) != oldest.as_ref())
+            .map(|(_, b)| fingerprint(b))
+            .collect();
+        let mut m = [0.0; 5];
+        for sh in &shapes {
+            for (i, v) in sh.iter().enumerate() {
+                m[i] += v;
+            }
+        }
+        if !shapes.is_empty() {
+            for v in m.iter_mut() {
+                *v /= shapes.len() as f64;
+            }
+        }
+        (m, shapes.len())
+    };
 
     // Newest first, and only as many as were asked for — plus one extra kept
     // aside so the oldest card still has a previous period to compare against.
@@ -642,6 +788,18 @@ pub async fn reports(
             "top_chain": top_chain,
             "gear": gear_json,
             "company": company_json,
+            // Five numbers between 0 and 1, and the same five for "you,
+            // usually" — every one answerable from any history, and none of
+            // them a comparison against another person. See `fingerprint`.
+            "fingerprint": {
+                "axes": FINGERPRINT_AXES,
+                "you": fingerprint(b),
+                "usual": usual,
+                // Whether the baseline rests on anything. One period is not a
+                // habit, and a radar that silently compared a month against
+                // itself would draw two identical shapes and mean nothing by it.
+                "usual_periods": usual_periods,
+            },
             "milestones": milestones.get(key).cloned().unwrap_or_default(),
             "prev": prev_json,
         }));
@@ -801,6 +959,107 @@ mod tests {
             chain_id: None,
             company: None,
         }
+    }
+
+    /// A period entirely inside one hour reports **zero** spread, not "-0".
+    ///
+    /// `-p * ln(p)` with `p == 1` is a negative zero, and `clamp` keeps it —
+    /// so the axis rendered as "-0" on the page. Harmless arithmetically and it
+    /// reads as a bug, which for a number nobody can check by eye is the same
+    /// thing as being one.
+    #[test]
+    fn a_single_hour_of_listening_is_no_spread_rather_than_minus_zero() {
+        let rows: Vec<_> =
+            (0..5).map(|i| row(1_700_000_000 + i * 60, "Burial", None, "Untrue")).collect();
+        let f = fold_periods(rows, Tz::UTC, Unit::Month);
+        let spread = fingerprint(&f.buckets[&f.order[0]])[3];
+        assert_eq!(spread, 0.0);
+        assert!(spread.is_sign_positive(), "a negative zero renders as \"-0\"");
+    }
+
+    /// A run is three in a row from one album, and the play that completes it
+    /// brings the earlier two with it.
+    ///
+    /// The axis exists to separate "put a record on" from "shuffled", so a run
+    /// that is counted from its third play onwards would under-report every
+    /// record ever played by exactly two listens.
+    #[test]
+    fn a_run_counts_the_plays_that_made_it_not_only_the_ones_after() {
+        let album = |ts: i64, a: &str| {
+            let mut r = row(ts, "Burial", None, a);
+            r.album = Some(a.into());
+            r
+        };
+        // Three from one record, then one from another.
+        let rows = vec![
+            album(1_700_000_000, "Untrue"),
+            album(1_700_000_100, "Untrue"),
+            album(1_700_000_200, "Untrue"),
+            album(1_700_000_300, "Kid A"),
+        ];
+        let f = fold_periods(rows, Tz::UTC, Unit::Month);
+        assert_eq!(f.buckets[&f.order[0]].run_plays, 3, "all three, not one");
+
+        // Two in a row is not a run — it happens on shuffle often enough to
+        // mean nothing, which is what `RUN_LEN` is for.
+        let rows = vec![album(1_700_000_000, "Untrue"), album(1_700_000_100, "Untrue")];
+        let f = fold_periods(rows, Tz::UTC, Unit::Month);
+        assert_eq!(f.buckets[&f.order[0]].run_plays, 0);
+
+        // A listen with no album **breaks** a run rather than extending it: it
+        // is not evidence of a record being played through.
+        let mut broken = vec![album(1_700_000_000, "Untrue"), album(1_700_000_100, "Untrue")];
+        broken.push({
+            let mut r = row(1_700_000_150, "Burial", None, "");
+            r.album = None;
+            r
+        });
+        broken.push(album(1_700_000_200, "Untrue"));
+        let f = fold_periods(broken, Tz::UTC, Unit::Month);
+        assert_eq!(f.buckets[&f.order[0]].run_plays, 0, "the gap ends the run");
+    }
+
+    /// Every axis is answerable from a listen that carries nothing but a time,
+    /// an artist and a title — and that is the point of choosing these five.
+    ///
+    /// The tempting axes are the Tapedeck-only ones (chain, format, attention)
+    /// and each is *unknown* for most of a real history, so a shape drawn from
+    /// them would picture how the listening was **recorded** while appearing to
+    /// picture the listening. This pins that a metadata-free history still
+    /// produces a real shape rather than a collapsed one.
+    #[test]
+    fn the_fingerprint_needs_no_metadata_a_history_might_be_missing() {
+        let bare = |ts: i64, artist: &str, title: &str| crate::db::ReportRow {
+            timestamp: ts,
+            artist: artist.into(),
+            artist_credit: None,
+            title: title.into(),
+            album: None,
+            duration: None,
+            genres: None,
+            chain_id: None,
+            company: None,
+        };
+        let rows = vec![
+            bare(1_700_000_000, "Burial", "Archangel"),
+            bare(1_700_003_600, "Aphex Twin", "Xtal"),
+            bare(1_700_007_200, "Burial", "Archangel"),
+        ];
+        let f = fold_periods(rows, Tz::UTC, Unit::Month);
+        let fp = fingerprint(&f.buckets[&f.order[0]]);
+        assert_eq!(fp.len(), 5);
+        assert!(fp.iter().all(|v| v.is_finite() && (0.0..=1.0).contains(v)), "got {fp:?}");
+        // Three plays, two distinct tracks — one of them was a repeat.
+        assert!((fp[1] - 1.0 / 3.0).abs() < 1e-9, "repeat axis, got {}", fp[1]);
+        // Nothing carried an album, so nothing can have been a run.
+        assert_eq!(fp[4], 0.0);
+    }
+
+    /// An empty period is a flat shape, not a division by zero.
+    #[test]
+    fn a_period_with_nothing_in_it_has_no_shape_rather_than_a_wrong_one() {
+        let b = Bucket::default();
+        assert_eq!(fingerprint(&b), [0.0; 5]);
     }
 
     /// Gear hours charge a chain once per piece, however often it names one.
@@ -1096,6 +1355,36 @@ fn fold_periods(rows: Vec<ReportRow>, tz: Tz, unit: Unit) -> Folded {
         }
         let sub_index = si.min(b.sub.len().saturating_sub(1));
         b.days.insert(dt.num_days_from_ce());
+
+        // Runs of one album, counted as the ascending scan goes past them.
+        // Ascending is what makes this possible at all — `report_rows` is the
+        // one listing query that scans oldest-first, and a run is a fact about
+        // order.
+        match r.album.as_deref().map(str::trim).filter(|a| !a.is_empty()) {
+            Some(album) if b.run_album.as_deref() == Some(album) => {
+                b.run_len += 1;
+                // Nothing counts until a run exists. The play that *completes*
+                // one brings the earlier ones with it; every play after that is
+                // one more. Three branches, not two — an `else { 1 }` scores the
+                // second play of a pair that never becomes a run, which is
+                // exactly what shuffle produces all day.
+                b.run_plays += match b.run_len.cmp(&RUN_LEN) {
+                    std::cmp::Ordering::Less => 0,
+                    std::cmp::Ordering::Equal => RUN_LEN,
+                    std::cmp::Ordering::Greater => 1,
+                };
+            }
+            Some(album) => {
+                b.run_album = Some(album.to_string());
+                b.run_len = 1;
+            }
+            // A listen with no album breaks the run rather than extending it —
+            // it is not evidence of a record being played through.
+            None => {
+                b.run_album = None;
+                b.run_len = 0;
+            }
+        }
 
         // Who actually played it.
         //

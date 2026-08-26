@@ -14,6 +14,7 @@
 	import MonthLine from './MonthLine.svelte';
 	import GenreBands from './GenreBands.svelte';
 	import { nf, delta, deltaText, ordinal, barPct } from './bits';
+	import Fingerprint from '$lib/components/charts/Fingerprint.svelte';
 
 	export let p: ReportPeriod;
 	export let onShare: (() => void) | null = null;
@@ -123,6 +124,19 @@
 				{#each p.milestones as m}<span class="milestone">{m}</span>{/each}
 			</div>
 		{/if}
+	</section>
+
+	<!-- The shape of the year against your usual. Against your **own** periods
+	     — there is no comparison here to anybody else, by design. -->
+	<section class="tile span2">
+		<div class="k" style="margin-bottom:6px;">The shape of it</div>
+		<Fingerprint
+			axes={p.fingerprint.axes}
+			you={p.fingerprint.you}
+			usual={p.fingerprint.usual}
+			usualPeriods={p.fingerprint.usual_periods}
+			size={210}
+		/>
 	</section>
 
 	<!-- Through what. A year is the span on which gear actually changes, so
