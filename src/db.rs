@@ -5979,6 +5979,41 @@ impl Database {
     // ── Server-wide settings ──
 
     /// Read an admin-set server setting, decrypted.
+    /// The title of one track of a shelved record, by side and position.
+    ///
+    /// What turns the design's `A:3:12` coordinate into something a lyric
+    /// lookup can use: the reference names a *place on a record*, and the
+    /// tracklist is what knows which song is there. A record that is not on the
+    /// shelf, or a side and position nothing sits at, resolves to nothing — and
+    /// the reference then renders as readable prose, the way an unresolved
+    /// `[[track:…]]` already does.
+    pub async fn shelf_track_title(
+        &self,
+        user_id: i64,
+        artist: &str,
+        album: &str,
+        side: &str,
+        position: i64,
+    ) -> Result<Option<String>, sqlx::Error> {
+        let row: Option<(String,)> = sqlx::query_as(
+            "SELECT tracks FROM physical_releases
+              WHERE user_id = ? AND LOWER(TRIM(artist)) = ? AND LOWER(TRIM(title)) = ?
+              ORDER BY id LIMIT 1",
+        )
+        .bind(user_id)
+        .bind(artist.trim().to_lowercase())
+        .bind(album.trim().to_lowercase())
+        .fetch_optional(&self.pool)
+        .await?;
+        let Some((json,)) = row else { return Ok(None) };
+        let tracks: Vec<crate::metadata::release_lookup::PhysicalTrack> =
+            serde_json::from_str(&json).unwrap_or_default();
+        Ok(tracks
+            .into_iter()
+            .find(|t| t.side.eq_ignore_ascii_case(side.trim()) && t.position == position)
+            .map(|t| t.title))
+    }
+
     /// Stamp a pressing's own sleeve onto every listen it has ever produced.
     ///
     /// **A record has one cover, and the shelf is holding it.** A side written

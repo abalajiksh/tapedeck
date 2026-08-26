@@ -131,6 +131,74 @@ pub fn strip_cues(synced: &str) -> String {
         .to_string()
 }
 
+/// One numbered line of a lyric.
+///
+/// **The index is the whole point.** A note refers to a line by its number, not
+/// by its words, so correcting a fetched lyric later corrects every quote with
+/// it rather than orphaning them — the same call `notes.rs` already makes for
+/// entities, and the first of the four rules the design states.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LyricLine {
+    /// 1-based, and **blank lines are numbered**. A stanza break is a line, or
+    /// renumbering breaks every reference already written — the design's second
+    /// rule, and it has to be true of the parse rather than only of the
+    /// renderer.
+    pub index: usize,
+    /// Seconds into the track, when the lyric is timed.
+    pub at: Option<f64>,
+    /// The words. Empty for a stanza break, which is a real line.
+    pub text: String,
+}
+
+/// Split a lyric into numbered lines, preferring the timed form.
+///
+/// The synced lyric is preferred when there is one, because it carries the
+/// timestamps *and* the same words — taking the plain one and trying to pair
+/// them up afterwards would be inventing an alignment nobody measured.
+pub fn parse_lines(plain: Option<&str>, synced: Option<&str>) -> Vec<LyricLine> {
+    if let Some(sy) = synced.filter(|s| !s.trim().is_empty()) {
+        return sy
+            .lines()
+            .enumerate()
+            .map(|(i, raw)| {
+                let (at, text) = split_cue(raw);
+                LyricLine { index: i + 1, at, text }
+            })
+            .collect();
+    }
+    plain
+        .filter(|p| !p.trim().is_empty())
+        .map(|p| {
+            p.lines()
+                .enumerate()
+                .map(|(i, l)| LyricLine { index: i + 1, at: None, text: l.trim_end().to_string() })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// `[01:04.20] the words` → `(Some(64.2), "the words")`.
+///
+/// A line whose leading bracket is not a cue keeps it: `[Chorus]` is a lyric in
+/// a great many songs, and eating it would quietly rewrite the words.
+fn split_cue(raw: &str) -> (Option<f64>, String) {
+    let line = raw.trim_end();
+    let Some(rest) = line.strip_prefix('[') else { return (None, line.trim().to_string()) };
+    let Some(end) = rest.find(']') else { return (None, line.trim().to_string()) };
+    let inside = &rest[..end];
+    let mut parts = inside.split(':');
+    let (Some(m), Some(s)) = (parts.next(), parts.next()) else {
+        return (None, line.trim().to_string());
+    };
+    if parts.next().is_some() {
+        return (None, line.trim().to_string());
+    }
+    let (Ok(mins), Ok(secs)) = (m.trim().parse::<f64>(), s.trim().parse::<f64>()) else {
+        return (None, line.trim().to_string());
+    };
+    (Some(mins * 60.0 + secs), rest[end + 1..].trim().to_string())
+}
+
 /// The language of a lyric, by the script it is mostly written in.
 ///
 /// **By weight, not by presence**, which is the difference between this and the
@@ -368,6 +436,52 @@ impl std::fmt::Display for LyricsError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Blank lines are numbered, because a reference is an index.
+    ///
+    /// The design's second rule, and it has to hold in the *parse*: a stanza
+    /// break that is skipped renumbers every line after it, which silently
+    /// re-points every quote already written. This is the assertion that fails
+    /// if somebody filters empties out for tidiness.
+    #[test]
+    fn a_stanza_break_is_a_numbered_line() {
+        let plain = "first\n\nthird";
+        let lines = parse_lines(Some(plain), None);
+        assert_eq!(lines.len(), 3);
+        assert_eq!(lines[1], LyricLine { index: 2, at: None, text: String::new() });
+        assert_eq!(lines[2].index, 3, "the line after a break keeps its number");
+    }
+
+    /// Timed lyrics carry their cue as a number, and keep the words.
+    #[test]
+    fn a_timed_lyric_is_numbered_and_timed() {
+        let synced = "[00:17.12] first line\n[01:04.20] second line";
+        let lines = parse_lines(None, Some(synced));
+        assert_eq!(lines[0].at, Some(17.12));
+        assert_eq!(lines[0].text, "first line");
+        assert_eq!(lines[1].at, Some(64.2));
+        assert_eq!(lines[1].index, 2);
+    }
+
+    /// A bracket that is not a cue is part of the song.
+    #[test]
+    fn a_section_heading_is_not_eaten_as_a_timestamp() {
+        let lines = parse_lines(None, Some("[Chorus]\n[00:10.00] words"));
+        assert_eq!(lines[0].text, "[Chorus]", "a section heading is a line of the lyric");
+        assert_eq!(lines[0].at, None);
+        assert_eq!(lines[1].at, Some(10.0));
+    }
+
+    /// The timed form wins when there is one — it has the same words *and* the
+    /// cues, so pairing a plain lyric against it would invent an alignment.
+    #[test]
+    fn the_timed_form_is_preferred_and_an_absent_lyric_is_no_lines() {
+        let both = parse_lines(Some("plain"), Some("[00:01.00] timed"));
+        assert_eq!(both.len(), 1);
+        assert_eq!(both[0].text, "timed");
+        assert!(parse_lines(None, None).is_empty());
+        assert!(parse_lines(Some("   "), None).is_empty());
+    }
 
     /// The cues come off, and only the cues.
     ///

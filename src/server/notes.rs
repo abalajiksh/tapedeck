@@ -160,30 +160,115 @@ async fn resolve_target(
 
 /// Artist and album in scope for a note's shortcodes, so `[[track:3]]` and a
 /// bare `[[album:…]]` mean what the writer expects.
-async fn note_context(
+/// Resolve `[[line:12]]` or `[[line:A:3:12]]` to the words and a reader link.
+///
+/// **Read against the thing the note is about**, which is the rule
+/// `[[track:3]]` already follows: inside a note on a track, `[[line:12]]` is
+/// line 12 of that track; inside a note on a record, the coordinate needs the
+/// side and the track as well, which is the design's `A:3:12`. The design only
+/// specifies the long form because it is a shelf design — the short one is what
+/// makes a line reference usable for the majority of listening, which never
+/// came off a record.
+///
+/// Returns `None` when there is no lyric held, and that is deliberate: an
+/// unresolved reference renders as readable prose with a dotted underline,
+/// never an error, exactly as an unresolved `[[track:…]]` does. The design says
+/// the same thing — "degrades to plain `line A3·12` when no lyrics are held".
+///
+/// The **words are never stored**, only the index, so correcting a fetched
+/// lyric later corrects every quote with it. That is the first of the design's
+/// four rules, and this function is where it is true.
+async fn resolve_line(
     db: &Database,
+    lyrics: Option<&crate::lyrics::LyricsClient>,
     user_id: i64,
-    note: &NoteRow,
-) -> (Option<String>, Option<String>) {
+    target: &str,
+    ctx: &NoteCtx,
+) -> Option<Resolved> {
+    let parts: Vec<&str> = target.split(':').map(str::trim).collect();
+    let (artist, title, n) = match parts.as_slice() {
+        // `[[line:12]]` — the track this note is about.
+        [n] => (ctx.artist.as_deref()?, ctx.track.as_deref()?, n.parse::<usize>().ok()?),
+        // `[[line:A:3:12]]` — side A, track 3 of the record this note is about.
+        [side, track, n] => {
+            let pos: i64 = track.parse().ok()?;
+            let n: usize = n.parse().ok()?;
+            let artist = ctx.artist.as_deref()?;
+            let album = ctx.album.as_deref()?;
+            let title = db.shelf_track_title(user_id, artist, album, side, pos).await.ok()??;
+            return line_resolution(lyrics, artist, &title, n).await;
+        }
+        _ => return None,
+    };
+    line_resolution(lyrics, artist, title, n).await
+}
+
+/// The shared half: look the lyric up and turn one line into a rendering.
+async fn line_resolution(
+    lyrics: Option<&crate::lyrics::LyricsClient>,
+    artist: &str,
+    title: &str,
+    n: usize,
+) -> Option<Resolved> {
+    let lyrics = lyrics?;
+    let crate::lyrics::Found::Lyrics { plain, synced, .. } = lyrics.cached(artist, title).await?
+    else {
+        // An instrumental has no lines, and saying so by not resolving is
+        // better than linking to an empty reader.
+        return None;
+    };
+    let lines = crate::lyrics::parse_lines(plain.as_deref(), synced.as_deref());
+    let line = lines.iter().find(|l| l.index == n)?;
+    if line.text.trim().is_empty() {
+        // A stanza break is a numbered line — that is the point — but quoting
+        // one is quoting nothing, so it stays unresolved rather than rendering
+        // an empty quotation.
+        return None;
+    }
+    let href = format!(
+        "/lyrics?artist={}&title={}&line={}",
+        urlencoding::encode(artist),
+        urlencoding::encode(title),
+        n
+    );
+    Some(Resolved { label: line.text.clone(), href })
+}
+
+/// What a note is *about*, which is what its shortcodes are read against.
+///
+/// `track` is here for `[[line:12]]`: a line reference is read against the
+/// thing being annotated, the same way `[[track:3]]` means "the third track of
+/// this record". Without it a line reference on a track note has no track to
+/// count lines in.
+#[derive(Default, Clone)]
+pub struct NoteCtx {
+    pub artist: Option<String>,
+    pub album: Option<String>,
+    pub track: Option<String>,
+}
+
+async fn note_context(db: &Database, user_id: i64, note: &NoteRow) -> NoteCtx {
     if let Some(sid) = note.scrobble_id {
         if let Ok(Some(s)) = db.get_scrobble(user_id, sid).await {
-            return (Some(s.artist), s.album);
+            return NoteCtx { artist: Some(s.artist), album: s.album, track: Some(s.title) };
         }
-        return (None, None);
+        return NoteCtx::default();
     }
     let Some(eid) = note.entity_id else {
-        return (None, None);
+        return NoteCtx::default();
     };
     let Ok(Some(e)) = db.get_entity(eid).await else {
-        return (None, None);
+        return NoteCtx::default();
     };
     match e.kind.as_str() {
-        "artist" => (Some(e.name), None),
-        "release" => (Some(e.artist_name), Some(e.name)),
+        "artist" => NoteCtx { artist: Some(e.name), ..Default::default() },
+        "release" => {
+            NoteCtx { artist: Some(e.artist_name), album: Some(e.name), ..Default::default() }
+        }
         // For a track, the album comes from where this user actually heard it.
         _ => {
             let album = db.album_for_track(user_id, &e.name, &e.artist_name).await.ok().flatten();
-            (Some(e.artist_name), album)
+            NoteCtx { artist: Some(e.artist_name), album, track: Some(e.name) }
         }
     }
 }
@@ -205,10 +290,10 @@ fn entity_title(e: &EntityRow) -> String {
 /// and listening history.
 async fn render(
     db: &Database,
+    lyrics: Option<&crate::lyrics::LyricsClient>,
     user_id: i64,
     body_md: &str,
-    ctx_artist: Option<&str>,
-    ctx_album: Option<&str>,
+    ctx: &NoteCtx,
 ) -> String {
     let mut resolved: HashMap<(RefKind, String), Resolved> = HashMap::new();
     for code in notes::scan(body_md) {
@@ -216,9 +301,16 @@ async fn render(
         if resolved.contains_key(&key) {
             continue;
         }
-        // Gear is the caller's own equipment, on its own route; the other three
-        // are entities. This is the only place the two are told apart, which is
-        // why `notes.rs` takes an href rather than building one.
+        // Gear is the caller's own equipment, a line is a position in somebody
+        // else's text, and the other three are entities. This is the only place
+        // the three are told apart, which is why `notes.rs` takes an href
+        // rather than building one.
+        if code.kind == RefKind::Line {
+            if let Some(r) = resolve_line(db, lyrics, user_id, &code.target, ctx).await {
+                resolved.insert(key, r);
+            }
+            continue;
+        }
         let Some(entity_kind) = code.kind.entity_kind() else {
             if let Ok(Some((id, label))) = db.find_equipment_by_name(user_id, &code.target).await {
                 resolved.insert(key, Resolved { label, href: format!("/chains?gear={}", id) });
@@ -231,8 +323,8 @@ async fn render(
                 entity_kind,
                 &code.target,
                 code.position(),
-                ctx_artist,
-                ctx_album,
+                ctx.artist.as_deref(),
+                ctx.album.as_deref(),
             )
             .await;
         if let Ok(Some((entity_id, label))) = hit {
@@ -247,11 +339,12 @@ async fn render(
 /// exist.
 async fn note_json(
     db: &Database,
+    lyrics: Option<&crate::lyrics::LyricsClient>,
     user_id: i64,
     note: &NoteRow,
     with_html: bool,
 ) -> serde_json::Value {
-    let (ctx_artist, ctx_album) = note_context(db, user_id, note).await;
+    let ctx = note_context(db, user_id, note).await;
     let entity: Option<EntityRow> = match note.entity_id {
         Some(id) => db.get_entity(id).await.ok().flatten(),
         None => None,
@@ -294,8 +387,7 @@ async fn note_json(
         "revisions": revisions,
     });
     if with_html {
-        let html =
-            render(db, user_id, &note.body_md, ctx_artist.as_deref(), ctx_album.as_deref()).await;
+        let html = render(db, lyrics, user_id, &note.body_md, &ctx).await;
         out["body_html"] = serde_json::Value::String(html);
     }
     out
@@ -335,10 +427,13 @@ pub async fn save_note(
     };
     match state.db.upsert_note(user.user_id, &target, &body.body_md, &visibility).await {
         Ok(id) => match state.db.get_note(user.user_id, id).await {
-            Ok(Some(note)) => {
-                (StatusCode::OK, Json(note_json(&state.db, user.user_id, &note, true).await))
-                    .into_response()
-            }
+            Ok(Some(note)) => (
+                StatusCode::OK,
+                Json(
+                    note_json(&state.db, state.lyrics.as_deref(), user.user_id, &note, true).await,
+                ),
+            )
+                .into_response(),
             Ok(None) => err(StatusCode::INTERNAL_SERVER_ERROR, "Note vanished after saving"),
             Err(e) => server_error(e),
         },
@@ -378,7 +473,9 @@ pub async fn list_notes(
         Ok(rows) => {
             let mut out = Vec::with_capacity(rows.len());
             for note in &rows {
-                out.push(note_json(&state.db, user.user_id, note, false).await);
+                out.push(
+                    note_json(&state.db, state.lyrics.as_deref(), user.user_id, note, false).await,
+                );
             }
             // Only worth a second query when something was actually filtered.
             let total = if query.trim().is_empty() && kind.is_empty() {
@@ -400,10 +497,11 @@ async fn get_note(
     Path(id): Path<i64>,
 ) -> impl IntoResponse {
     match state.db.get_note(user.user_id, id).await {
-        Ok(Some(note)) => {
-            (StatusCode::OK, Json(note_json(&state.db, user.user_id, &note, true).await))
-                .into_response()
-        }
+        Ok(Some(note)) => (
+            StatusCode::OK,
+            Json(note_json(&state.db, state.lyrics.as_deref(), user.user_id, &note, true).await),
+        )
+            .into_response(),
         Ok(None) => err(StatusCode::NOT_FOUND, "No such note"),
         Err(e) => server_error(e),
     }
@@ -465,8 +563,7 @@ async fn preview(
 ) -> impl IntoResponse {
     // The target only supplies context here; a preview never creates a note,
     // and an unresolvable target just means no album/artist in scope.
-    let (ctx_artist, ctx_album) = match resolve_target(&state.db, user.user_id, &body.target).await
-    {
+    let ctx = match resolve_target(&state.db, user.user_id, &body.target).await {
         Ok(NoteTarget::Entity(id)) => {
             let stub = NoteRow {
                 id: 0,
@@ -499,12 +596,10 @@ async fn preview(
         // nothing to be relative *to* — which is right: a month is not about
         // one record. Named shortcodes still resolve; only the positional
         // `[[track:3]]` loses its meaning, and it renders as plain text.
-        Ok(NoteTarget::Period(_)) | Err(_) => (None, None),
+        Ok(NoteTarget::Period(_)) | Err(_) => NoteCtx::default(),
     };
 
-    let html =
-        render(&state.db, user.user_id, &body.body_md, ctx_artist.as_deref(), ctx_album.as_deref())
-            .await;
+    let html = render(&state.db, state.lyrics.as_deref(), user.user_id, &body.body_md, &ctx).await;
     (StatusCode::OK, Json(serde_json::json!({ "body_html": html }))).into_response()
 }
 
@@ -579,7 +674,8 @@ async fn note_for(
 
     match note {
         Ok(Some(note)) => {
-            let body = note_json(&state.db, user.user_id, &note, true).await;
+            let body =
+                note_json(&state.db, state.lyrics.as_deref(), user.user_id, &note, true).await;
             (
                 StatusCode::OK,
                 Json(serde_json::json!({ "note": body, "target": target_json, "loved": loved })),
@@ -775,7 +871,9 @@ async fn get_entity(
             let loved = state.db.is_loved(user.user_id, id).await.unwrap_or(false);
             let note = state.db.note_for_entity(user.user_id, id).await.ok().flatten();
             let note_json = match note {
-                Some(n) => note_json(&state.db, user.user_id, &n, true).await,
+                Some(n) => {
+                    note_json(&state.db, state.lyrics.as_deref(), user.user_id, &n, true).await
+                }
                 None => serde_json::Value::Null,
             };
             (
@@ -897,9 +995,9 @@ fn iso(ts: i64) -> String {
 /// One note as a standalone Markdown document: frontmatter, then the body with
 /// its shortcodes turned into wikilinks.
 async fn note_document(db: &Database, user_id: i64, note: &NoteRow, title: &str) -> String {
-    let (ctx_artist, ctx_album) = note_context(db, user_id, note).await;
+    let ctx = note_context(db, user_id, note).await;
     let resolutions =
-        export_resolutions(db, user_id, &note.body_md, ctx_artist.as_deref(), ctx_album.as_deref())
+        export_resolutions(db, user_id, &note.body_md, ctx.artist.as_deref(), ctx.album.as_deref())
             .await;
 
     let entity = match note.entity_id {

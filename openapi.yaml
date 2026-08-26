@@ -26,7 +26,7 @@ openapi: 3.1.0
 
 info:
   title: Tapedeck
-  version: 0.98.0
+  version: 0.99.0
   summary: Self-hosted scrobbler and listening journal.
   description: |
     Tapedeck ingests listens, enriches them with MusicBrainz metadata, stores
@@ -7421,6 +7421,55 @@ paths:
         '401': { $ref: '#/components/responses/Unauthorized' }
 
   # ── Maintenance ────────────────────────────────────────────────────────────
+  /api/v1/lyrics:
+    get:
+      tags: [Statistics]
+      summary: The words to one track, as numbered lines.
+      description: |
+        Scope: `read`.
+
+        **Numbered including blank lines.** A stanza break is a line, because a
+        liner note refers to a line by its *index* — `[[line:12]]` or
+        `[[line:A:3:12]]` — and skipping empties would renumber every line after
+        one, silently re-pointing every quote already written.
+
+        Reads only what is stored and **never triggers a fetch**. LRCLIB is free
+        and asks callers to be considerate; the backfill is what paces that, and
+        a screen that fetched on open would let a page refresh drive the rate.
+
+        Three answers, all real: lines, `instrumental: true` (a track with no
+        words, which is not a gap), and an empty list.
+
+        Lyrics are the provider's text. They are cached outside the listening
+        database, so `GET /api/v1/backup` does not carry them, and they are not
+        served by the public now-playing endpoint or by Patch.
+      security: [{ sessionCookie: [] }, { apiToken: [read] }]
+      parameters:
+        - { name: artist, in: query, required: true, schema: { type: string } }
+        - { name: title, in: query, required: true, schema: { type: string } }
+      responses:
+        '200':
+          description: OK — including for a track nothing is held for.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  artist: { type: string }
+                  title: { type: string }
+                  language: { type: string, nullable: true }
+                  timed: { type: boolean }
+                  instrumental: { type: boolean }
+                  source: { type: string, example: LRCLIB }
+                  lines:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        n: { type: integer, description: '1-based, and blank lines are numbered.' }
+                        at: { type: number, nullable: true }
+                        text: { type: string, description: Empty for a stanza break. }
+
   /api/v1/lyrics/status:
     get:
       tags: [Maintenance]

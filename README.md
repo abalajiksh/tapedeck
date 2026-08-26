@@ -626,6 +626,18 @@ LRCLIB is free and asks callers to be considerate, so Tapedeck identifies
 itself, honours `Retry-After`, and fetches a few tracks a minute — one request
 per *track*, not per listen.
 
+**A note can quote a line.** `[[line:12]]` is line 12 of the track you're
+writing about; `[[line:A:3:12]]` is side A, track 3, line 12 of the record. What
+gets stored is the **index, never the words**, so correcting a lyric later
+corrects every quote you have written rather than orphaning them — and blank
+lines are numbered, because a stanza break that gets skipped renumbers
+everything after it. A reference to a lyric nobody holds stays readable prose
+with a dotted underline, the way an unresolved `[[track:…]]` already does.
+
+The reader shows the words with timestamps or line numbers, and opens on the
+line a note points at. It reads only what is already stored — it never fetches,
+so a page refresh cannot drive the request rate.
+
 ### "Various Artists" is not an artist
 
 It is a filing convention meaning *look at the track* — unresolved metadata —

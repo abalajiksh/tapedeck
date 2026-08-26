@@ -35,6 +35,23 @@ pub enum RefKind {
     /// own table and is per-user, so it resolves and links differently. "Heard
     /// this on the [[gear:Bifrost 2]] for the first time" is the point.
     Gear,
+    /// A numbered line of a lyric — `[[line:12]]` or `[[line:A:3:12]]`.
+    ///
+    /// **Stores the index, never the words**, so correcting a fetched lyric
+    /// later corrects every quote with it rather than orphaning them. That is
+    /// the first of the four rules the design states, and it is the same call
+    /// this module already makes for entities.
+    ///
+    /// Two forms, and the short one exists for the reason `[[track:3]]` does:
+    /// a reference is read *against the thing the note is about*. Inside a note
+    /// on a track, `[[line:12]]` is line 12 of that track. Inside a note on a
+    /// record, the coordinate needs the side and the track too, which is what
+    /// the design's `A:3:12` is.
+    ///
+    /// Not an entity, and never creates one — the same refusal `Gear` makes.
+    /// A line is a position in somebody else's text; there is nothing to
+    /// conjure a row for, and it cannot be a note or a love target.
+    Line,
 }
 
 impl RefKind {
@@ -44,6 +61,7 @@ impl RefKind {
             "album" | "release" => Some(Self::Album),
             "artist" => Some(Self::Artist),
             "gear" | "equipment" => Some(Self::Gear),
+            "line" | "lyric" => Some(Self::Line),
             _ => None,
         }
     }
@@ -55,6 +73,7 @@ impl RefKind {
             Self::Album => Some("release"),
             Self::Artist => Some("artist"),
             Self::Gear => None,
+            Self::Line => None,
         }
     }
 }
@@ -338,6 +357,45 @@ mod tests {
                 ((*k, t.to_lowercase()), Resolved { label: label.to_string(), href })
             })
             .collect()
+    }
+
+    /// A line reference is a fifth kind, and it parses both forms.
+    ///
+    /// The short one is read against whatever the note is about — the rule
+    /// `[[track:3]]` already follows — which is what makes a line reference
+    /// usable for the majority of listening, none of which came off a record.
+    #[test]
+    fn a_line_reference_parses_in_both_of_its_forms() {
+        let codes = scan("the turn is [[line:12]], and [[line:A:3:12]] is the one everyone quotes");
+        assert_eq!(codes.len(), 2);
+        assert!(codes.iter().all(|c| c.kind == RefKind::Line));
+        assert_eq!(codes[0].target, "12");
+        assert_eq!(codes[1].target, "A:3:12");
+        assert_eq!(RefKind::parse("lyric"), Some(RefKind::Line), "spelled either way");
+    }
+
+    /// A line is a position in somebody else's text, so it is not an entity and
+    /// never creates one — the same refusal gear makes, and what stops it being
+    /// a note or a love target.
+    #[test]
+    fn a_line_is_not_an_entity_and_conjures_nothing() {
+        assert_eq!(RefKind::Line.entity_kind(), None);
+        assert_eq!(RefKind::Gear.entity_kind(), None);
+        assert_eq!(RefKind::Track.entity_kind(), Some("recording"));
+    }
+
+    /// An unresolved line renders as readable prose, never an error.
+    ///
+    /// A lyric nobody holds is the normal case for most of a library, and those
+    /// are exactly the records worth writing about — the same reasoning that
+    /// makes an unresolved `[[track:…]]` a dotted underline rather than a
+    /// failure. The design says the same: "degrades to plain line A3·12".
+    #[test]
+    fn a_line_nobody_holds_the_words_to_stays_prose() {
+        let html = render("the turn is [[line:A:3:12]]", &HashMap::new());
+        assert!(html.contains("td-unresolved"), "{html}");
+        assert!(html.contains("A:3:12"), "the coordinate is still readable: {html}");
+        assert!(!html.contains("<a "), "and it is not a link to nowhere");
     }
 
     #[test]

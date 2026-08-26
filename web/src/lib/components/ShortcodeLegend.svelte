@@ -41,7 +41,11 @@
 		{ code: '[[track:3]]', what: 'the third track of the record this note is about' },
 		{ code: '[[album:Untrue]]', what: 'a record' },
 		{ code: '[[artist:Burial]]', what: 'an artist' },
-		{ code: '[[gear:Bifrost 2]]', what: 'something on your own shelf of equipment' }
+		{ code: '[[gear:Bifrost 2]]', what: 'something on your own shelf of equipment' },
+		// Two forms; the short one is read against whatever the note is about,
+		// the same rule the positional [[track:3]] follows.
+		{ code: '[[line:12]]', what: 'line 12 of the track this note is about' },
+		{ code: '[[line:A:3:12]]', what: 'side A, track 3, line 12 of this record' }
 	];
 </script>
 

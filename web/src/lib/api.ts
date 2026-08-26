@@ -2386,6 +2386,21 @@ class TapedeckAPI {
 	}
 	/** Edit the shelf-keeping fields. Every one distinguishes absent from null:
 	 *  omit to leave alone, pass `null` to clear. */
+	/** The words to one track, as numbered lines — blanks included, because a
+	 *  note points at a line by its index. Reads only what is stored; the
+	 *  backfill is what talks to LRCLIB. */
+	async lyrics(artist: string, title: string) {
+		const q = new URLSearchParams({ artist, title });
+		return this.get<{
+			artist: string;
+			title: string;
+			language?: string | null;
+			timed?: boolean;
+			instrumental?: boolean;
+			lines: { n: number; at: number | null; text: string }[];
+			source?: string;
+		}>(`/api/v1/lyrics?${q}`);
+	}
 	async updatePressing(
 		id: number,
 		body: {

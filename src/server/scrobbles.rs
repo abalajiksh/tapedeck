@@ -933,6 +933,56 @@ async fn backfill_languages_now(
 /// asked about and had nothing for — real listening simply not in their
 /// database — and it is reported because without it a progress bar that stops
 /// short reads as a stall rather than as an answer.
+#[derive(serde::Deserialize)]
+pub struct LyricsQuery {
+    pub artist: String,
+    pub title: String,
+}
+
+/// GET /api/v1/lyrics — the words to one track, as numbered lines.
+///
+/// **Numbered including blanks.** A stanza break is a line, because a note
+/// refers to a line by its index and skipping empties would renumber every
+/// line after one — silently re-pointing every quote already written.
+///
+/// Reads only what is stored and never triggers a fetch. LRCLIB is free and
+/// asks callers to be considerate; the backfill is what paces that, and a
+/// screen that fetched on open would let a page refresh drive the rate.
+///
+/// Three answers, all of them real: lines, `instrumental` (a track with no
+/// words, which is not a gap), and nothing at all.
+async fn lyrics_for_track(
+    State(state): State<Arc<AppState>>,
+    _user: ReadAuth,
+    Query(q): Query<LyricsQuery>,
+) -> impl IntoResponse {
+    let Some(lyrics) = state.lyrics.clone() else {
+        return server_error("This instance has no lyrics cache".to_string());
+    };
+    let body = match lyrics.cached(&q.artist, &q.title).await {
+        Some(crate::lyrics::Found::Lyrics { plain, synced, language }) => {
+            let lines = crate::lyrics::parse_lines(plain.as_deref(), synced.as_deref());
+            serde_json::json!({
+                "artist": q.artist, "title": q.title,
+                "language": language,
+                "timed": lines.iter().any(|l| l.at.is_some()),
+                "lines": lines.iter().map(|l| serde_json::json!({
+                    "n": l.index, "at": l.at, "text": l.text,
+                })).collect::<Vec<_>>(),
+                // Shown wherever the words are, because they are not ours.
+                "source": "LRCLIB",
+            })
+        }
+        Some(crate::lyrics::Found::Instrumental) => serde_json::json!({
+            "artist": q.artist, "title": q.title, "instrumental": true, "lines": [],
+        }),
+        Some(crate::lyrics::Found::Missing) | None => serde_json::json!({
+            "artist": q.artist, "title": q.title, "lines": [],
+        }),
+    };
+    (StatusCode::OK, Json(body)).into_response()
+}
+
 /// GET /api/v1/lyrics/status — how far the lyric language pass has got.
 ///
 /// Reports what it is *for* rather than a lyric count: the pass exists to empty
@@ -1112,6 +1162,7 @@ pub fn create_scrobbles_router() -> Router<Arc<AppState>> {
         .route("/api/v1/personality", get(personality))
         .route("/api/v1/languages/status", get(language_status))
         .route("/api/v1/languages/backfill", axum::routing::post(backfill_languages_now))
+        .route("/api/v1/lyrics", get(lyrics_for_track))
         .route("/api/v1/lyrics/status", get(lyrics_status))
         .route("/api/v1/mbids/status", get(mbid_status))
         .route("/api/v1/mbids/backfill", axum::routing::post(backfill_mbids_now))
