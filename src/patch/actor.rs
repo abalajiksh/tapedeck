@@ -25,22 +25,28 @@ pub const JRD_JSON: &str = "application/jrd+json";
 /// signal chain and the audio format, which is the half that makes a Tapedeck
 /// listen a Tapedeck listen rather than a sentence.
 ///
-/// **PROVISIONAL, and it has a deadline.** Deferred by Ashwin on 2026-08-22:
-/// the value below is the project's own repository, on the grounds that a
-/// namespace IRI should resolve to something that explains it, but a
-/// forge-hosted URL is not obviously the right permanent home.
+/// **FROZEN** (Ashwin, 2026-08-26). `tapedeck.cc` is the project's own domain
+/// and will host the page explaining what Tapedeck is, which makes it the one
+/// home for this that is both permanent and *ours* — the objection to the
+/// provisional value was that a forge URL says "wherever the source happens to
+/// live today", and a project domain does not.
 ///
-/// It is safe to change **only while nothing has ever been delivered
-/// outbound**, which is true today and stops being true the moment Step 3
-/// ships delivery. After that the IRI is a fact about documents other servers
-/// hold: renaming it migrates nothing, it just leaves every stored activity
-/// pointing at a vocabulary that no longer exists.
+/// This is what every comparable project does — `joinmastodon.org/ns#`,
+/// `funkwhale.audio/ns#` — for the same reason.
 ///
-/// So: settle this before the first `Create` leaves the building. Nothing in
-/// Step 1 emits a `td:` term — the namespace rides on the actor document to
-/// declare what this server speaks, and an actor document is refetched rather
-/// than stored as history.
-pub const TD_NS: &str = "https://codeberg.org/abksh/tapedeck/ns#";
+/// **Treat it as unchangeable from here.** It is *technically* still free,
+/// because nothing has ever been delivered outbound, and that stops being true
+/// the moment Step 3 ships delivery. After that the IRI is a fact about
+/// documents other servers hold: renaming it migrates nothing, it just leaves
+/// every stored activity pointing at a vocabulary that no longer exists.
+///
+/// One thing to do when the site is built, and it is a courtesy rather than a
+/// requirement: **serve something at this address that explains the terms.**
+/// Nothing dereferences a namespace IRI in practice — Mastodon never fetches
+/// `joinmastodon.org/ns#` — but the next person implementing against a
+/// Tapedeck `Create` will paste it into a browser, and a 404 is a poor answer
+/// to "what is `td:chain`?".
+pub const TD_NS: &str = "https://tapedeck.cc/ns#";
 
 /// The `@context` every document this server emits carries.
 ///
@@ -287,6 +293,33 @@ mod tests {
         assert!(ctx.iter().any(|c| c == "https://www.w3.org/ns/activitystreams"));
         assert!(ctx.iter().any(|c| c == "https://w3id.org/security/v1"));
         assert!(ctx.iter().any(|c| c["td"] == TD_NS), "the frozen namespace travels from day one");
+    }
+
+    /// The namespace IRI is written down, so changing it has to be deliberate.
+    ///
+    /// Not a tautology, and not a test of `TD_NS` against itself: this is the
+    /// one constant in the codebase whose entire value is that it never moves.
+    /// Once an activity has been delivered, other servers hold documents that
+    /// name it, and renaming it migrates nothing — it orphans every stored
+    /// copy. A guard that fails on edit is what turns "somebody changed a
+    /// string" into "somebody decided to break every peer".
+    ///
+    /// Settled by Ashwin on 2026-08-26: `tapedeck.cc`, the project's own
+    /// domain, which will host the page explaining what these terms are.
+    #[test]
+    fn the_namespace_is_the_one_that_was_frozen() {
+        assert_eq!(
+            TD_NS, "https://tapedeck.cc/ns#",
+            "the `td:` namespace is frozen. Changing it orphans every activity already \
+             delivered to another server — it does not migrate them. If this is deliberate, \
+             it needs a migration plan for peers, not a new string."
+        );
+        // A namespace that is not a prefix would concatenate into nonsense:
+        // `td:chain` has to resolve to `…/ns#chain`, not `…/nschain`.
+        assert!(
+            TD_NS.ends_with('#') || TD_NS.ends_with('/'),
+            "a namespace IRI must end in a separator or every term name runs into it"
+        );
     }
 
     /// Advertising an endpoint that 404s is worse than not having it: a sender
