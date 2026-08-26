@@ -1165,7 +1165,15 @@
 						<div style="width:{l.duration ? Math.min(100, (livePos(l, livesSec) / l.duration) * 100) : 0}%"></div>
 					</div>
 					<div class="livefoot">
-						<span class="tag">{l.chain_name}</span>
+						<!-- Named when they share it; "Private signal chain" when they
+						     do not; nothing at all when the listen ran through no chain
+						     anybody recorded. Three states, because collapsing the last
+						     two would claim a chain exists where none does. -->
+						{#if l.chain_name}
+							<span class="tag">{l.chain_name}</span>
+						{:else if l.has_chain}
+							<span class="privtag">Private signal chain</span>
+						{/if}
 						{#if liveBadge(l)}<span class="tag">{liveBadge(l)}</span>{/if}
 						<!-- Built in one expression rather than with an inline
 						     `{#if}`: Svelte trims the whitespace around a block, so
@@ -1271,10 +1279,16 @@
 									<div class="lsub">
 										<a class="lwho" href="/users/{l.username}">{l.display_name || l.username}</a>
 										{#if handleOf(l)}<span class="rhandle">{handleOf(l)}</span>{/if}
-										<span class="lchain">
-											<ChainIcon name={l.chain_icon} size={13} title={l.chain_name} />
-											{l.chain_name}
-										</span>
+										{#if l.chain_name}
+											<span class="lchain">
+												<ChainIcon name={l.chain_icon} size={13} title={l.chain_name} />
+												{l.chain_name}
+											</span>
+										{:else if l.has_chain}
+											<span class="lchain privchain" title="They keep this chain private">
+												Private signal chain
+											</span>
+										{/if}
 									</div>
 								</div>
 								<div class="ldots" title={steps(l).map((x) => x.name).join(' → ')}>
@@ -2260,6 +2274,39 @@
 		white-space: nowrap;
 		overflow: hidden;
 		text-overflow: ellipsis;
+	}
+	/* A chain its owner keeps private. Dashed, italic and muted — the idiom
+	   this codebase already uses for "shown to you, but not yours", the same
+	   treatment the unowned genre neighbours carry. It must not read as a chain
+	   actually *called* "Private signal chain", which a plain tag would. */
+	/* Deliberately **not** `.tag`. `app.css` re-colours `.tag` per theme
+	   (`:root[data-theme="dark"] .tag { color: var(--td-text) }`) at a
+	   specificity a scoped class cannot beat, so the marker came out in
+	   full-strength text in dark mode and read like a chain actually *called*
+	   "Private signal chain". Its own class owes nothing to that cascade.
+	   Caught by reading the computed colour in both themes, not by any check. */
+	.privtag {
+		display: inline-flex;
+		align-items: center;
+		font-size: 11px;
+		letter-spacing: .02em;
+		padding: 3px 10px;
+		border-radius: 12px;
+		white-space: nowrap;
+		font-style: italic;
+		color: var(--td-muted-3);
+		border: 1px dashed var(--td-border);
+		background: none;
+	}
+	/* The Reel row's own chain line already sets the layout and a muted tone;
+	   this only says "withheld". */
+	.privchain {
+		font-style: italic;
+		color: var(--td-muted-3);
+		border: 1px dashed var(--td-border);
+		border-radius: 10px;
+		padding: 1px 7px;
+		background: none;
 	}
 	.ldots { display: flex; gap: 3.5px; flex: none; }
 	.dot { width: 7px; height: 7px; border-radius: 999px; display: block; }

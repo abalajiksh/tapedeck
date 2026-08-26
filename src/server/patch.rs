@@ -68,6 +68,7 @@ pub fn create_patch_router() -> Router<Arc<AppState>> {
         .route("/users/:name/following", get(following))
         .route("/.well-known/webfinger", get(webfinger))
         .route("/api/v1/profile/federation", get(get_federation).put(put_federation))
+        .route("/api/v1/profile/share-all", get(get_share_all).put(put_share_all))
         // Step 2 — local Patch. Session-only, all of it.
         .route("/api/v1/patch/decks", get(decks))
         .route("/api/v1/patch/reel", get(reel))
@@ -711,13 +712,11 @@ async fn live(State(state): State<Arc<AppState>>, user: super::auth::AuthUser) -
         let Some((np, position)) = state.now_playing.get(p.user_id) else {
             continue;
         };
-        // No chain is no sharing — the default has to be exclusion, the same
-        // call `reel` makes by joining rather than left-joining.
-        let Some(chain_id) = np.chain_id else {
-            continue;
-        };
-        match state.db.chain_if_shared(p.user_id, chain_id).await {
-            Ok(Some(chain_name)) => out.push(serde_json::json!({
+        // A listen with no chain used to be excluded outright. It is offered
+        // now when its owner has opened up, because "all the music they
+        // scrobble" has to mean all of it — see `PATCH_VISIBLE_LISTENS`.
+        match state.db.live_visibility(p.user_id, np.chain_id).await {
+            Ok(crate::db::Visible::Yes(chain_name)) => out.push(serde_json::json!({
                 "user_id": p.user_id,
                 "username": p.username,
                 "display_name": p.display_name,
@@ -733,7 +732,11 @@ async fn live(State(state): State<Arc<AppState>>, user: super::auth::AuthUser) -
                 // to stop.
                 "position_known": np.position_known,
                 "paused": np.paused,
+                // Null with `has_chain` true is "Private signal chain" on the
+                // strip; null with it false is a listen that ran through
+                // nothing anybody recorded. Different facts, drawn differently.
                 "chain_name": chain_name,
+                "has_chain": np.chain_id.is_some(),
                 "artwork_url": np.artwork_url,
                 "format_type": np.format_type,
                 "codec": np.codec,
@@ -741,7 +744,7 @@ async fn live(State(state): State<Arc<AppState>>, user: super::auth::AuthUser) -
                 "sample_rate": np.sample_rate,
                 "is_lossless": np.is_lossless,
             })),
-            Ok(None) => {}
+            Ok(crate::db::Visible::No) => {}
             Err(e) => warn!("📡 live: {e}"),
         }
     }
@@ -1149,6 +1152,69 @@ async fn get_federation(
 /// now-playing switch sit on: `AuthUser`, so a token gets 401 and the question
 /// of scopes never arises.
 ///
+/// What a patched deck sees of this account.
+async fn get_share_all(
+    State(state): State<Arc<AppState>>,
+    user: super::auth::AuthUser,
+) -> Response {
+    match state.db.share_all_with_patched(user.user_id).await {
+        Ok(on) => (StatusCode::OK, Json(serde_json::json!({ "enabled": on }))).into_response(),
+        Err(e) => {
+            warn!("📡 share-all: {e}");
+            refused(StatusCode::INTERNAL_SERVER_ERROR, "Could not read that")
+        }
+    }
+}
+
+/// `PUT /api/v1/profile/share-all` — let patched decks see everything, or not.
+///
+/// **The third sharing switch, and it answers a third question.**
+/// `public_now_playing` decides whether a stranger may read the deck;
+/// `federation_enabled` decides whether this account can be *found*; this one
+/// decides how much a person you have already let in can see. They are
+/// deliberately separate because letting one friend in is not the same act as
+/// being listed publicly, and the settings copy has to carry that difference.
+///
+/// **Off by default and off for every account that predates it.** A patch
+/// accepted under the old rule was accepted on the understanding that an
+/// unshared chain published nothing, and nobody consents to more by their
+/// operator upgrading a binary — the rule `public_now_playing` and
+/// `federation_enabled` both follow.
+///
+/// It widens what a **patched** deck sees and nothing else. The Instance tab
+/// still counts shared-chain listens only, because a patch is consent to one
+/// person and there is no patch behind a figure the whole instance reads; and
+/// a Shared Spool still captures only through shared chains, because a capture
+/// enters somebody's history rather than merely being visible.
+///
+/// Session-only, like the other two: a token is held by a scrobble client, and
+/// no scrobble client has business widening who may read its owner's listening.
+async fn put_share_all(
+    State(state): State<Arc<AppState>>,
+    user: super::auth::AuthUser,
+    Json(body): Json<FederationRequest>,
+) -> Response {
+    // Required, not an `Option<bool>` with a default: a body that merely
+    // misspelled the key must not be read as an answer, and here the two
+    // answers are "show them everything I play" and "no".
+    let Some(enabled) = body.enabled else {
+        return refused(
+            StatusCode::BAD_REQUEST,
+            "`enabled` is required — say true or false explicitly.",
+        );
+    };
+    if let Err(e) = state.db.set_share_all_with_patched(user.user_id, enabled).await {
+        warn!("📡 could not set share-all for {}: {e}", user.username);
+        return refused(StatusCode::INTERNAL_SERVER_ERROR, "Could not save that");
+    }
+    info!(
+        "📡 {} now shows patched decks {}",
+        user.username,
+        if enabled { "every listen" } else { "only shared chains" }
+    );
+    (StatusCode::OK, Json(serde_json::json!({ "enabled": enabled }))).into_response()
+}
+
 /// Switching **on** mints the keypair then and there rather than leaving it to
 /// the first stranger's fetch. It costs a moment on a screen where somebody is
 /// waiting anyway, and it means the settings page can show the real actor URI

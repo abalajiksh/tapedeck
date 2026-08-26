@@ -26,7 +26,7 @@ openapi: 3.1.0
 
 info:
   title: Tapedeck
-  version: 0.92.4
+  version: 0.93.0
   summary: Self-hosted scrobbler and listening journal.
   description: |
     Tapedeck ingests listens, enriches them with MusicBrainz metadata, stores
@@ -2387,6 +2387,68 @@ paths:
 
 
   # ── Patch (ActivityPub) ────────────────────────────────────────────────────
+  /api/v1/profile/share-all:
+    get:
+      tags: [Patch]
+      summary: Whether patched decks see all your listens.
+      description: Session-only.
+      responses:
+        '200':
+          description: OK.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties: { enabled: { type: boolean } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+    put:
+      tags: [Patch]
+      summary: Let patched decks see every listen, or only shared chains.
+      description: |
+        Session-only. **The third sharing switch, and it answers a third
+        question.** `public_now_playing` decides whether a stranger may read
+        the deck; `/profile/federation` decides whether this account can be
+        *found*; this one decides how much a person you have already let in can
+        see.
+
+
+        **Off by default and off for every account that predates it.** A patch
+        accepted under the old rule was accepted on the understanding that a
+        listen through an unshared chain published nothing, and nobody consents
+        to more by their operator upgrading a binary.
+
+
+        On, a patched deck sees every listen — including those through chains
+        you keep private and those with no chain at all — and the chain is
+        named only where you share it, rendering as "Private signal chain"
+        otherwise. It widens what a **patched** deck sees and nothing else: the
+        Instance tab still counts shared-chain listens only, because a patch is
+        consent to one person and there is no patch behind a figure the whole
+        instance reads; and a Shared Spool still captures only through shared
+        chains, because a capture enters somebody's history rather than merely
+        being visible.
+
+
+        `enabled` is required — a body that merely misspelled the key must not
+        be read as an answer.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [enabled]
+              properties: { enabled: { type: boolean } }
+      responses:
+        '200':
+          description: Saved.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties: { enabled: { type: boolean } }
+        '400': { description: '`enabled` was absent.' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
   /api/v1/profile/federation:
     get:
       tags: [Patch]

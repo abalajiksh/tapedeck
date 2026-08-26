@@ -126,6 +126,22 @@ pub struct HandedSitting {
     pub ended_at: Option<i64>,
 }
 
+/// Whether a patched deck may see a listen, and whether it may be told what it
+/// ran through.
+///
+/// Two answers rather than one because since 2026-08-26 they can differ: a deck
+/// that has opened up shows every listen, and names the chain only on the ones
+/// whose chain it shares.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Visible {
+    /// Not shown at all.
+    No,
+    /// Shown. `Some(name)` when the chain may be named, `None` when it may not
+    /// — which the screen renders as "Private signal chain" rather than as a
+    /// hole.
+    Yes(Option<String>),
+}
+
 /// One sitting **you** passed on, for the sender's own list.
 ///
 /// A separate type from [`HandedSitting`] rather than a nullable-both-ways
@@ -1127,6 +1143,13 @@ impl Database {
                 -- this design, so being discoverable and being readable are two
                 -- switches and always will be.
                 federation_enabled INTEGER NOT NULL DEFAULT 0,
+                -- Whether a deck you have patched with sees **all** your
+                -- listens, or only those through chains you share.
+                --
+                -- Off by default, which is the old behaviour exactly. See
+                -- `PATCH_VISIBLE_LISTENS` for what it opens up and, just as
+                -- importantly, what it does not.
+                share_all_with_patched INTEGER NOT NULL DEFAULT 0,
                 -- Whether a play accepted out of a Shared Spool is forwarded on
                 -- to this account's Last.fm / ListenBrainz, or stored here
                 -- only.
@@ -3111,6 +3134,19 @@ impl Database {
             info!("⚙️ Migrating: adding users.federation_enabled...");
             let _ = sqlx::query(
                 "ALTER TABLE users ADD COLUMN federation_enabled INTEGER NOT NULL DEFAULT 0",
+            )
+            .execute(&self.pool)
+            .await;
+        }
+
+        // Nobody is published by an upgrade — the rule `public_now_playing`
+        // and `federation_enabled` both follow, and the one that matters most
+        // here: a patch accepted under the old rule was accepted on the
+        // understanding that an unshared chain published nothing.
+        if !has_column(&self.pool, "users", "share_all_with_patched").await {
+            info!("⚙️ Migrating: adding users.share_all_with_patched...");
+            let _ = sqlx::query(
+                "ALTER TABLE users ADD COLUMN share_all_with_patched INTEGER NOT NULL DEFAULT 0",
             )
             .execute(&self.pool)
             .await;
@@ -14011,14 +14047,22 @@ impl Database {
                     s.submission_client,
                     u.id AS user_id, u.username, u.display_name, u.avatar_url,
                     a.uri AS actor_uri,
-                    c.name AS chain_name, c.icon AS chain_icon, c.components AS chain_components
+                    -- Named only when its owner shares it; present-but-private
+                    -- and absent-entirely are different facts and the row draws
+                    -- them differently. See `CHAIN_VISIBILITY`.
+                    CASE WHEN c.shared = 1 THEN c.name END AS chain_name,
+                    CASE WHEN c.shared = 1 THEN c.icon END AS chain_icon,
+                    CASE WHEN c.shared = 1 THEN c.components END AS chain_components,
+                    CASE WHEN s.chain_id IS NULL THEN 0 ELSE 1 END AS has_chain
                FROM scrobbles s
-               JOIN signal_chains c ON c.id = s.chain_id AND c.shared = 1
+               LEFT JOIN signal_chains c ON c.id = s.chain_id
                JOIN users u ON u.id = s.user_id
                JOIN patches p ON p.target_user_id = s.user_id
                LEFT JOIN actors a ON a.user_id = u.id
               WHERE p.follower_user_id = ? AND p.state = 'accepted'
                 AND s.skipped = FALSE
+                -- The gate, and the whole of it — see `PATCH_VISIBLE_LISTENS`.
+                AND (u.share_all_with_patched = 1 OR c.shared = 1)
                 AND (? IS NULL OR s.timestamp < ?)
                 AND (? IS NULL OR u.username = ?)
                 AND (? IS NULL OR
@@ -14104,11 +14148,54 @@ impl Database {
     /// reader cannot quietly publish more than the Reel does.
     ///
     /// `?` binds the reader's own user id.
-    pub(crate) const SHARED_LISTENS: &'static str = "FROM scrobbles s \
-         JOIN signal_chains c ON c.id = s.chain_id AND c.shared = 1 \
+    /// What a deck you are patched with may **see**.
+    ///
+    /// **The sharing unit moved from the chain to the patch** (Ashwin,
+    /// 2026-08-26), and this is where that lives. It used to `JOIN
+    /// signal_chains … AND c.shared = 1`, so a listen was published by the
+    /// *equipment* it ran through — which meant a deck you had deliberately
+    /// let in still saw nothing of anything played on gear you had not
+    /// switched on, including everything with no chain at all (Navidrome, an
+    /// unattributed submission). A signal chain is a gear configuration; using
+    /// it as an access-control list was always an odd proxy for consent, and a
+    /// patch is a decision about a *person*, which is what consent is.
+    ///
+    /// So a listen is visible when **either**:
+    ///
+    /// * its owner has `share_all_with_patched` on — the switch is off by
+    ///   default and off for every account that predates it, because a patch
+    ///   accepted under the old rule was accepted on the understanding that an
+    ///   unshared chain published nothing; or
+    /// * it ran through a chain its owner shares, which is the old rule intact.
+    ///
+    /// **`LEFT JOIN`, and that is deliberate here** — the opposite of the
+    /// warning on `reel`, which said an inner join was what stopped every
+    /// unattributed listen being published. That warning was right *while the
+    /// chain was the gate*. It is not the gate any more, so the join is there
+    /// to name the chain rather than to decide, and the deciding is in the
+    /// `WHERE`. `c.shared = 1` over a missing row is NULL, which is false — so
+    /// a chainless listen is still excluded unless the switch is on.
+    ///
+    /// Three narrowings are **unchanged and must stay**: the patch is
+    /// `accepted`, skips never appear, and this is not what the Instance tab
+    /// counts — that stays chain-gated, because a patch is consent to one
+    /// person and there is no patch behind a figure the whole instance reads.
+    pub(crate) const PATCH_VISIBLE_LISTENS: &'static str = "FROM scrobbles s \
          JOIN users u ON u.id = s.user_id \
+         LEFT JOIN signal_chains c ON c.id = s.chain_id \
          JOIN patches p ON p.target_user_id = s.user_id \
-        WHERE p.follower_user_id = ? AND p.state = 'accepted' AND s.skipped = FALSE";
+        WHERE p.follower_user_id = ? AND p.state = 'accepted' AND s.skipped = FALSE \
+          AND (u.share_all_with_patched = 1 OR c.shared = 1)";
+
+    /// How a chain is named to somebody who may see the listen.
+    ///
+    /// Shared chains are named; a chain its owner keeps private is present but
+    /// unnamed, and the screen says *"Private signal chain"* rather than
+    /// leaving a hole. A listen with no chain at all says nothing — those are
+    /// different facts and the row draws them differently.
+    pub(crate) const CHAIN_VISIBILITY: &'static str =
+        "CASE WHEN c.shared = 1 THEN c.name END AS chain_name, \
+         CASE WHEN s.chain_id IS NULL THEN 0 ELSE 1 END AS has_chain";
 
     /// The folded artist keys this user plays, with their own counts.
     ///
@@ -14162,7 +14249,7 @@ impl Database {
                {} AND (?2 IS NULL OR s.timestamp >= ?2) \
             GROUP BY LOWER(TRIM(s.artist)) \
             ORDER BY plays DESC LIMIT ?3",
-            Self::SHARED_LISTENS
+            Self::PATCH_VISIBLE_LISTENS
         ))
         .bind(user_id)
         .bind(since)
@@ -14251,8 +14338,10 @@ impl Database {
         // history *per artist of theirs*. See `my_artist_plays`.
         let theirs: Vec<(String, String)> = sqlx::query_as(
             "SELECT s.artist, LOWER(TRIM(s.artist)) FROM scrobbles s
-               JOIN signal_chains c ON c.id = s.chain_id AND c.shared = 1
+               JOIN users u ON u.id = s.user_id
+               LEFT JOIN signal_chains c ON c.id = s.chain_id
               WHERE s.user_id = ? AND s.skipped = FALSE
+                AND (u.share_all_with_patched = 1 OR c.shared = 1)
               GROUP BY LOWER(TRIM(s.artist))
               ORDER BY COUNT(*) DESC",
         )
@@ -14269,8 +14358,10 @@ impl Database {
 
         let listens: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM scrobbles s
-               JOIN signal_chains c ON c.id = s.chain_id AND c.shared = 1
-              WHERE s.user_id = ? AND s.skipped = FALSE",
+               JOIN users u ON u.id = s.user_id
+               LEFT JOIN signal_chains c ON c.id = s.chain_id
+              WHERE s.user_id = ? AND s.skipped = FALSE
+                AND (u.share_all_with_patched = 1 OR c.shared = 1)",
         )
         .bind(id)
         .fetch_one(&self.pool)
@@ -15269,23 +15360,81 @@ impl Database {
         .await
     }
 
-    /// That chain's name, **only if its owner shares it**.
+    /// Whether a deck you have patched with sees **all** your listens.
+    pub async fn share_all_with_patched(&self, user_id: i64) -> Result<bool, sqlx::Error> {
+        Ok(sqlx::query_scalar("SELECT share_all_with_patched FROM users WHERE id = ?")
+            .bind(user_id)
+            .fetch_optional(&self.pool)
+            .await?
+            .unwrap_or(false))
+    }
+
+    /// Open the deck up to everyone patched with you, or close it again.
+    ///
+    /// Closing takes effect immediately and completely: every read goes back
+    /// through `PATCH_VISIBLE_LISTENS`, which is evaluated per query rather
+    /// than copied anywhere. Nothing was ever handed over — unlike a spool
+    /// capture, which enters somebody's history and stays there — so this is a
+    /// switch that genuinely reverses.
+    pub async fn set_share_all_with_patched(
+        &self,
+        user_id: i64,
+        on: bool,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query("UPDATE users SET share_all_with_patched = ? WHERE id = ?")
+            .bind(on)
+            .bind(user_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// May a patched deck see what this person is playing, and may it be told
+    /// what through?
+    ///
+    /// Two questions, and since 2026-08-26 they have different answers — which
+    /// is the whole of what changed. `Visible::No` means the listen is not
+    /// shown at all; `Visible::Yes(None)` means it is shown with *"Private
+    /// signal chain"* where the chain would be.
     ///
     /// Returns the name rather than a boolean so one round trip answers both
     /// "may this be shown" and "what is it called" — and so a caller cannot
     /// accidentally show the name of a chain it did not check.
-    pub async fn chain_if_shared(
+    ///
+    /// `chain_id` is `None` for a source that reports no chain at all
+    /// (Navidrome, an unattributed submission). Those used to be excluded
+    /// outright; now they are shown when their owner has opened up, because
+    /// "all the music they scrobble" has to mean all of it.
+    pub async fn live_visibility(
         &self,
         user_id: i64,
-        chain_id: i64,
-    ) -> Result<Option<String>, sqlx::Error> {
-        sqlx::query_scalar(
-            "SELECT name FROM signal_chains WHERE id = ? AND user_id = ? AND shared = 1",
-        )
-        .bind(chain_id)
-        .bind(user_id)
-        .fetch_optional(&self.pool)
-        .await
+        chain_id: Option<i64>,
+    ) -> Result<Visible, sqlx::Error> {
+        let all: bool = sqlx::query_scalar("SELECT share_all_with_patched FROM users WHERE id = ?")
+            .bind(user_id)
+            .fetch_optional(&self.pool)
+            .await?
+            .unwrap_or(false);
+
+        let named: Option<String> =
+            match chain_id {
+                Some(cid) => sqlx::query_scalar(
+                    "SELECT name FROM signal_chains WHERE id = ? AND user_id = ? AND shared = 1",
+                )
+                .bind(cid)
+                .bind(user_id)
+                .fetch_optional(&self.pool)
+                .await?,
+                None => None,
+            };
+
+        // A shared chain is visible however the switch is set — that is the old
+        // rule, intact.
+        if named.is_some() || all {
+            Ok(Visible::Yes(named))
+        } else {
+            Ok(Visible::No)
+        }
     }
 
     /// How many things are waiting on this person in Patch.
@@ -15376,12 +15525,16 @@ impl Database {
 
     /// The document itself: what played, in order, and what is not shown.
     ///
-    /// **Only listens through shared chains appear**, exactly as for the Reel —
-    /// a hand-over is a deliberate act but it is still publishing, and this
-    /// phase has one switch for that, not two. The listens it therefore leaves
-    /// out are **counted and reported** rather than silently dropped: a
-    /// document with invisible holes misrepresents the evening, and the
-    /// recipient could never tell.
+    /// **Shows exactly what the Reel would**, which since 2026-08-26 means:
+    /// every listen if the sender has `share_all_with_patched` on, and
+    /// otherwise only those through chains they share. Following the Reel is
+    /// the point — a recipient who can already see a listen on the Reel would
+    /// find it absurd to have it withheld from a document that person chose to
+    /// hand them.
+    ///
+    /// Whatever is left out is **counted and reported** rather than silently
+    /// dropped: a document with invisible holes misrepresents the evening, and
+    /// the recipient could never tell.
     ///
     /// Rendered live, so un-sharing a chain afterwards really does take those
     /// listens back out.
@@ -15439,10 +15592,13 @@ impl Database {
 
         let listens: Vec<HandedListen> = sqlx::query_as(
             "SELECT s.title, s.artist, s.album, s.timestamp, s.duration, s.artwork_url,
-                    s.caa_id, s.caa_release_mbid, c.name AS chain_name
+                    s.caa_id, s.caa_release_mbid,
+                    CASE WHEN c.shared = 1 THEN c.name END AS chain_name
                FROM scrobbles s
-               JOIN signal_chains c ON c.id = s.chain_id AND c.shared = 1
+               JOIN users u ON u.id = s.user_id
+               LEFT JOIN signal_chains c ON c.id = s.chain_id
               WHERE s.session_id = ? AND s.skipped = FALSE
+                AND (u.share_all_with_patched = 1 OR c.shared = 1)
               ORDER BY s.timestamp",
         )
         .bind(session_id)
@@ -16040,11 +16196,18 @@ pub struct ReelListen {
     /// has no published address, and the row shows none rather than inventing
     /// one that resolves nowhere.
     pub actor_uri: Option<String>,
-    /// The chain is the whole point of the Reel: it is what makes a Tapedeck
-    /// listen a Tapedeck listen rather than a sentence.
-    pub chain_name: String,
+    /// The chain, **when its owner shares it**.
+    ///
+    /// `None` has two meanings and the row must not conflate them, which is
+    /// what `has_chain` is for: a chain kept private reads *"Private signal
+    /// chain"*, and a listen that ran through no chain at all says nothing.
+    /// Before 2026-08-26 this was a non-`Option` `String`, because the chain
+    /// *was* the gate and a row could not exist without one.
+    pub chain_name: Option<String>,
     pub chain_icon: Option<String>,
     pub chain_components: Option<String>,
+    /// Whether there was a chain, whatever its owner shares.
+    pub has_chain: bool,
 }
 
 /// An artist seen across the decks a user is patched into.
@@ -21246,7 +21409,11 @@ mod tests {
         assert_eq!(reel.len(), 1);
         assert_eq!(reel[0].title, "Teardrop");
         assert_eq!(reel[0].username, "kim");
-        assert_eq!(reel[0].chain_name, "Study Chain", "the chain is the point of the Reel");
+        assert_eq!(
+            reel[0].chain_name.as_deref(),
+            Some("Study Chain"),
+            "a shared chain is still named"
+        );
 
         // And withdrawing takes it away again.
         assert!(db.unpatch(me, them).await.unwrap());
@@ -21757,6 +21924,129 @@ mod tests {
         assert_eq!(pulse.listens, 1);
     }
 
+    /// The switch opens the deck up, and the things it must **not** open.
+    ///
+    /// The sharing unit moved from the chain to the patch on 2026-08-26: a
+    /// signal chain is a gear configuration, and using it as an access-control
+    /// list was an odd proxy for consent, where a patch is a decision about a
+    /// person. So a deck that has opened up shows everything to those it has
+    /// let in — including listens with no chain at all, which the chain gate
+    /// could never have shown however many switches were on.
+    ///
+    /// Three narrowings survive it, and each is here because it protects
+    /// somebody who did not agree to this:
+    ///
+    /// * **The Instance tab stays chain-gated.** A patch is consent to one
+    ///   person; there is no patch behind a figure the whole instance reads.
+    /// * **Skips still never appear**, anywhere, ever.
+    /// * **The switch is per deck.** Opening yours says nothing about mine.
+    #[tokio::test]
+    async fn opening_a_deck_up_shows_every_listen_and_still_spares_the_instance() {
+        let db = testdb().await;
+        let (me, them, chain) = patched_pair(&db).await;
+        let private = sqlx::query_scalar::<_, i64>(
+            "INSERT INTO signal_chains (user_id, name, created_at) VALUES (?, 'Bedroom', ?) \
+             RETURNING id",
+        )
+        .bind(them)
+        .bind(Database::now_secs())
+        .fetch_all(&db.pool)
+        .await
+        .unwrap()[0];
+
+        listen(&db, them, Some(chain), "Shared", "Public Artist", 1_760_000_100).await;
+        listen(&db, them, Some(private), "Hidden", "Private Artist", 1_760_000_200).await;
+        listen(&db, them, None, "Orphan", "Chainless Artist", 1_760_000_300).await;
+        let skip = Play::new(
+            "Bailed".into(),
+            "Skipped Artist".into(),
+            1_760_000_400,
+            "sk-1".into(),
+            "test".into(),
+        );
+        db.save_scrobble(
+            them,
+            &skip,
+            None,
+            None,
+            Some(private),
+            None,
+            None,
+            None,
+            None,
+            ListenDisposition { imported: false, skipped: true },
+        )
+        .await
+        .unwrap();
+
+        db.set_share_all_with_patched(them, true).await.unwrap();
+
+        let reel = db.reel(me, 50, None, None, None).await.unwrap();
+        let titles: Vec<&str> = reel.iter().map(|r| r.title.as_str()).collect();
+        assert_eq!(
+            titles,
+            ["Orphan", "Hidden", "Shared"],
+            "everything they played, newest first — and never the skip"
+        );
+
+        // The chain is named only where they share it, and "private" is told
+        // apart from "there was none".
+        let by_title = |t: &str| reel.iter().find(|r| r.title == t).expect("row");
+        assert_eq!(by_title("Shared").chain_name.as_deref(), Some("Study"));
+        assert!(by_title("Shared").has_chain);
+        assert_eq!(by_title("Hidden").chain_name, None, "a private chain is not named");
+        assert!(by_title("Hidden").has_chain, "but the screen must know there *was* one");
+        assert_eq!(by_title("Orphan").chain_name, None);
+        assert!(!by_title("Orphan").has_chain, "and that this one ran through nothing");
+
+        // The rest of the patched screens follow.
+        let names: Vec<String> =
+            db.patch_artists(me, 50, None).await.unwrap().into_iter().map(|a| a.name).collect();
+        assert_eq!(names.len(), 3, "artists tab, got {names:?}");
+        let deck = db.deck_view(me, "kim").await.unwrap().expect("the deck");
+        assert_eq!(deck.listens, 3, "deck page");
+        assert_eq!(deck.chains.len(), 1, "but it still lists only the chains they share");
+
+        // And the instance does not. This is the assertion that matters most:
+        // it is the one place a person who never agreed to any of this is read.
+        let pulse = db.instance_pulse(0).await.unwrap();
+        assert_eq!(pulse.listens, 1, "instance figures stay chain-gated");
+        let pulse_names: Vec<String> = pulse.artists.iter().map(|a| a.name.clone()).collect();
+        assert_eq!(pulse_names, ["Public Artist"]);
+    }
+
+    /// The switch is one deck's own, and closing it closes everything again.
+    #[tokio::test]
+    async fn the_switch_is_per_deck_and_reverses() {
+        let db = testdb().await;
+        let (me, them, chain) = patched_pair(&db).await;
+        let mine = sqlx::query_scalar::<_, i64>(
+            "INSERT INTO signal_chains (user_id, name, created_at) VALUES (?, 'Mine', ?) \
+             RETURNING id",
+        )
+        .bind(me)
+        .bind(Database::now_secs())
+        .fetch_all(&db.pool)
+        .await
+        .unwrap()[0];
+
+        listen(&db, them, None, "Theirs", "Their Artist", 1_760_000_100).await;
+        listen(&db, me, Some(mine), "Mine", "My Artist", 1_760_000_200).await;
+
+        // I open *mine*. Theirs is untouched, so their chainless listen stays
+        // hidden from me — the switch is not a setting on the relationship.
+        db.set_share_all_with_patched(me, true).await.unwrap();
+        assert!(db.reel(me, 50, None, None, None).await.unwrap().is_empty(), "mine is not theirs");
+
+        db.set_share_all_with_patched(them, true).await.unwrap();
+        assert_eq!(db.reel(me, 50, None, None, None).await.unwrap().len(), 1);
+
+        // Nothing was ever handed over, so closing it takes it back completely.
+        db.set_share_all_with_patched(them, false).await.unwrap();
+        assert!(db.reel(me, 50, None, None, None).await.unwrap().is_empty(), "and it reverses");
+        assert_eq!(chain, chain);
+    }
+
     /// A deck page is readable only through an accepted patch, and the check
     /// is in the query rather than the handler.
     #[tokio::test]
@@ -21960,11 +22250,12 @@ mod tests {
         assert!(titles(db.reel(me, 40, None, Some("%"), None).await.unwrap()).is_empty());
     }
 
-    /// A live deck is gated on the same shared chain a banked listen is.
+    /// A live deck is gated exactly as a banked listen is.
     ///
-    /// `chain_if_shared` is the whole gate for Patch's live strip, and it
-    /// returns the *name* rather than a boolean so one round trip answers both
-    /// questions — which is also what stops a caller showing the name of a
+    /// With the switch **off** — the default, and every account that predates
+    /// it — that is the shared chain, unchanged. `live_visibility` returns the
+    /// chain's *name* rather than a boolean so one round trip answers both
+    /// questions, which is also what stops a caller showing the name of a
     /// chain it never checked.
     #[tokio::test]
     async fn a_live_deck_is_gated_on_the_same_shared_chain_a_listen_is() {
@@ -21980,13 +22271,45 @@ mod tests {
         .await
         .unwrap()[0];
 
-        assert_eq!(db.chain_if_shared(them, shared).await.unwrap().as_deref(), Some("Study"));
-        assert!(
-            db.chain_if_shared(them, private).await.unwrap().is_none(),
-            "unshared shows nothing"
+        assert_eq!(
+            db.live_visibility(them, Some(shared)).await.unwrap(),
+            Visible::Yes(Some("Study".into()))
+        );
+        assert_eq!(
+            db.live_visibility(them, Some(private)).await.unwrap(),
+            Visible::No,
+            "with the switch off an unshared chain shows nothing at all"
+        );
+        assert_eq!(
+            db.live_visibility(them, None).await.unwrap(),
+            Visible::No,
+            "and neither does a source that reports no chain"
         );
         // Somebody else's chain is not yours to publish, whatever its switch says.
-        assert!(db.chain_if_shared(me, shared).await.unwrap().is_none(), "scoped by owner");
+        assert_eq!(
+            db.live_visibility(me, Some(shared)).await.unwrap(),
+            Visible::No,
+            "scoped by owner"
+        );
+
+        // With the switch on, the track shows and the private chain is simply
+        // not named — which is the whole of what changed.
+        db.set_share_all_with_patched(them, true).await.unwrap();
+        assert_eq!(
+            db.live_visibility(them, Some(shared)).await.unwrap(),
+            Visible::Yes(Some("Study".into())),
+            "a shared chain is still named"
+        );
+        assert_eq!(
+            db.live_visibility(them, Some(private)).await.unwrap(),
+            Visible::Yes(None),
+            "a private chain shows the track and withholds the name"
+        );
+        assert_eq!(
+            db.live_visibility(them, None).await.unwrap(),
+            Visible::Yes(None),
+            "and a chainless listen shows too — 'all the music they scrobble' means all of it"
+        );
 
         // And the strip only ever looks at decks you actually patched into.
         let peers = db.accepted_patch_targets(me).await.unwrap();
@@ -23032,7 +23355,7 @@ mod tests {
                 "patch_artists",
                 format!(
                     "SELECT s.artist, COUNT(*) {} GROUP BY LOWER(TRIM(s.artist)) LIMIT 50",
-                    Database::SHARED_LISTENS
+                    Database::PATCH_VISIBLE_LISTENS
                 ),
             ),
             (

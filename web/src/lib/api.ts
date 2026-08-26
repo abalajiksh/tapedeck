@@ -561,9 +561,11 @@ export interface ArtistDeck {
 
 /** A deck you're patched into, playing something right now.
  *
- *  Gated by exactly the rule the Reel uses — an accepted patch and a **shared
- *  chain** — which is why `chain_name` is always present here: an entry that
- *  could not be checked never reaches this list. */
+ *  Gated by exactly the rule the Reel uses — an accepted patch, and then
+ *  either the deck has opened up or the listen ran through a chain they share.
+ *  `chain_name` is therefore nullable: `null` with `has_chain` means "Private
+ *  signal chain", and `null` without it means the listen ran through nothing
+ *  anybody recorded. Two different facts, drawn differently. */
 export interface LiveDeck {
 	user_id: number;
 	username: string;
@@ -578,7 +580,10 @@ export interface LiveDeck {
 	 *  playhead. Drawn as an estimate, never as a measurement. */
 	position_known: boolean;
 	paused: boolean;
-	chain_name: string;
+	/** Named only when its owner shares the chain — see the note above. */
+	chain_name: string | null;
+	/** Whether there was a chain at all, whatever its owner shares. */
+	has_chain: boolean;
 	artwork_url: string | null;
 	format_type: string | null;
 	codec: string | null;
@@ -711,11 +716,16 @@ export interface ReelListen {
 	 *  with no actor has no published address, and showing one would invent
 	 *  something that resolves nowhere. */
 	actor_uri: string | null;
-	/** The chain is the point of the Reel — it is what makes a Tapedeck listen
-	 *  a Tapedeck listen rather than a sentence. */
-	chain_name: string;
+	/** The chain, **when its owner shares it**.
+	 *
+	 *  `null` has two meanings and the row must not conflate them, which is
+	 *  what `has_chain` is for: a chain kept private reads "Private signal
+	 *  chain", and a listen that ran through no chain at all says nothing. */
+	chain_name: string | null;
 	chain_icon: string | null;
 	chain_components: string | null;
+	/** Whether there was a chain, whatever its owner shares. */
+	has_chain: boolean;
 }
 
 export interface ReelPage {
@@ -2141,6 +2151,13 @@ class TapedeckAPI {
 	// deck can be discoverable and unreadable at the same time.
 	//
 	// Session-only on the server, same as the switch above: a token gets 401.
+	/** Whether decks you have patched with see all your listens. */
+	async getShareAll(): Promise<{ enabled: boolean }> {
+		return this.get('/api/v1/profile/share-all');
+	}
+	async setShareAll(enabled: boolean): Promise<{ enabled: boolean }> {
+		return this.put('/api/v1/profile/share-all', { enabled });
+	}
 	async getFederation(): Promise<FederationSwitch> {
 		return this.get('/api/v1/profile/federation');
 	}

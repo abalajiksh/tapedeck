@@ -1153,6 +1153,39 @@
 	let federationSaving = false;
 	let federationCopied = '';
 
+	// ── What a patched deck sees ──
+	//
+	// The third sharing switch, and it answers a third question. The other two
+	// are about strangers: whether the deck can be *read* without a password,
+	// and whether the account can be *found*. This one is about somebody you
+	// have already let in.
+	let shareAll: { enabled: boolean } | null = null;
+	let shareAllLoading = false;
+	let shareAllSaving = false;
+
+	async function loadShareAll() {
+		shareAllLoading = true;
+		try {
+			shareAll = await api.getShareAll();
+		} catch {
+			/* the section shows its own empty state */
+		} finally {
+			shareAllLoading = false;
+		}
+	}
+
+	async function saveShareAll(enabled: boolean) {
+		shareAllSaving = true;
+		try {
+			shareAll = await api.setShareAll(enabled);
+		} catch (e) {
+			alert(e instanceof Error ? e.message : 'Could not save that');
+			await loadShareAll();
+		} finally {
+			shareAllSaving = false;
+		}
+	}
+
 	async function loadFederation() {
 		federationLoading = true;
 		try {
@@ -1249,6 +1282,7 @@
 	$: if (section === 'ai' && !mcpEndpoint && !mcpLoading) loadMcp();
 	$: if (section === 'sharing' && !publish && !publishLoading) loadPublish();
 	$: if (section === 'sharing' && !federation && !federationLoading) loadFederation();
+	$: if (section === 'sharing' && !shareAll && !shareAllLoading) loadShareAll();
 
 	let mcpConnections: McpConnection[] = [];
 	let mcpEndpoint = '';
@@ -1612,6 +1646,51 @@
 		{/if}
 
 		{#if section === 'sharing'}
+			<!-- Three switches, three different questions, and the copy has to
+			     carry the difference or they read as one feature built thrice.
+			     This one first, because it is the one about people you know. -->
+			<div class="panel" style="border-radius:22px;padding:24px;margin-bottom:18px;">
+				<h3 class="h-display" style="font-size:19px;margin-bottom:4px;">What patched decks see</h3>
+				<p style="font-size:13px;color:var(--td-muted);margin:0 0 6px;max-width:64ch;">
+					Somebody you have patched with has already been let in — you approved them. This
+					decides how much of your listening they see once they are.
+				</p>
+				<p style="font-size:12.5px;color:var(--td-muted-3);margin:0 0 18px;max-width:64ch;">
+					It changes nothing for anyone else. The instance-wide figures still count only
+					listens through chains you share, and a Shared Spool still captures only those —
+					a capture lands in somebody's history, which is a good deal more than being seen.
+				</p>
+
+				{#if shareAllLoading && !shareAll}
+					<p style="font-size:13px;color:var(--td-muted-3);">Loading…</p>
+				{:else if !shareAll}
+					<p style="font-size:13px;color:var(--td-muted-3);">Couldn't load this setting.</p>
+				{:else}
+					<div class="row">
+						<div class="row-main">
+							<div class="row-title">Show them everything I play</div>
+							<div class="row-sub">
+								Off, they see only what runs through chains you have shared — which
+								leaves out anything played on gear you keep private, and everything
+								with no chain recorded at all. On, they see every listen, and a chain
+								you keep private simply reads <em>Private signal chain</em> instead of
+								its name.
+							</div>
+						</div>
+						<label style="display:flex;align-items:center;gap:8px;cursor:pointer;font-size:14px;white-space:nowrap;">
+							<input type="checkbox" checked={shareAll.enabled} disabled={shareAllSaving}
+								on:change={(e) => saveShareAll(e.currentTarget.checked)}
+								style="width:16px;height:16px;accent-color:var(--td-accent);cursor:pointer;">
+							{shareAllSaving ? 'Saving…' : shareAll.enabled ? 'On' : 'Off'}
+						</label>
+					</div>
+					<p style="font-size:12px;color:var(--td-muted-3);margin:12px 0 0;max-width:64ch;">
+						Nothing is copied anywhere, so turning this off takes it all back — unlike a
+						spool capture, which somebody has already accepted into their own history.
+					</p>
+				{/if}
+			</div>
+
 			<div class="panel" style="border-radius:22px;padding:24px;margin-bottom:18px;">
 				<h3 class="h-display" style="font-size:19px;margin-bottom:4px;">Public now-playing</h3>
 				<p style="font-size:13px;color:var(--td-muted);margin:0 0 6px;max-width:64ch;">
