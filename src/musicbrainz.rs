@@ -37,12 +37,90 @@ impl Default for MusicBrainzConfig {
     fn default() -> Self {
         Self {
             api_base_url: "https://musicbrainz.org/ws/2".to_string(),
-            user_agent: "Tapedeck/1.0 ( your-email@example.com )".to_string(),
+            user_agent: user_agent_for(None),
             rate_limit_per_second: 1, // MusicBrainz rate limit
             postgres_url: None,
             enable_postgres: false,
         }
     }
+}
+
+/// The contact string an unconfigured instance carries, and the one
+/// [`contact_is_placeholder`] refuses.
+pub const UNCONFIGURED_CONTACT: &str = "no contact configured";
+
+/// Build the `User-Agent` MusicBrainz asks every client to send.
+///
+/// **Derived from `CARGO_PKG_*`, never written out**, because it had been
+/// written out three times — `Tapedeck/1.0` here, `Tapedeck/0.5.0` in
+/// `config.rs` and `Tapedeck/0.10.0` in `tapedeck.toml.example` — on an
+/// application that was at 0.101.0. A version string a human has to remember
+/// to bump is one that is always wrong, and this one is sent to a service that
+/// judges us by it.
+pub fn user_agent_for(contact: Option<&str>) -> String {
+    let contact = contact.map(str::trim).filter(|c| !c.is_empty()).unwrap_or(UNCONFIGURED_CONTACT);
+    format!("{}/{} ( {} )", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"), contact)
+}
+
+/// Does this `User-Agent` name somebody MusicBrainz could actually reach?
+///
+/// **This is what got the instance blocked** (2026-08-27). The shipped default
+/// was `Tapedeck/1.0 ( your-email@example.com )` — a template nobody had
+/// filled in — and MetaBrainz's policy is explicit that a client must identify
+/// itself with real contact details and that ones which do not are blocked.
+/// A placeholder is *worse* than a bare product name: it identifies an
+/// unconfigured bot. Their edge then denied the address at the connection
+/// level, which is why 48 hours of logs contain no HTTP status at all — the
+/// server accepted each TCP connection and closed it without answering, on
+/// port 80 as well as 443.
+///
+/// So this is the same rule the Every Noise scrape already follows — it
+/// **refuses to start without an admin contact email**, on the grounds that a
+/// made-up address is worse than none. That rule existed and this client did
+/// not follow it.
+///
+/// Deliberately a check on the *contact*, not on the whole string: an operator
+/// may set any product name they like, but `example.com` in it means nobody is
+/// there.
+/// Which service a URL belongs to, for the breaker's key.
+///
+/// Cover Art Archive is tracked **separately from MusicBrainz** even though
+/// both are MetaBrainz: they are different hosts, and on 2026-08-27 exactly one
+/// address was denied. Folding them together would have taken artwork down for
+/// a fault that never touched it.
+fn service_name(url: &str) -> &'static str {
+    if url.contains("coverartarchive.org") {
+        "Cover Art Archive"
+    } else {
+        "MusicBrainz"
+    }
+}
+
+pub fn contact_is_placeholder(user_agent: &str) -> bool {
+    let ua = user_agent.to_ascii_lowercase();
+
+    // No contact at all. MusicBrainz wants a URL or an email; a bare product
+    // name tells them nothing about who to ask to stop.
+    let has_contact = ua.contains('@') || ua.contains("http://") || ua.contains("https://");
+    if !has_contact {
+        return true;
+    }
+
+    // The template values this project and the wider world ship.
+    const TEMPLATES: &[&str] = &[
+        "example.com",
+        "example.org",
+        "example.net",
+        "your-email",
+        "your_email",
+        "youremail",
+        "yourname",
+        "user@host",
+        "changeme",
+        "todo@",
+        "foo@bar",
+    ];
+    TEMPLATES.iter().any(|t| ua.contains(t))
 }
 
 pub struct MusicBrainzClient {
@@ -101,9 +179,78 @@ impl MusicBrainzClient {
             config,
             sqlite_pool,
             postgres_pool,
-            http_client: reqwest::Client::builder().timeout(Duration::from_secs(30)).build()?,
+            // `timeout` is the whole request; `connect_timeout` bounds getting
+            // off the ground. Without the second, a blackholed route holds a
+            // lookup for the full thirty seconds — and these run inside the
+            // engine tick, so that is thirty seconds of the deck being stale
+            // for one unreachable host.
+            http_client: reqwest::Client::builder()
+                .timeout(Duration::from_secs(30))
+                .connect_timeout(Duration::from_secs(10))
+                .build()?,
             rate_limiter,
         })
+    }
+
+    /// The one place an outbound MetaBrainz request is made.
+    ///
+    /// Five call sites used to each do `rate_limiter.acquire()` then build
+    /// their own `get(...).header("User-Agent", ...).send()`, which meant the
+    /// politeness contract had to be remembered five times and the breaker
+    /// would have had to be added five times. It is a chokepoint now, for the
+    /// reason `credited_artists` is one: a rule that decides whether we may
+    /// talk to somebody at all belongs where the talking happens, so the sixth
+    /// call site inherits it instead of having to know.
+    ///
+    /// Three things happen here, in this order, and the order matters:
+    ///
+    /// 1. **Refuse to call at all with a placeholder contact.** Costs nothing
+    ///    and is the only one that prevents the block rather than surviving it.
+    /// 2. **Ask the breaker.** An unreachable service is learned about once,
+    ///    not once per track — on 2026-08-27 a single query was re-sent 155
+    ///    times in 2h18m, and 39 distinct tracks accounted for 912 lookups.
+    /// 3. **Only then pay the rate limiter's second.** That sleep is paid per
+    ///    lookup whether or not it succeeds, so sleeping before a call we were
+    ///    always going to skip is the pure waste that made the backfill block
+    ///    take four minutes.
+    ///
+    /// `Ok` is recorded on the breaker for any *answer*, including a 404 or a
+    /// search that matched nothing: the service is plainly alive, and counting
+    /// "MusicBrainz has never heard of this track" as an outage would open the
+    /// breaker on a library it simply does not cover.
+    async fn api_get(&self, url: &str) -> Result<reqwest::Response> {
+        if contact_is_placeholder(&self.config.user_agent) {
+            return Err(anyhow!(
+                "refusing to call {} with a placeholder User-Agent ({}) — \
+                 set MUSICBRAINZ_CONTACT to an email or URL they can reach",
+                service_name(url),
+                self.config.user_agent
+            ));
+        }
+
+        let service = service_name(url);
+        if let Some(left) = crate::sinks::health().skip_for(service) {
+            return Err(anyhow!("{} is being skipped for another {}s", service, left.as_secs()));
+        }
+
+        self.rate_limiter.acquire().await;
+
+        match self.http_client.get(url).header("User-Agent", &self.config.user_agent).send().await {
+            Ok(resp) => {
+                crate::sinks::health().record_ok(service);
+                Ok(resp)
+            }
+            Err(e) => {
+                // The cause chain, not just `{}`. Bare Display on a reqwest
+                // error is `error sending request for url (...)` for a DNS
+                // failure, a refused connection and a TLS handshake that was
+                // cut off alike — and it was the third of those all along.
+                // Two days of logs said nothing that could tell them apart.
+                let detail = crate::logging::error_chain(&e);
+                crate::sinks::health().record_failure(service, &detail);
+                Err(anyhow!("{}", detail))
+            }
+        }
     }
 
     /// Main entry point - fetches metadata with 3-tier strategy
@@ -379,9 +526,6 @@ impl MusicBrainzClient {
         artist_name: &str,
         _album_name: Option<&str>,
     ) -> Result<MusicBrainzMetadata> {
-        // Rate limiting
-        self.rate_limiter.acquire().await;
-
         // Build search query
         let query = format!(r#"recording:"{}" AND artist:"{}""#, track_title, artist_name);
 
@@ -391,8 +535,7 @@ impl MusicBrainzClient {
             urlencoding::encode(&query)
         );
 
-        let response =
-            self.http_client.get(&url).header("User-Agent", &self.config.user_agent).send().await?;
+        let response = self.api_get(&url).await?;
 
         if !response.status().is_success() {
             return Err(anyhow!("MusicBrainz API error: {}", response.status()));
@@ -461,13 +604,9 @@ impl MusicBrainzClient {
         &self,
         release_mbid: &str,
     ) -> Result<(Option<i64>, Option<String>)> {
-        // Rate limiting
-        self.rate_limiter.acquire().await;
-
         let url = format!("https://coverartarchive.org/release/{}", release_mbid);
 
-        let response =
-            self.http_client.get(&url).header("User-Agent", &self.config.user_agent).send().await?;
+        let response = self.api_get(&url).await?;
 
         if !response.status().is_success() {
             return Ok((None, None));
@@ -586,15 +725,13 @@ impl MusicBrainzClient {
             count: i64,
         }
 
-        self.rate_limiter.acquire().await;
         let query = format!(r#"artist:"{}""#, artist_name.replace('"', ""));
         let url = format!(
             "{}/artist?query={}&fmt=json&limit=1",
             self.config.api_base_url,
             urlencoding::encode(&query)
         );
-        let resp =
-            self.http_client.get(&url).header("User-Agent", &self.config.user_agent).send().await?;
+        let resp = self.api_get(&url).await?;
         if !resp.status().is_success() {
             return Err(anyhow!("MusicBrainz artist search returned {}", resp.status()));
         }
@@ -646,7 +783,6 @@ impl MusicBrainzClient {
                 .unwrap_or_default());
         }
 
-        self.rate_limiter.acquire().await;
         let url = format!(
             "{}/recording/{}?inc=isrcs&fmt=json",
             self.config.api_base_url.trim_end_matches('/'),
@@ -657,8 +793,7 @@ impl MusicBrainzClient {
             #[serde(default)]
             isrcs: Vec<String>,
         }
-        let resp =
-            self.http_client.get(&url).header("User-Agent", &self.config.user_agent).send().await?;
+        let resp = self.api_get(&url).await?;
         if !resp.status().is_success() {
             return Err(anyhow!("MusicBrainz API error: {}", resp.status()));
         }
@@ -719,18 +854,11 @@ impl MusicBrainzClient {
 
         // Tier 2: API — recording?inc=work-rels → work.languages[0] (ISO 639-3).
         if resolved.is_none() {
-            self.rate_limiter.acquire().await;
             let url = format!(
                 "{}/recording/{}?inc=work-rels&fmt=json",
                 self.config.api_base_url, recording_mbid
             );
-            if let Ok(resp) = self
-                .http_client
-                .get(&url)
-                .header("User-Agent", &self.config.user_agent)
-                .send()
-                .await
-            {
+            if let Ok(resp) = self.api_get(&url).await {
                 if resp.status().is_success() {
                     if let Ok(v) = resp.json::<serde_json::Value>().await {
                         resolved = v["relations"]
@@ -861,4 +989,127 @@ struct CAAResponse {
 struct CAAImage {
     id: i64,
     front: bool,
+}
+
+#[cfg(test)]
+mod identity_tests {
+    use super::*;
+
+    /// **The bug that got this instance blocked**, pinned so it cannot ship
+    /// again. `Tapedeck/1.0 ( your-email@example.com )` was the shipped default
+    /// for the entire life of the project, and MetaBrainz denied the address at
+    /// the connection level on 2026-08-27 — no HTTP status, on port 80 as well
+    /// as 443, while every other host on the same machine was reachable.
+    #[test]
+    fn the_shipped_placeholders_are_all_refused() {
+        for ua in [
+            "Tapedeck/1.0 ( your-email@example.com )",
+            "Tapedeck/0.5.0 ( contact@example.com )",
+            "Tapedeck/0.10.0 ( your-email@example.com )",
+            "Tapedeck/0.101.0 ( https://example.org/tapedeck )",
+            "Tapedeck/0.101.0 ( changeme@somewhere.net )",
+        ] {
+            assert!(contact_is_placeholder(ua), "should have been refused: {ua}");
+        }
+    }
+
+    /// A client that names no way to reach anybody is refused too. This is the
+    /// half a check on `example.com` alone would miss, and MusicBrainz's policy
+    /// asks for contact details rather than merely for a product name.
+    #[test]
+    fn a_user_agent_with_no_contact_at_all_is_refused() {
+        assert!(contact_is_placeholder("Tapedeck/0.101.0"));
+        assert!(contact_is_placeholder("Tapedeck/0.101.0 ( )"));
+        assert!(contact_is_placeholder(&user_agent_for(None)));
+        assert!(contact_is_placeholder(&user_agent_for(Some("   "))));
+    }
+
+    /// And a real one passes, by either of the two forms MusicBrainz accepts.
+    /// Without this the check could be "return true" and every test above would
+    /// still pass — which is the shape that silently disables the API forever.
+    #[test]
+    fn a_real_contact_is_accepted() {
+        assert!(!contact_is_placeholder(&user_agent_for(Some("someone@example-host.test"))));
+        assert!(!contact_is_placeholder("Tapedeck/0.101.0 ( https://codeberg.org/x/tapedeck )"));
+    }
+
+    /// The version is read from the crate, not typed out. It had been typed out
+    /// three times, in three different and equally wrong values, on an
+    /// application at 0.101.0 — and it is the string a rate limiter judges.
+    #[test]
+    fn the_user_agent_carries_the_version_the_binary_actually_is() {
+        let ua = user_agent_for(Some("someone@example-host.test"));
+        assert!(ua.contains(env!("CARGO_PKG_VERSION")), "{ua}");
+        assert!(ua.starts_with(env!("CARGO_PKG_NAME")), "{ua}");
+    }
+
+    /// Cover Art Archive is a different host from MusicBrainz and gets its own
+    /// breaker. On 2026-08-27 exactly one address was denied; folding the two
+    /// together would have taken artwork down for a fault it never had.
+    #[test]
+    fn cover_art_is_tracked_apart_from_musicbrainz() {
+        assert_eq!(service_name("https://coverartarchive.org/release/abc"), "Cover Art Archive");
+        assert_eq!(service_name("https://musicbrainz.org/ws/2/recording?query=x"), "MusicBrainz");
+    }
+}
+
+#[cfg(test)]
+mod refusal_tests {
+    use super::*;
+
+    async fn client(user_agent: &str, api_base_url: &str) -> MusicBrainzClient {
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
+        let c = MusicBrainzClient::new(
+            MusicBrainzConfig {
+                api_base_url: api_base_url.to_string(),
+                user_agent: user_agent.to_string(),
+                rate_limit_per_second: 1000, // no pacing; this test makes no calls
+                postgres_url: None,
+                enable_postgres: false,
+            },
+            pool,
+        )
+        .await
+        .unwrap();
+        c.initialize_schema().await.unwrap();
+        c
+    }
+
+    /// **The refusal happens before the request, not instead of reading the
+    /// reply.** Proven by pointing the client at an address nothing can be
+    /// reached at: if a call were made the error would be a transport failure,
+    /// and it is only because none is made that the message is about the
+    /// User-Agent. That distinction is the whole feature — an instance with no
+    /// contact configured must generate *no traffic at all*, since traffic is
+    /// what got the last one blocked.
+    #[tokio::test]
+    async fn a_placeholder_contact_makes_no_request_at_all() {
+        // Nothing listens on port 1, so a request that *is* made fails
+        // immediately and loudly rather than making this test wait out a
+        // timeout — the failure has to be legible, not merely present.
+        let c = client("Tapedeck/1.0 ( your-email@example.com )", "http://127.0.0.1:1/ws/2").await;
+
+        let err = c.fetch_metadata("Xtal", "Aphex Twin", None).await.unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("placeholder User-Agent"), "should name the real reason: {msg}");
+        assert!(
+            !msg.contains("error sending request"),
+            "a request was attempted, which is exactly what must not happen: {msg}"
+        );
+    }
+
+    /// And a configured instance is *not* refused — it gets as far as trying,
+    /// which against an unroutable address is a transport error. Without this
+    /// the guard could refuse everything and the test above would still pass,
+    /// which is the shape that silently disables enrichment forever.
+    #[tokio::test]
+    async fn a_configured_contact_is_allowed_through_to_the_network() {
+        let c =
+            client(&user_agent_for(Some("someone@example-host.test")), "http://127.0.0.1:1/ws/2")
+                .await;
+
+        let err = c.fetch_metadata("Xtal", "Aphex Twin", None).await.unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(!msg.contains("placeholder"), "should not have been refused locally: {msg}");
+    }
 }

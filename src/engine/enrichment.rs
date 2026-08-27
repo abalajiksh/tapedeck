@@ -1,6 +1,6 @@
 use crate::models::Play;
 use crate::musicbrainz::MusicBrainzClient;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 /// Enrich a `Play` in-place with MusicBrainz metadata + Cover Art Archive info.
 /// Returns `true` if enrichment succeeded, `false` if it failed (play is still usable).
@@ -37,7 +37,27 @@ pub async fn enrich_play(
             true
         }
         Err(e) => {
-            warn!("⚠ MusicBrainz lookup failed for {} - {}: {}", play.artist, play.title, e);
+            // **Debug, not warn, and that is a fix rather than a demotion.**
+            // On 2026-08-27 this line ran 912 times in 2h18m for 39 distinct
+            // tracks — one query 155 times — because a track MusicBrainz has
+            // never heard of is re-asked on every flush, and a *transport*
+            // failure cannot be tombstoned at all so it is re-asked forever.
+            // At warn that is the same outage the ListenBrainz spam was: 6,096
+            // copies of one sentence, and nothing else in the file findable.
+            //
+            // The signal did not go away, it moved somewhere it is said once:
+            // the breaker reports an unreachable service in Settings →
+            // Operations, and Maintenance → MusicBrainz Recordings reports how
+            // many tracks they simply do not have.
+            debug!(
+                "MusicBrainz lookup failed for {} - {}: {}",
+                play.artist,
+                play.title,
+                // `{:#}` is anyhow's own cause chain — the same thing
+                // `logging::error_chain` does for a plain `std` error, which is
+                // what the reqwest error inside `api_get` is.
+                format_args!("{e:#}")
+            );
             false
         }
     }

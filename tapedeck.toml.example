@@ -46,8 +46,20 @@ file_enabled = true
 console_enabled = true
 
 [musicbrainz]
-# Their API requires a contact address in the User-Agent.
-user_agent = "Tapedeck/0.10.0 ( your-email@example.com )"
+# REQUIRED. MusicBrainz block clients that do not identify themselves, and a
+# template address is worse than none — it names an unconfigured bot. Put an
+# email address or a URL they could actually reach you at.
+#
+# Leave this empty and MusicBrainz and Cover Art Archive lookups are DISABLED:
+# the cache still answers, nothing else is called, and the log says so at
+# startup. That is deliberate — an instance that cannot enrich is a great deal
+# better than one that gets its address blocked.
+contact = ""
+# Only if you want to name yourself something else entirely. Left unset, the
+# User-Agent is built from the running version and `contact`, which is what
+# keeps it from going stale — this line used to be spelled four different ways
+# across the tree, none of them the version actually running.
+# user_agent = "Tapedeck/1.2.3 ( you@example-host.test )"
 rate_limit_per_second = 1
 # Optional: a local MusicBrainz Postgres mirror, queried before the API.
 enable_postgres = false

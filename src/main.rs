@@ -58,12 +58,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let sqlite_pool = SqlitePool::connect(&format!("sqlite:{}?mode=rwc", sqlite_path)).await?;
 
     let mb_config = musicbrainz::MusicBrainzConfig {
-        api_base_url: "https://musicbrainz.org/ws/2".to_string(),
+        api_base_url: config.musicbrainz.api_base_url.clone(),
         user_agent: config.musicbrainz.user_agent.clone(),
         rate_limit_per_second: config.musicbrainz.rate_limit_per_second,
         postgres_url: config.musicbrainz.postgres_url.clone(),
         enable_postgres: config.musicbrainz.enable_postgres,
     };
+    // Say it once, at startup, where somebody will see it — rather than
+    // letting every lookup fail quietly for two days. This does **not** stop
+    // the binary: the cache and the optional Postgres dump still answer, and
+    // an instance that cannot enrich is far better than one that will not run.
+    // What it stops is calling the API, which is the thing that gets the
+    // address blocked.
+    if musicbrainz::contact_is_placeholder(&config.musicbrainz.user_agent) {
+        warn!(
+            "🚫 MusicBrainz and Cover Art Archive lookups are DISABLED: the User-Agent \
+             names no real contact ({}). MetaBrainz block clients that do not identify \
+             themselves — that is how this instance was blocked on 2026-08-27. Set \
+             MUSICBRAINZ_CONTACT to an email address or URL they can reach and restart.",
+            config.musicbrainz.user_agent
+        );
+    }
+
     let mb_client = MusicBrainzClient::new(mb_config, sqlite_pool.clone()).await?;
     mb_client.initialize_schema().await?;
     info!("✅ MusicBrainz client initialized");

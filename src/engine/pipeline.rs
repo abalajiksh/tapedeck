@@ -168,6 +168,8 @@ pub struct ScrobbleEngine {
     poll_interval: Duration,
     /// Next wall-clock second the enrichment backfills may run.
     next_backfill_at: i64,
+    /// Which pass the next round starts from. See [`Self::run_backfills`].
+    backfill_cursor: usize,
     /// Next wall-clock second the per-user scrobble thresholds are re-read.
     next_threshold_refresh_at: i64,
     /// ListenBrainz endpoint (self-hosted instances override the default).
@@ -233,6 +235,20 @@ fn default_interval_secs(kind: &str) -> i64 {
 /// cost.
 const BACKFILL_INTERVAL_SECS: i64 = 60;
 
+/// Where the next backfill round begins, given how many passes this one got
+/// through.
+///
+/// Pure and separate for the reason `resume_point` and `consume_sessions` are:
+/// it decides whether a pass ever runs at all, and a rule like that must be
+/// testable without an engine. A wrong modulo here does not fail — it starves
+/// one pass forever, silently, and the symptom is artwork that never resolves.
+fn advance_backfill_cursor(cursor: usize, ran: usize, passes: usize) -> usize {
+    if passes == 0 {
+        return 0;
+    }
+    (cursor + ran) % passes
+}
+
 /// How often the per-user scrobble thresholds are re-read from preferences.
 ///
 /// On a clock of its own for the same reason the backfills are: the tick is 5s
@@ -276,6 +292,7 @@ impl ScrobbleEngine {
             mb_client,
             poll_interval: Duration::from_secs(5),
             next_backfill_at: 0,
+            backfill_cursor: 0,
             // Zero so the first tick reads them, rather than every source
             // running a minute on the default before the owner's setting lands.
             next_threshold_refresh_at: 0,
@@ -1433,56 +1450,139 @@ impl ScrobbleEngine {
         // MusicBrainz for no gain.
         if now >= self.next_backfill_at {
             self.next_backfill_at = now_secs() + BACKFILL_INTERVAL_SECS;
+            self.run_backfills().await;
+        }
+    }
 
-            // Incrementally classify listen languages (script instantly, a few
-            // MusicBrainz lookups per pass to respect the rate limit).
-            crate::enrich::backfill_languages(&self.db, &self.mb_client, 50, 8).await;
+    /// One round of the incremental metadata backfills, bounded.
+    ///
+    /// **Bounded, and rotated.** The bound is [`Self::backfill_budget`] and the
+    /// reason for it is written there. The rotation is the half that is easy to
+    /// leave out and wrong to: with a fixed order and a budget, the passes at
+    /// the front eat it and the ones at the back — artwork and artist
+    /// portraits, which are also the two whose absence is most visible — would
+    /// never run again on any instance with a real backlog. Starting each round
+    /// where the last one stopped means every pass gets its turn.
+    ///
+    /// That does relax "recording MBIDs first, because everything below keys
+    /// off what it produces". It is the right trade: that ordering is about the
+    /// long run, and these run every minute forever, so what matters is that
+    /// each pass gets time at all — which is precisely what a fixed order under
+    /// a budget takes away.
+    ///
+    /// The breaker does the rest. When MusicBrainz is unreachable its passes
+    /// now fail instantly instead of sleeping a second per lookup, so they stop
+    /// consuming the budget and the passes that do not need it — artwork via
+    /// Deezer, portraits from the user's own library — keep running through the
+    /// outage. Before, they were the first thing to be starved by it.
+    async fn run_backfills(&mut self) {
+        let deadline = Instant::now() + self.backfill_budget();
 
-            // Same deal for release years (feeds the by-decade breakdown) —
-            // cache hits are free, so the budget only bounds real API calls.
-            crate::enrich::backfill_release_years(&self.db, &self.mb_client, 50, 8).await;
+        // Named so a skipped round can say what it skipped. The order is the
+        // one they were written in; `backfill_cursor` decides where it starts.
+        const PASSES: usize = 8;
+        let mut ran = 0usize;
 
-            // **First, because everything below keys off what it produces.**
-            // A recording MBID is otherwise only ever written by
-            // `flush_pending`, which sees `status = 'pending'` listens alone —
-            // so an imported listen never got one, and the ISRC and
-            // work-language passes below it were structurally excluded from
-            // most of a mostly-imported history. Given its own budget rather
-            // than sharing, because it is the pass that unblocks the others.
-            crate::enrich::backfill_recording_mbids(&self.db, &self.mb_client, 25, 8).await;
-
-            // Genres come off the same `fetch_metadata` call the two above use,
-            // so on an already-enriched history this resolves entirely out of
-            // the cache and spends none of its budget.
-            crate::enrich::backfill_genres(&self.db, &self.mb_client, 50, 8).await;
-
-            // And ISRCs, off that same call — the recording search asks
-            // `inc=isrcs` now, so an already-enriched history resolves these
-            // from the cache without spending any of the budget. It is the only
-            // identifier a playlist push can hand a streaming service instead of
-            // a name, so it is worth having before somebody needs it rather than
-            // fetching a hundred of them while they wait.
-            crate::enrich::backfill_isrc(&self.db, &self.mb_client, 50, 8).await;
-
-            // Lyrics, for the language a transliterated title cannot give.
-            // A small budget: this is one request per *track* rather than per
-            // listen, and LRCLIB is a free service that asks callers to be
-            // considerate — the docs' words, and it has no API key to ration
-            // with, so the rationing is ours to do.
-            if let Some(lyrics) = self.lyrics.clone() {
-                crate::enrich::backfill_lyrics(&self.db, &lyrics, 8).await;
+        for step in 0..PASSES {
+            if Instant::now() >= deadline {
+                break;
             }
+            let which = (self.backfill_cursor + step) % PASSES;
+            ran += 1;
 
-            crate::enrich::backfill_artwork(
-                &self.db,
-                &self.mb_client,
-                &self.artwork_providers,
-                50,
-                8,
-            )
-            .await;
+            // **Around each pass, not only between them.** A deadline checked
+            // between passes bounds how many *start*, not how long one takes —
+            // and one pass is eight lookups, each of which can sit for the
+            // client's own timeout. Measured against an upstream answering in
+            // three seconds: a round meant to stop at ten ran to 28.6, all of
+            // it inside a single pass. This is the same correction
+            // `flush_pending` already applies around `enrich_play`, for the
+            // same reason.
+            //
+            // Cancelling here is safe: every pass writes one row at a time, so
+            // being dropped at an await point loses at most the item in flight
+            // and never half of one. It comes back round next time.
+            let left = deadline.saturating_duration_since(Instant::now());
+            let pass = async {
+                match which {
+                    // Incrementally classify listen languages (script instantly, a
+                    // few MusicBrainz lookups per pass to respect the rate limit).
+                    0 => {
+                        crate::enrich::backfill_languages(&self.db, &self.mb_client, 50, 8).await;
+                    }
 
-            self.backfill_artist_images().await;
+                    // Same deal for release years (feeds the by-decade breakdown) —
+                    // cache hits are free, so the budget only bounds real API calls.
+                    1 => {
+                        crate::enrich::backfill_release_years(&self.db, &self.mb_client, 50, 8)
+                            .await;
+                    }
+
+                    // A recording MBID is otherwise only ever written by
+                    // `flush_pending`, which sees `status = 'pending'` listens alone
+                    // — so an imported listen never got one, and the ISRC and
+                    // work-language passes were structurally excluded from most of a
+                    // mostly-imported history. Given its own budget rather than
+                    // sharing, because it is the pass that unblocks the others.
+                    2 => {
+                        crate::enrich::backfill_recording_mbids(&self.db, &self.mb_client, 25, 8)
+                            .await;
+                    }
+
+                    // Genres come off the same `fetch_metadata` call the two above
+                    // use, so on an already-enriched history this resolves entirely
+                    // out of the cache and spends none of its budget.
+                    3 => {
+                        crate::enrich::backfill_genres(&self.db, &self.mb_client, 50, 8).await;
+                    }
+
+                    // And ISRCs, off that same call. It is the only identifier a
+                    // playlist push can hand a streaming service instead of a name,
+                    // so it is worth having before somebody needs it rather than
+                    // fetching a hundred of them while they wait.
+                    4 => {
+                        crate::enrich::backfill_isrc(&self.db, &self.mb_client, 50, 8).await;
+                    }
+
+                    // Lyrics, for the language a transliterated title cannot give.
+                    // A small budget: this is one request per *track* rather than
+                    // per listen, and LRCLIB is a free service that asks callers to
+                    // be considerate — the docs' words, and it has no API key to
+                    // ration with, so the rationing is ours to do.
+                    5 => {
+                        if let Some(lyrics) = self.lyrics.clone() {
+                            crate::enrich::backfill_lyrics(&self.db, &lyrics, 8).await;
+                        }
+                    }
+
+                    6 => {
+                        crate::enrich::backfill_artwork(
+                            &self.db,
+                            &self.mb_client,
+                            &self.artwork_providers,
+                            50,
+                            8,
+                        )
+                        .await;
+                    }
+
+                    _ => self.backfill_artist_images().await,
+                }
+            };
+            if tokio::time::timeout(left, pass).await.is_err() {
+                break;
+            }
+        }
+
+        self.backfill_cursor = advance_backfill_cursor(self.backfill_cursor, ran, PASSES);
+
+        if ran < PASSES {
+            debug!(
+                "Backfills used their {}s budget after {} of {} passes — the rest run next round",
+                self.backfill_budget().as_secs(),
+                ran,
+                PASSES
+            );
         }
     }
 
@@ -1720,5 +1820,86 @@ impl ScrobbleEngine {
     /// fast tick cannot starve forwarding entirely.
     fn flush_budget(&self) -> Duration {
         (self.poll_interval * 2).max(Duration::from_secs(10))
+    }
+
+    /// How long a round of metadata backfills may hold the tick.
+    ///
+    /// **This is the 2026-08-24 rule arriving where it was missed.** That
+    /// release bounded `flush_pending` because a dead sink was stopping the
+    /// engine, and left the eight passes immediately above it awaited inline
+    /// with no bound at all. On 2026-08-27 that cost the same outage a second
+    /// time: Plex polling fell from 1,440 reads an hour to 45 — a tick every
+    /// four minutes instead of every five seconds — with Plex itself perfectly
+    /// healthy the whole time.
+    ///
+    /// The floor of the *healthy* case is the surprise, and it is why no fixed
+    /// number works: the passes budget about 89 lookups between them, and the
+    /// MusicBrainz rate limiter sleeps a second per lookup **whether or not it
+    /// succeeds**. So a round with real work takes ninety seconds when nothing
+    /// is wrong. The tick is five. There was never a version of this that fit.
+    ///
+    /// Same shape as [`Self::flush_budget`] and the same reasoning, so the
+    /// whole tick is bounded at roughly four times its own interval however
+    /// badly a third party is behaving. Deliberately **not** generous: these
+    /// are a background trickle, and the latency that matters is at *track
+    /// start*, which is exactly what a long round delays. A real backlog is
+    /// not this loop's job — Settings → Maintenance has a button that walks it
+    /// off the tick, which is where the throughput belongs.
+    fn backfill_budget(&self) -> Duration {
+        (self.poll_interval * 2).max(Duration::from_secs(10))
+    }
+}
+
+#[cfg(test)]
+mod backfill_rotation_tests {
+    use super::advance_backfill_cursor;
+
+    /// **Every pass gets its turn, however few fit in a round.**
+    ///
+    /// The bound on the backfill round is what stops a slow upstream holding
+    /// the tick, and rotation is what stops that bound turning into a
+    /// permanent starvation: with a fixed order, the passes at the front eat
+    /// the budget and artwork and artist portraits — the two whose absence is
+    /// most visible on screen — would never run again on any instance with a
+    /// real backlog.
+    ///
+    /// Asserted as *coverage over rounds* rather than on the arithmetic,
+    /// because that is the property; an off-by-one in the modulo is a pass that
+    /// silently never runs, not an error anybody sees.
+    #[test]
+    fn a_starved_round_still_reaches_every_pass_eventually() {
+        const PASSES: usize = 8;
+        for fits in 1..=PASSES {
+            let mut cursor = 0usize;
+            let mut seen = [false; PASSES];
+            // Enough rounds that a fair rotation must have covered everything.
+            for _ in 0..PASSES {
+                for step in 0..fits {
+                    seen[(cursor + step) % PASSES] = true;
+                }
+                cursor = advance_backfill_cursor(cursor, fits, PASSES);
+            }
+            assert!(
+                seen.iter().all(|s| *s),
+                "with only {fits} of {PASSES} passes per round, some pass never ran: {seen:?}"
+            );
+        }
+    }
+
+    /// A round that ran nothing must not advance past anything. Otherwise a
+    /// spell of the tick being busy would skip passes that were never even
+    /// attempted — losing work precisely when the instance is least healthy.
+    #[test]
+    fn a_round_that_ran_nothing_does_not_skip_a_pass() {
+        assert_eq!(advance_backfill_cursor(3, 0, 8), 3);
+    }
+
+    /// A full round comes back to where it started, so the fixed order is what
+    /// a healthy instance actually sees — rotation is a response to starvation,
+    /// not a reshuffle for its own sake.
+    #[test]
+    fn a_complete_round_leaves_the_order_alone() {
+        assert_eq!(advance_backfill_cursor(0, 8, 8), 0);
+        assert_eq!(advance_backfill_cursor(5, 8, 8), 5);
     }
 }

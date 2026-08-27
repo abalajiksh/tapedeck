@@ -44,7 +44,7 @@
 		{ id: 'sanitiser', label: 'Sanitiser', hint: 'Fix split albums, artists and credits' },
 		{ id: 'maintenance', label: 'Maintenance', hint: 'Enrichment and health' },
 		{ id: 'genremap', label: 'Genre Map', hint: 'Every Noise at Once' },
-		{ id: 'ops', label: 'Operations', hint: 'Engine, sinks, logs', admin: true },
+		{ id: 'ops', label: 'Operations', hint: 'Engine, services, logs', admin: true },
 		{ id: 'about', label: 'About', hint: 'Version, sign out' }
 	];
 	let section = 'appearance';
@@ -3023,11 +3023,12 @@
 
 				<!-- Sinks, with the breaker's state. -->
 				<div class="panel" style="border-radius:22px;padding:24px;margin-bottom:18px;">
-					<h3 class="h-display" style="font-size:19px;margin-bottom:4px;">Forwarding</h3>
+					<h3 class="h-display" style="font-size:19px;margin-bottom:4px;">Outbound services</h3>
 					<p style="font-size:13px;color:var(--td-muted);margin:0 0 16px;">
-						Services this instance has spoken to since it started. When one fails repeatedly it
-						is skipped for a while rather than retried per listen — that is what stops a
-						single service's outage from holding up the engine.
+						Everything this instance has spoken to since it started — the services your
+						listens are forwarded to, and the ones it looks metadata up in. When one fails
+						repeatedly it is skipped for a while rather than retried per listen, which is
+						what stops a single service's outage from holding up the engine.
 					</p>
 					{#if ops && ops.sinks.length}
 						<div class="opsrows">
@@ -3036,8 +3037,8 @@
 									<div style="min-width:0;">
 										<div class="opsname">{sink.name}</div>
 										<div class="opssub">
-											last accepted {ago(sink.last_ok, nowSec)}
-											· {sink.total_successes} sent, {sink.total_failures} failed
+											last answered {ago(sink.last_ok, nowSec)}
+											· {sink.total_successes} ok, {sink.total_failures} failed
 										</div>
 										{#if sink.last_error}
 											<!-- Once, verbatim. The alternative is what the log did on
@@ -3062,8 +3063,8 @@
 						</div>
 					{:else if ops}
 						<p style="font-size:13px;color:var(--td-muted-3);margin:0;">
-							Nothing has been forwarded yet this run. A service appears here the first time
-							something is sent to it.
+							Nothing has been called yet this run. A service appears here the first time
+							this instance speaks to it.
 						</p>
 					{/if}
 				</div>

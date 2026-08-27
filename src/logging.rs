@@ -120,3 +120,82 @@ pub fn init_logging(
 
     Ok(handle)
 }
+
+/// Render an error together with everything that caused it.
+///
+/// **This function exists because of 2026-08-27.** Two days of logs said, 11,819
+/// times:
+///
+/// ```text
+/// error sending request for url (https://musicbrainz.org/ws/2/recording?...)
+/// ```
+///
+/// which is the bare `Display` of a `reqwest::Error`, and is the *same string*
+/// for a DNS failure, a refused connection, a connect timeout and a TLS
+/// handshake the peer cut off. It was the last of those, and finding that out
+/// took four rounds of network archaeology on a live Raspberry Pi. The cause
+/// chain — `unexpected eof while reading` — was hanging off the error the whole
+/// time and was never printed, because every call site formatted with `{}`.
+///
+/// So: when logging an error that crossed a network, use this. The rule is not
+/// "log more", it is that **the top-level message of a transport error names
+/// the operation and never the fault**.
+pub fn error_chain(err: &(dyn std::error::Error + 'static)) -> String {
+    let mut out = err.to_string();
+    let mut source = err.source();
+    // Bounded: a cause chain is a handful of links, and a cycle would otherwise
+    // hang the logger — which is a worse outage than the one being logged.
+    for _ in 0..8 {
+        let Some(cause) = source else { break };
+        let text = cause.to_string();
+        // Chains commonly restate the layer above them verbatim; repeating it
+        // makes the line longer without making it say more.
+        if !out.contains(&text) {
+            out.push_str(": ");
+            out.push_str(&text);
+        }
+        source = cause.source();
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(Debug)]
+    struct Layer(&'static str, Option<Box<Layer>>);
+    impl std::fmt::Display for Layer {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str(self.0)
+        }
+    }
+    impl std::error::Error for Layer {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            self.1.as_deref().map(|l| l as &(dyn std::error::Error + 'static))
+        }
+    }
+
+    /// The whole point. `reqwest` says "error sending request for url (…)" for
+    /// every transport fault there is; the answer to *which* one is one link
+    /// down, and on 2026-08-27 it was the difference between chasing DNS for an
+    /// afternoon and reading "unexpected eof" once.
+    #[test]
+    fn the_cause_is_printed_and_not_only_the_symptom() {
+        let e = Layer(
+            "error sending request for url (https://musicbrainz.org/ws/2/recording)",
+            Some(Box::new(Layer("unexpected eof while reading", None))),
+        );
+        let s = error_chain(&e);
+        assert!(s.contains("error sending request"), "keeps the operation");
+        assert!(s.contains("unexpected eof while reading"), "and names the fault: {s}");
+    }
+
+    /// A chain that restates its parent should not print it twice — the point
+    /// is a line somebody reads, not every link for its own sake.
+    #[test]
+    fn a_repeated_cause_is_not_restated() {
+        let e = Layer("connect error", Some(Box::new(Layer("connect error", None))));
+        assert_eq!(error_chain(&e), "connect error");
+    }
+}

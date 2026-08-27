@@ -66,6 +66,7 @@ pub struct LoggingConfig {
 
 #[derive(Debug, Clone)]
 pub struct MusicBrainzConfig {
+    pub api_base_url: String,
     pub user_agent: String,
     pub rate_limit_per_second: u32,
     pub postgres_url: Option<String>,
@@ -173,7 +174,14 @@ impl Default for TomlLogging {
 #[derive(Deserialize)]
 #[serde(default)]
 struct TomlMusicBrainz {
-    user_agent: String,
+    /// Where the web service lives. Configurable so an instance can be pointed
+    /// at its own MusicBrainz mirror — and so the breaker can be exercised
+    /// against an address that is deliberately not answering.
+    api_url: String,
+    /// A full override. `None` means "build one from `contact`", which is what
+    /// keeps the version from going stale in a config file nobody rereads.
+    user_agent: Option<String>,
+    contact: String,
     rate_limit_per_second: u32,
     postgres_url: Option<String>,
     postgres_enabled: bool,
@@ -181,7 +189,14 @@ struct TomlMusicBrainz {
 impl Default for TomlMusicBrainz {
     fn default() -> Self {
         Self {
-            user_agent: "Tapedeck/0.5.0 ( contact@example.com )".into(),
+            api_url: "https://musicbrainz.org/ws/2".into(),
+            // `None` means: build it from `CARGO_PKG_*` and `contact`, rather
+            // than writing it out. It had been written out four times across
+            // the tree — `Tapedeck/1.0`, `/0.5.0`, `/0.10.0`, `/0.96.0` — on an
+            // application at 0.101.0, and it is the string MetaBrainz judge us
+            // by.
+            user_agent: None,
+            contact: String::new(),
             rate_limit_per_second: 1,
             postgres_url: None,
             postgres_enabled: false,
@@ -281,7 +296,21 @@ impl Config {
             listenbrainz_url: env_or("LISTENBRAINZ_URL", t.listenbrainz.url),
             secret_key_path: env_or("TAPEDECK_SECRET_KEY_PATH", t.server.secret_key_path),
             musicbrainz: MusicBrainzConfig {
-                user_agent: env_or("MUSICBRAINZ_USER_AGENT", t.musicbrainz.user_agent),
+                api_base_url: env_or("MUSICBRAINZ_API_URL", t.musicbrainz.api_url),
+                // Two knobs, and `contact` is the one to reach for. MusicBrainz
+                // asks for a product, a version and somebody to contact; only
+                // the last of those is the operator's to know, so making them
+                // retype the other two is how a template ships unfilled and an
+                // instance gets blocked. A full `MUSICBRAINZ_USER_AGENT` still
+                // wins outright, for anyone who wants to name themselves.
+                user_agent: {
+                    let contact = env_or("MUSICBRAINZ_CONTACT", t.musicbrainz.contact);
+                    let built = t
+                        .musicbrainz
+                        .user_agent
+                        .unwrap_or_else(|| crate::musicbrainz::user_agent_for(Some(&contact)));
+                    env_or("MUSICBRAINZ_USER_AGENT", built)
+                },
                 rate_limit_per_second: env_or_parse(
                     "MUSICBRAINZ_RATE_LIMIT",
                     t.musicbrainz.rate_limit_per_second,

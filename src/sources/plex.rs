@@ -599,6 +599,10 @@ pub struct PlexSource {
     /// exists to catch plays that finished between polls, which at this cadence
     /// is close to nothing. Throttled separately rather than tied to the caller.
     last_history_at: u64,
+    /// Newest `viewedAt` any history walk has returned, which is where the next
+    /// one resumes from. `None` until the first walk, so a cold start still
+    /// sweeps the full window. See [`history_window_floor`].
+    history_seen_through: Option<u64>,
     /// `rating_key` -> when the live path last emitted a scrobble for it.
     ///
     /// The history endpoint re-reports plays the live path already caught, and
@@ -623,6 +627,59 @@ const HISTORY_SYNC_INTERVAL_SECS: u64 = 60;
 /// Rows per request on the history walk. Plex's own default, and the value this
 /// asked for as a hard `limit` before it learned to page.
 const HISTORY_PAGE_SIZE: usize = 50;
+
+/// How far the history walk rewinds past what it has already seen.
+///
+/// The same trade `navidrome::resume_point` makes, and free here for the same
+/// reason: a Plex history row's `source_id` is derived from the row itself, so
+/// re-reading one yields an identical id that `save_scrobble`'s uniqueness
+/// absorbs. Prefer a few redundant rows to a silent hole.
+///
+/// An hour, which is enormous next to the 60-second sync and deliberately so:
+/// `viewedAt` is the Plex server's clock and everything else here is ours, and
+/// the cost curve is almost flat. At a play every fifteen minutes an hour of
+/// slack is four rows; even at a play a minute it is sixty, which is one extra
+/// page. Set against that, a hole is permanent — nothing looks at those rows
+/// again — so this buys a large margin for very little.
+const HISTORY_SLACK_SECS: u64 = 3600;
+
+/// The oldest a walk will ever reach back, and the floor a cold start uses.
+const HISTORY_MAX_LOOKBACK_SECS: u64 = 7 * 86400;
+
+/// How far back the next history walk should look.
+///
+/// **This walk used to sweep seven days on every single sync**, because the
+/// `min_timestamp` parameter it takes was never read and the floor was
+/// hardcoded. Measured on a real instance on 2026-08-27: **fourteen requests to
+/// Plex and 650 rows, once a minute per user, forever** — of which ~602 were
+/// pushed through the dedup path every time to be discarded. That is not a
+/// catch-up cost, it was the steady state, and it was there in the healthy
+/// hours too. The note claiming "at a healthy cadence the first page already
+/// reaches past the window, so it is one request exactly as before" was simply
+/// wrong: fifty rows reach back hours, not days, so the walk always ran to the
+/// full seven.
+///
+/// Now it resumes from what the last walk saw, rewound by
+/// [`HISTORY_SLACK_SECS`] — the trade `navidrome::resume_point` already makes,
+/// and free here because a row's `source_id` is derived from the row, so
+/// re-reading one produces an identical id that uniqueness absorbs. Prefer a
+/// few redundant rows to a silent hole.
+///
+/// Two floors that must not be dropped: a cold start (`None`) still sweeps the
+/// **full** window, which is what makes a restart after an outage catch up; and
+/// the result is never older than that window however stale the cursor is, so
+/// this cannot degenerate into an unbounded walk.
+///
+/// Pure and split out for the reason `wants_another_page` and
+/// `own_history_tracks` are: it decides whether a listen is ever seen at all,
+/// and a rule like that has to be testable without a server.
+fn history_window_floor(seen_through: Option<u64>, now: u64) -> u64 {
+    let oldest = now.saturating_sub(HISTORY_MAX_LOOKBACK_SECS);
+    match seen_through {
+        None => oldest,
+        Some(seen) => seen.saturating_sub(HISTORY_SLACK_SECS).max(oldest),
+    }
+}
 
 /// Ceiling on one walk, so a server with a pathological history cannot make a
 /// single tick unbounded — the mistake this whole area is being fixed for. At
@@ -669,6 +726,7 @@ impl PlexSource {
             session_states: HashMap::new(),
             libraries: Vec::new(),
             last_history_at: 0,
+            history_seen_through: None,
             recent_scrobbles: HashMap::new(),
             threshold: ScrobbleThreshold::default(),
         }
@@ -1222,7 +1280,7 @@ impl PlexSource {
             // `Box<dyn Error>`, which is not `Send`, and binding the whole
             // Result keeps it alive across the hydrate await below — which is
             // enough to make the trait method's future non-`Send`.
-            let history = self.fetch_history_tracks(0).await.ok();
+            let history = self.fetch_history_tracks().await.ok();
             if let Some(history) = history {
                 let fetched = history.len();
                 // Drop anything the live path already banked. History is the
@@ -1499,17 +1557,11 @@ impl PlexSource {
     /// — `source_id` is derived from the row, so `save_scrobble`'s uniqueness
     /// absorbs a row seen twice. Prefer a few redundant rows to a silent hole,
     /// which is the rule `navidrome::resume_point` already follows.
-    async fn fetch_history_tracks(
-        &mut self,
-        _min_timestamp: u64,
-    ) -> Result<Vec<PlexTrack>, Box<dyn std::error::Error>> {
+    async fn fetch_history_tracks(&mut self) -> Result<Vec<PlexTrack>, Box<dyn std::error::Error>> {
         let endpoint = format!("{}/status/sessions/history/all", self.url);
 
-        let seven_days_ago = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs()
-            .saturating_sub(7 * 86400);
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+        let window_floor = history_window_floor(self.history_seen_through, now);
 
         let mut history_tracks: Vec<HistoryTrack> = Vec::new();
         let mut start = 0usize;
@@ -1538,7 +1590,7 @@ impl PlexSource {
             let page = Self::parse_history_xml(&text);
             let got = page.len();
             pages += 1;
-            let more = Self::wants_another_page(&page, seven_days_ago, start + got);
+            let more = Self::wants_another_page(&page, window_floor, start + got);
             history_tracks.extend(page);
 
             if !more {
@@ -1554,13 +1606,37 @@ impl PlexSource {
             start += got;
         }
 
-        info!("Processing {} history tracks from Plex ({} page(s))", history_tracks.len(), pages);
+        // Only when it is *not* the steady state. One page a minute is the
+        // normal shape and logging it is 1,440 lines a day per source saying
+        // nothing; more than one page means the walk is catching up, which is
+        // the thing worth seeing — and it is the number that made the
+        // seven-day-sweep bug visible in the first place.
+        if pages > 1 {
+            info!(
+                "Plex history walk took {} pages for {} rows — catching up",
+                pages,
+                history_tracks.len()
+            );
+        } else {
+            debug!("Processing {} history tracks from Plex (1 page)", history_tracks.len());
+        }
+
+        // Resume from what this walk actually saw, on the *server's* clock, so
+        // a disagreement between its clock and ours cannot open a hole. A walk
+        // that returned nothing leaves the cursor where it was, which widens
+        // the next window by exactly the quiet period — correct, and
+        // self-limiting at `HISTORY_MAX_LOOKBACK_SECS`.
+        if let Some(newest) = history_tracks.iter().filter_map(|t| t.viewed_at).max() {
+            self.history_seen_through =
+                Some(self.history_seen_through.map_or(newest, |seen| seen.max(newest)));
+        }
+
         let isolated = !self.filters.users_allow.is_empty();
         Ok(Self::own_history_tracks(
             history_tracks,
             isolated,
             &self.filters.accounts_allow,
-            seven_days_ago,
+            window_floor,
         ))
     }
 
@@ -1778,6 +1854,62 @@ mod tests {
     /// code read as "done" — the other twenty were never asked for and nothing
     /// anywhere said so. A saturated page still inside the window means there
     /// is more behind it.
+    /// **The steady state is one page, not fourteen.**
+    ///
+    /// Measured on the real instance on 2026-08-27, in the *healthy* hours as
+    /// well as the sick ones: 650 rows over 14 requests, once a minute, per
+    /// user, forever — because the floor was hardcoded to seven days and the
+    /// `min_timestamp` parameter was never read. A minute of listening is a
+    /// handful of rows, and that is what a walk resuming from its own cursor
+    /// asks for.
+    #[test]
+    fn a_resumed_walk_asks_for_a_minute_of_history_and_not_a_week() {
+        const NOW: u64 = 1_800_000_000;
+        let floor = history_window_floor(Some(NOW - 60), NOW);
+        assert_eq!(floor, NOW - 60 - HISTORY_SLACK_SECS);
+        assert!(
+            NOW - floor < HISTORY_MAX_LOOKBACK_SECS / 24,
+            "a steady-state walk should look back hours at most, not {}s",
+            NOW - floor
+        );
+    }
+
+    /// A cold start still sweeps the whole window — that is what makes a
+    /// restart after an outage catch up, and it is the half a resume cursor is
+    /// most likely to break.
+    #[test]
+    fn a_cold_start_still_sweeps_the_full_window() {
+        const NOW: u64 = 1_800_000_000;
+        assert_eq!(history_window_floor(None, NOW), NOW - HISTORY_MAX_LOOKBACK_SECS);
+    }
+
+    /// And a cursor left behind by a long silence never walks further back than
+    /// the window, so this cannot become an unbounded scan of somebody's whole
+    /// Plex history.
+    #[test]
+    fn a_stale_cursor_is_clamped_to_the_window() {
+        const NOW: u64 = 1_800_000_000;
+        let ancient = NOW - 400 * 86400;
+        assert_eq!(history_window_floor(Some(ancient), NOW), NOW - HISTORY_MAX_LOOKBACK_SECS);
+    }
+
+    /// The rewind is the whole safety argument: two clocks are involved
+    /// (`viewedAt` is Plex's, everything else is ours) and a row landing just
+    /// under the mark between two walks would otherwise never be looked at
+    /// again. Overlap is free — a row's `source_id` is derived from the row.
+    #[test]
+    fn the_cursor_rewinds_rather_than_resuming_exactly() {
+        const NOW: u64 = 1_800_000_000;
+        let seen = NOW - 60;
+        let floor = history_window_floor(Some(seen), NOW);
+        // A row stamped *at* the cursor, and one stamped just under it, must
+        // both still be inside the next window — that is the hole a cursor
+        // that resumed exactly would leave, and nothing would ever look again.
+        assert!(floor <= seen, "a row at the cursor must be re-read");
+        assert!(floor < seen.saturating_sub(1), "so must one just under it");
+        assert_eq!(floor, seen - HISTORY_SLACK_SECS, "the rewind is the slack, not an accident");
+    }
+
     #[test]
     fn a_full_page_inside_the_window_is_not_the_end_of_the_backfill() {
         let page: Vec<HistoryTrack> =
@@ -1788,14 +1920,53 @@ mod tests {
         );
     }
 
-    /// And the ordinary case must stay one request: at a healthy cadence the
-    /// first page already reaches past the window, so paging costs nothing.
+    /// And the ordinary case is one request — but only because the *window*
+    /// is a minute wide. This used to be justified by "at a healthy cadence the
+    /// first page already reaches past the window", which was wrong: fifty rows
+    /// reach back hours and the window was seven days, so the walk always ran
+    /// to the full seven. See `history_window_floor`.
     #[test]
     fn a_page_reaching_past_the_window_stops_the_walk() {
         let mut page: Vec<HistoryTrack> =
             (0..HISTORY_PAGE_SIZE - 1).map(|i| hrow(Some(FLOOR + DAY + i as u64))).collect();
         page.push(hrow(Some(FLOOR - 1))); // older than the floor
         assert!(!PlexSource::wants_another_page(&page, FLOOR, page.len()));
+    }
+
+    /// **The whole point, counted in requests.** A week of ordinary listening
+    /// walked fourteen pages every sync; the same history behind a resumed
+    /// cursor walks one. Asserted on the *number of requests* rather than on
+    /// the floor, because that is the cost that was actually being paid — 14
+    /// round trips to Plex and 650 rows through dedup, once a minute per user,
+    /// in the healthy hours as much as the sick ones.
+    #[test]
+    fn a_week_of_history_costs_one_page_to_resume_and_fourteen_to_sweep() {
+        const NOW: u64 = 1_800_000_000;
+        // A play every fifteen minutes for a week: 672 rows, newest first.
+        let history: Vec<HistoryTrack> =
+            (0..672).map(|i| hrow(Some(NOW - i as u64 * 900))).collect();
+
+        // Walk the same loop `fetch_history_tracks` runs, counting requests.
+        let pages_for = |floor: u64| {
+            let mut start = 0usize;
+            let mut pages = 0usize;
+            loop {
+                let end = (start + HISTORY_PAGE_SIZE).min(history.len());
+                let page = &history[start..end];
+                let got = page.len();
+                pages += 1;
+                if !PlexSource::wants_another_page(page, floor, start + got) {
+                    break pages;
+                }
+                start += got;
+            }
+        };
+
+        let swept = pages_for(history_window_floor(None, NOW));
+        let resumed = pages_for(history_window_floor(Some(NOW - 60), NOW));
+
+        assert!(swept >= 13, "a cold start really does sweep the week: {swept} page(s)");
+        assert_eq!(resumed, 1, "a resumed walk is one request, not {resumed}");
     }
 
     /// A short page is the end of the server's history, whatever its dates.

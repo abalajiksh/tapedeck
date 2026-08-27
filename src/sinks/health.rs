@@ -1,5 +1,13 @@
-//! Per-sink health, and the breaker that keeps one dead service out of the
+//! Per-service health, and the breaker that keeps one dead service out of the
 //! engine tick.
+//!
+//! **It lives under `sinks` because that is where it was needed first, and it
+//! is not sinks-only.** Since 2026-08-27 it also carries MusicBrainz and Cover
+//! Art Archive, which are lookups rather than forwarding targets — the entries
+//! are keyed by name and nothing here knows what kind of service it is
+//! tracking. A second registry for lookups would be a second answer to "what
+//! outbound service is failing", and Settings → Operations would have to read
+//! both to give one.
 //!
 //! **This exists because of 2026-08-24.** Two MetaBrainz hosts went unreachable
 //! for a day while Last.fm stayed perfectly healthy. Every pending listen then
