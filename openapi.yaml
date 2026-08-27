@@ -26,7 +26,7 @@ openapi: 3.1.0
 
 info:
   title: Tapedeck
-  version: 0.99.1
+  version: 0.101.0
   summary: Self-hosted scrobbler and listening journal.
   description: |
     Tapedeck ingests listens, enriches them with MusicBrainz metadata, stores
@@ -7447,6 +7447,14 @@ paths:
       parameters:
         - { name: artist, in: query, required: true, schema: { type: string } }
         - { name: title, in: query, required: true, schema: { type: string } }
+        - name: album
+          in: query
+          schema: { type: string }
+          description: >-
+            Which record to draw `tracklist` from. Resolved from the history
+            when absent; passed explicitly it wins, because a track on three
+            compilations has three honest answers and only the caller knows
+            which record is being read.
       responses:
         '200':
           description: OK — including for a track nothing is held for.
@@ -7457,10 +7465,42 @@ paths:
                 properties:
                   artist: { type: string }
                   title: { type: string }
+                  album: { type: string, nullable: true }
+                  plays:
+                    type: integer
+                    description: How often this user has played the track. Skips excluded, as everywhere.
                   language: { type: string, nullable: true }
                   timed: { type: boolean }
                   instrumental: { type: boolean }
+                  edited:
+                    type: boolean
+                    description: >-
+                      These words were corrected here rather than fetched, and a
+                      later lookup will not overwrite them.
+                  plain: { type: string, nullable: true, description: The stored text, for correcting it by hand. }
+                  synced: { type: string, nullable: true }
                   source: { type: string, example: LRCLIB }
+                  tracklist:
+                    type: array
+                    description: >-
+                      The rest of the record, in the order it plays — track
+                      number where a tagger supplied one, alphabetical where not.
+                      Empty when the track belongs to no album here.
+                    items:
+                      type: object
+                      properties:
+                        title: { type: string }
+                        plays: { type: integer }
+                        duration: { type: integer, nullable: true }
+                        track_number: { type: integer, nullable: true }
+                        lyrics:
+                          type: string
+                          enum: [words, instrumental]
+                          description: >-
+                            What is held for that track. **Absent** for one
+                            nobody has asked about, which is a different thing
+                            from one that has no words — the reader dims the
+                            first and marks the second.
                   lines:
                     type: array
                     items:
@@ -7469,6 +7509,154 @@ paths:
                         n: { type: integer, description: '1-based, and blank lines are numbered.' }
                         at: { type: number, nullable: true }
                         text: { type: string, description: Empty for a stanza break. }
+                        quoted:
+                          type: integer
+                          description: >-
+                            How many of this user's notes quote this line.
+                            Counted from the note bodies on read, so it cannot
+                            drift from what is written.
+                        pin:
+                          type: object
+                          nullable: true
+                          description: >-
+                            The note pinned to this line, if there is one. A pin
+                            is a note whose target *is* the line — see
+                            `POST /api/v1/notes` with `line`.
+                          properties:
+                            note_id: { type: integer }
+                            body_md: { type: string }
+                            excerpt: { type: string }
+                            visibility: { type: string }
+                            updated_at: { type: integer }
+    put:
+      tags: [Statistics]
+      summary: Correct the words by hand.
+      description: |
+        Scope: session only.
+
+        **A value you supplied is never overwritten by a lookup** — the rule the
+        shelf's running times already follow, and what settles the collision
+        between this and "newest fetch wins": between two fetches the newer one
+        wins, and between a fetch and something a person typed, the person does.
+        The row is marked as corrected and the backfill will not write over it.
+
+        Instance-wide rather than per user, like everything else in this cache:
+        these are one track's words, not one person's opinion of them.
+
+        The response reports the line count **before and after**, and
+        `renumbered` when they differ. Every reference already written is an
+        index, so a correction that adds or removes a line moves every quote
+        after it onto different words — silently, because an index cannot be
+        wrong, only pointed somewhere else. It is reported rather than refused:
+        the correction is usually the point, and the alternative is a lyric that
+        stays wrong for ever.
+      security: [{ sessionCookie: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [artist, title]
+              properties:
+                artist: { type: string }
+                title: { type: string }
+                plain: { type: string, nullable: true }
+                synced: { type: string, nullable: true, description: '`[mm:ss.xx] words` per line.' }
+      responses:
+        '200':
+          description: Saved.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, example: saved }
+                  language: { type: string, nullable: true, description: Re-read from the new words. }
+                  lines_before: { type: integer }
+                  lines_after: { type: integer }
+                  renumbered:
+                    type: boolean
+                    description: The count changed, so every quote past the change now points at different words.
+        '400': { description: No artist, no title, or no words in it. }
+
+  /api/v1/lyrics/keys:
+    get:
+      tags: [Statistics]
+      summary: Every track this instance holds words for.
+      description: |
+        Scope: `read`.
+
+        One request for the whole set, exactly the shape `GET /api/v1/loves/keys`
+        has and for the same reason: a history page wants to know which of fifty
+        rows has something to read, and fifty questions is not the way to ask.
+
+        A key is `<artist>|<title>`, both trimmed and lowercased — the same fold
+        `loveKey` uses for its artist half. **The browser's derivation and this
+        one must stay in step**, or "Read the words" quietly stops appearing on
+        rows that have lyrics and nothing errors.
+
+        Only tracks with words. An instrumental is a real answer and a finished
+        lookup, but there is nothing to open a reader on.
+
+        Not scoped to the caller, and it cannot be: the cache is one copy of one
+        track's words for the whole instance, keyed by the track rather than by
+        who played it.
+      security: [{ sessionCookie: [] }, { apiToken: [read] }]
+      responses:
+        '200':
+          description: OK. An instance with no lyrics cache answers an empty list rather than failing.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  keys: { type: array, items: { type: string } }
+
+  /api/v1/lines:
+    get:
+      tags: [Notes]
+      summary: Every lyric line this user has pinned.
+      description: |
+        Scope: `read`.
+
+        A **pin** is a note whose target *is* the line, rather than prose that
+        quotes one. It is the one form of lyric reference that can ever
+        federate, because nothing of the provider's text is written into the
+        note — a reader elsewhere sees your words and a stub.
+
+        Across everything rather than per record on purpose: that is what makes
+        it a way back into writing you had forgotten rather than a second copy
+        of the margin you are already looking at.
+
+        `line.text` carries the words when this instance still holds them and is
+        simply absent when it does not. A pin outlives the lyric it points at,
+        the same way a note outlives the entity that resolved it, and that is
+        not an error.
+      security: [{ sessionCookie: [] }, { apiToken: [read] }]
+      responses:
+        '200':
+          description: OK.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  lines:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        note_id: { type: integer }
+                        excerpt: { type: string }
+                        updated_at: { type: integer }
+                        line:
+                          type: object
+                          properties:
+                            artist: { type: string }
+                            title: { type: string }
+                            line: { type: integer }
+                            text: { type: string, nullable: true }
 
   /api/v1/lyrics/status:
     get:

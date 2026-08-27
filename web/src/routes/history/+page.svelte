@@ -2,7 +2,7 @@
 	import { goto } from '$app/navigation';
 	import { onMount, onDestroy } from 'svelte';
 	import { syncUrl } from '$lib/url';
-	import { api } from '$lib/api';
+	import { api, lyricKey } from '$lib/api';
 	import type { Scrobble, SignalChain , ChainVariant } from '$lib/api';
 	import ScrobbleRow from '$lib/components/ScrobbleRow.svelte';
 	import InspectListen from '$lib/components/InspectListen.svelte';
@@ -289,13 +289,37 @@
 	/** Open the lyric reader for a listen.
 	 *
 	 *  Offered on every listen rather than only where lyrics are held: knowing
-	 *  which have them would be a lookup per row, and the reader's own empty
-	 *  state says plainly that the backfill fetches a few tracks a minute,
-	 *  most-played first. A page that explains itself beats a menu item that
-	 *  silently isn't there. */
+	 *  which have them was, at first, a lookup per row — so the item was offered
+	 *  on every listen and the reader's own empty state explained itself.
+	 *
+	 *  It is gated now, for **one** request per page: `/api/v1/lyrics/keys`
+	 *  returns the whole set at once and a row's key is derived here, which is
+	 *  exactly the shape `/loves/keys` and `loveKey` already have. The standing
+	 *  trap comes with it — `lyricKey` must stay in step with the server's fold
+	 *  or the item quietly stops appearing on rows that do have words, and
+	 *  nothing errors.
+	 *
+	 *  A failed fetch leaves the set empty, and an empty set means *offer it
+	 *  everywhere* rather than nowhere: the reader explains itself, and a menu
+	 *  item missing because a request failed is the worse of the two. */
+	let lyricKeys = new Set<string>();
+
+	async function loadLyricKeys() {
+		try {
+			lyricKeys = new Set((await api.lyricKeys()).keys);
+		} catch {
+			lyricKeys = new Set();
+		}
+	}
+
+	function hasWords(s: Scrobble): boolean {
+		return lyricKeys.size === 0 || lyricKeys.has(lyricKey(s.artist, s.title));
+	}
+
 	function readWords(s: Scrobble) {
 		menuFor = null;
 		const q = new URLSearchParams({ artist: s.artist, title: s.title });
+		if (s.album) q.set('album', s.album);
 		goto(`/lyrics?${q}`);
 	}
 
@@ -349,6 +373,10 @@
 			track: q.get('track') ?? undefined
 		};
 		loadLoves();
+		// One request for the whole set, the way loves are loaded. Not awaited:
+		// the menu item is offered everywhere until it arrives, which is the
+		// safe direction — see `hasWords`.
+		void loadLyricKeys();
 		try { chains = (await api.getChains()).chains; } catch { /* optional */ }
 		// Optional in the same way: an instance with no variants simply shows no
 		// variant picker on a session card.
@@ -548,8 +576,10 @@
 		     else — and to write one you need a line number, which you get by
 		     opening the reader. A closed loop, which is the shipped-switched-off
 		     pattern with an extra step. This is the way in. -->
-		<button class="menu-item" on:click={() => menuFor && readWords(menuFor)}>
-			<svg viewBox="0 0 24 24" width="16" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M4 6h10M4 12h16M4 18h7"/></svg>Read the words</button>
+		{#if menuFor && hasWords(menuFor)}
+			<button class="menu-item" on:click={() => menuFor && readWords(menuFor)}>
+				<svg viewBox="0 0 24 24" width="16" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M4 6h10M4 12h16M4 18h7"/></svg>Read the words</button>
+		{/if}
 		<button class="menu-item" on:click={() => menuFor && openEdit(menuFor)}>
 			<svg viewBox="0 0 24 24" width="16" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4z"/></svg>Edit details</button>
 		<button class="menu-item" on:click={() => { inspecting = menuFor; menuFor = null; }}>

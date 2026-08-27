@@ -8,6 +8,7 @@
 	import { loadLoves, lovedKeys, isLovedNamed, toggleLoveByName } from '$lib/loves';
 	import { openAlbum, openArtist } from '$lib/entities';
 	import { fidelity, fidelityLabel } from '$lib/fidelity';
+	import LyricStrip from '$lib/components/LyricStrip.svelte';
 
 	let recent: Scrobble[] = [];
 	let loading = true;
@@ -232,6 +233,17 @@
 							<span style="font-size:9px;letter-spacing:.14em;color:#9a8c72;">TAPE</span>{counter}
 						</div>
 					</div>
+					<!-- The words, when there are words. Inside the `live` branch
+					     because it follows the playhead: against the fallback row
+					     — the most recent listen, which finished some time ago —
+					     there is no line to be on. -->
+					<LyricStrip
+						artist={live.artist}
+						title={live.title}
+						album={live.album}
+						position={$deck.position}
+						positionKnown={live.position_known}
+					/>
 				{/if}
 			{:else}
 				<h2 class="h-display" style="font-size:26px;margin:0 0 6px;">The deck is empty</h2>

@@ -8,6 +8,9 @@
 	import type { NoteQuery } from '$lib/api';
 	import ShortcodeLegend from '$lib/components/ShortcodeLegend.svelte';
 	import ToTop from '$lib/components/ToTop.svelte';
+	import LyricPicker from '$lib/components/LyricPicker.svelte';
+	import LyricAnnotate from '$lib/components/LyricAnnotate.svelte';
+	import type { PinnedLine } from '$lib/api';
 
 	/**
 	 * Liner notes. A note is a living document about one thing — a track, a
@@ -41,7 +44,11 @@
 		{ value: 'release', label: 'Records' },
 		{ value: 'artist', label: 'Artists' },
 		{ value: 'listen', label: 'Listens' },
-		{ value: 'period', label: 'Periods' }
+		{ value: 'period', label: 'Periods' },
+		// A **pin** — a note whose target *is* a lyric line, rather than prose
+		// that quotes one. Its own filter because it is its own kind of writing:
+		// a footnote on somebody else's words.
+		{ value: 'line', label: 'Lines' }
 	];
 
 	/** Debounced, so typing a word is one request rather than one per letter. */
@@ -107,6 +114,170 @@
 	let previewing = false;
 	let previewBusy = false;
 
+	// ── Annotate lines ──
+	//
+	// What the open note is *about*, which is what a picked line is written
+	// against — the same context the server resolves `[[line:12]]` with. Held
+	// separately from `targetLabel` because that one is a sentence for a
+	// heading and this has to be three fields.
+	let ctxArtist = '';
+	let ctxAlbum: string | null = null;
+	let ctxTrack: string | null = null;
+	/** The panel is off by default: most notes are prose about a record, and a
+	 *  lyric column that is always there would take a third of the editor from
+	 *  everyone to serve the notes that quote. Remembered per device. */
+	let annotating = false;
+	let editorEl: HTMLTextAreaElement | null = null;
+
+	// ── The two modes ──
+	//
+	// The design's own split, and it is not decoration: **Write & quote** is
+	// prose that *mentions* a line, and **Annotate lines** is the footnote form
+	// — a note whose target *is* the line. They are different kinds of writing
+	// with different targets, and folding them into one screen is what made the
+	// first pass ship pinning inside the reader, which is not where the design
+	// puts it.
+	let mode: 'quote' | 'pins' = 'quote';
+	/** A line the reader sent us to pin. Consumed once, so re-rendering does
+	 *  not keep re-opening an editor the writer closed. */
+	let pinFocus: number | null = null;
+	/** Every line pinned anywhere, for the sidebar. */
+	let pinned: PinnedLine[] = [];
+
+	function setMode(m: 'quote' | 'pins') {
+		mode = m;
+		if (m === 'quote') pinFocus = null;
+		try {
+			localStorage.setItem('td-notes-mode', m);
+		} catch {
+			/* not worth failing the page over */
+		}
+	}
+
+	async function loadPinned() {
+		try {
+			pinned = (await api.pinnedLines()).lines;
+		} catch {
+			// A sidebar that fails to load is a sidebar with nothing in it, not
+			// a page that fails to render.
+			pinned = [];
+		}
+	}
+
+	/** A pin somewhere other than the record in front of you — the design's
+	 *  "· other record", which is what stops the sidebar reading as a list of
+	 *  this record's pins when most of it is not. */
+	function elsewhere(p: PinnedLine): boolean {
+		const here = (ctxTrack ?? '').trim().toLowerCase();
+		const t = p.line.title.trim().toLowerCase();
+		if (here) return t !== here;
+		return !albumTracks.some((x) => x.trim().toLowerCase() === t);
+	}
+
+	/** The tracks of the record being annotated, so `elsewhere` can tell a pin
+	 *  on it from a pin on something else. Empty for a track note, which uses
+	 *  its own title instead. */
+	let albumTracks: string[] = [];
+
+	async function loadAlbumTracks() {
+		albumTracks = [];
+		if (!ctxAlbum || !ctxArtist) return;
+		try {
+			albumTracks = ((await api.lyrics(ctxArtist, ctxAlbum, ctxAlbum)).tracklist ?? []).map(
+				(t) => t.title
+			);
+		} catch {
+			// Only used to label the sidebar; not worth surfacing.
+		}
+	}
+
+	function openPinnedLine(p: PinnedLine) {
+		// Its own track, which is what the coordinate is read against.
+		openTarget({ kind: 'track', name: p.line.title, artist: p.line.artist }).then(() => {
+			pinFocus = p.line.line;
+			setMode('pins');
+		});
+	}
+
+	/** Whether there is anything to read against at all. An artist note has no
+	 *  track, so the toggle is not offered rather than opening onto a panel
+	 *  that can only say so. */
+	$: canAnnotate = !!ctxArtist && (!!ctxTrack || !!ctxAlbum);
+	$: void ctxArtist, ctxAlbum, loadAlbumTracks();
+	// A subject with nothing to read against cannot be annotated, so the mode
+	// falls back rather than showing an empty panel — an artist note is prose.
+	$: if (!canAnnotate && mode === 'pins') mode = 'quote';
+
+	function toggleAnnotate() {
+		annotating = !annotating;
+		try {
+			localStorage.setItem('td-notes-annotate', annotating ? '1' : '0');
+		} catch {
+			/* not worth failing the page over */
+		}
+	}
+
+	/** Drop a shortcode where the cursor is.
+	 *
+	 *  At the cursor rather than appended, because the whole point is that a
+	 *  quote sits *inside* a sentence — the design's "drop it at the cursor".
+	 *  Spaced only where it needs to be, so clicking twice does not run two
+	 *  references together. */
+	function insertCode(code: string) {
+		const el = editorEl;
+		if (!el) {
+			body = body ? `${body} ${code}` : code;
+			dirty = true;
+			return;
+		}
+		const start = el.selectionStart ?? body.length;
+		const end = el.selectionEnd ?? start;
+		const before = body.slice(0, start);
+		const after = body.slice(end);
+		const lead = before && !/\s$/.test(before) ? ' ' : '';
+		const tail = after && !/^\s/.test(after) ? ' ' : '';
+		body = `${before}${lead}${code}${tail}${after}`;
+		dirty = true;
+		const caret = start + lead.length + code.length;
+		// After a paint, or the textarea still holds the old value and the
+		// caret lands in the wrong place.
+		requestAnimationFrame(() => {
+			el.focus();
+			el.setSelectionRange(caret, caret);
+		});
+	}
+
+	/** Swap one reference for a whole run of them — a ⇧-range extending the
+	 *  reference the plain click already dropped.
+	 *
+	 *  Falls back to inserting when the anchor's text is no longer where it was
+	 *  put: the writer may have typed over it or undone it, and silently
+	 *  rewriting a body somewhere else would be worse than one extra
+	 *  reference. */
+	function replaceCode(was: string, now: string) {
+		const at = was ? body.lastIndexOf(was) : -1;
+		if (at < 0) {
+			insertCode(now);
+			return;
+		}
+		body = body.slice(0, at) + now + body.slice(at + was.length);
+		dirty = true;
+		const caret = at + now.length;
+		requestAnimationFrame(() => {
+			editorEl?.focus();
+			editorEl?.setSelectionRange(caret, caret);
+		});
+	}
+
+	/** How many distinct lines the body quotes, for the badge the design puts
+	 *  under the editor. Derived from the text rather than from the saved
+	 *  note's count, so it moves as you type. */
+	$: linesQuoted = new Set(
+		[...body.matchAll(/\[\[(?:line|lyric|quote|blockline):\s*([^\]]+?)\s*\]\]/g)].map((m) =>
+			m[1].toLowerCase()
+		)
+	).size;
+
 	let revisions: NoteRevision[] = [];
 	let showRevisions = false;
 	let confirmDelete = false;
@@ -128,6 +299,12 @@
 			};
 		}
 		if (note.period) return { label: periodLabel(note.period), kind: note.period.unit };
+		if (note.line) {
+			return {
+				label: note.line.text ?? `${note.line.title} — line ${note.line.line}`,
+				kind: `line ${note.line.line} · ${note.line.title}`
+			};
+		}
 		return { label: 'Untitled', kind: '' };
 	}
 
@@ -179,13 +356,27 @@
 			dirty = false;
 			const entity = r.target.entity ?? r.note?.entity ?? null;
 			const listen = r.target.listen ?? r.note?.listen ?? null;
+			ctxArtist = '';
+			ctxAlbum = null;
+			ctxTrack = null;
 			if (entity) {
 				({ label: targetLabel, kind: targetKind } = entityLabel(entity));
 				target = { entity_id: entity.id };
+				// What a `[[line:12]]` in this note will be read against — the
+				// same three fields `note_context` builds server-side. An
+				// artist note has neither, which is why the panel is not
+				// offered on one.
+				ctxArtist = entity.artist_name || entity.name;
+				if (entity.kind === 'recording') ctxTrack = entity.name;
+				else if (entity.kind === 'release') ctxAlbum = entity.name;
+				else ctxArtist = entity.name;
 			} else if (listen) {
 				targetLabel = `${listen.title} — ${listen.artist}`;
 				targetKind = `listen · ${formatDateTime(listen.timestamp)}`;
 				target = { scrobble_id: listen.id };
+				ctxArtist = listen.artist;
+				ctxTrack = listen.title;
+				ctxAlbum = listen.album ?? null;
 			} else {
 				target = t;
 			}
@@ -204,6 +395,21 @@
 		}
 	}
 
+	/** A pin was written or removed: the note in front of us gathers these as
+	 *  footnotes, so it has to be re-read — otherwise the footnote you just
+	 *  wrote is missing from the page you are looking at. */
+	async function pinsChanged() {
+		await loadPinned();
+		if (target) {
+			try {
+				open = (await api.noteFor(target)).note;
+			} catch {
+				// The pin saved; only the footnote list is stale.
+			}
+		}
+		await load();
+	}
+
 	function openNote(note: Note) {
 		if (note.entity) return openTarget({ entity_id: note.entity.id });
 		if (note.listen) return openTarget({ scrobble_id: note.listen.id });
@@ -213,6 +419,17 @@
 		if (note.period) {
 			const at = note.period.unit;
 			window.location.href = `/reports?unit=${at}`;
+		}
+		// A pin is read where the line is. Editing it in a box with no lyric
+		// round it would be editing a footnote with the page torn out — the
+		// same reasoning that sends a period note back to its chapter.
+		if (note.line) {
+			const q = new URLSearchParams({
+				artist: note.line.artist,
+				title: note.line.title,
+				line: String(note.line.line)
+			});
+			window.location.href = `/lyrics?${q}`;
 		}
 	}
 
@@ -325,8 +542,52 @@
 		else if (listen && target?.scrobble_id !== Number(listen)) await openTarget({ scrobble_id: Number(listen) });
 	}
 
+	/** Arrive here from the deck's Quote button: open the note on that track and
+	 *  drop the reference in, so quoting a line while it plays is one click.
+	 *
+	 *  A one-shot on mount rather than part of the reactive `?entity=` sync,
+	 *  because it names a track by *name* — the entity may not exist yet, and
+	 *  `openTarget` is what creates it. Re-running it on every URL change would
+	 *  re-insert the reference each time the router touched the query. */
+	async function openFromQuery(p: URLSearchParams) {
+		const name = p.get('name');
+		const artist = p.get('artist');
+		const kind = p.get('kind');
+		if (!name || (kind !== 'track' && kind !== 'album' && kind !== 'artist')) return false;
+		await openTarget({ kind, name, ...(kind === 'artist' ? {} : { artist: artist ?? '' }) });
+		const pin = Number(p.get('pin'));
+		if (Number.isFinite(pin) && pin > 0) {
+			pinFocus = pin;
+			mode = 'pins';
+		}
+		const quote = p.get('quote');
+		if (quote) {
+			// Appended rather than inserted at the cursor: nothing is focused
+			// yet on a page that has only just opened, so there is no cursor to
+			// respect. A line of its own, because it arrives before the sentence
+			// it will end up inside.
+			body = body ? `${body}\n\n${quote} ` : `${quote} `;
+			dirty = true;
+			annotating = true;
+			requestAnimationFrame(() => {
+				editorEl?.focus();
+				editorEl?.setSelectionRange(body.length, body.length);
+			});
+		}
+		return true;
+	}
+
 	onMount(async () => {
+		try {
+			annotating = localStorage.getItem('td-notes-annotate') === '1';
+			const m = localStorage.getItem('td-notes-mode');
+			if (m === 'pins' || m === 'quote') mode = m;
+		} catch {
+			// A browser that refuses storage still gets an editor.
+		}
 		await load();
+		await loadPinned();
+		await openFromQuery(new URLSearchParams(window.location.search));
 		ready = true;
 	});
 </script>
@@ -340,7 +601,18 @@
 			What you think about a record, kept with it.
 		</p>
 	</div>
-	<div style="display:flex;gap:8px;align-items:center;">
+	<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
+		{#if canAnnotate}
+			<!-- The design's two modes. Only offered where there is something to
+			     annotate: an artist note is prose, and a tab that switches to a
+			     panel whose only job is to say so is worse than no tab. -->
+			<div class="modes" role="tablist" aria-label="Writing mode">
+				<button class="mode" class:on={mode === 'quote'} role="tab"
+					aria-selected={mode === 'quote'} on:click={() => setMode('quote')}>Write &amp; quote</button>
+				<button class="mode" class:on={mode === 'pins'} role="tab"
+					aria-selected={mode === 'pins'} on:click={() => setMode('pins')}>Annotate lines</button>
+			</div>
+		{/if}
 		<a class="btn btn-secondary" href="/settings#data" title="Export every note as Markdown">
 			Export
 		</a>
@@ -353,6 +625,40 @@
 <div class="notes-layout">
 	<!-- Everything written, newest edit first -->
 	<div>
+		{#if mode === 'pins'}
+			<!-- The design's "Lines you've written about". **Across everything**
+			     rather than this record, which is what makes it a way back into
+			     writing you had forgotten rather than a second copy of the margin
+			     already on screen. -->
+			<div class="panel" style="border-radius:22px;padding:20px;margin-bottom:16px;">
+				<h3 class="h-display" style="font-size:17px;margin:0 0 4px;">Lines you've written about</h3>
+				<p style="margin:0 0 12px;font-size:11.5px;color:var(--td-muted-3);line-height:1.45;">
+					Across the whole shelf, newest first.
+				</p>
+				{#if !pinned.length}
+					<p style="font-size:13px;color:var(--td-muted);margin:0;">
+						None yet. Hover a line on the right and pin a note to it.
+					</p>
+				{:else}
+					<div style="display:flex;flex-direction:column;gap:5px;">
+						{#each pinned as p (p.note_id)}
+							<button class="pinrow" on:click={() => openPinnedLine(p)}>
+								<div class="pinco">{p.line.title} · {p.line.line}</div>
+								<div class="pinwords">{p.line.text ?? '—'}</div>
+								<div class="pinmeta">
+									{timeAgo(p.updated_at)}{elsewhere(p) ? ' · other record' : ''}
+								</div>
+							</button>
+						{/each}
+					</div>
+				{/if}
+				<div style="height:1px;background:var(--td-border);margin:14px 0;"></div>
+				<p style="margin:0;font-size:11.5px;color:var(--td-muted-2);line-height:1.5;">
+					A pin is a note whose target <em>is</em> the line. It shows here, in the
+					reader's sidebar, and as a footnote on the record's own note.
+				</p>
+			</div>
+		{:else}
 		<div class="panel" style="border-radius:22px;padding:20px;margin-bottom:16px;">
 			<div style="display:flex;align-items:baseline;justify-content:space-between;gap:8px;margin-bottom:10px;">
 				<h3 class="h-display" style="font-size:17px;margin:0;">Your notes</h3>
@@ -406,13 +712,14 @@
 							</div>
 							<div style="font-size:12px;color:var(--td-muted-2);margin-top:2px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">{n.excerpt}</div>
 							<div style="font-size:11px;color:var(--td-muted-3);margin-top:3px;">
-								{timeAgo(n.updated_at)}{n.revisions ? ` · ${n.revisions} earlier version${n.revisions > 1 ? 's' : ''}` : ''}{n.visibility !== 'private' ? ` · ${n.visibility}` : ''}
+								{timeAgo(n.updated_at)}{n.lines_quoted ? ` · ${n.lines_quoted} line${n.lines_quoted > 1 ? 's' : ''} quoted` : ''}{n.revisions ? ` · ${n.revisions} earlier version${n.revisions > 1 ? 's' : ''}` : ''}{n.visibility !== 'private' ? ` · ${n.visibility}` : ''}
 							</div>
 						</button>
 					{/each}
 				</div>
 			{/if}
 		</div>
+		{/if}
 
 	</div>
 
@@ -453,6 +760,14 @@
 					<div style="font-size:11.5px;color:var(--td-muted-3);text-transform:uppercase;letter-spacing:.08em;">{targetKind}</div>
 				</div>
 				<div style="display:flex;gap:8px;align-items:center;">
+					{#if canAnnotate}
+						<!-- Not offered where there is nothing to read against: an
+						     artist note has no track, so a toggle would open onto
+						     a panel whose only job would be to say so. -->
+						<button class="btn btn-secondary" class:on={annotating} on:click={toggleAnnotate}>
+							{annotating ? 'Hide lyrics' : 'Annotate lines'}
+						</button>
+					{/if}
 					{#if target.entity_id}
 						<button class="btn btn-secondary" style="color:{loved ? '#b2622d' : 'inherit'};" on:click={toggleLove}>
 							{loved ? '♥ Loved' : '♡ Love'}
@@ -462,7 +777,19 @@
 				</div>
 			</div>
 
-			{#if previewing}
+			{#if mode === 'pins'}
+				<!-- The footnote form. The pin *is* the note, so this is not a
+				     second editor for the same thing — it writes a different
+				     target, and the prose editor is one tab away. -->
+				<LyricAnnotate
+					artist={ctxArtist}
+					track={ctxTrack}
+					album={ctxAlbum}
+					focus={pinFocus}
+					on:changed={pinsChanged}
+					on:prose={() => setMode('quote')}
+				/>
+			{:else if previewing}
 				<div class="note-body">
 					{#if previewBusy}
 						<p style="color:var(--td-muted);">Rendering…</p>
@@ -473,15 +800,34 @@
 					{/if}
 				</div>
 			{:else}
-				<textarea
-					class="input note-input"
-					bind:value={body}
-					on:input={() => (dirty = true)}
-					placeholder="Bought this on a whim in 2011. [[track:3]] is the one that got me — nothing else on it sounds like [[artist:Boards of Canada]]."
-				></textarea>
-				<div style="margin-top:10px;"><ShortcodeLegend /></div>
+				<div class="writecols" class:split={annotating && canAnnotate}>
+					<div style="min-width:0;">
+						<textarea
+							class="input note-input"
+							bind:this={editorEl}
+							bind:value={body}
+							on:input={() => (dirty = true)}
+							placeholder="Bought this on a whim in 2011. [[track:3]] is the one that got me — nothing else on it sounds like [[artist:Boards of Canada]]."
+						></textarea>
+						{#if linesQuoted}
+							<p class="quoted">{linesQuoted} line{linesQuoted === 1 ? '' : 's'} quoted</p>
+						{/if}
+						<div style="margin-top:10px;"><ShortcodeLegend /></div>
+					</div>
+					{#if annotating && canAnnotate}
+						<LyricPicker
+							artist={ctxArtist}
+							track={ctxTrack}
+							album={ctxAlbum}
+							{body}
+							on:insert={(e) => insertCode(e.detail)}
+							on:replace={(e) => replaceCode(e.detail.was, e.detail.now)}
+						/>
+					{/if}
+				</div>
 			{/if}
 
+			{#if mode === 'quote'}
 			<div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-top:16px;">
 				<button class="btn btn-primary" on:click={save} disabled={saving || !body.trim()}>
 					{saving ? '…' : dirty || !open ? 'Save' : 'Saved'}
@@ -509,6 +855,33 @@
 				Visibility is stored for later — patches and federation aren't built yet, so for now
 				every note is yours alone whatever this says.
 			</p>
+
+			<!-- **Pins roll up into the record's own note as footnotes** — the
+			     design's third rendering, and the one that could ever federate:
+			     nothing of the provider's text is written into the prose, so a
+			     reader elsewhere sees your words and a stub. -->
+			{#if open?.pins?.length}
+				<div class="fnotes">
+					<div class="fnhead">Pinned lines on this record</div>
+					{#each open.pins as pin, i (pin.note_id)}
+						<div class="fn">
+							<span class="fnmark">{i + 1}</span>
+							<div style="min-width:0;">
+								<div class="fntext">{pin.excerpt}</div>
+								<div class="fnline">
+									<span class="fnco">{pin.line.title} · line {pin.line.line}</span>
+									{#if pin.line.text}
+										<span class="fnwords">{pin.line.text}</span>
+									{:else}
+										<span class="fngone">no words held for that line any more</span>
+									{/if}
+								</div>
+							</div>
+						</div>
+					{/each}
+				</div>
+			{/if}
+			{/if}
 
 			{#if showRevisions}
 				<div style="margin-top:16px;padding-top:16px;border-top:1px solid var(--td-border);">
@@ -621,6 +994,111 @@
 {/if}
 
 <style>
+	/* The editor and the lyrics beside it. Splits only when the panel is open,
+	   so a note that quotes nothing keeps the full width — and stacks under
+	   1100 rather than squeezing both, since a lyric in a 200px column is
+	   unreadable and so is prose. */
+	.writecols { display: grid; grid-template-columns: minmax(0, 1fr); gap: 14px; }
+	.writecols.split { grid-template-columns: minmax(0, 1fr) 320px; align-items: start; }
+	@media (max-width: 1100px) {
+		.writecols.split { grid-template-columns: minmax(0, 1fr); }
+	}
+	.quoted {
+		display: inline-block;
+		font-size: 11.5px;
+		color: var(--td-good-fg);
+		background: var(--td-good-bg);
+		padding: 3px 10px;
+		border-radius: 999px;
+		margin: 8px 0 0;
+	}
+	.btn.on { border-color: var(--td-accent); color: var(--td-accent); }
+
+	/* The two writing modes. Declared here rather than borrowed, for the reason
+	   `.seg-btn` is repeated on every page that uses it: Svelte scopes styles,
+	   so a class defined elsewhere renders as bare text and nothing errors. */
+	.modes {
+		display: inline-flex;
+		gap: 4px;
+		padding: 4px;
+		border-radius: 999px;
+		background: var(--td-surface2);
+		border: 1px solid var(--td-border);
+	}
+	.mode {
+		font-family: 'Caprasimo', serif;
+		font-size: 12.5px;
+		padding: 6px 15px;
+		border-radius: 999px;
+		border: none;
+		background: transparent;
+		color: var(--td-muted-2);
+		cursor: pointer;
+	}
+	.mode.on { background: var(--td-accent); color: #fbf5ea; }
+
+	/* "Lines you've written about" */
+	.pinrow {
+		display: block;
+		width: 100%;
+		text-align: left;
+		padding: 9px 11px;
+		border-radius: 14px;
+		border: 1px solid transparent;
+		background: none;
+		cursor: pointer;
+		font-family: inherit;
+	}
+	.pinrow:hover { background: var(--td-surface2); border-color: var(--td-border); }
+	.pinco { font: 500 10px ui-monospace, Menlo, monospace; color: var(--td-accent); }
+	.pinwords {
+		font-size: 12.5px;
+		line-height: 1.4;
+		margin-top: 2px;
+		color: var(--td-text);
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
+	}
+	.pinmeta { font-size: 10.5px; color: var(--td-muted-3); margin-top: 3px; }
+
+	/* Footnotes under the record's own note. */
+	.fnotes {
+		margin-top: 18px;
+		padding-top: 16px;
+		border-top: 1px solid var(--td-border);
+		display: flex;
+		flex-direction: column;
+		gap: 10px;
+	}
+	.fnhead {
+		font: 600 9.5px 'Figtree', system-ui, sans-serif;
+		letter-spacing: 0.16em;
+		text-transform: uppercase;
+		color: var(--td-muted-3);
+	}
+	.fn { display: grid; grid-template-columns: 22px minmax(0, 1fr); gap: 10px; align-items: start; }
+	.fnmark {
+		display: grid;
+		place-items: center;
+		width: 20px;
+		height: 20px;
+		border-radius: 999px;
+		background: color-mix(in srgb, var(--td-accent) 18%, transparent);
+		color: var(--td-accent);
+		font: 600 10.5px 'Figtree', system-ui, sans-serif;
+	}
+	.fntext { font-size: 13px; line-height: 1.55; color: var(--td-text); }
+	.fnline { margin-top: 3px; display: flex; gap: 8px; flex-wrap: wrap; align-items: baseline; }
+	.fnco {
+		font: 500 10px ui-monospace, Menlo, monospace;
+		text-transform: uppercase;
+		letter-spacing: 0.06em;
+		color: var(--td-muted-3);
+	}
+	.fnwords { font-size: 12px; color: var(--td-muted-2); font-style: italic; }
+	.fngone { font-size: 12px; color: var(--td-muted-3); }
+
 	.notes-layout {
 		display: grid;
 		grid-template-columns: minmax(0, 320px) minmax(0, 1fr);

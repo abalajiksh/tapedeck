@@ -45,7 +45,10 @@
 		// Two forms; the short one is read against whatever the note is about,
 		// the same rule the positional [[track:3]] follows.
 		{ code: '[[line:12]]', what: 'line 12 of the track this note is about' },
-		{ code: '[[line:A:3:12]]', what: 'side A, track 3, line 12 of this record' }
+		{ code: '[[line:A:3:12]]', what: 'side A, track 3, line 12 of this record' },
+		// The same coordinate, set as a pull-quote rather than a phrase — for
+		// when the note is *about* the line rather than mentioning it.
+		{ code: '[[quote:12]]', what: 'the same line, set out on its own' }
 	];
 </script>
 

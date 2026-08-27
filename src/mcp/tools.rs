@@ -408,7 +408,7 @@ the user said outright rather than something inferred from a play count.",
             name: "lyrics",
             title: "The words to a track they have played",
             description:
-                "The lyrics Tapedeck has cached for one track, from LRCLIB. THIS IS SOMEBODY ELSE'S COPYRIGHTED TEXT, not the user's writing and not Tapedeck's: quote from it sparingly and never reproduce a whole lyric. It is here so you can talk about a song they actually played — what it is about, a line they asked after, what language it is in. Returns nothing at all for a track nobody has fetched yet, for one LRCLIB has never heard of, and for an instrumental, which is a real answer rather than a gap.",
+                "The lyrics Tapedeck has cached for one track, from LRCLIB. THIS IS SOMEBODY ELSE'S COPYRIGHTED TEXT, not the user's writing and not Tapedeck's: quote from it sparingly and never reproduce a whole lyric. It is here so you can talk about a song they actually played — what it is about, a line they asked after, what language it is in. Returns nothing at all for a track nobody has fetched yet, for one LRCLIB has never heard of, and for an instrumental, which is a real answer rather than a gap. Comes back as NUMBERED LINES — use those numbers rather than counting yourself, because a blank line is numbered too and that is the numbering a [[line:N]] reference in their own notes points at.",
             scope: scopes::LIBRARY_READ,
             read_only: true,
             schema: json!({
@@ -927,13 +927,27 @@ pub async fn call(
             // requests at a free service Tapedeck has asked to be considerate
             // of, and the backfill is what paces that.
             match lyrics.cached(&artist, &title).await {
-                Some(crate::lyrics::Found::Lyrics { plain, synced, language }) => json!({
-                    "artist": artist, "title": title,
-                    "language": language,
-                    "plain": plain,
-                    "synced": synced,
-                    "note": "Third-party copyrighted text via LRCLIB. Quote sparingly; do not reproduce in full.",
-                }),
+                Some(crate::lyrics::Found::Lyrics { plain, synced, language }) => {
+                    // **Numbered lines, the same numbering the reader draws.**
+                    // A model handed a blob and asked about line 12 has to
+                    // count, and it will count blank lines differently from
+                    // `parse_lines` — where a stanza break is a numbered line,
+                    // because a reference is an index and skipping empties
+                    // would renumber every line after one. Two numberings of
+                    // one lyric is how an assistant confidently quotes the
+                    // wrong words at somebody's own note.
+                    let lines = crate::lyrics::parse_lines(plain.as_deref(), synced.as_deref());
+                    json!({
+                        "artist": artist, "title": title,
+                        "language": language,
+                        "timed": lines.iter().any(|l| l.at.is_some()),
+                        "lines": lines.iter().map(|l| json!({
+                            "n": l.index, "at": l.at, "text": l.text,
+                        })).collect::<Vec<_>>(),
+                        "numbering": "1-based, and a blank line is numbered — this is the same numbering the reader and a [[line:N]] reference use.",
+                        "note": "Third-party copyrighted text via LRCLIB. Quote sparingly; do not reproduce in full.",
+                    })
+                }
                 Some(crate::lyrics::Found::Instrumental) => json!({
                     "artist": artist, "title": title,
                     "instrumental": true,
@@ -999,6 +1013,7 @@ pub async fn call(
                     scrobble_id: None,
                     period_unit: None,
                     period_key: None,
+                    line: None,
                     from_scrobble: None,
                     kind: Some(kind.clone()),
                     name: Some(require(args, "name")?),
@@ -1328,6 +1343,7 @@ async fn write_note(
             scrobble_id: None,
             period_unit: None,
             period_key: None,
+            line: None,
             from_scrobble: None,
             kind: Some(kind),
             name: Some(name),

@@ -34,6 +34,7 @@
 //! be picked up by its own background fetcher and appear later, so a miss is a
 //! tombstone with a TTL rather than a permanent verdict.
 
+use std::collections::HashMap;
 use std::time::Duration;
 
 use serde::Deserialize;
@@ -255,13 +256,142 @@ impl LyricsClient {
                 synced TEXT,
                 language TEXT,                -- by script, NULL for Latin text
                 found INTEGER NOT NULL,       -- 0 = LRCLIB has nothing (yet)
-                fetched_at INTEGER NOT NULL
+                fetched_at INTEGER NOT NULL,
+                edited INTEGER NOT NULL DEFAULT 0  -- corrected here; a fetch must not overwrite
             );
             "#,
         )
         .execute(&self.pool)
         .await?;
+        // A cache that predates "Fix the words" has no `edited` column, and
+        // this table is created by `CREATE TABLE IF NOT EXISTS` so the line
+        // above never reaches it. Unguarded and ignored on failure: the only
+        // way this errors is the column already being there.
+        let _ =
+            sqlx::query("ALTER TABLE lyrics_cache ADD COLUMN edited INTEGER NOT NULL DEFAULT 0")
+                .execute(&self.pool)
+                .await;
         Ok(())
+    }
+
+    /// Replace the words by hand, and stop asking LRCLIB for them.
+    ///
+    /// **A value you supplied is never overwritten by a lookup** — the rule the
+    /// shelf's running times already follow, and the answer to the collision
+    /// between this and *newest fetch wins*: a later fetch is newer, and a
+    /// correction somebody typed is better. `edited` is what carries that, and
+    /// [`Self::remember`] refuses to write over a row holding it.
+    ///
+    /// The language is re-read from the new words, because correcting a lyric
+    /// is exactly the case where the old reading may have been wrong — a
+    /// placeholder in the wrong script is precisely what somebody would be
+    /// fixing.
+    ///
+    /// Instance-wide rather than per user, like everything else in this cache:
+    /// these are one track's words, not one person's opinion of them.
+    pub async fn set_words(
+        &self,
+        artist: &str,
+        title: &str,
+        plain: Option<&str>,
+        synced: Option<&str>,
+    ) -> Result<Found, sqlx::Error> {
+        let plain = plain.map(str::trim).filter(|t| !t.is_empty()).map(str::to_string);
+        let synced = synced.map(str::trim).filter(|t| !t.is_empty()).map(str::to_string);
+        let language = language_of(plain.as_deref(), synced.as_deref()).map(str::to_string);
+        let key = Self::track_key(artist, title);
+        let now = crate::db::Database::now_secs();
+        // `found` is 1 even for an empty correction: somebody has answered for
+        // this track, and re-asking LRCLIB would undo the answer.
+        sqlx::query(
+            "INSERT INTO lyrics_cache
+                (track_key, lrclib_id, instrumental, plain, synced, language, found, fetched_at, edited)
+             VALUES (?, NULL, 0, ?, ?, ?, 1, ?, 1)
+             ON CONFLICT(track_key) DO UPDATE SET
+                plain = excluded.plain, synced = excluded.synced,
+                language = excluded.language, instrumental = 0, found = 1,
+                fetched_at = excluded.fetched_at, edited = 1",
+        )
+        .bind(&key)
+        .bind(&plain)
+        .bind(&synced)
+        .bind(&language)
+        .bind(now)
+        .execute(&self.pool)
+        .await?;
+        Ok(Found::Lyrics { plain, synced, language })
+    }
+
+    /// Whether these words were corrected here rather than fetched.
+    pub async fn is_edited(&self, artist: &str, title: &str) -> bool {
+        let key = Self::track_key(artist, title);
+        sqlx::query_as::<_, (i64,)>("SELECT edited FROM lyrics_cache WHERE track_key = ?")
+            .bind(&key)
+            .fetch_optional(&self.pool)
+            .await
+            .ok()
+            .flatten()
+            .is_some_and(|(e,)| e != 0)
+    }
+
+    /// What is known about each of a handful of tracks, in one query.
+    ///
+    /// For the reader's tracklist, which wants to mark the instrumentals — the
+    /// design's `· instrumental` — and dim the ones there is nothing to open.
+    /// One `IN` rather than a lookup per track: a record is ten to twenty
+    /// tracks and twenty round trips to decorate a sidebar is not the way.
+    ///
+    /// Three answers, matching [`Found`]: `"words"`, `"instrumental"`, and
+    /// absent for a track nobody has asked about — which is a different thing
+    /// from one that has no words, and the sidebar says so differently.
+    pub async fn states_for(&self, tracks: &[(String, String)]) -> HashMap<String, &'static str> {
+        let mut out = HashMap::new();
+        if tracks.is_empty() {
+            return out;
+        }
+        let keys: Vec<String> = tracks.iter().map(|(a, t)| Self::track_key(a, t)).collect();
+        let holes = std::iter::repeat_n("?", keys.len()).collect::<Vec<_>>().join(",");
+        let sql = format!(
+            "SELECT track_key, instrumental,
+                    (COALESCE(plain, '') <> '' OR COALESCE(synced, '') <> '') AS has_words
+               FROM lyrics_cache WHERE found = 1 AND track_key IN ({holes})"
+        );
+        let mut q = sqlx::query_as::<_, (String, i64, i64)>(&sql);
+        for k in &keys {
+            q = q.bind(k);
+        }
+        for (key, instrumental, has_words) in q.fetch_all(&self.pool).await.unwrap_or_default() {
+            if instrumental != 0 {
+                out.insert(key, "instrumental");
+            } else if has_words != 0 {
+                out.insert(key, "words");
+            }
+        }
+        out
+    }
+
+    /// Every track this instance holds words for, as folded track keys.
+    ///
+    /// One request for the whole set rather than a lookup per row, which is
+    /// exactly the shape `GET /api/v1/loves/keys` already has and for the same
+    /// reason: a history page wants to know which of fifty rows has something
+    /// to read, and fifty questions is not the way to ask.
+    ///
+    /// **Only tracks with words.** An instrumental is a real answer and a
+    /// finished lookup, but there is nothing to open a reader on, so offering
+    /// one would be offering an empty page.
+    pub async fn keys_with_lyrics(&self) -> Vec<String> {
+        sqlx::query_as::<_, (String,)>(
+            "SELECT track_key FROM lyrics_cache
+              WHERE found = 1 AND instrumental = 0
+                AND (COALESCE(plain, '') <> '' OR COALESCE(synced, '') <> '')",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(k,)| k)
+        .collect()
     }
 
     /// `artist|title`, folded the way the rest of the application folds both.
@@ -369,6 +499,14 @@ impl LyricsClient {
 
     async fn remember(&self, artist: &str, title: &str, hit: Option<(&Found, Option<i64>)>) {
         let key = Self::track_key(artist, title);
+        // **A correction outlives every later fetch.** *Newest fetch wins* is
+        // the rule for two fetches; between a fetch and something a person
+        // typed, the person wins — the same trade `apply_durations` makes on
+        // the shelf, where a running time somebody supplied survives every
+        // lookup after it.
+        if self.is_edited(artist, title).await {
+            return;
+        }
         let now = crate::db::Database::now_secs();
         let (found, instrumental, plain, synced, language, id) = match hit {
             None => (0, 0, None, None, None, None),
@@ -570,6 +708,13 @@ mod tests {
             LyricsClient::track_key("Burial", "Archangel"),
             LyricsClient::track_key("Burial", "Shell of Light")
         );
+        // The **literal shape**, because `GET /api/v1/lyrics/keys` hands this
+        // string to the browser and `lyricKey` in `web/src/lib/api.ts` builds
+        // the same one from a row in hand. Nothing links the two, so a change
+        // to the separator or the fold here silently stops "Read the words"
+        // appearing on rows that do have words. Same standing trap as
+        // `loveKey`, and this is the half of it that can be pinned.
+        assert_eq!(LyricsClient::track_key("Burial", "Archangel"), "burial|archangel");
     }
 
     /// `instrumental` is an answer, not an absence.

@@ -55,6 +55,10 @@ fn server_error(e: sqlx::Error) -> axum::response::Response {
 /// * `kind` + `name` (+ `artist`) — spelled out.
 /// * `period_unit` + `period_key` — a week, a month or a year of listening,
 ///   named exactly as the Reports page names it.
+/// * `line` + `artist` + `name` — one numbered line of a lyric, which is a
+///   **pin**. Not an entity and never becomes one, the same refusal a period
+///   makes: a line is a position in somebody else's text, so there is nothing
+///   to conjure a row for — and it cannot be loved for the same reason.
 #[derive(Debug, Deserialize, Default)]
 pub struct TargetSpec {
     pub entity_id: Option<i64>,
@@ -63,6 +67,14 @@ pub struct TargetSpec {
     pub period_unit: Option<String>,
     /// One of `reports::period_of`'s keys — `2026`, `2026-08`, `2026-W32`.
     pub period_key: Option<String>,
+    /// A **pin**: `line` alongside `artist` and `name` (the track's title).
+    ///
+    /// The artist and title are named outright rather than read against
+    /// anything, because a pin has no other subject — it *is* the target, and
+    /// it has to be findable from the reader, which knows the names and has no
+    /// note to read them against. The `[[line:12]]` in a note's prose is the
+    /// relative form and lives in `resolve_line`.
+    pub line: Option<usize>,
     pub from_scrobble: Option<i64>,
     pub kind: Option<String>,
     pub name: Option<String>,
@@ -110,6 +122,18 @@ async fn resolve_target(
     if let (Some(unit), Some(key)) = (spec.period_unit.as_deref(), spec.period_key.as_deref()) {
         return NoteTarget::period(unit, key)
             .ok_or_else(|| format!("Not a period Reports names: {unit} {key}"));
+    }
+
+    // A pin, like a period, is never an entity. The coordinate is validated
+    // here rather than trusted, because it *is* the note's identity: a pin
+    // filed under a malformed one is not findable again by the reader that
+    // wrote it, which reads to its author as a save that silently did nothing.
+    if let Some(n) = spec.line {
+        let artist = spec.artist.as_deref().unwrap_or("");
+        let title = spec.name.as_deref().unwrap_or("");
+        return NoteTarget::line(artist, title, n).ok_or_else(|| {
+            "A pin needs an artist, a track title and a line number above zero".to_string()
+        });
     }
 
     let kind = spec
@@ -184,23 +208,103 @@ async fn resolve_line(
     user_id: i64,
     target: &str,
     ctx: &NoteCtx,
+    block: bool,
 ) -> Option<Resolved> {
+    let LineRef { artist, title, n, chip } = line_ref(db, user_id, target, ctx).await?;
+    line_resolution(lyrics, &artist, &title, n, chip, block).await
+}
+
+/// Which track and which line a `[[line:…]]` in some prose actually names.
+///
+/// Split out from the rendering because two things need it and only one of them
+/// wants the words: the renderer, and the count of how many notes quote a given
+/// line. Resolving the same reference twice in two shapes is how the two would
+/// come to disagree about what it points at.
+pub struct LineRef {
+    pub artist: String,
+    pub title: String,
+    pub n: usize,
+    /// What the inline chip says — `12`, or `A3·12` on a record.
+    pub chip: String,
+}
+
+async fn line_ref(db: &Database, user_id: i64, target: &str, ctx: &NoteCtx) -> Option<LineRef> {
     let parts: Vec<&str> = target.split(':').map(str::trim).collect();
-    let (artist, title, n) = match parts.as_slice() {
+    match parts.as_slice() {
         // `[[line:12]]` — the track this note is about.
-        [n] => (ctx.artist.as_deref()?, ctx.track.as_deref()?, n.parse::<usize>().ok()?),
+        [n] => {
+            let n = n.parse::<usize>().ok().filter(|n| *n > 0)?;
+            Some(LineRef {
+                artist: ctx.artist.clone()?,
+                title: ctx.track.clone()?,
+                n,
+                chip: n.to_string(),
+            })
+        }
         // `[[line:A:3:12]]` — side A, track 3 of the record this note is about.
         [side, track, n] => {
             let pos: i64 = track.parse().ok()?;
-            let n: usize = n.parse().ok()?;
+            let n = n.parse::<usize>().ok().filter(|n| *n > 0)?;
             let artist = ctx.artist.as_deref()?;
             let album = ctx.album.as_deref()?;
             let title = db.shelf_track_title(user_id, artist, album, side, pos).await.ok()??;
-            return line_resolution(lyrics, artist, &title, n).await;
+            Some(LineRef {
+                artist: artist.to_string(),
+                title,
+                n,
+                // The design's chip, which names the coordinate rather than the
+                // line alone: on a record "A3·12" is what tells two tracks'
+                // line twelves apart at a glance.
+                chip: format!("{}{}\u{b7}{}", side.to_uppercase(), pos, n),
+            })
         }
-        _ => return None,
+        _ => None,
+    }
+}
+
+/// How many of this user's notes quote each line of one track.
+///
+/// The design's "quoted in N notes". Counted from the note bodies on read
+/// rather than from a stored number, so it cannot drift from what is actually
+/// written — the rule chain hours, gear hours and a crate entry's landing all
+/// follow.
+///
+/// One note quoting one line twice is one note, which is what the inner set is
+/// for: the badge answers "how many notes talk about this line", and a writer
+/// who quotes a couplet either side of a sentence has not doubled it.
+///
+/// Bounded by `notes_quoting_lines`, which narrows in SQL to bodies that
+/// contain a line shortcode at all — most notes contain none, and that is what
+/// keeps them out of the per-note context lookup this loop makes.
+pub async fn quoted_lines(
+    db: &Database,
+    user_id: i64,
+    artist: &str,
+    title: &str,
+) -> HashMap<usize, usize> {
+    let want = (Database::artist_key(artist), title.trim().to_lowercase());
+    let mut out: HashMap<usize, usize> = HashMap::new();
+    let Ok(rows) = db.notes_quoting_lines(user_id).await else {
+        return out;
     };
-    line_resolution(lyrics, artist, title, n).await
+    for note in &rows {
+        let ctx = note_context(db, user_id, note).await;
+        let mut seen: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        for code in notes::scan(&note.body_md) {
+            if !code.kind.is_line() {
+                continue;
+            }
+            if let Some(r) = line_ref(db, user_id, &code.target, &ctx).await {
+                if (Database::artist_key(&r.artist), r.title.trim().to_lowercase()) == want {
+                    seen.insert(r.n);
+                }
+            }
+        }
+        for n in seen {
+            *out.entry(n).or_default() += 1;
+        }
+    }
+    out
 }
 
 /// The shared half: look the lyric up and turn one line into a rendering.
@@ -209,6 +313,8 @@ async fn line_resolution(
     artist: &str,
     title: &str,
     n: usize,
+    chip: String,
+    block: bool,
 ) -> Option<Resolved> {
     let lyrics = lyrics?;
     let crate::lyrics::Found::Lyrics { plain, synced, .. } = lyrics.cached(artist, title).await?
@@ -231,7 +337,20 @@ async fn line_resolution(
         urlencoding::encode(title),
         n
     );
-    Some(Resolved { label: line.text.clone(), href })
+    // The block form carries the coordinate and, where the lyric is timed, the
+    // moment — which is the caption the design puts under a pull-quote. The
+    // inline form carries the same coordinate as a chip instead, because it
+    // sits inside a sentence and a caption would break it.
+    let render = if block {
+        let meta = match line.at {
+            Some(at) => format!("line {n} \u{b7} {}:{:02}", at as u64 / 60, at as u64 % 60),
+            None => format!("line {n}"),
+        };
+        crate::notes::Render::LineBlock { meta }
+    } else {
+        crate::notes::Render::LineInline { chip }
+    };
+    Some(Resolved { label: line.text.clone(), href, render })
 }
 
 /// What a note is *about*, which is what its shortcodes are read against.
@@ -248,6 +367,18 @@ pub struct NoteCtx {
 }
 
 async fn note_context(db: &Database, user_id: i64, note: &NoteRow) -> NoteCtx {
+    // A pin is about a line of a track, so that track is what its own prose is
+    // read against — which is what makes "and line 11 sets it up" work inside a
+    // footnote without naming the track a second time.
+    if let Some(label) = note.line_label.as_deref() {
+        if let Some((artist, title)) = NoteTarget::line_names(label) {
+            return NoteCtx {
+                artist: Some(artist.to_string()),
+                album: None,
+                track: Some(title.to_string()),
+            };
+        }
+    }
     if let Some(sid) = note.scrobble_id {
         if let Ok(Some(s)) = db.get_scrobble(user_id, sid).await {
             return NoteCtx { artist: Some(s.artist), album: s.album, track: Some(s.title) };
@@ -271,6 +402,102 @@ async fn note_context(db: &Database, user_id: i64, note: &NoteRow) -> NoteCtx {
             NoteCtx { artist: Some(e.artist_name), album, track: Some(e.name) }
         }
     }
+}
+
+/// A pin's coordinate as the shape every screen reads it in.
+///
+/// The stored pair is a folded key and a display label; a client wants the
+/// artist, the title and the number. Built in one place so the reader, the
+/// notes list and `notes/for` cannot disagree about the shape — and so the
+/// separator stays an implementation detail of the storage.
+fn line_json(key: &str, label: &str, text: Option<&str>) -> serde_json::Value {
+    let (artist, title) = NoteTarget::line_names(label).unwrap_or(("", label));
+    serde_json::json!({
+        "artist": artist,
+        "title": title,
+        "line": NoteTarget::line_number(key).unwrap_or(0),
+        // The words, when the lyric is still held. Resolved on read and never
+        // stored — the first of the design's four rules, and the reason a pin
+        // survives the lyric being corrected under it.
+        "text": text,
+    })
+}
+
+/// The words of one line, if this instance still holds them.
+async fn line_text(
+    lyrics: Option<&crate::lyrics::LyricsClient>,
+    artist: &str,
+    title: &str,
+    n: usize,
+) -> Option<String> {
+    let crate::lyrics::Found::Lyrics { plain, synced, .. } = lyrics?.cached(artist, title).await?
+    else {
+        return None;
+    };
+    crate::lyrics::parse_lines(plain.as_deref(), synced.as_deref())
+        .into_iter()
+        .find(|l| l.index == n)
+        .map(|l| l.text)
+        .filter(|t| !t.trim().is_empty())
+}
+
+/// A pin as it reads under the note it belongs to.
+///
+/// The design's third rendering: *"Pins roll up into the record's own note as
+/// footnotes."* Nothing of the provider's text is written into the prose — the
+/// words are resolved on read and sit beside the footnote — which is what makes
+/// a pin the one form of lyric reference that could ever federate: a reader
+/// elsewhere sees your words and a stub.
+async fn pin_footnotes(
+    db: &Database,
+    lyrics: Option<&crate::lyrics::LyricsClient>,
+    user_id: i64,
+    scope: &[(String, String)],
+) -> Vec<serde_json::Value> {
+    if scope.is_empty() {
+        return Vec::new();
+    }
+    // Folded once, so the comparison below is set membership rather than a
+    // query per track. `line_notes` is a person's own pins — tens of rows.
+    let want: std::collections::HashSet<(String, String)> =
+        scope.iter().map(|(a, t)| (Database::artist_key(a), t.trim().to_lowercase())).collect();
+    let Ok(rows) = db.line_notes(user_id, 500).await else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for note in &rows {
+        let (Some(key), Some(label)) = (note.line_key.as_deref(), note.line_label.as_deref())
+        else {
+            continue;
+        };
+        let (Some((artist, title)), Some(n)) =
+            (NoteTarget::line_names(label), NoteTarget::line_number(key))
+        else {
+            continue;
+        };
+        if !want.contains(&(Database::artist_key(artist), title.trim().to_lowercase())) {
+            continue;
+        }
+        let text = line_text(lyrics, artist, title, n).await;
+        out.push(serde_json::json!({
+            "note_id": note.id,
+            "line": line_json(key, label, text.as_deref()),
+            "body_md": note.body_md,
+            "excerpt": notes::excerpt(&note.body_md, 200),
+            "updated_at": note.updated_at,
+        }));
+    }
+    // Footnotes read in the order the record plays, not the order they were
+    // written: they are numbered markers under a piece of prose, and 3 before 1
+    // would look like a mistake.
+    out.sort_by_key(|v| {
+        let t = v["line"]["title"].as_str().unwrap_or("").to_lowercase();
+        let n = v["line"]["line"].as_u64().unwrap_or(0);
+        let pos =
+            scope.iter().position(|(_, st)| st.trim().to_lowercase() == t).unwrap_or(usize::MAX);
+        (pos, n)
+    });
+    out
 }
 
 /// What a note is *about*, as one line.
@@ -305,15 +532,16 @@ async fn render(
         // else's text, and the other three are entities. This is the only place
         // the three are told apart, which is why `notes.rs` takes an href
         // rather than building one.
-        if code.kind == RefKind::Line {
-            if let Some(r) = resolve_line(db, lyrics, user_id, &code.target, ctx).await {
+        if code.kind.is_line() {
+            let block = code.kind == RefKind::LineBlock;
+            if let Some(r) = resolve_line(db, lyrics, user_id, &code.target, ctx, block).await {
                 resolved.insert(key, r);
             }
             continue;
         }
         let Some(entity_kind) = code.kind.entity_kind() else {
             if let Ok(Some((id, label))) = db.find_equipment_by_name(user_id, &code.target).await {
-                resolved.insert(key, Resolved { label, href: format!("/chains?gear={}", id) });
+                resolved.insert(key, Resolved::link(label, format!("/chains?gear={}", id)));
             }
             continue;
         };
@@ -328,7 +556,7 @@ async fn render(
             )
             .await;
         if let Ok(Some((entity_id, label))) = hit {
-            resolved.insert(key, Resolved { label, href: format!("/notes?entity={}", entity_id) });
+            resolved.insert(key, Resolved::link(label, format!("/notes?entity={}", entity_id)));
         }
     }
     notes::render(body_md, &resolved)
@@ -373,6 +601,58 @@ async fn note_json(
         serde_json::json!({ "unit": unit, "key": k })
     });
 
+    // A pin: the note *is* the footnote, so the line it hangs off is part of
+    // what a listing has to show — a pin with no line named is unreadable in a
+    // way an entity note never is.
+    let line = match (note.line_key.as_deref(), note.line_label.as_deref()) {
+        (Some(key), Some(label)) => {
+            let text = match (NoteTarget::line_names(label), NoteTarget::line_number(key)) {
+                (Some((artist, title)), Some(n)) => line_text(lyrics, artist, title, n).await,
+                _ => None,
+            };
+            Some(line_json(key, label, text.as_deref()))
+        }
+        _ => None,
+    };
+
+    // How many lines this note quotes, which is the design's badge on a note in
+    // the list and in the editor. Counted from the *scan*, not from a stored
+    // number, so it cannot drift from the body — and de-duplicated, because
+    // quoting one line twice is one line quoted.
+    let quoted: std::collections::HashSet<String> = notes::scan(&note.body_md)
+        .into_iter()
+        .filter(|c| matches!(c.kind, RefKind::Line | RefKind::LineBlock))
+        .map(|c| c.target.to_lowercase())
+        .collect();
+
+    // The pins that roll up under this note. A record's note gathers the pins on
+    // every track of it that has been played; a track's note gathers its own.
+    // An **artist** note gathers none: every line of every record they made is
+    // not a footnote, it is a different screen.
+    let pins = if with_html {
+        let scope: Vec<(String, String)> = match entity.as_ref() {
+            Some(e) if e.kind == "release" => db
+                .album_track_list(user_id, &e.artist_name, &e.name)
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(title, ..)| (e.artist_name.clone(), title))
+                .collect(),
+            Some(e) if e.kind == "recording" => vec![(e.artist_name.clone(), e.name.clone())],
+            _ => match (&ctx.artist, &ctx.track) {
+                // A listen note is about one playing of one track, so its own
+                // track is the scope.
+                (Some(a), Some(t)) if note.scrobble_id.is_some() => {
+                    vec![(a.clone(), t.clone())]
+                }
+                _ => Vec::new(),
+            },
+        };
+        pin_footnotes(db, lyrics, user_id, &scope).await
+    } else {
+        Vec::new()
+    };
+
     let mut out = serde_json::json!({
         "id": note.id,
         "body_md": note.body_md,
@@ -383,6 +663,9 @@ async fn note_json(
         "entity": entity,
         "listen": listen,
         "period": period,
+        "line": line,
+        "lines_quoted": quoted.len(),
+        "pins": pins,
         "loved": loved,
         "revisions": revisions,
     });
@@ -571,6 +854,8 @@ async fn preview(
                 entity_id: Some(id),
                 scrobble_id: None,
                 period_key: None,
+                line_key: None,
+                line_label: None,
                 body_md: String::new(),
                 visibility: "private".into(),
                 created_at: 0,
@@ -585,6 +870,8 @@ async fn preview(
                 entity_id: None,
                 scrobble_id: Some(id),
                 period_key: None,
+                line_key: None,
+                line_label: None,
                 body_md: String::new(),
                 visibility: "private".into(),
                 created_at: 0,
@@ -596,11 +883,65 @@ async fn preview(
         // nothing to be relative *to* — which is right: a month is not about
         // one record. Named shortcodes still resolve; only the positional
         // `[[track:3]]` loses its meaning, and it renders as plain text.
+        // A pin is previewed against the track it is pinned to, so a
+        // `[[line:12]]` written *inside* a pin still resolves — which is what
+        // makes "see line 11 too" work in a footnote.
+        Ok(NoteTarget::Line { ref label, .. }) => match NoteTarget::line_names(label) {
+            Some((artist, title)) => NoteCtx {
+                artist: Some(artist.to_string()),
+                album: None,
+                track: Some(title.to_string()),
+            },
+            None => NoteCtx::default(),
+        },
         Ok(NoteTarget::Period(_)) | Err(_) => NoteCtx::default(),
     };
 
     let html = render(&state.db, state.lyrics.as_deref(), user.user_id, &body.body_md, &ctx).await;
     (StatusCode::OK, Json(serde_json::json!({ "body_html": html }))).into_response()
+}
+
+/// GET /api/v1/lines — every line this user has pinned, newest edit first.
+///
+/// The design's "Lines you've written about", beside the annotate-lines mode.
+/// **Across everything** rather than per record on purpose: that is what makes
+/// it a way back into writing you had forgotten, rather than a second copy of
+/// the margin you are already looking at.
+///
+/// `line.text` carries the words when this instance still holds them and is
+/// simply absent when it does not — a pin outlives the lyric it points at, the
+/// same way a note outlives the entity that resolved it, and that is not an
+/// error.
+async fn list_lines(
+    State(state): State<Arc<AppState>>,
+    ReadAuth { user }: ReadAuth,
+) -> impl IntoResponse {
+    match state.db.line_notes(user.user_id, 200).await {
+        Ok(rows) => {
+            let mut out = Vec::with_capacity(rows.len());
+            for note in &rows {
+                let (Some(key), Some(label)) =
+                    (note.line_key.as_deref(), note.line_label.as_deref())
+                else {
+                    continue;
+                };
+                let text = match (NoteTarget::line_names(label), NoteTarget::line_number(key)) {
+                    (Some((artist, title)), Some(n)) => {
+                        line_text(state.lyrics.as_deref(), artist, title, n).await
+                    }
+                    _ => None,
+                };
+                out.push(serde_json::json!({
+                    "note_id": note.id,
+                    "line": line_json(key, label, text.as_deref()),
+                    "excerpt": notes::excerpt(&note.body_md, 120),
+                    "updated_at": note.updated_at,
+                }));
+            }
+            (StatusCode::OK, Json(serde_json::json!({ "lines": out }))).into_response()
+        }
+        Err(e) => server_error(e),
+    }
 }
 
 #[derive(Deserialize)]
@@ -609,6 +950,7 @@ struct ForQuery {
     scrobble_id: Option<i64>,
     period_unit: Option<String>,
     period_key: Option<String>,
+    line: Option<usize>,
     from_scrobble: Option<i64>,
     kind: Option<String>,
     name: Option<String>,
@@ -630,6 +972,7 @@ async fn note_for(
         scrobble_id: q.scrobble_id,
         period_unit: q.period_unit,
         period_key: q.period_key,
+        line: q.line,
         from_scrobble: q.from_scrobble,
         kind: q.kind,
         name: q.name,
@@ -670,6 +1013,11 @@ async fn note_for(
                 false,
             )
         }
+        NoteTarget::Line { ref key, ref label } => (
+            state.db.note_for_line_key(user.user_id, key).await,
+            serde_json::json!({ "line": line_json(key, label, None) }),
+            false,
+        ),
     };
 
     match note {
@@ -713,6 +1061,14 @@ pub async fn set_love(
             return err(
                 StatusCode::BAD_REQUEST,
                 "Love a track, album or artist — not a single listen",
+            )
+        }
+        // A line is a position in somebody else's text. There is no entity to
+        // love, which is the same reason it never creates one.
+        Ok(NoteTarget::Line { .. }) => {
+            return err(
+                StatusCode::BAD_REQUEST,
+                "Love a track, album or artist — a lyric line is not something to love",
             )
         }
         // Same category error one step further out: a love points at a thing,
@@ -911,12 +1267,21 @@ async fn export_resolutions(
         if resolved.contains_key(&key) {
             continue;
         }
+        // **A lyric line is never resolved into an export**, and that is the
+        // fourth of the design's rules holding rather than an omission: the
+        // words are the provider's text, and a resolved reference would put
+        // them into a file that leaves this instance. Left exactly as typed,
+        // which is what the renderer does with any reference it cannot resolve
+        // — and what the writer wrote.
+        if code.kind.is_line() {
+            continue;
+        }
         let Some(entity_kind) = code.kind.entity_kind() else {
             // Gear has no note file of its own, so the link is to a page named
             // after the equipment. Dangling until the writer makes one, which is
             // ordinary in a wiki and better than dropping the reference.
             if let Ok(Some((_, label))) = db.find_equipment_by_name(user_id, &code.target).await {
-                resolved.insert(key, Resolved { label, href: String::new() });
+                resolved.insert(key, Resolved::link(label, ""));
             }
             continue;
         };
@@ -935,7 +1300,7 @@ async fn export_resolutions(
                 Ok(Some(e)) => entity_title(&e),
                 _ => label,
             };
-            resolved.insert(key, Resolved { label: title, href: String::new() });
+            resolved.insert(key, Resolved::link(title, ""));
         }
     }
     resolved
@@ -1229,6 +1594,7 @@ pub fn create_notes_router() -> Router<Arc<AppState>> {
         .route("/api/v1/notes", get(list_notes).post(save_note))
         .route("/api/v1/notes/:id", get(get_note).delete(delete_note))
         .route("/api/v1/notes/:id/revisions", get(note_revisions))
+        .route("/api/v1/lines", get(list_lines))
         .route("/api/v1/loves", get(list_loves).post(set_love))
         .route("/api/v1/loves/keys", get(love_keys))
         .route("/api/v1/entities/:id", get(get_entity))

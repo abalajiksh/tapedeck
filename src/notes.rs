@@ -50,8 +50,22 @@ pub enum RefKind {
     ///
     /// Not an entity, and never creates one — the same refusal `Gear` makes.
     /// A line is a position in somebody else's text; there is nothing to
-    /// conjure a row for, and it cannot be a note or a love target.
+    /// conjure a row for, and it cannot be a love target. It *can* be a note
+    /// target — that is a pin — but through `NoteTarget::Line` rather than
+    /// through anything here.
     Line,
+    /// The same coordinate, asked for as a **block** — `[[quote:12]]`.
+    ///
+    /// The design's second rendering, "for when the note is about the line":
+    /// the words set as a pull-quote with their coordinate under them and a way
+    /// into the reader, rather than a phrase inside a sentence.
+    ///
+    /// A separate kind rather than a modifier on `line` because the choice is
+    /// about *how the line sits in the sentence*, which is a thing the writer
+    /// decides per reference — and a distinct word is easier to read back in
+    /// six months than a punctuation flag. The stored coordinate is identical,
+    /// so switching between them is a one-word edit and nothing is re-resolved.
+    LineBlock,
 }
 
 impl RefKind {
@@ -62,6 +76,7 @@ impl RefKind {
             "artist" => Some(Self::Artist),
             "gear" | "equipment" => Some(Self::Gear),
             "line" | "lyric" => Some(Self::Line),
+            "quote" | "blockline" => Some(Self::LineBlock),
             _ => None,
         }
     }
@@ -73,8 +88,13 @@ impl RefKind {
             Self::Album => Some("release"),
             Self::Artist => Some("artist"),
             Self::Gear => None,
-            Self::Line => None,
+            Self::Line | Self::LineBlock => None,
         }
+    }
+
+    /// Whether this kind is a coordinate into a lyric, in either rendering.
+    pub fn is_line(&self) -> bool {
+        matches!(self, Self::Line | Self::LineBlock)
     }
 }
 
@@ -103,6 +123,28 @@ impl Shortcode {
     }
 }
 
+/// How a resolved reference is set into the prose.
+///
+/// The design's three renderings, minus the one that is not a shortcode at all:
+/// a **pin** is a note whose target *is* the line, so it is a `NoteTarget`
+/// rather than something written into a sentence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Render {
+    /// A plain link. Every entity and every piece of gear.
+    Link,
+    /// The default for a line: the words in quotation marks, followed by a
+    /// small chip that opens the reader at that line.
+    LineInline {
+        /// What the chip says — `12`, or `A3·12` for a coordinate on a record.
+        chip: String,
+    },
+    /// The line as a pull-quote, for when the note is *about* it.
+    LineBlock {
+        /// The line under the quote — "line 12 · 1:04".
+        meta: String,
+    },
+}
+
 /// Where a resolved shortcode points, and what to call it.
 #[derive(Debug, Clone)]
 pub struct Resolved {
@@ -113,6 +155,16 @@ pub struct Resolved {
     /// and entities live on different routes, and this module stays free of
     /// any knowledge of how the app is laid out.
     pub href: String,
+    /// Which of the three shapes to draw. Defaulted to [`Render::Link`] by
+    /// [`Resolved::link`], which is what every non-line caller wants.
+    pub render: Render,
+}
+
+impl Resolved {
+    /// A plain link — an entity or a piece of gear.
+    pub fn link(label: impl Into<String>, href: impl Into<String>) -> Self {
+        Self { label: label.into(), href: href.into(), render: Render::Link }
+    }
 }
 
 /// Every shortcode in the text, in order of appearance.
@@ -170,15 +222,43 @@ fn substitute(src: &str, resolved: &HashMap<(RefKind, String), Resolved>) -> Str
     for code in codes {
         out.push_str(&src[cursor..code.span.start]);
         match resolved.get(&code.key()) {
-            Some(r) => {
-                // Markdown link syntax, so the label still gets escaped by the
-                // renderer rather than injected as HTML.
-                out.push('[');
-                out.push_str(&escape_link_text(&r.label));
-                out.push_str("](");
-                out.push_str(&escape_link_dest(&r.href));
-                out.push(')');
-            }
+            Some(r) => match &r.render {
+                Render::Link => {
+                    // Markdown link syntax, so the label still gets escaped by
+                    // the renderer rather than injected as HTML.
+                    out.push('[');
+                    out.push_str(&escape_link_text(&r.label));
+                    out.push_str("](");
+                    out.push_str(&escape_link_dest(&r.href));
+                    out.push(')');
+                }
+                // The two line forms are HTML rather than Markdown, because a
+                // link cannot carry a chip beside it or a caption under it.
+                // Everything interpolated is escaped here, and ammonia then
+                // sanitises the whole document anyway — the classes below are
+                // the ones `render` allow-lists, and a form that emitted any
+                // other would silently lose it.
+                Render::LineInline { chip } => {
+                    out.push_str("<span class=\"td-line\">");
+                    out.push_str("<span class=\"td-line-words\">\u{201c}");
+                    out.push_str(&escape_html(&r.label));
+                    out.push_str("\u{201d}</span>");
+                    out.push_str("<a class=\"td-line-chip\" href=\"");
+                    out.push_str(&escape_attr(&r.href));
+                    out.push_str("\">");
+                    out.push_str(&escape_html(chip));
+                    out.push_str("</a></span>");
+                }
+                Render::LineBlock { meta } => {
+                    out.push_str("<figure class=\"td-line-block\"><blockquote>");
+                    out.push_str(&escape_html(&r.label));
+                    out.push_str("</blockquote><figcaption>");
+                    out.push_str(&escape_html(meta));
+                    out.push_str(" <a class=\"td-line-chip\" href=\"");
+                    out.push_str(&escape_attr(&r.href));
+                    out.push_str("\">Reader</a></figcaption></figure>");
+                }
+            },
             None => {
                 out.push_str("<span class=\"td-unresolved\" title=\"No match yet — write a note or love it and this links up\">");
                 out.push_str(&escape_html(&code.target));
@@ -210,6 +290,16 @@ fn escape_html(s: &str) -> String {
     s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
 }
 
+/// Same, plus the quote that would end an attribute early.
+///
+/// The href is built by the caller from a track name a stranger's tagger wrote,
+/// so it is not trusted here even though ammonia sanitises afterwards — a
+/// double quote in a title would otherwise break out of the attribute and the
+/// only thing standing between that and a live tag would be the sanitiser.
+fn escape_attr(s: &str) -> String {
+    escape_html(s).replace('"', "&quot;")
+}
+
 /// Markdown → sanitised HTML, with shortcodes substituted first.
 ///
 /// The output is safe to drop into the page with `{@html}`: ammonia strips
@@ -230,9 +320,15 @@ pub fn render(src: &str, resolved: &HashMap<(RefKind, String), Resolved>) -> Str
     html::push_html(&mut unsafe_html, Parser::new_ext(&substituted, options));
 
     ammonia::Builder::default()
-        // The dotted-underline marker for an unresolved reference is the one
-        // class the renderer itself emits, so it has to survive sanitising.
-        .add_allowed_classes("span", &["td-unresolved"])
+        // The classes the renderer itself emits, which therefore have to
+        // survive sanitising. Nothing else in a note carries a class: a body is
+        // the user's Markdown, and ammonia strips every attribute it is not
+        // told about — so a rendering that grows a new class has to be added
+        // here or it is *silently* lost, which looks like a styling bug.
+        .add_allowed_classes("span", &["td-unresolved", "td-line", "td-line-words"])
+        .add_allowed_classes("a", &["td-line-chip"])
+        .add_allowed_classes("figure", &["td-line-block"])
+        .add_tags(&["figure", "figcaption"])
         .link_rel(Some("noopener nofollow"))
         .clean(&unsafe_html)
         .to_string()
@@ -267,7 +363,15 @@ pub fn export_markdown(src: &str, resolved: &HashMap<(RefKind, String), Resolved
     let mut cursor = 0;
     for code in codes {
         out.push_str(&src[cursor..code.span.start]);
-        match resolved.get(&code.key()) {
+        // **A lyric line is never written out.** The words are the provider's
+        // text and an export is a folder of files that leaves this instance, so
+        // the reference is left exactly as typed — which is also what the
+        // renderer does with anything it cannot resolve, and what the writer
+        // wrote. Refused *here*, in the function that produces the file, rather
+        // than only in the caller that builds the resolutions: a second caller
+        // would otherwise have to know, and the cost of it not knowing is
+        // somebody else's copyrighted text in a vault.
+        match resolved.get(&code.key()).filter(|_| !code.kind.is_line()) {
             // Through `export_filename`, not the raw label: a wikilink resolves
             // by *filename*, so the two must be produced by the same rule or
             // every link in the export dangles. Deriving both from one function
@@ -354,7 +458,7 @@ mod tests {
                     RefKind::Gear => format!("/chains?gear={id}"),
                     _ => format!("/notes?entity={id}"),
                 };
-                ((*k, t.to_lowercase()), Resolved { label: label.to_string(), href })
+                ((*k, t.to_lowercase()), Resolved::link(*label, href))
             })
             .collect()
     }
@@ -396,6 +500,91 @@ mod tests {
         assert!(html.contains("td-unresolved"), "{html}");
         assert!(html.contains("A:3:12"), "the coordinate is still readable: {html}");
         assert!(!html.contains("<a "), "and it is not a link to nowhere");
+    }
+
+    /// The three renderings, and only two of them are shortcodes.
+    ///
+    /// A **pin** is a note whose target *is* the line, so it is a `NoteTarget`
+    /// rather than something written into a sentence — which is also why it is
+    /// the only form that can federate. What this pins is the other two:
+    /// inline carries the words plus a chip, block sets them as a pull-quote
+    /// with the coordinate under them.
+    #[test]
+    fn a_line_reads_inline_by_default_and_as_a_block_when_asked() {
+        let mut r = HashMap::new();
+        r.insert(
+            (RefKind::Line, "12".to_string()),
+            Resolved {
+                label: "longer than the map lets on".into(),
+                href: "/lyrics?artist=X&title=Y&line=12".into(),
+                render: Render::LineInline { chip: "A3\u{b7}12".into() },
+            },
+        );
+        r.insert(
+            (RefKind::LineBlock, "13".to_string()),
+            Resolved {
+                label: "I keep the sea in a coffee tin".into(),
+                href: "/lyrics?artist=X&title=Y&line=13".into(),
+                render: Render::LineBlock { meta: "line 13 \u{b7} 1:11".into() },
+            },
+        );
+
+        let html = render("the turn is [[line:12]].\n\n[[quote:13]]", &r);
+
+        // Inline: the words in quotation marks, and a chip that opens the
+        // reader — a phrase inside a sentence rather than a bare link.
+        assert!(html.contains("td-line-words"), "{html}");
+        assert!(html.contains("longer than the map lets on"), "{html}");
+        assert!(html.contains("A3\u{b7}12"), "the chip names the coordinate: {html}");
+
+        // Block: a pull-quote with the coordinate under it.
+        assert!(html.contains("td-line-block"), "{html}");
+        assert!(html.contains("<blockquote>"), "{html}");
+        assert!(html.contains("line 13 \u{b7} 1:11"), "{html}");
+
+        // And the classes survived ammonia. This is the half that fails
+        // silently: a rendering that grows a class nobody allow-listed is
+        // stripped, the markup still parses, and it merely looks unstyled.
+        assert!(html.contains("class=\"td-line-chip\""), "{html}");
+    }
+
+    /// `quote` and `line` are the same coordinate asked for differently.
+    ///
+    /// Switching between them has to be a one-word edit that re-resolves
+    /// nothing — which is why the target is untouched and only the kind moves.
+    #[test]
+    fn the_block_form_is_the_same_coordinate_under_another_word() {
+        let codes = scan("[[quote:A:3:12]] and [[blockline:7]]");
+        assert_eq!(codes.len(), 2);
+        assert!(codes.iter().all(|c| c.kind == RefKind::LineBlock));
+        assert_eq!(codes[0].target, "A:3:12", "the stored coordinate is identical");
+        assert!(RefKind::Line.is_line() && RefKind::LineBlock.is_line());
+        assert!(!RefKind::Track.is_line());
+        assert_eq!(RefKind::LineBlock.entity_kind(), None, "still not an entity");
+    }
+
+    /// **A quoted line never leaves this instance in an export.**
+    ///
+    /// The fourth of the design's rules, and it holds here by the reference
+    /// being left exactly as typed: the words are the provider's text, and an
+    /// export is a folder of files that goes into somebody's vault. A dangling
+    /// `[[line:12]]` is honest about what it is; the words would not be.
+    #[test]
+    fn an_export_carries_the_reference_and_never_the_words() {
+        // Even handed a resolution — which is what a caller that forgot the
+        // rule would do — the markdown export must not paste the words in.
+        let mut r = HashMap::new();
+        r.insert(
+            (RefKind::Line, "12".to_string()),
+            Resolved {
+                label: "longer than the map lets on".into(),
+                href: String::new(),
+                render: Render::LineInline { chip: "12".into() },
+            },
+        );
+        let md = export_markdown("the turn is [[line:12]]", &HashMap::new());
+        assert_eq!(md, "the turn is [[line:12]]", "left exactly as typed");
+        assert!(!export_markdown("the turn is [[line:12]]", &r).contains("longer than the map"));
     }
 
     #[test]

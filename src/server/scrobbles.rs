@@ -937,6 +937,14 @@ async fn backfill_languages_now(
 pub struct LyricsQuery {
     pub artist: String,
     pub title: String,
+    /// Which record to draw the tracklist from.
+    ///
+    /// Optional and resolved from the history when it is absent, because the
+    /// caller is usually a note or a history row that knows the track and not
+    /// the record it was filed under. Passed explicitly it wins, since a track
+    /// on three compilations has three honest answers and only the caller knows
+    /// which one is being read.
+    pub album: Option<String>,
 }
 
 /// GET /api/v1/lyrics — the words to one track, as numbered lines.
@@ -953,34 +961,221 @@ pub struct LyricsQuery {
 /// words, which is not a gap), and nothing at all.
 async fn lyrics_for_track(
     State(state): State<Arc<AppState>>,
-    _user: ReadAuth,
+    ReadAuth { user }: ReadAuth,
     Query(q): Query<LyricsQuery>,
 ) -> impl IntoResponse {
     let Some(lyrics) = state.lyrics.clone() else {
         return server_error("This instance has no lyrics cache".to_string());
     };
+    // The furniture round the words: which record this is on, how often it has
+    // been played, and what has been written about it. All of it is about the
+    // *track*, so it is gathered whether or not the lyric turns out to be held
+    // — an instrumental still has a tracklist beside it, and a pin outlives the
+    // words it was pinned to.
+    let album = match q.album.clone().filter(|a| !a.trim().is_empty()) {
+        Some(a) => Some(a),
+        None => state.db.album_for_track(user.user_id, &q.title, &q.artist).await.ok().flatten(),
+    };
+    let plays = state.db.track_play_count(user.user_id, &q.artist, &q.title).await.unwrap_or(0);
+    let rows = match album.as_deref() {
+        Some(a) => state.db.album_track_list(user.user_id, &q.artist, a).await.unwrap_or_default(),
+        None => Vec::new(),
+    };
+    // What each sibling track has, so the sidebar can mark the instrumentals and
+    // dim what there is nothing to open — the design's `· instrumental`. One
+    // query for the whole record rather than a lookup per row.
+    let states = lyrics
+        .states_for(&rows.iter().map(|(t, ..)| (q.artist.clone(), t.clone())).collect::<Vec<_>>())
+        .await;
+    let tracklist = rows
+        .into_iter()
+        .map(|(title, plays, duration, track_number)| {
+            let key = crate::lyrics::LyricsClient::track_key(&q.artist, &title);
+            serde_json::json!({
+                "title": title, "plays": plays,
+                "duration": duration, "track_number": track_number,
+                // Absent for a track nobody has asked about, which is a
+                // different thing from one that has no words.
+                "lyrics": states.get(&key),
+            })
+        })
+        .collect::<Vec<_>>();
+
+    // Pins, keyed by the line they hang off. One query for the whole reader
+    // rather than one per line — a lyric is a couple of hundred lines.
+    let mut pins: std::collections::HashMap<usize, serde_json::Value> =
+        std::collections::HashMap::new();
+    for note in state.db.pins_for_track(user.user_id, &q.artist, &q.title).await.unwrap_or_default()
+    {
+        let Some(n) = note.line_key.as_deref().and_then(crate::db::NoteTarget::line_number) else {
+            continue;
+        };
+        pins.insert(
+            n,
+            serde_json::json!({
+                "note_id": note.id,
+                "body_md": note.body_md,
+                "excerpt": crate::notes::excerpt(&note.body_md, 200),
+                "visibility": note.visibility,
+                "updated_at": note.updated_at,
+            }),
+        );
+    }
+    let quoted =
+        crate::server::notes::quoted_lines(&state.db, user.user_id, &q.artist, &q.title).await;
+
+    let head = serde_json::json!({
+        "artist": q.artist,
+        "title": q.title,
+        "album": album,
+        "plays": plays,
+        "tracklist": tracklist,
+    });
+    let merge = |mut base: serde_json::Value, extra: serde_json::Value| {
+        if let (Some(b), Some(e)) = (base.as_object_mut(), extra.as_object()) {
+            for (k, v) in e {
+                b.insert(k.clone(), v.clone());
+            }
+        }
+        base
+    };
+
     let body = match lyrics.cached(&q.artist, &q.title).await {
         Some(crate::lyrics::Found::Lyrics { plain, synced, language }) => {
             let lines = crate::lyrics::parse_lines(plain.as_deref(), synced.as_deref());
-            serde_json::json!({
-                "artist": q.artist, "title": q.title,
-                "language": language,
-                "timed": lines.iter().any(|l| l.at.is_some()),
-                "lines": lines.iter().map(|l| serde_json::json!({
-                    "n": l.index, "at": l.at, "text": l.text,
-                })).collect::<Vec<_>>(),
-                // Shown wherever the words are, because they are not ours.
-                "source": "LRCLIB",
-            })
+            merge(
+                head,
+                serde_json::json!({
+                    "language": language,
+                    "timed": lines.iter().any(|l| l.at.is_some()),
+                    "lines": lines.iter().map(|l| serde_json::json!({
+                        "n": l.index, "at": l.at, "text": l.text,
+                        "pin": pins.get(&l.index),
+                        // How many notes quote this line. Zero is sent as zero
+                        // rather than omitted: the reader draws nothing for it,
+                        // and a missing key would be indistinguishable from a
+                        // count that failed to be computed.
+                        "quoted": quoted.get(&l.index).copied().unwrap_or(0),
+                    })).collect::<Vec<_>>(),
+                    // The raw text, for correcting it by hand. Sent so "Fix the
+                    // words" opens on what is actually stored rather than on
+                    // the parsed lines put back together, which would quietly
+                    // rewrite a lyric nobody meant to touch.
+                    "plain": plain,
+                    "synced": synced,
+                    "edited": lyrics.is_edited(&q.artist, &q.title).await,
+                    // Shown wherever the words are, because they are not ours.
+                    "source": "LRCLIB",
+                }),
+            )
         }
-        Some(crate::lyrics::Found::Instrumental) => serde_json::json!({
-            "artist": q.artist, "title": q.title, "instrumental": true, "lines": [],
-        }),
-        Some(crate::lyrics::Found::Missing) | None => serde_json::json!({
-            "artist": q.artist, "title": q.title, "lines": [],
-        }),
+        Some(crate::lyrics::Found::Instrumental) => {
+            merge(head, serde_json::json!({ "instrumental": true, "lines": [] }))
+        }
+        Some(crate::lyrics::Found::Missing) | None => {
+            merge(head, serde_json::json!({ "lines": [] }))
+        }
     };
     (StatusCode::OK, Json(body)).into_response()
+}
+
+/// GET /api/v1/lyrics/keys — every track this instance holds words for.
+///
+/// One request for the whole set, exactly the shape `GET /api/v1/loves/keys`
+/// has and for the same reason: a history page wants to know which of fifty
+/// rows has something to read, and fifty questions is not the way to ask. The
+/// browser derives a row's key the same way `LyricsClient::track_key` does —
+/// **and those two must stay in step**, or "Read the words" quietly stops
+/// appearing and nothing errors. Same standing trap as `loveKey`.
+///
+/// Not scoped to the caller, and it cannot be: the cache is one copy of one
+/// track's words for the whole instance, keyed by the track rather than by who
+/// played it. What it discloses is which tracks *anybody here* has had fetched,
+/// which is the same thing the backfill's own progress readout says.
+async fn lyrics_keys(State(state): State<Arc<AppState>>, _user: ReadAuth) -> impl IntoResponse {
+    let keys = match state.lyrics.clone() {
+        Some(l) => l.keys_with_lyrics().await,
+        // No cache is not an error — it is an instance with no lyrics, and the
+        // honest answer is that nothing has words rather than a failed request
+        // that stops a history page rendering.
+        None => Vec::new(),
+    };
+    (StatusCode::OK, Json(serde_json::json!({ "keys": keys }))).into_response()
+}
+
+#[derive(serde::Deserialize)]
+pub struct FixLyricsRequest {
+    pub artist: String,
+    pub title: String,
+    /// The words, plain. Absent clears them.
+    pub plain: Option<String>,
+    /// The timed form, `[mm:ss.xx] words` per line.
+    pub synced: Option<String>,
+}
+
+/// PUT /api/v1/lyrics — correct the words by hand.
+///
+/// **A value you supplied is never overwritten by a lookup**, the rule the
+/// shelf's running times already follow, and it is what settles the collision
+/// between this and the design's *newest fetch wins*: between two fetches the
+/// newer one wins, and between a fetch and something a person typed, the person
+/// does.
+///
+/// The honest warning is about the **line count**. Every reference already
+/// written is an index, so a correction that adds or removes a line moves every
+/// quote after it onto different words — silently, because an index cannot be
+/// wrong, only pointed somewhere else. The response reports the count before
+/// and after so the caller can say so; it is not refused, because the
+/// correction is usually the point and the alternative is a lyric that stays
+/// wrong for ever.
+async fn fix_lyrics(
+    State(state): State<Arc<AppState>>,
+    user: AuthUser,
+    Json(body): Json<FixLyricsRequest>,
+) -> impl IntoResponse {
+    let Some(lyrics) = state.lyrics.clone() else {
+        return server_error("This instance has no lyrics cache".to_string());
+    };
+    if body.artist.trim().is_empty() || body.title.trim().is_empty() {
+        return bad_request("A correction needs an artist and a title");
+    }
+    if body.plain.as_deref().unwrap_or("").trim().is_empty()
+        && body.synced.as_deref().unwrap_or("").trim().is_empty()
+    {
+        return bad_request("There are no words in that");
+    }
+
+    let before = match lyrics.cached(&body.artist, &body.title).await {
+        Some(crate::lyrics::Found::Lyrics { plain, synced, .. }) => {
+            crate::lyrics::parse_lines(plain.as_deref(), synced.as_deref()).len()
+        }
+        _ => 0,
+    };
+    match lyrics
+        .set_words(&body.artist, &body.title, body.plain.as_deref(), body.synced.as_deref())
+        .await
+    {
+        Ok(crate::lyrics::Found::Lyrics { plain, synced, language }) => {
+            let after = crate::lyrics::parse_lines(plain.as_deref(), synced.as_deref()).len();
+            let _ = user;
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "status": "saved",
+                    "language": language,
+                    "lines_before": before,
+                    "lines_after": after,
+                    // The one thing worth saying out loud: a reference is an
+                    // index, so a changed count re-points every quote past the
+                    // change.
+                    "renumbered": before > 0 && before != after,
+                })),
+            )
+                .into_response()
+        }
+        Ok(_) => server_error("The correction did not come back as words".to_string()),
+        Err(e) => server_error(e.to_string()),
+    }
 }
 
 /// GET /api/v1/lyrics/status — how far the lyric language pass has got.
@@ -1162,7 +1357,8 @@ pub fn create_scrobbles_router() -> Router<Arc<AppState>> {
         .route("/api/v1/personality", get(personality))
         .route("/api/v1/languages/status", get(language_status))
         .route("/api/v1/languages/backfill", axum::routing::post(backfill_languages_now))
-        .route("/api/v1/lyrics", get(lyrics_for_track))
+        .route("/api/v1/lyrics", get(lyrics_for_track).put(fix_lyrics))
+        .route("/api/v1/lyrics/keys", get(lyrics_keys))
         .route("/api/v1/lyrics/status", get(lyrics_status))
         .route("/api/v1/mbids/status", get(mbid_status))
         .route("/api/v1/mbids/backfill", axum::routing::post(backfill_mbids_now))

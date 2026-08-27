@@ -324,6 +324,19 @@ pub struct NoteRow {
     /// `<unit>:<key>` — `month:2026-08`, `week:2026-W32`, `year:2026`. See
     /// [`NoteTarget::Period`].
     pub period_key: Option<String>,
+    /// A **pin**: the folded coordinate of one lyric line —
+    /// `<artist_key>\x1f<folded title>\x1f<n>`. See [`NoteTarget::Line`].
+    pub line_key: Option<String>,
+    /// The same line's names as they were written — `<artist>\x1f<title>`.
+    ///
+    /// A display snapshot beside a folded key, which is the pair
+    /// `scrobbles.artist_credit` and a spool's `company` already are. It exists
+    /// because the identity fold has to happen in **Rust**: SQLite's `LOWER()`
+    /// folds ASCII only, so an index built on it would disagree with
+    /// [`Database::artist_key`] for every non-Latin name — and a list of the
+    /// lines you have written about has to be able to say "Cœur de pirate"
+    /// rather than the key it was filed under.
+    pub line_label: Option<String>,
     pub body_md: String,
     pub visibility: String,
     pub created_at: i64,
@@ -351,7 +364,31 @@ pub enum NoteTarget {
     /// there is nothing to point at. Build it with [`Self::period`], which is
     /// what stops an unparseable key reaching the table.
     Period(String),
+    /// One numbered line of a lyric — a **pin**.
+    ///
+    /// The design's footnote form: the pin *is* the note, targeted at the line,
+    /// and it is the one rendering that can ever federate, because nothing of
+    /// the provider's text is quoted into the prose — a patched-in reader sees
+    /// your words and a stub.
+    ///
+    /// Two fields because identity and display are different jobs. `key` is
+    /// folded in Rust and is what the unique index and the CHECK see; `label`
+    /// is the spelling to show. Built only by [`Self::line`], so the two cannot
+    /// be set apart — the same reason this is an enum rather than four
+    /// nullable arguments.
+    ///
+    /// **Absolute, not relative.** `[[line:12]]` in a note's prose is read
+    /// against whatever that note is about, because it sits inside a sentence
+    /// that already has a subject. A pin has no other subject — it *is* the
+    /// target — and it has to be findable from the reader and from a list of
+    /// every line you have written about, neither of which has a note to read
+    /// it against. So the artist and title are named outright.
+    Line { key: String, label: String },
 }
+
+/// See [`NoteTarget::columns`].
+type NoteColumns<'a> =
+    (Option<i64>, Option<i64>, Option<&'a str>, Option<&'a str>, Option<&'a str>);
 
 impl NoteTarget {
     /// The three units a report is bucketed by, matching `reports::Unit`.
@@ -391,11 +428,68 @@ impl NoteTarget {
         shaped.then(|| Self::Period(format!("{unit}:{key}")))
     }
 
-    fn columns(&self) -> (Option<i64>, Option<i64>, Option<&str>) {
+    /// The separator inside a line key.
+    ///
+    /// ASCII 31, the unit separator — the same answer [`COVER_PICK`] gives to
+    /// the same question, and for the same reason: a title may legitimately
+    /// contain a pipe ("Intro | Outro") and a control character may not.
+    pub const SEP: char = '\u{1f}';
+
+    /// A pin on line `n` of a track, validated.
+    ///
+    /// Refuses an empty artist or title and a line number of zero, because the
+    /// key *is* the note's identity: a pin filed under a malformed coordinate
+    /// is one the reader can never find again, which reads to its author as a
+    /// save that silently did nothing. Same rule [`Self::period`] follows.
+    ///
+    /// The fold is [`Database::artist_key`] — trim and lowercase — which is
+    /// what [`crate::lyrics::LyricsClient::track_key`] folds with, so a pin and
+    /// the lyric it points at agree about which track they mean. Deliberately
+    /// *not* `normalise_artist`: that one strips punctuation and accents to
+    /// answer "same performer?", and over-folding here would file one artist's
+    /// lines under another's name.
+    pub fn line(artist: &str, title: &str, n: usize) -> Option<Self> {
+        let (artist, title) = (artist.trim(), title.trim());
+        if artist.is_empty() || title.is_empty() || n == 0 {
+            return None;
+        }
+        Some(Self::Line {
+            key: format!(
+                "{}{}{}{}{}",
+                Database::artist_key(artist),
+                Self::SEP,
+                title.to_lowercase(),
+                Self::SEP,
+                n
+            ),
+            label: format!("{artist}{}{title}", Self::SEP),
+        })
+    }
+
+    /// The line number out of a stored `line_key`.
+    pub fn line_number(key: &str) -> Option<usize> {
+        key.rsplit(Self::SEP).next()?.parse().ok()
+    }
+
+    /// The artist and title out of a stored `line_label`.
+    pub fn line_names(label: &str) -> Option<(&str, &str)> {
+        label.split_once(Self::SEP)
+    }
+
+    /// The five nullable columns a target writes, in the order `upsert_note`
+    /// binds them: entity, listen, period, line key, line label.
+    ///
+    /// A named type because the tuple is now five wide and a caller binding it
+    /// in the wrong order would compile perfectly and file every note against
+    /// the wrong thing.
+    fn columns(&self) -> NoteColumns<'_> {
         match self {
-            Self::Entity(id) => (Some(*id), None, None),
-            Self::Listen(id) => (None, Some(*id), None),
-            Self::Period(key) => (None, None, Some(key.as_str())),
+            Self::Entity(id) => (Some(*id), None, None, None, None),
+            Self::Listen(id) => (None, Some(*id), None, None, None),
+            Self::Period(key) => (None, None, Some(key.as_str()), None, None),
+            Self::Line { key, label } => {
+                (None, None, None, Some(key.as_str()), Some(label.as_str()))
+            }
         }
     }
 }
@@ -1819,6 +1913,14 @@ impl Database {
         // what makes it safe to write down — including for weeks, which
         // deliberately ignore the user's week-start preference so a named
         // period cannot change shape under a note about it.
+        //
+        // `line_key` is the fourth target: a **pin**, one numbered line of a
+        // lyric. Also a text key rather than a foreign key, and for a sharper
+        // version of the same reason — the lyric it points into lives in a
+        // *different database file* (the metadata cache, deliberately outside
+        // `VACUUM INTO`), so there is nothing here to reference even in
+        // principle. `line_label` rides beside it because the fold has to
+        // happen in Rust; see [`NoteRow::line_label`].
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS notes (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1826,12 +1928,15 @@ impl Database {
                 entity_id INTEGER REFERENCES entities(id),
                 scrobble_id INTEGER REFERENCES scrobbles(id),
                 period_key TEXT,
+                line_key TEXT,
+                line_label TEXT,
                 body_md TEXT NOT NULL,
                 visibility TEXT NOT NULL DEFAULT 'private',
                 created_at INTEGER NOT NULL,
                 updated_at INTEGER NOT NULL,
                 CHECK ((entity_id IS NOT NULL) + (scrobble_id IS NOT NULL)
-                       + (period_key IS NOT NULL) = 1)
+                       + (period_key IS NOT NULL) + (line_key IS NOT NULL) = 1),
+                CHECK ((line_key IS NULL) = (line_label IS NULL))
             )",
         )
         .execute(&self.pool)
@@ -3543,6 +3648,80 @@ impl Database {
             let _ = sqlx::query("PRAGMA foreign_keys = ON").execute(&self.pool).await;
         }
 
+        // Migration: a note can hang off one line of a lyric — a **pin**.
+        //
+        // The third CHECK rebuild in this file, and the same shape as the two
+        // above it: SQLite cannot alter a constraint in place, and this one has
+        // to gain a fourth term. Guarded on the **constraint text** rather than
+        // on a column, because a `line_key` added by `ADD COLUMN` would sit
+        // under the old three-term CHECK, which reads `… = 1` over three
+        // targets and would reject every pin as having no target at all.
+        //
+        // `note_revisions.note_id` references this table, so foreign keys come
+        // off for the swap and the whole thing is one transaction. The insert
+        // names its columns on both sides: the new table has two more, and a
+        // bare `INSERT INTO … SELECT *` would shift `body_md` into one of them.
+        let notes_sql: Option<(String,)> =
+            sqlx::query_as("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'notes'")
+                .fetch_optional(&self.pool)
+                .await
+                .ok()
+                .flatten();
+        if notes_sql.is_some_and(|(sql,)| !sql.contains("line_key")) {
+            info!("⚙️ Migrating: letting a liner note be pinned to a lyric line...");
+            let _ = sqlx::query("PRAGMA foreign_keys = OFF").execute(&self.pool).await;
+            let rebuild = async {
+                let mut tx = self.pool.begin().await?;
+                sqlx::query(
+                    "CREATE TABLE notes_new (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        user_id INTEGER NOT NULL REFERENCES users(id),
+                        entity_id INTEGER REFERENCES entities(id),
+                        scrobble_id INTEGER REFERENCES scrobbles(id),
+                        period_key TEXT,
+                        line_key TEXT,
+                        line_label TEXT,
+                        body_md TEXT NOT NULL,
+                        visibility TEXT NOT NULL DEFAULT 'private',
+                        created_at INTEGER NOT NULL,
+                        updated_at INTEGER NOT NULL,
+                        CHECK ((entity_id IS NOT NULL) + (scrobble_id IS NOT NULL)
+                               + (period_key IS NOT NULL) + (line_key IS NOT NULL) = 1),
+                        CHECK ((line_key IS NULL) = (line_label IS NULL))
+                    )",
+                )
+                .execute(&mut *tx)
+                .await?;
+                sqlx::query(
+                    "INSERT INTO notes_new
+                            (id, user_id, entity_id, scrobble_id, period_key, body_md,
+                             visibility, created_at, updated_at)
+                     SELECT  id, user_id, entity_id, scrobble_id, period_key, body_md,
+                             visibility, created_at, updated_at
+                       FROM notes",
+                )
+                .execute(&mut *tx)
+                .await?;
+                sqlx::query("DROP TABLE notes").execute(&mut *tx).await?;
+                sqlx::query("ALTER TABLE notes_new RENAME TO notes").execute(&mut *tx).await?;
+                // Dropped with the old table, so they are rebuilt here rather
+                // than left to `init()`, which has already run by now.
+                for idx in &[
+                    "CREATE UNIQUE INDEX IF NOT EXISTS idx_notes_user_entity ON notes(user_id, entity_id) WHERE entity_id IS NOT NULL",
+                    "CREATE UNIQUE INDEX IF NOT EXISTS idx_notes_user_scrobble ON notes(user_id, scrobble_id) WHERE scrobble_id IS NOT NULL",
+                    "CREATE UNIQUE INDEX IF NOT EXISTS idx_notes_user_period ON notes(user_id, period_key) WHERE period_key IS NOT NULL",
+                ] {
+                    sqlx::query(idx).execute(&mut *tx).await?;
+                }
+                tx.commit().await
+            }
+            .await;
+            if let Err(e) = rebuild {
+                warn!("Could not let a liner note be pinned to a lyric line: {}", e);
+            }
+            let _ = sqlx::query("PRAGMA foreign_keys = ON").execute(&self.pool).await;
+        }
+
         // Deliberately here rather than in `init()` alongside the other two note
         // indexes, and this is the trap: `init()` runs *before* `migrate()`, so
         // on an existing database `period_key` does not exist yet and creating
@@ -3554,6 +3733,15 @@ impl Database {
         // A fresh database gets the column from `init()`, a migrated one from
         // the block above, so by this line it always exists.
         sqlx::query("CREATE UNIQUE INDEX IF NOT EXISTS idx_notes_user_period ON notes(user_id, period_key) WHERE period_key IS NOT NULL")
+            .execute(&self.pool)
+            .await?;
+
+        // One pin per line per user, the rule every other note target follows —
+        // a note is a living document, edited in place. In `migrate()` and not
+        // `init()` for exactly the reason above: on a database that predates
+        // the rebuild `line_key` does not exist when `init()` runs, and `init()`
+        // propagates with `?`.
+        sqlx::query("CREATE UNIQUE INDEX IF NOT EXISTS idx_notes_user_line ON notes(user_id, line_key) WHERE line_key IS NOT NULL")
             .execute(&self.pool)
             .await?;
 
@@ -4764,6 +4952,60 @@ impl Database {
         .fetch_optional(&self.pool)
         .await?;
         Ok(row.filter(|r| r.plays > 0))
+    }
+
+    /// The tracklist beside the reader: every distinct track of one record, in
+    /// the order the record plays.
+    ///
+    /// Deliberately *not* [`Self::album_tracks`], which answers a different
+    /// question and pays for it — that one carries the whole quality record per
+    /// track through a dozen correlated subqueries, and the reader wants a
+    /// title, a running time and how often it has been played. One grouped scan.
+    ///
+    /// Ordered by track number where the tagger supplied one and alphabetically
+    /// where it did not, because a reader's sidebar is a *place in a record*
+    /// rather than a chart — sorting it by plays would move the row under the
+    /// cursor as the listening changes.
+    pub async fn album_track_list(
+        &self,
+        user_id: i64,
+        artist: &str,
+        album: &str,
+    ) -> Result<Vec<(String, i64, Option<i64>, Option<i64>)>, sqlx::Error> {
+        sqlx::query_as(
+            "SELECT title, COUNT(*) AS plays, MAX(duration) AS duration,
+                    MIN(track_number) AS track_number
+               FROM scrobbles
+              WHERE user_id = ? AND skipped = FALSE
+                AND LOWER(TRIM(artist)) = ? AND LOWER(TRIM(COALESCE(album, ''))) = ?
+              GROUP BY LOWER(TRIM(title))
+              ORDER BY track_number IS NULL, track_number ASC, LOWER(TRIM(title)) ASC",
+        )
+        .bind(user_id)
+        .bind(artist.trim().to_lowercase())
+        .bind(album.trim().to_lowercase())
+        .fetch_all(&self.pool)
+        .await
+    }
+
+    /// How many times this user has played one track, skips excluded as ever.
+    pub async fn track_play_count(
+        &self,
+        user_id: i64,
+        artist: &str,
+        title: &str,
+    ) -> Result<i64, sqlx::Error> {
+        let row: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM scrobbles
+              WHERE user_id = ? AND skipped = FALSE
+                AND LOWER(TRIM(artist)) = ? AND LOWER(TRIM(title)) = ?",
+        )
+        .bind(user_id)
+        .bind(artist.trim().to_lowercase())
+        .bind(title.trim().to_lowercase())
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(row.0)
     }
 
     /// One row per distinct track on the album, most played first.
@@ -10550,8 +10792,9 @@ impl Database {
             NoteTarget::Entity(e) => self.note_for_entity(user_id, *e).await?,
             NoteTarget::Listen(s) => self.note_for_scrobble(user_id, *s).await?,
             NoteTarget::Period(k) => self.note_for_period(user_id, k).await?,
+            NoteTarget::Line { key, .. } => self.note_for_line_key(user_id, key).await?,
         };
-        let (entity_id, scrobble_id, period_key) = target.columns();
+        let (entity_id, scrobble_id, period_key, line_key, line_label) = target.columns();
 
         if let Some(note) = existing {
             if note.body_md != body_md {
@@ -10571,14 +10814,112 @@ impl Database {
         }
 
         let result = sqlx::query(
-            "INSERT INTO notes (user_id, entity_id, scrobble_id, period_key, body_md, visibility, created_at, updated_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+            "INSERT INTO notes (user_id, entity_id, scrobble_id, period_key, line_key, line_label, body_md, visibility, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
         )
         .bind(user_id).bind(entity_id).bind(scrobble_id).bind(period_key)
+        .bind(line_key).bind(line_label)
         .bind(body_md).bind(visibility)
         .bind(now).bind(now)
         .execute(&self.pool).await?;
         Ok(result.last_insert_rowid())
+    }
+
+    /// The pin on one lyric line, if there is one.
+    ///
+    /// Takes the folded key rather than the names so there is one place the
+    /// fold happens — [`NoteTarget::line`] — and no caller can look a pin up
+    /// under a spelling it could never have been filed under.
+    pub async fn note_for_line_key(
+        &self,
+        user_id: i64,
+        line_key: &str,
+    ) -> Result<Option<NoteRow>, sqlx::Error> {
+        sqlx::query_as("SELECT * FROM notes WHERE user_id = ? AND line_key = ?")
+            .bind(user_id)
+            .bind(line_key)
+            .fetch_optional(&self.pool)
+            .await
+    }
+
+    /// Every pin on one track, newest edit first.
+    ///
+    /// One query for the whole reader rather than one per line: a lyric is a
+    /// couple of hundred lines and asking per line would be a couple of hundred
+    /// round trips for a page that usually has one or two pins on it. The
+    /// caller matches them to lines by [`NoteTarget::line_number`].
+    ///
+    /// The `LIKE` is anchored on the track's folded key plus the separator, so
+    /// it is a prefix match and cannot spill onto another track whose key
+    /// happens to start the same way.
+    pub async fn pins_for_track(
+        &self,
+        user_id: i64,
+        artist: &str,
+        title: &str,
+    ) -> Result<Vec<NoteRow>, sqlx::Error> {
+        let prefix = format!(
+            "{}{}{}{}",
+            Self::artist_key(artist),
+            NoteTarget::SEP,
+            title.trim().to_lowercase(),
+            NoteTarget::SEP
+        );
+        // `%` and `_` are wildcards to LIKE and a title may hold either, so the
+        // prefix is escaped by hand — the rule `search_notes` already follows.
+        let mut escaped = String::with_capacity(prefix.len());
+        for c in prefix.chars() {
+            if matches!(c, '\\' | '%' | '_') {
+                escaped.push('\\');
+            }
+            escaped.push(c);
+        }
+        sqlx::query_as(
+            "SELECT * FROM notes
+              WHERE user_id = ? AND line_key LIKE ? ESCAPE '\\'
+              ORDER BY updated_at DESC",
+        )
+        .bind(user_id)
+        .bind(format!("{escaped}%"))
+        .fetch_all(&self.pool)
+        .await
+    }
+
+    /// Every line this user has pinned, newest edit first.
+    ///
+    /// Two callers, and they want it for opposite reasons: the design's "Lines
+    /// you've written about" sidebar, which is deliberately **across
+    /// everything** so it is a way back into writing you had forgotten; and the
+    /// footnote roll-up on a record's own note, which filters this down to the
+    /// record in hand. Folding one bounded read in Rust beats a prefix query
+    /// per track — a person has tens of pins, and an album has tens of tracks.
+    pub async fn line_notes(&self, user_id: i64, limit: i64) -> Result<Vec<NoteRow>, sqlx::Error> {
+        sqlx::query_as(
+            "SELECT * FROM notes
+              WHERE user_id = ? AND line_key IS NOT NULL
+              ORDER BY updated_at DESC LIMIT ?",
+        )
+        .bind(user_id)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+    }
+
+    /// Every note whose body quotes a line, for counting what is quoted where.
+    ///
+    /// Narrowed in SQL to bodies that actually contain the shortcode, because
+    /// the caller has to `scan` each one and resolve it against what that note
+    /// is about — which costs a query or two per note. Most notes contain no
+    /// line reference at all, and this is what keeps them out of that loop.
+    pub async fn notes_quoting_lines(&self, user_id: i64) -> Result<Vec<NoteRow>, sqlx::Error> {
+        sqlx::query_as(
+            "SELECT * FROM notes
+              WHERE user_id = ? AND (body_md LIKE '%[[line:%' OR body_md LIKE '%[[quote:%')
+              ORDER BY updated_at DESC",
+        )
+        .bind(user_id)
+        .fetch_all(&self.pool)
+        .await
     }
 
     /// The note about a week, a month or a year, if there is one.
@@ -10664,7 +11005,9 @@ impl Database {
             // entity name, so it sorts last rather than under an empty string
             // at the top; period notes then fall together by their own key,
             // which is chronological because the key was built to sort.
-            "title" => "e.name IS NULL, LOWER(e.name) ASC, n.period_key ASC, n.updated_at DESC",
+            "title" => {
+                "e.name IS NULL, LOWER(e.name) ASC, n.period_key ASC, LOWER(n.line_label) ASC, n.updated_at DESC"
+            }
             _ => "n.updated_at DESC",
         };
         // `kind` is one of the stored entity kinds, or `listen` for a note about
@@ -10674,6 +11017,7 @@ impl Database {
             "recording" | "release" | "artist" => "e.kind = ?",
             "listen" => "n.scrobble_id IS NOT NULL AND ? IS NOT NULL",
             "period" => "n.period_key IS NOT NULL AND ? IS NOT NULL",
+            "line" => "n.line_key IS NOT NULL AND ? IS NOT NULL",
             _ => "? IS NOT NULL",
         };
         let kind_bind = match kind {
@@ -10705,12 +11049,13 @@ impl Database {
                     OR e.artist_name LIKE ? ESCAPE '\\'
                     OR s.title LIKE ? ESCAPE '\\'
                     OR s.artist LIKE ? ESCAPE '\\'
-                    OR n.period_key LIKE ? ESCAPE '\\')
+                    OR n.period_key LIKE ? ESCAPE '\\'
+                    OR n.line_label LIKE ? ESCAPE '\\')
              ORDER BY {order}"
         );
 
         let mut query = sqlx::query_as(&sql).bind(user_id).bind(kind_bind).bind(q.trim());
-        for _ in 0..6 {
+        for _ in 0..7 {
             query = query.bind(like.clone());
         }
         query.fetch_all(&self.pool).await
@@ -24145,6 +24490,222 @@ mod tests {
         db.upsert_note(1, &target, "the month Bach took over", "private").await.unwrap();
         let found = db.note_for_period(1, "month:2026-08").await.unwrap().expect("period note");
         assert_eq!(found.body_md, "the month Bach took over");
+    }
+
+    /// A database on the previous release opens and gains pins.
+    ///
+    /// The third CHECK rebuild, and the same check
+    /// `an_existing_database_opens_and_gains_period_notes` exists for — every
+    /// other test in this file starts from an empty file, takes the `init()`
+    /// path, and therefore never runs `migrate()` against a real prior schema.
+    /// That is exactly how a migration that cannot run on an existing database
+    /// passes the whole suite, which is what v0.61.1 was.
+    ///
+    /// The prior schema here is the **three-target** one, CHECK and all: a
+    /// `line_key` added by `ALTER TABLE` would sit under a constraint that
+    /// counts three targets and would reject every pin as having none.
+    #[tokio::test]
+    async fn an_existing_database_opens_and_gains_pinned_lines() {
+        let n = N.fetch_add(1, Ordering::SeqCst);
+        let path = std::env::temp_dir().join(format!("td-oldpin-{}-{}.db", std::process::id(), n));
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{}", path.display(), suffix));
+        }
+
+        {
+            let pool = sqlx::SqlitePool::connect(&format!("sqlite:{}?mode=rwc", path.display()))
+                .await
+                .unwrap();
+            for ddl in [
+                "CREATE TABLE users (id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT NOT NULL,
+                     email TEXT, password_hash TEXT NOT NULL, role TEXT NOT NULL DEFAULT 'user',
+                     created_at INTEGER NOT NULL DEFAULT 0, settings TEXT)",
+                "CREATE TABLE entities (id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT NOT NULL,
+                     name TEXT NOT NULL, artist_name TEXT NOT NULL DEFAULT '', mbid TEXT)",
+                "CREATE TABLE scrobbles (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER,
+                     title TEXT NOT NULL, artist TEXT NOT NULL, timestamp INTEGER NOT NULL,
+                     source_id TEXT NOT NULL, source_name TEXT NOT NULL)",
+                "CREATE TABLE notes (
+                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                     user_id INTEGER NOT NULL REFERENCES users(id),
+                     entity_id INTEGER REFERENCES entities(id),
+                     scrobble_id INTEGER REFERENCES scrobbles(id),
+                     period_key TEXT,
+                     body_md TEXT NOT NULL,
+                     visibility TEXT NOT NULL DEFAULT 'private',
+                     created_at INTEGER NOT NULL,
+                     updated_at INTEGER NOT NULL,
+                     CHECK ((entity_id IS NOT NULL) + (scrobble_id IS NOT NULL)
+                            + (period_key IS NOT NULL) = 1))",
+                "CREATE TABLE note_revisions (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                     note_id INTEGER NOT NULL REFERENCES notes(id), body_md TEXT NOT NULL,
+                     created_at INTEGER NOT NULL)",
+                "INSERT INTO users (id, username, password_hash) VALUES (1, 'ashwin', 'x')",
+                "INSERT INTO entities (id, kind, name) VALUES (1, 'release', 'Untrue')",
+                "INSERT INTO notes (user_id, entity_id, body_md, visibility, created_at, updated_at)
+                     VALUES (1, 1, 'what I thought in 2026', 'private', 100, 100)",
+                "INSERT INTO notes (user_id, period_key, body_md, visibility, created_at, updated_at)
+                     VALUES (1, 'month:2026-08', 'the month Bach took over', 'private', 100, 100)",
+            ] {
+                sqlx::query(ddl).execute(&pool).await.unwrap();
+            }
+            pool.close().await;
+        }
+
+        let db =
+            Database::new(&format!("sqlite:{}", path.display()), Arc::new(SecretBox::test_key()))
+                .await
+                .expect("an existing database must open");
+
+        // Both older targets survived the rebuild, with their own targets
+        // intact — the insert names its columns on both sides precisely so a
+        // period note does not come back as an entity one.
+        let kept = db.note_for_entity(1, 1).await.unwrap().expect("the old note is still there");
+        assert_eq!(kept.body_md, "what I thought in 2026");
+        assert!(kept.line_key.is_none());
+        let month = db.note_for_period(1, "month:2026-08").await.unwrap().expect("period note");
+        assert_eq!(month.body_md, "the month Bach took over");
+
+        // And the thing the migration was for actually works afterwards.
+        let target = NoteTarget::line("Burial", "Archangel", 12).unwrap();
+        db.upsert_note(1, &target, "the whole record turns here", "private").await.unwrap();
+        let pins = db.pins_for_track(1, "burial", "  ARCHANGEL ").await.unwrap();
+        assert_eq!(pins.len(), 1, "a pin is found under any spelling of the fold");
+        assert_eq!(pins[0].body_md, "the whole record turns here");
+        assert_eq!(
+            NoteTarget::line_number(pins[0].line_key.as_deref().unwrap()),
+            Some(12),
+            "the line number survives the round trip"
+        );
+        assert_eq!(
+            NoteTarget::line_names(pins[0].line_label.as_deref().unwrap()),
+            Some(("Burial", "Archangel")),
+            "and so does the spelling, which the folded key cannot carry"
+        );
+    }
+
+    /// A pin is one note per line, edited in place — and it does not collide
+    /// with a pin on a *different* line of the same track, or with the same
+    /// line of a different track.
+    ///
+    /// The prefix match in `pins_for_track` is the part worth pinning: keying
+    /// on the track without the trailing separator would let "Archangel" match
+    /// "Archangel (Live)", which is a different recording with different words.
+    #[tokio::test]
+    async fn a_pin_is_one_note_per_line_and_does_not_bleed_between_tracks() {
+        let db = testdb().await;
+        let uid = db.create_user("ash", None, "pw", "user").await.unwrap();
+
+        let twelve = NoteTarget::line("Burial", "Archangel", 12).unwrap();
+        db.upsert_note(uid, &twelve, "first thought", "private").await.unwrap();
+        db.upsert_note(uid, &twelve, "second thought", "private").await.unwrap();
+
+        let pins = db.pins_for_track(uid, "Burial", "Archangel").await.unwrap();
+        assert_eq!(pins.len(), 1, "the second write edits the first, as every other target does");
+        assert_eq!(pins[0].body_md, "second thought");
+        assert_eq!(
+            db.note_revisions(uid, pins[0].id).await.unwrap().len(),
+            1,
+            "and what it said before is kept"
+        );
+
+        // A second line of the same track is a second pin.
+        db.upsert_note(
+            uid,
+            &NoteTarget::line("Burial", "Archangel", 24).unwrap(),
+            "later",
+            "private",
+        )
+        .await
+        .unwrap();
+        assert_eq!(db.pins_for_track(uid, "Burial", "Archangel").await.unwrap().len(), 2);
+
+        // The same line number on a track whose title merely *starts* the same
+        // is not this track's pin.
+        db.upsert_note(
+            uid,
+            &NoteTarget::line("Burial", "Archangel (Live)", 12).unwrap(),
+            "the live one",
+            "private",
+        )
+        .await
+        .unwrap();
+        let pins = db.pins_for_track(uid, "Burial", "Archangel").await.unwrap();
+        assert_eq!(pins.len(), 2, "a prefix of a title is a different track");
+
+        // And nothing malformed reaches the table at all.
+        assert!(NoteTarget::line("Burial", "Archangel", 0).is_none(), "line zero is not a line");
+        assert!(NoteTarget::line("", "Archangel", 3).is_none());
+        assert!(NoteTarget::line("Burial", "   ", 3).is_none());
+    }
+
+    /// A pin rolls up under the record it is on, and under nothing else.
+    ///
+    /// The footnote form is the design's third rendering, and the thing worth
+    /// pinning is its **scope**: a record's note gathers the pins on tracks of
+    /// that record, and a pin on some other record must not appear under it.
+    /// Getting that wrong is not a visual bug — it puts a footnote about one
+    /// evening's listening under an unrelated piece of writing.
+    #[tokio::test]
+    async fn a_pin_rolls_up_under_its_own_record_and_no_other() {
+        let db = testdb().await;
+        let uid = db.create_user("ash", None, "pw", "user").await.unwrap();
+
+        // Two records, each with a track that has been played — the tracklist a
+        // note's footnotes are gathered from is the *listening*, not a provider.
+        for (title, album, ts) in [
+            ("Archangel", "Untrue", 1_700_000_100),
+            ("Shell of Light", "Untrue", 1_700_000_200),
+            ("Ghost Hardware", "Burial", 1_700_000_300),
+        ] {
+            let mut p = play(title, "Burial", ts);
+            p.album = Some(album.into());
+            db.save_scrobble(
+                uid,
+                &p,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                ListenDisposition::LIVE,
+            )
+            .await
+            .unwrap();
+        }
+
+        for (title, n) in [("Archangel", 12), ("Shell of Light", 4), ("Ghost Hardware", 7)] {
+            let t = NoteTarget::line("Burial", title, n).unwrap();
+            db.upsert_note(uid, &t, &format!("about {title} line {n}"), "private").await.unwrap();
+        }
+
+        // Everything is in the one place the roll-up reads from...
+        let all = db.line_notes(uid, 500).await.unwrap();
+        assert_eq!(all.len(), 3);
+
+        // ...and the scope is what narrows it. Folded here the way the handler
+        // folds it, which is the half that decides where a footnote lands.
+        let untrue: Vec<String> = db
+            .album_track_list(uid, "Burial", "Untrue")
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|(t, ..)| t.trim().to_lowercase())
+            .collect();
+        let under_untrue: Vec<&str> = all
+            .iter()
+            .filter(|n| {
+                let label = n.line_label.as_deref().unwrap();
+                let (_, title) = NoteTarget::line_names(label).unwrap();
+                untrue.contains(&title.trim().to_lowercase())
+            })
+            .map(|n| n.body_md.as_str())
+            .collect();
+
+        assert_eq!(under_untrue.len(), 2, "both Untrue pins, and only those");
+        assert!(under_untrue.iter().all(|b| !b.contains("Ghost Hardware")));
     }
 
     /// The same check for `equipment.status`, and for the same reason: every

@@ -1072,6 +1072,20 @@ export interface NoteTarget {
 	period_unit?: 'week' | 'month' | 'year';
 	/** Exactly as Reports names it: `2026`, `2026-08`, `2026-W32`. */
 	period_key?: string;
+	/** A **pin**: one numbered line of a lyric, alongside `artist` and `name`
+	 *  (the track's title). Named outright rather than read against anything,
+	 *  because a pin has no other subject — it *is* the target. */
+	line?: number;
+}
+
+/** The line a pin hangs off. `text` is the words when this instance still
+ *  holds them and absent when it does not — a pin outlives the lyric it points
+ *  at, which is not an error. */
+export interface NoteLine {
+	artist: string;
+	title: string;
+	line: number;
+	text: string | null;
 }
 
 /** The period a note is about, echoed back split rather than as the stored
@@ -1095,8 +1109,102 @@ export interface Note {
 	/** Set when the note is about a report period rather than a record or a
 	 *  listen. Exactly one of `entity` / `listen` / `period` is ever present. */
 	period: NotePeriod | null;
+	/** Set when the note is a **pin** — one whose target *is* a lyric line. */
+	line: NoteLine | null;
+	/** How many distinct lines this note's prose quotes. Counted from the body
+	 *  on read, so it cannot drift from what is actually written. */
+	lines_quoted: number;
+	/** The pins that roll up under this note as footnotes — the design's third
+	 *  rendering. A record's note gathers the pins on every track of it that has
+	 *  been played; a track's note gathers its own. Present only on a single
+	 *  note, not in a listing. */
+	pins?: PinFootnote[];
 	loved: boolean;
 	revisions: number;
+}
+
+/** One line of a lyric as the reader draws it.
+ *
+ *  `n` is 1-based **and blank lines are numbered**: a stanza break is a line,
+ *  because a reference is an index and skipping empties would renumber every
+ *  line after one — silently re-pointing every quote already written. */
+export interface LyricLine {
+	n: number;
+	at: number | null;
+	text: string;
+	/** How many of this user's notes quote this line. */
+	quoted?: number;
+	/** The note pinned to this line, if there is one. */
+	pin?: LinePin | null;
+}
+
+export interface LinePin {
+	note_id: number;
+	body_md: string;
+	excerpt: string;
+	visibility: Visibility;
+	updated_at: number;
+}
+
+/** What the reader is given for one track: the words, and the furniture round
+ *  them. Everything but `lines` is about the *track*, so it is there whether or
+ *  not the lyric turns out to be held. */
+export interface LyricDoc {
+	artist: string;
+	title: string;
+	album?: string | null;
+	plays?: number;
+	language?: string | null;
+	timed?: boolean;
+	instrumental?: boolean;
+	/** These words were corrected here and a later fetch will not overwrite. */
+	edited?: boolean;
+	/** The stored text, for correcting it by hand. */
+	plain?: string | null;
+	synced?: string | null;
+	lines: LyricLine[];
+	tracklist?: LyricSibling[];
+	source?: string;
+}
+
+/** One other track of the same record, for the reader's sidebar. */
+export interface LyricSibling {
+	title: string;
+	plays: number;
+	duration: number | null;
+	track_number: number | null;
+	/** What is held for it. Absent for a track nobody has asked about, which is
+	 *  a different thing from one that has no words — the sidebar dims the
+	 *  first and marks the second. */
+	lyrics?: 'words' | 'instrumental';
+}
+
+/** A pin as it reads under the note it belongs to. */
+export interface PinFootnote {
+	note_id: number;
+	line: NoteLine;
+	body_md: string;
+	excerpt: string;
+	updated_at: number;
+}
+
+/** A pinned line in "Lines you've written about". */
+export interface PinnedLine {
+	note_id: number;
+	line: NoteLine;
+	excerpt: string;
+	updated_at: number;
+}
+
+/** The key `/api/v1/lyrics/keys` returns, derived for a row in hand.
+ *
+ *  **Must stay in step with `LyricsClient::track_key`** — artist and title,
+ *  each trimmed and lowercased, joined by a pipe. If the two drift, "Read the
+ *  words" silently stops appearing on rows that have lyrics and nothing errors.
+ *  The same standing trap as `loveKey`, which folds the artist half the same
+ *  way. */
+export function lyricKey(artist: string, title: string): string {
+	return `${artist.trim().toLowerCase()}|${title.trim().toLowerCase()}`;
 }
 
 /** Per-target state around one listen. `entity_id` is null until something has
@@ -1119,7 +1227,7 @@ export interface ListenAnnotations {
  *  shortcode one, because that is what the server filters on. */
 export interface NoteQuery {
 	q?: string;
-	kind?: '' | 'recording' | 'release' | 'artist' | 'listen' | 'period';
+	kind?: '' | 'recording' | 'release' | 'artist' | 'listen' | 'period' | 'line';
 	sort?: 'updated' | 'created' | 'title';
 }
 
@@ -2389,18 +2497,42 @@ class TapedeckAPI {
 	/** The words to one track, as numbered lines — blanks included, because a
 	 *  note points at a line by its index. Reads only what is stored; the
 	 *  backfill is what talks to LRCLIB. */
-	async lyrics(artist: string, title: string) {
+	async lyrics(artist: string, title: string, album?: string) {
 		const q = new URLSearchParams({ artist, title });
-		return this.get<{
-			artist: string;
-			title: string;
-			language?: string | null;
-			timed?: boolean;
-			instrumental?: boolean;
-			lines: { n: number; at: number | null; text: string }[];
-			source?: string;
-		}>(`/api/v1/lyrics?${q}`);
+		if (album) q.set('album', album);
+		return this.get<LyricDoc>(`/api/v1/lyrics?${q}`);
 	}
+
+	/** Every track this instance holds words for, as `artist|title` keys.
+	 *
+	 *  One request for the whole set rather than a lookup per row — the shape
+	 *  `/loves/keys` already has. Derive a row's key with `lyricKey`, and keep
+	 *  that in step with the server's fold or "Read the words" quietly stops
+	 *  appearing and nothing errors. */
+	async lyricKeys() {
+		return this.get<{ keys: string[] }>('/api/v1/lyrics/keys');
+	}
+
+	/** Every lyric line this user has pinned, newest edit first — across
+	 *  everything, which is what makes it a way back into writing you had
+	 *  forgotten rather than a second copy of the margin in front of you. */
+	async pinnedLines() {
+		return this.get<{ lines: PinnedLine[] }>('/api/v1/lines');
+	}
+
+	/** Correct the words by hand. A value you supplied is never overwritten by
+	 *  a later lookup — and `renumbered` says when the line count changed,
+	 *  which re-points every quote past the change. */
+	async fixLyrics(body: { artist: string; title: string; plain?: string; synced?: string }) {
+		return this.put<{
+			status: string;
+			language: string | null;
+			lines_before: number;
+			lines_after: number;
+			renumbered: boolean;
+		}>('/api/v1/lyrics', body);
+	}
+
 	async updatePressing(
 		id: number,
 		body: {

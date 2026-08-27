@@ -217,3 +217,53 @@
   color: var(--td-muted-2);
   cursor: help;
 }
+/* A quoted lyric line, in the two shapes the renderer emits.
+   Here rather than in a component for the reason `.td-unresolved` is: a note's
+   HTML is produced by the server and dropped in with `{@html}`, which Svelte's
+   scoped styles never reach — so a class defined in the page it appears on
+   renders as nothing at all, and the markup still reads correctly. */
+.note-body .td-line-words {
+  color: var(--td-text);
+}
+.note-body .td-line-chip {
+  display: inline-block;
+  margin-left: 5px;
+  padding: 1px 7px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--td-accent) 18%, transparent);
+  color: var(--td-accent);
+  font: 500 11px ui-monospace, Menlo, monospace;
+  text-decoration: none;
+  vertical-align: 1px;
+}
+.note-body .td-line-chip:hover {
+  background: var(--td-accent);
+  color: #fbf5ea;
+}
+/* The block form — for when the note is *about* the line rather than
+   mentioning it. A rule down the side rather than a filled card: the words are
+   somebody else's and should read as quoted, not as a panel of their own. */
+.note-body .td-line-block {
+  margin: 14px 0;
+  padding: 2px 0 2px 16px;
+  border-left: 3px solid var(--td-accent);
+}
+.note-body .td-line-block blockquote {
+  margin: 0;
+  padding: 0;
+  border: none;
+  /* The base note blockquote is muted and italic. A quoted lyric is the thing
+     being read rather than an aside, and Caprasimo has no italic — leaving it
+     would have the browser synthesise a slant. */
+  font-style: normal;
+  font-family: 'Caprasimo', serif;
+  font-size: 19px;
+  line-height: 1.35;
+  letter-spacing: -0.02em;
+  color: var(--td-text);
+}
+.note-body .td-line-block figcaption {
+  margin-top: 5px;
+  font-size: 11.5px;
+  color: var(--td-muted-3);
+}
