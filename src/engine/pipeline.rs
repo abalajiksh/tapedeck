@@ -242,6 +242,17 @@ const BACKFILL_INTERVAL_SECS: i64 = 60;
 /// it decides whether a pass ever runs at all, and a rule like that must be
 /// testable without an engine. A wrong modulo here does not fail — it starves
 /// one pass forever, silently, and the symptom is artwork that never resolves.
+/// Whether the operator has switched the lyrics backfill off.
+///
+/// Anything other than `0`, `false` or empty counts as on, because a flag set
+/// to stop an outage should not need its spelling checked.
+fn lyrics_backfill_disabled() -> bool {
+    match std::env::var("TAPEDECK_DISABLE_LYRICS_BACKFILL") {
+        Ok(v) => !matches!(v.trim().to_ascii_lowercase().as_str(), "" | "0" | "false" | "no"),
+        Err(_) => false,
+    }
+}
+
 fn advance_backfill_cursor(cursor: usize, ran: usize, passes: usize) -> usize {
     if passes == 0 {
         return 0;
@@ -1550,7 +1561,22 @@ impl ScrobbleEngine {
                     // be considerate — the docs' words, and it has no API key to
                     // ration with, so the rationing is ours to do.
                     5 => {
-                        if let Some(lyrics) = self.lyrics.clone() {
+                        // `TAPEDECK_DISABLE_LYRICS_BACKFILL=1` stops this pass
+                        // without stopping the reader, the cache or the
+                        // shortcodes — lyrics already held stay readable and
+                        // only the fetching goes quiet. It exists because this
+                        // is the pass that took an instance down, and an
+                        // operator meeting that again should not have to
+                        // choose between a wedged deck and a downgrade.
+                        //
+                        // Read per pass rather than cached at construction, so
+                        // it takes effect on the next tick rather than at the
+                        // next restart — the point is to stop a live incident.
+                        if lyrics_backfill_disabled() {
+                            debug!(
+                                "🎤 lyrics backfill disabled by TAPEDECK_DISABLE_LYRICS_BACKFILL"
+                            );
+                        } else if let Some(lyrics) = self.lyrics.clone() {
                             crate::enrich::backfill_lyrics(&self.db, &lyrics, 8).await;
                         }
                     }
@@ -1569,6 +1595,22 @@ impl ScrobbleEngine {
                     _ => self.backfill_artist_images().await,
                 }
             };
+            // **This bounds the tick, not the database.** Dropping the future
+            // cancels the await; it does not cancel a statement SQLite has
+            // already started, and the connection stays checked out until that
+            // finishes. So a pass blocked on a genuinely slow query is not
+            // stopped here — it is *abandoned*, and the next tick starts
+            // another one beside it. Five of those and the pool is gone.
+            //
+            // That is not theoretical: v0.102.0 added this guard, and a
+            // quadratic query in the lyrics pass turned it into a two-day
+            // outage — one instance every 76 seconds, each holding a
+            // connection for six minutes, five concurrent against a pool of
+            // five. The timeout was right and the query was not.
+            //
+            // The rule: this is a backstop for a pass that is slow *between*
+            // awaits, never a licence to leave a slow query in one. If a pass
+            // is timing out here, fix the pass.
             if tokio::time::timeout(left, pass).await.is_err() {
                 break;
             }

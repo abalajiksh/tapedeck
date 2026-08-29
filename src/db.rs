@@ -856,6 +856,13 @@ pub struct SkipRow {
 /// 49k-listen history is about a hundred statements rather than 49,000.
 const SESSION_LINK_CHUNK: usize = 500;
 
+/// How many track keys one duration lookup may bind at a time.
+///
+/// Comfortably under SQLite's bound-parameter ceiling, which the language
+/// queue could otherwise walk into: the status endpoint used to ask this for
+/// a hundred thousand tracks at once.
+const DURATION_KEY_CHUNK: usize = 400;
+
 /// How long `musicbrainz_cache`'s "asked, nothing there" answer is trusted.
 ///
 /// Mirrors `NEGATIVE_CACHE_TTL_SECS` in `musicbrainz.rs`, which is the client's
@@ -6760,30 +6767,120 @@ impl Database {
     /// ±2s, so the length most of the plays agree on is the one most likely to
     /// find the record, where a single mis-tagged listen could push a max out
     /// of range.
+    /// The `WHERE` the language queue is made of. One place, because the count
+    /// and the listing must describe the same population — a progress readout
+    /// that cannot reach the end of its own queue is the paired-counts trap.
+    fn language_queue_predicate() -> String {
+        format!(
+            "skipped = FALSE
+               AND (language IS NULL OR language = '{}')
+               AND TRIM(title) != '' AND TRIM(artist) != ''
+               AND LOWER(TRIM(artist)) {NOT_VARIOUS}",
+            crate::language::DEFAULT_LANGUAGE
+        )
+    }
+
+    /// How many distinct tracks are still waiting on a language.
+    ///
+    /// A `COUNT` rather than `tracks_wanting_language(…).len()`, which is what
+    /// the status endpoint used to do — it fetched a hundred thousand rows,
+    /// with their albums and durations, to look at the length of the vector.
+    pub async fn count_tracks_wanting_language(&self) -> Result<i64, sqlx::Error> {
+        let (n,): (i64,) = sqlx::query_as(&format!(
+            "SELECT COUNT(*) FROM (
+               SELECT 1 FROM scrobbles WHERE {}
+                GROUP BY LOWER(TRIM(title)), LOWER(TRIM(artist)))",
+            Self::language_queue_predicate()
+        ))
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(n)
+    }
+
+    /// Tracks still wanting a language, most-played first, with the running
+    /// time LRCLIB should be asked to match on.
+    ///
+    /// **Two bounded scans folded in Rust, never a lookup per row.** This was
+    /// one statement whose duration came from a correlated subquery joined on
+    /// `LOWER(TRIM(d.title)) = LOWER(TRIM(s.title))` — a join key that is a
+    /// *function* of a column, so no index can serve it and SQLite scans the
+    /// whole history once per candidate track. `ORDER BY plays DESC` then means
+    /// every group is computed before the `LIMIT` applies, so there is no early
+    /// exit either. Measured on the real instance: **357s average, 753s worst**,
+    /// with five running at once against a pool of five — the dashboard, session
+    /// validation and the engine all queued behind it for two days.
+    ///
+    /// Same shape as `loved_but_unplayed` (v0.56.0) and the same fix as
+    /// `list_crate` and `playlist_tracks_detailed`: ask for the candidates,
+    /// then ask one bounded question about them.
+    ///
+    /// **The grouping key is computed by SQLite in both passes and never
+    /// reproduced here.** SQLite's `LOWER` folds ASCII only, so a Rust
+    /// `to_lowercase` would disagree with it on every accented title — two
+    /// normalisers, silently losing the duration for exactly the non-Latin
+    /// catalogue this queue exists to serve. The key is an opaque string that
+    /// came from the database, matched against itself.
     pub async fn tracks_wanting_language(
         &self,
         limit: i64,
     ) -> Result<Vec<(String, String, Option<String>, Option<i64>, i64)>, sqlx::Error> {
-        sqlx::query_as(&format!(
-            "SELECT title, artist, MAX(album) AS album,
-                    (SELECT duration FROM scrobbles d
-                      WHERE LOWER(TRIM(d.title)) = LOWER(TRIM(s.title))
-                        AND LOWER(TRIM(d.artist)) = LOWER(TRIM(s.artist))
-                        AND d.duration IS NOT NULL
-                      GROUP BY d.duration ORDER BY COUNT(*) DESC LIMIT 1) AS duration,
-                    COUNT(*) AS plays
-               FROM scrobbles s
-              WHERE skipped = FALSE
-                AND (language IS NULL OR language = '{}')
-                AND TRIM(title) != '' AND TRIM(artist) != ''
-                AND LOWER(TRIM(artist)) {NOT_VARIOUS}
+        // Pass one: the candidates. One scan, no subquery.
+        let rows: Vec<(String, String, String, Option<String>, i64)> = sqlx::query_as(&format!(
+            "SELECT LOWER(TRIM(title)) || CHAR(31) || LOWER(TRIM(artist)) AS k,
+                    title, artist, MAX(album) AS album, COUNT(*) AS plays
+               FROM scrobbles
+              WHERE {}
               GROUP BY LOWER(TRIM(title)), LOWER(TRIM(artist))
               ORDER BY plays DESC LIMIT ?",
-            crate::language::DEFAULT_LANGUAGE
+            Self::language_queue_predicate()
         ))
         .bind(limit)
         .fetch_all(&self.pool)
-        .await
+        .await?;
+        if rows.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Pass two: the modal running time of just those tracks. Chunked so a
+        // large limit cannot walk into SQLite's bound-parameter ceiling.
+        let mut best: HashMap<String, (i64, i64)> = HashMap::new();
+        for chunk in rows.chunks(DURATION_KEY_CHUNK) {
+            let keys: Vec<&str> = chunk.iter().map(|r| r.0.as_str()).collect();
+            let placeholders = vec!["?"; keys.len()].join(",");
+            let sql = format!(
+                "SELECT LOWER(TRIM(title)) || CHAR(31) || LOWER(TRIM(artist)) AS k,
+                        duration, COUNT(*) AS n
+                   FROM scrobbles
+                  WHERE duration IS NOT NULL AND skipped = FALSE
+                    AND LOWER(TRIM(title)) || CHAR(31) || LOWER(TRIM(artist))
+                        IN ({placeholders})
+                  GROUP BY k, duration"
+            );
+            let mut q = sqlx::query_as::<_, (String, i64, i64)>(&sql);
+            for k in keys {
+                q = q.bind(k);
+            }
+            for (k, duration, n) in q.fetch_all(&self.pool).await? {
+                // The mode, which is the statistic the Spotify import already
+                // argues for: seeking forward shortens a play and seeking back
+                // lengthens it, so the distribution is a spike with thin tails
+                // and the median or the max would both sit off it. Ties break
+                // on the shorter time rather than arbitrarily — the old
+                // subquery left that to SQLite, so the same history could
+                // answer differently between two runs.
+                let e = best.entry(k).or_insert((n, duration));
+                if n > e.0 || (n == e.0 && duration < e.1) {
+                    *e = (n, duration);
+                }
+            }
+        }
+
+        Ok(rows
+            .into_iter()
+            .map(|(k, title, artist, album, plays)| {
+                (title, artist, album, best.get(&k).map(|(_, d)| *d), plays)
+            })
+            .collect())
     }
 
     /// Write a language onto every listen of one track, saying where it came
@@ -24335,6 +24432,141 @@ mod tests {
     /// a timing is not — the rule v0.58.0 arrived at. One `SCAN scrobbles` is
     /// the honest cost of a grouped aggregation; two or more means something is
     /// being re-scanned per row.
+    /// The language queue answers the same thing, without scanning per track.
+    ///
+    /// The old statement got its duration from a correlated subquery joined on
+    /// `LOWER(TRIM(d.title)) = LOWER(TRIM(s.title))`, which no index can serve
+    /// — a full scan of the history per candidate. On the real instance that
+    /// was 357s average and 753s worst, five at a time against a pool of five,
+    /// for two days. A faster query that answers differently is not a fix, so
+    /// this runs **the old SQL beside the new method** and compares.
+    #[tokio::test]
+    async fn the_language_queue_reads_the_history_twice_and_answers_the_same() {
+        let db = testdb().await;
+        let uid = db.create_user("ash", None, "pw", "user").await.unwrap();
+
+        // Three tracks wanting a language, one already resolved, one skipped,
+        // and one by the placeholder artist — the four exclusions in the
+        // predicate, so a rewrite that drops one is caught here.
+        let seed: &[(&str, &str, &str, Option<i64>, Option<&str>, i64)] = &[
+            ("Star", "Heize", "Late Autumn", Some(211), None, 0),
+            ("Star", "Heize", "Late Autumn", Some(211), None, 0),
+            ("Star", "Heize", "Late Autumn", Some(999), None, 0),
+            ("Adieu", "Cœur de pirate", "Blonde", Some(184), None, 0),
+            ("Adieu", "Cœur de pirate", "Blonde", None, None, 0),
+            ("Xtal", "Aphex Twin", "SAW 85-92", None, Some("English/Other"), 0),
+            ("Teardrop", "Massive Attack", "Mezzanine", Some(330), Some("English"), 0),
+            ("Skipped", "Some Artist", "X", Some(120), None, 1),
+            ("Comp", "Various Artists", "X", Some(120), None, 0),
+        ];
+        for (i, (title, artist, album, dur, lang, skipped)) in seed.iter().enumerate() {
+            sqlx::query(
+                "INSERT INTO scrobbles
+                   (user_id, title, artist, album, duration, language, skipped,
+                    timestamp, source_id, source_name, status)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'test', 'imported')",
+            )
+            .bind(uid)
+            .bind(title)
+            .bind(artist)
+            .bind(album)
+            .bind(dur)
+            .bind(lang)
+            .bind(skipped)
+            .bind(1_760_000_000i64 + i as i64)
+            .bind(format!("seed-{i}"))
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        }
+
+        // The statement exactly as it was before the rewrite.
+        let old_sql = format!(
+            "SELECT title, artist, MAX(album) AS album,
+                    (SELECT duration FROM scrobbles d
+                      WHERE LOWER(TRIM(d.title)) = LOWER(TRIM(s.title))
+                        AND LOWER(TRIM(d.artist)) = LOWER(TRIM(s.artist))
+                        AND d.duration IS NOT NULL
+                      GROUP BY d.duration ORDER BY COUNT(*) DESC LIMIT 1) AS duration,
+                    COUNT(*) AS plays
+               FROM scrobbles s
+              WHERE skipped = FALSE
+                AND (language IS NULL OR language = '{}')
+                AND TRIM(title) != '' AND TRIM(artist) != ''
+                AND LOWER(TRIM(artist)) {NOT_VARIOUS}
+              GROUP BY LOWER(TRIM(title)), LOWER(TRIM(artist))
+              ORDER BY plays DESC LIMIT ?",
+            crate::language::DEFAULT_LANGUAGE
+        );
+        let mut old: Vec<(String, String, Option<String>, Option<i64>, i64)> =
+            sqlx::query_as(&old_sql).bind(50i64).fetch_all(&db.pool).await.unwrap();
+        let mut new = db.tracks_wanting_language(50).await.unwrap();
+        old.sort();
+        new.sort();
+        assert_eq!(new, old, "the rewrite must return what the old statement returned");
+
+        // And it really is answering, not returning an empty set that happens
+        // to match a broken `old`.
+        assert_eq!(new.len(), 3, "three tracks want a language: {new:?}");
+        let star = new.iter().find(|r| r.0 == "Star").unwrap();
+        assert_eq!(star.3, Some(211), "the modal duration, not the outlier");
+        assert_eq!(star.4, 3, "plays");
+        let adieu = new.iter().find(|r| r.0 == "Adieu").unwrap();
+        assert_eq!(adieu.3, Some(184), "a track with one known duration keeps it");
+        assert!(
+            new.iter().all(|r| r.1 != "Various Artists" && r.0 != "Skipped"),
+            "the placeholder artist and skips stay out"
+        );
+
+        // The count must describe the same population as the listing, or the
+        // Settings card cannot reach the end of its own queue.
+        assert_eq!(
+            db.count_tracks_wanting_language().await.unwrap(),
+            new.len() as i64,
+            "the count and the listing must agree"
+        );
+
+        // And the plan: no correlated subquery, and the history scanned once
+        // per statement rather than once per candidate.
+        for (name, sql) in [
+            (
+                "candidates",
+                format!(
+                    "SELECT LOWER(TRIM(title)) || CHAR(31) || LOWER(TRIM(artist)) AS k,
+                        title, artist, MAX(album), COUNT(*) AS plays
+                   FROM scrobbles WHERE {}
+                  GROUP BY LOWER(TRIM(title)), LOWER(TRIM(artist))
+                  ORDER BY plays DESC LIMIT 50",
+                    Database::language_queue_predicate()
+                ),
+            ),
+            (
+                "durations",
+                "SELECT LOWER(TRIM(title)) || CHAR(31) || LOWER(TRIM(artist)) AS k,
+                        duration, COUNT(*) AS n
+                   FROM scrobbles
+                  WHERE duration IS NOT NULL AND skipped = FALSE
+                    AND LOWER(TRIM(title)) || CHAR(31) || LOWER(TRIM(artist)) IN ('a')
+                  GROUP BY k, duration"
+                    .to_string(),
+            ),
+        ] {
+            let rows: Vec<(i64, i64, i64, String)> =
+                sqlx::query_as(&format!("EXPLAIN QUERY PLAN {sql}"))
+                    .fetch_all(&db.pool)
+                    .await
+                    .unwrap_or_default();
+            let plan: Vec<String> = rows.into_iter().map(|r| r.3).collect();
+            assert!(
+                !plan.iter().any(|l| l.contains("CORRELATED")),
+                "{name} has a correlated subquery — that is the bug. Plan:\n{}",
+                plan.join("\n")
+            );
+            let scans = plan.iter().filter(|l| l.contains("SCAN scrobbles")).count();
+            assert!(scans <= 1, "{name} scans scrobbles {scans} times. Plan:\n{}", plan.join("\n"));
+        }
+    }
+
     #[tokio::test]
     async fn the_patch_screens_scan_the_history_once() {
         let db = testdb().await;

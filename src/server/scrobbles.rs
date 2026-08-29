@@ -1188,7 +1188,12 @@ async fn fix_lyrics(
 /// with no words has no language — and folding it into "found" would present a
 /// finished lookup as an unfinished one.
 async fn lyrics_status(State(state): State<Arc<AppState>>, user: AuthUser) -> impl IntoResponse {
-    let unresolved = state.db.tracks_wanting_language(100_000).await.map(|v| v.len()).unwrap_or(0);
+    // A COUNT. This asked `tracks_wanting_language(100_000)` and took `.len()`
+    // of the answer — a hundred thousand rows, with their albums and their
+    // running times, fetched to be counted and dropped. That query was also
+    // quadratic at the time, so this endpoint could hold a pool connection for
+    // twelve minutes; the card that reads it made a page load do that.
+    let unresolved = state.db.count_tracks_wanting_language().await.unwrap_or(0);
     let Some(lyrics) = state.lyrics.clone() else {
         return (
             StatusCode::OK,
