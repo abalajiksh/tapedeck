@@ -657,6 +657,20 @@
 		} catch (e) { fetchingMbids = false; alert(String(e).replace(/^API \d+: /, '')); }
 	}
 
+	// Lyrics — a readout, with no button beside it on purpose. The pass runs
+	// only on the engine tick, at the pace LRCLIB asks for, so a "fetch now"
+	// control here would let a page refresh drive an unbounded number of
+	// requests at a free service. That pacing is the whole of our side of the
+	// bargain with them.
+	let lyricStatus: {
+		available: boolean; why?: string;
+		asked?: number; with_lyrics?: number; instrumental?: number;
+		unresolved: number;
+	} | null = null;
+	async function loadLyricStatus() {
+		try { lyricStatus = await api.getLyricsStatus(); } catch { /* optional */ }
+	}
+
 	// artwork
 	let artStatus: { total: number; resolved: number; pending: number } | null = null;
 	let fetchingArt = false;
@@ -1370,6 +1384,7 @@
 		loadProfile();
 		loadMbidStatus();
 		loadArtStatus();
+		loadLyricStatus();
 		loadSanitize();
 		loadDiscogs();
 		loadEveryNoise();
@@ -2895,6 +2910,58 @@
 							MusicBrainz is rate-limited, so a large history takes a while. You can leave this page.
 						</p>
 					{/if}
+				{:else}
+					<p style="font-size:13px;color:var(--td-muted-3);margin:0;">No status available.</p>
+				{/if}
+			</div>
+
+			<!-- Immediately above Language Enrichment because it feeds it: a
+			     romanised title tells `script_language` nothing, and the lyric is
+			     where that title's own script went.
+
+			     No button, unlike every other card in this section. Lyrics are
+			     fetched on the engine tick alone, at the pace LRCLIB asks for; a
+			     control here would let a page refresh drive an unbounded number of
+			     requests at a free service that charges nothing and asks only that.
+
+			     And no progress bar, which is the tempting thing to draw. `asked`
+			     and `unresolved` do not share a population — a track asked about
+			     whose lyric came back in Latin script is counted in both — so a bar
+			     dividing one into the other could never reach the end, and would
+			     report an answer as a stall. Two counts, each saying what it is of. -->
+			<div class="panel" style="border-radius:22px;padding:24px;margin-bottom:18px;">
+				<h3 class="h-display" style="font-size:19px;margin-bottom:4px;">Lyrics</h3>
+				<p style="font-size:13px;color:var(--td-muted);margin:0 0 16px;max-width:66ch;">
+					Words come from <a href="https://lrclib.net" target="_blank" rel="noreferrer noopener">LRCLIB</a>,
+					and they are what settles the language of a <strong>romanised</strong> title — a Korean
+					track written in Latin letters gives the script test nothing to read, and its lyric
+					gives it everything. They are also what the reader and <code>[[line:…]]</code> quotes are
+					made of. Fetched in the background, a few tracks a minute, most-played first.
+				</p>
+				{#if lyricStatus?.available}
+					<div style="font-size:12.5px;color:var(--td-muted-2);">
+						{lyricStatus.asked ?? 0} track{(lyricStatus.asked ?? 0) === 1 ? '' : 's'} asked about —
+						{lyricStatus.with_lyrics ?? 0} with words
+						· {lyricStatus.instrumental ?? 0} instrumental
+						<!-- Named rather than left as the gap between two numbers: a track
+						     LRCLIB has never heard of is a finished lookup, not a pending one. -->
+						· {Math.max(0, (lyricStatus.asked ?? 0) - (lyricStatus.with_lyrics ?? 0) - (lyricStatus.instrumental ?? 0))}
+						LRCLIB doesn't have
+					</div>
+					<div style="font-size:12.5px;color:var(--td-muted-2);margin-top:6px;">
+						{lyricStatus.unresolved} track{lyricStatus.unresolved === 1 ? '' : 's'} still filed under
+						English/Other
+					</div>
+					<p style="font-size:12px;color:var(--td-muted-3);margin:10px 0 0;max-width:66ch;">
+						Those two counts overlap and are not a fraction of one another: some of what is
+						still English/Other has already been asked about and came back in Latin script,
+						which this pass cannot settle either way. Telling French from English needs a
+						detector Tapedeck doesn't have yet.
+					</p>
+				{:else if lyricStatus}
+					<p style="font-size:13px;color:var(--td-muted-3);margin:0;">
+						{lyricStatus.why ?? 'The lyrics cache is unavailable, so the language pass is skipped.'}
+					</p>
 				{:else}
 					<p style="font-size:13px;color:var(--td-muted-3);margin:0;">No status available.</p>
 				{/if}

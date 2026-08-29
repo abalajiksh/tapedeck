@@ -2003,6 +2003,28 @@ class TapedeckAPI {
 		return this.post('/api/v1/mbids/backfill');
 	}
 
+	/** How far the lyric pass has got.
+	 *
+	 *  There is deliberately no companion `backfill` call: lyrics are fetched
+	 *  by the engine tick alone, at LRCLIB's asked-for pace, so a button here
+	 *  would drive an unbounded number of requests at a free service. This is
+	 *  a readout.
+	 *
+	 *  `asked` and `unresolved` do **not** share a population and must never be
+	 *  divided into one another — `unresolved` counts tracks still showing
+	 *  `English/Other`, which includes tracks already asked about whose lyric
+	 *  turned out to be Latin. Report them as two counts, never as a bar. */
+	async getLyricsStatus(): Promise<{
+		available: boolean;
+		why?: string;
+		asked?: number;
+		with_lyrics?: number;
+		instrumental?: number;
+		unresolved: number;
+	}> {
+		return this.get('/api/v1/lyrics/status');
+	}
+
 	async getArtworkStatus(): Promise<{ total: number; resolved: number; pending: number }> {
 		return this.get('/api/v1/artwork/status');
 	}

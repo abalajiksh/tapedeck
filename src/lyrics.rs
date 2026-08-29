@@ -539,18 +539,37 @@ impl LyricsClient {
     }
 
     /// How much of the library has been asked about, for the progress readout.
-    pub async fn coverage(&self) -> (i64, i64, i64) {
-        let row: Option<(i64, i64, i64)> = sqlx::query_as(
+    ///
+    /// `None` means the cache could not be **read**, which is not the same
+    /// thing as a cache with nothing in it and must never be reported as one.
+    /// This returned `(0, 0, 0)` for both until the Settings card gave it a
+    /// reader, at which point a broken cache would have said "0 tracks asked
+    /// about" in as many words — a failed read rendered as a measurement, the
+    /// shape `needs_setup` took down the instance with in v0.81.0.
+    ///
+    /// The `COALESCE` is not load-bearing today and is kept deliberately.
+    /// `SUM` over zero rows is NULL rather than 0, and this driver was
+    /// **measured** decoding a NULL into a bare `i64` as `0` rather than
+    /// refusing it — so an empty table happens to come back `(0, 0, 0)` on its
+    /// own. That is undocumented driver behaviour to be leaning on: were it
+    /// ever to become the decode error it looks like it should be, an empty
+    /// cache would start reporting as an unreadable one, which is precisely
+    /// the distinction above collapsing again in the other direction. The
+    /// `COALESCE` makes the SQL say what it means and removes the dependency.
+    pub async fn coverage(&self) -> Option<(i64, i64, i64)> {
+        sqlx::query_as(
             "SELECT COUNT(*),
-                    SUM(CASE WHEN found = 1 AND instrumental = 0 THEN 1 ELSE 0 END),
-                    SUM(CASE WHEN instrumental = 1 THEN 1 ELSE 0 END)
+                    COALESCE(SUM(CASE WHEN found = 1 AND instrumental = 0 THEN 1 ELSE 0 END), 0),
+                    COALESCE(SUM(CASE WHEN instrumental = 1 THEN 1 ELSE 0 END), 0)
                FROM lyrics_cache",
         )
-        .fetch_optional(&self.pool)
+        // An aggregate with no GROUP BY always returns exactly one row, so
+        // `fetch_one` is the honest shape here — and this is a read, not one
+        // of the `RETURNING` writes that must not be consumed this way.
+        .fetch_one(&self.pool)
         .await
+        .map_err(|e| tracing::warn!("🎤 Lyrics cache could not be read: {e}"))
         .ok()
-        .flatten();
-        row.unwrap_or((0, 0, 0))
     }
 }
 
@@ -574,6 +593,78 @@ impl std::fmt::Display for LyricsError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn testpool() -> Pool<Sqlite> {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static N: AtomicU32 = AtomicU32::new(0);
+        let n = N.fetch_add(1, Ordering::SeqCst);
+        let path = std::env::temp_dir().join(format!("td-lyrics-{}-{}.db", std::process::id(), n));
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{}", path.display(), suffix));
+        }
+        sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(2)
+            .connect_with(
+                sqlx::sqlite::SqliteConnectOptions::new().filename(&path).create_if_missing(true),
+            )
+            .await
+            .unwrap()
+    }
+
+    /// A cache nobody has filled yet is an answer; one that cannot be read is not.
+    ///
+    /// These were the *same* value — `(0, 0, 0)` — until the Settings card gave
+    /// `coverage` a reader, and then a broken cache would have reported "0
+    /// tracks asked about" as a finding. Never report a failed read as an
+    /// absence; the instance-wide version of this mistake is what made v0.80.0
+    /// tell its owner their history was gone.
+    ///
+    /// The empty half is asserted in its own right rather than as a guard on
+    /// the `COALESCE`: it pins that a cache with nothing in it is an *answer*,
+    /// so this cannot later be "tidied" into returning `None` for zero rows —
+    /// which would make every fresh instance report itself broken.
+    #[tokio::test]
+    async fn an_unreadable_lyrics_cache_is_not_an_empty_one() {
+        let pool = testpool().await;
+        let c = LyricsClient::new(pool.clone()).await.unwrap();
+
+        assert_eq!(
+            c.coverage().await,
+            Some((0, 0, 0)),
+            "an empty cache reports zeros rather than failing to be read"
+        );
+
+        let now = 1_700_000_000i64;
+        for (key, instrumental, found) in
+            [("a|one", 0, 1), ("a|two", 0, 1), ("a|three", 1, 1), ("a|four", 0, 0)]
+        {
+            sqlx::query(
+                "INSERT INTO lyrics_cache (track_key, instrumental, found, fetched_at)
+                 VALUES (?, ?, ?, ?)",
+            )
+            .bind(key)
+            .bind(instrumental)
+            .bind(found)
+            .bind(now)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        assert_eq!(
+            c.coverage().await,
+            Some((4, 2, 1)),
+            "asked, with words, instrumental — the fourth is one LRCLIB does not have"
+        );
+
+        // The table going away stands in for any unreadable cache. The point is
+        // the *shape* of the answer, not this particular cause.
+        sqlx::query("DROP TABLE lyrics_cache").execute(&pool).await.unwrap();
+        assert_eq!(
+            c.coverage().await,
+            None,
+            "a cache that cannot be read must not read as a cache with nothing in it"
+        );
+    }
 
     /// Blank lines are numbered, because a reference is an index.
     ///

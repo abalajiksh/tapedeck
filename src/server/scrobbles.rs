@@ -1200,7 +1200,21 @@ async fn lyrics_status(State(state): State<Arc<AppState>>, user: AuthUser) -> im
         )
             .into_response();
     };
-    let (asked, with_lyrics, instrumental) = lyrics.coverage().await;
+    // A cache that cannot be read is reported as unavailable rather than as a
+    // cache with nothing in it. Those were the same answer until the Settings
+    // card gave this a reader — an unreadable cache said "0 tracks asked
+    // about", which is a failed read wearing the clothes of a measurement.
+    let Some((asked, with_lyrics, instrumental)) = lyrics.coverage().await else {
+        return (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "available": false,
+                "why": "The lyrics cache could not be read, so its coverage is unknown.",
+                "unresolved": unresolved,
+            })),
+        )
+            .into_response();
+    };
     let _ = user;
     (
         StatusCode::OK,
