@@ -205,6 +205,17 @@ mod tests {
     ///
     /// The drift test above only compares paths, so it never noticed. This is
     /// the cheap half of the guarantee.
+    ///
+    /// **`Cargo.lock` has the same hazard and cannot be guarded this way.** It
+    /// records this crate's own version too, and CI builds `--locked`, so a
+    /// bump that is not followed by a `cargo` run fails the pipeline at its
+    /// first step with "cannot update the lock file" — a message that names
+    /// neither the version nor the bump. A test cannot catch it from either
+    /// side: locally, `cargo test` rewrites the lock before the test compiles,
+    /// and in CI `--locked` fails before any test runs. It was tried, measured
+    /// doing nothing, and removed. The only thing that covers it is running
+    /// `cargo check` after touching the version and committing the lock with
+    /// it — so bump the version *before* the last test run, not after.
     #[test]
     fn the_spec_states_the_version_the_binary_actually_is() {
         let want = env!("CARGO_PKG_VERSION");
