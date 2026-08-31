@@ -2014,6 +2014,36 @@ class TapedeckAPI {
 	 *  divided into one another — `unresolved` counts tracks still showing
 	 *  `English/Other`, which includes tracks already asked about whose lyric
 	 *  turned out to be Latin. Report them as two counts, never as a bar. */
+	/** The other records LRCLIB holds for a track.
+	 *
+	 *  Not versions — LRCLIB has none. These are different *records* for the
+	 *  same song, which is what the design's version picker was really reaching
+	 *  for: the way to fix a wrong match without typing the words out.
+	 *
+	 *  Reaches the network, so it is called on a press and never on a render.
+	 *  A rate limit comes back as `unavailable` with a reason rather than an
+	 *  error, because LRCLIB asking us to wait is not a failure of ours. */
+	async lyricMatches(
+		artist: string,
+		title: string
+	): Promise<{
+		matches: {
+			id: number | null;
+			title: string | null;
+			artist: string | null;
+			duration: number | null;
+			synced: boolean;
+			lines: number;
+			plain: string | null;
+			synced_text: string | null;
+		}[];
+		unavailable?: boolean;
+		why?: string;
+	}> {
+		const q = new URLSearchParams({ artist, title });
+		return this.get(`/api/v1/lyrics/matches?${q}`);
+	}
+
 	async getLyricsStatus(): Promise<{
 		available: boolean;
 		why?: string;

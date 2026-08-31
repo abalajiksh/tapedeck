@@ -26,7 +26,7 @@ openapi: 3.1.0
 
 info:
   title: Tapedeck
-  version: 0.102.2
+  version: 0.103.0
   summary: Self-hosted scrobbler and listening journal.
   description: |
     Tapedeck ingests listens, enriches them with MusicBrainz metadata, stores
@@ -7579,6 +7579,67 @@ paths:
                     type: boolean
                     description: The count changed, so every quote past the change now points at different words.
         '400': { description: No artist, no title, or no words in it. }
+
+  /api/v1/lyrics/matches:
+    get:
+      tags: [Statistics]
+      summary: The other records LRCLIB holds for a track.
+      description: |
+        Session or a `read` token.
+
+        **Not a version history.** LRCLIB has none — `/api/get` returns one
+        record and nothing behind it. These are *different records* for the same
+        song, from `/api/search`: other uploads, other pressings, a live take
+        filed under the same name. Picking a better one is how a wrong match is
+        fixed without typing the words out.
+
+        Records with no words are omitted. The whole gesture is "these are the
+        wrong words, give me the other ones", which an instrumental cannot
+        answer.
+
+        **Adopt one with `PUT /api/v1/lyrics`**, sending the chosen `plain` and
+        `synced_text`. That is the ordinary correction path, so the choice is
+        marked edited and survives every later fetch — and it reports
+        `renumbered`, which matters here more than anywhere: a `[[line:...]]`
+        reference is an index, so a different record re-points every quote
+        already written.
+
+        This reaches the network, so it belongs on a press rather than a page
+        load. A rate limit or an unreachable LRCLIB comes back **200** with
+        `unavailable: true` and a reason rather than a 5xx: the upstream asking
+        us to wait is not this server failing, and the distinction is what stops
+        a client reporting "no other matches" when it never managed to ask.
+      parameters:
+        - { in: query, name: artist, required: true, schema: { type: string } }
+        - { in: query, name: title, required: true, schema: { type: string } }
+      responses:
+        '200':
+          description: OK.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  matches:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        id: { type: integer, nullable: true }
+                        title: { type: string, nullable: true }
+                        artist: { type: string, nullable: true }
+                        duration: { type: integer, nullable: true }
+                        synced:
+                          type: boolean
+                          description: Timed. A timed lyric can follow the deck; a plain one cannot.
+                        lines: { type: integer }
+                        plain: { type: string, nullable: true }
+                        synced_text: { type: string, nullable: true }
+                  unavailable:
+                    type: boolean
+                    description: Present and true when LRCLIB could not be asked.
+                  why: { type: string }
+        '400': { description: Missing artist or title. }
 
   /api/v1/lyrics/keys:
     get:

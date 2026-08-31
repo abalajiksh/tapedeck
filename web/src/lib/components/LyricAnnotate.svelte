@@ -21,6 +21,7 @@
 	import { createEventDispatcher } from 'svelte';
 	import { api } from '$lib/api';
 	import type { LyricDoc, LyricLine } from '$lib/api';
+	import { gutter, cycleGutter, gutterLabel, gutterTitle } from '$lib/lyricgutter';
 
 	export let artist = '';
 	/** The track being annotated. A record's note picks one from its tracklist. */
@@ -161,6 +162,11 @@
 				{#if doc?.plays}· played {doc.plays} time{doc.plays === 1 ? '' : 's'}{/if}
 			</div>
 		</div>
+		{#if lines.length}
+			<button class="agut" on:click={cycleGutter} title={gutterTitle($gutter)}>
+				{$gutter === 'time' ? '0:00' : $gutter === 'number' ? '#' : '–'}
+			</button>
+		{/if}
 		<a class="btn btn-secondary" href={readerHref()}>Open the reader ↗</a>
 	</div>
 
@@ -184,7 +190,7 @@
 					<div class="abreak"></div>
 				{:else}
 					<div class="aline" class:on={editing === l.n || !!l.pin}>
-						<span class="an">{doc?.timed && l.at != null ? mmss(l.at) : l.n}</span>
+						<span class="an" class:empty={$gutter === 'none'}>{gutterLabel($gutter, l.n, l.at, mmss)}</span>
 						<div class="atext">
 							<div class="awords">{l.text}</div>
 							{#if (l.quoted ?? 0) > 0}
@@ -240,6 +246,22 @@
 </div>
 
 <style>
+	.agut {
+		flex: none;
+		min-width: 42px;
+		padding: 6px 9px;
+		border-radius: 999px;
+		border: 1px solid var(--td-border);
+		background: transparent;
+		color: var(--td-muted-2);
+		font: 500 11px ui-monospace, Menlo, monospace;
+		cursor: pointer;
+	}
+	.agut:hover { border-color: var(--td-accent); color: var(--td-accent); }
+	/* Hidden, not removed: the column stays so turning the gutter off does not
+	   shift every line and make the list read as a different lyric. */
+	.an.empty { visibility: hidden; }
+
 	.ann { border-radius: 22px; overflow: hidden; display: flex; flex-direction: column; }
 	.ahead {
 		display: flex;

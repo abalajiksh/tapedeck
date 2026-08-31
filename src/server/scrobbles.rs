@@ -1178,6 +1178,87 @@ async fn fix_lyrics(
     }
 }
 
+/// GET /api/v1/lyrics/matches — the other records LRCLIB holds for a track.
+///
+/// The honest form of the design's `LRCLIB v3 ▾`, which implies a version
+/// history LRCLIB does not have. These are *different records* for the same
+/// track, and picking one is how a wrong match gets fixed without typing the
+/// words out.
+///
+/// Adopting one is a `PUT /api/v1/lyrics` with the chosen words — the ordinary
+/// correction path, so it is marked `edited`, survives every later fetch, and
+/// reports whether the line count changed. That last part is not a nicety: a
+/// `[[line:…]]` reference is an index, so a different record re-points every
+/// quote already written.
+///
+/// It reaches the network, so it is a deliberate press rather than something a
+/// page load does — and a rate limit comes back as a plain answer rather than
+/// a 5xx, because "LRCLIB asked us to wait" is not this server failing.
+async fn lyric_matches(
+    State(state): State<Arc<AppState>>,
+    ReadAuth { user }: ReadAuth,
+    Query(q): Query<LyricsQuery>,
+) -> impl IntoResponse {
+    let Some(lyrics) = state.lyrics.clone() else {
+        return server_error("This instance has no lyrics cache".to_string());
+    };
+    if q.artist.trim().is_empty() || q.title.trim().is_empty() {
+        return bad_request("A search needs an artist and a title");
+    }
+    let _ = user;
+    match lyrics.search(&q.artist, &q.title).await {
+        Ok(found) => {
+            let matches: Vec<_> = found
+                .iter()
+                .map(|r| {
+                    let synced = r.synced_lyrics.as_deref().is_some_and(|t| !t.trim().is_empty());
+                    serde_json::json!({
+                        "id": r.id,
+                        "title": r.track_name,
+                        "artist": r.artist_name,
+                        "duration": r.duration.map(|d| d as i64),
+                        // What the reader gets if this one is adopted: a timed
+                        // lyric follows the deck, a plain one cannot.
+                        "synced": synced,
+                        "lines": crate::lyrics::parse_lines(
+                            r.plain_lyrics.as_deref(),
+                            r.synced_lyrics.as_deref(),
+                        )
+                        .len(),
+                        "plain": r.plain_lyrics,
+                        "synced_text": r.synced_lyrics,
+                    })
+                })
+                .collect();
+            (StatusCode::OK, Json(serde_json::json!({ "matches": matches }))).into_response()
+        }
+        Err(crate::lyrics::LyricsError::RateLimited(secs)) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "matches": [],
+                "unavailable": true,
+                "why": format!("LRCLIB asked us to wait {secs}s — try again shortly."),
+            })),
+        )
+            .into_response(),
+        // Deliberately not the transport error verbatim: it carries a `Debug`
+        // wrapper and the configured LRCLIB URL, neither of which means
+        // anything to the person reading it. The cause goes to the log.
+        Err(e) => {
+            tracing::debug!("🎤 lyric match search failed for {} — {}: {e:?}", q.artist, q.title);
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "matches": [],
+                    "unavailable": true,
+                    "why": "Could not reach LRCLIB just now — try again shortly.",
+                })),
+            )
+                .into_response()
+        }
+    }
+}
+
 /// GET /api/v1/lyrics/status — how far the lyric language pass has got.
 ///
 /// Reports what it is *for* rather than a lyric count: the pass exists to empty
@@ -1378,6 +1459,7 @@ pub fn create_scrobbles_router() -> Router<Arc<AppState>> {
         .route("/api/v1/languages/backfill", axum::routing::post(backfill_languages_now))
         .route("/api/v1/lyrics", get(lyrics_for_track).put(fix_lyrics))
         .route("/api/v1/lyrics/keys", get(lyrics_keys))
+        .route("/api/v1/lyrics/matches", get(lyric_matches))
         .route("/api/v1/lyrics/status", get(lyrics_status))
         .route("/api/v1/mbids/status", get(mbid_status))
         .route("/api/v1/mbids/backfill", axum::routing::post(backfill_mbids_now))

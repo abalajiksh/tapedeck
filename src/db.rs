@@ -18224,7 +18224,18 @@ mod tests {
         // The skip is the one that is easiest to lose in a rewrite: it is the
         // busiest listen in the fixture on every axis.
         assert_eq!(got["total"].as_i64().unwrap(), 5, "the skip counts nowhere");
-        assert_eq!(got["today"].as_i64().unwrap(), 2);
+        // Derived from the fixture rather than hardcoded, because **on a Monday
+        // `week_start` *is* `today_start`** and the "earlier this week" row
+        // falls inside today — so a literal `2` was right six days a week and
+        // failed on the seventh. Found by running the suite on a Monday, which
+        // is the only way it ever announces itself.
+        //
+        // It still asserts the thing it was written for: the filter excludes
+        // the skip, so a rewrite that started counting skipped listens in
+        // "today" fails here whatever the day.
+        let today_expected =
+            rows.iter().filter(|(_, _, ts, _, _, skipped)| !skipped && *ts >= today_start).count();
+        assert_eq!(got["today"].as_i64().unwrap(), today_expected as i64);
         assert!(got["avg_quality"].as_f64().unwrap() > 0.0, "nulls are skipped, not zeroed");
 
         // Dropped deliberately: three `COUNT(DISTINCT)` scans that nothing

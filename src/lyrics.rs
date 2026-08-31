@@ -497,6 +497,60 @@ impl LyricsClient {
         Ok(found)
     }
 
+    /// What else LRCLIB holds for this track.
+    ///
+    /// **Not a version history**, which is what the design's `LRCLIB v3 ▾`
+    /// label implies and what LRCLIB does not have: `/api/get` returns one
+    /// record and there is no history behind it. `/api/search` returns up to
+    /// twenty *different records* — other uploads, other pressings, a live
+    /// take filed under the same name — and picking a better one is the real
+    /// need underneath that control. So it is offered as what it is.
+    ///
+    /// Candidates with no words are dropped rather than shown: the whole
+    /// gesture is "these are the wrong words, give me the other ones", and an
+    /// instrumental record cannot answer it. Adopting one goes through the
+    /// ordinary correction path, so it is marked `edited` and survives every
+    /// later fetch — and it reports the line count either side, because a
+    /// reference is an index and a different record renumbers every quote.
+    pub async fn search(&self, artist: &str, title: &str) -> Result<Vec<LrcResponse>, LyricsError> {
+        let url = format!(
+            "{}/api/search?artist_name={}&track_name={}",
+            self.base,
+            urlencoding::encode(artist.trim()),
+            urlencoding::encode(title.trim())
+        );
+
+        tokio::time::sleep(REQUEST_GAP).await;
+        let resp =
+            self.http.get(&url).send().await.map_err(|e| LyricsError::Network(e.to_string()))?;
+
+        if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            let wait = resp
+                .headers()
+                .get(reqwest::header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.trim().parse::<u64>().ok())
+                .unwrap_or(5);
+            return Err(LyricsError::RateLimited(wait.min(MAX_WAIT_SECS)));
+        }
+        // A search that finds nothing is a 200 with an empty array; a 404 here
+        // would be the endpoint being wrong, not the track being unknown.
+        if !resp.status().is_success() {
+            return Err(LyricsError::Network(format!("LRCLIB returned {}", resp.status())));
+        }
+
+        let body: Vec<LrcResponse> =
+            resp.json().await.map_err(|e| LyricsError::Network(e.to_string()))?;
+        Ok(body
+            .into_iter()
+            .filter(|r| {
+                !r.instrumental
+                    && (r.plain_lyrics.as_deref().is_some_and(|t| !t.trim().is_empty())
+                        || r.synced_lyrics.as_deref().is_some_and(|t| !t.trim().is_empty()))
+            })
+            .collect())
+    }
+
     async fn remember(&self, artist: &str, title: &str, hit: Option<(&Found, Option<i64>)>) {
         let key = Self::track_key(artist, title);
         // **A correction outlives every later fetch.** *Newest fetch wins* is
