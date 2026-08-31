@@ -1132,6 +1132,134 @@ impl MediaBrowserSource {
         }
         Ok((resp.bytes().await?.to_vec(), content_type))
     }
+
+    /// The lyrics this server holds for an item, as `(plain, synced)`.
+    ///
+    /// `GET /Audio/{id}/Lyrics`, which is a first-class endpoint here rather
+    /// than something dug out of a stream list — and it is **the user's own
+    /// tagging**, so it beats any provider: the right pressing, the right edit,
+    /// and no rate limit because it is their server.
+    ///
+    /// Deliberately *not* `/Audio/{id}/RemoteSearch/Lyrics`. That is Jellyfin
+    /// asking a lyrics provider on our behalf, which is LRCLIB one hop further
+    /// away and is precisely the half that is not the user's.
+    ///
+    /// **`Start` is in .NET ticks — 10,000,000 per second, not milliseconds.**
+    /// Reading them as ms puts every cue four orders of magnitude out, the
+    /// reader sits on line one forever, and nothing errors. `Offset` is ticks
+    /// too, and is applied here rather than stored, because everything
+    /// downstream of this expects cues that are already right.
+    ///
+    /// Returns `Ok(None)` when the server has none, which is an ordinary answer
+    /// and not a failure — most libraries are only partly tagged.
+    pub async fn fetch_lyrics(
+        &self,
+        item_id: &str,
+    ) -> Result<Option<(Option<String>, Option<String>)>, Box<dyn std::error::Error + Send + Sync>>
+    {
+        let resp = self
+            .client
+            .get(self.endpoint(&format!("/Audio/{item_id}/Lyrics")))
+            .header("X-Emby-Token", &self.api_key)
+            .send()
+            .await?;
+
+        // 404 is "this item has no lyrics", which is the common case.
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        if !resp.status().is_success() {
+            return Err(
+                format!("{} lyrics returned {}", self.flavour.label(), resp.status()).into()
+            );
+        }
+
+        let dto: LyricDto = resp.json().await?;
+        Ok(lyric_dto_to_pair(&dto))
+    }
+}
+
+/// `LyricDto` — what `GET /Audio/{id}/Lyrics` returns.
+///
+/// PascalCase on the wire like every other Jellyfin/Emby response. Pinned to
+/// the 12.0.0 schema; the field that fails silently if it is wrong is `Start`,
+/// which is ticks.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct LyricDto {
+    #[serde(default)]
+    pub metadata: Option<LyricMetadata>,
+    #[serde(default)]
+    pub lyrics: Vec<LyricLine>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct LyricMetadata {
+    #[serde(default)]
+    pub is_synced: Option<bool>,
+    /// Ticks, and signed: a negative offset pulls the words earlier.
+    #[serde(default)]
+    pub offset: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct LyricLine {
+    #[serde(default)]
+    pub text: Option<String>,
+    /// **Ticks — 10,000,000 per second.** Not milliseconds.
+    #[serde(default)]
+    pub start: Option<i64>,
+}
+
+/// Turn a `LyricDto` into `(plain, synced)`.
+///
+/// Split out of the fetch for the reason `consume_sessions` is: **the ticks
+/// conversion fails silently.** A `Start` read as milliseconds is four orders
+/// of magnitude out, so every cue lands in the first thousandth of a second,
+/// the reader sits on line one forever, and nothing anywhere errors. That has
+/// to be testable without a server.
+///
+/// `Offset` is applied here rather than stored, because everything downstream
+/// expects cues that are already right, and it is signed — a negative offset
+/// legitimately pulls the words earlier.
+pub fn lyric_dto_to_pair(dto: &LyricDto) -> Option<(Option<String>, Option<String>)> {
+    /// .NET ticks in one second. The whole trap, named.
+    const TICKS_PER_SEC: f64 = 10_000_000.0;
+
+    let offset = dto.metadata.as_ref().and_then(|m| m.offset).unwrap_or(0);
+    let lines: Vec<&LyricLine> =
+        dto.lyrics.iter().filter(|l| l.text.is_some() || l.start.is_some()).collect();
+    if lines.is_empty() {
+        return None;
+    }
+
+    let plain: String =
+        lines.iter().map(|l| l.text.clone().unwrap_or_default()).collect::<Vec<_>>().join("\n");
+
+    // Timed when the cues are actually there. `IsSynced` is the server's
+    // opinion of the file; the lines are the evidence, and a file claiming to
+    // be synced with no cues would otherwise produce an unusable timed lyric.
+    let synced = lines.iter().any(|l| l.start.is_some()).then(|| {
+        lines
+            .iter()
+            .map(|l| {
+                let t = (l.start.unwrap_or(0) + offset).max(0);
+                let secs = t as f64 / TICKS_PER_SEC;
+                let m = (secs / 60.0).floor() as i64;
+                let rest = secs - (m as f64) * 60.0;
+                format!("[{:02}:{:05.2}] {}", m, rest, l.text.clone().unwrap_or_default())
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    });
+
+    let plain = (!plain.trim().is_empty()).then_some(plain);
+    if plain.is_none() && synced.is_none() {
+        return None;
+    }
+    Some((plain, synced))
 }
 
 #[async_trait::async_trait]

@@ -290,4 +290,77 @@ mod tests {
         assert_eq!(p.artist, "Aphex Twin");
         assert_eq!(p.source_name, "jellyfin");
     }
+
+    /// `Start` is .NET ticks, and reading it as milliseconds is silent.
+    ///
+    /// Pinned against the 12.0.0 schema's own units: 10,000,000 ticks to the
+    /// second. Read as ms, 27,500,000 becomes 7.6 *hours* instead of 2.75
+    /// seconds — or, the way it actually goes wrong, every cue lands in the
+    /// first instant, the reader never leaves line one, and nothing errors.
+    #[test]
+    fn jellyfin_lyric_cues_are_ticks_not_milliseconds() {
+        let body = r#"{
+            "Metadata": { "IsSynced": true, "Offset": 0 },
+            "Lyrics": [
+                { "Text": "first line",  "Start": 10000000 },
+                { "Text": "second line", "Start": 27500000 },
+                { "Text": "past a minute", "Start": 615000000 }
+            ]
+        }"#;
+        let dto: crate::sources::mediabrowser::LyricDto = serde_json::from_str(body).unwrap();
+        let (plain, synced) = crate::sources::mediabrowser::lyric_dto_to_pair(&dto).unwrap();
+
+        let synced = synced.expect("cues present, so the lyric is timed");
+        assert!(synced.starts_with("[00:01.00] first line"), "got {synced}");
+        assert!(synced.contains("[00:02.75] second line"), "got {synced}");
+        // 615,000,000 ticks = 61.5s = 1:01.50 — the minute rollover, which an
+        // implementation that forgot to divide would put at [00:61.50].
+        assert!(synced.contains("[01:01.50] past a minute"), "got {synced}");
+
+        assert_eq!(plain.unwrap(), "first line\nsecond line\npast a minute");
+    }
+
+    /// A signed offset really moves the cues, and never past zero.
+    #[test]
+    fn a_negative_lyric_offset_pulls_the_words_earlier() {
+        let body = r#"{
+            "Metadata": { "Offset": -5000000 },
+            "Lyrics": [
+                { "Text": "early", "Start": 10000000 },
+                { "Text": "clamped", "Start": 1000000 }
+            ]
+        }"#;
+        let dto: crate::sources::mediabrowser::LyricDto = serde_json::from_str(body).unwrap();
+        let (_, synced) = crate::sources::mediabrowser::lyric_dto_to_pair(&dto).unwrap();
+        let synced = synced.unwrap();
+        assert!(synced.contains("[00:00.50] early"), "1.0s - 0.5s = 0.5s; got {synced}");
+        // Clamped rather than negative: a cue before the start of the track is
+        // not a time, and `[-00:00.40]` parses as nothing downstream.
+        assert!(synced.contains("[00:00.00] clamped"), "got {synced}");
+    }
+
+    /// A lyric with words and no cues is plain, not a timed lyric with none.
+    ///
+    /// `IsSynced` is the server's claim about the file; the cues are the
+    /// evidence. Trusting the claim yields a "timed" lyric the reader cannot
+    /// follow, which looks like the deck being broken.
+    #[test]
+    fn a_lyric_with_no_cues_is_plain_whatever_the_metadata_claims() {
+        let body = r#"{
+            "Metadata": { "IsSynced": true },
+            "Lyrics": [ { "Text": "just words" }, { "Text": "no cues" } ]
+        }"#;
+        let dto: crate::sources::mediabrowser::LyricDto = serde_json::from_str(body).unwrap();
+        let (plain, synced) = crate::sources::mediabrowser::lyric_dto_to_pair(&dto).unwrap();
+        assert!(synced.is_none(), "no cues, so not timed");
+        assert_eq!(plain.unwrap(), "just words\nno cues");
+    }
+
+    /// An empty lyric document is no lyrics, not empty ones.
+    #[test]
+    fn an_empty_lyric_document_is_no_lyrics() {
+        let dto: crate::sources::mediabrowser::LyricDto =
+            serde_json::from_str(r#"{"Lyrics": []}"#).unwrap();
+        assert!(crate::sources::mediabrowser::lyric_dto_to_pair(&dto).is_none());
+    }
 }

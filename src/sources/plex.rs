@@ -484,6 +484,10 @@ pub struct PlexPart {
 pub struct PlexStream {
     #[serde(deserialize_with = "deserialize_i32_flexible", default)]
     pub stream_type: Option<i32>,
+    /// Where an independently streamable stream can be fetched from, e.g.
+    /// `/library/streams/1`. The spec's words, and it is how a lyric stream is
+    /// read — `streamType == 4` says one is *there*, this says where.
+    pub key: Option<String>,
     pub codec: Option<String>,
     #[serde(deserialize_with = "deserialize_i32_flexible", default)]
     pub bitrate: Option<i32>,
@@ -622,6 +626,33 @@ pub struct PlexSource {
 
 /// How often the Plex history endpoint is walked, independent of how often
 /// sessions are read.
+/// Decide whether a lyric file Plex served is timed, as `(plain, synced)`.
+///
+/// **Plex serves the bytes and does not say which it is.** There is no field
+/// for it, and the stream's `codec` is not dependable, so the shape of the file
+/// is the only evidence. A timed lyric filed as plain silently stops the reader
+/// following the deck — no error, the words are just static — which is why this
+/// is a named function with tests rather than a condition inside a fetch.
+///
+/// A cued line is `[mm:ss.xx] words`. **One is enough**: an `.lrc` legitimately
+/// opens with uncued metadata tags (`[ar:…]`, `[ti:…]`), so requiring every
+/// line to be cued would read a perfectly good LRC as plain text. Requiring
+/// *digits* after the bracket is what keeps those tags from counting as cues.
+fn split_lyric_body(body: String) -> (Option<String>, Option<String>) {
+    let timed = body.lines().any(|l| {
+        let t = l.trim_start();
+        t.starts_with('[') && t.get(1..3).is_some_and(|d| d.chars().all(|c| c.is_ascii_digit()))
+    });
+    if timed {
+        (None, Some(body))
+    } else {
+        (Some(body), None)
+    }
+}
+
+/// `streamType == 4` is a lyric stream — the Plex spec's own enumeration.
+const LYRIC_STREAM_TYPE: i32 = 4;
+
 const HISTORY_SYNC_INTERVAL_SECS: u64 = 60;
 
 /// Rows per request on the history walk. Plex's own default, and the value this
@@ -1135,6 +1166,75 @@ impl PlexSource {
             .into_iter()
             .find_map(|m| m.rating_key)
             .ok_or_else(|| "Plex created the playlist but reported no id".into())
+    }
+
+    /// The lyrics Plex holds for a track, as `(plain, synced)`.
+    ///
+    /// Plex has no lyrics endpoint. It has the **stream chain**, and the spec
+    /// is explicit: `streamType` is *"`1` for video, `2` for audio, `3` for
+    /// subtitles, `4` for lyrics"*, with `key` giving the path the stream can
+    /// be fetched from. So this is the same `/library/metadata/<ratingKey>`
+    /// walk `hydrate_from_library` already makes, one branch further along.
+    ///
+    /// These are **the user's own tags** and beat any provider for the reason
+    /// their artwork does: it is the pressing they actually played, with their
+    /// own corrections in it, and asking their server costs no rate limit.
+    ///
+    /// `.lrc` is told from plain text by the shape of the file rather than by
+    /// its name — Plex serves the bytes and does not say which it is, and a
+    /// timed lyric filed as plain would silently stop the reader following the
+    /// deck.
+    ///
+    /// `Ok(None)` when there is no lyric stream, which is ordinary: most
+    /// libraries are only partly tagged.
+    pub async fn fetch_lyrics(
+        &self,
+        rating_key: &str,
+    ) -> Result<Option<(Option<String>, Option<String>)>, Box<dyn std::error::Error + Send + Sync>>
+    {
+        let meta_url = format!("{}/library/metadata/{}", self.url, rating_key);
+        let meta: SessionsResponse = self
+            .client
+            .get(&meta_url)
+            .header("X-Plex-Token", &self.token)
+            .header("Accept", "application/json")
+            .send()
+            .await?
+            .json()
+            .await?;
+
+        let Some(path) = meta
+            .media_container
+            .metadata
+            .first()
+            .and_then(|m| m.media.as_ref())
+            .into_iter()
+            .flatten()
+            .filter_map(|m| m.part.as_ref())
+            .flatten()
+            .filter_map(|p| p.stream.as_ref())
+            .flatten()
+            .find(|st| st.stream_type == Some(LYRIC_STREAM_TYPE))
+            .and_then(|st| st.key.clone())
+        else {
+            return Ok(None);
+        };
+
+        let resp = self
+            .client
+            .get(format!("{}{}", self.url, path))
+            .header("X-Plex-Token", &self.token)
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            return Err(format!("Plex lyrics returned {}", resp.status()).into());
+        }
+        let body = resp.text().await?;
+        if body.trim().is_empty() {
+            return Ok(None);
+        }
+
+        Ok(Some(split_lyric_body(body)))
     }
 
     pub async fn fetch_cover_art(
@@ -2444,5 +2544,40 @@ mod tests {
         assert_eq!(q.is_lossless, Some(true));
         assert_eq!(q.sample_rate, Some(44_100));
         assert_eq!(q.bit_depth, Some(24));
+    }
+
+    /// Plex does not say whether a lyric file is timed, so the file must.
+    ///
+    /// The failure is silent either way round: an LRC read as plain stops the
+    /// reader following the deck, and plain text read as an LRC gives a timed
+    /// lyric with no usable cues.
+    #[test]
+    fn a_plex_lyric_is_timed_only_when_it_carries_cues() {
+        let (plain, synced) = super::split_lyric_body("[00:12.30] first\n[00:15.00] second".into());
+        assert!(plain.is_none());
+        assert!(synced.unwrap().contains("[00:12.30] first"));
+
+        let (plain, synced) = super::split_lyric_body("first\nsecond".into());
+        assert!(synced.is_none(), "no cues, so not timed");
+        assert_eq!(plain.unwrap(), "first\nsecond");
+    }
+
+    /// An LRC's metadata tags are not cues, and its words are still timed.
+    ///
+    /// `[ar:Artist]` opens a great many real `.lrc` files. Counting it as a cue
+    /// would call a plain lyric timed; requiring *every* line to be cued would
+    /// call this real LRC plain. Both are wrong, and this is the case that
+    /// tells the two rules apart.
+    #[test]
+    fn lrc_metadata_tags_are_not_mistaken_for_cues() {
+        let lrc = "[ar:Halden Vale]\n[ti:Brake Light Country]\n[00:09.10] the words";
+        let (plain, synced) = super::split_lyric_body(lrc.into());
+        assert!(plain.is_none(), "a real LRC with tags above the words is still timed");
+        assert!(synced.unwrap().contains("[00:09.10] the words"));
+
+        // Tags and nothing else is not a timed lyric.
+        let (plain, synced) = super::split_lyric_body("[ar:Halden Vale]\nthe words".into());
+        assert!(synced.is_none(), "tags alone are not cues");
+        assert_eq!(plain.unwrap(), "[ar:Halden Vale]\nthe words");
     }
 }

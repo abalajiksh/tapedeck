@@ -1,5 +1,5 @@
 mod admin;
-mod artwork;
+pub(crate) mod artwork;
 pub mod auth;
 pub mod chains;
 mod connections;

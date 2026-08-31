@@ -383,9 +383,13 @@
 	</div>
 
 	<p class="foot">
-		Words via {doc.source ?? 'LRCLIB'}. Cached here so a note can point at a line — they are the
-		provider's text, and they never leave this instance: not in a backup, not in an export, not to
-		anyone you have patched with.
+		<!-- Never defaulted to "LRCLIB": provenance is recorded now, and a row
+		     from before it was says so rather than claiming a source nothing
+		     can vouch for. Naming the *server* matters — words off your own
+		     Plex are the pressing you played, with your tagging in them. -->
+		{#if doc.source}Words via {doc.source}.{:else}Where these words came from was not recorded.{/if}
+		Cached here so a note can point at a line — they are not ours, and they never leave this
+		instance: not in a backup, not in an export, not to anyone you have patched with.
 		{#if !doc.timed && spoken.length}
 			This lyric is untimed, so the ribbon is your place in the words rather than in the track —
 			↑ and ↓ move it.

@@ -1040,6 +1040,21 @@ async fn lyrics_for_track(
         base
     };
 
+    // Nothing held yet: try the user's own library before answering. Free —
+    // their server, no rate limit — and it is the whole point of the tier: they
+    // tag their albums, so the words are usually right there while the LRCLIB
+    // trickle is still hours away from this track.
+    //
+    // Only when the cache has *nothing*. A stored `Missing` means LRCLIB was
+    // asked and had none, which says nothing about their library, so that is
+    // retried too — but a stored lyric is never re-fetched on a page load.
+    if !matches!(
+        lyrics.cached(&q.artist, &q.title).await,
+        Some(crate::lyrics::Found::Lyrics { .. }) | Some(crate::lyrics::Found::Instrumental)
+    ) {
+        crate::enrich::lyrics_from_library_now(&state.db, &lyrics, &q.artist, &q.title).await;
+    }
+
     let body = match lyrics.cached(&q.artist, &q.title).await {
         Some(crate::lyrics::Found::Lyrics { plain, synced, language }) => {
             let lines = crate::lyrics::parse_lines(plain.as_deref(), synced.as_deref());
@@ -1064,8 +1079,13 @@ async fn lyrics_for_track(
                     "plain": plain,
                     "synced": synced,
                     "edited": lyrics.is_edited(&q.artist, &q.title).await,
-                    // Shown wherever the words are, because they are not ours.
-                    "source": "LRCLIB",
+                    // Shown wherever the words are, because they are not ours
+                    // — and *which* not-ours matters: "your Plex" says these
+                    // are the pressing you played with your own tagging in it,
+                    // where "LRCLIB" says a stranger uploaded them. A row from
+                    // before provenance was recorded says so rather than
+                    // claiming a source it cannot vouch for.
+                    "source": lyrics.source_of(&q.artist, &q.title).await,
                 }),
             )
         }

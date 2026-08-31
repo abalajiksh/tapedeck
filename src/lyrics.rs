@@ -257,7 +257,8 @@ impl LyricsClient {
                 language TEXT,                -- by script, NULL for Latin text
                 found INTEGER NOT NULL,       -- 0 = LRCLIB has nothing (yet)
                 fetched_at INTEGER NOT NULL,
-                edited INTEGER NOT NULL DEFAULT 0  -- corrected here; a fetch must not overwrite
+                edited INTEGER NOT NULL DEFAULT 0,  -- corrected here; a fetch must not overwrite
+                source TEXT                        -- who these words came from
             );
             "#,
         )
@@ -271,6 +272,14 @@ impl LyricsClient {
             sqlx::query("ALTER TABLE lyrics_cache ADD COLUMN edited INTEGER NOT NULL DEFAULT 0")
                 .execute(&self.pool)
                 .await;
+        // Same again for provenance. A row written before this column existed
+        // came from LRCLIB, because that was the only source — but it is left
+        // NULL rather than backfilled to say so, since "we did not record it"
+        // and "we know it was LRCLIB" are different claims and the reader can
+        // say the first honestly.
+        let _ = sqlx::query("ALTER TABLE lyrics_cache ADD COLUMN source TEXT")
+            .execute(&self.pool)
+            .await;
         Ok(())
     }
 
@@ -305,12 +314,16 @@ impl LyricsClient {
         // this track, and re-asking LRCLIB would undo the answer.
         sqlx::query(
             "INSERT INTO lyrics_cache
-                (track_key, lrclib_id, instrumental, plain, synced, language, found, fetched_at, edited)
-             VALUES (?, NULL, 0, ?, ?, ?, 1, ?, 1)
+                (track_key, lrclib_id, instrumental, plain, synced, language, found, fetched_at, edited, source)
+             VALUES (?, NULL, 0, ?, ?, ?, 1, ?, 1, 'You')
              ON CONFLICT(track_key) DO UPDATE SET
                 plain = excluded.plain, synced = excluded.synced,
                 language = excluded.language, instrumental = 0, found = 1,
-                fetched_at = excluded.fetched_at, edited = 1",
+                fetched_at = excluded.fetched_at, edited = 1,
+                -- The words are yours now. Leaving the old provenance would
+                -- have the reader credit a server for something typed here,
+                -- which is a small lie about whose text it is.
+                source = 'You'",
         )
         .bind(&key)
         .bind(&plain)
@@ -320,6 +333,78 @@ impl LyricsClient {
         .execute(&self.pool)
         .await?;
         Ok(Found::Lyrics { plain, synced, language })
+    }
+
+    /// Store words that came out of the user's own library.
+    ///
+    /// **Not `set_words`**, which is for a correction and sets `edited`. These
+    /// are fetched, so a later fetch may legitimately replace them — what must
+    /// not happen is a fetch of any kind overwriting something a person typed,
+    /// which is why this refuses a row holding `edited` exactly as
+    /// [`Self::remember`] does.
+    ///
+    /// `source` is recorded rather than assumed: the reader says where a lyric
+    /// came from, and "your Plex" is a materially different statement from
+    /// "LRCLIB" — one of them is the pressing you actually played.
+    pub async fn remember_library(
+        &self,
+        artist: &str,
+        title: &str,
+        plain: Option<String>,
+        synced: Option<String>,
+        source: &str,
+    ) -> Result<Found, sqlx::Error> {
+        let plain = plain.map(|t| t.trim().to_string()).filter(|t| !t.is_empty());
+        let synced = synced.map(|t| t.trim().to_string()).filter(|t| !t.is_empty());
+        let language = language_of(plain.as_deref(), synced.as_deref()).map(str::to_string);
+        let found = Found::Lyrics {
+            plain: plain.clone(),
+            synced: synced.clone(),
+            language: language.clone(),
+        };
+        if self.is_edited(artist, title).await {
+            return Ok(found);
+        }
+        let key = Self::track_key(artist, title);
+        let now = crate::db::Database::now_secs();
+        sqlx::query(
+            "INSERT INTO lyrics_cache
+                (track_key, lrclib_id, instrumental, plain, synced, language, found, fetched_at, edited, source)
+             VALUES (?, NULL, 0, ?, ?, ?, 1, ?, 0, ?)
+             ON CONFLICT(track_key) DO UPDATE SET
+                plain = excluded.plain, synced = excluded.synced,
+                language = excluded.language, instrumental = 0, found = 1,
+                fetched_at = excluded.fetched_at, source = excluded.source
+              WHERE lyrics_cache.edited = 0",
+        )
+        .bind(&key)
+        .bind(&plain)
+        .bind(&synced)
+        .bind(&language)
+        .bind(now)
+        .bind(source)
+        .execute(&self.pool)
+        .await?;
+        Ok(found)
+    }
+
+    /// Where a track's stored words came from, for the line the reader prints
+    /// under them.
+    ///
+    /// `None` for a row written before provenance was recorded. Reported as
+    /// unknown rather than assumed to be LRCLIB: it almost certainly was, but
+    /// "we did not record it" is the true statement and the reader can make it.
+    pub async fn source_of(&self, artist: &str, title: &str) -> Option<String> {
+        let key = Self::track_key(artist, title);
+        sqlx::query_as::<_, (Option<String>,)>(
+            "SELECT source FROM lyrics_cache WHERE track_key = ?",
+        )
+        .bind(&key)
+        .fetch_optional(&self.pool)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|r| r.0)
     }
 
     /// Whether these words were corrected here rather than fetched.

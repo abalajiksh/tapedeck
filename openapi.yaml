@@ -26,7 +26,7 @@ openapi: 3.1.0
 
 info:
   title: Tapedeck
-  version: 0.103.0
+  version: 0.104.0
   summary: Self-hosted scrobbler and listening journal.
   description: |
     Tapedeck ingests listens, enriches them with MusicBrainz metadata, stores
@@ -7433,9 +7433,15 @@ paths:
         `[[line:A:3:12]]` — and skipping empties would renumber every line after
         one, silently re-pointing every quote already written.
 
-        Reads only what is stored and **never triggers a fetch**. LRCLIB is free
-        and asks callers to be considerate; the backfill is what paces that, and
-        a screen that fetched on open would let a page refresh drive the rate.
+        **Never triggers an LRCLIB fetch.** That service is free and asks callers
+        to be considerate; the backfill is what paces it, and a screen that
+        fetched on open would let a page refresh drive the rate.
+
+        It *does* reach the user's own media server when nothing is stored yet.
+        Their Plex or Jellyfin has no rate limit and no shared budget to spend,
+        and they tag their own albums — so those words are usually right there
+        while the LRCLIB trickle is still hours from this track. Only when the
+        cache holds nothing: a stored lyric is never re-fetched on a page load.
 
         Three answers, all real: lines, `instrumental: true` (a track with no
         words, which is not a gap), and an empty list.
@@ -7479,7 +7485,18 @@ paths:
                       later lookup will not overwrite them.
                   plain: { type: string, nullable: true, description: The stored text, for correcting it by hand. }
                   synced: { type: string, nullable: true }
-                  source: { type: string, example: LRCLIB }
+                  source:
+                    type: [string, 'null']
+                    description: >
+                      Where these words came from — `Plex`, `Jellyfin`, `Emby`,
+                      `LRCLIB`, or `You` for a correction typed here. **Null when
+                      it was not recorded**, which is a row written before
+                      provenance was kept: reported as unknown rather than
+                      assumed to be LRCLIB, because "we did not record it" is the
+                      true statement. Worth showing wherever the words are —
+                      words off the user's own server are the pressing they
+                      played, with their own tagging in them.
+                    example: Plex
                   tracklist:
                     type: array
                     description: >-

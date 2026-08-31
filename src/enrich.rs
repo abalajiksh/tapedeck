@@ -91,6 +91,21 @@ pub async fn backfill_languages(
 /// song, so a track played fifty times is one request. A 429 **stops the pass**
 /// — the docs say a client that ignores `Retry-After` may be banned, and that
 /// would cost every Tapedeck instance the feature rather than only this one.
+/// Fetch lyrics for the tracks whose language is still a shrug.
+///
+/// **Two tiers, and the user's own library goes first.** They tag their own
+/// albums, so their words are the right pressing with their own corrections in
+/// them — the vision rule that the user's own library beats any provider, in
+/// the one place where the provider is a free service being asked nicely.
+/// A library hit costs no LRCLIB request and no politeness budget, so a
+/// well-tagged library makes this pass nearly free.
+///
+/// **The one exception is timing** (Ashwin's call, 2026-08-31): a tagged lyric
+/// is often plain text where LRCLIB has a timed one, and only a timed lyric can
+/// follow the deck in the reader. So a library lyric that is *already timed*
+/// settles it outright; a plain one still asks LRCLIB, and loses only if LRCLIB
+/// has cues. A person's own correction beats both, which `remember_library`
+/// and `remember` both enforce by refusing a row holding `edited`.
 pub async fn backfill_lyrics(
     db: &Database,
     lyrics: &crate::lyrics::LyricsClient,
@@ -105,47 +120,269 @@ pub async fn backfill_lyrics(
         Err(_) => return 0,
     };
 
+    // Where each of them sits in the user's own servers: one bounded scan for
+    // the whole batch rather than a lookup per track.
+    let keys: Vec<String> = candidates.iter().map(|c| c.key.clone()).collect();
+    let refs = db.library_refs_for_tracks(&keys).await.unwrap_or_default();
+    let mut servers = LibraryClients::default();
+
     let mut spent = 0i64;
     let mut done = 0usize;
-    for (title, artist, album, duration, _plays) in candidates {
-        let found = match lyrics.cached(&artist, &title).await {
-            Some(f) => f,
-            None => {
-                if spent >= budget {
-                    break;
+    for cand in candidates {
+        let crate::db::LanguageCandidate { key, title, artist, album, duration, .. } = cand;
+
+        // Already answered — for or against — costs nothing to re-read.
+        if let Some(f) = lyrics.cached(&artist, &title).await {
+            if let Some(lang) = language_from(&f) {
+                if db.set_track_language(&artist, &title, &lang, "lyrics").await.is_ok() {
+                    done += 1;
                 }
-                spent += 1;
-                match lyrics.fetch(&artist, &title, album.as_deref(), duration).await {
-                    Ok(f) => f,
-                    Err(crate::lyrics::LyricsError::RateLimited(secs)) => {
-                        // Stop, rather than sleep through it holding the budget
-                        // open. The next tick is a minute away.
-                        tracing::warn!("🎤 LRCLIB asked us to wait {secs}s — pausing lyrics until the next pass");
-                        break;
+            }
+            continue;
+        }
+
+        // Tier one: their own library. No budget, no rate limit.
+        let mut from_library: Option<Found> = None;
+        if let Some(r) = refs.get(&key) {
+            if let Some((plain, synced)) = servers.fetch(db, r).await {
+                let timed = synced.is_some();
+                match lyrics
+                    .remember_library(&artist, &title, plain, synced, library_label(&r.source_name))
+                    .await
+                {
+                    Ok(f) => {
+                        // A timed lyric of their own settles it: nothing LRCLIB
+                        // could return would be preferred, so it is not asked.
+                        if timed {
+                            if let Some(lang) = language_from(&f) {
+                                if db
+                                    .set_track_language(&artist, &title, &lang, "lyrics")
+                                    .await
+                                    .is_ok()
+                                {
+                                    done += 1;
+                                }
+                            }
+                            continue;
+                        }
+                        from_library = Some(f);
                     }
-                    Err(e) => {
-                        tracing::debug!("🎤 lyrics lookup failed for {artist} — {title}: {e}");
-                        continue;
+                    Err(e) => tracing::debug!("🎤 could not store library lyrics: {e}"),
+                }
+            }
+        }
+
+        // Tier two: LRCLIB, which is the rate-limited one and therefore the one
+        // the budget is for.
+        if spent >= budget {
+            // Their plain words are already stored; stopping here loses nothing
+            // but the chance of finding cues, which the next pass can still do.
+            match &from_library {
+                Some(f) => {
+                    if let Some(lang) = language_from(f) {
+                        if db.set_track_language(&artist, &title, &lang, "lyrics").await.is_ok() {
+                            done += 1;
+                        }
+                    }
+                    continue;
+                }
+                // Nothing from the library and no budget left: every candidate
+                // after this one is in the same position, so stop the pass.
+                None => break,
+            }
+        }
+        spent += 1;
+        let found = match lyrics.fetch(&artist, &title, album.as_deref(), duration).await {
+            Ok(f) => f,
+            Err(crate::lyrics::LyricsError::RateLimited(secs)) => {
+                // Stop, rather than sleep through it holding the budget open.
+                // The next tick is a minute away.
+                tracing::warn!(
+                    "🎤 LRCLIB asked us to wait {secs}s — pausing lyrics until the next pass"
+                );
+                break;
+            }
+            Err(e) => {
+                tracing::debug!("🎤 lyrics lookup failed for {artist} — {title}: {e}");
+                // Their plain words still stand; `fetch` wrote nothing.
+                if let Some(f) = &from_library {
+                    if let Some(lang) = language_from(f) {
+                        let _ = db.set_track_language(&artist, &title, &lang, "lyrics").await;
                     }
                 }
+                continue;
             }
         };
 
-        let language = match &found {
-            Found::Instrumental => Some(crate::language::INSTRUMENTAL.to_string()),
-            Found::Lyrics { language, .. } => language.clone(),
-            Found::Missing => None,
+        // **The whole of the ordering rule, in one condition.** LRCLIB only
+        // displaces their own words when it brings cues they did not have —
+        // otherwise `fetch` has already been refused the write, because
+        // `remember` will not overwrite a row it did not fetch itself... which
+        // it would, so the library's words are put back deliberately.
+        let resolved = match (&from_library, &found) {
+            (Some(lib), Found::Lyrics { synced: Some(_), .. }) => {
+                let _ = lib; // LRCLIB has cues and theirs did not: cues win.
+                found.clone()
+            }
+            (Some(lib), _) => {
+                // Nothing better came back. Restore their words, which `fetch`
+                // has just written over with a worse answer.
+                let (plain, synced) = match lib {
+                    Found::Lyrics { plain, synced, .. } => (plain.clone(), synced.clone()),
+                    _ => (None, None),
+                };
+                let src =
+                    refs.get(&key).map(|r| library_label(&r.source_name)).unwrap_or("Library");
+                let _ = lyrics.remember_library(&artist, &title, plain, synced, src).await;
+                lib.clone()
+            }
+            (None, _) => found.clone(),
         };
-        // No language is not a failure and not a reason to write anything: the
-        // row keeps whatever it had, and the MusicBrainz tier or the default
-        // still gets its turn.
-        if let Some(lang) = language {
+
+        if let Some(lang) = language_from(&resolved) {
             if db.set_track_language(&artist, &title, &lang, "lyrics").await.is_ok() {
                 done += 1;
             }
         }
     }
     done
+}
+
+/// Fetch one track's lyrics from the user's own library, if it is in one.
+///
+/// The on-demand half of the two tiers: the backfill fills the cache in the
+/// background, and this covers a track somebody opens the reader on before the
+/// trickle has reached it. Their own server has none of the constraints that
+/// make LRCLIB a trickle — no rate limit, no politeness budget, no shared
+/// service to be considerate of — so asking it on a page load is fair where
+/// asking LRCLIB would not be.
+///
+/// Returns whether anything was stored, so the caller can re-read the cache.
+pub async fn lyrics_from_library_now(
+    db: &Database,
+    lyrics: &crate::lyrics::LyricsClient,
+    artist: &str,
+    title: &str,
+) -> bool {
+    let Ok(Some(r)) = db.library_ref_for_track(title, artist).await else {
+        return false;
+    };
+    let mut servers = LibraryClients::default();
+    let Some((plain, synced)) = servers.fetch(db, &r).await else {
+        return false;
+    };
+    match lyrics.remember_library(artist, title, plain, synced, library_label(&r.source_name)).await
+    {
+        Ok(found) => {
+            if let Some(lang) = language_from(&found) {
+                let _ = db.set_track_language(artist, title, &lang, "lyrics").await;
+            }
+            true
+        }
+        Err(e) => {
+            tracing::debug!("🎤 could not store library lyrics: {e}");
+            false
+        }
+    }
+}
+
+/// The language a lookup concluded, or `None` when it concluded nothing.
+///
+/// No language is not a failure and not a reason to write anything: the row
+/// keeps whatever it had, and the MusicBrainz tier or the default still gets
+/// its turn.
+fn language_from(found: &crate::lyrics::Found) -> Option<String> {
+    match found {
+        crate::lyrics::Found::Instrumental => Some(crate::language::INSTRUMENTAL.to_string()),
+        crate::lyrics::Found::Lyrics { language, .. } => language.clone(),
+        crate::lyrics::Found::Missing => None,
+    }
+}
+
+/// What to call a server's lyrics in the reader. Their name, not "Library" —
+/// "your Plex" is a different statement from "LRCLIB" and worth making.
+fn library_label(source_name: &str) -> &'static str {
+    match source_name.to_ascii_lowercase().as_str() {
+        "plex" => "Plex",
+        "jellyfin" => "Jellyfin",
+        "emby" => "Emby",
+        _ => "Library",
+    }
+}
+
+/// Media-server clients built once per pass and reused.
+///
+/// Several tracks in a batch usually come off the *same* server, and building a
+/// client means reading and decrypting its credentials. A source that has gone
+/// away is remembered as absent so it is not looked up again on every track.
+#[derive(Default)]
+struct LibraryClients {
+    seen: std::collections::HashMap<i64, Option<(String, String, String)>>,
+}
+
+impl LibraryClients {
+    /// `(kind, url, credential)` for a source, or `None` if it cannot be used.
+    async fn creds(
+        &mut self,
+        db: &Database,
+        source_ref: i64,
+        user_id: i64,
+    ) -> Option<&(String, String, String)> {
+        if !self.seen.contains_key(&source_ref) {
+            let got = match db.get_source(user_id, source_ref).await {
+                Ok(Some(src)) if src.enabled => {
+                    let kind = src.kind.to_ascii_lowercase();
+                    let cred = match kind.as_str() {
+                        "jellyfin" | "emby" => src.credential("api_key"),
+                        _ => src.credential("token"),
+                    };
+                    cred.map(|c| (kind, src.url.clone(), c))
+                }
+                _ => None,
+            };
+            self.seen.insert(source_ref, got);
+        }
+        self.seen.get(&source_ref).and_then(|o| o.as_ref())
+    }
+
+    async fn fetch(
+        &mut self,
+        db: &Database,
+        r: &crate::db::LibraryRef,
+    ) -> Option<(Option<String>, Option<String>)> {
+        let item = crate::server::artwork::remote_item_id(&r.source_name, &r.source_id)?;
+        let (kind, url, cred) = self.creds(db, r.source_ref, r.user_id).await?.clone();
+        let got = match kind.as_str() {
+            "jellyfin" => {
+                crate::sources::mediabrowser::MediaBrowserSource::jellyfin(url, cred, String::new())
+                    .fetch_lyrics(&item)
+                    .await
+            }
+            "emby" => {
+                crate::sources::mediabrowser::MediaBrowserSource::emby(url, cred, String::new())
+                    .fetch_lyrics(&item)
+                    .await
+            }
+            "plex" => {
+                crate::sources::plex::PlexSource::with_filters(
+                    url,
+                    cred,
+                    crate::sources::plex::PlexFilters::default(),
+                )
+                .fetch_lyrics(&item)
+                .await
+            }
+            _ => return None,
+        };
+        match got {
+            Ok(v) => v,
+            Err(e) => {
+                // A server that is off is an ordinary state, not an incident.
+                tracing::debug!("🎤 library lyrics unavailable from {}: {e}", r.source_name);
+                None
+            }
+        }
+    }
 }
 
 /// Resolve release years for up to `batch` listens, using at most `mb_budget`

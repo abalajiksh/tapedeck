@@ -6823,7 +6823,7 @@ impl Database {
     pub async fn tracks_wanting_language(
         &self,
         limit: i64,
-    ) -> Result<Vec<(String, String, Option<String>, Option<i64>, i64)>, sqlx::Error> {
+    ) -> Result<Vec<LanguageCandidate>, sqlx::Error> {
         // Pass one: the candidates. One scan, no subquery.
         let rows: Vec<(String, String, String, Option<String>, i64)> = sqlx::query_as(&format!(
             "SELECT LOWER(TRIM(title)) || CHAR(31) || LOWER(TRIM(artist)) AS k,
@@ -6877,10 +6877,114 @@ impl Database {
 
         Ok(rows
             .into_iter()
-            .map(|(k, title, artist, album, plays)| {
-                (title, artist, album, best.get(&k).map(|(_, d)| *d), plays)
+            .map(|(k, title, artist, album, plays)| LanguageCandidate {
+                duration: best.get(&k).map(|(_, d)| *d),
+                key: k,
+                title,
+                artist,
+                album,
+                plays,
             })
             .collect())
+    }
+
+    /// Where one track sits in a library, by name.
+    ///
+    /// The batch version above is what the backfill uses. This is for the
+    /// reader opening on a track nothing is cached for — one query on a
+    /// deliberate press, never per row.
+    ///
+    /// **Both sides are folded by SQLite**, so no Rust `to_lowercase` gets to
+    /// disagree with its ASCII-only `LOWER` on an accented title.
+    ///
+    /// Deliberately no `ORDER BY`: it would force the whole scan, where
+    /// `LIMIT 1` alone lets SQLite stop at the first match. Any listen of the
+    /// track gives a usable item id, and if that one has since been removed
+    /// from the library the fetch simply finds nothing — which is the same
+    /// answer as the track being untagged.
+    pub async fn library_ref_for_track(
+        &self,
+        title: &str,
+        artist: &str,
+    ) -> Result<Option<LibraryRef>, sqlx::Error> {
+        sqlx::query_as::<_, (i64, i64, String, String, i64)>(
+            "SELECT user_id, source_ref, source_id, source_name, timestamp
+               FROM scrobbles
+              WHERE source_ref IS NOT NULL
+                AND LOWER(source_name) IN ('plex', 'jellyfin', 'emby')
+                AND LOWER(TRIM(title)) = LOWER(TRIM(?))
+                AND LOWER(TRIM(artist)) = LOWER(TRIM(?))
+              LIMIT 1",
+        )
+        .bind(title)
+        .bind(artist)
+        .fetch_optional(&self.pool)
+        .await
+        .map(|o| {
+            o.map(|(user_id, source_ref, source_id, source_name, timestamp)| LibraryRef {
+                user_id,
+                source_ref,
+                source_id,
+                source_name,
+                timestamp,
+            })
+        })
+    }
+
+    /// Where a track can be found in the user's own libraries, for the
+    /// candidates in hand.
+    ///
+    /// **Keyed on the string SQLite computed**, never one folded again in Rust:
+    /// `LOWER` here is ASCII-only, so a Rust `to_lowercase` disagrees with it on
+    /// every accented title — and would silently miss exactly the non-Latin
+    /// catalogue this queue exists to serve. `LanguageCandidate::key` came out
+    /// of the query above, and goes straight back in.
+    ///
+    /// One scan for the whole batch, folded in Rust — never a lookup per track,
+    /// which on a `LOWER(TRIM(…))` predicate is a full scan each and is the
+    /// shape that took this instance down.
+    ///
+    /// The newest listen wins: a track re-ripped or re-tagged is most likely to
+    /// be found under the id it carried last.
+    pub async fn library_refs_for_tracks(
+        &self,
+        keys: &[String],
+    ) -> Result<HashMap<String, LibraryRef>, sqlx::Error> {
+        let mut out: HashMap<String, LibraryRef> = HashMap::new();
+        if keys.is_empty() {
+            return Ok(out);
+        }
+        for chunk in keys.chunks(DURATION_KEY_CHUNK) {
+            let placeholders = vec!["?"; chunk.len()].join(",");
+            let sql = format!(
+                "SELECT LOWER(TRIM(title)) || CHAR(31) || LOWER(TRIM(artist)) AS k,
+                        user_id, source_ref, source_id, source_name, timestamp
+                   FROM scrobbles
+                  WHERE source_ref IS NOT NULL
+                    AND LOWER(source_name) IN ('plex', 'jellyfin', 'emby')
+                    AND LOWER(TRIM(title)) || CHAR(31) || LOWER(TRIM(artist))
+                        IN ({placeholders})"
+            );
+            let mut q = sqlx::query_as::<_, (String, i64, i64, String, String, i64)>(&sql);
+            for k in chunk {
+                q = q.bind(k);
+            }
+            for (k, user_id, source_ref, source_id, source_name, ts) in
+                q.fetch_all(&self.pool).await?
+            {
+                let e = out.entry(k).or_insert(LibraryRef {
+                    user_id,
+                    source_ref,
+                    source_id: source_id.clone(),
+                    source_name: source_name.clone(),
+                    timestamp: ts,
+                });
+                if ts > e.timestamp {
+                    *e = LibraryRef { user_id, source_ref, source_id, source_name, timestamp: ts };
+                }
+            }
+        }
+        Ok(out)
     }
 
     /// Write a language onto every listen of one track, saying where it came
@@ -18028,6 +18132,35 @@ pub struct GearHours {
     pub hours: f64,
 }
 
+/// A track still wanting a language, and what is known about it.
+///
+/// `key` is the grouping key **as SQLite computed it** — carried rather than
+/// recomputed so a second pass can join on it without a Rust fold disagreeing
+/// with SQLite's ASCII-only `LOWER`.
+#[derive(Debug, Clone)]
+pub struct LanguageCandidate {
+    pub key: String,
+    pub title: String,
+    pub artist: String,
+    pub album: Option<String>,
+    /// The modal running time across this track's listens, for the lyric match.
+    pub duration: Option<i64>,
+    pub plays: i64,
+}
+
+/// Where a track sits in one of the user's own media servers.
+///
+/// `source_ref` is which server, which is what makes this work when somebody
+/// runs two of the same kind — the same reason the artwork proxy reads it.
+#[derive(Debug, Clone)]
+pub struct LibraryRef {
+    pub user_id: i64,
+    pub source_ref: i64,
+    pub source_id: String,
+    pub source_name: String,
+    pub timestamp: i64,
+}
+
 #[derive(Debug, FromRow, serde::Serialize)]
 pub struct EquipmentRow {
     pub id: i64,
@@ -24511,7 +24644,15 @@ mod tests {
         );
         let mut old: Vec<(String, String, Option<String>, Option<i64>, i64)> =
             sqlx::query_as(&old_sql).bind(50i64).fetch_all(&db.pool).await.unwrap();
-        let mut new = db.tracks_wanting_language(50).await.unwrap();
+        // Flattened to the shape the old statement returned, so the comparison
+        // is about the answer rather than about the struct that now carries it.
+        let mut new: Vec<(String, String, Option<String>, Option<i64>, i64)> = db
+            .tracks_wanting_language(50)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|c| (c.title, c.artist, c.album, c.duration, c.plays))
+            .collect();
         old.sort();
         new.sort();
         assert_eq!(new, old, "the rewrite must return what the old statement returned");

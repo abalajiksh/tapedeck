@@ -52,7 +52,7 @@ fn not_found(msg: &str) -> Response {
 /// * `navidrome-<mediaFileId>-<submissionTime>` — ids are UUIDs, full of
 ///   dashes, and the suffix is a single numeric segment. This one must split
 ///   from the right.
-fn remote_item_id(source_name: &str, source_id: &str) -> Option<String> {
+pub(crate) fn remote_item_id(source_name: &str, source_id: &str) -> Option<String> {
     let (prefix, from_left) = match source_name {
         "navidrome" => ("navidrome-", false),
         "Plex" | "plex" => ("plex-", true),

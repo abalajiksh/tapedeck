@@ -139,7 +139,7 @@
 				<button class="chevbtn" on:click={toggle} aria-label="Collapse lyrics">
 					<span class="chev up">▾</span><span class="lbl">Lyrics</span>
 				</button>
-				<span class="badge">Timed · {doc?.source ?? 'LRCLIB'}</span>
+				<span class="badge">Timed{doc?.source ? ` · ${doc.source}` : ''}</span>
 				<span style="flex:1;"></span>
 				<span class="pos">line {current.n} / {lines.length}</span>
 				<a class="out" href={readerHref(current.n)} title="Open the reader" aria-label="Open the reader">↗</a>
