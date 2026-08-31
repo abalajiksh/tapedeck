@@ -142,6 +142,34 @@
 		steering = true;
 	}
 
+	/** Hand the cursor back to the deck.
+	 *
+	 *  `steering` had no way out: pointing at a line set it, and **arriving with
+	 *  `?line=` set it too** — so opening the reader from the deck strip, or
+	 *  from a `[[line:…]]` chip, pinned the words at that line and the only way
+	 *  to get them moving again was to edit the URL. Reported exactly that way.
+	 *
+	 *  Arriving steered is still right: you clicked a particular line and being
+	 *  yanked off it by the playhead would be worse. What was missing is the way
+	 *  back, and it is one press or the Escape key. */
+	function followDeck() {
+		steering = false;
+		// Jump straight to where the music is rather than waiting for the next
+		// cue to pass, which on a long line is an uncomfortable few seconds of
+		// looking like nothing happened.
+		if (onDeck && doc) {
+			const at = $deck.position;
+			let n: number | null = null;
+			for (const l of doc.lines) if (l.at != null && l.at <= at + 0.25) n = l.n;
+			if (n != null) cursor = n;
+		}
+	}
+
+	/** Whether handing it back is on offer: the deck is on this track and
+	 *  reporting a real playhead, and we are not already following. An
+	 *  estimated position must not drive a highlight that looks measured. */
+	$: canFollow = onDeck && ($deck.track?.position_known ?? false) && steering;
+
 	function step(by: number) {
 		if (!spoken.length) return;
 		const next = at < 0 ? 0 : at + by;
@@ -154,7 +182,14 @@
 		if (t && /^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName)) return;
 		if (e.key === 'ArrowDown' || e.key === 'ArrowRight') { e.preventDefault(); step(1); }
 		else if (e.key === 'ArrowUp' || e.key === 'ArrowLeft') { e.preventDefault(); step(-1); }
-		else if (e.key === 'Escape') close();
+		// Escape unwinds the innermost state first: steering with the arrows is
+		// something to get *out of* before leaving the page, and a keyboard user
+		// who has just stepped through a verse wants the music back rather than
+		// the dashboard. It still closes when there is nothing to hand back.
+		else if (e.key === 'Escape') {
+			if (canFollow) followDeck();
+			else close();
+		}
 	}
 
 	function close() {
@@ -318,7 +353,16 @@
 					{#if doc.timed}<span class="wpill good">Timed</span>{:else if spoken.length}<span class="wpill">Untimed</span>{/if}
 					{#if doc.language}<span class="wpill">{doc.language}</span>{/if}
 					{#if doc.edited}<span class="wpill">corrected here</span>{/if}
-					{#if deckOn}<span class="wpill good"><span class="blip"></span>Following</span>{/if}
+					{#if deckOn}
+						<span class="wpill good"><span class="blip"></span>Following</span>
+					{:else if canFollow}
+						<!-- The way back. Drawn only when the deck really is on this
+						     track with a measured playhead, so it never offers to
+						     follow something it cannot. -->
+						<button class="wpill follow" on:click={followDeck} title="Follow the deck again (Esc)">
+							<span class="blip"></span>Follow the deck
+						</button>
+					{/if}
 				</div>
 
 				<div class="wrule"></div>
@@ -398,6 +442,27 @@
 {/if}
 
 <style>
+	/* The pill as a control. Same size and shape as its neighbours so the row
+	   still reads as a row of pills, with the accent and a pointer to say this
+	   one does something. */
+	/* Literal, like every other colour on this stage. The first version used
+	   `var(--td-accent)` — in the one file whose own note says a token here
+	   follows the theme onto a ground that does not. It happens to be the same
+	   orange in both today, which is exactly how that trap survives review. */
+	.wpill.follow {
+		border-color: rgba(198, 113, 57, 0.75);
+		color: #d98c4f;
+		cursor: pointer;
+		font: inherit;
+		font-size: 10.5px;
+		font-weight: 700;
+		letter-spacing: 0.05em;
+		text-transform: uppercase;
+	}
+	.wpill.follow:hover,
+	.wpill.follow:focus-visible { background: rgba(198, 113, 57, 0.14); }
+	.wpill.follow .blip { animation: none; }
+
 	/* **Dark in both themes, on purpose**, which is the one screen in this app
 	   where that is true — see the note at the top of this file. Every colour is
 	   therefore literal rather than a token: a token would follow the theme and

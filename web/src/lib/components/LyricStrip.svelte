@@ -136,8 +136,8 @@
 	{:else}
 		<div class="well">
 			<div class="wtop">
-				<button class="chevbtn" on:click={toggle} aria-label="Collapse lyrics">
-					<span class="chev up">▾</span><span class="lbl">Lyrics</span>
+				<button class="chevbtn" on:click={toggle} title="Collapse lyrics" aria-label="Collapse lyrics">
+					<span class="chev up">▾</span><span class="lbl">Hide</span>
 				</button>
 				<span class="badge">Timed{doc?.source ? ` · ${doc.source}` : ''}</span>
 				<span style="flex:1;"></span>
@@ -215,15 +215,27 @@
 	}
 	.well { padding: 11px 14px 12px; }
 	.wtop { display: flex; align-items: center; gap: 9px; margin-bottom: 9px; flex-wrap: wrap; }
+	/* A control, not a label.
+	   This was `background:none; border:none; padding:0` — a bare chevron and
+	   the word "Lyrics", which is exactly what a *heading* looks like. It
+	   worked; nobody could tell it was the way back. Reported as "is there a
+	   way to toggle the lyrics back to minimized". Affordance, not behaviour. */
 	.chevbtn {
 		display: inline-flex;
 		align-items: center;
 		gap: 7px;
-		background: none;
-		border: none;
-		padding: 0;
+		background: transparent;
+		border: 1px solid var(--td-border);
+		border-radius: 999px;
+		padding: 3px 10px 3px 8px;
 		cursor: pointer;
 		font-family: inherit;
+		color: inherit;
+	}
+	.chevbtn:hover,
+	.chevbtn:focus-visible {
+		border-color: var(--td-accent);
+		color: var(--td-accent);
 	}
 	.pos { font-size: 10.5px; color: var(--td-muted-3); font-variant-numeric: tabular-nums; }
 	.out {

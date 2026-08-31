@@ -763,6 +763,24 @@
 	 *  keep reporting while you browse the rest of the shelf, so the push reads
 	 *  this one. */
 	$: spinTrack = spinning ? sideTracks(spinning.side, spinRelease)[currentIndex(spinning)] ?? null : null;
+	/** The theatre, for whatever is on the platter.
+	 *
+	 *  Deliberately **no `line` parameter**. Passing one puts the reader into
+	 *  steering, which is right when you clicked a particular line and wrong
+	 *  here: what you want off the shelf is the words moving with the record.
+	 *  The shelf pushes an exact playhead, so the reader picks it up and
+	 *  follows on its own.
+	 *
+	 *  The track's own artist where the tracklist carries one — a compilation
+	 *  side is several artists and the record's name is not the singer's. */
+	$: spinLyricsHref = spinTrack && deckRelease
+		? `/lyrics?${new URLSearchParams({
+				artist: spinTrack.artist || deckRelease.artist || '',
+				title: spinTrack.title,
+				...(deckRelease.title ? { album: deckRelease.title } : {})
+			})}`
+		: null;
+
 	/** Seconds into the current track, not into the side. */
 	$: trackElapsed = (() => {
 		if (!spinning || !spinTrack) return 0;
@@ -1650,6 +1668,11 @@
 				on:click={() => spinning && play(spinning.side, spinning.startedAt, spinning.releaseId)}>
 				{playing ? '…' : spinOver ? 'Record it' : 'Stop & record'}
 			</button>
+			{#if spinLyricsHref}
+				<a class="btn btn-secondary" href={spinLyricsHref} title="Open the lyric theatre for this track">
+					Read the words
+				</a>
+			{/if}
 			<button class="btn btn-secondary" on:click={() => saveSpinning(null)}>Cancel</button>
 		</div>
 	</div>
