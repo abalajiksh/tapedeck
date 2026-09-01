@@ -86,6 +86,14 @@
 		}
 	}
 
+	/** The reader, addressed at a particular line.
+	 *
+	 *  For *pinning*, where the line is the subject. **Not** for the ↗, which
+	 *  opens the theatre live: this strip is showing the deck, so a reader
+	 *  opened from it should follow the deck too — addressing it would pin the
+	 *  words to whatever was playing at the moment of the click, and the next
+	 *  song would leave them behind. That is the bug the live mode exists for,
+	 *  and this link was one of the ways into it. */
 	function readerHref(line?: number): string {
 		const q = new URLSearchParams({ artist, title });
 		if (album) q.set('album', album);
@@ -142,7 +150,7 @@
 				<span class="badge">Timed{doc?.source ? ` · ${doc.source}` : ''}</span>
 				<span style="flex:1;"></span>
 				<span class="pos">line {current.n} / {lines.length}</span>
-				<a class="out" href={readerHref(current.n)} title="Open the reader" aria-label="Open the reader">↗</a>
+				<a class="out" href="/lyrics" title="Open the reader" aria-label="Open the reader">↗</a>
 			</div>
 			<div class="lines">
 				{#each window_ as l (l.n)}

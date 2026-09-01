@@ -1167,6 +1167,25 @@ export interface LyricDoc {
 	source?: string;
 }
 
+/** The reader's whole state for whatever is on the deck.
+ *
+ *  `playing: false` is a normal answer — nothing is on, the theatre says so and
+ *  waits. When something is on, this is a `LyricDoc` with the playhead
+ *  alongside it, so a cold open lands on the right line without waiting for the
+ *  first deck poll. */
+export type LiveLyricDoc =
+	| { playing: false }
+	| (LyricDoc & {
+			playing: true;
+			/** Seconds in, as of the moment the server answered. */
+			position: number;
+			/** Whether that is a measurement. A guess must not drive the
+			 *  highlight — the same distinction the deck itself draws. */
+			position_known: boolean;
+			paused: boolean;
+			duration: number | null;
+	  });
+
 /** One other track of the same record, for the reader's sidebar. */
 export interface LyricSibling {
 	title: string;
@@ -2553,6 +2572,34 @@ class TapedeckAPI {
 		const q = new URLSearchParams({ artist, title });
 		if (album) q.set('album', album);
 		return this.get<LyricDoc>(`/api/v1/lyrics?${q}`);
+	}
+
+	/** The words for whatever is playing, in one request.
+	 *
+	 *  What makes the theatre stateful: it is asked once when the reader opens
+	 *  and again only when the deck's track changes, so the words follow the
+	 *  music without the page being addressed by URL — and without a document
+	 *  this size being pulled every three seconds. */
+	async liveLyrics() {
+		return this.get<LiveLyricDoc>('/api/v1/lyrics/live');
+	}
+
+	/** Look for this track's words now, rather than waiting for the backfill.
+	 *
+	 *  Their own library first, then LRCLIB. Answers with the whole document so
+	 *  the reader can simply replace what it is showing; `unavailable` with a
+	 *  `why` means the upstream asked us to wait, which is not the same as
+	 *  having found nothing and must not be reported as it. */
+	async fetchLyricsNow(body: {
+		artist: string;
+		title: string;
+		album?: string;
+		duration?: number;
+	}) {
+		return this.post<LyricDoc & { already_held?: boolean; unavailable?: boolean; why?: string }>(
+			'/api/v1/lyrics/fetch',
+			body
+		);
 	}
 
 	/** Every track this instance holds words for, as `artist|title` keys.

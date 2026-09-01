@@ -26,7 +26,7 @@ openapi: 3.1.0
 
 info:
   title: Tapedeck
-  version: 0.104.1
+  version: 0.105.0
   summary: Self-hosted scrobbler and listening journal.
   description: |
     Tapedeck ingests listens, enriches them with MusicBrainz metadata, stores
@@ -7596,6 +7596,121 @@ paths:
                     type: boolean
                     description: The count changed, so every quote past the change now points at different words.
         '400': { description: No artist, no title, or no words in it. }
+
+  /api/v1/lyrics/live:
+    get:
+      tags: [Statistics]
+      summary: The words for whatever is on the deck.
+      description: |
+        Scope: `read`.
+
+        The reader's whole state in one request, so the lyric theatre stops
+        being addressed by URL. `GET /api/v1/lyrics` names a track, which is
+        right for a `[[line:...]]` chip and wrong for reading along: the words
+        stayed on whichever song the address named, so the next track left them
+        behind and the only way out was editing the query string.
+
+        The body is a `LyricDoc` with the playhead beside it, so a cold open
+        lands on the right line without waiting for a now-playing poll. Nothing
+        playing is `{ "playing": false }` and a normal answer, not an error.
+
+        **Ask it once per track, not once per poll.** The document carries the
+        tracklist and every pin on the track; a client should watch
+        `GET /api/v1/now-playing` (which it is already polling) and re-ask this
+        only when the track changes.
+      security: [{ sessionCookie: [] }, { apiToken: [read] }]
+      responses:
+        '200':
+          description: The deck's track and its words, or nothing playing.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+                properties:
+                  playing: { type: boolean }
+                  artist: { type: string }
+                  title: { type: string }
+                  album: { type: string, nullable: true }
+                  lines: { type: array, items: { type: object, additionalProperties: true } }
+                  position:
+                    type: integer
+                    description: Seconds in, as of the moment this was answered.
+                  position_known:
+                    type: boolean
+                    description: >-
+                      Whether `position` is a measurement rather than wall-clock
+                      arithmetic. A guess must not drive a highlight that looks
+                      measured.
+                  paused: { type: boolean }
+                  duration: { type: integer, nullable: true }
+
+  /api/v1/lyrics/fetch:
+    post:
+      tags: [Statistics]
+      summary: Look for one track's words now.
+      description: |
+        **Session only.** A token is refused with 401 and its scopes never enter
+        into it: this spends a shared politeness budget at a free service and
+        writes an instance-wide cache, which is not something a scrobble client
+        holding `read` has any business doing.
+
+        The backfill runs at a few tracks a minute, most-played first, which is
+        the right pace for a queue nobody is watching and no use for the track
+        somebody is looking at. This is the button behind that, and it resolves
+        the track exactly as the backfill would: the user's own library first,
+        then LRCLIB, with cues winning.
+
+        **A deliberate press is not a page load**, which is why this may ask
+        LRCLIB where `GET /api/v1/lyrics` may not. It bypasses the 30-day miss
+        tombstone — LRCLIB fills its own gaps, so "nobody had this a fortnight
+        ago" is exactly the answer worth re-asking — but it will not displace
+        words already held: `already_held: true` says so, and
+        `/api/v1/lyrics/matches` is the control for disagreeing with them.
+
+        A rate limit or an unreachable LRCLIB is **200 with `unavailable`**, not
+        a 5xx. Being asked to wait is not this server failing, and reporting it
+        as "nothing found" would be a claim about the track rather than about
+        the request.
+      security: [{ sessionCookie: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [artist, title]
+              properties:
+                artist: { type: string }
+                title: { type: string }
+                album: { type: string }
+                duration:
+                  type: integer
+                  description: >-
+                    Track length in seconds. LRCLIB matches on it, and a
+                    wrong-length record is the usual reason a well-known song
+                    comes back with somebody else's words.
+      responses:
+        '200':
+          description: >-
+            The whole document as it now stands, so the caller can replace what
+            it is showing — or `unavailable` with a `why`.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+                properties:
+                  artist: { type: string }
+                  title: { type: string }
+                  lines: { type: array, items: { type: object, additionalProperties: true } }
+                  already_held:
+                    type: boolean
+                    description: Words were already stored, so nothing was asked.
+                  unavailable: { type: boolean }
+                  why: { type: string }
+        '400': { description: An artist or a title that is blank. }
+        '422': { description: The body is missing `artist` or `title` outright. }
 
   /api/v1/lyrics/matches:
     get:

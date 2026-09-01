@@ -35,7 +35,7 @@
 //! tombstone with a TTL rather than a permanent verdict.
 
 use std::collections::HashMap;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 use sqlx::{Pool, Sqlite};
@@ -47,9 +47,18 @@ use sqlx::{Pool, Sqlite};
 /// that gains lyrics is picked up within a month.
 const MISS_TTL_SECS: i64 = 30 * 24 * 3600;
 
-/// The gap between requests. The docs ask for 200–500ms; the backfill's budget
-/// makes the real rate far slower than this, so it is a floor rather than the
-/// pacing.
+/// The gap between requests.
+///
+/// The docs ask for 200–500ms and for requests to be made sequentially. The
+/// backfill's budget makes the real rate far slower than this, so for that path
+/// it is a floor rather than the pacing — but the backfill is no longer the only
+/// caller. `/api/v1/lyrics/fetch` puts a **button** in front of this, and a
+/// button can be pressed twice in a second, so the gap has to be enforced
+/// *across* callers rather than by each one sleeping on its own.
+///
+/// See [`LyricsClient::pace`]: the sleep is taken under a lock, so two
+/// concurrent callers start their requests at least this far apart instead of
+/// both sleeping 350ms and then firing together.
 const REQUEST_GAP: Duration = Duration::from_millis(350);
 
 /// Bounded like every other outbound call made from inside this process.
@@ -227,6 +236,10 @@ pub struct LyricsClient {
     http: reqwest::Client,
     pool: Pool<Sqlite>,
     base: String,
+    /// When the last outbound request was *started*, so [`Self::pace`] can
+    /// space the next one. `Mutex` rather than an atomic because the wait is
+    /// taken while holding it — that is the whole mechanism.
+    last_request: tokio::sync::Mutex<Option<Instant>>,
 }
 
 impl LyricsClient {
@@ -240,7 +253,7 @@ impl LyricsClient {
         let http = reqwest::Client::builder().user_agent(ua).timeout(TIMEOUT).build()?;
         let base = std::env::var("TAPEDECK_LRCLIB_URL")
             .unwrap_or_else(|_| "https://lrclib.net".to_string());
-        let c = LyricsClient { http, pool, base };
+        let c = LyricsClient { http, pool, base, last_request: tokio::sync::Mutex::new(None) };
         c.init().await?;
         Ok(c)
     }
@@ -523,6 +536,33 @@ impl LyricsClient {
     /// same title. A listen whose source reported no length still gets a
     /// lookup, and the match is simply less certain — which is the same trade
     /// the playlist push makes when it searches by name.
+    /// Wait our turn, and space this request from the last one.
+    ///
+    /// **The wait is taken under the lock**, which is the only part that
+    /// matters: a bare `sleep(REQUEST_GAP)` per caller means two concurrent
+    /// callers both sleep and then fire simultaneously, which is exactly what
+    /// LRCLIB asks clients not to do. Holding it means the second caller starts
+    /// its wait where the first one finished.
+    ///
+    /// This was a per-call sleep while the backfill was the only caller and it
+    /// was sequential, so nothing could overlap. `/api/v1/lyrics/fetch` ended
+    /// that: a person can press a button twice, and a bounded rate that depends
+    /// on nobody clicking quickly is not a bounded rate.
+    async fn pace(&self) {
+        let mut last = self.last_request.lock().await;
+        if let Some(prev) = *last {
+            let since = prev.elapsed();
+            if since < REQUEST_GAP {
+                tokio::time::sleep(REQUEST_GAP - since).await;
+            }
+        } else {
+            // Nothing to space from, but still the documented courtesy gap
+            // before the first request of a run.
+            tokio::time::sleep(REQUEST_GAP).await;
+        }
+        *last = Some(Instant::now());
+    }
+
     pub async fn fetch(
         &self,
         artist: &str,
@@ -544,7 +584,7 @@ impl LyricsClient {
             url.push_str(&format!("&duration={d}"));
         }
 
-        tokio::time::sleep(REQUEST_GAP).await;
+        self.pace().await;
         let resp =
             self.http.get(&url).send().await.map_err(|e| LyricsError::Network(e.to_string()))?;
 
@@ -605,7 +645,7 @@ impl LyricsClient {
             urlencoding::encode(title.trim())
         );
 
-        tokio::time::sleep(REQUEST_GAP).await;
+        self.pace().await;
         let resp =
             self.http.get(&url).send().await.map_err(|e| LyricsError::Network(e.to_string()))?;
 
@@ -655,15 +695,26 @@ impl LyricsClient {
             }
             Some((Found::Missing, _)) => (0, 0, None, None, None, None),
         };
+        // **Say who these words came from.** This wrote no `source` at all when
+        // the column landed in v0.104.0 — only the library path and a hand
+        // correction did — so every lyric fetched from LRCLIB since then read
+        // as *"where these words came from was not recorded"*, and a row whose
+        // library words LRCLIB later displaced with cues kept the **old
+        // server's name** over somebody else's text. Both are the reader
+        // crediting the wrong party, which is the one thing provenance exists
+        // to stop.
+        //
+        // NULL on a miss: nothing was stored, so there is nobody to credit.
+        let source = if found == 1 { Some("LRCLIB") } else { None };
         let _ = sqlx::query(
             "INSERT INTO lyrics_cache
-                (track_key, lrclib_id, instrumental, plain, synced, language, found, fetched_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                (track_key, lrclib_id, instrumental, plain, synced, language, found, fetched_at, source)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
              ON CONFLICT(track_key) DO UPDATE SET
                 lrclib_id = excluded.lrclib_id, instrumental = excluded.instrumental,
                 plain = excluded.plain, synced = excluded.synced,
                 language = excluded.language, found = excluded.found,
-                fetched_at = excluded.fetched_at",
+                fetched_at = excluded.fetched_at, source = excluded.source",
         )
         .bind(&key)
         .bind(id)
@@ -673,6 +724,7 @@ impl LyricsClient {
         .bind(language)
         .bind(found)
         .bind(now)
+        .bind(source)
         .execute(&self.pool)
         .await;
     }
@@ -748,6 +800,81 @@ mod tests {
             )
             .await
             .unwrap()
+    }
+
+    /// Words carry who they came from, and a miss carries nobody.
+    ///
+    /// `source` landed with the library tier and only the library path wrote
+    /// it, so **everything fetched from LRCLIB read as "not recorded"** — and a
+    /// row whose plain library words LRCLIB later displaced with cues kept the
+    /// *server's* name over somebody else's text. Nothing errors either way;
+    /// the reader simply credits the wrong party under words that are not ours,
+    /// which is the whole reason the column exists.
+    #[tokio::test]
+    async fn a_fetched_lyric_says_where_it_came_from() {
+        let c = LyricsClient {
+            http: reqwest::Client::new(),
+            pool: testpool().await,
+            base: "http://127.0.0.1:1".into(),
+            last_request: tokio::sync::Mutex::new(None),
+        };
+        c.init().await.unwrap();
+
+        let found = Found::Lyrics { plain: Some("a line".into()), synced: None, language: None };
+        c.remember("Massive Attack", "Teardrop", Some((&found, Some(7)))).await;
+        assert_eq!(c.source_of("Massive Attack", "Teardrop").await.as_deref(), Some("LRCLIB"));
+
+        // A library lyric names the server it came off, and LRCLIB not having
+        // displaced it must not rewrite that.
+        c.remember_library("Burial", "Archangel", Some("words".into()), None, "Plex")
+            .await
+            .unwrap();
+        assert_eq!(c.source_of("Burial", "Archangel").await.as_deref(), Some("Plex"));
+
+        // Nothing found is nobody to credit, not "LRCLIB said nothing".
+        c.remember("Nobody", "Nothing", None).await;
+        assert_eq!(c.source_of("Nobody", "Nothing").await, None);
+    }
+
+    /// **Two callers do not get to fire at the same instant.**
+    ///
+    /// LRCLIB asks for requests to be made sequentially, 200–500ms apart, and
+    /// ignoring that "may result in a temporary ban" — which would cost every
+    /// Tapedeck instance the feature rather than only this one. That was safe
+    /// for free while the backfill was the sole caller and ran a track at a
+    /// time; `/api/v1/lyrics/fetch` put a **button** in front of it, and a
+    /// button can be pressed twice.
+    ///
+    /// The tempting spelling — `sleep(REQUEST_GAP)` at the top of each call —
+    /// looks identical in review and enforces nothing: two callers both sleep
+    /// 350ms and then fire together. The sleep has to be taken *under the
+    /// lock*, which is what this asserts, and it fails against that spelling
+    /// with a gap of about zero.
+    #[tokio::test]
+    async fn two_lookups_at_once_are_still_spaced_apart() {
+        let c = std::sync::Arc::new(LyricsClient {
+            http: reqwest::Client::new(),
+            pool: testpool().await,
+            base: "http://127.0.0.1:1".into(),
+            last_request: tokio::sync::Mutex::new(None),
+        });
+
+        let (a, b) = (c.clone(), c.clone());
+        let one = tokio::spawn(async move {
+            a.pace().await;
+            Instant::now()
+        });
+        let two = tokio::spawn(async move {
+            b.pace().await;
+            Instant::now()
+        });
+        let (x, y) = (one.await.unwrap(), two.await.unwrap());
+
+        let gap = if x > y { x - y } else { y - x };
+        assert!(
+            gap >= REQUEST_GAP,
+            "two concurrent lookups started {gap:?} apart, which is inside the gap LRCLIB asks for"
+        );
     }
 
     /// A cache nobody has filled yet is an answer; one that cannot be read is not.

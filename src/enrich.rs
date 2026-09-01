@@ -111,8 +111,6 @@ pub async fn backfill_lyrics(
     lyrics: &crate::lyrics::LyricsClient,
     budget: i64,
 ) -> usize {
-    use crate::lyrics::Found;
-
     // More candidates than budget, because most of the head of this queue is
     // already cached — a miss is remembered, and re-reading it costs no request.
     let candidates = match db.tracks_wanting_language(budget * 20).await {
@@ -141,60 +139,29 @@ pub async fn backfill_lyrics(
             continue;
         }
 
-        // Tier one: their own library. No budget, no rate limit.
-        let mut from_library: Option<Found> = None;
-        if let Some(r) = refs.get(&key) {
-            if let Some((plain, synced)) = servers.fetch(db, r).await {
-                let timed = synced.is_some();
-                match lyrics
-                    .remember_library(&artist, &title, plain, synced, library_label(&r.source_name))
-                    .await
-                {
-                    Ok(f) => {
-                        // A timed lyric of their own settles it: nothing LRCLIB
-                        // could return would be preferred, so it is not asked.
-                        if timed {
-                            if let Some(lang) = language_from(&f) {
-                                if db
-                                    .set_track_language(&artist, &title, &lang, "lyrics")
-                                    .await
-                                    .is_ok()
-                                {
-                                    done += 1;
-                                }
-                            }
-                            continue;
-                        }
-                        from_library = Some(f);
-                    }
-                    Err(e) => tracing::debug!("🎤 could not store library lyrics: {e}"),
-                }
-            }
+        // Both tiers, in `resolve_lyrics` — the one copy of the ordering rule.
+        // `spent >= budget` withholds only the *LRCLIB* half: their own library
+        // costs nothing and is asked either way.
+        let out = resolve_lyrics(
+            db,
+            lyrics,
+            &mut servers,
+            refs.get(&key),
+            &artist,
+            &title,
+            album.as_deref(),
+            duration,
+            spent < budget,
+        )
+        .await;
+        if out.asked {
+            spent += 1;
         }
-
-        // Tier two: LRCLIB, which is the rate-limited one and therefore the one
-        // the budget is for.
-        if spent >= budget {
-            // Their plain words are already stored; stopping here loses nothing
-            // but the chance of finding cues, which the next pass can still do.
-            match &from_library {
-                Some(f) => {
-                    if let Some(lang) = language_from(f) {
-                        if db.set_track_language(&artist, &title, &lang, "lyrics").await.is_ok() {
-                            done += 1;
-                        }
-                    }
-                    continue;
-                }
-                // Nothing from the library and no budget left: every candidate
-                // after this one is in the same position, so stop the pass.
-                None => break,
-            }
+        if out.language_set {
+            done += 1;
         }
-        spent += 1;
-        let found = match lyrics.fetch(&artist, &title, album.as_deref(), duration).await {
-            Ok(f) => f,
-            Err(crate::lyrics::LyricsError::RateLimited(secs)) => {
+        match out.resolved {
+            Resolved::RateLimited(secs) => {
                 // Stop, rather than sleep through it holding the budget open.
                 // The next tick is a minute away.
                 tracing::warn!(
@@ -202,60 +169,168 @@ pub async fn backfill_lyrics(
                 );
                 break;
             }
-            Err(e) => {
-                tracing::debug!("🎤 lyrics lookup failed for {artist} — {title}: {e}");
-                // Their plain words still stand; `fetch` wrote nothing.
-                if let Some(f) = &from_library {
-                    if let Some(lang) = language_from(f) {
-                        let _ = db.set_track_language(&artist, &title, &lang, "lyrics").await;
-                    }
-                }
-                continue;
-            }
-        };
-
-        // **The whole of the ordering rule, in one condition.** LRCLIB only
-        // displaces their own words when it brings cues they did not have —
-        // otherwise `fetch` has already been refused the write, because
-        // `remember` will not overwrite a row it did not fetch itself... which
-        // it would, so the library's words are put back deliberately.
-        let resolved = match (&from_library, &found) {
-            (Some(lib), Found::Lyrics { synced: Some(_), .. }) => {
-                let _ = lib; // LRCLIB has cues and theirs did not: cues win.
-                found.clone()
-            }
-            (Some(lib), _) => {
-                // Nothing better came back. Restore their words, which `fetch`
-                // has just written over with a worse answer.
-                let (plain, synced) = match lib {
-                    Found::Lyrics { plain, synced, .. } => (plain.clone(), synced.clone()),
-                    _ => (None, None),
-                };
-                let src =
-                    refs.get(&key).map(|r| library_label(&r.source_name)).unwrap_or("Library");
-                let _ = lyrics.remember_library(&artist, &title, plain, synced, src).await;
-                lib.clone()
-            }
-            (None, _) => found.clone(),
-        };
-
-        if let Some(lang) = language_from(&resolved) {
-            if db.set_track_language(&artist, &title, &lang, "lyrics").await.is_ok() {
-                done += 1;
-            }
+            // Nothing from the library and no budget left to ask LRCLIB: every
+            // candidate after this one is in the same position, so stop.
+            Resolved::Nothing | Resolved::Unreachable if spent >= budget => break,
+            _ => {}
         }
     }
     done
 }
 
+/// What one track's lyric lookup concluded.
+///
+/// **The last two are the distinction this whole enum exists for.** *Asked, and
+/// there is nothing* is a fact about the track; *could not ask* is a fact about
+/// the request, and reporting the second as the first tells somebody their song
+/// has no words when nobody ever managed to look. The same line
+/// `/physical/:id/durations` draws, and the reason `unavailable` is a field
+/// rather than a 5xx.
+pub enum Resolved {
+    /// Settled — this is what is now stored.
+    Words(crate::lyrics::Found),
+    /// LRCLIB asked us to wait. The backfill stops the pass rather than
+    /// sleeping through it; a handler reports it and asks the caller to retry.
+    RateLimited(u64),
+    /// LRCLIB could not be reached at all. Nothing was learned and nothing was
+    /// cached — in particular no miss, which would retire the track for a month
+    /// on the strength of a network blip.
+    Unreachable,
+    /// Asked, and nothing came back.
+    Nothing,
+}
+
+/// The result of one lookup, and what it cost.
+pub struct LyricOutcome {
+    pub resolved: Resolved,
+    /// Whether an **LRCLIB** request was actually made — the thing a budget
+    /// paces. A library hit costs nothing and is not counted here.
+    pub asked: bool,
+    /// Whether a language was concluded and written to the listens.
+    pub language_set: bool,
+}
+
+/// Look one track up across both tiers, and store whatever comes back.
+///
+/// **This is the only copy of the ordering rule**, which is why it is a function
+/// rather than a shape repeated per caller: the backfill, the reader's page
+/// load and the *Look for the words* button all resolve a track the same way,
+/// and three copies of "a plain library lyric still asks LRCLIB, and loses only
+/// to cues" would drift. It has already been subtle enough to be worth a
+/// paragraph of its own — see [`backfill_lyrics`].
+///
+/// `ask_lrclib` withholds the second tier only. Their own library has no rate
+/// limit and no shared budget, so it is asked whatever the answer.
+#[allow(clippy::too_many_arguments)]
+pub async fn resolve_lyrics(
+    db: &Database,
+    lyrics: &crate::lyrics::LyricsClient,
+    servers: &mut LibraryClients,
+    lib_ref: Option<&crate::db::LibraryRef>,
+    artist: &str,
+    title: &str,
+    album: Option<&str>,
+    duration: Option<i64>,
+    ask_lrclib: bool,
+) -> LyricOutcome {
+    use crate::lyrics::Found;
+
+    // Settling: a lookup that concluded a language writes it to the listens.
+    // Done here rather than at each call site because every caller did it
+    // identically, and one that forgot would leave a track with words and no
+    // language — which looks exactly like a lyric that was never fetched.
+    let settle = |found: Found, asked: bool| async move {
+        let language_set = match language_from(&found) {
+            Some(lang) => db.set_track_language(artist, title, &lang, "lyrics").await.is_ok(),
+            None => false,
+        };
+        LyricOutcome { resolved: Resolved::Words(found), asked, language_set }
+    };
+
+    // Tier one: their own library. No budget, no rate limit.
+    let mut from_library: Option<Found> = None;
+    let mut label = "Library";
+    if let Some(r) = lib_ref {
+        if let Some((plain, synced)) = servers.fetch(db, r).await {
+            let timed = synced.is_some();
+            label = library_label(&r.source_name);
+            match lyrics.remember_library(artist, title, plain, synced, label).await {
+                Ok(f) => {
+                    // A timed lyric of their own settles it: nothing LRCLIB
+                    // could return would be preferred, so it is not asked.
+                    if timed {
+                        return settle(f, false).await;
+                    }
+                    from_library = Some(f);
+                }
+                Err(e) => tracing::debug!("🎤 could not store library lyrics: {e}"),
+            }
+        }
+    }
+
+    if !ask_lrclib {
+        // Their plain words are already stored; stopping here loses nothing but
+        // the chance of finding cues, which a later pass can still do.
+        return match from_library {
+            Some(f) => settle(f, false).await,
+            None => LyricOutcome { resolved: Resolved::Nothing, asked: false, language_set: false },
+        };
+    }
+
+    // Tier two: LRCLIB, which is the rate-limited one and therefore the one the
+    // budget is for.
+    let found = match lyrics.fetch(artist, title, album, duration).await {
+        Ok(f) => f,
+        Err(crate::lyrics::LyricsError::RateLimited(secs)) => {
+            return LyricOutcome {
+                resolved: Resolved::RateLimited(secs),
+                asked: true,
+                language_set: false,
+            };
+        }
+        Err(e) => {
+            tracing::debug!("🎤 lyrics lookup failed for {artist} — {title}: {e}");
+            // Their plain words still stand; `fetch` wrote nothing.
+            return match from_library {
+                Some(f) => settle(f, true).await,
+                None => LyricOutcome {
+                    resolved: Resolved::Unreachable,
+                    asked: true,
+                    language_set: false,
+                },
+            };
+        }
+    };
+
+    // **The whole of the ordering rule, in one condition.** LRCLIB only
+    // displaces their own words when it brings cues they did not have.
+    let resolved = match (&from_library, &found) {
+        (Some(_), Found::Lyrics { synced: Some(_), .. }) => found,
+        (Some(lib), _) => {
+            // Nothing better came back. Restore their words, which `fetch` has
+            // just written over with a worse answer.
+            let (plain, synced) = match lib {
+                Found::Lyrics { plain, synced, .. } => (plain.clone(), synced.clone()),
+                _ => (None, None),
+            };
+            let _ = lyrics.remember_library(artist, title, plain, synced, label).await;
+            lib.clone()
+        }
+        (None, _) => found,
+    };
+    settle(resolved, true).await
+}
+
 /// Fetch one track's lyrics from the user's own library, if it is in one.
 ///
-/// The on-demand half of the two tiers: the backfill fills the cache in the
+/// The on-demand half of tier one: the backfill fills the cache in the
 /// background, and this covers a track somebody opens the reader on before the
 /// trickle has reached it. Their own server has none of the constraints that
 /// make LRCLIB a trickle — no rate limit, no politeness budget, no shared
 /// service to be considerate of — so asking it on a page load is fair where
-/// asking LRCLIB would not be.
+/// asking LRCLIB would not be. **That is the whole reason `ask_lrclib` is
+/// false here**, and the line between this and [`lyrics_now`], which a person
+/// asks for by pressing a button.
 ///
 /// Returns whether anything was stored, so the caller can re-read the cache.
 pub async fn lyrics_from_library_now(
@@ -268,22 +343,43 @@ pub async fn lyrics_from_library_now(
         return false;
     };
     let mut servers = LibraryClients::default();
-    let Some((plain, synced)) = servers.fetch(db, &r).await else {
-        return false;
-    };
-    match lyrics.remember_library(artist, title, plain, synced, library_label(&r.source_name)).await
-    {
-        Ok(found) => {
-            if let Some(lang) = language_from(&found) {
-                let _ = db.set_track_language(artist, title, &lang, "lyrics").await;
-            }
-            true
-        }
-        Err(e) => {
-            tracing::debug!("🎤 could not store library lyrics: {e}");
-            false
-        }
-    }
+    let out =
+        resolve_lyrics(db, lyrics, &mut servers, Some(&r), artist, title, None, None, false).await;
+    matches!(out.resolved, Resolved::Words(_))
+}
+
+/// Look for one track's words **now**, LRCLIB included, because somebody asked.
+///
+/// The backfill's pace — eight tracks a minute, most-played first — is right for
+/// a queue running on its own and wrong for the one track a person is looking
+/// at, which may be hours down it. This is the button behind that.
+///
+/// **A deliberate press is not a page load, and that is the whole argument for
+/// asking LRCLIB here.** The reader's own load path stays library-only for
+/// exactly that reason: a refresh, a bot or a second tab must not be able to
+/// drive requests at a free service. What bounds this one is structural rather
+/// than a policy nobody enforces — [`crate::lyrics::LyricsClient::pace`] spaces
+/// every outbound call across callers, so a held-down button spends requests at
+/// the rate the docs sanction rather than as fast as it can be clicked.
+///
+/// It **bypasses the miss tombstone**, which is what "force" means: LRCLIB fills
+/// its own gaps, so "nobody had this a fortnight ago" is exactly the answer a
+/// person is entitled to re-ask. It does **not** displace words already held —
+/// there is nothing to force there, and *Pick a different match* is the control
+/// for that, which already exists and does not spend a fetch on the answer it
+/// already has.
+pub async fn lyrics_now(
+    db: &Database,
+    lyrics: &crate::lyrics::LyricsClient,
+    artist: &str,
+    title: &str,
+    album: Option<&str>,
+    duration: Option<i64>,
+) -> LyricOutcome {
+    let lib = db.library_ref_for_track(title, artist).await.ok().flatten();
+    let mut servers = LibraryClients::default();
+    resolve_lyrics(db, lyrics, &mut servers, lib.as_ref(), artist, title, album, duration, true)
+        .await
 }
 
 /// The language a lookup concluded, or `None` when it concluded nothing.
@@ -316,7 +412,7 @@ fn library_label(source_name: &str) -> &'static str {
 /// client means reading and decrypting its credentials. A source that has gone
 /// away is remembered as absent so it is not looked up again on every track.
 #[derive(Default)]
-struct LibraryClients {
+pub struct LibraryClients {
     seen: std::collections::HashMap<i64, Option<(String, String, String)>>,
 }
 

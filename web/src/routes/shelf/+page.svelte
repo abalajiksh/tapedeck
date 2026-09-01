@@ -765,21 +765,15 @@
 	$: spinTrack = spinning ? sideTracks(spinning.side, spinRelease)[currentIndex(spinning)] ?? null : null;
 	/** The theatre, for whatever is on the platter.
 	 *
-	 *  Deliberately **no `line` parameter**. Passing one puts the reader into
-	 *  steering, which is right when you clicked a particular line and wrong
-	 *  here: what you want off the shelf is the words moving with the record.
-	 *  The shelf pushes an exact playhead, so the reader picks it up and
-	 *  follows on its own.
+	 *  **Live, so it names nothing.** It used to address the reader at the track
+	 *  playing when the link was clicked, which meant the words stopped at the
+	 *  end of that track while the side played on. A bare `/lyrics` follows the
+	 *  deck instead — and the shelf pushes an exact playhead, so it follows the
+	 *  side track by track without anything here having to say so.
 	 *
-	 *  The track's own artist where the tracklist carries one — a compilation
-	 *  side is several artists and the record's name is not the singer's. */
-	$: spinLyricsHref = spinTrack && deckRelease
-		? `/lyrics?${new URLSearchParams({
-				artist: spinTrack.artist || deckRelease.artist || '',
-				title: spinTrack.title,
-				...(deckRelease.title ? { album: deckRelease.title } : {})
-			})}`
-		: null;
+	 *  Still gated on there being a track: the link is about something being on,
+	 *  and offering it to an empty deck is offering an empty reader. */
+	$: spinLyricsHref = spinTrack && deckRelease ? '/lyrics' : null;
 
 	/** Seconds into the current track, not into the side. */
 	$: trackElapsed = (() => {

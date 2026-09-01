@@ -33,16 +33,56 @@
 	 * be controls over data that does not exist.
 	 */
 	import { onMount, onDestroy } from 'svelte';
+	import { page } from '$app/stores';
 	import { api, lyricKey } from '$lib/api';
 	import type { LyricDoc } from '$lib/api';
+	import { syncUrl } from '$lib/url';
 	import { deck, watchNowPlaying } from '$lib/nowplaying';
 
 	let doc: LyricDoc | null = null;
 	let loading = true;
 	let error = '';
-	let artist = '';
-	let title = '';
-	let album = '';
+
+	/** **The address is read reactively, not once on mount**, and both halves of
+	 *  that matter.
+	 *
+	 *  A sibling-track link is a navigation to *this same route*, so Svelte
+	 *  keeps the component alive and only the page store changes — reading the
+	 *  query string in `onMount` meant clicking a track in the wing changed the
+	 *  address and not the words. And it is what lets the reader move between
+	 *  live and addressed without a reload. */
+	$: q = $page.url.searchParams;
+	$: wantArtist = (q.get('artist') ?? '').trim();
+	$: wantTitle = (q.get('title') ?? '').trim();
+	$: wantAlbum = (q.get('album') ?? '').trim();
+
+	/** **Live is the default, and the reason is the bug it fixes.** The reader
+	 *  used to be addressed only — `?artist=…&title=…` — so it went on showing
+	 *  whatever the URL named after the next song started, and the only way out
+	 *  was to edit the query string.
+	 *
+	 *  So a bare `/lyrics` follows the deck: it asks `/api/v1/lyrics/live` once,
+	 *  and again whenever the deck's track changes. An address still wins when
+	 *  there is one, because a `[[line:…]]` chip and a history row are naming a
+	 *  particular song on purpose — and *Follow the deck* hands it back. */
+	$: live = !wantArtist || !wantTitle;
+
+	/** What `doc` is about, and what the deck is on. Compared as folded keys,
+	 *  which is the same fold the server stores lyrics under. */
+	$: deckKey = $deck.playing && $deck.track ? lyricKey($deck.track.artist, $deck.track.title) : '';
+	$: addressed = live ? '' : lyricKey(wantArtist, wantTitle);
+
+	/** The key of whatever we have asked for. A sentinel to begin with, so the
+	 *  first pass always loads — including in live mode with an empty deck,
+	 *  where the target key is legitimately the empty string. */
+	let wanted = '\u0000';
+	let ready = false;
+	/** Set when the deck has nothing on and the reader has nothing to show. */
+	let idle = false;
+
+	/** Fetching the words on demand — the button, not the backfill. */
+	let looking = false;
+	let lookMsg = '';
 
 	/** The enlarged line. Moved by the deck when it is following, by the reader
 	 *  otherwise — the design's one theatre for timed and untimed alike. */
@@ -59,17 +99,100 @@
 		return `${m}:${String(Math.floor(s - m * 60)).padStart(2, '0')}`;
 	}
 
-	async function load() {
+	/** Start on the first line with words in it, unless a `?line=` said
+	 *  otherwise — a blank line is numbered, which is what makes an index
+	 *  stable, but it is not a place to open on. */
+	function settle() {
+		if (cursor == null) cursor = doc?.lines.find((l) => l.text.trim())?.n ?? null;
+	}
+
+	/** The addressed reader: a particular song, because something named it. */
+	async function loadAddressed() {
 		loading = true;
 		error = '';
+		lookMsg = '';
 		try {
-			doc = await api.lyrics(artist, title, album || undefined);
-			album = doc.album ?? '';
-			if (cursor == null) cursor = doc.lines.find((l) => l.text.trim())?.n ?? null;
+			doc = await api.lyrics(wantArtist, wantTitle, wantAlbum || undefined);
+			idle = false;
+			settle();
 		} catch (e) {
 			error = clean(e);
 		} finally {
 			loading = false;
+		}
+	}
+
+	/** Whatever is on the deck, in one request.
+	 *
+	 *  The playhead comes back with it so the first paint lands on the right
+	 *  line rather than at the top of the song — a cold open (a fresh tab, the
+	 *  shelf's *Read the words*) has no deck poll behind it yet. */
+	async function loadLive() {
+		loading = !doc;
+		error = '';
+		lookMsg = '';
+		try {
+			const r = await api.liveLyrics();
+			if (!r.playing) {
+				// **The last words stay on screen.** A deck legitimately empties
+				// between tracks — a Plex tick with no sessions clears it — and
+				// blanking the theatre every time would flicker. `idle` is what
+				// the pill reads; the next track replaces the words outright.
+				idle = true;
+				wanted = '';
+				return;
+			}
+			idle = false;
+			doc = r;
+			wanted = lyricKey(r.artist, r.title);
+			// Land on the line the music is on, when it can be known.
+			cursor = null;
+			steering = false;
+			if (r.position_known) lineAt(r.position);
+			settle();
+		} catch (e) {
+			if (!doc) error = clean(e);
+		} finally {
+			loading = false;
+		}
+	}
+
+	/** Look for this track's words now rather than waiting for the trickle.
+	 *
+	 *  The backfill runs at a few tracks a minute, most-played first, so the one
+	 *  in front of you may be hours down it. A deliberate press is not a page
+	 *  load, which is the whole reason this may ask LRCLIB where opening the
+	 *  reader may not. */
+	async function lookNow() {
+		if (!doc || looking) return;
+		looking = true;
+		lookMsg = '';
+		try {
+			const r = await api.fetchLyricsNow({
+				artist: doc.artist,
+				title: doc.title,
+				album: doc.album ?? undefined,
+				// Only when the deck is on this track: LRCLIB matches on length,
+				// and handing it another song's is how a lookup comes back with
+				// somebody else's words.
+				duration: onDeck ? ($deck.track?.duration ?? undefined) : undefined
+			});
+			if (r.unavailable) {
+				// Asked to wait is not the same as nothing found, and must not
+				// be reported as it.
+				lookMsg = r.why ?? 'Could not ask just now — try again shortly.';
+				return;
+			}
+			doc = r;
+			cursor = null;
+			settle();
+			if (!r.lines.length && !r.instrumental) {
+				lookMsg = 'Nobody has words for this one yet. Worth trying again another day.';
+			}
+		} catch (e) {
+			lookMsg = clean(e);
+		} finally {
+			looking = false;
 		}
 	}
 
@@ -89,18 +212,43 @@
 		lyricKey($deck.track.artist, $deck.track.title) === lyricKey(doc.artist, doc.title);
 	$: deckOn = onDeck && ($deck.track?.position_known ?? false) && !steering;
 
-	// The line the clock is on: the last one whose cue has passed.
-	//
-	// `$deck.position` is **named in the statement**, not read through a call — a
-	// reactive block re-runs on the variables it syntactically references and
-	// does not trace them through a function. That is the Svelte trap this
-	// codebase has walked into four times now.
-	$: if (deckOn && doc) {
-		const at = $deck.position;
+	/** Put the cursor where the clock is: the last line whose cue has passed.
+	 *
+	 *  A function so the reactive block below and `loadLive` can both use it —
+	 *  but note the block still **names `$deck.position` itself**. A reactive
+	 *  statement re-runs on the variables it syntactically references and does
+	 *  not trace them through a call, which is the Svelte trap this codebase has
+	 *  now walked into five times. */
+	function lineAt(secs: number) {
+		if (!doc) return;
 		let n: number | null = null;
-		for (const l of doc.lines) if (l.at != null && l.at <= at + 0.25) n = l.n;
+		for (const l of doc.lines) if (l.at != null && l.at <= secs + 0.25) n = l.n;
 		if (n != null) cursor = n;
 	}
+
+	$: if (deckOn && doc?.timed) lineAt($deck.position);
+
+	/** **An untimed lyric scrolls too, and it is honest about being a guess.**
+	 *
+	 *  The design's rule is that the ribbon becomes your place in the *words*
+	 *  when there are no cues, and moving it by hand is right for reading a
+	 *  lyric with nothing playing. It is the wrong answer while the record is
+	 *  on: the words then simply do not follow, which is what the theatre is
+	 *  for.
+	 *
+	 *  So the clock drives it proportionally — but only where there is a real
+	 *  playhead *and* a length to divide by, and the ribbon says `≈` for as long
+	 *  as it is doing so. This estimates the **line**, never the position: the
+	 *  seconds under the ribbon stay the measurement they always were. Verses
+	 *  and instrumental breaks make it wrong in the middle of a song, which is
+	 *  exactly why it is marked rather than presented as a cue. */
+	$: if (deckOn && doc && !doc.timed && spoken.length && ($deck.track?.duration ?? 0) > 0) {
+		const frac = Math.min(1, Math.max(0, $deck.position / ($deck.track?.duration ?? 1)));
+		cursor = spoken[Math.min(spoken.length - 1, Math.floor(frac * spoken.length))].n;
+	}
+
+	/** Whether the line being lit is estimated rather than cued. */
+	$: estimating = deckOn && !!doc && !doc.timed && spoken.length > 0;
 
 	/** Only the lines with words. A stanza break is a numbered line — that is
 	 *  what makes an index stable — but the theatre reads one line at a time,
@@ -125,7 +273,13 @@
 		}
 		return spoken.length > 1 && at >= 0 ? at / (spoken.length - 1) : 0;
 	})();
-	$: ribbonLabel = deckOn ? mmss($deck.position) : current?.at != null ? mmss(current.at) : `${at + 1}/${spoken.length}`;
+	// `≈` when the *line* is estimated from the playhead rather than cued. The
+	// seconds themselves are still a measurement — see `estimating`.
+	$: ribbonLabel = deckOn
+		? `${estimating ? '≈' : ''}${mmss($deck.position)}`
+		: current?.at != null
+			? mmss(current.at)
+			: `${at + 1}/${spoken.length}`;
 
 	/** The coordinate, as the design writes it: the track's position on the
 	 *  record where one is known, and the line either way. */
@@ -142,33 +296,44 @@
 		steering = true;
 	}
 
-	/** Hand the cursor back to the deck.
+	/** Hand the reader back to the deck — **both senses of it**.
 	 *
-	 *  `steering` had no way out: pointing at a line set it, and **arriving with
-	 *  `?line=` set it too** — so opening the reader from the deck strip, or
-	 *  from a `[[line:…]]` chip, pinned the words at that line and the only way
-	 *  to get them moving again was to edit the URL. Reported exactly that way.
+	 *  There are two ways the theatre stops following, and one button that ends
+	 *  either. *Steering* is the cursor: pointing at a line stops the clock
+	 *  moving it, and arriving with `?line=` does the same, which is right —
+	 *  you clicked a particular line, and being yanked off it would be worse.
+	 *  *Addressed* is the whole page: a `[[line:…]]` chip or a history row names
+	 *  a song, and the reader stays on it while the music moves on.
 	 *
-	 *  Arriving steered is still right: you clicked a particular line and being
-	 *  yanked off it by the playhead would be worse. What was missing is the way
-	 *  back, and it is one press or the Escape key. */
+	 *  Merging them is not a shortcut. The label says "follow the deck", and a
+	 *  press that un-froze the cursor while leaving the reader on last week's
+	 *  song would be a button that half did what it said. */
 	function followDeck() {
 		steering = false;
+		if (!live) {
+			// Leaving the address is what makes the theatre follow the *music*
+			// rather than a song. `syncUrl` rather than `history.replaceState`,
+			// which breaks the Back button and logs nothing — the standing rule
+			// in `$lib/url`. Replace rather than push: switching mode is not a
+			// place somebody wants to come back to.
+			syncUrl('/lyrics');
+			return;
+		}
 		// Jump straight to where the music is rather than waiting for the next
 		// cue to pass, which on a long line is an uncomfortable few seconds of
 		// looking like nothing happened.
-		if (onDeck && doc) {
-			const at = $deck.position;
-			let n: number | null = null;
-			for (const l of doc.lines) if (l.at != null && l.at <= at + 0.25) n = l.n;
-			if (n != null) cursor = n;
-		}
+		if (onDeck) lineAt($deck.position);
 	}
 
-	/** Whether handing it back is on offer: the deck is on this track and
-	 *  reporting a real playhead, and we are not already following. An
-	 *  estimated position must not drive a highlight that looks measured. */
-	$: canFollow = onDeck && ($deck.track?.position_known ?? false) && steering;
+	/** Whether handing it back is on offer.
+	 *
+	 *  Either the cursor is frozen on a track the deck really is playing with a
+	 *  measured playhead, or the reader is addressed and something is on. The
+	 *  second case does not require the deck to be on *this* track — that is
+	 *  the whole point of it. */
+	$: canFollow =
+		(onDeck && ($deck.track?.position_known ?? false) && steering) ||
+		(!live && $deck.playing && !!$deck.track);
 
 	function step(by: number) {
 		if (!spoken.length) return;
@@ -203,9 +368,9 @@
 	/** Where a sibling track's reader lives. Carries the album so its own
 	 *  tracklist comes back without another resolution. */
 	function readerHref(t: string): string {
-		const q = new URLSearchParams({ artist, title: t });
-		if (album) q.set('album', album);
-		return `/lyrics?${q}`;
+		const p = new URLSearchParams({ artist: doc?.artist ?? '', title: t });
+		if (doc?.album) p.set('album', doc.album);
+		return `/lyrics?${p}`;
 	}
 
 	/** Hand the line to Liner Notes, which is where writing happens.
@@ -214,15 +379,25 @@
 	 *  what the note is about, so it only means line twelve of this song inside
 	 *  a note about this song. */
 	function quoteHref(n: number): string {
-		const q = new URLSearchParams({ kind: 'track', name: title, artist, quote: `[[line:${n}]]` });
-		return `/notes?${q}`;
+		const p = new URLSearchParams({
+			kind: 'track',
+			name: doc?.title ?? '',
+			artist: doc?.artist ?? '',
+			quote: `[[line:${n}]]`
+		});
+		return `/notes?${p}`;
 	}
 
 	/** The annotate-lines mode, opened on this track and this line. */
 	function pinHref(n: number): string {
-		const q = new URLSearchParams({ kind: 'track', name: title, artist, pin: String(n) });
-		if (album) q.set('album', album);
-		return `/notes?${q}`;
+		const p = new URLSearchParams({
+			kind: 'track',
+			name: doc?.title ?? '',
+			artist: doc?.artist ?? '',
+			pin: String(n)
+		});
+		if (doc?.album) p.set('album', doc.album);
+		return `/notes?${p}`;
 	}
 
 	/** Which track comes before and after, so the reader can walk the record. */
@@ -233,20 +408,39 @@
 	$: prev = mine > 0 ? siblings[mine - 1] : null;
 	$: next = mine >= 0 && mine < siblings.length - 1 ? siblings[mine + 1] : null;
 
+	/** What the reader should be showing: the deck's track in live mode, the
+	 *  addressed one otherwise.
+	 *
+	 *  **This is the whole of "it switches on its own".** The deck store already
+	 *  polls once every three seconds for the sidebar and the dashboard; all
+	 *  this does is notice when the track behind that poll has changed. So a
+	 *  song change costs **one** request for the new words, and a poll that
+	 *  finds the same song costs nothing — where re-asking `/lyrics/live` on a
+	 *  timer would pull a document with a tracklist and every pin in it twenty
+	 *  times a minute. */
+	$: target = live ? deckKey : addressed;
+	$: if (ready && target !== wanted) {
+		wanted = target;
+		void (live ? loadLive() : loadAddressed());
+	}
+
 	onMount(async () => {
-		const p = new URLSearchParams(window.location.search);
-		artist = p.get('artist') ?? '';
-		title = p.get('title') ?? '';
-		album = p.get('album') ?? '';
-		const l = Number(p.get('line'));
+		// `?line=` still arrives steered, and that is deliberate: somebody
+		// clicked a particular line. `followDeck` is the way back out, which is
+		// what it did not have.
+		const l = Number($page.url.searchParams.get('line'));
 		cursor = Number.isFinite(l) && l > 0 ? l : null;
 		if (cursor != null) steering = true;
-		if (!artist || !title) {
-			error = 'No track named — open a lyric from a listen or a note.';
-			loading = false;
-			return;
-		}
-		await load();
+
+		// The first load happens here rather than being left to the reactive
+		// block, because in live mode with a deck that has not been polled yet
+		// the target key is legitimately the empty string — and a page that
+		// waited for the first poll would open blank for up to three seconds
+		// when the server could have answered immediately.
+		if (live) await loadLive();
+		else await loadAddressed();
+		wanted = live ? (doc ? lyricKey(doc.artist, doc.title) : '') : addressed;
+		ready = true;
 		unwatch = watchNowPlaying();
 	});
 
@@ -256,13 +450,26 @@
 	onDestroy(() => unwatch?.());
 </script>
 
-<svelte:head><title>{title ? `${title} — Lyrics` : 'Lyrics'} — Tapedeck</title></svelte:head>
+<svelte:head><title>{doc ? `${doc.title} — Lyrics` : 'Lyrics'} — Tapedeck</title></svelte:head>
 <svelte:window on:keydown={onKey} />
 
-{#if loading}
+{#if loading && !doc}
 	<div class="shell"><div class="stage plain">Reading…</div></div>
 {:else if error && !doc}
 	<div class="shell"><div class="stage plain">{error}</div></div>
+{:else if !doc}
+	<!-- Live, with an empty deck. Not an error and not a blank page: the reader
+	     is waiting, and it says which — the words arrive on their own when
+	     something starts. -->
+	<div class="shell">
+		<div class="stage plain">
+			<p>Nothing playing.</p>
+			<p class="plainsub">
+				The words follow the deck — start something and they will appear here. To read a
+				particular song, open it from a listen or a note.
+			</p>
+		</div>
+	</div>
 {:else if doc}
 	<div class="shell">
 		<div class="stage">
@@ -295,8 +502,15 @@
 				{:else if !spoken.length}
 					<p class="plainmsg">
 						Nothing held for this one yet. Lyrics are fetched a few tracks a minute,
-						most-played first — or LRCLIB may simply not have it.
+						most-played first — so this one may still be a way down the queue.
 					</p>
+					<!-- The button the queue's pace makes necessary. A deliberate
+					     press is not a page load, which is why this may ask
+					     LRCLIB where opening the reader may not. -->
+					<button class="lookbtn" on:click={lookNow} disabled={looking}>
+						{looking ? 'Looking…' : 'Look for the words now'}
+					</button>
+					{#if lookMsg}<p class="lookmsg">{lookMsg}</p>{/if}
 				{:else}
 					<div class="prevlines">
 						{#each above as l, i (l.n)}
@@ -353,8 +567,13 @@
 					{#if doc.timed}<span class="wpill good">Timed</span>{:else if spoken.length}<span class="wpill">Untimed</span>{/if}
 					{#if doc.language}<span class="wpill">{doc.language}</span>{/if}
 					{#if doc.edited}<span class="wpill">corrected here</span>{/if}
+					{#if idle && live}
+						<span class="wpill">Deck is quiet</span>
+					{/if}
 					{#if deckOn}
-						<span class="wpill good"><span class="blip"></span>Following</span>
+						<span class="wpill good">
+							<span class="blip"></span>{estimating ? 'Following ≈' : 'Following'}
+						</span>
 					{:else if canFollow}
 						<!-- The way back. Drawn only when the deck really is on this
 						     track with a measured playhead, so it never offers to
@@ -431,10 +650,24 @@
 		     from before it was says so rather than claiming a source nothing
 		     can vouch for. Naming the *server* matters — words off your own
 		     Plex are the pressing you played, with your tagging in them. -->
-		{#if doc.source}Words via {doc.source}.{:else}Where these words came from was not recorded.{/if}
-		Cached here so a note can point at a line — they are not ours, and they never leave this
-		instance: not in a backup, not in an export, not to anyone you have patched with.
-		{#if !doc.timed && spoken.length}
+		<!-- Provenance is a sentence about words, so it is not printed where
+		     there are none: "where these words came from was not recorded" over
+		     an empty theatre reads as a fact about a lyric nobody holds. -->
+		{#if spoken.length || doc.instrumental}
+			{#if doc.source}Words via {doc.source}.{:else}Where these words came from was not
+				recorded.{/if}
+			Cached here so a note can point at a line — they are not ours, and they never leave this
+			instance: not in a backup, not in an export, not to anyone you have patched with.
+		{:else}
+			Words are cached here so a note can point at a line. They are not ours, and they never
+			leave this instance: not in a backup, not in an export, not to anyone you have patched
+			with.
+		{/if}
+		{#if estimating}
+			This lyric has no cues, so the line is worked out from how far through the track you are —
+			an estimate, which is what the ≈ means, and it drifts around long instrumentals. ↑ and ↓
+			take it over.
+		{:else if !doc.timed && spoken.length}
 			This lyric is untimed, so the ribbon is your place in the words rather than in the track —
 			↑ and ↓ move it.
 		{/if}
@@ -573,6 +806,33 @@
 		overflow: hidden;
 	}
 	.plainmsg { color: #9a8c72; font-size: 15px; line-height: 1.6; max-width: 46ch; }
+	.plainsub {
+		margin-top: 8px;
+		max-width: 44ch;
+		color: #8a7d68;
+		font-size: 13px;
+		line-height: 1.6;
+		text-align: center;
+	}
+	/* Literal, like every colour on this stage — a token here would follow the
+	   theme onto a ground that does not, which is the `--td-panel` trap this
+	   file's own header warns about. Shaped like `.act.primary`, because it is
+	   the same kind of thing: the one action offered by this state. */
+	.lookbtn {
+		margin-top: 16px;
+		align-self: flex-start;
+		font-family: 'Caprasimo', serif;
+		font-size: 13px;
+		padding: 9px 18px;
+		border: 1px solid transparent;
+		border-radius: 999px;
+		background: #c67139;
+		color: #fbf5ea;
+		cursor: pointer;
+	}
+	.lookbtn:hover:not(:disabled) { background: #b2622d; }
+	.lookbtn:disabled { background: rgba(244, 231, 207, 0.09); color: #9a8c72; cursor: default; }
+	.lookmsg { margin-top: 10px; max-width: 46ch; color: #9a8c72; font-size: 13px; line-height: 1.55; }
 	.prevlines { display: flex; flex-direction: column; gap: 4px; margin-bottom: 26px; }
 	.nextlines { display: flex; flex-direction: column; gap: 5px; margin-top: 30px; }
 	/* Fading **and shrinking** away from the line being read. Not merely dimmed:

@@ -967,30 +967,51 @@ async fn lyrics_for_track(
     let Some(lyrics) = state.lyrics.clone() else {
         return server_error("This instance has no lyrics cache".to_string());
     };
+    let doc =
+        lyric_document(&state, &lyrics, user.user_id, &q.artist, &q.title, q.album.clone()).await;
+    (StatusCode::OK, Json(doc)).into_response()
+}
+
+/// Everything the reader draws for one track: the words, and the furniture
+/// round them.
+///
+/// Shared by the three ways in — the addressed reader, [`live_lyrics`] and the
+/// *Look for the words* button — because they differ only in **where the track
+/// comes from**, and a second copy of this would be a second answer to what a
+/// lyric page shows. Same reasoning as `push_tracks` being shared by its
+/// endpoint and its MCP tool.
+async fn lyric_document(
+    state: &Arc<AppState>,
+    lyrics: &Arc<crate::lyrics::LyricsClient>,
+    user_id: i64,
+    artist: &str,
+    title: &str,
+    album_hint: Option<String>,
+) -> serde_json::Value {
     // The furniture round the words: which record this is on, how often it has
     // been played, and what has been written about it. All of it is about the
     // *track*, so it is gathered whether or not the lyric turns out to be held
     // — an instrumental still has a tracklist beside it, and a pin outlives the
     // words it was pinned to.
-    let album = match q.album.clone().filter(|a| !a.trim().is_empty()) {
+    let album = match album_hint.filter(|a| !a.trim().is_empty()) {
         Some(a) => Some(a),
-        None => state.db.album_for_track(user.user_id, &q.title, &q.artist).await.ok().flatten(),
+        None => state.db.album_for_track(user_id, title, artist).await.ok().flatten(),
     };
-    let plays = state.db.track_play_count(user.user_id, &q.artist, &q.title).await.unwrap_or(0);
+    let plays = state.db.track_play_count(user_id, artist, title).await.unwrap_or(0);
     let rows = match album.as_deref() {
-        Some(a) => state.db.album_track_list(user.user_id, &q.artist, a).await.unwrap_or_default(),
+        Some(a) => state.db.album_track_list(user_id, artist, a).await.unwrap_or_default(),
         None => Vec::new(),
     };
     // What each sibling track has, so the sidebar can mark the instrumentals and
     // dim what there is nothing to open — the design's `· instrumental`. One
     // query for the whole record rather than a lookup per row.
     let states = lyrics
-        .states_for(&rows.iter().map(|(t, ..)| (q.artist.clone(), t.clone())).collect::<Vec<_>>())
+        .states_for(&rows.iter().map(|(t, ..)| (artist.to_string(), t.clone())).collect::<Vec<_>>())
         .await;
     let tracklist = rows
         .into_iter()
         .map(|(title, plays, duration, track_number)| {
-            let key = crate::lyrics::LyricsClient::track_key(&q.artist, &title);
+            let key = crate::lyrics::LyricsClient::track_key(artist, &title);
             serde_json::json!({
                 "title": title, "plays": plays,
                 "duration": duration, "track_number": track_number,
@@ -1005,8 +1026,7 @@ async fn lyrics_for_track(
     // rather than one per line — a lyric is a couple of hundred lines.
     let mut pins: std::collections::HashMap<usize, serde_json::Value> =
         std::collections::HashMap::new();
-    for note in state.db.pins_for_track(user.user_id, &q.artist, &q.title).await.unwrap_or_default()
-    {
+    for note in state.db.pins_for_track(user_id, artist, title).await.unwrap_or_default() {
         let Some(n) = note.line_key.as_deref().and_then(crate::db::NoteTarget::line_number) else {
             continue;
         };
@@ -1021,12 +1041,11 @@ async fn lyrics_for_track(
             }),
         );
     }
-    let quoted =
-        crate::server::notes::quoted_lines(&state.db, user.user_id, &q.artist, &q.title).await;
+    let quoted = crate::server::notes::quoted_lines(&state.db, user_id, artist, title).await;
 
     let head = serde_json::json!({
-        "artist": q.artist,
-        "title": q.title,
+        "artist": artist,
+        "title": title,
         "album": album,
         "plays": plays,
         "tracklist": tracklist,
@@ -1049,13 +1068,13 @@ async fn lyrics_for_track(
     // asked and had none, which says nothing about their library, so that is
     // retried too — but a stored lyric is never re-fetched on a page load.
     if !matches!(
-        lyrics.cached(&q.artist, &q.title).await,
+        lyrics.cached(artist, title).await,
         Some(crate::lyrics::Found::Lyrics { .. }) | Some(crate::lyrics::Found::Instrumental)
     ) {
-        crate::enrich::lyrics_from_library_now(&state.db, &lyrics, &q.artist, &q.title).await;
+        crate::enrich::lyrics_from_library_now(&state.db, &lyrics, artist, title).await;
     }
 
-    let body = match lyrics.cached(&q.artist, &q.title).await {
+    let body = match lyrics.cached(artist, title).await {
         Some(crate::lyrics::Found::Lyrics { plain, synced, language }) => {
             let lines = crate::lyrics::parse_lines(plain.as_deref(), synced.as_deref());
             merge(
@@ -1078,14 +1097,14 @@ async fn lyrics_for_track(
                     // rewrite a lyric nobody meant to touch.
                     "plain": plain,
                     "synced": synced,
-                    "edited": lyrics.is_edited(&q.artist, &q.title).await,
+                    "edited": lyrics.is_edited(artist, title).await,
                     // Shown wherever the words are, because they are not ours
                     // — and *which* not-ours matters: "your Plex" says these
                     // are the pressing you played with your own tagging in it,
                     // where "LRCLIB" says a stranger uploaded them. A row from
                     // before provenance was recorded says so rather than
                     // claiming a source it cannot vouch for.
-                    "source": lyrics.source_of(&q.artist, &q.title).await,
+                    "source": lyrics.source_of(artist, title).await,
                 }),
             )
         }
@@ -1096,7 +1115,168 @@ async fn lyrics_for_track(
             merge(head, serde_json::json!({ "lines": [] }))
         }
     };
+    body
+}
+
+/// GET /api/v1/lyrics/live — the words for whatever is on the deck.
+///
+/// **The reader's whole state, in one request, so the theatre stops being
+/// addressed by URL.** It opened as `/lyrics?artist=…&title=…`, which is right
+/// for a line somebody clicked in a note and wrong for the common case: the
+/// words were pinned to whichever track the address named, so when the next
+/// song started the reader went on showing the last one, and the only way out
+/// was to edit the query string. Reported exactly that way.
+///
+/// Two things make this an endpoint rather than the browser stitching
+/// `/api/v1/now-playing` to `/api/v1/lyrics` itself:
+///
+/// * **The server already knows what is playing.** A cold open — a fresh tab,
+///   a bookmark, the shelf's *Read the words* — is one round trip instead of
+///   two, and the reader has words on screen before its first deck poll.
+/// * **"Nothing is playing" is a state, not a failure**, and it belongs in the
+///   payload rather than being assembled from an empty deck and a request the
+///   caller then knows not to make.
+///
+/// The playhead travels with it so the first paint lands on the right line; the
+/// shared `deck` store takes over from there, which is what keeps this to **one
+/// request per track** rather than one per poll. The client re-asks when the
+/// track changes and at no other time.
+async fn live_lyrics(
+    State(state): State<Arc<AppState>>,
+    ReadAuth { user }: ReadAuth,
+) -> impl IntoResponse {
+    let Some(lyrics) = state.lyrics.clone() else {
+        return server_error("This instance has no lyrics cache".to_string());
+    };
+    // An empty deck is a normal answer and not an error: the reader says so and
+    // waits, and picks the next track up on its own.
+    let Some((np, position)) = state.now_playing.get(user.user_id) else {
+        return (StatusCode::OK, Json(serde_json::json!({ "playing": false }))).into_response();
+    };
+    let doc =
+        lyric_document(&state, &lyrics, user.user_id, &np.artist, &np.title, np.album.clone())
+            .await;
+    let mut body = doc;
+    if let Some(o) = body.as_object_mut() {
+        o.insert("playing".into(), serde_json::json!(true));
+        o.insert("position".into(), serde_json::json!(position));
+        // Whether that position is a measurement. The reader will not drive a
+        // highlight from a guess, so it has to be able to tell — the same
+        // distinction `Progress` exists to keep, carried one screen further.
+        o.insert("position_known".into(), serde_json::json!(np.position_known));
+        o.insert("paused".into(), serde_json::json!(np.paused));
+        o.insert("duration".into(), serde_json::json!(np.duration));
+    }
     (StatusCode::OK, Json(body)).into_response()
+}
+
+#[derive(serde::Deserialize)]
+pub struct FetchLyricsRequest {
+    pub artist: String,
+    pub title: String,
+    /// Narrows the LRCLIB lookup when the caller knows it.
+    pub album: Option<String>,
+    /// Likewise — LRCLIB matches on length, and a wrong-length record is the
+    /// usual reason a well-known song comes back with somebody else's words.
+    pub duration: Option<i64>,
+}
+
+/// POST /api/v1/lyrics/fetch — look for this track's words now.
+///
+/// The backfill runs at eight tracks a minute, most-played first, which is the
+/// right pace for a queue nobody is watching and no use at all for the track a
+/// person is looking at — that one may be hours down the queue. This is the
+/// button for it, and it goes through `enrich::lyrics_now`, so it resolves the
+/// track exactly the way the backfill would have: their own library first, then
+/// LRCLIB, with cues winning.
+///
+/// **Session-only, and that is deliberate**: it spends a shared politeness
+/// budget at a free service and writes an instance-wide cache. `read` on a
+/// token is for an app showing a lyric, not for driving fetches — so a token
+/// gets **401** here and its scopes never enter into it, the same line
+/// `PUT /api/v1/lyrics` and `/api/v1/sources` both sit on.
+///
+/// A rate limit or an unreachable LRCLIB is **200 with `unavailable`**, never a
+/// 5xx — the convention `/lyrics/matches` and `/physical/:id/durations` already
+/// follow. The upstream asking us to wait is not this server failing, and
+/// collapsing the two would have the button report "nothing found" about a
+/// track it never managed to ask about.
+async fn fetch_lyrics_now(
+    State(state): State<Arc<AppState>>,
+    user: AuthUser,
+    Json(body): Json<FetchLyricsRequest>,
+) -> impl IntoResponse {
+    let Some(lyrics) = state.lyrics.clone() else {
+        return server_error("This instance has no lyrics cache".to_string());
+    };
+    if body.artist.trim().is_empty() || body.title.trim().is_empty() {
+        return bad_request("A lookup needs an artist and a title");
+    }
+
+    // Words already held are not re-fetched. There is nothing to force here:
+    // the cache has an answer, and *Pick a different match* is the control for
+    // disagreeing with it — which already exists and spends its request on the
+    // question actually being asked.
+    let held = matches!(
+        lyrics.cached(&body.artist, &body.title).await,
+        Some(crate::lyrics::Found::Lyrics { .. }) | Some(crate::lyrics::Found::Instrumental)
+    );
+    let outcome = if held {
+        None
+    } else {
+        Some(
+            crate::enrich::lyrics_now(
+                &state.db,
+                &lyrics,
+                &body.artist,
+                &body.title,
+                body.album.as_deref(),
+                body.duration,
+            )
+            .await,
+        )
+    };
+
+    // **"Could not ask" is not "there is nothing"**, and the reader must not
+    // report the first as the second — "nobody has words for this one" is a
+    // claim about the *track*, and making it after a failed request tells
+    // somebody their song has no lyrics when nobody ever managed to look. The
+    // cause goes to the log rather than the screen: it carries a `Debug`
+    // wrapper and the configured LRCLIB URL, neither of which means anything to
+    // a reader.
+    let why = match &outcome {
+        Some(crate::enrich::LyricOutcome {
+            resolved: crate::enrich::Resolved::RateLimited(secs),
+            ..
+        }) => Some(format!("LRCLIB asked us to wait {secs}s — try again shortly.")),
+        Some(crate::enrich::LyricOutcome {
+            resolved: crate::enrich::Resolved::Unreachable,
+            ..
+        }) => Some("Could not reach LRCLIB just now — try again shortly.".to_string()),
+        _ => None,
+    };
+    if let Some(why) = why {
+        return (StatusCode::OK, Json(serde_json::json!({ "unavailable": true, "why": why })))
+            .into_response();
+    }
+
+    // The whole document back, not a verdict: the reader replaces what it is
+    // showing, so a fetch that found words puts them on screen without a second
+    // request and without the page having to work out what changed.
+    let doc = lyric_document(
+        &state,
+        &lyrics,
+        user.user_id,
+        &body.artist,
+        &body.title,
+        body.album.clone(),
+    )
+    .await;
+    let mut out = doc;
+    if let Some(o) = out.as_object_mut() {
+        o.insert("already_held".into(), serde_json::json!(held));
+    }
+    (StatusCode::OK, Json(out)).into_response()
 }
 
 /// GET /api/v1/lyrics/keys — every track this instance holds words for.
@@ -1478,6 +1658,8 @@ pub fn create_scrobbles_router() -> Router<Arc<AppState>> {
         .route("/api/v1/languages/status", get(language_status))
         .route("/api/v1/languages/backfill", axum::routing::post(backfill_languages_now))
         .route("/api/v1/lyrics", get(lyrics_for_track).put(fix_lyrics))
+        .route("/api/v1/lyrics/live", get(live_lyrics))
+        .route("/api/v1/lyrics/fetch", axum::routing::post(fetch_lyrics_now))
         .route("/api/v1/lyrics/keys", get(lyrics_keys))
         .route("/api/v1/lyrics/matches", get(lyric_matches))
         .route("/api/v1/lyrics/status", get(lyrics_status))
