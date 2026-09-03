@@ -12927,6 +12927,27 @@ impl Database {
         }
     }
 
+    /// Create an account.
+    ///
+    /// **`share_all_with_patched` starts on, and it is written here rather than
+    /// left to the column default.** The column defaults to `0` because an
+    /// account that predates it accepted its patches under the old rule — an
+    /// unshared chain published nothing — and nobody consents to more by their
+    /// operator upgrading a binary. That obligation is to *those* patches and
+    /// it expires: it is no reason for an account created afterwards, whose
+    /// every patch will be accepted under this rule, to start closed.
+    ///
+    /// Setting it at the insert rather than moving the column default is what
+    /// keeps the two kinds of database agreeing. `init()` creates the column
+    /// with `DEFAULT 0` and `migrate()` adds it with `DEFAULT 0`, so flipping
+    /// the default in `init()` would make a fresh instance and a migrated one
+    /// behave differently for every account created after the upgrade — the
+    /// worst possible split, because it depends on when the file was made
+    /// rather than on anything anybody decided.
+    ///
+    /// It widens what a **patched** deck sees and nothing else: the Instance
+    /// tab, Discover and a Shared Spool's captures are all still narrowed to
+    /// shared chains. See `PATCH_VISIBLE_LISTENS`.
     pub async fn create_user(
         &self,
         username: &str,
@@ -12936,9 +12957,16 @@ impl Database {
     ) -> Result<i64, sqlx::Error> {
         let now = Self::now_secs();
         let result = sqlx::query(
-            "INSERT INTO users (username, display_name, password_hash, role, created_at) VALUES (?, ?, ?, ?, ?)"
-        ).bind(username).bind(display_name).bind(password_hash).bind(role).bind(now)
-        .execute(&self.pool).await?;
+            "INSERT INTO users (username, display_name, password_hash, role, created_at, \
+                                share_all_with_patched) VALUES (?, ?, ?, ?, ?, 1)",
+        )
+        .bind(username)
+        .bind(display_name)
+        .bind(password_hash)
+        .bind(role)
+        .bind(now)
+        .execute(&self.pool)
+        .await?;
         Ok(result.last_insert_rowid())
     }
 
@@ -14822,19 +14850,28 @@ impl Database {
     /// The other end of a patch, as both directions need it. One list so the
     /// two cannot drift into describing a person differently.
     const PATCH_PEER_COLUMNS: &'static str = "u.id AS user_id, u.username, u.display_name, \
-         u.bio, u.avatar_url, \
+         u.bio, u.avatar_url, u.share_all_with_patched AS shares_everything, \
          (SELECT COUNT(*) FROM signal_chains c \
            WHERE c.user_id = u.id AND c.shared = 1) AS shared_chains";
 
     /// Turn a chain's sharing on or off.
     ///
-    /// **The sharing unit is the chain, and this is the only switch there is.**
-    /// A listen reaches the Reel because the chain it ran through was switched
-    /// to shared by its owner — there is no per-listen override and there
-    /// should not be one. It makes "what am I publishing?" answerable by
-    /// looking at a list of chains you already understand, and it makes the
-    /// decision a standing one about *how you listen* rather than a choice to
-    /// make per play.
+    /// **This is no longer the gate — it is the floor.** A listen reaches a
+    /// patched deck when its owner has opened up *or* it ran through a chain
+    /// switched to shared here; see `PATCH_VISIBLE_LISTENS`. What this switch
+    /// still decides on its own is everything a patch is not behind: the
+    /// Instance tab, Discover, "who else here plays them", and whether a Shared
+    /// Spool may capture a play into somebody else's history.
+    ///
+    /// It also decides whether the chain is **named**. `CHAIN_VISIBILITY` draws
+    /// three states, not two: a shared chain by name, a private one as "Private
+    /// signal chain", and a listen that ran through nothing says nothing. So
+    /// this remains the answer to "who may see how I listen", which is a
+    /// different question from "who may see what I listen to".
+    ///
+    /// There is still no per-listen override and there should not be one: the
+    /// decision is a standing one about *how you listen* rather than a choice
+    /// to make per play.
     pub async fn set_chain_shared(
         &self,
         user_id: i64,
@@ -15244,6 +15281,35 @@ impl Database {
             both_play: both,
             actor,
         }))
+    }
+
+    /// A deck this viewer has an accepted patch **into**, by username.
+    ///
+    /// Deliberately one-directional, unlike `dub`'s guard. A dub needs a patch
+    /// either way because it is a message between two people who know each
+    /// other; this answers "may I say I got this off their deck", and only the
+    /// direction that lets you *read* their listening can make that true.
+    /// Somebody who follows you has told you nothing.
+    ///
+    /// Returns their id and the name to write down.
+    pub async fn deck_i_am_patched_into(
+        &self,
+        viewer_id: i64,
+        username: &str,
+    ) -> Result<Option<(i64, String)>, sqlx::Error> {
+        let row: Option<(i64, String, Option<String>)> = sqlx::query_as(
+            "SELECT u.id, u.username, u.display_name
+               FROM users u
+               JOIN patches p ON p.target_user_id = u.id
+              WHERE u.username = ? COLLATE NOCASE
+                AND p.follower_user_id = ? AND p.state = 'accepted'
+                AND u.disabled = 0",
+        )
+        .bind(username)
+        .bind(viewer_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|(id, username, display)| (id, display.unwrap_or(username))))
     }
 
     /// Everyone on the instance, with what the viewer has in common with them.
@@ -17010,10 +17076,20 @@ pub struct PatchPeer {
     pub display_name: Option<String>,
     pub bio: Option<String>,
     pub avatar_url: Option<String>,
-    /// How many chains this person publishes. **Zero is the interesting case**:
-    /// a patch into a deck sharing nothing is accepted and reads empty, which
-    /// is correct and needs saying on screen rather than looking broken.
+    /// How many chains this person publishes. **Zero is no longer the
+    /// interesting case on its own** — read it with `shares_everything`, which
+    /// is the gate. A deck sharing no chains and open to patched decks shows
+    /// everything it plays; one sharing no chains and *closed* is the empty
+    /// patch that needs saying on screen rather than looking broken.
     pub shared_chains: i64,
+    /// Whether they let decks they have patched in see **everything** they
+    /// play, not only listens through a chain they publish.
+    ///
+    /// Carried so the screen can say what a patch will actually show, which it
+    /// could not do from `shared_chains` alone — and it leaks nothing: this
+    /// only ever describes the far end of an *edge that exists*, and whoever
+    /// can read it can already read the listens it is about.
+    pub shares_everything: bool,
 }
 
 /// A listen on somebody else's deck, reaching this user through a patch.
@@ -17110,7 +17186,9 @@ pub struct DeckView {
     pub bio: Option<String>,
     pub avatar_url: Option<String>,
     pub created_at: i64,
-    /// Listens through their **shared** chains. Not their history.
+    /// Listens a patch into this deck can see — everything they play when they
+    /// have opened up, and otherwise only what ran through a chain they
+    /// publish. Not, either way, their whole history: skips never appear.
     pub listens: i64,
     pub chains: Vec<DeckChain>,
     /// Overlap only — no score.
@@ -22590,6 +22668,10 @@ mod tests {
         ts: u64,
     ) -> (i64, i64) {
         let uid = db.create_user(name, None, "pw", "user").await.unwrap();
+        // Closed, stated rather than inherited — see `patched_pair`. This deck
+        // exists to test the chain gate, so it must not take whatever
+        // `create_user` defaults to.
+        db.set_share_all_with_patched(uid, false).await.unwrap();
         let chain_id = sqlx::query_scalar::<_, i64>(
             "INSERT INTO signal_chains (user_id, name, created_at) VALUES (?, ?, ?) RETURNING id",
         )
@@ -23046,6 +23128,13 @@ mod tests {
         .await
         .unwrap()[0];
         db.set_chain_shared(them, chain, true).await.unwrap();
+        // **Closed, stated rather than inherited.** These fixtures are about
+        // the gate, and `create_user` now opens a new account to its patched
+        // decks — so a fixture that took the default would quietly change
+        // meaning with it, and every "nothing unshared reaches this screen"
+        // test would start passing for the wrong reason. A test that wants the
+        // switch on turns it on.
+        db.set_share_all_with_patched(them, false).await.unwrap();
         let uuid = db.request_patch(me, them).await.unwrap();
         db.settle_patch(&uuid, them, true).await.unwrap();
         (me, them, chain)
@@ -23174,6 +23263,43 @@ mod tests {
     ///   person; there is no patch behind a figure the whole instance reads.
     /// * **Skips still never appear**, anywhere, ever.
     /// * **The switch is per deck.** Opening yours says nothing about mine.
+    /// A new account starts open to the decks it lets in; one that predates the
+    /// switch does not.
+    ///
+    /// The asymmetry is the whole point and it is easy to "tidy" away in either
+    /// direction. Flipping the column default would open every existing
+    /// account, whose patches were accepted on the understanding that an
+    /// unshared chain published nothing. Leaving the insert alone would keep
+    /// every *new* account closed for an obligation it never incurred, which is
+    /// what made the switch look like a feature nobody uses.
+    #[tokio::test]
+    async fn a_new_account_starts_open_to_the_decks_it_lets_in() {
+        let db = testdb().await;
+        let fresh = db.create_user("newcomer", None, "pw", "user").await.unwrap();
+        assert!(
+            db.share_all_with_patched(fresh).await.unwrap(),
+            "an account created under this rule starts open"
+        );
+
+        // An account that predates the column: the migration gives it 0, which
+        // is what `create_user` is deliberately not relying on.
+        sqlx::query(
+            "INSERT INTO users (username, password_hash, role, created_at) VALUES \
+             ('oldtimer', 'pw', 'user', 0)",
+        )
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        let old: i64 = sqlx::query_scalar("SELECT id FROM users WHERE username = 'oldtimer'")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert!(
+            !db.share_all_with_patched(old).await.unwrap(),
+            "an account that predates the switch is left exactly as it was"
+        );
+    }
+
     #[tokio::test]
     async fn opening_a_deck_up_shows_every_listen_and_still_spares_the_instance() {
         let db = testdb().await;
@@ -23519,11 +23645,13 @@ mod tests {
             Visible::No,
             "and neither does a source that reports no chain"
         );
-        // Somebody else's chain is not yours to publish, whatever its switch says.
+        // Somebody else's chain is not yours to publish, whatever its switch
+        // says. `me` is open to their patched decks, so the *listen* is visible
+        // — what must not happen is their chain's name coming back on it.
         assert_eq!(
             db.live_visibility(me, Some(shared)).await.unwrap(),
-            Visible::No,
-            "scoped by owner"
+            Visible::Yes(None),
+            "a chain that is not theirs is never named on their deck"
         );
 
         // With the switch on, the track shows and the private chain is simply

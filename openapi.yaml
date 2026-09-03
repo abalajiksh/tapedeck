@@ -26,7 +26,7 @@ openapi: 3.1.0
 
 info:
   title: Tapedeck
-  version: 0.105.0
+  version: 0.106.0
   summary: Self-hosted scrobbler and listening journal.
   description: |
     Tapedeck ingests listens, enriches them with MusicBrainz metadata, stores
@@ -1154,6 +1154,17 @@ components:
             **Required.** What in *your own* listening prompted the suggestion.
             A recommendation with no grounding in the history is free
             association, and is refused.
+        from:
+          type: string
+          description: |
+            Optional. The **username of a deck you are patched into** — the
+            Reel's "into my crate" button. Resolved and checked server-side,
+            and a deck you cannot read is a **403**: the Crate groups by origin
+            and shows "suggested by X", so a client writing that string itself
+            would be asserting a provenance rather than earning one. The patch
+            must point *from* you *to* them; somebody who follows you has told
+            you nothing. Omit it for something you found yourself, which files
+            under the origin `user`.
 
     CrateEntry:
       type: object
@@ -2753,10 +2764,15 @@ paths:
         states in between. A peer with a null `uuid` and `state` is one nobody
         has asked about.
 
-        `shared_chains` is how many chains that person publishes. **Zero is the
-        interesting case**: a patch into a deck sharing nothing is accepted and
-        reads empty, which is correct and needs saying on screen rather than
-        looking broken.
+        Each peer carries two fields describing what a patch into them would
+        actually show, and they have to be read together.
+        **`shares_everything`** is the gate: with it on, a patched deck sees
+        every listen they play, whatever chain it ran through or whether it ran
+        through one at all. **`shared_chains`** is how many chains they publish,
+        which is what decides visibility when that switch is off — and, either
+        way, whether the chain is *named* on a row. Zero chains **and** closed is
+        the empty patch that needs saying on screen rather than looking broken;
+        zero chains and open is a deck publishing everything it plays, unnamed.
       security: [{ sessionCookie: [] }]
       responses:
         '200':
@@ -9254,6 +9270,7 @@ paths:
                 properties: { id: { type: integer }, created: { type: boolean } }
         '400': { description: 'Missing grounding, malformed, or already in the history.' }
         '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { description: '`from` named a deck you are not patched into.' }
 
   /api/v1/crate/{id}:
     patch:

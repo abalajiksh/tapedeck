@@ -14,7 +14,7 @@
 	 * with the play count. The third — that you must be patched with them — is
 	 * enforced by the picker having nobody else in it.
 	 */
-	import { api, type PatchPeer } from '$lib/api';
+	import { api, humanError, type PatchPeer } from '$lib/api';
 	import { createEventDispatcher } from 'svelte';
 
 	export let open = false;
@@ -70,21 +70,6 @@
 			error = humanError(e);
 		}
 		busy = false;
-	}
-
-	/** The server's own sentence, out of the client's `API <status>: <body>`. */
-	function humanError(e: unknown): string {
-		const raw = e instanceof Error ? e.message : String(e);
-		const brace = raw.indexOf('{');
-		if (brace >= 0) {
-			try {
-				const parsed = JSON.parse(raw.slice(brace));
-				if (typeof parsed?.error === 'string') return parsed.error;
-			} catch {
-				/* fall through to the raw text */
-			}
-		}
-		return raw;
 	}
 
 	function close() {

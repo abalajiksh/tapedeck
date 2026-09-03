@@ -724,10 +724,14 @@ export interface PatchPeer {
 	display_name: string | null;
 	bio: string | null;
 	avatar_url: string | null;
-	/** How many chains this person publishes. **Zero is the interesting case**:
-	 *  a patch into a deck sharing nothing is accepted and reads empty, which is
-	 *  correct and needs saying rather than looking broken. */
+	/** How many chains this person publishes. **Read it with
+	 *  `shares_everything`**, which is the gate: a deck sharing no chains but
+	 *  open to its patched decks shows everything it plays. Zero chains *and*
+	 *  closed is the empty patch that needs saying rather than looking broken. */
 	shared_chains: number;
+	/** Whether they let decks they have patched in see everything they play,
+	 *  rather than only listens through a chain they publish. */
+	shares_everything: boolean;
 }
 
 export interface PatchDecks {
@@ -3312,6 +3316,28 @@ class TapedeckAPI {
 	async getCrate(): Promise<{ crate: CrateEntry[]; open: number; landed: number }> {
 		return this.get('/api/v1/crate');
 	}
+	/**
+	 * File something in your own crate.
+	 *
+	 * `from` is the username of a deck you are **patched into** — the Reel's
+	 * "into my crate" button. The server resolves it and refuses a deck you
+	 * cannot read, so the provenance the Crate then shows is earned rather than
+	 * asserted; leave it out for something you found yourself.
+	 *
+	 * Throws on a record already in your history, and the message carries the
+	 * play count — which is the useful half of that refusal.
+	 */
+	async addToCrate(entry: {
+		kind: 'artist' | 'album' | 'track';
+		artist: string;
+		name?: string | null;
+		mbid?: string | null;
+		because: string;
+		reason?: string | null;
+		from?: string;
+	}): Promise<{ id: number; created: boolean }> {
+		return this.post('/api/v1/crate', entry);
+	}
 	async setCrateStatus(id: number, status: 'open' | 'acquired' | 'dismissed'): Promise<void> {
 		await this.patch(`/api/v1/crate/${id}`, { status });
 	}
@@ -3379,6 +3405,28 @@ export interface SavedPlaylist {
 	pushed_to: string | null;
 	connection_name: string | null;
 	tracks: number;
+}
+
+/**
+ * The server's own sentence, out of the client's `API <status>: <body>`.
+ *
+ * Several refusals in this application are written to be read by a person —
+ * "you already have 43 plays of this", "you are not patched into that deck" —
+ * and putting the envelope in front of them is showing them our plumbing.
+ * One copy, because two would drift the moment the envelope's shape changed.
+ */
+export function humanError(e: unknown, fallback?: string): string {
+	const raw = e instanceof Error ? e.message : String(e);
+	const brace = raw.indexOf('{');
+	if (brace >= 0) {
+		try {
+			const parsed = JSON.parse(raw.slice(brace));
+			if (typeof parsed?.error === 'string') return parsed.error;
+		} catch {
+			/* fall through to the raw text */
+		}
+	}
+	return fallback && !raw ? fallback : raw;
 }
 
 export interface CrateEntry {

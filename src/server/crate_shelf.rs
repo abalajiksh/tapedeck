@@ -55,20 +55,42 @@ pub enum CrateRefusal {
 }
 
 impl CrateRefusal {
+    fn what(artist: &str, name: Option<&str>) -> String {
+        match name {
+            Some(n) => format!("{artist} — {n}"),
+            None => artist.to_string(),
+        }
+    }
+
+    /// Said to an **assistant**, which is why it is third-person and names the
+    /// tool to reach for instead. This wording is load-bearing on the MCP
+    /// surface: the play count is what tells a model its suggestion was
+    /// grounded in something the person already has, and the pointer at
+    /// rediscovery is what it should have called.
     pub fn message(&self, artist: &str, name: Option<&str>) -> String {
         match self {
             CrateRefusal::Invalid(m) => m.clone(),
-            CrateRefusal::AlreadyHeard { plays } => {
-                let what = match name {
-                    Some(n) => format!("{artist} — {n}"),
-                    None => artist.to_string(),
-                };
-                format!(
-                    "{what} is already in this listening history ({plays} plays), so it is not \
+            CrateRefusal::AlreadyHeard { plays } => format!(
+                "{} is already in this listening history ({plays} plays), so it is not \
 something to put in the crate. Suggesting a record they already own is what the rediscovery \
-tool is for."
-                )
-            }
+tool is for.",
+                Self::what(artist, name)
+            ),
+        }
+    }
+
+    /// Said to the **person whose crate it is**, who is reading it on their own
+    /// screen. Same refusal, second person, and it points at a page rather than
+    /// at a tool they have never heard of.
+    pub fn for_reader(&self, artist: &str, name: Option<&str>) -> String {
+        match self {
+            CrateRefusal::Invalid(m) => m.clone(),
+            CrateRefusal::AlreadyHeard { plays } => format!(
+                "You already have {} — {plays} {}. The crate is for records you haven't got; \
+Rediscovery is where the ones you have go quiet.",
+                Self::what(artist, name),
+                if *plays == 1 { "play" } else { "plays" }
+            ),
         }
     }
 }
@@ -141,18 +163,50 @@ async fn list_crate(State(state): State<Arc<AppState>>, user: AuthUser) -> Respo
     }
 }
 
+/// What a hand-filed crate entry says, plus where it came from.
+///
+/// `from` is the *username of a deck the caller is patched into* — the Reel's
+/// "put this in my crate" button — and it is **resolved and checked**, never
+/// taken as text. An origin string is displayed on the Crate as "suggested by
+/// X" and groups everything that person turned you on to, so letting a client
+/// write one directly would let it assert a provenance it did not have. Same
+/// reasoning as `fold_artist_credit` deriving its target rather than accepting
+/// one: what a record *says about where it came from* has to be earned.
+#[derive(Deserialize)]
+struct CrateAddBody {
+    #[serde(flatten)]
+    rec: NewRecommendation,
+    /// Optional. The deck you took this off.
+    from: Option<String>,
+}
+
 /// POST /api/v1/crate — add something by hand.
 async fn add(
     State(state): State<Arc<AppState>>,
     user: AuthUser,
-    Json(body): Json<NewRecommendation>,
+    Json(body): Json<CrateAddBody>,
 ) -> Response {
-    match file(&state, user.user_id, &body, "user", None).await {
+    // Absent is "I found this myself", which is what the Crate has always
+    // called `user`. Present means the caller is claiming they got it off
+    // somebody's deck, and only an accepted patch *into* that deck makes the
+    // claim true — a deck you cannot read has told you nothing.
+    let origin = match body.from.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        None => "user".to_string(),
+        Some(name) => match state.db.deck_i_am_patched_into(user.user_id, name).await {
+            Ok(Some((_, display))) => format!("{display}'s deck"),
+            Ok(None) => {
+                return err(403, "You are not patched into that deck.");
+            }
+            Err(e) => return err(500, e.to_string()),
+        },
+    };
+
+    match file(&state, user.user_id, &body.rec, &origin, None).await {
         Ok((id, created)) => {
             (StatusCode::OK, Json(serde_json::json!({ "id": id, "created": created })))
                 .into_response()
         }
-        Err(refusal) => err(400, refusal.message(&body.artist, body.name.as_deref())),
+        Err(refusal) => err(400, refusal.for_reader(&body.rec.artist, body.rec.name.as_deref())),
     }
 }
 

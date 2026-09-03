@@ -7,7 +7,7 @@
 	// instance, so nothing is signed and nothing is delivered. Outbound delivery
 	// is the whole of what is left of the phase.
 	import { onMount, onDestroy } from 'svelte';
-	import { api } from '$lib/api';
+	import { api, humanError } from '$lib/api';
 	import type {
 		SentSitting,
 		PatchPeer,
@@ -271,6 +271,29 @@
 	let myHandle = '';
 	let federating = false;
 	let npPublic = false;
+	// The third switch, and the one this page is actually about: what a deck
+	// you have already let in may see. `null` while unread — the nudge below
+	// must not accuse you of being closed before anybody has asked.
+	let myShareAll: boolean | null = null;
+	let openingUp = false;
+	let hideOpenUp = false;
+
+	async function setShareAll(on: boolean) {
+		if (myShareAll === on) return;
+		openingUp = true;
+		try {
+			myShareAll = (await api.setShareAll(on)).enabled;
+			// What the *other* end of every patch is told about you changes with
+			// it, and so does the Reel's own explanation — re-read rather than
+			// left describing the previous setting, the same call `setShared`
+			// makes.
+			await loadDecks();
+		} catch (e) {
+			notice = humanError(e, 'Could not save');
+		} finally {
+			openingUp = false;
+		}
+	}
 
 	async function loadMe() {
 		try {
@@ -288,6 +311,11 @@
 			npPublic = (await api.getPublicNowPlaying()).enabled;
 		} catch {
 			/* likewise */
+		}
+		try {
+			myShareAll = (await api.getShareAll()).enabled;
+		} catch {
+			/* the nudge stays hidden rather than guessing */
 		}
 	}
 
@@ -399,6 +427,82 @@
 		unpicked = next;
 	}
 
+	/**
+	 * Put somebody else's listen in your own crate.
+	 *
+	 * **Not a love and not a dub.** A love says you already know this; a dub
+	 * hands a record to somebody else. This is the third gesture and the one the
+	 * Reel was missing: *I have not got this, and I want to.*
+	 *
+	 * The provenance is sent as their **username** and resolved server-side —
+	 * the Crate groups by origin and shows "suggested by X", so a client
+	 * writing that string itself would be asserting a provenance rather than
+	 * earning one.
+	 *
+	 * The refusal worth surfacing is `already_heard`: the crate is for records
+	 * you do not have, and "you have 43 plays of this" is the useful half of
+	 * that answer. It arrives wrapped in the client's `API 400: {json}`
+	 * envelope, so it is unwrapped — showing somebody our plumbing is not
+	 * showing them the reason.
+	 */
+	let crating: number | null = null;
+	/** Filed this visit — the row goes to its "in your crate" state at once
+	 *  rather than waiting for a re-read. */
+	let crated = new Set<number>();
+	/**
+	 * What is *already* in the crate, so the button is honest after a reload
+	 * rather than offering a record you filed last week.
+	 *
+	 * One request for the whole crate, not a lookup per row — the same call
+	 * `loves/keys` makes, and for the same reason.
+	 *
+	 * **`crateKey` must stay in step with the server's dedup**, which is
+	 * `kind` + `Database::artist_key(artist)` + `artist_key(name)`: trimmed and
+	 * lowercased. If the two drift the button silently stops filling, exactly
+	 * as a drifted `loveKey` stops filling hearts, and nothing errors.
+	 */
+	let crateKeys = new Set<string>();
+	const crateKey = (kind: string, artist: string, name: string) =>
+		`${kind}|${artist.trim().toLowerCase()}|${name.trim().toLowerCase()}`;
+	const listenCrateKey = (l: ReelListen) =>
+		crateKey(l.album ? 'album' : 'track', l.artist, l.album || l.title);
+	$: inCrate = (l: ReelListen) => crated.has(l.id) || crateKeys.has(listenCrateKey(l));
+
+	async function loadCrateKeys() {
+		try {
+			const { crate } = await api.getCrate();
+			crateKeys = new Set(crate.map((e) => crateKey(e.kind, e.artist, e.name ?? '')));
+		} catch {
+			// A failed read must not remove the button — an offer that turns out
+			// to be a duplicate is answered by the server, and the refusal says
+			// so. Silently hiding it would be worse.
+		}
+	}
+
+	async function toCrate(l: ReelListen) {
+		if (crating || crated.has(l.id)) return;
+		crating = l.id;
+		const who = l.display_name || l.username;
+		try {
+			await api.addToCrate({
+				// The album when there is one: a record is the thing you go and
+				// find. Only the track's own title is left for a single.
+				kind: l.album ? 'album' : 'track',
+				artist: l.artist,
+				name: l.album || l.title,
+				because: `${who} played ${l.title} on ${new Date(l.timestamp * 1000).toLocaleDateString()}.`,
+				from: l.username
+			});
+			crated = new Set(crated).add(l.id);
+			crateKeys = new Set(crateKeys).add(listenCrateKey(l));
+			notice = `In your crate, off ${who}'s deck.`;
+		} catch (e) {
+			notice = humanError(e, 'Could not file that');
+		} finally {
+			crating = null;
+		}
+	}
+
 	const pickedIn = (sit: { rows: SpoolCapture[] }) =>
 		sit.rows.filter((c) => picked.has(c.id)).map((c) => c.id);
 	$: openDubs = dubs.filter((d) => d.status === 'open');
@@ -415,7 +519,12 @@
 	// A patch into a deck that publishes nothing is accepted and reads empty.
 	// That is correct, and saying so is the difference between an honest empty
 	// state and one that looks like a bug.
-	$: silent = accepted.filter((f) => f.shared_chains === 0);
+	//
+	// **Both gates, not just the chain.** A deck that shares no chains but has
+	// opened up to its patched decks publishes everything it plays, so counting
+	// it as silent would explain an empty Reel with a reason that is not the
+	// reason.
+	$: silent = accepted.filter((f) => f.shared_chains === 0 && !f.shares_everything);
 
 	async function loadDecks() {
 		try {
@@ -639,6 +748,7 @@
 		await Promise.all([
 			loadDecks(),
 			loadReel(),
+			loadCrateKeys(),
 			loadSpool(),
 			loadForwarding(),
 			loadDubs(),
@@ -1130,9 +1240,11 @@
 	<div class="panel note">Loading…</div>
 {:else if tab === 'reel'}
 	<!--
-		Rolling now. Only decks with an accepted patch playing through a **shared
-		chain** — the same gate the Reel below uses, applied to a live entry
-		because `NowPlaying` carries the chain its listen will get.
+		Rolling now. The same gate the Reel below uses, applied to a live entry:
+		an accepted patch, and then either the deck has opened up or the track is
+		running through a chain it shares. `NowPlaying` carries the chain its
+		listen will get, which is what makes the second half answerable live —
+		a name could not do it.
 	-->
 	{#if live.length}
 		<div class="livehead">
@@ -1187,6 +1299,38 @@
 		</div>
 	{/if}
 
+	<!--
+		The one moment the third switch means something.
+
+		Off is a real answer and this must not nag: it shows only once somebody
+		has actually been let in, it says what turning it on would do rather than
+		naming a setting, and dismissing it is remembered for the session. It
+		reads `myShareAll === false` and never `!myShareAll`, so an unread switch
+		does not accuse anybody of being closed.
+	-->
+	{#if myShareAll === false && accepted.length + followers.filter((f) => f.state === 'accepted').length > 0 && !hideOpenUp}
+		<div class="panel opennudge">
+			<div style="flex:1;min-width:0;">
+				<div class="h-display" style="font-size:16px;margin-bottom:3px;">
+					Your deck shows only the chains you share
+				</div>
+				<div class="esub" style="margin:0;">
+					Decks you've let in see a listen only when it ran through a chain you publish —
+					so anything played through a private chain, or through none at all, is invisible
+					to them. Opening up shows them everything you play; a private chain is still
+					never <em>named</em>, and this changes nothing about the Instance tab, Discover,
+					or what a Shared Spool may capture.
+				</div>
+			</div>
+			<div class="nudgeacts">
+				<button class="btn btn-primary" disabled={openingUp} on:click={() => setShareAll(true)}>
+					{openingUp ? 'Saving…' : 'Show them everything'}
+				</button>
+				<button class="linkish" on:click={() => (hideOpenUp = true)}>Not now</button>
+			</div>
+		</div>
+	{/if}
+
 	{#if !accepted.length}
 		<div class="panel empty">
 			<div class="h-display" style="font-size:19px;margin-bottom:6px;">Nothing on the Reel yet</div>
@@ -1197,11 +1341,11 @@
 			<div class="h-display" style="font-size:19px;margin-bottom:6px;">Quiet so far</div>
 			<div class="esub">
 				{#if silent.length === accepted.length}
-					{silent.length === 1 ? 'The deck you patched into publishes' : 'The decks you patched into publish'}
-					no chains yet — so there is nothing to show. Sharing is per chain and off by default,
-					which is theirs to switch on, not yours.
+					{silent.length === 1 ? 'The deck you patched into keeps' : 'The decks you patched into keep'}
+					every chain private and hasn't opened up to the decks it lets in — so there is
+					nothing to show. That is theirs to switch, not yours.
 				{:else}
-					Nothing has played through a shared chain yet.
+					Nothing has played yet.
 				{/if}
 			</div>
 		</div>
@@ -1314,6 +1458,28 @@
 								>
 									<svg viewBox="0 0 24 24" width="15" fill={isLovedNamed($lovedKeys, 'track', l.artist, l.title) ? 'currentColor' : 'none'} stroke="currentColor" stroke-width="2.3" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20.3l-1.35-1.2C5.9 14.85 3 12.2 3 8.9 3 6.3 5 4.3 7.5 4.3c1.6 0 3.2.8 4.5 2.6 1.3-1.8 2.9-2.6 4.5-2.6C19 4.3 21 6.3 21 8.9c0 3.3-2.9 5.95-7.65 10.2z"/></svg>
 								</button>
+								<!--
+									Into your crate — the gesture the Reel was missing. A
+									love says you already know it; this says you do not
+									have it and want to. The refusal for something already
+									in your history is the point, not an error.
+								-->
+								<button
+									class="rcrate"
+									class:on={inCrate(l)}
+									disabled={crating === l.id || inCrate(l)}
+									aria-label={inCrate(l)
+										? `${l.album || l.title} is in your crate`
+										: `Put ${l.album || l.title} in your crate`}
+									title={inCrate(l) ? 'In your crate' : 'Into my crate'}
+									on:click={() => toCrate(l)}
+								>
+									<svg viewBox="0 0 24 24" width="15" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round">
+										<path d="M3 8.5h18v10a1.5 1.5 0 0 1-1.5 1.5h-15A1.5 1.5 0 0 1 3 18.5z"/>
+										<path d="M6.2 8.5 7.4 4.6a1.4 1.4 0 0 1 1.35-1h6.5a1.4 1.4 0 0 1 1.35 1L17.8 8.5"/>
+										{#if inCrate(l)}<path d="m9 13.6 2.1 2.1 4-4"/>{:else}<path d="M12 11.4v4.4M9.8 13.6h4.4"/>{/if}
+									</svg>
+								</button>
 							</div>
 						{/each}
 					</div>
@@ -1330,8 +1496,11 @@
 	{/if}
 
 	<p class="footnote">
-		Listens only reach the Reel from chains their owner switched to shared — everything defaults
-		to private. <a href="/chains">Choose what your deck publishes</a>.
+		A listen reaches the Reel when its owner has an accepted patch with you and has either
+		opened their deck to the decks they let in, or played it through a chain they share. The
+		chain is named only where it is shared — everything else reads
+		<em>Private signal chain</em>. <button class="linkish" on:click={() => go('decks')}
+		>Choose what your own deck publishes</button>.
 	</p>
 {:else if tab === 'artists'}
 	<div class="secbar">
@@ -1341,9 +1510,9 @@
 		<span class="rankedby">{RANGE_LABEL[artistDays ?? 0]}</span>
 	</div>
 	<p class="sub">
-		Across the decks you've patched into, from the chains they share. The number beside a card
-		is <strong>your own plays</strong> — the overlap is shown as which artists, never as a
-		score.
+		Across the decks you've patched into — everything they play, or just the chains they
+		share, as each of them has decided. The number beside a card is
+		<strong>your own plays</strong> — the overlap is shown as which artists, never as a score.
 	</p>
 
 	<!--
@@ -1407,7 +1576,7 @@
 		<div class="panel empty">
 			<div class="esub">
 				Nothing yet. Artists appear here once a deck you're patched into plays something
-				through a chain it shares.
+				it publishes to you.
 			</div>
 		</div>
 	{/if}
@@ -1614,14 +1783,66 @@
 			<div>
 				<h2 class="h-display sech" style="margin:0 0 4px;">What your deck publishes</h2>
 				<p class="esub" style="margin:0;max-width:56ch;">
-					Per chain, off by default. The same switch sits in each chain's drawer on
-					<a href="/chains">Signal Chains</a> — one state, two places.
+					Two decisions, and they answer different questions: who hears
+					<em>what you play</em>, and who hears <em>how you played it</em>.
 				</p>
 			</div>
 			<span class="tag" class:tag-on={mySharedChains > 0}>
 				{mySharedChains} of {myChains.length} shared
 			</span>
 		</div>
+
+		<!--
+			The deck-level gate. It lived only in Settings and in a nudge that
+			goes away once answered, which left the page actually called "what
+			your deck publishes" unable to say what the deck publishes.
+
+			A segmented pair, not a checkbox: what this holds is a *state*, and a
+			checkbox labelled with its own state is the ambiguity the pair was
+			built to remove. Same control the chain rows below use, because it is
+			the same kind of decision one level up.
+		-->
+		<div class="pubrow deckgate">
+			<div style="flex:1;min-width:0;">
+				<div class="pubname">Decks you've patched in</div>
+				<div class="pubsub">
+					{#if myShareAll === null}
+						…
+					{:else if myShareAll}
+						See everything you play. A chain you keep private is still never
+						<em>named</em> to them — it reads "Private signal chain".
+					{:else}
+						See a listen only when it ran through a chain you share below. Anything
+						else — a private chain, or no chain at all — is invisible to them.
+					{/if}
+				</div>
+			</div>
+			<div class="seg pubseg" role="group" aria-label="What decks you have patched in can see">
+				<button
+					class="seg-btn"
+					class:on={myShareAll === false}
+					aria-pressed={myShareAll === false}
+					disabled={openingUp || myShareAll === null}
+					on:click={() => setShareAll(false)}
+				>Shared chains</button>
+				<button
+					class="seg-btn"
+					class:on={myShareAll === true}
+					aria-pressed={myShareAll === true}
+					disabled={openingUp || myShareAll === null}
+					on:click={() => setShareAll(true)}
+				>Everything</button>
+			</div>
+		</div>
+
+		<p class="esub" style="margin:14px 0 10px;max-width:60ch;">
+			Below is per chain, off by default, and it decides three more things whatever the
+			switch above says: whether the chain is <em>named</em>, whether these listens reach
+			the <button class="linkish" on:click={() => go('instance')}>Instance</button> figures
+			and Discover — where there is no patch behind the number — and whether a Shared Spool
+			may capture a play into somebody else's history. The same switch sits in each chain's
+			drawer on <a href="/chains">Signal Chains</a> — one state, two places.
+		</p>
 
 		{#if myChains.length}
 			<div class="pubgrid">
@@ -1685,6 +1906,8 @@
 							<div class="pmeta">
 								{#if p.state === 'pending'}
 									Waiting on them
+								{:else if p.shares_everything}
+									Everything they play
 								{:else if p.shared_chains === 0}
 									Shares no chains yet — nothing will appear
 								{:else}
@@ -2580,11 +2803,52 @@
 	}
 	.rlove:hover { color: var(--td-accent); }
 	.rlove.on { color: #b2622d; }
+	/* Same affordance as the love, one step quieter: filing is a rarer gesture
+	   than a heart and should not compete with it for the eye. */
+	.rcrate {
+		border: none;
+		background: transparent;
+		color: var(--td-muted-3);
+		cursor: pointer;
+		padding: 5px;
+		border-radius: 9px;
+		display: flex;
+		flex: none;
+	}
+	.rcrate:hover:not(:disabled) { color: var(--td-accent); }
+	.rcrate.on { color: var(--td-good-fg); }
+	.rcrate:disabled { cursor: default; }
+	.rcrate.on:disabled { opacity: 1; }
 	@media (max-width: 640px) {
 		/* The sleeve goes before the person does: at this width the row is
 		   already carrying an avatar, and two circles crowd the title. */
 		.lrow :global(.cover) { display: none; }
 		.rhandle { display: none; }
+	}
+
+	/* — the open-up nudge — */
+	.opennudge {
+		display: flex;
+		align-items: flex-start;
+		gap: 16px;
+		flex-wrap: wrap;
+		margin-bottom: 16px;
+	}
+	/* The deck-level gate reads as the row above the per-chain ones, not as one
+	   of them: it is the decision they sit under. */
+	.deckgate {
+		border-bottom: 1px solid var(--td-border);
+		padding-bottom: 14px;
+		margin-bottom: 2px;
+	}
+	.nudgeacts {
+		display: flex;
+		align-items: center;
+		gap: 12px;
+		flex: none;
+	}
+	@media (max-width: 560px) {
+		.nudgeacts { width: 100%; }
 	}
 
 	/* — rolling now — */
