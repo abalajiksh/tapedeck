@@ -21,12 +21,15 @@
 
 pub mod card;
 pub mod fonts;
+pub mod layout;
 pub mod month;
 pub mod svg;
 pub mod theme;
+pub mod week;
+pub mod year;
 
 pub use card::Card;
-pub use month::Size;
+pub use layout::{Size, Unit};
 pub use theme::Theme;
 
 /// What a render produced, and what it could not promise about it.
@@ -73,8 +76,16 @@ impl std::error::Error for RenderError {}
 /// `spawn_blocking`. A 1080×1920 pixmap is ~8 MB of RGBA and rasterising it in
 /// an async handler pins a tokio worker, one of four on a Pi, which is the
 /// mistake `report_rows`' fold already had to be moved off.
-pub fn render(c: &Card, size: Size, theme: Theme) -> Result<Rendered, RenderError> {
-    let drawn = month::render_measured(c, size, theme);
+pub fn render(c: &Card, unit: Unit, size: Size, theme: Theme) -> Result<Rendered, RenderError> {
+    // Three units, three compositions — never one card with a different label.
+    // A week has no clock and no genre split, a year is a bento over twelve
+    // months, and a month is neither; the chapters on the page are three
+    // components for exactly this reason.
+    let drawn = match unit {
+        Unit::Week => week::render_measured(c, size, theme),
+        Unit::Month => month::render_measured(c, size, theme),
+        Unit::Year => year::render_measured(c, size, theme),
+    };
 
     let mut opt =
         usvg::Options { fontdb: std::sync::Arc::new(fonts::db().clone()), ..Default::default() };
@@ -98,44 +109,7 @@ mod tests {
     use super::*;
 
     fn a_month() -> Card {
-        Card {
-            label: "August 2026".into(),
-            plays: 4182,
-            hours: 214.6,
-            avg_daily: 135,
-            rank: 2,
-            rank_of: 14,
-            artists: 214,
-            albums: 318,
-            tracks: 902,
-            colour: Some("#a18430".into()),
-            top_artist: Some(card::Named { name: "Cœur de pirate".into(), plays: 612 }),
-            top_album: Some(card::Titled {
-                title: "Blonde".into(),
-                artist: "Cœur de pirate".into(),
-                plays: 96,
-            }),
-            genres: vec![
-                ("dance-pop".into(), 41),
-                ("chanson".into(), 22),
-                ("french pop".into(), 14),
-                ("indie poptimism".into(), 8),
-            ],
-            on_repeat: vec![
-                card::Titled {
-                    title: "Comme des enfants".into(),
-                    artist: "Cœur de pirate".into(),
-                    plays: 9,
-                },
-                card::Titled {
-                    title: "Ne m'appelle pas Fanny".into(),
-                    artist: "Clara Luciani".into(),
-                    plays: 7,
-                },
-            ],
-            crush: Some(card::Named { name: "Clara Luciani".into(), plays: 63 }),
-            top_chain: Some("Desk2 · HD 650".into()),
-        }
+        Card::sample(Unit::Month)
     }
 
     /// The whole point, end to end: every shape and both themes produce a real
@@ -147,16 +121,22 @@ mod tests {
     /// would otherwise wave through.
     #[test]
     fn every_shape_and_theme_rasterises_to_a_png_of_the_right_size() {
-        for size in [Size::Story, Size::Square, Size::Wide] {
-            for theme in [Theme::Dark, Theme::Light] {
-                let r = render(&a_month(), size, theme).expect("render");
-                let (w, h) = size.dims();
-                assert_eq!(&r.png[..8], b"\x89PNG\r\n\x1a\n", "{size:?}/{theme:?} is not a PNG");
-                // IHDR width and height, big-endian, at a fixed offset.
-                let px = u32::from_be_bytes(r.png[16..20].try_into().unwrap());
-                let py = u32::from_be_bytes(r.png[20..24].try_into().unwrap());
-                assert_eq!((px, py), (w as u32, h as u32), "{size:?}");
-                assert!(r.fully_covered, "a Latin card must be fully covered");
+        for (unit, card) in [Unit::Week, Unit::Month, Unit::Year].map(|u| (u, Card::sample(u))) {
+            for size in [Size::Story, Size::Square, Size::Wide] {
+                for theme in [Theme::Dark, Theme::Light] {
+                    let r = render(&card, unit, size, theme).expect("render");
+                    let (w, h) = size.dims();
+                    assert_eq!(
+                        &r.png[..8],
+                        b"\x89PNG\r\n\x1a\n",
+                        "{size:?}/{theme:?} is not a PNG"
+                    );
+                    // IHDR width and height, big-endian, at a fixed offset.
+                    let px = u32::from_be_bytes(r.png[16..20].try_into().unwrap());
+                    let py = u32::from_be_bytes(r.png[20..24].try_into().unwrap());
+                    assert_eq!((px, py), (w as u32, h as u32), "{unit:?}/{size:?}");
+                    assert!(r.fully_covered, "a Latin card must be fully covered");
+                }
             }
         }
     }
@@ -170,7 +150,7 @@ mod tests {
     /// apart, and it fails if text ever stops rendering.
     #[test]
     fn the_card_is_actually_drawn_and_not_a_flat_rectangle() {
-        let r = render(&a_month(), Size::Square, Theme::Dark).expect("render");
+        let r = render(&a_month(), Unit::Month, Size::Square, Theme::Dark).expect("render");
         let pix = tiny_skia::Pixmap::decode_png(&r.png).expect("decode");
         let mut seen = std::collections::HashSet::new();
         for p in pix.pixels() {
@@ -222,17 +202,23 @@ mod tests {
     /// panels overlapping — and this feature is one where the only real check
     /// is opening the picture. Run with:
     /// `TAPEDECK_CARD_DIR=/tmp/cards cargo test -- --ignored render_the_cards`
+    /// All three units, because three compositions is three times as much that
+    /// can look wrong while every assertion passes.
     #[test]
     #[ignore]
     fn render_the_cards_to_look_at() {
         let dir = std::env::var("TAPEDECK_CARD_DIR").expect("set TAPEDECK_CARD_DIR");
         std::fs::create_dir_all(&dir).expect("mkdir");
-        for size in [Size::Story, Size::Square, Size::Wide] {
-            for theme in [Theme::Dark, Theme::Light] {
-                let r = render(&a_month(), size, theme).expect("render");
-                let path = format!("{dir}/{}-{}.png", size.as_str(), theme.as_str());
-                std::fs::write(&path, &r.png).expect("write");
-                println!("{path} ({} bytes)", r.png.len());
+        for unit in [Unit::Week, Unit::Month, Unit::Year] {
+            let card = Card::sample(unit);
+            for size in [Size::Story, Size::Square, Size::Wide] {
+                for theme in [Theme::Dark, Theme::Light] {
+                    let r = render(&card, unit, size, theme).expect("render");
+                    let path =
+                        format!("{dir}/{}-{}-{}.png", unit.as_str(), size.as_str(), theme.as_str());
+                    std::fs::write(&path, &r.png).expect("write");
+                    println!("{path} ({} bytes)", r.png.len());
+                }
             }
         }
     }
@@ -247,7 +233,7 @@ mod tests {
             artist: "헤이즈".into(),
             plays: 12,
         });
-        let r = render(&c, Size::Square, Theme::Dark).expect("render");
+        let r = render(&c, Unit::Month, Size::Square, Theme::Dark).expect("render");
         assert!(!r.png.is_empty(), "the image is still produced");
         assert!(!r.fully_covered, "and the caller is told it may contain tofu");
     }

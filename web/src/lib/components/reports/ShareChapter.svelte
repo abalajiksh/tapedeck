@@ -14,7 +14,9 @@
 	 */
 	import { onDestroy } from 'svelte';
 
-	/** Which chapter. Only `month` has a composition on the server so far. */
+	/** Which chapter. All three have their own composition on the server — a
+	 *  week's by-day bars, a year's twelve-month shape and genre bands — rather
+	 *  than one card relabelled, which is why this is a unit and not a title. */
 	export let unit: 'week' | 'month' | 'year';
 	export let offset = 0;
 	export let label = '';
@@ -96,86 +98,73 @@
 		>
 			<div class="dialog-title">Share {label}</div>
 			<div class="dialog-body">
-				{#if unit !== 'month'}
-					<p class="sub" style="margin:0;">
-						Only a month can be drawn as an image so far. A week and a year are different
-						layouts on the page — a week has no clock and no genre split — so they need
-						their own card rather than a month's wearing the wrong label.
+				<div class="field">
+					<span class="lbl">Shape</span>
+					<div class="seg">
+						{#each SIZES as s (s.k)}
+							<button
+								class="seg-btn"
+								class:on={size === s.k}
+								on:click={() => (size = s.k)}>{s.label}</button
+							>
+						{/each}
+					</div>
+					<!-- Beside the control rather than in a `title`: a tooltip
+					     overrode each button's accessible name, so the shapes read
+					     as "1080 × 1920" instead of "Story" — and a tooltip is
+					     unreachable from a keyboard or a phone anyway. -->
+					<p class="hint">{SIZES.find((s) => s.k === size)?.hint}</p>
+				</div>
+
+				<div class="field">
+					<span class="lbl">Look</span>
+					<div class="seg">
+						{#each THEMES as t (t.k)}
+							<button
+								class="seg-btn"
+								class:on={theme === t.k}
+								on:click={() => (theme = t.k)}>{t.label}</button
+							>
+						{/each}
+					</div>
+					<p class="hint">
+						Asked here rather than taken from your own theme — this one lands on
+						somebody else's screen.
 					</p>
-				{:else}
-					<div class="field">
-						<span class="lbl">Shape</span>
-						<div class="seg">
-							{#each SIZES as s (s.k)}
-								<button
-									class="seg-btn"
-									class:on={size === s.k}
-									on:click={() => (size = s.k)}>{s.label}</button
-								>
-							{/each}
-						</div>
-						<!-- Beside the control rather than in a `title`: a tooltip
-						     overrode each button's accessible name, so the shapes read
-						     as "1080 × 1920" instead of "Story" — and a tooltip is
-						     unreachable from a keyboard or a phone anyway. -->
-						<p class="hint">{SIZES.find((s) => s.k === size)?.hint}</p>
+				</div>
+
+				<!-- Keyed so switching shape or look replaces the image rather than
+				     leaving the previous one up while the next decodes. -->
+				{#key src}
+					<div class="preview" class:wide={size === 'wide'}>
+						<img {src} alt="{label} as a {size} card" />
 					</div>
+				{/key}
 
-					<div class="field">
-						<span class="lbl">Look</span>
-						<div class="seg">
-							{#each THEMES as t (t.k)}
-								<button
-									class="seg-btn"
-									class:on={theme === t.k}
-									on:click={() => (theme = t.k)}>{t.label}</button
-								>
-							{/each}
-						</div>
-						<p class="hint">
-							Asked here rather than taken from your own theme — this one lands on
-							somebody else's screen.
-						</p>
-					</div>
-
-					<!-- Keyed so switching shape or look replaces the image rather than
-					     leaving the previous one up while the next decodes. -->
-					{#key src}
-						<div class="preview" class:wide={size === 'wide'}>
-							<img {src} alt="{label} as a {size} card" />
-						</div>
-					{/key}
-
-					{#if coverage === 'partial'}
-						<p class="warn">
-							Some characters on this card aren't in Tapedeck's own fonts — Hangul, CJK
-							and Cyrillic fall back to whatever the server has installed, so they may
-							come out as boxes. Everything else is exact.
-						</p>
-					{/if}
-					{#if error}<p class="bad">{error}</p>{/if}
-
-					<div class="acts">
-						<button class="btn btn-secondary" on:click={close}>Close</button>
-						<a class="btn btn-secondary" href="{src}&format=svg" target="_blank" rel="noreferrer">
-							Open the SVG
-						</a>
-						<button class="btn btn-primary" on:click={save} disabled={saving}>
-							{saving ? 'Drawing…' : 'Save the PNG'}
-						</button>
-					</div>
+				{#if coverage === 'partial'}
+					<p class="warn">
+						Some characters on this card aren't in Tapedeck's own fonts — Hangul, CJK
+						and Cyrillic fall back to whatever the server has installed, so they may
+						come out as boxes. Everything else is exact.
+					</p>
 				{/if}
+				{#if error}<p class="bad">{error}</p>{/if}
+
+				<div class="acts">
+					<button class="btn btn-secondary" on:click={close}>Close</button>
+					<a class="btn btn-secondary" href="{src}&format=svg" target="_blank" rel="noreferrer">
+						Open the SVG
+					</a>
+					<button class="btn btn-primary" on:click={save} disabled={saving}>
+						{saving ? 'Drawing…' : 'Save the PNG'}
+					</button>
+				</div>
 			</div>
 		</div>
 	</div>
 {/if}
 
 <style>
-	.sub {
-		font-size: 13px;
-		color: var(--td-muted);
-		text-wrap: pretty;
-	}
 	.lbl {
 		display: block;
 		font-size: 12px;

@@ -22,7 +22,7 @@ use axum::routing::get;
 use axum::{Json, Router};
 use serde::Deserialize;
 
-use crate::report_image::{self, Card, Size, Theme};
+use crate::report_image::{self, Card, Size, Theme, Unit};
 use crate::server::auth::ReadAuth;
 use crate::server::models::ErrorResponse;
 use crate::server::AppState;
@@ -37,7 +37,8 @@ fn err(code: u16, msg: &str) -> axum::response::Response {
 
 #[derive(Deserialize)]
 pub struct ImageQuery {
-    /// Which bucket. Only `month` is drawn today — see `unsupported`.
+    /// `week`, `month` (default) or `year`. Each has its own composition —
+    /// there is no card that is another card at a different size.
     pub unit: Option<String>,
     /// How many periods back from the newest, matching the Reports stepper.
     pub offset: Option<usize>,
@@ -54,26 +55,19 @@ pub struct ImageQuery {
     pub format: Option<String>,
 }
 
-/// The units this endpoint can draw.
-///
-/// A week and a year want different compositions rather than the month's at a
-/// different size — the reason Reports has three chapter components and not one
-/// — so asking for one is a **400 naming what is available** rather than a
-/// month card wearing a year's label, which is the answer that would be wrong
-/// while looking right.
-fn unsupported(unit: &str) -> bool {
-    !matches!(unit, "month")
-}
-
 pub async fn report_image(
     State(state): State<Arc<AppState>>,
     auth: ReadAuth,
     Query(q): Query<ImageQuery>,
 ) -> impl IntoResponse {
-    let unit = q.unit.clone().unwrap_or_else(|| "month".into());
-    if unsupported(&unit) {
-        return err(400, "Only a month can be drawn as an image so far — pass unit=month");
-    }
+    // A week, a month and a year are three compositions, never one card at a
+    // different size — the reason Reports has three chapter components. An
+    // unknown bucket is refused rather than defaulted, because the wrong one
+    // would be an answer that looks entirely right.
+    let unit_str = q.unit.clone().unwrap_or_else(|| "month".into());
+    let Some(unit) = Unit::parse(&unit_str) else {
+        return err(400, "unit must be week, month or year");
+    };
     let Some(size) = Size::parse(q.size.as_deref()) else {
         return err(400, "size must be story, square or wide");
     };
@@ -88,7 +82,7 @@ pub async fn report_image(
     // an optimisation — the fold walks the whole history whatever is asked for
     // — it is so the page cannot be misread for the period.
     let rq = crate::server::reports::ReportQuery {
-        unit: Some(unit.clone()),
+        unit: Some(unit.as_str().to_string()),
         offset: Some(offset),
         limit: Some(1),
     };
@@ -126,7 +120,9 @@ pub async fn report_image(
     // rasterising it in the handler pins a tokio worker — one of four on a Pi —
     // which is the mistake the report fold itself had to be moved off.
     let rendered =
-        match tokio::task::spawn_blocking(move || report_image::render(&card, size, theme)).await {
+        match tokio::task::spawn_blocking(move || report_image::render(&card, unit, size, theme))
+            .await
+        {
             Ok(Ok(r)) => r,
             Ok(Err(e)) => {
                 tracing::error!("Report image could not be drawn: {e}");
@@ -140,7 +136,7 @@ pub async fn report_image(
 
     let stem = format!(
         "tapedeck-{}-{}-{}",
-        slug(period.get("key").and_then(serde_json::Value::as_str).unwrap_or(&unit)),
+        slug(period.get("key").and_then(serde_json::Value::as_str).unwrap_or(unit.as_str())),
         size.as_str(),
         theme.as_str()
     );
@@ -201,18 +197,22 @@ pub fn create_report_image_router() -> Router<Arc<AppState>> {
 mod tests {
     use super::*;
 
-    /// A week and a year are refused rather than drawn as a month.
+    /// The three buckets are drawn, and nothing else is guessed at.
     ///
-    /// The three chapters are three compositions in the app for a reason — a
-    /// week has no clock and no genre split — so drawing a month's card and
-    /// labelling it "Week 34" would be an answer that is wrong while looking
-    /// entirely right.
+    /// A unit with no composition must be **refused**, never quietly rendered
+    /// as a month: the card would carry that period's numbers under the wrong
+    /// heading and the wrong crush line, which is an answer that is wrong while
+    /// looking entirely right.
     #[test]
-    fn only_the_shape_that_has_been_drawn_is_offered() {
-        assert!(!unsupported("month"));
-        for u in ["week", "year", "decade", ""] {
-            assert!(unsupported(u), "{u} has no composition yet");
+    fn only_the_buckets_that_have_been_drawn_are_offered() {
+        for (s, u) in [("week", Unit::Week), ("month", Unit::Month), ("year", Unit::Year)] {
+            assert_eq!(Unit::parse(s), Some(u));
+            assert_eq!(u.as_str(), s, "the round trip is what builds the report query");
         }
+        for u in ["decade", "day", "", "MONTHS"] {
+            assert_eq!(Unit::parse(u), None, "{u} has no composition");
+        }
+        assert_eq!(Unit::parse("  Year "), Some(Unit::Year), "trimmed and folded, like Size");
     }
 
     /// The period key lands in a response header, so it is reduced rather than

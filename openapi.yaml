@@ -26,7 +26,7 @@ openapi: 3.1.0
 
 info:
   title: Tapedeck
-  version: 0.106.0
+  version: 0.107.0
   summary: Self-hosted scrobbler and listening journal.
   description: |
     Tapedeck ingests listens, enriches them with MusicBrainz metadata, stores
@@ -3890,21 +3890,37 @@ paths:
         chapter it was shared from — including the rule that the only
         comparison on the card is against the caller's *own* periods.
 
-        The card is a **composition, not a screenshot of the chapter**: a
-        headline, the top artist and record, the counts, and then whatever of
-        the genres, the repeats and the crush fits the shape. A section that
-        would not fit is left out whole rather than clipped, so a thin month
-        draws fewer sections rather than empty headings.
+        The card is a **composition, not a screenshot of the chapter**, and
+        each unit has its own — never one card relabelled, the same reason the
+        app has three chapter components:
 
-        Only `unit=month` is drawn so far. A week and a year are separate
-        compositions in the app — a week has no clock and no genre split — so
-        asking for one is a 400 rather than a month card wearing a year's label.
+        * **week** — a headline, the **by-day bars**, the top artist and the
+          track of the week, the counts, the crush. Deliberately **no genre
+          split**: seven days make a thin one, which is the chapter's own
+          judgement.
+        * **month** — the top artist and record, the counts, the top genres,
+          what was on repeat, the crush. No by-week bars: five columns say less
+          than the ranked genre list beneath them.
+        * **year** — the **by-month bars** and the **genre bands** (the three
+          biggest genres tracked by name across the year, everything else folded
+          into `other`), the artist and record of the year, what was discovered,
+          the crush.
+
+        A section that would not fit is **left out whole** rather than clipped —
+        a PNG has no scrollbar, so a section drawn over the footer would look
+        deliberate. A thin period therefore draws fewer sections rather than
+        empty headings, and a full year gives up its discovery line before it
+        gives up the crush.
       security: [{ sessionCookie: [] }, { apiToken: [read] }]
       parameters:
         - name: unit
           in: query
-          schema: { type: string, enum: [month], default: month }
-          description: Only `month` has a composition yet; anything else is a 400.
+          schema: { type: string, enum: [week, month, year], default: month }
+          description: |
+            Each has its own composition — see the description above. Anything
+            else is a 400 rather than a default, because the wrong card would
+            carry that period's numbers under the wrong heading and the wrong
+            crush line, which is an answer that is wrong while looking right.
         - name: offset
           in: query
           schema: { type: integer, minimum: 0, default: 0 }

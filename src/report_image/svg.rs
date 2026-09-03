@@ -94,6 +94,32 @@ impl Doc {
         self
     }
 
+    /// A rounded rect at less than full opacity.
+    ///
+    /// Separate from `rounded` rather than an `Option` on it, because every
+    /// existing caller is opaque and threading a parameter through them to say
+    /// so would make the common case read as the exception. Used by the genre
+    /// bands, where the tints are opacities of the period's own colour rather
+    /// than three hues invented here.
+    #[allow(clippy::too_many_arguments)]
+    pub fn rounded_opacity(
+        &mut self,
+        x: f32,
+        y: f32,
+        w: f32,
+        h: f32,
+        r: f32,
+        fill: &str,
+        op: f32,
+    ) -> &mut Self {
+        let _ = write!(
+            self.body,
+            r#"<rect x="{x:.2}" y="{y:.2}" width="{w:.2}" height="{h:.2}" rx="{r:.2}" ry="{r:.2}" fill="{}" fill-opacity="{op:.3}"/>"#,
+            esc(fill)
+        );
+        self
+    }
+
     /// A hairline, drawn as a filled rect rather than a stroked line: a stroke
     /// straddles its coordinate, so a 1px rule at an integer y lands half in
     /// each row of pixels and renders as two grey rows instead of one.

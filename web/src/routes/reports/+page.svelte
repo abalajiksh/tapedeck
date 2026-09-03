@@ -202,9 +202,9 @@
 	{#if period}
 		{#key period.key}
 			{#if unit === 'year'}
-				<YearChapter p={period} onShare={null} />
+				<YearChapter p={period} onShare={() => (sharing = true)} />
 			{:else if unit === 'week'}
-				<WeekChapter p={period} onShare={null}>
+				<WeekChapter p={period} onShare={() => (sharing = true)}>
 					<svelte:fragment slot="blurb">{blurb(period)}</svelte:fragment>
 					<svelte:fragment slot="footer">
 						<div class="chapter-foot"><p class="foot-note">{footNote}</p></div>
@@ -228,11 +228,14 @@
 			<PeriodNote {unit} periodKey={period.key} label={period.label} />
 		{/key}
 
-		<!-- Only the month offers the button — a week and a year are separate
-		     compositions on the server and are not drawn yet, and a control whose
-		     only job is to explain that it does nothing is one to leave out. The
-		     dialog still checks, since the unit can change while it is open. -->
-		<ShareChapter {unit} offset={idx} label={period.label} bind:open={sharing} />
+		<!-- All three units are drawn now, and each is its own composition on
+		     the server rather than the month's at a different size — the same
+		     reason there are three chapter components above. Keyed on the unit
+		     as well as the period so the dialog cannot keep a preview of the
+		     shape that was on screen before the stepper moved. -->
+		{#key unit}
+			<ShareChapter {unit} offset={idx} label={period.label} bind:open={sharing} />
+		{/key}
 	{/if}
 
 	<ToTop />
