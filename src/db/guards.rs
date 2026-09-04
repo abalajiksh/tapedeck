@@ -163,6 +163,10 @@ fn filter_bearing_fragments() -> BTreeSet<String> {
 /// where SQL appears inside the test fixtures below — exactly the trap the
 /// OpenAPI drift test records, which had to filter out `.route(` occurrences in
 /// its own string literals.
+///
+/// `tests.rs` and `pg_live.rs` go with it: both are `#[cfg(test)]`-only and
+/// hold fixtures rather than production queries, so scanning them reports the
+/// test's own SQL as an application defect.
 fn db_sources() -> Vec<(PathBuf, String)> {
     let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/db");
     let mut out = Vec::new();
@@ -171,7 +175,7 @@ fn db_sources() -> Vec<(PathBuf, String)> {
         if p.extension().is_some_and(|e| e == "rs")
             && !matches!(
                 p.file_name().and_then(|n| n.to_str()),
-                Some("guards.rs") | Some("tests.rs")
+                Some("guards.rs") | Some("tests.rs") | Some("pg_live.rs")
             )
         {
             let src = std::fs::read_to_string(&p).expect("read db source");

@@ -2917,5 +2917,8 @@ mod users;
 // throwaway Postgres schema (a `TAPEDECK_TEST_DATABASE_URL`, a schema per test,
 // dropped afterwards) is the work that closes it, and it should land before
 // anyone points a Postgres build at data they care about.
+#[cfg(all(test, feature = "postgres"))]
+mod pg_live;
+
 #[cfg(all(test, not(feature = "postgres")))]
 mod tests;

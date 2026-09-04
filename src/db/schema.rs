@@ -131,6 +131,170 @@ impl Database {
 
     pub(super) async fn init(&self) -> Result<(), sqlx::Error> {
         self.ddl(
+            "CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT UNIQUE NOT NULL,
+                display_name TEXT,
+                password_hash TEXT NOT NULL,
+                role TEXT NOT NULL DEFAULT 'user',
+                created_at INTEGER NOT NULL,
+                settings JSON DEFAULT '{}',
+                disabled INTEGER NOT NULL DEFAULT 0,
+                avatar_url TEXT,
+                bio TEXT,
+                -- The one deliberately public read path in this application.
+                -- Off by default and never inferred: everything else here is
+                -- self-only, so publishing has to be an act, not a default.
+                public_now_playing INTEGER NOT NULL DEFAULT 0,
+                -- Which *extra* fields the publish switch carries, as a JSON
+                -- array drawn from `PublicNpFields::KNOWN`. Title, artist and
+                -- album are the whole of the base payload; everything richer
+                -- than that is opted into one field at a time.
+                public_np_fields TEXT,
+                -- Whether this account answers to the rest of the fediverse at
+                -- all: an actor document, a WebFinger record, an inbox that
+                -- takes deliveries.
+                --
+                -- Off by default and off for every account that predates the
+                -- column, for the reason `public_now_playing` is: serving an
+                -- actor publishes a handle, a display name, a bio and an avatar
+                -- to any stranger who asks, and nobody consents to that by
+                -- their operator upgrading a binary. Ashwin's call, 2026-08-22.
+                --
+                -- Note this is *not* the same question as whether the deck is
+                -- public. It is the question of whether the person can be found
+                -- and patched into at all -- following happens while private in
+                -- this design, so being discoverable and being readable are two
+                -- switches and always will be.
+                federation_enabled INTEGER NOT NULL DEFAULT 0,
+                -- Whether a deck you have patched with sees **all** your
+                -- listens, or only those through chains you share.
+                --
+                -- Off by default, which is the old behaviour exactly. See
+                -- `PATCH_VISIBLE_LISTENS` for what it opens up and, just as
+                -- importantly, what it does not.
+                share_all_with_patched INTEGER NOT NULL DEFAULT 0,
+                -- Whether a play accepted out of a Shared Spool is forwarded on
+                -- to this account's Last.fm / ListenBrainz, or stored here
+                -- only.
+                --
+                -- Off by default and off for every account that predates the
+                -- column, for the reason the two switches above are: turning it
+                -- on writes to somebody's permanent public record, and nobody
+                -- consents to that by their operator upgrading a binary.
+                --
+                -- It is a *user* setting rather than a per-connection one
+                -- because the question is about the listening, not about any
+                -- one service: either somebody else's deck playing a record you
+                -- were in the room for counts as your listen or it does not,
+                -- and that answer cannot differ between Last.fm and
+                -- ListenBrainz without meaning two different things at once.
+                forward_spool_listens INTEGER NOT NULL DEFAULT 0
+            )",
+        )
+        .await?;
+        self.ddl(
+            "CREATE TABLE IF NOT EXISTS signal_chains (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL REFERENCES users(id),
+                name TEXT NOT NULL, description TEXT,
+                components JSON NOT NULL DEFAULT '[]',
+                listening_context TEXT NOT NULL DEFAULT 'unknown',
+                icon TEXT,
+                is_active BOOLEAN DEFAULT TRUE,
+                total_hours REAL DEFAULT 0,
+                created_at INTEGER NOT NULL,
+                -- Phase 6: the sharing unit is the chain, not the listen.
+                --
+                -- Off by default, and it is what decides whether a listen ever
+                -- reaches the Reel, the instance figures or an outbox. There is
+                -- no per-listen override and there should not be one: this is a
+                -- standing decision about *how you listen*, which is a thing
+                -- somebody can hold in their head, where a choice per play is
+                -- not. It is the reason private-by-default is not also useless.
+                shared BOOLEAN NOT NULL DEFAULT FALSE,
+                UNIQUE(user_id, name)
+            )",
+        )
+        .await?;
+        self.ddl(
+            "CREATE TABLE IF NOT EXISTS tokens (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL REFERENCES users(id),
+                token_hash TEXT UNIQUE NOT NULL,
+                name TEXT NOT NULL,
+                scopes TEXT DEFAULT 'submit',
+                created_at INTEGER NOT NULL,
+                last_used_at INTEGER,
+                expires_at INTEGER,
+                default_chain_id INTEGER REFERENCES signal_chains(id),
+                -- Whether this client's import-type submissions are
+                -- live listens rather than a backfill. Off by default and never
+                -- inferred: turning it on lets a client write to the owner's
+                -- permanent Last.fm/ListenBrainz record, which is not a decision
+                -- to make on their behalf.
+                imports_are_live BOOLEAN DEFAULT FALSE
+            )",
+        )
+        .await?;
+        self.ddl(
+            "CREATE TABLE IF NOT EXISTS devices (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL REFERENCES users(id),
+                machine_id TEXT NOT NULL, name TEXT, platform TEXT,
+                product TEXT, device_type TEXT,
+                default_chain_id INTEGER REFERENCES signal_chains(id),
+                first_seen INTEGER NOT NULL, last_seen INTEGER NOT NULL,
+                total_listens INTEGER DEFAULT 0,
+                UNIQUE(user_id, machine_id)
+            )",
+        )
+        .await?;
+        self.ddl(
+            "CREATE TABLE IF NOT EXISTS equipment (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL REFERENCES users(id),
+                name TEXT NOT NULL, type TEXT NOT NULL,
+                brand TEXT, model TEXT,
+                total_hours REAL DEFAULT 0,
+                first_used INTEGER, last_used INTEGER, notes TEXT,
+                -- Distinct from `first_used`, which is when Tapedeck first saw
+                -- it. Gear is usually owned for a while before it is logged,
+                -- and burn-in hours are counted from the purchase, not from the
+                -- day someone got round to typing it in.
+                purchased_at INTEGER,
+                -- Why a piece of gear is not in a chain: 'new', 'spare',
+                -- 'lent'. Free text rather than a CHECK, for the reason
+                -- `equipment_type` is — the UI owns the vocabulary, and a
+                -- constraint here would mean a rebuild to add a word. NULL is
+                -- the usual state and means nothing has been said.
+                status TEXT,
+                UNIQUE(user_id, name)
+            )",
+        )
+        .await?;
+        self.ddl(
+            "CREATE TABLE IF NOT EXISTS sessions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL REFERENCES users(id),
+                device_id INTEGER REFERENCES devices(id),
+                chain_id INTEGER REFERENCES signal_chains(id),
+                started_at INTEGER NOT NULL, ended_at INTEGER,
+                track_count INTEGER DEFAULT 0, total_duration INTEGER DEFAULT 0,
+                skip_count INTEGER DEFAULT 0, avg_quality_score REAL,
+                listening_context TEXT DEFAULT 'unknown',
+                token_id INTEGER REFERENCES tokens(id),
+                uuid TEXT,
+                title TEXT,
+                -- A note about the sitting itself, distinct from a liner note
+                -- about a record, e.g. a first listen on a new cartridge.
+                notes TEXT,
+                updated_at INTEGER
+            )",
+        )
+        .await?;
+
+        self.ddl(
             "CREATE TABLE IF NOT EXISTS scrobbles (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_id INTEGER NOT NULL DEFAULT 1,
@@ -200,116 +364,6 @@ impl Database {
         )
         .await?;
 
-        self.ddl(
-            "CREATE TABLE IF NOT EXISTS users (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                username TEXT UNIQUE NOT NULL,
-                display_name TEXT,
-                password_hash TEXT NOT NULL,
-                role TEXT NOT NULL DEFAULT 'user',
-                created_at INTEGER NOT NULL,
-                settings JSON DEFAULT '{}',
-                disabled INTEGER NOT NULL DEFAULT 0,
-                avatar_url TEXT,
-                bio TEXT,
-                -- The one deliberately public read path in this application.
-                -- Off by default and never inferred: everything else here is
-                -- self-only, so publishing has to be an act, not a default.
-                public_now_playing INTEGER NOT NULL DEFAULT 0,
-                -- Which *extra* fields the publish switch carries, as a JSON
-                -- array drawn from `PublicNpFields::KNOWN`. Title, artist and
-                -- album are the whole of the base payload; everything richer
-                -- than that is opted into one field at a time.
-                public_np_fields TEXT,
-                -- Whether this account answers to the rest of the fediverse at
-                -- all: an actor document, a WebFinger record, an inbox that
-                -- takes deliveries.
-                --
-                -- Off by default and off for every account that predates the
-                -- column, for the reason `public_now_playing` is: serving an
-                -- actor publishes a handle, a display name, a bio and an avatar
-                -- to any stranger who asks, and nobody consents to that by
-                -- their operator upgrading a binary. Ashwin's call, 2026-08-22.
-                --
-                -- Note this is *not* the same question as whether the deck is
-                -- public. It is the question of whether the person can be found
-                -- and patched into at all -- following happens while private in
-                -- this design, so being discoverable and being readable are two
-                -- switches and always will be.
-                federation_enabled INTEGER NOT NULL DEFAULT 0,
-                -- Whether a deck you have patched with sees **all** your
-                -- listens, or only those through chains you share.
-                --
-                -- Off by default, which is the old behaviour exactly. See
-                -- `PATCH_VISIBLE_LISTENS` for what it opens up and, just as
-                -- importantly, what it does not.
-                share_all_with_patched INTEGER NOT NULL DEFAULT 0,
-                -- Whether a play accepted out of a Shared Spool is forwarded on
-                -- to this account's Last.fm / ListenBrainz, or stored here
-                -- only.
-                --
-                -- Off by default and off for every account that predates the
-                -- column, for the reason the two switches above are: turning it
-                -- on writes to somebody's permanent public record, and nobody
-                -- consents to that by their operator upgrading a binary.
-                --
-                -- It is a *user* setting rather than a per-connection one
-                -- because the question is about the listening, not about any
-                -- one service: either somebody else's deck playing a record you
-                -- were in the room for counts as your listen or it does not,
-                -- and that answer cannot differ between Last.fm and
-                -- ListenBrainz without meaning two different things at once.
-                forward_spool_listens INTEGER NOT NULL DEFAULT 0
-            )",
-        )
-        .await?;
-
-        self.ddl(
-            "CREATE TABLE IF NOT EXISTS tokens (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER NOT NULL REFERENCES users(id),
-                token_hash TEXT UNIQUE NOT NULL,
-                name TEXT NOT NULL,
-                scopes TEXT DEFAULT 'submit',
-                created_at INTEGER NOT NULL,
-                last_used_at INTEGER,
-                expires_at INTEGER,
-                default_chain_id INTEGER REFERENCES signal_chains(id),
-                -- Whether this client's import-type submissions are
-                -- live listens rather than a backfill. Off by default and never
-                -- inferred: turning it on lets a client write to the owner's
-                -- permanent Last.fm/ListenBrainz record, which is not a decision
-                -- to make on their behalf.
-                imports_are_live BOOLEAN DEFAULT FALSE
-            )",
-        )
-        .await?;
-
-        self.ddl(
-            "CREATE TABLE IF NOT EXISTS signal_chains (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER NOT NULL REFERENCES users(id),
-                name TEXT NOT NULL, description TEXT,
-                components JSON NOT NULL DEFAULT '[]',
-                listening_context TEXT NOT NULL DEFAULT 'unknown',
-                icon TEXT,
-                is_active BOOLEAN DEFAULT TRUE,
-                total_hours REAL DEFAULT 0,
-                created_at INTEGER NOT NULL,
-                -- Phase 6: the sharing unit is the chain, not the listen.
-                --
-                -- Off by default, and it is what decides whether a listen ever
-                -- reaches the Reel, the instance figures or an outbox. There is
-                -- no per-listen override and there should not be one: this is a
-                -- standing decision about *how you listen*, which is a thing
-                -- somebody can hold in their head, where a choice per play is
-                -- not. It is the reason private-by-default is not also useless.
-                shared BOOLEAN NOT NULL DEFAULT FALSE,
-                UNIQUE(user_id, name)
-            )",
-        )
-        .await?;
-
         // A chain with one step swapped.
         //
         // Two cartridges on one turntable, or the same commute with a different
@@ -333,20 +387,6 @@ impl Database {
                 overrides JSON NOT NULL DEFAULT '[]',
                 created_at INTEGER NOT NULL,
                 UNIQUE(chain_id, name)
-            )",
-        )
-        .await?;
-
-        self.ddl(
-            "CREATE TABLE IF NOT EXISTS devices (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER NOT NULL REFERENCES users(id),
-                machine_id TEXT NOT NULL, name TEXT, platform TEXT,
-                product TEXT, device_type TEXT,
-                default_chain_id INTEGER REFERENCES signal_chains(id),
-                first_seen INTEGER NOT NULL, last_seen INTEGER NOT NULL,
-                total_listens INTEGER DEFAULT 0,
-                UNIQUE(user_id, machine_id)
             )",
         )
         .await?;
@@ -554,51 +594,6 @@ impl Database {
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL,
                 updated_at INTEGER NOT NULL
-            )",
-        )
-        .await?;
-
-        self.ddl(
-            "CREATE TABLE IF NOT EXISTS equipment (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER NOT NULL REFERENCES users(id),
-                name TEXT NOT NULL, type TEXT NOT NULL,
-                brand TEXT, model TEXT,
-                total_hours REAL DEFAULT 0,
-                first_used INTEGER, last_used INTEGER, notes TEXT,
-                -- Distinct from `first_used`, which is when Tapedeck first saw
-                -- it. Gear is usually owned for a while before it is logged,
-                -- and burn-in hours are counted from the purchase, not from the
-                -- day someone got round to typing it in.
-                purchased_at INTEGER,
-                -- Why a piece of gear is not in a chain: 'new', 'spare',
-                -- 'lent'. Free text rather than a CHECK, for the reason
-                -- `equipment_type` is — the UI owns the vocabulary, and a
-                -- constraint here would mean a rebuild to add a word. NULL is
-                -- the usual state and means nothing has been said.
-                status TEXT,
-                UNIQUE(user_id, name)
-            )",
-        )
-        .await?;
-
-        self.ddl(
-            "CREATE TABLE IF NOT EXISTS sessions (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER NOT NULL REFERENCES users(id),
-                device_id INTEGER REFERENCES devices(id),
-                chain_id INTEGER REFERENCES signal_chains(id),
-                started_at INTEGER NOT NULL, ended_at INTEGER,
-                track_count INTEGER DEFAULT 0, total_duration INTEGER DEFAULT 0,
-                skip_count INTEGER DEFAULT 0, avg_quality_score REAL,
-                listening_context TEXT DEFAULT 'unknown',
-                token_id INTEGER REFERENCES tokens(id),
-                uuid TEXT,
-                title TEXT,
-                -- A note about the sitting itself, distinct from a liner note
-                -- about a record, e.g. a first listen on a new cartridge.
-                notes TEXT,
-                updated_at INTEGER
             )",
         )
         .await?;
@@ -881,8 +876,14 @@ impl Database {
                 visibility TEXT NOT NULL DEFAULT 'private',
                 created_at INTEGER NOT NULL,
                 updated_at INTEGER NOT NULL,
-                CHECK ((entity_id IS NOT NULL) + (scrobble_id IS NOT NULL)
-                       + (period_key IS NOT NULL) + (line_key IS NOT NULL) = 1),
+                -- Exactly one target. Written as CASE rather than by summing the
+                -- predicates: SQLite treats a boolean as an integer and adds them
+                -- happily, where Postgres refuses with `operator does not exist:
+                -- boolean + boolean`. CASE is standard SQL and means the same in both.
+                CHECK ((CASE WHEN entity_id   IS NOT NULL THEN 1 ELSE 0 END)
+                     + (CASE WHEN scrobble_id IS NOT NULL THEN 1 ELSE 0 END)
+                     + (CASE WHEN period_key  IS NOT NULL THEN 1 ELSE 0 END)
+                     + (CASE WHEN line_key    IS NOT NULL THEN 1 ELSE 0 END) = 1),
                 CHECK ((line_key IS NULL) = (line_label IS NULL))
             )",
         )

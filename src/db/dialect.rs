@@ -525,6 +525,13 @@ mod tests {
             "INTEGER",
             "REAL",
             "AUTOINCREMENT",
+            // Standard SQL, identical in both. The notes CHECK sums its targets
+            // with CASE because Postgres will not add booleans.
+            "CASE",
+            "WHEN",
+            "THEN",
+            "ELSE",
+            "END",
             "WITHOUT",
             "ROWID",
             // identical in both dialects
