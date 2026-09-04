@@ -2774,6 +2774,7 @@ mod auth;
 mod chains;
 mod connections;
 mod crate_shelf;
+pub mod dialect;
 mod gear;
 #[cfg(test)]
 mod guards;

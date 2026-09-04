@@ -27,6 +27,11 @@
 //! `mcp::drift` — a dumb textual scan over our own source, which is exactly as
 //! clever as it needs to be.
 //!
+//! A SQL-ish *test fixture* elsewhere under `src/db/` will trip this if it
+//! names `scrobbles` — `dialect.rs` did, once. Rename the fixture's table
+//! rather than excluding its file: an exclusion is permanent and silent,
+//! where a fixture is neither.
+//!
 //! **Known limitation:** an exemption is keyed on the *method*, so a method in
 //! the list that later grows a counting query is exempt without anyone
 //! noticing. The `skipped = TRUE` rule above exists to keep the list small and

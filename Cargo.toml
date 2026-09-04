@@ -6,6 +6,13 @@ edition = "2021"
 # the whole build and a fresh clone compiles. See build.rs.
 build = "build.rs"
 
+[features]
+# Selects the `db::Db` type alias and nothing else. Both sqlx drivers are
+# compiled either way — the optional MusicBrainz mirror needs the Postgres
+# one regardless — which is what lets a Postgres build read an old SQLite
+# file to migrate out of it.
+postgres = []
+
 [dependencies]
 # Async runtime
 tokio = { version = "1", features = ["full"] }
