@@ -220,6 +220,17 @@ impl MusicBrainzClient {
     /// "MusicBrainz has never heard of this track" as an outage would open the
     /// breaker on a library it simply does not cover.
     async fn api_get(&self, url: &str) -> Result<reqwest::Response> {
+        // A replica shares a public address with the instance it copied, and
+        // MetaBrainz blocks by IP at the connection level with no status code
+        // to say so — the 2026-08-27 outage. The cache still answers; the
+        // network does not get asked twice for the same history.
+        if crate::replica::is_replica() {
+            return Err(anyhow!(
+                "replica mode: not asking {} — the authoritative instance owns \
+                 the enrichment budget for this address",
+                service_name(url)
+            ));
+        }
         if contact_is_placeholder(&self.config.user_agent) {
             return Err(anyhow!(
                 "refusing to call {} with a placeholder User-Agent ({}) — \

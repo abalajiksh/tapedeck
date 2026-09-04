@@ -1241,7 +1241,18 @@ paths:
                   service: { type: string }
                   database: { type: string }
                   version: { type: string }
-              example: { status: ok, service: tapedeck, database: ok, version: 0.38.0 }
+                  replica:
+                    type: boolean
+                    description: |
+                      Whether this instance is a **replica** — a full copy that
+                      forwards no listens, publishes no actor and makes no
+                      MusicBrainz request. A staging instance restored from a
+                      production snapshot is byte-identical on every other
+                      screen, so this is the only thing that tells them apart.
+                      Always present; its absence means a binary older than
+                      0.109.0.
+              example:
+                { status: ok, service: tapedeck, database: ok, version: 0.109.0, replica: false }
 
   /metrics:
     get:

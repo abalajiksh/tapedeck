@@ -70,6 +70,15 @@ pub async fn sinks_for_user(
     user_id: i64,
     listenbrainz_url: &str,
 ) -> Result<Vec<Box<dyn ScrobbleSink>>, sqlx::Error> {
+    // A replica holds the credentials — its snapshot came from an instance that
+    // has them — and must not spend them. Note this is *not* on its own enough
+    // to stop forwarding: `flush_pending` reads "every enabled sink took it" as
+    // vacuously true over an empty list and would mark the row delivered having
+    // sent it nowhere, which is the v0.91.0 defect. The flush gate is what makes
+    // this one safe; this one is what catches every other caller.
+    if crate::replica::is_replica() {
+        return Ok(Vec::new());
+    }
     let conns = db.get_connections_for_forwarding(user_id).await?;
     let mut sinks: Vec<Box<dyn ScrobbleSink>> = Vec::new();
 
@@ -152,6 +161,9 @@ where
 
 /// Forward a now-playing update to every one of a user's sinks.
 pub async fn submit_now_playing(sinks: &[Box<dyn ScrobbleSink>], play: &Play) {
+    if crate::replica::is_replica() {
+        return;
+    }
     for sink in sinks {
         // Through the breaker like everything else. Now-playing is the call
         // made most often — once per track change, per user — so a dead service

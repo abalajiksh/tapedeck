@@ -17,6 +17,7 @@ mod openapi;
 mod patch;
 mod playlist_lab;
 mod playlists;
+mod replica;
 mod report_image;
 mod rockbox;
 mod server;
@@ -50,6 +51,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         &config.logging.level,
     )?;
     info!("🚀 Tapedeck v{} Started", env!("CARGO_PKG_VERSION"));
+    if let Some(line) = replica::banner() {
+        info!("{}", line);
+    }
 
     // ── MusicBrainz client ──
     let sqlite_path = config.database.sqlite_path.clone();

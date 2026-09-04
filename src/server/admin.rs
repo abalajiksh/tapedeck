@@ -23,6 +23,12 @@ async fn health_check(State(state): State<Arc<AdminState>>) -> impl IntoResponse
             "service": "tapedeck",
             "database": if db_ok { "ok" } else { "unreachable" },
             "version": env!("CARGO_PKG_VERSION"),
+            // Which instance is this? A replica is a byte-identical copy
+            // serving identical screens, so nothing else on the page tells an
+            // operator with two tabs open which one forwards listens. Always
+            // present rather than only when true, so its absence is an old
+            // binary rather than an authoritative instance.
+            "replica": crate::replica::is_replica(),
         })),
     )
 }

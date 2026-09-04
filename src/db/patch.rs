@@ -120,6 +120,16 @@ impl Database {
     /// at one per federating account, ever, and only for names that are real
     /// and published.
     pub async fn discoverable_user_id(&self, username: &str) -> Result<Option<i64>, sqlx::Error> {
+        // A replica restored from a snapshot carries the *authoritative*
+        // instance's `actors.uri`, because that column is written once and
+        // never re-derived (v0.78.0). Serving it from a second host would put
+        // two keys behind one actor, which is indistinguishable from a
+        // compromise. So a replica publishes nobody, whatever the rows say —
+        // and an unpublished account is byte-identical to an unknown one, which
+        // is the property `discoverable_user_id` exists to hold.
+        if crate::replica::is_replica() {
+            return Ok(None);
+        }
         sqlx::query_scalar(&crate::sql!(
             "SELECT id FROM users
               WHERE username = ? COLLATE NOCASE AND federation_enabled = 1 AND disabled = 0"

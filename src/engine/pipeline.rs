@@ -1713,6 +1713,13 @@ impl ScrobbleEngine {
     /// cannot double-send a listen a partial flush did deliver. Being late is
     /// recoverable; being stopped is not.
     async fn flush_pending(&mut self) {
+        // Nothing a replica holds is its to deliver. Gated here rather than
+        // only at `sinks_for_user` because the "everyone took it" test below is
+        // vacuously true over an empty sink list, so an empty list alone would
+        // mark every listen `synced` having sent it nowhere.
+        if crate::replica::is_replica() {
+            return;
+        }
         let deadline = Instant::now() + self.flush_budget();
         let pending = match self.db.get_pending_scrobbles().await {
             Ok(p) => p,
