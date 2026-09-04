@@ -1203,6 +1203,90 @@ impl Database {
             }
         }
 
+        // Migration: a stable id on every table a replica has to agree about.
+        //
+        // Nothing reads these yet, and that is the point. The argument is the
+        // one Phase 6 already made and `sessions.uuid` already acted on:
+        // deferring a *feature* is cheap, and retrofitting an id onto rows a
+        // second instance already holds is not. A staging instance restored
+        // from a snapshot needs none of this; a desktop replica that writes
+        // offline and reconciles later needs all of it, and by then these rows
+        // exist in two places.
+        //
+        // Deliberately absent: `scrobbles`, `loves` and `entities`. Each
+        // already has a natural key that is *already* used across instances --
+        // `(user_id, source_id, source_name)` for a listen, `entity_key` for
+        // the other two, which is what `/loves/keys` is built on. A second
+        // identity for a row that already has one is a second answer free to
+        // disagree with the first.
+        //
+        // **This block must stay last.** Three migrations above rebuild a table
+        // by copying an explicit column list into a fresh one -- the `notes`
+        // CHECK widenings and the `physical_releases` disc-kinds rebuild -- and
+        // a column added before them is silently dropped on exactly the
+        // databases that still need the rebuild. That trap is recorded against
+        // v0.44.0 and it costs nothing to avoid by appending.
+        for table in [
+            "notes",
+            "note_revisions",
+            "signal_chains",
+            "chain_variants",
+            "equipment",
+            "physical_releases",
+            "physical_plays",
+            "physical_images",
+        ] {
+            if has_column(&self.pool, table, "uuid").await {
+                continue;
+            }
+            info!("⚙️ Migrating: adding {}.uuid...", table);
+            let _ = sqlx::query(&format!("ALTER TABLE {table} ADD COLUMN uuid TEXT"))
+                .execute(&self.pool)
+                .await;
+
+            // Backfill, or the rows that predate this are the only ones that
+            // can never be reconciled -- which is the whole reason to add it
+            // before there is a second copy rather than after.
+            let ids: Vec<(i64,)> =
+                sqlx::query_as(&format!("SELECT id FROM {table} WHERE uuid IS NULL"))
+                    .fetch_all(&self.pool)
+                    .await
+                    .unwrap_or_default();
+            if ids.is_empty() {
+                continue;
+            }
+            // One transaction, not one per row. A shelf can hold thousands of
+            // plays, and a commit each is the shape that made `rebuild_sessions`
+            // run past a proxy timeout on the real host (v0.61.0): no statement
+            // is slow, there are simply fifty thousand of them.
+            let count = ids.len();
+            match self.pool.begin().await {
+                Ok(mut tx) => {
+                    for (id,) in ids {
+                        let _ = sqlx::query(&format!("UPDATE {table} SET uuid = ? WHERE id = ?"))
+                            .bind(new_uuid())
+                            .bind(id)
+                            .execute(&mut *tx)
+                            .await;
+                    }
+                    if let Err(e) = tx.commit().await {
+                        warn!(
+                            "⚠️ {}.uuid backfill did not commit: {}",
+                            table,
+                            crate::logging::error_chain(&e)
+                        );
+                    } else {
+                        info!("✅ {} {} row(s) given a stable id", count, table);
+                    }
+                }
+                Err(e) => warn!(
+                    "⚠️ {}.uuid backfill could not start: {}",
+                    table,
+                    crate::logging::error_chain(&e)
+                ),
+            }
+        }
+
         Ok(())
     }
 }

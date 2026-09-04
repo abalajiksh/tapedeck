@@ -2501,9 +2501,10 @@ impl Database {
         let old_overrides = crate::models::overrides_against(&new_base, &base);
         let old_json = serde_json::to_string(&old_overrides).unwrap_or_else(|_| "[]".into());
         sqlx::query(&crate::sql!(
-            "INSERT INTO chain_variants (user_id, chain_id, name, overrides, created_at)
-             VALUES (?, ?, ?, ?, ?)",
+            "INSERT INTO chain_variants (uuid, user_id, chain_id, name, overrides, created_at)
+             VALUES (?, ?, ?, ?, ?, ?)",
         ))
+        .bind(new_uuid())
         .bind(user_id)
         .bind(chain_id)
         .bind(old_base_name)

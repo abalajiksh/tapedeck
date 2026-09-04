@@ -115,6 +115,35 @@ impl Database {
 
         speed!("CREATE INDEX IF NOT EXISTS idx_entities_match ON entities(match_key)");
         speed!("CREATE INDEX IF NOT EXISTS idx_entities_mbid ON entities(kind, mbid)");
+
+        // The stable ids a replica reconciles on.
+        //
+        // Justified where v0.59.0 dropped three indexes as a net loss, by that
+        // note's own test: those replaced *sequential scans of whole-history
+        // aggregations*, where an index scan costs a rowid lookup per row on an
+        // SD card. These serve a **point lookup** — "the row with this id" —
+        // which is the workload it names as the one an index is actually for,
+        // and they sit on tables holding hundreds of rows written a handful of
+        // times a day rather than on `scrobbles`.
+        //
+        // UNIQUE rather than a plain index because the uniqueness is the
+        // property, not the speed: two rows sharing an id is a reconciliation
+        // silently applying one write over another. NULL is allowed many times
+        // over in both engines, so a database mid-backfill is fine.
+        for table in [
+            "notes",
+            "note_revisions",
+            "signal_chains",
+            "chain_variants",
+            "equipment",
+            "physical_releases",
+            "physical_plays",
+            "physical_images",
+        ] {
+            constraint!(&format!(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_{table}_uuid ON {table}(uuid)"
+            ));
+        }
         Ok(())
     }
 
@@ -196,6 +225,9 @@ impl Database {
         self.ddl(
             "CREATE TABLE IF NOT EXISTS signal_chains (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                -- Stable id for replicas; see the note on `notes.uuid`.
+                -- referenced by scrobbles.chain_id, so this gets worse with every listen.
+                uuid TEXT,
                 user_id INTEGER NOT NULL REFERENCES users(id),
                 name TEXT NOT NULL, description TEXT,
                 components JSON NOT NULL DEFAULT '[]',
@@ -253,6 +285,9 @@ impl Database {
         self.ddl(
             "CREATE TABLE IF NOT EXISTS equipment (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                -- Stable id for replicas; see the note on `notes.uuid`.
+                -- chains name it, and a replica has to agree which box that is.
+                uuid TEXT,
                 user_id INTEGER NOT NULL REFERENCES users(id),
                 name TEXT NOT NULL, type TEXT NOT NULL,
                 brand TEXT, model TEXT,
@@ -311,6 +346,9 @@ impl Database {
         self.ddl(
             "CREATE TABLE IF NOT EXISTS chain_variants (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                -- Stable id for replicas; see the note on `notes.uuid`.
+                -- referenced by scrobbles.chain_variant_id.
+                uuid TEXT,
                 user_id INTEGER NOT NULL REFERENCES users(id),
                 chain_id INTEGER NOT NULL REFERENCES signal_chains(id),
                 name TEXT NOT NULL,
@@ -409,6 +447,9 @@ impl Database {
                 -- the variant this pressing usually runs through. `migrate()` adds it too, for databases predating it.
                 chain_variant_id INTEGER REFERENCES chain_variants(id),
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                -- Stable id for replicas; see the note on `notes.uuid`.
+                -- the shelf's own rows reference it.
+                uuid TEXT,
                 user_id INTEGER NOT NULL REFERENCES users(id),
                 kind TEXT NOT NULL CHECK (kind IN ('vinyl', 'cassette', 'cd', 'sacd')),
                 artist TEXT NOT NULL, title TEXT NOT NULL,
@@ -506,6 +547,9 @@ impl Database {
         self.ddl(
             "CREATE TABLE IF NOT EXISTS physical_images (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                -- Stable id for replicas; see the note on `notes.uuid`.
+                -- an upload is the one image a provider cannot re-supply.
+                uuid TEXT,
                 user_id INTEGER NOT NULL REFERENCES users(id),
                 release_id INTEGER NOT NULL REFERENCES physical_releases(id),
                 kind TEXT NOT NULL DEFAULT 'other',
@@ -544,6 +588,9 @@ impl Database {
                 -- which variant of that chain was fitted. `migrate()` adds it too, for databases predating it.
                 chain_variant_id INTEGER REFERENCES chain_variants(id),
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                -- Stable id for replicas; see the note on `notes.uuid`.
+                -- a side played is a fact, and it is deletable.
+                uuid TEXT,
                 user_id INTEGER NOT NULL REFERENCES users(id),
                 release_id INTEGER NOT NULL REFERENCES physical_releases(id),
                 side TEXT NOT NULL,
@@ -871,6 +918,19 @@ impl Database {
         self.ddl(
             "CREATE TABLE IF NOT EXISTS notes (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                -- A stable id that survives leaving this database.
+                --
+                -- Nothing reads it yet. It is here now because retrofitting an
+                -- id onto rows another instance already holds is the migration
+                -- Phase 6 warns about, and it is the same call `sessions.uuid`
+                -- made before anything shared one outward. Tables with a
+                -- natural key -- `scrobbles(user_id, source_id, source_name)`,
+                -- `loves`/`entities` on `entity_key` -- deliberately have none:
+                -- a second identity for a row that already has one is a second
+                -- answer free to disagree with the first.
+                --
+                -- the note itself is the thing another replica holds.
+                uuid TEXT,
                 user_id INTEGER NOT NULL REFERENCES users(id),
                 entity_id INTEGER REFERENCES entities(id),
                 scrobble_id INTEGER REFERENCES scrobbles(id),
@@ -903,6 +963,9 @@ impl Database {
         self.ddl(
             "CREATE TABLE IF NOT EXISTS note_revisions (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                -- Stable id for replicas; see the note on `notes.uuid`.
+                -- a revision is how a concurrent edit survives as a choice rather than a loss.
+                uuid TEXT,
                 note_id INTEGER NOT NULL REFERENCES notes(id),
                 body_md TEXT NOT NULL,
                 created_at INTEGER NOT NULL

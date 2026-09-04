@@ -8272,3 +8272,120 @@ async fn a_gear_total_breaks_down_into_the_chains_that_earned_it() {
     let gear = db.get_equipment(uid).await.unwrap();
     assert!(gear.iter().find(|g| g.id == spare).unwrap().sources.is_empty());
 }
+
+/// An existing database gains the stable ids a replica reconciles on — and so
+/// does every row written afterwards.
+///
+/// The second half is the one that matters. The columns are easy; what fails
+/// silently is an `INSERT` site that was not updated to bind one, because the
+/// column is nullable and nothing errors — the row is simply invisible to any
+/// future reconciliation, and it stays that way. So this asserts a *new* row of
+/// every kind carries an id, not just a migrated one.
+///
+/// Same shape and the same reason as `an_existing_database_gains_the_gear_status_column`:
+/// every other test starts from an empty file, takes the `init()` path and never
+/// exercises `migrate()` against a real prior schema. That is the v0.61.1 blind
+/// spot — 297 restarts in 26 minutes while the suite stayed green.
+#[tokio::test]
+async fn an_existing_database_gains_stable_ids_and_keeps_minting_them() {
+    let n = N.fetch_add(1, Ordering::SeqCst);
+    let path = std::env::temp_dir().join(format!("td-olduuid-{}-{}.db", std::process::id(), n));
+    for suffix in ["", "-wal", "-shm"] {
+        let _ = std::fs::remove_file(format!("{}{}", path.display(), suffix));
+    }
+
+    // The pre-uuid shape, with a row in each table that is getting one.
+    {
+        let pool = sqlx::SqlitePool::connect(&format!("sqlite:{}?mode=rwc", path.display()))
+            .await
+            .unwrap();
+        for ddl in [
+            "CREATE TABLE users (id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT NOT NULL,
+                 password_hash TEXT NOT NULL, role TEXT NOT NULL DEFAULT 'user',
+                 created_at INTEGER NOT NULL DEFAULT 0, settings TEXT)",
+            "CREATE TABLE equipment (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 user_id INTEGER NOT NULL REFERENCES users(id),
+                 name TEXT NOT NULL, type TEXT NOT NULL, brand TEXT, model TEXT,
+                 total_hours REAL DEFAULT 0, first_used INTEGER, last_used INTEGER,
+                 notes TEXT, purchased_at INTEGER, UNIQUE(user_id, name))",
+            "CREATE TABLE signal_chains (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 user_id INTEGER NOT NULL REFERENCES users(id),
+                 name TEXT NOT NULL, description TEXT,
+                 components TEXT NOT NULL DEFAULT '[]',
+                 listening_context TEXT NOT NULL DEFAULT 'unknown', icon TEXT,
+                 is_active BOOLEAN DEFAULT TRUE, total_hours REAL DEFAULT 0,
+                 created_at INTEGER NOT NULL, UNIQUE(user_id, name))",
+            "INSERT INTO users (id, username, password_hash) VALUES (1, 'ashwin', 'x')",
+            "INSERT INTO equipment (user_id, name, type, brand, notes)
+                 VALUES (1, 'HD 650', 'headphones', 'Sennheiser', 'the good pads')",
+            "INSERT INTO signal_chains (user_id, name, created_at)
+                 VALUES (1, 'Desk', 0)",
+        ] {
+            sqlx::query(ddl).execute(&pool).await.unwrap();
+        }
+        pool.close().await;
+    }
+
+    let url = format!("sqlite:{}", path.display());
+    let db = Database::new(&url, Arc::new(SecretBox::test_key()))
+        .await
+        .expect("an existing database must open");
+
+    /// Every row's id, in insertion order, with NULLs kept so a gap is visible.
+    async fn ids(db: &Database, table: &str) -> Vec<Option<String>> {
+        sqlx::query_scalar::<_, Option<String>>(&format!("SELECT uuid FROM {table} ORDER BY id"))
+            .fetch_all(&db.pool)
+            .await
+            .unwrap()
+    }
+
+    // The migration half: the rows that predate the column have one now.
+    for table in ["equipment", "signal_chains"] {
+        let got = ids(&db, table).await;
+        assert_eq!(got.len(), 1, "{table}: the row survived the migration");
+        assert!(got[0].is_some(), "{table}: a row predating the column was backfilled");
+    }
+    // And the data came with it, rather than a fresh table wearing the name.
+    let gear = db.get_equipment(1).await.unwrap();
+    assert_eq!(gear[0].name, "HD 650");
+    assert_eq!(gear[0].notes.as_deref(), Some("the good pads"));
+
+    // The half that fails silently: a row written *after* the migration.
+    db.upsert_equipment(1, "Bifrost", "dac", Some("Schiit"), None, 0.0, None).await.unwrap();
+    db.create_chain(&SignalChain {
+        id: None,
+        user_id: 1,
+        name: "Vinyl".into(),
+        description: None,
+        components: vec![],
+        listening_context: ListeningContext::Active,
+        icon: None,
+        is_active: true,
+        shared: false,
+        total_hours: 0.0,
+        created_at: 0,
+    })
+    .await
+    .unwrap();
+
+    for table in ["equipment", "signal_chains"] {
+        let got = ids(&db, table).await;
+        assert_eq!(got.len(), 2, "{table}: the new row landed");
+        assert!(
+            got.iter().all(|u| u.is_some()),
+            "{table}: an INSERT site is not binding an id — the column is nullable, so \
+             nothing errors and the row is simply unreconcilable for ever"
+        );
+        assert_ne!(got[0], got[1], "{table}: two rows must not share an id");
+    }
+
+    // Opening runs on every start, so being a no-op the second time is the
+    // property that matters — a backfill that re-ran would mint new ids and
+    // orphan whatever already referred to the old ones.
+    let before = ids(&db, "equipment").await;
+    drop(db);
+    let db = Database::new(&url, Arc::new(SecretBox::test_key()))
+        .await
+        .expect("reopening must be idempotent");
+    assert_eq!(before, ids(&db, "equipment").await, "a reopen must not re-mint ids");
+}

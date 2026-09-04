@@ -75,8 +75,8 @@ impl Database {
         let components_json =
             serde_json::to_string(&chain.components).unwrap_or_else(|_| "[]".into());
         let now = Self::now_secs();
-        let result = sqlx::query_as::<_, (i64,)>(&crate::sql!("INSERT INTO signal_chains (user_id, name, description, components, listening_context, icon, is_active, created_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?) RETURNING id")).bind(chain.user_id).bind(&chain.name).bind(&chain.description)
+        let result = sqlx::query_as::<_, (i64,)>(&crate::sql!("INSERT INTO signal_chains (uuid, user_id, name, description, components, listening_context, icon, is_active, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id")).bind(new_uuid()).bind(chain.user_id).bind(&chain.name).bind(&chain.description)
         .bind(&components_json).bind(chain.listening_context.as_str()).bind(&chain.icon)
         .bind(chain.is_active).bind(now)
         .fetch_all(&self.pool).await?;

@@ -93,9 +93,9 @@ impl Database {
             .await?;
             Ok(id)
         } else {
-            let result = sqlx::query_as::<_, (i64,)>(&crate::sql!("INSERT INTO equipment (user_id, name, type, brand, model, total_hours, first_used, last_used, purchased_at)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id"))
-            .bind(user_id).bind(name).bind(equipment_type).bind(brand).bind(model)
+            let result = sqlx::query_as::<_, (i64,)>(&crate::sql!("INSERT INTO equipment (uuid, user_id, name, type, brand, model, total_hours, first_used, last_used, purchased_at)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id"))
+            .bind(new_uuid()).bind(user_id).bind(name).bind(equipment_type).bind(brand).bind(model)
             .bind(hours_to_add).bind(now).bind(now).bind(purchased_at).fetch_all(&self.pool).await?;
             result.first().map(|r| r.0).ok_or(sqlx::Error::RowNotFound)
         }
@@ -155,9 +155,10 @@ impl Database {
         let json = serde_json::to_string(overrides).unwrap_or_else(|_| "[]".into());
         let now = chrono::Utc::now().timestamp();
         let res = sqlx::query_as::<_, (i64,)>(&crate::sql!(
-            "INSERT INTO chain_variants (user_id, chain_id, name, overrides, created_at)
-             VALUES (?, ?, ?, ?, ?) RETURNING id",
+            "INSERT INTO chain_variants (uuid, user_id, chain_id, name, overrides, created_at)
+             VALUES (?, ?, ?, ?, ?, ?) RETURNING id",
         ))
+        .bind(new_uuid())
         .bind(user_id)
         .bind(chain_id)
         .bind(name)
@@ -355,9 +356,10 @@ impl Database {
                 let overrides = crate::models::derive_overrides(&into.components, &from.components);
                 let json = serde_json::to_string(&overrides).unwrap_or_else(|_| "[]".into());
                 let res = sqlx::query_as::<_, (i64,)>(&crate::sql!(
-                    "INSERT INTO chain_variants (user_id, chain_id, name, overrides, created_at)
-                     VALUES (?, ?, ?, ?, ?) RETURNING id",
+                    "INSERT INTO chain_variants (uuid, user_id, chain_id, name, overrides, created_at)
+                     VALUES (?, ?, ?, ?, ?, ?) RETURNING id",
                 ))
+                .bind(new_uuid())
                 .bind(user_id)
                 .bind(into_chain_id)
                 .bind(name)

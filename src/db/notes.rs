@@ -1315,8 +1315,9 @@ impl Database {
         if let Some(note) = existing {
             if note.body_md != body_md {
                 sqlx::query(&crate::sql!(
-                    "INSERT INTO note_revisions (note_id, body_md, created_at) VALUES (?, ?, ?)",
+                    "INSERT INTO note_revisions (uuid, note_id, body_md, created_at) VALUES (?, ?, ?, ?)",
                 ))
+                .bind(new_uuid())
                 .bind(note.id)
                 .bind(&note.body_md)
                 .bind(note.updated_at)
@@ -1329,9 +1330,9 @@ impl Database {
             return Ok(note.id);
         }
 
-        let result = sqlx::query_as::<_, (i64,)>(&crate::sql!("INSERT INTO notes (user_id, entity_id, scrobble_id, period_key, line_key, line_label, body_md, visibility, created_at, updated_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id"))
-        .bind(user_id).bind(entity_id).bind(scrobble_id).bind(period_key)
+        let result = sqlx::query_as::<_, (i64,)>(&crate::sql!("INSERT INTO notes (uuid, user_id, entity_id, scrobble_id, period_key, line_key, line_label, body_md, visibility, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id"))
+        .bind(new_uuid()).bind(user_id).bind(entity_id).bind(scrobble_id).bind(period_key)
         .bind(line_key).bind(line_label)
         .bind(body_md).bind(visibility)
         .bind(now).bind(now)

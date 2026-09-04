@@ -99,11 +99,12 @@ impl Database {
     ) -> Result<i64, sqlx::Error> {
         let res = sqlx::query_as::<_, (i64,)>(&crate::sql!(
             "INSERT INTO physical_releases
-                (user_id, kind, artist, title, year, mbid_release, discogs_id, barcode,
+                (uuid, user_id, kind, artist, title, year, mbid_release, discogs_id, barcode,
                  catalog_number, artwork_url, tracks, notes, added_at, purchased_at,
                  acquired_as, acquired_from)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id"
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id"
         ))
+        .bind(new_uuid())
         .bind(user_id)
         .bind(kind)
         .bind(artist)
@@ -394,9 +395,9 @@ impl Database {
     ) -> Result<i64, sqlx::Error> {
         sqlx::query(&crate::sql!(
             "INSERT INTO physical_images
-                (user_id, release_id, kind, provider, url, thumb_url, file_path, mime,
+                (uuid, user_id, release_id, kind, provider, url, thumb_url, file_path, mime,
                  bytes, caption, position, remote_id, added_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
              -- The `WHERE` is part of the conflict target, not decoration:
              -- SQLite matches an upsert against a *partial* unique index only
              -- when the predicate is repeated here, and rejects the statement
@@ -408,6 +409,7 @@ impl Database {
                 kind = excluded.kind, url = excluded.url, thumb_url = excluded.thumb_url,
                 caption = excluded.caption, position = excluded.position"
         ))
+        .bind(new_uuid())
         .bind(user_id)
         .bind(release_id)
         .bind(kind)
@@ -645,10 +647,11 @@ impl Database {
     ) -> Result<i64, sqlx::Error> {
         let res = sqlx::query_as::<_, (i64,)>(&crate::sql!(
             "INSERT INTO physical_plays
-                (user_id, release_id, side, played_at, duration_secs, track_count,
+                (uuid, user_id, release_id, side, played_at, duration_secs, track_count,
                  equipment_id, chain_id, recorded_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id"
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id"
         ))
+        .bind(new_uuid())
         .bind(user_id)
         .bind(release_id)
         .bind(side)
