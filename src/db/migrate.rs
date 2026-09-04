@@ -15,13 +15,25 @@ use super::*;
 
 impl Database {
     pub(super) async fn migrate(&self) -> Result<(), sqlx::Error> {
-        async fn has_column(pool: &Pool<Sqlite>, table: &str, column: &str) -> bool {
-            let result: Result<(i64,), _> = sqlx::query_as(&format!(
+        /// Does `table` already have `column`?
+        ///
+        /// The schema catalogue is the one thing no dialect layer can paper
+        /// over — SQLite answers through `pragma_table_info` and Postgres
+        /// through `information_schema`, and they are different queries rather
+        /// than one query spelled twice.
+        async fn has_column(pool: &Pool<Db>, table: &str, column: &str) -> bool {
+            #[cfg(not(feature = "postgres"))]
+            let sql = format!(
                 "SELECT COUNT(*) FROM pragma_table_info('{}') WHERE name='{}'",
                 table, column
-            ))
-            .fetch_one(pool)
-            .await;
+            );
+            #[cfg(feature = "postgres")]
+            let sql = format!(
+                "SELECT COUNT(*) FROM information_schema.columns \
+                 WHERE table_name = '{}' AND column_name = '{}'",
+                table, column
+            );
+            let result: Result<(i64,), _> = sqlx::query_as(&sql).fetch_one(pool).await;
             matches!(result, Ok((count,)) if count > 0)
         }
 

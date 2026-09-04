@@ -112,11 +112,11 @@ impl Database {
         options: &str,
     ) -> Result<i64, sqlx::Error> {
         let sealed = if credentials.is_empty() { String::new() } else { self.seal(credentials) };
-        let res = sqlx::query(
+        let res = sqlx::query_as::<_, (i64,)>(
             "INSERT INTO user_sources
                 (user_id, kind, label, enabled, url, credentials, remote_account,
                  poll_interval_secs, options, updated_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
         )
         .bind(user_id)
         .bind(kind)
@@ -128,9 +128,9 @@ impl Database {
         .bind(poll_interval_secs)
         .bind(options)
         .bind(Self::now_secs())
-        .execute(&self.pool)
+        .fetch_all(&self.pool)
         .await?;
-        Ok(res.last_insert_rowid())
+        res.first().map(|r| r.0).ok_or(sqlx::Error::RowNotFound)
     }
     #[allow(clippy::too_many_arguments)]
     pub async fn update_source(
@@ -285,11 +285,11 @@ impl Database {
     /// start (not just completion) means an interrupted import leaves a durable
     /// record instead of a job that vanishes with the process.
     pub async fn create_import_job(&self, user_id: i64, source: &str) -> Result<i64, sqlx::Error> {
-        let res = sqlx::query(
+        let res = sqlx::query_as::<_, (i64,)>(
             "INSERT INTO import_jobs (user_id, source, state, fetched, imported, status, created_at)
-             VALUES (?, ?, 'running', 0, 0, 'started', ?)"
-        ).bind(user_id).bind(source).bind(Self::now_secs()).execute(&self.pool).await?;
-        Ok(res.last_insert_rowid())
+             VALUES (?, ?, 'running', 0, 0, 'started', ?) RETURNING id"
+        ).bind(user_id).bind(source).bind(Self::now_secs()).fetch_all(&self.pool).await?;
+        res.first().map(|r| r.0).ok_or(sqlx::Error::RowNotFound)
     }
     /// Update a job to its final state on completion.
     pub async fn finish_import_job(

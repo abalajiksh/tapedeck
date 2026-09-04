@@ -97,12 +97,12 @@ impl Database {
         acquired_as: Option<&str>,
         acquired_from: Option<&str>,
     ) -> Result<i64, sqlx::Error> {
-        let res = sqlx::query(
+        let res = sqlx::query_as::<_, (i64,)>(
             "INSERT INTO physical_releases
                 (user_id, kind, artist, title, year, mbid_release, discogs_id, barcode,
                  catalog_number, artwork_url, tracks, notes, added_at, purchased_at,
                  acquired_as, acquired_from)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
         )
         .bind(user_id)
         .bind(kind)
@@ -120,9 +120,9 @@ impl Database {
         .bind(purchased_at)
         .bind(acquired_as)
         .bind(acquired_from)
-        .execute(&self.pool)
+        .fetch_all(&self.pool)
         .await?;
-        Ok(res.last_insert_rowid())
+        res.first().map(|r| r.0).ok_or(sqlx::Error::RowNotFound)
     }
     /// Edit the shelf-keeping fields of a pressing: when it was bought, what it
     /// is normally played on, and the note beside it.
@@ -633,11 +633,11 @@ impl Database {
         equipment_id: Option<i64>,
         chain_id: Option<i64>,
     ) -> Result<i64, sqlx::Error> {
-        let res = sqlx::query(
+        let res = sqlx::query_as::<_, (i64,)>(
             "INSERT INTO physical_plays
                 (user_id, release_id, side, played_at, duration_secs, track_count,
                  equipment_id, chain_id, recorded_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
         )
         .bind(user_id)
         .bind(release_id)
@@ -648,9 +648,9 @@ impl Database {
         .bind(equipment_id)
         .bind(chain_id)
         .bind(Self::now_secs())
-        .execute(&self.pool)
+        .fetch_all(&self.pool)
         .await?;
-        Ok(res.last_insert_rowid())
+        res.first().map(|r| r.0).ok_or(sqlx::Error::RowNotFound)
     }
     /// How often each side has been played, and for how long.
     ///

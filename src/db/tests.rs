@@ -14,6 +14,26 @@ async fn testdb() -> Database {
         .unwrap()
 }
 
+/// A build refuses a URL it cannot serve, in words, before it tries to connect.
+///
+/// The failure this prevents is a driver error twenty frames down when the real
+/// answer is "you want the other build". Only checkable in the SQLite
+/// direction here, because the Postgres build compiles this module out.
+#[tokio::test]
+async fn a_build_refuses_a_url_for_the_other_backend() {
+    // `Database` is not Debug, so match rather than `expect_err`.
+    let msg =
+        match Database::new("postgres://u:p@localhost/tapedeck", Arc::new(SecretBox::test_key()))
+            .await
+        {
+            Ok(_) => panic!("a SQLite build must not accept a postgres URL"),
+            Err(e) => e.to_string(),
+        };
+    assert!(msg.contains("SQLite"), "should name the build it is: {msg}");
+    assert!(msg.contains("sqlite"), "should name the scheme it accepts: {msg}");
+    assert!(msg.contains("--features postgres"), "should point at the other build: {msg}");
+}
+
 fn play(title: &str, artist: &str, ts: u64) -> Play {
     Play::new(title.into(), artist.into(), ts, format!("src-{ts}"), "test".into())
 }

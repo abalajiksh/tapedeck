@@ -29,11 +29,11 @@ impl Database {
             .bind(now).bind(name).bind(platform).bind(product).bind(id).execute(&self.pool).await?;
             Ok(id)
         } else {
-            let result = sqlx::query("INSERT INTO devices (user_id, machine_id, name, platform, product, first_seen, last_seen, total_listens)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, 1)")
+            let result = sqlx::query_as::<_, (i64,)>("INSERT INTO devices (user_id, machine_id, name, platform, product, first_seen, last_seen, total_listens)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, 1) RETURNING id")
             .bind(user_id).bind(machine_id).bind(name).bind(platform).bind(product).bind(now).bind(now)
-            .execute(&self.pool).await?;
-            Ok(result.last_insert_rowid())
+            .fetch_all(&self.pool).await?;
+            result.first().map(|r| r.0).ok_or(sqlx::Error::RowNotFound)
         }
     }
     /// Look a device up without creating or touching it.
@@ -89,11 +89,11 @@ impl Database {
             .await?;
             Ok(id)
         } else {
-            let result = sqlx::query("INSERT INTO equipment (user_id, name, type, brand, model, total_hours, first_used, last_used, purchased_at)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)")
+            let result = sqlx::query_as::<_, (i64,)>("INSERT INTO equipment (user_id, name, type, brand, model, total_hours, first_used, last_used, purchased_at)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id")
             .bind(user_id).bind(name).bind(equipment_type).bind(brand).bind(model)
-            .bind(hours_to_add).bind(now).bind(now).bind(purchased_at).execute(&self.pool).await?;
-            Ok(result.last_insert_rowid())
+            .bind(hours_to_add).bind(now).bind(now).bind(purchased_at).fetch_all(&self.pool).await?;
+            result.first().map(|r| r.0).ok_or(sqlx::Error::RowNotFound)
         }
     }
     /// Resolve a `[[gear:…]]` shortcode to one of the user's equipment rows.
@@ -150,18 +150,18 @@ impl Database {
     ) -> Result<i64, sqlx::Error> {
         let json = serde_json::to_string(overrides).unwrap_or_else(|_| "[]".into());
         let now = chrono::Utc::now().timestamp();
-        let res = sqlx::query(
+        let res = sqlx::query_as::<_, (i64,)>(
             "INSERT INTO chain_variants (user_id, chain_id, name, overrides, created_at)
-             VALUES (?, ?, ?, ?, ?)",
+             VALUES (?, ?, ?, ?, ?) RETURNING id",
         )
         .bind(user_id)
         .bind(chain_id)
         .bind(name)
         .bind(json)
         .bind(now)
-        .execute(&self.pool)
+        .fetch_all(&self.pool)
         .await?;
-        Ok(res.last_insert_rowid())
+        res.first().map(|r| r.0).ok_or(sqlx::Error::RowNotFound)
     }
     pub async fn update_variant(
         &self,
@@ -347,19 +347,23 @@ impl Database {
                 }
                 let overrides = crate::models::derive_overrides(&into.components, &from.components);
                 let json = serde_json::to_string(&overrides).unwrap_or_else(|_| "[]".into());
-                let res = sqlx::query(
+                let res = sqlx::query_as::<_, (i64,)>(
                     "INSERT INTO chain_variants (user_id, chain_id, name, overrides, created_at)
-                     VALUES (?, ?, ?, ?, ?)",
+                     VALUES (?, ?, ?, ?, ?) RETURNING id",
                 )
                 .bind(user_id)
                 .bind(into_chain_id)
                 .bind(name)
                 .bind(json)
                 .bind(now)
-                .execute(&mut *tx)
+                .fetch_all(&mut *tx)
                 .await;
                 match res {
-                    Ok(r) => (r.last_insert_rowid(), name.to_string(), true),
+                    Ok(r) => (
+                        r.first().map(|r| r.0).ok_or(sqlx::Error::RowNotFound)?,
+                        name.to_string(),
+                        true,
+                    ),
                     // `UNIQUE(chain_id, name)`, so this is the ordinary
                     // collision rather than a fault.
                     Err(sqlx::Error::Database(e)) if e.is_unique_violation() => {
@@ -821,11 +825,11 @@ impl Database {
             .await?;
             Ok(session_id)
         } else {
-            let result = sqlx::query(
+            let result = sqlx::query_as::<_, (i64,)>(
                 "INSERT INTO sessions (user_id, device_id, chain_id, started_at, ended_at,
                     track_count, total_duration, avg_quality_score, listening_context, token_id,
                     uuid, updated_at)
-                 VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?)",
+                 VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?) RETURNING id",
             )
             .bind(user_id)
             .bind(device_id)
@@ -839,9 +843,9 @@ impl Database {
             // Every session gets its stable id at birth — see the migration.
             .bind(new_uuid())
             .bind(Self::now_secs())
-            .execute(&self.pool)
+            .fetch_all(&self.pool)
             .await?;
-            Ok(result.last_insert_rowid())
+            result.first().map(|r| r.0).ok_or(sqlx::Error::RowNotFound)
         }
     }
 }

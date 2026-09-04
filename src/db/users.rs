@@ -106,18 +106,18 @@ impl Database {
         role: &str,
     ) -> Result<i64, sqlx::Error> {
         let now = Self::now_secs();
-        let result = sqlx::query(
+        let result = sqlx::query_as::<_, (i64,)>(
             "INSERT INTO users (username, display_name, password_hash, role, created_at, \
-                                share_all_with_patched) VALUES (?, ?, ?, ?, ?, 1)",
+                                share_all_with_patched) VALUES (?, ?, ?, ?, ?, 1) RETURNING id",
         )
         .bind(username)
         .bind(display_name)
         .bind(password_hash)
         .bind(role)
         .bind(now)
-        .execute(&self.pool)
+        .fetch_all(&self.pool)
         .await?;
-        Ok(result.last_insert_rowid())
+        result.first().map(|r| r.0).ok_or(sqlx::Error::RowNotFound)
     }
     /// Returns (role, disabled) for a user, if they exist.
     pub async fn get_user_role_disabled(

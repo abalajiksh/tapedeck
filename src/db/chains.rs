@@ -74,14 +74,14 @@ impl Database {
         let components_json =
             serde_json::to_string(&chain.components).unwrap_or_else(|_| "[]".into());
         let now = Self::now_secs();
-        let result = sqlx::query(
+        let result = sqlx::query_as::<_, (i64,)>(
             "INSERT INTO signal_chains (user_id, name, description, components, listening_context, icon, is_active, created_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?) RETURNING id"
         ).bind(chain.user_id).bind(&chain.name).bind(&chain.description)
         .bind(&components_json).bind(chain.listening_context.as_str()).bind(&chain.icon)
         .bind(chain.is_active).bind(now)
-        .execute(&self.pool).await?;
-        Ok(result.last_insert_rowid())
+        .fetch_all(&self.pool).await?;
+        result.first().map(|r| r.0).ok_or(sqlx::Error::RowNotFound)
     }
     pub async fn get_chains(&self, user_id: i64) -> Result<Vec<SignalChain>, sqlx::Error> {
         let rows: Vec<ChainRow> = sqlx::query_as(&format!(

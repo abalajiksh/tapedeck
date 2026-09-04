@@ -5,13 +5,17 @@ use argon2::{
     Argon2,
 };
 use sha2::{Digest, Sha256};
-use sqlx::{
-    sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous},
-    FromRow, Pool, Sqlite,
-};
+use sqlx::{FromRow, Pool};
+// Only the SQLite build opens a SQLite pool. The Postgres build still links the
+// driver — that is what will let it read an old file to migrate out of — but it
+// does not configure one here.
+#[cfg(not(feature = "postgres"))]
+use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
 use std::collections::{HashMap, HashSet};
+#[cfg(not(feature = "postgres"))]
 use std::str::FromStr;
 use std::sync::Arc;
+#[cfg(not(feature = "postgres"))]
 use std::time::Duration;
 use tracing::{debug, error, info, warn};
 
@@ -813,8 +817,22 @@ impl PlexSettings {
     }
 }
 
+/// The database this binary was built for, chosen by the `postgres` cargo
+/// feature. See [`dialect`] for what the switch does and does not cover.
+///
+/// **Only the main store is dual-backend.** The MusicBrainz cache
+/// (`SQLITE_DB_PATH`) and the Every Noise map (`EVERYNOISE_DB_PATH`) stay
+/// SQLite in either build: they are regenerable local caches, already kept out
+/// of `VACUUM INTO` backups on purpose, and making them switch too would
+/// triple the work for nothing. A Postgres deployment therefore still keeps a
+/// couple of small SQLite files beside it, and still wants a volume for them.
+#[cfg(feature = "postgres")]
+pub type Db = sqlx::Postgres;
+#[cfg(not(feature = "postgres"))]
+pub type Db = sqlx::Sqlite;
+
 pub struct Database {
-    pool: Pool<Sqlite>,
+    pool: Pool<Db>,
     /// Encrypts the credential blobs Tapedeck must keep replayable. Held here so
     /// ciphertext never escapes this module — callers pass and receive plaintext.
     secrets: Arc<SecretBox>,
@@ -1079,6 +1097,36 @@ pub const FIDELITY_KNOWN: &str = "(COALESCE(format_type, '') = 'dsd' \
 
 impl Database {
     pub async fn new(database_url: &str, secrets: Arc<SecretBox>) -> Result<Self, sqlx::Error> {
+        // Refuse a URL this build cannot serve, in words rather than as a
+        // driver error twenty frames down. Getting handed
+        // "unsupported URL scheme" when the real answer is "you want the other
+        // build" is the kind of message that costs an evening.
+        if !dialect::ACTIVE.accepts(database_url) {
+            return Err(sqlx::Error::Configuration(
+                format!(
+                    "this build serves {}, but DATABASE_URL names something else. \
+                     Accepted schemes: {}. The other backend is a separate build \
+                     of the same binary — see `cargo build --features postgres`.",
+                    dialect::ACTIVE.name(),
+                    dialect::ACTIVE.schemes().join(", "),
+                )
+                .into(),
+            ));
+        }
+        let pool = Self::connect(database_url).await?;
+        let db = Self { pool, secrets };
+        db.init().await?;
+        db.migrate().await?;
+        db.encrypt_legacy_credentials().await?;
+        db.plan_stats().await;
+        Ok(db)
+    }
+
+    /// Open the pool. Every knob here is per-backend and none of it transfers:
+    /// WAL, `busy_timeout` and the page-cache pragmas are answers to SQLite's
+    /// single-writer model and to running off an SD card.
+    #[cfg(not(feature = "postgres"))]
+    async fn connect(database_url: &str) -> Result<Pool<Db>, sqlx::Error> {
         // WAL + a busy_timeout let concurrent writers (poll engine, HTTP
         // handlers, background imports) wait for the lock instead of erroring
         // out with SQLITE_BUSY — which would otherwise drop listens on ingest.
@@ -1102,13 +1150,18 @@ impl Database {
             // every time; this is small enough for a 1 GB host and large enough
             // to hold the working set of the analytics queries.
             .pragma("cache_size", "-8000");
-        let pool = SqlitePoolOptions::new().max_connections(5).connect_with(options).await?;
-        let db = Self { pool, secrets };
-        db.init().await?;
-        db.migrate().await?;
-        db.encrypt_legacy_credentials().await?;
-        db.plan_stats().await;
-        Ok(db)
+        SqlitePoolOptions::new().max_connections(5).connect_with(options).await
+    }
+
+    #[cfg(feature = "postgres")]
+    async fn connect(database_url: &str) -> Result<Pool<Db>, sqlx::Error> {
+        // Deliberately the same five connections as the SQLite build, which is
+        // almost certainly too few for a server that has no single-writer
+        // constraint. It is left alone because this codebase's two worst
+        // incidents were pool exhaustion behind a slow query, and the honest
+        // way to raise it is a measurement on the real host rather than a
+        // number picked here.
+        sqlx::postgres::PgPoolOptions::new().max_connections(5).connect(database_url).await
     }
 
     /// Give the query planner something to plan with.
@@ -2792,5 +2845,14 @@ mod sources;
 mod stats;
 mod users;
 
-#[cfg(test)]
+// These build a temp SQLite file and drive it through the real `Database`.
+// Under `--features postgres` that type is `Pool<Postgres>`, so they cannot run
+// without a live server and are compiled out rather than left to fail.
+//
+// **That is a real gap, not a tidy-up.** The Postgres build's data layer has no
+// test coverage at all today — 153 tests' worth. Pointing this module at a
+// throwaway Postgres schema (a `TAPEDECK_TEST_DATABASE_URL`, a schema per test,
+// dropped afterwards) is the work that closes it, and it should land before
+// anyone points a Postgres build at data they care about.
+#[cfg(all(test, not(feature = "postgres")))]
 mod tests;

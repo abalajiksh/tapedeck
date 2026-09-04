@@ -803,11 +803,11 @@ impl Database {
                 Some((u, t, n)) => (u.clone().unwrap_or_else(new_uuid), t.clone(), n.clone()),
                 None => (new_uuid(), None, None),
             };
-            let res = sqlx::query(
+            let res = sqlx::query_as::<_, (i64,)>(
                 "INSERT INTO sessions (user_id, device_id, chain_id, started_at, ended_at,
                     track_count, total_duration, avg_quality_score, listening_context,
                     uuid, title, notes, updated_at)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
             )
             .bind(user_id)
             .bind(g.device_id)
@@ -822,9 +822,9 @@ impl Database {
             .bind(title)
             .bind(notes)
             .bind(now)
-            .execute(&mut *tx)
+            .fetch_all(&mut *tx)
             .await?;
-            let sid = res.last_insert_rowid();
+            let sid = res.first().map(|r| r.0).ok_or(sqlx::Error::RowNotFound)?;
 
             // Chunked rather than one statement per listen. The cap is well
             // under SQLite's parameter limit and keeps a long session from
@@ -1032,10 +1032,10 @@ impl Database {
         let moving: Vec<i64> = listens[pos..].iter().map(|s| s.id).collect();
         let started = listens[pos].timestamp;
 
-        let res = sqlx::query(
+        let res = sqlx::query_as::<_, (i64,)>(
             "INSERT INTO sessions (user_id, device_id, chain_id, started_at, ended_at,
                 track_count, total_duration, listening_context, uuid, updated_at)
-             VALUES (?, ?, ?, ?, ?, 0, 0, ?, ?, ?)",
+             VALUES (?, ?, ?, ?, ?, 0, 0, ?, ?, ?) RETURNING id",
         )
         .bind(user_id)
         .bind(device_id)
@@ -1045,9 +1045,9 @@ impl Database {
         .bind(context.unwrap_or_else(|| "unknown".into()))
         .bind(new_uuid())
         .bind(Self::now_secs())
-        .execute(&self.pool)
+        .fetch_all(&self.pool)
         .await?;
-        let new_id = res.last_insert_rowid();
+        let new_id = res.first().map(|r| r.0).ok_or(sqlx::Error::RowNotFound)?;
 
         let ph = vec!["?"; moving.len()].join(",");
         let sql =
@@ -1326,16 +1326,16 @@ impl Database {
             return Ok(note.id);
         }
 
-        let result = sqlx::query(
+        let result = sqlx::query_as::<_, (i64,)>(
             "INSERT INTO notes (user_id, entity_id, scrobble_id, period_key, line_key, line_label, body_md, visibility, created_at, updated_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id"
         )
         .bind(user_id).bind(entity_id).bind(scrobble_id).bind(period_key)
         .bind(line_key).bind(line_label)
         .bind(body_md).bind(visibility)
         .bind(now).bind(now)
-        .execute(&self.pool).await?;
-        Ok(result.last_insert_rowid())
+        .fetch_all(&self.pool).await?;
+        result.first().map(|r| r.0).ok_or(sqlx::Error::RowNotFound)
     }
     /// The pin on one lyric line, if there is one.
     ///
