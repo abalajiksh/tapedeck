@@ -2830,7 +2830,7 @@ mod crate_shelf;
 pub mod dialect;
 mod gear;
 #[cfg(test)]
-mod guards;
+pub(crate) mod guards;
 mod import;
 mod library;
 mod listens;

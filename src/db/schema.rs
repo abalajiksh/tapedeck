@@ -12,8 +12,20 @@
 use super::*;
 
 impl Database {
+    /// Run one DDL statement, translated into the active dialect.
+    ///
+    /// Every `CREATE` in this file is written in SQLite's spelling and mapped
+    /// by [`dialect::rewrite_ddl`] — **the schema is translated, never written
+    /// twice.** A hand-maintained second copy of 48 tables would be free to
+    /// drift from the first, and a schema that disagrees with itself between
+    /// backends is the worst thing this application could own.
+    async fn ddl(&self, sql: &str) -> Result<(), sqlx::Error> {
+        sqlx::query(&dialect::rewrite_ddl(sql)).execute(&self.pool).await?;
+        Ok(())
+    }
+
     pub(super) async fn init(&self) -> Result<(), sqlx::Error> {
-        sqlx::query(
+        self.ddl(
             "CREATE TABLE IF NOT EXISTS scrobbles (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_id INTEGER NOT NULL DEFAULT 1,
@@ -81,10 +93,9 @@ impl Database {
                 UNIQUE(user_id, source_id, source_name)
             )",
         )
-        .execute(&self.pool)
         .await?;
 
-        sqlx::query(
+        self.ddl(
             "CREATE TABLE IF NOT EXISTS users (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 username TEXT UNIQUE NOT NULL,
@@ -146,10 +157,9 @@ impl Database {
                 forward_spool_listens INTEGER NOT NULL DEFAULT 0
             )",
         )
-        .execute(&self.pool)
         .await?;
 
-        sqlx::query(
+        self.ddl(
             "CREATE TABLE IF NOT EXISTS tokens (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_id INTEGER NOT NULL REFERENCES users(id),
@@ -168,10 +178,9 @@ impl Database {
                 imports_are_live BOOLEAN DEFAULT FALSE
             )",
         )
-        .execute(&self.pool)
         .await?;
 
-        sqlx::query(
+        self.ddl(
             "CREATE TABLE IF NOT EXISTS signal_chains (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_id INTEGER NOT NULL REFERENCES users(id),
@@ -194,7 +203,6 @@ impl Database {
                 UNIQUE(user_id, name)
             )",
         )
-        .execute(&self.pool)
         .await?;
 
         // A chain with one step swapped.
@@ -211,7 +219,7 @@ impl Database {
         // steps that differ are stored, so editing the shared part of a chain
         // updates every variant of it — which is the entire reason this is an
         // override rather than a copy.
-        sqlx::query(
+        self.ddl(
             "CREATE TABLE IF NOT EXISTS chain_variants (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_id INTEGER NOT NULL REFERENCES users(id),
@@ -222,10 +230,9 @@ impl Database {
                 UNIQUE(chain_id, name)
             )",
         )
-        .execute(&self.pool)
         .await?;
 
-        sqlx::query(
+        self.ddl(
             "CREATE TABLE IF NOT EXISTS devices (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_id INTEGER NOT NULL REFERENCES users(id),
@@ -237,7 +244,6 @@ impl Database {
                 UNIQUE(user_id, machine_id)
             )",
         )
-        .execute(&self.pool)
         .await?;
 
         // ── Physical media ──
@@ -252,7 +258,7 @@ impl Database {
         // whole, and because side assignment is frequently hand-corrected —
         // MusicBrainz records vinyl track numbers as "A1" only when the editor
         // bothered, and as plain 1..n otherwise.
-        sqlx::query(
+        self.ddl(
             "CREATE TABLE IF NOT EXISTS physical_releases (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_id INTEGER NOT NULL REFERENCES users(id),
@@ -293,7 +299,6 @@ impl Database {
                 parked_secs INTEGER
             )",
         )
-        .execute(&self.pool)
         .await?;
 
         // What is on the deck right now, as a fact about the *shelf* rather
@@ -315,7 +320,7 @@ impl Database {
         // `outcomes` is the per-track record the browser accumulates (position,
         // real start, skipped) and is JSON because it is written and read
         // whole, never queried into.
-        sqlx::query(
+        self.ddl(
             "CREATE TABLE IF NOT EXISTS physical_spins (
                 user_id INTEGER PRIMARY KEY REFERENCES users(id),
                 release_id INTEGER NOT NULL REFERENCES physical_releases(id),
@@ -334,7 +339,6 @@ impl Database {
                 updated_at INTEGER NOT NULL
             )",
         )
-        .execute(&self.pool)
         .await?;
 
         // Sleeves, booklets, labels, obi strips — the parts of a record you
@@ -351,7 +355,7 @@ impl Database {
         //
         // `kind` is free text rather than a CHECK: the archive adds types, and a
         // scan of something it has no word for is still a scan.
-        sqlx::query(
+        self.ddl(
             "CREATE TABLE IF NOT EXISTS physical_images (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_id INTEGER NOT NULL REFERENCES users(id),
@@ -370,27 +374,24 @@ impl Database {
                 added_at INTEGER NOT NULL
             )",
         )
-        .execute(&self.pool)
         .await?;
-        sqlx::query(
+        self.ddl(
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_physical_images_remote
                 ON physical_images(release_id, provider, remote_id)
              WHERE remote_id IS NOT NULL",
         )
-        .execute(&self.pool)
         .await?;
-        sqlx::query(
+        self.ddl(
             "CREATE INDEX IF NOT EXISTS idx_physical_images_release
                 ON physical_images(release_id, position)",
         )
-        .execute(&self.pool)
         .await?;
 
         // One row per *side played*, which is the unit you actually handle: you
         // put a side on, it plays through, you flip it. The listens themselves
         // are ordinary `scrobbles` rows — this is the record of the physical
         // act, and what stylus hours and a cassette counter are computed from.
-        sqlx::query(
+        self.ddl(
             "CREATE TABLE IF NOT EXISTS physical_plays (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_id INTEGER NOT NULL REFERENCES users(id),
@@ -412,7 +413,6 @@ impl Database {
                 recorded_at INTEGER
             )",
         )
-        .execute(&self.pool)
         .await?;
 
         // Server-wide settings an admin sets in the UI, as opposed to
@@ -421,7 +421,7 @@ impl Database {
         // Device-code pairing. A client that cannot show a browser — a DAP, a
         // headless player, a TV app — asks for a code here and polls; the user
         // approves it in the web UI and the client collects its token.
-        sqlx::query(
+        self.ddl(
             "CREATE TABLE IF NOT EXISTS pairing_requests (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 -- Hashed like a token: the device code is a bearer secret, and
@@ -442,20 +442,18 @@ impl Database {
                 approved_at INTEGER
             )",
         )
-        .execute(&self.pool)
         .await?;
 
-        sqlx::query(
+        self.ddl(
             "CREATE TABLE IF NOT EXISTS app_settings (
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL,
                 updated_at INTEGER NOT NULL
             )",
         )
-        .execute(&self.pool)
         .await?;
 
-        sqlx::query(
+        self.ddl(
             "CREATE TABLE IF NOT EXISTS equipment (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_id INTEGER NOT NULL REFERENCES users(id),
@@ -477,10 +475,9 @@ impl Database {
                 UNIQUE(user_id, name)
             )",
         )
-        .execute(&self.pool)
         .await?;
 
-        sqlx::query(
+        self.ddl(
             "CREATE TABLE IF NOT EXISTS sessions (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_id INTEGER NOT NULL REFERENCES users(id),
@@ -499,11 +496,10 @@ impl Database {
                 updated_at INTEGER
             )",
         )
-        .execute(&self.pool)
         .await?;
 
         // ── Web Sessions (browser login) ──
-        sqlx::query(
+        self.ddl(
             "CREATE TABLE IF NOT EXISTS web_sessions (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_id INTEGER NOT NULL REFERENCES users(id),
@@ -513,14 +509,13 @@ impl Database {
                 last_active_at INTEGER NOT NULL
             )",
         )
-        .execute(&self.pool)
         .await?;
 
         // ── Output-device → chain bindings (Phase B) ──
         // One row per distinct output the client reports (USB DAC name, BT
         // device, "wired", …). chain_id NULL = seen but unmapped, which the UI
         // surfaces for one-tap assignment (auto-learn).
-        sqlx::query(
+        self.ddl(
             "CREATE TABLE IF NOT EXISTS chain_bindings (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_id INTEGER NOT NULL REFERENCES users(id),
@@ -532,13 +527,12 @@ impl Database {
                 UNIQUE(user_id, identifier)
             )",
         )
-        .execute(&self.pool)
         .await?;
 
         // ── Per-user scrobble connections (Last.fm / ListenBrainz) ──
         // Credentials stay server-side; the API only ever exposes the connected
         // account name, never the token/session key.
-        sqlx::query(
+        self.ddl(
             "CREATE TABLE IF NOT EXISTS user_connections (
                 user_id INTEGER NOT NULL REFERENCES users(id),
                 service TEXT NOT NULL,
@@ -548,11 +542,10 @@ impl Database {
                 PRIMARY KEY (user_id, service)
             )",
         )
-        .execute(&self.pool)
         .await?;
 
         // ── Import history (one row per finished import job) ──
-        sqlx::query(
+        self.ddl(
             "CREATE TABLE IF NOT EXISTS import_jobs (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_id INTEGER NOT NULL REFERENCES users(id),
@@ -564,14 +557,13 @@ impl Database {
                 created_at INTEGER NOT NULL
             )",
         )
-        .execute(&self.pool)
         .await?;
 
         // Artists as entities rather than bare strings on a listen. Needed for
         // anywhere an artist has properties of its own — an image today, MBIDs
         // and liner notes later. Global, not per-user: "Aphex Twin" is the same
         // artist for everyone on the instance.
-        sqlx::query(
+        self.ddl(
             "CREATE TABLE IF NOT EXISTS artists (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 name TEXT NOT NULL,
@@ -590,7 +582,6 @@ impl Database {
                 updated_at INTEGER NOT NULL DEFAULT 0
             )",
         )
-        .execute(&self.pool)
         .await?;
 
         // ── Entities, liner notes and loves (Phase 7) ──
@@ -599,7 +590,7 @@ impl Database {
         // Deliberately *not* keyed by MBID — an un-enriched listen has none, so
         // notes would silently fail on exactly the obscure records worth
         // annotating. The MBID is one alias among others.
-        sqlx::query(
+        self.ddl(
             "CREATE TABLE IF NOT EXISTS entities (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 kind TEXT NOT NULL,
@@ -616,13 +607,12 @@ impl Database {
                 created_at INTEGER NOT NULL
             )",
         )
-        .execute(&self.pool)
         .await?;
 
         // Other names the same entity answers to. Today this carries MBIDs; it
         // is what makes merging two spellings of one record possible later
         // without rewriting every note that points at either.
-        sqlx::query(
+        self.ddl(
             "CREATE TABLE IF NOT EXISTS bio_cache (
                 entity_id INTEGER PRIMARY KEY REFERENCES entities(id),
                 bio TEXT,
@@ -632,10 +622,9 @@ impl Database {
                 fetched_at INTEGER NOT NULL
             )",
         )
-        .execute(&self.pool)
         .await?;
 
-        sqlx::query(
+        self.ddl(
             "CREATE TABLE IF NOT EXISTS entity_aliases (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 entity_id INTEGER NOT NULL REFERENCES entities(id),
@@ -644,10 +633,8 @@ impl Database {
                 UNIQUE(entity_id, alias_kind, value)
             )",
         )
-        .execute(&self.pool)
         .await?;
-        sqlx::query("CREATE INDEX IF NOT EXISTS idx_entity_aliases_lookup ON entity_aliases(alias_kind, value)")
-            .execute(&self.pool).await?;
+        self.ddl("CREATE INDEX IF NOT EXISTS idx_entity_aliases_lookup ON entity_aliases(alias_kind, value)").await?;
 
         // `scrobbles` carried no index at all beyond the UNIQUE it needs for
         // dedup, so every ranged query — history, stats, all seven rediscovery
@@ -664,17 +651,15 @@ impl Database {
         // to the caller, then bounded or ordered by time. `skipped` is left out
         // deliberately — it is a low-cardinality flag, and putting it in front
         // of `timestamp` would help no range scan while making the index wider.
-        sqlx::query(
+        self.ddl(
             "CREATE INDEX IF NOT EXISTS idx_scrobbles_user_time ON scrobbles(user_id, timestamp)",
         )
-        .execute(&self.pool)
         .await?;
         // Grouping queries (top artists/albums/tracks, the variant pass) sort
         // by artist within a user before they aggregate.
-        sqlx::query(
+        self.ddl(
             "CREATE INDEX IF NOT EXISTS idx_scrobbles_user_artist ON scrobbles(user_id, artist)",
         )
-        .execute(&self.pool)
         .await?;
 
         // **Almost no expression indexes on the folded name** — the single
@@ -734,7 +719,7 @@ impl Database {
         // The primary key is `(scrobble_id, artist_key)`, so a listen crediting
         // the same artist twice — which real tags do, "Bach; J.S. Bach" — counts
         // once. Same rule as the `fitted` set in `equipment_seconds`.
-        sqlx::query(
+        self.ddl(
             "CREATE TABLE IF NOT EXISTS scrobble_artists (
                 scrobble_id INTEGER NOT NULL REFERENCES scrobbles(id),
                 artist_key TEXT NOT NULL,
@@ -744,7 +729,6 @@ impl Database {
                 PRIMARY KEY (scrobble_id, artist_key)
             ) WITHOUT ROWID",
         )
-        .execute(&self.pool)
         .await?;
         // Unlike the expression indexes the note above rejects, this one is for
         // a **point lookup** — "every listen crediting this artist", which is
@@ -752,11 +736,10 @@ impl Database {
         // of the join table per visit. It is the workload an index is actually
         // for. The whole-history direction (top artists) still scans, which is
         // correct on this storage.
-        sqlx::query(
+        self.ddl(
             "CREATE INDEX IF NOT EXISTS idx_scrobble_artists_key
                  ON scrobble_artists(artist_key, scrobble_id)",
         )
-        .execute(&self.pool)
         .await?;
 
         // A note is a living document: one per user per target, edited in place.
@@ -780,7 +763,7 @@ impl Database {
         // `VACUUM INTO`), so there is nothing here to reference even in
         // principle. `line_label` rides beside it because the fold has to
         // happen in Rust; see [`NoteRow::line_label`].
-        sqlx::query(
+        self.ddl(
             "CREATE TABLE IF NOT EXISTS notes (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_id INTEGER NOT NULL REFERENCES users(id),
@@ -798,18 +781,15 @@ impl Database {
                 CHECK ((line_key IS NULL) = (line_label IS NULL))
             )",
         )
-        .execute(&self.pool)
         .await?;
         // Partial uniques: one note per target per user, enforced by the
         // database rather than by every write path remembering to check.
-        sqlx::query("CREATE UNIQUE INDEX IF NOT EXISTS idx_notes_user_entity ON notes(user_id, entity_id) WHERE entity_id IS NOT NULL")
-            .execute(&self.pool).await?;
-        sqlx::query("CREATE UNIQUE INDEX IF NOT EXISTS idx_notes_user_scrobble ON notes(user_id, scrobble_id) WHERE scrobble_id IS NOT NULL")
-            .execute(&self.pool).await?;
+        self.ddl("CREATE UNIQUE INDEX IF NOT EXISTS idx_notes_user_entity ON notes(user_id, entity_id) WHERE entity_id IS NOT NULL").await?;
+        self.ddl("CREATE UNIQUE INDEX IF NOT EXISTS idx_notes_user_scrobble ON notes(user_id, scrobble_id) WHERE scrobble_id IS NOT NULL").await?;
 
         // Every edit keeps what was there before. These are meant to be kept for
         // years; a rewrite in 2031 shouldn't erase what you thought in 2026.
-        sqlx::query(
+        self.ddl(
             "CREATE TABLE IF NOT EXISTS note_revisions (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 note_id INTEGER NOT NULL REFERENCES notes(id),
@@ -817,12 +797,10 @@ impl Database {
                 created_at INTEGER NOT NULL
             )",
         )
-        .execute(&self.pool)
         .await?;
-        sqlx::query("CREATE INDEX IF NOT EXISTS idx_note_revisions_note ON note_revisions(note_id, created_at)")
-            .execute(&self.pool).await?;
+        self.ddl("CREATE INDEX IF NOT EXISTS idx_note_revisions_note ON note_revisions(note_id, created_at)").await?;
 
-        sqlx::query(
+        self.ddl(
             "CREATE TABLE IF NOT EXISTS loves (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_id INTEGER NOT NULL REFERENCES users(id),
@@ -831,13 +809,12 @@ impl Database {
                 UNIQUE(user_id, entity_id)
             )",
         )
-        .execute(&self.pool)
         .await?;
 
         // One row per user per source kind. Replaces the single-row
         // `plex_settings`: a source belongs to the person whose account it
         // reads, so nobody's token can see anybody else's listening.
-        sqlx::query(
+        self.ddl(
             "CREATE TABLE IF NOT EXISTS user_sources (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_id INTEGER NOT NULL REFERENCES users(id),
@@ -854,12 +831,11 @@ impl Database {
                 updated_at INTEGER NOT NULL DEFAULT 0
             )",
         )
-        .execute(&self.pool)
         .await?;
 
         // Plex is a single server-wide source, not a per-user connection, so
         // this is deliberately a one-row table (the CHECK enforces it).
-        sqlx::query(
+        self.ddl(
             "CREATE TABLE IF NOT EXISTS plex_settings (
                 id INTEGER PRIMARY KEY CHECK (id = 1),
                 enabled INTEGER NOT NULL DEFAULT 0,
@@ -874,7 +850,6 @@ impl Database {
                 updated_at INTEGER NOT NULL DEFAULT 0
             )",
         )
-        .execute(&self.pool)
         .await?;
 
         self.init_mcp().await?;
@@ -900,7 +875,7 @@ impl Database {
     /// * Revoking "the chatbot I connected last month" should not mean reading
     ///   past six players in the same list.
     async fn init_mcp(&self) -> Result<(), sqlx::Error> {
-        sqlx::query(
+        self.ddl(
             "CREATE TABLE IF NOT EXISTS mcp_connections (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_id INTEGER NOT NULL REFERENCES users(id),
@@ -924,14 +899,12 @@ impl Database {
                 revoked_at INTEGER
             )",
         )
-        .execute(&self.pool)
         .await?;
 
-        sqlx::query(
+        self.ddl(
             "CREATE INDEX IF NOT EXISTS idx_mcp_connections_user
              ON mcp_connections(user_id)",
         )
-        .execute(&self.pool)
         .await?;
 
         // Every call, kept. This is what makes "I connected a chatbot to my
@@ -940,7 +913,7 @@ impl Database {
         // building. `rows` is the last of those and the one worth having — a
         // tool that answered with 12 rows and a tool that answered with 20,000
         // are different events however identical the call looks.
-        sqlx::query(
+        self.ddl(
             "CREATE TABLE IF NOT EXISTS mcp_audit (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 connection_id INTEGER REFERENCES mcp_connections(id),
@@ -954,20 +927,18 @@ impl Database {
                 ms INTEGER
             )",
         )
-        .execute(&self.pool)
         .await?;
 
-        sqlx::query(
+        self.ddl(
             "CREATE INDEX IF NOT EXISTS idx_mcp_audit_user_at
              ON mcp_audit(user_id, at DESC)",
         )
-        .execute(&self.pool)
         .await?;
 
         // Registered OAuth clients. `redirect_uris` and `grant_types` are JSON
         // arrays; `secret_hash` is null for a public client, which is what
         // every MCP client is (PKCE, no back channel).
-        sqlx::query(
+        self.ddl(
             "CREATE TABLE IF NOT EXISTS oauth_clients (
                 client_id TEXT PRIMARY KEY,
                 secret_hash TEXT,
@@ -980,13 +951,12 @@ impl Database {
                 created_at INTEGER NOT NULL
             )",
         )
-        .execute(&self.pool)
         .await?;
 
         // Authorization codes. Single use, short lived, and bound to both the
         // PKCE challenge and the RFC 8707 resource the client asked for — the
         // audience the minted credential is then pinned to.
-        sqlx::query(
+        self.ddl(
             "CREATE TABLE IF NOT EXISTS oauth_codes (
                 code_hash TEXT PRIMARY KEY,
                 client_id TEXT NOT NULL,
@@ -1000,7 +970,6 @@ impl Database {
                 expires_at INTEGER NOT NULL
             )",
         )
-        .execute(&self.pool)
         .await?;
 
         Ok(())
@@ -1026,7 +995,7 @@ impl Database {
     /// accumulator that nothing recomputes drifts from the thing it summarises,
     /// and this codebase has now found that bug at three different levels.
     async fn init_crate(&self) -> Result<(), sqlx::Error> {
-        sqlx::query(
+        self.ddl(
             "CREATE TABLE IF NOT EXISTS recommendations (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_id INTEGER NOT NULL REFERENCES users(id),
@@ -1050,25 +1019,22 @@ impl Database {
                 acted_at INTEGER
             )",
         )
-        .execute(&self.pool)
         .await?;
 
-        sqlx::query(
+        self.ddl(
             "CREATE INDEX IF NOT EXISTS idx_recommendations_user
              ON recommendations(user_id, status, created_at DESC)",
         )
-        .execute(&self.pool)
         .await?;
 
         // One row per thing, per user. A second assistant suggesting the same
         // record should not produce a duplicate card — the interesting fact is
         // that two of them did, which the UI can show from the audit trail
         // rather than by stacking rows.
-        sqlx::query(
+        self.ddl(
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_recommendations_target
              ON recommendations(user_id, kind, LOWER(TRIM(artist)), LOWER(TRIM(COALESCE(name,''))))",
         )
-        .execute(&self.pool)
         .await?;
 
         Ok(())
@@ -1082,7 +1048,7 @@ impl Database {
     /// yet, and the whole point of storing it is that somebody does before it
     /// reaches the household's Plex.
     async fn init_saved_playlists(&self) -> Result<(), sqlx::Error> {
-        sqlx::query(
+        self.ddl(
             "CREATE TABLE IF NOT EXISTS playlists (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_id INTEGER NOT NULL REFERENCES users(id),
@@ -1102,22 +1068,20 @@ impl Database {
                 pushed_to TEXT
             )",
         )
-        .execute(&self.pool)
         .await?;
 
-        sqlx::query(
+        self.ddl(
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_playlists_idempotency
              ON playlists(user_id, idempotency_key)
              WHERE idempotency_key IS NOT NULL",
         )
-        .execute(&self.pool)
         .await?;
 
         // Names, not ids. A generated list is titles and artists — the same
         // shape `playlists::pick` resolves against a real library at push time,
         // and the only shape that survives the user not owning the track on
         // every server they have.
-        sqlx::query(
+        self.ddl(
             "CREATE TABLE IF NOT EXISTS playlist_tracks (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 playlist_id INTEGER NOT NULL REFERENCES playlists(id),
@@ -1130,14 +1094,12 @@ impl Database {
                 note TEXT
             )",
         )
-        .execute(&self.pool)
         .await?;
 
-        sqlx::query(
+        self.ddl(
             "CREATE INDEX IF NOT EXISTS idx_playlist_tracks_playlist
              ON playlist_tracks(playlist_id, position)",
         )
-        .execute(&self.pool)
         .await?;
 
         // Which remote playlist a push owns.
@@ -1152,7 +1114,7 @@ impl Database {
         //
         // `source_id` is part of the key so the same list pushed to Plex and to
         // TIDAL remembers both, and `-1` is the reserved TIDAL target.
-        sqlx::query(
+        self.ddl(
             "CREATE TABLE IF NOT EXISTS pushed_playlists (
                 user_id INTEGER NOT NULL REFERENCES users(id),
                 source_id INTEGER NOT NULL,
@@ -1162,7 +1124,6 @@ impl Database {
                 PRIMARY KEY (user_id, source_id, name_key)
             )",
         )
-        .execute(&self.pool)
         .await?;
 
         // Which track on the far end a name resolved to, last time.
@@ -1181,7 +1142,7 @@ impl Database {
         // **Misses are deliberately not cached.** A catalogue gains tracks, and
         // remembering "not on TIDAL" would make that permanent for a listener
         // who would never find out why. The win is on hits and that is enough.
-        sqlx::query(
+        self.ddl(
             "CREATE TABLE IF NOT EXISTS playlist_matches (
                 user_id INTEGER NOT NULL REFERENCES users(id),
                 source_id INTEGER NOT NULL,
@@ -1199,7 +1160,6 @@ impl Database {
                 PRIMARY KEY (user_id, source_id, artist_key, title_key)
             )",
         )
-        .execute(&self.pool)
         .await?;
 
         self.init_patch().await?;
@@ -1226,7 +1186,7 @@ impl Database {
         // `PUBLIC_URL` and the username at creation, but the moment a remote
         // server holds it, it is a fact about the past — recomputing it from
         // today's config would silently rename an actor other people follow.
-        sqlx::query(
+        self.ddl(
             "CREATE TABLE IF NOT EXISTS actors (
                 user_id INTEGER PRIMARY KEY REFERENCES users(id),
                 uri TEXT NOT NULL UNIQUE,
@@ -1249,14 +1209,13 @@ impl Database {
                 created_at INTEGER NOT NULL
             )",
         )
-        .execute(&self.pool)
         .await?;
 
         // Everyone we have resolved who is not us. Cached rather than fetched
         // per request -- an actor document is the key material a signature is
         // checked against, and re-fetching it per inbox delivery would make
         // every remote server's availability our own.
-        sqlx::query(
+        self.ddl(
             "CREATE TABLE IF NOT EXISTS remote_actors (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 uri TEXT NOT NULL UNIQUE,
@@ -1275,7 +1234,6 @@ impl Database {
                 fetched_at INTEGER NOT NULL
             )",
         )
-        .execute(&self.pool)
         .await?;
 
         // A patch is a follow edge, and it carries state because an
@@ -1285,7 +1243,7 @@ impl Database {
         // Either end may be local or remote, which is why there are four
         // columns and not two. The CHECKs are what stop a row that names both
         // or neither: exactly one side of each end is set, always.
-        sqlx::query(
+        self.ddl(
             "CREATE TABLE IF NOT EXISTS patches (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 uuid TEXT NOT NULL UNIQUE,
@@ -1303,32 +1261,28 @@ impl Database {
                 CHECK ((target_user_id IS NULL) <> (target_actor_id IS NULL))
             )",
         )
-        .execute(&self.pool)
         .await?;
 
         // One edge per pair, whichever shape the ends take. Two partial indexes
         // rather than one, because a UNIQUE over four mostly-null columns
         // treats every NULL as distinct and would enforce nothing at all.
-        sqlx::query(
+        self.ddl(
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_patches_local_pair
              ON patches(follower_user_id, target_user_id)
              WHERE follower_user_id IS NOT NULL AND target_user_id IS NOT NULL",
         )
-        .execute(&self.pool)
         .await?;
-        sqlx::query(
+        self.ddl(
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_patches_remote_out
              ON patches(follower_user_id, target_actor_id)
              WHERE follower_user_id IS NOT NULL AND target_actor_id IS NOT NULL",
         )
-        .execute(&self.pool)
         .await?;
-        sqlx::query(
+        self.ddl(
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_patches_remote_in
              ON patches(follower_actor_id, target_user_id)
              WHERE follower_actor_id IS NOT NULL AND target_user_id IS NOT NULL",
         )
-        .execute(&self.pool)
         .await?;
 
         // Every social action, with a stable id and a timestamp.
@@ -1343,7 +1297,7 @@ impl Database {
         // `payload` is the JSON-LD **as signed**, kept rather than rebuilt.
         // Rebuilding it later would produce a different document once anything
         // upstream of it changes, and a signature is over bytes.
-        sqlx::query(
+        self.ddl(
             "CREATE TABLE IF NOT EXISTS activities (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 uuid TEXT NOT NULL UNIQUE,
@@ -1364,23 +1318,20 @@ impl Database {
                 visibility TEXT NOT NULL DEFAULT 'private'
             )",
         )
-        .execute(&self.pool)
         .await?;
 
-        sqlx::query(
+        self.ddl(
             "CREATE INDEX IF NOT EXISTS idx_activities_user_published
              ON activities(user_id, published)",
         )
-        .execute(&self.pool)
         .await?;
-        sqlx::query("CREATE INDEX IF NOT EXISTS idx_activities_object ON activities(object_ref)")
-            .execute(&self.pool)
+        self.ddl("CREATE INDEX IF NOT EXISTS idx_activities_object ON activities(object_ref)")
             .await?;
 
         // Delivery is per recipient, for the reason `delivered_sinks` is per
         // scrobble: one inbox being down must not redeliver to the twenty that
         // already took it. Retries only touch rows that are not yet 'sent'.
-        sqlx::query(
+        self.ddl(
             "CREATE TABLE IF NOT EXISTS activity_deliveries (
                 activity_id INTEGER NOT NULL REFERENCES activities(id),
                 actor_id INTEGER NOT NULL REFERENCES remote_actors(id),
@@ -1392,14 +1343,12 @@ impl Database {
                 PRIMARY KEY (activity_id, actor_id)
             )",
         )
-        .execute(&self.pool)
         .await?;
 
-        sqlx::query(
+        self.ddl(
             "CREATE INDEX IF NOT EXISTS idx_activity_deliveries_pending
              ON activity_deliveries(state, attempts) WHERE state <> 'sent'",
         )
-        .execute(&self.pool)
         .await?;
 
         // What other servers have said to us, kept apart from what we have
@@ -1413,7 +1362,7 @@ impl Database {
         // look completely reasonable in review. Two tables make that
         // impossible rather than merely unlikely, which is the same call the
         // Crate's separate table makes about unowned music.
-        sqlx::query(
+        self.ddl(
             "CREATE TABLE IF NOT EXISTS inbox_activities (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 -- Whose inbox it arrived at.
@@ -1436,14 +1385,12 @@ impl Database {
                 state TEXT NOT NULL DEFAULT 'pending'
             )",
         )
-        .execute(&self.pool)
         .await?;
 
-        sqlx::query(
+        self.ddl(
             "CREATE INDEX IF NOT EXISTS idx_inbox_activities_user
              ON inbox_activities(user_id, received_at)",
         )
-        .execute(&self.pool)
         .await?;
 
         // ── Shared Spools ──
@@ -1457,7 +1404,7 @@ impl Database {
         // joint listen really is duplicated storage, and each copy forwards to
         // its own owner's services — which is correct, because each listener
         // really did listen.
-        sqlx::query(
+        self.ddl(
             "CREATE TABLE IF NOT EXISTS spools (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 uuid TEXT NOT NULL UNIQUE,
@@ -1474,19 +1421,17 @@ impl Database {
                 session_uuid TEXT
             )",
         )
-        .execute(&self.pool)
         .await?;
 
         // Nobody hosts two sittings at once, and saying so here means no
         // handler has to remember it.
-        sqlx::query(
+        self.ddl(
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_spools_one_running
              ON spools(host_user_id) WHERE ended_at IS NULL",
         )
-        .execute(&self.pool)
         .await?;
 
-        sqlx::query(
+        self.ddl(
             "CREATE TABLE IF NOT EXISTS spool_members (
                 spool_id INTEGER NOT NULL REFERENCES spools(id),
                 user_id INTEGER NOT NULL REFERENCES users(id),
@@ -1497,7 +1442,6 @@ impl Database {
                 PRIMARY KEY (spool_id, user_id)
             )",
         )
-        .execute(&self.pool)
         .await?;
 
         // What somebody else's deck played while you were in the room.
@@ -1509,7 +1453,7 @@ impl Database {
         // plays one forgotten `WHERE` away from every count in the
         // application; a separate table makes that impossible, the same call
         // the Crate and `inbox_activities` both make.
-        sqlx::query(
+        self.ddl(
             "CREATE TABLE IF NOT EXISTS spool_captures (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 spool_id INTEGER NOT NULL REFERENCES spools(id),
@@ -1535,7 +1479,6 @@ impl Database {
                 UNIQUE (user_id, spool_id, played_at, title)
             )",
         )
-        .execute(&self.pool)
         .await?;
 
         // ── Handing over a past sitting ──
@@ -1554,7 +1497,7 @@ impl Database {
         // un-patching" by physics rather than preference — that rule is about
         // bytes already on somebody else's server, which cannot be recalled.
         // **When this federates it has to become a snapshot.**
-        sqlx::query(
+        self.ddl(
             "CREATE TABLE IF NOT EXISTS shared_sessions (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 uuid TEXT NOT NULL UNIQUE,
@@ -1573,24 +1516,21 @@ impl Database {
                 CHECK ((to_user_id IS NULL) <> (to_actor_id IS NULL))
             )",
         )
-        .execute(&self.pool)
         .await?;
 
         // Handing the same sitting to the same person twice updates the note
         // rather than filling their inbox with copies.
-        sqlx::query(
+        self.ddl(
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_shared_sessions_local
              ON shared_sessions(from_user_id, session_uuid, to_user_id)
              WHERE to_user_id IS NOT NULL",
         )
-        .execute(&self.pool)
         .await?;
 
-        sqlx::query(
+        self.ddl(
             "CREATE INDEX IF NOT EXISTS idx_shared_sessions_inbox
              ON shared_sessions(to_user_id, created_at)",
         )
-        .execute(&self.pool)
         .await?;
 
         // Every live listen now asks "am I in a sitting?", which walks
@@ -1598,15 +1538,13 @@ impl Database {
         // it cannot serve that prefix. A point lookup is exactly the workload
         // v0.59.0 says an index is for, unlike the whole-history aggregations
         // its expression indexes were dropped from.
-        sqlx::query("CREATE INDEX IF NOT EXISTS idx_spool_members_user ON spool_members(user_id)")
-            .execute(&self.pool)
+        self.ddl("CREATE INDEX IF NOT EXISTS idx_spool_members_user ON spool_members(user_id)")
             .await?;
 
-        sqlx::query(
+        self.ddl(
             "CREATE INDEX IF NOT EXISTS idx_spool_captures_pending
              ON spool_captures(user_id, state, played_at)",
         )
-        .execute(&self.pool)
         .await?;
 
         Ok(())

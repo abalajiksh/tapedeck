@@ -231,7 +231,7 @@ fn is_read(n: &str) -> bool {
 /// Handles line and block comments, raw strings, and `\`-escapes. A `\` at the
 /// end of a line inside a normal string is Rust's line continuation, so a
 /// multi-line SQL statement is one literal.
-fn literals(src: &str) -> Vec<(usize, usize, String)> {
+pub(super) fn literals(src: &str) -> Vec<(usize, usize, String)> {
     let b = src.as_bytes();
     let (mut i, n, mut out) = (0usize, b.len(), Vec::new());
     while i < n {
