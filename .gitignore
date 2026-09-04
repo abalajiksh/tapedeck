@@ -75,6 +75,9 @@ temp/
 # Design/planning docs, not shipped with the binary
 docs/
 
+# Engineering design notes — planning, not shipped
+design/
+
 # The generated demo history — a ~7 MB blob that changes wholesale on every
 # regenerate. The generator beside it is deterministic (same seed, same bytes),
 # so the recipe is what's worth tracking, not the output.
