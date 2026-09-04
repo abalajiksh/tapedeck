@@ -74,6 +74,114 @@ async fn a_fresh_database_refuses_the_same_listen_twice_at_the_constraint() {
     );
 }
 
+/// Open a **real** existing database and prove the migration path survives it.
+///
+/// Opt-in and `#[ignore]`d: it needs a database nobody else has.
+///
+/// ```text
+/// TAPEDECK_TEST_EXISTING_DB=/path/to/a/COPY/of/scrobbles.db \
+///   cargo test --bin tapedeck -- --ignored an_existing_production_database
+/// ```
+///
+/// **Point it at a copy.** It opens the file for writing and runs `init()`,
+/// `migrate()` and `indexes()` against it, which is the whole thing being
+/// tested.
+///
+/// Every other migration test in this file builds a pre-version schema by hand,
+/// which is exactly the blind spot v0.61.1 fell into: a migration that could not
+/// run against a real database crash-looped 297 times while the suite stayed
+/// green, because every test starts from an empty file.
+#[tokio::test]
+#[ignore = "needs TAPEDECK_TEST_EXISTING_DB pointing at a copy of a real database"]
+async fn an_existing_production_database_opens_and_keeps_its_listens() {
+    let Ok(path) = std::env::var("TAPEDECK_TEST_EXISTING_DB") else {
+        panic!("set TAPEDECK_TEST_EXISTING_DB to a COPY of a real scrobbles.db");
+    };
+    let url = format!("sqlite:{path}");
+
+    async fn count(db: &Database) -> i64 {
+        let n: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM scrobbles")
+            .fetch_one(&db.pool)
+            .await
+            .expect("count listens");
+        n.0
+    }
+
+    let started = std::time::Instant::now();
+    let db = Database::new(&url, Arc::new(SecretBox::test_key()))
+        .await
+        .unwrap_or_else(|e| panic!("an existing database must open: {e}"));
+    let opened_in = started.elapsed();
+
+    let listens = count(&db).await;
+    println!("opened in {opened_in:?}, {listens} listens");
+    assert!(listens > 0, "the database came back empty");
+
+    // The four columns that used to exist only in `migrate()`. On this database
+    // they arrived by ALTER long ago; what is being checked is that adding them
+    // to `init()` did not disturb anything.
+    for (table, col) in [
+        ("scrobbles", "chain_variant_id"),
+        ("physical_plays", "chain_variant_id"),
+        ("physical_releases", "chain_variant_id"),
+        ("recommendations", "from_user_id"),
+    ] {
+        let n: (i64,) = sqlx::query_as(&format!(
+            "SELECT COUNT(*) FROM pragma_table_info('{table}') WHERE name = '{col}'"
+        ))
+        .fetch_one(&db.pool)
+        .await
+        .expect("read the column list");
+        assert_eq!(n.0, 1, "{table}.{col} is missing after opening");
+    }
+
+    // Opening twice must be a no-op, or the migration is not idempotent — which
+    // matters because it runs on every single start.
+    drop(db);
+    let db2 = Database::new(&url, Arc::new(SecretBox::test_key()))
+        .await
+        .unwrap_or_else(|e| panic!("a second open must also work: {e}"));
+    assert_eq!(count(&db2).await, listens, "reopening changed the listen count");
+    println!("reopened cleanly, still {listens} listens");
+
+    // Opening exercises perhaps fifty of the 577 rewritten query sites. These
+    // are the heavy readouts, on real data with real edge cases — the thing a
+    // synthetic fixture cannot stand in for.
+    let uid: (i64,) =
+        sqlx::query_as("SELECT MIN(id) FROM users").fetch_one(&db2.pool).await.expect("a user");
+    let uid = uid.0;
+
+    let t = std::time::Instant::now();
+    let dash = db2.get_dashboard_stats(uid, chrono_tz::Tz::UTC, 1).await.expect("dashboard");
+    println!("  dashboard        {:>7.0?}  total={}", t.elapsed(), dash["total"]);
+
+    let t = std::time::Instant::now();
+    let ranged = db2.get_ranged_stats(uid, None, false).await.expect("ranged stats");
+    let totals = &ranged["totals"];
+    println!(
+        "  stats?range=all  {:>7.0?}  plays={} hours={}",
+        t.elapsed(),
+        totals["plays"],
+        totals["hours"]
+    );
+    assert!(totals["plays"].as_i64().unwrap_or(0) > 0, "ranged stats came back empty");
+
+    for kind in ["artists", "albums", "tracks"] {
+        let t = std::time::Instant::now();
+        let rows = db2.chart(uid, kind, None, 10, false).await.expect("chart");
+        println!(
+            "  chart {kind:<8}   {:>7.0?}  {} rows, top: {}",
+            t.elapsed(),
+            rows.len(),
+            rows.first().map(|r| r.name.as_str()).unwrap_or("—")
+        );
+    }
+
+    let t = std::time::Instant::now();
+    let variants = db2.artists_with_spelling_variants(uid).await.expect("variants");
+    println!("  spelling variants{:>7.0?}  {} groups", t.elapsed(), variants.len());
+}
+
 /// A build refuses a URL it cannot serve, in words, before it tries to connect.
 ///
 /// The failure this prevents is a driver error twenty frames down when the real
