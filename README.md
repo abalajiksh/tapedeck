@@ -756,6 +756,31 @@ cd tapedeck
 cargo build --release
 ```
 
+#### Two backends, one source tree
+
+Tapedeck stores its listening in **SQLite by default**, and can be built against
+**Postgres** instead:
+
+```bash
+cargo build --release                      # SQLite  (default)
+cargo build --release --features postgres  # Postgres
+```
+
+The feature picks one type alias and nothing else — there is one schema, one set
+of queries, and a dialect layer that translates them. Which backend a binary
+speaks is fixed when it is compiled, so a build handed a `DATABASE_URL` it
+cannot serve refuses it by name and points at the other build rather than
+failing somewhere in a driver.
+
+Under Postgres the MusicBrainz cache, the lyrics cache and the Every Noise map
+share the one database, so `DATABASE_URL` is the only URL to configure and
+`SQLITE_DB_PATH` / `EVERYNOISE_DB_PATH` are ignored. Under SQLite they stay
+separate files, because `VACUUM INTO` copies a whole file and cannot exclude a
+table — which is the only reason they were ever apart.
+
+**There is no migration tool yet**: a binary built for Postgres opens a fresh
+database, not an existing SQLite one. Moving a history across is unbuilt work.
+
 This means **bun is required for every cargo invocation**, including `cargo
 check` and `cargo clippy`. For Rust-only work against an existing `static/`:
 
@@ -1123,7 +1148,12 @@ src/
 ├── main.rs                  Init, wire everything, run
 ├── config.rs                Infrastructure config (env > .env > tapedeck.toml)
 ├── models.rs                Play, AudioQuality, SignalChain, Device, Session
-├── db.rs                    SQLite: all tables, migrations, every query
+├── db/                      Storage: schema, migrations, every query
+│   ├── schema.rs            Every CREATE TABLE / INDEX — the current shape
+│   ├── migrate.rs           Walks an existing SQLite database up to it
+│   ├── dialect.rs           SQLite ⇄ Postgres translation, and what it will not do
+│   ├── guards.rs            Source scanners: the skip filter, index drift, dialect
+│   └── …                    listens, library, physical, notes, patch, users, …
 ├── crypto.rs                XChaCha20-Poly1305 credential encryption at rest
 ├── musicbrainz.rs           3-tier metadata client
 ├── enrich.rs                Background backfills (MBIDs, ISRC, language, art)
@@ -1390,8 +1420,25 @@ Things that look finished and aren't:
 ```bash
 cargo fmt
 cargo clippy
-cargo test          # 565 tests
+cargo test                       # 653 tests, SQLite
+cargo test --features postgres   # 466, the Postgres configuration
 ```
+
+The two are different sets rather than the same set run twice: the feature
+decides which code compiles, so ~190 SQLite-backed tests are compiled out of the
+Postgres build. Closing that gap means pointing them at a throwaway Postgres
+schema, and is unbuilt.
+
+There are also opt-in checks against a **real** Postgres — the only thing that
+can prove the schema translation rather than assert it:
+
+```bash
+TAPEDECK_TEST_POSTGRES_URL=postgres://user:pass@host/db \
+  cargo test --features postgres -- --ignored pg_live
+```
+
+Each creates a schema of its own, works only inside it and drops it, so nothing
+else in that database is touched and the account needs only `CREATE` on it.
 
 `static/` is gitignored but baked into the binary; `build.rs` builds it, so a
 fresh clone compiles. `build-web.sh` still exists for rebuilding the UI without

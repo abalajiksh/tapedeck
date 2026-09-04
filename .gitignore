@@ -2,6 +2,11 @@
 # will have compiled files and executables
 debug
 target
+# The CI pipeline builds each backend into its own target dir — flipping the
+# `postgres` feature in one dir invalidates the whole dependency graph, so a
+# shared one means a full rebuild every stage.
+target-sqlite
+target-postgres
 Cargo.lock
 lb_clear.sh
 
