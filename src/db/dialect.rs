@@ -266,7 +266,7 @@ const DDL_PHRASES: &[(&[&str], &str)] = &[
 fn to_postgres(sql: &str, mode: Mode) -> String {
     let b = sql.as_bytes();
     let (mut out, mut i, n) = (String::with_capacity(sql.len() + 16), 0usize, b.len());
-    let mut param = 0u32;
+    let mut next_auto = 0u32;
     while i < n {
         match b[i] {
             // '…' string literal; '' is an escaped quote and stays inside it.
@@ -310,11 +310,31 @@ fn to_postgres(sql: &str, mode: Mode) -> String {
                 i = sql[i..].find("*/").map_or(n, |j| i + j + 2);
                 out.push_str(&sql[start..i]);
             }
+            // `?` and `?N` are both SQLite's, and `$N` is Postgres's answer to
+            // both. **A bare `?` and a numbered one are not the same thing**, and
+            // treating `?2` as a placeholder followed by the digit `2` writes
+            // `$12` — valid-looking SQL that binds the wrong parameter, which is
+            // the exact class of silent corruption this tokeniser exists to
+            // prevent. It went unnoticed until a real Postgres reported
+            // `could not determine data type of parameter $5`.
+            //
+            // `next_auto` follows SQLite's own rule so a query mixing the two
+            // still numbers correctly: a bare `?` takes one more than the
+            // largest index used so far.
             b'?' => {
-                param += 1;
-                out.push('$');
-                out.push_str(&param.to_string());
-                i += 1;
+                let digits = sql[i + 1..].bytes().take_while(|c| c.is_ascii_digit()).count();
+                if digits > 0 {
+                    let n: u32 = sql[i + 1..i + 1 + digits].parse().unwrap_or(0);
+                    next_auto = next_auto.max(n);
+                    out.push('$');
+                    out.push_str(&n.to_string());
+                    i += 1 + digits;
+                } else {
+                    next_auto += 1;
+                    out.push('$');
+                    out.push_str(&next_auto.to_string());
+                    i += 1;
+                }
             }
             _ => {
                 if mode == Mode::Ddl {
@@ -420,6 +440,41 @@ mod tests {
         assert_eq!(
             to_postgres("WHERE a = ? AND b = ? AND c IN (?, ?)", Mode::Query),
             "WHERE a = $1 AND b = $2 AND c IN ($3, $4)"
+        );
+    }
+
+    /// `?2` is one placeholder, not a placeholder and a digit.
+    ///
+    /// The bug this pins wrote `$12`, which is valid SQL binding the wrong
+    /// parameter — found only when a real Postgres refused a query on a
+    /// parameter number that did not exist.
+    #[test]
+    fn a_numbered_placeholder_keeps_its_number() {
+        assert_eq!(
+            to_postgres("WHERE a = ?1 AND b >= ?2 AND c >= ?2", Mode::Query),
+            "WHERE a = $1 AND b >= $2 AND c >= $2"
+        );
+        // The real dashboard shape: reused, out of order, and 4 distinct.
+        assert_eq!(
+            to_postgres(
+                "SUM(CASE WHEN t >= ?2 THEN 1 END), SUM(CASE WHEN t >= ?3 THEN 1 END) \
+                 WHERE user_id = ?1 AND t >= ?4",
+                Mode::Query
+            ),
+            "SUM(CASE WHEN t >= $2 THEN 1 END), SUM(CASE WHEN t >= $3 THEN 1 END) \
+             WHERE user_id = $1 AND t >= $4"
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+        // Ten and above, so the digit run is read whole rather than one char.
+        assert_eq!(to_postgres("?12 ?7", Mode::Query), "$12 $7");
+        // Mixed, following SQLite's rule: a bare `?` is one past the largest so far.
+        assert_eq!(to_postgres("?1 ? ?5 ?", Mode::Query), "$1 $2 $5 $6");
+        // And a `?2` inside a literal is still data.
+        assert_eq!(
+            to_postgres("WHERE s = 'a?2b' AND x = ?1", Mode::Query),
+            "WHERE s = 'a?2b' AND x = $1"
         );
     }
 

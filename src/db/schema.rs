@@ -294,8 +294,36 @@ impl Database {
         )
         .await?;
 
+        // A chain with one step swapped.
+        //
+        // Two cartridges on one turntable, or the same commute with a different
+        // pair of IEMs, are not two signal chains — they are one chain and a
+        // choice. Modelling them as separate chains is what made a shelf of
+        // eight chains unreadable: "Commute Phone" and "Summer Commute"
+        // differed by exactly one component, and every gear swap forever adds
+        // another near-duplicate row.
+        //
+        // `overrides` is a JSON array of `{position, equipment_id, name}`, where
+        // `position` indexes into the parent chain's `components`. Only the
+        // steps that differ are stored, so editing the shared part of a chain
+        // updates every variant of it — which is the entire reason this is an
+        // override rather than a copy.
+        self.ddl(
+            "CREATE TABLE IF NOT EXISTS chain_variants (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL REFERENCES users(id),
+                chain_id INTEGER NOT NULL REFERENCES signal_chains(id),
+                name TEXT NOT NULL,
+                overrides JSON NOT NULL DEFAULT '[]',
+                created_at INTEGER NOT NULL,
+                UNIQUE(chain_id, name)
+            )",
+        )
+        .await?;
         self.ddl(
             "CREATE TABLE IF NOT EXISTS scrobbles (
+                -- which variant of that chain was fitted. `migrate()` adds it too, for databases predating it.
+                chain_variant_id INTEGER REFERENCES chain_variants(id),
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_id INTEGER NOT NULL DEFAULT 1,
                 title TEXT NOT NULL, artist TEXT NOT NULL, album TEXT,
@@ -364,33 +392,6 @@ impl Database {
         )
         .await?;
 
-        // A chain with one step swapped.
-        //
-        // Two cartridges on one turntable, or the same commute with a different
-        // pair of IEMs, are not two signal chains — they are one chain and a
-        // choice. Modelling them as separate chains is what made a shelf of
-        // eight chains unreadable: "Commute Phone" and "Summer Commute"
-        // differed by exactly one component, and every gear swap forever adds
-        // another near-duplicate row.
-        //
-        // `overrides` is a JSON array of `{position, equipment_id, name}`, where
-        // `position` indexes into the parent chain's `components`. Only the
-        // steps that differ are stored, so editing the shared part of a chain
-        // updates every variant of it — which is the entire reason this is an
-        // override rather than a copy.
-        self.ddl(
-            "CREATE TABLE IF NOT EXISTS chain_variants (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER NOT NULL REFERENCES users(id),
-                chain_id INTEGER NOT NULL REFERENCES signal_chains(id),
-                name TEXT NOT NULL,
-                overrides JSON NOT NULL DEFAULT '[]',
-                created_at INTEGER NOT NULL,
-                UNIQUE(chain_id, name)
-            )",
-        )
-        .await?;
-
         // ── Physical media ──
         //
         // A record or tape you own. Separate from `entities` on purpose: an
@@ -405,6 +406,8 @@ impl Database {
         // bothered, and as plain 1..n otherwise.
         self.ddl(
             "CREATE TABLE IF NOT EXISTS physical_releases (
+                -- the variant this pressing usually runs through. `migrate()` adds it too, for databases predating it.
+                chain_variant_id INTEGER REFERENCES chain_variants(id),
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_id INTEGER NOT NULL REFERENCES users(id),
                 kind TEXT NOT NULL CHECK (kind IN ('vinyl', 'cassette', 'cd', 'sacd')),
@@ -538,6 +541,8 @@ impl Database {
         // act, and what stylus hours and a cassette counter are computed from.
         self.ddl(
             "CREATE TABLE IF NOT EXISTS physical_plays (
+                -- which variant of that chain was fitted. `migrate()` adds it too, for databases predating it.
+                chain_variant_id INTEGER REFERENCES chain_variants(id),
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_id INTEGER NOT NULL REFERENCES users(id),
                 release_id INTEGER NOT NULL REFERENCES physical_releases(id),
@@ -1103,6 +1108,8 @@ impl Database {
     async fn init_crate(&self) -> Result<(), sqlx::Error> {
         self.ddl(
             "CREATE TABLE IF NOT EXISTS recommendations (
+                -- the deck a dub came from. `migrate()` adds it too, for databases predating it.
+                from_user_id INTEGER REFERENCES users(id),
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_id INTEGER NOT NULL REFERENCES users(id),
                 kind TEXT NOT NULL CHECK (kind IN ('artist','album','track')),

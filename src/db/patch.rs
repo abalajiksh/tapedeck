@@ -35,11 +35,12 @@ impl Database {
             return Ok(actor);
         }
 
-        let username: String = sqlx::query_scalar("SELECT username FROM users WHERE id = ?")
-            .bind(user_id)
-            .fetch_optional(&self.pool)
-            .await?
-            .ok_or(sqlx::Error::RowNotFound)?;
+        let username: String =
+            sqlx::query_scalar(&crate::sql!("SELECT username FROM users WHERE id = ?"))
+                .bind(user_id)
+                .fetch_optional(&self.pool)
+                .await?
+                .ok_or(sqlx::Error::RowNotFound)?;
 
         // CPU-bound for a noticeable fraction of a second. Holding an async
         // worker for that is what makes one request look like a hung server.
@@ -54,10 +55,10 @@ impl Database {
 
         let uri = crate::patch::actor::uri_for(origin, &username);
 
-        sqlx::query(
-            "INSERT OR IGNORE INTO actors (user_id, uri, public_key, private_key, created_at)
-             VALUES (?, ?, ?, ?, ?)",
-        )
+        sqlx::query(&crate::sql!(
+            "INSERT INTO actors (user_id, uri, public_key, private_key, created_at)
+             VALUES (?, ?, ?, ?, ?) ON CONFLICT DO NOTHING",
+        ))
         .bind(user_id)
         .bind(&uri)
         .bind(&keys.public_pem)
@@ -90,9 +91,9 @@ impl Database {
     }
     /// Has anybody been let in to this deck?
     async fn has_accepted_patch(&self, user_id: i64) -> Result<bool, sqlx::Error> {
-        let n: i64 = sqlx::query_scalar(
+        let n: i64 = sqlx::query_scalar(&crate::sql!(
             "SELECT COUNT(*) FROM patches WHERE target_user_id = ? AND state = 'accepted'",
-        )
+        ))
         .bind(user_id)
         .fetch_one(&self.pool)
         .await?;
@@ -119,10 +120,10 @@ impl Database {
     /// at one per federating account, ever, and only for names that are real
     /// and published.
     pub async fn discoverable_user_id(&self, username: &str) -> Result<Option<i64>, sqlx::Error> {
-        sqlx::query_scalar(
+        sqlx::query_scalar(&crate::sql!(
             "SELECT id FROM users
-              WHERE username = ? COLLATE NOCASE AND federation_enabled = 1 AND disabled = 0",
-        )
+              WHERE username = ? COLLATE NOCASE AND federation_enabled = 1 AND disabled = 0"
+        ))
         .bind(username)
         .fetch_optional(&self.pool)
         .await
@@ -140,12 +141,12 @@ impl Database {
     /// The stored actor for a user, unsealed. `None` when no keypair has been
     /// minted yet.
     async fn load_actor(&self, user_id: i64) -> Result<Option<Actor>, sqlx::Error> {
-        let row: Option<ActorRow> = sqlx::query_as(
+        let row: Option<ActorRow> = sqlx::query_as(&crate::sql!(
             "SELECT a.user_id, u.username, a.uri, a.public_key, a.private_key, a.frozen_at,
                     u.display_name, u.bio, u.avatar_url, u.federation_enabled
                FROM actors a JOIN users u ON u.id = a.user_id
               WHERE a.user_id = ?",
-        )
+        ))
         .bind(user_id)
         .fetch_optional(&self.pool)
         .await?;
@@ -165,7 +166,7 @@ impl Database {
     }
     /// Whether this user's deck answers to strangers at all.
     pub async fn set_federation_enabled(&self, user_id: i64, on: bool) -> Result<(), sqlx::Error> {
-        sqlx::query("UPDATE users SET federation_enabled = ? WHERE id = ?")
+        sqlx::query(&crate::sql!("UPDATE users SET federation_enabled = ? WHERE id = ?"))
             .bind(if on { 1 } else { 0 })
             .bind(user_id)
             .execute(&self.pool)
@@ -181,11 +182,13 @@ impl Database {
     /// public. Idempotent: the first stamp is the true one, and re-stamping
     /// would move a date that other servers' copies are dated against.
     pub async fn freeze_actor_username(&self, user_id: i64) -> Result<(), sqlx::Error> {
-        sqlx::query("UPDATE actors SET frozen_at = ? WHERE user_id = ? AND frozen_at IS NULL")
-            .bind(Self::now_secs())
-            .bind(user_id)
-            .execute(&self.pool)
-            .await?;
+        sqlx::query(&crate::sql!(
+            "UPDATE actors SET frozen_at = ? WHERE user_id = ? AND frozen_at IS NULL",
+        ))
+        .bind(Self::now_secs())
+        .bind(user_id)
+        .execute(&self.pool)
+        .await?;
         Ok(())
     }
     /// Is this user's username now load-bearing for somebody else?
@@ -200,7 +203,7 @@ impl Database {
     /// deliberate migration and is not built.
     pub async fn username_is_frozen(&self, user_id: i64) -> Result<bool, sqlx::Error> {
         let frozen: Option<Option<i64>> =
-            sqlx::query_scalar("SELECT frozen_at FROM actors WHERE user_id = ?")
+            sqlx::query_scalar(&crate::sql!("SELECT frozen_at FROM actors WHERE user_id = ?"))
                 .bind(user_id)
                 .fetch_optional(&self.pool)
                 .await?;
@@ -223,7 +226,7 @@ impl Database {
         public_key: Option<&str>,
         icon_url: Option<&str>,
     ) -> Result<RemoteActor, sqlx::Error> {
-        sqlx::query(
+        sqlx::query(&crate::sql!(
             "INSERT INTO remote_actors (uri, handle, name, inbox, shared_inbox, public_key,
                                         icon_url, fetched_at)
              VALUES (?, ?, ?, ?, ?, ?, ?, ?)
@@ -235,7 +238,7 @@ impl Database {
                 public_key = excluded.public_key,
                 icon_url = excluded.icon_url,
                 fetched_at = excluded.fetched_at",
-        )
+        ))
         .bind(uri)
         .bind(handle)
         .bind(name)
@@ -250,10 +253,10 @@ impl Database {
         self.remote_actor_by_uri(uri).await?.ok_or(sqlx::Error::RowNotFound)
     }
     pub async fn remote_actor_by_uri(&self, uri: &str) -> Result<Option<RemoteActor>, sqlx::Error> {
-        sqlx::query_as(
+        sqlx::query_as(&crate::sql!(
             "SELECT id, uri, handle, name, inbox, shared_inbox, public_key, icon_url, fetched_at
                FROM remote_actors WHERE uri = ?",
-        )
+        ))
         .bind(uri)
         .fetch_optional(&self.pool)
         .await
@@ -280,11 +283,11 @@ impl Database {
         object_ref: Option<&str>,
         payload: &str,
     ) -> Result<bool, sqlx::Error> {
-        let result = sqlx::query(
-            "INSERT OR IGNORE INTO inbox_activities
+        let result = sqlx::query(&crate::sql!(
+            "INSERT INTO inbox_activities
                 (user_id, actor_id, activity_uri, kind, object_ref, payload, received_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?)",
-        )
+             VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT DO NOTHING"
+        ))
         .bind(user_id)
         .bind(actor_id)
         .bind(activity_uri)
@@ -311,18 +314,18 @@ impl Database {
         user_id: i64,
         limit: i64,
     ) -> Result<(i64, Vec<String>), sqlx::Error> {
-        let total: i64 = sqlx::query_scalar(
+        let total: i64 = sqlx::query_scalar(&crate::sql!(
             "SELECT COUNT(*) FROM activities WHERE user_id = ? AND visibility = 'public'",
-        )
+        ))
         .bind(user_id)
         .fetch_one(&self.pool)
         .await?;
 
-        let items: Vec<String> = sqlx::query_scalar(
+        let items: Vec<String> = sqlx::query_scalar(&crate::sql!(
             "SELECT payload FROM activities
               WHERE user_id = ? AND visibility = 'public'
-              ORDER BY published DESC LIMIT ?",
-        )
+              ORDER BY published DESC LIMIT ?"
+        ))
         .bind(user_id)
         .bind(limit)
         .fetch_all(&self.pool)
@@ -343,9 +346,9 @@ impl Database {
     /// locally is that a patch needs approval and a chain publishes nothing
     /// until its owner shares it.
     pub async fn patchable_user_id(&self, username: &str) -> Result<Option<i64>, sqlx::Error> {
-        sqlx::query_scalar(
+        sqlx::query_scalar(&crate::sql!(
             "SELECT id FROM users WHERE username = ? COLLATE NOCASE AND disabled = 0",
-        )
+        ))
         .bind(username)
         .fetch_optional(&self.pool)
         .await
@@ -379,8 +382,7 @@ impl Database {
         // rejection reopens it — but an **accepted** patch is left alone, or
         // asking again would quietly un-approve a patch its target had already
         // said yes to.
-        sqlx::query(
-            "INSERT INTO patches (uuid, follower_user_id, target_user_id, state, created_at, updated_at)
+        sqlx::query(&crate::sql!("INSERT INTO patches (uuid, follower_user_id, target_user_id, state, created_at, updated_at)
              VALUES (?, ?, ?, 'pending', ?, ?)
              -- The index this conflicts against is **partial**, and SQLite
              -- rejects an ON CONFLICT target that does not repeat the
@@ -390,8 +392,7 @@ impl Database {
              ON CONFLICT(follower_user_id, target_user_id)
                WHERE follower_user_id IS NOT NULL AND target_user_id IS NOT NULL
                DO UPDATE SET state = 'pending', updated_at = excluded.updated_at
-               WHERE patches.state <> 'accepted'",
-        )
+               WHERE patches.state <> 'accepted'",))
         .bind(&uuid)
         .bind(follower_user_id)
         .bind(target_user_id)
@@ -400,9 +401,9 @@ impl Database {
         .execute(&self.pool)
         .await?;
 
-        sqlx::query_scalar(
+        sqlx::query_scalar(&crate::sql!(
             "SELECT uuid FROM patches WHERE follower_user_id = ? AND target_user_id = ?",
-        )
+        ))
         .bind(follower_user_id)
         .bind(target_user_id)
         .fetch_one(&self.pool)
@@ -429,10 +430,10 @@ impl Database {
     ) -> Result<bool, sqlx::Error> {
         let state = if accept { "accepted" } else { "rejected" };
 
-        let result = sqlx::query(
+        let result = sqlx::query(&crate::sql!(
             "UPDATE patches SET state = ?, updated_at = ?
-              WHERE uuid = ? AND target_user_id = ? AND state = 'pending'",
-        )
+              WHERE uuid = ? AND target_user_id = ? AND state = 'pending'"
+        ))
         .bind(state)
         .bind(Self::now_secs())
         .bind(uuid)
@@ -461,23 +462,24 @@ impl Database {
         follower_user_id: i64,
         target_user_id: i64,
     ) -> Result<bool, sqlx::Error> {
-        let result =
-            sqlx::query("DELETE FROM patches WHERE follower_user_id = ? AND target_user_id = ?")
-                .bind(follower_user_id)
-                .bind(target_user_id)
-                .execute(&self.pool)
-                .await?;
+        let result = sqlx::query(&crate::sql!(
+            "DELETE FROM patches WHERE follower_user_id = ? AND target_user_id = ?",
+        ))
+        .bind(follower_user_id)
+        .bind(target_user_id)
+        .execute(&self.pool)
+        .await?;
         Ok(result.rows_affected() > 0)
     }
     /// Everyone this user has patched into, or asked to.
     pub async fn patches_out(&self, user_id: i64) -> Result<Vec<PatchPeer>, sqlx::Error> {
-        sqlx::query_as(&format!(
+        sqlx::query_as(&crate::sql!(&format!(
             "SELECT p.uuid, p.state, p.created_at, {}
                FROM patches p JOIN users u ON u.id = p.target_user_id
               WHERE p.follower_user_id = ?
               ORDER BY u.username COLLATE NOCASE",
             Self::PATCH_PEER_COLUMNS
-        ))
+        )))
         .bind(user_id)
         .fetch_all(&self.pool)
         .await
@@ -487,13 +489,13 @@ impl Database {
     /// `pending` rows are included: this is what the inbox reads, and the
     /// distinction is `state`.
     pub async fn patches_in(&self, user_id: i64) -> Result<Vec<PatchPeer>, sqlx::Error> {
-        sqlx::query_as(&format!(
+        sqlx::query_as(&crate::sql!(&format!(
             "SELECT p.uuid, p.state, p.created_at, {}
                FROM patches p JOIN users u ON u.id = p.follower_user_id
               WHERE p.target_user_id = ?
               ORDER BY p.state = 'pending' DESC, p.created_at DESC",
             Self::PATCH_PEER_COLUMNS
-        ))
+        )))
         .bind(user_id)
         .fetch_all(&self.pool)
         .await
@@ -522,13 +524,14 @@ impl Database {
         chain_id: i64,
         shared: bool,
     ) -> Result<bool, sqlx::Error> {
-        let result =
-            sqlx::query("UPDATE signal_chains SET shared = ? WHERE id = ? AND user_id = ?")
-                .bind(shared)
-                .bind(chain_id)
-                .bind(user_id)
-                .execute(&self.pool)
-                .await?;
+        let result = sqlx::query(&crate::sql!(
+            "UPDATE signal_chains SET shared = ? WHERE id = ? AND user_id = ?"
+        ))
+        .bind(shared)
+        .bind(chain_id)
+        .bind(user_id)
+        .execute(&self.pool)
+        .await?;
         Ok(result.rows_affected() > 0)
     }
     /// The Reel: what the decks this user has patched into have been playing.
@@ -574,7 +577,7 @@ impl Database {
                     .replace('_', "\\_")
             )
         });
-        sqlx::query_as(
+        sqlx::query_as(&crate::sql!(
             "SELECT s.id, s.timestamp, s.title, s.artist, s.album,
                     s.artwork_url, s.caa_id, s.caa_release_mbid,
                     s.format_type, s.codec, s.bitrate, s.sample_rate, s.bit_depth, s.is_lossless,
@@ -607,8 +610,8 @@ impl Database {
                      LOWER(u.username) LIKE ? ESCAPE '\\' OR
                      LOWER(COALESCE(u.display_name, '')) LIKE ? ESCAPE '\\')
               ORDER BY s.timestamp DESC
-              LIMIT ?",
-        )
+              LIMIT ?"
+        ))
         .bind(user_id)
         .bind(before)
         .bind(before)
@@ -634,13 +637,13 @@ impl Database {
     /// protects a deck here is that a patch needs approval and that a chain
     /// publishes nothing until its owner shares it.
     pub async fn patchable_decks(&self, user_id: i64) -> Result<Vec<PatchPeer>, sqlx::Error> {
-        sqlx::query_as(&format!(
+        sqlx::query_as(&crate::sql!(&format!(
             "SELECT NULL AS uuid, NULL AS state, NULL AS created_at, {}
                FROM users u
               WHERE u.id <> ? AND u.disabled = 0
               ORDER BY u.username COLLATE NOCASE",
             Self::PATCH_PEER_COLUMNS
-        ))
+        )))
         .bind(user_id)
         .fetch_all(&self.pool)
         .await
@@ -664,7 +667,7 @@ impl Database {
         } else {
             "SELECT COUNT(*) FROM patches WHERE follower_user_id = ? AND state = 'accepted'"
         };
-        sqlx::query_scalar(sql).bind(user_id).fetch_one(&self.pool).await
+        sqlx::query_scalar(&crate::sql!(sql)).bind(user_id).fetch_one(&self.pool).await
     }
     /// The folded artist keys this user plays, with their own counts.
     ///
@@ -677,12 +680,12 @@ impl Database {
     /// connection pool and took the instance down. See the incident note in
     /// CLAUDE.md.
     async fn my_artist_plays(&self, user_id: i64) -> Result<HashMap<String, i64>, sqlx::Error> {
-        let rows: Vec<(String, i64)> = sqlx::query_as(&format!(
+        let rows: Vec<(String, i64)> = sqlx::query_as(&crate::sql!(&format!(
             "SELECT LOWER(TRIM(artist)), COUNT(*) FROM scrobbles
               WHERE user_id = ? AND skipped = FALSE
                 AND LOWER(TRIM(artist)) {NOT_VARIOUS}
               GROUP BY LOWER(TRIM(artist))"
-        ))
+        )))
         .bind(user_id)
         .fetch_all(&self.pool)
         .await?;
@@ -708,7 +711,7 @@ impl Database {
         limit: i64,
         since: Option<i64>,
     ) -> Result<Vec<PatchArtist>, sqlx::Error> {
-        let mut artists: Vec<PatchArtist> = sqlx::query_as(&format!(
+        let mut artists: Vec<PatchArtist> = sqlx::query_as(&crate::sql!(&format!(
             "SELECT s.artist AS name, COUNT(*) AS plays, \
                     COUNT(DISTINCT s.user_id) AS decks, \
                     GROUP_CONCAT(DISTINCT u.username) AS who, \
@@ -720,7 +723,7 @@ impl Database {
             GROUP BY LOWER(TRIM(s.artist)) \
             ORDER BY plays DESC LIMIT ?3",
             Self::PATCH_VISIBLE_LISTENS
-        ))
+        )))
         .bind(user_id)
         .bind(since)
         .bind(limit)
@@ -733,10 +736,11 @@ impl Database {
         // is the tag cache the genre map already fills, so this costs nothing
         // beyond the scan.
         let mut genres: HashMap<String, String> = HashMap::new();
-        let rows: Vec<(String, Option<String>)> =
-            sqlx::query_as("SELECT name, genres FROM artists WHERE genres IS NOT NULL")
-                .fetch_all(&self.pool)
-                .await?;
+        let rows: Vec<(String, Option<String>)> = sqlx::query_as(&crate::sql!(
+            "SELECT name, genres FROM artists WHERE genres IS NOT NULL"
+        ))
+        .fetch_all(&self.pool)
+        .await?;
         for (name, raw) in rows {
             if let Some(first) = raw
                 .as_deref()
@@ -764,14 +768,14 @@ impl Database {
         username: &str,
     ) -> Result<Option<DeckView>, sqlx::Error> {
         let Some(row): Option<(i64, String, Option<String>, Option<String>, Option<String>, i64)> =
-            sqlx::query_as(
+            sqlx::query_as(&crate::sql!(
                 "SELECT u.id, u.username, u.display_name, u.bio, u.avatar_url, u.created_at
                    FROM users u
                    JOIN patches p ON p.target_user_id = u.id
                   WHERE u.username = ? COLLATE NOCASE
                     AND p.follower_user_id = ? AND p.state = 'accepted'
                     AND u.disabled = 0",
-            )
+            ))
             .bind(username)
             .bind(viewer_id)
             .fetch_optional(&self.pool)
@@ -785,7 +789,7 @@ impl Database {
         // Only the chains they publish. An unshared chain is not theirs to be
         // asked about, and listing it would say what they own without saying
         // what they played — which is worse than saying nothing.
-        let chains: Vec<DeckChain> = sqlx::query_as(
+        let chains: Vec<DeckChain> = sqlx::query_as(&crate::sql!(
             "SELECT c.name, c.icon, c.components,
                     CAST(COALESCE((
                         SELECT SUM(sc.duration) FROM scrobbles sc
@@ -793,8 +797,8 @@ impl Database {
                     ), 0) AS REAL) / 3600.0 AS hours
                FROM signal_chains c
               WHERE c.user_id = ? AND c.shared = 1
-              ORDER BY hours DESC",
-        )
+              ORDER BY hours DESC"
+        ))
         .bind(id)
         .fetch_all(&self.pool)
         .await?;
@@ -805,7 +809,7 @@ impl Database {
         // on `LOWER(TRIM(artist))`: that join key is a function of a column, so
         // no index can serve it and it becomes a full scan of the viewer's
         // history *per artist of theirs*. See `my_artist_plays`.
-        let theirs: Vec<(String, String)> = sqlx::query_as(&format!(
+        let theirs: Vec<(String, String)> = sqlx::query_as(&crate::sql!(&format!(
             "SELECT s.artist, LOWER(TRIM(s.artist)) FROM scrobbles s
                JOIN users u ON u.id = s.user_id
                LEFT JOIN signal_chains c ON c.id = s.chain_id
@@ -814,7 +818,7 @@ impl Database {
                 AND LOWER(TRIM(s.artist)) {NOT_VARIOUS}
               GROUP BY LOWER(TRIM(s.artist))
               ORDER BY COUNT(*) DESC"
-        ))
+        )))
         .bind(id)
         .fetch_all(&self.pool)
         .await?;
@@ -826,13 +830,13 @@ impl Database {
             .take(12)
             .collect();
 
-        let listens: i64 = sqlx::query_scalar(
+        let listens: i64 = sqlx::query_scalar(&crate::sql!(
             "SELECT COUNT(*) FROM scrobbles s
                JOIN users u ON u.id = s.user_id
                LEFT JOIN signal_chains c ON c.id = s.chain_id
               WHERE s.user_id = ? AND s.skipped = FALSE
-                AND (u.share_all_with_patched = 1 OR c.shared = 1)",
-        )
+                AND (u.share_all_with_patched = 1 OR c.shared = 1)"
+        ))
         .bind(id)
         .fetch_one(&self.pool)
         .await?;
@@ -840,10 +844,11 @@ impl Database {
         // The actor endpoints, if they have an identity at all. `None` is a
         // normal state — federation is opt-in — and the page says so rather
         // than printing URLs that would 404.
-        let actor: Option<String> = sqlx::query_scalar("SELECT uri FROM actors WHERE user_id = ?")
-            .bind(id)
-            .fetch_optional(&self.pool)
-            .await?;
+        let actor: Option<String> =
+            sqlx::query_scalar(&crate::sql!("SELECT uri FROM actors WHERE user_id = ?"))
+                .bind(id)
+                .fetch_optional(&self.pool)
+                .await?;
 
         Ok(Some(DeckView {
             user_id: id,
@@ -872,14 +877,14 @@ impl Database {
         viewer_id: i64,
         username: &str,
     ) -> Result<Option<(i64, String)>, sqlx::Error> {
-        let row: Option<(i64, String, Option<String>)> = sqlx::query_as(
+        let row: Option<(i64, String, Option<String>)> = sqlx::query_as(&crate::sql!(
             "SELECT u.id, u.username, u.display_name
                FROM users u
                JOIN patches p ON p.target_user_id = u.id
               WHERE u.username = ? COLLATE NOCASE
                 AND p.follower_user_id = ? AND p.state = 'accepted'
-                AND u.disabled = 0",
-        )
+                AND u.disabled = 0"
+        ))
         .bind(username)
         .bind(viewer_id)
         .fetch_optional(&self.pool)
@@ -899,7 +904,7 @@ impl Database {
     /// within a minute of the first patch being accepted and took everything
     /// down with it. See the incident note in CLAUDE.md.
     pub async fn discover_decks(&self, user_id: i64) -> Result<Vec<DiscoverDeck>, sqlx::Error> {
-        let mut decks: Vec<DiscoverDeck> = sqlx::query_as(
+        let mut decks: Vec<DiscoverDeck> = sqlx::query_as(&crate::sql!(
             "SELECT u.id AS user_id, u.username, u.display_name, u.bio, u.avatar_url,
                     u.created_at,
                     (SELECT COUNT(*) FROM signal_chains c
@@ -910,21 +915,21 @@ impl Database {
                FROM users u
               WHERE u.id <> ? AND u.disabled = 0
               ORDER BY u.created_at DESC",
-        )
+        ))
         .bind(user_id)
         .bind(user_id)
         .fetch_all(&self.pool)
         .await?;
 
         // Every deck's shared artists, in one pass over the shared listens.
-        let shared: Vec<(i64, String, String, i64)> = sqlx::query_as(
+        let shared: Vec<(i64, String, String, i64)> = sqlx::query_as(&crate::sql!(
             "SELECT s.user_id, s.artist, LOWER(TRIM(s.artist)), COUNT(*) AS plays
                FROM scrobbles s
                JOIN signal_chains c ON c.id = s.chain_id AND c.shared = 1
               WHERE s.skipped = FALSE
               GROUP BY s.user_id, LOWER(TRIM(s.artist))
               ORDER BY plays DESC",
-        )
+        ))
         .fetch_all(&self.pool)
         .await?;
 
@@ -965,32 +970,34 @@ impl Database {
              JOIN signal_chains c ON c.id = s.chain_id AND c.shared = 1 \
             WHERE s.skipped = FALSE";
 
-        let decks: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users WHERE disabled = 0")
-            .fetch_one(&self.pool)
-            .await?;
-        let publishing: i64 = sqlx::query_scalar(
+        let decks: i64 =
+            sqlx::query_scalar(&crate::sql!("SELECT COUNT(*) FROM users WHERE disabled = 0"))
+                .fetch_one(&self.pool)
+                .await?;
+        let publishing: i64 = sqlx::query_scalar(&crate::sql!(
             "SELECT COUNT(DISTINCT user_id) FROM signal_chains WHERE shared = 1",
-        )
+        ))
         .fetch_one(&self.pool)
         .await?;
         let shared_chains: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM signal_chains WHERE shared = 1")
+            sqlx::query_scalar(&crate::sql!("SELECT COUNT(*) FROM signal_chains WHERE shared = 1"))
                 .fetch_one(&self.pool)
                 .await?;
 
-        let listens: i64 =
-            sqlx::query_scalar(&format!("SELECT COUNT(*) {SHARED} AND s.timestamp >= ?"))
-                .bind(since)
-                .fetch_one(&self.pool)
-                .await?;
-        let hours: f64 = sqlx::query_scalar(&format!(
+        let listens: i64 = sqlx::query_scalar(&crate::sql!(&format!(
+            "SELECT COUNT(*) {SHARED} AND s.timestamp >= ?"
+        )))
+        .bind(since)
+        .fetch_one(&self.pool)
+        .await?;
+        let hours: f64 = sqlx::query_scalar(&crate::sql!(&format!(
             "SELECT CAST(COALESCE(SUM(s.duration), 0) AS REAL) / 3600.0 {SHARED} AND s.timestamp >= ?"
-        ))
+        )))
         .bind(since)
         .fetch_one(&self.pool)
         .await?;
 
-        let artists: Vec<PatchArtist> = sqlx::query_as(&format!(
+        let artists: Vec<PatchArtist> = sqlx::query_as(&crate::sql!(&format!(
             "SELECT s.artist AS name, COUNT(*) AS plays, \
                     COUNT(DISTINCT s.user_id) AS decks, \
                     GROUP_CONCAT(DISTINCT (SELECT username FROM users WHERE id = s.user_id)) AS who, \
@@ -999,22 +1006,22 @@ impl Database {
                {SHARED} AND s.timestamp >= ? \
                 AND LOWER(TRIM(s.artist)) {NOT_VARIOUS} \
             GROUP BY LOWER(TRIM(s.artist)) ORDER BY plays DESC LIMIT 8"
-        ))
+        )))
         .bind(since)
         .fetch_all(&self.pool)
         .await?;
 
-        let artists_heard: i64 = sqlx::query_scalar(&format!(
+        let artists_heard: i64 = sqlx::query_scalar(&crate::sql!(&format!(
             "SELECT COUNT(DISTINCT LOWER(TRIM(s.artist))) {SHARED} AND s.timestamp >= ?"
-        ))
+        )))
         .bind(since)
         .fetch_one(&self.pool)
         .await?;
 
-        let chains: Vec<(String, i64)> = sqlx::query_as(&format!(
+        let chains: Vec<(String, i64)> = sqlx::query_as(&crate::sql!(&format!(
             "SELECT c.name, COUNT(*) AS plays {SHARED} AND s.timestamp >= ? \
               GROUP BY c.id ORDER BY plays DESC LIMIT 6"
-        ))
+        )))
         .bind(since)
         .fetch_all(&self.pool)
         .await?;
@@ -1022,10 +1029,10 @@ impl Database {
         // Per day, oldest first, as raw (day, hours) — bucketed here by UTC
         // day and re-bucketed by the caller's timezone would be wrong, so the
         // *timestamps* go out and the client draws them. Seven numbers.
-        let daily: Vec<(i64, f64)> = sqlx::query_as(&format!(
+        let daily: Vec<(i64, f64)> = sqlx::query_as(&crate::sql!(&format!(
             "SELECT s.timestamp, CAST(COALESCE(s.duration, 0) AS REAL) / 3600.0 \
                {SHARED} AND s.timestamp >= ?"
-        ))
+        )))
         .bind(since)
         .fetch_all(&self.pool)
         .await?;
@@ -1050,7 +1057,7 @@ impl Database {
     /// than an empty one — so the screen says where to look instead.
     pub async fn federation_ops(&self) -> Result<FederationOps, sqlx::Error> {
         let one = |sql: &'static str| async move {
-            sqlx::query_scalar::<_, i64>(sql).fetch_one(&self.pool).await
+            sqlx::query_scalar::<_, i64>(&crate::sql!(sql)).fetch_one(&self.pool).await
         };
         Ok(FederationOps {
             identities: one("SELECT COUNT(*) FROM actors").await?,
@@ -1089,12 +1096,12 @@ impl Database {
         rec: &NewRecommendation,
         from_username: &str,
     ) -> Result<i64, sqlx::Error> {
-        let connected: i64 = sqlx::query_scalar(
+        let connected: i64 = sqlx::query_scalar(&crate::sql!(
             "SELECT COUNT(*) FROM patches
               WHERE state = 'accepted'
                 AND ((follower_user_id = ? AND target_user_id = ?)
-                  OR (follower_user_id = ? AND target_user_id = ?))",
-        )
+                  OR (follower_user_id = ? AND target_user_id = ?))"
+        ))
         .bind(from_user_id)
         .bind(to_user_id)
         .bind(to_user_id)
@@ -1107,12 +1114,12 @@ impl Database {
 
         let now = Self::now_secs();
         // `fetch_all`, never `fetch_one` — see `create_mcp_connection`.
-        let row: Vec<(i64,)> = sqlx::query_as(
+        let row: Vec<(i64,)> = sqlx::query_as(&crate::sql!(
             "INSERT INTO recommendations
                 (user_id, kind, artist, name, mbid, reason, because, origin,
                  from_user_id, created_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
-        )
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id"
+        ))
         .bind(to_user_id)
         .bind(&rec.kind)
         .bind(&rec.artist)
@@ -1134,14 +1141,14 @@ impl Database {
     /// record a friend handed you from one a model suggested, on a page that
     /// deliberately holds both.
     pub async fn dubs_for(&self, user_id: i64) -> Result<Vec<Dub>, sqlx::Error> {
-        sqlx::query_as(
+        sqlx::query_as(&crate::sql!(
             "SELECT r.id, r.kind, r.artist, r.name, r.reason, r.because, r.status,
                     r.created_at, u.username AS from_username, u.display_name AS from_display_name
                FROM recommendations r
                JOIN users u ON u.id = r.from_user_id
               WHERE r.user_id = ? AND r.from_user_id IS NOT NULL
-              ORDER BY r.status = 'open' DESC, r.created_at DESC",
-        )
+              ORDER BY r.status = 'open' DESC, r.created_at DESC"
+        ))
         .bind(user_id)
         .fetch_all(&self.pool)
         .await
@@ -1171,11 +1178,11 @@ impl Database {
         // in Rust — the pattern `list_crate` and `playlist_tracks_detailed`
         // use. Checked before anything is written, so a sitting never
         // half-starts with the strangers quietly dropped.
-        let patched: Vec<i64> = sqlx::query_scalar(
+        let patched: Vec<i64> = sqlx::query_scalar(&crate::sql!(
             "SELECT CASE WHEN follower_user_id = ? THEN target_user_id ELSE follower_user_id END
                FROM patches
               WHERE state = 'accepted' AND (follower_user_id = ? OR target_user_id = ?)",
-        )
+        ))
         .bind(host_user_id)
         .bind(host_user_id)
         .bind(host_user_id)
@@ -1189,9 +1196,9 @@ impl Database {
         let now = Self::now_secs();
         let mut tx = self.pool.begin().await?;
 
-        sqlx::query(
+        sqlx::query(&crate::sql!(
             "INSERT INTO spools (uuid, host_user_id, title, started_at) VALUES (?, ?, ?, ?)",
-        )
+        ))
         .bind(&uuid)
         .bind(host_user_id)
         .bind(title)
@@ -1199,17 +1206,16 @@ impl Database {
         .execute(&mut *tx)
         .await?;
 
-        let spool_id: i64 = sqlx::query_scalar("SELECT id FROM spools WHERE uuid = ?")
-            .bind(&uuid)
-            .fetch_one(&mut *tx)
-            .await?;
+        let spool_id: i64 =
+            sqlx::query_scalar(&crate::sql!("SELECT id FROM spools WHERE uuid = ?"))
+                .bind(&uuid)
+                .fetch_one(&mut *tx)
+                .await?;
 
         // The host is a member and is already in the room — everyone else is
         // invited, because a spool must not start capturing onto somebody's
         // deck before they have said yes to being in it.
-        sqlx::query(
-            "INSERT INTO spool_members (spool_id, user_id, state, joined_at) VALUES (?, ?, 'joined', ?)",
-        )
+        sqlx::query(&crate::sql!("INSERT INTO spool_members (spool_id, user_id, state, joined_at) VALUES (?, ?, 'joined', ?)",))
         .bind(spool_id)
         .bind(host_user_id)
         .bind(now)
@@ -1220,11 +1226,13 @@ impl Database {
             if uid == host_user_id {
                 continue;
             }
-            sqlx::query("INSERT OR IGNORE INTO spool_members (spool_id, user_id) VALUES (?, ?)")
-                .bind(spool_id)
-                .bind(uid)
-                .execute(&mut *tx)
-                .await?;
+            sqlx::query(&crate::sql!(
+                "INSERT INTO spool_members (spool_id, user_id) VALUES (?, ?) ON CONFLICT DO NOTHING",
+            ))
+            .bind(spool_id)
+            .bind(uid)
+            .execute(&mut *tx)
+            .await?;
         }
 
         tx.commit().await?;
@@ -1256,7 +1264,7 @@ impl Database {
         state: &str,
     ) -> Result<Option<i64>, sqlx::Error> {
         let Some(spool_id): Option<i64> =
-            sqlx::query_scalar("SELECT id FROM spools WHERE uuid = ?")
+            sqlx::query_scalar(&crate::sql!("SELECT id FROM spools WHERE uuid = ?"))
                 .bind(uuid)
                 .fetch_optional(&self.pool)
                 .await?
@@ -1264,10 +1272,10 @@ impl Database {
             return Ok(None);
         };
 
-        let res = sqlx::query(
+        let res = sqlx::query(&crate::sql!(
             "UPDATE spool_members SET state = ?, joined_at = COALESCE(joined_at, ?)
               WHERE user_id = ? AND spool_id = ?",
-        )
+        ))
         .bind(state)
         .bind(Self::now_secs())
         .bind(user_id)
@@ -1330,12 +1338,12 @@ impl Database {
         uuid: &str,
         user_id: i64,
     ) -> Result<i64, sqlx::Error> {
-        let present: Vec<(i64, String)> = sqlx::query_as(
+        let present: Vec<(i64, String)> = sqlx::query_as(&crate::sql!(
             "SELECT m.user_id, COALESCE(u.display_name, u.username)
                FROM spool_members m JOIN users u ON u.id = m.user_id
               WHERE m.spool_id = ? AND m.state = 'joined'
-              ORDER BY u.username",
-        )
+              ORDER BY u.username"
+        ))
         .bind(spool_id)
         .fetch_all(&self.pool)
         .await?;
@@ -1343,25 +1351,26 @@ impl Database {
             present.iter().filter(|(id, _)| *id != user_id).map(|(_, n)| n.as_str()).collect();
         let company = (!names.is_empty()).then(|| names.join(", "));
 
-        let plays: Vec<(i64, String, String, Option<String>, Option<i64>, i64)> = sqlx::query_as(
-            "SELECT s.user_id, s.title, s.artist, s.album, s.duration, s.timestamp
+        let plays: Vec<(i64, String, String, Option<String>, Option<i64>, i64)> =
+            sqlx::query_as(&crate::sql!(
+                "SELECT s.user_id, s.title, s.artist, s.album, s.duration, s.timestamp
                FROM scrobbles s
                JOIN signal_chains c ON c.id = s.chain_id AND c.shared = 1
               WHERE s.joint_session_id = ? AND s.user_id != ? AND s.skipped = FALSE
                 AND s.user_id IN (
                       SELECT user_id FROM spool_members
                        WHERE spool_id = ? AND state = 'joined')
-              ORDER BY s.timestamp",
-        )
-        .bind(uuid)
-        .bind(user_id)
-        .bind(spool_id)
-        .fetch_all(&self.pool)
-        .await?;
+              ORDER BY s.timestamp"
+            ))
+            .bind(uuid)
+            .bind(user_id)
+            .bind(spool_id)
+            .fetch_all(&self.pool)
+            .await?;
 
         let mut offered = 0i64;
         for (from, title, artist, album, duration, played_at) in &plays {
-            let res = sqlx::query(
+            let res = sqlx::query(&crate::sql!(
                 "INSERT INTO spool_captures
                     (spool_id, user_id, from_user_id, title, artist, album, duration, played_at,
                      company)
@@ -1369,8 +1378,8 @@ impl Database {
                   WHERE NOT EXISTS (
                         SELECT 1 FROM spool_captures
                          WHERE user_id = ? AND played_at = ? AND title = ?
-                  )",
-            )
+                  )"
+            ))
             .bind(spool_id)
             .bind(user_id)
             .bind(from)
@@ -1395,9 +1404,7 @@ impl Database {
     /// answered yet, and ending the room does not withdraw what was played in
     /// it.
     pub async fn end_spool(&self, uuid: &str, host_user_id: i64) -> Result<bool, sqlx::Error> {
-        let res = sqlx::query(
-            "UPDATE spools SET ended_at = ? WHERE uuid = ? AND host_user_id = ? AND ended_at IS NULL",
-        )
+        let res = sqlx::query(&crate::sql!("UPDATE spools SET ended_at = ? WHERE uuid = ? AND host_user_id = ? AND ended_at IS NULL",))
         .bind(Self::now_secs())
         .bind(uuid)
         .bind(host_user_id)
@@ -1419,14 +1426,14 @@ impl Database {
     /// live room sees the live one.
     pub async fn active_spool(&self, user_id: i64) -> Result<Option<SpoolView>, sqlx::Error> {
         let Some(row): Option<(i64, String, i64, Option<String>, i64, Option<i64>, String)> =
-            sqlx::query_as(
+            sqlx::query_as(&crate::sql!(
                 "SELECT sp.id, sp.uuid, sp.host_user_id, sp.title, sp.started_at, sp.ended_at,
                         m.state
                    FROM spools sp
                    JOIN spool_members m ON m.spool_id = sp.id AND m.user_id = ?
                   WHERE sp.ended_at IS NULL OR m.state = 'invited'
                   ORDER BY sp.ended_at IS NULL DESC, sp.started_at DESC LIMIT 1",
-            )
+            ))
             .bind(user_id)
             .fetch_optional(&self.pool)
             .await?
@@ -1435,18 +1442,18 @@ impl Database {
         };
         let (id, uuid, host_user_id, title, started_at, ended_at, my_state) = row;
 
-        let members: Vec<SpoolMember> = sqlx::query_as(
+        let members: Vec<SpoolMember> = sqlx::query_as(&crate::sql!(
             "SELECT u.id AS user_id, u.username, u.display_name, m.state
                FROM spool_members m JOIN users u ON u.id = m.user_id
-              WHERE m.spool_id = ? ORDER BY m.state = 'joined' DESC, u.username",
-        )
+              WHERE m.spool_id = ? ORDER BY m.state = 'joined' DESC, u.username"
+        ))
         .bind(id)
         .fetch_all(&self.pool)
         .await?;
 
-        let captured: i64 = sqlx::query_scalar(
+        let captured: i64 = sqlx::query_scalar(&crate::sql!(
             "SELECT COUNT(*) FROM spool_captures WHERE spool_id = ? AND user_id = ?",
-        )
+        ))
         .bind(id)
         .bind(user_id)
         .fetch_one(&self.pool)
@@ -1484,12 +1491,12 @@ impl Database {
         if to_user_id == from_user_id {
             return Err(sqlx::Error::Protocol("hand it to somebody else".into()));
         }
-        let connected: i64 = sqlx::query_scalar(
+        let connected: i64 = sqlx::query_scalar(&crate::sql!(
             "SELECT COUNT(*) FROM patches
               WHERE state = 'accepted'
                 AND ((follower_user_id = ? AND target_user_id = ?)
-                  OR (follower_user_id = ? AND target_user_id = ?))",
-        )
+                  OR (follower_user_id = ? AND target_user_id = ?))"
+        ))
         .bind(from_user_id)
         .bind(to_user_id)
         .bind(to_user_id)
@@ -1502,12 +1509,13 @@ impl Database {
 
         // The sitting has to be *yours*. Checked in the query rather than by the
         // handler, so a second caller inherits it.
-        let owned: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM sessions WHERE uuid = ? AND user_id = ?")
-                .bind(session_uuid)
-                .bind(from_user_id)
-                .fetch_one(&self.pool)
-                .await?;
+        let owned: i64 = sqlx::query_scalar(&crate::sql!(
+            "SELECT COUNT(*) FROM sessions WHERE uuid = ? AND user_id = ?",
+        ))
+        .bind(session_uuid)
+        .bind(from_user_id)
+        .fetch_one(&self.pool)
+        .await?;
         if owned == 0 {
             return Err(sqlx::Error::RowNotFound);
         }
@@ -1519,14 +1527,14 @@ impl Database {
         // `request_patch` both document.
         //
         // `fetch_all`, never `fetch_one`, on a RETURNING write against a pool.
-        let row: Vec<(String,)> = sqlx::query_as(
+        let row: Vec<(String,)> = sqlx::query_as(&crate::sql!(
             "INSERT INTO shared_sessions (uuid, session_uuid, from_user_id, to_user_id, note,
                                           created_at)
              VALUES (?, ?, ?, ?, ?, ?)
              ON CONFLICT(from_user_id, session_uuid, to_user_id) WHERE to_user_id IS NOT NULL
              DO UPDATE SET note = excluded.note
              RETURNING uuid",
-        )
+        ))
         .bind(&uuid)
         .bind(session_uuid)
         .bind(from_user_id)
@@ -1561,12 +1569,12 @@ impl Database {
         if to_user_id == host_user_id {
             return Err(sqlx::Error::Protocol("share it with somebody else".into()));
         }
-        let connected: i64 = sqlx::query_scalar(
+        let connected: i64 = sqlx::query_scalar(&crate::sql!(
             "SELECT COUNT(*) FROM patches
               WHERE state = 'accepted'
                 AND ((follower_user_id = ? AND target_user_id = ?)
-                  OR (follower_user_id = ? AND target_user_id = ?))",
-        )
+                  OR (follower_user_id = ? AND target_user_id = ?))"
+        ))
         .bind(host_user_id)
         .bind(to_user_id)
         .bind(to_user_id)
@@ -1582,9 +1590,9 @@ impl Database {
             Option<String>,
             i64,
             Option<i64>,
-        )> = sqlx::query_as(
+        )> = sqlx::query_as(&crate::sql!(
             "SELECT id, title, started_at, ended_at FROM sessions WHERE uuid = ? AND user_id = ?",
-        )
+        ))
         .bind(session_uuid)
         .bind(host_user_id)
         .fetch_optional(&self.pool)
@@ -1599,9 +1607,9 @@ impl Database {
         // Find or create the sitting. A second person added to the same evening
         // joins the spool that already exists — one event, however many people
         // were in it — which is what the partial unique index enforces.
-        let existing: Option<(i64, String)> = sqlx::query_as(
+        let existing: Option<(i64, String)> = sqlx::query_as(&crate::sql!(
             "SELECT id, uuid FROM spools WHERE host_user_id = ? AND session_uuid = ?",
-        )
+        ))
         .bind(host_user_id)
         .bind(session_uuid)
         .fetch_optional(&mut *tx)
@@ -1614,11 +1622,11 @@ impl Database {
                 // Created **already ended**, with the sitting's own times. It
                 // is not running, so the one-running-spool-per-host index does
                 // not apply and a live sitting elsewhere is undisturbed.
-                sqlx::query(
+                sqlx::query(&crate::sql!(
                     "INSERT INTO spools (uuid, host_user_id, title, started_at, ended_at,
                                          session_uuid)
                      VALUES (?, ?, ?, ?, ?, ?)",
-                )
+                ))
                 .bind(&uuid)
                 .bind(host_user_id)
                 .bind(&title)
@@ -1627,14 +1635,15 @@ impl Database {
                 .bind(session_uuid)
                 .execute(&mut *tx)
                 .await?;
-                let id: i64 = sqlx::query_scalar("SELECT id FROM spools WHERE uuid = ?")
-                    .bind(&uuid)
-                    .fetch_one(&mut *tx)
-                    .await?;
-                sqlx::query(
-                    "INSERT OR IGNORE INTO spool_members (spool_id, user_id, state, joined_at)
-                     VALUES (?, ?, 'joined', ?)",
-                )
+                let id: i64 =
+                    sqlx::query_scalar(&crate::sql!("SELECT id FROM spools WHERE uuid = ?"))
+                        .bind(&uuid)
+                        .fetch_one(&mut *tx)
+                        .await?;
+                sqlx::query(&crate::sql!(
+                    "INSERT INTO spool_members (spool_id, user_id, state, joined_at)
+                     VALUES (?, ?, 'joined', ?) ON CONFLICT DO NOTHING",
+                ))
                 .bind(id)
                 .bind(host_user_id)
                 .bind(now)
@@ -1649,47 +1658,50 @@ impl Database {
         // only: it decides nothing on its own. Every play still arrives as a
         // capture they must accept, so nothing reaches their history without
         // their yes — the invariant a live spool rests on, unchanged.
-        sqlx::query(
+        sqlx::query(&crate::sql!(
             "INSERT INTO spool_members (spool_id, user_id, state, joined_at)
              VALUES (?, ?, 'joined', ?)
-             ON CONFLICT(spool_id, user_id) DO UPDATE SET state = 'joined'",
-        )
+             ON CONFLICT(spool_id, user_id) DO UPDATE SET state = 'joined'"
+        ))
         .bind(spool_id)
         .bind(to_user_id)
         .bind(now)
         .execute(&mut *tx)
         .await?;
 
-        let host_name: String =
-            sqlx::query_scalar("SELECT COALESCE(display_name, username) FROM users WHERE id = ?")
-                .bind(host_user_id)
-                .fetch_one(&mut *tx)
-                .await?;
-        let their_name: String =
-            sqlx::query_scalar("SELECT COALESCE(display_name, username) FROM users WHERE id = ?")
-                .bind(to_user_id)
-                .fetch_one(&mut *tx)
-                .await?;
+        let host_name: String = sqlx::query_scalar(&crate::sql!(
+            "SELECT COALESCE(display_name, username) FROM users WHERE id = ?",
+        ))
+        .bind(host_user_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        let their_name: String = sqlx::query_scalar(&crate::sql!(
+            "SELECT COALESCE(display_name, username) FROM users WHERE id = ?",
+        ))
+        .bind(to_user_id)
+        .fetch_one(&mut *tx)
+        .await?;
 
         // **The same shared-chain rule a live sitting follows**, so a spool made
         // late captures exactly what one started on time would have. What it
         // therefore leaves out is counted and returned, never silently dropped —
         // and unlike a live sitting there is a recovery: share the chain and do
         // it again.
-        let plays: Vec<(String, String, Option<String>, Option<i64>, i64)> = sqlx::query_as(
-            "SELECT s.title, s.artist, s.album, s.duration, s.timestamp
+        let plays: Vec<(String, String, Option<String>, Option<i64>, i64)> =
+            sqlx::query_as(&crate::sql!(
+                "SELECT s.title, s.artist, s.album, s.duration, s.timestamp
                FROM scrobbles s
                JOIN signal_chains c ON c.id = s.chain_id AND c.shared = 1
               WHERE s.session_id = ? AND s.skipped = FALSE
-              ORDER BY s.timestamp",
-        )
-        .bind(session_id)
-        .fetch_all(&mut *tx)
-        .await?;
+              ORDER BY s.timestamp"
+            ))
+            .bind(session_id)
+            .fetch_all(&mut *tx)
+            .await?;
 
-        let total: i64 = sqlx::query_scalar(
+        let total: i64 = sqlx::query_scalar(&crate::sql!(
             "SELECT COUNT(*) FROM scrobbles WHERE session_id = ? AND skipped = FALSE",
-        )
+        ))
         .bind(session_id)
         .fetch_one(&mut *tx)
         .await?;
@@ -1703,7 +1715,7 @@ impl Database {
             // by doing it on a running instance: the same track appeared twice
             // in the inbox, once from each. An already-settled capture matches
             // too, so a play they have accepted or declined is not re-offered.
-            let res = sqlx::query(
+            let res = sqlx::query(&crate::sql!(
                 "INSERT INTO spool_captures
                     (spool_id, user_id, from_user_id, title, artist, album, duration, played_at,
                      company)
@@ -1711,8 +1723,8 @@ impl Database {
                   WHERE NOT EXISTS (
                         SELECT 1 FROM spool_captures
                          WHERE user_id = ? AND played_at = ? AND title = ?
-                  )",
-            )
+                  )"
+            ))
             .bind(spool_id)
             .bind(to_user_id)
             .bind(host_user_id)
@@ -1733,10 +1745,10 @@ impl Database {
         // And the host's own listens learn they were not heard alone. Only the
         // ones not already in a sitting: a listen carrying a `joint_session_id`
         // was in a real spool at the time, and that is the better record.
-        sqlx::query(
+        sqlx::query(&crate::sql!(
             "UPDATE scrobbles SET joint_session_id = ?, company = COALESCE(company, ?)
               WHERE session_id = ? AND user_id = ? AND joint_session_id IS NULL",
-        )
+        ))
         .bind(&spool_uuid)
         .bind(&their_name)
         .bind(session_id)
@@ -1753,11 +1765,13 @@ impl Database {
         uuid: &str,
         from_user_id: i64,
     ) -> Result<bool, sqlx::Error> {
-        let res = sqlx::query("DELETE FROM shared_sessions WHERE uuid = ? AND from_user_id = ?")
-            .bind(uuid)
-            .bind(from_user_id)
-            .execute(&self.pool)
-            .await?;
+        let res = sqlx::query(&crate::sql!(
+            "DELETE FROM shared_sessions WHERE uuid = ? AND from_user_id = ?"
+        ))
+        .bind(uuid)
+        .bind(from_user_id)
+        .execute(&self.pool)
+        .await?;
         Ok(res.rows_affected() > 0)
     }
     /// Who else on this instance plays a given artist, and which of your own
@@ -1783,7 +1797,7 @@ impl Database {
     ) -> Result<(Vec<ArtistDeck>, Vec<ChainTally>), sqlx::Error> {
         let key = artist.trim().to_lowercase();
 
-        let decks: Vec<ArtistDeck> = sqlx::query_as(
+        let decks: Vec<ArtistDeck> = sqlx::query_as(&crate::sql!(
             "SELECT u.id AS user_id, u.username, u.display_name, u.avatar_url,
                     a.uri AS actor_uri, COUNT(*) AS plays,
                     EXISTS (SELECT 1 FROM patches p
@@ -1800,7 +1814,7 @@ impl Database {
                 AND s.user_id <> ?1
                 AND u.disabled = 0
               GROUP BY u.id ORDER BY plays DESC LIMIT 12",
-        )
+        ))
         .bind(user_id)
         .bind(&key)
         .fetch_all(&self.pool)
@@ -1809,12 +1823,12 @@ impl Database {
         // **Your own** chains for this artist — no sharing question, it is your
         // listening. Not filtered on `shared`: what you heard them on is a fact
         // about your setup rather than a publication.
-        let chains: Vec<(String, i64)> = sqlx::query_as(
+        let chains: Vec<(String, i64)> = sqlx::query_as(&crate::sql!(
             "SELECT c.name, COUNT(*) AS plays
                FROM scrobbles s JOIN signal_chains c ON c.id = s.chain_id
               WHERE s.user_id = ? AND s.skipped = FALSE AND LOWER(TRIM(s.artist)) = ?
-              GROUP BY c.id ORDER BY plays DESC LIMIT 6",
-        )
+              GROUP BY c.id ORDER BY plays DESC LIMIT 6"
+        ))
         .bind(user_id)
         .bind(&key)
         .fetch_all(&self.pool)
@@ -1827,23 +1841,25 @@ impl Database {
     /// Just the people — no listens — because the live strip reads what they
     /// are playing from the in-memory registry rather than from the history.
     pub async fn accepted_patch_targets(&self, user_id: i64) -> Result<Vec<DeckPeer>, sqlx::Error> {
-        sqlx::query_as(
+        sqlx::query_as(&crate::sql!(
             "SELECT u.id AS user_id, u.username, u.display_name, u.avatar_url
                FROM patches p JOIN users u ON u.id = p.target_user_id
               WHERE p.follower_user_id = ? AND p.state = 'accepted'
-              ORDER BY u.username",
-        )
+              ORDER BY u.username"
+        ))
         .bind(user_id)
         .fetch_all(&self.pool)
         .await
     }
     /// Whether a deck you have patched with sees **all** your listens.
     pub async fn share_all_with_patched(&self, user_id: i64) -> Result<bool, sqlx::Error> {
-        Ok(sqlx::query_scalar("SELECT share_all_with_patched FROM users WHERE id = ?")
-            .bind(user_id)
-            .fetch_optional(&self.pool)
-            .await?
-            .unwrap_or(false))
+        Ok(sqlx::query_scalar(&crate::sql!(
+            "SELECT share_all_with_patched FROM users WHERE id = ?"
+        ))
+        .bind(user_id)
+        .fetch_optional(&self.pool)
+        .await?
+        .unwrap_or(false))
     }
     /// Open the deck up to everyone patched with you, or close it again.
     ///
@@ -1857,7 +1873,7 @@ impl Database {
         user_id: i64,
         on: bool,
     ) -> Result<(), sqlx::Error> {
-        sqlx::query("UPDATE users SET share_all_with_patched = ? WHERE id = ?")
+        sqlx::query(&crate::sql!("UPDATE users SET share_all_with_patched = ? WHERE id = ?"))
             .bind(on)
             .bind(user_id)
             .execute(&self.pool)
@@ -1885,23 +1901,26 @@ impl Database {
         user_id: i64,
         chain_id: Option<i64>,
     ) -> Result<Visible, sqlx::Error> {
-        let all: bool = sqlx::query_scalar("SELECT share_all_with_patched FROM users WHERE id = ?")
-            .bind(user_id)
-            .fetch_optional(&self.pool)
-            .await?
-            .unwrap_or(false);
+        let all: bool = sqlx::query_scalar(&crate::sql!(
+            "SELECT share_all_with_patched FROM users WHERE id = ?"
+        ))
+        .bind(user_id)
+        .fetch_optional(&self.pool)
+        .await?
+        .unwrap_or(false);
 
-        let named: Option<String> =
-            match chain_id {
-                Some(cid) => sqlx::query_scalar(
+        let named: Option<String> = match chain_id {
+            Some(cid) => {
+                sqlx::query_scalar(&crate::sql!(
                     "SELECT name FROM signal_chains WHERE id = ? AND user_id = ? AND shared = 1",
-                )
+                ))
                 .bind(cid)
                 .bind(user_id)
                 .fetch_optional(&self.pool)
-                .await?,
-                None => None,
-            };
+                .await?
+            }
+            None => None,
+        };
 
         // A shared chain is visible however the switch is set — that is the old
         // rule, intact.
@@ -1923,7 +1942,7 @@ impl Database {
     /// on a yes, a capture nobody has settled, a dub still open, and a sitting
     /// passed on but not yet opened.
     pub async fn patch_inbox_count(&self, user_id: i64) -> Result<i64, sqlx::Error> {
-        sqlx::query_scalar(
+        sqlx::query_scalar(&crate::sql!(
             "SELECT (SELECT COUNT(*) FROM patches
                       WHERE target_user_id = ?1 AND state = 'pending')
                   + (SELECT COUNT(*) FROM spool_captures
@@ -1931,15 +1950,15 @@ impl Database {
                   + (SELECT COUNT(*) FROM recommendations
                       WHERE user_id = ?1 AND from_user_id IS NOT NULL AND status = 'open')
                   + (SELECT COUNT(*) FROM shared_sessions
-                      WHERE to_user_id = ?1 AND seen_at IS NULL)",
-        )
+                      WHERE to_user_id = ?1 AND seen_at IS NULL)"
+        ))
         .bind(user_id)
         .fetch_one(&self.pool)
         .await
     }
     /// Sittings handed to this person, newest first.
     pub async fn sittings_for(&self, user_id: i64) -> Result<Vec<HandedSitting>, sqlx::Error> {
-        sqlx::query_as(
+        sqlx::query_as(&crate::sql!(
             "SELECT ss.uuid, ss.session_uuid, ss.note, ss.created_at, ss.seen_at,
                     u.username AS from_username, u.display_name AS from_display_name,
                     se.title, se.started_at, se.ended_at
@@ -1947,8 +1966,8 @@ impl Database {
                JOIN users u ON u.id = ss.from_user_id
                LEFT JOIN sessions se ON se.uuid = ss.session_uuid
               WHERE ss.to_user_id = ?
-              ORDER BY ss.created_at DESC",
-        )
+              ORDER BY ss.created_at DESC"
+        ))
         .bind(user_id)
         .fetch_all(&self.pool)
         .await
@@ -1964,7 +1983,7 @@ impl Database {
     /// there is nothing to withdraw — which is correct rather than an omission:
     /// those are plays they accept or decline for themselves.
     pub async fn sittings_sent(&self, user_id: i64) -> Result<Vec<SentSitting>, sqlx::Error> {
-        sqlx::query_as(
+        sqlx::query_as(&crate::sql!(
             "SELECT ss.uuid, ss.session_uuid, ss.note, ss.created_at, ss.seen_at,
                     u.username AS to_username, u.display_name AS to_display_name,
                     se.title, se.started_at, se.ended_at
@@ -1972,8 +1991,8 @@ impl Database {
                JOIN users u ON u.id = ss.to_user_id
                LEFT JOIN sessions se ON se.uuid = ss.session_uuid
               WHERE ss.from_user_id = ?
-              ORDER BY ss.created_at DESC",
-        )
+              ORDER BY ss.created_at DESC"
+        ))
         .bind(user_id)
         .fetch_all(&self.pool)
         .await
@@ -1982,10 +2001,10 @@ impl Database {
     /// nothing to a history, so there is nothing to consent to — only a
     /// notification to clear.
     pub async fn mark_sitting_seen(&self, uuid: &str, user_id: i64) -> Result<bool, sqlx::Error> {
-        let res = sqlx::query(
+        let res = sqlx::query(&crate::sql!(
             "UPDATE shared_sessions SET seen_at = ?
-              WHERE uuid = ? AND to_user_id = ? AND seen_at IS NULL",
-        )
+              WHERE uuid = ? AND to_user_id = ? AND seen_at IS NULL"
+        ))
         .bind(Self::now_secs())
         .bind(uuid)
         .bind(user_id)
@@ -2020,11 +2039,11 @@ impl Database {
             Option<String>,
             String,
             Option<String>,
-        )> = sqlx::query_as(
+        )> = sqlx::query_as(&crate::sql!(
             "SELECT ss.session_uuid, ss.note, u.username, u.display_name
                FROM shared_sessions ss JOIN users u ON u.id = ss.from_user_id
-              WHERE ss.uuid = ? AND (ss.to_user_id = ? OR ss.from_user_id = ?)",
-        )
+              WHERE ss.uuid = ? AND (ss.to_user_id = ? OR ss.from_user_id = ?)"
+        ))
         .bind(uuid)
         .bind(viewer_id)
         .bind(viewer_id)
@@ -2039,10 +2058,12 @@ impl Database {
             Option<String>,
             i64,
             Option<i64>,
-        )> = sqlx::query_as("SELECT id, title, started_at, ended_at FROM sessions WHERE uuid = ?")
-            .bind(&session_uuid)
-            .fetch_optional(&self.pool)
-            .await?
+        )> = sqlx::query_as(&crate::sql!(
+            "SELECT id, title, started_at, ended_at FROM sessions WHERE uuid = ?",
+        ))
+        .bind(&session_uuid)
+        .fetch_optional(&self.pool)
+        .await?
         else {
             // The sitting was regrouped out of existence. An honest empty
             // document beats a 404, which would read as a broken link.
@@ -2060,7 +2081,7 @@ impl Database {
             }));
         };
 
-        let listens: Vec<HandedListen> = sqlx::query_as(
+        let listens: Vec<HandedListen> = sqlx::query_as(&crate::sql!(
             "SELECT s.title, s.artist, s.album, s.timestamp, s.duration, s.artwork_url,
                     s.caa_id, s.caa_release_mbid,
                     CASE WHEN c.shared = 1 THEN c.name END AS chain_name
@@ -2070,16 +2091,16 @@ impl Database {
               WHERE s.session_id = ? AND s.skipped = FALSE
                 AND (u.share_all_with_patched = 1 OR c.shared = 1)
               ORDER BY s.timestamp",
-        )
+        ))
         .bind(session_id)
         .fetch_all(&self.pool)
         .await?;
 
         // Everything in the sitting that the reader is not being shown. One
         // count, stated on the document — never a silent difference.
-        let total: i64 = sqlx::query_scalar(
+        let total: i64 = sqlx::query_scalar(&crate::sql!(
             "SELECT COUNT(*) FROM scrobbles WHERE session_id = ? AND skipped = FALSE",
-        )
+        ))
         .bind(session_id)
         .fetch_one(&self.pool)
         .await?;
@@ -2138,11 +2159,11 @@ impl Database {
         play: &Play,
         chain_id: Option<i64>,
     ) -> Result<(), sqlx::Error> {
-        let Some((spool_id, uuid)): Option<(i64, String)> = sqlx::query_as(
+        let Some((spool_id, uuid)): Option<(i64, String)> = sqlx::query_as(&crate::sql!(
             "SELECT sp.id, sp.uuid FROM spools sp
                JOIN spool_members m ON m.spool_id = sp.id AND m.user_id = ? AND m.state = 'joined'
-              WHERE sp.ended_at IS NULL LIMIT 1",
-        )
+              WHERE sp.ended_at IS NULL LIMIT 1"
+        ))
         .bind(user_id)
         .fetch_optional(&self.pool)
         .await?
@@ -2159,12 +2180,12 @@ impl Database {
         //
         // One read serves every stamp below — this listener's own, and one per
         // recipient, each of which needs the same list minus themselves.
-        let present: Vec<(i64, String)> = sqlx::query_as(
+        let present: Vec<(i64, String)> = sqlx::query_as(&crate::sql!(
             "SELECT m.user_id, COALESCE(u.display_name, u.username)
                FROM spool_members m JOIN users u ON u.id = m.user_id
               WHERE m.spool_id = ? AND m.state = 'joined'
-              ORDER BY u.username",
-        )
+              ORDER BY u.username"
+        ))
         .bind(spool_id)
         .fetch_all(&self.pool)
         .await?;
@@ -2191,10 +2212,10 @@ impl Database {
         // **Before the chain gate**, and that is deliberate — see the note on
         // this function. Nobody but the owner ever reads these columns, so a
         // publishing switch has no business deciding them.
-        sqlx::query(
+        sqlx::query(&crate::sql!(
             "UPDATE scrobbles SET joint_session_id = ?, company = COALESCE(?, company)
               WHERE user_id = ? AND source_id = ? AND source_name = ?",
-        )
+        ))
         .bind(&uuid)
         .bind(&company)
         .bind(user_id)
@@ -2209,9 +2230,9 @@ impl Database {
         let Some(chain_id) = chain_id else {
             return Ok(());
         };
-        let shared: i64 = sqlx::query_scalar(
+        let shared: i64 = sqlx::query_scalar(&crate::sql!(
             "SELECT COUNT(*) FROM signal_chains WHERE id = ? AND user_id = ? AND shared = 1",
-        )
+        ))
         .bind(chain_id)
         .bind(user_id)
         .fetch_one(&self.pool)
@@ -2224,12 +2245,12 @@ impl Database {
         // not when it is eventually accepted. Those can be hours apart, and
         // somebody joining in between was not there for this one.
         for (other, _) in present.iter().filter(|(id, _)| *id != user_id) {
-            sqlx::query(
-                "INSERT OR IGNORE INTO spool_captures
+            sqlx::query(&crate::sql!(
+                "INSERT INTO spool_captures
                     (spool_id, user_id, from_user_id, title, artist, album, duration, played_at,
                      company)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            )
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT DO NOTHING"
+            ))
             .bind(spool_id)
             .bind(other)
             .bind(user_id)
@@ -2247,7 +2268,7 @@ impl Database {
     }
     /// Captures waiting on this user.
     pub async fn spool_captures(&self, user_id: i64) -> Result<Vec<SpoolCapture>, sqlx::Error> {
-        sqlx::query_as(
+        sqlx::query_as(&crate::sql!(
             "SELECT cap.id, cap.title, cap.artist, cap.album, cap.duration, cap.played_at,
                     cap.state, u.username AS from_username, u.display_name AS from_display_name,
                     sp.uuid AS spool_uuid, sp.title AS spool_title
@@ -2257,7 +2278,7 @@ impl Database {
               WHERE cap.user_id = ?
               ORDER BY cap.state = 'pending' DESC, cap.played_at DESC
               LIMIT 200",
-        )
+        ))
         .bind(user_id)
         .fetch_all(&self.pool)
         .await
@@ -2304,10 +2325,11 @@ impl Database {
               WHERE cap.user_id = ? AND cap.state = 'pending'
                 AND cap.id IN ({placeholders})"
         );
+        let stmt = crate::sql!(&sql);
         let mut q = sqlx::query_as::<
             _,
             (i64, String, String, Option<String>, Option<i64>, i64, String, Option<String>),
-        >(&sql)
+        >(&stmt)
         .bind(user_id);
         for id in ids {
             q = q.bind(id);
@@ -2353,10 +2375,10 @@ impl Database {
                 // is the snapshot taken when the play happened — which names
                 // the host who played it and excludes the person accepting —
                 // rather than a fresh reading of who is in the sitting now.
-                sqlx::query(
+                sqlx::query(&crate::sql!(
                     "UPDATE scrobbles SET joint_session_id = ?, company = COALESCE(?, company)
                       WHERE user_id = ? AND source_id = ? AND source_name = 'Shared Spool'",
-                )
+                ))
                 .bind(&spool_uuid)
                 .bind(&company)
                 .bind(user_id)
@@ -2364,9 +2386,9 @@ impl Database {
                 .execute(&self.pool)
                 .await?;
             }
-            sqlx::query(
+            sqlx::query(&crate::sql!(
                 "UPDATE spool_captures SET state = ?, settled_at = ? WHERE id = ? AND user_id = ?",
-            )
+            ))
             .bind(if accept { "accepted" } else { "declined" })
             .bind(Self::now_secs())
             .bind(id)
@@ -2379,11 +2401,12 @@ impl Database {
     }
     /// Whether this account wants accepted Shared Spool plays relayed onward.
     pub async fn forward_spool_listens(&self, user_id: i64) -> Result<bool, sqlx::Error> {
-        let on: Option<i64> =
-            sqlx::query_scalar("SELECT forward_spool_listens FROM users WHERE id = ?")
-                .bind(user_id)
-                .fetch_optional(&self.pool)
-                .await?;
+        let on: Option<i64> = sqlx::query_scalar(&crate::sql!(
+            "SELECT forward_spool_listens FROM users WHERE id = ?"
+        ))
+        .bind(user_id)
+        .fetch_optional(&self.pool)
+        .await?;
         Ok(on.unwrap_or(0) != 0)
     }
     /// Set it.
@@ -2392,7 +2415,7 @@ impl Database {
         user_id: i64,
         on: bool,
     ) -> Result<(), sqlx::Error> {
-        sqlx::query("UPDATE users SET forward_spool_listens = ? WHERE id = ?")
+        sqlx::query(&crate::sql!("UPDATE users SET forward_spool_listens = ? WHERE id = ?"))
             .bind(i64::from(on))
             .bind(user_id)
             .execute(&self.pool)
@@ -2477,10 +2500,10 @@ impl Database {
         // 1. The old base, as a variant that restores it.
         let old_overrides = crate::models::overrides_against(&new_base, &base);
         let old_json = serde_json::to_string(&old_overrides).unwrap_or_else(|_| "[]".into());
-        sqlx::query(
+        sqlx::query(&crate::sql!(
             "INSERT INTO chain_variants (user_id, chain_id, name, overrides, created_at)
              VALUES (?, ?, ?, ?, ?)",
-        )
+        ))
         .bind(user_id)
         .bind(chain_id)
         .bind(old_base_name)
@@ -2488,10 +2511,10 @@ impl Database {
         .bind(now)
         .execute(&mut *tx)
         .await?;
-        let old_variant_id: i64 = sqlx::query_scalar(
+        let old_variant_id: i64 = sqlx::query_scalar(&crate::sql!(
             "SELECT id FROM chain_variants WHERE user_id = ? AND chain_id = ? AND created_at = ?
               ORDER BY id DESC LIMIT 1",
-        )
+        ))
         .bind(user_id)
         .bind(chain_id)
         .bind(now)
@@ -2504,30 +2527,32 @@ impl Database {
             let json =
                 serde_json::to_string(&crate::models::overrides_against(&new_base, resolved))
                     .unwrap_or_else(|_| "[]".into());
-            sqlx::query("UPDATE chain_variants SET overrides = ? WHERE id = ? AND user_id = ?")
-                .bind(json)
-                .bind(id)
-                .bind(user_id)
-                .execute(&mut *tx)
-                .await?;
+            sqlx::query(&crate::sql!(
+                "UPDATE chain_variants SET overrides = ? WHERE id = ? AND user_id = ?",
+            ))
+            .bind(json)
+            .bind(id)
+            .bind(user_id)
+            .execute(&mut *tx)
+            .await?;
         }
 
         // 3. Repoint what was recorded. **Null first**, or the second statement
         //    would catch the rows the first just wrote.
         for table in ["scrobbles", "physical_plays", "physical_releases"] {
-            sqlx::query(&format!(
+            sqlx::query(&crate::sql!(&format!(
                 "UPDATE {table} SET chain_variant_id = ?
                   WHERE user_id = ? AND chain_id = ? AND chain_variant_id IS NULL"
-            ))
+            )))
             .bind(old_variant_id)
             .bind(user_id)
             .bind(chain_id)
             .execute(&mut *tx)
             .await?;
-            sqlx::query(&format!(
+            sqlx::query(&crate::sql!(&format!(
                 "UPDATE {table} SET chain_variant_id = NULL
                   WHERE user_id = ? AND chain_variant_id = ?"
-            ))
+            )))
             .bind(user_id)
             .bind(variant_id)
             .execute(&mut *tx)
@@ -2536,13 +2561,15 @@ impl Database {
 
         // 4. The chain becomes what the variant described, and the variant row
         //    goes — it is the chain now.
-        sqlx::query("UPDATE signal_chains SET components = ? WHERE id = ? AND user_id = ?")
-            .bind(serde_json::to_string(&new_base).unwrap_or_else(|_| "[]".into()))
-            .bind(chain_id)
-            .bind(user_id)
-            .execute(&mut *tx)
-            .await?;
-        sqlx::query("DELETE FROM chain_variants WHERE id = ? AND user_id = ?")
+        sqlx::query(&crate::sql!(
+            "UPDATE signal_chains SET components = ? WHERE id = ? AND user_id = ?"
+        ))
+        .bind(serde_json::to_string(&new_base).unwrap_or_else(|_| "[]".into()))
+        .bind(chain_id)
+        .bind(user_id)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(&crate::sql!("DELETE FROM chain_variants WHERE id = ? AND user_id = ?"))
             .bind(variant_id)
             .bind(user_id)
             .execute(&mut *tx)

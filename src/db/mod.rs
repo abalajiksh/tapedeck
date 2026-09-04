@@ -839,6 +839,29 @@ pub type Db = sqlx::Sqlite;
 /// One runner for all four schemas — the main store, the Every Noise map, the
 /// MusicBrainz cache and the lyrics cache — so the translation cannot be
 /// applied in three places and forgotten in the fourth.
+/// Translate a query into the active dialect.
+///
+/// Every `sqlx::query*` call in this module and its children goes through it,
+/// which is what turns `?` binds into `$1` and `LIKE` into `ILIKE` under
+/// Postgres. Under SQLite it is the identity and borrows, so the default build
+/// pays nothing — see [`dialect::rewrite`].
+///
+/// **A macro rather than a function**, because `sql` is a common local variable
+/// name in this file and a function by that name is shadowed at two dozen call
+/// sites — silently, since a `String` is callable-looking enough to produce a
+/// confusing error rather than the right one. A macro cannot be shadowed by a
+/// binding, and it leaves somewhere to put a per-site cache later without
+/// touching 578 call sites a second time.
+///
+/// `migrate.rs` and `tests.rs` are the deliberate exceptions: both are
+/// SQLite-only by construction, so their queries can never reach Postgres.
+#[macro_export]
+macro_rules! sql {
+    ($q:expr $(,)?) => {
+        $crate::db::dialect::rewrite($q)
+    };
+}
+
 pub async fn run_ddl(pool: &Pool<Db>, sql: &str) -> Result<(), sqlx::Error> {
     for stmt in dialect::statements(&dialect::rewrite_ddl(sql)) {
         sqlx::query(&stmt).execute(pool).await?;
@@ -1255,24 +1278,34 @@ impl Database {
     ///
     /// Failure is logged and ignored: stale statistics make queries slower,
     /// never wrong, and that is not a reason to refuse to start.
+    ///
+    /// **SQLite only.** `ANALYZE` and `PRAGMA optimize` are its vocabulary, and
+    /// `sqlite_stat1` is its table. Postgres keeps its own statistics through
+    /// autovacuum and needs nothing here — a Postgres build that ran this would
+    /// log three failures on every start and change nothing.
     async fn plan_stats(&self) {
-        let analysed: Option<(i64,)> = sqlx::query_as(
-            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'sqlite_stat1'",
-        )
-        .fetch_optional(&self.pool)
-        .await
-        .ok()
-        .flatten();
+        #[cfg(feature = "postgres")]
+        return;
+        #[cfg(not(feature = "postgres"))]
+        {
+            let analysed: Option<(i64,)> = sqlx::query_as(&crate::sql!(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'sqlite_stat1'",
+            ))
+            .fetch_optional(&self.pool)
+            .await
+            .ok()
+            .flatten();
 
-        if analysed.map(|(n,)| n) == Some(0) {
-            info!("⚙️ Analysing the database so the query planner has statistics...");
-            if let Err(e) = sqlx::query("ANALYZE").execute(&self.pool).await {
-                warn!("Could not analyse the database: {}", e);
-                return;
+            if analysed.map(|(n,)| n) == Some(0) {
+                info!("⚙️ Analysing the database so the query planner has statistics...");
+                if let Err(e) = sqlx::query(&crate::sql!("ANALYZE")).execute(&self.pool).await {
+                    warn!("Could not analyse the database: {}", e);
+                    return;
+                }
             }
-        }
-        if let Err(e) = sqlx::query("PRAGMA optimize").execute(&self.pool).await {
-            warn!("Could not run PRAGMA optimize: {}", e);
+            if let Err(e) = sqlx::query(&crate::sql!("PRAGMA optimize")).execute(&self.pool).await {
+                warn!("Could not run PRAGMA optimize: {}", e);
+            }
         }
     }
 

@@ -17,20 +17,21 @@ impl Database {
         product: Option<&str>,
     ) -> Result<i64, sqlx::Error> {
         let now = Self::now_secs();
-        let existing: Option<(i64,)> =
-            sqlx::query_as("SELECT id FROM devices WHERE user_id = ? AND machine_id = ?")
-                .bind(user_id)
-                .bind(machine_id)
-                .fetch_optional(&self.pool)
-                .await?;
+        let existing: Option<(i64,)> = sqlx::query_as(&crate::sql!(
+            "SELECT id FROM devices WHERE user_id = ? AND machine_id = ?"
+        ))
+        .bind(user_id)
+        .bind(machine_id)
+        .fetch_optional(&self.pool)
+        .await?;
         if let Some((id,)) = existing {
-            sqlx::query("UPDATE devices SET last_seen = ?, total_listens = total_listens + 1,
-                 name = COALESCE(?, name), platform = COALESCE(?, platform), product = COALESCE(?, product) WHERE id = ?")
+            sqlx::query(&crate::sql!("UPDATE devices SET last_seen = ?, total_listens = total_listens + 1,
+                 name = COALESCE(?, name), platform = COALESCE(?, platform), product = COALESCE(?, product) WHERE id = ?"))
             .bind(now).bind(name).bind(platform).bind(product).bind(id).execute(&self.pool).await?;
             Ok(id)
         } else {
-            let result = sqlx::query_as::<_, (i64,)>("INSERT INTO devices (user_id, machine_id, name, platform, product, first_seen, last_seen, total_listens)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, 1) RETURNING id")
+            let result = sqlx::query_as::<_, (i64,)>(&crate::sql!("INSERT INTO devices (user_id, machine_id, name, platform, product, first_seen, last_seen, total_listens)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, 1) RETURNING id"))
             .bind(user_id).bind(machine_id).bind(name).bind(platform).bind(product).bind(now).bind(now)
             .fetch_all(&self.pool).await?;
             result.first().map(|r| r.0).ok_or(sqlx::Error::RowNotFound)
@@ -47,19 +48,22 @@ impl Database {
         user_id: i64,
         machine_id: &str,
     ) -> Result<Option<i64>, sqlx::Error> {
-        let row: Option<(i64,)> =
-            sqlx::query_as("SELECT id FROM devices WHERE user_id = ? AND machine_id = ?")
-                .bind(user_id)
-                .bind(machine_id)
-                .fetch_optional(&self.pool)
-                .await?;
+        let row: Option<(i64,)> = sqlx::query_as(&crate::sql!(
+            "SELECT id FROM devices WHERE user_id = ? AND machine_id = ?"
+        ))
+        .bind(user_id)
+        .bind(machine_id)
+        .fetch_optional(&self.pool)
+        .await?;
         Ok(row.map(|(id,)| id))
     }
     pub async fn get_devices(&self, user_id: i64) -> Result<Vec<DeviceRow>, sqlx::Error> {
-        sqlx::query_as("SELECT * FROM devices WHERE user_id = ? ORDER BY last_seen DESC")
-            .bind(user_id)
-            .fetch_all(&self.pool)
-            .await
+        sqlx::query_as(&crate::sql!(
+            "SELECT * FROM devices WHERE user_id = ? ORDER BY last_seen DESC"
+        ))
+        .bind(user_id)
+        .fetch_all(&self.pool)
+        .await
     }
     pub async fn upsert_equipment(
         &self,
@@ -73,15 +77,15 @@ impl Database {
     ) -> Result<i64, sqlx::Error> {
         let now = Self::now_secs();
         let existing: Option<(i64,)> =
-            sqlx::query_as("SELECT id FROM equipment WHERE user_id = ? AND name = ?")
+            sqlx::query_as(&crate::sql!("SELECT id FROM equipment WHERE user_id = ? AND name = ?"))
                 .bind(user_id)
                 .bind(name)
                 .fetch_optional(&self.pool)
                 .await?;
         if let Some((id,)) = existing {
-            sqlx::query(
+            sqlx::query(&crate::sql!(
                 "UPDATE equipment SET total_hours = total_hours + ?, last_used = ? WHERE id = ?",
-            )
+            ))
             .bind(hours_to_add)
             .bind(now)
             .bind(id)
@@ -89,8 +93,8 @@ impl Database {
             .await?;
             Ok(id)
         } else {
-            let result = sqlx::query_as::<_, (i64,)>("INSERT INTO equipment (user_id, name, type, brand, model, total_hours, first_used, last_used, purchased_at)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id")
+            let result = sqlx::query_as::<_, (i64,)>(&crate::sql!("INSERT INTO equipment (user_id, name, type, brand, model, total_hours, first_used, last_used, purchased_at)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id"))
             .bind(user_id).bind(name).bind(equipment_type).bind(brand).bind(model)
             .bind(hours_to_add).bind(now).bind(now).bind(purchased_at).fetch_all(&self.pool).await?;
             result.first().map(|r| r.0).ok_or(sqlx::Error::RowNotFound)
@@ -112,11 +116,11 @@ impl Database {
         if needle.is_empty() {
             return Ok(None);
         }
-        sqlx::query_as(
+        sqlx::query_as(&crate::sql!(
             "SELECT id, name FROM equipment
              WHERE user_id = ? AND (LOWER(TRIM(name)) = ? OR LOWER(TRIM(model)) = ?)
-             ORDER BY (LOWER(TRIM(name)) = ?) DESC, id ASC LIMIT 1",
-        )
+             ORDER BY (LOWER(TRIM(name)) = ?) DESC, id ASC LIMIT 1"
+        ))
         .bind(user_id)
         .bind(&needle)
         .bind(&needle)
@@ -125,7 +129,7 @@ impl Database {
         .await
     }
     pub async fn list_variants(&self, user_id: i64) -> Result<Vec<ChainVariant>, sqlx::Error> {
-        sqlx::query_as::<_, ChainVariantRow>(
+        sqlx::query_as::<_, ChainVariantRow>(&crate::sql!(
             "SELECT v.id, v.user_id, v.chain_id, v.name, v.overrides, v.created_at,
                     CAST(COALESCE((
                         SELECT SUM(sc.duration) FROM scrobbles sc
@@ -135,7 +139,7 @@ impl Database {
                FROM chain_variants v
               WHERE v.user_id = ?
               ORDER BY v.chain_id, v.name",
-        )
+        ))
         .bind(user_id)
         .fetch_all(&self.pool)
         .await
@@ -150,10 +154,10 @@ impl Database {
     ) -> Result<i64, sqlx::Error> {
         let json = serde_json::to_string(overrides).unwrap_or_else(|_| "[]".into());
         let now = chrono::Utc::now().timestamp();
-        let res = sqlx::query_as::<_, (i64,)>(
+        let res = sqlx::query_as::<_, (i64,)>(&crate::sql!(
             "INSERT INTO chain_variants (user_id, chain_id, name, overrides, created_at)
              VALUES (?, ?, ?, ?, ?) RETURNING id",
-        )
+        ))
         .bind(user_id)
         .bind(chain_id)
         .bind(name)
@@ -182,7 +186,8 @@ impl Database {
         }
         let sql =
             format!("UPDATE chain_variants SET {} WHERE user_id = ? AND id = ?", sets.join(", "));
-        let mut q = sqlx::query(&sql);
+        let stmt = crate::sql!(&sql);
+        let mut q = sqlx::query(&stmt);
         if let Some(v) = name {
             q = q.bind(v.to_string());
         }
@@ -201,20 +206,21 @@ impl Database {
     pub async fn delete_variant(&self, user_id: i64, id: i64) -> Result<bool, sqlx::Error> {
         let mut tx = self.pool.begin().await?;
         for table in ["scrobbles", "physical_plays", "physical_releases"] {
-            sqlx::query(&format!(
+            sqlx::query(&crate::sql!(&format!(
                 "UPDATE {table} SET chain_variant_id = NULL
                   WHERE chain_variant_id = ? AND user_id = ?"
-            ))
+            )))
             .bind(id)
             .bind(user_id)
             .execute(&mut *tx)
             .await?;
         }
-        let res = sqlx::query("DELETE FROM chain_variants WHERE user_id = ? AND id = ?")
-            .bind(user_id)
-            .bind(id)
-            .execute(&mut *tx)
-            .await?;
+        let res =
+            sqlx::query(&crate::sql!("DELETE FROM chain_variants WHERE user_id = ? AND id = ?"))
+                .bind(user_id)
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
         tx.commit().await?;
         Ok(res.rows_affected() > 0)
     }
@@ -230,9 +236,9 @@ impl Database {
         variant_id: i64,
         chain_id: i64,
     ) -> Result<bool, sqlx::Error> {
-        let row: Option<(i64,)> = sqlx::query_as(
+        let row: Option<(i64,)> = sqlx::query_as(&crate::sql!(
             "SELECT id FROM chain_variants WHERE id = ? AND user_id = ? AND chain_id = ?",
-        )
+        ))
         .bind(variant_id)
         .bind(user_id)
         .bind(chain_id)
@@ -299,12 +305,13 @@ impl Database {
 
         // Its variants index into components that are about to stop being the
         // base. Refused rather than re-derived.
-        let own: Vec<(i64,)> =
-            sqlx::query_as("SELECT id FROM chain_variants WHERE chain_id = ? AND user_id = ?")
-                .bind(from_chain_id)
-                .bind(user_id)
-                .fetch_all(&self.pool)
-                .await?;
+        let own: Vec<(i64,)> = sqlx::query_as(&crate::sql!(
+            "SELECT id FROM chain_variants WHERE chain_id = ? AND user_id = ?",
+        ))
+        .bind(from_chain_id)
+        .bind(user_id)
+        .fetch_all(&self.pool)
+        .await?;
         if !own.is_empty() {
             return Ok(Err(format!(
                 "\"{}\" has {} variant(s) of its own. Their overrides index into its components, \
@@ -319,10 +326,10 @@ impl Database {
 
         let (variant_id, variant_name, created) = match variant {
             FoldTarget::Existing(id) => {
-                let row: Option<(i64, String)> = sqlx::query_as(
+                let row: Option<(i64, String)> = sqlx::query_as(&crate::sql!(
                     "SELECT id, name FROM chain_variants
-                      WHERE id = ? AND user_id = ? AND chain_id = ?",
-                )
+                      WHERE id = ? AND user_id = ? AND chain_id = ?"
+                ))
                 .bind(id)
                 .bind(user_id)
                 .bind(into_chain_id)
@@ -347,10 +354,10 @@ impl Database {
                 }
                 let overrides = crate::models::derive_overrides(&into.components, &from.components);
                 let json = serde_json::to_string(&overrides).unwrap_or_else(|_| "[]".into());
-                let res = sqlx::query_as::<_, (i64,)>(
+                let res = sqlx::query_as::<_, (i64,)>(&crate::sql!(
                     "INSERT INTO chain_variants (user_id, chain_id, name, overrides, created_at)
                      VALUES (?, ?, ?, ?, ?) RETURNING id",
-                )
+                ))
                 .bind(user_id)
                 .bind(into_chain_id)
                 .bind(name)
@@ -391,10 +398,10 @@ impl Database {
             ("physical_plays", &mut out.sides),
             ("physical_releases", &mut out.releases),
         ] {
-            let res = sqlx::query(&format!(
+            let res = sqlx::query(&crate::sql!(&format!(
                 "UPDATE {table} SET chain_id = ?, chain_variant_id = ?
                   WHERE chain_id = ? AND user_id = ?"
-            ))
+            )))
             .bind(into_chain_id)
             .bind(variant_id)
             .bind(from_chain_id)
@@ -412,9 +419,9 @@ impl Database {
             ("chain_bindings", "chain_id", &mut out.bindings),
             ("tokens", "default_chain_id", &mut out.tokens),
         ] {
-            let res = sqlx::query(&format!(
+            let res = sqlx::query(&crate::sql!(&format!(
                 "UPDATE {table} SET {column} = ? WHERE {column} = ? AND user_id = ?"
-            ))
+            )))
             .bind(into_chain_id)
             .bind(from_chain_id)
             .bind(user_id)
@@ -429,14 +436,16 @@ impl Database {
         for (table, column) in
             [("physical_spins", "chain_id"), ("pairing_requests", "default_chain_id")]
         {
-            sqlx::query(&format!("UPDATE {table} SET {column} = ? WHERE {column} = ?"))
-                .bind(into_chain_id)
-                .bind(from_chain_id)
-                .execute(&mut *tx)
-                .await?;
+            sqlx::query(&crate::sql!(&format!(
+                "UPDATE {table} SET {column} = ? WHERE {column} = ?"
+            )))
+            .bind(into_chain_id)
+            .bind(from_chain_id)
+            .execute(&mut *tx)
+            .await?;
         }
 
-        sqlx::query("DELETE FROM signal_chains WHERE id = ? AND user_id = ?")
+        sqlx::query(&crate::sql!("DELETE FROM signal_chains WHERE id = ? AND user_id = ?"))
             .bind(from_chain_id)
             .bind(user_id)
             .execute(&mut *tx)
@@ -471,22 +480,23 @@ impl Database {
         //
         // Components and overrides need no scan at all, and the hours come from
         // one grouped pass — the shape `equipment_seconds` already uses.
-        let rows: Vec<(i64, String, String)> =
-            sqlx::query_as("SELECT id, name, components FROM signal_chains WHERE user_id = ?")
-                .bind(user_id)
-                .fetch_all(&self.pool)
-                .await?;
-        let variant_rows: Vec<(i64, i64, String, String)> = sqlx::query_as(
-            "SELECT id, chain_id, name, overrides FROM chain_variants WHERE user_id = ?",
-        )
+        let rows: Vec<(i64, String, String)> = sqlx::query_as(&crate::sql!(
+            "SELECT id, name, components FROM signal_chains WHERE user_id = ?",
+        ))
         .bind(user_id)
         .fetch_all(&self.pool)
         .await?;
-        let totals: Vec<(Option<i64>, Option<i64>)> = sqlx::query_as(
+        let variant_rows: Vec<(i64, i64, String, String)> = sqlx::query_as(&crate::sql!(
+            "SELECT id, chain_id, name, overrides FROM chain_variants WHERE user_id = ?",
+        ))
+        .bind(user_id)
+        .fetch_all(&self.pool)
+        .await?;
+        let totals: Vec<(Option<i64>, Option<i64>)> = sqlx::query_as(&crate::sql!(
             "SELECT chain_id, SUM(duration) FROM scrobbles
               WHERE user_id = ? AND skipped = FALSE AND chain_id IS NOT NULL
-              GROUP BY chain_id",
-        )
+              GROUP BY chain_id"
+        ))
         .bind(user_id)
         .fetch_all(&self.pool)
         .await?;
@@ -590,16 +600,18 @@ impl Database {
         user_id: i64,
     ) -> Result<(HashMap<i64, i64>, HashMap<(i64, i64, Option<i64>), i64>), sqlx::Error> {
         // Every chain's own components, and every variant's overrides.
-        let chains: Vec<(i64, String)> =
-            sqlx::query_as("SELECT id, components FROM signal_chains WHERE user_id = ?")
-                .bind(user_id)
-                .fetch_all(&self.pool)
-                .await?;
-        let variants: Vec<(i64, i64, String)> =
-            sqlx::query_as("SELECT id, chain_id, overrides FROM chain_variants WHERE user_id = ?")
-                .bind(user_id)
-                .fetch_all(&self.pool)
-                .await?;
+        let chains: Vec<(i64, String)> = sqlx::query_as(&crate::sql!(
+            "SELECT id, components FROM signal_chains WHERE user_id = ?"
+        ))
+        .bind(user_id)
+        .fetch_all(&self.pool)
+        .await?;
+        let variants: Vec<(i64, i64, String)> = sqlx::query_as(&crate::sql!(
+            "SELECT id, chain_id, overrides FROM chain_variants WHERE user_id = ?",
+        ))
+        .bind(user_id)
+        .fetch_all(&self.pool)
+        .await?;
 
         let base: HashMap<i64, Vec<ChainComponent>> = chains
             .into_iter()
@@ -612,12 +624,12 @@ impl Database {
             })
             .collect();
 
-        let grouped: Vec<(Option<i64>, Option<i64>, Option<i64>)> = sqlx::query_as(
+        let grouped: Vec<(Option<i64>, Option<i64>, Option<i64>)> = sqlx::query_as(&crate::sql!(
             "SELECT chain_id, chain_variant_id, SUM(duration)
                FROM scrobbles
               WHERE user_id = ? AND skipped = FALSE AND chain_id IS NOT NULL
-              GROUP BY chain_id, chain_variant_id",
-        )
+              GROUP BY chain_id, chain_variant_id"
+        ))
         .bind(user_id)
         .fetch_all(&self.pool)
         .await?;
@@ -684,13 +696,13 @@ impl Database {
     }
     pub async fn get_equipment(&self, user_id: i64) -> Result<Vec<EquipmentRow>, sqlx::Error> {
         let (seconds, split) = self.equipment_seconds(user_id).await?;
-        let mut rows: Vec<EquipmentRow> = sqlx::query_as(
+        let mut rows: Vec<EquipmentRow> = sqlx::query_as(&crate::sql!(
             "SELECT e.id, e.user_id, e.name, e.type, e.brand, e.model,
                     0.0 AS total_hours,
                     e.first_used, e.last_used, e.notes, e.purchased_at, e.status
                FROM equipment e
-              WHERE e.user_id = ?",
-        )
+              WHERE e.user_id = ?"
+        ))
         .bind(user_id)
         .fetch_all(&self.pool)
         .await?;
@@ -698,14 +710,14 @@ impl Database {
         // Names for the breakdown, so a source reads "Commute Phone / Summer"
         // rather than a pair of ids. Two small tables, fetched once.
         let chain_names: HashMap<i64, String> =
-            sqlx::query_as("SELECT id, name FROM signal_chains WHERE user_id = ?")
+            sqlx::query_as(&crate::sql!("SELECT id, name FROM signal_chains WHERE user_id = ?"))
                 .bind(user_id)
                 .fetch_all(&self.pool)
                 .await?
                 .into_iter()
                 .collect();
         let variant_names: HashMap<i64, String> =
-            sqlx::query_as("SELECT id, name FROM chain_variants WHERE user_id = ?")
+            sqlx::query_as(&crate::sql!("SELECT id, name FROM chain_variants WHERE user_id = ?"))
                 .bind(user_id)
                 .fetch_all(&self.pool)
                 .await?
@@ -760,11 +772,11 @@ impl Database {
         purchased_at: Option<i64>,
         status: Option<&str>,
     ) -> Result<bool, sqlx::Error> {
-        let res = sqlx::query(
+        let res = sqlx::query(&crate::sql!(
             "UPDATE equipment SET name = ?, type = ?, brand = ?, model = ?, notes = ?,
                     purchased_at = ?, status = ?
               WHERE id = ? AND user_id = ?",
-        )
+        ))
         .bind(name)
         .bind(equipment_type)
         .bind(brand)
@@ -779,7 +791,7 @@ impl Database {
         Ok(res.rows_affected() > 0)
     }
     pub async fn delete_equipment(&self, user_id: i64, id: i64) -> Result<bool, sqlx::Error> {
-        let res = sqlx::query("DELETE FROM equipment WHERE id = ? AND user_id = ?")
+        let res = sqlx::query(&crate::sql!("DELETE FROM equipment WHERE id = ? AND user_id = ?"))
             .bind(id)
             .bind(user_id)
             .execute(&self.pool)
@@ -803,19 +815,17 @@ impl Database {
         // per app is how these are organised, so "fooyin stopped, Pano started"
         // is a different setup even if it happened a minute later. A browser
         // submission carries no token and is treated as its own bucket.
-        let recent: Option<(i64, i64, Option<i64>)> = sqlx::query_as(
-            "SELECT id, ended_at, token_id FROM sessions WHERE user_id = ? AND ended_at >= ? - ? ORDER BY ended_at DESC LIMIT 1"
-        ).bind(user_id).bind(timestamp).bind(session_gap_seconds).fetch_optional(&self.pool).await?;
+        let recent: Option<(i64, i64, Option<i64>)> = sqlx::query_as(&crate::sql!("SELECT id, ended_at, token_id FROM sessions WHERE user_id = ? AND ended_at >= ? - ? ORDER BY ended_at DESC LIMIT 1")).bind(user_id).bind(timestamp).bind(session_gap_seconds).fetch_optional(&self.pool).await?;
         let ended_at = timestamp + duration_secs;
         let recent = recent.filter(|(_, _, prev_token)| *prev_token == token_id);
         if let Some((session_id, _, _)) = recent {
-            sqlx::query(
+            sqlx::query(&crate::sql!(
                 "UPDATE sessions SET ended_at = MAX(ended_at, ?), track_count = track_count + 1,
                     total_duration = total_duration + ?,
                     avg_quality_score = CASE WHEN ? IS NOT NULL THEN
                         (COALESCE(avg_quality_score, 0) * track_count + ?) / (track_count + 1)
                     ELSE avg_quality_score END WHERE id = ?",
-            )
+            ))
             .bind(ended_at)
             .bind(duration_secs)
             .bind(quality_score)
@@ -825,12 +835,12 @@ impl Database {
             .await?;
             Ok(session_id)
         } else {
-            let result = sqlx::query_as::<_, (i64,)>(
+            let result = sqlx::query_as::<_, (i64,)>(&crate::sql!(
                 "INSERT INTO sessions (user_id, device_id, chain_id, started_at, ended_at,
                     track_count, total_duration, avg_quality_score, listening_context, token_id,
                     uuid, updated_at)
                  VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?) RETURNING id",
-            )
+            ))
             .bind(user_id)
             .bind(device_id)
             .bind(chain_id)

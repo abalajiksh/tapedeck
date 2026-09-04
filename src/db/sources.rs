@@ -11,11 +11,11 @@ impl Database {
     /// registry against each tick. Credentials come back decrypted; a row we
     /// can't decrypt is dropped rather than failing the whole tick.
     pub async fn list_enabled_sources(&self) -> Result<Vec<UserSource>, sqlx::Error> {
-        let rows: Vec<UserSourceRow> = sqlx::query_as(
+        let rows: Vec<UserSourceRow> = sqlx::query_as(&crate::sql!(
             "SELECT id, user_id, kind, label, enabled, url, credentials, remote_account,
                     poll_interval_secs, options, last_polled_at, last_error, updated_at
              FROM user_sources WHERE enabled = 1 ORDER BY user_id, kind",
-        )
+        ))
         .fetch_all(&self.pool)
         .await?;
         Ok(rows.into_iter().filter_map(|r| self.hydrate_source(r)).collect())
@@ -26,11 +26,11 @@ impl Database {
         &self,
         user_id: i64,
     ) -> Result<Vec<UserSource>, sqlx::Error> {
-        let rows: Vec<UserSourceRow> = sqlx::query_as(
+        let rows: Vec<UserSourceRow> = sqlx::query_as(&crate::sql!(
             "SELECT id, user_id, kind, label, enabled, url, credentials, remote_account,
                     poll_interval_secs, options, last_polled_at, last_error, updated_at
              FROM user_sources WHERE user_id = ? ORDER BY kind",
-        )
+        ))
         .bind(user_id)
         .fetch_all(&self.pool)
         .await?;
@@ -49,13 +49,13 @@ impl Database {
     /// the reading was missing. On 2026-08-24 "Plex last polled 78 minutes ago"
     /// against a 5-second interval was true all day and visible nowhere.
     pub async fn source_health(&self) -> Result<Vec<SourceHealth>, sqlx::Error> {
-        sqlx::query_as(
+        sqlx::query_as(&crate::sql!(
             "SELECT s.id, s.user_id, COALESCE(u.username, '') AS username, s.kind, s.label,
                     s.enabled, s.poll_interval_secs, s.last_polled_at, s.last_error
              FROM user_sources s
              LEFT JOIN users u ON u.id = s.user_id
              ORDER BY s.user_id, s.kind",
-        )
+        ))
         .fetch_all(&self.pool)
         .await
     }
@@ -66,11 +66,11 @@ impl Database {
         user_id: i64,
         id: i64,
     ) -> Result<Option<UserSource>, sqlx::Error> {
-        let row: Option<UserSourceRow> = sqlx::query_as(
+        let row: Option<UserSourceRow> = sqlx::query_as(&crate::sql!(
             "SELECT id, user_id, kind, label, enabled, url, credentials, remote_account,
                     poll_interval_secs, options, last_polled_at, last_error, updated_at
              FROM user_sources WHERE user_id = ? AND id = ?",
-        )
+        ))
         .bind(user_id)
         .bind(id)
         .fetch_optional(&self.pool)
@@ -112,12 +112,12 @@ impl Database {
         options: &str,
     ) -> Result<i64, sqlx::Error> {
         let sealed = if credentials.is_empty() { String::new() } else { self.seal(credentials) };
-        let res = sqlx::query_as::<_, (i64,)>(
+        let res = sqlx::query_as::<_, (i64,)>(&crate::sql!(
             "INSERT INTO user_sources
                 (user_id, kind, label, enabled, url, credentials, remote_account,
                  poll_interval_secs, options, updated_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
-        )
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id"
+        ))
         .bind(user_id)
         .bind(kind)
         .bind(label)
@@ -146,12 +146,12 @@ impl Database {
         options: &str,
     ) -> Result<bool, sqlx::Error> {
         let sealed = if credentials.is_empty() { String::new() } else { self.seal(credentials) };
-        let res = sqlx::query(
+        let res = sqlx::query(&crate::sql!(
             "UPDATE user_sources SET
                 label = ?, enabled = ?, url = ?, credentials = ?, remote_account = ?,
                 poll_interval_secs = ?, options = ?, updated_at = ?
-             WHERE id = ? AND user_id = ?",
-        )
+             WHERE id = ? AND user_id = ?"
+        ))
         .bind(label)
         .bind(enabled)
         .bind(url)
@@ -167,11 +167,12 @@ impl Database {
         Ok(res.rows_affected() > 0)
     }
     pub async fn delete_source(&self, user_id: i64, id: i64) -> Result<bool, sqlx::Error> {
-        let res = sqlx::query("DELETE FROM user_sources WHERE user_id = ? AND id = ?")
-            .bind(user_id)
-            .bind(id)
-            .execute(&self.pool)
-            .await?;
+        let res =
+            sqlx::query(&crate::sql!("DELETE FROM user_sources WHERE user_id = ? AND id = ?"))
+                .bind(user_id)
+                .bind(id)
+                .execute(&self.pool)
+                .await?;
         Ok(res.rows_affected() > 0)
     }
     /// Record the outcome of a poll. Deliberately does *not* touch
@@ -182,12 +183,14 @@ impl Database {
         id: i64,
         error: Option<&str>,
     ) -> Result<(), sqlx::Error> {
-        sqlx::query("UPDATE user_sources SET last_polled_at = ?, last_error = ? WHERE id = ?")
-            .bind(Self::now_secs())
-            .bind(error)
-            .bind(id)
-            .execute(&self.pool)
-            .await?;
+        sqlx::query(&crate::sql!(
+            "UPDATE user_sources SET last_polled_at = ?, last_error = ? WHERE id = ?",
+        ))
+        .bind(Self::now_secs())
+        .bind(error)
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
         Ok(())
     }
     /// Merge one key into a source's sealed credential blob, leaving the rest
@@ -211,7 +214,7 @@ impl Database {
         value: &str,
     ) -> Result<(), sqlx::Error> {
         let stored: Option<String> =
-            sqlx::query_scalar("SELECT credentials FROM user_sources WHERE id = ?")
+            sqlx::query_scalar(&crate::sql!("SELECT credentials FROM user_sources WHERE id = ?"))
                 .bind(id)
                 .fetch_optional(&self.pool)
                 .await?
@@ -235,7 +238,7 @@ impl Database {
                 "refusing to store an unencryptable credential".into(),
             ));
         }
-        sqlx::query("UPDATE user_sources SET credentials = ? WHERE id = ?")
+        sqlx::query(&crate::sql!("UPDATE user_sources SET credentials = ? WHERE id = ?"))
             .bind(sealed)
             .bind(id)
             .execute(&self.pool)
@@ -244,18 +247,18 @@ impl Database {
     }
     /// The stored Plex config, or `None` before first-run seeding.
     pub async fn get_plex_settings(&self) -> Result<Option<PlexSettings>, sqlx::Error> {
-        sqlx::query_as(
+        sqlx::query_as(&crate::sql!(
             "SELECT enabled, url, token, users_allow, users_block, devices_allow,
                     devices_block, libraries_allow, libraries_block, updated_at
-             FROM plex_settings WHERE id = 1",
-        )
+             FROM plex_settings WHERE id = 1"
+        ))
         .fetch_optional(&self.pool)
         .await
     }
     /// Write the single settings row. `updated_at` doubles as the change stamp
     /// the engine watches to decide when to rebuild its Plex source.
     pub async fn save_plex_settings(&self, s: &PlexSettings) -> Result<(), sqlx::Error> {
-        sqlx::query(
+        sqlx::query(&crate::sql!(
             "INSERT INTO plex_settings
                 (id, enabled, url, token, users_allow, users_block, devices_allow,
                  devices_block, libraries_allow, libraries_block, updated_at)
@@ -265,8 +268,8 @@ impl Database {
                 users_allow=excluded.users_allow, users_block=excluded.users_block,
                 devices_allow=excluded.devices_allow, devices_block=excluded.devices_block,
                 libraries_allow=excluded.libraries_allow, libraries_block=excluded.libraries_block,
-                updated_at=excluded.updated_at",
-        )
+                updated_at=excluded.updated_at"
+        ))
         .bind(s.enabled)
         .bind(&s.url)
         .bind(&s.token)
@@ -285,10 +288,8 @@ impl Database {
     /// start (not just completion) means an interrupted import leaves a durable
     /// record instead of a job that vanishes with the process.
     pub async fn create_import_job(&self, user_id: i64, source: &str) -> Result<i64, sqlx::Error> {
-        let res = sqlx::query_as::<_, (i64,)>(
-            "INSERT INTO import_jobs (user_id, source, state, fetched, imported, status, created_at)
-             VALUES (?, ?, 'running', 0, 0, 'started', ?) RETURNING id"
-        ).bind(user_id).bind(source).bind(Self::now_secs()).fetch_all(&self.pool).await?;
+        let res = sqlx::query_as::<_, (i64,)>(&crate::sql!("INSERT INTO import_jobs (user_id, source, state, fetched, imported, status, created_at)
+             VALUES (?, ?, 'running', 0, 0, 'started', ?) RETURNING id")).bind(user_id).bind(source).bind(Self::now_secs()).fetch_all(&self.pool).await?;
         res.first().map(|r| r.0).ok_or(sqlx::Error::RowNotFound)
     }
     /// Update a job to its final state on completion.
@@ -300,9 +301,9 @@ impl Database {
         imported: i64,
         status: &str,
     ) -> Result<(), sqlx::Error> {
-        sqlx::query(
+        sqlx::query(&crate::sql!(
             "UPDATE import_jobs SET state = ?, fetched = ?, imported = ?, status = ? WHERE id = ?",
-        )
+        ))
         .bind(state)
         .bind(fetched)
         .bind(imported)
@@ -315,15 +316,13 @@ impl Database {
     /// On startup, any import still marked `running` died with the previous
     /// process — mark it interrupted so history is accurate and nothing lingers.
     pub async fn mark_running_imports_interrupted(&self) -> Result<u64, sqlx::Error> {
-        let res = sqlx::query(
-            "UPDATE import_jobs SET state = 'interrupted', status = 'interrupted by shutdown' WHERE state = 'running'"
-        ).execute(&self.pool).await?;
+        let res = sqlx::query(&crate::sql!("UPDATE import_jobs SET state = 'interrupted', status = 'interrupted by shutdown' WHERE state = 'running'")).execute(&self.pool).await?;
         Ok(res.rows_affected())
     }
     pub async fn list_imports(&self, user_id: i64) -> Result<Vec<ImportHistoryRow>, sqlx::Error> {
-        sqlx::query_as(
+        sqlx::query_as(&crate::sql!(
             "SELECT * FROM import_jobs WHERE user_id = ? ORDER BY created_at DESC LIMIT 50",
-        )
+        ))
         .bind(user_id)
         .fetch_all(&self.pool)
         .await
@@ -364,7 +363,8 @@ impl Database {
         let sql = format!(
             "UPDATE scrobbles SET company = ? WHERE user_id = ? AND id IN ({placeholders})"
         );
-        let mut q = sqlx::query(&sql).bind(company).bind(user_id);
+        let stmt = crate::sql!(&sql);
+        let mut q = sqlx::query(&stmt).bind(company).bind(user_id);
         for id in ids {
             q = q.bind(id);
         }
@@ -384,7 +384,8 @@ impl Database {
         let sql = format!(
             "UPDATE scrobbles SET chain_id = ?, chain_variant_id = ? WHERE user_id = ? AND id IN ({placeholders})"
         );
-        let mut q = sqlx::query(&sql).bind(chain_id).bind(variant_id).bind(user_id);
+        let stmt = crate::sql!(&sql);
+        let mut q = sqlx::query(&stmt).bind(chain_id).bind(variant_id).bind(user_id);
         for id in ids {
             q = q.bind(id);
         }

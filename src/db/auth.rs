@@ -24,10 +24,11 @@ impl Database {
     }
     /// Returns true if no user has a real password (first-run or pre-auth upgrade).
     pub async fn needs_setup(&self) -> Result<bool, sqlx::Error> {
-        let count: (i64,) =
-            sqlx::query_as("SELECT COUNT(*) FROM users WHERE password_hash != 'not-used-yet'")
-                .fetch_one(&self.pool)
-                .await?;
+        let count: (i64,) = sqlx::query_as(&crate::sql!(
+            "SELECT COUNT(*) FROM users WHERE password_hash != 'not-used-yet'",
+        ))
+        .fetch_one(&self.pool)
+        .await?;
         Ok(count.0 == 0)
     }
     /// Verify username + password, return user info if valid.
@@ -36,9 +37,7 @@ impl Database {
         username: &str,
         password: &str,
     ) -> Result<Option<AuthUser>, sqlx::Error> {
-        let row: Option<(i64, String, String, String)> = sqlx::query_as(
-            "SELECT id, username, password_hash, role FROM users WHERE username = ? AND disabled = 0"
-        ).bind(username).fetch_optional(&self.pool).await?;
+        let row: Option<(i64, String, String, String)> = sqlx::query_as(&crate::sql!("SELECT id, username, password_hash, role FROM users WHERE username = ? AND disabled = 0")).bind(username).fetch_optional(&self.pool).await?;
 
         if let Some((user_id, uname, hash, role)) = row {
             if Self::verify_password(password, &hash) {
@@ -54,7 +53,7 @@ impl Database {
         username: &str,
     ) -> Result<Option<i64>, sqlx::Error> {
         let row: Option<(i64,)> =
-            sqlx::query_as("SELECT id FROM users WHERE LOWER(username) = LOWER(?)")
+            sqlx::query_as(&crate::sql!("SELECT id FROM users WHERE LOWER(username) = LOWER(?)"))
                 .bind(username)
                 .fetch_optional(&self.pool)
                 .await?;
@@ -75,13 +74,13 @@ impl Database {
         &self,
         username: &str,
     ) -> Result<Option<(i64, Option<String>, PublicNpFields)>, sqlx::Error> {
-        let row: Option<(i64, Option<String>, Option<String>)> = sqlx::query_as(
+        let row: Option<(i64, Option<String>, Option<String>)> = sqlx::query_as(&crate::sql!(
             "SELECT id, display_name, public_np_fields
                FROM users
               WHERE LOWER(username) = LOWER(?)
                 AND public_now_playing = 1
-                AND disabled = 0",
-        )
+                AND disabled = 0"
+        ))
         .bind(username)
         .fetch_optional(&self.pool)
         .await?;
@@ -92,11 +91,12 @@ impl Database {
         &self,
         user_id: i64,
     ) -> Result<(bool, PublicNpFields), sqlx::Error> {
-        let row: Option<(i64, Option<String>)> =
-            sqlx::query_as("SELECT public_now_playing, public_np_fields FROM users WHERE id = ?")
-                .bind(user_id)
-                .fetch_optional(&self.pool)
-                .await?;
+        let row: Option<(i64, Option<String>)> = sqlx::query_as(&crate::sql!(
+            "SELECT public_now_playing, public_np_fields FROM users WHERE id = ?",
+        ))
+        .bind(user_id)
+        .fetch_optional(&self.pool)
+        .await?;
         Ok(match row {
             Some((on, fields)) => (on != 0, PublicNpFields::from_json(fields.as_deref())),
             None => (false, PublicNpFields::default()),
@@ -111,12 +111,14 @@ impl Database {
         enabled: bool,
         fields: PublicNpFields,
     ) -> Result<(), sqlx::Error> {
-        sqlx::query("UPDATE users SET public_now_playing = ?, public_np_fields = ? WHERE id = ?")
-            .bind(i64::from(enabled))
-            .bind(fields.to_json())
-            .bind(user_id)
-            .execute(&self.pool)
-            .await?;
+        sqlx::query(&crate::sql!(
+            "UPDATE users SET public_now_playing = ?, public_np_fields = ? WHERE id = ?",
+        ))
+        .bind(i64::from(enabled))
+        .bind(fields.to_json())
+        .bind(user_id)
+        .execute(&self.pool)
+        .await?;
         Ok(())
     }
     /// Update the password for user_id=1 during setup.
@@ -130,9 +132,7 @@ impl Database {
 
         if has_users {
             // Update existing user_id=1
-            sqlx::query(
-                "UPDATE users SET username = ?, display_name = ?, password_hash = ?, role = 'admin' WHERE id = 1"
-            )
+            sqlx::query(&crate::sql!("UPDATE users SET username = ?, display_name = ?, password_hash = ?, role = 'admin' WHERE id = 1"))
             .bind(username).bind(display_name).bind(password_hash)
             .execute(&self.pool).await?;
             Ok(1)
@@ -153,10 +153,8 @@ impl Database {
         let now = Self::now_secs();
         let expires_at = now + 7 * 86400; // 7 days
 
-        sqlx::query(
-            "INSERT INTO web_sessions (user_id, session_hash, created_at, expires_at, last_active_at)
-             VALUES (?, ?, ?, ?, ?)"
-        )
+        sqlx::query(&crate::sql!("INSERT INTO web_sessions (user_id, session_hash, created_at, expires_at, last_active_at)
+             VALUES (?, ?, ?, ?, ?)"))
         .bind(user_id).bind(&session_hash).bind(now).bind(expires_at).bind(now)
         .execute(&self.pool).await?;
 
@@ -171,11 +169,11 @@ impl Database {
 
         // The stamp comes back with the row it lives on, so deciding whether
         // to write costs nothing.
-        let row: Option<(i64, i64, String, String, i64)> = sqlx::query_as(
+        let row: Option<(i64, i64, String, String, i64)> = sqlx::query_as(&crate::sql!(
             "SELECT ws.id, u.id, u.username, u.role, ws.last_active_at FROM web_sessions ws
              JOIN users u ON ws.user_id = u.id
              WHERE ws.session_hash = ? AND ws.expires_at > ? AND u.disabled = 0",
-        )
+        ))
         .bind(&session_hash)
         .bind(now)
         .fetch_optional(&self.pool)
@@ -186,11 +184,13 @@ impl Database {
             // that matches no rows still opens a write transaction, so the only
             // way not to pay for it is not to issue it.
             if now - last_active >= Self::ACTIVITY_STAMP_INTERVAL_SECS {
-                let _ = sqlx::query("UPDATE web_sessions SET last_active_at = ? WHERE id = ?")
-                    .bind(now)
-                    .bind(session_id)
-                    .execute(&self.pool)
-                    .await;
+                let _ = sqlx::query(&crate::sql!(
+                    "UPDATE web_sessions SET last_active_at = ? WHERE id = ?"
+                ))
+                .bind(now)
+                .bind(session_id)
+                .execute(&self.pool)
+                .await;
             }
             Ok(Some(AuthUser { user_id, username, is_admin: role == "admin" }))
         } else {
@@ -200,7 +200,7 @@ impl Database {
     /// Delete a session by its raw token (logout).
     pub async fn delete_web_session(&self, session_token: &str) -> Result<(), sqlx::Error> {
         let session_hash = Self::hash_session(session_token);
-        sqlx::query("DELETE FROM web_sessions WHERE session_hash = ?")
+        sqlx::query(&crate::sql!("DELETE FROM web_sessions WHERE session_hash = ?"))
             .bind(&session_hash)
             .execute(&self.pool)
             .await?;

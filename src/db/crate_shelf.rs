@@ -20,11 +20,11 @@ impl Database {
         connection_id: Option<i64>,
     ) -> Result<(i64, bool), sqlx::Error> {
         let now = Self::now_secs();
-        let existing: Option<(i64,)> = sqlx::query_as(
+        let existing: Option<(i64,)> = sqlx::query_as(&crate::sql!(
             "SELECT id FROM recommendations
              WHERE user_id = ? AND kind = ? AND LOWER(TRIM(artist)) = ?
-               AND LOWER(TRIM(COALESCE(name,''))) = ?",
-        )
+               AND LOWER(TRIM(COALESCE(name,''))) = ?"
+        ))
         .bind(user_id)
         .bind(&rec.kind)
         .bind(Self::artist_key(&rec.artist))
@@ -33,11 +33,11 @@ impl Database {
         .await?;
 
         if let Some((id,)) = existing {
-            sqlx::query(
+            sqlx::query(&crate::sql!(
                 "UPDATE recommendations SET reason = ?, because = ?, origin = ?,
                         connection_id = ?, mbid = COALESCE(?, mbid)
-                 WHERE id = ?",
-            )
+                 WHERE id = ?"
+            ))
             .bind(&rec.reason)
             .bind(&rec.because)
             .bind(origin)
@@ -51,12 +51,12 @@ impl Database {
 
         // `fetch_all` — see `create_mcp_connection`. `fetch_one` here would
         // leave the row invisible to the next read on another pool connection.
-        let row: Vec<(i64,)> = sqlx::query_as(
+        let row: Vec<(i64,)> = sqlx::query_as(&crate::sql!(
             "INSERT INTO recommendations
                 (user_id, kind, artist, name, mbid, reason, because, origin,
                  connection_id, created_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
-        )
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id"
+        ))
         .bind(user_id)
         .bind(&rec.kind)
         .bind(&rec.artist)
@@ -81,12 +81,12 @@ impl Database {
     /// as an `IN` filter, so the history is walked once and returns only rows
     /// that could possibly match.
     pub async fn list_crate(&self, user_id: i64) -> Result<Vec<CrateEntry>, sqlx::Error> {
-        let rows: Vec<RecommendationRow> = sqlx::query_as(
+        let rows: Vec<RecommendationRow> = sqlx::query_as(&crate::sql!(
             "SELECT r.id, r.kind, r.artist, r.name, r.mbid, r.reason, r.because,
                     r.origin, r.status, r.created_at, r.acted_at
              FROM recommendations r
              WHERE r.user_id = ? ORDER BY r.created_at DESC",
-        )
+        ))
         .bind(user_id)
         .fetch_all(&self.pool)
         .await?;
@@ -112,7 +112,8 @@ impl Database {
              WHERE user_id = ? AND skipped = FALSE AND LOWER(TRIM(artist)) IN ({placeholders})
              GROUP BY ak, bk, tk"
         );
-        let mut q = sqlx::query_as::<_, (String, String, String, i64, i64)>(&sql).bind(user_id);
+        let stmt = crate::sql!(&sql);
+        let mut q = sqlx::query_as::<_, (String, String, String, i64, i64)>(&stmt).bind(user_id);
         for k in &keys {
             q = q.bind(k);
         }
@@ -170,7 +171,8 @@ impl Database {
                   AND LOWER(TRIM(artist)) = ?"
             }
         };
-        let mut q = sqlx::query_as::<_, (i64,)>(sql).bind(user_id).bind(&ak);
+        let stmt = crate::sql!(sql);
+        let mut q = sqlx::query_as::<_, (i64,)>(&stmt).bind(user_id).bind(&ak);
         if kind == "album" || kind == "track" {
             q = q.bind(&nk);
         }
@@ -182,9 +184,9 @@ impl Database {
         id: i64,
         status: &str,
     ) -> Result<bool, sqlx::Error> {
-        let res = sqlx::query(
+        let res = sqlx::query(&crate::sql!(
             "UPDATE recommendations SET status = ?, acted_at = ? WHERE id = ? AND user_id = ?",
-        )
+        ))
         .bind(status)
         .bind(Self::now_secs())
         .bind(id)
@@ -194,11 +196,12 @@ impl Database {
         Ok(res.rows_affected() > 0)
     }
     pub async fn delete_recommendation(&self, user_id: i64, id: i64) -> Result<bool, sqlx::Error> {
-        let res = sqlx::query("DELETE FROM recommendations WHERE id = ? AND user_id = ?")
-            .bind(id)
-            .bind(user_id)
-            .execute(&self.pool)
-            .await?;
+        let res =
+            sqlx::query(&crate::sql!("DELETE FROM recommendations WHERE id = ? AND user_id = ?"))
+                .bind(id)
+                .bind(user_id)
+                .execute(&self.pool)
+                .await?;
         Ok(res.rows_affected() > 0)
     }
     /// Save a playlist, replacing one with the same idempotency key.
@@ -221,39 +224,41 @@ impl Database {
 
         let existing: Option<(i64,)> = match idempotency_key {
             Some(key) => {
-                sqlx::query_as("SELECT id FROM playlists WHERE user_id = ? AND idempotency_key = ?")
-                    .bind(user_id)
-                    .bind(key)
-                    .fetch_optional(&mut *tx)
-                    .await?
+                sqlx::query_as(&crate::sql!(
+                    "SELECT id FROM playlists WHERE user_id = ? AND idempotency_key = ?",
+                ))
+                .bind(user_id)
+                .bind(key)
+                .fetch_optional(&mut *tx)
+                .await?
             }
             None => None,
         };
 
         let (id, replaced) = match existing {
             Some((id,)) => {
-                sqlx::query(
+                sqlx::query(&crate::sql!(
                     "UPDATE playlists SET name = ?, description = ?, updated_at = ? WHERE id = ?",
-                )
+                ))
                 .bind(name)
                 .bind(description)
                 .bind(now)
                 .bind(id)
                 .execute(&mut *tx)
                 .await?;
-                sqlx::query("DELETE FROM playlist_tracks WHERE playlist_id = ?")
+                sqlx::query(&crate::sql!("DELETE FROM playlist_tracks WHERE playlist_id = ?"))
                     .bind(id)
                     .execute(&mut *tx)
                     .await?;
                 (id, true)
             }
             None => {
-                let row: (i64,) = sqlx::query_as(
+                let row: (i64,) = sqlx::query_as(&crate::sql!(
                     "INSERT INTO playlists
                         (user_id, name, description, origin, connection_id, idempotency_key,
                          created_at, updated_at)
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
-                )
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?) RETURNING id"
+                ))
                 .bind(user_id)
                 .bind(name)
                 .bind(description)
@@ -269,10 +274,10 @@ impl Database {
         };
 
         for (i, t) in tracks.iter().enumerate() {
-            sqlx::query(
+            sqlx::query(&crate::sql!(
                 "INSERT INTO playlist_tracks (playlist_id, position, title, artist, album, note)
                  VALUES (?, ?, ?, ?, ?, ?)",
-            )
+            ))
             .bind(id)
             .bind(i as i64)
             .bind(&t.title)
@@ -290,13 +295,13 @@ impl Database {
         &self,
         user_id: i64,
     ) -> Result<Vec<SavedPlaylistRecord>, sqlx::Error> {
-        sqlx::query_as(
+        sqlx::query_as(&crate::sql!(
             "SELECT p.id, p.name, p.description, p.origin, p.created_at, p.updated_at,
                     p.pushed_at, p.pushed_to, c.name AS connection_name,
                     (SELECT COUNT(*) FROM playlist_tracks t WHERE t.playlist_id = p.id) AS tracks
              FROM playlists p LEFT JOIN mcp_connections c ON c.id = p.connection_id
              WHERE p.user_id = ? ORDER BY p.updated_at DESC",
-        )
+        ))
         .bind(user_id)
         .fetch_all(&self.pool)
         .await
@@ -306,11 +311,11 @@ impl Database {
         user_id: i64,
         playlist_id: i64,
     ) -> Result<Vec<SavedPlaylistTrack>, sqlx::Error> {
-        sqlx::query_as(
+        sqlx::query_as(&crate::sql!(
             "SELECT t.title, t.artist, t.album, t.note
              FROM playlist_tracks t JOIN playlists p ON p.id = t.playlist_id
-             WHERE t.playlist_id = ? AND p.user_id = ? ORDER BY t.position ASC",
-        )
+             WHERE t.playlist_id = ? AND p.user_id = ? ORDER BY t.position ASC"
+        ))
         .bind(playlist_id)
         .bind(user_id)
         .fetch_all(&self.pool)
@@ -357,7 +362,8 @@ impl Database {
              WHERE user_id = ? AND skipped = FALSE AND LOWER(TRIM(artist)) IN ({placeholders})
              GROUP BY ak, tk"
         );
-        let mut q = sqlx::query_as::<_, (String, String, i64, Option<String>)>(&sql).bind(user_id);
+        let stmt = crate::sql!(&sql);
+        let mut q = sqlx::query_as::<_, (String, String, i64, Option<String>)>(&stmt).bind(user_id);
         for k in &keys {
             q = q.bind(k);
         }
@@ -387,15 +393,15 @@ impl Database {
         let mut tx = self.pool.begin().await?;
         // Tracks reference the playlist and foreign keys are on, so they go
         // first — the same rule `delete_chain` follows.
-        sqlx::query(
+        sqlx::query(&crate::sql!(
             "DELETE FROM playlist_tracks WHERE playlist_id IN
-                (SELECT id FROM playlists WHERE id = ? AND user_id = ?)",
-        )
+                (SELECT id FROM playlists WHERE id = ? AND user_id = ?)"
+        ))
         .bind(id)
         .bind(user_id)
         .execute(&mut *tx)
         .await?;
-        let res = sqlx::query("DELETE FROM playlists WHERE id = ? AND user_id = ?")
+        let res = sqlx::query(&crate::sql!("DELETE FROM playlists WHERE id = ? AND user_id = ?"))
             .bind(id)
             .bind(user_id)
             .execute(&mut *tx)
@@ -409,9 +415,9 @@ impl Database {
         id: i64,
         target: &str,
     ) -> Result<(), sqlx::Error> {
-        sqlx::query(
+        sqlx::query(&crate::sql!(
             "UPDATE playlists SET pushed_at = ?, pushed_to = ? WHERE id = ? AND user_id = ?",
-        )
+        ))
         .bind(Self::now_secs())
         .bind(target)
         .bind(id)

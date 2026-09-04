@@ -14,7 +14,7 @@ impl Database {
         artist: &str,
         album: &str,
     ) -> Result<Option<AlbumSummary>, sqlx::Error> {
-        let row: Option<AlbumSummary> = sqlx::query_as(
+        let row: Option<AlbumSummary> = sqlx::query_as(&crate::sql!(
             "SELECT COUNT(*) AS plays,
                     COALESCE(SUM(duration), 0) AS seconds,
                     COUNT(DISTINCT LOWER(TRIM(title))) AS track_count,
@@ -23,8 +23,8 @@ impl Database {
                     MAX(release_year) AS year
              FROM scrobbles
              WHERE user_id = ? AND skipped = FALSE
-               AND LOWER(TRIM(artist)) = ? AND LOWER(TRIM(album)) = ?",
-        )
+               AND LOWER(TRIM(artist)) = ? AND LOWER(TRIM(album)) = ?"
+        ))
         .bind(user_id)
         .bind(artist.trim().to_lowercase())
         .bind(album.trim().to_lowercase())
@@ -50,15 +50,15 @@ impl Database {
         artist: &str,
         album: &str,
     ) -> Result<Vec<(String, i64, Option<i64>, Option<i64>)>, sqlx::Error> {
-        sqlx::query_as(
+        sqlx::query_as(&crate::sql!(
             "SELECT title, COUNT(*) AS plays, MAX(duration) AS duration,
                     MIN(track_number) AS track_number
                FROM scrobbles
               WHERE user_id = ? AND skipped = FALSE
                 AND LOWER(TRIM(artist)) = ? AND LOWER(TRIM(COALESCE(album, ''))) = ?
               GROUP BY LOWER(TRIM(title))
-              ORDER BY track_number IS NULL, track_number ASC, LOWER(TRIM(title)) ASC",
-        )
+              ORDER BY track_number IS NULL, track_number ASC, LOWER(TRIM(title)) ASC"
+        ))
         .bind(user_id)
         .bind(artist.trim().to_lowercase())
         .bind(album.trim().to_lowercase())
@@ -72,11 +72,11 @@ impl Database {
         artist: &str,
         title: &str,
     ) -> Result<i64, sqlx::Error> {
-        let row: (i64,) = sqlx::query_as(
+        let row: (i64,) = sqlx::query_as(&crate::sql!(
             "SELECT COUNT(*) FROM scrobbles
               WHERE user_id = ? AND skipped = FALSE
-                AND LOWER(TRIM(artist)) = ? AND LOWER(TRIM(title)) = ?",
-        )
+                AND LOWER(TRIM(artist)) = ? AND LOWER(TRIM(title)) = ?"
+        ))
         .bind(user_id)
         .bind(artist.trim().to_lowercase())
         .bind(title.trim().to_lowercase())
@@ -95,7 +95,7 @@ impl Database {
         artist: &str,
         album: &str,
     ) -> Result<Vec<TrackAggregate>, sqlx::Error> {
-        sqlx::query_as(
+        sqlx::query_as(&crate::sql!(
             "SELECT title,
                     COUNT(*) AS plays,
                     MAX(duration) AS duration,
@@ -133,8 +133,8 @@ impl Database {
              WHERE user_id = ? AND skipped = FALSE
                AND LOWER(TRIM(artist)) = ? AND LOWER(TRIM(album)) = ?
              GROUP BY LOWER(TRIM(title))
-             ORDER BY plays DESC, track_number ASC",
-        )
+             ORDER BY plays DESC, track_number ASC"
+        ))
         .bind(user_id)
         .bind(artist.trim().to_lowercase())
         .bind(album.trim().to_lowercase())
@@ -150,7 +150,7 @@ impl Database {
         exclude: Option<&str>,
         limit: i64,
     ) -> Result<Vec<AlbumAggregate>, sqlx::Error> {
-        let mut rows: Vec<AlbumAggregate> = sqlx::query_as(&format!(
+        let mut rows: Vec<AlbumAggregate> = sqlx::query_as(&crate::sql!(&format!(
             "SELECT album AS name, COUNT(*) AS plays, MAX(release_year) AS year,
                     {COVER_PICK} AS cover_pick
              FROM scrobbles s
@@ -159,7 +159,7 @@ impl Database {
                AND (? IS NULL OR LOWER(TRIM(album)) != ?)
              GROUP BY LOWER(TRIM(album))
              ORDER BY plays DESC LIMIT ?"
-        ))
+        )))
         .bind(user_id)
         .bind(artist.trim().to_lowercase())
         .bind(exclude.map(|e| e.trim().to_lowercase()))
@@ -176,7 +176,7 @@ impl Database {
         user_id: i64,
         artist: &str,
     ) -> Result<Option<ArtistSummary>, sqlx::Error> {
-        let row: Option<ArtistSummary> = sqlx::query_as(&format!(
+        let row: Option<ArtistSummary> = sqlx::query_as(&crate::sql!(&format!(
             "SELECT COUNT(*) AS plays,
                     COALESCE(SUM(duration), 0) AS seconds,
                     COUNT(DISTINCT LOWER(TRIM(title))) AS track_count,
@@ -186,7 +186,7 @@ impl Database {
                     MAX(timestamp) AS last_heard
              FROM scrobbles s
              WHERE user_id = ? AND skipped = FALSE AND {CREDITS_ARTIST}"
-        ))
+        )))
         .bind(user_id)
         .bind(artist.trim().to_lowercase())
         .fetch_optional(&self.pool)
@@ -201,13 +201,13 @@ impl Database {
         // Over the credits, not over `scrobbles.artist` — a performer who is
         // never the primary would otherwise have no rank at all, and the total
         // would be a count of record artists rather than of artists heard.
-        let rows: Vec<(String, i64)> = sqlx::query_as(
+        let rows: Vec<(String, i64)> = sqlx::query_as(&crate::sql!(
             "SELECT sa.artist_key, COUNT(*) AS plays
                FROM scrobble_artists sa
                JOIN scrobbles s ON s.id = sa.scrobble_id
               WHERE s.user_id = ? AND s.skipped = FALSE
-              GROUP BY sa.artist_key ORDER BY plays DESC",
-        )
+              GROUP BY sa.artist_key ORDER BY plays DESC"
+        ))
         .bind(user_id)
         .fetch_all(&self.pool)
         .await?;
@@ -226,7 +226,7 @@ impl Database {
         artist: &str,
         limit: i64,
     ) -> Result<Vec<TrackAggregate>, sqlx::Error> {
-        sqlx::query_as(&format!(
+        sqlx::query_as(&crate::sql!(&format!(
             "SELECT title,
                     COUNT(*) AS plays,
                     MAX(duration) AS duration,
@@ -243,7 +243,7 @@ impl Database {
              WHERE user_id = ? AND skipped = FALSE AND {CREDITS_ARTIST}
              GROUP BY LOWER(TRIM(title))
              ORDER BY plays DESC LIMIT ?"
-        ))
+        )))
         .bind(user_id)
         .bind(artist.trim().to_lowercase())
         .bind(limit)
@@ -258,12 +258,12 @@ impl Database {
         user_id: i64,
         artist: &str,
     ) -> Result<Vec<(String, i64)>, sqlx::Error> {
-        sqlx::query_as(&format!(
+        sqlx::query_as(&crate::sql!(&format!(
             "SELECT strftime('%Y', timestamp, 'unixepoch') AS year, COUNT(*) AS plays
              FROM scrobbles s
              WHERE user_id = ? AND skipped = FALSE AND {CREDITS_ARTIST}
              GROUP BY year ORDER BY year ASC"
-        ))
+        )))
         .bind(user_id)
         .bind(artist.trim().to_lowercase())
         .fetch_all(&self.pool)
@@ -276,10 +276,10 @@ impl Database {
     /// PARK" and "Linkin Park" are one artist to every chart, so a share
     /// computed against one spelling would be wrong for the other.
     pub async fn artist_plays(&self, user_id: i64, artist: &str) -> Result<i64, sqlx::Error> {
-        let (n,): (i64,) = sqlx::query_as(&format!(
+        let (n,): (i64,) = sqlx::query_as(&crate::sql!(&format!(
             "SELECT COUNT(*) FROM scrobbles s
               WHERE user_id = ? AND skipped = FALSE AND {CREDITS_ARTIST}"
-        ))
+        )))
         .bind(user_id)
         .bind(artist.trim().to_lowercase())
         .fetch_one(&self.pool)
@@ -287,11 +287,12 @@ impl Database {
         Ok(n)
     }
     pub async fn total_plays(&self, user_id: i64) -> Result<i64, sqlx::Error> {
-        let (n,): (i64,) =
-            sqlx::query_as("SELECT COUNT(*) FROM scrobbles WHERE user_id = ? AND skipped = FALSE")
-                .bind(user_id)
-                .fetch_one(&self.pool)
-                .await?;
+        let (n,): (i64,) = sqlx::query_as(&crate::sql!(
+            "SELECT COUNT(*) FROM scrobbles WHERE user_id = ? AND skipped = FALSE",
+        ))
+        .bind(user_id)
+        .fetch_one(&self.pool)
+        .await?;
         Ok(n)
     }
     /// Best artwork known for an album — used by the album hero and the cards.
@@ -301,13 +302,13 @@ impl Database {
         artist: &str,
         album: &str,
     ) -> Result<Option<(Option<String>, Option<i64>, Option<String>)>, sqlx::Error> {
-        sqlx::query_as(
+        sqlx::query_as(&crate::sql!(
             "SELECT artwork_url, caa_id, caa_release_mbid FROM scrobbles
              WHERE user_id = ? AND skipped = FALSE
                AND LOWER(TRIM(artist)) = ? AND LOWER(TRIM(album)) = ?
                AND (artwork_url IS NOT NULL AND artwork_url != '' OR caa_id > 0)
-             ORDER BY timestamp DESC LIMIT 1",
-        )
+             ORDER BY timestamp DESC LIMIT 1"
+        ))
         .bind(user_id)
         .bind(artist.trim().to_lowercase())
         .bind(album.trim().to_lowercase())

@@ -31,7 +31,7 @@ impl Database {
         // hand: the cover is what made the mistake visible in the first place.
         let clear_artwork = mbid_release.is_some();
 
-        let res = sqlx::query(
+        let res = sqlx::query(&crate::sql!(
             "UPDATE scrobbles SET
                 title = COALESCE(?, title),
                 artist = COALESCE(?, artist),
@@ -54,8 +54,8 @@ impl Database {
                 artwork_url = CASE WHEN ? THEN NULL ELSE artwork_url END,
                 caa_id = CASE WHEN ? THEN NULL ELSE caa_id END,
                 caa_release_mbid = CASE WHEN ? THEN NULL ELSE caa_release_mbid END
-             WHERE id = ? AND user_id = ?",
-        )
+             WHERE id = ? AND user_id = ?"
+        ))
         .bind(title)
         .bind(artist)
         .bind(album)
@@ -85,7 +85,7 @@ impl Database {
     pub async fn delete_scrobble(&self, user_id: i64, id: i64) -> Result<bool, sqlx::Error> {
         self.delete_notes_for_scrobbles(user_id, Some(id)).await?;
         self.delete_artists_for_scrobbles(user_id, Some(id)).await?;
-        let res = sqlx::query("DELETE FROM scrobbles WHERE id = ? AND user_id = ?")
+        let res = sqlx::query(&crate::sql!("DELETE FROM scrobbles WHERE id = ? AND user_id = ?"))
             .bind(id)
             .bind(user_id)
             .execute(&self.pool)
@@ -96,7 +96,7 @@ impl Database {
     pub async fn clear_scrobbles(&self, user_id: i64) -> Result<u64, sqlx::Error> {
         self.delete_notes_for_scrobbles(user_id, None).await?;
         self.delete_artists_for_scrobbles(user_id, None).await?;
-        let res = sqlx::query("DELETE FROM scrobbles WHERE user_id = ?")
+        let res = sqlx::query(&crate::sql!("DELETE FROM scrobbles WHERE user_id = ?"))
             .bind(user_id)
             .execute(&self.pool)
             .await?;
@@ -115,20 +115,20 @@ impl Database {
     ) -> Result<(), sqlx::Error> {
         match id {
             Some(id) => {
-                sqlx::query(
+                sqlx::query(&crate::sql!(
                     "DELETE FROM scrobble_artists WHERE scrobble_id IN
-                         (SELECT id FROM scrobbles WHERE id = ? AND user_id = ?)",
-                )
+                         (SELECT id FROM scrobbles WHERE id = ? AND user_id = ?)"
+                ))
                 .bind(id)
                 .bind(user_id)
                 .execute(&self.pool)
                 .await?;
             }
             None => {
-                sqlx::query(
+                sqlx::query(&crate::sql!(
                     "DELETE FROM scrobble_artists WHERE scrobble_id IN
-                         (SELECT id FROM scrobbles WHERE user_id = ?)",
-                )
+                         (SELECT id FROM scrobbles WHERE user_id = ?)"
+                ))
                 .bind(user_id)
                 .execute(&self.pool)
                 .await?;
@@ -145,25 +145,32 @@ impl Database {
     ) -> Result<(), sqlx::Error> {
         let ids: Vec<(i64,)> = match id {
             Some(id) => {
-                sqlx::query_as("SELECT id FROM notes WHERE user_id = ? AND scrobble_id = ?")
-                    .bind(user_id)
-                    .bind(id)
-                    .fetch_all(&self.pool)
-                    .await?
+                sqlx::query_as(&crate::sql!(
+                    "SELECT id FROM notes WHERE user_id = ? AND scrobble_id = ?"
+                ))
+                .bind(user_id)
+                .bind(id)
+                .fetch_all(&self.pool)
+                .await?
             }
             None => {
-                sqlx::query_as("SELECT id FROM notes WHERE user_id = ? AND scrobble_id IS NOT NULL")
-                    .bind(user_id)
-                    .fetch_all(&self.pool)
-                    .await?
+                sqlx::query_as(&crate::sql!(
+                    "SELECT id FROM notes WHERE user_id = ? AND scrobble_id IS NOT NULL",
+                ))
+                .bind(user_id)
+                .fetch_all(&self.pool)
+                .await?
             }
         };
         for (note_id,) in ids {
-            sqlx::query("DELETE FROM note_revisions WHERE note_id = ?")
+            sqlx::query(&crate::sql!("DELETE FROM note_revisions WHERE note_id = ?"))
                 .bind(note_id)
                 .execute(&self.pool)
                 .await?;
-            sqlx::query("DELETE FROM notes WHERE id = ?").bind(note_id).execute(&self.pool).await?;
+            sqlx::query(&crate::sql!("DELETE FROM notes WHERE id = ?"))
+                .bind(note_id)
+                .execute(&self.pool)
+                .await?;
         }
         Ok(())
     }
@@ -173,20 +180,22 @@ impl Database {
         user_id: i64,
         id: i64,
     ) -> Result<Option<ScrobbleRecord>, sqlx::Error> {
-        sqlx::query_as::<_, ScrobbleRecord>("SELECT * FROM scrobbles WHERE id = ? AND user_id = ?")
-            .bind(id)
-            .bind(user_id)
-            .fetch_optional(&self.pool)
-            .await
+        sqlx::query_as::<_, ScrobbleRecord>(&crate::sql!(
+            "SELECT * FROM scrobbles WHERE id = ? AND user_id = ?",
+        ))
+        .bind(id)
+        .bind(user_id)
+        .fetch_optional(&self.pool)
+        .await
     }
     /// Every listen for a user, newest first — for full-backup export.
     pub async fn get_all_scrobbles(
         &self,
         user_id: i64,
     ) -> Result<Vec<ScrobbleRecord>, sqlx::Error> {
-        sqlx::query_as::<_, ScrobbleRecord>(
+        sqlx::query_as::<_, ScrobbleRecord>(&crate::sql!(
             "SELECT * FROM scrobbles WHERE user_id = ? ORDER BY timestamp DESC",
-        )
+        ))
         .bind(user_id)
         .fetch_all(&self.pool)
         .await
@@ -269,11 +278,11 @@ impl Database {
             return Ok(false);
         }
 
-        let Some(row) = sqlx::query_as::<_, SparseColumns>(
+        let Some(row) = sqlx::query_as::<_, SparseColumns>(&crate::sql!(
             "SELECT album, duration, mbid_recording, mbid_release, mbid_artist,
                     caa_id, caa_release_mbid, track_number, spotify_track_id
                FROM scrobbles WHERE id = ?",
-        )
+        ))
         .bind(id)
         .fetch_optional(&self.pool)
         .await?
@@ -343,7 +352,8 @@ impl Database {
         }
 
         let sql = format!("UPDATE scrobbles SET {} WHERE id = ?", sets.join(", "));
-        let mut q = sqlx::query(&sql);
+        let stmt = crate::sql!(&sql);
+        let mut q = sqlx::query(&stmt);
         if let Some(v) = album {
             q = q.bind(v.to_string());
         }
@@ -404,13 +414,13 @@ impl Database {
         }
         let mbid_artist_json =
             play.mbid_artist.as_ref().map(|arr| serde_json::to_string(arr).unwrap());
-        sqlx::query(
+        sqlx::query(&crate::sql!(
             "INSERT INTO scrobbles (
                 user_id, title, artist, album, timestamp, duration, source_id, source_name, status,
                 mbid_recording, mbid_release, mbid_artist, caa_id, caa_release_mbid, isrc,
                 submission_client, track_number, skipped, spotify_track_id
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'imported', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        )
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'imported', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+        ))
         .bind(user_id)
         .bind(&play.title)
         .bind(&play.artist)

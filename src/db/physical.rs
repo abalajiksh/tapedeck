@@ -10,7 +10,7 @@ impl Database {
         user_id: i64,
         kind: Option<&str>,
     ) -> Result<Vec<PhysicalRelease>, sqlx::Error> {
-        sqlx::query_as(
+        sqlx::query_as(&crate::sql!(
             "SELECT r.*,
                     (SELECT COUNT(*) FROM physical_plays p WHERE p.release_id = r.id) AS play_count,
                     (SELECT COALESCE(SUM(p.duration_secs), 0) FROM physical_plays p
@@ -35,8 +35,8 @@ impl Database {
                       LIMIT 1) AS cover_thumb
                FROM physical_releases r
               WHERE r.user_id = ? AND (? IS NULL OR r.kind = ?)
-              ORDER BY r.artist COLLATE NOCASE, r.title COLLATE NOCASE",
-        )
+              ORDER BY r.artist COLLATE NOCASE, r.title COLLATE NOCASE"
+        ))
         .bind(user_id)
         .bind(kind)
         .bind(kind)
@@ -48,7 +48,7 @@ impl Database {
         user_id: i64,
         id: i64,
     ) -> Result<Option<PhysicalRelease>, sqlx::Error> {
-        sqlx::query_as(
+        sqlx::query_as(&crate::sql!(
             "SELECT r.*,
                     (SELECT COUNT(*) FROM physical_plays p WHERE p.release_id = r.id) AS play_count,
                     (SELECT COALESCE(SUM(p.duration_secs), 0) FROM physical_plays p
@@ -71,8 +71,8 @@ impl Database {
                       WHERE i.release_id = r.id AND i.kind = 'front'
                       ORDER BY (i.file_path IS NULL), i.position, i.id
                       LIMIT 1) AS cover_thumb
-               FROM physical_releases r WHERE r.user_id = ? AND r.id = ?",
-        )
+               FROM physical_releases r WHERE r.user_id = ? AND r.id = ?"
+        ))
         .bind(user_id)
         .bind(id)
         .fetch_optional(&self.pool)
@@ -97,13 +97,13 @@ impl Database {
         acquired_as: Option<&str>,
         acquired_from: Option<&str>,
     ) -> Result<i64, sqlx::Error> {
-        let res = sqlx::query_as::<_, (i64,)>(
+        let res = sqlx::query_as::<_, (i64,)>(&crate::sql!(
             "INSERT INTO physical_releases
                 (user_id, kind, artist, title, year, mbid_release, discogs_id, barcode,
                  catalog_number, artwork_url, tracks, notes, added_at, purchased_at,
                  acquired_as, acquired_from)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
-        )
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id"
+        ))
         .bind(user_id)
         .bind(kind)
         .bind(artist)
@@ -193,7 +193,8 @@ impl Database {
             "UPDATE physical_releases SET {} WHERE user_id = ? AND id = ?",
             sets.join(", ")
         );
-        let mut q = sqlx::query(&sql);
+        let stmt = crate::sql!(&sql);
+        let mut q = sqlx::query(&stmt);
         // Bound in the same order the SET clauses were pushed.
         if let Some(v) = kind {
             q = q.bind(v.to_string());
@@ -227,10 +228,12 @@ impl Database {
     }
     /// The side currently on this user's deck, if any.
     pub async fn get_spin(&self, user_id: i64) -> Result<Option<PhysicalSpin>, sqlx::Error> {
-        sqlx::query_as::<_, PhysicalSpin>("SELECT * FROM physical_spins WHERE user_id = ?")
-            .bind(user_id)
-            .fetch_optional(&self.pool)
-            .await
+        sqlx::query_as::<_, PhysicalSpin>(&crate::sql!(
+            "SELECT * FROM physical_spins WHERE user_id = ?"
+        ))
+        .bind(user_id)
+        .fetch_optional(&self.pool)
+        .await
     }
     /// Put a side on the deck, or update the one that is on it.
     ///
@@ -253,7 +256,7 @@ impl Database {
         start_secs: i64,
     ) -> Result<(), sqlx::Error> {
         let now = chrono::Utc::now().timestamp();
-        sqlx::query(
+        sqlx::query(&crate::sql!(
             "INSERT INTO physical_spins
                (user_id, release_id, side, started_at, paused_at, paused_total,
                 outcomes, chain_id, equipment_id, start_secs, updated_at)
@@ -268,8 +271,8 @@ impl Database {
                chain_id = excluded.chain_id,
                equipment_id = excluded.equipment_id,
                start_secs = excluded.start_secs,
-               updated_at = excluded.updated_at",
-        )
+               updated_at = excluded.updated_at"
+        ))
         .bind(user_id)
         .bind(release_id)
         .bind(side)
@@ -308,10 +311,10 @@ impl Database {
         side: &str,
         secs: i64,
     ) -> Result<bool, sqlx::Error> {
-        let res = sqlx::query(
+        let res = sqlx::query(&crate::sql!(
             "UPDATE physical_releases SET parked_side = ?, parked_secs = ?
-               WHERE user_id = ? AND id = ? AND kind = 'cassette'",
-        )
+               WHERE user_id = ? AND id = ? AND kind = 'cassette'"
+        ))
         .bind(side)
         .bind(secs.max(0))
         .bind(user_id)
@@ -322,10 +325,10 @@ impl Database {
     }
     /// Wind a tape back to the start.
     pub async fn rewind_tape(&self, user_id: i64, release_id: i64) -> Result<bool, sqlx::Error> {
-        let res = sqlx::query(
+        let res = sqlx::query(&crate::sql!(
             "UPDATE physical_releases SET parked_side = NULL, parked_secs = NULL
-               WHERE user_id = ? AND id = ?",
-        )
+               WHERE user_id = ? AND id = ?"
+        ))
         .bind(user_id)
         .bind(release_id)
         .execute(&self.pool)
@@ -334,7 +337,7 @@ impl Database {
     }
     /// Take whatever is on the deck off it.
     pub async fn clear_spin(&self, user_id: i64) -> Result<bool, sqlx::Error> {
-        let res = sqlx::query("DELETE FROM physical_spins WHERE user_id = ?")
+        let res = sqlx::query(&crate::sql!("DELETE FROM physical_spins WHERE user_id = ?"))
             .bind(user_id)
             .execute(&self.pool)
             .await?;
@@ -345,11 +348,11 @@ impl Database {
         user_id: i64,
         release_id: i64,
     ) -> Result<Vec<PhysicalImage>, sqlx::Error> {
-        sqlx::query_as(
+        sqlx::query_as(&crate::sql!(
             "SELECT * FROM physical_images
               WHERE user_id = ? AND release_id = ?
-              ORDER BY position ASC, id ASC",
-        )
+              ORDER BY position ASC, id ASC"
+        ))
         .bind(user_id)
         .bind(release_id)
         .fetch_all(&self.pool)
@@ -362,7 +365,7 @@ impl Database {
         user_id: i64,
         id: i64,
     ) -> Result<Option<PhysicalImage>, sqlx::Error> {
-        sqlx::query_as("SELECT * FROM physical_images WHERE user_id = ? AND id = ?")
+        sqlx::query_as(&crate::sql!("SELECT * FROM physical_images WHERE user_id = ? AND id = ?"))
             .bind(user_id)
             .bind(id)
             .fetch_one(&self.pool)
@@ -389,7 +392,7 @@ impl Database {
         position: i64,
         remote_id: Option<&str>,
     ) -> Result<i64, sqlx::Error> {
-        sqlx::query(
+        sqlx::query(&crate::sql!(
             "INSERT INTO physical_images
                 (user_id, release_id, kind, provider, url, thumb_url, file_path, mime,
                  bytes, caption, position, remote_id, added_at)
@@ -403,8 +406,8 @@ impl Database {
              ON CONFLICT(release_id, provider, remote_id) WHERE remote_id IS NOT NULL
              DO UPDATE SET
                 kind = excluded.kind, url = excluded.url, thumb_url = excluded.thumb_url,
-                caption = excluded.caption, position = excluded.position",
-        )
+                caption = excluded.caption, position = excluded.position"
+        ))
         .bind(user_id)
         .bind(release_id)
         .bind(kind)
@@ -422,12 +425,12 @@ impl Database {
         .await?;
         // `last_insert_rowid` is meaningless after an upsert that updated, so
         // the id is read back by the key that decided it.
-        let row: (i64,) = sqlx::query_as(
+        let row: (i64,) = sqlx::query_as(&crate::sql!(
             "SELECT id FROM physical_images
               WHERE release_id = ? AND provider = ?
                 AND (remote_id IS ? OR (remote_id IS NULL AND ? IS NULL))
-              ORDER BY id DESC LIMIT 1",
-        )
+              ORDER BY id DESC LIMIT 1"
+        ))
         .bind(release_id)
         .bind(provider)
         .bind(remote_id)
@@ -459,7 +462,8 @@ impl Database {
         }
         let sql =
             format!("UPDATE physical_images SET {} WHERE user_id = ? AND id = ?", sets.join(", "));
-        let mut q = sqlx::query(&sql);
+        let stmt = crate::sql!(&sql);
+        let mut q = sqlx::query(&stmt);
         if let Some(v) = kind {
             q = q.bind(v.to_string());
         }
@@ -484,7 +488,7 @@ impl Database {
         let Some(img) = self.get_physical_image(user_id, id).await? else {
             return Ok(None);
         };
-        sqlx::query("DELETE FROM physical_images WHERE user_id = ? AND id = ?")
+        sqlx::query(&crate::sql!("DELETE FROM physical_images WHERE user_id = ? AND id = ?"))
             .bind(user_id)
             .bind(id)
             .execute(&self.pool)
@@ -524,10 +528,10 @@ impl Database {
                 continue;
             }
             let pattern = format!("physical-{release_id}-{side}-%-{position}");
-            let r = sqlx::query(
+            let r = sqlx::query(&crate::sql!(
                 "UPDATE scrobbles SET duration = ?
-                  WHERE user_id = ? AND source_name = 'physical' AND source_id LIKE ?",
-            )
+                  WHERE user_id = ? AND source_name = 'physical' AND source_id LIKE ?"
+            ))
             .bind(secs)
             .bind(user_id)
             .bind(&pattern)
@@ -559,10 +563,10 @@ impl Database {
         full_track_count: i64,
         side_secs: i64,
     ) -> Result<u64, sqlx::Error> {
-        let r = sqlx::query(
+        let r = sqlx::query(&crate::sql!(
             "UPDATE physical_plays SET duration_secs = ?
-              WHERE user_id = ? AND release_id = ? AND side = ? AND track_count = ?",
-        )
+              WHERE user_id = ? AND release_id = ? AND side = ? AND track_count = ?"
+        ))
         .bind(side_secs)
         .bind(user_id)
         .bind(release_id)
@@ -578,13 +582,14 @@ impl Database {
         id: i64,
         tracks_json: &str,
     ) -> Result<bool, sqlx::Error> {
-        let res =
-            sqlx::query("UPDATE physical_releases SET tracks = ? WHERE user_id = ? AND id = ?")
-                .bind(tracks_json)
-                .bind(user_id)
-                .bind(id)
-                .execute(&self.pool)
-                .await?;
+        let res = sqlx::query(&crate::sql!(
+            "UPDATE physical_releases SET tracks = ? WHERE user_id = ? AND id = ?",
+        ))
+        .bind(tracks_json)
+        .bind(user_id)
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
         Ok(res.rows_affected() > 0)
     }
     /// Remove a pressing. Returns the uploaded scans it was holding so the
@@ -595,30 +600,35 @@ impl Database {
         user_id: i64,
         id: i64,
     ) -> Result<Option<Vec<String>>, sqlx::Error> {
-        let files: Vec<(String,)> = sqlx::query_as(
+        let files: Vec<(String,)> = sqlx::query_as(&crate::sql!(
             "SELECT file_path FROM physical_images
-              WHERE user_id = ? AND release_id = ? AND file_path IS NOT NULL",
-        )
+              WHERE user_id = ? AND release_id = ? AND file_path IS NOT NULL"
+        ))
         .bind(user_id)
         .bind(id)
         .fetch_all(&self.pool)
         .await?;
         // Plays and images both reference the release, and foreign keys are on.
-        sqlx::query("DELETE FROM physical_images WHERE user_id = ? AND release_id = ?")
-            .bind(user_id)
-            .bind(id)
-            .execute(&self.pool)
-            .await?;
-        sqlx::query("DELETE FROM physical_plays WHERE user_id = ? AND release_id = ?")
-            .bind(user_id)
-            .bind(id)
-            .execute(&self.pool)
-            .await?;
-        let res = sqlx::query("DELETE FROM physical_releases WHERE user_id = ? AND id = ?")
-            .bind(user_id)
-            .bind(id)
-            .execute(&self.pool)
-            .await?;
+        sqlx::query(&crate::sql!(
+            "DELETE FROM physical_images WHERE user_id = ? AND release_id = ?"
+        ))
+        .bind(user_id)
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(&crate::sql!(
+            "DELETE FROM physical_plays WHERE user_id = ? AND release_id = ?"
+        ))
+        .bind(user_id)
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        let res =
+            sqlx::query(&crate::sql!("DELETE FROM physical_releases WHERE user_id = ? AND id = ?"))
+                .bind(user_id)
+                .bind(id)
+                .execute(&self.pool)
+                .await?;
         Ok((res.rows_affected() > 0).then(|| files.into_iter().map(|(f,)| f).collect()))
     }
     #[allow(clippy::too_many_arguments)]
@@ -633,12 +643,12 @@ impl Database {
         equipment_id: Option<i64>,
         chain_id: Option<i64>,
     ) -> Result<i64, sqlx::Error> {
-        let res = sqlx::query_as::<_, (i64,)>(
+        let res = sqlx::query_as::<_, (i64,)>(&crate::sql!(
             "INSERT INTO physical_plays
                 (user_id, release_id, side, played_at, duration_secs, track_count,
                  equipment_id, chain_id, recorded_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
-        )
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id"
+        ))
         .bind(user_id)
         .bind(release_id)
         .bind(side)
@@ -675,7 +685,7 @@ impl Database {
         user_id: i64,
         release_id: i64,
     ) -> Result<Vec<SidePlays>, sqlx::Error> {
-        sqlx::query_as(
+        sqlx::query_as(&crate::sql!(
             "SELECT side,
                     COUNT(*) AS plays,
                     COALESCE(SUM(duration_secs), 0) AS secs,
@@ -683,8 +693,8 @@ impl Database {
                FROM physical_plays
               WHERE user_id = ? AND release_id = ?
               GROUP BY side
-              ORDER BY side",
-        )
+              ORDER BY side"
+        ))
         .bind(user_id)
         .bind(release_id)
         .fetch_all(&self.pool)
@@ -701,10 +711,10 @@ impl Database {
         user_id: i64,
         equipment_id: i64,
     ) -> Result<(f64, i64), sqlx::Error> {
-        let row: (Option<i64>, i64) = sqlx::query_as(
+        let row: (Option<i64>, i64) = sqlx::query_as(&crate::sql!(
             "SELECT SUM(duration_secs), COUNT(*) FROM physical_plays
-              WHERE user_id = ? AND equipment_id = ?",
-        )
+              WHERE user_id = ? AND equipment_id = ?"
+        ))
         .bind(user_id)
         .bind(equipment_id)
         .fetch_one(&self.pool)
@@ -728,11 +738,11 @@ impl Database {
         side: &str,
         position: i64,
     ) -> Result<Option<String>, sqlx::Error> {
-        let row: Option<(String,)> = sqlx::query_as(
+        let row: Option<(String,)> = sqlx::query_as(&crate::sql!(
             "SELECT tracks FROM physical_releases
               WHERE user_id = ? AND LOWER(TRIM(artist)) = ? AND LOWER(TRIM(title)) = ?
-              ORDER BY id LIMIT 1",
-        )
+              ORDER BY id LIMIT 1"
+        ))
         .bind(user_id)
         .bind(artist.trim().to_lowercase())
         .bind(album.trim().to_lowercase())
@@ -770,12 +780,12 @@ impl Database {
         release_id: i64,
         cover: &str,
     ) -> Result<u64, sqlx::Error> {
-        let r = sqlx::query(
+        let r = sqlx::query(&crate::sql!(
             "UPDATE scrobbles SET artwork_url = ?, caa_id = NULL, caa_release_mbid = NULL
               WHERE user_id = ? AND source_name = 'physical'
                 AND source_id LIKE 'physical-' || ? || '-%'
                 AND COALESCE(artwork_url, '') != ?",
-        )
+        ))
         .bind(cover)
         .bind(user_id)
         .bind(release_id)
@@ -795,7 +805,7 @@ impl Database {
         user_id: i64,
         release_id: i64,
     ) -> Result<Option<String>, sqlx::Error> {
-        let row: Option<(Option<String>,)> = sqlx::query_as(
+        let row: Option<(Option<String>,)> = sqlx::query_as(&crate::sql!(
             "SELECT COALESCE(
                       (SELECT COALESCE(i.thumb_url, i.url,
                                        '/api/v1/physical/images/' || i.id || '/file')
@@ -804,8 +814,8 @@ impl Database {
                         ORDER BY (i.file_path IS NULL), i.position, i.id
                         LIMIT 1),
                       r.artwork_url)
-               FROM physical_releases r WHERE r.user_id = ? AND r.id = ?",
-        )
+               FROM physical_releases r WHERE r.user_id = ? AND r.id = ?"
+        ))
         .bind(user_id)
         .bind(release_id)
         .fetch_optional(&self.pool)
@@ -813,27 +823,28 @@ impl Database {
         Ok(row.and_then(|r| r.0).filter(|s| !s.trim().is_empty()))
     }
     pub async fn get_app_setting(&self, key: &str) -> Result<Option<String>, sqlx::Error> {
-        let row: Option<(String,)> = sqlx::query_as("SELECT value FROM app_settings WHERE key = ?")
-            .bind(key)
-            .fetch_optional(&self.pool)
-            .await?;
+        let row: Option<(String,)> =
+            sqlx::query_as(&crate::sql!("SELECT value FROM app_settings WHERE key = ?"))
+                .bind(key)
+                .fetch_optional(&self.pool)
+                .await?;
         Ok(row.and_then(|r| self.secrets.decrypt(&r.0).ok()).filter(|v| !v.trim().is_empty()))
     }
     /// Store (or clear) a server setting. Encrypted at rest like every other
     /// credential that has to be replayed.
     pub async fn set_app_setting(&self, key: &str, value: &str) -> Result<(), sqlx::Error> {
         if value.trim().is_empty() {
-            sqlx::query("DELETE FROM app_settings WHERE key = ?")
+            sqlx::query(&crate::sql!("DELETE FROM app_settings WHERE key = ?"))
                 .bind(key)
                 .execute(&self.pool)
                 .await?;
             return Ok(());
         }
-        sqlx::query(
+        sqlx::query(&crate::sql!(
             "INSERT INTO app_settings (key, value, updated_at) VALUES (?, ?, ?)
              ON CONFLICT(key) DO UPDATE SET value = excluded.value,
-                                            updated_at = excluded.updated_at",
-        )
+                                            updated_at = excluded.updated_at"
+        ))
         .bind(key)
         .bind(
             self.secrets
@@ -863,12 +874,12 @@ impl Database {
         &self,
         user_id: i64,
     ) -> Result<Vec<SplitAttribution>, sqlx::Error> {
-        let rows: Vec<(String, String, String, i64)> = sqlx::query_as(
+        let rows: Vec<(String, String, String, i64)> = sqlx::query_as(&crate::sql!(
             "SELECT title, album, artist, COUNT(*) AS plays FROM scrobbles
              WHERE user_id = ? AND skipped = FALSE
                AND album IS NOT NULL AND TRIM(album) != ''
-             GROUP BY LOWER(TRIM(title)), LOWER(TRIM(album)), LOWER(TRIM(artist))",
-        )
+             GROUP BY LOWER(TRIM(title)), LOWER(TRIM(album)), LOWER(TRIM(artist))"
+        ))
         .bind(user_id)
         .fetch_all(&self.pool)
         .await?;
@@ -976,7 +987,7 @@ impl Database {
         from_artist: &str,
         to_artist: &str,
     ) -> Result<u64, sqlx::Error> {
-        let res = sqlx::query(
+        let res = sqlx::query(&crate::sql!(
             "UPDATE scrobbles
                 SET artist_credit = COALESCE(artist_credit, ? || '; ' || artist),
                     artist = ?,
@@ -986,8 +997,8 @@ impl Database {
               WHERE user_id = ?
                 AND LOWER(TRIM(title)) = LOWER(TRIM(?))
                 AND LOWER(TRIM(album)) = LOWER(TRIM(?))
-                AND LOWER(TRIM(artist)) = LOWER(TRIM(?))",
-        )
+                AND LOWER(TRIM(artist)) = LOWER(TRIM(?))"
+        ))
         .bind(to_artist)
         .bind(to_artist)
         .bind(user_id)
@@ -1008,9 +1019,9 @@ impl Database {
         from: &str,
         to: &str,
     ) -> Result<u64, sqlx::Error> {
-        let res = sqlx::query(
+        let res = sqlx::query(&crate::sql!(
             "UPDATE scrobbles SET artist = ? WHERE user_id = ? AND LOWER(TRIM(artist)) = ?",
-        )
+        ))
         .bind(to)
         .bind(user_id)
         .bind(from.trim().to_lowercase())
@@ -1029,11 +1040,11 @@ impl Database {
         from: &str,
         to: &str,
     ) -> Result<u64, sqlx::Error> {
-        let res = sqlx::query(
+        let res = sqlx::query(&crate::sql!(
             "UPDATE scrobbles
                 SET artist_credit = COALESCE(artist_credit, artist), artist = ?
-              WHERE user_id = ? AND LOWER(TRIM(artist)) = ?",
-        )
+              WHERE user_id = ? AND LOWER(TRIM(artist)) = ?"
+        ))
         .bind(to)
         .bind(user_id)
         .bind(from.trim().to_lowercase())
@@ -1047,9 +1058,9 @@ impl Database {
         &self,
         user_id: i64,
     ) -> Result<(i64, Option<i64>), sqlx::Error> {
-        let row: (i64, Option<i64>) = sqlx::query_as(
+        let row: (i64, Option<i64>) = sqlx::query_as(&crate::sql!(
             "SELECT COUNT(*), MAX(timestamp) FROM scrobbles WHERE user_id = ? AND skipped = FALSE",
-        )
+        ))
         .bind(user_id)
         .fetch_one(&self.pool)
         .await?;
@@ -1073,13 +1084,13 @@ impl Database {
         user_id: i64,
         limit: i64,
     ) -> Result<Vec<ReportRow>, sqlx::Error> {
-        sqlx::query_as(
+        sqlx::query_as(&crate::sql!(
             "SELECT timestamp, artist, artist_credit, title, album, duration, genres, chain_id,
                     company
              FROM scrobbles
              WHERE user_id = ? AND skipped = FALSE
              ORDER BY timestamp ASC LIMIT ?",
-        )
+        ))
         .bind(user_id)
         .bind(limit)
         .fetch_all(&self.pool)
@@ -1101,12 +1112,12 @@ impl Database {
         limit: i64,
     ) -> Result<Vec<crate::playlist_lab::LabRow>, sqlx::Error> {
         let rows: Vec<(i64, String, String, Option<String>, Option<String>, Option<i64>)> =
-            sqlx::query_as(
+            sqlx::query_as(&crate::sql!(
                 "SELECT timestamp, artist, title, album, genres, release_year
                    FROM scrobbles
                   WHERE user_id = ? AND skipped = FALSE
-                  ORDER BY timestamp DESC LIMIT ?",
-            )
+                  ORDER BY timestamp DESC LIMIT ?"
+            ))
             .bind(user_id)
             .bind(limit)
             .fetch_all(&self.pool)
@@ -1132,12 +1143,12 @@ impl Database {
         from: i64,
         to: i64,
     ) -> Result<Vec<(String, String, String, i64)>, sqlx::Error> {
-        sqlx::query_as(
+        sqlx::query_as(&crate::sql!(
             "SELECT r.title, r.artist, p.side, COUNT(*) AS spins
              FROM physical_plays p JOIN physical_releases r ON r.id = p.release_id
              WHERE p.user_id = ? AND p.played_at >= ? AND p.played_at < ?
-             GROUP BY r.id, p.side ORDER BY spins DESC, r.title",
-        )
+             GROUP BY r.id, p.side ORDER BY spins DESC, r.title"
+        ))
         .bind(user_id)
         .bind(from)
         .bind(to)
@@ -1154,7 +1165,7 @@ impl Database {
         &self,
         user_id: i64,
     ) -> Result<Vec<PhysicalPlayRow>, sqlx::Error> {
-        sqlx::query_as(
+        sqlx::query_as(&crate::sql!(
             "SELECT p.id, p.release_id, r.artist, r.title, r.kind, p.side, p.played_at,
                     p.duration_secs, p.track_count,
                     e.name AS equipment_name, c.name AS chain_name
@@ -1164,7 +1175,7 @@ impl Database {
                LEFT JOIN signal_chains c ON c.id = p.chain_id
               WHERE p.user_id = ?
               ORDER BY p.played_at ASC, p.id ASC",
-        )
+        ))
         .bind(user_id)
         .fetch_all(&self.pool)
         .await
@@ -1174,10 +1185,10 @@ impl Database {
         &self,
         user_id: i64,
     ) -> Result<Vec<PhysicalImage>, sqlx::Error> {
-        sqlx::query_as(
+        sqlx::query_as(&crate::sql!(
             "SELECT * FROM physical_images WHERE user_id = ?
-              ORDER BY release_id ASC, position ASC, id ASC",
-        )
+              ORDER BY release_id ASC, position ASC, id ASC"
+        ))
         .bind(user_id)
         .fetch_all(&self.pool)
         .await
@@ -1190,11 +1201,11 @@ impl Database {
         after: Option<i64>,
         limit: i64,
     ) -> Result<Vec<(i64, String, String, Option<String>, Option<i32>)>, sqlx::Error> {
-        sqlx::query_as(
+        sqlx::query_as(&crate::sql!(
             "SELECT timestamp, artist, title, album, track_number FROM scrobbles
              WHERE user_id = ? AND skipped = FALSE AND (? IS NULL OR timestamp >= ?)
-             ORDER BY timestamp DESC LIMIT ?",
-        )
+             ORDER BY timestamp DESC LIMIT ?"
+        ))
         .bind(user_id)
         .bind(after)
         .bind(after)
@@ -1207,10 +1218,10 @@ impl Database {
         &self,
         limit: i64,
     ) -> Result<Vec<(i64, String, Option<String>, Option<String>)>, sqlx::Error> {
-        sqlx::query_as(
+        sqlx::query_as(&crate::sql!(
             "SELECT id, title, album, mbid_recording FROM scrobbles
-             WHERE language IS NULL AND skipped = FALSE ORDER BY timestamp DESC LIMIT ?",
-        )
+             WHERE language IS NULL AND skipped = FALSE ORDER BY timestamp DESC LIMIT ?"
+        ))
         .bind(limit)
         .fetch_all(&self.pool)
         .await
@@ -1250,12 +1261,12 @@ impl Database {
     /// the status endpoint used to do — it fetched a hundred thousand rows,
     /// with their albums and durations, to look at the length of the vector.
     pub async fn count_tracks_wanting_language(&self) -> Result<i64, sqlx::Error> {
-        let (n,): (i64,) = sqlx::query_as(&format!(
+        let (n,): (i64,) = sqlx::query_as(&crate::sql!(&format!(
             "SELECT COUNT(*) FROM (
                SELECT 1 FROM scrobbles WHERE {}
                 GROUP BY LOWER(TRIM(title)), LOWER(TRIM(artist)))",
             Self::language_queue_predicate()
-        ))
+        )))
         .fetch_one(&self.pool)
         .await?;
         Ok(n)
@@ -1288,18 +1299,19 @@ impl Database {
         limit: i64,
     ) -> Result<Vec<LanguageCandidate>, sqlx::Error> {
         // Pass one: the candidates. One scan, no subquery.
-        let rows: Vec<(String, String, String, Option<String>, i64)> = sqlx::query_as(&format!(
-            "SELECT LOWER(TRIM(title)) || CHAR(31) || LOWER(TRIM(artist)) AS k,
+        let rows: Vec<(String, String, String, Option<String>, i64)> =
+            sqlx::query_as(&crate::sql!(&format!(
+                "SELECT LOWER(TRIM(title)) || CHAR(31) || LOWER(TRIM(artist)) AS k,
                     title, artist, MAX(album) AS album, COUNT(*) AS plays
                FROM scrobbles
               WHERE {}
               GROUP BY LOWER(TRIM(title)), LOWER(TRIM(artist))
               ORDER BY plays DESC LIMIT ?",
-            Self::language_queue_predicate()
-        ))
-        .bind(limit)
-        .fetch_all(&self.pool)
-        .await?;
+                Self::language_queue_predicate()
+            )))
+            .bind(limit)
+            .fetch_all(&self.pool)
+            .await?;
         if rows.is_empty() {
             return Ok(Vec::new());
         }
@@ -1319,7 +1331,8 @@ impl Database {
                         IN ({placeholders})
                   GROUP BY k, duration"
             );
-            let mut q = sqlx::query_as::<_, (String, i64, i64)>(&sql);
+            let stmt = crate::sql!(&sql);
+            let mut q = sqlx::query_as::<_, (String, i64, i64)>(&stmt);
             for k in keys {
                 q = q.bind(k);
             }
@@ -1369,7 +1382,7 @@ impl Database {
         title: &str,
         artist: &str,
     ) -> Result<Option<LibraryRef>, sqlx::Error> {
-        sqlx::query_as::<_, (i64, i64, String, String, i64)>(
+        sqlx::query_as::<_, (i64, i64, String, String, i64)>(&crate::sql!(
             "SELECT user_id, source_ref, source_id, source_name, timestamp
                FROM scrobbles
               WHERE source_ref IS NOT NULL
@@ -1377,7 +1390,7 @@ impl Database {
                 AND LOWER(TRIM(title)) = LOWER(TRIM(?))
                 AND LOWER(TRIM(artist)) = LOWER(TRIM(?))
               LIMIT 1",
-        )
+        ))
         .bind(title)
         .bind(artist)
         .fetch_optional(&self.pool)
@@ -1426,7 +1439,8 @@ impl Database {
                     AND LOWER(TRIM(title)) || CHAR(31) || LOWER(TRIM(artist))
                         IN ({placeholders})"
             );
-            let mut q = sqlx::query_as::<_, (String, i64, i64, String, String, i64)>(&sql);
+            let stmt = crate::sql!(&sql);
+            let mut q = sqlx::query_as::<_, (String, i64, i64, String, String, i64)>(&stmt);
             for k in chunk {
                 q = q.bind(k);
             }
@@ -1462,10 +1476,10 @@ impl Database {
         language: &str,
         source: &str,
     ) -> Result<u64, sqlx::Error> {
-        let r = sqlx::query(
+        let r = sqlx::query(&crate::sql!(
             "UPDATE scrobbles SET language = ?, language_source = ?
-              WHERE LOWER(TRIM(artist)) = ? AND LOWER(TRIM(title)) = ? AND skipped = FALSE",
-        )
+              WHERE LOWER(TRIM(artist)) = ? AND LOWER(TRIM(title)) = ? AND skipped = FALSE"
+        ))
         .bind(language)
         .bind(source)
         .bind(artist.trim().to_lowercase())
@@ -1482,12 +1496,14 @@ impl Database {
         language: &str,
         source: &str,
     ) -> Result<(), sqlx::Error> {
-        sqlx::query("UPDATE scrobbles SET language = ?, language_source = ? WHERE id = ?")
-            .bind(language)
-            .bind(source)
-            .bind(id)
-            .execute(&self.pool)
-            .await?;
+        sqlx::query(&crate::sql!(
+            "UPDATE scrobbles SET language = ?, language_source = ? WHERE id = ?"
+        ))
+        .bind(language)
+        .bind(source)
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
         Ok(())
     }
     /// Every genre the user has listened to, with play counts.
@@ -1500,13 +1516,13 @@ impl Database {
         user_id: i64,
         after: Option<i64>,
     ) -> Result<Vec<(String, i64)>, sqlx::Error> {
-        sqlx::query_as(
+        sqlx::query_as(&crate::sql!(
             "SELECT g.value AS name, COUNT(*) AS plays
                FROM scrobbles s, json_each(s.genres) g
               WHERE s.user_id = ? AND s.skipped = FALSE AND s.genres IS NOT NULL
                 AND (? IS NULL OR s.timestamp >= ?)
-              GROUP BY LOWER(g.value) ORDER BY plays DESC",
-        )
+              GROUP BY LOWER(g.value) ORDER BY plays DESC"
+        ))
         .bind(user_id)
         .bind(after)
         .bind(after)
@@ -1527,13 +1543,13 @@ impl Database {
         &self,
         user_id: i64,
     ) -> Result<Vec<(String, String, i64)>, sqlx::Error> {
-        sqlx::query_as(
+        sqlx::query_as(&crate::sql!(
             "SELECT g.value AS genre, s.artist, COUNT(*) AS plays
                FROM scrobbles s, json_each(s.genres) g
               WHERE s.user_id = ? AND s.skipped = FALSE AND s.genres IS NOT NULL
               GROUP BY LOWER(g.value), s.artist
-              ORDER BY plays DESC",
-        )
+              ORDER BY plays DESC"
+        ))
         .bind(user_id)
         .fetch_all(&self.pool)
         .await
@@ -1554,14 +1570,14 @@ impl Database {
         fmt: &str,
     ) -> Result<Vec<(String, String, i64)>, sqlx::Error> {
         let shift = format!("{} hours", tz_offset_hours);
-        sqlx::query_as(
+        sqlx::query_as(&crate::sql!(
             "SELECT strftime(?, s.timestamp, 'unixepoch', ?) AS yr, g.value AS name,
                     COUNT(*) AS plays
                FROM scrobbles s, json_each(s.genres) g
               WHERE s.user_id = ? AND s.skipped = FALSE AND s.genres IS NOT NULL
               GROUP BY yr, LOWER(g.value)
               ORDER BY yr",
-        )
+        ))
         .bind(fmt)
         .bind(&shift)
         .bind(user_id)
@@ -1578,14 +1594,14 @@ impl Database {
         fmt: &str,
     ) -> Result<Vec<(String, i64, i64)>, sqlx::Error> {
         let shift = format!("{} hours", tz_offset_hours);
-        sqlx::query_as(
+        sqlx::query_as(&crate::sql!(
             "SELECT strftime(?, timestamp, 'unixepoch', ?) AS yr,
                     COUNT(*) AS listens,
                     SUM(CASE WHEN genres IS NOT NULL THEN 1 ELSE 0 END) AS enriched
                FROM scrobbles
               WHERE user_id = ? AND skipped = FALSE
-              GROUP BY yr ORDER BY yr",
-        )
+              GROUP BY yr ORDER BY yr"
+        ))
         .bind(fmt)
         .bind(&shift)
         .bind(user_id)
@@ -1596,18 +1612,19 @@ impl Database {
     /// exist — so a thin map can say "the backfill is still running" rather
     /// than looking like a small life.
     pub async fn genre_backfill_progress(&self, user_id: i64) -> Result<(i64, i64), sqlx::Error> {
-        let done: (i64,) = sqlx::query_as(
+        let done: (i64,) = sqlx::query_as(&crate::sql!(
             "SELECT COUNT(*) FROM scrobbles
-              WHERE user_id = ? AND skipped = FALSE AND genres IS NOT NULL",
-        )
+              WHERE user_id = ? AND skipped = FALSE AND genres IS NOT NULL"
+        ))
         .bind(user_id)
         .fetch_one(&self.pool)
         .await?;
-        let total: (i64,) =
-            sqlx::query_as("SELECT COUNT(*) FROM scrobbles WHERE user_id = ? AND skipped = FALSE")
-                .bind(user_id)
-                .fetch_one(&self.pool)
-                .await?;
+        let total: (i64,) = sqlx::query_as(&crate::sql!(
+            "SELECT COUNT(*) FROM scrobbles WHERE user_id = ? AND skipped = FALSE",
+        ))
+        .bind(user_id)
+        .fetch_one(&self.pool)
+        .await?;
         Ok((done.0, total.0))
     }
     /// Listens with no genres resolved yet.
@@ -1619,10 +1636,10 @@ impl Database {
         &self,
         limit: i64,
     ) -> Result<Vec<(i64, String, String, Option<String>)>, sqlx::Error> {
-        sqlx::query_as(
+        sqlx::query_as(&crate::sql!(
             "SELECT id, title, artist, album FROM scrobbles
-             WHERE genres IS NULL AND skipped = FALSE ORDER BY timestamp DESC LIMIT ?",
-        )
+             WHERE genres IS NULL AND skipped = FALSE ORDER BY timestamp DESC LIMIT ?"
+        ))
         .bind(limit)
         .fetch_all(&self.pool)
         .await
@@ -1635,7 +1652,7 @@ impl Database {
         // across a chain's components. A comma-joined string would need a
         // recursive CTE to split, for no gain.
         let json = serde_json::to_string(genres).unwrap_or_else(|_| "[]".into());
-        sqlx::query("UPDATE scrobbles SET genres = ? WHERE id = ?")
+        sqlx::query(&crate::sql!("UPDATE scrobbles SET genres = ? WHERE id = ?"))
             .bind(&json)
             .bind(id)
             .execute(&self.pool)
@@ -1678,7 +1695,8 @@ impl Database {
                 AND LOWER(TRIM(artist)) IN ({placeholders})
               GROUP BY 1, 2"
         );
-        let mut q = sqlx::query_as::<_, (String, String, String)>(&sql).bind(user_id);
+        let stmt = crate::sql!(&sql);
+        let mut q = sqlx::query_as::<_, (String, String, String)>(&stmt).bind(user_id);
         for k in &keys {
             q = q.bind(k);
         }
@@ -1708,13 +1726,13 @@ impl Database {
         &self,
         limit: i64,
     ) -> Result<Vec<(String, String, Option<String>)>, sqlx::Error> {
-        sqlx::query_as(
+        sqlx::query_as(&crate::sql!(
             "SELECT title, artist, MAX(album) FROM scrobbles
               WHERE mbid_recording IS NULL AND skipped = FALSE
               GROUP BY LOWER(TRIM(title)), LOWER(TRIM(artist))
               ORDER BY MAX(timestamp) DESC
-              LIMIT ?",
-        )
+              LIMIT ?"
+        ))
         .bind(limit)
         .fetch_all(&self.pool)
         .await
@@ -1728,11 +1746,11 @@ impl Database {
         &self,
         user_id: i64,
     ) -> Result<Vec<(String, String)>, sqlx::Error> {
-        sqlx::query_as(
+        sqlx::query_as(&crate::sql!(
             "SELECT LOWER(TRIM(title)), LOWER(TRIM(artist)) FROM scrobbles
               WHERE user_id = ? AND mbid_recording IS NULL AND skipped = FALSE
-              GROUP BY 1, 2",
-        )
+              GROUP BY 1, 2"
+        ))
         .bind(user_id)
         .fetch_all(&self.pool)
         .await
@@ -1752,7 +1770,7 @@ impl Database {
     ) -> Result<u64, sqlx::Error> {
         let artists_json =
             play.mbid_artist.as_ref().map(|a| serde_json::to_string(a).unwrap_or_default());
-        let r = sqlx::query(
+        let r = sqlx::query(&crate::sql!(
             "UPDATE scrobbles SET
                  mbid_recording   = COALESCE(mbid_recording, ?),
                  mbid_release     = COALESCE(mbid_release, ?),
@@ -1760,8 +1778,8 @@ impl Database {
                  caa_id           = COALESCE(caa_id, ?),
                  caa_release_mbid = COALESCE(caa_release_mbid, ?)
               WHERE mbid_recording IS NULL
-                AND LOWER(TRIM(title)) = ? AND LOWER(TRIM(artist)) = ?",
-        )
+                AND LOWER(TRIM(title)) = ? AND LOWER(TRIM(artist)) = ?"
+        ))
         .bind(&play.mbid_recording)
         .bind(&play.mbid_release)
         .bind(&artists_json)
@@ -1781,13 +1799,13 @@ impl Database {
     /// in the handler from `unresolved_track_keys` and
     /// `MusicBrainzClient::negative_track_keys`.
     pub async fn recording_mbid_coverage(&self, user_id: i64) -> Result<(i64, i64), sqlx::Error> {
-        sqlx::query_as(
+        sqlx::query_as(&crate::sql!(
             "SELECT COUNT(*),
                     COALESCE(SUM(CASE WHEN mbid_recording IS NOT NULL
                                        AND TRIM(mbid_recording) != ''
                                       THEN 1 ELSE 0 END), 0)
-               FROM scrobbles WHERE user_id = ? AND skipped = FALSE",
-        )
+               FROM scrobbles WHERE user_id = ? AND skipped = FALSE"
+        ))
         .bind(user_id)
         .fetch_one(&self.pool)
         .await
@@ -1811,14 +1829,14 @@ impl Database {
         &self,
         limit: i64,
     ) -> Result<Vec<(String, String, String)>, sqlx::Error> {
-        sqlx::query_as(
+        sqlx::query_as(&crate::sql!(
             "SELECT mbid_recording, title, artist FROM scrobbles
               WHERE isrc IS NULL AND skipped = FALSE
                 AND mbid_recording IS NOT NULL AND TRIM(mbid_recording) != ''
               GROUP BY mbid_recording
               ORDER BY MAX(timestamp) DESC
-              LIMIT ?",
-        )
+              LIMIT ?"
+        ))
         .bind(limit)
         .fetch_all(&self.pool)
         .await
@@ -1837,12 +1855,12 @@ impl Database {
         artist: &str,
         isrc: &str,
     ) -> Result<u64, sqlx::Error> {
-        let r = sqlx::query(
+        let r = sqlx::query(&crate::sql!(
             "UPDATE scrobbles SET isrc = ?
               WHERE isrc IS NULL
                 AND LOWER(TRIM(title)) = LOWER(TRIM(?))
-                AND LOWER(TRIM(artist)) = LOWER(TRIM(?))",
-        )
+                AND LOWER(TRIM(artist)) = LOWER(TRIM(?))"
+        ))
         .bind(isrc)
         .bind(title)
         .bind(artist)
@@ -1854,10 +1872,10 @@ impl Database {
         &self,
         limit: i64,
     ) -> Result<Vec<(i64, String, String, Option<String>)>, sqlx::Error> {
-        sqlx::query_as(
+        sqlx::query_as(&crate::sql!(
             "SELECT id, title, artist, album FROM scrobbles
-             WHERE release_year IS NULL AND skipped = FALSE ORDER BY timestamp DESC LIMIT ?",
-        )
+             WHERE release_year IS NULL AND skipped = FALSE ORDER BY timestamp DESC LIMIT ?"
+        ))
         .bind(limit)
         .fetch_all(&self.pool)
         .await
@@ -1871,7 +1889,7 @@ impl Database {
     /// the row ended up with a Cover Art Archive id but no `artwork_url`.
     /// Artwork is `backfill_artwork`'s job alone.
     pub async fn set_scrobble_release_year(&self, id: i64, year: i32) -> Result<(), sqlx::Error> {
-        sqlx::query("UPDATE scrobbles SET release_year = ? WHERE id = ?")
+        sqlx::query(&crate::sql!("UPDATE scrobbles SET release_year = ? WHERE id = ?"))
             .bind(year)
             .bind(id)
             .execute(&self.pool)
@@ -1880,18 +1898,19 @@ impl Database {
     }
     /// (total, with cover art) — drives the Settings artwork progress readout.
     pub async fn artwork_coverage(&self, user_id: i64) -> Result<(i64, i64), sqlx::Error> {
-        let total: (i64,) =
-            sqlx::query_as("SELECT COUNT(*) FROM scrobbles WHERE user_id = ? AND skipped = FALSE")
-                .bind(user_id)
-                .fetch_one(&self.pool)
-                .await?;
+        let total: (i64,) = sqlx::query_as(&crate::sql!(
+            "SELECT COUNT(*) FROM scrobbles WHERE user_id = ? AND skipped = FALSE",
+        ))
+        .bind(user_id)
+        .fetch_one(&self.pool)
+        .await?;
         // Must match the total's population exactly. It didn't: the total
         // excluded skips and this didn't, so a history with skipped listens
         // that happened to have artwork reported more resolved than existed.
-        let with_art: (i64,) = sqlx::query_as(
+        let with_art: (i64,) = sqlx::query_as(&crate::sql!(
             "SELECT COUNT(*) FROM scrobbles
-              WHERE user_id = ? AND skipped = FALSE AND artwork_url IS NOT NULL",
-        )
+              WHERE user_id = ? AND skipped = FALSE AND artwork_url IS NOT NULL"
+        ))
         .bind(user_id)
         .fetch_one(&self.pool)
         .await?;
@@ -1915,12 +1934,12 @@ impl Database {
         Vec<(i64, String, String, Option<String>, Option<i64>, Option<String>, String)>,
         sqlx::Error,
     > {
-        sqlx::query_as(
+        sqlx::query_as(&crate::sql!(
             "SELECT id, title, artist, album, caa_id, caa_release_mbid, source_name
              FROM scrobbles
              WHERE artwork_url IS NULL AND skipped = FALSE
              ORDER BY timestamp DESC LIMIT ?",
-        )
+        ))
         .bind(limit)
         .fetch_all(&self.pool)
         .await
@@ -1936,12 +1955,12 @@ impl Database {
         caa_id: Option<i64>,
         caa_release_mbid: Option<&str>,
     ) -> Result<(), sqlx::Error> {
-        sqlx::query(
+        sqlx::query(&crate::sql!(
             "UPDATE scrobbles SET artwork_url = ?,
                 caa_id = COALESCE(?, caa_id),
                 caa_release_mbid = COALESCE(?, caa_release_mbid)
-             WHERE id = ?",
-        )
+             WHERE id = ?"
+        ))
         .bind(url)
         .bind(caa_id)
         .bind(caa_release_mbid)
@@ -1957,12 +1976,13 @@ impl Database {
     /// permanently in the denominator, so the progress readout could not reach
     /// 100% on any history containing a skip.
     pub async fn language_coverage(&self) -> Result<(i64, i64), sqlx::Error> {
-        let total: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM scrobbles WHERE skipped = FALSE")
-            .fetch_one(&self.pool)
-            .await?;
-        let done: (i64,) = sqlx::query_as(
+        let total: (i64,) =
+            sqlx::query_as(&crate::sql!("SELECT COUNT(*) FROM scrobbles WHERE skipped = FALSE"))
+                .fetch_one(&self.pool)
+                .await?;
+        let done: (i64,) = sqlx::query_as(&crate::sql!(
             "SELECT COUNT(*) FROM scrobbles WHERE skipped = FALSE AND language IS NOT NULL",
-        )
+        ))
         .fetch_one(&self.pool)
         .await?;
         Ok((total.0, done.0))
@@ -2006,14 +2026,14 @@ impl Database {
         // standing in for counts — hence the `Option`s. A fresh account reading
         // `null` where it used to read `0` is the one way this could regress.
         let whole: (i64, Option<i64>, Option<i64>, Option<i64>, Option<f64>) =
-            sqlx::query_as(&format!(
+            sqlx::query_as(&crate::sql!(&format!(
                 "SELECT COUNT(*),
                         SUM(CASE WHEN is_lossless = TRUE THEN 1 ELSE 0 END),
                         SUM(CASE WHEN {FIDELITY_KNOWN} THEN 1 ELSE 0 END),
                         SUM(duration),
                         AVG(quality_score)
                    FROM scrobbles WHERE user_id = ? AND skipped = FALSE"
-            ))
+            )))
             .bind(user_id)
             .fetch_one(&self.pool)
             .await?;
@@ -2024,20 +2044,21 @@ impl Database {
         // inside this week, but the floor is the smaller of the two anyway —
         // the alternative is a silent hole on whichever boundary is wrong.
         let floor = week_start.min(today_start);
-        let recent: (Option<i64>, Option<i64>, Option<i64>, Option<i64>) = sqlx::query_as(
-            "SELECT SUM(CASE WHEN timestamp >= ?2 THEN 1 ELSE 0 END),
+        let recent: (Option<i64>, Option<i64>, Option<i64>, Option<i64>) =
+            sqlx::query_as(&crate::sql!(
+                "SELECT SUM(CASE WHEN timestamp >= ?2 THEN 1 ELSE 0 END),
                     SUM(CASE WHEN timestamp >= ?3 THEN 1 ELSE 0 END),
                     SUM(CASE WHEN timestamp >= ?2 THEN duration END),
                     SUM(CASE WHEN timestamp >= ?3 THEN duration END)
                FROM scrobbles
-              WHERE user_id = ?1 AND skipped = FALSE AND timestamp >= ?4",
-        )
-        .bind(user_id)
-        .bind(today_start)
-        .bind(week_start)
-        .bind(floor)
-        .fetch_one(&self.pool)
-        .await?;
+              WHERE user_id = ?1 AND skipped = FALSE AND timestamp >= ?4"
+            ))
+            .bind(user_id)
+            .bind(today_start)
+            .bind(week_start)
+            .bind(floor)
+            .fetch_one(&self.pool)
+            .await?;
         let today = recent.0.unwrap_or(0);
         let week = recent.1.unwrap_or(0);
         let today_hours = recent.2.unwrap_or(0) as f64 / 3600.0;
@@ -2048,12 +2069,12 @@ impl Database {
         } else {
             0
         };
-        let top_artist: Option<(String, i64)> = sqlx::query_as(&format!(
+        let top_artist: Option<(String, i64)> = sqlx::query_as(&crate::sql!(&format!(
             "SELECT artist, COUNT(*) as cnt FROM scrobbles
               WHERE user_id = ? AND skipped = FALSE AND timestamp >= ?
                 AND LOWER(TRIM(artist)) {NOT_VARIOUS}
               GROUP BY artist ORDER BY cnt DESC LIMIT 1"
-        ))
+        )))
         .bind(user_id)
         .bind(now - 30 * 86400)
         .fetch_optional(&self.pool)

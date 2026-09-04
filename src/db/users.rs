@@ -33,12 +33,10 @@ impl Database {
             Option<String>,
             Option<bool>,
             Option<i64>,
-        )> = sqlx::query_as(
-            "SELECT u.id, u.username, u.role, t.id, t.default_chain_id, t.scopes,
+        )> = sqlx::query_as(&crate::sql!("SELECT u.id, u.username, u.role, t.id, t.default_chain_id, t.scopes,
                         t.imports_are_live, t.last_used_at
              FROM tokens t JOIN users u ON t.user_id = u.id
-             WHERE t.token_hash = ? AND (t.expires_at IS NULL OR t.expires_at > ?) AND u.disabled = 0"
-        )
+             WHERE t.token_hash = ? AND (t.expires_at IS NULL OR t.expires_at > ?) AND u.disabled = 0"))
         .bind(&token_hash)
         .bind(now)
         .fetch_optional(&self.pool)
@@ -60,11 +58,13 @@ impl Database {
             // reader nothing — and a scrobble client submitting every few
             // minutes stops taking the write lock for it every time.
             if last_used.is_none_or(|t| now - t >= Self::ACTIVITY_STAMP_INTERVAL_SECS) {
-                let _ = sqlx::query("UPDATE tokens SET last_used_at = ? WHERE token_hash = ?")
-                    .bind(now)
-                    .bind(&token_hash)
-                    .execute(&self.pool)
-                    .await;
+                let _ = sqlx::query(&crate::sql!(
+                    "UPDATE tokens SET last_used_at = ? WHERE token_hash = ?"
+                ))
+                .bind(now)
+                .bind(&token_hash)
+                .execute(&self.pool)
+                .await;
             }
             Ok(Some(TokenAuth {
                 user: AuthUser { user_id, username, is_admin: role == "admin" },
@@ -106,10 +106,10 @@ impl Database {
         role: &str,
     ) -> Result<i64, sqlx::Error> {
         let now = Self::now_secs();
-        let result = sqlx::query_as::<_, (i64,)>(
+        let result = sqlx::query_as::<_, (i64,)>(&crate::sql!(
             "INSERT INTO users (username, display_name, password_hash, role, created_at, \
                                 share_all_with_patched) VALUES (?, ?, ?, ?, ?, 1) RETURNING id",
-        )
+        ))
         .bind(username)
         .bind(display_name)
         .bind(password_hash)
@@ -125,7 +125,7 @@ impl Database {
         id: i64,
     ) -> Result<Option<(String, bool)>, sqlx::Error> {
         let row: Option<(String, bool)> =
-            sqlx::query_as("SELECT role, disabled FROM users WHERE id = ?")
+            sqlx::query_as(&crate::sql!("SELECT role, disabled FROM users WHERE id = ?"))
                 .bind(id)
                 .fetch_optional(&self.pool)
                 .await?;
@@ -134,14 +134,15 @@ impl Database {
     /// Count admins who can actually log in (enabled). Used to guard against
     /// leaving the instance with no reachable admin.
     pub async fn count_active_admins(&self) -> Result<i64, sqlx::Error> {
-        let c: (i64,) =
-            sqlx::query_as("SELECT COUNT(*) FROM users WHERE role = 'admin' AND disabled = 0")
-                .fetch_one(&self.pool)
-                .await?;
+        let c: (i64,) = sqlx::query_as(&crate::sql!(
+            "SELECT COUNT(*) FROM users WHERE role = 'admin' AND disabled = 0",
+        ))
+        .fetch_one(&self.pool)
+        .await?;
         Ok(c.0)
     }
     pub async fn update_user_role(&self, id: i64, role: &str) -> Result<bool, sqlx::Error> {
-        let res = sqlx::query("UPDATE users SET role = ? WHERE id = ?")
+        let res = sqlx::query(&crate::sql!("UPDATE users SET role = ? WHERE id = ?"))
             .bind(role)
             .bind(id)
             .execute(&self.pool)
@@ -149,14 +150,14 @@ impl Database {
         Ok(res.rows_affected() > 0)
     }
     pub async fn set_user_disabled(&self, id: i64, disabled: bool) -> Result<bool, sqlx::Error> {
-        let res = sqlx::query("UPDATE users SET disabled = ? WHERE id = ?")
+        let res = sqlx::query(&crate::sql!("UPDATE users SET disabled = ? WHERE id = ?"))
             .bind(disabled)
             .bind(id)
             .execute(&self.pool)
             .await?;
         // Disabling a user invalidates their live web sessions immediately.
         if disabled {
-            let _ = sqlx::query("DELETE FROM web_sessions WHERE user_id = ?")
+            let _ = sqlx::query(&crate::sql!("DELETE FROM web_sessions WHERE user_id = ?"))
                 .bind(id)
                 .execute(&self.pool)
                 .await;
@@ -168,7 +169,7 @@ impl Database {
         id: i64,
         password_hash: &str,
     ) -> Result<bool, sqlx::Error> {
-        let res = sqlx::query("UPDATE users SET password_hash = ? WHERE id = ?")
+        let res = sqlx::query(&crate::sql!("UPDATE users SET password_hash = ? WHERE id = ?"))
             .bind(password_hash)
             .bind(id)
             .execute(&self.pool)
@@ -181,7 +182,7 @@ impl Database {
     /// else may have access", and a new password that leaves the old sessions
     /// logged in does not actually take anything away from them.
     pub async fn clear_user_sessions(&self, id: i64) -> Result<u64, sqlx::Error> {
-        let res = sqlx::query("DELETE FROM web_sessions WHERE user_id = ?")
+        let res = sqlx::query(&crate::sql!("DELETE FROM web_sessions WHERE user_id = ?"))
             .bind(id)
             .execute(&self.pool)
             .await?;
@@ -189,10 +190,10 @@ impl Database {
     }
     /// A user's own profile, for the account screen.
     pub async fn get_profile(&self, id: i64) -> Result<Option<UserProfile>, sqlx::Error> {
-        sqlx::query_as::<_, UserProfile>(
+        sqlx::query_as::<_, UserProfile>(&crate::sql!(
             "SELECT id, username, display_name, role, created_at, avatar_url, bio, disabled
                FROM users WHERE id = ?",
-        )
+        ))
         .bind(id)
         .fetch_optional(&self.pool)
         .await
@@ -217,7 +218,7 @@ impl Database {
     ) -> Result<bool, sqlx::Error> {
         let mut changed = false;
         if let Some(v) = display_name {
-            sqlx::query("UPDATE users SET display_name = ? WHERE id = ?")
+            sqlx::query(&crate::sql!("UPDATE users SET display_name = ? WHERE id = ?"))
                 .bind(v)
                 .bind(id)
                 .execute(&self.pool)
@@ -225,7 +226,7 @@ impl Database {
             changed = true;
         }
         if let Some(v) = bio {
-            sqlx::query("UPDATE users SET bio = ? WHERE id = ?")
+            sqlx::query(&crate::sql!("UPDATE users SET bio = ? WHERE id = ?"))
                 .bind(v)
                 .bind(id)
                 .execute(&self.pool)
@@ -233,7 +234,7 @@ impl Database {
             changed = true;
         }
         if let Some(v) = avatar_url {
-            sqlx::query("UPDATE users SET avatar_url = ? WHERE id = ?")
+            sqlx::query(&crate::sql!("UPDATE users SET avatar_url = ? WHERE id = ?"))
                 .bind(v)
                 .bind(id)
                 .execute(&self.pool)
@@ -248,11 +249,12 @@ impl Database {
     /// the caller already holds a session, so without it a borrowed browser is
     /// enough to lock the owner out of their own account.
     pub async fn check_user_password(&self, id: i64, password: &str) -> bool {
-        let row: Result<(String,), _> =
-            sqlx::query_as("SELECT password_hash FROM users WHERE id = ? AND disabled = 0")
-                .bind(id)
-                .fetch_one(&self.pool)
-                .await;
+        let row: Result<(String,), _> = sqlx::query_as(&crate::sql!(
+            "SELECT password_hash FROM users WHERE id = ? AND disabled = 0"
+        ))
+        .bind(id)
+        .fetch_one(&self.pool)
+        .await;
         matches!(row, Ok((hash,)) if Self::verify_password(password, &hash))
     }
     /// Delete a user and everything they own, in one transaction. Every listen,
@@ -263,29 +265,29 @@ impl Database {
         // Revisions reference notes, and notes reference scrobbles, so both have
         // to be cleared before the rows they point at. Entities are shared
         // metadata and stay; the loves and notes that pointed at them go.
-        sqlx::query(
+        sqlx::query(&crate::sql!(
             "DELETE FROM note_revisions WHERE note_id IN (SELECT id FROM notes WHERE user_id = ?)",
-        )
+        ))
         .bind(id)
         .execute(&mut *tx)
         .await?;
         // Credits point at listens, so they go before them — the same rule as
         // the notes above, and the one the loop below cannot express because
         // this table has no `user_id` of its own.
-        sqlx::query(
+        sqlx::query(&crate::sql!(
             "DELETE FROM scrobble_artists WHERE scrobble_id IN
-                 (SELECT id FROM scrobbles WHERE user_id = ?)",
-        )
+                 (SELECT id FROM scrobbles WHERE user_id = ?)"
+        ))
         .bind(id)
         .execute(&mut *tx)
         .await?;
         // Playlist tracks point at playlists and have no `user_id` of their
         // own, so they cannot go in the loop below — the same shape as
         // `scrobble_artists` above, and the same reason.
-        sqlx::query(
+        sqlx::query(&crate::sql!(
             "DELETE FROM playlist_tracks WHERE playlist_id IN
-                 (SELECT id FROM playlists WHERE user_id = ?)",
-        )
+                 (SELECT id FROM playlists WHERE user_id = ?)"
+        ))
         .bind(id)
         .execute(&mut *tx)
         .await?;
@@ -323,12 +325,15 @@ impl Database {
             "web_sessions",
             "user_connections",
         ] {
-            sqlx::query(&format!("DELETE FROM {} WHERE user_id = ?", table))
+            sqlx::query(&crate::sql!(&format!("DELETE FROM {} WHERE user_id = ?", table)))
                 .bind(id)
                 .execute(&mut *tx)
                 .await?;
         }
-        let res = sqlx::query("DELETE FROM users WHERE id = ?").bind(id).execute(&mut *tx).await?;
+        let res = sqlx::query(&crate::sql!("DELETE FROM users WHERE id = ?"))
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
         tx.commit().await?;
         Ok(res.rows_affected() > 0)
     }
@@ -363,11 +368,11 @@ impl Database {
                     }
                 })
                 .collect();
-            let res = sqlx::query(
+            let res = sqlx::query(&crate::sql!(
                 "INSERT INTO pairing_requests
                     (device_code_hash, user_code, client_name, scopes, created_at, expires_at)
-                 VALUES (?, ?, ?, ?, ?, ?)",
-            )
+                 VALUES (?, ?, ?, ?, ?, ?)"
+            ))
             .bind(Self::hash_token(&device_code))
             .bind(&code)
             .bind(client_name)
@@ -390,10 +395,10 @@ impl Database {
         &self,
         user_code: &str,
     ) -> Result<Option<(i64, String, String, bool)>, sqlx::Error> {
-        let row: Option<(i64, String, String, Option<i64>)> = sqlx::query_as(
+        let row: Option<(i64, String, String, Option<i64>)> = sqlx::query_as(&crate::sql!(
             "SELECT id, client_name, scopes, approved_at FROM pairing_requests
               WHERE user_code = ? AND expires_at > ?",
-        )
+        ))
         .bind(user_code.trim().to_uppercase())
         .bind(Self::now_secs())
         .fetch_optional(&self.pool)
@@ -412,10 +417,10 @@ impl Database {
         default_chain_id: Option<i64>,
     ) -> Result<bool, sqlx::Error> {
         let now = Self::now_secs();
-        let row: Option<(i64, String, String)> = sqlx::query_as(
+        let row: Option<(i64, String, String)> = sqlx::query_as(&crate::sql!(
             "SELECT id, client_name, scopes FROM pairing_requests
-              WHERE user_code = ? AND expires_at > ? AND approved_at IS NULL",
-        )
+              WHERE user_code = ? AND expires_at > ? AND approved_at IS NULL"
+        ))
         .bind(user_code.trim().to_uppercase())
         .bind(now)
         .fetch_optional(&self.pool)
@@ -428,11 +433,11 @@ impl Database {
         // operator flips it live from Settings once they know what it is.
         let token =
             self.create_token(user_id, &client_name, &scopes, default_chain_id, false).await?;
-        sqlx::query(
+        sqlx::query(&crate::sql!(
             "UPDATE pairing_requests
                 SET user_id = ?, default_chain_id = ?, token = ?, approved_at = ?
-              WHERE id = ? AND approved_at IS NULL",
-        )
+              WHERE id = ? AND approved_at IS NULL"
+        ))
         .bind(user_id)
         .bind(default_chain_id)
         .bind(&token)
@@ -445,9 +450,9 @@ impl Database {
     /// What the polling client should be told.
     pub async fn poll_pairing(&self, device_code: &str) -> Result<PairingPoll, sqlx::Error> {
         let hash = Self::hash_token(device_code);
-        let row: Option<(i64, Option<String>, i64)> = sqlx::query_as(
+        let row: Option<(i64, Option<String>, i64)> = sqlx::query_as(&crate::sql!(
             "SELECT id, token, expires_at FROM pairing_requests WHERE device_code_hash = ?",
-        )
+        ))
         .bind(&hash)
         .fetch_optional(&self.pool)
         .await?;
@@ -457,7 +462,7 @@ impl Database {
         if let Some(token) = token {
             // Handed over once, then cleared: the request row must not remain a
             // second copy of a live credential.
-            sqlx::query("DELETE FROM pairing_requests WHERE id = ?")
+            sqlx::query(&crate::sql!("DELETE FROM pairing_requests WHERE id = ?"))
                 .bind(id)
                 .execute(&self.pool)
                 .await?;
@@ -471,11 +476,12 @@ impl Database {
     /// Drop expired, unapproved requests. Cheap, and keeps a guessable code
     /// from lingering.
     pub async fn purge_expired_pairings(&self) -> Result<u64, sqlx::Error> {
-        let res =
-            sqlx::query("DELETE FROM pairing_requests WHERE expires_at <= ? AND token IS NULL")
-                .bind(Self::now_secs())
-                .execute(&self.pool)
-                .await?;
+        let res = sqlx::query(&crate::sql!(
+            "DELETE FROM pairing_requests WHERE expires_at <= ? AND token IS NULL",
+        ))
+        .bind(Self::now_secs())
+        .execute(&self.pool)
+        .await?;
         Ok(res.rows_affected())
     }
     pub async fn create_token(
@@ -491,7 +497,7 @@ impl Database {
         let token = format!("td_{}", hex::encode(raw));
         let token_hash = Self::hash_token(&token);
         let now = Self::now_secs();
-        sqlx::query("INSERT INTO tokens (user_id, token_hash, name, scopes, created_at, default_chain_id, imports_are_live) VALUES (?, ?, ?, ?, ?, ?, ?)")
+        sqlx::query(&crate::sql!("INSERT INTO tokens (user_id, token_hash, name, scopes, created_at, default_chain_id, imports_are_live) VALUES (?, ?, ?, ?, ?, ?, ?)"))
             .bind(user_id).bind(&token_hash).bind(name).bind(scopes).bind(now)
             .bind(default_chain_id)
             .bind(imports_are_live)
@@ -510,10 +516,10 @@ impl Database {
         default_chain_id: Option<i64>,
         imports_are_live: bool,
     ) -> Result<bool, sqlx::Error> {
-        let result = sqlx::query(
+        let result = sqlx::query(&crate::sql!(
             "UPDATE tokens SET name = ?, default_chain_id = ?, imports_are_live = ?
              WHERE id = ? AND user_id = ?",
-        )
+        ))
         .bind(name)
         .bind(default_chain_id)
         .bind(imports_are_live)
@@ -535,12 +541,14 @@ impl Database {
         use rand::Rng;
         let raw: [u8; 24] = rand::rng().random();
         let token = format!("td_{}", hex::encode(raw));
-        let result = sqlx::query("UPDATE tokens SET token_hash = ? WHERE id = ? AND user_id = ?")
-            .bind(Self::hash_token(&token))
-            .bind(token_id)
-            .bind(user_id)
-            .execute(&self.pool)
-            .await?;
+        let result = sqlx::query(&crate::sql!(
+            "UPDATE tokens SET token_hash = ? WHERE id = ? AND user_id = ?"
+        ))
+        .bind(Self::hash_token(&token))
+        .bind(token_id)
+        .bind(user_id)
+        .execute(&self.pool)
+        .await?;
         if result.rows_affected() == 0 {
             return Ok(None);
         }
@@ -548,7 +556,7 @@ impl Database {
         Ok(Some(token))
     }
     pub async fn delete_token(&self, user_id: i64, token_id: i64) -> Result<bool, sqlx::Error> {
-        let result = sqlx::query("DELETE FROM tokens WHERE id = ? AND user_id = ?")
+        let result = sqlx::query(&crate::sql!("DELETE FROM tokens WHERE id = ? AND user_id = ?"))
             .bind(token_id)
             .bind(user_id)
             .execute(&self.pool)
@@ -556,21 +564,22 @@ impl Database {
         Ok(result.rows_affected() > 0)
     }
     pub async fn has_users(&self) -> Result<bool, sqlx::Error> {
-        let count: (i64,) =
-            sqlx::query_as("SELECT COUNT(*) FROM users").fetch_one(&self.pool).await?;
+        let count: (i64,) = sqlx::query_as(&crate::sql!("SELECT COUNT(*) FROM users"))
+            .fetch_one(&self.pool)
+            .await?;
         Ok(count.0 > 0)
     }
     pub async fn list_users(&self) -> Result<Vec<UserRecord>, sqlx::Error> {
-        sqlx::query_as("SELECT id, username, display_name, role, created_at, disabled FROM users ORDER BY id ASC")
+        sqlx::query_as(&crate::sql!("SELECT id, username, display_name, role, created_at, disabled FROM users ORDER BY id ASC"))
             .fetch_all(&self.pool).await
     }
     pub async fn list_tokens(&self, user_id: i64) -> Result<Vec<TokenRecord>, sqlx::Error> {
-        sqlx::query_as(
+        sqlx::query_as(&crate::sql!(
             "SELECT t.id, t.name, t.scopes, t.created_at, t.last_used_at, t.default_chain_id,
                     t.imports_are_live, c.name AS default_chain_name
              FROM tokens t LEFT JOIN signal_chains c ON c.id = t.default_chain_id
              WHERE t.user_id = ? ORDER BY t.created_at ASC",
-        )
+        ))
         .bind(user_id)
         .fetch_all(&self.pool)
         .await
@@ -596,7 +605,7 @@ impl Database {
     /// fractions of the same whole. Paired counts that do not share a
     /// population is the bug this codebase has now found five times.
     pub async fn listening_coverage(&self, user_id: i64) -> Result<ListeningCoverage, sqlx::Error> {
-        let row: ListeningCoverage = sqlx::query_as(&format!(
+        let row: ListeningCoverage = sqlx::query_as(&crate::sql!(&format!(
             "SELECT
                 COUNT(*) AS plays,
                 COUNT(DISTINCT LOWER(TRIM(artist))) AS artists,
@@ -615,7 +624,7 @@ impl Database {
                 SUM(CASE WHEN quality_score IS NOT NULL THEN 1 ELSE 0 END) AS with_quality
              FROM scrobbles WHERE user_id = ? AND skipped = FALSE",
             fidelity = FIDELITY_KNOWN
-        ))
+        )))
         .bind(user_id)
         .fetch_one(&self.pool)
         .await?;
@@ -625,14 +634,14 @@ impl Database {
     /// not the listen — which is also the reason a genre position is
     /// artist-level and the MCP instructions say so.
     pub async fn genre_coverage(&self, user_id: i64) -> Result<(i64, i64), sqlx::Error> {
-        let row: (i64, i64) = sqlx::query_as(
+        let row: (i64, i64) = sqlx::query_as(&crate::sql!(
             "SELECT
                 COUNT(*),
                 SUM(CASE WHEN a.genres IS NOT NULL AND a.genres != '[]' THEN 1 ELSE 0 END)
              FROM (SELECT DISTINCT LOWER(TRIM(artist)) AS k FROM scrobbles
                    WHERE user_id = ? AND skipped = FALSE) s
-             LEFT JOIN artists a ON LOWER(TRIM(a.name)) = s.k",
-        )
+             LEFT JOIN artists a ON LOWER(TRIM(a.name)) = s.k"
+        ))
         .bind(user_id)
         .fetch_one(&self.pool)
         .await?;
@@ -642,11 +651,11 @@ impl Database {
     /// this history imported or observed?", which decides how much of the rest
     /// of the profile can be trusted.
     pub async fn source_breakdown(&self, user_id: i64) -> Result<Vec<(String, i64)>, sqlx::Error> {
-        sqlx::query_as(
+        sqlx::query_as(&crate::sql!(
             "SELECT source_name, COUNT(*) AS plays FROM scrobbles
              WHERE user_id = ? AND skipped = FALSE
-             GROUP BY source_name ORDER BY plays DESC",
-        )
+             GROUP BY source_name ORDER BY plays DESC"
+        ))
         .bind(user_id)
         .fetch_all(&self.pool)
         .await
@@ -698,11 +707,11 @@ impl Database {
             format!("tdmcpr_{}", hex::encode(raw))
         });
 
-        let id: Vec<(i64,)> = sqlx::query_as(
+        let id: Vec<(i64,)> = sqlx::query_as(&crate::sql!(
             "INSERT INTO mcp_connections
                 (user_id, name, token_hash, scopes, client_id, created_at, expires_at, refresh_hash)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
-        )
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?) RETURNING id"
+        ))
         .bind(user_id)
         .bind(name)
         .bind(Self::hash_token(&token))
@@ -728,12 +737,12 @@ impl Database {
         let hash = Self::hash_token(token);
         let now = Self::now_secs();
         let row: Option<(i64, i64, String, String, String, bool, Option<i64>, Option<i64>)> =
-            sqlx::query_as(
+            sqlx::query_as(&crate::sql!(
                 "SELECT c.id, u.id, u.username, u.role, c.scopes, u.disabled,
                         c.expires_at, c.revoked_at
                  FROM mcp_connections c JOIN users u ON u.id = c.user_id
-                 WHERE c.token_hash = ?",
-            )
+                 WHERE c.token_hash = ?"
+            ))
             .bind(&hash)
             .fetch_optional(&self.pool)
             .await?;
@@ -746,7 +755,7 @@ impl Database {
             return Ok(None);
         }
 
-        sqlx::query("UPDATE mcp_connections SET last_used_at = ? WHERE id = ?")
+        sqlx::query(&crate::sql!("UPDATE mcp_connections SET last_used_at = ? WHERE id = ?"))
             .bind(now)
             .bind(id)
             .execute(&self.pool)
@@ -768,9 +777,9 @@ impl Database {
         ttl_secs: i64,
     ) -> Result<Option<McpCredential>, sqlx::Error> {
         use rand::Rng;
-        let row: Option<(i64,)> = sqlx::query_as(
+        let row: Option<(i64,)> = sqlx::query_as(&crate::sql!(
             "SELECT id FROM mcp_connections WHERE refresh_hash = ? AND revoked_at IS NULL",
-        )
+        ))
         .bind(Self::hash_token(refresh_token))
         .fetch_optional(&self.pool)
         .await?;
@@ -782,10 +791,10 @@ impl Database {
         let refresh = format!("tdmcpr_{}", hex::encode(raw));
         let now = Self::now_secs();
 
-        sqlx::query(
+        sqlx::query(&crate::sql!(
             "UPDATE mcp_connections SET token_hash = ?, refresh_hash = ?, expires_at = ?
              WHERE id = ?",
-        )
+        ))
         .bind(Self::hash_token(&token))
         .bind(Self::hash_token(&refresh))
         .bind(now + ttl_secs)
@@ -799,13 +808,13 @@ impl Database {
         &self,
         user_id: i64,
     ) -> Result<Vec<McpConnectionRecord>, sqlx::Error> {
-        sqlx::query_as(
+        sqlx::query_as(&crate::sql!(
             "SELECT id, name, scopes, client_id, created_at, last_used_at, expires_at,
                     (SELECT COUNT(*) FROM mcp_audit a WHERE a.connection_id = c.id) AS calls
              FROM mcp_connections c
              WHERE user_id = ? AND revoked_at IS NULL
              ORDER BY created_at DESC",
-        )
+        ))
         .bind(user_id)
         .fetch_all(&self.pool)
         .await
@@ -814,11 +823,11 @@ impl Database {
     /// with a name. "Which chatbot read my history in March" is a question that
     /// outlives the connection, and a dangling id cannot answer it.
     pub async fn revoke_mcp_connection(&self, user_id: i64, id: i64) -> Result<bool, sqlx::Error> {
-        let res = sqlx::query(
+        let res = sqlx::query(&crate::sql!(
             "UPDATE mcp_connections SET revoked_at = ?, token_hash = 'revoked:' || id,
                     refresh_hash = NULL
              WHERE id = ? AND user_id = ? AND revoked_at IS NULL",
-        )
+        ))
         .bind(Self::now_secs())
         .bind(id)
         .bind(user_id)
@@ -846,11 +855,11 @@ impl Database {
         // free-text argument should not turn the audit table into the largest
         // thing in the database.
         let args = args.map(|a| a.chars().take(500).collect::<String>());
-        let res = sqlx::query(
+        let res = sqlx::query(&crate::sql!(
             "INSERT INTO mcp_audit
                 (connection_id, user_id, at, method, tool, args, ok, rows_returned, ms)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        )
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
+        ))
         .bind(connection_id)
         .bind(user_id)
         .bind(Self::now_secs())
@@ -871,12 +880,12 @@ impl Database {
         user_id: i64,
         limit: i64,
     ) -> Result<Vec<McpAuditRow>, sqlx::Error> {
-        sqlx::query_as(
+        sqlx::query_as(&crate::sql!(
             "SELECT a.id, a.at, a.method, a.tool, a.args, a.ok, a.rows_returned, a.ms,
                     c.name AS connection_name
              FROM mcp_audit a LEFT JOIN mcp_connections c ON c.id = a.connection_id
              WHERE a.user_id = ? ORDER BY a.at DESC, a.id DESC LIMIT ?",
-        )
+        ))
         .bind(user_id)
         .bind(limit)
         .fetch_all(&self.pool)
@@ -885,12 +894,13 @@ impl Database {
     /// How many calls this connection has made since `since`. The budget check
     /// — one indexed count, run before the tool rather than after.
     pub async fn mcp_calls_since(&self, connection_id: i64, since: i64) -> i64 {
-        let row: Result<(i64,), _> =
-            sqlx::query_as("SELECT COUNT(*) FROM mcp_audit WHERE connection_id = ? AND at >= ?")
-                .bind(connection_id)
-                .bind(since)
-                .fetch_one(&self.pool)
-                .await;
+        let row: Result<(i64,), _> = sqlx::query_as(&crate::sql!(
+            "SELECT COUNT(*) FROM mcp_audit WHERE connection_id = ? AND at >= ?",
+        ))
+        .bind(connection_id)
+        .bind(since)
+        .fetch_one(&self.pool)
+        .await;
         row.map(|r| r.0).unwrap_or(0)
     }
     pub async fn register_oauth_client(
@@ -900,14 +910,14 @@ impl Database {
         redirect_uris: &str,
         registered_by_url: bool,
     ) -> Result<(), sqlx::Error> {
-        sqlx::query(
+        sqlx::query(&crate::sql!(
             "INSERT INTO oauth_clients
                 (client_id, client_name, redirect_uris, registered_by_url, created_at)
              VALUES (?, ?, ?, ?, ?)
              ON CONFLICT(client_id) DO UPDATE SET
                 client_name = excluded.client_name,
-                redirect_uris = excluded.redirect_uris",
-        )
+                redirect_uris = excluded.redirect_uris"
+        ))
         .bind(client_id)
         .bind(client_name)
         .bind(redirect_uris)
@@ -921,10 +931,10 @@ impl Database {
         &self,
         client_id: &str,
     ) -> Result<Option<OAuthClient>, sqlx::Error> {
-        sqlx::query_as(
+        sqlx::query_as(&crate::sql!(
             "SELECT client_id, client_name, redirect_uris, registered_by_url
-             FROM oauth_clients WHERE client_id = ?",
-        )
+             FROM oauth_clients WHERE client_id = ?"
+        ))
         .bind(client_id)
         .fetch_optional(&self.pool)
         .await
@@ -944,12 +954,12 @@ impl Database {
         let raw: [u8; 32] = rand::rng().random();
         let code = hex::encode(raw);
         let now = Self::now_secs();
-        sqlx::query(
+        sqlx::query(&crate::sql!(
             "INSERT INTO oauth_codes
                 (code_hash, client_id, user_id, redirect_uri, scopes, code_challenge,
                  resource, created_at, expires_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        )
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
+        ))
         .bind(Self::hash_token(&code))
         .bind(client_id)
         .bind(user_id)
@@ -979,18 +989,18 @@ impl Database {
     /// unrelated query, rather than on the delete having happened. See
     /// `create_mcp_connection` for the measurement.
     pub async fn consume_oauth_code(&self, code: &str) -> Result<Option<OAuthCode>, sqlx::Error> {
-        let rows: Vec<OAuthCode> = sqlx::query_as(
+        let rows: Vec<OAuthCode> = sqlx::query_as(&crate::sql!(
             "DELETE FROM oauth_codes WHERE code_hash = ?
              RETURNING client_id, user_id, redirect_uri, scopes, code_challenge,
-                       resource, expires_at",
-        )
+                       resource, expires_at"
+        ))
         .bind(Self::hash_token(code))
         .fetch_all(&self.pool)
         .await?;
         Ok(rows.into_iter().next().filter(|c| c.expires_at > Self::now_secs()))
     }
     pub async fn purge_expired_oauth_codes(&self) -> Result<(), sqlx::Error> {
-        sqlx::query("DELETE FROM oauth_codes WHERE expires_at < ?")
+        sqlx::query(&crate::sql!("DELETE FROM oauth_codes WHERE expires_at < ?"))
             .bind(Self::now_secs())
             .execute(&self.pool)
             .await?;

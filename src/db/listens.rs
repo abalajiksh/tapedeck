@@ -55,7 +55,7 @@ impl Database {
         // as `fold_artist_credit`: the fuller form of the credit.
         let artist_credit = play.artists.as_ref().filter(|a| a.len() > 1).map(|a| a.join("; "));
 
-        sqlx::query(
+        sqlx::query(&crate::sql!(
             "INSERT INTO scrobbles (
                 user_id, title, artist, artist_credit, album, timestamp, duration,
                 source_id, source_name, status, skipped,
@@ -72,8 +72,8 @@ impl Database {
                 ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
                 ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
                 ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
-            )",
-        )
+            )"
+        ))
         .bind(user_id)
         .bind(&play.title)
         .bind(&play.artist)
@@ -178,13 +178,13 @@ impl Database {
             return Ok(());
         }
         // COALESCE so a client that sends one field does not blank the others.
-        sqlx::query(
+        sqlx::query(&crate::sql!(
             "UPDATE scrobbles SET
                 listened_ms  = COALESCE(?, listened_ms),
                 is_shuffle   = COALESCE(?, is_shuffle),
                 queue_source = COALESCE(?, queue_source)
-             WHERE user_id = ? AND source_id = ? AND source_name = ?",
-        )
+             WHERE user_id = ? AND source_id = ? AND source_name = ?"
+        ))
         .bind(report.listened_ms)
         .bind(report.is_shuffle)
         .bind(report.queue_source.as_deref())
@@ -209,9 +209,9 @@ impl Database {
         source_name: &str,
         play: &Play,
     ) -> Result<(), sqlx::Error> {
-        let row: Option<(i64,)> = sqlx::query_as(
+        let row: Option<(i64,)> = sqlx::query_as(&crate::sql!(
             "SELECT id FROM scrobbles WHERE user_id = ? AND source_id = ? AND source_name = ?",
-        )
+        ))
         .bind(user_id)
         .bind(source_id)
         .bind(source_name)
@@ -225,10 +225,10 @@ impl Database {
             // `OR IGNORE` rather than a check: the primary key already says one
             // row per artist per listen, and a tag crediting somebody twice is
             // a real thing rather than an error worth failing a listen over.
-            sqlx::query(
-                "INSERT OR IGNORE INTO scrobble_artists (scrobble_id, artist_key, name, position, mbid)
-                 VALUES (?, ?, ?, ?, ?)",
-            )
+            sqlx::query(&crate::sql!(
+                "INSERT INTO scrobble_artists (scrobble_id, artist_key, name, position, mbid)
+                 VALUES (?, ?, ?, ?, ?) ON CONFLICT DO NOTHING",
+            ))
             .bind(scrobble_id)
             .bind(Database::artist_key(&name))
             .bind(&name)
@@ -255,9 +255,9 @@ impl Database {
         source_id: &str,
         source_name: &str,
     ) -> Result<Option<i64>, sqlx::Error> {
-        let hit: Option<(i64,)> = sqlx::query_as(
+        let hit: Option<(i64,)> = sqlx::query_as(&crate::sql!(
             "SELECT id FROM scrobbles WHERE user_id = ? AND source_id = ? AND source_name = ?",
-        )
+        ))
         .bind(user_id)
         .bind(source_id)
         .bind(source_name)
@@ -370,7 +370,8 @@ impl Database {
               ORDER BY id LIMIT 1",
             ph = placeholders
         );
-        let mut q = sqlx::query_as::<_, (i64,)>(&sql)
+        let stmt = crate::sql!(&sql);
+        let mut q = sqlx::query_as::<_, (i64,)>(&stmt)
             .bind(user_id)
             .bind(skipped)
             .bind(timestamp)
@@ -403,9 +404,9 @@ impl Database {
         Ok(self.fuzzy_existing_id(user_id, play, skipped).await?.is_some())
     }
     pub async fn get_pending_scrobbles(&self) -> Result<Vec<PendingScrobble>, sqlx::Error> {
-        let records: Vec<ScrobbleRecord> = sqlx::query_as::<_, ScrobbleRecord>(
+        let records: Vec<ScrobbleRecord> = sqlx::query_as::<_, ScrobbleRecord>(&crate::sql!(
             "SELECT * FROM scrobbles WHERE status = 'pending' ORDER BY timestamp ASC",
-        )
+        ))
         .fetch_all(&self.pool)
         .await?;
 
@@ -449,7 +450,7 @@ impl Database {
     /// retry from re-sending to a sink that already accepted the listen.
     pub async fn mark_sink_delivered(&self, id: i64, sink_name: &str) -> Result<(), sqlx::Error> {
         let row: Option<(Option<String>,)> =
-            sqlx::query_as("SELECT delivered_sinks FROM scrobbles WHERE id = ?")
+            sqlx::query_as(&crate::sql!("SELECT delivered_sinks FROM scrobbles WHERE id = ?"))
                 .bind(id)
                 .fetch_optional(&self.pool)
                 .await?;
@@ -457,7 +458,7 @@ impl Database {
             row.and_then(|(s,)| s).and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
         if !set.iter().any(|s| s == sink_name) {
             set.push(sink_name.to_string());
-            sqlx::query("UPDATE scrobbles SET delivered_sinks = ? WHERE id = ?")
+            sqlx::query(&crate::sql!("UPDATE scrobbles SET delivered_sinks = ? WHERE id = ?"))
                 .bind(serde_json::to_string(&set).unwrap_or_else(|_| "[]".into()))
                 .bind(id)
                 .execute(&self.pool)
@@ -474,10 +475,8 @@ impl Database {
     ) -> Result<(), sqlx::Error> {
         let mbid_artist_json =
             play.mbid_artist.as_ref().map(|a| serde_json::to_string(a).unwrap_or_default());
-        sqlx::query(
-            "UPDATE scrobbles SET mbid_recording = ?, mbid_release = ?, mbid_artist = ?, caa_id = ?, caa_release_mbid = ?
-             WHERE id = ?"
-        )
+        sqlx::query(&crate::sql!("UPDATE scrobbles SET mbid_recording = ?, mbid_release = ?, mbid_artist = ?, caa_id = ?, caa_release_mbid = ?
+             WHERE id = ?"))
         .bind(&play.mbid_recording).bind(&play.mbid_release).bind(&mbid_artist_json)
         .bind(play.caa_id).bind(&play.caa_release_mbid).bind(id)
         .execute(&self.pool).await?;
@@ -485,7 +484,7 @@ impl Database {
     }
     /// Mark a scrobble fully synced (delivered to every enabled sink).
     pub async fn mark_scrobble_synced(&self, id: i64) -> Result<(), sqlx::Error> {
-        sqlx::query("UPDATE scrobbles SET status = 'synced' WHERE id = ?")
+        sqlx::query(&crate::sql!("UPDATE scrobbles SET status = 'synced' WHERE id = ?"))
             .bind(id)
             .execute(&self.pool)
             .await?;
@@ -493,7 +492,7 @@ impl Database {
     }
     /// Lightweight liveness check for the DB connection (used by /health).
     pub async fn ping(&self) -> Result<(), sqlx::Error> {
-        sqlx::query("SELECT 1").execute(&self.pool).await?;
+        sqlx::query(&crate::sql!("SELECT 1")).execute(&self.pool).await?;
         Ok(())
     }
     /// Write a consistent, compacted snapshot of the whole database to `path`
@@ -502,7 +501,7 @@ impl Database {
     /// VACUUM INTO takes a string literal, not a bound parameter.
     pub async fn backup_to(&self, path: &str) -> Result<(), sqlx::Error> {
         let safe = path.replace('\'', "''");
-        sqlx::query(&format!("VACUUM INTO '{}'", safe)).execute(&self.pool).await?;
+        sqlx::query(&crate::sql!(&format!("VACUUM INTO '{}'", safe))).execute(&self.pool).await?;
         Ok(())
     }
     pub async fn get_recent_scrobbles(
@@ -517,7 +516,7 @@ impl Database {
         before: Option<i64>,
         social: Option<bool>,
     ) -> Result<Vec<ScrobbleRecord>, sqlx::Error> {
-        sqlx::query_as::<_, ScrobbleRecord>(
+        sqlx::query_as::<_, ScrobbleRecord>(&crate::sql!(
             "SELECT * FROM scrobbles WHERE user_id = ? AND skipped = FALSE
                AND (? IS NULL OR LOWER(artist) LIKE '%' || LOWER(?) || '%')
                AND (? IS NULL OR LOWER(album) LIKE '%' || LOWER(?) || '%')
@@ -526,7 +525,7 @@ impl Database {
                AND (? IS NULL OR timestamp <= ?)
                AND (? IS NULL OR (company IS NOT NULL) = ?)
              ORDER BY timestamp DESC LIMIT ? OFFSET ?",
-        )
+        ))
         .bind(user_id)
         .bind(artist_filter)
         .bind(artist_filter)
@@ -570,11 +569,23 @@ impl Database {
             return Ok((Vec::new(), Vec::new(), Vec::new()));
         }
 
-        let artists: Vec<(String, i64)> = sqlx::query_as(&format!(
+        let artists: Vec<(String, i64)> = sqlx::query_as(&crate::sql!(&format!(
             "SELECT artist, COUNT(*) AS plays FROM scrobbles
              WHERE user_id = ? AND skipped = FALSE AND LOWER(artist) LIKE '%' || ? || '%'
                AND LOWER(TRIM(artist)) {NOT_VARIOUS}
              GROUP BY LOWER(artist) ORDER BY plays DESC LIMIT ?"
+        )))
+        .bind(user_id)
+        .bind(&needle)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let albums: Vec<(String, String, i64)> = sqlx::query_as(&crate::sql!(
+            "SELECT album, artist, COUNT(*) AS plays FROM scrobbles
+             WHERE user_id = ? AND skipped = FALSE AND album IS NOT NULL AND album != ''
+               AND LOWER(album) LIKE '%' || ? || '%'
+             GROUP BY LOWER(album), LOWER(artist) ORDER BY plays DESC LIMIT ?"
         ))
         .bind(user_id)
         .bind(&needle)
@@ -582,23 +593,11 @@ impl Database {
         .fetch_all(&self.pool)
         .await?;
 
-        let albums: Vec<(String, String, i64)> = sqlx::query_as(
-            "SELECT album, artist, COUNT(*) AS plays FROM scrobbles
-             WHERE user_id = ? AND skipped = FALSE AND album IS NOT NULL AND album != ''
-               AND LOWER(album) LIKE '%' || ? || '%'
-             GROUP BY LOWER(album), LOWER(artist) ORDER BY plays DESC LIMIT ?",
-        )
-        .bind(user_id)
-        .bind(&needle)
-        .bind(limit)
-        .fetch_all(&self.pool)
-        .await?;
-
-        let tracks: Vec<(String, String, Option<String>, i64)> = sqlx::query_as(
+        let tracks: Vec<(String, String, Option<String>, i64)> = sqlx::query_as(&crate::sql!(
             "SELECT title, artist, album, COUNT(*) AS plays FROM scrobbles
              WHERE user_id = ? AND skipped = FALSE AND LOWER(title) LIKE '%' || ? || '%'
-             GROUP BY LOWER(title), LOWER(artist) ORDER BY plays DESC LIMIT ?",
-        )
+             GROUP BY LOWER(title), LOWER(artist) ORDER BY plays DESC LIMIT ?"
+        ))
         .bind(user_id)
         .bind(&needle)
         .bind(limit)

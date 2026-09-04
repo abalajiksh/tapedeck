@@ -268,11 +268,11 @@ impl MusicBrainzClient {
     /// the only shape a two-database question has.
     pub async fn negative_track_keys(&self) -> std::collections::HashSet<(String, String)> {
         let cutoff = chrono::Utc::now().timestamp() - NEGATIVE_CACHE_TTL_SECS;
-        let rows: Vec<(String, String)> = sqlx::query_as(
+        let rows: Vec<(String, String)> = sqlx::query_as(&crate::sql!(
             "SELECT LOWER(TRIM(track_title)), LOWER(TRIM(artist_name))
                FROM musicbrainz_cache
               WHERE track_mbid IS NULL AND fetched_at > ?",
-        )
+        ))
         .bind(cutoff)
         .fetch_all(&self.sqlite_pool)
         .await
@@ -350,8 +350,11 @@ impl MusicBrainzClient {
         artist_name: &str,
         album_name: Option<&str>,
     ) -> Result<Option<MusicBrainzMetadata>> {
-        let query = if let Some(album) = album_name {
-            sqlx::query_as::<_, MusicBrainzMetadataRow>(
+        // The statement is chosen first and bound to a name, because a query
+        // built inside an `if` borrows a translated `Cow` that dies with the
+        // branch — see `crate::sql!`.
+        let stmt = if album_name.is_some() {
+            crate::sql!(
                 r#"
                 SELECT * FROM musicbrainz_cache
                 WHERE LOWER(track_title) = LOWER($1)
@@ -359,13 +362,10 @@ impl MusicBrainzClient {
                   AND LOWER(album_name) = LOWER($3)
                 ORDER BY fetched_at DESC
                 LIMIT 1
-                "#,
+                "#
             )
-            .bind(track_title)
-            .bind(artist_name)
-            .bind(album)
         } else {
-            sqlx::query_as::<_, MusicBrainzMetadataRow>(
+            crate::sql!(
                 r#"
                 SELECT * FROM musicbrainz_cache
                 WHERE LOWER(track_title) = LOWER($1)
@@ -373,11 +373,14 @@ impl MusicBrainzClient {
                   AND album_name IS NULL
                 ORDER BY fetched_at DESC
                 LIMIT 1
-                "#,
+                "#
             )
-            .bind(track_title)
-            .bind(artist_name)
         };
+        let mut query =
+            sqlx::query_as::<_, MusicBrainzMetadataRow>(&stmt).bind(track_title).bind(artist_name);
+        if let Some(album) = album_name {
+            query = query.bind(album);
+        }
 
         match query.fetch_optional(&self.sqlite_pool).await? {
             Some(row) => {
@@ -423,7 +426,7 @@ impl MusicBrainzClient {
     ) -> Result<()> {
         let genres_json = serde_json::to_string(&metadata.genres)?;
 
-        sqlx::query(
+        sqlx::query(&crate::sql!(
             r#"
             INSERT INTO musicbrainz_cache (
                 track_mbid, artist_mbid, album_mbid,
@@ -442,7 +445,7 @@ impl MusicBrainzClient {
                 caa_release_mbid = EXCLUDED.caa_release_mbid,
                 fetched_at = EXCLUDED.fetched_at
             "#,
-        )
+        ))
         .bind(&metadata.track_mbid)
         .bind(&metadata.artist_mbid)
         .bind(&metadata.album_mbid)
@@ -475,7 +478,7 @@ impl MusicBrainzClient {
             None => return Ok(None),
         };
 
-        let result = sqlx::query_as::<_, PostgresMBRow>(
+        let result = sqlx::query_as::<_, PostgresMBRow>(&crate::sql!(
             r#"
             SELECT
                 r.gid as recording_gid,
@@ -495,7 +498,7 @@ impl MusicBrainzClient {
               AND LOWER(ar.name) = LOWER($2)
             LIMIT 1
             "#,
-        )
+        ))
         .bind(track_title)
         .bind(artist_name)
         .fetch_optional(pool)
@@ -771,12 +774,13 @@ impl MusicBrainzClient {
     /// common and legitimate answer — the tombstone that stops it being asked
     /// forever against a rate-limited service.
     pub async fn fetch_recording_isrcs(&self, recording_mbid: &str) -> Result<Vec<String>> {
-        let cached: Option<(Option<String>,)> =
-            sqlx::query_as("SELECT isrcs FROM mb_isrc_cache WHERE recording_mbid = ?")
-                .bind(recording_mbid)
-                .fetch_optional(&self.sqlite_pool)
-                .await
-                .unwrap_or(None);
+        let cached: Option<(Option<String>,)> = sqlx::query_as(&crate::sql!(
+            "SELECT isrcs FROM mb_isrc_cache WHERE recording_mbid = ?",
+        ))
+        .bind(recording_mbid)
+        .fetch_optional(&self.sqlite_pool)
+        .await
+        .unwrap_or(None);
         if let Some((raw,)) = cached {
             return Ok(raw
                 .as_deref()
@@ -804,12 +808,12 @@ impl MusicBrainzClient {
         let isrcs: Vec<String> =
             found.isrcs.iter().map(|s| s.trim().to_uppercase()).filter(|s| !s.is_empty()).collect();
 
-        let _ = sqlx::query(
+        let _ = sqlx::query(&crate::sql!(
             "INSERT INTO mb_isrc_cache (recording_mbid, isrcs, fetched_at)
              VALUES (?, ?, ?)
              ON CONFLICT (recording_mbid) DO UPDATE SET
                 isrcs = excluded.isrcs, fetched_at = excluded.fetched_at",
-        )
+        ))
         .bind(recording_mbid)
         .bind(serde_json::to_string(&isrcs).unwrap_or_else(|_| "[]".into()))
         .bind(chrono::Utc::now().timestamp())
@@ -820,12 +824,13 @@ impl MusicBrainzClient {
     }
 
     pub async fn fetch_recording_language(&self, recording_mbid: &str) -> Result<Option<String>> {
-        let cached: Option<(Option<String>,)> =
-            sqlx::query_as("SELECT language FROM mb_language_cache WHERE recording_mbid = ?")
-                .bind(recording_mbid)
-                .fetch_optional(&self.sqlite_pool)
-                .await
-                .unwrap_or(None);
+        let cached: Option<(Option<String>,)> = sqlx::query_as(&crate::sql!(
+            "SELECT language FROM mb_language_cache WHERE recording_mbid = ?",
+        ))
+        .bind(recording_mbid)
+        .fetch_optional(&self.sqlite_pool)
+        .await
+        .unwrap_or(None);
         if let Some((lang,)) = cached {
             return Ok(lang.filter(|s| !s.is_empty()));
         }
@@ -834,7 +839,7 @@ impl MusicBrainzClient {
 
         // Tier 1: Postgres MB dump — l_recording_work → work_language → language.
         if let Some(pool) = &self.postgres_pool {
-            let row: Option<(String,)> = sqlx::query_as(
+            let row: Option<(String,)> = sqlx::query_as(&crate::sql!(
                 r#"
                 SELECT lang.name
                 FROM recording r
@@ -845,7 +850,7 @@ impl MusicBrainzClient {
                 WHERE r.gid = $1::uuid
                 LIMIT 1
                 "#,
-            )
+            ))
             .bind(recording_mbid)
             .fetch_optional(pool)
             .await
@@ -883,11 +888,11 @@ impl MusicBrainzClient {
             }
         }
 
-        let _ = sqlx::query(
+        let _ = sqlx::query(&crate::sql!(
             "INSERT INTO mb_language_cache (recording_mbid, language, fetched_at) VALUES (?, ?, ?)
              ON CONFLICT (recording_mbid) DO UPDATE SET
                 language = excluded.language, fetched_at = excluded.fetched_at",
-        )
+        ))
         .bind(recording_mbid)
         .bind(resolved.clone().unwrap_or_default())
         .bind(chrono::Utc::now().timestamp())

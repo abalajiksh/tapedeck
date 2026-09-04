@@ -21,7 +21,7 @@ impl Database {
         artist: &str,
         album: &str,
     ) -> Result<Option<String>, sqlx::Error> {
-        let row: Option<(String,)> = sqlx::query_as(
+        let row: Option<(String,)> = sqlx::query_as(&crate::sql!(
             "SELECT mbid_release
                FROM scrobbles
               WHERE user_id = ? AND LOWER(TRIM(artist)) = LOWER(TRIM(?))
@@ -29,8 +29,8 @@ impl Database {
                 AND mbid_release IS NOT NULL AND TRIM(mbid_release) != ''
               GROUP BY mbid_release
               ORDER BY COUNT(*) DESC
-              LIMIT 1",
-        )
+              LIMIT 1"
+        ))
         .bind(user_id)
         .bind(artist)
         .bind(album)
@@ -48,14 +48,14 @@ impl Database {
         // the winner; per-edit review needs every candidate and its play count,
         // because deciding whether a 4-of-29 plurality is trustworthy is
         // exactly the judgement being handed to the operator.
-        let rows: Vec<(String, String, Option<String>, i64)> = sqlx::query_as(
+        let rows: Vec<(String, String, Option<String>, i64)> = sqlx::query_as(&crate::sql!(
             "SELECT artist, album, mbid_release, COUNT(*) AS n
                FROM scrobbles
               WHERE user_id = ? AND skipped = FALSE
                 AND album IS NOT NULL AND TRIM(album) != ''
               GROUP BY LOWER(TRIM(artist)), LOWER(TRIM(album)), mbid_release
-              ORDER BY n DESC",
-        )
+              ORDER BY n DESC"
+        ))
         .bind(user_id)
         .fetch_all(&self.pool)
         .await?;
@@ -108,13 +108,13 @@ impl Database {
         album: &str,
         mbid_release: &str,
     ) -> Result<u64, sqlx::Error> {
-        let res = sqlx::query(
+        let res = sqlx::query(&crate::sql!(
             "UPDATE scrobbles
                 SET mbid_release = ?, artwork_url = NULL, caa_id = NULL, caa_release_mbid = NULL
               WHERE user_id = ?
                 AND LOWER(TRIM(artist)) = ? AND LOWER(TRIM(album)) = ?
-                AND (mbid_release IS NULL OR mbid_release != ?)",
-        )
+                AND (mbid_release IS NULL OR mbid_release != ?)"
+        ))
         .bind(mbid_release)
         .bind(user_id)
         .bind(artist.trim().to_lowercase())
@@ -136,11 +136,11 @@ impl Database {
         &self,
         user_id: i64,
     ) -> Result<Vec<FeaturedArtist>, sqlx::Error> {
-        let rows: Vec<(String, i64)> = sqlx::query_as(
+        let rows: Vec<(String, i64)> = sqlx::query_as(&crate::sql!(
             "SELECT artist, COUNT(*) AS plays FROM scrobbles
              WHERE user_id = ? AND skipped = FALSE
-             GROUP BY LOWER(TRIM(artist)) ORDER BY plays DESC",
-        )
+             GROUP BY LOWER(TRIM(artist)) ORDER BY plays DESC"
+        ))
         .bind(user_id)
         .fetch_all(&self.pool)
         .await?;
@@ -178,11 +178,11 @@ impl Database {
         // The half that worked — punctuation and spacing, "A.R. Rahman"
         // against "A R Rahman" — survives the collapse, which is why it
         // looked correct.
-        let rows: Vec<(String, i64)> = sqlx::query_as(
+        let rows: Vec<(String, i64)> = sqlx::query_as(&crate::sql!(
             "SELECT artist, COUNT(*) AS plays FROM scrobbles
              WHERE user_id = ? AND skipped = FALSE
-             GROUP BY artist ORDER BY plays DESC",
-        )
+             GROUP BY artist ORDER BY plays DESC"
+        ))
         .bind(user_id)
         .fetch_all(&self.pool)
         .await?;

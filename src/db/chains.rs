@@ -10,7 +10,7 @@ impl Database {
     /// Returns the user's `settings` JSON object (defaults to `{}`).
     pub async fn get_preferences(&self, user_id: i64) -> Result<serde_json::Value, sqlx::Error> {
         let row: Option<(Option<String>,)> =
-            sqlx::query_as("SELECT settings FROM users WHERE id = ?")
+            sqlx::query_as(&crate::sql!("SELECT settings FROM users WHERE id = ?"))
                 .bind(user_id)
                 .fetch_optional(&self.pool)
                 .await?;
@@ -31,10 +31,11 @@ impl Database {
     pub async fn scrobble_thresholds(
         &self,
     ) -> Result<HashMap<i64, crate::models::ScrobbleThreshold>, sqlx::Error> {
-        let rows: Vec<(i64, Option<String>)> =
-            sqlx::query_as("SELECT id, settings FROM users WHERE settings IS NOT NULL")
-                .fetch_all(&self.pool)
-                .await?;
+        let rows: Vec<(i64, Option<String>)> = sqlx::query_as(&crate::sql!(
+            "SELECT id, settings FROM users WHERE settings IS NOT NULL"
+        ))
+        .fetch_all(&self.pool)
+        .await?;
         Ok(rows
             .into_iter()
             .filter_map(|(id, settings)| {
@@ -63,7 +64,7 @@ impl Database {
                 obj.insert(k.clone(), v.clone());
             }
         }
-        sqlx::query("UPDATE users SET settings = ? WHERE id = ?")
+        sqlx::query(&crate::sql!("UPDATE users SET settings = ? WHERE id = ?"))
             .bind(current.to_string())
             .bind(user_id)
             .execute(&self.pool)
@@ -74,20 +75,18 @@ impl Database {
         let components_json =
             serde_json::to_string(&chain.components).unwrap_or_else(|_| "[]".into());
         let now = Self::now_secs();
-        let result = sqlx::query_as::<_, (i64,)>(
-            "INSERT INTO signal_chains (user_id, name, description, components, listening_context, icon, is_active, created_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?) RETURNING id"
-        ).bind(chain.user_id).bind(&chain.name).bind(&chain.description)
+        let result = sqlx::query_as::<_, (i64,)>(&crate::sql!("INSERT INTO signal_chains (user_id, name, description, components, listening_context, icon, is_active, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?) RETURNING id")).bind(chain.user_id).bind(&chain.name).bind(&chain.description)
         .bind(&components_json).bind(chain.listening_context.as_str()).bind(&chain.icon)
         .bind(chain.is_active).bind(now)
         .fetch_all(&self.pool).await?;
         result.first().map(|r| r.0).ok_or(sqlx::Error::RowNotFound)
     }
     pub async fn get_chains(&self, user_id: i64) -> Result<Vec<SignalChain>, sqlx::Error> {
-        let rows: Vec<ChainRow> = sqlx::query_as(&format!(
+        let rows: Vec<ChainRow> = sqlx::query_as(&crate::sql!(&format!(
             "SELECT {} FROM signal_chains s WHERE s.user_id = ? ORDER BY s.name ASC",
             Self::CHAIN_COLUMNS
-        ))
+        )))
         .bind(user_id)
         .fetch_all(&self.pool)
         .await?;
@@ -98,10 +97,10 @@ impl Database {
         user_id: i64,
         chain_id: i64,
     ) -> Result<Option<SignalChain>, sqlx::Error> {
-        let row: Option<ChainRow> = sqlx::query_as(&format!(
+        let row: Option<ChainRow> = sqlx::query_as(&crate::sql!(&format!(
             "SELECT {} FROM signal_chains s WHERE s.id = ? AND s.user_id = ?",
             Self::CHAIN_COLUMNS
-        ))
+        )))
         .bind(chain_id)
         .bind(user_id)
         .fetch_optional(&self.pool)
@@ -119,10 +118,10 @@ impl Database {
         user_id: i64,
         release_id: i64,
     ) -> Result<Vec<(String, i64)>, sqlx::Error> {
-        sqlx::query_as(
+        sqlx::query_as(&crate::sql!(
             "SELECT side, played_at FROM physical_plays
-              WHERE user_id = ? AND release_id = ?",
-        )
+              WHERE user_id = ? AND release_id = ?"
+        ))
         .bind(user_id)
         .bind(release_id)
         .fetch_all(&self.pool)
@@ -133,9 +132,9 @@ impl Database {
         user_id: i64,
         name: &str,
     ) -> Result<Option<i64>, sqlx::Error> {
-        let row: Option<(i64,)> = sqlx::query_as(
+        let row: Option<(i64,)> = sqlx::query_as(&crate::sql!(
             "SELECT id FROM signal_chains WHERE user_id = ? AND LOWER(name) = LOWER(?)",
-        )
+        ))
         .bind(user_id)
         .bind(name)
         .fetch_optional(&self.pool)
@@ -149,12 +148,13 @@ impl Database {
         user_id: i64,
         device_id: i64,
     ) -> Result<Option<i64>, sqlx::Error> {
-        let row: Option<(Option<i64>,)> =
-            sqlx::query_as("SELECT default_chain_id FROM devices WHERE id = ? AND user_id = ?")
-                .bind(device_id)
-                .bind(user_id)
-                .fetch_optional(&self.pool)
-                .await?;
+        let row: Option<(Option<i64>,)> = sqlx::query_as(&crate::sql!(
+            "SELECT default_chain_id FROM devices WHERE id = ? AND user_id = ?",
+        ))
+        .bind(device_id)
+        .bind(user_id)
+        .fetch_optional(&self.pool)
+        .await?;
         Ok(row.and_then(|(c,)| c))
     }
     /// The chain a device defaults to, looked up by the **key the source
@@ -172,9 +172,9 @@ impl Database {
         user_id: i64,
         machine_id: &str,
     ) -> Result<Option<i64>, sqlx::Error> {
-        let row: Option<(Option<i64>,)> = sqlx::query_as(
+        let row: Option<(Option<i64>,)> = sqlx::query_as(&crate::sql!(
             "SELECT default_chain_id FROM devices WHERE user_id = ? AND machine_id = ?",
-        )
+        ))
         .bind(user_id)
         .bind(machine_id)
         .fetch_optional(&self.pool)
@@ -188,13 +188,14 @@ impl Database {
         device_id: i64,
         chain_id: Option<i64>,
     ) -> Result<bool, sqlx::Error> {
-        let result =
-            sqlx::query("UPDATE devices SET default_chain_id = ? WHERE id = ? AND user_id = ?")
-                .bind(chain_id)
-                .bind(device_id)
-                .bind(user_id)
-                .execute(&self.pool)
-                .await?;
+        let result = sqlx::query(&crate::sql!(
+            "UPDATE devices SET default_chain_id = ? WHERE id = ? AND user_id = ?",
+        ))
+        .bind(chain_id)
+        .bind(device_id)
+        .bind(user_id)
+        .execute(&self.pool)
+        .await?;
         Ok(result.rows_affected() > 0)
     }
     pub async fn update_chain(
@@ -208,15 +209,13 @@ impl Database {
         icon: Option<&str>,
     ) -> Result<bool, sqlx::Error> {
         let components_json = serde_json::to_string(components).unwrap_or_else(|_| "[]".into());
-        let res = sqlx::query(
-            // `shared` is deliberately absent. This is a whole-record replace
+        let res = sqlx::query(&crate::sql!(// `shared` is deliberately absent. This is a whole-record replace
             // of everything the editor owns, and sharing is not the editor's —
             // it is switched from the chain drawer or Patch → Decks. Adding it
             // here would un-publish a chain as a side effect of renaming it,
             // which is the shape that silently erased gear notes in v0.50.0.
             "UPDATE signal_chains SET name = ?, description = ?, components = ?, listening_context = ?, icon = ?
-             WHERE id = ? AND user_id = ?"
-        ).bind(name).bind(description).bind(&components_json).bind(listening_context).bind(icon)
+             WHERE id = ? AND user_id = ?")).bind(name).bind(description).bind(&components_json).bind(listening_context).bind(icon)
          .bind(chain_id).bind(user_id).execute(&self.pool).await?;
         Ok(res.rows_affected() > 0)
     }
@@ -242,12 +241,13 @@ impl Database {
         // id alone. That matters for `pairing_requests`, whose `user_id` is
         // nullable — scoping its clear by user would skip exactly the rows that
         // then block the delete.
-        let owned: Option<(i64,)> =
-            sqlx::query_as("SELECT id FROM signal_chains WHERE id = ? AND user_id = ?")
-                .bind(chain_id)
-                .bind(user_id)
-                .fetch_optional(&self.pool)
-                .await?;
+        let owned: Option<(i64,)> = sqlx::query_as(&crate::sql!(
+            "SELECT id FROM signal_chains WHERE id = ? AND user_id = ?"
+        ))
+        .bind(chain_id)
+        .bind(user_id)
+        .fetch_optional(&self.pool)
+        .await?;
         if owned.is_none() {
             return Ok(false);
         }
@@ -257,16 +257,16 @@ impl Database {
         // Anything pointing at a *variant* of this chain has to let go before
         // the variants themselves can be deleted.
         for table in ["scrobbles", "physical_plays", "physical_releases"] {
-            sqlx::query(&format!(
+            sqlx::query(&crate::sql!(&format!(
                 "UPDATE {table} SET chain_variant_id = NULL
                   WHERE chain_variant_id IN
                         (SELECT id FROM chain_variants WHERE chain_id = ?)"
-            ))
+            )))
             .bind(chain_id)
             .execute(&mut *tx)
             .await?;
         }
-        sqlx::query("DELETE FROM chain_variants WHERE chain_id = ?")
+        sqlx::query(&crate::sql!("DELETE FROM chain_variants WHERE chain_id = ?"))
             .bind(chain_id)
             .execute(&mut *tx)
             .await?;
@@ -284,17 +284,20 @@ impl Database {
             ("physical_spins", "chain_id"),
             ("pairing_requests", "default_chain_id"),
         ] {
-            sqlx::query(&format!("UPDATE {table} SET {column} = NULL WHERE {column} = ?"))
-                .bind(chain_id)
-                .execute(&mut *tx)
-                .await?;
-        }
-
-        let res = sqlx::query("DELETE FROM signal_chains WHERE id = ? AND user_id = ?")
+            sqlx::query(&crate::sql!(&format!(
+                "UPDATE {table} SET {column} = NULL WHERE {column} = ?"
+            )))
             .bind(chain_id)
-            .bind(user_id)
             .execute(&mut *tx)
             .await?;
+        }
+
+        let res =
+            sqlx::query(&crate::sql!("DELETE FROM signal_chains WHERE id = ? AND user_id = ?"))
+                .bind(chain_id)
+                .bind(user_id)
+                .execute(&mut *tx)
+                .await?;
         tx.commit().await?;
         Ok(res.rows_affected() > 0)
     }
@@ -308,13 +311,13 @@ impl Database {
         interface: Option<&str>,
     ) -> Result<(), sqlx::Error> {
         let now = Self::now_secs();
-        sqlx::query(
+        sqlx::query(&crate::sql!(
             "INSERT INTO chain_bindings (user_id, identifier, interface, chain_id, last_seen, hits)
              VALUES (?, ?, ?, NULL, ?, 1)
              ON CONFLICT(user_id, identifier) DO UPDATE SET
                 hits = hits + 1, last_seen = excluded.last_seen,
                 interface = COALESCE(excluded.interface, chain_bindings.interface)",
-        )
+        ))
         .bind(user_id)
         .bind(identifier)
         .bind(interface)
@@ -329,9 +332,9 @@ impl Database {
         user_id: i64,
         identifier: &str,
     ) -> Result<Option<i64>, sqlx::Error> {
-        let row: Option<(Option<i64>,)> = sqlx::query_as(
+        let row: Option<(Option<i64>,)> = sqlx::query_as(&crate::sql!(
             "SELECT chain_id FROM chain_bindings WHERE user_id = ? AND identifier = ?",
-        )
+        ))
         .bind(user_id)
         .bind(identifier)
         .fetch_optional(&self.pool)
@@ -339,7 +342,7 @@ impl Database {
         Ok(row.and_then(|(c,)| c))
     }
     pub async fn list_bindings(&self, user_id: i64) -> Result<Vec<BindingRow>, sqlx::Error> {
-        sqlx::query_as("SELECT * FROM chain_bindings WHERE user_id = ? ORDER BY chain_id IS NOT NULL, last_seen DESC")
+        sqlx::query_as(&crate::sql!("SELECT * FROM chain_bindings WHERE user_id = ? ORDER BY chain_id IS NOT NULL, last_seen DESC"))
             .bind(user_id).fetch_all(&self.pool).await
     }
     /// Assign (or clear, with None) the chain for an output identifier. Creates
@@ -351,11 +354,11 @@ impl Database {
         chain_id: Option<i64>,
     ) -> Result<(), sqlx::Error> {
         let now = Self::now_secs();
-        sqlx::query(
+        sqlx::query(&crate::sql!(
             "INSERT INTO chain_bindings (user_id, identifier, chain_id, last_seen, hits)
              VALUES (?, ?, ?, ?, 0)
              ON CONFLICT(user_id, identifier) DO UPDATE SET chain_id = excluded.chain_id",
-        )
+        ))
         .bind(user_id)
         .bind(identifier)
         .bind(chain_id)
@@ -365,11 +368,12 @@ impl Database {
         Ok(())
     }
     pub async fn delete_binding(&self, user_id: i64, id: i64) -> Result<bool, sqlx::Error> {
-        let res = sqlx::query("DELETE FROM chain_bindings WHERE id = ? AND user_id = ?")
-            .bind(id)
-            .bind(user_id)
-            .execute(&self.pool)
-            .await?;
+        let res =
+            sqlx::query(&crate::sql!("DELETE FROM chain_bindings WHERE id = ? AND user_id = ?"))
+                .bind(id)
+                .bind(user_id)
+                .execute(&self.pool)
+                .await?;
         Ok(res.rows_affected() > 0)
     }
 }

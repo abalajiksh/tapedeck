@@ -49,7 +49,7 @@ async fn column_exists(pool: &Pool<Db>, table: &str, column: &str) -> bool {
     #[cfg(not(feature = "postgres"))]
     {
         let rows: Vec<(i64, String, String, i64, Option<String>, i64)> =
-            sqlx::query_as(&format!("PRAGMA table_info({})", table))
+            sqlx::query_as(&crate::sql!(&format!("PRAGMA table_info({})", table)))
                 .fetch_all(pool)
                 .await
                 .unwrap_or_default();
@@ -57,10 +57,10 @@ async fn column_exists(pool: &Pool<Db>, table: &str, column: &str) -> bool {
     }
     #[cfg(feature = "postgres")]
     {
-        let n: i64 = sqlx::query_scalar(
+        let n: i64 = sqlx::query_scalar(&crate::sql!(
             "SELECT COUNT(*) FROM information_schema.columns \
              WHERE table_name = $1 AND column_name = $2",
-        )
+        ))
         .bind(table)
         .bind(column)
         .fetch_one(pool)
@@ -200,7 +200,7 @@ impl EveryNoiseStore {
         let now = Self::now();
         let mut tx = self.pool.begin().await?;
         for g in genres {
-            sqlx::query(
+            sqlx::query(&crate::sql!(
                 "INSERT INTO genres (slug, name, name_key, loose_key, x, y, color, font_size,
                                      preview_track_id, example_title, scraped_at)
                  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -212,7 +212,7 @@ impl EveryNoiseStore {
                     preview_track_id = excluded.preview_track_id,
                     example_title = excluded.example_title,
                     scraped_at = excluded.scraped_at",
-            )
+            ))
             .bind(&g.slug)
             .bind(&g.name)
             .bind(g.name.trim().to_lowercase())
@@ -245,12 +245,12 @@ impl EveryNoiseStore {
         let now = Self::now();
         let mut tx = self.pool.begin().await?;
 
-        sqlx::query("DELETE FROM genre_artists WHERE genre_slug = ?")
+        sqlx::query(&crate::sql!("DELETE FROM genre_artists WHERE genre_slug = ?"))
             .bind(slug)
             .execute(&mut *tx)
             .await?;
         for a in artists {
-            sqlx::query(
+            sqlx::query(&crate::sql!(
                 "INSERT INTO genre_artists
                     (genre_slug, name, norm_name, spotify_id, x, y, color, font_size)
                  VALUES (?, ?, ?, ?, ?, ?, ?, ?)
@@ -258,7 +258,7 @@ impl EveryNoiseStore {
                     norm_name = excluded.norm_name, spotify_id = excluded.spotify_id,
                     x = excluded.x, y = excluded.y, color = excluded.color,
                     font_size = excluded.font_size",
-            )
+            ))
             .bind(slug)
             .bind(&a.name)
             .bind(crate::db::normalise_artist(&a.name))
@@ -271,17 +271,17 @@ impl EveryNoiseStore {
             .await?;
         }
 
-        sqlx::query("DELETE FROM genre_edges WHERE genre_slug = ?")
+        sqlx::query(&crate::sql!("DELETE FROM genre_edges WHERE genre_slug = ?"))
             .bind(slug)
             .execute(&mut *tx)
             .await?;
         for n in neighbours {
-            sqlx::query(
+            sqlx::query(&crate::sql!(
                 "INSERT INTO genre_edges (genre_slug, related_slug, relation, position)
                  VALUES (?, ?, ?, ?)
                  ON CONFLICT (genre_slug, related_slug, relation) DO UPDATE SET
                     position = excluded.position",
-            )
+            ))
             .bind(slug)
             .bind(&n.slug)
             .bind(n.relation.as_str())
@@ -290,11 +290,11 @@ impl EveryNoiseStore {
             .await?;
         }
 
-        sqlx::query(
+        sqlx::query(&crate::sql!(
             "INSERT INTO scraped_pages (slug, scraped_at, artists) VALUES (?, ?, ?)
              ON CONFLICT (slug) DO UPDATE SET
                 scraped_at = excluded.scraped_at, artists = excluded.artists",
-        )
+        ))
         .bind(slug)
         .bind(now)
         .bind(artists.len() as i64)
@@ -307,30 +307,34 @@ impl EveryNoiseStore {
 
     /// Genre slugs with no page walked yet, in map order — the tier 2 queue.
     pub async fn pending_pages(&self) -> Result<Vec<String>, sqlx::Error> {
-        let rows: Vec<(String,)> = sqlx::query_as(
+        let rows: Vec<(String,)> = sqlx::query_as(&crate::sql!(
             "SELECT g.slug FROM genres g
               LEFT JOIN scraped_pages p ON p.slug = g.slug
               WHERE p.slug IS NULL
               ORDER BY g.font_size DESC, g.slug",
-        )
+        ))
         .fetch_all(&self.pool)
         .await?;
         Ok(rows.into_iter().map(|(s,)| s).collect())
     }
 
     pub async fn summary(&self) -> Result<Summary, sqlx::Error> {
-        let genres: (i64,) =
-            sqlx::query_as("SELECT COUNT(*) FROM genres").fetch_one(&self.pool).await?;
-        let artists: (i64,) =
-            sqlx::query_as("SELECT COUNT(*) FROM genre_artists").fetch_one(&self.pool).await?;
-        let edges: (i64,) =
-            sqlx::query_as("SELECT COUNT(*) FROM genre_edges").fetch_one(&self.pool).await?;
-        let pages: (i64,) =
-            sqlx::query_as("SELECT COUNT(*) FROM scraped_pages").fetch_one(&self.pool).await?;
-        let last: (Option<i64>,) = sqlx::query_as(
+        let genres: (i64,) = sqlx::query_as(&crate::sql!("SELECT COUNT(*) FROM genres"))
+            .fetch_one(&self.pool)
+            .await?;
+        let artists: (i64,) = sqlx::query_as(&crate::sql!("SELECT COUNT(*) FROM genre_artists"))
+            .fetch_one(&self.pool)
+            .await?;
+        let edges: (i64,) = sqlx::query_as(&crate::sql!("SELECT COUNT(*) FROM genre_edges"))
+            .fetch_one(&self.pool)
+            .await?;
+        let pages: (i64,) = sqlx::query_as(&crate::sql!("SELECT COUNT(*) FROM scraped_pages"))
+            .fetch_one(&self.pool)
+            .await?;
+        let last: (Option<i64>,) = sqlx::query_as(&crate::sql!(
             "SELECT MAX(t) FROM (SELECT MAX(scraped_at) AS t FROM genres
                                  UNION ALL SELECT MAX(scraped_at) FROM scraped_pages)",
-        )
+        ))
         .fetch_one(&self.pool)
         .await?;
         Ok(Summary {
@@ -371,7 +375,8 @@ impl EveryNoiseStore {
                 "SELECT loose_key, x, y, color FROM genres WHERE loose_key IN ({})",
                 placeholders
             );
-            let mut q = sqlx::query_as::<_, (String, f64, f64, String)>(&sql);
+            let stmt = crate::sql!(&sql);
+            let mut q = sqlx::query_as::<_, (String, f64, f64, String)>(&stmt);
             for n in chunk {
                 q = q.bind(genre_key(n));
             }
@@ -388,7 +393,7 @@ impl EveryNoiseStore {
     /// done, so it can run unconditionally at open.
     async fn backfill_loose_keys(&self) -> Result<(), sqlx::Error> {
         let rows: Vec<(String, String)> =
-            sqlx::query_as("SELECT slug, name FROM genres WHERE loose_key = ''")
+            sqlx::query_as(&crate::sql!("SELECT slug, name FROM genres WHERE loose_key = ''"))
                 .fetch_all(&self.pool)
                 .await?;
         if rows.is_empty() {
@@ -396,7 +401,7 @@ impl EveryNoiseStore {
         }
         let mut tx = self.pool.begin().await?;
         for (slug, name) in &rows {
-            sqlx::query("UPDATE genres SET loose_key = ? WHERE slug = ?")
+            sqlx::query(&crate::sql!("UPDATE genres SET loose_key = ? WHERE slug = ?"))
                 .bind(genre_key(name))
                 .bind(slug)
                 .execute(&mut *tx)
@@ -411,16 +416,20 @@ impl EveryNoiseStore {
     /// colour. ~6,300 rows and identical for every user, so it is worth the
     /// client caching it.
     pub async fn all_points(&self) -> Result<Vec<(String, f64, f64, String)>, sqlx::Error> {
-        sqlx::query_as("SELECT name, x, y, color FROM genres ORDER BY font_size DESC")
-            .fetch_all(&self.pool)
-            .await
+        sqlx::query_as(
+            &crate::sql!("SELECT name, x, y, color FROM genres ORDER BY font_size DESC",),
+        )
+        .fetch_all(&self.pool)
+        .await
     }
 
     /// The map's extent, so the client can set a viewBox without scanning
     /// every point itself.
     pub async fn extent(&self) -> Result<(f64, f64), sqlx::Error> {
         let row: (Option<f64>, Option<f64>) =
-            sqlx::query_as("SELECT MAX(x), MAX(y) FROM genres").fetch_one(&self.pool).await?;
+            sqlx::query_as(&crate::sql!("SELECT MAX(x), MAX(y) FROM genres"))
+                .fetch_one(&self.pool)
+                .await?;
         Ok((row.0.unwrap_or(0.0), row.1.unwrap_or(0.0)))
     }
 
@@ -438,7 +447,8 @@ impl EveryNoiseStore {
             let placeholders = vec!["?"; chunk.len()].join(",");
             let sql =
                 format!("SELECT loose_key, slug FROM genres WHERE loose_key IN ({})", placeholders);
-            let mut q = sqlx::query_as::<_, (String, String)>(&sql);
+            let stmt = crate::sql!(&sql);
+            let mut q = sqlx::query_as::<_, (String, String)>(&stmt);
             for n in chunk {
                 q = q.bind(genre_key(n));
             }
@@ -475,7 +485,8 @@ impl EveryNoiseStore {
                   WHERE e.relation = ? AND e.genre_slug IN ({})",
                 placeholders
             );
-            let mut q = sqlx::query_as::<_, (String, String, String, f64, f64, String, i64)>(&sql);
+            let stmt = crate::sql!(&sql);
+            let mut q = sqlx::query_as::<_, (String, String, String, f64, f64, String, i64)>(&stmt);
             q = q.bind(relation);
             for s in chunk {
                 q = q.bind(s);
@@ -517,7 +528,8 @@ impl EveryNoiseStore {
                   ORDER BY genre_slug, font_size DESC, name",
                 placeholders
             );
-            let mut q = sqlx::query_as::<_, (String, String)>(&sql);
+            let stmt = crate::sql!(&sql);
+            let mut q = sqlx::query_as::<_, (String, String)>(&stmt);
             for s in chunk {
                 q = q.bind(s);
             }
@@ -536,21 +548,22 @@ impl EveryNoiseStore {
     /// distance in map units means nothing to anyone.
     pub async fn spread(&self) -> Result<f64, sqlx::Error> {
         let row: (Option<f64>, Option<f64>, i64) =
-            sqlx::query_as("SELECT AVG(x), AVG(y), COUNT(*) FROM genres")
+            sqlx::query_as(&crate::sql!("SELECT AVG(x), AVG(y), COUNT(*) FROM genres"))
                 .fetch_one(&self.pool)
                 .await?;
         let (Some(mx), Some(my), n) = row else { return Ok(0.0) };
         if n == 0 {
             return Ok(0.0);
         }
-        let var: (Option<f64>,) =
-            sqlx::query_as("SELECT AVG((x - ?) * (x - ?) + (y - ?) * (y - ?)) FROM genres")
-                .bind(mx)
-                .bind(mx)
-                .bind(my)
-                .bind(my)
-                .fetch_one(&self.pool)
-                .await?;
+        let var: (Option<f64>,) = sqlx::query_as(&crate::sql!(
+            "SELECT AVG((x - ?) * (x - ?) + (y - ?) * (y - ?)) FROM genres",
+        ))
+        .bind(mx)
+        .bind(mx)
+        .bind(my)
+        .bind(my)
+        .fetch_one(&self.pool)
+        .await?;
         Ok(var.0.unwrap_or(0.0).max(0.0).sqrt())
     }
 
@@ -558,7 +571,7 @@ impl EveryNoiseStore {
     /// than a destructive act — but it does mean another full walk.
     pub async fn clear(&self) -> Result<(), sqlx::Error> {
         for t in ["genre_edges", "genre_artists", "scraped_pages", "genres"] {
-            sqlx::query(&format!("DELETE FROM {}", t)).execute(&self.pool).await?;
+            sqlx::query(&crate::sql!(&format!("DELETE FROM {}", t))).execute(&self.pool).await?;
         }
         Ok(())
     }
@@ -681,7 +694,10 @@ mod tests {
         let s = store().await;
         s.put_genres(&[genre("dancepop", "dance pop")]).await.unwrap();
         // Put it back into the pre-migration state.
-        sqlx::query("UPDATE genres SET loose_key = ''").execute(&s.pool).await.unwrap();
+        sqlx::query(&crate::sql!("UPDATE genres SET loose_key = ''"))
+            .execute(&s.pool)
+            .await
+            .unwrap();
         assert!(s.coordinates_for(&["dance-pop".into()]).await.unwrap().is_empty());
 
         s.backfill_loose_keys().await.unwrap();

@@ -465,6 +465,101 @@ mod tests {
         assert_eq!(names.len(), EXEMPT.len(), "duplicate entry in EXEMPT");
     }
 
+    /// Every query goes through the dialect, or Postgres cannot parse it.
+    ///
+    /// A `sqlx::query*` call handed raw SQL keeps its `?` binds, which Postgres
+    /// answers with `syntax error at or near ","` — and only on the build
+    /// nobody may be running, so nothing else in the tree notices. This is a
+    /// textual scan for the same reason the OpenAPI route drift test is one.
+    ///
+    /// `migrate.rs` and `tests.rs` are exempt because both are compiled out
+    /// under `--features postgres`, so their queries cannot reach it.
+    #[test]
+    fn every_query_goes_through_the_dialect() {
+        const EXEMPT_FILES: &[(&str, &str)] = &[
+            ("migrate.rs", "SQLite-only: the whole body is cfg'd out under --features postgres"),
+            ("tests.rs", "SQLite-backed fixtures, compiled out under --features postgres"),
+        ];
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = Vec::new();
+        fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            for e in std::fs::read_dir(dir).expect("read src/").flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    walk(&p, out);
+                } else if p.extension().is_some_and(|x| x == "rs") {
+                    out.push(p);
+                }
+            }
+        }
+        walk(&root, &mut files);
+        files.sort();
+
+        let exempt: BTreeSet<&str> = EXEMPT_FILES.iter().map(|(f, _)| *f).collect();
+        for (f, reason) in EXEMPT_FILES {
+            assert!(reason.len() > 30, "{f} is exempt with no real reason given");
+        }
+
+        let (mut checked, mut raw) = (0usize, Vec::new());
+        for path in &files {
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            if exempt.contains(name) || matches!(name, "dialect.rs" | "guards.rs" | "pg_live.rs") {
+                continue;
+            }
+            let src = std::fs::read_to_string(path).expect("read source");
+            for (idx, _) in src.match_indices("sqlx::query") {
+                let after = &src[idx + "sqlx::query".len()..];
+                // `_as` / `_scalar`, then an optional turbofish, then the call.
+                let after = after
+                    .strip_prefix("_scalar")
+                    .or_else(|| after.strip_prefix("_as"))
+                    .unwrap_or(after);
+                let after = if let Some(t) = after.strip_prefix("::<") {
+                    // Angle-matched, because a turbofish holds `(i64,)` and
+                    // looking for the next `(` finds the tuple's, not the call's.
+                    let (mut depth, mut end) = (1usize, 0usize);
+                    for (k, c) in t.char_indices() {
+                        match c {
+                            '<' => depth += 1,
+                            '>' => {
+                                depth -= 1;
+                                if depth == 0 {
+                                    end = k + 1;
+                                    break;
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    if end == 0 {
+                        continue;
+                    }
+                    &t[end..]
+                } else {
+                    after
+                };
+                let Some(arg) = after.strip_prefix('(') else { continue };
+                let arg = arg.trim_start();
+                checked += 1;
+                if !arg.starts_with("&crate::sql!") && !arg.starts_with("&stmt") {
+                    let line = src[..idx].matches('\n').count() + 1;
+                    raw.push(format!(
+                        "  {}:{line}  {}",
+                        path.file_name().and_then(|n| n.to_str()).unwrap_or("?"),
+                        arg.chars().take(60).collect::<String>()
+                    ));
+                }
+            }
+        }
+        assert!(checked > 400, "only {checked} query sites found — the scanner is broken");
+        assert!(
+            raw.is_empty(),
+            "these queries do not go through `crate::sql!`, so Postgres will not parse \
+             their `?` binds:\n{}",
+            raw.join("\n")
+        );
+    }
+
     /// Every index `migrate()` creates must also be created where **both**
     /// backends will run it.
     ///

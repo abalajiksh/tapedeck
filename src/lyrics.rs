@@ -282,16 +282,17 @@ impl LyricsClient {
         // this table is created by `CREATE TABLE IF NOT EXISTS` so the line
         // above never reaches it. Unguarded and ignored on failure: the only
         // way this errors is the column already being there.
-        let _ =
-            sqlx::query("ALTER TABLE lyrics_cache ADD COLUMN edited INTEGER NOT NULL DEFAULT 0")
-                .execute(&self.pool)
-                .await;
+        let _ = sqlx::query(&crate::sql!(
+            "ALTER TABLE lyrics_cache ADD COLUMN edited INTEGER NOT NULL DEFAULT 0",
+        ))
+        .execute(&self.pool)
+        .await;
         // Same again for provenance. A row written before this column existed
         // came from LRCLIB, because that was the only source — but it is left
         // NULL rather than backfilled to say so, since "we did not record it"
         // and "we know it was LRCLIB" are different claims and the reader can
         // say the first honestly.
-        let _ = sqlx::query("ALTER TABLE lyrics_cache ADD COLUMN source TEXT")
+        let _ = sqlx::query(&crate::sql!("ALTER TABLE lyrics_cache ADD COLUMN source TEXT"))
             .execute(&self.pool)
             .await;
         Ok(())
@@ -326,8 +327,7 @@ impl LyricsClient {
         let now = crate::db::Database::now_secs();
         // `found` is 1 even for an empty correction: somebody has answered for
         // this track, and re-asking LRCLIB would undo the answer.
-        sqlx::query(
-            "INSERT INTO lyrics_cache
+        sqlx::query(&crate::sql!("INSERT INTO lyrics_cache
                 (track_key, lrclib_id, instrumental, plain, synced, language, found, fetched_at, edited, source)
              VALUES (?, NULL, 0, ?, ?, ?, 1, ?, 1, 'You')
              ON CONFLICT(track_key) DO UPDATE SET
@@ -337,8 +337,7 @@ impl LyricsClient {
                 -- The words are yours now. Leaving the old provenance would
                 -- have the reader credit a server for something typed here,
                 -- which is a small lie about whose text it is.
-                source = 'You'",
-        )
+                source = 'You'",))
         .bind(&key)
         .bind(&plain)
         .bind(&synced)
@@ -381,16 +380,14 @@ impl LyricsClient {
         }
         let key = Self::track_key(artist, title);
         let now = crate::db::Database::now_secs();
-        sqlx::query(
-            "INSERT INTO lyrics_cache
+        sqlx::query(&crate::sql!("INSERT INTO lyrics_cache
                 (track_key, lrclib_id, instrumental, plain, synced, language, found, fetched_at, edited, source)
              VALUES (?, NULL, 0, ?, ?, ?, 1, ?, 0, ?)
              ON CONFLICT(track_key) DO UPDATE SET
                 plain = excluded.plain, synced = excluded.synced,
                 language = excluded.language, instrumental = 0, found = 1,
                 fetched_at = excluded.fetched_at, source = excluded.source
-              WHERE lyrics_cache.edited = 0",
-        )
+              WHERE lyrics_cache.edited = 0",))
         .bind(&key)
         .bind(&plain)
         .bind(&synced)
@@ -410,9 +407,9 @@ impl LyricsClient {
     /// "we did not record it" is the true statement and the reader can make it.
     pub async fn source_of(&self, artist: &str, title: &str) -> Option<String> {
         let key = Self::track_key(artist, title);
-        sqlx::query_as::<_, (Option<String>,)>(
+        sqlx::query_as::<_, (Option<String>,)>(&crate::sql!(
             "SELECT source FROM lyrics_cache WHERE track_key = ?",
-        )
+        ))
         .bind(&key)
         .fetch_optional(&self.pool)
         .await
@@ -424,13 +421,15 @@ impl LyricsClient {
     /// Whether these words were corrected here rather than fetched.
     pub async fn is_edited(&self, artist: &str, title: &str) -> bool {
         let key = Self::track_key(artist, title);
-        sqlx::query_as::<_, (i64,)>("SELECT edited FROM lyrics_cache WHERE track_key = ?")
-            .bind(&key)
-            .fetch_optional(&self.pool)
-            .await
-            .ok()
-            .flatten()
-            .is_some_and(|(e,)| e != 0)
+        sqlx::query_as::<_, (i64,)>(&crate::sql!(
+            "SELECT edited FROM lyrics_cache WHERE track_key = ?",
+        ))
+        .bind(&key)
+        .fetch_optional(&self.pool)
+        .await
+        .ok()
+        .flatten()
+        .is_some_and(|(e,)| e != 0)
     }
 
     /// What is known about each of a handful of tracks, in one query.
@@ -455,7 +454,8 @@ impl LyricsClient {
                     (COALESCE(plain, '') <> '' OR COALESCE(synced, '') <> '') AS has_words
                FROM lyrics_cache WHERE found = 1 AND track_key IN ({holes})"
         );
-        let mut q = sqlx::query_as::<_, (String, i64, i64)>(&sql);
+        let stmt = crate::sql!(&sql);
+        let mut q = sqlx::query_as::<_, (String, i64, i64)>(&stmt);
         for k in &keys {
             q = q.bind(k);
         }
@@ -480,11 +480,11 @@ impl LyricsClient {
     /// finished lookup, but there is nothing to open a reader on, so offering
     /// one would be offering an empty page.
     pub async fn keys_with_lyrics(&self) -> Vec<String> {
-        sqlx::query_as::<_, (String,)>(
+        sqlx::query_as::<_, (String,)>(&crate::sql!(
             "SELECT track_key FROM lyrics_cache
               WHERE found = 1 AND instrumental = 0
                 AND (COALESCE(plain, '') <> '' OR COALESCE(synced, '') <> '')",
-        )
+        ))
         .fetch_all(&self.pool)
         .await
         .unwrap_or_default()
@@ -507,10 +507,10 @@ impl LyricsClient {
         let key = Self::track_key(artist, title);
         /// `(found, instrumental, plain, synced, language, fetched_at)`.
         type CachedRow = (i64, i64, Option<String>, Option<String>, Option<String>, i64);
-        let row: Option<CachedRow> = sqlx::query_as(
+        let row: Option<CachedRow> = sqlx::query_as(&crate::sql!(
             "SELECT found, instrumental, plain, synced, language, fetched_at
                    FROM lyrics_cache WHERE track_key = ?",
-        )
+        ))
         .bind(&key)
         .fetch_optional(&self.pool)
         .await
@@ -707,16 +707,14 @@ impl LyricsClient {
         //
         // NULL on a miss: nothing was stored, so there is nobody to credit.
         let source = if found == 1 { Some("LRCLIB") } else { None };
-        let _ = sqlx::query(
-            "INSERT INTO lyrics_cache
+        let _ = sqlx::query(&crate::sql!("INSERT INTO lyrics_cache
                 (track_key, lrclib_id, instrumental, plain, synced, language, found, fetched_at, source)
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
              ON CONFLICT(track_key) DO UPDATE SET
                 lrclib_id = excluded.lrclib_id, instrumental = excluded.instrumental,
                 plain = excluded.plain, synced = excluded.synced,
                 language = excluded.language, found = excluded.found,
-                fetched_at = excluded.fetched_at, source = excluded.source",
-        )
+                fetched_at = excluded.fetched_at, source = excluded.source",))
         .bind(&key)
         .bind(id)
         .bind(instrumental)
@@ -749,12 +747,12 @@ impl LyricsClient {
     /// the distinction above collapsing again in the other direction. The
     /// `COALESCE` makes the SQL say what it means and removes the dependency.
     pub async fn coverage(&self) -> Option<(i64, i64, i64)> {
-        sqlx::query_as(
+        sqlx::query_as(&crate::sql!(
             "SELECT COUNT(*),
                     COALESCE(SUM(CASE WHEN found = 1 AND instrumental = 0 THEN 1 ELSE 0 END), 0),
                     COALESCE(SUM(CASE WHEN instrumental = 1 THEN 1 ELSE 0 END), 0)
                FROM lyrics_cache",
-        )
+        ))
         // An aggregate with no GROUP BY always returns exactly one row, so
         // `fetch_one` is the honest shape here — and this is a read, not one
         // of the `RETURNING` writes that must not be consumed this way.
@@ -905,10 +903,10 @@ mod tests {
         for (key, instrumental, found) in
             [("a|one", 0, 1), ("a|two", 0, 1), ("a|three", 1, 1), ("a|four", 0, 0)]
         {
-            sqlx::query(
+            sqlx::query(&crate::sql!(
                 "INSERT INTO lyrics_cache (track_key, instrumental, found, fetched_at)
                  VALUES (?, ?, ?, ?)",
-            )
+            ))
             .bind(key)
             .bind(instrumental)
             .bind(found)
@@ -925,7 +923,7 @@ mod tests {
 
         // The table going away stands in for any unreadable cache. The point is
         // the *shape* of the answer, not this particular cause.
-        sqlx::query("DROP TABLE lyrics_cache").execute(&pool).await.unwrap();
+        sqlx::query(&crate::sql!("DROP TABLE lyrics_cache")).execute(&pool).await.unwrap();
         assert_eq!(
             c.coverage().await,
             None,

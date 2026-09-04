@@ -25,51 +25,31 @@ impl Database {
         // so it is coalesced to 0; those sort last under Hours, which is right
         // — an unknown running time is not a large one.
         let order = if by_hours { "COALESCE(secs, 0) DESC, plays DESC" } else { "plays DESC" };
-        let plays: (i64,) = sqlx::query_as(
-            "SELECT COUNT(*) FROM scrobbles WHERE user_id = ? AND skipped = FALSE AND (? IS NULL OR timestamp >= ?)"
-        ).bind(user_id).bind(after).bind(after).fetch_one(&self.pool).await?;
+        let plays: (i64,) = sqlx::query_as(&crate::sql!("SELECT COUNT(*) FROM scrobbles WHERE user_id = ? AND skipped = FALSE AND (? IS NULL OR timestamp >= ?)")).bind(user_id).bind(after).bind(after).fetch_one(&self.pool).await?;
         let total = plays.0;
 
-        let secs: (Option<i64>,) = sqlx::query_as(
-            "SELECT SUM(duration) FROM scrobbles WHERE user_id = ? AND skipped = FALSE AND (? IS NULL OR timestamp >= ?) AND duration IS NOT NULL"
-        ).bind(user_id).bind(after).bind(after).fetch_one(&self.pool).await?;
+        let secs: (Option<i64>,) = sqlx::query_as(&crate::sql!("SELECT SUM(duration) FROM scrobbles WHERE user_id = ? AND skipped = FALSE AND (? IS NULL OR timestamp >= ?) AND duration IS NOT NULL")).bind(user_id).bind(after).bind(after).fetch_one(&self.pool).await?;
         let hours = secs.0.unwrap_or(0) as f64 / 3600.0;
         // Hours is a sum over the listens that *have* a length, so it is a floor
         // rather than a total — a source that reported no duration contributes
         // nothing and says nothing. Cheaper to state the coverage than to
         // pretend a listen of unknown length lasted zero seconds.
-        let duration_known: (i64,) = sqlx::query_as(
-            "SELECT COUNT(*) FROM scrobbles WHERE user_id = ? AND skipped = FALSE AND (? IS NULL OR timestamp >= ?) AND duration IS NOT NULL"
-        ).bind(user_id).bind(after).bind(after).fetch_one(&self.pool).await?;
+        let duration_known: (i64,) = sqlx::query_as(&crate::sql!("SELECT COUNT(*) FROM scrobbles WHERE user_id = ? AND skipped = FALSE AND (? IS NULL OR timestamp >= ?) AND duration IS NOT NULL")).bind(user_id).bind(after).bind(after).fetch_one(&self.pool).await?;
 
-        let artists: (i64,) = sqlx::query_as(
-            "SELECT COUNT(DISTINCT artist) FROM scrobbles WHERE user_id = ? AND skipped = FALSE AND (? IS NULL OR timestamp >= ?)"
-        ).bind(user_id).bind(after).bind(after).fetch_one(&self.pool).await?;
-        let albums: (i64,) = sqlx::query_as(
-            "SELECT COUNT(DISTINCT album) FROM scrobbles WHERE user_id = ? AND skipped = FALSE AND (? IS NULL OR timestamp >= ?) AND album IS NOT NULL"
-        ).bind(user_id).bind(after).bind(after).fetch_one(&self.pool).await?;
-        let tracks: (i64,) = sqlx::query_as(
-            "SELECT COUNT(DISTINCT title || '|' || artist) FROM scrobbles WHERE user_id = ? AND skipped = FALSE AND (? IS NULL OR timestamp >= ?)"
-        ).bind(user_id).bind(after).bind(after).fetch_one(&self.pool).await?;
-        let avg_quality: (Option<f64>,) = sqlx::query_as(
-            "SELECT AVG(quality_score) FROM scrobbles WHERE user_id = ? AND skipped = FALSE AND (? IS NULL OR timestamp >= ?) AND quality_score IS NOT NULL"
-        ).bind(user_id).bind(after).bind(after).fetch_one(&self.pool).await?;
+        let artists: (i64,) = sqlx::query_as(&crate::sql!("SELECT COUNT(DISTINCT artist) FROM scrobbles WHERE user_id = ? AND skipped = FALSE AND (? IS NULL OR timestamp >= ?)")).bind(user_id).bind(after).bind(after).fetch_one(&self.pool).await?;
+        let albums: (i64,) = sqlx::query_as(&crate::sql!("SELECT COUNT(DISTINCT album) FROM scrobbles WHERE user_id = ? AND skipped = FALSE AND (? IS NULL OR timestamp >= ?) AND album IS NOT NULL")).bind(user_id).bind(after).bind(after).fetch_one(&self.pool).await?;
+        let tracks: (i64,) = sqlx::query_as(&crate::sql!("SELECT COUNT(DISTINCT title || '|' || artist) FROM scrobbles WHERE user_id = ? AND skipped = FALSE AND (? IS NULL OR timestamp >= ?)")).bind(user_id).bind(after).bind(after).fetch_one(&self.pool).await?;
+        let avg_quality: (Option<f64>,) = sqlx::query_as(&crate::sql!("SELECT AVG(quality_score) FROM scrobbles WHERE user_id = ? AND skipped = FALSE AND (? IS NULL OR timestamp >= ?) AND quality_score IS NOT NULL")).bind(user_id).bind(after).bind(after).fetch_one(&self.pool).await?;
         // The average's own denominator. Paired counts must share a population,
         // and this one is *not* `total` — see `quality_known` in the payload.
-        let quality_known: (i64,) = sqlx::query_as(
-            "SELECT COUNT(*) FROM scrobbles WHERE user_id = ? AND skipped = FALSE AND (? IS NULL OR timestamp >= ?) AND quality_score IS NOT NULL"
-        ).bind(user_id).bind(after).bind(after).fetch_one(&self.pool).await?;
-        let lossless: (i64,) = sqlx::query_as(
-            "SELECT COUNT(*) FROM scrobbles WHERE user_id = ? AND skipped = FALSE AND (? IS NULL OR timestamp >= ?) AND is_lossless = TRUE"
-        ).bind(user_id).bind(after).bind(after).fetch_one(&self.pool).await?;
-        let dsd: (i64,) = sqlx::query_as(
-            "SELECT COUNT(*) FROM scrobbles WHERE user_id = ? AND skipped = FALSE AND (? IS NULL OR timestamp >= ?) AND format_type = 'dsd'"
-        ).bind(user_id).bind(after).bind(after).fetch_one(&self.pool).await?;
-        let fidelity_known: (i64,) = sqlx::query_as(&format!(
+        let quality_known: (i64,) = sqlx::query_as(&crate::sql!("SELECT COUNT(*) FROM scrobbles WHERE user_id = ? AND skipped = FALSE AND (? IS NULL OR timestamp >= ?) AND quality_score IS NOT NULL")).bind(user_id).bind(after).bind(after).fetch_one(&self.pool).await?;
+        let lossless: (i64,) = sqlx::query_as(&crate::sql!("SELECT COUNT(*) FROM scrobbles WHERE user_id = ? AND skipped = FALSE AND (? IS NULL OR timestamp >= ?) AND is_lossless = TRUE")).bind(user_id).bind(after).bind(after).fetch_one(&self.pool).await?;
+        let dsd: (i64,) = sqlx::query_as(&crate::sql!("SELECT COUNT(*) FROM scrobbles WHERE user_id = ? AND skipped = FALSE AND (? IS NULL OR timestamp >= ?) AND format_type = 'dsd'")).bind(user_id).bind(after).bind(after).fetch_one(&self.pool).await?;
+        let fidelity_known: (i64,) = sqlx::query_as(&crate::sql!(&format!(
             "SELECT COUNT(*) FROM scrobbles
               WHERE user_id = ? AND skipped = FALSE AND (? IS NULL OR timestamp >= ?)
                 AND {FIDELITY_KNOWN}"
-        ))
+        )))
         .bind(user_id)
         .bind(after)
         .bind(after)
@@ -80,26 +60,25 @@ impl Database {
         // Deliberately *not* filtered to `skipped = FALSE`: this is the one
         // query in the file whose whole subject is the skips. Everything that
         // counts listens still filters them out, and `plays` above already did.
-        let skips: (i64,) = sqlx::query_as(
-            "SELECT COUNT(*) FROM scrobbles WHERE user_id = ? AND skipped = TRUE AND (? IS NULL OR timestamp >= ?)"
-        ).bind(user_id).bind(after).bind(after).fetch_one(&self.pool).await?;
+        let skips: (i64,) = sqlx::query_as(&crate::sql!("SELECT COUNT(*) FROM scrobbles WHERE user_id = ? AND skipped = TRUE AND (? IS NULL OR timestamp >= ?)")).bind(user_id).bind(after).bind(after).fetch_one(&self.pool).await?;
 
         // "Since" is a fact about the whole history and is therefore *not*
         // ranged — asking it of a one-week window would answer with the start
         // of that window, which is a restatement of the control rather than an
         // answer. Skips are excluded: the first thing you skipped past is not
         // the day you started listening.
-        let first_listen: (Option<i64>,) = sqlx::query_as(
+        let first_listen: (Option<i64>,) = sqlx::query_as(&crate::sql!(
             "SELECT MIN(timestamp) FROM scrobbles WHERE user_id = ? AND skipped = FALSE",
-        )
+        ))
         .bind(user_id)
         .fetch_one(&self.pool)
         .await?;
 
-        let loves: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM loves WHERE user_id = ?")
-            .bind(user_id)
-            .fetch_one(&self.pool)
-            .await?;
+        let loves: (i64,) =
+            sqlx::query_as(&crate::sql!("SELECT COUNT(*) FROM loves WHERE user_id = ?"))
+                .bind(user_id)
+                .fetch_one(&self.pool)
+                .await?;
 
         // Plays per **calendar** day, not per day you happened to listen — 846
         // plays over five active days reads as 169/day when the month's real
@@ -142,14 +121,14 @@ impl Database {
         // Over the credits, exactly as `chart()` does. These two answer the
         // same question on two screens, and the whole reason the handoff
         // between them exists is that they must not disagree.
-        let top_rows: Vec<(String, i64, Option<i64>)> = sqlx::query_as(&format!(
+        let top_rows: Vec<(String, i64, Option<i64>)> = sqlx::query_as(&crate::sql!(&format!(
             "SELECT MAX(sa.name) AS artist, COUNT(*) as plays, SUM(s.duration) as secs
              FROM scrobble_artists sa
              JOIN scrobbles s ON s.id = sa.scrobble_id
              WHERE s.user_id = ? AND s.skipped = FALSE AND (? IS NULL OR s.timestamp >= ?)
              GROUP BY sa.artist_key ORDER BY {} LIMIT 50",
             order
-        ))
+        )))
         .bind(user_id)
         .bind(after)
         .bind(after)
@@ -169,18 +148,19 @@ impl Database {
             })
             .collect();
 
-        let album_rows: Vec<(String, String, i64, Option<i64>)> = sqlx::query_as(&format!(
-            "SELECT album, artist, COUNT(*) as plays, SUM(duration) as secs
+        let album_rows: Vec<(String, String, i64, Option<i64>)> =
+            sqlx::query_as(&crate::sql!(&format!(
+                "SELECT album, artist, COUNT(*) as plays, SUM(duration) as secs
              FROM scrobbles WHERE user_id = ? AND skipped = FALSE AND (? IS NULL OR timestamp >= ?)
                AND album IS NOT NULL AND album != ''
              GROUP BY album, artist ORDER BY {} LIMIT 50",
-            order
-        ))
-        .bind(user_id)
-        .bind(after)
-        .bind(after)
-        .fetch_all(&self.pool)
-        .await?;
+                order
+            )))
+            .bind(user_id)
+            .bind(after)
+            .bind(after)
+            .fetch_all(&self.pool)
+            .await?;
         let top_albums: Vec<serde_json::Value> = album_rows
             .into_iter()
             .map(|(name, artist, plays, secs)| {
@@ -192,13 +172,11 @@ impl Database {
         // Grouped case-insensitively on title+artist, like every other listing
         // query — the same song submitted as "Xtal" and "XTAL" by two clients is
         // one track, not two entries competing for the same slot.
-        let track_rows: Vec<(String, String, Option<String>, i64, Option<i64>)> = sqlx::query_as(
-            &format!(            "SELECT title, artist, MAX(album) AS album, COUNT(*) as plays, SUM(duration) as secs
+        let track_rows: Vec<(String, String, Option<String>, i64, Option<i64>)> = sqlx::query_as(&crate::sql!(&format!(            "SELECT title, artist, MAX(album) AS album, COUNT(*) as plays, SUM(duration) as secs
              FROM scrobbles WHERE user_id = ? AND skipped = FALSE AND (? IS NULL OR timestamp >= ?)
              GROUP BY LOWER(TRIM(title)), LOWER(TRIM(artist)) ORDER BY {} LIMIT 50",
                 order
-            ),
-        )
+            ),))
         .bind(user_id)
         .bind(after)
         .bind(after)
@@ -220,7 +198,7 @@ impl Database {
         // as its own `ELSE`, so this bucket and the shares above are provably
         // the same split of the same rows. Written the other way round they were
         // *almost* the same, which is worse than different.
-        let fidelity_rows: Vec<(String, i64)> = sqlx::query_as(&format!(
+        let fidelity_rows: Vec<(String, i64)> = sqlx::query_as(&crate::sql!(&format!(
             "SELECT CASE
                     WHEN NOT {FIDELITY_KNOWN} THEN 'Unknown'
                     WHEN format_type = 'dsd' THEN 'DSD'
@@ -229,7 +207,7 @@ impl Database {
                 END AS tier, COUNT(*) as c
              FROM scrobbles WHERE user_id = ? AND skipped = FALSE AND (? IS NULL OR timestamp >= ?)
              GROUP BY tier ORDER BY c DESC"
-        ))
+        )))
         .bind(user_id)
         .bind(after)
         .bind(after)
@@ -242,12 +220,12 @@ impl Database {
 
         // Release decades. Only listens whose release year has been resolved by
         // the MusicBrainz backfill count — the rest are simply absent.
-        let decade_rows: Vec<(i64, i64)> = sqlx::query_as(
+        let decade_rows: Vec<(i64, i64)> = sqlx::query_as(&crate::sql!(
             "SELECT (release_year / 10) * 10 AS decade, COUNT(*) as c
              FROM scrobbles WHERE user_id = ? AND skipped = FALSE AND (? IS NULL OR timestamp >= ?)
                AND release_year IS NOT NULL AND release_year > 1000
-             GROUP BY decade ORDER BY decade",
-        )
+             GROUP BY decade ORDER BY decade"
+        ))
         .bind(user_id)
         .bind(after)
         .bind(after)
@@ -264,13 +242,13 @@ impl Database {
         // it — which means the percentages are a share of *tag mentions*, not
         // of listens, and cannot be read as "40% of what I played was rock".
         // Tombstoned rows (`[]`) contribute nothing and drop out naturally.
-        let genre_rows: Vec<(String, i64)> = sqlx::query_as(
+        let genre_rows: Vec<(String, i64)> = sqlx::query_as(&crate::sql!(
             "SELECT g.value AS name, COUNT(*) AS c
                FROM scrobbles s, json_each(s.genres) g
               WHERE s.user_id = ? AND s.skipped = FALSE
                 AND (? IS NULL OR s.timestamp >= ?) AND s.genres IS NOT NULL
-              GROUP BY LOWER(g.value) ORDER BY c DESC LIMIT 12",
-        )
+              GROUP BY LOWER(g.value) ORDER BY c DESC LIMIT 12"
+        ))
         .bind(user_id)
         .bind(after)
         .bind(after)
@@ -285,12 +263,12 @@ impl Database {
         // Language breakdown (only listens that have been classified).
         // `skipped = FALSE` was missing here: a skip is stored but must never be
         // counted, and this is a counting query like any other.
-        let lang_rows: Vec<(String, i64)> = sqlx::query_as(
+        let lang_rows: Vec<(String, i64)> = sqlx::query_as(&crate::sql!(
             "SELECT language, COUNT(*) as c FROM scrobbles
              WHERE user_id = ? AND skipped = FALSE AND (? IS NULL OR timestamp >= ?)
                AND language IS NOT NULL
-             GROUP BY language ORDER BY c DESC LIMIT 12",
-        )
+             GROUP BY language ORDER BY c DESC LIMIT 12"
+        ))
         .bind(user_id)
         .bind(after)
         .bind(after)
