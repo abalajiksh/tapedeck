@@ -1173,8 +1173,13 @@ impl Database {
         }
         let pool = Self::connect(database_url).await?;
         let db = Self { pool, secrets };
+        // The current shape, then walking an existing database up to it, then
+        // the indexes over whatever those two produced. `indexes()` is last
+        // because it names columns `migrate()` may only just have added — see
+        // its own docs, and v0.61.1.
         db.init().await?;
         db.migrate().await?;
+        db.indexes().await?;
         db.encrypt_legacy_credentials().await?;
         db.plan_stats().await;
         Ok(db)

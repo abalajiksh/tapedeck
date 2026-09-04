@@ -14,7 +14,33 @@
 use super::*;
 
 impl Database {
+    /// Walk a database forward to the shape [`super::schema`]'s `init` writes.
+    ///
+    /// **This is SQLite-only work, and not by omission.** Every block below
+    /// exists to carry a database forward from a shape that only ever existed
+    /// in SQLite — the `postgres` feature has never shipped, so no Postgres
+    /// database of this application predates the current schema. A fresh one
+    /// gets the whole shape from `init()`, and one filled by a future
+    /// `migrate-db` tool lands on that same shape.
+    ///
+    /// **That stops being true the moment Postgres ships and the schema next
+    /// changes.** The first Postgres migration goes here, in an arm of its own
+    /// — `has_column` below is SQLite's `pragma_table_info` and is compiled out
+    /// with the rest, so a Postgres arm needs its own guard against
+    /// `information_schema.columns`. Do not translate the blocks below to get
+    /// one: they are answers to questions a Postgres database never asked.
+    ///
+    /// The indexes are the part both backends need, and they are in
+    /// [`Database::indexes`] rather than here for exactly that reason.
     pub(super) async fn migrate(&self) -> Result<(), sqlx::Error> {
+        #[cfg(feature = "postgres")]
+        return Ok(());
+        #[cfg(not(feature = "postgres"))]
+        self.migrate_sqlite().await
+    }
+
+    #[cfg(not(feature = "postgres"))]
+    async fn migrate_sqlite(&self) -> Result<(), sqlx::Error> {
         /// Does `table` already have `column`?
         ///
         /// The schema catalogue is the one thing no dialect layer can paper

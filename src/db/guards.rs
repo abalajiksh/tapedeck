@@ -461,6 +461,85 @@ mod tests {
         assert_eq!(names.len(), EXEMPT.len(), "duplicate entry in EXEMPT");
     }
 
+    /// Every index `migrate()` creates must also be created where **both**
+    /// backends will run it.
+    ///
+    /// `migrate()` is SQLite-only, so an index that exists only there is an
+    /// index a Postgres database silently does without. That is not a
+    /// performance question for all of them:
+    /// `idx_scrobbles_user_source` is the UNIQUE constraint `exists` dedup
+    /// rests on, so its absence means the same listen banked twice, with
+    /// nothing erroring.
+    ///
+    /// `migrate()` keeps its own copies on purpose — a table rebuild drops the
+    /// table and has to put them back in the same transaction — so the rule is
+    /// containment rather than exclusivity.
+    #[test]
+    fn every_index_migrate_creates_is_part_of_the_shared_shape() {
+        fn index_names(file: &str) -> BTreeSet<String> {
+            let src = std::fs::read_to_string(
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/db").join(file),
+            )
+            .unwrap_or_else(|e| panic!("read {file}: {e}"));
+            let mut out = BTreeSet::new();
+            for (_, _, lit) in literals(&src) {
+                let flat = norm(&lit);
+                let Some(rest) = flat.strip_prefix("create ") else { continue };
+                let rest = rest.strip_prefix("unique ").unwrap_or(rest);
+                let Some(rest) = rest.strip_prefix("index if not exists ") else { continue };
+                let name: String =
+                    rest.chars().take_while(|c| c.is_ascii_alphanumeric() || *c == '_').collect();
+                if !name.is_empty() {
+                    out.insert(name);
+                }
+            }
+            out
+        }
+        // Created by `migrate()` and deliberately not repeated in the shared
+        // set, with the reason — the shape of `EXEMPT` above.
+        const ONLY_IN_MIGRATE: &[(&str, &str)] = &[(
+            "idx_scrobbles_user_source",
+            "`init()` declares UNIQUE(user_id, source_id, source_name) inline on the \
+             table, so every current database already has the constraint under the \
+             engine's own name. This named index exists only to give it to a database \
+             that predates the user_id column, which can only be a SQLite one.",
+        )];
+
+        let in_migrate = index_names("migrate.rs");
+        let shared = index_names("schema.rs");
+
+        // A scanner that finds nothing would pass this by examining an empty
+        // set — the trap the OpenAPI drift test records.
+        assert!(
+            in_migrate.len() >= 8 && shared.len() >= 8,
+            "the index scanner found {} in migrate.rs and {} in schema.rs — it is broken",
+            in_migrate.len(),
+            shared.len()
+        );
+
+        for (name, reason) in ONLY_IN_MIGRATE {
+            assert!(reason.len() > 40, "{name} is exempt with no real reason given");
+            assert!(
+                in_migrate.contains(*name),
+                "{name} is listed as migrate-only and migrate() no longer creates it"
+            );
+        }
+        let exempt: BTreeSet<&str> = ONLY_IN_MIGRATE.iter().map(|(n, _)| *n).collect();
+
+        let missing: Vec<&str> = in_migrate
+            .iter()
+            .filter(|n| !shared.contains(*n) && !exempt.contains(n.as_str()))
+            .map(|s| s.as_str())
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "these indexes are created only by migrate(), which does not run under \
+             --features postgres, so a Postgres database would not have them: {missing:?}.\n\
+             Add them to Database::indexes() in schema.rs — keeping migrate()'s own copy \
+             is fine and expected where a table rebuild has to recreate it."
+        );
+    }
+
     /// Under Postgres all four schemas share one database, so a table name
     /// used twice would have one module silently reading the other's rows.
     ///

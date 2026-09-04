@@ -14,6 +14,66 @@ async fn testdb() -> Database {
         .unwrap()
 }
 
+/// A fresh database really ends up with every index, wherever it is created.
+///
+/// The drift guard in `db::guards` reads the *source*; this reads the
+/// *database*. They catch different things: that one fails if a name is missing
+/// from the shared list, this one fails if the list is never run, runs in the
+/// wrong order, or silently errors — which is how `idx_scrobbles_user_source`
+/// would go missing and `save_scrobble` start accepting the same listen twice.
+#[tokio::test]
+async fn a_fresh_database_has_every_index_the_shape_calls_for() {
+    let db = testdb().await;
+    let names: Vec<(String,)> =
+        sqlx::query_as("SELECT name FROM sqlite_master WHERE type = 'index' ORDER BY name")
+            .fetch_all(&db.pool)
+            .await
+            .expect("read the index list");
+    let have: std::collections::BTreeSet<String> = names.into_iter().map(|(n,)| n).collect();
+
+    for want in [
+        // Correctness first — each of these is a rule, not a speed-up.
+        "idx_spools_one_per_sitting",
+        "idx_notes_user_entity",
+        "idx_notes_user_scrobble",
+        "idx_notes_user_period",
+        "idx_notes_user_line",
+        // Then the ones that only make something fast.
+        "idx_scrobbles_session",
+        "idx_scrobbles_album_release",
+        "idx_entities_match",
+        "idx_entities_mbid",
+        // And one from `init` itself, so this fails loudly if the whole
+        // schema stopped being applied rather than only the new step.
+        "idx_scrobbles_user_time",
+    ] {
+        assert!(have.contains(want), "a fresh database is missing {want}; it has {have:?}");
+    }
+}
+
+/// The dedup backstop is a *constraint*, so it is tested as one.
+///
+/// `save_scrobble` asks `exists` before inserting, and the UNIQUE behind it is
+/// what makes that safe against a race rather than merely usually right. It is
+/// declared inline in `init()`'s `CREATE TABLE`, so it carries whatever name
+/// the engine chooses — which is why this asserts the *behaviour* and not an
+/// index called `idx_scrobbles_user_source`. That name is a historical one
+/// `migrate()` gives to databases predating the `user_id` column.
+#[tokio::test]
+async fn a_fresh_database_refuses_the_same_listen_twice_at_the_constraint() {
+    let db = testdb().await;
+    let insert =
+        "INSERT INTO scrobbles (user_id, title, artist, timestamp, source_id, source_name, status)
+                  VALUES (1, 'Xtal', 'Aphex Twin', 100, 'src-1', 'test', 'imported')";
+    sqlx::query(insert).execute(&db.pool).await.expect("the first insert is fine");
+    let again = sqlx::query(insert).execute(&db.pool).await;
+    assert!(
+        again.is_err(),
+        "a second listen with the same (user_id, source_id, source_name) was accepted — \
+         the dedup constraint is missing, and `exists` is on its own"
+    );
+}
+
 /// A build refuses a URL it cannot serve, in words, before it tries to connect.
 ///
 /// The failure this prevents is a driver error twenty frames down when the real

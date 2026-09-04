@@ -12,6 +12,112 @@
 use super::*;
 
 impl Database {
+    /// Every index that is part of the current shape but cannot live in
+    /// [`init`].
+    ///
+    /// These name columns that arrive by `ALTER TABLE` on an existing SQLite
+    /// database, and `init()` runs *first* and propagates with `?` — so an
+    /// index here placed in `init()` takes startup down on every database that
+    /// has not yet gained the column. That is the v0.61.1 crash loop, 297
+    /// restarts in 26 minutes.
+    ///
+    /// So they run **after** `migrate()`, and both backends need them: a fresh
+    /// Postgres database reaches the current shape through `init()` alone and
+    /// would otherwise have none of these.
+    ///
+    /// Not every index `migrate()` creates belongs here. `idx_scrobbles_user_source`
+    /// deliberately does not: `init()` already declares
+    /// `UNIQUE(user_id, source_id, source_name)` inline on the table, so the
+    /// constraint `exists` dedup is backstopped by is present on any current
+    /// database under whatever name the engine gives it, and the named index
+    /// exists only for databases predating the `user_id` column. The guard in
+    /// `db::guards` carries that as an exemption with its reason.
+    ///
+    /// **Two kinds of index here, and they fail differently on purpose.** A
+    /// UNIQUE constraint carries correctness — `idx_scrobbles_user_source` is
+    /// what `exists` dedup rests on — so failing to create one is fatal and
+    /// says so. A performance index is only a degradation, and taking startup
+    /// down over one is the v0.61.1 crash loop: an index naming a column some
+    /// database does not have, run unconditionally, 297 restarts in 26
+    /// minutes. Those are logged and stepped over. `migrate()` swallowed
+    /// *both* kinds with `let _ =`, which is why the dedup constraint could
+    /// have gone missing without a word.
+    ///
+    /// `migrate()` still creates its own copies inline, because a table
+    /// rebuild drops the table and has to put them back in the same
+    /// transaction. They are `IF NOT EXISTS`, so running both is free — and
+    /// `every_index_migrate_creates_is_part_of_the_shared_shape` is what stops
+    /// the two lists drifting.
+    pub(super) async fn indexes(&self) -> Result<(), sqlx::Error> {
+        // A UNIQUE constraint the application's correctness rests on.
+        macro_rules! constraint {
+            ($sql:expr) => {
+                self.ddl($sql).await?
+            };
+        }
+        // An index that only makes something faster. Report it and carry on.
+        macro_rules! speed {
+            ($sql:expr) => {
+                if let Err(e) = self.ddl($sql).await {
+                    warn!(
+                        "⚠️ index not created, queries will be slower: {}",
+                        crate::logging::error_chain(&e)
+                    );
+                }
+            };
+        }
+        // One sitting per host, enforced by the database rather than by a
+        // handler that could race a double-click.
+        constraint!(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_spools_one_per_sitting
+                 ON spools(host_user_id, session_uuid) WHERE session_uuid IS NOT NULL"
+        );
+
+        // One note per user per target, and a note hangs off exactly one of the
+        // four. Partial, so the three NULL targets do not collide with each
+        // other.
+        constraint!(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_notes_user_entity
+                 ON notes(user_id, entity_id) WHERE entity_id IS NOT NULL"
+        );
+        constraint!(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_notes_user_scrobble
+                 ON notes(user_id, scrobble_id) WHERE scrobble_id IS NOT NULL"
+        );
+        constraint!(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_notes_user_period
+                 ON notes(user_id, period_key) WHERE period_key IS NOT NULL"
+        );
+        constraint!(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_notes_user_line
+                 ON notes(user_id, line_key) WHERE line_key IS NOT NULL"
+        );
+
+        // A point lookup — "the listens in this session" — which is the
+        // workload an index is actually for, and the distinction v0.59.0 drew
+        // when it dropped the *expression* indexes: those replaced sequential
+        // scans of whole-history aggregations and lost on an SD card.
+        speed!(
+            "CREATE INDEX IF NOT EXISTS idx_scrobbles_session
+                 ON scrobbles(session_id) WHERE session_id IS NOT NULL"
+        );
+
+        // The album page's "whole record" button: 400,247 VDBE steps to 37.
+        // The `WHERE` is load-bearing rather than a size trim — without it the
+        // planner takes this index for the top-artist and top-album
+        // aggregations too and flips them back to a non-covering walk, which
+        // is exactly the v0.59.0 regression.
+        speed!(
+            "CREATE INDEX IF NOT EXISTS idx_scrobbles_album_release
+                 ON scrobbles(user_id, LOWER(TRIM(artist)), LOWER(TRIM(album)), mbid_release)
+                WHERE mbid_release IS NOT NULL AND TRIM(mbid_release) != ''"
+        );
+
+        speed!("CREATE INDEX IF NOT EXISTS idx_entities_match ON entities(match_key)");
+        speed!("CREATE INDEX IF NOT EXISTS idx_entities_mbid ON entities(kind, mbid)");
+        Ok(())
+    }
+
     /// Run one DDL statement, translated into the active dialect.
     ///
     /// Every `CREATE` in this file is written in SQLite's spelling and mapped
