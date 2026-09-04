@@ -37,8 +37,9 @@
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
+use crate::db::Db;
 use serde::Deserialize;
-use sqlx::{Pool, Sqlite};
+use sqlx::Pool;
 
 /// How long a miss is believed before asking again.
 ///
@@ -234,7 +235,7 @@ pub fn language_of(plain: Option<&str>, synced: Option<&str>) -> Option<&'static
 /// Reads lyrics, and remembers what it read.
 pub struct LyricsClient {
     http: reqwest::Client,
-    pool: Pool<Sqlite>,
+    pool: Pool<Db>,
     base: String,
     /// When the last outbound request was *started*, so [`Self::pace`] can
     /// space the next one. `Mutex` rather than an atomic because the wait is
@@ -243,7 +244,7 @@ pub struct LyricsClient {
 }
 
 impl LyricsClient {
-    pub async fn new(pool: Pool<Sqlite>) -> Result<Self, Box<dyn std::error::Error>> {
+    pub async fn new(pool: Pool<Db>) -> Result<Self, Box<dyn std::error::Error>> {
         // The docs require a name, a version and a link. A project URL rather
         // than an address, so this needs no configuration and cannot ship a
         // made-up contact — the objection the Every Noise scraper answers by
@@ -259,7 +260,8 @@ impl LyricsClient {
     }
 
     async fn init(&self) -> Result<(), sqlx::Error> {
-        sqlx::query(
+        crate::db::run_ddl(
+            &self.pool,
             r#"
             CREATE TABLE IF NOT EXISTS lyrics_cache (
                 track_key TEXT PRIMARY KEY,   -- artist_key + '|' + folded title
@@ -275,7 +277,6 @@ impl LyricsClient {
             );
             "#,
         )
-        .execute(&self.pool)
         .await?;
         // A cache that predates "Fix the words" has no `edited` column, and
         // this table is created by `CREATE TABLE IF NOT EXISTS` so the line
@@ -781,11 +782,11 @@ impl std::fmt::Display for LyricsError {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "postgres")))]
 mod tests {
     use super::*;
 
-    async fn testpool() -> Pool<Sqlite> {
+    async fn testpool() -> Pool<Db> {
         use std::sync::atomic::{AtomicU32, Ordering};
         static N: AtomicU32 = AtomicU32::new(0);
         let n = N.fetch_add(1, Ordering::SeqCst);

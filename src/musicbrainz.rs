@@ -1,7 +1,8 @@
 // musicbrainz.rs - MusicBrainz metadata with 3-tier caching
+use crate::db::Db;
 use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
-use sqlx::{Pool, Postgres, Sqlite};
+use sqlx::{Pool, Postgres};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{RwLock, Semaphore};
@@ -125,7 +126,7 @@ pub fn contact_is_placeholder(user_agent: &str) -> bool {
 
 pub struct MusicBrainzClient {
     config: MusicBrainzConfig,
-    sqlite_pool: Pool<Sqlite>,
+    sqlite_pool: Pool<Db>,
     postgres_pool: Option<Pool<Postgres>>,
     http_client: reqwest::Client,
     rate_limiter: Arc<RateLimiter>,
@@ -162,7 +163,7 @@ impl RateLimiter {
 }
 
 impl MusicBrainzClient {
-    pub async fn new(config: MusicBrainzConfig, sqlite_pool: Pool<Sqlite>) -> Result<Self> {
+    pub async fn new(config: MusicBrainzConfig, sqlite_pool: Pool<Db>) -> Result<Self> {
         let postgres_pool = if config.enable_postgres {
             if let Some(ref pg_url) = config.postgres_url {
                 Some(Pool::<Postgres>::connect(pg_url).await?)
@@ -637,7 +638,8 @@ impl MusicBrainzClient {
     }
 
     pub async fn initialize_schema(&self) -> Result<()> {
-        sqlx::query(
+        crate::db::run_ddl(
+            &self.sqlite_pool,
             r#"
             CREATE TABLE IF NOT EXISTS musicbrainz_cache (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -680,7 +682,6 @@ impl MusicBrainzClient {
             );
             "#,
         )
-        .execute(&self.sqlite_pool)
         .await?;
 
         Ok(())
@@ -804,8 +805,10 @@ impl MusicBrainzClient {
             found.isrcs.iter().map(|s| s.trim().to_uppercase()).filter(|s| !s.is_empty()).collect();
 
         let _ = sqlx::query(
-            "INSERT OR REPLACE INTO mb_isrc_cache (recording_mbid, isrcs, fetched_at)
-             VALUES (?, ?, ?)",
+            "INSERT INTO mb_isrc_cache (recording_mbid, isrcs, fetched_at)
+             VALUES (?, ?, ?)
+             ON CONFLICT (recording_mbid) DO UPDATE SET
+                isrcs = excluded.isrcs, fetched_at = excluded.fetched_at",
         )
         .bind(recording_mbid)
         .bind(serde_json::to_string(&isrcs).unwrap_or_else(|_| "[]".into()))
@@ -881,9 +884,15 @@ impl MusicBrainzClient {
         }
 
         let _ = sqlx::query(
-            "INSERT OR REPLACE INTO mb_language_cache (recording_mbid, language, fetched_at) VALUES (?, ?, ?)"
-        ).bind(recording_mbid).bind(resolved.clone().unwrap_or_default())
-         .bind(chrono::Utc::now().timestamp()).execute(&self.sqlite_pool).await;
+            "INSERT INTO mb_language_cache (recording_mbid, language, fetched_at) VALUES (?, ?, ?)
+             ON CONFLICT (recording_mbid) DO UPDATE SET
+                language = excluded.language, fetched_at = excluded.fetched_at",
+        )
+        .bind(recording_mbid)
+        .bind(resolved.clone().unwrap_or_default())
+        .bind(chrono::Utc::now().timestamp())
+        .execute(&self.sqlite_pool)
+        .await;
 
         Ok(resolved)
     }
@@ -991,7 +1000,7 @@ struct CAAImage {
     front: bool,
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "postgres")))]
 mod identity_tests {
     use super::*;
 
@@ -1053,12 +1062,12 @@ mod identity_tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "postgres")))]
 mod refusal_tests {
     use super::*;
 
     async fn client(user_agent: &str, api_base_url: &str) -> MusicBrainzClient {
-        let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
+        let pool: Pool<Db> = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
         let c = MusicBrainzClient::new(
             MusicBrainzConfig {
                 api_base_url: api_base_url.to_string(),

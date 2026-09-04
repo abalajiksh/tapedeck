@@ -820,16 +820,74 @@ impl PlexSettings {
 /// The database this binary was built for, chosen by the `postgres` cargo
 /// feature. See [`dialect`] for what the switch does and does not cover.
 ///
-/// **Only the main store is dual-backend.** The MusicBrainz cache
-/// (`SQLITE_DB_PATH`) and the Every Noise map (`EVERYNOISE_DB_PATH`) stay
-/// SQLite in either build: they are regenerable local caches, already kept out
-/// of `VACUUM INTO` backups on purpose, and making them switch too would
-/// triple the work for nothing. A Postgres deployment therefore still keeps a
-/// couple of small SQLite files beside it, and still wants a volume for them.
+/// **All four schemas switch together.** The main store, the MusicBrainz cache
+/// (`SQLITE_DB_PATH`), the lyrics cache and the Every Noise map
+/// (`EVERYNOISE_DB_PATH`) are separate SQLite *files* only because
+/// `VACUUM INTO` copies a whole file and cannot exclude a table — the one way
+/// to keep bulk reference data out of the user's backup. Postgres has
+/// `pg_dump --exclude-table`, so under it they share one database and
+/// `DATABASE_URL` is the only one to configure. Choosing Postgres should not
+/// leave stray SQLite files behind that nobody asked for.
 #[cfg(feature = "postgres")]
 pub type Db = sqlx::Postgres;
 #[cfg(not(feature = "postgres"))]
 pub type Db = sqlx::Sqlite;
+
+/// Execute a DDL blob against `pool`, translated into the active dialect and
+/// split into individual statements.
+///
+/// One runner for all four schemas — the main store, the Every Noise map, the
+/// MusicBrainz cache and the lyrics cache — so the translation cannot be
+/// applied in three places and forgotten in the fourth.
+pub async fn run_ddl(pool: &Pool<Db>, sql: &str) -> Result<(), sqlx::Error> {
+    for stmt in dialect::statements(&dialect::rewrite_ddl(sql)) {
+        sqlx::query(&stmt).execute(pool).await?;
+    }
+    Ok(())
+}
+
+/// Open a pool for one of the **auxiliary** stores — the MusicBrainz cache and
+/// the Every Noise map.
+///
+/// Under SQLite these are separate database *files*, and the reason is
+/// `VACUUM INTO`: it copies a whole file and cannot exclude a table, so the
+/// only way to keep 6,300 rows of someone else's reference data out of the
+/// user's backup is to keep it out of the user's file.
+///
+/// **Under Postgres that reason disappears.** `pg_dump --exclude-table` leaves
+/// them out of a backup while they live in the same database, so a Postgres
+/// deployment configures **one** `DATABASE_URL` and `SQLITE_DB_PATH` /
+/// `EVERYNOISE_DB_PATH` are ignored. Choosing Postgres should not leave a
+/// couple of SQLite files lying about that nobody asked for.
+///
+/// Sharing one database is only safe because no table name collides across the
+/// three schemas — `the_auxiliary_schemas_do_not_collide_with_the_main_one`
+/// asserts it, so a new table named `sessions` in the lyrics cache fails the
+/// build rather than shadowing the real one.
+pub async fn open_aux_pool(
+    sqlite_url: &str,
+    primary_url: &str,
+    max_connections: u32,
+) -> Result<Pool<Db>, sqlx::Error> {
+    #[cfg(not(feature = "postgres"))]
+    {
+        let _ = primary_url;
+        let options = SqliteConnectOptions::from_str(sqlite_url)?
+            .create_if_missing(true)
+            .journal_mode(SqliteJournalMode::Wal)
+            .busy_timeout(Duration::from_secs(10))
+            .synchronous(SqliteSynchronous::Normal);
+        SqlitePoolOptions::new().max_connections(max_connections).connect_with(options).await
+    }
+    #[cfg(feature = "postgres")]
+    {
+        let _ = sqlite_url;
+        sqlx::postgres::PgPoolOptions::new()
+            .max_connections(max_connections)
+            .connect(primary_url)
+            .await
+    }
+}
 
 pub struct Database {
     pool: Pool<Db>,

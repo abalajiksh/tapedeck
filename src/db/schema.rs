@@ -20,8 +20,7 @@ impl Database {
     /// drift from the first, and a schema that disagrees with itself between
     /// backends is the worst thing this application could own.
     async fn ddl(&self, sql: &str) -> Result<(), sqlx::Error> {
-        sqlx::query(&dialect::rewrite_ddl(sql)).execute(&self.pool).await?;
-        Ok(())
+        crate::db::run_ddl(&self.pool, sql).await
     }
 
     pub(super) async fn init(&self) -> Result<(), sqlx::Error> {

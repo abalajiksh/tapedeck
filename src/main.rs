@@ -28,7 +28,6 @@ mod web_assets;
 
 use std::sync::Arc;
 
-use sqlx::SqlitePool;
 use tracing::{error, info, warn};
 
 use crate::config::Config;
@@ -55,7 +54,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ── MusicBrainz client ──
     let sqlite_path = config.database.sqlite_path.clone();
     info!("📦 Initializing SQLite database at {}", sqlite_path);
-    let sqlite_pool = SqlitePool::connect(&format!("sqlite:{}?mode=rwc", sqlite_path)).await?;
+    let sqlite_pool = crate::db::open_aux_pool(
+        &format!("sqlite:{}?mode=rwc", sqlite_path),
+        &config.database.scrobble_db_url,
+        5,
+    )
+    .await?;
 
     let mb_config = musicbrainz::MusicBrainzConfig {
         api_base_url: config.musicbrainz.api_base_url.clone(),
@@ -144,8 +148,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // anything the user did, and re-acquirable at any time. Opening it here
     // rather than lazily means a bad path fails at startup instead of the first
     // time someone opens Settings. Empty until an admin asks for a scrape.
-    let everynoise =
-        crate::everynoise::store::EveryNoiseStore::open(&config.database.everynoise_path).await?;
+    let everynoise = crate::everynoise::store::EveryNoiseStore::open(
+        &config.database.everynoise_path,
+        &config.database.scrobble_db_url,
+    )
+    .await?;
 
     // ── Lyrics ──
     // In the MusicBrainz cache database, not in `scrobbles.db`: third-party

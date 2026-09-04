@@ -176,6 +176,67 @@ pub fn rewrite_ddl(sql: &str) -> Cow<'_, str> {
     }
 }
 
+/// Split a DDL blob into individual statements.
+///
+/// SQLite happily executes several statements in one `execute`; **Postgres does
+/// not**, because sqlx prepares its queries and the extended protocol carries
+/// exactly one statement. Two of the cache schemas are written as one raw block
+/// of `CREATE`s separated by semicolons, and a third ends with a stray `;` — all
+/// fine on SQLite, all a syntax error on Postgres.
+///
+/// Splits only on **top-level** semicolons: one inside a string literal or a
+/// comment is data, and cutting there would produce two invalid fragments out
+/// of one valid statement.
+pub fn statements(sql: &str) -> Vec<String> {
+    let b = sql.as_bytes();
+    let (mut out, mut start, mut i, n) = (Vec::new(), 0usize, 0usize, b.len());
+    let mut push = |from: usize, to: usize, out: &mut Vec<String>| {
+        let stmt = sql[from..to].trim();
+        if !stmt.is_empty() {
+            out.push(stmt.to_string());
+        }
+    };
+    while i < n {
+        match b[i] {
+            b'\'' => {
+                i += 1;
+                while i < n {
+                    if b[i] == b'\'' {
+                        if i + 1 < n && b[i + 1] == b'\'' {
+                            i += 2;
+                            continue;
+                        }
+                        break;
+                    }
+                    i += 1;
+                }
+                i += 1;
+            }
+            b'"' => {
+                i += 1;
+                while i < n && b[i] != b'"' {
+                    i += 1;
+                }
+                i += 1;
+            }
+            b'-' if i + 1 < n && b[i + 1] == b'-' => {
+                i = sql[i..].find('\n').map_or(n, |j| i + j + 1);
+            }
+            b'/' if i + 1 < n && b[i + 1] == b'*' => {
+                i = sql[i..].find("*/").map_or(n, |j| i + j + 2);
+            }
+            b';' => {
+                push(start, i, &mut out);
+                i += 1;
+                start = i;
+            }
+            _ => i += 1,
+        }
+    }
+    push(start, n, &mut out);
+    out
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Mode {
     Query,
@@ -531,6 +592,26 @@ mod tests {
              Either add a mapping to DDL_PHRASES, or add the word to KNOWN if it \
              means the same thing in both dialects."
         );
+    }
+
+    #[test]
+    fn a_ddl_blob_splits_into_statements_but_never_inside_a_literal() {
+        assert_eq!(
+            statements("CREATE TABLE a (x TEXT);\n CREATE TABLE b (y TEXT);\n"),
+            vec!["CREATE TABLE a (x TEXT)", "CREATE TABLE b (y TEXT)"]
+        );
+        // A trailing semicolon yields no empty statement.
+        assert_eq!(statements("CREATE TABLE a (x TEXT);"), vec!["CREATE TABLE a (x TEXT)"]);
+        // A semicolon that is data must not split anything.
+        assert_eq!(
+            statements("INSERT INTO t VALUES ('a;b')"),
+            vec!["INSERT INTO t VALUES ('a;b')"]
+        );
+        assert_eq!(
+            statements("CREATE TABLE a (x TEXT) -- ; not here\n"),
+            vec!["CREATE TABLE a (x TEXT) -- ; not here"]
+        );
+        assert!(statements("  \n ; \n ").is_empty());
     }
 
     #[test]

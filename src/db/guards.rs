@@ -461,6 +461,58 @@ mod tests {
         assert_eq!(names.len(), EXEMPT.len(), "duplicate entry in EXEMPT");
     }
 
+    /// Under Postgres all four schemas share one database, so a table name
+    /// used twice would have one module silently reading the other's rows.
+    ///
+    /// Under SQLite they are separate files and a collision is invisible — so
+    /// this only fails on the build nobody may be running, which is exactly why
+    /// it is a test rather than a note.
+    #[test]
+    fn the_auxiliary_schemas_do_not_collide_with_the_main_one() {
+        use std::collections::BTreeMap;
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let files = [
+            ("main", "src/db/schema.rs"),
+            ("everynoise", "src/everynoise/store.rs"),
+            ("lyrics", "src/lyrics.rs"),
+            ("musicbrainz", "src/musicbrainz.rs"),
+        ];
+        let mut owner: BTreeMap<String, &str> = BTreeMap::new();
+        let mut clashes: Vec<String> = Vec::new();
+        let mut found = 0usize;
+        for (module, rel) in files {
+            let src = std::fs::read_to_string(root.join(rel)).expect("read schema source");
+            for (_, _, lit) in literals(&src) {
+                let mut rest = lit.as_str();
+                while let Some(i) = rest.find("CREATE TABLE IF NOT EXISTS ") {
+                    rest = &rest[i + "CREATE TABLE IF NOT EXISTS ".len()..];
+                    let name: String = rest
+                        .chars()
+                        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                        .collect();
+                    if name.is_empty() {
+                        continue;
+                    }
+                    found += 1;
+                    match owner.get(&name) {
+                        Some(prev) if *prev != module => {
+                            clashes.push(format!("`{name}` in both {prev} and {module}"))
+                        }
+                        _ => {
+                            owner.insert(name, module);
+                        }
+                    }
+                }
+            }
+        }
+        assert!(found > 40, "only {found} tables found — the scanner is broken");
+        assert!(
+            clashes.is_empty(),
+            "these table names are used by more than one schema, which under \
+             Postgres means one module reading another's rows: {clashes:?}"
+        );
+    }
+
     /// A stale exemption is how this guard rots: the query gets its filter (or
     /// is deleted) and the entry stays, quietly exempting whatever is written
     /// under that name next.

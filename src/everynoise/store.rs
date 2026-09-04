@@ -9,10 +9,8 @@
 //! It is also **not** derived from anything the user did, which is why nothing
 //! here is scoped by `user_id`.
 
-use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
-use sqlx::{Pool, Sqlite};
-use std::str::FromStr;
-use std::time::Duration;
+use crate::db::Db;
+use sqlx::Pool;
 
 use super::parse::{Artist, Genre, Neighbour};
 
@@ -45,18 +43,36 @@ pub fn genre_key(s: &str) -> String {
 
 /// Does a column exist? Same shape as `db.rs::has_column` — this database has
 /// no migration list of its own, since it is rebuildable reference data.
-async fn column_exists(pool: &Pool<Sqlite>, table: &str, column: &str) -> bool {
-    let rows: Vec<(i64, String, String, i64, Option<String>, i64)> =
-        sqlx::query_as(&format!("PRAGMA table_info({})", table))
-            .fetch_all(pool)
-            .await
-            .unwrap_or_default();
-    rows.iter().any(|r| r.1 == column)
+async fn column_exists(pool: &Pool<Db>, table: &str, column: &str) -> bool {
+    // The schema catalogue is the one thing the dialect layer cannot translate:
+    // these are different queries, not one query spelled twice.
+    #[cfg(not(feature = "postgres"))]
+    {
+        let rows: Vec<(i64, String, String, i64, Option<String>, i64)> =
+            sqlx::query_as(&format!("PRAGMA table_info({})", table))
+                .fetch_all(pool)
+                .await
+                .unwrap_or_default();
+        rows.iter().any(|r| r.1 == column)
+    }
+    #[cfg(feature = "postgres")]
+    {
+        let n: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM information_schema.columns \
+             WHERE table_name = $1 AND column_name = $2",
+        )
+        .bind(table)
+        .bind(column)
+        .fetch_one(pool)
+        .await
+        .unwrap_or(0);
+        n > 0
+    }
 }
 
 #[derive(Clone)]
 pub struct EveryNoiseStore {
-    pool: Pool<Sqlite>,
+    pool: Pool<Db>,
 }
 
 /// What the local copy currently holds.
@@ -73,24 +89,32 @@ pub struct Summary {
 }
 
 impl EveryNoiseStore {
-    pub async fn open(path: &str) -> Result<Self, sqlx::Error> {
-        let options = SqliteConnectOptions::from_str(path)?
-            .create_if_missing(true)
-            .journal_mode(SqliteJournalMode::Wal)
-            .busy_timeout(Duration::from_secs(10))
-            .synchronous(SqliteSynchronous::Normal);
+    /// Open the map's store.
+    ///
+    /// Under SQLite that is `path`, its own file, so 6,300 rows of someone
+    /// else's reference data stay out of the user's `VACUUM INTO` backup.
+    /// Under Postgres it is `primary_url` — the same database as everything
+    /// else, because `pg_dump --exclude-table` can leave these out of a backup
+    /// without them living somewhere separate, and choosing Postgres should not
+    /// leave a stray SQLite file behind.
+    pub async fn open(path: &str, primary_url: &str) -> Result<Self, sqlx::Error> {
         // Two connections is plenty: one scrape job writes, handlers read.
-        let pool = SqlitePoolOptions::new().max_connections(2).connect_with(options).await?;
+        let pool = crate::db::open_aux_pool(path, primary_url, 2).await?;
         let store = Self { pool };
         store.init().await?;
         Ok(store)
+    }
+
+    /// Run one DDL statement, translated into the active dialect.
+    async fn ddl(&self, sql: &str) -> Result<(), sqlx::Error> {
+        crate::db::run_ddl(&self.pool, sql).await
     }
 
     async fn init(&self) -> Result<(), sqlx::Error> {
         // `name_key` is the join column, not `name`: genre names are compared
         // case-insensitively against MusicBrainz tags, and doing that with
         // LOWER() at query time would give up the index.
-        sqlx::query(
+        self.ddl(
             "CREATE TABLE IF NOT EXISTS genres (
                 slug TEXT PRIMARY KEY,
                 name TEXT NOT NULL,
@@ -105,29 +129,22 @@ impl EveryNoiseStore {
                 scraped_at INTEGER NOT NULL
             )",
         )
-        .execute(&self.pool)
         .await?;
-        sqlx::query("CREATE INDEX IF NOT EXISTS idx_en_genres_key ON genres(name_key)")
-            .execute(&self.pool)
-            .await?;
+        self.ddl("CREATE INDEX IF NOT EXISTS idx_en_genres_key ON genres(name_key)").await?;
         // Added after the first scrape shipped, so an existing copy has to gain
         // the column rather than be re-walked — that walk is two hours against
         // someone else's server and the data has not changed.
         if !column_exists(&self.pool, "genres", "loose_key").await {
-            sqlx::query("ALTER TABLE genres ADD COLUMN loose_key TEXT NOT NULL DEFAULT ''")
-                .execute(&self.pool)
-                .await?;
+            self.ddl("ALTER TABLE genres ADD COLUMN loose_key TEXT NOT NULL DEFAULT ''").await?;
         }
-        sqlx::query("CREATE INDEX IF NOT EXISTS idx_en_genres_loose ON genres(loose_key)")
-            .execute(&self.pool)
-            .await?;
+        self.ddl("CREATE INDEX IF NOT EXISTS idx_en_genres_loose ON genres(loose_key)").await?;
         self.backfill_loose_keys().await?;
 
         // `norm_name` is `db::normalise_artist` — the *one* artist identity
         // function in this codebase. A second one here would be the third, and
         // CLAUDE.md is explicit that the answer to needing a different notion
         // of artist identity is a conversation, not another normaliser.
-        sqlx::query(
+        self.ddl(
             "CREATE TABLE IF NOT EXISTS genre_artists (
                 genre_slug TEXT NOT NULL,
                 name TEXT NOT NULL,
@@ -140,13 +157,11 @@ impl EveryNoiseStore {
                 PRIMARY KEY (genre_slug, name)
             )",
         )
-        .execute(&self.pool)
         .await?;
-        sqlx::query("CREATE INDEX IF NOT EXISTS idx_en_artists_norm ON genre_artists(norm_name)")
-            .execute(&self.pool)
+        self.ddl("CREATE INDEX IF NOT EXISTS idx_en_artists_norm ON genre_artists(norm_name)")
             .await?;
 
-        sqlx::query(
+        self.ddl(
             "CREATE TABLE IF NOT EXISTS genre_edges (
                 genre_slug TEXT NOT NULL,
                 related_slug TEXT NOT NULL,
@@ -155,20 +170,18 @@ impl EveryNoiseStore {
                 PRIMARY KEY (genre_slug, related_slug, relation)
             )",
         )
-        .execute(&self.pool)
         .await?;
 
         // The resume marker. A tier 2 walk is ~6,300 requests over about two
         // hours; losing it to a restart would mean starting over, and starting
         // over means asking a frozen one-person site for everything twice.
-        sqlx::query(
+        self.ddl(
             "CREATE TABLE IF NOT EXISTS scraped_pages (
                 slug TEXT PRIMARY KEY,
                 scraped_at INTEGER NOT NULL,
                 artists INTEGER NOT NULL
             )",
         )
-        .execute(&self.pool)
         .await?;
 
         Ok(())
@@ -238,9 +251,13 @@ impl EveryNoiseStore {
             .await?;
         for a in artists {
             sqlx::query(
-                "INSERT OR REPLACE INTO genre_artists
+                "INSERT INTO genre_artists
                     (genre_slug, name, norm_name, spotify_id, x, y, color, font_size)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                 ON CONFLICT (genre_slug, name) DO UPDATE SET
+                    norm_name = excluded.norm_name, spotify_id = excluded.spotify_id,
+                    x = excluded.x, y = excluded.y, color = excluded.color,
+                    font_size = excluded.font_size",
             )
             .bind(slug)
             .bind(&a.name)
@@ -260,8 +277,10 @@ impl EveryNoiseStore {
             .await?;
         for n in neighbours {
             sqlx::query(
-                "INSERT OR REPLACE INTO genre_edges (genre_slug, related_slug, relation, position)
-                 VALUES (?, ?, ?, ?)",
+                "INSERT INTO genre_edges (genre_slug, related_slug, relation, position)
+                 VALUES (?, ?, ?, ?)
+                 ON CONFLICT (genre_slug, related_slug, relation) DO UPDATE SET
+                    position = excluded.position",
             )
             .bind(slug)
             .bind(&n.slug)
@@ -272,7 +291,9 @@ impl EveryNoiseStore {
         }
 
         sqlx::query(
-            "INSERT OR REPLACE INTO scraped_pages (slug, scraped_at, artists) VALUES (?, ?, ?)",
+            "INSERT INTO scraped_pages (slug, scraped_at, artists) VALUES (?, ?, ?)
+             ON CONFLICT (slug) DO UPDATE SET
+                scraped_at = excluded.scraped_at, artists = excluded.artists",
         )
         .bind(slug)
         .bind(now)
@@ -543,7 +564,9 @@ impl EveryNoiseStore {
     }
 }
 
-#[cfg(test)]
+// SQLite-backed, like `db::tests` — see the note there. Under
+// `--features postgres` these would need a live server.
+#[cfg(all(test, not(feature = "postgres")))]
 mod tests {
     use super::*;
     use crate::everynoise::parse::Relation;
@@ -557,7 +580,7 @@ mod tests {
         for suffix in ["", "-wal", "-shm"] {
             let _ = std::fs::remove_file(format!("{}{}", path.display(), suffix));
         }
-        EveryNoiseStore::open(&format!("sqlite:{}", path.display())).await.unwrap()
+        EveryNoiseStore::open(&format!("sqlite:{}", path.display()), "").await.unwrap()
     }
 
     fn genre(slug: &str, name: &str) -> Genre {
