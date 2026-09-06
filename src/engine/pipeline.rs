@@ -1207,11 +1207,32 @@ impl ScrobbleEngine {
 
             let session_result = match plex.fetch_sessions_extended(None).await {
                 Ok(r) => {
-                    if self.sources[i].error_logged {
-                        info!("✅ Plex recovered for user {}", user_id);
-                        self.sources[i].error_logged = false;
+                    // A poll can come back `Ok` and still have failed at one
+                    // half — the live read and the history walk fail
+                    // independently, and each reports rather than cancelling
+                    // the other. Treated exactly like a whole-poll failure from
+                    // here down, because to the operator it is one: the deck
+                    // goes dark either way, and `last_error` is what Operations
+                    // reads. Before this, a 401 on the live read was recorded
+                    // as a clean poll.
+                    match r.trouble() {
+                        None => {
+                            if self.sources[i].error_logged {
+                                info!("✅ Plex recovered for user {}", user_id);
+                                self.sources[i].error_logged = false;
+                            }
+                            let _ = db.record_source_poll(row_id, None).await;
+                        }
+                        Some(msg) => {
+                            if !self.sources[i].error_logged {
+                                error!("Plex trouble for user {}: {}", user_id, msg);
+                                self.sources[i].error_logged = true;
+                            } else {
+                                debug!("Plex still troubled for user {}: {}", user_id, msg);
+                            }
+                            let _ = db.record_source_poll(row_id, Some(&msg)).await;
+                        }
                     }
-                    let _ = db.record_source_poll(row_id, None).await;
                     r
                 }
                 Err(e) => {

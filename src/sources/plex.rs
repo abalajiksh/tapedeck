@@ -737,6 +737,32 @@ pub struct SessionResult {
     /// Tracks replaced before they ever counted. `view_offset` is how far in
     /// the listener got, which is the half that makes a skip mean anything.
     pub skipped: Vec<PlexTrack>,
+    /// Why the live-session read produced nothing, when it *failed* rather than
+    /// genuinely finding nothing playing. `None` means Plex was asked and
+    /// answered; an empty session list is an answer.
+    ///
+    /// These two halves are reported rather than returned as `Err` because they
+    /// fail independently and the other half is still worth having: a live read
+    /// that cannot be made must not also cancel the history walk, which is the
+    /// only thing that catches plays finishing between polls. `Err` from
+    /// `fetch_sessions_extended` stays what it always was — the whole poll
+    /// failed.
+    pub live_error: Option<String>,
+    /// Why the history walk produced nothing. Same rule as `live_error`.
+    pub history_error: Option<String>,
+}
+
+impl SessionResult {
+    /// Whatever went wrong this poll, as one line for `user_sources.last_error`.
+    /// Both halves can fail at once and they mean different things, so both are
+    /// named rather than the first one winning.
+    pub fn trouble(&self) -> Option<String> {
+        let parts: Vec<&str> = [self.live_error.as_deref(), self.history_error.as_deref()]
+            .into_iter()
+            .flatten()
+            .collect();
+        (!parts.is_empty()).then(|| parts.join("; "))
+    }
 }
 
 impl PlexSource {
@@ -1310,64 +1336,102 @@ impl PlexSource {
         let mut result = SessionResult::default();
 
         // A. Live Sessions
+        //
+        // Every failure here used to be swallowed — a transport error, a
+        // non-2xx status and an unreadable body all produced *no log line at
+        // all*, and `last_error` never saw them because the poll still returned
+        // `Ok`. So "Plex answered 401" and "Plex is fine and nothing is
+        // playing" were indistinguishable from the log, from Operations and
+        // from anywhere else. Same rule as `needs_setup` and the lyrics
+        // coverage card: never report a failed read as an absence.
         let endpoint = format!("{}/status/sessions", self.url);
-        if let Ok(resp) = self
+        let sent = self
             .client
             .get(&endpoint)
             .header("X-Plex-Token", &self.token)
             .header("Accept", "application/json")
             .send()
-            .await
-        {
-            if resp.status().is_success() {
-                if let Ok(sessions) = resp.json::<SessionsResponse>().await {
-                    info!(
-                        "Processing {} active Plex sessions",
-                        sessions.media_container.metadata.len()
-                    );
+            .await;
+        let parsed = match sent {
+            // The top-level message of a transport error names the operation
+            // and not the fault, so a refused connection, a DNS failure and a
+            // handshake the peer cut off all read alike. Print the chain.
+            Err(e) => {
+                Err(format!("live sessions unreachable: {}", crate::logging::error_chain(&e)))
+            }
+            Ok(resp) if !resp.status().is_success() => {
+                Err(format!("live sessions: Plex answered {}", resp.status()))
+            }
+            Ok(resp) => resp.json::<SessionsResponse>().await.map_err(|e| {
+                format!("live sessions unreadable: {}", crate::logging::error_chain(&e))
+            }),
+        };
 
-                    for session in sessions.media_container.metadata {
-                        if let Some(reason) = self.validate_session(&session) {
-                            debug!("Skipping session: {}", reason);
-                            continue;
-                        }
-                        if session.media_type.as_deref() != Some("track") {
-                            continue;
-                        }
+        match parsed {
+            Err(msg) => result.live_error = Some(msg),
+            Ok(sessions) => {
+                let total = sessions.media_container.metadata.len();
+                // Counted rather than logged per session. Every Plex source on
+                // the instance polls the same server and sees *every* session,
+                // so in a three-account household two of every three are
+                // rejected on every tick — logging each one at INFO would be
+                // ~1,400 lines an hour saying nothing. One fact, logged once.
+                let (mut not_mine, mut not_music, mut mine) = (0usize, 0usize, 0usize);
 
-                        let is_playing = session
-                            .player
-                            .as_ref()
-                            .map(|p| p.state.as_deref() == Some("playing"))
-                            .unwrap_or(false);
+                for session in sessions.media_container.metadata {
+                    if let Some(reason) = self.validate_session(&session) {
+                        debug!("Skipping session: {}", reason);
+                        not_mine += 1;
+                        continue;
+                    }
+                    if session.media_type.as_deref() != Some("track") {
+                        not_music += 1;
+                        continue;
+                    }
+                    mine += 1;
 
-                        if let Some(track) = PlexTrack::from_session(session) {
-                            if let Some(ref q) = track.audio_quality {
-                                debug!(
-                                    "Plex quality: {} {} {}/{} score={:.0}{}",
-                                    q.codec.as_deref().unwrap_or("?"),
-                                    if q.is_lossless.unwrap_or(false) {
-                                        "lossless"
-                                    } else {
-                                        "lossy"
-                                    },
-                                    q.bit_depth.unwrap_or(0),
-                                    q.sample_rate.unwrap_or(0),
-                                    q.quality_score.unwrap_or(0.0),
-                                    if q.is_transcoded.unwrap_or(false) {
-                                        format!(
-                                            " → transcoded to {}",
-                                            q.delivery_codec.as_deref().unwrap_or("?")
-                                        )
-                                    } else {
-                                        String::new()
-                                    },
-                                );
-                            }
-                            self.process_live_track(track, is_playing, &mut result).await;
+                    let is_playing = session
+                        .player
+                        .as_ref()
+                        .map(|p| p.state.as_deref() == Some("playing"))
+                        .unwrap_or(false);
+
+                    if let Some(track) = PlexTrack::from_session(session) {
+                        if let Some(ref q) = track.audio_quality {
+                            debug!(
+                                "Plex quality: {} {} {}/{} score={:.0}{}",
+                                q.codec.as_deref().unwrap_or("?"),
+                                if q.is_lossless.unwrap_or(false) { "lossless" } else { "lossy" },
+                                q.bit_depth.unwrap_or(0),
+                                q.sample_rate.unwrap_or(0),
+                                q.quality_score.unwrap_or(0.0),
+                                if q.is_transcoded.unwrap_or(false) {
+                                    format!(
+                                        " → transcoded to {}",
+                                        q.delivery_codec.as_deref().unwrap_or("?")
+                                    )
+                                } else {
+                                    String::new()
+                                },
+                            );
                         }
+                        self.process_live_track(track, is_playing, &mut result).await;
                     }
                 }
+
+                // `mine of total` is the line that answers the question this
+                // log could not: an empty list means Plex says nothing is
+                // playing, whereas `0 of 3` means it is playing for somebody
+                // else on the server. Those look identical as a bare count and
+                // need completely different things from the operator.
+                let mut note = String::new();
+                if not_mine > 0 {
+                    note.push_str(&format!(", {} for another account", not_mine));
+                }
+                if not_music > 0 {
+                    note.push_str(&format!(", {} not music", not_music));
+                }
+                info!("Processing {} of {} active Plex sessions{}", mine, total, note);
             }
         }
 
@@ -1376,11 +1440,22 @@ impl PlexSource {
         if now.saturating_sub(self.last_history_at) >= HISTORY_SYNC_INTERVAL_SECS {
             self.last_history_at = now;
             self.recent_scrobbles.retain(|_, at| now.saturating_sub(*at) < HISTORY_SUPPRESS_SECS);
-            // `.ok()` rather than `if let Ok(..)`: the error type is a bare
-            // `Box<dyn Error>`, which is not `Send`, and binding the whole
-            // Result keeps it alive across the hydrate await below — which is
-            // enough to make the trait method's future non-`Send`.
-            let history = self.fetch_history_tracks().await.ok();
+            // `map_err` to a `String` immediately, rather than binding the
+            // whole Result: the error type is a bare `Box<dyn Error>`, which is
+            // not `Send`, and keeping it alive across the hydrate await below
+            // is enough to make the trait method's future non-`Send`. A String
+            // is `Send`, so the reason survives where the error cannot — which
+            // is the whole point, since `.ok()` used to drop it on the floor
+            // and a history walk that never ran looked exactly like one that
+            // found nothing.
+            let history = self.fetch_history_tracks().await.map_err(|e| e.to_string());
+            let history = match history {
+                Ok(h) => Some(h),
+                Err(msg) => {
+                    result.history_error = Some(format!("history walk: {}", msg));
+                    None
+                }
+            };
             if let Some(history) = history {
                 let fetched = history.len();
                 // Drop anything the live path already banked. History is the
@@ -2579,5 +2654,112 @@ mod tests {
         let (plain, synced) = super::split_lyric_body("[ar:Halden Vale]\nthe words".into());
         assert!(synced.is_none(), "tags alone are not cues");
         assert_eq!(plain.unwrap(), "[ar:Halden Vale]\nthe words");
+    }
+
+    // ---------------------------------------------------------------
+    //  A failed live read is not an empty deck
+    // ---------------------------------------------------------------
+
+    /// A one-request HTTP stub on an ephemeral port. Enough to drive the real
+    /// `fetch_sessions_extended` against a transport, a status line and a body
+    /// — the three things that were being swallowed, and none of which a pure
+    /// function can reach.
+    async fn stub(response: &'static str) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            if let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = [0u8; 4096];
+                let _ = sock.read(&mut buf).await;
+                let _ = sock.write_all(response.as_bytes()).await;
+                let _ = sock.flush().await;
+            }
+        });
+        format!("http://{}", addr)
+    }
+
+    fn body(status: &str, payload: &str) -> String {
+        format!(
+            "HTTP/1.1 {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            status,
+            payload.len(),
+            payload
+        )
+    }
+
+    /// Silences part B so these tests are about the live read alone.
+    fn live_only(url: String) -> PlexSource {
+        let mut src = PlexSource::new(url, "t".into());
+        src.last_history_at = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+        src
+    }
+
+    /// The defect this guards: a transport error, a non-2xx status and an
+    /// unreadable body were all swallowed, so the poll returned `Ok` with an
+    /// empty session list and `last_error` was never written. "Plex answered
+    /// 401" and "Plex is fine and nothing is playing" were indistinguishable
+    /// from the log, from Operations, and from anywhere else.
+    ///
+    /// Asserted on `trouble()` rather than on the private field, because that
+    /// is what the pipeline reads and what reaches the operator.
+    #[tokio::test]
+    async fn a_live_read_that_failed_is_not_reported_as_nothing_playing() {
+        // 1. A status Plex chose.
+        let url = stub(&*Box::leak(body("401 Unauthorized", "{}").into_boxed_str())).await;
+        let r = live_only(url).fetch_sessions_extended(None).await.unwrap();
+        let msg = r.trouble().expect("a 401 must not read as an idle deck");
+        assert!(msg.contains("401"), "the status is the whole diagnosis, got: {msg}");
+
+        // 2. A body that is not the shape we parse. Plex answered, so this is
+        //    not a transport fault and must not be described as one.
+        let url = stub(&*Box::leak(body("200 OK", "not json at all").into_boxed_str())).await;
+        let r = live_only(url).fetch_sessions_extended(None).await.unwrap();
+        assert!(
+            r.trouble()
+                .expect("an unreadable body must not read as an idle deck")
+                .contains("unreadable"),
+            "an unparseable body is its own fault and should say so"
+        );
+
+        // 3. Nothing listening at all.
+        let dead = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = dead.local_addr().unwrap();
+        drop(dead);
+        let r = live_only(format!("http://{}", addr)).fetch_sessions_extended(None).await.unwrap();
+        assert!(
+            r.trouble()
+                .expect("an unreachable server must not read as an idle deck")
+                .contains("unreachable"),
+            "a transport failure is its own fault and should say so"
+        );
+    }
+
+    /// The other half, and the one that stops this being "fixed" by reporting
+    /// every quiet moment as an outage. An empty session list is an **answer**:
+    /// Plex was asked and said nothing is playing, which is the normal state
+    /// for most of any day and must stay clean.
+    #[tokio::test]
+    async fn nothing_playing_is_an_answer_and_not_an_error() {
+        let payload = r#"{"MediaContainer":{"size":0,"Metadata":[]}}"#;
+        let url = stub(&*Box::leak(body("200 OK", payload).into_boxed_str())).await;
+        let r = live_only(url).fetch_sessions_extended(None).await.unwrap();
+        assert!(r.trouble().is_none(), "an idle Plex is not a fault: {:?}", r.trouble());
+        assert!(r.now_playing.is_empty());
+    }
+
+    /// Both halves fail independently and mean different things — the live read
+    /// going dark stops the deck, the history walk going dark stops the
+    /// catch-up. Reporting only the first would hide whichever came second.
+    #[test]
+    fn both_halves_of_a_poll_are_named_when_both_fail() {
+        let mut r = SessionResult::default();
+        assert!(r.trouble().is_none());
+
+        r.live_error = Some("live sessions: Plex answered 401 Unauthorized".into());
+        r.history_error = Some("history walk: connection closed".into());
+        let msg = r.trouble().unwrap();
+        assert!(msg.contains("401"), "lost the live half: {msg}");
+        assert!(msg.contains("history walk"), "lost the history half: {msg}");
     }
 }
