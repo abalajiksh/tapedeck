@@ -80,45 +80,76 @@ SQL
 echo "→ installing on ${STAGING_HOST}:${STAGING_DIR}"
 scp $SSHOPTS "$SNAP" "$STAGING_HOST:${STAGING_DIR}/${DB_NAME}.new"
 
-ssh $SSHOPTS "$STAGING_HOST" "
-  set -e
-  export XDG_RUNTIME_DIR=/run/user/\$(id -u)
+# Passed as ARGUMENTS into a quoted heredoc rather than interpolated into a
+# double-quoted ssh argument. The previous form needed \$ escapes to survive two
+# shells and is exactly what the deploy step was fixed away from — it is one
+# missed backslash from a script that expands on the wrong machine.
+ssh $SSHOPTS "$STAGING_HOST" bash -s -- \
+    "$STAGING_DIR" "$DB_NAME" "$SERVICE" "$HEALTH_URL" <<'REMOTE'
+set -e
+STAGING_DIR="$1"; DB_NAME="$2"; SERVICE="$3"; HEALTH_URL="$4"
 
-  grep -q '^TAPEDECK_REPLICA=1' '${STAGING_DIR}/.env' 2>/dev/null || {
-    echo '❌ ${STAGING_DIR}/.env does not set TAPEDECK_REPLICA=1.'
-    echo '   Refusing to install production data on an instance that would forward it.'
-    rm -f '${STAGING_DIR}/${DB_NAME}.new'
-    exit 1
-  }
+export XDG_RUNTIME_DIR="/run/user/$(id -u)"
 
-  systemctl --user stop ${SERVICE} || true
-  # The -wal and -shm belong to the database being replaced. Leaving them puts
-  # a fresh file next to another database's journal.
-  rm -f '${STAGING_DIR}/${DB_NAME}-wal' '${STAGING_DIR}/${DB_NAME}-shm'
-  mv -f '${STAGING_DIR}/${DB_NAME}.new' '${STAGING_DIR}/${DB_NAME}'
-  systemctl --user start ${SERVICE}
+# The whole safety argument in four lines. TAPEDECK_REPLICA=1 is what stops this
+# instance forwarding the listens it is about to be handed, and a mode cannot be
+# forgotten on the night somebody restores by hand.
+grep -q '^TAPEDECK_REPLICA=1' "$STAGING_DIR/.env" 2>/dev/null || {
+  echo "❌ $STAGING_DIR/.env does not set TAPEDECK_REPLICA=1."
+  echo "   Refusing to install production data on an instance that would forward it."
+  rm -f "$STAGING_DIR/$DB_NAME.new"
+  exit 1
+}
 
-  # Poll rather than sleep. RestartSec=5 makes a crash loop and a slow start
-  # indistinguishable through a single check — the v0.61.1 lesson the deploy
-  # step already carries.
-  for i in \$(seq 1 30); do
-    state=\$(systemctl --user is-active ${SERVICE} || true)
-    [ \"\$state\" = active ] && break
-    sleep 1
-  done
-  if [ \"\$state\" != active ]; then
-    echo \"service is '\$state' after 30s — last 40 log lines:\"
-    journalctl --user -u ${SERVICE} -n 40 --no-pager || true
-    exit 1
+systemctl --user stop "$SERVICE" || true
+# The -wal and -shm belong to the database being replaced. Leaving them puts a
+# fresh file next to another database's journal.
+rm -f "$STAGING_DIR/$DB_NAME-wal" "$STAGING_DIR/$DB_NAME-shm"
+mv -f "$STAGING_DIR/$DB_NAME.new" "$STAGING_DIR/$DB_NAME"
+systemctl --user start "$SERVICE"
+
+# One loop asserting the thing actually wanted: the unit is up AND the app
+# answers. Three reasons it is not a poll-for-active followed by a single curl,
+# which is what this did until 2026-09-06:
+#
+#   - RestartSec=5 makes a crash loop and a slow start indistinguishable through
+#     a single check (v0.61.1: 297 restarts in 26 minutes while a deploy step
+#     reported only 'activating').
+#   - `active` is not `listening`. A Type=exec unit is active the moment the
+#     process runs, and this app opens the database, migrates it and builds its
+#     indexes before binding anything — which is the whole point here, since a
+#     restore is the one time those migrations meet a production-shaped file.
+#   - `health=$(curl -fsS ...)` under `set -e` aborted the script on the very
+#     failure the journalctl dump below exists to explain.
+#
+# The budget is generous for that reason: a first restore of a 100 MB database
+# is doing real work before it can answer.
+health=""
+waited=0
+while [ "$waited" -lt 180 ]; do
+  state=$(systemctl --user is-active "$SERVICE" || true)
+  if [ "$state" = active ]; then
+    health=$(curl -fsS --max-time 5 "$HEALTH_URL" 2>/dev/null || true)
+    [ -n "$health" ] && break
   fi
+  waited=$((waited + 1))
+  sleep 1
+done
 
-  # Active is not healthy. And this is where a migration that cannot run
-  # against a real database shows itself, which is most of why staging exists.
-  health=\$(curl -fsS --max-time 15 ${HEALTH_URL})
-  echo \"   \$health\"
-  echo \"\$health\" | grep -q '\"replica\":true' || {
-    echo '❌ the instance came up but does not report replica mode'
-    exit 1
-  }
-"
+if [ -z "$health" ]; then
+  echo "unit is '${state:-unknown}' and $HEALTH_URL did not answer in 180s — last 40 log lines:"
+  journalctl --user -u "$SERVICE" -n 40 --no-pager || true
+  exit 1
+fi
+
+echo "   healthy after ${waited}s: $health"
+
+# The last gate, and the reason the whole restore is safe: an instance that came
+# up without replica mode is one that will forward this data.
+case "$health" in
+  *'"replica":true'*) ;;
+  *) echo "❌ it came up but does not report replica mode — check $STAGING_DIR/.env"
+     exit 1 ;;
+esac
+REMOTE
 echo "✅ staging restored and healthy, in replica mode"
