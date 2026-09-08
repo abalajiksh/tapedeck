@@ -919,9 +919,51 @@ pub struct Database {
     secrets: Arc<SecretBox>,
 }
 
+/// What moving a listen in time actually did, and what it could not do.
+///
+/// Three of these four fields exist because a timestamp edit has consequences
+/// this application cannot reach, and saying so is the whole difference
+/// between a correction and a quiet inconsistency.
+#[derive(Debug, Default, serde::Serialize)]
+pub struct TimeEdit {
+    /// Listens whose timestamp moved.
+    pub moved: i64,
+    /// Of those, how many had already been forwarded to somebody's Last.fm or
+    /// ListenBrainz.
+    ///
+    /// **Neither service has an edit API**, so their copy keeps the time it was
+    /// sent with, permanently and silently. The edit is still the right thing
+    /// to do — the local record is the one that has to be true — but a screen
+    /// that did not say this would be letting somebody believe they had
+    /// corrected a public record they had not.
+    pub already_forwarded: i64,
+    /// Sessions whose aggregates were recomputed to match.
+    pub sessions_touched: i64,
+    /// Whether a moved listen now sits far enough from its session's
+    /// neighbours that the *grouping* is stale.
+    ///
+    /// The aggregates are fixed here; the grouping is not, and deliberately.
+    /// Sessions are stored rather than computed (which is what lets a manual
+    /// merge survive), `sessions.uuid` is what a handed-over sitting points at,
+    /// and re-grouping silently on a metadata edit would move an identity
+    /// somebody else is holding a reference to. So this reports, and Rebuild
+    /// remains a thing the user asks for.
+    pub grouping_stale: bool,
+}
+
 /// How long after a listen a second report of it is still assumed to be the
 /// same play rather than a repeat. See `fuzzy_exists`.
 const DUPLICATE_WINDOW_SECS: i64 = 60;
+
+/// The silence that ends a session.
+///
+/// Was written out as a bare `1800` at both call sites. It is named here
+/// because `shift_listen_times` has to ask the same question in a third place
+/// — whether moving a listen has left its session holding a gap it was grouped
+/// to exclude — and three copies of a rule about what counts as contiguous
+/// listening is how two of them come to disagree. A rebuild still takes it as
+/// a parameter, which is the honest place for it: changing it means regrouping.
+pub const SESSION_GAP_SECS: i64 = 1800;
 
 /// How far either side of a skip to look for the tracks that bracketed it.
 ///
@@ -1937,6 +1979,93 @@ pub struct SpoolMember {
     pub display_name: Option<String>,
     /// invited | joined | left.
     pub state: String,
+    /// When they were in the room from, or `None` for the whole sitting.
+    ///
+    /// Not `joined_at`, which is when they pressed the button — somebody added
+    /// an hour in was usually there all along, and the host says which.
+    pub present_from: Option<i64>,
+    /// When they left, or `None` for stayed to the end.
+    pub present_until: Option<i64>,
+}
+
+/// One sitting on the history list.
+///
+/// Deliberately not [`SpoolView`]: that type answers *what is happening now*
+/// and carries a full roster and the caller's own membership state, where this
+/// answers *what happened* and has to stay cheap across a page of them. The
+/// same call [`SentSitting`] makes against [`HandedSitting`].
+#[derive(Debug, serde::Serialize)]
+pub struct SpoolSummary {
+    pub uuid: String,
+    pub title: Option<String>,
+    pub notes: Option<String>,
+    pub started_at: i64,
+    pub ended_at: Option<i64>,
+    pub hosting: bool,
+    pub host_username: String,
+    pub host_display_name: Option<String>,
+    /// Everyone who was actually in the room, the caller included — the
+    /// screen decides whether to leave the reader out, because only it knows
+    /// whether it is writing "with Noor" or listing attendance.
+    pub present: Vec<String>,
+    /// Names with no account on this instance.
+    pub guests: Vec<String>,
+    /// Plays that reached this sitting's timeline, from every deck in it.
+    pub plays: i64,
+    /// Offers still sitting in the caller's inbox from this evening.
+    pub pending: i64,
+}
+
+/// One play on a sitting's timeline, whoever's deck it came off.
+///
+/// **This is the first row type in the application that mixes several people's
+/// listening into one sequence.** Everything else — the Reel included — keeps
+/// one deck per row.
+#[derive(Debug, serde::Serialize)]
+pub struct SpoolPlay {
+    pub title: String,
+    pub artist: String,
+    pub album: Option<String>,
+    pub duration: Option<i64>,
+    pub played_at: i64,
+    pub from_username: String,
+    pub from_display_name: Option<String>,
+    /// `mine` | `accepted` | `declined` | `pending` | `theirs`.
+    ///
+    /// Four of those are facts about the caller and the fifth is the absence of
+    /// one. Declined and never-answered are told apart deliberately: both mean
+    /// "not in my history" and they are not the same decision.
+    pub standing: String,
+    /// The capture this row came from, where there is one to act on.
+    pub capture_id: Option<i64>,
+    pub artwork_url: Option<String>,
+    pub caa_id: Option<i64>,
+    pub caa_release_mbid: Option<String>,
+}
+
+/// A sitting, in full.
+#[derive(Debug, serde::Serialize)]
+pub struct SpoolDetail {
+    pub uuid: String,
+    pub viewer_id: i64,
+    pub title: Option<String>,
+    pub notes: Option<String>,
+    pub started_at: i64,
+    pub ended_at: Option<i64>,
+    pub host_user_id: i64,
+    pub hosting: bool,
+    pub my_state: String,
+    pub members: Vec<SpoolMember>,
+    pub guests: Vec<String>,
+    pub plays: Vec<SpoolPlay>,
+    /// Plays that happened in this sitting and are not on the timeline, because
+    /// they ran through chains their owner does not share.
+    ///
+    /// **Counted and stated rather than silently dropped.** A document with
+    /// invisible holes misrepresents the evening and the reader could never
+    /// tell — the rule `handed_sitting` already carries, in the one other place
+    /// this application shows somebody an evening.
+    pub withheld: i64,
 }
 
 /// A sitting several people are in at once.
@@ -1960,6 +2089,9 @@ pub struct SpoolView {
     /// The *caller's* membership: `invited` until they join.
     pub my_state: String,
     pub members: Vec<SpoolMember>,
+    /// Names with no account here, so the banner can say who else is in the
+    /// room rather than only who else has a deck.
+    pub guests: Vec<String>,
     /// How many offers this sitting has put in the caller's inbox.
     pub captured: i64,
 }
@@ -2209,6 +2341,28 @@ pub const SPOOL_FORWARD_WINDOW_SECS: i64 = 14 * 24 * 60 * 60;
 /// only to an hour — the same bound and the same reason as the ingest rule.
 pub fn spool_forward_is_live(played_at: i64, now: i64) -> bool {
     (now - played_at) <= SPOOL_FORWARD_WINDOW_SECS && (played_at - now) <= 3600
+}
+
+/// Split a stored free-text name list into names.
+///
+/// The same comma-joined shape `scrobbles.company` uses, so a sitting's guests
+/// and a listen's company are the one format rather than two — which matters
+/// because the first is written into the second on every fan-out.
+///
+/// Empty entries are dropped rather than kept as blanks: a trailing comma is
+/// what somebody typing a list produces, not a person with no name.
+pub fn split_names(raw: Option<&str>) -> Vec<String> {
+    raw.map(|s| s.split(',').map(str::trim).filter(|n| !n.is_empty()).map(str::to_string).collect())
+        .unwrap_or_default()
+}
+
+/// Join names back into the stored form, or `None` where there are none.
+///
+/// `None` rather than an empty string, so "nobody said" and "nobody was there"
+/// stay the same absence they are everywhere else in this schema.
+pub fn join_names(names: &[String]) -> Option<String> {
+    let cleaned: Vec<&str> = names.iter().map(|n| n.trim()).filter(|n| !n.is_empty()).collect();
+    (!cleaned.is_empty()).then(|| cleaned.join(", "))
 }
 
 fn new_uuid() -> String {

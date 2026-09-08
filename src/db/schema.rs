@@ -102,6 +102,22 @@ impl Database {
                  ON scrobbles(session_id) WHERE session_id IS NOT NULL"
         );
 
+        // The same shape one step over: "the listens in this sitting", which is
+        // what a Shared Spool's page and its history list both ask, and what
+        // `offer_spool_backlog` asks every time somebody joins late.
+        //
+        // Partial, and here it is barely an index at all — a joint listen is a
+        // handful an evening against a history of tens of thousands, so the
+        // rows it covers round to nothing while the scan it replaces is the
+        // whole table. The v0.59.0 objection does not reach it for the reason
+        // it does not reach `idx_scrobbles_session`: this supplies a *seek*,
+        // not a grouping key for an aggregation that was going to read
+        // everything anyway.
+        speed!(
+            "CREATE INDEX IF NOT EXISTS idx_scrobbles_joint
+                 ON scrobbles(joint_session_id) WHERE joint_session_id IS NOT NULL"
+        );
+
         // The album page's "whole record" button: 400,247 VDBE steps to 37.
         // The `WHERE` is load-bearing rather than a size trim — without it the
         // planner takes this index for the top-artist and top-album
@@ -218,7 +234,29 @@ impl Database {
                 -- were in the room for counts as your listen or it does not,
                 -- and that answer cannot differ between Last.fm and
                 -- ListenBrainz without meaning two different things at once.
-                forward_spool_listens INTEGER NOT NULL DEFAULT 0
+                forward_spool_listens INTEGER NOT NULL DEFAULT 0,
+                -- Which chain an accepted Shared Spool play is filed under —
+                -- the room you were in rather than a rig of your own.
+                --
+                -- A capture used to land with no chain at all, so those listens
+                -- earned no gear hours, carried no fidelity and could never
+                -- reach the Reel. That is defensible (it was not your gear) and
+                -- it is not the whole truth either: you were in the room
+                -- hearing real speakers, and somebody who has built a
+                -- Noor's-living-room chain should be able to say so. Unset is the
+                -- default and reproduces the old behaviour exactly.
+                --
+                -- **Deliberately no `REFERENCES signal_chains(id)`**, and this
+                -- is the forward-reference trap rather than an oversight:
+                -- `users` is created before `signal_chains` and `signal_chains`
+                -- references `users`, so the graph has a cycle and Postgres —
+                -- which resolves a FK target eagerly where SQLite does not —
+                -- would refuse the whole `init()`. `tokens.default_chain_id`
+                -- gets the constraint only because `tokens` is created after
+                -- both. What actually matters here is ownership, which no
+                -- foreign key would have checked anyway: `set_spool_chain`
+                -- scopes the lookup by `user_id`.
+                spool_chain_id INTEGER
             )",
         )
         .await?;
@@ -425,6 +463,19 @@ impl Database {
                 -- not have accounts on this instance, and a feature that can
                 -- only record the ones who do would miss the common case.
                 company TEXT,
+                -- What the clock said before anybody corrected it, written
+                -- **once** on the first hand edit and never again.
+                --
+                -- Several paths produce a timestamp that is only approximately
+                -- right: a capture accepted out of a Shared Spool carries the
+                -- *host's* clock, a reconstructed evening replays an old one,
+                -- and the shelf lays a side out by arithmetic from the moment
+                -- the needle went down. Correcting those is the point of the
+                -- edit; keeping what was there is what separates a listen
+                -- that is at 9pm from one that is at 9pm and was recorded at
+                -- 8pm. `note_revisions` is the precedent — an edit here never
+                -- destroys the observation it replaces.
+                timestamp_original INTEGER,
                 UNIQUE(user_id, source_id, source_name)
             )",
         )
@@ -1586,7 +1637,29 @@ impl Database {
                 uuid TEXT NOT NULL UNIQUE,
                 -- Whose deck is playing. Captures flow outward from here.
                 host_user_id INTEGER NOT NULL REFERENCES users(id),
+                -- Set at the start, when you know least about the evening, and
+                -- editable afterwards — you name a sitting for what it turned
+                -- out to be.
                 title TEXT,
+                -- What the evening was. A sitting is the one thing in this
+                -- application that has an ending, and an ending is when
+                -- somebody writes about it.
+                --
+                -- Not a `notes` row: those hang off an entity, a listen, a
+                -- period or a line, and every one of them is about *music*.
+                -- This is about an occasion, and the sitting is already the
+                -- thing that owns it.
+                notes TEXT,
+                -- Everybody else who was in the room, as names — the friend on
+                -- the sofa with no account on this instance.
+                --
+                -- Free text for the reason `scrobbles.company` is free text: a
+                -- feature that could only record the people who have accounts
+                -- would miss the common case. They get no captures and no
+                -- inbox, because there is nobody to offer anything to; what
+                -- they get is being named in the company of every play the
+                -- sitting fans out.
+                guests TEXT,
                 started_at INTEGER NOT NULL,
                 -- Null while it is running. One running spool per host, which
                 -- the partial index below enforces rather than the handler.
@@ -1615,6 +1688,22 @@ impl Database {
                 -- captures are only made for members who actually joined.
                 state TEXT NOT NULL DEFAULT 'invited',
                 joined_at INTEGER,
+                -- When they were **in the room** from, which is not when they
+                -- pressed the button. NULL means from the start of the sitting.
+                --
+                -- These are two different facts and conflating them is what
+                -- makes late joining wrong in one direction or the other.
+                -- Somebody added an hour in is usually somebody who was there
+                -- all along and the host forgot — that is NULL, and they get
+                -- the whole evening. Somebody who genuinely walked in at ten
+                -- did not hear the eight o'clock records, and saying so is what
+                -- this column is for. The host says which when adding and the
+                -- joiner can correct it.
+                present_from INTEGER,
+                -- When they left, or NULL for stayed to the end. The mirror of
+                -- the above, and the reason `state = 'left'` is not enough on
+                -- its own: leaving is a fact with a time on it.
+                present_until INTEGER,
                 PRIMARY KEY (spool_id, user_id)
             )",
         )

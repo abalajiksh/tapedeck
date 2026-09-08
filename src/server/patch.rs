@@ -95,7 +95,15 @@ pub fn create_patch_router() -> Router<Arc<AppState>> {
         .route("/api/v1/patch/spool", get(spool).post(start_spool))
         .route("/api/v1/patch/spool/:uuid/join", post(join_spool))
         .route("/api/v1/patch/spool/:uuid/end", post(end_spool))
+        // A sitting is a thing you can come back to. `spool` (singular) is
+        // what is happening now; these are what happened.
+        .route("/api/v1/patch/spools", get(spool_history))
+        .route("/api/v1/patch/spools/:uuid", get(spool_detail).patch(edit_spool))
+        .route("/api/v1/patch/spools/:uuid/members", post(add_spool_members))
+        .route("/api/v1/patch/spools/:uuid/presence", axum::routing::put(set_presence))
         .route("/api/v1/patch/captures", post(settle_captures))
+        .route("/api/v1/patch/captures/:id", axum::routing::patch(edit_capture))
+        .route("/api/v1/profile/spool-chain", get(get_spool_chain).put(put_spool_chain))
         .route("/api/v1/patch/artist", get(artist_context))
         .route("/api/v1/patch/live", get(live))
         .route("/api/v1/patch/inbox-count", get(inbox_count))
@@ -613,6 +621,64 @@ struct SpoolBody {
     title: Option<String>,
     /// Usernames to invite.
     with: Option<Vec<String>>,
+    /// Names of people in the room with no account on this instance.
+    guests: Option<Vec<String>>,
+}
+
+/// Name a sitting, write about it, or change who else was there.
+///
+/// Every field is `Option<Option<_>>` so that an absent key and an explicit
+/// null stay distinguishable — this endpoint decides between "change this" and
+/// "leave it alone", which is exactly where a bare `Option` is the wrong type.
+#[derive(Deserialize)]
+struct SpoolEditBody {
+    #[serde(default, deserialize_with = "double_option_str")]
+    title: Option<Option<String>>,
+    #[serde(default, deserialize_with = "double_option_str")]
+    notes: Option<Option<String>>,
+    guests: Option<Vec<String>>,
+}
+
+#[derive(Deserialize)]
+struct SpoolMembersBody {
+    /// Usernames to add.
+    with: Option<Vec<String>>,
+    /// When they arrived, or absent for "they were here all along" — which is
+    /// the common case and the reason this is not derived from the clock.
+    present_from: Option<i64>,
+}
+
+#[derive(Deserialize)]
+struct PresenceBody {
+    #[serde(default, deserialize_with = "double_option_i64")]
+    present_from: Option<Option<i64>>,
+    #[serde(default, deserialize_with = "double_option_i64")]
+    present_until: Option<Option<i64>>,
+}
+
+#[derive(Deserialize)]
+struct CaptureTimeBody {
+    played_at: Option<i64>,
+}
+
+#[derive(Deserialize)]
+struct SpoolChainBody {
+    #[serde(default, deserialize_with = "double_option_i64")]
+    chain_id: Option<Option<i64>>,
+}
+
+fn double_option_i64<'de, D>(de: D) -> Result<Option<Option<i64>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<i64>::deserialize(de).map(Some)
+}
+
+fn double_option_str<'de, D>(de: D) -> Result<Option<Option<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<String>::deserialize(de).map(Some)
 }
 
 #[derive(Deserialize)]
@@ -972,7 +1038,8 @@ async fn start_spool(
         }
     }
 
-    match state.db.start_spool(user.user_id, body.title.as_deref(), &ids).await {
+    let guests = body.guests.unwrap_or_default();
+    match state.db.start_spool(user.user_id, body.title.as_deref(), &ids, &guests).await {
         Ok(uuid) => {
             info!("📡 {} started a spool with {} others", user.username, ids.len());
             (StatusCode::OK, Json(serde_json::json!({ "uuid": uuid }))).into_response()
@@ -1011,13 +1078,16 @@ async fn join_spool(
             "`accept` is required — say true or false explicitly.",
         );
     };
-    let state_name = if join { "joined" } else { "left" };
-    match state.db.set_spool_membership(&uuid, user.user_id, state_name).await {
+    match state.db.set_spool_membership(&uuid, user.user_id, join).await {
         // `offered` is the backlog joining has just put in their inbox, which
         // for a sitting that ended before they answered is the whole of it. The
         // screen says so rather than leaving a join that plainly did something
         // looking like a join that did nothing.
-        Ok(Some(offered)) => {
+        // `state` comes back from the database rather than being decided here,
+        // because saying no to an invitation and going home from a sitting you
+        // were in are different answers and only the row knows which one this
+        // was.
+        Ok(Some((state_name, offered))) => {
             (StatusCode::OK, Json(serde_json::json!({ "state": state_name, "offered": offered })))
                 .into_response()
         }
@@ -1043,6 +1113,217 @@ async fn end_spool(
             refused(StatusCode::INTERNAL_SERVER_ERROR, "Could not save that")
         }
     }
+}
+
+/// `GET /api/v1/patch/spools` — every sitting you were in, newest first.
+///
+/// **Membership is what admits you, not a patch** — see
+/// [`Database::spool_history`] for why that widening is deliberate and what it
+/// does not widen.
+async fn spool_history(
+    State(state): State<Arc<AppState>>,
+    user: super::auth::AuthUser,
+    Query(q): Query<HistoryQuery>,
+) -> Response {
+    let limit = q.limit.unwrap_or(50).clamp(1, 200);
+    match state.db.spool_history(user.user_id, limit).await {
+        Ok(v) => (StatusCode::OK, Json(serde_json::json!({ "sittings": v }))).into_response(),
+        Err(e) => {
+            warn!("📡 spool history: {}", crate::logging::error_chain(&e));
+            refused(StatusCode::INTERNAL_SERVER_ERROR, "Could not read that")
+        }
+    }
+}
+
+/// `GET /api/v1/patch/spools/:uuid` — one sitting, in full.
+async fn spool_detail(
+    State(state): State<Arc<AppState>>,
+    user: super::auth::AuthUser,
+    Path(uuid): Path<String>,
+) -> Response {
+    match state.db.spool_detail(&uuid, user.user_id).await {
+        Ok(Some(v)) => (StatusCode::OK, Json(v)).into_response(),
+        // A sitting somebody else was in is the same answer as one that does
+        // not exist, or the first confirms an id is real to somebody it does
+        // not concern.
+        Ok(None) => refused(StatusCode::NOT_FOUND, "No sitting of yours with that id"),
+        Err(e) => {
+            warn!("📡 spool detail: {}", crate::logging::error_chain(&e));
+            refused(StatusCode::INTERNAL_SERVER_ERROR, "Could not read that")
+        }
+    }
+}
+
+/// `PATCH /api/v1/patch/spools/:uuid` — name it, write about it, say who was
+/// there. The host's.
+async fn edit_spool(
+    State(state): State<Arc<AppState>>,
+    user: super::auth::AuthUser,
+    Path(uuid): Path<String>,
+    Json(body): Json<SpoolEditBody>,
+) -> Response {
+    if body.title.is_none() && body.notes.is_none() && body.guests.is_none() {
+        return refused(
+            StatusCode::BAD_REQUEST,
+            "Name a field to change — `title`, `notes` or `guests`.",
+        );
+    }
+    let result = state
+        .db
+        .update_spool(
+            &uuid,
+            user.user_id,
+            body.title.as_ref().map(|t| t.as_deref()),
+            body.notes.as_ref().map(|n| n.as_deref()),
+            body.guests.as_deref(),
+        )
+        .await;
+    match result {
+        Ok(true) => (StatusCode::OK, Json(serde_json::json!({ "saved": true }))).into_response(),
+        Ok(false) => refused(StatusCode::NOT_FOUND, "No sitting of yours with that id"),
+        Err(e) => {
+            warn!("📡 spool edit: {}", crate::logging::error_chain(&e));
+            refused(StatusCode::INTERNAL_SERVER_ERROR, "Could not save that")
+        }
+    }
+}
+
+/// `POST /api/v1/patch/spools/:uuid/members` — add people to a sitting that
+/// has already started, or already ended.
+async fn add_spool_members(
+    State(state): State<Arc<AppState>>,
+    user: super::auth::AuthUser,
+    Path(uuid): Path<String>,
+    Json(body): Json<SpoolMembersBody>,
+) -> Response {
+    let names = body.with.unwrap_or_default();
+    if names.is_empty() {
+        return refused(StatusCode::BAD_REQUEST, "`with` is required — name the decks.");
+    }
+    let mut ids = Vec::new();
+    for name in &names {
+        match state.db.patchable_user_id(name).await {
+            Ok(Some(id)) => ids.push(id),
+            Ok(None) => return refused(StatusCode::NOT_FOUND, format!("No deck called {name}")),
+            Err(e) => {
+                warn!("📡 spool members: {}", crate::logging::error_chain(&e));
+                return refused(StatusCode::INTERNAL_SERVER_ERROR, "Could not look that deck up");
+            }
+        }
+    }
+
+    match state.db.add_spool_members(&uuid, user.user_id, &ids, body.present_from).await {
+        Ok(-1) => refused(StatusCode::NOT_FOUND, "No sitting of yours with that id"),
+        Ok(added) => (StatusCode::OK, Json(serde_json::json!({ "added": added }))).into_response(),
+        // One stranger refuses the whole list rather than the list being
+        // quietly filtered — the rule `start_spool` and `dub` both carry.
+        Err(sqlx::Error::Protocol(msg)) => refused(StatusCode::FORBIDDEN, msg),
+        Err(e) => {
+            warn!("📡 spool members: {}", crate::logging::error_chain(&e));
+            refused(StatusCode::INTERNAL_SERVER_ERROR, "Could not save that")
+        }
+    }
+}
+
+/// `PUT /api/v1/patch/spools/:uuid/presence` — correct when you were in the
+/// room.
+///
+/// **Yours to set**, because you are the one who knows. Everything it decides
+/// is about your own inbox.
+async fn set_presence(
+    State(state): State<Arc<AppState>>,
+    user: super::auth::AuthUser,
+    Path(uuid): Path<String>,
+    Json(body): Json<PresenceBody>,
+) -> Response {
+    if body.present_from.is_none() && body.present_until.is_none() {
+        return refused(
+            StatusCode::BAD_REQUEST,
+            "Name a field to change — `present_from` or `present_until`.",
+        );
+    }
+    match state
+        .db
+        .set_member_presence(&uuid, user.user_id, body.present_from, body.present_until)
+        .await
+    {
+        Ok(Some(offered)) => {
+            (StatusCode::OK, Json(serde_json::json!({ "offered": offered }))).into_response()
+        }
+        Ok(None) => refused(StatusCode::NOT_FOUND, "No sitting of yours with that id"),
+        Err(e) => {
+            warn!("📡 spool presence: {}", crate::logging::error_chain(&e));
+            refused(StatusCode::INTERNAL_SERVER_ERROR, "Could not save that")
+        }
+    }
+}
+
+/// `PATCH /api/v1/patch/captures/:id` — fix when a capture was played, before
+/// it becomes a listen.
+///
+/// The cheapest correction in the application: nothing is in a history yet, so
+/// none of the traps that make editing a *listen's* timestamp delicate apply.
+async fn edit_capture(
+    State(state): State<Arc<AppState>>,
+    user: super::auth::AuthUser,
+    Path(id): Path<i64>,
+    Json(body): Json<CaptureTimeBody>,
+) -> Response {
+    let Some(played_at) = body.played_at else {
+        return refused(StatusCode::BAD_REQUEST, "`played_at` is required.");
+    };
+    match state.db.set_capture_time(user.user_id, id, played_at).await {
+        Ok(true) => (StatusCode::OK, Json(serde_json::json!({ "saved": true }))).into_response(),
+        Ok(false) => refused(StatusCode::NOT_FOUND, "No offer of yours with that id still waiting"),
+        Err(e) => {
+            warn!("📡 capture time: {}", crate::logging::error_chain(&e));
+            refused(StatusCode::INTERNAL_SERVER_ERROR, "Could not save that")
+        }
+    }
+}
+
+/// `GET|PUT /api/v1/profile/spool-chain` — the chain an accepted Shared Spool
+/// play is filed under.
+async fn get_spool_chain(
+    State(state): State<Arc<AppState>>,
+    user: super::auth::AuthUser,
+) -> Response {
+    match state.db.spool_chain_id(user.user_id).await {
+        Ok(v) => (StatusCode::OK, Json(serde_json::json!({ "chain_id": v }))).into_response(),
+        Err(e) => {
+            warn!("📡 spool chain: {}", crate::logging::error_chain(&e));
+            refused(StatusCode::INTERNAL_SERVER_ERROR, "Could not read that")
+        }
+    }
+}
+
+async fn put_spool_chain(
+    State(state): State<Arc<AppState>>,
+    user: super::auth::AuthUser,
+    Json(body): Json<SpoolChainBody>,
+) -> Response {
+    // Absent is a 400 rather than a guess. This decides where every play you
+    // accept out of a room lands, so a misspelled key must not read as "clear
+    // it" — `bulk-chain`'s lesson, which cost data the one time it was learned.
+    let Some(chain_id) = body.chain_id else {
+        return refused(
+            StatusCode::BAD_REQUEST,
+            "`chain_id` is required — a chain id, or null to file these under nothing.",
+        );
+    };
+    match state.db.set_spool_chain(user.user_id, chain_id).await {
+        Ok(true) => (StatusCode::OK, Json(serde_json::json!({ "saved": true }))).into_response(),
+        Ok(false) => refused(StatusCode::NOT_FOUND, "No chain of yours with that id"),
+        Err(e) => {
+            warn!("📡 spool chain: {}", crate::logging::error_chain(&e));
+            refused(StatusCode::INTERNAL_SERVER_ERROR, "Could not save that")
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct HistoryQuery {
+    limit: Option<i64>,
 }
 
 /// `POST /api/v1/patch/captures` — accept or decline what a sitting offered.

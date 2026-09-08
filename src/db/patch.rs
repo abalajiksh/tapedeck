@@ -1176,6 +1176,7 @@ impl Database {
         host_user_id: i64,
         title: Option<&str>,
         with: &[i64],
+        guests: &[String],
     ) -> Result<String, sqlx::Error> {
         // **You may only invite a deck you are patched with**, in either
         // direction — the rule `dub` already follows, and for the same reason:
@@ -1207,12 +1208,14 @@ impl Database {
         let mut tx = self.pool.begin().await?;
 
         sqlx::query(&crate::sql!(
-            "INSERT INTO spools (uuid, host_user_id, title, started_at) VALUES (?, ?, ?, ?)",
+            "INSERT INTO spools (uuid, host_user_id, title, started_at, guests)
+             VALUES (?, ?, ?, ?, ?)",
         ))
         .bind(&uuid)
         .bind(host_user_id)
         .bind(title)
         .bind(now)
+        .bind(join_names(guests))
         .execute(&mut *tx)
         .await?;
 
@@ -1271,35 +1274,53 @@ impl Database {
         &self,
         uuid: &str,
         user_id: i64,
-        state: &str,
-    ) -> Result<Option<i64>, sqlx::Error> {
-        let Some(spool_id): Option<i64> =
-            sqlx::query_scalar(&crate::sql!("SELECT id FROM spools WHERE uuid = ?"))
-                .bind(uuid)
-                .fetch_optional(&self.pool)
-                .await?
+        join: bool,
+    ) -> Result<Option<(String, i64)>, sqlx::Error> {
+        let Some((spool_id, was)): Option<(i64, String)> = sqlx::query_as(&crate::sql!(
+            "SELECT sp.id, m.state FROM spools sp
+               JOIN spool_members m ON m.spool_id = sp.id AND m.user_id = ?
+              WHERE sp.uuid = ?"
+        ))
+        .bind(user_id)
+        .bind(uuid)
+        .fetch_optional(&self.pool)
+        .await?
         else {
             return Ok(None);
         };
 
-        let res = sqlx::query(&crate::sql!(
-            "UPDATE spool_members SET state = ?, joined_at = COALESCE(joined_at, ?)
+        // **Saying no is not the same as going home**, and until they were told
+        // apart neither could be recorded properly: both wrote `left`, so a
+        // sitting could not say who had actually been in it, and
+        // `present_until` had nothing to hang on. Which one this is depends
+        // entirely on where you are answering from.
+        let now = Self::now_secs();
+        let state = match (join, was.as_str()) {
+            (true, _) => "joined",
+            (false, "joined") => "left",
+            (false, _) => "declined",
+        };
+
+        // Leaving is a fact with a time on it. Declining is not — you were
+        // never in the room, so there is no moment you stopped being in it.
+        let left_at = (state == "left").then_some(now);
+        sqlx::query(&crate::sql!(
+            "UPDATE spool_members
+                SET state = ?, joined_at = COALESCE(joined_at, ?), present_until = ?
               WHERE user_id = ? AND spool_id = ?",
         ))
         .bind(state)
-        .bind(Self::now_secs())
+        .bind(join.then_some(now))
+        .bind(left_at)
         .bind(user_id)
         .bind(spool_id)
         .execute(&self.pool)
         .await?;
-        if res.rows_affected() == 0 {
-            return Ok(None);
-        }
 
-        if state != "joined" {
-            return Ok(Some(0));
+        if !join {
+            return Ok(Some((state.to_string(), 0)));
         }
-        Ok(Some(self.offer_spool_backlog(spool_id, uuid, user_id).await?))
+        Ok(Some((state.to_string(), self.offer_spool_backlog(spool_id, uuid, user_id).await?)))
     }
     /// Offer the plays a sitting has already held to somebody who has just
     /// joined it.
@@ -1325,9 +1346,11 @@ impl Database {
     ///   `retro_spool_from_session` does. Dropping that join would publish
     ///   every private-chain listen of the evening while looking like a
     ///   simplification.
-    /// * **Only members who were actually in the room**, so a listen stamped
-    ///   with this uuid by somebody who has since left is not re-published by
-    ///   a third person joining.
+    /// * **Only members who were actually in the room** — joined, or joined
+    ///   and since gone home. Somebody who *declined* never had a play stamped
+    ///   with this uuid in the first place, and reading 'left' as "was never
+    ///   here" would drop the records they put on while they were, which is
+    ///   the half telling declining and leaving apart exists to get right.
     /// * **Nothing already offered in *any* sitting**, settled or not — the
     ///   v0.84.0 rule. `spool_captures`' uniqueness is per spool and cannot see
     ///   a sibling, and a live sitting can cover the same plays as a
@@ -1357,9 +1380,35 @@ impl Database {
         .bind(spool_id)
         .fetch_all(&self.pool)
         .await?;
-        let names: Vec<&str> =
-            present.iter().filter(|(id, _)| *id != user_id).map(|(_, n)| n.as_str()).collect();
-        let company = (!names.is_empty()).then(|| names.join(", "));
+        let mut names: Vec<String> =
+            present.iter().filter(|(id, _)| *id != user_id).map(|(_, n)| n.clone()).collect();
+        // The people in the room with no deck of their own. They are company
+        // like anybody else — the whole reason `spools.guests` exists is that a
+        // sitting that could only name account holders would miss the friend on
+        // the sofa.
+        let guests: Option<String> =
+            sqlx::query_scalar(&crate::sql!("SELECT guests FROM spools WHERE id = ?"))
+                .bind(spool_id)
+                .fetch_one(&self.pool)
+                .await?;
+        names.extend(split_names(guests.as_deref()));
+        let company = join_names(&names);
+
+        // **How much of the evening they get is what `present_from` decides.**
+        // NULL is the common case and means the whole of it: somebody added an
+        // hour in was almost always in the room from the start and the host
+        // simply had not got round to it. A real mid-evening arrival is what
+        // the column is for, and it is the host or the joiner saying so rather
+        // than this function guessing from a join time it has no reason to
+        // trust.
+        let (from, until): (Option<i64>, Option<i64>) = sqlx::query_as(&crate::sql!(
+            "SELECT present_from, present_until FROM spool_members
+              WHERE spool_id = ? AND user_id = ?"
+        ))
+        .bind(spool_id)
+        .bind(user_id)
+        .fetch_one(&self.pool)
+        .await?;
 
         let plays: Vec<(i64, String, String, Option<String>, Option<i64>, i64)> =
             sqlx::query_as(&crate::sql!(
@@ -1367,13 +1416,17 @@ impl Database {
                FROM scrobbles s
                JOIN signal_chains c ON c.id = s.chain_id AND c.shared = 1
               WHERE s.joint_session_id = ? AND s.user_id != ? AND s.skipped = FALSE
+                AND s.timestamp >= COALESCE(?, s.timestamp)
+                AND s.timestamp <= COALESCE(?, s.timestamp)
                 AND s.user_id IN (
                       SELECT user_id FROM spool_members
-                       WHERE spool_id = ? AND state = 'joined')
+                       WHERE spool_id = ? AND state IN ('joined', 'left'))
               ORDER BY s.timestamp"
             ))
             .bind(uuid)
             .bind(user_id)
+            .bind(from)
+            .bind(until)
             .bind(spool_id)
             .fetch_all(&self.pool)
             .await?;
@@ -1435,31 +1488,33 @@ impl Database {
     /// A running sitting still wins, so somebody with a stale invitation and a
     /// live room sees the live one.
     pub async fn active_spool(&self, user_id: i64) -> Result<Option<SpoolView>, sqlx::Error> {
-        let Some(row): Option<(i64, String, i64, Option<String>, i64, Option<i64>, String)> =
-            sqlx::query_as(&crate::sql!(
-                "SELECT sp.id, sp.uuid, sp.host_user_id, sp.title, sp.started_at, sp.ended_at,
-                        m.state
+        #[allow(clippy::type_complexity)]
+        let Some(row): Option<(
+            i64,
+            String,
+            i64,
+            Option<String>,
+            i64,
+            Option<i64>,
+            String,
+            Option<String>,
+        )> = sqlx::query_as(&crate::sql!(
+            "SELECT sp.id, sp.uuid, sp.host_user_id, sp.title, sp.started_at, sp.ended_at,
+                        m.state, sp.guests
                    FROM spools sp
                    JOIN spool_members m ON m.spool_id = sp.id AND m.user_id = ?
                   WHERE sp.ended_at IS NULL OR m.state = 'invited'
                   ORDER BY sp.ended_at IS NULL DESC, sp.started_at DESC LIMIT 1",
-            ))
-            .bind(user_id)
-            .fetch_optional(&self.pool)
-            .await?
+        ))
+        .bind(user_id)
+        .fetch_optional(&self.pool)
+        .await?
         else {
             return Ok(None);
         };
-        let (id, uuid, host_user_id, title, started_at, ended_at, my_state) = row;
+        let (id, uuid, host_user_id, title, started_at, ended_at, my_state, guests) = row;
 
-        let members: Vec<SpoolMember> = sqlx::query_as(&crate::sql!(
-            "SELECT u.id AS user_id, u.username, u.display_name, m.state
-               FROM spool_members m JOIN users u ON u.id = m.user_id
-              WHERE m.spool_id = ? ORDER BY m.state = 'joined' DESC, u.username"
-        ))
-        .bind(id)
-        .fetch_all(&self.pool)
-        .await?;
+        let members = self.spool_members(id).await?;
 
         let captured: i64 = sqlx::query_scalar(&crate::sql!(
             "SELECT COUNT(*) FROM spool_captures WHERE spool_id = ? AND user_id = ?",
@@ -1479,8 +1534,678 @@ impl Database {
             hosting: host_user_id == user_id,
             my_state,
             members,
+            guests: split_names(guests.as_deref()),
             captured,
         }))
+    }
+    /// Every sitting this person was actually in, newest first.
+    ///
+    /// **Membership is the gate, not the patch**, and that is a deliberate
+    /// widening of `PATCH_VISIBLE_LISTENS` rather than an inherited rule. A
+    /// sitting is an evening you were physically in the room for; un-patching
+    /// afterwards is a decision about what you want to *keep seeing of theirs*,
+    /// and it has no standing to un-happen an evening you attended — the same
+    /// argument as "no delete sweep on un-patching", which this file already
+    /// makes about bytes that have already been delivered. The practical half
+    /// matters too: your own accepted listens from that evening stay in your
+    /// history whatever happens to the patch, and a history row whose sitting
+    /// has vanished is a row with nothing to explain it.
+    ///
+    /// What that widening does **not** touch is what any of it *shows*. A
+    /// sitting still only ever renders the plays the chain gate allows, which
+    /// is applied here in the SQL and again in [`Database::spool_detail`] —
+    /// never in a handler, which is a filter a second handler can forget.
+    ///
+    /// Four queries whatever the page holds, folded in Rust: the sittings, then
+    /// the roster, the play counts and the pending offers for all of them at
+    /// once. The shape `list_crate` and `playlist_tracks_detailed` use, and the
+    /// reason is the one this codebase keeps relearning — a sub-select per row
+    /// is a full scan per row the moment its join key is not a plain indexed
+    /// column.
+    pub async fn spool_history(
+        &self,
+        user_id: i64,
+        limit: i64,
+    ) -> Result<Vec<SpoolSummary>, sqlx::Error> {
+        // `state` decides who has a history entry, and the distinction between
+        // 'left' and 'declined' is what makes it answerable: somebody who
+        // joined and then went home was at the sitting, and somebody who said
+        // no thanks was not. Before those were told apart both were 'left' and
+        // this list could only have been wrong one way or the other.
+        #[allow(clippy::type_complexity)]
+        let rows: Vec<(
+            i64,
+            String,
+            Option<String>,
+            Option<String>,
+            i64,
+            Option<i64>,
+            i64,
+            String,
+            Option<String>,
+            Option<String>,
+        )> = sqlx::query_as(&crate::sql!(
+            "SELECT sp.id, sp.uuid, sp.title, sp.notes, sp.started_at, sp.ended_at,
+                    sp.host_user_id, u.username, u.display_name, sp.guests
+               FROM spools sp
+               JOIN users u ON u.id = sp.host_user_id
+               JOIN spool_members m ON m.spool_id = sp.id AND m.user_id = ?
+              WHERE m.state IN ('joined', 'left')
+              ORDER BY sp.started_at DESC
+              LIMIT ?"
+        ))
+        .bind(user_id)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        if rows.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let ids: Vec<i64> = rows.iter().map(|r| r.0).collect();
+        let uuids: Vec<String> = rows.iter().map(|r| r.1.clone()).collect();
+        let id_marks = std::iter::repeat("?").take(ids.len()).collect::<Vec<_>>().join(",");
+        let uuid_marks = std::iter::repeat("?").take(uuids.len()).collect::<Vec<_>>().join(",");
+
+        // Who was in the room, per sitting. Anyone who was ever actually in it
+        // — an invitation nobody answered names somebody who was not there, and
+        // printing them as attendance would assert something the host only
+        // hoped for.
+        let sql = format!(
+            "SELECT m.spool_id, COALESCE(u.display_name, u.username)
+               FROM spool_members m JOIN users u ON u.id = m.user_id
+              WHERE m.spool_id IN ({id_marks}) AND m.state IN ('joined', 'left')
+              ORDER BY u.username"
+        );
+        let stmt = crate::sql!(&sql);
+        let mut q = sqlx::query_as::<_, (i64, String)>(&stmt);
+        for id in &ids {
+            q = q.bind(id);
+        }
+        let member_rows = q.fetch_all(&self.pool).await?;
+
+        // Plays that reached the timeline, counted the way the page will draw
+        // them: originals only, and only those this caller may see.
+        //
+        // `source_name != 'Shared Spool'` is what keeps one play one row. A
+        // joint listen is N rows by design, so counting all of them would
+        // report an evening as twice the length it was the moment somebody
+        // accepted their half of it.
+        let sql = format!(
+            "SELECT s.joint_session_id, COUNT(*)
+               FROM scrobbles s
+               LEFT JOIN signal_chains c ON c.id = s.chain_id
+              WHERE s.joint_session_id IN ({uuid_marks}) AND s.skipped = FALSE
+                AND s.source_name != 'Shared Spool'
+                AND (s.user_id = ? OR c.shared = 1)
+              GROUP BY s.joint_session_id"
+        );
+        let stmt = crate::sql!(&sql);
+        let mut q = sqlx::query_as::<_, (String, i64)>(&stmt);
+        for u in &uuids {
+            q = q.bind(u);
+        }
+        let play_rows = q.bind(user_id).fetch_all(&self.pool).await?;
+
+        let sql = format!(
+            "SELECT sp.uuid, COUNT(*)
+               FROM spool_captures cap JOIN spools sp ON sp.id = cap.spool_id
+              WHERE cap.user_id = ? AND cap.state = 'pending'
+                AND sp.uuid IN ({uuid_marks})
+              GROUP BY sp.uuid"
+        );
+        let stmt = crate::sql!(&sql);
+        let mut q = sqlx::query_as::<_, (String, i64)>(&stmt).bind(user_id);
+        for u in &uuids {
+            q = q.bind(u);
+        }
+        let pending_rows = q.fetch_all(&self.pool).await?;
+
+        let mut present: HashMap<i64, Vec<String>> = HashMap::new();
+        for (id, name) in member_rows {
+            present.entry(id).or_default().push(name);
+        }
+        let plays: HashMap<String, i64> = play_rows.into_iter().collect();
+        let pending: HashMap<String, i64> = pending_rows.into_iter().collect();
+
+        Ok(rows
+            .into_iter()
+            .map(
+                |(
+                    id,
+                    uuid,
+                    title,
+                    notes,
+                    started_at,
+                    ended_at,
+                    host_user_id,
+                    host_username,
+                    host_display_name,
+                    guests,
+                )| SpoolSummary {
+                    plays: plays.get(&uuid).copied().unwrap_or(0),
+                    pending: pending.get(&uuid).copied().unwrap_or(0),
+                    present: present.remove(&id).unwrap_or_default(),
+                    guests: split_names(guests.as_deref()),
+                    hosting: host_user_id == user_id,
+                    uuid,
+                    title,
+                    notes,
+                    started_at,
+                    ended_at,
+                    host_username,
+                    host_display_name,
+                },
+            )
+            .collect())
+    }
+    /// One sitting, in full: the roster, the joint timeline, and what is not on
+    /// it.
+    ///
+    /// **The timeline is one row per play, not one per listen**, and holding
+    /// that line is most of this function. A joint listen is N rows sharing a
+    /// `joint_session_id` — one per person in the room — so the naive read
+    /// shows an evening at twice its real length as soon as anybody accepts
+    /// their half of it. The originals are the timeline; the caller's own
+    /// accepted copies (`source_name = 'Shared Spool'`) are folded back onto
+    /// the play they came from and become its `standing`.
+    ///
+    /// An accepted copy whose original is *no longer* visible — the host
+    /// un-shared that chain after the fact — is added back rather than
+    /// dropped. It is in your history and this is the page you accepted it on;
+    /// hiding it here would leave a listen you can see everywhere else missing
+    /// from the one screen that explains it.
+    ///
+    /// Three queries: the sitting, every listen carrying its uuid, and the
+    /// caller's captures. The fold is in Rust because the rule deciding
+    /// `standing` is a rule about two tables that have no key in common —
+    /// a capture is matched to a play by `(played_at, title)`, which is
+    /// `spool_captures`' own uniqueness key.
+    pub async fn spool_detail(
+        &self,
+        uuid: &str,
+        user_id: i64,
+    ) -> Result<Option<SpoolDetail>, sqlx::Error> {
+        // Membership is what admits you, and it is checked in the `WHERE` so
+        // that a sitting somebody else attended is a 404 rather than a
+        // permission error — the same call `settle_patch` makes, and for the
+        // same reason: the alternative confirms an id is real to somebody it
+        // does not concern.
+        #[allow(clippy::type_complexity)]
+        let Some((id, title, notes, started_at, ended_at, host_user_id, my_state, guests)): Option<(
+            i64,
+            Option<String>,
+            Option<String>,
+            i64,
+            Option<i64>,
+            i64,
+            String,
+            Option<String>,
+        )> = sqlx::query_as(&crate::sql!(
+            "SELECT sp.id, sp.title, sp.notes, sp.started_at, sp.ended_at, sp.host_user_id,
+                    m.state, sp.guests
+               FROM spools sp
+               JOIN spool_members m ON m.spool_id = sp.id AND m.user_id = ?
+              WHERE sp.uuid = ?"
+        ))
+        .bind(user_id)
+        .bind(uuid)
+        .fetch_optional(&self.pool)
+        .await?
+        else {
+            return Ok(None);
+        };
+
+        let members = self.spool_members(id).await?;
+
+        // Every listen carrying this sitting's id, whoever's it is, with the
+        // two things that decide what happens to it: whose it is, and whether
+        // the chain it ran through is shared.
+        #[allow(clippy::type_complexity)]
+        let rows: Vec<(
+            i64,
+            String,
+            Option<String>,
+            String,
+            String,
+            Option<String>,
+            Option<i64>,
+            i64,
+            String,
+            Option<i64>,
+            Option<String>,
+            Option<i64>,
+            Option<String>,
+        )> = sqlx::query_as(&crate::sql!(
+            "SELECT s.user_id, u.username, u.display_name, s.title, s.artist, s.album,
+                    s.duration, s.timestamp, s.source_name,
+                    CASE WHEN c.shared = 1 THEN 1 ELSE 0 END,
+                    s.artwork_url, s.caa_id, s.caa_release_mbid
+               FROM scrobbles s
+               JOIN users u ON u.id = s.user_id
+               LEFT JOIN signal_chains c ON c.id = s.chain_id
+              WHERE s.joint_session_id = ? AND s.skipped = FALSE
+              ORDER BY s.timestamp"
+        ))
+        .bind(uuid)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let captures: Vec<(i64, i64, String, String)> = sqlx::query_as(&crate::sql!(
+            "SELECT cap.id, cap.played_at, cap.title, cap.state
+               FROM spool_captures cap JOIN spools sp ON sp.id = cap.spool_id
+              WHERE cap.user_id = ? AND sp.uuid = ?"
+        ))
+        .bind(user_id)
+        .bind(uuid)
+        .fetch_all(&self.pool)
+        .await?;
+        let by_play: HashMap<(i64, String), (i64, String)> = captures
+            .into_iter()
+            .map(|(cid, at, title, state)| ((at, title.to_lowercase()), (cid, state)))
+            .collect();
+
+        let mut plays: Vec<SpoolPlay> = Vec::new();
+        let mut withheld = 0i64;
+        let mut copies: Vec<&(_, _, _, _, _, _, _, _, _, _, _, _, _)> = Vec::new();
+        let mut seen: Vec<(i64, String)> = Vec::new();
+
+        for row in &rows {
+            let (
+                owner,
+                username,
+                display_name,
+                title,
+                artist,
+                album,
+                duration,
+                at,
+                source_name,
+                shared,
+                artwork_url,
+                caa_id,
+                caa_release_mbid,
+            ) = row;
+            let mine = *owner == user_id;
+            if source_name == "Shared Spool" {
+                // Somebody *else's* accepted copy is never on anybody's
+                // timeline: it is their answer to a play that is already here
+                // as the original.
+                if mine {
+                    copies.push(row);
+                }
+                continue;
+            }
+            // Your own listens are always yours to see. Everybody else's are
+            // published by the chain gate and by nothing else — the default has
+            // to be exclusion, the same call `reel` makes.
+            if !mine && shared.unwrap_or(0) == 0 {
+                withheld += 1;
+                continue;
+            }
+
+            let key = (*at, title.to_lowercase());
+            let (standing, capture_id) = if mine {
+                ("mine".to_string(), None)
+            } else {
+                match by_play.get(&key) {
+                    Some((cid, state)) => (
+                        match state.as_str() {
+                            "accepted" => "accepted",
+                            "declined" => "declined",
+                            _ => "pending",
+                        }
+                        .to_string(),
+                        Some(*cid),
+                    ),
+                    // A play from a deck in the room that was never offered to
+                    // you — you had not joined yet, or you were not in that
+                    // stretch of the evening. It happened; it is simply not
+                    // yours to answer.
+                    None => ("theirs".to_string(), None),
+                }
+            };
+            seen.push(key);
+            plays.push(SpoolPlay {
+                title: title.clone(),
+                artist: artist.clone(),
+                album: album.clone(),
+                duration: *duration,
+                played_at: *at,
+                from_username: username.clone(),
+                from_display_name: display_name.clone(),
+                standing,
+                capture_id,
+                artwork_url: artwork_url.clone(),
+                caa_id: *caa_id,
+                caa_release_mbid: caa_release_mbid.clone(),
+            });
+        }
+
+        // The accepted copies whose original went out of view.
+        for row in copies {
+            let key = (row.7, row.3.to_lowercase());
+            if seen.contains(&key) {
+                continue;
+            }
+            plays.push(SpoolPlay {
+                title: row.3.clone(),
+                artist: row.4.clone(),
+                album: row.5.clone(),
+                duration: row.6,
+                played_at: row.7,
+                from_username: row.1.clone(),
+                from_display_name: row.2.clone(),
+                standing: "accepted".into(),
+                capture_id: None,
+                artwork_url: row.10.clone(),
+                caa_id: row.11,
+                caa_release_mbid: row.12.clone(),
+            });
+        }
+        plays.sort_by_key(|p| p.played_at);
+
+        Ok(Some(SpoolDetail {
+            uuid: uuid.to_string(),
+            viewer_id: user_id,
+            title,
+            notes,
+            started_at,
+            ended_at,
+            host_user_id,
+            hosting: host_user_id == user_id,
+            my_state,
+            members,
+            guests: split_names(guests.as_deref()),
+            plays,
+            withheld,
+        }))
+    }
+    /// Name a sitting, write about it, and say who else was in the room.
+    ///
+    /// **The host's, and editable after the fact on purpose.** `title` used to
+    /// be settable once, at `start_spool` — which is the moment you know least
+    /// about an evening. You name a sitting for what it turned out to be, and
+    /// the notes are what makes it a thing you can come back to rather than a
+    /// row with a timestamp on it.
+    ///
+    /// Every field is `Option<Option<_>>`: this endpoint decides between
+    /// "change this" and "leave it alone", and on any endpoint where it does,
+    /// a bare `Option` is the wrong type — serde reads an absent field as
+    /// `None` and a misspelled key would silently clear the thing it was
+    /// trying to set. `bulk-chain`'s lesson, in a place where the cost is
+    /// somebody's writing rather than an attribution.
+    ///
+    /// Changing the guest list does **not** rewrite the company on plays
+    /// already fanned out. Those snapshots were taken when the play happened
+    /// and they were accurate then; a listen's `company` is a record of an
+    /// evening as it stood, not a view onto a list that keeps moving.
+    pub async fn update_spool(
+        &self,
+        uuid: &str,
+        host_user_id: i64,
+        title: Option<Option<&str>>,
+        notes: Option<Option<&str>>,
+        guests: Option<&[String]>,
+    ) -> Result<bool, sqlx::Error> {
+        let mut touched = false;
+        // Scoped by `host_user_id` in the `WHERE` rather than checked first, so
+        // a sitting that is not yours changes nothing instead of being reported
+        // as existing.
+        macro_rules! set {
+            ($col:literal, $val:expr) => {
+                let res = sqlx::query(&crate::sql!(concat!(
+                    "UPDATE spools SET ",
+                    $col,
+                    " = ? WHERE uuid = ? AND host_user_id = ?"
+                )))
+                .bind($val)
+                .bind(uuid)
+                .bind(host_user_id)
+                .execute(&self.pool)
+                .await?;
+                touched |= res.rows_affected() > 0;
+            };
+        }
+        if let Some(t) = title {
+            set!("title", t.map(str::trim).filter(|t| !t.is_empty()));
+        }
+        if let Some(n) = notes {
+            set!("notes", n.map(str::trim).filter(|n| !n.is_empty()));
+        }
+        if let Some(g) = guests {
+            set!("guests", join_names(g));
+        }
+        Ok(touched)
+    }
+    /// Add people to a sitting that has already started — or has already ended.
+    ///
+    /// The guest list used to be frozen at `start_spool`, which is wrong about
+    /// how an evening actually goes: somebody arrives, somebody's deck comes
+    /// on, or the host simply forgot one of the people sitting in front of
+    /// them. Nothing about a sitting makes its membership a thing that can only
+    /// be known in the first second of it.
+    ///
+    /// `present_from` is the whole of the "from when" question, and it is
+    /// answered by the person adding rather than inferred:
+    ///
+    /// * `None` — they were here all along. They are offered the whole evening,
+    ///   which is what every member of every sitting got before this existed.
+    /// * `Some(t)` — they arrived at `t`, and the backlog is bounded by it.
+    ///
+    /// **Host only**, and that is a consent decision rather than a hierarchy.
+    /// The rule `start_spool` carries is that you may only invite a deck *you*
+    /// are patched with; letting a guest invite would let them bring somebody
+    /// the host has never patched with into a room where the host's plays are
+    /// being published. A guest who wants somebody added can ask.
+    ///
+    /// Somebody already in the sitting is left exactly as they are — re-adding
+    /// must not reset a membership they have already answered, and in
+    /// particular must not walk somebody's `declined` back to `invited`.
+    pub async fn add_spool_members(
+        &self,
+        uuid: &str,
+        host_user_id: i64,
+        with: &[i64],
+        present_from: Option<i64>,
+    ) -> Result<i64, sqlx::Error> {
+        let Some(spool_id): Option<i64> = sqlx::query_scalar(&crate::sql!(
+            "SELECT id FROM spools WHERE uuid = ? AND host_user_id = ?"
+        ))
+        .bind(uuid)
+        .bind(host_user_id)
+        .fetch_optional(&self.pool)
+        .await?
+        else {
+            return Ok(-1);
+        };
+
+        // The same guard `start_spool` applies, in the same place and for the
+        // same reason: an invitation puts a banner on somebody's screen, and
+        // one stranger in the list refuses the whole call rather than being
+        // quietly dropped from a guest list the host had just typed.
+        let patched: Vec<i64> = sqlx::query_scalar(&crate::sql!(
+            "SELECT CASE WHEN follower_user_id = ? THEN target_user_id ELSE follower_user_id END
+               FROM patches
+              WHERE state = 'accepted' AND (follower_user_id = ? OR target_user_id = ?)",
+        ))
+        .bind(host_user_id)
+        .bind(host_user_id)
+        .bind(host_user_id)
+        .fetch_all(&self.pool)
+        .await?;
+        if with.iter().any(|u| *u != host_user_id && !patched.contains(u)) {
+            return Err(sqlx::Error::Protocol("not patched with that deck".into()));
+        }
+
+        let mut added = 0;
+        for &uid in with {
+            if uid == host_user_id {
+                continue;
+            }
+            let res = sqlx::query(&crate::sql!(
+                "INSERT INTO spool_members (spool_id, user_id, present_from) VALUES (?, ?, ?)
+                 ON CONFLICT DO NOTHING",
+            ))
+            .bind(spool_id)
+            .bind(uid)
+            .bind(present_from)
+            .execute(&self.pool)
+            .await?;
+            added += res.rows_affected() as i64;
+        }
+        Ok(added)
+    }
+    /// Correct when somebody was in the room.
+    ///
+    /// The host sets this when adding a person late; **the person themselves
+    /// can change it**, because they are the one who knows. Everything it
+    /// decides is about their own inbox — how much of the evening they are
+    /// offered — so there is nothing here for them to overreach with.
+    ///
+    /// Clearing `present_from` back to NULL means "I was here the whole time",
+    /// which is why both are `Option<Option<_>>`: absent has to stay
+    /// distinguishable from null on an endpoint whose null is meaningful.
+    ///
+    /// Re-running the backlog afterwards is deliberate. Widening your presence
+    /// should offer you the plays you have just claimed to have heard, and it
+    /// costs nothing to be wrong about: `offer_spool_backlog` refuses anything
+    /// already offered in any sitting, so nothing is duplicated, and narrowing
+    /// it withdraws no offer already made — an offer is a question somebody
+    /// asked you, and it is yours to answer either way.
+    pub async fn set_member_presence(
+        &self,
+        uuid: &str,
+        user_id: i64,
+        present_from: Option<Option<i64>>,
+        present_until: Option<Option<i64>>,
+    ) -> Result<Option<i64>, sqlx::Error> {
+        let Some((spool_id, state)): Option<(i64, String)> = sqlx::query_as(&crate::sql!(
+            "SELECT sp.id, m.state FROM spools sp
+               JOIN spool_members m ON m.spool_id = sp.id AND m.user_id = ?
+              WHERE sp.uuid = ?"
+        ))
+        .bind(user_id)
+        .bind(uuid)
+        .fetch_optional(&self.pool)
+        .await?
+        else {
+            return Ok(None);
+        };
+
+        if let Some(from) = present_from {
+            sqlx::query(&crate::sql!(
+                "UPDATE spool_members SET present_from = ? WHERE spool_id = ? AND user_id = ?"
+            ))
+            .bind(from)
+            .bind(spool_id)
+            .bind(user_id)
+            .execute(&self.pool)
+            .await?;
+        }
+        if let Some(until) = present_until {
+            sqlx::query(&crate::sql!(
+                "UPDATE spool_members SET present_until = ? WHERE spool_id = ? AND user_id = ?"
+            ))
+            .bind(until)
+            .bind(spool_id)
+            .bind(user_id)
+            .execute(&self.pool)
+            .await?;
+        }
+
+        // Only for somebody actually in the sitting. Widening the presence of
+        // an invitation nobody has answered must not start filling their inbox
+        // — joining is what does that, and it is theirs to do.
+        if state != "joined" {
+            return Ok(Some(0));
+        }
+        Ok(Some(self.offer_spool_backlog(spool_id, uuid, user_id).await?))
+    }
+    /// Correct when a capture was played, before it becomes a listen.
+    ///
+    /// **The cheapest place in the application to fix a wrong time**, and the
+    /// reason it exists separately from editing a listen: a capture is an offer
+    /// and not a record, so nothing is in a history, nothing has been forwarded
+    /// to anybody's Last.fm, no session has been grouped around it and no
+    /// dedup window has been drawn against it. Every trap that makes editing a
+    /// *listen's* timestamp delicate arrives only once it has been accepted.
+    ///
+    /// A capture carries the **host's** clock, which is the ordinary way one
+    /// comes to be wrong: their phone was an hour out, or the sitting was
+    /// reconstructed from an evening whose times were laid out by arithmetic.
+    ///
+    /// Pending only. A settled capture has either become a listen — where
+    /// `set_listen_time` is the thing to reach for — or been declined, and
+    /// re-timing a refusal changes nothing about anything.
+    pub async fn set_capture_time(
+        &self,
+        user_id: i64,
+        capture_id: i64,
+        played_at: i64,
+    ) -> Result<bool, sqlx::Error> {
+        let res = sqlx::query(&crate::sql!(
+            "UPDATE spool_captures SET played_at = ?
+              WHERE id = ? AND user_id = ? AND state = 'pending'"
+        ))
+        .bind(played_at)
+        .bind(capture_id)
+        .bind(user_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(res.rows_affected() > 0)
+    }
+    /// The chain an accepted Shared Spool play is filed under, if this account
+    /// has named one.
+    pub async fn spool_chain_id(&self, user_id: i64) -> Result<Option<i64>, sqlx::Error> {
+        sqlx::query_scalar(&crate::sql!("SELECT spool_chain_id FROM users WHERE id = ?"))
+            .bind(user_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map(Option::flatten)
+    }
+    /// Name the chain an accepted Shared Spool play lands on, or clear it.
+    ///
+    /// **Ownership is checked here rather than left to a foreign key**, which
+    /// is what the column could not have — `users` is created before
+    /// `signal_chains`, so the constraint would be a forward reference. It is
+    /// the better guard anyway: a foreign key would have accepted somebody
+    /// else's chain quite happily.
+    pub async fn set_spool_chain(
+        &self,
+        user_id: i64,
+        chain_id: Option<i64>,
+    ) -> Result<bool, sqlx::Error> {
+        if let Some(id) = chain_id {
+            let mine: i64 = sqlx::query_scalar(&crate::sql!(
+                "SELECT COUNT(*) FROM signal_chains WHERE id = ? AND user_id = ?"
+            ))
+            .bind(id)
+            .bind(user_id)
+            .fetch_one(&self.pool)
+            .await?;
+            if mine == 0 {
+                return Ok(false);
+            }
+        }
+        sqlx::query(&crate::sql!("UPDATE users SET spool_chain_id = ? WHERE id = ?"))
+            .bind(chain_id)
+            .bind(user_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(true)
+    }
+    /// The roster of one sitting, joined first and then alphabetically.
+    async fn spool_members(&self, spool_id: i64) -> Result<Vec<SpoolMember>, sqlx::Error> {
+        sqlx::query_as(&crate::sql!(
+            "SELECT u.id AS user_id, u.username, u.display_name, m.state,
+                    m.present_from, m.present_until
+               FROM spool_members m JOIN users u ON u.id = m.user_id
+              WHERE m.spool_id = ? ORDER BY m.state = 'joined' DESC, u.username"
+        ))
+        .bind(spool_id)
+        .fetch_all(&self.pool)
+        .await
     }
     /// Hand one of your sittings to somebody you are patched with.
     ///
@@ -2169,6 +2894,17 @@ impl Database {
         play: &Play,
         chain_id: Option<i64>,
     ) -> Result<(), sqlx::Error> {
+        // **A play accepted out of one sitting is not a play in another.**
+        // `settle_captures` writes a real listen, and with a spool chain named
+        // that listen now passes the chain gate below — so without this,
+        // answering last week's inbox while a sitting happens to be running
+        // would fan those plays out into tonight's room and stamp them with
+        // tonight's uuid. The rule belongs here, on the kind of play, rather
+        // than as a flag the caller has to remember to pass.
+        if play.source_name == "Shared Spool" {
+            return Ok(());
+        }
+
         let Some((spool_id, uuid)): Option<(i64, String)> = sqlx::query_as(&crate::sql!(
             "SELECT sp.id, sp.uuid FROM spools sp
                JOIN spool_members m ON m.spool_id = sp.id AND m.user_id = ? AND m.state = 'joined'
@@ -2199,13 +2935,22 @@ impl Database {
         .bind(spool_id)
         .fetch_all(&self.pool)
         .await?;
+        // The people in the room with no deck of their own. They are company
+        // like anybody else — a sitting that could only name account holders
+        // would miss the friend on the sofa, which is the whole reason
+        // `spools.guests` exists and the reason `scrobbles.company` was free
+        // text before it did.
+        let guests: Option<String> =
+            sqlx::query_scalar(&crate::sql!("SELECT guests FROM spools WHERE id = ?"))
+                .bind(spool_id)
+                .fetch_one(&self.pool)
+                .await?;
+        let guests = split_names(guests.as_deref());
         let company_for = |excluding: i64| -> Option<String> {
-            let names: Vec<&str> = present
-                .iter()
-                .filter(|(id, _)| *id != excluding)
-                .map(|(_, n)| n.as_str())
-                .collect();
-            (!names.is_empty()).then(|| names.join(", "))
+            let mut names: Vec<String> =
+                present.iter().filter(|(id, _)| *id != excluding).map(|(_, n)| n.clone()).collect();
+            names.extend(guests.iter().cloned());
+            join_names(&names)
         };
         let company = company_for(user_id);
 
@@ -2326,6 +3071,16 @@ impl Database {
         // Read once for the batch rather than per capture: it is one person's
         // standing answer, and it cannot change halfway through a click.
         let forwarding = accept && self.forward_spool_listens(user_id).await?;
+        // The chain this account files a room it sat in under, if it has named
+        // one. Read once for the batch like the forwarding switch above: it is
+        // a standing answer, not a per-play one.
+        //
+        // Unset is the default and reproduces exactly what these listens used
+        // to be — no chain, therefore no gear hours, no place in the Reel and
+        // nothing in any chain total. That was defensible and it was not the
+        // whole truth: you were in the room hearing real speakers, and if you
+        // have built a chain that says so it should get the hours.
+        let chain_id = if accept { self.spool_chain_id(user_id).await? } else { None };
         let placeholders = std::iter::repeat("?").take(ids.len()).collect::<Vec<_>>().join(",");
 
         let sql = format!(
@@ -2373,7 +3128,7 @@ impl Database {
                     &play,
                     None,
                     None,
-                    None,
+                    chain_id,
                     None,
                     None,
                     Some("Shared Spool"),

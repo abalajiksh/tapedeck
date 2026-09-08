@@ -5219,17 +5219,17 @@ async fn a_sitting_cannot_be_opened_onto_a_deck_you_are_not_patched_with() {
     let stranger = db.create_user("sam", None, "pw", "user").await.unwrap();
 
     // Along the patch, either direction.
-    assert!(db.start_spool(me, None, &[them]).await.is_ok());
+    assert!(db.start_spool(me, None, &[them], &[]).await.is_ok());
     db.end_spool(&db.active_spool(me).await.unwrap().unwrap().uuid, me).await.unwrap();
 
-    assert!(db.start_spool(me, None, &[stranger]).await.is_err());
+    assert!(db.start_spool(me, None, &[stranger], &[]).await.is_err());
     // And nothing was written on the way to refusing.
     assert!(db.active_spool(me).await.unwrap().is_none());
     assert!(db.active_spool(stranger).await.unwrap().is_none());
 
     // One stranger in the guest list refuses the whole sitting rather than
     // opening it without them.
-    assert!(db.start_spool(me, None, &[them, stranger]).await.is_err());
+    assert!(db.start_spool(me, None, &[them, stranger], &[]).await.is_err());
     assert!(db.active_spool(me).await.unwrap().is_none());
 }
 
@@ -5581,8 +5581,8 @@ async fn reconstructing_an_evening_does_not_re_offer_what_a_live_sitting_already
     let db = testdb().await;
     let (me, them, chain) = patched_pair(&db).await;
 
-    let live = db.start_spool(them, None, &[me]).await.unwrap();
-    assert!(db.set_spool_membership(&live, me, "joined").await.unwrap().is_some());
+    let live = db.start_spool(them, None, &[me], &[]).await.unwrap();
+    assert!(db.set_spool_membership(&live, me, true).await.unwrap().is_some());
     listen(&db, them, Some(chain), "Both", "Talk Talk", 1_760_000_100).await;
     assert_eq!(db.spool_captures(me).await.unwrap().len(), 1, "the live sitting offered it");
 
@@ -5697,8 +5697,8 @@ async fn an_unshared_chain_still_knows_you_were_not_alone() {
     .await
     .unwrap()[0];
 
-    let spool = db.start_spool(them, None, &[me]).await.unwrap();
-    assert!(db.set_spool_membership(&spool, me, "joined").await.unwrap().is_some());
+    let spool = db.start_spool(them, None, &[me], &[]).await.unwrap();
+    assert!(db.set_spool_membership(&spool, me, true).await.unwrap().is_some());
 
     listen(&db, them, Some(private), "Unshared", "Talk Talk", 1_760_000_100).await;
     listen(&db, them, Some(chain), "Shared", "Talk Talk", 1_760_000_200).await;
@@ -5793,7 +5793,7 @@ async fn a_spool_offers_plays_and_nothing_lands_until_it_is_accepted() {
     let db = testdb().await;
     let (me, them, chain) = patched_pair(&db).await;
 
-    let spool = db.start_spool(them, Some("Sunday listening"), &[me]).await.unwrap();
+    let spool = db.start_spool(them, Some("Sunday listening"), &[me], &[]).await.unwrap();
 
     // Invited, not joined: a sitting must not write onto somebody's deck
     // before they have said they are in it.
@@ -5812,7 +5812,10 @@ async fn a_spool_offers_plays_and_nothing_lands_until_it_is_accepted() {
     //
     // The invariant is untouched: nothing was offered until the yes, and
     // nothing enters a history until each play is accepted on its own.
-    assert_eq!(db.set_spool_membership(&spool, me, "joined").await.unwrap(), Some(1));
+    assert_eq!(
+        db.set_spool_membership(&spool, me, true).await.unwrap(),
+        Some(("joined".into(), 1))
+    );
     listen(&db, them, Some(chain), "During", "Massive Attack", 1_760_000_200).await;
 
     let caps = db.spool_captures(me).await.unwrap();
@@ -5869,8 +5872,8 @@ async fn a_spool_offers_plays_and_nothing_lands_until_it_is_accepted() {
 async fn an_import_and_a_skip_are_never_captured() {
     let db = testdb().await;
     let (me, them, chain) = patched_pair(&db).await;
-    let spool = db.start_spool(them, None, &[me]).await.unwrap();
-    db.set_spool_membership(&spool, me, "joined").await.unwrap();
+    let spool = db.start_spool(them, None, &[me], &[]).await.unwrap();
+    db.set_spool_membership(&spool, me, true).await.unwrap();
 
     for (i, disp) in [
         ListenDisposition { imported: true, skipped: false },
@@ -5925,7 +5928,7 @@ async fn an_unanswered_invitation_outlives_the_sitting_and_still_carries_its_pla
         .await
         .unwrap()[0];
 
-    let spool = db.start_spool(them, Some("Sunday"), &[me]).await.unwrap();
+    let spool = db.start_spool(them, Some("Sunday"), &[me], &[]).await.unwrap();
 
     // The whole evening plays out with the guest never having answered, so
     // not one capture is written for them as it happens.
@@ -5945,8 +5948,8 @@ async fn an_unanswered_invitation_outlives_the_sitting_and_still_carries_its_pla
 
     // And answering it now is what it always should have been.
     assert_eq!(
-        db.set_spool_membership(&spool, me, "joined").await.unwrap(),
-        Some(1),
+        db.set_spool_membership(&spool, me, true).await.unwrap(),
+        Some(("joined".into(), 1)),
         "joining late offers the sitting's plays, and only the shareable ones"
     );
     let titles: Vec<String> =
@@ -5958,7 +5961,10 @@ async fn an_unanswered_invitation_outlives_the_sitting_and_still_carries_its_pla
 
     // Joining twice does not offer the same play twice — the rule
     // `retro_spool_from_session` already carries, which this shares.
-    assert_eq!(db.set_spool_membership(&spool, me, "joined").await.unwrap(), Some(0));
+    assert_eq!(
+        db.set_spool_membership(&spool, me, true).await.unwrap(),
+        Some(("joined".into(), 0))
+    );
     assert_eq!(db.spool_captures(me).await.unwrap().len(), 1);
 }
 
@@ -5977,8 +5983,8 @@ async fn an_unanswered_invitation_outlives_the_sitting_and_still_carries_its_pla
 async fn a_spool_play_is_forwarded_only_if_asked_for_and_only_if_recent() {
     let db = testdb().await;
     let (me, them, chain) = patched_pair(&db).await;
-    let spool = db.start_spool(them, None, &[me]).await.unwrap();
-    db.set_spool_membership(&spool, me, "joined").await.unwrap();
+    let spool = db.start_spool(them, None, &[me], &[]).await.unwrap();
+    db.set_spool_membership(&spool, me, true).await.unwrap();
 
     let status_of = |title: &'static str| {
         let db = &db;
@@ -6051,11 +6057,16 @@ fn the_spool_forward_window_admits_a_late_accept_and_refuses_a_backfill() {
 async fn no_thanks_dismisses_an_invitation_for_good() {
     let db = testdb().await;
     let (me, them, _) = patched_pair(&db).await;
-    let spool = db.start_spool(them, None, &[me]).await.unwrap();
+    let spool = db.start_spool(them, None, &[me], &[]).await.unwrap();
     assert!(db.end_spool(&spool, them).await.unwrap());
 
     assert!(db.active_spool(me).await.unwrap().is_some());
-    assert_eq!(db.set_spool_membership(&spool, me, "left").await.unwrap(), Some(0));
+    // Saying no to an invitation is `declined`, not `left` — nobody who was
+    // never in the room went home from it.
+    assert_eq!(
+        db.set_spool_membership(&spool, me, false).await.unwrap(),
+        Some(("declined".into(), 0))
+    );
     assert!(db.active_spool(me).await.unwrap().is_none());
 }
 
@@ -6080,8 +6091,8 @@ async fn a_sitting_captures_only_from_shared_chains() {
         .await
         .unwrap()[0];
 
-    let spool = db.start_spool(them, None, &[me]).await.unwrap();
-    db.set_spool_membership(&spool, me, "joined").await.unwrap();
+    let spool = db.start_spool(them, None, &[me], &[]).await.unwrap();
+    db.set_spool_membership(&spool, me, true).await.unwrap();
 
     listen(&db, them, Some(private), "Private", "Talk Talk", 1_760_000_100).await;
     listen(&db, them, None, "Chainless", "Talk Talk", 1_760_000_200).await;
@@ -6103,15 +6114,15 @@ async fn a_deck_hosts_one_sitting_at_a_time() {
     let db = testdb().await;
     let (me, them, _) = patched_pair(&db).await;
 
-    let first = db.start_spool(them, Some("One"), &[me]).await.unwrap();
-    assert!(db.start_spool(them, Some("Two"), &[me]).await.is_err(), "two rooms at once");
+    let first = db.start_spool(them, Some("One"), &[me], &[]).await.unwrap();
+    assert!(db.start_spool(them, Some("Two"), &[me], &[]).await.is_err(), "two rooms at once");
 
     assert!(db.end_spool(&first, me).await.unwrap() == false, "only the host may end it");
     assert!(db.end_spool(&first, them).await.unwrap());
     assert!(db.active_spool(them).await.unwrap().is_none());
 
     // And now a second one is fine.
-    assert!(db.start_spool(them, Some("Two"), &[me]).await.is_ok());
+    assert!(db.start_spool(them, Some("Two"), &[me], &[]).await.is_ok());
 }
 
 /// **Promotion is a relabelling, and this is how you know.**
@@ -8388,4 +8399,596 @@ async fn an_existing_database_gains_stable_ids_and_keeps_minting_them() {
         .await
         .expect("reopening must be idempotent");
     assert_eq!(before, ids(&db, "equipment").await, "a reopen must not re-mint ids");
+}
+
+/// The timeline is one row per **play**, not one per listen.
+///
+/// A joint listen is N rows sharing a `joint_session_id` — one per person in
+/// the room — so the naive read reports an evening at twice its real length the
+/// moment somebody accepts their half of it. This asserts on the *timeline*
+/// rather than on the query, because that doubling is not an error anywhere: it
+/// is a page confidently describing a two-record evening as four records.
+#[tokio::test]
+async fn a_sitting_is_one_row_per_play_however_many_decks_were_in_it() {
+    let db = testdb().await;
+    let (me, them, chain) = patched_pair(&db).await;
+
+    let spool = db.start_spool(them, Some("Sunday"), &[me], &[]).await.unwrap();
+    assert_eq!(
+        db.set_spool_membership(&spool, me, true).await.unwrap(),
+        Some(("joined".into(), 0))
+    );
+
+    listen(&db, them, Some(chain), "Teardrop", "Massive Attack", 1_760_000_000).await;
+    listen(&db, them, Some(chain), "Angel", "Massive Attack", 1_760_000_400).await;
+
+    let before = db.spool_detail(&spool, me).await.unwrap().unwrap();
+    assert_eq!(before.plays.len(), 2, "two records played, so two rows");
+    assert!(
+        before.plays.iter().all(|p| p.standing == "pending"),
+        "they are offers until they are answered"
+    );
+
+    // Accepting writes a real listen of mine carrying the same sitting id. The
+    // evening did not get longer.
+    let ids: Vec<i64> = before.plays.iter().filter_map(|p| p.capture_id).collect();
+    assert_eq!(ids.len(), 2);
+    db.settle_captures(me, &ids, true).await.unwrap();
+
+    let after = db.spool_detail(&spool, me).await.unwrap().unwrap();
+    assert_eq!(
+        after.plays.len(),
+        2,
+        "accepting a play must not put a second copy of it on the timeline — a joint \
+         listen is N rows by design, and counting all of them reports the evening at \
+         twice the length it was"
+    );
+    assert!(after.plays.iter().all(|p| p.standing == "accepted"));
+
+    // And the history list counts it the same way.
+    let hist = db.spool_history(me, 50).await.unwrap();
+    assert_eq!(hist.len(), 1);
+    assert_eq!(hist[0].plays, 2);
+    assert_eq!(hist[0].pending, 0);
+    assert!(hist[0].present.iter().any(|n| n == "kim"), "both decks were in the room");
+}
+
+/// A sitting shows what the sharing switch allows and **says how much it is not
+/// showing**.
+///
+/// The withheld count is the half that matters. A page with invisible holes
+/// misrepresents the evening and the reader could never tell — the rule
+/// `handed_sitting` already carries, in the one other place this application
+/// shows somebody an evening.
+#[tokio::test]
+async fn a_sitting_says_what_it_is_not_showing() {
+    let db = testdb().await;
+    let (me, them, shared) = patched_pair(&db).await;
+    let private = sqlx::query_scalar::<_, i64>(
+        "INSERT INTO signal_chains (user_id, name, created_at) VALUES (?, 'Private', ?) RETURNING id",
+    )
+    .bind(them)
+    .bind(Database::now_secs())
+    .fetch_all(&db.pool)
+    .await
+    .unwrap()[0];
+
+    let spool = db.start_spool(them, None, &[me], &[]).await.unwrap();
+    db.set_spool_membership(&spool, me, true).await.unwrap();
+
+    listen(&db, them, Some(shared), "Teardrop", "Massive Attack", 1_760_000_000).await;
+    listen(&db, them, Some(private), "Karmacoma", "Massive Attack", 1_760_000_400).await;
+
+    let view = db.spool_detail(&spool, me).await.unwrap().unwrap();
+    let titles: Vec<&str> = view.plays.iter().map(|p| p.title.as_str()).collect();
+    assert_eq!(
+        titles,
+        vec!["Teardrop"],
+        "a play through an unshared chain does not reach somebody else's screen"
+    );
+    assert_eq!(view.withheld, 1, "and the evening says so rather than quietly omitting it");
+}
+
+/// A sitting stays visible after the patch that made it possible is gone.
+///
+/// The decision, and it is a deliberate widening rather than an inherited rule:
+/// you were in the room, and un-patching afterwards is a choice about what you
+/// want to keep seeing *of theirs*. It has no standing to un-happen an evening
+/// you attended — and your own accepted listens from it stay in your history
+/// regardless, so a vanished sitting would leave rows with nothing to explain
+/// them.
+#[tokio::test]
+async fn un_patching_does_not_un_happen_an_evening_you_were_in() {
+    let db = testdb().await;
+    let (me, them, chain) = patched_pair(&db).await;
+
+    let spool = db.start_spool(them, Some("Before"), &[me], &[]).await.unwrap();
+    db.set_spool_membership(&spool, me, true).await.unwrap();
+    listen(&db, them, Some(chain), "Teardrop", "Massive Attack", 1_760_000_000).await;
+    assert_eq!(db.spool_history(me, 50).await.unwrap().len(), 1);
+
+    db.unpatch(me, them).await.unwrap();
+
+    let hist = db.spool_history(me, 50).await.unwrap();
+    assert_eq!(hist.len(), 1, "the evening happened whatever the patch says now");
+    assert!(db.spool_detail(&spool, me).await.unwrap().is_some());
+
+    // The Reel is the thing the patch does gate, and it is untouched by any of
+    // this — which is what makes the widening narrow.
+    assert!(
+        db.reel(me, 50, None, None, None).await.unwrap().is_empty(),
+        "un-patching still stops their listening reaching your Reel"
+    );
+}
+
+/// Saying no to an invitation and going home from a sitting are different
+/// answers, and until they were told apart neither could be recorded.
+///
+/// Both used to write `left`, so the history could not say who had actually
+/// been in a sitting and `present_until` had nothing to hang on.
+#[tokio::test]
+async fn declining_an_invitation_is_not_leaving_a_sitting() {
+    let db = testdb().await;
+    let (me, them, chain) = patched_pair(&db).await;
+
+    let declined = db.start_spool(them, Some("Not this one"), &[me], &[]).await.unwrap();
+    assert_eq!(
+        db.set_spool_membership(&declined, me, false).await.unwrap(),
+        Some(("declined".into(), 0))
+    );
+    db.end_spool(&declined, them).await.unwrap();
+
+    let attended = db.start_spool(them, Some("This one"), &[me], &[]).await.unwrap();
+    db.set_spool_membership(&attended, me, true).await.unwrap();
+    listen(&db, them, Some(chain), "Teardrop", "Massive Attack", 1_760_000_000).await;
+    assert_eq!(
+        db.set_spool_membership(&attended, me, false).await.unwrap(),
+        Some(("left".into(), 0)),
+        "leaving a sitting you were in is `left`"
+    );
+
+    let hist = db.spool_history(me, 50).await.unwrap();
+    let titles: Vec<&str> = hist.iter().filter_map(|s| s.title.as_deref()).collect();
+    assert_eq!(titles, vec!["This one"], "an evening you said no to is not an evening you were at");
+
+    // Leaving has a time on it. Declining does not — there is no moment you
+    // stopped being in a room you were never in.
+    let left_at: Option<i64> = sqlx::query_scalar(
+        "SELECT present_until FROM spool_members m JOIN spools sp ON sp.id = m.spool_id
+          WHERE sp.uuid = ? AND m.user_id = ?",
+    )
+    .bind(&attended)
+    .bind(me)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert!(left_at.is_some());
+    let never: Option<i64> = sqlx::query_scalar(
+        "SELECT present_until FROM spool_members m JOIN spools sp ON sp.id = m.spool_id
+          WHERE sp.uuid = ? AND m.user_id = ?",
+    )
+    .bind(&declined)
+    .bind(me)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert!(never.is_none());
+}
+
+/// Somebody added to a sitting after it started gets the part of the evening
+/// they were actually in the room for.
+///
+/// **Absent `present_from` is the whole evening**, which is the common case: a
+/// host adding somebody an hour in has almost always just remembered the person
+/// sitting in front of them. A real mid-evening arrival is what the column is
+/// for, and it is said rather than inferred from a join time that means
+/// something else entirely.
+#[tokio::test]
+async fn somebody_added_late_gets_the_evening_they_were_there_for() {
+    let db = testdb().await;
+    let (me, them, chain) = patched_pair(&db).await;
+    let spool = db.start_spool(them, None, &[], &[]).await.unwrap();
+
+    listen(&db, them, Some(chain), "Early", "Massive Attack", 1_760_000_000).await;
+    listen(&db, them, Some(chain), "Late", "Massive Attack", 1_760_004_000).await;
+
+    // Arrived between the two.
+    assert_eq!(db.add_spool_members(&spool, them, &[me], Some(1_760_002_000)).await.unwrap(), 1);
+    assert_eq!(
+        db.set_spool_membership(&spool, me, true).await.unwrap(),
+        Some(("joined".into(), 1)),
+        "only the play they were in the room for"
+    );
+    let waiting: Vec<String> =
+        db.spool_captures(me).await.unwrap().into_iter().map(|c| c.title).collect();
+    assert_eq!(waiting, vec!["Late".to_string()]);
+
+    // Correcting it to "I was here all along" offers the rest, and offers
+    // nothing twice.
+    assert_eq!(
+        db.set_member_presence(&spool, me, Some(None), None).await.unwrap(),
+        Some(1),
+        "widening presence offers the plays you have just said you heard"
+    );
+    let mut waiting: Vec<String> =
+        db.spool_captures(me).await.unwrap().into_iter().map(|c| c.title).collect();
+    waiting.sort();
+    assert_eq!(waiting, vec!["Early".to_string(), "Late".to_string()]);
+}
+
+/// Adding somebody to a sitting carries the consent guard `start_spool` has,
+/// and one stranger refuses the whole list rather than being dropped from it.
+#[tokio::test]
+async fn a_stranger_cannot_be_added_to_a_sitting_either() {
+    let db = testdb().await;
+    let (me, them, _chain) = patched_pair(&db).await;
+    let stranger = db.create_user("noor", None, "pw", "user").await.unwrap();
+    let spool = db.start_spool(them, None, &[], &[]).await.unwrap();
+
+    assert!(db.add_spool_members(&spool, them, &[stranger], None).await.is_err());
+    assert!(
+        db.add_spool_members(&spool, them, &[me, stranger], None).await.is_err(),
+        "a mixed list is refused whole"
+    );
+    let members: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM spool_members m JOIN spools sp ON sp.id = m.spool_id
+          WHERE sp.uuid = ?",
+    )
+    .bind(&spool)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(members, 1, "nothing is written on the way to refusing — only the host");
+
+    // And a guest cannot add anybody at all: it is the host's sitting.
+    assert_eq!(db.add_spool_members(&spool, me, &[them], None).await.unwrap(), -1);
+}
+
+/// A play accepted out of one sitting is not a play in another.
+///
+/// Naming a spool chain is what makes this reachable: with a chain set, an
+/// accepted capture passes the chain gate, so without the guard, answering last
+/// week's inbox while a sitting happens to be running would fan those plays out
+/// into tonight's room and stamp them with tonight's uuid.
+#[tokio::test]
+async fn answering_an_old_inbox_does_not_publish_into_tonights_room() {
+    let db = testdb().await;
+    let (me, them, chain) = patched_pair(&db).await;
+
+    // My own shared chain, and I file rooms I sit in under it.
+    let mine = sqlx::query_scalar::<_, i64>(
+        "INSERT INTO signal_chains (user_id, name, created_at) VALUES (?, 'Sofa', ?) RETURNING id",
+    )
+    .bind(me)
+    .bind(Database::now_secs())
+    .fetch_all(&db.pool)
+    .await
+    .unwrap()[0];
+    db.set_chain_shared(me, mine, true).await.unwrap();
+    assert!(db.set_spool_chain(me, Some(mine)).await.unwrap());
+
+    let last_week = db.start_spool(them, Some("Last week"), &[me], &[]).await.unwrap();
+    db.set_spool_membership(&last_week, me, true).await.unwrap();
+    listen(&db, them, Some(chain), "Teardrop", "Massive Attack", 1_760_000_000).await;
+    let waiting: Vec<i64> =
+        db.spool_captures(me).await.unwrap().into_iter().map(|c| c.id).collect();
+    db.end_spool(&last_week, them).await.unwrap();
+
+    // Tonight, I am hosting.
+    let tonight = db.start_spool(me, Some("Tonight"), &[them], &[]).await.unwrap();
+    db.set_spool_membership(&tonight, them, true).await.unwrap();
+
+    db.settle_captures(me, &waiting, true).await.unwrap();
+
+    assert_eq!(
+        db.spool_captures(them).await.unwrap().len(),
+        0,
+        "answering an old inbox must not put last week's plays in tonight's room"
+    );
+    let stamped: Option<String> = sqlx::query_scalar(
+        "SELECT joint_session_id FROM scrobbles WHERE user_id = ? AND source_name = 'Shared Spool'",
+    )
+    .bind(me)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        stamped.as_deref(),
+        Some(last_week.as_str()),
+        "it belongs to the evening it was played in"
+    );
+
+    // And the chain really did land, which is the whole point of naming one.
+    let filed: Option<i64> = sqlx::query_scalar(
+        "SELECT chain_id FROM scrobbles WHERE user_id = ? AND source_name = 'Shared Spool'",
+    )
+    .bind(me)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(filed, Some(mine), "an accepted play is filed under the room you named");
+}
+
+/// A chain named for accepted captures has to be one of yours.
+#[tokio::test]
+async fn the_room_you_name_has_to_be_a_chain_of_yours() {
+    let db = testdb().await;
+    let (me, _them, theirs) = patched_pair(&db).await;
+    assert!(!db.set_spool_chain(me, Some(theirs)).await.unwrap());
+    assert_eq!(db.spool_chain_id(me).await.unwrap(), None);
+}
+
+/// Moving a listen keeps what the clock said, and says what it could not reach.
+#[tokio::test]
+async fn a_time_edit_keeps_the_original_and_states_its_limits() {
+    let db = testdb().await;
+    let uid = db.create_user("ash", None, "pw", "user").await.unwrap();
+    listen(&db, uid, None, "Teardrop", "Massive Attack", 1_760_000_000).await;
+    let id: i64 = sqlx::query_scalar("SELECT id FROM scrobbles WHERE user_id = ?")
+        .bind(uid)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE scrobbles SET status = 'synced' WHERE id = ?")
+        .bind(id)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+    let edit = db.shift_listen_times(uid, &[id], -3600).await.unwrap();
+    assert_eq!(edit.moved, 1);
+    assert_eq!(
+        edit.already_forwarded, 1,
+        "neither Last.fm nor ListenBrainz has an edit API, so a screen that could not \
+         say this would let somebody believe they had corrected a public record"
+    );
+
+    let (now, was): (i64, Option<i64>) =
+        sqlx::query_as("SELECT timestamp, timestamp_original FROM scrobbles WHERE id = ?")
+            .bind(id)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(now, 1_760_000_000 - 3600);
+    assert_eq!(was, Some(1_760_000_000), "what the clock said is kept");
+
+    // A second correction does not overwrite the first one's record. What is
+    // worth keeping is the observation, not the previous guess at it.
+    db.shift_listen_times(uid, &[id], 60).await.unwrap();
+    let was: Option<i64> =
+        sqlx::query_scalar("SELECT timestamp_original FROM scrobbles WHERE id = ?")
+            .bind(id)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(was, Some(1_760_000_000));
+}
+
+/// A listen is never moved on top of another of the same track.
+///
+/// Dedup runs at ingest and never again, so a duplicate created by a hand edit
+/// is one nothing in the application will ever reconcile — `fuzzy_exists` has
+/// already had its chance.
+#[tokio::test]
+async fn a_time_edit_never_creates_a_duplicate_nothing_will_reconcile() {
+    let db = testdb().await;
+    let uid = db.create_user("ash", None, "pw", "user").await.unwrap();
+    listen(&db, uid, None, "Teardrop", "Massive Attack", 1_760_000_000).await;
+    listen(&db, uid, None, "Teardrop", "Massive Attack", 1_760_003_600).await;
+    listen(&db, uid, None, "Angel", "Massive Attack", 1_760_007_200).await;
+
+    let ids: Vec<i64> =
+        sqlx::query_scalar("SELECT id FROM scrobbles WHERE user_id = ? ORDER BY timestamp")
+            .bind(uid)
+            .fetch_all(&db.pool)
+            .await
+            .unwrap();
+
+    // Move the second Teardrop back onto the first.
+    let edit = db.shift_listen_times(uid, &[ids[1]], -3600).await.unwrap();
+    assert_eq!(edit.moved, 0, "it would have landed on the other play of the same track");
+    let still: i64 = sqlx::query_scalar("SELECT timestamp FROM scrobbles WHERE id = ?")
+        .bind(ids[1])
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(still, 1_760_003_600);
+
+    // A different track over the same ground is fine — it is not a duplicate of
+    // anything.
+    let edit = db.shift_listen_times(uid, &[ids[2]], -7200).await.unwrap();
+    assert_eq!(edit.moved, 1);
+}
+
+/// Moving a listen out of its session reports that the *grouping* is stale
+/// rather than silently regrouping.
+///
+/// Sessions are stored rather than computed, which is what lets a manual merge
+/// survive — and `sessions.uuid` is what a handed-over sitting points at, so
+/// regrouping on a metadata edit would move an identity somebody else holds.
+#[tokio::test]
+async fn a_time_edit_reports_a_stale_grouping_rather_than_regrouping() {
+    let db = testdb().await;
+    let uid = db.create_user("ash", None, "pw", "user").await.unwrap();
+    for (i, ts) in [1_760_000_000u64, 1_760_000_300, 1_760_000_600].iter().enumerate() {
+        listen(&db, uid, None, &format!("T{i}"), "Massive Attack", *ts).await;
+    }
+    db.rebuild_sessions(uid, crate::db::SESSION_GAP_SECS).await.unwrap();
+
+    let ids: Vec<i64> =
+        sqlx::query_scalar("SELECT id FROM scrobbles WHERE user_id = ? ORDER BY timestamp")
+            .bind(uid)
+            .fetch_all(&db.pool)
+            .await
+            .unwrap();
+    let before: Option<String> = sqlx::query_scalar("SELECT uuid FROM sessions WHERE user_id = ?")
+        .bind(uid)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+
+    // Nudging one listen a minute leaves the run contiguous.
+    let edit = db.shift_listen_times(uid, &[ids[2]], 60).await.unwrap();
+    assert_eq!(edit.sessions_touched, 1);
+    assert!(!edit.grouping_stale);
+
+    // Throwing it a day forward does not.
+    let edit = db.shift_listen_times(uid, &[ids[2]], 86_400).await.unwrap();
+    assert!(
+        edit.grouping_stale,
+        "the stored grouping no longer describes this run, and only a rebuild the \
+         user asks for may change it"
+    );
+    let after: Option<String> = sqlx::query_scalar("SELECT uuid FROM sessions WHERE user_id = ?")
+        .bind(uid)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(before, after, "nothing regrouped, so no identity moved under anybody");
+}
+
+/// A sitting can be named and written about afterwards, and the people with no
+/// account here are named too.
+#[tokio::test]
+async fn a_sitting_can_be_named_for_what_it_turned_out_to_be() {
+    let db = testdb().await;
+    let (me, them, chain) = patched_pair(&db).await;
+    let spool = db.start_spool(them, None, &[me], &["Tobias".into(), "  ".into()]).await.unwrap();
+    db.set_spool_membership(&spool, me, true).await.unwrap();
+
+    let view = db.spool_detail(&spool, me).await.unwrap().unwrap();
+    assert_eq!(view.guests, vec!["Tobias".to_string()], "a blank is not a person");
+    assert_eq!(view.title, None);
+
+    assert!(db
+        .update_spool(&spool, them, Some(Some("The long one")), Some(Some("Ran to 3am.")), None)
+        .await
+        .unwrap());
+    let view = db.spool_detail(&spool, me).await.unwrap().unwrap();
+    assert_eq!(view.title.as_deref(), Some("The long one"));
+    assert_eq!(view.notes.as_deref(), Some("Ran to 3am."));
+
+    // Not the guests' — only the host names a sitting.
+    assert!(!db.update_spool(&spool, me, Some(Some("Mine now")), None, None).await.unwrap());
+
+    // A guest with no account is company like anybody else.
+    listen(&db, them, Some(chain), "Teardrop", "Massive Attack", 1_760_000_000).await;
+    let company: Option<String> = sqlx::query_scalar(
+        "SELECT company FROM scrobbles WHERE user_id = ? AND title = 'Teardrop'",
+    )
+    .bind(them)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    let company = company.unwrap();
+    assert!(company.contains("Tobias"), "got {company}");
+    assert!(company.contains("ash"), "got {company}");
+}
+
+/// Correcting a capture's time is the cheapest fix in the application, and it
+/// is only ever available while it is still an offer.
+#[tokio::test]
+async fn a_capture_can_be_re_timed_while_it_is_still_an_offer() {
+    let db = testdb().await;
+    let (me, them, chain) = patched_pair(&db).await;
+    let spool = db.start_spool(them, None, &[me], &[]).await.unwrap();
+    db.set_spool_membership(&spool, me, true).await.unwrap();
+    listen(&db, them, Some(chain), "Teardrop", "Massive Attack", 1_760_000_000).await;
+
+    let cap = db.spool_captures(me).await.unwrap().remove(0);
+    assert_eq!(cap.played_at, 1_760_000_000);
+    assert!(db.set_capture_time(me, cap.id, 1_760_003_600).await.unwrap());
+
+    // And it is the corrected time that becomes the listen.
+    db.settle_captures(me, &[cap.id], true).await.unwrap();
+    let ts: i64 = sqlx::query_scalar(
+        "SELECT timestamp FROM scrobbles WHERE user_id = ? AND source_name = 'Shared Spool'",
+    )
+    .bind(me)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(ts, 1_760_003_600);
+
+    // Settled is past re-timing: it is a listen now, and `shift_listen_times`
+    // is what moves one of those.
+    assert!(!db.set_capture_time(me, cap.id, 1_760_007_200).await.unwrap());
+}
+
+/// An existing database gains a sittings history, and keeps writing one.
+///
+/// The half that fails silently is the second: every other test in this file
+/// starts from `Database::new` on an empty file, which takes the `init()` path
+/// and never exercises `migrate()` against a real prior schema — so a migration
+/// that cannot run on an existing database passes the whole suite. v0.61.1 is
+/// what that costs.
+#[tokio::test]
+async fn an_existing_database_gains_a_sittings_history() {
+    let n = N.fetch_add(1, Ordering::SeqCst);
+    let path = std::env::temp_dir().join(format!("td-oldspool-{}-{}.db", std::process::id(), n));
+    for suffix in ["", "-wal", "-shm"] {
+        let _ = std::fs::remove_file(format!("{}{}", path.display(), suffix));
+    }
+
+    // The pre-history shape: spools with no notes and no guests, members with
+    // no presence, and a member row already in it.
+    {
+        let pool = sqlx::SqlitePool::connect(&format!("sqlite:{}?mode=rwc", path.display()))
+            .await
+            .unwrap();
+        for ddl in [
+            "CREATE TABLE users (id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT NOT NULL,
+                 password_hash TEXT NOT NULL, role TEXT NOT NULL DEFAULT 'user',
+                 created_at INTEGER NOT NULL DEFAULT 0, settings TEXT, display_name TEXT)",
+            "CREATE TABLE spools (id INTEGER PRIMARY KEY AUTOINCREMENT, uuid TEXT NOT NULL UNIQUE,
+                 host_user_id INTEGER NOT NULL, title TEXT, started_at INTEGER NOT NULL,
+                 ended_at INTEGER, session_uuid TEXT)",
+            "CREATE TABLE spool_members (spool_id INTEGER NOT NULL, user_id INTEGER NOT NULL,
+                 state TEXT NOT NULL DEFAULT 'invited', joined_at INTEGER,
+                 PRIMARY KEY (spool_id, user_id))",
+            "INSERT INTO users (id, username, password_hash) VALUES (1, 'ashwin', 'x')",
+            "INSERT INTO spools (uuid, host_user_id, title, started_at, ended_at)
+                 VALUES ('old', 1, 'An old evening', 100, 200)",
+            "INSERT INTO spool_members (spool_id, user_id, state, joined_at)
+                 VALUES (1, 1, 'joined', 100)",
+        ] {
+            sqlx::query(ddl).execute(&pool).await.unwrap();
+        }
+        pool.close().await;
+    }
+
+    let url = format!("sqlite:{}", path.display());
+    let db = Database::new(&url, Arc::new(SecretBox::test_key()))
+        .await
+        .expect("an existing database must open");
+
+    // The migration half: the evening survived, and it has a page now.
+    let hist = db.spool_history(1, 50).await.unwrap();
+    assert_eq!(hist.len(), 1);
+    assert_eq!(hist[0].title.as_deref(), Some("An old evening"));
+    assert_eq!(hist[0].notes, None);
+
+    // **No backfill of `present_from`, and that is the correct reading rather
+    // than a saving.** NULL means the whole sitting, which is exactly what
+    // every member of every existing spool was offered — writing `joined_at`
+    // into it would retroactively cut people out of plays they had accepted.
+    let view = db.spool_detail("old", 1).await.unwrap().unwrap();
+    assert_eq!(view.members.len(), 1);
+    assert_eq!(view.members[0].present_from, None);
+
+    // The half that fails silently: a sitting written *after* the migration.
+    let them = db.create_user("kim", None, "pw", "user").await.unwrap();
+    // Adding somebody carries the consent guard, so the fixture has to be a
+    // real patch rather than two accounts that merely exist.
+    let patch = db.request_patch(them, 1).await.unwrap();
+    db.settle_patch(&patch, 1, true).await.unwrap();
+    let uuid = db.start_spool(1, Some("A new one"), &[], &["Tobias".into()]).await.unwrap();
+    assert!(db.update_spool(&uuid, 1, None, Some(Some("wrote about it")), None).await.unwrap());
+    assert_eq!(db.add_spool_members(&uuid, 1, &[them], Some(500)).await.unwrap(), 1);
+
+    let view = db.spool_detail(&uuid, 1).await.unwrap().unwrap();
+    assert_eq!(view.notes.as_deref(), Some("wrote about it"));
+    assert_eq!(view.guests, vec!["Tobias".to_string()]);
+    let added = view.members.iter().find(|m| m.user_id == them).unwrap();
+    assert_eq!(added.present_from, Some(500));
 }

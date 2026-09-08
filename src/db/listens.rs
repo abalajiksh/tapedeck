@@ -606,4 +606,137 @@ impl Database {
 
         Ok((artists, albums, tracks))
     }
+
+    /// Move listens in time.
+    ///
+    /// **An offset over a selection is the shape that matters**, and the
+    /// reason is that it is the shape of the actual failure. A timestamp is
+    /// almost never wrong on its own: a phone's clock was an hour out, an
+    /// evening was reconstructed from a session whose times were laid out by
+    /// arithmetic, or a capture arrived carrying the host's clock rather than
+    /// yours. Every one of those moves a *run* of listens by a *constant*, and
+    /// an offset cannot scramble an ordering the way a set of hand-typed
+    /// absolute times can. A single listen is the same operation over one row.
+    ///
+    /// Four things it takes care of, in the order they bite:
+    ///
+    /// * **`timestamp_original` is written once**, so a second correction does
+    ///   not overwrite the observation the first one replaced. What is worth
+    ///   keeping is what the clock said, not the previous guess at what it
+    ///   should have said.
+    /// * **Nothing is moved onto another listen of the same track.** The unique
+    ///   key is `(user_id, source_id, source_name)`, so the database will
+    ///   happily hold two rows a second apart that `fuzzy_exists` would have
+    ///   collapsed on the way in. Dedup runs at ingest and never again, so a
+    ///   duplicate created here is one nothing will ever reconcile.
+    /// * **Sessions are recomputed**, but only their aggregates — see
+    ///   [`TimeEdit::grouping_stale`].
+    /// * **Already-forwarded rows are counted and reported**, not refused.
+    ///
+    /// One transaction, because a half-applied shift leaves an ordering that
+    /// was never true at any point.
+    pub async fn shift_listen_times(
+        &self,
+        user_id: i64,
+        ids: &[i64],
+        offset: i64,
+    ) -> Result<TimeEdit, sqlx::Error> {
+        if ids.is_empty() || offset == 0 {
+            return Ok(TimeEdit::default());
+        }
+        let marks = std::iter::repeat("?").take(ids.len()).collect::<Vec<_>>().join(",");
+
+        let sql = format!(
+            "SELECT id, timestamp, session_id, status, title, artist
+               FROM scrobbles WHERE user_id = ? AND id IN ({marks})"
+        );
+        let stmt = crate::sql!(&sql);
+        #[allow(clippy::type_complexity)]
+        let mut q = sqlx::query_as::<_, (i64, i64, Option<i64>, String, String, String)>(&stmt)
+            .bind(user_id);
+        for id in ids {
+            q = q.bind(id);
+        }
+        let rows = q.fetch_all(&self.pool).await?;
+        if rows.is_empty() {
+            return Ok(TimeEdit::default());
+        }
+
+        let mut edit = TimeEdit::default();
+        let mut sessions: Vec<i64> = Vec::new();
+        let mut tx = self.pool.begin().await?;
+
+        for (id, timestamp, session_id, status, title, artist) in &rows {
+            let moved_to = timestamp + offset;
+
+            // Would this land on top of another listen of the same track? The
+            // window is the one `fuzzy_exists` uses, and this is the only place
+            // that question gets asked after ingest.
+            let clash: i64 = sqlx::query_scalar(&crate::sql!(
+                "SELECT COUNT(*) FROM scrobbles
+                  WHERE user_id = ? AND id != ?
+                    AND LOWER(TRIM(title)) = LOWER(TRIM(?))
+                    AND LOWER(TRIM(artist)) = LOWER(TRIM(?))
+                    AND timestamp BETWEEN ? AND ?"
+            ))
+            .bind(user_id)
+            .bind(id)
+            .bind(title)
+            .bind(artist)
+            .bind(moved_to - DUPLICATE_WINDOW_SECS)
+            .bind(moved_to + DUPLICATE_WINDOW_SECS)
+            .fetch_one(&mut *tx)
+            .await?;
+            if clash > 0 {
+                continue;
+            }
+
+            sqlx::query(&crate::sql!(
+                "UPDATE scrobbles
+                    SET timestamp = ?, timestamp_original = COALESCE(timestamp_original, ?)
+                  WHERE id = ? AND user_id = ?"
+            ))
+            .bind(moved_to)
+            .bind(timestamp)
+            .bind(id)
+            .bind(user_id)
+            .execute(&mut *tx)
+            .await?;
+
+            edit.moved += 1;
+            if status == "synced" {
+                edit.already_forwarded += 1;
+            }
+            if let Some(sid) = session_id {
+                if !sessions.contains(sid) {
+                    sessions.push(*sid);
+                }
+            }
+        }
+        tx.commit().await?;
+
+        for sid in &sessions {
+            self.recompute_session(*sid).await?;
+            if self.session_has_a_gap(*sid).await? {
+                edit.grouping_stale = true;
+            }
+        }
+        edit.sessions_touched = sessions.len() as i64;
+        Ok(edit)
+    }
+    /// Whether a session now holds a gap wider than the one it was grouped by.
+    ///
+    /// Cheap and exact: one ordered read of the session's own listens, which
+    /// `idx_scrobbles_session` makes a seek. It answers only "does the stored
+    /// grouping still describe this run" — never what the new grouping would
+    /// be, which is `rebuild_sessions`' job and the user's decision.
+    async fn session_has_a_gap(&self, session_id: i64) -> Result<bool, sqlx::Error> {
+        let times: Vec<i64> = sqlx::query_scalar(&crate::sql!(
+            "SELECT timestamp FROM scrobbles WHERE session_id = ? ORDER BY timestamp"
+        ))
+        .bind(session_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(times.windows(2).any(|w| w[1] - w[0] > SESSION_GAP_SECS))
+    }
 }

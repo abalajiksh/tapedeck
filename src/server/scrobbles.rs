@@ -880,6 +880,69 @@ async fn bulk_set_company(
     }
 }
 
+/// The body of `POST /api/v1/scrobbles/bulk-time`.
+#[derive(Debug, Deserialize)]
+pub struct BulkTime {
+    pub ids: Vec<i64>,
+    /// Seconds to move these listens by. Negative moves them earlier.
+    ///
+    /// **An offset rather than an absolute time, and that is the design.** A
+    /// timestamp is almost never wrong on its own: a clock was out by an hour,
+    /// an evening was reconstructed from times laid out by arithmetic, or a
+    /// capture arrived carrying somebody else's clock. Every one of those moves
+    /// a run of listens by a constant, and a constant cannot scramble an
+    /// ordering the way a set of hand-typed times can. Correcting a single
+    /// listen is this operation over one id — the caller subtracts.
+    ///
+    /// Required rather than defaulted: a body that failed to say how far to
+    /// move must not read as zero and report success at having done nothing.
+    pub offset_seconds: Option<i64>,
+}
+
+/// POST /api/v1/scrobbles/bulk-time — move listens in time.
+///
+/// The half of a time correction that cannot be done at the capture stage,
+/// which is where it should be done when it can be — nothing is in a history
+/// there, so none of the traps below apply.
+///
+/// What comes back matters as much as what it does. Neither Last.fm nor
+/// ListenBrainz has an edit API, so a listen that has already been forwarded
+/// keeps the time it was sent with, permanently; and sessions are stored
+/// rather than computed, so their *grouping* is not re-derived here. Both are
+/// reported, because a correction somebody believes reached further than it
+/// did is worse than one they know the edges of.
+async fn bulk_set_time(
+    State(state): State<Arc<AppState>>,
+    user: AuthUser,
+    Json(body): Json<BulkTime>,
+) -> impl IntoResponse {
+    let Some(offset) = body.offset_seconds else {
+        return bad_request(
+            "`offset_seconds` is required — say how far to move these, in seconds.",
+        );
+    };
+    if body.ids.is_empty() {
+        return bad_request("`ids` is required — name the listens.");
+    }
+    if offset == 0 {
+        return bad_request("`offset_seconds` is zero — that would move nothing.");
+    }
+    // A year either way. Not a safety boundary — the edit is reversible by
+    // running it back — but a stray milliseconds-for-seconds mix-up parks a
+    // listen in the wrong decade, where it is out of every range control on
+    // every screen and therefore very hard to find again.
+    if offset.abs() > 366 * 86_400 {
+        return bad_request(
+            "`offset_seconds` is more than a year — that is almost certainly a slip",
+        );
+    }
+
+    match state.db.shift_listen_times(user.user_id, &body.ids, offset).await {
+        Ok(edit) => (StatusCode::OK, Json(edit)).into_response(),
+        Err(e) => server_error(e.to_string()),
+    }
+}
+
 fn bad_request(msg: &str) -> axum::response::Response {
     (
         StatusCode::BAD_REQUEST,
@@ -1648,6 +1711,7 @@ pub fn create_scrobbles_router() -> Router<Arc<AppState>> {
         .route("/api/v1/scrobbles", get(list_scrobbles).delete(clear_scrobbles))
         .route("/api/v1/scrobbles/bulk-chain", axum::routing::post(bulk_set_chain))
         .route("/api/v1/scrobbles/bulk-company", axum::routing::post(bulk_set_company))
+        .route("/api/v1/scrobbles/bulk-time", axum::routing::post(bulk_set_time))
         .route("/api/v1/scrobbles/:id", patch(update_scrobble).delete(delete_scrobble))
         .route("/api/v1/search", get(search))
         .route("/api/v1/skips", get(list_skips))

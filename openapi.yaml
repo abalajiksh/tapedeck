@@ -1975,6 +1975,83 @@ paths:
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
 
+  /api/v1/scrobbles/bulk-time:
+    post:
+      tags: [Listens]
+      summary: Move listens in time.
+      description: |
+        **An offset over a selection, not an absolute time**, and that is the
+        design rather than a limitation. A timestamp is almost never wrong on
+        its own: a clock was out by an hour, an evening was reconstructed from
+        times laid out by arithmetic, or a capture arrived carrying somebody
+        else's clock. Every one of those moves a *run* of listens by a
+        *constant*, and a constant cannot scramble an ordering the way a set of
+        hand-typed times can. Correcting a single listen is this operation over
+        one id — subtract to get the offset.
+
+        Where the listen has not been accepted yet,
+        `PATCH /api/v1/patch/captures/{id}` is the cheaper place to do it:
+        nothing is in a history there, so none of the consequences below apply.
+
+        What it takes care of:
+
+        * **`timestamp_original` is written once**, so a second correction does
+          not overwrite the observation the first one replaced.
+        * **Nothing is moved on top of another listen of the same track.** Dedup
+          runs at ingest and never again, so a duplicate created here is one
+          nothing will ever reconcile. Such a listen is skipped and is not
+          counted in `moved`.
+        * **Sessions are recomputed** — their aggregates, not their grouping.
+
+        What it reports, because it cannot fix them:
+
+        * `already_forwarded` — how many of the moved listens had already gone
+          to Last.fm or ListenBrainz. **Neither has an edit API**, so their copy
+          keeps the time it was sent with, permanently and silently. The edit is
+          still right; a screen that did not say this would let somebody believe
+          they had corrected a public record they had not.
+        * `grouping_stale` — whether a moved listen now sits further from its
+          session's neighbours than the gap those sessions were grouped by.
+          Sessions are stored rather than computed, which is what lets a manual
+          merge survive, and `sessions.uuid` is what a handed-over sitting
+          points at — so re-grouping silently on a time edit would move an
+          identity somebody else holds a reference to. Rebuild stays something
+          the user asks for.
+      security: [{ sessionCookie: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [ids, offset_seconds]
+              properties:
+                ids:
+                  type: array
+                  items: { type: integer }
+                offset_seconds:
+                  type: integer
+                  description: |
+                    Seconds to move by; negative moves earlier. Required — a
+                    body that failed to say how far must not read as zero and
+                    report success at having done nothing. Refused beyond a
+                    year either way, which is almost always a
+                    milliseconds-for-seconds slip.
+      responses:
+        '200':
+          description: What moved, and what could not be reached.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  moved: { type: integer }
+                  already_forwarded: { type: integer }
+                  sessions_touched: { type: integer }
+                  grouping_stale: { type: boolean }
+        '400': { description: No ids, no offset, a zero offset, or one beyond a year. }
+        '401': { description: Not signed in. }
+
   /api/v1/scrobbles/bulk-company:
     post:
       tags: [Listens]
@@ -3443,12 +3520,286 @@ paths:
                   type: array
                   items: { type: string }
                   description: Usernames to invite.
+                guests:
+                  type: array
+                  items: { type: string }
+                  description: |
+                    Names of people in the room with no account here. They get
+                    no captures and no inbox — there is nobody to offer
+                    anything to — but they are named in the company of every
+                    play the sitting fans out.
       responses:
         '200': { description: The sitting's uuid. }
         '401': { description: Not signed in. }
         '403': { description: One of the named decks is not patched with you. Nothing was started. }
         '404': { description: One of the named decks does not exist. }
         '409': { description: You already have a sitting running. }
+
+  /api/v1/patch/spools:
+    get:
+      tags: [Patch]
+      summary: Every sitting you were in, newest first.
+      description: |
+        **Membership is the gate, not the patch.** A sitting is an evening you
+        were in the room for, and un-patching from the host afterwards has no
+        standing to un-happen it — the same argument as "no delete sweep on
+        un-patching". Your own accepted listens from that evening stay in your
+        history whatever happens to the patch, and a history row whose sitting
+        has vanished is a row with nothing to explain it.
+
+        That widening does **not** widen what any of it shows: a sitting still
+        only ever renders the plays the per-chain sharing switch allows, and
+        `withheld` on the detail below says how many it did not.
+
+        A sitting you declined does not appear. You were not there.
+      security: [{ sessionCookie: [] }]
+      parameters:
+        - in: query
+          name: limit
+          schema: { type: integer, default: 50, minimum: 1, maximum: 200 }
+      responses:
+        '200':
+          description: The sittings.
+          content:
+            application/json:
+              schema: { type: object, additionalProperties: true }
+        '401': { description: Not signed in. }
+
+  /api/v1/patch/spools/{uuid}:
+    get:
+      tags: [Patch]
+      summary: One sitting, in full.
+      description: |
+        The roster with each person's span, the joint timeline, and a count of
+        what is not on it.
+
+        **The timeline is one row per play, not one per listen.** A joint listen
+        is N rows sharing a `joint_session_id`, one per person in the room, so
+        the naive read shows an evening at twice its length as soon as somebody
+        accepts their half. Each row's `standing` is the caller's own relation
+        to that play — `mine`, `accepted`, `declined`, `pending`, or `theirs`
+        for a play from a deck in the room that was never offered to you.
+        Declined and never-answered are told apart deliberately: both mean "not
+        in my history" and they are not the same decision.
+
+        `withheld` counts plays that happened in this sitting and are not shown,
+        because they ran through chains their owner does not share. Stated
+        rather than dropped — a document with invisible holes misrepresents the
+        evening and the reader could never tell.
+      security: [{ sessionCookie: [] }]
+      parameters:
+        - in: path
+          name: uuid
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: The sitting.
+          content:
+            application/json:
+              schema: { type: object, additionalProperties: true }
+        '401': { description: Not signed in. }
+        '404': { description: No sitting of yours with that id. Same answer as one somebody else was in. }
+    patch:
+      tags: [Patch]
+      summary: Name a sitting, write about it, or say who else was there.
+      description: |
+        **The host's, and editable after the fact on purpose.** `title` used to
+        be settable once, at the start — which is the moment you know least
+        about an evening.
+
+        `title` and `notes` distinguish absent from null: an absent field is
+        left alone and an explicit null clears it. A body naming none of the
+        three is a 400 rather than a no-op reported as success.
+
+        Changing `guests` does **not** rewrite the company on plays already
+        fanned out. Those snapshots were accurate when they were taken.
+      security: [{ sessionCookie: [] }]
+      parameters:
+        - in: path
+          name: uuid
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                title: { type: string, nullable: true }
+                notes: { type: string, nullable: true }
+                guests:
+                  type: array
+                  items: { type: string }
+      responses:
+        '200': { description: Saved. }
+        '400': { description: No field named. }
+        '401': { description: Not signed in. }
+        '404': { description: No sitting of yours with that id. }
+
+  /api/v1/patch/spools/{uuid}/members:
+    post:
+      tags: [Patch]
+      summary: Add people to a sitting that has already started, or ended.
+      description: |
+        The guest list used to be frozen at the moment the sitting opened, which
+        is wrong about how an evening goes: somebody arrives, somebody's deck
+        comes on, or the host simply forgot one of the people in front of them.
+
+        `present_from` answers "from when", and it is stated rather than
+        inferred from the clock:
+
+        * **absent** — they were here all along, and are offered the whole
+          evening. This is the common case by a distance.
+        * **a timestamp** — they arrived then, and the backlog is bounded by it.
+
+        **Host only.** The rule that you may only invite a deck *you* are
+        patched with is what stops a guest bringing somebody the host has never
+        patched with into a room where the host's plays are being published.
+        One stranger in `with` refuses the whole call.
+
+        Somebody already in the sitting is left exactly as they are — re-adding
+        must not walk a `declined` back to `invited`.
+      security: [{ sessionCookie: [] }]
+      parameters:
+        - in: path
+          name: uuid
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [with]
+              properties:
+                with:
+                  type: array
+                  items: { type: string }
+                present_from: { type: integer, nullable: true }
+      responses:
+        '200': { description: How many were added. }
+        '400': { description: No decks named. }
+        '401': { description: Not signed in. }
+        '403': { description: One of the named decks is not patched with you. Nothing was added. }
+        '404': { description: No sitting of yours with that id, or no deck by that name. }
+
+  /api/v1/patch/spools/{uuid}/presence:
+    put:
+      tags: [Patch]
+      summary: Correct when you were in the room.
+      description: |
+        Yours to set, because you are the one who knows. Everything it decides
+        is about your own inbox — how much of the evening you are offered — so
+        there is nothing here to overreach with.
+
+        Both fields distinguish absent from null; clearing `present_from` back
+        to null means "I was here the whole time".
+
+        Widening your presence offers you the plays you have just said you
+        heard. Narrowing it withdraws no offer already made: an offer is a
+        question somebody asked you, and it stays yours to answer.
+      security: [{ sessionCookie: [] }]
+      parameters:
+        - in: path
+          name: uuid
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                present_from: { type: integer, nullable: true }
+                present_until: { type: integer, nullable: true }
+      responses:
+        '200': { description: How many plays this has now put in your inbox. }
+        '400': { description: No field named. }
+        '401': { description: Not signed in. }
+        '404': { description: No sitting of yours with that id. }
+
+  /api/v1/patch/captures/{id}:
+    patch:
+      tags: [Patch]
+      summary: Fix when a capture was played, before it becomes a listen.
+      description: |
+        **The cheapest correction in the application.** A capture is an offer
+        and not a record, so nothing is in a history, nothing has been forwarded
+        to anybody's Last.fm, no session has been grouped around it and no dedup
+        window has been drawn against it. Every trap that makes editing a
+        *listen's* timestamp delicate arrives only once it has been accepted.
+
+        A capture carries the **host's** clock, which is the ordinary way one
+        comes to be wrong.
+
+        Pending only. A settled capture has either become a listen — where
+        `POST /api/v1/scrobbles/bulk-time` is the thing to reach for — or been
+        declined, and re-timing a refusal changes nothing.
+      security: [{ sessionCookie: [] }]
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: integer }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [played_at]
+              properties:
+                played_at: { type: integer }
+      responses:
+        '200': { description: Saved. }
+        '400': { description: No `played_at`. }
+        '401': { description: Not signed in. }
+        '404': { description: No offer of yours with that id still waiting. }
+
+  /api/v1/profile/spool-chain:
+    get:
+      tags: [Profile]
+      summary: The chain an accepted Shared Spool play is filed under.
+      security: [{ sessionCookie: [] }]
+      responses:
+        '200': { description: '`chain_id`, or null.' }
+        '401': { description: Not signed in. }
+    put:
+      tags: [Profile]
+      summary: Name the chain a room you sat in is filed under.
+      description: |
+        A capture used to land with no chain at all, so those listens earned no
+        gear hours, carried no fidelity and could never reach the Reel. That was
+        defensible — it was not your gear — and it was not the whole truth
+        either: you were in the room hearing real speakers, and if you have
+        built a chain that says so it should get the hours.
+
+        Unset is the default and reproduces the old behaviour exactly.
+
+        `chain_id` is required and an absent field is a **400**: this decides
+        where every play you accept out of a room lands, so a misspelled key
+        must not read as "clear it". Explicit null clears it.
+
+        Session-only. A scrobble client has no business deciding this.
+      security: [{ sessionCookie: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [chain_id]
+              properties:
+                chain_id: { type: integer, nullable: true }
+      responses:
+        '200': { description: Saved. }
+        '400': { description: '`chain_id` absent.' }
+        '401': { description: Not signed in. }
+        '404': { description: No chain of yours with that id. }
 
   /api/v1/patch/spool/{uuid}/join:
     post:

@@ -1203,6 +1203,59 @@ impl Database {
             }
         }
 
+        // Migration: a sitting is a thing you can come back to.
+        //
+        // Everything a Shared Spool needed for a page of its own was already
+        // stored — a host, a span, a roster with join times, captures in three
+        // states, and the listens tied by `joint_session_id`. What was missing
+        // was any query that returned an *ended* one: `active_spool` was the
+        // only reader of the table, so closing a sitting made the evening
+        // disappear from every screen in the application. These columns are
+        // what turn it from a transient into a record.
+        if !has_column(&self.pool, "spools", "notes").await {
+            info!("⚙️ Migrating: a Shared Spool can be written about...");
+            for col in &["notes TEXT", "guests TEXT"] {
+                let _ = sqlx::query(&format!("ALTER TABLE spools ADD COLUMN {col}"))
+                    .execute(&self.pool)
+                    .await;
+            }
+        }
+
+        // **No backfill, and that is the correct reading rather than a saving.**
+        // NULL means "from the start of the sitting", which is exactly what
+        // every member of every existing spool got: `offer_spool_backlog` has
+        // always replayed the whole evening to whoever joined. Writing
+        // `joined_at` into `present_from` here would retroactively cut those
+        // people out of plays they were offered and in many cases accepted.
+        if !has_column(&self.pool, "spool_members", "present_from").await {
+            info!("⚙️ Migrating: when somebody was actually in the room...");
+            for col in &["present_from INTEGER", "present_until INTEGER"] {
+                let _ = sqlx::query(&format!("ALTER TABLE spool_members ADD COLUMN {col}"))
+                    .execute(&self.pool)
+                    .await;
+            }
+        }
+
+        // What the clock said before a hand edit. Written once, so a row that
+        // already carries one is not overwritten by a second correction — the
+        // original observation is the thing worth keeping, not the last guess.
+        if !has_column(&self.pool, "scrobbles", "timestamp_original").await {
+            info!("⚙️ Migrating: keeping what the clock said before it was corrected...");
+            let _ = sqlx::query("ALTER TABLE scrobbles ADD COLUMN timestamp_original INTEGER")
+                .execute(&self.pool)
+                .await;
+        }
+
+        // The chain an accepted Shared Spool play is filed under. Unset for
+        // every account that predates it, which reproduces the old behaviour
+        // exactly — those listens carried no chain at all.
+        if !has_column(&self.pool, "users", "spool_chain_id").await {
+            info!("⚙️ Migrating: a chain for the room you were in...");
+            let _ = sqlx::query("ALTER TABLE users ADD COLUMN spool_chain_id INTEGER")
+                .execute(&self.pool)
+                .await;
+        }
+
         // Migration: a stable id on every table a replica has to agree about.
         //
         // Nothing reads these yet, and that is the point. The argument is the

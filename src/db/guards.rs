@@ -123,6 +123,21 @@ const EXEMPT: &[(&str, &str)] = &[
     ("list_sessions", "the session list, joined on session_id — same reason"),
     ("recompute_session", "recomputes a session's aggregates from its own rows"),
     ("session_scrobbles", "one session's listens by session_id"),
+    (
+        "session_has_a_gap",
+        "one session's listens by session_id, to ask whether a \
+                          time edit has left the stored grouping stale",
+    ),
+    // ── Editing a listen, which is about the row and not about listening ──
+    (
+        "shift_listen_times",
+        "moves listens named by id. A skip has a timestamp \
+                            that can be as wrong as any other, and correcting \
+                            it is not counting it; the duplicate check beside \
+                            it is dedup-shaped and unfiltered for the reason \
+                            `fuzzy_exists` is — a skip still occupies its slot \
+                            and a listen must not be moved on top of one",
+    ),
     // ── Not about listening at all ────────────────────────────────────────
     ("has_column", "probes the schema; the row is never read"),
 ];

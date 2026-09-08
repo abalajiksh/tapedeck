@@ -694,7 +694,7 @@ pub async fn submit_listens(
                                     chain_id,
                                     quality.quality_score,
                                     listening_context.as_deref().unwrap_or("unknown"),
-                                    1800,
+                                    crate::db::SESSION_GAP_SECS,
                                     token_id,
                                 )
                                 .await
