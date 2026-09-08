@@ -8450,10 +8450,7 @@ async fn a_sitting_is_one_row_per_play_however_many_decks_were_in_it() {
     assert_eq!(hist.len(), 1);
     assert_eq!(hist[0].plays, 2);
     assert_eq!(hist[0].pending, 0);
-    assert!(
-        hist[0].present.iter().any(|n| n == "kim"),
-        "the other deck was in the room"
-    );
+    assert!(hist[0].present.iter().any(|n| n == "kim"), "the other deck was in the room");
     assert!(
         !hist[0].present.iter().any(|n| n == "ash"),
         "and the summary leaves the reader out — it exists to write 'with Kim'"
@@ -9008,4 +9005,52 @@ async fn an_existing_database_gains_a_sittings_history() {
     assert_eq!(view.guests, vec!["Tobias".to_string()]);
     let added = view.members.iter().find(|m| m.user_id == them).unwrap();
     assert_eq!(added.present_from, Some(500));
+}
+
+/// A capture re-timed still belongs to the play it came from.
+///
+/// The timeline matched captures to plays on `(played_at, title)`, and
+/// `set_capture_time` exists precisely so a host's wrong clock can be
+/// corrected — so the moment anybody used it, the offer stopped matching its
+/// own play and the row read "not offered" while a Keep button should have
+/// been on it. Found by re-timing one on a running instance, which is the only
+/// place it could have been found.
+#[tokio::test]
+async fn re_timing_an_offer_does_not_orphan_it_from_its_play() {
+    let db = testdb().await;
+    let (me, them, chain) = patched_pair(&db).await;
+    let spool = db.start_spool(them, None, &[me], &[]).await.unwrap();
+    db.set_spool_membership(&spool, me, true).await.unwrap();
+    listen(&db, them, Some(chain), "Teardrop", "Massive Attack", 1_760_000_000).await;
+
+    let cap = db.spool_captures(me).await.unwrap().remove(0);
+    assert!(db.set_capture_time(me, cap.id, 1_760_003_600).await.unwrap());
+
+    let view = db.spool_detail(&spool, me).await.unwrap().unwrap();
+    assert_eq!(view.plays.len(), 1);
+    assert_eq!(
+        view.plays[0].standing, "pending",
+        "the offer is still yours to answer — correcting its clock said nothing about that"
+    );
+    assert_eq!(view.plays[0].capture_id, Some(cap.id));
+}
+
+/// Two plays of one track in an evening take one offer each.
+///
+/// Nearest-time-wins is what separates them, and claiming each capture once is
+/// what stops the second play taking the first's.
+#[tokio::test]
+async fn a_track_played_twice_gets_an_offer_each() {
+    let db = testdb().await;
+    let (me, them, chain) = patched_pair(&db).await;
+    let spool = db.start_spool(them, None, &[me], &[]).await.unwrap();
+    db.set_spool_membership(&spool, me, true).await.unwrap();
+    listen(&db, them, Some(chain), "Teardrop", "Massive Attack", 1_760_000_000).await;
+    listen(&db, them, Some(chain), "Teardrop", "Massive Attack", 1_760_007_200).await;
+
+    let view = db.spool_detail(&spool, me).await.unwrap().unwrap();
+    assert_eq!(view.plays.len(), 2);
+    let ids: Vec<Option<i64>> = view.plays.iter().map(|p| p.capture_id).collect();
+    assert!(ids.iter().all(Option::is_some), "both were offered");
+    assert_ne!(ids[0], ids[1], "and the second play did not take the first's offer");
 }

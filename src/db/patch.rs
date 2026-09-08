@@ -1792,8 +1792,8 @@ impl Database {
         .fetch_all(&self.pool)
         .await?;
 
-        let captures: Vec<(i64, i64, String, String)> = sqlx::query_as(&crate::sql!(
-            "SELECT cap.id, cap.played_at, cap.title, cap.state
+        let captures: Vec<(i64, i64, String, String, i64)> = sqlx::query_as(&crate::sql!(
+            "SELECT cap.id, cap.played_at, cap.title, cap.state, cap.from_user_id
                FROM spool_captures cap JOIN spools sp ON sp.id = cap.spool_id
               WHERE cap.user_id = ? AND sp.uuid = ?"
         ))
@@ -1801,10 +1801,23 @@ impl Database {
         .bind(uuid)
         .fetch_all(&self.pool)
         .await?;
-        let by_play: HashMap<(i64, String), (i64, String)> = captures
-            .into_iter()
-            .map(|(cid, at, title, state)| ((at, title.to_lowercase()), (cid, state)))
-            .collect();
+
+        // **Matched on who played it and what, then on nearest time — not on
+        // the time alone.** A capture carries the *host's* clock, and
+        // `set_capture_time` exists precisely so it can be corrected; the
+        // moment it is, the capture no longer shares a timestamp with the
+        // listen it came from. Keying on the pair therefore reported a play
+        // with a pending offer against it as one that was never offered, which
+        // is the opposite of what it means and hides the row's own Keep
+        // button. Found by re-timing one on a running instance.
+        //
+        // Nearest-time-wins is what separates two plays of the same track in
+        // one evening, and each capture is claimed once so the second play
+        // cannot take the first's.
+        let mut by_track: HashMap<(i64, String), Vec<(i64, i64, String)>> = HashMap::new();
+        for (cid, at, title, state, from) in captures {
+            by_track.entry((from, title.to_lowercase())).or_default().push((cid, at, state));
+        }
 
         let mut plays: Vec<SpoolPlay> = Vec::new();
         let mut withheld = 0i64;
@@ -1849,15 +1862,23 @@ impl Database {
             let (standing, capture_id) = if mine {
                 ("mine".to_string(), None)
             } else {
-                match by_play.get(&key) {
-                    Some((cid, state)) => (
+                let slot = by_track.get_mut(&(*owner, title.to_lowercase())).and_then(|cands| {
+                    let best = cands
+                        .iter()
+                        .enumerate()
+                        .min_by_key(|(_, (_, cap_at, _))| (cap_at - at).abs())
+                        .map(|(i, _)| i)?;
+                    Some(cands.remove(best))
+                });
+                match slot {
+                    Some((cid, _, state)) => (
                         match state.as_str() {
                             "accepted" => "accepted",
                             "declined" => "declined",
                             _ => "pending",
                         }
                         .to_string(),
-                        Some(*cid),
+                        Some(cid),
                     ),
                     // A play from a deck in the room that was never offered to
                     // you — you had not joined yet, or you were not in that
