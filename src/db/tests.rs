@@ -8667,18 +8667,28 @@ async fn answering_an_old_inbox_does_not_publish_into_tonights_room() {
     db.set_chain_shared(me, mine, true).await.unwrap();
     assert!(db.set_spool_chain(me, Some(mine)).await.unwrap());
 
+    // **Forwarding on, and a play from this week.** Without both, accepting
+    // files the listen as `imported` and the fan-out is never reached at all —
+    // so this would be asserting an empty inbox that was empty for a reason
+    // having nothing to do with the guard. It was written that way first, and
+    // breaking the guard did not fail it.
+    db.set_forward_spool_listens(me, true).await.unwrap();
+    let recent = Database::now_secs() as u64 - 3600;
+
     let last_week = db.start_spool(them, Some("Last week"), &[me], &[]).await.unwrap();
     db.set_spool_membership(&last_week, me, true).await.unwrap();
-    listen(&db, them, Some(chain), "Teardrop", "Massive Attack", 1_760_000_000).await;
+    listen(&db, them, Some(chain), "Teardrop", "Massive Attack", recent).await;
     let waiting: Vec<i64> =
         db.spool_captures(me).await.unwrap().into_iter().map(|c| c.id).collect();
+    assert_eq!(waiting.len(), 1);
     db.end_spool(&last_week, them).await.unwrap();
 
     // Tonight, I am hosting.
     let tonight = db.start_spool(me, Some("Tonight"), &[them], &[]).await.unwrap();
     db.set_spool_membership(&tonight, them, true).await.unwrap();
 
-    db.settle_captures(me, &waiting, true).await.unwrap();
+    let (settled, forwarded) = db.settle_captures(me, &waiting, true).await.unwrap();
+    assert_eq!((settled, forwarded), (1, 1), "it relayed, so it was not filed as imported");
 
     assert_eq!(
         db.spool_captures(them).await.unwrap().len(),
