@@ -1777,11 +1777,12 @@ impl Database {
             Option<String>,
             Option<i64>,
             Option<String>,
+            String,
         )> = sqlx::query_as(&crate::sql!(
             "SELECT s.user_id, u.username, u.display_name, s.title, s.artist, s.album,
                     s.duration, s.timestamp, s.source_name,
                     CASE WHEN c.shared = 1 THEN 1 ELSE 0 END,
-                    s.artwork_url, s.caa_id, s.caa_release_mbid
+                    s.artwork_url, s.caa_id, s.caa_release_mbid, s.source_id
                FROM scrobbles s
                JOIN users u ON u.id = s.user_id
                LEFT JOIN signal_chains c ON c.id = s.chain_id
@@ -1821,8 +1822,10 @@ impl Database {
 
         let mut plays: Vec<SpoolPlay> = Vec::new();
         let mut withheld = 0i64;
-        let mut copies: Vec<&(_, _, _, _, _, _, _, _, _, _, _, _, _)> = Vec::new();
-        let mut seen: Vec<(i64, String)> = Vec::new();
+        let mut copies: Vec<&(_, _, _, _, _, _, _, _, _, _, _, _, _, _)> = Vec::new();
+        // The offers already accounted for on the timeline, so an accepted copy
+        // of one is not drawn a second time beside it.
+        let mut claimed: Vec<i64> = Vec::new();
 
         for row in &rows {
             let (
@@ -1839,6 +1842,7 @@ impl Database {
                 artwork_url,
                 caa_id,
                 caa_release_mbid,
+                _source_id,
             ) = row;
             let mine = *owner == user_id;
             if source_name == "Shared Spool" {
@@ -1858,7 +1862,6 @@ impl Database {
                 continue;
             }
 
-            let key = (*at, title.to_lowercase());
             let (standing, capture_id) = if mine {
                 ("mine".to_string(), None)
             } else {
@@ -1887,7 +1890,9 @@ impl Database {
                     None => ("theirs".to_string(), None),
                 }
             };
-            seen.push(key);
+            if let Some(cid) = capture_id {
+                claimed.push(cid);
+            }
             plays.push(SpoolPlay {
                 title: title.clone(),
                 artist: artist.clone(),
@@ -1905,9 +1910,16 @@ impl Database {
         }
 
         // The accepted copies whose original went out of view.
+        //
+        // Matched back to the offer they came from **by its id**, which
+        // `settle_captures` writes into `source_id` as `spool-<uuid>-<capture>`
+        // — exact, where matching on time is not. A capture's clock can be
+        // corrected before it is accepted, and then the copy and the original
+        // genuinely disagree about when the play happened; both are true
+        // records and it is still one play, so it is still one row.
         for row in copies {
-            let key = (row.7, row.3.to_lowercase());
-            if seen.contains(&key) {
+            let from_offer = row.13.rsplit('-').next().and_then(|tail| tail.parse::<i64>().ok());
+            if from_offer.is_some_and(|cid| claimed.contains(&cid)) {
                 continue;
             }
             plays.push(SpoolPlay {

@@ -9054,3 +9054,40 @@ async fn a_track_played_twice_gets_an_offer_each() {
     assert!(ids.iter().all(Option::is_some), "both were offered");
     assert_ne!(ids[0], ids[1], "and the second play did not take the first's offer");
 }
+
+/// An offer re-timed and then accepted is still one row, not two.
+///
+/// The copy `settle_captures` writes carries the *corrected* time, so it no
+/// longer shares a timestamp with the original — and matching the two on time
+/// drew both, which is the doubling the whole timeline exists to avoid, in the
+/// one case where it is least obvious. Matched on the offer's id instead, which
+/// `settle_captures` writes into `source_id`.
+#[tokio::test]
+async fn a_re_timed_offer_accepted_is_still_one_row() {
+    let db = testdb().await;
+    let (me, them, chain) = patched_pair(&db).await;
+    let spool = db.start_spool(them, None, &[me], &[]).await.unwrap();
+    db.set_spool_membership(&spool, me, true).await.unwrap();
+    listen(&db, them, Some(chain), "Teardrop", "Massive Attack", 1_760_000_000).await;
+
+    let cap = db.spool_captures(me).await.unwrap().remove(0);
+    db.set_capture_time(me, cap.id, 1_760_009_000).await.unwrap();
+    db.settle_captures(me, &[cap.id], true).await.unwrap();
+
+    // Two listens, by design — one per person in the room, and they now
+    // disagree about the clock because one of them was corrected.
+    let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM scrobbles WHERE joint_session_id = ?")
+        .bind(&spool)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(rows, 2);
+
+    let view = db.spool_detail(&spool, me).await.unwrap().unwrap();
+    assert_eq!(
+        view.plays.len(),
+        1,
+        "one play happened, so one row — the copy is the same play under a corrected clock"
+    );
+    assert_eq!(view.plays[0].standing, "accepted");
+}

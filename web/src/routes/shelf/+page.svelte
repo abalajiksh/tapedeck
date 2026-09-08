@@ -1698,30 +1698,31 @@
 			<button class="btn btn-secondary" on:click={() => saveSpinning(null)}>Cancel</button>
 		</div>
 	</div>
-	<!--
-		**The shelf is where the record player is**, and it is the one surface
-		that knew nothing about Shared Spools — you could drop a needle in a
-		room with three people and get no sign that a sitting was capturing, or
-		that one could be.
+{/if}
 
-		It reports rather than starting one. Opening a sitting needs a guest
-		list, and a second copy of that dialog is a second place for the consent
-		guard and the "from when" question to drift — so this says what is
-		happening and points at the page that owns it.
-	-->
-	{#if sitting}
-		<a class="spoolbar" href="/patch">
-			<span class="sp-dot"></span>
-			<span
-				>Capturing into <strong>{sitting.title || 'a Shared Spool'}</strong> — every side
-				you record is offered to everyone in it.</span
-			>
-		</a>
-	{:else if canSpool}
-		<a class="spoolbar quiet" href="/patch">
-			<span>Listening with somebody? Start a Shared Spool →</span>
-		</a>
-	{/if}
+<!--
+	**The shelf is where the record player is**, and it is the one surface
+	that knew nothing about Shared Spools — you could drop a needle in a
+	room with three people and get no sign that a sitting was capturing, or
+	that one could be.
+
+	It reports rather than starting one. Opening a sitting needs a guest
+	list, and a second copy of that dialog is a second place for the consent
+	guard and the "from when" question to drift — so this says what is
+	happening and points at the page that owns it.
+-->
+{#if sitting}
+	<a class="spoolbar" href="/patch">
+		<span class="sp-dot"></span>
+		<span
+			>Capturing into <strong>{sitting.title || 'a Shared Spool'}</strong> — every side
+			you record is offered to everyone in it.</span
+		>
+	</a>
+{:else if canSpool}
+	<a class="spoolbar quiet" href="/patch">
+		<span>Listening with somebody? Start a Shared Spool →</span>
+	</a>
 {/if}
 
 {#if !spinning}

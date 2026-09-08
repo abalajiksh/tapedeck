@@ -330,8 +330,15 @@
 						/>
 						<div class="pmain">
 							<div class="ptitle">{p.title}</div>
+							<!--
+								The separator lives inside the expression, not at
+								the start of the block: Svelte trims leading
+								whitespace in an `{#if}` body, so `{#if x} — {x}`
+								renders as `Artist— Album`. Third time in this
+								codebase (v0.96.1, v0.101.0).
+							-->
 							<div class="partist">
-								{p.artist}{#if p.album} — {p.album}{/if}
+								{p.artist}{#if p.album}{` — ${p.album}`}{/if}
 							</div>
 						</div>
 						<div class="pside">
