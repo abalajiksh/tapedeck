@@ -23,6 +23,7 @@ pub mod card;
 pub mod fonts;
 pub mod layout;
 pub mod month;
+pub mod sitting;
 pub mod svg;
 pub mod theme;
 pub mod week;
@@ -30,6 +31,7 @@ pub mod year;
 
 pub use card::Card;
 pub use layout::{Size, Unit};
+pub use sitting::SittingCard;
 pub use theme::Theme;
 
 /// What a render produced, and what it could not promise about it.
@@ -87,10 +89,28 @@ pub fn render(c: &Card, unit: Unit, size: Size, theme: Theme) -> Result<Rendered
         Unit::Year => year::render_measured(c, size, theme),
     };
 
+    rasterise(drawn, size)
+}
+
+/// Draw an evening and rasterise it.
+///
+/// A separate entry rather than a fourth `Unit`, because a sitting is not a
+/// period — see `sitting.rs`. Everything below the composition is shared, which
+/// is the half worth sharing: one font database, one rasteriser, one set of
+/// failure modes.
+pub fn render_sitting(c: &SittingCard, size: Size, theme: Theme) -> Result<Rendered, RenderError> {
+    let drawn = sitting::render_measured(c, size, theme);
+    rasterise(drawn, size)
+}
+
+/// Turn a drawn document into a PNG. Shared so the two entries above cannot
+/// come to disagree about fonts or pixmap size.
+fn rasterise(drawn: layout::Drawn, size: Size) -> Result<Rendered, RenderError> {
+    // The default font family is whatever the host calls sans-serif. Ours is
+    // embedded and is the only one whose metrics the layouts were measured
+    // against.
     let mut opt =
         usvg::Options { fontdb: std::sync::Arc::new(fonts::db().clone()), ..Default::default() };
-    // The default is whatever face the host calls sans-serif. Ours is embedded
-    // and is the only one whose metrics the layout above was measured against.
     opt.font_family = fonts::BODY.to_string();
 
     let tree =
@@ -221,6 +241,107 @@ mod tests {
                 }
             }
         }
+        let sitting = SittingCard::sample();
+        for size in [Size::Story, Size::Square, Size::Wide] {
+            for theme in [Theme::Dark, Theme::Light] {
+                let r = render_sitting(&sitting, size, theme).expect("render");
+                let path = format!("{dir}/sitting-{}-{}.png", size.as_str(), theme.as_str());
+                std::fs::write(&path, &r.png).expect("write");
+                println!("{path} ({} bytes)", r.png.len());
+            }
+        }
+    }
+
+    /// A sitting rasterises at every shape and both themes, and is actually
+    /// drawn rather than a flat rectangle.
+    ///
+    /// The two guards the report cards already carry, applied to the fourth
+    /// composition — a document usvg failed to lay out still encodes perfectly
+    /// well, as a blank pixmap of exactly the right size.
+    #[test]
+    fn a_sitting_rasterises_at_every_shape_and_is_actually_drawn() {
+        let c = SittingCard::sample();
+        for size in [Size::Story, Size::Square, Size::Wide] {
+            for theme in [Theme::Dark, Theme::Light] {
+                let r = render_sitting(&c, size, theme).expect("render");
+                let (w, h) = size.dims();
+                assert_eq!(&r.png[..8], b"\x89PNG\r\n\x1a\n", "{size:?}/{theme:?}");
+                let px = u32::from_be_bytes(r.png[16..20].try_into().unwrap());
+                let py = u32::from_be_bytes(r.png[20..24].try_into().unwrap());
+                assert_eq!((px, py), (w as u32, h as u32), "{size:?}");
+                assert!(r.fully_covered, "a Latin card must be fully covered");
+            }
+        }
+
+        let r = render_sitting(&c, Size::Square, Theme::Dark).expect("render");
+        let pix = tiny_skia::Pixmap::decode_png(&r.png).expect("decode");
+        let mut seen = std::collections::HashSet::new();
+        for p in pix.pixels() {
+            seen.insert((p.red(), p.green(), p.blue()));
+            if seen.len() > 32 {
+                break;
+            }
+        }
+        assert!(seen.len() > 32, "only {} distinct colours — nothing was drawn", seen.len());
+    }
+
+    /// An evening that reported no running time says nothing about one.
+    ///
+    /// Nothing reported a length and "no time passed" are different statements,
+    /// and only one of them is ever true of an evening somebody sat through —
+    /// the em-dash discipline the quality card already follows, which is why
+    /// `running()` returns `None` rather than a zero to format.
+    #[test]
+    fn an_evening_with_no_running_time_does_not_claim_one() {
+        let mut c = SittingCard::sample();
+        c.seconds = 0;
+        c.duration_known = 0;
+        assert_eq!(c.running(), None);
+        assert!(render_sitting(&c, Size::Story, Theme::Dark).is_ok());
+
+        // And a sitting of one play is a record rather than records.
+        let mut one = SittingCard::sample();
+        one.plays = 1;
+        assert!(render_sitting(&one, Size::Square, Theme::Light).is_ok());
+    }
+
+    /// A record too long to fit is shortened, never silently dropped.
+    ///
+    /// `facts` skips a line it cannot fit, which is right for a fact nobody
+    /// promised and wrong under a count: the record would disappear *and* the
+    /// "and N more" beneath it would undercount by exactly the ones that
+    /// vanished, so the card would quietly claim a shorter evening.
+    #[test]
+    fn a_long_record_title_is_shortened_rather_than_dropped() {
+        let mut c = SittingCard::sample();
+        c.played = vec![
+            (
+                "The Rise and Fall of a Midwest Princess (Deluxe Edition)".into(),
+                "Somebody With a Very Long Name Indeed".into(),
+            ),
+            ("Untrue".into(), "Burial".into()),
+        ];
+        let drawn = sitting::render_measured(&c, Size::Story, Theme::Dark);
+        assert!(
+            drawn.svg.contains('…'),
+            "the long title should be ellipsised into the card, not left out of it"
+        );
+        assert!(drawn.svg.contains("Untrue"), "and the rest of the list still drew");
+    }
+
+    /// A guest list is capped rather than allowed to become a paragraph.
+    #[test]
+    fn the_company_line_is_a_sentence_and_not_a_roster() {
+        let names = |n: usize| {
+            let mut c = SittingCard::sample();
+            c.with = (0..n).map(|i| format!("Person{i}")).collect();
+            c.company()
+        };
+        assert_eq!(names(0), "On your own");
+        assert_eq!(names(1), "with Person0");
+        assert_eq!(names(2), "with Person0 and Person1");
+        assert_eq!(names(3), "with Person0, Person1 and Person2");
+        assert_eq!(names(6), "with Person0, Person1 and 4 others");
     }
 
     /// A Hangul title is rendered rather than refused, and the result says the

@@ -15,8 +15,10 @@
 	import { api, humanError } from '$lib/api';
 	import type { SpoolDetail, SpoolMember, SpoolPlay, PatchPeer } from '$lib/api';
 	import CoverArt from '$lib/components/CoverArt.svelte';
+	import ShareChapter from '$lib/components/reports/ShareChapter.svelte';
 
 	let sitting: SpoolDetail | null = null;
+	let sharing = false;
 	let loading = true;
 	let error = '';
 	let notice = '';
@@ -81,6 +83,31 @@
 		const rest = m % 60;
 		return rest ? `${h}h ${rest}m` : `${h}h`;
 	}
+
+	// ── What the evening came to ─────────────────────────────────────────
+	//
+	// **A sitting is the one thing here that has an ending**, and ending one
+	// used to just stop it. These are what turn the stop into a summary, and
+	// every one is folded out of the timeline the page is already holding.
+	function running(f: { seconds: number; duration_known: number }) {
+		// Nothing reported a length and "no time passed" are different
+		// statements, and only one is ever true of an evening somebody sat
+		// through. The em-dash discipline, rather than a confident 0h.
+		if (!f.duration_known || f.seconds <= 0) return '—';
+		const m = Math.round(f.seconds / 60);
+		if (m < 60) return `${m} min`;
+		const h = Math.floor(m / 60);
+		const rest = m % 60;
+		return rest ? `${h}h ${rest}m` : `${h}h`;
+	}
+
+	// The running time is a **floor** — a play whose source reported no length
+	// contributes nothing — so it says what it is a total of rather than
+	// presenting itself as the evening's length.
+	$: hoursNote =
+		sitting && sitting.figures.duration_known < sitting.figures.plays
+			? `from ${sitting.figures.duration_known} of ${sitting.figures.plays}`
+			: '';
 
 	// ── The timeline ─────────────────────────────────────────────────────
 	//
@@ -251,16 +278,49 @@
 			<h1 class="h-display">{sitting.title || 'A sitting'}</h1>
 			<p class="sub">{dateLine(sitting)}</p>
 		</div>
-		{#if sitting.hosting}
-			<div class="acts">
+		<div class="acts">
+			{#if sitting.figures.plays}
+				<button class="btn btn-primary" on:click={() => (sharing = true)}>Share</button>
+			{/if}
+			{#if sitting.hosting}
 				<button class="btn btn-secondary" on:click={openEdit}>Name it</button>
 				<button class="btn btn-secondary" on:click={openAdd}>Add somebody</button>
-			</div>
-		{/if}
+			{/if}
+		</div>
 	</header>
 
 	{#if notice}<div class="notice">{notice}</div>{/if}
 	{#if error}<div class="notice bad">{error}</div>{/if}
+
+	{#if sitting.figures.plays}
+		<section class="figs">
+			<div class="fig">
+				<div class="fv">{sitting.figures.plays}</div>
+				<div class="fl">{sitting.figures.plays === 1 ? 'record' : 'records'}</div>
+			</div>
+			<div class="fig">
+				<div class="fv">{running(sitting.figures)}</div>
+				<div class="fl">played{#if hoursNote}{` · ${hoursNote}`}{/if}</div>
+			</div>
+			<div class="fig">
+				<div class="fv">{sitting.figures.artists}</div>
+				<div class="fl">{sitting.figures.artists === 1 ? 'artist' : 'artists'}</div>
+			</div>
+			<div class="fig">
+				<div class="fv">{sitting.figures.decks.length}</div>
+				<div class="fl">{sitting.figures.decks.length === 1 ? 'deck' : 'decks'}</div>
+			</div>
+			{#if sitting.figures.top_artist}
+				<div class="fig wide">
+					<div class="fv sm">{sitting.figures.top_artist[0]}</div>
+					<div class="fl">
+						most played · {sitting.figures.top_artist[1]}
+						{sitting.figures.top_artist[1] === 1 ? 'play' : 'plays'}
+					</div>
+				</div>
+			{/if}
+		</section>
+	{/if}
 
 	<section class="panel">
 		<h2 class="sech2">Who was there</h2>
@@ -375,6 +435,14 @@
 			<p class="notes">{sitting.notes}</p>
 		</section>
 	{/if}
+{/if}
+
+{#if sitting}
+	<ShareChapter
+		endpoint={api.spoolImageUrl(sitting.uuid)}
+		label={sitting.title || 'this sitting'}
+		bind:open={sharing}
+	/>
 {/if}
 
 {#if editing && sitting}
@@ -755,4 +823,43 @@
 			gap: 2px;
 		}
 	}
+
+	/* What the evening came to. */
+	.figs {
+		display: grid;
+		grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+		gap: 1px;
+		background: var(--td-border);
+		border: 1px solid var(--td-border);
+		border-radius: 14px;
+		overflow: hidden;
+		margin-bottom: 16px;
+	}
+	.fig {
+		background: var(--td-surface);
+		padding: 14px 16px;
+	}
+	.fig.wide {
+		grid-column: span 2;
+	}
+	.fv {
+		font-size: 26px;
+		font-weight: 700;
+		line-height: 1.1;
+	}
+	.fv.sm {
+		font-size: 17px;
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
+	}
+	.fl {
+		font-size: 12px;
+		color: var(--td-muted);
+		margin-top: 3px;
+	}
+	@media (max-width: 560px) {
+		.fig.wide { grid-column: span 1; }
+	}
+
 </style>

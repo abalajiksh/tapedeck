@@ -967,6 +967,43 @@ mod tests {
         }
     }
 
+    /// And neither may a sitting, which is the fourth composition and the one
+    /// with the most variable content — a guest list, a deck list and two
+    /// superlatives, any of which an evening may or may not have.
+    #[test]
+    fn a_sitting_is_not_drawn_over_its_footer_either() {
+        use crate::report_image::sitting;
+        use crate::report_image::SittingCard;
+
+        // The full card, and then the awkward ones: an evening with a long
+        // guest list and every section present is the tallest stack it can
+        // produce, and one with nothing but plays is the shortest.
+        let mut crowded = SittingCard::sample();
+        crowded.with = (0..6).map(|i| format!("Person{i}")).collect();
+        crowded.decks = (0..6).map(|i| (format!("Deck{i}"), 20 - i)).collect();
+
+        let mut bare = SittingCard::sample();
+        bare.top_artist = None;
+        bare.top_album = None;
+        bare.decks = vec![("Ash".into(), 3)];
+        bare.with = vec![];
+
+        for c in [SittingCard::sample(), crowded, bare] {
+            for size in [Size::Story, Size::Square, Size::Wide] {
+                for theme in [Theme::Dark, Theme::Light] {
+                    let drawn = sitting::render_measured(&c, size, theme);
+                    let m = M::for_size(size);
+                    assert!(
+                        drawn.bottom <= m.footer_top(),
+                        "sitting/{size:?}: content ends at {} but the footer starts at {}",
+                        drawn.bottom,
+                        m.footer_top()
+                    );
+                }
+            }
+        }
+    }
+
     /// The rank line names the bucket it is ranking, and singular is not a
     /// special case somebody has to remember.
     #[test]

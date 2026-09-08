@@ -28,6 +28,7 @@
 	} from '$lib/api';
 	import CoverArt from '$lib/components/CoverArt.svelte';
 	import ChainIcon from '$lib/components/ChainIcon.svelte';
+	import { goto } from '$app/navigation';
 	import { syncUrl } from '$lib/url';
 	import { openArtist } from '$lib/entities';
 	import { lovedKeys, isLovedNamed, toggleLoveByName, loadLoves } from '$lib/loves';
@@ -1028,10 +1029,16 @@
 
 	async function endSpool() {
 		if (!spool) return;
+		const uuid = spool.uuid;
 		busy = 'spool';
 		try {
-			await api.endSpool(spool.uuid);
-			await loadSpool();
+			await api.endSpool(uuid);
+			// **The ending is the point.** Closing a sitting used to just stop
+			// it — the evening went off the screen and there was nowhere it had
+			// gone. Landing on its page is the moment somebody names it, writes
+			// about it, or hands it to the people who were in it.
+			await goto(`/spool/${uuid}`);
+			return;
 		} catch (e) {
 			alert(e instanceof Error ? e.message : 'Could not save');
 		} finally {

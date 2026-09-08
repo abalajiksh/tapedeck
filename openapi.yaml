@@ -26,7 +26,7 @@ openapi: 3.1.0
 
 info:
   title: Tapedeck
-  version: 0.110.0
+  version: 0.110.1
   summary: Self-hosted scrobbler and listening journal.
   description: |
     Tapedeck ingests listens, enriches them with MusicBrainz metadata, stores
@@ -3635,6 +3635,67 @@ paths:
       responses:
         '200': { description: Saved. }
         '400': { description: No field named. }
+        '401': { description: Not signed in. }
+        '404': { description: No sitting of yours with that id. }
+
+  /api/v1/patch/spools/{uuid}/image:
+    get:
+      tags: [Patch]
+      summary: An evening as a card.
+      description: |
+        **The ending a sitting never had.** Ending one used to just stop it;
+        this is the thing you look at afterwards and hand to the people who
+        were in it.
+
+        A fourth composition rather than a report card with a different label. A
+        sitting has no period, so no rank, no per-day rate and no bucket chart —
+        what it has instead is who was in the room, which is the subject, and
+        which no report card has anywhere to put.
+
+        It **computes nothing**: every figure comes from
+        `GET /api/v1/patch/spools/{uuid}`, so a card and the page it was shared
+        from cannot disagree. And it makes no network call, so it needs none of
+        the deadline machinery every other outbound-from-a-handler path here has
+        had to grow.
+
+        `X-Tapedeck-Glyph-Coverage` is `full` or `partial`. Partial is **not** a
+        failure and the image is still returned: the embedded faces are Latin,
+        the host's own fonts sit behind them and may well cover the rest. It
+        means this server cannot *promise* the image is free of tofu, which is a
+        thing to say rather than let the reader discover from the picture.
+      security: [{ sessionCookie: [] }]
+      parameters:
+        - in: path
+          name: uuid
+          required: true
+          schema: { type: string }
+        - in: query
+          name: size
+          schema: { type: string, enum: [story, square, wide], default: story }
+        - in: query
+          name: theme
+          description: |
+            Asked at export time rather than inherited — a share lands on
+            somebody else's screen, so the reader's own preference is not the
+            question. An unrecognised value falls back to `dark` rather than
+            being refused: this is presentation, and declining to draw over a
+            misspelling is worse than drawing the default.
+          schema: { type: string, enum: [dark, light], default: dark }
+        - in: query
+          name: format
+          schema: { type: string, enum: [png, svg], default: png }
+      responses:
+        '200':
+          description: The card.
+          headers:
+            X-Tapedeck-Glyph-Coverage:
+              schema: { type: string, enum: [full, partial] }
+          content:
+            image/png:
+              schema: { type: string, format: binary }
+            image/svg+xml:
+              schema: { type: string }
+        '400': { description: An unknown size or format. }
         '401': { description: Not signed in. }
         '404': { description: No sitting of yours with that id. }
 

@@ -9091,3 +9091,81 @@ async fn a_re_timed_offer_accepted_is_still_one_row() {
     );
     assert_eq!(view.plays[0].standing, "accepted");
 }
+
+/// Saying when you left stops the room going on without you.
+///
+/// `present_until` was recorded and nothing narrowed on it: `state` said
+/// whether you had answered the invitation and the window said when you were
+/// actually in the room, and only the first was read. So somebody who had said
+/// they left at ten went on being offered plays at eleven, and went on being
+/// named in the company of the people still there.
+#[tokio::test]
+async fn saying_when_you_left_stops_the_captures_and_the_company() {
+    let db = testdb().await;
+    let (me, them, chain) = patched_pair(&db).await;
+    let spool = db.start_spool(them, None, &[me], &[]).await.unwrap();
+    db.set_spool_membership(&spool, me, true).await.unwrap();
+
+    let start = Database::now_secs();
+    listen(&db, them, Some(chain), "While I was there", "Massive Attack", start as u64 - 60).await;
+
+    // "I went home a moment ago." State is untouched — leaving through the
+    // banner is a different gesture, and this is a correction to the record.
+    db.set_member_presence(&spool, me, None, Some(Some(start))).await.unwrap();
+
+    listen(&db, them, Some(chain), "After I left", "Massive Attack", start as u64 + 600).await;
+
+    let waiting: Vec<String> =
+        db.spool_captures(me).await.unwrap().into_iter().map(|c| c.title).collect();
+    assert_eq!(
+        waiting,
+        vec!["While I was there".to_string()],
+        "a play from after you went home is not yours to answer"
+    );
+
+    let company: Option<String> = sqlx::query_scalar(
+        "SELECT company FROM scrobbles WHERE user_id = ? AND title = 'After I left'",
+    )
+    .bind(them)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert!(
+        !company.unwrap_or_default().contains("ash"),
+        "and you are not named in the company of a play you were not there for"
+    );
+
+    // The play from while you *were* there still names you, because it was
+    // true when it was taken — a company snapshot is a record of the room at
+    // the time, not a view onto a list that keeps moving.
+    let earlier: Option<String> = sqlx::query_scalar(
+        "SELECT company FROM scrobbles WHERE user_id = ? AND title = 'While I was there'",
+    )
+    .bind(them)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert!(earlier.unwrap_or_default().contains("ash"));
+}
+
+/// And your own plays stop belonging to a sitting you have left.
+#[tokio::test]
+async fn a_play_after_you_went_home_is_not_part_of_the_sitting() {
+    let db = testdb().await;
+    let (me, them, chain) = patched_pair(&db).await;
+    let spool = db.start_spool(them, None, &[me], &[]).await.unwrap();
+    db.set_spool_membership(&spool, me, true).await.unwrap();
+
+    let start = Database::now_secs();
+    db.set_member_presence(&spool, me, None, Some(Some(start))).await.unwrap();
+    listen(&db, me, Some(chain), "On my own now", "Burial", start as u64 + 600).await;
+
+    let stamped: Option<String> = sqlx::query_scalar(
+        "SELECT joint_session_id FROM scrobbles WHERE user_id = ? AND title = 'On my own now'",
+    )
+    .bind(me)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(stamped, None, "you were not in the room, so it was not a joint listen");
+}

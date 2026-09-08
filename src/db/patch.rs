@@ -12,6 +12,68 @@
 
 use super::*;
 
+/// Fold an evening's timeline into what it came to.
+///
+/// Pure, and over the rows the page is already holding — an evening is tens of
+/// plays, so there is nothing here worth a query. Split out for the reason
+/// `consume_sessions` and `resume_point` are: it is a rule somebody will want
+/// to change, and it should be testable without a database.
+///
+/// **Ties are broken by name so the answer is stable.** Two artists on three
+/// plays each is an ordinary evening, and a summary that named a different one
+/// on every refresh would look broken rather than tied.
+fn spool_figures(plays: &[SpoolPlay]) -> SpoolFigures {
+    use std::collections::BTreeMap;
+
+    let mut artists: BTreeMap<String, (String, i64)> = BTreeMap::new();
+    let mut albums: BTreeMap<(String, String), (String, String, i64)> = BTreeMap::new();
+    let mut decks: BTreeMap<String, i64> = BTreeMap::new();
+    let mut seconds = 0i64;
+    let mut duration_known = 0i64;
+
+    for p in plays {
+        // Folded for counting and kept as written for showing — the same call
+        // `artist_credit` and every chart in this file make.
+        let key = p.artist.trim().to_lowercase();
+        let e = artists.entry(key).or_insert_with(|| (p.artist.clone(), 0));
+        e.1 += 1;
+
+        if let Some(album) = p.album.as_deref().map(str::trim).filter(|a| !a.is_empty()) {
+            let k = (p.artist.trim().to_lowercase(), album.to_lowercase());
+            let e = albums.entry(k).or_insert_with(|| (album.to_string(), p.artist.clone(), 0));
+            e.2 += 1;
+        }
+
+        let who = p.from_display_name.clone().unwrap_or_else(|| p.from_username.clone());
+        *decks.entry(who).or_insert(0) += 1;
+
+        if let Some(d) = p.duration.filter(|d| *d > 0) {
+            seconds += d;
+            duration_known += 1;
+        }
+    }
+
+    let mut deck_rows: Vec<(String, i64)> = decks.into_iter().collect();
+    deck_rows.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+
+    SpoolFigures {
+        plays: plays.len() as i64,
+        seconds,
+        duration_known,
+        artists: artists.len() as i64,
+        albums: albums.len() as i64,
+        top_artist: artists
+            .into_values()
+            .max_by(|a, b| a.1.cmp(&b.1).then_with(|| b.0.cmp(&a.0)))
+            .filter(|(_, n)| *n > 0),
+        top_album: albums
+            .into_values()
+            .max_by(|a, b| a.2.cmp(&b.2).then_with(|| b.0.cmp(&a.0)))
+            .filter(|(_, _, n)| *n > 0),
+        decks: deck_rows,
+    }
+}
+
 impl Database {
     /// The outward-facing half of a local user's identity, minted on first need.
     ///
@@ -1371,15 +1433,7 @@ impl Database {
         uuid: &str,
         user_id: i64,
     ) -> Result<i64, sqlx::Error> {
-        let present: Vec<(i64, String)> = sqlx::query_as(&crate::sql!(
-            "SELECT m.user_id, COALESCE(u.display_name, u.username)
-               FROM spool_members m JOIN users u ON u.id = m.user_id
-              WHERE m.spool_id = ? AND m.state = 'joined'
-              ORDER BY u.username"
-        ))
-        .bind(spool_id)
-        .fetch_all(&self.pool)
-        .await?;
+        let present = self.in_the_room(spool_id, Self::now_secs()).await?;
         let mut names: Vec<String> =
             present.iter().filter(|(id, _)| *id != user_id).map(|(_, n)| n.clone()).collect();
         // The people in the room with no deck of their own. They are company
@@ -1938,6 +1992,7 @@ impl Database {
             });
         }
         plays.sort_by_key(|p| p.played_at);
+        let figures = spool_figures(&plays);
 
         Ok(Some(SpoolDetail {
             uuid: uuid.to_string(),
@@ -1953,6 +2008,7 @@ impl Database {
             guests: split_names(guests.as_deref()),
             plays,
             withheld,
+            figures,
         }))
     }
     /// Name a sitting, write about it, and say who else was in the room.
@@ -2228,6 +2284,34 @@ impl Database {
             .execute(&self.pool)
             .await?;
         Ok(true)
+    }
+    /// Everybody in the room at `at`, alphabetically.
+    ///
+    /// **Both halves have to hold, and that is what makes `present_until` mean
+    /// anything.** `state` is whether they answered the invitation;
+    /// `present_from` / `present_until` are when they were actually in the
+    /// room, and those are different facts — leaving through the banner sets
+    /// both, but correcting your own presence sets only the window. Reading the
+    /// state alone therefore meant somebody who had said they left at ten went
+    /// on being offered plays at eleven and went on being named in their
+    /// company: a column recorded and nothing narrowing on it.
+    ///
+    /// NULL at either end is open, which is the common case — most people are
+    /// in a sitting for the whole of it.
+    async fn in_the_room(&self, spool_id: i64, at: i64) -> Result<Vec<(i64, String)>, sqlx::Error> {
+        sqlx::query_as(&crate::sql!(
+            "SELECT m.user_id, COALESCE(u.display_name, u.username)
+               FROM spool_members m JOIN users u ON u.id = m.user_id
+              WHERE m.spool_id = ? AND m.state = 'joined'
+                AND (m.present_from IS NULL OR m.present_from <= ?)
+                AND (m.present_until IS NULL OR m.present_until >= ?)
+              ORDER BY u.username"
+        ))
+        .bind(spool_id)
+        .bind(at)
+        .bind(at)
+        .fetch_all(&self.pool)
+        .await
     }
     /// The roster of one sitting, joined first and then alphabetically.
     async fn spool_members(&self, spool_id: i64) -> Result<Vec<SpoolMember>, sqlx::Error> {
@@ -2942,9 +3026,14 @@ impl Database {
         let Some((spool_id, uuid)): Option<(i64, String)> = sqlx::query_as(&crate::sql!(
             "SELECT sp.id, sp.uuid FROM spools sp
                JOIN spool_members m ON m.spool_id = sp.id AND m.user_id = ? AND m.state = 'joined'
-              WHERE sp.ended_at IS NULL LIMIT 1"
+              WHERE sp.ended_at IS NULL
+                AND (m.present_from IS NULL OR m.present_from <= ?)
+                AND (m.present_until IS NULL OR m.present_until >= ?)
+              LIMIT 1"
         ))
         .bind(user_id)
+        .bind(play.timestamp as i64)
+        .bind(play.timestamp as i64)
         .fetch_optional(&self.pool)
         .await?
         else {
@@ -2960,15 +3049,7 @@ impl Database {
         //
         // One read serves every stamp below — this listener's own, and one per
         // recipient, each of which needs the same list minus themselves.
-        let present: Vec<(i64, String)> = sqlx::query_as(&crate::sql!(
-            "SELECT m.user_id, COALESCE(u.display_name, u.username)
-               FROM spool_members m JOIN users u ON u.id = m.user_id
-              WHERE m.spool_id = ? AND m.state = 'joined'
-              ORDER BY u.username"
-        ))
-        .bind(spool_id)
-        .fetch_all(&self.pool)
-        .await?;
+        let present = self.in_the_room(spool_id, play.timestamp as i64).await?;
         // The people in the room with no deck of their own. They are company
         // like anybody else — a sitting that could only name account holders
         // would miss the friend on the sofa, which is the whole reason

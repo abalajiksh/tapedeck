@@ -624,6 +624,22 @@ export interface SpoolPlay {
 	caa_release_mbid: string | null;
 }
 
+/** What an evening came to. */
+export interface SpoolFigures {
+	plays: number;
+	/** Running time of the plays that reported one, and how many did. **Both
+	 *  travel or neither does** — a source that reported no length contributes
+	 *  nothing, so this is a floor. */
+	seconds: number;
+	duration_known: number;
+	artists: number;
+	albums: number;
+	top_artist: [string, number] | null;
+	top_album: [string, string, number] | null;
+	/** Whose deck played how many, biggest first. */
+	decks: [string, number][];
+}
+
 /** A sitting, in full. */
 export interface SpoolDetail {
 	uuid: string;
@@ -642,6 +658,8 @@ export interface SpoolDetail {
 	 *  chains their owner does not share. Stated rather than dropped — a
 	 *  timeline with invisible holes misrepresents the evening. */
 	withheld: number;
+	/** What the evening came to, folded out of `plays`. */
+	figures: SpoolFigures;
 }
 
 export interface SpoolView {
@@ -2397,6 +2415,23 @@ class TapedeckAPI {
 	 *  correction there is, because nothing is in a history yet. */
 	async setCaptureTime(id: number, playedAt: number): Promise<{ saved: boolean }> {
 		return this.request('PATCH', `/api/v1/patch/captures/${id}`, { played_at: playedAt });
+	}
+
+	/** An evening as a card.
+	 *
+	 *  The URL rather than the bytes: the caller renders it in an `<img>` and
+	 *  fetches it only when saving, which is what lets the coverage header be
+	 *  read. Session-only, like everything else on a sitting. */
+	spoolImageUrl(
+		uuid: string,
+		opts: { size?: string; theme?: string; format?: string } = {}
+	): string {
+		const q = new URLSearchParams();
+		if (opts.size) q.set('size', opts.size);
+		if (opts.theme) q.set('theme', opts.theme);
+		if (opts.format) q.set('format', opts.format);
+		const s = q.toString();
+		return `/api/v1/patch/spools/${encodeURIComponent(uuid)}/image${s ? `?${s}` : ''}`;
 	}
 
 	async getSpoolChain(): Promise<{ chain_id: number | null }> {

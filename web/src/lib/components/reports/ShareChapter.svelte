@@ -1,6 +1,6 @@
 <script lang="ts">
 	/**
-	 * Export a chapter as an image.
+	 * Export a chapter or a sitting as an image.
 	 *
 	 * **The picture is drawn on the server** — `GET /api/v1/reports/image` — so
 	 * this component chooses, previews and saves, and lays nothing out. That is
@@ -14,11 +14,17 @@
 	 */
 	import { onDestroy } from 'svelte';
 
-	/** Which chapter. All three have their own composition on the server — a
-	 *  week's by-day bars, a year's twelve-month shape and genre bands — rather
-	 *  than one card relabelled, which is why this is a unit and not a title. */
-	export let unit: 'week' | 'month' | 'year';
-	export let offset = 0;
+	/**
+	 * Which image, as an endpoint carrying whatever fixed parameters it needs.
+	 *
+	 * A path rather than a chapter, so the one dialog serves a report chapter
+	 * and a Shared Spool alike. Both are somebody's listening drawn on the
+	 * server and handed to somebody else, and both ask the same two questions
+	 * about it — a second copy of this would be a second place for "which look"
+	 * to drift.
+	 */
+	export let endpoint: string;
+	/** Names the dialog and the saved file. */
 	export let label = '';
 	export let open = false;
 
@@ -42,7 +48,7 @@
 	/** Whether the server could promise every character on the card. */
 	let coverage: string | null = null;
 
-	$: src = `/api/v1/reports/image?unit=${unit}&offset=${offset}&size=${size}&theme=${theme}`;
+	$: src = `${endpoint}${endpoint.includes('?') ? '&' : '?'}size=${size}&theme=${theme}`;
 	$: filename = `tapedeck-${label.toLowerCase().replace(/[^a-z0-9]+/g, '-')}-${size}.png`;
 
 	/**

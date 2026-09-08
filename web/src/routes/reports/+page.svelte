@@ -234,7 +234,11 @@
 		     as well as the period so the dialog cannot keep a preview of the
 		     shape that was on screen before the stepper moved. -->
 		{#key unit}
-			<ShareChapter {unit} offset={idx} label={period.label} bind:open={sharing} />
+			<ShareChapter
+					endpoint={`/api/v1/reports/image?unit=${unit}&offset=${idx}`}
+					label={period.label}
+					bind:open={sharing}
+				/>
 		{/key}
 	{/if}
 

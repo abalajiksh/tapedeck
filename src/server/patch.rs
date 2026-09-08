@@ -99,6 +99,7 @@ pub fn create_patch_router() -> Router<Arc<AppState>> {
         // what is happening now; these are what happened.
         .route("/api/v1/patch/spools", get(spool_history))
         .route("/api/v1/patch/spools/:uuid", get(spool_detail).patch(edit_spool))
+        .route("/api/v1/patch/spools/:uuid/image", get(spool_image))
         .route("/api/v1/patch/spools/:uuid/members", post(add_spool_members))
         .route("/api/v1/patch/spools/:uuid/presence", axum::routing::put(set_presence))
         .route("/api/v1/patch/captures", post(settle_captures))
@@ -1324,6 +1325,183 @@ async fn put_spool_chain(
 #[derive(Deserialize)]
 struct HistoryQuery {
     limit: Option<i64>,
+}
+
+/// `GET /api/v1/patch/spools/:uuid/image` — an evening as a card.
+///
+/// **The ending a sitting never had.** Ending one used to just stop it; this is
+/// the thing you look at afterwards and hand to the people who were in it.
+///
+/// It computes nothing — every figure comes from `spool_detail`, so a card and
+/// the page it was shared from cannot disagree — and it makes no network call,
+/// which is what keeps it free of the deadline every other outbound-from-a-
+/// handler path in this codebase has had to grow.
+async fn spool_image(
+    State(state): State<Arc<AppState>>,
+    user: super::auth::AuthUser,
+    Path(uuid): Path<String>,
+    Query(q): Query<ImageQuery>,
+) -> Response {
+    let Some(size) = crate::report_image::Size::parse(q.size.as_deref()) else {
+        return refused(StatusCode::BAD_REQUEST, "size must be story, square or wide");
+    };
+    // Asked at export time rather than inherited: a share lands on somebody
+    // else's screen, so the reader's own theme preference is not the question.
+    // An unrecognised value is the default rather than a 400 — this is
+    // presentation, and refusing to draw over a misspelling is worse than
+    // drawing the default. `size` and `format` are 400s because neither has a
+    // sensible default shape.
+    let theme = crate::report_image::Theme::parse(q.theme.as_deref());
+    let svg_only = matches!(q.format.as_deref(), Some("svg"));
+    if !matches!(q.format.as_deref(), None | Some("png") | Some("svg")) {
+        return refused(StatusCode::BAD_REQUEST, "format must be png or svg");
+    }
+
+    let sitting = match state.db.spool_detail(&uuid, user.user_id).await {
+        Ok(Some(v)) => v,
+        Ok(None) => return refused(StatusCode::NOT_FOUND, "No sitting of yours with that id"),
+        Err(e) => {
+            warn!("📡 spool image: {}", crate::logging::error_chain(&e));
+            return refused(StatusCode::INTERNAL_SERVER_ERROR, "Could not read that");
+        }
+    };
+
+    let zone = crate::server::scrobbles::user_tz_for(&state, user.user_id).await;
+    let card = sitting_card(&sitting, zone);
+
+    // **Off the async worker.** A 1080×1920 pixmap is ~8 MB of RGBA and
+    // rasterising it in the handler pins a tokio worker, one of four on a Pi.
+    let rendered = match tokio::task::spawn_blocking(move || {
+        crate::report_image::render_sitting(&card, size, theme)
+    })
+    .await
+    {
+        Ok(Ok(r)) => r,
+        Ok(Err(e)) => {
+            warn!("📡 spool image: {e}");
+            return refused(StatusCode::INTERNAL_SERVER_ERROR, "Could not draw the image");
+        }
+        Err(e) => {
+            warn!("📡 spool image render panicked: {e}");
+            return refused(StatusCode::INTERNAL_SERVER_ERROR, "Could not draw the image");
+        }
+    };
+
+    let coverage = if rendered.fully_covered { "full" } else { "partial" };
+    let stem = format!("tapedeck-sitting-{}-{}", size.as_str(), theme.as_str());
+    let (body, mime, ext) = if svg_only {
+        (rendered.svg.into_bytes(), "image/svg+xml; charset=utf-8", "svg")
+    } else {
+        (rendered.png, "image/png", "png")
+    };
+
+    (
+        StatusCode::OK,
+        [
+            (header::CONTENT_TYPE, mime.to_string()),
+            // One evening of somebody's listening, so never a shared cache.
+            (header::CACHE_CONTROL, "private, max-age=300".to_string()),
+            (header::CONTENT_DISPOSITION, format!("inline; filename=\"{stem}.{ext}\"")),
+            (header::HeaderName::from_static("x-tapedeck-glyph-coverage"), coverage.to_string()),
+        ],
+        body,
+    )
+        .into_response()
+}
+
+/// Turn a sitting into the card's own model.
+///
+/// Pure, and separate from the handler for the reason `public_payload` is: it
+/// decides what an evening looks like to somebody who was not necessarily in
+/// it, and a rule like that should be readable without a server around it.
+fn sitting_card(
+    s: &crate::db::SpoolDetail,
+    zone: chrono_tz::Tz,
+) -> crate::report_image::SittingCard {
+    use chrono::TimeZone;
+
+    // **Everybody else**, decks and guests alike — the reader is left out, the
+    // way every "with …" line in this application leaves them out.
+    let mut with: Vec<String> = s
+        .members
+        .iter()
+        .filter(|m| m.user_id != s.viewer_id && matches!(m.state.as_str(), "joined" | "left"))
+        .map(|m| m.display_name.clone().unwrap_or_else(|| m.username.clone()))
+        .collect();
+    with.extend(s.guests.iter().cloned());
+
+    // Bucketed in the **reader's** timezone, not UTC. A sitting that ran to
+    // half past midnight in CET belongs to the evening it started in, and the
+    // date on the card is the one thing everybody in the room would agree on.
+    let started = zone.timestamp_opt(s.started_at, 0).single();
+    let date = started.map(|d| d.format("%A, %-d %B %Y").to_string()).unwrap_or_default();
+    let span = match (started, s.ended_at.and_then(|e| zone.timestamp_opt(e, 0).single())) {
+        (Some(a), Some(b)) => {
+            // Rounded, not truncated — the page rounds, and a card saying
+            // "9 min" beside a page saying "10 min" about one evening is the
+            // kind of small disagreement that makes a reader doubt both.
+            let secs = (s.ended_at.unwrap_or(0) - s.started_at).max(0);
+            let mins = (secs + 30) / 60;
+            let ran = if mins < 60 {
+                format!("{mins} min")
+            } else if mins % 60 == 0 {
+                format!("{}h", mins / 60)
+            } else {
+                format!("{}h {}m", mins / 60, mins % 60)
+            };
+            format!("{} – {} · {ran}", a.format("%H:%M"), b.format("%H:%M"))
+        }
+        (Some(a), None) => format!("from {} · still running", a.format("%H:%M")),
+        _ => String::new(),
+    };
+
+    crate::report_image::SittingCard {
+        title: s.title.clone().unwrap_or_else(|| "A sitting".into()),
+        date,
+        span,
+        with,
+        plays: s.figures.plays,
+        seconds: s.figures.seconds,
+        duration_known: s.figures.duration_known,
+        artists: s.figures.artists,
+        albums: s.figures.albums,
+        top_artist: s.figures.top_artist.clone(),
+        top_album: s.figures.top_album.clone(),
+        decks: s.figures.decks.clone(),
+        // In the order they went on, capped well above anything a card can
+        // draw — the composition truncates to the room it has, and it is the
+        // only thing that knows how much that is.
+        played: s
+            .plays
+            .iter()
+            .filter_map(|p| {
+                p.album
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|a| !a.is_empty())
+                    .map(|a| (a.to_string(), p.artist.clone()))
+            })
+            .fold(Vec::new(), |mut acc, row| {
+                // Consecutive plays off one record are one record going on,
+                // not several — a side is several listens and the card is
+                // describing the evening rather than the scrobbles.
+                if acc.last() != Some(&row) {
+                    acc.push(row);
+                }
+                acc
+            })
+            .into_iter()
+            .take(12)
+            .collect(),
+        withheld: s.withheld,
+    }
+}
+
+#[derive(Deserialize)]
+struct ImageQuery {
+    size: Option<String>,
+    theme: Option<String>,
+    format: Option<String>,
 }
 
 /// `POST /api/v1/patch/captures` — accept or decline what a sitting offered.

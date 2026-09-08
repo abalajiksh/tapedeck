@@ -2047,6 +2047,36 @@ pub struct SpoolPlay {
     pub caa_release_mbid: Option<String>,
 }
 
+/// What an evening came to.
+///
+/// **A sitting is the one thing in this application that has an ending**, and
+/// until now ending one simply stopped it. These are the figures that make the
+/// stop a summary — and every one of them is folded out of the timeline that
+/// was already built, so the page costs no more to draw than it did.
+#[derive(Debug, Default, serde::Serialize)]
+pub struct SpoolFigures {
+    /// Plays on the timeline. The same count the history list shows, so the two
+    /// screens cannot disagree about how long an evening was.
+    pub plays: i64,
+    /// Running time of the plays that reported one, and **how many did**.
+    ///
+    /// Both travel or neither does. A source that reported no length
+    /// contributes nothing, so this is a floor — the confession `total_hours`
+    /// already makes on the dashboard, in a place where an evening's length is
+    /// the headline rather than a detail.
+    pub seconds: i64,
+    pub duration_known: i64,
+    pub artists: i64,
+    pub albums: i64,
+    /// The artist the evening kept coming back to, and how often.
+    pub top_artist: Option<(String, i64)>,
+    /// The record it kept coming back to, with its artist.
+    pub top_album: Option<(String, String, i64)>,
+    /// Whose deck played what, biggest first. A sitting is several people's
+    /// listening in one sequence, and this is the only figure that says so.
+    pub decks: Vec<(String, i64)>,
+}
+
 /// A sitting, in full.
 #[derive(Debug, serde::Serialize)]
 pub struct SpoolDetail {
@@ -2070,6 +2100,8 @@ pub struct SpoolDetail {
     /// tell — the rule `handed_sitting` already carries, in the one other place
     /// this application shows somebody an evening.
     pub withheld: i64,
+    /// What the evening came to, folded out of `plays`.
+    pub figures: SpoolFigures,
 }
 
 /// A sitting several people are in at once.
