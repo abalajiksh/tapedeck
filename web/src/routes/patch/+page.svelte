@@ -228,6 +228,11 @@
 	let openedSitting: HandedSittingDetail | null = null;
 	let spoolPicked: Record<string, boolean> = {};
 	let spoolTitle = '';
+	// The people in the room with no deck here. They get no captures and no
+	// inbox — there is nobody to offer anything to — and they are named in the
+	// company of every play the sitting fans out, which is the whole reason a
+	// sitting that could only name account holders would miss the common case.
+	let spoolGuests = '';
 	let showSpoolDialog = false;
 
 	// Ticks the elapsed clock on the running banner. Assigned only while a
@@ -268,6 +273,12 @@
 				})
 			: clock(spool.started_at, nowSec)
 		: '';
+	/** A sitting nobody closed. Twelve hours is longer than any evening and
+	 *  shorter than a forgotten one, and the cost of being wrong either way is
+	 *  a sentence rather than an action. */
+	$: forgotten =
+		!!spool && !spool.ended_at && spool.hosting && nowSec - spool.started_at > 12 * 3600;
+
 	$: spoolRan =
 		spool && spool.ended_at
 			? spool.ended_at - spool.started_at < 60
@@ -561,6 +572,36 @@
 	// it does not widen.
 	let spoolHistory: SpoolSummary[] = [];
 	let spoolHistoryLoaded = false;
+	// Correcting a capture's clock. `retimeAt` is a wall-clock time on the day
+	// the play is already recorded on — a capture is minutes or hours out, not
+	// days, and asking for a full date to fix an hour's drift is a worse
+	// control than the one that is wrong.
+	let retiming: number | null = null;
+	let retimeAt = '';
+
+	function openRetime(c: SpoolCapture) {
+		retiming = c.id;
+		const d = new Date(c.played_at * 1000);
+		retimeAt = `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
+	}
+
+	async function saveRetime(c: SpoolCapture) {
+		const [h, m] = retimeAt.split(':').map(Number);
+		if (Number.isNaN(h) || Number.isNaN(m)) return;
+		const d = new Date(c.played_at * 1000);
+		d.setHours(h, m, 0, 0);
+		busy = 'retime';
+		try {
+			await api.setCaptureTime(c.id, Math.floor(d.getTime() / 1000));
+			retiming = null;
+			await loadSpool();
+		} catch (e) {
+			error = humanError(e);
+		} finally {
+			busy = '';
+		}
+	}
+
 	async function loadSpoolHistory() {
 		spoolHistoryLoaded = true;
 		try {
@@ -900,6 +941,7 @@
 
 	function openSpool() {
 		spoolTitle = '';
+		spoolGuests = '';
 		spoolPicked = {};
 		showSpoolDialog = true;
 	}
@@ -939,9 +981,17 @@
 		const with_ = Object.keys(spoolPicked).filter((u) => spoolPicked[u]);
 		busy = 'spool';
 		try {
-			await api.startSpool({ title: spoolTitle.trim() || null, with: with_ });
+			await api.startSpool({
+				title: spoolTitle.trim() || null,
+				with: with_,
+				guests: spoolGuests
+					.split(',')
+					.map((g) => g.trim())
+					.filter(Boolean)
+			});
 			showSpoolDialog = false;
 			spoolTitle = '';
+			spoolGuests = '';
 			spoolPicked = {};
 			await loadSpool();
 		} catch (e) {
@@ -1220,7 +1270,25 @@
 				{#if spool.title}{spool.title}{/if}
 				{#if spool.title && invitedCount(spool)} · {/if}
 				{#if invitedCount(spool)}{invitedCount(spool)} invited{/if}
+				{#if spool.guests.length}
+					{#if spool.title || invitedCount(spool)} · {/if}with {spool.guests.join(', ')}
+				{/if}
 			</div>
+			<!--
+				Nobody ends these. A sitting that has been running since
+				yesterday is one somebody forgot, and it goes on capturing every
+				play into other people's inboxes until it is closed — so it says
+				so rather than waiting to be noticed. A nudge and not an
+				auto-close: ending is a decision about somebody's evening.
+			-->
+			{#if forgotten}
+				<div class="sforgot">
+					Running since {new Date(spool.started_at * 1000).toLocaleDateString(undefined, {
+						weekday: 'long'
+					})}. If the evening is over, end it — every play is still being offered to
+					everyone in it.
+				</div>
+			{/if}
 			<!--
 				A sitting does not bypass the sharing switch, so a host who
 				publishes no chain captures nothing — and that has to be said
@@ -2192,7 +2260,45 @@
 								<div class="pname">{c.title}</div>
 								<div class="pmeta">{c.artist}{#if c.album} · {c.album}{/if}</div>
 							</div>
-							<span class="sitat">{new Date(c.played_at * 1000).toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' })}</span>
+							<!--
+								The clock on a capture is the **host's**, which
+								is the ordinary way one comes to be wrong. This
+								is the cheapest place in the application to fix
+								it: nothing is in a history yet, nothing has
+								been forwarded, no session is grouped around it
+								and no dedup window is drawn against it. Every
+								trap that makes editing a listen's timestamp
+								delicate arrives only once it is accepted.
+							-->
+							{#if retiming === c.id}
+								<input
+									class="input attime"
+									type="time"
+									bind:value={retimeAt}
+									aria-label="When {c.title} played"
+									on:click|preventDefault|stopPropagation
+								/>
+								<button
+									class="btn btn-secondary tiny"
+									on:click|preventDefault|stopPropagation={() => saveRetime(c)}
+									disabled={busy === 'retime'}>Save</button
+								>
+								<button
+									class="btn btn-secondary tiny"
+									on:click|preventDefault|stopPropagation={() => (retiming = null)}
+									>Close</button
+								>
+							{:else}
+								<button
+									class="sitat linky"
+									title="Fix when this played"
+									on:click|preventDefault|stopPropagation={() => openRetime(c)}
+									>{new Date(c.played_at * 1000).toLocaleTimeString(undefined, {
+										hour: '2-digit',
+										minute: '2-digit'
+									})}</button
+								>
+							{/if}
 						</label>
 					{/each}
 				</div>
@@ -2442,6 +2548,21 @@
 						placeholder="Sunday listening"
 						maxlength="80"
 					/>
+				</div>
+
+				<div class="field">
+					<label for="sp-guests">Anyone else in the room</label>
+					<input
+						id="sp-guests"
+						class="input"
+						bind:value={spoolGuests}
+						placeholder="Tobias, Marie"
+						maxlength="200"
+					/>
+					<p class="fhint">
+						The people with no deck here. They get nothing to answer — there is
+						nobody to offer it to — and they are named in the company of every play.
+					</p>
 				</div>
 
 				<div class="field">
@@ -3513,6 +3634,45 @@
 		.sitside .noted {
 			display: none;
 		}
+	}
+
+
+	.fhint {
+		margin: 6px 0 0;
+		font-size: 11px;
+		color: var(--td-muted);
+		line-height: 1.4;
+	}
+	/* The capture's clock, which is a control rather than a readout — it is the
+	   host's time, and this is the cheapest place to correct it. */
+	.linky {
+		background: none;
+		border: none;
+		padding: 0;
+		font: inherit;
+		cursor: pointer;
+		border-bottom: 1px dotted var(--td-muted);
+	}
+	.linky:hover {
+		color: var(--td-accent);
+		border-bottom-color: var(--td-accent);
+	}
+	.tiny {
+		padding: 3px 8px;
+		font-size: 12px;
+	}
+	.attime {
+		width: auto;
+		padding: 3px 6px;
+		font-size: 12px;
+	}
+
+
+	.sforgot {
+		margin-top: 6px;
+		font-size: 12px;
+		line-height: 1.45;
+		color: var(--td-accent);
 	}
 
 </style>

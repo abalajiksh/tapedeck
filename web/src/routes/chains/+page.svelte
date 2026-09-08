@@ -845,10 +845,32 @@
 	// question is "is this number right", asked of one piece at a time.
 	let openGearHours: number | null = null;
 
+	// Which chain a play accepted out of somebody else's sitting is filed
+	// under. Unset by default, and unset is the old behaviour exactly.
+	let spoolChainId: number | null = null;
+
+	async function saveSpoolChain(raw: string) {
+		const id = raw ? Number(raw) : null;
+		try {
+			await api.setSpoolChain(id);
+			spoolChainId = id;
+		} catch (e) {
+			error = e instanceof Error ? e.message : 'Could not save that';
+		}
+	}
+
 	onMount(async () => {
 		const g = new URLSearchParams(window.location.search).get('gear');
 		highlightGear = g ? Number(g) : null;
 		await load();
+		// Failing to read it leaves the picker on "No chain", which is the
+		// default and therefore honest — never an error banner over a
+		// preference nobody was setting.
+		try {
+			spoolChainId = (await api.getSpoolChain()).chain_id;
+		} catch {
+			/* the picker shows the default */
+		}
 		if (highlightGear != null) {
 			// Equipment is the default tab, so the row is rendered by now.
 			await tick();
@@ -945,6 +967,40 @@
 			</span>
 			<span class="nudge-cta">Review →</span>
 		</button>
+	{/if}
+
+	<!-- Rooms you sit in.
+	     A play accepted out of a Shared Spool used to land with no chain at
+	     all, so those listens earned no gear hours, carried no fidelity and
+	     could never reach the Reel. Defensible — it was not your gear — and not
+	     the whole truth, because you were in the room hearing real speakers.
+
+	     Here rather than in Settings because the question is "which of my
+	     chains", and this is the page holding the answer to it. Rendered only
+	     once there is a chain to pick: a picker with nothing in it is a control
+	     that reads as broken. -->
+	{#if chainRows.length}
+		<div class="spoolchain">
+			<div class="sc-main">
+				<div class="sc-title">Rooms you sit in</div>
+				<div class="sc-sub">
+					Where a play lands when you accept it out of somebody else's Shared Spool.
+					Leave it unset and those listens carry no chain, which is what they have
+					always done.
+				</div>
+			</div>
+			<select
+				class="input sc-pick"
+				aria-label="Chain for plays accepted out of a Shared Spool"
+				value={spoolChainId ?? ''}
+				on:change={(e) => saveSpoolChain(e.currentTarget.value)}
+			>
+				<option value="">No chain</option>
+				{#each chainRows as c (c.id)}
+					<option value={String(c.id)}>{c.name}</option>
+				{/each}
+			</select>
+		</div>
 	{/if}
 
 	<!-- Chain rows.
@@ -2190,4 +2246,22 @@
 	tr.highlight {
 		background: color-mix(in srgb, var(--td-accent) 12%, transparent);
 	}
+
+	/* Rooms you sit in — the chain an accepted Shared Spool play lands on. */
+	.spoolchain {
+		display: flex;
+		align-items: center;
+		gap: 14px;
+		flex-wrap: wrap;
+		padding: 14px 16px;
+		margin-bottom: 16px;
+		background: var(--td-surface2);
+		border: 1px solid var(--td-border);
+		border-radius: 14px;
+	}
+	.sc-main { flex: 1; min-width: 240px; }
+	.sc-title { font-weight: 600; font-size: 14px; }
+	.sc-sub { font-size: 12.5px; color: var(--td-muted); margin-top: 2px; line-height: 1.45; }
+	.sc-pick { width: auto; min-width: 160px; }
+
 </style>

@@ -111,6 +111,9 @@
 		bulkChain = '';
 		bulkVariant = '';
 		bulkCompany = '';
+		shiftAmount = '';
+		shiftDir = -1;
+		timeNotice = '';
 	}
 
 	/**
@@ -135,6 +138,68 @@
 			exitSelect();
 		} catch (e) {
 			alert('Could not save that: ' + e);
+		}
+		saving = false;
+	}
+
+	// ── Moving listens in time ───────────────────────────────────────────
+	//
+	// **An offset over a selection, not an absolute time**, and that is the
+	// shape of the actual failure rather than a limitation. A timestamp is
+	// almost never wrong on its own: a clock was out by an hour, an evening was
+	// reconstructed from times laid out by arithmetic, or a capture arrived
+	// carrying somebody else's clock. Every one of those moves a *run* by a
+	// *constant*, and a constant cannot scramble an ordering the way a set of
+	// hand-typed times can.
+	//
+	// Where the play has not been accepted out of a sitting yet, the capture's
+	// own re-time is the cheaper place to do it — nothing is in a history
+	// there, so none of the consequences below apply.
+	let shiftAmount = '';
+	/** -1 earlier, +1 later. Two buttons rather than a minus sign somebody has
+	 *  to remember to type, and a direction the control states out loud. */
+	let shiftDir: -1 | 1 = -1;
+	let timeNotice = '';
+
+	/** "1h30", "90m", "45", "2h" — minutes unless it says otherwise. */
+	function parseShift(raw: string): number | null {
+		const t = raw.trim().toLowerCase();
+		if (!t) return null;
+		const m = t.match(/^(?:(\d+)\s*h)?\s*(?:(\d+)\s*m?)?$/);
+		if (!m || (!m[1] && !m[2])) return null;
+		const secs = (Number(m[1] ?? 0) * 60 + Number(m[2] ?? 0)) * 60;
+		return secs > 0 ? secs : null;
+	}
+	$: shiftSecs = parseShift(shiftAmount);
+
+	async function applyShift() {
+		if (!selected.size || !shiftSecs) return;
+		const offset = shiftSecs * shiftDir;
+		saving = true;
+		try {
+			const r = await api.shiftListenTimes([...selected], offset);
+			// Everything it could not reach is said out loud. A correction
+			// somebody believes went further than it did is worse than one they
+			// know the edges of.
+			const bits = [`${r.moved} moved`];
+			if (r.moved < selected.size)
+				bits.push(
+					`${selected.size - r.moved} left alone — moving them would have landed on another play of the same track`
+				);
+			if (r.already_forwarded)
+				bits.push(
+					`${r.already_forwarded} had already gone to Last.fm or ListenBrainz, and neither can be edited — their copy keeps the old time`
+				);
+			if (r.grouping_stale)
+				bits.push('sessions no longer match the gap they were grouped by — rebuild when you want them regrouped');
+			timeNotice = bits.join('. ') + '.';
+			// A full reload rather than patching the rows in place: moving a
+			// listen can reorder the list and change which day it falls under,
+			// so the page's own grouping has to be rebuilt from the answer.
+			selected = new Set();
+			await load(true);
+		} catch (e) {
+			timeNotice = 'Could not move those: ' + e;
 		}
 		saving = false;
 	}
@@ -487,6 +552,26 @@
 		<button class="btn btn-secondary" on:click={() => applyBulkCompany(true)} disabled={!selectedCount || saving}>
 			Unmark
 		</button>
+		<div style="flex-basis:100%;height:0;"></div>
+		<span style="font-size:13px;color:var(--td-muted);">Move in time:</span>
+		<div style="display:flex;background:var(--td-sidebar);border-radius:999px;padding:4px;gap:2px;">
+			<button class="seg-btn" class:on={shiftDir === -1} on:click={() => (shiftDir = -1)}>Earlier</button>
+			<button class="seg-btn" class:on={shiftDir === 1} on:click={() => (shiftDir = 1)}>Later</button>
+		</div>
+		<input
+			class="input"
+			style="width:auto;min-width:110px;"
+			bind:value={shiftAmount}
+			placeholder="1h30"
+			aria-label="How far to move them"
+			on:keydown={(e) => e.key === 'Enter' && applyShift()}
+		/>
+		<button class="btn btn-primary" on:click={applyShift} disabled={!selectedCount || saving || !shiftSecs}>
+			Move
+		</button>
+		{#if timeNotice}
+			<div style="flex-basis:100%;font-size:12.5px;color:var(--td-muted);line-height:1.45;">{timeNotice}</div>
+		{/if}
 	</div>
 {/if}
 

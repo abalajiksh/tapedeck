@@ -6,7 +6,7 @@
 		api,
 		type PhysicalRelease, type PhysicalTrack, type ReleaseCandidate,
 		type PhysicalImage, type SignalChain, type Equipment, type Spin, type SidePlays,
-		type DurationPreview, type DurationProposal
+		type DurationPreview, type DurationProposal, type SpoolView
 	} from '$lib/api';
 	import { formatDuration, formatDateTime, timeAgo, toDateInput, fromDateInput, ownedFor, formatHours } from '$lib/utils';
 	import CoverArt from '$lib/components/CoverArt.svelte';
@@ -1381,8 +1381,33 @@
 		return list.filter((t) => t.side === side).reduce((n, t) => n + (t.duration_secs ?? 180), 0);
 	}
 
+	// Whether a Shared Spool is running, so the deck can say that the sides it
+	// records are being offered to other people. Read once — a sitting starts
+	// and ends on the Patch page, and polling for it from here would be a
+	// request every few seconds to learn something that changes twice an
+	// evening. Refreshed on focus with the rest of the deck state.
+	let sitting: SpoolView | null = null;
+	/** Whether starting one is even possible: with nobody patched there is
+	 *  nobody a sitting could contain, and offering it would be offering a
+	 *  dialog with an empty guest list. */
+	let canSpool = false;
+
+	async function loadSitting() {
+		try {
+			const r = await api.getSpool();
+			sitting = r.spool && !r.spool.ended_at && r.spool.my_state === 'joined' ? r.spool : null;
+			if (!sitting && !canSpool) {
+				const d = await api.getPatchDecks();
+				canSpool = [...d.following, ...d.followers].some((p) => p.state === 'accepted');
+			}
+		} catch {
+			/* the bar simply does not render */
+		}
+	}
+
 	onMount(() => {
 		void loadSpinning();
+		void loadSitting();
 		// Drives the countdown and the "side is over" prompt. One second is the
 		// right resolution for a twenty-minute side and costs nothing.
 		const tick = setInterval(() => (nowSec = Math.floor(Date.now() / 1000)), 1000);
@@ -1393,7 +1418,10 @@
 		// Now that the deck lives on the server, another device can change it.
 		// Re-reading on focus is enough: nobody watches two screens at once, and
 		// polling would fight with the local edits this tab is making.
-		const refocus = () => void loadSpinning();
+		const refocus = () => {
+			void loadSpinning();
+			void loadSitting();
+		};
 		window.addEventListener('focus', refocus);
 		load();
 		loadGear();
@@ -1670,6 +1698,30 @@
 			<button class="btn btn-secondary" on:click={() => saveSpinning(null)}>Cancel</button>
 		</div>
 	</div>
+	<!--
+		**The shelf is where the record player is**, and it is the one surface
+		that knew nothing about Shared Spools — you could drop a needle in a
+		room with three people and get no sign that a sitting was capturing, or
+		that one could be.
+
+		It reports rather than starting one. Opening a sitting needs a guest
+		list, and a second copy of that dialog is a second place for the consent
+		guard and the "from when" question to drift — so this says what is
+		happening and points at the page that owns it.
+	-->
+	{#if sitting}
+		<a class="spoolbar" href="/patch">
+			<span class="sp-dot"></span>
+			<span
+				>Capturing into <strong>{sitting.title || 'a Shared Spool'}</strong> — every side
+				you record is offered to everyone in it.</span
+			>
+		</a>
+	{:else if canSpool}
+		<a class="spoolbar quiet" href="/patch">
+			<span>Listening with somebody? Start a Shared Spool →</span>
+		</a>
+	{/if}
 {/if}
 
 {#if !spinning}
@@ -2837,4 +2889,34 @@
 		background: color-mix(in srgb, var(--td-accent) 8%, transparent);
 		flex-wrap: wrap;
 	}
+
+	/* Whether a Shared Spool is capturing what this deck plays. */
+	.spoolbar {
+		display: flex;
+		align-items: center;
+		gap: 10px;
+		margin: -6px 0 18px;
+		padding: 10px 14px;
+		border: 1px solid var(--td-accent);
+		border-radius: 12px;
+		background: var(--td-surface);
+		color: var(--td-text);
+		font-size: 13px;
+		text-decoration: none;
+		line-height: 1.45;
+	}
+	.spoolbar.quiet {
+		border-style: dashed;
+		border-color: var(--td-border);
+		color: var(--td-muted);
+	}
+	.spoolbar:hover { border-color: var(--td-accent); }
+	.sp-dot {
+		flex: none;
+		width: 8px;
+		height: 8px;
+		border-radius: 50%;
+		background: var(--td-accent);
+	}
+
 </style>
