@@ -20,6 +20,7 @@
 		SpoolView,
 		SpoolCapture,
 		SpoolMember,
+		SpoolSummary,
 		HandedSitting,
 		HandedSittingDetail,
 		SignalChain,
@@ -31,13 +32,22 @@
 	import { openArtist } from '$lib/entities';
 	import { lovedKeys, isLovedNamed, toggleLoveByName, loadLoves } from '$lib/loves';
 
-	type Tab = 'reel' | 'artists' | 'decks' | 'discover' | 'instance' | 'inbox';
+	type Tab = 'reel' | 'artists' | 'decks' | 'sittings' | 'discover' | 'instance' | 'inbox';
 	let tab: Tab = 'reel';
-	const TABS: Tab[] = ['reel', 'artists', 'decks', 'discover', 'instance', 'inbox'];
+	const TABS: Tab[] = [
+		'reel',
+		'artists',
+		'decks',
+		'sittings',
+		'discover',
+		'instance',
+		'inbox'
+	];
 	const TAB_LABELS: Record<Tab, string> = {
 		reel: 'The Reel',
 		artists: 'Artists',
 		decks: 'Decks',
+		sittings: 'Sittings',
 		discover: 'Discover',
 		instance: 'Instance',
 		inbox: 'Inbox'
@@ -546,6 +556,20 @@
 		}
 	}
 
+	// Every sitting you were in. **Membership is the gate, not the patch** —
+	// see the endpoint's own note on why that widening is deliberate and what
+	// it does not widen.
+	let spoolHistory: SpoolSummary[] = [];
+	let spoolHistoryLoaded = false;
+	async function loadSpoolHistory() {
+		spoolHistoryLoaded = true;
+		try {
+			spoolHistory = (await api.getSpoolHistory()).sittings;
+		} catch (e) {
+			error = e instanceof Error ? e.message : 'Could not load';
+		}
+	}
+
 	async function loadDiscover() {
 		discoverLoaded = true;
 		try {
@@ -743,6 +767,7 @@
 		const t = new URLSearchParams(window.location.search).get('tab');
 		if (t && (TABS as string[]).includes(t)) tab = t as Tab;
 		if (tab === 'artists') void loadArtists();
+		if (tab === 'sittings') void loadSpoolHistory();
 		if (tab === 'discover') void loadDiscover();
 		if (tab === 'instance') void loadInstance();
 		await Promise.all([
@@ -825,6 +850,7 @@
 	function go(t: Tab) {
 		tab = t;
 		if (t === 'artists' && !artistsLoaded) void loadArtists();
+		if (t === 'sittings' && !spoolHistoryLoaded) void loadSpoolHistory();
 		if (t === 'discover' && !discoverLoaded) void loadDiscover();
 		if (t === 'instance' && !instanceLoaded) void loadInstance();
 		// Through `syncUrl`, never `history.replaceState` — the latter wipes
@@ -999,6 +1025,26 @@
 		if (s < 3600) return `${Math.floor(s / 60)}m`;
 		if (s < 86400) return `${Math.floor(s / 3600)}h`;
 		return `${Math.floor(s / 86400)}d`;
+	}
+
+	/** How long a sitting ran, as words. */
+	function spanOf(from: number, to: number) {
+		const m = Math.max(0, Math.round((to - from) / 60));
+		if (m < 1) return 'a moment';
+		if (m < 60) return `${m} min`;
+		const h = Math.floor(m / 60);
+		const rest = m % 60;
+		return rest ? `${h}h ${rest}m` : `${h}h`;
+	}
+
+	/** "with Noor and Tobias" — everybody else who was there, decks and guests
+	 *  alike. `present` already leaves the reader out. */
+	function withList(sit: SpoolSummary) {
+		const names = [...sit.present, ...sit.guests];
+		if (!names.length) return 'On your own';
+		if (names.length === 1) return `with ${names[0]}`;
+		const last = names[names.length - 1];
+		return `with ${names.slice(0, -1).join(', ')} and ${last}`;
 	}
 
 	function dayLabel(ts: number) {
@@ -1577,6 +1623,56 @@
 			<div class="esub">
 				Nothing yet. Artists appear here once a deck you're patched into plays something
 				it publishes to you.
+			</div>
+		</div>
+	{/if}
+{:else if tab === 'sittings'}
+	<h2 class="h-display sech">Sittings</h2>
+	<p class="sub">
+		Evenings you were in the room for. They stay here whatever happens to the patch
+		afterwards — you were there.
+	</p>
+	{#if spoolHistory.length}
+		<div class="sitlist">
+			{#each spoolHistory as sit (sit.uuid)}
+				<a class="sitrow" href={`/spool/${sit.uuid}`}>
+					<div class="sitmain">
+						<div class="sitname">
+							{sit.title || 'A sitting'}
+							{#if !sit.ended_at}<span class="running">running</span>{/if}
+						</div>
+						<div class="sitsub">
+							{new Date(sit.started_at * 1000).toLocaleDateString(undefined, {
+								weekday: 'short',
+								day: 'numeric',
+								month: 'short',
+								year: 'numeric'
+							})}
+							{#if sit.ended_at}
+								· {spanOf(sit.started_at, sit.ended_at)}
+							{/if}
+							· {sit.plays}
+							{sit.plays === 1 ? 'play' : 'plays'}
+						</div>
+						<div class="sitwith">
+							{withList(sit)}
+						</div>
+					</div>
+					<div class="sitside">
+						{#if sit.pending}
+							<span class="pend">{sit.pending} waiting</span>
+						{/if}
+						{#if sit.notes}<span class="noted">noted</span>{/if}
+						<span class="chev">›</span>
+					</div>
+				</a>
+			{/each}
+		</div>
+	{:else}
+		<div class="panel empty">
+			<div class="esub">
+				No sittings yet. Start a Shared Spool when you are listening with somebody, and
+				the evening lands here when it is over.
 			</div>
 		</div>
 	{/if}
@@ -3342,4 +3438,81 @@
 		cursor: pointer;
 	}
 	.linkish:hover { color: var(--td-accent-hi); }
+
+	/* ── Sittings ─────────────────────────────────────────────────────── */
+	.sitlist {
+		display: flex;
+		flex-direction: column;
+		border: 1px solid var(--td-border);
+		border-radius: 14px;
+		overflow: hidden;
+		background: var(--td-surface);
+	}
+	.sitrow {
+		display: flex;
+		align-items: center;
+		gap: 12px;
+		padding: 14px 16px;
+		border-top: 1px solid var(--td-border);
+		text-decoration: none;
+		color: inherit;
+	}
+	.sitrow:first-child {
+		border-top: none;
+	}
+	.sitrow:hover {
+		background: var(--td-surface2);
+	}
+	.sitmain {
+		flex: 1;
+		min-width: 0;
+	}
+	.sitname {
+		font-size: 15px;
+		font-weight: 600;
+	}
+	.sitsub,
+	.sitwith {
+		font-size: 12px;
+		color: var(--td-muted);
+		margin-top: 2px;
+	}
+	.running {
+		font-size: 10px;
+		text-transform: uppercase;
+		letter-spacing: 0.06em;
+		color: var(--td-accent);
+		border: 1px solid var(--td-accent);
+		border-radius: 5px;
+		padding: 1px 5px;
+		margin-left: 6px;
+		vertical-align: middle;
+	}
+	.sitside {
+		display: flex;
+		align-items: center;
+		gap: 10px;
+		flex: none;
+	}
+	.pend {
+		font-size: 11px;
+		color: var(--td-accent);
+		border: 1px solid var(--td-accent);
+		border-radius: 6px;
+		padding: 2px 6px;
+	}
+	.noted {
+		font-size: 11px;
+		color: var(--td-muted);
+	}
+	.chev {
+		color: var(--td-muted);
+		font-size: 18px;
+	}
+	@media (max-width: 560px) {
+		.sitside .noted {
+			display: none;
+		}
+	}
+
 </style>

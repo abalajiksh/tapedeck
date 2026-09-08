@@ -2004,9 +2004,13 @@ pub struct SpoolSummary {
     pub hosting: bool,
     pub host_username: String,
     pub host_display_name: Option<String>,
-    /// Everyone who was actually in the room, the caller included — the
-    /// screen decides whether to leave the reader out, because only it knows
-    /// whether it is writing "with Noor" or listing attendance.
+    /// Who else was actually in the room — the caller is left out here.
+    ///
+    /// [`SpoolDetail`] keeps everybody and hands over a `viewer_id`, because a
+    /// page listing attendance has to be able to show you your own row. A
+    /// summary has one use, which is the sentence "with Noor and Tobias", and
+    /// giving it a roster plus an id to subtract would be handing every caller
+    /// the same small filter to get wrong.
     pub present: Vec<String>,
     /// Names with no account on this instance.
     pub guests: Vec<String>,

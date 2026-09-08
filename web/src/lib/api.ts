@@ -570,7 +570,78 @@ export interface SpoolMember {
 	user_id: number;
 	username: string;
 	display_name: string | null;
+	/** invited | joined | left | declined.
+	 *
+	 *  Leaving a sitting you were in and saying no to an invitation are
+	 *  different answers, and only one of them means you were there. */
 	state: string;
+	/** When they were in the room from, or null for the whole sitting — which
+	 *  is the common case, not a missing value. */
+	present_from: number | null;
+	/** When they left, or null for stayed to the end. */
+	present_until: number | null;
+}
+
+/** One sitting on the history list. */
+export interface SpoolSummary {
+	uuid: string;
+	title: string | null;
+	notes: string | null;
+	started_at: number;
+	ended_at: number | null;
+	hosting: boolean;
+	host_username: string;
+	host_display_name: string | null;
+	/** Who else was actually in the room — you are left out.
+	 *
+	 *  `SpoolDetail` keeps everybody and hands over a `viewer_id`, because a
+	 *  page listing attendance has to show you your own row. This has one use:
+	 *  the sentence "with Noor and Tobias". */
+	present: string[];
+	/** Names with no account here. */
+	guests: string[];
+	plays: number;
+	pending: number;
+}
+
+/** One play on a sitting's timeline, whoever's deck it came off. */
+export interface SpoolPlay {
+	title: string;
+	artist: string;
+	album: string | null;
+	duration: number | null;
+	played_at: number;
+	from_username: string;
+	from_display_name: string | null;
+	/** `mine` | `accepted` | `declined` | `pending` | `theirs`.
+	 *
+	 *  Declined and never-answered are told apart deliberately: both mean "not
+	 *  in my history" and they are not the same decision. */
+	standing: string;
+	capture_id: number | null;
+	artwork_url: string | null;
+	caa_id: number | null;
+	caa_release_mbid: string | null;
+}
+
+/** A sitting, in full. */
+export interface SpoolDetail {
+	uuid: string;
+	viewer_id: number;
+	title: string | null;
+	notes: string | null;
+	started_at: number;
+	ended_at: number | null;
+	host_user_id: number;
+	hosting: boolean;
+	my_state: string;
+	members: SpoolMember[];
+	guests: string[];
+	plays: SpoolPlay[];
+	/** Plays that happened here and are not shown, because they ran through
+	 *  chains their owner does not share. Stated rather than dropped — a
+	 *  timeline with invisible holes misrepresents the evening. */
+	withheld: number;
 }
 
 export interface SpoolView {
@@ -588,6 +659,9 @@ export interface SpoolView {
 	hosting: boolean;
 	my_state: string;
 	members: SpoolMember[];
+	/** Names with no account here, so a banner can say who else is in the room
+	 *  rather than only who else has a deck. */
+	guests: string[];
 	captured: number;
 }
 
@@ -2259,8 +2333,103 @@ class TapedeckAPI {
 		return this.get('/api/v1/patch/spool');
 	}
 
-	async startSpool(body: { title?: string | null; with: string[] }): Promise<{ uuid: string }> {
+	async startSpool(body: {
+		title?: string | null;
+		with: string[];
+		guests?: string[];
+	}): Promise<{ uuid: string }> {
 		return this.request('POST', '/api/v1/patch/spool', body);
+	}
+
+	/** Every sitting you were in, newest first.
+	 *
+	 *  **Membership is the gate, not the patch** — you were in the room, and
+	 *  un-patching afterwards has no standing to un-happen an evening you
+	 *  attended. What it shows is still gated by the per-chain switch. */
+	async getSpoolHistory(limit = 50): Promise<{ sittings: SpoolSummary[] }> {
+		return this.get(`/api/v1/patch/spools?limit=${limit}`);
+	}
+
+	async getSpoolDetail(uuid: string): Promise<SpoolDetail> {
+		return this.get(`/api/v1/patch/spools/${encodeURIComponent(uuid)}`);
+	}
+
+	/** Name a sitting, write about it, or say who else was there. The host's.
+	 *
+	 *  An omitted field is left alone and an explicit null clears it, which is
+	 *  why `title` and `notes` are `string | null | undefined`. */
+	async editSpool(
+		uuid: string,
+		body: { title?: string | null; notes?: string | null; guests?: string[] }
+	): Promise<{ saved: boolean }> {
+		return this.request('PATCH', `/api/v1/patch/spools/${encodeURIComponent(uuid)}`, body);
+	}
+
+	/** Add people to a sitting that has already started, or already ended.
+	 *
+	 *  `present_from` absent means they were here all along and are offered the
+	 *  whole evening — the common case by a distance. */
+	async addSpoolMembers(
+		uuid: string,
+		body: { with: string[]; present_from?: number | null }
+	): Promise<{ added: number }> {
+		return this.request(
+			'POST',
+			`/api/v1/patch/spools/${encodeURIComponent(uuid)}/members`,
+			body
+		);
+	}
+
+	/** Correct when *you* were in the room. Returns how many plays that has
+	 *  just put in your inbox. */
+	async setSpoolPresence(
+		uuid: string,
+		body: { present_from?: number | null; present_until?: number | null }
+	): Promise<{ offered: number }> {
+		return this.request(
+			'PUT',
+			`/api/v1/patch/spools/${encodeURIComponent(uuid)}/presence`,
+			body
+		);
+	}
+
+	/** Fix when a capture was played, before it becomes a listen — the cheapest
+	 *  correction there is, because nothing is in a history yet. */
+	async setCaptureTime(id: number, playedAt: number): Promise<{ saved: boolean }> {
+		return this.request('PATCH', `/api/v1/patch/captures/${id}`, { played_at: playedAt });
+	}
+
+	async getSpoolChain(): Promise<{ chain_id: number | null }> {
+		return this.get('/api/v1/profile/spool-chain');
+	}
+
+	/** The chain a play accepted out of a room is filed under. Null files it
+	 *  under nothing, which is the default. */
+	async setSpoolChain(chainId: number | null): Promise<{ saved: boolean }> {
+		return this.request('PUT', '/api/v1/profile/spool-chain', { chain_id: chainId });
+	}
+
+	/** Move listens in time by an offset.
+	 *
+	 *  An offset rather than an absolute time because that is the shape of the
+	 *  actual failure — a clock out by an hour moves a *run* by a *constant*,
+	 *  and a constant cannot scramble an ordering. For one listen, subtract.
+	 *
+	 *  `already_forwarded` and `grouping_stale` are the two things it cannot
+	 *  reach and therefore has to report. */
+	async shiftListenTimes(
+		ids: number[],
+		offsetSeconds: number
+	): Promise<{
+		moved: number;
+		already_forwarded: number;
+		sessions_touched: number;
+		grouping_stale: boolean;
+	}> {
+		return this.request('POST', '/api/v1/scrobbles/bulk-time', {
+			ids,
+			offset_seconds: offsetSeconds
+		});
 	}
 
 	/** Answering an invitation. `offered` is the backlog joining has just put

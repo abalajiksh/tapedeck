@@ -1615,6 +1615,7 @@ impl Database {
             "SELECT m.spool_id, COALESCE(u.display_name, u.username)
                FROM spool_members m JOIN users u ON u.id = m.user_id
               WHERE m.spool_id IN ({id_marks}) AND m.state IN ('joined', 'left')
+                AND m.user_id != ?
               ORDER BY u.username"
         );
         let stmt = crate::sql!(&sql);
@@ -1622,7 +1623,7 @@ impl Database {
         for id in &ids {
             q = q.bind(id);
         }
-        let member_rows = q.fetch_all(&self.pool).await?;
+        let member_rows = q.bind(user_id).fetch_all(&self.pool).await?;
 
         // Plays that reached the timeline, counted the way the page will draw
         // them: originals only, and only those this caller may see.

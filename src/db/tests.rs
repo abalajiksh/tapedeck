@@ -8450,7 +8450,14 @@ async fn a_sitting_is_one_row_per_play_however_many_decks_were_in_it() {
     assert_eq!(hist.len(), 1);
     assert_eq!(hist[0].plays, 2);
     assert_eq!(hist[0].pending, 0);
-    assert!(hist[0].present.iter().any(|n| n == "kim"), "both decks were in the room");
+    assert!(
+        hist[0].present.iter().any(|n| n == "kim"),
+        "the other deck was in the room"
+    );
+    assert!(
+        !hist[0].present.iter().any(|n| n == "ash"),
+        "and the summary leaves the reader out — it exists to write 'with Kim'"
+    );
 }
 
 /// A sitting shows what the sharing switch allows and **says how much it is not
