@@ -28,10 +28,22 @@
 	} from '$lib/api';
 	import CoverArt from '$lib/components/CoverArt.svelte';
 	import ChainIcon from '$lib/components/ChainIcon.svelte';
+	import ToTop from '$lib/components/ToTop.svelte';
 	import { goto } from '$app/navigation';
 	import { syncUrl } from '$lib/url';
 	import { openArtist } from '$lib/entities';
 	import { lovedKeys, isLovedNamed, toggleLoveByName, loadLoves } from '$lib/loves';
+
+	// A sitting is routinely a hundred plays, and the decision under them —
+	// Accept N — was three thousand pixels below the card's own heading. Past
+	// this many the list scrolls inside its card rather than pushing the page
+	// down, which is the containment the notes page's Loved digest and the
+	// Statistics top lists already use.
+	//
+	// It pairs with `.sittracks.scrolls`'s max-height, which is set so the cut
+	// falls part-way down a row: a half-row at the fold is what says there is
+	// more, since an overlay scrollbar shows nothing until you touch it.
+	const CAPTURE_PREVIEW = 7;
 
 	type Tab = 'reel' | 'artists' | 'decks' | 'sittings' | 'discover' | 'instance' | 'inbox';
 	let tab: Tab = 'reel';
@@ -525,8 +537,24 @@
 		}
 	}
 
-	const pickedIn = (sit: { rows: SpoolCapture[] }) =>
-		sit.rows.filter((c) => picked.has(c.id)).map((c) => c.id);
+	// **Named, not called through.** `pickedIn(sit)` was a plain function reading
+	// `picked` out of the closure, and `Accept {pickedIn(sit).length} plays` is a
+	// template expression naming `pickedIn` and `sit` — never `picked` — so it
+	// did not re-run when a row was un-ticked. The button went on saying "Accept
+	// 44 plays" over 42 ticks and then correctly accepted 42, because the click
+	// handler reads the set at click time. A label that misreports an
+	// irreversible action by two rows.
+	//
+	// Fifth instance of the trap already recorded for `clock`, `noteCurrentTrack`
+	// and `sideTotals`: a reactive statement depends on what it *names*, so the
+	// filter is inlined here where `picked` is written down.
+	$: pickedBySitting = new Map(
+		captureSittings.map((sit) => [
+			sit.uuid,
+			sit.rows.filter((c) => picked.has(c.id)).map((c) => c.id)
+		])
+	);
+	const pickedIn = (uuid: string): number[] => pickedBySitting.get(uuid) ?? [];
 	$: openDubs = dubs.filter((d) => d.status === 'open');
 	$: unseenSittings = sittings.filter((h) => !h.seen_at);
 	// One number on the tab. Three kinds of thing wait in that inbox and a
@@ -2254,7 +2282,7 @@
 					<span class="tag">{sit.rows.length} pending</span>
 				</div>
 
-				<div class="sittracks">
+				<div class="sittracks" class:scrolls={sit.rows.length > CAPTURE_PREVIEW}>
 					{#each sit.rows as c (c.id)}
 						<label class="sittrack" class:on={picked.has(c.id)}>
 							<input
@@ -2313,14 +2341,24 @@
 				<div class="bulk">
 					<button
 						class="btn btn-primary"
-						disabled={busy === 'captures' || !pickedIn(sit).length}
-						on:click={() => settleCaptures(pickedIn(sit), true)}
+						disabled={busy === 'captures' || !(pickedBySitting.get(sit.uuid)?.length ?? 0)}
+						on:click={() => settleCaptures(pickedIn(sit.uuid), true)}
 					>
-						Accept {pickedIn(sit).length} play{pickedIn(sit).length === 1 ? '' : 's'}
+						Accept {pickedBySitting.get(sit.uuid)?.length ?? 0} play{(pickedBySitting.get(
+							sit.uuid
+						)?.length ?? 0) === 1
+							? ''
+							: 's'}
 					</button>
+					<!-- It declines **every** row, ticked ones included, which is right —
+					     the gesture is "bin this evening", and sparing the ticks would
+					     leave a button that does nothing for somebody who un-ticked
+					     nothing. So the count is on the label: declining is permanent,
+					     an already-settled capture is never re-offered, and "the rest"
+					     alone reads as though it spares what you ticked. -->
 					<button class="btn btn-secondary" disabled={busy === 'captures'}
 						on:click={() => settleCaptures(sit.rows.map((c) => c.id), false)}>
-						Decline the rest
+						Decline all {sit.rows.length}
 					</button>
 					<span class="esub" style="margin:0;">
 						Accepted plays land in your history credited to {sit.from}'s deck — and are
@@ -2606,6 +2644,8 @@
 		</div>
 	</div>
 {/if}
+
+<ToTop />
 
 <style>
 	.head {
@@ -3051,12 +3091,17 @@
 	}
 
 	/* — the open-up nudge — */
+	/* `.panel` is a surface, a border and a radius and carries **no padding** —
+	   every user supplies its own, inline or through a companion class. This one
+	   never did, so the heading sat on the left border and "Not now" ended flush
+	   against the right one, which reads as a control clipped off the card. */
 	.opennudge {
 		display: flex;
 		align-items: flex-start;
 		gap: 16px;
 		flex-wrap: wrap;
 		margin-bottom: 16px;
+		padding: 18px 20px;
 	}
 	/* The deck-level gate reads as the row above the per-chain ones, not as one
 	   of them: it is the decision they sit under. */
@@ -3217,6 +3262,14 @@
 	.sittitle { font-size: 15px; font-weight: 600; }
 	.sitwhen { font-size: 12.5px; color: var(--td-muted-2); margin-top: 2px; }
 	.sittracks { display: flex; flex-direction: column; gap: 5px; margin-bottom: 14px; }
+	/* 480px is a little over seven rows at this row height, so the eighth is cut
+	   part-way down — which is the affordance. A height landing exactly on a row
+	   boundary leaves a list that looks complete and silently is not. */
+	.sittracks.scrolls {
+		max-height: 480px;
+		overflow-y: auto;
+		padding-right: 5px;
+	}
 	.sittrack {
 		display: flex;
 		align-items: center;

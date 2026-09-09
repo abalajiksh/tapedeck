@@ -16,6 +16,7 @@
 	import type { SpoolDetail, SpoolMember, SpoolPlay, PatchPeer } from '$lib/api';
 	import CoverArt from '$lib/components/CoverArt.svelte';
 	import ShareChapter from '$lib/components/reports/ShareChapter.svelte';
+	import ToTop from '$lib/components/ToTop.svelte';
 
 	let sitting: SpoolDetail | null = null;
 	let sharing = false;
@@ -527,6 +528,11 @@
 		</div>
 	</div>
 {/if}
+
+<!-- The timeline is one row per play and an evening runs to a hundred of them.
+     No scroller here, unlike the inbox card: this page *is* the evening, so
+     reading down it is the point — what was missing was the way back up. -->
+<ToTop />
 
 <style>
 	.back {
