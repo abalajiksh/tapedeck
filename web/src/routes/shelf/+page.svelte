@@ -1700,31 +1700,6 @@
 	</div>
 {/if}
 
-<!--
-	**The shelf is where the record player is**, and it is the one surface
-	that knew nothing about Shared Spools — you could drop a needle in a
-	room with three people and get no sign that a sitting was capturing, or
-	that one could be.
-
-	It reports rather than starting one. Opening a sitting needs a guest
-	list, and a second copy of that dialog is a second place for the consent
-	guard and the "from when" question to drift — so this says what is
-	happening and points at the page that owns it.
--->
-{#if sitting}
-	<a class="spoolbar" href="/patch">
-		<span class="sp-dot"></span>
-		<span
-			>Capturing into <strong>{sitting.title || 'a Shared Spool'}</strong> — every side
-			you record is offered to everyone in it.</span
-		>
-	</a>
-{:else if canSpool}
-	<a class="spoolbar quiet" href="/patch">
-		<span>Listening with somebody? Start a Shared Spool →</span>
-	</a>
-{/if}
-
 {#if !spinning}
 	<div class="idle">
 		<svg viewBox="0 0 120 120" width="86" height="86" aria-hidden="true">
@@ -1811,6 +1786,38 @@
 			<button class="btn btn-secondary" on:click={() => (flip = null)}>Not now</button>
 		</div>
 	</div>
+{/if}
+
+<!--
+	**The shelf is where the record player is**, and it is the one surface
+	that knew nothing about Shared Spools — you could drop a needle in a
+	room with three people and get no sign that a sitting was capturing, or
+	that one could be.
+
+	It reports rather than starting one. Opening a sitting needs a guest
+	list, and a second copy of that dialog is a second place for the consent
+	guard and the "from when" question to drift — so this says what is
+	happening and points at the page that owns it.
+
+	It sits *under* the deck rather than above it, because both halves are
+	about what recording a side will do — and the two halves are not the same
+	weight. A sitting that is running is live information about this deck and
+	earns a bar; an offer to start one is a suggestion, and a full-width
+	dashed banner in the slot a warning would occupy reads as an alert about
+	nothing.
+-->
+{#if sitting}
+	<a class="spoolbar" href="/patch">
+		<span class="sp-dot"></span>
+		<span
+			>Capturing into <strong>{sitting.title || 'a Shared Spool'}</strong> — every side
+			you record is offered to everyone in it.</span
+		>
+	</a>
+{:else if canSpool}
+	<p class="spoolhint">
+		Listening with somebody? <a href="/patch">Start a Shared Spool →</a>
+	</p>
 {/if}
 
 <!-- What the setup is wearing out. A stylus is a consumable with a life in
@@ -2891,12 +2898,14 @@
 		flex-wrap: wrap;
 	}
 
-	/* Whether a Shared Spool is capturing what this deck plays. */
+	/* Whether a Shared Spool is capturing what this deck plays. A running
+	   sitting is live information about this deck, so it gets the bar; the
+	   offer to start one is `.spoolhint` below and gets a line. */
 	.spoolbar {
 		display: flex;
 		align-items: center;
 		gap: 10px;
-		margin: -6px 0 18px;
+		margin: 16px 0 0;
 		padding: 10px 14px;
 		border: 1px solid var(--td-accent);
 		border-radius: 12px;
@@ -2906,11 +2915,16 @@
 		text-decoration: none;
 		line-height: 1.45;
 	}
-	.spoolbar.quiet {
-		border-style: dashed;
-		border-color: var(--td-border);
+	.spoolhint {
+		margin: 14px 0 0;
 		color: var(--td-muted);
+		font-size: 13px;
 	}
+	.spoolhint a {
+		color: var(--td-accent);
+		text-decoration: none;
+	}
+	.spoolhint a:hover { text-decoration: underline; }
 	.spoolbar:hover { border-color: var(--td-accent); }
 	.sp-dot {
 		flex: none;
