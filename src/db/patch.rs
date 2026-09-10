@@ -1541,6 +1541,15 @@ impl Database {
     ///
     /// A running sitting still wins, so somebody with a stale invitation and a
     /// live room sees the live one.
+    ///
+    /// **The answer is what makes the banner go, and that has to be true of a
+    /// running sitting too.** The first version narrowed on the *sitting*
+    /// (`ended_at IS NULL`) and never on the member's own state, so somebody
+    /// who had left a live room — or declined an invitation into one — kept
+    /// the banner, and the Leave button on it went on writing `left` over
+    /// `left` for ever. The row moved, the screen did not, and from the outside
+    /// that is a button that does nothing. Membership is a state with two ways
+    /// out of it and neither of them is a sitting the banner still shows.
     pub async fn active_spool(&self, user_id: i64) -> Result<Option<SpoolView>, sqlx::Error> {
         #[allow(clippy::type_complexity)]
         let Some(row): Option<(
@@ -1557,7 +1566,8 @@ impl Database {
                         m.state, sp.guests
                    FROM spools sp
                    JOIN spool_members m ON m.spool_id = sp.id AND m.user_id = ?
-                  WHERE sp.ended_at IS NULL OR m.state = 'invited'
+                  WHERE (m.state = 'joined' AND sp.ended_at IS NULL)
+                     OR m.state = 'invited'
                   ORDER BY sp.ended_at IS NULL DESC, sp.started_at DESC LIMIT 1",
         ))
         .bind(user_id)

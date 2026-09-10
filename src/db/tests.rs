@@ -6070,6 +6070,48 @@ async fn no_thanks_dismisses_an_invitation_for_good() {
     assert!(db.active_spool(me).await.unwrap().is_none());
 }
 
+/// Leaving a sitting that is still going takes it off the screen.
+///
+/// The reported bug, and it read as *"I cannot leave a Shared Spool"* because
+/// the leaving worked perfectly: `set_spool_membership` wrote `left`, and the
+/// banner — which narrowed on the sitting being open and never on the member's
+/// own state — came straight back with its Leave button. Pressing it again
+/// wrote `left` over `left`.
+///
+/// Note where its sibling above could not have caught this: that test declines
+/// an invitation into a sitting the host has already **ended**, which is the
+/// one case where `m.state = 'invited'` was the only reason the banner
+/// appeared, so answering removed it whatever the rest of the clause said.
+/// Both ways out are asserted here against a room that is still open.
+#[tokio::test]
+async fn answering_a_live_sitting_takes_its_banner_away() {
+    let db = testdb().await;
+    let (me, them, _) = patched_pair(&db).await;
+
+    let spool = db.start_spool(them, None, &[me], &[]).await.unwrap();
+    db.set_spool_membership(&spool, me, true).await.unwrap();
+    assert!(db.active_spool(me).await.unwrap().is_some(), "in the room, so the banner is right");
+
+    assert_eq!(db.set_spool_membership(&spool, me, false).await.unwrap(), Some(("left".into(), 0)));
+    assert!(db.active_spool(me).await.unwrap().is_none(), "went home, and the room is still open");
+
+    // The host is still in it, and leaving is one person's decision.
+    assert!(db.active_spool(them).await.unwrap().is_some());
+
+    // And the same for somebody who never joined: declining an invitation into
+    // a room that is still open is an answer, so it dismisses it too.
+    let third = db.create_user("noor", None, "pw", "user").await.unwrap();
+    let uuid = db.request_patch(third, them).await.unwrap();
+    db.settle_patch(&uuid, them, true).await.unwrap();
+    db.add_spool_members(&spool, them, &[third], None).await.unwrap();
+    assert!(db.active_spool(third).await.unwrap().is_some(), "invited");
+    assert_eq!(
+        db.set_spool_membership(&spool, third, false).await.unwrap(),
+        Some(("declined".into(), 0))
+    );
+    assert!(db.active_spool(third).await.unwrap().is_none());
+}
+
 /// **A sitting does not bypass the sharing switch.**
 ///
 /// The other reading is defensible — a spool is a bounded event both people
