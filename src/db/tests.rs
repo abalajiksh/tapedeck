@@ -2410,12 +2410,14 @@ async fn chain_and_gear_hours_follow_the_listens_however_late_they_are_assigned(
                     component_type: ComponentType::Dac,
                     name: "Bifrost 2".into(),
                     detail: None,
+                    since: None,
                     equipment_id: Some(gear),
                 },
                 ChainComponent {
                     component_type: ComponentType::Transport,
                     name: "Bifrost 2".into(),
                     detail: None,
+                    since: None,
                     equipment_id: Some(gear),
                 },
             ],
@@ -3063,12 +3065,14 @@ async fn a_variant_moves_the_wear_onto_the_gear_that_was_fitted() {
                     component_type: ComponentType::Source,
                     name: "LP5X".into(),
                     detail: None,
+                    since: None,
                     equipment_id: Some(deck),
                 },
                 ChainComponent {
                     component_type: ComponentType::Source,
                     name: "Elliptical".into(),
                     detail: None,
+                    since: None,
                     equipment_id: Some(ell),
                 },
             ],
@@ -6204,6 +6208,7 @@ async fn promoting_a_variant_moves_no_hours() {
         component_type: ComponentType::Transducer,
         name: name.into(),
         detail: None,
+        since: None,
         equipment_id: Some(id),
     };
 
@@ -6329,6 +6334,7 @@ async fn promoting_repoints_the_listens_both_ways() {
                 component_type: ComponentType::Transducer,
                 name: "HD 650".into(),
                 detail: None,
+                since: None,
                 equipment_id: None,
             }],
             listening_context: ListeningContext::Unknown,
@@ -6400,6 +6406,7 @@ async fn retagging_a_listen_s_chain_does_not_leave_a_stale_setup() {
             component_type: ComponentType::Transducer,
             name: "Cans".into(),
             detail: None,
+            since: None,
             equipment_id: None,
         }],
         listening_context: ListeningContext::Unknown,
@@ -7495,6 +7502,7 @@ async fn chain_of(db: &Database, uid: i64, name: &str, steps: &[(&str, i64)]) ->
                 component_type: ComponentType::Transducer,
                 name: (*n).into(),
                 detail: None,
+                since: None,
                 equipment_id: Some(*g),
             })
             .collect(),
@@ -7527,6 +7535,100 @@ async fn hour_on(db: &Database, uid: i64, chain: i64, ts: u64) {
     )
     .await
     .unwrap();
+}
+
+/// The reported bug: a subwoofer bought on Tuesday reporting a year of use.
+///
+/// Chain hours are derived from the listens, which is right — assigning a chain
+/// to an old listen really does mean it ran through that chain. What it cannot
+/// mean is that every *box* the chain names today was in the path back then,
+/// and without a date the two are the same statement.
+///
+/// Asserted on the **readout** rather than on the stamp, because a `since`
+/// written into the blob and ignored by the sum is the same screen as no
+/// `since` at all.
+#[tokio::test]
+async fn gear_added_to_an_old_chain_is_not_credited_with_the_chain_s_past() {
+    let db = testdb().await;
+    let uid = db.create_user("ash", None, "pw", "user").await.unwrap();
+
+    let pc = db
+        .upsert_equipment(uid, "Dell Precision", "computer", None, None, 0.0, None)
+        .await
+        .unwrap();
+    let dac = db.upsert_equipment(uid, "Mimir", "dac", None, None, 0.0, None).await.unwrap();
+    let mon = db.upsert_equipment(uid, "MR4", "speakers", None, None, 0.0, None).await.unwrap();
+    let sub =
+        db.upsert_equipment(uid, "Eris Sub 8BT", "subwoofer", None, None, 0.0, None).await.unwrap();
+
+    let desk = chain_of(
+        &db,
+        uid,
+        "Casual Desktop",
+        &[("Dell Precision", pc), ("Mimir", dac), ("MR4", mon)],
+    )
+    .await;
+
+    // Two hours long before anybody owned a subwoofer.
+    let old = Database::now_secs() as i64 - 400 * 86_400;
+    hour_on(&db, uid, desk, old as u64).await;
+    hour_on(&db, uid, desk, old as u64 + 3_600).await;
+
+    // It goes in the middle, which is the half a position comparison gets
+    // wrong: the monitors move down a slot without changing.
+    let step = |name: &str, gear: i64, since: Option<i64>| ChainComponent {
+        component_type: ComponentType::Transducer,
+        name: name.into(),
+        detail: None,
+        since,
+        equipment_id: Some(gear),
+    };
+    let with_sub = vec![
+        step("Dell Precision", pc, None),
+        step("Mimir", dac, None),
+        step("Eris Sub 8BT", sub, None),
+        step("MR4", mon, None),
+    ];
+    assert!(db
+        .update_chain(uid, desk, "Casual Desktop", None, &with_sub, "active", None)
+        .await
+        .unwrap());
+
+    let (secs, _) = db.equipment_seconds(uid).await.unwrap();
+    assert_eq!(secs.get(&sub), None, "the subwoofer was not in the path for any of it");
+    assert_eq!(secs.get(&pc), Some(&7_200), "the computer was there throughout");
+    assert_eq!(secs.get(&dac), Some(&7_200));
+    assert_eq!(secs.get(&mon), Some(&7_200), "and so were the monitors, one slot down");
+
+    // An hour since, and the subwoofer has it.
+    hour_on(&db, uid, desk, Database::now_secs() as u64 + 60).await;
+    let (secs, _) = db.equipment_seconds(uid).await.unwrap();
+    assert_eq!(secs.get(&sub), Some(&3_600), "everything played since it arrived");
+    assert_eq!(secs.get(&mon), Some(&10_800), "the monitors keep all three hours");
+
+    // The stamp is "when this was saved", which is usually a few days after the
+    // box actually arrived — so it is correctable, and a correction has to
+    // survive the next unrelated edit or it is not a correction.
+    let stored = db.get_chains(uid).await.unwrap();
+    let mut comps = stored.iter().find(|c| c.id == Some(desk)).unwrap().components.clone();
+    let i = comps.iter().position(|c| c.equipment_id == Some(sub)).unwrap();
+    assert!(comps[i].since.is_some(), "adding gear dates it");
+    comps[i].since = Some(old - 86_400);
+    assert!(db.update_chain(uid, desk, "Desk", None, &comps, "active", None).await.unwrap());
+
+    let (secs, _) = db.equipment_seconds(uid).await.unwrap();
+    assert_eq!(secs.get(&sub), Some(&10_800), "backdated on purpose, so it has the lot");
+
+    // And clearing it means "it was always here" rather than being re-stamped
+    // as new — the chain names it already, so nothing about it is arriving.
+    comps[i].since = None;
+    assert!(db.update_chain(uid, desk, "Desk", None, &comps, "active", None).await.unwrap());
+    let stored = db.get_chains(uid).await.unwrap();
+    let c = stored.iter().find(|c| c.id == Some(desk)).unwrap();
+    assert!(
+        c.components.iter().find(|c| c.equipment_id == Some(sub)).unwrap().since.is_none(),
+        "a cleared date stays cleared"
+    );
 }
 
 /// The complaint this exists for: two chains differing by one box, each

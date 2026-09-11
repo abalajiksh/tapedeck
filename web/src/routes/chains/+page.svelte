@@ -490,6 +490,10 @@
 		{ v: 'headphones', label: 'Headphones' },
 		{ v: 'iem', label: 'IEM' },
 		{ v: 'speakers', label: 'Speakers' },
+		// The chain icons have had a subwoofer since v0.50.0 and the gear list
+		// never did, so a sub had to be filed as speakers — which then reads as
+		// a second pair in every slot that offers transducers.
+		{ v: 'subwoofer', label: 'Subwoofer' },
 		{ v: 'builtin-speakers', label: 'Built-in speakers (phone / laptop)' },
 		{ v: 'earbuds', label: 'Wireless earbuds' },
 		{ v: 'dac', label: 'DAC' },
@@ -535,6 +539,9 @@
 	// selection and freely overridable, never re-applied afterwards.
 	const componentTypeForGear: Record<string, string> = {
 		headphones: 'transducer', iem: 'transducer', speakers: 'transducer',
+		// A sub is a second transducer beside the mains rather than a stage the
+		// signal passes through — it lands in the same slot as the speakers.
+		subwoofer: 'transducer',
 		'builtin-speakers': 'transducer', earbuds: 'bluetooth',
 		dac: 'dac', 'dac-amp': 'dac', interface: 'dac', receiver: 'dac',
 		amp: 'amp', preamp: 'amp',
@@ -649,7 +656,35 @@
 		cComps = c.components?.length ? c.components.map((x) => ({ ...x })) : [blankComp('source')];
 		chainOpen = true;
 	}
-	const blankComp = (type: string): ChainComponent => ({ type, name: '', detail: null, equipment_id: null });
+	const blankComp = (type: string): ChainComponent => ({ type, name: '', detail: null, equipment_id: null, since: null });
+
+	// ── when a box joined the path ──
+	//
+	// Chain hours are derived from the listens, so a box added to a chain that
+	// already has history is otherwise credited with all of it — a subwoofer
+	// bought on Tuesday reporting a year of use. The server dates gear a chain
+	// did not name before, and this is where that date is corrected: it is
+	// stamped on the day you got round to saving, which is rarely the day the
+	// thing arrived.
+	//
+	// Quiet by default. Every row carrying a third control is the clutter the
+	// drawer was built to remove, so it is one line of muted text that becomes
+	// a date field when you press it.
+	let sinceOpen: Record<number, boolean> = {};
+	const dateValue = (secs?: number | null) =>
+		secs ? new Date(secs * 1000).toISOString().slice(0, 10) : '';
+	const sinceLabel = (secs?: number | null) =>
+		secs
+			? `in the path since ${new Date(secs * 1000).toLocaleDateString(undefined, { day: 'numeric', month: 'short', year: 'numeric' })}`
+			: 'in the path from the start';
+	function setSince(i: number, value: string) {
+		// Midday rather than midnight: the date is a day the user names, and a
+		// listen that afternoon should be on the near side of it whatever
+		// timezone they are in.
+		const t = value ? Math.floor(new Date(`${value}T12:00:00`).getTime() / 1000) : null;
+		cComps[i] = { ...cComps[i], since: t };
+		cComps = cComps;
+	}
 	function addComp() { cComps = [...cComps, blankComp('transducer')]; }
 	function rmComp(i: number) { cComps = cComps.filter((_, j) => j !== i); }
 
@@ -1369,6 +1404,10 @@
 									<span class="pswap" aria-hidden="true">swap</span>
 								</div>
 								{#if step.detail}<div style="font-size:12.5px;color:var(--td-muted-2);">{step.detail}</div>{/if}
+								<!-- Only where there is one: the great majority of steps have
+								     been there as long as the chain has, and saying so on
+								     every row would bury the one that has not. -->
+								{#if step.since}<div class="psince">{sinceLabel(step.since)}</div>{/if}
 							</button>
 						</div>
 					{/each}
@@ -1777,6 +1816,29 @@
 									{/if}
 									<button class="icon-btn danger" on:click={() => rmComp(i)} aria-label="Remove component">✕</button>
 								</div>
+								<!-- Empty means "for as long as the chain has existed", which
+								     is what every step written before this field meant. -->
+								<div class="cwhen">
+									{#if sinceOpen[i]}
+										<input
+											type="date"
+											class="input"
+											style="width:auto;padding:4px 8px;font-size:12.5px;"
+											value={dateValue(comp.since)}
+											aria-label="In the path since"
+											on:change={(e) => setSince(i, e.currentTarget.value)}
+										>
+										{#if comp.since}
+											<button class="linkish" on:click={() => setSince(i, '')}>from the start instead</button>
+										{/if}
+									{:else}
+										<button
+											class="linkish"
+											on:click={() => (sinceOpen = { ...sinceOpen, [i]: true })}
+											title="Hours are counted from here. A box added to a chain that already has history should not be credited with it."
+										>{sinceLabel(comp.since)}</button>
+									{/if}
+								</div>
 							{/each}
 							<button class="btn btn-ghost" style="align-self:flex-start;" on:click={addComp}>+ Add component</button>
 						</div>
@@ -2067,6 +2129,23 @@
 		width: 100%;
 	}
 	.pstep:hover, .pstep:focus-visible { background: var(--td-surface2); }
+	/* Svelte scopes styles per component, so this is repeated here rather than
+	   inherited from the four other pages that use it — matching them exactly
+	   matters more than deduplicating, and a class defined nowhere renders as a
+	   default browser button with nothing erroring. */
+	.linkish {
+		border: none;
+		background: none;
+		padding: 0;
+		font: inherit;
+		font-weight: 600;
+		color: var(--td-accent);
+		cursor: pointer;
+	}
+	.linkish:hover { color: var(--td-accent-hi); }
+	.cwhen { display: flex; align-items: center; gap: 8px; margin: -2px 0 4px 176px; }
+	@media (max-width: 560px) { .cwhen { margin-left: 0; } }
+	.psince { font-size: 12px; color: var(--td-muted-2); font-style: italic; margin-top: 1px; }
 	.pswap {
 		font-size: 10.5px;
 		letter-spacing: .1em;

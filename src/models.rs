@@ -466,6 +466,20 @@ pub struct ChainComponent {
     /// readable instead of blank.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub equipment_id: Option<i64>,
+    /// When this step joined the path, as unix seconds.
+    ///
+    /// **`None` means "for as long as the chain has existed"**, which is what
+    /// every component written before this field meant and is why it stays
+    /// absent from the JSON rather than defaulting to a date. Chain hours are
+    /// derived from the listens, so without this a box added to an existing
+    /// chain is credited with every hour the chain ever logged — a subwoofer
+    /// bought on Tuesday reporting a year of use on Wednesday.
+    ///
+    /// Stamped by [`Database::update_chain`] when a chain gains gear it did not
+    /// name before, and editable, because the honest date is usually a few days
+    /// before anybody got round to recording it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub since: Option<i64>,
 }
 
 /// One step of a chain, replaced.
@@ -707,6 +721,7 @@ mod tests {
             component_type: ComponentType::Transducer,
             name: name.into(),
             detail: None,
+            since: None,
             equipment_id: gear,
         }
     }
@@ -979,6 +994,10 @@ pub fn resolve_variant(
                     // position — keeping it under different gear is worse than
                     // nothing, and nothing errors.
                     detail: if o.equipment_id == c.equipment_id { c.detail.clone() } else { None },
+                    // And `since` describes the box rather than the slot, for
+                    // exactly the reason `detail` does: carried onto different
+                    // gear it would assert a date that box was never there.
+                    since: if o.equipment_id == c.equipment_id { c.since } else { None },
                     equipment_id: o.equipment_id,
                 });
             }
@@ -1001,6 +1020,9 @@ pub fn resolve_variant(
             component_type: ComponentType::Transducer,
             name: o.name.clone().unwrap_or_default(),
             detail: None,
+            // A variant's own steps are bounded by the listens that name the
+            // variant, so there is nothing for a date to add here.
+            since: None,
             equipment_id: o.equipment_id,
         });
     }
@@ -1057,6 +1079,7 @@ mod variant_promotion_tests {
             component_type: ComponentType::Transducer,
             name: name.into(),
             detail: None,
+            since: None,
             equipment_id: id,
         }
     }

@@ -3018,7 +3018,7 @@ dependencies = [
 
 [[package]]
 name = "tapedeck"
-version = "0.110.4"
+version = "0.111.0"
 dependencies = [
  "ammonia",
  "anyhow",

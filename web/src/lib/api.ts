@@ -450,6 +450,12 @@ export interface ChainComponent {
 	/** The `Equipment` row this step is, when picked from your gear. `name` is
 	 *  kept as a snapshot so the chain still reads if the gear is deleted. */
 	equipment_id?: number | null;
+	/** Unix seconds from which this box was in the path, or null for "as long
+	 *  as the chain has existed" — which is what every step written before this
+	 *  field meant. Chain hours are derived from the listens, so without it a
+	 *  box added to a chain that already has history is credited with all of
+	 *  it. Stamped by the server on gear a chain did not name before. */
+	since?: number | null;
 }
 
 export interface ChainInput {

@@ -6,6 +6,7 @@
 //! charges it twice.
 
 use super::*;
+use std::collections::hash_map::Entry;
 
 impl Database {
     pub async fn upsert_device(
@@ -626,24 +627,92 @@ impl Database {
             })
             .collect();
 
-        let grouped: Vec<(Option<i64>, Option<i64>, Option<i64>)> = sqlx::query_as(&crate::sql!(
-            "SELECT chain_id, chain_variant_id, SUM(duration)
+        // Every date at which some box joined some chain, oldest first. A step
+        // with no `since` contributes none, so an instance where nobody has
+        // ever added gear to an existing chain has an empty list here and the
+        // query below is the one it always was.
+        let mut cuts: Vec<i64> = base
+            .values()
+            .flatten()
+            .filter_map(|c| c.since)
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect();
+        cuts.sort_unstable();
+
+        // One scan, with an extra grouping column rather than a column per
+        // cut: `era` is how many of those dates a listen is on or after, so a
+        // listen's era says which arrangements of the chain it belongs to.
+        // Summing eras `>= i + 1` gives the listens a box fitted at `cuts[i]`
+        // was actually in the path for.
+        //
+        // Bucketed rather than fanned out into one conditional aggregate per
+        // cut because the result set stays chains × variants × eras — small —
+        // where the columns would grow with the dates. Same single-pass shape
+        // `get_dashboard_stats` folds into.
+        let era = if cuts.is_empty() {
+            "0".to_string()
+        } else {
+            let arms: String = (0..cuts.len())
+                .rev()
+                .map(|i| format!("WHEN timestamp >= ? THEN {} ", i + 1))
+                .collect();
+            format!("CASE {arms}ELSE 0 END")
+        };
+        // Both bindings are held: `crate::sql!` borrows, so the translated
+        // statement cannot outlive the string it was built from.
+        let raw = format!(
+            "SELECT chain_id, chain_variant_id, {era} AS era, SUM(duration)
                FROM scrobbles
               WHERE user_id = ? AND skipped = FALSE AND chain_id IS NOT NULL
-              GROUP BY chain_id, chain_variant_id"
-        ))
-        .bind(user_id)
-        .fetch_all(&self.pool)
-        .await?;
+              GROUP BY chain_id, chain_variant_id, era"
+        );
+        let stmt = crate::sql!(&raw);
+        let mut q = sqlx::query_as(&stmt);
+        // Newest first, matching the `WHEN` arms above — the placeholders are
+        // numbered in the order they appear, so the binds follow the SQL and
+        // not the sorted list.
+        for c in cuts.iter().rev() {
+            q = q.bind(c);
+        }
+        let grouped: Vec<(Option<i64>, Option<i64>, i64, Option<i64>)> =
+            q.bind(user_id).fetch_all(&self.pool).await?;
+
+        // `(chain, variant) -> seconds per era`, so the component walk below
+        // can ask for "everything from era k onwards" per piece of gear.
+        let mut eras: HashMap<(i64, Option<i64>), Vec<i64>> = HashMap::new();
+        for (chain_id, variant_id, era, secs) in grouped {
+            let (Some(chain_id), Some(secs)) = (chain_id, secs) else { continue };
+            let row = eras.entry((chain_id, variant_id)).or_insert_with(|| vec![0; cuts.len() + 1]);
+            if let Some(slot) = row.get_mut(era.clamp(0, cuts.len() as i64) as usize) {
+                *slot += secs;
+            }
+        }
+        let grouped: Vec<(Option<i64>, Option<i64>, Vec<i64>)> =
+            eras.into_iter().map(|((c, v), secs)| (Some(c), v, secs)).collect();
 
         let mut out: HashMap<i64, i64> = HashMap::new();
         // The same walk, remembered rather than only summed: `(gear, chain,
         // variant) -> seconds`. A total is not checkable on its own, and with a
         // variant in play the hours genuinely arrive from more than one chain.
         let mut split: HashMap<(i64, i64, Option<i64>), i64> = HashMap::new();
-        for (chain_id, variant_id, secs) in grouped {
-            let (Some(chain_id), Some(secs)) = (chain_id, secs) else { continue };
+        for (chain_id, variant_id, by_era) in grouped {
+            let Some(chain_id) = chain_id else { continue };
             let Some(components) = base.get(&chain_id) else { continue };
+            // Seconds from a given date onwards: the eras at or past it. `None`
+            // is the whole chain, which is what a step with no date means.
+            let from = |since: Option<i64>| -> i64 {
+                let first = match since {
+                    None => 0,
+                    Some(t) => match cuts.binary_search(&t) {
+                        Ok(i) => i + 1,
+                        // A date nobody's step carries — a hand-edited blob.
+                        // The era boundary above it is the honest floor.
+                        Err(i) => i,
+                    },
+                };
+                by_era.iter().skip(first).sum()
+            };
             // A variant belonging to a different chain is ignored rather than
             // applied — it can only mean the listen's chain was repointed after
             // the fact, and applying it would credit gear that was never fitted.
@@ -653,24 +722,44 @@ impl Database {
                 .map(|(_, o)| o.as_slice())
                 .unwrap_or(&[]);
 
-            // One entry per distinct piece of gear: a chain naming the same
-            // thing at two steps must not count its running time twice — the
-            // trap `get_equipment` hit when it used a join instead of EXISTS.
-            let mut fitted: HashSet<i64> = HashSet::new();
+            // One entry per distinct piece of gear, carrying the date it joined
+            // the path: a chain naming the same thing at two steps must not
+            // count its running time twice — the trap `get_equipment` hit when
+            // it used a join instead of EXISTS — and where it does appear
+            // twice the **earlier** date wins, since that is when the box
+            // first became part of this chain.
+            let mut fitted: HashMap<i64, Option<i64>> = HashMap::new();
+            let mut fit = |id: i64, since: Option<i64>| match fitted.entry(id) {
+                Entry::Occupied(mut e) => {
+                    let keep = match (*e.get(), since) {
+                        (None, _) | (_, None) => None,
+                        (Some(a), Some(b)) => Some(a.min(b)),
+                    };
+                    e.insert(keep);
+                }
+                Entry::Vacant(e) => {
+                    e.insert(since);
+                }
+            };
             for (i, c) in components.iter().enumerate() {
                 match applied.iter().find(|o| o.position == i as i64) {
                     // An override replaces the step, so the gear it replaced
                     // gets no hours for these listens. That is the whole
                     // feature: the elliptical stylus does not accrue wear while
                     // the microlinear is in the headshell.
+                    //
+                    // The slot's own date does not travel with it, for the
+                    // reason `resolve_variant` drops the detail: it describes
+                    // the box that was there. A variant's listens already say
+                    // when it was fitted, which is the date that matters.
                     Some(o) => {
                         if let Some(id) = o.equipment_id {
-                            fitted.insert(id);
+                            fit(id, None);
                         }
                     }
                     None => {
                         if let Some(id) = c.equipment_id {
-                            fitted.insert(id);
+                            fit(id, c.since);
                         }
                     }
                 }
@@ -680,12 +769,16 @@ impl Database {
             for o in applied {
                 if o.position as usize >= components.len() {
                     if let Some(id) = o.equipment_id {
-                        fitted.insert(id);
+                        fit(id, None);
                     }
                 }
             }
 
-            for id in fitted {
+            for (id, since) in fitted {
+                let secs = from(since);
+                if secs == 0 {
+                    continue;
+                }
                 *out.entry(id).or_insert(0) += secs;
                 // Keyed on the variant *as applied*, so a variant paired with
                 // the wrong chain — which the `filter` above already refuses to

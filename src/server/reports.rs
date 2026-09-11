@@ -1086,6 +1086,7 @@ mod tests {
             component_type: t,
             name: name.into(),
             detail: None,
+            since: None,
             equipment_id: None,
         };
         // The fold the emit does, in miniature.

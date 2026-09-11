@@ -198,6 +198,57 @@ impl Database {
         .await?;
         Ok(result.rows_affected() > 0)
     }
+    /// The key a step is recognised by across an edit: the gear row it names,
+    /// or its own name when it is free text.
+    ///
+    /// Positions cannot do this job — inserting a subwoofer between the DAC and
+    /// the monitors moves the monitors down one, and a comparison by index
+    /// would read that as two boxes changing rather than one arriving.
+    fn step_key(c: &ChainComponent) -> String {
+        match c.equipment_id {
+            Some(id) => format!("eq:{id}"),
+            None => format!("name:{}", c.name.trim().to_lowercase()),
+        }
+    }
+
+    /// Stamp `since` on gear this chain did not name before.
+    ///
+    /// **Chain hours are derived from the listens**, which is right — assigning
+    /// a chain to a listen recorded months ago really does mean the listen ran
+    /// through that chain. What it cannot mean is that every *box* the chain
+    /// names today was in the path back then. Without a date, adding a
+    /// subwoofer to a two-year-old chain credits it with two years of use on
+    /// the day it is unboxed.
+    ///
+    /// Three rules, and the first is what keeps every existing chain unchanged:
+    ///
+    /// * **A step already named keeps whatever it had**, including nothing. A
+    ///   chain that predates this field goes on meaning "all of it", which is
+    ///   what it always meant.
+    /// * **A `since` the caller supplied is never overwritten**, so correcting
+    ///   the date to the day the box actually arrived survives the next save —
+    ///   and so does clearing it back to "it was always here".
+    /// * **Only [`Self::update_chain`] stamps.** Creating a chain stamps
+    ///   nothing: its components *are* the chain, so there is no earlier
+    ///   arrangement for them to have joined.
+    fn stamp_new_steps(
+        components: &[ChainComponent],
+        was: &[ChainComponent],
+    ) -> Vec<ChainComponent> {
+        let known: HashSet<String> = was.iter().map(Self::step_key).collect();
+        let now = Self::now_secs() as i64;
+        components
+            .iter()
+            .map(|c| {
+                let mut c = c.clone();
+                if c.since.is_none() && !known.contains(&Self::step_key(&c)) {
+                    c.since = Some(now);
+                }
+                c
+            })
+            .collect()
+    }
+
     pub async fn update_chain(
         &self,
         user_id: i64,
@@ -208,6 +259,19 @@ impl Database {
         listening_context: &str,
         icon: Option<&str>,
     ) -> Result<bool, sqlx::Error> {
+        // What the chain named a moment ago, so gear arriving now can be dated.
+        // One indexed read on a path somebody triggers by pressing Save.
+        let was: Vec<ChainComponent> = sqlx::query_scalar::<_, String>(&crate::sql!(
+            "SELECT components FROM signal_chains WHERE id = ? AND user_id = ?"
+        ))
+        .bind(chain_id)
+        .bind(user_id)
+        .fetch_optional(&self.pool)
+        .await?
+        .and_then(|j| serde_json::from_str(&j).ok())
+        .unwrap_or_default();
+        let components = &Self::stamp_new_steps(components, &was);
+
         let components_json = serde_json::to_string(components).unwrap_or_else(|_| "[]".into());
         let res = sqlx::query(&crate::sql!(// `shared` is deliberately absent. This is a whole-record replace
             // of everything the editor owns, and sharing is not the editor's —

@@ -26,7 +26,7 @@ openapi: 3.1.0
 
 info:
   title: Tapedeck
-  version: 0.110.4
+  version: 0.111.0
   summary: Self-hosted scrobbler and listening journal.
   description: |
     Tapedeck ingests listens, enriches them with MusicBrainz metadata, stores
@@ -837,6 +837,18 @@ components:
               equipment_id:
                 type: [integer, 'null']
                 description: Set when picked from your gear, absent for free text.
+              since:
+                type: [integer, 'null']
+                description: |
+                  Unix seconds from which this box was in the path. **Absent
+                  means "for as long as the chain has existed"**, which is what
+                  every step written before this field meant.
+
+                  Chain and gear hours are derived from the listens, so without
+                  it a box added to a chain that already has history is credited
+                  with all of it. Stamped automatically on gear a chain did not
+                  name before; send one to correct the date, or `null` to say it
+                  was always there.
 
     Equipment:
       type: object
