@@ -26,7 +26,7 @@ openapi: 3.1.0
 
 info:
   title: Tapedeck
-  version: 0.111.1
+  version: 0.112.0
   summary: Self-hosted scrobbler and listening journal.
   description: |
     Tapedeck ingests listens, enriches them with MusicBrainz metadata, stores
@@ -447,6 +447,31 @@ components:
           description: |
             A **JSON-encoded array**, not an array — the column stores what was
             written to it. Parse it before use.
+        mbid_release_group:
+          type: [string, 'null']
+          description: |
+            The release group, which is what relates a reissue, a remaster and a
+            regional edition to one another. Filled from a submitting client's
+            `additional_info`, a ListenBrainz export's `mbid_mapping`, or a
+            Jellyfin/Emby session — never by a lookup.
+        mbid_release_track:
+          type: [string, 'null']
+          description: |
+            The track *on a particular release*, as distinct from the recording:
+            the same recording is a different release-track on an album, a
+            single and a compilation. Only a tagging client ever knows it.
+        mbid_work:
+          type: [string, 'null']
+          description: |
+            The composition rather than a performance of it — the identifier
+            that relates every recording of one piece. Only a tagging client
+            ever knows it.
+        mbid_album_artist:
+          type: [string, 'null']
+          description: |
+            A **JSON-encoded array**, like `mbid_artist`. Whoever the *record*
+            is credited to, which on a compilation or a soundtrack is not the
+            performer of the track.
         caa_id:
           type: [integer, 'null']
           description: |
@@ -760,7 +785,10 @@ components:
                 recording_mbid: { type: string }
                 release_mbid: { type: string }
                 release_group_mbid: { type: string }
+                release_track_mbid: { type: string }
+                work_mbid: { type: string }
                 artist_mbids: { type: array, items: { type: string } }
+                album_artist_mbids: { type: array, items: { type: string } }
                 duration_ms: { type: integer }
                 tracknumber:
                   type: [integer, string]

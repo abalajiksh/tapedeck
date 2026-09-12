@@ -244,7 +244,17 @@
 
 			<div style="flex:none;padding:2px 12px 14px;display:flex;align-items:center;justify-content:space-between;gap:10px;border-top:1px solid var(--td-border);padding-top:10px;">
 				<span style="font-size:11px;color:var(--td-muted-2);padding-left:10px;">
-					{serverVersion ? `server v${serverVersion} · ` : ''}ui v{__UI_VERSION__}
+					<!-- One version, because there is one artifact: `build.rs` builds
+					     this app into `static/` and the binary embeds it, so a
+					     deployed instance cannot have a UI built from another
+					     tree. `__UI_VERSION__` is derived from the crate's own
+					     version for the same reason (see vite.config.ts).
+
+					     The second number is kept for the one case where the two
+					     really can disagree — `bun run dev` against a backend
+					     built from a different tree — and is shown only then, so
+					     it is a signal rather than a decoration. -->
+					v{serverVersion || __UI_VERSION__}{#if serverVersion && serverVersion !== __UI_VERSION__}{` · ui v${__UI_VERSION__}`}{/if}
 				</span>
 				<button on:click={toggleTheme} aria-label="Toggle dark mode" class="theme-toggle">
 					{#if $theme === 'dark' || (typeof document !== 'undefined' && document.documentElement.dataset.theme === 'dark')}

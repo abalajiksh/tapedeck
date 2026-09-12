@@ -34,6 +34,11 @@ pub struct ScrobbleRecord {
     pub mbid_recording: Option<String>,
     pub mbid_release: Option<String>,
     pub mbid_artist: Option<String>,
+    pub mbid_release_group: Option<String>,
+    pub mbid_release_track: Option<String>,
+    pub mbid_work: Option<String>,
+    /// JSON array, like `mbid_artist`.
+    pub mbid_album_artist: Option<String>,
     pub caa_id: Option<i64>,
     pub caa_release_mbid: Option<String>,
     pub isrc: Option<String>,

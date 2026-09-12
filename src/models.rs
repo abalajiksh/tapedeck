@@ -27,6 +27,20 @@ pub struct Play {
     pub mbid_artist: Option<Vec<String>>,
     pub artists: Option<Vec<String>>,
     pub mbid_release_group: Option<String>,
+    /// The *track* on a particular release, as distinct from the recording:
+    /// the same recording appears as a different release-track on an album, a
+    /// single and a compilation. A tagging client is the only thing that ever
+    /// knows which one was played.
+    pub mbid_release_track: Option<String>,
+    /// The composition, not a performance of it. Where the rest of these are
+    /// near-useless for classical — one work spans dozens of recordings by
+    /// different performers — this is the identifier that holds it together.
+    pub mbid_work: Option<String>,
+    /// Whoever the *record* is credited to, which on a compilation or a
+    /// soundtrack is not the performer of the track. Kept apart from
+    /// `mbid_artist` for the same reason `artist_credit` is kept apart from
+    /// `artist`.
+    pub mbid_album_artist: Option<Vec<String>>,
     pub caa_id: Option<i64>,
     pub caa_release_mbid: Option<String>,
     /// The recording's ISRC, when anything knew it. The only identifier that
@@ -57,6 +71,9 @@ impl Play {
             mbid_artist: None,
             artists: None,
             mbid_release_group: None,
+            mbid_release_track: None,
+            mbid_work: None,
+            mbid_album_artist: None,
             caa_id: None,
             caa_release_mbid: None,
             isrc: None,

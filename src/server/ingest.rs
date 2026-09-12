@@ -312,6 +312,12 @@ pub async fn submit_listens(
                 || mbid_mapping.and_then(|m| m.artist_mbids.clone()).filter(|v| !v.is_empty()),
             );
         let mbid_release_group = info_ref.and_then(|ai| present(&ai.release_group_mbid));
+        // Only a tagging client ever knows these two, so there is no mapping or
+        // backfill to fall back on: unread here is unread for good.
+        let mbid_release_track = info_ref.and_then(|ai| present(&ai.release_track_mbid));
+        let mbid_work = info_ref.and_then(|ai| present(&ai.work_mbid));
+        let mbid_album_artist =
+            info_ref.and_then(|ai| ai.album_artist_mbids.clone()).filter(|v| !v.is_empty());
         let caa_id = mbid_mapping.and_then(|m| m.caa_id);
         let caa_release_mbid = mbid_mapping.and_then(|m| m.caa_release_mbid.clone());
 
@@ -329,6 +335,9 @@ pub async fn submit_listens(
             mbid_artist,
             artists: submitted_artists(&meta.artist_name, info_ref),
             mbid_release_group,
+            mbid_release_track,
+            mbid_work,
+            mbid_album_artist,
             caa_id,
             caa_release_mbid,
             // Taken straight from the bag when the client knew it. A tag read
@@ -818,20 +827,35 @@ fn extract_audio_quality(info: Option<&AdditionalInfo>) -> AudioQuality {
         return AudioQuality::default();
     };
 
+    /// A codec name is a **grouping key**, so its spelling has to be one
+    /// spelling.
+    ///
+    /// Every source quotes whatever its upstream calls the format, and they
+    /// disagree about case: ffmpeg-derived paths say `flac`, fooyin says
+    /// `FLAC`. Classification is unaffected — `codec_is_lossless` and
+    /// `codec_is_dsd` both lowercase first — and so is the badge, which
+    /// uppercases for display. What splits is anything that ever **groups** on
+    /// the column, which today is nothing and tomorrow is the first per-codec
+    /// breakdown somebody writes. Folded here rather than left for that
+    /// query to remember, since a client cannot be asked to agree.
+    fn fold(s: &Option<String>) -> Option<String> {
+        s.as_deref().map(str::trim).filter(|v| !v.is_empty()).map(str::to_lowercase)
+    }
+
     AudioQuality {
-        format_type: ta.format_type.clone(),
-        codec: ta.codec.clone(),
+        format_type: fold(&ta.format_type),
+        codec: fold(&ta.codec),
         bitrate: ta.bitrate,
         sample_rate: ta.sample_rate,
         bit_depth: ta.bit_depth,
         channels: ta.channels,
-        container: ta.container.clone(),
+        container: fold(&ta.container),
         source_quality: ta.source_quality.clone(),
         is_lossless: ta.is_lossless,
         dsd_rate: ta.dsd_rate,
         dsd_multiplier: ta.dsd_multiplier,
         dsd_to_pcm_converted: ta.dsd_to_pcm_converted,
-        delivery_codec: ta.delivery_codec.clone(),
+        delivery_codec: fold(&ta.delivery_codec),
         delivery_bitrate: ta.delivery_bitrate,
         delivery_sample_rate: ta.delivery_sample_rate,
         delivery_bit_depth: ta.delivery_bit_depth,
@@ -896,5 +920,45 @@ mod relay_tests {
                 assert!(!import_is_live(&lt, NOW - 60, NOW, trusted));
             }
         }
+    }
+
+    /// **A codec name is a grouping key, so one format is one spelling.**
+    ///
+    /// Reported by the Tapeout plugin's author: fooyin reports `"FLAC"` where
+    /// every ffmpeg-derived source reports `"flac"`, and the column stores the
+    /// literal. Nothing today is *wrong* because of it — `codec_is_lossless`
+    /// lowercases before testing and the badge uppercases for display — which
+    /// is exactly what makes it worth folding now rather than when the first
+    /// per-codec breakdown finds two `FLAC` rows that will not add up.
+    ///
+    /// `format_type` matters more than it looks: `FIDELITY_KNOWN` and the badge
+    /// both compare it to a lowercase literal, so an uppercase `"DSD"` would
+    /// have been filed as neither DSD nor known.
+    #[test]
+    fn one_format_is_one_spelling_however_a_client_writes_it() {
+        // Built from the wire shape rather than from a struct literal, so the
+        // field names are exercised too — this is a deserialisation path, and
+        // a `tapedeck_audio` key nothing reads is the failure mode next door.
+        let info: AdditionalInfo = serde_json::from_value(serde_json::json!({
+            "tapedeck_audio": {
+                "format_type": "DSD",
+                "codec": "  FLAC  ",
+                "container": "Ogg",
+                "delivery_codec": "AAC"
+            }
+        }))
+        .unwrap();
+        let q = extract_audio_quality(Some(&info));
+        assert_eq!(q.format_type.as_deref(), Some("dsd"));
+        assert_eq!(q.codec.as_deref(), Some("flac"), "trimmed as well as folded");
+        assert_eq!(q.container.as_deref(), Some("ogg"));
+        assert_eq!(q.delivery_codec.as_deref(), Some("aac"));
+
+        // An empty string is not a codec, and storing one would be a third
+        // spelling of "we do not know" beside NULL and absent.
+        let blank: AdditionalInfo =
+            serde_json::from_value(serde_json::json!({"tapedeck_audio": {"codec": "   "}}))
+                .unwrap();
+        assert_eq!(extract_audio_quality(Some(&blank)).codec, None);
     }
 }

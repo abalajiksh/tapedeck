@@ -46,6 +46,8 @@ impl Database {
         }
         let mbid_artist_json =
             play.mbid_artist.as_ref().map(|arr| serde_json::to_string(arr).unwrap());
+        let mbid_album_artist_json =
+            play.mbid_album_artist.as_ref().map(|arr| serde_json::to_string(arr).unwrap());
         let q = quality.cloned().unwrap_or_default();
 
         // Everyone credited, when the source named more than one. `artist` is
@@ -59,7 +61,9 @@ impl Database {
             "INSERT INTO scrobbles (
                 user_id, title, artist, artist_credit, album, timestamp, duration,
                 source_id, source_name, status, skipped,
-                mbid_recording, mbid_release, mbid_artist, caa_id, caa_release_mbid, isrc,
+                mbid_recording, mbid_release, mbid_artist,
+                mbid_release_group, mbid_release_track, mbid_work, mbid_album_artist,
+                caa_id, caa_release_mbid, isrc,
                 format_type, codec, bitrate, sample_rate, bit_depth, channels,
                 container, source_quality, is_lossless,
                 dsd_rate, dsd_multiplier, dsd_to_pcm_converted,
@@ -70,8 +74,9 @@ impl Database {
             ) VALUES (
                 ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
                 ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                ?, ?, ?
             )"
         ))
         .bind(user_id)
@@ -88,6 +93,10 @@ impl Database {
         .bind(&play.mbid_recording)
         .bind(&play.mbid_release)
         .bind(&mbid_artist_json)
+        .bind(&play.mbid_release_group)
+        .bind(&play.mbid_release_track)
+        .bind(&play.mbid_work)
+        .bind(&mbid_album_artist_json)
         .bind(play.caa_id)
         .bind(&play.caa_release_mbid)
         .bind(&play.isrc)
@@ -438,6 +447,9 @@ impl Database {
                         mbid_artist,
                         artists: None,
                         mbid_release_group: None,
+                        mbid_release_track: None,
+                        mbid_work: None,
+                        mbid_album_artist: None,
                         caa_id: r.caa_id,
                         caa_release_mbid: r.caa_release_mbid,
                         isrc: r.isrc,

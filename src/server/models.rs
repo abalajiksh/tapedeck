@@ -111,8 +111,20 @@ pub struct AdditionalInfo {
     pub release_mbid: Option<String>,
     #[serde(default, deserialize_with = "lenient")]
     pub release_group_mbid: Option<String>,
+    /// The release-track and the work, neither of which any other source can
+    /// supply — a media server surfaces neither, and MusicBrainz would have to
+    /// be asked per listen. A tagging client read them off the file.
+    #[serde(default, deserialize_with = "lenient")]
+    pub release_track_mbid: Option<String>,
+    #[serde(default, deserialize_with = "lenient")]
+    pub work_mbid: Option<String>,
     #[serde(default, deserialize_with = "lenient_string_list")]
     pub artist_mbids: Option<Vec<String>>,
+    /// Whoever the *record* is credited to. On a compilation or a soundtrack
+    /// that is not the performer, which is the whole reason it is a field of
+    /// its own rather than a fallback for `artist_mbids`.
+    #[serde(default, deserialize_with = "lenient_string_list")]
+    pub album_artist_mbids: Option<Vec<String>>,
 
     /// Every artist credited, where the client sends them separately.
     ///

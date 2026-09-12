@@ -408,6 +408,25 @@ impl Database {
                 source_id TEXT NOT NULL, source_name TEXT NOT NULL,
                 status TEXT NOT NULL DEFAULT 'pending',
                 mbid_recording TEXT, mbid_release TEXT, mbid_artist TEXT,
+                -- The release group, the release-track and the work.
+                --
+                -- The first was **parsed and discarded for months**: ingest read
+                -- it out of `additional_info`, the ListenBrainz import read it
+                -- out of `mbid_mapping`, Jellyfin read `MusicBrainzReleaseGroup`
+                -- off the session — and `Play` carried it to an insert that had
+                -- no column for it. Three sources collecting a field that went
+                -- nowhere, with nothing erroring to say so.
+                --
+                -- The other two only ever come from a tagging client, so there
+                -- is no mapping and no backfill behind them: not stored here is
+                -- not stored anywhere. `mbid_work` is the one that matters for
+                -- classical, where a single work spans dozens of recordings by
+                -- different performers and nothing else in this schema relates
+                -- them.
+                mbid_release_group TEXT, mbid_release_track TEXT, mbid_work TEXT,
+                -- A JSON array, mirroring `mbid_artist`: a record can be
+                -- credited to several people.
+                mbid_album_artist TEXT,
                 caa_id INTEGER, caa_release_mbid TEXT,
                 -- The recording's International Standard Recording Code. The
                 -- only identifier that survives crossing between a library, a

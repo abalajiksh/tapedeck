@@ -105,3 +105,90 @@ fn not_found_json(path: &str) -> Response {
     )
         .into_response()
 }
+
+#[cfg(test)]
+mod tests {
+    /// **The UI's version is the crate's, and there is no second copy to
+    /// drift.**
+    ///
+    /// It used to come out of `web/package.json`, which sat **eighteen releases
+    /// behind** the server (ui 0.84.0 against 0.102.0, v0.102.1) — so the one
+    /// readout anybody would use to check whether their frontend was stale was
+    /// itself the stalest thing on the screen. Bumping it into line fixed the
+    /// number and kept the shape: two versions, always equal, one maintained by
+    /// remembering. This is the rule v0.102.0 earned on the MusicBrainz
+    /// User-Agent, applied to the next hand-written version string in the tree:
+    /// *a version a human has to remember to bump is one that is always
+    /// wrong.*
+    ///
+    /// Textual, the same technique as the OpenAPI route-drift test, because the
+    /// failure it guards is somebody "tidying" `vite.config.ts` back to
+    /// `pkg.version` — which reintroduces the drift **silently**, since the two
+    /// numbers agree on the day of the change and only part company later.
+    #[test]
+    fn the_ui_version_is_the_crate_version_and_not_a_second_copy() {
+        let raw =
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/web/vite.config.ts"))
+                .expect("web/vite.config.ts is where __UI_VERSION__ is injected");
+        // **Comments out first, and this is not fussiness.** The first version
+        // of this test asserted the file *mentioned* `../Cargo.toml` — which
+        // the doc comment above `crateVersion` does, at length. So pointing the
+        // `readFileSync` back at `./package.json` left the guard **passing**,
+        // and only breaking it on purpose said so. A guard that reads prose is
+        // reading the explanation rather than the code.
+        let vite = strip_comments(&raw);
+
+        // The companion assertion the OpenAPI note insists on: a scanner that
+        // found nothing would pass by examining an empty set.
+        assert!(
+            vite.contains("__UI_VERSION__"),
+            "vite.config.ts no longer injects __UI_VERSION__ — this guard is \
+             looking at the wrong file"
+        );
+        assert!(
+            vite.contains("readFileSync('../Cargo.toml'"),
+            "__UI_VERSION__ must be derived from the crate's own version, not \
+             kept as a second copy someone has to remember to bump"
+        );
+        assert!(
+            !vite.contains("readFileSync('./package.json'"),
+            "vite.config.ts is reading a version out of web/package.json \
+             again — that is the copy which drifted eighteen releases"
+        );
+
+        let pkg = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/web/package.json"))
+            .expect("web/package.json");
+        assert!(
+            !pkg.contains("\"version\""),
+            "web/package.json has a version field again. It is a `private` \
+             package, so the field has no packaging meaning — it only ever fed \
+             __UI_VERSION__, and a copy that exists is a copy that drifts"
+        );
+    }
+
+    /// Block and line comments out, so a scan sees code rather than the
+    /// explanation of it. Crude on purpose — it reads one small file whose
+    /// shape is known, and a real TypeScript parse here would be a dependency
+    /// bought to check three lines.
+    fn strip_comments(src: &str) -> String {
+        let mut out = String::with_capacity(src.len());
+        let mut rest = src;
+        while let Some(ch) = rest.chars().next() {
+            if rest.starts_with("/*") {
+                match rest.find("*/") {
+                    Some(end) => rest = &rest[end + 2..],
+                    None => break,
+                }
+            } else if rest.starts_with("//") {
+                match rest.find('\n') {
+                    Some(end) => rest = &rest[end..],
+                    None => break,
+                }
+            } else {
+                out.push(ch);
+                rest = &rest[ch.len_utf8()..];
+            }
+        }
+        out
+    }
+}

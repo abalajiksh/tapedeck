@@ -3326,7 +3326,9 @@
 				<div>
 					<h3 class="h-display" style="font-size:19px;margin-bottom:6px;">About</h3>
 					<div style="font-size:13px;color:var(--td-muted);display:flex;flex-direction:column;gap:3px;">
-						<span>Server v{backendVersion} · UI v{uiVersion}</span>
+						<!-- See the sidebar footer: one artifact, so one version,
+						     and the UI's is only named when it disagrees. -->
+						<span>Tapedeck v{backendVersion}{#if backendVersion !== '…' && backendVersion !== uiVersion}{` · UI built from v${uiVersion}`}{/if}</span>
 						<span>A self-hosted music listening journal.</span>
 						<a href="https://codeberg.org/abksh/tapedeck" target="_blank" rel="noopener">View on Codeberg →</a>
 					</div>

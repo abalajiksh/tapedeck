@@ -1340,6 +1340,29 @@ impl Database {
             }
         }
 
+        // ── The MBIDs only a tagging client can supply ──
+        //
+        // Appended after the uuid block for the reason that block is appended
+        // after everything else: three migrations above **rebuild** their table
+        // by copying an explicit column list, and a column added before one of
+        // them is silently dropped on exactly the databases that still need the
+        // rebuild (v0.44.0). New columns go at the bottom.
+        //
+        // `mbid_release_group` is the one that had been read and thrown away —
+        // by ingest, by the ListenBrainz import and by Jellyfin — so an existing
+        // history gains the column and starts filling it from the next listen.
+        // Nothing backfills the rows already written: the id was never stored,
+        // so there is nothing to recover, and asking MusicBrainz per track is
+        // what `backfill_recording_mbids` is for.
+        for col in ["mbid_release_group", "mbid_release_track", "mbid_work", "mbid_album_artist"] {
+            if !has_column(&self.pool, "scrobbles", col).await {
+                info!("⚙️ Migrating: adding scrobbles.{}...", col);
+                let _ = sqlx::query(&format!("ALTER TABLE scrobbles ADD COLUMN {col} TEXT"))
+                    .execute(&self.pool)
+                    .await;
+            }
+        }
+
         Ok(())
     }
 }

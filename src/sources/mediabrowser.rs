@@ -788,6 +788,21 @@ impl MediaBrowserSource {
                 .provider_ids
                 .as_ref()
                 .and_then(|p| p.musicbrainz_release_group.clone()),
+            // No release-track or work id in `ProviderIds` — Jellyfin does not
+            // surface either, so these stay unset rather than guessed at.
+            mbid_release_track: None,
+            mbid_work: None,
+            // Also recorded now, rather than only as a fallback for the
+            // performer above: the record's credit and the track's are
+            // different facts, and on a compilation they disagree. The fallback
+            // is deliberately left in place — it is a guess, but it is the
+            // guess this source has always made, and narrowing it is a separate
+            // change from storing something it was throwing away.
+            mbid_album_artist: item
+                .provider_ids
+                .as_ref()
+                .and_then(|p| p.musicbrainz_album_artist.clone())
+                .map(|id| vec![id]),
             caa_id: None,
             caa_release_mbid: None,
             isrc: None,

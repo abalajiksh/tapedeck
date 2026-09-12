@@ -9313,3 +9313,141 @@ async fn a_play_after_you_went_home_is_not_part_of_the_sitting() {
     .unwrap();
     assert_eq!(stamped, None, "you were not in the room, so it was not a joint listen");
 }
+
+/// **An identifier a client sent has to reach the row, and nothing was
+/// checking that it did.**
+///
+/// `mbid_release_group` was read three separate ways — out of a submitting
+/// client's `additional_info`, out of a ListenBrainz export's `mbid_mapping`,
+/// and off a Jellyfin/Emby session's `MusicBrainzReleaseGroup` — carried on
+/// `Play`, and then handed to an insert whose column list did not mention it
+/// and a table that had no such column. Three sources collecting a field that
+/// went nowhere, for months, with nothing erroring to say so; CLAUDE.md
+/// meanwhile described Jellyfin's copy as "a rate-limited lookup not made",
+/// which it was not.
+///
+/// That is the shape this asserts against, so it is phrased about the **row**
+/// rather than about the insert: a column added to `Play` and forgotten at the
+/// bind site produces exactly the original bug and would pass any test that
+/// only checked the struct. Reported by the Tapeout plugin's author, who could
+/// see the fields going out and not coming back.
+#[tokio::test]
+async fn every_mbid_a_client_sends_reaches_the_row() {
+    let db = testdb().await;
+    let uid = db.create_user("ash", None, "pw", "user").await.unwrap();
+
+    let mut p = play("Kannalane", "A.R. Rahman", Database::now_secs() as u64);
+    p.album = Some("Bombay".into());
+    p.mbid_recording = Some("rec-1".into());
+    p.mbid_release = Some("rel-1".into());
+    p.mbid_artist = Some(vec!["art-1".into(), "art-2".into()]);
+    p.mbid_release_group = Some("rg-1".into());
+    p.mbid_release_track = Some("rt-1".into());
+    p.mbid_work = Some("work-1".into());
+    p.mbid_album_artist = Some(vec!["aa-1".into()]);
+    p.isrc = Some("GBAYE0601498".into());
+    let source_id = p.source_id.clone();
+
+    db.save_scrobble(uid, &p, None, None, None, None, None, None, None, ListenDisposition::LIVE)
+        .await
+        .unwrap();
+
+    let rows =
+        db.get_recent_scrobbles(uid, 10, 0, None, None, None, None, None, None).await.unwrap();
+    let row = rows.iter().find(|r| r.source_id == source_id).expect("the listen we just wrote");
+
+    assert_eq!(row.mbid_recording.as_deref(), Some("rec-1"));
+    assert_eq!(row.mbid_release.as_deref(), Some("rel-1"));
+    assert_eq!(row.mbid_release_group.as_deref(), Some("rg-1"), "the one that was discarded");
+    assert_eq!(row.mbid_release_track.as_deref(), Some("rt-1"));
+    assert_eq!(row.mbid_work.as_deref(), Some("work-1"));
+    assert_eq!(row.isrc.as_deref(), Some("GBAYE0601498"));
+
+    // Both artist fields are JSON-encoded arrays, and they are separate facts:
+    // on a compilation the record's credit and the track's disagree, which is
+    // the whole reason the album artist is not a fallback for the performer.
+    let performers: Vec<String> =
+        serde_json::from_str(row.mbid_artist.as_deref().unwrap()).unwrap();
+    let credited: Vec<String> =
+        serde_json::from_str(row.mbid_album_artist.as_deref().unwrap()).unwrap();
+    assert_eq!(performers, vec!["art-1", "art-2"]);
+    assert_eq!(credited, vec!["aa-1"]);
+}
+
+/// **A database that predates the columns gains them and starts filling them.**
+///
+/// Every other test in this file opens an empty file and therefore takes the
+/// `init()` path, which means a migration that cannot run against a real prior
+/// schema **passes the entire suite** — the v0.61.1 crash loop, 297 restarts in
+/// 26 minutes, found in production rather than here.
+///
+/// The other half it pins is that `SELECT *` still maps onto `ScrobbleRecord`
+/// after four columns arrive by `ALTER TABLE` rather than from `init()`, and
+/// that the listen already in the table is untouched: nothing backfills these,
+/// because the ids were never stored and there is nothing to recover.
+#[tokio::test]
+async fn an_existing_database_gains_the_client_supplied_mbids() {
+    let n = N.fetch_add(1, Ordering::SeqCst);
+    let path = std::env::temp_dir().join(format!("td-oldmbid-{}-{}.db", std::process::id(), n));
+    for suffix in ["", "-wal", "-shm"] {
+        let _ = std::fs::remove_file(format!("{}{}", path.display(), suffix));
+    }
+
+    {
+        let pool = sqlx::SqlitePool::connect(&format!("sqlite:{}?mode=rwc", path.display()))
+            .await
+            .unwrap();
+        for ddl in [
+            // The shipped shape minus exactly the four columns this adds —
+            // including `mbid_release_group`, which was the one being read by
+            // three separate sources and written by none.
+            "CREATE TABLE scrobbles (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER,
+                     title TEXT NOT NULL, artist TEXT NOT NULL, artist_credit TEXT,
+                     album TEXT, timestamp INTEGER NOT NULL, duration INTEGER,
+                     source_id TEXT NOT NULL, source_name TEXT NOT NULL,
+                     status TEXT NOT NULL DEFAULT 'pending',
+                     skipped BOOLEAN NOT NULL DEFAULT FALSE,
+                     mbid_recording TEXT, mbid_release TEXT, mbid_artist TEXT,
+                     caa_id INTEGER, caa_release_mbid TEXT, isrc TEXT,
+                     UNIQUE(user_id, source_id, source_name))",
+            "INSERT INTO scrobbles (user_id, title, artist, timestamp, source_id, source_name,
+                     mbid_recording)
+                     VALUES (1, 'Xtal', 'Aphex Twin', 1700000000, 'old-1', 'test', 'rec-old')",
+        ] {
+            sqlx::query(ddl).execute(&pool).await.unwrap();
+        }
+        pool.close().await;
+    }
+
+    let db = Database::new(&format!("sqlite:{}", path.display()), Arc::new(SecretBox::test_key()))
+        .await
+        .expect("an existing database must open");
+
+    let rows = db.get_recent_scrobbles(1, 10, 0, None, None, None, None, None, None).await.unwrap();
+    assert_eq!(rows.len(), 1, "the listen that was already there");
+    assert_eq!(rows[0].mbid_recording.as_deref(), Some("rec-old"));
+    assert_eq!(
+        rows[0].mbid_release_group, None,
+        "nothing backfills these — the id was never stored, so there is nothing to recover"
+    );
+
+    // And a listen written afterwards carries all four.
+    let uid = db.create_user("ash", None, "pw", "user").await.unwrap();
+    let mut p = play("Ageispolis", "Aphex Twin", Database::now_secs() as u64);
+    p.mbid_release_group = Some("rg-new".into());
+    p.mbid_release_track = Some("rt-new".into());
+    p.mbid_work = Some("work-new".into());
+    p.mbid_album_artist = Some(vec!["aa-new".into()]);
+    let source_id = p.source_id.clone();
+    db.save_scrobble(uid, &p, None, None, None, None, None, None, None, ListenDisposition::LIVE)
+        .await
+        .unwrap();
+
+    let rows =
+        db.get_recent_scrobbles(uid, 10, 0, None, None, None, None, None, None).await.unwrap();
+    let row = rows.iter().find(|r| r.source_id == source_id).expect("the new listen");
+    assert_eq!(row.mbid_release_group.as_deref(), Some("rg-new"));
+    assert_eq!(row.mbid_release_track.as_deref(), Some("rt-new"));
+    assert_eq!(row.mbid_work.as_deref(), Some("work-new"));
+    assert_eq!(row.mbid_album_artist.as_deref(), Some(r#"["aa-new"]"#));
+}
