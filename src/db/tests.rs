@@ -9451,3 +9451,131 @@ async fn an_existing_database_gains_the_client_supplied_mbids() {
     assert_eq!(row.mbid_work.as_deref(), Some("work-new"));
     assert_eq!(row.mbid_album_artist.as_deref(), Some(r#"["aa-new"]"#));
 }
+
+/// **Every write path folds the codec, because `save_scrobble` does.**
+///
+/// Each source quoted whatever its upstream called the format and stored it
+/// raw — fooyin says `FLAC`, ffmpeg-derived paths say `flac` — so a history
+/// held both spellings and they are two grouping keys. Folding it per source is
+/// six places to remember and one to forget, which is why it happens at the
+/// chokepoint instead.
+///
+/// Asserted on the **stored row**, not on `AudioQuality::normalise`, because
+/// the failure being guarded is a write path that does not call it.
+#[tokio::test]
+async fn one_codec_spelling_reaches_the_row_whatever_the_source_said() {
+    let db = testdb().await;
+    let uid = db.create_user("ash", None, "pw", "user").await.unwrap();
+
+    let q = AudioQuality {
+        // As a media server hands them over, untouched.
+        codec: Some("FLAC".into()),
+        container: Some("  Ogg  ".into()),
+        delivery_codec: Some("AAC".into()),
+        format_type: Some("DSD".into()),
+        ..Default::default()
+    };
+    let p = play("Xtal", "Aphex Twin", Database::now_secs() as u64);
+    let source_id = p.source_id.clone();
+    db.save_scrobble(
+        uid,
+        &p,
+        Some(&q),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        ListenDisposition::LIVE,
+    )
+    .await
+    .unwrap();
+
+    let rows =
+        db.get_recent_scrobbles(uid, 10, 0, None, None, None, None, None, None).await.unwrap();
+    let row = rows.iter().find(|r| r.source_id == source_id).unwrap();
+    assert_eq!(row.codec.as_deref(), Some("flac"));
+    assert_eq!(row.container.as_deref(), Some("ogg"), "trimmed as well as folded");
+    assert_eq!(row.delivery_codec.as_deref(), Some("aac"));
+    // The one that was never merely cosmetic: `FIDELITY_KNOWN` and the badge
+    // both compare this to a lowercase literal, so an uppercase spelling was
+    // filed as neither DSD nor known.
+    assert_eq!(row.format_type.as_deref(), Some("dsd"));
+}
+
+/// **The rows already written get folded once, and only once.**
+///
+/// Every source stored whatever its upstream spelled, so a real history holds
+/// `FLAC` beside `flac`. The new listens are handled at the chokepoint; this is
+/// the half that reaches the ones already there.
+///
+/// Pins the marker as well as the fold, because the guard is not cosmetic: the
+/// `WHERE` is self-limiting, but *asking* costs a scan of the whole `scrobbles`
+/// table and on the real host that is 77,000 rows off an SD card for an answer
+/// that cannot change after the first pass.
+#[tokio::test]
+async fn mixed_codec_casing_is_folded_once_and_the_pass_does_not_run_again() {
+    let n = N.fetch_add(1, Ordering::SeqCst);
+    let path = std::env::temp_dir().join(format!("td-codeccase-{}-{}.db", std::process::id(), n));
+    for suffix in ["", "-wal", "-shm"] {
+        let _ = std::fs::remove_file(format!("{}{}", path.display(), suffix));
+    }
+    let url = format!("sqlite:{}", path.display());
+
+    // A history holding both spellings, written by an older binary.
+    {
+        let db = Database::new(&url, Arc::new(SecretBox::test_key())).await.unwrap();
+        let uid = db.create_user("ash", None, "pw", "user").await.unwrap();
+        for (i, codec) in ["FLAC", "flac"].iter().enumerate() {
+            let p = play("Xtal", "Aphex Twin", Database::now_secs() as u64 - 500 + i as u64 * 100);
+            let q = AudioQuality { codec: Some((*codec).into()), ..Default::default() };
+            db.save_scrobble(
+                uid,
+                &p,
+                Some(&q),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                ListenDisposition::LIVE,
+            )
+            .await
+            .unwrap();
+        }
+        // Put the uppercase spelling back, behind `save_scrobble`'s fold, and
+        // clear the marker — this is what an existing database looks like.
+        sqlx::query("UPDATE scrobbles SET codec = 'FLAC' WHERE id = 1")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM app_settings WHERE key = 'codec_casing_folded'")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        let mixed: (i64,) = sqlx::query_as("SELECT COUNT(DISTINCT codec) FROM scrobbles")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(mixed.0, 2, "two spellings of one format, as an old history holds them");
+    }
+
+    // Reopening runs the pass.
+    {
+        let db = Database::new(&url, Arc::new(SecretBox::test_key())).await.unwrap();
+        let spellings: Vec<(String,)> =
+            sqlx::query_as("SELECT DISTINCT codec FROM scrobbles WHERE codec IS NOT NULL")
+                .fetch_all(&db.pool)
+                .await
+                .unwrap();
+        assert_eq!(spellings.len(), 1, "one format is one spelling");
+        assert_eq!(spellings[0].0, "flac");
+        assert_eq!(
+            db.get_app_setting("codec_casing_folded").await.unwrap().as_deref(),
+            Some("1"),
+            "and it records that it ran, so a 77k-row scan is not repeated every start"
+        );
+    }
+}

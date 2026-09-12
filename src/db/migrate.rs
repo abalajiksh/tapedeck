@@ -1340,6 +1340,61 @@ impl Database {
             }
         }
 
+        // ── One format, one spelling, for the rows already written ──
+        //
+        // `AudioQuality::normalise` folds this at every write path now, and
+        // every source before it stored whatever its upstream said: fooyin
+        // reports `FLAC` where ffmpeg-derived paths report `flac`, so a history
+        // holds both and they are two grouping keys.
+        //
+        // Marker-guarded rather than run every start. The `WHERE` is
+        // self-limiting — after one pass there is nothing left to match — but
+        // asking costs a scan of the whole `scrobbles` table, and on the real
+        // host that is 77,000 rows off an SD card for an answer that cannot
+        // change. Same reasoning as the shelf artwork repair above.
+        //
+        // `format_type` is the one that was not merely cosmetic: `FIDELITY_KNOWN`
+        // and the badge both compare it to a lowercase literal, so an uppercase
+        // `DSD` was filed as neither DSD nor known.
+        if self.get_app_setting("codec_casing_folded").await.ok().flatten().is_none() {
+            let mut folded = 0u64;
+            let mut all_ok = true;
+            for col in ["codec", "container", "delivery_codec", "format_type"] {
+                // `LOWER()` here is SQLite's, which is ASCII-only — and that is
+                // exactly right for a codec name. Nothing in this vocabulary is
+                // non-Latin, and a Rust-side fold would disagree with the
+                // `LOWER()` the queries use.
+                let r = sqlx::query(&format!(
+                    "UPDATE scrobbles SET {col} = LOWER({col})
+                      WHERE {col} IS NOT NULL AND {col} <> LOWER({col})"
+                ))
+                .execute(&self.pool)
+                .await;
+                match r {
+                    Ok(done) => folded += done.rows_affected(),
+                    // Reported rather than swallowed, and the marker is left
+                    // unset so the pass runs again — but **`migrate` carries
+                    // on**. Returning early here would take the column
+                    // migrations below it with it, which is a far worse outcome
+                    // than a codec name keeping its capital letters.
+                    Err(e) => {
+                        all_ok = false;
+                        warn!(
+                            "⚠️ Could not fold scrobbles.{} casing: {}",
+                            col,
+                            crate::logging::error_chain(&e)
+                        );
+                    }
+                }
+            }
+            if folded > 0 {
+                info!("⚙️ Migrating: folded {folded} codec/container spelling(s) to one case...");
+            }
+            if all_ok {
+                let _ = self.set_app_setting("codec_casing_folded", "1").await;
+            }
+        }
+
         // ── The MBIDs only a tagging client can supply ──
         //
         // Appended after the uuid block for the reason that block is appended

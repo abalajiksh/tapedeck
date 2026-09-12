@@ -354,18 +354,80 @@ impl AudioQuality {
     /// Shared so the two session-shaped sources cannot answer differently about
     /// the same file; see `codec_is_dsd` for what they used to get wrong.
     pub fn classify_codec(&mut self) {
+        // Recomputed from the codec, so whatever was there is discarded first
+        // and `fill_classification` does the single implementation of the rule.
+        self.format_type = None;
+        self.is_lossless = None;
+        self.fill_classification();
+    }
+
+    /// The same derivation, but **only where nothing said otherwise**.
+    ///
+    /// What a source *reports* outranks what its codec implies: a client that
+    /// says `is_lossless: false` about a FLAC knows something we do not — it
+    /// may be describing a lossy file in a FLAC container, or a transcode. So
+    /// ingest fills the gaps and overrules nobody, where Plex and Jellyfin
+    /// derive the lot because neither server reports either field.
+    ///
+    /// The two share one body rather than one being a copy of the other, which
+    /// is the rule `codec_is_lossless` itself earned: there used to be two
+    /// lossless lists and the same file was lossless from one server and lossy
+    /// from the other.
+    pub fn fill_classification(&mut self) {
         let codec = self.codec.clone().unwrap_or_default();
+        if codec.trim().is_empty() {
+            // Nothing to derive from. Leaving these unset is the honest answer
+            // — `FIDELITY_KNOWN` treats a NULL `is_lossless` as "we never
+            // knew", which is the population the fidelity cards confess to.
+            return;
+        }
         let dsd = codec_is_dsd(&codec);
-        self.format_type = Some(if dsd { "dsd" } else { "pcm" }.to_string());
-        self.is_lossless = Some(codec_is_lossless(&codec));
+        if self.format_type.is_none() {
+            self.format_type = Some(if dsd { "dsd" } else { "pcm" }.to_string());
+        }
+        if self.is_lossless.is_none() {
+            self.is_lossless = Some(codec_is_lossless(&codec));
+        }
         if dsd {
             if let Some(sr) = self.sample_rate {
                 if let Some(m) = dsd_multiplier_from_rate(sr as i64) {
-                    self.dsd_multiplier = Some(m);
-                    self.dsd_rate = Some(m as i64 * 44_100);
+                    if self.dsd_multiplier.is_none() {
+                        self.dsd_multiplier = Some(m);
+                    }
+                    if self.dsd_rate.is_none() {
+                        self.dsd_rate = Some(m as i64 * 44_100);
+                    }
                 }
             }
         }
+    }
+
+    /// **One format is one spelling.**
+    ///
+    /// Every source quotes whatever its upstream calls the format and they
+    /// disagree about case: ffmpeg-derived paths say `flac`, fooyin says
+    /// `FLAC`, and each source stored the string raw. Classification was never
+    /// affected — `codec_is_lossless` and `codec_is_dsd` lowercase before
+    /// testing — and neither was the badge, which uppercases for display. What
+    /// splits is anything that **groups** on the column, which today is nothing
+    /// and tomorrow is the first per-codec breakdown somebody writes.
+    ///
+    /// `format_type` is the one that was not merely latent: `FIDELITY_KNOWN`
+    /// and the badge both compare it to a lowercase literal, so an uppercase
+    /// `"DSD"` would have been filed as neither DSD nor known.
+    ///
+    /// Called from `save_scrobble`, which is the chokepoint every write path
+    /// goes through — so no source can reintroduce the split by forgetting.
+    /// Ingest calls it a second time, before `compute_score`, because a score
+    /// is computed from `format_type` *before* the row is stored.
+    pub fn normalise(&mut self) {
+        fn fold(s: &mut Option<String>) {
+            *s = s.as_deref().map(str::trim).filter(|v| !v.is_empty()).map(str::to_lowercase);
+        }
+        fold(&mut self.format_type);
+        fold(&mut self.codec);
+        fold(&mut self.container);
+        fold(&mut self.delivery_codec);
     }
 
     /// Note what is deliberately *not* in here: `dsd_to_pcm_converted` and

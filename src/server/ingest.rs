@@ -279,7 +279,12 @@ pub async fn submit_listens(
         let submission_client =
             info_ref.and_then(|ai| ai.submission_client.as_deref()).unwrap_or("unknown");
 
-        let source_id = format!("ingest-{}-{}-{}", user.user_id, timestamp, meta.track_name);
+        let source_id = ingest_source_id(
+            user.user_id,
+            timestamp,
+            &meta.track_name,
+            info_ref.and_then(|ai| ai.skipped).unwrap_or(false),
+        );
 
         let duration = info_ref.and_then(|ai| ai.duration_ms).map(|ms| (ms / 1000) as u64);
         let track_number = info_ref.and_then(|ai| ai.track_number);
@@ -359,10 +364,7 @@ pub async fn submit_listens(
         // single track forwarded right away.)
 
         // ── Phase 2: Extract quality metadata ──
-        let mut quality = extract_audio_quality(info_ref);
-        if quality.has_data() {
-            quality.compute_score();
-        }
+        let quality = prepare_quality(info_ref);
         let quality_opt = if quality.has_data() { Some(&quality) } else { None };
 
         // ── Phase 2: Resolve device ──
@@ -818,6 +820,60 @@ pub async fn submit_listens(
         .into_response()
 }
 
+/// The id a submitted listen is deduplicated on.
+///
+/// **A skip and a listen of one track at one second are two events**, and this
+/// used to be `ingest-<user>-<ts>-<track>` with nothing to tell them apart — so
+/// they collided on `UNIQUE(user_id, source_id, source_name)` and whichever
+/// arrived second was reported `duplicate` with **no row written**. Reported by
+/// the Tapeout plugin's author as `Accepted 1 duplicate 1` about a batch
+/// holding one of each; the guess there was that a skip writes no listen row,
+/// which it does, and the cause is the id.
+///
+/// Plex has carried the same marker since v0.71.0. This differs in one way that
+/// matters: Plex appends `skip-<now>` because *it* observed the skip and nothing
+/// else can identify it, where a client supplies `listened_at` — so the suffix
+/// here is a **constant**, and a resent skip still dedups on its own id rather
+/// than minting a second listen on every retry.
+///
+/// A function rather than a `format!` at the call site for the reason
+/// `consume_sessions` and `own_history_tracks` are functions: it decides
+/// whether a listen is ever stored, and a rule like that has to be testable
+/// without a server.
+fn ingest_source_id(user_id: i64, timestamp: i64, track_name: &str, skipped: bool) -> String {
+    format!("ingest-{}-{}-{}{}", user_id, timestamp, track_name, if skipped { "-skip" } else { "" })
+}
+
+/// What the client said about the audio, made fit to store and to score.
+///
+/// Three steps that were inline in the handler, which is where the untested
+/// half of this lives — `submit_listens` has no test suite, so every statement
+/// left loose in it is a statement a guard cannot reach. Folded into one
+/// function the tests call, leaving exactly one line of wiring that the
+/// compiler holds: delete it and `quality` does not exist.
+///
+/// * **Fold the spelling**, here as well as in `save_scrobble`, because the
+///   score is computed from `format_type` *before* the row is stored and
+///   `compute_score` compares against a lowercase literal — an uppercase
+///   `"DSD"` would otherwise be scored as PCM and then stored correctly, which
+///   is the worst of both.
+/// * **Derive what the client did not say.** Plex and Jellyfin both call
+///   `classify_codec`, so a listen off a media server arrives with a
+///   `format_type` and an `is_lossless`; a listen off a scrobble client arrived
+///   with a codec and neither, so a FLAC submission was stored as being of
+///   unknown fidelity — outside the population the fidelity cards report on —
+///   and scored as if the format were unknown.
+/// * **Score it**, but only where there is anything to score.
+fn prepare_quality(info: Option<&AdditionalInfo>) -> AudioQuality {
+    let mut q = extract_audio_quality(info);
+    q.normalise();
+    q.fill_classification();
+    if q.has_data() {
+        q.compute_score();
+    }
+    q
+}
+
 /// Extract audio quality from Tapedeck extension fields.
 fn extract_audio_quality(info: Option<&AdditionalInfo>) -> AudioQuality {
     let Some(ai) = info else {
@@ -827,35 +883,20 @@ fn extract_audio_quality(info: Option<&AdditionalInfo>) -> AudioQuality {
         return AudioQuality::default();
     };
 
-    /// A codec name is a **grouping key**, so its spelling has to be one
-    /// spelling.
-    ///
-    /// Every source quotes whatever its upstream calls the format, and they
-    /// disagree about case: ffmpeg-derived paths say `flac`, fooyin says
-    /// `FLAC`. Classification is unaffected — `codec_is_lossless` and
-    /// `codec_is_dsd` both lowercase first — and so is the badge, which
-    /// uppercases for display. What splits is anything that ever **groups** on
-    /// the column, which today is nothing and tomorrow is the first per-codec
-    /// breakdown somebody writes. Folded here rather than left for that
-    /// query to remember, since a client cannot be asked to agree.
-    fn fold(s: &Option<String>) -> Option<String> {
-        s.as_deref().map(str::trim).filter(|v| !v.is_empty()).map(str::to_lowercase)
-    }
-
     AudioQuality {
-        format_type: fold(&ta.format_type),
-        codec: fold(&ta.codec),
+        format_type: ta.format_type.clone(),
+        codec: ta.codec.clone(),
         bitrate: ta.bitrate,
         sample_rate: ta.sample_rate,
         bit_depth: ta.bit_depth,
         channels: ta.channels,
-        container: fold(&ta.container),
+        container: ta.container.clone(),
         source_quality: ta.source_quality.clone(),
         is_lossless: ta.is_lossless,
         dsd_rate: ta.dsd_rate,
         dsd_multiplier: ta.dsd_multiplier,
         dsd_to_pcm_converted: ta.dsd_to_pcm_converted,
-        delivery_codec: fold(&ta.delivery_codec),
+        delivery_codec: ta.delivery_codec.clone(),
         delivery_bitrate: ta.delivery_bitrate,
         delivery_sample_rate: ta.delivery_sample_rate,
         delivery_bit_depth: ta.delivery_bit_depth,
@@ -922,43 +963,122 @@ mod relay_tests {
         }
     }
 
-    /// **A codec name is a grouping key, so one format is one spelling.**
+    /// **What a client says about the audio, as it is actually stored.**
     ///
-    /// Reported by the Tapeout plugin's author: fooyin reports `"FLAC"` where
-    /// every ffmpeg-derived source reports `"flac"`, and the column stores the
-    /// literal. Nothing today is *wrong* because of it — `codec_is_lossless`
-    /// lowercases before testing and the badge uppercases for display — which
-    /// is exactly what makes it worth folding now rather than when the first
-    /// per-codec breakdown finds two `FLAC` rows that will not add up.
+    /// Against `prepare_quality` rather than its three steps, because the steps
+    /// were inline in `submit_listens` and a test that called them itself
+    /// proved nothing about the handler — removing one of them from the
+    /// handler left this green, which is how the weakness was found. The
+    /// remaining wiring is a single line the compiler holds.
     ///
-    /// `format_type` matters more than it looks: `FIDELITY_KNOWN` and the badge
-    /// both compare it to a lowercase literal, so an uppercase `"DSD"` would
-    /// have been filed as neither DSD nor known.
+    /// Three rules in one place:
+    ///
+    /// * **One format is one spelling.** fooyin reports `FLAC` where
+    ///   ffmpeg-derived sources report `flac`, and the column stores the
+    ///   literal. `format_type` is the one that was never merely cosmetic —
+    ///   `FIDELITY_KNOWN`, the badge and `compute_score` all compare it to a
+    ///   lowercase literal, so an uppercase `DSD` was filed as neither DSD nor
+    ///   known **and scored as PCM**.
+    /// * **A codec alone is enough to classify.** Ingest called neither
+    ///   `classify_codec` nor anything like it, so a FLAC submission was stored
+    ///   as being of unknown fidelity, outside the population the fidelity
+    ///   cards report on.
+    /// * **The client still wins.** One saying `is_lossless: false` about a
+    ///   FLAC knows something the codec does not — a lossy file in a FLAC
+    ///   container, or a transcode — so the derivation fills gaps and overrules
+    ///   nobody.
     #[test]
-    fn one_format_is_one_spelling_however_a_client_writes_it() {
-        // Built from the wire shape rather than from a struct literal, so the
-        // field names are exercised too — this is a deserialisation path, and
-        // a `tapedeck_audio` key nothing reads is the failure mode next door.
-        let info: AdditionalInfo = serde_json::from_value(serde_json::json!({
-            "tapedeck_audio": {
-                "format_type": "DSD",
-                "codec": "  FLAC  ",
-                "container": "Ogg",
-                "delivery_codec": "AAC"
-            }
-        }))
-        .unwrap();
-        let q = extract_audio_quality(Some(&info));
+    fn one_format_is_one_spelling_and_a_codec_alone_is_enough_to_classify() {
+        // Built from the wire shape rather than a struct literal, so the field
+        // names are exercised too — this is a deserialisation path, and a
+        // `tapedeck_audio` key nothing reads is the failure mode next door.
+        let q = prepare_quality(Some(
+            &serde_json::from_value(serde_json::json!({
+                "tapedeck_audio": {
+                    "format_type": "DSD",
+                    "codec": "  DSD64  ",
+                    "container": "Ogg",
+                    "delivery_codec": "AAC"
+                }
+            }))
+            .unwrap(),
+        ));
         assert_eq!(q.format_type.as_deref(), Some("dsd"));
-        assert_eq!(q.codec.as_deref(), Some("flac"), "trimmed as well as folded");
+        assert_eq!(q.codec.as_deref(), Some("dsd64"), "trimmed as well as folded");
         assert_eq!(q.container.as_deref(), Some("ogg"));
         assert_eq!(q.delivery_codec.as_deref(), Some("aac"));
 
+        // **And the score was computed from the folded value.** A DSD64 direct
+        // play scores 92; an unfolded `"DSD"` matches neither arm of
+        // `compute_score` and falls through. Kept on its own fixture with no
+        // `delivery_codec`, because that field means the audio was transcoded
+        // and is correctly docked — the first version of this assertion mixed
+        // the two and read as a scoring bug when it was a fixture describing an
+        // AAC transcode of a DSD file.
+        let q = prepare_quality(Some(
+            &serde_json::from_value(serde_json::json!({
+                "tapedeck_audio": {
+                    "format_type": "DSD",
+                    "codec": "dsd64",
+                    "sample_rate": 2_822_400
+                }
+            }))
+            .unwrap(),
+        ));
+        assert_eq!(q.dsd_multiplier, Some(64), "derived from the rate");
+        assert_eq!(q.quality_score, Some(92.0), "an uppercase format scored down some other arm");
+
+        // A codec and nothing else: both derived.
+        let q = prepare_quality(Some(
+            &serde_json::from_value(serde_json::json!({"tapedeck_audio": {"codec": "FLAC"}}))
+                .unwrap(),
+        ));
+        assert_eq!(q.codec.as_deref(), Some("flac"));
+        assert_eq!(q.format_type.as_deref(), Some("pcm"));
+        assert_eq!(q.is_lossless, Some(true), "derived, where it used to be left unknown");
+
+        // Stated by the client, and therefore kept.
+        let q = prepare_quality(Some(
+            &serde_json::from_value(serde_json::json!({
+                "tapedeck_audio": {"codec": "flac", "is_lossless": false}
+            }))
+            .unwrap(),
+        ));
+        assert_eq!(q.is_lossless, Some(false), "the client knows something the codec does not");
+
         // An empty string is not a codec, and storing one would be a third
-        // spelling of "we do not know" beside NULL and absent.
-        let blank: AdditionalInfo =
-            serde_json::from_value(serde_json::json!({"tapedeck_audio": {"codec": "   "}}))
-                .unwrap();
-        assert_eq!(extract_audio_quality(Some(&blank)).codec, None);
+        // spelling of "we do not know" beside NULL and absent. With nothing to
+        // derive from, both stay unset — `FIDELITY_KNOWN` reads a NULL
+        // `is_lossless` as "we never knew", which is the population the
+        // fidelity cards confess to.
+        let q = prepare_quality(Some(
+            &serde_json::from_value(serde_json::json!({"tapedeck_audio": {"codec": "   "}}))
+                .unwrap(),
+        ));
+        assert_eq!(q.codec, None);
+        assert_eq!(q.is_lossless, None);
+        assert_eq!(q.format_type, None);
+    }
+
+    /// **A skip does not swallow the listen it sat next to.**
+    ///
+    /// The two are separate events, and with one id between them the second to
+    /// arrive was answered `duplicate` and never stored. Idempotence is the
+    /// other half: a client resending its batch must still dedup, which is why
+    /// the marker is a constant rather than Plex's `-<now>`.
+    #[test]
+    fn a_skip_and_a_listen_of_one_track_at_one_second_are_two_ids() {
+        let listen = ingest_source_id(1, 1_700_000_000, "LA Girls", false);
+        let skip = ingest_source_id(1, 1_700_000_000, "LA Girls", true);
+        assert_ne!(listen, skip, "one id between them loses whichever arrives second");
+
+        // Resending either is the same id, so `exists` still catches a retry.
+        assert_eq!(listen, ingest_source_id(1, 1_700_000_000, "LA Girls", false));
+        assert_eq!(skip, ingest_source_id(1, 1_700_000_000, "LA Girls", true));
+
+        // And the parts that always distinguished listens still do.
+        assert_ne!(listen, ingest_source_id(2, 1_700_000_000, "LA Girls", false));
+        assert_ne!(listen, ingest_source_id(1, 1_700_000_001, "LA Girls", false));
+        assert_ne!(listen, ingest_source_id(1, 1_700_000_000, "Cheating", false));
     }
 }

@@ -48,7 +48,14 @@ impl Database {
             play.mbid_artist.as_ref().map(|arr| serde_json::to_string(arr).unwrap());
         let mbid_album_artist_json =
             play.mbid_album_artist.as_ref().map(|arr| serde_json::to_string(arr).unwrap());
-        let q = quality.cloned().unwrap_or_default();
+        let mut q = quality.cloned().unwrap_or_default();
+        // **One format is one spelling**, folded here because this is the one
+        // place every write path goes through: ingest, Plex, Jellyfin/Emby,
+        // Navidrome, Roon, the shelf and the importers. Each of those quoted
+        // whatever its upstream called the format and stored it raw, so `FLAC`
+        // and `flac` were two grouping keys. Doing it per source is six places
+        // to remember and one to forget.
+        q.normalise();
 
         // Everyone credited, when the source named more than one. `artist` is
         // the primary — for a film soundtrack the music director, which is how
