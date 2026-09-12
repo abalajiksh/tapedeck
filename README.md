@@ -740,10 +740,33 @@ Backfill your history from elsewhere and take it with you:
 
 ### Prerequisites
 
+To build:
+
 - Rust toolchain (1.85+ — the SVG renderer behind report images sets the floor)
 - [Bun](https://bun.sh) (to build the embedded web UI)
-- A Plex, Navidrome, Jellyfin, Emby or Roon server (optional — the ingest API works standalone)
-- A ListenBrainz / Last.fm / Libre.fm account (optional — connected per user in the UI)
+
+Optional, and connected in the UI rather than configured here:
+
+- A Plex, Navidrome, Jellyfin, Emby or Roon server — the ingest API works standalone
+- A ListenBrainz / Last.fm / Libre.fm account
+
+### System requirements
+
+**512 MB of RAM and four ARM cores**, which is a Raspberry Pi Zero 2 W — a
+1 GHz quad-core Cortex-A53 with 512 MB of LPDDR2. That is not an estimate of
+a floor: it is what the public demo at
+[demo.tapedeck.cc](https://demo.tapedeck.cc) runs on, passively cooled, off a
+64 GB SD card, serving a real history. Anything at or above it has headroom.
+
+One binary, no runtime and no daemon beside it, and SQLite by default — so
+what storage costs is the history itself plus the MusicBrainz and lyrics
+caches, on whatever card or disk the machine already has.
+
+**Building on that hardware is a different question, and the answer is don't.**
+`cargo build --release` wants considerably more memory than running the result
+does, and 512 MB will thrash or be killed. Build on a real machine and copy the
+binary over, or cross-compile to `aarch64-unknown-linux-gnu` — the artifact is
+self-contained, since `build.rs` bakes the web UI into it.
 
 ### Build
 
@@ -884,16 +907,65 @@ This covers all your devices — Walkman, Android phone, desktop Linux via MPRIS
 
 ### Connecting fooyin
 
+There are two ways, and they are not equivalent. Run **one** of them — both
+submit the same listen at the same timestamp, dedup drops whichever arrives
+second, and that can be the richer one.
+
+#### Tapeout, the native plugin
+
+[**Tapeout**](https://github.com/abalajiksh/fooyin-tapeout) is a fooyin plugin
+that reports what the ListenBrainz wire format has no field for. Build and
+install it against fooyin 0.12.6+, then:
+
+1. fooyin → Settings → Integrations → Tapedeck
+2. Tick **Send listens to Tapedeck**
+3. Address: `http://your-server:8080`, and a token with the `submit` scope
+4. Press **Test** — it names the token's owner and the Tapedeck it reached,
+   and says so if the scopes are wrong rather than letting you find out from a
+   403 later
+5. Turn fooyin's own ListenBrainz service off, if it points here too
+
+Nothing is submitted until that first box is ticked, so a passing **Test**
+alone will not produce listens.
+
+What it adds over the generic path:
+
+- **The audio as fooyin decoded it** — codec, container, sample rate, bit
+  depth, channels, lossless. fooyin is the decoder, so this is measured. A
+  listen that arrives without it stays permanently untagged; nothing recovers
+  it later.
+- **The output device**, which is rung two of the chain ladder below — learn
+  it once and every future listen through that sink attributes itself.
+- **Skips, submitted as skips**, kept and excluded from every count.
+- **The MusicBrainz ids a media server cannot give you** — release-group,
+  release-track, work and album-artist, plus ISRC, from the file's own tags.
+  `work` is the one that matters for classical: one composition spans dozens
+  of recordings by different performers, and nothing else relates them. These
+  need **0.114.0 or newer**; before that they were accepted and dropped.
+
+Each of those is its own switch under **Report**, and **Signal chain** is an
+override — leave it empty and the chain resolves from the output device, which
+is the arrangement worth having.
+
+Tested against fooyin 0.12.6 on Fedora 44 (Sway), x86-64, which is the only
+configuration it has been run on. Other platforms are untested rather than
+unsupported.
+
+#### The generic ListenBrainz path
+
+Built into fooyin, no plugin to build, and it works everywhere:
+
 1. fooyin → Settings → Integrations → Scrobbling → Services
 2. Add a custom ListenBrainz service
 3. URL: `http://your-server:8080`
 4. Token: your `td_xxx` token
 
-fooyin labels every scrobble it sends as an import, so its listens will arrive
-in Tapedeck but not be forwarded to Last.fm or ListenBrainz until you tick
-**Relay listens** on that token in Settings → API Tokens. Leave it off if
-fooyin is already scrobbling to those services directly, or you'll get each
-listen twice.
+You get the listen and none of the fields above. fooyin also labels every
+scrobble it sends as an import, so its listens will arrive in Tapedeck but not
+be forwarded to Last.fm or ListenBrainz until you tick **Relay listens** on that
+token in Settings → API Tokens. Leave it off if fooyin is already scrobbling to
+those services directly, or you'll get each listen twice. (Tapeout does not have
+this problem — it submits as a player, not an import.)
 
 ### Managing Users
 
