@@ -106,6 +106,13 @@ const EXEMPT: &[(&str, &str)] = &[
                                    and a skip still has a performer",
     ),
     (
+        "reclassify_unclassified_listens",
+        "one-off pass giving a listen that reported a \
+                                codec the classification ingest never ran; a \
+                                skip's stored fidelity is as much a fact as a \
+                                play's, and the filter belongs on the readers",
+    ),
+    (
         "reclassify_dsd_listens",
         "repairs format_type/quality_score on rows the \
                                 old classifier misparsed; leaving a skip wrong \

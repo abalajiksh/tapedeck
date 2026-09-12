@@ -486,6 +486,120 @@ impl Database {
     /// expressed in SQL, because a second copy of that formula in a `CASE` is
     /// free to drift from the real one — and this is the query that decides
     /// what the fidelity readouts say.
+    /// **A listen that reported a codec and was never classified.**
+    ///
+    /// Ingest called neither `classify_codec` nor anything like it until
+    /// v0.113.0, where Plex and Jellyfin both do. So a listen arriving with
+    /// `codec: "FLAC"` and nothing else was stored with no `format_type` and no
+    /// `is_lossless` — which put it outside `FIDELITY_KNOWN` *and* sent
+    /// `compute_score` down the PCM arm with `lossless = false` and a bitrate of
+    /// zero. Measured on a running instance: **30.0**, the bottom of the lossy
+    /// scale, for a lossless file. `avg_quality` on the Statistics page averages
+    /// exactly that column.
+    ///
+    /// **This is not the general rescore `compute_score` warns against.** That
+    /// warning is about changing the *formula*, which makes listens either side
+    /// of the change incomparable. The formula is untouched here and an input
+    /// was never read: these rows are being given the score they should always
+    /// have had — the same argument `reclassify_dsd_listens` makes below.
+    ///
+    /// Keyed on the **condition** rather than on `source_name LIKE 'ingest:%'`,
+    /// even though ingest is the only source that can produce it today
+    /// (Navidrome, Roon and the shelf report no codec at all; Plex and Jellyfin
+    /// classify). A source added later that sets a codec and forgets to
+    /// classify lands in exactly this state, and a predicate about the data
+    /// catches it where one about the writer would not.
+    ///
+    /// **Must run after the casing fold**, which is why it sits below it in
+    /// `migrate`: `compute_score` docks by a `match` on lowercase
+    /// `delivery_codec` spellings, so an unfolded `"AAC"` would take the `_`
+    /// arm and dock 5 instead of 8.
+    pub async fn reclassify_unclassified_listens(&self) -> Result<u64, sqlx::Error> {
+        // `is_lossless` is selected and carried back in because
+        // `fill_classification` **respects what a source stated** — a client
+        // saying `is_lossless: false` about a FLAC knows something the codec
+        // does not, and this pass must not overrule it any more than ingest
+        // does.
+        type Row = (
+            i64,
+            String,
+            Option<i32>,
+            Option<i32>,
+            Option<i16>,
+            Option<bool>,
+            Option<bool>,
+            Option<String>,
+            Option<i16>,
+            Option<i64>,
+        );
+        let rows: Vec<Row> = sqlx::query_as(&crate::sql!(
+            "SELECT id, codec, sample_rate, bitrate, bit_depth, is_lossless,
+                        is_transcoded, delivery_codec, dsd_multiplier, dsd_rate
+                   FROM scrobbles
+                  WHERE codec IS NOT NULL AND TRIM(codec) <> ''
+                    AND format_type IS NULL",
+        ))
+        .fetch_all(&self.pool)
+        .await?;
+
+        if rows.is_empty() {
+            return Ok(0);
+        }
+        info!("⚙️ Migrating: scoring {} listen(s) that reported a codec...", rows.len());
+
+        // One transaction, not one per row — the shape that made
+        // `rebuild_sessions` run past a proxy timeout on the real host.
+        let mut tx = self.pool.begin().await?;
+        let mut done = 0u64;
+        for (
+            id,
+            codec,
+            sample_rate,
+            bitrate,
+            bit_depth,
+            is_lossless,
+            is_transcoded,
+            delivery_codec,
+            dsd_multiplier,
+            dsd_rate,
+        ) in rows
+        {
+            let mut q = AudioQuality {
+                codec: Some(codec),
+                sample_rate,
+                bitrate,
+                bit_depth,
+                is_lossless,
+                is_transcoded,
+                delivery_codec,
+                dsd_multiplier,
+                dsd_rate,
+                ..Default::default()
+            };
+            q.fill_classification();
+            q.compute_score();
+            sqlx::query(&crate::sql!(
+                "UPDATE scrobbles
+                    SET format_type = ?, is_lossless = ?,
+                        dsd_rate = COALESCE(?, dsd_rate),
+                        dsd_multiplier = COALESCE(?, dsd_multiplier),
+                        quality_score = ?
+                  WHERE id = ?"
+            ))
+            .bind(&q.format_type)
+            .bind(q.is_lossless)
+            .bind(q.dsd_rate)
+            .bind(q.dsd_multiplier)
+            .bind(q.quality_score)
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+            done += 1;
+        }
+        tx.commit().await?;
+        Ok(done)
+    }
+
     pub async fn reclassify_dsd_listens(&self) -> Result<u64, sqlx::Error> {
         // `codec LIKE 'dsd%'` is the cheap half of `codec_is_dsd`; `dst` is
         // named explicitly. The container is *not* consulted — a DSF holding

@@ -9579,3 +9579,121 @@ async fn mixed_codec_casing_is_folded_once_and_the_pass_does_not_run_again() {
         );
     }
 }
+
+/// **A FLAC that was scored 30 gets the score it should always have had.**
+///
+/// Ingest called neither `classify_codec` nor anything like it, so a listen
+/// arriving with a codec and nothing else was stored with no `format_type` and
+/// no `is_lossless` — outside `FIDELITY_KNOWN`, and sent down `compute_score`'s
+/// PCM arm with `lossless = false` and a bitrate of zero. 30.0 for a lossless
+/// file, which is the bottom of the lossy scale, and `avg_quality` averages
+/// exactly that column.
+///
+/// Three things pinned, because each fails differently:
+///
+/// * the score moves, which is the point;
+/// * **a stated `is_lossless` survives** — the pass respects what a source said
+///   for the same reason ingest does, and overruling it here would be worse
+///   than the bug, since it would rewrite a client's own statement;
+/// * and **a skip is repaired too**. Its stored fidelity is as much a fact as a
+///   play's, and leaving one mis-scored makes two stored columns disagree.
+#[tokio::test]
+async fn a_listen_that_reported_a_codec_and_was_never_classified_gets_scored() {
+    let n = N.fetch_add(1, Ordering::SeqCst);
+    let path = std::env::temp_dir().join(format!("td-unclass-{}-{}.db", std::process::id(), n));
+    for suffix in ["", "-wal", "-shm"] {
+        let _ = std::fs::remove_file(format!("{}{}", path.display(), suffix));
+    }
+    let url = format!("sqlite:{}", path.display());
+
+    {
+        let db = Database::new(&url, Arc::new(SecretBox::test_key())).await.unwrap();
+        let uid = db.create_user("ash", None, "pw", "user").await.unwrap();
+        let now = Database::now_secs() as u64;
+        for (i, disposition) in
+            [ListenDisposition::LIVE, ListenDisposition { imported: false, skipped: true }]
+                .into_iter()
+                .enumerate()
+        {
+            let p = play("Xtal", "Aphex Twin", now - 900 + i as u64 * 300);
+            let q = AudioQuality {
+                codec: Some("flac".into()),
+                bit_depth: Some(16),
+                sample_rate: Some(44100),
+                ..Default::default()
+            };
+            db.save_scrobble(uid, &p, Some(&q), None, None, None, None, None, None, disposition)
+                .await
+                .unwrap();
+        }
+        // A third that stated its own fidelity, which must survive.
+        let p = play("Ageispolis", "Aphex Twin", now - 100);
+        let q = AudioQuality {
+            codec: Some("flac".into()),
+            is_lossless: Some(false),
+            ..Default::default()
+        };
+        db.save_scrobble(
+            uid,
+            &p,
+            Some(&q),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            ListenDisposition::LIVE,
+        )
+        .await
+        .unwrap();
+
+        // What an older binary left behind: a codec, no classification, and a
+        // score computed down the wrong arm.
+        sqlx::query(
+            "UPDATE scrobbles SET format_type = NULL, quality_score = 30.0,
+                    is_lossless = CASE WHEN title = 'Ageispolis' THEN 0 ELSE NULL END",
+        )
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        sqlx::query("DELETE FROM app_settings WHERE key = 'ingest_quality_classified'")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+    }
+
+    {
+        let db = Database::new(&url, Arc::new(SecretBox::test_key())).await.unwrap();
+        let rows: Vec<(String, i64, Option<String>, Option<bool>, Option<f64>)> = sqlx::query_as(
+            "SELECT title, skipped, format_type, is_lossless, quality_score
+               FROM scrobbles ORDER BY timestamp",
+        )
+        .fetch_all(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(rows.len(), 3);
+
+        let (_, skipped, fmt, lossless, score) = &rows[0];
+        assert_eq!(*skipped, 0);
+        assert_eq!(fmt.as_deref(), Some("pcm"));
+        assert_eq!(*lossless, Some(true), "derived from the codec");
+        assert_eq!(*score, Some(80.0), "16/44.1 lossless, where it was stored as 30");
+
+        let (_, skipped, fmt, _, score) = &rows[1];
+        assert_eq!(*skipped, 1, "the skipped one");
+        assert_eq!(fmt.as_deref(), Some("pcm"), "a skip's fidelity is a fact too");
+        assert_eq!(*score, Some(80.0));
+
+        let (title, _, _, lossless, score) = &rows[2];
+        assert_eq!(title, "Ageispolis");
+        assert_eq!(*lossless, Some(false), "what the client stated is not overruled");
+        assert_eq!(*score, Some(30.0), "and its score follows its own statement");
+
+        assert_eq!(
+            db.get_app_setting("ingest_quality_classified").await.unwrap().as_deref(),
+            Some("1"),
+            "recorded, so a whole-table scan is not repeated every start"
+        );
+    }
+}

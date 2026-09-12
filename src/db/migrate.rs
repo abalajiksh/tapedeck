@@ -1395,6 +1395,31 @@ impl Database {
             }
         }
 
+        // ── The listens that reported a codec and were never classified ──
+        //
+        // **Below the casing fold on purpose**: `compute_score` docks by a
+        // `match` on lowercase `delivery_codec` spellings, so an unfolded
+        // `"AAC"` would take the `_` arm and dock 5 instead of 8.
+        //
+        // Marker-guarded for the same reason that one is — the `WHERE` is
+        // self-limiting, but asking costs a scan of the whole table. A failure
+        // leaves the marker unset and `migrate` carries on, because the column
+        // migrations below matter more than a score.
+        if self.get_app_setting("ingest_quality_classified").await.ok().flatten().is_none() {
+            match self.reclassify_unclassified_listens().await {
+                Ok(n) => {
+                    if n > 0 {
+                        info!("✅ Scored {n} listen(s) that had reported a codec and no format");
+                    }
+                    let _ = self.set_app_setting("ingest_quality_classified", "1").await;
+                }
+                Err(e) => warn!(
+                    "⚠️ Could not score the unclassified listens: {}",
+                    crate::logging::error_chain(&e)
+                ),
+            }
+        }
+
         // ── The MBIDs only a tagging client can supply ──
         //
         // Appended after the uuid block for the reason that block is appended
