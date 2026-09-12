@@ -35,7 +35,7 @@
 	import { onMount, onDestroy } from 'svelte';
 	import { page } from '$app/stores';
 	import { api, lyricKey } from '$lib/api';
-	import type { LyricDoc } from '$lib/api';
+	import type { LyricDoc, LyricLine } from '$lib/api';
 	import { syncUrl } from '$lib/url';
 	import { deck, watchNowPlaying } from '$lib/nowplaying';
 
@@ -222,7 +222,19 @@
 	function lineAt(secs: number) {
 		if (!doc) return;
 		let n: number | null = null;
-		for (const l of doc.lines) if (l.at != null && l.at <= secs + 0.25) n = l.n;
+		// **Only lines that have words.** A synced lyric cues its instrumental
+		// gaps as empty lines — `[01:36.68]` with nothing after it, which is
+		// the conventional way an LRC marks one, and Teardrop's LRCLIB record
+		// carries five. Considering them here landed the cursor on a line the
+		// theatre cannot show, and the stage went **completely blank** for the
+		// length of every break: no lit line, no ghosts either side, and not
+		// even the "nothing held" message, since there are words. The rule was
+		// already written on `spoken` below — stepping onto a blank line is
+		// stepping onto nothing — and this is the place that did not follow it.
+		//
+		// So during a break the last line sung stays lit while the ribbon runs
+		// on, which is what a teleprompter does and what the words are for.
+		for (const l of doc.lines) if (l.at != null && l.at <= secs + 0.25 && l.text.trim()) n = l.n;
 		if (n != null) cursor = n;
 	}
 
@@ -254,7 +266,29 @@
 	 *  what makes an index stable — but the theatre reads one line at a time,
 	 *  and stepping onto a blank one would be stepping onto nothing. */
 	$: spoken = (doc?.lines ?? []).filter((l) => l.text.trim());
-	$: at = cursor == null ? -1 : spoken.findIndex((l) => l.n === cursor);
+	$: at = resolveAt(cursor, spoken);
+
+	/** Where the cursor sits among the lines that have words.
+	 *
+	 *  Resolved rather than looked up, because a cursor can legitimately name a
+	 *  line the theatre has nothing to show for: a cued instrumental gap (the
+	 *  bug above, closed at its source but reachable from `?line=` too), or a
+	 *  pin on a line some later correction blanked. Both used to return `-1`,
+	 *  which empties `current`, `above` and `below` together and leaves a blank
+	 *  stage — the one failure this screen cannot explain to anybody looking at
+	 *  it.
+	 *
+	 *  Falls back to the last line before the cursor, and to the first line
+	 *  when there is none: an LRC that opens on a cued blank intro should show
+	 *  what is coming rather than nothing at all. */
+	function resolveAt(c: number | null, sp: LyricLine[]): number {
+		if (c == null || !sp.length) return -1;
+		const exact = sp.findIndex((l) => l.n === c);
+		if (exact >= 0) return exact;
+		let before = -1;
+		for (let i = 0; i < sp.length; i++) if (sp[i].n < c) before = i;
+		return before >= 0 ? before : 0;
+	}
 	$: current = at >= 0 ? spoken[at] : null;
 	/** Three above and four below, fading and shrinking away — the design's own
 	 *  counts, and what turns a list into a place in a song. */
