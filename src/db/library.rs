@@ -296,6 +296,90 @@ impl Database {
         Ok(n)
     }
     /// Best artwork known for an album — used by the album hero and the cards.
+    /// Does this album already have a cover, from any source?
+    ///
+    /// The question a client asks **before** reading a megabyte off disk and
+    /// offering it, so the common case costs one small `GET` instead.
+    ///
+    /// **Deliberately not `album_artwork(..).is_some()`**, which is the obvious
+    /// reuse and is subtly wrong here. That one picks a cover to *display* and
+    /// therefore excludes skips — so an album whose only listens are skips
+    /// would answer "nothing held" for ever, and a client that trusts the
+    /// answer re-uploads the same sleeve on every run. The two questions differ:
+    /// one is "what should I show", this is "do you need this from me", and a
+    /// skipped listen carrying a cover is a fact either way.
+    ///
+    /// A hand-set cover counts. `entities.image_url` is what the album page
+    /// prefers over everything the listens carry, so answering `false` while
+    /// one is set would invite a client to send a picture that would never be
+    /// shown. Matched on `entity_key` rather than folded columns, so it is an
+    /// indexed lookup — and **nothing is created**: a client asking a question
+    /// must not mint an entity as a side effect, which is why `resolve` is no
+    /// use here.
+    pub async fn album_art_held(
+        &self,
+        user_id: i64,
+        artist: &str,
+        album: &str,
+    ) -> Result<bool, sqlx::Error> {
+        let (a, al) = (artist.trim().to_lowercase(), album.trim().to_lowercase());
+        let held: (i64,) = sqlx::query_as(&crate::sql!(
+            "SELECT
+               CASE WHEN EXISTS(
+                 SELECT 1 FROM scrobbles
+                  WHERE user_id = ? AND LOWER(TRIM(artist)) = ? AND LOWER(TRIM(album)) = ?
+                    AND (artwork_url IS NOT NULL AND artwork_url != '' OR caa_id > 0)
+               ) OR EXISTS(
+                 SELECT 1 FROM entities
+                  WHERE entity_key = ? AND image_url IS NOT NULL AND image_url != ''
+               ) THEN 1 ELSE 0 END"
+        ))
+        .bind(user_id)
+        .bind(&a)
+        .bind(&al)
+        .bind(Self::entity_key("release", artist, album))
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(held.0 == 1)
+    }
+
+    /// Stamp a cover a client read off its own files onto that album's listens.
+    ///
+    /// Writes `artwork_url` and nothing else, because that column **is** the
+    /// artwork backfill's queue and `album_artwork` reads it back — so a cover
+    /// that arrived with the listens is exactly what a Plex-sourced listen
+    /// carries, and it is served by the path that already exists. A
+    /// `cover_override` would say somebody set this by hand, and nobody did.
+    ///
+    /// **Only rows that have none**, which includes the `artwork_url = ''`
+    /// tombstone — and overwriting that one is the point rather than an
+    /// oversight. It means "asked every provider, nobody had a picture", and
+    /// the whole premise here is that the listener's own file does.
+    ///
+    /// Skips are filled too. Artwork is not a count, and a skipped listen
+    /// showing a lettered tile beside its neighbours would be the odd one out
+    /// for no reason anybody could see.
+    pub async fn set_album_artwork_from_library(
+        &self,
+        user_id: i64,
+        artist: &str,
+        album: &str,
+        url: &str,
+    ) -> Result<u64, sqlx::Error> {
+        let r = sqlx::query(&crate::sql!(
+            "UPDATE scrobbles SET artwork_url = ?
+              WHERE user_id = ? AND LOWER(TRIM(artist)) = ? AND LOWER(TRIM(album)) = ?
+                AND COALESCE(artwork_url, '') = ''",
+        ))
+        .bind(url)
+        .bind(user_id)
+        .bind(artist.trim().to_lowercase())
+        .bind(album.trim().to_lowercase())
+        .execute(&self.pool)
+        .await?;
+        Ok(r.rows_affected())
+    }
+
     pub async fn album_artwork(
         &self,
         user_id: i64,

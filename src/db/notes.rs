@@ -10,7 +10,7 @@ impl Database {
     /// Identity of an entity: kind + artist + name, all case- and
     /// padding-insensitive. Two spellings of one record should be one row, and
     /// the same track title by two artists must not be.
-    fn entity_key(kind: &str, artist_name: &str, name: &str) -> String {
+    pub(super) fn entity_key(kind: &str, artist_name: &str, name: &str) -> String {
         format!(
             "{}|{}|{}",
             kind.trim().to_lowercase(),

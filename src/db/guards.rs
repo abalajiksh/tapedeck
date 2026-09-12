@@ -106,6 +106,13 @@ const EXEMPT: &[(&str, &str)] = &[
                                    and a skip still has a performer",
     ),
     (
+        "album_art_held",
+        "answers whether a client should bother offering \
+                                a cover; a skipped listen carries artwork like \
+                                any other and excluding them would have the \
+                                same sleeve re-uploaded on every run",
+    ),
+    (
         "reclassify_unclassified_listens",
         "one-off pass giving a listen that reported a \
                                 codec the classification ingest never ran; a \

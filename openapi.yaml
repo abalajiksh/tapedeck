@@ -26,7 +26,7 @@ openapi: 3.1.0
 
 info:
   title: Tapedeck
-  version: 0.114.0
+  version: 0.115.0
   summary: Self-hosted scrobbler and listening journal.
   description: |
     Tapedeck ingests listens, enriches them with MusicBrainz metadata, stores
@@ -4870,6 +4870,105 @@ paths:
         '401': { $ref: '#/components/responses/Unauthorized' }
         '404': { description: 'No such picture, or the file is no longer on this server.' }
 
+  /api/v1/art/library:
+    get:
+      tags: [Library]
+      summary: Does this album already have a cover?
+      description: |
+        Scope: `write`.
+
+        The precondition of an upload, so the common case costs one small `GET`
+        rather than a megabyte of JPEG. A client reads the picture off disk only
+        when this answers `false`.
+
+        **`write`, not `read`** — this exists only to decide a write, and
+        requiring `read` would force a scrobbling token that wants to offer a
+        sleeve to carry read access to the whole listening history as well.
+
+        `held` is true when any listen of this album carries artwork (a
+        Cover Art Archive id counts, `-1` excluded), **or** when a cover has been
+        set by hand on the album — one set that way is what the album page
+        prefers over everything else, so answering `false` would invite a
+        picture that would never be shown.
+
+        Deliberately **not** `album_artwork`'s question, which excludes skips
+        because its job is choosing a cover to display. An album whose only
+        listens are skips would otherwise answer "nothing held" for ever and the
+        same sleeve would be re-uploaded on every run.
+
+        Creates nothing. `GET /api/v1/resolve` would mint the entity as a side
+        effect of being asked, which is right for a browser about to annotate
+        something and wrong for a player asking whether to bother.
+      parameters:
+        - { name: artist, in: query, required: true, schema: { type: string }, description: 'The **track** artist, matching `scrobbles.artist`.' }
+        - { name: album, in: query, required: true, schema: { type: string } }
+      responses:
+        '200':
+          description: Whether a cover is already held.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  held: { type: boolean }
+        '400': { description: A blank artist or album. }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+    post:
+      tags: [Library]
+      summary: Offer a cover read from the client's own files.
+      description: |
+        Scope: `write`.
+
+        Writes `scrobbles.artwork_url` on every listen of this album that has
+        none, and nothing else. That column **is** the artwork backfill's queue
+        and the album page reads it back, so a sleeve arriving with the listens
+        is exactly what a Plex-sourced listen carries. A cover *override* would
+        claim somebody set it by hand, and nobody did.
+
+        Rows holding the `artwork_url = ''` tombstone are filled too, and that
+        is the point rather than an oversight: the tombstone means "asked every
+        provider, nobody had a picture", and the premise here is that the
+        listener's own file does. Skipped listens are filled as well — artwork
+        is not a count.
+
+        The held check runs again before the bytes are written, so a cover that
+        arrived between the `GET` and this costs no file on disk and is reported
+        rather than treated as an error.
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [artist, album, file]
+              properties:
+                artist: { type: string, description: 'The **track** artist, matching `scrobbles.artist`.' }
+                album: { type: string }
+                release_mbid:
+                  type: string
+                  description: |
+                    **Accepted and not read.** Said out loud rather than left for
+                    a client author to discover: the cover is keyed on names like
+                    every other album query, and writing this to `mbid_release`
+                    would be a different claim — the client's tagging, which has
+                    its own path through `additional_info` on a submission.
+                file: { type: string, format: binary, description: 'The image, original bytes, content type declared.' }
+      responses:
+        '200':
+          description: Stored, or already held.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  artwork_url: { type: string, example: /api/v1/art/upload/0123456789abcdef01234567.jpg }
+                  listens_covered: { type: integer, description: How many listens gained the cover. }
+                  already_held: { type: boolean, description: Something filled it between the check and this. Not an error. }
+        '400': { description: 'No image, or a blank artist or album.' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '413': { description: Larger than 8 MB. }
+        '415': { description: Not an image type this server stores. }
+
   # ── Loves ──────────────────────────────────────────────────────────────────
   /api/v1/loves:
     get:
@@ -8091,6 +8190,64 @@ paths:
                     type: boolean
                     description: The count changed, so every quote past the change now points at different words.
         '400': { description: No artist, no title, or no words in it. }
+
+  /api/v1/lyrics/library:
+    post:
+      tags: [Statistics]
+      summary: Words a player found in its own files.
+      description: |
+        Scope: `write`.
+
+        **Not a correction.** `PUT /api/v1/lyrics` calls `set_words`, which sets
+        `edited` and stamps the source as *You* — a claim only a person typing
+        gets to make, and the flag that outranks every later fetch. A client
+        reporting what a file contains is not correcting anything, so this goes
+        through the library path instead: it refuses to write over an edited row,
+        re-reads the language from the new words, and upserts, so a repeat send
+        is harmless.
+
+        **Not `POST /api/v1/lyrics/fetch` either**, which spends a shared
+        politeness budget at LRCLIB. This is offering words, not asking for them.
+
+        Sends nothing to any third party, and the words never leave the instance
+        — not in a backup, not in an export, not to a patched deck.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [artist, title, source]  # source enforced in the handler, so a missing one is a 400 with a reason rather than a deserialiser 422
+              properties:
+                artist: { type: string }
+                title: { type: string }
+                album: { type: string, description: 'Advisory. Not used to match — the key is artist and title.' }
+                plain: { type: string, description: 'Either or both of `plain` and `synced`.' }
+                synced: { type: string, example: '[00:12.30] the words' }
+                source:
+                  type: string
+                  example: Tapeout
+                  description: |
+                    Whose words these are, and **required**. The reader prints
+                    "Words via X", and that sentence is the whole reason this
+                    route exists apart from the LRCLIB one — *from your own
+                    files* and *from a lyrics service* are different statements
+                    about whose text somebody is reading. A client that will not
+                    say who it is does not get to write provenance.
+      responses:
+        '200':
+          description: Stored, or left alone because the row holds a correction.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, enum: [saved, kept] }
+                  why: { type: [string, 'null'], description: Why it was kept rather than saved. }
+                  language: { type: [string, 'null'], description: Re-read from the words just given. }
+                  lines: { type: integer, description: 'Numbered including blank lines, as the reader numbers them.' }
+        '400': { description: 'A blank artist, title or source, or no words.' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
 
   /api/v1/lyrics/live:
     get:

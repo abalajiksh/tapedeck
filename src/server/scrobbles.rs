@@ -1391,6 +1391,101 @@ pub struct FixLyricsRequest {
 /// and after so the caller can say so; it is not refused, because the
 /// correction is usually the point and the alternative is a lyric that stays
 /// wrong for ever.
+/// Words a player found in its own files, offered by the player.
+///
+/// **Deliberately not `PUT /api/v1/lyrics`**, which is the correction path: that
+/// one calls `set_words`, which sets `edited` and stamps the source as *You*.
+/// Typing a line in is a claim only a person gets to make, and a client
+/// reporting what a file contains is not correcting anything — so it must not
+/// be able to mint the flag that outranks every later fetch.
+///
+/// Nor `additional_info` on a submission: a lyric is a few KB on every play of a
+/// track already held, and ingest stays about the listening.
+#[derive(serde::Deserialize)]
+pub struct LibraryLyricsRequest {
+    pub artist: String,
+    pub title: String,
+    /// Advisory. Not used to match — `track_key` is artist and title — and kept
+    /// out of the store for the same reason.
+    #[allow(dead_code)]
+    pub album: Option<String>,
+    pub plain: Option<String>,
+    pub synced: Option<String>,
+    /// Whose words these are, and **required**.
+    ///
+    /// The reader prints "Words via X", and that sentence is the entire reason
+    /// this route exists apart from the LRCLIB one: *from your own files* and
+    /// *from a lyrics service* are different statements about whose text
+    /// somebody is reading. A client that will not say who it is should not get
+    /// to write provenance, and inventing one here would be the placeholder
+    /// User-Agent mistake in a new place.
+    ///
+    /// Typed `Option` and required **in the handler**, not by serde. A missing
+    /// required field is rejected by axum's `Json` extractor with a 422 before
+    /// any of this runs — so the client is handed a deserialiser's sentence
+    /// about a field name instead of the reason, which is the trap
+    /// `additional_info` already documents. The requirement is unchanged; only
+    /// the answer is legible.
+    pub source: Option<String>,
+}
+
+async fn library_lyrics(
+    State(state): State<Arc<AppState>>,
+    auth: WriteAuth,
+    Json(body): Json<LibraryLyricsRequest>,
+) -> impl IntoResponse {
+    let Some(lyrics) = state.lyrics.clone() else {
+        return server_error("This instance has no lyrics cache".to_string());
+    };
+    if body.artist.trim().is_empty() || body.title.trim().is_empty() {
+        return bad_request("Words need an artist and a title");
+    }
+    let source = body.source.as_deref().unwrap_or("").trim().to_string();
+    if source.is_empty() {
+        return bad_request("Say where the words came from — the reader shows it");
+    }
+    if body.plain.as_deref().unwrap_or("").trim().is_empty()
+        && body.synced.as_deref().unwrap_or("").trim().is_empty()
+    {
+        return bad_request("There are no words in that");
+    }
+
+    // Asked before, so the answer can say *stored* rather than *left alone* —
+    // `remember_library` refuses an edited row by returning early, which is the
+    // right behaviour and tells the caller nothing.
+    let edited = lyrics.is_edited(&body.artist, &body.title).await;
+    match lyrics
+        .remember_library(
+            &body.artist,
+            &body.title,
+            body.plain.clone(),
+            body.synced.clone(),
+            &source,
+        )
+        .await
+    {
+        Ok(crate::lyrics::Found::Lyrics { plain, synced, language }) => {
+            let _ = auth;
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "status": if edited { "kept" } else { "saved" },
+                    "why": if edited {
+                        Some("A correction typed in here outranks a file's own tags")
+                    } else {
+                        None
+                    },
+                    "language": language,
+                    "lines": crate::lyrics::parse_lines(plain.as_deref(), synced.as_deref()).len(),
+                })),
+            )
+                .into_response()
+        }
+        Ok(_) => server_error("The words did not come back".to_string()),
+        Err(e) => server_error(format!("Could not store those words: {e}")),
+    }
+}
+
 async fn fix_lyrics(
     State(state): State<Arc<AppState>>,
     user: AuthUser,
@@ -1722,6 +1817,7 @@ pub fn create_scrobbles_router() -> Router<Arc<AppState>> {
         .route("/api/v1/languages/status", get(language_status))
         .route("/api/v1/languages/backfill", axum::routing::post(backfill_languages_now))
         .route("/api/v1/lyrics", get(lyrics_for_track).put(fix_lyrics))
+        .route("/api/v1/lyrics/library", axum::routing::post(library_lyrics))
         .route("/api/v1/lyrics/live", get(live_lyrics))
         .route("/api/v1/lyrics/fetch", axum::routing::post(fetch_lyrics_now))
         .route("/api/v1/lyrics/keys", get(lyrics_keys))

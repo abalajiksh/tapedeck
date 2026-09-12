@@ -18,7 +18,7 @@
 
 use axum::{
     body::Body,
-    extract::{Multipart, Path, State},
+    extract::{Multipart, Path, Query, State},
     http::{header, StatusCode},
     response::{IntoResponse, Json, Response},
     routing::{get, post, put},
@@ -26,7 +26,7 @@ use axum::{
 };
 use std::sync::Arc;
 
-use super::auth::AuthUser;
+use super::auth::{AuthUser, WriteAuth};
 use super::models::ErrorResponse;
 use super::AppState;
 use crate::sources::{MediaBrowserSource, NavidromeSource, PlexFilters, PlexSource};
@@ -626,6 +626,141 @@ async fn upload_album_cover(
     }
 }
 
+// ── The cover a player is holding ──
+//
+// A scrobbling client knows names and never entity ids, which rules out the
+// routes that already exist: `PUT /api/v1/albums/:id/cover` takes an id, and
+// `GET /api/v1/resolve` would *create* the entity as a side effect of asking —
+// a write on a read path, which is fine for a browser that is about to annotate
+// something and wrong for a player asking whether to bother.
+
+#[derive(serde::Deserialize)]
+pub struct AlbumArtQuery {
+    pub artist: String,
+    pub album: String,
+}
+
+/// Whether this album already has a cover, so the common case costs one small
+/// `GET` instead of a megabyte of JPEG.
+///
+/// **`write` scope, not `read`** — deliberately, and it is the doc's argument
+/// rather than laziness: this exists only to decide a write, and making it
+/// `read` would force every scrobbling token that wants to offer a sleeve to
+/// also carry read access to the whole listening history.
+async fn album_art_held(
+    State(state): State<Arc<AppState>>,
+    auth: WriteAuth,
+    Query(q): Query<AlbumArtQuery>,
+) -> impl IntoResponse {
+    if q.artist.trim().is_empty() || q.album.trim().is_empty() {
+        return bad(StatusCode::BAD_REQUEST, "An artist and an album, please");
+    }
+    match state.db.album_art_held(auth.user.user_id, &q.artist, &q.album).await {
+        Ok(held) => (StatusCode::OK, Json(serde_json::json!({ "held": held }))).into_response(),
+        // Never reported as `held: false`, which would have the client send a
+        // picture on the strength of a failed read — the rule this codebase
+        // learned the hard way from `needs_setup`.
+        Err(e) => {
+            tracing::warn!("art/library: could not check: {}", crate::logging::error_chain(&e));
+            bad(StatusCode::INTERNAL_SERVER_ERROR, "Could not check for a cover")
+        }
+    }
+}
+
+/// Take a cover a player read off its own files.
+///
+/// Writes `scrobbles.artwork_url` rather than a cover override: that column is
+/// the artwork backfill's queue and `album_artwork` already reads it back, so a
+/// sleeve arriving with the listens is exactly what a Plex-sourced listen
+/// carries. An override would claim somebody set it by hand.
+async fn upload_album_art_from_library(
+    State(state): State<Arc<AppState>>,
+    auth: WriteAuth,
+    mut multipart: Multipart,
+) -> impl IntoResponse {
+    // **`read_one_image` cannot be reused.** It takes the first field that
+    // yields bytes and stops, and this body carries text fields before the
+    // file — so it would read "Charlie Puth" as the picture and refuse it as an
+    // unsupported type, which is a confusing 415 about a request that was fine.
+    let mut artist = String::new();
+    let mut album = String::new();
+    let mut file: Option<(Vec<u8>, String)> = None;
+    while let Ok(Some(field)) = multipart.next_field().await {
+        match field.name().unwrap_or("").to_string().as_str() {
+            "artist" => artist = field.text().await.unwrap_or_default(),
+            "album" => album = field.text().await.unwrap_or_default(),
+            "file" => {
+                let declared = field.content_type().unwrap_or("").to_string();
+                let named = field.file_name().unwrap_or("").to_string();
+                let mime = if super::physical::image_ext(&declared).is_some() {
+                    declared
+                } else {
+                    mime_guess::from_path(&named).first_raw().unwrap_or("").to_string()
+                };
+                if let Ok(b) = field.bytes().await {
+                    file = Some((b.to_vec(), mime));
+                }
+            }
+            // `release_mbid` arrives and is **not read**, which is said out
+            // loud here and in the spec rather than left for a client author to
+            // discover. There is nothing for it to decide: the cover is keyed
+            // on names like every other album query, and writing it to
+            // `mbid_release` would be a different claim entirely — the client's
+            // tagging, which already has a path through `additional_info` on a
+            // submission.
+            _ => {}
+        }
+    }
+
+    if artist.trim().is_empty() || album.trim().is_empty() {
+        return bad(StatusCode::BAD_REQUEST, "An artist and an album, please");
+    }
+    let Some((bytes, mime)) = file else {
+        return bad(StatusCode::BAD_REQUEST, "No image in the request");
+    };
+    // The same limits the browser uploads use, kept rather than re-derived.
+    if bytes.len() > MAX_ART_BYTES {
+        return bad(StatusCode::PAYLOAD_TOO_LARGE, "That picture is larger than 8 MB");
+    }
+    let Some(ext) = super::physical::image_ext(&mime) else {
+        return bad(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "Only JPEG, PNG, WebP, GIF, AVIF and TIFF images can be uploaded",
+        );
+    };
+
+    // Asked again, because the client's own check was a separate request and
+    // anything may have filled the cover since — the artwork backfill runs on
+    // the engine tick. Checked *before* the bytes are written, so a race costs
+    // no file on disk.
+    match state.db.album_art_held(auth.user.user_id, &artist, &album).await {
+        Ok(true) => {
+            return (StatusCode::OK, Json(serde_json::json!({ "already_held": true })))
+                .into_response()
+        }
+        Ok(false) => {}
+        Err(e) => {
+            tracing::warn!("art/library: could not check: {}", crate::logging::error_chain(&e));
+            return bad(StatusCode::INTERNAL_SERVER_ERROR, "Could not check for a cover");
+        }
+    }
+
+    let url = match store_upload(&state, &bytes, ext).await {
+        Ok(u) => u,
+        Err(r) => return r,
+    };
+    match state.db.set_album_artwork_from_library(auth.user.user_id, &artist, &album, &url).await {
+        Ok(n) => {
+            (StatusCode::OK, Json(serde_json::json!({ "artwork_url": url, "listens_covered": n })))
+                .into_response()
+        }
+        Err(e) => {
+            tracing::warn!("art/library: could not store: {}", crate::logging::error_chain(&e));
+            bad(StatusCode::INTERNAL_SERVER_ERROR, "Could not record that cover")
+        }
+    }
+}
+
 pub fn create_artwork_router() -> Router<Arc<AppState>> {
     Router::new()
         .route("/api/v1/art/:id", get(scrobble_art))
@@ -638,6 +773,7 @@ pub fn create_artwork_router() -> Router<Arc<AppState>> {
         .route("/api/v1/artists/img/:id/upload", post(upload_artist_image))
         .route("/api/v1/artists/landscape/:id/upload", post(upload_artist_landscape))
         .route("/api/v1/albums/:id/cover/upload", post(upload_album_cover))
+        .route("/api/v1/art/library", get(album_art_held).post(upload_album_art_from_library))
 }
 
 #[cfg(test)]

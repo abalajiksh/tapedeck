@@ -9697,3 +9697,165 @@ async fn a_listen_that_reported_a_codec_and_was_never_classified_gets_scored() {
         );
     }
 }
+
+/// **A cover a player offers fills the listens that have none, and only those.**
+///
+/// `artwork_url` is the artwork backfill's queue and the album page reads it
+/// back, so a sleeve that arrives with the listens is served by the path that
+/// already exists. Three rules, and each fails differently:
+///
+/// * the `artwork_url = ''` **tombstone is overwritten**, which is the point
+///   rather than an oversight — it means "asked every provider, nobody had a
+///   picture", and the premise here is that the listener's own file does;
+/// * a listen that already carries a cover is **left alone**, so a provider's
+///   answer, a shelf sleeve or a later upload is not trampled;
+/// * and **skips are filled**, because artwork is not a count and a skipped
+///   listen showing a lettered tile beside its neighbours would be the odd one
+///   out for no reason anybody could see.
+#[tokio::test]
+async fn a_library_cover_fills_only_the_listens_that_have_none() {
+    let db = testdb().await;
+    let uid = db.create_user("ash", None, "pw", "user").await.unwrap();
+    let now = Database::now_secs() as u64;
+
+    // Four listens of one record: nothing, a tombstone, a cover already, and a
+    // skip with nothing.
+    for (i, (art, skipped)) in
+        [(None, false), (Some(""), false), (Some("/held.jpg"), false), (None, true)]
+            .into_iter()
+            .enumerate()
+    {
+        let mut p = play("Xtal", "Aphex Twin", now - 900 + i as u64 * 100);
+        p.album = Some("Selected Ambient Works".into());
+        let source_id = p.source_id.clone();
+        db.save_scrobble(
+            uid,
+            &p,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            ListenDisposition { imported: false, skipped },
+        )
+        .await
+        .unwrap();
+        if let Some(a) = art {
+            sqlx::query("UPDATE scrobbles SET artwork_url = ? WHERE source_id = ?")
+                .bind(a)
+                .bind(&source_id)
+                .execute(&db.pool)
+                .await
+                .unwrap();
+        }
+    }
+    // And one of a different record, which must not be touched.
+    let mut other = play("Ageispolis", "Aphex Twin", now - 50);
+    other.album = Some("Untrue".into());
+    db.save_scrobble(
+        uid,
+        &other,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        ListenDisposition::LIVE,
+    )
+    .await
+    .unwrap();
+
+    let n = db
+        .set_album_artwork_from_library(
+            uid,
+            "  aphex twin  ",
+            "Selected Ambient Works",
+            "/mine.jpg",
+        )
+        .await
+        .unwrap();
+    assert_eq!(n, 3, "the empty one, the tombstone and the skip — not the one already covered");
+
+    let rows: Vec<(String, i64, Option<String>)> =
+        sqlx::query_as("SELECT title, skipped, artwork_url FROM scrobbles ORDER BY timestamp")
+            .fetch_all(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(rows[0].2.as_deref(), Some("/mine.jpg"));
+    assert_eq!(rows[1].2.as_deref(), Some("/mine.jpg"), "the tombstone is not a refusal");
+    assert_eq!(rows[2].2.as_deref(), Some("/held.jpg"), "a cover already there wins");
+    assert_eq!(rows[3].1, 1);
+    assert_eq!(rows[3].2.as_deref(), Some("/mine.jpg"), "a skip carries artwork like any other");
+    assert_eq!(rows[4].2, None, "another record entirely");
+}
+
+/// **"Do you need this from me" is not "what should I show".**
+///
+/// The obvious implementation reuses `album_artwork`, which excludes skips
+/// because its job is picking a cover to display. An album whose only listens
+/// are skips would then answer "nothing held" for ever, and a client that
+/// trusts the answer re-uploads the same sleeve on every run.
+///
+/// A cover set by hand counts too: the album page prefers one of those over
+/// everything the listens carry, so answering `false` would invite a picture
+/// that would never be shown.
+#[tokio::test]
+async fn the_held_check_sees_a_skip_and_a_hand_set_cover() {
+    let db = testdb().await;
+    let uid = db.create_user("ash", None, "pw", "user").await.unwrap();
+    let now = Database::now_secs() as u64;
+
+    // An album known only from a skip, which does carry a cover.
+    let mut p = play("Xtal", "Aphex Twin", now - 500);
+    p.album = Some("Selected Ambient Works".into());
+    let sid = p.source_id.clone();
+    db.save_scrobble(
+        uid,
+        &p,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        ListenDisposition { imported: false, skipped: true },
+    )
+    .await
+    .unwrap();
+    assert!(
+        !db.album_art_held(uid, "Aphex Twin", "Selected Ambient Works").await.unwrap(),
+        "nothing yet"
+    );
+    sqlx::query("UPDATE scrobbles SET artwork_url = '/mine.jpg' WHERE source_id = ?")
+        .bind(&sid)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    assert!(
+        db.album_art_held(uid, "aphex twin", "  selected ambient works ").await.unwrap(),
+        "a skip's cover is still a cover — otherwise the same sleeve is sent every run"
+    );
+
+    // A record with no listens carrying artwork, but a cover set by hand.
+    let mut q = play("Archangel", "Burial", now - 100);
+    q.album = Some("Untrue".into());
+    db.save_scrobble(uid, &q, None, None, None, None, None, None, None, ListenDisposition::LIVE)
+        .await
+        .unwrap();
+    assert!(!db.album_art_held(uid, "Burial", "Untrue").await.unwrap());
+    let e = db.upsert_entity("release", "Untrue", "Burial", None).await.unwrap();
+    db.set_entity_image(e, Some("/by-hand.jpg")).await.unwrap();
+    assert!(
+        db.album_art_held(uid, "Burial", "Untrue").await.unwrap(),
+        "the album page prefers a hand-set cover, so a client must not be asked for one"
+    );
+
+    // And another user's listens are not this user's answer.
+    let other = db.create_user("noor", None, "pw", "user").await.unwrap();
+    assert!(!db.album_art_held(other, "Aphex Twin", "Selected Ambient Works").await.unwrap());
+}
