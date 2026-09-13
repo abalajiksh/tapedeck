@@ -526,6 +526,12 @@ pub struct LibrariesContainer {
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct Library {
+    /// The section id, which is what addresses it: `/library/sections/{key}/…`.
+    /// `default` because every other reader of this struct wants only the
+    /// title, and a Plex that somehow omitted it should not fail the whole
+    /// library list.
+    #[serde(default)]
+    pub key: String,
     pub title: String,
     #[serde(rename = "type")]
     pub collection_type: String,
@@ -660,6 +666,22 @@ const HISTORY_SYNC_INTERVAL_SECS: u64 = 60;
 
 /// Rows per request on the history walk. Plex's own default, and the value this
 /// asked for as a hard `limit` before it learned to page.
+/// How many rated items to ask for at a time.
+///
+/// Larger than the history page because this is a manual, user-triggered walk
+/// against a server on the user's own network rather than something on the
+/// five-second tick, and the round trips are the cost here rather than the
+/// rows.
+const RATING_PAGE_SIZE: usize = 500;
+
+/// Where the walk gives up, per library section per kind.
+///
+/// A ceiling rather than an expectation — the `userRating` filter should make
+/// this unreachable, and reaching it means the filter was ignored and the
+/// section is simply enormous. It is the one stopping condition that is a
+/// *loss*, so it is the one that logs.
+const RATING_MAX_ITEMS: usize = 50_000;
+
 const HISTORY_PAGE_SIZE: usize = 50;
 
 /// How far the history walk rewinds past what it has already seen.
@@ -1022,6 +1044,165 @@ impl PlexSource {
             .flat_map(|h| h.metadata)
             .find(|m| m.title.as_deref().is_some_and(|t| artist_matches(t, name)))
             .and_then(|m| m.rating_key))
+    }
+
+    /// Every rated or starred item in this server's music libraries.
+    ///
+    /// **`userRating` is out of ten**, confirmed against Plex's own OpenAPI
+    /// description of a `metadata` item (`minimum: 0, maximum: 10`) — the UI
+    /// draws it as five stars at half-star granularity, so a 7 is three and a
+    /// half. The raw ten-point number is what travels; see [`crate::ratings`]
+    /// for why it is never normalised on the way in.
+    ///
+    /// **The `userRating>>=1` filter is an optimisation and never a
+    /// correctness dependency.** `>>=` is Plex's own spelling of ">=", and a
+    /// server that ignored it would simply return everything — which this then
+    /// filters client-side anyway. So the worst a wrong filter can do here is
+    /// make the walk slower, never make it miss a rating. That asymmetry is the
+    /// whole reason the client-side test is kept rather than trusted away.
+    ///
+    /// All three entity kinds, because a love can point at any of them: tracks
+    /// (`type=10`), albums (`9`) and artists (`8`).
+    ///
+    /// **Not verified against a live server.** The field name, its range and
+    /// the container paging headers come from Plex's published spec and from
+    /// the paging this module already does for history; what a real
+    /// `/library/sections/{key}/all` body carries has not been captured. Same
+    /// caveat `emby.rs` records, and for the same reason.
+    pub async fn fetch_ratings(
+        &self,
+    ) -> Result<Vec<crate::db::IncomingRating>, Box<dyn std::error::Error + Send + Sync>> {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "PascalCase")]
+        struct Resp {
+            media_container: Container,
+        }
+        #[derive(Deserialize)]
+        struct Container {
+            #[serde(rename = "Metadata", default)]
+            metadata: Vec<Item>,
+        }
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Item {
+            #[serde(default)]
+            rating_key: Option<String>,
+            #[serde(default)]
+            title: Option<String>,
+            /// The per-track credit, which wins over the record's artist for
+            /// the reason ingest keeps it: on a compilation
+            /// `grandparentTitle` is "Various Artists".
+            #[serde(default)]
+            original_title: Option<String>,
+            #[serde(default)]
+            grandparent_title: Option<String>,
+            #[serde(default)]
+            parent_title: Option<String>,
+            #[serde(default)]
+            user_rating: Option<f32>,
+            #[serde(default)]
+            last_rated_at: Option<i64>,
+        }
+
+        let mut out: Vec<crate::db::IncomingRating> = Vec::new();
+        let sections: Vec<String> = self
+            .libraries
+            .iter()
+            .filter(|l| l.collection_type == "artist" && !l.key.is_empty())
+            .map(|l| l.key.clone())
+            .collect();
+
+        for section in sections {
+            // 10 = track, 9 = album, 8 = artist — the three things a love can
+            // point at, and the three entity kinds this maps onto.
+            for (plex_type, kind) in [("10", "recording"), ("9", "release"), ("8", "artist")] {
+                let mut start = 0usize;
+                loop {
+                    let resp = self
+                        .client
+                        .get(format!("{}/library/sections/{}/all", self.url, section))
+                        .query(&[("type", plex_type), ("userRating>>", "1")])
+                        .header("X-Plex-Token", &self.token)
+                        .header("Accept", "application/json")
+                        .header("X-Plex-Container-Start", start.to_string())
+                        .header("X-Plex-Container-Size", RATING_PAGE_SIZE.to_string())
+                        .send()
+                        .await?;
+                    if !resp.status().is_success() {
+                        return Err(format!(
+                            "Plex returned {} listing rated items in section {}",
+                            resp.status(),
+                            section
+                        )
+                        .into());
+                    }
+                    let body: Resp = resp.json().await?;
+                    let n = body.media_container.metadata.len();
+
+                    for m in body.media_container.metadata {
+                        let (Some(remote_id), Some(title)) = (m.rating_key, m.title) else {
+                            continue;
+                        };
+                        // Zero is how Plex spells "not rated", and the filter
+                        // may not have been applied — see the note above.
+                        let Some(value) = m.user_rating.filter(|v| *v > 0.0) else { continue };
+
+                        // An artist *is* the name; a track and an album hang
+                        // off one. That is the shape `entity_key` expects.
+                        //
+                        // `parentTitle` is the album for a track and the artist
+                        // for an album, which is why one field feeds two very
+                        // different slots below.
+                        let parent = m.parent_title.clone();
+                        let (artist, name) = match kind {
+                            "artist" => (String::new(), title),
+                            "release" => (parent.unwrap_or_default(), title),
+                            _ => (
+                                m.original_title
+                                    .filter(|s| !s.trim().is_empty())
+                                    .or(m.grandparent_title)
+                                    .unwrap_or_default(),
+                                title,
+                            ),
+                        };
+                        if name.trim().is_empty() || (kind != "artist" && artist.trim().is_empty())
+                        {
+                            continue;
+                        }
+
+                        out.push(crate::db::IncomingRating {
+                            kind: kind.to_string(),
+                            remote_id,
+                            artist,
+                            name,
+                            album: if kind == "recording" { m.parent_title } else { None },
+                            mbid: None,
+                            rating: Some(crate::ratings::Rating::new(
+                                value,
+                                crate::ratings::SourceScale::PLEX,
+                            )),
+                            // Plex has no favourite separate from the rating.
+                            starred: false,
+                            rated_at: m.last_rated_at,
+                        });
+                    }
+
+                    if n < RATING_PAGE_SIZE {
+                        break;
+                    }
+                    start += n;
+                    if start >= RATING_MAX_ITEMS {
+                        warn!(
+                            "Plex: stopped listing rated items at {} — raise the cap if a library \
+                             really holds more than this",
+                            start
+                        );
+                        break;
+                    }
+                }
+            }
+        }
+        Ok(out)
     }
 
     /// This server's `machineIdentifier`.
@@ -2689,6 +2870,105 @@ mod tests {
             payload.len(),
             payload
         )
+    }
+
+    /// A stub that answers several requests, choosing a body by request path,
+    /// and records what it was asked.
+    ///
+    /// The single-shot `stub` above cannot cover a walk: the ratings pass makes
+    /// one request per library section per entity kind, and the thing most
+    /// worth asserting is *what was asked for*.
+    async fn routed_stub(
+        routes: Vec<(&'static str, String)>,
+        serve: usize,
+    ) -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let asked = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let seen = asked.clone();
+        tokio::spawn(async move {
+            for _ in 0..serve {
+                let Ok((mut sock, _)) = listener.accept().await else { break };
+                let mut buf = [0u8; 8192];
+                let n = sock.read(&mut buf).await.unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                let line = req.lines().next().unwrap_or("").to_string();
+                seen.lock().unwrap().push(line.clone());
+                let payload = routes
+                    .iter()
+                    .find(|(pat, _)| line.contains(*pat))
+                    .map(|(_, b)| b.clone())
+                    .unwrap_or_else(|| "{\"MediaContainer\":{}}".to_string());
+                let _ = sock.write_all(body("200 OK", &payload).as_bytes()).await;
+                let _ = sock.flush().await;
+            }
+        });
+        (format!("http://{addr}"), asked)
+    }
+
+    /// Plex rates out of **ten**, and the ten is what is stored.
+    ///
+    /// The number on the wire is `userRating` with `minimum: 0, maximum: 10`
+    /// per Plex's own OpenAPI description of a metadata item — the UI draws it
+    /// as five stars at half-star granularity, so a 7 is three and a half. What
+    /// must never happen is the ten-point number being folded to five on the
+    /// way in: a bare `3.5` can no longer say what the person actually clicked,
+    /// and if this reading of the field ever turns out to be wrong there is
+    /// nothing left to re-derive from.
+    #[tokio::test]
+    async fn plex_rates_out_of_ten_and_the_ten_is_what_is_kept() {
+        let tracks = r#"{"MediaContainer":{"Metadata":[
+            {"ratingKey":"101","title":"Archangel","grandparentTitle":"Burial",
+             "parentTitle":"Untrue","userRating":8.0,"lastRatedAt":1789000000},
+            {"ratingKey":"102","title":"Xtal","grandparentTitle":"Aphex Twin",
+             "originalTitle":"AFX","parentTitle":"SAW","userRating":7.0},
+            {"ratingKey":"103","title":"Never Rated","grandparentTitle":"Can",
+             "parentTitle":"Ege","userRating":0.0}
+        ]}}"#;
+        let (url, asked) = routed_stub(
+            vec![("type=10", tracks.to_string()), ("", r#"{"MediaContainer":{}}"#.into())],
+            3,
+        )
+        .await;
+
+        let mut src = PlexSource::new(url, "t".into());
+        src.libraries = vec![Library {
+            key: "1".into(),
+            title: "Music".into(),
+            collection_type: "artist".into(),
+        }];
+        let got = src.fetch_ratings().await.expect("the walk");
+
+        let arch = got.iter().find(|r| r.name == "Archangel").expect("Archangel");
+        let rating = arch.rating.expect("a rating");
+        assert_eq!(rating.value, 8.0, "the raw number, not a five-point one");
+        assert_eq!(rating.scale.max, 10.0, "and out of ten, or the eight means nothing");
+        assert_eq!(arch.artist, "Burial");
+        assert_eq!(arch.album.as_deref(), Some("Untrue"));
+        assert_eq!(arch.kind, "recording");
+
+        // `originalTitle` is the per-track credit and wins, for the reason
+        // ingest keeps it: on a compilation `grandparentTitle` is the
+        // placeholder rather than whoever played.
+        let xtal = got.iter().find(|r| r.name == "Xtal").expect("Xtal");
+        assert_eq!(xtal.artist, "AFX");
+
+        // **Zero is how Plex spells "not rated".** The `userRating>>=1` filter
+        // is an optimisation, not a correctness dependency — a server that
+        // ignored it returns everything, and this is what stops the unrated
+        // half of a library arriving as nought-star verdicts.
+        assert!(!got.iter().any(|r| r.name == "Never Rated"), "a zero is not a rating");
+
+        let asked = asked.lock().unwrap().clone();
+        assert!(
+            asked.iter().any(|l| l.contains("userRating%3E%3E=1")),
+            "the filter is still sent, because it makes the walk cheap: {asked:?}"
+        );
+        // Tracks, albums and artists — a love can point at any of the three.
+        for t in ["type=10", "type=9", "type=8"] {
+            assert!(asked.iter().any(|l| l.contains(t)), "{t} was never asked for: {asked:?}");
+        }
     }
 
     /// Silences part B so these tests are about the live read alone.

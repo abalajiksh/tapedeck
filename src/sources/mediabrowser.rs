@@ -46,6 +46,16 @@ pub(crate) const TICKS_PER_SECOND: u64 = 10_000_000;
 /// not about the precision of the source.
 const REPEAT_REWIND_SECS: u64 = 20;
 
+/// How many items to ask for at a time when walking the library for ratings.
+///
+/// A manual, user-triggered walk against a server on the user's own network,
+/// so the round trips cost more than the rows.
+const RATING_PAGE_SIZE: usize = 500;
+
+/// Where that walk gives up. A ceiling rather than an expectation, and the one
+/// stopping condition that is a *loss*, so it is the one that logs.
+const RATING_MAX_ITEMS: usize = 200_000;
+
 /// Which of the two servers this client is talking to.
 ///
 /// Everything that differs between Jellyfin and Emby is a method on this, so
@@ -1059,6 +1069,180 @@ impl MediaBrowserSource {
             .collect())
     }
 
+    /// Every rated or favourited item in this server's music library.
+    ///
+    /// **`IsFavorite` is the signal here and the number usually is not.**
+    /// `UserItemDataDto.Rating` is a nullable double inherited from
+    /// MediaBrowser and, per Jellyfin's own OpenAPI document, its
+    /// `POST /UserItems/{itemId}/Rating` takes **`likes` — a boolean — and no
+    /// number at all**. So on a modern Jellyfin that field is typically empty
+    /// and the heart is what people actually press. It is read anyway because
+    /// Emby still writes one and an older library may hold them, and because a
+    /// field that is read costs nothing where a field that is not is
+    /// unrecoverable.
+    ///
+    /// A favourite carries no scale and therefore takes no threshold: it is
+    /// already the same statement a love makes. See [`crate::ratings::LoveRule`].
+    ///
+    /// Three kinds in one walk (`Audio`, `MusicAlbum`, `MusicArtist`), because
+    /// a love can point at any of them and this server will happily rate all
+    /// three.
+    ///
+    /// **Not verified against a live server.** `Rating` and `IsFavorite` are
+    /// pinned to the shapes the OpenAPI schema declares; whether either is
+    /// populated on a real `/Items` response with `EnableUserData` has not been
+    /// captured. Same caveat the rest of this module's Emby half carries.
+    pub async fn fetch_ratings(
+        &self,
+    ) -> Result<Vec<crate::db::IncomingRating>, Box<dyn std::error::Error + Send + Sync>> {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "PascalCase")]
+        struct Resp {
+            #[serde(default)]
+            items: Vec<Item>,
+            #[serde(default)]
+            total_record_count: Option<usize>,
+        }
+        #[derive(Deserialize)]
+        #[serde(rename_all = "PascalCase")]
+        struct Item {
+            id: String,
+            #[serde(default)]
+            name: Option<String>,
+            #[serde(default)]
+            #[serde(rename = "Type")]
+            item_type: Option<String>,
+            #[serde(default)]
+            artists: Vec<String>,
+            #[serde(default)]
+            album_artist: Option<String>,
+            #[serde(default)]
+            album: Option<String>,
+            #[serde(default)]
+            user_data: Option<UserData>,
+            #[serde(default)]
+            provider_ids: HashMap<String, String>,
+        }
+        #[derive(Deserialize)]
+        #[serde(rename_all = "PascalCase")]
+        struct UserData {
+            #[serde(default)]
+            rating: Option<f32>,
+            #[serde(default)]
+            is_favorite: bool,
+        }
+
+        // Emby scopes item queries to a user where Jellyfin accepts a bare
+        // `/Items` — the same split `search_tracks` makes, and the account is
+        // needed here regardless because `UserData` is per user.
+        let account = self.account_id().await?;
+        let path = match self.flavour {
+            Flavour::Jellyfin => "/Items".to_string(),
+            Flavour::Emby => format!("/Users/{account}/Items"),
+        };
+
+        let mut out: Vec<crate::db::IncomingRating> = Vec::new();
+        let mut start = 0usize;
+        loop {
+            let resp = self
+                .client
+                .get(self.endpoint(&path))
+                .query(&[
+                    ("userId", account.as_str()),
+                    ("includeItemTypes", "Audio,MusicAlbum,MusicArtist"),
+                    ("recursive", "true"),
+                    ("fields", "Artists,ProviderIds"),
+                    ("enableUserData", "true"),
+                    ("startIndex", &start.to_string()),
+                    ("limit", &RATING_PAGE_SIZE.to_string()),
+                ])
+                .header("X-Emby-Token", &self.api_key)
+                .header("Accept", "application/json")
+                .send()
+                .await?;
+            if !resp.status().is_success() {
+                return Err(format!(
+                    "{} returned {} listing rated items",
+                    self.flavour.label(),
+                    resp.status()
+                )
+                .into());
+            }
+            let body: Resp = resp.json().await?;
+            let n = body.items.len();
+
+            for it in body.items {
+                let Some(name) = it.name.filter(|n| !n.trim().is_empty()) else { continue };
+                let Some(ud) = it.user_data else { continue };
+                let rating = ud.rating.filter(|v| *v > 0.0);
+                if rating.is_none() && !ud.is_favorite {
+                    continue;
+                }
+
+                let kind = match it.item_type.as_deref() {
+                    Some("MusicAlbum") => "release",
+                    Some("MusicArtist") => "artist",
+                    _ => "recording",
+                };
+                let artist = match kind {
+                    "artist" => String::new(),
+                    _ => it
+                        .artists
+                        .into_iter()
+                        .next()
+                        .filter(|s| !s.trim().is_empty())
+                        .or(it.album_artist)
+                        .unwrap_or_default(),
+                };
+                if kind != "artist" && artist.trim().is_empty() {
+                    continue;
+                }
+
+                out.push(crate::db::IncomingRating {
+                    kind: kind.to_string(),
+                    remote_id: it.id,
+                    artist,
+                    name,
+                    album: if kind == "recording" { it.album } else { None },
+                    // Free, and every one is a MusicBrainz lookup not made.
+                    mbid: it
+                        .provider_ids
+                        .get("MusicBrainzTrack")
+                        .or_else(|| it.provider_ids.get("MusicBrainzAlbum"))
+                        .or_else(|| it.provider_ids.get("MusicBrainzArtist"))
+                        .cloned(),
+                    rating: rating.map(|v| {
+                        crate::ratings::Rating::new(v, crate::ratings::SourceScale::MEDIABROWSER)
+                    }),
+                    starred: ud.is_favorite,
+                    // Neither server records when a favourite was pressed.
+                    rated_at: None,
+                });
+            }
+
+            start += n;
+            // A short page is the end, and so is running past the count the
+            // server itself reported — belt and braces, because a server that
+            // ignores `startIndex` would otherwise re-serve page one forever.
+            if n == 0 || n < RATING_PAGE_SIZE {
+                break;
+            }
+            if body.total_record_count.is_some_and(|t| start >= t) {
+                break;
+            }
+            if start >= RATING_MAX_ITEMS {
+                tracing::warn!(
+                    "{}: stopped listing rated items at {} — raise the cap if a library really \
+                     holds more than this",
+                    self.flavour.label(),
+                    start
+                );
+                break;
+            }
+        }
+        Ok(out)
+    }
+
     /// Create an audio playlist holding `ids`, in that order.
     ///
     /// The two flavours disagree about how to say it. Jellyfin marks the query
@@ -1306,6 +1490,96 @@ impl crate::sources::MusicSource for MediaBrowserSource {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A stub answering several requests, choosing a body by request path.
+    async fn routed_stub(
+        routes: Vec<(&'static str, String)>,
+        serve: usize,
+    ) -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let asked = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let seen = asked.clone();
+        tokio::spawn(async move {
+            for _ in 0..serve {
+                let Ok((mut sock, _)) = listener.accept().await else { break };
+                let mut buf = [0u8; 8192];
+                let n = sock.read(&mut buf).await.unwrap_or(0);
+                let line =
+                    String::from_utf8_lossy(&buf[..n]).lines().next().unwrap_or("").to_string();
+                seen.lock().unwrap().push(line.clone());
+                let payload = routes
+                    .iter()
+                    .find(|(pat, _)| line.contains(*pat))
+                    .map(|(_, b)| b.clone())
+                    .unwrap_or_else(|| "{}".to_string());
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    payload.len(),
+                    payload
+                );
+                let _ = sock.write_all(resp.as_bytes()).await;
+                let _ = sock.flush().await;
+            }
+        });
+        (format!("http://{addr}"), asked)
+    }
+
+    /// A favourite is the signal, and the number — where there is one — is out
+    /// of ten.
+    ///
+    /// `UserItemDataDto.Rating` is a nullable double inherited from
+    /// MediaBrowser, and Jellyfin's own `POST /UserItems/{itemId}/Rating` takes
+    /// **`likes` (a boolean) and no number at all**, so on a modern Jellyfin
+    /// that field is usually empty and `IsFavorite` carries everything. Both
+    /// are read: Emby still writes a number and an old library may hold them,
+    /// and a field that is read costs nothing where a field that is not is
+    /// unrecoverable.
+    ///
+    /// The three item types map to the three kinds a love can point at, and an
+    /// item with neither a rating nor a heart is not a nought-star verdict.
+    #[tokio::test]
+    async fn a_favourite_and_a_ten_point_rating_both_arrive_and_nothing_else_does() {
+        let items = r#"{"Items":[
+            {"Id":"j1","Name":"Teardrop","Type":"Audio","Artists":["Massive Attack"],
+             "Album":"Mezzanine","UserData":{"IsFavorite":true}},
+            {"Id":"j2","Name":"Angel","Type":"Audio","Artists":["Massive Attack"],
+             "Album":"Mezzanine","UserData":{"Rating":6.0,"IsFavorite":false}},
+            {"Id":"j3","Name":"Mezzanine","Type":"MusicAlbum","Artists":["Massive Attack"],
+             "UserData":{"Rating":10.0,"IsFavorite":false}},
+            {"Id":"j4","Name":"Massive Attack","Type":"MusicArtist",
+             "UserData":{"IsFavorite":true}},
+            {"Id":"j5","Name":"Untouched","Type":"Audio","Artists":["Massive Attack"],
+             "UserData":{"IsFavorite":false}}
+        ],"TotalRecordCount":5}"#;
+        let users = r#"[{"Id":"u1","Name":"ash"}]"#;
+        let (url, _asked) =
+            routed_stub(vec![("/Users", users.to_string()), ("/Items", items.to_string())], 4)
+                .await;
+
+        let src = MediaBrowserSource::jellyfin(url, "k".into(), "ash".into());
+        let got = src.fetch_ratings().await.expect("the walk");
+
+        let teardrop = got.iter().find(|r| r.name == "Teardrop").expect("Teardrop");
+        assert!(teardrop.starred, "a heart is the statement a love makes");
+        assert!(teardrop.rating.is_none(), "and carries no number to apply a threshold to");
+
+        let angel = got.iter().find(|r| r.name == "Angel").expect("Angel");
+        let rating = angel.rating.expect("a rating");
+        assert_eq!(rating.value, 6.0);
+        assert_eq!(rating.scale.max, 10.0, "ten, not five — this is a MediaBrowser double");
+
+        // All three kinds, because a love can point at any of them.
+        assert_eq!(got.iter().find(|r| r.name == "Mezzanine").unwrap().kind, "release");
+        let artist = got.iter().find(|r| r.kind == "artist").expect("the artist");
+        assert_eq!(artist.name, "Massive Attack");
+        assert_eq!(artist.artist, "", "an artist *is* the name — the shape entity_key expects");
+
+        // Neither rated nor hearted is not a verdict of nought.
+        assert!(!got.iter().any(|r| r.name == "Untouched"));
+        assert_eq!(got.len(), 4);
+    }
 
     /// `Type` must actually reach `stream_type`, and the audio stream must be
     /// found by it.

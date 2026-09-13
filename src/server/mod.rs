@@ -27,6 +27,7 @@ pub mod playlists;
 mod preferences;
 pub mod public_np;
 pub mod ratelimit;
+mod ratings;
 pub mod rediscovery;
 pub mod report_image;
 pub mod reports;
@@ -129,6 +130,7 @@ pub fn build_app(state: Arc<AppState>) -> Router {
         .merge(notes::create_notes_router())
         .merge(library::create_library_router())
         .merge(loves_pull::create_loves_pull_router())
+        .merge(ratings::create_ratings_router())
         .merge(metrics::create_metrics_router())
         .merge(ops::create_ops_router())
         .merge(sessions::create_sessions_router())

@@ -18,6 +18,7 @@ mod openapi;
 mod patch;
 mod playlist_lab;
 mod playlists;
+mod ratings;
 mod replica;
 mod report_image;
 mod rockbox;

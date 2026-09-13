@@ -1,4 +1,5 @@
 use super::*;
+use crate::ratings::LoveRule;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 static N: AtomicU32 = AtomicU32::new(0);
@@ -9858,4 +9859,410 @@ async fn the_held_check_sees_a_skip_and_a_hand_set_cover() {
     // And another user's listens are not this user's answer.
     let other = db.create_user("noor", None, "pw", "user").await.unwrap();
     assert!(!db.album_art_held(other, "Aphex Twin", "Selected Ambient Works").await.unwrap());
+}
+
+// ── Library ratings, and the threshold that turns them into loves ──────────
+
+/// A user with a library source and one listen already in the history.
+async fn rated_deck(db: &Database) -> (i64, i64) {
+    let uid = db.create_user("ash", None, "pw", "user").await.unwrap();
+    let source = db
+        .create_source(uid, "plex", "Front room", true, "http://plex", "{}", None, None, "{}")
+        .await
+        .unwrap();
+    (uid, source)
+}
+
+fn rating(kind: &str, artist: &str, name: &str, value: f32, max: f32) -> IncomingRating {
+    IncomingRating {
+        kind: kind.into(),
+        remote_id: format!("{kind}-{name}"),
+        artist: artist.into(),
+        name: name.into(),
+        album: None,
+        mbid: None,
+        rating: Some(crate::ratings::Rating::new(value, crate::ratings::SourceScale::new(max))),
+        starred: false,
+        rated_at: None,
+    }
+}
+
+/// The number the server gave survives the round trip, and so does what it was
+/// out of.
+///
+/// Storing a normalised value instead would be unrecoverable: a bare `0.8` can
+/// no longer say whether the person clicked four stars out of five or eight out
+/// of ten, and if the reading of a server's field ever turns out to be wrong
+/// there is nothing left to re-derive from. Same call `artist_credit`,
+/// `timestamp_original` and `spotify_track_id` all make.
+#[tokio::test]
+async fn a_rating_is_stored_as_the_server_gave_it_and_not_as_a_fraction() {
+    let db = testdb().await;
+    let (uid, source) = rated_deck(&db).await;
+
+    db.upsert_library_ratings(
+        uid,
+        source,
+        "plex",
+        &[
+            rating("recording", "Burial", "Archangel", 7.0, 10.0),
+            rating("recording", "Aphex Twin", "Xtal", 4.0, 5.0),
+        ],
+    )
+    .await
+    .unwrap();
+
+    let rows = db.list_library_ratings(uid, 50).await.unwrap();
+    let arch = rows.iter().find(|r| r.name == "Archangel").expect("Archangel");
+    assert_eq!(arch.rating, Some(7.0), "seven, not 0.7 and not three and a half");
+    assert_eq!(arch.scale_max, 10.0, "and out of ten, or the seven means nothing");
+
+    let xtal = rows.iter().find(|r| r.name == "Xtal").expect("Xtal");
+    assert_eq!(xtal.rating, Some(4.0));
+    assert_eq!(xtal.scale_max, 5.0, "a five-point scale is kept as one");
+
+    // Both are the same verdict, and only the fraction says so.
+    assert!((arch.fraction() - 0.7).abs() < 0.001);
+    assert!((xtal.fraction() - 0.8).abs() < 0.001);
+}
+
+/// Re-pulling tracks the server rather than piling up.
+///
+/// The server is the authority on its own ratings and this table is a copy of
+/// them, so a rating raised there is raised here — and a second pull of an
+/// unchanged library leaves exactly what the first one did.
+#[tokio::test]
+async fn a_second_pull_updates_a_rating_rather_than_duplicating_it() {
+    let db = testdb().await;
+    let (uid, source) = rated_deck(&db).await;
+
+    db.upsert_library_ratings(
+        uid,
+        source,
+        "plex",
+        &[rating("recording", "Burial", "Archangel", 4.0, 10.0)],
+    )
+    .await
+    .unwrap();
+    db.upsert_library_ratings(
+        uid,
+        source,
+        "plex",
+        &[rating("recording", "Burial", "Archangel", 9.0, 10.0)],
+    )
+    .await
+    .unwrap();
+
+    let rows = db.list_library_ratings(uid, 50).await.unwrap();
+    assert_eq!(rows.len(), 1, "one row, not two");
+    assert_eq!(rows[0].rating, Some(9.0), "and it is what the server says now");
+}
+
+/// One threshold means the same thing on a server that counts to ten and one
+/// that counts to five.
+///
+/// This is the whole reason the source's scale is stored beside the number. The
+/// two ratings below are both four-out-of-five and both must land; the two
+/// beside them are both three-out-of-five and neither may.
+#[tokio::test]
+async fn one_threshold_reads_the_same_across_servers_that_count_differently() {
+    let db = testdb().await;
+    let (uid, source) = rated_deck(&db).await;
+
+    // Distinct timestamps, because `listen` derives its `source_id` from one
+    // and `save_scrobble` dedups on it — four listens at one second is one
+    // listen, which is the dedup working rather than a fixture detail.
+    for (i, (artist, title)) in [
+        ("Burial", "Archangel"),
+        ("Aphex Twin", "Xtal"),
+        ("Neu!", "Hallogallo"),
+        ("Can", "Vitamin C"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        listen(&db, uid, None, title, artist, 1_760_000_000 + i as u64 * 300).await;
+    }
+    db.upsert_library_ratings(
+        uid,
+        source,
+        "plex",
+        &[
+            rating("recording", "Burial", "Archangel", 8.0, 10.0), // 4/5 on a ten-point server
+            rating("recording", "Aphex Twin", "Xtal", 4.0, 5.0),   // 4/5 on a five-point one
+            rating("recording", "Neu!", "Hallogallo", 6.0, 10.0),  // 3/5
+            rating("recording", "Can", "Vitamin C", 3.0, 5.0),     // 3/5
+        ],
+    )
+    .await
+    .unwrap();
+
+    let rule = LoveRule::new(crate::ratings::DisplayScale::Five.fraction_of(4.0), false);
+    let report = db.apply_rating_loves(uid, rule, false).await.unwrap();
+    assert_eq!(report.qualifying, 2, "the two four-star ratings, whatever they were out of");
+    assert_eq!(report.loved, 2);
+
+    let loved = db.loves_detailed(uid).await.unwrap();
+    let names: std::collections::BTreeSet<&str> = loved.iter().map(|l| l.name.as_str()).collect();
+    assert_eq!(names, ["Archangel", "Xtal"].into_iter().collect());
+}
+
+/// **The rule everything rests on: a love somebody made by hand is never
+/// withdrawn.**
+///
+/// Moving the threshold is meant to be a knob — try it at four stars, then at
+/// five — and every setting withdraws what the last one derived. If that reach
+/// extended to a love that was *pressed*, a slider would be quietly deleting
+/// statements the person made, and on a recording it would already have been
+/// mirrored to Last.fm.
+///
+/// Two halves, and both are asserted here because either alone passes for the
+/// wrong reason: a derived love **is** taken back when its rating stops
+/// clearing the bar, and a hand-made one is not, even when its rating says
+/// exactly the same thing.
+#[tokio::test]
+async fn raising_the_threshold_takes_back_only_what_it_gave() {
+    let db = testdb().await;
+    let (uid, source) = rated_deck(&db).await;
+
+    listen(&db, uid, None, "Archangel", "Burial", 1_760_000_100).await;
+    listen(&db, uid, None, "Xtal", "Aphex Twin", 1_760_000_200).await;
+
+    // Loved by hand, and rated the same as the other one. `set_love` is what
+    // the loves endpoint calls, so this row carries no source.
+    let by_hand = db.upsert_entity("recording", "Xtal", "Aphex Twin", None).await.unwrap();
+    db.set_love(uid, by_hand, true).await.unwrap();
+
+    db.upsert_library_ratings(
+        uid,
+        source,
+        "plex",
+        &[
+            rating("recording", "Burial", "Archangel", 8.0, 10.0),
+            rating("recording", "Aphex Twin", "Xtal", 8.0, 10.0),
+        ],
+    )
+    .await
+    .unwrap();
+
+    // Four stars: the derived one is made, the hand-made one is left alone.
+    let four = LoveRule::new(crate::ratings::DisplayScale::Five.fraction_of(4.0), false);
+    let report = db.apply_rating_loves(uid, four, false).await.unwrap();
+    assert_eq!(report.loved, 1, "only Archangel is new");
+    assert_eq!(report.already, 1, "Xtal was already loved and stays as it was");
+
+    // Now five stars, which neither rating clears.
+    let five = LoveRule::new(1.0, false);
+    let report = db.apply_rating_loves(uid, five, false).await.unwrap();
+    assert_eq!(report.withdrawn, 1, "the derived love goes back");
+
+    let loved = db.loves_detailed(uid).await.unwrap();
+    let names: Vec<&str> = loved.iter().map(|l| l.name.as_str()).collect();
+    assert_eq!(names, ["Xtal"], "and the one somebody pressed is still there");
+}
+
+/// A rating on something never played is kept, and is not a love.
+///
+/// The rule `loves_pull` already states in as many words: loves point at
+/// entities, entities are things you actually listened to, and manufacturing
+/// rows for records with no listens behind them puts things on the Loved page
+/// that render as a column of zeroes. The rating itself is real data off the
+/// user's own library and is kept — what must not happen is it silently going
+/// missing from *both* places, so the count comes back as `unmatched`.
+#[tokio::test]
+async fn a_rating_on_something_never_played_is_kept_and_not_loved() {
+    let db = testdb().await;
+    let (uid, source) = rated_deck(&db).await;
+
+    listen(&db, uid, None, "Archangel", "Burial", 1_760_000_100).await;
+    db.upsert_library_ratings(
+        uid,
+        source,
+        "plex",
+        &[
+            rating("recording", "Burial", "Archangel", 10.0, 10.0),
+            rating("recording", "Someone Else", "Never Played", 10.0, 10.0),
+        ],
+    )
+    .await
+    .unwrap();
+
+    let report = db.apply_rating_loves(uid, LoveRule::new(0.8, false), false).await.unwrap();
+    assert_eq!(report.qualifying, 2);
+    assert_eq!(report.matched, 1);
+    assert_eq!(report.unmatched, 1, "stated rather than silently absent");
+    assert_eq!(report.loved, 1);
+
+    // And the rating is still on file — it is a fact about their library.
+    let rows = db.list_library_ratings(uid, 50).await.unwrap();
+    assert_eq!(rows.len(), 2);
+}
+
+/// A preview writes nothing at all, including no entities.
+///
+/// `upsert_entity` *creates*, so a dry run that reached for it would leave rows
+/// behind for every rating it was asked to consider. A preview that created
+/// things would not be a preview.
+#[tokio::test]
+async fn a_preview_writes_nothing() {
+    let db = testdb().await;
+    let (uid, source) = rated_deck(&db).await;
+
+    listen(&db, uid, None, "Archangel", "Burial", 1_760_000_100).await;
+    db.upsert_library_ratings(
+        uid,
+        source,
+        "plex",
+        &[rating("recording", "Burial", "Archangel", 10.0, 10.0)],
+    )
+    .await
+    .unwrap();
+
+    let before: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM entities").fetch_one(&db.pool).await.unwrap();
+
+    let report = db.apply_rating_loves(uid, LoveRule::new(0.8, false), true).await.unwrap();
+    assert!(report.dry_run);
+    assert_eq!(report.loved, 1, "it still says what would happen");
+
+    let after: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM entities").fetch_one(&db.pool).await.unwrap();
+    assert_eq!(before, after, "and created nothing while saying it");
+    assert!(db.loves_detailed(uid).await.unwrap().is_empty(), "and loved nothing");
+}
+
+/// A favourite carries no scale, so no threshold applies to it — and its own
+/// switch is what governs it.
+#[tokio::test]
+async fn a_favourite_is_a_love_without_a_threshold() {
+    let db = testdb().await;
+    let (uid, source) = rated_deck(&db).await;
+
+    listen(&db, uid, None, "Teardrop", "Massive Attack", 1_760_000_100).await;
+    let starred = IncomingRating {
+        kind: "recording".into(),
+        remote_id: "jf-1".into(),
+        artist: "Massive Attack".into(),
+        name: "Teardrop".into(),
+        album: None,
+        mbid: None,
+        // Jellyfin's usual state: a heart and no number at all.
+        rating: None,
+        starred: true,
+        rated_at: None,
+    };
+    db.upsert_library_ratings(uid, source, "jellyfin", &[starred]).await.unwrap();
+
+    // Full marks demanded, and it still lands — there is no scale to fall short
+    // of.
+    let report = db.apply_rating_loves(uid, LoveRule::new(1.0, true), false).await.unwrap();
+    assert_eq!(report.loved, 1);
+
+    // And with stars excluded it does not, which is what makes the switch real.
+    let report = db.apply_rating_loves(uid, LoveRule::new(1.0, false), false).await.unwrap();
+    assert_eq!(report.withdrawn, 1);
+    assert!(db.loves_detailed(uid).await.unwrap().is_empty());
+}
+
+/// Forgetting the ratings does not un-love anything.
+///
+/// A love already made is a statement that was made. Taking those back is what
+/// raising the threshold and applying does, which is a separate and visible
+/// act — and it is the one that reports how many it withdrew.
+#[tokio::test]
+async fn forgetting_the_ratings_leaves_the_loves_alone() {
+    let db = testdb().await;
+    let (uid, source) = rated_deck(&db).await;
+
+    listen(&db, uid, None, "Archangel", "Burial", 1_760_000_100).await;
+    db.upsert_library_ratings(
+        uid,
+        source,
+        "plex",
+        &[rating("recording", "Burial", "Archangel", 10.0, 10.0)],
+    )
+    .await
+    .unwrap();
+    db.apply_rating_loves(uid, LoveRule::new(0.8, false), false).await.unwrap();
+    assert_eq!(db.loves_detailed(uid).await.unwrap().len(), 1);
+
+    db.clear_library_ratings(uid).await.unwrap();
+    assert!(db.list_library_ratings(uid, 50).await.unwrap().is_empty());
+    assert_eq!(db.loves_detailed(uid).await.unwrap().len(), 1, "the love is still there");
+}
+
+/// An existing database gains the ratings shape.
+///
+/// Every other test here opens an empty file and therefore takes the `init()`
+/// path, so a migration that cannot run against a real prior schema **passes
+/// the whole suite** — the v0.61.1 crash loop, 297 restarts in 26 minutes. This
+/// builds the pre-ratings `loves` table by hand, opens it through the normal
+/// path, and asserts both that it opens and that what was in it survived with
+/// the NULL `source` that keeps it out of every future withdrawal.
+#[tokio::test]
+async fn an_existing_database_gains_the_ratings_shape() {
+    let n = N.fetch_add(1, Ordering::SeqCst);
+    let path = std::env::temp_dir().join(format!("td-ratings-mig-{}-{}.db", std::process::id(), n));
+    for suffix in ["", "-wal", "-shm"] {
+        let _ = std::fs::remove_file(format!("{}{}", path.display(), suffix));
+    }
+
+    {
+        let pool = sqlx::SqlitePool::connect(&format!("sqlite:{}?mode=rwc", path.display()))
+            .await
+            .unwrap();
+        // The shape before this feature: no `source` column on `loves`.
+        for ddl in [
+            "CREATE TABLE users (id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT)",
+            "CREATE TABLE entities (id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT NOT NULL,
+                 name TEXT NOT NULL, artist_name TEXT NOT NULL DEFAULT '',
+                 entity_key TEXT NOT NULL UNIQUE, mbid TEXT, created_at INTEGER NOT NULL)",
+            "CREATE TABLE loves (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL,
+                 entity_id INTEGER NOT NULL, created_at INTEGER NOT NULL,
+                 UNIQUE(user_id, entity_id))",
+            "INSERT INTO users (id, username) VALUES (1, 'ash')",
+            "INSERT INTO entities (id, kind, name, artist_name, entity_key, created_at)
+                 VALUES (1, 'recording', 'Xtal', 'Aphex Twin', 'recording|aphex twin|xtal', 1)",
+            "INSERT INTO loves (user_id, entity_id, created_at) VALUES (1, 1, 1)",
+        ] {
+            sqlx::query(ddl).execute(&pool).await.unwrap();
+        }
+        pool.close().await;
+    }
+
+    let db = Database::new(&format!("sqlite:{}", path.display()), Arc::new(SecretBox::test_key()))
+        .await
+        .expect("an existing database opens");
+
+    // The love that predates the column is still there, and reads NULL — which
+    // is the honest value: it was not derived from a rating, so no threshold
+    // may ever take it back.
+    let source: Option<String> =
+        sqlx::query_scalar("SELECT source FROM loves WHERE user_id = 1 AND entity_id = 1")
+            .fetch_one(&db.pool)
+            .await
+            .expect("the love survived");
+    assert_eq!(source, None, "a love that predates ratings is not a rating's to withdraw");
+
+    // And the new table is there and usable. The source row is created through
+    // the normal path rather than by hand: `library_ratings.source_id` is a
+    // real foreign key, and the pool opens with `foreign_keys(true)`.
+    let source = db
+        .create_source(1, "plex", "Front room", true, "http://plex", "{}", None, None, "{}")
+        .await
+        .expect("a source on a migrated database");
+    db.upsert_library_ratings(
+        1,
+        source,
+        "plex",
+        &[rating("recording", "Aphex Twin", "Xtal", 10.0, 10.0)],
+    )
+    .await
+    .expect("ratings can be stored on a migrated database");
+    assert_eq!(db.list_library_ratings(1, 10).await.unwrap().len(), 1);
+
+    // Applying at full marks must not reach the hand-made love.
+    let report = db.apply_rating_loves(1, LoveRule::new(1.0, false), false).await.unwrap();
+    assert_eq!(report.withdrawn, 0);
+    assert_eq!(report.already, 0, "it is unmatched — nothing has been listened to here");
 }

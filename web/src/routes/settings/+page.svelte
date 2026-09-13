@@ -18,7 +18,10 @@
 		SignalChain,
 		UserProfile,
 		PublishSwitch,
-		FederationSwitch
+		FederationSwitch,
+		RatingsView,
+		RatingSample,
+		RatingApplyResult
 	} from '$lib/api';
 	import SourcesPanel from '$lib/components/SourcesPanel.svelte';
 
@@ -37,6 +40,7 @@
 		{ id: 'time', label: 'Time', hint: 'Timezone and week start' },
 		{ id: 'scrobbling', label: 'Scrobbling', hint: 'When a listen counts' },
 		{ id: 'sources', label: 'Sources', hint: 'Plex, Navidrome, Jellyfin' },
+		{ id: 'ratings', label: 'Ratings', hint: 'Stars from your library, as loves' },
 		{ id: 'connections', label: 'Connections', hint: 'Where listens are forwarded' },
 		{ id: 'tokens', label: 'API Tokens', hint: 'Scrobble clients' },
 		{ id: 'ai', label: 'AI Connections', hint: 'Chatbots that can read your listening' },
@@ -1643,6 +1647,221 @@
 		await api.logout();
 		window.location.href = '/login';
 	}
+
+	// ── Library star ratings ──
+	//
+	// Two scales and they are not the same kind of thing. The *source's* scale
+	// is a fact — Plex counts to ten, Subsonic to five — and is what the raw
+	// number is out of. The *display* scale is this person's preference, and is
+	// the units the threshold is typed in. The server does every comparison on
+	// the fraction of the first, so a rating that reads as four stars on a
+	// coarse display has not thereby cleared a four-star bar; `shown` is a lens.
+	let ratings: RatingsView | null = null;
+	let ratingsLoading = false;
+	let ratingsErr = '';
+	let ratingScale = '5';
+	let ratingThreshold = 4;
+	let ratingStarred = true;
+	let ratingPulling = false;
+	let ratingPullMsg = '';
+	let ratingPreview: RatingApplyResult['report'] | null = null;
+	let ratingApplying = false;
+	let ratingApplied: RatingApplyResult['report'] | null = null;
+
+	const RATING_SCALES = [
+		{ id: '5', label: '5 stars' },
+		{ id: '5h', label: '5 ½' },
+		{ id: '10', label: '10 stars' },
+		{ id: '10h', label: '10 ½' }
+	];
+
+	/** Every value the chosen scale can express. Derived here rather than taken
+	 *  from the payload, so the control still works before the first load. */
+	$: ratingChoices = (() => {
+		const max = ratingScale.startsWith('10') ? 10 : 5;
+		const step = ratingScale.endsWith('h') ? 0.5 : 1;
+		const out: number[] = [];
+		for (let v = step; v <= max + 0.001; v += step) out.push(Math.round(v * 10) / 10);
+		return out;
+	})();
+
+	/** Keep the threshold expressible after a scale change, and keep it meaning
+	 *  roughly the same thing — 4/5 becomes 8/10 rather than 4/10. */
+	function pickRatingScale(id: string) {
+		if (id === ratingScale) return;
+		const oldMax = ratingScale.startsWith('10') ? 10 : 5;
+		const newMax = id.startsWith('10') ? 10 : 5;
+		const step = id.endsWith('h') ? 0.5 : 1;
+		const fraction = ratingThreshold / oldMax;
+		ratingScale = id;
+		ratingThreshold = Math.min(newMax, Math.max(step, Math.round((fraction * newMax) / step) * step));
+		ratingPreview = null;
+		ratingApplied = null;
+	}
+
+	async function loadRatings() {
+		if (ratingsLoading) return;
+		ratingsLoading = true;
+		ratingsErr = '';
+		try {
+			ratings = await api.getRatings();
+			ratingScale = ratings.scale;
+			ratingThreshold = ratings.threshold;
+			ratingStarred = ratings.include_starred;
+		} catch (e) {
+			ratingsErr = e instanceof Error ? e.message : String(e);
+		} finally {
+			ratingsLoading = false;
+		}
+	}
+
+	async function pullRatings() {
+		ratingPulling = true;
+		ratingPullMsg = '';
+		ratingPreview = null;
+		try {
+			const res = await api.pullRatings();
+			// An error and a count of zero are different answers, so both are
+			// shown: a server that could not be reached is not a library with
+			// no ratings in it.
+			const failed = res.sources.filter((s) => s.error);
+			ratingPullMsg =
+				`Read ${res.found} rating${res.found === 1 ? '' : 's'}.` +
+				(failed.length ? ` ${failed.map((f) => `${f.label}: ${f.error}`).join(' · ')}` : '');
+			await loadRatings();
+		} catch (e) {
+			ratingPullMsg = e instanceof Error ? e.message : String(e);
+		} finally {
+			ratingPulling = false;
+		}
+	}
+
+	async function previewRatings() {
+		ratingApplying = true;
+		ratingApplied = null;
+		try {
+			const res = await api.applyRatings({
+				dry_run: true,
+				threshold: ratingThreshold,
+				scale: ratingScale,
+				include_starred: ratingStarred
+			});
+			ratingPreview = res.report;
+		} catch (e) {
+			ratingsErr = e instanceof Error ? e.message : String(e);
+		} finally {
+			ratingApplying = false;
+		}
+	}
+
+	async function applyRatings() {
+		ratingApplying = true;
+		try {
+			const res = await api.applyRatings({
+				dry_run: false,
+				threshold: ratingThreshold,
+				scale: ratingScale,
+				include_starred: ratingStarred,
+				save: true
+			});
+			ratingApplied = res.report;
+			ratingPreview = null;
+			await loadRatings();
+		} catch (e) {
+			ratingsErr = e instanceof Error ? e.message : String(e);
+		} finally {
+			ratingApplying = false;
+		}
+	}
+
+	async function forgetRatings() {
+		if (!confirm('Forget the ratings read from your servers? Loves already made are left alone.'))
+			return;
+		try {
+			await api.clearRatings();
+			ratingPreview = null;
+			ratingApplied = null;
+			await loadRatings();
+		} catch (e) {
+			ratingsErr = e instanceof Error ? e.message : String(e);
+		}
+	}
+
+	/** Where a rating sits on its own scale, 0..=1. The one comparable number,
+	 *  and the only thing a threshold is ever applied to. */
+	function ratingFraction(r: RatingSample): number {
+		if (r.rating === null || r.rating <= 0 || r.scale_max <= 0) return 0;
+		return Math.min(1, r.rating / r.scale_max);
+	}
+
+	/** The same rating on whichever scale is selected right now.
+	 *
+	 *  Derived here rather than taken from the payload's `shown`, because the
+	 *  controls above are a *proposal* and the payload describes the rule as
+	 *  **saved** — so after switching to a ten-star display the server's number
+	 *  would still be out of five, and the list would disagree with the heading
+	 *  over it. The server keeps sending both for a client that does not want to
+	 *  implement the conversion; this screen does.
+	 *
+	 *  Presentation only. A coarse scale cannot express every rating it is asked
+	 *  to show — a Plex 7/10 rounds to 4 stars — so `ratingClears` below compares
+	 *  the fraction and never this. */
+	function ratingShownOn(r: RatingSample, scale: string): number {
+		const max = scale.startsWith('10') ? 10 : 5;
+		const step = scale.endsWith('h') ? 0.5 : 1;
+		return Math.round((ratingFraction(r) * max) / step) * step;
+	}
+
+	/** Does this clear the threshold as currently set? Compared on the
+	 *  fraction, exactly as the server does — a rating that *reads* as four
+	 *  stars on a coarse display has not thereby earned a four-star bar. */
+	function ratingClears(r: RatingSample, threshold: number, scale: string, starred: boolean): boolean {
+		if (r.starred && starred) return true;
+		if (r.rating === null || r.rating <= 0) return false;
+		const max = scale.startsWith('10') ? 10 : 5;
+		return ratingFraction(r) + 1e-6 >= threshold / max;
+	}
+
+	/** How a rating reads, keeping the original visible beside it. The raw
+	 *  number is the thing the server actually said, and dropping it would make
+	 *  a disagreement impossible to diagnose. */
+	function ratingLabel(r: RatingSample, shown: number): string {
+		if (r.rating === null) return r.starred ? 'favourite' : '—';
+		return `${shown} — ${r.rating}/${r.scale_max} from ${r.source_kind}`;
+	}
+
+	// Rows as the controls currently describe them.
+	//
+	// A reactive statement rather than calling the helpers from the template:
+	// a template expression re-runs when the variables it *names* change and
+	// does not trace them through a function call, so `{ratingLabel(r)}` would
+	// never notice the scale moving. Naming all three here is what makes the
+	// list follow the controls — the same fix `pickedBySitting` uses on the
+	// Patch inbox, and the fifth time this trap has been met.
+	//
+	// Until a control is touched the **server's** answer is used, not the
+	// derived one. That is deliberate: the two implementations of the same rule
+	// must agree, and using the server's wherever it applies makes a
+	// disagreement show up on the first paint rather than hiding behind a
+	// browser that quietly computes something else. The derived value is for
+	// the *proposal* only — a rule the server has not been asked about yet.
+	$: ratingRuleDirty =
+		!ratings ||
+		ratingScale !== ratings.scale ||
+		ratingThreshold !== ratings.threshold ||
+		ratingStarred !== ratings.include_starred;
+	$: ratingRows = (ratings?.sample ?? []).map((r) => ({
+		r,
+		label: ratingLabel(r, ratingRuleDirty ? ratingShownOn(r, ratingScale) : r.shown),
+		clears: ratingRuleDirty
+			? ratingClears(r, ratingThreshold, ratingScale, ratingStarred)
+			: r.loved
+	}));
+
+	// Every control that changes the rule clears the preview where it changes
+	// it, rather than through a reactive statement — a preview left on screen
+	// describing the *previous* threshold is the kind of wrong that looks right.
+	$: if (section === 'ratings' && !ratings && !ratingsLoading) loadRatings();
 </script>
 
 <svelte:head><title>Settings — Tapedeck</title></svelte:head>
@@ -2176,6 +2395,174 @@
 
 		{#if section === 'sources'}
 			<SourcesPanel />
+		{/if}
+
+		{#if section === 'ratings'}
+			<div class="panel" style="border-radius:22px;padding:24px;margin-bottom:18px;">
+				<h3 class="h-display" style="font-size:19px;margin-bottom:4px;">Stars from your library</h3>
+				<p style="font-size:13px;color:var(--td-muted);margin:0 0 6px;max-width:64ch;">
+					Plex, Navidrome, Jellyfin and Emby all let you rate a track, and years of
+					deliberate marks are worth more than a play count. Tapedeck reads them, keeps
+					them exactly as the server gave them, and turns the ones you choose into loves.
+				</p>
+				<p style="font-size:12.5px;color:var(--td-muted-3);margin:0 0 18px;max-width:64ch;">
+					The servers count differently — Plex out of ten with half stars, Navidrome out of
+					five — so a threshold here means <em>four out of five</em> rather than the number
+					four, and reads the same on all of them. <strong>Roon publishes no ratings at
+					all</strong>; its API has no rating, favourite or thumb field.
+				</p>
+
+				{#if ratingsErr}
+					<div style="font-size:12.5px;color:#b2622d;margin-bottom:12px;">{ratingsErr}</div>
+				{/if}
+
+				<div class="row">
+					<div class="row-main">
+						<div class="row-title">Read your servers</div>
+						<div class="row-sub">
+							Walks every library source you have set up. Nothing is loved by this —
+							it only reads what is there.
+						</div>
+					</div>
+					<button class="btn btn-secondary" on:click={pullRatings} disabled={ratingPulling}>
+						{ratingPulling ? 'Reading…' : 'Read ratings'}
+					</button>
+				</div>
+				{#if ratingPullMsg}
+					<p style="font-size:12.5px;color:var(--td-muted);margin:0 0 14px;">{ratingPullMsg}</p>
+				{/if}
+
+				{#if ratings && ratings.sources.length}
+					<div style="display:flex;flex-wrap:wrap;gap:8px;margin:4px 0 18px;">
+						{#each ratings.sources as src}
+							<span class="chip">
+								{src.label || src.source_kind} — {src.rated} rated{#if src.starred}, {src.starred} starred{/if}
+								<span style="color:var(--td-muted-3);"> · out of {src.scale_max}</span>
+							</span>
+						{/each}
+					</div>
+				{/if}
+
+				<div class="row">
+					<div class="row-main">
+						<div class="row-title">How you count stars</div>
+						<div class="row-sub">
+							How ratings are shown here, and the units the threshold below is in. It
+							does not change what any server stores.
+						</div>
+					</div>
+					<div style="display:flex;background:var(--td-sidebar);border-radius:999px;padding:4px;gap:2px;">
+						{#each RATING_SCALES as sc}
+							<button class="seg-btn" class:on={ratingScale === sc.id}
+								on:click={() => pickRatingScale(sc.id)}>{sc.label}</button>
+						{/each}
+					</div>
+				</div>
+
+				<div class="row">
+					<div class="row-main">
+						<div class="row-title">
+							Loved from {ratingThreshold} of {ratingScale.startsWith('10') ? 10 : 5} up
+						</div>
+						<div class="row-sub">
+							Anything you rated this highly on any server becomes a love. Move it and
+							apply again as often as you like — a love this made can be taken back.
+						</div>
+					</div>
+					<select class="input" style="width:auto;" bind:value={ratingThreshold}
+						on:change={() => (ratingPreview = null)}
+						aria-label="Lowest rating that counts as a love">
+						{#each ratingChoices as v}
+							<option value={v}>{v}</option>
+						{/each}
+					</select>
+				</div>
+
+				<div class="row">
+					<div class="row-main">
+						<div class="row-title">Favourites and stars</div>
+						<div class="row-sub">
+							A heart in Jellyfin or a star in Navidrome is already the thing a love
+							is, so no threshold applies to it. On Jellyfin this is usually the only
+							signal there is.
+						</div>
+					</div>
+					<div style="display:flex;background:var(--td-sidebar);border-radius:999px;padding:4px;gap:2px;">
+						<button class="seg-btn" class:on={!ratingStarred}
+							on:click={() => { ratingStarred = false; ratingPreview = null; }}>Ratings only</button>
+						<button class="seg-btn" class:on={ratingStarred}
+							on:click={() => { ratingStarred = true; ratingPreview = null; }}>Count them too</button>
+					</div>
+				</div>
+
+				<div style="display:flex;gap:10px;align-items:center;margin-top:16px;flex-wrap:wrap;">
+					<button class="btn btn-secondary" on:click={previewRatings} disabled={ratingApplying}>
+						{ratingApplying ? 'Working…' : 'What would this do?'}
+					</button>
+					<button class="btn" on:click={applyRatings} disabled={ratingApplying}>
+						Apply
+					</button>
+					{#if ratings && ratings.sources.length}
+						<button class="btn btn-danger" on:click={forgetRatings}>Forget the ratings</button>
+					{/if}
+				</div>
+
+				{#if ratingPreview}
+					<div style="margin-top:14px;padding:12px 14px;background:var(--td-surface2);border:1px solid var(--td-border);border-radius:14px;font-size:13px;line-height:1.6;">
+						<strong>{ratingPreview.loved}</strong> would be loved,
+						<strong>{ratingPreview.withdrawn}</strong> taken back,
+						{ratingPreview.already} already loved.
+						{#if ratingPreview.unmatched}
+							<div style="color:var(--td-muted);margin-top:4px;">
+								{ratingPreview.unmatched} rated {ratingPreview.unmatched === 1 ? 'thing is' : 'things are'}
+								not in your listening history, so {ratingPreview.unmatched === 1 ? 'it stays' : 'they stay'}
+								a rating and {ratingPreview.unmatched === 1 ? 'does' : 'do'} not become a love. Loves point at
+								records you have actually played.
+							</div>
+						{/if}
+					</div>
+				{/if}
+
+				{#if ratingApplied}
+					<div style="margin-top:14px;padding:12px 14px;background:var(--td-surface2);border:1px solid var(--td-border);border-radius:14px;font-size:13px;line-height:1.6;">
+						✓ <strong>{ratingApplied.loved}</strong> loved,
+						<strong>{ratingApplied.withdrawn}</strong> taken back.
+						{#if ratingApplied.unmatched}
+							{ratingApplied.unmatched} not in your history and left as ratings.
+						{/if}
+					</div>
+				{/if}
+
+				<p style="font-size:12px;color:var(--td-muted-3);margin:14px 0 0;max-width:64ch;">
+					A love made here is kept on this instance and is <strong>not</strong> sent to
+					Last.fm or ListenBrainz — this is a threshold you are meant to try at several
+					settings, and every setting would otherwise be a broadcast. Loves you pressed
+					yourself are never touched by any of this.
+				</p>
+
+				{#if ratings && ratings.sample.length}
+					<h4 style="font-size:14px;margin:22px 0 8px;">What you have rated</h4>
+					<div style="display:flex;flex-direction:column;gap:2px;max-height:420px;overflow-y:auto;">
+						{#each ratingRows as row}
+							<div style="display:flex;align-items:baseline;gap:10px;padding:5px 0;border-bottom:1px solid var(--td-border);font-size:13px;">
+								<span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">
+									{row.r.artist ? `${row.r.artist} — ` : ''}{row.r.name}{#if row.r.kind !== 'recording'}<span
+											style="color:var(--td-muted-3);"
+										>{` · ${row.r.kind === 'release' ? 'album' : 'artist'}`}</span>{:else if row.r.album}<span
+											style="color:var(--td-muted-3);">{` · ${row.r.album}`}</span>{/if}
+								</span>
+								<span style="color:var(--td-muted-3);font-size:12px;white-space:nowrap;">
+									{row.label}
+								</span>
+								<span style="width:1.2em;text-align:center;"
+									title={row.clears ? 'Clears the threshold' : 'Below the threshold'}>
+									{row.clears ? '♥' : ''}
+								</span>
+							</div>
+						{/each}
+					</div>
+				{/if}
+			</div>
 		{/if}
 
 		{#if section === 'connections'}

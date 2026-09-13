@@ -129,6 +129,19 @@ impl Database {
                 WHERE mbid_release IS NOT NULL AND TRIM(mbid_release) != ''"
         );
 
+        // Matching a library rating to something in the history, which is a
+        // point lookup per rating rather than a grouping — the workload
+        // v0.59.0 names as the one an index is actually for. On a table holding
+        // a few thousand rows written by a manual pull.
+        speed!(
+            "CREATE INDEX IF NOT EXISTS idx_library_ratings_key
+                 ON library_ratings(user_id, entity_key)"
+        );
+        speed!(
+            "CREATE INDEX IF NOT EXISTS idx_library_ratings_match
+                 ON library_ratings(user_id, match_key) WHERE match_key IS NOT NULL"
+        );
+
         speed!("CREATE INDEX IF NOT EXISTS idx_entities_match ON entities(match_key)");
         speed!("CREATE INDEX IF NOT EXISTS idx_entities_mbid ON entities(kind, mbid)");
 
@@ -1049,6 +1062,15 @@ impl Database {
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_id INTEGER NOT NULL REFERENCES users(id),
                 entity_id INTEGER NOT NULL REFERENCES entities(id),
+                -- Where this love came from, and it exists to protect the ones
+                -- that came from a person. `rating` marks a love derived from a
+                -- library star rating under a threshold, so raising that
+                -- threshold can withdraw it again. NULL is everything else —
+                -- pressed by hand, or pulled from Last.fm or ListenBrainz — and
+                -- **nothing may ever remove one of those automatically**. A
+                -- love is a statement somebody made; only the ones this
+                -- instance derived are this instance\'s to take back.
+                source TEXT,
                 created_at INTEGER NOT NULL,
                 UNIQUE(user_id, entity_id)
             )",
@@ -1073,6 +1095,54 @@ impl Database {
                 last_polled_at INTEGER,
                 last_error TEXT,
                 updated_at INTEGER NOT NULL DEFAULT 0
+            )",
+        )
+        .await?;
+
+        // Star ratings lifted off a media server, exactly as that server gave
+        // them.
+        //
+        // **The raw number and what it was out of, never a normalised one.**
+        // Plex counts to ten, Subsonic to five, and a bare `7` means nothing
+        // without the second column — so `rating` is verbatim and `scale_max`
+        // says what it is a rating out of. Everything downstream compares the
+        // fraction of the two, which is what lets one threshold mean the same
+        // thing on every server. Normalising at the door would throw away the
+        // only thing that makes this answerable if the reading of a server's
+        // field ever turns out to be wrong, which is the same call
+        // `artist_credit`, `timestamp_original` and `spotify_track_id` all
+        // make.
+        //
+        // A table of its own rather than columns on `loves`, because a rating
+        // and a love are different statements: a rating is what the server
+        // holds, and a love is what this instance decided about it under a
+        // threshold the user can move. Keeping them apart is what makes the
+        // threshold a knob rather than a ratchet — re-applying it can withdraw
+        // the loves it made without touching one made by hand.
+        //
+        // `entity_key` and `match_key` are stamped at write time with the same
+        // functions `entities` uses, so matching a rating to something in the
+        // history is an indexed join rather than a fold per row.
+        self.ddl(
+            "CREATE TABLE IF NOT EXISTS library_ratings (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL REFERENCES users(id),
+                source_id INTEGER NOT NULL REFERENCES user_sources(id),
+                source_kind TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                remote_id TEXT NOT NULL,
+                artist TEXT NOT NULL DEFAULT '',
+                name TEXT NOT NULL DEFAULT '',
+                album TEXT,
+                entity_key TEXT NOT NULL,
+                match_key TEXT,
+                mbid TEXT,
+                rating REAL,
+                scale_max REAL NOT NULL,
+                starred INTEGER NOT NULL DEFAULT 0,
+                rated_at INTEGER,
+                fetched_at INTEGER NOT NULL,
+                UNIQUE(user_id, source_id, kind, remote_id)
             )",
         )
         .await?;

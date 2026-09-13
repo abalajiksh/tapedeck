@@ -26,7 +26,7 @@ openapi: 3.1.0
 
 info:
   title: Tapedeck
-  version: 0.117.0
+  version: 0.118.0
   summary: Self-hosted scrobbler and listening journal.
   description: |
     Tapedeck ingests listens, enriches them with MusicBrainz metadata, stores
@@ -5184,6 +5184,189 @@ paths:
                 properties:
                   matched: { type: integer }
                   skipped: { type: integer }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  # ── Library ratings ────────────────────────────────────────────────────────
+  /api/v1/ratings:
+    get:
+      tags: [Loves]
+      summary: Star ratings held from your media servers, and the rule applied to them.
+      description: |
+        Session-only. Reading is a fact about your library and pulling spends a
+        source's credential, so a token gets 401 here and scopes never enter
+        into it — the same line `/api/v1/sources` sits on.
+
+        Every rating carries **the raw number the server gave and what that
+        number was out of**, because a bare `7` means nothing: Plex counts to
+        ten (half stars, so a 7 is three and a half), Subsonic to five, and
+        Jellyfin/Emby's legacy `Rating` to ten. `shown` is the same rating on
+        the display scale you chose, and is presentation only — every threshold
+        comparison is made on the underlying fraction, so a rating that *reads*
+        as four stars on a coarse scale does not thereby clear a four-star bar.
+
+        `threshold` comes back in the units of `scale`, which is what you typed.
+      responses:
+        '200':
+          description: What is held.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  scale: { type: string, enum: ['5', '5h', '10', '10h'], description: 'Display scale: five stars, five with halves, ten, ten with halves.' }
+                  scale_label: { type: string }
+                  scale_choices: { type: array, items: { type: number }, description: Every value expressible on that scale. }
+                  threshold: { type: number, description: The cut-off, in the units of `scale`. }
+                  include_starred: { type: boolean, description: Whether a starred or favourited item is a love regardless of its rating. }
+                  sources:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        source_id: { type: integer }
+                        source_kind: { type: string }
+                        label: { type: string }
+                        rated: { type: integer }
+                        starred: { type: integer }
+                        scale_max: { type: number, description: What this server's numbers are out of. }
+                        fetched_at: { type: integer, nullable: true }
+                  sample:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        kind: { type: string, enum: [recording, release, artist] }
+                        artist: { type: string }
+                        name: { type: string }
+                        album: { type: string, nullable: true }
+                        source_kind: { type: string }
+                        rating: { type: number, nullable: true, description: The raw number, verbatim. }
+                        scale_max: { type: number, description: What it was out of. Meaningless apart from `rating`. }
+                        shown: { type: number, description: The same rating on your display scale. Presentation only. }
+                        starred: { type: boolean }
+                        loved: { type: boolean, description: Whether it clears the current threshold. }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+    delete:
+      tags: [Loves]
+      summary: Forget the stored ratings.
+      description: |
+        Session-only. **Does not un-love anything** — a love already made is a
+        statement that was made. To take those back, raise the threshold and
+        apply, which is a separate and visible act.
+      responses:
+        '200':
+          description: Forgotten.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  forgotten: { type: integer }
+                  note: { type: string }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /api/v1/ratings/pull:
+    post:
+      tags: [Loves]
+      summary: Read the ratings your media servers hold.
+      description: |
+        Session-only — it spends the credential of a configured source.
+
+        Walks every enabled library source and replaces what that source said
+        last time, so a rating raised, lowered or cleared on the server is
+        raised, lowered or cleared here: the server is the authority on its own
+        ratings and this is a copy of them. One source failing does not stop the
+        others, and an error is reported separately from a count of zero — a
+        server that could not be reached is not a library with no ratings in it.
+
+        **Roon is reported as having nothing rather than returning an empty
+        list.** Its extension API publishes no rating, favourite or thumb field
+        at all, so a source that silently returned nothing would look broken.
+
+        Ratings are stored; nothing becomes a love until
+        `/api/v1/ratings/apply`.
+      responses:
+        '200':
+          description: Done.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  found: { type: integer }
+                  sources:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        source_id: { type: integer }
+                        kind: { type: string }
+                        label: { type: string }
+                        found: { type: integer }
+                        error: { type: string, nullable: true }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /api/v1/ratings/apply:
+    post:
+      tags: [Loves]
+      summary: Love what clears the threshold, and withdraw what no longer does.
+      description: |
+        Session-only.
+
+        `dry_run` is **required and has no default**: the two things this can do
+        are "tell me what would happen" and "write to my Loved page", and a body
+        that merely misspelled the key must not be read as an answer either way.
+        A preview and a real run go through the same code, so a preview cannot
+        describe something the apply then does differently — and a preview
+        writes nothing at all, including no entities.
+
+        Two rules hold it safe. **A rating on something you have never listened
+        to is kept and not loved** — loves point at entities and entities are
+        things you actually played — and the count comes back as `unmatched` so
+        it is visible rather than silently absent. And **only loves this
+        instance derived are ever withdrawn**: one pressed by hand, or pulled
+        from Last.fm or ListenBrainz, is outside the reach of a threshold
+        however far it moves.
+
+        Nothing here is forwarded to Last.fm or ListenBrainz. These are loves
+        being imported, not loves being pressed, and a threshold you are
+        expected to try at several settings would otherwise be a broadcast at
+        every setting.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [dry_run]
+              properties:
+                dry_run: { type: boolean, description: Preview only. Required. }
+                threshold: { type: number, description: 'The cut-off, in the units of `scale`. Absent means the stored one.' }
+                scale: { type: string, enum: ['5', '5h', '10', '10h'], description: Which scale `threshold` is in. Absent means the stored one. }
+                include_starred: { type: boolean }
+                save: { type: boolean, description: Store the rule as well as applying it. Ignored on a dry run. }
+      responses:
+        '200':
+          description: What happened, or what would.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  threshold: { type: number }
+                  scale: { type: string }
+                  include_starred: { type: boolean }
+                  report:
+                    type: object
+                    properties:
+                      qualifying: { type: integer, description: Ratings that clear the bar. }
+                      matched: { type: integer, description: '…of which this many are things you have listened to.' }
+                      unmatched: { type: integer, description: '…and this many are not, so they are not loved.' }
+                      loved: { type: integer }
+                      withdrawn: { type: integer }
+                      already: { type: integer }
+                      dry_run: { type: boolean }
+        '400': { $ref: '#/components/responses/BadRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
 
   # ── Notes ──────────────────────────────────────────────────────────────────

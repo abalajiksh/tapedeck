@@ -1966,6 +1966,65 @@ export interface TokenInfo {
 	imports_are_live: boolean;
 }
 
+export interface RatingSample {
+	kind: string;
+	artist: string;
+	name: string;
+	album: string | null;
+	source_kind: string;
+	/** The number the server gave, verbatim. */
+	rating: number | null;
+	/** What that number was out of. Meaningless apart from `rating`. */
+	scale_max: number;
+	/** The same rating on the display scale. Presentation only. */
+	shown: number;
+	starred: boolean;
+	loved: boolean;
+}
+
+export interface RatingSourceSummary {
+	source_id: number;
+	source_kind: string;
+	label: string;
+	rated: number;
+	starred: number;
+	scale_max: number;
+	fetched_at: number | null;
+}
+
+export interface RatingSourcePull {
+	source_id: number;
+	kind: string;
+	label: string;
+	found: number;
+	error: string | null;
+}
+
+export interface RatingsView {
+	scale: string;
+	scale_label: string;
+	scale_choices: number[];
+	threshold: number;
+	include_starred: boolean;
+	sources: RatingSourceSummary[];
+	sample: RatingSample[];
+}
+
+export interface RatingApplyResult {
+	threshold: number;
+	scale: string;
+	include_starred: boolean;
+	report: {
+		qualifying: number;
+		matched: number;
+		unmatched: number;
+		loved: number;
+		withdrawn: number;
+		already: number;
+		dry_run: boolean;
+	};
+}
+
 class TapedeckAPI {
 	private async request<T>(method: string, path: string, body?: unknown): Promise<T> {
 		const opts: RequestInit = {
@@ -3294,6 +3353,37 @@ class TapedeckAPI {
 	/** Fetch loved tracks from every connected service. */
 	async pullLoves(): Promise<{ loved: number; services: { service: string; found: number; loved: number; skipped: number; error: string | null }[] }> {
 		return this.post('/api/v1/loves/pull', {});
+	}
+
+	// ── Library star ratings ──
+	//
+	// The raw number and `scale_max` travel together and neither means anything
+	// alone: Plex counts to ten, Subsonic to five. `shown` is the same rating on
+	// the display scale, and is presentation only — the server compares the
+	// underlying fraction, so a rating that *reads* as four stars on a coarse
+	// scale has not thereby cleared a four-star bar.
+	async getRatings(): Promise<RatingsView> {
+		return this.get('/api/v1/ratings');
+	}
+	/** Read what every configured library server holds. Stores; loves nothing. */
+	async pullRatings(): Promise<{ found: number; sources: RatingSourcePull[] }> {
+		return this.post('/api/v1/ratings/pull', {});
+	}
+	/** Love what clears the bar, and withdraw what no longer does.
+	 *  `dry_run` is required by the server — the two things this can do are
+	 *  "tell me what would happen" and "write to my Loved page". */
+	async applyRatings(req: {
+		dry_run: boolean;
+		threshold?: number;
+		scale?: string;
+		include_starred?: boolean;
+		save?: boolean;
+	}): Promise<RatingApplyResult> {
+		return this.post('/api/v1/ratings/apply', req);
+	}
+	/** Forget the stored ratings. Does not un-love anything. */
+	async clearRatings(): Promise<{ forgotten: number; note: string }> {
+		return this.del('/api/v1/ratings');
 	}
 
 	// ── Album & artist pages ──

@@ -274,7 +274,10 @@ from the endpoint's default like any other. And it carries **no MusicBrainz IDs
 and no structured metadata**, only rendered display strings, so a Roon listen
 holds *less* detail than a Plex or Jellyfin one and pays for a metadata lookup
 it could have skipped. That is the opposite of what most people expect, and it
-is a limit of the API rather than something Tapedeck can work around.
+is a limit of the API rather than something Tapedeck can work around. **Ratings
+are the third thing it does not carry** — there is no rating, favourite or thumb
+field anywhere in the extension API, so a Roon source is reported as having
+nothing to offer rather than quietly reading zero of them.
 
 Setup has one step nothing else does: after saving the source, open **Roon →
 Settings → Extensions** and enable Tapedeck. Roon issues its own credential at
@@ -334,7 +337,8 @@ with:
   playing; see below.
 - **The Shelf** — records, tapes and discs, with a deck drawn for whichever is
   in hand: pause, skip and flip reminders.
-- **Loved** — every heart in one place, across tracks, records and artists.
+- **Loved** — every heart in one place, across tracks, records and artists,
+  including the ones lifted from your media server's star ratings.
 - **Reports** — your listening in chapters, one week, month or year at a time.
 - **Rediscovery** — smart collections built from your own history.
 - **Playlist Lab** — build a playlist by sound and habit from a seed you already
@@ -482,7 +486,65 @@ it implies), and filter by kind or to the ones carrying a liner note.
 
 A love of a **recording** is mirrored outward to Last.fm and ListenBrainz;
 albums and artists stay local because neither service has the concept. Loves
-you already have on those services can be pulled in from Settings → Connections.
+you already have on those services can be pulled in from Settings → Connections,
+and the star ratings sitting in your media server can become loves from
+Settings → Ratings — see below.
+
+### Star ratings from your library, as loves
+
+Plex, Navidrome, Jellyfin and Emby all let you rate a track, and years of
+deliberate marks say more than a play count does. Settings → **Ratings** reads
+them, keeps them exactly as the server gave them, and turns the ones you choose
+into loves.
+
+**The servers count differently, and Tapedeck records which.** A bare `7` means
+nothing on its own:
+
+| Server | Field | Out of | What it is |
+|---|---|---|---|
+| Plex | `userRating` | **10** | five stars at half-star granularity — a 7 is three and a half |
+| Navidrome / Subsonic | `userRating` | **5** | five stars, whole ones, plus a separate `starred` |
+| Jellyfin / Emby | `UserData.Rating` | **10** | a legacy MediaBrowser double. `IsFavorite` is what these servers actually use |
+| Roon | — | — | **nothing.** Its extension API has no rating, favourite or thumb field at all |
+
+So the raw number is stored beside what it was out of, and the threshold is
+applied to the *fraction* of the two. That is what lets one setting mean the
+same thing everywhere: **four out of five** is the same verdict as eight out of
+ten, and a Plex track rated 7 does not clear it on either.
+
+**How you read stars is your own choice** — five, five with halves, ten, or ten
+with halves. That is presentation and the units the threshold is typed in; it
+changes nothing any server stores, and nothing about how the comparison is made.
+A rating that *reads* as four stars on a coarse scale has not thereby earned a
+four-star bar.
+
+A **favourite** takes no threshold. A heart in Jellyfin or a star in Navidrome
+is already the statement a love makes, and there is no scale to fall short of —
+which matters most on Jellyfin, where it is usually the only signal there is.
+
+Three rules worth knowing before you move the slider:
+
+* **Preview, then apply.** *What would this do?* and *Apply* run the same code,
+  so the preview cannot describe something the apply then does differently.
+* **The threshold is a knob, not a ratchet.** Raising it takes back the loves it
+  made last time — and **only** those. A love you pressed yourself, or pulled
+  from Last.fm or ListenBrainz, is outside its reach however far it moves.
+* **A rating on something you have never played is kept and not loved.** Loves
+  point at records you actually listened to; the rating stays on file and the
+  count is reported rather than silently dropped.
+
+Nothing here is forwarded to Last.fm or ListenBrainz. These are loves being
+imported rather than pressed, and a threshold you are meant to try at several
+settings would otherwise be a broadcast at every setting.
+
+Re-reading a server replaces what it said last time, so a rating raised, lowered
+or cleared there is raised, lowered or cleared here — the server is the authority
+on its own ratings and this is a copy of them.
+
+> The Plex and Jellyfin/Emby walks are written from those servers' published
+> API descriptions and pinned by tests against them, but **have not been run
+> against a real server of either kind** — the same caveat the Emby source
+> carries. Navidrome's has.
 
 ### Patch — the other decks on your instance
 
@@ -1456,6 +1518,10 @@ deploy/                      Sample hardened systemd unit
 - [x] **Reports** — week, month and year chapters with a stepper through the
       whole history, each a different layout rather than one card resized
 - [x] **Loved** — every heart in one place, across tracks, records and artists
+- [x] **Star ratings as loves** — read what Plex, Navidrome, Jellyfin or Emby
+      hold, keep the raw number and the scale it was out of, and set your own
+      threshold in five or ten stars, halves or whole. Roon publishes none.
+      The Plex and Jellyfin/Emby walks are **unverified against a real server**
 - [x] **Discs on the shelf** — CD and SACD alongside vinyl and cassette, with a
       deck drawn for the medium in hand
 - [x] **Playlist Lab and pushing playlists out** — build a list from your own

@@ -1443,6 +1443,24 @@ impl Database {
             }
         }
 
+        // ── Where a love came from ──
+        //
+        // `library_ratings` is a new table and `init()` creates it on every
+        // start, so only this column needs walking forward.
+        //
+        // **Every love that predates it reads NULL, and that is the honest
+        // value rather than a convenience.** NULL means "not derived from a
+        // rating", which is true of all of them — they were pressed by hand or
+        // pulled from Last.fm or ListenBrainz — and it is what keeps
+        // `withdraw_rating_loves` from ever touching one. Defaulting the column
+        // to anything else would put somebody's hand-made loves inside the
+        // reach of a threshold they later moved.
+        if !has_column(&self.pool, "loves", "source").await {
+            info!("⚙️ Migrating: recording where a love came from...");
+            let _ =
+                sqlx::query("ALTER TABLE loves ADD COLUMN source TEXT").execute(&self.pool).await;
+        }
+
         Ok(())
     }
 }

@@ -63,6 +63,12 @@ const SONG_MAX_ROWS: usize = 500_000;
 
 const HISTORY_SLACK_SECS: u64 = 300;
 
+/// How many rows to ask for at a time when walking the library for ratings.
+const RATING_PAGE_SIZE: usize = 1_000;
+
+/// Where that walk gives up. A ceiling rather than an expectation.
+const RATING_MAX_ITEMS: usize = 500_000;
+
 pub struct NavidromeSource {
     url: String,
     username: String,
@@ -541,6 +547,136 @@ impl NavidromeSource {
         self.subsonic_get("ping").await.map(|_| ())
     }
 
+    /// Every rated or starred item in the library.
+    ///
+    /// **Subsonic's `userRating` is out of five**, whole stars, and `starred`
+    /// is a separate binary — which is why the two travel apart here. A star is
+    /// already the statement a love makes and takes no threshold; see
+    /// [`crate::ratings::LoveRule`].
+    ///
+    /// Reads the **native** API rather than Subsonic, for the reason
+    /// `fetch_scrobbles` does: stock Subsonic has no "list everything that is
+    /// rated" call at all — `getStarred2` covers stars and nothing covers
+    /// numbers — while Navidrome's own `/api/song`, `/api/album` and
+    /// `/api/artist` carry `rating` and `starred` on every row. That makes this
+    /// Navidrome-specific in the same way the history walk already is.
+    ///
+    /// It walks the whole library and filters here rather than asking the
+    /// server to filter. A sort or a filter hint would only help if this then
+    /// stopped early on it — and stopping early on a hint a server quietly
+    /// ignored is how a walk silently under-reports, which is the one failure
+    /// this cannot afford. Paging to a short page cannot be wrong, and this is
+    /// a manual action against a box on the user's own network.
+    pub async fn fetch_ratings(
+        &mut self,
+    ) -> Result<Vec<crate::db::IncomingRating>, Box<dyn std::error::Error>> {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Rated {
+            id: String,
+            #[serde(default)]
+            name: Option<String>,
+            #[serde(default)]
+            title: Option<String>,
+            #[serde(default)]
+            artist: Option<String>,
+            #[serde(default)]
+            album_artist: Option<String>,
+            #[serde(default)]
+            album: Option<String>,
+            #[serde(default)]
+            rating: Option<f32>,
+            #[serde(default)]
+            starred: bool,
+            #[serde(default)]
+            starred_at: Option<String>,
+            /// Same spelling drift as `NativeSong` — a miss here is silent and
+            /// costs a MusicBrainz lookup that need not have happened.
+            #[serde(
+                default,
+                alias = "mbzRecordingID",
+                alias = "mbzRecordingId",
+                alias = "mbzTrackId",
+                alias = "mbzTrackID",
+                alias = "mbzAlbumId",
+                alias = "mbzAlbumID",
+                alias = "mbzArtistId",
+                alias = "mbzArtistID",
+                alias = "musicBrainzId"
+            )]
+            mbz_id: Option<String>,
+        }
+
+        let mut out: Vec<crate::db::IncomingRating> = Vec::new();
+        for (path, kind) in
+            [("/api/song", "recording"), ("/api/album", "release"), ("/api/artist", "artist")]
+        {
+            let mut start = 0usize;
+            loop {
+                let resp = self
+                    .native_get(
+                        path,
+                        &[
+                            ("_start", start.to_string()),
+                            ("_end", (start + RATING_PAGE_SIZE).to_string()),
+                        ],
+                    )
+                    .await?;
+                let rows: Vec<Rated> = resp.json().await?;
+                let n = rows.len();
+
+                for r in rows {
+                    let rating = r.rating.filter(|v| *v > 0.0);
+                    if rating.is_none() && !r.starred {
+                        continue;
+                    }
+                    // `/api/song` names the track in `title`; `/api/album` and
+                    // `/api/artist` name theirs in `name`.
+                    let Some(name) =
+                        r.title.or(r.name).map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+                    else {
+                        continue;
+                    };
+                    let artist = match kind {
+                        "artist" => String::new(),
+                        _ => r
+                            .artist
+                            .filter(|s| !s.trim().is_empty())
+                            .or(r.album_artist)
+                            .unwrap_or_default(),
+                    };
+                    if kind != "artist" && artist.trim().is_empty() {
+                        continue;
+                    }
+
+                    out.push(crate::db::IncomingRating {
+                        kind: kind.to_string(),
+                        remote_id: r.id,
+                        artist,
+                        name,
+                        album: if kind == "recording" { r.album } else { None },
+                        mbid: r.mbz_id.filter(|m| !m.trim().is_empty()),
+                        rating: rating.map(|v| {
+                            crate::ratings::Rating::new(v, crate::ratings::SourceScale::SUBSONIC)
+                        }),
+                        starred: r.starred,
+                        rated_at: r.starred_at.as_deref().and_then(parse_iso8601),
+                    });
+                }
+
+                if n < RATING_PAGE_SIZE {
+                    break;
+                }
+                start += n;
+                if start >= RATING_MAX_ITEMS {
+                    debug!("Navidrome: stopped walking {} for ratings at {}", path, start);
+                    break;
+                }
+            }
+        }
+        Ok(out)
+    }
+
     /// Tracks matching a free-text query, as candidates for a playlist push.
     ///
     /// `search3` is OpenSubsonic's own search, so this works against anything
@@ -770,8 +906,42 @@ impl MusicSource for NavidromeSource {
     }
 }
 
+/// When something was starred, out of whatever Navidrome felt like sending.
+///
+/// Accepts an RFC 3339 string *or* bare epoch seconds, because the native API's
+/// timestamp spellings are not uniform — `submissionTime` on a scrobble is a
+/// number and `starredAt` is a string — and neither is documented. A value it
+/// cannot read is `None` rather than a guess: this is the date a star was
+/// pressed, it decorates a row and decides nothing, and inventing one would be
+/// worse than leaving it blank.
+fn parse_iso8601(s: &str) -> Option<i64> {
+    let s = s.trim();
+    if s.is_empty() {
+        return None;
+    }
+    if let Ok(n) = s.parse::<i64>() {
+        return Some(n);
+    }
+    chrono::DateTime::parse_from_rfc3339(s).ok().map(|d| d.timestamp())
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_star_date_is_read_from_either_spelling_and_never_guessed() {
+        // The native API is not uniform about this — `submissionTime` on a
+        // scrobble is a number where `starredAt` is a string — and neither is
+        // documented, so both are accepted.
+        assert_eq!(super::parse_iso8601("2026-09-13T10:04:00Z"), Some(1789293840));
+        assert_eq!(super::parse_iso8601("1789293840"), Some(1789293840));
+        // And anything else is blank rather than invented. This date decorates
+        // a row and decides nothing, so a wrong one is strictly worse than
+        // none.
+        assert_eq!(super::parse_iso8601("last Tuesday"), None);
+        assert_eq!(super::parse_iso8601(""), None);
+        assert_eq!(super::parse_iso8601("   "), None);
+    }
+
     use super::*;
 
     fn song() -> NavidromeSong {

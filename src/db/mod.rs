@@ -3148,7 +3148,12 @@ mod migrate;
 mod notes;
 mod patch;
 mod physical;
+mod ratings;
 mod rediscovery;
+// The rating types are named by the sources that produce them and by the
+// handler that serves them, so they surface here rather than being reached
+// through the module.
+pub use ratings::{IncomingRating, LibraryRatingRow, RatingApply, RatingSourceSummary};
 mod sanitise;
 mod schema;
 mod sources;
