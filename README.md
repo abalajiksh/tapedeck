@@ -612,6 +612,45 @@ Needs the genre map fetched (Settings → Genre Map — one request) and the gen
 backfill to have run. Finished playlists export as M3U, JSON or plain text, or
 go straight to your Plex, Jellyfin or Navidrome with **Send to…**.
 
+A per-recording space is what would lift that ceiling, and Tapedeck cannot
+compute one from listens — see **AudioMuse-AI** below.
+
+### AudioMuse-AI — an optional sonic sidecar
+
+[AudioMuse-AI](https://github.com/NeptuneHub/AudioMuse-AI) ("amai") listens to
+the actual audio files in your media server and works out how each *recording*
+sounds: a 200-dimension embedding, a second 512-dimension one, tempo, key,
+energy, a mood vector and six continuous axes. **That is the one thing Tapedeck
+cannot derive from its own data** — genres attach to artists, so on the genre
+map every track by one artist sits at the same point.
+
+Settings → Connections takes its address and its `API_TOKEN`. One connection for
+the whole server, admin-only, stored encrypted.
+
+**Be clear about what this does today: it is the connection, not a feature.**
+Nothing in Tapedeck reads those vectors yet. What you get is a **Test** button
+and a **coverage** measurement, and the measurement is the point — it answers
+the one question everything downstream depends on, in three parts:
+
+- **How much of your history could ever be matched.** A listen joins to amai on
+  a media-server track id, so one that arrived as a Spotify or Last.fm import
+  has nothing to join on, however much amai analyses. On a real history that
+  alone can be a third of it.
+- **How much amai has actually analysed**, of your most-played tracks, weighted
+  by plays — a track you have played fifty times is worth fifty of one you
+  played once.
+- **What share of your listening that sample was**, so the figure above is never
+  read as a fact about the whole history.
+
+Two things worth knowing before you set it up. **amai wants 4 cores and 8 GB of
+RAM**, so it belongs on a desktop or a NUC — not on the Pi that runs Tapedeck
+perfectly well. And **Tapedeck never starts an analysis**: you run that from
+amai's own screen, and this only reads what it has already worked out. Both
+applications talk to your media server independently, which is exactly why a
+track id means the same thing to both.
+
+Unconfigured is a normal state and everything works without it.
+
 ### Lyrics, for the language a title cannot give
 
 Tapedeck reads lyrics from **your own server first** — Plex and Jellyfin both
@@ -799,6 +838,11 @@ One binary, no runtime and no daemon beside it, and SQLite by default — so
 what storage costs is the history itself plus the MusicBrainz and lyrics
 caches, on whatever card or disk the machine already has.
 
+That floor is unchanged by the optional **AudioMuse-AI** sidecar, which wants
+far more. It is a separate application on a separate machine that Tapedeck
+talks to over HTTP; nothing about connecting one raises what Tapedeck itself
+needs to run.
+
 **Building on that hardware is a different question, and the answer is don't.**
 `cargo build --release` wants considerably more memory than running the result
 does, and 512 MB will thrash or be killed. Build on a real machine and copy the
@@ -898,6 +942,9 @@ MUSICBRAINZ_RATE_LIMIT=1
 # TAPEDECK_METRICS_TOKEN=...     # bearer token for scraping /metrics
 # TAPEDECK_DISCOGS_TOKEN=...     # barcode lookup; also settable in the UI
 # TAPEDECK_APPLE_MUSIC_TOKEN=... # one provider in the artist/album bio chain
+# TAPEDECK_AMAI_URL=...          # AudioMuse-AI sidecar; also settable in the UI
+# TAPEDECK_AMAI_TOKEN=...        # its API_TOKEN
+# TAPEDECK_AMAI_SERVER=...       # which of its media servers, if it has several
 # TAPEDECK_SECRET_KEY=...        # credential encryption; generated on first run
 #                                # into a keyfile if unset. Keep it OUT of
 #                                # backups — a backup plus this key is the same
@@ -1283,6 +1330,7 @@ src/
 ├── rockbox.rs               .scrobbler.log parsing (Audioscrobbler Log 1.1)
 ├── spotify.rs               Spotify extended streaming history (pure, tested)
 ├── tidal.rs                 TIDAL as a playlist target (PKCE + the write half)
+├── amai.rs                  AudioMuse-AI client (per-recording audio vectors)
 ├── playlist_lab.rs          The ten-axis space a playlist is generated in
 ├── playlists.rs             Track matching + the push-to-server target trait
 ├── logging.rs               tracing + file output + live log level
@@ -1518,6 +1566,13 @@ Things that look finished and aren't:
   listened to in between. Only the start was ever stored, so there is nothing to
   reconstruct the real spacing from. New plays stamp each track as it starts, and
   `physical_plays.recorded_at` now keeps the other end.
+- **Nothing reads AudioMuse-AI's vectors yet.** The sidecar can be connected,
+  tested and measured, and that is all it does — the per-recording audio space
+  it exists to supply is not wired into Playlist Lab or anywhere else. The
+  coverage measurement is deliberately the first thing built rather than the
+  last, because how much of a history can be joined at all decides whether the
+  rest is worth building, and that number differs enormously between a library
+  streamed from a media server and one assembled from imports.
 - **Sides may be split by track count.** When a lookup returns no durations,
   `assign_sides` splits by number of tracks instead of playing time, which can
   put the break in the wrong place. Filling the running times in afterwards does
@@ -1583,6 +1638,9 @@ See LICENSE file for details.
 - [Every Noise at Once](https://everynoise.com) — Glenn McDonald's map of the
   genre space, which the Genre Map and Playlist Lab are both built on
 - [Discogs](https://www.discogs.com) — pressing-level release data for the shelf
+- [AudioMuse-AI](https://github.com/NeptuneHub/AudioMuse-AI) — NeptuneHub's
+  sonic analysis of your own library, the optional source of per-recording audio
+  vectors
 - [Figtree](https://github.com/erikdkennedy/figtree) and
   [Caprasimo](https://github.com/vv-monsalve/Caprasimo) — the typefaces, OFL 1.1
 - Built with Rust's async ecosystem (tokio, axum, sqlx, reqwest)
