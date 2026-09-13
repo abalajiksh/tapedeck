@@ -13,7 +13,8 @@
 	import { onMount } from 'svelte';
 	import { page } from '$app/stores';
 	import { api, humanError } from '$lib/api';
-	import type { SpoolDetail, SpoolMember, SpoolPlay, PatchPeer } from '$lib/api';
+	import type { SpoolDetail, SpoolMember, SpoolPlay } from '$lib/api';
+	import AddToSitting from '$lib/components/AddToSitting.svelte';
 	import CoverArt from '$lib/components/CoverArt.svelte';
 	import ShareChapter from '$lib/components/reports/ShareChapter.svelte';
 	import ToTop from '$lib/components/ToTop.svelte';
@@ -188,53 +189,14 @@
 
 	// ── Adding somebody who was there ────────────────────────────────────
 	//
-	// The "from when" question is answered by the person adding rather than
-	// inferred from a clock that means something else. Whole evening is the
-	// default because it is the common case by a distance.
+	// The dialog itself is `AddToSitting`, shared with the running banner on
+	// Patch — one copy of the consent guard and the "from when" question.
 	let adding = false;
-	let candidates: PatchPeer[] = [];
-	let picked: Record<string, boolean> = {};
-	let arrivedNow = false;
 
-	async function openAdd() {
-		adding = true;
-		try {
-			const d = await api.getPatchDecks();
-			const here = new Set((sitting?.members ?? []).map((m) => m.username));
-			candidates = [...d.following, ...d.followers].filter(
-				(p, i, all) =>
-					p.state === 'accepted' &&
-					!here.has(p.username) &&
-					all.findIndex((q) => q.username === p.username) === i
-			);
-		} catch (e) {
-			error = humanError(e);
-		}
-	}
-
-	async function saveAdd() {
-		if (!sitting) return;
-		const names = Object.keys(picked).filter((u) => picked[u]);
-		if (!names.length) return;
-		busy = 'add';
-		try {
-			// `present_from` absent means the whole evening. A real mid-evening
-			// arrival says so — and "now" is the honest reading of that,
-			// because the host is adding them as they walk in.
-			const r = await api.addSpoolMembers(sitting.uuid, {
-				with: names,
-				present_from: arrivedNow ? Math.floor(Date.now() / 1000) : null
-			});
-			notice = `${r.added} invited. Nothing reaches their deck until they say yes.`;
-			adding = false;
-			picked = {};
-			arrivedNow = false;
-			await load();
-		} catch (e) {
-			error = humanError(e);
-		} finally {
-			busy = '';
-		}
+	async function addedSome(added: number) {
+		notice = `${added} invited. Nothing reaches their deck until they say yes.`;
+		adding = false;
+		await load();
 	}
 
 	// ── Correcting your own presence ─────────────────────────────────────
@@ -285,7 +247,7 @@
 			{/if}
 			{#if sitting.hosting}
 				<button class="btn btn-secondary" on:click={openEdit}>Name it</button>
-				<button class="btn btn-secondary" on:click={openAdd}>Add somebody</button>
+				<button class="btn btn-secondary" on:click={() => (adding = true)}>Add somebody</button>
 			{/if}
 		</div>
 	</header>
@@ -477,56 +439,12 @@
 {/if}
 
 {#if adding && sitting}
-	<div class="scrim" role="presentation" on:click={() => (adding = false)}></div>
-	<div class="dialog" role="dialog" aria-label="Add somebody to this sitting">
-		<h3 class="h-display">Add somebody</h3>
-		<p class="sub">
-			Nothing reaches their deck until they say yes, and then only plays through chains
-			their owner shares.
-		</p>
-		{#if candidates.length}
-			<div class="picks">
-				{#each candidates as c (c.username)}
-					<label class="pick">
-						<input type="checkbox" bind:checked={picked[c.username]} />
-						<span>{c.display_name || c.username}</span>
-					</label>
-				{/each}
-			</div>
-			<!--
-				The "from when" question, and the default is the common case: a
-				host adding somebody an hour in has usually just remembered the
-				person sitting in front of them.
-			-->
-			<div class="seg">
-				<button class="seg-btn" class:on={!arrivedNow} on:click={() => (arrivedNow = false)}>
-					Here all along
-				</button>
-				<button class="seg-btn" class:on={arrivedNow} on:click={() => (arrivedNow = true)}>
-					Just arrived
-				</button>
-			</div>
-			<p class="hint">
-				{arrivedNow
-					? 'They will only be offered what plays from now on.'
-					: 'They will be offered the whole evening.'}
-			</p>
-		{:else}
-			<p class="hint">
-				Everybody you are patched with is already in this sitting.
-			</p>
-		{/if}
-		<div class="dacts">
-			<button class="btn btn-secondary" on:click={() => (adding = false)}>Close</button>
-			<button
-				class="btn btn-primary"
-				disabled={busy === 'add' || !candidates.length}
-				on:click={saveAdd}
-			>
-				Add
-			</button>
-		</div>
-	</div>
+	<AddToSitting
+		uuid={sitting.uuid}
+		members={sitting.members}
+		on:added={(e) => addedSome(e.detail.added)}
+		on:close={() => (adding = false)}
+	/>
 {/if}
 
 <!-- The timeline is one row per play and an evening runs to a hundred of them.
@@ -784,37 +702,6 @@
 		margin-top: 4px;
 		font-size: 11px;
 		color: var(--td-muted);
-	}
-	.picks {
-		display: flex;
-		flex-direction: column;
-		gap: 6px;
-		margin: 14px 0;
-	}
-	.pick {
-		display: flex;
-		align-items: center;
-		gap: 8px;
-		font-size: 14px;
-	}
-	.seg {
-		display: inline-flex;
-		border: 1px solid var(--td-border);
-		border-radius: 8px;
-		overflow: hidden;
-	}
-	.seg-btn {
-		background: none;
-		border: none;
-		padding: 6px 12px;
-		font: inherit;
-		font-size: 13px;
-		color: var(--td-muted);
-		cursor: pointer;
-	}
-	.seg-btn.on {
-		background: var(--td-accent);
-		color: #fff;
 	}
 	.dacts {
 		display: flex;

@@ -26,7 +26,7 @@ openapi: 3.1.0
 
 info:
   title: Tapedeck
-  version: 0.115.1
+  version: 0.116.0
   summary: Self-hosted scrobbler and listening journal.
   description: |
     Tapedeck ingests listens, enriches them with MusicBrainz metadata, stores

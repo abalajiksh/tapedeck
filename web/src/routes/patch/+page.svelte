@@ -29,6 +29,7 @@
 	import CoverArt from '$lib/components/CoverArt.svelte';
 	import ChainIcon from '$lib/components/ChainIcon.svelte';
 	import ToTop from '$lib/components/ToTop.svelte';
+	import AddToSitting from '$lib/components/AddToSitting.svelte';
 	import { goto } from '$app/navigation';
 	import { syncUrl } from '$lib/url';
 	import { openArtist } from '$lib/entities';
@@ -998,6 +999,23 @@
 
 	const invitedCount = (sp: SpoolView) => sp.members.filter((m) => m.state === 'invited').length;
 
+	/** The banner's subline, built as one string rather than assembled from
+	 *  `{#if}` blocks in the markup.
+	 *
+	 *  Svelte trims whitespace at the edges of a block body, so an inline
+	 *  `{#if …} · {/if}with {…}` loses the space after the separator and renders
+	 *  `1 invited ·with Sam`. Fourth time in this codebase (v0.96.1, v0.101.0,
+	 *  v0.110.0), and the standing fix is the same: the separator goes inside the
+	 *  expression. */
+	function memberLine(sp: SpoolView): string {
+		const parts: string[] = [];
+		if (sp.title) parts.push(sp.title);
+		const invited = invitedCount(sp);
+		if (invited) parts.push(`${invited} invited`);
+		if (sp.guests.length) parts.push(`with ${sp.guests.join(', ')}`);
+		return parts.join(' · ');
+	}
+
 	function clock(from: number, now: number): string {
 		const s = Math.max(0, now - from);
 		const h = Math.floor(s / 3600);
@@ -1053,6 +1071,25 @@
 		} finally {
 			busy = null;
 		}
+	}
+
+	// **Adding somebody while the room is still full.**
+	//
+	// The controls for a sitting live on its own page, and that page was only
+	// ever reachable from the Sittings tab — a list whose own subtitle is in the
+	// past tense. So the one moment you need this, which is somebody walking in
+	// while the banner is in front of you, was the moment it was furthest away.
+	// The dialog is shared with that page rather than copied, so the consent
+	// guard and the "from when" question have one home.
+	let addingToSpool = false;
+
+	async function addedToSpool(added: number) {
+		addingToSpool = false;
+		notice =
+			added === 1
+				? '1 person invited. Nothing reaches their deck until they say yes.'
+				: `${added} people invited. Nothing reaches their decks until they say yes.`;
+		await loadSpool();
 	}
 
 	async function endSpool() {
@@ -1300,15 +1337,19 @@
 						? 'You were asked into a Shared Spool'
 						: 'Shared Spool running'}
 			</div>
-			<div class="stitle">{withLabel(spool)}</div>
-			<div class="smembers">
-				{#if spool.title}{spool.title}{/if}
-				{#if spool.title && invitedCount(spool)} · {/if}
-				{#if invitedCount(spool)}{invitedCount(spool)} invited{/if}
-				{#if spool.guests.length}
-					{#if spool.title || invitedCount(spool)} · {/if}with {spool.guests.join(', ')}
-				{/if}
-			</div>
+			<!--
+				The way into the sitting's own page, where it is named, its
+				timeline read, people added and presence corrected. A link rather
+				than another button in `.sacts`: the banner already carries the
+				two decisions (answer it, end it) and a third control competing
+				with them would bury both. It cannot wrap the whole card — that
+				holds buttons, and a nested interactive element is invalid markup,
+				the trap the Signal Chains row already documents.
+			-->
+			<a class="stitle" href={`/spool/${spool.uuid}`}>
+				{withLabel(spool)}<span class="sgo">›</span>
+			</a>
+			<div class="smembers">{memberLine(spool)}</div>
 			<!--
 				Nobody ends these. A sitting that has been running since
 				yesterday is one somebody forgot, and it goes on capturing every
@@ -1365,6 +1406,9 @@
 					</button>
 				{/if}
 				{#if spool.hosting}
+					<button class="btn btn-secondary" on:click={() => (addingToSpool = true)}>
+						Add somebody
+					</button>
 					<button class="btn btn-primary" disabled={busy === 'spool'} on:click={endSpool}>End spool</button>
 				{:else}
 					<button class="btn btn-secondary" disabled={busy === 'spool'} on:click={() => answerSpool(false)}>Leave</button>
@@ -1372,6 +1416,15 @@
 			{/if}
 		</div>
 	</div>
+{/if}
+
+{#if addingToSpool && spool}
+	<AddToSitting
+		uuid={spool.uuid}
+		members={spool.members}
+		on:added={(e) => addedToSpool(e.detail.added)}
+		on:close={() => (addingToSpool = false)}
+	/>
 {/if}
 
 {#if error}
@@ -2899,7 +2952,25 @@
 		color: #c9a678;
 		margin-bottom: 4px;
 	}
-	.spool .stitle { font-size: 15.5px; font-weight: 600; color: #f4e7cf; }
+	/* The title is an anchor now, so it has to give back everything a link
+	   takes: the underline, the user-agent colour, and inline layout where a
+	   block was. The colour stays literal because this sits on the dark panel in
+	   both themes — `.spool.over` below restates it for the ended card, which has
+	   no dark panel under it (the `--td-panel` trap). */
+	.spool .stitle {
+		display: inline-flex;
+		align-items: baseline;
+		gap: 4px;
+		font-size: 15.5px;
+		font-weight: 600;
+		color: #f4e7cf;
+		text-decoration: none;
+	}
+	.spool .stitle:hover,
+	.spool .stitle:focus-visible { text-decoration: underline; }
+	/* The chevron is what says the line goes somewhere — a title that only
+	   changes on hover is unreachable information on a touch screen. */
+	.spool .sgo { font-size: 13px; opacity: 0.6; }
 	.spool .smembers { font-size: 12.5px; color: #a4967c; margin-top: 2px; }
 	.spool .swarn { font-size: 12.5px; color: #e0b48c; margin-top: 7px; max-width: 56ch; }
 	.spool .swarn a { color: #f0c8a4; text-decoration: underline; }

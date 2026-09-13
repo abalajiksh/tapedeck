@@ -502,9 +502,23 @@ Pass a record to someone as a **Dub** — it lands in their Crate with your reas
 attached, never in their history — or listen together in a **Shared Spool**,
 where plays from one deck wait in the other's inbox and enter no history until
 each is accepted. A sitting you both forgot to start can be reconstructed
-afterwards from the listens themselves. A listen heard in company is *marked* as
-such, and "unmarked" is never read as "alone": the History filter has three
-states rather than two, because most listening predates the column.
+afterwards from the listens themselves.
+
+**A sitting is a thing you come back to.** It has its own page: a timeline that
+is one row per *play* rather than one per listen, so an evening does not report
+itself at twice its length the moment somebody accepts their half of it; who was
+in the room and from when; and, once it ends, what it came to — records, running
+time, the artist and the record of the evening — as a card you can hand on.
+People can be **added after it starts**, either as having been there all along
+or as having just walked in, which decides how much of the evening reaches their
+inbox; people with no account here are named as guests. A capture's time can be
+corrected before it is ever a listen, which is the cheapest correction there is.
+Leaving a sitting takes its banner away and leaves the evening on your list —
+you were there.
+
+A listen heard in company is *marked* as such, and "unmarked" is never read as
+"alone": the History filter has three states rather than two, because most
+listening predates the column.
 
 **Nothing federates yet.** The actor endpoints, WebFinger and signature
 verification all serve; delivery outward is the remaining work.
@@ -527,15 +541,22 @@ people's listening, and on a household instance it quietly reports how much
 everyone else plays. Where the design put a percentile, Tapedeck ranks the
 period against *your own*: "your 2nd busiest month of 8".
 
-**A month can be shared as an image**, and it is drawn on the server — story,
-square or wide, in whichever look you pick at export time. That is a deliberate
-choice rather than an implementation detail: the fonts are embedded in the
-binary and nothing is fetched, so the same month produces the same picture from
-any client, and a phone app asks `GET /api/v1/reports/image` instead of
-reimplementing a layout that would drift from this one. The card is its own
-composition rather than a screenshot of the chapter, it uses the period's own
-blended colour, and a section with nothing to say is left out rather than drawn
-empty.
+**Any chapter can be shared as an image** — week, month or year — and it is
+drawn on the server, story, square or wide, in whichever look you pick at export
+time. That is a deliberate choice rather than an implementation detail: the
+fonts are embedded in the binary and nothing is fetched, so the same period
+produces the same picture from any client, and a phone app asks
+`GET /api/v1/reports/image` instead of reimplementing a layout that would drift
+from this one.
+
+The three cards are three compositions rather than one resized, for the reason
+the chapters themselves are: a week leads with its by-day bars and draws no
+genre split at any size, because seven days make a thin one; a year leads with
+twelve months and the genre bands; a month draws neither, because five
+sub-buckets say less than the ranked list beneath them. Each is its own
+composition rather than a screenshot of the chapter, uses the period's own
+blended colour, and leaves out a section with nothing to say rather than drawing
+it empty — so a year that discovered no new artists is shorter, not emptier.
 
 Tapedeck ships Latin faces (Figtree and Caprasimo, ~104 KB, OFL). If your
 listening has Hangul, CJK or Cyrillic in it, the render falls back to whatever
@@ -593,9 +614,15 @@ go straight to your Plex, Jellyfin or Navidrome with **Send to…**.
 
 ### Lyrics, for the language a title cannot give
 
-Tapedeck fetches lyrics from [LRCLIB](https://lrclib.net) — no key, no account —
-for one reason: **script detection settles any non-Latin title and gives up on a
-romanised one.** "Bam Haneul-ui Jeo Byeolcheoreom" is Latin characters, so it
+Tapedeck reads lyrics from **your own server first** — Plex and Jellyfin both
+serve the words you tagged onto the file — and falls back to
+[LRCLIB](https://lrclib.net), which needs no key and no account. A *timed*
+library lyric settles it outright and LRCLIB is never asked; a plain one still
+asks, and loses only if LRCLIB has cues, because only a timed lyric can follow
+the deck. Words you type in yourself outrank both and survive every later fetch.
+
+The reason any of it is fetched at all: **script detection settles any non-Latin
+title and gives up on a romanised one.** "Bam Haneul-ui Jeo Byeolcheoreom" is Latin characters, so it
 falls through to *English/Other*, which is a shrug rather than a measurement.
 The lyric is where that title's own script went, and a romanised Korean track
 comes back overwhelmingly in Hangul.
@@ -618,9 +645,9 @@ two measurements and calls them one.
 **They are cached, never redistributed.** Lyrics are third-party copyrighted
 text, so they live in the metadata cache database rather than the listening one:
 `GET /api/v1/backup` is a snapshot of *your listening*, and it does not carry
-them. Nor does the shelf export, the public now-playing endpoint or Patch. There
-is no lyrics screen yet; a connected AI assistant can read them under
-`library:read`, which is the one reader.
+them. Nor does the shelf export, the public now-playing endpoint or Patch. A
+quote in a note is stored as an index, so a Markdown export carries your words
+and a coordinate rather than anybody else's text.
 
 LRCLIB is free and asks callers to be considerate, so Tapedeck identifies
 itself, honours `Retry-After`, and fetches a few tracks a minute — one request
@@ -634,9 +661,19 @@ lines are numbered, because a stanza break that gets skipped renumbers
 everything after it. A reference to a lyric nobody holds stays readable prose
 with a dotted underline, the way an unresolved `[[track:…]]` already does.
 
-The reader shows the words with timestamps or line numbers, and opens on the
-line a note points at. It reads only what is already stored — it never fetches,
-so a page refresh cannot drive the request rate.
+**The reader is a theatre**, dark in both themes because it is somewhere you go
+to read rather than another page of the app: one enlarged line with the rest set
+back from it, a ribbon for where you are in the song, and the gutter cycling
+between cue times, line numbers and nothing. It **follows the deck** by default
+and changes song when the music does; an untimed lyric scrolls from the playhead
+and is marked `≈`, because the line is an estimate where the seconds are a
+measurement. Pointing at a line by hand takes it over, and *Follow the deck*
+hands it back.
+
+Pins hang off a line the way a note hangs off a record, and roll up as footnotes
+under that record's own note. Loading the page never fetches — a refresh must not
+be able to drive the rate at a free service — but a deliberate press of *Look for
+the words* does, and so does picking a different match when LRCLIB's are wrong.
 
 ### "Various Artists" is not an artist
 
@@ -1395,9 +1432,9 @@ deploy/                      Sample hardened systemd unit
       language a romanised title cannot give; instrumental is a real answer
 - [x] **Public now-playing** — one opt-in address, four separate field switches,
       and a Hugo shortcode for your own site
-- [x] **A chapter as an image** — a month as a story, square or wide card,
-      drawn on the server so a phone app asks for one rather than
-      reimplementing the layout
+- [x] **A chapter as an image** — a week, month or year as a story, square or
+      wide card, drawn on the server so a phone app asks for one rather than
+      reimplementing the layout. Three compositions, not one resized
 
 ### Next
 
@@ -1501,8 +1538,8 @@ Things that look finished and aren't:
 ```bash
 cargo fmt
 cargo clippy
-cargo test                       # 653 tests, SQLite
-cargo test --features postgres   # 466, the Postgres configuration
+cargo test                       # 697 tests, SQLite
+cargo test --features postgres   # 481, the Postgres configuration
 ```
 
 The two are different sets rather than the same set run twice: the feature
