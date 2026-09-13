@@ -1,4 +1,5 @@
 mod admin;
+pub mod amai;
 pub(crate) mod artwork;
 pub mod auth;
 pub mod chains;
@@ -144,6 +145,7 @@ pub fn build_app(state: Arc<AppState>) -> Router {
         .merge(mcp::create_mcp_router())
         .merge(oauth::create_oauth_router())
         .merge(tidal::create_tidal_router())
+        .merge(amai::create_amai_router())
         // The spec describes *this* instance at *this* version — the one
         // thing a separately hosted docs site cannot do.
         .route("/api/openapi.yaml", axum::routing::get(crate::openapi::spec))

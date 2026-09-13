@@ -219,6 +219,25 @@ pub struct PendingScrobble {
     pub delivered: Vec<String>,
 }
 
+/// One distinct track of a history, ordered by how much it was played, with a
+/// media-server reference that really came from one of its listens.
+///
+/// **`source_name` and `source_id` are picked together and that is not a
+/// nicety.** They are only meaningful as a pair — `remote_item_id` reads the
+/// prefix of one according to the other — and a group holds several listens
+/// which may have come from different sources. Two separate `MAX()`es would
+/// take them from whichever row won each comparison, which is the defect
+/// v0.74.0 found putting a compilation's sleeve on a record: three columns,
+/// three different source rows, each one individually plausible. So they are
+/// packed into one value before the aggregate and split afterwards.
+pub struct TrackByPlays {
+    pub artist: String,
+    pub title: String,
+    pub plays: i64,
+    pub source_name: String,
+    pub source_id: String,
+}
+
 #[derive(Debug, FromRow, serde::Serialize)]
 pub struct BindingRow {
     pub id: i64,

@@ -758,4 +758,62 @@ impl Database {
         .await?;
         Ok(times.windows(2).any(|w| w[1] - w[0] > SESSION_GAP_SECS))
     }
+
+    /// Every distinct track of a user's history, most played first, each
+    /// carrying one of its own listens' media-server references.
+    ///
+    /// **One scan, and the totals come out of it rather than out of a second
+    /// query.** The caller wants three things — how much listening there is,
+    /// how many distinct tracks that is, and the tracks themselves in
+    /// play order — and a grouped pass over `scrobbles` already knows all
+    /// three. The fold-over-a-scan-you-are-doing-anyway rule from
+    /// `rebuild_sessions`, applied to a read.
+    ///
+    /// It is deliberately **not** limited in SQL, so the totals are exact
+    /// rather than extrapolated from a window. This is an admin-triggered
+    /// diagnostic rather than a page load: the grouping is the same shape
+    /// `chart()` runs, measured at 0.334 s over 77k listens on the real host,
+    /// and the only extra cost is transferring one small row per distinct
+    /// track. If a history ever grows large enough for that to matter, the
+    /// answer is a `LIMIT` plus a separate count — not a window function, whose
+    /// `SUM(COUNT(*))` comes back as `numeric` under Postgres and as an integer
+    /// under SQLite, which is a decode that works on exactly one backend.
+    ///
+    /// Skips are excluded, as everywhere that counts listening.
+    pub async fn tracks_by_plays(
+        &self,
+        user_id: i64,
+    ) -> Result<Vec<crate::db::TrackByPlays>, sqlx::Error> {
+        // CHAR(31) is the ASCII unit separator, which cannot occur in a source
+        // name or a provider id. `crate::sql!` rewrites it to CHR( for
+        // Postgres. Same packing `COVER_PICK` uses, for the same reason.
+        let rows: Vec<(String, String, i64, String)> = sqlx::query_as(&crate::sql!(
+            "SELECT MAX(artist) AS artist,
+                    MAX(title) AS title,
+                    COUNT(*) AS plays,
+                    MAX(source_name || CHAR(31) || source_id) AS pick
+               FROM scrobbles
+              WHERE user_id = ? AND skipped = FALSE
+              GROUP BY LOWER(TRIM(artist)), LOWER(TRIM(title))
+              ORDER BY plays DESC"
+        ))
+        .bind(user_id)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows
+            .into_iter()
+            .map(|(artist, title, plays, pick)| {
+                let (source_name, source_id) =
+                    pick.split_once('\u{1f}').unwrap_or(("", pick.as_str()));
+                crate::db::TrackByPlays {
+                    artist,
+                    title,
+                    plays,
+                    source_name: source_name.to_string(),
+                    source_id: source_id.to_string(),
+                }
+            })
+            .collect())
+    }
 }

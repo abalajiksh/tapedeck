@@ -3082,6 +3082,78 @@ class TapedeckAPI {
 		return this.post('/api/v1/physical/settings/discogs/test');
 	}
 
+	// ── AudioMuse-AI (amai), the sonic sidecar ──────────────────────────────
+	//
+	// Admin and session-only. amai analyses the audio of a media-server library
+	// and holds a per-recording vector, which is the one thing this application
+	// cannot derive from its own data — see `src/amai.rs`.
+
+	async getAmaiSetting(): Promise<{
+		configured: boolean;
+		/** Shown; it is an address, not a credential. The token never comes back. */
+		url: string | null;
+		has_token: boolean;
+		/** Which of amai's media servers our provider ids belong to. */
+		server: string | null;
+		stored: boolean;
+		from_env: boolean;
+	}> {
+		return this.get('/api/v1/amai/settings');
+	}
+
+	/** Only the supplied fields are written, so saving one doesn't wipe another. */
+	async setAmaiSetting(patch: {
+		url?: string;
+		token?: string;
+		server?: string;
+	}): Promise<{ configured: boolean }> {
+		return this.request('PUT', '/api/v1/amai/settings', patch);
+	}
+
+	/**
+	 * Reachable, and does the token work? Two answers, not one: amai's auth
+	 * barrier exempts `/api/health`, so "running with a wrong token" and "not
+	 * running" are distinguishable and need different things doing about them.
+	 */
+	async testAmai(): Promise<{
+		ok: boolean;
+		reachable: boolean;
+		authenticated: boolean;
+		message: string;
+		servers?: { server_id: string; name: string; server_type: string; is_default: boolean }[];
+	}> {
+		return this.post('/api/v1/amai/test');
+	}
+
+	/**
+	 * How much of this history amai can answer for.
+	 *
+	 * `joinable_*` is the structural ceiling — a listen that never came off a
+	 * media server has no provider id to join on, whatever amai has analysed.
+	 * The `analysed_*` figures are measured on the most-played sample, and
+	 * `sample_share_of_listening` is what stops them being read as facts about
+	 * the whole history.
+	 */
+	async getAmaiCoverage(sample?: number): Promise<{
+		total_plays: number;
+		distinct_tracks: number;
+		joinable_tracks: number;
+		joinable_plays: number;
+		joinable_share_of_listening: number | null;
+		asked: number;
+		analysed: number;
+		analysed_share_of_asked: number | null;
+		analysed_share_of_sampled_listening: number | null;
+		sample_share_of_listening: number | null;
+		sample_requested: number;
+		deadline_hit: boolean;
+		error: string | null;
+		server_asked: string | null;
+		examples_not_analysed: { artist: string; title: string; plays: number }[];
+	}> {
+		return this.get(`/api/v1/amai/coverage${sample ? `?sample=${sample}` : ''}`);
+	}
+
 	/** Genres bordering the caller's listening. */
 	async getGenreNeighbours(): Promise<GenreNeighbours> {
 		return this.get('/api/v1/genre-map/neighbours');

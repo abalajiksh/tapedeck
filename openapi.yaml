@@ -26,7 +26,7 @@ openapi: 3.1.0
 
 info:
   title: Tapedeck
-  version: 0.116.0
+  version: 0.117.0
   summary: Self-hosted scrobbler and listening journal.
   description: |
     Tapedeck ingests listens, enriches them with MusicBrainz metadata, stores
@@ -7236,6 +7236,173 @@ paths:
                   ok: { type: boolean }
                   message: { type: string }
         '401': { $ref: '#/components/responses/Unauthorized' }
+
+  # ── AudioMuse-AI (amai) ────────────────────────────────────────────────────
+  /api/v1/amai/settings:
+    get:
+      tags: [Settings, AudioMuse-AI]
+      summary: Whether the AudioMuse-AI sidecar is configured.
+      description: |
+        Admin, session-only. Returns the address — which is not a credential and
+        is shown the way a source's URL is — and never the API token.
+      responses:
+        '200':
+          description: OK.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  configured: { type: boolean }
+                  url: { type: [string, 'null'] }
+                  has_token: { type: boolean }
+                  server: { type: [string, 'null'] }
+                  stored: { type: boolean }
+                  from_env: { type: boolean }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { description: Admin only. }
+    put:
+      tags: [Settings, AudioMuse-AI]
+      summary: Point this instance at an AudioMuse-AI instance.
+      description: |
+        Admin, session-only — a token gets 401 and scopes never enter into it,
+        the line `/api/v1/sources` already sits on. Server-wide rather than
+        per-user: amai is one box the operator runs over one library, and every
+        user here reads the same catalogue. Stored encrypted, and a stored value
+        beats `TAPEDECK_AMAI_URL` / `_TOKEN` / `_SERVER`.
+
+        Each field is written only when present, so saving one does not wipe
+        another; clearing is an explicit empty string. An address with no
+        `http://` or `https://` scheme is a 400 rather than being guessed at —
+        guessing `http` would silently downgrade an instance meant to be reached
+        over TLS.
+
+        `server` names which of amai's own media servers this instance's
+        provider ids belong to (its display name or internal id). Absent means
+        amai's default server, which is the whole answer on a single-server
+        install.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                url: { type: string }
+                token: { type: string }
+                server: { type: string }
+      responses:
+        '200': { description: Saved., content: { application/json: { schema: { type: object, properties: { configured: { type: boolean } } } } } }
+        '400': { description: The address is unusable. }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { description: Admin only. }
+
+  /api/v1/amai/test:
+    post:
+      tags: [Settings, AudioMuse-AI]
+      summary: Is AudioMuse-AI there, and does the token work?
+      description: |
+        Admin, session-only. **Two questions, reported separately**, because
+        they need completely different things doing about them and a screen
+        that only says `ok: false` makes them the same colour. amai's own
+        `before_request` barrier exempts `/api/health` and nothing else, so
+        reachability is answerable without a credential and a bad token is a
+        clean 401 — the inverse of the Discogs trap, where a bad credential is
+        served as a normal 200.
+
+        A rejection is a 200 with `ok: false`, not an HTTP error: the request to
+        Tapedeck succeeded and the answer is "no".
+
+        `servers` carries only `server_id`, `name`, `server_type` and
+        `is_default`. amai's own response also holds a masked `creds` map;
+        nothing here stores or logs it.
+      responses:
+        '200':
+          description: Result of the check.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean }
+                  reachable: { type: boolean }
+                  authenticated: { type: boolean }
+                  message: { type: string }
+                  servers:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        server_id: { type: string }
+                        name: { type: string }
+                        server_type: { type: string }
+                        is_default: { type: boolean }
+        '400': { description: Not configured on this server. }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { description: Admin only. }
+
+  /api/v1/amai/coverage:
+    get:
+      tags: [Settings, AudioMuse-AI]
+      summary: How much of this history can AudioMuse-AI answer for?
+      description: |
+        Admin, session-only. The measurement that decides whether anything is
+        worth building on the sidecar, and it narrows in three steps.
+
+        **The structural ceiling.** A listen joins to amai on a media-server
+        provider id, so one that never came off Plex, Jellyfin or Navidrome
+        cannot join at all whatever amai has analysed. `joinable_*` is that,
+        computed over the whole history because it is a plain string test.
+
+        **What amai has**, measured on the most-played tracks. Weighted by
+        plays rather than sampled evenly, because a track played fifty times is
+        worth fifty times as much to anything built on these vectors.
+
+        **What the sample is a sample of** — `sample_share_of_listening` — so
+        the figure above is never read as a fact about the whole history. A
+        share stated without its population is the fidelity-card failure.
+
+        One request per track against amai, so the handler owns a deadline
+        rather than trusting N × the client timeout. `deadline_hit` says when it
+        stopped early, and a failed ask is never counted as a miss: `error`
+        carries the first one.
+      parameters:
+        - name: sample
+          in: query
+          schema: { type: integer, default: 100, minimum: 1, maximum: 500 }
+      responses:
+        '200':
+          description: The measurement.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  total_plays: { type: integer }
+                  distinct_tracks: { type: integer }
+                  joinable_tracks: { type: integer }
+                  joinable_plays: { type: integer }
+                  joinable_share_of_listening: { type: [number, 'null'] }
+                  asked: { type: integer }
+                  analysed: { type: integer }
+                  analysed_share_of_asked: { type: [number, 'null'] }
+                  analysed_share_of_sampled_listening: { type: [number, 'null'] }
+                  sample_share_of_listening: { type: [number, 'null'] }
+                  sample_requested: { type: integer }
+                  deadline_hit: { type: boolean }
+                  error: { type: [string, 'null'] }
+                  server_asked: { type: [string, 'null'] }
+                  examples_not_analysed:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        artist: { type: string }
+                        title: { type: string }
+                        plays: { type: integer }
+        '400': { description: Not configured, or there are no listens to measure. }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { description: Admin only. }
 
   # ── Genre map ──────────────────────────────────────────────────────────────
   /api/v1/genre-map:

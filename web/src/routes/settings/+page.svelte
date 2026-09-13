@@ -431,6 +431,105 @@
 
 	let timezone = '';
 	let tzSaved = false;
+	// ── AudioMuse-AI, "amai" (admin, server-wide) ──
+	//
+	// The sonic sidecar. It analyses the audio of a media-server library and
+	// holds a per-recording vector — the one thing this application cannot
+	// derive from its own data, and what Playlist Lab's second space and the
+	// manifold view are both blocked on.
+	let amaiConfigured = false;
+	let amaiFromEnv = false;
+	let amaiUrlShown: string | null = null;
+	let amaiHasToken = false;
+	let amaiServerShown: string | null = null;
+	let amaiUrl = '';
+	let amaiToken = '';
+	let amaiServer = '';
+	let amaiMsg = '';
+	let amaiTestOk: boolean | null = null;
+	let amaiTesting = false;
+	let amaiCoverage: Awaited<ReturnType<typeof api.getAmaiCoverage>> | null = null;
+	let amaiMeasuring = false;
+	let amaiCoverageErr = '';
+
+	async function loadAmai() {
+		try {
+			const a = await api.getAmaiSetting();
+			amaiConfigured = a.configured;
+			amaiFromEnv = a.from_env;
+			amaiUrlShown = a.url;
+			amaiHasToken = a.has_token;
+			amaiServerShown = a.server;
+		} catch { /* optional */ }
+	}
+
+	async function saveAmai() {
+		amaiMsg = '';
+		amaiTestOk = null;
+		try {
+			const patch: { url?: string; token?: string; server?: string } = {};
+			// Only what was typed, so saving a server name can't wipe a working
+			// token. An empty box is "leave it alone", and Clear is what removes.
+			if (amaiUrl.trim()) patch.url = amaiUrl.trim();
+			if (amaiToken.trim()) patch.token = amaiToken.trim();
+			if (amaiServer.trim()) patch.server = amaiServer.trim();
+			const r = await api.setAmaiSetting(patch);
+			amaiToken = '';
+			await loadAmai();
+			amaiMsg = r.configured ? 'Saved. Test it to check it answers.' : 'Saved.';
+		} catch (e) {
+			amaiTestOk = false;
+			amaiMsg = String(e).replace(/^API \d+: /, '');
+		}
+	}
+
+	async function clearAmai() {
+		amaiMsg = '';
+		amaiTestOk = null;
+		amaiCoverage = null;
+		try {
+			await api.setAmaiSetting({ url: '', token: '', server: '' });
+			amaiUrl = amaiToken = amaiServer = '';
+			await loadAmai();
+			amaiMsg = 'Cleared.';
+		} catch (e) {
+			amaiTestOk = false;
+			amaiMsg = String(e).replace(/^API \d+: /, '');
+		}
+	}
+
+	async function testAmai() {
+		amaiTesting = true;
+		amaiTestOk = null;
+		try {
+			const r = await api.testAmai();
+			amaiTestOk = r.ok;
+			amaiMsg = r.message;
+		} catch (e) {
+			amaiTestOk = false;
+			amaiMsg = String(e).replace(/^API \d+: /, '');
+		}
+		amaiTesting = false;
+	}
+
+	async function measureAmai() {
+		amaiMeasuring = true;
+		amaiCoverageErr = '';
+		try {
+			amaiCoverage = await api.getAmaiCoverage();
+		} catch (e) {
+			amaiCoverage = null;
+			amaiCoverageErr = String(e).replace(/^API \d+: /, '');
+		}
+		amaiMeasuring = false;
+	}
+
+	// A share with no population behind it is the fidelity-card failure, so a
+	// null reads as an em dash rather than as zero.
+	function pct(v: number | null | undefined): string {
+		return v == null ? '—' : `${v.toFixed(1)}%`;
+	}
+
 	// ── Discogs (admin, server-wide) ──
 	// Server-wide rather than per-user because it is one API credential for the
 	// instance, like the metrics token — not something each household member
@@ -1387,6 +1486,7 @@
 		loadLyricStatus();
 		loadSanitize();
 		loadDiscogs();
+		loadAmai();
 		loadEveryNoise();
 		loadConnections();
 		loadLangStatus();
@@ -2211,6 +2311,110 @@
 							coverage for many pressings.
 						{/if}
 					</p>
+				</div>
+			{/if}
+
+			{#if isAdmin}
+				<div class="panel" style="border-radius:22px;padding:24px;margin-bottom:18px;">
+					<h3 class="h-display" style="font-size:19px;margin-bottom:4px;">AudioMuse-AI</h3>
+					<p style="font-size:13px;color:var(--td-muted);margin:0 0 14px;">
+						An optional sidecar that listens to the actual audio files in your
+						media server and works out how each <em>recording</em> sounds. Tapedeck
+						can't derive that from listens — genres attach to artists, so every
+						track by one artist sits at the same point on the genre map. One
+						address for the whole server.
+					</p>
+					<p style="font-size:12.5px;color:var(--td-muted-2);margin:0 0 14px;">
+						It wants 4 cores and 8&nbsp;GB of RAM, so it belongs on a desktop or a
+						NUC rather than on a Pi. Nothing here starts an analysis — run that
+						from AudioMuse-AI's own screen; this only reads what it has already
+						worked out. The token is its <code>API_TOKEN</code>.
+					</p>
+
+					<div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:10px;">
+						<input class="input" type="text" bind:value={amaiUrl} style="max-width:320px;"
+							placeholder={amaiUrlShown ?? 'http://192.168.1.10:8000'}>
+						<input class="input" type="password" bind:value={amaiToken} style="max-width:220px;"
+							placeholder={amaiHasToken ? '••••••••  (token stored)' : 'API token'}>
+					</div>
+					<div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;">
+						<input class="input" type="text" bind:value={amaiServer} style="max-width:220px;"
+							placeholder={amaiServerShown ?? 'Media server name (optional)'}>
+						<button class="btn btn-secondary" on:click={saveAmai}>Save</button>
+						{#if amaiConfigured}
+							<button class="btn btn-secondary" on:click={testAmai} disabled={amaiTesting}>
+								{amaiTesting ? 'Testing…' : 'Test'}
+							</button>
+							<button class="btn btn-danger" on:click={clearAmai}>Clear</button>
+						{/if}
+					</div>
+					{#if amaiMsg}
+						<p style="font-size:13px;margin:10px 0 0;color:{amaiTestOk === false ? 'var(--td-bad-fg)' : 'var(--td-good-fg)'};">
+							{amaiMsg}
+						</p>
+					{/if}
+					<p style="font-size:12.5px;color:var(--td-muted-2);margin:10px 0 0;">
+						{#if amaiFromEnv && !amaiConfigured}
+							Supplied by TAPEDECK_AMAI_URL but unusable — the address needs an
+							http:// or https:// scheme.
+						{:else if amaiConfigured}
+							Pointing at {amaiUrlShown}{amaiServerShown ? `, reading its "${amaiServerShown}" library` : ''}{amaiHasToken ? '' : ' — no token set, which only works if AudioMuse-AI has auth switched off'}.
+							{#if amaiFromEnv}Supplied by the environment; saving one here overrides it.{/if}
+						{:else}
+							Not configured. Everything works without it; nothing reads its
+							vectors yet either — this is the connection, not a feature.
+						{/if}
+					</p>
+
+					{#if amaiConfigured}
+						<!--
+							The measurement that decides whether anything is worth building on
+							this. A listen joins to AudioMuse-AI on a media-server track id, so
+							one that came from an import can't join at all however much has
+							been analysed — and that ceiling is a fact about the history rather
+							than about the sidecar.
+						-->
+						<div style="border-top:1px solid var(--td-border);margin-top:18px;padding-top:16px;">
+							<div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;">
+								<button class="btn btn-secondary" on:click={measureAmai} disabled={amaiMeasuring}>
+									{amaiMeasuring ? 'Measuring…' : 'Measure coverage'}
+								</button>
+								<span style="font-size:12.5px;color:var(--td-muted-2);">
+									Asks about your 100 most-played tracks. Takes a few seconds.
+								</span>
+							</div>
+							{#if amaiCoverageErr}
+								<p style="font-size:13px;margin:10px 0 0;color:var(--td-bad-fg);">{amaiCoverageErr}</p>
+							{/if}
+							{#if amaiCoverage}
+								<p style="font-size:13px;color:var(--td-muted);margin:14px 0 6px;">
+									<strong>{pct(amaiCoverage.joinable_share_of_listening)}</strong> of your
+									listening can be matched at all — {amaiCoverage.joinable_tracks.toLocaleString()}
+									of {amaiCoverage.distinct_tracks.toLocaleString()} tracks came off a media
+									server and carry an id to join on. The rest were imported and have none,
+									whatever AudioMuse-AI analyses.
+								</p>
+								<p style="font-size:13px;color:var(--td-muted);margin:0 0 6px;">
+									Of the {amaiCoverage.asked} most-played it was asked about,
+									<strong>{amaiCoverage.analysed}</strong> are analysed
+									({pct(amaiCoverage.analysed_share_of_asked)}) —
+									{pct(amaiCoverage.analysed_share_of_sampled_listening)} weighted by plays.
+								</p>
+								<p style="font-size:12.5px;color:var(--td-muted-2);margin:0;">
+									That sample is {pct(amaiCoverage.sample_share_of_listening)} of your
+									listening, so it says nothing certain about the tail.
+									{#if amaiCoverage.deadline_hit}It stopped early at the time limit.{/if}
+									{#if amaiCoverage.error}Some lookups failed: {amaiCoverage.error}{/if}
+								</p>
+								{#if amaiCoverage.examples_not_analysed.length}
+									<p style="font-size:12.5px;color:var(--td-muted-2);margin:8px 0 0;">
+										Not analysed yet, most played first:
+										{amaiCoverage.examples_not_analysed.slice(0, 5).map((t) => `${t.artist} — ${t.title}`).join(' · ')}
+									</p>
+								{/if}
+							{/if}
+						</div>
+					{/if}
 				</div>
 			{/if}
 
