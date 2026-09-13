@@ -231,4 +231,31 @@ mod tests {
             "openapi.yaml says {found}, Cargo.toml says {want} — bump the spec too"
         );
     }
+
+    /// The document has to *parse*, and for a long time it did not.
+    ///
+    /// Found 2026-09-13 while answering a question about one schema: two keys
+    /// of the report payload were indented one level too deep, which made the
+    /// whole 279-operation document unloadable by **any** YAML parser — so
+    /// every client generator, linter and docs renderer failed at the first
+    /// step, and nothing here noticed. Reading it by eye worked perfectly,
+    /// which is exactly why it survived: the only reader was a person.
+    ///
+    /// The drift test above compares *paths* by scanning text and cannot see
+    /// this. Neither can `cargo build` — the spec is `include_str!`d, so a
+    /// syntactically broken document compiles into the binary and is served
+    /// with a 200. This is the cheapest possible guard against shipping one.
+    #[test]
+    fn the_spec_is_a_document_a_client_can_actually_load() {
+        let docs = yaml_rust2::YamlLoader::load_from_str(super::OPENAPI_YAML)
+            .unwrap_or_else(|e| panic!("openapi.yaml does not parse as YAML: {e}"));
+        let doc = docs.first().expect("openapi.yaml is empty");
+
+        // Parsing is most of it, but a document that parses into something
+        // other than an API description would pass that alone — an indentation
+        // slip can move a whole block under the wrong key without breaking the
+        // syntax, which is the half of this bug that was *not* fatal.
+        let paths = doc["paths"].as_hash().expect("openapi.yaml has no paths mapping");
+        assert!(paths.len() > 200, "only {} paths parsed — a block has moved", paths.len());
+    }
 }

@@ -1170,7 +1170,7 @@ none of them implies another:
 
 | Scope | What it allows |
 |-------|----------------|
-| `submit` | `POST /1/submit-listens` and nothing else. What every scrobble client holds. |
+| `submit` | `POST /1/submit-listens`, and `GET /api/v1/scrobble-settings` — the rule that submission is judged by. Nothing else. What every scrobble client holds. |
 | `read` | History, stats, loves, notes, now-playing, chains, gear. |
 | `write` | Loves, notes, and editing or deleting a listen. |
 | `all` | `read` + `write`. |
@@ -1178,6 +1178,15 @@ none of them implies another:
 `submit` deliberately does not imply `read`: the token in a scrobble client on
 a phone that gets lost must not be able to read the history it is appending to.
 Matching is exact, so a scope of `rewrite` does not grant `write`.
+
+The settings endpoint rides on `submit` for that same reason inverted — it exists
+only to decide a submission, and putting it behind `read` would make every
+scrobble client carry read access to the whole history in order to learn one
+number it is obliged to obey. It answers **when a listen counts**: half the
+track or four minutes is only the default, the listener can change both, and a
+client that hardcodes Last.fm's convention disagrees with their setting
+silently — banking early, or banking late and leaving a spurious skip behind it.
+Re-read it when a session starts rather than caching it from setup.
 
 A valid token missing the needed scope gets **403, not 401** — it authenticated
 fine, and a 401 would send a client into a refresh loop it cannot win.

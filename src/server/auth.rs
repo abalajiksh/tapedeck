@@ -182,9 +182,19 @@ impl FromRequestParts<Arc<super::AppState>> for WriteAuth {
     }
 }
 
-/// `IngestAuth` accepts a session cookie **or** an `Authorization: Token` header.
-/// Used by exactly one route — `POST /1/submit-listens` — so a token can
-/// authenticate nowhere else.
+/// `IngestAuth` accepts a session cookie **or** an `Authorization: Token`
+/// header, whatever scopes that token carries.
+///
+/// Used by exactly two routes, and the pair is the boundary: `POST
+/// /1/submit-listens`, and `GET /api/v1/scrobble-settings`, which is the rule
+/// that submission is judged by. A plain `submit` token reaches both and
+/// nothing else. The second is deliberately not behind `read` — that would make
+/// every scrobble client carry read access to the whole listening history in
+/// order to learn one number it is obliged to obey, where the grant should
+/// match what the read is *for*.
+///
+/// Anything that is not "post a listen, or ask when a listen counts" belongs on
+/// `ReadAuth`, `WriteAuth` or session-only `AuthUser`.
 pub struct IngestAuth {
     pub user: AuthUser,
     /// The signal chain the authenticating *token* defaults to. `None` for a

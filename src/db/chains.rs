@@ -41,10 +41,12 @@ impl Database {
             .filter_map(|(id, settings)| {
                 let json = serde_json::from_str::<serde_json::Value>(&settings?).ok()?;
                 // Only users who actually set one, so the default stays the
-                // single source of truth for everybody else.
-                if json.get("scrobble_threshold_percent").is_none()
-                    && json.get("scrobble_threshold_secs").is_none()
-                {
+                // single source of truth for everybody else. Asked through
+                // `is_configured` rather than inline, because
+                // `GET /api/v1/scrobble-settings` reports the same fact to a
+                // client and a second copy of the test would be free to
+                // disagree about whether a number was chosen.
+                if !crate::models::ScrobbleThreshold::is_configured(&json) {
                     return None;
                 }
                 Some((id, crate::models::ScrobbleThreshold::from_prefs(&json)))

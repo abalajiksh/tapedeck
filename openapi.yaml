@@ -26,7 +26,7 @@ openapi: 3.1.0
 
 info:
   title: Tapedeck
-  version: 0.115.0
+  version: 0.115.1
   summary: Self-hosted scrobbler and listening journal.
   description: |
     Tapedeck ingests listens, enriches them with MusicBrainz metadata, stores
@@ -841,18 +841,57 @@ components:
 
     Chain:
       type: object
+      description: |
+        **There is no `is_default`.** This schema documented one until v0.115.1
+        and the server has never served or accepted it — a client setting it on
+        a create got a silent 201 and no effect. A chain is not default for
+        anything by itself; *being the default* is a property of the thing
+        pointing at it, and there are two: a **device**
+        (`/api/v1/device-bindings`) and an **API token**, whose
+        `default_chain_id` is rung 3 of the chain ladder and is reported by
+        `GET /1/validate-token`. Read it there.
+
+        Absent is not null here. `icon`, and a component's `equipment_id` and
+        `since`, are **omitted entirely** when unset rather than sent as null —
+        a strict deserialiser wants those optional, not nullable. `description`,
+        `detail` and `status` really are present-and-null.
       properties:
         id: { type: integer }
+        user_id: { type: integer }
         name: { type: string }
+        description: { type: [string, 'null'] }
         icon:
-          type: [string, 'null']
+          type: string
           description: |
-            A name from the UI's `CHAIN_ICONS` set. Unvalidated on purpose — an
-            unknown value falls back to a generic mark rather than erroring, and
-            rejecting a save because the front end learned a new icon first
-            would be the worse failure.
-        is_default: { type: boolean }
-        total_hours: { type: number }
+            A name from the UI's `CHAIN_ICONS` set. **Omitted when unset**, not
+            null. Unvalidated on purpose — an unknown value falls back to a
+            generic mark rather than erroring, and rejecting a save because the
+            front end learned a new icon first would be the worse failure.
+        listening_context:
+          type: string
+          enum: [unknown, active, active-mobile, passive, background]
+          description: |
+            How you listen through this chain. **Attention, not company** — the
+            two are orthogonal, and who you were with is `company` on the
+            listen.
+        is_active: { type: boolean }
+        shared:
+          type: boolean
+          description: |
+            *(since v0.76.1)* Whether this chain may be **named** to a deck
+            patched into yours, and whether its listens reach the parts of Patch
+            that have no patch behind them — the Instance tab, Discover, and
+            Shared Spool captures. **Not the sharing unit** since v0.93.0: what
+            a patched deck sees is `share_all_with_patched` on the profile.
+        total_hours:
+          type: number
+          description: |
+            Derived from the listens (`SUM(duration)` where `chain_id` matches
+            and the listen is not a skip), never accumulated — so assigning a
+            chain to an old listen moves the hours, and un-assigning takes them
+            back. A source that reported no length contributes nothing, so this
+            is a floor.
+        created_at: { type: integer, description: Unix seconds. }
         components:
           type: array
           items:
@@ -861,14 +900,23 @@ components:
               name:
                 type: string
                 description: Always written, so deleting the gear leaves the chain readable.
-              type: { type: string, description: 'source, dac, amp, headphones, …' }
-              equipment_id:
-                type: [integer, 'null']
-                description: Set when picked from your gear, absent for free text.
-              since:
-                type: [integer, 'null']
+              type: { type: string, description: 'source, transport, dac, amp, transducer, network, …' }
+              detail:
+                type: [string, 'null']
                 description: |
-                  Unix seconds from which this box was in the path. **Absent
+                  Free text about this step. Always present; null when there is
+                  none. Guessed from the gear type when a step is first picked
+                  and never re-applied, so an override sticks.
+              equipment_id:
+                type: integer
+                description: |
+                  The `equipment` row this step *is*, set when it was picked
+                  from your gear. **Omitted** for free text — a chain can name
+                  something you do not own.
+              since:
+                type: integer
+                description: |
+                  Unix seconds from which this box was in the path. **Omitted
                   means "for as long as the chain has existed"**, which is what
                   every step written before this field meant.
 
@@ -880,11 +928,29 @@ components:
 
     Equipment:
       type: object
+      description: |
+        **The type field is `equipment_type` on the way out and `type` on the
+        way in.** This schema said `type` in both directions until v0.115.1 and
+        the response has never carried one. The asymmetry is real and is left
+        as it is rather than broken: `POST`/`PATCH` take `type`, every read
+        returns `equipment_type`.
       properties:
         id: { type: integer }
+        user_id: { type: integer }
         name: { type: string }
-        type: { type: string }
+        equipment_type: { type: string, description: 'dac, amp, transducer, cartridge, headshell, phono, turntable, tape-deck, transport, …' }
         brand: { type: [string, 'null'] }
+        model: { type: [string, 'null'] }
+        notes: { type: [string, 'null'] }
+        purchased_at:
+          type: [integer, 'null']
+          description: |
+            When it was bought, unix seconds. Distinct from `first_used`, which
+            is when Tapedeck first saw it — gear is usually owned for a while
+            before anyone gets round to cataloguing it, and burn-in hours are
+            counted from the purchase.
+        first_used: { type: integer, description: 'When Tapedeck first saw it, unix seconds.' }
+        last_used: { type: integer }
         status:
           type: [string, 'null']
           description: |
@@ -1117,7 +1183,6 @@ components:
         caa_release_mbid: { type: [string, 'null'] }
         note_id: { type: [integer, 'null'], description: 'The liner note on this entity, if there is one.' }
         note_excerpt: { type: [string, 'null'], description: 'First ~90 characters of that note.' }
-        loved_at: { type: integer }
 
     McpConnection:
       type: object
@@ -4043,8 +4108,13 @@ paths:
         session, which are nobody else's business.
       security: [{ sessionCookie: [] }]
       parameters:
-        - { name: limit, in: query, schema: { type: integer } }
-        - { name: before, in: query, schema: { type: integer }, description: Keyset cursor — listens strictly older than this timestamp. }
+        - name: limit
+          in: query
+          schema: { type: integer, default: 40, maximum: 200, minimum: 1 }
+        - name: before
+          in: query
+          description: Keyset cursor — listens strictly older than this timestamp, in unix seconds.
+          schema: { type: integer }
         - name: q
           in: query
           schema: { type: string }
@@ -4061,14 +4131,6 @@ paths:
             publish are unaffected, so no query reaches a chain its owner does
             not share.
         - { name: deck, in: query, schema: { type: string }, description: One deck's username, for the filter chips. }
-      parameters:
-        - name: limit
-          in: query
-          schema: { type: integer, default: 40, maximum: 200 }
-        - name: before
-          in: query
-          description: Unix seconds; return listens older than this.
-          schema: { type: integer }
       responses:
         '200':
           description: '`listens` and a `next` cursor.'
@@ -4303,34 +4365,58 @@ paths:
                         crush: { type: [object, 'null'], description: Most-played artist never played before. Absent for the oldest period. }
                         shelf: { type: object, additionalProperties: true }
                         top_chain: { type: [string, 'null'] }
-                  gear:
-                    type: object
-                    additionalProperties: true
-                    description: >
-                      What the period was listened *through*. `unattributed` and
-                      `no_duration` are stated rather than folded away: on most
-                      histories the first is nearly everything, and the hours
-                      are a floor without the second.
-                    properties:
-                      chains: { type: array, items: { type: object, additionalProperties: true } }
-                      items: { type: array, items: { type: object, additionalProperties: true } }
-                      unattributed: { type: integer, description: 'Listens with no chain at all.' }
-                      no_duration: { type: integer, description: 'Chained listens whose source reported no length.' }
-                  company:
-                    type: object
-                    additionalProperties: true
-                    description: >
-                      Listens **marked** as heard with somebody. `company` is
-                      null on everything nobody has tagged, so `of_plays`
-                      travels as the denominator — never present a bare share,
-                      and never read the complement as "alone".
-                    properties:
-                      marked_plays: { type: integer }
-                      marked_hours: { type: number }
-                      of_plays: { type: integer }
-                      people: { type: array, items: { type: object, additionalProperties: true } }
+                        gear:
+                          type: object
+                          additionalProperties: true
+                          description: >
+                            What the period was listened *through*. `unattributed` and
+                            `no_duration` are stated rather than folded away: on most
+                            histories the first is nearly everything, and the hours
+                            are a floor without the second.
+                          properties:
+                            chains: { type: array, items: { type: object, additionalProperties: true } }
+                            items: { type: array, items: { type: object, additionalProperties: true } }
+                            unattributed: { type: integer, description: 'Listens with no chain at all.' }
+                            no_duration: { type: integer, description: 'Chained listens whose source reported no length.' }
+                        company:
+                          type: object
+                          additionalProperties: true
+                          description: >
+                            Listens **marked** as heard with somebody. `company` is
+                            null on everything nobody has tagged, so `of_plays`
+                            travels as the denominator — never present a bare share,
+                            and never read the complement as "alone".
+                          properties:
+                            marked_plays: { type: integer }
+                            marked_hours: { type: number }
+                            of_plays: { type: integer }
+                            people: { type: array, items: { type: object, additionalProperties: true } }
                         milestones: { type: array, items: { type: string } }
                         prev: { type: [object, 'null'], additionalProperties: true, description: The period before, for deltas. }
+                        fingerprint:
+                          type: object
+                          description: |
+                            Five ratios between 0 and 1, and the same five for
+                            *you, usually* — every one answerable from any
+                            history, and **none of them a comparison against
+                            another person**. The baseline is the mean of your
+                            own periods, not one shape over the whole history:
+                            `variety` shrinks as plays grow and `discovery` is
+                            pinned at 1.0 over a whole history, so a
+                            whole-history baseline would report every period as
+                            more varied and less exploratory than usual.
+                          properties:
+                            axes: { type: array, items: { type: string } }
+                            you: { type: array, items: { type: number } }
+                            usual: { type: array, items: { type: number } }
+                            usual_periods:
+                              type: integer
+                              description: |
+                                How many periods the baseline rests on. One is
+                                not a habit — a radar comparing a month against
+                                itself draws two identical shapes and means
+                                nothing by it, so a client should decline to
+                                draw the baseline below two.
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
 
@@ -5543,23 +5629,64 @@ paths:
     post:
       tags: [Chains]
       summary: Create a chain.
-      description: Session-only.
+      description: |
+        Session-only.
+
+        **There is no `is_default`**, and until v0.115.1 this said there was —
+        sending it got a 201 and no effect, because unknown fields are ignored.
+        A chain is made the default *by* a device binding or an API token; see
+        the `Chain` schema.
+
+        A new chain is never `shared`. Sharing is switched on deliberately, from
+        the chain drawer or Patch → Decks, and never as a side effect of
+        creating something.
       requestBody:
         required: true
         content:
           application/json:
             schema:
               type: object
-              required: [name]
+              required: [name, components]
               properties:
                 name: { type: string }
-                icon: { type: string }
-                is_default: { type: boolean }
-                components: { type: array, items: { type: object, additionalProperties: true } }
+                description: { type: [string, 'null'] }
+                icon: { type: string, description: 'A name from `CHAIN_ICONS`; unvalidated.' }
+                listening_context:
+                  type: string
+                  enum: [unknown, active, active-mobile, passive, background]
+                  default: unknown
+                components:
+                  type: array
+                  description: |
+                    Required — send `[]` for a chain with no steps yet. Each
+                    item takes `type` and `name`, optionally `detail`,
+                    `equipment_id` and `since`.
+                  items:
+                    type: object
+                    required: [type, name]
+                    properties:
+                      type: { type: string }
+                      name: { type: string }
+                      detail: { type: [string, 'null'] }
+                      equipment_id: { type: integer }
+                      since: { type: integer }
       responses:
-        '200': { description: Created., content: { application/json: { schema: { $ref: '#/components/schemas/Chain' } } } }
+        '201':
+          description: Created.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  id: { type: integer }
+                  status: { type: string, enum: [created] }
         '400': { $ref: '#/components/responses/BadRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
+        '409':
+          description: A chain of that name already exists for this user.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
 
   /api/v1/chains/{id}:
     get:
@@ -5576,15 +5703,47 @@ paths:
     patch:
       tags: [Chains]
       summary: Update a chain.
-      description: Session-only.
+      description: |
+        Session-only, and a **whole-record replace** despite the verb — it takes
+        the same body as the create. Every field the editor owns is written, so
+        an omitted `icon`, `description` or `listening_context` is *cleared*.
+        Send the full record back.
+
+        Two fields it deliberately does **not** touch: `shared`, which is
+        switched from the chain drawer or Patch → Decks — writing it here would
+        un-publish a chain as a side effect of renaming it — and `total_hours`,
+        which is derived from the listens.
+
+        A component naming gear the chain did not name before is stamped with
+        `since` at the moment of the save. That is what stops a box added to a
+        chain with history being credited with all of it; send your own `since`
+        to correct the date, which is usually a few days before anybody got
+        round to recording it.
       parameters: [{ name: id, in: path, required: true, schema: { type: integer } }]
       requestBody:
         required: true
         content:
           application/json:
-            schema: { type: object, additionalProperties: true }
+            schema:
+              type: object
+              required: [name, components]
+              additionalProperties: true
+              properties:
+                name: { type: string }
+                description: { type: [string, 'null'] }
+                icon: { type: string }
+                listening_context: { type: string }
+                components: { type: array, items: { type: object, additionalProperties: true } }
       responses:
-        '200': { description: Updated., content: { application/json: { schema: { $ref: '#/components/schemas/Ok' } } } }
+        '200':
+          description: Updated.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  id: { type: integer }
+                  status: { type: string, enum: [updated] }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '404': { $ref: '#/components/responses/NotFound' }
     delete:
@@ -5617,7 +5776,9 @@ paths:
     post:
       tags: [Chains]
       summary: Add gear.
-      description: Session-only.
+      description: |
+        Session-only. The type field is **`type`** here and comes back as
+        `equipment_type` — see the `Equipment` schema.
       requestBody:
         required: true
         content:
@@ -5628,9 +5789,25 @@ paths:
               properties:
                 name: { type: string }
                 type: { type: string }
-                brand: { type: string }
+                brand: { type: [string, 'null'] }
+                model: { type: [string, 'null'] }
+                notes: { type: [string, 'null'] }
+                purchased_at: { type: [integer, 'null'], description: Unix seconds. }
       responses:
-        '200': { description: Created., content: { application/json: { schema: { $ref: '#/components/schemas/Equipment' } } } }
+        '201':
+          description: |
+            Created — **or matched**. Gear is keyed on `(user, name)`: posting a
+            name you already own returns that row's id and stamps `last_used`,
+            and every other field you sent is **ignored** rather than applied.
+            Use `PATCH /api/v1/equipment/{id}` to change one. Always 201, even
+            when nothing was created.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  id: { type: integer }
+                  status: { type: string, enum: [created] }
         '400': { $ref: '#/components/responses/BadRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
 
@@ -7551,6 +7728,97 @@ paths:
         '200': { description: Saved., content: { application/json: { schema: { $ref: '#/components/schemas/Ok' } } } }
         '400': { $ref: '#/components/responses/BadRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /api/v1/scrobble-settings:
+    get:
+      tags: [Settings]
+      summary: When a listen counts — follow the same rule the server does.
+      description: |
+        Half the track **or** four minutes, whichever comes first, is only the
+        *default*: it is a per-user setting, because that convention fits a
+        three-minute pop song far better than a forty-minute raga or a
+        ninety-second hardcore track. A client that hardcodes it disagrees with
+        the listener's own choice, silently, and nothing anywhere errors.
+
+        Following it is not cosmetic agreement. The same threshold decides
+        whether a track this client announced as now-playing and never
+        scrobbled is written off as a **skip** — so submitting later than this
+        rule banks the listen *and* leaves a skip behind it, and submitting
+        earlier puts a listen on a permanent public record that the listener's
+        own setting says had not been heard.
+
+        Reported **as the server computes it, never as stored**: the values are
+        clamped (fraction 0.05–1.0, seconds 10–3600), so a preferences object
+        holding nonsense reads as the number every source here actually uses.
+        `GET /api/v1/preferences` serves the raw blob and is session-only.
+
+        Accepts a plain **`submit`** token, not `read`: this read exists only to
+        decide a submission, and putting it behind `read` would make every
+        scrobble client carry read access to the whole listening history to
+        learn one number it is obliged to obey.
+
+        It is its own endpoint rather than more keys on `/1/validate-token` —
+        the opposite call from the introspection there, and deliberately. Those
+        keys describe the *token*, are asked once at setup, and stay correct
+        when cached. This is a setting, changed from a settings screen at any
+        time; cached from a setup handshake it would go quietly stale, which is
+        the failure this endpoint exists to prevent. Re-read it when a session
+        starts.
+      security: [{ apiToken: [] }, { sessionCookie: [] }]
+      responses:
+        '200':
+          description: OK.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  fraction:
+                    type: number
+                    description: |
+                      Share of the track that must have played, 0.05–1.0. This
+                      is the number the server multiplies the duration by.
+                  percent:
+                    type: number
+                    description: '`fraction` as a percentage, which is how the setting is worded.'
+                  after_secs:
+                    type: integer
+                    description: Seconds after which it counts regardless of the fraction.
+                  rule:
+                    type: string
+                    enum: [either]
+                    description: |
+                      **Whichever comes first.** Stated rather than implied: a
+                      client reading the two as an AND scrobbles a long track
+                      hours late and a short one never.
+                  no_duration_after_secs:
+                    type: integer
+                    description: |
+                      What applies when the track's length is unknown — the
+                      fraction is unanswerable, so the flat number is the only
+                      rule left. Equal to `after_secs`; named separately so a
+                      client does not invent its own answer for that case.
+                  source:
+                    type: string
+                    enum: [user, default]
+                    description: |
+                      Whether the listener chose these numbers or inherited
+                      them, so a settings screen can say which.
+                  default_percent:
+                    type: number
+                    description: The instance default, for showing what "standard" is.
+                  default_after_secs:
+                    type: integer
+                    description: The instance default, for showing what "standard" is.
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '500':
+          description: |
+            The settings could not be read. **Never answered as "they have not
+            set one"** — the default is an answer, and giving it here would have
+            a client follow a rule the server is not applying.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
 
   # ── Sources ────────────────────────────────────────────────────────────────
   /api/v1/sources:

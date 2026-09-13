@@ -234,6 +234,32 @@ impl ScrobbleThreshold {
         }
     }
 
+    /// Did the listener choose this, or is it the default?
+    ///
+    /// Either key alone is a choice — the settings screen writes both, but a
+    /// client or a hand-edited preferences object may set one — so this is an
+    /// OR, and `from_prefs` fills the other half from the default either way.
+    ///
+    /// Split out because two callers ask it and they must not disagree: the
+    /// engine skips users who never set one so the default stays the single
+    /// source of truth for everybody else, and
+    /// `GET /api/v1/scrobble-settings` reports it so a client can say whether
+    /// the number it is following was chosen or inherited.
+    pub fn is_configured(prefs: &serde_json::Value) -> bool {
+        prefs.get("scrobble_threshold_percent").is_some()
+            || prefs.get("scrobble_threshold_secs").is_some()
+    }
+
+    /// The fraction as a percentage, which is how the setting is worded
+    /// everywhere a person meets it.
+    ///
+    /// Rounded to the nearest hundredth because `0.05 * 100.0` is
+    /// `5.000000000000001` in binary floating point, and a settings screen
+    /// reading that back off the API would show it.
+    pub fn percent(&self) -> f64 {
+        (self.fraction * 10_000.0).round() / 100.0
+    }
+
     /// Has this playhead earned the listen?
     ///
     /// One implementation shared by every source, so the case that used to be
@@ -991,6 +1017,57 @@ mod tests {
             ScrobbleThreshold::from_prefs(&serde_json::json!({})),
             ScrobbleThreshold::default()
         );
+    }
+
+    /// The number a client is handed has to be the number the server applies.
+    ///
+    /// `GET /api/v1/scrobble-settings` exists so a scrobble client submits at
+    /// the same point the engine would have banked at — and the same point it
+    /// writes an unbanked track off as a skip. Reporting the *stored*
+    /// preferences instead of the clamped ones would hand a client a rule
+    /// nothing here obeys, and the disagreement is silent at both ends.
+    #[test]
+    fn the_reported_threshold_is_the_one_the_server_applies() {
+        let prefs = serde_json::json!({
+            "scrobble_threshold_percent": 0,
+            "scrobble_threshold_secs": 0
+        });
+        let t = ScrobbleThreshold::from_prefs(&prefs);
+
+        assert_eq!(t.percent(), 5.0, "the clamped fraction, not the stored zero");
+        assert_eq!(t.after_secs, 10);
+        // The reported percent and the fraction the server multiplies by are
+        // the same number, or a client's arithmetic diverges from ours.
+        assert!((t.percent() / 100.0 - t.fraction).abs() < f64::EPSILON);
+
+        assert_eq!(ScrobbleThreshold::default().percent(), 50.0);
+
+        // Eight of the settings screen's ninety-six whole percentages do not
+        // survive the round trip through a fraction — `7 / 100.0 * 100.0` is
+        // `7.000000000000001` — and a settings screen reading that back off
+        // the API would show it. 7 and 58 are two of the eight; 50 is not,
+        // which is why the default alone proves nothing here.
+        for p in [7, 14, 28, 29, 55, 56, 57, 58] {
+            let t = ScrobbleThreshold::from_prefs(
+                &serde_json::json!({ "scrobble_threshold_percent": p }),
+            );
+            assert_eq!(t.percent(), f64::from(p), "{p}% must read back as itself");
+        }
+    }
+
+    /// Chosen or inherited is a different question from what the numbers are,
+    /// and two callers ask it: the engine skips users who never set one, and
+    /// the settings endpoint reports it so a client can say which.
+    #[test]
+    fn either_key_alone_counts_as_having_chosen() {
+        assert!(!ScrobbleThreshold::is_configured(&serde_json::json!({})));
+        assert!(!ScrobbleThreshold::is_configured(&serde_json::json!({ "theme": "dark" })));
+        assert!(ScrobbleThreshold::is_configured(
+            &serde_json::json!({ "scrobble_threshold_percent": 50 })
+        ));
+        assert!(ScrobbleThreshold::is_configured(
+            &serde_json::json!({ "scrobble_threshold_secs": 240 })
+        ));
     }
 
     /// The publish switch has to fail in the direction that publishes *less*.
