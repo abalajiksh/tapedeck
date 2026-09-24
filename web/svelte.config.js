@@ -17,6 +17,13 @@ const config = {
 		// All API calls go through /api/ or /1/ — prefix with the backend
 		paths: {
 			base: ''
+		},
+		// SvelteKit's default is Date.now(), which is written into version.json
+		// and a chunk, so every chunk hash changes between two builds of the same
+		// commit. scripts/make_obs_source.sh sets this to the commit SHA so that a
+		// release tarball is reproducible; everything else keeps the default.
+		version: {
+			name: process.env.TAPEDECK_UI_VERSION_NAME || Date.now().toString()
 		}
 	}
 };

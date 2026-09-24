@@ -1,0 +1,23 @@
+Source: tapedeck
+Section: sound
+Priority: optional
+Maintainer: Ashwin Balaji <s.ashwinbalaji.de@gmail.com>
+Build-Depends: debhelper-compat (= 13), cargo-web (>= 1.88) | cargo (>= 1.88),
+ rustc-web (>= 1.88) | rustc (>= 1.88), gcc
+Standards-Version: 4.6.2
+Homepage: https://codeberg.org/abksh/tapedeck
+Rules-Requires-Root: no
+
+Package: tapedeck
+Architecture: any
+Depends: ${shlibs:Depends}, ${misc:Depends}
+Description: self-hosted scrobbler and listening journal
+ Tapedeck records what you listen to from Plex, Jellyfin, Emby, Navidrome,
+ Roon and any ListenBrainz-compatible player, enriches it with MusicBrainz
+ metadata, keeps it in SQLite, and forwards it to Last.fm, ListenBrainz and
+ Libre.fm. It also records how you listened (signal chains and gear), a
+ shelf of vinyl, tape and discs, and your own liner notes. The web UI is
+ built into the binary.
+ .
+ The service is installed but not enabled. Set MUSICBRAINZ_CONTACT in
+ /etc/tapedeck/tapedeck.env, then: systemctl enable --now tapedeck

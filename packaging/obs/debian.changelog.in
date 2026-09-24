@@ -1,0 +1,5 @@
+tapedeck (@VERSION@-1) unstable; urgency=medium
+
+  * Update to @VERSION@: @CHANGE@
+
+ -- Ashwin Balaji <s.ashwinbalaji.de@gmail.com>  @DEB_DATE@

@@ -1,0 +1,9 @@
+Format: 1.0
+Source: tapedeck
+Binary: tapedeck
+Architecture: any
+Version: @VERSION@-1
+Maintainer: Ashwin Balaji <s.ashwinbalaji.de@gmail.com>
+Homepage: https://codeberg.org/abksh/tapedeck
+Standards-Version: 4.6.2
+Build-Depends: debhelper-compat (= 13), cargo-web (>= 1.88) | cargo (>= 1.88), rustc-web (>= 1.88) | rustc (>= 1.88), gcc

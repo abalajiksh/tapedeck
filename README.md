@@ -876,11 +876,67 @@ Backfill your history from elsewhere and take it with you:
 
 ## Installation
 
+### Linux packages
+
+Prebuilt packages are published from the openSUSE Build Service project
+[`home:abksh:tapedeck`](https://build.opensuse.org/package/show/home:abksh:tapedeck/tapedeck).
+The one-click page generates the right commands for your distribution:
+**<https://software.opensuse.org/download.html?project=home:abksh:tapedeck&package=tapedeck>**
+
+| Distribution | Repository | Architectures |
+|--------------|------------|---------------|
+| openSUSE Tumbleweed | `openSUSE_Tumbleweed` (x86_64), `openSUSE_Factory_ARM` (aarch64) | x86_64, aarch64 |
+| openSUSE Leap 16.0 | `16.0` | x86_64, aarch64 |
+| Fedora 43, 44, Rawhide | `Fedora_43`, `Fedora_44`, `Fedora_Rawhide` | x86_64, aarch64 (Rawhide x86_64 only) |
+| Debian 13 (and Raspberry Pi OS on trixie) | `Debian_13` | x86_64, aarch64 |
+| Ubuntu 26.04 | `xUbuntu_26.04` | x86_64 |
+| Arch Linux | `Arch` | x86_64 |
+
+Debian 12 and Ubuntu 22.04/24.04 are not built: their Rust toolchains are
+older than the 1.88 the dependency tree needs. (Debian 13 builds with its
+`rustc-web`, which Debian keeps current for the browsers.)
+
+```bash
+# openSUSE
+sudo zypper addrepo https://download.opensuse.org/repositories/home:abksh:tapedeck/openSUSE_Tumbleweed/home:abksh:tapedeck.repo
+sudo zypper install tapedeck
+
+# Fedora
+sudo dnf config-manager addrepo --from-repofile=https://download.opensuse.org/repositories/home:abksh:tapedeck/Fedora_44/home:abksh:tapedeck.repo
+sudo dnf install tapedeck
+
+# Debian 13 / Ubuntu 26.04 (substitute xUbuntu_26.04 for Debian_13)
+echo 'deb https://download.opensuse.org/repositories/home:/abksh:/tapedeck/Debian_13/ /' | sudo tee /etc/apt/sources.list.d/tapedeck.list
+curl -fsSL https://download.opensuse.org/repositories/home:abksh:tapedeck/Debian_13/Release.key | gpg --dearmor | sudo tee /etc/apt/trusted.gpg.d/tapedeck.gpg > /dev/null
+sudo apt update && sudo apt install tapedeck
+```
+
+The package installs `/usr/bin/tapedeck` (web UI embedded), a hardened
+`tapedeck.service` and `/etc/tapedeck/tapedeck.env`. **The service is installed
+but not enabled**: until the first admin account exists, the setup page answers
+anyone who can reach the port, so start it deliberately:
+
+```bash
+sudo $EDITOR /etc/tapedeck/tapedeck.env   # set MUSICBRAINZ_CONTACT at least
+sudo systemctl enable --now tapedeck      # then open http://<host>:8080
+```
+
+It runs as a systemd dynamic user. Databases, the credential key and uploaded
+scans live in `/var/lib/tapedeck` (back up the whole directory, keeping
+`tapedeck.key` out of the database backups) and logs in `/var/log/tapedeck`.
+Every setting is documented in `/usr/share/doc/tapedeck/env.example`.
+
+The package is built from one self-contained tarball — every crate vendored and
+the UI prebuilt, since OBS builds offline and no distro packages bun. A release
+tag is published by Jenkins; to produce the upload set yourself:
+`scripts/make_obs_source.sh OUTDIR [REF]`, and to check a tarball builds and
+boots offline on a Linux host: `scripts/obs_smoke_build.sh TARBALL`.
+
 ### Prerequisites
 
 To build:
 
-- Rust toolchain (1.85+ — the SVG renderer behind report images sets the floor)
+- Rust toolchain (1.88+ — `time`, `zip` and `home` in `Cargo.lock` set the floor)
 - [Bun](https://bun.sh) (to build the embedded web UI)
 
 Optional, and connected in the UI rather than configured here:

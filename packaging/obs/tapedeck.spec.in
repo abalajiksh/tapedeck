@@ -1,0 +1,111 @@
+#
+# spec file for tapedeck -- generated from packaging/obs/tapedeck.spec.in by
+# scripts/make_obs_source.sh. Edit the template, not the generated file.
+#
+# The tarball carries everything the build would otherwise fetch: every crate
+# in Cargo.lock under vendor/ (with .cargo/config.toml pointing cargo at it)
+# and the SvelteKit UI already built into static/. OBS has no network and no
+# distro packages bun, so TAPEDECK_SKIP_WEB_BUILD=1 tells build.rs to embed
+# the prebuilt UI instead of building it.
+#
+# The License tag is generated from the crates actually built for Linux.
+
+# Release builds carry no -g, so a debuginfo package would be empty; cargo
+# strips the binary itself (CARGO_PROFILE_RELEASE_STRIP below).
+%global debug_package %{nil}
+# The bundled SQLite and ring's C are the only C, and are linked by rustc,
+# which cannot consume GCC LTO objects.
+%define _lto_cflags %{nil}
+
+Name:           tapedeck
+Version:        @VERSION@
+Release:        0
+Summary:        Self-hosted scrobbler and listening journal
+License:        @LICENSE@
+URL:            https://codeberg.org/abksh/tapedeck
+Source0:        tapedeck-%{version}.tar.gz
+
+BuildRequires:  cargo
+BuildRequires:  rust >= 1.88
+BuildRequires:  gcc
+BuildRequires:  systemd-rpm-macros
+%if 0%{?suse_version}
+%{?systemd_ordering}
+%else
+%{?systemd_requires}
+%endif
+
+%description
+Tapedeck is a self-hosted scrobbler and listening journal. It records what
+you listen to from Plex, Jellyfin, Emby, Navidrome, Roon and any
+ListenBrainz-compatible player, enriches it with MusicBrainz metadata,
+keeps it in SQLite, and forwards it to Last.fm, ListenBrainz and Libre.fm.
+It also records how you listened (signal chains and gear), a shelf of
+vinyl, tape and discs, and your own liner notes. The web UI is built into
+the binary.
+
+The service is installed but not enabled. Set MUSICBRAINZ_CONTACT in
+/etc/tapedeck/tapedeck.env, then: systemctl enable --now tapedeck
+
+%prep
+%autosetup -p1
+
+%build
+export TAPEDECK_SKIP_WEB_BUILD=1
+export CARGO_PROFILE_RELEASE_STRIP=symbols
+export CARGO_HOME=$PWD/.cargo-home
+cargo build --release --frozen
+
+%install
+install -Dm755 target/release/tapedeck %{buildroot}%{_bindir}/tapedeck
+install -Dm644 packaging/obs/tapedeck.service %{buildroot}%{_unitdir}/tapedeck.service
+install -Dm640 packaging/obs/tapedeck.env %{buildroot}%{_sysconfdir}/tapedeck/tapedeck.env
+mkdir -p %{buildroot}%{_docdir}/%{name}
+install -m644 README.md %{buildroot}%{_docdir}/%{name}/
+install -m644 .env.example %{buildroot}%{_docdir}/%{name}/env.example
+install -m644 tapedeck.toml.example %{buildroot}%{_docdir}/%{name}/
+%if 0%{?suse_version}
+mkdir -p %{buildroot}%{_sbindir}
+ln -s service %{buildroot}%{_sbindir}/rctapedeck
+%endif
+
+%check
+# The UI is embedded in release builds; its root layout's auth call must be
+# in the binary, or the service would boot to a blank page.
+grep -qF 'auth/status' target/release/tapedeck
+
+%if 0%{?suse_version}
+%pre
+%service_add_pre tapedeck.service
+
+%post
+%service_add_post tapedeck.service
+
+%preun
+%service_del_preun tapedeck.service
+
+%postun
+%service_del_postun tapedeck.service
+%else
+%post
+%systemd_post tapedeck.service
+
+%preun
+%systemd_preun tapedeck.service
+
+%postun
+%systemd_postun_with_restart tapedeck.service
+%endif
+
+%files
+%license LICENSE
+%{_docdir}/%{name}
+%{_bindir}/tapedeck
+%{_unitdir}/tapedeck.service
+%if 0%{?suse_version}
+%{_sbindir}/rctapedeck
+%endif
+%dir %{_sysconfdir}/tapedeck
+%config(noreplace) %attr(0640,root,root) %{_sysconfdir}/tapedeck/tapedeck.env
+
+%changelog

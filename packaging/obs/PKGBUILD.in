@@ -1,0 +1,45 @@
+# Maintainer: Ashwin Balaji <s.ashwinbalaji.de@gmail.com>
+# Generated from packaging/obs/PKGBUILD.in by scripts/make_obs_source.sh.
+#
+# The tarball carries every crate under vendor/ and the UI prebuilt into
+# static/ (OBS has no network, and bun is not packaged), so build.rs is told
+# to embed the prebuilt UI.
+
+pkgname=tapedeck
+pkgver=@VERSION@
+pkgrel=1
+pkgdesc='Self-hosted scrobbler and listening journal'
+arch=('x86_64' 'aarch64')
+url='https://codeberg.org/abksh/tapedeck'
+license=(@ARCH_LICENSES@)
+depends=('gcc-libs' 'glibc')
+makedepends=('rust' 'gcc')
+options=('!lto' '!debug')
+backup=('etc/tapedeck/tapedeck.env')
+source=("tapedeck-${pkgver}.tar.gz")
+sha256sums=('@SHA256@')
+
+build() {
+  cd "tapedeck-${pkgver}"
+  export TAPEDECK_SKIP_WEB_BUILD=1
+  export CARGO_PROFILE_RELEASE_STRIP=symbols
+  cargo build --release --frozen
+}
+
+check() {
+  cd "tapedeck-${pkgver}"
+  # The UI is embedded; its auth call must be in the binary.
+  grep -qF 'auth/status' target/release/tapedeck
+}
+
+package() {
+  cd "tapedeck-${pkgver}"
+  install -Dm755 target/release/tapedeck "${pkgdir}/usr/bin/tapedeck"
+  install -Dm644 packaging/obs/tapedeck.service \
+    "${pkgdir}/usr/lib/systemd/system/tapedeck.service"
+  install -Dm640 packaging/obs/tapedeck.env "${pkgdir}/etc/tapedeck/tapedeck.env"
+  install -Dm644 LICENSE "${pkgdir}/usr/share/licenses/tapedeck/LICENSE"
+  install -Dm644 README.md "${pkgdir}/usr/share/doc/tapedeck/README.md"
+  install -Dm644 .env.example "${pkgdir}/usr/share/doc/tapedeck/env.example"
+  install -Dm644 tapedeck.toml.example "${pkgdir}/usr/share/doc/tapedeck/tapedeck.toml.example"
+}

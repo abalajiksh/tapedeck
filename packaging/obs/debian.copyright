@@ -1,0 +1,28 @@
+Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
+Upstream-Name: tapedeck
+Upstream-Contact: Ashwin Balaji <s.ashwinbalaji.de@gmail.com>
+Source: https://codeberg.org/abksh/tapedeck
+Comment:
+ The source tarball also carries every Rust crate the build uses under
+ vendor/, each with its own licence file, and a prebuilt copy of the web UI
+ under static/. The crates are almost all MIT, Apache-2.0 or both; the
+ generated RPM spec's License tag lists every licence among them.
+
+Files: *
+Copyright: 2025-2026 Ashwin Balaji
+License: AGPL-3.0-only
+ This program is free software: you can redistribute it and/or modify it
+ under the terms of the GNU Affero General Public License as published by the
+ Free Software Foundation, version 3.
+ .
+ This program is distributed in the hope that it will be useful, but WITHOUT
+ ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
+ FOR A PARTICULAR PURPOSE. See the GNU Affero General Public License for more
+ details.
+ .
+ The full text is in the LICENSE file of the source.
+
+Files: vendor/*
+Copyright: the respective crate authors
+License: various
+ See the licence files inside each crate directory under vendor/.

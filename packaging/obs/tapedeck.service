@@ -1,0 +1,62 @@
+# Tapedeck systemd unit, as shipped in the distribution packages.
+#
+# Installed but NOT enabled: until someone opens it and creates the first
+# admin account, the setup page answers anyone who can reach port 8080, so it
+# should be started deliberately rather than as a side effect of `apt install`.
+#
+#   sudo $EDITOR /etc/tapedeck/tapedeck.env     # MUSICBRAINZ_CONTACT at least
+#   sudo systemctl enable --now tapedeck
+#
+# All state (databases, the credential key, uploaded scans) lives in
+# /var/lib/tapedeck and the logs in /var/log/tapedeck. Both are created by
+# systemd and owned by a dynamic user: there is no `tapedeck` account to
+# create, and nothing else on the host can write here.
+
+[Unit]
+Description=Tapedeck — self-hosted scrobbler
+Documentation=https://codeberg.org/abksh/tapedeck
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+ExecStart=/usr/bin/tapedeck
+DynamicUser=yes
+StateDirectory=tapedeck
+LogsDirectory=tapedeck
+# Every default path in the configuration is relative, so the working
+# directory is where the databases, the key and the uploads land.
+WorkingDirectory=/var/lib/tapedeck
+Environment=LOG_DIR=/var/log/tapedeck
+# Read by systemd as root before privileges drop, so it can stay 0640.
+# Loaded after the line above, so a value set here wins.
+EnvironmentFile=-/etc/tapedeck/tapedeck.env
+
+# Settings → Operations → Restart exits 75 after draining, and relies on
+# on-failure to come back. A clean exit (0) is a stop.
+Restart=on-failure
+RestartSec=5
+# Matches the app's graceful shutdown: in-flight requests finish and the
+# engine completes its tick. Even a kill cannot corrupt the database (WAL).
+KillSignal=SIGTERM
+TimeoutStopSec=45
+
+# ── Hardening (DynamicUser already implies ProtectSystem=strict, ──
+# ── ProtectHome=read-only, PrivateTmp, NoNewPrivileges, RemoveIPC) ──
+ProtectHome=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+LockPersonality=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+SystemCallArchitectures=native
+UMask=0027
+
+[Install]
+WantedBy=multi-user.target

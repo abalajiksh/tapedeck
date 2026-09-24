@@ -1,0 +1,51 @@
+#!/usr/bin/make -f
+# The tarball is self-contained: crates are vendored under vendor/ (with
+# .cargo/config.toml pointing cargo at it) and the UI is prebuilt into
+# static/, so TAPEDECK_SKIP_WEB_BUILD tells build.rs not to look for bun.
+export TAPEDECK_SKIP_WEB_BUILD = 1
+export CARGO_PROFILE_RELEASE_STRIP = symbols
+# The build user's HOME may not be writable; cargo only needs somewhere.
+export CARGO_HOME = $(CURDIR)/debian/cargo-home
+
+%:
+	dh $@
+
+override_dh_auto_configure:
+
+override_dh_auto_build:
+	cargo build --release --frozen
+
+# The UI is embedded in release builds; its root layout's auth call must be in
+# the binary, or the service would boot to a blank page.
+override_dh_auto_test:
+	grep -qF 'auth/status' target/release/tapedeck
+
+override_dh_auto_install:
+	install -Dm755 target/release/tapedeck debian/tapedeck/usr/bin/tapedeck
+	install -Dm644 packaging/obs/tapedeck.service \
+	    debian/tapedeck/usr/lib/systemd/system/tapedeck.service
+	install -Dm640 packaging/obs/tapedeck.env debian/tapedeck/etc/tapedeck/tapedeck.env
+	install -Dm644 README.md debian/tapedeck/usr/share/doc/tapedeck/README.md
+	install -Dm644 .env.example debian/tapedeck/usr/share/doc/tapedeck/env.example
+	install -Dm644 tapedeck.toml.example \
+	    debian/tapedeck/usr/share/doc/tapedeck/tapedeck.toml.example
+
+# Installed, not enabled or started: until the first admin account exists the
+# setup page answers anyone who can reach the port.
+override_dh_installsystemd:
+	dh_installsystemd --no-enable --no-start
+
+# dh_fixperms resets /etc to 0644; the env file may hold secrets.
+override_dh_fixperms:
+	dh_fixperms
+	chmod 0640 debian/tapedeck/etc/tapedeck/tapedeck.env
+
+override_dh_auto_clean:
+	rm -rf target debian/cargo-home
+
+# Release builds carry no -g, so there is nothing for dwz and a -dbgsym
+# package would be empty.
+override_dh_dwz:
+
+override_dh_strip:
+	dh_strip --no-automatic-dbgsym
