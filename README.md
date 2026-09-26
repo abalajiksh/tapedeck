@@ -1356,9 +1356,24 @@ device-pairing flows are in it. Serving it from the binary is the one thing a
 separately hosted docs site cannot do: it describes **that** instance at **that**
 version, which for a self-hosted app beats any version dropdown.
 
-A drift test walks every `.route("…")` in the source and compares both
-directions — routed but undocumented, and documented but not routed — so the
-build fails rather than sending you to an endpoint that 404s.
+**The document is generated from the code** with
+[utoipa](https://github.com/juhaku/utoipa): every handler carries a
+`#[utoipa::path]`, and every body it sends or accepts is a Rust type deriving
+`ToSchema`, so a schema is the type the server actually serialises rather than
+a description of it. The committed `openapi.yaml` is a snapshot of that output,
+and the test suite fails when it is stale:
+
+```bash
+TAPEDECK_BLESS_OPENAPI=1 cargo test openapi   # regenerate openapi.yaml
+tapedeck openapi > openapi.yaml               # or ask the binary
+```
+
+Guards in `src/openapi.rs` hold it to the router: a drift test walks every
+`.route("…")` in the source and compares both directions — routed but
+undocumented, and documented but not routed — and others check that each
+operation is annotated on the handler that serves it, that its documented
+`security` is what that handler's extractor accepts, that every path parameter
+is declared and every `$ref` resolves.
 
 Endpoint tables used to live here and were removed: a second copy of the API,
 maintained by hand, is a copy that goes stale. The spec is the one to read.
@@ -1444,7 +1459,7 @@ src/
 ├── language.rs              Script/language classification
 ├── lyrics.rs                LRCLIB client + lyrics cache (language by script)
 ├── notes.rs                 Liner-note shortcodes + Markdown rendering
-├── openapi.rs               Serves openapi.yaml, plus the router drift test
+├── openapi.rs               Builds and serves the generated spec, plus its guards
 ├── rockbox.rs               .scrobbler.log parsing (Audioscrobbler Log 1.1)
 ├── spotify.rs               Spotify extended streaming history (pure, tested)
 ├── tidal.rs                 TIDAL as a playlist target (PKCE + the write half)
@@ -1517,7 +1532,7 @@ src/
 
 src/everynoise/              Every Noise map: parse, store, scrape
 assets/fonts/                Figtree + Caprasimo, embedded for report images
-openapi.yaml                 The whole API; served at /api/openapi.yaml
+openapi.yaml                 The whole API, generated; served at /api/openapi.yaml
 integrations/hugo/           Now-playing shortcode for a static site
 web/                         SvelteKit SPA (built into static/, embedded)
 deploy/                      Sample hardened systemd unit
@@ -1567,8 +1582,9 @@ deploy/                      Sample hardened systemd unit
 - [x] **Scoped API tokens** — `submit` / `read` / `write` / `all`, none
       implying another, with `/admin/` and anything destructive permanently
       session-only
-- [x] **OpenAPI spec** — the whole API in `openapi.yaml`, served by the binary
-      at `/api/openapi.yaml`, with a drift test in both directions
+- [x] **OpenAPI spec** — the whole API in `openapi.yaml`, generated from the
+      handlers' own types with utoipa, served by the binary at
+      `/api/openapi.yaml`, with a drift test in both directions
 - [x] **Device-code pairing** — RFC 8628-shaped, for clients that cannot show a
       browser
 - [x] **Reports** — week, month and year chapters with a stepper through the
@@ -1715,12 +1731,12 @@ Things that look finished and aren't:
 ```bash
 cargo fmt
 cargo clippy
-cargo test                       # 697 tests, SQLite
-cargo test --features postgres   # 481, the Postgres configuration
+cargo test                       # 740 tests, SQLite
+cargo test --features postgres   # 517, the Postgres configuration
 ```
 
 The two are different sets rather than the same set run twice: the feature
-decides which code compiles, so ~190 SQLite-backed tests are compiled out of the
+decides which code compiles, so ~220 SQLite-backed tests are compiled out of the
 Postgres build. Closing that gap means pointing them at a throwaway Postgres
 schema, and is unbuilt.
 
