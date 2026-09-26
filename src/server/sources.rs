@@ -23,15 +23,99 @@ use axum::{
     routing::{get, post},
     Router,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tracing::info;
+use utoipa::ToSchema;
 
 use super::auth::AuthUser;
 use super::models::ErrorResponse;
 use super::AppState;
 use crate::db::UserSource;
+use crate::openapi::{BadRequest, NotFound, Unauthorized};
+use crate::sources::mediabrowser::MediaBrowserAccount;
+use crate::sources::plex::PlexAccount;
 use crate::sources::{Flavour, MediaBrowserSource, NavidromeSource, PlexFilters, PlexSource};
+
+/// A configured source, without its credentials.
+#[derive(Serialize, ToSchema)]
+pub struct Source {
+    pub id: i64,
+    /// `plex`, `navidrome`, `jellyfin`, `emby` or `roon`.
+    pub kind: String,
+    /// Your name for it, so two servers of the same kind are tellable apart.
+    pub label: String,
+    pub enabled: bool,
+    pub url: String,
+    /// A credential is stored. It is never returned.
+    pub has_token: bool,
+    /// The account on the server whose plays are scrobbled, resolved on save.
+    pub remote_account: Option<String>,
+    /// Navidrome's login name.
+    pub username: Option<String>,
+    /// Null means the engine's default.
+    pub poll_interval_secs: Option<i64>,
+    pub libraries_allow: Vec<String>,
+    pub libraries_block: Vec<String>,
+    pub devices_allow: Vec<String>,
+    pub devices_block: Vec<String>,
+    pub last_polled_at: Option<i64>,
+    pub last_error: Option<String>,
+    pub updated_at: i64,
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct SourceList {
+    pub sources: Vec<Source>,
+    /// The kinds a source can be created as.
+    pub kinds: Vec<&'static str>,
+}
+
+/// Every account on the server, for the "scrobble as" picker. Plex numbers
+/// its accounts; Jellyfin and Emby use string ids.
+#[derive(Serialize, ToSchema)]
+#[serde(untagged)]
+pub enum SourceAccounts {
+    Plex(Vec<PlexAccount>),
+    MediaBrowser(Vec<MediaBrowserAccount>),
+}
+
+/// Whether the credentials work. A failed check is a 200 with `ok: false`.
+#[derive(Serialize, ToSchema)]
+pub struct SourceCheck {
+    pub ok: bool,
+    /// The account the credential belongs to, where the server can say.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub account: Option<String>,
+    /// The server was reached but could not name the account — recoverable
+    /// by picking one from `accounts`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub account_error: Option<String>,
+    /// Empty or absent when the credential may not list them; the picker is
+    /// then not offered. Jellyfin needs this more than Plex: a dashboard API
+    /// key belongs to no user.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub accounts: Option<SourceAccounts>,
+    /// Plex's music libraries.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub libraries: Option<Vec<String>>,
+    /// Why it failed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+impl SourceCheck {
+    fn failed(e: impl ToString) -> Json<Self> {
+        Json(Self {
+            ok: false,
+            account: None,
+            account_error: None,
+            accounts: None,
+            libraries: None,
+            error: Some(e.to_string()),
+        })
+    }
+}
 
 /// Jellyfin and Emby are one protocol with a prefix on it, so the two kinds
 /// share every code path here and differ only by this.
@@ -49,84 +133,98 @@ const KINDS: [&str; 5] = ["plex", "navidrome", "jellyfin", "emby", "roon"];
 
 fn err(code: u16, msg: impl Into<String>) -> axum::response::Response {
     let status = StatusCode::from_u16(code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-    (status, Json(serde_json::json!(ErrorResponse { code, error: msg.into() }))).into_response()
+    (status, Json(ErrorResponse { code, error: msg.into() })).into_response()
 }
 
-fn public_view(s: &UserSource) -> serde_json::Value {
-    serde_json::json!({
-        "id": s.id,
-        "kind": s.kind,
-        "label": s.label,
-        "enabled": s.enabled,
-        "url": s.url,
-        "has_token": !s.credentials.is_empty(),
-        "remote_account": s.remote_account,
-        "username": s.credential("username"),
-        "poll_interval_secs": s.poll_interval_secs,
-        "libraries_allow": s.option_list("libraries_allow"),
-        "libraries_block": s.option_list("libraries_block"),
-        "devices_allow": s.option_list("devices_allow"),
-        "devices_block": s.option_list("devices_block"),
-        "last_polled_at": s.last_polled_at,
-        "last_error": s.last_error,
-        "updated_at": s.updated_at,
-    })
+fn public_view(s: &UserSource) -> Source {
+    Source {
+        id: s.id,
+        kind: s.kind.clone(),
+        label: s.label.clone(),
+        enabled: s.enabled,
+        url: s.url.clone(),
+        has_token: !s.credentials.is_empty(),
+        remote_account: s.remote_account.clone(),
+        username: s.credential("username"),
+        poll_interval_secs: s.poll_interval_secs,
+        libraries_allow: s.option_list("libraries_allow"),
+        libraries_block: s.option_list("libraries_block"),
+        devices_allow: s.option_list("devices_allow"),
+        devices_block: s.option_list("devices_block"),
+        last_polled_at: s.last_polled_at,
+        last_error: s.last_error.clone(),
+        updated_at: s.updated_at,
+    }
 }
 
-/// GET /api/v1/sources — the caller's own sources.
+// GET /api/v1/sources — the caller's own sources.
+/// Your configured sources.
+///
+/// **Session-only, permanently** — these rows hold credentials. The stored
+/// token or password is never returned; `has_token` says whether one is
+/// set.
+#[utoipa::path(
+    get,
+    path = "/api/v1/sources",
+    tag = "Sources",
+    responses(
+        (status = 200, description = "OK.", body = SourceList),
+        (status = 401, response = Unauthorized),
+    )
+)]
 async fn list_sources(State(state): State<Arc<AppState>>, user: AuthUser) -> impl IntoResponse {
     match state.db.list_sources_for_user(user.user_id).await {
         Ok(rows) => {
-            let items: Vec<serde_json::Value> = rows.iter().map(public_view).collect();
-            (
-                StatusCode::OK,
-                Json(serde_json::json!({
-                    "sources": items,
-                    "kinds": KINDS,
-                })),
-            )
-                .into_response()
+            let sources = rows.iter().map(public_view).collect();
+            (StatusCode::OK, Json(SourceList { sources, kinds: KINDS.to_vec() })).into_response()
         }
         Err(e) => err(500, e.to_string()),
     }
 }
 
-#[derive(Deserialize)]
+/// A source to save. On update every field is optional, and an omitted or
+/// empty credential **keeps the stored one** — it is never sent back, so a
+/// client could not echo it anyway.
+#[derive(Deserialize, ToSchema)]
+#[schema(as = SourceSettings)]
 struct SourceUpdate {
-    /// Only honoured on create; a source can't change kind afterwards.
+    /// `plex`, `navidrome`, `jellyfin`, `emby` or `roon`. Required on create
+    /// and ignored afterwards; a source cannot change kind.
     kind: Option<String>,
     label: Option<String>,
+    /// Enabling needs a complete set of credentials for the kind — a 400
+    /// otherwise. Defaults to off on create.
     enabled: Option<bool>,
     url: Option<String>,
-    /// Omitted or empty keeps the stored credential — it's never sent back, so
-    /// the UI can't echo it even if it wanted to.
+    /// Plex.
     token: Option<String>,
-    /// Navidrome logs in as a user, so it needs a username too. Subsonic hashes
-    /// password+salt per request, which is why the password itself is stored
-    /// (encrypted) rather than a token.
+    /// Navidrome logs in as a user.
+    //
+    // Subsonic hashes password+salt per request, which is why the password
+    // itself is stored (encrypted) rather than a token.
     username: Option<String>,
     password: Option<String>,
-    /// Jellyfin mints a per-client API key, so it's per-user like a Plex token.
+    /// Jellyfin and Emby.
     api_key: Option<String>,
     poll_interval_secs: Option<i64>,
     libraries_allow: Option<Vec<String>>,
     libraries_block: Option<Vec<String>>,
     devices_allow: Option<Vec<String>>,
     devices_block: Option<Vec<String>>,
-    /// Which Plex account's sessions this source should scrobble.
-    ///
-    /// Omitted means "whoever the token belongs to", which is the old behaviour
-    /// and the right default for a personal token. It matters on a household
-    /// server, where one admin holds the token: without this, every source
-    /// resolved to the server owner and a second user could not be set up at
-    /// all. Validated against `/accounts` on save — a name that isn't on the
-    /// server would match no session and scrobble nothing, silently.
+    /// Which Plex account's sessions this source should scrobble. Omitted
+    /// means whoever the token belongs to. Validated against the server's
+    /// accounts on save.
+    //
+    // It matters on a household server, where one admin holds the token:
+    // without this, every source resolved to the server owner and a second
+    // user could not be set up at all. A name that isn't on the server would
+    // match no session and scrobble nothing, silently.
     plex_account: Option<String>,
-    /// Which Jellyfin account's sessions to scrobble.
-    ///
-    /// Needed more often than the Plex equivalent: a dashboard API key belongs
-    /// to no user at all, so `/Users/Me` answers 400 and there is nothing to
-    /// infer from. Only a token minted by a user login resolves on its own.
+    /// Which Jellyfin or Emby account's sessions to scrobble. Needed whenever
+    /// the key is a dashboard API key, which belongs to no user.
+    //
+    // `/Users/Me` answers 400 for such a key and there is nothing to infer
+    // from. Only a token minted by a user login resolves on its own.
     jellyfin_account: Option<String>,
 }
 
@@ -345,7 +443,25 @@ async fn resolve_save(
     Ok(Resolved { url, credentials, remote_account, options, complete })
 }
 
-/// POST /api/v1/sources — add another server.
+// POST /api/v1/sources — add another server.
+/// Add a source.
+///
+/// Session-only. Sources are per user, and one user can have several of a
+/// kind, told apart by `label`. For Plex
+/// the token is resolved to a Plex account via plex.tv and the source is
+/// filtered to that account, so there is no name-matching — which means
+/// saving needs outbound internet even for a LAN Plex.
+#[utoipa::path(
+    post,
+    path = "/api/v1/sources",
+    tag = "Sources",
+    request_body = SourceUpdate,
+    responses(
+        (status = 201, description = "Created.", body = Source),
+        (status = 400, response = BadRequest),
+        (status = 401, response = Unauthorized),
+    )
+)]
 async fn create_source(
     State(state): State<Arc<AppState>>,
     user: AuthUser,
@@ -390,7 +506,22 @@ async fn create_source(
     }
 }
 
-/// PUT /api/v1/sources/:id
+/// Update a source.
+///
+/// Session-only. **An omitted token keeps the stored one** — it is not cleared.
+#[utoipa::path(
+    put,
+    path = "/api/v1/sources/{id}",
+    tag = "Sources",
+    params(("id" = i64, Path)),
+    request_body = SourceUpdate,
+    responses(
+        (status = 200, description = "Updated.", body = Source),
+        (status = 400, response = BadRequest),
+        (status = 401, response = Unauthorized),
+        (status = 404, response = NotFound),
+    )
+)]
 async fn update_source(
     State(state): State<Arc<AppState>>,
     user: AuthUser,
@@ -439,7 +570,18 @@ async fn update_source(
     }
 }
 
-/// DELETE /api/v1/sources/:id
+/// Delete a source.
+#[utoipa::path(
+    delete,
+    path = "/api/v1/sources/{id}",
+    tag = "Sources",
+    params(("id" = i64, Path)),
+    responses(
+        (status = 204, description = "Deleted."),
+        (status = 401, response = Unauthorized),
+        (status = 404, response = NotFound),
+    )
+)]
 async fn delete_source(
     State(state): State<Arc<AppState>>,
     user: AuthUser,
@@ -452,10 +594,14 @@ async fn delete_source(
     }
 }
 
-#[derive(Deserialize)]
+/// Credentials to try. Anything omitted falls back to the stored source named
+/// by `id`.
+#[derive(Deserialize, ToSchema)]
+#[schema(as = SourceCredentials)]
 struct SourceTest {
+    /// Required unless `id` is given.
     kind: Option<String>,
-    /// Optional: test an existing source's stored credentials by id.
+    /// Test an existing source, reusing its stored secret.
     id: Option<i64>,
     url: Option<String>,
     token: Option<String>,
@@ -464,11 +610,28 @@ struct SourceTest {
     api_key: Option<String>,
 }
 
-/// POST /api/v1/sources/test — verify credentials before or after saving.
+// POST /api/v1/sources/test — verify credentials before or after saving.
+//
+// Takes `kind` in the body rather than the path so it can be called while
+// adding a server that doesn't exist yet; pass `id` instead to re-test one
+// that does, reusing its stored secret.
+/// Test a source's credentials without saving.
 ///
-/// Takes `kind` in the body rather than the path so it can be called while
-/// adding a server that doesn't exist yet; pass `id` instead to re-test one
-/// that does, reusing its stored secret.
+/// Session-only. `kind` rides in the body rather than the path so a server
+/// can be tested before it is saved; pass `id` instead to re-test one that
+/// is, reusing its stored secret.
+#[utoipa::path(
+    post,
+    path = "/api/v1/sources/test",
+    tag = "Sources",
+    request_body = SourceTest,
+    responses(
+        (status = 200, description = "Result. A failed check is still a 200, with `ok: false`.", body = SourceCheck),
+        (status = 400, description = "Unknown kind, or not enough to test with.", body = ErrorResponse),
+        (status = 401, response = Unauthorized),
+        (status = 404, response = NotFound),
+    )
+)]
 async fn test_source(
     State(state): State<Arc<AppState>>,
     user: AuthUser,
@@ -518,9 +681,14 @@ async fn test_source(
             match MediaBrowserSource::resolve_account(flavour, &url, &key).await {
                 Ok(name) => (
                     StatusCode::OK,
-                    Json(serde_json::json!({
-                        "ok": true, "account": name, "accounts": accounts,
-                    })),
+                    Json(SourceCheck {
+                        ok: true,
+                        account: Some(name),
+                        account_error: None,
+                        accounts: Some(SourceAccounts::MediaBrowser(accounts)),
+                        libraries: None,
+                        error: None,
+                    }),
                 )
                     .into_response(),
                 // Reaching the server but not being able to name the account is
@@ -530,19 +698,17 @@ async fn test_source(
                 // Plex uses.
                 Err(e) if !accounts.is_empty() => (
                     StatusCode::OK,
-                    Json(serde_json::json!({
-                        "ok": true,
-                        "account": serde_json::Value::Null,
-                        "account_error": e.to_string(),
-                        "accounts": accounts,
-                    })),
+                    Json(SourceCheck {
+                        ok: true,
+                        account: None,
+                        account_error: Some(e.to_string()),
+                        accounts: Some(SourceAccounts::MediaBrowser(accounts)),
+                        libraries: None,
+                        error: None,
+                    }),
                 )
                     .into_response(),
-                Err(e) => (
-                    StatusCode::OK,
-                    Json(serde_json::json!({ "ok": false, "error": e.to_string() })),
-                )
-                    .into_response(),
+                Err(e) => (StatusCode::OK, SourceCheck::failed(e)).into_response(),
             }
         }
         "navidrome" => {
@@ -553,13 +719,19 @@ async fn test_source(
             }
             let mut probe = NavidromeSource::new(url, u.clone(), p);
             match probe.initialize().await {
-                Ok(()) => (StatusCode::OK, Json(serde_json::json!({ "ok": true, "account": u })))
-                    .into_response(),
-                Err(e) => (
+                Ok(()) => (
                     StatusCode::OK,
-                    Json(serde_json::json!({ "ok": false, "error": e.to_string() })),
+                    Json(SourceCheck {
+                        ok: true,
+                        account: Some(u),
+                        account_error: None,
+                        accounts: None,
+                        libraries: None,
+                        error: None,
+                    }),
                 )
                     .into_response(),
+                Err(e) => (StatusCode::OK, SourceCheck::failed(e)).into_response(),
             }
         }
         _ => {
@@ -585,26 +757,25 @@ async fn test_source(
             match probe.initialize().await {
                 Ok(()) => (
                     StatusCode::OK,
-                    Json(serde_json::json!({
-                        "ok": true,
-                        "libraries": probe.library_names(),
-                        "account": account,
-                        "account_error": account_error,
-                        "accounts": accounts,
-                    })),
+                    Json(SourceCheck {
+                        ok: true,
+                        libraries: Some(probe.library_names()),
+                        account,
+                        account_error,
+                        accounts: Some(SourceAccounts::Plex(accounts)),
+                        error: None,
+                    }),
                 )
                     .into_response(),
-                Err(e) => (
-                    StatusCode::OK,
-                    Json(serde_json::json!({
-                        "ok": false, "error": e.to_string(),
-                    })),
-                )
-                    .into_response(),
+                Err(e) => (StatusCode::OK, SourceCheck::failed(e)).into_response(),
             }
         }
     }
 }
+
+#[derive(utoipa::OpenApi)]
+#[openapi(paths(test_source, list_sources, create_source, update_source, delete_source))]
+pub struct Api;
 
 pub fn create_sources_router() -> Router<Arc<AppState>> {
     Router::new()

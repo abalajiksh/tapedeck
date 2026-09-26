@@ -36,10 +36,11 @@ use super::auth::AuthUser;
 use super::AppState;
 use crate::db::Database;
 
-/// What one service's pull did. Every field is a count of listens, not of
+/// What one service's pull did. Every field is a count of loves, not of
 /// requests, so the numbers mean the same thing across services.
-#[derive(Debug, Default, serde::Serialize)]
+#[derive(Debug, Default, serde::Serialize, utoipa::ToSchema)]
 pub struct PullReport {
+    /// `listenbrainz` or `lastfm`.
     pub service: String,
     /// Loves the service reported.
     pub found: usize,
@@ -308,12 +309,29 @@ async fn store_love(
 
 // ── Endpoint ──
 
-/// POST /api/v1/loves/pull — fetch loves from every connected service.
+// POST /api/v1/loves/pull — fetch loves from every connected service.
+//
+// Runs inline rather than as a background job: a loves list is thousands of
+// rows at most, not the hundreds of thousands a listen import walks, so there
+// is nothing here worth the progress-tracking machinery. Each service reports
+// separately, and one failing doesn't stop the other.
+/// Pull loves from Last.fm / ListenBrainz.
 ///
-/// Runs inline rather than as a background job: a loves list is thousands of
-/// rows at most, not the hundreds of thousands a listen import walks, so there
-/// is nothing here worth the progress-tracking machinery. Each service reports
-/// separately, and one failing doesn't stop the other.
+/// Session-only — it uses stored service credentials. Not one code path:
+/// ListenBrainz returns only a recording MBID so an un-enriched track
+/// cannot be matched, while Last.fm returns names and can fall back to a
+/// name match. A love whose track is not in your history is **skipped,
+/// never invented** — loves point at entities, and entities are things you
+/// actually played. Libre.fm has no loved-tracks call and is not asked.
+#[utoipa::path(
+    post,
+    path = "/api/v1/loves/pull",
+    tag = "Loves",
+    responses(
+        (status = 200, description = "Done.", body = LovesPulled),
+        (status = 401, response = crate::openapi::Unauthorized),
+    )
+)]
 async fn pull_loves(State(state): State<Arc<AppState>>, user: AuthUser) -> impl IntoResponse {
     let conns = state.db.list_connections(user.user_id).await.unwrap_or_default();
     let mut reports: Vec<PullReport> = Vec::new();
@@ -343,9 +361,21 @@ async fn pull_loves(State(state): State<Arc<AppState>>, user: AuthUser) -> impl 
     }
 
     let loved: usize = reports.iter().map(|r| r.loved).sum();
-    (StatusCode::OK, Json(serde_json::json!({ "loved": loved, "services": reports })))
-        .into_response()
+    (StatusCode::OK, Json(LovesPulled { loved, services: reports })).into_response()
 }
+
+/// Loves fetched from every connected service.
+#[derive(serde::Serialize, utoipa::ToSchema)]
+pub struct LovesPulled {
+    /// Newly stored, across every service.
+    pub loved: usize,
+    /// One entry per connected service; one failing does not stop the other.
+    pub services: Vec<PullReport>,
+}
+
+#[derive(utoipa::OpenApi)]
+#[openapi(paths(pull_loves))]
+pub struct Api;
 
 pub fn create_loves_pull_router() -> Router<Arc<AppState>> {
     Router::new().route("/api/v1/loves/pull", post(pull_loves))

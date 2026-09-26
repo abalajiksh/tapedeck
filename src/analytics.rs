@@ -20,7 +20,7 @@ pub struct ListenRow {
     pub track_number: Option<i32>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 pub struct Trait {
     pub label: String,
     pub low: String,
@@ -29,14 +29,14 @@ pub struct Trait {
     pub evidence: String,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 pub struct LoyalArtist {
     pub artist: String,
     pub plays: i64,
     pub loyalty_score: f64,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 pub struct Personality {
     pub verdict: String,
     pub traits: Vec<Trait>,

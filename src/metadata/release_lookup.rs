@@ -63,7 +63,7 @@ impl DiscogsAuth {
 }
 
 /// One track on a physical side.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct PhysicalTrack {
     /// "A", "B", "C"… Cassettes have two, a double LP four.
     pub side: String,
@@ -74,17 +74,20 @@ pub struct PhysicalTrack {
     pub duration_secs: Option<i64>,
     /// Which physical disc of the set this track is on, from 1.
     ///
-    /// Needs no migration: the tracklist is a JSON blob in
-    /// `physical_releases.tracks`, so a record catalogued before this existed
-    /// parses with `None` — which is honest. It means "nobody recorded which
-    /// disc", not "disc 1", and the panel groups only when it actually knows.
+    /// Null means nobody recorded which disc, not disc 1.
+    // Needs no migration: the tracklist is a JSON blob in
+    // `physical_releases.tracks`, so a record catalogued before this existed
+    // parses with `None` — which is honest. It means "nobody recorded which
+    // disc", not "disc 1", and the panel groups only when it actually knows.
     #[serde(default)]
     pub disc: Option<i64>,
 }
 
 /// A candidate pressing.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, utoipa::ToSchema)]
+#[schema(as = PressingCandidate)]
 pub struct ReleaseCandidate {
+    /// `musicbrainz` or `discogs`.
     pub source: &'static str,
     pub artist: String,
     pub title: String,

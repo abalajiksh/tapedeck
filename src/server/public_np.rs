@@ -40,10 +40,14 @@ use axum::{
     routing::get,
     Router,
 };
+use serde::Serialize;
 use std::sync::Arc;
+use utoipa::ToSchema;
 
+use super::models::ErrorResponse;
 use super::AppState;
 use crate::models::PublicNpFields;
+use crate::openapi::Unauthorized;
 
 /// Live state, so a shared cache must not hold it long — but a widget on a
 /// public page can be fetched by a great many browsers at once, and the origin
@@ -74,18 +78,45 @@ fn no_deck() -> axum::response::Response {
     (
         StatusCode::NOT_FOUND,
         public_headers(),
-        Json(serde_json::json!({
-            "code": 404,
-            "error": "No public deck here.",
-        })),
+        Json(ErrorResponse { code: 404, error: "No public deck here.".into() }),
     )
         .into_response()
 }
 
-/// GET /public/np/:username — what this person is listening to, if they publish.
+// GET /public/np/:username — what this person is listening to, if they publish.
+//
+// Unauthenticated. Returns 404 when there is nothing public to show, 200 with
+// `playing: false` when the person publishes and the deck is empty.
+/// What this person is listening to, if they publish it.
 ///
-/// Unauthenticated. Returns 404 when there is nothing public to show, 200 with
-/// `playing: false` when the person publishes and the deck is empty.
+/// **Unauthenticated — the one route that publishes someone's listening
+/// without a credential.** It
+/// exists because a static site renders long before anyone visits it, so a
+/// live now-playing widget must be fetched from the reader's browser, where
+/// no credential of the owner's can safely go.
+///
+/// Sends `Access-Control-Allow-Origin: *` and
+/// `Cache-Control: public, max-age=5`. A `GET` with no custom headers is a
+/// CORS simple request, so there is no preflight and no `OPTIONS`.
+///
+/// **A username that does not exist and one that has not published return
+/// the same 404.** Anything that told them apart would make this a
+/// membership oracle for a private, invite-only instance.
+///
+/// Everything past `title`/`artist`/`album` appears only if its owner
+/// ticked it — see the publish switch above. An absent field means "not
+/// published" or "not known"; the two are deliberately not distinguished.
+#[utoipa::path(
+    get,
+    path = "/public/np/{username}",
+    tag = "Listens",
+    security(),
+    params(("username" = String, Path)),
+    responses(
+        (status = 200, description = "The person publishes. `playing` is false when the deck is empty.", body = PublicNowPlaying),
+        (status = 404, description = "No such user, or they do not publish. Identical answers.", body = ErrorResponse),
+    )
+)]
 async fn public_now_playing(
     State(state): State<Arc<AppState>>,
     Path(username): Path<String>,
@@ -99,11 +130,7 @@ async fn public_now_playing(
         return (
             StatusCode::OK,
             public_headers(),
-            Json(serde_json::json!({
-                "playing": false,
-                "user": username,
-                "name": display_name,
-            })),
+            Json(PublicNowPlaying::idle(username, display_name)),
         )
             .into_response();
     };
@@ -133,39 +160,32 @@ fn public_payload(
     username: &str,
     display_name: Option<&str>,
     artwork: Option<String>,
-) -> serde_json::Value {
-    let mut body = serde_json::json!({
-        "playing": true,
-        "user": username,
-        "name": display_name,
-        "title": np.title,
-        "artist": np.artist,
-        "album": np.album,
-    });
-    let obj = body.as_object_mut().expect("built as an object");
+) -> PublicNowPlaying {
+    let mut body = PublicNowPlaying::idle(username.to_string(), display_name.map(str::to_string));
+    body.playing = true;
+    body.title = Some(np.title.clone());
+    body.artist = Some(np.artist.clone());
+    body.album = Some(np.album.clone());
 
     if fields.position {
-        obj.insert("position".into(), serde_json::json!(position));
-        obj.insert("duration".into(), serde_json::json!(np.duration));
+        body.position = Some(position);
+        body.duration = Some(np.duration);
         // Whether that number is a measurement or our own arithmetic. A widget
         // drawing a confident progress bar over a guess is the same error
         // `Progress` was introduced to stop, exported to somebody's website.
-        obj.insert("position_known".into(), serde_json::json!(np.position_known));
-        obj.insert("paused".into(), serde_json::json!(np.paused));
+        body.position_known = Some(np.position_known);
+        body.paused = Some(np.paused);
     }
 
     if fields.fidelity {
-        obj.insert(
-            "quality".into(),
-            serde_json::json!({
-                "format": np.format_type,
-                "codec": np.codec,
-                "bit_depth": np.bit_depth,
-                "sample_rate": np.sample_rate,
-                "dsd_multiplier": np.dsd_multiplier,
-                "lossless": np.is_lossless,
-            }),
-        );
+        body.quality = Some(PublicQuality {
+            format: np.format_type.clone(),
+            codec: np.codec.clone(),
+            bit_depth: np.bit_depth,
+            sample_rate: np.sample_rate,
+            dsd_multiplier: np.dsd_multiplier,
+            lossless: np.is_lossless,
+        });
     }
 
     if fields.gear {
@@ -173,19 +193,102 @@ fn public_payload(
         // listen resolves its chain from the device default — the coarsest rung
         // of the ladder — and naming that as "how you listened" would dress a
         // fallback up as a choice.
-        if let Some(chain) = &np.chain_name {
-            obj.insert("chain".into(), serde_json::json!(chain));
-        }
-        if let Some(ctx) = &np.listening_context {
-            obj.insert("context".into(), serde_json::json!(ctx));
-        }
+        body.chain = np.chain_name.clone();
+        body.context = np.listening_context.clone();
     }
 
-    if let Some(url) = artwork {
-        obj.insert("artwork".into(), serde_json::json!(url));
-    }
-
+    body.artwork = artwork;
     body
+}
+
+/// The public payload. Only `playing`, `user` and `name` are always present;
+/// `title`/`artist`/`album` appear whenever something is playing, and
+/// everything below that appears only if its owner opted into it.
+///
+/// An absent field means "not published" **or** "the source did not know" —
+/// the two are not distinguished, and a client must not infer either.
+// A field is **omitted** rather than nulled when it is not granted, so there
+// is no shape difference between "you may not see this" and "nobody knows
+// it": a reader learns nothing from the absence either way.
+#[derive(Serialize, ToSchema)]
+pub struct PublicNowPlaying {
+    pub playing: bool,
+    /// The username as asked for.
+    pub user: String,
+    /// Display name, when set.
+    pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub artist: Option<String>,
+    /// Present whenever something is playing; null when the track has no album.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = Option<String>)]
+    pub album: Option<Option<String>>,
+    /// Opt-in (`position`). Seconds in. Read `position_known` before drawing
+    /// this as a measurement.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub position: Option<u64>,
+    /// Opt-in (`position`). Seconds; null when the source reported no length.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = Option<u64>)]
+    pub duration: Option<Option<u64>>,
+    /// Opt-in (`position`). False when the number is the server's own
+    /// wall-clock arithmetic rather than a reported playhead.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub position_known: Option<bool>,
+    /// Opt-in (`position`). Only a pushing source can know this.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub paused: Option<bool>,
+    /// Opt-in (`fidelity`). Every member may be null — most of a history has no
+    /// format at all.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quality: Option<PublicQuality>,
+    /// Opt-in (`gear`). The signal chain, and **only where the source actually
+    /// chose one** — an ingest submission or a side off the shelf. A polled
+    /// listen falls through to the device default, the coarsest rung of the
+    /// ladder, and omits this rather than dressing a fallback up as a decision.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chain: Option<String>,
+    /// Opt-in (`gear`). The listening context, or the medium for a shelf play.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context: Option<String>,
+    /// Opt-in (`artwork`). A cover URL, resolved at most once per track.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub artwork: Option<String>,
+}
+
+impl PublicNowPlaying {
+    /// A published deck with nothing on it.
+    fn idle(user: String, name: Option<String>) -> Self {
+        Self {
+            playing: false,
+            user,
+            name,
+            title: None,
+            artist: None,
+            album: None,
+            position: None,
+            duration: None,
+            position_known: None,
+            paused: None,
+            quality: None,
+            chain: None,
+            context: None,
+            artwork: None,
+        }
+    }
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct PublicQuality {
+    /// `pcm`, `dsd` or `mqa`.
+    pub format: Option<String>,
+    pub codec: Option<String>,
+    pub bit_depth: Option<i16>,
+    pub sample_rate: Option<i32>,
+    pub dsd_multiplier: Option<i16>,
+    pub lossless: Option<bool>,
 }
 
 /// A cover for what is on the deck, at most one lookup per track.
@@ -234,29 +337,63 @@ async fn resolve_artwork(
 /// misspelled the key must not be read as an answer either way. Same reasoning
 /// as `bulk-chain` and `default_chain_id`, in the one place where guessing
 /// wrong is published rather than merely wrong.
-#[derive(serde::Deserialize)]
+#[derive(serde::Deserialize, ToSchema)]
 struct PublishRequest {
+    /// **Required** — a body that does not say true or false explicitly is a
+    /// 400, never read as either.
+    #[schema(required = true)]
     enabled: Option<bool>,
-    /// Names from `PublicNpFields::KNOWN`; anything else is dropped rather than
-    /// rejected, so a newer UI cannot make an older server fail — it can only
-    /// fail to grant something, which is the safe direction.
+    /// The extra disclosures to grant: any of `artwork`, `position`,
+    /// `fidelity`, `gear`. Unknown names are dropped rather than rejected, so a
+    /// newer client cannot make an older server fail — it can only fail to
+    /// grant something, which is the safe direction. Absent grants none.
     fields: Option<Vec<String>>,
 }
 
-fn settings_body(enabled: bool, fields: PublicNpFields, username: &str) -> serde_json::Value {
-    serde_json::json!({
-        "enabled": enabled,
-        "fields": PublicNpFields::KNOWN.iter().filter(|n| fields.has(n)).collect::<Vec<_>>(),
-        "known_fields": PublicNpFields::KNOWN,
+/// Your own view of your public now-playing setting.
+#[derive(Serialize, ToSchema)]
+#[schema(as = PublishSwitch)]
+struct PublishSettings {
+    enabled: bool,
+    /// The extra disclosures currently granted, in canonical order.
+    fields: Vec<&'static str>,
+    /// Every field this build knows how to publish. Render the toggles from
+    /// this rather than a hardcoded list, so the two cannot drift.
+    known_fields: Vec<&'static str>,
+    /// The public address, e.g. `/public/np/ashwin`. Built server-side so a
+    /// settings screen cannot assemble a different one.
+    path: String,
+}
+
+fn settings_body(enabled: bool, fields: PublicNpFields, username: &str) -> PublishSettings {
+    PublishSettings {
+        enabled,
+        fields: PublicNpFields::KNOWN.iter().copied().filter(|n| fields.has(n)).collect(),
+        known_fields: PublicNpFields::KNOWN.to_vec(),
         // The address to paste into a website, built here so the screen cannot
         // assemble a different one. Relative when the operator has not said what
         // this instance is reached at — a guess would be worse than an obvious
         // blank, since the whole value of the string is being correct.
-        "path": format!("/public/np/{username}"),
-    })
+        path: format!("/public/np/{username}"),
+    }
 }
 
-/// GET /api/v1/profile/public-now-playing — the owner's own view of the switch.
+// GET /api/v1/profile/public-now-playing — the owner's own view of the switch.
+/// The caller's publish switch for now-playing.
+///
+/// **Session-only.** A token gets 401 — the endpoint does not accept one at
+/// all, so scopes never enter into it. A scrobble client has no business
+/// deciding that its owner's listening is public.
+#[utoipa::path(
+    get,
+    path = "/api/v1/profile/public-now-playing",
+    tag = "Listens",
+    security(("sessionCookie" = [])),
+    responses(
+        (status = 200, description = "OK.", body = PublishSettings),
+        (status = 401, response = Unauthorized),
+    )
+)]
 async fn get_publish(
     State(state): State<Arc<AppState>>,
     user: super::auth::AuthUser,
@@ -267,19 +404,41 @@ async fn get_publish(
         }
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "code": 500, "error": e.to_string() })),
+            Json(ErrorResponse { code: 500, error: e.to_string() }),
         )
             .into_response(),
     }
 }
 
-/// PUT /api/v1/profile/public-now-playing — turn publishing on or off.
+// PUT /api/v1/profile/public-now-playing — turn publishing on or off.
+//
+// **Session-only, and permanently.** A token is held by a scrobble client, and
+// no scrobble client has any business deciding that its owner's listening is
+// public. This sits on the same line as `/api/v1/sources` and the password
+// endpoints: `AuthUser`, so a token gets 401 and the question of scopes never
+// arises.
+/// Turn public now-playing on or off.
 ///
-/// **Session-only, and permanently.** A token is held by a scrobble client, and
-/// no scrobble client has any business deciding that its owner's listening is
-/// public. This sits on the same line as `/api/v1/sources` and the password
-/// endpoints: `AuthUser`, so a token gets 401 and the question of scopes never
-/// arises.
+/// **Session-only.** `enabled` is required — a body that merely misspelled
+/// the key must not be read as an answer either way, because getting this
+/// one wrong is published rather than merely wrong.
+///
+/// `fields` names the *extra* disclosures beyond title/artist/album.
+/// Unknown names are dropped rather than rejected, so a newer client cannot
+/// make an older server fail; it can only fail to grant something.
+/// Omitting `fields` while enabling publishes the base payload alone.
+#[utoipa::path(
+    put,
+    path = "/api/v1/profile/public-now-playing",
+    tag = "Listens",
+    security(("sessionCookie" = [])),
+    request_body = PublishRequest,
+    responses(
+        (status = 200, description = "OK.", body = PublishSettings),
+        (status = 400, description = "`enabled` was absent.", body = ErrorResponse),
+        (status = 401, response = Unauthorized),
+    )
+)]
 async fn put_publish(
     State(state): State<Arc<AppState>>,
     user: super::auth::AuthUser,
@@ -288,10 +447,10 @@ async fn put_publish(
     let Some(enabled) = body.enabled else {
         return (
             StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({
-                "code": 400,
-                "error": "`enabled` is required — say true or false explicitly.",
-            })),
+            Json(ErrorResponse {
+                code: 400,
+                error: "`enabled` is required — say true or false explicitly.".into(),
+            }),
         )
             .into_response();
     };
@@ -302,11 +461,15 @@ async fn put_publish(
         }
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "code": 500, "error": e.to_string() })),
+            Json(ErrorResponse { code: 500, error: e.to_string() }),
         )
             .into_response(),
     }
 }
+
+#[derive(utoipa::OpenApi)]
+#[openapi(paths(public_now_playing, get_publish, put_publish))]
+pub struct Api;
 
 pub fn create_public_router() -> Router<Arc<AppState>> {
     Router::new()
@@ -317,6 +480,19 @@ pub fn create_public_router() -> Router<Arc<AppState>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The payload as it goes over the wire.
+    fn pp(
+        np: &crate::server::now_playing::NowPlaying,
+        position: u64,
+        fields: PublicNpFields,
+        username: &str,
+        display_name: Option<&str>,
+        artwork: Option<String>,
+    ) -> serde_json::Value {
+        serde_json::to_value(public_payload(np, position, fields, username, display_name, artwork))
+            .unwrap()
+    }
     use crate::models::Play;
     use crate::server::now_playing::{NowPlaying, Progress};
 
@@ -347,7 +523,7 @@ mod tests {
     #[test]
     fn nothing_beyond_the_base_payload_is_public_by_default() {
         let np = deck();
-        let body = public_payload(&np, 84, PublicNpFields::default(), "ashwin", None, None);
+        let body = pp(&np, 84, PublicNpFields::default(), "ashwin", None, None);
         assert_eq!(keys(&body), ["album", "artist", "name", "playing", "title", "user"]);
     }
 
@@ -358,12 +534,12 @@ mod tests {
     #[test]
     fn each_field_is_its_own_switch() {
         let np = deck();
-        let base = keys(&public_payload(&np, 84, PublicNpFields::default(), "a", None, None));
+        let base = keys(&pp(&np, 84, PublicNpFields::default(), "a", None, None));
 
         for name in PublicNpFields::KNOWN {
             let only = PublicNpFields::from_names([name]);
             let art = (name == "artwork").then(|| "https://example.invalid/a.jpg".to_string());
-            let got = keys(&public_payload(&np, 84, only, "a", None, art));
+            let got = keys(&pp(&np, 84, only, "a", None, art));
             let extra: Vec<&String> = got.iter().filter(|k| !base.contains(k)).collect();
 
             let expected: &[&str] = match name {
@@ -387,7 +563,7 @@ mod tests {
         np.chain_name = None;
         np.listening_context = None;
         let all = PublicNpFields::from_names(PublicNpFields::KNOWN);
-        let body = public_payload(&np, 84, all, "a", None, None);
+        let body = pp(&np, 84, all, "a", None, None);
         let obj = body.as_object().unwrap();
         assert!(!obj.contains_key("chain"), "an unknown chain is omitted, never null");
         assert!(!obj.contains_key("context"));
@@ -401,8 +577,7 @@ mod tests {
     fn a_published_position_says_whether_it_is_a_measurement() {
         let mut np = deck();
         np.position_known = false;
-        let body =
-            public_payload(&np, 84, PublicNpFields::from_names(["position"]), "a", None, None);
+        let body = pp(&np, 84, PublicNpFields::from_names(["position"]), "a", None, None);
         assert_eq!(body["position"], 84);
         assert_eq!(body["position_known"], false);
     }

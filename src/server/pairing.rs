@@ -31,14 +31,16 @@ use axum::{
     routing::{get, post},
     Router,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tracing::{info, warn};
+use utoipa::ToSchema;
 
 use super::auth::AuthUser;
-use super::models::ErrorResponse;
+use super::models::{ErrorResponse, OkResponse};
 use super::AppState;
 use crate::db::{Database, PairingPoll};
+use crate::openapi::{NotFound, Unauthorized};
 
 /// How often a client should poll. Matched to the limiter's tolerance — faster
 /// than this and a client throttles itself out of its own pairing.
@@ -46,7 +48,7 @@ const POLL_INTERVAL_SECS: i64 = 5;
 
 fn err(code: u16, msg: impl Into<String>) -> axum::response::Response {
     let status = StatusCode::from_u16(code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-    (status, Json(serde_json::json!(ErrorResponse { code, error: msg.into() }))).into_response()
+    (status, Json(ErrorResponse { code, error: msg.into() })).into_response()
 }
 
 /// Where to send the user to approve, as something they can actually type.
@@ -106,19 +108,86 @@ fn client_key(state: &AppState, headers: &HeaderMap) -> String {
     "pairing".to_string()
 }
 
-#[derive(Deserialize)]
+/// Both fields are optional, and so is the body.
+#[derive(Deserialize, ToSchema)]
 pub struct StartBody {
     /// What to call the token once it exists — "Pano on Android", "fooyin".
+    /// Shown to the user when approving, so name it per device. At most 60
+    /// characters; `name` is accepted too.
+    // `client_name` is what the published document has always said and what
+    // Tapeout sends; the handler used to read only `name`, so every paired
+    // device arrived as "Paired device". Both spellings are accepted now.
+    #[serde(default, alias = "name")]
+    pub client_name: Option<String>,
+    /// Requested grants, space- or comma-separated: `submit`, `read`,
+    /// `write`. `submit` is always granted; anything else unknown is ignored.
+    /// The approval screen shows the user what they are granting.
     #[serde(default)]
-    pub name: Option<String>,
-    /// Requested grants. `read` is only granted if the approving user leaves it
-    /// ticked, so asking for it here is a request rather than a decision.
-    #[serde(default)]
+    #[schema(example = "submit read write")]
     pub scopes: Option<String>,
 }
 
-/// POST /1/pair/start — unauthenticated; anyone can ask, nobody gets anything
-/// without a human approving it.
+/// A pairing, begun.
+#[derive(Serialize, ToSchema)]
+pub struct PairingStarted {
+    /// Poll `/1/pair/poll` with this. Keep it secret — it collects the token.
+    pub device_code: String,
+    /// The short code for the human to type into Settings → API Tokens, as
+    /// `XXXX-XXXX`.
+    pub user_code: String,
+    /// Where the human goes to approve it, as far as the server can tell from
+    /// the request. A bare path when it cannot.
+    pub verification_uri: String,
+    /// Seconds until the request lapses. Five minutes.
+    pub expires_in: i64,
+    /// Minimum seconds between polls.
+    pub interval: i64,
+}
+
+/// The grants a pairing request asks for, as stored. `submit` always; `read`
+/// and `write` only when asked for by name. Anything else is dropped rather
+/// than stored, so a client cannot invent a scope by asking for it.
+fn requested_scopes(asked: Option<&str>) -> String {
+    let words: Vec<&str> = asked
+        .unwrap_or("")
+        .split(|c: char| c.is_whitespace() || c == ',')
+        .filter(|w| !w.is_empty())
+        .collect();
+    let mut granted = vec!["submit"];
+    for scope in ["read", "write"] {
+        if words.contains(&scope) {
+            granted.push(scope);
+        }
+    }
+    granted.join(" ")
+}
+
+// POST /1/pair/start — unauthenticated; anyone can ask, nobody gets anything
+// without a human approving it.
+/// Begin device-code pairing.
+///
+/// Unauthenticated by design — the client has no credential yet. Returns a
+/// `device_code` to poll with and a short `user_code` for the human to type
+/// into Settings.
+///
+/// Vocabulary echoes RFC 8628 because client authors have met that shape,
+/// but this is **not OAuth**: no client registration, no `client_id`, and
+/// the result is an ordinary Tapedeck token.
+///
+/// The user code is eight characters and therefore guessable, so its safety
+/// is structural: a five-minute window, single use in both directions, rate
+/// limiting, and approval requiring a signed-in session.
+#[utoipa::path(
+    post,
+    path = "/1/pair/start",
+    tag = "Pairing",
+    security(),
+    request_body(content = StartBody, description = "Optional."),
+    responses(
+        (status = 200, description = "Pairing started.", body = PairingStarted),
+        (status = 429, description = "Rate limited.", body = ErrorResponse),
+    )
+)]
 pub async fn start(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -129,9 +198,9 @@ pub async fn start(
         return err(429, format!("Too many pairing attempts. Try again in {retry}s"));
     }
 
-    let body = body.map(|Json(b)| b).unwrap_or(StartBody { name: None, scopes: None });
+    let body = body.map(|Json(b)| b).unwrap_or(StartBody { client_name: None, scopes: None });
     let name = body
-        .name
+        .client_name
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty())
@@ -139,30 +208,29 @@ pub async fn start(
         .chars()
         .take(60)
         .collect::<String>();
-    // Only these two are on offer; anything else is ignored rather than stored,
-    // so a client cannot invent a scope by asking for it.
-    let scopes = match body.scopes.as_deref() {
-        Some(s) if s.split_whitespace().any(|w| w == "read") => "submit read",
-        _ => "submit",
-    };
+    // `write` is on offer since the approval screen learned to say so: a
+    // client like Tapeout asks for `submit read write` in one approval, and
+    // this used to drop the `write` without a word, so every love and upload
+    // it made afterwards was a 403.
+    let scopes = requested_scopes(body.scopes.as_deref());
 
     // Opportunistic cleanup — there is no scheduled job for this and it costs
     // one indexed delete.
     let _ = state.db.purge_expired_pairings().await;
 
-    match state.db.start_pairing(&name, scopes).await {
+    match state.db.start_pairing(&name, &scopes).await {
         Ok((device_code, user_code)) => {
             state.login_limiter.record_failure(&key);
             info!("🔗 Pairing requested for '{}'", name);
             (
                 StatusCode::OK,
-                Json(serde_json::json!({
-                    "device_code": device_code,
-                    "user_code": user_code,
-                    "verification_uri": verification_uri(&state, &headers),
-                    "expires_in": Database::PAIRING_TTL_SECS,
-                    "interval": POLL_INTERVAL_SECS,
-                })),
+                Json(PairingStarted {
+                    device_code,
+                    user_code,
+                    verification_uri: verification_uri(&state, &headers),
+                    expires_in: Database::PAIRING_TTL_SECS,
+                    interval: POLL_INTERVAL_SECS,
+                }),
             )
                 .into_response()
         }
@@ -187,6 +255,26 @@ mod tests {
 
     /// The device shows this on a screen for someone to type. A bare path is
     /// not an address, which is what it used to return.
+    /// `submit` always; `read` and `write` only by name; nothing invented.
+    #[test]
+    fn a_pairing_grants_what_it_asked_for_and_nothing_it_made_up() {
+        assert_eq!(requested_scopes(None), "submit");
+        assert_eq!(requested_scopes(Some("read")), "submit read");
+        assert_eq!(requested_scopes(Some("submit read write")), "submit read write");
+        assert_eq!(requested_scopes(Some("write,read")), "submit read write");
+        assert_eq!(requested_scopes(Some("all admin rewrite")), "submit");
+    }
+
+    /// The published body field is `client_name`; `name` is what the handler
+    /// used to read. Both have to land.
+    #[test]
+    fn the_client_name_is_read_under_either_spelling() {
+        for body in [r#"{"client_name":"fooyin"}"#, r#"{"name":"fooyin"}"#] {
+            let b: StartBody = serde_json::from_str(body).unwrap();
+            assert_eq!(b.client_name.as_deref(), Some("fooyin"), "{body}");
+        }
+    }
+
     #[test]
     fn the_verification_uri_is_somewhere_you_can_actually_go() {
         let plain = hdrs(&[("host", "tapedeck.lan:8080")]);
@@ -221,12 +309,62 @@ mod tests {
     }
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, ToSchema)]
 pub struct PollBody {
     pub device_code: String,
 }
 
-/// POST /1/pair/poll — the client asks whether it has been approved yet.
+/// The token, collected.
+#[derive(Serialize, ToSchema)]
+pub struct PairingApproved {
+    /// Always `approved`.
+    pub status: &'static str,
+    /// The new API token. **In this body and nowhere else** — it is deleted
+    /// from the request the moment it is collected.
+    pub token: String,
+    /// Whose token it is — the account that approved the request.
+    pub user_name: Option<String>,
+}
+
+/// Not collected, and why — RFC 8628's error vocabulary, in Tapedeck's error
+/// shape.
+#[derive(Serialize, ToSchema)]
+pub struct PairingPending {
+    /// Always 400.
+    pub code: u16,
+    /// `authorization_pending` — nobody has approved it yet, keep polling —
+    /// or `expired_token`, which is also what an unknown device code gets.
+    #[schema(pattern = "^(authorization_pending|expired_token)$")]
+    pub error: &'static str,
+    /// Human-readable.
+    pub error_description: &'static str,
+    /// Minimum seconds before the next poll. Only on `authorization_pending`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub interval: Option<i64>,
+}
+
+// POST /1/pair/poll — the client asks whether it has been approved yet.
+/// Poll for approval.
+///
+/// `400 authorization_pending` until approved, then the token **once** — it is
+/// deleted from the request the moment it is collected. Expired and unknown
+/// device codes are both `400 expired_token`, so polling cannot be used to
+/// learn whether a code was ever real.
+#[utoipa::path(
+    post,
+    path = "/1/pair/poll",
+    tag = "Pairing",
+    security(),
+    request_body = PollBody,
+    responses(
+        (status = 200, description = "Approved. The token is in this body and nowhere else.",
+            body = PairingApproved),
+        (status = 400, description = "`authorization_pending` (keep polling) or `expired_token` \
+            (start again).", body = PairingPending),
+        (status = 429, description = "Polling too fast. Back off and keep the pairing alive.",
+            body = ErrorResponse),
+    )
+)]
 pub async fn poll(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -242,22 +380,44 @@ pub async fn poll(
             // Succeeded, so stop counting this client's attempts against it.
             state.login_limiter.reset(&key);
             info!("🔗 Pairing approved and collected");
-            (StatusCode::OK, Json(serde_json::json!({ "status": "approved", "token": token })))
+            // The name a client shows as "paired as …". Looked up from the
+            // token rather than stored on the request: the token is the thing
+            // that now says whose it is.
+            let user_name =
+                state.db.validate_token(&token).await.ok().flatten().map(|t| t.user.username);
+            (StatusCode::OK, Json(PairingApproved { status: "approved", token, user_name }))
                 .into_response()
         }
+        // RFC 8628's shape: pending is a **400** carrying
+        // `authorization_pending`, not a 200. The published document and the
+        // clients built from it (Tapeout) have always expected that, and this
+        // used to answer 200 `{status: "authorization_pending"}` — which such a
+        // client reads as "approved, but sent no token" and gives up on the
+        // first poll.
         Ok(PairingPoll::Pending) => (
-            StatusCode::OK,
-            Json(serde_json::json!({
-                "status": "authorization_pending",
-                "interval": POLL_INTERVAL_SECS,
-            })),
+            StatusCode::BAD_REQUEST,
+            Json(PairingPending {
+                code: 400,
+                error: "authorization_pending",
+                error_description: "Waiting for someone to approve this code in Tapedeck.",
+                interval: Some(POLL_INTERVAL_SECS),
+            }),
         )
             .into_response(),
         // Expired and unknown are reported identically, so polling cannot be
         // used to find out whether a device code was ever real.
         Ok(_) => {
             state.login_limiter.record_failure(&key);
-            err(410, "That pairing request has expired. Start a new one.")
+            (
+                StatusCode::BAD_REQUEST,
+                Json(PairingPending {
+                    code: 400,
+                    error: "expired_token",
+                    error_description: "That pairing request has expired. Start a new one.",
+                    interval: None,
+                }),
+            )
+                .into_response()
         }
         Err(e) => {
             warn!("Pairing poll failed: {}", e);
@@ -266,7 +426,21 @@ pub async fn poll(
     }
 }
 
-/// GET /api/v1/pair/:user_code — what the user is about to approve.
+// GET /api/v1/pair/:user_code — what the user is about to approve.
+/// Describe a pending pairing, for the approval screen.
+///
+/// Requires a signed-in session — this is the browser half.
+#[utoipa::path(
+    get,
+    path = "/api/v1/pair/{user_code}",
+    tag = "Pairing",
+    params(("user_code" = String, Path, description = "As shown on the device, `XXXX-XXXX`.")),
+    responses(
+        (status = 200, description = "OK.", body = PairingRequest),
+        (status = 401, response = Unauthorized),
+        (status = 404, response = NotFound),
+    )
+)]
 pub async fn describe(
     State(state): State<Arc<AppState>>,
     _user: AuthUser,
@@ -275,12 +449,13 @@ pub async fn describe(
     match state.db.pairing_by_user_code(&user_code).await {
         Ok(Some((_, client_name, scopes, approved))) => (
             StatusCode::OK,
-            Json(serde_json::json!({
-                "client_name": client_name,
-                "scopes": scopes,
-                "can_read": scopes.split_whitespace().any(|w| w == "read"),
-                "approved": approved,
-            })),
+            Json(PairingRequest {
+                can_read: scopes.split_whitespace().any(|w| w == "read"),
+                can_write: scopes.split_whitespace().any(|w| w == "write"),
+                client_name,
+                scopes,
+                approved,
+            }),
         )
             .into_response(),
         Ok(None) => err(404, "No pending request for that code"),
@@ -291,19 +466,54 @@ pub async fn describe(
     }
 }
 
-#[derive(Deserialize)]
+/// A pending pairing, for the approval screen.
+#[derive(Serialize, ToSchema)]
+pub struct PairingRequest {
+    /// What the client called itself.
+    pub client_name: String,
+    /// What approving grants, space-separated.
+    pub scopes: String,
+    /// Whether approving grants `read`.
+    pub can_read: bool,
+    /// Whether approving grants `write`.
+    pub can_write: bool,
+    pub approved: bool,
+}
+
+/// The body is optional.
+#[derive(Deserialize, ToSchema)]
 pub struct ApproveBody {
     /// The chain listens from this client should be attributed to — rung 3 of
     /// the ladder, and the reason one token per app is worth the trouble.
+    /// Must be one of your chains.
     #[serde(default)]
     pub default_chain_id: Option<i64>,
 }
 
-/// POST /api/v1/pair/:user_code/approve — mint the token.
+// POST /api/v1/pair/:user_code/approve — mint the token.
+//
+// The token goes to the *polling client*, never into this response: the
+// browser approving a pairing has no use for it, and putting a live credential
+// in a second place is how it ends up in a screenshot.
+/// Approve a pairing request.
 ///
-/// The token goes to the *polling client*, never into this response: the
-/// browser approving a pairing has no use for it, and putting a live credential
-/// in a second place is how it ends up in a screenshot.
+/// Session-only, and single use — approving twice mints nothing the second
+/// time. **The token is never in this response**; it goes to the polling
+/// client. A live credential in a second place is how it ends up in a
+/// screenshot.
+#[utoipa::path(
+    post,
+    path = "/api/v1/pair/{user_code}/approve",
+    tag = "Pairing",
+    params(("user_code" = String, Path, description = "As shown on the device, `XXXX-XXXX`.")),
+    request_body(content = ApproveBody, description = "Optional."),
+    responses(
+        (status = 200, description = "Approved. `status` is `approved`.", body = OkResponse),
+        (status = 400, description = "Not one of your chains.", body = ErrorResponse),
+        (status = 401, response = Unauthorized),
+        (status = 404, response = NotFound),
+    )
+)]
 pub async fn approve(
     State(state): State<Arc<AppState>>,
     user: AuthUser,
@@ -327,7 +537,7 @@ pub async fn approve(
     match state.db.approve_pairing(&user_code, user.user_id, chain).await {
         Ok(true) => {
             info!("🔗 Pairing approved by {}", user.username);
-            (StatusCode::OK, Json(serde_json::json!({ "status": "approved" }))).into_response()
+            (StatusCode::OK, OkResponse::new("approved")).into_response()
         }
         Ok(false) => err(404, "That code is unknown, expired, or already approved"),
         Err(e) => {
@@ -336,6 +546,10 @@ pub async fn approve(
         }
     }
 }
+
+#[derive(utoipa::OpenApi)]
+#[openapi(paths(start, poll, describe, approve))]
+pub struct Api;
 
 pub fn create_pairing_router() -> Router<Arc<AppState>> {
     Router::new()

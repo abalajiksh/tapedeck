@@ -52,6 +52,26 @@ fn esc(s: &str) -> String {
     s.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', " ")
 }
 
+/// Prometheus metrics.
+///
+/// Never open — an **admin** session, or `Authorization: Bearer
+/// $TAPEDECK_METRICS_TOKEN`. The metrics that matter are the per-job import
+/// gauges and `process_resident_memory_bytes` (Linux only), which is what
+/// distinguishes a stall from a slowdown from an OOM on a small host.
+#[utoipa::path(
+    get,
+    path = "/metrics",
+    tag = "Ops",
+    security(("metricsBearer" = []), ("sessionCookie" = [])),
+    responses(
+        (status = 200, description = "Prometheus text exposition format.", body = String,
+            content_type = "text/plain"),
+        (status = 401, description = "Neither the bearer token nor an **admin** session. A \
+            non-admin session is refused the same way — every gauge is instance-wide. The body \
+            is plain text saying how to get in, not the JSON error.", body = String,
+            content_type = "text/plain"),
+    )
+)]
 async fn metrics(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
     // ── auth ──
     let bearer = headers
@@ -190,6 +210,10 @@ fn extract_session_cookie_from(headers: &HeaderMap) -> Option<String> {
         .split(';')
         .find_map(|c| c.trim().strip_prefix("td_session=").map(|v| v.to_string()))
 }
+
+#[derive(utoipa::OpenApi)]
+#[openapi(paths(metrics))]
+pub struct Api;
 
 pub fn create_metrics_router() -> Router<Arc<AppState>> {
     Router::new().route("/metrics", get(metrics))

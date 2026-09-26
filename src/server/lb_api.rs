@@ -30,16 +30,19 @@ use axum::{
     routing::{get, post},
     Router,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use utoipa::{IntoParams, ToSchema};
 
 use super::auth::IngestAuth;
+use super::models::{ErrorResponse, OkResponse};
 use super::AppState;
 use crate::db::ScrobbleRecord;
+use crate::openapi::{BadRequest, Forbidden, NotFound, Unauthorized};
 
 fn error(code: u16, msg: impl Into<String>) -> axum::response::Response {
     let status = StatusCode::from_u16(code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-    (status, Json(serde_json::json!({ "code": code, "error": msg.into() }))).into_response()
+    (status, Json(ErrorResponse { code, error: msg.into() })).into_response()
 }
 
 /// Resolve the `{user}` path segment, enforcing that it's the caller (or that
@@ -63,125 +66,243 @@ async fn authorize_for(
     }
 }
 
-/// A stored listen in ListenBrainz's shape. Tapedeck's audio-quality extensions
-/// ride along in `additional_info` under the same keys the ingest API accepts,
-/// so a listen submitted to Tapedeck reads back the way it went in.
-fn to_lb_listen(s: &ScrobbleRecord, include_listened_at: bool) -> serde_json::Value {
-    let mut additional = serde_json::Map::new();
-    if let Some(d) = s.duration {
-        additional.insert("duration_ms".into(), serde_json::json!(d * 1000));
-    }
-    if let Some(ref m) = s.mbid_recording {
-        additional.insert("recording_mbid".into(), serde_json::json!(m));
-    }
-    if let Some(ref m) = s.mbid_release {
-        additional.insert("release_mbid".into(), serde_json::json!(m));
-    }
-    if let Some(ref m) = s.mbid_artist {
-        // Stored as a JSON array string; pass it through as an array when it parses.
-        match serde_json::from_str::<serde_json::Value>(m) {
-            Ok(v) if v.is_array() => {
-                additional.insert("artist_mbids".into(), v);
-            }
-            _ => {
-                additional.insert("artist_mbids".into(), serde_json::json!([m]));
-            }
-        }
-    }
-    if let Some(ref c) = s.submission_client {
-        additional.insert("submission_client".into(), serde_json::json!(c));
-    }
-    if let Some(n) = s.track_number {
-        additional.insert("track_number".into(), serde_json::json!(n));
-    }
-
-    let mut audio = serde_json::Map::new();
-    if let Some(ref v) = s.format_type {
-        audio.insert("format_type".into(), serde_json::json!(v));
-    }
-    if let Some(ref v) = s.codec {
-        audio.insert("codec".into(), serde_json::json!(v));
-    }
-    if let Some(v) = s.bitrate {
-        audio.insert("bitrate".into(), serde_json::json!(v));
-    }
-    if let Some(v) = s.sample_rate {
-        audio.insert("sample_rate".into(), serde_json::json!(v));
-    }
-    if let Some(v) = s.bit_depth {
-        audio.insert("bit_depth".into(), serde_json::json!(v));
-    }
-    if let Some(v) = s.channels {
-        audio.insert("channels".into(), serde_json::json!(v));
-    }
-    if let Some(ref v) = s.container {
-        audio.insert("container".into(), serde_json::json!(v));
-    }
-    if let Some(ref v) = s.source_quality {
-        audio.insert("source_quality".into(), serde_json::json!(v));
-    }
-    if let Some(v) = s.is_lossless {
-        audio.insert("is_lossless".into(), serde_json::json!(v));
-    }
-    if let Some(v) = s.dsd_rate {
-        audio.insert("dsd_rate".into(), serde_json::json!(v));
-    }
-    if let Some(v) = s.dsd_multiplier {
-        audio.insert("dsd_multiplier".into(), serde_json::json!(v));
-    }
-    if let Some(v) = s.dsd_to_pcm_converted {
-        audio.insert("dsd_to_pcm_converted".into(), serde_json::json!(v));
-    }
-    if let Some(ref v) = s.delivery_codec {
-        audio.insert("delivery_codec".into(), serde_json::json!(v));
-    }
-    if let Some(v) = s.delivery_bitrate {
-        audio.insert("delivery_bitrate".into(), serde_json::json!(v));
-    }
-    if let Some(v) = s.delivery_sample_rate {
-        audio.insert("delivery_sample_rate".into(), serde_json::json!(v));
-    }
-    if let Some(v) = s.delivery_bit_depth {
-        audio.insert("delivery_bit_depth".into(), serde_json::json!(v));
-    }
-    if let Some(v) = s.is_transcoded {
-        audio.insert("is_transcoded".into(), serde_json::json!(v));
-    }
-    if let Some(ref v) = s.transcode_reason {
-        audio.insert("transcode_reason".into(), serde_json::json!(v));
-    }
-    // `quality_score` is deliberately not emitted. It is derived, written once
-    // at ingest, and re-importing it would fossilise a number computed under
-    // whatever formula was current then — the reader should recompute from the
-    // measurements above, which are the facts.
-    if !audio.is_empty() {
-        additional.insert("tapedeck_audio".into(), serde_json::Value::Object(audio));
-    }
-
-    let mut listen = serde_json::Map::new();
-    if include_listened_at {
-        listen.insert("listened_at".into(), serde_json::json!(s.timestamp));
-    }
-    listen.insert(
-        "track_metadata".into(),
-        serde_json::json!({
-            "artist_name": s.artist,
-            "track_name": s.title,
-            "release_name": s.album,
-            "additional_info": serde_json::Value::Object(additional),
-        }),
-    );
-    serde_json::Value::Object(listen)
+/// A listen in ListenBrainz's shape. Tapedeck's audio-quality extensions
+/// ride along in `additional_info.tapedeck_audio` under the keys the ingest
+/// API accepts, so a listen submitted to Tapedeck reads back the way it went
+/// in.
+#[derive(Serialize, ToSchema)]
+pub struct LbListen {
+    /// Unix seconds. **Absent on a now-playing entry** — that is how a client
+    /// tells it apart from history.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub listened_at: Option<i64>,
+    pub track_metadata: LbTrackMetadata,
+    /// Only on a now-playing entry, and then `true`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub playing_now: Option<bool>,
 }
 
-#[derive(Deserialize)]
+#[derive(Serialize, ToSchema)]
+pub struct LbTrackMetadata {
+    pub artist_name: String,
+    pub track_name: String,
+    pub release_name: Option<String>,
+    pub additional_info: LbAdditionalInfo,
+}
+
+/// Every key is omitted when unknown rather than sent as null.
+#[derive(Serialize, ToSchema, Default)]
+pub struct LbAdditionalInfo {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recording_mbid: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub release_mbid: Option<String>,
+    // Stored as a JSON array string; passed through as the array when it
+    // parses, wrapped as a one-element array when it does not.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = Option<Vec<String>>)]
+    pub artist_mbids: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub submission_client: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub track_number: Option<i32>,
+    /// Present when any audio detail is known.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tapedeck_audio: Option<LbAudio>,
+}
+
+/// The `tapedeck_audio` object a client submitted, read back. Every key is
+/// omitted when unknown.
+///
+/// `quality_score` is deliberately absent: it is derived, and a reader should
+/// recompute it from the measurements, which are the facts.
+// Re-importing a score would fossilise a number computed under whatever
+// formula was current when the listen arrived.
+#[derive(Serialize, ToSchema, Default)]
+pub struct LbAudio {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub format_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub codec: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bitrate: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sample_rate: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bit_depth: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub channels: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub container: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_quality: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub is_lossless: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dsd_rate: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dsd_multiplier: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dsd_to_pcm_converted: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delivery_codec: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delivery_bitrate: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delivery_sample_rate: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delivery_bit_depth: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub is_transcoded: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub transcode_reason: Option<String>,
+}
+
+impl LbAudio {
+    fn is_empty(&self) -> bool {
+        serde_json::to_value(self).ok().and_then(|v| v.as_object().map(|o| o.is_empty()))
+            == Some(true)
+    }
+}
+
+fn to_lb_listen(s: &ScrobbleRecord, include_listened_at: bool) -> LbListen {
+    let artist_mbids = s.mbid_artist.as_ref().map(|m| {
+        // Stored as a JSON array string; pass it through as an array when it parses.
+        match serde_json::from_str::<serde_json::Value>(m) {
+            Ok(v) if v.is_array() => v,
+            _ => serde_json::json!([m]),
+        }
+    });
+    let audio = LbAudio {
+        format_type: s.format_type.clone(),
+        codec: s.codec.clone(),
+        bitrate: s.bitrate,
+        sample_rate: s.sample_rate,
+        bit_depth: s.bit_depth,
+        channels: s.channels,
+        container: s.container.clone(),
+        source_quality: s.source_quality.clone(),
+        is_lossless: s.is_lossless,
+        dsd_rate: s.dsd_rate,
+        dsd_multiplier: s.dsd_multiplier,
+        dsd_to_pcm_converted: s.dsd_to_pcm_converted,
+        delivery_codec: s.delivery_codec.clone(),
+        delivery_bitrate: s.delivery_bitrate,
+        delivery_sample_rate: s.delivery_sample_rate,
+        delivery_bit_depth: s.delivery_bit_depth,
+        is_transcoded: s.is_transcoded,
+        transcode_reason: s.transcode_reason.clone(),
+    };
+    LbListen {
+        listened_at: include_listened_at.then_some(s.timestamp),
+        track_metadata: LbTrackMetadata {
+            artist_name: s.artist.clone(),
+            track_name: s.title.clone(),
+            release_name: s.album.clone(),
+            additional_info: LbAdditionalInfo {
+                duration_ms: s.duration.map(|d| d * 1000),
+                recording_mbid: s.mbid_recording.clone(),
+                release_mbid: s.mbid_release.clone(),
+                artist_mbids,
+                submission_client: s.submission_client.clone(),
+                track_number: s.track_number,
+                tapedeck_audio: (!audio.is_empty()).then_some(audio),
+            },
+        },
+        playing_now: None,
+    }
+}
+
+/// ListenBrainz wraps every read in `payload`.
+#[derive(Serialize, ToSchema)]
+pub struct LbListensResponse {
+    pub payload: LbListensPayload,
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct LbListensPayload {
+    pub count: usize,
+    /// The username asked for, as given in the path.
+    pub user_id: String,
+    pub listens: Vec<LbListen>,
+    /// The newest listen's timestamp, or 0 with none.
+    pub latest_listen_ts: i64,
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct LbPlayingNowResponse {
+    pub payload: LbPlayingNowPayload,
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct LbPlayingNowPayload {
+    /// 0 when nothing is playing, else 1.
+    pub count: usize,
+    pub user_id: String,
+    pub listens: Vec<LbListen>,
+    /// Always `true`.
+    pub playing_now: bool,
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct LbCountResponse {
+    pub payload: LbCount,
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct LbCount {
+    /// Every listen, skips excluded.
+    pub count: i64,
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct LbServices {
+    pub user_name: String,
+    /// The forwarding services connected: `lastfm`, `listenbrainz`, `librefm`.
+    pub services: Vec<String>,
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct LbLatestImport {
+    /// The username asked about.
+    pub musicbrainz_id: String,
+    /// Unix seconds; 0 when none was ever recorded.
+    pub latest_import: i64,
+}
+
+#[derive(Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
 pub struct ListensQuery {
+    /// Only listens strictly before this, unix seconds. Not with `min_ts`.
     max_ts: Option<i64>,
+    /// Only listens strictly after this, unix seconds. Not with `max_ts`.
     min_ts: Option<i64>,
+    /// How many, newest first. 25 by default, at most 1000.
+    #[param(minimum = 1, maximum = 1000, default = 25)]
     count: Option<i64>,
 }
 
-/// GET /1/user/:user/listens
+/// A user's listens, LB-shaped.
+///
+/// **Scoped to the caller.** LB serves this publicly; a self-hosted instance
+/// must not, so asking for another user's listens is refused unless the caller
+/// is an admin. Newest first.
+#[utoipa::path(
+    get,
+    path = "/1/user/{user}/listens",
+    tag = "ListenBrainz",
+    security(("apiToken" = []), ("sessionCookie" = [])),
+    params(("user" = String, Path, description = "Your own username."), ListensQuery),
+    responses(
+        (status = 200, description = "OK.", body = LbListensResponse),
+        (status = 400, response = BadRequest),
+        (status = 401, response = Unauthorized),
+        (status = 403, response = Forbidden),
+        (status = 404, response = NotFound),
+    )
+)]
 async fn user_listens(
     State(state): State<Arc<AppState>>,
     IngestAuth { user: caller, .. }: IngestAuth,
@@ -209,23 +330,37 @@ async fn user_listens(
         Err(e) => return error(500, e.to_string()),
     };
     let (_, latest) = state.db.listen_count_and_latest(user_id).await.unwrap_or((0, None));
-    let listens: Vec<serde_json::Value> = rows.iter().map(|s| to_lb_listen(s, true)).collect();
+    let listens: Vec<LbListen> = rows.iter().map(|s| to_lb_listen(s, true)).collect();
 
     (
         StatusCode::OK,
-        Json(serde_json::json!({
-            "payload": {
-                "count": listens.len(),
-                "user_id": user,
-                "listens": listens,
-                "latest_listen_ts": latest.unwrap_or(0),
-            }
-        })),
+        Json(LbListensResponse {
+            payload: LbListensPayload {
+                count: listens.len(),
+                user_id: user,
+                listens,
+                latest_listen_ts: latest.unwrap_or(0),
+            },
+        }),
     )
         .into_response()
 }
 
-/// GET /1/user/:user/playing-now
+/// What is on the deck, LB-shaped.
+#[utoipa::path(
+    get,
+    path = "/1/user/{user}/playing-now",
+    tag = "ListenBrainz",
+    security(("apiToken" = []), ("sessionCookie" = [])),
+    params(("user" = String, Path, description = "Your own username.")),
+    responses(
+        (status = 200, description = "OK. `count` is 0 when nothing is playing.",
+            body = LbPlayingNowResponse),
+        (status = 401, response = Unauthorized),
+        (status = 403, response = Forbidden),
+        (status = 404, response = NotFound),
+    )
+)]
 async fn user_playing_now(
     State(state): State<Arc<AppState>>,
     IngestAuth { user: caller, .. }: IngestAuth,
@@ -238,40 +373,51 @@ async fn user_playing_now(
 
     // A now-playing listen carries no `listened_at` — that's how clients tell
     // it apart from history.
-    let listens: Vec<serde_json::Value> = match state.now_playing.get(user_id) {
-        Some((np, _)) => {
-            let mut additional = serde_json::Map::new();
-            if let Some(d) = np.duration {
-                additional.insert("duration_ms".into(), serde_json::json!(d * 1000));
-            }
-            vec![serde_json::json!({
-                "track_metadata": {
-                    "artist_name": np.artist,
-                    "track_name": np.title,
-                    "release_name": np.album,
-                    "additional_info": serde_json::Value::Object(additional),
+    let listens: Vec<LbListen> = match state.now_playing.get(user_id) {
+        Some((np, _)) => vec![LbListen {
+            listened_at: None,
+            track_metadata: LbTrackMetadata {
+                artist_name: np.artist.clone(),
+                track_name: np.title.clone(),
+                release_name: np.album.clone(),
+                additional_info: LbAdditionalInfo {
+                    duration_ms: np.duration.map(|d| d as i64 * 1000),
+                    ..Default::default()
                 },
-                "playing_now": true,
-            })]
-        }
+            },
+            playing_now: Some(true),
+        }],
         None => Vec::new(),
     };
 
     (
         StatusCode::OK,
-        Json(serde_json::json!({
-            "payload": {
-                "count": listens.len(),
-                "user_id": user,
-                "listens": listens,
-                "playing_now": true,
-            }
-        })),
+        Json(LbPlayingNowResponse {
+            payload: LbPlayingNowPayload {
+                count: listens.len(),
+                user_id: user,
+                listens,
+                playing_now: true,
+            },
+        }),
     )
         .into_response()
 }
 
-/// GET /1/user/:user/listen-count
+/// Total listens. Excludes skips.
+#[utoipa::path(
+    get,
+    path = "/1/user/{user}/listen-count",
+    tag = "ListenBrainz",
+    security(("apiToken" = []), ("sessionCookie" = [])),
+    params(("user" = String, Path, description = "Your own username.")),
+    responses(
+        (status = 200, description = "OK.", body = LbCountResponse),
+        (status = 401, response = Unauthorized),
+        (status = 403, response = Forbidden),
+        (status = 404, response = NotFound),
+    )
+)]
 async fn user_listen_count(
     State(state): State<Arc<AppState>>,
     IngestAuth { user: caller, .. }: IngestAuth,
@@ -282,18 +428,28 @@ async fn user_listen_count(
         Err(resp) => return resp,
     };
     match state.db.listen_count_and_latest(user_id).await {
-        Ok((count, _)) => (
-            StatusCode::OK,
-            Json(serde_json::json!({
-                "payload": { "count": count }
-            })),
-        )
-            .into_response(),
+        Ok((count, _)) => {
+            (StatusCode::OK, Json(LbCountResponse { payload: LbCount { count } })).into_response()
+        }
         Err(e) => error(500, e.to_string()),
     }
 }
 
-/// GET /1/user/:user/services — which scrobble services this user has connected.
+// GET /1/user/:user/services — which scrobble services this user has connected.
+/// Connected forwarding services.
+#[utoipa::path(
+    get,
+    path = "/1/user/{user}/services",
+    tag = "ListenBrainz",
+    security(("apiToken" = []), ("sessionCookie" = [])),
+    params(("user" = String, Path, description = "Your own username.")),
+    responses(
+        (status = 200, description = "OK.", body = LbServices),
+        (status = 401, response = Unauthorized),
+        (status = 403, response = Forbidden),
+        (status = 404, response = NotFound),
+    )
+)]
 async fn user_services(
     State(state): State<Arc<AppState>>,
     IngestAuth { user: caller, .. }: IngestAuth,
@@ -306,25 +462,30 @@ async fn user_services(
     match state.db.list_connections(user_id).await {
         Ok(rows) => {
             let services: Vec<String> = rows.into_iter().map(|(s, _, _)| s).collect();
-            (
-                StatusCode::OK,
-                Json(serde_json::json!({
-                    "user_name": user, "services": services,
-                })),
-            )
-                .into_response()
+            (StatusCode::OK, Json(LbServices { user_name: user, services })).into_response()
         }
         Err(e) => error(500, e.to_string()),
     }
 }
 
-/// POST /1/playing-now/delete — stop reporting this user as playing.
+// POST /1/playing-now/delete — stop reporting this user as playing.
+/// Clear the caller's now-playing entry.
+#[utoipa::path(
+    post,
+    path = "/1/playing-now/delete",
+    tag = "ListenBrainz",
+    security(("apiToken" = []), ("sessionCookie" = [])),
+    responses(
+        (status = 200, description = "Cleared. `status` is `ok`.", body = OkResponse),
+        (status = 401, response = Unauthorized),
+    )
+)]
 async fn playing_now_delete(
     State(state): State<Arc<AppState>>,
     IngestAuth { user: caller, .. }: IngestAuth,
 ) -> impl IntoResponse {
     state.now_playing.clear_user(caller.user_id);
-    (StatusCode::OK, Json(serde_json::json!({ "status": "ok" }))).into_response()
+    (StatusCode::OK, OkResponse::new("ok")).into_response()
 }
 
 // ── latest-import ──
@@ -333,12 +494,30 @@ async fn playing_now_delete(
 // write the new high-water mark back. Stored in the user's settings blob rather
 // than its own table — it's one integer per user.
 
-#[derive(Deserialize)]
+#[derive(Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
 pub struct LatestImportQuery {
+    /// Whose bookmark. Defaults to the caller; anyone else's is admin-only.
     user_name: Option<String>,
 }
 
-/// GET /1/latest-import?user_name=…
+/// Timestamp of the caller's most recent import.
+///
+/// Importers use this as a bookmark: read the timestamp, fetch everything
+/// newer, write the new high-water mark back.
+#[utoipa::path(
+    get,
+    path = "/1/latest-import",
+    tag = "ListenBrainz",
+    security(("apiToken" = []), ("sessionCookie" = [])),
+    params(LatestImportQuery),
+    responses(
+        (status = 200, description = "OK.", body = LbLatestImport),
+        (status = 401, response = Unauthorized),
+        (status = 403, response = Forbidden),
+        (status = 404, response = NotFound),
+    )
+)]
 async fn get_latest_import(
     State(state): State<Arc<AppState>>,
     IngestAuth { user: caller, .. }: IngestAuth,
@@ -356,21 +535,33 @@ async fn get_latest_import(
         .ok()
         .and_then(|p| p.get("latest_import").and_then(|v| v.as_i64()))
         .unwrap_or(0);
-    (
-        StatusCode::OK,
-        Json(serde_json::json!({
-            "musicbrainz_id": user, "latest_import": ts,
-        })),
-    )
+    (StatusCode::OK, Json(LbLatestImport { musicbrainz_id: user, latest_import: ts }))
         .into_response()
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, ToSchema)]
 pub struct LatestImportBody {
+    /// Unix seconds. Not negative.
+    #[schema(minimum = 0)]
     ts: i64,
 }
 
-/// POST /1/latest-import — body `{"ts": <unix seconds>}`, always the caller's own.
+// POST /1/latest-import — body `{"ts": <unix seconds>}`, always the caller's own.
+/// Record an import high-water mark.
+///
+/// Always the caller's own.
+#[utoipa::path(
+    post,
+    path = "/1/latest-import",
+    tag = "ListenBrainz",
+    security(("apiToken" = []), ("sessionCookie" = [])),
+    request_body = LatestImportBody,
+    responses(
+        (status = 200, description = "Stored. `status` is `ok`.", body = OkResponse),
+        (status = 400, response = BadRequest),
+        (status = 401, response = Unauthorized),
+    )
+)]
 async fn set_latest_import(
     State(state): State<Arc<AppState>>,
     IngestAuth { user: caller, .. }: IngestAuth,
@@ -384,10 +575,22 @@ async fn set_latest_import(
         .merge_preferences(caller.user_id, &serde_json::json!({ "latest_import": body.ts }))
         .await
     {
-        Ok(_) => (StatusCode::OK, Json(serde_json::json!({ "status": "ok" }))).into_response(),
+        Ok(_) => (StatusCode::OK, OkResponse::new("ok")).into_response(),
         Err(e) => error(500, e.to_string()),
     }
 }
+
+#[derive(utoipa::OpenApi)]
+#[openapi(paths(
+    user_listens,
+    user_playing_now,
+    user_listen_count,
+    user_services,
+    playing_now_delete,
+    get_latest_import,
+    set_latest_import,
+))]
+pub struct Api;
 
 pub fn create_lb_api_router() -> Router<Arc<AppState>> {
     // axum 0.7 path syntax — `:user`, not `{user}`.

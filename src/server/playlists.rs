@@ -32,15 +32,17 @@ use axum::{
     routing::{get, post},
     Router,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tracing::{debug, info, warn};
+use utoipa::ToSchema;
 
 use super::auth::AuthUser;
 use super::models::ErrorResponse;
 use super::AppState;
-use crate::db::UserSource;
-use crate::playlists::{self, PlaylistTarget, PlaylistTrack};
+use crate::db::{PlaylistTrackView, SavedPlaylistRecord, UserSource};
+use crate::openapi::{BadRequest, Unauthorized};
+use crate::playlists::{self, Miss, PlaylistTarget, PlaylistTrack};
 use crate::sources::{MediaBrowserSource, NavidromeSource, PlexFilters, PlexSource};
 
 /// How many tracks one push may carry.
@@ -51,9 +53,91 @@ use crate::sources::{MediaBrowserSource, NavidromeSource, PlexFilters, PlexSourc
 /// playlist half made.
 const MAX_TRACKS: usize = 100;
 
+/// A server this user can push a playlist to.
+#[derive(Clone, Serialize, ToSchema)]
+#[schema(as = PushTarget)]
+pub struct TargetView {
+    /// What `source_id` takes. `-1` is TIDAL, which is a connection rather
+    /// than a source.
+    pub source_id: i64,
+    /// `plex`, `jellyfin`, `navidrome` or `tidal`.
+    pub kind: String,
+    /// `Plex`, `Jellyfin`, `Subsonic` or `TIDAL`.
+    pub protocol: &'static str,
+    /// Falls back to the protocol name when the source has none.
+    pub label: String,
+    pub account: Option<String>,
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct PushTargets {
+    /// Enabled, writable sources, and TIDAL when it is connected. Empty is a
+    /// normal answer.
+    pub targets: Vec<TargetView>,
+}
+
+/// What was made, and **every track that did not land**, with why.
+#[derive(Serialize, ToSchema)]
+pub struct PlaylistPushed {
+    /// The server's own id. Empty when a Subsonic server answered `ok`
+    /// without one.
+    pub playlist_id: String,
+    pub name: String,
+    pub protocol: &'static str,
+    pub target: TargetView,
+    pub requested: usize,
+    pub matched: usize,
+    /// How many were answered from remembered matches without asking the far
+    /// end. Nearly everything on a re-push.
+    pub from_cache: usize,
+    /// A partial match is the normal outcome — a listening history is not the
+    /// same set as any one library.
+    pub missing: Vec<MissingTrack>,
+    /// A playlist of this name was pushed here before and was rewritten in
+    /// place rather than made again.
+    pub updated_existing: bool,
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct MissingTrack {
+    pub title: String,
+    pub artist: String,
+    pub album: Option<String>,
+    #[serde(flatten)]
+    pub why: Miss,
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct SavedPlaylists {
+    pub playlists: Vec<SavedPlaylistRecord>,
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct SavedPlaylistDetail {
+    pub playlist: SavedPlaylistRecord,
+    /// With the plays and artwork the history already holds.
+    pub tracks: Vec<PlaylistTrackView>,
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct PlaylistSaved {
+    pub id: i64,
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct PlaylistDeleted {
+    pub deleted: bool,
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct MatchSet {
+    /// `matched` or `cleared`.
+    pub status: &'static str,
+}
+
 fn err(code: u16, msg: impl Into<String>) -> axum::response::Response {
     let status = StatusCode::from_u16(code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-    (status, Json(serde_json::json!(ErrorResponse { code, error: msg.into() }))).into_response()
+    (status, Json(ErrorResponse { code, error: msg.into() })).into_response()
 }
 
 /// Which source kinds can receive a playlist, and what protocol that is.
@@ -116,36 +200,67 @@ fn build_target(source: &UserSource) -> Result<Box<dyn PlaylistTarget>, String> 
 /// from `AUTOINCREMENT` and are always positive, so this can never collide.
 pub const TIDAL_TARGET_ID: i64 = -1;
 
-fn target_view(s: &UserSource, protocol: &str) -> serde_json::Value {
-    serde_json::json!({
-        "source_id": s.id,
-        "kind": s.kind,
-        "protocol": protocol,
+fn target_view(s: &UserSource, protocol: &'static str) -> TargetView {
+    TargetView {
+        source_id: s.id,
+        kind: s.kind.clone(),
+        protocol,
         // The label is what tells two Plex servers apart; without one, the
         // protocol name is a better button than a blank.
-        "label": if s.label.trim().is_empty() { protocol.to_string() } else { s.label.clone() },
-        "account": s.remote_account,
-    })
+        label: if s.label.trim().is_empty() { protocol.to_string() } else { s.label.clone() },
+        account: s.remote_account.clone(),
+    }
 }
 
-/// GET /api/v1/playlist-targets — the servers this user could push to.
+fn tidal_target() -> TargetView {
+    TargetView {
+        source_id: TIDAL_TARGET_ID,
+        kind: "tidal".into(),
+        protocol: "TIDAL",
+        label: "TIDAL".into(),
+        account: None,
+    }
+}
+
+// GET /api/v1/playlist-targets — the servers this user could push to.
+//
+// Enabled sources only. A disabled source keeps its credentials on purpose, but
+// the user has said they don't want Tapedeck talking to it, and writing a
+// playlist is talking to it.
+/// Servers a generated list can be sent to.
 ///
-/// Enabled sources only. A disabled source keeps its credentials on purpose, but
-/// the user has said they don't want Tapedeck talking to it, and writing a
-/// playlist is talking to it.
+/// Session-only, and permanently so: pushing spends the credential of a
+/// configured source, which puts it on the same side of the line as
+/// `/api/v1/sources` — the line API tokens do not cross.
+///
+/// The targets are the caller's **enabled** sources, filtered to the kinds
+/// that can receive a playlist. `protocol` names the wire protocol rather
+/// than the product, so a Navidrome source reads as `Subsonic`: the calls
+/// are `search3` and `createPlaylist`, which any OpenSubsonic server
+/// answers. A kind missing from the list is a source that polls and cannot
+/// be written to, not a bug.
+#[utoipa::path(
+    get,
+    path = "/api/v1/playlist-targets",
+    tag = "Playlists",
+    responses(
+        (status = 200, description = "OK.", body = PushTargets),
+        (status = 401, response = Unauthorized),
+    )
+)]
 async fn list_targets(State(state): State<Arc<AppState>>, user: AuthUser) -> impl IntoResponse {
     let targets = targets_for(&state, user.user_id).await;
-    (StatusCode::OK, Json(serde_json::json!({ "targets": targets }))).into_response()
+    (StatusCode::OK, Json(PushTargets { targets })).into_response()
 }
 
-/// The push targets for one user, as JSON.
+/// The push targets for one user.
 ///
 /// Split out of the handler so the MCP surface offers exactly the same list.
 /// An empty vec is a normal answer — plenty of instances have no writable
 /// source at all — and both callers say so rather than showing a button or a
 /// tool that cannot work.
-pub async fn targets_for(state: &AppState, user_id: i64) -> Vec<serde_json::Value> {
-    let mut targets: Vec<serde_json::Value> = match state.db.list_sources_for_user(user_id).await {
+pub async fn targets_for(state: &AppState, user_id: i64) -> Vec<TargetView> {
+    let mut targets: Vec<TargetView> = match state.db.list_sources_for_user(user_id).await {
         Ok(rows) => rows
             .iter()
             .filter(|s| s.enabled)
@@ -162,33 +277,66 @@ pub async fn targets_for(state: &AppState, user_id: i64) -> Vec<serde_json::Valu
     // button, which is why the endpoint returns an empty list rather than a
     // disabled entry.
     if crate::server::tidal::credentials(state, user_id).await.is_some() {
-        targets.push(serde_json::json!({
-            "source_id": TIDAL_TARGET_ID,
-            "kind": "tidal",
-            "protocol": "TIDAL",
-            "label": "TIDAL",
-            "account": null,
-        }));
+        targets.push(tidal_target());
     }
     targets
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, ToSchema)]
+#[schema(as = PlaylistPush)]
 struct PushRequest {
+    /// From `/api/v1/playlist-targets`.
     source_id: i64,
+    /// Trimmed, and truncated to 120 characters.
     name: String,
+    /// In playlist order.
+    #[schema(max_items = 100)]
     tracks: Vec<PlaylistTrack>,
 }
 
-/// POST /api/v1/playlists — resolve every track against one server and create
-/// the playlist from whatever was found.
+// POST /api/v1/playlists — resolve every track against one server and create
+// the playlist from whatever was found.
+/// Create a playlist on one of your servers from a list of tracks.
+///
+/// Session-only — see `/api/v1/playlist-targets`.
+///
+/// Tapedeck stores **names, not the server's item ids**, for a generated
+/// list, so every track is resolved by searching the target and every one of
+/// those searches is fuzzy. A hit is checked on artist *and* title before it
+/// is used; an exact title beats a `(Remastered)` one, and a hit for a
+/// different artist is discarded rather than taken.
+///
+/// **A partial push is a success, not an error.** A listening history is not
+/// the same set as any one library, so `matched` below `requested` is the
+/// normal case and `missing` names every track that did not land. The push
+/// only fails outright when nothing matched (`404`) or the server refused or
+/// could not be reached (`502`) — the two need completely different things
+/// from the user, so they are not collapsed.
+///
+/// Order is preserved; misses drop out. At most 100 tracks, which is a
+/// wall-clock bound as much as a politeness one — the searches run in turn
+/// against what is often a Raspberry Pi.
+#[utoipa::path(
+    post,
+    path = "/api/v1/playlists",
+    tag = "Playlists",
+    request_body = PushRequest,
+    responses(
+        (status = 200, description = "Created — possibly with fewer tracks than asked for.", body = PlaylistPushed),
+        (status = 400, response = BadRequest),
+        (status = 401, response = Unauthorized),
+        (status = 404, description = "No such source, or none of those tracks are on it.", body = ErrorResponse),
+        (status = 502, description = "The server refused the playlist or could not be reached.", body = ErrorResponse),
+        (status = 501, description = "TIDAL was named and is not configured on this instance.", body = ErrorResponse),
+    )
+)]
 async fn push(
     State(state): State<Arc<AppState>>,
     user: AuthUser,
     Json(body): Json<PushRequest>,
 ) -> impl IntoResponse {
     match push_tracks(&state, user.user_id, body.source_id, &body.name, &body.tracks).await {
-        Ok(value) => (StatusCode::OK, Json(value)).into_response(),
+        Ok(pushed) => (StatusCode::OK, Json(pushed)).into_response(),
         Err(PushError { code, message }) => err(code, message),
     }
 }
@@ -224,7 +372,7 @@ pub async fn push_tracks(
     source_id: i64,
     name: &str,
     tracks: &[PlaylistTrack],
-) -> Result<serde_json::Value, PushError> {
+) -> Result<PlaylistPushed, PushError> {
     let fail = |code: u16, message: String| PushError { code, message };
 
     let name = name.trim();
@@ -249,14 +397,8 @@ pub async fn push_tracks(
     let mut tidal_handle: Option<std::sync::Arc<crate::tidal::TidalClient>> = None;
     // Built inside whichever branch resolves the target, so the response can
     // describe it without the source row being in scope afterwards.
-    let mut target_desc = serde_json::json!({
-        "source_id": TIDAL_TARGET_ID,
-        "kind": "tidal",
-        "protocol": "TIDAL",
-        "label": "TIDAL",
-        "account": null,
-    });
-    let (protocol, target): (&str, Box<dyn playlists::PlaylistTarget>) = if source_id
+    let mut target_desc = tidal_target();
+    let (protocol, target): (&'static str, Box<dyn playlists::PlaylistTarget>) = if source_id
         == TIDAL_TARGET_ID
     {
         let Some(app) = crate::tidal::TidalApp::resolve(&state.db).await else {
@@ -380,18 +522,13 @@ pub async fn push_tracks(
         }
     }
 
-    let missing_json: Vec<_> = missing
-        .iter()
-        .map(|(t, why)| {
-            let mut o = serde_json::json!({
-                "title": t.title, "artist": t.artist, "album": t.album,
-            });
-            if let (Some(obj), Ok(serde_json::Value::Object(w))) =
-                (o.as_object_mut(), serde_json::to_value(why))
-            {
-                obj.extend(w);
-            }
-            o
+    let missing: Vec<MissingTrack> = missing
+        .into_iter()
+        .map(|(t, why)| MissingTrack {
+            title: t.title.clone(),
+            artist: t.artist.clone(),
+            album: t.album.clone(),
+            why,
         })
         .collect();
 
@@ -467,23 +604,23 @@ pub async fn push_tracks(
             {
                 warn!("Could not remember the pushed playlist: {e}");
             }
-            Ok(serde_json::json!({
-                "playlist_id": playlist_id,
-                "name": name,
-                "protocol": protocol,
-                "target": target_desc,
-                "requested": tracks.len(),
-                "matched": ids.len(),
+            Ok(PlaylistPushed {
+                playlist_id,
+                name,
+                protocol,
+                target: target_desc,
+                requested: tracks.len(),
+                matched: ids.len(),
                 // How much of that was answered without asking the far end.
                 // Worth reporting rather than hiding: on a re-push it should be
                 // nearly everything, and if it is not, the cache is not working.
-                "from_cache": from_cache,
-                "missing": missing_json,
+                from_cache,
+                missing,
                 // So a caller can tell "I made you one" from "I rewrote the one
                 // you already had", which are different things to say to
                 // somebody looking at their library.
-                "updated_existing": reused,
-            }))
+                updated_existing: reused,
+            })
         }
         Err(e) => Err(fail(502, format!("{protocol} refused the playlist: {e}"))),
     }
@@ -499,17 +636,40 @@ pub async fn push_tracks(
 // is the product of a conversation, nobody has looked at it yet, and the point
 // of storing it is that somebody does before it reaches the household's Plex.
 
-/// GET /api/v1/saved-playlists
+/// Playlists kept in Tapedeck.
+///
+/// Session-only. `origin` is `user` for one you built, or the name of the
+/// MCP connection that wrote it — a list an assistant produced stays
+/// distinguishable from one you made, the same provenance rule notes
+/// follow.
+#[utoipa::path(
+    get,
+    path = "/api/v1/saved-playlists",
+    tag = "Playlists",
+    responses(
+        (status = 200, description = "The playlists.", body = SavedPlaylists),
+        (status = 401, response = Unauthorized),
+    )
+)]
 async fn list_saved(State(state): State<Arc<AppState>>, user: AuthUser) -> impl IntoResponse {
     match state.db.list_playlists(user.user_id).await {
-        Ok(rows) => {
-            (StatusCode::OK, Json(serde_json::json!({ "playlists": rows }))).into_response()
-        }
+        Ok(rows) => (StatusCode::OK, Json(SavedPlaylists { playlists: rows })).into_response(),
         Err(e) => err(500, e.to_string()),
     }
 }
 
-/// GET /api/v1/saved-playlists/:id
+/// One playlist and its tracks.
+#[utoipa::path(
+    get,
+    path = "/api/v1/saved-playlists/{id}",
+    tag = "Playlists",
+    params(("id" = i64, Path)),
+    responses(
+        (status = 200, description = "The playlist.", body = SavedPlaylistDetail),
+        (status = 401, response = Unauthorized),
+        (status = 404, description = "No such playlist.", body = ErrorResponse),
+    )
+)]
 async fn get_saved(
     State(state): State<Arc<AppState>>,
     user: AuthUser,
@@ -526,21 +686,37 @@ async fn get_saved(
     // file sitting next to Rediscovery's sleeves.
     match state.db.playlist_tracks_detailed(user.user_id, id).await {
         Ok(tracks) => {
-            (StatusCode::OK, Json(serde_json::json!({ "playlist": meta, "tracks": tracks })))
-                .into_response()
+            (StatusCode::OK, Json(SavedPlaylistDetail { playlist: meta, tracks })).into_response()
         }
         Err(e) => err(500, e.to_string()),
     }
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, ToSchema)]
+#[schema(as = PlaylistToSave)]
 struct SavePlaylistRequest {
     name: String,
     description: Option<String>,
+    /// In playlist order. At least one.
     tracks: Vec<crate::db::SavedPlaylistTrack>,
 }
 
-/// POST /api/v1/saved-playlists
+/// Save a playlist.
+///
+/// Session-only. Tracks are **names, not file paths** — Tapedeck stores no
+/// server item ids for a generated list and resolves them against the real
+/// library at push time.
+#[utoipa::path(
+    post,
+    path = "/api/v1/saved-playlists",
+    tag = "Playlists",
+    request_body = SavePlaylistRequest,
+    responses(
+        (status = 200, description = "Saved.", body = PlaylistSaved),
+        (status = 400, description = "No name, or no tracks.", body = ErrorResponse),
+        (status = 401, response = Unauthorized),
+    )
+)]
 async fn save_saved(
     State(state): State<Arc<AppState>>,
     user: AuthUser,
@@ -568,34 +744,75 @@ async fn save_saved(
         )
         .await
     {
-        Ok((id, _)) => (StatusCode::OK, Json(serde_json::json!({ "id": id }))).into_response(),
+        Ok((id, _)) => (StatusCode::OK, Json(PlaylistSaved { id })).into_response(),
         Err(e) => err(500, e.to_string()),
     }
 }
 
-/// DELETE /api/v1/saved-playlists/:id
+/// Delete a playlist.
+#[utoipa::path(
+    delete,
+    path = "/api/v1/saved-playlists/{id}",
+    tag = "Playlists",
+    params(("id" = i64, Path)),
+    responses(
+        (status = 200, description = "Deleted.", body = PlaylistDeleted),
+        (status = 401, response = Unauthorized),
+        (status = 404, description = "No such playlist.", body = ErrorResponse),
+    )
+)]
 async fn delete_saved(
     State(state): State<Arc<AppState>>,
     user: AuthUser,
     axum::extract::Path(id): axum::extract::Path<i64>,
 ) -> impl IntoResponse {
     match state.db.delete_playlist(user.user_id, id).await {
-        Ok(true) => (StatusCode::OK, Json(serde_json::json!({ "deleted": true }))).into_response(),
+        Ok(true) => (StatusCode::OK, Json(PlaylistDeleted { deleted: true })).into_response(),
         Ok(false) => err(404, "No such playlist"),
         Err(e) => err(500, e.to_string()),
     }
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, ToSchema)]
+#[schema(as = PlaylistDestination)]
 struct PushSavedRequest {
+    /// From `/api/v1/playlist-targets`.
     source_id: i64,
 }
 
-/// POST /api/v1/saved-playlists/:id/push — send a stored playlist onward.
+// POST /api/v1/saved-playlists/:id/push — send a stored playlist onward.
+//
+// The review step the whole design turns on: a list an LLM wrote is saved
+// first and reaches a media server only when the person whose server it is
+// says so.
+/// Send a stored playlist to a media server.
 ///
-/// The review step the whole design turns on: a list an LLM wrote is saved
-/// first and reaches a media server only when the person whose server it is
-/// says so.
+/// Session-only — pushing spends the credential of a configured source,
+/// which is the line `WriteAuth` deliberately does not cross.
+///
+/// **This is the review step the MCP design turns on**: a list an assistant
+/// built is saved first and reaches a media server only when the person
+/// whose server it is says so.
+///
+/// A partial match is the normal outcome — a listening history is not the
+/// same set as any one library — and every track that did not land is
+/// named. `404` means nothing matched; `502` means the server could not be
+/// reached. They need completely different things from the user.
+#[utoipa::path(
+    post,
+    path = "/api/v1/saved-playlists/{id}/push",
+    tag = "Playlists",
+    params(("id" = i64, Path)),
+    request_body = PushSavedRequest,
+    responses(
+        (status = 200, description = "Sent, wholly or partly.", body = PlaylistPushed),
+        (status = 400, description = "The source is off, or cannot receive a playlist.", body = ErrorResponse),
+        (status = 401, response = Unauthorized),
+        (status = 404, description = "No such playlist, or none of the tracks are on that server.", body = ErrorResponse),
+        (status = 502, description = "The server could not be reached, or refused the playlist.", body = ErrorResponse),
+        (status = 501, description = "TIDAL was named and is not configured on this instance.", body = ErrorResponse),
+    )
+)]
 async fn push_saved(
     State(state): State<Arc<AppState>>,
     user: AuthUser,
@@ -625,18 +842,27 @@ async fn push_saved(
         .collect();
 
     match push_tracks(&state, user.user_id, body.source_id, &meta.name, &wanted).await {
-        Ok(value) => {
-            let target = value
-                .get("protocol")
-                .and_then(|v| v.as_str())
-                .unwrap_or("media server")
-                .to_string();
-            let _ = state.db.mark_playlist_pushed(user.user_id, id, &target).await;
-            (StatusCode::OK, Json(value)).into_response()
+        Ok(pushed) => {
+            let _ = state.db.mark_playlist_pushed(user.user_id, id, pushed.protocol).await;
+            (StatusCode::OK, Json(pushed)).into_response()
         }
         Err(PushError { code, message }) => err(code, message),
     }
 }
+
+#[derive(utoipa::OpenApi)]
+#[openapi(paths(
+    list_targets,
+    push,
+    list_saved,
+    save_saved,
+    get_saved,
+    delete_saved,
+    push_saved,
+    set_match,
+    clear_match
+))]
+pub struct Api;
 
 pub fn create_playlists_router() -> Router<Arc<AppState>> {
     Router::new()
@@ -649,13 +875,15 @@ pub fn create_playlists_router() -> Router<Arc<AppState>> {
 }
 
 /// A track the search got wrong, and which of its candidates it really is.
-#[derive(serde::Deserialize)]
+#[derive(serde::Deserialize, ToSchema)]
+#[schema(as = PlaylistMatch)]
 pub struct MatchRequest {
+    /// The target this resolution is for. `-1` is TIDAL.
     pub source_id: i64,
     pub artist: String,
     pub title: String,
-    /// The far end's id, taken from the `offered` list a push reported. Absent
-    /// on the `DELETE`, which forgets the mapping instead.
+    /// An `id` from a miss's `offered` list. Required to record a match;
+    /// ignored by the `DELETE`, which forgets the mapping instead.
     #[serde(default)]
     pub remote_id: Option<String>,
     /// What the far end calls it, so the mapping can be shown back as something
@@ -664,17 +892,42 @@ pub struct MatchRequest {
     pub remote_label: Option<String>,
 }
 
-/// Pin a track to one of the candidates the far end offered.
-///
-/// **This is what makes the resolution cache self-improving.** A push reports
-/// every miss with the candidates that were offered — which is how SE SO NEON,
-/// Kim Jong Wan and Lee Moon Sae were found — and until now that list was a
-/// dead end you read and then went and fixed by hand somewhere else. Choosing
-/// from it writes a `manual` entry, which never expires and is never overwritten
-/// by a later automatic guess: somebody looked at the candidates and settled it,
-/// and a search that already got it wrong once must not be given another vote.
+// Pin a track to one of the candidates the far end offered.
+//
+// **This is what makes the resolution cache self-improving.** A push reports
+// every miss with the candidates that were offered — which is how SE SO NEON,
+// Kim Jong Wan and Lee Moon Sae were found — and until now that list was a
+// dead end you read and then went and fixed by hand somewhere else. Choosing
+// from it writes a `manual` entry, which never expires and is never overwritten
+// by a later automatic guess: somebody looked at the candidates and settled it,
+// and a search that already got it wrong once must not be given another vote.
+//
+// Session-only, like the push it serves.
+/// Pin a track to one of the candidates a push offered.
 ///
 /// Session-only, like the push it serves.
+///
+/// A push reports every miss with the candidates the far end offered.
+/// Until this existed that list was a dead end — plausible names you could
+/// read and not act on. Choosing one records a **manual** resolution, which
+/// never expires and is never overwritten by a later automatic guess: a
+/// person read the candidates and settled it, and a search that already got
+/// it wrong once does not get another vote.
+///
+/// This is also what makes the resolution cache self-improving. Every
+/// successful match is remembered, so a re-push costs almost no searches at
+/// all — which matters because the far end meters them.
+#[utoipa::path(
+    post,
+    path = "/api/v1/playlist-matches",
+    tag = "Playlists",
+    request_body = MatchRequest,
+    responses(
+        (status = 200, description = "Recorded.", body = MatchSet),
+        (status = 400, response = BadRequest),
+        (status = 401, response = Unauthorized),
+    )
+)]
 async fn set_match(
     State(state): State<Arc<AppState>>,
     user: AuthUser,
@@ -699,13 +952,28 @@ async fn set_match(
         )
         .await
     {
-        Ok(()) => Json(serde_json::json!({ "status": "matched" })).into_response(),
+        Ok(()) => Json(MatchSet { status: "matched" }).into_response(),
         Err(e) => err(500, e.to_string()),
     }
 }
 
-/// Forget a mapping — the pick was wrong, or the far end has changed. The next
-/// push searches for it again from scratch.
+// Forget a mapping — the pick was wrong, or the far end has changed. The next
+// push searches for it again from scratch.
+/// Forget a resolution.
+///
+/// Session-only. The pick was wrong, or the far end has changed what it
+/// holds; the next push searches for the track again from scratch. Takes
+/// the same body without `remote_id`.
+#[utoipa::path(
+    delete,
+    path = "/api/v1/playlist-matches",
+    tag = "Playlists",
+    request_body = MatchRequest,
+    responses(
+        (status = 200, description = "Forgotten.", body = MatchSet),
+        (status = 401, response = Unauthorized),
+    )
+)]
 async fn clear_match(
     State(state): State<Arc<AppState>>,
     user: AuthUser,
@@ -716,7 +984,7 @@ async fn clear_match(
         .forget_playlist_match(user.user_id, body.source_id, &body.artist, &body.title)
         .await
     {
-        Ok(()) => Json(serde_json::json!({ "status": "cleared" })).into_response(),
+        Ok(()) => Json(MatchSet { status: "cleared" }).into_response(),
         Err(e) => err(500, e.to_string()),
     }
 }

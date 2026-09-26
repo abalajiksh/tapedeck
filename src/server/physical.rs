@@ -29,15 +29,289 @@ use super::models::ErrorResponse;
 use super::now_playing::{NowPlaying, Progress};
 use super::AppState;
 use crate::db::PhysicalImage;
+use crate::db::{PhysicalRelease, SidePlays};
+use crate::metadata::release_lookup::ReleaseCandidate;
 use crate::metadata::release_lookup::{self, PhysicalTrack};
 use crate::models::{ListenDisposition, Play};
+use crate::openapi::{BadRequest, Bytes, FileUpload, NotFound, Unauthorized};
+use utoipa::{IntoParams, ToSchema};
+
+/// Candidate pressings for what you are holding.
+#[derive(Serialize, ToSchema)]
+pub struct PressingLookup {
+    /// Discogs first when a barcode and a credential are in hand, then
+    /// MusicBrainz.
+    pub candidates: Vec<ReleaseCandidate>,
+    pub discogs_enabled: bool,
+    /// A provider that failed, and why. The others still answered.
+    pub notes: Vec<String>,
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct DiscogsPressing {
+    pub candidate: ReleaseCandidate,
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct Shelf {
+    pub releases: Vec<PhysicalRelease>,
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct ShelfEntry {
+    pub release: PhysicalRelease,
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct Shelved {
+    pub id: i64,
+    /// How many scans came back from the archive.
+    pub images: usize,
+    /// The shelf it went on.
+    pub kind: String,
+    /// Set when the release's own `format` overrode the `kind` asked for — a
+    /// box of CDs looked up by barcode is filed as CDs whatever was picked.
+    pub corrected_from: Option<String>,
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct ShelfItemSaved {
+    /// `ok`.
+    pub status: &'static str,
+    /// The medium changed and the tracklist's sides were re-derived — a
+    /// record's A/B break, or a disc's numbers.
+    pub sides_rewritten: bool,
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct TracklistSaved {
+    /// `ok`.
+    pub status: &'static str,
+    /// Running times that differ from what was stored.
+    pub changed: usize,
+    /// Listens already recorded from these sides that were corrected.
+    pub listens_updated: u64,
+    /// Whole-side plays whose recorded wear was brought back in line.
+    pub plays_recomputed: u64,
+}
+
+/// What another pressing says the tracks run. Nothing is written.
+#[derive(Serialize, ToSchema)]
+pub struct DurationPreview {
+    /// Every track already has a running time; there is nothing to ask.
+    pub complete: bool,
+    pub durations: Vec<DurationProposal>,
+    /// The pressing the running times came from.
+    pub source: Option<DurationSource>,
+    /// The lookup could not be made — MusicBrainz was busy, throttling, or
+    /// did not answer inside this endpoint's own 20-second deadline. **Still a
+    /// 200**, deliberately: an upstream being slow is a normal outcome of
+    /// asking, and a 5xx here is indistinguishable from a reverse proxy's own.
+    /// An empty `durations` without this means the lookup succeeded and found
+    /// nothing.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unavailable: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct DurationSource {
+    pub title: String,
+    pub artist: String,
+    pub year: Option<i64>,
+    pub format: Option<String>,
+    pub country: Option<String>,
+    pub mbid_release: Option<String>,
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct DurationsApplied {
+    /// Tracks that gained a duration. One the shelf already had is never
+    /// overwritten.
+    pub filled: usize,
+    /// Listens already recorded that were corrected.
+    pub listens_updated: u64,
+    /// Side plays whose recorded wear was brought back in line. **Whole-side
+    /// plays only** — a partial play records how many tracks ran but never
+    /// which, so its wear cannot be reconstructed and is left alone.
+    pub plays_recomputed: u64,
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct ShelfDone {
+    /// `ok`, `deleted` or `cleared`.
+    pub status: &'static str,
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct Sides {
+    /// Only sides that have been played, including any recorded under a label
+    /// the tracklist no longer uses.
+    pub sides: Vec<SidePlays>,
+}
+
+/// One scan or photograph of a pressing.
+#[derive(Serialize, ToSchema)]
+#[schema(as = ShelfImage)]
+pub struct ImageView {
+    pub id: i64,
+    pub release_id: i64,
+    /// `front`, `back`, `booklet`, `medium`, `spine`, … Free text rather than
+    /// an enum: the archive's vocabulary grows, and a scan of something it has
+    /// no word for is still a scan.
+    pub kind: String,
+    /// `caa`, `discogs` or `upload`.
+    pub provider: String,
+    /// What to render, whichever provider it came from.
+    pub src: String,
+    pub thumb: String,
+    pub caption: Option<String>,
+    pub position: i64,
+    pub bytes: Option<i64>,
+    pub mime: Option<String>,
+    pub added_at: i64,
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct ShelfImages {
+    pub images: Vec<ImageView>,
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct ImagesFetched {
+    /// Newly stored.
+    pub stored: usize,
+    /// Now held.
+    pub total: usize,
+    /// A provider with nothing to offer or that failed, and why.
+    pub notes: Vec<String>,
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct ScansStored {
+    pub ids: Vec<i64>,
+}
+
+/// A scan of your own copy. Several `file` fields may be sent at once.
+#[derive(ToSchema)]
+#[allow(dead_code)] // describes a multipart body; never constructed
+pub struct ScanUpload {
+    /// JPEG, PNG, WebP, GIF, AVIF or TIFF, at most 24 MB.
+    #[schema(value_type = String, format = Binary)]
+    pub file: Vec<u8>,
+    /// Defaults to `other`.
+    pub kind: Option<String>,
+    pub caption: Option<String>,
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct SideLogged {
+    pub listens_added: usize,
+    pub skipped: usize,
+    pub tracks: usize,
+    /// Running time credited as wear.
+    pub duration_secs: i64,
+    pub started_at: i64,
+    /// The side to reach for next — only when this one ran to its end.
+    pub next_side: Option<String>,
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct DeckReported {
+    /// `ok`.
+    pub status: &'static str,
+    /// A different track from the last report.
+    pub changed: bool,
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct Spin {
+    /// Null when nothing is on the deck.
+    pub spin: Option<SpinView>,
+}
+
+/// The side on the deck, with enough of the record to draw it.
+#[derive(Serialize, ToSchema)]
+pub struct SpinView {
+    pub release_id: i64,
+    pub kind: String,
+    pub artist: String,
+    pub title: String,
+    pub artwork_url: Option<String>,
+    pub mbid_release: Option<String>,
+    pub side: String,
+    pub started_at: i64,
+    /// Null while running.
+    pub paused_at: Option<i64>,
+    /// Seconds spent stopped.
+    pub paused_total: i64,
+    /// Per-track `{position, started_at, skipped}`, as the deck wrote them.
+    #[schema(value_type = Vec<Object>)]
+    pub outcomes: serde_json::Value,
+    pub chain_id: Option<i64>,
+    pub equipment_id: Option<i64>,
+    /// How far into the side this spin began — non-zero when the needle was
+    /// dropped mid-side, or a tape resumed from where it was parked.
+    pub start_secs: i64,
+    pub updated_at: i64,
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct GearWear {
+    /// To one decimal place.
+    pub hours: f64,
+    pub sides_played: i64,
+}
+
+/// Whether Discogs is configured, and never the credential.
+#[derive(Serialize, ToSchema)]
+pub struct DiscogsSettings {
+    pub configured: bool,
+    pub from_env: bool,
+    pub stored: bool,
+    /// Which credential shape is in use: `token`, `key_secret` or `none`.
+    pub kind: &'static str,
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct DiscogsConfigured {
+    pub configured: bool,
+}
+
+/// A rejection is a 200 with `ok: false`: the request succeeded and the answer
+/// is no.
+#[derive(Serialize, ToSchema)]
+pub struct DiscogsCheck {
+    pub ok: bool,
+    /// Discogs' own words, which name the credential shape it rejected.
+    pub message: String,
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct ShelfImported {
+    /// Pressings added.
+    pub releases: usize,
+    /// Matched an existing pressing and left alone.
+    pub already_on_the_shelf: usize,
+    /// Entries that could not be read.
+    pub skipped: usize,
+    pub gear: usize,
+    pub images: usize,
+    /// Listed in the manifest but absent from the archive.
+    pub missing_scans: usize,
+    /// Sides played, restored.
+    pub plays: usize,
+    /// What a shelf export cannot carry.
+    pub note: &'static str,
+}
 
 /// Where an admin-set Discogs token lives.
 pub const DISCOGS_TOKEN_KEY: &str = "discogs_token";
 
 fn err(code: u16, msg: impl Into<String>) -> axum::response::Response {
     let status = StatusCode::from_u16(code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-    (status, Json(serde_json::json!(ErrorResponse { code, error: msg.into() }))).into_response()
+    (status, Json(ErrorResponse { code, error: msg.into() })).into_response()
 }
 
 /// Where an admin-set consumer key/secret pair lives.
@@ -100,20 +374,41 @@ async fn discogs_auth(state: &AppState) -> Option<release_lookup::DiscogsAuth> {
 //  Looking up what you're holding
 // ════════════════════════════════════════════════════════════
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
 pub struct LookupQuery {
     /// Scanned off the sleeve or the spine.
     pub barcode: Option<String>,
     /// The label's catalogue number, which is on the spine when the barcode
     /// isn't — and is the only identifier on most pre-1980 pressings.
     pub catalog_number: Option<String>,
+    /// With `release`, when there is neither.
     pub artist: Option<String>,
     pub release: Option<String>,
     /// `vinyl`, `cassette`, `cd` or `sacd`; narrows the format filter.
     pub kind: Option<String>,
 }
 
-/// GET /api/v1/physical/lookup — find the pressing.
+// GET /api/v1/physical/lookup — find the pressing.
+/// Resolve a barcode to a pressing.
+///
+/// Session-only. Discogs first when configured — it catalogues *pressings*,
+/// so a barcode usually resolves to the exact edition, often with real side
+/// letters that MusicBrainz lacks. Falls back to MusicBrainz.
+///
+/// Barcodes may be sent with or without the printed spacing; the unspaced
+/// form a scanner produces matches slightly **more** often.
+#[utoipa::path(
+    get,
+    path = "/api/v1/physical/lookup",
+    tag = "Shelf",
+    params(LookupQuery),
+    responses(
+        (status = 200, description = "OK.", body = PressingLookup),
+        (status = 400, description = "Nothing to look up by.", body = ErrorResponse),
+        (status = 401, response = Unauthorized),
+    )
+)]
 async fn lookup(
     State(state): State<Arc<AppState>>,
     _user: AuthUser,
@@ -180,22 +475,29 @@ async fn lookup(
         }
     }
 
-    (
-        StatusCode::OK,
-        Json(serde_json::json!({
-            "candidates": candidates,
-            "discogs_enabled": auth.is_some(),
-            "notes": notes,
-        })),
-    )
+    (StatusCode::OK, Json(PressingLookup { candidates, discogs_enabled: auth.is_some(), notes }))
         .into_response()
 }
 
-/// GET /api/v1/physical/discogs/:id — one Discogs release, with its tracklist.
-///
-/// Separate from search because the search endpoint carries no tracklist:
-/// browsing ten results would otherwise be ten extra calls against a
-/// rate-limited API for nine releases nobody picked.
+// GET /api/v1/physical/discogs/:id — one Discogs release, with its tracklist.
+//
+// Separate from search because the search endpoint carries no tracklist:
+// browsing ten results would otherwise be ten extra calls against a
+// rate-limited API for nine releases nobody picked.
+/// A Discogs release, with its tracklist positions.
+#[utoipa::path(
+    get,
+    path = "/api/v1/physical/discogs/{id}",
+    tag = "Shelf",
+    params(("id" = String, Path)),
+    responses(
+        (status = 200, description = "OK.", body = DiscogsPressing),
+        (status = 400, description = "Discogs is not configured on this server.", body = ErrorResponse),
+        (status = 401, response = Unauthorized),
+        (status = 404, response = NotFound),
+        (status = 502, description = "Discogs failed to answer.", body = ErrorResponse),
+    )
+)]
 async fn discogs_detail(
     State(state): State<Arc<AppState>>,
     _user: AuthUser,
@@ -205,9 +507,7 @@ async fn discogs_detail(
         return err(400, "Discogs isn't configured on this server");
     };
     match release_lookup::discogs_release(&auth, &id).await {
-        Ok(Some(c)) => {
-            (StatusCode::OK, Json(serde_json::json!({ "candidate": c }))).into_response()
-        }
+        Ok(Some(c)) => (StatusCode::OK, Json(DiscogsPressing { candidate: c })).into_response(),
         Ok(None) => err(404, "No such Discogs release"),
         Err(e) => err(502, e.to_string()),
     }
@@ -217,11 +517,27 @@ async fn discogs_detail(
 //  The shelf
 // ════════════════════════════════════════════════════════════
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
 pub struct ShelfQuery {
+    /// `vinyl`, `cassette`, `cd` or `sacd`. Anything else is ignored rather
+    /// than rejected.
     pub kind: Option<String>,
 }
 
+/// Your shelf.
+///
+/// Session-only.
+#[utoipa::path(
+    get,
+    path = "/api/v1/physical",
+    tag = "Shelf",
+    params(ShelfQuery),
+    responses(
+        (status = 200, description = "OK.", body = Shelf),
+        (status = 401, response = Unauthorized),
+    )
+)]
 pub async fn list_shelf(
     State(state): State<Arc<AppState>>,
     user: AuthUser,
@@ -229,25 +545,40 @@ pub async fn list_shelf(
 ) -> impl IntoResponse {
     let kind = q.kind.as_deref().filter(|k| matches!(*k, "vinyl" | "cassette" | "cd" | "sacd"));
     match state.db.list_physical(user.user_id, kind).await {
-        Ok(rows) => (StatusCode::OK, Json(serde_json::json!({ "releases": rows }))).into_response(),
+        Ok(releases) => (StatusCode::OK, Json(Shelf { releases })).into_response(),
         Err(e) => err(500, e.to_string()),
     }
 }
 
+/// One shelf item, with its sides.
+#[utoipa::path(
+    get,
+    path = "/api/v1/physical/{id}",
+    tag = "Shelf",
+    params(("id" = i64, Path)),
+    responses(
+        (status = 200, description = "OK.", body = ShelfEntry),
+        (status = 401, response = Unauthorized),
+        (status = 404, response = NotFound),
+    )
+)]
 async fn get_one(
     State(state): State<Arc<AppState>>,
     user: AuthUser,
     Path(id): Path<i64>,
 ) -> impl IntoResponse {
     match state.db.get_physical(user.user_id, id).await {
-        Ok(Some(r)) => (StatusCode::OK, Json(serde_json::json!({ "release": r }))).into_response(),
+        Ok(Some(release)) => (StatusCode::OK, Json(ShelfEntry { release })).into_response(),
         Ok(None) => err(404, "No such record"),
         Err(e) => err(500, e.to_string()),
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
+#[schema(as = NewShelfItem)]
 pub struct NewRelease {
+    /// `vinyl`, `cassette`, `cd` or `sacd`. A **disc has no sides**: its
+    /// tracklist is one numbered unit per disc.
     pub kind: String,
     pub artist: String,
     pub title: String,
@@ -262,8 +593,8 @@ pub struct NewRelease {
     pub notes: Option<String>,
     /// The medium the *release* declares — `"CD"`, `"12\" Vinyl"`, `"Hybrid
     /// SACD"` — as the lookup returned it. When present it **overrides `kind`**,
-    /// because `kind` is what the user picked before anyone looked at the
-    /// record and this is what the record says it is. See `settled_kind`.
+    /// because `kind` is what was picked before anyone looked at the record and
+    /// this is what the record says it is.
     #[serde(default)]
     pub format: Option<String>,
     /// When you bought it, unix seconds. Optional — most of a shelf is
@@ -278,9 +609,10 @@ pub struct NewRelease {
     /// rather than a flag.
     pub acquired_from: Option<String>,
     /// Pull the sleeve, labels and booklet from the Cover Art Archive as part
-    /// of adding it. On by default: it is one request and it is the whole
-    /// reason for shelving from MusicBrainz rather than typing it in.
+    /// of adding it. On by default. A failure does **not** fail the add, and
+    /// it does nothing without `mbid_release`.
     #[serde(default = "yes")]
+    #[schema(default = true)]
     pub fetch_images: bool,
 }
 
@@ -288,6 +620,20 @@ fn yes() -> bool {
     true
 }
 
+/// Add a release to the shelf.
+///
+/// Session-only. Seed from a barcode lookup, or supply the tracklist yourself.
+#[utoipa::path(
+    post,
+    path = "/api/v1/physical",
+    tag = "Shelf",
+    request_body = NewRelease,
+    responses(
+        (status = 201, description = "Added.", body = Shelved),
+        (status = 400, response = BadRequest),
+        (status = 401, response = Unauthorized),
+    )
+)]
 async fn add_release(
     State(state): State<Arc<AppState>>,
     user: AuthUser,
@@ -362,60 +708,76 @@ async fn add_release(
 
     (
         StatusCode::CREATED,
-        Json(serde_json::json!({
-            "id": id,
-            "images": images,
-            "kind": kind,
+        Json(Shelved {
+            id,
+            images,
+            kind: kind.to_string(),
             // Only when it differs from what was asked for, so a client can say
             // "filed as CD — the release says so" rather than silently landing
             // it somewhere else.
-            "corrected_from": corrected.map(|_| body.kind.clone()),
-        })),
+            corrected_from: corrected.map(|_| body.kind.clone()),
+        }),
     )
         .into_response()
 }
 
-#[derive(Debug, Deserialize)]
+/// The shelf-keeping fields. **An absent field is left alone and an explicit
+/// `null` clears it** — a misspelled key is never read as a clear.
+#[derive(Debug, Deserialize, ToSchema)]
+#[schema(as = ShelfItemUpdate)]
 pub struct ReleaseUpdate {
-    /// `Option<Option<_>>` throughout, for the reason `bulk-chain` learned the
-    /// hard way: a bare `Option` reads a *misspelled* key as an explicit null,
-    /// so a typo would clear the field it was trying to set and answer 200.
-    /// Absent leaves it alone; an explicit null clears it.
+    // `Option<Option<_>>` throughout, for the reason `bulk-chain` learned the
+    // hard way: a bare `Option` reads a *misspelled* key as an explicit null,
+    // so a typo would clear the field it was trying to set and answer 200.
+    /// When you bought it, Unix seconds.
     #[serde(default, deserialize_with = "explicit")]
+    #[schema(value_type = Option<i64>)]
     pub purchased_at: Option<Option<i64>>,
-    /// Both clearable: a wrong answer is worse than a blank, and "I don't
-    /// actually remember" is a real thing to want to say afterwards.
+    /// `new`, `used`, `gift` or `inherited`.
+    //
+    // Both clearable: a wrong answer is worse than a blank, and "I don't
+    // actually remember" is a real thing to want to say afterwards.
     #[serde(default, deserialize_with = "explicit")]
+    #[schema(value_type = Option<String>)]
     pub acquired_as: Option<Option<String>>,
+    /// The shop, the fair, the person.
     #[serde(default, deserialize_with = "explicit")]
+    #[schema(value_type = Option<String>)]
     pub acquired_from: Option<Option<String>>,
+    /// What it is normally played on. Must be yours — a 400 otherwise.
     #[serde(default, deserialize_with = "explicit")]
+    #[schema(value_type = Option<i64>)]
     pub chain_id: Option<Option<i64>>,
+    /// Must be yours — a 400 otherwise.
     #[serde(default, deserialize_with = "explicit")]
+    #[schema(value_type = Option<i64>)]
     pub equipment_id: Option<Option<i64>>,
     #[serde(default, deserialize_with = "explicit")]
+    #[schema(value_type = Option<String>)]
     pub notes: Option<Option<String>>,
     /// The variant of `chain_id` this pressing is normally played on — the
     /// cartridge you keep fitted for it.
     #[serde(default, deserialize_with = "explicit")]
+    #[schema(value_type = Option<i64>)]
     pub chain_variant_id: Option<Option<i64>>,
-    /// Move it to another shelf. A plain `Option` on purpose — a kind has no
-    /// "cleared" state, so absent is the only thing `None` can mean.
-    ///
-    /// Changing this re-derives the tracklist's sides, because what a side *is*
-    /// depends on the medium: a record has a break in it that `assign_sides`
-    /// has to guess, and a disc has none at all. Leaving the old split behind
-    /// would have the shelf offer to remind you to flip a CD.
+    /// Move it to another shelf: `vinyl`, `cassette`, `cd` or `sacd`. Not
+    /// clearable. Changing it re-derives the tracklist's sides, because what a
+    /// side *is* depends on the medium.
+    //
+    // A record has a break in it that `assign_sides` has to guess, and a disc
+    // has none at all. Leaving the old split behind would have the shelf offer
+    // to remind you to flip a CD.
     #[serde(default)]
     pub kind: Option<String>,
-    /// The MusicBrainz release this pressing is, typed in by hand.
-    ///
-    /// Worth having for its own sake — a record catalogued from Discogs carries
-    /// no MusicBrainz id at all — and it is also the cheapest way to ask for
-    /// running times: with one, the lookup is a single request against a known
-    /// release rather than a search that may walk several candidates and be cut
-    /// off by a proxy before it answers.
+    /// The MusicBrainz release this pressing is, typed in by hand — also the
+    /// cheapest way to ask for running times.
+    //
+    // Worth having for its own sake — a record catalogued from Discogs carries
+    // no MusicBrainz id at all — and with one, the lookup is a single request
+    // against a known release rather than a search that may walk several
+    // candidates and be cut off by a proxy before it answers.
     #[serde(default, deserialize_with = "explicit")]
+    #[schema(value_type = Option<String>)]
     pub mbid_release: Option<Option<String>>,
 }
 
@@ -433,7 +795,40 @@ where
     Option::<T>::deserialize(d).map(Some)
 }
 
-/// PATCH /api/v1/physical/:id — the shelf-keeping fields.
+// PATCH /api/v1/physical/:id — the shelf-keeping fields.
+/// Edit the shelf-keeping fields.
+///
+/// Session-only. When it was bought, what it is normally played through,
+/// and the note beside it.
+///
+/// Every field distinguishes **absent from null**: omitting one leaves the
+/// column alone, and an explicit `null` clears it. That is not decoration —
+/// a bare optional reads a *misspelled* key as an explicit null, so a typo
+/// would clear the chain it was trying to set and answer 200. Same shape and
+/// the same reason as `default_chain_id` on `PATCH /admin/tokens/{id}`.
+///
+/// `chain_id` and `equipment_id` are checked against the caller's own rows
+/// before they are stored.
+///
+/// `kind` is the exception to the absent/null rule — a format has no
+/// "cleared" state, so a plain optional is correct. Changing it **rewrites
+/// the tracklist's sides**, because what a side is depends on the medium: a
+/// record has a break `assign_sides` has to place by playing time, and a
+/// disc has none at all. The response reports `sides_rewritten` so a client
+/// knows the tracklist it is holding is stale.
+#[utoipa::path(
+    patch,
+    path = "/api/v1/physical/{id}",
+    tag = "Shelf",
+    params(("id" = i64, Path)),
+    request_body = ReleaseUpdate,
+    responses(
+        (status = 200, description = "Saved.", body = ShelfItemSaved),
+        (status = 400, response = BadRequest),
+        (status = 401, response = Unauthorized),
+        (status = 404, response = NotFound),
+    )
+)]
 async fn update_release(
     State(state): State<Arc<AppState>>,
     user: AuthUser,
@@ -506,7 +901,7 @@ async fn update_release(
         }
     }
 
-    (StatusCode::OK, Json(serde_json::json!({ "status": "ok", "sides_rewritten": resplit })))
+    (StatusCode::OK, Json(ShelfItemSaved { status: "ok", sides_rewritten: resplit }))
         .into_response()
 }
 
@@ -561,15 +956,61 @@ async fn respread_sides(
     Ok(true)
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
+#[schema(as = Tracklist)]
 pub struct TracksUpdate {
+    /// The whole tracklist. Not empty, no side and position twice, and no
+    /// running time of zero or less.
+    #[schema(min_items = 1)]
     pub tracks: Vec<PhysicalTrack>,
 }
 
-/// PUT /api/v1/physical/:id/tracks — save a corrected side split.
+// PUT /api/v1/physical/:id/tracks — save a corrected side split.
+//
+// The one edit that matters, because the split Tapedeck guessed is a guess:
+// MusicBrainz only records a side letter when an editor entered one.
+/// Replace the tracklist and side split.
 ///
-/// The one edit that matters, because the split Tapedeck guessed is a guess:
-/// MusicBrainz only records a side letter when an editor entered one.
+/// Session-only. Sides are **not reliably available from any provider** —
+/// MusicBrainz records a vinyl track number as "A1" only when an editor
+/// entered one. When there is no explicit side letter the split is guessed
+/// by **playing time**, not track count, because a mastering engineer
+/// balances sides and a nine-minute closer would otherwise land on the
+/// wrong one. It is still a guess, which is why this endpoint exists.
+///
+/// None of that applies to a **disc**. A CD or SACD plays start to finish,
+/// so its tracks are numbered one unit per disc with no guessing at all —
+/// splitting a CD by playing time would invent a break that is not there.
+/// The medium's own format string decides which rule applies, not what was
+/// searched for.
+///
+///
+/// **It is also how a running time is typed in**, which for a pressing no
+/// provider carries is the only way one is ever known. That is not
+/// cosmetic: `scrobbles.duration` is what every hours readout sums and
+/// `physical_plays.duration_secs` is what the stylus meter reads, so this
+/// corrects **both** alongside the tracklist rather than leaving three
+/// answers free to disagree. Whole-side plays only — a partial records how
+/// many tracks ran and never which, so its wear cannot be reconstructed.
+///
+///
+/// Unlike `POST /durations`, a value here **overwrites** a stored one. That
+/// is the whole difference between the two: there the source is another
+/// pressing and a hand-typed figure must survive it, here the source is the
+/// person, and refusing their correction would make the field pointless.
+#[utoipa::path(
+    put,
+    path = "/api/v1/physical/{id}/tracks",
+    tag = "Shelf",
+    params(("id" = i64, Path)),
+    request_body = TracksUpdate,
+    responses(
+        (status = 200, description = "Saved.", body = TracklistSaved),
+        (status = 400, description = "Empty tracklist, a duplicated side and position, or a running time of zero or less.", body = ErrorResponse),
+        (status = 401, response = Unauthorized),
+        (status = 404, response = NotFound),
+    )
+)]
 async fn set_tracks(
     State(state): State<Arc<AppState>>,
     user: AuthUser,
@@ -634,12 +1075,12 @@ async fn set_tracks(
 
     (
         StatusCode::OK,
-        Json(serde_json::json!({
-            "status": "ok",
-            "changed": listen_updates.len(),
-            "listens_updated": listens,
-            "plays_recomputed": sides_touched,
-        })),
+        Json(TracklistSaved {
+            status: "ok",
+            changed: listen_updates.len(),
+            listens_updated: listens,
+            plays_recomputed: sides_touched,
+        }),
     )
         .into_response()
 }
@@ -695,36 +1136,66 @@ async fn reconcile_durations(
 const LOOKUP_DEADLINE: std::time::Duration = std::time::Duration::from_secs(20);
 
 /// One track's proposed running time, as previewed and as applied.
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone, ToSchema)]
 pub struct DurationProposal {
     pub side: String,
     pub position: i64,
     pub title: String,
-    /// What the shelf holds now. `None` is the case this exists for.
+    /// What the shelf holds now.
     pub current: Option<i64>,
-    /// What the looked-up pressing says. `None` where nothing matched.
+    /// What the looked-up pressing says. Null where nothing matched — never a
+    /// guess.
     pub proposed: Option<i64>,
 }
 
-#[derive(Debug, Deserialize)]
+/// The proposals exactly as the preview showed them.
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct ApplyDurations {
     pub durations: Vec<DurationProposal>,
 }
 
-/// GET /api/v1/physical/:id/durations — what another pressing says the tracks run.
+// GET /api/v1/physical/:id/durations — what another pressing says the tracks run.
+//
+// **Preview only.** Nothing is written, and the apply below takes back exactly
+// what was shown rather than searching again — a preview that says one thing
+// and applies another is worse than no preview, which is the rule the metadata
+// sanitiser already follows. It matters more here than usual: a wrong duration
+// is invisible the moment it is stored, and there is no way afterwards to tell
+// which figures were guessed.
+//
+// The lookup is a **search**, not a join. A record catalogued from Discogs
+// often carries no MusicBrainz id at all — Fallen does not — so the barcode is
+// the key, and whatever comes back is a *different pressing* that may be
+// ordered differently or carry bonus tracks. `match_durations` therefore
+// matches on titles; see its own note for why position matching is wrong.
+/// What another pressing says this record's tracks run.
 ///
-/// **Preview only.** Nothing is written, and the apply below takes back exactly
-/// what was shown rather than searching again — a preview that says one thing
-/// and applies another is worse than no preview, which is the rule the metadata
-/// sanitiser already follows. It matters more here than usual: a wrong duration
-/// is invisible the moment it is stored, and there is no way afterwards to tell
-/// which figures were guessed.
+/// **Preview only — nothing is written.** Session-only.
 ///
-/// The lookup is a **search**, not a join. A record catalogued from Discogs
-/// often carries no MusicBrainz id at all — Fallen does not — so the barcode is
-/// the key, and whatever comes back is a *different pressing* that may be
-/// ordered differently or carry bonus tracks. `match_durations` therefore
-/// matches on titles; see its own note for why position matching is wrong.
+/// Exists because a record catalogued from Discogs often has no running
+/// times at all, which used to leave the deck showing three minutes a track
+/// as though it were a length. The lookup is a *search* (MusicBrainz id if
+/// the record has one, else barcode, else artist and title), so whatever
+/// comes back is a **different pressing** and may be ordered differently or
+/// carry bonus tracks — tracks are therefore matched by title, never by
+/// position.
+///
+/// `complete: true` means every track already has a duration and there is
+/// nothing to do. An empty `durations` with a null `source` means nothing
+/// with running times was found, which is a normal answer.
+#[utoipa::path(
+    get,
+    path = "/api/v1/physical/{id}/durations",
+    tag = "Shelf",
+    security(("sessionCookie" = [])),
+    params(("id" = i64, Path)),
+    responses(
+        (status = 200, description = "OK.", body = DurationPreview),
+        (status = 400, description = "That record has no tracklist.", body = ErrorResponse),
+        (status = 401, response = Unauthorized),
+        (status = 404, description = "No such record.", body = ErrorResponse),
+    )
+)]
 async fn preview_durations(
     State(state): State<Arc<AppState>>,
     user: AuthUser,
@@ -740,11 +1211,13 @@ async fn preview_durations(
     if stored.iter().all(|t| t.duration_secs.is_some()) {
         return (
             StatusCode::OK,
-            Json(serde_json::json!({
-                "complete": true,
-                "durations": [],
-                "source": serde_json::Value::Null,
-            })),
+            Json(DurationPreview {
+                complete: true,
+                durations: Vec::new(),
+                source: None,
+                unavailable: None,
+                note: None,
+            }),
         )
             .into_response();
     }
@@ -788,13 +1261,13 @@ async fn preview_durations(
     let unavailable = |note: String| {
         (
             StatusCode::OK,
-            Json(serde_json::json!({
-                "complete": false,
-                "durations": [],
-                "source": serde_json::Value::Null,
-                "unavailable": true,
-                "note": note,
-            })),
+            Json(DurationPreview {
+                complete: false,
+                durations: Vec::new(),
+                source: None,
+                unavailable: Some(true),
+                note: Some(note),
+            }),
         )
             .into_response()
     };
@@ -804,12 +1277,13 @@ async fn preview_durations(
         Ok(Ok(None)) => {
             return (
                 StatusCode::OK,
-                Json(serde_json::json!({
-                    "complete": false,
-                    "durations": [],
-                    "source": serde_json::Value::Null,
-                    "note": "Nothing with running times was found for this record.",
-                })),
+                Json(DurationPreview {
+                    complete: false,
+                    durations: Vec::new(),
+                    source: None,
+                    unavailable: None,
+                    note: Some("Nothing with running times was found for this record.".into()),
+                }),
             )
                 .into_response();
         }
@@ -838,33 +1312,64 @@ async fn preview_durations(
 
     (
         StatusCode::OK,
-        Json(serde_json::json!({
-            "complete": false,
-            "durations": durations,
-            "source": {
-                "title": source.title,
-                "artist": source.artist,
-                "year": source.year,
-                "format": source.format,
-                "country": source.country,
-                "mbid_release": source.mbid_release,
-            },
-        })),
+        Json(DurationPreview {
+            complete: false,
+            durations,
+            source: Some(DurationSource {
+                title: source.title,
+                artist: source.artist,
+                year: source.year,
+                format: source.format,
+                country: source.country,
+                mbid_release: source.mbid_release,
+            }),
+            unavailable: None,
+            note: None,
+        }),
     )
         .into_response()
 }
 
-/// POST /api/v1/physical/:id/durations — write the running times that were shown.
+// POST /api/v1/physical/:id/durations — write the running times that were shown.
+//
+// Takes the proposals back rather than re-running the search, so what lands is
+// what was on the screen. Only fills a duration the shelf does **not** already
+// have: a running time somebody typed in, or one an earlier lookup got right,
+// is not something a later fetch may quietly overwrite.
+//
+// Then the listens already recorded from those sides are given the same
+// figures, because every hours readout in the application derives from
+// `scrobbles.duration` — filling the tracklist alone would leave the shelf
+// saying one thing and the stylus meter another.
+/// Write the running times that were previewed.
 ///
-/// Takes the proposals back rather than re-running the search, so what lands is
-/// what was on the screen. Only fills a duration the shelf does **not** already
-/// have: a running time somebody typed in, or one an earlier lookup got right,
-/// is not something a later fetch may quietly overwrite.
+/// Session-only. Takes the proposals **back** rather than searching again,
+/// so what lands is what was on the screen — a preview that applies
+/// something else is worse than no preview.
 ///
-/// Then the listens already recorded from those sides are given the same
-/// figures, because every hours readout in the application derives from
-/// `scrobbles.duration` — filling the tracklist alone would leave the shelf
-/// saying one thing and the stylus meter another.
+/// Only fills a duration the record does not already have: one that was
+/// typed in, or that an earlier lookup got right, is never overwritten by a
+/// later fetch.
+///
+/// The listens already recorded from those sides are given the same figures,
+/// because every hours readout derives from `scrobbles.duration`. Their
+/// **timestamps are not touched** — `physical_plays` records when a side
+/// started and nothing about when it ended, so where the tracks fell is
+/// unrecoverable, and re-spacing them would assume the side ran
+/// uninterrupted.
+#[utoipa::path(
+    post,
+    path = "/api/v1/physical/{id}/durations",
+    tag = "Shelf",
+    security(("sessionCookie" = [])),
+    params(("id" = i64, Path)),
+    request_body = ApplyDurations,
+    responses(
+        (status = 200, description = "OK.", body = DurationsApplied),
+        (status = 401, response = Unauthorized),
+        (status = 404, description = "No such record.", body = ErrorResponse),
+    )
+)]
 async fn apply_durations(
     State(state): State<Arc<AppState>>,
     user: AuthUser,
@@ -912,15 +1417,31 @@ async fn apply_durations(
 
     (
         StatusCode::OK,
-        Json(serde_json::json!({
-            "filled": filled,
-            "listens_updated": listens,
-            "plays_recomputed": sides_touched,
-        })),
+        Json(DurationsApplied {
+            filled,
+            listens_updated: listens,
+            plays_recomputed: sides_touched,
+        }),
     )
         .into_response()
 }
 
+/// Remove a shelf item.
+///
+/// Session-only. Its plays and its images go with it, and any scan files
+/// the user uploaded are removed from disk — nothing else knows those files
+/// exist, so leaving them would orphan them permanently.
+#[utoipa::path(
+    delete,
+    path = "/api/v1/physical/{id}",
+    tag = "Shelf",
+    params(("id" = i64, Path)),
+    responses(
+        (status = 200, description = "Deleted.", body = ShelfDone),
+        (status = 401, response = Unauthorized),
+        (status = 404, response = NotFound),
+    )
+)]
 async fn delete_release(
     State(state): State<Arc<AppState>>,
     user: AuthUser,
@@ -936,7 +1457,7 @@ async fn delete_release(
                     warn!("Could not remove the scan at {}: {}", f, e);
                 }
             }
-            (StatusCode::OK, Json(serde_json::json!({ "status": "deleted" }))).into_response()
+            (StatusCode::OK, Json(ShelfDone { status: "deleted" })).into_response()
         }
         Ok(None) => err(404, "No such record"),
         Err(e) => err(500, e.to_string()),
@@ -953,39 +1474,69 @@ async fn delete_release(
 /// `file_path` cannot reach the page: an uploaded scan is addressed by a
 /// Tapedeck URL, and the server's own layout is nobody's business. The row type
 /// also skips the field, so this is belt and braces on the thing that matters.
-fn image_payload(img: &PhysicalImage) -> serde_json::Value {
+fn image_payload(img: &PhysicalImage) -> ImageView {
     let own = format!("/api/v1/physical/images/{}/file", img.id);
-    serde_json::json!({
-        "id": img.id,
-        "release_id": img.release_id,
-        "kind": img.kind,
-        "provider": img.provider,
+    ImageView {
+        id: img.id,
+        release_id: img.release_id,
+        kind: img.kind.clone(),
+        provider: img.provider.clone(),
         // One field the page renders, whichever provenance it came from.
-        "src": img.url.clone().unwrap_or_else(|| own.clone()),
+        src: img.url.clone().unwrap_or_else(|| own.clone()),
         // A remote provider's thumbnail, or the full file for an upload —
         // scans are the user's own and there is nothing else to serve.
-        "thumb": img.thumb_url.clone().or_else(|| img.url.clone()).unwrap_or(own),
-        "caption": img.caption,
-        "position": img.position,
-        "bytes": img.bytes,
-        "mime": img.mime,
-        "added_at": img.added_at,
-    })
+        thumb: img.thumb_url.clone().or_else(|| img.url.clone()).unwrap_or(own),
+        caption: img.caption.clone(),
+        position: img.position,
+        bytes: img.bytes,
+        mime: img.mime.clone(),
+        added_at: img.added_at,
+    }
 }
 
-/// GET /api/v1/physical/:id/sides — how often each side has been played.
+// GET /api/v1/physical/:id/sides — how often each side has been played.
+//
+// A shelf item's totals answer "how much has this record been played"; this
+// answers the question the object actually raises, which is that a record has
+// a side you reach for and a side you rarely turn over.
+//
+// Reports only the sides that have plays. The page holds the tracklist and
+// zero-fills from it, which is what lets a side that has never been played
+// say so — and it is also how a side recorded under a *different* label shows
+// up: re-filing a release rewrites its sides (a vinyl A/B becomes a CD's 1),
+// and the plays keep the letter they were recorded with. Dropping those here
+// would leave the sides summing to less than the release's own total with
+// nothing to say why.
+/// How often each side has been played, and for how long.
 ///
-/// A shelf item's totals answer "how much has this record been played"; this
-/// answers the question the object actually raises, which is that a record has
-/// a side you reach for and a side you rarely turn over.
+/// Session-only. A record has a side you reach for and a side you rarely
+/// turn over, and the release's own totals cannot say which is which.
 ///
-/// Reports only the sides that have plays. The page holds the tracklist and
-/// zero-fills from it, which is what lets a side that has never been played
-/// say so — and it is also how a side recorded under a *different* label shows
-/// up: re-filing a release rewrites its sides (a vinyl A/B becomes a CD's 1),
-/// and the plays keep the letter they were recorded with. Dropping those here
-/// would leave the sides summing to less than the release's own total with
-/// nothing to say why.
+/// Everything here is derived from the sides played on read — never a
+/// counter — so it cannot drift from the plays it counts, and deleting a
+/// play takes its wear back with it. `secs` is the running time of the
+/// tracks that actually played, which is the same figure the stylus is
+/// charged for: a side started at track four counts four tracks' worth.
+/// It is nominal rather than wall clock.
+///
+/// **Only sides with plays are returned.** A side that has never been
+/// played is not an entry with zeros — the caller holds the tracklist and
+/// fills those in. That also means a side may appear that is not on the
+/// tracklist at all: re-filing a release rewrites its sides (a vinyl A/B
+/// becomes a CD's 1) while its plays keep the label they were recorded
+/// with, and dropping those would leave the sides summing to less than the
+/// release total with nothing to say why.
+#[utoipa::path(
+    get,
+    path = "/api/v1/physical/{id}/sides",
+    tag = "Shelf",
+    params(("id" = i64, Path)),
+    responses(
+        (status = 200, description = "OK.", body = Sides),
+        (status = 401, response = Unauthorized),
+        (status = 404, description = "No such record.", body = ErrorResponse),
+    )
+)]
 async fn side_plays(
     State(state): State<Arc<AppState>>,
     user: AuthUser,
@@ -1000,12 +1551,32 @@ async fn side_plays(
         Ok(Some(_)) => {}
     }
     match state.db.side_plays(user.user_id, id).await {
-        Ok(sides) => (StatusCode::OK, Json(serde_json::json!({ "sides": sides }))).into_response(),
+        Ok(sides) => (StatusCode::OK, Json(Sides { sides })).into_response(),
         Err(e) => err(500, e.to_string()),
     }
 }
 
-/// GET /api/v1/physical/:id/images
+/// Every scan held for a pressing.
+///
+/// Session-only. Sleeves, labels, obi strips and booklet pages — the parts
+/// of a record you actually hold, which is why they are rows rather than
+/// one more `artwork_url` column. The Cover Art Archive carries 29 for a
+/// typical CD, 19 of them booklet pages.
+///
+/// Each entry carries a single `src` and `thumb` whichever provenance it
+/// came from: a provider's image is its own URL, an uploaded scan is a
+/// Tapedeck URL that checks who is asking. The server's own file layout is
+/// never in the response.
+#[utoipa::path(
+    get,
+    path = "/api/v1/physical/{id}/images",
+    tag = "Shelf",
+    params(("id" = i64, Path)),
+    responses(
+        (status = 200, description = "OK.", body = ShelfImages),
+        (status = 401, response = Unauthorized),
+    )
+)]
 async fn list_images(
     State(state): State<Arc<AppState>>,
     user: AuthUser,
@@ -1013,8 +1584,8 @@ async fn list_images(
 ) -> impl IntoResponse {
     match state.db.list_physical_images(user.user_id, id).await {
         Ok(rows) => {
-            let images: Vec<_> = rows.iter().map(image_payload).collect();
-            (StatusCode::OK, Json(serde_json::json!({ "images": images }))).into_response()
+            let images = rows.iter().map(image_payload).collect();
+            (StatusCode::OK, Json(ShelfImages { images })).into_response()
         }
         Err(e) => err(500, e.to_string()),
     }
@@ -1062,12 +1633,40 @@ async fn store_archive_images(
     Ok(n)
 }
 
-/// POST /api/v1/physical/:id/images/fetch — ask the providers again.
+// POST /api/v1/physical/:id/images/fetch — ask the providers again.
+//
+// Runs when the user asks rather than on a clock: the archive is not going to
+// change under a record that has been on a shelf for thirty years, and the one
+// case that does — an editor uploading the booklet you were missing — is
+// exactly the case where the user knows and Tapedeck cannot.
+/// Pull the sleeve from the Cover Art Archive.
 ///
-/// Runs when the user asks rather than on a clock: the archive is not going to
-/// change under a record that has been on a shelf for thirty years, and the one
-/// case that does — an editor uploading the booklet you were missing — is
-/// exactly the case where the user knows and Tapedeck cannot.
+/// Session-only. Runs when the user asks rather than on a clock: the
+/// archive is not going to change under a record that has been on a shelf
+/// for thirty years, and the one case that does — an editor uploading the
+/// booklet you were missing — is exactly the case where the user knows and
+/// Tapedeck cannot.
+///
+/// **Idempotent** on the provider's own image id, so re-running this adds
+/// what is new and leaves the rest alone rather than stacking a second copy
+/// of all nineteen booklet pages on top of the first.
+///
+/// Discogs runs second and only when a credential is configured; it says
+/// only "primary" or "secondary" about an image, so everything but the
+/// cover lands in `other` for the user to file. A pressing with no
+/// MusicBrainz id is **not** an error — it comes back with a note saying
+/// there is nothing to look it up by.
+#[utoipa::path(
+    post,
+    path = "/api/v1/physical/{id}/images/fetch",
+    tag = "Shelf",
+    params(("id" = i64, Path)),
+    responses(
+        (status = 200, description = "OK.", body = ImagesFetched),
+        (status = 401, response = Unauthorized),
+        (status = 404, response = NotFound),
+    )
+)]
 async fn fetch_images(
     State(state): State<Arc<AppState>>,
     user: AuthUser,
@@ -1131,8 +1730,7 @@ async fn fetch_images(
     }
 
     let total = state.db.list_physical_images(user.user_id, id).await.map(|r| r.len()).unwrap_or(0);
-    (StatusCode::OK, Json(serde_json::json!({ "stored": added, "total": total, "notes": notes })))
-        .into_response()
+    (StatusCode::OK, Json(ImagesFetched { stored: added, total, notes })).into_response()
 }
 
 /// The largest a single scan may be. A 600dpi A4 page is a few megabytes; this
@@ -1154,11 +1752,39 @@ pub(super) fn image_ext(mime: &str) -> Option<&'static str> {
     }
 }
 
-/// POST /api/v1/physical/:id/images — upload a scan of your own copy.
+// POST /api/v1/physical/:id/images — upload a scan of your own copy.
+//
+// The one image source that is not somebody else's database. A pressing
+// nobody has photographed, a sleeve with your own handwriting on it, the
+// receipt tucked inside — none of that exists anywhere but here.
+/// Upload scans of your own copy.
 ///
-/// The one image source that is not somebody else's database. A pressing
-/// nobody has photographed, a sleeve with your own handwriting on it, the
-/// receipt tucked inside — none of that exists anywhere but here.
+/// Session-only. `multipart/form-data`: any number of file fields, plus
+/// optional `kind` and `caption` text fields that apply to all of them —
+/// which is what makes uploading a booklet in one go work, since the files
+/// land in the order they are sent.
+///
+/// The declared content type decides the stored extension; a filename from
+/// the client never reaches the path. Max 24 MB per image.
+///
+/// Uploads are files on the server rather than blobs in the database, so
+/// `GET /api/v1/backup` does **not** carry them — `GET /api/v1/physical/export`
+/// is what does.
+#[utoipa::path(
+    post,
+    path = "/api/v1/physical/{id}/images",
+    tag = "Shelf",
+    params(("id" = i64, Path)),
+    request_body(content = ScanUpload, content_type = "multipart/form-data"),
+    responses(
+        (status = 201, description = "Stored.", body = ScansStored),
+        (status = 400, response = BadRequest),
+        (status = 401, response = Unauthorized),
+        (status = 404, response = NotFound),
+        (status = 413, description = "Larger than 24 MB.", body = ErrorResponse),
+        (status = 415, description = "Not an image type this server stores.", body = ErrorResponse),
+    )
+)]
 async fn upload_image(
     State(state): State<Arc<AppState>>,
     user: AuthUser,
@@ -1269,7 +1895,7 @@ async fn upload_image(
     }
 
     info!("🖼️ Stored {} scan(s) for shelf item {}", stored.len(), id);
-    (StatusCode::CREATED, Json(serde_json::json!({ "ids": stored }))).into_response()
+    (StatusCode::CREATED, Json(ScansStored { ids: stored })).into_response()
 }
 
 pub(super) fn random_name() -> String {
@@ -1278,13 +1904,34 @@ pub(super) fn random_name() -> String {
     raw.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// GET /api/v1/physical/images/:id/file — serve an uploaded scan.
+// GET /api/v1/physical/images/:id/file — serve an uploaded scan.
+//
+// Scoped to the caller by `(id, user_id)`, the same rule the artwork proxy
+// keeps: these are photographs of someone's own possessions and ids must not
+// be walkable. Cached hard — a scan never changes once uploaded — but
+// `private`, because it is per-user and a shared cache holding it would serve
+// it to the next person through the proxy.
+/// An uploaded scan's bytes.
 ///
-/// Scoped to the caller by `(id, user_id)`, the same rule the artwork proxy
-/// keeps: these are photographs of someone's own possessions and ids must not
-/// be walkable. Cached hard — a scan never changes once uploaded — but
-/// `private`, because it is per-user and a shared cache holding it would serve
-/// it to the next person through the proxy.
+/// Session-only, and scoped to the caller by `(id, user_id)` — these are
+/// photographs of someone's own possessions and ids must not be walkable,
+/// the same rule the artwork proxy keeps.
+///
+/// Cached hard, because a scan never changes once uploaded, but `private`:
+/// it is per-user, and a shared cache holding it would serve it to the next
+/// person through the proxy. A provider-hosted image 404s here — it has a
+/// URL of its own and this server is not in front of it.
+#[utoipa::path(
+    get,
+    path = "/api/v1/physical/images/{id}/file",
+    tag = "Shelf",
+    params(("id" = i64, Path)),
+    responses(
+        (status = 200, description = "The image.", body = Bytes, content_type = "image/*"),
+        (status = 401, response = Unauthorized),
+        (status = 404, response = NotFound),
+    )
+)]
 async fn image_file(
     State(state): State<Arc<AppState>>,
     user: AuthUser,
@@ -1313,15 +1960,31 @@ async fn image_file(
     }
 }
 
-#[derive(Debug, Deserialize)]
+/// Absent fields are left alone; a `null` caption clears it.
+#[derive(Debug, Deserialize, ToSchema)]
+#[schema(as = ShelfImageUpdate)]
 pub struct ImageUpdate {
     pub kind: Option<String>,
     #[serde(default, deserialize_with = "explicit")]
+    #[schema(value_type = Option<String>)]
     pub caption: Option<Option<String>>,
     pub position: Option<i64>,
 }
 
-/// PATCH /api/v1/physical/images/:id — file it, name it, move it.
+// PATCH /api/v1/physical/images/:id — file it, name it, move it.
+/// Re-file, caption or reorder a scan.
+#[utoipa::path(
+    patch,
+    path = "/api/v1/physical/images/{id}",
+    tag = "Shelf",
+    params(("id" = i64, Path)),
+    request_body = ImageUpdate,
+    responses(
+        (status = 200, description = "Saved.", body = ShelfDone),
+        (status = 401, response = Unauthorized),
+        (status = 404, response = NotFound),
+    )
+)]
 async fn update_image(
     State(state): State<Arc<AppState>>,
     user: AuthUser,
@@ -1340,12 +2003,28 @@ async fn update_image(
         )
         .await
     {
-        Ok(true) => (StatusCode::OK, Json(serde_json::json!({ "status": "ok" }))).into_response(),
+        Ok(true) => (StatusCode::OK, Json(ShelfDone { status: "ok" })).into_response(),
         Ok(false) => err(404, "No such image"),
         Err(e) => err(500, e.to_string()),
     }
 }
 
+/// Remove a scan.
+///
+/// Session-only. An uploaded file is deleted from disk with the row and
+/// cannot be recovered; a provider's image is only unlinked and can be
+/// fetched again.
+#[utoipa::path(
+    delete,
+    path = "/api/v1/physical/images/{id}",
+    tag = "Shelf",
+    params(("id" = i64, Path)),
+    responses(
+        (status = 200, description = "Deleted.", body = ShelfDone),
+        (status = 401, response = Unauthorized),
+        (status = 404, response = NotFound),
+    )
+)]
 async fn delete_image(
     State(state): State<Arc<AppState>>,
     user: AuthUser,
@@ -1358,7 +2037,7 @@ async fn delete_image(
                     warn!("Could not remove the scan at {}: {}", f, e);
                 }
             }
-            (StatusCode::OK, Json(serde_json::json!({ "status": "deleted" }))).into_response()
+            (StatusCode::OK, Json(ShelfDone { status: "deleted" })).into_response()
         }
         Ok(None) => err(404, "No such image"),
         Err(e) => err(500, e.to_string()),
@@ -1369,30 +2048,34 @@ async fn delete_image(
 //  Playing a side
 // ════════════════════════════════════════════════════════════
 
-/// What actually happened to one track on the side.
-///
-/// The client sends this because it is the only thing that *knows*: it ran the
-/// clock, so it saw the pauses and the skips. Deriving it server-side from a
-/// start time and a running order can only describe an uninterrupted play.
-#[derive(Debug, Deserialize)]
+/// What actually happened to one track on the side, as the deck saw it.
+//
+// The client sends this because it is the only thing that *knows*: it ran the
+// clock, so it saw the pauses and the skips. Deriving it server-side from a
+// start time and a running order can only describe an uninterrupted play.
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct TrackOutcome {
     pub position: i64,
     /// When this track actually started, unix seconds.
     pub started_at: i64,
-    /// Skipped rather than heard. Stored — `scrobbles.skipped` exists for
-    /// exactly this — but excluded from every count and never forwarded, which
-    /// is the rule the Rockbox import already follows. A skip forwarded to
-    /// Last.fm would be a wrong scrobble on a permanent record.
+    /// Skipped rather than heard. Stored, but excluded from every count and
+    /// never forwarded.
+    //
+    // `scrobbles.skipped` exists for exactly this — the rule the Rockbox
+    // import already follows. A skip forwarded to Last.fm would be a wrong
+    // scrobble on a permanent record.
     #[serde(default)]
     pub skipped: bool,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
+#[schema(as = SidePlay)]
 pub struct PlaySide {
+    #[schema(example = "A")]
     pub side: String,
-    /// Per-track outcomes from the deck. Authoritative when present; without it
-    /// the running order is laid out from `started_at`, which is what the
-    /// "already played" path sends.
+    /// Per-track outcomes from the deck. Authoritative where present — the
+    /// browser ran the clock, so it is the only thing that saw the pauses and
+    /// the skips. Without it the running order is laid out from `started_at`.
     #[serde(default)]
     pub tracks: Vec<TrackOutcome>,
     /// When the side *started*, unix seconds. Defaults to now minus its running
@@ -1402,35 +2085,32 @@ pub struct PlaySide {
     /// these rows.
     pub equipment_id: Option<i64>,
     pub chain_id: Option<i64>,
-    /// The last track that played, when the side was not run to its end —
-    /// dropping the needle on one song and lifting it again.
-    ///
-    /// With `from_position` this selects a range, and the two being equal is a
-    /// single track. Everything after it is left unwritten for the same reason
-    /// everything before `from_position` is: a track nobody reached is not a
-    /// track they skipped, and filing it as one would put noise into the single
-    /// query in `db.rs` whose subject *is* the skipped rows.
-    ///
-    /// The play still counts as wear — the needle really was in the groove —
-    /// and `track_count` is what tells it apart from a whole side afterwards,
-    /// which is why no new column was needed.
+    /// The last track that played, when the side was not run to its end. With
+    /// `from_position` this selects a range; the two equal is a single track.
+    /// Tracks after it are not written at all — not as skips either. The play
+    /// still counts as wear.
+    //
+    // A track nobody reached is not a track they skipped, and filing it as one
+    // would put noise into the single query in `db.rs` whose subject *is* the
+    // skipped rows. `track_count` is what tells a partial apart from a whole
+    // side afterwards, which is why no new column was needed.
     pub to_position: Option<i64>,
-    /// The first track that actually played, when the side did not start at its
-    /// beginning — the needle dropped at track 4, or a tape carried on from
-    /// where it was parked.
-    ///
-    /// This is load-bearing rather than cosmetic. `play_side` writes a listen
-    /// for **every** track on the side, so without it starting at track 4
-    /// silently records tracks 1–3 as having played. They must not be written
-    /// at all — and in particular must not be written as *skips*, because a
-    /// skip means "I heard some of it and moved on" and feeds the skip-rate
-    /// analytics `scrobbles.skipped` exists for. A track you never reached is
-    /// not a track you skipped.
+    /// The first track that actually played, when the side did not start at
+    /// its beginning. **Load-bearing**: without it, starting at track 4
+    /// records tracks 1–3 as played. They are not written at all — and not as
+    /// *skips*, since a track you never reached is not one you skipped. Wear
+    /// is credited only for the part that played.
+    //
+    // `play_side` writes a listen for **every** track on the side, and a skip
+    // feeds the skip-rate analytics `scrobbles.skipped` exists for.
     #[serde(default)]
     pub from_position: Option<i64>,
-    /// Where the tape was left when it came off, in seconds into the side.
-    /// Cassettes only — `Database::park_tape` enforces that, since it is a fact
-    /// about the medium rather than about this request.
+    /// Where a tape was left when it came off, in seconds into the side.
+    /// **Cassettes only**, and clamped to the side's length. Absent means the
+    /// side ran through and the tape is wound back.
+    //
+    // `Database::park_tape` enforces the medium, since it is a fact about the
+    // medium rather than about this request.
     #[serde(default)]
     pub parked_secs: Option<i64>,
     /// Which variant of the chain was fitted — the cartridge in the headshell.
@@ -1440,18 +2120,47 @@ pub struct PlaySide {
     pub chain_variant_id: Option<i64>,
 }
 
-/// POST /api/v1/physical/:id/play — record a side.
+// POST /api/v1/physical/:id/play — record a side.
+//
+// **One listen per track**, not one per side. Every counting query in this app
+// is over listens, so a side-shaped row would be invisible to all of them.
+//
+// The timestamps are the only inferred thing here, and worth being honest
+// about: you observed when the side started, not when track three did. They
+// are spaced by each track's running time from the pressing's tracklist, so
+// the ordering and the gaps are right even though no individual timestamp was
+// measured. A track with no known duration is given three minutes, which is
+// wrong but bounded — the alternative is stacking every track on one instant,
+// which would break session grouping and the hour-of-day heatmap outright.
+/// Record a side as played.
 ///
-/// **One listen per track**, not one per side. Every counting query in this app
-/// is over listens, so a side-shaped row would be invisible to all of them.
+/// Session-only. **Writes one listen per track, not one per side** — every
+/// counting query in Tapedeck is over listens, so a side-shaped row would
+/// be invisible to all of them.
 ///
-/// The timestamps are the only inferred thing here, and worth being honest
-/// about: you observed when the side started, not when track three did. They
-/// are spaced by each track's running time from the pressing's tracklist, so
-/// the ordering and the gaps are right even though no individual timestamp was
-/// measured. A track with no known duration is given three minutes, which is
-/// wrong but bounded — the alternative is stacking every track on one instant,
-/// which would break session grouping and the hour-of-day heatmap outright.
+/// Timestamps are the one inferred thing here: you observed when the side
+/// *started*, so tracks are spaced by their running times. A track of
+/// unknown length gets three minutes — wrong but bounded, where stacking
+/// them on one instant would break session grouping and the hour-of-day
+/// heatmap outright.
+///
+/// Per-track outcomes from the browser deck are taken as authoritative: a
+/// side laid out from a start time can only describe an uninterrupted play.
+/// A skipped track is stored, excluded from every count, and never
+/// forwarded — and does not accrue gear hours.
+#[utoipa::path(
+    post,
+    path = "/api/v1/physical/{id}/play",
+    tag = "Shelf",
+    params(("id" = i64, Path)),
+    request_body = PlaySide,
+    responses(
+        (status = 200, description = "Logged.", body = SideLogged),
+        (status = 400, response = BadRequest),
+        (status = 401, response = Unauthorized),
+        (status = 404, response = NotFound),
+    )
+)]
 async fn play_side(
     State(state): State<Arc<AppState>>,
     user: AuthUser,
@@ -1734,14 +2443,14 @@ async fn play_side(
 
     (
         StatusCode::OK,
-        Json(serde_json::json!({
-            "listens_added": written,
-            "skipped": skipped_count,
-            "tracks": tracks.len(),
-            "duration_secs": total,
-            "started_at": start,
-            "next_side": next,
-        })),
+        Json(SideLogged {
+            listens_added: written,
+            skipped: skipped_count,
+            tracks: tracks.len(),
+            duration_secs: total,
+            started_at: start,
+            next_side: next,
+        }),
     )
         .into_response()
 }
@@ -1755,11 +2464,14 @@ async fn play_side(
 /// clear the entry a started side wrote.
 const SHELF_SOURCE: &str = "Shelf";
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct DeckState {
+    #[schema(example = "A")]
     pub side: String,
-    /// The track's position on the side — the deck knows which one it is
-    /// inside, because it is the thing running the clock.
+    /// The track's position on the side.
+    //
+    // The deck knows which one it is inside, because it is the thing running
+    // the clock.
     pub position: i64,
     /// Seconds into that track.
     #[serde(default)]
@@ -1770,18 +2482,50 @@ pub struct DeckState {
     pub paused: bool,
 }
 
-/// POST /api/v1/physical/:id/now-playing — a side is on.
+// POST /api/v1/physical/:id/now-playing — a side is on.
+//
+// The shelf is the one source where the **browser** is the player: the clock
+// runs in front of the turntable, in localStorage, and the server cannot
+// derive a playhead from anything it holds. So the deck pushes, rather than
+// the engine polling — which is why this endpoint exists at all when Plex,
+// Jellyfin and Navidrome need nothing of the kind.
+//
+// Called on every track change, on pause and resume, and on a heartbeat while
+// a side runs. The heartbeat is not optional: `NowPlaying::is_live` expires an
+// entry by *running past the end of the track*, so a paused record would drop
+// off the dashboard one track length after it was paused.
+/// A side is on the deck.
 ///
-/// The shelf is the one source where the **browser** is the player: the clock
-/// runs in front of the turntable, in localStorage, and the server cannot
-/// derive a playhead from anything it holds. So the deck pushes, rather than
-/// the engine polling — which is why this endpoint exists at all when Plex,
-/// Jellyfin and Navidrome need nothing of the kind.
+/// Session-only. The shelf is the one source where the **browser** is the
+/// player: the clock runs in front of the turntable, in localStorage, and
+/// nothing server-side can derive a playhead from a stack of rows. So the
+/// deck pushes here, where Plex, Jellyfin and Navidrome are polled.
 ///
-/// Called on every track change, on pause and resume, and on a heartbeat while
-/// a side runs. The heartbeat is not optional: `NowPlaying::is_live` expires an
-/// entry by *running past the end of the track*, so a paused record would drop
-/// off the dashboard one track length after it was paused.
+/// Call it on every track change, on pause and resume, and on a heartbeat
+/// of about ten seconds. The heartbeat is **not optional**: the registry
+/// expires an entry by running past the end of the track it knows about, so
+/// a paused record would drop off the dashboard one track length after it
+/// was paused.
+///
+/// Now-playing is forwarded to the user's Last.fm and ListenBrainz only
+/// when the track actually **changed**, and never while paused — their
+/// now-playing is a one-shot that expires on its own, so re-sending it on
+/// every heartbeat is noise aimed at someone else's servers. The listens
+/// themselves are written by `/play` when the side comes off; this endpoint
+/// stores nothing.
+#[utoipa::path(
+    post,
+    path = "/api/v1/physical/{id}/now-playing",
+    tag = "Shelf",
+    params(("id" = i64, Path)),
+    request_body = DeckState,
+    responses(
+        (status = 200, description = "OK.", body = DeckReported),
+        (status = 400, response = BadRequest),
+        (status = 401, response = Unauthorized),
+        (status = 404, response = NotFound),
+    )
+)]
 async fn set_now_playing(
     State(state): State<Arc<AppState>>,
     user: AuthUser,
@@ -1861,20 +2605,34 @@ async fn set_now_playing(
         crate::sinks::submit_now_playing(&sinks, &play).await;
     }
 
-    (StatusCode::OK, Json(serde_json::json!({ "status": "ok", "changed": changed })))
-        .into_response()
+    (StatusCode::OK, Json(DeckReported { status: "ok", changed })).into_response()
 }
 
-/// DELETE /api/v1/physical/now-playing — nothing is on the deck.
+// DELETE /api/v1/physical/now-playing — nothing is on the deck.
+//
+// Its own route rather than a field on the one above because it is also what
+// *cancelling* a side means, and that has no track to name.
+/// Nothing is on the deck.
 ///
-/// Its own route rather than a field on the one above because it is also what
-/// *cancelling* a side means, and that has no track to name.
+/// Session-only. Its own route rather than a field on the push, because it
+/// is also what *cancelling* a side means and that has no track to name.
+/// Clears only entries this shelf reported — an idle turntable must not
+/// wipe a now-playing the user's phone is currently sending over ingest.
+#[utoipa::path(
+    delete,
+    path = "/api/v1/physical/now-playing",
+    tag = "Shelf",
+    responses(
+        (status = 200, description = "Cleared.", body = ShelfDone),
+        (status = 401, response = Unauthorized),
+    )
+)]
 async fn clear_now_playing(
     State(state): State<Arc<AppState>>,
     user: AuthUser,
 ) -> impl IntoResponse {
     state.now_playing.clear_user_source(user.user_id, SHELF_SOURCE);
-    (StatusCode::OK, Json(serde_json::json!({ "status": "cleared" }))).into_response()
+    (StatusCode::OK, Json(ShelfDone { status: "cleared" })).into_response()
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -1886,16 +2644,22 @@ async fn clear_now_playing(
 //  between a side that survives a crash and one that does not, and it is what
 //  lets the phone in your pocket see the record that is actually playing.
 
-#[derive(Debug, Deserialize)]
+/// The whole state of the deck, every time.
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct SpinUpdate {
+    /// Must be yours — a 404 otherwise.
     pub release_id: i64,
     pub side: String,
     pub started_at: i64,
+    /// Null while running.
     #[serde(default)]
     pub paused_at: Option<i64>,
+    /// Seconds spent stopped.
     #[serde(default)]
     pub paused_total: i64,
+    /// Per-track `{position, started_at, skipped}`, stored whole.
     #[serde(default)]
+    #[schema(value_type = Vec<Object>)]
     pub outcomes: Vec<serde_json::Value>,
     #[serde(default)]
     pub chain_id: Option<i64>,
@@ -1907,15 +2671,35 @@ pub struct SpinUpdate {
     pub start_secs: i64,
 }
 
-/// GET /api/v1/physical/spin — the side on the deck, with enough of the record
-/// to draw it without a second request.
+// GET /api/v1/physical/spin — the side on the deck, with enough of the record
+// to draw it without a second request.
+/// The side currently on the deck.
+///
+/// Session-only. Returns `{ "spin": null }` when nothing is on.
+///
+/// The shelf is the one source where the *browser* is the player, so the
+/// countdown runs in the page — but what is on and when it started live
+/// here. That is what lets a second device see the record, and what makes a
+/// side survive a browser crash.
+///
+/// A spin whose release has since been deleted is cleared and reported as
+/// nothing on, rather than returned as a dangling id.
+#[utoipa::path(
+    get,
+    path = "/api/v1/physical/spin",
+    tag = "Shelf",
+    responses(
+        (status = 200, description = "OK.", body = Spin),
+        (status = 401, response = Unauthorized),
+    )
+)]
 async fn get_spin(State(state): State<Arc<AppState>>, user: AuthUser) -> impl IntoResponse {
     let spin = match state.db.get_spin(user.user_id).await {
         Ok(s) => s,
         Err(e) => return err(500, e.to_string()),
     };
     let Some(spin) = spin else {
-        return (StatusCode::OK, Json(serde_json::json!({ "spin": null }))).into_response();
+        return (StatusCode::OK, Json(Spin { spin: None })).into_response();
     };
 
     // A spin whose record has since been deleted is not a spin. Clearing it
@@ -1925,7 +2709,7 @@ async fn get_spin(State(state): State<Arc<AppState>>, user: AuthUser) -> impl In
         Ok(Some(r)) => r,
         Ok(None) => {
             let _ = state.db.clear_spin(user.user_id).await;
-            return (StatusCode::OK, Json(serde_json::json!({ "spin": null }))).into_response();
+            return (StatusCode::OK, Json(Spin { spin: None })).into_response();
         }
         Err(e) => return err(500, e.to_string()),
     };
@@ -1934,35 +2718,56 @@ async fn get_spin(State(state): State<Arc<AppState>>, user: AuthUser) -> impl In
         serde_json::from_str(&spin.outcomes).unwrap_or_else(|_| serde_json::json!([]));
     (
         StatusCode::OK,
-        Json(serde_json::json!({
-            "spin": {
-                "release_id": spin.release_id,
-                "kind": release.kind,
-                "artist": release.artist,
-                "title": release.title,
-                "artwork_url": release.artwork_url,
-                "mbid_release": release.mbid_release,
-                "side": spin.side,
-                "started_at": spin.started_at,
-                "paused_at": spin.paused_at,
-                "paused_total": spin.paused_total,
-                "outcomes": outcomes,
-                "chain_id": spin.chain_id,
-                "equipment_id": spin.equipment_id,
-                "start_secs": spin.start_secs,
-                "updated_at": spin.updated_at,
-            }
-        })),
+        Json(Spin {
+            spin: Some(SpinView {
+                release_id: spin.release_id,
+                kind: release.kind,
+                artist: release.artist,
+                title: release.title,
+                artwork_url: release.artwork_url,
+                mbid_release: release.mbid_release,
+                side: spin.side,
+                started_at: spin.started_at,
+                paused_at: spin.paused_at,
+                paused_total: spin.paused_total,
+                outcomes,
+                chain_id: spin.chain_id,
+                equipment_id: spin.equipment_id,
+                start_secs: spin.start_secs,
+                updated_at: spin.updated_at,
+            }),
+        }),
     )
         .into_response()
 }
 
-/// PUT /api/v1/physical/spin — put a side on, or update the one that is on.
+// PUT /api/v1/physical/spin — put a side on, or update the one that is on.
+//
+// The whole state every time rather than a patch per field: it is half a dozen
+// small numbers, it changes only on real events (start, pause, skip, next),
+// and a partial update would let two devices interleave into a state neither
+// of them meant.
+/// Put a side on the deck, or update the one that is on.
 ///
-/// The whole state every time rather than a patch per field: it is half a dozen
-/// small numbers, it changes only on real events (start, pause, skip, next),
-/// and a partial update would let two devices interleave into a state neither
-/// of them meant.
+/// Session-only. One deck per user — the table's primary key is the user,
+/// because nobody listens to two records at once, so starting a second side
+/// replaces the first rather than erroring.
+///
+/// The whole state is sent every time rather than a patch per field: it is
+/// half a dozen small numbers, it changes only on real events (start,
+/// pause, skip, next track), and a partial update would let two devices
+/// interleave into a state neither of them meant.
+#[utoipa::path(
+    put,
+    path = "/api/v1/physical/spin",
+    tag = "Shelf",
+    request_body = SpinUpdate,
+    responses(
+        (status = 200, description = "Stored.", body = ShelfDone),
+        (status = 401, response = Unauthorized),
+        (status = 404, description = "No such record.", body = ErrorResponse),
+    )
+)]
 async fn put_spin(
     State(state): State<Arc<AppState>>,
     user: AuthUser,
@@ -1993,22 +2798,37 @@ async fn put_spin(
         )
         .await
     {
-        Ok(()) => (StatusCode::OK, Json(serde_json::json!({ "status": "ok" }))).into_response(),
+        Ok(()) => (StatusCode::OK, Json(ShelfDone { status: "ok" })).into_response(),
         Err(e) => err(500, e.to_string()),
     }
 }
 
-/// DELETE /api/v1/physical/spin — take it off the deck.
+// DELETE /api/v1/physical/spin — take it off the deck.
+//
+// Also clears the now-playing entry, so the two cannot disagree: a deck
+// showing a record that came off twenty minutes ago is the failure the
+// now-playing design already calls out.
+/// Take the side off the deck.
 ///
-/// Also clears the now-playing entry, so the two cannot disagree: a deck
-/// showing a record that came off twenty minutes ago is the failure the
-/// now-playing design already calls out.
+/// Session-only. Clears the now-playing entry as well, so the two cannot
+/// disagree. Recording a side (`POST /api/v1/physical/{id}/play`) clears it
+/// too — otherwise reopening the page would offer to resume a side that has
+/// already been logged, which is how one gets logged twice.
+#[utoipa::path(
+    delete,
+    path = "/api/v1/physical/spin",
+    tag = "Shelf",
+    responses(
+        (status = 200, description = "Cleared.", body = ShelfDone),
+        (status = 401, response = Unauthorized),
+    )
+)]
 async fn delete_spin(State(state): State<Arc<AppState>>, user: AuthUser) -> impl IntoResponse {
     if let Err(e) = state.db.clear_spin(user.user_id).await {
         return err(500, e.to_string());
     }
     state.now_playing.clear_user_source(user.user_id, SHELF_SOURCE);
-    (StatusCode::OK, Json(serde_json::json!({ "status": "cleared" }))).into_response()
+    (StatusCode::OK, Json(ShelfDone { status: "cleared" })).into_response()
 }
 
 /// How a medium is written on a listen. One place, because it is written by the
@@ -2022,7 +2842,21 @@ fn medium_label(kind: &str) -> &'static str {
     }
 }
 
-/// GET /api/v1/physical/equipment/:id/wear — hours on a stylus or head.
+// GET /api/v1/physical/equipment/:id/wear — hours on a stylus or head.
+/// Stylus hours or head wear for a piece of gear.
+///
+/// Derived from `physical_plays`. A duplicate submission is not counted as
+/// wear.
+#[utoipa::path(
+    get,
+    path = "/api/v1/physical/equipment/{id}/wear",
+    tag = "Shelf",
+    params(("id" = i64, Path)),
+    responses(
+        (status = 200, description = "OK.", body = GearWear),
+        (status = 401, response = Unauthorized),
+    )
+)]
 async fn equipment_wear(
     State(state): State<Arc<AppState>>,
     user: AuthUser,
@@ -2031,10 +2865,7 @@ async fn equipment_wear(
     match state.db.equipment_playback_hours(user.user_id, id).await {
         Ok((hours, sides)) => (
             StatusCode::OK,
-            Json(serde_json::json!({
-                "hours": (hours * 10.0).round() / 10.0,
-                "sides_played": sides,
-            })),
+            Json(GearWear { hours: (hours * 10.0).round() / 10.0, sides_played: sides }),
         )
             .into_response(),
         Err(e) => err(500, e.to_string()),
@@ -2045,6 +2876,19 @@ async fn equipment_wear(
 //  Discogs configuration (admin)
 // ════════════════════════════════════════════════════════════
 
+/// Whether Discogs is configured.
+///
+/// Session-only. Never returns the credential itself.
+#[utoipa::path(
+    get,
+    path = "/api/v1/physical/settings/discogs",
+    tag = "Shelf",
+    responses(
+        (status = 200, description = "OK.", body = DiscogsSettings),
+        (status = 401, response = Unauthorized),
+        (status = 403, description = "Admin only.", body = ErrorResponse),
+    )
+)]
 async fn get_discogs(State(state): State<Arc<AppState>>, user: AuthUser) -> impl IntoResponse {
     if !user.is_admin {
         return err(403, "Admin only");
@@ -2073,22 +2917,27 @@ async fn get_discogs(State(state): State<Arc<AppState>>, user: AuthUser) -> impl
     let stored = stored_token || stored_pair;
     (
         StatusCode::OK,
-        Json(serde_json::json!({
+        Json(DiscogsSettings {
             // Never the credential itself, the same rule source credentials follow.
-            "configured": stored || from_env,
-            "from_env": from_env,
-            "stored": stored,
+            configured: stored || from_env,
+            from_env,
+            stored,
             // Which shape is in use, so the UI can say so rather than leaving
             // someone guessing which of the two fields took effect.
-            "kind": if stored_token || (!stored && token_env) { "token" }
-                    else if stored_pair || (!stored && pair_env) { "key_secret" }
-                    else { "none" },
-        })),
+            kind: if stored_token || (!stored && token_env) {
+                "token"
+            } else if stored_pair || (!stored && pair_env) {
+                "key_secret"
+            } else {
+                "none"
+            },
+        }),
     )
         .into_response()
 }
 
-#[derive(Debug, Deserialize)]
+/// Each field is written only when present; an empty string clears it.
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct DiscogsUpdate {
     /// A personal access token. Empty clears it.
     #[serde(default)]
@@ -2100,6 +2949,24 @@ pub struct DiscogsUpdate {
     pub secret: Option<String>,
 }
 
+/// Store a Discogs credential.
+///
+/// Session-only. Accepts **either** a personal access token **or** a
+/// consumer key/secret pair — either is enough, since Tapedeck only reads
+/// the public database. The three-legged OAuth flow is deliberately not
+/// implemented: it exists so an app can act *as a user*, and registering an
+/// app hands you a key and secret that work directly. Stored encrypted.
+#[utoipa::path(
+    put,
+    path = "/api/v1/physical/settings/discogs",
+    tag = "Shelf",
+    request_body = DiscogsUpdate,
+    responses(
+        (status = 200, description = "Saved.", body = DiscogsConfigured),
+        (status = 401, response = Unauthorized),
+        (status = 403, description = "Admin only.", body = ErrorResponse),
+    )
+)]
 async fn set_discogs(
     State(state): State<Arc<AppState>>,
     user: AuthUser,
@@ -2123,15 +2990,36 @@ async fn set_discogs(
         }
     }
     let configured = discogs_auth(&state).await.is_some();
-    (StatusCode::OK, Json(serde_json::json!({ "configured": configured }))).into_response()
+    (StatusCode::OK, Json(DiscogsConfigured { configured })).into_response()
 }
 
-/// POST /api/v1/physical/settings/discogs/test — does the credential work?
+// POST /api/v1/physical/settings/discogs/test — does the credential work?
+//
+// Separate from saving it because Discogs answers a bad key/secret with a
+// normal 200, serving the request as anonymous. Without this, a typo looks
+// exactly like success until someone notices barcode lookups are quietly
+// worse.
+/// Verify the stored Discogs credential.
 ///
-/// Separate from saving it because Discogs answers a bad key/secret with a
-/// normal 200, serving the request as anonymous. Without this, a typo looks
-/// exactly like success until someone notices barcode lookups are quietly
-/// worse.
+/// Session-only, and **necessary rather than a nicety**: Discogs does not
+/// reject a bad credential. With a bogus key and secret, `/releases/1` and
+/// `/database/search` both return a normal 200 with real data, and the
+/// rate-limit header reads the *authenticated* 60 — the limit is raised for
+/// the presence of an `Authorization` header without checking its contents.
+/// `/users/{username}` is the one endpoint that actually verifies, and is
+/// what this calls. Without it, a typo is indistinguishable from a working
+/// credential.
+#[utoipa::path(
+    post,
+    path = "/api/v1/physical/settings/discogs/test",
+    tag = "Shelf",
+    responses(
+        (status = 200, description = "Result of the check.", body = DiscogsCheck),
+        (status = 400, description = "Discogs is not configured on this server.", body = ErrorResponse),
+        (status = 401, response = Unauthorized),
+        (status = 403, description = "Admin only.", body = ErrorResponse),
+    )
+)]
 async fn test_discogs(State(state): State<Arc<AppState>>, user: AuthUser) -> impl IntoResponse {
     if !user.is_admin {
         return err(403, "Admin only");
@@ -2142,19 +3030,17 @@ async fn test_discogs(State(state): State<Arc<AppState>>, user: AuthUser) -> imp
     match release_lookup::discogs_verify(&auth).await {
         Ok(()) => (
             StatusCode::OK,
-            Json(serde_json::json!({
-                "ok": true,
-                "message": "Working — Discogs accepted the credential.",
-            })),
+            Json(DiscogsCheck {
+                ok: true,
+                message: "Working — Discogs accepted the credential.".into(),
+            }),
         )
             .into_response(),
         // A rejection is a 200 with `ok: false`, not an HTTP error: the request
         // to Tapedeck succeeded and the answer is "no". The message is
         // Discogs' own, which names which credential shape it rejected.
-        Err(e) => {
-            (StatusCode::OK, Json(serde_json::json!({ "ok": false, "message": e.to_string() })))
-                .into_response()
-        }
+        Err(e) => (StatusCode::OK, Json(DiscogsCheck { ok: false, message: e.to_string() }))
+            .into_response(),
     }
 }
 
@@ -2186,22 +3072,60 @@ beside it rather than rows inside it. A backup and this export together are the
 whole shelf.
 ";
 
-/// POST /api/v1/physical/import — put a shelf back.
+// POST /api/v1/physical/import — put a shelf back.
+//
+// The counterpart of the export above, and deliberately **not** a database
+// restore. It brings back the objects: pressings, their tracklists, the gear,
+// the sides you played, and your own scans.
+//
+// What it cannot bring back is the *listening* — a shelf export holds no
+// `scrobbles`, so the listens a side generated are not in the file and the
+// chain hours derived from them stay where they are. That is stated in the
+// response rather than papered over, because a shelf that came back with its
+// play counts but no listens would make two screens disagree.
+//
+// **Everything is matched before it is inserted**, so importing the same zip
+// twice changes nothing the second time. That matters more here than for a
+// listens import: a duplicated pressing is a visible mess on a page you look
+// at, and there is no dedup elsewhere that would catch it.
+/// Put a shelf back from an export.
 ///
-/// The counterpart of the export above, and deliberately **not** a database
-/// restore. It brings back the objects: pressings, their tracklists, the gear,
-/// the sides you played, and your own scans.
+/// Session-only, `multipart/form-data`, 256 MB maximum. The counterpart of
+/// `GET /api/v1/physical/export`, and deliberately **not** a database
+/// restore: it brings back the *objects* — pressings, tracklists, gear,
+/// the sides played, and your own scans.
 ///
-/// What it cannot bring back is the *listening* — a shelf export holds no
-/// `scrobbles`, so the listens a side generated are not in the file and the
-/// chain hours derived from them stay where they are. That is stated in the
-/// response rather than papered over, because a shelf that came back with its
-/// play counts but no listens would make two screens disagree.
+/// What it cannot bring back is the **listening**. A shelf export holds no
+/// `scrobbles`, so the listens a side generated are not in the file, and
+/// the chain hours derived from them do not return with the objects. The
+/// response says so rather than leaving it to be discovered.
 ///
-/// **Everything is matched before it is inserted**, so importing the same zip
-/// twice changes nothing the second time. That matters more here than for a
-/// listens import: a duplicated pressing is a visible mess on a page you look
-/// at, and there is no dedup elsewhere that would catch it.
+/// **Everything is matched before it is inserted**, so importing the same
+/// archive twice changes nothing the second time. A pressing is matched on
+/// its barcode or release MBID when it has one, and otherwise on artist,
+/// title and medium together; a side played is matched on its side and
+/// timestamp, so re-importing cannot double the wear on a stylus.
+///
+/// Signal chains are **matched by name, never created** — the same rule
+/// `[[gear:…]]` follows. A chain is something you build step by step, and
+/// conjuring an empty one from a name in a file would silently attribute
+/// listens to a chain with no components. Gear *is* created, since a piece
+/// of equipment is fully described by the file.
+///
+/// Nothing is written until `shelf.json` parses, so an unrelated or
+/// truncated zip fails before it has half-populated a shelf.
+#[utoipa::path(
+    post,
+    path = "/api/v1/physical/import",
+    tag = "Shelf",
+    request_body(content = FileUpload, content_type = "multipart/form-data"),
+    responses(
+        (status = 200, description = "Imported.", body = ShelfImported),
+        (status = 400, response = BadRequest),
+        (status = 401, response = Unauthorized),
+        (status = 413, description = "Larger than 256 MB.", body = ErrorResponse),
+    )
+)]
 async fn import_shelf(
     State(state): State<Arc<AppState>>,
     user: AuthUser,
@@ -2493,24 +3417,24 @@ async fn import_shelf(
 
     (
         StatusCode::OK,
-        Json(serde_json::json!({
-            "releases": report.releases,
-            "already_on_the_shelf": report.already,
-            "skipped": report.skipped,
-            "gear": report.gear,
-            "images": report.images,
-            "missing_scans": report.missing_scans,
-            "plays": report.plays,
+        Json(ShelfImported {
+            releases: report.releases,
+            already_on_the_shelf: report.already,
+            skipped: report.skipped,
+            gear: report.gear,
+            images: report.images,
+            missing_scans: report.missing_scans,
+            plays: report.plays,
             // Said plainly rather than left to be discovered: the listens a
             // side generated live in `scrobbles`, which a shelf export does not
             // carry. Chain hours are derived from those, so they do not return
             // with the objects.
-            "note": concat!(
+            note: concat!(
                 "Pressings, gear, scans and sides are back. The listens those sides ",
                 "generated are not in a shelf export — restore a database backup for ",
                 "the history and the chain hours derived from it."
             ),
-        })),
+        }),
     )
         .into_response()
 }
@@ -2622,11 +3546,36 @@ fn parse_csv_row(line: &str) -> Vec<String> {
     out
 }
 
-/// GET /api/v1/physical/export — the shelf as a zip.
+// GET /api/v1/physical/export — the shelf as a zip.
+//
+// Built in memory rather than streamed, unlike the listen export: a zip's
+// central directory is written after the entries anyway, and a shelf is
+// bounded by how many records fit in a room.
+/// The whole shelf as a zip.
 ///
-/// Built in memory rather than streamed, unlike the listen export: a zip's
-/// central directory is written after the entries anyway, and a shelf is
-/// bounded by how many records fit in a room.
+/// Session-only. `shelf.json` (pressings, purchase dates, tracklists and an
+/// image manifest), `plays.csv` (every side played, oldest first, gear
+/// named), `gear.json` (equipment and chains with purchase dates) and
+/// `scans/` — the images the **user uploaded**, one directory per pressing.
+///
+/// Images that live at the Cover Art Archive or Discogs are listed with
+/// their URLs rather than copied in: they are not the user's to
+/// redistribute and they are still there to fetch. Their own scans exist
+/// nowhere else, which is why those are the ones in the file.
+///
+/// This exists separately from `GET /api/v1/backup` for a concrete reason:
+/// a backup is a `VACUUM INTO` snapshot of the database, and uploaded scans
+/// are files beside it rather than rows inside it. A backup and this export
+/// together are the whole shelf.
+#[utoipa::path(
+    get,
+    path = "/api/v1/physical/export",
+    tag = "Shelf",
+    responses(
+        (status = 200, description = "A zip archive.", body = Bytes, content_type = "application/zip"),
+        (status = 401, response = Unauthorized),
+    )
+)]
 async fn export_shelf(State(state): State<Arc<AppState>>, user: AuthUser) -> impl IntoResponse {
     use std::io::Write;
 
@@ -2846,6 +3795,40 @@ fn csv(s: &str) -> String {
         s.to_string()
     }
 }
+
+#[derive(utoipa::OpenApi)]
+#[openapi(paths(
+    lookup,
+    export_shelf,
+    import_shelf,
+    discogs_detail,
+    equipment_wear,
+    get_discogs,
+    set_discogs,
+    test_discogs,
+    clear_now_playing,
+    get_spin,
+    put_spin,
+    delete_spin,
+    update_image,
+    delete_image,
+    image_file,
+    list_shelf,
+    add_release,
+    get_one,
+    update_release,
+    delete_release,
+    set_tracks,
+    preview_durations,
+    apply_durations,
+    play_side,
+    set_now_playing,
+    side_plays,
+    list_images,
+    upload_image,
+    fetch_images
+))]
+pub struct Api;
 
 pub fn create_physical_router() -> Router<Arc<AppState>> {
     Router::new()

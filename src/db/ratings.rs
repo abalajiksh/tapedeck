@@ -70,7 +70,7 @@ impl LibraryRatingRow {
 
 /// What is held, per source, so a screen can say where the numbers came from
 /// without listing them.
-#[derive(Debug, Clone, FromRow, serde::Serialize)]
+#[derive(Debug, Clone, FromRow, serde::Serialize, utoipa::ToSchema)]
 pub struct RatingSourceSummary {
     pub source_id: i64,
     pub source_kind: String,
@@ -87,7 +87,7 @@ pub struct RatingSourceSummary {
 /// count in this codebase is: a rating on something never played is real data
 /// and is kept, but it does not become a love, and a screen reporting only the
 /// loves would silently understate what the library holds.
-#[derive(Debug, Clone, Default, serde::Serialize)]
+#[derive(Debug, Clone, Default, serde::Serialize, utoipa::ToSchema)]
 pub struct RatingApply {
     /// Ratings that clear the bar.
     pub qualifying: usize,

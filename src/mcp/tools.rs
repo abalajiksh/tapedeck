@@ -1247,7 +1247,7 @@ async fn push_playlist(
         })
         .collect();
 
-    let result = crate::server::playlists::push_tracks(
+    let pushed = crate::server::playlists::push_tracks(
         state,
         auth.user.user_id,
         source_id,
@@ -1257,16 +1257,11 @@ async fn push_playlist(
     .await
     .map_err(|e| ToolFailure::Execution(e.message))?;
 
-    let _ = state
-        .db
-        .mark_playlist_pushed(
-            auth.user.user_id,
-            playlist_id,
-            result.get("target").and_then(Value::as_str).unwrap_or("media server"),
-        )
-        .await;
+    // The protocol, as the HTTP push records it. This used to read `target`,
+    // which is an object, so every push from here was filed as "media server".
+    let _ = state.db.mark_playlist_pushed(auth.user.user_id, playlist_id, pushed.protocol).await;
 
-    Ok(ToolOutcome::new(result))
+    Ok(ToolOutcome::new(serde_json::to_value(&pushed).unwrap_or_default()))
 }
 
 /// `add_to_crate` — the one tool that may name music the user does not own.

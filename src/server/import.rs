@@ -25,28 +25,82 @@ use super::models::ErrorResponse;
 use super::AppState;
 use crate::db::{Database, ImportOutcome};
 use crate::models::Play;
+use crate::openapi::{BadRequest, NotFound, Unauthorized};
+use utoipa::ToSchema;
+
+/// The id to poll `/api/v1/import/jobs/{job_id}` with.
+#[derive(Serialize, ToSchema)]
+pub struct ImportStarted {
+    pub job_id: String,
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct ImportJobs {
+    /// Still running.
+    pub jobs: Vec<ImportJob>,
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct ImportHistory {
+    /// The last fifty, newest first.
+    pub imports: Vec<PastImport>,
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct PastImport {
+    /// `listenbrainz`, `lastfm` or `file`.
+    pub source: String,
+    /// Started, Unix seconds.
+    pub date: i64,
+    /// New rows actually inserted.
+    pub count: i64,
+    /// `done`, `error`, or `interrupted` — a job the server restarted under.
+    pub status: String,
+}
+
+/// An export or log file, sniffed by content rather than by name.
+#[derive(ToSchema)]
+#[allow(dead_code)] // describes a multipart body; never constructed
+pub struct ImportUpload {
+    #[schema(value_type = String, format = Binary)]
+    pub file: Vec<u8>,
+    /// IANA region. Required for a Rockbox log whose header says
+    /// `#TZ/UNKNOWN`.
+    #[schema(example = "Europe/Berlin")]
+    pub timezone: Option<String>,
+}
 
 pub type ImportRegistry = Arc<Mutex<HashMap<String, ImportJob>>>;
 
-#[derive(Clone, Serialize)]
+/// One import's progress.
+#[derive(Clone, Serialize, ToSchema)]
 pub struct ImportJob {
     pub job_id: String,
     #[serde(skip)]
     pub user_id: i64, // owner (not serialized to clients)
     #[serde(skip)]
     pub db_id: i64, // row in import_jobs (persisted for durable history)
-    pub source: String,  // "listenbrainz" | "lastfm" | "file"
-    pub state: String,   // "running" | "done" | "error"
-    pub fetched: usize,  // listens pulled from the source
-    pub imported: usize, // new rows actually inserted (post-dedup)
+    /// `listenbrainz`, `lastfm` or `file`.
+    pub source: String,
+    /// `running`, `done` or `error`.
+    pub state: String,
+    /// Listens read from the source, before dedup.
+    pub fetched: usize,
+    /// New rows actually inserted.
+    pub imported: usize,
     /// Listens already held that the incoming copy taught something to — an
-    /// MBID, a duration, a cover-art id. Counted apart from `imported` because
-    /// "0 new listens" reads as "nothing happened", and on a re-import of a
-    /// history you already hold, a great deal just did.
+    /// MBID, a duration, a cover-art id, a track number. Fields that are
+    /// **blank** are filled from a duplicate; fields already populated are
+    /// never touched. Counted apart from `imported` because a re-import of a
+    /// history you already hold correctly inserts nothing, and `imported: 0`
+    /// alone reads as though the job did nothing at all.
     pub enriched: usize,
-    pub total: Option<usize>, // known upper bound, when the source reports one
-    pub status: String,       // human message / error detail
-    pub date: i64,            // started, unix seconds
+    /// A known upper bound, when the source reports one.
+    pub total: Option<usize>,
+    /// Human-readable progress; the error detail when `state` is `error`.
+    pub status: String,
+    /// Started, Unix seconds.
+    pub date: i64,
 }
 
 fn job_id() -> String {
@@ -161,9 +215,11 @@ fn play(
 
 // ── Request bodies ──
 
-#[derive(Deserialize)]
+#[derive(Deserialize, ToSchema)]
 pub struct ServiceImport {
+    /// The account to import from.
     pub username: String,
+    /// ListenBrainz only: a user token, which lets a private history be read.
     #[serde(default)]
     pub token: Option<String>,
 }
@@ -172,6 +228,23 @@ pub struct ServiceImport {
 //  Endpoints
 // ════════════════════════════════════════════════════════════
 
+/// Import from a ListenBrainz account.
+///
+/// Session-only. Paced deliberately: a 30s timeout, exponential backoff on
+/// network errors and 5xx, `429` honoured via `X-RateLimit-Reset-In`, and
+/// 400ms between pages. **Do not remove the inter-page sleep to speed this
+/// up** — hammering is what broke it at ~80k listens.
+#[utoipa::path(
+    post,
+    path = "/api/v1/import/listenbrainz",
+    tag = "Import & export",
+    request_body = ServiceImport,
+    responses(
+        (status = 202, description = "Job started; poll it.", body = ImportStarted),
+        (status = 400, response = BadRequest),
+        (status = 401, response = Unauthorized),
+    )
+)]
 async fn import_listenbrainz(
     State(state): State<Arc<AppState>>,
     user: AuthUser,
@@ -191,9 +264,23 @@ async fn import_listenbrainz(
         }
         persist_job(&reg, &id, &db).await;
     });
-    (StatusCode::ACCEPTED, Json(serde_json::json!({ "job_id": ret }))).into_response()
+    (StatusCode::ACCEPTED, Json(ImportStarted { job_id: ret })).into_response()
 }
 
+/// Import from a Last.fm account.
+///
+/// Session-only.
+#[utoipa::path(
+    post,
+    path = "/api/v1/import/lastfm",
+    tag = "Import & export",
+    request_body = ServiceImport,
+    responses(
+        (status = 202, description = "Job started; poll it.", body = ImportStarted),
+        (status = 400, response = BadRequest),
+        (status = 401, response = Unauthorized),
+    )
+)]
 async fn import_lastfm(
     State(state): State<Arc<AppState>>,
     user: AuthUser,
@@ -202,10 +289,10 @@ async fn import_lastfm(
     if crate::sinks::LASTFM_API_KEY.is_empty() {
         return (
             StatusCode::BAD_REQUEST,
-            Json(serde_json::json!(ErrorResponse {
+            Json(ErrorResponse {
                 code: 400,
-                error: "Last.fm import requires LASTFM_API_KEY to be configured".into()
-            })),
+                error: "Last.fm import requires LASTFM_API_KEY to be configured".into(),
+            }),
         )
             .into_response();
     }
@@ -226,9 +313,48 @@ async fn import_lastfm(
         }
         persist_job(&reg, &id, &db).await;
     });
-    (StatusCode::ACCEPTED, Json(serde_json::json!({ "job_id": ret }))).into_response()
+    (StatusCode::ACCEPTED, Json(ImportStarted { job_id: ret })).into_response()
 }
 
+/// Import a file.
+///
+/// Session-only. Sniffs the **content**, not the filename — people rename
+/// downloads. Accepts a ListenBrainz export zip (JSONL, and its
+/// `feedback.jsonl` becomes loves), a Spotify Extended Streaming History
+/// zip, a CSV, or a Rockbox `.scrobbler.log`. The two zip formats are told
+/// apart by their entry names, since both are plain zips.
+///
+/// A ListenBrainz export carries a full `mbid_mapping`, so those listens
+/// skip MusicBrainz enrichment *and* the artwork chain — for a 20k history
+/// that is the difference between free and a week of rate-limited lookups.
+/// A Spotify export carries no MusicBrainz identifiers at all, so the
+/// opposite is true and every distinct track needs a lookup afterwards.
+///
+/// **A Spotify export's `ts` is when the track stopped**, not when it
+/// started, so it is corrected on the way in; each play is filed as a
+/// listen or a skip on the same half-the-track threshold the live sources
+/// use, rather than on Spotify's own `skipped` field, which records
+/// something else. Podcast episodes and audiobook chapters are dropped.
+/// Those listens keep `spotify_track_id` and land with `source_name`
+/// `spotify`.
+///
+/// **Rockbox `#TZ/UNKNOWN` is refused, not guessed.** DAPs often have no
+/// time sync, so their timestamps are local wall-clock seconds; assuming
+/// the server's zone would shift a whole device's history by the offset,
+/// unrecoverably. Supply `timezone` in that case.
+///
+/// Imports land as `imported` and are **never forwarded**.
+#[utoipa::path(
+    post,
+    path = "/api/v1/import/file",
+    tag = "Import & export",
+    request_body(content = ImportUpload, content_type = "multipart/form-data"),
+    responses(
+        (status = 202, description = "Job started; poll it.", body = ImportStarted),
+        (status = 400, response = BadRequest),
+        (status = 401, response = Unauthorized),
+    )
+)]
 async fn import_file(
     State(state): State<Arc<AppState>>,
     user: AuthUser,
@@ -255,10 +381,7 @@ async fn import_file(
     let Some(bytes) = bytes else {
         return (
             StatusCode::BAD_REQUEST,
-            Json(serde_json::json!(ErrorResponse {
-                code: 400,
-                error: "No file field in multipart body".into()
-            })),
+            Json(ErrorResponse { code: 400, error: "No file field in multipart body".into() }),
         )
             .into_response();
     };
@@ -275,9 +398,21 @@ async fn import_file(
         }
         persist_job(&reg, &id, &db).await;
     });
-    (StatusCode::ACCEPTED, Json(serde_json::json!({ "job_id": ret }))).into_response()
+    (StatusCode::ACCEPTED, Json(ImportStarted { job_id: ret })).into_response()
 }
 
+/// One job's progress.
+#[utoipa::path(
+    get,
+    path = "/api/v1/import/jobs/{job_id}",
+    tag = "Import & export",
+    params(("job_id" = String, Path)),
+    responses(
+        (status = 200, description = "OK.", body = ImportJob),
+        (status = 401, response = Unauthorized),
+        (status = 404, response = NotFound),
+    )
+)]
 async fn job_status(
     State(state): State<Arc<AppState>>,
     user: AuthUser,
@@ -290,20 +425,33 @@ async fn job_status(
         .and_then(|m| m.get(&job).cloned())
         .filter(|j| j.user_id == user.user_id);
     match found {
-        Some(j) => (StatusCode::OK, Json(serde_json::json!(j))).into_response(),
-        None => (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!(ErrorResponse { code: 404, error: "Unknown job".into() })),
-        )
-            .into_response(),
+        Some(j) => (StatusCode::OK, Json(j)).into_response(),
+        None => {
+            (StatusCode::NOT_FOUND, Json(ErrorResponse { code: 404, error: "Unknown job".into() }))
+                .into_response()
+        }
     }
 }
 
-/// GET /api/v1/import/jobs — the caller's jobs that are still running.
+// GET /api/v1/import/jobs — the caller's jobs that are still running.
+//
+// The import page only learned a job id from the response to the POST that
+// started it, so navigating away and back lost the progress bar while the job
+// carried on in the background. This lets the page find its own work again.
+/// Jobs running right now.
 ///
-/// The import page only learned a job id from the response to the POST that
-/// started it, so navigating away and back lost the progress bar while the job
-/// carried on in the background. This lets the page find its own work again.
+/// Session-only. Live progress is an **in-memory** registry, so in-flight
+/// jobs are lost on restart (the import aborts with them). Finished jobs
+/// are persisted — see `/api/v1/import/history`.
+#[utoipa::path(
+    get,
+    path = "/api/v1/import/jobs",
+    tag = "Import & export",
+    responses(
+        (status = 200, description = "OK.", body = ImportJobs),
+        (status = 401, response = Unauthorized),
+    )
+)]
 async fn active_jobs(State(state): State<Arc<AppState>>, user: AuthUser) -> impl IntoResponse {
     let jobs: Vec<ImportJob> = state
         .imports
@@ -316,20 +464,38 @@ async fn active_jobs(State(state): State<Arc<AppState>>, user: AuthUser) -> impl
                 .collect()
         })
         .unwrap_or_default();
-    (StatusCode::OK, Json(serde_json::json!({ "jobs": jobs }))).into_response()
+    (StatusCode::OK, Json(ImportJobs { jobs })).into_response()
 }
 
+/// Finished import jobs.
+///
+/// Session-only. Persisted, so this survives restarts.
+#[utoipa::path(
+    get,
+    path = "/api/v1/import/history",
+    tag = "Import & export",
+    responses(
+        (status = 200, description = "OK.", body = ImportHistory),
+        (status = 401, response = Unauthorized),
+    )
+)]
 async fn import_history(State(state): State<Arc<AppState>>, user: AuthUser) -> impl IntoResponse {
     match state.db.list_imports(user.user_id).await {
         Ok(rows) => {
-            let imports: Vec<serde_json::Value> = rows.iter().map(|r| serde_json::json!({
-                "source": r.source, "date": r.created_at, "count": r.imported, "status": r.state,
-            })).collect();
-            (StatusCode::OK, Json(serde_json::json!({ "imports": imports }))).into_response()
+            let imports = rows
+                .into_iter()
+                .map(|r| PastImport {
+                    source: r.source,
+                    date: r.created_at,
+                    count: r.imported,
+                    status: r.state,
+                })
+                .collect();
+            (StatusCode::OK, Json(ImportHistory { imports })).into_response()
         }
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!(ErrorResponse { code: 500, error: e.to_string() })),
+            Json(ErrorResponse { code: 500, error: e.to_string() }),
         )
             .into_response(),
     }
@@ -1123,6 +1289,17 @@ fn split_csv(line: &str) -> Vec<String> {
     fields.push(cur);
     fields
 }
+
+#[derive(utoipa::OpenApi)]
+#[openapi(paths(
+    import_listenbrainz,
+    import_lastfm,
+    import_file,
+    active_jobs,
+    job_status,
+    import_history
+))]
+pub struct Api;
 
 pub fn create_import_router() -> Router<Arc<AppState>> {
     Router::new()

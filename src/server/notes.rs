@@ -24,58 +24,64 @@ use axum::{
     routing::{get, post},
     Router,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
+use utoipa::{IntoParams, ToSchema};
 
 use super::auth::{ReadAuth, WriteAuth};
 use super::models::ErrorResponse;
+use super::models::OkResponse;
 use super::AppState;
 use crate::db::{Database, EntityRow, NoteRow, NoteTarget};
 use crate::notes::{self, RefKind, Resolved};
+use crate::openapi::{BadRequest, Bytes, Forbidden, NotFound, Unauthorized};
 
 const VISIBILITIES: [&str; 3] = ["private", "patched", "public"];
 
 fn err(code: StatusCode, msg: impl Into<String>) -> axum::response::Response {
-    (code, Json(serde_json::json!(ErrorResponse { code: code.as_u16(), error: msg.into() })))
-        .into_response()
+    (code, Json(ErrorResponse { code: code.as_u16(), error: msg.into() })).into_response()
 }
 
 fn server_error(e: sqlx::Error) -> axum::response::Response {
     err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
 }
 
-/// What a note or a love points at. Exactly one of these forms is used:
+// `from_scrobble` is how the UI turns a row in the history into something
+// annotatable without the browser having to know entity ids. A line is not an
+// entity and never becomes one, the same refusal a period makes: it is a
+// position in somebody else's text, so there is nothing to conjure a row for —
+// and it cannot be loved for the same reason.
+/// What a note (or a love) is about. Name it one way:
 ///
-/// * `entity_id` — an entity that already exists.
-/// * `scrobble_id` — the listen itself.
-/// * `from_scrobble` + `kind` — the track / album / artist *of* that listen,
-///   created on demand. This is how the UI turns a row in the history into
-///   something annotatable without the browser having to know entity ids.
-/// * `kind` + `name` (+ `artist`) — spelled out.
-/// * `period_unit` + `period_key` — a week, a month or a year of listening,
-///   named exactly as the Reports page names it.
-/// * `line` + `artist` + `name` — one numbered line of a lyric, which is a
-///   **pin**. Not an entity and never becomes one, the same refusal a period
-///   makes: a line is a position in somebody else's text, so there is nothing
-///   to conjure a row for — and it cannot be loved for the same reason.
-#[derive(Debug, Deserialize, Default)]
+/// * `entity_id` — a track, album or artist already known;
+/// * `scrobble_id` — one listen;
+/// * `from_scrobble` + `kind` — the track, album or artist *of* that listen,
+///   created if new;
+/// * `kind` + `name` (+ `artist` for a track or album) — spelled out, created
+///   if new;
+/// * `period_unit` + `period_key` — a week, a month or a year of listening;
+/// * `line` + `artist` + `name` — one numbered line of a lyric, a **pin**. A
+///   pin is never an entity and cannot be loved.
+#[derive(Debug, Deserialize, Default, ToSchema)]
 pub struct TargetSpec {
     pub entity_id: Option<i64>,
     pub scrobble_id: Option<i64>,
-    /// `week` / `month` / `year`, alongside `period_key`. Both or neither.
+    /// `week`, `month` or `year`, alongside `period_key`. Both or neither.
     pub period_unit: Option<String>,
-    /// One of `reports::period_of`'s keys — `2026`, `2026-08`, `2026-W32`.
+    /// As Reports names it — `2026`, `2026-08`, `2026-W32`.
     pub period_key: Option<String>,
-    /// A **pin**: `line` alongside `artist` and `name` (the track's title).
-    ///
-    /// The artist and title are named outright rather than read against
-    /// anything, because a pin has no other subject — it *is* the target, and
-    /// it has to be findable from the reader, which knows the names and has no
-    /// note to read them against. The `[[line:12]]` in a note's prose is the
-    /// relative form and lives in `resolve_line`.
+    /// A **pin**: the line's number, alongside `artist` and `name` (the
+    /// track's title). Blank lines are numbered.
+    // The artist and title are named outright rather than read against
+    // anything, because a pin has no other subject — it *is* the target, and
+    // it has to be findable from the reader, which knows the names and has no
+    // note to read them against. The `[[line:12]]` in a note's prose is the
+    // relative form and lives in `resolve_line`.
     pub line: Option<usize>,
+    /// With `kind: track`, prefer the album this listen was filed under.
     pub from_scrobble: Option<i64>,
+    /// `track`/`recording`, `album`/`release` or `artist`.
     pub kind: Option<String>,
     pub name: Option<String>,
     pub artist: Option<String>,
@@ -410,17 +416,93 @@ async fn note_context(db: &Database, user_id: i64, note: &NoteRow) -> NoteCtx {
 /// artist, the title and the number. Built in one place so the reader, the
 /// notes list and `notes/for` cannot disagree about the shape — and so the
 /// separator stays an implementation detail of the storage.
-fn line_json(key: &str, label: &str, text: Option<&str>) -> serde_json::Value {
+fn line_json(key: &str, label: &str, text: Option<&str>) -> LinePos {
     let (artist, title) = NoteTarget::line_names(label).unwrap_or(("", label));
-    serde_json::json!({
-        "artist": artist,
-        "title": title,
-        "line": NoteTarget::line_number(key).unwrap_or(0),
+    LinePos {
+        artist: artist.to_string(),
+        title: title.to_string(),
+        line: NoteTarget::line_number(key).unwrap_or(0),
         // The words, when the lyric is still held. Resolved on read and never
         // stored — the first of the design's four rules, and the reason a pin
         // survives the lyric being corrected under it.
-        "text": text,
-    })
+        text: text.map(str::to_string),
+    }
+}
+
+/// One numbered line of a lyric.
+#[derive(Serialize, ToSchema)]
+pub struct LinePos {
+    pub artist: String,
+    pub title: String,
+    /// 1-based, blank lines included.
+    pub line: usize,
+    /// The words, when this instance still holds the lyric. A pin outlives the
+    /// lyric it points at, so null is not an error.
+    pub text: Option<String>,
+}
+
+/// A pin, as it reads under the note it rolls up into.
+#[derive(Serialize, ToSchema)]
+pub struct PinFootnote {
+    pub note_id: i64,
+    pub line: LinePos,
+    pub body_md: String,
+    /// The first 200 characters, as text.
+    pub excerpt: String,
+    pub updated_at: i64,
+}
+
+/// A listen a note hangs off.
+#[derive(Serialize, ToSchema)]
+pub struct NoteListen {
+    pub id: i64,
+    pub title: String,
+    pub artist: String,
+    pub album: Option<String>,
+    pub timestamp: i64,
+}
+
+/// A period a note hangs off.
+#[derive(Serialize, ToSchema)]
+pub struct NotePeriod {
+    /// `week`, `month` or `year`.
+    pub unit: String,
+    /// `2026-W32`, `2026-08`, `2026`.
+    pub key: String,
+}
+
+/// A liner note, with everything a screen needs: what it hangs off, the
+/// rendered body, whether the subject is loved, and how many earlier versions
+/// exist. Exactly one of `entity`, `listen`, `period` and `line` is set.
+#[derive(Serialize, ToSchema)]
+#[schema(as = Note)]
+pub struct NoteView {
+    pub id: i64,
+    /// Markdown, with `[[kind:name]]` shortcodes.
+    pub body_md: String,
+    /// The first 140 characters, as text.
+    pub excerpt: String,
+    /// `private` or another of the allowed visibilities.
+    pub visibility: String,
+    pub created_at: i64,
+    pub updated_at: i64,
+    pub entity: Option<EntityRow>,
+    pub listen: Option<NoteListen>,
+    pub period: Option<NotePeriod>,
+    /// Set on a pin: the line it hangs off.
+    pub line: Option<LinePos>,
+    /// How many distinct lyric lines the body quotes.
+    pub lines_quoted: usize,
+    /// The pins that roll up under this note as footnotes, in the order the
+    /// record plays. Empty in a listing.
+    pub pins: Vec<PinFootnote>,
+    pub loved: bool,
+    /// Earlier versions kept.
+    pub revisions: usize,
+    /// The rendered, sanitised body with every shortcode resolved. Absent in a
+    /// listing.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub body_html: Option<String>,
 }
 
 /// The words of one line, if this instance still holds them.
@@ -453,7 +535,7 @@ async fn pin_footnotes(
     lyrics: Option<&crate::lyrics::LyricsClient>,
     user_id: i64,
     scope: &[(String, String)],
-) -> Vec<serde_json::Value> {
+) -> Vec<PinFootnote> {
     if scope.is_empty() {
         return Vec::new();
     }
@@ -479,20 +561,20 @@ async fn pin_footnotes(
             continue;
         }
         let text = line_text(lyrics, artist, title, n).await;
-        out.push(serde_json::json!({
-            "note_id": note.id,
-            "line": line_json(key, label, text.as_deref()),
-            "body_md": note.body_md,
-            "excerpt": notes::excerpt(&note.body_md, 200),
-            "updated_at": note.updated_at,
-        }));
+        out.push(PinFootnote {
+            note_id: note.id,
+            line: line_json(key, label, text.as_deref()),
+            body_md: note.body_md.clone(),
+            excerpt: notes::excerpt(&note.body_md, 200),
+            updated_at: note.updated_at,
+        });
     }
     // Footnotes read in the order the record plays, not the order they were
     // written: they are numbered markers under a piece of prose, and 3 before 1
     // would look like a mistake.
     out.sort_by_key(|v| {
-        let t = v["line"]["title"].as_str().unwrap_or("").to_lowercase();
-        let n = v["line"]["line"].as_u64().unwrap_or(0);
+        let t = v.line.title.to_lowercase();
+        let n = v.line.line;
         let pos =
             scope.iter().position(|(_, st)| st.trim().to_lowercase() == t).unwrap_or(usize::MAX);
         (pos, n)
@@ -571,18 +653,19 @@ async fn note_json(
     user_id: i64,
     note: &NoteRow,
     with_html: bool,
-) -> serde_json::Value {
+) -> NoteView {
     let ctx = note_context(db, user_id, note).await;
     let entity: Option<EntityRow> = match note.entity_id {
         Some(id) => db.get_entity(id).await.ok().flatten(),
         None => None,
     };
     let listen = match note.scrobble_id {
-        Some(id) => db.get_scrobble(user_id, id).await.ok().flatten().map(|s| {
-            serde_json::json!({
-                "id": s.id, "title": s.title, "artist": s.artist,
-                "album": s.album, "timestamp": s.timestamp,
-            })
+        Some(id) => db.get_scrobble(user_id, id).await.ok().flatten().map(|s| NoteListen {
+            id: s.id,
+            title: s.title,
+            artist: s.artist,
+            album: s.album,
+            timestamp: s.timestamp,
         }),
         None => None,
     };
@@ -598,7 +681,7 @@ async fn note_json(
     // is without parsing the key's shape a second time.
     let period = note.period_key.as_deref().map(|key| {
         let (unit, k) = key.split_once(':').unwrap_or(("", key));
-        serde_json::json!({ "unit": unit, "key": k })
+        NotePeriod { unit: unit.to_string(), key: k.to_string() }
     });
 
     // A pin: the note *is* the footnote, so the line it hangs off is part of
@@ -653,41 +736,74 @@ async fn note_json(
         Vec::new()
     };
 
-    let mut out = serde_json::json!({
-        "id": note.id,
-        "body_md": note.body_md,
-        "excerpt": notes::excerpt(&note.body_md, 140),
-        "visibility": note.visibility,
-        "created_at": note.created_at,
-        "updated_at": note.updated_at,
-        "entity": entity,
-        "listen": listen,
-        "period": period,
-        "line": line,
-        "lines_quoted": quoted.len(),
-        "pins": pins,
-        "loved": loved,
-        "revisions": revisions,
-    });
-    if with_html {
-        let html = render(db, lyrics, user_id, &note.body_md, &ctx).await;
-        out["body_html"] = serde_json::Value::String(html);
+    let body_html =
+        if with_html { Some(render(db, lyrics, user_id, &note.body_md, &ctx).await) } else { None };
+    NoteView {
+        id: note.id,
+        body_md: note.body_md.clone(),
+        excerpt: notes::excerpt(&note.body_md, 140),
+        visibility: note.visibility.clone(),
+        created_at: note.created_at,
+        updated_at: note.updated_at,
+        entity,
+        listen,
+        period,
+        line,
+        lines_quoted: quoted.len(),
+        pins,
+        loved,
+        revisions,
+        body_html,
     }
-    out
 }
 
 // ── Handlers ──
 
-#[derive(Deserialize)]
+/// A note's target, flattened alongside its body.
+#[derive(Deserialize, ToSchema)]
 pub struct SaveNoteRequest {
     #[serde(flatten)]
     pub target: TargetSpec,
+    /// Markdown. `[[track:…]]`, `[[album:…]]`, `[[artist:…]]`, `[[gear:…]]` and
+    /// `[[line:12]]` shortcodes resolve against your own history.
     pub body_md: String,
+    /// `private` by default.
     pub visibility: Option<String>,
 }
 
-/// POST /api/v1/notes — write the note for a target, creating it or editing the
-/// one already there. The previous body is archived by the database layer.
+// POST /api/v1/notes — write the note for a target, creating it or editing the
+// one already there. The previous body is archived by the database layer.
+/// Create or update a note.
+///
+/// Scope: `write` *(since v0.39)*.
+///
+/// A note hangs off **exactly one** target: `entity_id`, `scrobble_id`, or
+/// the `period_unit` + `period_key` pair. Editing archives the previous
+/// body into revisions — but only when the body actually changed, so
+/// flipping visibility is not a rewrite.
+///
+/// A **period** target names a week, a month or a year exactly as the
+/// Reports page does. The key is validated against the shapes
+/// `reports::period_of` produces and anything else is a 400 — the key is
+/// the note's identity, so one that page cannot reproduce files a note its
+/// author can never find again.
+///
+/// The body is Markdown. `[[track:…]]`, `[[album:…]]`, `[[artist:…]]`,
+/// `[[track:3]]` and `[[gear:…]]` shortcodes resolve server-side; an
+/// unresolved one is never an error.
+#[utoipa::path(
+    post,
+    path = "/api/v1/notes",
+    tag = "Notes",
+    security(("sessionCookie" = []), ("apiToken" = ["write"])),
+    request_body = SaveNoteRequest,
+    responses(
+        (status = 200, description = "Saved.", body = NoteView),
+        (status = 400, description = "No target named, or a period key Reports would not produce.", body = ErrorResponse),
+        (status = 401, response = Unauthorized),
+        (status = 403, response = Forbidden),
+    )
+)]
 pub async fn save_note(
     State(state): State<Arc<AppState>>,
     WriteAuth { user }: WriteAuth,
@@ -724,7 +840,8 @@ pub async fn save_note(
     }
 }
 
-#[derive(Deserialize, Default)]
+#[derive(Deserialize, Default, IntoParams)]
+#[into_params(parameter_in = Query)]
 pub struct ListQuery {
     /// Free text, matched against the body *and* the subject.
     pub q: Option<String>,
@@ -735,14 +852,38 @@ pub struct ListQuery {
     pub sort: Option<String>,
 }
 
-/// GET /api/v1/notes — everything this user has written, newest edit first.
+// GET /api/v1/notes — everything this user has written, newest edit first.
+//
+// Takes a query and a kind because a notes collection is a thing that grows: at
+// twenty notes a flat list is fine and at two hundred it is a wall. Both are
+// applied in SQL rather than here — see `Database::search_notes` for why.
+//
+// `total` is the unfiltered count, so the UI can say "12 of 240" and a search
+// returning nothing reads as a search rather than as an empty account.
+/// Your liner notes.
 ///
-/// Takes a query and a kind because a notes collection is a thing that grows: at
-/// twenty notes a flat list is fine and at two hundred it is a wall. Both are
-/// applied in SQL rather than here — see `Database::search_notes` for why.
+/// Scope: `read` *(since v0.39)*. Self-only, whatever `visibility` says.
 ///
-/// `total` is the unfiltered count, so the UI can say "12 of 240" and a search
-/// returning nothing reads as a search rather than as an empty account.
+/// `q` matches the note's **body and its subject both** — someone looking
+/// for what they wrote about Burial means either, and asking which is a
+/// worse answer than searching both. Case-insensitivity is SQLite's `LIKE`,
+/// which folds ASCII only: `BURIAL` finds `Burial`, `CŒUR` does not find
+/// `Cœur`.
+///
+/// `total` is the count **before** filtering, so a search that finds nothing
+/// reads as a search rather than as an empty account.
+#[utoipa::path(
+    get,
+    path = "/api/v1/notes",
+    tag = "Notes",
+    security(("sessionCookie" = []), ("apiToken" = ["read"])),
+    params(ListQuery),
+    responses(
+        (status = 200, description = "OK.", body = NoteList),
+        (status = 401, response = Unauthorized),
+        (status = 403, response = Forbidden),
+    )
+)]
 pub async fn list_notes(
     State(state): State<Arc<AppState>>,
     ReadAuth { user }: ReadAuth,
@@ -766,14 +907,37 @@ pub async fn list_notes(
             } else {
                 state.db.list_notes(user.user_id).await.map(|r| r.len()).unwrap_or(out.len())
             };
-            (StatusCode::OK, Json(serde_json::json!({ "notes": out, "total": total })))
-                .into_response()
+            (StatusCode::OK, Json(NoteList { notes: out, total })).into_response()
         }
         Err(e) => server_error(e),
     }
 }
 
-/// GET /api/v1/notes/:id
+/// Your notes, and how many there are in all.
+#[derive(Serialize, ToSchema)]
+pub struct NoteList {
+    /// Without `body_html` or `pins`.
+    pub notes: Vec<NoteView>,
+    /// Every note you have, filtered or not — "12 of 240".
+    pub total: usize,
+}
+
+/// One note.
+///
+/// Scope: `read` *(since v0.39)*.
+#[utoipa::path(
+    get,
+    path = "/api/v1/notes/{id}",
+    tag = "Notes",
+    security(("sessionCookie" = []), ("apiToken" = ["read"])),
+    params(("id" = i64, Path, description = "The note.")),
+    responses(
+        (status = 200, description = "OK.", body = NoteView),
+        (status = 401, response = Unauthorized),
+        (status = 403, response = Forbidden),
+        (status = 404, response = NotFound),
+    )
+)]
 async fn get_note(
     State(state): State<Arc<AppState>>,
     ReadAuth { user }: ReadAuth,
@@ -790,22 +954,54 @@ async fn get_note(
     }
 }
 
-/// DELETE /api/v1/notes/:id — drops the revisions with it.
+// DELETE /api/v1/notes/:id — drops the revisions with it.
+/// Delete a note.
+///
+/// Scope: `write` *(since v0.39)*. Revisions go with it.
+#[utoipa::path(
+    delete,
+    path = "/api/v1/notes/{id}",
+    tag = "Notes",
+    security(("sessionCookie" = []), ("apiToken" = ["write"])),
+    params(("id" = i64, Path, description = "The note.")),
+    responses(
+        (status = 200, description = "Deleted, with its revisions. `status` is `deleted`.", body = OkResponse),
+        (status = 401, response = Unauthorized),
+        (status = 403, response = Forbidden),
+        (status = 404, response = NotFound),
+    )
+)]
 async fn delete_note(
     State(state): State<Arc<AppState>>,
     WriteAuth { user }: WriteAuth,
     Path(id): Path<i64>,
 ) -> impl IntoResponse {
     match state.db.delete_note(user.user_id, id).await {
-        Ok(true) => {
-            (StatusCode::OK, Json(serde_json::json!({ "status": "deleted" }))).into_response()
-        }
+        Ok(true) => (StatusCode::OK, OkResponse::new("deleted")).into_response(),
         Ok(false) => err(StatusCode::NOT_FOUND, "No such note"),
         Err(e) => server_error(e),
     }
 }
 
-/// GET /api/v1/notes/:id/revisions — earlier bodies, newest first.
+// GET /api/v1/notes/:id/revisions — earlier bodies, newest first.
+/// A note's history.
+///
+/// Scope: `read` *(since v0.39)*. Opt-in — the read path serves only the
+/// current body. Notes are meant to be kept, and a rewrite five years on
+/// should not erase what you thought at the time.
+#[utoipa::path(
+    get,
+    path = "/api/v1/notes/{id}/revisions",
+    tag = "Notes",
+    security(("sessionCookie" = []), ("apiToken" = ["read"])),
+    params(("id" = i64, Path, description = "The note.")),
+    responses(
+        (status = 200, description = "OK.", body = Revisions),
+        (status = 401, response = Unauthorized),
+        (status = 403, response = Forbidden),
+        (status = 404, response = NotFound),
+    )
+)]
 async fn note_revisions(
     State(state): State<Arc<AppState>>,
     ReadAuth { user }: ReadAuth,
@@ -815,30 +1011,101 @@ async fn note_revisions(
         Ok(rows) => {
             let out: Vec<_> = rows
                 .iter()
-                .map(|r| {
-                    serde_json::json!({
-                        "id": r.id,
-                        "body_md": r.body_md,
-                        "excerpt": notes::excerpt(&r.body_md, 140),
-                        "created_at": r.created_at,
-                    })
+                .map(|r| Revision {
+                    id: r.id,
+                    body_md: r.body_md.clone(),
+                    excerpt: notes::excerpt(&r.body_md, 140),
+                    created_at: r.created_at,
                 })
                 .collect();
-            (StatusCode::OK, Json(serde_json::json!({ "revisions": out }))).into_response()
+            (StatusCode::OK, Json(Revisions { revisions: out })).into_response()
         }
         Err(e) => server_error(e),
     }
 }
 
-#[derive(Deserialize)]
+/// Earlier versions of a note, newest first.
+#[derive(Serialize, ToSchema)]
+pub struct Revisions {
+    pub revisions: Vec<Revision>,
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct Revision {
+    pub id: i64,
+    pub body_md: String,
+    pub excerpt: String,
+    /// When this version was replaced.
+    pub created_at: i64,
+}
+
+/// A rendered body.
+#[derive(Serialize, ToSchema)]
+pub struct Preview {
+    pub body_html: String,
+}
+
+/// Every pinned line.
+#[derive(Serialize, ToSchema)]
+pub struct PinnedLines {
+    pub lines: Vec<PinnedLine>,
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct PinnedLine {
+    pub note_id: i64,
+    pub line: LinePos,
+    /// The first 120 characters, as text.
+    pub excerpt: String,
+    pub updated_at: i64,
+}
+
+/// The note for a target, or `null` — "no note here" is the normal case, and
+/// the caller still needs the resolved target to open an editor on it.
+#[derive(Serialize, ToSchema)]
+pub struct NoteFor {
+    pub note: Option<NoteView>,
+    pub target: TargetView,
+    pub loved: bool,
+}
+
+/// What a target resolved to. One key, named for its kind.
+#[derive(Serialize, ToSchema)]
+#[serde(untagged)]
+pub enum TargetView {
+    Entity { entity: Option<EntityRow> },
+    Listen { listen: Option<NoteListen> },
+    Period { period: NotePeriod },
+    Line { line: LinePos },
+}
+
+#[derive(Deserialize, ToSchema)]
 struct PreviewRequest {
     #[serde(flatten)]
     target: TargetSpec,
     body_md: String,
 }
 
-/// POST /api/v1/notes/preview — render without saving, so the editor can show
-/// what a shortcode will actually resolve to before you commit to it.
+// POST /api/v1/notes/preview — render without saving, so the editor can show
+// what a shortcode will actually resolve to before you commit to it.
+/// Render Markdown and resolve shortcodes, without saving.
+///
+/// Scope: `write` *(since v0.39)*. A POST that does not save, but **not** a
+/// pure read: resolving a shortcode can create the entity it points at, the
+/// same write-on-read trade `/api/v1/resolve` makes.
+#[utoipa::path(
+    post,
+    path = "/api/v1/notes/preview",
+    tag = "Notes",
+    security(("sessionCookie" = []), ("apiToken" = ["write"])),
+    request_body = PreviewRequest,
+    responses(
+        (status = 200, description = "Rendered.", body = Preview),
+        (status = 401, response = Unauthorized),
+        (status = 403, response = Forbidden),
+        (status = 422, description = "The body is not a note — `body_md` missing or not a string."),
+    )
+)]
 async fn preview(
     State(state): State<Arc<AppState>>,
     WriteAuth { user }: WriteAuth,
@@ -898,20 +1165,46 @@ async fn preview(
     };
 
     let html = render(&state.db, state.lyrics.as_deref(), user.user_id, &body.body_md, &ctx).await;
-    (StatusCode::OK, Json(serde_json::json!({ "body_html": html }))).into_response()
+    (StatusCode::OK, Json(Preview { body_html: html })).into_response()
 }
 
-/// GET /api/v1/lines — every line this user has pinned, newest edit first.
+// GET /api/v1/lines — every line this user has pinned, newest edit first.
+//
+// The design's "Lines you've written about", beside the annotate-lines mode.
+// **Across everything** rather than per record on purpose: that is what makes
+// it a way back into writing you had forgotten, rather than a second copy of
+// the margin you are already looking at.
+//
+// `line.text` carries the words when this instance still holds them and is
+// simply absent when it does not — a pin outlives the lyric it points at, the
+// same way a note outlives the entity that resolved it, and that is not an
+// error.
+/// Every lyric line this user has pinned.
 ///
-/// The design's "Lines you've written about", beside the annotate-lines mode.
-/// **Across everything** rather than per record on purpose: that is what makes
-/// it a way back into writing you had forgotten, rather than a second copy of
-/// the margin you are already looking at.
+/// Scope: `read`.
+///
+/// A **pin** is a note whose target *is* the line, rather than prose that
+/// quotes one. It is the one form of lyric reference that can ever
+/// federate, because nothing of the provider's text is written into the
+/// note — a reader elsewhere sees your words and a stub.
+///
+/// Across everything rather than per record on purpose: that is what makes
+/// it a way back into writing you had forgotten rather than a second copy
+/// of the margin you are already looking at.
 ///
 /// `line.text` carries the words when this instance still holds them and is
-/// simply absent when it does not — a pin outlives the lyric it points at, the
-/// same way a note outlives the entity that resolved it, and that is not an
-/// error.
+/// simply absent when it does not. A pin outlives the lyric it points at,
+/// the same way a note outlives the entity that resolved it, and that is
+/// not an error.
+#[utoipa::path(
+    get,
+    path = "/api/v1/lines",
+    tag = "Notes",
+    security(("sessionCookie" = []), ("apiToken" = ["read"])),
+    responses(
+        (status = 200, description = "OK.", body = PinnedLines),
+    )
+)]
 async fn list_lines(
     State(state): State<Arc<AppState>>,
     ReadAuth { user }: ReadAuth,
@@ -931,20 +1224,22 @@ async fn list_lines(
                     }
                     _ => None,
                 };
-                out.push(serde_json::json!({
-                    "note_id": note.id,
-                    "line": line_json(key, label, text.as_deref()),
-                    "excerpt": notes::excerpt(&note.body_md, 120),
-                    "updated_at": note.updated_at,
-                }));
+                out.push(PinnedLine {
+                    note_id: note.id,
+                    line: line_json(key, label, text.as_deref()),
+                    excerpt: notes::excerpt(&note.body_md, 120),
+                    updated_at: note.updated_at,
+                });
             }
-            (StatusCode::OK, Json(serde_json::json!({ "lines": out }))).into_response()
+            (StatusCode::OK, Json(PinnedLines { lines: out })).into_response()
         }
         Err(e) => server_error(e),
     }
 }
 
-#[derive(Deserialize)]
+/// The target, named the ways `TargetSpec` allows.
+#[derive(Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
 struct ForQuery {
     entity_id: Option<i64>,
     scrobble_id: Option<i64>,
@@ -957,11 +1252,27 @@ struct ForQuery {
     artist: Option<String>,
 }
 
-/// GET /api/v1/notes/for?… — the note for a target, if there is one.
+// GET /api/v1/notes/for?… — the note for a target, if there is one.
+//
+// Answers `{ note: null, target: {…} }` rather than 404 when nothing has been
+// written yet: "no note here" is the normal case, and the caller still needs
+// the resolved target to open an editor on it.
+/// The note for a given target, if any.
 ///
-/// Answers `{ note: null, target: {…} }` rather than 404 when nothing has been
-/// written yet: "no note here" is the normal case, and the caller still needs
-/// the resolved target to open an editor on it.
+/// Scope: `read` *(since v0.39)*.
+#[utoipa::path(
+    get,
+    path = "/api/v1/notes/for",
+    tag = "Notes",
+    security(("sessionCookie" = []), ("apiToken" = ["read"])),
+    params(ForQuery),
+    responses(
+        (status = 200, description = "OK. `note` is null when nothing is written yet.", body = NoteFor),
+        (status = 400, description = "The query names no target, or one that does not resolve.", body = ErrorResponse),
+        (status = 401, response = Unauthorized),
+        (status = 403, response = Forbidden),
+    )
+)]
 async fn note_for(
     State(state): State<Arc<AppState>>,
     ReadAuth { user }: ReadAuth,
@@ -988,18 +1299,20 @@ async fn note_for(
         NoteTarget::Entity(id) => {
             let entity = state.db.get_entity(id).await.ok().flatten();
             let loved = state.db.is_loved(user.user_id, id).await.unwrap_or(false);
-            (
-                state.db.note_for_entity(user.user_id, id).await,
-                serde_json::json!({ "entity": entity }),
-                loved,
-            )
+            (state.db.note_for_entity(user.user_id, id).await, TargetView::Entity { entity }, loved)
         }
         NoteTarget::Listen(id) => {
-            let listen = state.db.get_scrobble(user.user_id, id).await.ok().flatten()
-                .map(|s| serde_json::json!({ "id": s.id, "title": s.title, "artist": s.artist, "album": s.album, "timestamp": s.timestamp }));
+            let listen =
+                state.db.get_scrobble(user.user_id, id).await.ok().flatten().map(|s| NoteListen {
+                    id: s.id,
+                    title: s.title,
+                    artist: s.artist,
+                    album: s.album,
+                    timestamp: s.timestamp,
+                });
             (
                 state.db.note_for_scrobble(user.user_id, id).await,
-                serde_json::json!({ "listen": listen }),
+                TargetView::Listen { listen },
                 false,
             )
         }
@@ -1009,13 +1322,15 @@ async fn note_for(
             let (unit, k) = key.split_once(':').unwrap_or(("", key.as_str()));
             (
                 state.db.note_for_period(user.user_id, key).await,
-                serde_json::json!({ "period": { "unit": unit, "key": k } }),
+                TargetView::Period {
+                    period: NotePeriod { unit: unit.to_string(), key: k.to_string() },
+                },
                 false,
             )
         }
         NoteTarget::Line { ref key, ref label } => (
             state.db.note_for_line_key(user.user_id, key).await,
-            serde_json::json!({ "line": line_json(key, label, None) }),
+            TargetView::Line { line: line_json(key, label, None) },
             false,
         ),
     };
@@ -1024,30 +1339,131 @@ async fn note_for(
         Ok(Some(note)) => {
             let body =
                 note_json(&state.db, state.lyrics.as_deref(), user.user_id, &note, true).await;
-            (
-                StatusCode::OK,
-                Json(serde_json::json!({ "note": body, "target": target_json, "loved": loved })),
-            )
+            (StatusCode::OK, Json(NoteFor { note: Some(body), target: target_json, loved }))
                 .into_response()
         }
-        Ok(None) => (
-            StatusCode::OK,
-            Json(serde_json::json!({ "note": null, "target": target_json, "loved": loved })),
-        )
+        Ok(None) => (StatusCode::OK, Json(NoteFor { note: None, target: target_json, loved }))
             .into_response(),
         Err(e) => server_error(e),
     }
 }
 
-#[derive(Deserialize)]
+/// What to love, named the ways `TargetSpec` allows — a track, an album or an
+/// artist; not a listen, a period or a line.
+#[derive(Deserialize, ToSchema)]
 pub struct LoveRequest {
     #[serde(flatten)]
     pub target: TargetSpec,
-    /// Omitted means "love it"; pass false to un-love.
+    /// Omitted means "love it"; pass `false` to un-love.
     pub loved: Option<bool>,
 }
 
-/// POST /api/v1/loves — love or un-love an entity.
+/// A love, set or withdrawn.
+#[derive(Serialize, ToSchema)]
+pub struct LoveSet {
+    pub entity: Option<EntityRow>,
+    pub loved: bool,
+}
+
+/// Every loved entity as its identity key.
+#[derive(Serialize, ToSchema)]
+pub struct LoveKeys {
+    /// `kind|artist|name`, lowercased — `recording|aphex twin|xtal`. Derive a
+    /// row's key the same way and match locally.
+    pub keys: Vec<String>,
+}
+
+/// The Loved page.
+#[derive(Serialize, ToSchema)]
+pub struct Loves {
+    pub loves: Vec<LovedRow>,
+}
+
+/// A loved entity, and what your history says about it.
+#[derive(Serialize, ToSchema)]
+pub struct LovedRow {
+    pub entity: LovedEntityRef,
+    /// Unix seconds.
+    pub loved_at: i64,
+    pub plays: i64,
+    pub last_played: Option<i64>,
+    /// Absent for an artist.
+    pub album: Option<String>,
+    pub artwork_url: Option<String>,
+    pub caa_id: Option<i64>,
+    pub caa_release_mbid: Option<String>,
+    pub note_id: Option<i64>,
+    pub note_excerpt: Option<String>,
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct LovedEntityRef {
+    pub id: i64,
+    /// `recording`, `release` or `artist`.
+    pub kind: String,
+    pub name: String,
+    pub artist_name: String,
+    pub mbid: Option<String>,
+}
+
+/// What has been written or loved around one listen.
+#[derive(Serialize, ToSchema)]
+pub struct Annotations {
+    /// The note on this playing itself.
+    pub listen_note_id: Option<i64>,
+    /// Null when the listen has no title.
+    pub track: Option<AnnotationTarget>,
+    /// Null when the listen has no album.
+    pub album: Option<AnnotationTarget>,
+    pub artist: Option<AnnotationTarget>,
+}
+
+/// A track, album or artist around a listen. `entity_id` is null until
+/// someone actually writes about it or loves it — inspecting a listen mints
+/// nothing.
+#[derive(Serialize, ToSchema)]
+pub struct AnnotationTarget {
+    pub name: String,
+    pub entity_id: Option<i64>,
+    pub note_id: Option<i64>,
+    pub loved: bool,
+}
+
+/// One entity, and your note on it.
+#[derive(Serialize, ToSchema)]
+pub struct EntityView {
+    pub entity: EntityRow,
+    pub loved: bool,
+    pub note: Option<NoteView>,
+}
+
+// POST /api/v1/loves — love or un-love an entity.
+/// Love or un-love.
+///
+/// Scope: `write` *(since v0.39)*.
+///
+/// Loves attach to **entities, never to a listen** — loving one *playing*
+/// of a track is a category error and is rejected.
+///
+/// A love of a **recording** is mirrored outward (Last.fm `track.love`,
+/// ListenBrainz `recording-feedback`); albums and artists stay local
+/// because neither service has the concept. ListenBrainz needs a recording
+/// MBID, so an un-enriched track is skipped rather than guessed at. The
+/// forward is spawned, not awaited — the love is already stored and the UI
+/// should not wait on Last.fm.
+#[utoipa::path(
+    post,
+    path = "/api/v1/loves",
+    tag = "Loves",
+    security(("sessionCookie" = []), ("apiToken" = ["write"])),
+    request_body = LoveRequest,
+    responses(
+        (status = 200, description = "Stored.", body = LoveSet),
+        (status = 400, response = BadRequest),
+        (status = 401, response = Unauthorized),
+        (status = 403, response = Forbidden),
+    )
+)]
 pub async fn set_love(
     State(state): State<Arc<AppState>>,
     WriteAuth { user }: WriteAuth,
@@ -1107,31 +1523,81 @@ pub async fn set_love(
                 });
             }
 
-            (StatusCode::OK, Json(serde_json::json!({ "entity": entity, "loved": loved })))
-                .into_response()
+            (StatusCode::OK, Json(LoveSet { entity, loved })).into_response()
         }
         Err(e) => server_error(e),
     }
 }
 
-/// GET /api/v1/loves/keys — every loved entity as its identity key.
+// GET /api/v1/loves/keys — every loved entity as its identity key.
+//
+// The history and dashboard put a heart on every row, and asking per row would
+// be one request per listen. The key is deterministic (`kind|artist|name`,
+// lowercased — `Database::entity_key`), so the client fetches this once and
+// matches locally. Entities are only created when something is annotated or
+// loved, so this stays small even on a large library.
+/// Every loved entity key, as a flat set.
 ///
-/// The history and dashboard put a heart on every row, and asking per row would
-/// be one request per listen. The key is deterministic (`kind|artist|name`,
-/// lowercased — `Database::entity_key`), so the client fetches this once and
-/// matches locally. Entities are only created when something is annotated or
-/// loved, so this stays small even on a large library.
+/// Scope: `read` *(since v0.39)*. One request instead of one per history
+/// row.
+///
+/// Since v0.69 a love is published in **up to three forms**, and a row is
+/// loved if *any* key it can derive is in the set. Two players rarely spell
+/// one song identically — Plex files a listen under the record's artist
+/// while a scrobble client reports what the player displayed — so an exact
+/// match alone left the heart empty on the same track from another source.
+///
+/// * `kind|artist|name` — trimmed and lowercased, an artist's `artist` half
+///   empty. The exact key, as before.
+/// * `kind|artist|name` **folded** — accents, ligatures and all punctuation
+///   removed, and the primary taken from an explicit `feat.` credit. Note a
+///   trailing title qualifier is *not* removed: "Archangel" and "Archangel
+///   (Remastered)" stay apart.
+/// * `mbid:<kind>:<mbid>` — present when the entity has a MusicBrainz id.
+///   The strongest of the three; a listen row carries a recording id.
+///
+/// **If your derivation drifts from the server's, hearts silently stop
+/// filling — nothing errors.** The folded form is pinned character for
+/// character by `the_folded_key_is_exactly_what_the_client_must_reproduce`.
+#[utoipa::path(
+    get,
+    path = "/api/v1/loves/keys",
+    tag = "Loves",
+    security(("sessionCookie" = []), ("apiToken" = ["read"])),
+    responses(
+        (status = 200, description = "OK.", body = LoveKeys),
+        (status = 401, response = Unauthorized),
+        (status = 403, response = Forbidden),
+    )
+)]
 async fn love_keys(
     State(state): State<Arc<AppState>>,
     ReadAuth { user }: ReadAuth,
 ) -> impl IntoResponse {
     match state.db.loved_keys(user.user_id).await {
-        Ok(keys) => (StatusCode::OK, Json(serde_json::json!({ "keys": keys }))).into_response(),
+        Ok(keys) => (StatusCode::OK, Json(LoveKeys { keys })).into_response(),
         Err(e) => server_error(e),
     }
 }
 
-/// GET /api/v1/loves
+/// Loved entities.
+///
+/// Scope: `read` *(since v0.39)*.
+///
+/// Since v0.43 each row carries what the Loved page needs to render it —
+/// plays, last played, artwork and the liner note — rather than the bare
+/// entity. Four queries regardless of how many loves there are.
+#[utoipa::path(
+    get,
+    path = "/api/v1/loves",
+    tag = "Loves",
+    security(("sessionCookie" = []), ("apiToken" = ["read"])),
+    responses(
+        (status = 200, description = "OK.", body = Loves),
+        (status = 401, response = Unauthorized),
+        (status = 403, response = Forbidden),
+    )
+)]
 pub async fn list_loves(
     State(state): State<Arc<AppState>>,
     ReadAuth { user }: ReadAuth,
@@ -1143,37 +1609,52 @@ pub async fn list_loves(
         Ok(rows) => {
             let out: Vec<_> = rows
                 .into_iter()
-                .map(|r| {
-                    serde_json::json!({
-                        "entity": {
-                            "id": r.id, "kind": r.kind, "name": r.name,
-                            "artist_name": r.artist_name, "mbid": r.mbid,
-                        },
-                        "loved_at": r.loved_at,
-                        "plays": r.plays,
-                        "last_played": r.last_played,
-                        "album": r.album,
-                        "artwork_url": r.artwork_url,
-                        "caa_id": r.caa_id,
-                        "caa_release_mbid": r.caa_release_mbid,
-                        "note_id": r.note_id,
-                        "note_excerpt": r.note_excerpt,
-                    })
+                .map(|r| LovedRow {
+                    entity: LovedEntityRef {
+                        id: r.id,
+                        kind: r.kind,
+                        name: r.name,
+                        artist_name: r.artist_name,
+                        mbid: r.mbid,
+                    },
+                    loved_at: r.loved_at,
+                    plays: r.plays,
+                    last_played: r.last_played,
+                    album: r.album,
+                    artwork_url: r.artwork_url,
+                    caa_id: r.caa_id,
+                    caa_release_mbid: r.caa_release_mbid,
+                    note_id: r.note_id,
+                    note_excerpt: r.note_excerpt,
                 })
                 .collect();
-            (StatusCode::OK, Json(serde_json::json!({ "loves": out }))).into_response()
+            (StatusCode::OK, Json(Loves { loves: out })).into_response()
         }
         Err(e) => server_error(e),
     }
 }
 
-/// GET /api/v1/scrobbles/:id/annotations
+// What's already been written or loved around one listen: the note on the
+// playing itself, and — for its track, album and artist — the entity **only if
+// it already exists**. Deliberately read-only: inspecting a listen shouldn't
+// mint three entity rows, so the ids come back null until someone actually
+// writes or loves something.
+/// Notes and loves attached to one listen.
 ///
-/// What's already been written or loved around one listen: the note on the
-/// playing itself, and — for its track, album and artist — the entity **only if
-/// it already exists**. Deliberately read-only: inspecting a listen shouldn't
-/// mint three entity rows, so the ids come back null until someone actually
-/// writes or loves something.
+/// Scope: `read` *(since v0.39)*.
+#[utoipa::path(
+    get,
+    path = "/api/v1/scrobbles/{id}/annotations",
+    tag = "Listens",
+    security(("sessionCookie" = []), ("apiToken" = ["read"])),
+    params(("id" = i64, Path, description = "The listen.")),
+    responses(
+        (status = 200, description = "OK.", body = Annotations),
+        (status = 401, response = Unauthorized),
+        (status = 403, response = Forbidden),
+        (status = 404, response = NotFound),
+    )
+)]
 async fn listen_annotations(
     State(state): State<Arc<AppState>>,
     ReadAuth { user }: ReadAuth,
@@ -1183,10 +1664,18 @@ async fn listen_annotations(
         return err(StatusCode::NOT_FOUND, "No such listen");
     };
 
-    let mut out = serde_json::json!({
-        "listen_note_id": state.db.note_for_scrobble(user.user_id, id).await
-            .ok().flatten().map(|n| n.id),
-    });
+    let mut out = Annotations {
+        listen_note_id: state
+            .db
+            .note_for_scrobble(user.user_id, id)
+            .await
+            .ok()
+            .flatten()
+            .map(|n| n.id),
+        track: None,
+        album: None,
+        artist: None,
+    };
 
     let album = listen.album.clone().unwrap_or_default();
     let targets: [(&str, &str, &str); 3] = [
@@ -1195,28 +1684,57 @@ async fn listen_annotations(
         ("artist", "artist", &listen.artist),
     ];
     for (label, kind, name) in targets {
-        if name.trim().is_empty() {
-            out[label] = serde_json::Value::Null;
-            continue;
-        }
-        let artist = if kind == "artist" { None } else { Some(listen.artist.as_str()) };
-        let entity = state.db.find_entity(kind, name, artist).await.ok().flatten();
-        out[label] = match entity {
-            Some(e) => serde_json::json!({
-                "name": name,
-                "entity_id": e.id,
-                "note_id": state.db.note_for_entity(user.user_id, e.id).await.ok().flatten().map(|n| n.id),
-                "loved": state.db.is_loved(user.user_id, e.id).await.unwrap_or(false),
-            }),
-            None => {
-                serde_json::json!({ "name": name, "entity_id": null, "note_id": null, "loved": false })
-            }
+        let found = if name.trim().is_empty() {
+            None
+        } else {
+            let artist = if kind == "artist" { None } else { Some(listen.artist.as_str()) };
+            let entity = state.db.find_entity(kind, name, artist).await.ok().flatten();
+            Some(match entity {
+                Some(e) => AnnotationTarget {
+                    name: name.to_string(),
+                    entity_id: Some(e.id),
+                    note_id: state
+                        .db
+                        .note_for_entity(user.user_id, e.id)
+                        .await
+                        .ok()
+                        .flatten()
+                        .map(|n| n.id),
+                    loved: state.db.is_loved(user.user_id, e.id).await.unwrap_or(false),
+                },
+                None => AnnotationTarget {
+                    name: name.to_string(),
+                    entity_id: None,
+                    note_id: None,
+                    loved: false,
+                },
+            })
         };
+        match label {
+            "track" => out.track = found,
+            "album" => out.album = found,
+            _ => out.artist = found,
+        }
     }
     (StatusCode::OK, Json(out)).into_response()
 }
 
-/// GET /api/v1/entities/:id
+/// One entity.
+///
+/// Scope: `read` *(since v0.39)*. Needed to render a note's target.
+#[utoipa::path(
+    get,
+    path = "/api/v1/entities/{id}",
+    tag = "Library",
+    security(("sessionCookie" = []), ("apiToken" = ["read"])),
+    params(("id" = i64, Path, description = "The entity.")),
+    responses(
+        (status = 200, description = "OK.", body = EntityView),
+        (status = 401, response = Unauthorized),
+        (status = 403, response = Forbidden),
+        (status = 404, response = NotFound),
+    )
+)]
 async fn get_entity(
     State(state): State<Arc<AppState>>,
     ReadAuth { user }: ReadAuth,
@@ -1226,17 +1744,13 @@ async fn get_entity(
         Ok(Some(entity)) => {
             let loved = state.db.is_loved(user.user_id, id).await.unwrap_or(false);
             let note = state.db.note_for_entity(user.user_id, id).await.ok().flatten();
-            let note_json = match note {
-                Some(n) => {
-                    note_json(&state.db, state.lyrics.as_deref(), user.user_id, &n, true).await
-                }
-                None => serde_json::Value::Null,
+            let note = match note {
+                Some(n) => Some(
+                    note_json(&state.db, state.lyrics.as_deref(), user.user_id, &n, true).await,
+                ),
+                None => None,
             };
-            (
-                StatusCode::OK,
-                Json(serde_json::json!({ "entity": entity, "loved": loved, "note": note_json })),
-            )
-                .into_response()
+            (StatusCode::OK, Json(EntityView { entity, loved, note })).into_response()
         }
         Ok(None) => err(StatusCode::NOT_FOUND, "No such entity"),
         Err(e) => server_error(e),
@@ -1463,21 +1977,56 @@ would be read as metadata anywhere.
 
 ";
 
-#[derive(Deserialize)]
+#[derive(Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
 struct ExportQuery {
     /// `zip` (default) — one file per note. `md` — everything in one document.
     format: Option<String>,
 }
 
-/// GET /api/v1/notes/export — every note as Markdown.
+// GET /api/v1/notes/export — every note as Markdown.
+//
+// Session-only, deliberately. This is the whole of the user's own writing in
+// one request; `read` on a token is meant for an app showing a note, not for
+// draining the lot.
+//
+// Held in memory rather than streamed like `/api/v1/export`: notes are a few
+// hundred short documents where listens are hundreds of thousands of rows, and
+// a zip's central directory has to be written after the entries anyway.
+/// Every note as Markdown, for Obsidian / Logseq / a folder of files.
 ///
-/// Session-only, deliberately. This is the whole of the user's own writing in
-/// one request; `read` on a token is meant for an app showing a note, not for
-/// draining the lot.
+/// **Session-only**, unlike the rest of `/notes`. This is the whole of the
+/// user's own writing in one request; `read` on a token is meant for an app
+/// showing a note, not for draining the lot.
 ///
-/// Held in memory rather than streamed like `/api/v1/export`: notes are a few
-/// hundred short documents where listens are hundreds of thousands of rows, and
-/// a zip's central directory has to be written after the entries anyway.
+/// `format=zip` (default) gives one file per note with YAML frontmatter —
+/// `title`, `kind`, `name`, `artist`, `mbid`, `loved`, `visibility`,
+/// `created`, `updated`, `tags` — plus a `README.md`. `format=md` gives one
+/// document with a section per note.
+///
+/// **Shortcodes become wikilinks, and only where they resolve.** `[[…]]` is
+/// Tapedeck's reference syntax *and* the wikilink syntax of every tool this
+/// is aimed at, so `[[track:Xtal]]` left as-is would point at a page called
+/// `track:Xtal` that will never exist. A resolved reference becomes
+/// `[[Xtal — Aphex Twin]]`, matching that note's own filename by
+/// construction. An **unresolved** one is left exactly as written: it is
+/// what the writer typed, and the same judgement the HTML renderer makes.
+///
+/// Filenames are de-duplicated (`Untitled (2)`), so a wikilink can never
+/// land on whichever of two files the vault happened to see first.
+#[utoipa::path(
+    get,
+    path = "/api/v1/notes/export",
+    tag = "Notes",
+    params(ExportQuery),
+    responses(
+        (status = 200, description = "An attachment: `tapedeck-liner-notes.zip`, or `.md` with `format=md`.", content(
+            (Bytes = "application/zip"),
+            (String = "text/markdown"),
+        )),
+        (status = 401, response = Unauthorized),
+    )
+)]
 async fn export_notes(
     State(state): State<Arc<AppState>>,
     user: super::auth::AuthUser,
@@ -1507,7 +2056,20 @@ async fn export_notes(
                     _ => "Untitled listen".to_string(),
                 },
                 (_, Some(key)) => period_title(key),
-                _ => "Untitled".to_string(),
+                // A pin names its own subject in the stored label, so it has
+                // a title of its own rather than being one more "Untitled" —
+                // which is what every pin in an export was, numbered (2), (3)…
+                _ => match (note.line_key.as_deref(), note.line_label.as_deref()) {
+                    (Some(key), Some(label)) => {
+                        match (NoteTarget::line_names(label), NoteTarget::line_number(key)) {
+                            (Some((artist, title)), Some(n)) => {
+                                format!("{title} — {artist}, line {n}")
+                            }
+                            _ => "Untitled line".to_string(),
+                        }
+                    }
+                    _ => "Untitled".to_string(),
+                },
             },
         };
         let base = notes::export_filename(&title);
@@ -1584,6 +2146,25 @@ async fn export_notes(
     )
         .into_response()
 }
+
+#[derive(utoipa::OpenApi)]
+#[openapi(paths(
+    list_notes,
+    save_note,
+    get_note,
+    delete_note,
+    note_revisions,
+    preview,
+    note_for,
+    export_notes,
+    list_lines,
+    list_loves,
+    set_love,
+    love_keys,
+    get_entity,
+    listen_annotations,
+))]
+pub struct Api;
 
 pub fn create_notes_router() -> Router<Arc<AppState>> {
     Router::new()

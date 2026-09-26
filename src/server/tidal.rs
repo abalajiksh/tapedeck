@@ -19,15 +19,62 @@ use axum::{
     Json, Router,
 };
 use base64::Engine;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::sync::{OnceLock, RwLock};
 use tracing::{info, warn};
+use utoipa::{IntoParams, ToSchema};
 
 use super::auth::AuthUser;
 use super::models::ErrorResponse;
 use super::AppState;
+use crate::openapi::{Forbidden, Unauthorized};
+
+/// Whether TIDAL can be used here, and whether you have.
+#[derive(Serialize, ToSchema)]
+pub struct TidalStatus {
+    /// The operator has registered an app. Without it there is no button to
+    /// offer — a different thing from an account nobody has linked.
+    pub configured: bool,
+    pub connected: bool,
+}
+
+/// Where to send the browser.
+#[derive(Serialize, ToSchema)]
+pub struct TidalConnect {
+    /// TIDAL's authorize URL, carrying a PKCE `S256` challenge and a
+    /// single-use `state` that expires in ten minutes. Open it in a new tab.
+    pub authorize_url: String,
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct TidalDisconnected {
+    /// Whether there was a connection to forget.
+    pub disconnected: bool,
+}
+
+/// The app registration, without its credentials.
+#[derive(Serialize, ToSchema)]
+pub struct TidalSettings {
+    /// Stored or from the environment.
+    pub configured: bool,
+    /// A client id is stored in the database — which wins over the environment.
+    pub stored: bool,
+    /// A stored client id has a stored secret beside it.
+    pub has_secret: bool,
+    /// `TAPEDECK_TIDAL_CLIENT_ID` and its secret are set.
+    pub from_env: bool,
+    /// The exact redirect URI TIDAL must have registered — the one the flow
+    /// will send.
+    pub redirect_uri: String,
+}
+
+/// Whether TIDAL is configured now.
+#[derive(Serialize, ToSchema)]
+pub struct TidalConfigured {
+    pub configured: bool,
+}
 use crate::tidal::{self, TidalApp, TidalCredentials};
 
 /// How long a half-finished connect attempt is worth remembering.
@@ -55,7 +102,7 @@ fn pending() -> &'static RwLock<HashMap<String, Pending>> {
 
 fn err(code: u16, msg: impl Into<String>) -> axum::response::Response {
     let status = StatusCode::from_u16(code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-    (status, Json(serde_json::json!(ErrorResponse { code, error: msg.into() }))).into_response()
+    (status, Json(ErrorResponse { code, error: msg.into() })).into_response()
 }
 
 fn random_token() -> String {
@@ -84,12 +131,29 @@ async fn app_or_err(state: &AppState) -> Result<TidalApp, Box<axum::response::Re
     })
 }
 
-/// GET /api/v1/tidal/status — whether this user has TIDAL connected.
+// GET /api/v1/tidal/status — whether this user has TIDAL connected.
+//
+// Reports `configured` separately from `connected`: an instance whose operator
+// has set no client id cannot offer the button at all, and that is a different
+// thing from an account nobody has linked yet. Saying so is the same courtesy
+// Discogs gets for "not configured".
+/// Whether TIDAL is configured and connected.
 ///
-/// Reports `configured` separately from `connected`: an instance whose operator
-/// has set no client id cannot offer the button at all, and that is a different
-/// thing from an account nobody has linked yet. Saying so is the same courtesy
-/// Discogs gets for "not configured".
+/// Session-only. `configured` is about the *instance* — whether the
+/// operator registered an app at developer.tidal.com and set
+/// `TAPEDECK_TIDAL_CLIENT_ID` — and `connected` is about this user. They are
+/// separate because an instance that cannot offer the button at all is a
+/// different thing from an account nobody has linked yet.
+#[utoipa::path(
+    operation_id = "tidal_status",
+    get,
+    path = "/api/v1/tidal/status",
+    tag = "Connections",
+    responses(
+        (status = 200, description = "OK.", body = TidalStatus),
+        (status = 401, response = Unauthorized),
+    )
+)]
 async fn status(
     State(state): State<std::sync::Arc<AppState>>,
     user: AuthUser,
@@ -101,15 +165,33 @@ async fn status(
         .await
         .map(|rows| rows.iter().any(|(s, _, _)| s == tidal::SERVICE))
         .unwrap_or(false);
-    (StatusCode::OK, Json(serde_json::json!({ "configured": configured, "connected": connected })))
-        .into_response()
+    (StatusCode::OK, Json(TidalStatus { configured, connected })).into_response()
 }
 
-/// POST /api/v1/tidal/connect — begin the flow, and hand back the URL to open.
+// POST /api/v1/tidal/connect — begin the flow, and hand back the URL to open.
+//
+// The browser is sent to TIDAL rather than redirected from here so the SPA can
+// open it in a new tab and keep its own state, which is the shape the Last.fm
+// connect flow already uses.
+/// Begin connecting a TIDAL account.
 ///
-/// The browser is sent to TIDAL rather than redirected from here so the SPA can
-/// open it in a new tab and keep its own state, which is the shape the Last.fm
-/// connect flow already uses.
+/// Session-only. Returns the URL to open. Authorization Code + PKCE with
+/// `S256`; the verifier is held in memory for ten minutes and the `state`
+/// token is single-use.
+///
+/// Scopes asked for are the minimum a push needs — `playlists.write`,
+/// `playlists.read`, `search.read`, `user.read` — and no `collection.*` or
+/// `playback`.
+#[utoipa::path(
+    post,
+    path = "/api/v1/tidal/connect",
+    tag = "Connections",
+    responses(
+        (status = 200, description = "OK.", body = TidalConnect),
+        (status = 401, response = Unauthorized),
+        (status = 501, description = "TIDAL is not configured on this instance.", body = ErrorResponse),
+    )
+)]
 async fn connect(
     State(state): State<std::sync::Arc<AppState>>,
     user: AuthUser,
@@ -142,25 +224,48 @@ async fn connect(
         tidal::urlencoding(&challenge),
         tidal::urlencoding(&csrf),
     );
-    (StatusCode::OK, Json(serde_json::json!({ "authorize_url": url }))).into_response()
+    (StatusCode::OK, Json(TidalConnect { authorize_url: url })).into_response()
 }
 
-#[derive(Deserialize)]
+/// What TIDAL appends when it sends the browser back.
+#[derive(Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
 struct CallbackQuery {
     code: Option<String>,
+    /// The single-use token minted by `connect`. It identifies the account.
     state: Option<String>,
+    /// Set when the user declined.
     error: Option<String>,
     error_description: Option<String>,
 }
 
-/// GET /api/v1/tidal/callback — where TIDAL sends the browser back.
+// GET /api/v1/tidal/callback — where TIDAL sends the browser back.
+//
+// **Deliberately takes no `AuthUser`.** The owner comes from the `state` token
+// minted at connect time, which is single-use and expires; requiring a session
+// cookie here would additionally depend on it surviving a cross-site
+// navigation from `login.tidal.com`, which is a `SameSite` question with no
+// good answer. The state token *is* the CSRF protection, which is what it is
+// for.
+/// Where TIDAL sends the browser back.
 ///
-/// **Deliberately takes no `AuthUser`.** The owner comes from the `state` token
-/// minted at connect time, which is single-use and expires; requiring a session
+/// **Takes no session.** The owner comes from the single-use `state` token
+/// minted at connect time, which is also the CSRF protection; requiring a
 /// cookie here would additionally depend on it surviving a cross-site
-/// navigation from `login.tidal.com`, which is a `SameSite` question with no
-/// good answer. The state token *is* the CSRF protection, which is what it is
-/// for.
+/// navigation from `login.tidal.com`. Redirects to Settings either way —
+/// the user declining is a normal outcome, not an error.
+#[utoipa::path(
+    get,
+    path = "/api/v1/tidal/callback",
+    security(),
+    tag = "Connections",
+    params(CallbackQuery),
+    responses(
+        (status = 303, description = "Back to Settings, with `tidal=connected` or `tidal=denied`."),
+        (status = 400, description = "The sign-in expired, was already used, or carried no code.", body = ErrorResponse),
+        (status = 502, description = "TIDAL refused the token exchange.", body = ErrorResponse),
+    )
+)]
 async fn callback(
     State(state): State<std::sync::Arc<AppState>>,
     headers: HeaderMap,
@@ -204,14 +309,27 @@ async fn callback(
     Redirect::to("/settings?section=connections&tidal=connected").into_response()
 }
 
-/// DELETE /api/v1/tidal/disconnect — forget the account.
+// DELETE /api/v1/tidal/disconnect — forget the account.
+/// Forget the connected TIDAL account.
+///
+/// Session-only.
+#[utoipa::path(
+    operation_id = "tidal_disconnect",
+    delete,
+    path = "/api/v1/tidal/disconnect",
+    tag = "Connections",
+    responses(
+        (status = 200, description = "OK.", body = TidalDisconnected),
+        (status = 401, response = Unauthorized),
+    )
+)]
 async fn disconnect(
     State(state): State<std::sync::Arc<AppState>>,
     user: AuthUser,
 ) -> impl IntoResponse {
     match state.db.delete_connection(user.user_id, tidal::SERVICE).await {
         Ok(removed) => {
-            (StatusCode::OK, Json(serde_json::json!({ "disconnected": removed }))).into_response()
+            (StatusCode::OK, Json(TidalDisconnected { disconnected: removed })).into_response()
         }
         Err(e) => err(500, e.to_string()),
     }
@@ -244,15 +362,37 @@ pub async fn credentials(state: &AppState, user_id: i64) -> Option<TidalCredenti
 //  The app registration (admin, server-wide)
 // ════════════════════════════════════════════════════════════
 
-/// GET /api/v1/tidal/settings — is a registration configured, and from where?
+// GET /api/v1/tidal/settings — is a registration configured, and from where?
+//
+// Never returns the credential itself, the same rule source credentials and
+// the Discogs pair follow. `stored` and `from_env` are reported separately so
+// the screen can say which one is in effect rather than leaving an operator
+// wondering why the value they exported is being ignored.
+/// The TIDAL app registration for this server.
 ///
-/// Never returns the credential itself, the same rule source credentials and
-/// the Discogs pair follow. `stored` and `from_env` are reported separately so
-/// the screen can say which one is in effect rather than leaving an operator
-/// wondering why the value they exported is being ignored.
+/// **Admin only.** Never returns the credential itself, the same rule the
+/// Discogs pair and every source credential follow. `stored` and `from_env`
+/// are reported separately so the screen can say which is in effect rather
+/// than leaving an operator wondering why an exported variable is being
+/// ignored — a stored value wins.
+///
+/// `redirect_uri` is the exact string TIDAL must have registered, derived
+/// from `PUBLIC_URL` so it is the same one the flow will actually send.
+#[utoipa::path(
+    operation_id = "tidal_get_settings",
+    get,
+    path = "/api/v1/tidal/settings",
+    tag = "Connections",
+    responses(
+        (status = 200, description = "OK.", body = TidalSettings),
+        (status = 401, response = Unauthorized),
+        (status = 403, response = Forbidden),
+    )
+)]
 async fn get_settings(
     State(state): State<std::sync::Arc<AppState>>,
     user: AuthUser,
+    headers: HeaderMap,
 ) -> impl IntoResponse {
     if !user.is_admin {
         return err(403, "Admin only");
@@ -272,21 +412,25 @@ async fn get_settings(
         .is_some_and(|v| !v.trim().is_empty());
     (
         StatusCode::OK,
-        Json(serde_json::json!({
-            "configured": stored || from_env,
-            "stored": stored,
-            "has_secret": stored && has_secret,
-            "from_env": from_env,
-            // The exact string TIDAL must have registered. Derived here rather
-            // than assembled in the browser so there is one answer, and it is
-            // the same one the flow will actually send.
-            "redirect_uri": format!("{}/api/v1/tidal/callback", state.public_url.trim_end_matches('/')),
-        })),
+        Json(TidalSettings {
+            configured: stored || from_env,
+            stored,
+            has_secret: stored && has_secret,
+            from_env,
+            // The exact string TIDAL must have registered, built by the same
+            // function the flow sends. It was `PUBLIC_URL` alone, so with that
+            // unset this showed a bare path while the flow sent an origin
+            // derived from the request — and the operator registered the wrong
+            // one.
+            redirect_uri: redirect_uri(&state, &headers),
+        }),
     )
         .into_response()
 }
 
-#[derive(Deserialize)]
+/// Each field is written only when present, so saving one does not wipe the
+/// other. An explicit empty string clears.
+#[derive(Deserialize, ToSchema)]
 pub struct SettingsUpdate {
     #[serde(default)]
     pub client_id: Option<String>,
@@ -294,16 +438,38 @@ pub struct SettingsUpdate {
     pub client_secret: Option<String>,
 }
 
-/// PUT /api/v1/tidal/settings — store the registration.
+// PUT /api/v1/tidal/settings — store the registration.
+//
+// Each field is written only when present, so saving one does not silently
+// wipe the other — the rule the Discogs pair already follows. Clearing is an
+// explicit empty string.
+//
+// **Changing the registration disconnects every account**, and that is not
+// tidiness: the stored access and refresh tokens were issued *by the old app*
+// and are meaningless to a new one, so leaving them would offer people a
+// connection that silently fails on the next push.
+/// Store the TIDAL app registration.
 ///
-/// Each field is written only when present, so saving one does not silently
-/// wipe the other — the rule the Discogs pair already follows. Clearing is an
-/// explicit empty string.
+/// **Admin only.** Each field is written only when present, so saving one
+/// does not wipe the other; clearing is an explicit empty string. Stored
+/// encrypted at rest.
 ///
-/// **Changing the registration disconnects every account**, and that is not
-/// tidiness: the stored access and refresh tokens were issued *by the old app*
-/// and are meaningless to a new one, so leaving them would offer people a
-/// connection that silently fails on the next push.
+/// **Changing the client id disconnects every account on the instance** —
+/// the stored tokens were issued by the old app and are meaningless to a
+/// new one, so keeping them would offer a connection that fails on the next
+/// push.
+#[utoipa::path(
+    operation_id = "tidal_set_settings",
+    put,
+    path = "/api/v1/tidal/settings",
+    tag = "Connections",
+    request_body = SettingsUpdate,
+    responses(
+        (status = 200, description = "OK.", body = TidalConfigured),
+        (status = 401, response = Unauthorized),
+        (status = 403, response = Forbidden),
+    )
+)]
 async fn set_settings(
     State(state): State<std::sync::Arc<AppState>>,
     user: AuthUser,
@@ -336,8 +502,12 @@ async fn set_settings(
     }
 
     let configured = TidalApp::resolve(&state.db).await.is_some();
-    (StatusCode::OK, Json(serde_json::json!({ "configured": configured }))).into_response()
+    (StatusCode::OK, Json(TidalConfigured { configured })).into_response()
 }
+
+#[derive(utoipa::OpenApi)]
+#[openapi(paths(status, connect, callback, disconnect, get_settings, set_settings))]
+pub struct Api;
 
 pub fn create_tidal_router() -> Router<std::sync::Arc<AppState>> {
     Router::new()

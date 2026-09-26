@@ -29,19 +29,87 @@ use std::sync::{Arc, Mutex};
 use super::auth::AuthUser;
 use super::models::ErrorResponse;
 use super::AppState;
+use crate::db::{ScrobbleRecord, SessionRow};
+use crate::openapi::{BadRequest, NotFound, Unauthorized};
+use utoipa::{IntoParams, ToSchema};
 
 fn err(code: StatusCode, msg: impl Into<String>) -> axum::response::Response {
-    (code, Json(serde_json::json!(ErrorResponse { code: code.as_u16(), error: msg.into() })))
-        .into_response()
+    (code, Json(ErrorResponse { code: code.as_u16(), error: msg.into() })).into_response()
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
 pub struct ListQuery {
+    /// Page size. 50 by default, at most 200.
+    #[param(minimum = 1, maximum = 200, default = 50)]
     pub limit: Option<i64>,
+    #[param(minimum = 0, default = 0)]
     pub offset: Option<i64>,
 }
 
-/// GET /api/v1/sessions
+/// A page of sessions, newest first.
+#[derive(Serialize, ToSchema)]
+pub struct SessionList {
+    pub sessions: Vec<SessionRow>,
+    /// Rows in this page.
+    pub count: usize,
+}
+
+/// One session and its listens, in play order.
+#[derive(Serialize, ToSchema)]
+pub struct SessionDetail {
+    pub session: SessionRow,
+    pub scrobbles: Vec<ScrobbleRecord>,
+}
+
+/// A session, as it stands after an edit.
+#[derive(Serialize, ToSchema)]
+pub struct OneSession {
+    pub session: SessionRow,
+}
+
+/// The fallback answer to a merge whose surviving session could not be read
+/// back.
+#[derive(Serialize, ToSchema)]
+pub struct MergedId {
+    /// The surviving session.
+    pub id: i64,
+}
+
+/// A merge's outcome: the surviving session, or just its id.
+#[derive(Serialize, ToSchema)]
+#[serde(untagged)]
+#[allow(dead_code, clippy::large_enum_variant)] // describes the two bodies `merge` sends
+pub enum Merged {
+    Session(OneSession),
+    Id(MergedId),
+}
+
+/// Both halves of a split, as they stand now.
+#[derive(Serialize, ToSchema)]
+pub struct SplitSessions {
+    /// The original session, now ending before the split.
+    pub session: Option<SessionRow>,
+    /// The new session, starting at the listen you split at.
+    pub new_session: Option<SessionRow>,
+}
+
+/// Listening sessions.
+///
+/// Session-only. Contiguous listening with gaps under 30 minutes. A change
+/// of submitting token also breaks a session — one token per app is how
+/// people organise these, so "fooyin stopped, Pano started" is a different
+/// setup even a minute later.
+#[utoipa::path(
+    get,
+    path = "/api/v1/sessions",
+    tag = "Sessions",
+    params(ListQuery),
+    responses(
+        (status = 200, description = "OK.", body = SessionList),
+        (status = 401, response = Unauthorized),
+    )
+)]
 pub async fn list_sessions(
     State(state): State<Arc<AppState>>,
     user: AuthUser,
@@ -50,16 +118,26 @@ pub async fn list_sessions(
     let limit = q.limit.unwrap_or(50).clamp(1, 200);
     let offset = q.offset.unwrap_or(0).max(0);
     match state.db.list_sessions(user.user_id, limit, offset).await {
-        Ok(sessions) => (
-            StatusCode::OK,
-            Json(serde_json::json!({ "sessions": sessions, "count": sessions.len() })),
-        )
-            .into_response(),
+        Ok(sessions) => {
+            (StatusCode::OK, Json(SessionList { count: sessions.len(), sessions })).into_response()
+        }
         Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     }
 }
 
-/// GET /api/v1/sessions/:id — the session plus the listens in it, in play order.
+// GET /api/v1/sessions/:id — the session plus the listens in it, in play order.
+/// One session and its listens.
+#[utoipa::path(
+    get,
+    path = "/api/v1/sessions/{id}",
+    tag = "Sessions",
+    params(("id" = i64, Path)),
+    responses(
+        (status = 200, description = "OK.", body = SessionDetail),
+        (status = 401, response = Unauthorized),
+        (status = 404, response = NotFound),
+    )
+)]
 async fn get_session(
     State(state): State<Arc<AppState>>,
     user: AuthUser,
@@ -71,17 +149,32 @@ async fn get_session(
         Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     };
     let scrobbles = state.db.session_scrobbles(user.user_id, id).await.unwrap_or_default();
-    (StatusCode::OK, Json(serde_json::json!({ "session": session, "scrobbles": scrobbles })))
-        .into_response()
+    (StatusCode::OK, Json(SessionDetail { session, scrobbles })).into_response()
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct MergeRequest {
     /// Two or more session ids. The earliest survives.
     pub ids: Vec<i64>,
 }
 
-/// POST /api/v1/sessions/merge
+/// Merge sessions.
+///
+/// Keeps the **earliest** session's identity — its id and uuid are what
+/// anything else already refers to. Ownership is checked for every id
+/// before anything moves, so a merge naming someone else's session changes
+/// nothing rather than half-completing.
+#[utoipa::path(
+    post,
+    path = "/api/v1/sessions/merge",
+    tag = "Sessions",
+    request_body = MergeRequest,
+    responses(
+        (status = 200, description = "Merged. The surviving session.", body = Merged),
+        (status = 400, response = BadRequest),
+        (status = 401, response = Unauthorized),
+    )
+)]
 async fn merge(
     State(state): State<Arc<AppState>>,
     user: AuthUser,
@@ -94,22 +187,37 @@ async fn merge(
         // `None` means one of the ids wasn't the caller's — nothing was moved.
         Ok(None) => err(StatusCode::BAD_REQUEST, "Those sessions can't be merged"),
         Ok(Some(id)) => match state.db.get_session(user.user_id, id).await {
-            Ok(Some(s)) => {
-                (StatusCode::OK, Json(serde_json::json!({ "session": s }))).into_response()
-            }
-            _ => (StatusCode::OK, Json(serde_json::json!({ "id": id }))).into_response(),
+            Ok(Some(s)) => (StatusCode::OK, Json(OneSession { session: s })).into_response(),
+            _ => (StatusCode::OK, Json(MergedId { id })).into_response(),
         },
         Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct SplitRequest {
     /// The listen that starts the new session.
     pub at_scrobble_id: i64,
 }
 
-/// POST /api/v1/sessions/:id/split
+/// Split a session at a listen.
+///
+/// Splitting at the *first* listen is a no-op, not an error — it would
+/// leave one empty half, which is the session you already had. Aggregates
+/// are recomputed from the listens rather than adjusted arithmetically.
+#[utoipa::path(
+    post,
+    path = "/api/v1/sessions/{id}/split",
+    tag = "Sessions",
+    params(("id" = i64, Path)),
+    request_body = SplitRequest,
+    responses(
+        (status = 200, description = "Split.", body = SplitSessions),
+        (status = 400, description = "That listen is not in this session, or is already its first.", body = ErrorResponse),
+        (status = 401, response = Unauthorized),
+        (status = 404, response = NotFound),
+    )
+)]
 async fn split(
     State(state): State<Arc<AppState>>,
     user: AuthUser,
@@ -124,27 +232,35 @@ async fn split(
         Ok(Some(new_id)) => {
             let new = state.db.get_session(user.user_id, new_id).await.ok().flatten();
             let old = state.db.get_session(user.user_id, id).await.ok().flatten();
-            (StatusCode::OK, Json(serde_json::json!({ "session": old, "new_session": new })))
-                .into_response()
+            (StatusCode::OK, Json(SplitSessions { session: old, new_session: new })).into_response()
         }
         Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     }
 }
 
-#[derive(Debug, Deserialize)]
+/// Every field is optional and distinguishes absent ("leave alone") from an
+/// explicit `null` ("clear").
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct UpdateSession {
-    /// Present-and-null clears the chain; absent leaves it alone.
+    /// Retag every listen in the sitting with this chain. Present-and-null
+    /// clears the chain; absent leaves it alone. Must be one of your chains.
     #[serde(default, deserialize_with = "double_option")]
+    #[schema(value_type = Option<i64>)]
     pub chain_id: Option<Option<i64>>,
+    /// Name the sitting.
     #[serde(default, deserialize_with = "double_option_str")]
+    #[schema(value_type = Option<String>)]
     pub title: Option<Option<String>>,
     /// Which variant of the chain — "with the microlinear", "on the Hexas".
-    /// Rewritten whenever `chain_id` is, since a variant belongs to one chain.
+    /// Only read alongside `chain_id`, and rewritten whenever it is, since a
+    /// variant belongs to one chain.
     #[serde(default, deserialize_with = "double_option")]
+    #[schema(value_type = Option<i64>)]
     pub chain_variant_id: Option<Option<i64>>,
     /// A note about the sitting. Not a liner note about a record — that is
     /// `/api/v1/notes`, which hangs off an entity or a single listen.
     #[serde(default, deserialize_with = "double_option_str")]
+    #[schema(value_type = Option<String>)]
     pub notes: Option<Option<String>>,
 }
 
@@ -162,7 +278,25 @@ where
     Option::<String>::deserialize(de).map(Some)
 }
 
-/// PATCH /api/v1/sessions/:id — retag the whole sitting, or name it.
+// PATCH /api/v1/sessions/:id — retag the whole sitting, or name it.
+/// Retag, name or annotate a whole sitting.
+///
+/// Session-only. Setting `chain_id` rewrites the chain on every listen in the
+/// sitting.
+#[utoipa::path(
+    patch,
+    path = "/api/v1/sessions/{id}",
+    tag = "Sessions",
+    params(("id" = i64, Path)),
+    request_body = UpdateSession,
+    responses(
+        (status = 200, description = "Updated. The session as it now stands.", body = OneSession),
+        (status = 400, description = "Not one of your chains, a variant of another chain, or a \
+            variant without a chain.", body = ErrorResponse),
+        (status = 401, response = Unauthorized),
+        (status = 404, response = NotFound),
+    )
+)]
 async fn update_session(
     State(state): State<Arc<AppState>>,
     user: AuthUser,
@@ -214,16 +348,18 @@ async fn update_session(
     }
 
     match state.db.get_session(user.user_id, id).await {
-        Ok(Some(s)) => (StatusCode::OK, Json(serde_json::json!({ "session": s }))).into_response(),
+        Ok(Some(s)) => (StatusCode::OK, Json(OneSession { session: s })).into_response(),
         _ => err(StatusCode::NOT_FOUND, "Session not found"),
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct RebuildRequest {
-    /// Gap in seconds that starts a new session. Defaults to the 30 minutes the
-    /// live assigner uses; exposed because that constant is a guess and a
-    /// rebuild is the only place it can be reconsidered.
+    /// Gap in seconds that starts a new session: 1800 (the 30 minutes the live
+    /// assigner uses) by default, clamped to between a minute and a day.
+    // Exposed because that constant is a guess and a rebuild is the only place
+    // it can be reconsidered.
+    #[schema(minimum = 60, maximum = 86400, default = 1800)]
     pub gap_seconds: Option<i64>,
 }
 
@@ -245,18 +381,40 @@ pub struct RebuildRequest {
 // leaving half a regrouping behind. Only the progress report is lost.
 
 /// One rebuild, as it runs.
-#[derive(Clone, Serialize)]
+#[derive(Clone, Serialize, ToSchema)]
 pub struct RebuildJob {
     pub job_id: String,
     #[serde(skip)]
     pub user_id: i64,
-    /// `running` | `done` | `error`
+    /// `running`, `done` or `error`.
     pub state: String,
     /// Sessions written. Only meaningful once `state` is `done`.
     pub sessions: u64,
+    /// Listens regrouped. Only meaningful once `state` is `done`.
     pub listens: u64,
+    /// A sentence saying how it went — the error, when `state` is `error`.
     pub status: String,
+    /// Unix seconds.
     pub started_at: i64,
+}
+
+/// A rebuild, begun.
+#[derive(Serialize, ToSchema)]
+pub struct RebuildStarted {
+    /// Poll `/api/v1/sessions/rebuild/{job_id}` with this.
+    pub job_id: String,
+    /// Always `running`.
+    pub state: &'static str,
+}
+
+/// A rebuild is already running; attach to it.
+#[derive(Serialize, ToSchema)]
+pub struct RebuildRunning {
+    /// Always 409.
+    pub code: u16,
+    pub error: &'static str,
+    /// The running rebuild.
+    pub job_id: String,
 }
 
 pub type RebuildRegistry = Arc<Mutex<HashMap<String, RebuildJob>>>;
@@ -266,15 +424,43 @@ fn now_secs() -> i64 {
         as i64
 }
 
-/// POST /api/v1/sessions/rebuild — start a regroup and return its id.
+// POST /api/v1/sessions/rebuild — start a regroup and return its id.
+//
+// **Discards manual merges and splits**, because they live in the same column
+// this rewrites. It exists because sessions were never linked to their listens
+// until v0.42, and because an imported history bypasses the ingest path that
+// would have grouped it.
+//
+// Answers **202** with a `job_id` rather than doing the work inline; poll
+// `/api/v1/sessions/rebuild/:job_id` for the outcome.
+/// Start a regroup of every listen into sessions.
 ///
-/// **Discards manual merges and splits**, because they live in the same column
-/// this rewrites. It exists because sessions were never linked to their listens
-/// until v0.42, and because an imported history bypasses the ingest path that
-/// would have grouped it.
+/// Session-only. **Destructive** — it rewrites the column that manual
+/// merges and splits live in, discarding them. Exists for histories that
+/// predate session linking, and for imports, which bypass the ingest path
+/// entirely.
 ///
-/// Answers **202** with a `job_id` rather than doing the work inline; poll
-/// `/api/v1/sessions/rebuild/:job_id` for the outcome.
+/// *(since v0.70.2)* Runs in the **background** and answers `202` with a
+/// `job_id`; poll `/api/v1/sessions/rebuild/{job_id}`. It used to do the
+/// work inline, and on a real history that ran past a reverse proxy's
+/// origin timeout — the browser got a 524 while the rebuild carried on
+/// unseen, which is worse than failing outright for something destructive.
+///
+/// One rebuild per user at a time. A second request while one is running is
+/// a **409** carrying the running `job_id`, so a client can attach to it
+/// rather than starting a second pass that would clear the first's work
+/// halfway through.
+#[utoipa::path(
+    post,
+    path = "/api/v1/sessions/rebuild",
+    tag = "Sessions",
+    request_body = RebuildRequest,
+    responses(
+        (status = 202, description = "Started.", body = RebuildStarted),
+        (status = 409, description = "A rebuild is already running; the body carries its `job_id`.", body = RebuildRunning),
+        (status = 401, response = Unauthorized),
+    )
+)]
 async fn rebuild(
     State(state): State<Arc<AppState>>,
     user: AuthUser,
@@ -327,11 +513,11 @@ async fn rebuild(
     if let Err(running) = claimed {
         return (
             StatusCode::CONFLICT,
-            Json(serde_json::json!({
-                "code": 409,
-                "error": "A rebuild is already running",
-                "job_id": running,
-            })),
+            Json(RebuildRunning {
+                code: 409,
+                error: "A rebuild is already running",
+                job_id: running,
+            }),
         )
             .into_response();
     }
@@ -362,16 +548,36 @@ async fn rebuild(
         }
     });
 
-    (StatusCode::ACCEPTED, Json(serde_json::json!({ "job_id": job_id, "state": "running" })))
-        .into_response()
+    (StatusCode::ACCEPTED, Json(RebuildStarted { job_id, state: "running" })).into_response()
 }
 
-/// GET /api/v1/sessions/rebuild/:job_id — how the regroup is going.
+// GET /api/v1/sessions/rebuild/:job_id — how the regroup is going.
+//
+// Scoped to the caller: a job id is short and this is the only thing that
+// stops one household member watching another's. An unknown id and someone
+// else's are the same 404, so polling cannot be used to learn that a job
+// exists.
+/// How a running regroup is going.
 ///
-/// Scoped to the caller: a job id is short and this is the only thing that
-/// stops one household member watching another's. An unknown id and someone
+/// Session-only, and scoped to the caller — an unknown id and someone
 /// else's are the same 404, so polling cannot be used to learn that a job
 /// exists.
+///
+/// The registry is in memory, so a job is lost if the process restarts.
+/// That is safe rather than merely tolerable: the rebuild is one
+/// transaction, so a process that dies mid-pass rolls back instead of
+/// leaving half a regrouping behind — only the progress report is lost.
+#[utoipa::path(
+    get,
+    path = "/api/v1/sessions/rebuild/{job_id}",
+    tag = "Sessions",
+    params(("job_id" = String, Path, description = "From the `202` that started it.")),
+    responses(
+        (status = 200, description = "OK.", body = RebuildJob),
+        (status = 401, response = Unauthorized),
+        (status = 404, response = NotFound),
+    )
+)]
 async fn rebuild_status(
     State(state): State<Arc<AppState>>,
     user: AuthUser,
@@ -384,7 +590,7 @@ async fn rebuild_status(
         .and_then(|m| m.get(&job_id).cloned())
         .filter(|j| j.user_id == user.user_id);
     match job {
-        Some(j) => (StatusCode::OK, Json(serde_json::json!(j))).into_response(),
+        Some(j) => (StatusCode::OK, Json(j)).into_response(),
         // Also what a restart mid-rebuild looks like, which is why the message
         // says so rather than only "not found".
         None => err(
@@ -393,6 +599,18 @@ async fn rebuild_status(
         ),
     }
 }
+
+#[derive(utoipa::OpenApi)]
+#[openapi(paths(
+    list_sessions,
+    get_session,
+    update_session,
+    merge,
+    split,
+    rebuild,
+    rebuild_status
+))]
+pub struct Api;
 
 pub fn create_sessions_router() -> Router<Arc<AppState>> {
     Router::new()

@@ -38,14 +38,88 @@ use axum::{
     routing::{get, post, put},
     Json, Router,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use utoipa::{IntoParams, ToSchema};
 
 use super::auth::AuthUser;
 use super::models::ErrorResponse;
 use super::AppState;
-use crate::amai::{self, Amai, Lookup};
+use crate::amai::{self, Amai, AmaiServer, Lookup};
+use crate::openapi::Unauthorized;
+
+/// Where the AudioMuse-AI sidecar is, and never its token.
+#[derive(Serialize, ToSchema)]
+pub struct AmaiSettings {
+    pub configured: bool,
+    /// The address. Not a credential, and shown the way a source's URL is.
+    pub url: Option<String>,
+    pub has_token: bool,
+    /// Which of amai's media servers this instance's provider ids belong to.
+    /// Absent means amai's default server.
+    pub server: Option<String>,
+    /// Something is stored in this instance's settings — which beats the
+    /// environment.
+    pub stored: bool,
+    /// `TAPEDECK_AMAI_URL` is set.
+    pub from_env: bool,
+}
+
+/// Whether the sidecar is configured now.
+#[derive(Serialize, ToSchema)]
+pub struct AmaiConfigured {
+    pub configured: bool,
+}
+
+/// Both halves of the check, reported separately.
+#[derive(Serialize, ToSchema)]
+pub struct AmaiTest {
+    pub ok: bool,
+    pub reachable: bool,
+    pub authenticated: bool,
+    pub message: String,
+    /// amai's media servers. Present only when the token was accepted.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub servers: Option<Vec<AmaiServer>>,
+}
+
+/// A most-played track amai had not analysed.
+#[derive(Serialize, ToSchema)]
+pub struct AmaiMissing {
+    pub artist: String,
+    pub title: String,
+    pub plays: i64,
+}
+
+/// How much of this history AudioMuse-AI can answer for. Every share is a
+/// percentage, and null when its population is empty.
+#[derive(Serialize, ToSchema)]
+pub struct AmaiCoverage {
+    pub total_plays: i64,
+    pub distinct_tracks: usize,
+    /// Tracks that came off a media server, so could join at all.
+    pub joinable_tracks: usize,
+    pub joinable_plays: i64,
+    /// The structural ceiling, over the whole history.
+    pub joinable_share_of_listening: Option<f64>,
+    /// Joinable tracks actually asked about, most-played first.
+    pub asked: usize,
+    pub analysed: usize,
+    pub analysed_share_of_asked: Option<f64>,
+    /// Weighted by plays — the figure the decision rests on.
+    pub analysed_share_of_sampled_listening: Option<f64>,
+    /// What share of all listening the sample is.
+    pub sample_share_of_listening: Option<f64>,
+    pub sample_requested: usize,
+    /// The probe stopped at its deadline before asking about the whole sample.
+    pub deadline_hit: bool,
+    /// The first failed ask. A failed ask is never counted as a miss.
+    pub error: Option<String>,
+    pub server_asked: Option<String>,
+    /// Up to twenty.
+    pub examples_not_analysed: Vec<AmaiMissing>,
+}
 
 /// How many of the most-played tracks the probe asks about.
 ///
@@ -70,7 +144,7 @@ const PROBE_DEADLINE: Duration = Duration::from_secs(20);
 
 fn err(code: u16, msg: impl Into<String>) -> axum::response::Response {
     let status = StatusCode::from_u16(code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-    (status, Json(serde_json::json!(ErrorResponse { code, error: msg.into() }))).into_response()
+    (status, Json(ErrorResponse { code, error: msg.into() })).into_response()
 }
 
 fn env_nonempty(name: &str) -> Option<String> {
@@ -124,6 +198,20 @@ async fn configured(state: &AppState) -> Option<Amai> {
 //  Settings
 // ════════════════════════════════════════════════════════════
 
+/// Whether the AudioMuse-AI sidecar is configured.
+///
+/// Admin, session-only. Returns the address — which is not a credential and
+/// is shown the way a source's URL is — and never the API token.
+#[utoipa::path(
+    get,
+    path = "/api/v1/amai/settings",
+    tag = "Settings",
+    responses(
+        (status = 200, description = "OK.", body = AmaiSettings),
+        (status = 401, response = Unauthorized),
+        (status = 403, description = "Admin only.", body = ErrorResponse),
+    )
+)]
 async fn get_settings(State(state): State<Arc<AppState>>, user: AuthUser) -> impl IntoResponse {
     if !user.is_admin {
         return err(403, "Admin only");
@@ -136,23 +224,25 @@ async fn get_settings(State(state): State<Arc<AppState>>, user: AuthUser) -> imp
     let client = configured(&state).await;
     (
         StatusCode::OK,
-        Json(serde_json::json!({
-            "configured": client.is_some(),
+        Json(AmaiSettings {
+            configured: client.is_some(),
             // The address is not a credential and is shown, exactly as a
             // source's URL is. The token never comes back over the wire.
-            "url": client.as_ref().map(|c| c.base_url().to_string()),
-            "has_token": client.as_ref().is_some_and(Amai::has_token),
-            "server": client.as_ref().and_then(|c| c.server().map(str::to_string)),
-            "stored": stored_url.is_some() || stored_token.is_some() || stored_server.is_some(),
-            "from_env": env_url.is_some(),
-        })),
+            url: client.as_ref().map(|c| c.base_url().to_string()),
+            has_token: client.as_ref().is_some_and(Amai::has_token),
+            server: client.as_ref().and_then(|c| c.server().map(str::to_string)),
+            stored: stored_url.is_some() || stored_token.is_some() || stored_server.is_some(),
+            from_env: env_url.is_some(),
+        }),
     )
         .into_response()
 }
 
-#[derive(Debug, Deserialize)]
+/// Each field is written only when present; an empty string clears it.
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct AmaiUpdate {
-    /// `http://host:8000`. Empty clears it and switches the sidecar off.
+    /// `http://host:8000`. Empty clears it and switches the sidecar off. No
+    /// scheme is a 400 rather than a guess.
     #[serde(default)]
     pub url: Option<String>,
     /// Their `API_TOKEN`. Empty clears it.
@@ -165,6 +255,36 @@ pub struct AmaiUpdate {
     pub server: Option<String>,
 }
 
+/// Point this instance at an AudioMuse-AI instance.
+///
+/// Admin, session-only — a token gets 401 and scopes never enter into it,
+/// the line `/api/v1/sources` already sits on. Server-wide rather than
+/// per-user: amai is one box the operator runs over one library, and every
+/// user here reads the same catalogue. Stored encrypted, and a stored value
+/// beats `TAPEDECK_AMAI_URL` / `_TOKEN` / `_SERVER`.
+///
+/// Each field is written only when present, so saving one does not wipe
+/// another; clearing is an explicit empty string. An address with no
+/// `http://` or `https://` scheme is a 400 rather than being guessed at —
+/// guessing `http` would silently downgrade an instance meant to be reached
+/// over TLS.
+///
+/// `server` names which of amai's own media servers this instance's
+/// provider ids belong to (its display name or internal id). Absent means
+/// amai's default server, which is the whole answer on a single-server
+/// install.
+#[utoipa::path(
+    put,
+    path = "/api/v1/amai/settings",
+    tag = "Settings",
+    request_body = AmaiUpdate,
+    responses(
+        (status = 200, description = "Saved.", body = AmaiConfigured),
+        (status = 400, description = "The address is unusable.", body = ErrorResponse),
+        (status = 401, response = Unauthorized),
+        (status = 403, description = "Admin only.", body = ErrorResponse),
+    )
+)]
 async fn set_settings(
     State(state): State<Arc<AppState>>,
     user: AuthUser,
@@ -198,19 +318,46 @@ async fn set_settings(
         }
     }
     let configured = configured(&state).await.is_some();
-    (StatusCode::OK, Json(serde_json::json!({ "configured": configured }))).into_response()
+    (StatusCode::OK, Json(AmaiConfigured { configured })).into_response()
 }
 
 // ════════════════════════════════════════════════════════════
 //  Test
 // ════════════════════════════════════════════════════════════
 
-/// POST /api/v1/amai/test — is it there, and does the token work?
+// POST /api/v1/amai/test — is it there, and does the token work?
+//
+// Both halves are reported rather than collapsed into one boolean. "Running,
+// wrong token" and "not running" are the same colour on a screen that only
+// says `ok: false`, and they need completely different things doing about
+// them.
+/// Is AudioMuse-AI there, and does the token work?
 ///
-/// Both halves are reported rather than collapsed into one boolean. "Running,
-/// wrong token" and "not running" are the same colour on a screen that only
-/// says `ok: false`, and they need completely different things doing about
-/// them.
+/// Admin, session-only. **Two questions, reported separately**, because
+/// they need completely different things doing about them and a screen
+/// that only says `ok: false` makes them the same colour. amai's own
+/// `before_request` barrier exempts `/api/health` and nothing else, so
+/// reachability is answerable without a credential and a bad token is a
+/// clean 401 — the inverse of the Discogs trap, where a bad credential is
+/// served as a normal 200.
+///
+/// A rejection is a 200 with `ok: false`, not an HTTP error: the request to
+/// Tapedeck succeeded and the answer is "no".
+///
+/// `servers` carries only `server_id`, `name`, `server_type` and
+/// `is_default`. amai's own response also holds a masked `creds` map;
+/// nothing here stores or logs it.
+#[utoipa::path(
+    post,
+    path = "/api/v1/amai/test",
+    tag = "Settings",
+    responses(
+        (status = 200, description = "Result of the check.", body = AmaiTest),
+        (status = 400, description = "Not configured on this server.", body = ErrorResponse),
+        (status = 401, response = Unauthorized),
+        (status = 403, description = "Admin only.", body = ErrorResponse),
+    )
+)]
 async fn test(State(state): State<Arc<AppState>>, user: AuthUser) -> impl IntoResponse {
     if !user.is_admin {
         return err(403, "Admin only");
@@ -224,12 +371,13 @@ async fn test(State(state): State<Arc<AppState>>, user: AuthUser) -> impl IntoRe
         // succeeded and the answer is "no". Same call the Discogs test makes.
         return (
             StatusCode::OK,
-            Json(serde_json::json!({
-                "ok": false,
-                "reachable": false,
-                "authenticated": false,
-                "message": format!("Could not reach {}: {e}", client.base_url()),
-            })),
+            Json(AmaiTest {
+                ok: false,
+                reachable: false,
+                authenticated: false,
+                message: format!("Could not reach {}: {e}", client.base_url()),
+                servers: None,
+            }),
         )
             .into_response();
     }
@@ -256,26 +404,27 @@ async fn test(State(state): State<Arc<AppState>>, user: AuthUser) -> impl IntoRe
             };
             (
                 StatusCode::OK,
-                Json(serde_json::json!({
-                    "ok": true,
-                    "reachable": true,
-                    "authenticated": true,
-                    "servers": servers,
-                    "message": message,
-                })),
+                Json(AmaiTest {
+                    ok: true,
+                    reachable: true,
+                    authenticated: true,
+                    servers: Some(servers),
+                    message,
+                }),
             )
                 .into_response()
         }
         Err(e) => (
             StatusCode::OK,
-            Json(serde_json::json!({
-                "ok": false,
+            Json(AmaiTest {
+                ok: false,
                 // The half that did work, stated, because it narrows the
                 // problem to exactly one thing.
-                "reachable": true,
-                "authenticated": false,
-                "message": e.to_string(),
-            })),
+                reachable: true,
+                authenticated: false,
+                message: e.to_string(),
+                servers: None,
+            }),
         )
             .into_response(),
     }
@@ -285,24 +434,62 @@ async fn test(State(state): State<Arc<AppState>>, user: AuthUser) -> impl IntoRe
 //  Coverage
 // ════════════════════════════════════════════════════════════
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
 pub struct CoverageQuery {
+    /// How many of the most-played joinable tracks to ask about. Default 100,
+    /// at most 500.
     #[serde(default)]
+    #[param(minimum = 1, maximum = 500)]
     pub sample: Option<usize>,
 }
 
-/// GET /api/v1/amai/coverage — how much of this history can amai answer for?
+// GET /api/v1/amai/coverage — how much of this history can amai answer for?
+//
+// Three numbers, and they narrow in this order:
+//
+// 1. **The structural ceiling.** A listen joins on a media-server provider id,
+//    so one that never came off Plex, Jellyfin or Navidrome cannot join at
+//    all, whatever amai has analysed. This is a fact about the *history* and
+//    no amount of analysis moves it.
+// 2. **What amai has**, of the tracks that could join — measured, on the
+//    most-played sample.
+// 3. **What share of listening that sample is**, so neither of the above is
+//    read as a fact about the whole history.
+/// How much of this history can AudioMuse-AI answer for?
 ///
-/// Three numbers, and they narrow in this order:
+/// Admin, session-only. The measurement that decides whether anything is
+/// worth building on the sidecar, and it narrows in three steps.
 ///
-/// 1. **The structural ceiling.** A listen joins on a media-server provider id,
-///    so one that never came off Plex, Jellyfin or Navidrome cannot join at
-///    all, whatever amai has analysed. This is a fact about the *history* and
-///    no amount of analysis moves it.
-/// 2. **What amai has**, of the tracks that could join — measured, on the
-///    most-played sample.
-/// 3. **What share of listening that sample is**, so neither of the above is
-///    read as a fact about the whole history.
+/// **The structural ceiling.** A listen joins to amai on a media-server
+/// provider id, so one that never came off Plex, Jellyfin or Navidrome
+/// cannot join at all whatever amai has analysed. `joinable_*` is that,
+/// computed over the whole history because it is a plain string test.
+///
+/// **What amai has**, measured on the most-played tracks. Weighted by
+/// plays rather than sampled evenly, because a track played fifty times is
+/// worth fifty times as much to anything built on these vectors.
+///
+/// **What the sample is a sample of** — `sample_share_of_listening` — so
+/// the figure above is never read as a fact about the whole history. A
+/// share stated without its population is the fidelity-card failure.
+///
+/// One request per track against amai, so the handler owns a deadline
+/// rather than trusting N × the client timeout. `deadline_hit` says when it
+/// stopped early, and a failed ask is never counted as a miss: `error`
+/// carries the first one.
+#[utoipa::path(
+    get,
+    path = "/api/v1/amai/coverage",
+    tag = "Settings",
+    params(CoverageQuery),
+    responses(
+        (status = 200, description = "The measurement.", body = AmaiCoverage),
+        (status = 400, description = "Not configured, or there are no listens to measure.", body = ErrorResponse),
+        (status = 401, response = Unauthorized),
+        (status = 403, description = "Admin only.", body = ErrorResponse),
+    )
+)]
 async fn coverage(
     State(state): State<Arc<AppState>>,
     user: AuthUser,
@@ -344,7 +531,7 @@ async fn coverage(
     let mut analysed_plays = 0i64;
     let mut asked_plays = 0i64;
     let mut first_error: Option<String> = None;
-    let mut missing: Vec<serde_json::Value> = Vec::new();
+    let mut missing: Vec<AmaiMissing> = Vec::new();
 
     for t in joinable.iter().take(want) {
         if started.elapsed() >= PROBE_DEADLINE {
@@ -360,9 +547,11 @@ async fn coverage(
             }
             Ok(Lookup::NotAnalysed) => {
                 if missing.len() < 20 {
-                    missing.push(serde_json::json!({
-                        "artist": t.artist, "title": t.title, "plays": t.plays,
-                    }));
+                    missing.push(AmaiMissing {
+                        artist: t.artist.clone(),
+                        title: t.title.clone(),
+                        plays: t.plays,
+                    });
                 }
             }
             Err(e) => {
@@ -384,39 +573,43 @@ async fn coverage(
 
     (
         StatusCode::OK,
-        Json(serde_json::json!({
-            "total_plays": total_plays,
-            "distinct_tracks": distinct_tracks,
+        Json(AmaiCoverage {
+            total_plays,
+            distinct_tracks,
 
             // 1. The ceiling.
-            "joinable_tracks": joinable.len(),
-            "joinable_plays": joinable_plays,
-            "joinable_share_of_listening": pct(joinable_plays, total_plays),
+            joinable_tracks: joinable.len(),
+            joinable_plays,
+            joinable_share_of_listening: pct(joinable_plays, total_plays),
 
             // 2. What amai has, of what was actually asked.
-            "asked": asked,
-            "analysed": analysed,
-            "analysed_share_of_asked": pct(analysed as i64, asked as i64),
+            asked,
+            analysed,
+            analysed_share_of_asked: pct(analysed as i64, asked as i64),
             // Weighted by plays, which is the figure the decision actually
             // rests on: a track played fifty times is worth fifty times as
             // much to anything built on these vectors, so a share of *tracks*
             // would understate a well-covered library and overstate a thin one.
-            "analysed_share_of_sampled_listening": pct(analysed_plays, asked_plays),
+            analysed_share_of_sampled_listening: pct(analysed_plays, asked_plays),
 
             // 3. What the sample is a sample of. Without this the figure above
             //    reads as a fact about the whole history, which is the
             //    fidelity-card failure in a new place.
-            "sample_share_of_listening": pct(asked_plays, total_plays),
+            sample_share_of_listening: pct(asked_plays, total_plays),
 
-            "sample_requested": want,
-            "deadline_hit": started.elapsed() >= PROBE_DEADLINE,
-            "error": first_error,
-            "server_asked": client.server(),
-            "examples_not_analysed": missing,
-        })),
+            sample_requested: want,
+            deadline_hit: started.elapsed() >= PROBE_DEADLINE,
+            error: first_error,
+            server_asked: client.server().map(str::to_string),
+            examples_not_analysed: missing,
+        }),
     )
         .into_response()
 }
+
+#[derive(utoipa::OpenApi)]
+#[openapi(paths(get_settings, set_settings, test, coverage))]
+pub struct Api;
 
 pub fn create_amai_router() -> Router<Arc<AppState>> {
     Router::new()

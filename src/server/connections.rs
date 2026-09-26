@@ -12,13 +12,55 @@ use axum::{
     routing::get,
     Router,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use utoipa::ToSchema;
 
 use super::auth::AuthUser;
 use super::models::ErrorResponse;
 use super::AppState;
+use crate::openapi::{BadRequest, Unauthorized};
+
+/// Your forwarding connections. Never carries a token or session key.
+#[derive(Serialize, ToSchema)]
+pub struct ConnectionList {
+    pub connections: Vec<Connection>,
+    pub lastfm_available: bool,
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct Connection {
+    /// `listenbrainz`, `lastfm` or `librefm`.
+    pub service: String,
+    /// The account on that service, where it said.
+    pub username: Option<String>,
+    pub connected_at: i64,
+}
+
+/// Whether plays accepted out of a Shared Spool are forwarded.
+#[derive(Serialize, ToSchema)]
+pub struct SpoolForwarding {
+    pub enabled: bool,
+    /// Only plays this recent are relayed, whatever the switch says. Absent
+    /// from the answer to a change.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub window_days: Option<i64>,
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct Connected {
+    pub connected: bool,
+    pub username: Option<String>,
+}
+
+/// Where to send the browser to approve Tapedeck.
+#[derive(Serialize, ToSchema)]
+pub struct ScrobblerAuth {
+    /// The request token — send it back to `…/complete` once approved.
+    pub token: String,
+    pub auth_url: String,
+}
 
 /// The switch deciding whether plays accepted out of a Shared Spool are relayed
 /// on to this user's connections, or stored here only.
@@ -26,22 +68,40 @@ use super::AppState;
 /// It lives beside the connections rather than with the rest of Patch because
 /// this is the question "what do my connected services receive", and the answer
 /// is only meaningful next to the list of them.
-#[derive(Deserialize)]
+#[derive(Deserialize, ToSchema)]
 struct SpoolForwardingRequest {
-    /// **Not `Option<bool>` with a default**, and the `Option` here is only so
-    /// an absent key can be told from an explicit `false`. A body that merely
-    /// misspelled the key must not be read as an answer either way — the
-    /// `bulk-chain` rule, in another place where guessing wrong writes to
-    /// somebody's permanent public record.
+    /// Required, and said explicitly — an absent key is a 400, not a default.
+    //
+    // **Not `Option<bool>` with a default**, and the `Option` here is only so
+    // an absent key can be told from an explicit `false`. A body that merely
+    // misspelled the key must not be read as an answer either way — the
+    // `bulk-chain` rule, in another place where guessing wrong writes to
+    // somebody's permanent public record.
+    #[schema(required, value_type = bool)]
     enabled: Option<bool>,
 }
 
-/// GET /api/v1/connections/spool-forwarding — the switch, and the window that
-/// bounds it.
+// GET /api/v1/connections/spool-forwarding — the switch, and the window that
+// bounds it.
+//
+// `window_days` is reported rather than left for the screen to hardcode: it is
+// a rule about what will actually be relayed, and a second copy of it in the
+// UI would be free to drift from the one enforced.
+/// Whether accepted Shared Spool plays are forwarded onward.
 ///
-/// `window_days` is reported rather than left for the screen to hardcode: it is
-/// a rule about what will actually be relayed, and a second copy of it in the
-/// UI would be free to drift from the one enforced.
+/// `enabled` is the switch; `window_days` is the freshness bound that
+/// applies even when it is on, reported rather than hardcoded in a client
+/// so the two cannot disagree about what will actually be relayed.
+#[utoipa::path(
+    get,
+    path = "/api/v1/connections/spool-forwarding",
+    tag = "Connections",
+    security(("sessionCookie" = [])),
+    responses(
+        (status = 200, description = "The switch and its window.", body = SpoolForwarding),
+        (status = 401, response = Unauthorized),
+    )
+)]
 async fn get_spool_forwarding(
     State(state): State<Arc<AppState>>,
     user: AuthUser,
@@ -49,21 +109,49 @@ async fn get_spool_forwarding(
     match state.db.forward_spool_listens(user.user_id).await {
         Ok(on) => (
             StatusCode::OK,
-            Json(serde_json::json!({
-                "enabled": on,
-                "window_days": crate::db::SPOOL_FORWARD_WINDOW_SECS / 86_400,
-            })),
+            Json(SpoolForwarding {
+                enabled: on,
+                window_days: Some(crate::db::SPOOL_FORWARD_WINDOW_SECS / 86_400),
+            }),
         )
             .into_response(),
         Err(e) => err(500, e.to_string()),
     }
 }
 
-/// PUT /api/v1/connections/spool-forwarding — set it.
+// PUT /api/v1/connections/spool-forwarding — set it.
+//
+// **Session-only, and it takes no token**, the line every switch that decides
+// an outward-facing write sits on: a scrobble client has no business deciding
+// that somebody else's deck may write to its owner's public history.
+/// Set it.
 ///
-/// **Session-only, and it takes no token**, the line every switch that decides
-/// an outward-facing write sits on: a scrobble client has no business deciding
-/// that somebody else's deck may write to its owner's public history.
+/// **Off by default, and off for every account that predates it.** Turning
+/// it on means a play somebody else's deck made — which you were in the
+/// room for, and accepted one at a time — is relayed to your Last.fm and
+/// ListenBrainz like any listen of your own.
+///
+/// A play older than `window_days` is stored and never relayed even with
+/// the switch on. `retro_spool_from_session` can offer an evening of any
+/// age and an unanswered invitation can be joined a month later, so
+/// without that bound a single Accept could rewrite a year of a public
+/// history.
+///
+/// **Session-only; a token gets 401 and scopes never enter into it.** A
+/// scrobble client has no business deciding that another deck may write to
+/// its owner's public record.
+#[utoipa::path(
+    put,
+    path = "/api/v1/connections/spool-forwarding",
+    tag = "Connections",
+    security(("sessionCookie" = [])),
+    request_body = SpoolForwardingRequest,
+    responses(
+        (status = 200, description = "The switch as it now stands.", body = SpoolForwarding),
+        (status = 400, description = "`enabled` was absent.", body = ErrorResponse),
+        (status = 401, response = Unauthorized),
+    )
+)]
 async fn put_spool_forwarding(
     State(state): State<Arc<AppState>>,
     user: AuthUser,
@@ -73,39 +161,70 @@ async fn put_spool_forwarding(
         return err(400, "`enabled` is required — say true or false explicitly.");
     };
     match state.db.set_forward_spool_listens(user.user_id, enabled).await {
-        Ok(()) => (StatusCode::OK, Json(serde_json::json!({ "enabled": enabled }))).into_response(),
+        Ok(()) => {
+            (StatusCode::OK, Json(SpoolForwarding { enabled, window_days: None })).into_response()
+        }
         Err(e) => err(500, e.to_string()),
     }
 }
 
 fn err(code: u16, msg: impl Into<String>) -> axum::response::Response {
     let code_status = StatusCode::from_u16(code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-    (code_status, Json(serde_json::json!(ErrorResponse { code, error: msg.into() })))
-        .into_response()
+    (code_status, Json(ErrorResponse { code, error: msg.into() })).into_response()
 }
 
-/// GET /api/v1/connections — which services this user has connected.
+// GET /api/v1/connections — which services this user has connected.
+/// Where your listens are forwarded.
+///
+/// **Session-only, permanently** — holds credentials.
+///
+/// Forwarding is strictly per user. A user with no connections keeps their
+/// listens local; there is deliberately **no server-wide fallback**, which
+/// previously sent every unconnected user's listens to the operator's own
+/// account.
+#[utoipa::path(
+    get,
+    path = "/api/v1/connections",
+    tag = "Connections",
+    responses(
+        (status = 200, description = "OK.", body = ConnectionList),
+        (status = 401, response = Unauthorized),
+    )
+)]
 async fn list_connections(State(state): State<Arc<AppState>>, user: AuthUser) -> impl IntoResponse {
     match state.db.list_connections(user.user_id).await {
         Ok(rows) => {
-            let items: Vec<serde_json::Value> = rows.into_iter().map(|(service, username, at)| {
-                serde_json::json!({ "service": service, "username": username, "connected_at": at })
-            }).collect();
+            let connections = rows
+                .into_iter()
+                .map(|(service, username, connected_at)| Connection {
+                    service,
+                    username,
+                    connected_at,
+                })
+                .collect();
             // Kept for the UI's shape; Tapedeck ships its own Last.fm app
             // credentials, so connecting is always possible.
-            (
-                StatusCode::OK,
-                Json(serde_json::json!({
-                    "connections": items,
-                    "lastfm_available": true,
-                })),
-            )
+            (StatusCode::OK, Json(ConnectionList { connections, lastfm_available: true }))
                 .into_response()
         }
         Err(e) => err(500, e.to_string()),
     }
 }
 
+/// Disconnect a service.
+///
+/// Session-only.
+#[utoipa::path(
+    delete,
+    path = "/api/v1/connections/{service}",
+    tag = "Connections",
+    params(("service" = String, Path, description = "`lastfm`, `librefm` or `listenbrainz`.")),
+    responses(
+        (status = 204, description = "Disconnected, or was never connected."),
+        (status = 400, response = BadRequest),
+        (status = 401, response = Unauthorized),
+    )
+)]
 async fn disconnect(
     State(state): State<Arc<AppState>>,
     user: AuthUser,
@@ -122,11 +241,30 @@ async fn disconnect(
 
 // ── ListenBrainz: paste a user token ──
 
-#[derive(Deserialize)]
+#[derive(Deserialize, ToSchema)]
 struct LbConnect {
+    /// Your ListenBrainz user token. Checked against ListenBrainz before it is
+    /// stored.
     token: String,
 }
 
+/// Store a ListenBrainz token.
+///
+/// Session-only. Stored encrypted. The endpoint is configurable for
+/// self-hosted ListenBrainz instances — that is the one scrobble setting
+/// still in the config file rather than the database.
+#[utoipa::path(
+    put,
+    path = "/api/v1/connections/listenbrainz",
+    tag = "Connections",
+    request_body = LbConnect,
+    responses(
+        (status = 200, description = "Connected.", body = Connected),
+        (status = 400, response = BadRequest),
+        (status = 401, response = Unauthorized),
+        (status = 502, description = "ListenBrainz could not be reached.", body = ErrorResponse),
+    )
+)]
 async fn connect_listenbrainz(
     State(state): State<Arc<AppState>>,
     user: AuthUser,
@@ -157,10 +295,7 @@ async fn connect_listenbrainz(
 
     let creds = serde_json::json!({ "token": token }).to_string();
     match state.db.set_connection(user.user_id, "listenbrainz", &creds, username.as_deref()).await {
-        Ok(()) => {
-            (StatusCode::OK, Json(serde_json::json!({ "connected": true, "username": username })))
-                .into_response()
-        }
+        Ok(()) => (StatusCode::OK, Json(Connected { connected: true, username })).into_response(),
         Err(e) => err(500, e.to_string()),
     }
 }
@@ -234,8 +369,7 @@ async fn scrobbler_start(svc: &Scrobbler) -> axum::response::Response {
 
     let auth_url =
         format!("{}?api_key={}&token={}", svc.auth_page, crate::sinks::LASTFM_API_KEY, token);
-    (StatusCode::OK, Json(serde_json::json!({ "token": token, "auth_url": auth_url })))
-        .into_response()
+    (StatusCode::OK, Json(ScrobblerAuth { token, auth_url })).into_response()
 }
 
 /// Step 2: exchange the approved token for a long-lived session key.
@@ -287,31 +421,72 @@ async fn scrobbler_complete(
 
     let creds = serde_json::json!({ "session_key": session_key }).to_string();
     match state.db.set_connection(user.user_id, service_key, &creds, username.as_deref()).await {
-        Ok(()) => {
-            (StatusCode::OK, Json(serde_json::json!({ "connected": true, "username": username })))
-                .into_response()
-        }
+        Ok(()) => (StatusCode::OK, Json(Connected { connected: true, username })).into_response(),
         Err(e) => err(500, e.to_string()),
     }
 }
 
-/// POST /api/v1/connections/lastfm/start — get a request token + the approval URL.
+// POST /api/v1/connections/lastfm/start — get a request token + the approval URL.
+/// Begin the Last.fm connect flow.
+///
+/// Session-only. Returns a URL to send the browser to.
+#[utoipa::path(
+    post,
+    path = "/api/v1/connections/lastfm/start",
+    tag = "Connections",
+    responses(
+        (status = 200, description = "OK.", body = ScrobblerAuth),
+        (status = 401, response = Unauthorized),
+        (status = 502, description = "The service could not be reached, or refused a token.", body = ErrorResponse),
+    )
+)]
 async fn lastfm_start(_user: AuthUser) -> impl IntoResponse {
     scrobbler_start(&LASTFM).await
 }
 
-/// POST /api/v1/connections/librefm/start
+/// Begin the Libre.fm connect flow.
+///
+/// Session-only. GNU FM implements the same AudioScrobbler auth, so this reuses
+/// the Last.fm app credentials.
+#[utoipa::path(
+    post,
+    path = "/api/v1/connections/librefm/start",
+    tag = "Connections",
+    responses(
+        (status = 200, description = "OK.", body = ScrobblerAuth),
+        (status = 401, response = Unauthorized),
+        (status = 502, description = "The service could not be reached, or refused a token.", body = ErrorResponse),
+    )
+)]
 async fn librefm_start(_user: AuthUser) -> impl IntoResponse {
     scrobbler_start(&LIBREFM).await
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, ToSchema)]
+#[schema(as = ScrobblerApproved)]
 struct LastfmComplete {
+    /// The token `…/start` returned, after you approved it.
     token: String,
 }
 
-/// POST /api/v1/connections/lastfm/complete — exchange the approved token for a
-/// session key. Fails if the user hasn't approved on Last.fm's site yet.
+// POST /api/v1/connections/lastfm/complete — exchange the approved token for a
+// session key. Fails if the user hasn't approved on Last.fm's site yet.
+/// Finish the Last.fm connect flow.
+///
+/// Session-only. Exchanges the approved request token for a session key, stored
+/// encrypted.
+#[utoipa::path(
+    post,
+    path = "/api/v1/connections/lastfm/complete",
+    tag = "Connections",
+    request_body = LastfmComplete,
+    responses(
+        (status = 200, description = "Connected.", body = Connected),
+        (status = 400, description = "Not approved yet, or no token.", body = ErrorResponse),
+        (status = 401, response = Unauthorized),
+        (status = 502, description = "The service could not be reached.", body = ErrorResponse),
+    )
+)]
 async fn lastfm_complete(
     State(state): State<Arc<AppState>>,
     user: AuthUser,
@@ -320,7 +495,21 @@ async fn lastfm_complete(
     scrobbler_complete(&state, &user, &LASTFM, "lastfm", body.token.trim()).await
 }
 
-/// POST /api/v1/connections/librefm/complete
+/// Finish the Libre.fm connect flow.
+///
+/// Session-only.
+#[utoipa::path(
+    post,
+    path = "/api/v1/connections/librefm/complete",
+    tag = "Connections",
+    request_body = LastfmComplete,
+    responses(
+        (status = 200, description = "Connected.", body = Connected),
+        (status = 400, description = "Not approved yet, or no token.", body = ErrorResponse),
+        (status = 401, response = Unauthorized),
+        (status = 502, description = "The service could not be reached.", body = ErrorResponse),
+    )
+)]
 async fn librefm_complete(
     State(state): State<Arc<AppState>>,
     user: AuthUser,
@@ -358,6 +547,20 @@ mod tests {
         assert_eq!(lastfm_sign(&a, "s"), lastfm_sign(&b, "s"));
     }
 }
+
+#[derive(utoipa::OpenApi)]
+#[openapi(paths(
+    list_connections,
+    get_spool_forwarding,
+    put_spool_forwarding,
+    disconnect,
+    connect_listenbrainz,
+    lastfm_start,
+    lastfm_complete,
+    librefm_start,
+    librefm_complete
+))]
+pub struct Api;
 
 pub fn create_connections_router() -> Router<Arc<AppState>> {
     use axum::routing::{delete, post, put};

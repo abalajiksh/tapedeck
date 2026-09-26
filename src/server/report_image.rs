@@ -32,10 +32,11 @@ const MAX_REPORT_BYTES: usize = 8 * 1024 * 1024;
 
 fn err(code: u16, msg: &str) -> axum::response::Response {
     let status = StatusCode::from_u16(code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-    (status, Json(serde_json::json!(ErrorResponse { code, error: msg.into() }))).into_response()
+    (status, Json(ErrorResponse { code, error: msg.into() })).into_response()
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
 pub struct ImageQuery {
     /// `week`, `month` (default) or `year`. Each has its own composition —
     /// there is no card that is another card at a different size.
@@ -55,6 +56,58 @@ pub struct ImageQuery {
     pub format: Option<String>,
 }
 
+/// A report chapter as a shareable PNG, rendered on the server.
+///
+/// Scope: `read` *(since v0.96)*.
+///
+/// **Rendered on the server on purpose.** A share image is a deliverable
+/// rather than a view: a native client asks for one instead of
+/// reimplementing a layout, a type scale and a palette that would then be
+/// free to drift from the web's. The fonts are embedded in the binary and
+/// no artwork is fetched, so the same period produces the same bytes on any
+/// host.
+///
+/// It **computes nothing**. Every figure comes from `GET /api/v1/reports`
+/// with the same `unit` and `offset`, so a share cannot disagree with the
+/// chapter it was shared from — including the rule that the only
+/// comparison on the card is against the caller's *own* periods.
+///
+/// The card is a **composition, not a screenshot of the chapter**, and
+/// each unit has its own — never one card relabelled, the same reason the
+/// app has three chapter components:
+///
+/// * **week** — a headline, the **by-day bars**, the top artist and the
+///   track of the week, the counts, the crush. Deliberately **no genre
+///   split**: seven days make a thin one, which is the chapter's own
+///   judgement.
+/// * **month** — the top artist and record, the counts, the top genres,
+///   what was on repeat, the crush. No by-week bars: five columns say less
+///   than the ranked genre list beneath them.
+/// * **year** — the **by-month bars** and the **genre bands** (the three
+///   biggest genres tracked by name across the year, everything else folded
+///   into `other`), the artist and record of the year, what was discovered,
+///   the crush.
+///
+/// A section that would not fit is **left out whole** rather than clipped —
+/// a PNG has no scrollbar, so a section drawn over the footer would look
+/// deliberate. A thin period therefore draws fewer sections rather than
+/// empty headings, and a full year gives up its discovery line before it
+/// gives up the crush.
+#[utoipa::path(
+    get,
+    path = "/api/v1/reports/image",
+    tag = "Statistics",
+    security(("sessionCookie" = []), ("apiToken" = ["read"])),
+    params(ImageQuery),
+    responses(
+        (status = 200, description = "The image. `Cache-Control` is `private`: it is one person's listening, and a shared cache must not hold it.", content(
+            (crate::openapi::Bytes = "image/png"),
+            (String = "image/svg+xml"),
+        ), headers(("x-tapedeck-glyph-coverage" = String, description = "`full`, or `partial` when the embedded fonts could not draw every character on the card. Not an error — the host's own fonts may cover it — but a client can say \"this may not render your Korean titles\" instead of the user finding out from the picture."))),
+        (status = 400, description = "An unsupported unit, size or format.", body = ErrorResponse),
+        (status = 404, description = "No report for that period — an offset past the end of the history, or an instance with nothing in it yet. A real answer, not a failure.", body = ErrorResponse),
+    )
+)]
 pub async fn report_image(
     State(state): State<Arc<AppState>>,
     auth: ReadAuth,
@@ -188,6 +241,10 @@ fn slug(s: &str) -> String {
         out.chars().take(40).collect()
     }
 }
+
+#[derive(utoipa::OpenApi)]
+#[openapi(paths(report_image))]
+pub struct Api;
 
 pub fn create_report_image_router() -> Router<Arc<AppState>> {
     Router::new().route("/api/v1/reports/image", get(report_image))

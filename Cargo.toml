@@ -84,5 +84,12 @@ fontdb = "0.24"
 tiny-skia = "0.12"
 skrifa = "0.44"
 
+# The OpenAPI document is derived from the handlers and their body types rather
+# than written beside them. `preserve_order` keeps a schema's properties in the
+# order its struct declares them; `preserve_path_order` keeps operations grouped
+# by module, in the order `build_app` merges the routers. `yaml` renders
+# /api/openapi.yaml.
+utoipa = { version = "5.5", features = ["yaml", "preserve_order", "preserve_path_order"] }
+
 [dev-dependencies]
 yaml-rust2 = "0.13.0"

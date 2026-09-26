@@ -14,13 +14,90 @@ use axum::{
     routing::{get, post},
     Router,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
+use utoipa::ToSchema;
 
 use super::auth::AuthUser;
 use super::models::ErrorResponse;
 use super::AppState;
+use crate::db::{McpAuditRow, McpConnectionRecord};
 use crate::mcp::{dispatch, protocol, scopes};
+use crate::openapi::Unauthorized;
+
+/// A JSON-RPC 2.0 request. One message per POST; a batch is refused.
+#[derive(ToSchema)]
+#[allow(dead_code)] // describes a body parsed by `protocol::parse`
+pub struct JsonRpcRequest {
+    /// `2.0`.
+    #[schema(example = "2.0")]
+    pub jsonrpc: String,
+    /// A string or an integer. Absent for a notification, which is answered
+    /// `202`.
+    #[schema(value_type = Option<Object>)]
+    pub id: Option<serde_json::Value>,
+    #[schema(example = "tools/call")]
+    pub method: String,
+    pub params: Option<serde_json::Map<String, serde_json::Value>>,
+}
+
+/// A JSON-RPC 2.0 response: `result` or `error`, never both.
+#[derive(ToSchema)]
+#[allow(dead_code)] // built as JSON by `protocol`
+pub struct JsonRpcResponse {
+    pub jsonrpc: String,
+    #[schema(value_type = Option<Object>)]
+    pub id: Option<serde_json::Value>,
+    pub result: Option<serde_json::Map<String, serde_json::Value>>,
+    pub error: Option<JsonRpcError>,
+}
+
+#[derive(ToSchema)]
+#[allow(dead_code)]
+pub struct JsonRpcError {
+    pub code: i64,
+    pub message: String,
+    #[schema(value_type = Option<Object>)]
+    pub data: Option<serde_json::Value>,
+}
+
+/// Your assistant connections, and what one can be granted.
+#[derive(Serialize, ToSchema)]
+pub struct McpConnections {
+    pub connections: Vec<McpConnectionRecord>,
+    /// The address to paste into a client.
+    #[schema(format = "uri")]
+    pub endpoint: String,
+    pub scopes: Vec<McpScope>,
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct McpScope {
+    pub scope: &'static str,
+    pub description: &'static str,
+}
+
+/// A new connection and its credential.
+#[derive(Serialize, ToSchema)]
+pub struct McpConnectionCreated {
+    pub id: i64,
+    pub name: String,
+    /// What was actually granted, unrecognised grants dropped.
+    pub scopes: String,
+    /// Shown once and never again — it is stored only as a hash.
+    pub token: String,
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct McpRevoked {
+    pub revoked: bool,
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct McpAudit {
+    /// Newest first.
+    pub calls: Vec<McpAuditRow>,
+}
 
 /// Calls one connection may make per hour.
 ///
@@ -32,7 +109,7 @@ const CALLS_PER_HOUR: i64 = 600;
 
 fn err(code: u16, msg: impl Into<String>) -> Response {
     let status = StatusCode::from_u16(code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-    (status, Json(serde_json::json!(ErrorResponse { code, error: msg.into() }))).into_response()
+    (status, Json(ErrorResponse { code, error: msg.into() })).into_response()
 }
 
 // ════════════════════════════════════════════════════════════
@@ -226,7 +303,54 @@ pub(crate) fn is_private_host(host: &str) -> bool {
     !host.contains('.')
 }
 
-/// `POST /mcp`
+// `POST /mcp`
+/// The MCP endpoint (JSON-RPC over Streamable HTTP).
+///
+/// One endpoint carrying the whole protocol. **Not a REST resource** — the
+/// body is a JSON-RPC 2.0 request and the method decides what happens, so
+/// this entry documents the transport rather than a payload.
+///
+/// **Authentication is `Authorization: Bearer <credential>`**, where the
+/// credential comes from Settings → AI Connections or from the OAuth flow.
+/// A 401 carries `WWW-Authenticate` with a `resource_metadata` pointer, and
+/// that pointer is how a client discovers the authorization server.
+///
+/// **Dual-era.** A request carrying
+/// `params._meta["io.modelcontextprotocol/protocolVersion"]` of
+/// `2026-07-28` is served statelessly and **must** mirror `Mcp-Method`,
+/// `Mcp-Name` and `MCP-Protocol-Version` into headers matching the body —
+/// a mismatch is `400` with JSON-RPC `-32020`. A request opening with
+/// `initialize` selects legacy semantics (`2025-11-25` and earlier) and is
+/// not subject to header validation. No session id is ever minted: this
+/// server is stateless on both eras.
+///
+/// Methods: `initialize`, `server/discover`, `ping`, `tools/list`,
+/// `tools/call`, `resources/list`, `resources/templates/list`,
+/// `resources/read`, `prompts/list`, `prompts/get`, `logging/setLevel`,
+/// and any `notifications/*` (accepted, `202`, no body).
+///
+/// Unknown method is `404` **and** JSON-RPC `-32601` together — the body is
+/// what distinguishes this from the `404` a legacy HTTP+SSE server returns
+/// for a path it does not host.
+///
+/// Rate limited to 600 calls an hour per connection. Every call is written
+/// to the audit log.
+#[utoipa::path(
+    post,
+    path = "/mcp",
+    tag = "MCP",
+    security(("mcpBearer" = [])),
+    request_body = JsonRpcRequest,
+    responses(
+        (status = 200, description = "A JSON-RPC response.", body = JsonRpcResponse),
+        (status = 202, description = "A notification was accepted. No body."),
+        (status = 400, description = "Malformed, header/body mismatch (-32020), or unsupported protocol version (-32022).", body = JsonRpcResponse),
+        (status = 401, description = "Missing or invalid credential. Carries `WWW-Authenticate`.", body = ErrorResponse),
+        (status = 403, description = "Cross-origin request, or a tool the connection was not granted. Carries `WWW-Authenticate` with `error=\"insufficient_scope\"`.", body = JsonRpcResponse),
+        (status = 404, description = "Unknown method (-32601) or unknown tool.", body = JsonRpcResponse),
+        (status = 429, description = "The connection's hourly call budget is spent.", body = ErrorResponse),
+    )
+)]
 pub async fn endpoint(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -347,13 +471,48 @@ fn bearer(headers: &HeaderMap) -> Option<String> {
     (!token.is_empty()).then(|| token.to_string())
 }
 
-/// GET and DELETE on the MCP endpoint.
+// GET and DELETE on the MCP endpoint.
+//
+// Both belonged to the 2025 revisions — a standalone SSE stream and session
+// termination — and neither is part of this one. `405` is what the spec tells
+// a modern-only transport to answer, and it is also what a dual-era client
+// reads as "no legacy stream here, use POST".
+/// Not allowed.
 ///
-/// Both belonged to the 2025 revisions — a standalone SSE stream and session
-/// termination — and neither is part of this one. `405` is what the spec tells
-/// a modern-only transport to answer, and it is also what a dual-era client
-/// reads as "no legacy stream here, use POST".
-pub async fn method_not_allowed() -> Response {
+/// The standalone SSE stream belonged to the 2025 revisions and is not part
+/// of this one. `405` is what the spec tells a modern transport to answer,
+/// and it is what a dual-era client reads as "use POST".
+#[utoipa::path(
+    get,
+    path = "/mcp",
+    tag = "MCP",
+    security(),
+    responses(
+        (status = 405, description = "Method not allowed.", body = JsonRpcResponse),
+    )
+)]
+pub async fn get_not_allowed() -> Response {
+    refuse()
+}
+
+/// Not allowed.
+///
+/// Session termination belonged to the 2025 revisions; there is no session to
+/// delete.
+#[utoipa::path(
+    delete,
+    path = "/mcp",
+    tag = "MCP",
+    security(),
+    responses(
+        (status = 405, description = "Method not allowed.", body = JsonRpcResponse),
+    )
+)]
+pub async fn delete_not_allowed() -> Response {
+    refuse()
+}
+
+fn refuse() -> Response {
     (StatusCode::METHOD_NOT_ALLOWED, Json(serde_json::json!({
         "jsonrpc": "2.0",
         "id": null,
@@ -372,7 +531,21 @@ pub async fn method_not_allowed() -> Response {
 // that could mint another connection would make revocation meaningless, and one
 // that could read the audit log could check whether anyone was watching it.
 
-/// GET /api/v1/mcp/connections
+/// Your AI connections.
+///
+/// Session-only. Also returns this instance's MCP endpoint address, derived
+/// from the request the way the pairing verification URI is, and the full
+/// grant catalogue with the sentence shown for each on the consent screen.
+#[utoipa::path(
+    operation_id = "mcp_list_connections",
+    get,
+    path = "/api/v1/mcp/connections",
+    tag = "MCP",
+    responses(
+        (status = 200, description = "The connections.", body = McpConnections),
+        (status = 401, response = Unauthorized),
+    )
+)]
 async fn list_connections(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -381,30 +554,58 @@ async fn list_connections(
     match state.db.list_mcp_connections(user.user_id).await {
         Ok(rows) => (
             StatusCode::OK,
-            Json(serde_json::json!({
-                "connections": rows,
+            Json(McpConnections {
+                connections: rows,
                 // The address to paste into a client, worked out the same way
                 // the pairing screen works out its verification URI.
-                "endpoint": format!("{}/mcp", public_origin(&state, &headers)),
-                "scopes": scopes::ALL.iter()
-                    .map(|(s, d)| serde_json::json!({ "scope": s, "description": d }))
-                    .collect::<Vec<_>>(),
-            })),
+                endpoint: format!("{}/mcp", public_origin(&state, &headers)),
+                scopes: scopes::ALL
+                    .iter()
+                    .map(|&(scope, description)| McpScope { scope, description })
+                    .collect(),
+            }),
         )
             .into_response(),
         Err(e) => err(500, e.to_string()),
     }
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, ToSchema)]
+#[schema(as = NewMcpConnection)]
 struct NewConnection {
+    /// Up to 60 characters. Defaults to "AI assistant".
+    #[schema(example = "Claude Desktop")]
     name: Option<String>,
     /// Space- or comma-separated grants. Anything unrecognised is dropped
-    /// rather than stored.
+    /// rather than stored. Omitted means the default read grants.
+    #[schema(example = "listening:read library:read")]
     scopes: Option<String>,
 }
 
-/// POST /api/v1/mcp/connections — mint one by hand, for a local client.
+// POST /api/v1/mcp/connections — mint one by hand, for a local client.
+/// Mint a connection by hand, for a local client.
+///
+/// Session-only. **The credential is in this response and nowhere else,
+/// ever again** — only its hash is stored.
+///
+/// A connection created here does not expire: it is something the user
+/// pasted into a client themselves, there is nothing for it to refresh
+/// against, and expiring it would break their setup for no gain they asked
+/// for. An OAuth grant is the one that expires.
+///
+/// Unrecognised grants are dropped rather than stored, so a client cannot
+/// invent one by asking for it. There is no wildcard.
+#[utoipa::path(
+    post,
+    path = "/api/v1/mcp/connections",
+    tag = "MCP",
+    request_body = NewConnection,
+    responses(
+        (status = 200, description = "Created.", body = McpConnectionCreated),
+        (status = 400, description = "No recognised grant was requested.", body = ErrorResponse),
+        (status = 401, response = Unauthorized),
+    )
+)]
 async fn create_connection(
     State(state): State<Arc<AppState>>,
     user: AuthUser,
@@ -432,20 +633,35 @@ async fn create_connection(
     match state.db.create_mcp_connection(user.user_id, &name, &granted, None, None).await {
         Ok(cred) => (
             StatusCode::OK,
-            Json(serde_json::json!({
-                "id": cred.id,
-                "name": name,
-                "scopes": granted,
+            Json(McpConnectionCreated {
+                id: cred.id,
+                name,
+                scopes: granted,
                 // Shown once and never again — it is stored only as a hash.
-                "token": cred.token,
-            })),
+                token: cred.token,
+            }),
         )
             .into_response(),
         Err(e) => err(500, e.to_string()),
     }
 }
 
-/// DELETE /api/v1/mcp/connections/:id
+/// Revoke a connection.
+///
+/// Session-only. Revoked rather than deleted, so the audit rows keep
+/// pointing at something with a name — "which assistant read my history in
+/// March" outlives the connection.
+#[utoipa::path(
+    delete,
+    path = "/api/v1/mcp/connections/{id}",
+    tag = "MCP",
+    params(("id" = i64, Path)),
+    responses(
+        (status = 200, description = "Revoked.", body = McpRevoked),
+        (status = 401, response = Unauthorized),
+        (status = 404, description = "No such connection.", body = ErrorResponse),
+    )
+)]
 async fn revoke_connection(
     State(state): State<Arc<AppState>>,
     user: AuthUser,
@@ -454,24 +670,52 @@ async fn revoke_connection(
     match state.db.revoke_mcp_connection(user.user_id, id).await {
         Ok(true) => {
             info!("🤖 MCP connection {} revoked by {}", id, user.username);
-            (StatusCode::OK, Json(serde_json::json!({ "revoked": true }))).into_response()
+            (StatusCode::OK, Json(McpRevoked { revoked: true })).into_response()
         }
         Ok(false) => err(404, "No such connection"),
         Err(e) => err(500, e.to_string()),
     }
 }
 
-/// GET /api/v1/mcp/audit — what the connections have actually been doing.
+// GET /api/v1/mcp/audit — what the connections have actually been doing.
+/// What the assistants have been doing.
+///
+/// Session-only. Every call: which connection, which tool, with what
+/// arguments (truncated), whether it worked, **how many rows came back**,
+/// and how long it took. The row count is the interesting one — a tool that
+/// answered with 12 rows and one that answered with 20,000 are different
+/// events however identical the call looks.
+#[utoipa::path(
+    get,
+    path = "/api/v1/mcp/audit",
+    tag = "MCP",
+    responses(
+        (status = 200, description = "The most recent 200 calls.", body = McpAudit),
+        (status = 401, response = Unauthorized),
+    )
+)]
 async fn audit(State(state): State<Arc<AppState>>, user: AuthUser) -> Response {
     match state.db.list_mcp_audit(user.user_id, 200).await {
-        Ok(rows) => (StatusCode::OK, Json(serde_json::json!({ "calls": rows }))).into_response(),
+        Ok(calls) => (StatusCode::OK, Json(McpAudit { calls })).into_response(),
         Err(e) => err(500, e.to_string()),
     }
 }
 
+#[derive(utoipa::OpenApi)]
+#[openapi(paths(
+    endpoint,
+    get_not_allowed,
+    delete_not_allowed,
+    list_connections,
+    create_connection,
+    revoke_connection,
+    audit
+))]
+pub struct Api;
+
 pub fn create_mcp_router() -> Router<Arc<AppState>> {
     Router::new()
-        .route("/mcp", post(endpoint).get(method_not_allowed).delete(method_not_allowed))
+        .route("/mcp", post(endpoint).get(get_not_allowed).delete(delete_not_allowed))
         .route("/api/v1/mcp/connections", get(list_connections).post(create_connection))
         .route("/api/v1/mcp/connections/:id", axum::routing::delete(revoke_connection))
         .route("/api/v1/mcp/audit", get(audit))

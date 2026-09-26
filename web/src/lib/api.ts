@@ -3617,6 +3617,7 @@ class TapedeckAPI {
 		client_name: string;
 		scopes: string;
 		can_read: boolean;
+		can_write: boolean;
 		approved: boolean;
 	}> {
 		return this.get(`/api/v1/pair/${encodeURIComponent(userCode)}`);

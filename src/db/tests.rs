@@ -153,11 +153,16 @@ async fn an_existing_production_database_opens_and_keeps_its_listens() {
     let uid = uid.0;
 
     let t = std::time::Instant::now();
-    let dash = db2.get_dashboard_stats(uid, chrono_tz::Tz::UTC, 1).await.expect("dashboard");
+    let dash = serde_json::to_value(
+        db2.get_dashboard_stats(uid, chrono_tz::Tz::UTC, 1).await.expect("dashboard"),
+    )
+    .unwrap();
     println!("  dashboard        {:>7.0?}  total={}", t.elapsed(), dash["total"]);
 
     let t = std::time::Instant::now();
-    let ranged = db2.get_ranged_stats(uid, None, false).await.expect("ranged stats");
+    let ranged =
+        serde_json::to_value(db2.get_ranged_stats(uid, None, false).await.expect("ranged stats"))
+            .unwrap();
     let totals = &ranged["totals"];
     println!(
         "  stats?range=all  {:>7.0?}  plays={} hours={}",
@@ -273,7 +278,7 @@ async fn the_dashboard_folds_its_scans_without_changing_the_answers() {
         .unwrap();
     }
 
-    let got = db.get_dashboard_stats(uid, tz, 1).await.unwrap();
+    let got = serde_json::to_value(db.get_dashboard_stats(uid, tz, 1).await.unwrap()).unwrap();
 
     // The originals, run verbatim.
     let one = |sql: &'static str| {
@@ -1373,7 +1378,8 @@ async fn the_placeholder_reaches_no_artist_shaped_readout() {
     assert!(chart.iter().any(|n| n == "Burial"), "a real artist still charts");
 
     // ── Statistics ──
-    let ranged = db.get_ranged_stats(uid, None, false).await.unwrap();
+    let ranged =
+        serde_json::to_value(db.get_ranged_stats(uid, None, false).await.unwrap()).unwrap();
     let top: Vec<String> = ranged["top_artists"]
         .as_array()
         .unwrap()
@@ -1384,7 +1390,8 @@ async fn the_placeholder_reaches_no_artist_shaped_readout() {
     assert!(top.iter().any(|n| n == "Burial"), "a real artist still ranks");
 
     // ── Dashboard ──
-    let dash = db.get_dashboard_stats(uid, chrono_tz::UTC, 1).await.unwrap();
+    let dash = serde_json::to_value(db.get_dashboard_stats(uid, chrono_tz::UTC, 1).await.unwrap())
+        .unwrap();
     let dash_top = dash["top_artist"].as_str().map(str::to_string);
     assert!(!dash_top.as_deref().is_some_and(is_various_artists), "Dashboard: {dash_top:?}");
 
@@ -1478,7 +1485,8 @@ async fn a_skip_reaches_no_counting_readout() {
 
     assert_eq!(db.listen_count_and_latest(uid).await.unwrap().0, 1, "listen count");
 
-    let stats = db.get_dashboard_stats(uid, chrono_tz::UTC, 1).await.unwrap();
+    let stats = serde_json::to_value(db.get_dashboard_stats(uid, chrono_tz::UTC, 1).await.unwrap())
+        .unwrap();
     assert_eq!(
         stats["top_artist"].as_str(),
         Some("Real Artist"),
@@ -1550,7 +1558,7 @@ async fn the_shape_figures_count_the_right_populations() {
         .unwrap();
     }
 
-    let all = db.get_ranged_stats(uid, None, false).await.unwrap();
+    let all = serde_json::to_value(db.get_ranged_stats(uid, None, false).await.unwrap()).unwrap();
     let t = &all["totals"];
 
     assert_eq!(t["plays"].as_i64(), Some(10), "plays still exclude skips");
@@ -1567,7 +1575,10 @@ async fn the_shape_figures_count_the_right_populations() {
     // "Since" is about the whole history and ignores the range control, or
     // a one-week view answers with the start of that week.
     let first = t["first_listen"].as_i64().expect("first_listen");
-    let week = db.get_ranged_stats(uid, Some(now - 7 * 86_400), false).await.unwrap();
+    let week = serde_json::to_value(
+        db.get_ranged_stats(uid, Some(now - 7 * 86_400), false).await.unwrap(),
+    )
+    .unwrap();
     assert_eq!(week["totals"]["first_listen"].as_i64(), Some(first), "first_listen is not ranged");
     assert_eq!(week["totals"]["plays"].as_i64(), Some(0), "the burst is outside this week");
     assert_eq!(week["totals"]["skips"].as_i64(), Some(0), "and so are its skips");
@@ -1580,7 +1591,7 @@ async fn the_shape_figures_count_the_right_populations() {
     assert_eq!(t["loves"].as_i64(), Some(0));
     let e = db.upsert_entity("recording", "Track 1", "Real Artist", None).await.unwrap();
     db.set_love(uid, e, true).await.unwrap();
-    let after = db.get_ranged_stats(uid, None, false).await.unwrap();
+    let after = serde_json::to_value(db.get_ranged_stats(uid, None, false).await.unwrap()).unwrap();
     assert_eq!(after["totals"]["loves"].as_i64(), Some(1));
 }
 
@@ -7439,13 +7450,15 @@ async fn a_fidelity_share_ignores_listens_of_unknown_format() {
         .unwrap();
     }
 
-    let dash = db.get_dashboard_stats(uid, chrono_tz::UTC, 1).await.unwrap();
+    let dash = serde_json::to_value(db.get_dashboard_stats(uid, chrono_tz::UTC, 1).await.unwrap())
+        .unwrap();
     assert_eq!(dash["total"], 100);
     assert_eq!(dash["fidelity_known"], 3);
     // Two of the three known, not two of a hundred.
     assert_eq!(dash["lossless_pct"], 67);
 
-    let ranged = db.get_ranged_stats(uid, None, false).await.unwrap();
+    let ranged =
+        serde_json::to_value(db.get_ranged_stats(uid, None, false).await.unwrap()).unwrap();
     assert_eq!(ranged["totals"]["fidelity_known"], 3);
     assert_eq!(ranged["totals"]["lossless_pct"], 67);
 

@@ -522,7 +522,20 @@ impl AudioQuality {
 
 // ── Phase 2: Signal Chains ──
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// A signal chain: the gear a listen ran through, in order.
+///
+/// **There is no `is_default`.** A chain is not default for anything by
+/// itself; *being the default* is a property of the thing pointing at it, and
+/// there are two: a **device** (`PATCH /api/v1/devices/{id}`) and an **API
+/// token**, whose `default_chain_id` is rung 3 of the chain ladder and is
+/// reported by `GET /1/validate-token`.
+///
+/// Absent is not null here. `icon`, and a component's `equipment_id` and
+/// `since`, are **omitted entirely** when unset rather than sent as null — a
+/// strict deserialiser wants those optional, not nullable. `description`,
+/// `detail` and `status` really are present-and-null.
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+#[schema(as = Chain)]
 pub struct SignalChain {
     pub id: Option<i64>,
     pub user_id: i64,
@@ -530,59 +543,64 @@ pub struct SignalChain {
     pub description: Option<String>,
     pub components: Vec<ChainComponent>,
     pub listening_context: ListeningContext,
-    /// A glyph name from the UI's fixed set, so a chain is recognisable at a
-    /// glance on a listen row. `None` falls back to a generic mark — an
-    /// unrecognised value does too, which is what keeps this from being a way
-    /// to inject anything into the page.
+    /// A name from the UI's `CHAIN_ICONS` set. **Omitted when unset**, not
+    /// null. Unvalidated on purpose — an unknown value falls back to a generic
+    /// mark rather than erroring, and rejecting a save because the front end
+    /// learned a new icon first would be the worse failure.
+    // An unrecognised value falling back is also what keeps this from being a
+    // way to inject anything into the page.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub icon: Option<String>,
     pub is_active: bool,
-    /// Whether listens through this chain reach the Reel of anyone patched into
-    /// its owner.
-    ///
-    /// **No longer the sharing unit** (v0.93.0). It was, and the argument for
-    /// it was that "what am I publishing?" is answerable by looking at a list
-    /// of chains you already understand. What that missed is that a chain is a
-    /// *gear configuration*, and using one as an access-control list is an odd
-    /// proxy for consent — a patch is a decision about a person, which is what
-    /// consent is.
-    ///
-    /// So `users.share_all_with_patched` decides whether a patched deck sees
-    /// every listen, and this now decides two narrower things: whether the
-    /// chain may be **named** to them (unshared reads "Private signal chain"),
-    /// and whether its listens reach the parts that have no patch behind them —
-    /// the Instance tab, Discover, and Shared Spool captures.
+    /// *(since v0.76.1)* Whether this chain may be **named** to a deck patched
+    /// into yours, and whether its listens reach the parts of Patch that have
+    /// no patch behind them — the Instance tab, Discover, and Shared Spool
+    /// captures. **Not the sharing unit** since v0.93.0: what a patched deck
+    /// sees is `share_all_with_patched` on the profile.
+    // It was the sharing unit, and the argument for it was that "what am I
+    // publishing?" is answerable by looking at a list of chains you already
+    // understand. What that missed is that a chain is a *gear configuration*,
+    // and using one as an access-control list is an odd proxy for consent — a
+    // patch is a decision about a person, which is what consent is.
     #[serde(default)]
     pub shared: bool,
+    /// Derived from the listens (`SUM(duration)` where `chain_id` matches and
+    /// the listen is not a skip), never accumulated — so assigning a chain to
+    /// an old listen moves the hours, and un-assigning takes them back. A
+    /// source that reported no length contributes nothing, so this is a floor.
     pub total_hours: f64,
+    /// Unix seconds.
     pub created_at: i64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// One step of a chain.
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct ChainComponent {
     #[serde(rename = "type")]
     pub component_type: ComponentType,
+    /// Always written, so deleting the gear leaves the chain readable.
     pub name: String,
+    /// Free text about this step. Always present; null when there is none.
+    /// Guessed from the gear type when a step is first picked and never
+    /// re-applied, so an override sticks.
     pub detail: Option<String>,
-    /// The `equipment` row this step *is*, when it was picked from the user's
-    /// gear rather than typed. Optional on purpose: a chain can name something
-    /// you don't own (a friend's amp, a rental) and old chains predate the link
-    /// entirely. `name` stays a snapshot so a deleted gear row leaves the chain
-    /// readable instead of blank.
+    /// The `equipment` row this step *is*, set when it was picked from your
+    /// gear. **Omitted** for free text — a chain can name something you do not
+    /// own (a friend's amp, a rental).
+    // Old chains predate the link entirely. `name` stays a snapshot so a
+    // deleted gear row leaves the chain readable instead of blank.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub equipment_id: Option<i64>,
-    /// When this step joined the path, as unix seconds.
+    /// Unix seconds from which this box was in the path. **Omitted means "for
+    /// as long as the chain has existed"**, which is what every step written
+    /// before this field meant.
     ///
-    /// **`None` means "for as long as the chain has existed"**, which is what
-    /// every component written before this field meant and is why it stays
-    /// absent from the JSON rather than defaulting to a date. Chain hours are
-    /// derived from the listens, so without this a box added to an existing
-    /// chain is credited with every hour the chain ever logged — a subwoofer
-    /// bought on Tuesday reporting a year of use on Wednesday.
-    ///
-    /// Stamped by [`Database::update_chain`] when a chain gains gear it did not
-    /// name before, and editable, because the honest date is usually a few days
-    /// before anybody got round to recording it.
+    /// Chain and gear hours are derived from the listens, so without it a box
+    /// added to a chain that already has history is credited with all of it.
+    /// Stamped automatically on gear a chain did not name before; send one to
+    /// correct the date, or `null` to say it was always there.
+    // Stamped by [`Database::update_chain`], and editable, because the honest
+    // date is usually a few days before anybody got round to recording it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub since: Option<i64>,
 }
@@ -596,20 +614,22 @@ pub struct ChainComponent {
 ///
 /// A `position` past the end of the base components *adds* a step, so a chain
 /// that never named a cartridge can gain one without being rewritten.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, utoipa::ToSchema)]
 pub struct VariantOverride {
+    /// Index into the chain's `components`. One past the end *adds* a step.
     pub position: i64,
-    /// The gear fitted at this step. `None` removes the step for this variant —
+    /// The gear fitted at this step. Null removes the step for this variant —
     /// a chain run without its amp, say.
     #[serde(default)]
     pub equipment_id: Option<i64>,
-    /// Snapshot of the name, for the same reason `ChainComponent` keeps one: a
-    /// deleted gear row leaves the variant readable instead of blank.
+    /// Snapshot of the name, so a deleted gear row leaves the variant readable
+    /// instead of blank.
     #[serde(default)]
     pub name: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+/// What kind of box a step is.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ComponentType {
     Source,
@@ -621,10 +641,19 @@ pub enum ComponentType {
     Bluetooth,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+/// How you listen through a chain. **Attention, not company** — the two are
+/// orthogonal, and who you were with is `company` on the listen.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ListeningContext {
     Active,
+    // `active-mobile`, with a hyphen: the spelling `as_str` stores, the web UI
+    // offers and the published document has always named. It was serialised
+    // `active_mobile` by `rename_all`, so a chain saved as "active-mobile"
+    // was refused with a 422 and one stored that way came back under the
+    // other spelling, which the chains page could not match. The underscore
+    // form is still accepted, since it is what this used to send.
+    #[serde(rename = "active-mobile", alias = "active_mobile")]
     ActiveMobile,
     Passive,
     Background,
@@ -820,6 +849,28 @@ impl PublicNpFields {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `active-mobile` is one spelling everywhere: what is stored, what is
+    /// served, and what a save may send — and the underscore form a client
+    /// may have learned from an older server still reads.
+    #[test]
+    fn active_mobile_is_spelled_the_way_it_is_stored() {
+        let c: ListeningContext = serde_json::from_str(r#""active-mobile""#).unwrap();
+        assert_eq!(c, ListeningContext::ActiveMobile);
+        let c: ListeningContext = serde_json::from_str(r#""active_mobile""#).unwrap();
+        assert_eq!(c, ListeningContext::ActiveMobile);
+        assert_eq!(serde_json::to_value(&c).unwrap(), serde_json::json!(c.as_str()));
+        for c in [
+            ListeningContext::Active,
+            ListeningContext::ActiveMobile,
+            ListeningContext::Passive,
+            ListeningContext::Background,
+            ListeningContext::Unknown,
+        ] {
+            assert_eq!(serde_json::to_value(&c).unwrap(), serde_json::json!(c.as_str()));
+            assert_eq!(ListeningContext::from_str_loose(c.as_str()), c);
+        }
+    }
 
     fn step(name: &str, gear: Option<i64>) -> ChainComponent {
         ChainComponent {

@@ -11,21 +11,172 @@ use axum::{
     routing::{get, post, put},
     Router,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tracing::error;
 
 use super::auth::AuthUser;
 use super::models::ErrorResponse;
 use super::AppState;
-use crate::everynoise::scrape::{self, Tier};
+use crate::everynoise::scrape::{self, Progress, Tier};
+use crate::everynoise::store::Summary;
+use crate::openapi::{Forbidden, Unauthorized};
+use utoipa::{IntoParams, ToSchema};
+
+/// What is held, and whether a walk is running.
+#[derive(Serialize, ToSchema)]
+pub struct EveryNoiseStatus {
+    pub summary: Summary,
+    /// Null when nothing has run since the process started.
+    pub progress: Option<Progress>,
+    /// The admin's address sent in the scraper's `User-Agent`. Echoed so the
+    /// field can be pre-filled; it is not a credential.
+    pub contact: Option<String>,
+    pub source: &'static str,
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct ScrapeStarted {
+    /// `started`.
+    pub status: &'static str,
+    pub tier: Tier,
+}
+
+/// Everything on the map, and where your listening sits on it.
+#[derive(Serialize, ToSchema)]
+pub struct GenreMap {
+    pub map: MapBackdrop,
+    /// Your genres that have a place on the map.
+    pub mine: Vec<MyGenre>,
+    /// Play-weighted average colour of `mine`, blended in linear light — what
+    /// your listening sounds like.
+    #[schema(example = "#a18430")]
+    pub colour: Option<String>,
+    pub placed_tags: usize,
+    /// Plays on tags with no place on the map — instruments, nationalities,
+    /// roles.
+    pub unplaced_plays: i64,
+    /// So a half-backfilled history says so rather than looking like a small
+    /// life.
+    pub listens_with_genres: i64,
+    pub listens_total: i64,
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct MapBackdrop {
+    pub width: f64,
+    pub height: f64,
+    #[schema(schema_with = map_points)]
+    pub points: Vec<(String, f64, f64, String)>,
+}
+
+fn map_points() -> utoipa::openapi::schema::Array {
+    use utoipa::openapi::schema::{ArrayBuilder, ObjectBuilder, OneOfBuilder, Type};
+    let cell = OneOfBuilder::new()
+        .item(ObjectBuilder::new().schema_type(Type::String))
+        .item(ObjectBuilder::new().schema_type(Type::Number));
+    ArrayBuilder::new()
+        .description(Some(
+            "`[name, x, y, colour]` per genre — positional to keep ~6,300 rows small.",
+        ))
+        .items(ArrayBuilder::new().items(cell).min_items(Some(4)).max_items(Some(4)))
+        .build()
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct MyGenre {
+    pub name: String,
+    pub plays: i64,
+    pub x: f64,
+    pub y: f64,
+    pub color: String,
+}
+
+/// The play-weighted centre of each period's listening, on the map's
+/// coordinates.
+#[derive(Serialize, ToSchema)]
+pub struct GenreTrajectory {
+    pub years: Vec<TrajectoryPoint>,
+    /// `year` or `month`.
+    pub unit: &'static str,
+    /// Periods with fewer placed plays than this are left out.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub min_plays: Option<i64>,
+    /// Set when nothing could be drawn.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<&'static str>,
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct TrajectoryPoint {
+    /// `2024`, or `2024-03` by month.
+    pub year: String,
+    pub x: f64,
+    pub y: f64,
+    pub plays: i64,
+    pub colour: Option<String>,
+    /// Listens in the period…
+    pub listens: i64,
+    /// …and how many of them have genres resolved. A thin period is labelled
+    /// rather than drawn as if it were complete.
+    pub enriched: i64,
+}
+
+/// Genres bordering your listening, split by whether you already own music
+/// there.
+#[derive(Serialize, ToSchema)]
+pub struct GenreNeighbours {
+    /// Bordering genres you already own music in and underplay. This half
+    /// leads.
+    pub next_door: Vec<NeighbourGenre>,
+    /// Bordering genres you own nothing in — a region, never a suggestion.
+    pub unexplored: Vec<NeighbourGenre>,
+    /// Furthest from your listening. Suggests nothing by construction.
+    pub opposite: Vec<NeighbourGenre>,
+    /// How many of your top genres the walk started from.
+    pub seeded_from: usize,
+}
+
+/// A genre bordering your listening. **`your_artists` and `exemplar_artists`
+/// are never both populated**, so nothing can present an Every Noise exemplar
+/// as something the listener owns.
+#[derive(Serialize, ToSchema)]
+pub struct NeighbourGenre {
+    pub name: String,
+    pub x: f64,
+    pub y: f64,
+    pub color: String,
+    /// How many of your top genres border it.
+    pub borders: usize,
+    /// `plays / sqrt(rank + 1)`, summed: weighted by your play counts and
+    /// discounted by Every Noise's own neighbour rank.
+    pub affinity: f64,
+    pub your_plays: i64,
+    /// From **your own history**. Empty is what puts a genre in `unexplored`.
+    pub your_artists: Vec<ArtistPlays>,
+    /// **Every Noise's exemplars — not your music.** Set only where
+    /// `your_artists` is empty. Requires a tier-2 scrape; empty otherwise.
+    pub exemplar_artists: Vec<String>,
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct ArtistPlays {
+    pub artist: String,
+    pub plays: i64,
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct EveryNoiseDone {
+    /// `saved`, `stopping` or `cleared`.
+    pub status: &'static str,
+}
 
 /// Where the admin's contact address for the scraper's `User-Agent` lives.
 pub const CONTACT_KEY: &str = "everynoise_contact";
 
 fn err(code: u16, msg: impl Into<String>) -> axum::response::Response {
     let status = StatusCode::from_u16(code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-    (status, Json(serde_json::json!(ErrorResponse { code, error: msg.into() }))).into_response()
+    (status, Json(ErrorResponse { code, error: msg.into() })).into_response()
 }
 
 /// The configured contact address, database first and environment second —
@@ -54,7 +205,21 @@ fn looks_like_an_address(s: &str) -> bool {
     }
 }
 
-/// GET /admin/everynoise — what is held, whether a walk is running.
+// GET /admin/everynoise — what is held, whether a walk is running.
+/// Genre-map scrape status.
+///
+/// Session-only, admin role.
+#[utoipa::path(
+    operation_id = "everynoise_status",
+    get,
+    path = "/admin/everynoise",
+    tag = "Admin",
+    responses(
+        (status = 200, description = "OK.", body = EveryNoiseStatus),
+        (status = 401, response = Unauthorized),
+        (status = 403, response = Forbidden),
+    )
+)]
 pub async fn status(State(state): State<Arc<AppState>>, user: AuthUser) -> impl IntoResponse {
     if !user.is_admin {
         return err(403, "Admin only");
@@ -69,24 +234,42 @@ pub async fn status(State(state): State<Arc<AppState>>, user: AuthUser) -> impl 
     let contact = contact(&state).await;
     (
         StatusCode::OK,
-        Json(serde_json::json!({
-            "summary": summary,
-            "progress": state.everynoise_jobs.get().await,
+        Json(EveryNoiseStatus {
+            summary,
+            progress: state.everynoise_jobs.get().await,
             // Echoed back so the field can be pre-filled; it is the admin's own
             // address, not a credential.
-            "contact": contact,
-            "source": "https://everynoise.com/",
-        })),
+            contact,
+            source: "https://everynoise.com/",
+        }),
     )
         .into_response()
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, ToSchema)]
+#[schema(as = EveryNoiseContact)]
 pub struct ContactBody {
+    /// An email address, sent in the scraper's `User-Agent` so the site's
+    /// owner can reach whoever is fetching. Empty clears it.
     pub contact: String,
 }
 
-/// PUT /admin/everynoise/contact
+/// Set the admin contact email for the scraper's User-Agent.
+///
+/// Session-only, admin role. The scrape **refuses to start without one** —
+/// a made-up address is worse than none.
+#[utoipa::path(
+    put,
+    path = "/admin/everynoise/contact",
+    tag = "Admin",
+    request_body = ContactBody,
+    responses(
+        (status = 200, description = "Saved.", body = EveryNoiseDone),
+        (status = 400, description = "Not a plausible address.", body = ErrorResponse),
+        (status = 401, response = Unauthorized),
+        (status = 403, response = Forbidden),
+    )
+)]
 pub async fn set_contact(
     State(state): State<Arc<AppState>>,
     user: AuthUser,
@@ -100,7 +283,7 @@ pub async fn set_contact(
         return err(400, "That doesn't look like an email address");
     }
     match state.db.set_app_setting(CONTACT_KEY, &value).await {
-        Ok(_) => (StatusCode::OK, Json(serde_json::json!({ "status": "saved" }))).into_response(),
+        Ok(_) => (StatusCode::OK, Json(EveryNoiseDone { status: "saved" })).into_response(),
         Err(e) => {
             error!("Could not save the Every Noise contact: {}", e);
             err(500, "Could not save that")
@@ -108,13 +291,45 @@ pub async fn set_contact(
     }
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, ToSchema)]
+#[schema(as = ScrapeRequest)]
 pub struct StartBody {
-    /// `map` (one request) or `pages` (~6,300, about two hours).
+    /// `map` (one request) or `pages` (~6,300, about two hours). `pages`
+    /// needs the map first.
+    #[schema(example = "map")]
     pub tier: String,
 }
 
-/// POST /admin/everynoise/scrape
+/// Start a scrape.
+///
+/// Session-only, admin role. Runs when an admin asks and **never on a
+/// schedule** — Every Noise has been frozen since December 2023, so there
+/// is nothing to sync.
+///
+/// **Tier 1 is one HTTP request** and returns every genre with coordinates
+/// and colour; genre-level features cost that alone. **Tier 2 walks ~6,300
+/// genre pages at 1 req/s** — about two hours — for exemplar artists and
+/// the adjacency graph. Build on tier 1 first.
+///
+/// A fetch that parses to **zero** genres is treated as a failure rather
+/// than written, or a changed page would silently empty the table. Resume
+/// is per page, written in the same transaction as the page's contents, so
+/// a crash can never mark a page done with nothing in it. A second
+/// concurrent start is refused.
+#[utoipa::path(
+    operation_id = "everynoise_start",
+    post,
+    path = "/admin/everynoise/scrape",
+    tag = "Admin",
+    request_body = StartBody,
+    responses(
+        (status = 202, description = "Started.", body = ScrapeStarted),
+        (status = 400, description = "No admin contact set, or an unknown tier.", body = ErrorResponse),
+        (status = 401, response = Unauthorized),
+        (status = 403, response = Forbidden),
+        (status = 409, description = "A scrape is already running, or `pages` was asked for before the map.", body = ErrorResponse),
+    )
+)]
 pub async fn start(
     State(state): State<Arc<AppState>>,
     user: AuthUser,
@@ -174,20 +389,51 @@ pub async fn start(
         }
     });
 
-    (StatusCode::ACCEPTED, Json(serde_json::json!({ "status": "started", "tier": tier })))
-        .into_response()
+    (StatusCode::ACCEPTED, Json(ScrapeStarted { status: "started", tier })).into_response()
 }
 
-/// POST /admin/everynoise/cancel
+/// Cancel a running scrape.
+///
+/// Session-only, admin role. Progress already written is kept — resume is per
+/// page.
+#[utoipa::path(
+    operation_id = "everynoise_cancel",
+    post,
+    path = "/admin/everynoise/cancel",
+    tag = "Admin",
+    responses(
+        (status = 200, description = "Cancelled.", body = EveryNoiseDone),
+        (status = 401, response = Unauthorized),
+        (status = 403, response = Forbidden),
+    )
+)]
 pub async fn cancel(State(state): State<Arc<AppState>>, user: AuthUser) -> impl IntoResponse {
     if !user.is_admin {
         return err(403, "Admin only");
     }
     state.everynoise_jobs.cancel().await;
-    (StatusCode::OK, Json(serde_json::json!({ "status": "stopping" }))).into_response()
+    (StatusCode::OK, Json(EveryNoiseDone { status: "stopping" })).into_response()
 }
 
-/// DELETE /admin/everynoise — drop the local copy.
+// DELETE /admin/everynoise — drop the local copy.
+/// Drop the scraped genre map.
+///
+/// Session-only, admin role. The genre map lives in its **own database**
+/// (`EVERYNOISE_DB_PATH`), kept out of `VACUUM INTO` backups — those should
+/// hold the user's listening, not 6,300 rows of someone else's reference
+/// data.
+#[utoipa::path(
+    operation_id = "everynoise_clear",
+    delete,
+    path = "/admin/everynoise",
+    tag = "Admin",
+    responses(
+        (status = 200, description = "Cleared.", body = EveryNoiseDone),
+        (status = 401, response = Unauthorized),
+        (status = 403, response = Forbidden),
+        (status = 409, description = "A scrape is running; stop it first.", body = ErrorResponse),
+    )
+)]
 pub async fn clear(State(state): State<Arc<AppState>>, user: AuthUser) -> impl IntoResponse {
     if !user.is_admin {
         return err(403, "Admin only");
@@ -196,7 +442,7 @@ pub async fn clear(State(state): State<Arc<AppState>>, user: AuthUser) -> impl I
         return err(409, "Stop the running scrape first");
     }
     match state.everynoise.clear().await {
-        Ok(_) => (StatusCode::OK, Json(serde_json::json!({ "status": "cleared" }))).into_response(),
+        Ok(_) => (StatusCode::OK, Json(EveryNoiseDone { status: "cleared" })).into_response(),
         Err(e) => {
             error!("Could not clear the genre map: {}", e);
             err(500, "Could not clear it")
@@ -248,11 +494,30 @@ pub(crate) fn blend(weighted: &[(&str, i64)]) -> Option<String> {
     })
 }
 
-/// GET /api/v1/genre-map — the whole map, and where the caller lives on it.
+// GET /api/v1/genre-map — the whole map, and where the caller lives on it.
+//
+// Not admin-only: the map itself is instance-wide reference data, but the
+// weighting is entirely the caller's own listening, so this is scoped by
+// `user_id` like every other read.
+/// The map, your genres on it, and your average colour.
 ///
-/// Not admin-only: the map itself is instance-wide reference data, but the
-/// weighting is entirely the caller's own listening, so this is scoped by
-/// `user_id` like every other read.
+/// Session-only. The canvas is 1500 × 22,648 — fifteen times taller than
+/// wide — so a client must compress the y axis **in the coordinates**, not
+/// with `preserveAspectRatio`, which would squash the circles into ellipses
+/// too.
+///
+/// `colour` is blended in **linear light**, not sRGB; mixing gamma-encoded
+/// values drags every user toward the same brown-grey.
+#[utoipa::path(
+    get,
+    path = "/api/v1/genre-map",
+    tag = "Genre map",
+    responses(
+        (status = 200, description = "OK.", body = GenreMap),
+        (status = 401, response = Unauthorized),
+        (status = 409, description = "The map has not been fetched yet. Run the scrape in Settings.", body = ErrorResponse),
+    )
+)]
 pub async fn genre_map(State(state): State<Arc<AppState>>, user: AuthUser) -> impl IntoResponse {
     let backdrop = match state.everynoise.all_points().await {
         Ok(p) => p,
@@ -285,9 +550,13 @@ pub async fn genre_map(State(state): State<Arc<AppState>>, user: AuthUser) -> im
     let mut unplaced = 0i64;
     for (name, plays) in &counts {
         match coords.get(&crate::everynoise::store::genre_key(name)) {
-            Some((x, y, color)) => mine.push(serde_json::json!({
-                "name": name, "plays": plays, "x": x, "y": y, "color": color,
-            })),
+            Some((x, y, color)) => mine.push(MyGenre {
+                name: name.clone(),
+                plays: *plays,
+                x: *x,
+                y: *y,
+                color: color.clone(),
+            }),
             None => unplaced += plays,
         }
     }
@@ -299,6 +568,7 @@ pub async fn genre_map(State(state): State<Arc<AppState>>, user: AuthUser) -> im
         })
         .collect();
     let colour = blend(&weighted);
+    let placed = weighted.len();
 
     let (w, h) = state.everynoise.extent().await.unwrap_or((1500.0, 22648.0));
     let (with_genres, total) =
@@ -306,25 +576,20 @@ pub async fn genre_map(State(state): State<Arc<AppState>>, user: AuthUser) -> im
 
     (
         StatusCode::OK,
-        Json(serde_json::json!({
+        Json(GenreMap {
             // Compact tuples rather than objects: 6,300 of these, and the
             // difference between [n,x,y,c] and four keys apiece is most of the
             // payload.
-            "map": {
-                "width": w, "height": h,
-                "points": backdrop.iter()
-                    .map(|(n, x, y, c)| serde_json::json!([n, x, y, c]))
-                    .collect::<Vec<_>>(),
-            },
-            "mine": mine,
-            "colour": colour,
-            "placed_tags": weighted.len(),
-            "unplaced_plays": unplaced,
+            map: MapBackdrop { width: w, height: h, points: backdrop },
+            mine,
+            colour,
+            placed_tags: placed,
+            unplaced_plays: unplaced,
             // So a half-backfilled history says so rather than looking like a
             // small life.
-            "listens_with_genres": with_genres,
-            "listens_total": total,
-        })),
+            listens_with_genres: with_genres,
+            listens_total: total,
+        }),
     )
         .into_response()
 }
@@ -370,12 +635,39 @@ const MONTHS_BELOW_YEARS: usize = 4;
 ///   slices by time, which makes it the feature most distorted by that: it
 ///   would look like the listening only started recently. Each year therefore
 ///   reports its own enrichment coverage, and the client says so.
-#[derive(Deserialize)]
+#[derive(Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
 pub struct TrajectoryQuery {
-    /// `year` or `month`. Omitted lets the server pick from the span.
+    /// `year` or `month`. Omitted lets the server pick from the span: by
+    /// month under a few years of history, by year otherwise.
     pub by: Option<String>,
 }
 
+/// Where your listening sat, period by period.
+///
+/// Session-only. The play-weighted centroid of each period.
+///
+/// Three honesty constraints, all load-bearing. It is an **artist-mix**
+/// trajectory, not a track-level one — every track by an artist carries
+/// that artist's genres and sits at the same point. A period under 25
+/// placed plays is **omitted, not drawn**, because a centroid from four
+/// listens reads as a real movement inside a path. And each period reports
+/// its own enrichment coverage, to be drawn faintly below 90% — the genre
+/// backfill runs newest-first, so a time-sliced view is the one most
+/// distorted by a half-done pass.
+///
+/// The server picks month or year by how much history there is and says
+/// which it used. Buckets are in the user's own timezone.
+#[utoipa::path(
+    get,
+    path = "/api/v1/genre-map/trajectory",
+    tag = "Genre map",
+    params(TrajectoryQuery),
+    responses(
+        (status = 200, description = "OK.", body = GenreTrajectory),
+        (status = 401, response = Unauthorized),
+    )
+)]
 pub async fn genre_trajectory(
     State(state): State<Arc<AppState>>,
     user: AuthUser,
@@ -412,9 +704,12 @@ pub async fn genre_trajectory(
     if rows.is_empty() {
         return (
             StatusCode::OK,
-            Json(
-                serde_json::json!({ "years": [], "unit": unit, "note": "no genres resolved yet" }),
-            ),
+            Json(GenreTrajectory {
+                years: Vec::new(),
+                unit,
+                min_plays: None,
+                note: Some("no genres resolved yet"),
+            }),
         )
             .into_response();
     }
@@ -457,32 +752,28 @@ pub async fn genre_trajectory(
         e.colours.push((colour.clone(), *plays));
     }
 
-    let years: Vec<serde_json::Value> = per_year
+    let years: Vec<TrajectoryPoint> = per_year
         .into_iter()
         .filter(|(_, a)| a.plays >= MIN_PLAYS_PER_PERIOD)
         .map(|(year, a)| {
             let (listens, enriched) = coverage.get(&year).copied().unwrap_or((0, 0));
             let weighted: Vec<(&str, i64)> =
                 a.colours.iter().map(|(c, p)| (c.as_str(), *p)).collect();
-            serde_json::json!({
-                "year": year,
-                "x": a.x / a.plays as f64,
-                "y": a.y / a.plays as f64,
-                "plays": a.plays,
-                "colour": blend(&weighted),
-                "listens": listens,
-                "enriched": enriched,
-            })
+            TrajectoryPoint {
+                colour: blend(&weighted),
+                year,
+                x: a.x / a.plays as f64,
+                y: a.y / a.plays as f64,
+                plays: a.plays,
+                listens,
+                enriched,
+            }
         })
         .collect();
 
     (
         StatusCode::OK,
-        Json(serde_json::json!({
-            "years": years,
-            "unit": unit,
-            "min_plays": MIN_PLAYS_PER_PERIOD,
-        })),
+        Json(GenreTrajectory { years, unit, min_plays: Some(MIN_PLAYS_PER_PERIOD), note: None }),
     )
         .into_response()
 }
@@ -521,10 +812,16 @@ pub(crate) fn breadth(
     counts: &[(String, i64)],
     coords: &std::collections::HashMap<String, (f64, f64, String)>,
     map_spread: f64,
-) -> serde_json::Value {
+) -> Breadth {
     let total: i64 = counts.iter().map(|(_, p)| p).sum();
     if total == 0 {
-        return serde_json::json!({ "genres_played": 0 });
+        return Breadth {
+            genres_played: 0,
+            genres_placed: None,
+            effective_genres: None,
+            evenness: None,
+            reach: None,
+        };
     }
 
     // Evenness is over *everything* played, map or not — an untagged-by-Every-
@@ -557,52 +854,113 @@ pub(crate) fn breadth(
         (var.sqrt() / map_spread * 1000.0).round() / 1000.0
     });
 
-    serde_json::json!({
-        "genres_played": counts.len(),
-        "genres_placed": placed.len(),
-        "effective_genres": (effective * 10.0).round() / 10.0,
+    Breadth {
+        genres_played: counts.len(),
+        genres_placed: Some(placed.len()),
+        effective_genres: Some((effective * 10.0).round() / 10.0),
         // 1.0 would mean every genre played exactly equally.
-        "evenness": ((effective / counts.len() as f64) * 1000.0).round() / 1000.0,
-        "reach": reach,
-    })
+        evenness: Some(((effective / counts.len() as f64) * 1000.0).round() / 1000.0),
+        reach: Some(reach),
+    }
 }
 
-/// GET /api/v1/genre-map/neighbours — what sits next to your listening.
+/// How widely you listen across the genre map. Every field but
+/// `genres_played` is absent when nothing was played.
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+pub struct Breadth {
+    pub genres_played: usize,
+    /// Of those, the ones the map places.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub genres_placed: Option<usize>,
+    /// `exp(H)` over play counts — as varied as playing N genres equally.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub effective_genres: Option<f64>,
+    /// `effective_genres` over `genres_played`, 0–1. 1.0 would mean every
+    /// genre played exactly equally.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub evenness: Option<f64>,
+    /// Your play-weighted spread over the map's own spread, 0–1. Null when
+    /// nothing played is on the map.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = Option<f64>)]
+    pub reach: Option<Option<f64>>,
+}
+
+// GET /api/v1/genre-map/neighbours — what sits next to your listening.
+//
+// Every Noise precomputes, per genre, its ~20 nearest and ~20 maximally
+// opposite genres. That graph is the tier-2 walk's real payoff — it is a
+// *global* signal, unlike the artist coordinates from the same pages, which
+// are page-local and cannot be compared across genres.
+//
+// **This does not recommend music.** The vision rule is that Tapedeck never
+// points at things the listener does not own, and a genre map makes it very
+// easy to do so accidentally. So the response is split by whether the caller
+// *already has music there*, and the two halves carry artists in **two
+// different fields that must never be merged**:
+//
+// * `your_artists` — from the caller's own listening history. Only ever set on
+//   `next_door`, which is the half that leads, because "you have 243 plays of
+//   boy band and it is not in your top 25" is the actionable finding.
+// * `exemplar_artists` — Every Noise's own exemplars for a genre the caller
+//   owns *nothing* in. These name music they do not have, so the field is
+//   separate rather than shared: any consumer that renders them without
+//   saying where they came from is doing it wrong, and a distinct field name
+//   is what makes that visible at the call site rather than a convention to
+//   remember. Empty until a tier-2 walk has run.
+//
+// The original design left unowned genres with no artist field at all, which
+// enforced the rule by shape. Labelling replaced that (2026-08-06, at
+// Ashwin's direction): a bordering region reduced to one word on a pill said
+// less than the rule was protecting, and the honest fix is provenance, not
+// omission. The shape still enforces the half that matters — nothing can
+// present an Every Noise exemplar as something the listener owns.
+/// What sits next to your listening.
 ///
-/// Every Noise precomputes, per genre, its ~20 nearest and ~20 maximally
-/// opposite genres. That graph is the tier-2 walk's real payoff — it is a
-/// *global* signal, unlike the artist coordinates from the same pages, which
-/// are page-local and cannot be compared across genres.
+/// Session-only. Walks Every Noise's precomputed adjacency, seeded from
+/// your top 25 genres.
 ///
-/// **This does not recommend music.** The vision rule is that Tapedeck never
-/// points at things the listener does not own, and a genre map makes it very
-/// easy to do so accidentally. So the response is split by whether the caller
-/// *already has music there*, and the two halves carry artists in **two
-/// different fields that must never be merged**:
+/// **This does not recommend music**, and the response shape is what
+/// enforces that. Two artist fields that are never both populated on the
+/// same card:
 ///
-/// * `your_artists` — from the caller's own listening history. Only ever set on
-///   `next_door`, which is the half that leads, because "you have 243 plays of
-///   boy band and it is not in your top 25" is the actionable finding.
-/// * `exemplar_artists` — Every Noise's own exemplars for a genre the caller
-///   owns *nothing* in. These name music they do not have, so the field is
-///   separate rather than shared: any consumer that renders them without
-///   saying where they came from is doing it wrong, and a distinct field name
-///   is what makes that visible at the call site rather than a convention to
-///   remember. Empty until a tier-2 walk has run.
+/// * `your_artists` — from **your own history**. Only ever set on
+///   `next_door`.
+/// * `exemplar_artists` — **Every Noise's own exemplars**, for a genre you
+///   own nothing in. These name music you do not have. Any client showing
+///   them owes the reader that provenance, in words and in styling.
 ///
-/// The original design left unowned genres with no artist field at all, which
-/// enforced the rule by shape. Labelling replaced that (2026-08-06, at
-/// Ashwin's direction): a bordering region reduced to one word on a pill said
-/// less than the rule was protecting, and the honest fix is provenance, not
-/// omission. The shape still enforces the half that matters — nothing can
-/// present an Every Noise exemplar as something the listener owns.
+/// `exemplar_artists` is empty until a tier-2 scrape has run — a
+/// tier-1-only instance has adjacency but no exemplars. Say so rather than
+/// rendering bare cards that look like a bug.
+#[utoipa::path(
+    get,
+    path = "/api/v1/genre-map/neighbours",
+    tag = "Genre map",
+    responses(
+        (status = 200, description = "OK.", body = GenreNeighbours),
+        (status = 401, response = Unauthorized),
+        (status = 409, description = "None of your genres are on the map yet.", body = ErrorResponse),
+    )
+)]
 pub async fn genre_neighbours(
     State(state): State<Arc<AppState>>,
     user: AuthUser,
 ) -> impl IntoResponse {
     let counts = state.db.genre_play_counts(user.user_id, None).await.unwrap_or_default();
     if counts.is_empty() {
-        return (StatusCode::OK, Json(serde_json::json!({ "nearby": [], "opposite": [] })))
+        // The full shape, empty. This used to be `{nearby, opposite}` — a key
+        // the real answer has never had — so the map page read
+        // `next_door.length` off `undefined` for anybody with no genres yet.
+        return (
+            StatusCode::OK,
+            Json(GenreNeighbours {
+                next_door: Vec::new(),
+                unexplored: Vec::new(),
+                opposite: Vec::new(),
+                seeded_from: 0,
+            }),
+        )
             .into_response();
     }
 
@@ -670,7 +1028,7 @@ pub async fn genre_neighbours(
                    seeds: &[(String, i64)],
                    plays_by_slug: &std::collections::HashMap<String, i64>,
                    mine: &std::collections::HashMap<String, Vec<(String, i64)>>|
-     -> Vec<serde_json::Value> {
+     -> Vec<NeighbourGenre> {
         let seed_plays: std::collections::HashMap<&str, i64> =
             seeds.iter().map(|(s, p)| (s.as_str(), *p)).collect();
 
@@ -703,27 +1061,31 @@ pub async fn genre_neighbours(
                 // Exemplars fill in exactly where the caller's own history has
                 // nothing to say, and never alongside it — a card showing both
                 // would be the one place a reader could confuse the two.
-                let exemplar_artists: Vec<&String> = if yours.is_empty() {
-                    exemplars.get(&slug).map(|v| v.iter().collect()).unwrap_or_default()
+                let exemplar_artists: Vec<String> = if yours.is_empty() {
+                    exemplars.get(&slug).cloned().unwrap_or_default()
                 } else {
                     Vec::new()
                 };
 
-                Some(serde_json::json!({
-                    "name": name,
-                    "x": x, "y": y, "color": colour,
-                    "borders": borders,
-                    "affinity": (affinity * 10.0).round() / 10.0,
-                    "your_plays": slug_plays,
+                Some(NeighbourGenre {
+                    name,
+                    x,
+                    y,
+                    color: colour,
+                    borders,
+                    affinity: (affinity * 10.0).round() / 10.0,
+                    your_plays: slug_plays,
                     // Strictly the caller's own artists. Empty is a real answer
                     // and it is what splits the response — see `exemplar_artists`.
-                    "your_artists": yours.iter().take(4)
-                        .map(|(a, p)| serde_json::json!({ "artist": a, "plays": p }))
-                        .collect::<Vec<_>>(),
+                    your_artists: yours
+                        .iter()
+                        .take(4)
+                        .map(|(a, p)| ArtistPlays { artist: a.clone(), plays: *p })
+                        .collect(),
                     // Every Noise's exemplars. **Not the caller's music.** Any
                     // consumer rendering these owes the reader that provenance.
-                    "exemplar_artists": exemplar_artists,
-                }))
+                    exemplar_artists,
+                })
             })
             .collect()
     };
@@ -732,7 +1094,7 @@ pub async fn genre_neighbours(
     // Drop the genres that *are* your listening — bordering yourself is not a
     // neighbourhood.
     nearby.retain(|g| {
-        let k = g["name"].as_str().map(crate::everynoise::store::genre_key).unwrap_or_default();
+        let k = crate::everynoise::store::genre_key(&g.name);
         !seed_slugs.iter().any(|s| slugs.get(&k) == Some(s))
     });
     // Split rather than sorted, because the two halves answer different
@@ -741,9 +1103,8 @@ pub async fn genre_neighbours(
     // actionable rows, since the vision rule means there is nothing to point at
     // in them. "You have 243 plays of boy band and it is not in your top 25" is
     // the finding; everything else is context.
-    let (owned, unexplored): (Vec<_>, Vec<_>) = nearby
-        .into_iter()
-        .partition(|g| g["your_artists"].as_array().is_some_and(|a| !a.is_empty()));
+    let (owned, unexplored): (Vec<_>, Vec<_>) =
+        nearby.into_iter().partition(|g| !g.your_artists.is_empty());
     let mut owned = owned;
     let mut unexplored = unexplored;
     owned.truncate(16);
@@ -754,19 +1115,32 @@ pub async fn genre_neighbours(
 
     (
         StatusCode::OK,
-        Json(serde_json::json!({
+        Json(GenreNeighbours {
             // Bordering genres you already have music in, underplayed.
-            "next_door": owned,
+            next_door: owned,
             // Bordering genres you own nothing in. `your_artists` is empty by
             // construction here; `exemplar_artists` is Every Noise's, and has
             // to be presented as such.
-            "unexplored": unexplored,
-            "opposite": opposite,
-            "seeded_from": seeds.len(),
-        })),
+            unexplored,
+            opposite,
+            seeded_from: seeds.len(),
+        }),
     )
         .into_response()
 }
+
+#[derive(utoipa::OpenApi)]
+#[openapi(paths(
+    status,
+    clear,
+    set_contact,
+    start,
+    cancel,
+    genre_map,
+    genre_trajectory,
+    genre_neighbours
+))]
+pub struct Api;
 
 pub fn create_everynoise_router() -> Router<Arc<AppState>> {
     Router::new()

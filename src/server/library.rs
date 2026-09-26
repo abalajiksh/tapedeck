@@ -20,16 +20,18 @@ use axum::{
     routing::get,
     Router,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use utoipa::{IntoParams, ToSchema};
 
 use super::auth::AuthUser;
 use super::models::ErrorResponse;
 use super::AppState;
+use crate::db::{AlbumAggregate, ChartRow, TrackAggregate};
+use crate::openapi::{BadRequest, NotFound, Unauthorized};
 
 fn err(code: StatusCode, msg: impl Into<String>) -> axum::response::Response {
-    (code, Json(serde_json::json!(ErrorResponse { code: code.as_u16(), error: msg.into() })))
-        .into_response()
+    (code, Json(ErrorResponse { code: code.as_u16(), error: msg.into() })).into_response()
 }
 
 fn not_found(what: &str) -> axum::response::Response {
@@ -38,8 +40,110 @@ fn not_found(what: &str) -> axum::response::Response {
 
 /// Stat-card strings are built here, not in the browser, so every surface that
 /// shows "412 plays" phrases it identically.
-fn stat(k: &str, v: String, sub: String, dark: bool) -> serde_json::Value {
-    serde_json::json!({ "k": k, "v": v, "sub": sub, "tone": if dark { "dark" } else { "plain" } })
+fn stat(k: &'static str, v: String, sub: String, dark: bool) -> StatCard {
+    StatCard { k, v, sub, tone: if dark { "dark" } else { "plain" } }
+}
+
+/// One stat card, phrased by the server so every surface says "412 plays" the
+/// same way.
+#[derive(Serialize, ToSchema)]
+pub struct StatCard {
+    /// The label — `Your Plays`, `Hours`, `First Heard`, `Share`.
+    pub k: &'static str,
+    /// The figure, formatted.
+    pub v: String,
+    /// The line under it.
+    pub sub: String,
+    /// `plain` or `dark`.
+    pub tone: &'static str,
+}
+
+/// A description of the album or artist, with the attribution it must be
+/// shown with. Every field is null when no provider had one.
+#[derive(Serialize, ToSchema)]
+pub struct Bio {
+    pub text: Option<String>,
+    /// Shown with the text, always — Last.fm's is CC BY-SA, and one without the
+    /// other breaks the licence.
+    pub attribution: Option<String>,
+    pub provider: Option<String>,
+    /// Where the full text lives.
+    pub url: Option<String>,
+}
+
+/// An album page: your listening of one record.
+#[derive(Serialize, ToSchema)]
+pub struct AlbumPage {
+    /// The entity id.
+    pub id: i64,
+    /// Always `album`.
+    pub kind: &'static str,
+    pub title: String,
+    pub artist: String,
+    /// The artist's page.
+    pub artist_entity_id: Option<i64>,
+    pub mbid: Option<String>,
+    pub year: Option<i32>,
+    pub track_count: i64,
+    /// Time *you* spent on this record, not the record's length — that is the
+    /// sum of the distinct track durations in `tracks`.
+    pub listening_seconds: i64,
+    pub plays: i64,
+    pub artwork_url: Option<String>,
+    pub caa_id: Option<i64>,
+    pub caa_release_mbid: Option<String>,
+    /// A cover was chosen by hand, so offer "reset to the cover from your
+    /// listens" rather than only "clear".
+    pub cover_override: bool,
+    pub loved: bool,
+    pub bio: Bio,
+    /// Four cards: plays, hours, first heard, and this record's share of the
+    /// artist.
+    pub stats: Vec<StatCard>,
+    /// The tracks you have played, with how they sounded.
+    pub tracks: Vec<TrackAggregate>,
+    /// Up to four more records by the artist.
+    pub more: Vec<AlbumAggregate>,
+}
+
+/// An artist page: your listening of one artist.
+#[derive(Serialize, ToSchema)]
+pub struct ArtistPage {
+    /// The entity id.
+    pub id: i64,
+    /// Always `artist`.
+    pub kind: &'static str,
+    pub name: String,
+    pub mbid: Option<String>,
+    /// The portrait the charts use.
+    pub image_url: Option<String>,
+    /// The wide image, only where you chose one.
+    pub landscape_url: Option<String>,
+    /// The shared `artists` row the image endpoints address.
+    pub artist_row_id: Option<i64>,
+    /// Where this artist sits among yours by plays, 1 being the most played.
+    pub rank: i64,
+    /// How many artists that rank is out of.
+    pub artist_total: i64,
+    pub plays: i64,
+    pub album_count: i64,
+    pub track_count: i64,
+    pub loved: bool,
+    pub bio: Bio,
+    /// Four cards: plays, hours, first heard, and this artist's share of all
+    /// your listening.
+    pub stats: Vec<StatCard>,
+    /// Up to six records.
+    pub albums: Vec<AlbumAggregate>,
+    /// The ten most-played tracks.
+    pub top_tracks: Vec<TrackAggregate>,
+    pub trend: Vec<TrendPoint>,
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct TrendPoint {
+    pub label: String,
+    pub value: i64,
 }
 
 fn hours(seconds: i64) -> String {
@@ -94,18 +198,18 @@ async fn bio_for(
     name: &str,
     artist: &str,
     mbid: Option<&str>,
-) -> serde_json::Value {
+) -> Bio {
     use crate::metadata::bio::{fetch_bio, BioQuery};
 
     let now = chrono::Utc::now().timestamp();
     if let Ok(Some(row)) = state.db.get_bio(entity_id).await {
         if now - row.fetched_at < BIO_TTL_SECS {
-            return serde_json::json!({
-                "text": row.bio,
-                "attribution": row.attribution,
-                "provider": row.provider,
-                "url": row.url,
-            });
+            return Bio {
+                text: row.bio,
+                attribution: row.attribution,
+                provider: row.provider,
+                url: row.url,
+            };
         }
     }
 
@@ -130,18 +234,39 @@ async fn bio_for(
         .await;
 
     match found {
-        Some(b) => serde_json::json!({
-            "text": b.text, "attribution": b.attribution,
-            "provider": b.provider, "url": b.url,
-        }),
-        None => serde_json::json!({
-            "text": null, "attribution": null, "provider": null, "url": null,
-        }),
+        Some(b) => Bio {
+            text: Some(b.text),
+            attribution: b.attribution,
+            provider: Some(b.provider.to_string()),
+            url: b.url,
+        },
+        None => Bio { text: None, attribution: None, provider: None, url: None },
     }
 }
 
 // ── GET /api/v1/albums/:id ──
 
+/// An album page.
+///
+/// Session-only. Aggregated over `scrobbles` by name. Track rows carry the
+/// **raw quality columns**, not a formatted label — the client formats
+/// them, so a server-side copy of that logic cannot drift.
+///
+/// An entity with **zero plays still renders** rather than 404ing:
+/// something annotated once and since deleted from the history is still a
+/// real record.
+#[utoipa::path(
+    get,
+    path = "/api/v1/albums/{id}",
+    tag = "Library",
+    params(("id" = i64, Path, description = "The album's entity id, from `GET /api/v1/resolve`.")),
+    responses(
+        (status = 200, description = "OK.", body = AlbumPage),
+        (status = 400, description = "That entity is not an album.", body = ErrorResponse),
+        (status = 401, response = Unauthorized),
+        (status = 404, response = NotFound),
+    )
+)]
 pub async fn album_detail(
     State(state): State<Arc<AppState>>,
     user: AuthUser,
@@ -237,38 +362,55 @@ pub async fn album_detail(
 
     (
         StatusCode::OK,
-        Json(serde_json::json!({
-            "id": entity.id,
-            "kind": "album",
-            "title": album,
-            "artist": artist,
-            "artist_entity_id": artist_entity_id,
-            "mbid": entity.mbid,
-            "year": summary.as_ref().and_then(|s| s.year),
-            "track_count": summary.as_ref().map(|s| s.track_count).unwrap_or(0),
+        Json(AlbumPage {
+            id: entity.id,
+            kind: "album",
+            title: album,
+            artist,
+            artist_entity_id,
+            mbid: entity.mbid,
+            year: summary.as_ref().and_then(|s| s.year),
+            track_count: summary.as_ref().map(|s| s.track_count).unwrap_or(0),
             // Time *you* spent on this record, not the record's length — the
             // album's own runtime is the sum of the distinct track durations
             // below, which the client already has.
-            "listening_seconds": summary.as_ref().map(|s| s.seconds).unwrap_or(0),
-            "plays": summary.as_ref().map(|s| s.plays).unwrap_or(0),
-            "artwork_url": override_url.clone().or_else(|| artwork.as_ref().and_then(|a| a.0.clone())),
-            "caa_id": artwork.as_ref().and_then(|a| a.1),
-            "caa_release_mbid": artwork.as_ref().and_then(|a| a.2.clone()),
+            listening_seconds: summary.as_ref().map(|s| s.seconds).unwrap_or(0),
+            plays: summary.as_ref().map(|s| s.plays).unwrap_or(0),
+            artwork_url: override_url
+                .clone()
+                .or_else(|| artwork.as_ref().and_then(|a| a.0.clone())),
+            caa_id: artwork.as_ref().and_then(|a| a.1),
+            caa_release_mbid: artwork.as_ref().and_then(|a| a.2.clone()),
             // So the page can offer "reset to the cover from your listens"
             // rather than only "clear", which would read as "no cover at all".
-            "cover_override": override_url.is_some(),
-            "loved": loved,
-            "bio": bio,
-            "stats": stats,
-            "tracks": tracks,
-            "more": more,
-        })),
+            cover_override: override_url.is_some(),
+            loved,
+            bio,
+            stats,
+            tracks,
+            more,
+        }),
     )
         .into_response()
 }
 
 // ── GET /api/v1/artists/:id ──
 
+/// An artist page.
+///
+/// Session-only. Same shape and same rules as the album page.
+#[utoipa::path(
+    get,
+    path = "/api/v1/artists/{id}",
+    tag = "Library",
+    params(("id" = i64, Path, description = "The artist's entity id, from `GET /api/v1/resolve`.")),
+    responses(
+        (status = 200, description = "OK.", body = ArtistPage),
+        (status = 400, description = "That entity is not an artist.", body = ErrorResponse),
+        (status = 401, response = Unauthorized),
+        (status = 404, response = NotFound),
+    )
+)]
 pub async fn artist_detail(
     State(state): State<Arc<AppState>>,
     user: AuthUser,
@@ -354,44 +496,48 @@ pub async fn artist_detail(
         ],
     };
 
-    let trend: Vec<_> = trend
-        .into_iter()
-        .map(|(label, value)| serde_json::json!({ "label": label, "value": value }))
-        .collect();
+    let trend: Vec<_> =
+        trend.into_iter().map(|(label, value)| TrendPoint { label, value }).collect();
 
     (
         StatusCode::OK,
-        Json(serde_json::json!({
-            "id": entity.id,
-            "kind": "artist",
-            "name": name,
-            "mbid": entity.mbid,
-            "image_url": image_url,
-            "landscape_url": landscape_url,
-            "artist_row_id": artist_row_id,
-            "rank": rank,
-            "artist_total": artist_total,
-            "plays": summary.as_ref().map(|s| s.plays).unwrap_or(0),
-            "album_count": summary.as_ref().map(|s| s.album_count).unwrap_or(0),
-            "track_count": summary.as_ref().map(|s| s.track_count).unwrap_or(0),
-            "loved": loved,
-            "bio": bio,
-            "stats": stats,
-            "albums": albums,
-            "top_tracks": top_tracks,
-            "trend": trend,
-        })),
+        Json(ArtistPage {
+            id: entity.id,
+            kind: "artist",
+            name,
+            mbid: entity.mbid,
+            image_url,
+            landscape_url,
+            artist_row_id,
+            rank,
+            artist_total,
+            plays: summary.as_ref().map(|s| s.plays).unwrap_or(0),
+            album_count: summary.as_ref().map(|s| s.album_count).unwrap_or(0),
+            track_count: summary.as_ref().map(|s| s.track_count).unwrap_or(0),
+            loved,
+            bio,
+            stats,
+            albums,
+            top_tracks,
+            trend,
+        }),
     )
         .into_response()
 }
 
 // ── GET /api/v1/charts ──
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
 pub struct ChartQuery {
     /// `artists` (default), `albums` or `tracks`.
+    #[param(pattern = "^(artists|albums|tracks)$", default = "artists")]
     pub kind: Option<String>,
+    /// The window, as on `GET /api/v1/stats`: `today`, `d7`, `month`, `year`
+    /// or `all`, the default.
     pub range: Option<String>,
+    /// 100 by default, at most 500.
+    #[param(minimum = 1, maximum = 500, default = 100)]
     pub limit: Option<i64>,
     /// `plays` (default) or `hours` — the *ranking*, not just the number shown.
     /// Statistics hands off here carrying its own metric, and the two lists
@@ -401,13 +547,42 @@ pub struct ChartQuery {
 
 /// Ranked chart over one window. The Statistics page shows the head of these
 /// three lists; this serves the whole thing for the dedicated charts screen.
+/// A ranked chart.
+#[derive(Serialize, ToSchema)]
+pub struct Chart {
+    /// `artists`, `albums` or `tracks`.
+    pub kind: &'static str,
+    /// The window, as asked.
+    pub range: String,
+    pub rows: Vec<ChartRow>,
+}
+
+/// Top charts.
+///
+/// Session-only. Note this offers a **different range set** from
+/// `/api/v1/stats` — it has `today`. The two answering the same question
+/// over different windows is known, and is why the Insights redesign wants
+/// one shared range control.
+#[utoipa::path(
+    get,
+    path = "/api/v1/charts",
+    tag = "Statistics",
+    params(ChartQuery),
+    responses(
+        (status = 200, description = "OK.", body = Chart),
+        (status = 400, response = BadRequest),
+        (status = 401, response = Unauthorized),
+    )
+)]
 pub async fn charts(
     State(state): State<Arc<AppState>>,
     user: AuthUser,
     Query(q): Query<ChartQuery>,
 ) -> impl IntoResponse {
-    let kind = match q.kind.as_deref().unwrap_or("artists") {
-        k @ ("artists" | "albums" | "tracks") => k,
+    let kind: &'static str = match q.kind.as_deref().unwrap_or("artists") {
+        "artists" => "artists",
+        "albums" => "albums",
+        "tracks" => "tracks",
         _ => return err(StatusCode::BAD_REQUEST, "kind must be artists, albums or tracks"),
     };
     let limit = q.limit.unwrap_or(100).clamp(1, 500);
@@ -417,11 +592,7 @@ pub async fn charts(
     match state.db.chart(user.user_id, kind, after, limit, by_hours).await {
         Ok(rows) => (
             StatusCode::OK,
-            Json(serde_json::json!({
-                "kind": kind,
-                "range": q.range.unwrap_or_else(|| "all".into()),
-                "rows": rows,
-            })),
+            Json(Chart { kind, range: q.range.unwrap_or_else(|| "all".into()), rows }),
         )
             .into_response(),
         Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
@@ -430,7 +601,8 @@ pub async fn charts(
 
 // ── GET /api/v1/resolve ──
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
 pub struct ResolveQuery {
     /// `album` / `release`, `artist`, or `track` / `recording`.
     pub kind: String,
@@ -443,6 +615,31 @@ pub struct ResolveQuery {
 /// Name → entity id, creating the entity if this is the first time anyone has
 /// pointed at it. Lets a history row link to `/album/<id>` without the browser
 /// knowing any ids.
+/// An entity, found or created.
+#[derive(Serialize, ToSchema)]
+pub struct Resolved {
+    pub id: i64,
+    /// The stored kind: `release`, `artist` or `recording`.
+    pub kind: &'static str,
+}
+
+/// Resolve names to an entity id.
+///
+/// Session-only. **Creates the entity on first visit** — a write on a read
+/// path, on purpose. The browser knows names, not ids, so without this
+/// every link out of the history would be dead until you happened to
+/// annotate the thing it points at.
+#[utoipa::path(
+    get,
+    path = "/api/v1/resolve",
+    tag = "Library",
+    params(ResolveQuery),
+    responses(
+        (status = 200, description = "OK.", body = Resolved),
+        (status = 400, response = BadRequest),
+        (status = 401, response = Unauthorized),
+    )
+)]
 pub async fn resolve(
     State(state): State<Arc<AppState>>,
     // Unused, and required anyway: `entities` is a shared table with no
@@ -464,30 +661,60 @@ pub async fn resolve(
     let artist = if kind == "artist" { "" } else { q.artist.as_deref().unwrap_or("").trim() };
 
     match state.db.upsert_entity(kind, name, artist, None).await {
-        Ok(id) => {
-            (StatusCode::OK, Json(serde_json::json!({ "id": id, "kind": kind }))).into_response()
-        }
+        Ok(id) => (StatusCode::OK, Json(Resolved { id, kind })).into_response(),
         Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     }
 }
 
 // ── GET /api/v1/albums/:id/tracklist ──
 
-/// The record's *own* tracklist, from MusicBrainz — including the tracks you
-/// have never played.
+// The record's *own* tracklist, from MusicBrainz — including the tracks you
+// have never played.
+//
+// The album page is otherwise built entirely from listens, which means a record
+// you have played twice shows two tracks and looks like a two-track record.
+// That is honest about the listening and useless as a picture of the object.
+//
+// Deliberately **not** merged into `album_detail`: this costs a rate-limited
+// call to somebody else's server, and the page has to render instantly and
+// without one. It is behind a button for the same reason the Cover Art Archive
+// pull is — an explicit ask, not a page load.
+//
+// Nothing is stored. The response is the record as MusicBrainz has it, and the
+// browser matches it against the plays it already holds; writing a tracklist
+// into `scrobbles` would be inventing listens that never happened.
+/// The record's own tracklist, including tracks never played.
 ///
-/// The album page is otherwise built entirely from listens, which means a record
-/// you have played twice shows two tracks and looks like a two-track record.
-/// That is honest about the listening and useless as a picture of the object.
+/// Session-only. Everything else on the album page is aggregated from
+/// listens, so a record played twice renders as a two-track record. This
+/// asks MusicBrainz what is actually on it.
 ///
-/// Deliberately **not** merged into `album_detail`: this costs a rate-limited
-/// call to somebody else's server, and the page has to render instantly and
-/// without one. It is behind a button for the same reason the Cover Art Archive
-/// pull is — an explicit ask, not a page load.
+/// **Nothing is stored.** The caller matches these against the plays it
+/// already holds; writing a tracklist into `scrobbles` would invent listens
+/// that never happened. It is a separate call rather than part of
+/// `/api/v1/albums/{id}` because it costs a rate-limited request to an
+/// external service and the page must render without one.
 ///
-/// Nothing is stored. The response is the record as MusicBrainz has it, and the
-/// browser matches it against the plays it already holds; writing a tracklist
-/// into `scrobbles` would be inventing listens that never happened.
+/// The release is chosen in order: the entity's own MBID, then the release
+/// MBID a **plurality** of the album's listens claim (a tagger works per
+/// track, so one listen in twelve routinely carries a compilation's), then
+/// a search, which is a guess.
+///
+/// **404 is a normal answer** — a great deal of any real library is not in
+/// MusicBrainz, and those are exactly the records worth keeping.
+#[utoipa::path(
+    get,
+    path = "/api/v1/albums/{id}/tracklist",
+    tag = "Library",
+    params(("id" = i64, Path, description = "The album's entity id.")),
+    responses(
+        (status = 200, description = "OK.", body = AlbumTracklist),
+        (status = 400, description = "That entity is not an album.", body = ErrorResponse),
+        (status = 401, response = Unauthorized),
+        (status = 404, description = "No matching release, or no such album.", body = ErrorResponse),
+        (status = 502, description = "MusicBrainz could not be reached.", body = ErrorResponse),
+    )
+)]
 async fn album_tracklist(
     State(state): State<Arc<AppState>>,
     user: AuthUser,
@@ -535,21 +762,40 @@ async fn album_tracklist(
 
     (
         StatusCode::OK,
-        Json(serde_json::json!({
-            "source": candidate.source,
-            "mbid_release": candidate.mbid_release,
-            "title": candidate.title,
-            "artist": candidate.artist,
-            "year": candidate.year,
-            "format": candidate.format,
+        Json(AlbumTracklist {
+            source: candidate.source,
+            mbid_release: candidate.mbid_release,
+            title: candidate.title,
+            artist: candidate.artist,
+            year: candidate.year,
+            format: candidate.format,
             // `side` and `position` come straight from the lookup. A CD is one
             // side, a double LP four — the shelf's own splitter decided that,
             // and the page shows whatever it says rather than re-deriving it.
-            "tracks": candidate.tracks,
-        })),
+            tracks: candidate.tracks,
+        }),
     )
         .into_response()
 }
+
+/// The record as MusicBrainz has it, including tracks you have never played.
+/// Nothing is stored.
+#[derive(Serialize, ToSchema)]
+pub struct AlbumTracklist {
+    /// Always `musicbrainz`.
+    pub source: &'static str,
+    pub mbid_release: Option<String>,
+    pub title: String,
+    pub artist: String,
+    pub year: Option<i64>,
+    pub format: Option<String>,
+    /// A CD is one side, a double LP four.
+    pub tracks: Vec<crate::metadata::release_lookup::PhysicalTrack>,
+}
+
+#[derive(utoipa::OpenApi)]
+#[openapi(paths(album_detail, album_tracklist, artist_detail, charts, resolve))]
+pub struct Api;
 
 pub fn create_library_router() -> Router<Arc<AppState>> {
     Router::new()

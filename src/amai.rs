@@ -125,7 +125,7 @@ pub enum Lookup<T> {
 /// map — masked, but still theirs — and `music_libraries`. Nothing here stores
 /// or logs either: a credential belonging to another application has no
 /// business crossing into this one even in masked form.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct AmaiServer {
     pub server_id: String,
     pub name: String,

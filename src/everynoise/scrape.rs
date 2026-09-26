@@ -38,8 +38,11 @@ const REQUEST_DELAY: Duration = Duration::from_secs(1);
 const TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_RETRIES: u32 = 3;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+/// `map` is the genre map, one request; `pages` is every genre's page,
+/// ~6,300 requests at one a second.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
+#[schema(as = ScrapeTier)]
 pub enum Tier {
     /// The genre map. One request.
     Map,
@@ -47,8 +50,9 @@ pub enum Tier {
     Pages,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
+#[schema(as = ScrapeState)]
 pub enum State {
     Running,
     Done,
@@ -57,7 +61,9 @@ pub enum State {
     Cancelled,
 }
 
-#[derive(Debug, Clone, serde::Serialize)]
+/// The running or most recent scrape.
+#[derive(Debug, Clone, serde::Serialize, utoipa::ToSchema)]
+#[schema(as = ScrapeProgress)]
 pub struct Progress {
     pub tier: Tier,
     pub state: State,

@@ -6,6 +6,130 @@
 
 use super::*;
 
+/// Ranged statistics: totals, top lists (50 rows each), fidelity mix, decades,
+/// a 7×24 listening heatmap, breadth, genres and languages.
+#[derive(Debug, serde::Serialize, utoipa::ToSchema)]
+pub struct RangedStats {
+    pub totals: RangedTotals,
+    pub top_artists: Vec<TopArtist>,
+    pub top_albums: Vec<TopAlbum>,
+    pub top_tracks: Vec<TopTrack>,
+    /// `DSD`, `Lossless`, `Lossy` and `Unknown`, largest first. A share of
+    /// `plays`, because it carries the `Unknown` bucket of its own.
+    pub fidelity: Vec<Share>,
+    /// Release decades, `1970s` and so on, oldest first. Only listens whose
+    /// release year has been resolved count, so `pct` is a share of those.
+    pub decades: Vec<Share>,
+    /// The twelve most-mentioned genres. **A share of tag mentions, not
+    /// listens** — one track carries several tags. Never present it as a
+    /// percentage of plays.
+    pub genres: Vec<Share>,
+    /// The twelve largest languages, over the listens that have been
+    /// classified.
+    pub languages: Vec<LanguageShare>,
+    /// Always empty; reserved.
+    #[schema(value_type = Vec<Object>)]
+    pub regions: Vec<serde_json::Value>,
+    /// Seven rows of 24, counts of plays by hour, in your own timezone. Row 0
+    /// is Monday.
+    pub heatmap: Vec<Vec<i64>>,
+    /// Absent until the genre map is fetched and genres backfilled — "you play
+    /// 0 genres" would be a lie about the listening rather than a statement
+    /// about the data.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub breadth: Option<crate::server::everynoise::Breadth>,
+}
+
+#[derive(Debug, serde::Serialize, utoipa::ToSchema)]
+pub struct RangedTotals {
+    pub plays: i64,
+    /// Summed over the listens with a known length — see `duration_known`.
+    pub hours: f64,
+    /// Listens `hours` is summed over. A listen whose source reported no
+    /// length contributes nothing, so `hours` is a floor rather than a total.
+    pub duration_known: i64,
+    pub artists: i64,
+    pub albums: i64,
+    pub tracks: i64,
+    /// 0–100, averaged over `quality_known` listens only; 0 when there are none.
+    pub avg_quality: f64,
+    /// Listens `avg_quality` is averaged over. Only a live source ever writes a
+    /// quality score, so an imported history has none and the average is over
+    /// the same narrow population the fidelity shares are. Present it with its
+    /// coverage or not at all; at zero there is no score to show, not a score
+    /// of zero.
+    pub quality_known: i64,
+    /// Share of `fidelity_known`, not of `plays`. A whole percentage.
+    pub lossless_pct: i64,
+    /// Share of `fidelity_known`, not of `plays`. A whole percentage.
+    pub dsd_pct: i64,
+    /// Listens in this window whose format is known — the denominator of the
+    /// two shares above. The `fidelity` array is a share of `plays` instead,
+    /// because it carries an `Unknown` bucket of its own.
+    pub fidelity_known: i64,
+    /// Skipped plays in this window. Every other count in this object excludes
+    /// them; this one is about them. Not every source reports skips, so zero
+    /// means "nothing told us", not "nothing skipped".
+    pub skips: i64,
+    /// Plays per **calendar** day of the window, including days with no
+    /// listening. Dividing by active days instead reports a busy afternoon's
+    /// rate as the year's.
+    pub per_day: f64,
+    /// Earliest non-skipped listen, unix seconds. A fact about the whole
+    /// history and therefore **not** ranged — asking it of a one-week window
+    /// would only restate the window.
+    pub first_listen: Option<i64>,
+    /// Loved entities: tracks, records and artists together. All time, not
+    /// ranged.
+    pub loves: i64,
+}
+
+/// A top artist. Counted over everyone credited, the way the charts count.
+#[derive(Debug, serde::Serialize, utoipa::ToSchema)]
+pub struct TopArtist {
+    pub name: String,
+    pub plays: i64,
+    /// One decimal place.
+    pub hours: f64,
+    pub image_url: Option<String>,
+}
+
+#[derive(Debug, serde::Serialize, utoipa::ToSchema)]
+pub struct TopAlbum {
+    pub name: String,
+    pub artist: String,
+    pub plays: i64,
+    /// One decimal place.
+    pub hours: f64,
+}
+
+#[derive(Debug, serde::Serialize, utoipa::ToSchema)]
+pub struct TopTrack {
+    pub title: String,
+    pub artist: String,
+    pub album: Option<String>,
+    pub plays: i64,
+    /// One decimal place.
+    pub hours: f64,
+}
+
+/// One slice of a breakdown.
+#[derive(Debug, serde::Serialize, utoipa::ToSchema)]
+pub struct Share {
+    pub name: String,
+    pub plays: i64,
+    /// A whole percentage of the breakdown's own total — which total, each
+    /// breakdown says.
+    pub pct: i64,
+}
+
+#[derive(Debug, serde::Serialize, utoipa::ToSchema)]
+pub struct LanguageShare {
+    pub name: String,
+    /// A whole percentage of the classified listens.
+    pub pct: i64,
+}
+
 impl Database {
     /// `after` = None means all-time. Genres/languages/regions/decades need
     /// MusicBrainz enrichment we don't have yet, so they return empty arrays
@@ -15,7 +139,7 @@ impl Database {
         user_id: i64,
         after: Option<i64>,
         by_hours: bool,
-    ) -> Result<serde_json::Value, sqlx::Error> {
+    ) -> Result<RangedStats, sqlx::Error> {
         // The top lists are cut to 50 rows, so the sort has to happen in SQL:
         // re-sorting the returned 50 by hours in the browser would rank within
         // the top 50 *by plays*, and silently miss a long record played a few
@@ -136,15 +260,16 @@ impl Database {
         .await?;
         let names: Vec<String> = top_rows.iter().map(|(n, _, _)| n.clone()).collect();
         let images = self.artist_images(&names).await.unwrap_or_default();
-        let top_artists: Vec<serde_json::Value> = top_rows
+        let top_artists: Vec<TopArtist> = top_rows
             .into_iter()
             .map(|(name, plays, secs)| {
-                let image = images.get(&Self::artist_key(&name)).cloned();
-                serde_json::json!({
-                    "name": name, "plays": plays,
-                    "hours": (secs.unwrap_or(0) as f64 / 3600.0 * 10.0).round() / 10.0,
-                    "image_url": image,
-                })
+                let image_url = images.get(&Self::artist_key(&name)).cloned();
+                TopArtist {
+                    name,
+                    plays,
+                    hours: (secs.unwrap_or(0) as f64 / 3600.0 * 10.0).round() / 10.0,
+                    image_url,
+                }
             })
             .collect();
 
@@ -161,11 +286,13 @@ impl Database {
             .bind(after)
             .fetch_all(&self.pool)
             .await?;
-        let top_albums: Vec<serde_json::Value> = album_rows
+        let top_albums: Vec<TopAlbum> = album_rows
             .into_iter()
-            .map(|(name, artist, plays, secs)| {
-                serde_json::json!({ "name": name, "artist": artist, "plays": plays,
-                "hours": (secs.unwrap_or(0) as f64 / 3600.0 * 10.0).round() / 10.0 })
+            .map(|(name, artist, plays, secs)| TopAlbum {
+                name,
+                artist,
+                plays,
+                hours: (secs.unwrap_or(0) as f64 / 3600.0 * 10.0).round() / 10.0,
             })
             .collect();
 
@@ -182,12 +309,14 @@ impl Database {
         .bind(after)
         .fetch_all(&self.pool)
         .await?;
-        let top_tracks: Vec<serde_json::Value> = track_rows
+        let top_tracks: Vec<TopTrack> = track_rows
             .into_iter()
-            .map(|(title, artist, album, plays, secs)| {
-                serde_json::json!({ "title": title, "artist": artist, "album": album,
-                "plays": plays,
-                "hours": (secs.unwrap_or(0) as f64 / 3600.0 * 10.0).round() / 10.0 })
+            .map(|(title, artist, album, plays, secs)| TopTrack {
+                title,
+                artist,
+                album,
+                plays,
+                hours: (secs.unwrap_or(0) as f64 / 3600.0 * 10.0).round() / 10.0,
             })
             .collect();
 
@@ -213,9 +342,9 @@ impl Database {
         .bind(after)
         .fetch_all(&self.pool)
         .await?;
-        let fidelity: Vec<serde_json::Value> = fidelity_rows
+        let fidelity: Vec<Share> = fidelity_rows
             .into_iter()
-            .map(|(name, c)| serde_json::json!({ "name": name, "plays": c, "pct": pct(c) }))
+            .map(|(name, c)| Share { name, plays: c, pct: pct(c) })
             .collect();
 
         // Release decades. Only listens whose release year has been resolved by
@@ -232,10 +361,18 @@ impl Database {
         .fetch_all(&self.pool)
         .await?;
         let decade_total: i64 = decade_rows.iter().map(|(_, c)| c).sum();
-        let decades: Vec<serde_json::Value> = decade_rows.into_iter().map(|(d, c)| {
-            serde_json::json!({ "name": format!("{}s", d), "plays": c,
-                "pct": if decade_total > 0 { (c as f64 / decade_total as f64 * 100.0).round() as i64 } else { 0 } })
-        }).collect();
+        let decades: Vec<Share> = decade_rows
+            .into_iter()
+            .map(|(d, c)| Share {
+                name: format!("{}s", d),
+                plays: c,
+                pct: if decade_total > 0 {
+                    (c as f64 / decade_total as f64 * 100.0).round() as i64
+                } else {
+                    0
+                },
+            })
+            .collect();
 
         // Genre breakdown. One listen carries several tags, so `json_each`
         // fans the array out and each tag is counted once per listen that has
@@ -255,10 +392,18 @@ impl Database {
         .fetch_all(&self.pool)
         .await?;
         let genre_total: i64 = genre_rows.iter().map(|(_, c)| c).sum();
-        let genres: Vec<serde_json::Value> = genre_rows.into_iter().map(|(name, c)| {
-            serde_json::json!({ "name": name, "plays": c,
-                "pct": if genre_total > 0 { (c as f64 / genre_total as f64 * 100.0).round() as i64 } else { 0 } })
-        }).collect();
+        let genres: Vec<Share> = genre_rows
+            .into_iter()
+            .map(|(name, c)| Share {
+                name,
+                plays: c,
+                pct: if genre_total > 0 {
+                    (c as f64 / genre_total as f64 * 100.0).round() as i64
+                } else {
+                    0
+                },
+            })
+            .collect();
 
         // Language breakdown (only listens that have been classified).
         // `skipped = FALSE` was missing here: a skip is stored but must never be
@@ -275,41 +420,56 @@ impl Database {
         .fetch_all(&self.pool)
         .await?;
         let lang_total: i64 = lang_rows.iter().map(|(_, c)| c).sum();
-        let languages: Vec<serde_json::Value> = lang_rows.into_iter().map(|(name, c)| {
-            serde_json::json!({ "name": name, "pct": if lang_total > 0 { (c as f64 / lang_total as f64 * 100.0).round() as i64 } else { 0 } })
-        }).collect();
+        let languages: Vec<LanguageShare> = lang_rows
+            .into_iter()
+            .map(|(name, c)| LanguageShare {
+                name,
+                pct: if lang_total > 0 {
+                    (c as f64 / lang_total as f64 * 100.0).round() as i64
+                } else {
+                    0
+                },
+            })
+            .collect();
 
-        Ok(serde_json::json!({
-            "totals": {
-                "plays": total, "hours": (hours * 10.0).round() / 10.0,
+        Ok(RangedStats {
+            totals: RangedTotals {
+                plays: total,
+                hours: (hours * 10.0).round() / 10.0,
                 // What that sum is over. A listen with no reported length adds
                 // nothing to it, so the figure is a floor.
-                "duration_known": duration_known.0,
-                "artists": artists.0, "albums": albums.0, "tracks": tracks.0,
-                "avg_quality": avg_quality.0.map(|q| (q * 10.0).round() / 10.0).unwrap_or(0.0),
+                duration_known: duration_known.0,
+                artists: artists.0,
+                albums: albums.0,
+                tracks: tracks.0,
+                avg_quality: avg_quality.0.map(|q| (q * 10.0).round() / 10.0).unwrap_or(0.0),
                 // How many listens that average is actually over. `compute_score`
                 // only runs at ingest and in the Plex/Jellyfin sources, so an
                 // imported listen has no score — the average has the same narrow
                 // population the fidelity shares do, and the card must say so
                 // rather than presenting a figure drawn from 5% of a history as
                 // a fact about all of it.
-                "quality_known": quality_known.0,
-                "lossless_pct": fpct(lossless.0), "dsd_pct": fpct(dsd.0),
+                quality_known: quality_known.0,
+                lossless_pct: fpct(lossless.0),
+                dsd_pct: fpct(dsd.0),
                 // The two shares above are of this, not of `plays`.
-                "fidelity_known": fidelity_known.0,
-                "skips": skips.0,
-                "per_day": per_day,
-                "first_listen": first_listen.0,
-                "loves": loves.0,
+                fidelity_known: fidelity_known.0,
+                skips: skips.0,
+                per_day,
+                first_listen: first_listen.0,
+                loves: loves.0,
             },
-            "top_artists": top_artists,
-            "top_albums": top_albums,
-            "top_tracks": top_tracks,
-            "fidelity": fidelity,
-            "decades": decades,
-            "genres": genres, "languages": languages, "regions": [],
+            top_artists,
+            top_albums,
+            top_tracks,
+            fidelity,
+            decades,
+            genres,
+            languages,
+            regions: Vec::new(),
             // heatmap is filled in by the handler in the user's local timezone
-            "heatmap": Vec::<Vec<i64>>::new(),
-        }))
+            heatmap: Vec::new(),
+            breadth: None,
+        })
     }
 }

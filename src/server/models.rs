@@ -1,13 +1,23 @@
 use serde::{Deserialize, Serialize};
+use utoipa::ToSchema;
 
-/// Top-level request body for `/1/submit-listens`
-#[derive(Debug, Deserialize)]
+// The request side of `/1/submit-listens`. Every type here is published in the
+// OpenAPI document, so `///` on them is written for a client author and notes
+// for whoever edits this file are `//` comments.
+
+/// A ListenBrainz-shaped submission.
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct SubmitListensRequest {
     pub listen_type: ListenType,
+    /// At least one listen and at most 1000; exactly one for `playing_now`.
+    #[schema(min_items = 1, max_items = 1000)]
     pub payload: Vec<ListenPayload>,
 }
 
-#[derive(Debug, Deserialize, PartialEq, Eq)]
+/// **This decides forwarding.** `single` and `playing_now` are live;
+/// `import` is stored only unless the token is marked `imports_are_live` —
+/// see `POST /1/submit-listens`.
+#[derive(Debug, Deserialize, PartialEq, Eq, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ListenType {
     Single,
@@ -15,129 +25,141 @@ pub enum ListenType {
     Import,
 }
 
-#[derive(Debug, Deserialize)]
+/// One listen in a ListenBrainz-shaped submission.
+#[derive(Debug, Deserialize, ToSchema)]
+#[schema(as = SubmitListen)]
 pub struct ListenPayload {
-    /// Unix timestamp — required for `single` and `import`, absent for `playing_now`
+    /// Unix seconds, UTC, **start** of play. Required for `single` and
+    /// `import`, and ignored for `playing_now`, which is always now.
     pub listened_at: Option<i64>,
     pub track_metadata: TrackMetadata,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct TrackMetadata {
+    /// The artist credit as one string. A **semicolon-separated** value
+    /// (`Bach; Hilary Hahn`) is read as several credited artists when
+    /// `additional_info.artist_names` is absent — see there.
     pub artist_name: String,
     pub track_name: String,
     pub release_name: Option<String>,
     #[serde(default)]
     pub additional_info: Option<AdditionalInfo>,
+    /// The shape ListenBrainz **returns** its MBIDs in. Read as a fallback;
+    /// a submitting client should put them in `additional_info`.
     #[serde(default)]
     pub mbid_mapping: Option<MbidMapping>,
 }
 
-#[derive(Debug, Deserialize, Default)]
+/// ListenBrainz's free-form bag, and where Tapedeck's own extensions ride.
+///
+/// **No field in here can fail a submission.** A value of the wrong type
+/// costs that field — or, for a `tapedeck_*` object, that object — and the
+/// listen is still stored. Unknown keys are ignored.
+// Every field is lenient for the reason `lenient` states: ListenBrainz imposes
+// no schema on this bag and serde has no per-field recovery, so one strict
+// field would fail the whole body with a 422 before the handler ran.
+#[derive(Debug, Deserialize, Default, ToSchema)]
 pub struct AdditionalInfo {
     #[serde(default, deserialize_with = "lenient")]
     pub submission_client: Option<String>,
     #[serde(default, deserialize_with = "lenient")]
     pub submission_client_version: Option<String>,
-    /// Lenient because this is the field CLAUDE.md named as the obvious
-    /// next casualty of a strict type in this bag — it escaped only because
-    /// fooyin happens to send it as a number.
+    /// The track's length in milliseconds. A number or a numeric string.
+    // Lenient because this is the field CLAUDE.md named as the obvious
+    // next casualty of a strict type in this bag — it escaped only because
+    // fooyin happens to send it as a number.
     #[serde(default, deserialize_with = "lenient_millis")]
+    #[schema(schema_with = integer_or_string)]
     pub duration_ms: Option<i64>,
-    /// The recording's ISRC, when the client knows it — a tag read off the file
-    /// usually does. Worth taking because it is the one identifier that
-    /// survives crossing between a library, a streaming catalogue and
-    /// MusicBrainz, so a listen that arrives with one never needs the
-    /// rate-limited lookup that would otherwise find it.
-    ///
-    /// Lenient like everything else in this bag: `additional_info` has no schema
-    /// and a strict type here would cost the whole submission rather than the
-    /// field.
+    /// The recording's ISRC, when the client knows it — a tag read off the
+    /// file usually does. It survives crossing between a library, a streaming
+    /// catalogue and MusicBrainz, so a listen that arrives with one never needs
+    /// a lookup to be identified.
     #[serde(default, deserialize_with = "lenient")]
     pub isrc: Option<String>,
-    /// ListenBrainz spells this `tracknumber`; Tapedeck's own submissions and
-    /// some clients use `track_number`. A mismatch here is silent — the number
-    /// simply goes missing, taking album-playthrough analytics and `[[track:3]]`
-    /// with it — so accept both spellings.
-    ///
-    /// It also arrives as a **string** as often as a number: `additional_info`
-    /// is free-form in ListenBrainz and a tag read straight off a file is text
-    /// (fooyin sends `"tracknumber": "3"`, and vinyl-style `"A1"` exists too).
-    /// A bare `Option<i32>` failed the whole body rather than this one field —
-    /// serde has no per-field recovery, so axum's `Json` extractor rejected the
-    /// request with a 422 before `submit_listens` ran and *every* listen in the
-    /// batch was lost, with no `rejected` entry to say why. That is why this is
-    /// hand-deserialised: an unusable track number must cost the track number,
-    /// never the listen.
+    /// Also accepted as `tracknumber` (ListenBrainz's spelling) and
+    /// `trackNumber`. A number, or the string a tag reader hands over — `"7"`
+    /// and `"7/12"` both work. Anything that is neither (a vinyl `"A1"`, a
+    /// bool, an object) costs the track number only.
+    // It arrives as a **string** as often as a number: fooyin sends
+    // `"tracknumber": "3"`, and vinyl-style `"A1"` exists too. A bare
+    // `Option<i32>` failed the whole body rather than this one field — axum's
+    // `Json` extractor rejected the request with a 422 before `submit_listens`
+    // ran and *every* listen in the batch was lost, with no `rejected` entry to
+    // say why. That is why this is hand-deserialised: an unusable track number
+    // must cost the track number, never the listen.
     #[serde(default, alias = "tracknumber", alias = "trackNumber")]
     #[serde(deserialize_with = "lenient_track_number")]
+    #[schema(schema_with = integer_or_string)]
     pub track_number: Option<i32>,
-    /// The client reporting that this track was skipped rather than played
-    /// through. `scrobbles.skipped` has existed since Phase 2 but only Rockbox
-    /// imports and the shelf's deck transport ever set it, so skip-rate
-    /// analytics had no live source. A skipped listen is stored, excluded from
-    /// every count, and never forwarded.
+    /// The track was skipped rather than played through. Stored, excluded
+    /// from every count, and **never forwarded** — a forwarded skip is a wrong
+    /// scrobble on a permanent record. Top level of `additional_info`; there
+    /// is no `tapedeck_skipped`.
+    // `scrobbles.skipped` has existed since Phase 2 but only Rockbox imports
+    // and the shelf's deck transport ever set it, so skip-rate analytics had
+    // no live source until a client could say so here.
     #[serde(default)]
     pub skipped: Option<bool>,
-
-    /// How much of the track was actually heard, in milliseconds, with paused
-    /// time excluded.
-    ///
-    /// `skipped` is a bool, and a bool cannot tell "skipped three seconds in"
-    /// from "skipped with thirty seconds left" — opposite listening behaviours
-    /// filed identically. Until a pushing client sends this there is nothing in
-    /// the system that could distinguish them: `skipped` had no live source at
-    /// all beyond Rockbox imports and the shelf transport.
-    ///
-    /// Lenient for the same reason as `track_number`: this lives in
-    /// `additional_info`, and a strict type in that bag fails the **whole
-    /// submission** with a 422 before the handler runs. `duration_ms` was named
-    /// as the next field likely to be bitten by that; this is a new one in the
-    /// same position, so it does not get to repeat the mistake.
+    /// How much of the track was actually heard, in milliseconds, with
+    /// paused time excluded. A number or a numeric string. This is what makes
+    /// `skipped` worth having: a bool cannot separate "skipped three seconds
+    /// in" from "skipped with thirty seconds left", and those are opposite
+    /// behaviours.
+    // Lenient for the same reason as `track_number`: a strict type in this bag
+    // fails the **whole submission** with a 422 before the handler runs.
     #[serde(default, deserialize_with = "lenient_millis")]
+    #[schema(schema_with = integer_or_string)]
     pub listened_ms: Option<i64>,
 
-    /// MBIDs as a *submitting* client sends them. `mbid_mapping` is the shape
-    /// ListenBrainz **returns** — it's what the export carries, which is why
-    /// `import.rs` reads it — but on the way in the spec puts these in
-    /// `additional_info`, and that is where every real client (fooyin, Pano,
-    /// multi-scrobbler) writes them. Reading only `mbid_mapping` meant a client
-    /// that had already done the identification paid for a rate-limited
-    /// MusicBrainz lookup anyway, and nothing errored to say so. `openapi.yaml`
-    /// has documented these as read since v0.39.0; now they are.
+    /// MBIDs as a submitting client sends them. A listen that arrives
+    /// identified is never looked up again.
+    // `mbid_mapping` is the shape ListenBrainz **returns** — it's what the
+    // export carries, which is why `import.rs` reads it — but on the way in the
+    // spec puts these in `additional_info`, and that is where every real client
+    // (fooyin, Pano, multi-scrobbler) writes them. Reading only `mbid_mapping`
+    // meant a client that had already done the identification paid for a
+    // rate-limited MusicBrainz lookup anyway.
     #[serde(default, deserialize_with = "lenient")]
     pub recording_mbid: Option<String>,
     #[serde(default, deserialize_with = "lenient")]
     pub release_mbid: Option<String>,
+    /// The release group, which is what relates a reissue, a remaster and a
+    /// regional edition to one another.
     #[serde(default, deserialize_with = "lenient")]
     pub release_group_mbid: Option<String>,
-    /// The release-track and the work, neither of which any other source can
-    /// supply — a media server surfaces neither, and MusicBrainz would have to
-    /// be asked per listen. A tagging client read them off the file.
+    /// The track *on a particular release*, as distinct from the recording.
+    /// Only a tagging client ever knows it.
+    // Neither this nor `work_mbid` can come from any other source — a media
+    // server surfaces neither, and MusicBrainz would have to be asked per
+    // listen.
     #[serde(default, deserialize_with = "lenient")]
     pub release_track_mbid: Option<String>,
+    /// The composition rather than a performance of it. Only a tagging client
+    /// ever knows it.
     #[serde(default, deserialize_with = "lenient")]
     pub work_mbid: Option<String>,
     #[serde(default, deserialize_with = "lenient_string_list")]
     pub artist_mbids: Option<Vec<String>>,
     /// Whoever the *record* is credited to. On a compilation or a soundtrack
-    /// that is not the performer, which is the whole reason it is a field of
-    /// its own rather than a fallback for `artist_mbids`.
+    /// that is not the performer, which is why it is a field of its own rather
+    /// than a fallback for `artist_mbids`.
     #[serde(default, deserialize_with = "lenient_string_list")]
     pub album_artist_mbids: Option<Vec<String>>,
 
-    /// Every artist credited, where the client sends them separately.
+    /// Everyone credited, where the client can separate them — the only
+    /// structured way to say "Bach *and* Hilary Hahn". All of them are recorded
+    /// and the artist pages and charts aggregate over every one, so a soloist
+    /// appears under their own name rather than vanishing into the composer's.
     ///
-    /// ListenBrainz's own field, and the only structured way a submission can
-    /// say "this is Bach *and* Hilary Hahn". Without it a classical listen is
-    /// one string and the performer is unrecoverable — which is what it was:
-    /// ingest hardcoded `artists: None` and threw the credit away even when it
-    /// was there to read.
-    ///
-    /// Typed loosely on purpose. This lives in `additional_info`, which has no
-    /// schema and where one strict field costs the **whole submission** — the
-    /// trap `lenient_track_number` exists for. Anything that is not an array of
-    /// strings is ignored rather than fatal.
+    /// Failing this, a **semicolon-separated** `artist_name` is split on `;`
+    /// and nothing else. `&` and `,` appear inside real names — "Simon &
+    /// Garfunkel", "Earth, Wind & Fire" — so splitting on those would invent
+    /// artists who do not exist.
+    // Ingest used to hardcode `artists: None` and threw the credit away even
+    // when it was there to read. Anything that is not an array of strings is
+    // ignored rather than fatal — the trap `lenient_track_number` exists for.
     #[serde(default, deserialize_with = "lenient_string_list")]
     pub artist_names: Option<Vec<String>>,
 
@@ -152,6 +174,14 @@ pub struct AdditionalInfo {
     pub tapedeck_session: Option<TapedeckSession>,
     #[serde(default, deserialize_with = "lenient")]
     pub tapedeck_playback: Option<TapedeckPlayback>,
+}
+
+/// The schema of a field that takes a number or a numeric string.
+fn integer_or_string() -> utoipa::openapi::schema::Object {
+    use utoipa::openapi::schema::{ObjectBuilder, SchemaType, Type};
+    ObjectBuilder::new()
+        .schema_type(SchemaType::from_iter([Type::Integer, Type::String, Type::Null]))
+        .build()
 }
 
 /// Accepts whatever a client put in a milliseconds field and yields a
@@ -236,114 +266,178 @@ where
     .filter(|n| *n > 0))
 }
 
-#[derive(Debug, Deserialize)]
+/// ListenBrainz's read-side MBID block, accepted as a fallback for the
+/// fields in `additional_info`.
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct MbidMapping {
     pub recording_mbid: Option<String>,
     pub release_mbid: Option<String>,
     pub artist_mbids: Option<Vec<String>>,
+    /// Cover Art Archive id.
     pub caa_id: Option<i64>,
     pub caa_release_mbid: Option<String>,
 }
 
 // ── Tapedeck-specific extensions (roadmap 4.2) ──
 
-#[derive(Debug, Deserialize)]
+/// How the audio actually sounded, as a **submitting client** reports it in
+/// `additional_info.tapedeck_audio`. Every field is optional; a plugin that
+/// can see its decoder reports most, a bare scrobble client none.
+///
+/// This is the write-side shape. A stored listen carries the same information
+/// **flat** on the `Listen` object rather than nested.
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct TapedeckAudio {
-    pub format_type: Option<String>, // "pcm", "dsd", "mqa"
+    /// `pcm`, `dsd`, or `mqa`. Not the codec.
+    pub format_type: Option<String>,
+    /// The codec as your decoder names it — `flac`, `mp3`, `dsd_lsbf_planar`.
+    /// Tapedeck matches DSD and PCM by **prefix**, so ffmpeg's per-ordering and
+    /// per-sample-format spellings all classify correctly.
     pub codec: Option<String>,
+    /// kbps.
     pub bitrate: Option<i32>,
+    /// Hz.
     pub sample_rate: Option<i32>,
     pub bit_depth: Option<i16>,
     pub channels: Option<i16>,
+    /// The file container, e.g. `ogg`, `m4a`.
     pub container: Option<String>,
     pub is_lossless: Option<bool>,
+    /// What the source claims to be, where that differs from what was measured.
     pub source_quality: Option<String>,
     // DSD fields
+    /// Hz.
     pub dsd_rate: Option<i64>,
+    /// 64, 128, 256… Derived from `dsd_rate` when absent, and left unset rather
+    /// than guessed when the rate is not a real DSD multiple.
     pub dsd_multiplier: Option<i16>,
     // Delivery (BT / transcode)
+    /// Set **only** when the audio was genuinely transcoded. Remuxing a
+    /// container without touching the audio is not a transcode, nor is a video
+    /// transcode that left the audio alone. Scoring docks points whenever this
+    /// is set, so filling it on a direct play quietly penalises the best
+    /// listens on the system.
     pub delivery_codec: Option<String>,
+    /// kbps.
     pub delivery_bitrate: Option<i32>,
+    /// Hz.
     pub delivery_sample_rate: Option<i32>,
     pub delivery_bit_depth: Option<i32>,
+    /// Usually derived from the signal chain rather than reported. SACD's DSD
+    /// layer cannot leave a player over coax or optical, so nothing downstream
+    /// will ever tell you this directly.
     pub dsd_to_pcm_converted: Option<bool>,
     pub is_transcoded: Option<bool>,
     pub transcode_reason: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+/// What was playing it. Resolves to a `devices` row, which is rung 4 of the
+/// chain ladder — without it a listen from a client with no token default and
+/// no output binding gets no signal chain at all.
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct TapedeckDevice {
     pub player_name: Option<String>,
     pub player_version: Option<String>,
     pub platform: Option<String>,
+    /// **The key.** Stable per installation and never the display name, which
+    /// the user edits — keying on a name re-registers the device as a new one
+    /// the moment it is renamed. Nothing is recorded without this.
     pub machine_id: Option<String>,
+    /// What the audio came out of. Recorded whether or not it is mapped, so the
+    /// UI can offer unmapped ones for one-tap assignment, and it drives rung 2
+    /// of the chain ladder.
     pub output_device: Option<String>,
     pub output_type: Option<String>,
+    /// USB, Bluetooth, analog… Preferred over `output_type`.
     pub interface: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+/// Signal chain, rung 1 of the four-rung ladder: explicit name →
+/// output-device binding → the submitting token's `default_chain_id` → the
+/// source device's default. An unknown name resolves to no chain rather than
+/// erroring.
+///
+/// Note this is an **object**. It was documented as a bare string until
+/// v0.66.0 and never was one.
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct TapedeckChain {
+    /// The chain's **name**, despite the field being called `chain_id` — a
+    /// client knows what the user called it, not its row id. Use `?dry_run=1`
+    /// to check it resolves.
     pub chain_id: Option<String>,
+    /// Accepted and not yet stored.
     pub components: Option<Vec<String>>,
 }
 
-/// What the client was doing when the track came up.
-///
-/// Deliberately two fields where there were five. The struct existed since the
-/// extensions were first sketched and **nothing anywhere read it** — it was
-/// deserialised on every submission and dropped, so a client filling it in got
-/// silence with no error to say so. Half-present is the worst of the available
-/// states: it costs a client author real work and returns nothing.
-///
-/// The two kept are the two that answer a question nothing else in Tapedeck
-/// can: *what did I put on deliberately, and what did shuffle hand me?* The
-/// three dropped could not. `volume_level` at the moment of submission says
-/// nothing about a listen — it is a fact about a slider, and one sample of it
-/// at that. `skip_count` is per-session state the server derives from the
-/// listens themselves, and better, since it does not reset when a client
-/// restarts. `is_repeat` is a mode rather than an event: a repeat that actually
-/// happened is already visible as two listens of the same track.
-///
-/// A dropped field costs nothing to reinstate if a use for it appears. Storing
-/// one nothing reads is how this struct got here.
-#[derive(Debug, Deserialize)]
+/// What the client was doing when the track came up — specifically, whether
+/// the listener chose it.
+// Deliberately two fields where there were five. The struct existed since the
+// extensions were first sketched and **nothing anywhere read it** — it was
+// deserialised on every submission and dropped, so a client filling it in got
+// silence with no error to say so. Half-present is the worst of the available
+// states: it costs a client author real work and returns nothing.
+//
+// The two kept are the two that answer a question nothing else in Tapedeck
+// can: *what did I put on deliberately, and what did shuffle hand me?* The
+// three dropped could not. `volume_level` at the moment of submission says
+// nothing about a listen — it is a fact about a slider, and one sample of it
+// at that. `skip_count` is per-session state the server derives from the
+// listens themselves, and better, since it does not reset when a client
+// restarts. `is_repeat` is a mode rather than an event: a repeat that actually
+// happened is already visible as two listens of the same track.
+//
+// A dropped field costs nothing to reinstate if a use for it appears. Storing
+// one nothing reads is how this struct got here.
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct TapedeckSession {
     /// Whether shuffle chose this track rather than the listener.
     pub is_shuffle: Option<bool>,
     /// What it was played from — a playlist name, an album, a queue, radio.
-    /// Free text: it is the client's own vocabulary for its own containers, and
-    /// there is no shared one to normalise it against.
+    /// Free text: it is your vocabulary for your own containers and there is
+    /// no shared one to normalise against.
     #[serde(default, deserialize_with = "lenient")]
     pub queue_source: Option<String>,
 }
 
 /// Where the playhead is, from a client that can actually see it.
 ///
-/// `playing_now` carries no position — the ListenBrainz submission format has
-/// no field for one — so a pushed now-playing was wall-clock arithmetic from
-/// the moment the client spoke, and a paused player drew a confident and
-/// completely wrong position. [`Progress`](super::now_playing::Progress) has
-/// modelled the difference between a measurement and a guess for a while; this
-/// is the missing half, the way for a client to supply the measurement.
+/// The ListenBrainz submission format carries no position, so a `playing_now`
+/// without this is wall-clock arithmetic from the moment you spoke — right
+/// until the listener pauses or seeks, wrong from then on, and reported as an
+/// estimate (`position_known: false`) rather than dressed up as a measurement.
+/// Send this and the deck shows a real position.
 ///
-/// Both fields are lenient, because this rides in `additional_info` where a
-/// strict type costs the entire submission.
-#[derive(Debug, Deserialize)]
+/// A playhead sent here is believed **outright**, including a step backwards:
+/// a polled source's report may lag its player by a few seconds and is smoothed
+/// for it, but a client measuring at the instant it sends has no such lag, so
+/// a backward step is the listener seeking and you are the authority on that.
+// [`Progress`](super::now_playing::Progress) has modelled the difference
+// between a measurement and a guess for a while; this is the missing half, the
+// way for a client to supply the measurement. Both fields are lenient, because
+// this rides in `additional_info` where a strict type costs the entire
+// submission.
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct TapedeckPlayback {
-    /// Exact playhead at the instant of submission, in milliseconds.
+    /// Exact playhead at the instant of submission, in milliseconds. A number
+    /// or a numeric string.
     #[serde(default, deserialize_with = "lenient_millis")]
+    #[schema(schema_with = integer_or_string)]
     pub position_ms: Option<i64>,
-    /// `playing` or `paused`. Anything else is read as playing, which is the
-    /// safe default: a wrongly-paused deck freezes and looks broken, where a
-    /// wrongly-playing one is merely the behaviour of every other source.
+    /// `playing` or `paused`. Anything other than `paused` is read as playing,
+    /// which is the safe way to fall: a wrongly-paused deck freezes and reads
+    /// as broken.
     ///
-    /// Lenient like everything else in this bag. A bare `Option<String>` here
-    /// is a *strict* type — a client sending a number or an object for `state`
-    /// would fail the whole submission with a 422 before the handler ran, and
-    /// take every listen in the batch with it. Caught by
-    /// `only_an_explicit_pause_pauses_the_deck`, which is the exact shape of
-    /// the fooyin bug arriving in a new field.
+    /// **Send `paused` when the listener pauses.** Without it the position
+    /// counts forward through the pause while `position_known` asserts it is a
+    /// measurement — a confident and completely wrong readout. A paused entry
+    /// holds still and expires after ten minutes of silence, so a heartbeat
+    /// keeps it alive and stopping altogether clears it.
+    // Lenient like everything else in this bag. A bare `Option<String>` here
+    // is a *strict* type — a client sending a number or an object for `state`
+    // would fail the whole submission with a 422 before the handler ran, and
+    // take every listen in the batch with it. Caught by
+    // `only_an_explicit_pause_pauses_the_deck`, which is the exact shape of
+    // the fooyin bug arriving in a new field.
     #[serde(default, deserialize_with = "lenient")]
     pub state: Option<String>,
 }
@@ -394,29 +488,31 @@ impl TapedeckPlayback {
 
 // ── Response types ──
 
-/// The response to `submit-listens`.
-///
-/// Everything past `status` is a Tapedeck extension and purely additive:
-/// ListenBrainz clients branch on `status` alone, so extra keys cannot break
-/// them. It exists because a batch submit was previously all-or-nothing from
-/// the client's point of view — "ok" told a plugin author nothing about which
-/// listens were stored, which were already known, and which were malformed.
-#[derive(Debug, Serialize)]
+/// Everything past `status` is a Tapedeck extension and purely additive —
+/// ListenBrainz clients branch on `status` alone, so the extra keys cannot
+/// break them. They exist because a batch submit was otherwise all-or-nothing
+/// from the client's side: "ok" said nothing about which listens were stored,
+/// which were already held, and which were malformed.
+#[derive(Debug, Serialize, ToSchema)]
 pub struct SubmitListensResponse {
+    /// Always `ok`.
+    #[schema(example = "ok")]
     pub status: String,
     /// Newly stored.
     pub accepted: u32,
-    /// Recognised as already held, by `source_id` or by the fuzzy window.
-    /// Not an error — a client re-sending after a dropped connection is the
-    /// normal way this happens.
+    /// **Singular.** Recognised as already held, by `source_id` or by the
+    /// fuzzy window. Not an error — a client resending after a dropped
+    /// connection is the normal way this happens. But a client whose every
+    /// listen comes back here has a bug, which is why it is counted apart from
+    /// `accepted` rather than folded in.
     pub duplicate: u32,
-    /// Listens that could not be stored and should **not** be retried, each
-    /// with its index into the submitted payload. Always present, empty when
-    /// nothing was rejected — an absent key would be ambiguous.
+    /// Could not be stored and **must not be retried** — malformed client
+    /// data, so resending changes nothing. Always present, empty when nothing
+    /// was rejected; an absent key would be ambiguous.
     pub rejected: Vec<RejectedListen>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct RejectedListen {
     /// Index into the submitted `payload`, so the client can map it back to
     /// what it sent.
@@ -424,45 +520,91 @@ pub struct RejectedListen {
     pub reason: String,
 }
 
-/// The response to `submit-listens?dry_run=1`: what *would* have happened.
-#[derive(Debug, Serialize)]
+/// The reply to `?dry_run` — what *would* have happened.
+#[derive(Debug, Serialize, ToSchema)]
 pub struct DryRunResponse {
+    /// Always `ok`.
+    #[schema(example = "ok")]
     pub status: String,
+    /// Always `true`.
     pub dry_run: bool,
     pub listens: Vec<DryRunListen>,
     pub rejected: Vec<RejectedListen>,
 }
 
 /// One listen's resolved state, computed and thrown away.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct DryRunListen {
+    /// Index into the submitted `payload`.
     pub index: usize,
     pub artist: String,
     pub title: String,
     pub album: Option<String>,
     pub timestamp: i64,
-    /// The score `AudioQuality::compute_score` derives from the submitted
-    /// fields — the main thing a plugin author is trying to get right.
+    /// What your `tapedeck_audio` fields scored, 0–100 — the main thing worth
+    /// getting right and otherwise invisible.
+    // The score `AudioQuality::compute_score` derives from the submitted fields.
     pub quality_score: Option<f64>,
-    /// The winner of the four-rung ladder, and which rung won it.
     pub chain_id: Option<i64>,
     pub chain_name: Option<String>,
+    /// **Which rung of the ladder won:** `explicit`, `output_binding`,
+    /// `token_default`, `device_default` or `none`. The single most useful
+    /// field here: a chain arriving from the wrong rung looks identical to one
+    /// arriving from the right one, so without this a misconfiguration is
+    /// invisible until someone reads their history months later.
+    #[schema(
+        value_type = String,
+        pattern = "^(explicit|output_binding|token_default|device_default|none)$"
+    )]
     pub chain_source: &'static str,
     pub device_id: Option<i64>,
     pub listening_context: Option<String>,
-    /// What the row would be filed as: `pending` (will be forwarded onward) or
-    /// `imported` (stored only). The distinction a backfill has to get right.
+    /// `pending` will be forwarded onward; `imported` is stored only. The
+    /// distinction a backfill has to get right, answered before it is too late
+    /// to change.
+    #[schema(value_type = String, pattern = "^(pending|imported)$")]
     pub status_if_stored: &'static str,
     pub skipped: bool,
-    /// Whether the dedup would have swallowed it — checked read-only against
-    /// the same two rules the real path uses.
+    /// Whether dedup would have swallowed it, checked read-only against the
+    /// real rules.
     pub duplicate: bool,
 }
 
-#[derive(Debug, Serialize)]
+/// A submit answers one of these: the outcome, or — with `?dry_run` — the
+/// preview.
+#[derive(Serialize, ToSchema)]
+#[serde(untagged)]
+#[allow(dead_code)] // describes the two bodies `submit_listens` sends
+pub enum SubmitOutcome {
+    Stored(SubmitListensResponse),
+    DryRun(DryRunResponse),
+}
+
+/// Every error body in the API has this shape.
+#[derive(Debug, Serialize, ToSchema)]
+#[schema(as = Error)]
 pub struct ErrorResponse {
+    /// Mirrors the HTTP status.
     pub code: u16,
+    /// Human-readable. Not a stable identifier — do not branch on it.
     pub error: String,
+}
+
+/// An acknowledgement with nothing else to report.
+///
+/// `status` names what happened — `ok`, `updated`, `deleted`, `cleared`,
+/// `started` and so on; the operation says which it sends. A client needs only
+/// the HTTP status to know it worked.
+#[derive(Debug, Serialize, ToSchema)]
+#[schema(as = Ok)]
+pub struct OkResponse {
+    pub status: &'static str,
+}
+
+impl OkResponse {
+    pub fn new(status: &'static str) -> axum::Json<Self> {
+        axum::Json(Self { status })
+    }
 }
 
 #[cfg(test)]

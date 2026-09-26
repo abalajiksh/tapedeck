@@ -50,9 +50,10 @@
 
 use std::collections::HashMap;
 
-/// Which half of the space an axis belongs to. The distinction is load-bearing
-/// — see the module docs.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+/// Which half of the space an axis belongs to: `sound` is about the music
+/// (from the genre map), `habit` about the listener (from their history).
+// The distinction is load-bearing — see the module docs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum Group {
     /// Derived from Every Noise, i.e. about the music.

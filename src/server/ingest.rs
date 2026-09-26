@@ -3,7 +3,7 @@ use axum::{
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Json},
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{debug, error, info, warn};
@@ -14,37 +14,112 @@ use super::now_playing::{NowPlaying, Progress};
 use super::AppState;
 use crate::engine::enrichment::enrich_play;
 use crate::models::{AudioQuality, ListenDisposition, Play, PlaybackReport};
+use crate::openapi::{BadRequest, Unauthorized};
+use utoipa::{IntoParams, ToSchema};
 
-#[derive(Deserialize)]
+#[derive(Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
 pub struct TokenQuery {
+    /// The token, for a client that cannot set a header. The
+    /// `Authorization: Token …` header wins when both are sent.
     token: Option<String>,
 }
 
-/// GET /1/validate-token — the handshake ListenBrainz clients (Pano Scrobbler,
-/// multi-scrobbler, Web Scrobbler…) use to check a token before submitting.
+/// ListenBrainz's answer, plus what this token may do when it is valid.
+#[derive(Serialize, ToSchema)]
+pub struct TokenValidation {
+    /// Always 200.
+    pub code: u16,
+    pub message: &'static str,
+    pub valid: bool,
+    /// Present only when `valid`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user_name: Option<String>,
+    /// As granted, with `all` expanded: some of `submit`, `read`, `write`.
+    /// Present only when `valid`. Matching is exact and **none implies
+    /// another** — `submit` does not carry `read`, and `write` does not carry
+    /// `read`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scopes: Option<Vec<&'static str>>,
+    /// Rung 3 of the chain ladder. Show the user which chain their listens
+    /// will be attributed to rather than leaving them to find out from their
+    /// history. Present only when `valid`, and then null when the token has
+    /// no default.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = Option<i64>)]
+    pub default_chain_id: Option<Option<i64>>,
+    /// Whether this token's `listen_type: "import"` submissions are relayed
+    /// onward — see `POST /1/submit-listens` for the two gates that still
+    /// apply. Invisible from the client side and silent in its absence, which
+    /// matters most for players that label every scrobble `import`. Present
+    /// only when `valid`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub imports_are_live: Option<bool>,
+    /// So a client shipped against one version can tell which extensions this
+    /// instance understands without parsing this document to find out. Present
+    /// only when `valid`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub server_version: Option<&'static str>,
+}
+
+// GET /1/validate-token — the handshake ListenBrainz clients (Pano Scrobbler,
+// multi-scrobbler, Web Scrobbler…) use to check a token before submitting.
+//
+// Deliberately mirrors ListenBrainz's contract rather than Tapedeck's own
+// conventions: the token may arrive in the `Authorization` header *or* as a
+// `?token=` query parameter, and an invalid token is reported as HTTP 200 with
+// `valid: false` — not a 401. Clients branch on that field, so returning an
+// auth error here makes them report a server fault instead of a bad token.
+//
+// **The Tapedeck keys past `user_name` are introspection**, and they exist
+// because a client had no way to learn what its own token may do. Without them
+// a settings screen has two bad options — hide features that might work, or
+// offer features that 403 at the moment of use — in a screen whose entire job
+// is telling the user their setup is right. Extending this endpoint rather
+// than adding a second one is deliberate: real ListenBrainz clients branch on
+// `valid` alone, so extra keys cannot break them, and it costs no round trip.
+//
+// They appear **only on the valid branch**. This endpoint answers whoever
+// asks, so returning the server version beside `valid: false` would report the
+// build to anyone who guessed at a token. A caller holding a real token is
+// already inside; a caller without one learns nothing.
+//
+// Note this reports what the token *may* do, never any of the user's data —
+// the scope grants themselves, not what they unlock. It widens no boundary:
+// `submit` still reaches nothing but this endpoint and `submit-listens`.
+/// Check a token, and ask what it may do.
 ///
-/// Deliberately mirrors ListenBrainz's contract rather than Tapedeck's own
-/// conventions: the token may arrive in the `Authorization` header *or* as a
-/// `?token=` query parameter, and an invalid token is reported as HTTP 200 with
-/// `valid: false` — not a 401. Clients branch on that field, so returning an
-/// auth error here makes them report a server fault instead of a bad token.
+/// An invalid token is **`200 {valid:false}`, never 401** — LB clients read
+/// the field, and a 401 sends them into a refresh loop.
 ///
-/// **The Tapedeck keys past `user_name` are introspection**, and they exist
-/// because a client had no way to learn what its own token may do. Without them
-/// a settings screen has two bad options — hide features that might work, or
-/// offer features that 403 at the moment of use — in a screen whose entire job
-/// is telling the user their setup is right. Extending this endpoint rather
-/// than adding a second one is deliberate: real ListenBrainz clients branch on
-/// `valid` alone, so extra keys cannot break them, and it costs no round trip.
+/// The token may arrive in the `Authorization` header **or** as `?token=`.
 ///
-/// They appear **only on the valid branch**. This endpoint answers whoever
-/// asks, so returning the server version beside `valid: false` would report the
-/// build to anyone who guessed at a token. A caller holding a real token is
-/// already inside; a caller without one learns nothing.
+/// Everything past `user_name` is Tapedeck introspection, and it is
+/// additive: real ListenBrainz clients branch on `valid` alone, so the
+/// extra keys cannot break them, and putting them here rather than on a
+/// second endpoint costs no extra round trip. They let a settings screen
+/// say what this token can do instead of choosing between hiding features
+/// that might work and offering features that 403 at the moment of use.
 ///
-/// Note this reports what the token *may* do, never any of the user's data —
-/// the scope grants themselves, not what they unlock. It widens no boundary:
-/// `submit` still reaches nothing but this endpoint and `submit-listens`.
+/// They appear **only when `valid` is true.** This endpoint answers whoever
+/// asks, so reporting the build beside `valid: false` would hand it to
+/// anyone guessing at tokens.
+///
+/// Note this reports the grants themselves, never any of the user's data.
+/// It widens nothing: `submit` still reaches only this endpoint and
+/// `submit-listens`.
+#[utoipa::path(
+    get,
+    path = "/1/validate-token",
+    tag = "ListenBrainz",
+    security(("apiToken" = [])),
+    params(TokenQuery),
+    responses(
+        (status = 200, description = "Valid or not — read `valid`.", body = TokenValidation),
+        (status = 400, description = "No token at all, in the header or the query.",
+            body = ErrorResponse),
+    )
+)]
 pub async fn validate_token(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -64,10 +139,10 @@ pub async fn validate_token(
     if token.is_empty() {
         return (
             StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({
-                "code": 400,
-                "error": "You need to provide an Authorization header.",
-            })),
+            Json(ErrorResponse {
+                code: 400,
+                error: "You need to provide an Authorization header.".into(),
+            }),
         )
             .into_response();
     }
@@ -75,56 +150,75 @@ pub async fn validate_token(
     match state.db.validate_token(&token).await {
         Ok(Some(t)) => (
             StatusCode::OK,
-            Json(serde_json::json!({
-                "code": 200,
-                "message": "Token valid.",
-                "valid": true,
-                "user_name": t.user.username,
+            Json(TokenValidation {
+                code: 200,
+                message: "Token valid.",
+                valid: true,
+                user_name: Some(t.user.username.clone()),
 
                 // ── Tapedeck introspection; see this function's note. ──
-                "scopes": t.granted_scopes(),
+                scopes: Some(t.granted_scopes()),
                 // Rung 3 of the four-rung chain ladder. A client can show which
                 // chain its listens will be attributed to, and say so rather
                 // than leaving the user to discover it from the history.
-                "default_chain_id": t.default_chain_id,
+                // Nested so a token with no default still sends the key, as
+                // `null`, rather than dropping it.
+                default_chain_id: Some(t.default_chain_id),
                 // Whether this client's `listen_type: "import"` is relayed
                 // onward. Invisible from the client side and silent in its
                 // absence, which matters most for the players that hardcode
                 // `import` for every scrobble they send.
-                "imports_are_live": t.imports_are_live,
+                imports_are_live: Some(t.imports_are_live),
                 // So a plugin shipped against one version can tell which
-                // extensions this instance understands without parsing 5.5k
-                // lines of OpenAPI to find out.
-                "server_version": env!("CARGO_PKG_VERSION"),
-            })),
+                // extensions this instance understands without parsing the
+                // OpenAPI document to find out.
+                server_version: Some(env!("CARGO_PKG_VERSION")),
+            }),
         )
             .into_response(),
         Ok(None) => (
             StatusCode::OK,
-            Json(serde_json::json!({
-                "code": 200,
-                "message": "Token invalid.",
-                "valid": false,
-            })),
+            Json(TokenValidation {
+                code: 200,
+                message: "Token invalid.",
+                valid: false,
+                user_name: None,
+                scopes: None,
+                default_chain_id: None,
+                imports_are_live: None,
+                server_version: None,
+            }),
         )
             .into_response(),
         Err(e) => {
             error!("Token validation error: {}", e);
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({
-                    "code": 500,
-                    "error": "Internal server error",
-                })),
+                Json(ErrorResponse { code: 500, error: "Internal server error".into() }),
             )
                 .into_response()
         }
     }
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
 pub struct SubmitQuery {
-    /// `?dry_run=1` — resolve everything, store nothing, forward nothing.
+    /// Resolve everything, **store nothing and forward nothing**, and report
+    /// what would have happened. `1`, `true`, `yes`, `on` and a bare
+    /// `?dry_run` all count.
+    ///
+    /// This is the endpoint to point a client at while it is being set up: it
+    /// names the winning rung of the chain ladder, the quality score your
+    /// fields produced, whether the listen would be forwarded or stored only,
+    /// and whether dedup would swallow it — none of which is visible from a
+    /// successful submit. The preview and the real path share one
+    /// implementation, so it cannot promise something the real path would not
+    /// do.
+    ///
+    /// Note it is genuinely read-only: a dry run looks a device up rather than
+    /// upserting it, because asking what would happen must not itself be a
+    /// listen.
     dry_run: Option<String>,
 }
 
@@ -164,8 +258,6 @@ fn import_is_live(listen_type: &ListenType, timestamp: i64, now: i64, token_is_l
     token_is_live && (now - timestamp) <= IMPORT_LIVE_WINDOW_SECS && (timestamp - now) <= 3600
 }
 
-/// Accepts `1`, `true`, `yes`, and a bare `?dry_run` — a plugin author trying
-/// this by hand shouldn't have to guess which spelling we wanted.
 /// Everyone a submission credits, or `None` when it names only one.
 ///
 /// Two sources, and the order matters. `additional_info.artist_names` is
@@ -196,6 +288,8 @@ fn submitted_artists(artist_name: &str, info: Option<&AdditionalInfo>) -> Option
     (split.len() > 1).then_some(split)
 }
 
+/// Accepts `1`, `true`, `yes`, `on` and a bare `?dry_run` — a plugin author
+/// trying this by hand shouldn't have to guess which spelling we wanted.
 fn truthy(v: &Option<String>) -> bool {
     match v {
         Some(s) => {
@@ -206,7 +300,56 @@ fn truthy(v: &Option<String>) -> bool {
     }
 }
 
-/// POST /1/submit-listens
+/// Submit listens.
+///
+/// Accepts a session cookie or any valid token — this is the one endpoint a
+/// `submit`-scoped token reaches.
+///
+/// **`listen_type` decides forwarding**, and getting it wrong rewrites
+/// someone's permanent public history. `single` and `playing_now` are live
+/// and will be forwarded.
+///
+/// `import` is stored only and **not** forwarded *(since v0.26 — before
+/// that, an import was forwarded like a live listen)* — unless the token
+/// used to submit it is marked **`imports_are_live`**, which exists because
+/// some players label every scrobble `import` and nothing on the wire
+/// distinguishes that from a backfill. Even then two gates apply and both
+/// must pass:
+///
+/// * the listen is **no more than 24h old**, so a genuine history import
+///   from the same client still stays local; and
+/// * its timestamp is **no more than 1h in the future**, so ordinary clock
+///   skew is tolerated but a broken clock cannot park a scrobble years
+///   ahead of everything else.
+///
+/// The flag is per token and invisible from the client side, which is why
+/// `GET /1/validate-token` reports it — read it there rather than guessing
+/// from whether listens appear at the far end.
+///
+/// Dedup is on `(user_id, source_id, source_name)` plus a fuzzy window, so
+/// re-sending the same listen is safe. Max 1000 listens per request.
+///
+/// `additional_info` is free-form and **no field in it can fail a
+/// submission**: an unusable value costs that field and the listen is still
+/// stored. Unknown keys are ignored.
+#[utoipa::path(
+    post,
+    path = "/1/submit-listens",
+    tag = "ListenBrainz",
+    security(("apiToken" = []), ("sessionCookie" = [])),
+    params(SubmitQuery),
+    request_body = SubmitListensRequest,
+    responses(
+        (status = 200, description = "Accepted, or — with `?dry_run` — resolved and discarded. \
+            Per-listen results are reported rather than the whole batch failing: one bad row \
+            must not lose the other 999.", body = SubmitOutcome),
+        (status = 400, response = BadRequest),
+        (status = 401, response = Unauthorized),
+        (status = 503, description = "One or more listens could not be stored. **Retryable** — \
+            resend the batch; dedup makes that safe. Distinct from `rejected`, which is the \
+            do-not-retry list.", body = ErrorResponse),
+    )
+)]
 pub async fn submit_listens(
     State(state): State<Arc<AppState>>,
     IngestAuth { user, token_chain_id, token_id, imports_are_live }: IngestAuth,
@@ -1082,3 +1225,7 @@ mod relay_tests {
         assert_ne!(listen, ingest_source_id(1, 1_700_000_000, "Cheating", false));
     }
 }
+
+#[derive(utoipa::OpenApi)]
+#[openapi(paths(submit_listens, validate_token))]
+pub struct Api;

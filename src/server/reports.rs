@@ -34,33 +34,277 @@ use axum::{
 };
 use chrono::{DateTime, Datelike, Duration, NaiveDate, TimeZone, Timelike};
 use chrono_tz::Tz;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use utoipa::ToSchema;
 
 use super::auth::ReadAuth;
 use super::models::ErrorResponse;
 use super::AppState;
 use crate::db::ReportRow;
+use crate::openapi::{Forbidden, Unauthorized};
 
 fn err(code: u16, msg: impl Into<String>) -> axum::response::Response {
     let status = StatusCode::from_u16(code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-    (status, Json(serde_json::json!(ErrorResponse { code, error: msg.into() }))).into_response()
+    (status, Json(ErrorResponse { code, error: msg.into() })).into_response()
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
 pub struct ReportQuery {
     /// `week`, `month` (default) or `year`.
+    #[param(pattern = "^(week|month|year)$", default = "month")]
     pub unit: Option<String>,
-    /// How many periods to return, newest first.
+    /// How many periods to return, newest first. 12 by default, at most 60.
+    #[param(minimum = 1, maximum = 60, default = 12)]
     pub limit: Option<usize>,
-    /// How many periods to skip before that, counting back from the newest.
-    ///
-    /// The stepper on the Reports page asks for one period at a time and walks
-    /// this. Paging costs nothing extra: the handler already folds the *whole*
-    /// history into buckets on every call, so an offset is a slice of work that
-    /// has been done regardless — see `report_rows`.
+    /// Periods to skip, counting back from the newest. The stepper on the
+    /// Reports page walks this one period at a time. Costs nothing extra — the
+    /// whole history is folded on every call regardless.
+    // Paging costs nothing extra: the handler already folds the *whole*
+    // history into buckets on every call, so an offset is a slice of work that
+    // has been done regardless — see `report_rows`.
+    #[param(minimum = 0, default = 0)]
     pub offset: Option<usize>,
+}
+
+/// A feed of period cards, newest first.
+#[derive(Serialize, ToSchema)]
+pub struct Reports {
+    /// `week`, `month` or `year`.
+    pub unit: &'static str,
+    /// The IANA zone the buckets were cut in.
+    pub timezone: String,
+    pub periods: Vec<Period>,
+    /// Where this page sits, counting back from the newest.
+    pub offset: usize,
+    /// How many periods exist at this bucket size — what tells a stepper where
+    /// the ends are.
+    pub total_periods: usize,
+    /// The scan hit the analytics row cap, so the oldest periods are partial
+    /// and must not be presented as final. Absent with no listening at all.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub capped: Option<bool>,
+}
+
+/// One week, month or year.
+#[derive(Serialize, ToSchema)]
+pub struct Period {
+    /// `2026-W31`, `2026-08`, `2026`.
+    #[schema(example = "2026-08")]
+    pub key: String,
+    #[schema(example = "August 2026")]
+    pub label: String,
+    /// Unix seconds — the first listen in the period.
+    pub start: i64,
+    /// Unix seconds — the last listen in the period.
+    pub end: i64,
+    pub plays: i64,
+    pub hours: f64,
+    /// Plays per **calendar** day — a finished period by its full length, one
+    /// still running by the days it has actually had.
+    pub avg_daily: i64,
+    pub artists: usize,
+    pub albums: usize,
+    pub tracks: usize,
+    /// Artists with no earlier listen anywhere in the history.
+    pub new_artists: usize,
+    /// Never "Various Artists", which is a filing convention, not an artist.
+    pub top_artist: Option<PeriodArtist>,
+    pub top_album: Option<PeriodAlbum>,
+    pub top_track: Option<PeriodTrack>,
+    /// 24 counts, local hours.
+    pub clock: [i64; 24],
+    /// One level finer than the period — days across a week, weeks across a
+    /// month, months across a year.
+    pub sub: Vec<i64>,
+    pub sub_labels: Vec<String>,
+    /// The six biggest genres. Shares of **tag mentions**, not of listens.
+    pub genres: Vec<GenreShare>,
+    pub genre_bands: GenreBands,
+    /// Where this period sits among *your own* periods by plays, 1 being the
+    /// busiest. This is what fills the slot the design gave to a cross-user
+    /// percentile — there is no such thing here: it needs other people's
+    /// listening, and on a private instance it would leak how much the rest of
+    /// the household plays.
+    pub rank: usize,
+    /// How many periods `rank` is out of.
+    pub rank_of: usize,
+    /// Play-weighted blend of the period's genre colours, in linear light.
+    /// Null until the genre map is fetched.
+    pub colour: Option<String>,
+    /// The heaviest single days of single tracks — three plays or more.
+    pub on_repeat: Vec<PeriodTrack>,
+    /// Most-played artist never played before, with at least five plays.
+    /// Null for the oldest period, where every artist is new by construction
+    /// and it would just be the top artist relabelled.
+    pub crush: Option<Crush>,
+    /// Sides played off the shelf.
+    pub shelf: ShelfSummary,
+    /// The chain most listens went through.
+    pub top_chain: Option<String>,
+    pub gear: PeriodGear,
+    pub company: PeriodCompany,
+    pub fingerprint: Fingerprint,
+    /// Sentences worth a line of their own — "your 10,000th listen".
+    pub milestones: Vec<String>,
+    /// The period before, for deltas. Null for the oldest.
+    pub prev: Option<PrevPeriod>,
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct PeriodArtist {
+    /// The latest spelling actually submitted.
+    pub name: String,
+    pub plays: i64,
+    pub hours: f64,
+    /// A wide image, when you chose one for this artist. Absent otherwise —
+    /// nothing Tapedeck can reach supplies one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub landscape_url: Option<String>,
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct PeriodAlbum {
+    pub name: String,
+    pub artist: String,
+    pub plays: i64,
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct PeriodTrack {
+    pub title: String,
+    pub artist: String,
+    pub plays: i64,
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct Crush {
+    /// The first spelling it arrived under.
+    pub name: String,
+    pub plays: i64,
+    /// Unix seconds of the first listen.
+    pub since: i64,
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct GenreShare {
+    pub name: String,
+    /// A whole percentage of tag mentions.
+    pub pct: i64,
+}
+
+/// The period's three biggest genres **by name**, fixed across every
+/// sub-bucket, plus `other` as the remainder. Drawn as stacked bands by the
+/// year chapter. A sub-bucket with no tags at all is all zeroes rather than
+/// 100% `other` — an empty month is an absence, not a genre.
+///
+/// Shares of tag *mentions*, like `genres`.
+#[derive(Serialize, ToSchema)]
+pub struct GenreBands {
+    /// At most three.
+    pub names: Vec<String>,
+    /// One row per sub-bucket; each row is the named shares then `other`.
+    pub shares: Vec<Vec<f64>>,
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct ShelfSummary {
+    pub sides: i64,
+    /// The five most-played sides.
+    pub rows: Vec<ShelfRow>,
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct ShelfRow {
+    pub title: String,
+    pub artist: String,
+    pub side: String,
+    pub spins: i64,
+}
+
+/// What the period was listened *through*. `unattributed` and `no_duration`
+/// are stated rather than folded away: on most histories the first is nearly
+/// everything, and the hours are a floor without the second.
+#[derive(Serialize, ToSchema)]
+pub struct PeriodGear {
+    pub chains: Vec<GearChain>,
+    /// The eight pieces of gear with the most hours, each counted once per
+    /// chain even when a chain names it twice.
+    pub items: Vec<GearItem>,
+    /// Listens with no chain at all.
+    pub unattributed: i64,
+    /// Chained listens whose source reported no length.
+    pub no_duration: i64,
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct GearChain {
+    pub name: String,
+    pub icon: Option<String>,
+    pub plays: i64,
+    pub hours: f64,
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct GearItem {
+    pub name: String,
+    /// The component type, lowercased — `dac`, `amp`, `transducer`…
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub plays: i64,
+    pub hours: f64,
+}
+
+/// Listens **marked** as heard with somebody. `company` is null on
+/// everything nobody has tagged, so `of_plays` travels as the denominator —
+/// never present a bare share, and never read the complement as "alone".
+#[derive(Serialize, ToSchema)]
+pub struct PeriodCompany {
+    pub marked_plays: i64,
+    pub marked_hours: f64,
+    pub of_plays: i64,
+    /// The eight people heard with most.
+    pub people: Vec<Person>,
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct Person {
+    pub name: String,
+    pub plays: i64,
+}
+
+/// Five ratios between 0 and 1, and the same five for *you, usually* — every
+/// one answerable from any history, and **none of them a comparison against
+/// another person**. The baseline is the mean of your own periods, not one
+/// shape over the whole history: `variety` shrinks as plays grow and
+/// `discovery` is pinned at 1.0 over a whole history, so a whole-history
+/// baseline would report every period as more varied and less exploratory
+/// than usual.
+#[derive(Serialize, ToSchema)]
+pub struct Fingerprint {
+    /// `Variety`, `Repeat`, `Discovery`, `Spread`, `Runs`.
+    pub axes: [&'static str; 5],
+    pub you: [f64; 5],
+    pub usual: [f64; 5],
+    /// How many periods the baseline rests on. One is not a habit — a radar
+    /// comparing a month against itself draws two identical shapes and means
+    /// nothing by it, so decline to draw the baseline below two.
+    pub usual_periods: usize,
+}
+
+/// The period before, for deltas.
+#[derive(Serialize, ToSchema)]
+pub struct PrevPeriod {
+    pub label: String,
+    pub plays: i64,
+    pub hours: f64,
+    pub avg_daily: i64,
+    pub artists: usize,
+    pub albums: usize,
+    pub tracks: usize,
+    pub sub: Vec<i64>,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -358,7 +602,43 @@ struct Bucket {
     days: HashSet<i32>,
 }
 
-/// GET /api/v1/reports
+/// Period reports — a feed of week / month / year cards, newest first.
+///
+/// Scope: `read` *(since v0.41)*.
+///
+/// Reads the history **once** and folds it in Rust. A card carries a dozen
+/// aggregates and every one is bucketed in the caller's own timezone, which
+/// SQL here cannot do — a year of monthly cards would otherwise be hundreds
+/// of round trips.
+///
+/// Weeks are ISO (Monday-start), deliberately **not** the caller's
+/// week-start preference: that setting shapes the dashboard counter and the
+/// heatmap rows, whereas a report is a named object and its boundary has to
+/// stay put, or last month's report changes shape when the preference does.
+///
+/// `avg_daily` divides by **calendar** days — a finished period by its full
+/// length, one still running by the days it has actually had. Dividing by
+/// days-with-listens would report the rate of your busiest fortnight as the
+/// month's average.
+///
+/// Two things deliberately absent. There is **no percentile against other
+/// users** ("you out-listened 88% of listeners"): that needs other people's
+/// listening, and on a private instance it would leak how much the rest of
+/// the household plays. And `crush` is omitted for the oldest period, where
+/// every artist is new by construction and it would just be the top artist
+/// relabelled.
+#[utoipa::path(
+    get,
+    path = "/api/v1/reports",
+    tag = "Statistics",
+    security(("sessionCookie" = []), ("apiToken" = ["read"])),
+    params(ReportQuery),
+    responses(
+        (status = 200, description = "OK.", body = Reports),
+        (status = 401, response = Unauthorized),
+        (status = 403, response = Forbidden),
+    )
+)]
 pub async fn reports(
     State(state): State<Arc<AppState>>,
     ReadAuth { user }: ReadAuth,
@@ -379,10 +659,14 @@ pub async fn reports(
     if rows.is_empty() {
         return (
             StatusCode::OK,
-            Json(serde_json::json!({
-                "unit": unit.as_str(), "periods": [], "timezone": "UTC",
-                "offset": 0, "total_periods": 0,
-            })),
+            Json(Reports {
+                unit: unit.as_str(),
+                periods: Vec::new(),
+                timezone: "UTC".into(),
+                offset: 0,
+                total_periods: 0,
+                capped: None,
+            }),
         )
             .into_response();
     }
@@ -523,11 +807,12 @@ pub async fn reports(
                 // this replaced was picking.
                 let display =
                     display.get(k).map(|(_, last)| last.clone()).unwrap_or_else(|| k.clone());
-                serde_json::json!({
-                    "name": display,
-                    "plays": v.0,
-                    "hours": (v.1 as f64 / 3600.0 * 10.0).round() / 10.0,
-                })
+                PeriodArtist {
+                    name: display,
+                    plays: v.0,
+                    hours: (v.1 as f64 / 3600.0 * 10.0).round() / 10.0,
+                    landscape_url: None,
+                }
             });
         let top_album = b.albums.iter().max_by_key(|(_, v)| v.1).map(|(k, v)| {
             // The key is lowercased for grouping; show the spelling that was
@@ -535,21 +820,21 @@ pub async fn reports(
             let akey = k.split('|').next().unwrap_or("");
             let artist =
                 display.get(akey).map(|(_, last)| last.clone()).unwrap_or_else(|| akey.to_string());
-            serde_json::json!({ "name": v.0, "artist": artist, "plays": v.1 })
+            PeriodAlbum { name: v.0.clone(), artist, plays: v.1 }
         });
-        let top_track = b
-            .tracks
-            .values()
-            .max_by_key(|v| v.2)
-            .map(|v| serde_json::json!({ "title": v.0, "artist": v.1, "plays": v.2 }));
+        let top_track = b.tracks.values().max_by_key(|v| v.2).map(|v| PeriodTrack {
+            title: v.0.clone(),
+            artist: v.1.clone(),
+            plays: v.2,
+        });
 
         // "On repeat": the heaviest single day of a single track.
         let mut repeat: Vec<_> = b.per_day.values().filter(|v| v.2 >= 3).collect();
         repeat.sort_by(|a, b| b.2.cmp(&a.2));
-        let on_repeat: Vec<serde_json::Value> = repeat
+        let on_repeat: Vec<PeriodTrack> = repeat
             .iter()
             .take(4)
-            .map(|v| serde_json::json!({ "title": v.0, "artist": v.1, "plays": v.2 }))
+            .map(|v| PeriodTrack { title: v.0.clone(), artist: v.1.clone(), plays: v.2 })
             .collect();
 
         // The crush: the most-played artist you had never played before.
@@ -565,24 +850,26 @@ pub async fn reports(
                 // artist first appeared.
                 let display =
                     display.get(k).map(|(first, _)| first.clone()).unwrap_or_else(|| k.clone());
-                serde_json::json!({
-                    "name": display,
-                    "plays": p,
-                    "since": b.first_seen_at.get(k).copied().unwrap_or(0),
-                })
+                Crush {
+                    name: display,
+                    plays: *p,
+                    since: b.first_seen_at.get(k).copied().unwrap_or(0),
+                }
             });
 
         let tag_total: i64 = b.genres.values().sum();
         let mut gs: Vec<_> = b.genres.iter().collect();
         gs.sort_by(|a, b| b.1.cmp(a.1));
-        let genres: Vec<serde_json::Value> = gs
+        let genres: Vec<GenreShare> = gs
             .iter()
             .take(6)
-            .map(|(n, c)| {
-                serde_json::json!({
-                    "name": n,
-                    "pct": if tag_total > 0 { (**c as f64 / tag_total as f64 * 100.0).round() as i64 } else { 0 },
-                })
+            .map(|(n, c)| GenreShare {
+                name: (*n).clone(),
+                pct: if tag_total > 0 {
+                    (**c as f64 / tag_total as f64 * 100.0).round() as i64
+                } else {
+                    0
+                },
             })
             .collect();
 
@@ -593,7 +880,7 @@ pub async fn reports(
         // month to month — a stacked area whose series change identity partway
         // along is unreadable.
         let top_names: Vec<String> = gs.iter().take(3).map(|(n, _)| (*n).clone()).collect();
-        let sub_genres: Vec<serde_json::Value> = b
+        let sub_genres: Vec<Vec<f64>> = b
             .sub_genres
             .iter()
             .map(|counts| {
@@ -620,7 +907,7 @@ pub async fn reports(
                     let named: f64 = shares.iter().sum();
                     shares.push((1.0 - named).max(0.0));
                 }
-                serde_json::json!(shares)
+                shares
             })
             .collect();
 
@@ -693,29 +980,36 @@ pub async fn reports(
         let mut gear_rows: Vec<_> = gear.into_values().collect();
         gear_rows.sort_by(|a, z| z.3.cmp(&a.3).then(z.2.cmp(&a.2)));
 
-        let gear_json = serde_json::json!({
-            "chains": chain_rows.iter().map(|(c, plays, secs)| serde_json::json!({
-                "name": c.name,
-                "icon": c.icon,
-                "plays": plays,
-                "hours": (*secs as f64 / 3600.0 * 10.0).round() / 10.0,
-            })).collect::<Vec<_>>(),
-            "items": gear_rows.iter().take(8).map(|(name, kind, plays, secs)| serde_json::json!({
-                "name": name,
-                "type": kind,
-                "plays": plays,
-                "hours": (*secs as f64 / 3600.0 * 10.0).round() / 10.0,
-            })).collect::<Vec<_>>(),
+        let gear_json = PeriodGear {
+            chains: chain_rows
+                .iter()
+                .map(|(c, plays, secs)| GearChain {
+                    name: c.name.clone(),
+                    icon: c.icon.clone(),
+                    plays: *plays,
+                    hours: (*secs as f64 / 3600.0 * 10.0).round() / 10.0,
+                })
+                .collect(),
+            items: gear_rows
+                .iter()
+                .take(8)
+                .map(|(name, kind, plays, secs)| GearItem {
+                    name: name.clone(),
+                    kind: kind.clone(),
+                    plays: *plays,
+                    hours: (*secs as f64 / 3600.0 * 10.0).round() / 10.0,
+                })
+                .collect(),
             // Both stated, never implied. Most listens on most histories have
             // no chain, and a panel that folded those away would read as a
             // complete account of the period rather than of the part of it
             // anybody attributed.
-            "unattributed": b.chainless,
+            unattributed: b.chainless,
             // The hours are a **floor**: a listen whose source reported no
             // length contributes plays but no time, the same confession
             // `total_hours` makes on the dashboard.
-            "no_duration": b.chain_seconds_unknown,
-        });
+            no_duration: b.chain_seconds_unknown,
+        };
 
         // ── Who you heard it with ────────────────────────────────────────
         //
@@ -727,14 +1021,16 @@ pub async fn reports(
         // listening was recorded.
         let mut people: Vec<(&String, &i64)> = b.company_people.iter().collect();
         people.sort_by(|a, z| z.1.cmp(a.1).then(a.0.cmp(z.0)));
-        let company_json = serde_json::json!({
-            "marked_plays": b.company_plays,
-            "marked_hours": (b.company_seconds as f64 / 3600.0 * 10.0).round() / 10.0,
-            "of_plays": b.plays,
-            "people": people.iter().take(8).map(|(name, plays)| serde_json::json!({
-                "name": name, "plays": plays,
-            })).collect::<Vec<_>>(),
-        });
+        let company_json = PeriodCompany {
+            marked_plays: b.company_plays,
+            marked_hours: (b.company_seconds as f64 / 3600.0 * 10.0).round() / 10.0,
+            of_plays: b.plays,
+            people: people
+                .iter()
+                .take(8)
+                .map(|(name, plays)| Person { name: (*name).clone(), plays: **plays })
+                .collect(),
+        };
 
         // Calendar days, not days you happened to play something. Dividing by
         // listening days answers "how much on the days you listened", which is
@@ -746,40 +1042,40 @@ pub async fn reports(
         let days = elapsed_days(b, unit, tz) as f64;
         let prev_json = prev.map(|p| {
             let pd = elapsed_days(p, unit, tz) as f64;
-            serde_json::json!({
-                "label": p.label,
-                "plays": p.plays,
-                "hours": (p.seconds as f64 / 3600.0 * 10.0).round() / 10.0,
-                "avg_daily": (p.plays as f64 / pd).round() as i64,
-                "artists": p.artists.len(),
-                "albums": p.albums.len(),
-                "tracks": p.tracks.len(),
-                "sub": p.sub,
-            })
+            PrevPeriod {
+                label: p.label.clone(),
+                plays: p.plays,
+                hours: (p.seconds as f64 / 3600.0 * 10.0).round() / 10.0,
+                avg_daily: (p.plays as f64 / pd).round() as i64,
+                artists: p.artists.len(),
+                albums: p.albums.len(),
+                tracks: p.tracks.len(),
+                sub: p.sub.clone(),
+            }
         });
 
-        periods.push(serde_json::json!({
-            "key": key,
-            "label": b.label,
-            "start": b.start,
-            "end": b.end,
-            "plays": b.plays,
-            "hours": (b.seconds as f64 / 3600.0 * 10.0).round() / 10.0,
-            "avg_daily": (b.plays as f64 / days).round() as i64,
-            "artists": b.artists.len(),
-            "albums": b.albums.len(),
-            "tracks": b.tracks.len(),
-            "new_artists": b.new_artists.len(),
-            "top_artist": top_artist,
-            "top_album": top_album,
-            "top_track": top_track,
-            "clock": b.clock,
-            "sub": b.sub,
-            "sub_labels": sub_labels(unit),
-            "genres": genres,
+        periods.push(Period {
+            key: key.clone(),
+            label: b.label.clone(),
+            start: b.start,
+            end: b.end,
+            plays: b.plays,
+            hours: (b.seconds as f64 / 3600.0 * 10.0).round() / 10.0,
+            avg_daily: (b.plays as f64 / days).round() as i64,
+            artists: b.artists.len(),
+            albums: b.albums.len(),
+            tracks: b.tracks.len(),
+            new_artists: b.new_artists.len(),
+            top_artist,
+            top_album,
+            top_track,
+            clock: b.clock,
+            sub: b.sub.clone(),
+            sub_labels: sub_labels(unit),
+            genres,
             // The three biggest genres by name plus "other", and their share in
             // each sub-bucket. Only the year chapter draws these.
-            "genre_bands": { "names": top_names, "shares": sub_genres },
+            genre_bands: GenreBands { names: top_names, shares: sub_genres },
             // Where this period sits among *your own* periods by play count,
             // 1 being the busiest. This is what fills the slot the design gave
             // to "you out-listened 88% of Tapedeck listeners" — a cross-user
@@ -787,35 +1083,42 @@ pub async fn reports(
             // household instance, quietly reports how much everyone else plays.
             // A rank against your own history says something comparable and
             // needs nobody else.
-            "rank": rank_of.get(key).copied().unwrap_or(0),
-            "rank_of": total_periods,
-            "colour": colour,
-            "on_repeat": on_repeat,
-            "crush": crush,
-            "shelf": {
-                "sides": sides,
-                "rows": shelf.iter().take(5).map(|(title, artist, side, spins)| serde_json::json!({
-                    "title": title, "artist": artist, "side": side, "spins": spins
-                })).collect::<Vec<_>>(),
+            rank: rank_of.get(key).copied().unwrap_or(0),
+            rank_of: total_periods,
+            colour,
+            on_repeat,
+            crush,
+            shelf: ShelfSummary {
+                sides,
+                rows: shelf
+                    .iter()
+                    .take(5)
+                    .map(|(title, artist, side, spins)| ShelfRow {
+                        title: title.clone(),
+                        artist: artist.clone(),
+                        side: side.clone(),
+                        spins: *spins,
+                    })
+                    .collect(),
             },
-            "top_chain": top_chain,
-            "gear": gear_json,
-            "company": company_json,
+            top_chain,
+            gear: gear_json,
+            company: company_json,
             // Five numbers between 0 and 1, and the same five for "you,
             // usually" — every one answerable from any history, and none of
             // them a comparison against another person. See `fingerprint`.
-            "fingerprint": {
-                "axes": FINGERPRINT_AXES,
-                "you": fingerprint(b),
-                "usual": usual,
+            fingerprint: Fingerprint {
+                axes: FINGERPRINT_AXES,
+                you: fingerprint(b),
+                usual,
                 // Whether the baseline rests on anything. One period is not a
                 // habit, and a radar that silently compared a month against
                 // itself would draw two identical shapes and mean nothing by it.
-                "usual_periods": usual_periods,
+                usual_periods,
             },
-            "milestones": milestones.get(key).cloned().unwrap_or_default(),
-            "prev": prev_json,
-        }));
+            milestones: milestones.get(key).cloned().unwrap_or_default(),
+            prev: prev_json,
+        });
     }
 
     // Wide images for the artists that head a chapter.
@@ -829,41 +1132,32 @@ pub async fn reports(
     // supplies a landscape, so it is there only if the user chose one. The card
     // falls back to the initial, which is the design rather than a placeholder
     // for a photo that never arrives.
-    let top_names: Vec<String> = periods
-        .iter()
-        .filter_map(|p| p.get("top_artist")?.get("name")?.as_str().map(str::to_string))
-        .collect();
+    let top_names: Vec<String> =
+        periods.iter().filter_map(|p| p.top_artist.as_ref().map(|a| a.name.clone())).collect();
     let landscapes = state.db.artist_landscapes(&top_names).await.unwrap_or_default();
     for p in &mut periods {
-        let Some(name) = p
-            .get("top_artist")
-            .and_then(|a| a.get("name"))
-            .and_then(|n| n.as_str())
-            .map(str::to_string)
-        else {
+        let Some(a) = p.top_artist.as_mut() else {
             continue;
         };
-        if let Some(url) = landscapes.get(&crate::db::normalise_artist(&name)) {
-            if let Some(a) = p.get_mut("top_artist").and_then(|a| a.as_object_mut()) {
-                a.insert("landscape_url".into(), serde_json::json!(url));
-            }
+        if let Some(url) = landscapes.get(&crate::db::normalise_artist(&a.name)) {
+            a.landscape_url = Some(url.clone());
         }
     }
 
     (
         StatusCode::OK,
-        Json(serde_json::json!({
-            "unit": unit.as_str(),
-            "timezone": tz.name(),
-            "periods": periods,
+        Json(Reports {
+            unit: unit.as_str(),
+            timezone: tz.name().to_string(),
+            periods,
             // What the stepper needs to know where the ends are: how many
             // periods exist at this bucket size, and where this page sits.
-            "offset": offset,
-            "total_periods": total_periods,
+            offset,
+            total_periods,
             // The scan is capped like every other analytics read; say so rather
             // than silently reporting on a truncated history.
-            "capped": scanned >= state.analytics_row_cap,
-        })),
+            capped: Some(scanned >= state.analytics_row_cap),
+        }),
     )
         .into_response()
 }
@@ -953,6 +1247,10 @@ pub fn thousands(n: i64) -> String {
     }
     out
 }
+
+#[derive(utoipa::OpenApi)]
+#[openapi(paths(reports))]
+pub struct Api;
 
 pub fn create_reports_router() -> Router<Arc<AppState>> {
     Router::new().route("/api/v1/reports", get(reports))

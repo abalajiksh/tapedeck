@@ -12,9 +12,14 @@ use std::sync::Arc;
 use super::auth::AuthUser;
 use super::models::ErrorResponse;
 use super::AppState;
+use crate::db::ScrobbleRecord;
+use crate::openapi::{Bytes, Forbidden, Unauthorized};
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
 pub struct ExportQuery {
+    /// `csv`, or anything else for JSON — the default.
+    #[param(pattern = "^(json|csv)$", default = "json")]
     pub format: Option<String>,
 }
 
@@ -26,8 +31,27 @@ enum Phase {
     End,
 }
 
-/// GET /api/v1/export?format=json|csv — full listen dump, streamed in pages so a
-/// huge history can't blow up memory. JSON is a plain array (import-compatible).
+// GET /api/v1/export?format=json|csv — full listen dump, streamed in pages so a
+// huge history can't blow up memory. JSON is a plain array (import-compatible).
+/// Export your listens.
+///
+/// Session-only. Your whole history, newest first, streamed in pages so a
+/// large one cannot exhaust the server's memory. JSON by default — an array of
+/// `Listen`, the shape the importer reads back — or CSV with
+/// `title,artist,album,format,chain,mbid,time`.
+#[utoipa::path(
+    get,
+    path = "/api/v1/export",
+    tag = "Import & export",
+    params(ExportQuery),
+    responses(
+        (status = 200, description = "An attachment, `tapedeck-export.json` or `.csv`.", content(
+            (Vec<ScrobbleRecord> = "application/json"),
+            (String = "text/csv"),
+        )),
+        (status = 401, response = Unauthorized),
+    )
+)]
 async fn export(
     State(state): State<Arc<AppState>>,
     user: AuthUser,
@@ -106,12 +130,32 @@ async fn export(
         .into_response()
 }
 
-/// GET /api/v1/backup — admin-only consistent SQLite snapshot download.
+// GET /api/v1/backup — admin-only consistent SQLite snapshot download.
+/// Download a database snapshot.
+///
+/// **Session-only, admin role.** A `VACUUM INTO` snapshot of the whole
+/// database — every user's listens, and the encrypted credentials.
+///
+/// The encryption key deliberately lives **outside** the database, so it
+/// does not ride along in this file. That is what the encryption protects
+/// against: a leaked backup, not host compromise. Do not describe it as
+/// more than that.
+#[utoipa::path(
+    get,
+    path = "/api/v1/backup",
+    tag = "Import & export",
+    responses(
+        (status = 200, description = "The SQLite file, as the attachment `tapedeck-backup.db`.",
+            body = Bytes, content_type = "application/x-sqlite3"),
+        (status = 401, response = Unauthorized),
+        (status = 403, response = Forbidden),
+    )
+)]
 async fn backup(State(state): State<Arc<AppState>>, user: AuthUser) -> impl IntoResponse {
     if !user.is_admin {
         return (
             StatusCode::FORBIDDEN,
-            Json(serde_json::json!(ErrorResponse { code: 403, error: "Admin only".into() })),
+            Json(ErrorResponse { code: 403, error: "Admin only".into() }),
         )
             .into_response();
     }
@@ -122,10 +166,7 @@ async fn backup(State(state): State<Arc<AppState>>, user: AuthUser) -> impl Into
     if let Err(e) = state.db.backup_to(&tmp_str).await {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!(ErrorResponse {
-                code: 500,
-                error: format!("Backup failed: {e}")
-            })),
+            Json(ErrorResponse { code: 500, error: format!("Backup failed: {e}") }),
         )
             .into_response();
     }
@@ -134,10 +175,7 @@ async fn backup(State(state): State<Arc<AppState>>, user: AuthUser) -> impl Into
         Err(e) => {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!(ErrorResponse {
-                    code: 500,
-                    error: format!("Backup read failed: {e}")
-                })),
+                Json(ErrorResponse { code: 500, error: format!("Backup read failed: {e}") }),
             )
                 .into_response()
         }
@@ -163,6 +201,10 @@ fn csv(s: &str) -> String {
         s.to_string()
     }
 }
+
+#[derive(utoipa::OpenApi)]
+#[openapi(paths(export, backup))]
+pub struct Api;
 
 pub fn create_export_router() -> Router<Arc<AppState>> {
     Router::new().route("/api/v1/export", get(export)).route("/api/v1/backup", get(backup))

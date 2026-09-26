@@ -76,7 +76,8 @@ pub struct EveryNoiseStore {
 }
 
 /// What the local copy currently holds.
-#[derive(Debug, Default, serde::Serialize)]
+#[derive(Debug, Default, serde::Serialize, utoipa::ToSchema)]
+#[schema(as = GenreMapHeld)]
 pub struct Summary {
     pub genres: i64,
     pub artists: i64,

@@ -103,6 +103,51 @@ pub struct AppState {
     pub log_dir: String,
 }
 
+/// Every module's slice of the OpenAPI document, in the order the reference
+/// reads best — which is roughly the order a client meets them. `openapi.rs`
+/// merges these under the root document; a module missing from here is
+/// undocumented, and the drift test says which routes that leaves.
+pub fn api_docs() -> Vec<utoipa::openapi::OpenApi> {
+    use utoipa::OpenApi as _;
+    vec![
+        admin::Api::openapi(),
+        metrics::Api::openapi(),
+        users::Api::openapi(),
+        ingest::Api::openapi(),
+        lb_api::Api::openapi(),
+        pairing::Api::openapi(),
+        scrobbles::Api::openapi(),
+        sessions::Api::openapi(),
+        now_playing::Api::openapi(),
+        public_np::Api::openapi(),
+        preferences::Api::openapi(),
+        ratings::Api::openapi(),
+        loves_pull::Api::openapi(),
+        export::Api::openapi(),
+        reports::Api::openapi(),
+        report_image::Api::openapi(),
+        rediscovery::Api::openapi(),
+        playlist_lab::Api::openapi(),
+        library::Api::openapi(),
+        artwork::Api::openapi(),
+        chains::Api::openapi(),
+        notes::Api::openapi(),
+        tidal::Api::openapi(),
+        amai::Api::openapi(),
+        crate_shelf::Api::openapi(),
+        ops::Api::openapi(),
+        sources::Api::openapi(),
+        connections::Api::openapi(),
+        import::Api::openapi(),
+        playlists::Api::openapi(),
+        everynoise::Api::openapi(),
+        mcp::Api::openapi(),
+        oauth::Api::openapi(),
+        physical::Api::openapi(),
+        patch::Api::openapi(),
+    ]
+}
+
 /// Build the full Axum application.
 pub fn build_app(state: Arc<AppState>) -> Router {
     let admin = admin::create_admin_router(state.db.clone());

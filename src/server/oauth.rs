@@ -40,13 +40,113 @@ use axum::{
     routing::{get, post},
     Form, Router,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
+use utoipa::{IntoParams, ToSchema};
 
 use super::auth::AuthUser;
 use super::mcp::public_origin;
 use super::AppState;
 use crate::mcp::scopes;
+use crate::openapi::Unauthorized;
+
+/// An OAuth error, as RFC 6749 shapes it.
+#[derive(Serialize, ToSchema)]
+pub struct OAuthError {
+    /// `invalid_request`, `invalid_client`, `invalid_grant`, `invalid_target`,
+    /// `invalid_redirect_uri`, `unsupported_grant_type`, `server_error`.
+    pub error: String,
+    pub error_description: String,
+}
+
+/// RFC 9728 protected resource metadata.
+#[derive(Serialize, ToSchema)]
+pub struct ProtectedResourceMetadata {
+    /// This instance's `/mcp`.
+    pub resource: String,
+    pub authorization_servers: Vec<String>,
+    /// The minimal grant. More is asked for through a step-up.
+    pub scopes_supported: Vec<&'static str>,
+    pub bearer_methods_supported: Vec<&'static str>,
+    pub resource_name: &'static str,
+}
+
+/// RFC 8414 authorization server metadata.
+#[derive(Serialize, ToSchema)]
+pub struct AuthorizationServerMetadata {
+    pub issuer: String,
+    pub authorization_endpoint: String,
+    pub token_endpoint: String,
+    pub registration_endpoint: String,
+    pub scopes_supported: Vec<&'static str>,
+    pub response_types_supported: Vec<&'static str>,
+    pub grant_types_supported: Vec<&'static str>,
+    /// `S256` only.
+    pub code_challenge_methods_supported: Vec<&'static str>,
+    /// `none` — every client is public.
+    pub token_endpoint_auth_methods_supported: Vec<&'static str>,
+    /// RFC 9207: `iss` is sent on authorization responses.
+    pub authorization_response_iss_parameter_supported: bool,
+}
+
+/// RFC 7591 registration response. The `client_id` is not a credential; it
+/// gets a client as far as a request a signed-in person has to approve.
+#[derive(Serialize, ToSchema)]
+pub struct ClientRegistered {
+    pub client_id: String,
+    pub client_name: String,
+    pub redirect_uris: Vec<String>,
+    pub token_endpoint_auth_method: &'static str,
+    pub grant_types: Vec<&'static str>,
+    pub response_types: Vec<&'static str>,
+}
+
+/// An authorization request, in the terms of the person approving it.
+#[derive(Serialize, ToSchema)]
+pub struct AuthorizeInfo {
+    pub client_name: String,
+    pub client_id: String,
+    /// The client identified itself with a URL that could be fetched, rather
+    /// than registering a name of its own choosing — which could be anything.
+    pub verified: bool,
+    pub redirect_uri: String,
+    /// **Every** grant, with the requested ones marked. A client requests; the
+    /// person whose listening it is decides.
+    pub scopes: Vec<ScopeOffer>,
+    /// The requested grants, space-separated, unrecognised ones dropped.
+    pub requested: String,
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct ScopeOffer {
+    pub scope: &'static str,
+    pub description: &'static str,
+    pub requested: bool,
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct Approved {
+    /// The client's `redirect_uri` with `code`, `iss` and `state` added.
+    #[schema(format = "uri")]
+    pub redirect_to: String,
+}
+
+/// An access credential. Served `no-store`.
+#[derive(Serialize, ToSchema)]
+pub struct TokenIssued {
+    pub access_token: String,
+    /// `Bearer`.
+    pub token_type: &'static str,
+    /// Seconds. A day.
+    pub expires_in: i64,
+    /// Rotates on every refresh; the old pair stops working.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub refresh_token: Option<String>,
+    /// What was actually granted, which can differ from what was asked for.
+    /// Absent on a refresh.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scope: Option<String>,
+}
 
 /// How long a minted credential lives.
 ///
@@ -61,7 +161,10 @@ const CODE_TTL_SECS: i64 = 300;
 
 fn oauth_err(status: u16, error: &str, description: &str) -> Response {
     let code = StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_REQUEST);
-    (code, Json(serde_json::json!({ "error": error, "error_description": description })))
+    (
+        code,
+        Json(OAuthError { error: error.to_string(), error_description: description.to_string() }),
+    )
         .into_response()
 }
 
@@ -69,72 +172,131 @@ fn oauth_err(status: u16, error: &str, description: &str) -> Response {
 //  Discovery
 // ════════════════════════════════════════════════════════════
 
-/// RFC 9728 — protected resource metadata.
+// RFC 9728 — protected resource metadata.
+//
+// This is the document a client is pointed at by the `WWW-Authenticate` header
+// on a 401 from `/mcp`, and it is the first step of the whole flow. It says
+// which authorization server covers this resource; here that is the same host,
+// but the indirection is what lets a client discover it rather than guess.
+/// RFC 9728 protected resource metadata.
 ///
-/// This is the document a client is pointed at by the `WWW-Authenticate` header
-/// on a 401 from `/mcp`, and it is the first step of the whole flow. It says
-/// which authorization server covers this resource; here that is the same host,
-/// but the indirection is what lets a client discover it rather than guess.
+/// Unauthenticated. The document a client is pointed at by
+/// `WWW-Authenticate` on a 401 from `/mcp`, and the first step of the whole
+/// flow. `scopes_supported` names the *minimal* set for basic
+/// functionality — a client asks for more through a step-up rather than
+/// being nudged into requesting everything at once.
+#[utoipa::path(
+    get,
+    path = "/.well-known/oauth-protected-resource",
+    tag = "OAuth",
+    security(),
+    responses(
+        (status = 200, description = "The metadata document.", body = ProtectedResourceMetadata),
+    )
+)]
 async fn protected_resource(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
     let origin = public_origin(&state, &headers);
-    Json(serde_json::json!({
-        "resource": format!("{origin}/mcp"),
-        "authorization_servers": [origin],
+    Json(ProtectedResourceMetadata {
+        resource: format!("{origin}/mcp"),
+        authorization_servers: vec![origin],
         // The *minimal* set for basic functionality, per the spec's scope
         // minimisation guidance — a client asks for more through a step-up
         // rather than being nudged into requesting everything up front.
-        "scopes_supported": [scopes::DEFAULT],
-        "bearer_methods_supported": ["header"],
-        "resource_name": "Tapedeck",
-    }))
+        scopes_supported: vec![scopes::DEFAULT],
+        bearer_methods_supported: vec!["header"],
+        resource_name: "Tapedeck",
+    })
 }
 
-/// RFC 8414 — authorization server metadata.
+// RFC 8414 — authorization server metadata.
+/// RFC 8414 authorization server metadata.
+///
+/// Unauthenticated. Advertises `S256` as the only PKCE method — `plain` is
+/// in RFC 7636 and provides no protection against the code interception
+/// PKCE exists for — and `authorization_response_iss_parameter_supported`,
+/// because this server emits `iss` (RFC 9207) and a strict client will not
+/// check it otherwise.
+#[utoipa::path(
+    get,
+    path = "/.well-known/oauth-authorization-server",
+    tag = "OAuth",
+    security(),
+    responses(
+        (status = 200, description = "The metadata document.", body = AuthorizationServerMetadata),
+    )
+)]
 async fn authorization_server(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
     let origin = public_origin(&state, &headers);
-    Json(serde_json::json!({
-        "issuer": origin,
-        "authorization_endpoint": format!("{origin}/oauth/authorize"),
-        "token_endpoint": format!("{origin}/oauth/token"),
-        "registration_endpoint": format!("{origin}/oauth/register"),
-        "scopes_supported": scopes::ALL.iter().map(|(s, _)| *s).collect::<Vec<_>>(),
-        "response_types_supported": ["code"],
-        "grant_types_supported": ["authorization_code", "refresh_token"],
+    Json(AuthorizationServerMetadata {
+        authorization_endpoint: format!("{origin}/oauth/authorize"),
+        token_endpoint: format!("{origin}/oauth/token"),
+        registration_endpoint: format!("{origin}/oauth/register"),
+        issuer: origin,
+        scopes_supported: scopes::ALL.iter().map(|(s, _)| *s).collect(),
+        response_types_supported: vec!["code"],
+        grant_types_supported: vec!["authorization_code", "refresh_token"],
         // S256 only. `plain` is in the RFC and provides no protection against
         // code interception, which is the attack PKCE is for.
-        "code_challenge_methods_supported": ["S256"],
-        "token_endpoint_auth_methods_supported": ["none"],
+        code_challenge_methods_supported: vec!["S256"],
+        token_endpoint_auth_methods_supported: vec!["none"],
         // RFC 9207: we emit `iss` on authorization responses, so we must say
         // so or a strict client will not know to check it.
-        "authorization_response_iss_parameter_supported": true,
-    }))
+        authorization_response_iss_parameter_supported: true,
+    })
 }
 
 // ════════════════════════════════════════════════════════════
 //  Client registration
 // ════════════════════════════════════════════════════════════
 
-#[derive(Deserialize)]
+/// RFC 7591 registration. Open by design.
+#[derive(Deserialize, ToSchema)]
+#[schema(as = ClientRegistration)]
 struct RegistrationRequest {
+    /// Up to 80 characters. Shown on the consent screen as unverified.
     #[serde(default)]
     client_name: Option<String>,
+    /// At least one. `https`, loopback `http`, or a private-use scheme; no
+    /// fragment.
     #[serde(default)]
+    #[schema(min_items = 1)]
     redirect_uris: Vec<String>,
 }
 
-/// RFC 7591 — dynamic client registration.
+// RFC 7591 — dynamic client registration.
+//
+// Open by design: this endpoint hands out an identifier and nothing else. A
+// `client_id` is not a credential here — every client is public, there is no
+// secret, and possession of an id gets you as far as an authorization request
+// that a logged-in human then has to approve by hand. Registration being open
+// is what lets a client the user has never configured start the flow at all.
+/// RFC 7591 dynamic client registration.
 ///
-/// Open by design: this endpoint hands out an identifier and nothing else. A
-/// `client_id` is not a credential here — every client is public, there is no
-/// secret, and possession of an id gets you as far as an authorization request
-/// that a logged-in human then has to approve by hand. Registration being open
-/// is what lets a client the user has never configured start the flow at all.
+/// Unauthenticated by design: this hands out an identifier and nothing
+/// else. Every client is public, there is no secret, and possession of a
+/// `client_id` gets you as far as an authorization request that a logged-in
+/// human then has to approve by hand.
+///
+/// `redirect_uris` must be https, a loopback http address, or a private-use
+/// scheme. Plain http anywhere else would put an authorization code on the
+/// network in the clear.
+#[utoipa::path(
+    post,
+    path = "/oauth/register",
+    tag = "OAuth",
+    security(),
+    request_body = RegistrationRequest,
+    responses(
+        (status = 201, description = "Registered.", body = ClientRegistered),
+        (status = 400, description = "A redirect_uri was missing or not acceptable.", body = OAuthError),
+    )
+)]
 async fn register(
     State(state): State<Arc<AppState>>,
     Json(body): Json<RegistrationRequest>,
@@ -167,14 +329,14 @@ async fn register(
             info!("🤖 OAuth client registered: {} ({})", name, client_id);
             (
                 StatusCode::CREATED,
-                Json(serde_json::json!({
-                    "client_id": client_id,
-                    "client_name": name,
-                    "redirect_uris": body.redirect_uris,
-                    "token_endpoint_auth_method": "none",
-                    "grant_types": ["authorization_code", "refresh_token"],
-                    "response_types": ["code"],
-                })),
+                Json(ClientRegistered {
+                    client_id,
+                    client_name: name,
+                    redirect_uris: body.redirect_uris,
+                    token_endpoint_auth_method: "none",
+                    grant_types: vec!["authorization_code", "refresh_token"],
+                    response_types: vec!["code"],
+                }),
             )
                 .into_response()
         }
@@ -214,33 +376,69 @@ fn redirect_uri_is_plausible(uri: &str) -> Result<(), &'static str> {
 //  Authorization
 // ════════════════════════════════════════════════════════════
 
-#[derive(Deserialize, Clone)]
+#[derive(Deserialize, Clone, IntoParams)]
+#[into_params(parameter_in = Query)]
 pub struct AuthorizeParams {
     pub client_id: String,
+    /// Must match one the client registered exactly.
     pub redirect_uri: String,
+    /// `code`. Required by `/oauth/authorize`.
     #[serde(default)]
     pub response_type: Option<String>,
+    /// Space-separated grants. Unrecognised ones are dropped; none means the
+    /// minimal default.
     #[serde(default)]
     pub scope: Option<String>,
+    /// Handed back unchanged.
     #[serde(default)]
     pub state: Option<String>,
+    /// PKCE. Required by `/oauth/authorize`.
     #[serde(default)]
     pub code_challenge: Option<String>,
+    /// `S256`, the only method accepted.
     #[serde(default)]
     pub code_challenge_method: Option<String>,
-    /// RFC 8707 — which resource the credential is for. Required by the MCP
-    /// spec, and validated rather than merely recorded.
+    /// RFC 8707 — which resource the credential is for. Validated as naming
+    /// this instance, not merely recorded.
+    //
+    // Required by the MCP spec.
     #[serde(default)]
     pub resource: Option<String>,
 }
 
-/// `GET /oauth/authorize` — the front door.
+// `GET /oauth/authorize` — the front door.
+//
+// This validates and then hands off to the SPA, which is where the consent
+// screen lives. It deliberately does **not** render HTML: this application
+// serves one `index.html` and does its rendering in the browser, and a
+// server-rendered consent page would be the only exception in the codebase
+// and the only page that could drift from the app's own styling.
+/// The authorization endpoint.
 ///
-/// This validates and then hands off to the SPA, which is where the consent
-/// screen lives. It deliberately does **not** render HTML: this application
-/// serves one `index.html` and does its rendering in the browser, and a
-/// server-rendered consent page would be the only exception in the codebase
-/// and the only page that could drift from the app's own styling.
+/// Unauthenticated at this step. Validates the request and **redirects to
+/// the SPA consent screen** at `/authorize` carrying the parameters; it
+/// does not render HTML, because this application serves one `index.html`
+/// and a server-rendered consent page would be the only thing that could
+/// drift from the app's own styling.
+///
+/// Failures concerning the redirect target itself are reported directly
+/// rather than bounced off it — an unvalidated `redirect_uri` is an open
+/// redirect and must not be used to deliver its own error. `redirect_uri`
+/// is matched **exactly** against one the client registered; a prefix match
+/// here would hand somebody else an authorization code.
+///
+/// PKCE is required and `code_challenge_method` must be `S256`.
+#[utoipa::path(
+    get,
+    path = "/oauth/authorize",
+    tag = "OAuth",
+    security(),
+    params(AuthorizeParams),
+    responses(
+        (status = 303, description = "To the consent screen, or back to the client with an error."),
+        (status = 400, description = "Unknown client, or a redirect_uri that does not match its registration.", body = OAuthError),
+    )
+)]
 async fn authorize(
     State(state): State<Arc<AppState>>,
     Query(p): Query<AuthorizeParams>,
@@ -312,12 +510,30 @@ async fn authorize(
     Redirect::to(&next).into_response()
 }
 
-/// GET /api/v1/oauth/authorize-info — what the consent screen puts in front of
-/// the user.
+// GET /api/v1/oauth/authorize-info — what the consent screen puts in front of
+// the user.
+//
+// Scope *descriptions* travel with it rather than raw scope strings, because
+// "listening:read" is not something a person can consent to and
+// "Read your listening history, statistics, reports and genre map" is.
+/// What the consent screen puts in front of the user.
 ///
-/// Scope *descriptions* travel with it rather than raw scope strings, because
-/// "listening:read" is not something a person can consent to and
-/// "Read your listening history, statistics, reports and genre map" is.
+/// Session-only. Scope **descriptions** travel with it rather than raw
+/// scope strings — `listening:read` is not something a person can consent
+/// to. `verified` says whether the client identified itself with a
+/// fetchable URL or merely registered a name it chose for itself; the
+/// consent screen warns on the latter.
+#[utoipa::path(
+    get,
+    path = "/api/v1/oauth/authorize-info",
+    tag = "OAuth",
+    params(AuthorizeParams),
+    responses(
+        (status = 200, description = "The request, in the user's terms.", body = AuthorizeInfo),
+        (status = 401, response = Unauthorized),
+        (status = 404, description = "Unknown client.", body = OAuthError),
+    )
+)]
 async fn authorize_info(
     State(state): State<Arc<AppState>>,
     _user: AuthUser,
@@ -348,46 +564,70 @@ async fn authorize_info(
     // the person whose listening it is *decides*. OAuth has always allowed
     // granting something other than what was asked for, and the token response
     // carries `scope` so the client learns what it actually got.
-    let detail: Vec<_> = scopes::ALL
+    let detail: Vec<ScopeOffer> = scopes::ALL
         .iter()
-        .map(|(name, desc)| {
-            serde_json::json!({
-                "scope": name,
-                "description": desc,
-                "requested": requested.split_whitespace().any(|r| r == *name),
-            })
+        .map(|&(scope, description)| ScopeOffer {
+            scope,
+            description,
+            requested: requested.split_whitespace().any(|r| r == scope),
         })
         .collect();
 
-    Json(serde_json::json!({
-        "client_name": client.client_name,
-        "client_id": client.client_id,
+    Json(AuthorizeInfo {
+        client_name: client.client_name,
+        client_id: client.client_id,
         // Whether the client identified itself with a URL that could be
         // fetched, or merely registered a name it chose. The consent screen
         // says which — an anonymous registration can call itself anything.
-        "verified": client.registered_by_url,
-        "redirect_uri": q.redirect_uri,
-        "scopes": detail,
-        "requested": requested,
-    }))
+        verified: client.registered_by_url,
+        redirect_uri: q.redirect_uri,
+        scopes: detail,
+        requested,
+    })
     .into_response()
 }
 
-#[derive(Deserialize)]
+/// The authorization request being approved, and what the person ticked.
+#[derive(Deserialize, ToSchema)]
+#[schema(as = OAuthApproval)]
 struct ApproveRequest {
     client_id: String,
     redirect_uri: String,
     code_challenge: String,
+    /// What the person granted — which may be more or less than the client
+    /// asked for.
     scope: Option<String>,
     state: Option<String>,
     resource: Option<String>,
 }
 
-/// POST /api/v1/oauth/approve — the user said yes.
+// POST /api/v1/oauth/approve — the user said yes.
+//
+// Session-only, and that is the load-bearing part of the whole flow: minting a
+// credential requires a logged-in human on this instance. Everything before
+// this point is a request; this is the consent.
+/// The user said yes.
 ///
-/// Session-only, and that is the load-bearing part of the whole flow: minting a
-/// credential requires a logged-in human on this instance. Everything before
-/// this point is a request; this is the consent.
+/// **Session-only, and that is the load-bearing part of the whole flow**:
+/// minting a credential requires a logged-in human on this instance.
+/// Everything before this point is a request; this is the consent.
+///
+/// `redirect_uri` is re-checked here rather than trusted from the browser —
+/// this handler is reachable directly. The `resource` must name this
+/// server, or RFC 8707's audience binding would record an audience and
+/// enforce nothing. The response carries `iss` (RFC 9207) in the redirect.
+#[utoipa::path(
+    operation_id = "oauth_approve",
+    post,
+    path = "/api/v1/oauth/approve",
+    tag = "OAuth",
+    request_body = ApproveRequest,
+    responses(
+        (status = 200, description = "Where to send the browser next.", body = Approved),
+        (status = 400, description = "invalid_client, invalid_request or invalid_target.", body = OAuthError),
+        (status = 401, response = Unauthorized),
+    )
+)]
 async fn approve(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -465,15 +705,18 @@ async fn approve(
     }
 
     info!("🤖 {} approved '{}' for [{}]", user.username, client.client_name, granted);
-    Json(serde_json::json!({ "redirect_to": url })).into_response()
+    Json(Approved { redirect_to: url }).into_response()
 }
 
 // ════════════════════════════════════════════════════════════
 //  Token
 // ════════════════════════════════════════════════════════════
 
-#[derive(Deserialize)]
+/// Form-encoded, as the RFC requires.
+#[derive(Deserialize, ToSchema)]
+#[schema(as = OAuthTokenRequest)]
 struct TokenRequest {
+    /// `authorization_code` or `refresh_token`.
     grant_type: String,
     #[serde(default)]
     code: Option<String>,
@@ -481,6 +724,7 @@ struct TokenRequest {
     redirect_uri: Option<String>,
     #[serde(default)]
     client_id: Option<String>,
+    /// 43–128 characters, per RFC 7636.
     #[serde(default)]
     code_verifier: Option<String>,
     #[serde(default)]
@@ -489,7 +733,32 @@ struct TokenRequest {
     resource: Option<String>,
 }
 
-/// `POST /oauth/token` — form-encoded, as the RFC requires.
+// `POST /oauth/token` — form-encoded, as the RFC requires.
+/// Exchange a code, or refresh.
+///
+/// Unauthenticated (public clients, `token_endpoint_auth_method: none`);
+/// form-encoded, as the RFC requires. Grants: `authorization_code` and
+/// `refresh_token`.
+///
+/// The code is **single use**, taken with `DELETE … RETURNING` so two
+/// simultaneous redemptions cannot both succeed. It is bound to the client,
+/// the redirect, the PKCE challenge and the resource — every one of those
+/// is re-checked here.
+///
+/// A refresh **rotates both secrets**, so a leaked access token stops
+/// working as soon as the legitimate client refreshes. Access credentials
+/// live 24 hours.
+#[utoipa::path(
+    post,
+    path = "/oauth/token",
+    tag = "OAuth",
+    security(),
+    request_body(content = TokenRequest, content_type = "application/x-www-form-urlencoded"),
+    responses(
+        (status = 200, description = "A credential. Never cached.", body = TokenIssued),
+        (status = 400, description = "invalid_grant, invalid_request, invalid_target or unsupported_grant_type.", body = OAuthError),
+    )
+)]
 async fn token(State(state): State<Arc<AppState>>, Form(body): Form<TokenRequest>) -> Response {
     match body.grant_type.as_str() {
         "authorization_code" => exchange_code(&state, &body).await,
@@ -584,17 +853,13 @@ async fn refresh(state: &Arc<AppState>, body: &TokenRequest) -> Response {
 }
 
 fn issued(cred: crate::db::McpCredential, scope: &str) -> Response {
-    let mut out = serde_json::json!({
-        "access_token": cred.token,
-        "token_type": "Bearer",
-        "expires_in": cred.expires_in.unwrap_or(ACCESS_TTL_SECS),
-    });
-    if let Some(r) = cred.refresh {
-        out["refresh_token"] = serde_json::json!(r);
-    }
-    if !scope.is_empty() {
-        out["scope"] = serde_json::json!(scope);
-    }
+    let out = TokenIssued {
+        access_token: cred.token,
+        token_type: "Bearer",
+        expires_in: cred.expires_in.unwrap_or(ACCESS_TTL_SECS),
+        refresh_token: cred.refresh,
+        scope: (!scope.is_empty()).then(|| scope.to_string()),
+    };
     // A token response must not be cached anywhere, by anything.
     (StatusCode::OK, [("cache-control", "no-store"), ("pragma", "no-cache")], Json(out))
         .into_response()
@@ -617,6 +882,18 @@ fn pkce_matches(verifier: &str, challenge: &str) -> bool {
     let computed = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(digest);
     computed == challenge
 }
+
+#[derive(utoipa::OpenApi)]
+#[openapi(paths(
+    protected_resource,
+    authorization_server,
+    authorize,
+    token,
+    register,
+    authorize_info,
+    approve
+))]
+pub struct Api;
 
 pub fn create_oauth_router() -> Router<Arc<AppState>> {
     Router::new()

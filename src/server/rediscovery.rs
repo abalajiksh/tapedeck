@@ -16,28 +16,82 @@ use axum::{
     routing::get,
     Router,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use utoipa::{IntoParams, ToSchema};
 
 use super::auth::AuthUser;
 use super::models::ErrorResponse;
 use super::AppState;
+use crate::db::RediscoveryRow;
+use crate::openapi::{NotFound, Unauthorized};
 
 fn err(code: u16, msg: impl Into<String>) -> axum::response::Response {
     let status = StatusCode::from_u16(code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-    (status, Json(serde_json::json!(ErrorResponse { code, error: msg.into() }))).into_response()
+    (status, Json(ErrorResponse { code, error: msg.into() })).into_response()
 }
 
 fn now() -> i64 {
     chrono::Utc::now().timestamp()
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
 pub struct RediscoverQuery {
     /// How long is "not lately", in days. Defaults to six months — long enough
-    /// that a gap is meaningful rather than just a busy fortnight.
+    /// that a gap is meaningful rather than just a busy fortnight. Clamped to
+    /// between a week and ten years.
+    #[param(minimum = 7, maximum = 3650, default = 180)]
     pub quiet_days: Option<i64>,
+    /// Rows per list. 12 by default, at most 50.
+    #[param(minimum = 1, maximum = 50, default = 12)]
     pub limit: Option<i64>,
+}
+
+/// Five lists — seven, now — all built from your own history.
+#[derive(Serialize, ToSchema)]
+pub struct Rediscovery {
+    pub quiet_days: i64,
+    /// `quiet_days` in words — "six months".
+    pub window: String,
+    /// The collection with the most rows, for the hero card. Null when every
+    /// list is empty.
+    pub featured: Option<Collection>,
+    /// Every collection, in the page's order, empty ones included.
+    pub collections: Vec<Collection>,
+    /// Your gear, for the per-gear list at `/api/v1/rediscovery/gear/{id}`.
+    pub gear: Vec<GearChoice>,
+}
+
+/// One collection: rows, and the reason they are together.
+#[derive(Clone, Serialize, ToSchema)]
+pub struct Collection {
+    /// `forgotten`, `highrated`, `onelisten`, `seasonal`, `latenight`,
+    /// `deepcuts` or `dusty`.
+    pub key: &'static str,
+    pub title: &'static str,
+    /// Why these rows are together.
+    pub blurb: &'static str,
+    /// A hex colour.
+    pub accent: &'static str,
+    /// The evidence, in words — "Last played 14 months ago".
+    pub stat: String,
+    pub count: usize,
+    pub rows: Vec<RediscoveryRow>,
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct GearChoice {
+    pub id: i64,
+    pub name: String,
+    #[serde(rename = "type")]
+    pub kind: String,
+}
+
+/// Favourites a piece of gear has never played.
+#[derive(Serialize, ToSchema)]
+pub struct GearRows {
+    pub rows: Vec<RediscoveryRow>,
 }
 
 /// One collection on the Rediscovery screen.
@@ -51,29 +105,38 @@ pub struct RediscoverQuery {
 /// Tapedeck has no playback, and a button that does nothing is worse than an
 /// absent one — the same call the album/artist pages already made.
 fn collection(
-    key: &str,
-    title: &str,
-    blurb: &str,
-    accent: &str,
+    key: &'static str,
+    title: &'static str,
+    blurb: &'static str,
+    accent: &'static str,
     stat: String,
     rows: Vec<crate::db::RediscoveryRow>,
-) -> serde_json::Value {
-    serde_json::json!({
-        "key": key,
-        "title": title,
-        "blurb": blurb,
-        "accent": accent,
-        "stat": stat,
-        "count": rows.len(),
-        "rows": rows,
-    })
+) -> Collection {
+    Collection { key, title, blurb, accent, stat, count: rows.len(), rows }
 }
 
 fn plural(n: usize, one: &str, many: &str) -> String {
     format!("{n} {}", if n == 1 { one } else { many })
 }
 
-/// GET /api/v1/rediscovery
+/// The Rediscovery lists, all built from your own history.
+///
+/// Session-only. Nothing here points at music you do not own — that is the
+/// design, not an implementation detail.
+///
+/// "Not lately" is a **parameter, not a constant**: six months is a long
+/// gap for a daily listener and no gap at all otherwise. The seasonal list
+/// excludes the current year, or it would just be "recently played".
+#[utoipa::path(
+    get,
+    path = "/api/v1/rediscovery",
+    tag = "Rediscovery",
+    params(RediscoverQuery),
+    responses(
+        (status = 200, description = "OK.", body = Rediscovery),
+        (status = 401, response = Unauthorized),
+    )
+)]
 pub async fn rediscover(
     State(state): State<Arc<AppState>>,
     user: AuthUser,
@@ -233,33 +296,40 @@ pub async fn rediscover(
     // The featured card is whichever collection has the most to say, rather
     // than a fixed one — an empty hero on a new instance would be the worst
     // thing on the screen.
-    let featured = collections
-        .iter()
-        .filter(|c| c["count"].as_u64().unwrap_or(0) > 0)
-        .max_by_key(|c| c["count"].as_u64().unwrap_or(0))
-        .cloned();
+    let featured = collections.iter().filter(|c| c.count > 0).max_by_key(|c| c.count).cloned();
 
     // Gear the page offers for the per-gear list, so it needs no second trip.
     let gear = state.db.get_equipment(user.user_id).await.unwrap_or_default();
-    let gear_json: Vec<serde_json::Value> = gear
+    let gear_json: Vec<GearChoice> = gear
         .iter()
-        .map(|g| serde_json::json!({ "id": g.id, "name": g.name, "type": g.equipment_type }))
+        .map(|g| GearChoice { id: g.id, name: g.name.clone(), kind: g.equipment_type.clone() })
         .collect();
 
     (
         StatusCode::OK,
-        Json(serde_json::json!({
-            "quiet_days": quiet_days,
-            "window": window,
-            "featured": featured,
-            "collections": collections,
-            "gear": gear_json,
-        })),
+        Json(Rediscovery { quiet_days, window, featured, collections, gear: gear_json }),
     )
         .into_response()
 }
 
-/// GET /api/v1/rediscovery/gear/:id — favourites this gear has never played.
+// GET /api/v1/rediscovery/gear/:id — favourites this gear has never played.
+/// Favourites never heard on a piece of gear.
+///
+/// Session-only. Answered by joining `chain_id` to the chains whose
+/// components reference the gear — no per-listen equipment field needed.
+/// Restricted to tracks played more than once: the interesting question is
+/// how your *favourites* sound on it.
+#[utoipa::path(
+    get,
+    path = "/api/v1/rediscovery/gear/{id}",
+    tag = "Rediscovery",
+    params(("id" = i64, Path, description = "One of your pieces of gear."), RediscoverQuery),
+    responses(
+        (status = 200, description = "OK.", body = GearRows),
+        (status = 401, response = Unauthorized),
+        (status = 404, response = NotFound),
+    )
+)]
 async fn never_on_gear(
     State(state): State<Arc<AppState>>,
     user: AuthUser,
@@ -277,10 +347,14 @@ async fn never_on_gear(
     }
 
     match state.db.never_on_gear(user.user_id, id, limit).await {
-        Ok(rows) => (StatusCode::OK, Json(serde_json::json!({ "rows": rows }))).into_response(),
+        Ok(rows) => (StatusCode::OK, Json(GearRows { rows })).into_response(),
         Err(e) => err(500, e.to_string()),
     }
 }
+
+#[derive(utoipa::OpenApi)]
+#[openapi(paths(rediscover, never_on_gear))]
+pub struct Api;
 
 pub fn create_rediscovery_router() -> Router<Arc<AppState>> {
     Router::new()

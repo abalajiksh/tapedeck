@@ -122,7 +122,7 @@ mod tests {
             .get_dashboard_stats(uid, chrono_tz::Tz::UTC, 1)
             .await
             .unwrap_or_else(|e| panic!("get_dashboard_stats: {}", crate::logging::error_chain(&e)));
-        println!("dashboard: {stats}");
+        println!("dashboard: {}", serde_json::to_value(&stats).unwrap());
     }
 
     /// What can this account actually do? Diagnostic, not a guard.

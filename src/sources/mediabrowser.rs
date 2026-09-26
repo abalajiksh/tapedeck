@@ -98,7 +98,7 @@ impl Flavour {
 
 /// An account on the server. Sessions are matched on `name`, which is what
 /// `SessionInfo.UserName` carries.
-#[derive(Debug, Clone, serde::Serialize, Deserialize)]
+#[derive(Debug, Clone, serde::Serialize, Deserialize, utoipa::ToSchema)]
 pub struct MediaBrowserAccount {
     pub id: String,
     pub name: String,

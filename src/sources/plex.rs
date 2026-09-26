@@ -143,7 +143,7 @@ pub struct PlexTrack {
 /// An account on the Plex server — the server owner plus any managed or shared
 /// users. `id` is Plex's own account id; sessions are matched on `name`, which
 /// is what the `User` element on a session carries.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct PlexAccount {
     pub id: i64,
     pub name: String,

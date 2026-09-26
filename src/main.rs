@@ -40,6 +40,14 @@ use crate::musicbrainz::MusicBrainzClient;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // `tapedeck openapi` prints this build's API description and exits,
+    // before any configuration is read — it needs none, and regenerating the
+    // committed `openapi.yaml` should not require a database.
+    if std::env::args().nth(1).as_deref() == Some("openapi") {
+        print!("{}", openapi::yaml());
+        return Ok(());
+    }
+
     dotenv::dotenv().ok();
 
     // ── Configuration (TOML + env overrides) ──

@@ -1,4 +1,4 @@
-//! Per-user music sources, keyed `(user_id, kind)`.
+//! Per-user music sources — several of a kind per user, told apart by `label`.
 //!
 //! `record_source_poll` and `set_source_credential` must **not** touch
 //! `updated_at` — that is the stamp `reconcile_sources` watches, and bumping

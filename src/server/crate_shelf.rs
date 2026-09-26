@@ -30,19 +30,49 @@ use axum::{
     extract::{Path, State},
     http::StatusCode,
     response::{IntoResponse, Json, Response},
-    routing::{get, post},
+    routing::get,
     Router,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+use utoipa::ToSchema;
 
 use super::auth::AuthUser;
 use super::models::ErrorResponse;
 use super::AppState;
-use crate::db::NewRecommendation;
+use crate::db::{CrateEntry, NewRecommendation};
+use crate::openapi::Unauthorized;
+
+/// Everything in the crate, and how much of it landed.
+#[derive(Serialize, ToSchema)]
+pub struct Crate {
+    #[serde(rename = "crate")]
+    pub entries: Vec<CrateEntry>,
+    /// Entries still `open`.
+    pub open: usize,
+    /// How many suggestions were actually played.
+    pub landed: usize,
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct CrateFiled {
+    pub id: i64,
+    /// False when it was already there and its reason was updated.
+    pub created: bool,
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct CrateStatusSet {
+    pub ok: bool,
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct CrateRemoved {
+    pub deleted: bool,
+}
 
 fn err(code: u16, msg: impl Into<String>) -> Response {
     let status = StatusCode::from_u16(code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-    (status, Json(serde_json::json!(ErrorResponse { code, error: msg.into() }))).into_response()
+    (status, Json(ErrorResponse { code, error: msg.into() })).into_response()
 }
 
 /// Why an entry could not be filed.
@@ -141,7 +171,24 @@ suggestion. A recommendation with no grounding in their history is not one."
         .map_err(|e| CrateRefusal::Invalid(e.to_string()))
 }
 
-/// GET /api/v1/crate
+/// Things somebody suggested that you do not own.
+///
+/// Session-only. Each entry carries **`first_played_at`**, derived from the
+/// listens rather than stored — whether the suggestion actually landed.
+/// That is the thing only a scrobbler can answer, and it is what makes this
+/// more than a wantlist: a recommendation is a prediction, and Tapedeck is
+/// the only party that can score it.
+///
+/// `landed` counts how many entries have since turned up in the history.
+#[utoipa::path(
+    get,
+    path = "/api/v1/crate",
+    tag = "Crate",
+    responses(
+        (status = 200, description = "The crate.", body = Crate),
+        (status = 401, response = Unauthorized),
+    )
+)]
 async fn list_crate(State(state): State<Arc<AppState>>, user: AuthUser) -> Response {
     match state.db.list_crate(user.user_id).await {
         Ok(entries) => {
@@ -149,38 +196,62 @@ async fn list_crate(State(state): State<Arc<AppState>>, user: AuthUser) -> Respo
             // suggestions turned into listening.
             let open = entries.iter().filter(|e| e.rec.status == "open").count();
             let landed = entries.iter().filter(|e| e.first_played_at.is_some()).count();
-            (
-                StatusCode::OK,
-                Json(serde_json::json!({
-                    "crate": entries,
-                    "open": open,
-                    "landed": landed,
-                })),
-            )
-                .into_response()
+            (StatusCode::OK, Json(Crate { entries, open, landed })).into_response()
         }
         Err(e) => err(500, e.to_string()),
     }
 }
 
 /// What a hand-filed crate entry says, plus where it came from.
-///
-/// `from` is the *username of a deck the caller is patched into* — the Reel's
-/// "put this in my crate" button — and it is **resolved and checked**, never
-/// taken as text. An origin string is displayed on the Crate as "suggested by
-/// X" and groups everything that person turned you on to, so letting a client
-/// write one directly would let it assert a provenance it did not have. Same
-/// reasoning as `fold_artist_credit` deriving its target rather than accepting
-/// one: what a record *says about where it came from* has to be earned.
-#[derive(Deserialize)]
+//
+// `from` is the *username of a deck the caller is patched into* — the Reel's
+// "put this in my crate" button — and it is **resolved and checked**, never
+// taken as text. An origin string is displayed on the Crate as "suggested by
+// X" and groups everything that person turned you on to, so letting a client
+// write one directly would let it assert a provenance it did not have. Same
+// reasoning as `fold_artist_credit` deriving its target rather than accepting
+// one: what a record *says about where it came from* has to be earned.
+#[derive(Deserialize, ToSchema)]
+#[schema(as = CrateAdd)]
 struct CrateAddBody {
     #[serde(flatten)]
     rec: NewRecommendation,
-    /// Optional. The deck you took this off.
+    /// Optional. The **username of a deck you are patched into** — the Reel's
+    /// "into my crate" button. Resolved and checked server-side, and a deck
+    /// you cannot read is a **403**: the Crate groups by origin and shows
+    /// "suggested by X", so a client writing that string itself would be
+    /// asserting a provenance rather than earning one. The patch must point
+    /// *from* you *to* them; somebody who follows you has told you nothing.
+    /// Omit it for something you found yourself, which files under the
+    /// origin `user`.
     from: Option<String>,
 }
 
-/// POST /api/v1/crate — add something by hand.
+// POST /api/v1/crate — add something by hand.
+/// Add something to the crate.
+///
+/// Session-only for this endpoint; an assistant uses the MCP `add_to_crate`
+/// tool, which shares the same validation.
+///
+/// Two refusals, both deliberate. **`because` is required** — what in your
+/// own listening prompted this — which is the vision doc's pipeline
+/// (analytics, candidate selection, explanation) enforced at the door
+/// rather than asked for in a prompt. And **anything already in the
+/// history is refused with its play count**: that is not a suggestion, it
+/// is rediscovery, and letting it through would turn the crate into a
+/// worse copy of a screen that already exists.
+#[utoipa::path(
+    post,
+    path = "/api/v1/crate",
+    tag = "Crate",
+    request_body = CrateAddBody,
+    responses(
+        (status = 200, description = "Filed. `created` is false when it was already there and the reason was updated.", body = CrateFiled),
+        (status = 400, description = "Missing grounding, malformed, or already in the history.", body = ErrorResponse),
+        (status = 401, response = Unauthorized),
+        (status = 403, description = "`from` named a deck you are not patched into.", body = ErrorResponse),
+    )
+)]
 async fn add(
     State(state): State<Arc<AppState>>,
     user: AuthUser,
@@ -202,21 +273,33 @@ async fn add(
     };
 
     match file(&state, user.user_id, &body.rec, &origin, None).await {
-        Ok((id, created)) => {
-            (StatusCode::OK, Json(serde_json::json!({ "id": id, "created": created })))
-                .into_response()
-        }
+        Ok((id, created)) => (StatusCode::OK, Json(CrateFiled { id, created })).into_response(),
         Err(refusal) => err(400, refusal.for_reader(&body.rec.artist, body.rec.name.as_deref())),
     }
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, ToSchema)]
+#[schema(as = CrateStatus)]
 struct StatusBody {
     /// `open`, `acquired` or `dismissed`.
+    #[schema(example = "acquired")]
     status: String,
 }
 
-/// PATCH /api/v1/crate/:id
+/// Mark an entry acquired, dismissed, or open again.
+#[utoipa::path(
+    patch,
+    path = "/api/v1/crate/{id}",
+    tag = "Crate",
+    params(("id" = i64, Path)),
+    request_body = StatusBody,
+    responses(
+        (status = 200, description = "Updated.", body = CrateStatusSet),
+        (status = 400, description = "Unknown status.", body = ErrorResponse),
+        (status = 401, response = Unauthorized),
+        (status = 404, description = "No such entry.", body = ErrorResponse),
+    )
+)]
 async fn set_status(
     State(state): State<Arc<AppState>>,
     user: AuthUser,
@@ -227,24 +310,39 @@ async fn set_status(
         return err(400, "status must be open, acquired or dismissed");
     }
     match state.db.set_recommendation_status(user.user_id, id, &body.status).await {
-        Ok(true) => (StatusCode::OK, Json(serde_json::json!({ "ok": true }))).into_response(),
+        Ok(true) => (StatusCode::OK, Json(CrateStatusSet { ok: true })).into_response(),
         Ok(false) => err(404, "No such crate entry"),
         Err(e) => err(500, e.to_string()),
     }
 }
 
-/// DELETE /api/v1/crate/:id
+/// Remove an entry.
+#[utoipa::path(
+    delete,
+    path = "/api/v1/crate/{id}",
+    tag = "Crate",
+    params(("id" = i64, Path)),
+    responses(
+        (status = 200, description = "Removed.", body = CrateRemoved),
+        (status = 401, response = Unauthorized),
+        (status = 404, description = "No such entry.", body = ErrorResponse),
+    )
+)]
 async fn remove(
     State(state): State<Arc<AppState>>,
     user: AuthUser,
     Path(id): Path<i64>,
 ) -> Response {
     match state.db.delete_recommendation(user.user_id, id).await {
-        Ok(true) => (StatusCode::OK, Json(serde_json::json!({ "deleted": true }))).into_response(),
+        Ok(true) => (StatusCode::OK, Json(CrateRemoved { deleted: true })).into_response(),
         Ok(false) => err(404, "No such crate entry"),
         Err(e) => err(500, e.to_string()),
     }
 }
+
+#[derive(utoipa::OpenApi)]
+#[openapi(paths(list_crate, add, set_status, remove))]
+pub struct Api;
 
 pub fn create_crate_router() -> Router<Arc<AppState>> {
     Router::new()

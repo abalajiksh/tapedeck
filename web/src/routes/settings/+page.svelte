@@ -206,7 +206,7 @@
 	// ── Pairing a device ──
 	// For clients with no browser: they show a code, you type it here.
 	let pairCode = '';
-	let pairInfo: { client_name: string; scopes: string; can_read: boolean; approved: boolean } | null = null;
+	let pairInfo: { client_name: string; scopes: string; can_read: boolean; can_write: boolean; approved: boolean } | null = null;
 	let pairChain = '';
 	let pairMsg = '';
 	let pairBusy = false;
@@ -3006,8 +3006,8 @@
 					<div style="margin-top:16px;padding:14px;border-radius:14px;background:var(--td-track);">
 						<div style="font-size:14px;font-weight:600;margin-bottom:6px;">{pairInfo.client_name}</div>
 						<div style="font-size:12.5px;color:var(--td-muted-2);margin-bottom:12px;">
-							Will be able to submit listens{pairInfo.can_read ? ' and read your chains, devices, gear and what\'s playing' : ''}.
-							It can never write anything else or reach admin actions.
+							Will be able to submit listens{pairInfo.can_read ? ' and read your chains, devices, gear and what\'s playing' : ''}{pairInfo.can_write ? ', and change your own data — loves, notes, lyrics and cover art' : ''}.
+							It can never reach your sources, connections or admin actions.
 						</div>
 						<div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;">
 							{#if chains.length}

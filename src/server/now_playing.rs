@@ -61,64 +61,66 @@ impl Progress {
     }
 }
 
-/// Nothing here is persisted: "now playing" is live state, so a restart
-/// correctly shows an empty deck until a source reports again.
-#[derive(Clone, Debug, Serialize)]
+/// What is on the deck. **Not a `Listen`** — nothing here is persisted, so
+/// there is no id, no timestamp, no status and no `source_id`. It carries the
+/// quality fields a source could report plus the playhead.
+// Nothing here is persisted: "now playing" is live state, so a restart
+// correctly shows an empty deck until a source reports again.
+#[derive(Clone, Debug, Serialize, utoipa::ToSchema)]
+#[schema(as = NowPlayingTrack)]
 pub struct NowPlaying {
     pub title: String,
     pub artist: String,
     pub album: Option<String>,
     /// Track length in seconds, when the source reports one.
     pub duration: Option<u64>,
-    /// Playback position in seconds **as of `updated_at`**. The client
-    /// extrapolates from there between polls rather than us ticking every second.
+    /// Seconds in **as of `updated_at`**. Extrapolate from there rather than
+    /// expecting a tick per second — but see `position_known` first, and stop
+    /// extrapolating when `paused`.
     pub progress: u64,
-    /// False when `progress` is wall-clock arithmetic rather than a reported
-    /// playhead — see `Progress`. The deck reads this to decide whether it is
-    /// showing a position or a guess.
+    /// **False when `progress` is the server's own wall-clock arithmetic rather
+    /// than a reported playhead.** A ListenBrainz `playing_now` has no position
+    /// field in the format and Subsonic answers `minutesAgo`, so for those there
+    /// is nothing to report and the number is a guess. Draw it as one. Plex,
+    /// Jellyfin, Emby, Roon and the shelf report a real playhead, and so does
+    /// any client sending `tapedeck_playback`.
     pub position_known: bool,
-    /// Whether the playhead was measured at the instant it was sent, and may
-    /// therefore overrule our own extrapolation in either direction. Internal
-    /// staleness policy rather than anything about the listen, so it stays off
-    /// the wire: the deck already distinguishes a measurement from a guess with
-    /// `position_known`, and both kinds of measurement draw the same.
+    // Whether the playhead was measured at the instant it was sent, and may
+    // therefore overrule our own extrapolation in either direction. Internal
+    // staleness policy rather than anything about the listen, so it stays off
+    // the wire: the deck already distinguishes a measurement from a guess with
+    // `position_known`, and both kinds of measurement draw the same.
     #[serde(skip)]
     pub position_exact: bool,
-    /// The listener has paused. Only a pushing client can know this — a poll
-    /// that simply stops arriving is indistinguishable from a client that
-    /// crashed — so it is false for every polled source.
-    ///
-    /// Load-bearing rather than decorative: `position_at` counts forward from
-    /// `updated_at`, so without this a paused track's position runs away while
-    /// `position_known` asserts it is a measurement. That is the "confident and
-    /// completely wrong position" this type was introduced to stop, made worse
-    /// by now being stated with confidence.
+    /// Only a pushing client can know this — a poll that stops arriving is
+    /// indistinguishable from a client that crashed — so it is false for every
+    /// polled source. A paused entry holds its position rather than counting
+    /// forward, and expires after ten minutes of silence.
+    // Load-bearing rather than decorative: `position_at` counts forward from
+    // `updated_at`, so without this a paused track's position runs away while
+    // `position_known` asserts it is a measurement. That is the "confident and
+    // completely wrong position" this type was introduced to stop, made worse
+    // by now being stated with confidence.
     pub paused: bool,
+    /// Unix seconds when this was last reported.
     pub updated_at: i64,
-    /// Which source reported this — also the key the pipeline clears by.
+    /// `Plex`, `Roon`, `ingest`, `physical`…
+    // Also the key the pipeline clears by.
     pub source: String,
     pub listening_context: Option<String>,
-    /// The signal chain this listen is attributed to, where the writer already
-    /// knew it.
-    ///
-    /// Filled by the two sources for which a chain is a *deliberate statement*
-    /// rather than a fallback: an ingest submission resolves one through the
-    /// four-rung ladder, and a side off the shelf runs through the turntable
-    /// the pressing remembers. A polled source falls through to the device's
-    /// default — the coarsest rung — and does not set this, so the public
-    /// payload omits the field rather than naming a chain nobody chose.
+    /// The signal chain, **only where it was a deliberate statement** — an
+    /// ingest submission's resolved chain, or the turntable a pressing on the
+    /// shelf remembers. A polled source falls back to its device's default and
+    /// leaves this null rather than naming a chain nobody chose.
     pub chain_name: Option<String>,
-    /// The chain this listen will be attributed to, resolved the way its
-    /// eventual scrobble will resolve it.
-    ///
-    /// **Internal, and `skip`ped off the wire on purpose.** It is a *gate
-    /// input* rather than anything about the listen: Patch's live strip has to
-    /// apply the same shared-chain rule the Reel does, and `chain_name` cannot
-    /// carry it — a name is not a key, and a polled source sets no name at all
-    /// because its chain is the device's default rather than a choice.
-    ///
-    /// Nothing about the deck's own readout changes, which is why the field
-    /// does not appear in `/api/v1/now-playing`.
+    // The chain this listen will be attributed to, resolved the way its
+    // eventual scrobble will resolve it.
+    //
+    // **Internal, and `skip`ped off the wire on purpose.** It is a *gate
+    // input* rather than anything about the listen: Patch's live strip has to
+    // apply the same shared-chain rule the Reel does, and `chain_name` cannot
+    // carry it — a name is not a key, and a polled source sets no name at all
+    // because its chain is the device's default rather than a choice.
     #[serde(skip)]
     pub chain_id: Option<i64>,
     // Quality fields, named to match the frontend's `qualityLabel()` shape.
@@ -130,29 +132,27 @@ pub struct NowPlaying {
     pub dsd_to_pcm_converted: Option<bool>,
     pub delivery_codec: Option<String>,
     pub is_lossless: Option<bool>,
-    /// A cover for what is on the deck, resolved lazily and at most once per
-    /// track.
-    ///
-    /// Deliberately not filled by whoever writes the entry: the deck in the SPA
-    /// has never drawn one, so paying for a lookup on the hot path would be a
-    /// cost with no reader. The public endpoint is the first thing that wants
-    /// it, so it resolves on first ask and hands the answer back through
-    /// `set_artwork` — one query per track rather than one per request, which
-    /// on an unauthenticated route is the difference that matters.
+    /// A cover for what is on the deck, once something has asked for one — it
+    /// is resolved lazily, at most once per track, by the public widget.
+    // Deliberately not filled by whoever writes the entry: the deck in the SPA
+    // has never drawn one, so paying for a lookup on the hot path would be a
+    // cost with no reader. The public endpoint resolves on first ask and hands
+    // the answer back through `set_artwork` — one query per track rather than
+    // one per request, which on an unauthenticated route is what matters.
     pub artwork_url: Option<String>,
-    /// Whether the lookup above has been *attempted*. A track nobody has a
-    /// cover for must not be re-asked on every poll of every widget, so a
-    /// resolved `None` is a tombstone — the same discipline as `caa_id = -1`
-    /// and `artwork_url = ''` in the backfills.
+    // Whether the lookup above has been *attempted*. A track nobody has a
+    // cover for must not be re-asked on every poll of every widget, so a
+    // resolved `None` is a tombstone — the same discipline as `caa_id = -1`
+    // and `artwork_url = ''` in the backfills.
     #[serde(skip)]
     pub artwork_resolved: bool,
-    /// Whether a real listen for this track has been submitted.
-    ///
-    /// Off the wire — it says nothing about what is playing, only about what we
-    /// have already banked. It exists to tell a **skip** from a track that
-    /// simply finished: a client that scrobbles at end-of-track sends the
-    /// listen and *then* announces the next one, so without this every
-    /// completed track would look abandoned the moment its successor arrived.
+    // Whether a real listen for this track has been submitted.
+    //
+    // Off the wire — it says nothing about what is playing, only about what we
+    // have already banked. It exists to tell a **skip** from a track that
+    // simply finished: a client that scrobbles at end-of-track sends the
+    // listen and *then* announces the next one, so without this every
+    // completed track would look abandoned the moment its successor arrived.
     #[serde(skip)]
     pub banked: bool,
 }
@@ -478,7 +478,39 @@ impl NowPlayingRegistry {
     }
 }
 
-/// GET /api/v1/now-playing → `{ playing, track?, position? }`
+/// Never persisted. Held in memory only, so a restart correctly shows an empty
+/// deck until a source reports again.
+#[derive(Serialize, utoipa::ToSchema)]
+#[schema(as = NowPlaying)]
+pub struct NowPlayingResponse {
+    pub playing: bool,
+    /// Seconds into the track, extrapolated to now. Absent when nothing is
+    /// playing. Read `track.position_known` before presenting this as a
+    /// readout — for a source with no playhead it is the server's own
+    /// wall-clock arithmetic, not a measurement.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub position: Option<u64>,
+    /// Absent when nothing is playing.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub track: Option<NowPlaying>,
+}
+
+/// What is on the deck.
+///
+/// Scope: `read`. In-memory only. Entries expire on read — past `duration`
+/// + 10s, or after 10 minutes when the source reported no duration.
+#[utoipa::path(
+    get,
+    path = "/api/v1/now-playing",
+    tag = "Listens",
+    security(("apiToken" = ["read"]), ("sessionCookie" = [])),
+    responses(
+        (status = 200, description = "OK — `playing: false` when the deck is empty.",
+            body = NowPlayingResponse),
+        (status = 401, response = crate::openapi::Unauthorized),
+        (status = 403, response = crate::openapi::Forbidden),
+    )
+)]
 pub async fn now_playing(
     State(state): State<Arc<AppState>>,
     ReadAuth { user }: ReadAuth,
@@ -486,16 +518,24 @@ pub async fn now_playing(
     match state.now_playing.get(user.user_id) {
         Some((track, position)) => (
             StatusCode::OK,
-            Json(serde_json::json!({
-                "playing": true,
-                "position": position,
-                "track": track,
-            })),
+            Json(NowPlayingResponse {
+                playing: true,
+                position: Some(position),
+                track: Some(track),
+            }),
         )
             .into_response(),
-        None => (StatusCode::OK, Json(serde_json::json!({ "playing": false }))).into_response(),
+        None => (
+            StatusCode::OK,
+            Json(NowPlayingResponse { playing: false, position: None, track: None }),
+        )
+            .into_response(),
     }
 }
+
+#[derive(utoipa::OpenApi)]
+#[openapi(paths(now_playing))]
+pub struct Api;
 
 pub fn create_now_playing_router() -> Router<Arc<AppState>> {
     Router::new().route("/api/v1/now-playing", get(now_playing))

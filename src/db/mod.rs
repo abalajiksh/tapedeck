@@ -19,83 +19,149 @@ use std::sync::Arc;
 use std::time::Duration;
 use tracing::{debug, error, info, warn};
 
-#[derive(Debug, FromRow, serde::Serialize)]
+/// A stored listen. The quality columns are **flat**, not nested under a
+/// `quality` object — the frontend reads them raw so its own `qualityLabel()`
+/// produces the same tag everywhere, and a server-side copy of that logic
+/// would drift.
+///
+/// The audio fields are null for most of any real history: they are only ever
+/// written by ingest and the session-shaped sources, so an imported listen
+/// carries none of them. Any share computed over them is a share of *that*
+/// population, not of the listening.
+#[derive(Debug, FromRow, serde::Serialize, utoipa::ToSchema)]
+#[schema(as = Listen)]
 pub struct ScrobbleRecord {
     pub id: i64,
     pub user_id: i64,
     pub title: String,
+    /// The primary artist. Everyone credited lives in `scrobble_artists` and is
+    /// what the artist pages and charts aggregate over, so a listen crediting a
+    /// soloist appears under both names there while this field still names the
+    /// one the record is filed under.
     pub artist: String,
     pub album: Option<String>,
+    /// Unix seconds, UTC, **start** of play.
     pub timestamp: i64,
+    /// Seconds.
     pub duration: Option<i64>,
+    /// Dedup key. Unique per user per play.
     pub source_id: String,
+    /// `Plex`, `Jellyfin`, `Navidrome`, `ingest:<client>`, `Import`…
     pub source_name: String,
+    /// `pending` is queued for forwarding, `synced` has been forwarded, and
+    /// `imported` is stored only and will never be forwarded. Both an import
+    /// and a skip land as `imported` — forwarding either would put a wrong
+    /// scrobble on a permanent public record.
+    ///
+    /// There is no `sent` and no `failed`. A delivery that fails stays
+    /// `pending` and is retried, and which sinks it has already reached is in
+    /// `delivered_sinks` — that is what stops a partial failure
+    /// double-scrobbling.
     pub status: String,
     pub mbid_recording: Option<String>,
     pub mbid_release: Option<String>,
+    /// A **JSON-encoded array**, not an array — the column stores what was
+    /// written to it. Parse it before use.
     pub mbid_artist: Option<String>,
+    /// The release group, which is what relates a reissue, a remaster and a
+    /// regional edition to one another. Filled from a submitting client's
+    /// `additional_info`, a ListenBrainz export's `mbid_mapping`, or a
+    /// Jellyfin/Emby session — never by a lookup.
     pub mbid_release_group: Option<String>,
+    /// The track *on a particular release*, as distinct from the recording:
+    /// the same recording is a different release-track on an album, a single
+    /// and a compilation. Only a tagging client ever knows it.
     pub mbid_release_track: Option<String>,
+    /// The composition rather than a performance of it — the identifier that
+    /// relates every recording of one piece. Only a tagging client ever knows
+    /// it.
     pub mbid_work: Option<String>,
-    /// JSON array, like `mbid_artist`.
+    /// A **JSON-encoded array**, like `mbid_artist`. Whoever the *record* is
+    /// credited to, which on a compilation or a soundtrack is not the
+    /// performer of the track.
     pub mbid_album_artist: Option<String>,
+    /// Cover Art Archive id. **`-1` is a tombstone** meaning "asked, no artwork
+    /// exists" — treat any non-positive value as no artwork.
     pub caa_id: Option<i64>,
     pub caa_release_mbid: Option<String>,
     pub isrc: Option<String>,
+    /// `pcm`, `dsd`, `mqa`.
     pub format_type: Option<String>,
     pub codec: Option<String>,
+    /// kbps.
     pub bitrate: Option<i32>,
+    /// Hz.
     pub sample_rate: Option<i32>,
     pub bit_depth: Option<i32>,
     pub channels: Option<i32>,
     pub container: Option<String>,
     pub source_quality: Option<String>,
     pub is_lossless: Option<bool>,
+    /// Hz.
     pub dsd_rate: Option<i64>,
     pub dsd_multiplier: Option<i32>,
     pub dsd_to_pcm_converted: Option<bool>,
+    /// Set only on a genuine transcode.
     pub delivery_codec: Option<String>,
+    /// kbps.
     pub delivery_bitrate: Option<i32>,
+    /// Hz.
     pub delivery_sample_rate: Option<i32>,
     pub delivery_bit_depth: Option<i32>,
     pub is_transcoded: Option<bool>,
     pub transcode_reason: Option<String>,
+    /// 0–100, computed once at ingest and never recomputed. Null for anything
+    /// imported, so an average over it has the same narrow population as the
+    /// audio fields.
     pub quality_score: Option<f64>,
     pub device_id: Option<i64>,
+    /// The resolved signal chain.
     pub chain_id: Option<i64>,
-    /// Which setup of that chain was fitted. Exposed so the History edit dialog
-    /// can preselect it — without this the picker could offer setups but never
-    /// show which one a listen is already on, and every edit would silently
-    /// look like a change.
+    /// Which setup of that chain was fitted.
+    // Exposed so the History edit dialog can preselect it — without this the
+    // picker could offer setups but never show which one a listen is already
+    // on, and every edit would silently look like a change.
     pub chain_variant_id: Option<i64>,
     pub session_id: Option<i64>,
+    /// From the resolved chain.
     pub listening_context: Option<String>,
     pub submission_client: Option<String>,
     pub track_number: Option<i32>,
+    /// Empty string is a tombstone, same idea as `caa_id: -1`.
     pub artwork_url: Option<String>,
+    /// The `user_sources` row this was polled from.
     pub source_ref: Option<i64>,
-    /// How much of the track was actually heard, in milliseconds, paused time
-    /// excluded. Only a pushing client can report this, so it is null for
-    /// everything polled and everything imported.
+    /// Milliseconds actually heard, paused time excluded. Only a pushing
+    /// client can report this, so it is null for everything polled and
+    /// everything imported. What `skipped` cannot express — "cut short three
+    /// seconds in" and "cut short with thirty seconds left" are opposite
+    /// behaviours.
     pub listened_ms: Option<i64>,
-    /// Whether shuffle chose this track rather than the listener.
+    /// Shuffle chose this, not the listener.
     pub is_shuffle: Option<bool>,
-    /// What it was played from, in the client's own words.
+    /// What it played from, in the client's own words.
     pub queue_source: Option<String>,
-    /// Who this was heard with, or null for not marked.
+    /// Who this was heard with, as names. Filled automatically for a listen
+    /// that happened inside a Shared Spool, and by hand via
+    /// `POST /api/v1/scrobbles/bulk-company` otherwise.
     ///
-    /// **Null is "unmarked", not "alone"** — most of any history predates this
-    /// existing. A count of marked listens is exact; a *share* of listening
-    /// that was social is not, and anything presenting one has to say so.
+    /// **`null` means unmarked, not alone.** Nobody recorded who was there —
+    /// which is true of every listen predating the field. Counting marked
+    /// listens is exact; reporting a *share* of listening that was solitary is
+    /// not, and would be a fact about how much has been marked.
     pub company: Option<String>,
-    /// The Shared Spool this listen belonged to, if any.
+    /// The Shared Spool this listen belonged to, as the spool's uuid. A joint
+    /// listen is N rows across N decks sharing this — never one row with
+    /// several owners. Only a sitting ever sets it.
     pub joint_session_id: Option<String>,
+    /// JSON array of the sinks this has already reached, so a retry only hits
+    /// the ones that have not. A string, not an array.
     #[serde(default)]
     pub delivered_sinks: Option<String>,
 }
 
 /// A deck on this instance that plays a given artist.
-#[derive(Debug, FromRow, serde::Serialize)]
+#[derive(Debug, FromRow, serde::Serialize, utoipa::ToSchema)]
 pub struct ArtistDeck {
     pub user_id: i64,
     pub username: String,
@@ -119,7 +185,7 @@ pub struct DeckPeer {
 }
 
 /// A sitting somebody handed you, as it appears in the inbox.
-#[derive(Debug, FromRow, serde::Serialize)]
+#[derive(Debug, FromRow, serde::Serialize, utoipa::ToSchema)]
 pub struct HandedSitting {
     pub uuid: String,
     pub session_uuid: String,
@@ -152,12 +218,12 @@ pub enum Visible {
 }
 
 /// One sitting **you** passed on, for the sender's own list.
-///
-/// A separate type from [`HandedSitting`] rather than a nullable-both-ways
-/// version of it: the recipient's row is about who sent it, this one is about
-/// who got it, and a struct carrying `from_*` and `to_*` with one half always
-/// null is how a reader ends up showing the wrong name.
-#[derive(Debug, FromRow, serde::Serialize)]
+//
+// A separate type from [`HandedSitting`] rather than a nullable-both-ways
+// version of it: the recipient's row is about who sent it, this one is about
+// who got it, and a struct carrying `from_*` and `to_*` with one half always
+// null is how a reader ends up showing the wrong name.
+#[derive(Debug, FromRow, serde::Serialize, utoipa::ToSchema)]
 pub struct SentSitting {
     pub uuid: String,
     pub session_uuid: String,
@@ -175,9 +241,9 @@ pub struct SentSitting {
 }
 
 /// One listen inside a handed-over sitting. **Not a listen of the reader's** —
-/// this enters no history, count or chart, which is why it is its own type
-/// rather than a `ScrobbleRecord`.
-#[derive(Debug, FromRow, serde::Serialize)]
+/// this enters no history, count or chart.
+// Which is why it is its own type rather than a `ScrobbleRecord`.
+#[derive(Debug, FromRow, serde::Serialize, utoipa::ToSchema)]
 pub struct HandedListen {
     pub title: String,
     pub artist: String,
@@ -191,7 +257,7 @@ pub struct HandedListen {
 }
 
 /// The document a hand-over renders to.
-#[derive(Debug, serde::Serialize)]
+#[derive(Debug, serde::Serialize, utoipa::ToSchema)]
 pub struct HandedSittingDetail {
     pub uuid: String,
     pub note: Option<String>,
@@ -238,21 +304,29 @@ pub struct TrackByPlays {
     pub source_id: String,
 }
 
-#[derive(Debug, FromRow, serde::Serialize)]
+/// An output device, and the chain it maps to — rung 2 of the chain ladder.
+#[derive(Debug, FromRow, serde::Serialize, utoipa::ToSchema)]
+#[schema(as = Binding)]
 pub struct BindingRow {
     pub id: i64,
     pub user_id: i64,
+    /// The output device, as a client reports it in `tapedeck_device.output_device`.
     pub identifier: String,
     pub interface: Option<String>,
+    /// Null for one seen but not mapped yet — offered for one-tap assignment.
     pub chain_id: Option<i64>,
+    /// Unix seconds.
     pub last_seen: i64,
+    /// Listens that reported it.
     pub hits: i64,
 }
 
 /// Something a note or a love can point at: a recording, a release, an artist.
-#[derive(Debug, Clone, FromRow, serde::Serialize)]
+#[derive(Debug, Clone, FromRow, serde::Serialize, utoipa::ToSchema)]
+#[schema(as = Entity)]
 pub struct EntityRow {
     pub id: i64,
+    /// `recording`, `release` or `artist`.
     pub kind: String,
     pub name: String,
     /// Empty for `kind = 'artist'`, where the name *is* the artist.
@@ -307,7 +381,7 @@ pub struct ArtistSummary {
 /// One distinct track. The quality columns are carried raw so the frontend's
 /// existing `qualityLabel()` produces the same tag it does on a history row —
 /// duplicating that logic server-side would let the two drift.
-#[derive(Debug, FromRow, serde::Serialize)]
+#[derive(Debug, FromRow, serde::Serialize, utoipa::ToSchema)]
 pub struct TrackAggregate {
     pub title: String,
     pub plays: i64,
@@ -324,20 +398,21 @@ pub struct TrackAggregate {
     pub is_lossless: Option<bool>,
 }
 
-#[derive(Debug, FromRow, serde::Serialize)]
+#[derive(Debug, FromRow, serde::Serialize, utoipa::ToSchema)]
 pub struct AlbumAggregate {
     pub name: String,
     pub plays: i64,
     pub year: Option<i32>,
-    /// Filled from `cover_pick` after the query, never selected directly —
-    /// see [`COVER_PICK`] for why the three must come from one listen.
+    /// A cover, from one of the listens counted.
+    // Filled from `cover_pick` after the query, never selected directly —
+    // see [`COVER_PICK`] for why the three must come from one listen.
     #[sqlx(default)]
     pub artwork_url: Option<String>,
     #[sqlx(default)]
     pub caa_id: Option<i64>,
     #[sqlx(default)]
     pub caa_release_mbid: Option<String>,
-    /// The packed pick, unpacked by `resolve_cover` before the row is served.
+    // The packed pick, unpacked by `resolve_cover` before the row is served.
     #[serde(skip)]
     #[sqlx(default)]
     pub cover_pick: Option<String>,
@@ -546,35 +621,39 @@ pub struct ImportHistoryRow {
 ///
 /// Same shape whichever list produced it, so the page renders one row type and
 /// the reason lives on the list rather than the item.
-#[derive(Debug, Clone, sqlx::FromRow, serde::Serialize)]
+#[derive(Debug, Clone, sqlx::FromRow, serde::Serialize, utoipa::ToSchema)]
 pub struct RediscoveryRow {
     pub name: String,
     pub artist: String,
     pub album: Option<String>,
     pub plays: i64,
+    /// Unix seconds; null when never played (a loved or shelved item).
     pub last_played: Option<i64>,
-    /// Filled from `cover_pick` after the query, never selected directly —
-    /// see [`COVER_PICK`] for why the three must come from one listen.
+    /// A cover, from one of the listens counted. See `caa_id` on `Listen` for
+    /// the tombstones.
+    // Filled from `cover_pick` after the query, never selected directly —
+    // see [`COVER_PICK`] for why the three must come from one listen.
     #[sqlx(default)]
     pub artwork_url: Option<String>,
     #[sqlx(default)]
     pub caa_id: Option<i64>,
     #[sqlx(default)]
     pub caa_release_mbid: Option<String>,
-    /// The packed pick, unpacked by `resolve_cover` before the row is served.
+    // The packed pick, unpacked by `resolve_cover` before the row is served.
     #[serde(skip)]
     #[sqlx(default)]
     pub cover_pick: Option<String>,
 }
 
-/// A record or tape you own.
-///
-/// Distinct from an `entity`, which is a work you have listened to: this is an
-/// *object* with a pressing, a barcode and a side order. Two pressings of the
-/// same album are two of these and one entity.
-#[derive(Debug, Clone, sqlx::FromRow, serde::Serialize)]
+/// A record, tape or disc you own — an *object* with a pressing, a barcode and
+/// a side order. Two pressings of the same album are two of these.
+//
+// Distinct from an `entity`, which is a work you have listened to.
+#[derive(Debug, Clone, sqlx::FromRow, serde::Serialize, utoipa::ToSchema)]
+#[schema(as = ShelfItem)]
 pub struct PhysicalRelease {
     pub id: i64,
+    /// `vinyl`, `cassette`, `cd` or `sacd`.
     pub kind: String,
     pub artist: String,
     pub title: String,
@@ -584,8 +663,11 @@ pub struct PhysicalRelease {
     pub barcode: Option<String>,
     pub catalog_number: Option<String>,
     pub artwork_url: Option<String>,
-    /// JSON array of `{side, position, title, duration_secs}`, served through
-    /// as-is — the browser is the only thing that reads its shape.
+    /// The tracklist, **as a JSON-encoded string** of an array of tracks
+    /// (`side`, `position`, `title`, `artist`, `duration_secs`, `disc`).
+    //
+    // Served through as-is — the browser is the only thing that reads its
+    // shape.
     pub tracks: String,
     pub notes: Option<String>,
     pub added_at: i64,
@@ -620,14 +702,13 @@ pub struct PhysicalRelease {
     /// Sleeves, booklet pages and labels held for this pressing. Derived the
     /// same way, so a card can say "29 scans" without a second request.
     pub image_count: i64,
-    /// The front sleeve, when this pressing has one — so a shelf card wears the
-    /// cover of the object rather than a lettered tile.
-    ///
-    /// `artwork_url` is what the *lookup* returned, and it is frequently empty:
-    /// Discogs and MusicBrainz both answer plenty of releases without one, and
-    /// nothing back-fills it. Meanwhile the add already pulls the Cover Art
-    /// Archive into `physical_images`, so the sleeve was sitting one table away
-    /// the whole time and the card was drawing a letter over it.
+    /// The front sleeve from this pressing's own scans, when it has one.
+    /// `artwork_url` is only what the lookup returned, and is often empty.
+    //
+    // Discogs and MusicBrainz both answer plenty of releases without one, and
+    // nothing back-fills it. Meanwhile the add already pulls the Cover Art
+    // Archive into `physical_images`, so the sleeve was sitting one table away
+    // the whole time and the card was drawing a letter over it.
     pub cover_thumb: Option<String>,
 }
 
@@ -653,8 +734,9 @@ pub struct PhysicalPlayRow {
 
 /// One side of a pressing, and what it has been through.
 ///
-/// Every field is derived from `physical_plays` on read — see `side_plays`.
-#[derive(Debug, Clone, sqlx::FromRow, serde::Serialize)]
+/// Every field is derived from the plays on read.
+#[derive(Debug, Clone, sqlx::FromRow, serde::Serialize, utoipa::ToSchema)]
+#[schema(as = SidePlayed)]
 pub struct SidePlays {
     /// As it was recorded: "A", "B", or a disc number.
     pub side: String,
@@ -720,9 +802,9 @@ pub struct PhysicalImage {
     pub added_at: i64,
 }
 
-/// One source's liveness, with nothing secret in it — see
-/// [`Database::source_health`].
-#[derive(Debug, Clone, serde::Serialize, sqlx::FromRow)]
+/// One source's liveness, with nothing secret in it.
+// See [`Database::source_health`].
+#[derive(Debug, Clone, serde::Serialize, sqlx::FromRow, utoipa::ToSchema)]
 pub struct SourceHealth {
     pub id: i64,
     pub user_id: i64,
@@ -948,7 +1030,7 @@ pub struct Database {
 /// Three of these four fields exist because a timestamp edit has consequences
 /// this application cannot reach, and saying so is the whole difference
 /// between a correction and a quiet inconsistency.
-#[derive(Debug, Default, serde::Serialize)]
+#[derive(Debug, Default, serde::Serialize, utoipa::ToSchema)]
 pub struct TimeEdit {
     /// Listens whose timestamp moved.
     pub moved: i64,
@@ -1784,7 +1866,7 @@ struct ActorRow {
 /// cannot drift into describing a person differently. `uuid` and `state` are
 /// null for a deck nobody has asked about yet, which is what tells "not
 /// patched" apart from "asked and waiting".
-#[derive(Debug, FromRow, serde::Serialize)]
+#[derive(Debug, FromRow, serde::Serialize, utoipa::ToSchema)]
 pub struct PatchPeer {
     /// The patch's own id, `None` when no edge exists yet.
     pub uuid: Option<String>,
@@ -1813,13 +1895,13 @@ pub struct PatchPeer {
 }
 
 /// A listen on somebody else's deck, reaching this user through a patch.
-///
-/// Deliberately **not** `ScrobbleRecord`. That type is the shape of the
-/// caller's own history and carries things nobody else is entitled to — the
-/// source id, the delivery state, the chain id, the session. This one carries
-/// what a Reel row draws and nothing more, so a field cannot leak by being
-/// added to a struct somebody else also serialises.
-#[derive(Debug, FromRow, serde::Serialize)]
+//
+// Deliberately **not** `ScrobbleRecord`. That type is the shape of the
+// caller's own history and carries things nobody else is entitled to — the
+// source id, the delivery state, the chain id, the session. This one carries
+// what a Reel row draws and nothing more, so a field cannot leak by being
+// added to a struct somebody else also serialises.
+#[derive(Debug, FromRow, serde::Serialize, utoipa::ToSchema)]
 pub struct ReelListen {
     pub id: i64,
     pub timestamp: i64,
@@ -1842,21 +1924,21 @@ pub struct ReelListen {
     pub avatar_url: Option<String>,
     /// This deck's actor URI, or null when they have not switched federation
     /// on.
-    ///
-    /// The **handle is derived from this**, never from today's origin — the bug
-    /// v0.78.0 found on the settings page, where a handle built from the
-    /// current host sat beside a stored actor that disagreed with it, and the
-    /// larger of the two was the one that did not work. A deck with no actor
-    /// has no published address, and the row shows none rather than inventing
-    /// one that resolves nowhere.
+    //
+    // The **handle is derived from this**, never from today's origin — the bug
+    // v0.78.0 found on the settings page, where a handle built from the
+    // current host sat beside a stored actor that disagreed with it, and the
+    // larger of the two was the one that did not work. A deck with no actor
+    // has no published address, and the row shows none rather than inventing
+    // one that resolves nowhere.
     pub actor_uri: Option<String>,
     /// The chain, **when its owner shares it**.
-    ///
-    /// `None` has two meanings and the row must not conflate them, which is
-    /// what `has_chain` is for: a chain kept private reads *"Private signal
-    /// chain"*, and a listen that ran through no chain at all says nothing.
-    /// Before 2026-08-26 this was a non-`Option` `String`, because the chain
-    /// *was* the gate and a row could not exist without one.
+    //
+    // `None` has two meanings and the row must not conflate them, which is
+    // what `has_chain` is for: a chain kept private reads *"Private signal
+    // chain"*, and a listen that ran through no chain at all says nothing.
+    // Before 2026-08-26 this was a non-`Option` `String`, because the chain
+    // *was* the gate and a row could not exist without one.
     pub chain_name: Option<String>,
     pub chain_icon: Option<String>,
     pub chain_components: Option<String>,
@@ -1865,7 +1947,7 @@ pub struct ReelListen {
 }
 
 /// An artist seen across the decks a user is patched into.
-#[derive(Debug, FromRow, serde::Serialize)]
+#[derive(Debug, FromRow, serde::Serialize, utoipa::ToSchema)]
 pub struct PatchArtist {
     pub name: String,
     pub plays: i64,
@@ -1881,15 +1963,15 @@ pub struct PatchArtist {
     /// *which artists* rather than as a similarity score: a score invites a
     /// ranking of people, which is not what this is for.
     pub mine: i64,
-    /// The artist's own tags, from `artists.genres` — the same cache the genre
-    /// map reads, so this costs no lookup. Absent for anyone MusicBrainz has
-    /// not tagged, which is a normal state and draws nothing rather than a
-    /// placeholder.
+    /// The artist's own tags. Absent for anyone MusicBrainz has not tagged,
+    /// which is a normal state.
+    // From `artists.genres` — the same cache the genre map reads, so this
+    // costs no lookup. Draws nothing rather than a placeholder.
     pub genre: Option<String>,
 }
 
 /// One chain a deck publishes.
-#[derive(Debug, FromRow, serde::Serialize)]
+#[derive(Debug, FromRow, serde::Serialize, utoipa::ToSchema)]
 pub struct DeckChain {
     pub name: String,
     pub icon: Option<String>,
@@ -1898,7 +1980,7 @@ pub struct DeckChain {
 }
 
 /// Somebody else's deck, as the person patched into it may see it.
-#[derive(Debug, serde::Serialize)]
+#[derive(Debug, serde::Serialize, utoipa::ToSchema)]
 pub struct DeckView {
     pub user_id: i64,
     pub username: String,
@@ -1920,7 +2002,7 @@ pub struct DeckView {
 }
 
 /// A deck on the instance, with what the viewer has in common with it.
-#[derive(Debug, FromRow, serde::Serialize)]
+#[derive(Debug, FromRow, serde::Serialize, utoipa::ToSchema)]
 pub struct DiscoverDeck {
     pub user_id: i64,
     pub username: String,
@@ -1937,7 +2019,7 @@ pub struct DiscoverDeck {
     pub overlap: String,
 }
 
-#[derive(Debug, serde::Serialize)]
+#[derive(Debug, serde::Serialize, utoipa::ToSchema)]
 pub struct ChainTally {
     pub name: String,
     pub plays: i64,
@@ -1946,14 +2028,14 @@ pub struct ChainTally {
 /// One listen's contribution to a day's hours. Sent as raw timestamps rather
 /// than pre-bucketed, because the day boundary belongs to the *reader's*
 /// timezone and the server does not know it here.
-#[derive(Debug, serde::Serialize)]
+#[derive(Debug, serde::Serialize, utoipa::ToSchema)]
 pub struct DailyHour {
     pub at: i64,
     pub hours: f64,
 }
 
 /// What the instance has been playing, over shared chains only.
-#[derive(Debug, serde::Serialize)]
+#[derive(Debug, serde::Serialize, utoipa::ToSchema)]
 pub struct InstancePulse {
     pub decks: i64,
     /// How many of them publish at least one chain.
@@ -1961,9 +2043,9 @@ pub struct InstancePulse {
     pub shared_chains: i64,
     pub listens: i64,
     pub hours: f64,
-    /// Distinct artists heard across shared chains in the window. **Not
-    /// `artists.len()`** — that list is cut to the top 8 for the panel, so
-    /// counting it would report 8 forever.
+    /// Distinct artists heard across shared chains in the window — not the
+    /// length of `artists`, which is cut to the top eight.
+    // Counting `artists.len()` would report 8 forever.
     pub artists_heard: i64,
     pub artists: Vec<PatchArtist>,
     pub chains: Vec<ChainTally>,
@@ -1971,7 +2053,7 @@ pub struct InstancePulse {
 }
 
 /// The admin Operations panel. Only what is actually recorded.
-#[derive(Debug, serde::Serialize)]
+#[derive(Debug, serde::Serialize, utoipa::ToSchema)]
 pub struct FederationOps {
     pub identities: i64,
     pub published: i64,
@@ -1982,7 +2064,7 @@ pub struct FederationOps {
 }
 
 /// A record somebody handed you.
-#[derive(Debug, FromRow, serde::Serialize)]
+#[derive(Debug, FromRow, serde::Serialize, utoipa::ToSchema)]
 pub struct Dub {
     pub id: i64,
     pub kind: String,
@@ -1996,7 +2078,7 @@ pub struct Dub {
     pub from_display_name: Option<String>,
 }
 
-#[derive(Debug, FromRow, serde::Serialize)]
+#[derive(Debug, FromRow, serde::Serialize, utoipa::ToSchema)]
 pub struct SpoolMember {
     pub user_id: i64,
     pub username: String,
@@ -2013,12 +2095,12 @@ pub struct SpoolMember {
 }
 
 /// One sitting on the history list.
-///
-/// Deliberately not [`SpoolView`]: that type answers *what is happening now*
-/// and carries a full roster and the caller's own membership state, where this
-/// answers *what happened* and has to stay cheap across a page of them. The
-/// same call [`SentSitting`] makes against [`HandedSitting`].
-#[derive(Debug, serde::Serialize)]
+//
+// Deliberately not [`SpoolView`]: that type answers *what is happening now*
+// and carries a full roster and the caller's own membership state, where this
+// answers *what happened* and has to stay cheap across a page of them. The
+// same call [`SentSitting`] makes against [`HandedSitting`].
+#[derive(Debug, serde::Serialize, utoipa::ToSchema)]
 pub struct SpoolSummary {
     pub uuid: String,
     pub title: Option<String>,
@@ -2029,12 +2111,12 @@ pub struct SpoolSummary {
     pub host_username: String,
     pub host_display_name: Option<String>,
     /// Who else was actually in the room — the caller is left out here.
-    ///
-    /// [`SpoolDetail`] keeps everybody and hands over a `viewer_id`, because a
-    /// page listing attendance has to be able to show you your own row. A
-    /// summary has one use, which is the sentence "with Noor and Tobias", and
-    /// giving it a roster plus an id to subtract would be handing every caller
-    /// the same small filter to get wrong.
+    //
+    // [`SpoolDetail`] keeps everybody and hands over a `viewer_id`, because a
+    // page listing attendance has to be able to show you your own row. A
+    // summary has one use, which is the sentence "with Noor and Tobias", and
+    // giving it a roster plus an id to subtract would be handing every caller
+    // the same small filter to get wrong.
     pub present: Vec<String>,
     /// Names with no account on this instance.
     pub guests: Vec<String>,
@@ -2049,7 +2131,7 @@ pub struct SpoolSummary {
 /// **This is the first row type in the application that mixes several people's
 /// listening into one sequence.** Everything else — the Reel included — keeps
 /// one deck per row.
-#[derive(Debug, serde::Serialize)]
+#[derive(Debug, serde::Serialize, utoipa::ToSchema)]
 pub struct SpoolPlay {
     pub title: String,
     pub artist: String,
@@ -2077,17 +2159,17 @@ pub struct SpoolPlay {
 /// until now ending one simply stopped it. These are the figures that make the
 /// stop a summary — and every one of them is folded out of the timeline that
 /// was already built, so the page costs no more to draw than it did.
-#[derive(Debug, Default, serde::Serialize)]
+#[derive(Debug, Default, serde::Serialize, utoipa::ToSchema)]
 pub struct SpoolFigures {
     /// Plays on the timeline. The same count the history list shows, so the two
     /// screens cannot disagree about how long an evening was.
     pub plays: i64,
     /// Running time of the plays that reported one, and **how many did**.
-    ///
-    /// Both travel or neither does. A source that reported no length
-    /// contributes nothing, so this is a floor — the confession `total_hours`
-    /// already makes on the dashboard, in a place where an evening's length is
-    /// the headline rather than a detail.
+    //
+    // Both travel or neither does. A source that reported no length
+    // contributes nothing, so this is a floor — the confession `total_hours`
+    // already makes on the dashboard, in a place where an evening's length is
+    // the headline rather than a detail.
     pub seconds: i64,
     pub duration_known: i64,
     pub artists: i64,
@@ -2102,7 +2184,7 @@ pub struct SpoolFigures {
 }
 
 /// A sitting, in full.
-#[derive(Debug, serde::Serialize)]
+#[derive(Debug, serde::Serialize, utoipa::ToSchema)]
 pub struct SpoolDetail {
     pub uuid: String,
     pub viewer_id: i64,
@@ -2118,18 +2200,18 @@ pub struct SpoolDetail {
     pub plays: Vec<SpoolPlay>,
     /// Plays that happened in this sitting and are not on the timeline, because
     /// they ran through chains their owner does not share.
-    ///
-    /// **Counted and stated rather than silently dropped.** A document with
-    /// invisible holes misrepresents the evening and the reader could never
-    /// tell — the rule `handed_sitting` already carries, in the one other place
-    /// this application shows somebody an evening.
+    //
+    // **Counted and stated rather than silently dropped.** A document with
+    // invisible holes misrepresents the evening and the reader could never
+    // tell — the rule `handed_sitting` already carries, in the one other place
+    // this application shows somebody an evening.
     pub withheld: i64,
     /// What the evening came to, folded out of `plays`.
     pub figures: SpoolFigures,
 }
 
 /// A sitting several people are in at once.
-#[derive(Debug, serde::Serialize)]
+#[derive(Debug, serde::Serialize, utoipa::ToSchema)]
 pub struct SpoolView {
     pub uuid: String,
     /// Who is asking. The members list includes the caller, and a screen saying
@@ -2157,11 +2239,11 @@ pub struct SpoolView {
 }
 
 /// A play from somebody else's deck, waiting to be accepted.
-///
-/// **Not a listen.** It enters no history, no count and no chart until its
-/// owner says yes — which is why it lives in its own table rather than in
-/// `scrobbles` behind a flag.
-#[derive(Debug, FromRow, serde::Serialize)]
+//
+// **Not a listen.** It enters no history, no count and no chart until its
+// owner says yes — which is why it lives in its own table rather than in
+// `scrobbles` behind a flag.
+#[derive(Debug, FromRow, serde::Serialize, utoipa::ToSchema)]
 pub struct SpoolCapture {
     pub id: i64,
     pub title: String,
@@ -2192,13 +2274,17 @@ pub struct RemoteActor {
     pub fetched_at: i64,
 }
 
-#[derive(Debug, FromRow, serde::Serialize)]
+/// An account, as an admin sees it in the user list.
+#[derive(Debug, FromRow, serde::Serialize, utoipa::ToSchema)]
 pub struct UserRecord {
     pub id: i64,
     pub username: String,
     pub display_name: Option<String>,
+    /// `admin` or `user`.
     pub role: String,
+    /// Unix seconds.
     pub created_at: i64,
+    /// Blocked from signing in; nothing is deleted.
     pub disabled: bool,
 }
 
@@ -2221,7 +2307,7 @@ pub struct UserProfile {
 
 /// One row of a chart. `sub` is the secondary line — an album's or track's
 /// artist — and is null for an artist chart, where the name says it all.
-#[derive(Debug, FromRow, serde::Serialize)]
+#[derive(Debug, FromRow, serde::Serialize, utoipa::ToSchema)]
 pub struct ChartRow {
     pub name: String,
     pub sub: Option<String>,
@@ -2230,15 +2316,16 @@ pub struct ChartRow {
     pub album: Option<String>,
     pub plays: i64,
     pub seconds: i64,
-    /// Filled from `cover_pick` after the query, never selected directly —
-    /// see [`COVER_PICK`] for why the three must come from one listen.
+    /// A cover, from one of the listens counted.
+    // Filled from `cover_pick` after the query, never selected directly —
+    // see [`COVER_PICK`] for why the three must come from one listen.
     #[sqlx(default)]
     pub artwork_url: Option<String>,
     #[sqlx(default)]
     pub caa_id: Option<i64>,
     #[sqlx(default)]
     pub caa_release_mbid: Option<String>,
-    /// The packed pick, unpacked by `resolve_cover` before the row is served.
+    // The packed pick, unpacked by `resolve_cover` before the row is served.
     #[serde(skip)]
     #[sqlx(default)]
     pub cover_pick: Option<String>,
@@ -2257,14 +2344,14 @@ pub struct BioRow {
 }
 
 /// One release an album's listens claim to be, and how many say so.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, utoipa::ToSchema)]
 pub struct ReleaseCandidate {
     pub mbid: String,
     pub plays: i64,
 }
 
 /// An album whose listens disagree about which release they belong to.
-#[derive(Debug, serde::Serialize)]
+#[derive(Debug, serde::Serialize, utoipa::ToSchema)]
 pub struct MixedAlbum {
     pub artist: String,
     pub album: String,
@@ -2284,7 +2371,7 @@ pub struct MixedAlbum {
 
 /// An artist string carrying a featured credit, and the primary artist it would
 /// fold into.
-#[derive(Debug, serde::Serialize)]
+#[derive(Debug, serde::Serialize, utoipa::ToSchema)]
 pub struct FeaturedArtist {
     pub artist: String,
     pub primary: String,
@@ -2292,9 +2379,10 @@ pub struct FeaturedArtist {
 }
 
 /// One track carrying two different artists on the same record.
-#[derive(Debug, serde::Serialize)]
+#[derive(Debug, serde::Serialize, utoipa::ToSchema)]
 pub struct SplitAttribution {
-    /// Lowercased grouping keys — the same normalisation the query grouped on.
+    /// Lowercased grouping keys.
+    // The same normalisation the query grouped on.
     pub title: String,
     pub album: String,
     /// The record's own artist, and what everything else folds into.
@@ -2312,7 +2400,7 @@ pub struct SplitAttribution {
 }
 
 /// An artist name with other spellings of itself in the same history.
-#[derive(Debug, serde::Serialize)]
+#[derive(Debug, serde::Serialize, utoipa::ToSchema)]
 pub struct VariantArtist {
     /// The most-played spelling — the one the others fold into.
     pub primary: String,
@@ -2333,18 +2421,22 @@ pub struct VariantArtist {
 /// `chain_name` / `device_name` / `token_name` are joined so a list of sessions
 /// renders without a request per row. `title` is a user label; when it's null
 /// the UI derives one from the span.
-#[derive(Debug, FromRow, serde::Serialize)]
+#[derive(Debug, FromRow, serde::Serialize, utoipa::ToSchema)]
 pub struct SessionRow {
     pub id: i64,
     /// Stable across merges and splits, and the id a shared session will carry.
     pub uuid: Option<String>,
+    /// Your name for it; null means the screen derives one from the span.
     pub title: Option<String>,
     /// A note about the sitting itself. Distinct from a liner note, which is
     /// about a record and hangs off an entity or a single listen.
     pub notes: Option<String>,
+    /// Unix seconds.
     pub started_at: i64,
+    /// Unix seconds.
     pub ended_at: Option<i64>,
     pub track_count: i64,
+    /// Seconds.
     pub total_duration: i64,
     pub avg_quality_score: Option<f64>,
     pub listening_context: Option<String>,
@@ -2357,16 +2449,12 @@ pub struct SessionRow {
     pub chain_variant_name: Option<String>,
     pub device_id: Option<i64>,
     pub device_name: Option<String>,
+    /// The API token the listens were submitted with. A change of token
+    /// starts a new session.
     pub token_id: Option<i64>,
     pub token_name: Option<String>,
 }
 
-/// A stable, opaque id for a session.
-///
-/// Not a real UUID library — a hex random is enough for something that only has
-/// to be unique across instances and never parsed. It exists so a session keeps
-/// one identity through merges, splits and (later) being handed to someone
-/// else's Tapedeck.
 /// How recent a Shared Spool play must be for accepting it to relay it onward.
 /// Fourteen days.
 ///
@@ -2425,6 +2513,12 @@ pub fn join_names(names: &[String]) -> Option<String> {
     (!cleaned.is_empty()).then(|| cleaned.join(", "))
 }
 
+/// A stable, opaque id for a session.
+///
+/// Not a real UUID library — a hex random is enough for something that only has
+/// to be unique across instances and never parsed. It exists so a session keeps
+/// one identity through merges, splits and (later) being handed to someone
+/// else's Tapedeck.
 fn new_uuid() -> String {
     use rand::Rng;
     let raw: [u8; 16] = rand::rng().random();
@@ -2704,19 +2798,26 @@ impl TokenAuth {
     const SCOPES: [&'static str; 3] = ["submit", "read", "write"];
 }
 
-#[derive(Debug, FromRow, serde::Serialize)]
+/// An API token, without its secret.
+#[derive(Debug, FromRow, serde::Serialize, utoipa::ToSchema)]
 pub struct TokenRecord {
     pub id: i64,
     pub name: String,
+    /// As stored: `submit`, `read`, `write`, `all`, space- or comma-separated.
     pub scopes: String,
+    /// Unix seconds.
     pub created_at: i64,
+    /// Unix seconds; null for a token never used.
     pub last_used_at: Option<i64>,
+    /// Rung 3 of the chain ladder.
     pub default_chain_id: Option<i64>,
-    /// Nullable in the column (it was added by migration), but a token that has
-    /// never been told is not live — so it reads as a plain bool out here.
+    /// Whether this client's `import` submissions are forwarded as live listens.
+    // Nullable in the column (it was added by migration), but a token that has
+    // never been told is not live — so it reads as a plain bool out here.
     #[sqlx(default)]
     pub imports_are_live: bool,
-    /// Joined for display so the token list doesn't need a second round-trip.
+    /// The default chain's name.
+    // Joined for display so the token list doesn't need a second round-trip.
     pub default_chain_name: Option<String>,
 }
 
@@ -2741,22 +2842,33 @@ pub struct ListeningCoverage {
 }
 
 /// Something to put in the crate.
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Deserialize, utoipa::ToSchema)]
+#[schema(as = NewCrateEntry)]
 pub struct NewRecommendation {
     /// `artist`, `album` or `track`.
+    #[schema(example = "album")]
     pub kind: String,
     pub artist: String,
-    /// The album or track title. `None` for an artist.
+    /// Album or track title. Omitted for an artist, whose name is already in
+    /// `artist`.
     pub name: Option<String>,
     pub mbid: Option<String>,
+    /// Why you would like it, in the suggester's words.
     pub reason: Option<String>,
-    /// What in the user's own listening prompted this.
+    /// **Required.** What in *your own* listening prompted the suggestion. A
+    /// recommendation with no grounding in the history is free association,
+    /// and is refused.
+    //
+    // Optional in the type so the refusal is a sentence rather than a serde
+    // error; `file` enforces it.
+    #[schema(required, value_type = String)]
     pub because: Option<String>,
 }
 
-#[derive(Debug, FromRow, serde::Serialize)]
+#[derive(Debug, FromRow, serde::Serialize, utoipa::ToSchema)]
 pub struct RecommendationRow {
     pub id: i64,
+    /// `artist`, `album` or `track`.
     pub kind: String,
     pub artist: String,
     pub name: Option<String>,
@@ -2765,6 +2877,7 @@ pub struct RecommendationRow {
     pub because: Option<String>,
     /// `user`, or the name of the connection that suggested it.
     pub origin: String,
+    /// `open`, `acquired` or `dismissed`.
     pub status: String,
     pub created_at: i64,
     pub acted_at: Option<i64>,
@@ -2776,11 +2889,13 @@ pub struct RecommendationRow {
 /// A recommendation is a *prediction*, and a scrobbler is the only thing in the
 /// room that can score it. `first_played_at` is derived from the listens rather
 /// than stored, so it cannot drift from them.
-#[derive(Debug, serde::Serialize)]
+#[derive(Debug, serde::Serialize, utoipa::ToSchema)]
 pub struct CrateEntry {
     #[serde(flatten)]
     pub rec: RecommendationRow,
-    /// When this first turned up in the history, if it ever did.
+    /// When this first turned up in the listening history, if it ever did.
+    /// **Derived from the listens, not stored**, so it cannot drift from what
+    /// it summarises.
     pub first_played_at: Option<i64>,
     pub plays: i64,
 }
@@ -2820,30 +2935,53 @@ impl McpAuth {
     }
 }
 
-#[derive(Debug, FromRow, serde::Serialize)]
+/// A standing grant to an AI assistant — deliberately not an API token, so
+/// it can be granted, read and revoked on its own.
+//
+// `tokens.scopes` treats `all` as a wildcard (so an existing token would gain
+// this reach from an upgrade), an OAuth credential expires and refreshes where
+// a token does not, and revoking "the assistant I connected last month" should
+// not mean reading past six players.
+#[derive(Debug, FromRow, serde::Serialize, utoipa::ToSchema)]
+#[schema(as = McpConnection)]
 pub struct McpConnectionRecord {
     pub id: i64,
     pub name: String,
+    /// Space-separated. **No wildcard** — a consent screen names what it is
+    /// granting, and "everything, including whatever is added later" is not
+    /// something a person can consent to.
+    #[schema(example = "listening:read library:read")]
     pub scopes: String,
+    /// Set when the grant came through OAuth.
     pub client_id: Option<String>,
     pub created_at: i64,
     pub last_used_at: Option<i64>,
+    /// Null for a connection created by hand — those do not expire.
     pub expires_at: Option<i64>,
+    /// How many calls it has made, ever.
     pub calls: i64,
 }
 
-#[derive(Debug, FromRow, serde::Serialize)]
+#[derive(Debug, FromRow, serde::Serialize, utoipa::ToSchema)]
+#[schema(as = McpAuditCall)]
 pub struct McpAuditRow {
     pub id: i64,
     pub at: i64,
+    /// The JSON-RPC method — `tools/call`, `resources/read`.
     pub method: String,
+    /// The tool, resource URI or prompt name.
     pub tool: Option<String>,
+    /// The arguments, truncated to 500 characters. A record of what was
+    /// asked, not a copy of it.
     pub args: Option<String>,
     pub ok: bool,
+    /// How much data left the building. Null where the answer was not a list.
+    /// A tool that answered with 12 rows and one that answered with 20,000
+    /// are different events however identical the call looks.
     pub rows_returned: Option<i64>,
     pub ms: Option<i64>,
-    /// Null once the connection has been deleted outright rather than revoked —
-    /// which nothing does, but the join has to allow for it.
+    // Null once the connection has been deleted outright rather than revoked —
+    // which nothing does, but the join has to allow for it.
     pub connection_name: Option<String>,
 }
 
@@ -2868,10 +3006,14 @@ pub struct OAuthCode {
     pub expires_at: i64,
 }
 
-#[derive(Debug, Clone, FromRow, serde::Serialize, serde::Deserialize)]
+/// Names, not ids — the only shape that survives the user not owning the
+/// track on every server they have. Resolved against a real library at push
+/// time.
+#[derive(Debug, Clone, FromRow, serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
 pub struct SavedPlaylistTrack {
     pub title: String,
     pub artist: String,
+    /// A tiebreaker at push time, never a requirement.
     pub album: Option<String>,
     /// Why this track is here, in the words of whatever chose it. Never
     /// generated by Tapedeck.
@@ -2879,11 +3021,12 @@ pub struct SavedPlaylistTrack {
 }
 
 /// A playlist track with what the listening history already knows about it.
-///
-/// Separate from `SavedPlaylistTrack` because that one is also the *input*
-/// shape — an assistant sends title, artist and album — and an input struct
-/// carrying derived fields invites somebody to try setting them.
-#[derive(Debug, serde::Serialize)]
+//
+// Separate from `SavedPlaylistTrack` because that one is also the *input*
+// shape — an assistant sends title, artist and album — and an input struct
+// carrying derived fields invites somebody to try setting them.
+#[derive(Debug, serde::Serialize, utoipa::ToSchema)]
+#[schema(as = SavedPlaylistEntry)]
 pub struct PlaylistTrackView {
     #[serde(flatten)]
     pub track: SavedPlaylistTrack,
@@ -2895,17 +3038,23 @@ pub struct PlaylistTrackView {
     pub caa_release_mbid: Option<String>,
 }
 
-#[derive(Debug, FromRow, serde::Serialize)]
+#[derive(Debug, FromRow, serde::Serialize, utoipa::ToSchema)]
+#[schema(as = SavedPlaylist)]
 pub struct SavedPlaylistRecord {
     pub id: i64,
     pub name: String,
     pub description: Option<String>,
+    /// `user`, or `mcp` for one an assistant wrote — `connection_name` says
+    /// which.
     pub origin: String,
     pub created_at: i64,
     pub updated_at: i64,
     pub pushed_at: Option<i64>,
+    /// The protocol it was last sent to — `Plex`, `Jellyfin`, `Subsonic`,
+    /// `TIDAL`.
     pub pushed_to: Option<String>,
     pub connection_name: Option<String>,
+    /// How many tracks.
     pub tracks: i64,
 }
 
@@ -2921,18 +3070,12 @@ pub struct ChainVariantRow {
     pub total_hours: f64,
 }
 
-/// A chain with one or more steps swapped.
-///
-/// `total_hours` here is the listening that went through *this variant*, which
-/// is a different question from a chain's total — a chain's hours include every
-/// variant of it, since they all ran through the same chain.
-
 /// What a fold moved, so the caller can say it rather than claim success.
 ///
 /// Reported per table because they are different kinds of thing: listens
 /// are the hours, a token or a device default is *future* attribution, and
 /// a record on the shelf is the turntable it lives with.
-#[derive(Debug, Default, Clone, serde::Serialize)]
+#[derive(Debug, Default, Clone, serde::Serialize, utoipa::ToSchema)]
 pub struct FoldOutcome {
     pub variant_id: i64,
     pub variant_name: String,
@@ -2964,7 +3107,7 @@ pub enum FoldTarget<'a> {
 /// metadata sanitiser follows, and for the same reason: a fold is not
 /// reversible, and a plurality of one step is a weak signal the operator should
 /// see before agreeing to it.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, utoipa::ToSchema)]
 pub struct FoldSuggestion {
     pub base_chain_id: i64,
     pub base_name: String,
@@ -2976,23 +3119,33 @@ pub struct FoldSuggestion {
     pub distance: i64,
     /// What the folded chain becomes as a variant of the base.
     pub overrides: Vec<VariantOverride>,
-    /// A variant of the base that is *already* wired this way — the state
-    /// someone is in when they built the variant and found the old chain still
-    /// sitting in the list beside it.
+    /// A variant of the base that is *already* wired this way, as
+    /// `[id, name]` — the state someone is in when they built the variant and
+    /// found the old chain still sitting in the list beside it.
+    #[schema(value_type = Option<Vec<Object>>)]
     pub matching_variant: Option<(i64, String)>,
     /// This one carries variants of its own, so it cannot be the side that
     /// folds. Surfaced here rather than left for the fold to refuse.
     pub fold_blocked_by_variants: bool,
 }
 
-#[derive(Debug, Clone, serde::Serialize)]
+/// A chain with one step swapped — two cartridges on one turntable, or the
+/// same commute with different IEMs, are one chain and a choice.
+#[derive(Debug, Clone, serde::Serialize, utoipa::ToSchema)]
+#[schema(as = Variant)]
 pub struct ChainVariant {
     pub id: i64,
     pub user_id: i64,
+    /// The chain this is a variant of.
     pub chain_id: i64,
     pub name: String,
+    /// Only the steps that differ from the chain.
     pub overrides: Vec<VariantOverride>,
+    /// Unix seconds.
     pub created_at: i64,
+    /// The listening that went through *this variant*, which is a different
+    /// question from a chain's total — a chain's hours include every variant
+    /// of it, since they all ran through the same chain.
     pub total_hours: f64,
 }
 
@@ -3044,10 +3197,13 @@ impl From<ChainRow> for SignalChain {
     }
 }
 
-#[derive(Debug, FromRow, serde::Serialize)]
+/// A player that has submitted listens — rung 4 of the chain ladder.
+#[derive(Debug, FromRow, serde::Serialize, utoipa::ToSchema)]
+#[schema(as = Device)]
 pub struct DeviceRow {
     pub id: i64,
     pub user_id: i64,
+    /// `tapedeck_device.machine_id` — the key.
     pub machine_id: String,
     pub name: Option<String>,
     pub platform: Option<String>,
@@ -3060,13 +3216,13 @@ pub struct DeviceRow {
 }
 
 /// Where one piece of gear's hours came from.
-///
-/// The gear total is a sum and a sum is not checkable — "Hexa: 1.9h" is a
-/// number you either believe or you do not, and with a variant in play the
-/// listening genuinely arrives from more than one chain. This is the same
-/// arithmetic `equipment_seconds` already does internally, kept instead of
-/// thrown away, so the total can be read as the addition it is.
-#[derive(Debug, Clone, serde::Serialize)]
+//
+// The gear total is a sum and a sum is not checkable — "Hexa: 1.9h" is a
+// number you either believe or you do not, and with a variant in play the
+// listening genuinely arrives from more than one chain. This is the same
+// arithmetic `equipment_seconds` already does internally, kept instead of
+// thrown away, so the total can be read as the addition it is.
+#[derive(Debug, Clone, serde::Serialize, utoipa::ToSchema)]
 pub struct GearHours {
     pub chain_id: i64,
     pub chain_name: String,
@@ -3107,29 +3263,43 @@ pub struct LibraryRef {
     pub timestamp: i64,
 }
 
-#[derive(Debug, FromRow, serde::Serialize)]
+/// A piece of gear.
+///
+/// **The type field is `equipment_type` on the way out and `type` on the way
+/// in.** `POST`/`PATCH` take `type`, every read returns `equipment_type`.
+#[derive(Debug, FromRow, serde::Serialize, utoipa::ToSchema)]
+#[schema(as = Equipment)]
 pub struct EquipmentRow {
     pub id: i64,
     pub user_id: i64,
     pub name: String,
+    /// `dac`, `amp`, `transducer`, `cartridge`, `headshell`, `phono`,
+    /// `turntable`, `tape-deck`, `transport`, …
     #[sqlx(rename = "type")]
     pub equipment_type: String,
     pub brand: Option<String>,
     pub model: Option<String>,
+    /// Derived — summed from every chain referencing this gear, never
+    /// accumulated. Free-text chain steps report zero, which is honest.
     pub total_hours: f64,
+    /// When Tapedeck first saw it, unix seconds.
     pub first_used: Option<i64>,
+    /// Unix seconds.
     pub last_used: Option<i64>,
     pub notes: Option<String>,
-    /// When it was bought, as opposed to `first_used`, which is when Tapedeck
-    /// first saw it. Gear is usually owned well before it is catalogued.
+    /// When it was bought, unix seconds. Distinct from `first_used` — gear is
+    /// usually owned for a while before anyone gets round to cataloguing it,
+    /// and burn-in hours are counted from the purchase.
     pub purchased_at: Option<i64>,
-    /// Which chains and variants those hours came from, largest first. Empty
-    /// for gear nothing has logged time through.
+    /// *(since v0.70.4)* What `total_hours` is made of, largest first — the
+    /// same per-(chain, variant) seconds the hours are derived from, so the
+    /// parts always add to the whole. Empty for gear nothing has logged time
+    /// through.
     #[sqlx(skip)]
     pub sources: Vec<GearHours>,
-    /// Why this piece is not in a chain — `new`, `spare`, `lent`. Only ever
-    /// meaningful for gear no chain names; the Signal Chains page shows it in
-    /// the "Not in a chain yet" table and nowhere else.
+    /// Why this piece is not in a chain — `new`, `spare` or `lent`. Null is the
+    /// usual state and means nothing has been said. Free text: the UI owns the
+    /// vocabulary.
     pub status: Option<String>,
 }
 
@@ -3158,6 +3328,8 @@ mod sanitise;
 mod schema;
 mod sources;
 mod stats;
+pub use physical::DashboardStats;
+pub use stats::RangedStats;
 mod users;
 
 // These build a temp SQLite file and drive it through the real `Database`.

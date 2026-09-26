@@ -2005,7 +2005,7 @@ impl Database {
         user_id: i64,
         tz: chrono_tz::Tz,
         week_start_day: u32,
-    ) -> Result<serde_json::Value, sqlx::Error> {
+    ) -> Result<DashboardStats, sqlx::Error> {
         let now = Self::now_secs();
         let today_start = crate::analytics::local_day_start(now, tz);
         let week_start = crate::analytics::local_week_start(now, tz, week_start_day);
@@ -2084,19 +2084,45 @@ impl Database {
         .await?;
         let total_hours = total_duration as f64 / 3600.0;
 
-        Ok(serde_json::json!({
-            "today": today, "this_week": week, "total": total,
-            "lossless_pct": lossless_pct,
+        Ok(DashboardStats {
+            today,
+            this_week: week,
+            total,
+            lossless_pct,
             // What the share is *of*. The client shows the coverage instead of
             // the percentage when this is too small a slice to score — a 94%
             // computed from 558 of 21,390 listens is a fact about the 558.
-            "fidelity_known": fidelity_known,
-            "top_artist": top_artist.as_ref().map(|(a, _)| a.as_str()).unwrap_or("—"),
-            "top_artist_count": top_artist.as_ref().map(|(_, c)| *c).unwrap_or(0),
-            "total_hours": (total_hours * 10.0).round() / 10.0,
-            "today_hours": (today_hours * 10.0).round() / 10.0,
-            "week_hours": (week_hours * 10.0).round() / 10.0,
-            "avg_quality": avg_quality.map(|q| (q * 10.0).round() / 10.0).unwrap_or(0.0),
-        }))
+            fidelity_known,
+            top_artist: top_artist.as_ref().map(|(a, _)| a.clone()).unwrap_or_else(|| "—".into()),
+            top_artist_count: top_artist.as_ref().map(|(_, c)| *c).unwrap_or(0),
+            total_hours: (total_hours * 10.0).round() / 10.0,
+            today_hours: (today_hours * 10.0).round() / 10.0,
+            week_hours: (week_hours * 10.0).round() / 10.0,
+            avg_quality: avg_quality.map(|q| (q * 10.0).round() / 10.0).unwrap_or(0.0),
+        })
     }
+}
+
+/// The home screen's numbers. "Today" and "this week" are in your own
+/// timezone, and the week starts on the day your preferences say.
+#[derive(Debug, serde::Serialize, utoipa::ToSchema)]
+pub struct DashboardStats {
+    pub today: i64,
+    pub this_week: i64,
+    pub total: i64,
+    /// A whole percentage of `fidelity_known`, not of `total`.
+    pub lossless_pct: i64,
+    /// Listens whose format is known — the population `lossless_pct` is a
+    /// share of. When that is a small slice, show the coverage rather than the
+    /// percentage: a 94% computed from 558 of 21,390 listens is a fact about
+    /// the 558.
+    pub fidelity_known: i64,
+    /// The most-played artist of the last 30 days, or `—` with none.
+    pub top_artist: String,
+    pub top_artist_count: i64,
+    pub total_hours: f64,
+    pub today_hours: f64,
+    pub week_hours: f64,
+    /// Over the listens that carry a score; 0 with none.
+    pub avg_quality: f64,
 }

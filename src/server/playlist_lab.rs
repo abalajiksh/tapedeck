@@ -33,6 +33,7 @@ use tracing::error;
 use super::auth::AuthUser;
 use super::models::ErrorResponse;
 use super::AppState;
+use crate::openapi::Unauthorized;
 use crate::playlist_lab::{self, DIMS};
 
 /// How much history one build reads.
@@ -57,17 +58,104 @@ const DEFAULT_MIN_PLAYS: i64 = 2;
 
 fn err(code: u16, msg: impl Into<String>) -> axum::response::Response {
     let status = StatusCode::from_u16(code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-    (status, Json(serde_json::json!(ErrorResponse { code, error: msg.into() }))).into_response()
+    (status, Json(ErrorResponse { code, error: msg.into() })).into_response()
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
 pub struct SpaceQuery {
-    /// Lower it to reach further into the tail of the history.
+    /// Plays a track needs to be in the pool. Lower it to reach further into
+    /// the tail of the history.
+    #[param(minimum = 1, maximum = 50, default = 2)]
     pub min_plays: Option<i64>,
+    /// The most tracks to return, most-played first.
+    #[param(minimum = 50, maximum = 10000)]
     pub cap: Option<usize>,
 }
 
-/// GET /api/v1/playlist-lab — the pool, its coordinates, and what the axes mean.
+/// The pool, where each track sits, and what the axes mean.
+#[derive(serde::Serialize, utoipa::ToSchema)]
+pub struct LabSpace {
+    /// The ten axes, in the order every track's vector lists them.
+    pub dims: Vec<LabDim>,
+    /// One array per track rather than an object, to keep a large pool small:
+    /// `[title, artist, album, plays, vector]`, the vector's coordinates
+    /// rounded to three places.
+    #[schema(value_type = Vec<Vec<Object>>)]
+    pub tracks: Vec<serde_json::Value>,
+    /// Indexes into `tracks` of the ones you love.
+    pub loved: Vec<usize>,
+    /// Tracks in the pool.
+    pub pool: usize,
+    /// Tracks considered before the cut.
+    pub considered: usize,
+    /// Tracks left out for having no genre the map places.
+    pub unplaced: usize,
+    pub min_plays: i64,
+    pub cap: usize,
+    /// Always `artist`: the Sound axes are reached through each track's
+    /// artist, so every track by one artist shares them. Present so no client
+    /// can present this as per-recording analysis.
+    pub granularity: &'static str,
+    pub note: &'static str,
+}
+
+/// One axis.
+#[derive(serde::Serialize, utoipa::ToSchema)]
+pub struct LabDim {
+    pub key: &'static str,
+    pub label: &'static str,
+    /// What the low end means.
+    pub low: &'static str,
+    /// What the high end means.
+    pub high: &'static str,
+    pub group: crate::playlist_lab::Group,
+}
+
+// GET /api/v1/playlist-lab — the pool, its coordinates, and what the axes mean.
+/// The vector space the Playlist Lab generates from.
+///
+/// Session-only. Returns the candidate pool with a position for each track,
+/// plus what every axis means.
+///
+/// **Read `granularity` and `note` before using this.** The space is ten
+/// real dimensions, and they come from two different places:
+///
+/// * **Six are about the music** (`group: sound`), from the Every Noise
+///   genre map — `x` (dense/atmospheric ↔ spiky/bouncy), `y` (organic ↔
+///   mechanical/electric), the colour's three channels, and how far apart a
+///   track's own genres sit.
+/// * **Four are about the listener** (`group: habit`) — era, familiarity,
+///   hour of day, recency — from their own history.
+///
+/// These are **not** per-recording audio features. Genres attach to
+/// artists, so `granularity` is `artist` and every track by one artist
+/// shares its six `sound` coordinates exactly; the `habit` axes are the
+/// only thing separating them. Anything describing this as track-level
+/// audio similarity is wrong. A client mixing the two groups without
+/// weighting will find "similar" quietly means "played at the same hour".
+///
+/// Values are normalised 0–1 against **the pool's own extremes**, so
+/// "newer" means newer than the rest of this collection. A track whose
+/// genres have no place on the map is **dropped, not centred** — placing it
+/// in the middle would invent a similarity it does not have — and the count
+/// comes back as `unplaced`.
+///
+/// `tracks` is compact — `[title, artist, album, plays, [v0…v9]]` — because
+/// on a 3,000-track pool the repeated key names would be most of the
+/// payload. Answers `409` when the genre map has not been fetched, when
+/// there is no history, or when nothing has been placed yet.
+#[utoipa::path(
+    get,
+    path = "/api/v1/playlist-lab",
+    tag = "Playlists",
+    params(SpaceQuery),
+    responses(
+        (status = 200, description = "OK.", body = LabSpace),
+        (status = 401, response = Unauthorized),
+        (status = 409, description = "No genre map yet, no history, or nothing placed yet — the message says which.", body = ErrorResponse),
+    )
+)]
 async fn space(
     State(state): State<Arc<AppState>>,
     user: AuthUser,
@@ -163,37 +251,36 @@ async fn space(
         })
         .collect();
 
-    let dims: Vec<serde_json::Value> = DIMS
+    let dims: Vec<LabDim> = DIMS
         .iter()
-        .map(|d| {
-            serde_json::json!({
-                "key": d.key, "label": d.label,
-                "low": d.low, "high": d.high, "group": d.group,
-            })
-        })
+        .map(|d| LabDim { key: d.key, label: d.label, low: d.low, high: d.high, group: d.group })
         .collect();
 
     (
         StatusCode::OK,
-        Json(serde_json::json!({
-            "dims": dims,
-            "tracks": tracks,
-            "loved": loved_idx,
-            "pool": space.tracks.len(),
-            "considered": space.considered,
-            "unplaced": space.unplaced,
-            "min_plays": min_plays,
-            "cap": cap,
+        Json(LabSpace {
+            dims,
+            tracks,
+            loved: loved_idx,
+            pool: space.tracks.len(),
+            considered: space.considered,
+            unplaced: space.unplaced,
+            min_plays,
+            cap,
             // Stated in the payload rather than only in the UI, so a client
             // reading this API cannot present it as something it is not.
-            "granularity": "artist",
-            "note": "Six axes come from the Every Noise genre map, reached through each track's \
-                     artist — so every track by one artist shares them. Four come from your own \
-                     listening. Nothing here is a per-recording audio analysis.",
-        })),
+            granularity: "artist",
+            note: "Six axes come from the Every Noise genre map, reached through each track's \
+                   artist — so every track by one artist shares them. Four come from your own \
+                   listening. Nothing here is a per-recording audio analysis.",
+        }),
     )
         .into_response()
 }
+
+#[derive(utoipa::OpenApi)]
+#[openapi(paths(space))]
+pub struct Api;
 
 pub fn create_playlist_lab_router() -> Router<Arc<AppState>> {
     Router::new().route("/api/v1/playlist-lab", get(space))

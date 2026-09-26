@@ -37,18 +37,19 @@ use serde::{Deserialize, Serialize};
 /// tiebreaker rather than a requirement: a listen's album is whichever release
 /// the tagger claimed, which for a compilation track is not the album the
 /// server files it under.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct PlaylistTrack {
     pub title: String,
     pub artist: String,
+    /// A tiebreaker between pressings, never a requirement.
     #[serde(default)]
     pub album: Option<String>,
-    /// The recording's ISRC, where the history has one.
-    ///
-    /// The only identifier that crosses from a listening history into a
-    /// streaming catalogue, so a target that can look one up needs no name
-    /// matching at all — which is the whole game, because every miss below is a
-    /// name that did not agree.
+    /// The recording's ISRC. Filled from the history when absent, and where a
+    /// target can look one up no name matching is needed at all.
+    //
+    // The only identifier that crosses from a listening history into a
+    // streaming catalogue — which is the whole game, because every miss below
+    // is a name that did not agree.
     #[serde(default)]
     pub isrc: Option<String>,
 }
@@ -195,20 +196,21 @@ fn score(want: &PlaylistTrack, c: &Candidate) -> Option<u32> {
     Some(points)
 }
 
-/// Why a track did not land.
-///
-/// The push used to report only *which* tracks missed, and those are two
-/// completely different faults wearing the same face: a server that returned
-/// nothing for the query has a search problem, and a server that returned the
-/// right song and had it refused has a *matching* problem. Reported as
-/// "12 didn't land" they are indistinguishable, and there is no way to tell
-/// from outside which one to go and fix.
-///
-/// `ArtistMismatch` carries what the server actually offered, because that is
-/// the fact that settles it in one glance: asked for "Bones" by
-/// "Low Roar feat. Jófríður Ákadóttir" and offered "Low Roar" says exactly
-/// what is wrong, where a bare miss says nothing.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+/// Why a track did not land — which distinguishes a search problem from a
+/// matching one. A mismatch carries what the server actually offered, at most
+/// five, which is the fact that settles it at a glance.
+//
+// The push used to report only *which* tracks missed, and those are two
+// completely different faults wearing the same face: a server that returned
+// nothing for the query has a search problem, and a server that returned the
+// right song and had it refused has a *matching* problem. Reported as
+// "12 didn't land" they are indistinguishable, and there is no way to tell
+// from outside which one to go and fix.
+//
+// `ArtistMismatch` carries what the server actually offered: asked for "Bones"
+// by "Low Roar feat. Jófríður Ákadóttir" and offered "Low Roar" says exactly
+// what is wrong, where a bare miss says nothing.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, utoipa::ToSchema)]
 #[serde(tag = "reason", rename_all = "snake_case")]
 pub enum Miss {
     /// The search itself failed — the server is unwell, not unhelpful.
@@ -221,14 +223,15 @@ pub enum Miss {
     TitleMismatch { offered: Vec<Offered> },
 }
 
-/// One track the far end offered, in the shape a reader *and* a reconciliation
-/// screen can both use.
-///
-/// It used to be a bare `Vec<String>` of names — enough to see what went wrong
-/// and useless for doing anything about it, because pinning a track to one of
-/// these needs the far end's **id** and the list did not carry one. Reading a
-/// list of plausible titles you cannot act on is the definition of a dead end.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+/// One track the far end offered. Carries its id, so a candidate can be
+/// **chosen** rather than only read: POST it to `/api/v1/playlist-matches`
+/// and every later push of that track uses it.
+//
+// It used to be a bare `Vec<String>` of names — enough to see what went wrong
+// and useless for doing anything about it, because pinning a track to one of
+// these needs the far end's **id** and the list did not carry one. Reading a
+// list of plausible titles you cannot act on is the definition of a dead end.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, utoipa::ToSchema)]
 pub struct Offered {
     /// The far end's own id, which is what `POST /api/v1/playlist-matches`
     /// takes. Opaque here; it only ever goes back to the server that made it.
