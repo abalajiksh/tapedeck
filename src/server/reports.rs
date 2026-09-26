@@ -791,30 +791,25 @@ pub async fn reports(
         // Excluded from the *superlative* only. The plays are still real
         // listening and still count towards the totals, the artist tally and
         // everything else; what they cannot do is name the month.
-        let top_artist = b
-            .artists
-            .iter()
-            .filter(|(k, _)| !crate::db::is_various_artists(k))
-            .max_by_key(|(_, v)| v.0)
-            .map(|(k, v)| {
-                // Display the spelling actually used, not the lowercased key —
-                // the trap `top_album` hit once and shipped as "epitone project".
-                //
-                // Both columns are checked, because the key may have come from
-                // `artist_credit` on a compilation track, in which case no row's
-                // `artist` matches it and the fallback would print the folded key.
-                // The latest spelling seen, which is what the reverse scan
-                // this replaced was picking.
-                let display =
-                    display.get(k).map(|(_, last)| last.clone()).unwrap_or_else(|| k.clone());
-                PeriodArtist {
-                    name: display,
-                    plays: v.0,
-                    hours: (v.1 as f64 / 3600.0 * 10.0).round() / 10.0,
-                    landscape_url: None,
-                }
-            });
-        let top_album = b.albums.iter().max_by_key(|(_, v)| v.1).map(|(k, v)| {
+        let real_artists = b.artists.iter().filter(|(k, _)| !crate::db::is_various_artists(k));
+        let top_artist = top_by(real_artists, |v| v.0).map(|(k, v)| {
+            // Display the spelling actually used, not the lowercased key —
+            // the trap `top_album` hit once and shipped as "epitone project".
+            //
+            // Both columns are checked, because the key may have come from
+            // `artist_credit` on a compilation track, in which case no row's
+            // `artist` matches it and the fallback would print the folded key.
+            // The latest spelling seen, which is what the reverse scan
+            // this replaced was picking.
+            let display = display.get(k).map(|(_, last)| last.clone()).unwrap_or_else(|| k.clone());
+            PeriodArtist {
+                name: display,
+                plays: v.0,
+                hours: (v.1 as f64 / 3600.0 * 10.0).round() / 10.0,
+                landscape_url: None,
+            }
+        });
+        let top_album = top_by(&b.albums, |v| v.1).map(|(k, v)| {
             // The key is lowercased for grouping; show the spelling that was
             // actually submitted, or the card reads "epitone project".
             let akey = k.split('|').next().unwrap_or("");
@@ -822,29 +817,27 @@ pub async fn reports(
                 display.get(akey).map(|(_, last)| last.clone()).unwrap_or_else(|| akey.to_string());
             PeriodAlbum { name: v.0.clone(), artist, plays: v.1 }
         });
-        let top_track = b.tracks.values().max_by_key(|v| v.2).map(|v| PeriodTrack {
+        let top_track = top_by(&b.tracks, |v| v.2).map(|(_, v)| PeriodTrack {
             title: v.0.clone(),
             artist: v.1.clone(),
             plays: v.2,
         });
 
         // "On repeat": the heaviest single day of a single track.
-        let mut repeat: Vec<_> = b.per_day.values().filter(|v| v.2 >= 3).collect();
-        repeat.sort_by(|a, b| b.2.cmp(&a.2));
+        let mut repeat: Vec<_> = b.per_day.iter().filter(|(_, v)| v.2 >= 3).collect();
+        repeat.sort_by(|a, z| z.1 .2.cmp(&a.1 .2).then_with(|| a.0.cmp(z.0)));
         let on_repeat: Vec<PeriodTrack> = repeat
             .iter()
             .take(4)
-            .map(|v| PeriodTrack { title: v.0.clone(), artist: v.1.clone(), plays: v.2 })
+            .map(|(_, v)| PeriodTrack { title: v.0.clone(), artist: v.1.clone(), plays: v.2 })
             .collect();
 
         // The crush: the most-played artist you had never played before.
         // Only where there was a "before". In the oldest period every artist is
         // new by construction, so the crush would just be the top artist wearing
         // a different label.
-        let crush = prev
-            .and(b.new_artists.iter().max_by_key(|(_, p)| **p))
-            .filter(|(_, p)| **p >= 5)
-            .map(|(k, p)| {
+        let crush =
+            prev.and(top_by(&b.new_artists, |p| *p)).filter(|(_, p)| **p >= 5).map(|(k, p)| {
                 // The *first* spelling here, not the latest — the forward scan
                 // this replaces took the oldest, and a crush is about how an
                 // artist first appeared.
@@ -859,7 +852,7 @@ pub async fn reports(
 
         let tag_total: i64 = b.genres.values().sum();
         let mut gs: Vec<_> = b.genres.iter().collect();
-        gs.sort_by(|a, b| b.1.cmp(a.1));
+        gs.sort_by(|a, b| b.1.cmp(a.1).then_with(|| a.0.cmp(b.0)));
         let genres: Vec<GenreShare> = gs
             .iter()
             .take(6)
@@ -935,11 +928,11 @@ pub async fn reports(
             state.db.physical_plays_in(user.user_id, b.start, b.end + 1).await.unwrap_or_default();
         let sides: i64 = shelf.iter().map(|(_, _, _, n)| *n).sum();
 
-        let top_chain = b
-            .chains
-            .iter()
-            .max_by_key(|(_, (n, _))| *n)
-            .and_then(|(cid, _)| chain_name.get(cid).cloned());
+        let top_chain = top_by(
+            b.chains.iter().filter_map(|(cid, v)| chain_name.get(cid).map(|n| (n, v))),
+            |v| v.0,
+        )
+        .map(|(name, _)| name.clone());
 
         // ── What you listened *through* ──────────────────────────────────
         //
@@ -952,7 +945,9 @@ pub async fn reports(
             .iter()
             .filter_map(|(cid, (plays, secs))| chain_by_id.get(cid).map(|c| (*c, *plays, *secs)))
             .collect();
-        chain_rows.sort_by(|a, z| z.2.cmp(&a.2).then(z.1.cmp(&a.1)));
+        chain_rows.sort_by(|a, z| {
+            z.2.cmp(&a.2).then(z.1.cmp(&a.1)).then_with(|| a.0.name.cmp(&z.0.name))
+        });
 
         // The gear behind those chains. **A set per chain**, because a chain
         // naming the same piece at two steps must not be charged twice for the
@@ -978,7 +973,12 @@ pub async fn reports(
             }
         }
         let mut gear_rows: Vec<_> = gear.into_values().collect();
-        gear_rows.sort_by(|a, z| z.3.cmp(&a.3).then(z.2.cmp(&a.2)));
+        gear_rows.sort_by(|a, z| {
+            z.3.cmp(&a.3)
+                .then(z.2.cmp(&a.2))
+                .then_with(|| a.0.cmp(&z.0))
+                .then_with(|| a.1.cmp(&z.1))
+        });
 
         let gear_json = PeriodGear {
             chains: chain_rows
@@ -1271,6 +1271,44 @@ mod tests {
             genres: None,
             chain_id: None,
             company: None,
+        }
+    }
+
+    /// A tie names the same winner on every request, and it is the name that
+    /// sorts first.
+    ///
+    /// Every superlative is picked out of a `HashMap`, and each fold makes
+    /// fresh ones with fresh seeds — so folding the same rows thirty-two times,
+    /// in both orders, is thirty-two chances for `max_by_key`'s "whichever tie
+    /// it met last" to answer differently. It did: on a history where every
+    /// track had six plays, three requests named three top tracks.
+    #[test]
+    fn a_tie_names_the_same_winner_however_the_period_was_built() {
+        let artists = ["Massive Attack", "Burial", "Heize", "Aphex Twin", "Evanescence"];
+        let rows = || -> Vec<_> {
+            artists
+                .iter()
+                .enumerate()
+                .flat_map(|(i, a)| {
+                    (0..3).map(move |k| {
+                        row(1_700_000_000 + (i as i64) * 600 + k * 60, a, None, &format!("{a} LP"))
+                    })
+                })
+                .collect()
+        };
+        for run in 0..32 {
+            let mut rows = rows();
+            if run % 2 == 1 {
+                rows.reverse();
+            }
+            let f = fold_periods(rows, Tz::UTC, Unit::Month);
+            let b = &f.buckets[&f.order[0]];
+            let artist = top_by(&b.artists, |v| v.0).map(|(k, _)| k.as_str());
+            let album = top_by(&b.albums, |v| v.1).map(|(_, v)| v.0.as_str());
+            let track = top_by(&b.tracks, |v| v.2).map(|(_, v)| v.1.as_str());
+            assert_eq!(artist, Some("aphex twin"), "run {run}");
+            assert_eq!(album, Some("Aphex Twin LP"), "run {run}");
+            assert_eq!(track, Some("Aphex Twin"), "run {run}");
         }
     }
 
@@ -1581,6 +1619,22 @@ mod tests {
         assert_eq!(thousands(20_000), "20,000");
         assert_eq!(thousands(100_000), "100,000");
     }
+}
+
+/// The entry with the highest count, a tie going to the key that sorts first.
+///
+/// Every superlative on a card is picked out of a `HashMap`, whose iteration
+/// order is seeded per map — so `max_by_key`, which keeps whichever tied entry
+/// it happened to meet last, named a different top track, top album or crush
+/// on each request for the same period. Found 2026-09-26 by asking one running
+/// instance the same question three times and getting three answers. Ties
+/// break by name, the rule the spool figures already follow, so a refresh
+/// cannot rename a month's top artist.
+fn top_by<'a, K: Ord + 'a, V: 'a>(
+    entries: impl IntoIterator<Item = (&'a K, &'a V)>,
+    count: impl Fn(&V) -> i64,
+) -> Option<(&'a K, &'a V)> {
+    entries.into_iter().max_by(|a, z| count(a.1).cmp(&count(z.1)).then_with(|| z.0.cmp(a.0)))
 }
 
 /// What one pass over the history leaves behind.

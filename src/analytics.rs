@@ -99,7 +99,11 @@ fn top_n_artists(rows: &[&ListenRow], n: usize) -> HashSet<String> {
         *c.entry(r.artist.as_str()).or_default() += 1;
     }
     let mut v: Vec<_> = c.into_iter().collect();
-    v.sort_by(|a, b| b.1.cmp(&a.1));
+    // Ties by name. `take(n)` cuts through a tie often — most of a long tail
+    // sits on one or two plays — and which side of the cut a tied artist
+    // landed on used to follow the HashMap's per-process seed, so the two
+    // Jaccard axes came out differently on each request for the same history.
+    v.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
     v.into_iter().take(n).map(|(a, _)| a.to_string()).collect()
 }
 
@@ -308,7 +312,9 @@ fn compute_loyalty(rows: &[ListenRow], tz: Tz) -> Vec<LoyalArtist> {
             LoyalArtist { artist: (*artist).to_string(), plays, loyalty_score }
         })
         .collect();
-    out.sort_by(|a, b| b.plays.cmp(&a.plays));
+    // Ties by name, for the reason `top_n_artists` gives: the list is cut at
+    // ten and was otherwise ordered, and cut, by the HashMap's seed.
+    out.sort_by(|a, b| b.plays.cmp(&a.plays).then_with(|| a.artist.cmp(&b.artist)));
     out.truncate(10);
     out
 }
@@ -437,6 +443,35 @@ mod tests {
             title: t.into(),
             album: album.map(str::to_string),
             track_number: tn,
+        }
+    }
+
+    /// Tied artists come back in the same order on every request.
+    ///
+    /// Twelve artists on five plays each: the loyalty list is cut at ten and
+    /// the Jaccard axes cut their top ten, both straight through a tie. Each
+    /// call builds fresh `HashMap`s, so without a name tie-break the list and
+    /// the scores moved between identical requests.
+    #[test]
+    fn a_tie_is_broken_by_name_on_every_request() {
+        let names: Vec<String> = (0..12).map(|i| format!("Artist {:02}", 11 - i)).collect();
+        let rows: Vec<ListenRow> = names
+            .iter()
+            .enumerate()
+            .flat_map(|(i, a)| {
+                (0..5).map(move |d| {
+                    row(1_700_000_000 + d * 86_400 + (i as i64) * 3_700, a, "t", None, None)
+                })
+            })
+            .collect();
+        let first = serde_json::to_string(&compute_personality(&rows, UTC)).unwrap();
+        let p = compute_personality(&rows, UTC);
+        let loyal: Vec<&str> = p.loyalty.iter().map(|l| l.artist.as_str()).collect();
+        let expected: Vec<String> = (0..10).map(|i| format!("Artist {i:02}")).collect();
+        assert_eq!(loyal, expected.iter().map(String::as_str).collect::<Vec<_>>());
+        for run in 0..32 {
+            let again = serde_json::to_string(&compute_personality(&rows, UTC)).unwrap();
+            assert_eq!(again, first, "run {run}");
         }
     }
 
