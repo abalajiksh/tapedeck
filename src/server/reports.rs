@@ -277,12 +277,17 @@ fn fingerprint(b: &Bucket) -> [f64; 5] {
     // timezone upstream, so this is not quietly UTC.
     let ch: f64 =
         b.clock.iter().map(|n| *n as f64 / plays).filter(|p| *p > 0.0).map(|p| -p * p.ln()).sum();
-    // `.max(0.0)` as well as the clamp: a period entirely inside one hour has
-    // an entropy of `-1 * ln(1)`, which is **negative zero** — `clamp` keeps
-    // it and the axis then renders as "-0". Harmless arithmetically, and it
-    // reads as a bug, which for a number nobody can check by eye is the same
-    // thing as being one.
-    let spread = (ch / 24f64.ln()).clamp(0.0, 1.0).max(0.0);
+    // `+ 0.0` after the clamp: a period entirely inside one hour has an
+    // entropy of `-1 * ln(1)`, which is **negative zero** — `clamp` keeps it
+    // and the axis then renders as "-0". Harmless arithmetically, and it reads
+    // as a bug, which for a number nobody can check by eye is the same thing as
+    // being one.
+    //
+    // Not `.max(0.0)`, which is what this was: IEEE 754 leaves the sign of
+    // `max(-0.0, 0.0)` to the implementation, and current Rust hands back the
+    // negative zero — the guard compiled, did nothing, and its own test failed.
+    // Adding positive zero is defined to give positive zero in round-to-nearest.
+    let spread = (ch / 24f64.ln()).clamp(0.0, 1.0) + 0.0;
 
     // Runs — the share of plays inside a run of one album. The "did you put a
     // record on, or did you shuffle" axis, and the one nothing else here says.
