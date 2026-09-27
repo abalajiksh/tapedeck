@@ -24,7 +24,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tracing::{info, warn};
 
-use super::auth::AuthUser;
+use super::auth::{AuthUser, ReadAuth, WriteAuth};
 use super::models::ErrorResponse;
 use super::now_playing::{NowPlaying, Progress};
 use super::AppState;
@@ -314,6 +314,41 @@ fn err(code: u16, msg: impl Into<String>) -> axum::response::Response {
     (status, Json(ErrorResponse { code, error: msg.into() })).into_response()
 }
 
+/// Refuse a chain or a piece of gear that is not the caller's own.
+///
+/// Every shelf write that takes one in its body goes through this, because a
+/// stored id is trusted everywhere downstream: `play_side` stamps it on every
+/// listen the side writes, and from there it reaches chain and gear hours and
+/// the Reel. An id naming another household member's chain would file your
+/// listening under their gear, and nothing would ever error. `update_release`
+/// always checked; `play_side` and `put_spin` did not — the output-binding bug
+/// of v0.119.0 in a second place, found when the shelf was opened to tokens.
+///
+/// One copy, because the next shelf write that takes a chain should inherit
+/// the check rather than have to know it exists.
+async fn refuse_foreign_gear(
+    state: &AppState,
+    user_id: i64,
+    chain_id: Option<i64>,
+    equipment_id: Option<i64>,
+) -> Option<axum::response::Response> {
+    if let Some(cid) = chain_id {
+        match state.db.get_chain(user_id, cid).await {
+            Ok(Some(_)) => {}
+            Ok(None) => return Some(err(400, "No such signal chain")),
+            Err(e) => return Some(err(500, e.to_string())),
+        }
+    }
+    if let Some(eid) = equipment_id {
+        match state.db.get_equipment(user_id).await {
+            Ok(gear) if gear.iter().any(|g| g.id == eid) => {}
+            Ok(_) => return Some(err(400, "No such equipment")),
+            Err(e) => return Some(err(500, e.to_string())),
+        }
+    }
+    None
+}
+
 /// Where an admin-set consumer key/secret pair lives.
 pub const DISCOGS_KEY_KEY: &str = "discogs_key";
 pub const DISCOGS_SECRET_KEY: &str = "discogs_secret";
@@ -392,9 +427,14 @@ pub struct LookupQuery {
 // GET /api/v1/physical/lookup — find the pressing.
 /// Resolve a barcode to a pressing.
 ///
-/// Session-only. Discogs first when configured — it catalogues *pressings*,
-/// so a barcode usually resolves to the exact edition, often with real side
-/// letters that MusicBrainz lacks. Falls back to MusicBrainz.
+/// Scope: `write` *(since v0.120)*, although it is a `GET`: it exists only to
+/// add a record to the shelf, and it spends rate-limited Discogs and
+/// MusicBrainz lookups doing it, so a token that can only read the shelf has
+/// no use for it. `GET /api/v1/art/library` makes the same call.
+///
+/// Discogs first when configured — it catalogues *pressings*, so a barcode
+/// usually resolves to the exact edition, often with real side letters that
+/// MusicBrainz lacks. Falls back to MusicBrainz.
 ///
 /// Barcodes may be sent with or without the printed spacing; the unspaced
 /// form a scanner produces matches slightly **more** often.
@@ -402,6 +442,7 @@ pub struct LookupQuery {
     get,
     path = "/api/v1/physical/lookup",
     tag = "Shelf",
+    security(("apiToken" = ["write"]), ("sessionCookie" = [])),
     params(LookupQuery),
     responses(
         (status = 200, description = "OK.", body = PressingLookup),
@@ -411,7 +452,7 @@ pub struct LookupQuery {
 )]
 async fn lookup(
     State(state): State<Arc<AppState>>,
-    _user: AuthUser,
+    WriteAuth { user: _user }: WriteAuth,
     Query(q): Query<LookupQuery>,
 ) -> impl IntoResponse {
     let barcode = q.barcode.as_deref().map(str::trim).filter(|s| !s.is_empty());
@@ -485,10 +526,14 @@ async fn lookup(
 // browsing ten results would otherwise be ten extra calls against a
 // rate-limited API for nine releases nobody picked.
 /// A Discogs release, with its tracklist positions.
+///
+/// Scope: `write` *(since v0.120)*, for the reason the barcode lookup is: it
+/// is the second half of adding a record, and it spends a Discogs request.
 #[utoipa::path(
     get,
     path = "/api/v1/physical/discogs/{id}",
     tag = "Shelf",
+    security(("apiToken" = ["write"]), ("sessionCookie" = [])),
     params(("id" = String, Path)),
     responses(
         (status = 200, description = "OK.", body = DiscogsPressing),
@@ -500,7 +545,7 @@ async fn lookup(
 )]
 async fn discogs_detail(
     State(state): State<Arc<AppState>>,
-    _user: AuthUser,
+    WriteAuth { user: _user }: WriteAuth,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
     let Some(auth) = discogs_auth(&state).await else {
@@ -527,11 +572,12 @@ pub struct ShelfQuery {
 
 /// Your shelf.
 ///
-/// Session-only.
+/// Scope: `read` *(since v0.120)*.
 #[utoipa::path(
     get,
     path = "/api/v1/physical",
     tag = "Shelf",
+    security(("apiToken" = ["read"]), ("sessionCookie" = [])),
     params(ShelfQuery),
     responses(
         (status = 200, description = "OK.", body = Shelf),
@@ -540,7 +586,7 @@ pub struct ShelfQuery {
 )]
 pub async fn list_shelf(
     State(state): State<Arc<AppState>>,
-    user: AuthUser,
+    ReadAuth { user }: ReadAuth,
     Query(q): Query<ShelfQuery>,
 ) -> impl IntoResponse {
     let kind = q.kind.as_deref().filter(|k| matches!(*k, "vinyl" | "cassette" | "cd" | "sacd"));
@@ -551,10 +597,13 @@ pub async fn list_shelf(
 }
 
 /// One shelf item, with its sides.
+///
+/// Scope: `read` *(since v0.120)*.
 #[utoipa::path(
     get,
     path = "/api/v1/physical/{id}",
     tag = "Shelf",
+    security(("apiToken" = ["read"]), ("sessionCookie" = [])),
     params(("id" = i64, Path)),
     responses(
         (status = 200, description = "OK.", body = ShelfEntry),
@@ -564,7 +613,7 @@ pub async fn list_shelf(
 )]
 async fn get_one(
     State(state): State<Arc<AppState>>,
-    user: AuthUser,
+    ReadAuth { user }: ReadAuth,
     Path(id): Path<i64>,
 ) -> impl IntoResponse {
     match state.db.get_physical(user.user_id, id).await {
@@ -622,11 +671,12 @@ fn yes() -> bool {
 
 /// Add a release to the shelf.
 ///
-/// Session-only. Seed from a barcode lookup, or supply the tracklist yourself.
+/// Scope: `write` *(since v0.120)*. Seed from a barcode lookup, or supply the tracklist yourself.
 #[utoipa::path(
     post,
     path = "/api/v1/physical",
     tag = "Shelf",
+    security(("apiToken" = ["write"]), ("sessionCookie" = [])),
     request_body = NewRelease,
     responses(
         (status = 201, description = "Added.", body = Shelved),
@@ -636,7 +686,7 @@ fn yes() -> bool {
 )]
 async fn add_release(
     State(state): State<Arc<AppState>>,
-    user: AuthUser,
+    WriteAuth { user }: WriteAuth,
     Json(body): Json<NewRelease>,
 ) -> impl IntoResponse {
     if !matches!(body.kind.as_str(), "vinyl" | "cassette" | "cd" | "sacd") {
@@ -798,7 +848,7 @@ where
 // PATCH /api/v1/physical/:id — the shelf-keeping fields.
 /// Edit the shelf-keeping fields.
 ///
-/// Session-only. When it was bought, what it is normally played through,
+/// Scope: `write` *(since v0.120)*. When it was bought, what it is normally played through,
 /// and the note beside it.
 ///
 /// Every field distinguishes **absent from null**: omitting one leaves the
@@ -820,6 +870,7 @@ where
     patch,
     path = "/api/v1/physical/{id}",
     tag = "Shelf",
+    security(("apiToken" = ["write"]), ("sessionCookie" = [])),
     params(("id" = i64, Path)),
     request_body = ReleaseUpdate,
     responses(
@@ -831,26 +882,22 @@ where
 )]
 async fn update_release(
     State(state): State<Arc<AppState>>,
-    user: AuthUser,
+    WriteAuth { user }: WriteAuth,
     Path(id): Path<i64>,
     Json(body): Json<ReleaseUpdate>,
 ) -> impl IntoResponse {
     // A chain or a piece of gear arriving in a body is checked against the
     // *owner's* rows before it is stored, the same rule ingest follows for a
     // token's default chain.
-    if let Some(Some(cid)) = body.chain_id {
-        match state.db.get_chain(user.user_id, cid).await {
-            Ok(Some(_)) => {}
-            Ok(None) => return err(400, "No such signal chain"),
-            Err(e) => return err(500, e.to_string()),
-        }
-    }
-    if let Some(Some(eid)) = body.equipment_id {
-        match state.db.get_equipment(user.user_id).await {
-            Ok(gear) if gear.iter().any(|g| g.id == eid) => {}
-            Ok(_) => return err(400, "No such equipment"),
-            Err(e) => return err(500, e.to_string()),
-        }
+    if let Some(refused) = refuse_foreign_gear(
+        &state,
+        user.user_id,
+        body.chain_id.flatten(),
+        body.equipment_id.flatten(),
+    )
+    .await
+    {
+        return refused;
     }
 
     let kind = body.kind.as_deref().map(|k| k.trim().to_ascii_lowercase());
@@ -971,7 +1018,7 @@ pub struct TracksUpdate {
 // MusicBrainz only records a side letter when an editor entered one.
 /// Replace the tracklist and side split.
 ///
-/// Session-only. Sides are **not reliably available from any provider** —
+/// Scope: `write` *(since v0.120)*. Sides are **not reliably available from any provider** —
 /// MusicBrainz records a vinyl track number as "A1" only when an editor
 /// entered one. When there is no explicit side letter the split is guessed
 /// by **playing time**, not track count, because a mastering engineer
@@ -1002,6 +1049,7 @@ pub struct TracksUpdate {
     put,
     path = "/api/v1/physical/{id}/tracks",
     tag = "Shelf",
+    security(("apiToken" = ["write"]), ("sessionCookie" = [])),
     params(("id" = i64, Path)),
     request_body = TracksUpdate,
     responses(
@@ -1013,7 +1061,7 @@ pub struct TracksUpdate {
 )]
 async fn set_tracks(
     State(state): State<Arc<AppState>>,
-    user: AuthUser,
+    WriteAuth { user }: WriteAuth,
     Path(id): Path<i64>,
     Json(body): Json<TracksUpdate>,
 ) -> impl IntoResponse {
@@ -1428,9 +1476,12 @@ async fn apply_durations(
 
 /// Remove a shelf item.
 ///
-/// Session-only. Its plays and its images go with it, and any scan files
-/// the user uploaded are removed from disk — nothing else knows those files
-/// exist, so leaving them would orphan them permanently.
+/// Session-only, deliberately, although the rest of the shelf takes a
+/// `write` token: its plays and its images go with it, and any scan files the
+/// user uploaded are removed from disk — nothing else knows those files
+/// exist, so leaving them would orphan them permanently. Scans are not in
+/// `GET /api/v1/backup`, so this is the one shelf operation a lost phone could
+/// make unrecoverable, which is the line `DELETE /api/v1/scrobbles` sits on.
 #[utoipa::path(
     delete,
     path = "/api/v1/physical/{id}",
@@ -1509,7 +1560,7 @@ fn image_payload(img: &PhysicalImage) -> ImageView {
 // nothing to say why.
 /// How often each side has been played, and for how long.
 ///
-/// Session-only. A record has a side you reach for and a side you rarely
+/// Scope: `read` *(since v0.120)*. A record has a side you reach for and a side you rarely
 /// turn over, and the release's own totals cannot say which is which.
 ///
 /// Everything here is derived from the sides played on read — never a
@@ -1530,6 +1581,7 @@ fn image_payload(img: &PhysicalImage) -> ImageView {
     get,
     path = "/api/v1/physical/{id}/sides",
     tag = "Shelf",
+    security(("apiToken" = ["read"]), ("sessionCookie" = [])),
     params(("id" = i64, Path)),
     responses(
         (status = 200, description = "OK.", body = Sides),
@@ -1539,7 +1591,7 @@ fn image_payload(img: &PhysicalImage) -> ImageView {
 )]
 async fn side_plays(
     State(state): State<Arc<AppState>>,
-    user: AuthUser,
+    ReadAuth { user }: ReadAuth,
     Path(id): Path<i64>,
 ) -> impl IntoResponse {
     // Ownership before the stats: scoping the query alone would answer an
@@ -1558,7 +1610,7 @@ async fn side_plays(
 
 /// Every scan held for a pressing.
 ///
-/// Session-only. Sleeves, labels, obi strips and booklet pages — the parts
+/// Scope: `read` *(since v0.120)*. Sleeves, labels, obi strips and booklet pages — the parts
 /// of a record you actually hold, which is why they are rows rather than
 /// one more `artwork_url` column. The Cover Art Archive carries 29 for a
 /// typical CD, 19 of them booklet pages.
@@ -1571,6 +1623,7 @@ async fn side_plays(
     get,
     path = "/api/v1/physical/{id}/images",
     tag = "Shelf",
+    security(("apiToken" = ["read"]), ("sessionCookie" = [])),
     params(("id" = i64, Path)),
     responses(
         (status = 200, description = "OK.", body = ShelfImages),
@@ -1579,7 +1632,7 @@ async fn side_plays(
 )]
 async fn list_images(
     State(state): State<Arc<AppState>>,
-    user: AuthUser,
+    ReadAuth { user }: ReadAuth,
     Path(id): Path<i64>,
 ) -> impl IntoResponse {
     match state.db.list_physical_images(user.user_id, id).await {
@@ -1641,7 +1694,7 @@ async fn store_archive_images(
 // exactly the case where the user knows and Tapedeck cannot.
 /// Pull the sleeve from the Cover Art Archive.
 ///
-/// Session-only. Runs when the user asks rather than on a clock: the
+/// Scope: `write` *(since v0.120)*. Runs when the user asks rather than on a clock: the
 /// archive is not going to change under a record that has been on a shelf
 /// for thirty years, and the one case that does — an editor uploading the
 /// booklet you were missing — is exactly the case where the user knows and
@@ -1660,6 +1713,7 @@ async fn store_archive_images(
     post,
     path = "/api/v1/physical/{id}/images/fetch",
     tag = "Shelf",
+    security(("apiToken" = ["write"]), ("sessionCookie" = [])),
     params(("id" = i64, Path)),
     responses(
         (status = 200, description = "OK.", body = ImagesFetched),
@@ -1669,7 +1723,7 @@ async fn store_archive_images(
 )]
 async fn fetch_images(
     State(state): State<Arc<AppState>>,
-    user: AuthUser,
+    WriteAuth { user }: WriteAuth,
     Path(id): Path<i64>,
 ) -> impl IntoResponse {
     let Ok(Some(release)) = state.db.get_physical(user.user_id, id).await else {
@@ -1759,7 +1813,7 @@ pub(super) fn image_ext(mime: &str) -> Option<&'static str> {
 // receipt tucked inside — none of that exists anywhere but here.
 /// Upload scans of your own copy.
 ///
-/// Session-only. `multipart/form-data`: any number of file fields, plus
+/// Scope: `write` *(since v0.120)*. `multipart/form-data`: any number of file fields, plus
 /// optional `kind` and `caption` text fields that apply to all of them —
 /// which is what makes uploading a booklet in one go work, since the files
 /// land in the order they are sent.
@@ -1774,6 +1828,7 @@ pub(super) fn image_ext(mime: &str) -> Option<&'static str> {
     post,
     path = "/api/v1/physical/{id}/images",
     tag = "Shelf",
+    security(("apiToken" = ["write"]), ("sessionCookie" = [])),
     params(("id" = i64, Path)),
     request_body(content = ScanUpload, content_type = "multipart/form-data"),
     responses(
@@ -1787,7 +1842,7 @@ pub(super) fn image_ext(mime: &str) -> Option<&'static str> {
 )]
 async fn upload_image(
     State(state): State<Arc<AppState>>,
-    user: AuthUser,
+    WriteAuth { user }: WriteAuth,
     Path(id): Path<i64>,
     mut multipart: Multipart,
 ) -> impl IntoResponse {
@@ -1913,7 +1968,7 @@ pub(super) fn random_name() -> String {
 // it to the next person through the proxy.
 /// An uploaded scan's bytes.
 ///
-/// Session-only, and scoped to the caller by `(id, user_id)` — these are
+/// Scope: `read` *(since v0.120)*, and scoped to the caller by `(id, user_id)` — these are
 /// photographs of someone's own possessions and ids must not be walkable,
 /// the same rule the artwork proxy keeps.
 ///
@@ -1925,6 +1980,7 @@ pub(super) fn random_name() -> String {
     get,
     path = "/api/v1/physical/images/{id}/file",
     tag = "Shelf",
+    security(("apiToken" = ["read"]), ("sessionCookie" = [])),
     params(("id" = i64, Path)),
     responses(
         (status = 200, description = "The image.", body = Bytes, content_type = "image/*"),
@@ -1934,7 +1990,7 @@ pub(super) fn random_name() -> String {
 )]
 async fn image_file(
     State(state): State<Arc<AppState>>,
-    user: AuthUser,
+    ReadAuth { user }: ReadAuth,
     Path(id): Path<i64>,
 ) -> impl IntoResponse {
     let Ok(Some(img)) = state.db.get_physical_image(user.user_id, id).await else {
@@ -1973,10 +2029,13 @@ pub struct ImageUpdate {
 
 // PATCH /api/v1/physical/images/:id — file it, name it, move it.
 /// Re-file, caption or reorder a scan.
+///
+/// Scope: `write` *(since v0.120)*.
 #[utoipa::path(
     patch,
     path = "/api/v1/physical/images/{id}",
     tag = "Shelf",
+    security(("apiToken" = ["write"]), ("sessionCookie" = [])),
     params(("id" = i64, Path)),
     request_body = ImageUpdate,
     responses(
@@ -1987,7 +2046,7 @@ pub struct ImageUpdate {
 )]
 async fn update_image(
     State(state): State<Arc<AppState>>,
-    user: AuthUser,
+    WriteAuth { user }: WriteAuth,
     Path(id): Path<i64>,
     Json(body): Json<ImageUpdate>,
 ) -> impl IntoResponse {
@@ -2011,8 +2070,9 @@ async fn update_image(
 
 /// Remove a scan.
 ///
-/// Session-only. An uploaded file is deleted from disk with the row and
-/// cannot be recovered; a provider's image is only unlinked and can be
+/// Session-only, deliberately, for the reason removing a shelf item is: an
+/// uploaded file is deleted from disk with the row and cannot be recovered,
+/// and no backup holds it. A provider's image is only unlinked and can be
 /// fetched again.
 #[utoipa::path(
     delete,
@@ -2134,7 +2194,7 @@ pub struct PlaySide {
 // which would break session grouping and the hour-of-day heatmap outright.
 /// Record a side as played.
 ///
-/// Session-only. **Writes one listen per track, not one per side** — every
+/// Scope: `write` *(since v0.120)*. **Writes one listen per track, not one per side** — every
 /// counting query in Tapedeck is over listens, so a side-shaped row would
 /// be invisible to all of them.
 ///
@@ -2152,6 +2212,7 @@ pub struct PlaySide {
     post,
     path = "/api/v1/physical/{id}/play",
     tag = "Shelf",
+    security(("apiToken" = ["write"]), ("sessionCookie" = [])),
     params(("id" = i64, Path)),
     request_body = PlaySide,
     responses(
@@ -2163,13 +2224,20 @@ pub struct PlaySide {
 )]
 async fn play_side(
     State(state): State<Arc<AppState>>,
-    user: AuthUser,
+    WriteAuth { user }: WriteAuth,
     Path(id): Path<i64>,
     Json(body): Json<PlaySide>,
 ) -> impl IntoResponse {
     let Ok(Some(release)) = state.db.get_physical(user.user_id, id).await else {
         return err(404, "No such record");
     };
+    // Before anything is written: these land on every listen below and are
+    // then remembered on the pressing.
+    if let Some(refused) =
+        refuse_foreign_gear(&state, user.user_id, body.chain_id, body.equipment_id).await
+    {
+        return refused;
+    }
 
     let all: Vec<PhysicalTrack> = serde_json::from_str(&release.tracks).unwrap_or_default();
     let side = body.side.trim().to_uppercase();
@@ -2496,7 +2564,7 @@ pub struct DeckState {
 // off the dashboard one track length after it was paused.
 /// A side is on the deck.
 ///
-/// Session-only. The shelf is the one source where the **browser** is the
+/// Scope: `write` *(since v0.120)*. The shelf is the one source where the **browser** is the
 /// player: the clock runs in front of the turntable, in localStorage, and
 /// nothing server-side can derive a playhead from a stack of rows. So the
 /// deck pushes here, where Plex, Jellyfin and Navidrome are polled.
@@ -2517,6 +2585,7 @@ pub struct DeckState {
     post,
     path = "/api/v1/physical/{id}/now-playing",
     tag = "Shelf",
+    security(("apiToken" = ["write"]), ("sessionCookie" = [])),
     params(("id" = i64, Path)),
     request_body = DeckState,
     responses(
@@ -2528,7 +2597,7 @@ pub struct DeckState {
 )]
 async fn set_now_playing(
     State(state): State<Arc<AppState>>,
-    user: AuthUser,
+    WriteAuth { user }: WriteAuth,
     Path(id): Path<i64>,
     Json(body): Json<DeckState>,
 ) -> impl IntoResponse {
@@ -2614,7 +2683,7 @@ async fn set_now_playing(
 // *cancelling* a side means, and that has no track to name.
 /// Nothing is on the deck.
 ///
-/// Session-only. Its own route rather than a field on the push, because it
+/// Scope: `write` *(since v0.120)*. Its own route rather than a field on the push, because it
 /// is also what *cancelling* a side means and that has no track to name.
 /// Clears only entries this shelf reported — an idle turntable must not
 /// wipe a now-playing the user's phone is currently sending over ingest.
@@ -2622,6 +2691,7 @@ async fn set_now_playing(
     delete,
     path = "/api/v1/physical/now-playing",
     tag = "Shelf",
+    security(("apiToken" = ["write"]), ("sessionCookie" = [])),
     responses(
         (status = 200, description = "Cleared.", body = ShelfDone),
         (status = 401, response = Unauthorized),
@@ -2629,7 +2699,7 @@ async fn set_now_playing(
 )]
 async fn clear_now_playing(
     State(state): State<Arc<AppState>>,
-    user: AuthUser,
+    WriteAuth { user }: WriteAuth,
 ) -> impl IntoResponse {
     state.now_playing.clear_user_source(user.user_id, SHELF_SOURCE);
     (StatusCode::OK, Json(ShelfDone { status: "cleared" })).into_response()
@@ -2675,7 +2745,7 @@ pub struct SpinUpdate {
 // to draw it without a second request.
 /// The side currently on the deck.
 ///
-/// Session-only. Returns `{ "spin": null }` when nothing is on.
+/// Scope: `read` *(since v0.120)*. Returns `{ "spin": null }` when nothing is on.
 ///
 /// The shelf is the one source where the *browser* is the player, so the
 /// countdown runs in the page — but what is on and when it started live
@@ -2688,12 +2758,16 @@ pub struct SpinUpdate {
     get,
     path = "/api/v1/physical/spin",
     tag = "Shelf",
+    security(("apiToken" = ["read"]), ("sessionCookie" = [])),
     responses(
         (status = 200, description = "OK.", body = Spin),
         (status = 401, response = Unauthorized),
     )
 )]
-async fn get_spin(State(state): State<Arc<AppState>>, user: AuthUser) -> impl IntoResponse {
+async fn get_spin(
+    State(state): State<Arc<AppState>>,
+    ReadAuth { user }: ReadAuth,
+) -> impl IntoResponse {
     let spin = match state.db.get_spin(user.user_id).await {
         Ok(s) => s,
         Err(e) => return err(500, e.to_string()),
@@ -2749,7 +2823,7 @@ async fn get_spin(State(state): State<Arc<AppState>>, user: AuthUser) -> impl In
 // of them meant.
 /// Put a side on the deck, or update the one that is on.
 ///
-/// Session-only. One deck per user — the table's primary key is the user,
+/// Scope: `write` *(since v0.120)*. One deck per user — the table's primary key is the user,
 /// because nobody listens to two records at once, so starting a second side
 /// replaces the first rather than erroring.
 ///
@@ -2761,6 +2835,7 @@ async fn get_spin(State(state): State<Arc<AppState>>, user: AuthUser) -> impl In
     put,
     path = "/api/v1/physical/spin",
     tag = "Shelf",
+    security(("apiToken" = ["write"]), ("sessionCookie" = [])),
     request_body = SpinUpdate,
     responses(
         (status = 200, description = "Stored.", body = ShelfDone),
@@ -2770,15 +2845,21 @@ async fn get_spin(State(state): State<Arc<AppState>>, user: AuthUser) -> impl In
 )]
 async fn put_spin(
     State(state): State<Arc<AppState>>,
-    user: AuthUser,
+    WriteAuth { user }: WriteAuth,
     Json(body): Json<SpinUpdate>,
 ) -> impl IntoResponse {
-    // The release must be the caller's — this is the only id in the body that
-    // names something owned.
+    // Every id in the body names something owned, and each must be the
+    // caller's. The chain and the gear are not decoration: the deck hands them
+    // straight back to `play_side` when the side is recorded.
     match state.db.get_physical(user.user_id, body.release_id).await {
         Ok(Some(_)) => {}
         Ok(None) => return err(404, "No such record"),
         Err(e) => return err(500, e.to_string()),
+    }
+    if let Some(refused) =
+        refuse_foreign_gear(&state, user.user_id, body.chain_id, body.equipment_id).await
+    {
+        return refused;
     }
 
     let outcomes = serde_json::to_string(&body.outcomes).unwrap_or_else(|_| "[]".into());
@@ -2810,7 +2891,7 @@ async fn put_spin(
 // now-playing design already calls out.
 /// Take the side off the deck.
 ///
-/// Session-only. Clears the now-playing entry as well, so the two cannot
+/// Scope: `write` *(since v0.120)*. Clears the now-playing entry as well, so the two cannot
 /// disagree. Recording a side (`POST /api/v1/physical/{id}/play`) clears it
 /// too — otherwise reopening the page would offer to resume a side that has
 /// already been logged, which is how one gets logged twice.
@@ -2818,12 +2899,16 @@ async fn put_spin(
     delete,
     path = "/api/v1/physical/spin",
     tag = "Shelf",
+    security(("apiToken" = ["write"]), ("sessionCookie" = [])),
     responses(
         (status = 200, description = "Cleared.", body = ShelfDone),
         (status = 401, response = Unauthorized),
     )
 )]
-async fn delete_spin(State(state): State<Arc<AppState>>, user: AuthUser) -> impl IntoResponse {
+async fn delete_spin(
+    State(state): State<Arc<AppState>>,
+    WriteAuth { user }: WriteAuth,
+) -> impl IntoResponse {
     if let Err(e) = state.db.clear_spin(user.user_id).await {
         return err(500, e.to_string());
     }
@@ -2845,12 +2930,15 @@ fn medium_label(kind: &str) -> &'static str {
 // GET /api/v1/physical/equipment/:id/wear — hours on a stylus or head.
 /// Stylus hours or head wear for a piece of gear.
 ///
+/// Scope: `read` *(since v0.120)*.
+///
 /// Derived from `physical_plays`. A duplicate submission is not counted as
 /// wear.
 #[utoipa::path(
     get,
     path = "/api/v1/physical/equipment/{id}/wear",
     tag = "Shelf",
+    security(("apiToken" = ["read"]), ("sessionCookie" = [])),
     params(("id" = i64, Path)),
     responses(
         (status = 200, description = "OK.", body = GearWear),
@@ -2859,7 +2947,7 @@ fn medium_label(kind: &str) -> &'static str {
 )]
 async fn equipment_wear(
     State(state): State<Arc<AppState>>,
-    user: AuthUser,
+    ReadAuth { user }: ReadAuth,
     Path(id): Path<i64>,
 ) -> impl IntoResponse {
     match state.db.equipment_playback_hours(user.user_id, id).await {

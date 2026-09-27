@@ -36,7 +36,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
-use super::auth::AuthUser;
+use super::auth::{AuthUser, ReadAuth};
 use super::models::ErrorResponse;
 use super::AppState;
 use crate::db::{CrateEntry, NewRecommendation};
@@ -173,7 +173,7 @@ suggestion. A recommendation with no grounding in their history is not one."
 
 /// Things somebody suggested that you do not own.
 ///
-/// Session-only. Each entry carries **`first_played_at`**, derived from the
+/// Scope: `read` *(since v0.120)*. Each entry carries **`first_played_at`**, derived from the
 /// listens rather than stored — whether the suggestion actually landed.
 /// That is the thing only a scrobbler can answer, and it is what makes this
 /// more than a wantlist: a recommendation is a prediction, and Tapedeck is
@@ -184,12 +184,13 @@ suggestion. A recommendation with no grounding in their history is not one."
     get,
     path = "/api/v1/crate",
     tag = "Crate",
+    security(("apiToken" = ["read"]), ("sessionCookie" = [])),
     responses(
         (status = 200, description = "The crate.", body = Crate),
         (status = 401, response = Unauthorized),
     )
 )]
-async fn list_crate(State(state): State<Arc<AppState>>, user: AuthUser) -> Response {
+async fn list_crate(State(state): State<Arc<AppState>>, ReadAuth { user }: ReadAuth) -> Response {
     match state.db.list_crate(user.user_id).await {
         Ok(entries) => {
             // The number that makes this more than a wantlist: how many

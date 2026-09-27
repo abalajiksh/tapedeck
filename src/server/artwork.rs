@@ -28,7 +28,7 @@ use serde::Serialize;
 use std::sync::Arc;
 use utoipa::ToSchema;
 
-use super::auth::{AuthUser, WriteAuth};
+use super::auth::{AuthUser, ReadAuth, WriteAuth};
 use super::models::ErrorResponse;
 use crate::openapi::{BadRequest, Bytes, FileUpload, NotFound, Unauthorized};
 
@@ -87,12 +87,13 @@ pub(crate) fn remote_item_id(source_name: &str, source_id: &str) -> Option<Strin
 
 /// Cover art for a listen, proxied.
 ///
-/// Session-only. Proxies the user's own library server, which the browser
+/// Scope: `read` *(since v0.120)*. Proxies the user's own library server, which the browser
 /// usually cannot reach and must not hold credentials for.
 #[utoipa::path(
     get,
     path = "/api/v1/art/{id}",
     tag = "Library",
+    security(("apiToken" = ["read"]), ("sessionCookie" = [])),
     params(("id" = i64, Path, description = "The listen.")),
     responses(
         (status = 200, description = "Image bytes, `Cache-Control: private` for a week.", body = Bytes, content_type = "image/*"),
@@ -102,7 +103,7 @@ pub(crate) fn remote_item_id(source_name: &str, source_id: &str) -> Option<Strin
 )]
 async fn scrobble_art(
     State(state): State<Arc<AppState>>,
-    user: AuthUser,
+    ReadAuth { user }: ReadAuth,
     Path(id): Path<i64>,
 ) -> impl IntoResponse {
     let Ok(Some(scrobble)) = state.db.get_scrobble(user.user_id, id).await else {
@@ -215,11 +216,12 @@ async fn artist_image_from_library(
 
 /// An artist portrait, proxied.
 ///
-/// Session-only.
+/// Scope: `read` *(since v0.120)*.
 #[utoipa::path(
     get,
     path = "/api/v1/artists/img/{id}",
     tag = "Library",
+    security(("apiToken" = ["read"]), ("sessionCookie" = [])),
     params(("id" = i64, Path, description = "The `artists` row — `artist_row_id` on an artist page.")),
     responses(
         (status = 200, description = "Image bytes, `Cache-Control: private` for a week.", body = Bytes, content_type = "image/*"),
@@ -229,7 +231,7 @@ async fn artist_image_from_library(
 )]
 async fn artist_image(
     State(state): State<Arc<AppState>>,
-    user: AuthUser,
+    ReadAuth { user }: ReadAuth,
     Path(id): Path<i64>,
 ) -> Response {
     let Ok(Some((name, _))) = state.db.artist_by_id(id).await else {
@@ -590,7 +592,7 @@ async fn forget_previous(state: &Arc<AppState>, previous: Option<&str>) {
 // uploads directory.
 /// Serve an uploaded picture.
 ///
-/// Session-only. Cached `private, immutable` — the name is random per
+/// Scope: `read` *(since v0.120)*. Cached `private, immutable` — the name is random per
 /// upload, so the bytes behind a given URL never change.
 ///
 /// `name` is **validated, not trusted**: it must be exactly the 24 hex
@@ -601,6 +603,7 @@ async fn forget_previous(state: &Arc<AppState>, previous: Option<&str>) {
     get,
     path = "/api/v1/art/upload/{name}",
     tag = "Library",
+    security(("apiToken" = ["read"]), ("sessionCookie" = [])),
     params(("name" = String, Path, description = "As it appears in the stored URL.")),
     responses(
         (status = 200, description = "Image bytes, `Cache-Control: private, immutable`.", body = Bytes, content_type = "image/*"),
@@ -610,7 +613,7 @@ async fn forget_previous(state: &Arc<AppState>, previous: Option<&str>) {
 )]
 async fn serve_upload(
     State(state): State<Arc<AppState>>,
-    user: AuthUser,
+    ReadAuth { user }: ReadAuth,
     Path(name): Path<String>,
 ) -> Response {
     let _ = &user;

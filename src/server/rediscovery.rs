@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use utoipa::{IntoParams, ToSchema};
 
-use super::auth::AuthUser;
+use super::auth::ReadAuth;
 use super::models::ErrorResponse;
 use super::AppState;
 use crate::db::RediscoveryRow;
@@ -121,7 +121,7 @@ fn plural(n: usize, one: &str, many: &str) -> String {
 
 /// The Rediscovery lists, all built from your own history.
 ///
-/// Session-only. Nothing here points at music you do not own — that is the
+/// Scope: `read` *(since v0.120)*. Nothing here points at music you do not own — that is the
 /// design, not an implementation detail.
 ///
 /// "Not lately" is a **parameter, not a constant**: six months is a long
@@ -131,6 +131,7 @@ fn plural(n: usize, one: &str, many: &str) -> String {
     get,
     path = "/api/v1/rediscovery",
     tag = "Rediscovery",
+    security(("apiToken" = ["read"]), ("sessionCookie" = [])),
     params(RediscoverQuery),
     responses(
         (status = 200, description = "OK.", body = Rediscovery),
@@ -139,7 +140,7 @@ fn plural(n: usize, one: &str, many: &str) -> String {
 )]
 pub async fn rediscover(
     State(state): State<Arc<AppState>>,
-    user: AuthUser,
+    ReadAuth { user }: ReadAuth,
     Query(q): Query<RediscoverQuery>,
 ) -> impl IntoResponse {
     let limit = q.limit.unwrap_or(12).clamp(1, 50);
@@ -315,7 +316,7 @@ pub async fn rediscover(
 // GET /api/v1/rediscovery/gear/:id — favourites this gear has never played.
 /// Favourites never heard on a piece of gear.
 ///
-/// Session-only. Answered by joining `chain_id` to the chains whose
+/// Scope: `read` *(since v0.120)*. Answered by joining `chain_id` to the chains whose
 /// components reference the gear — no per-listen equipment field needed.
 /// Restricted to tracks played more than once: the interesting question is
 /// how your *favourites* sound on it.
@@ -323,6 +324,7 @@ pub async fn rediscover(
     get,
     path = "/api/v1/rediscovery/gear/{id}",
     tag = "Rediscovery",
+    security(("apiToken" = ["read"]), ("sessionCookie" = [])),
     params(("id" = i64, Path, description = "One of your pieces of gear."), RediscoverQuery),
     responses(
         (status = 200, description = "OK.", body = GearRows),
@@ -332,7 +334,7 @@ pub async fn rediscover(
 )]
 async fn never_on_gear(
     State(state): State<Arc<AppState>>,
-    user: AuthUser,
+    ReadAuth { user }: ReadAuth,
     Path(id): Path<i64>,
     Query(q): Query<RediscoverQuery>,
 ) -> impl IntoResponse {

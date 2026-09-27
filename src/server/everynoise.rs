@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tracing::error;
 
-use super::auth::AuthUser;
+use super::auth::{AuthUser, ReadAuth};
 use super::models::ErrorResponse;
 use super::AppState;
 use crate::everynoise::scrape::{self, Progress, Tier};
@@ -501,7 +501,7 @@ pub(crate) fn blend(weighted: &[(&str, i64)]) -> Option<String> {
 // `user_id` like every other read.
 /// The map, your genres on it, and your average colour.
 ///
-/// Session-only. The canvas is 1500 × 22,648 — fifteen times taller than
+/// Scope: `read` *(since v0.120)*. The canvas is 1500 × 22,648 — fifteen times taller than
 /// wide — so a client must compress the y axis **in the coordinates**, not
 /// with `preserveAspectRatio`, which would squash the circles into ellipses
 /// too.
@@ -512,13 +512,17 @@ pub(crate) fn blend(weighted: &[(&str, i64)]) -> Option<String> {
     get,
     path = "/api/v1/genre-map",
     tag = "Genre map",
+    security(("apiToken" = ["read"]), ("sessionCookie" = [])),
     responses(
         (status = 200, description = "OK.", body = GenreMap),
         (status = 401, response = Unauthorized),
         (status = 409, description = "The map has not been fetched yet. Run the scrape in Settings.", body = ErrorResponse),
     )
 )]
-pub async fn genre_map(State(state): State<Arc<AppState>>, user: AuthUser) -> impl IntoResponse {
+pub async fn genre_map(
+    State(state): State<Arc<AppState>>,
+    ReadAuth { user }: ReadAuth,
+) -> impl IntoResponse {
     let backdrop = match state.everynoise.all_points().await {
         Ok(p) => p,
         Err(e) => {
@@ -645,7 +649,7 @@ pub struct TrajectoryQuery {
 
 /// Where your listening sat, period by period.
 ///
-/// Session-only. The play-weighted centroid of each period.
+/// Scope: `read` *(since v0.120)*. The play-weighted centroid of each period.
 ///
 /// Three honesty constraints, all load-bearing. It is an **artist-mix**
 /// trajectory, not a track-level one — every track by an artist carries
@@ -662,6 +666,7 @@ pub struct TrajectoryQuery {
     get,
     path = "/api/v1/genre-map/trajectory",
     tag = "Genre map",
+    security(("apiToken" = ["read"]), ("sessionCookie" = [])),
     params(TrajectoryQuery),
     responses(
         (status = 200, description = "OK.", body = GenreTrajectory),
@@ -670,7 +675,7 @@ pub struct TrajectoryQuery {
 )]
 pub async fn genre_trajectory(
     State(state): State<Arc<AppState>>,
-    user: AuthUser,
+    ReadAuth { user }: ReadAuth,
     axum::extract::Query(q): axum::extract::Query<TrajectoryQuery>,
 ) -> impl IntoResponse {
     let tz = super::scrobbles::user_tz_for(&state, user.user_id).await;
@@ -917,7 +922,7 @@ pub struct Breadth {
 // present an Every Noise exemplar as something the listener owns.
 /// What sits next to your listening.
 ///
-/// Session-only. Walks Every Noise's precomputed adjacency, seeded from
+/// Scope: `read` *(since v0.120)*. Walks Every Noise's precomputed adjacency, seeded from
 /// your top 25 genres.
 ///
 /// **This does not recommend music**, and the response shape is what
@@ -937,6 +942,7 @@ pub struct Breadth {
     get,
     path = "/api/v1/genre-map/neighbours",
     tag = "Genre map",
+    security(("apiToken" = ["read"]), ("sessionCookie" = [])),
     responses(
         (status = 200, description = "OK.", body = GenreNeighbours),
         (status = 401, response = Unauthorized),
@@ -945,7 +951,7 @@ pub struct Breadth {
 )]
 pub async fn genre_neighbours(
     State(state): State<Arc<AppState>>,
-    user: AuthUser,
+    ReadAuth { user }: ReadAuth,
 ) -> impl IntoResponse {
     let counts = state.db.genre_play_counts(user.user_id, None).await.unwrap_or_default();
     if counts.is_empty() {

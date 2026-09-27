@@ -796,7 +796,7 @@ pub async fn call(
                 metric: arg_str(args, "metric"),
             };
             handler_json(
-                crate::server::library::charts(st(), user(), Query(q)).await.into_response(),
+                crate::server::library::charts(st(), read(), Query(q)).await.into_response(),
             )
             .await?
         }
@@ -816,7 +816,7 @@ pub async fn call(
         "genre_trajectory" => {
             let q = crate::server::everynoise::TrajectoryQuery { by: arg_str(args, "by") };
             handler_json(
-                crate::server::everynoise::genre_trajectory(st(), user(), Query(q))
+                crate::server::everynoise::genre_trajectory(st(), read(), Query(q))
                     .await
                     .into_response(),
             )
@@ -825,7 +825,7 @@ pub async fn call(
 
         "genre_neighbours" => {
             handler_json(
-                crate::server::everynoise::genre_neighbours(st(), user()).await.into_response(),
+                crate::server::everynoise::genre_neighbours(st(), read()).await.into_response(),
             )
             .await?
         }
@@ -836,7 +836,7 @@ pub async fn call(
                 offset: arg_i64(args, "offset"),
             };
             handler_json(
-                crate::server::sessions::list_sessions(st(), user(), Query(q))
+                crate::server::sessions::list_sessions(st(), read(), Query(q))
                     .await
                     .into_response(),
             )
@@ -849,7 +849,7 @@ pub async fn call(
                 offset: arg_i64(args, "offset"),
             };
             handler_json(
-                crate::server::scrobbles::list_skips(st(), user(), Query(q)).await.into_response(),
+                crate::server::scrobbles::list_skips(st(), read(), Query(q)).await.into_response(),
             )
             .await?
         }
@@ -867,7 +867,7 @@ pub async fn call(
                 limit: Some(arg_i64(args, "limit").unwrap_or(10).clamp(1, 50)),
             };
             handler_json(
-                crate::server::scrobbles::search(st(), user(), Query(q)).await.into_response(),
+                crate::server::scrobbles::search(st(), read(), Query(q)).await.into_response(),
             )
             .await?
         }
@@ -876,7 +876,7 @@ pub async fn call(
             let name = require(args, "name")?;
             let id = entity_id(state, "artist", &name, "").await?;
             handler_json(
-                crate::server::library::artist_detail(st(), user(), Path(id)).await.into_response(),
+                crate::server::library::artist_detail(st(), read(), Path(id)).await.into_response(),
             )
             .await?
         }
@@ -886,7 +886,7 @@ pub async fn call(
             let artist = require(args, "artist")?;
             let id = entity_id(state, "album", &name, &artist).await?;
             handler_json(
-                crate::server::library::album_detail(st(), user(), Path(id)).await.into_response(),
+                crate::server::library::album_detail(st(), read(), Path(id)).await.into_response(),
             )
             .await?
         }
@@ -904,7 +904,7 @@ pub async fn call(
         "shelf" => {
             let q = crate::server::physical::ShelfQuery { kind: arg_str(args, "kind") };
             handler_json(
-                crate::server::physical::list_shelf(st(), user(), Query(q)).await.into_response(),
+                crate::server::physical::list_shelf(st(), read(), Query(q)).await.into_response(),
             )
             .await?
         }
@@ -978,7 +978,7 @@ pub async fn call(
                 limit: Some(arg_i64(args, "limit").unwrap_or(12).clamp(1, 50)),
             };
             handler_json(
-                crate::server::rediscovery::rediscover(st(), user(), Query(q))
+                crate::server::rediscovery::rediscover(st(), read(), Query(q))
                     .await
                     .into_response(),
             )

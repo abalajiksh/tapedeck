@@ -11,7 +11,7 @@ use std::sync::Arc;
 use tracing::warn;
 use utoipa::ToSchema;
 
-use super::auth::AuthUser;
+use super::auth::{AuthUser, ReadAuth};
 use super::models::{ErrorResponse, OkResponse};
 use super::AppState;
 use crate::db::Database;
@@ -1235,19 +1235,23 @@ fn avatar_src(stored: Option<&str>) -> Option<String> {
 // GET /api/v1/profile — your own account.
 /// The caller's own account.
 ///
-/// Session-only. Takes no id — it is always the caller's own account, which
+/// Scope: `read` *(since v0.120)*. Takes no id — it is always the caller's own account, which
 /// is the point: an account created for someone else was previously only
 /// changeable by the admin who created it.
 #[utoipa::path(
     get,
     path = "/api/v1/profile",
     tag = "Account",
+    security(("apiToken" = ["read"]), ("sessionCookie" = [])),
     responses(
         (status = 200, description = "OK.", body = Profile),
         (status = 401, response = Unauthorized),
     )
 )]
-async fn get_profile(State(state): State<Arc<AppState>>, user: AuthUser) -> impl IntoResponse {
+async fn get_profile(
+    State(state): State<Arc<AppState>>,
+    ReadAuth { user }: ReadAuth,
+) -> impl IntoResponse {
     match state.db.get_profile(user.user_id).await {
         Ok(Some(p)) => {
             // The path on disk is replaced, not accompanied.
@@ -1621,7 +1625,7 @@ pub struct AvatarStored {
 // cache holding one would hand it to the next person through the proxy.
 /// The caller's uploaded profile picture.
 ///
-/// Session-only and scoped to the caller, like the artwork proxy. Cached
+/// Scope: `read` *(since v0.120)*, and scoped to the caller, like the artwork proxy. Cached
 /// `private` — a shared cache holding one would serve it to the next person
 /// through the proxy. 404 when the avatar is an external URL rather than an
 /// uploaded file.
@@ -1629,6 +1633,7 @@ pub struct AvatarStored {
     get,
     path = "/api/v1/profile/avatar",
     tag = "Account",
+    security(("apiToken" = ["read"]), ("sessionCookie" = [])),
     responses(
         (status = 200, description = "The image bytes.", body = crate::openapi::Bytes,
             content_type = "image/*"),
@@ -1636,7 +1641,10 @@ pub struct AvatarStored {
         (status = 404, response = NotFound),
     )
 )]
-async fn serve_avatar(State(state): State<Arc<AppState>>, user: AuthUser) -> impl IntoResponse {
+async fn serve_avatar(
+    State(state): State<Arc<AppState>>,
+    ReadAuth { user }: ReadAuth,
+) -> impl IntoResponse {
     let stored = state.db.get_profile(user.user_id).await.ok().flatten().and_then(|p| p.avatar_url);
     let Some(rel) = stored.filter(|s| !s.starts_with("http")) else {
         return (

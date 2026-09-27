@@ -213,7 +213,7 @@ pub struct MostSkipped {
 // belongs.
 /// Tracks you bailed out of.
 ///
-/// Session-only. Skips are stored but excluded from every listening figure,
+/// Scope: `read` *(since v0.120)*. Skips are stored but excluded from every listening figure,
 /// so this is the only place they are readable.
 ///
 /// `listened_ms` is how far in the listener got, and is **null** when
@@ -229,6 +229,7 @@ pub struct MostSkipped {
     get,
     path = "/api/v1/skips",
     tag = "Listens",
+    security(("apiToken" = ["read"]), ("sessionCookie" = [])),
     params(SkipsQuery),
     responses(
         (status = 200, description = "OK.", body = Skips),
@@ -237,7 +238,7 @@ pub struct MostSkipped {
 )]
 pub async fn list_skips(
     State(state): State<Arc<AppState>>,
-    user: AuthUser,
+    ReadAuth { user }: ReadAuth,
     Query(params): Query<SkipsQuery>,
 ) -> impl IntoResponse {
     let limit = params.limit.unwrap_or(25).clamp(1, 100);
@@ -302,12 +303,13 @@ pub async fn list_skips(
 // person's library is not searchable by another.
 /// Search your listens.
 ///
-/// Session-only. Searches `scrobbles`, not `entities` — searching entities
+/// Scope: `read` *(since v0.120)*. Searches `scrobbles`, not `entities` — searching entities
 /// would only find records you had already been to.
 #[utoipa::path(
     get,
     path = "/api/v1/search",
     tag = "Listens",
+    security(("apiToken" = ["read"]), ("sessionCookie" = [])),
     params(SearchQuery),
     responses(
         (status = 200, description = "OK.", body = SearchResults),
@@ -316,7 +318,7 @@ pub async fn list_skips(
 )]
 pub async fn search(
     State(state): State<Arc<AppState>>,
-    user: AuthUser,
+    ReadAuth { user }: ReadAuth,
     Query(params): Query<SearchQuery>,
 ) -> impl IntoResponse {
     let q = params.q.unwrap_or_default();
@@ -1059,11 +1061,12 @@ pub async fn ranged_stats(
 // GET /api/v1/personality?range=… — five-axis listening personality.
 /// Musical personality — a verdict, traits and loyalty.
 ///
-/// Session-only.
+/// Scope: `read` *(since v0.120)*.
 #[utoipa::path(
     get,
     path = "/api/v1/personality",
     tag = "Statistics",
+    security(("apiToken" = ["read"]), ("sessionCookie" = [])),
     params(StatsQuery),
     responses(
         (status = 200, description = "OK.", body = crate::analytics::Personality),
@@ -1072,7 +1075,7 @@ pub async fn ranged_stats(
 )]
 async fn personality(
     State(state): State<Arc<AppState>>,
-    user: AuthUser,
+    ReadAuth { user }: ReadAuth,
     Query(q): Query<StatsQuery>,
 ) -> impl IntoResponse {
     match state

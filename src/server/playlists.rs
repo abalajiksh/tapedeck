@@ -37,7 +37,7 @@ use std::sync::Arc;
 use tracing::{debug, info, warn};
 use utoipa::ToSchema;
 
-use super::auth::AuthUser;
+use super::auth::{AuthUser, ReadAuth};
 use super::models::ErrorResponse;
 use super::AppState;
 use crate::db::{PlaylistTrackView, SavedPlaylistRecord, UserSource};
@@ -638,7 +638,7 @@ pub async fn push_tracks(
 
 /// Playlists kept in Tapedeck.
 ///
-/// Session-only. `origin` is `user` for one you built, or the name of the
+/// Scope: `read` *(since v0.120)*. `origin` is `user` for one you built, or the name of the
 /// MCP connection that wrote it — a list an assistant produced stays
 /// distinguishable from one you made, the same provenance rule notes
 /// follow.
@@ -646,12 +646,16 @@ pub async fn push_tracks(
     get,
     path = "/api/v1/saved-playlists",
     tag = "Playlists",
+    security(("apiToken" = ["read"]), ("sessionCookie" = [])),
     responses(
         (status = 200, description = "The playlists.", body = SavedPlaylists),
         (status = 401, response = Unauthorized),
     )
 )]
-async fn list_saved(State(state): State<Arc<AppState>>, user: AuthUser) -> impl IntoResponse {
+async fn list_saved(
+    State(state): State<Arc<AppState>>,
+    ReadAuth { user }: ReadAuth,
+) -> impl IntoResponse {
     match state.db.list_playlists(user.user_id).await {
         Ok(rows) => (StatusCode::OK, Json(SavedPlaylists { playlists: rows })).into_response(),
         Err(e) => err(500, e.to_string()),
@@ -659,10 +663,13 @@ async fn list_saved(State(state): State<Arc<AppState>>, user: AuthUser) -> impl 
 }
 
 /// One playlist and its tracks.
+///
+/// Scope: `read` *(since v0.120)*.
 #[utoipa::path(
     get,
     path = "/api/v1/saved-playlists/{id}",
     tag = "Playlists",
+    security(("apiToken" = ["read"]), ("sessionCookie" = [])),
     params(("id" = i64, Path)),
     responses(
         (status = 200, description = "The playlist.", body = SavedPlaylistDetail),
@@ -672,7 +679,7 @@ async fn list_saved(State(state): State<Arc<AppState>>, user: AuthUser) -> impl 
 )]
 async fn get_saved(
     State(state): State<Arc<AppState>>,
-    user: AuthUser,
+    ReadAuth { user }: ReadAuth,
     axum::extract::Path(id): axum::extract::Path<i64>,
 ) -> impl IntoResponse {
     let Ok(all) = state.db.list_playlists(user.user_id).await else {

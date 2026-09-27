@@ -24,7 +24,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use utoipa::{IntoParams, ToSchema};
 
-use super::auth::AuthUser;
+use super::auth::{ReadAuth, WriteAuth};
 use super::models::ErrorResponse;
 use super::AppState;
 use crate::db::{AlbumAggregate, ChartRow, TrackAggregate};
@@ -248,7 +248,7 @@ async fn bio_for(
 
 /// An album page.
 ///
-/// Session-only. Aggregated over `scrobbles` by name. Track rows carry the
+/// Scope: `read` *(since v0.120)*. Aggregated over `scrobbles` by name. Track rows carry the
 /// **raw quality columns**, not a formatted label — the client formats
 /// them, so a server-side copy of that logic cannot drift.
 ///
@@ -259,6 +259,7 @@ async fn bio_for(
     get,
     path = "/api/v1/albums/{id}",
     tag = "Library",
+    security(("apiToken" = ["read"]), ("sessionCookie" = [])),
     params(("id" = i64, Path, description = "The album's entity id, from `GET /api/v1/resolve`.")),
     responses(
         (status = 200, description = "OK.", body = AlbumPage),
@@ -269,7 +270,7 @@ async fn bio_for(
 )]
 pub async fn album_detail(
     State(state): State<Arc<AppState>>,
-    user: AuthUser,
+    ReadAuth { user }: ReadAuth,
     Path(id): Path<i64>,
 ) -> impl IntoResponse {
     let entity = match state.db.get_entity(id).await {
@@ -398,11 +399,12 @@ pub async fn album_detail(
 
 /// An artist page.
 ///
-/// Session-only. Same shape and same rules as the album page.
+/// Scope: `read` *(since v0.120)*. Same shape and same rules as the album page.
 #[utoipa::path(
     get,
     path = "/api/v1/artists/{id}",
     tag = "Library",
+    security(("apiToken" = ["read"]), ("sessionCookie" = [])),
     params(("id" = i64, Path, description = "The artist's entity id, from `GET /api/v1/resolve`.")),
     responses(
         (status = 200, description = "OK.", body = ArtistPage),
@@ -413,7 +415,7 @@ pub async fn album_detail(
 )]
 pub async fn artist_detail(
     State(state): State<Arc<AppState>>,
-    user: AuthUser,
+    ReadAuth { user }: ReadAuth,
     Path(id): Path<i64>,
 ) -> impl IntoResponse {
     let entity = match state.db.get_entity(id).await {
@@ -559,7 +561,7 @@ pub struct Chart {
 
 /// Top charts.
 ///
-/// Session-only. Note this offers a **different range set** from
+/// Scope: `read` *(since v0.120)*. Note this offers a **different range set** from
 /// `/api/v1/stats` — it has `today`. The two answering the same question
 /// over different windows is known, and is why the Insights redesign wants
 /// one shared range control.
@@ -567,6 +569,7 @@ pub struct Chart {
     get,
     path = "/api/v1/charts",
     tag = "Statistics",
+    security(("apiToken" = ["read"]), ("sessionCookie" = [])),
     params(ChartQuery),
     responses(
         (status = 200, description = "OK.", body = Chart),
@@ -576,7 +579,7 @@ pub struct Chart {
 )]
 pub async fn charts(
     State(state): State<Arc<AppState>>,
-    user: AuthUser,
+    ReadAuth { user }: ReadAuth,
     Query(q): Query<ChartQuery>,
 ) -> impl IntoResponse {
     let kind: &'static str = match q.kind.as_deref().unwrap_or("artists") {
@@ -625,14 +628,16 @@ pub struct Resolved {
 
 /// Resolve names to an entity id.
 ///
-/// Session-only. **Creates the entity on first visit** — a write on a read
-/// path, on purpose. The browser knows names, not ids, so without this
-/// every link out of the history would be dead until you happened to
-/// annotate the thing it points at.
+/// Scope: `write` *(since v0.120)*, although it is a `GET`, because it
+/// **creates the entity on first visit** — a write on a read path, on
+/// purpose. The browser knows names, not ids, so without this every link out
+/// of the history would be dead until you happened to annotate the thing it
+/// points at. `POST /api/v1/notes/preview` takes `write` for the same reason.
 #[utoipa::path(
     get,
     path = "/api/v1/resolve",
     tag = "Library",
+    security(("apiToken" = ["write"]), ("sessionCookie" = [])),
     params(ResolveQuery),
     responses(
         (status = 200, description = "OK.", body = Resolved),
@@ -645,7 +650,7 @@ pub async fn resolve(
     // Unused, and required anyway: `entities` is a shared table with no
     // `user_id`, so there is nothing here to scope — but this endpoint *writes*,
     // and an unauthenticated caller must not be able to fill it with rows.
-    _user: AuthUser,
+    WriteAuth { user: _user }: WriteAuth,
     Query(q): Query<ResolveQuery>,
 ) -> impl IntoResponse {
     let kind = match crate::notes::RefKind::parse(&q.kind).and_then(|k| k.entity_kind()) {
@@ -685,7 +690,7 @@ pub async fn resolve(
 // into `scrobbles` would be inventing listens that never happened.
 /// The record's own tracklist, including tracks never played.
 ///
-/// Session-only. Everything else on the album page is aggregated from
+/// Scope: `read` *(since v0.120)*. Everything else on the album page is aggregated from
 /// listens, so a record played twice renders as a two-track record. This
 /// asks MusicBrainz what is actually on it.
 ///
@@ -706,6 +711,7 @@ pub async fn resolve(
     get,
     path = "/api/v1/albums/{id}/tracklist",
     tag = "Library",
+    security(("apiToken" = ["read"]), ("sessionCookie" = [])),
     params(("id" = i64, Path, description = "The album's entity id.")),
     responses(
         (status = 200, description = "OK.", body = AlbumTracklist),
@@ -717,7 +723,7 @@ pub async fn resolve(
 )]
 async fn album_tracklist(
     State(state): State<Arc<AppState>>,
-    user: AuthUser,
+    ReadAuth { user }: ReadAuth,
     Path(id): Path<i64>,
 ) -> impl IntoResponse {
     let entity = match state.db.get_entity(id).await {

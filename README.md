@@ -1388,8 +1388,8 @@ none of them implies another:
 | Scope | What it allows |
 |-------|----------------|
 | `submit` | `POST /1/submit-listens`, and `GET /api/v1/scrobble-settings` — the rule that submission is judged by. Nothing else. What every scrobble client holds. |
-| `read` | History, stats, loves, notes, now-playing, chains, gear. |
-| `write` | Loves, notes, and editing or deleting a listen. |
+| `read` | History, stats, charts, search, reports, sessions, Rediscovery, the album and artist pages and their artwork, loves, notes, lyrics, now-playing, chains, gear, the shelf (records, sides, scans, wear, the deck), saved playlists, the crate, the genre map, and your own profile. |
+| `write` | Loves, notes, editing or deleting a listen, and the shelf: looking a pressing up by barcode, adding and editing a record, uploading its scans, typing in running times, and playing a side on the deck. |
 | `all` | `read` + `write`. |
 
 `submit` deliberately does not imply `read`: the token in a scrobble client on
@@ -1412,7 +1412,9 @@ fine, and a 401 would send a client into a refresh loop it cannot win.
 `/admin/`, plus sources, service connections, Discogs settings, export and
 backup, the metadata sanitiser, the enrichment jobs, and
 `DELETE /api/v1/scrobbles` (clear everything) — the one listen operation a lost
-phone could make unrecoverable.
+phone could make unrecoverable. Removing a record from the shelf, or one of your
+own scans, stays session-only for the same reason: uploaded scans are not in the
+backup, so a deleted one is gone.
 
 ## How a listen gets its chain
 

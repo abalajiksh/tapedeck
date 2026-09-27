@@ -82,7 +82,7 @@ info:
   license:
     name: AGPL-3.0-or-later
     identifier: AGPL-3.0-or-later
-  version: 0.119.0
+  version: 0.120.0
 servers:
 - url: /
   description: The Tapedeck instance serving this document.
@@ -590,7 +590,7 @@ paths:
       - Account
       summary: The caller's own account.
       description: |-
-        Session-only. Takes no id — it is always the caller's own account, which
+        Scope: `read` *(since v0.120)*. Takes no id — it is always the caller's own account, which
         is the point: an account created for someone else was previously only
         changeable by the admin who created it.
       operationId: get_profile
@@ -603,6 +603,10 @@ paths:
                 $ref: '#/components/schemas/Profile'
         '401':
           $ref: '#/components/responses/Unauthorized'
+      security:
+      - apiToken:
+        - read
+      - sessionCookie: []
     patch:
       tags:
       - Account
@@ -672,7 +676,7 @@ paths:
       - Account
       summary: The caller's uploaded profile picture.
       description: |-
-        Session-only and scoped to the caller, like the artwork proxy. Cached
+        Scope: `read` *(since v0.120)*, and scoped to the caller, like the artwork proxy. Cached
         `private` — a shared cache holding one would serve it to the next person
         through the proxy. 404 when the avatar is an external URL rather than an
         uploaded file.
@@ -688,6 +692,10 @@ paths:
           $ref: '#/components/responses/Unauthorized'
         '404':
           $ref: '#/components/responses/NotFound'
+      security:
+      - apiToken:
+        - read
+      - sessionCookie: []
     post:
       tags:
       - Account
@@ -1588,7 +1596,7 @@ paths:
       - Listens
       summary: Search your listens.
       description: |-
-        Session-only. Searches `scrobbles`, not `entities` — searching entities
+        Scope: `read` *(since v0.120)*. Searches `scrobbles`, not `entities` — searching entities
         would only find records you had already been to.
       operationId: search
       parameters:
@@ -1619,13 +1627,17 @@ paths:
                 $ref: '#/components/schemas/SearchResults'
         '401':
           $ref: '#/components/responses/Unauthorized'
+      security:
+      - apiToken:
+        - read
+      - sessionCookie: []
   /api/v1/skips:
     get:
       tags:
       - Listens
       summary: Tracks you bailed out of.
       description: |-
-        Session-only. Skips are stored but excluded from every listening figure,
+        Scope: `read` *(since v0.120)*. Skips are stored but excluded from every listening figure,
         so this is the only place they are readable.
 
         `listened_ms` is how far in the listener got, and is **null** when
@@ -1666,6 +1678,10 @@ paths:
                 $ref: '#/components/schemas/Skips'
         '401':
           $ref: '#/components/responses/Unauthorized'
+      security:
+      - apiToken:
+        - read
+      - sessionCookie: []
   /api/v1/stats/dashboard:
     get:
       tags:
@@ -1756,7 +1772,7 @@ paths:
       tags:
       - Statistics
       summary: Musical personality — a verdict, traits and loyalty.
-      description: Session-only.
+      description: 'Scope: `read` *(since v0.120)*.'
       operationId: personality
       parameters:
       - name: range
@@ -1792,6 +1808,10 @@ paths:
                 $ref: '#/components/schemas/Personality'
         '401':
           $ref: '#/components/responses/Unauthorized'
+      security:
+      - apiToken:
+        - read
+      - sessionCookie: []
   /api/v1/lyrics:
     get:
       tags:
@@ -2384,7 +2404,7 @@ paths:
       - Sessions
       summary: Listening sessions.
       description: |-
-        Session-only. Contiguous listening with gaps under 30 minutes. A change
+        Scope: `read` *(since v0.120)*. Contiguous listening with gaps under 30 minutes. A change
         of submitting token also breaks a session — one token per app is how
         people organise these, so "fooyin stopped, Pano started" is a different
         setup even a minute later.
@@ -2417,11 +2437,16 @@ paths:
                 $ref: '#/components/schemas/SessionList'
         '401':
           $ref: '#/components/responses/Unauthorized'
+      security:
+      - apiToken:
+        - read
+      - sessionCookie: []
   /api/v1/sessions/{id}:
     get:
       tags:
       - Sessions
       summary: One session and its listens.
+      description: 'Scope: `read` *(since v0.120)*.'
       operationId: get_session
       parameters:
       - name: id
@@ -2441,6 +2466,10 @@ paths:
           $ref: '#/components/responses/Unauthorized'
         '404':
           $ref: '#/components/responses/NotFound'
+      security:
+      - apiToken:
+        - read
+      - sessionCookie: []
     patch:
       tags:
       - Sessions
@@ -3251,7 +3280,7 @@ paths:
       - Rediscovery
       summary: The Rediscovery lists, all built from your own history.
       description: |-
-        Session-only. Nothing here points at music you do not own — that is the
+        Scope: `read` *(since v0.120)*. Nothing here points at music you do not own — that is the
         design, not an implementation detail.
 
         "Not lately" is a **parameter, not a constant**: six months is a long
@@ -3291,13 +3320,17 @@ paths:
                 $ref: '#/components/schemas/Rediscovery'
         '401':
           $ref: '#/components/responses/Unauthorized'
+      security:
+      - apiToken:
+        - read
+      - sessionCookie: []
   /api/v1/rediscovery/gear/{id}:
     get:
       tags:
       - Rediscovery
       summary: Favourites never heard on a piece of gear.
       description: |-
-        Session-only. Answered by joining `chain_id` to the chains whose
+        Scope: `read` *(since v0.120)*. Answered by joining `chain_id` to the chains whose
         components reference the gear — no per-listen equipment field needed.
         Restricted to tracks played more than once: the interesting question is
         how your *favourites* sound on it.
@@ -3344,6 +3377,10 @@ paths:
           $ref: '#/components/responses/Unauthorized'
         '404':
           $ref: '#/components/responses/NotFound'
+      security:
+      - apiToken:
+        - read
+      - sessionCookie: []
   /api/v1/playlist-lab:
     get:
       tags:
@@ -3423,7 +3460,7 @@ paths:
       - Library
       summary: An album page.
       description: |-
-        Session-only. Aggregated over `scrobbles` by name. Track rows carry the
+        Scope: `read` *(since v0.120)*. Aggregated over `scrobbles` by name. Track rows carry the
         **raw quality columns**, not a formatted label — the client formats
         them, so a server-side copy of that logic cannot drift.
 
@@ -3456,13 +3493,17 @@ paths:
           $ref: '#/components/responses/Unauthorized'
         '404':
           $ref: '#/components/responses/NotFound'
+      security:
+      - apiToken:
+        - read
+      - sessionCookie: []
   /api/v1/albums/{id}/tracklist:
     get:
       tags:
       - Library
       summary: The record's own tracklist, including tracks never played.
       description: |-
-        Session-only. Everything else on the album page is aggregated from
+        Scope: `read` *(since v0.120)*. Everything else on the album page is aggregated from
         listens, so a record played twice renders as a two-track record. This
         asks MusicBrainz what is actually on it.
 
@@ -3515,12 +3556,16 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
+      security:
+      - apiToken:
+        - read
+      - sessionCookie: []
   /api/v1/artists/{id}:
     get:
       tags:
       - Library
       summary: An artist page.
-      description: Session-only. Same shape and same rules as the album page.
+      description: 'Scope: `read` *(since v0.120)*. Same shape and same rules as the album page.'
       operationId: artist_detail
       parameters:
       - name: id
@@ -3547,13 +3592,17 @@ paths:
           $ref: '#/components/responses/Unauthorized'
         '404':
           $ref: '#/components/responses/NotFound'
+      security:
+      - apiToken:
+        - read
+      - sessionCookie: []
   /api/v1/charts:
     get:
       tags:
       - Statistics
       summary: Top charts.
       description: |-
-        Session-only. Note this offers a **different range set** from
+        Scope: `read` *(since v0.120)*. Note this offers a **different range set** from
         `/api/v1/stats` — it has `today`. The two answering the same question
         over different windows is known, and is why the Insights redesign wants
         one shared range control.
@@ -3605,16 +3654,21 @@ paths:
           $ref: '#/components/responses/BadRequest'
         '401':
           $ref: '#/components/responses/Unauthorized'
+      security:
+      - apiToken:
+        - read
+      - sessionCookie: []
   /api/v1/resolve:
     get:
       tags:
       - Library
       summary: Resolve names to an entity id.
       description: |-
-        Session-only. **Creates the entity on first visit** — a write on a read
-        path, on purpose. The browser knows names, not ids, so without this
-        every link out of the history would be dead until you happened to
-        annotate the thing it points at.
+        Scope: `write` *(since v0.120)*, although it is a `GET`, because it
+        **creates the entity on first visit** — a write on a read path, on
+        purpose. The browser knows names, not ids, so without this every link out
+        of the history would be dead until you happened to annotate the thing it
+        points at. `POST /api/v1/notes/preview` takes `write` for the same reason.
       operationId: resolve
       parameters:
       - name: kind
@@ -3647,13 +3701,17 @@ paths:
           $ref: '#/components/responses/BadRequest'
         '401':
           $ref: '#/components/responses/Unauthorized'
+      security:
+      - apiToken:
+        - write
+      - sessionCookie: []
   /api/v1/art/{id}:
     get:
       tags:
       - Library
       summary: Cover art for a listen, proxied.
       description: |-
-        Session-only. Proxies the user's own library server, which the browser
+        Scope: `read` *(since v0.120)*. Proxies the user's own library server, which the browser
         usually cannot reach and must not hold credentials for.
       operationId: scrobble_art
       parameters:
@@ -3679,12 +3737,16 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
+      security:
+      - apiToken:
+        - read
+      - sessionCookie: []
   /api/v1/artists/img/{id}:
     get:
       tags:
       - Library
       summary: An artist portrait, proxied.
-      description: Session-only.
+      description: 'Scope: `read` *(since v0.120)*.'
       operationId: artist_image
       parameters:
       - name: id
@@ -3709,6 +3771,10 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
+      security:
+      - apiToken:
+        - read
+      - sessionCookie: []
     put:
       tags:
       - Library
@@ -3845,7 +3911,7 @@ paths:
       - Library
       summary: Serve an uploaded picture.
       description: |-
-        Session-only. Cached `private, immutable` — the name is random per
+        Scope: `read` *(since v0.120)*. Cached `private, immutable` — the name is random per
         upload, so the bytes behind a given URL never change.
 
         `name` is **validated, not trusted**: it must be exactly the 24 hex
@@ -3875,6 +3941,10 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
+      security:
+      - apiToken:
+        - read
+      - sessionCookie: []
   /api/v1/artists/img/{id}/upload:
     post:
       tags:
@@ -5751,7 +5821,7 @@ paths:
       - Crate
       summary: Things somebody suggested that you do not own.
       description: |-
-        Session-only. Each entry carries **`first_played_at`**, derived from the
+        Scope: `read` *(since v0.120)*. Each entry carries **`first_played_at`**, derived from the
         listens rather than stored — whether the suggestion actually landed.
         That is the thing only a scrobbler can answer, and it is what makes this
         more than a wantlist: a recommendation is a prediction, and Tapedeck is
@@ -5768,6 +5838,10 @@ paths:
                 $ref: '#/components/schemas/Crate'
         '401':
           $ref: '#/components/responses/Unauthorized'
+      security:
+      - apiToken:
+        - read
+      - sessionCookie: []
     post:
       tags:
       - Crate
@@ -6689,7 +6763,7 @@ paths:
       - Playlists
       summary: Playlists kept in Tapedeck.
       description: |-
-        Session-only. `origin` is `user` for one you built, or the name of the
+        Scope: `read` *(since v0.120)*. `origin` is `user` for one you built, or the name of the
         MCP connection that wrote it — a list an assistant produced stays
         distinguishable from one you made, the same provenance rule notes
         follow.
@@ -6703,6 +6777,10 @@ paths:
                 $ref: '#/components/schemas/SavedPlaylists'
         '401':
           $ref: '#/components/responses/Unauthorized'
+      security:
+      - apiToken:
+        - read
+      - sessionCookie: []
     post:
       tags:
       - Playlists
@@ -6738,6 +6816,7 @@ paths:
       tags:
       - Playlists
       summary: One playlist and its tracks.
+      description: 'Scope: `read` *(since v0.120)*.'
       operationId: get_saved
       parameters:
       - name: id
@@ -6761,6 +6840,10 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
+      security:
+      - apiToken:
+        - read
+      - sessionCookie: []
     delete:
       tags:
       - Playlists
@@ -7065,7 +7148,7 @@ paths:
       - Genre map
       summary: The map, your genres on it, and your average colour.
       description: |-
-        Session-only. The canvas is 1500 × 22,648 — fifteen times taller than
+        Scope: `read` *(since v0.120)*. The canvas is 1500 × 22,648 — fifteen times taller than
         wide — so a client must compress the y axis **in the coordinates**, not
         with `preserveAspectRatio`, which would squash the circles into ellipses
         too.
@@ -7088,13 +7171,17 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
+      security:
+      - apiToken:
+        - read
+      - sessionCookie: []
   /api/v1/genre-map/trajectory:
     get:
       tags:
       - Genre map
       summary: Where your listening sat, period by period.
       description: |-
-        Session-only. The play-weighted centroid of each period.
+        Scope: `read` *(since v0.120)*. The play-weighted centroid of each period.
 
         Three honesty constraints, all load-bearing. It is an **artist-mix**
         trajectory, not a track-level one — every track by an artist carries
@@ -7126,13 +7213,17 @@ paths:
                 $ref: '#/components/schemas/GenreTrajectory'
         '401':
           $ref: '#/components/responses/Unauthorized'
+      security:
+      - apiToken:
+        - read
+      - sessionCookie: []
   /api/v1/genre-map/neighbours:
     get:
       tags:
       - Genre map
       summary: What sits next to your listening.
       description: |-
-        Session-only. Walks Every Noise's precomputed adjacency, seeded from
+        Scope: `read` *(since v0.120)*. Walks Every Noise's precomputed adjacency, seeded from
         your top 25 genres.
 
         **This does not recommend music**, and the response shape is what
@@ -7164,6 +7255,10 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
+      security:
+      - apiToken:
+        - read
+      - sessionCookie: []
   /mcp:
     get:
       tags:
@@ -7706,9 +7801,14 @@ paths:
       - Shelf
       summary: Resolve a barcode to a pressing.
       description: |-
-        Session-only. Discogs first when configured — it catalogues *pressings*,
-        so a barcode usually resolves to the exact edition, often with real side
-        letters that MusicBrainz lacks. Falls back to MusicBrainz.
+        Scope: `write` *(since v0.120)*, although it is a `GET`: it exists only to
+        add a record to the shelf, and it spends rate-limited Discogs and
+        MusicBrainz lookups doing it, so a token that can only read the shelf has
+        no use for it. `GET /api/v1/art/library` makes the same call.
+
+        Discogs first when configured — it catalogues *pressings*, so a barcode
+        usually resolves to the exact edition, often with real side letters that
+        MusicBrainz lacks. Falls back to MusicBrainz.
 
         Barcodes may be sent with or without the printed spacing; the unspaced
         form a scanner produces matches slightly **more** often.
@@ -7760,6 +7860,10 @@ paths:
                 $ref: '#/components/schemas/Error'
         '401':
           $ref: '#/components/responses/Unauthorized'
+      security:
+      - apiToken:
+        - write
+      - sessionCookie: []
   /api/v1/physical/export:
     get:
       tags:
@@ -7849,6 +7953,9 @@ paths:
       tags:
       - Shelf
       summary: A Discogs release, with its tracklist positions.
+      description: |-
+        Scope: `write` *(since v0.120)*, for the reason the barcode lookup is: it
+        is the second half of adding a record, and it spends a Discogs request.
       operationId: discogs_detail
       parameters:
       - name: id
@@ -7879,12 +7986,18 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
+      security:
+      - apiToken:
+        - write
+      - sessionCookie: []
   /api/v1/physical/equipment/{id}/wear:
     get:
       tags:
       - Shelf
       summary: Stylus hours or head wear for a piece of gear.
       description: |-
+        Scope: `read` *(since v0.120)*.
+
         Derived from `physical_plays`. A duplicate submission is not counted as
         wear.
       operationId: equipment_wear
@@ -7904,6 +8017,10 @@ paths:
                 $ref: '#/components/schemas/GearWear'
         '401':
           $ref: '#/components/responses/Unauthorized'
+      security:
+      - apiToken:
+        - read
+      - sessionCookie: []
   /api/v1/physical/settings/discogs:
     get:
       tags:
@@ -8000,7 +8117,7 @@ paths:
       - Shelf
       summary: Nothing is on the deck.
       description: |-
-        Session-only. Its own route rather than a field on the push, because it
+        Scope: `write` *(since v0.120)*. Its own route rather than a field on the push, because it
         is also what *cancelling* a side means and that has no track to name.
         Clears only entries this shelf reported — an idle turntable must not
         wipe a now-playing the user's phone is currently sending over ingest.
@@ -8014,13 +8131,17 @@ paths:
                 $ref: '#/components/schemas/ShelfDone'
         '401':
           $ref: '#/components/responses/Unauthorized'
+      security:
+      - apiToken:
+        - write
+      - sessionCookie: []
   /api/v1/physical/spin:
     get:
       tags:
       - Shelf
       summary: The side currently on the deck.
       description: |-
-        Session-only. Returns `{ "spin": null }` when nothing is on.
+        Scope: `read` *(since v0.120)*. Returns `{ "spin": null }` when nothing is on.
 
         The shelf is the one source where the *browser* is the player, so the
         countdown runs in the page — but what is on and when it started live
@@ -8039,12 +8160,16 @@ paths:
                 $ref: '#/components/schemas/Spin'
         '401':
           $ref: '#/components/responses/Unauthorized'
+      security:
+      - apiToken:
+        - read
+      - sessionCookie: []
     put:
       tags:
       - Shelf
       summary: Put a side on the deck, or update the one that is on.
       description: |-
-        Session-only. One deck per user — the table's primary key is the user,
+        Scope: `write` *(since v0.120)*. One deck per user — the table's primary key is the user,
         because nobody listens to two records at once, so starting a second side
         replaces the first rather than erroring.
 
@@ -8074,12 +8199,16 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
+      security:
+      - apiToken:
+        - write
+      - sessionCookie: []
     delete:
       tags:
       - Shelf
       summary: Take the side off the deck.
       description: |-
-        Session-only. Clears the now-playing entry as well, so the two cannot
+        Scope: `write` *(since v0.120)*. Clears the now-playing entry as well, so the two cannot
         disagree. Recording a side (`POST /api/v1/physical/{id}/play`) clears it
         too — otherwise reopening the page would offer to resume a side that has
         already been logged, which is how one gets logged twice.
@@ -8093,14 +8222,19 @@ paths:
                 $ref: '#/components/schemas/ShelfDone'
         '401':
           $ref: '#/components/responses/Unauthorized'
+      security:
+      - apiToken:
+        - write
+      - sessionCookie: []
   /api/v1/physical/images/{id}:
     delete:
       tags:
       - Shelf
       summary: Remove a scan.
       description: |-
-        Session-only. An uploaded file is deleted from disk with the row and
-        cannot be recovered; a provider's image is only unlinked and can be
+        Session-only, deliberately, for the reason removing a shelf item is: an
+        uploaded file is deleted from disk with the row and cannot be recovered,
+        and no backup holds it. A provider's image is only unlinked and can be
         fetched again.
       operationId: delete_image
       parameters:
@@ -8125,6 +8259,7 @@ paths:
       tags:
       - Shelf
       summary: Re-file, caption or reorder a scan.
+      description: 'Scope: `write` *(since v0.120)*.'
       operationId: update_image
       parameters:
       - name: id
@@ -8150,13 +8285,17 @@ paths:
           $ref: '#/components/responses/Unauthorized'
         '404':
           $ref: '#/components/responses/NotFound'
+      security:
+      - apiToken:
+        - write
+      - sessionCookie: []
   /api/v1/physical/images/{id}/file:
     get:
       tags:
       - Shelf
       summary: An uploaded scan's bytes.
       description: |-
-        Session-only, and scoped to the caller by `(id, user_id)` — these are
+        Scope: `read` *(since v0.120)*, and scoped to the caller by `(id, user_id)` — these are
         photographs of someone's own possessions and ids must not be walkable,
         the same rule the artwork proxy keeps.
 
@@ -8183,12 +8322,16 @@ paths:
           $ref: '#/components/responses/Unauthorized'
         '404':
           $ref: '#/components/responses/NotFound'
+      security:
+      - apiToken:
+        - read
+      - sessionCookie: []
   /api/v1/physical:
     get:
       tags:
       - Shelf
       summary: Your shelf.
-      description: Session-only.
+      description: 'Scope: `read` *(since v0.120)*.'
       operationId: list_shelf
       parameters:
       - name: kind
@@ -8208,11 +8351,15 @@ paths:
                 $ref: '#/components/schemas/Shelf'
         '401':
           $ref: '#/components/responses/Unauthorized'
+      security:
+      - apiToken:
+        - read
+      - sessionCookie: []
     post:
       tags:
       - Shelf
       summary: Add a release to the shelf.
-      description: Session-only. Seed from a barcode lookup, or supply the tracklist yourself.
+      description: 'Scope: `write` *(since v0.120)*. Seed from a barcode lookup, or supply the tracklist yourself.'
       operationId: add_release
       requestBody:
         content:
@@ -8231,11 +8378,16 @@ paths:
           $ref: '#/components/responses/BadRequest'
         '401':
           $ref: '#/components/responses/Unauthorized'
+      security:
+      - apiToken:
+        - write
+      - sessionCookie: []
   /api/v1/physical/{id}:
     get:
       tags:
       - Shelf
       summary: One shelf item, with its sides.
+      description: 'Scope: `read` *(since v0.120)*.'
       operationId: get_one
       parameters:
       - name: id
@@ -8255,14 +8407,21 @@ paths:
           $ref: '#/components/responses/Unauthorized'
         '404':
           $ref: '#/components/responses/NotFound'
+      security:
+      - apiToken:
+        - read
+      - sessionCookie: []
     delete:
       tags:
       - Shelf
       summary: Remove a shelf item.
       description: |-
-        Session-only. Its plays and its images go with it, and any scan files
-        the user uploaded are removed from disk — nothing else knows those files
-        exist, so leaving them would orphan them permanently.
+        Session-only, deliberately, although the rest of the shelf takes a
+        `write` token: its plays and its images go with it, and any scan files the
+        user uploaded are removed from disk — nothing else knows those files
+        exist, so leaving them would orphan them permanently. Scans are not in
+        `GET /api/v1/backup`, so this is the one shelf operation a lost phone could
+        make unrecoverable, which is the line `DELETE /api/v1/scrobbles` sits on.
       operationId: delete_release
       parameters:
       - name: id
@@ -8287,7 +8446,7 @@ paths:
       - Shelf
       summary: Edit the shelf-keeping fields.
       description: |-
-        Session-only. When it was bought, what it is normally played through,
+        Scope: `write` *(since v0.120)*. When it was bought, what it is normally played through,
         and the note beside it.
 
         Every field distinguishes **absent from null**: omitting one leaves the
@@ -8332,13 +8491,17 @@ paths:
           $ref: '#/components/responses/Unauthorized'
         '404':
           $ref: '#/components/responses/NotFound'
+      security:
+      - apiToken:
+        - write
+      - sessionCookie: []
   /api/v1/physical/{id}/tracks:
     put:
       tags:
       - Shelf
       summary: Replace the tracklist and side split.
       description: |-
-        Session-only. Sides are **not reliably available from any provider** —
+        Scope: `write` *(since v0.120)*. Sides are **not reliably available from any provider** —
         MusicBrainz records a vinyl track number as "A1" only when an editor
         entered one. When there is no explicit side letter the split is guessed
         by **playing time**, not track count, because a mastering engineer
@@ -8398,6 +8561,10 @@ paths:
           $ref: '#/components/responses/Unauthorized'
         '404':
           $ref: '#/components/responses/NotFound'
+      security:
+      - apiToken:
+        - write
+      - sessionCookie: []
   /api/v1/physical/{id}/durations:
     get:
       tags:
@@ -8504,7 +8671,7 @@ paths:
       - Shelf
       summary: Record a side as played.
       description: |-
-        Session-only. **Writes one listen per track, not one per side** — every
+        Scope: `write` *(since v0.120)*. **Writes one listen per track, not one per side** — every
         counting query in Tapedeck is over listens, so a side-shaped row would
         be invisible to all of them.
 
@@ -8545,13 +8712,17 @@ paths:
           $ref: '#/components/responses/Unauthorized'
         '404':
           $ref: '#/components/responses/NotFound'
+      security:
+      - apiToken:
+        - write
+      - sessionCookie: []
   /api/v1/physical/{id}/now-playing:
     post:
       tags:
       - Shelf
       summary: A side is on the deck.
       description: |-
-        Session-only. The shelf is the one source where the **browser** is the
+        Scope: `write` *(since v0.120)*. The shelf is the one source where the **browser** is the
         player: the clock runs in front of the turntable, in localStorage, and
         nothing server-side can derive a playhead from a stack of rows. So the
         deck pushes here, where Plex, Jellyfin and Navidrome are polled.
@@ -8595,13 +8766,17 @@ paths:
           $ref: '#/components/responses/Unauthorized'
         '404':
           $ref: '#/components/responses/NotFound'
+      security:
+      - apiToken:
+        - write
+      - sessionCookie: []
   /api/v1/physical/{id}/sides:
     get:
       tags:
       - Shelf
       summary: How often each side has been played, and for how long.
       description: |-
-        Session-only. A record has a side you reach for and a side you rarely
+        Scope: `read` *(since v0.120)*. A record has a side you reach for and a side you rarely
         turn over, and the release's own totals cannot say which is which.
 
         Everything here is derived from the sides played on read — never a
@@ -8641,13 +8816,17 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
+      security:
+      - apiToken:
+        - read
+      - sessionCookie: []
   /api/v1/physical/{id}/images:
     get:
       tags:
       - Shelf
       summary: Every scan held for a pressing.
       description: |-
-        Session-only. Sleeves, labels, obi strips and booklet pages — the parts
+        Scope: `read` *(since v0.120)*. Sleeves, labels, obi strips and booklet pages — the parts
         of a record you actually hold, which is why they are rows rather than
         one more `artwork_url` column. The Cover Art Archive carries 29 for a
         typical CD, 19 of them booklet pages.
@@ -8673,12 +8852,16 @@ paths:
                 $ref: '#/components/schemas/ShelfImages'
         '401':
           $ref: '#/components/responses/Unauthorized'
+      security:
+      - apiToken:
+        - read
+      - sessionCookie: []
     post:
       tags:
       - Shelf
       summary: Upload scans of your own copy.
       description: |-
-        Session-only. `multipart/form-data`: any number of file fields, plus
+        Scope: `write` *(since v0.120)*. `multipart/form-data`: any number of file fields, plus
         optional `kind` and `caption` text fields that apply to all of them —
         which is what makes uploading a booklet in one go work, since the files
         land in the order they are sent.
@@ -8728,13 +8911,17 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
+      security:
+      - apiToken:
+        - write
+      - sessionCookie: []
   /api/v1/physical/{id}/images/fetch:
     post:
       tags:
       - Shelf
       summary: Pull the sleeve from the Cover Art Archive.
       description: |-
-        Session-only. Runs when the user asks rather than on a clock: the
+        Scope: `write` *(since v0.120)*. Runs when the user asks rather than on a clock: the
         archive is not going to change under a record that has been on a shelf
         for thirty years, and the one case that does — an editor uploading the
         booklet you were missing — is exactly the case where the user knows and
@@ -8768,6 +8955,10 @@ paths:
           $ref: '#/components/responses/Unauthorized'
         '404':
           $ref: '#/components/responses/NotFound'
+      security:
+      - apiToken:
+        - write
+      - sessionCookie: []
   /users/{name}:
     get:
       tags:

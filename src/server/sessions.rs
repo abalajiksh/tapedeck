@@ -26,7 +26,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use super::auth::AuthUser;
+use super::auth::{AuthUser, ReadAuth};
 use super::models::ErrorResponse;
 use super::AppState;
 use crate::db::{ScrobbleRecord, SessionRow};
@@ -96,7 +96,7 @@ pub struct SplitSessions {
 
 /// Listening sessions.
 ///
-/// Session-only. Contiguous listening with gaps under 30 minutes. A change
+/// Scope: `read` *(since v0.120)*. Contiguous listening with gaps under 30 minutes. A change
 /// of submitting token also breaks a session — one token per app is how
 /// people organise these, so "fooyin stopped, Pano started" is a different
 /// setup even a minute later.
@@ -104,6 +104,7 @@ pub struct SplitSessions {
     get,
     path = "/api/v1/sessions",
     tag = "Sessions",
+    security(("apiToken" = ["read"]), ("sessionCookie" = [])),
     params(ListQuery),
     responses(
         (status = 200, description = "OK.", body = SessionList),
@@ -112,7 +113,7 @@ pub struct SplitSessions {
 )]
 pub async fn list_sessions(
     State(state): State<Arc<AppState>>,
-    user: AuthUser,
+    ReadAuth { user }: ReadAuth,
     Query(q): Query<ListQuery>,
 ) -> impl IntoResponse {
     let limit = q.limit.unwrap_or(50).clamp(1, 200);
@@ -127,10 +128,13 @@ pub async fn list_sessions(
 
 // GET /api/v1/sessions/:id — the session plus the listens in it, in play order.
 /// One session and its listens.
+///
+/// Scope: `read` *(since v0.120)*.
 #[utoipa::path(
     get,
     path = "/api/v1/sessions/{id}",
     tag = "Sessions",
+    security(("apiToken" = ["read"]), ("sessionCookie" = [])),
     params(("id" = i64, Path)),
     responses(
         (status = 200, description = "OK.", body = SessionDetail),
@@ -140,7 +144,7 @@ pub async fn list_sessions(
 )]
 async fn get_session(
     State(state): State<Arc<AppState>>,
-    user: AuthUser,
+    ReadAuth { user }: ReadAuth,
     Path(id): Path<i64>,
 ) -> impl IntoResponse {
     let session = match state.db.get_session(user.user_id, id).await {
