@@ -53,6 +53,12 @@ The service is installed but not enabled. Set MUSICBRAINZ_CONTACT in
 %build
 export TAPEDECK_SKIP_WEB_BUILD=1
 export CARGO_PROFILE_RELEASE_STRIP=symbols
+# Fedora's build environment puts -Cdebuginfo=2 -Cstrip=none in RUSTFLAGS,
+# which override the profile: full debuginfo was generated for a debuginfo
+# package this spec disables, and on 2026-09-26 it ran a Fedora 43 aarch64
+# worker out of memory (rustc at ~9.9 GB). rustc takes the last of a repeated
+# -C option, so appending here restores what the comment above promises.
+export RUSTFLAGS="${RUSTFLAGS:-} -Cdebuginfo=0 -Cstrip=symbols"
 export CARGO_HOME=$PWD/.cargo-home
 cargo build --release --frozen
 
