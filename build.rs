@@ -35,6 +35,11 @@ fn main() {
         println!("cargo:rerun-if-changed={path}");
     }
     println!("cargo:rerun-if-env-changed=TAPEDECK_SKIP_WEB_BUILD");
+    // The bundle's version stamp (svelte.config.js). CI sets it to the commit
+    // so the amd64 and arm64 builds of one commit embed the same bytes; without
+    // a rerun here, a commit touching only Rust would keep the previous
+    // commit's bundle in a persistent target dir, stamped with the old sha.
+    println!("cargo:rerun-if-env-changed=TAPEDECK_UI_VERSION_NAME");
 
     if std::env::var("TAPEDECK_SKIP_WEB_BUILD").is_ok_and(|v| v != "0") {
         println!("cargo:warning=TAPEDECK_SKIP_WEB_BUILD set — using the existing static/");
