@@ -206,7 +206,7 @@
 	// ── Pairing a device ──
 	// For clients with no browser: they show a code, you type it here.
 	let pairCode = '';
-	let pairInfo: { client_name: string; scopes: string; can_read: boolean; can_write: boolean; approved: boolean } | null = null;
+	let pairInfo: Awaited<ReturnType<typeof api.describePairing>> | null = null;
 	let pairChain = '';
 	let pairMsg = '';
 	let pairBusy = false;
@@ -3009,6 +3009,20 @@
 							Will be able to submit listens{pairInfo.can_read ? ' and read your chains, devices, gear and what\'s playing' : ''}{pairInfo.can_write ? ', and change your own data — loves, notes, lyrics and cover art' : ''}.
 							It can never reach your sources, connections or admin actions.
 						</div>
+						{#if pairInfo.started_by_other}
+							<!-- Approving mints the token for you and hands it to whoever holds
+							     the device, so another account's request is never approvable. -->
+							<div style="font-size:12.5px;color:var(--td-bad-fg);">
+								{pairInfo.started_by} started this pairing, so only {pairInfo.started_by} can approve it.
+								Approving it here would give them access to your account.
+							</div>
+						{:else}
+						<div style="font-size:12.5px;color:var(--td-muted-2);margin-bottom:12px;">
+							Requested {pairInfo.started_secs_ago < 60 ? `${pairInfo.started_secs_ago}s` : `${Math.floor(pairInfo.started_secs_ago / 60)} min`} ago{pairInfo.started_by ? ' from your own session' : ''}.
+							{#if !pairInfo.started_by}
+								Only approve a code showing on a device in front of you — whoever holds that device gets this access to your account.
+							{/if}
+						</div>
 						<div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;">
 							{#if chains.length}
 								<select class="input" style="width:auto;min-width:170px;" bind:value={pairChain} aria-label="Default signal chain for this device">
@@ -3020,6 +3034,7 @@
 								{pairBusy ? '…' : 'Approve'}
 							</button>
 						</div>
+						{/if}
 					</div>
 				{/if}
 				{#if pairMsg}

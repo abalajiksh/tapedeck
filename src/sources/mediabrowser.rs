@@ -27,6 +27,7 @@
 //! Ticks are .NET "ticks" (100-nanosecond units), which is why every duration
 //! and position here is divided by ten million rather than a thousand.
 
+use super::egress::Egress;
 use reqwest::{Client, StatusCode};
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -112,6 +113,7 @@ pub struct MediaBrowserSource {
     /// is discarded — a shared server must not leak between users.
     account: String,
     client: Client,
+    egress: Egress,
     /// Per-session progress, so a track is scrobbled once rather than every
     /// poll.
     tracker: SessionTracker,
@@ -471,32 +473,35 @@ fn now_secs() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs()
 }
 
-fn http_client() -> Client {
-    Client::builder()
-        .timeout(Duration::from_secs(10))
-        .user_agent(format!("{}/{}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION")))
-        .build()
-        .unwrap_or_else(|_| Client::new())
+fn http_client(egress: Egress) -> Client {
+    egress.client(Duration::from_secs(10))
 }
 
 impl MediaBrowserSource {
-    pub fn new(flavour: Flavour, url: String, api_key: String, account: String) -> Self {
+    pub fn new(
+        flavour: Flavour,
+        url: String,
+        api_key: String,
+        account: String,
+        egress: Egress,
+    ) -> Self {
         Self {
             flavour,
             url: url.trim_end_matches('/').to_string(),
             api_key,
             account,
-            client: http_client(),
+            client: http_client(egress),
+            egress,
             tracker: SessionTracker::new(),
         }
     }
 
-    pub fn jellyfin(url: String, api_key: String, account: String) -> Self {
-        Self::new(Flavour::Jellyfin, url, api_key, account)
+    pub fn jellyfin(url: String, api_key: String, account: String, egress: Egress) -> Self {
+        Self::new(Flavour::Jellyfin, url, api_key, account, egress)
     }
 
-    pub fn emby(url: String, api_key: String, account: String) -> Self {
-        Self::new(Flavour::Emby, url, api_key, account)
+    pub fn emby(url: String, api_key: String, account: String, egress: Egress) -> Self {
+        Self::new(Flavour::Emby, url, api_key, account, egress)
     }
 
     pub fn flavour(&self) -> Flavour {
@@ -517,6 +522,7 @@ impl MediaBrowserSource {
         flavour: Flavour,
         url: &str,
         api_key: &str,
+        egress: Egress,
     ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
         #[derive(Deserialize)]
         #[serde(rename_all = "PascalCase")]
@@ -525,7 +531,7 @@ impl MediaBrowserSource {
             name: Option<String>,
         }
 
-        let client = http_client();
+        let client = http_client(egress);
         let base = format!("{}{}", url.trim_end_matches('/'), flavour.base());
 
         let resp = client
@@ -551,7 +557,7 @@ impl MediaBrowserSource {
             }
         }
 
-        let users = Self::list_accounts(flavour, url, api_key).await?;
+        let users = Self::list_accounts(flavour, url, api_key, egress).await?;
         match users.len() {
             0 => Err(format!("{} reported no users for that key", flavour.label()).into()),
             // One user is unambiguous, so don't make them pick.
@@ -573,6 +579,7 @@ impl MediaBrowserSource {
         flavour: Flavour,
         url: &str,
         api_key: &str,
+        egress: Egress,
     ) -> Result<Vec<MediaBrowserAccount>, Box<dyn std::error::Error + Send + Sync>> {
         #[derive(Deserialize)]
         #[serde(rename_all = "PascalCase")]
@@ -589,7 +596,7 @@ impl MediaBrowserSource {
             policy: Option<Policy>,
         }
 
-        let client = http_client();
+        let client = http_client(egress);
         let base = format!("{}{}", url.trim_end_matches('/'), flavour.base());
 
         let resp = client
@@ -966,7 +973,8 @@ impl MediaBrowserSource {
     /// playlist would either be refused or land on whichever account the server
     /// picked, which on a household server is somebody else's.
     pub async fn account_id(&self) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-        let users = Self::list_accounts(self.flavour, &self.url, &self.api_key).await?;
+        let users =
+            Self::list_accounts(self.flavour, &self.url, &self.api_key, self.egress).await?;
         if self.account.trim().is_empty() {
             return match users.len() {
                 1 => Ok(users.into_iter().next().expect("checked").id),
@@ -1558,7 +1566,7 @@ mod tests {
             routed_stub(vec![("/Users", users.to_string()), ("/Items", items.to_string())], 4)
                 .await;
 
-        let src = MediaBrowserSource::jellyfin(url, "k".into(), "ash".into());
+        let src = MediaBrowserSource::jellyfin(url, "k".into(), "ash".into(), Egress::Open);
         let got = src.fetch_ratings().await.expect("the walk");
 
         let teardrop = got.iter().find(|r| r.name == "Teardrop").expect("Teardrop");
@@ -1619,8 +1627,18 @@ mod tests {
     /// interchangeable and a copied constructor would look correct.
     #[test]
     fn the_base_path_is_the_flavours_only_routing_difference() {
-        let jf = MediaBrowserSource::jellyfin("http://jf:8096".into(), "k".into(), "a".into());
-        let emby = MediaBrowserSource::emby("http://emby:8096".into(), "k".into(), "a".into());
+        let jf = MediaBrowserSource::jellyfin(
+            "http://jf:8096".into(),
+            "k".into(),
+            "a".into(),
+            Egress::Open,
+        );
+        let emby = MediaBrowserSource::emby(
+            "http://emby:8096".into(),
+            "k".into(),
+            "a".into(),
+            Egress::Open,
+        );
 
         assert_eq!(jf.endpoint("/Sessions"), "http://jf:8096/Sessions");
         assert_eq!(emby.endpoint("/Sessions"), "http://emby:8096/emby/Sessions");
@@ -1642,9 +1660,19 @@ mod tests {
 
     #[test]
     fn url_trailing_slash_is_normalised() {
-        let s = MediaBrowserSource::jellyfin("http://jf:8096/".into(), "k".into(), "ashwin".into());
+        let s = MediaBrowserSource::jellyfin(
+            "http://jf:8096/".into(),
+            "k".into(),
+            "ashwin".into(),
+            Egress::Open,
+        );
         assert_eq!(s.url, "http://jf:8096");
-        let e = MediaBrowserSource::emby("http://emby:8096/".into(), "k".into(), "ashwin".into());
+        let e = MediaBrowserSource::emby(
+            "http://emby:8096/".into(),
+            "k".into(),
+            "ashwin".into(),
+            Egress::Open,
+        );
         assert_eq!(e.endpoint("/Users"), "http://emby:8096/emby/Users");
     }
 

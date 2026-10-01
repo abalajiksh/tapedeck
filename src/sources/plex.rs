@@ -1,3 +1,4 @@
+use super::egress::Egress;
 use crate::models::{AudioQuality, Play, ScrobbleThreshold};
 use crate::sources::MusicSource;
 use async_trait::async_trait;
@@ -604,6 +605,7 @@ pub struct PlexSource {
     url: String,
     token: String,
     client: Client,
+    egress: Egress,
     filters: PlexFilters,
     session_states: HashMap<String, SessionState>,
     libraries: Vec<Library>,
@@ -791,19 +793,16 @@ impl SessionResult {
 }
 
 impl PlexSource {
-    pub fn new(url: String, token: String) -> Self {
-        Self::with_filters(url, token, PlexFilters::default())
+    pub fn new(url: String, token: String, egress: Egress) -> Self {
+        Self::with_filters(url, token, PlexFilters::default(), egress)
     }
 
-    pub fn with_filters(url: String, token: String, filters: PlexFilters) -> Self {
+    pub fn with_filters(url: String, token: String, filters: PlexFilters, egress: Egress) -> Self {
         Self {
             url: url.trim_end_matches('/').to_string(),
             token,
-            client: Client::builder()
-                .timeout(Duration::from_secs(10))
-                .user_agent(format!("{}/{}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION")))
-                .build()
-                .unwrap_or_else(|_| Client::new()),
+            client: egress.client(Duration::from_secs(10)),
+            egress,
             filters,
             session_states: HashMap::new(),
             libraries: Vec::new(),
@@ -841,7 +840,7 @@ impl PlexSource {
         if self.filters.users_allow.is_empty() {
             return;
         }
-        match Self::list_accounts(&self.url, &self.token).await {
+        match Self::list_accounts(&self.url, &self.token, self.egress).await {
             Ok(accounts) => {
                 self.filters.accounts_allow = accounts
                     .iter()
@@ -896,6 +895,7 @@ impl PlexSource {
     pub async fn list_accounts(
         url: &str,
         token: &str,
+        egress: Egress,
     ) -> Result<Vec<PlexAccount>, Box<dyn std::error::Error>> {
         #[derive(Deserialize)]
         struct Container {
@@ -908,10 +908,7 @@ impl PlexSource {
             media_container: Container,
         }
 
-        let client = Client::builder()
-            .timeout(Duration::from_secs(10))
-            .user_agent(format!("{}/{}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION")))
-            .build()?;
+        let client = egress.client(Duration::from_secs(10));
 
         let resp = client
             .get(format!("{}/accounts", url.trim_end_matches('/')))
@@ -2362,7 +2359,7 @@ mod tests {
     /// test, because the two can drift without anything erroring.
     #[tokio::test]
     async fn a_track_dropped_before_the_threshold_is_recorded_as_a_skip() {
-        let mut src = PlexSource::new("http://localhost:32400".into(), "t".into());
+        let mut src = PlexSource::new("http://localhost:32400".into(), "t".into(), Egress::Open);
 
         // Twenty seconds into a five-minute track, then the listener moves on.
         let mut r = SessionResult::default();
@@ -2389,7 +2386,7 @@ mod tests {
     /// every completed track in a queue would be filed as one.
     #[tokio::test]
     async fn a_banked_plex_track_is_not_also_a_skip() {
-        let mut src = PlexSource::new("http://localhost:32400".into(), "t".into());
+        let mut src = PlexSource::new("http://localhost:32400".into(), "t".into(), Egress::Open);
 
         let mut r = SessionResult::default();
         src.process_live_track(track(160_000), true, &mut r).await;
@@ -2407,7 +2404,7 @@ mod tests {
     /// half of every track, and the pipeline reads an empty list as "stopped".
     #[tokio::test]
     async fn now_playing_survives_the_scrobble_threshold() {
-        let mut src = PlexSource::new("http://localhost:32400".into(), "t".into());
+        let mut src = PlexSource::new("http://localhost:32400".into(), "t".into(), Egress::Open);
 
         // 20% in — playing, nothing to scrobble yet.
         let mut r = SessionResult::default();
@@ -2438,7 +2435,7 @@ mod tests {
     /// banked. The playhead rewinding is the only evidence it started over.
     #[tokio::test]
     async fn a_looped_track_scrobbles_once_per_pass() {
-        let mut src = PlexSource::new("http://localhost:32400".into(), "t".into());
+        let mut src = PlexSource::new("http://localhost:32400".into(), "t".into(), Egress::Open);
 
         let mut scrobbles = 0;
         for pass in 0..3 {
@@ -2458,7 +2455,7 @@ mod tests {
     /// seconds must not mint a second scrobble.
     #[tokio::test]
     async fn a_small_seek_back_is_not_a_repeat() {
-        let mut src = PlexSource::new("http://localhost:32400".into(), "t".into());
+        let mut src = PlexSource::new("http://localhost:32400".into(), "t".into(), Egress::Open);
 
         let mut r = SessionResult::default();
         src.process_live_track(track(160_000), true, &mut r).await;
@@ -2932,7 +2929,7 @@ mod tests {
         )
         .await;
 
-        let mut src = PlexSource::new(url, "t".into());
+        let mut src = PlexSource::new(url, "t".into(), Egress::Open);
         src.libraries = vec![Library {
             key: "1".into(),
             title: "Music".into(),
@@ -2973,7 +2970,7 @@ mod tests {
 
     /// Silences part B so these tests are about the live read alone.
     fn live_only(url: String) -> PlexSource {
-        let mut src = PlexSource::new(url, "t".into());
+        let mut src = PlexSource::new(url, "t".into(), Egress::Open);
         src.last_history_at = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
         src
     }

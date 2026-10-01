@@ -162,6 +162,8 @@ fn protocol_for(kind: &str) -> Option<&'static str> {
 /// answers 404 for every failure (the UI falls back to a lettered tile) while a
 /// push has to report *why* it could not go.
 fn build_target(source: &UserSource) -> Result<Box<dyn PlaylistTarget>, String> {
+    let egress = source.egress();
+    egress.check_url(&source.url).map_err(|e| e.to_string())?;
     match source.kind.as_str() {
         "plex" => {
             let token = source.credential("token").ok_or("Plex token is missing")?;
@@ -169,6 +171,7 @@ fn build_target(source: &UserSource) -> Result<Box<dyn PlaylistTarget>, String> 
                 source.url.clone(),
                 token,
                 PlexFilters::default(),
+                egress,
             )))
         }
         "jellyfin" => {
@@ -177,6 +180,7 @@ fn build_target(source: &UserSource) -> Result<Box<dyn PlaylistTarget>, String> 
                 source.url.clone(),
                 key,
                 source.remote_account.clone().unwrap_or_default(),
+                egress,
             )))
         }
         "navidrome" => {
@@ -184,7 +188,7 @@ fn build_target(source: &UserSource) -> Result<Box<dyn PlaylistTarget>, String> 
             else {
                 return Err("Navidrome credentials are missing".into());
             };
-            Ok(Box::new(NavidromeSource::new(source.url.clone(), u, p)))
+            Ok(Box::new(NavidromeSource::new(source.url.clone(), u, p, egress)))
         }
         other => Err(format!("A {other} source cannot receive a playlist")),
     }

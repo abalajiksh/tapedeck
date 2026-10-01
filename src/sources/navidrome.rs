@@ -21,6 +21,7 @@
 //! `tls_danger_accept_invalid_certs(true)` — that disables certificate checking
 //! entirely, which is not a trade a scrobbler should make on the user's behalf.
 
+use super::egress::Egress;
 use async_trait::async_trait;
 use reqwest::{Client, StatusCode};
 use serde::Deserialize;
@@ -241,16 +242,12 @@ pub struct NavidromeNowPlaying {
 }
 
 impl NavidromeSource {
-    pub fn new(url: String, username: String, password: String) -> Self {
+    pub fn new(url: String, username: String, password: String, egress: Egress) -> Self {
         Self {
             url: url.trim_end_matches('/').to_string(),
             username,
             password,
-            client: Client::builder()
-                .timeout(Duration::from_secs(15))
-                .user_agent(format!("{}/{}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION")))
-                .build()
-                .unwrap_or_else(|_| Client::new()),
+            client: egress.client(Duration::from_secs(15)),
             nd_token: None,
             songs: HashMap::new(),
             last_submission: 0,
@@ -1003,7 +1000,7 @@ mod tests {
 
     #[test]
     fn subsonic_params_are_salted_per_call() {
-        let src = NavidromeSource::new("http://nd".into(), "u".into(), "pw".into());
+        let src = NavidromeSource::new("http://nd".into(), "u".into(), "pw".into(), Egress::Open);
         let a = src.subsonic_params();
         let b = src.subsonic_params();
         let salt = |p: &Vec<(String, String)>| p.iter().find(|(k, _)| k == "s").unwrap().1.clone();
@@ -1052,7 +1049,8 @@ mod tests {
 
     #[test]
     fn url_trailing_slash_is_normalised() {
-        let src = NavidromeSource::new("http://nd:4533/".into(), "u".into(), "p".into());
+        let src =
+            NavidromeSource::new("http://nd:4533/".into(), "u".into(), "p".into(), Egress::Open);
         assert_eq!(src.url, "http://nd:4533");
     }
 }

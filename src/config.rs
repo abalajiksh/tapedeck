@@ -14,6 +14,15 @@ pub struct Config {
     /// Where the credential-encryption key lives (never inside the database).
     pub secret_key_path: String,
     pub plex: PlexConfig,
+    /// Private networks a **member's** source may point at, as CIDRs —
+    /// `192.168.178.0/24`. Empty means none: a member's sources reach only
+    /// the public internet, and an admin's reach anywhere. See
+    /// `sources::egress`.
+    //
+    // Infrastructure, so it lives here rather than in the UI: it says which
+    // parts of the network this host sits on may be probed from an account,
+    // and only the person running the host knows that.
+    pub source_networks: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -208,6 +217,7 @@ impl Default for TomlMusicBrainz {
 #[serde(default)]
 struct TomlSources {
     plex: TomlPlex,
+    networks: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -295,6 +305,7 @@ impl Config {
             },
             listenbrainz_url: env_or("LISTENBRAINZ_URL", t.listenbrainz.url),
             secret_key_path: env_or("TAPEDECK_SECRET_KEY_PATH", t.server.secret_key_path),
+            source_networks: env_or_list("TAPEDECK_SOURCE_NETWORKS", t.sources.networks),
             musicbrainz: MusicBrainzConfig {
                 api_base_url: env_or("MUSICBRAINZ_API_URL", t.musicbrainz.api_url),
                 // Two knobs, and `contact` is the one to reach for. MusicBrainz

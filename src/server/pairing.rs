@@ -39,7 +39,7 @@ use utoipa::ToSchema;
 use super::auth::AuthUser;
 use super::models::{ErrorResponse, OkResponse};
 use super::AppState;
-use crate::db::{Database, PairingPoll};
+use crate::db::{Database, PairingApproval, PairingPoll};
 use crate::openapi::{NotFound, Unauthorized};
 
 /// How often a client should poll. Matched to the limiter's tolerance — faster
@@ -177,11 +177,16 @@ fn requested_scopes(asked: Option<&str>) -> String {
 /// The user code is eight characters and therefore guessable, so its safety
 /// is structural: a five-minute window, single use in both directions, rate
 /// limiting, and approval requiring a signed-in session.
+///
+/// Started from a signed-in browser session, the pairing belongs to that
+/// account and **only that account can approve it**.
 #[utoipa::path(
     post,
     path = "/1/pair/start",
     tag = "Pairing",
-    security(),
+    // Optional: anonymous is the device case; a session is recorded as the
+    // only account allowed to approve.
+    security((), ("sessionCookie" = [])),
     request_body(content = StartBody, description = "Optional."),
     responses(
         (status = 200, description = "Pairing started.", body = PairingStarted),
@@ -190,6 +195,7 @@ fn requested_scopes(asked: Option<&str>) -> String {
 )]
 pub async fn start(
     State(state): State<Arc<AppState>>,
+    starter: Option<AuthUser>,
     headers: HeaderMap,
     body: Option<Json<StartBody>>,
 ) -> impl IntoResponse {
@@ -218,7 +224,7 @@ pub async fn start(
     // one indexed delete.
     let _ = state.db.purge_expired_pairings().await;
 
-    match state.db.start_pairing(&name, &scopes).await {
+    match state.db.start_pairing(&name, &scopes, starter.as_ref().map(|u| u.user_id)).await {
         Ok((device_code, user_code)) => {
             state.login_limiter.record_failure(&key);
             info!("🔗 Pairing requested for '{}'", name);
@@ -385,7 +391,11 @@ pub async fn poll(
             // that now says whose it is.
             let user_name =
                 state.db.validate_token(&token).await.ok().flatten().map(|t| t.user.username);
-            (StatusCode::OK, Json(PairingApproved { status: "approved", token, user_name }))
+            (
+                StatusCode::OK,
+                [("cache-control", "no-store")],
+                Json(PairingApproved { status: "approved", token, user_name }),
+            )
                 .into_response()
         }
         // RFC 8628's shape: pending is a **400** carrying
@@ -443,18 +453,21 @@ pub async fn poll(
 )]
 pub async fn describe(
     State(state): State<Arc<AppState>>,
-    _user: AuthUser,
+    user: AuthUser,
     Path(user_code): Path<String>,
 ) -> impl IntoResponse {
     match state.db.pairing_by_user_code(&user_code).await {
-        Ok(Some((_, client_name, scopes, approved))) => (
+        Ok(Some(p)) => (
             StatusCode::OK,
             Json(PairingRequest {
-                can_read: scopes.split_whitespace().any(|w| w == "read"),
-                can_write: scopes.split_whitespace().any(|w| w == "write"),
-                client_name,
-                scopes,
-                approved,
+                can_read: p.scopes.split_whitespace().any(|w| w == "read"),
+                can_write: p.scopes.split_whitespace().any(|w| w == "write"),
+                started_by_other: p.started_by.is_some_and(|id| id != user.user_id),
+                started_by: p.started_by_name,
+                started_secs_ago: (Database::now_secs() - p.created_at).max(0),
+                client_name: p.client_name,
+                scopes: p.scopes,
+                approved: p.approved,
             }),
         )
             .into_response(),
@@ -478,6 +491,14 @@ pub struct PairingRequest {
     /// Whether approving grants `write`.
     pub can_write: bool,
     pub approved: bool,
+    /// The account whose session started this, if one did. Null is a device
+    /// with no account — the usual case, and the one to approve only when
+    /// the code is on a screen in front of you.
+    pub started_by: Option<String>,
+    /// Started by another account, so you cannot approve it.
+    pub started_by_other: bool,
+    /// How long ago the device asked.
+    pub started_secs_ago: i64,
 }
 
 /// The body is optional.
@@ -511,6 +532,8 @@ pub struct ApproveBody {
         (status = 200, description = "Approved. `status` is `approved`.", body = OkResponse),
         (status = 400, description = "Not one of your chains.", body = ErrorResponse),
         (status = 401, response = Unauthorized),
+        (status = 403, description = "Another account started this pairing; only it can approve.",
+            body = ErrorResponse),
         (status = 404, response = NotFound),
     )
 )]
@@ -535,11 +558,17 @@ pub async fn approve(
     }
 
     match state.db.approve_pairing(&user_code, user.user_id, chain).await {
-        Ok(true) => {
+        Ok(PairingApproval::Approved) => {
             info!("🔗 Pairing approved by {}", user.username);
             (StatusCode::OK, OkResponse::new("approved")).into_response()
         }
-        Ok(false) => err(404, "That code is unknown, expired, or already approved"),
+        Ok(PairingApproval::Unavailable) => {
+            err(404, "That code is unknown, expired, or already approved")
+        }
+        Ok(PairingApproval::OtherAccount) => {
+            warn!("🔗 {} tried to approve a pairing another account started", user.username);
+            err(403, "Another account started this pairing, so only that account can approve it")
+        }
         Err(e) => {
             warn!("Pairing approval failed: {}", e);
             err(500, "Could not approve that pairing")

@@ -1,3 +1,4 @@
+pub mod egress;
 mod emby;
 mod jellyfin;
 pub mod mediabrowser;

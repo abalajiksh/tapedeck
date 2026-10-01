@@ -315,11 +315,15 @@ impl Database {
             // before all three — same trap `physical_plays` was missing from.
             "physical_spins",
             "physical_releases",
+            // A session points at the token, device and chain it ran
+            // through, so it clears before all three. It used to come after
+            // them, and deleting anyone who had ever submitted with a token
+            // failed on the foreign key.
+            "sessions",
             "tokens",
             "signal_chains",
             "devices",
             "equipment",
-            "sessions",
             "chain_bindings",
             "import_jobs",
             "web_sessions",
@@ -341,10 +345,18 @@ impl Database {
     ///
     /// The device code is the bearer secret the client polls with and is stored
     /// hashed; the user code is what a human carries between two screens.
+    ///
+    /// `started_by` is the account whose session asked, when one did. Only
+    /// that account may approve it: approving mints a token for the
+    /// approver and hands it to whoever holds the device code, so a code one
+    /// account started and another approved is the second account's
+    /// credential delivered to the first — the Strix scan of v0.120.0
+    /// collected an admin token that way.
     pub async fn start_pairing(
         &self,
         client_name: &str,
         scopes: &str,
+        started_by: Option<i64>,
     ) -> Result<(String, String), sqlx::Error> {
         use rand::Rng;
         let raw: [u8; 24] = rand::rng().random();
@@ -370,13 +382,15 @@ impl Database {
                 .collect();
             let res = sqlx::query(&crate::sql!(
                 "INSERT INTO pairing_requests
-                    (device_code_hash, user_code, client_name, scopes, created_at, expires_at)
-                 VALUES (?, ?, ?, ?, ?, ?)"
+                    (device_code_hash, user_code, client_name, scopes, user_id, created_at,
+                     expires_at)
+                 VALUES (?, ?, ?, ?, ?, ?, ?)"
             ))
             .bind(Self::hash_token(&device_code))
             .bind(&code)
             .bind(client_name)
             .bind(scopes)
+            .bind(started_by)
             .bind(now)
             .bind(now + Self::PAIRING_TTL_SECS)
             .execute(&self.pool)
@@ -394,40 +408,60 @@ impl Database {
     pub async fn pairing_by_user_code(
         &self,
         user_code: &str,
-    ) -> Result<Option<(i64, String, String, bool)>, sqlx::Error> {
-        let row: Option<(i64, String, String, Option<i64>)> = sqlx::query_as(&crate::sql!(
-            "SELECT id, client_name, scopes, approved_at FROM pairing_requests
-              WHERE user_code = ? AND expires_at > ?",
-        ))
-        .bind(user_code.trim().to_uppercase())
-        .bind(Self::now_secs())
-        .fetch_optional(&self.pool)
-        .await?;
-        Ok(row.map(|(id, name, scopes, approved)| (id, name, scopes, approved.is_some())))
+    ) -> Result<Option<PairingDescription>, sqlx::Error> {
+        #[allow(clippy::type_complexity)]
+        let row: Option<(String, String, Option<i64>, Option<i64>, Option<String>, i64)> =
+            sqlx::query_as(&crate::sql!(
+                "SELECT p.client_name, p.scopes, p.approved_at, p.user_id, u.username,
+                        p.created_at
+                   FROM pairing_requests p LEFT JOIN users u ON u.id = p.user_id
+                  WHERE p.user_code = ? AND p.expires_at > ?",
+            ))
+            .bind(user_code.trim().to_uppercase())
+            .bind(Self::now_secs())
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.map(|(client_name, scopes, approved_at, user_id, username, created_at)| {
+            // Approval overwrites `user_id` with the approver, so it only
+            // names the starter while the request is still pending.
+            let pending = approved_at.is_none();
+            PairingDescription {
+                client_name,
+                scopes,
+                approved: !pending,
+                started_by: user_id.filter(|_| pending),
+                started_by_name: username.filter(|_| pending),
+                created_at,
+            }
+        }))
     }
     /// Approve a pairing and mint its token.
     ///
     /// The token is stored on the request for the client to collect exactly
-    /// once. Returns `false` when the code is unknown, expired, or already
-    /// approved — a second approval must not mint a second token.
+    /// once. Unavailable when the code is unknown, expired, or already
+    /// approved — a second approval must not mint a second token — and
+    /// refused when another account's session started it.
     pub async fn approve_pairing(
         &self,
         user_code: &str,
         user_id: i64,
         default_chain_id: Option<i64>,
-    ) -> Result<bool, sqlx::Error> {
+    ) -> Result<PairingApproval, sqlx::Error> {
         let now = Self::now_secs();
-        let row: Option<(i64, String, String)> = sqlx::query_as(&crate::sql!(
-            "SELECT id, client_name, scopes FROM pairing_requests
+        let row: Option<(i64, String, String, Option<i64>)> = sqlx::query_as(&crate::sql!(
+            "SELECT id, client_name, scopes, user_id FROM pairing_requests
               WHERE user_code = ? AND expires_at > ? AND approved_at IS NULL"
         ))
         .bind(user_code.trim().to_uppercase())
         .bind(now)
         .fetch_optional(&self.pool)
         .await?;
-        let Some((id, client_name, scopes)) = row else {
-            return Ok(false);
+        let Some((id, client_name, scopes, started_by)) = row else {
+            return Ok(PairingApproval::Unavailable);
         };
+        if started_by.is_some_and(|starter| starter != user_id) {
+            return Ok(PairingApproval::OtherAccount);
+        }
 
         // A paired client starts as a backfill source like any other; the
         // operator flips it live from Settings once they know what it is.
@@ -445,7 +479,7 @@ impl Database {
         .bind(id)
         .execute(&self.pool)
         .await?;
-        Ok(true)
+        Ok(PairingApproval::Approved)
     }
     /// What the polling client should be told.
     pub async fn poll_pairing(&self, device_code: &str) -> Result<PairingPoll, sqlx::Error> {
@@ -555,12 +589,25 @@ impl Database {
         info!("🔑 Rotated token {} for user_id {}", token_id, user_id);
         Ok(Some(token))
     }
+    /// Revoke a token. Its sessions are the user's listening history and stay;
+    /// they stop naming the token, which is what lets the row go — a bare
+    /// delete failed on the foreign key for every token that had ever
+    /// submitted, and left it authenticating.
     pub async fn delete_token(&self, user_id: i64, token_id: i64) -> Result<bool, sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query(&crate::sql!(
+            "UPDATE sessions SET token_id = NULL WHERE token_id = ? AND user_id = ?"
+        ))
+        .bind(token_id)
+        .bind(user_id)
+        .execute(&mut *tx)
+        .await?;
         let result = sqlx::query(&crate::sql!("DELETE FROM tokens WHERE id = ? AND user_id = ?"))
             .bind(token_id)
             .bind(user_id)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?;
+        tx.commit().await?;
         Ok(result.rows_affected() > 0)
     }
     pub async fn has_users(&self) -> Result<bool, sqlx::Error> {

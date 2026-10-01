@@ -782,7 +782,7 @@ pub struct UpdateScrobble {
     request_body = UpdateScrobble,
     responses(
         (status = 200, description = "Updated. The fresh row, so a client can re-render without a refetch.", body = EditedListen),
-        (status = 400, description = "A variant without a chain, or one belonging to another chain.", body = ErrorResponse),
+        (status = 400, description = "Not one of your chains, a variant without a chain, or one belonging to another chain.", body = ErrorResponse),
         (status = 401, response = Unauthorized),
         (status = 403, response = Forbidden),
         (status = 404, response = NotFound),
@@ -794,6 +794,13 @@ async fn update_scrobble(
     Path(id): Path<i64>,
     Json(body): Json<UpdateScrobble>,
 ) -> impl IntoResponse {
+    // The chain has to be the caller's own. Unchecked, a listen could be filed
+    // under another household member's chain — their gear hours and their
+    // Reel — which is the Strix finding of v0.120.0 and the same hole
+    // `physical::refuse_foreign_gear` closed on the shelf.
+    if let Some(refused) = refuse_foreign_chain(&state, user.user_id, body.signal_chain_id).await {
+        return refused;
+    }
     // A variant belongs to exactly one chain; pairing it with another resolves
     // to components never fitted at the same time.
     if let Some(variant) = body.chain_variant_id {
@@ -1126,6 +1133,21 @@ pub struct BulkUpdated {
     pub updated: u64,
 }
 
+/// A 400 when `chain_id` names a chain the caller does not own. Nonexistent
+/// and somebody else's read the same, so the answer is no existence oracle.
+async fn refuse_foreign_chain(
+    state: &AppState,
+    user_id: i64,
+    chain_id: Option<i64>,
+) -> Option<axum::response::Response> {
+    let cid = chain_id?;
+    match state.db.get_chain(user_id, cid).await {
+        Ok(Some(_)) => None,
+        Ok(None) => Some(bad_request("No such signal chain")),
+        Err(e) => Some(server_error(e.to_string())),
+    }
+}
+
 /// Distinguish an absent field from an explicit `null`.
 ///
 /// `#[serde(default)]` alone cannot: both arrive as `None`. This is only ever
@@ -1191,6 +1213,10 @@ async fn bulk_set_chain(
             .into_response();
     };
 
+    // Only the caller's own chain, for the reason `update_scrobble` gives.
+    if let Some(refused) = refuse_foreign_chain(&state, user.user_id, chain_id).await {
+        return refused;
+    }
     // A variant belongs to exactly one chain. Pairing it with another resolves
     // to components that were never fitted at the same time, so it is refused
     // at the door rather than stored and quietly ignored by `equipment_seconds`.

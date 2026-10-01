@@ -879,8 +879,11 @@ async fn create_token(
         )
         .await
     {
+        // A live secret, shown once: nothing between here and the browser
+        // may keep a copy. The same header the OAuth token endpoint sends.
         Ok(token) => (
             StatusCode::CREATED,
+            [("cache-control", "no-store")],
             Json(CreateTokenResponse {
                 token,
                 name: body.name.trim().to_string(),
@@ -1072,6 +1075,7 @@ async fn rotate_token(
     match state.db.rotate_token(user.user_id, token_id).await {
         Ok(Some(token)) => (
             StatusCode::OK,
+            [("cache-control", "no-store")],
             Json(RotatedToken {
                 token,
                 message: "Token re-issued. Copy it now — it won't be shown again.",

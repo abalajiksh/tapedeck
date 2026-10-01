@@ -33,6 +33,7 @@ use super::models::ErrorResponse;
 use super::AppState;
 use crate::db::UserSource;
 use crate::openapi::{BadRequest, NotFound, Unauthorized};
+use crate::sources::egress::Egress;
 use crate::sources::mediabrowser::MediaBrowserAccount;
 use crate::sources::plex::PlexAccount;
 use crate::sources::{Flavour, MediaBrowserSource, NavidromeSource, PlexFilters, PlexSource};
@@ -244,6 +245,7 @@ async fn resolve_save(
     body: &mut SourceUpdate,
     current: Option<&UserSource>,
     enabled: bool,
+    egress: Egress,
 ) -> Result<Resolved, axum::response::Response> {
     let url = body
         .url
@@ -251,6 +253,13 @@ async fn resolve_save(
         .map(|u| u.trim().trim_end_matches('/').to_string())
         .or_else(|| current.map(|c| c.url.clone()))
         .unwrap_or_default();
+    // Before anything below dials it. A stored URL is re-checked too, so a
+    // row saved before the rule cannot be re-saved past it.
+    if !url.is_empty() {
+        if let Err(e) = egress.check_source(kind, &url).await {
+            return Err(err(400, e.to_string()));
+        }
+    }
 
     let keep = |incoming: Option<String>, key: &str| -> String {
         incoming
@@ -302,7 +311,7 @@ async fn resolve_save(
             let chosen = body.plex_account.take().filter(|a| !a.trim().is_empty());
             if let Some(chosen) = chosen {
                 if complete {
-                    match PlexSource::list_accounts(&url, &token).await {
+                    match PlexSource::list_accounts(&url, &token, egress).await {
                         Ok(accounts) => {
                             match accounts
                                 .iter()
@@ -359,7 +368,7 @@ async fn resolve_save(
             let chosen = body.jellyfin_account.take().filter(|a| !a.trim().is_empty());
             if let Some(chosen) = chosen {
                 if complete {
-                    match MediaBrowserSource::list_accounts(flavour, &url, &jf_key).await {
+                    match MediaBrowserSource::list_accounts(flavour, &url, &jf_key, egress).await {
                         Ok(accounts) => match accounts
                             .iter()
                             .find(|a| a.name.eq_ignore_ascii_case(chosen.trim()))
@@ -383,7 +392,7 @@ async fn resolve_save(
                     }
                 }
             } else if complete && changed {
-                match MediaBrowserSource::resolve_account(flavour, &url, &jf_key).await {
+                match MediaBrowserSource::resolve_account(flavour, &url, &jf_key, egress).await {
                     Ok(name) => remote_account = Some(name),
                     Err(e) => {
                         return Err(err(
@@ -409,7 +418,8 @@ async fn resolve_save(
         "roon" => current.map(|c| c.credentials.clone()).unwrap_or_default(),
         _ => {
             if complete && enabled {
-                let mut probe = NavidromeSource::new(url.clone(), nd_user.clone(), nd_pass.clone());
+                let mut probe =
+                    NavidromeSource::new(url.clone(), nd_user.clone(), nd_pass.clone(), egress);
                 if let Err(e) = probe.initialize().await {
                     return Err(err(400, format!("Could not sign in to Navidrome: {e}")));
                 }
@@ -451,6 +461,11 @@ async fn resolve_save(
 /// the token is resolved to a Plex account via plex.tv and the source is
 /// filtered to that account, so there is no name-matching — which means
 /// saving needs outbound internet even for a LAN Plex.
+///
+/// **A member's** source must point at the public internet, or at a private
+/// network the operator lists in `TAPEDECK_SOURCE_NETWORKS`; this server,
+/// loopback and link-local addresses are always refused (400). An admin's
+/// may point anywhere.
 #[utoipa::path(
     post,
     path = "/api/v1/sources",
@@ -475,7 +490,8 @@ async fn create_source(
     let label = body.label.clone().unwrap_or_default().trim().to_string();
     let interval = body.poll_interval_secs;
 
-    let resolved = match resolve_save(&kind, &mut body, None, enabled).await {
+    let egress = Egress::for_owner(user.is_admin);
+    let resolved = match resolve_save(&kind, &mut body, None, enabled, egress).await {
         Ok(r) => r,
         Err(resp) => return resp,
     };
@@ -538,10 +554,12 @@ async fn update_source(
     let label = body.label.clone().unwrap_or_else(|| current.label.clone()).trim().to_string();
     let interval = body.poll_interval_secs.or(current.poll_interval_secs);
 
-    let resolved = match resolve_save(&current.kind, &mut body, Some(&current), enabled).await {
-        Ok(r) => r,
-        Err(resp) => return resp,
-    };
+    let egress = Egress::for_owner(user.is_admin);
+    let resolved =
+        match resolve_save(&current.kind, &mut body, Some(&current), enabled, egress).await {
+            Ok(r) => r,
+            Err(resp) => return resp,
+        };
 
     match state
         .db
@@ -619,7 +637,8 @@ struct SourceTest {
 ///
 /// Session-only. `kind` rides in the body rather than the path so a server
 /// can be tested before it is saved; pass `id` instead to re-test one that
-/// is, reusing its stored secret.
+/// is, reusing its stored secret. The address is held to the same rule as a
+/// save — a 400, before anything connects.
 #[utoipa::path(
     post,
     path = "/api/v1/sources/test",
@@ -659,6 +678,14 @@ async fn test_source(
         .filter(|u| !u.is_empty())
         .or_else(|| stored.as_ref().map(|s| s.url.clone()))
         .unwrap_or_default();
+    // The cheapest place to probe the instance's own network — it fetches the
+    // URL and reports how that went — so it is checked like a save.
+    let egress = Egress::for_owner(user.is_admin);
+    if !url.is_empty() {
+        if let Err(e) = egress.check_source(&kind, &url).await {
+            return err(400, e.to_string());
+        }
+    }
     let cred = |incoming: Option<String>, key: &str| -> String {
         incoming
             .filter(|v| !v.trim().is_empty())
@@ -676,9 +703,10 @@ async fn test_source(
             }
             // Listed first: with a dashboard API key `resolve_account` cannot
             // answer on its own, and the list is what the picker needs anyway.
-            let accounts =
-                MediaBrowserSource::list_accounts(flavour, &url, &key).await.unwrap_or_default();
-            match MediaBrowserSource::resolve_account(flavour, &url, &key).await {
+            let accounts = MediaBrowserSource::list_accounts(flavour, &url, &key, egress)
+                .await
+                .unwrap_or_default();
+            match MediaBrowserSource::resolve_account(flavour, &url, &key, egress).await {
                 Ok(name) => (
                     StatusCode::OK,
                     Json(SourceCheck {
@@ -717,7 +745,7 @@ async fn test_source(
             if url.is_empty() || u.is_empty() || p.is_empty() {
                 return err(400, "Enter a server URL, username and password first");
             }
-            let mut probe = NavidromeSource::new(url, u.clone(), p);
+            let mut probe = NavidromeSource::new(url, u.clone(), p, egress);
             match probe.initialize().await {
                 Ok(()) => (
                     StatusCode::OK,
@@ -752,8 +780,9 @@ async fn test_source(
             // may not be allowed to read /accounts, and that is not a reason to
             // fail the connection test — the caller just gets no picker and the
             // token's own account as before.
-            let accounts = PlexSource::list_accounts(&url, &token).await.unwrap_or_default();
-            let mut probe = PlexSource::with_filters(url, token, PlexFilters::default());
+            let accounts =
+                PlexSource::list_accounts(&url, &token, egress).await.unwrap_or_default();
+            let mut probe = PlexSource::with_filters(url, token, PlexFilters::default(), egress);
             match probe.initialize().await {
                 Ok(()) => (
                     StatusCode::OK,
