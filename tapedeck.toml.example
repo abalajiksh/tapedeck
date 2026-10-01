@@ -64,3 +64,10 @@ rate_limit_per_second = 1
 # Optional: a local MusicBrainz Postgres mirror, queried before the API.
 enable_postgres = false
 postgres_url = ""
+
+[sources]
+# Private networks a *member's* media-server source may point at, as CIDRs.
+# Tapedeck fetches source URLs itself, so a member's are held to the public
+# internet plus this list; this server, loopback and link-local are always
+# refused. Admins' sources may point anywhere. Env: TAPEDECK_SOURCE_NETWORKS.
+# networks = ["192.168.178.0/24"]

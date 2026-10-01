@@ -17,6 +17,7 @@
 
 #[cfg(test)]
 mod tests {
+    use crate::sources::egress::Egress;
     use crate::sources::mediabrowser::*;
 
     /// `/Users` is the fallback that makes a dashboard API key usable at all —
@@ -242,8 +243,12 @@ mod tests {
     /// parsing that broke the state machine's inputs would still be caught.
     #[test]
     fn a_looped_track_scrobbles_once_per_pass_through_the_wire_format() {
-        let mut src =
-            MediaBrowserSource::jellyfin("http://jf:8096".into(), "k".into(), "abalaji".into());
+        let mut src = MediaBrowserSource::jellyfin(
+            "http://jf:8096".into(),
+            "k".into(),
+            "abalaji".into(),
+            Egress::Open,
+        );
         let mut banked = 0usize;
 
         for pass in 0..3 {
@@ -259,8 +264,12 @@ mod tests {
     /// the filter is the whole of the isolation for this source.
     #[test]
     fn another_accounts_session_is_ignored() {
-        let mut src =
-            MediaBrowserSource::jellyfin("http://jf:8096".into(), "k".into(), "abalaji".into());
+        let mut src = MediaBrowserSource::jellyfin(
+            "http://jf:8096".into(),
+            "k".into(),
+            "abalaji".into(),
+            Egress::Open,
+        );
         let body =
             session_at(195).replace(r#""UserName": "abalaji""#, r#""UserName": "housemate""#);
         let sessions: Vec<MbSession> = serde_json::from_str(&body).unwrap();

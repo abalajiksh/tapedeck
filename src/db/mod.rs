@@ -840,9 +840,17 @@ pub struct UserSource {
     pub last_polled_at: Option<i64>,
     pub last_error: Option<String>,
     pub updated_at: i64,
+    /// The owner is an admin, which decides where this source may connect —
+    /// `sources::egress`. Read with the row so no call site has to look it up.
+    pub owner_is_admin: bool,
 }
 
 impl UserSource {
+    /// Whose network rules this source's traffic follows.
+    pub fn egress(&self) -> crate::sources::egress::Egress {
+        crate::sources::egress::Egress::for_owner(self.owner_is_admin)
+    }
+
     /// A comma-or-array option read as a lowercased list, which is the shape
     /// `PlexFilters` matches against.
     pub fn option_list(&self, key: &str) -> Vec<String> {
@@ -893,6 +901,7 @@ struct UserSourceRow {
     last_polled_at: Option<i64>,
     last_error: Option<String>,
     updated_at: i64,
+    owner_role: String,
 }
 
 /// Server-wide Plex source config. The list fields are comma-separated so the
@@ -2684,6 +2693,30 @@ pub fn split_featured(artist: &str) -> Option<String> {
 /// What an API token resolves to. The id is carried because a session is now
 /// split when the submitting token changes — a different app means a different
 /// setup far more often than not.
+/// A pending pairing, as the approval screen needs it.
+#[derive(Debug, Clone)]
+pub struct PairingDescription {
+    pub client_name: String,
+    pub scopes: String,
+    pub approved: bool,
+    /// The account whose session started it, when one did. `None` is a device
+    /// with no account, which is what the flow is for.
+    pub started_by: Option<i64>,
+    pub started_by_name: Option<String>,
+    pub created_at: i64,
+}
+
+/// What approving a pairing did.
+#[derive(Debug, PartialEq, Eq)]
+pub enum PairingApproval {
+    Approved,
+    /// Unknown, expired, or already approved — one answer for all three.
+    Unavailable,
+    /// Started from another account's session. Its token would be minted for
+    /// the approver and handed to that account, so it is refused.
+    OtherAccount,
+}
+
 /// What a polling client is told about its pairing request.
 #[derive(Debug, PartialEq, Eq)]
 pub enum PairingPoll {

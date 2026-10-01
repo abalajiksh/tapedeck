@@ -1846,13 +1846,16 @@ async fn a_pairing_code_is_single_use_in_both_directions() {
     let uid = db.create_user("ash", None, "pw", "admin").await.unwrap();
 
     let (device_code, user_code) =
-        db.start_pairing("Pano on Android", "submit read").await.unwrap();
+        db.start_pairing("Pano on Android", "submit read", None).await.unwrap();
     assert_eq!(user_code.len(), 9, "8 characters plus the separator");
     assert_eq!(db.poll_pairing(&device_code).await.unwrap(), PairingPoll::Pending);
 
-    assert!(db.approve_pairing(&user_code, uid, None).await.unwrap());
+    assert_eq!(db.approve_pairing(&user_code, uid, None).await.unwrap(), PairingApproval::Approved);
     // A second approval must not mint a second token.
-    assert!(!db.approve_pairing(&user_code, uid, None).await.unwrap());
+    assert_eq!(
+        db.approve_pairing(&user_code, uid, None).await.unwrap(),
+        PairingApproval::Unavailable
+    );
 
     let token = match db.poll_pairing(&device_code).await.unwrap() {
         PairingPoll::Approved(t) => t,
@@ -1865,6 +1868,53 @@ async fn a_pairing_code_is_single_use_in_both_directions() {
     let auth = db.validate_token(&token).await.unwrap().expect("valid");
     assert_eq!(auth.user.user_id, uid);
     assert!(auth.can_read());
+}
+
+/// A pairing started from one account's session cannot be approved by
+/// another. Approving mints the token for the approver and hands it to
+/// whoever polls, so allowing it delivered the approver's credential to the
+/// starter — an admin's, in the Strix scan of v0.120.0.
+#[tokio::test]
+async fn only_the_account_that_started_a_pairing_can_approve_it() {
+    let db = testdb().await;
+    let admin = db.create_user("ash", None, "pw", "admin").await.unwrap();
+    let member = db.create_user("kit", None, "pw", "user").await.unwrap();
+
+    let (device_code, user_code) =
+        db.start_pairing("member-dev", "submit read write", Some(member)).await.unwrap();
+    let seen = db.pairing_by_user_code(&user_code).await.unwrap().expect("pending");
+    assert_eq!(seen.started_by, Some(member));
+    assert_eq!(seen.started_by_name.as_deref(), Some("kit"));
+
+    assert_eq!(
+        db.approve_pairing(&user_code, admin, None).await.unwrap(),
+        PairingApproval::OtherAccount
+    );
+    assert_eq!(db.poll_pairing(&device_code).await.unwrap(), PairingPoll::Pending, "no token");
+
+    assert_eq!(
+        db.approve_pairing(&user_code, member, None).await.unwrap(),
+        PairingApproval::Approved
+    );
+    let PairingPoll::Approved(token) = db.poll_pairing(&device_code).await.unwrap() else {
+        panic!("the starter's own approval mints");
+    };
+    assert_eq!(db.validate_token(&token).await.unwrap().unwrap().user.user_id, member);
+}
+
+/// A device with no account — the case pairing exists for — still pairs
+/// with whoever approves, and the approval screen says nobody started it.
+#[tokio::test]
+async fn an_anonymous_pairing_belongs_to_its_approver() {
+    let db = testdb().await;
+    let uid = db.create_user("ash", None, "pw", "user").await.unwrap();
+    let (_, user_code) = db.start_pairing("Fire TV", "submit", None).await.unwrap();
+    let seen = db.pairing_by_user_code(&user_code).await.unwrap().expect("pending");
+    assert_eq!(seen.started_by, None);
+    assert_eq!(db.approve_pairing(&user_code, uid, None).await.unwrap(), PairingApproval::Approved);
+    let after = db.pairing_by_user_code(&user_code).await.unwrap().expect("still there");
+    assert!(after.approved);
+    assert_eq!(after.started_by, None, "the approver is not reported as the starter");
 }
 
 /// `read` is an explicit grant. A token that only says `submit` must not be
@@ -3246,6 +3296,73 @@ async fn delete_user_cascades_their_data() {
     assert!(db.list_users().await.unwrap().iter().all(|u| u.id != uid));
     assert!(db.list_tokens(uid).await.unwrap().is_empty());
     assert!(db.list_connections(uid).await.unwrap().is_empty());
+}
+
+/// A token that has submitted a listen owns a session row, and revoking it
+/// still works: the secret stops authenticating and the session — the user's
+/// listening history — is kept, just no longer attributed to the token.
+///
+/// The Strix scan of v0.120.0 found the delete failing on the foreign key and
+/// leaving the token valid, which is revocation failing for exactly the tokens
+/// that have been used.
+#[tokio::test]
+async fn a_token_that_has_submitted_can_still_be_revoked() {
+    let db = testdb().await;
+    let uid = db.create_user("gus", None, "x", "user").await.unwrap();
+    let secret = db.create_token(uid, "t", "submit", None, false).await.unwrap();
+    let tid = db.validate_token(&secret).await.unwrap().expect("valid").token_id;
+    let sid = db
+        .assign_session(uid, 1_760_000_100, 180, None, None, None, "active", 1800, Some(tid))
+        .await
+        .unwrap();
+
+    assert!(db.delete_token(uid, tid).await.expect("revoke a used token"));
+    assert!(db.validate_token(&secret).await.unwrap().is_none(), "the secret is dead");
+    let (kept,): (Option<i64>,) = sqlx::query_as("SELECT token_id FROM sessions WHERE id = ?")
+        .bind(sid)
+        .fetch_one(&db.pool)
+        .await
+        .expect("the session survives");
+    assert_eq!(kept, None);
+}
+
+/// Somebody else's token id revokes nothing, and leaves their sessions alone.
+#[tokio::test]
+async fn revoking_is_scoped_to_the_caller() {
+    let db = testdb().await;
+    let a = db.create_user("hal", None, "x", "user").await.unwrap();
+    let b = db.create_user("ida", None, "x", "user").await.unwrap();
+    let secret = db.create_token(b, "t", "submit", None, false).await.unwrap();
+    let tid = db.validate_token(&secret).await.unwrap().expect("valid").token_id;
+    let sid = db
+        .assign_session(b, 1_760_000_100, 180, None, None, None, "active", 1800, Some(tid))
+        .await
+        .unwrap();
+
+    assert!(!db.delete_token(a, tid).await.unwrap());
+    assert!(db.validate_token(&secret).await.unwrap().is_some());
+    let (kept,): (Option<i64>,) = sqlx::query_as("SELECT token_id FROM sessions WHERE id = ?")
+        .bind(sid)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(kept, Some(tid));
+}
+
+/// The same foreign key, one level up: a user whose token opened a session
+/// can be deleted. `tokens` used to clear before `sessions`.
+#[tokio::test]
+async fn delete_user_with_a_used_token() {
+    let db = testdb().await;
+    let uid = db.create_user("jo", None, "x", "user").await.unwrap();
+    let secret = db.create_token(uid, "t", "submit", None, false).await.unwrap();
+    let tid = db.validate_token(&secret).await.unwrap().expect("valid").token_id;
+    db.assign_session(uid, 1_760_000_100, 180, None, None, None, "active", 1800, Some(tid))
+        .await
+        .unwrap();
+
+    assert!(db.delete_user(uid).await.expect("delete a user whose token was used"));
+    assert!(db.validate_token(&secret).await.unwrap().is_none());
 }
 
 #[tokio::test]

@@ -12,9 +12,11 @@ impl Database {
     /// can't decrypt is dropped rather than failing the whole tick.
     pub async fn list_enabled_sources(&self) -> Result<Vec<UserSource>, sqlx::Error> {
         let rows: Vec<UserSourceRow> = sqlx::query_as(&crate::sql!(
-            "SELECT id, user_id, kind, label, enabled, url, credentials, remote_account,
-                    poll_interval_secs, options, last_polled_at, last_error, updated_at
-             FROM user_sources WHERE enabled = 1 ORDER BY user_id, kind",
+            "SELECT s.id, s.user_id, s.kind, s.label, s.enabled, s.url, s.credentials,
+                    s.remote_account, s.poll_interval_secs, s.options, s.last_polled_at,
+                    s.last_error, s.updated_at, COALESCE(u.role, '') AS owner_role
+             FROM user_sources s LEFT JOIN users u ON u.id = s.user_id
+             WHERE s.enabled = 1 ORDER BY s.user_id, s.kind",
         ))
         .fetch_all(&self.pool)
         .await?;
@@ -27,9 +29,11 @@ impl Database {
         user_id: i64,
     ) -> Result<Vec<UserSource>, sqlx::Error> {
         let rows: Vec<UserSourceRow> = sqlx::query_as(&crate::sql!(
-            "SELECT id, user_id, kind, label, enabled, url, credentials, remote_account,
-                    poll_interval_secs, options, last_polled_at, last_error, updated_at
-             FROM user_sources WHERE user_id = ? ORDER BY kind",
+            "SELECT s.id, s.user_id, s.kind, s.label, s.enabled, s.url, s.credentials,
+                    s.remote_account, s.poll_interval_secs, s.options, s.last_polled_at,
+                    s.last_error, s.updated_at, COALESCE(u.role, '') AS owner_role
+             FROM user_sources s LEFT JOIN users u ON u.id = s.user_id
+             WHERE s.user_id = ? ORDER BY s.kind",
         ))
         .bind(user_id)
         .fetch_all(&self.pool)
@@ -67,9 +71,11 @@ impl Database {
         id: i64,
     ) -> Result<Option<UserSource>, sqlx::Error> {
         let row: Option<UserSourceRow> = sqlx::query_as(&crate::sql!(
-            "SELECT id, user_id, kind, label, enabled, url, credentials, remote_account,
-                    poll_interval_secs, options, last_polled_at, last_error, updated_at
-             FROM user_sources WHERE user_id = ? AND id = ?",
+            "SELECT s.id, s.user_id, s.kind, s.label, s.enabled, s.url, s.credentials,
+                    s.remote_account, s.poll_interval_secs, s.options, s.last_polled_at,
+                    s.last_error, s.updated_at, COALESCE(u.role, '') AS owner_role
+             FROM user_sources s LEFT JOIN users u ON u.id = s.user_id
+             WHERE s.user_id = ? AND s.id = ?",
         ))
         .bind(user_id)
         .bind(id)
@@ -94,6 +100,7 @@ impl Database {
             last_polled_at: row.last_polled_at,
             last_error: row.last_error,
             updated_at: row.updated_at,
+            owner_is_admin: row.owner_role == "admin",
         })
     }
     /// Create a source, returning its id. `updated_at` doubles as the change

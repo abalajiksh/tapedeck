@@ -3619,6 +3619,11 @@ class TapedeckAPI {
 		can_read: boolean;
 		can_write: boolean;
 		approved: boolean;
+		/** The account whose session started it; null for a device with no account. */
+		started_by: string | null;
+		/** Another account started it, so approving is refused. */
+		started_by_other: boolean;
+		started_secs_ago: number;
 	}> {
 		return this.get(`/api/v1/pair/${encodeURIComponent(userCode)}`);
 	}

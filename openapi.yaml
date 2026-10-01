@@ -1123,6 +1123,9 @@ paths:
         The user code is eight characters and therefore guessable, so its safety
         is structural: a five-minute window, single use in both directions, rate
         limiting, and approval requiring a signed-in session.
+
+        Started from a signed-in browser session, the pairing belongs to that
+        account and **only that account can approve it**.
       operationId: start
       requestBody:
         description: Optional.
@@ -1144,7 +1147,9 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
-      security: []
+      security:
+      - {}
+      - sessionCookie: []
   /1/pair/poll:
     post:
       tags:
@@ -1247,6 +1252,12 @@ paths:
                 $ref: '#/components/schemas/Error'
         '401':
           $ref: '#/components/responses/Unauthorized'
+        '403':
+          description: Another account started this pairing; only it can approve.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
         '404':
           $ref: '#/components/responses/NotFound'
   /api/v1/scrobbles:
@@ -1416,7 +1427,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/EditedListen'
         '400':
-          description: A variant without a chain, or one belonging to another chain.
+          description: Not one of your chains, a variant without a chain, or one belonging to another chain.
           content:
             application/json:
               schema:
@@ -6131,7 +6142,8 @@ paths:
       description: |-
         Session-only. `kind` rides in the body rather than the path so a server
         can be tested before it is saved; pass `id` instead to re-test one that
-        is, reusing its stored secret.
+        is, reusing its stored secret. The address is held to the same rule as a
+        save — a 400, before anything connects.
       operationId: test_source
       requestBody:
         content:
@@ -6185,6 +6197,11 @@ paths:
         the token is resolved to a Plex account via plex.tv and the source is
         filtered to that account, so there is no name-matching — which means
         saving needs outbound internet even for a LAN Plex.
+
+        **A member's** source must point at the public internet, or at a private
+        network the operator lists in `TAPEDECK_SOURCE_NETWORKS`; this server,
+        loopback and link-local addresses are always refused (400). An admin's
+        may point anywhere.
       operationId: create_source
       requestBody:
         content:
@@ -17424,6 +17441,8 @@ components:
       - can_read
       - can_write
       - approved
+      - started_by_other
+      - started_secs_ago
       properties:
         client_name:
           type: string
@@ -17439,6 +17458,21 @@ components:
           description: Whether approving grants `write`.
         approved:
           type: boolean
+        started_by:
+          type:
+          - string
+          - 'null'
+          description: |-
+            The account whose session started this, if one did. Null is a device
+            with no account — the usual case, and the one to approve only when
+            the code is on a screen in front of you.
+        started_by_other:
+          type: boolean
+          description: Started by another account, so you cannot approve it.
+        started_secs_ago:
+          type: integer
+          format: int64
+          description: How long ago the device asked.
     PairingStarted:
       type: object
       description: A pairing, begun.

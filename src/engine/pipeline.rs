@@ -484,6 +484,12 @@ impl ScrobbleEngine {
         &self,
         cfg: &crate::db::UserSource,
     ) -> Result<Box<dyn MusicSource>, Box<dyn std::error::Error>> {
+        // A member's row saved before `sources::egress` existed is held to it
+        // here; the client's resolver covers hostnames, this covers literals.
+        let egress = cfg.egress();
+        if cfg.kind != "roon" {
+            egress.check_url(&cfg.url)?;
+        }
         match cfg.kind.as_str() {
             "plex" => {
                 let token = cfg.credential("token").ok_or("no Plex token stored")?;
@@ -505,14 +511,14 @@ impl ScrobbleEngine {
                     devices_allow: cfg.option_list("devices_allow"),
                     devices_block: cfg.option_list("devices_block"),
                 };
-                let mut plex = PlexSource::with_filters(cfg.url.clone(), token, filters);
+                let mut plex = PlexSource::with_filters(cfg.url.clone(), token, filters, egress);
                 plex.initialize().await?;
                 Ok(Box::new(plex))
             }
             "navidrome" => {
                 let username = cfg.credential("username").ok_or("no Navidrome username stored")?;
                 let password = cfg.credential("password").ok_or("no Navidrome password stored")?;
-                let mut nd = NavidromeSource::new(cfg.url.clone(), username, password);
+                let mut nd = NavidromeSource::new(cfg.url.clone(), username, password, egress);
                 nd.initialize().await?;
                 // Navidrome keeps its own play history, so without a high-water
                 // mark a restart would re-walk all of it. Dedup would absorb the
@@ -535,9 +541,9 @@ impl ScrobbleEngine {
                     format!("{label} account not resolved — reconnect the source")
                 })?;
                 let mut mb = if emby {
-                    MediaBrowserSource::emby(cfg.url.clone(), key, account)
+                    MediaBrowserSource::emby(cfg.url.clone(), key, account, egress)
                 } else {
-                    MediaBrowserSource::jellyfin(cfg.url.clone(), key, account)
+                    MediaBrowserSource::jellyfin(cfg.url.clone(), key, account, egress)
                 };
                 mb.initialize().await?;
                 Ok(Box::new(mb))
@@ -555,6 +561,9 @@ impl ScrobbleEngine {
                     Some((h, p)) => (h.to_string(), p.parse::<u16>().ok()),
                     None => (host, None),
                 };
+                // Roon's own socket, not the egress client, so this is its
+                // only check. 9330 is the Core's default port.
+                egress.check_host_resolved(&host, port.unwrap_or(9330)).await?;
                 let mut roon = crate::sources::RoonSource::new(
                     host,
                     port,
@@ -1699,18 +1708,31 @@ impl ScrobbleEngine {
     async fn artist_is_in_a_library(&self, user_id: i64, name: &str) -> bool {
         let Ok(sources) = self.db.list_sources_for_user(user_id).await else { return false };
         for source in sources.iter().filter(|s| s.enabled) {
+            let egress = source.egress();
+            if egress.check_url(&source.url).is_err() {
+                continue;
+            }
             match source.kind.as_str() {
                 "plex" => {
                     let Some(token) = source.credential("token") else { continue };
-                    let plex =
-                        PlexSource::with_filters(source.url.clone(), token, PlexFilters::default());
+                    let plex = PlexSource::with_filters(
+                        source.url.clone(),
+                        token,
+                        PlexFilters::default(),
+                        egress,
+                    );
                     if matches!(plex.find_artist(name).await, Ok(Some(_))) {
                         return true;
                     }
                 }
                 "jellyfin" => {
                     let Some(key) = source.credential("api_key") else { continue };
-                    let jf = MediaBrowserSource::jellyfin(source.url.clone(), key, String::new());
+                    let jf = MediaBrowserSource::jellyfin(
+                        source.url.clone(),
+                        key,
+                        String::new(),
+                        egress,
+                    );
                     if matches!(jf.find_artist(name).await, Ok(Some(_))) {
                         return true;
                     }

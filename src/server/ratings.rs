@@ -86,10 +86,14 @@ struct SourcePull {
 /// a source that silently returned nothing would look broken. Same discipline
 /// as Phase 10's rule that a source declares its own blind spots.
 async fn pull_one(source: &UserSource) -> Result<Vec<IncomingRating>, String> {
+    let egress = source.egress();
+    if source.kind != "roon" {
+        egress.check_url(&source.url).map_err(|e| e.to_string())?;
+    }
     match source.kind.as_str() {
         "plex" => {
             let token = source.credential("token").ok_or("Plex token is missing")?;
-            let mut plex = PlexSource::new(source.url.clone(), token);
+            let mut plex = PlexSource::new(source.url.clone(), token, egress);
             // The section list is what the walk iterates, and it is only
             // populated by `initialize`.
             plex.initialize().await.map_err(|e| crate::logging::error_chain(&*e))?;
@@ -101,9 +105,9 @@ async fn pull_one(source: &UserSource) -> Result<Vec<IncomingRating>, String> {
                 .ok_or_else(|| format!("{} API key is missing", source.kind))?;
             let account = source.remote_account.clone().unwrap_or_default();
             let client = if source.kind == "emby" {
-                MediaBrowserSource::emby(source.url.clone(), key, account)
+                MediaBrowserSource::emby(source.url.clone(), key, account, egress)
             } else {
-                MediaBrowserSource::jellyfin(source.url.clone(), key, account)
+                MediaBrowserSource::jellyfin(source.url.clone(), key, account, egress)
             };
             client.fetch_ratings().await.map_err(|e| crate::logging::error_chain(&*e))
         }
@@ -112,7 +116,7 @@ async fn pull_one(source: &UserSource) -> Result<Vec<IncomingRating>, String> {
             else {
                 return Err("Navidrome credentials are missing".into());
             };
-            let mut nd = NavidromeSource::new(source.url.clone(), u, p);
+            let mut nd = NavidromeSource::new(source.url.clone(), u, p, egress);
             nd.fetch_ratings().await.map_err(|e| crate::logging::error_chain(&*e))
         }
         "roon" => Err("Roon publishes no ratings — its API has no rating, \

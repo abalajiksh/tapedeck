@@ -59,6 +59,7 @@
 
 #[cfg(test)]
 mod tests {
+    use crate::sources::egress::Egress;
     use crate::sources::mediabrowser::*;
 
     /// Every route is prefixed. This is the difference most likely to be got
@@ -67,7 +68,12 @@ mod tests {
     /// diagnose.
     #[test]
     fn every_route_is_namespaced_under_emby() {
-        let s = MediaBrowserSource::emby("http://emby:8096".into(), "k".into(), "abalaji".into());
+        let s = MediaBrowserSource::emby(
+            "http://emby:8096".into(),
+            "k".into(),
+            "abalaji".into(),
+            Egress::Open,
+        );
         for (path, expected) in [
             ("/Sessions", "http://emby:8096/emby/Sessions"),
             ("/Users", "http://emby:8096/emby/Users"),
@@ -177,8 +183,12 @@ mod tests {
     /// same as it is for Jellyfin.
     #[test]
     fn another_accounts_session_is_ignored() {
-        let mut src =
-            MediaBrowserSource::emby("http://emby:8096".into(), "k".into(), "abalaji".into());
+        let mut src = MediaBrowserSource::emby(
+            "http://emby:8096".into(),
+            "k".into(),
+            "abalaji".into(),
+            Egress::Open,
+        );
         let body = format!(
             "[{}]",
             ASSUMED_SESSION.replace(r#""UserName": "abalaji""#, r#""UserName": "housemate""#)
@@ -194,8 +204,12 @@ mod tests {
     /// feeds them correctly.
     #[test]
     fn a_track_past_the_threshold_is_banked_once() {
-        let mut src =
-            MediaBrowserSource::emby("http://emby:8096".into(), "k".into(), "abalaji".into());
+        let mut src = MediaBrowserSource::emby(
+            "http://emby:8096".into(),
+            "k".into(),
+            "abalaji".into(),
+            Egress::Open,
+        );
 
         // 60s of a 240s track — short of the halfway gate at 120s, and short of
         // the four-minute one.

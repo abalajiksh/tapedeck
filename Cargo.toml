@@ -57,6 +57,9 @@ hex = "0.4"
 # Utilities
 dotenv = "0.15"
 urlencoding = "2.1"
+# CIDR matching for TAPEDECK_SOURCE_NETWORKS (`sources::egress`). Already in
+# the tree through reqwest.
+ipnet = "2"
 chrono = "0.4"
 chrono-tz = "0.9"
 

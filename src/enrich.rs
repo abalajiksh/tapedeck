@@ -413,7 +413,10 @@ fn library_label(source_name: &str) -> &'static str {
 /// away is remembered as absent so it is not looked up again on every track.
 #[derive(Default)]
 pub struct LibraryClients {
-    seen: std::collections::HashMap<i64, Option<(String, String, String)>>,
+    seen: std::collections::HashMap<
+        i64,
+        Option<(String, String, String, crate::sources::egress::Egress)>,
+    >,
 }
 
 impl LibraryClients {
@@ -423,16 +426,16 @@ impl LibraryClients {
         db: &Database,
         source_ref: i64,
         user_id: i64,
-    ) -> Option<&(String, String, String)> {
+    ) -> Option<&(String, String, String, crate::sources::egress::Egress)> {
         if !self.seen.contains_key(&source_ref) {
             let got = match db.get_source(user_id, source_ref).await {
-                Ok(Some(src)) if src.enabled => {
+                Ok(Some(src)) if src.enabled && src.egress().check_url(&src.url).is_ok() => {
                     let kind = src.kind.to_ascii_lowercase();
                     let cred = match kind.as_str() {
                         "jellyfin" | "emby" => src.credential("api_key"),
                         _ => src.credential("token"),
                     };
-                    cred.map(|c| (kind, src.url.clone(), c))
+                    cred.map(|c| (kind, src.url.clone(), c, src.egress()))
                 }
                 _ => None,
             };
@@ -447,23 +450,34 @@ impl LibraryClients {
         r: &crate::db::LibraryRef,
     ) -> Option<(Option<String>, Option<String>)> {
         let item = crate::server::artwork::remote_item_id(&r.source_name, &r.source_id)?;
-        let (kind, url, cred) = self.creds(db, r.source_ref, r.user_id).await?.clone();
+        let (kind, url, cred, egress) = self.creds(db, r.source_ref, r.user_id).await?.clone();
         let got = match kind.as_str() {
             "jellyfin" => {
-                crate::sources::mediabrowser::MediaBrowserSource::jellyfin(url, cred, String::new())
-                    .fetch_lyrics(&item)
-                    .await
+                crate::sources::mediabrowser::MediaBrowserSource::jellyfin(
+                    url,
+                    cred,
+                    String::new(),
+                    egress,
+                )
+                .fetch_lyrics(&item)
+                .await
             }
             "emby" => {
-                crate::sources::mediabrowser::MediaBrowserSource::emby(url, cred, String::new())
-                    .fetch_lyrics(&item)
-                    .await
+                crate::sources::mediabrowser::MediaBrowserSource::emby(
+                    url,
+                    cred,
+                    String::new(),
+                    egress,
+                )
+                .fetch_lyrics(&item)
+                .await
             }
             "plex" => {
                 crate::sources::plex::PlexSource::with_filters(
                     url,
                     cred,
                     crate::sources::plex::PlexFilters::default(),
+                    egress,
                 )
                 .fetch_lyrics(&item)
                 .await

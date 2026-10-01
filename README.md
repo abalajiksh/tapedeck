@@ -1038,6 +1038,8 @@ served. Copy `.env.example` to `.env`, or `tapedeck.toml.example` to
 PORT=8080
 HOST=0.0.0.0
 TRUST_PROXY=false
+# Private networks a member's source may point at (admins' go anywhere).
+# TAPEDECK_SOURCE_NETWORKS=192.168.178.0/24
 
 # ── Database ──
 DATABASE_URL=sqlite:scrobbles.db

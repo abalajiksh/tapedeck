@@ -125,6 +125,10 @@ async fn scrobble_art(
     let Ok(Some(source)) = state.db.get_source(user.user_id, source_ref).await else {
         return not_found("That source is no longer connected");
     };
+    let egress = source.egress();
+    if let Err(e) = egress.check_url(&source.url) {
+        return not_found(&format!("Could not fetch artwork: {e}"));
+    }
 
     let fetched = match source.kind.as_str() {
         "navidrome" => {
@@ -132,13 +136,13 @@ async fn scrobble_art(
             else {
                 return not_found("Navidrome credentials are missing");
             };
-            NavidromeSource::new(source.url.clone(), u, p).fetch_cover_art(&item_id).await
+            NavidromeSource::new(source.url.clone(), u, p, egress).fetch_cover_art(&item_id).await
         }
         "jellyfin" => {
             let Some(key) = source.credential("api_key") else {
                 return not_found("Jellyfin API key is missing");
             };
-            MediaBrowserSource::jellyfin(source.url.clone(), key, String::new())
+            MediaBrowserSource::jellyfin(source.url.clone(), key, String::new(), egress)
                 .fetch_cover_art(&item_id)
                 .await
         }
@@ -146,7 +150,7 @@ async fn scrobble_art(
             let Some(token) = source.credential("token") else {
                 return not_found("Plex token is missing");
             };
-            PlexSource::with_filters(source.url.clone(), token, PlexFilters::default())
+            PlexSource::with_filters(source.url.clone(), token, PlexFilters::default(), egress)
                 .fetch_cover_art(&item_id)
                 .await
         }
@@ -184,11 +188,19 @@ async fn artist_image_from_library(
 ) -> Option<(Vec<u8>, String)> {
     let sources = state.db.list_sources_for_user(user_id).await.ok()?;
     for source in sources.iter().filter(|s| s.enabled) {
+        let egress = source.egress();
+        if egress.check_url(&source.url).is_err() {
+            continue;
+        }
         let found = match source.kind.as_str() {
             "plex" => {
                 let token = source.credential("token")?;
-                let plex =
-                    PlexSource::with_filters(source.url.clone(), token, PlexFilters::default());
+                let plex = PlexSource::with_filters(
+                    source.url.clone(),
+                    token,
+                    PlexFilters::default(),
+                    egress,
+                );
                 match plex.find_artist(name).await {
                     Ok(Some(key)) => plex.fetch_cover_art(&key).await.ok(),
                     _ => None,
@@ -196,7 +208,8 @@ async fn artist_image_from_library(
             }
             "jellyfin" => {
                 let key = source.credential("api_key")?;
-                let jf = MediaBrowserSource::jellyfin(source.url.clone(), key, String::new());
+                let jf =
+                    MediaBrowserSource::jellyfin(source.url.clone(), key, String::new(), egress);
                 match jf.find_artist(name).await {
                     Ok(Some(id)) => jf.fetch_cover_art(&id).await.ok(),
                     _ => None,

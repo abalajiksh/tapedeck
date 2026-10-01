@@ -64,6 +64,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(line) = replica::banner() {
         info!("{}", line);
     }
+    // Before anything builds a source client — the engine's first tick does.
+    sources::egress::set_networks(&config.source_networks);
+    if config.source_networks.is_empty() {
+        info!(
+            "🔒 Members' sources reach the public internet only (TAPEDECK_SOURCE_NETWORKS unset)"
+        );
+    } else {
+        info!("🔒 Members' sources may also reach {}", config.source_networks.join(", "));
+    }
 
     // ── MusicBrainz client ──
     let sqlite_path = config.database.sqlite_path.clone();
