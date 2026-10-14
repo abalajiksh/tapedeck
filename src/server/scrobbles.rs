@@ -1682,6 +1682,7 @@ async fn lyric_document(
     let words = match lyrics.cached(artist, title).await {
         Some(crate::lyrics::Found::Lyrics { plain, synced, language }) => {
             let lines = crate::lyrics::parse_lines(plain.as_deref(), synced.as_deref());
+            let held = lyrics.held(artist, title).await;
             Words::Lyrics {
                 language,
                 timed: lines.iter().any(|l| l.at.is_some()),
@@ -1705,14 +1706,17 @@ async fn lyric_document(
                 // rewrite a lyric nobody meant to touch.
                 plain,
                 synced,
-                edited: lyrics.is_edited(artist, title).await,
+                edited: held.as_ref().is_some_and(|h| h.edited),
+                chosen: held.as_ref().is_some_and(|h| h.chosen),
+                // So *Other versions* can mark the record already held.
+                lrclib_id: held.as_ref().and_then(|h| h.lrclib_id),
                 // Shown wherever the words are, because they are not ours
                 // — and *which* not-ours matters: "your Plex" says these
                 // are the pressing you played with your own tagging in it,
                 // where "LRCLIB" says a stranger uploaded them. A row from
                 // before provenance was recorded says so rather than
                 // claiming a source it cannot vouch for.
-                source: lyrics.source_of(artist, title).await,
+                source: held.and_then(|h| h.source),
             }
         }
         Some(crate::lyrics::Found::Instrumental) => {
@@ -1779,6 +1783,11 @@ pub enum Words {
         synced: Option<String>,
         /// Corrected by hand, and therefore never overwritten by a lookup.
         edited: bool,
+        /// An LRCLIB record picked from *Other versions* — likewise never
+        /// overwritten by a lookup or a library poll, but still LRCLIB's words.
+        chosen: bool,
+        /// The LRCLIB record these words are, when they are one.
+        lrclib_id: Option<i64>,
         /// Where the words came from — your library, LRCLIB, or you. Shown
         /// wherever the words are, because they are not Tapedeck's.
         source: Option<String>,
@@ -2206,8 +2215,9 @@ pub struct LibraryLyricsRequest {
 /// What became of words a player offered.
 #[derive(Serialize, ToSchema)]
 pub struct LibraryLyricsStored {
-    /// `saved`, or `kept` when the words held were corrected by hand — a
-    /// correction outranks a file's own tags, so those were left alone.
+    /// `saved`, or `kept` when the words held were corrected by hand or picked
+    /// from *Other versions* — either outranks a file's own tags, so those were
+    /// left alone.
     pub status: &'static str,
     /// Why they were kept; null when saved.
     pub why: Option<&'static str>,
@@ -2270,7 +2280,9 @@ async fn library_lyrics(
     // Asked before, so the answer can say *stored* rather than *left alone* —
     // `remember_library` refuses an edited row by returning early, which is the
     // right behaviour and tells the caller nothing.
-    let edited = lyrics.is_edited(&body.artist, &body.title).await;
+    let held = lyrics.held(&body.artist, &body.title).await;
+    let edited = held.as_ref().is_some_and(|h| h.edited);
+    let chosen = held.as_ref().is_some_and(|h| h.chosen);
     match lyrics
         .remember_library(
             &body.artist,
@@ -2286,9 +2298,11 @@ async fn library_lyrics(
             (
                 StatusCode::OK,
                 Json(LibraryLyricsStored {
-                    status: if edited { "kept" } else { "saved" },
+                    status: if edited || chosen { "kept" } else { "saved" },
                     why: if edited {
                         Some("A correction typed in here outranks a file's own tags")
+                    } else if chosen {
+                        Some("A version picked from Other versions outranks a file's own tags")
                     } else {
                         None
                     },
@@ -2428,18 +2442,42 @@ pub struct LyricMatches {
 /// One LRCLIB record for the track.
 #[derive(Serialize, ToSchema)]
 pub struct LyricMatch {
-    /// LRCLIB's id.
+    /// LRCLIB's id — what `POST /api/v1/lyrics/adopt` takes.
     pub id: Option<i64>,
     pub title: Option<String>,
     pub artist: Option<String>,
+    /// The release the record was filed under — usually what tells two
+    /// uploads of one song apart.
+    pub album: Option<String>,
     /// Seconds.
     pub duration: Option<i64>,
     /// Timed — a timed lyric follows the deck, a plain one cannot.
     pub synced: bool,
     /// Lines, blanks included.
     pub lines: usize,
+    /// The language read off the record's script, null for Latin text. The
+    /// question this list most often answers is "is there one in the original
+    /// script", which a romanised upload and a native one look identical on
+    /// every other field.
+    pub language: Option<String>,
+    /// This is the record already held.
+    pub held: bool,
     pub plain: Option<String>,
     pub synced_text: Option<String>,
+}
+
+/// Which track the matches are for, and optionally what to search for.
+#[derive(serde::Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
+pub struct LyricMatchesQuery {
+    /// The track, as it is filed here.
+    pub artist: String,
+    pub title: String,
+    /// Search LRCLIB under a different artist than the track's — for tags that
+    /// name it differently (a romanised name, a "feat." credit).
+    pub search_artist: Option<String>,
+    /// Likewise for the title.
+    pub search_title: Option<String>,
 }
 
 // GET /api/v1/lyrics/matches — the other records LRCLIB holds for a track.
@@ -2449,11 +2487,9 @@ pub struct LyricMatch {
 // track, and picking one is how a wrong match gets fixed without typing the
 // words out.
 //
-// Adopting one is a `PUT /api/v1/lyrics` with the chosen words — the ordinary
-// correction path, so it is marked `edited`, survives every later fetch, and
-// reports whether the line count changed. That last part is not a nicety: a
-// `[[line:…]]` reference is an index, so a different record re-points every
-// quote already written.
+// Adopting one is `POST /api/v1/lyrics/adopt` with the record's id. It was a
+// `PUT /api/v1/lyrics` with the words until v0.120.1, which credited LRCLIB's
+// upload to "You" and dropped the id — see `adopt_lyrics`.
 //
 // It reaches the network, so it is a deliberate press rather than something a
 // page load does — and a rate limit comes back as a plain answer rather than
@@ -2472,12 +2508,15 @@ pub struct LyricMatch {
 /// wrong words, give me the other ones", which an instrumental cannot
 /// answer.
 ///
-/// **Adopt one with `PUT /api/v1/lyrics`**, sending the chosen `plain` and
-/// `synced_text`. That is the ordinary correction path, so the choice is
-/// marked edited and survives every later fetch — and it reports
-/// `renumbered`, which matters here more than anywhere: a `[[line:...]]`
-/// reference is an index, so a different record re-points every quote
-/// already written.
+/// **Adopt one with `POST /api/v1/lyrics/adopt`**, by its `id`. The pick
+/// survives every later fetch and library poll, is credited to LRCLIB, and
+/// the response reports `renumbered` — which matters here more than
+/// anywhere: a `[[line:...]]` reference is an index, so a different record
+/// re-points every quote already written.
+///
+/// `search_artist` and `search_title` search under other names than the
+/// track's own, for tags LRCLIB files differently. `held` marks the record
+/// already stored for the track.
 ///
 /// This reaches the network, so it belongs on a press rather than a page
 /// load. A rate limit or an unreachable LRCLIB comes back **200** with
@@ -2489,7 +2528,7 @@ pub struct LyricMatch {
     path = "/api/v1/lyrics/matches",
     security(("apiToken" = ["read"]), ("sessionCookie" = [])),
     tag = "Statistics",
-    params(LyricsQuery),
+    params(LyricMatchesQuery),
     responses(
         (status = 200, description = "OK.", body = LyricMatches),
         (status = 400, description = "Missing artist or title.", body = ErrorResponse),
@@ -2498,7 +2537,7 @@ pub struct LyricMatch {
 async fn lyric_matches(
     State(state): State<Arc<AppState>>,
     ReadAuth { user }: ReadAuth,
-    Query(q): Query<LyricsQuery>,
+    Query(q): Query<LyricMatchesQuery>,
 ) -> impl IntoResponse {
     let Some(lyrics) = state.lyrics.clone() else {
         return server_error("This instance has no lyrics cache".to_string());
@@ -2507,7 +2546,14 @@ async fn lyric_matches(
         return bad_request("A search needs an artist and a title");
     }
     let _ = user;
-    match lyrics.search(&q.artist, &q.title).await {
+    // A blank override is no override: the field is there to be edited, and
+    // clearing it means "the track's own name" rather than "search for nothing".
+    let search_artist =
+        q.search_artist.as_deref().filter(|a| !a.trim().is_empty()).unwrap_or(&q.artist);
+    let search_title =
+        q.search_title.as_deref().filter(|t| !t.trim().is_empty()).unwrap_or(&q.title);
+    let held_id = lyrics.held(&q.artist, &q.title).await.and_then(|h| h.lrclib_id);
+    match lyrics.search(search_artist, search_title).await {
         Ok(found) => {
             let matches: Vec<_> = found
                 .iter()
@@ -2517,6 +2563,13 @@ async fn lyric_matches(
                         id: r.id,
                         title: r.track_name.clone(),
                         artist: r.artist_name.clone(),
+                        album: r.album_name.clone(),
+                        language: crate::lyrics::language_of(
+                            r.plain_lyrics.as_deref(),
+                            r.synced_lyrics.as_deref(),
+                        )
+                        .map(str::to_string),
+                        held: held_id.is_some() && r.id == held_id,
                         duration: r.duration.map(|d| d as i64),
                         // What the reader gets if this one is adopted: a timed
                         // lyric follows the deck, a plain one cannot.
@@ -2559,6 +2612,160 @@ async fn lyric_matches(
                 .into_response()
         }
     }
+}
+
+// POST /api/v1/lyrics/adopt — hold an LRCLIB record picked by hand.
+//
+// **By id, fetched here.** The picker used to send the chosen words back
+// through `PUT /api/v1/lyrics`, the correction path, which stamped them
+// "You" and dropped the record id: the reader then credited a stranger's
+// upload to whoever picked it, the one thing the provenance line exists to
+// stop. Fetching by id also means what is credited to LRCLIB is what LRCLIB
+// holds, not whatever a client sent.
+//
+// Session-only, like `/lyrics/fetch`: it spends the shared LRCLIB budget and
+// writes the instance-wide cache. A rate limit is 200 `unavailable`, the
+// convention every LRCLIB-facing route here follows.
+/// Hold an LRCLIB record picked from *Other versions*.
+///
+/// **Session only.** It reaches LRCLIB and writes the instance-wide cache,
+/// which a token is not for.
+///
+/// The server fetches the record by `id` itself. The words are credited to
+/// LRCLIB, and the pick is kept: no later fetch and no library poll
+/// replaces it. It replaces a hand correction, since choosing is as
+/// deliberate as typing and the later act wins; *Fix the words* afterwards
+/// is a correction again.
+///
+/// Reports the line count before and after, and `renumbered` when they
+/// differ: a `[[line:…]]` reference is an index, so a record with a
+/// different count re-points every quote past the change.
+///
+/// A rate limit or an unreachable LRCLIB is **200** with `unavailable` —
+/// nothing was changed and nothing was learned about the record.
+#[utoipa::path(
+    post,
+    path = "/api/v1/lyrics/adopt",
+    tag = "Statistics",
+    security(("sessionCookie" = [])),
+    request_body = AdoptLyricsRequest,
+    responses(
+        (status = 200, description = "Held — or `unavailable` with a `why`.", body = AdoptedLyrics),
+        (status = 400, description = "A blank artist or title, or a record with no words.", body = ErrorResponse),
+        (status = 404, description = "LRCLIB has no record with that id.", body = ErrorResponse),
+        (status = 422, description = "The body is missing a field outright."),
+    )
+)]
+async fn adopt_lyrics(
+    State(state): State<Arc<AppState>>,
+    user: AuthUser,
+    Json(body): Json<AdoptLyricsRequest>,
+) -> impl IntoResponse {
+    let Some(lyrics) = state.lyrics.clone() else {
+        return server_error("This instance has no lyrics cache".to_string());
+    };
+    if body.artist.trim().is_empty() || body.title.trim().is_empty() {
+        return bad_request("A track needs an artist and a title");
+    }
+    let record = match lyrics.record(body.id).await {
+        Ok(Some(r)) => r,
+        Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(ErrorResponse {
+                    code: 404,
+                    error: "LRCLIB has no record with that id any more".to_string(),
+                }),
+            )
+                .into_response();
+        }
+        Err(crate::lyrics::LyricsError::RateLimited(secs)) => {
+            return (
+                StatusCode::OK,
+                Json(AdoptedLyrics::Unavailable {
+                    unavailable: true,
+                    why: format!("LRCLIB asked us to wait {secs}s — try again shortly."),
+                }),
+            )
+                .into_response();
+        }
+        Err(e) => {
+            tracing::debug!("🎤 lyric record {} could not be fetched: {e:?}", body.id);
+            return (
+                StatusCode::OK,
+                Json(AdoptedLyrics::Unavailable {
+                    unavailable: true,
+                    why: "Could not reach LRCLIB just now — try again shortly.".to_string(),
+                }),
+            )
+                .into_response();
+        }
+    };
+    let has_words = [&record.plain_lyrics, &record.synced_lyrics]
+        .iter()
+        .any(|t| t.as_deref().is_some_and(|t| !t.trim().is_empty()));
+    if record.instrumental || !has_words {
+        return bad_request("That record has no words to hold");
+    }
+
+    let before = match lyrics.cached(&body.artist, &body.title).await {
+        Some(crate::lyrics::Found::Lyrics { plain, synced, .. }) => {
+            crate::lyrics::parse_lines(plain.as_deref(), synced.as_deref()).len()
+        }
+        _ => 0,
+    };
+    match lyrics.adopt(&body.artist, &body.title, &record).await {
+        Ok(crate::lyrics::Found::Lyrics { plain, synced, language }) => {
+            let after = crate::lyrics::parse_lines(plain.as_deref(), synced.as_deref()).len();
+            let _ = user;
+            (
+                StatusCode::OK,
+                Json(AdoptedLyrics::Adopted {
+                    status: "adopted",
+                    language,
+                    lines_before: before,
+                    lines_after: after,
+                    renumbered: before > 0 && before != after,
+                }),
+            )
+                .into_response()
+        }
+        Ok(_) => server_error("The record did not come back as words".to_string()),
+        Err(e) => server_error(e.to_string()),
+    }
+}
+
+/// An LRCLIB record to hold for a track.
+#[derive(serde::Deserialize, ToSchema)]
+pub struct AdoptLyricsRequest {
+    /// The track, as it is filed here — not necessarily the record's own names.
+    pub artist: String,
+    pub title: String,
+    /// The LRCLIB record, from `GET /api/v1/lyrics/matches`.
+    pub id: i64,
+}
+
+/// A picked record, held — or why LRCLIB could not be asked.
+#[derive(Serialize, ToSchema)]
+#[serde(untagged)]
+pub enum AdoptedLyrics {
+    /// LRCLIB could not be asked. Nothing was changed.
+    Unavailable {
+        /// Always `true`.
+        unavailable: bool,
+        why: String,
+    },
+    /// Held.
+    Adopted {
+        /// Always `adopted`.
+        status: &'static str,
+        language: Option<String>,
+        lines_before: usize,
+        lines_after: usize,
+        /// The line count changed, so every `[[line:…]]` quote past the change
+        /// now points at different words. Say so.
+        renumbered: bool,
+    },
 }
 
 // GET /api/v1/lyrics/status — how far the lyric language pass has got.
@@ -2913,6 +3120,7 @@ fn server_error(msg: String) -> axum::response::Response {
     live_lyrics,
     fetch_lyrics_now,
     lyric_matches,
+    adopt_lyrics,
     lyrics_keys,
     lyrics_status,
     mbid_status,
@@ -2948,6 +3156,7 @@ pub fn create_scrobbles_router() -> Router<Arc<AppState>> {
         .route("/api/v1/lyrics/fetch", axum::routing::post(fetch_lyrics_now))
         .route("/api/v1/lyrics/keys", get(lyrics_keys))
         .route("/api/v1/lyrics/matches", get(lyric_matches))
+        .route("/api/v1/lyrics/adopt", axum::routing::post(adopt_lyrics))
         .route("/api/v1/lyrics/status", get(lyrics_status))
         .route("/api/v1/mbids/status", get(mbid_status))
         .route("/api/v1/mbids/backfill", axum::routing::post(backfill_mbids_now))

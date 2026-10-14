@@ -31,6 +31,7 @@
 	import { api } from '$lib/api';
 	import type { LyricDoc } from '$lib/api';
 	import { gutter, cycleGutter, gutterLabel, gutterTitle } from '$lib/lyricgutter';
+	import LyricVersions from '$lib/components/LyricVersions.svelte';
 
 	/** What the note is about, which is what a picked line is written against. */
 	export let artist = '';
@@ -201,66 +202,21 @@
 		saving = false;
 	}
 
-	// ── Pick a different match ───────────────────────────────────────────────
+	// ── Other versions ───────────────────────────────────────────────────────
 	//
-	// The honest form of the design's `LRCLIB v3 ▾`. LRCLIB has no version
-	// history; what it has is *other records* for the same song, and swapping
-	// to one is how a wrong match gets fixed without retyping the words.
-	//
-	// Adopting one goes through the ordinary correction path, so it is marked
-	// edited and survives every later fetch — and it reports the renumbering,
-	// because a reference is an index and a different record moves every quote
-	// past the change.
-	let matching = false;
-	let matches: Awaited<ReturnType<typeof api.lyricMatches>>['matches'] = [];
-	let matchWhy = '';
-	let searching = false;
+	// The honest form of the design's `LRCLIB v3 ▾` — LRCLIB has no version
+	// history, only other records for the same song. The dialog is shared with
+	// the reader (`LyricVersions`), and adopts by record id so the words stay
+	// credited to LRCLIB; this panel only reloads and says what moved.
+	let versions = false;
 
-	async function startMatches() {
-		if (!doc) return;
-		matching = true;
-		searching = true;
-		matches = [];
-		matchWhy = '';
-		error = '';
-		try {
-			const r = await api.lyricMatches(doc.artist, doc.title);
-			matches = r.matches;
-			// Told apart on purpose: "LRCLIB has nothing else for this" is an
-			// answer, and "we could not ask" is not. Reporting the second as the
-			// first would send somebody off to type the words out by hand.
-			matchWhy = r.unavailable
-				? (r.why ?? 'Could not reach LRCLIB.')
-				: matches.length
-					? ''
-					: 'LRCLIB has nothing else for this track.';
-		} catch (e) {
-			error = clean(e);
-			matching = false;
-		}
-		searching = false;
-	}
-
-	async function adopt(m: (typeof matches)[number]) {
-		if (!doc) return;
-		saving = true;
-		error = '';
-		try {
-			const r = await api.fixLyrics({
-				artist: doc.artist,
-				title: doc.title,
-				plain: m.plain ?? '',
-				synced: m.synced_text ?? ''
-			});
-			matching = false;
-			await loadDoc();
-			fixNote = r.renumbered
-				? `Swapped — but this record has ${r.lines_after} lines where the last had ${r.lines_before}, so every reference past the change now points at a different line.`
-				: 'Swapped. A later fetch will not overwrite this.';
-		} catch (e) {
-			error = clean(e);
-		}
-		saving = false;
+	async function adopted(e: CustomEvent<{ renumbered: boolean; lines_before: number; lines_after: number }>) {
+		versions = false;
+		await loadDoc();
+		const r = e.detail;
+		fixNote = r.renumbered
+			? `Swapped — but this record has ${r.lines_after} lines where the last had ${r.lines_before}, so every reference past the change now points at a different line.`
+			: 'Swapped. A later fetch will not overwrite this.';
 	}
 
 	function readerHref(): string {
@@ -338,7 +294,7 @@
 			<button class="lpfix" on:click={cycleGutter} title={gutterTitle($gutter)}>
 				{$gutter === 'time' ? '0:00' : $gutter === 'number' ? '#' : '–'}
 			</button>
-			<button class="lpfix" on:click={startMatches}>Pick a different match</button>
+			<button class="lpfix" on:click={() => (versions = true)}>Other versions</button>
 			<button class="lpfix" on:click={startFix}>Fix the words</button>
 		{/if}
 	</div>
@@ -365,65 +321,17 @@
 	</div>
 {/if}
 
-{#if matching}
-	<div class="scrim" role="presentation" on:click={() => (matching = false)}></div>
-	<div class="dialog" role="dialog" aria-label="Pick a different match">
-		<h3 class="h-display" style="font-size:18px;margin:0 0 4px;">Pick a different match</h3>
-		<p class="dlgsub">
-			LRCLIB keeps no version history — these are <em>other records</em> for the
-			same song. Swapping to one is kept the same way a correction is: a later
-			lookup will never overwrite it.
-		</p>
-		{#if searching}
-			<p class="lpmsg">Asking LRCLIB…</p>
-		{:else if matchWhy}
-			<p class="lpmsg">{matchWhy}</p>
-		{:else}
-			<div class="mlist">
-				{#each matches as m (m.id ?? `${m.artist}-${m.title}-${m.lines}`)}
-					<button class="mrow" on:click={() => adopt(m)} disabled={saving}>
-						<span class="mmain">
-							<span class="mt">{m.title ?? doc?.title}</span>
-							<span class="ma">{m.artist ?? doc?.artist}</span>
-						</span>
-						<span class="mmeta">
-							<!-- Which of these matters most: a timed lyric follows the
-							     deck and a plain one cannot. -->
-							<span class="mpill" class:lit={m.synced}>{m.synced ? 'Timed' : 'Plain'}</span>
-							<span class="mn">{m.lines} lines</span>
-							{#if m.duration}<span class="mn">{mmss(m.duration)}</span>{/if}
-						</span>
-					</button>
-				{/each}
-			</div>
-		{/if}
-		<div class="dlgrow">
-			<button class="btn btn-secondary" on:click={() => (matching = false)}>Close</button>
-		</div>
-	</div>
+{#if versions && doc}
+	<LyricVersions
+		artist={doc.artist}
+		title={doc.title}
+		lines={doc.lines.length}
+		on:close={() => (versions = false)}
+		on:adopted={adopted}
+	/>
 {/if}
 
 <style>
-	.mlist { display: flex; flex-direction: column; gap: 6px; max-height: 46vh; overflow: auto; margin: 4px 0 12px; }
-	.mrow {
-		display: flex; align-items: center; justify-content: space-between; gap: 12px;
-		width: 100%; text-align: left; padding: 9px 11px; border-radius: 11px;
-		border: 1px solid var(--td-border); background: var(--td-surface);
-		color: var(--td-text); cursor: pointer;
-	}
-	.mrow:hover:not(:disabled) { border-color: var(--td-accent); }
-	.mrow:disabled { opacity: 0.55; cursor: default; }
-	.mmain { display: flex; flex-direction: column; gap: 1px; min-width: 0; }
-	.mt { font-size: 13.5px; font-weight: 600; }
-	.ma { font-size: 11.5px; color: var(--td-muted-2); }
-	.mmeta { display: flex; align-items: center; gap: 7px; flex: none; }
-	.mpill {
-		font-size: 10px; font-weight: 700; letter-spacing: 0.05em; text-transform: uppercase;
-		padding: 2px 7px; border-radius: 999px;
-		border: 1px solid var(--td-border); color: var(--td-muted-3);
-	}
-	.mpill.lit { border-color: var(--td-accent); color: var(--td-accent); }
-	.mn { font-size: 11px; color: var(--td-muted-3); font-variant-numeric: tabular-nums; }
 	/* A hidden gutter keeps its column, or every line shifts when it is turned
 	   off and the list reads as a different lyric. */
 	.lpn.empty { visibility: hidden; }

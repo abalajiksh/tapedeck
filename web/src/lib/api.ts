@@ -1261,12 +1261,35 @@ export interface LyricDoc {
 	instrumental?: boolean;
 	/** These words were corrected here and a later fetch will not overwrite. */
 	edited?: boolean;
+	/** An LRCLIB record picked from *Other versions* — kept like a correction,
+	 *  but still LRCLIB's words. */
+	chosen?: boolean;
+	/** The LRCLIB record these words are, when they are one. */
+	lrclib_id?: number | null;
 	/** The stored text, for correcting it by hand. */
 	plain?: string | null;
 	synced?: string | null;
 	lines: LyricLine[];
 	tracklist?: LyricSibling[];
 	source?: string;
+}
+
+/** One LRCLIB record for a track, from `lyricMatches`. */
+export interface LyricMatch {
+	id: number | null;
+	title: string | null;
+	artist: string | null;
+	/** The release it was filed under. */
+	album: string | null;
+	duration: number | null;
+	synced: boolean;
+	lines: number;
+	/** Read off the record's script; null for Latin text. */
+	language: string | null;
+	/** The record already held for this track. */
+	held: boolean;
+	plain: string | null;
+	synced_text: string | null;
 }
 
 /** The reader's whole state for whatever is on the deck.
@@ -2205,23 +2228,37 @@ class TapedeckAPI {
 	 *  error, because LRCLIB asking us to wait is not a failure of ours. */
 	async lyricMatches(
 		artist: string,
-		title: string
+		title: string,
+		search?: { artist?: string; title?: string }
 	): Promise<{
-		matches: {
-			id: number | null;
-			title: string | null;
-			artist: string | null;
-			duration: number | null;
-			synced: boolean;
-			lines: number;
-			plain: string | null;
-			synced_text: string | null;
-		}[];
+		matches: LyricMatch[];
 		unavailable?: boolean;
 		why?: string;
 	}> {
 		const q = new URLSearchParams({ artist, title });
+		// Names to search under when the tags differ from LRCLIB's. The track
+		// stays `artist`/`title`, which is what `held` is worked out against.
+		if (search?.artist?.trim()) q.set('search_artist', search.artist.trim());
+		if (search?.title?.trim()) q.set('search_title', search.title.trim());
 		return this.get(`/api/v1/lyrics/matches?${q}`);
+	}
+
+	/** Hold an LRCLIB record picked from *Other versions*, by its id.
+	 *
+	 *  The server fetches the record itself and credits it to LRCLIB. Never
+	 *  `fixLyrics` for this: that is the correction path and would credit a
+	 *  stranger's upload to "You". */
+	async adoptLyrics(body: { artist: string; title: string; id: number }): Promise<
+		| { unavailable: true; why: string }
+		| {
+				status: 'adopted';
+				language: string | null;
+				lines_before: number;
+				lines_after: number;
+				renumbered: boolean;
+		  }
+	> {
+		return this.post('/api/v1/lyrics/adopt', body);
 	}
 
 	async getLyricsStatus(): Promise<{
