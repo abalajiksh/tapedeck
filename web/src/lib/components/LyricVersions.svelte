@@ -30,10 +30,15 @@
 	export let duration: number | null = null;
 	/** Lines in the words held now, blanks included; 0 when none. */
 	export let lines = 0;
+	/** The words held are in Latin letters with nothing to romanize — so a
+	 *  version in the original script can be kept *beside* them instead of
+	 *  replacing them (the JISOO 꽃 case: a lyric tagged romanised in your own
+	 *  files). */
+	export let latinHeld = false;
 
 	const dispatch = createEventDispatcher<{
 		close: void;
-		adopted: { renumbered: boolean; lines_before: number; lines_after: number };
+		adopted: { renumbered: boolean; lines_before: number; lines_after: number; companion?: boolean };
 	}>();
 
 	let searchArtist = artist;
@@ -97,14 +102,16 @@
 		searching = false;
 	}
 
-	async function adopt(m: LyricMatch) {
+	async function adopt(m: LyricMatch, original_script = false) {
 		if (m.id == null || saving) return;
 		saving = true;
 		error = '';
 		try {
-			const r = await api.adoptLyrics({ artist, title, id: m.id });
+			const r = await api.adoptLyrics({ artist, title, id: m.id, original_script });
 			if ('unavailable' in r) {
 				error = r.why;
+			} else if (r.status === 'companion') {
+				dispatch('adopted', { renumbered: false, lines_before: lines, lines_after: lines, companion: true });
 			} else {
 				dispatch('adopted', {
 					renumbered: r.renumbered,
@@ -138,6 +145,10 @@
 		LRCLIB keeps no version history — these are <em>other records</em> for the same song. The one
 		you pick is kept: no later lookup and no library tag replaces it, and it stays credited to
 		LRCLIB.
+		{#if latinHeld}
+			Your words are in Latin letters: <em>Keep as original</em> keeps a version in its own script
+			beside them, and romanization is made from it — your words stay what a note quotes.
+		{/if}
 	</p>
 
 	<form class="vsearch" on:submit|preventDefault={search}>
@@ -170,6 +181,28 @@
 						</span>
 						{#if m.held}
 							<span class="vpill lit">Held now</span>
+						{:else if latinHeld && m.language && m.lines === lines}
+							<!-- Your words stay; this is kept beside them and romanized.
+							     Offered only where it lines up — the server checks the
+							     timing too. -->
+							<span class="vbtns">
+								<button
+									class="btn btn-primary vuse"
+									on:click={() => adopt(m, true)}
+									disabled={saving || m.id == null}
+									aria-label="Keep as the original script: {m.title ?? title}{m.album ? `, ${m.album}` : ''}, {m.lines} lines"
+								>
+									{saving ? '…' : 'Keep as original'}
+								</button>
+								<button
+									class="btn btn-secondary vuse"
+									on:click={() => adopt(m)}
+									disabled={saving || m.id == null}
+									aria-label="Use instead of your words: {m.title ?? title}{m.album ? `, ${m.album}` : ''}, {m.lines} lines"
+								>
+									Use instead
+								</button>
+							</span>
 						{:else}
 							<button
 								class="btn btn-primary vuse"
@@ -258,6 +291,7 @@
 	.vt { font-size: 13.5px; font-weight: 600; }
 	.va { font-size: 11.5px; color: var(--td-muted-2); overflow-wrap: anywhere; }
 	.vuse { flex: none; font-size: 12px; padding: 6px 14px; }
+	.vbtns { display: flex; gap: 6px; flex-wrap: wrap; justify-content: flex-end; }
 	.vmeta { display: flex; align-items: center; gap: 7px; flex-wrap: wrap; }
 	.vpill {
 		font-size: 10px;

@@ -1230,10 +1230,29 @@ export interface Note {
  *  `n` is 1-based **and blank lines are numbered**: a stanza break is a line,
  *  because a reference is an index and skipping empties would renumber every
  *  line after one — silently re-pointing every quote already written. */
+/** One line in Latin letters, as words of parts — a part is one Hangul
+ *  block, one Japanese or Chinese token, or one Indic word, with its
+ *  original (`o`) and romanization (`r`). `lit` parts are punctuation or text
+ *  that was Latin already; `syl` words are sung syllable by syllable (Korean)
+ *  and draw a dot between their parts. */
+export interface RomanLine {
+	text: string;
+	words: { parts: { o: string; r: string; lit?: boolean }[]; syl?: boolean }[];
+}
+
+/** The original a romanized line was made from — the held words, or the
+ *  original-script companion's line when one is used. */
+export function romanOriginal(r: RomanLine): string {
+	return r.words.map((w) => w.parts.map((p) => p.o).join('')).join(' ');
+}
+
 export interface LyricLine {
 	n: number;
 	at: number | null;
 	text: string;
+	/** The line in Latin letters, when the lyric is romanized and the line
+	 *  needs it. */
+	roman?: RomanLine | null;
 	/** How many of this user's notes quote this line. */
 	quoted?: number;
 	/** The note pinned to this line, if there is one. */
@@ -1266,6 +1285,18 @@ export interface LyricDoc {
 	chosen?: boolean;
 	/** The LRCLIB record these words are, when they are one. */
 	lrclib_id?: number | null;
+	/** Present when the lyric is romanized; lines then carry `roman`. */
+	romanization?: {
+		language: string | null;
+		indic: 'readable' | 'iso';
+		macrons: boolean;
+		/** Made from the original-script companion, not the words shown. */
+		from_companion: boolean;
+		/** This build reads kanji and hanzi. */
+		kanji: boolean;
+	} | null;
+	/** An LRCLIB record kept beside these words in their original script. */
+	companion?: { lrclib_id: number | null; language: string | null; lines_up: boolean } | null;
 	/** The stored text, for correcting it by hand. */
 	plain?: string | null;
 	synced?: string | null;
@@ -2248,8 +2279,15 @@ class TapedeckAPI {
 	 *  The server fetches the record itself and credits it to LRCLIB. Never
 	 *  `fixLyrics` for this: that is the correction path and would credit a
 	 *  stranger's upload to "You". */
-	async adoptLyrics(body: { artist: string; title: string; id: number }): Promise<
+	async adoptLyrics(body: {
+		artist: string;
+		title: string;
+		id: number;
+		/** Keep it beside the words as their original script instead. */
+		original_script?: boolean;
+	}): Promise<
 		| { unavailable: true; why: string }
+		| { status: 'companion'; language: string | null; lines: number }
 		| {
 				status: 'adopted';
 				language: string | null;
@@ -2259,6 +2297,12 @@ class TapedeckAPI {
 		  }
 	> {
 		return this.post('/api/v1/lyrics/adopt', body);
+	}
+
+	/** Forget the original-script companion kept beside a track's words. */
+	async clearCompanion(artist: string, title: string): Promise<{ status: 'cleared' }> {
+		const q = new URLSearchParams({ artist, title });
+		return this.del(`/api/v1/lyrics/companion?${q}`);
 	}
 
 	async getLyricsStatus(): Promise<{

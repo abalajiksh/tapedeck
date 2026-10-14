@@ -22,6 +22,7 @@ mod ratings;
 mod replica;
 mod report_image;
 mod rockbox;
+mod romanize;
 mod server;
 mod sinks;
 mod sources;

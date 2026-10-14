@@ -32,6 +32,8 @@
 	import type { LyricDoc } from '$lib/api';
 	import { gutter, cycleGutter, gutterLabel, gutterTitle } from '$lib/lyricgutter';
 	import LyricVersions from '$lib/components/LyricVersions.svelte';
+	import RomanLine from '$lib/components/RomanLine.svelte';
+	import { lyricView } from '$lib/lyricview';
 
 	/** What the note is about, which is what a picked line is written against. */
 	export let artist = '';
@@ -210,11 +212,15 @@
 	// credited to LRCLIB; this panel only reloads and says what moved.
 	let versions = false;
 
-	async function adopted(e: CustomEvent<{ renumbered: boolean; lines_before: number; lines_after: number }>) {
+	async function adopted(
+		e: CustomEvent<{ renumbered: boolean; lines_before: number; lines_after: number; companion?: boolean }>
+	) {
 		versions = false;
 		await loadDoc();
 		const r = e.detail;
-		fixNote = r.renumbered
+		fixNote = r.companion
+			? 'Kept beside these words as their original script — romanization is made from it.'
+			: r.renumbered
 			? `Swapped — but this record has ${r.lines_after} lines where the last had ${r.lines_before}, so every reference past the change now points at a different line.`
 			: 'Swapped. A later fetch will not overwrite this.';
 	}
@@ -275,6 +281,9 @@
 						<span class="lpn" class:empty={$gutter === 'none'}>{gutterLabel($gutter, l.n, l.at, mmss)}</span>
 						<span class="lptext">
 							{l.text}
+							{#if $lyricView !== 'original' && l.roman}
+								<span class="lproman"><RomanLine line={l.roman} /></span>
+							{/if}
 							{#if referenced.has(l.n)}<span class="lpin">in this note</span>{/if}
 						</span>
 						<span class="lpq">”</span>
@@ -401,6 +410,9 @@
 		font-variant-numeric: tabular-nums;
 	}
 	.lptext { font-size: 13px; line-height: 1.45; min-width: 0; }
+	/* The line in Latin letters under it — the words being picked are still
+	   the original's, since a reference is to the line, not to a spelling. */
+	.lproman { display: block; font-size: 11.5px; color: var(--td-muted-2); }
 	.lpin {
 		display: block;
 		font-size: 10.5px;

@@ -262,6 +262,12 @@
   letter-spacing: -0.02em;
   color: var(--td-text);
 }
+.note-body .td-line-block .td-line-roman {
+  margin: 3px 0 0;
+  font-size: 14px;
+  line-height: 1.4;
+  color: var(--td-muted);
+}
 .note-body .td-line-block figcaption {
   margin-top: 5px;
   font-size: 11.5px;

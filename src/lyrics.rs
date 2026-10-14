@@ -247,6 +247,29 @@ pub struct Held {
     pub lrclib_id: Option<i64>,
 }
 
+/// An LRCLIB record kept beside the held words, in the script they were
+/// romanised from.
+#[derive(Debug, Clone)]
+pub struct Companion {
+    pub language: Option<String>,
+    /// Its lines, numbered as [`parse_lines`] numbers them.
+    pub lines: Vec<String>,
+    pub lrclib_id: Option<i64>,
+    /// Same line count as the held words. When it is not, it is not used.
+    pub lines_up: bool,
+}
+
+/// A lyric in Latin letters.
+#[derive(Debug, Clone)]
+pub struct Romanized {
+    /// One per line of the held words; `None` where a line needs none.
+    pub lines: Vec<Option<crate::romanize::RomanLine>>,
+    /// The language it was romanized as.
+    pub language: Option<String>,
+    /// Made from the original-script companion rather than the held words.
+    pub from_companion: bool,
+}
+
 /// Reads lyrics, and remembers what it read.
 pub struct LyricsClient {
     http: reqwest::Client,
@@ -319,6 +342,34 @@ impl LyricsClient {
         ))
         .execute(&self.pool)
         .await;
+        // The original-script companion: LRCLIB's Hangul (or kana, or Tamil)
+        // for a lyric held only in Latin letters — the JISOO 꽃 case, tagged
+        // romanised in the user's own files. Kept beside the held words rather
+        // than replacing them: the tags stay what a note quotes, and the
+        // companion is what romanization is made from.
+        for col in ["native_plain TEXT", "native_synced TEXT", "native_lrclib_id INTEGER"] {
+            let stmt = format!("ALTER TABLE lyrics_cache ADD COLUMN {col}");
+            let _ = sqlx::query(&crate::sql!(&stmt)).execute(&self.pool).await;
+        }
+        // Romanizations, made on first read and kept. Beside the lyrics for the
+        // same reason the lyrics are here: derived from third-party text, so not
+        // in a backup either. `version` and `source_hash` say when one is stale
+        // — a better romanizer, or different words.
+        crate::db::run_ddl(
+            &self.pool,
+            r#"
+            CREATE TABLE IF NOT EXISTS lyrics_romanized (
+                track_key TEXT NOT NULL,
+                options TEXT NOT NULL,
+                version INTEGER NOT NULL,
+                source_hash TEXT NOT NULL,
+                lines TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                PRIMARY KEY (track_key, options)
+            );
+            "#,
+        )
+        .await?;
         Ok(())
     }
 
@@ -442,20 +493,6 @@ impl LyricsClient {
         .ok()
         .flatten()
         .and_then(|r| r.0)
-    }
-
-    /// Whether these words were corrected here rather than fetched.
-    pub async fn is_edited(&self, artist: &str, title: &str) -> bool {
-        let key = Self::track_key(artist, title);
-        sqlx::query_as::<_, (i64,)>(&crate::sql!(
-            "SELECT edited FROM lyrics_cache WHERE track_key = ?",
-        ))
-        .bind(&key)
-        .fetch_optional(&self.pool)
-        .await
-        .ok()
-        .flatten()
-        .is_some_and(|(e,)| e != 0)
     }
 
     /// Whether a person settled these words — typed them, or picked an LRCLIB
@@ -758,6 +795,159 @@ impl LyricsClient {
         Ok(Found::Lyrics { plain, synced, language })
     }
 
+    /// Keep an LRCLIB record as the original-script companion of the words
+    /// held, without replacing them.
+    ///
+    /// For a lyric the user's own files hold in Latin letters: their words
+    /// stay the lyric (what a note quotes, what *Fix the words* edits), and
+    /// romanization is made from the companion instead. The caller has checked
+    /// that the two line up; [`Self::companion`] checks again on every read, so
+    /// held words that change later simply stop using it.
+    pub async fn set_companion(
+        &self,
+        artist: &str,
+        title: &str,
+        record: &LrcResponse,
+    ) -> Result<(), sqlx::Error> {
+        let key = Self::track_key(artist, title);
+        sqlx::query(&crate::sql!(
+            "UPDATE lyrics_cache SET native_plain = ?, native_synced = ?, native_lrclib_id = ?
+              WHERE track_key = ?",
+        ))
+        .bind(record.plain_lyrics.as_deref().map(str::trim).filter(|t| !t.is_empty()))
+        .bind(record.synced_lyrics.as_deref().map(str::trim).filter(|t| !t.is_empty()))
+        .bind(record.id)
+        .bind(&key)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Forget the original-script companion.
+    pub async fn clear_companion(&self, artist: &str, title: &str) -> Result<(), sqlx::Error> {
+        let key = Self::track_key(artist, title);
+        sqlx::query(&crate::sql!(
+            "UPDATE lyrics_cache SET native_plain = NULL, native_synced = NULL, native_lrclib_id = NULL
+              WHERE track_key = ?",
+        ))
+        .bind(&key)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// The original-script companion, when one is held **and still lines up**
+    /// with the words: same number of lines, or it is not used. A companion
+    /// paired to words that have since changed would put each romanized line
+    /// under a different line of the song — an alignment nobody measured.
+    pub async fn companion(&self, artist: &str, title: &str) -> Option<Companion> {
+        let key = Self::track_key(artist, title);
+        type Row = (Option<String>, Option<String>, Option<String>, Option<String>, Option<i64>);
+        let (plain, synced, nplain, nsynced, id): Row = sqlx::query_as(&crate::sql!(
+            "SELECT plain, synced, native_plain, native_synced, native_lrclib_id
+               FROM lyrics_cache WHERE track_key = ? AND found = 1",
+        ))
+        .bind(&key)
+        .fetch_optional(&self.pool)
+        .await
+        .ok()
+        .flatten()?;
+        if nplain.is_none() && nsynced.is_none() {
+            return None;
+        }
+        let held = parse_lines(plain.as_deref(), synced.as_deref()).len();
+        let lines = parse_lines(nplain.as_deref(), nsynced.as_deref());
+        let lines_up = lines.len() == held;
+        Some(Companion {
+            language: language_of(nplain.as_deref(), nsynced.as_deref()).map(str::to_string),
+            lines: lines.into_iter().map(|l| l.text).collect(),
+            lrclib_id: id,
+            lines_up,
+        })
+    }
+
+    /// The lyric in Latin letters, line for line with [`parse_lines`] — `None`
+    /// where a line had nothing to romanize, and `None` overall when the lyric
+    /// is in no script this romanizes (or there are no words).
+    ///
+    /// Made on first read and stored; a stored one is served while its
+    /// romanizer version and the words it was made from are unchanged.
+    pub async fn romanized(
+        &self,
+        artist: &str,
+        title: &str,
+        opts: crate::romanize::Options,
+    ) -> Option<Romanized> {
+        let Found::Lyrics { plain, synced, language } = self.cached(artist, title).await? else {
+            return None;
+        };
+        // From the original-script companion when one lines up with the words,
+        // otherwise from the words themselves.
+        let (texts, language, from_companion) = match self.companion(artist, title).await {
+            Some(c) if c.lines_up && crate::romanize::supports(c.language.as_deref()) => {
+                (c.lines, c.language, true)
+            }
+            _ => (
+                parse_lines(plain.as_deref(), synced.as_deref())
+                    .into_iter()
+                    .map(|l| l.text)
+                    .collect(),
+                language,
+                false,
+            ),
+        };
+        if !crate::romanize::supports(language.as_deref()) {
+            return None;
+        }
+
+        let key = Self::track_key(artist, title);
+        let hash = {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            texts.hash(&mut h);
+            language.hash(&mut h);
+            format!("{:016x}", h.finish())
+        };
+        let stored: Option<(i64, String, String)> = sqlx::query_as(&crate::sql!(
+            "SELECT version, source_hash, lines FROM lyrics_romanized
+              WHERE track_key = ? AND options = ?",
+        ))
+        .bind(&key)
+        .bind(opts.key())
+        .fetch_optional(&self.pool)
+        .await
+        .ok()
+        .flatten();
+        if let Some((version, h, json)) = stored {
+            if version == crate::romanize::VERSION && h == hash {
+                if let Ok(lines) = serde_json::from_str(&json) {
+                    return Some(Romanized { lines, language, from_companion });
+                }
+            }
+        }
+
+        let refs: Vec<&str> = texts.iter().map(String::as_str).collect();
+        let lines = crate::romanize::lyric(&refs, language.as_deref(), opts);
+        let json = serde_json::to_string(&lines).ok()?;
+        // Not stored is not fatal: it is made again next time.
+        let _ = sqlx::query(&crate::sql!(
+            "INSERT INTO lyrics_romanized (track_key, options, version, source_hash, lines, created_at)
+             VALUES (?, ?, ?, ?, ?, ?)
+             ON CONFLICT(track_key, options) DO UPDATE SET
+                version = excluded.version, source_hash = excluded.source_hash,
+                lines = excluded.lines, created_at = excluded.created_at",
+        ))
+        .bind(&key)
+        .bind(opts.key())
+        .bind(crate::romanize::VERSION)
+        .bind(&hash)
+        .bind(&json)
+        .bind(crate::db::Database::now_secs())
+        .execute(&self.pool)
+        .await;
+        Some(Romanized { lines, language, from_companion })
+    }
+
     /// What else LRCLIB holds for this track.
     ///
     /// **Not a version history**, which is what the design's `LRCLIB v3 ▾`
@@ -991,6 +1181,47 @@ mod tests {
         assert_eq!(held.source.as_deref(), Some("You"));
         assert_eq!(held.lrclib_id, None, "typed words are no LRCLIB record");
         assert!(held.edited && !held.chosen);
+    }
+
+    /// The 꽃 case end to end in the cache: tagged words in Latin letters give
+    /// no romanization; an original-script companion that lines up does, line
+    /// for line; and one that stops lining up is not used.
+    #[tokio::test]
+    async fn a_companion_romanizes_words_held_in_latin_letters() {
+        let pool = testpool().await;
+        let c = LyricsClient::new(pool).await.unwrap();
+        let opts = crate::romanize::Options::default();
+        c.remember_library(
+            "JISOO",
+            "꽃",
+            Some("Kkothyanggiman\n\nnamgigo gatdanda".into()),
+            None,
+            "Plex",
+        )
+        .await
+        .unwrap();
+        assert!(
+            c.romanized("JISOO", "꽃", opts).await.is_none(),
+            "Latin words have nothing to romanize"
+        );
+
+        c.set_companion("JISOO", "꽃", &record(2312642, "꽃향기만\n\n남기고 갔단다"))
+            .await
+            .unwrap();
+        let r = c.romanized("JISOO", "꽃", opts).await.expect("romanized from the companion");
+        assert!(r.from_companion);
+        assert_eq!(r.lines.len(), 3, "one per line of the held words, blanks included");
+        assert_eq!(r.lines[0].as_ref().unwrap().text, "kkotyanggiman");
+        assert!(r.lines[1].is_none(), "a stanza break needs none");
+        assert_eq!(r.lines[2].as_ref().unwrap().text, "namgigo gattanda");
+        // Served from storage the second time, the same.
+        assert_eq!(c.romanized("JISOO", "꽃", opts).await.unwrap().lines, r.lines);
+
+        // The held words change to a different line count: the companion no
+        // longer lines up and is not used.
+        c.remember_library("JISOO", "꽃", Some("one line now".into()), None, "Plex").await.unwrap();
+        assert!(!c.companion("JISOO", "꽃").await.unwrap().lines_up);
+        assert!(c.romanized("JISOO", "꽃", opts).await.is_none());
     }
 
     /// Library words are not an LRCLIB record, so they must not inherit the

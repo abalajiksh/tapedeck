@@ -1,6 +1,7 @@
 import { writable } from 'svelte/store';
 import { browser } from '$app/environment';
 import { api } from './api';
+import { adoptLyricView } from './lyricview';
 
 /**
  * Display preferences that several screens read. Server-persisted like the
@@ -23,6 +24,7 @@ export async function initPrefs() {
 	if (!browser) return;
 	try {
 		const prefs = await api.getPreferences();
+		adoptLyricView(prefs.lyrics_view);
 		if (typeof prefs.show_artwork === 'boolean') {
 			showArtwork.set(prefs.show_artwork);
 			localStorage.setItem(ARTWORK_KEY, prefs.show_artwork ? '1' : '0');

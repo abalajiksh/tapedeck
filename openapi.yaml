@@ -2179,7 +2179,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/AdoptedLyrics'
         '400':
-          description: A blank artist or title, or a record with no words.
+          description: A blank artist or title, a record with no words — or, keeping it as the original script, one that does not line up with the words held.
           content:
             application/json:
               schema:
@@ -2192,6 +2192,54 @@ paths:
                 $ref: '#/components/schemas/Error'
         '422':
           description: The body is missing a field outright.
+      security:
+      - sessionCookie: []
+  /api/v1/lyrics/companion:
+    delete:
+      tags:
+      - Statistics
+      summary: Forget the original-script companion kept beside a track's words.
+      description: |-
+        Session only. The words are untouched; romanization goes back to being
+        made from them (which, for words held in Latin letters, means none).
+      operationId: clear_companion
+      parameters:
+      - name: artist
+        in: query
+        required: true
+        schema:
+          type: string
+      - name: title
+        in: query
+        required: true
+        schema:
+          type: string
+      - name: album
+        in: query
+        description: |-
+          Which record to draw the tracklist from.
+
+          Optional and resolved from the history when it is absent, because the
+          caller is usually a note or a history row that knows the track and not
+          the record it was filed under. Passed explicitly it wins, since a track
+          on three compilations has three honest answers and only the caller knows
+          which one is being read.
+        required: false
+        schema:
+          type: string
+      responses:
+        '200':
+          description: Forgotten, or there was none.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CompanionCleared'
+        '400':
+          description: Missing artist or title.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
       security:
       - sessionCookie: []
   /api/v1/lyrics/keys:
@@ -11154,6 +11202,13 @@ components:
           type: integer
           format: int64
           description: The LRCLIB record, from `GET /api/v1/lyrics/matches`.
+        original_script:
+          type: boolean
+          description: |-
+            Keep the record **beside** the words held, as their original script,
+            rather than replacing them. For words held in Latin letters (a lyric
+            tagged romanised in your own files): they stay what a note quotes, and
+            romanization is made from this record. Refused unless it lines up.
     AdoptedLyrics:
       oneOf:
       - type: object
@@ -11167,6 +11222,22 @@ components:
             description: Always `true`.
           why:
             type: string
+      - type: object
+        description: Kept beside the words as their original script (`original_script`).
+        required:
+        - status
+        - lines
+        properties:
+          status:
+            type: string
+            description: Always `companion`.
+          language:
+            type:
+            - string
+            - 'null'
+          lines:
+            type: integer
+            minimum: 0
       - type: object
         description: Held.
         required:
@@ -12534,6 +12605,33 @@ components:
           type: array
           items:
             $ref: '#/components/schemas/RediscoveryRow'
+    CompanionCleared:
+      type: object
+      description: An original-script companion, forgotten.
+      required:
+      - status
+      properties:
+        status:
+          type: string
+          description: Always `cleared`.
+    CompanionInfo:
+      type: object
+      description: An original-script companion kept beside the words.
+      required:
+      - lines_up
+      properties:
+        lrclib_id:
+          type:
+          - integer
+          - 'null'
+          format: int64
+        language:
+          type:
+          - string
+          - 'null'
+        lines_up:
+          type: boolean
+          description: Same line count as the words. When false it is held but not used.
     ComponentType:
       type: string
       description: What kind of box a step is.
@@ -17638,6 +17736,24 @@ components:
           type: integer
           format: int64
           description: Minimum seconds between polls.
+    Part:
+      type: object
+      description: One unit drawn under its original in the interlinear view.
+      required:
+      - o
+      - r
+      properties:
+        o:
+          type: string
+          description: The original text.
+        r:
+          type: string
+          description: Its romanization. Equal to `o` for punctuation and Latin text.
+        lit:
+          type: boolean
+          description: |-
+            Punctuation or text that was already Latin: carried along, never
+            separated from its neighbours by a syllable dot.
     PastImport:
       type: object
       required:
@@ -18483,6 +18599,15 @@ components:
         rating_love_starred:
           type: boolean
           description: Whether a starred (favourited) item counts as loved whatever its rating. True when unset.
+        lyrics_indic_style:
+          type: string
+          description: 'How Indian scripts are romanized in the lyrics reader: `readable` (lyric-site spelling, the default) or `iso` (ISO 15919).'
+        lyrics_macrons:
+          type: boolean
+          description: Romanized Japanese with macrons (Tōkyō) rather than spelled out (toukyou). False when unset.
+        lyrics_view:
+          type: string
+          description: '`original`, `romanized` or `both` — what the reader, deck strip and notes show for a lyric that is romanized. The web UI''s.'
         theme:
           type: string
           description: '`light`, `dark` or `system`. The web UI''s.'
@@ -19395,6 +19520,14 @@ components:
         text:
           type: string
           description: Empty for a stanza break, which is a real line.
+        roman:
+          oneOf:
+          - type: 'null'
+          - $ref: '#/components/schemas/RomanLine'
+            description: |-
+              The line in Latin letters, as words and parts (one Hangul block, one
+              Japanese or Chinese token, one Indic word each). Absent where the line
+              needs none — English, a stanza break — or the lyric is not romanized.
         pin:
           oneOf:
           - type: 'null'
@@ -19849,6 +19982,48 @@ components:
           type: array
           items:
             $ref: '#/components/schemas/Revision'
+    RomanLine:
+      type: object
+      description: One lyric line in Latin letters.
+      required:
+      - text
+      - words
+      properties:
+        text:
+          type: string
+          description: The whole line as plain text.
+        words:
+          type: array
+          items:
+            $ref: '#/components/schemas/Word'
+    RomanizationInfo:
+      type: object
+      description: How a lyric was romanized.
+      required:
+      - indic
+      - macrons
+      - from_companion
+      - kanji
+      properties:
+        language:
+          type:
+          - string
+          - 'null'
+          description: The language it was romanized as.
+        indic:
+          type: string
+          description: '`readable` or `iso`, from the `lyrics_indic_style` preference.'
+        macrons:
+          type: boolean
+          description: Japanese long vowels with macrons, from the `lyrics_macrons` preference.
+        from_companion:
+          type: boolean
+          description: Made from the original-script companion rather than the words shown.
+        kanji:
+          type: boolean
+          description: |-
+            Whether this build reads kanji and hanzi. Without it (a build with no
+            default features) kana is romanized and ideographs are left as written.
     RotatedToken:
       type: object
       description: A re-issued token.
@@ -24055,6 +24230,21 @@ components:
           type: string
         frozen:
           type: boolean
+    Word:
+      type: object
+      description: 'A word: parts written together, words separated by a space.'
+      required:
+      - parts
+      properties:
+        parts:
+          type: array
+          items:
+            $ref: '#/components/schemas/Part'
+        syl:
+          type: boolean
+          description: |-
+            The parts are sung syllables (Korean), so the reader marks the
+            boundaries between them.
     Words:
       oneOf:
       - type: object
@@ -24073,6 +24263,20 @@ components:
           timed:
             type: boolean
             description: Whether any line carries a time, so the reader can follow the deck.
+          romanization:
+            oneOf:
+            - type: 'null'
+            - $ref: '#/components/schemas/RomanizationInfo'
+              description: |-
+                Present when the lyric is in a script that is romanized; each line
+                then carries `roman`.
+          companion:
+            oneOf:
+            - type: 'null'
+            - $ref: '#/components/schemas/CompanionInfo'
+              description: |-
+                An LRCLIB record kept beside these words in their original script,
+                which romanization is made from while it lines up.
           lines:
             type: array
             items:

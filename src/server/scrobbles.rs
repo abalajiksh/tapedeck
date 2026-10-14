@@ -1683,15 +1683,35 @@ async fn lyric_document(
         Some(crate::lyrics::Found::Lyrics { plain, synced, language }) => {
             let lines = crate::lyrics::parse_lines(plain.as_deref(), synced.as_deref());
             let held = lyrics.held(artist, title).await;
+            // In Latin letters, line for line, when the lyric is in a script
+            // that is romanized — made once and kept, in the reader's chosen
+            // style. Index i is line i + 1, the same numbering as `lines`.
+            let opts = romanize_options(state, user_id).await;
+            let romanized = lyrics.romanized(artist, title, opts).await;
+            let companion = lyrics.companion(artist, title).await;
+            let mut roman = romanized.as_ref().map(|r| r.lines.clone()).unwrap_or_default();
             Words::Lyrics {
                 language,
                 timed: lines.iter().any(|l| l.at.is_some()),
+                romanization: romanized.as_ref().map(|r| RomanizationInfo {
+                    language: r.language.clone(),
+                    indic: opts.indic.as_str(),
+                    macrons: opts.macrons,
+                    from_companion: r.from_companion,
+                    kanji: cfg!(feature = "cjk"),
+                }),
+                companion: companion.map(|c| CompanionInfo {
+                    lrclib_id: c.lrclib_id,
+                    language: c.language,
+                    lines_up: c.lines_up,
+                }),
                 lines: lines
                     .iter()
                     .map(|l| ReaderLine {
                         n: l.index,
                         at: l.at,
                         text: l.text.clone(),
+                        roman: roman.get_mut(l.index - 1).and_then(Option::take),
                         pin: pins.remove(&l.index),
                         // How many notes quote this line. Zero is sent as zero
                         // rather than omitted: the reader draws nothing for it,
@@ -1773,6 +1793,12 @@ pub enum Words {
         language: Option<String>,
         /// Whether any line carries a time, so the reader can follow the deck.
         timed: bool,
+        /// Present when the lyric is in a script that is romanized; each line
+        /// then carries `roman`.
+        romanization: Option<RomanizationInfo>,
+        /// An LRCLIB record kept beside these words in their original script,
+        /// which romanization is made from while it lines up.
+        companion: Option<CompanionInfo>,
         /// **Numbered including blanks.** A stanza break is a line, because a
         /// note refers to a line by its index and skipping empties would
         /// renumber every line after one.
@@ -1815,10 +1841,55 @@ pub struct ReaderLine {
     pub at: Option<f64>,
     /// Empty for a stanza break, which is a real line.
     pub text: String,
+    /// The line in Latin letters, as words and parts (one Hangul block, one
+    /// Japanese or Chinese token, one Indic word each). Absent where the line
+    /// needs none — English, a stanza break — or the lyric is not romanized.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub roman: Option<crate::romanize::RomanLine>,
     /// The liner note pinned to this line, if any.
     pub pin: Option<LinePin>,
     /// How many notes quote this line. Zero is sent, never omitted.
     pub quoted: usize,
+}
+
+/// How a lyric was romanized.
+#[derive(Serialize, ToSchema)]
+pub struct RomanizationInfo {
+    /// The language it was romanized as.
+    pub language: Option<String>,
+    /// `readable` or `iso`, from the `lyrics_indic_style` preference.
+    pub indic: &'static str,
+    /// Japanese long vowels with macrons, from the `lyrics_macrons` preference.
+    pub macrons: bool,
+    /// Made from the original-script companion rather than the words shown.
+    pub from_companion: bool,
+    /// Whether this build reads kanji and hanzi. Without it (a build with no
+    /// default features) kana is romanized and ideographs are left as written.
+    pub kanji: bool,
+}
+
+/// An original-script companion kept beside the words.
+#[derive(Serialize, ToSchema)]
+pub struct CompanionInfo {
+    pub lrclib_id: Option<i64>,
+    pub language: Option<String>,
+    /// Same line count as the words. When false it is held but not used.
+    pub lines_up: bool,
+}
+
+/// The romanization a user has chosen, from their preferences: Indic style in
+/// Settings, Japanese macrons from the reader's toggle.
+pub(crate) async fn romanize_options(
+    state: &Arc<AppState>,
+    user_id: i64,
+) -> crate::romanize::Options {
+    let prefs = state.db.get_preferences(user_id).await.unwrap_or_default();
+    crate::romanize::Options {
+        indic: crate::romanize::IndicStyle::parse(
+            prefs.get("lyrics_indic_style").and_then(|v| v.as_str()).unwrap_or("readable"),
+        ),
+        macrons: prefs.get("lyrics_macrons").and_then(|v| v.as_bool()).unwrap_or(false),
+    }
 }
 
 /// A liner note pinned to a line.
@@ -2651,7 +2722,7 @@ async fn lyric_matches(
     request_body = AdoptLyricsRequest,
     responses(
         (status = 200, description = "Held — or `unavailable` with a `why`.", body = AdoptedLyrics),
-        (status = 400, description = "A blank artist or title, or a record with no words.", body = ErrorResponse),
+        (status = 400, description = "A blank artist or title, a record with no words — or, keeping it as the original script, one that does not line up with the words held.", body = ErrorResponse),
         (status = 404, description = "LRCLIB has no record with that id.", body = ErrorResponse),
         (status = 422, description = "The body is missing a field outright."),
     )
@@ -2707,6 +2778,9 @@ async fn adopt_lyrics(
     if record.instrumental || !has_words {
         return bad_request("That record has no words to hold");
     }
+    if body.original_script {
+        return keep_companion(&lyrics, &body, &record).await;
+    }
 
     let before = match lyrics.cached(&body.artist, &body.title).await {
         Some(crate::lyrics::Found::Lyrics { plain, synced, .. }) => {
@@ -2743,6 +2817,113 @@ pub struct AdoptLyricsRequest {
     pub title: String,
     /// The LRCLIB record, from `GET /api/v1/lyrics/matches`.
     pub id: i64,
+    /// Keep the record **beside** the words held, as their original script,
+    /// rather than replacing them. For words held in Latin letters (a lyric
+    /// tagged romanised in your own files): they stay what a note quotes, and
+    /// romanization is made from this record. Refused unless it lines up.
+    #[serde(default)]
+    pub original_script: bool,
+}
+
+/// How far apart two cues on the same line may be and still be the same line.
+const CUE_TOLERANCE_SECS: f64 = 2.0;
+
+/// Keep `record` as the original-script companion of the words held — when it
+/// is in a script that is romanized and its lines are the held words' lines:
+/// the same count, and where both are timed, the same moments. Anything else
+/// would set romanized lines under the wrong lines of the song.
+async fn keep_companion(
+    lyrics: &crate::lyrics::LyricsClient,
+    body: &AdoptLyricsRequest,
+    record: &crate::lyrics::LrcResponse,
+) -> axum::response::Response {
+    let Some(crate::lyrics::Found::Lyrics { plain, synced, .. }) =
+        lyrics.cached(&body.artist, &body.title).await
+    else {
+        return bad_request(
+            "There are no words held to keep it beside — use it as the words instead",
+        );
+    };
+    let language =
+        crate::lyrics::language_of(record.plain_lyrics.as_deref(), record.synced_lyrics.as_deref());
+    if !crate::romanize::supports(language) {
+        return bad_request(
+            "That version is not in a script Tapedeck romanizes, so it adds nothing as an original",
+        );
+    }
+    let held = crate::lyrics::parse_lines(plain.as_deref(), synced.as_deref());
+    let theirs =
+        crate::lyrics::parse_lines(record.plain_lyrics.as_deref(), record.synced_lyrics.as_deref());
+    if held.len() != theirs.len() {
+        return bad_request(&format!(
+            "That version has {} lines and yours {}, so its lines would sit under the wrong ones of yours",
+            theirs.len(),
+            held.len()
+        ));
+    }
+    if let Some((n, off)) = held
+        .iter()
+        .zip(&theirs)
+        .filter_map(|(a, b)| Some((a.index, (a.at? - b.at?).abs())))
+        .find(|(_, off)| *off > CUE_TOLERANCE_SECS)
+    {
+        return bad_request(&format!(
+            "That version's timing is {off:.1}s away from yours at line {n}, so its lines are not yours"
+        ));
+    }
+    match lyrics.set_companion(&body.artist, &body.title, record).await {
+        Ok(()) => (
+            StatusCode::OK,
+            Json(AdoptedLyrics::Companion {
+                status: "companion",
+                language: language.map(str::to_string),
+                lines: theirs.len(),
+            }),
+        )
+            .into_response(),
+        Err(e) => server_error(e.to_string()),
+    }
+}
+
+// DELETE /api/v1/lyrics/companion — stop romanizing from a companion.
+/// Forget the original-script companion kept beside a track's words.
+///
+/// Session only. The words are untouched; romanization goes back to being
+/// made from them (which, for words held in Latin letters, means none).
+#[utoipa::path(
+    delete,
+    path = "/api/v1/lyrics/companion",
+    tag = "Statistics",
+    security(("sessionCookie" = [])),
+    params(LyricsQuery),
+    responses(
+        (status = 200, description = "Forgotten, or there was none.", body = CompanionCleared),
+        (status = 400, description = "Missing artist or title.", body = ErrorResponse),
+    )
+)]
+async fn clear_companion(
+    State(state): State<Arc<AppState>>,
+    user: AuthUser,
+    Query(q): Query<LyricsQuery>,
+) -> impl IntoResponse {
+    let Some(lyrics) = state.lyrics.clone() else {
+        return server_error("This instance has no lyrics cache".to_string());
+    };
+    if q.artist.trim().is_empty() || q.title.trim().is_empty() {
+        return bad_request("A track needs an artist and a title");
+    }
+    let _ = user;
+    match lyrics.clear_companion(&q.artist, &q.title).await {
+        Ok(()) => (StatusCode::OK, Json(CompanionCleared { status: "cleared" })).into_response(),
+        Err(e) => server_error(e.to_string()),
+    }
+}
+
+/// An original-script companion, forgotten.
+#[derive(Serialize, ToSchema)]
+pub struct CompanionCleared {
+    /// Always `cleared`.
+    pub status: &'static str,
 }
 
 /// A picked record, held — or why LRCLIB could not be asked.
@@ -2754,6 +2935,13 @@ pub enum AdoptedLyrics {
         /// Always `true`.
         unavailable: bool,
         why: String,
+    },
+    /// Kept beside the words as their original script (`original_script`).
+    Companion {
+        /// Always `companion`.
+        status: &'static str,
+        language: Option<String>,
+        lines: usize,
     },
     /// Held.
     Adopted {
@@ -3121,6 +3309,7 @@ fn server_error(msg: String) -> axum::response::Response {
     fetch_lyrics_now,
     lyric_matches,
     adopt_lyrics,
+    clear_companion,
     lyrics_keys,
     lyrics_status,
     mbid_status,
@@ -3157,6 +3346,7 @@ pub fn create_scrobbles_router() -> Router<Arc<AppState>> {
         .route("/api/v1/lyrics/keys", get(lyrics_keys))
         .route("/api/v1/lyrics/matches", get(lyric_matches))
         .route("/api/v1/lyrics/adopt", axum::routing::post(adopt_lyrics))
+        .route("/api/v1/lyrics/companion", axum::routing::delete(clear_companion))
         .route("/api/v1/lyrics/status", get(lyrics_status))
         .route("/api/v1/mbids/status", get(mbid_status))
         .route("/api/v1/mbids/backfill", axum::routing::post(backfill_mbids_now))

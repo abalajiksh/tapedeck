@@ -142,6 +142,9 @@ pub enum Render {
     LineBlock {
         /// The line under the quote — "line 12 · 1:04".
         meta: String,
+        /// The quoted line in Latin letters, where the lyric is romanized —
+        /// drawn under the quote where the design put "its translation".
+        roman: Option<String>,
     },
 }
 
@@ -249,10 +252,16 @@ fn substitute(src: &str, resolved: &HashMap<(RefKind, String), Resolved>) -> Str
                     out.push_str(&escape_html(chip));
                     out.push_str("</a></span>");
                 }
-                Render::LineBlock { meta } => {
+                Render::LineBlock { meta, roman } => {
                     out.push_str("<figure class=\"td-line-block\"><blockquote>");
                     out.push_str(&escape_html(&r.label));
-                    out.push_str("</blockquote><figcaption>");
+                    out.push_str("</blockquote>");
+                    if let Some(roman) = roman {
+                        out.push_str("<p class=\"td-line-roman\">");
+                        out.push_str(&escape_html(roman));
+                        out.push_str("</p>");
+                    }
+                    out.push_str("<figcaption>");
                     out.push_str(&escape_html(meta));
                     out.push_str(" <a class=\"td-line-chip\" href=\"");
                     out.push_str(&escape_attr(&r.href));
@@ -328,6 +337,7 @@ pub fn render(src: &str, resolved: &HashMap<(RefKind, String), Resolved>) -> Str
         .add_allowed_classes("span", &["td-unresolved", "td-line", "td-line-words"])
         .add_allowed_classes("a", &["td-line-chip"])
         .add_allowed_classes("figure", &["td-line-block"])
+        .add_allowed_classes("p", &["td-line-roman"])
         .add_tags(&["figure", "figcaption"])
         .link_rel(Some("noopener nofollow"))
         .clean(&unsafe_html)
@@ -525,7 +535,7 @@ mod tests {
             Resolved {
                 label: "I keep the sea in a coffee tin".into(),
                 href: "/lyrics?artist=X&title=Y&line=13".into(),
-                render: Render::LineBlock { meta: "line 13 \u{b7} 1:11".into() },
+                render: Render::LineBlock { meta: "line 13 \u{b7} 1:11".into(), roman: None },
             },
         );
 
@@ -546,6 +556,26 @@ mod tests {
         // silently: a rendering that grows a class nobody allow-listed is
         // stripped, the markup still parses, and it merely looks unstyled.
         assert!(html.contains("class=\"td-line-chip\""), "{html}");
+    }
+
+    /// A romanized lyric's block quote carries the line in Latin letters
+    /// under it, and its class survives the sanitiser like the others.
+    #[test]
+    fn a_block_quote_of_a_romanized_line_carries_it_underneath() {
+        let mut r = HashMap::new();
+        r.insert(
+            (RefKind::LineBlock, "16".to_string()),
+            Resolved {
+                label: "꽃향기만".into(),
+                href: "/lyrics?artist=X&title=Y&line=16".into(),
+                render: Render::LineBlock {
+                    meta: "line 16".into(),
+                    roman: Some("kkotyanggiman <b>".into()),
+                },
+            },
+        );
+        let html = render("[[quote:16]]", &r);
+        assert!(html.contains("<p class=\"td-line-roman\">kkotyanggiman &lt;b&gt;</p>"), "{html}");
     }
 
     /// `quote` and `line` are the same coordinate asked for differently.

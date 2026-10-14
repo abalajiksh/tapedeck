@@ -352,7 +352,14 @@ async fn line_resolution(
             Some(at) => format!("line {n} \u{b7} {}:{:02}", at as u64 / 60, at as u64 % 60),
             None => format!("line {n}"),
         };
-        crate::notes::Render::LineBlock { meta }
+        // The same line in Latin letters, in the default style: a note is
+        // rendered once for whoever reads it, not per reader's preference.
+        let roman = lyrics
+            .romanized(artist, title, crate::romanize::Options::default())
+            .await
+            .and_then(|r| r.lines.into_iter().nth(n - 1).flatten())
+            .map(|r| r.text);
+        crate::notes::Render::LineBlock { meta, roman }
     } else {
         crate::notes::Render::LineInline { chip }
     };
