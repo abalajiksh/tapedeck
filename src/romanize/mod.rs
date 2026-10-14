@@ -38,7 +38,7 @@ use utoipa::ToSchema;
 
 /// Bumped whenever any romanizer's output changes, so stored romanizations
 /// are recomputed rather than served stale.
-pub const VERSION: i64 = 1;
+pub const VERSION: i64 = 2;
 
 /// One unit drawn under its original in the interlinear view.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
@@ -240,10 +240,15 @@ fn line(text: &str, cjk: CjkMode, opts: Options) -> Option<RomanLine> {
             // hyphen in it — not "kuchh- kuchh".
             let mut produced = produced.into_iter();
             if let Some(last) = chunk_words.last_mut() {
-                let after_punct = last
-                    .parts
-                    .last()
-                    .is_some_and(|p| p.lit && !p.o.chars().any(char::is_alphanumeric));
+                // Only marks that join: a hyphen, an apostrophe, an opening
+                // bracket or quote. After a colon or a comma the next word is
+                // a new word ("cí: Zhōu Jiélún", not "cí:Zhōu…").
+                let after_punct = last.parts.last().is_some_and(|p| {
+                    p.lit
+                        && p.o.ends_with([
+                            '-', '‐', '‑', '–', '\'', '’', '(', '（', '[', '「', '『', '“', '"',
+                        ])
+                });
                 if after_punct {
                     if let Some(first) = produced.next() {
                         last.syl = first.syl;
@@ -341,6 +346,11 @@ mod tests {
         let w = &l.words[1];
         assert!(w.syl);
         assert_eq!(w.parts.last().unwrap(), &Part { o: ",".into(), r: ",".into(), lit: true });
+    }
+
+    #[test]
+    fn a_colon_or_comma_is_followed_by_a_new_word() {
+        assert_eq!(roman("词：周杰伦", "Chinese").as_deref(), Some("cí: Zhōu Jiélún"));
     }
 
     #[test]

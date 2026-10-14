@@ -270,7 +270,17 @@ pub(super) fn words(run: &str) -> Vec<Word> {
                 Part { o: c.to_string(), r, lit: !found }
             })
             .collect();
-        out.push(Word { parts, syl: false });
+        // CC-CEDICT capitalizes each part of a name (Zhou1 Jie2 lun2): a
+        // capital after the first syllable starts a new word, so 周杰伦 is
+        // "Zhōu Jiélún" rather than "ZhōuJiélún".
+        let mut word: Vec<Part> = Vec::new();
+        for p in parts {
+            if !word.is_empty() && p.r.chars().next().is_some_and(char::is_uppercase) {
+                out.push(Word { parts: std::mem::take(&mut word), syl: false });
+            }
+            word.push(p);
+        }
+        out.push(Word { parts: word, syl: false });
     }
     out
 }
@@ -313,6 +323,11 @@ mod tests {
         // CC-CEDICT lists yù (to rain) and lìn (to filter) first.
         assert_eq!(text("下雨"), "xiàyǔ");
         assert_eq!(text("我好想再淋一遍"), "wǒ hǎo xiǎng zài lín yībiàn");
+    }
+
+    #[test]
+    fn a_name_is_written_as_its_parts() {
+        assert_eq!(text("周杰伦"), "Zhōu Jiélún");
     }
 
     #[test]
