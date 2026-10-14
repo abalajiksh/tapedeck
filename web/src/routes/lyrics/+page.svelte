@@ -34,10 +34,14 @@
 	 */
 	import { onMount, onDestroy } from 'svelte';
 	import { page } from '$app/stores';
-	import { api, lyricKey } from '$lib/api';
+	import { api, lyricKey, romanOriginal } from '$lib/api';
 	import type { LyricDoc, LyricLine } from '$lib/api';
 	import { syncUrl } from '$lib/url';
 	import { deck, watchNowPlaying } from '$lib/nowplaying';
+	import LyricVersions from '$lib/components/LyricVersions.svelte';
+	import RomanLine from '$lib/components/RomanLine.svelte';
+	import { lyricView, setLyricView, VIEW_LABEL } from '$lib/lyricview';
+	import type { LyricView } from '$lib/lyricview';
 
 	let doc: LyricDoc | null = null;
 	let loading = true;
@@ -84,6 +88,43 @@
 	let looking = false;
 	let lookMsg = '';
 
+	/** *Other versions*: the other LRCLIB records for this track, and the way
+	 *  to hold one of them instead. Offered whether or not words are held —
+	 *  the reader had no way to it at all once any were, which is exactly when
+	 *  somebody is looking at the wrong ones. */
+	let versions = false;
+	let versionMsg = '';
+
+	/** What the words are drawn as. Only a lyric the server romanized offers
+	 *  a choice; anything else is its own script, whatever the setting says. */
+	$: view = (doc?.romanization ? $lyricView : 'original') as LyricView;
+	/** Words held in Latin letters with no romanization behind them — the
+	 *  case an original-script companion is for (*Other versions* offers it). */
+	$: latinHeld = !!doc && !doc.romanization && (doc.lines ?? []).some((l) => l.text.trim());
+
+	/** Japanese long vowels, toggled in the reader and kept as a preference;
+	 *  the words are fetched again in the new style. */
+	let restyling = false;
+	async function toggleMacrons() {
+		if (!doc?.romanization || restyling) return;
+		restyling = true;
+		try {
+			await api.putPreferences({ lyrics_macrons: !doc.romanization.macrons });
+			if (live) await loadLive();
+			else await loadAddressed();
+		} finally {
+			restyling = false;
+		}
+	}
+
+	async function forgetCompanion() {
+		if (!doc) return;
+		await api.clearCompanion(doc.artist, doc.title).catch(() => {});
+		if (live) await loadLive();
+		else await loadAddressed();
+		versionMsg = 'Forgotten. Romanization is made from the words shown again.';
+	}
+
 	/** The enlarged line. Moved by the deck when it is following, by the reader
 	 *  otherwise — the design's one theatre for timed and untimed alike. */
 	let cursor: number | null = null;
@@ -111,6 +152,7 @@
 		loading = true;
 		error = '';
 		lookMsg = '';
+		versionMsg = '';
 		try {
 			doc = await api.lyrics(wantArtist, wantTitle, wantAlbum || undefined);
 			idle = false;
@@ -131,6 +173,7 @@
 		loading = !doc;
 		error = '';
 		lookMsg = '';
+		versionMsg = '';
 		try {
 			const r = await api.liveLyrics();
 			if (!r.playing) {
@@ -194,6 +237,33 @@
 		} finally {
 			looking = false;
 		}
+	}
+
+	/** The track's own length, to set each LRCLIB record's against: from the
+	 *  record's tracklist, or the deck when it is playing this. */
+	$: trackDuration =
+		doc?.tracklist?.find((t) => t.title.trim().toLowerCase() === doc?.title.trim().toLowerCase())
+			?.duration ??
+		(onDeck ? ($deck.track?.duration ?? null) : null);
+
+	async function adopted(
+		e: CustomEvent<{ renumbered: boolean; lines_before: number; lines_after: number; companion?: boolean }>
+	) {
+		versions = false;
+		cursor = null;
+		steering = false;
+		if (live) await loadLive();
+		else await loadAddressed();
+		const r = e.detail;
+		// Said after the reload, which clears it for a different track.
+		if (r.companion) {
+			versionMsg = 'Kept beside your words as their original script — romanization is made from it.';
+			if ($lyricView === 'original') setLyricView('romanized');
+			return;
+		}
+		versionMsg = r.renumbered
+			? `Swapped — ${r.lines_after} lines where there were ${r.lines_before}, so every quote past the change now points at a different line.`
+			: 'Swapped. Kept from now on, and still credited to LRCLIB.';
 	}
 
 	// ── Following the deck ──
@@ -377,6 +447,9 @@
 	}
 
 	function onKey(e: KeyboardEvent) {
+		// The dialog has the keyboard while it is open: Escape closes it, and
+		// must not also leave the page.
+		if (versions) return;
 		const t = e.target as HTMLElement | null;
 		if (t && /^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName)) return;
 		if (e.key === 'ArrowDown' || e.key === 'ArrowRight') { e.preventDefault(); step(1); }
@@ -544,18 +617,30 @@
 					<button class="lookbtn" on:click={lookNow} disabled={looking}>
 						{looking ? 'Looking…' : 'Look for the words now'}
 					</button>
+					<!-- A record filed under another name never comes back from a
+					     lookup, which matches on the exact title. -->
+					<button class="lookalt" on:click={() => (versions = true)}>Other versions…</button>
 					{#if lookMsg}<p class="lookmsg">{lookMsg}</p>{/if}
 				{:else}
 					<div class="prevlines">
 						{#each above as l, i (l.n)}
-							<button class="ghost g{above.length - i}" on:click={() => pointAt(l.n)}>{l.text}</button>
+							<button class="ghost g{above.length - i}" on:click={() => pointAt(l.n)}>
+								{#if view !== 'original' && l.roman}
+									{#if view === 'both'}<span class="gorig">{romanOriginal(l.roman)}</span>{/if}
+									<RomanLine line={l.roman} />
+								{:else}{l.text}{/if}
+							</button>
 						{/each}
 					</div>
 
 					{#if current}
 						<div class="nowline">
 							<span class="nowrule"></span>
-							<div class="nowtext">{current.text}</div>
+							<div class="nowtext">
+								{#if view !== 'original' && current.roman}
+									<RomanLine line={current.roman} mode={view === 'both' ? 'both' : 'romanized'} />
+								{:else}{current.text}{/if}
+							</div>
 							<div class="nowacts">
 								<a class="act primary" href={quoteHref(current.n)}>
 									<span class="qm">”</span> Quote this line
@@ -580,7 +665,12 @@
 
 					<div class="nextlines">
 						{#each below as l, i (l.n)}
-							<button class="ghost b{i + 1}" on:click={() => pointAt(l.n)}>{l.text}</button>
+							<button class="ghost b{i + 1}" on:click={() => pointAt(l.n)}>
+								{#if view !== 'original' && l.roman}
+									{#if view === 'both'}<span class="gorig">{romanOriginal(l.roman)}</span>{/if}
+									<RomanLine line={l.roman} />
+								{:else}{l.text}{/if}
+							</button>
 						{/each}
 					</div>
 				{/if}
@@ -601,6 +691,7 @@
 					{#if doc.timed}<span class="wpill good">Timed</span>{:else if spoken.length}<span class="wpill">Untimed</span>{/if}
 					{#if doc.language}<span class="wpill">{doc.language}</span>{/if}
 					{#if doc.edited}<span class="wpill">corrected here</span>{/if}
+					{#if doc.chosen}<span class="wpill">picked here</span>{/if}
 					{#if idle && live}
 						<span class="wpill">Deck is quiet</span>
 					{/if}
@@ -617,6 +708,52 @@
 						</button>
 					{/if}
 				</div>
+
+				{#if doc.romanization}
+					<!-- The script toggle. Remembered per account and shared with the
+					     deck strip and the notes panel. -->
+					<div class="wseg" role="group" aria-label="Show the words as">
+						{#each ['original', 'romanized', 'both'] as const as v}
+							<button class="wsegb" class:on={view === v} aria-pressed={view === v} on:click={() => setLyricView(v)}>
+								{VIEW_LABEL[v]}
+							</button>
+						{/each}
+					</div>
+					{#if doc.romanization.language === 'Japanese' && view !== 'original'}
+						<div class="wacts">
+							<button
+								class="wpill wbtn"
+								on:click={toggleMacrons}
+								disabled={restyling}
+								aria-pressed={doc.romanization.macrons}
+								title="Long vowels as macrons (tōkyō) or spelled out (toukyou)"
+							>
+								{doc.romanization.macrons ? 'Macrons on' : 'Macrons off'}
+							</button>
+						</div>
+					{/if}
+					{#if doc.romanization.from_companion}
+						<p class="wmsg">
+							Romanized from LRCLIB's {doc.romanization.language ?? 'original'} words, kept beside yours.
+							<button class="wlink" on:click={forgetCompanion}>Forget it</button>
+						</p>
+					{/if}
+					{#if !doc.romanization.kanji && (doc.romanization.language === 'Japanese' || doc.romanization.language === 'Chinese')}
+						<p class="wmsg">This build has no dictionary for kanji, so those are left as written.</p>
+					{/if}
+				{:else if doc.companion && !doc.companion.lines_up}
+					<p class="wmsg">
+						The original-script version kept for this track no longer lines up with these words, so it is
+						not used.
+						<button class="wlink" on:click={forgetCompanion}>Forget it</button>
+					</p>
+				{/if}
+				{#if spoken.length}
+					<div class="wacts">
+						<button class="wpill wbtn" on:click={() => (versions = true)}>Other versions</button>
+					</div>
+				{/if}
+				{#if versionMsg}<p class="wmsg">{versionMsg}</p>{/if}
 
 				<div class="wrule"></div>
 
@@ -708,6 +845,18 @@
 	</p>
 {/if}
 
+{#if versions && doc}
+	<LyricVersions
+		artist={doc.artist}
+		title={doc.title}
+		duration={trackDuration}
+		lines={doc.lines.length}
+		{latinHeld}
+		on:close={() => (versions = false)}
+		on:adopted={adopted}
+	/>
+{/if}
+
 <style>
 	/* The pill as a control. Same size and shape as its neighbours so the row
 	   still reads as a row of pills, with the accent and a pointer to say this
@@ -716,7 +865,8 @@
 	   `var(--td-accent)` — in the one file whose own note says a token here
 	   follows the theme onto a ground that does not. It happens to be the same
 	   orange in both today, which is exactly how that trap survives review. */
-	.wpill.follow {
+	.wpill.follow,
+	.wpill.wbtn {
 		border-color: rgba(198, 113, 57, 0.75);
 		color: #d98c4f;
 		cursor: pointer;
@@ -727,7 +877,47 @@
 		text-transform: uppercase;
 	}
 	.wpill.follow:hover,
-	.wpill.follow:focus-visible { background: rgba(198, 113, 57, 0.14); }
+	.wpill.follow:focus-visible,
+	.wpill.wbtn:hover,
+	.wpill.wbtn:focus-visible { background: rgba(198, 113, 57, 0.14); }
+	.wacts { display: flex; gap: 5px; margin-top: -4px; }
+	.wseg {
+		display: inline-flex;
+		align-self: flex-start;
+		border: 1px solid rgba(244, 231, 207, 0.18);
+		border-radius: 999px;
+		padding: 2px;
+		gap: 2px;
+	}
+	.wsegb {
+		font: inherit;
+		font-size: 10.5px;
+		font-weight: 700;
+		letter-spacing: 0.05em;
+		text-transform: uppercase;
+		padding: 4px 10px;
+		border-radius: 999px;
+		border: none;
+		background: none;
+		color: #9a8c72;
+		cursor: pointer;
+	}
+	.wsegb:hover,
+	.wsegb:focus-visible { color: #e9dcc4; }
+	.wsegb.on { background: rgba(198, 113, 57, 0.22); color: #f0b98c; }
+	.wlink {
+		font: inherit;
+		background: none;
+		border: none;
+		padding: 0;
+		color: #d98c4f;
+		text-decoration: underline;
+		cursor: pointer;
+	}
+	/* The original above a ghost line's romanization, in "both". */
+	.gorig { display: block; font-size: 0.7em; opacity: 0.75; }
+	.nowtext { --roman-original: #cdbfa6; }
+	.wmsg { margin: -4px 0 0; font-size: 11.5px; line-height: 1.5; color: #9a8c72; }
 	.wpill.follow .blip { animation: none; }
 
 	/* **Dark in both themes, on purpose**, which is the one screen in this app
@@ -738,7 +928,12 @@
 	.shell { max-width: 1460px; margin: 0 auto; }
 	.stage {
 		border-radius: 22px;
-		overflow: hidden;
+		/* `clip`, not `hidden`. The record drawing is wider than the stage below
+		   about 1000px, and `hidden` still makes this a scroll container: focusing
+		   anything in the wing (the close button, a track, *Other versions*)
+		   scrolled the whole theatre sideways by the overhang. `clip` cuts the
+		   same edge and cannot be scrolled. */
+		overflow: clip;
 		box-shadow: 0 12px 34px rgba(46, 43, 37, 0.18);
 		height: min(760px, calc(100vh - 120px));
 		min-height: 520px;
@@ -866,6 +1061,20 @@
 	}
 	.lookbtn:hover:not(:disabled) { background: #b2622d; }
 	.lookbtn:disabled { background: rgba(244, 231, 207, 0.09); color: #9a8c72; cursor: default; }
+	.lookalt {
+		margin-top: 10px;
+		align-self: flex-start;
+		font: inherit;
+		font-size: 12.5px;
+		padding: 7px 16px;
+		border-radius: 999px;
+		border: 1px solid rgba(198, 113, 57, 0.75);
+		background: none;
+		color: #d98c4f;
+		cursor: pointer;
+	}
+	.lookalt:hover,
+	.lookalt:focus-visible { background: rgba(198, 113, 57, 0.14); }
 	.lookmsg { margin-top: 10px; max-width: 46ch; color: #9a8c72; font-size: 13px; line-height: 1.55; }
 	.prevlines { display: flex; flex-direction: column; gap: 4px; margin-bottom: 26px; }
 	.nextlines { display: flex; flex-direction: column; gap: 5px; margin-top: 30px; }

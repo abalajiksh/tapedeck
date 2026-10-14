@@ -937,13 +937,26 @@ pub async fn call(
                     // one lyric is how an assistant confidently quotes the
                     // wrong words at somebody's own note.
                     let lines = crate::lyrics::parse_lines(plain.as_deref(), synced.as_deref());
+                    // In Latin letters too, when the lyric is in a script that
+                    // is romanized — so an assistant can read a Korean or Tamil
+                    // line out to someone who does not read the script. Same
+                    // numbering; absent on a line that needs none.
+                    let roman = lyrics
+                        .romanized(&artist, &title, crate::romanize::Options::default())
+                        .await
+                        .map(|r| r.lines)
+                        .unwrap_or_default();
                     json!({
                         "artist": artist, "title": title,
                         "language": language,
                         "timed": lines.iter().any(|l| l.at.is_some()),
-                        "lines": lines.iter().map(|l| json!({
-                            "n": l.index, "at": l.at, "text": l.text,
-                        })).collect::<Vec<_>>(),
+                        "lines": lines.iter().map(|l| {
+                            let mut line = json!({ "n": l.index, "at": l.at, "text": l.text });
+                            if let Some(Some(r)) = roman.get(l.index - 1) {
+                                line["romanized"] = json!(r.text);
+                            }
+                            line
+                        }).collect::<Vec<_>>(),
                         "numbering": "1-based, and a blank line is numbered — this is the same numbering the reader and a [[line:N]] reference use.",
                         "note": "Third-party copyrighted text via LRCLIB. Quote sparingly; do not reproduce in full.",
                     })

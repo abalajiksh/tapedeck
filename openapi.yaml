@@ -82,7 +82,7 @@ info:
   license:
     name: AGPL-3.0-or-later
     identifier: AGPL-3.0-or-later
-  version: 0.120.1
+  version: 0.121.0
 servers:
 - url: /
   description: The Tapedeck instance serving this document.
@@ -2084,12 +2084,15 @@ paths:
         wrong words, give me the other ones", which an instrumental cannot
         answer.
 
-        **Adopt one with `PUT /api/v1/lyrics`**, sending the chosen `plain` and
-        `synced_text`. That is the ordinary correction path, so the choice is
-        marked edited and survives every later fetch — and it reports
-        `renumbered`, which matters here more than anywhere: a `[[line:...]]`
-        reference is an index, so a different record re-points every quote
-        already written.
+        **Adopt one with `POST /api/v1/lyrics/adopt`**, by its `id`. The pick
+        survives every later fetch and library poll, is credited to LRCLIB, and
+        the response reports `renumbered` — which matters here more than
+        anywhere: a `[[line:...]]` reference is an index, so a different record
+        re-points every quote already written.
+
+        `search_artist` and `search_title` search under other names than the
+        track's own, for tags LRCLIB files differently. `held` marks the record
+        already stored for the track.
 
         This reaches the network, so it belongs on a press rather than a page
         load. A rate limit or an unreachable LRCLIB comes back **200** with
@@ -2097,6 +2100,109 @@ paths:
         us to wait is not this server failing, and the distinction is what stops
         a client reporting "no other matches" when it never managed to ask.
       operationId: lyric_matches
+      parameters:
+      - name: artist
+        in: query
+        description: The track, as it is filed here.
+        required: true
+        schema:
+          type: string
+      - name: title
+        in: query
+        required: true
+        schema:
+          type: string
+      - name: search_artist
+        in: query
+        description: |-
+          Search LRCLIB under a different artist than the track's — for tags that
+          name it differently (a romanised name, a "feat." credit).
+        required: false
+        schema:
+          type: string
+      - name: search_title
+        in: query
+        description: Likewise for the title.
+        required: false
+        schema:
+          type: string
+      responses:
+        '200':
+          description: OK.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LyricMatches'
+        '400':
+          description: Missing artist or title.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+      security:
+      - apiToken:
+        - read
+      - sessionCookie: []
+  /api/v1/lyrics/adopt:
+    post:
+      tags:
+      - Statistics
+      summary: Hold an LRCLIB record picked from *Other versions*.
+      description: |-
+        **Session only.** It reaches LRCLIB and writes the instance-wide cache,
+        which a token is not for.
+
+        The server fetches the record by `id` itself. The words are credited to
+        LRCLIB, and the pick is kept: no later fetch and no library poll
+        replaces it. It replaces a hand correction, since choosing is as
+        deliberate as typing and the later act wins; *Fix the words* afterwards
+        is a correction again.
+
+        Reports the line count before and after, and `renumbered` when they
+        differ: a `[[line:…]]` reference is an index, so a record with a
+        different count re-points every quote past the change.
+
+        A rate limit or an unreachable LRCLIB is **200** with `unavailable` —
+        nothing was changed and nothing was learned about the record.
+      operationId: adopt_lyrics
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AdoptLyricsRequest'
+        required: true
+      responses:
+        '200':
+          description: Held — or `unavailable` with a `why`.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AdoptedLyrics'
+        '400':
+          description: A blank artist or title, a record with no words — or, keeping it as the original script, one that does not line up with the words held.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: LRCLIB has no record with that id.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '422':
+          description: The body is missing a field outright.
+      security:
+      - sessionCookie: []
+  /api/v1/lyrics/companion:
+    delete:
+      tags:
+      - Statistics
+      summary: Forget the original-script companion kept beside a track's words.
+      description: |-
+        Session only. The words are untouched; romanization goes back to being
+        made from them (which, for words held in Latin letters, means none).
+      operationId: clear_companion
       parameters:
       - name: artist
         in: query
@@ -2123,11 +2229,11 @@ paths:
           type: string
       responses:
         '200':
-          description: OK.
+          description: Forgotten, or there was none.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/LyricMatches'
+                $ref: '#/components/schemas/CompanionCleared'
         '400':
           description: Missing artist or title.
           content:
@@ -2135,8 +2241,6 @@ paths:
               schema:
                 $ref: '#/components/schemas/Error'
       security:
-      - apiToken:
-        - read
       - sessionCookie: []
   /api/v1/lyrics/keys:
     get:
@@ -11081,6 +11185,86 @@ components:
           oneOf:
           - type: 'null'
           - $ref: '#/components/schemas/TapedeckPlayback'
+    AdoptLyricsRequest:
+      type: object
+      description: An LRCLIB record to hold for a track.
+      required:
+      - artist
+      - title
+      - id
+      properties:
+        artist:
+          type: string
+          description: The track, as it is filed here — not necessarily the record's own names.
+        title:
+          type: string
+        id:
+          type: integer
+          format: int64
+          description: The LRCLIB record, from `GET /api/v1/lyrics/matches`.
+        original_script:
+          type: boolean
+          description: |-
+            Keep the record **beside** the words held, as their original script,
+            rather than replacing them. For words held in Latin letters (a lyric
+            tagged romanised in your own files): they stay what a note quotes, and
+            romanization is made from this record. Refused unless it lines up.
+    AdoptedLyrics:
+      oneOf:
+      - type: object
+        description: LRCLIB could not be asked. Nothing was changed.
+        required:
+        - unavailable
+        - why
+        properties:
+          unavailable:
+            type: boolean
+            description: Always `true`.
+          why:
+            type: string
+      - type: object
+        description: Kept beside the words as their original script (`original_script`).
+        required:
+        - status
+        - lines
+        properties:
+          status:
+            type: string
+            description: Always `companion`.
+          language:
+            type:
+            - string
+            - 'null'
+          lines:
+            type: integer
+            minimum: 0
+      - type: object
+        description: Held.
+        required:
+        - status
+        - lines_before
+        - lines_after
+        - renumbered
+        properties:
+          status:
+            type: string
+            description: Always `adopted`.
+          language:
+            type:
+            - string
+            - 'null'
+          lines_before:
+            type: integer
+            minimum: 0
+          lines_after:
+            type: integer
+            minimum: 0
+          renumbered:
+            type: boolean
+            description: |-
+              The line count changed, so every `[[line:…]]` quote past the change
+              now points at different words. Say so.
+      description: A picked record, held — or why LRCLIB could not be asked.
     AlbumAggregate:
       type: object
       required:
@@ -12421,6 +12605,33 @@ components:
           type: array
           items:
             $ref: '#/components/schemas/RediscoveryRow'
+    CompanionCleared:
+      type: object
+      description: An original-script companion, forgotten.
+      required:
+      - status
+      properties:
+        status:
+          type: string
+          description: Always `cleared`.
+    CompanionInfo:
+      type: object
+      description: An original-script companion kept beside the words.
+      required:
+      - lines_up
+      properties:
+        lrclib_id:
+          type:
+          - integer
+          - 'null'
+          format: int64
+        language:
+          type:
+          - string
+          - 'null'
+        lines_up:
+          type: boolean
+          description: Same line count as the words. When false it is held but not used.
     ComponentType:
       type: string
       description: What kind of box a step is.
@@ -15256,8 +15467,9 @@ components:
         status:
           type: string
           description: |-
-            `saved`, or `kept` when the words held were corrected by hand — a
-            correction outranks a file's own tags, so those were left alone.
+            `saved`, or `kept` when the words held were corrected by hand or picked
+            from *Other versions* — either outranks a file's own tags, so those were
+            left alone.
         why:
           type:
           - string
@@ -16126,13 +16338,14 @@ components:
       required:
       - synced
       - lines
+      - held
       properties:
         id:
           type:
           - integer
           - 'null'
           format: int64
-          description: LRCLIB's id.
+          description: LRCLIB's id — what `POST /api/v1/lyrics/adopt` takes.
         title:
           type:
           - string
@@ -16141,6 +16354,13 @@ components:
           type:
           - string
           - 'null'
+        album:
+          type:
+          - string
+          - 'null'
+          description: |-
+            The release the record was filed under — usually what tells two
+            uploads of one song apart.
         duration:
           type:
           - integer
@@ -16154,6 +16374,18 @@ components:
           type: integer
           description: Lines, blanks included.
           minimum: 0
+        language:
+          type:
+          - string
+          - 'null'
+          description: |-
+            The language read off the record's script, null for Latin text. The
+            question this list most often answers is "is there one in the original
+            script", which a romanised upload and a native one look identical on
+            every other field.
+        held:
+          type: boolean
+          description: This is the record already held.
         plain:
           type:
           - string
@@ -17504,6 +17736,24 @@ components:
           type: integer
           format: int64
           description: Minimum seconds between polls.
+    Part:
+      type: object
+      description: One unit drawn under its original in the interlinear view.
+      required:
+      - o
+      - r
+      properties:
+        o:
+          type: string
+          description: The original text.
+        r:
+          type: string
+          description: Its romanization. Equal to `o` for punctuation and Latin text.
+        lit:
+          type: boolean
+          description: |-
+            Punctuation or text that was already Latin: carried along, never
+            separated from its neighbours by a syllable dot.
     PastImport:
       type: object
       required:
@@ -18349,6 +18599,15 @@ components:
         rating_love_starred:
           type: boolean
           description: Whether a starred (favourited) item counts as loved whatever its rating. True when unset.
+        lyrics_indic_style:
+          type: string
+          description: 'How Indian scripts are romanized in the lyrics reader: `readable` (lyric-site spelling, the default) or `iso` (ISO 15919).'
+        lyrics_macrons:
+          type: boolean
+          description: Romanized Japanese with macrons (Tōkyō) rather than spelled out (toukyou). False when unset.
+        lyrics_view:
+          type: string
+          description: '`original`, `romanized` or `both` — what the reader, deck strip and notes show for a lyric that is romanized. The web UI''s.'
         theme:
           type: string
           description: '`light`, `dark` or `system`. The web UI''s.'
@@ -19261,6 +19520,14 @@ components:
         text:
           type: string
           description: Empty for a stanza break, which is a real line.
+        roman:
+          oneOf:
+          - type: 'null'
+          - $ref: '#/components/schemas/RomanLine'
+            description: |-
+              The line in Latin letters, as words and parts (one Hangul block, one
+              Japanese or Chinese token, one Indic word each). Absent where the line
+              needs none — English, a stanza break — or the lyric is not romanized.
         pin:
           oneOf:
           - type: 'null'
@@ -19715,6 +19982,48 @@ components:
           type: array
           items:
             $ref: '#/components/schemas/Revision'
+    RomanLine:
+      type: object
+      description: One lyric line in Latin letters.
+      required:
+      - text
+      - words
+      properties:
+        text:
+          type: string
+          description: The whole line as plain text.
+        words:
+          type: array
+          items:
+            $ref: '#/components/schemas/Word'
+    RomanizationInfo:
+      type: object
+      description: How a lyric was romanized.
+      required:
+      - indic
+      - macrons
+      - from_companion
+      - kanji
+      properties:
+        language:
+          type:
+          - string
+          - 'null'
+          description: The language it was romanized as.
+        indic:
+          type: string
+          description: '`readable` or `iso`, from the `lyrics_indic_style` preference.'
+        macrons:
+          type: boolean
+          description: Japanese long vowels with macrons, from the `lyrics_macrons` preference.
+        from_companion:
+          type: boolean
+          description: Made from the original-script companion rather than the words shown.
+        kanji:
+          type: boolean
+          description: |-
+            Whether this build reads kanji and hanzi. Without it (a build with no
+            default features) kana is romanized and ideographs are left as written.
     RotatedToken:
       type: object
       description: A re-issued token.
@@ -23921,6 +24230,21 @@ components:
           type: string
         frozen:
           type: boolean
+    Word:
+      type: object
+      description: 'A word: parts written together, words separated by a space.'
+      required:
+      - parts
+      properties:
+        parts:
+          type: array
+          items:
+            $ref: '#/components/schemas/Part'
+        syl:
+          type: boolean
+          description: |-
+            The parts are sung syllables (Korean), so the reader marks the
+            boundaries between them.
     Words:
       oneOf:
       - type: object
@@ -23929,6 +24253,7 @@ components:
         - timed
         - lines
         - edited
+        - chosen
         properties:
           language:
             type:
@@ -23938,6 +24263,20 @@ components:
           timed:
             type: boolean
             description: Whether any line carries a time, so the reader can follow the deck.
+          romanization:
+            oneOf:
+            - type: 'null'
+            - $ref: '#/components/schemas/RomanizationInfo'
+              description: |-
+                Present when the lyric is in a script that is romanized; each line
+                then carries `roman`.
+          companion:
+            oneOf:
+            - type: 'null'
+            - $ref: '#/components/schemas/CompanionInfo'
+              description: |-
+                An LRCLIB record kept beside these words in their original script,
+                which romanization is made from while it lines up.
           lines:
             type: array
             items:
@@ -23959,6 +24298,17 @@ components:
           edited:
             type: boolean
             description: Corrected by hand, and therefore never overwritten by a lookup.
+          chosen:
+            type: boolean
+            description: |-
+              An LRCLIB record picked from *Other versions* — likewise never
+              overwritten by a lookup or a library poll, but still LRCLIB's words.
+          lrclib_id:
+            type:
+            - integer
+            - 'null'
+            format: int64
+            description: The LRCLIB record these words are, when they are one.
           source:
             type:
             - string

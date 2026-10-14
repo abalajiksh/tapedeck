@@ -66,6 +66,18 @@ impl utoipa::PartialSchema for Preferences {
                 prop(Type::Boolean, "Whether a starred (favourited) item counts as loved whatever its rating. True when unset."),
             )
             .property(
+                "lyrics_indic_style",
+                prop(Type::String, "How Indian scripts are romanized in the lyrics reader: `readable` (lyric-site spelling, the default) or `iso` (ISO 15919)."),
+            )
+            .property(
+                "lyrics_macrons",
+                prop(Type::Boolean, "Romanized Japanese with macrons (Tōkyō) rather than spelled out (toukyou). False when unset."),
+            )
+            .property(
+                "lyrics_view",
+                prop(Type::String, "`original`, `romanized` or `both` — what the reader, deck strip and notes show for a lyric that is romanized. The web UI's."),
+            )
+            .property(
                 "theme",
                 prop(Type::String, "`light`, `dark` or `system`. The web UI's."),
             )

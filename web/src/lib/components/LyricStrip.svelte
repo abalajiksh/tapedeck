@@ -18,8 +18,16 @@
 	 * the words themselves anywhere — a reference is an index.
 	 */
 	import { onMount } from 'svelte';
-	import { api } from '$lib/api';
-	import type { LyricDoc } from '$lib/api';
+	import { api, romanOriginal } from '$lib/api';
+	import type { LyricDoc, LyricLine } from '$lib/api';
+	import { lyricView } from '$lib/lyricview';
+	import RomanLine from '$lib/components/RomanLine.svelte';
+
+	/** The reader's script choice, shared: Latin letters when chosen and the
+	 *  line has them; "both" draws the romanization with the original small
+	 *  above it, which is what fits a strip. */
+	$: view = doc?.romanization ? $lyricView : 'original';
+	const showRoman = (l: LyricLine, v: string) => v !== 'original' && !!l.roman;
 
 	export let artist: string;
 	export let title: string;
@@ -138,7 +146,9 @@
 		<button class="strip" on:click={toggle}>
 			<span class="chev">▾</span>
 			<span class="lbl">Lyrics</span>
-			<span class="one">{current.text}</span>
+			<span class="one">
+				{#if showRoman(current, view) && current.roman}<RomanLine line={current.roman} />{:else}{current.text}{/if}
+			</span>
 			<span class="badge">Timed</span>
 		</button>
 	{:else}
@@ -156,7 +166,12 @@
 				{#each window_ as l (l.n)}
 					<div class="wl" class:now={l.n === current.n}>
 						<span class="wt">{l.at != null ? mmss(l.at) : l.n}</span>
-						<span class="wx">{l.text}</span>
+						<span class="wx">
+							{#if showRoman(l, view) && l.roman}
+								{#if view === 'both'}<span class="wxo">{romanOriginal(l.roman)}</span>{/if}
+								<RomanLine line={l.roman} />
+							{:else}{l.text}{/if}
+						</span>
 					</div>
 				{/each}
 			</div>
@@ -301,4 +316,5 @@
 	@media (max-width: 560px) {
 		.one { display: none; }
 	}
+	.wxo { display: block; font-size: 0.78em; opacity: 0.7; }
 </style>

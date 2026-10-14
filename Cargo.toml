@@ -1,6 +1,6 @@
 [package]
 name = "tapedeck"
-version = "0.120.1"
+version = "0.121.0"
 edition = "2021"
 # Builds the SvelteKit UI into static/ before rustc runs, so `cargo build` is
 # the whole build and a fresh clone compiles. See build.rs.
@@ -12,6 +12,13 @@ build = "build.rs"
 # one regardless — which is what lets a Postgres build read an old SQLite
 # file to migrate out of it.
 postgres = []
+# Reading Japanese kanji and Chinese hanzi for romanized lyrics: lindera with
+# IPADIC and CC-CEDICT embedded (+72 MB of binary, about 20 MB resident while
+# used, measured on a Pi 5). On by default; the 512 MB demo board can build
+# without it, and kana is still romanized there while ideographs are left as
+# written. Its build script downloads the dictionaries from lindera.dev.
+cjk = ["dep:lindera", "dep:pinyin"]
+default = ["cjk"]
 
 [dependencies]
 # Async runtime
@@ -79,6 +86,9 @@ ammonia = "4.1.4"
 # codecs pull in C libraries that would spoil cross-compiling for ARM boards.
 zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
 unicode-normalization = "0.1.25"
+lindera = { version = "6.2.0", default-features = false, features = ["embed-ipadic", "embed-cc-cedict"], optional = true }
+# A lone hanzi's most common reading, which CC-CEDICT does not order by.
+pinyin = { version = "0.11.0", default-features = false, features = ["with_tone"], optional = true }
 roon-api = "0.5.3"
 rsa = { version = "0.9", features = ["sha2"] }
 resvg = "0.48"

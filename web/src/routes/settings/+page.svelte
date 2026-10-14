@@ -774,6 +774,21 @@
 		try { lyricStatus = await api.getLyricsStatus(); } catch { /* optional */ }
 	}
 
+	// How Indian scripts are romanized in the reader: lyric-site spelling or
+	// ISO 15919. A preference on the server, because the server makes the
+	// romanization (and keeps one per style).
+	let indicStyle: 'readable' | 'iso' = 'readable';
+	let indicSaved = false;
+	async function saveIndicStyle() {
+		indicSaved = false;
+		try {
+			await api.putPreferences({ lyrics_indic_style: indicStyle });
+			indicSaved = true;
+		} catch (e) {
+			alert(String(e).replace(/^API \d+: /, ''));
+		}
+	}
+
 	// artwork
 	let artStatus: { total: number; resolved: number; pending: number } | null = null;
 	let fetchingArt = false;
@@ -1482,6 +1497,7 @@
 				thresholdPercent = Math.min(100, Math.max(5, Math.round(prefs.scrobble_threshold_percent)));
 			if (typeof prefs.scrobble_threshold_secs === 'number')
 				thresholdSecs = Math.min(3600, Math.max(10, Math.round(prefs.scrobble_threshold_secs)));
+			if (prefs.lyrics_indic_style === 'iso') indicStyle = 'iso';
 		} catch { timezone = 'UTC'; }
 		try { isAdmin = (await api.me()).is_admin; } catch { /* optional */ }
 		loadProfile();
@@ -3571,6 +3587,27 @@
 				{:else}
 					<p style="font-size:13px;color:var(--td-muted-3);margin:0;">No status available.</p>
 				{/if}
+
+				<!-- Romanization. The reader's own toggle chooses whether to show it;
+				     this chooses how Indian scripts are spelled when it does. -->
+				<div style="border-top:1px solid var(--td-border);margin-top:16px;padding-top:14px;">
+					<label for="indic-style" style="display:block;font-size:13px;font-weight:600;margin-bottom:6px;">
+						Romanizing Indian scripts
+					</label>
+					<div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;">
+						<select id="indic-style" class="input" style="max-width:340px;" bind:value={indicStyle} on:change={saveIndicStyle}>
+							<option value="readable">Readable — as lyric sites spell it (nilaave vaa, tum paas aaye)</option>
+							<option value="iso">ISO 15919 — exact, with diacritics (nilāvē vā, tuma pāsa āyē)</option>
+						</select>
+						{#if indicSaved}<span style="font-size:12px;color:var(--td-muted-3);">Saved</span>{/if}
+					</div>
+					<p style="font-size:12px;color:var(--td-muted-3);margin:8px 0 0;max-width:66ch;">
+						Tamil, Malayalam, Telugu, Kannada, Hindi, Bengali, Gujarati and Punjabi. Korean is written
+						as it is sung, Japanese in Hepburn (macrons are a toggle in the reader) and Chinese in
+						pinyin. Choose what the reader shows — the original, Latin letters, or both — in the
+						reader itself.
+					</p>
+				</div>
 			</div>
 
 			{#if isAdmin}

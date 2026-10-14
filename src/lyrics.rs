@@ -84,6 +84,9 @@ pub struct LrcResponse {
     pub id: Option<i64>,
     pub track_name: Option<String>,
     pub artist_name: Option<String>,
+    /// Shown when choosing between records: two uploads of one song are most
+    /// often told apart by the release they were filed under.
+    pub album_name: Option<String>,
     pub duration: Option<f64>,
     /// **A real third state, not a missing value.** An instrumental has no
     /// lyrics *and no language*, which the vocabulary could not previously
@@ -232,6 +235,41 @@ pub fn language_of(plain: Option<&str>, synced: Option<&str>) -> Option<&'static
     crate::language::dominant_script(&text)
 }
 
+/// How a track's stored words came to be here.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Held {
+    /// Typed here.
+    pub edited: bool,
+    /// An LRCLIB record picked by hand from *Other versions*.
+    pub chosen: bool,
+    pub source: Option<String>,
+    /// The LRCLIB record the words are, when they are one.
+    pub lrclib_id: Option<i64>,
+}
+
+/// An LRCLIB record kept beside the held words, in the script they were
+/// romanised from.
+#[derive(Debug, Clone)]
+pub struct Companion {
+    pub language: Option<String>,
+    /// Its lines, numbered as [`parse_lines`] numbers them.
+    pub lines: Vec<String>,
+    pub lrclib_id: Option<i64>,
+    /// Same line count as the held words. When it is not, it is not used.
+    pub lines_up: bool,
+}
+
+/// A lyric in Latin letters.
+#[derive(Debug, Clone)]
+pub struct Romanized {
+    /// One per line of the held words; `None` where a line needs none.
+    pub lines: Vec<Option<crate::romanize::RomanLine>>,
+    /// The language it was romanized as.
+    pub language: Option<String>,
+    /// Made from the original-script companion rather than the held words.
+    pub from_companion: bool,
+}
+
 /// Reads lyrics, and remembers what it read.
 pub struct LyricsClient {
     http: reqwest::Client,
@@ -273,7 +311,8 @@ impl LyricsClient {
                 found INTEGER NOT NULL,       -- 0 = LRCLIB has nothing (yet)
                 fetched_at INTEGER NOT NULL,
                 edited INTEGER NOT NULL DEFAULT 0,  -- corrected here; a fetch must not overwrite
-                source TEXT                        -- who these words came from
+                source TEXT,                       -- who these words came from
+                chosen INTEGER NOT NULL DEFAULT 0  -- an LRCLIB record picked by hand; likewise kept
             );
             "#,
         )
@@ -295,6 +334,42 @@ impl LyricsClient {
         let _ = sqlx::query(&crate::sql!("ALTER TABLE lyrics_cache ADD COLUMN source TEXT"))
             .execute(&self.pool)
             .await;
+        // And for *Other versions*. Before it, picking a record went through
+        // `set_words`, which credited LRCLIB's words to "You"; `chosen` keeps a
+        // pick safe from later fetches without that claim.
+        let _ = sqlx::query(&crate::sql!(
+            "ALTER TABLE lyrics_cache ADD COLUMN chosen INTEGER NOT NULL DEFAULT 0",
+        ))
+        .execute(&self.pool)
+        .await;
+        // The original-script companion: LRCLIB's Hangul (or kana, or Tamil)
+        // for a lyric held only in Latin letters — the JISOO 꽃 case, tagged
+        // romanised in the user's own files. Kept beside the held words rather
+        // than replacing them: the tags stay what a note quotes, and the
+        // companion is what romanization is made from.
+        for col in ["native_plain TEXT", "native_synced TEXT", "native_lrclib_id INTEGER"] {
+            let stmt = format!("ALTER TABLE lyrics_cache ADD COLUMN {col}");
+            let _ = sqlx::query(&crate::sql!(&stmt)).execute(&self.pool).await;
+        }
+        // Romanizations, made on first read and kept. Beside the lyrics for the
+        // same reason the lyrics are here: derived from third-party text, so not
+        // in a backup either. `version` and `source_hash` say when one is stale
+        // — a better romanizer, or different words.
+        crate::db::run_ddl(
+            &self.pool,
+            r#"
+            CREATE TABLE IF NOT EXISTS lyrics_romanized (
+                track_key TEXT NOT NULL,
+                options TEXT NOT NULL,
+                version INTEGER NOT NULL,
+                source_hash TEXT NOT NULL,
+                lines TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                PRIMARY KEY (track_key, options)
+            );
+            "#,
+        )
+        .await?;
         Ok(())
     }
 
@@ -328,12 +403,13 @@ impl LyricsClient {
         // `found` is 1 even for an empty correction: somebody has answered for
         // this track, and re-asking LRCLIB would undo the answer.
         sqlx::query(&crate::sql!("INSERT INTO lyrics_cache
-                (track_key, lrclib_id, instrumental, plain, synced, language, found, fetched_at, edited, source)
-             VALUES (?, NULL, 0, ?, ?, ?, 1, ?, 1, 'You')
+                (track_key, lrclib_id, instrumental, plain, synced, language, found, fetched_at, edited, source, chosen)
+             VALUES (?, NULL, 0, ?, ?, ?, 1, ?, 1, 'You', 0)
              ON CONFLICT(track_key) DO UPDATE SET
                 plain = excluded.plain, synced = excluded.synced,
                 language = excluded.language, instrumental = 0, found = 1,
-                fetched_at = excluded.fetched_at, edited = 1,
+                fetched_at = excluded.fetched_at, edited = 1, chosen = 0,
+                lrclib_id = NULL,
                 -- The words are yours now. Leaving the old provenance would
                 -- have the reader credit a server for something typed here,
                 -- which is a small lie about whose text it is.
@@ -352,9 +428,9 @@ impl LyricsClient {
     ///
     /// **Not `set_words`**, which is for a correction and sets `edited`. These
     /// are fetched, so a later fetch may legitimately replace them — what must
-    /// not happen is a fetch of any kind overwriting something a person typed,
-    /// which is why this refuses a row holding `edited` exactly as
-    /// [`Self::remember`] does.
+    /// not happen is a fetch of any kind overwriting something a person typed
+    /// or picked, which is why this refuses a row holding `edited` or `chosen`
+    /// exactly as [`Self::remember`] does.
     ///
     /// `source` is recorded rather than assumed: the reader says where a lyric
     /// came from, and "your Plex" is a materially different statement from
@@ -375,7 +451,7 @@ impl LyricsClient {
             synced: synced.clone(),
             language: language.clone(),
         };
-        if self.is_edited(artist, title).await {
+        if self.is_kept(artist, title).await {
             return Ok(found);
         }
         let key = Self::track_key(artist, title);
@@ -386,8 +462,9 @@ impl LyricsClient {
              ON CONFLICT(track_key) DO UPDATE SET
                 plain = excluded.plain, synced = excluded.synced,
                 language = excluded.language, instrumental = 0, found = 1,
-                fetched_at = excluded.fetched_at, source = excluded.source
-              WHERE lyrics_cache.edited = 0",))
+                fetched_at = excluded.fetched_at, source = excluded.source,
+                lrclib_id = NULL
+              WHERE lyrics_cache.edited = 0 AND lyrics_cache.chosen = 0",))
         .bind(&key)
         .bind(&plain)
         .bind(&synced)
@@ -418,18 +495,34 @@ impl LyricsClient {
         .and_then(|r| r.0)
     }
 
-    /// Whether these words were corrected here rather than fetched.
-    pub async fn is_edited(&self, artist: &str, title: &str) -> bool {
+    /// Whether a person settled these words — typed them, or picked an LRCLIB
+    /// record — so no fetch and no library poll may replace them.
+    ///
+    /// Two flags rather than one because they make different claims: `edited`
+    /// says *you wrote this*, `chosen` says *you chose this stranger's upload*,
+    /// and the reader credits them differently. Only their effect on a fetch
+    /// is the same.
+    pub async fn is_kept(&self, artist: &str, title: &str) -> bool {
+        self.held(artist, title).await.is_some_and(|h| h.edited || h.chosen)
+    }
+
+    /// How the stored words came to be here, in one read.
+    pub async fn held(&self, artist: &str, title: &str) -> Option<Held> {
         let key = Self::track_key(artist, title);
-        sqlx::query_as::<_, (i64,)>(&crate::sql!(
-            "SELECT edited FROM lyrics_cache WHERE track_key = ?",
+        sqlx::query_as::<_, (i64, i64, Option<String>, Option<i64>)>(&crate::sql!(
+            "SELECT edited, chosen, source, lrclib_id FROM lyrics_cache WHERE track_key = ?",
         ))
         .bind(&key)
         .fetch_optional(&self.pool)
         .await
         .ok()
         .flatten()
-        .is_some_and(|(e,)| e != 0)
+        .map(|(edited, chosen, source, lrclib_id)| Held {
+            edited: edited != 0,
+            chosen: chosen != 0,
+            source,
+            lrclib_id,
+        })
     }
 
     /// What is known about each of a handful of tracks, in one query.
@@ -623,6 +716,238 @@ impl LyricsClient {
         Ok(found)
     }
 
+    /// One LRCLIB record, by its id.
+    ///
+    /// For adopting a record from *Other versions*: the server fetches the
+    /// words itself rather than storing whatever a client sends, so what is
+    /// credited to LRCLIB is what LRCLIB actually holds. `None` is a 404 — the
+    /// record was removed or never existed.
+    pub async fn record(&self, id: i64) -> Result<Option<LrcResponse>, LyricsError> {
+        let url = format!("{}/api/get/{id}", self.base);
+        self.pace().await;
+        let resp =
+            self.http.get(&url).send().await.map_err(|e| LyricsError::Network(e.to_string()))?;
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            let wait = resp
+                .headers()
+                .get(reqwest::header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.trim().parse::<u64>().ok())
+                .unwrap_or(5);
+            return Err(LyricsError::RateLimited(wait.min(MAX_WAIT_SECS)));
+        }
+        if !resp.status().is_success() {
+            return Err(LyricsError::Network(format!("LRCLIB returned {}", resp.status())));
+        }
+        resp.json().await.map(Some).map_err(|e| LyricsError::Network(e.to_string()))
+    }
+
+    /// Hold an LRCLIB record picked by hand, in place of whatever was here.
+    ///
+    /// **Credited to LRCLIB, not to you.** This used to go through
+    /// [`Self::set_words`], which stamps `source = 'You'` and drops the record
+    /// id — the reader then credited a stranger's upload to the person who
+    /// merely chose it. `chosen` gives the pick the same protection a
+    /// correction has (no fetch and no library poll replaces it) without that
+    /// claim.
+    ///
+    /// It replaces a hand correction too: choosing a record is as deliberate
+    /// as typing one, and the later act wins.
+    pub async fn adopt(
+        &self,
+        artist: &str,
+        title: &str,
+        record: &LrcResponse,
+    ) -> Result<Found, sqlx::Error> {
+        let plain = record
+            .plain_lyrics
+            .as_deref()
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+            .map(String::from);
+        let synced = record
+            .synced_lyrics
+            .as_deref()
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+            .map(String::from);
+        let language = language_of(plain.as_deref(), synced.as_deref()).map(str::to_string);
+        let key = Self::track_key(artist, title);
+        let now = crate::db::Database::now_secs();
+        sqlx::query(&crate::sql!("INSERT INTO lyrics_cache
+                (track_key, lrclib_id, instrumental, plain, synced, language, found, fetched_at, edited, source, chosen)
+             VALUES (?, ?, 0, ?, ?, ?, 1, ?, 0, 'LRCLIB', 1)
+             ON CONFLICT(track_key) DO UPDATE SET
+                lrclib_id = excluded.lrclib_id, plain = excluded.plain, synced = excluded.synced,
+                language = excluded.language, instrumental = 0, found = 1,
+                fetched_at = excluded.fetched_at, edited = 0, source = 'LRCLIB', chosen = 1",))
+        .bind(&key)
+        .bind(record.id)
+        .bind(&plain)
+        .bind(&synced)
+        .bind(&language)
+        .bind(now)
+        .execute(&self.pool)
+        .await?;
+        Ok(Found::Lyrics { plain, synced, language })
+    }
+
+    /// Keep an LRCLIB record as the original-script companion of the words
+    /// held, without replacing them.
+    ///
+    /// For a lyric the user's own files hold in Latin letters: their words
+    /// stay the lyric (what a note quotes, what *Fix the words* edits), and
+    /// romanization is made from the companion instead. The caller has checked
+    /// that the two line up; [`Self::companion`] checks again on every read, so
+    /// held words that change later simply stop using it.
+    pub async fn set_companion(
+        &self,
+        artist: &str,
+        title: &str,
+        record: &LrcResponse,
+    ) -> Result<(), sqlx::Error> {
+        let key = Self::track_key(artist, title);
+        sqlx::query(&crate::sql!(
+            "UPDATE lyrics_cache SET native_plain = ?, native_synced = ?, native_lrclib_id = ?
+              WHERE track_key = ?",
+        ))
+        .bind(record.plain_lyrics.as_deref().map(str::trim).filter(|t| !t.is_empty()))
+        .bind(record.synced_lyrics.as_deref().map(str::trim).filter(|t| !t.is_empty()))
+        .bind(record.id)
+        .bind(&key)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Forget the original-script companion.
+    pub async fn clear_companion(&self, artist: &str, title: &str) -> Result<(), sqlx::Error> {
+        let key = Self::track_key(artist, title);
+        sqlx::query(&crate::sql!(
+            "UPDATE lyrics_cache SET native_plain = NULL, native_synced = NULL, native_lrclib_id = NULL
+              WHERE track_key = ?",
+        ))
+        .bind(&key)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// The original-script companion, when one is held **and still lines up**
+    /// with the words: same number of lines, or it is not used. A companion
+    /// paired to words that have since changed would put each romanized line
+    /// under a different line of the song — an alignment nobody measured.
+    pub async fn companion(&self, artist: &str, title: &str) -> Option<Companion> {
+        let key = Self::track_key(artist, title);
+        type Row = (Option<String>, Option<String>, Option<String>, Option<String>, Option<i64>);
+        let (plain, synced, nplain, nsynced, id): Row = sqlx::query_as(&crate::sql!(
+            "SELECT plain, synced, native_plain, native_synced, native_lrclib_id
+               FROM lyrics_cache WHERE track_key = ? AND found = 1",
+        ))
+        .bind(&key)
+        .fetch_optional(&self.pool)
+        .await
+        .ok()
+        .flatten()?;
+        if nplain.is_none() && nsynced.is_none() {
+            return None;
+        }
+        let held = parse_lines(plain.as_deref(), synced.as_deref()).len();
+        let lines = parse_lines(nplain.as_deref(), nsynced.as_deref());
+        let lines_up = lines.len() == held;
+        Some(Companion {
+            language: language_of(nplain.as_deref(), nsynced.as_deref()).map(str::to_string),
+            lines: lines.into_iter().map(|l| l.text).collect(),
+            lrclib_id: id,
+            lines_up,
+        })
+    }
+
+    /// The lyric in Latin letters, line for line with [`parse_lines`] — `None`
+    /// where a line had nothing to romanize, and `None` overall when the lyric
+    /// is in no script this romanizes (or there are no words).
+    ///
+    /// Made on first read and stored; a stored one is served while its
+    /// romanizer version and the words it was made from are unchanged.
+    pub async fn romanized(
+        &self,
+        artist: &str,
+        title: &str,
+        opts: crate::romanize::Options,
+    ) -> Option<Romanized> {
+        let Found::Lyrics { plain, synced, language } = self.cached(artist, title).await? else {
+            return None;
+        };
+        // From the original-script companion when one lines up with the words,
+        // otherwise from the words themselves.
+        let (texts, language, from_companion) = match self.companion(artist, title).await {
+            Some(c) if c.lines_up && crate::romanize::supports(c.language.as_deref()) => {
+                (c.lines, c.language, true)
+            }
+            _ => (
+                parse_lines(plain.as_deref(), synced.as_deref())
+                    .into_iter()
+                    .map(|l| l.text)
+                    .collect(),
+                language,
+                false,
+            ),
+        };
+        if !crate::romanize::supports(language.as_deref()) {
+            return None;
+        }
+
+        let key = Self::track_key(artist, title);
+        let hash = {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            texts.hash(&mut h);
+            language.hash(&mut h);
+            format!("{:016x}", h.finish())
+        };
+        let stored: Option<(i64, String, String)> = sqlx::query_as(&crate::sql!(
+            "SELECT version, source_hash, lines FROM lyrics_romanized
+              WHERE track_key = ? AND options = ?",
+        ))
+        .bind(&key)
+        .bind(opts.key())
+        .fetch_optional(&self.pool)
+        .await
+        .ok()
+        .flatten();
+        if let Some((version, h, json)) = stored {
+            if version == crate::romanize::VERSION && h == hash {
+                if let Ok(lines) = serde_json::from_str(&json) {
+                    return Some(Romanized { lines, language, from_companion });
+                }
+            }
+        }
+
+        let refs: Vec<&str> = texts.iter().map(String::as_str).collect();
+        let lines = crate::romanize::lyric(&refs, language.as_deref(), opts);
+        let json = serde_json::to_string(&lines).ok()?;
+        // Not stored is not fatal: it is made again next time.
+        let _ = sqlx::query(&crate::sql!(
+            "INSERT INTO lyrics_romanized (track_key, options, version, source_hash, lines, created_at)
+             VALUES (?, ?, ?, ?, ?, ?)
+             ON CONFLICT(track_key, options) DO UPDATE SET
+                version = excluded.version, source_hash = excluded.source_hash,
+                lines = excluded.lines, created_at = excluded.created_at",
+        ))
+        .bind(&key)
+        .bind(opts.key())
+        .bind(crate::romanize::VERSION)
+        .bind(&hash)
+        .bind(&json)
+        .bind(crate::db::Database::now_secs())
+        .execute(&self.pool)
+        .await;
+        Some(Romanized { lines, language, from_companion })
+    }
+
     /// What else LRCLIB holds for this track.
     ///
     /// **Not a version history**, which is what the design's `LRCLIB v3 ▾`
@@ -634,10 +959,10 @@ impl LyricsClient {
     ///
     /// Candidates with no words are dropped rather than shown: the whole
     /// gesture is "these are the wrong words, give me the other ones", and an
-    /// instrumental record cannot answer it. Adopting one goes through the
-    /// ordinary correction path, so it is marked `edited` and survives every
-    /// later fetch — and it reports the line count either side, because a
-    /// reference is an index and a different record renumbers every quote.
+    /// instrumental record cannot answer it. Adopting one is [`Self::adopt`],
+    /// by record id: it is marked `chosen` and survives every later fetch, and
+    /// the endpoint reports the line count either side, because a reference is
+    /// an index and a different record renumbers every quote.
     pub async fn search(&self, artist: &str, title: &str) -> Result<Vec<LrcResponse>, LyricsError> {
         let url = format!(
             "{}/api/search?artist_name={}&track_name={}",
@@ -683,8 +1008,9 @@ impl LyricsClient {
         // the rule for two fetches; between a fetch and something a person
         // typed, the person wins — the same trade `apply_durations` makes on
         // the shelf, where a running time somebody supplied survives every
-        // lookup after it.
-        if self.is_edited(artist, title).await {
+        // lookup after it. A record picked from *Other versions* is the same
+        // kind of answer.
+        if self.is_kept(artist, title).await {
             return;
         }
         let now = crate::db::Database::now_secs();
@@ -799,6 +1125,119 @@ mod tests {
             )
             .await
             .unwrap()
+    }
+
+    fn record(id: i64, plain: &str) -> LrcResponse {
+        LrcResponse {
+            id: Some(id),
+            track_name: Some("꽃".into()),
+            artist_name: Some("JISOO".into()),
+            album_name: Some("ME".into()),
+            duration: Some(173.0),
+            instrumental: false,
+            plain_lyrics: Some(plain.into()),
+            synced_lyrics: None,
+        }
+    }
+
+    /// A record picked from *Other versions* is LRCLIB's, it survives what
+    /// comes after it, and typing over it is still possible.
+    ///
+    /// The bug this pins: adopting went through `set_words`, so the reader
+    /// said "Words via You" about a stranger's upload and the record id was
+    /// lost. And the case that made it urgent — library words (a Plex tag)
+    /// arriving on the next poll — must not quietly undo the pick.
+    #[tokio::test]
+    async fn a_chosen_record_is_credited_to_lrclib_and_kept() {
+        let pool = testpool().await;
+        let c = LyricsClient::new(pool).await.unwrap();
+
+        c.remember_library("JISOO", "꽃", Some("Kkothyanggiman".into()), None, "Plex")
+            .await
+            .unwrap();
+        c.adopt("JISOO", "꽃", &record(2312642, "꽃향기만 남기고 갔단다")).await.unwrap();
+
+        let held = c.held("JISOO", "꽃").await.unwrap();
+        assert_eq!(held.source.as_deref(), Some("LRCLIB"), "a pick is LRCLIB's words, not yours");
+        assert_eq!(held.lrclib_id, Some(2312642));
+        assert!(held.chosen && !held.edited);
+        assert!(matches!(
+            c.cached("JISOO", "꽃").await,
+            Some(Found::Lyrics { language: Some(ref l), .. }) if l == "Korean"
+        ));
+
+        // The next library poll and the next fetch both leave it alone.
+        c.remember_library("JISOO", "꽃", Some("Kkothyanggiman".into()), None, "Plex")
+            .await
+            .unwrap();
+        c.remember("JISOO", "꽃", Some((&Found::Instrumental, Some(1)))).await;
+        let held = c.held("JISOO", "꽃").await.unwrap();
+        assert_eq!((held.source.as_deref(), held.lrclib_id), (Some("LRCLIB"), Some(2312642)));
+        assert!(matches!(c.cached("JISOO", "꽃").await, Some(Found::Lyrics { .. })));
+
+        // Typing over a pick is a correction like any other, and it is yours.
+        c.set_words("JISOO", "꽃", Some("my own words"), None).await.unwrap();
+        let held = c.held("JISOO", "꽃").await.unwrap();
+        assert_eq!(held.source.as_deref(), Some("You"));
+        assert_eq!(held.lrclib_id, None, "typed words are no LRCLIB record");
+        assert!(held.edited && !held.chosen);
+    }
+
+    /// The 꽃 case end to end in the cache: tagged words in Latin letters give
+    /// no romanization; an original-script companion that lines up does, line
+    /// for line; and one that stops lining up is not used.
+    #[tokio::test]
+    async fn a_companion_romanizes_words_held_in_latin_letters() {
+        let pool = testpool().await;
+        let c = LyricsClient::new(pool).await.unwrap();
+        let opts = crate::romanize::Options::default();
+        c.remember_library(
+            "JISOO",
+            "꽃",
+            Some("Kkothyanggiman\n\nnamgigo gatdanda".into()),
+            None,
+            "Plex",
+        )
+        .await
+        .unwrap();
+        assert!(
+            c.romanized("JISOO", "꽃", opts).await.is_none(),
+            "Latin words have nothing to romanize"
+        );
+
+        c.set_companion("JISOO", "꽃", &record(2312642, "꽃향기만\n\n남기고 갔단다"))
+            .await
+            .unwrap();
+        let r = c.romanized("JISOO", "꽃", opts).await.expect("romanized from the companion");
+        assert!(r.from_companion);
+        assert_eq!(r.lines.len(), 3, "one per line of the held words, blanks included");
+        assert_eq!(r.lines[0].as_ref().unwrap().text, "kkotyanggiman");
+        assert!(r.lines[1].is_none(), "a stanza break needs none");
+        assert_eq!(r.lines[2].as_ref().unwrap().text, "namgigo gattanda");
+        // Served from storage the second time, the same.
+        assert_eq!(c.romanized("JISOO", "꽃", opts).await.unwrap().lines, r.lines);
+
+        // The held words change to a different line count: the companion no
+        // longer lines up and is not used.
+        c.remember_library("JISOO", "꽃", Some("one line now".into()), None, "Plex").await.unwrap();
+        assert!(!c.companion("JISOO", "꽃").await.unwrap().lines_up);
+        assert!(c.romanized("JISOO", "꽃", opts).await.is_none());
+    }
+
+    /// Library words are not an LRCLIB record, so they must not inherit the
+    /// id of the record they replace — or *Other versions* would mark that
+    /// record "held now" over a Plex lyric.
+    #[tokio::test]
+    async fn library_words_drop_the_lrclib_id_they_replace() {
+        let pool = testpool().await;
+        let c = LyricsClient::new(pool).await.unwrap();
+        let found = Found::Lyrics { plain: Some("words".into()), synced: None, language: None };
+        c.remember("A", "t", Some((&found, Some(77)))).await;
+        assert_eq!(c.held("A", "t").await.unwrap().lrclib_id, Some(77));
+
+        c.remember_library("A", "t", Some("tagged words".into()), None, "Plex").await.unwrap();
+        let held = c.held("A", "t").await.unwrap();
+        assert_eq!((held.source.as_deref(), held.lrclib_id), (Some("Plex"), None));
     }
 
     /// Words carry who they came from, and a miss carries nobody.
@@ -1099,6 +1538,7 @@ mod tests {
         assert_eq!(r.id, Some(3396226));
         assert_eq!(r.track_name.as_deref(), Some("I Want to Live"));
         assert_eq!(r.artist_name.as_deref(), Some("Borislav Slavov"));
+        assert_eq!(r.album_name.as_deref(), Some("Baldur's Gate 3"));
         assert_eq!(r.duration, Some(233.0));
         assert!(r.plain_lyrics.is_some() && r.synced_lyrics.is_some());
     }

@@ -50,7 +50,10 @@ echo "→ ${HOST}: ${ROLE}, ~/${DIR}, port ${PORT}"
 # the way it does.
 scp $SSHOPTS "$UNIT" "${HOST}:/tmp/tapedeck-user.service"
 
-ssh $SSHOPTS "$HOST" bash -s -- "$DIR" "$SERVICE" "$PORT" "$PUBLIC_URL" "$REPLICA_LINE" <<'REMOTE'
+# ssh joins its arguments into one command line for the remote shell, so each
+# is quoted here: the demo/production REPLICA_LINE starts with "#", and unquoted
+# the remote shell read it as a comment and lost the argument ("$5: unbound").
+ssh $SSHOPTS "$HOST" bash -s -- "$(printf '%q ' "$DIR" "$SERVICE" "$PORT" "$PUBLIC_URL" "$REPLICA_LINE")" <<'REMOTE'
 set -euo pipefail
 DIR="$1"; SERVICE="$2"; PORT="$3"; PUBLIC_URL="$4"; REPLICA_LINE="$5"
 
