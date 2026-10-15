@@ -40,7 +40,7 @@ const SCRIPTS: &[(u32, u32, &str)] = &[
 ];
 
 /// Which of the named scripts a character belongs to, if any.
-fn script_of(c: char) -> Option<&'static str> {
+pub(crate) fn script_of(c: char) -> Option<&'static str> {
     let u = c as u32;
     SCRIPTS.iter().find(|(lo, hi, _)| u >= *lo && u <= *hi).map(|(_, _, name)| *name)
 }

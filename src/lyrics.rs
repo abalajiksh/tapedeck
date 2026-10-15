@@ -883,22 +883,22 @@ impl LyricsClient {
         };
         // From the original-script companion when one lines up with the words,
         // otherwise from the words themselves.
-        let (texts, language, from_companion) = match self.companion(artist, title).await {
-            Some(c) if c.lines_up && crate::romanize::supports(c.language.as_deref()) => {
-                (c.lines, c.language, true)
-            }
-            _ => (
-                parse_lines(plain.as_deref(), synced.as_deref())
+        let companion = self.companion(artist, title).await.filter(|c| c.lines_up).and_then(|c| {
+            let language = crate::romanize::language_for(c.language.as_deref(), &c.lines)?;
+            Some((c.lines, language))
+        });
+        let (texts, language, from_companion) = match companion {
+            Some((lines, language)) => (lines, language, true),
+            None => {
+                let texts: Vec<String> = parse_lines(plain.as_deref(), synced.as_deref())
                     .into_iter()
                     .map(|l| l.text)
-                    .collect(),
-                language,
-                false,
-            ),
+                    .collect();
+                let language = crate::romanize::language_for(language.as_deref(), &texts)?;
+                (texts, language, false)
+            }
         };
-        if !crate::romanize::supports(language.as_deref()) {
-            return None;
-        }
+        let language = Some(language);
 
         let key = Self::track_key(artist, title);
         let hash = {

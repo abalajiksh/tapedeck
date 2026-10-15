@@ -82,7 +82,7 @@ info:
   license:
     name: AGPL-3.0-or-later
     identifier: AGPL-3.0-or-later
-  version: 0.121.0
+  version: 0.122.0
 servers:
 - url: /
   description: The Tapedeck instance serving this document.
@@ -18602,6 +18602,9 @@ components:
         lyrics_indic_style:
           type: string
           description: 'How Indian scripts are romanized in the lyrics reader: `readable` (lyric-site spelling, the default) or `iso` (ISO 15919).'
+        lyrics_cyrillic_style:
+          type: string
+          description: 'How Russian is romanized in the lyrics reader: `readable` (Wikipedia''s spelling, the default) or `iso` (ISO 9).'
         lyrics_macrons:
           type: boolean
           description: Romanized Japanese with macrons (Tōkyō) rather than spelled out (toukyou). False when unset.
@@ -20001,6 +20004,7 @@ components:
       description: How a lyric was romanized.
       required:
       - indic
+      - cyrillic
       - macrons
       - from_companion
       - kanji
@@ -20013,6 +20017,9 @@ components:
         indic:
           type: string
           description: '`readable` or `iso`, from the `lyrics_indic_style` preference.'
+        cyrillic:
+          type: string
+          description: '`readable` or `iso`, from the `lyrics_cyrillic_style` preference.'
         macrons:
           type: boolean
           description: Japanese long vowels with macrons, from the `lyrics_macrons` preference.

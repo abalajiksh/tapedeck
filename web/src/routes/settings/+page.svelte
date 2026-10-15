@@ -789,6 +789,19 @@
 		}
 	}
 
+	// How Russian is romanized: Wikipedia's spelling or ISO 9.
+	let cyrillicStyle: 'readable' | 'iso' = 'readable';
+	let cyrillicSaved = false;
+	async function saveCyrillicStyle() {
+		cyrillicSaved = false;
+		try {
+			await api.putPreferences({ lyrics_cyrillic_style: cyrillicStyle });
+			cyrillicSaved = true;
+		} catch (e) {
+			alert(String(e).replace(/^API \d+: /, ''));
+		}
+	}
+
 	// artwork
 	let artStatus: { total: number; resolved: number; pending: number } | null = null;
 	let fetchingArt = false;
@@ -1498,6 +1511,7 @@
 			if (typeof prefs.scrobble_threshold_secs === 'number')
 				thresholdSecs = Math.min(3600, Math.max(10, Math.round(prefs.scrobble_threshold_secs)));
 			if (prefs.lyrics_indic_style === 'iso') indicStyle = 'iso';
+			if (prefs.lyrics_cyrillic_style === 'iso') cyrillicStyle = 'iso';
 		} catch { timezone = 'UTC'; }
 		try { isAdmin = (await api.me()).is_admin; } catch { /* optional */ }
 		loadProfile();
@@ -3606,6 +3620,21 @@
 						as it is sung, Japanese in Hepburn (macrons are a toggle in the reader) and Chinese in
 						pinyin. Choose what the reader shows — the original, Latin letters, or both — in the
 						reader itself.
+					</p>
+
+					<label for="cyrillic-style" style="display:block;font-size:13px;font-weight:600;margin:14px 0 6px;">
+						Romanizing Russian
+					</label>
+					<div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;">
+						<select id="cyrillic-style" class="input" style="max-width:340px;" bind:value={cyrillicStyle} on:change={saveCyrillicStyle}>
+							<option value="readable">Readable — as lyric sites spell it (moy marmeladny)</option>
+							<option value="iso">ISO 9 — one letter for each, with diacritics (moj marmeladnyj)</option>
+						</select>
+						{#if cyrillicSaved}<span style="font-size:12px;color:var(--td-muted-3);">Saved</span>{/if}
+					</div>
+					<p style="font-size:12px;color:var(--td-muted-3);margin:8px 0 0;max-width:66ch;">
+						Spelled as written, not as sung. Ukrainian, Serbian and other languages written in
+						Cyrillic are left as they are rather than read with Russian's rules.
 					</p>
 				</div>
 			</div>

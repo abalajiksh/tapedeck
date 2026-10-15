@@ -70,6 +70,10 @@ impl utoipa::PartialSchema for Preferences {
                 prop(Type::String, "How Indian scripts are romanized in the lyrics reader: `readable` (lyric-site spelling, the default) or `iso` (ISO 15919)."),
             )
             .property(
+                "lyrics_cyrillic_style",
+                prop(Type::String, "How Russian is romanized in the lyrics reader: `readable` (Wikipedia's spelling, the default) or `iso` (ISO 9)."),
+            )
+            .property(
                 "lyrics_macrons",
                 prop(Type::Boolean, "Romanized Japanese with macrons (Tōkyō) rather than spelled out (toukyou). False when unset."),
             )
