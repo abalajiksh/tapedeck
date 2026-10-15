@@ -8,7 +8,10 @@
 #   tapedeck-<ver>/            git archive of <ref>
 #   tapedeck-<ver>/static/     the SvelteKit UI, built here with bun
 #   tapedeck-<ver>/vendor/     every crate in Cargo.lock (`cargo vendor`)
-#   tapedeck-<ver>/.cargo/config.toml   source replacement onto vendor/
+#   tapedeck-<ver>/lindera-cache/  the dictionary archives lindera's build
+#                              scripts would otherwise download
+#   tapedeck-<ver>/.cargo/config.toml   source replacement onto vendor/, and
+#                              LINDERA_BUILD_DICTIONARY_CACHE_DIR
 #
 # The UI is prebuilt because no distro OBS targets packages bun. The package
 # build sets TAPEDECK_SKIP_WEB_BUILD=1, which is build.rs's own escape hatch,
@@ -201,6 +204,82 @@ PY
 # The stubs must still resolve exactly as the lockfile says.
 ( cd "$STAGE" && cargo metadata --locked --offline --format-version 1 "${FILTER_ARGS[@]}" >/dev/null ) \
     || { echo "error: the vendored tree no longer resolves" >&2; exit 1; }
+
+# ── lindera's dictionaries ──────────────────────────────────────────────────
+# The `cjk` feature's dictionary crates (lindera-ipadic, lindera-cc-cedict)
+# DOWNLOAD their MeCab sources in build.rs, which vendoring does not capture
+# and OBS cannot do: v0.121.0 failed on every repository with "Failed to
+# download dictionary assets". lindera skips the download when
+# LINDERA_BUILD_DICTIONARY_CACHE_DIR holds the archive at
+# <dir>/<crate version>-fmt<format version>/<file>, MD5-checked against the
+# hash its build.rs pins, so the archives are fetched here and the variable is
+# set through [env] in the vendored config, which cargo hands to build scripts
+# in every recipe (spec, debian.rules, PKGBUILD) without touching them.
+#
+# Read from the vendored build.rs rather than written down here, so a lindera
+# upgrade brings its new archive along instead of silently missing it.
+echo ">> fetching lindera dictionaries"
+python3 - "$STAGE" "${XDG_CACHE_HOME:-$HOME/.cache}/tapedeck-obs" <<'PY'
+import glob, hashlib, os, re, shutil, sys, tomllib, urllib.request
+stage, cache = sys.argv[1:]
+vendor = os.path.join(stage, "vendor")
+meta_rs = os.path.join(vendor, "lindera-dictionary", "src", "dictionary", "metadata.rs")
+fmt = re.search(r"DICTIONARY_FORMAT_VERSION:\s*u32\s*=\s*(\d+)", open(meta_rs).read())
+if not fmt:
+    sys.exit(f"error: no DICTIONARY_FORMAT_VERSION in {meta_rs}")
+fmt = fmt.group(1)
+
+def md5(path):
+    h = hashlib.md5()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+found = 0
+for build_rs in sorted(glob.glob(os.path.join(vendor, "lindera-*", "build.rs"))):
+    src = open(build_rs).read()
+    name = re.search(r'file_name:\s*"([^"]+)"', src)
+    if not name:
+        continue  # not a dictionary crate, or a stub for another platform
+    want = re.search(r'md5_hash:\s*"([0-9a-f]{32})"', src).group(1)
+    urls = re.findall(r'"(https?://[^"]+)"', re.search(r"download_urls:\s*&\[(.*?)\]", src, re.S).group(1))
+    crate_dir = os.path.dirname(build_rs)
+    version = tomllib.load(open(os.path.join(crate_dir, "Cargo.toml"), "rb"))["package"]["version"]
+    name = name.group(1)
+
+    # A local copy outside the tarball, so each release does not refetch.
+    os.makedirs(cache, exist_ok=True)
+    cached = os.path.join(cache, name)
+    if not (os.path.exists(cached) and md5(cached) == want):
+        for url in urls:
+            # lindera.dev answers Python's default User-Agent with a 403.
+            req = urllib.request.Request(url, headers={"User-Agent": "tapedeck-obs-source"})
+            try:
+                with urllib.request.urlopen(req, timeout=120) as r, open(cached + ".part", "wb") as f:
+                    shutil.copyfileobj(r, f)
+                if md5(cached + ".part") == want:
+                    os.replace(cached + ".part", cached)
+                    break
+                print(f"   {url}: MD5 mismatch", file=sys.stderr)
+            except OSError as e:
+                print(f"   {url}: {e}", file=sys.stderr)
+        else:
+            sys.exit(f"error: could not fetch {name} for {os.path.basename(crate_dir)}")
+    dest = os.path.join(stage, "lindera-cache", f"{version}-fmt{fmt}")
+    os.makedirs(dest, exist_ok=True)
+    shutil.copyfile(cached, os.path.join(dest, name))
+    print(f"   {os.path.basename(crate_dir)} {version}: {name}")
+    found += 1
+if found == 0:
+    sys.exit("error: no lindera dictionary crate found in vendor/ — has the cjk feature moved?")
+PY
+cat >> "$STAGE/.cargo/config.toml" <<'EOF'
+
+# lindera's dictionary archives, shipped in the tarball (see make_obs_source.sh).
+[env]
+LINDERA_BUILD_DICTIONARY_CACHE_DIR = { value = "lindera-cache", relative = true }
+EOF
 
 # ── Deterministic tar.gz ────────────────────────────────────────────────────
 # Python rather than tar flags: macOS ships bsdtar, whose options differ from

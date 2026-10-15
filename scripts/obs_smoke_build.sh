@@ -8,7 +8,8 @@
 #   1. extract it OUTSIDE any git checkout
 #   2. `cargo build --release --frozen` with an EMPTY CARGO_HOME, so no
 #      registry cache on the host can quietly supply a crate the tarball
-#      forgot to vendor (or that the Linux-only stubbing emptied)
+#      forgot to vendor (or that the Linux-only stubbing emptied), inside an
+#      empty network namespace so no build script can download either
 #   3. check the embedded UI made it into the binary
 #   4. start the binary as a replica on a free loopback port, in an empty
 #      state directory, and require /health to answer "ok" with the version
@@ -54,7 +55,17 @@ mkdir -p "$WORK/cargo-home"
     export CARGO_HOME="$WORK/cargo-home" CARGO_NET_OFFLINE=true
     export TAPEDECK_SKIP_WEB_BUILD=1
     export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$WORK/target}"
-    cargo build --release --frozen
+    # CARGO_NET_OFFLINE stops cargo, not a build script: lindera's fetched its
+    # dictionaries over HTTP right through it, so this passed for v0.121.0 and
+    # OBS then failed everywhere. A network namespace with nothing in it is
+    # what OBS actually gives a build.
+    if unshare --user --map-root-user --net true 2>/dev/null; then
+        unshare --user --map-root-user --net cargo build --release --frozen
+    else
+        echo "warning: cannot unshare a network namespace here; build scripts" \
+             "still have network, so this does not prove an offline build" >&2
+        cargo build --release --frozen
+    fi
     install -m755 "$CARGO_TARGET_DIR/release/tapedeck" "$WORK/tapedeck"
 )
 BIN="$WORK/tapedeck"
