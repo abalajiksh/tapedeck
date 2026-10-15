@@ -16,6 +16,13 @@ enabled repository/arch of PACKAGE is:
 Exits 0 when all are, 1 as soon as any build fails / is unresolvable / broken
 (printing the repositories concerned and the build-log command), 2 on timeout.
 "disabled" and "excluded" repositories are ignored.
+
+A failure is only final when it belongs to THIS upload. For the minutes after
+a commit, OBS goes on reporting the previous revision's result -- "failed" as
+readily as "succeeded" -- until the scheduler gets to the new sources. v0.122.0
+was declared failed on all 13 repositories four seconds after its upload, on
+v0.121.0's failures. So a failed repository is pending unless the newest job
+in its history was built from the package's current srcmd5.
 """
 
 import argparse
@@ -55,6 +62,7 @@ def main():
 
         if res is not None:
             pending, failed, done = [], [], []
+            srcmd5 = None
             for r in res.findall("result"):
                 where = f"{r.get('repository')}/{r.get('arch')}"
                 st = r.find("status")
@@ -62,7 +70,15 @@ def main():
                 if code in IGNORED:
                     continue
                 if code in FAILED:
-                    failed.append(f"{where}: {code}")
+                    if srcmd5 is None:
+                        srcmd5 = osc_api(a.osc_config, f"/source/{a.project}/{a.package}").get("srcmd5")
+                    jobs = osc_api(a.osc_config, f"/build/{a.project}/{r.get('repository')}"
+                                                 f"/{r.get('arch')}/_jobhistory?package={a.package}&limit=1"
+                                   ).findall("jobhist")
+                    if r.get("dirty") == "true" or not jobs or jobs[-1].get("srcmd5") != srcmd5:
+                        pending.append(f"{where}: {code}, but before this upload")
+                    else:
+                        failed.append(f"{where}: {code}")
                 elif code != "succeeded" or r.get("dirty") == "true":
                     pending.append(f"{where}: {code}{' (dirty)' if r.get('dirty') else ''}")
                 else:
