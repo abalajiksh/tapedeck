@@ -1289,6 +1289,7 @@ export interface LyricDoc {
 	romanization?: {
 		language: string | null;
 		indic: 'readable' | 'iso';
+		cyrillic: 'readable' | 'iso';
 		macrons: boolean;
 		/** Made from the original-script companion, not the words shown. */
 		from_companion: boolean;

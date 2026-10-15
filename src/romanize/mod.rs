@@ -2,9 +2,10 @@
 //! not read.
 //!
 //! Native Rust throughout, by decision: no Python, no subprocess. The rules are
-//! ported from three reference implementations, each credited in its module —
+//! ported from reference implementations, each credited in its module —
 //! Aksharamukha for the Indic scripts, cutlet for Japanese, korean-romanizer
-//! for Korean (with its pronunciation bugs fixed rather than copied).
+//! for Korean (with its pronunciation bugs fixed rather than copied), iuliia
+//! for Russian.
 //!
 //! ## Line for line, always
 //!
@@ -16,12 +17,13 @@
 //! ## Words and parts
 //!
 //! A line comes back as words, and a word as *parts*: one Hangul block, one
-//! Japanese or Chinese token, one Indic word. The reader draws the parts
+//! Japanese or Chinese token, one Indic or Russian word. The reader draws the parts
 //! three ways — joined (plain text), with a dot between syllables (Korean,
 //! sung syllable by syllable), and under their original (the interlinear
 //! "both" view) — so the split is data rather than something a client has to
 //! work out again.
 
+mod cyrillic;
 mod indic;
 #[allow(clippy::all)]
 mod indic_tables;
@@ -38,7 +40,7 @@ use utoipa::ToSchema;
 
 /// Bumped whenever any romanizer's output changes, so stored romanizations
 /// are recomputed rather than served stale.
-pub const VERSION: i64 = 2;
+pub const VERSION: i64 = 3;
 
 /// One unit drawn under its original in the interlinear view.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
@@ -98,10 +100,38 @@ impl IndicStyle {
     }
 }
 
+/// How Russian is written.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CyrillicStyle {
+    /// Wikipedia's scheme: no diacritics, the spelling lyric sites use
+    /// (Yuliya, kazhetsya, marmeladny).
+    #[default]
+    Readable,
+    /// ISO 9, one Latin letter per Cyrillic one (Ûliâ, kažetsâ).
+    Iso,
+}
+
+impl CyrillicStyle {
+    pub fn parse(s: &str) -> Self {
+        if s.eq_ignore_ascii_case("iso") {
+            Self::Iso
+        } else {
+            Self::Readable
+        }
+    }
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Readable => "readable",
+            Self::Iso => "iso",
+        }
+    }
+}
+
 /// The choices a reader can make.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Options {
     pub indic: IndicStyle,
+    pub cyrillic: CyrillicStyle,
     /// Japanese long vowels with macrons (Tōkyō) rather than spelled out
     /// (toukyou).
     pub macrons: bool,
@@ -109,8 +139,16 @@ pub struct Options {
 
 impl Options {
     /// A short stable name, part of the key a romanization is stored under.
+    ///
+    /// Each choice is in the key only when it is not the default, so a key
+    /// written before a choice existed still names the same romanization.
     pub fn key(self) -> String {
-        format!("{}{}", self.indic.as_str(), if self.macrons { "+macrons" } else { "" })
+        format!(
+            "{}{}{}",
+            self.indic.as_str(),
+            if self.cyrillic == CyrillicStyle::Iso { "+cyr-iso" } else { "" },
+            if self.macrons { "+macrons" } else { "" }
+        )
     }
 }
 
@@ -121,6 +159,7 @@ enum Class {
     /// Kana, kanji/hanzi and the CJK marks that travel with them.
     Cjk,
     Indic(indic::Script),
+    Cyrillic,
     /// Whitespace, including the ideographic space.
     Space,
     /// Anything else: Latin, digits, punctuation. Carried as it is.
@@ -148,6 +187,9 @@ fn class_of(c: char) -> Class {
     if let Some(s) = indic::Script::of(c) {
         return Class::Indic(s);
     }
+    if (0x0400..=0x04FF).contains(&u) {
+        return Class::Cyrillic;
+    }
     Class::Other
 }
 
@@ -167,8 +209,48 @@ pub fn supports(language: Option<&str>) -> bool {
                 | "Bengali"
                 | "Gujarati"
                 | "Punjabi"
+                | "Russian"
         )
     )
+}
+
+/// The language to romanize a lyric as, or `None` when there is nothing this
+/// module should romanize in it.
+///
+/// `language` is the lyric-level reading, which needs a script to be a fifth
+/// of the letters before it names one — right for *what language is this
+/// song*, wrong for *is there anything here to romanize*. "APT." is mostly
+/// English with forty lines of 아파트; its language is unresolved and every
+/// one of those lines still wants Latin letters. So when the lyric's language
+/// is not one romanized here, the most frequent script that is wins, however
+/// small its share.
+///
+/// Russian is checked the other way: Cyrillic is named "Russian" by codepoint,
+/// and a lyric with a letter only Ukrainian, Serbian or another neighbour uses
+/// is not romanized with Russian's rules.
+pub fn language_for<S: AsRef<str>>(language: Option<&str>, lines: &[S]) -> Option<String> {
+    let chars = || lines.iter().flat_map(|l| l.as_ref().chars());
+    let chosen = if supports(language) {
+        language.map(str::to_string)
+    } else {
+        let mut counts: Vec<(&'static str, usize)> = Vec::new();
+        for name in chars().filter_map(crate::language::script_of) {
+            match counts.iter_mut().find(|(n, _)| *n == name) {
+                Some((_, n)) => *n += 1,
+                None => counts.push((name, 1)),
+            }
+        }
+        counts.retain(|(n, _)| supports(Some(n)));
+        // Kana settles Japanese against Chinese however many kanji there are:
+        // Chinese has none.
+        let kana = counts.iter().any(|(n, _)| *n == "Japanese");
+        counts.retain(|(n, _)| !(kana && *n == "Chinese"));
+        counts.into_iter().max_by_key(|(_, n)| *n).map(|(n, _)| n.to_string())
+    }?;
+    if chosen == "Russian" && chars().any(cyrillic::not_russian) {
+        return None;
+    }
+    Some(chosen)
 }
 
 /// Romanize a lyric, line for line.
@@ -205,7 +287,9 @@ fn line(text: &str, cjk: CjkMode, opts: Options) -> Option<RomanLine> {
     // same text as its composed form. NFKC would be wrong here: it rewrites
     // full-width punctuation the reader should see as written.
     let text: String = text.nfc().collect();
-    if !text.chars().any(|c| matches!(class_of(c), Class::Hangul | Class::Cjk | Class::Indic(_))) {
+    if !text.chars().any(|c| {
+        matches!(class_of(c), Class::Hangul | Class::Cjk | Class::Indic(_) | Class::Cyrillic)
+    }) {
         return None;
     }
 
@@ -219,6 +303,7 @@ fn line(text: &str, cjk: CjkMode, opts: Options) -> Option<RomanLine> {
             let produced: Vec<Word> = match class {
                 Class::Hangul => vec![korean::word(&run)],
                 Class::Indic(script) => vec![indic::word(&run, script, opts.indic)],
+                Class::Cyrillic => vec![cyrillic::word(&run, opts.cyrillic)],
                 Class::Cjk => cjk_words(&run, cjk, opts),
                 Class::Other | Class::Space => {
                     // Carried as written. Bare punctuation is glued to what it
@@ -285,7 +370,8 @@ fn ascii_punct(s: &str) -> String {
 }
 
 /// Split a chunk into maximal runs of one class. Indic combining marks and
-/// joiners stay with the script they modify.
+/// joiners stay with the script they modify, and so does a stress mark on a
+/// Russian vowel (голова́), which NFC has no precomposed letter for.
 fn runs(chunk: &str) -> Vec<(Class, String)> {
     let mut out: Vec<(Class, String)> = Vec::new();
     for c in chunk.chars() {
@@ -295,6 +381,11 @@ fn runs(chunk: &str) -> Vec<(Class, String)> {
             if let Some((prev, _)) = out.last() {
                 class = *prev;
             }
+        }
+        if matches!(c, '\u{0300}' | '\u{0301}')
+            && out.last().is_some_and(|(prev, _)| *prev == Class::Cyrillic)
+        {
+            class = Class::Cyrillic;
         }
         match out.last_mut() {
             Some((prev, s)) if *prev == class => s.push(c),
@@ -364,6 +455,45 @@ mod tests {
     }
 
     #[test]
+    fn russian_in_both_styles() {
+        assert_eq!(
+            roman("Мой мармеладный, я не права", "Russian").as_deref(),
+            Some("Moy marmeladny, ya ne prava")
+        );
+        let iso = Options { cyrillic: CyrillicStyle::Iso, ..Options::default() };
+        let l = lyric(&["Опять мне кажется"], Some("Russian"), iso).remove(0).unwrap();
+        assert_eq!(l.text, "Opâtʹ mne kažetsâ");
+        // A hyphenated word stays one word, as कुछ-कुछ does.
+        assert_eq!(roman("муа-муа", "Russian").as_deref(), Some("mua-mua"));
+        // A stress mark stays on the original and off the Latin letters.
+        let l = lyric(&["голова́"], Some("Russian"), Options::default()).remove(0).unwrap();
+        assert_eq!((l.words[0].parts[0].o.as_str(), l.text.as_str()), ("голова́", "golova"));
+    }
+
+    /// "APT.": mostly English, so the lyric has no language, and its lines of
+    /// Hangul still want romanizing.
+    #[test]
+    fn a_lyric_with_no_language_is_romanized_by_the_script_it_has() {
+        let lines = [
+            "아파트, 아파트",
+            "Kissy face, kissy face, sent to your phone, but",
+            "I'm trying to kiss your lips for real",
+            "Don't you want me like I want you, baby?",
+        ];
+        assert_eq!(language_for(None, &lines).as_deref(), Some("Korean"));
+        assert_eq!(language_for(None, &["Only English here"]), None);
+        assert_eq!(language_for(Some("English/Other"), &["사랑"]).as_deref(), Some("Korean"));
+        // Kana makes it Japanese however many kanji there are.
+        assert_eq!(language_for(None, &["東京都庁の前で", "ね"]).as_deref(), Some("Japanese"));
+    }
+
+    #[test]
+    fn ukrainian_is_not_read_with_russian_rules() {
+        assert_eq!(language_for(Some("Russian"), &["Я їду до Києва"]), None);
+        assert_eq!(language_for(Some("Russian"), &["Я не права"]).as_deref(), Some("Russian"));
+    }
+
+    #[test]
     fn one_entry_per_line_blanks_included() {
         let out = lyric(&["꽃", "", "flower"], Some("Korean"), Options::default());
         assert_eq!(out.len(), 3);
@@ -385,7 +515,7 @@ fn print_samples() {
         let mut cur: Option<(String, String)> = None;
         for l in t.lines() {
             let head = l.split(':').next().unwrap_or("");
-            if ["Tamil", "Korean", "Japanese", "Hindi"].contains(&head) {
+            if ["Tamil", "Korean", "Japanese", "Hindi", "Russian"].contains(&head) {
                 if let Some(c) = cur.take() {
                     songs.push(c);
                 }
@@ -397,6 +527,9 @@ fn print_samples() {
         }
         songs.extend(cur);
     }
+    if let Ok(t) = std::fs::read_to_string(format!("{dir}ru_marmeladny.txt")) {
+        songs.push(("Russian".to_string(), t));
+    }
     for (lang, file) in [("Korean", "ko_flower.lrc"), ("Chinese", "zh_qingtian.lrc")] {
         if let Ok(t) = std::fs::read_to_string(format!("{dir}{file}")) {
             songs.push((lang.to_string(), crate::lyrics::strip_cues(&t)));
@@ -404,7 +537,10 @@ fn print_samples() {
     }
     for (lang, body) in songs {
         let lines: Vec<&str> = body.lines().collect();
-        for opts in [Options::default(), Options { indic: IndicStyle::Iso, macrons: true }] {
+        for opts in [
+            Options::default(),
+            Options { indic: IndicStyle::Iso, cyrillic: CyrillicStyle::Iso, macrons: true },
+        ] {
             println!("==== {lang} {}", opts.key());
             for (l, r) in lines.iter().zip(lyric(&lines, Some(&lang), opts)) {
                 match r {

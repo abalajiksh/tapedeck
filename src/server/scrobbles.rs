@@ -1696,6 +1696,7 @@ async fn lyric_document(
                 romanization: romanized.as_ref().map(|r| RomanizationInfo {
                     language: r.language.clone(),
                     indic: opts.indic.as_str(),
+                    cyrillic: opts.cyrillic.as_str(),
                     macrons: opts.macrons,
                     from_companion: r.from_companion,
                     kanji: cfg!(feature = "cjk"),
@@ -1859,6 +1860,8 @@ pub struct RomanizationInfo {
     pub language: Option<String>,
     /// `readable` or `iso`, from the `lyrics_indic_style` preference.
     pub indic: &'static str,
+    /// `readable` or `iso`, from the `lyrics_cyrillic_style` preference.
+    pub cyrillic: &'static str,
     /// Japanese long vowels with macrons, from the `lyrics_macrons` preference.
     pub macrons: bool,
     /// Made from the original-script companion rather than the words shown.
@@ -1877,8 +1880,8 @@ pub struct CompanionInfo {
     pub lines_up: bool,
 }
 
-/// The romanization a user has chosen, from their preferences: Indic style in
-/// Settings, Japanese macrons from the reader's toggle.
+/// The romanization a user has chosen, from their preferences: Indic and
+/// Russian styles in Settings, Japanese macrons from the reader's toggle.
 pub(crate) async fn romanize_options(
     state: &Arc<AppState>,
     user_id: i64,
@@ -1887,6 +1890,9 @@ pub(crate) async fn romanize_options(
     crate::romanize::Options {
         indic: crate::romanize::IndicStyle::parse(
             prefs.get("lyrics_indic_style").and_then(|v| v.as_str()).unwrap_or("readable"),
+        ),
+        cyrillic: crate::romanize::CyrillicStyle::parse(
+            prefs.get("lyrics_cyrillic_style").and_then(|v| v.as_str()).unwrap_or("readable"),
         ),
         macrons: prefs.get("lyrics_macrons").and_then(|v| v.as_bool()).unwrap_or(false),
     }
