@@ -1169,6 +1169,7 @@ impl Database {
         self.init_mcp().await?;
         self.init_saved_playlists().await?;
         self.init_crate().await?;
+        self.init_radio().await?;
 
         Ok(())
     }
@@ -1353,6 +1354,104 @@ impl Database {
         )
         .await?;
 
+        Ok(())
+    }
+    /// The Radio page's own tables: the listener's presets, each time they
+    /// tuned in, and the air log of what was heard.
+    ///
+    /// **A listen is still a row in `scrobbles`** — the air log is not a second
+    /// history. It is the record of what the station *said*, including what
+    /// was never a listen (a news break, a promo line, a track caught for ten
+    /// seconds) and what waits for a yes. `source_id` is how a logged line
+    /// points at the listen it became; a plain column rather than a foreign
+    /// key, so deleting a listen never needs to know the air log exists.
+    ///
+    /// `chain_id` is plain for the same reason: deleting a chain must not fail
+    /// because somebody once tuned in through it.
+    async fn init_radio(&self) -> Result<(), sqlx::Error> {
+        self.ddl(
+            "CREATE TABLE IF NOT EXISTS radio_presets (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL REFERENCES users(id),
+                -- `<gcc>.<pi>` from the station directory, e.g. `de0.d3c3`.
+                station_id TEXT NOT NULL,
+                name TEXT NOT NULL,
+                short_name TEXT,
+                band TEXT NOT NULL CHECK (band IN ('fm','dab')),
+                -- Where it sits on the dial: MHz for FM (`95.8`), the channel
+                -- block for DAB (`5C`). The listener's to type — SI.xml carries
+                -- neither — and optional: a preset without one still tunes.
+                dial TEXT,
+                city TEXT,
+                position INTEGER NOT NULL,
+                created_at INTEGER NOT NULL
+            )",
+        )
+        .await?;
+        self.ddl(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_radio_presets_station
+             ON radio_presets(user_id, station_id, band)",
+        )
+        .await?;
+
+        self.ddl(
+            "CREATE TABLE IF NOT EXISTS radio_sessions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL REFERENCES users(id),
+                station_id TEXT NOT NULL,
+                station_name TEXT NOT NULL,
+                band TEXT NOT NULL,
+                dial TEXT,
+                city TEXT,
+                chain_id INTEGER,
+                started_at INTEGER NOT NULL,
+                ended_at INTEGER,
+                -- 'off', 'auto_stop', 'retuned', 'restart'.
+                end_reason TEXT
+            )",
+        )
+        .await?;
+        self.ddl(
+            "CREATE INDEX IF NOT EXISTS idx_radio_sessions_user
+             ON radio_sessions(user_id, started_at DESC)",
+        )
+        .await?;
+
+        self.ddl(
+            "CREATE TABLE IF NOT EXISTS radio_air_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL REFERENCES users(id),
+                session_id INTEGER NOT NULL REFERENCES radio_sessions(id),
+                station_id TEXT NOT NULL,
+                station_name TEXT NOT NULL,
+                band TEXT NOT NULL,
+                started_at INTEGER NOT NULL,
+                ended_at INTEGER,
+                -- Exactly what the station sent.
+                raw TEXT NOT NULL,
+                artist TEXT,
+                title TEXT,
+                -- 'track': named, and MusicBrainz knows it. 'guess': named,
+                -- and nothing confirmed it. 'break': news, traffic, weather,
+                -- ads. 'other': anything else the station said.
+                kind TEXT NOT NULL CHECK (kind IN ('track','guess','break','other')),
+                -- Where the line came from: 'ICY' today; 'RT+', 'DL+' and
+                -- 'RadioText' once an off-air feeder exists.
+                source TEXT NOT NULL,
+                -- 'playing', 'scrobbled', 'review', 'kept', 'dropped', 'held',
+                -- 'partial', 'skipped', 'logged'. Free text, the UI owns it.
+                status TEXT NOT NULL,
+                -- The listen this became: `scrobbles.source_id`.
+                source_id TEXT,
+                mbid_recording TEXT
+            )",
+        )
+        .await?;
+        self.ddl(
+            "CREATE INDEX IF NOT EXISTS idx_radio_air_log_user
+             ON radio_air_log(user_id, started_at DESC)",
+        )
+        .await?;
         Ok(())
     }
     /// Playlists that live in Tapedeck rather than on a media server.

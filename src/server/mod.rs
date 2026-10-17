@@ -26,6 +26,7 @@ mod playlist_lab;
 pub mod playlists;
 mod preferences;
 pub mod public_np;
+mod radio;
 pub mod ratelimit;
 mod ratings;
 pub mod rediscovery;
@@ -101,6 +102,9 @@ pub struct AppState {
     /// is telling an admin to go and find it over SSH, which is the situation
     /// that panel exists to end.
     pub log_dir: String,
+    /// The station list and every running radio tuner. Tuners live here and
+    /// nowhere else, like now-playing: a restart ends them.
+    pub radio: crate::radio::Radio,
 }
 
 /// Every module's slice of the OpenAPI document, in the order the reference
@@ -144,6 +148,7 @@ pub fn api_docs() -> Vec<utoipa::openapi::OpenApi> {
         mcp::Api::openapi(),
         oauth::Api::openapi(),
         physical::Api::openapi(),
+        radio::Api::openapi(),
         patch::Api::openapi(),
     ]
 }
@@ -180,6 +185,7 @@ pub fn build_app(state: Arc<AppState>) -> Router {
         .merge(ops::create_ops_router())
         .merge(sessions::create_sessions_router())
         .merge(physical::create_physical_router())
+        .merge(radio::create_radio_router())
         .merge(rediscovery::create_rediscovery_router())
         .merge(playlists::create_playlists_router())
         .merge(playlist_lab::create_playlist_lab_router())

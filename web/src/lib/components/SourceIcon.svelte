@@ -18,11 +18,11 @@
 	export let size = 15;
 
 	// `source_name` is one of: Plex, jellyfin, emby, roon, navidrome, physical,
-	// rockbox, import, spotify, or `ingest:<client>`.
+	// rockbox, import, spotify, radio, or `ingest:<client>`.
 	$: key = (source ?? '').toLowerCase();
 	$: kind = key.startsWith('ingest:')
 		? 'push'
-		: ['plex', 'jellyfin', 'emby', 'roon', 'navidrome', 'physical', 'rockbox', 'import', 'spotify'].includes(key)
+		: ['plex', 'jellyfin', 'emby', 'roon', 'navidrome', 'physical', 'rockbox', 'import', 'spotify', 'radio'].includes(key)
 			? key
 			: 'unknown';
 
@@ -37,6 +37,8 @@
 						? 'Rockbox player'
 						: kind === 'spotify'
 							? (client ?? 'Streamed on Spotify')
+							: kind === 'radio'
+								? (client ?? 'Heard on the radio')
 							: kind === 'unknown'
 								? (source ?? 'Unknown source')
 								: key.charAt(0).toUpperCase() + key.slice(1);
@@ -65,6 +67,15 @@
 			<rect x="3.2" y="1.2" width="9.6" height="13.6" rx="1.8" />
 			<rect x="5" y="3" width="6" height="4" rx="0.6" />
 			<circle cx="8" cy="11" r="2" />
+		</svg>
+	{:else if kind === 'radio'}
+		<!-- A radio: the body, the speaker and the aerial. -->
+		<svg viewBox="0 0 16 16" width={size} height={size} fill="none" stroke="currentColor" stroke-width="1.3">
+			<rect x="1.6" y="5.4" width="12.8" height="8.6" rx="1.8" />
+			<path d="M4.4 5.4 11 1.8" />
+			<circle cx="10.2" cy="9.7" r="2" />
+			<line x1="4.2" y1="8.6" x2="6.4" y2="8.6" />
+			<line x1="4.2" y1="10.8" x2="6.4" y2="10.8" />
 		</svg>
 	{:else if kind === 'push'}
 		<!-- A phone: something submitted a listen to us. -->

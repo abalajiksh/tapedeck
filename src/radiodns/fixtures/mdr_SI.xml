@@ -1,0 +1,85 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<serviceInformation xmlns="http://www.worlddab.org/schemas/spi/31" xsi:schemaLocation="http://www.worlddab.org/schemas/spi/31 spi_31.xsd" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" creationTime="2026-10-17T02:30:31.662Z" originator="ARD POC RadioDNS Server" xml:lang="de">
+  <services>
+    <serviceProvider>
+      <shortName>MDR</shortName>
+      <mediumName>MDR</mediumName>
+      <longName>MITTELDEUTSCHER RUNDFUNK</longName>
+      <mediaDescription>
+        <shortDescription>Der MITTELDEUTSCHE RUNDFUNK ist die öffentlich-rechtliche Rundfunkanstalt von Sachsen, Sachsen-Anhalt und Thüringen.</shortDescription>
+      </mediaDescription>
+      <link uri="https://www.mdr.de/nachrichten/index.html" mimeValue="text/html" description="MDR Webpage" />
+      <link uri="postal:MITTELDEUTSCHER RUNDFUNK/Kantstraße 71 - 73/Leipzig/D-04360/Germany 1" />
+      <link uri="tel:+49-341-300-9696" />
+      <geolocation>
+        <country>de</country>
+      </geolocation>
+    </serviceProvider>
+        <service>
+      <shortName>MDR JUMP</shortName>
+      <mediumName>MDR JUMP</mediumName>
+      <longName>MDR JUMP</longName>
+      <mediaDescription>
+        <shortDescription>MDR JUMP: Echte Abwechslung im Radio</shortDescription>
+      </mediaDescription>
+      <mediaDescription>
+        <multimedia height="32" width="32" type="logo_colour_square" mimeValue="image/png" url="http://demdr.radiodns.ard.de/storage/9e5187642df485b16599f59c.png" />
+      </mediaDescription>
+      <mediaDescription>
+        <multimedia height="32" width="112" type="logo_colour_rectangle" mimeValue="image/png" url="http://demdr.radiodns.ard.de/storage/465bb98712db814ddb29deab.png" />
+      </mediaDescription>
+      <mediaDescription>
+        <multimedia height="128" width="128" type="logo_unrestricted" mimeValue="image/png" url="http://demdr.radiodns.ard.de/storage/e865294c64f9eac284be036d.png" />
+      </mediaDescription>
+      <mediaDescription>
+        <multimedia height="240" width="320" type="logo_unrestricted" mimeValue="image/png" url="http://demdr.radiodns.ard.de/storage/d0ce0e35cc4d06863233c101.png" />
+      </mediaDescription>
+      <mediaDescription>
+        <multimedia height="600" width="600" type="logo_unrestricted" mimeValue="image/png" url="http://demdr.radiodns.ard.de/storage/ac91416fcb34a510d6309775.png" />
+      </mediaDescription>
+      <genre href="urn:tva:metadata:cs:ContentCS:2011:3.6.4.1">Pop</genre>
+      <link uri="https://www.mdrjump.de/index.html" mimeValue="text/html" />
+      <link uri="postal:MITTELDEUTSCHER RUNDFUNK/Kantstraße 71 - 73/Leipzig/D-04360/Germany 1" />
+      <bearer id="http://mdr-284320-0.sslcast.mdr.de/mdr/284320/0/mp3/high/stream.mp3" cost="100" mimeValue="audio/mpeg" offset="2000" bitrate="128" />
+      <bearer id="dab:de0.10d1.d3c2.0" cost="20" mimeValue="audio/aac" />
+      <bearer id="dab:de0.10e5.d3c2.0" cost="20" mimeValue="audio/aac" />
+      <bearer id="dab:de0.1135.d3c2.0" cost="20" mimeValue="audio/aac" />
+      <bearer id="fm:de0.d3c2.*" cost="50" />
+      <radiodns fqdn="demdr.radiodns.ard.de" serviceIdentifier="ebu427demdr" />
+    </service>
+    <service>
+      <shortName>KULTUR</shortName>
+      <mediumName>MDR KULTUR</mediumName>
+      <longName>MDR KULTUR - Das Radio</longName>
+      <mediaDescription>
+        <shortDescription>MDR KULTUR begleitet durch den Tag mit handverlesener Musik, Nachrichten, Reportagen und vertiefenden Gesprächen, inspiriert mit Lesungen, Hörspielen und Features.</shortDescription>
+      </mediaDescription>
+      <mediaDescription>
+        <multimedia height="32" width="32" type="logo_colour_square" mimeValue="image/png" url="http://demdr.radiodns.ard.de/storage/fa75a453e0f136ac730b3fde.png" />
+      </mediaDescription>
+      <mediaDescription>
+        <multimedia height="32" width="112" type="logo_colour_rectangle" mimeValue="image/png" url="http://demdr.radiodns.ard.de/storage/d234af4c683e5c537293337e.png" />
+      </mediaDescription>
+      <mediaDescription>
+        <multimedia height="128" width="128" type="logo_unrestricted" mimeValue="image/png" url="http://demdr.radiodns.ard.de/storage/8e2c78be5ae1417bdec8c7bf.png" />
+      </mediaDescription>
+      <mediaDescription>
+        <multimedia height="240" width="320" type="logo_unrestricted" mimeValue="image/png" url="http://demdr.radiodns.ard.de/storage/bc66c4d670033b0958e87a60.png" />
+      </mediaDescription>
+      <mediaDescription>
+        <multimedia height="600" width="600" type="logo_unrestricted" mimeValue="image/png" url="http://demdr.radiodns.ard.de/storage/d8c9dab3ecb177966e59fda5.png" />
+      </mediaDescription>
+      <genre href="urn:tva:metadata:cs:ContentCS:2011:1.2">Information</genre>
+      <genre href="urn:tva:metadata:cs:ContentCS:2011:3.6">Other Music</genre>
+      <genre href="urn:tva:metadata:cs:ContentCS:2011:3.6.4.17">Singer/Songwriter</genre>
+      <link uri="https://www.mdr.de/kultur/radio/index.html" mimeValue="text/html" />
+      <link uri="postal:MITTELDEUTSCHER RUNDFUNK/Kantstraße 71 - 73/Leipzig/D-04360/Germany 1" />
+      <bearer id="http://mdr-284310-0.sslcast.mdr.de/mdr/284310/0/mp3/low/stream.mp3" cost="100" mimeValue="audio/mpeg" offset="2000" bitrate="128" />
+      <bearer id="dab:de0.10d1.d3c3.0" cost="20" mimeValue="audio/aac" />
+      <bearer id="dab:de0.10e5.d3c3.0" cost="20" mimeValue="audio/aac" />
+      <bearer id="dab:de0.1135.d3c3.0" cost="20" mimeValue="audio/aac" />
+      <bearer id="fm:de0.d3c3.*" cost="50" />
+      <radiodns fqdn="demdr.radiodns.ard.de" serviceIdentifier="ebu430demdr" />
+    </service>
+  </services>
+</serviceInformation>

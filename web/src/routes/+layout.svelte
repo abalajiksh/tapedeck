@@ -32,6 +32,7 @@
 		{ href: '/loved', label: 'Loved', icon: 'loved' },
 		{ href: '/notes', label: 'Liner Notes', icon: 'notes' },
 		{ href: '/shelf', label: 'The Shelf', icon: 'shelf' },
+		{ href: '/radio', label: 'Radio', icon: 'radio' },
 		{ href: '/crate', label: 'The Crate', icon: 'crate' },
 		{ href: '/rediscover', label: 'Rediscovery', icon: 'rediscover' },
 		{ href: '/patch', label: 'Patch', icon: 'patch', badge: 'patch' },
@@ -210,6 +211,7 @@
 						{:else if item.icon === 'patch'}<svg viewBox="0 0 24 24" width="20" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><circle cx="8" cy="12" r="4.4"/><circle cx="16" cy="12" r="4.4"/></svg>
 						{:else if item.icon === 'rediscover'}<svg viewBox="0 0 24 24" width="20" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><path d="M3 5v5h5"/><path d="M4.2 14a8 8 0 1 0 1.3-6.3L3 10"/></svg>
 						{:else if item.icon === 'shelf'}<svg viewBox="0 0 24 24" width="20" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="3"/></svg>
+						{:else if item.icon === 'radio'}<svg viewBox="0 0 24 24" width="20" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="8" width="18" height="12" rx="2.5"/><path d="M7 8l9-5"/><circle cx="15.5" cy="14" r="2.6"/><path d="M6.5 12.5h3"/><path d="M6.5 15.5h3"/></svg>
 						{:else if item.icon === 'crate'}<svg viewBox="0 0 24 24" width="20" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="7" width="18" height="12.6" rx="1.5"/><path d="M7.6 10.6v5.6"/><path d="M11.4 10.6v5.6"/><path d="M16.6 11l-2.2 5.2"/></svg>
 						{:else if item.icon === 'chains'}<svg viewBox="0 0 24 24" width="20" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><path d="M9 12a3 3 0 0 1 3-3h2a3 3 0 0 1 0 6"/><path d="M15 12a3 3 0 0 1-3 3h-2a3 3 0 0 1 0-6"/></svg>
 						{:else}<svg viewBox="0 0 24 24" width="20" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><line x1="4" y1="8" x2="20" y2="8"/><circle cx="15" cy="8" r="2.4" fill="var(--td-sidebar)"/><line x1="4" y1="16" x2="20" y2="16"/><circle cx="9" cy="16" r="2.4" fill="var(--td-sidebar)"/></svg>

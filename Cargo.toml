@@ -1,6 +1,6 @@
 [package]
 name = "tapedeck"
-version = "0.122.0"
+version = "0.123.0"
 edition = "2021"
 # Builds the SvelteKit UI into static/ before rustc runs, so `cargo build` is
 # the whole build and a fresh clone compiles. See build.rs.
@@ -69,6 +69,10 @@ urlencoding = "2.1"
 ipnet = "2"
 chrono = "0.4"
 chrono-tz = "0.9"
+# RadioDNS (`src/radiodns.rs`) is CNAME and SRV records, which neither std nor
+# reqwest's resolver can ask for. The system config so it follows the host's
+# resolv.conf like everything else does; no DNSSEC, no DoH.
+hickory-resolver = { version = "0.26", default-features = false, features = ["tokio", "system-config"] }
 
 # Frontend
 rust-embed = "8"
