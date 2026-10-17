@@ -23,6 +23,7 @@
 //! free text. Breaks and promo lines are logged, never listened.
 
 pub mod icy;
+pub mod machine;
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -40,7 +41,8 @@ use crate::radiodns::{self, spi, Bearer, ScheduleStatus};
 use crate::server::now_playing::{NowPlaying, Progress};
 use crate::server::AppState;
 use crate::sources::egress::Egress;
-use icy::{classify, stream_title, IcyDemux, Line};
+use icy::{classify, stream_title, IcyDemux};
+use machine::{BreakKind, Effect, Machine, Track};
 
 /// The now-playing registry's source key for the tuner.
 pub const RADIO_SOURCE: &str = "Radio";
@@ -143,22 +145,13 @@ pub enum TunerState {
     Dropped,
 }
 
+/// What the async half attaches to a track once it has logged it and asked
+/// MusicBrainz about it.
 #[derive(Debug, Clone)]
-struct OnAir {
+struct Heard {
     log_id: i64,
     play: Play,
     tagged: bool,
-    started_at: i64,
-    seen_start: bool,
-    /// When station text took the title's place, if it has; cleared when the
-    /// same title comes back.
-    interrupted_at: Option<i64>,
-}
-
-impl OnAir {
-    fn is(&self, artist: &str, title: &str) -> bool {
-        self.play.artist.eq_ignore_ascii_case(artist) && self.play.title.eq_ignore_ascii_case(title)
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -174,12 +167,11 @@ struct Tuned {
     chain_name: Option<String>,
     since: i64,
     ends_at: Option<i64>,
-    state: TunerState,
-    on_air: Option<OnAir>,
-    /// The last line the station sent, verbatim.
-    line: Option<String>,
-    /// The air-log row a run of non-track lines is coalesced into.
-    break_log: Option<i64>,
+    /// What is on air, and every rule about it. See [`machine`].
+    machine: Machine<Heard>,
+    /// The connection's own state when it overrides the broadcast's:
+    /// `Tuning` while (re)connecting, `Dropped` while waiting to retry.
+    transport: Option<TunerState>,
     retry_at: Option<i64>,
     egress: Egress,
 }
@@ -279,26 +271,27 @@ impl Radio {
                 logo: None,
             };
         };
-        let signal = match t.state {
+        let state = t.transport.or(t.machine.state).unwrap_or(TunerState::Tuning);
+        let signal = match state {
             TunerState::Dropped => 0,
             TunerState::Tuning => 1,
             _ => 5,
         };
         TunerStatus {
             tuned: true,
-            now: t.on_air.as_ref().map(|o| OnAirNow {
-                artist: o.play.artist.clone(),
-                title: o.play.title.clone(),
-                since: o.started_at,
-                tagged: o.tagged,
+            now: t.machine.current.as_ref().map(|c| OnAirNow {
+                artist: c.artist.clone(),
+                title: c.title.clone(),
+                since: c.started_at,
+                tagged: c.payload.as_ref().is_some_and(|h| h.tagged),
             }),
-            source: t.line.as_ref().map(|_| ICY.to_string()),
+            source: t.machine.line.as_ref().map(|_| ICY.to_string()),
             preset: Some(t.preset),
             session_id: Some(t.session_id),
             since: Some(t.since),
             ends_at: t.ends_at,
-            state: Some(t.state),
-            line: t.line,
+            state: Some(state),
+            line: t.machine.line,
             retry_at: t.retry_at,
             signal,
             chain_id: t.chain_id,
@@ -433,10 +426,8 @@ pub async fn tune_in(
         chain_id,
         chain_name,
         since,
-        state: TunerState::Tuning,
-        on_air: None,
-        line: None,
-        break_log: None,
+        machine: Machine::default(),
+        transport: Some(TunerState::Tuning),
         retry_at: None,
         egress: Egress::for_owner(is_admin),
     };
@@ -475,7 +466,7 @@ async fn finish(state: &Arc<AppState>, user_id: i64, gen: Option<u64>, reason: &
         (Some(_), _) => m.remove(&user_id),
         (None, _) => None,
     });
-    let Some(t) = removed else { return };
+    let Some(mut t) = removed else { return };
     if gen.is_some() {
         // The task ending itself: its handle is its own, and aborting it here
         // would cancel the rest of this function.
@@ -484,17 +475,8 @@ async fn finish(state: &Arc<AppState>, user_id: i64, gen: Option<u64>, reason: &
         }
     }
     let now = now_secs();
-    if let Some(on) = t.on_air.clone() {
-        // A paused track ended when the talk began; one still named was cut
-        // short by this.
-        match on.interrupted_at {
-            Some(at) => settle(state, user_id, &t, on, at, true).await,
-            None => settle(state, user_id, &t, on, now, false).await,
-        }
-    }
-    if let Some(id) = t.break_log {
-        close_break(state, user_id, &t, id, now).await;
-    }
+    let effects = t.machine.off(now);
+    apply(state, user_id, gen, &t, "", effects).await;
     if let Err(e) = state.db.end_radio_session(user_id, t.session_id, now, reason).await {
         warn!("📻 Could not close radio session {}: {e}", t.session_id);
     }
@@ -511,25 +493,27 @@ async fn close_break(state: &Arc<AppState>, user_id: i64, t: &Tuned, id: i64, no
 }
 
 /// Decide what a finished track was, write the listen if it is one, and say
-/// so in the air log.
+/// so in the air log. A track whose lookup had not come back yet has no row
+/// to settle; [`start_track`] marks that one itself when its attach fails.
 async fn settle(
     state: &Arc<AppState>,
     user_id: i64,
     t: &Tuned,
-    on: OnAir,
+    track: &Track<Heard>,
     ended_at: i64,
     natural_end: bool,
 ) {
+    let Some(heard) = &track.payload else { return };
     let prefs = state.db.get_preferences(user_id).await.unwrap_or_default();
     let threshold = ScrobbleThreshold::from_prefs(&prefs);
-    let kind = if on.tagged { "track" } else { "guess" };
-    let mbid = on.play.mbid_recording.clone();
-    if !heard_enough(on.started_at, ended_at, on.seen_start, natural_end, &threshold) {
+    let kind = if heard.tagged { "track" } else { "guess" };
+    let mbid = heard.play.mbid_recording.clone();
+    if !heard_enough(track.started_at, ended_at, track.seen_start, natural_end, &threshold) {
         let _ = state
             .db
             .settle_air_line(
                 user_id,
-                on.log_id,
+                heard.log_id,
                 kind,
                 "partial",
                 Some(ended_at),
@@ -539,11 +523,11 @@ async fn settle(
             .await;
         return;
     }
-    let status = if on.tagged || !t.settings.tagged_only {
+    let status = if heard.tagged || !t.settings.tagged_only {
         match write_listen(
             state,
             user_id,
-            &on.play,
+            &heard.play,
             t.chain_id,
             &t.preset.band,
             t.settings.tag_radio,
@@ -560,12 +544,12 @@ async fn settle(
     } else {
         "held"
     };
-    let source_id = (status == "scrobbled").then(|| on.play.source_id.clone());
+    let source_id = (status == "scrobbled").then(|| heard.play.source_id.clone());
     let _ = state
         .db
         .settle_air_line(
             user_id,
-            on.log_id,
+            heard.log_id,
             kind,
             status,
             Some(ended_at),
@@ -611,231 +595,177 @@ pub async fn write_listen(
     }
 }
 
-/// A line arrived from the station.
-async fn on_line(
-    state: &Arc<AppState>,
-    user_id: i64,
-    gen: u64,
-    raw: String,
-    seen_transition: bool,
-) {
-    let radio = &state.radio;
-    let now = now_secs();
-    // Same line again: nothing changed. Keep a live entry fresh in the
-    // registry, which forgets a durationless track after ten minutes.
-    let unchanged = radio.with(user_id, gen, |t| {
-        if t.line.as_deref() == Some(raw.as_str()) {
-            t.retry_at = None;
-            if t.state == TunerState::Dropped || t.state == TunerState::Tuning {
-                t.state = if t.on_air.is_some() { TunerState::Live } else { TunerState::Unknown };
-            }
-            return Some(t.clone());
-        }
-        None
-    });
-    match unchanged {
-        None => return, // not ours any more
-        Some(Some(t)) => {
-            if let Some(on) = &t.on_air {
-                if state.now_playing.get(user_id).is_none_or(|(np, _)| now - np.updated_at > 60) {
-                    publish_now_playing(state, user_id, &t, on, false).await;
-                }
-            }
-            return;
-        }
-        Some(None) => {}
-    }
+/// The station's own names, which a line made only of them is not a track by.
+fn station_names(t: &Tuned) -> Vec<String> {
+    [Some(&t.station.name), t.station.short_name.as_ref(), Some(&t.preset.name)]
+        .into_iter()
+        .flatten()
+        .cloned()
+        .collect()
+}
 
-    // A new line.
-    let Some(t) = radio.with(user_id, gen, |t| {
-        t.line = Some(raw.clone());
+/// A line arrived from the station. The decision is [`Machine::step`]'s;
+/// this carries it out.
+async fn on_line(state: &Arc<AppState>, user_id: i64, gen: u64, raw: String, first: bool) {
+    let now = now_secs();
+    let Some((t, effects)) = state.radio.with(user_id, gen, |t| {
+        // Any line means the connection is up.
+        t.transport = None;
         t.retry_at = None;
-        t.clone()
+        let names = station_names(t);
+        let names: Vec<&str> = names.iter().map(String::as_str).collect();
+        let effects = t.machine.step(now, &raw, classify(&raw, &names), first);
+        (t.clone(), effects)
     }) else {
         return;
     };
-    let prev_break = t.break_log;
-    let names: Vec<&str> = [
-        Some(t.station.name.as_str()),
-        t.station.short_name.as_deref(),
-        Some(t.preset.name.as_str()),
-    ]
-    .into_iter()
-    .flatten()
-    .collect();
-    let base_line = |artist, title, kind, status| NewAirLine {
-        session_id: t.session_id,
-        station_id: &t.station.id,
-        station_name: &t.station.name,
-        band: &t.preset.band,
-        started_at: now,
-        raw: &raw,
-        artist,
-        title,
-        kind,
-        source: ICY,
-        status,
-    };
-
-    match classify(&raw, &names) {
-        Line::Track { artist, title } => {
-            // The same track again after some station text: it never stopped.
-            // WDR 2 alternates "Songtitel gesucht? …" with the title all the
-            // way through a song, and reading each swap as an ending would cut
-            // one song into several.
-            let resumed = radio
-                .with(user_id, gen, |t| match &mut t.on_air {
-                    Some(o) if o.is(&artist, &title) => {
-                        o.interrupted_at = None;
-                        t.state = TunerState::Live;
-                        t.break_log = None;
-                        true
-                    }
-                    _ => false,
-                })
-                .unwrap_or(false);
-            if let Some(id) = prev_break {
-                close_break(state, user_id, &t, id, now).await;
-            }
-            if resumed {
-                return;
-            }
-            // Taken off the tuner before any await, so a second line arriving
-            // while this one is looked up cannot settle it twice.
-            if let Some(prev) = radio.with(user_id, gen, |t| t.on_air.take()).flatten() {
-                let ended = prev.interrupted_at.unwrap_or(now);
-                settle(state, user_id, &t, prev, ended, true).await;
-            }
-            let mut play = Play::new(
-                title.clone(),
-                artist.clone(),
-                now as u64,
-                format!("radio-{}-{}", t.station.id, now),
-                "radio".into(),
-            );
-            let tagged = enrich_play(&state.mb_client, &mut play, None).await
-                && play.mbid_recording.is_some();
-            let kind = if tagged { "track" } else { "guess" };
-            let log_id = match state
-                .db
-                .add_air_line(user_id, &base_line(Some(&artist), Some(&title), kind, "playing"))
-                .await
-            {
-                Ok(id) => id,
-                Err(e) => {
-                    warn!("📻 Could not log a line: {e}");
-                    return;
-                }
-            };
-            let on = OnAir {
-                log_id,
-                play,
-                tagged,
-                started_at: now,
-                seen_start: seen_transition,
-                interrupted_at: None,
-            };
-            let stored = radio.with(user_id, gen, |t| {
-                // Only if nothing newer arrived while MusicBrainz was asked.
-                if t.line.as_deref() == Some(raw.as_str()) {
-                    t.on_air = Some(on.clone());
-                    t.break_log = None;
-                    t.state = TunerState::Live;
-                    Some(t.clone())
-                } else {
-                    None
-                }
-            });
-            match stored.flatten() {
-                Some(t) => publish_now_playing(state, user_id, &t, &on, true).await,
-                None => {
-                    let _ = state
-                        .db
-                        .settle_air_line(user_id, log_id, kind, "partial", Some(now), None, None)
-                        .await;
-                }
-            }
-        }
-        line @ (Line::Break | Line::Other) => {
-            let is_break = line == Line::Break;
-            let kind = if is_break { "break" } else { "other" };
-            // News, traffic or an ad means the track is over. Anything else —
-            // a slogan, a web address — may be the station talking over the
-            // song, so the track is paused rather than ended, and it ends at
-            // the moment the talk began only if a different track follows.
-            let ended = if is_break {
-                radio.with(user_id, gen, |t| t.on_air.take()).flatten()
-            } else {
-                radio.with(user_id, gen, |t| {
-                    if let Some(o) = &mut t.on_air {
-                        o.interrupted_at.get_or_insert(now);
-                    }
-                });
-                None
-            };
-            if let Some(prev) = ended {
-                let at = prev.interrupted_at.unwrap_or(now);
-                settle(state, user_id, &t, prev, at, true).await;
-            }
-            // A run of non-track lines is one entry: a station rotating three
-            // promo texts through a news bulletin is one break, not thirty.
-            // Text over a paused track is not logged at all — the track's own
-            // line already says what was on.
-            let over_track =
-                !is_break && radio.with(user_id, gen, |t| t.on_air.is_some()).unwrap_or(false);
-            let log = if over_track {
-                None
-            } else if prev_break.is_none() {
-                let status = if t.settings.skip_breaks { "skipped" } else { "logged" };
-                state.db.add_air_line(user_id, &base_line(None, None, kind, status)).await.ok()
-            } else {
-                prev_break
-            };
-            let still_on = radio
-                .with(user_id, gen, |t| {
-                    t.break_log = log;
-                    t.state = match (is_break, t.on_air.is_some()) {
-                        (true, _) => TunerState::Break,
-                        (false, true) => TunerState::Live,
-                        (false, false) => TunerState::Unknown,
-                    };
-                    t.on_air.is_some()
-                })
-                .unwrap_or(false);
-            if !still_on {
-                state.now_playing.clear_user_source(user_id, RADIO_SOURCE);
-            }
-        }
-    }
+    apply(state, user_id, Some(gen), &t, &raw, effects).await;
 }
-
-/// A track paused by station text for this long has ended, whatever follows.
-const SUSPEND_MAX_SECS: i64 = 600;
 
 /// End a track that station text paused long ago. Called from the read loop,
 /// because a station that falls silent sends no line to end it with.
 async fn expire_suspended(state: &Arc<AppState>, user_id: i64, gen: u64) {
     let now = now_secs();
-    let taken = state
-        .radio
-        .with(user_id, gen, |t| {
-            let stale = t
-                .on_air
-                .as_ref()
-                .and_then(|o| o.interrupted_at)
-                .is_some_and(|i| now - i > SUSPEND_MAX_SECS);
-            if !stale {
-                return None;
+    let Some((t, effects)) = state.radio.with(user_id, gen, |t| {
+        let effects = t.machine.tick(now);
+        (t.clone(), effects)
+    }) else {
+        return;
+    };
+    apply(state, user_id, Some(gen), &t, "", effects).await;
+}
+
+/// Carry out what the machine decided, in order. `t` is the tuner as it was
+/// right after the decision; `gen` is `None` once it has been removed (Off),
+/// when nothing can be attached to it any more.
+async fn apply(
+    state: &Arc<AppState>,
+    user_id: i64,
+    gen: Option<u64>,
+    t: &Tuned,
+    raw: &str,
+    effects: Vec<Effect<Heard>>,
+) {
+    for effect in effects {
+        match effect {
+            Effect::Refresh => {
+                let Some(heard) = t.machine.current.as_ref().and_then(|c| c.payload.as_ref())
+                else {
+                    continue;
+                };
+                let now = now_secs();
+                let stale =
+                    state.now_playing.get(user_id).is_none_or(|(np, _)| now - np.updated_at > 60);
+                if stale {
+                    publish_now_playing(state, user_id, t, heard, false).await;
+                }
             }
-            t.state = TunerState::Unknown;
-            let on = t.on_air.take()?;
-            Some((t.clone(), on))
-        })
+            Effect::EndTrack { track, ended_at, natural } => {
+                settle(state, user_id, t, &track, ended_at, natural).await;
+            }
+            Effect::StartTrack { id, artist, title, started_at } => {
+                if let Some(gen) = gen {
+                    start_track(state, user_id, gen, t, raw, id, artist, title, started_at).await;
+                }
+            }
+            Effect::OpenBreak { id, kind, at } => {
+                let status = if t.settings.skip_breaks { "skipped" } else { "logged" };
+                let kind = match kind {
+                    BreakKind::Break => "break",
+                    BreakKind::Other => "other",
+                };
+                let line = air_line(t, raw, at, None, None, kind, status);
+                let Ok(log) = state.db.add_air_line(user_id, &line).await else { continue };
+                let kept = gen
+                    .and_then(|g| {
+                        state.radio.with(user_id, g, |tt| tt.machine.attach_break(id, log))
+                    })
+                    .unwrap_or(false);
+                if !kept {
+                    // The run ended while its row was being written.
+                    close_break(state, user_id, t, log, at).await;
+                }
+            }
+            Effect::CloseBreak { log, at } => {
+                if let Some(log) = log {
+                    close_break(state, user_id, t, log, at).await;
+                }
+            }
+            Effect::ClearNowPlaying => state.now_playing.clear_user_source(user_id, RADIO_SOURCE),
+        }
+    }
+}
+
+fn air_line<'a>(
+    t: &'a Tuned,
+    raw: &'a str,
+    started_at: i64,
+    artist: Option<&'a str>,
+    title: Option<&'a str>,
+    kind: &'a str,
+    status: &'a str,
+) -> NewAirLine<'a> {
+    NewAirLine {
+        session_id: t.session_id,
+        station_id: &t.station.id,
+        station_name: &t.station.name,
+        band: &t.preset.band,
+        started_at,
+        raw,
+        artist,
+        title,
+        kind,
+        source: ICY,
+        status,
+    }
+}
+
+/// A track began: look it up, log it as playing, and attach both to it — or,
+/// when it ended while MusicBrainz was being asked, mark its row cut short.
+#[allow(clippy::too_many_arguments)]
+async fn start_track(
+    state: &Arc<AppState>,
+    user_id: i64,
+    gen: u64,
+    t: &Tuned,
+    raw: &str,
+    id: u64,
+    artist: String,
+    title: String,
+    started_at: i64,
+) {
+    let mut play = Play::new(
+        title.clone(),
+        artist.clone(),
+        started_at as u64,
+        format!("radio-{}-{}", t.station.id, started_at),
+        "radio".into(),
+    );
+    let tagged =
+        enrich_play(&state.mb_client, &mut play, None).await && play.mbid_recording.is_some();
+    let kind = if tagged { "track" } else { "guess" };
+    let line = air_line(t, raw, started_at, Some(&artist), Some(&title), kind, "playing");
+    let log_id = match state.db.add_air_line(user_id, &line).await {
+        Ok(id) => id,
+        Err(e) => {
+            warn!("📻 Could not log a line: {e}");
+            return;
+        }
+    };
+    let heard = Heard { log_id, play, tagged };
+    let attached = state
+        .radio
+        .with(user_id, gen, |tt| tt.machine.attach(id, heard.clone()).is_ok().then(|| tt.clone()))
         .flatten();
-    if let Some((t, on)) = taken {
-        let at = on.interrupted_at.unwrap_or(now);
-        settle(state, user_id, &t, on, at, true).await;
-        state.now_playing.clear_user_source(user_id, RADIO_SOURCE);
+    match attached {
+        Some(tt) => publish_now_playing(state, user_id, &tt, &heard, true).await,
+        None => {
+            let now = now_secs();
+            let _ = state
+                .db
+                .settle_air_line(user_id, log_id, kind, "partial", Some(now), None, None)
+                .await;
+        }
     }
 }
 
@@ -843,21 +773,21 @@ async fn publish_now_playing(
     state: &Arc<AppState>,
     user_id: i64,
     t: &Tuned,
-    on: &OnAir,
+    heard: &Heard,
     announce: bool,
 ) {
-    let mut np = NowPlaying::from_play(&on.play, RADIO_SOURCE, None, Progress::Unknown);
+    let mut np = NowPlaying::from_play(&heard.play, RADIO_SOURCE, None, Progress::Unknown);
     np.listening_context = Some(t.station.name.clone());
     np.chain_name = t.chain_name.clone();
     np.chain_id = t.chain_id;
     let changed = state.now_playing.set(user_id, np);
     // Somebody else's servers hear about a track only when it would also be
     // forwarded as a listen — a guess waiting for review is not announced.
-    if announce && changed && (on.tagged || !t.settings.tagged_only) {
+    if announce && changed && (heard.tagged || !t.settings.tagged_only) {
         let sinks = crate::sinks::sinks_for_user(&state.db, user_id, &state.listenbrainz_url)
             .await
             .unwrap_or_default();
-        crate::sinks::submit_now_playing(&sinks, &on.play).await;
+        crate::sinks::submit_now_playing(&sinks, &heard.play).await;
     }
 }
 
@@ -878,8 +808,8 @@ async fn run(state: Arc<AppState>, user_id: i64, gen: u64) {
         }
         let Some(url) = url else { return };
         radio.with(user_id, gen, |t| {
-            if t.state == TunerState::Dropped {
-                t.state = TunerState::Tuning;
+            if t.transport == Some(TunerState::Dropped) {
+                t.transport = Some(TunerState::Tuning);
             }
         });
 
@@ -890,7 +820,7 @@ async fn run(state: Arc<AppState>, user_id: i64, gen: u64) {
                 let retry_at = now_secs() + backoff as i64;
                 if radio
                     .with(user_id, gen, |t| {
-                        t.state = TunerState::Dropped;
+                        t.transport = Some(TunerState::Dropped);
                         t.retry_at = Some(retry_at);
                     })
                     .is_none()
@@ -934,8 +864,9 @@ async fn read_stream(
         // session rather than reconnecting every minute.
         drop(resp);
         state.radio.with(user_id, gen, |t| {
-            t.state = TunerState::Unknown;
-            t.line = Some("This station's stream carries no track names".into());
+            t.transport = None;
+            t.machine.state = Some(TunerState::Unknown);
+            t.machine.line = Some("This station's stream carries no track names".into());
         });
         loop {
             tokio::time::sleep(Duration::from_secs(30)).await;
@@ -972,7 +903,7 @@ async fn read_stream(
             if let Some(title) = stream_title(&block) {
                 // The first line of a connection was already playing when we
                 // arrived; every later one is a change we watched happen.
-                on_line(state, user_id, gen, title, lines_seen > 0).await;
+                on_line(state, user_id, gen, title, lines_seen == 0).await;
                 lines_seen += 1;
             }
         }
