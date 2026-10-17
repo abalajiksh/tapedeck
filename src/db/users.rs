@@ -294,6 +294,10 @@ impl Database {
         for table in [
             "notes",
             "loves",
+            // The air log points at a radio session, so it clears first.
+            "radio_air_log",
+            "radio_sessions",
+            "radio_presets",
             "scrobbles",
             // The MCP tables clear before `users`, and in this order: audit
             // rows and playlists both reference a connection, so the

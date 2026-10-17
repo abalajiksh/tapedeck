@@ -337,6 +337,8 @@ with:
   playing; see below.
 - **The Shelf** — records, tapes and discs, with a deck drawn for whichever is
   in hand: pause, skip and flip reminders.
+- **Radio** — tune in to a German public station, FM or DAB+, and Tapedeck
+  logs what it plays; see below.
 - **Loved** — every heart in one place, across tracks, records and artists,
   including the ones lifted from your media server's star ratings.
 - **Reports** — your listening in chapters, one week, month or year at a time.
@@ -476,6 +478,36 @@ the record when a side starts and lifts when it stops; a cassette turns both
 reels behind the window; a disc spins at its own much faster rate with a sheen,
 because the silhouette is the same circle as a record. All of it stops dead
 when the deck is paused, and none of it moves under `prefers-reduced-motion`.
+
+### Radio — what the station played
+
+Press a preset and the server tunes in: it opens the station's own internet
+stream, throws the audio away and reads the track names the station sends
+(ICY). Each name that was heard long enough becomes a listen — source `radio`,
+client "FM radio" or "DAB+ radio", and your radio chain if you attach one —
+and is forwarded like any other. It logs until you press Off, tune elsewhere,
+or the auto-stop you set runs out.
+
+- **The stations** are every service the nine ARD broadcasters publish through
+  RadioDNS: about 140, each with its FM PI code, DAB service IDs and stream.
+  RadioDNS names no frequency, DAB channel or city, so a preset asks you for
+  them, and they place it on the dial. Commercial and worldwide stations come
+  later.
+- **What counts.** A track you heard from its first bar to its last counts
+  past 30 seconds; one caught part-way has to clear your usual threshold.
+  Station text over a song pauses it rather than ending it. News, traffic,
+  weather and promo lines go in the air log, never in your history.
+- **Trust.** A name MusicBrainz recognises is forwarded at once. One it does
+  not is a guess: with *Forward tagged tracks only* on, it waits in the review
+  queue for Keep or Drop rather than reaching your Last.fm on the strength of
+  a station's free text.
+- **Today's schedule** comes from the station's RadioDNS programme
+  information, where it publishes one (ARD does).
+- **A radio with its own speaker** is the gear type *Radio / tuner*: put it in
+  a chain's source slot and pick it again for the speaker.
+
+Off-air RT+ (FM) and DL+ (DAB) from an SDR on the Pi is the planned exact
+source; the air log already records where each line came from.
 
 ### Loved
 

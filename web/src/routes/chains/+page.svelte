@@ -506,6 +506,10 @@
 		{ v: 'dap', label: 'DAP / Music player' },
 		{ v: 'transport', label: 'Transport' },
 		{ v: 'turntable', label: 'Turntable' },
+		// A radio with its own speaker — a DAB+ kitchen radio, a clock radio.
+		// It is the source *and* the speaker, so it may fill both slots of one
+		// chain (see ALL_IN_ONE).
+		{ v: 'radio', label: 'Radio / tuner (own speaker)' },
 		// A cartridge is not a turntable, and it is the one piece of gear people
 		// own two of for the same deck — which is what chain variants exist for.
 		{ v: 'cartridge', label: 'Cartridge / stylus' },
@@ -545,7 +549,7 @@
 		'builtin-speakers': 'transducer', earbuds: 'bluetooth',
 		dac: 'dac', 'dac-amp': 'dac', interface: 'dac', receiver: 'dac',
 		amp: 'amp', preamp: 'amp',
-		source: 'source', turntable: 'source', phone: 'source',
+		source: 'source', turntable: 'source', phone: 'source', radio: 'source',
 		// A cartridge sits at the very start of the path, before anything
 		// amplifies it; a phono stage is the first gain stage after it.
 		cartridge: 'source', headshell: 'source', phono: 'amp',
@@ -561,9 +565,20 @@
 	for (const [gear, comp] of Object.entries(componentTypeForGear)) {
 		(gearTypesForComponent[comp] ??= []).push(gear);
 	}
+	// Gear that is its own speaker. It is placed as the source and may be
+	// picked again for the speaker slot of the same chain — a kitchen radio is
+	// both ends of its own chain. Gear hours count a box once per chain however
+	// many slots it fills (`gear_hours` folds by equipment id), so this does
+	// not double its hours.
+	const ALL_IN_ONE = new Set(['radio']);
 	function gearFitsSlot(gearType: string, compType: string): boolean {
 		const known = componentTypeForGear[gearType];
+		if (ALL_IN_ONE.has(gearType) && compType === 'transducer') return true;
 		return known === undefined || known === compType;
+	}
+	/** Taken by another slot, unless it is all-in-one gear going into the speaker slot. */
+	function blocked(e: Equipment, taken: Set<number | null | undefined>, slot: string): boolean {
+		return taken.has(e.id) && !(ALL_IN_ONE.has(e.equipment_type) && slot === 'transducer');
 	}
 
 	// chain editor
@@ -730,7 +745,7 @@
 			);
 			const slot = _cc[i]?.type ?? '';
 			return _eq.filter(
-				(e) => !taken.has(e.id) && (_all[i] || gearFitsSlot(e.equipment_type, slot))
+				(e) => !blocked(e, taken, slot) && (_all[i] || gearFitsSlot(e.equipment_type, slot))
 			);
 		})(equipment, cComps, showAllGear);
 
@@ -743,7 +758,7 @@
 			);
 			const slot = _cc[i]?.type ?? '';
 			return _eq.filter(
-				(e) => !taken.has(e.id) && !gearFitsSlot(e.equipment_type, slot)
+				(e) => !blocked(e, taken, slot) && !gearFitsSlot(e.equipment_type, slot)
 			).length;
 		})(equipment, cComps, showAllGear);
 

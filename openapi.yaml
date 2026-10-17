@@ -82,7 +82,7 @@ info:
   license:
     name: AGPL-3.0-or-later
     identifier: AGPL-3.0-or-later
-  version: 0.122.0
+  version: 0.123.0
 servers:
 - url: /
   description: The Tapedeck instance serving this document.
@@ -9080,6 +9080,496 @@ paths:
       - apiToken:
         - write
       - sessionCookie: []
+  /api/v1/radio/stations:
+    get:
+      tags:
+      - Radio
+      summary: Every station that can be picked.
+      description: |-
+        Scope: `read`. German public radio for now: every service the nine ARD
+        broadcasters list in their RadioDNS service information, fetched by the
+        server and kept for a day. FM frequency, DAB channel and city are not in
+        that data, which is why a preset asks for them.
+      operationId: stations
+      responses:
+        '200':
+          description: OK. Empty when no broadcaster could be reached.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StationList'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+      security:
+      - apiToken:
+        - read
+      - sessionCookie: []
+  /api/v1/radio/lookup:
+    get:
+      tags:
+      - Radio
+      summary: Any station by its broadcast identifiers.
+      description: |-
+        Scope: `read`. Resolves a bearer through RadioDNS to its broadcaster and
+        returns that broadcaster's description of the service and one day's
+        schedule. Works for stations outside the station list — any broadcaster
+        that runs RadioDNS — and is how one is identified from what a radio
+        shows (PI code and frequency, or ensemble and service ID).
+      operationId: radio_lookup
+      parameters:
+      - name: bearer
+        in: query
+        description: |-
+          `fm:<gcc>.<pi>.<freq>` or `dab:<gcc>.<eid>.<sid>.<scids>`, e.g.
+          `fm:de0.d3c3.09440`.
+        required: true
+        schema:
+          type: string
+      - name: date
+        in: query
+        description: '`YYYY-MM-DD`; today in your timezone when absent.'
+        required: false
+        schema:
+          type: string
+      responses:
+        '200':
+          description: Found.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StationLookup'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          description: Not in RadioDNS, or the broadcaster publishes no service information.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '502':
+          description: DNS or the broadcaster's server failed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+      security:
+      - apiToken:
+        - read
+      - sessionCookie: []
+  /api/v1/radio/presets:
+    get:
+      tags:
+      - Radio
+      summary: Your presets, in order.
+      description: 'Scope: `read`.'
+      operationId: list_presets
+      responses:
+        '200':
+          description: OK.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PresetList'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+      security:
+      - apiToken:
+        - read
+      - sessionCookie: []
+    post:
+      tags:
+      - Radio
+      summary: Save a station as a preset.
+      description: 'Scope: `write`. One preset per station and band.'
+      operationId: add_preset
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/NewPreset'
+        required: true
+      responses:
+        '201':
+          description: Saved.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RadioPreset'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          description: Not in the station list.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '409':
+          description: Already a preset on that band.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+      security:
+      - apiToken:
+        - write
+      - sessionCookie: []
+  /api/v1/radio/presets/{id}:
+    delete:
+      tags:
+      - Radio
+      summary: Remove a preset.
+      description: 'Scope: `write`. The air log and any listens it produced stay.'
+      operationId: delete_preset
+      parameters:
+      - name: id
+        in: path
+        description: Preset id
+        required: true
+        schema:
+          type: integer
+          format: int64
+      responses:
+        '204':
+          description: Removed.
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+      security:
+      - apiToken:
+        - write
+      - sessionCookie: []
+    patch:
+      tags:
+      - Radio
+      summary: Change a preset's dial position, city or order.
+      description: 'Scope: `write`.'
+      operationId: update_preset
+      parameters:
+      - name: id
+        in: path
+        description: Preset id
+        required: true
+        schema:
+          type: integer
+          format: int64
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PresetUpdate'
+        required: true
+      responses:
+        '200':
+          description: Changed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RadioPreset'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+      security:
+      - apiToken:
+        - write
+      - sessionCookie: []
+  /api/v1/radio/tuner:
+    get:
+      tags:
+      - Radio
+      summary: What the tuner is doing.
+      description: 'Scope: `read`. `tuned: false` when it is off.'
+      operationId: tuner
+      responses:
+        '200':
+          description: OK.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TunerStatus'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+      security:
+      - apiToken:
+        - read
+      - sessionCookie: []
+    post:
+      tags:
+      - Radio
+      summary: Tune in to a preset.
+      description: |-
+        Scope: `write`. From now until you turn it off, tune elsewhere or the
+        auto-stop runs out, the server reads the station's stream for track names
+        and logs them under your rules. Replaces whatever you were tuned to.
+      operationId: tune
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TuneRequest'
+        required: true
+      responses:
+        '200':
+          description: Tuned in.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TunerStatus'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: The station is not in the list, or publishes no stream.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+      security:
+      - apiToken:
+        - write
+      - sessionCookie: []
+    delete:
+      tags:
+      - Radio
+      summary: Turn the tuner off.
+      description: 'Scope: `write`. Whatever was playing is judged as cut short.'
+      operationId: tune_off
+      responses:
+        '200':
+          description: Off.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TunerStatus'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+      security:
+      - apiToken:
+        - write
+      - sessionCookie: []
+  /api/v1/radio/schedule:
+    get:
+      tags:
+      - Radio
+      summary: Today's programmes on a preset's station.
+      description: |-
+        Scope: `read`. From RadioDNS; `status` says when the broadcaster publishes
+        none. Cached for half an hour.
+      operationId: schedule
+      parameters:
+      - name: preset_id
+        in: query
+        required: true
+        schema:
+          type: integer
+          format: int64
+      responses:
+        '200':
+          description: OK.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ScheduleOut'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: The station is not in the list right now.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+      security:
+      - apiToken:
+        - read
+      - sessionCookie: []
+  /api/v1/radio/log:
+    get:
+      tags:
+      - Radio
+      summary: The air log and the review queue.
+      description: |-
+        Scope: `read`. Every line a station sent while you were tuned in —
+        tracks, guesses, breaks — and what became of it. Only `scrobbled` and
+        `kept` lines are listens.
+      operationId: air_log
+      parameters:
+      - name: limit
+        in: query
+        required: false
+        schema:
+          type: integer
+          format: int64
+          default: 50
+          maximum: 200
+          minimum: 1
+      responses:
+        '200':
+          description: OK.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AirLog'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+      security:
+      - apiToken:
+        - read
+      - sessionCookie: []
+  /api/v1/radio/log/{id}/keep:
+    post:
+      tags:
+      - Radio
+      summary: 'Keep a line from the review queue: write it as a listen.'
+      description: 'Scope: `write`. It is forwarded like any other listen.'
+      operationId: keep_line
+      parameters:
+      - name: id
+        in: path
+        description: Air log line id
+        required: true
+        schema:
+          type: integer
+          format: int64
+      responses:
+        '200':
+          description: Kept.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AirLogEntry'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: Already settled, or already in your history.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+      security:
+      - apiToken:
+        - write
+      - sessionCookie: []
+  /api/v1/radio/log/{id}/drop:
+    post:
+      tags:
+      - Radio
+      summary: Drop a line from the review queue.
+      description: |-
+        Scope: `write`. It stays in the air log, marked dropped, and never becomes
+        a listen.
+      operationId: drop_line
+      parameters:
+      - name: id
+        in: path
+        description: Air log line id
+        required: true
+        schema:
+          type: integer
+          format: int64
+      responses:
+        '200':
+          description: Dropped.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AirLogEntry'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: Already settled.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+      security:
+      - apiToken:
+        - write
+      - sessionCookie: []
+  /api/v1/radio/recent:
+    get:
+      tags:
+      - Radio
+      summary: Stations you tuned to recently.
+      description: 'Scope: `read`.'
+      operationId: recent
+      responses:
+        '200':
+          description: OK.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RecentTuned'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+      security:
+      - apiToken:
+        - read
+      - sessionCookie: []
+  /api/v1/radio/settings:
+    get:
+      tags:
+      - Radio
+      summary: Your radio scrobble rules.
+      description: 'Scope: `read`.'
+      operationId: radio_get_settings
+      responses:
+        '200':
+          description: OK.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RadioSettings'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+      security:
+      - apiToken:
+        - read
+      - sessionCookie: []
+    put:
+      tags:
+      - Radio
+      summary: Replace your radio scrobble rules.
+      description: |-
+        Scope: `write`. The whole object; a missing field takes its default. A
+        running tuner picks up the change at once — the auto-stop moves, and the
+        next track is judged by the new rules — except the chain, which a session
+        keeps from when it started.
+      operationId: radio_put_settings
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RadioSettings'
+        required: true
+      responses:
+        '200':
+          description: Saved.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RadioSettings'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+      security:
+      - apiToken:
+        - write
+      - sessionCookie: []
   /users/{name}:
     get:
       tags:
@@ -11265,6 +11755,88 @@ components:
               The line count changed, so every `[[line:…]]` quote past the change
               now points at different words. Say so.
       description: A picked record, held — or why LRCLIB could not be asked.
+    AirLog:
+      type: object
+      required:
+      - entries
+      - review
+      properties:
+        entries:
+          type: array
+          items:
+            $ref: '#/components/schemas/AirLogEntry'
+          description: Newest first.
+        review:
+          type: array
+          items:
+            $ref: '#/components/schemas/AirLogEntry'
+          description: Lines waiting for Keep or Drop, oldest first, however far back.
+    AirLogEntry:
+      type: object
+      description: One thing a station said while you were tuned in.
+      required:
+      - id
+      - session_id
+      - station_id
+      - station_name
+      - band
+      - started_at
+      - raw
+      - kind
+      - source
+      - status
+      properties:
+        id:
+          type: integer
+          format: int64
+        session_id:
+          type: integer
+          format: int64
+        station_id:
+          type: string
+        station_name:
+          type: string
+        band:
+          type: string
+        started_at:
+          type: integer
+          format: int64
+        ended_at:
+          type:
+          - integer
+          - 'null'
+          format: int64
+        raw:
+          type: string
+          description: Exactly what the station sent.
+        artist:
+          type:
+          - string
+          - 'null'
+        title:
+          type:
+          - string
+          - 'null'
+        kind:
+          type: string
+          description: '`track`, `guess`, `break` or `other`.'
+        source:
+          type: string
+          description: '`ICY` today.'
+        status:
+          type: string
+          description: |-
+            `playing`, `scrobbled`, `review`, `kept`, `dropped`, `held`,
+            `partial`, `skipped` or `logged`.
+        source_id:
+          type:
+          - string
+          - 'null'
+          description: The listen this became, as `scrobbles.source_id`.
+        mbid_recording:
+          type:
+          - string
+          - 'null'
     AlbumAggregate:
       type: object
       required:
@@ -13249,6 +13821,71 @@ components:
           type: array
           items:
             $ref: '#/components/schemas/Device'
+    DirectoryStation:
+      type: object
+      description: One pickable station.
+      required:
+      - id
+      - name
+      - broadcaster
+      - provider
+      - region
+      - genres
+      - dab
+      properties:
+        id:
+          type: string
+          description: |-
+            `<gcc>.<pi>`, e.g. `de0.d3c3`. In German public radio the FM PI code
+            and the DAB service ID are the same number, so one id names the
+            station on both bands.
+        name:
+          type: string
+        short_name:
+          type:
+          - string
+          - 'null'
+          description: The 8-character name a radio display shows.
+        broadcaster:
+          type: string
+          description: The broadcaster's FQDN, e.g. `demdr.radiodns.ard.de`.
+        provider:
+          type: string
+          description: e.g. `MDR`.
+        region:
+          type: string
+          description: The broadcaster's area — not where this station is heard.
+        description:
+          type:
+          - string
+          - 'null'
+        genres:
+          type: array
+          items:
+            type: string
+          description: The broadcaster's genre labels, e.g. `Pop`, `Information`.
+        logo:
+          type:
+          - string
+          - 'null'
+          description: The best square logo, when there is one.
+        fm:
+          type:
+          - string
+          - 'null'
+          description: |-
+            The FM bearer as published, e.g. `fm:de0.d3c3.*`. Absent for a
+            DAB-only station.
+        dab:
+          type: array
+          items:
+            type: string
+          description: Every DAB bearer, one per ensemble it is carried in.
+        stream:
+          oneOf:
+          - type: 'null'
+          - $ref: '#/components/schemas/StreamChoice'
+            description: The stream the tuner would read. Absent means it cannot be logged.
     DiscogsCheck:
       type: object
       description: |-
@@ -17067,6 +17704,28 @@ components:
             Space- or comma-separated grants. Anything unrecognised is dropped
             rather than stored. Omitted means the default read grants.
           example: listening:read library:read
+    NewPreset:
+      type: object
+      required:
+      - station_id
+      - band
+      properties:
+        station_id:
+          type: string
+          description: A station list id, e.g. `de0.d3c3`.
+        band:
+          type: string
+          description: '`fm` or `dab` — which you listen to it on.'
+        dial:
+          type:
+          - string
+          - 'null'
+          description: MHz for FM (`95.8`), the channel block for DAB (`5C`).
+        city:
+          type:
+          - string
+          - 'null'
+          description: At most 60 characters.
     NewShelfItem:
       type: object
       required:
@@ -17575,6 +18234,24 @@ components:
       properties:
         status:
           type: string
+    OnAirNow:
+      type: object
+      required:
+      - artist
+      - title
+      - since
+      - tagged
+      properties:
+        artist:
+          type: string
+        title:
+          type: string
+        since:
+          type: integer
+          format: int64
+        tagged:
+          type: boolean
+          description: MusicBrainz recognised it.
     OneSession:
       type: object
       description: A session, as it stands after an edit.
@@ -18624,6 +19301,33 @@ components:
           type: integer
           format: int64
           description: How many plays this has now put in your inbox.
+    PresetList:
+      type: object
+      required:
+      - presets
+      properties:
+        presets:
+          type: array
+          items:
+            $ref: '#/components/schemas/RadioPreset'
+    PresetUpdate:
+      type: object
+      description: Each field distinguishes absent ("leave alone") from `null` ("clear").
+      properties:
+        dial:
+          type:
+          - string
+          - 'null'
+        city:
+          type:
+          - string
+          - 'null'
+        position:
+          type:
+          - integer
+          - 'null'
+          format: int64
+          description: Order on the preset row, from 1.
     PressingCandidate:
       type: object
       description: A candidate pressing.
@@ -19099,6 +19803,132 @@ components:
           description: |-
             Enabled, writable sources, and TIDAL when it is connected. Empty is a
             normal answer.
+    RadioPreset:
+      type: object
+      description: A station the listener saved, where it sits on their dial.
+      required:
+      - id
+      - station_id
+      - name
+      - band
+      - position
+      properties:
+        id:
+          type: integer
+          format: int64
+        station_id:
+          type: string
+          description: '`<gcc>.<pi>`, the directory''s id.'
+        name:
+          type: string
+        short_name:
+          type:
+          - string
+          - 'null'
+        band:
+          type: string
+          description: '`fm` or `dab`.'
+        dial:
+          type:
+          - string
+          - 'null'
+          description: MHz for FM (`95.8`), the channel block for DAB (`5C`).
+        city:
+          type:
+          - string
+          - 'null'
+        position:
+          type: integer
+          format: int64
+          description: Order on the preset row, from 1.
+    RadioSession:
+      type: object
+      description: One stretch of listening to one station.
+      required:
+      - id
+      - station_id
+      - station_name
+      - band
+      - started_at
+      properties:
+        id:
+          type: integer
+          format: int64
+        station_id:
+          type: string
+        station_name:
+          type: string
+        band:
+          type: string
+        dial:
+          type:
+          - string
+          - 'null'
+        city:
+          type:
+          - string
+          - 'null'
+        chain_id:
+          type:
+          - integer
+          - 'null'
+          format: int64
+        started_at:
+          type: integer
+          format: int64
+        ended_at:
+          type:
+          - integer
+          - 'null'
+          format: int64
+        end_reason:
+          type:
+          - string
+          - 'null'
+    RadioSettings:
+      type: object
+      description: |-
+        The listener's rules, stored in their preferences under `radio`. Every
+        field defaults the way the design draws it: all on, a three-hour stop.
+      properties:
+        skip_breaks:
+          type: boolean
+          description: |-
+            Skip ads, talk & jingles: such lines are logged as skipped. Off, they
+            are logged as logged. Neither ever becomes a listen.
+          default: true
+        tagged_only:
+          type: boolean
+          description: 'Forward tagged tracks only: a guess waits rather than being written.'
+          default: true
+        review:
+          type: boolean
+          description: Guesses wait in the review queue. Off, they are held in the log.
+          default: true
+        tag_radio:
+          type: boolean
+          description: Save radio listens with `listening_context = radio`.
+          default: true
+        auto_stop:
+          type: boolean
+          description: End the session by itself after `auto_stop_hours`.
+          default: true
+        auto_stop_hours:
+          type: integer
+          format: int32
+          description: 1–12.
+          default: 3
+          minimum: 0
+        attach_chain:
+          type: boolean
+          description: File radio listens under `chain_id`.
+          default: true
+        chain_id:
+          type:
+          - integer
+          - 'null'
+          format: int64
+          default: null
     RangedStats:
       type: object
       description: |-
@@ -19618,6 +20448,16 @@ components:
         state:
           type: string
           description: Always `running`.
+    RecentTuned:
+      type: object
+      required:
+      - recent
+      properties:
+        recent:
+          type: array
+          items:
+            $ref: '#/components/schemas/RadioSession'
+          description: Newest first, one per station and band.
     RecommendationRow:
       type: object
       required:
@@ -20353,6 +21193,37 @@ components:
           items:
             type: integer
             format: int64
+    ScheduleOut:
+      type: object
+      description: What `GET /api/v1/radio/schedule` returns.
+      required:
+      - station_id
+      - date
+      - source
+      - status
+      - programmes
+      properties:
+        station_id:
+          type: string
+        date:
+          type: string
+          description: '`YYYY-MM-DD`.'
+        source:
+          type: string
+          description: '`RadioDNS` — the only source today.'
+        status:
+          $ref: '#/components/schemas/ScheduleStatus'
+        programmes:
+          type: array
+          items:
+            $ref: '#/components/schemas/SpiProgramme'
+    ScheduleStatus:
+      type: string
+      description: Whether a day's schedule came back, in words a client can show.
+      enum:
+      - published
+      - not_published
+      - unavailable
     ScopeOffer:
       type: object
       required:
@@ -21962,6 +22833,172 @@ components:
           description: |-
             Which Jellyfin or Emby account's sessions to scrobble. Needed whenever
             the key is a dashboard API key, which belongs to no user.
+    SpiBearer:
+      type: object
+      description: 'One way to receive a service: `fm:…`, `dab:…`, or an `http(s)://` stream.'
+      required:
+      - id
+      properties:
+        id:
+          type: string
+          description: |-
+            The bearer URI as published. An FM bearer may end in `*`, meaning
+            every frequency the PI code is heard on.
+        cost:
+          type:
+          - integer
+          - 'null'
+          format: int32
+          description: The broadcaster's preference between bearers; lower is preferred.
+          minimum: 0
+        mime:
+          type:
+          - string
+          - 'null'
+        bitrate:
+          type:
+          - integer
+          - 'null'
+          format: int32
+          description: kbit/s, given for streams.
+          minimum: 0
+    SpiGenre:
+      type: object
+      description: |-
+        A TV-Anytime genre: the classification URN and the label the broadcaster
+        gave it.
+      required:
+      - href
+      properties:
+        href:
+          type: string
+          description: e.g. `urn:tva:metadata:cs:ContentCS:2011:3.6.4.1`.
+        name:
+          type:
+          - string
+          - 'null'
+    SpiLogo:
+      type: object
+      description: A station logo, as a URL on the broadcaster's server. Never fetched here.
+      required:
+      - url
+      properties:
+        url:
+          type: string
+        width:
+          type:
+          - integer
+          - 'null'
+          format: int32
+          minimum: 0
+        height:
+          type:
+          - integer
+          - 'null'
+          format: int32
+          minimum: 0
+        kind:
+          type:
+          - string
+          - 'null'
+          description: '`logo_colour_square`, `logo_colour_rectangle` or `logo_unrestricted`.'
+        mime:
+          type:
+          - string
+          - 'null'
+    SpiNames:
+      type: object
+      description: |-
+        The three lengths of name SPI gives everything. `medium` is often a
+        truncation of `long` (MDR's "MDR KULTUR am Mo"), so [`Names::best`] reads
+        the longest one there is.
+      properties:
+        short:
+          type:
+          - string
+          - 'null'
+          description: At most 8 characters.
+        medium:
+          type:
+          - string
+          - 'null'
+          description: At most 16 characters.
+        long:
+          type:
+          - string
+          - 'null'
+          description: At most 128 characters.
+    SpiProgramme:
+      type: object
+      description: One programme from a `PI.xml` schedule.
+      required:
+      - names
+      - start
+      - genres
+      properties:
+        id:
+          type:
+          - string
+          - 'null'
+          description: The broadcaster's CRID, e.g. `crid://MDR.de/MDR+KULTUR/7409527`.
+        names:
+          $ref: '#/components/schemas/SpiNames'
+        start:
+          type: integer
+          format: int64
+          description: |-
+            Unix seconds. The broadcaster's `actualTime` when it gives one (the
+            time it really went out), otherwise the scheduled `time`.
+        duration:
+          type:
+          - integer
+          - 'null'
+          format: int32
+          description: Seconds, from the matching `actualDuration` or `duration`.
+          minimum: 0
+        description:
+          type:
+          - string
+          - 'null'
+        genres:
+          type: array
+          items:
+            $ref: '#/components/schemas/SpiGenre'
+    SpiService:
+      type: object
+      description: One service from a broadcaster's `SI.xml`.
+      required:
+      - names
+      - genres
+      - logos
+      - bearers
+      - links
+      properties:
+        names:
+          $ref: '#/components/schemas/SpiNames'
+        description:
+          type:
+          - string
+          - 'null'
+        genres:
+          type: array
+          items:
+            $ref: '#/components/schemas/SpiGenre'
+        logos:
+          type: array
+          items:
+            $ref: '#/components/schemas/SpiLogo'
+        bearers:
+          type: array
+          items:
+            $ref: '#/components/schemas/SpiBearer'
+        links:
+          type: array
+          items:
+            type: string
+          description: |-
+            Web pages the broadcaster lists (`http(s)` links only; postal and
+            telephone links are left out).
     Spin:
       type: object
       properties:
@@ -22783,6 +23820,92 @@ components:
         tone:
           type: string
           description: '`plain` or `dark`.'
+    StationList:
+      type: object
+      required:
+      - stations
+      - regions
+      - genres
+      - note
+      properties:
+        stations:
+          type: array
+          items:
+            $ref: '#/components/schemas/DirectoryStation'
+        regions:
+          type: array
+          items:
+            type: string
+          description: Every broadcaster area present, for the Browse chips.
+        genres:
+          type: array
+          items:
+            type: string
+          description: Every genre label present, most common first.
+        note:
+          type: string
+    StationLookup:
+      type: object
+      description: Everything one lookup found.
+      required:
+      - bearer
+      - broadcaster
+      - spi_server
+      - date
+      - schedule_status
+      - programmes
+      properties:
+        bearer:
+          type: string
+          description: The bearer looked up, in canonical spelling.
+        broadcaster:
+          type: string
+          description: The broadcaster RadioDNS pointed at, e.g. `demdr.radiodns.ard.de`.
+        spi_server:
+          type: string
+          description: The SPI server the documents came from.
+        provider:
+          oneOf:
+          - type: 'null'
+          - $ref: '#/components/schemas/SpiNames'
+            description: The broadcaster's own name for itself, when `SI.xml` gives one.
+        service:
+          oneOf:
+          - type: 'null'
+          - $ref: '#/components/schemas/SpiService'
+            description: |-
+              This bearer's service from `SI.xml`. Absent when the broadcaster's list
+              does not carry it, which happens: the schedule is still tried.
+        date:
+          type: string
+          description: The day asked for, `YYYY-MM-DD`.
+        schedule_status:
+          $ref: '#/components/schemas/ScheduleStatus'
+        programmes:
+          type: array
+          items:
+            $ref: '#/components/schemas/SpiProgramme'
+    StreamChoice:
+      type: object
+      description: |-
+        An internet stream a station publishes — what the tuner reads track names
+        from.
+      required:
+      - url
+      properties:
+        url:
+          type: string
+        mime:
+          type:
+          - string
+          - 'null'
+        bitrate:
+          type:
+          - integer
+          - 'null'
+          format: int32
+          description: kbit/s.
+          minimum: 0
     SubmitListen:
       type: object
       description: One listen in a ListenBrainz-shaped submission.
@@ -23820,6 +24943,95 @@ components:
         value:
           type: integer
           format: int64
+    TuneRequest:
+      type: object
+      required:
+      - preset_id
+      properties:
+        preset_id:
+          type: integer
+          format: int64
+    TunerState:
+      type: string
+      description: What the faceplate shows.
+      enum:
+      - tuning
+      - live
+      - unknown
+      - break
+      - dropped
+    TunerStatus:
+      type: object
+      description: What `GET /api/v1/radio/tuner` returns.
+      required:
+      - tuned
+      - signal
+      properties:
+        tuned:
+          type: boolean
+        preset:
+          oneOf:
+          - type: 'null'
+          - $ref: '#/components/schemas/RadioPreset'
+        session_id:
+          type:
+          - integer
+          - 'null'
+          format: int64
+        since:
+          type:
+          - integer
+          - 'null'
+          format: int64
+          description: Unix seconds.
+        ends_at:
+          type:
+          - integer
+          - 'null'
+          format: int64
+          description: When auto-stop will end it, if it will.
+        state:
+          oneOf:
+          - type: 'null'
+          - $ref: '#/components/schemas/TunerState'
+        now:
+          oneOf:
+          - type: 'null'
+          - $ref: '#/components/schemas/OnAirNow'
+        line:
+          type:
+          - string
+          - 'null'
+          description: The last thing the station said, verbatim.
+        source:
+          type:
+          - string
+          - 'null'
+          description: 'Where `line` came from: `ICY` today.'
+        retry_at:
+          type:
+          - integer
+          - 'null'
+          format: int64
+          description: When a dropped stream is next retried.
+        signal:
+          type: integer
+          format: int32
+          description: '0–5, the faceplate''s bars: connection health, not RF signal.'
+          minimum: 0
+        chain_id:
+          type:
+          - integer
+          - 'null'
+          format: int64
+        chain_name:
+          type:
+          - string
+          - 'null'
+        logo:
+          type:
+          - string
+          - 'null'
     Unpatched:
       type: object
       required:
@@ -24468,6 +25680,8 @@ tags:
   description: Signal chains, gear, devices and bindings.
 - name: Shelf
   description: Records, tapes and discs — a shelf you catalogue and sides you play.
+- name: Radio
+  description: Stations, presets and the tuner that logs what they play. German public radio, via RadioDNS.
 - name: Genre map
   description: Every Noise at Once — coverage, colour, trajectory, neighbours.
 - name: Rediscovery

@@ -51,6 +51,118 @@ export interface Scrobble {
 	artwork_url: string | null;
 }
 
+// ── Radio ─────────────────────────────────────────────────────────────────
+
+/** A station from the directory (ARD's RadioDNS service lists). */
+export interface RadioStation {
+	/** `<gcc>.<pi>`, e.g. `de0.d3c3`. */
+	id: string;
+	name: string;
+	short_name: string | null;
+	broadcaster: string;
+	provider: string;
+	/** The broadcaster's area, not where the station is heard. */
+	region: string;
+	description: string | null;
+	genres: string[];
+	logo: string | null;
+	/** `fm:de0.d3c3.*` — no frequency; that is the listener's to type. */
+	fm: string | null;
+	dab: string[];
+	/** Absent: nothing to read track names from, so it cannot be logged. */
+	stream: { url: string; mime: string | null; bitrate: number | null } | null;
+}
+
+export interface RadioPreset {
+	id: number;
+	station_id: string;
+	name: string;
+	short_name: string | null;
+	band: 'fm' | 'dab';
+	/** MHz for FM (`95.8`), the channel block for DAB (`5C`). */
+	dial: string | null;
+	city: string | null;
+	position: number;
+}
+
+export type TunerState = 'tuning' | 'live' | 'unknown' | 'break' | 'dropped';
+
+export interface TunerStatus {
+	tuned: boolean;
+	preset: RadioPreset | null;
+	session_id: number | null;
+	since: number | null;
+	ends_at: number | null;
+	state: TunerState | null;
+	now: { artist: string; title: string; since: number; tagged: boolean } | null;
+	line: string | null;
+	source: string | null;
+	retry_at: number | null;
+	/** 0–5: connection health, not RF signal. */
+	signal: number;
+	chain_id: number | null;
+	chain_name: string | null;
+	logo: string | null;
+}
+
+export interface RadioProgramme {
+	id: string | null;
+	names: { short: string | null; medium: string | null; long: string | null };
+	start: number;
+	duration: number | null;
+	description: string | null;
+}
+
+export interface RadioSchedule {
+	station_id: string;
+	date: string;
+	source: string;
+	status: 'published' | 'not_published' | 'unavailable';
+	programmes: RadioProgramme[];
+}
+
+export interface AirLogEntry {
+	id: number;
+	session_id: number;
+	station_id: string;
+	station_name: string;
+	band: string;
+	started_at: number;
+	ended_at: number | null;
+	raw: string;
+	artist: string | null;
+	title: string | null;
+	kind: 'track' | 'guess' | 'break' | 'other';
+	source: string;
+	status: string;
+	source_id: string | null;
+	mbid_recording: string | null;
+}
+
+export interface RadioSession {
+	id: number;
+	station_id: string;
+	station_name: string;
+	band: string;
+	dial: string | null;
+	city: string | null;
+	chain_id: number | null;
+	started_at: number;
+	ended_at: number | null;
+	end_reason: string | null;
+}
+
+export interface RadioSettings {
+	skip_breaks: boolean;
+	tagged_only: boolean;
+	review: boolean;
+	tag_radio: boolean;
+	auto_stop: boolean;
+	auto_stop_hours: number;
+	attach_chain: boolean;
+	chain_id: number | null;
+}
+
 /** Your listening placed on Every Noise's genre map. */
 export interface GenreMap {
 	/** The backdrop: every genre as a compact [name, x, y, colour] tuple. */
@@ -2800,6 +2912,54 @@ class TapedeckAPI {
 	async importHistory(): Promise<{ imports: ImportRecord[] }> { return this.get('/api/v1/import/history'); }
 
 	// ── Chains ──
+	// ── Radio ──
+	async getRadioStations(): Promise<{ stations: RadioStation[]; regions: string[]; genres: string[]; note: string }> {
+		return this.get('/api/v1/radio/stations');
+	}
+	async getRadioPresets(): Promise<{ presets: RadioPreset[] }> {
+		return this.get('/api/v1/radio/presets');
+	}
+	async addRadioPreset(body: { station_id: string; band: 'fm' | 'dab'; dial?: string | null; city?: string | null }): Promise<RadioPreset> {
+		return this.post('/api/v1/radio/presets', body);
+	}
+	/** Absent fields are left alone; `null` clears. */
+	async updateRadioPreset(id: number, body: { dial?: string | null; city?: string | null; position?: number }): Promise<RadioPreset> {
+		return this.patch(`/api/v1/radio/presets/${id}`, body);
+	}
+	async deleteRadioPreset(id: number): Promise<void> {
+		return this.delNoBody(`/api/v1/radio/presets/${id}`);
+	}
+	async getTuner(): Promise<TunerStatus> {
+		return this.get('/api/v1/radio/tuner');
+	}
+	async tuneIn(preset_id: number): Promise<TunerStatus> {
+		return this.post('/api/v1/radio/tuner', { preset_id });
+	}
+	async tuneOff(): Promise<TunerStatus> {
+		return this.del('/api/v1/radio/tuner');
+	}
+	async getRadioSchedule(preset_id: number): Promise<RadioSchedule> {
+		return this.get(`/api/v1/radio/schedule?preset_id=${preset_id}`);
+	}
+	async getAirLog(limit = 50): Promise<{ entries: AirLogEntry[]; review: AirLogEntry[] }> {
+		return this.get(`/api/v1/radio/log?limit=${limit}`);
+	}
+	async keepAirLine(id: number): Promise<AirLogEntry> {
+		return this.post(`/api/v1/radio/log/${id}/keep`);
+	}
+	async dropAirLine(id: number): Promise<AirLogEntry> {
+		return this.post(`/api/v1/radio/log/${id}/drop`);
+	}
+	async getRecentRadio(): Promise<{ recent: RadioSession[] }> {
+		return this.get('/api/v1/radio/recent');
+	}
+	async getRadioSettings(): Promise<RadioSettings> {
+		return this.get('/api/v1/radio/settings');
+	}
+	async putRadioSettings(body: RadioSettings): Promise<RadioSettings> {
+		return this.put('/api/v1/radio/settings', body);
+	}
+
 	async getChains(): Promise<{ chains: SignalChain[] }> { return this.get('/api/v1/chains'); }
 	async getChain(id: number): Promise<SignalChain> { return this.get(`/api/v1/chains/${id}`); }
 	async createChain(data: ChainInput): Promise<{ id: number }> {

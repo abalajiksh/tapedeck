@@ -18,6 +18,8 @@ mod openapi;
 mod patch;
 mod playlist_lab;
 mod playlists;
+mod radio;
+mod radiodns;
 mod ratings;
 mod replica;
 mod report_image;
@@ -198,6 +200,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
+    // A tuner lives in memory, so any radio session still open ended when the
+    // last process did.
+    if let Err(e) = db.close_dangling_radio().await {
+        warn!("📻 Could not close radio sessions left open: {e}");
+    }
+
     // ── HTTP server ──
     let app_state = Arc::new(server::AppState {
         db: db.clone(),
@@ -235,6 +243,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             String::new()
         },
         uploads_dir: std::path::PathBuf::from(&config.database.uploads_dir),
+        radio: Default::default(),
     });
 
     let app = server::build_app(app_state);

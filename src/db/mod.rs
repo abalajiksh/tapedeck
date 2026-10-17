@@ -3351,6 +3351,8 @@ mod migrate;
 mod notes;
 mod patch;
 mod physical;
+mod radio;
+pub use radio::{AirLogEntry, NewAirLine, RadioPreset, RadioSession};
 mod ratings;
 mod rediscovery;
 // The rating types are named by the sources that produce them and by the

@@ -1,0 +1,57 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<epg xmlns="http://www.worlddab.org/schemas/spi/31" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://www.worlddab.org/schemas/spi/31 http://www.worlddab.org/schemas/spi/31/spi_31.xsd">
+  <schedule creationTime="2026-10-17T14:05:20+02:00" originator="MDR.de">
+    <scope startTime="2026-10-17T00:00:00+02:00" stopTime="2026-10-18T00:00:00+02:00">
+      <serviceScope id="dab:de0.10d1.d3c3.0"/>
+      <serviceScope id="http://mdr-284310-0.sslcast.mdr.de/mdr/284310/0/mp3/low/stream.mp3"/>
+      <serviceScope id="dab:de0.10e5.d3c3.0"/>
+      <serviceScope id="dab:de0.1135.d3c3.0"/>
+    </scope>
+    <programme id="crid://MDR.de/MDR+KULTUR/7409527" shortId="7409527">
+      <mediumName><![CDATA[MDR KULTUR am Mo]]></mediumName>
+      <longName><![CDATA[MDR KULTUR am Morgen]]></longName>
+      <location>
+        <time time="2026-10-17T06:00:00+02:00" duration="PT3H" actualTime="2026-10-17T06:00:00+02:00" actualDuration="PT3H"/>
+      </location>
+      <mediaDescription>
+        <shortDescription><![CDATA[* 06:45 Uhr - Der Stichtag: 1936 Vorstellung des Agfa-Color-Films in Wolfen
+Wie bannt man die bunte Welt auf Film? Die Lösung fand man vor 90 Jahren in Wolfen. ...]]></shortDescription>
+      </mediaDescription>
+    </programme>
+    <programme id="crid://MDR.de/MDR+KULTUR/7409528" shortId="7409528">
+      <mediumName><![CDATA[MDR KULTUR Weltg]]></mediumName>
+      <longName><![CDATA[MDR KULTUR Weltgeschichte vor der Haustür]]></longName>
+      <location>
+        <time time="2026-10-17T09:00:00+02:00" duration="PT35M" actualTime="2026-10-17T09:00:00+02:00" actualDuration="PT35M"/>
+      </location>
+      <mediaDescription>
+        <shortDescription><![CDATA[Die Gensammler von Gatersleben / Eine Podcast - Folge von Hartmut Schade und Conny Wolter]]></shortDescription>
+      </mediaDescription>
+    </programme>
+    <programme id="crid://MDR.de/MDR+KULTUR/7409529" shortId="7409529">
+      <mediumName><![CDATA[MDR KULTUR am Vo]]></mediumName>
+      <longName><![CDATA[MDR KULTUR am Vormittag]]></longName>
+      <location>
+        <time time="2026-10-17T09:35:00+02:00" duration="PT1H25M" actualTime="2026-10-17T09:35:00+02:00" actualDuration="PT1H25M"/>
+      </location>
+      <mediaDescription>
+        <shortDescription><![CDATA[* 10:15 Uhr - Premiere Bautzen - „Der Wunderheiler“
+
+* 10:30 Uhr - Feuilleton
+
+* 10:40 Uhr - Der Stichtag: 1936 Vorstellung des Agfa-Color-Films in Wolfen
+Wie b...]]></shortDescription>
+      </mediaDescription>
+    </programme>
+    <programme id="crid://MDR.de/MDR+KULTUR/7409530" shortId="7409530">
+      <mediumName><![CDATA[MDR KULTUR triff]]></mediumName>
+      <longName><![CDATA[MDR KULTUR trifft... Anne Hahn ]]></longName>
+      <location>
+        <time time="2026-10-17T11:00:00+02:00" duration="PT1H" actualTime="2026-10-17T11:00:00+02:00" actualDuration="PT1H"/>
+      </location>
+      <mediaDescription>
+        <shortDescription><![CDATA[Autorin, Stadtschreiberin von Magdeburg  ]]></shortDescription>
+      </mediaDescription>
+    </programme>
+  </schedule>
+</epg>
