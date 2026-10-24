@@ -1187,9 +1187,13 @@ export interface NowPlayingTrack {
 	 * those as an estimate; a pause or a seek makes them arbitrarily wrong.
 	 */
 	position_known: boolean;
-	/** Only a pushing client can say so. A paused entry holds `progress` still. */
+	/** Only a pushing client can say so; false for every polled source. A
+	 *  paused entry holds `progress` still. */
 	paused: boolean;
 	updated_at: number;
+	/** `progress` and `updated_at` unrounded, in milliseconds. */
+	progress_ms?: number;
+	updated_at_ms?: number;
 	source: string;
 	listening_context: string | null;
 	format_type: string | null;
@@ -1205,6 +1209,8 @@ export interface NowPlayingState {
 	playing: boolean;
 	/** Seconds into the track, as of the moment the server answered. */
 	position?: number;
+	/** The same in milliseconds — what the deck's clock anchors to. */
+	position_ms?: number;
 	track?: NowPlayingTrack;
 }
 
@@ -1671,20 +1677,58 @@ export interface AlbumTracklist {
 	tracks: TracklistTrack[];
 }
 
+export type PictureKind = 'portrait' | 'wide';
+
+/** One tile in the artist picture picker. */
+export interface PictureCandidate {
+	/** `plex`, `jellyfin`, `emby`, `navidrome` or `deezer`. */
+	source: string;
+	source_ref: number | null;
+	/** The server's own label, or "Deezer". */
+	source_label: string;
+	/** The outside provider a server found it through, when it says. */
+	provider: string | null;
+	/** Opaque — send it back to choose this one. */
+	key: string;
+	preview: string;
+	width: number | null;
+	height: number | null;
+	/** The server itself currently shows this one. */
+	server_selected: boolean;
+	/** The one you chose. */
+	chosen: boolean;
+}
+
+export interface PictureChoices {
+	kind: PictureKind;
+	current: {
+		source: string;
+		source_ref: number | null;
+		source_label: string | null;
+		provider: string | null;
+		url: string;
+	} | null;
+	/** What everyone sees who has not chosen — the backfill's find. */
+	shared_url: string | null;
+	candidates: PictureCandidate[];
+	/** Sources that did not answer, by label. */
+	unreachable: string[];
+}
+
 export interface ArtistView {
 	id: number;
 	name: string;
 	mbid: string | null;
-	/** Portrait: from the metadata chain, from the user's own library through
-	 *  the proxy, or set by hand. Null means the lettered tile. */
+	/** Portrait as **you** see it: your own choice, else the shared one the
+	 *  metadata chain or your library supplied. Null means the lettered tile. */
 	image_url: string | null;
 	/** The wide one, for tiles that give an artist the whole frame — the
 	 *  Reports chapter card. A different photograph from the portrait, never a
-	 *  crop of it, and only ever set by hand. */
+	 *  crop of it, and only ever chosen. */
 	landscape_url: string | null;
 	/** The `artists` row this name maps to — keyed by name and shared, unlike
 	 *  `id` which is this user's entity. Addresses the portrait proxy and the
-	 *  manual override. */
+	 *  picture picker. */
 	artist_row_id: number | null;
 	rank: number;
 	artist_total: number;
@@ -3310,20 +3354,34 @@ class TapedeckAPI {
 	async clearSpin(): Promise<{ status: string }> {
 		return this.del('/api/v1/physical/spin');
 	}
-	/** Set or clear an artist portrait by hand. Empty clears it. */
-	async setArtistImage(artistRowId: number, url: string): Promise<{ image_url: string | null }> {
-		return this.request('PUT', `/api/v1/artists/img/${artistRowId}`, { url });
+	// ── Artist pictures, chosen per person ──
+	//
+	// What *you* see for an artist. Nobody else's choice changes, and the
+	// shared picture the backfill found stays underneath as the default.
+
+	/** Every picture on offer for one tab of the picker — your servers', the
+	 *  ones they can find online, Deezer's. Slow-ish: it asks each server live. */
+	async getArtistPictures(artistRowId: number, kind: PictureKind): Promise<PictureChoices> {
+		return this.get(`/api/v1/artists/${artistRowId}/pictures?kind=${kind}`);
 	}
-	/** Set or clear an artist's **wide** image by hand. Empty clears it.
-	 *
-	 *  A different photograph from the portrait, not a crop of it: the Reports
-	 *  chapter tile is 16/11, where a square either pillarboxes or loses the
-	 *  head. Nothing supplies these automatically, so it is always a choice. */
-	async setArtistLandscape(
+	/** Choose a candidate, or `{source: 'link', key: url}` for a URL of your own. */
+	async chooseArtistPicture(
 		artistRowId: number,
-		url: string
-	): Promise<{ landscape_url: string | null }> {
-		return this.request('PUT', `/api/v1/artists/landscape/${artistRowId}`, { url });
+		kind: PictureKind,
+		choice: { source: string; source_ref?: number | null; key: string }
+	): Promise<{ url: string | null }> {
+		return this.request('PUT', `/api/v1/artists/${artistRowId}/pictures/${kind}`, choice);
+	}
+	/** Back to the shared picture. Answers with what you see now. */
+	async clearArtistPicture(artistRowId: number, kind: PictureKind): Promise<{ url: string | null }> {
+		return this.request('DELETE', `/api/v1/artists/${artistRowId}/pictures/${kind}`);
+	}
+	async uploadArtistPicture(
+		artistRowId: number,
+		kind: PictureKind,
+		file: File
+	): Promise<{ url: string | null }> {
+		return this.uploadArt(`/api/v1/artists/${artistRowId}/pictures/${kind}/upload`, file);
 	}
 	/** Set or clear an album cover by hand — takes the *entity* id, the same one
 	 *  the album page is addressed by. Empty restores the cover derived from the
@@ -3332,24 +3390,13 @@ class TapedeckAPI {
 		return this.request('PUT', `/api/v1/albums/${entityId}/cover`, { url });
 	}
 
-	/** Upload a picture instead of pasting a URL.
+	/** Upload a cover instead of pasting a URL.
 	 *
-	 *  The three overrides above cover a picture that is already somewhere on
-	 *  the web. A photograph of a record you own, or a band shot that exists
-	 *  only on your disk, had no route in at all — and "host it somewhere
-	 *  first" is not an answer for a self-hosted journal.
-	 *
-	 *  These replace the override exactly as a pasted URL does, and the file
-	 *  the new one supersedes is deleted server-side. */
-	async uploadArtistImage(artistRowId: number, file: File): Promise<{ image_url: string }> {
-		return this.uploadArt(`/api/v1/artists/img/${artistRowId}/upload`, file);
-	}
-	async uploadArtistLandscape(
-		artistRowId: number,
-		file: File
-	): Promise<{ landscape_url: string }> {
-		return this.uploadArt(`/api/v1/artists/landscape/${artistRowId}/upload`, file);
-	}
+	 *  The override above covers a picture that is already somewhere on the
+	 *  web. A photograph of a record you own had no route in at all — and "host
+	 *  it somewhere first" is not an answer for a self-hosted journal. Replaces
+	 *  the override exactly as a pasted URL does; the file it supersedes is
+	 *  deleted server-side. */
 	async uploadAlbumCover(entityId: number, file: File): Promise<{ artwork_url: string }> {
 		return this.uploadArt(`/api/v1/albums/${entityId}/cover/upload`, file);
 	}

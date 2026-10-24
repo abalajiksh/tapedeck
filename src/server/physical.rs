@@ -2636,7 +2636,12 @@ async fn set_now_playing(
 
     // The browser sitting in front of the turntable ran the clock, so
     // unlike every other push source this really is a measured position.
-    let mut np = NowPlaying::from_play(&play, SHELF_SOURCE, None, Progress::Exact(body.elapsed));
+    let mut np = NowPlaying::from_play(
+        &play,
+        SHELF_SOURCE,
+        None,
+        Progress::Exact { ms: body.elapsed * 1000 },
+    );
     // `DeckState::paused` says the entry "stays and stops advancing", and until
     // the registry learned about pause only the first half was true: the
     // position counted forward regardless and the 10s heartbeat was the only

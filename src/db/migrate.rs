@@ -1461,6 +1461,35 @@ impl Database {
                 sqlx::query("ALTER TABLE loves ADD COLUMN source TEXT").execute(&self.pool).await;
         }
 
+        // ── Artist pictures become per person (v0.124.0) ──
+        //
+        // `artist_pictures` is a new table and `init()` creates it; what needs
+        // walking forward is the data. The shared row held both the backfill's
+        // finds and whatever anyone set by hand, so the hand-set ones move to
+        // the first admin and the row goes back to automatic. See
+        // `hand_set_source` for how the two are told apart.
+        //
+        // Marker-guarded, and the marker is left unset while there is no admin
+        // yet, so a database created before its first account still runs this
+        // once it has one.
+        if self.get_app_setting("artist_pictures_per_user").await.ok().flatten().is_none() {
+            match self.move_hand_set_artist_pictures().await {
+                Ok(Some(n)) => {
+                    if n > 0 {
+                        info!(
+                            "⚙️ Migrating: {n} hand-set artist picture(s) now belong to the admin"
+                        );
+                    }
+                    let _ = self.set_app_setting("artist_pictures_per_user", "1").await;
+                }
+                Ok(None) => {}
+                Err(e) => warn!(
+                    "⚠️ Could not move the hand-set artist pictures: {}",
+                    crate::logging::error_chain(&e)
+                ),
+            }
+        }
+
         Ok(())
     }
 }

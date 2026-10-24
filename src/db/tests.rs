@@ -10396,3 +10396,160 @@ async fn an_existing_database_gains_the_ratings_shape() {
     assert_eq!(report.withdrawn, 0);
     assert_eq!(report.already, 0, "it is unmatched — nothing has been listened to here");
 }
+
+// ── Artist pictures are per person (v0.124.0) ──
+
+/// One person's choice changes what they see and nothing anybody else sees;
+/// someone who chose nothing keeps the shared picture the backfill found.
+#[tokio::test]
+async fn an_artist_picture_choice_is_seen_only_by_whoever_made_it() {
+    let db = testdb().await;
+    let ash = db.create_user("ash", None, "pw", "admin").await.unwrap();
+    let kim = db.create_user("kim", None, "pw", "user").await.unwrap();
+    db.upsert_artist("The Marías", Some("https://cdn-images.dzcdn.net/a.jpg"), None).await.unwrap();
+    let id = db.artist_row_id("The Marías").await.unwrap().unwrap();
+    let names = vec!["The Marías".to_string()];
+
+    let pick = NewArtistPicture {
+        source: "link",
+        source_ref: None,
+        image_key: "https://example.com/mine.jpg",
+        provider: None,
+        url: "https://example.com/mine.jpg",
+    };
+    db.set_artist_picture(ash, id, "portrait", &pick).await.unwrap();
+
+    let key = Database::artist_key("The Marías");
+    let mine = db.artist_images(ash, &names).await.unwrap();
+    let theirs = db.artist_images(kim, &names).await.unwrap();
+    assert_eq!(mine.get(&key).map(String::as_str), Some("https://example.com/mine.jpg"));
+    assert_eq!(theirs.get(&key).map(String::as_str), Some("https://cdn-images.dzcdn.net/a.jpg"));
+
+    // A portrait choice is not a wide one.
+    assert!(db.artist_landscapes(ash, &names).await.unwrap().is_empty());
+    db.set_artist_picture(kim, id, "wide", &pick).await.unwrap();
+    assert_eq!(db.artist_landscapes(kim, &names).await.unwrap().len(), 1);
+    assert!(db.artist_landscapes(ash, &names).await.unwrap().is_empty());
+
+    // Clearing goes back to the shared one, and hands back what it removed.
+    let gone = db.clear_artist_picture(ash, id, "portrait").await.unwrap().unwrap();
+    assert_eq!(gone.source, "link");
+    let mine = db.artist_images(ash, &names).await.unwrap();
+    assert_eq!(mine.get(&key).map(String::as_str), Some("https://cdn-images.dzcdn.net/a.jpg"));
+}
+
+/// The pictures set by hand on the shared row before v0.124.0 become the
+/// admin's, and the row goes back to automatic — while what the backfill wrote
+/// (the library proxy, a Deezer link) stays shared.
+#[tokio::test]
+async fn hand_set_shared_pictures_move_to_the_admin() {
+    let db = testdb().await;
+    let _member = db.create_user("kim", None, "pw", "user").await.unwrap();
+    let admin = db.create_user("ash", None, "pw", "admin").await.unwrap();
+    for name in ["Uploaded", "Pasted", "Proxied", "Deezered"] {
+        db.upsert_artist(name, None, None).await.unwrap();
+    }
+    let id = |n: &str| {
+        let db = &db;
+        let n = n.to_string();
+        async move { db.artist_row_id(&n).await.unwrap().unwrap() }
+    };
+    let (up, pasted, proxied, deezered) =
+        (id("Uploaded").await, id("Pasted").await, id("Proxied").await, id("Deezered").await);
+    let set = |aid: i64, col: &'static str, url: String| {
+        let db = &db;
+        async move {
+            sqlx::query(&format!("UPDATE artists SET {col} = ? WHERE id = ?"))
+                .bind(url)
+                .bind(aid)
+                .execute(&db.pool)
+                .await
+                .unwrap();
+        }
+    };
+    set(up, "image_url", "/api/v1/art/upload/0123456789abcdef01234567.jpg".into()).await;
+    set(pasted, "image_url", "https://example.com/band.jpg".into()).await;
+    set(pasted, "landscape_url", "https://example.com/wide.jpg".into()).await;
+    set(proxied, "image_url", format!("/api/v1/artists/img/{proxied}")).await;
+    set(
+        deezered,
+        "image_url",
+        "https://e-cdns-images.dzcdn.net/images/artist/x/500x500.jpg".into(),
+    )
+    .await;
+
+    assert_eq!(db.move_hand_set_artist_pictures().await.unwrap(), Some(3));
+
+    let p = db.artist_picture(admin, up, "portrait").await.unwrap().unwrap();
+    assert_eq!(p.source, "upload");
+    let p = db.artist_picture(admin, pasted, "portrait").await.unwrap().unwrap();
+    assert_eq!((p.source.as_str(), p.url.as_str()), ("link", "https://example.com/band.jpg"));
+    assert!(db.artist_picture(admin, pasted, "wide").await.unwrap().is_some());
+    assert!(db.artist_picture(admin, proxied, "portrait").await.unwrap().is_none());
+    assert!(db.artist_picture(admin, deezered, "portrait").await.unwrap().is_none());
+
+    // The moved ones are gone from the shared row; the automatic ones stay.
+    let urls = |aid| db.artist_picture_urls(aid);
+    assert_eq!(urls(up).await.unwrap().unwrap(), (None, None));
+    assert_eq!(urls(pasted).await.unwrap().unwrap(), (None, None));
+    assert!(urls(proxied).await.unwrap().unwrap().0.is_some());
+    assert!(urls(deezered).await.unwrap().unwrap().0.is_some());
+
+    // Running again moves nothing.
+    assert_eq!(db.move_hand_set_artist_pictures().await.unwrap(), Some(0));
+}
+
+#[tokio::test]
+async fn with_no_admin_yet_nothing_moves() {
+    let db = testdb().await;
+    db.upsert_artist("Pasted", Some("https://example.com/band.jpg"), None).await.unwrap();
+    assert_eq!(db.move_hand_set_artist_pictures().await.unwrap(), None);
+}
+
+/// A picture chosen from a server goes when the server does — the proxy could
+/// only ever answer it with a fallback.
+#[tokio::test]
+async fn deleting_a_source_clears_the_pictures_chosen_from_it() {
+    let db = testdb().await;
+    let uid = db.create_user("ash", None, "pw", "admin").await.unwrap();
+    let src = db
+        .create_source(
+            uid,
+            "plex",
+            "Den",
+            true,
+            "http://plex",
+            r#"{"token":"t"}"#,
+            None,
+            None,
+            "{}",
+        )
+        .await
+        .unwrap();
+    db.upsert_artist("Arca", None, None).await.unwrap();
+    let id = db.artist_row_id("Arca").await.unwrap().unwrap();
+    let pick = NewArtistPicture {
+        source: "plex",
+        source_ref: Some(src),
+        image_key: "/library/metadata/1/thumb/2",
+        provider: None,
+        url: "/api/v1/artists/1/pictures/portrait?v=1",
+    };
+    db.set_artist_picture(uid, id, "portrait", &pick).await.unwrap();
+    assert!(db.delete_source(uid, src).await.unwrap());
+    assert!(db.artist_picture(uid, id, "portrait").await.unwrap().is_none());
+}
+
+#[test]
+fn what_counts_as_a_hand_set_picture() {
+    use super::pictures::hand_set_source;
+    assert_eq!(hand_set_source("portrait", "/api/v1/art/upload/ab.jpg"), Some("upload"));
+    assert_eq!(hand_set_source("portrait", "https://example.com/a.jpg"), Some("link"));
+    assert_eq!(hand_set_source("portrait", "/api/v1/art/914"), Some("link"));
+    assert_eq!(hand_set_source("portrait", "/api/v1/artists/img/12"), None);
+    assert_eq!(hand_set_source("portrait", "https://cdn-images.dzcdn.net/images/a.jpg"), None);
+    assert_eq!(hand_set_source("portrait", "https://dzcdn.net.evil.example/a.jpg"), Some("link"));
+    assert_eq!(hand_set_source("portrait", "  "), None);
+    // Nothing fills a wide picture automatically, so every one was a choice.
+    assert_eq!(hand_set_source("wide", "https://cdn-images.dzcdn.net/images/a.jpg"), Some("link"));
+}

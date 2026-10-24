@@ -441,7 +441,7 @@ pub async fn artist_detail(
     // stores it on the artist row, it just had nowhere to be shown here.
     let image_url = state
         .db
-        .artist_images(std::slice::from_ref(&name))
+        .artist_images(user.user_id, std::slice::from_ref(&name))
         .await
         .unwrap_or_default()
         .into_values()
@@ -450,7 +450,7 @@ pub async fn artist_detail(
     // automatically, so it is present only where the user chose one.
     let landscape_url = state
         .db
-        .artist_landscapes(std::slice::from_ref(&name))
+        .artist_landscapes(user.user_id, std::slice::from_ref(&name))
         .await
         .unwrap_or_default()
         .into_values()

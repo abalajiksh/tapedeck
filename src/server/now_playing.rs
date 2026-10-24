@@ -33,29 +33,33 @@ use crate::models::{AudioQuality, Play};
 /// same claim, and only one of them may overrule our own arithmetic.
 ///
 /// Every **polled** source reports what its player last uploaded on the player's
-/// own cadence, so its number is a few seconds behind the music through no
-/// fault of anyone's — that lag is what `MAX_PLAYHEAD_LAG_SECS` exists to
-/// absorb. A **pushing** client sends the playhead at the moment it was true,
-/// so it has no lag to absorb and the guard could only ever suppress a genuine
-/// seek. A measurement taken now beats arithmetic; a measurement taken at an
-/// unknown moment in the last few seconds does not.
+/// own cadence, so its number is behind the music through no fault of anyone's
+/// — `NowPlayingRegistry::set` is where that lag is absorbed. A **pushing**
+/// client sends the playhead at the moment it was true, so it has no lag to
+/// absorb and the guard could only ever suppress a genuine seek. A measurement
+/// taken now beats arithmetic; a measurement taken at an unknown moment in the
+/// last few seconds does not.
+///
+/// **Milliseconds**, and struct variants so that no caller can hand over
+/// seconds by habit: the hold rule compares reports a few hundred milliseconds
+/// apart, and whole seconds were part of what made the deck jump.
 #[derive(Clone, Copy, Debug)]
 pub enum Progress {
-    /// Seconds in, measured by the player and pushed the instant it was true.
-    /// Believed outright, backwards steps included — a client that says the
-    /// listener seeked back really is the authority on that.
-    Exact(u64),
-    /// Seconds in as of whenever this source last heard from its player. True
-    /// of every polled source.
-    Reported(u64),
+    /// Measured by the player and pushed the instant it was true. Believed
+    /// outright, backwards steps included — a client that says the listener
+    /// seeked back really is the authority on that.
+    Exact { ms: u64 },
+    /// As of whenever this source last heard from its player. True of every
+    /// polled source.
+    Reported { ms: u64 },
     /// No playhead exists for this source. The number is our own arithmetic.
     Unknown,
 }
 
 impl Progress {
-    fn seconds(self) -> u64 {
+    fn millis(self) -> u64 {
         match self {
-            Progress::Exact(p) | Progress::Reported(p) => p,
+            Progress::Exact { ms } | Progress::Reported { ms } => ms,
             Progress::Unknown => 0,
         }
     }
@@ -76,8 +80,11 @@ pub struct NowPlaying {
     pub duration: Option<u64>,
     /// Seconds in **as of `updated_at`**. Extrapolate from there rather than
     /// expecting a tick per second — but see `position_known` first, and stop
-    /// extrapolating when `paused`.
+    /// extrapolating when `paused`. `progress_ms` is the same, unrounded.
     pub progress: u64,
+    /// Milliseconds in as of `updated_at_ms`. The number the registry works in;
+    /// `progress` is this in whole seconds.
+    pub progress_ms: u64,
     /// **False when `progress` is the server's own wall-clock arithmetic rather
     /// than a reported playhead.** A ListenBrainz `playing_now` has no position
     /// field in the format and Subsonic answers `minutesAgo`, so for those there
@@ -104,6 +111,15 @@ pub struct NowPlaying {
     pub paused: bool,
     /// Unix seconds when this was last reported.
     pub updated_at: i64,
+    /// Unix milliseconds when this was last reported.
+    pub updated_at_ms: i64,
+    // The playhead exactly as the source last sent it, before the hold rule
+    // touched it. A polled source re-sends the same number until its player
+    // uploads a new one — Plexamp does so every ~15.6 s, measured 2026-10-24 —
+    // so a report equal to this one is not new information, and comparing it
+    // with our count is what dragged the deck backwards.
+    #[serde(skip)]
+    pub reported_ms: Option<u64>,
     /// `Plex`, `Roon`, `ingest`, `physical`…
     // Also the key the pipeline clears by.
     pub source: String,
@@ -188,14 +204,17 @@ impl NowPlaying {
             artist: play.artist.clone(),
             album: play.album.clone(),
             duration: play.duration,
-            progress: progress.seconds(),
+            progress: progress.millis() / 1000,
+            progress_ms: progress.millis(),
+            reported_ms: (!matches!(progress, Progress::Unknown)).then(|| progress.millis()),
             position_known: !matches!(progress, Progress::Unknown),
-            position_exact: matches!(progress, Progress::Exact(_)),
+            position_exact: matches!(progress, Progress::Exact { .. }),
             paused: false,
             banked: false,
             artwork_url: None,
             artwork_resolved: false,
-            updated_at: now_secs(),
+            updated_at: now_ms() / 1000,
+            updated_at_ms: now_ms(),
             source: source.to_string(),
             listening_context: None,
             chain_name: None,
@@ -236,16 +255,37 @@ impl NowPlaying {
         play
     }
 
-    /// Where playback would be by `now`, assuming it kept running.
+    /// Where playback would be by `now` (unix ms), assuming it kept running.
     ///
     /// A paused track is not running, so it stays exactly where it was told to
     /// stop. Counting a pause forward is what made a paused deck drift to the
     /// end of a track nobody was playing.
-    fn position_at(&self, now: i64) -> u64 {
+    fn position_at_ms(&self, now_ms: i64) -> u64 {
         if self.paused {
-            return self.progress;
+            return self.progress_ms;
         }
-        self.progress + (now - self.updated_at).max(0) as u64
+        self.progress_ms + (now_ms - self.updated_at_ms).max(0) as u64
+    }
+
+    /// The same in whole seconds, for the callers that count in them.
+    fn position_at(&self, now: i64) -> u64 {
+        self.position_at_ms(now * 1000) / 1000
+    }
+
+    /// The playhead right now in milliseconds, held at the track's end — what
+    /// the browser's smooth clock anchors to.
+    pub fn position_ms_now(&self) -> u64 {
+        let at = self.position_at_ms(now_ms());
+        match self.duration {
+            Some(d) => at.min(d * 1000),
+            None => at,
+        }
+    }
+
+    /// Move the playhead, keeping the whole-second fields on the wire in step.
+    fn set_progress_ms(&mut self, ms: u64) {
+        self.progress_ms = ms;
+        self.progress = ms / 1000;
     }
 
     /// A source that stops reporting has usually stopped playing, but sources
@@ -270,15 +310,14 @@ fn now_secs() -> i64 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64
 }
 
-/// How far a freshly reported playhead may sit *behind* our own extrapolation
-/// before we believe it rather than treating it as a stale report.
-///
-/// Sized against Plex, which is the worst of them: the offset in `/status/sessions`
-/// is whatever the player last uploaded on its own timeline cadence, so a few
-/// seconds of lag is normal and is not the listener doing anything. Deliberately
-/// well under the shortest deliberate seek anyone makes — a rewind bigger than
-/// this passes straight through.
-const MAX_PLAYHEAD_LAG_SECS: u64 = 12;
+fn now_ms() -> i64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as i64
+}
+
+/// Room for a changed report to be older than the gap since the previous poll:
+/// the request's own time, and a player whose upload landed just before we
+/// asked last time but after Plex answered.
+const FRESH_REPORT_SLACK_MS: i64 = 1_500;
 
 /// In-memory "what's playing right now", keyed by user. Shared by the HTTP
 /// handlers and the poll engine, so it lives behind its own `Arc` rather than
@@ -313,30 +352,60 @@ impl NowPlayingRegistry {
         });
 
         // A reported playhead is not the same thing as the current playhead.
-        // Plex's `view_offset` is whatever its client last uploaded, which lags
-        // the music by a few seconds and lands unevenly — so every engine tick
-        // handed us a position *behind* the one we had already extrapolated to,
-        // the deck snapped back, then walked forward again until the next tick.
-        // That sawtooth is what "it keeps going backward and forward" is.
+        // Measured against Plexamp on 2026-10-24: its `viewOffset` moves on
+        // every ~15.6 s and Plex hands back the same number in between, so a
+        // 5 s poll reads a figure anywhere from 0 to ~15 s old. The old rule
+        // held any report up to 12 s behind our count and believed the rest as
+        // a seek, so whenever a poll landed just before Plexamp's next upload
+        // the deck jumped back ~13 s and forward again at the next one. That
+        // is "it keeps going backward and forward".
         //
-        // So a small backward step is treated as the report being stale rather
-        // than the music having moved, and we hold our own count. A step bigger
-        // than the lag is a real seek or a restart and is believed — which is
-        // also what keeps a track put on repeat from being pinned at the end.
+        // The rule now, for a polled source on the same track:
+        //
+        // * **An unchanged report is no information.** Our own count carries
+        //   on and the report is not compared with it at all.
+        // * **A changed report was sent since the previous poll**, so it is at
+        //   most that gap old (plus slack). Behind our count by more than that
+        //   is the listener seeking back, and is believed. Behind by less is
+        //   the report's own age, and our count holds.
+        // * **Ahead of our count** is a fresher measurement than the one we
+        //   were extrapolating from, and moves the clock forward.
         //
         // None of that applies to a client that measured the playhead at the
         // moment it sent it. It has no upload cadence to lag behind, so a
-        // backward step from one is the listener seeking and nothing else —
-        // holding our own count there would suppress the very thing the client
-        // is better placed than us to know. A measurement taken now beats
-        // arithmetic; see `Progress`.
-        if !changed && !np.position_exact {
-            if let Some(prev) = previous {
-                let ours = prev.position_at(np.updated_at);
-                if np.progress < ours && ours - np.progress <= MAX_PLAYHEAD_LAG_SECS {
-                    np.progress = ours;
+        // backward step from one is the listener seeking and nothing else.
+        // A measurement taken now beats arithmetic; see `Progress`.
+        let reported = np.progress_ms;
+        let ours = previous.filter(|_| !changed).map(|p| p.position_at_ms(np.updated_at_ms));
+        let verdict = match (previous.filter(|_| !changed), ours) {
+            (Some(prev), Some(ours)) if !np.position_exact && np.position_known => {
+                let window = (np.updated_at_ms - prev.updated_at_ms).max(0) + FRESH_REPORT_SLACK_MS;
+                if prev.reported_ms == Some(reported) {
+                    np.set_progress_ms(ours);
+                    "unchanged, ours carries on"
+                } else if reported >= ours {
+                    "ahead of ours, moved forward"
+                } else if (ours - reported) as i64 <= window {
+                    np.set_progress_ms(ours);
+                    "behind by its own age, held"
+                } else {
+                    "behind by more than its age, believed (seek)"
                 }
             }
+            (Some(_), Some(_)) if np.position_exact => "exact, believed",
+            (Some(_), Some(_)) => "no playhead, ours",
+            _ => "new track",
+        };
+        // The `playhead` trace's other half: what the deck made of the report.
+        if tracing::enabled!(target: "playhead", tracing::Level::DEBUG) {
+            tracing::debug!(
+                target: "playhead",
+                "deck {} reported={}ms ours={} → {}ms ({verdict})",
+                np.source,
+                reported,
+                ours.map_or("-".to_string(), |o| format!("{o}ms")),
+                np.progress_ms
+            );
         }
 
         // A track leaving the deck with nothing banked for it is a skip —
@@ -490,6 +559,11 @@ pub struct NowPlayingResponse {
     /// wall-clock arithmetic, not a measurement.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub position: Option<u64>,
+    /// The same, in milliseconds. Anchor a running clock to this rather than
+    /// ticking whole seconds: whole seconds and a 1 s timer were half of why
+    /// the deck jumped.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub position_ms: Option<u64>,
     /// Absent when nothing is playing.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub track: Option<NowPlaying>,
@@ -521,13 +595,19 @@ pub async fn now_playing(
             Json(NowPlayingResponse {
                 playing: true,
                 position: Some(position),
+                position_ms: Some(track.position_ms_now()),
                 track: Some(track),
             }),
         )
             .into_response(),
         None => (
             StatusCode::OK,
-            Json(NowPlayingResponse { playing: false, position: None, track: None }),
+            Json(NowPlayingResponse {
+                playing: false,
+                position: None,
+                position_ms: None,
+                track: None,
+            }),
         )
             .into_response(),
     }
@@ -550,7 +630,7 @@ mod tests {
     fn displacing_an_unbanked_ingest_track_queues_a_skip() {
         let reg = NowPlayingRegistry::default();
         let mut first = np("Xtal", "ingest");
-        first.progress = 20;
+        first.set_progress_ms(20_000);
         reg.set(1, first);
         reg.set(1, np("Ageispolis", "ingest"));
 
@@ -624,7 +704,7 @@ mod tests {
     #[test]
     fn a_skip_is_timestamped_at_the_start_of_the_track() {
         let mut entry = np("Xtal", "ingest");
-        entry.progress = 45;
+        entry.set_progress_ms(45_000);
         let play = entry.to_play();
         assert_eq!(play.timestamp, (entry.updated_at - 45) as u64);
         assert_eq!(play.album.as_deref(), Some("Selected Ambient Works 85-92"));
@@ -638,6 +718,8 @@ mod tests {
             album: Some("Selected Ambient Works 85-92".into()),
             duration: Some(300),
             progress: 0,
+            progress_ms: 0,
+            reported_ms: None,
             position_known: true,
             // The polled shape, which is what these tests are about — a report
             // that may lag. `position_exact` is set per-test where a pushing
@@ -648,6 +730,7 @@ mod tests {
             artwork_url: None,
             artwork_resolved: false,
             updated_at: now_secs(),
+            updated_at_ms: now_ms(),
             source: source.into(),
             listening_context: None,
             chain_name: None,
@@ -692,54 +775,92 @@ mod tests {
         reg.set(1, np("Xtal", "Plex"));
 
         let mut later = np("Xtal", "Plex");
-        later.progress = 120;
+        later.set_progress_ms(120_000);
         assert!(!reg.set(1, later));
 
         let (_, position) = reg.get(1).expect("still playing");
         assert!(position >= 120, "expected the newer playhead, got {position}");
     }
 
-    /// The sawtooth. Plex uploads its playhead on its own cadence, so an engine
-    /// tick routinely reports a position a few seconds behind where the music
-    /// actually is — and the deck, which had already extrapolated past it,
-    /// jumped backwards every time. A stale report must not move the playhead
-    /// back.
-    #[test]
-    fn a_lagging_report_does_not_drag_the_playhead_backwards() {
-        let reg = NowPlayingRegistry::default();
-
-        let mut first = np("Xtal", "Plex");
-        first.progress = 100;
-        reg.set(1, first);
-
-        // The same track re-reported a little behind: Plex's client had not
-        // uploaded the intervening seconds yet.
-        let mut lagging = np("Xtal", "Plex");
-        lagging.progress = 95;
-        reg.set(1, lagging);
-
-        let (_, position) = reg.get(1).expect("still playing");
-        assert!(position >= 100, "playhead went backwards to {position}");
+    /// A polled report as it arrives: `ms` exactly as the source sent it, at
+    /// `at` (unix ms).
+    fn report(ms: u64, at: i64) -> NowPlaying {
+        let mut n = np("Xtal", "Plex");
+        n.set_progress_ms(ms);
+        n.reported_ms = Some(ms);
+        n.updated_at_ms = at;
+        n.updated_at = at / 1000;
+        n
     }
 
-    /// The other half of the same rule, and the reason it is a tolerance rather
-    /// than a floor: a real rewind — scrubbing back, or putting the track on
-    /// again — has to be believed, or the deck pins itself at the far end of a
-    /// track that has started over.
+    fn deck_ms(reg: &NowPlayingRegistry) -> u64 {
+        reg.0.read().unwrap().get(&1).unwrap().progress_ms
+    }
+
+    /// The sawtooth, as measured against Plexamp on 2026-10-24: its playhead
+    /// moves on every ~15.6 s and Plex hands back the same number in between,
+    /// so a 5 s poll reads it 0, 5, 10 and sometimes 15 s old. The old rule
+    /// held up to 12 s and believed the rest as a seek, so the 15 s case threw
+    /// the deck back. A repeated number is no information and is not compared.
+    #[test]
+    fn an_unchanged_report_is_not_information() {
+        let reg = NowPlayingRegistry::default();
+        let t = now_ms() - 60_000;
+        reg.set(1, report(108_970, t));
+        for (n, gap) in [(1, 5_000), (2, 10_000), (3, 15_055)] {
+            reg.set(1, report(108_970, t + gap));
+            assert_eq!(
+                deck_ms(&reg),
+                108_970 + gap as u64,
+                "repeat {n}, {gap} ms on: the deck should have carried on counting"
+            );
+        }
+        // And the whole seconds on the wire stay in step with it.
+        let held = reg.0.read().unwrap().get(&1).unwrap().clone();
+        assert_eq!(held.progress, held.progress_ms / 1000);
+    }
+
+    /// A changed report was sent some time since the previous poll, so it can
+    /// be up to that gap old. Behind our count by no more than that is its own
+    /// age, and our count holds.
+    #[test]
+    fn a_fresh_report_behind_by_its_own_age_is_held() {
+        let reg = NowPlayingRegistry::default();
+        let t = now_ms() - 60_000;
+        reg.set(1, report(46_750, t));
+        reg.set(1, report(46_750, t + 5_000));
+        // Plexamp's next upload happened ~3 s before this poll.
+        reg.set(1, report(58_750, t + 15_000));
+        assert_eq!(deck_ms(&reg), 61_750, "a report 3 s old dragged the deck back");
+    }
+
+    /// Ahead of our count is a fresher measurement than the one we were
+    /// counting from — the first number for a track may already have been
+    /// stale — and moves the clock forward.
+    #[test]
+    fn a_fresh_report_ahead_moves_the_clock_forward() {
+        let reg = NowPlayingRegistry::default();
+        let t = now_ms() - 60_000;
+        reg.set(1, report(130, t));
+        reg.set(1, report(15_730, t + 5_000));
+        assert_eq!(deck_ms(&reg), 15_730);
+    }
+
+    /// The other half of the rule, and the reason it is a window rather than a
+    /// floor: a real rewind — scrubbing back, or putting the track on again —
+    /// is further behind than any report can be old, and is believed.
     #[test]
     fn a_real_rewind_is_believed() {
         let reg = NowPlayingRegistry::default();
+        let t = now_ms() - 60_000;
+        reg.set(1, report(200_000, t));
+        reg.set(1, report(3_000, t + 5_000));
+        assert_eq!(deck_ms(&reg), 3_000);
 
-        let mut first = np("Xtal", "Plex");
-        first.progress = 200;
-        reg.set(1, first);
-
-        let mut rewound = np("Xtal", "Plex");
-        rewound.progress = 3;
-        reg.set(1, rewound);
-
-        let (_, position) = reg.get(1).expect("still playing");
-        assert!(position < 20, "expected the rewind to land, got {position}");
+        // A short one too: 10 s back is past a 5 s poll gap plus slack.
+        reg.set(1, report(90_000, t + 10_000));
+        reg.set(1, report(85_000, t + 15_000));
+        assert_eq!(deck_ms(&reg), 85_000);
     }
 
     /// A source that cannot see a playhead must not be presented as if it can.
@@ -763,14 +884,15 @@ mod tests {
         assert!(!guessed.position_known);
         assert_eq!(guessed.progress, 0);
 
-        let measured = NowPlaying::from_play(&play, "Plex", None, Progress::Reported(44));
+        let measured =
+            NowPlaying::from_play(&play, "Plex", None, Progress::Reported { ms: 44_000 });
         assert!(measured.position_known);
         assert_eq!(measured.progress, 44);
 
         // Both kinds of measurement are a measurement to the deck; the
         // difference between them is only about whose number wins a
         // disagreement, which is `set`'s business and not the browser's.
-        let pushed = NowPlaying::from_play(&play, "ingest", None, Progress::Exact(44));
+        let pushed = NowPlaying::from_play(&play, "ingest", None, Progress::Exact { ms: 44_000 });
         assert!(pushed.position_known);
         assert!(pushed.position_exact);
         assert!(!measured.position_exact);
@@ -787,14 +909,14 @@ mod tests {
         let reg = NowPlayingRegistry::default();
 
         let mut first = np("Xtal", "ingest");
-        first.progress = 100;
+        first.set_progress_ms(100_000);
         first.position_exact = true;
         reg.set(1, first);
 
-        // Five seconds back — well inside MAX_PLAYHEAD_LAG_SECS, so a polled
-        // source would have this held at 100.
+        // Five seconds back, reported at once — a changed polled report would
+        // be judged against the poll gap; a pushed one is simply believed.
         let mut seeked = np("Xtal", "ingest");
-        seeked.progress = 95;
+        seeked.set_progress_ms(95_000);
         seeked.position_exact = true;
         reg.set(1, seeked);
 
@@ -811,11 +933,12 @@ mod tests {
         let reg = NowPlayingRegistry::default();
 
         let mut paused = np("Xtal", "ingest");
-        paused.progress = 90;
+        paused.set_progress_ms(90_000);
         paused.paused = true;
         paused.position_exact = true;
         // Reported a minute ago and not heard from since.
         paused.updated_at = now_secs() - 60;
+        paused.updated_at_ms = now_ms() - 60_000;
         reg.set(1, paused);
 
         let (track, position) = reg.get(1).expect("a paused record is still on the deck");
@@ -832,9 +955,10 @@ mod tests {
         let reg = NowPlayingRegistry::default();
 
         let mut abandoned = np("Xtal", "ingest");
-        abandoned.progress = 30;
+        abandoned.set_progress_ms(30_000);
         abandoned.paused = true;
         abandoned.updated_at = now_secs() - 601;
+        abandoned.updated_at_ms = now_ms() - 601_000;
         reg.set(1, abandoned);
 
         assert!(reg.get(1).is_none(), "a pause held the deck past its timeout");

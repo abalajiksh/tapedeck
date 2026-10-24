@@ -823,7 +823,7 @@ impl ScrobbleEngine {
                 &play,
                 label,
                 track.quality.as_ref(),
-                Progress::Reported(track.position),
+                Progress::Reported { ms: track.position_ms },
             );
             // The chain this listen *will* be attributed to, resolved the way
             // the scrobble branch below resolves it — so Patch's live strip can
@@ -1037,8 +1037,13 @@ impl ScrobbleEngine {
 
         for track in &zones.now_playing {
             let mut play = track.play.clone();
-            let mut np =
-                NowPlaying::from_play(&play, "Roon", None, Progress::Reported(track.position));
+            let mut np = NowPlaying::from_play(
+                &play,
+                "Roon",
+                None,
+                // Roon's `seek_position` is whole seconds; that is all there is.
+                Progress::Reported { ms: track.position * 1000 },
+            );
             // Roon's endpoint is the device — the only rung of the ladder a
             // Roon listen ever reaches.
             np.chain_id = match &track.output {
@@ -1278,7 +1283,9 @@ impl ScrobbleEngine {
 
                 // The owning user comes from the source row, not from matching
                 // the Plex account name against Tapedeck usernames.
-                let progress = plex_track.view_offset.unwrap_or(0) / 1000;
+                // Milliseconds, as Plex sends them: the hold rule compares
+                // reports a few hundred milliseconds apart.
+                let progress = plex_track.view_offset.unwrap_or(0);
                 // Deck first. Enrichment is a rate-limited MusicBrainz round
                 // trip that the registry has no use for — only the sink payload
                 // does — so doing it first put a network wait between the user
@@ -1287,7 +1294,7 @@ impl ScrobbleEngine {
                     &play,
                     "Plex",
                     plex_track.audio_quality.as_ref(),
-                    Progress::Reported(progress),
+                    Progress::Reported { ms: progress },
                 );
                 // See the note on the Jellyfin/Emby writer: the live entry
                 // carries the chain its eventual listen will get, resolved

@@ -452,6 +452,10 @@ pub struct MediaBrowserTrack {
     /// Seconds into the track — both servers report a real playhead, so the deck
     /// gets a true position rather than one counted up from first sight.
     pub position: u64,
+    /// The same playhead in milliseconds, for the deck: `PositionTicks` carries
+    /// ten million to the second, and rounding it to whole seconds threw away
+    /// what the hold rule compares.
+    pub position_ms: u64,
     pub session_id: String,
     /// The client this is playing on, so the listen can carry a device and
     /// therefore a signal chain. `None` only when the server reported no
@@ -690,12 +694,9 @@ impl MediaBrowserSource {
                 continue;
             }
 
-            let position = session
-                .play_state
-                .as_ref()
-                .and_then(|p| p.position_ticks)
-                .map(|t| t / TICKS_PER_SECOND)
-                .unwrap_or(0);
+            let ticks = session.play_state.as_ref().and_then(|p| p.position_ticks).unwrap_or(0);
+            let position = ticks / TICKS_PER_SECOND;
+            let position_ms = ticks / (TICKS_PER_SECOND / 1000);
             let duration = item.run_time_ticks.map(|t| t / TICKS_PER_SECOND);
 
             let track = MediaBrowserTrack {
@@ -706,6 +707,7 @@ impl MediaBrowserSource {
                 ),
                 play: Self::to_play(self.flavour, item, &session.device_name),
                 position,
+                position_ms,
                 session_id: session.id.clone(),
                 player: Self::to_player(&session),
             };
@@ -1340,6 +1342,140 @@ impl MediaBrowserSource {
         Ok((resp.bytes().await?.to_vec(), content_type))
     }
 
+    /// An artist's item id, found by name, whatever pictures it has.
+    ///
+    /// `find_artist` insists on a Primary image because its callers want a
+    /// portrait; the picker wants the artist whether or not one is held, since
+    /// it lists backdrops and the server's online finds too.
+    pub async fn artist_item(
+        &self,
+        name: &str,
+    ) -> Result<Option<String>, Box<dyn std::error::Error + Send + Sync>> {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "PascalCase")]
+        struct Resp {
+            #[serde(default)]
+            items: Vec<Item>,
+        }
+        #[derive(Deserialize)]
+        #[serde(rename_all = "PascalCase")]
+        struct Item {
+            id: String,
+            name: String,
+        }
+        let resp = self
+            .client
+            .get(self.endpoint("/Artists"))
+            .query(&[("searchTerm", name), ("limit", "10")])
+            .header("X-Emby-Token", &self.api_key)
+            .header("Accept", "application/json")
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            return Err(format!(
+                "{} returned {} searching artists",
+                self.flavour.label(),
+                resp.status()
+            )
+            .into());
+        }
+        let body: Resp = resp.json().await?;
+        Ok(body
+            .items
+            .into_iter()
+            .find(|i| crate::sources::plex::artist_matches(&i.name, name))
+            .map(|i| i.id))
+    }
+
+    /// Every picture the server holds for an artist, then the ones it can find
+    /// online — Primary for a portrait, Backdrop for a wide one.
+    ///
+    /// Held pictures come from `/Items/{id}/Images` and are proxied. The online
+    /// ones come from `/Items/{id}/RemoteImages`, which asks the server's image
+    /// providers live; they are public URLs, so the browser loads them and
+    /// nothing is downloaded into the library. A failed online search costs
+    /// only the online half.
+    ///
+    /// `ImageInfo.Path` is the file's location on the server's disk and is
+    /// deliberately not read.
+    pub async fn artist_images(
+        &self,
+        item_id: &str,
+        wide: bool,
+    ) -> Result<Vec<super::LibraryImage>, Box<dyn std::error::Error + Send + Sync>> {
+        let kind = if wide { "Backdrop" } else { "Primary" };
+        let resp = self
+            .client
+            .get(self.endpoint(&format!("/Items/{item_id}/Images")))
+            .header("X-Emby-Token", &self.api_key)
+            .header("Accept", "application/json")
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            return Err(format!(
+                "{} returned {} listing images",
+                self.flavour.label(),
+                resp.status()
+            )
+            .into());
+        }
+        let held: Vec<MbImageInfo> = resp.json().await?;
+        let mut out = held_images(item_id, kind, held);
+
+        let remote = self
+            .client
+            .get(self.endpoint(&format!("/Items/{item_id}/RemoteImages")))
+            .query(&[("type", kind), ("limit", "24")])
+            .header("X-Emby-Token", &self.api_key)
+            .header("Accept", "application/json")
+            .send()
+            .await;
+        match remote {
+            Ok(r) if r.status().is_success() => match r.json::<MbRemoteImages>().await {
+                Ok(found) => out.extend(remote_images(found)),
+                Err(e) => {
+                    tracing::debug!("{} remote images unreadable: {}", self.flavour.label(), e)
+                }
+            },
+            Ok(r) => {
+                tracing::debug!("{} remote images returned {}", self.flavour.label(), r.status())
+            }
+            Err(e) => tracing::debug!("{} remote images failed: {}", self.flavour.label(), e),
+        }
+        Ok(out)
+    }
+
+    /// The bytes behind a held key `artist_images` returned.
+    pub async fn fetch_image(
+        &self,
+        key: &str,
+        max: u32,
+    ) -> Result<(Vec<u8>, String), Box<dyn std::error::Error + Send + Sync>> {
+        let Some((item, kind, index)) = parse_mb_image_key(key) else {
+            return Err("not an image key".into());
+        };
+        let resp = self
+            .client
+            .get(self.endpoint(&format!("/Items/{item}/Images/{kind}/{index}")))
+            .header("X-Emby-Token", &self.api_key)
+            .query(&[("maxWidth", max.to_string())])
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            return Err(format!("{} image returned {}", self.flavour.label(), resp.status()).into());
+        }
+        let content_type = resp
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("image/jpeg")
+            .to_string();
+        if !content_type.starts_with("image/") {
+            return Err("no image there".into());
+        }
+        Ok((resp.bytes().await?.to_vec(), content_type))
+    }
+
     /// The lyrics this server holds for an item, as `(plain, synced)`.
     ///
     /// `GET /Audio/{id}/Lyrics`, which is a first-class endpoint here rather
@@ -1495,9 +1631,154 @@ impl crate::sources::MusicSource for MediaBrowserSource {
     }
 }
 
+/// One entry of `/Items/{id}/Images` — Jellyfin's `ImageInfo`.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub(crate) struct MbImageInfo {
+    #[serde(default)]
+    image_type: String,
+    #[serde(default)]
+    image_index: Option<i64>,
+    #[serde(default)]
+    width: Option<i64>,
+    #[serde(default)]
+    height: Option<i64>,
+}
+
+/// `/Items/{id}/RemoteImages` — Jellyfin's `RemoteImageResult`.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub(crate) struct MbRemoteImages {
+    #[serde(default)]
+    images: Vec<MbRemoteImage>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub(crate) struct MbRemoteImage {
+    #[serde(default)]
+    provider_name: Option<String>,
+    #[serde(default)]
+    url: Option<String>,
+    #[serde(default)]
+    thumbnail_url: Option<String>,
+    #[serde(default)]
+    width: Option<i64>,
+    #[serde(default)]
+    height: Option<i64>,
+}
+
+/// The held pictures of one type, keyed `item/Type/index`.
+pub(crate) fn held_images(
+    item_id: &str,
+    kind: &str,
+    held: Vec<MbImageInfo>,
+) -> Vec<super::LibraryImage> {
+    held.into_iter()
+        .filter(|i| i.image_type == kind)
+        .map(|i| super::LibraryImage {
+            key: format!("{item_id}/{kind}/{}", i.image_index.unwrap_or(0)),
+            remote: false,
+            provider: None,
+            // The first held one is the one the server shows.
+            selected: i.image_index.unwrap_or(0) == 0,
+            width: i.width,
+            height: i.height,
+            thumb: None,
+        })
+        .collect()
+}
+
+/// The online finds that are real `http(s)` URLs, which is all the browser
+/// will be handed.
+pub(crate) fn remote_images(found: MbRemoteImages) -> Vec<super::LibraryImage> {
+    let web =
+        |u: &str| reqwest::Url::parse(u).is_ok_and(|u| matches!(u.scheme(), "http" | "https"));
+    found
+        .images
+        .into_iter()
+        .filter_map(|i| {
+            let url = i.url.filter(|u| web(u))?;
+            Some(super::LibraryImage {
+                key: url,
+                remote: true,
+                provider: i.provider_name.filter(|p| !p.is_empty()),
+                selected: false,
+                width: i.width,
+                height: i.height,
+                thumb: i.thumbnail_url.filter(|u| web(u)),
+            })
+        })
+        .collect()
+}
+
+/// Split and check a held key. It comes back from the browser when a picture
+/// is chosen, so every part is constrained to what `held_images` writes: an id
+/// of letters, digits and dashes, one of the image types the picker lists, and
+/// a number.
+pub(crate) fn parse_mb_image_key(key: &str) -> Option<(&str, &str, u32)> {
+    let mut parts = key.split('/');
+    let (item, kind, index) = (parts.next()?, parts.next()?, parts.next()?);
+    if parts.next().is_some()
+        || item.is_empty()
+        || !item.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        || !matches!(kind, "Primary" | "Backdrop")
+    {
+        return None;
+    }
+    Some((item, kind, index.parse().ok()?))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `/Items/{id}/Images` and `/Items/{id}/RemoteImages`, in the shape
+    /// Jellyfin's published OpenAPI gives `ImageInfo` and `RemoteImageResult`.
+    #[test]
+    fn held_and_online_images_read_into_tiles() {
+        let held: Vec<MbImageInfo> = serde_json::from_value(serde_json::json!([
+            { "ImageType": "Primary", "ImageTag": "a", "Path": "/srv/music/x/folder.jpg",
+              "Height": 1000, "Width": 1000, "Size": 1 },
+            { "ImageType": "Backdrop", "ImageIndex": 0, "Width": 1920, "Height": 1080 },
+            { "ImageType": "Backdrop", "ImageIndex": 1, "Width": 1920, "Height": 1080 },
+            { "ImageType": "Logo", "ImageIndex": 0 }
+        ]))
+        .unwrap();
+        let portrait = held_images("8f2a", "Primary", held);
+        assert_eq!(portrait.len(), 1);
+        assert_eq!(portrait[0].key, "8f2a/Primary/0", "an absent index is the first");
+        assert_eq!((portrait[0].width, portrait[0].height), (Some(1000), Some(1000)));
+        assert!(portrait[0].selected && !portrait[0].remote);
+
+        let remote: MbRemoteImages = serde_json::from_value(serde_json::json!({
+            "Images": [
+                { "ProviderName": "TheAudioDB", "Url": "https://www.theaudiodb.com/a.jpg",
+                  "ThumbnailUrl": "https://www.theaudiodb.com/a.jpg/preview", "Type": "Primary",
+                  "Width": 700, "Height": 700 },
+                { "ProviderName": "Odd", "Url": "file:///etc/passwd", "Type": "Primary" },
+                { "ProviderName": "", "Url": "https://assets.fanart.tv/b.jpg", "Type": "Primary" }
+            ],
+            "TotalRecordCount": 3, "Providers": ["TheAudioDB", "FanArt"]
+        }))
+        .unwrap();
+        let found = remote_images(remote);
+        assert_eq!(found.len(), 2, "only web URLs reach the browser");
+        assert!(found[0].remote);
+        assert_eq!(found[0].provider.as_deref(), Some("TheAudioDB"));
+        assert_eq!(found[0].thumb.as_deref(), Some("https://www.theaudiodb.com/a.jpg/preview"));
+        assert_eq!(found[1].provider, None);
+    }
+
+    #[test]
+    fn an_image_key_is_only_what_held_images_writes() {
+        assert_eq!(parse_mb_image_key("8f2a-11/Backdrop/3"), Some(("8f2a-11", "Backdrop", 3)));
+        assert_eq!(parse_mb_image_key("8f2a/Primary/x"), None);
+        assert_eq!(parse_mb_image_key("8f2a/Primary/0/extra"), None);
+        assert_eq!(parse_mb_image_key("8f2a/Logo/0"), None);
+        assert_eq!(parse_mb_image_key("../Primary/0"), None);
+        assert_eq!(parse_mb_image_key("/Primary/0"), None);
+    }
 
     /// A stub answering several requests, choosing a body by request path.
     async fn routed_stub(

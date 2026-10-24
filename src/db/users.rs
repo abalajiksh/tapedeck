@@ -332,6 +332,7 @@ impl Database {
             "import_jobs",
             "web_sessions",
             "user_connections",
+            "artist_pictures",
         ] {
             sqlx::query(&crate::sql!(&format!("DELETE FROM {} WHERE user_id = ?", table)))
                 .bind(id)

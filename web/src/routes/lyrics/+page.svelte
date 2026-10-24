@@ -310,6 +310,161 @@
 
 	$: if (deckOn && doc?.timed) lineAt($deck.position);
 
+	// ── The hand clock ──
+	//
+	// For when nothing can tell the reader where the song is: a Pano Scrobbler
+	// listen (ListenBrainz's `playing_now` carries no position at all), a song
+	// opened from history, or a quiet deck. The ribbon becomes a scrubber —
+	// drag it and the words go to that moment — and a play toggle runs a clock
+	// from there, so the lines turn over on their cues while you listen.
+	//
+	// It is **yours**, and labelled as such: no `≈`, because it is not an
+	// estimate of anything, and it never claims to be the deck. Dragging on a
+	// track the deck *does* measure is steering, and *Follow the deck* hands it
+	// back, exactly as pointing at a line does.
+
+	/** `at` seconds into the song, counted on from `from` (a `performance.now()`)
+	 *  while running; `from` is null while paused. */
+	let hand: { at: number; from: number | null } | null = null;
+	/** Bumped four times a second while the clock runs, so the statements
+	 *  below re-run — they cannot see time passing on their own. */
+	let handTick = 0;
+	let handTimer: ReturnType<typeof setInterval> | null = null;
+	let handKey = '';
+	let dragging = false;
+	let trackEl: HTMLDivElement;
+
+	/** The length the ribbon stands for: the track's, when the deck is on it
+	 *  and knows; otherwise a little past the last cue, which is the most the
+	 *  words themselves can say. */
+	$: lastCue = Math.max(0, ...(doc?.lines ?? []).map((l) => l.at ?? 0));
+	$: handScale = onDeck && $deck.track?.duration ? $deck.track.duration : lastCue + 15;
+	$: scrubbable = !!doc && !doc.instrumental && spoken.length > 0;
+	/** A track the deck is on and cannot measure — Pano Scrobbler's case. */
+	$: noPlayhead = onDeck && !($deck.track?.position_known ?? false);
+
+	function handNow(): number {
+		if (!hand) return 0;
+		const ran = hand.from == null ? 0 : (performance.now() - hand.from) / 1000;
+		return Math.min(handScale, hand.at + ran);
+	}
+	/** Where the hand clock is. The arguments are what the statement must
+	 *  re-run on — a reactive statement sees the names it is written with and
+	 *  does not trace them through `handNow`. */
+	function handAt(_h: typeof hand, _tick: number, _scale: number): number {
+		return hand ? handNow() : 0;
+	}
+	$: handPos = handAt(hand, handTick, handScale);
+	$: handRunning = !!hand && hand.from != null;
+	$: if (hand && doc?.timed) lineAt(handPos);
+
+	// A different song starts from nothing; a clock from the last one would
+	// be someone else's place.
+	$: docKey = doc ? lyricKey(doc.artist, doc.title) : '';
+	$: if (docKey !== handKey) {
+		handKey = docKey;
+		dropHand();
+	}
+
+	function startTimer() {
+		if (handTimer) return;
+		handTimer = setInterval(() => {
+			handTick++;
+			if (hand?.from != null && handNow() >= handScale) pauseHand();
+		}, 250);
+	}
+	function stopTimer() {
+		if (handTimer) clearInterval(handTimer);
+		handTimer = null;
+	}
+	function dropHand() {
+		hand = null;
+		stopTimer();
+	}
+
+	/** Run the clock from wherever it is — where you dragged it, or, before you
+	 *  have, from Tapedeck's estimate for a track it cannot measure, and from
+	 *  the line on screen otherwise. */
+	function runHand() {
+		const at = hand ? handNow() : noPlayhead ? $deck.position : (current?.at ?? 0);
+		hand = { at, from: performance.now() };
+		steering = true;
+		startTimer();
+	}
+	function pauseHand() {
+		if (!hand) return;
+		hand = { at: handNow(), from: null };
+		handTick++;
+		stopTimer();
+	}
+	function toggleHand() {
+		if (handRunning) pauseHand();
+		else runHand();
+	}
+
+	/** Go to `frac` of the way through. A timed lyric moves the clock (and
+	 *  keeps it running if it was); an untimed one has no clock, so the ribbon
+	 *  is a place in the words, as the design has it. */
+	function seekFrac(frac: number) {
+		if (!doc || !scrubbable) return;
+		const f = Math.min(1, Math.max(0, frac));
+		if (doc.timed) {
+			hand = { at: f * handScale, from: hand?.from != null ? performance.now() : null };
+			steering = true;
+			handTick++;
+		} else {
+			pointAt(spoken[Math.min(spoken.length - 1, Math.floor(f * spoken.length))].n);
+		}
+	}
+	function seekBy(secs: number) {
+		if (!doc?.timed) return step(secs > 0 ? 1 : -1);
+		const from = hand ? handNow() : noPlayhead || deckOn ? $deck.position : (current?.at ?? 0);
+		seekFrac((from + secs) / handScale);
+	}
+
+	/** The ribbon stands on its end above 900px and lies down below it, so the
+	 *  axis is read off its shape rather than a media query kept in step. */
+	function fracAt(e: PointerEvent): number {
+		const r = trackEl.getBoundingClientRect();
+		return r.height > r.width ? (e.clientY - r.top) / r.height : (e.clientX - r.left) / r.width;
+	}
+	function onScrubDown(e: PointerEvent) {
+		if (!scrubbable) return;
+		dragging = true;
+		// Capture is what keeps a drag going when the pointer leaves an 8px
+		// bar; failing to get it must not cost the tap itself.
+		try {
+			trackEl.setPointerCapture(e.pointerId);
+		} catch {
+			/* a pointer the browser no longer tracks */
+		}
+		seekFrac(fracAt(e));
+	}
+	function onScrubMove(e: PointerEvent) {
+		if (dragging) seekFrac(fracAt(e));
+	}
+	function onScrubUp(e: PointerEvent) {
+		dragging = false;
+		try {
+			trackEl.releasePointerCapture(e.pointerId);
+		} catch {
+			/* already released */
+		}
+	}
+	/** The ribbon as a slider. Its keys stop here so the page's own arrows —
+	 *  which step a line at a time — do not also fire. */
+	function onScrubKey(e: KeyboardEvent) {
+		const k = e.key;
+		if (k === 'ArrowDown' || k === 'ArrowRight') seekBy(5);
+		else if (k === 'ArrowUp' || k === 'ArrowLeft') seekBy(-5);
+		else if (k === 'Home') seekFrac(0);
+		else if (k === 'End') seekFrac(1);
+		else if ((k === ' ' || k === 'Enter') && doc?.timed) toggleHand();
+		else return;
+		e.preventDefault();
+		e.stopPropagation();
+	}
+
 	/** **An untimed lyric scrolls too, and it is honest about being a guess.**
 	 *
 	 *  The design's rule is that the ribbon becomes your place in the *words*
@@ -372,18 +527,29 @@
 	 *  lyric*, which is the design's "the ribbon becomes a plain scroll
 	 *  position". Two different measurements, and the label under it says which. */
 	$: progress = (() => {
+		if (hand && doc?.timed) return Math.min(1, handPos / handScale);
 		if (deckOn && $deck.track?.duration) {
+			return Math.min(1, $deck.position / $deck.track.duration);
+		}
+		// Pano's case before anyone touches it: the ribbon sits at Tapedeck's
+		// estimate, marked `≈`, and the play toggle starts from there.
+		if (noPlayhead && !steering && doc?.timed && $deck.track?.duration) {
 			return Math.min(1, $deck.position / $deck.track.duration);
 		}
 		return spoken.length > 1 && at >= 0 ? at / (spoken.length - 1) : 0;
 	})();
 	// `≈` when the *line* is estimated from the playhead rather than cued. The
 	// seconds themselves are still a measurement — see `estimating`.
-	$: ribbonLabel = deckOn
-		? `${estimating ? '≈' : ''}${mmss($deck.position)}`
-		: current?.at != null
-			? mmss(current.at)
-			: `${at + 1}/${spoken.length}`;
+	$: ribbonLabel =
+		hand && doc?.timed
+			? mmss(handPos)
+			: deckOn
+				? `${estimating ? '≈' : ''}${mmss($deck.position)}`
+				: noPlayhead && !steering && doc?.timed
+					? `≈${mmss($deck.position)}`
+					: current?.at != null
+						? mmss(current.at)
+						: `${at + 1}/${spoken.length}`;
 
 	/** The coordinate, as the design writes it: the track's position on the
 	 *  record where one is known, and the line either way. */
@@ -396,6 +562,9 @@
 		: '';
 
 	function pointAt(n: number) {
+		// Pointing at a line is a different way of steering; a clock still
+		// running would drag the cursor straight back off it.
+		dropHand();
 		cursor = n;
 		steering = true;
 	}
@@ -413,6 +582,7 @@
 	 *  press that un-froze the cursor while leaving the reader on last week's
 	 *  song would be a button that half did what it said. */
 	function followDeck() {
+		dropHand();
 		steering = false;
 		if (!live) {
 			// Leaving the address is what makes the theatre follow the *music*
@@ -554,7 +724,10 @@
 	// An async `onMount` returns a promise, which Svelte cannot use as a
 	// teardown — so the watch would outlive the page and hold the shared poll
 	// open for ever. Released here instead, the same trap v0.80.0 records.
-	onDestroy(() => unwatch?.());
+	onDestroy(() => {
+		unwatch?.();
+		stopTimer();
+	});
 </script>
 
 <svelte:head><title>{doc ? `${doc.title} — Lyrics` : 'Lyrics'} — Tapedeck</title></svelte:head>
@@ -594,13 +767,46 @@
 			</svg>
 
 			<!-- The ribbon: where you are, as a position rather than a number. -->
-			<div class="ribbon" style="--p:{(progress * 100).toFixed(2)}%">
+			<div class="ribbon" class:scrubbing={dragging} style="--p:{(progress * 100).toFixed(2)}%">
 				{#if mark}<span class="rmark">{mark}</span>{/if}
-				<div class="rtrack">
+				<!-- Draggable wherever the reader is not being driven by a measured
+				     playhead — and on a measured one too, as a way of steering. -->
+				<div
+					class="rtrack"
+					class:scrub={scrubbable}
+					bind:this={trackEl}
+					role="slider"
+					tabindex={scrubbable ? 0 : -1}
+					aria-label={doc.timed ? 'Where in the song' : 'Where in the words'}
+					aria-valuemin={0}
+					aria-valuemax={100}
+					aria-valuenow={Math.round(progress * 100)}
+					aria-valuetext={ribbonLabel}
+					on:pointerdown={onScrubDown}
+					on:pointermove={onScrubMove}
+					on:pointerup={onScrubUp}
+					on:pointercancel={onScrubUp}
+					on:keydown={onScrubKey}
+				>
 					<span class="rfill"></span>
 					<span class="rhead"></span>
 				</div>
 				<span class="rtime">{ribbonLabel}</span>
+				{#if doc.timed && scrubbable && !deckOn}
+					<button
+						class="rplay"
+						on:click={toggleHand}
+						aria-pressed={handRunning}
+						aria-label={handRunning ? 'Pause your clock' : `Run the words from ${ribbonLabel}`}
+						title={handRunning ? 'Pause your clock (Space on the bar)' : 'Run the words from here (Space on the bar)'}
+					>
+						{#if handRunning}
+							<svg viewBox="0 0 24 24" width="12" fill="currentColor"><rect x="6" y="5" width="4" height="14" rx="1" /><rect x="14" y="5" width="4" height="14" rx="1" /></svg>
+						{:else}
+							<svg viewBox="0 0 24 24" width="12" fill="currentColor"><path d="M8 5.5v13a1 1 0 0 0 1.5.86l10.5-6.5a1 1 0 0 0 0-1.72L9.5 4.64A1 1 0 0 0 8 5.5z" /></svg>
+						{/if}
+					</button>
+				{/if}
 			</div>
 
 			<div class="centre">
@@ -699,7 +905,19 @@
 						<span class="wpill good">
 							<span class="blip"></span>{estimating ? 'Following ≈' : 'Following'}
 						</span>
-					{:else if canFollow}
+					{:else if hand && doc.timed}
+						<span class="wpill" class:good={handRunning}>
+							{#if handRunning}<span class="blip"></span>{/if}Your clock{handRunning ? '' : ' · paused'}
+						</span>
+					{:else if noPlayhead && doc.timed}
+						<!-- Said rather than left to be discovered: the player
+						     sends no position, so the words will not move on
+						     their own. -->
+						<span class="wpill" title="This player sends no position. Drag the bar to where you are, or press play to run the words from ≈{mmss($deck.position)}.">
+							No playhead — drag the bar or press play
+						</span>
+					{/if}
+					{#if !deckOn && canFollow}
 						<!-- The way back. Drawn only when the deck really is on this
 						     track with a measured playhead, so it never offers to
 						     follow something it cannot. -->
@@ -995,6 +1213,10 @@
 	/* The fill and the playhead read `--p` off the ribbon rather than taking an
 	   inline height, so the same two elements turn on their side under 900px
 	   without a second set of markup to keep in step. */
+	/* The bar is 8px wide; the hit area is not. */
+	.rtrack.scrub { cursor: pointer; touch-action: none; }
+	.rtrack.scrub::before { content: ''; position: absolute; inset: -4px -14px; }
+	.rtrack:focus-visible { outline: 2px solid #e07a55; outline-offset: 6px; }
 	.rfill {
 		position: absolute;
 		left: 0;
@@ -1003,8 +1225,26 @@
 		height: var(--p);
 		border-radius: 999px;
 		background: linear-gradient(180deg, #7a8a5e, #e07a55);
-		transition: height 0.9s linear;
+		/* A quarter-second, matching the deck clock's refresh: a longer glide
+		   trails the music it is meant to show. */
+		transition: height 0.25s linear;
 	}
+	.ribbon.scrubbing .rfill,
+	.ribbon.scrubbing .rhead { transition: none; }
+	.rplay {
+		display: grid;
+		place-items: center;
+		width: 30px;
+		height: 30px;
+		border: 1px solid rgba(244, 231, 207, 0.16);
+		border-radius: 999px;
+		background: #221b13;
+		color: #f4e7cf;
+		cursor: pointer;
+	}
+	.rplay:hover,
+	.rplay:focus-visible { border-color: #e07a55; color: #fbf3e2; }
+	.rplay[aria-pressed='true'] { background: #e07a55; border-color: #e07a55; color: #1a140e; }
 	.rhead {
 		position: absolute;
 		left: -6px;
@@ -1014,7 +1254,7 @@
 		border-radius: 999px;
 		background: #fbf3e2;
 		box-shadow: 0 0 12px rgba(224, 122, 85, 0.8);
-		transition: top 0.9s linear;
+		transition: top 0.25s linear;
 	}
 	.rtime {
 		font: 600 10px ui-monospace, Menlo, monospace;
@@ -1291,8 +1531,9 @@
 		.centre { padding: 32px 24px; width: 100%; order: 1; }
 		.ribbon { flex-direction: row; width: 100%; height: 54px; padding: 0 22px; border-right: none; border-bottom: 1px solid rgba(244, 231, 207, 0.07); }
 		.rtrack { width: auto; height: 8px; flex: 1; }
-		.rfill { top: 0; bottom: 0; right: auto; height: auto; width: var(--p); transition: width 0.9s linear; }
-		.rhead { top: -6px; bottom: -6px; left: var(--p); right: auto; width: 3px; height: auto; transition: left 0.9s linear; }
+		.rfill { top: 0; bottom: 0; right: auto; height: auto; width: var(--p); transition: width 0.25s linear; }
+		.rhead { top: -6px; bottom: -6px; left: var(--p); right: auto; width: 3px; height: auto; transition: left 0.25s linear; }
+		.rtrack.scrub::before { inset: -14px -4px; }
 		.rmark, .rtime { writing-mode: horizontal-tb; }
 		.wing { width: 100%; border-left: none; border-top: 1px solid rgba(244, 231, 207, 0.07); order: 2; }
 	}

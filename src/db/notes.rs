@@ -1339,7 +1339,7 @@ impl Database {
         // row fell back to the lettered tile.
         if kind == "artists" {
             let names: Vec<String> = rows.iter().map(|r| r.name.clone()).collect();
-            let images = self.artist_images(&names).await.unwrap_or_default();
+            let images = self.artist_images(user_id, &names).await.unwrap_or_default();
             for row in &mut rows {
                 row.artwork_url = images.get(&Self::artist_key(&row.name)).cloned();
             }
@@ -1895,11 +1895,17 @@ impl Database {
         }
         let artist_rows: Vec<(String, i64, i64, Option<String>)> = sqlx::query_as(&crate::sql!(
             "SELECT LOWER(TRIM(s.artist)) AS k, COUNT(*) AS plays, MAX(s.timestamp) AS last_played,
-                    (SELECT a.image_url FROM artists a WHERE a.name_key = LOWER(TRIM(s.artist)))
+                    (SELECT COALESCE(p.url, a.image_url) FROM artists a
+                       LEFT JOIN artist_pictures p
+                         ON p.artist_id = a.id AND p.user_id = ? AND p.kind = 'portrait'
+                      WHERE a.name_key = LOWER(TRIM(s.artist)))
                FROM scrobbles s
               WHERE s.user_id = ? AND s.skipped = FALSE AND TRIM(s.artist) != ''
               GROUP BY k",
         ))
+        // The viewer's own pick first — the subquery's `?` comes before the
+        // `WHERE`'s, so the same id is bound twice in that order.
+        .bind(user_id)
         .bind(user_id)
         .fetch_all(&self.pool)
         .await?;

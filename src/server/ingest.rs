@@ -683,8 +683,8 @@ pub async fn submit_listens(
                 // staleness guard must not hold its own count against it — a
                 // backward step from this source is the listener seeking.
                 let playback = info_ref.and_then(|ai| ai.tapedeck_playback.as_ref());
-                let progress = match playback.and_then(|p| p.position_secs()) {
-                    Some(secs) => Progress::Exact(secs),
+                let progress = match playback.and_then(|p| p.position_ms) {
+                    Some(ms) => Progress::Exact { ms: ms.max(0) as u64 },
                     None => Progress::Unknown,
                 };
                 let mut np = NowPlaying::from_play(&play, "ingest", quality_opt, progress);

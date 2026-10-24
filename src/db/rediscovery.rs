@@ -590,49 +590,49 @@ impl Database {
         .await?;
         Ok(res.rows_affected() > 0)
     }
-    /// Set or clear an artist's **wide** image.
-    ///
-    /// Its own column and its own setter rather than a second argument to the
-    /// one above, because the two are set independently: a portrait usually
-    /// arrives from the library or a provider, while a landscape is almost
-    /// always chosen by hand — nothing Tapedeck can reach supplies one.
-    pub async fn set_artist_landscape(
-        &self,
-        id: i64,
-        url: Option<&str>,
-    ) -> Result<bool, sqlx::Error> {
-        let res = sqlx::query(&crate::sql!(
-            "UPDATE artists SET landscape_url = ?, updated_at = ? WHERE id = ?"
-        ))
-        .bind(url)
-        .bind(Self::now_secs())
-        .bind(id)
-        .execute(&self.pool)
-        .await?;
-        Ok(res.rows_affected() > 0)
-    }
-    /// A wide image for each of these artists, keyed by folded name.
+    /// A wide image for each of these artists as this person sees it, keyed
+    /// by `artist_key`.
     ///
     /// Reports asks for its chapters' top artists in one go rather than one
-    /// request per card — there are twelve of them on a year page.
+    /// request per card — there are twelve of them on a year page. The viewer's
+    /// own pick wins; the shared column is read too, though nothing fills it
+    /// automatically and v0.124.0 moved the hand-set ones onto their owner.
+    ///
+    /// Keyed by `artist_key` like `artist_images`, because that is what
+    /// `name_key` holds. It used to fold with `normalise_artist`, which turns
+    /// "Cœur" into "coeur" and so could never match the row it was asking for.
     pub async fn artist_landscapes(
         &self,
+        user_id: i64,
         names: &[String],
+    ) -> Result<HashMap<String, String>, sqlx::Error> {
+        self.artist_pictures_for(user_id, names, "wide").await
+    }
+    /// The picture of `kind` this person sees for each of these artists: their
+    /// own pick, else the shared one. Keyed by `artist_key`.
+    async fn artist_pictures_for(
+        &self,
+        user_id: i64,
+        names: &[String],
+        kind: &str,
     ) -> Result<HashMap<String, String>, sqlx::Error> {
         if names.is_empty() {
             return Ok(HashMap::new());
         }
-        let keys: Vec<String> = names.iter().map(|n| normalise_artist(n)).collect();
-        let placeholders = vec!["?"; keys.len()].join(",");
+        let shared = if kind == "wide" { "a.landscape_url" } else { "a.image_url" };
+        let placeholders = vec!["?"; names.len()].join(",");
         let sql = format!(
-            "SELECT name_key, landscape_url FROM artists
-              WHERE name_key IN ({placeholders}) AND landscape_url IS NOT NULL
-                AND TRIM(landscape_url) != ''"
+            "SELECT a.name_key, COALESCE(p.url, {shared}) FROM artists a
+               LEFT JOIN artist_pictures p
+                 ON p.artist_id = a.id AND p.user_id = ? AND p.kind = ?
+              WHERE a.name_key IN ({placeholders})
+                AND COALESCE(p.url, {shared}) IS NOT NULL
+                AND TRIM(COALESCE(p.url, {shared})) != ''"
         );
         let stmt = crate::sql!(&sql);
-        let mut q = sqlx::query_as::<_, (String, String)>(&stmt);
-        for k in &keys {
-            q = q.bind(k);
+        let mut q = sqlx::query_as::<_, (String, String)>(&stmt).bind(user_id).bind(kind);
+        for n in names {
+            q = q.bind(Self::artist_key(n));
         }
         Ok(q.fetch_all(&self.pool).await?.into_iter().collect())
     }
@@ -698,24 +698,14 @@ impl Database {
         .await?;
         Ok(rows.into_iter().map(|r| r.0).collect())
     }
+    /// The portrait this person sees for each of these artists — their own
+    /// pick, else the shared one — keyed by `artist_key`.
     pub async fn artist_images(
         &self,
+        user_id: i64,
         names: &[String],
     ) -> Result<HashMap<String, String>, sqlx::Error> {
-        if names.is_empty() {
-            return Ok(HashMap::new());
-        }
-        let placeholders = vec!["?"; names.len()].join(",");
-        let sql = format!(
-            "SELECT name_key, image_url FROM artists
-             WHERE image_url IS NOT NULL AND name_key IN ({placeholders})"
-        );
-        let stmt = crate::sql!(&sql);
-        let mut q = sqlx::query_as::<_, (String, String)>(&stmt);
-        for n in names {
-            q = q.bind(Self::artist_key(n));
-        }
-        Ok(q.fetch_all(&self.pool).await?.into_iter().collect())
+        self.artist_pictures_for(user_id, names, "portrait").await
     }
     /// How many distinct artists in this user's history have an image yet.
     pub async fn artist_image_coverage(&self, user_id: i64) -> Result<(i64, i64), sqlx::Error> {

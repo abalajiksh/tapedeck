@@ -3351,6 +3351,8 @@ mod migrate;
 mod notes;
 mod patch;
 mod physical;
+mod pictures;
+pub use pictures::{ArtistPicture, NewArtistPicture};
 mod radio;
 pub use radio::{AirLogEntry, NewAirLine, RadioPreset, RadioSession};
 mod ratings;

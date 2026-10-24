@@ -633,6 +633,34 @@ pub struct PlexSource {
     /// its own copy of the threshold too — but the *decision* is one shared
     /// method, so the two cannot drift.
     threshold: ScrobbleThreshold,
+    /// When the last `/status/sessions` request went out and came back, in
+    /// wall-clock milliseconds — what the `playhead` trace measures against.
+    last_fetch_ms: (u64, u64),
+    /// Per session, for the `playhead` trace only. See [`PlayheadTrace`].
+    playhead_trace: HashMap<String, PlayheadTrace>,
+}
+
+/// The `playhead` trace's memory of one session: where the track was when it
+/// was first seen, the last report, and the least stale report so far.
+///
+/// Diagnostic, and only touched when the `playhead` log target is enabled
+/// (`RUST_LOG=…,playhead=debug`). It exists to answer one question with
+/// numbers rather than a guess: how far behind the music is the `viewOffset`
+/// Plex hands us, and how unevenly does that lag arrive?
+#[derive(Debug, Clone)]
+struct PlayheadTrace {
+    rating_key: String,
+    anchor_offset_ms: u64,
+    anchor_wall_ms: u64,
+    last_offset_ms: u64,
+    last_wall_ms: u64,
+    /// The smallest lag seen against the anchor's clock. A report's lag minus
+    /// this is how much staler it is than the freshest one Plex ever sent.
+    min_lag_ms: i64,
+}
+
+fn wall_ms() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
 }
 
 /// How often the Plex history endpoint is walked, independent of how often
@@ -810,6 +838,8 @@ impl PlexSource {
             history_seen_through: None,
             recent_scrobbles: HashMap::new(),
             threshold: ScrobbleThreshold::default(),
+            last_fetch_ms: (0, 0),
+            playhead_trace: HashMap::new(),
         }
     }
 
@@ -1488,6 +1518,77 @@ impl PlexSource {
         Ok((resp.bytes().await?.to_vec(), content_type))
     }
 
+    /// Every picture Plex has for an artist: its own `/posters` (square) or
+    /// `/arts` (wide) list — the same lists Plex's *Edit → Poster* and
+    /// *Background* tabs draw, agents' alternates and uploads included.
+    ///
+    /// Neither list is in Plex's published spec. `/posters` was captured
+    /// from a real server on 2026-10-24 and `a_real_poster_list_reads_into_tiles`
+    /// is pinned to it: items under `Metadata` with `key`, `ratingKey`,
+    /// `thumb`, `selected` (a bool) and `provider`. That artist had no
+    /// backgrounds, so `/arts` has only been seen empty — an absent `Metadata`.
+    /// Still read leniently (`Photo` too, `selected` as a number) since the
+    /// non-empty `/arts` body has not been seen.
+    pub async fn artist_images(
+        &self,
+        rating_key: &str,
+        wide: bool,
+    ) -> Result<Vec<super::LibraryImage>, Box<dyn std::error::Error + Send + Sync>> {
+        let list = if wide { "arts" } else { "posters" };
+        let resp = self
+            .client
+            .get(format!("{}/library/metadata/{}/{}", self.url, rating_key, list))
+            .header("X-Plex-Token", &self.token)
+            .header("Accept", "application/json")
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            return Err(format!("Plex {list} returned {}", resp.status()).into());
+        }
+        Ok(parse_plex_images(&resp.json::<serde_json::Value>().await?))
+    }
+
+    /// The bytes behind a key `artist_images` returned.
+    ///
+    /// A path on the server is fetched as it is, the way `fetch_cover_art`
+    /// fetches a thumb. A remote URL — an agent's image Plex has not downloaded
+    /// — goes through Plex's own photo transcoder, so the only host Tapedeck
+    /// ever talks to is the Plex server the source names.
+    pub async fn fetch_image(
+        &self,
+        key: &str,
+        max: u32,
+    ) -> Result<(Vec<u8>, String), Box<dyn std::error::Error + Send + Sync>> {
+        if !plex_image_key_ok(key) {
+            return Err("not a Plex image key".into());
+        }
+        let req = if key.starts_with('/') {
+            self.client.get(format!("{}{}", self.url, key))
+        } else {
+            let size = max.to_string();
+            self.client.get(format!("{}/photo/:/transcode", self.url)).query(&[
+                ("url", key),
+                ("width", size.as_str()),
+                ("height", size.as_str()),
+                ("minSize", "1"),
+            ])
+        };
+        let resp = req.header("X-Plex-Token", &self.token).send().await?;
+        if !resp.status().is_success() {
+            return Err(format!("Plex image returned {}", resp.status()).into());
+        }
+        let content_type = resp
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("image/jpeg")
+            .to_string();
+        if !content_type.starts_with("image/") {
+            return Err("Plex sent something that is not an image".into());
+        }
+        Ok((resp.bytes().await?.to_vec(), content_type))
+    }
+
     /// Library titles discovered by `initialize`. Used by the settings UI to
     /// show what a URL/token pair can actually see.
     pub fn library_names(&self) -> Vec<String> {
@@ -1526,6 +1627,7 @@ impl PlexSource {
         // from anywhere else. Same rule as `needs_setup` and the lyrics
         // coverage card: never report a failed read as an absence.
         let endpoint = format!("{}/status/sessions", self.url);
+        let sent_at = wall_ms();
         let sent = self
             .client
             .get(&endpoint)
@@ -1533,6 +1635,7 @@ impl PlexSource {
             .header("Accept", "application/json")
             .send()
             .await;
+        self.last_fetch_ms = (sent_at, wall_ms());
         let parsed = match sent {
             // The top-level message of a transport error names the operation
             // and not the fault, so a refused connection, a DNS failure and a
@@ -1672,6 +1775,64 @@ impl PlexSource {
         Ok(result)
     }
 
+    /// One line per Plex report for the `playhead` trace.
+    ///
+    /// * `off` — the `viewOffset` Plex sent, in ms.
+    /// * `Δoff` / `Δwall` — how far it moved, against how much real time
+    ///   passed between the two responses. Equal means Plex's number is moving
+    ///   with the music; `Δoff = 0` while playing means Plex had nothing new.
+    /// * `rtt` — how long the request took.
+    /// * `lag` — how far behind a steady clock started at the first report this
+    ///   one is; `stale` — the same, less the freshest report seen, which is
+    ///   the part that would drag a deck backwards.
+    ///
+    /// A jump of more than 15 s either way is a seek, and re-anchors.
+    fn trace_playhead(&mut self, session: &str, rating_key: &str, off: u64, track: &PlexTrack) {
+        let (sent, recv) = self.last_fetch_ms;
+        let rtt = recv.saturating_sub(sent);
+        let player = track.player.as_ref().and_then(|p| p.product.as_deref()).unwrap_or("?");
+        let fresh = |off: u64| PlayheadTrace {
+            rating_key: rating_key.to_string(),
+            anchor_offset_ms: off,
+            anchor_wall_ms: recv,
+            last_offset_ms: off,
+            last_wall_ms: recv,
+            min_lag_ms: 0,
+        };
+        let Some(t) = self.playhead_trace.get_mut(session).filter(|t| t.rating_key == rating_key)
+        else {
+            debug!(
+                target: "playhead",
+                "plex {player} '{}' NEW off={off}ms rtt={rtt}ms",
+                track.title
+            );
+            self.playhead_trace.insert(session.to_string(), fresh(off));
+            return;
+        };
+        let d_off = off as i64 - t.last_offset_ms as i64;
+        let d_wall = recv as i64 - t.last_wall_ms as i64;
+        let expected = t.anchor_offset_ms as i64 + (recv as i64 - t.anchor_wall_ms as i64);
+        let lag = expected - off as i64;
+        if lag.abs() > 15_000 {
+            debug!(
+                target: "playhead",
+                "plex {player} '{}' SEEK off={off}ms Δoff={d_off}ms Δwall={d_wall}ms rtt={rtt}ms",
+                track.title
+            );
+            *t = fresh(off);
+            return;
+        }
+        t.min_lag_ms = t.min_lag_ms.min(lag);
+        let stale = lag - t.min_lag_ms;
+        debug!(
+            target: "playhead",
+            "plex {player} '{}' off={off}ms Δoff={d_off}ms Δwall={d_wall}ms rtt={rtt}ms lag={lag}ms stale={stale}ms",
+            track.title
+        );
+        t.last_offset_ms = off;
+        t.last_wall_ms = recv;
+    }
+
     async fn process_live_track(
         &mut self,
         track: PlexTrack,
@@ -1683,6 +1844,9 @@ impl PlexSource {
         let duration = track.duration.unwrap_or(0);
         let view_offset = track.view_offset.unwrap_or(0);
         let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+        if is_playing && tracing::enabled!(target: "playhead", tracing::Level::DEBUG) {
+            self.trace_playhead(&session_key, &rating_key, view_offset, &track);
+        }
 
         if let Some(state) = self.session_states.get(&session_key) {
             if state.rating_key != rating_key {
@@ -2157,9 +2321,150 @@ impl MusicSource for PlexSource {
     }
 }
 
+/// Is this a key `PlexSource::fetch_image` may ask for?
+///
+/// It arrives back from the browser when a picture is chosen, so it is checked
+/// rather than trusted: a path must stay under `/library/metadata/`, and
+/// anything else must be an `http(s)` URL, which only ever reaches Plex's
+/// transcoder as a parameter and is never fetched by Tapedeck.
+pub(crate) fn plex_image_key_ok(key: &str) -> bool {
+    if key.starts_with('/') {
+        return key.starts_with("/library/metadata/") && !key.contains("..");
+    }
+    reqwest::Url::parse(key).is_ok_and(|u| matches!(u.scheme(), "http" | "https"))
+}
+
+/// What a person calls one of Plex's image providers.
+fn plex_provider_name(p: &str) -> String {
+    match p {
+        "lastfm" => "Last.fm".into(),
+        "discogs" => "Discogs".into(),
+        "tivo" => "TiVo".into(),
+        "fanarttv" => "fanart.tv".into(),
+        "theaudiodb" => "TheAudioDB".into(),
+        other => other.to_string(),
+    }
+}
+
+/// Read a `/posters` or `/arts` body. See `PlexSource::artist_images`.
+pub(crate) fn parse_plex_images(body: &serde_json::Value) -> Vec<super::LibraryImage> {
+    let container = &body["MediaContainer"];
+    let items = ["Metadata", "Photo"].iter().filter_map(|k| container[*k].as_array()).flatten();
+    let text = |v: &serde_json::Value| v.as_str().map(str::to_string).filter(|s| !s.is_empty());
+    let mut out = Vec::new();
+    for item in items {
+        // **`key`, not `thumb`.** For a picture Plex holds the two are the same
+        // path. For one an agent found online, `key` is the original (Discogs,
+        // `metadata-static.plex.tv`) and `thumb` is a 225×336 crop of it on
+        // `images.plex.tv` — choosing that would keep a thumbnail as the
+        // picture. Confirmed against a real server on 2026-10-24.
+        let Some(key) = text(&item["key"]).or_else(|| text(&item["thumb"])) else { continue };
+        if !plex_image_key_ok(&key) {
+            continue;
+        }
+        let selected = match &item["selected"] {
+            serde_json::Value::Bool(b) => *b,
+            serde_json::Value::Number(n) => n.as_i64() == Some(1),
+            serde_json::Value::String(s) => s == "1" || s == "true",
+            _ => false,
+        };
+        // Plex's own music agent names its sources plainly (`lastfm`,
+        // `discogs`, `tivo`); a legacy agent sends a dotted id whose last
+        // segment is the same thing.
+        let provider = text(&item["provider"])
+            .map(|p| p.rsplit('.').next().unwrap_or(&p).to_string())
+            .filter(|p| p != "music" && p != "local")
+            .map(|p| plex_provider_name(&p));
+        out.push(super::LibraryImage {
+            // Never handed to the browser, even when it is a URL: an agent's
+            // image can sit behind plex.tv's own auth, and the transcoder
+            // already knows how to reach it.
+            remote: false,
+            key,
+            provider,
+            selected,
+            width: None,
+            height: None,
+            thumb: None,
+        });
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `/library/metadata/{id}/posters`, **captured from a real Plex on
+    /// 2026-10-24** (The Marías, Plex's own music agent) and trimmed to one of
+    /// each kind: the poster Plex holds and shows, and two an agent found
+    /// online. `thumb` on the online ones is a 225×336 crop on
+    /// `images.plex.tv`, which is exactly what must not become the key.
+    #[test]
+    fn a_real_poster_list_reads_into_tiles() {
+        let body = serde_json::json!({ "MediaContainer": {
+            "size": 3,
+            "identifier": "com.plexapp.plugins.library",
+            "mediaTagPrefix": "/system/bundle/media/flags/",
+            "mediaTagVersion": 1786914632,
+            "Metadata": [
+                {
+                    "key": "/library/metadata/101357/file?url=metadata%3A%2F%2Fposters%2Ftv%2Eplex%2Eagents%2Emusic_37e648aaf6783c81a2926225b0f990e4e572091f",
+                    "ratingKey": "metadata://posters/tv.plex.agents.music_37e648aaf6783c81a2926225b0f990e4e572091f",
+                    "thumb": "/library/metadata/101357/file?url=metadata%3A%2F%2Fposters%2Ftv%2Eplex%2Eagents%2Emusic_37e648aaf6783c81a2926225b0f990e4e572091f",
+                    "selected": true,
+                    "provider": "lastfm"
+                },
+                {
+                    "key": "https://i.discogs.com/nDoj8dyBGhUMed7l8XWjKYyNXOQxZHhW1UYuDzG_5Qc/rs:fit/g:sm/q:90/h:600/w:600/czM6Ly9kaXNjb2dz/LWRhdGFiYXNlLWlt/YWdlcy9BLTY4NjY1/MjctMTc0NjkyNTQw/Ni0xMzg4LmpwZWc.jpeg",
+                    "ratingKey": "https://i.discogs.com/nDoj8dyBGhUMed7l8XWjKYyNXOQxZHhW1UYuDzG_5Qc/rs:fit/g:sm/q:90/h:600/w:600/czM6Ly9kaXNjb2dz/LWRhdGFiYXNlLWlt/YWdlcy9BLTY4NjY1/MjctMTc0NjkyNTQw/Ni0xMzg4LmpwZWc.jpeg",
+                    "thumb": "https://images.plex.tv/photo?height=336&width=225&minSize=1&upscale=1&url=https%3A%2F%2Fi%2Ediscogs%2Ecom%2FnDoj8dyBGhUMed7l8XWjKYyNXOQxZHhW1UYuDzG_5Qc%2Frs%3Afit%2Fg%3Asm%2Fq%3A90%2Fh%3A600%2Fw%3A600%2FczM6Ly9kaXNjb2dz%2FLWRhdGFiYXNlLWlt%2FYWdlcy9BLTY4NjY1%2FMjctMTc0NjkyNTQw%2FNi0xMzg4LmpwZWc%2Ejpeg",
+                    "selected": false,
+                    "provider": "discogs"
+                },
+                {
+                    "key": "https://metadata-static.plex.tv/8/3504b0f3b0/8b5a1ef84fd9441c28f184fc99125adf.jpg",
+                    "ratingKey": "https://metadata-static.plex.tv/8/3504b0f3b0/8b5a1ef84fd9441c28f184fc99125adf.jpg",
+                    "thumb": "https://images.plex.tv/photo?height=336&width=225&minSize=1&upscale=1&url=https%3A%2F%2Fmetadata-static%2Eplex%2Etv%2F8%2F3504b0f3b0%2F8b5a1ef84fd9441c28f184fc99125adf%2Ejpg",
+                    "selected": false,
+                    "provider": "tivo"
+                }
+            ]
+        }});
+        let got = parse_plex_images(&body);
+        assert_eq!(got.len(), 3);
+        assert!(got[0].selected && got[0].key.starts_with("/library/metadata/101357/file?url="));
+        assert_eq!(got[0].provider.as_deref(), Some("Last.fm"));
+        assert!(got[1].key.starts_with("https://i.discogs.com/"), "the original, not the crop");
+        assert_eq!(got[1].provider.as_deref(), Some("Discogs"));
+        assert_eq!(
+            got[2].key,
+            "https://metadata-static.plex.tv/8/3504b0f3b0/8b5a1ef84fd9441c28f184fc99125adf.jpg"
+        );
+        assert_eq!(got[2].provider.as_deref(), Some("TiVo"));
+        assert!(got.iter().all(|i| !i.key.contains("images.plex.tv")));
+        assert!(got.iter().all(|i| !i.remote), "Plex pictures always go through Plex");
+
+        // An artist with no backgrounds: the same container, no `Metadata`.
+        let empty = serde_json::json!({ "MediaContainer": {
+            "size": 0, "identifier": "com.plexapp.plugins.library",
+            "mediaTagPrefix": "/system/bundle/media/flags/", "mediaTagVersion": 1786914632
+        }});
+        assert!(parse_plex_images(&empty).is_empty());
+    }
+
+    /// The leniency kept for the `/arts` body nobody has seen full: items under
+    /// `Photo`, `selected` as a string, an entry that is not a picture.
+    #[test]
+    fn an_unseen_spelling_still_reads() {
+        let photo = serde_json::json!({ "MediaContainer": { "Photo": [
+            { "thumb": "/library/metadata/41/thumb/1700000000", "selected": "1" },
+            { "key": "/:/prefs", "thumb": "/:/prefs" }
+        ]}});
+        let got = parse_plex_images(&photo);
+        assert_eq!(got.len(), 1);
+        assert!(got[0].selected);
+    }
 
     fn track(offset_ms: u64) -> PlexTrack {
         PlexTrack {

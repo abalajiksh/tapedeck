@@ -32,18 +32,6 @@ use super::auth::{AuthUser, ReadAuth, WriteAuth};
 use super::models::ErrorResponse;
 use crate::openapi::{BadRequest, Bytes, FileUpload, NotFound, Unauthorized};
 
-/// A portrait, set or cleared. Null when cleared.
-#[derive(Serialize, ToSchema)]
-pub struct ArtistImageSet {
-    pub image_url: Option<String>,
-}
-
-/// A wide image, set or cleared. Null when cleared.
-#[derive(Serialize, ToSchema)]
-pub struct LandscapeSet {
-    pub landscape_url: Option<String>,
-}
-
 /// An album cover, set or cleared. Null when cleared — the page then falls
 /// back to the cover from your listens.
 #[derive(Serialize, ToSchema)]
@@ -53,7 +41,7 @@ pub struct CoverSet {
 use super::AppState;
 use crate::sources::{MediaBrowserSource, NavidromeSource, PlexFilters, PlexSource};
 
-fn not_found(msg: &str) -> Response {
+pub(super) fn not_found(msg: &str) -> Response {
     (StatusCode::NOT_FOUND, Json(ErrorResponse { code: 404, error: msg.into() })).into_response()
 }
 
@@ -181,7 +169,7 @@ async fn scrobble_art(
 /// option, so Tapedeck fetches it. Sources are tried in turn and the first hit
 /// wins — a portrait is a portrait, and asking the rest costs the user's own
 /// servers a request for nothing.
-async fn artist_image_from_library(
+pub(super) async fn artist_image_from_library(
     state: &AppState,
     user_id: i64,
     name: &str,
@@ -279,7 +267,7 @@ pub struct ArtistImageUpdate {
 /// URL at all. Relative paths are allowed on purpose: `/api/v1/artists/img/12`
 /// and `/api/v1/art/914` are both this server, and pasting one is how a user
 /// points at their own library through the proxy.
-fn validate_image_url(raw: &str) -> Option<Option<&str>> {
+pub(super) fn validate_image_url(raw: &str) -> Option<Option<&str>> {
     let url = raw.trim();
     if url.is_empty() {
         return Some(None);
@@ -294,119 +282,6 @@ fn not_an_image_url() -> Response {
         Json(ErrorResponse { code: 400, error: "That doesn't look like an image URL".into() }),
     )
         .into_response()
-}
-
-// PUT /api/v1/artists/img/:id — set the portrait by hand.
-//
-// Tapedeck is a listening journal, so the operator gets the last word over
-// anything a provider or a library guessed. Stored as given, and it beats the
-// backfill because the backfill only ever fills a NULL.
-/// Override an artist portrait.
-///
-/// Session-only. A manual override beats every provider — this is a
-/// journal, and whoever keeps it gets the last word.
-#[utoipa::path(
-    put,
-    path = "/api/v1/artists/img/{id}",
-    tag = "Library",
-    params(("id" = i64, Path, description = "The `artists` row.")),
-    request_body = ArtistImageUpdate,
-    responses(
-        (status = 200, description = "Saved. Null when cleared.", body = ArtistImageSet),
-        (status = 400, response = BadRequest),
-        (status = 401, response = Unauthorized),
-        (status = 404, response = NotFound),
-    )
-)]
-async fn set_artist_image(
-    State(state): State<Arc<AppState>>,
-    user: AuthUser,
-    Path(id): Path<i64>,
-    Json(body): Json<ArtistImageUpdate>,
-) -> Response {
-    let _ = &user;
-    let Some(value) = validate_image_url(&body.url) else {
-        return not_an_image_url();
-    };
-    // What it replaces, so pasting a link over an uploaded picture removes the
-    // file rather than orphaning it. An upload does the same on its own path.
-    let previous = state.db.artist_picture_urls(id).await.ok().flatten().and_then(|(p, _)| p);
-    match state.db.set_artist_image(id, value).await {
-        Ok(true) => {
-            forget_previous(&state, previous.as_deref()).await;
-            (StatusCode::OK, Json(ArtistImageSet { image_url: value.map(str::to_string) }))
-                .into_response()
-        }
-        Ok(false) => not_found("No such artist"),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse { code: 500, error: e.to_string() }),
-        )
-            .into_response(),
-    }
-}
-
-// PUT /api/v1/artists/landscape/:id — set the **wide** image by hand.
-//
-// A separate route rather than a field on the one above, because the two are
-// set independently and from different places: a portrait usually arrives from
-// the user's own library or a provider, while nothing Tapedeck can reach
-// supplies a landscape — it is always chosen by hand. They are also different
-// *photographs* rather than two crops, which is why there are two columns.
-//
-// Used by a Reports chapter, which gives its top artist a whole tile; a square
-// portrait there either pillarboxes or crops the head off, and the giant
-// initial that stood in for it was a placeholder, not a design.
-/// Set or clear an artist's wide image.
-///
-/// Session-only. Takes the **artist row id** (`artist_row_id` on the artist
-/// page), not the entity id — the `artists` row is keyed by name and shared
-/// across users, which is what the portrait proxy addresses too.
-///
-/// A different photograph from the portrait rather than a crop of it: the
-/// Reports chapter tile is 16/11, where a square either pillarboxes or
-/// crops the head off. Nothing Tapedeck can reach supplies a landscape, so
-/// it is present only where the user chose one, and a chapter with none
-/// keeps the enormous faint initial — that is the design, not a placeholder.
-///
-/// An empty string clears it.
-#[utoipa::path(
-    put,
-    path = "/api/v1/artists/landscape/{id}",
-    tag = "Library",
-    params(("id" = i64, Path, description = "The `artists` row.")),
-    request_body = ArtistImageUpdate,
-    responses(
-        (status = 200, description = "Saved. Null when cleared.", body = LandscapeSet),
-        (status = 400, response = BadRequest),
-        (status = 401, response = Unauthorized),
-        (status = 404, response = NotFound),
-    )
-)]
-async fn set_artist_landscape(
-    State(state): State<Arc<AppState>>,
-    user: AuthUser,
-    Path(id): Path<i64>,
-    Json(body): Json<ArtistImageUpdate>,
-) -> Response {
-    let _ = &user;
-    let Some(value) = validate_image_url(&body.url) else {
-        return not_an_image_url();
-    };
-    let previous = state.db.artist_picture_urls(id).await.ok().flatten().and_then(|(_, l)| l);
-    match state.db.set_artist_landscape(id, value).await {
-        Ok(true) => {
-            forget_previous(&state, previous.as_deref()).await;
-            (StatusCode::OK, Json(LandscapeSet { landscape_url: value.map(str::to_string) }))
-                .into_response()
-        }
-        Ok(false) => not_found("No such artist"),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse { code: 500, error: e.to_string() }),
-        )
-            .into_response(),
-    }
 }
 
 // PUT /api/v1/albums/:id/cover — set the album's cover by hand.
@@ -492,7 +367,7 @@ const MAX_ART_BYTES: usize = 8 * 1024 * 1024;
 /// Where an uploaded picture is served from. Kept as a constant because the
 /// upload writes it into a database column and the serve route has to
 /// recognise it again to know a file is its own to delete.
-const UPLOAD_PREFIX: &str = "/api/v1/art/upload/";
+pub(super) const UPLOAD_PREFIX: &str = "/api/v1/art/upload/";
 
 /// Is this a name this module wrote?
 ///
@@ -515,7 +390,9 @@ fn safe_upload_name(name: &str) -> bool {
 /// them: those two each carry extra fields (a scan has a kind and a caption)
 /// and folding three callers into one helper would mean a parameter for every
 /// difference.
-async fn read_one_image(multipart: &mut Multipart) -> Result<(Vec<u8>, &'static str), Response> {
+pub(super) async fn read_one_image(
+    multipart: &mut Multipart,
+) -> Result<(Vec<u8>, &'static str), Response> {
     let mut file: Option<(Vec<u8>, String)> = None;
     while let Ok(Some(field)) = multipart.next_field().await {
         let declared = field.content_type().unwrap_or("").to_string();
@@ -546,19 +423,23 @@ async fn read_one_image(multipart: &mut Multipart) -> Result<(Vec<u8>, &'static 
     Ok((bytes, ext))
 }
 
-fn bad(code: StatusCode, msg: &str) -> Response {
+pub(super) fn bad(code: StatusCode, msg: &str) -> Response {
     (code, Json(ErrorResponse { code: code.as_u16(), error: msg.into() })).into_response()
 }
 
 /// Write the bytes and hand back the URL to store.
 ///
-/// Flat under `art/`, **not** under `art/<user>/` like the shelf's scans. That
-/// is deliberate and it is the honest layout: `artists` and `entities` carry no
-/// `user_id`, so a picture set here is the picture everyone on the instance
-/// sees. Filing it beneath a user directory would imply a scoping that does not
-/// exist — the shelf's per-user directories are real, and copying them here
-/// would be decoration.
-async fn store_upload(state: &Arc<AppState>, bytes: &[u8], ext: &str) -> Result<String, Response> {
+/// Flat under `art/`, **not** under `art/<user>/` like the shelf's scans. An
+/// album cover set here is shared — `entities` carries no `user_id` — and an
+/// artist picture, though it belongs to one person since v0.124.0, is found
+/// through that person's `artist_pictures` row rather than its path. The name
+/// is random and unguessable either way, and one directory keeps
+/// `serve_upload`'s single rule.
+pub(super) async fn store_upload(
+    state: &Arc<AppState>,
+    bytes: &[u8],
+    ext: &str,
+) -> Result<String, Response> {
     let dir = state.uploads_dir.join("art");
     if let Err(e) = tokio::fs::create_dir_all(&dir).await {
         tracing::warn!("art upload: could not create {}: {}", dir.display(), e);
@@ -585,7 +466,7 @@ async fn store_upload(state: &Arc<AppState>, bytes: &[u8], ext: &str) -> Result<
 /// does, and leaving the file behind is how an uploads directory fills up with
 /// images nothing references. Guarded on the prefix so it can only ever remove
 /// something this module wrote.
-async fn forget_previous(state: &Arc<AppState>, previous: Option<&str>) {
+pub(super) async fn forget_previous(state: &Arc<AppState>, previous: Option<&str>) {
     let Some(old) = previous.and_then(|p| p.strip_prefix(UPLOAD_PREFIX)) else { return };
     if safe_upload_name(old) {
         let _ = tokio::fs::remove_file(state.uploads_dir.join("art").join(old)).await;
@@ -649,138 +530,6 @@ async fn serve_upload(
         // The row still points at it but the file is gone. 404 lets the UI fall
         // back to the lettered tile, the same as a portrait nobody has.
         Err(_) => not_found("That picture is no longer on this server"),
-    }
-}
-
-// POST /api/v1/artists/img/:id/upload — upload a portrait.
-/// Upload an artist portrait.
-///
-/// Session-only. The counterpart of the `PUT` above, for a picture that is
-/// on your disk rather than already somewhere on the web.
-///
-/// The extension is taken from the **declared content type**, never from
-/// the filename — the path is one this server writes. The stored name is
-/// random, so the served URL is `immutable`-cacheable and a replaced
-/// picture is a new URL rather than the same URL with new bytes.
-///
-/// Replaces the override exactly as a pasted URL does, and the file it
-/// supersedes is deleted. `artists` carries no user column, so this is an
-/// **instance-wide** edit.
-#[utoipa::path(
-    post,
-    path = "/api/v1/artists/img/{id}/upload",
-    tag = "Library",
-    params(("id" = i64, Path, description = "The `artists` row.")),
-    request_body(content = FileUpload, content_type = "multipart/form-data"),
-    responses(
-        (status = 200, description = "Saved. The body carries the new URL, which is a path on this server.", body = ArtistImageSet),
-        (status = 400, response = BadRequest),
-        (status = 401, response = Unauthorized),
-        (status = 404, response = NotFound),
-        (status = 413, description = "Larger than 8 MB.", body = ErrorResponse),
-        (status = 415, description = "Not an image type this server stores (JPEG, PNG, WebP, GIF, AVIF, TIFF).", body = ErrorResponse),
-    )
-)]
-async fn upload_artist_image(
-    State(state): State<Arc<AppState>>,
-    user: AuthUser,
-    Path(id): Path<i64>,
-    mut multipart: Multipart,
-) -> Response {
-    let _ = &user;
-    let Ok(Some((previous, _))) = state.db.artist_picture_urls(id).await else {
-        return not_found("No such artist");
-    };
-    let (bytes, ext) = match read_one_image(&mut multipart).await {
-        Ok(v) => v,
-        Err(r) => return r,
-    };
-    let url = match store_upload(&state, &bytes, ext).await {
-        Ok(u) => u,
-        Err(r) => return r,
-    };
-    match state.db.set_artist_image(id, Some(&url)).await {
-        Ok(true) => {
-            forget_previous(&state, previous.as_deref()).await;
-            (StatusCode::OK, Json(ArtistImageSet { image_url: Some(url) })).into_response()
-        }
-        // The bytes are already on disk by this point, so a row that refused
-        // the write leaves a file nothing references. Discarding it here is
-        // what keeps "files in art/" equal to "URLs in the database" — an
-        // orphan is invisible until the disk fills.
-        Ok(false) => {
-            forget_previous(&state, Some(&url)).await;
-            not_found("No such artist")
-        }
-        Err(e) => {
-            forget_previous(&state, Some(&url)).await;
-            bad(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string())
-        }
-    }
-}
-
-// POST /api/v1/artists/landscape/:id/upload — upload the wide picture.
-//
-// The one override nothing can fill automatically: no provider Tapedeck
-// reaches supplies a landscape, so before this it was a URL or the big
-// initial, and a photograph on your own disk had no route in.
-/// Upload an artist's wide picture.
-///
-/// Session-only. Same rules as the portrait upload.
-///
-/// This is the one image override nothing can fill automatically — no
-/// provider Tapedeck reaches supplies a landscape — so before this it was a
-/// URL or the big initial.
-#[utoipa::path(
-    post,
-    path = "/api/v1/artists/landscape/{id}/upload",
-    tag = "Library",
-    params(("id" = i64, Path, description = "The `artists` row.")),
-    request_body(content = FileUpload, content_type = "multipart/form-data"),
-    responses(
-        (status = 200, description = "Saved. The body carries the new URL, which is a path on this server.", body = LandscapeSet),
-        (status = 400, response = BadRequest),
-        (status = 401, response = Unauthorized),
-        (status = 404, response = NotFound),
-        (status = 413, description = "Larger than 8 MB.", body = ErrorResponse),
-        (status = 415, description = "Not an image type this server stores (JPEG, PNG, WebP, GIF, AVIF, TIFF).", body = ErrorResponse),
-    )
-)]
-async fn upload_artist_landscape(
-    State(state): State<Arc<AppState>>,
-    user: AuthUser,
-    Path(id): Path<i64>,
-    mut multipart: Multipart,
-) -> Response {
-    let _ = &user;
-    let Ok(Some((_, previous))) = state.db.artist_picture_urls(id).await else {
-        return not_found("No such artist");
-    };
-    let (bytes, ext) = match read_one_image(&mut multipart).await {
-        Ok(v) => v,
-        Err(r) => return r,
-    };
-    let url = match store_upload(&state, &bytes, ext).await {
-        Ok(u) => u,
-        Err(r) => return r,
-    };
-    match state.db.set_artist_landscape(id, Some(&url)).await {
-        Ok(true) => {
-            forget_previous(&state, previous.as_deref()).await;
-            (StatusCode::OK, Json(LandscapeSet { landscape_url: Some(url) })).into_response()
-        }
-        // The bytes are already on disk by this point, so a row that refused
-        // the write leaves a file nothing references. Discarding it here is
-        // what keeps "files in art/" equal to "URLs in the database" — an
-        // orphan is invisible until the disk fills.
-        Ok(false) => {
-            forget_previous(&state, Some(&url)).await;
-            not_found("No such artist")
-        }
-        Err(e) => {
-            forget_previous(&state, Some(&url)).await;
-            bad(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string())
-        }
     }
 }
 
@@ -1105,12 +854,8 @@ async fn upload_album_art_from_library(
 #[openapi(paths(
     scrobble_art,
     artist_image,
-    set_artist_image,
-    set_artist_landscape,
     set_album_cover,
     serve_upload,
-    upload_artist_image,
-    upload_artist_landscape,
     upload_album_cover,
     album_art_held,
     upload_album_art_from_library,
@@ -1120,14 +865,13 @@ pub struct Api;
 pub fn create_artwork_router() -> Router<Arc<AppState>> {
     Router::new()
         .route("/api/v1/art/:id", get(scrobble_art))
-        .route("/api/v1/artists/img/:id", get(artist_image).put(set_artist_image))
-        .route("/api/v1/artists/landscape/:id", axum::routing::put(set_artist_landscape))
+        // Choosing an artist's picture is per person now, in `pictures`; this
+        // stays as the library proxy the portrait backfill points at.
+        .route("/api/v1/artists/img/:id", get(artist_image))
         .route("/api/v1/albums/:id/cover", put(set_album_cover))
         // Uploads sit one segment deeper than the URL setters they mirror, so
         // matchit tells them apart without any ordering rule.
         .route("/api/v1/art/upload/:name", get(serve_upload))
-        .route("/api/v1/artists/img/:id/upload", post(upload_artist_image))
-        .route("/api/v1/artists/landscape/:id/upload", post(upload_artist_landscape))
         .route("/api/v1/albums/:id/cover/upload", post(upload_album_cover))
         .route("/api/v1/art/library", get(album_art_held).post(upload_album_art_from_library))
 }

@@ -158,9 +158,92 @@ impl ArtworkProvider for DeezerProvider {
     }
 }
 
+/// `/search/artist`'s body.
+#[derive(Deserialize)]
+struct ArtistSearch {
+    #[serde(default)]
+    data: Vec<ArtistHit>,
+    #[serde(default)]
+    error: Option<serde_json::Value>,
+}
+
+#[derive(Deserialize)]
+struct ArtistHit {
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    picture_xl: Option<String>,
+    #[serde(default)]
+    picture_big: Option<String>,
+}
+
+impl DeezerProvider {
+    /// Deezer's picture of an artist, as a candidate for the picker.
+    ///
+    /// Its own search rather than the track search the artwork chain uses: the
+    /// picker knows a name and nothing else. Hits are checked with
+    /// `artist_matches`, and Deezer's placeholder — a URL with an empty hash,
+    /// `/images/artist//…` — is not a picture of anybody.
+    pub async fn artist_pictures(
+        &self,
+        name: &str,
+    ) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
+        let resp = self
+            .client
+            .get("https://api.deezer.com/search/artist")
+            .query(&[("q", name), ("limit", "10")])
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            return Err(format!("Deezer returned {}", resp.status()).into());
+        }
+        let body: ArtistSearch = resp.json().await?;
+        if let Some(e) = body.error {
+            return Err(format!("Deezer error: {e}").into());
+        }
+        Ok(artist_picture_urls(body.data, name))
+    }
+}
+
+fn artist_picture_urls(hits: Vec<ArtistHit>, name: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for hit in hits {
+        if !crate::sources::plex::artist_matches(&hit.name, name) {
+            continue;
+        }
+        if let Some(url) = hit.picture_xl.or(hit.picture_big) {
+            if !url.contains("/artist//") && !out.contains(&url) {
+                out.push(url);
+            }
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `/search/artist`: a near miss is not the artist, and Deezer's
+    /// placeholder (an empty hash in the path) is not a picture.
+    #[test]
+    fn an_artist_search_keeps_real_pictures_of_the_right_artist() {
+        let body: ArtistSearch = serde_json::from_value(serde_json::json!({ "data": [
+            { "id": 1, "name": "The Marías",
+              "picture_xl": "https://e-cdns-images.dzcdn.net/images/artist/abc/1000x1000-000000-80-0-0.jpg" },
+            { "id": 2, "name": "The Marias",
+              "picture_xl": "https://e-cdns-images.dzcdn.net/images/artist//1000x1000-000000-80-0-0.jpg" },
+            { "id": 3, "name": "María Zardoya",
+              "picture_xl": "https://e-cdns-images.dzcdn.net/images/artist/zzz/1000x1000.jpg" }
+        ], "total": 3 }))
+        .unwrap();
+        let got = artist_picture_urls(body.data, "The Marías");
+        assert_eq!(
+            got,
+            vec!["https://e-cdns-images.dzcdn.net/images/artist/abc/1000x1000-000000-80-0-0.jpg"
+                .to_string()]
+        );
+    }
 
     #[test]
     fn query_is_fielded_and_quote_safe() {
