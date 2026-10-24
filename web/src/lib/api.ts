@@ -1187,6 +1187,8 @@ export interface NowPlayingTrack {
 	 * those as an estimate; a pause or a seek makes them arbitrarily wrong.
 	 */
 	position_known: boolean;
+	/** Only a pushing client can say so. A paused entry holds `progress` still. */
+	paused: boolean;
 	updated_at: number;
 	source: string;
 	listening_context: string | null;

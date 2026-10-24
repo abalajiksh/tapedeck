@@ -47,9 +47,10 @@ async function poll() {
 				d.playing && d.track?.title === track.title && d.track?.artist === track.artist;
 			// Keep our own count while the server agrees to within a second or
 			// two — see DRIFT_TOLERANCE_SECS. A different track always takes the
-			// server's number, since ours belongs to the previous one.
+			// server's number, since ours belongs to the previous one, and so does
+			// a paused deck: there is no motion to keep smooth, only a place to stop.
 			const position =
-				sameTrack && Math.abs(reported - d.position) <= DRIFT_TOLERANCE_SECS
+				sameTrack && !track.paused && Math.abs(reported - d.position) <= DRIFT_TOLERANCE_SECS
 					? d.position
 					: reported;
 			return { playing: true, track, position };
@@ -62,7 +63,9 @@ async function poll() {
 
 function tick() {
 	deck.update((d) => {
-		if (!d.playing || !d.track) return d;
+		// A paused deck holds still, as the server does; counting on is what
+		// walked it forward until the next poll snapped it back.
+		if (!d.playing || !d.track || d.track.paused) return d;
 		const next = d.position + 1;
 		// Don't run past the end — the next poll decides whether it's still playing.
 		const max = d.track.duration ?? Infinity;
