@@ -1187,8 +1187,9 @@ export interface NowPlayingTrack {
 	 * those as an estimate; a pause or a seek makes them arbitrarily wrong.
 	 */
 	position_known: boolean;
-	/** Only a pushing client can say so; false for every polled source. */
-	paused?: boolean;
+	/** Only a pushing client can say so; false for every polled source. A
+	 *  paused entry holds `progress` still. */
+	paused: boolean;
 	updated_at: number;
 	/** `progress` and `updated_at` unrounded, in milliseconds. */
 	progress_ms?: number;
