@@ -185,6 +185,19 @@ struct SubsonicError {
 struct SearchResult3 {
     #[serde(default)]
     song: Vec<SubsonicSong>,
+    #[serde(default)]
+    artist: Vec<SubsonicArtist>,
+}
+
+#[derive(Deserialize)]
+struct SubsonicArtist {
+    id: String,
+    #[serde(default)]
+    name: String,
+    /// The id `getCoverArt` takes for the artist's picture. Navidrome spells it
+    /// `ar-<id>`, and sends it here so nobody has to know that.
+    #[serde(rename = "coverArt", default)]
+    cover_art: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -773,6 +786,40 @@ impl NavidromeSource {
         Ok((resp.bytes().await?.to_vec(), content_type))
     }
 
+    /// The cover id of an artist's picture, found by name.
+    ///
+    /// `search3` with only artists asked for, checked with `artist_matches` the
+    /// way Plex's and Jellyfin's searches are — a search hit is a suggestion,
+    /// not an identification. Falls back to Navidrome's `ar-<id>` spelling
+    /// when a server sends no `coverArt`.
+    ///
+    /// **Not verified against a live server**; the field names are
+    /// OpenSubsonic's `ArtistID3`.
+    pub async fn artist_cover_id(
+        &self,
+        name: &str,
+    ) -> Result<Option<String>, Box<dyn std::error::Error + Send + Sync>> {
+        let resp = self
+            .subsonic_get_with(
+                "search3",
+                &[
+                    ("query".into(), name.to_string()),
+                    ("artistCount".into(), "10".into()),
+                    ("albumCount".into(), "0".into()),
+                    ("songCount".into(), "0".into()),
+                ],
+            )
+            .await
+            .map_err(stringify)?;
+        Ok(resp
+            .search_result3
+            .map(|r| r.artist)
+            .unwrap_or_default()
+            .into_iter()
+            .find(|a| crate::sources::plex::artist_matches(&a.name, name))
+            .map(|a| a.cover_art.unwrap_or_else(|| format!("ar-{}", a.id))))
+    }
+
     /// What's playing right now, per account.
     ///
     /// Navidrome keeps reporting a finished track for a while, so entries that
@@ -924,6 +971,24 @@ fn parse_iso8601(s: &str) -> Option<i64> {
 
 #[cfg(test)]
 mod tests {
+
+    /// `search3` asked only for artists, in OpenSubsonic's `ArtistID3` shape.
+    #[test]
+    fn an_artist_search_carries_the_cover_id() {
+        let env: SubsonicEnvelope = serde_json::from_value(serde_json::json!({
+            "subsonic-response": { "status": "ok", "version": "1.16.1",
+                "searchResult3": { "artist": [
+                    { "id": "2f8a", "name": "Arca", "coverArt": "ar-2f8a_0", "albumCount": 4 },
+                    { "id": "9b1c", "name": "Arcade Fire" }
+                ]}
+            }
+        }))
+        .unwrap();
+        let artists = env.response.search_result3.unwrap().artist;
+        assert_eq!(artists[0].cover_art.as_deref(), Some("ar-2f8a_0"));
+        assert_eq!(artists[1].cover_art, None);
+        assert_eq!(artists[1].name, "Arcade Fire");
+    }
     #[test]
     fn a_star_date_is_read_from_either_spelling_and_never_guessed() {
         // The native API is not uniform about this — `submissionTime` on a

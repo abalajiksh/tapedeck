@@ -1134,12 +1134,12 @@ pub async fn reports(
     // for a photo that never arrives.
     let top_names: Vec<String> =
         periods.iter().filter_map(|p| p.top_artist.as_ref().map(|a| a.name.clone())).collect();
-    let landscapes = state.db.artist_landscapes(&top_names).await.unwrap_or_default();
+    let landscapes = state.db.artist_landscapes(user.user_id, &top_names).await.unwrap_or_default();
     for p in &mut periods {
         let Some(a) = p.top_artist.as_mut() else {
             continue;
         };
-        if let Some(url) = landscapes.get(&crate::db::normalise_artist(&a.name)) {
+        if let Some(url) = landscapes.get(&crate::db::Database::artist_key(&a.name)) {
             a.landscape_url = Some(url.clone());
         }
     }

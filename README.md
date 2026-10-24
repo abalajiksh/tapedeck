@@ -322,7 +322,10 @@ with:
   listen**: the stored row verbatim, every column including the ones no screen
   renders, with copy-to-clipboard and MusicBrainz links.
 - **Album & artist pages** — aggregations over your own listens, a provider bio
-  with its attribution, and a portrait from your library or one you set yourself.
+  with its attribution, and a portrait you choose for yourself — Plex-style, from
+  every picture your Plex, Jellyfin, Emby or Navidrome holds or can find, Deezer's,
+  or your own upload or link, each labelled with where it came from. Your choice
+  is yours alone; everyone else keeps theirs or the shared one.
 - **Top Charts** and **Statistics** — timeframe-ranged totals, top artists,
   records and tracks side by side, and a listening-clock heatmap. Every figure
   that is drawn from a narrower population than "everything you played" says
@@ -1598,7 +1601,7 @@ deploy/                      Sample hardened systemd unit
 - [x] **Liner notes & loves** — Markdown notes with `[[track:…]]` shortcodes,
       revision history, notes on a listen as well as on a record
 - [x] **Album and artist pages** — aggregations over your own listens, provider
-      bios with attribution, artist portraits from your library or set by hand
+      bios with attribution, artist portraits and wide pictures chosen per person
 - [x] **Metadata sanitiser** — per-edit review for mixed releases, featured
       credits, artist spellings and tracks credited two ways on one record
 - [x] **Sessions as objects** — merge, split, rebuild; stable UUIDs
@@ -1711,9 +1714,12 @@ deploy/                      Sample hardened systemd unit
 
 Things that look finished and aren't:
 
-- **Artist portraits from Navidrome** aren't wired. Plex and Jellyfin are;
-  Subsonic can answer it, but an untested path that silently returns nothing is
-  worse than a stated gap.
+- **Artist portraits from Navidrome and Emby are offered in the picker only.**
+  The background portrait backfill still asks Plex and Jellyfin alone. The
+  picker's Plex poster list is pinned to a real server's response; its
+  background list has only been seen empty, and the Navidrome artist search
+  follows OpenSubsonic's published shape without a live check. Roon supplies
+  no pictures at all.
 - **Audio quality is only known for listens a live source reported.** An import
   from Last.fm or ListenBrainz carries no format at all — on a real 21,000-listen
   history that is 97% of it — so the fidelity readouts divide by the listens

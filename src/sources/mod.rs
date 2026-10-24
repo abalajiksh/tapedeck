@@ -53,6 +53,28 @@ pub trait MusicSource: Send + Sync {
     fn set_scrobble_threshold(&mut self, _threshold: crate::models::ScrobbleThreshold) {}
 }
 
+/// One picture a library holds, or can find, for an artist — a tile in the
+/// picker.
+///
+/// `key` is what the library is asked for to get the bytes back, in that
+/// server's own terms (a Plex path, a Jellyfin `item/Type/index`, a Subsonic
+/// cover id). `remote` marks one that is already a public URL — a provider
+/// image a server *found* rather than holds — which the browser loads itself.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LibraryImage {
+    pub key: String,
+    pub remote: bool,
+    /// The outside provider behind it, when the server says (TheAudioDB,
+    /// fanart.tv, a Plex agent).
+    pub provider: Option<String>,
+    /// Whether the server itself is currently showing this one.
+    pub selected: bool,
+    pub width: Option<i64>,
+    pub height: Option<i64>,
+    /// A smaller public URL for the tile, when a remote one offers it.
+    pub thumb: Option<String>,
+}
+
 /// Jellyfin and Emby share one client — they are one protocol with a prefix on
 /// it, distinguished by [`mediabrowser::Flavour`]. They are deliberately *not*
 /// two Rust types: the pipeline already dispatches on `user_sources.kind`

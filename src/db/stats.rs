@@ -259,7 +259,7 @@ impl Database {
         .fetch_all(&self.pool)
         .await?;
         let names: Vec<String> = top_rows.iter().map(|(n, _, _)| n.clone()).collect();
-        let images = self.artist_images(&names).await.unwrap_or_default();
+        let images = self.artist_images(user_id, &names).await.unwrap_or_default();
         let top_artists: Vec<TopArtist> = top_rows
             .into_iter()
             .map(|(name, plays, secs)| {

@@ -174,12 +174,24 @@ impl Database {
         Ok(res.rows_affected() > 0)
     }
     pub async fn delete_source(&self, user_id: i64, id: i64) -> Result<bool, sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
+        // Artist pictures chosen from this server go with it: the proxy could
+        // only ever answer them with a fallback, and the picker would keep
+        // calling a picture "yours" that nothing can show.
+        sqlx::query(&crate::sql!(
+            "DELETE FROM artist_pictures WHERE user_id = ? AND source_ref = ?"
+        ))
+        .bind(user_id)
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
         let res =
             sqlx::query(&crate::sql!("DELETE FROM user_sources WHERE user_id = ? AND id = ?"))
                 .bind(user_id)
                 .bind(id)
-                .execute(&self.pool)
+                .execute(&mut *tx)
                 .await?;
+        tx.commit().await?;
         Ok(res.rows_affected() > 0)
     }
     /// Record the outcome of a poll. Deliberately does *not* touch

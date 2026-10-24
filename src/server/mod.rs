@@ -22,6 +22,7 @@ pub mod ops;
 mod pairing;
 pub mod patch;
 pub mod physical;
+mod pictures;
 mod playlist_lab;
 pub mod playlists;
 mod preferences;
@@ -134,6 +135,7 @@ pub fn api_docs() -> Vec<utoipa::openapi::OpenApi> {
         playlist_lab::Api::openapi(),
         library::Api::openapi(),
         artwork::Api::openapi(),
+        pictures::Api::openapi(),
         chains::Api::openapi(),
         notes::Api::openapi(),
         tidal::Api::openapi(),
@@ -173,6 +175,7 @@ pub fn build_app(state: Arc<AppState>) -> Router {
         .merge(now_playing::create_now_playing_router())
         .merge(public_np::create_public_router())
         .merge(artwork::create_artwork_router())
+        .merge(pictures::create_pictures_router())
         .merge(sources::create_sources_router())
         .merge(export::create_export_router())
         .merge(import::create_import_router())

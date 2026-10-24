@@ -1170,7 +1170,52 @@ impl Database {
         self.init_saved_playlists().await?;
         self.init_crate().await?;
         self.init_radio().await?;
+        self.init_artist_pictures().await?;
 
+        Ok(())
+    }
+    /// The picture each person chose for an artist.
+    ///
+    /// `artists.image_url` and `landscape_url` are shared by name, and until
+    /// v0.124.0 the hand override wrote straight into them — so whoever last
+    /// pressed *Change picture* chose the face everyone on the instance saw.
+    /// The shared row now holds only what the backfill found, and a choice is
+    /// a row here, read back as `COALESCE(pick.url, artists.image_url)`.
+    ///
+    /// `url` is what the browser loads, worked out once when the pick is made,
+    /// so every reader is that one `COALESCE` rather than a rule per source.
+    /// For a library picture it is this server's proxy with a version on it;
+    /// the proxy reads `source_ref` and `image_key` to find the bytes.
+    ///
+    /// `source_ref` is a plain column rather than a foreign key, the same call
+    /// `radio_air_log.source_id` makes: `delete_source` clears the picks that
+    /// pointed at it, and a pick left dangling by anything else falls back to
+    /// the shared picture when the proxy cannot reach it.
+    async fn init_artist_pictures(&self) -> Result<(), sqlx::Error> {
+        self.ddl(
+            "CREATE TABLE IF NOT EXISTS artist_pictures (
+                user_id INTEGER NOT NULL REFERENCES users(id),
+                artist_id INTEGER NOT NULL REFERENCES artists(id),
+                -- 'portrait' is artists.image_url's job, 'wide' landscape_url's.
+                kind TEXT NOT NULL CHECK (kind IN ('portrait','wide')),
+                -- 'upload', 'link', 'deezer', 'plex', 'jellyfin', 'emby',
+                -- 'navidrome'. Shown on the tile, so the person can see where a
+                -- face came from.
+                source TEXT NOT NULL,
+                -- The user_sources row, for a picture held by a library.
+                source_ref INTEGER,
+                -- What the proxy asks that library for, validated per kind of
+                -- server; for every other source, the URL itself.
+                image_key TEXT NOT NULL,
+                -- The outside provider a library found it through
+                -- (TheAudioDB, fanart.tv, a Plex agent), when it says.
+                provider TEXT,
+                url TEXT NOT NULL,
+                updated_at INTEGER NOT NULL,
+                PRIMARY KEY (user_id, artist_id, kind)
+            )",
+        )
+        .await?;
         Ok(())
     }
     /// The MCP surface's own tables.

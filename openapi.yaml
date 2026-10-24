@@ -3890,86 +3890,6 @@ paths:
       - apiToken:
         - read
       - sessionCookie: []
-    put:
-      tags:
-      - Library
-      summary: Override an artist portrait.
-      description: |-
-        Session-only. A manual override beats every provider — this is a
-        journal, and whoever keeps it gets the last word.
-      operationId: set_artist_image
-      parameters:
-      - name: id
-        in: path
-        description: The `artists` row.
-        required: true
-        schema:
-          type: integer
-          format: int64
-      requestBody:
-        content:
-          application/json:
-            schema:
-              $ref: '#/components/schemas/ArtistImageUpdate'
-        required: true
-      responses:
-        '200':
-          description: Saved. Null when cleared.
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ArtistImageSet'
-        '400':
-          $ref: '#/components/responses/BadRequest'
-        '401':
-          $ref: '#/components/responses/Unauthorized'
-        '404':
-          $ref: '#/components/responses/NotFound'
-  /api/v1/artists/landscape/{id}:
-    put:
-      tags:
-      - Library
-      summary: Set or clear an artist's wide image.
-      description: |-
-        Session-only. Takes the **artist row id** (`artist_row_id` on the artist
-        page), not the entity id — the `artists` row is keyed by name and shared
-        across users, which is what the portrait proxy addresses too.
-
-        A different photograph from the portrait rather than a crop of it: the
-        Reports chapter tile is 16/11, where a square either pillarboxes or
-        crops the head off. Nothing Tapedeck can reach supplies a landscape, so
-        it is present only where the user chose one, and a chapter with none
-        keeps the enormous faint initial — that is the design, not a placeholder.
-
-        An empty string clears it.
-      operationId: set_artist_landscape
-      parameters:
-      - name: id
-        in: path
-        description: The `artists` row.
-        required: true
-        schema:
-          type: integer
-          format: int64
-      requestBody:
-        content:
-          application/json:
-            schema:
-              $ref: '#/components/schemas/ArtistImageUpdate'
-        required: true
-      responses:
-        '200':
-          description: Saved. Null when cleared.
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/LandscapeSet'
-        '400':
-          $ref: '#/components/responses/BadRequest'
-        '401':
-          $ref: '#/components/responses/Unauthorized'
-        '404':
-          $ref: '#/components/responses/NotFound'
   /api/v1/albums/{id}/cover:
     put:
       tags:
@@ -4060,114 +3980,6 @@ paths:
       - apiToken:
         - read
       - sessionCookie: []
-  /api/v1/artists/img/{id}/upload:
-    post:
-      tags:
-      - Library
-      summary: Upload an artist portrait.
-      description: |-
-        Session-only. The counterpart of the `PUT` above, for a picture that is
-        on your disk rather than already somewhere on the web.
-
-        The extension is taken from the **declared content type**, never from
-        the filename — the path is one this server writes. The stored name is
-        random, so the served URL is `immutable`-cacheable and a replaced
-        picture is a new URL rather than the same URL with new bytes.
-
-        Replaces the override exactly as a pasted URL does, and the file it
-        supersedes is deleted. `artists` carries no user column, so this is an
-        **instance-wide** edit.
-      operationId: upload_artist_image
-      parameters:
-      - name: id
-        in: path
-        description: The `artists` row.
-        required: true
-        schema:
-          type: integer
-          format: int64
-      requestBody:
-        content:
-          multipart/form-data:
-            schema:
-              $ref: '#/components/schemas/FileUpload'
-        required: true
-      responses:
-        '200':
-          description: Saved. The body carries the new URL, which is a path on this server.
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ArtistImageSet'
-        '400':
-          $ref: '#/components/responses/BadRequest'
-        '401':
-          $ref: '#/components/responses/Unauthorized'
-        '404':
-          $ref: '#/components/responses/NotFound'
-        '413':
-          description: Larger than 8 MB.
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/Error'
-        '415':
-          description: Not an image type this server stores (JPEG, PNG, WebP, GIF, AVIF, TIFF).
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/Error'
-  /api/v1/artists/landscape/{id}/upload:
-    post:
-      tags:
-      - Library
-      summary: Upload an artist's wide picture.
-      description: |-
-        Session-only. Same rules as the portrait upload.
-
-        This is the one image override nothing can fill automatically — no
-        provider Tapedeck reaches supplies a landscape — so before this it was a
-        URL or the big initial.
-      operationId: upload_artist_landscape
-      parameters:
-      - name: id
-        in: path
-        description: The `artists` row.
-        required: true
-        schema:
-          type: integer
-          format: int64
-      requestBody:
-        content:
-          multipart/form-data:
-            schema:
-              $ref: '#/components/schemas/FileUpload'
-        required: true
-      responses:
-        '200':
-          description: Saved. The body carries the new URL, which is a path on this server.
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/LandscapeSet'
-        '400':
-          $ref: '#/components/responses/BadRequest'
-        '401':
-          $ref: '#/components/responses/Unauthorized'
-        '404':
-          $ref: '#/components/responses/NotFound'
-        '413':
-          description: Larger than 8 MB.
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/Error'
-        '415':
-          description: Not an image type this server stores (JPEG, PNG, WebP, GIF, AVIF, TIFF).
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/Error'
   /api/v1/albums/{id}/cover/upload:
     post:
       tags:
@@ -4346,6 +4158,282 @@ paths:
       - apiToken:
         - write
       - sessionCookie: []
+  /api/v1/artists/{id}/pictures:
+    get:
+      tags:
+      - Library
+      summary: Every picture on offer for one tab of the picker.
+      description: |-
+        Session-only. Asks each of your enabled media servers — Plex's poster or
+        background list, Jellyfin's and Emby's held images plus the ones they can
+        find online, Navidrome's artist picture — and, for a portrait, Deezer. The
+        servers are asked at once, with ten seconds each; one that does not answer
+        is named in `unreachable` rather than failing the list.
+
+        Library tiles preview through this server, since the browser cannot reach
+        your servers. Online finds and Deezer's are public URLs and load directly.
+      operationId: list_pictures
+      parameters:
+      - name: id
+        in: path
+        description: The `artists` row — `artist_row_id` on an artist page.
+        required: true
+        schema:
+          type: integer
+          format: int64
+      - name: kind
+        in: query
+        description: '`portrait` (the default) or `wide`.'
+        required: false
+        schema:
+          type: string
+      responses:
+        '200':
+          description: The picker's tiles.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PictureChoices'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /api/v1/artists/{id}/pictures/{kind}:
+    get:
+      tags:
+      - Library
+      summary: Your chosen picture, when it lives on one of your servers.
+      description: |-
+        Scope: `read`. This is the URL a library choice stores; a choice of any
+        other kind is a URL of its own. When the server cannot answer — off, or the
+        picture gone — this sends the shared picture instead, uncached, so a choice
+        that starts working again is shown again.
+      operationId: serve_picture
+      parameters:
+      - name: id
+        in: path
+        description: The `artists` row.
+        required: true
+        schema:
+          type: integer
+          format: int64
+      - name: kind
+        in: path
+        description: '`portrait` or `wide`.'
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: 'Image bytes, `Cache-Control: private` for a week — the URL is versioned per choice.'
+          content:
+            image/*:
+              schema:
+                $ref: '#/components/schemas/Bytes'
+        '307':
+          description: Your choice could not be fetched, or you have none; this is the shared picture.
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          description: No picture at all.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+      security:
+      - apiToken:
+        - read
+      - sessionCookie: []
+    put:
+      tags:
+      - Library
+      summary: Choose a picture.
+      description: |-
+        Session-only. Only **you** see it; everyone else keeps their own choice or
+        the shared picture.
+
+        Send back a candidate's `source`, `source_ref` and `key` from
+        `GET /api/v1/artists/{id}/pictures`, or `{"source": "link", "key": "https://…"}`
+        for a URL of your own. A key is checked against the shape that source
+        offers, so a made-up one is a 400 rather than a request to your server.
+        Uploads have their own route.
+      operationId: choose_picture
+      parameters:
+      - name: id
+        in: path
+        description: The `artists` row.
+        required: true
+        schema:
+          type: integer
+          format: int64
+      - name: kind
+        in: path
+        description: '`portrait` or `wide`.'
+        required: true
+        schema:
+          type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PictureChoose'
+        required: true
+      responses:
+        '200':
+          description: Chosen. The body carries what the browser should load.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PictureSet'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    delete:
+      tags:
+      - Library
+      summary: Go back to the shared picture.
+      description: |-
+        Session-only. Removes your choice; an uploaded file it pointed at is
+        deleted. The body carries the shared picture you see now.
+      operationId: clear_picture
+      parameters:
+      - name: id
+        in: path
+        description: The `artists` row.
+        required: true
+        schema:
+          type: integer
+          format: int64
+      - name: kind
+        in: path
+        description: '`portrait` or `wide`.'
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: Cleared. Null when there is no shared picture either.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PictureSet'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /api/v1/artists/{id}/pictures/{kind}/upload:
+    post:
+      tags:
+      - Library
+      summary: Upload a picture and choose it.
+      description: |-
+        Session-only. Same rules as every upload here: up to 8 MB, the extension
+        from the declared content type, a random name per file. Only you see it,
+        and it is deleted when you choose something else.
+      operationId: upload_picture
+      parameters:
+      - name: id
+        in: path
+        description: The `artists` row.
+        required: true
+        schema:
+          type: integer
+          format: int64
+      - name: kind
+        in: path
+        description: '`portrait` or `wide`.'
+        required: true
+        schema:
+          type: string
+      requestBody:
+        content:
+          multipart/form-data:
+            schema:
+              $ref: '#/components/schemas/FileUpload'
+        required: true
+      responses:
+        '200':
+          description: Saved and chosen. The URL is a path on this server.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PictureSet'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '413':
+          description: Larger than 8 MB.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '415':
+          description: Not an image type this server stores (JPEG, PNG, WebP, GIF, AVIF, TIFF).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+  /api/v1/artists/{id}/pictures/{kind}/preview:
+    get:
+      tags:
+      - Library
+      summary: A picker tile from one of your servers, proxied.
+      description: |-
+        Session-only. Takes a candidate's `source_ref` and `key`; the key is checked
+        against the shape that server offers before anything is asked of it.
+      operationId: preview_picture
+      parameters:
+      - name: id
+        in: path
+        description: The `artists` row.
+        required: true
+        schema:
+          type: integer
+          format: int64
+      - name: kind
+        in: path
+        description: '`portrait` or `wide`.'
+        required: true
+        schema:
+          type: string
+      - name: source_ref
+        in: query
+        description: The candidate's `source_ref`.
+        required: true
+        schema:
+          type: integer
+          format: int64
+      - name: key
+        in: query
+        description: The candidate's `key`.
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: Image bytes, cached privately for an hour.
+          content:
+            image/*:
+              schema:
+                $ref: '#/components/schemas/Bytes'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
   /api/v1/chains:
     get:
       tags:
@@ -12385,14 +12473,6 @@ components:
           description: |-
             Whether you already have an accepted patch with them, either direction.
             Decides whether their deck can be opened or has to be asked for.
-    ArtistImageSet:
-      type: object
-      description: A portrait, set or cleared. Null when cleared.
-      properties:
-        image_url:
-          type:
-          - string
-          - 'null'
     ArtistImageUpdate:
       type: object
       required:
@@ -15680,14 +15760,6 @@ components:
             can present this as per-recording analysis.
         note:
           type: string
-    LandscapeSet:
-      type: object
-      description: A wide image, set or cleared. Null when cleared.
-      properties:
-        landscape_url:
-          type:
-          - string
-          - 'null'
     LanguageShare:
       type: object
       required:
@@ -19008,6 +19080,146 @@ components:
             Which physical disc of the set this track is on, from 1.
 
             Null means nobody recorded which disc, not disc 1.
+    PictureCandidate:
+      type: object
+      description: One picture on offer.
+      required:
+      - source
+      - source_label
+      - key
+      - preview
+      - server_selected
+      - chosen
+      properties:
+        source:
+          type: string
+          description: '`plex`, `jellyfin`, `emby`, `navidrome` or `deezer`.'
+        source_ref:
+          type:
+          - integer
+          - 'null'
+          format: int64
+          description: The connected server it came from; null for Deezer.
+        source_label:
+          type: string
+          description: What to call that source on the tile — the server's own label.
+        provider:
+          type:
+          - string
+          - 'null'
+          description: |-
+            The outside provider a server found it through, when it says
+            (TheAudioDB, fanart.tv, a Plex agent).
+        key:
+          type: string
+          description: Opaque. Send it back unchanged to choose this picture.
+        preview:
+          type: string
+          description: What to draw on the tile.
+        width:
+          type:
+          - integer
+          - 'null'
+          format: int64
+        height:
+          type:
+          - integer
+          - 'null'
+          format: int64
+        server_selected:
+          type: boolean
+          description: The server itself currently shows this one.
+        chosen:
+          type: boolean
+          description: This is the picture you chose.
+    PictureChoice:
+      type: object
+      description: Your current choice.
+      required:
+      - source
+      - url
+      properties:
+        source:
+          type: string
+          description: '`upload`, `link`, `deezer`, `plex`, `jellyfin`, `emby` or `navidrome`.'
+        source_ref:
+          type:
+          - integer
+          - 'null'
+          format: int64
+        source_label:
+          type:
+          - string
+          - 'null'
+          description: The server's label for a library choice; null otherwise.
+        provider:
+          type:
+          - string
+          - 'null'
+        url:
+          type: string
+          description: What the browser loads.
+    PictureChoices:
+      type: object
+      description: Everything the picker draws for one tab.
+      required:
+      - kind
+      - candidates
+      - unreachable
+      properties:
+        kind:
+          type: string
+          description: '`portrait` or `wide`.'
+        current:
+          oneOf:
+          - type: 'null'
+          - $ref: '#/components/schemas/PictureChoice'
+            description: What you chose, if anything. Null means you see the shared picture.
+        shared_url:
+          type:
+          - string
+          - 'null'
+          description: |-
+            The picture everyone sees who has not chosen one — what the backfill
+            found. Null when it found nothing.
+        candidates:
+          type: array
+          items:
+            $ref: '#/components/schemas/PictureCandidate'
+        unreachable:
+          type: array
+          items:
+            type: string
+          description: |-
+            Sources that did not answer, by label, so the picker can say why a
+            server's pictures are missing rather than looking empty.
+    PictureChoose:
+      type: object
+      description: 'Choose a picture: a candidate from the list, or a link.'
+      required:
+      - source
+      - key
+      properties:
+        source:
+          type: string
+          description: A candidate's `source`, or `link` for a URL of your own.
+        source_ref:
+          type:
+          - integer
+          - 'null'
+          format: int64
+          description: A candidate's `source_ref`. Required for a library source.
+        key:
+          type: string
+          description: A candidate's `key`, or the URL for `link`.
+    PictureSet:
+      type: object
+      description: What you see now. Null when nothing is left to show.
+      properties:
+        url:
+          type:
+          - string
+          - 'null'
     PinFootnote:
       type: object
       description: A pin, as it reads under the note it rolls up into.

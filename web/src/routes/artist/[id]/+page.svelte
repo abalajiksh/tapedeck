@@ -3,6 +3,7 @@
 	import { page } from '$app/stores';
 	import { api } from '$lib/api';
 	import DubDialog from '$lib/components/DubDialog.svelte';
+	import ArtistPictures from '$lib/components/ArtistPictures.svelte';
 	import type { ArtistDeck } from '$lib/api';
 	let dubOpen = false;
 	import type { ArtistView } from '$lib/api';
@@ -15,72 +16,22 @@
 	import AlbumCard from '$lib/components/AlbumCard.svelte';
 
 	let artist: ArtistView | null = null;
-	let editingPic = false;
-	let picUrl = '';
+	let picsOpen = false;
 	let picMsg = '';
 	/** A stored URL can rot — a library server goes off, a CDN link expires.
 	 *  Tracked rather than removing the node, so the edit control survives. */
 	let imgFailed = false;
 
-	let wideUrl = '';
-
-	async function saveWide(url: string) {
-		if (!artist?.artist_row_id) return;
-		picMsg = '';
-		try {
-			const r = await api.setArtistLandscape(artist.artist_row_id, url);
-			artist = { ...artist, landscape_url: r.landscape_url };
-			wideUrl = '';
-			picMsg = url ? 'Wide picture updated.' : 'Wide picture cleared.';
-			setTimeout(() => (picMsg = ''), 2500);
-		} catch (e) {
-			picMsg = String(e).replace(/^API \d+: /, '');
-		}
-	}
-
-	/** Upload rather than paste. Same override, different way in — a picture on
-	 *  your own disk had no route before this. */
-	let picBusy = false;
-	async function uploadPicture(e: Event, wide: boolean) {
-		const input = e.target as HTMLInputElement;
-		const file = input.files?.[0];
-		if (!file || !artist?.artist_row_id) return;
-		picBusy = true;
-		picMsg = '';
-		try {
-			if (wide) {
-				const r = await api.uploadArtistLandscape(artist.artist_row_id, file);
-				artist = { ...artist, landscape_url: r.landscape_url };
-				picMsg = 'Wide picture uploaded.';
-			} else {
-				const r = await api.uploadArtistImage(artist.artist_row_id, file);
-				artist = { ...artist, image_url: r.image_url };
-				imgFailed = false;
-				picMsg = 'Picture uploaded.';
-			}
-			setTimeout(() => (picMsg = ''), 2500);
-		} catch (err) {
-			picMsg = String(err).replace(/^API \d+: /, '');
-		}
-		picBusy = false;
-		// Cleared so re-picking the same file fires `change` again.
-		input.value = '';
-	}
-
-	async function savePicture(url: string) {
-		if (!artist?.artist_row_id) return;
-		picMsg = '';
-		try {
-			const r = await api.setArtistImage(artist.artist_row_id, url);
-			artist = { ...artist, image_url: r.image_url };
+	function picturesSaved(e: CustomEvent<{ portrait?: string | null; wide?: string | null }>) {
+		if (!artist) return;
+		const { portrait, wide } = e.detail;
+		if (portrait !== undefined) {
+			artist = { ...artist, image_url: portrait };
 			imgFailed = false;
-			picUrl = '';
-			editingPic = false;
-			picMsg = url ? 'Picture updated.' : 'Picture cleared.';
-			setTimeout(() => (picMsg = ''), 2500);
-		} catch (e) {
-			picMsg = String(e).replace(/^API \d+: /, '');
 		}
+		if (wide !== undefined) artist = { ...artist, landscape_url: wide };
+		picMsg = 'Picture updated — only you see it.';
+		setTimeout(() => (picMsg = ''), 2500);
 	}
 	let loading = true;
 	let error = '';
@@ -251,66 +202,18 @@
 			{/if}
 			<!-- Tapedeck is a listening journal, so the last word on what an
 			     artist looks like belongs to whoever keeps it — not to whichever
-			     provider answered first. -->
+			     provider answered first. Since v0.124.0 that word is per person. -->
 			{#if artist.artist_row_id}
-				<button class="pic-edit" on:click={() => (editingPic = !editingPic)}>
+				<button class="pic-edit" on:click={() => (picsOpen = true)}>
 					{artist.image_url ? 'Change picture' : 'Add a picture'}
 				</button>
 			{/if}
 		</div>
 	</div>
 
-	{#if editingPic}
-		<div class="panel" style="border-radius:18px;padding:16px;margin-bottom:14px;">
-			<div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center;">
-				<input class="input" style="flex:1;min-width:240px;" bind:value={picUrl}
-					placeholder="https://… or /api/v1/artists/img/{artist.artist_row_id}">
-				<button class="btn btn-primary" on:click={() => savePicture(picUrl)}>Save</button>
-				<label class="btn btn-secondary" style="cursor:pointer;">
-					{picBusy ? 'Uploading…' : 'Upload…'}
-					<input type="file" accept="image/*" hidden disabled={picBusy}
-						on:change={(e) => uploadPicture(e, false)} />
-				</label>
-				<button class="btn btn-secondary" on:click={() => savePicture('')}>Clear</button>
-				<button class="btn btn-secondary" on:click={() => (editingPic = false)}>Cancel</button>
-			</div>
-			<p style="font-size:12.5px;color:var(--td-muted);margin:10px 0 0;">
-				Paste any image URL, or <strong>Upload…</strong> a file from this device
-				(up to 8&nbsp;MB). To use the picture from your own Plex or Jellyfin,
-				use <code>/api/v1/artists/img/{artist.artist_row_id}</code> — Tapedeck
-				fetches it server-side, since the browser can't reach your media server.
-			</p>
-			<!-- Said plainly rather than left to be discovered: `artists` has no
-			     user column, so this is not a per-account preference. -->
-			<p style="font-size:12.5px;color:var(--td-muted-2);margin:8px 0 0;">
-				Artist pictures are shared by everyone on this instance.
-			</p>
-
-			<!-- The wide one. Its own field rather than a crop of the portrait,
-			     because a 16/11 tile and a square photo are different pictures —
-			     cropping one to the other either pillarboxes or loses the head. -->
-			<div style="margin-top:16px;padding-top:14px;border-top:1px solid var(--td-border);">
-				<label for="wide" style="display:block;font-size:13px;margin-bottom:6px;">
-					Wide picture
-				</label>
-				<div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center;">
-					<input id="wide" class="input" style="flex:1;min-width:240px;" bind:value={wideUrl}
-						placeholder="https://… a landscape photo">
-					<button class="btn btn-primary" on:click={() => saveWide(wideUrl)}>Save</button>
-					<label class="btn btn-secondary" style="cursor:pointer;">
-						{picBusy ? 'Uploading…' : 'Upload…'}
-						<input type="file" accept="image/*" hidden disabled={picBusy}
-							on:change={(e) => uploadPicture(e, true)} />
-					</label>
-					<button class="btn btn-secondary" on:click={() => saveWide('')}>Clear</button>
-				</div>
-				<p style="font-size:12.5px;color:var(--td-muted);margin:10px 0 0;">
-					Used where an artist gets a whole tile — the top-artist card in a
-					Reports chapter. Nothing fetches these automatically, so a chapter
-					without one keeps the big initial.
-				</p>
-			</div>
-		</div>
+	{#if artist.artist_row_id}
+		<ArtistPictures bind:open={picsOpen} artistRowId={artist.artist_row_id} artistName={artist.name}
+			on:saved={picturesSaved} />
 	{/if}
 	{#if picMsg}
 		<p style="font-size:13px;color:var(--td-good-fg);margin:0 0 12px;">{picMsg}</p>
