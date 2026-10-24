@@ -1187,7 +1187,12 @@ export interface NowPlayingTrack {
 	 * those as an estimate; a pause or a seek makes them arbitrarily wrong.
 	 */
 	position_known: boolean;
+	/** Only a pushing client can say so; false for every polled source. */
+	paused?: boolean;
 	updated_at: number;
+	/** `progress` and `updated_at` unrounded, in milliseconds. */
+	progress_ms?: number;
+	updated_at_ms?: number;
 	source: string;
 	listening_context: string | null;
 	format_type: string | null;
@@ -1203,6 +1208,8 @@ export interface NowPlayingState {
 	playing: boolean;
 	/** Seconds into the track, as of the moment the server answered. */
 	position?: number;
+	/** The same in milliseconds — what the deck's clock anchors to. */
+	position_ms?: number;
 	track?: NowPlayingTrack;
 }
 

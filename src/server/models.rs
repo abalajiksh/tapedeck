@@ -479,11 +479,6 @@ impl TapedeckPlayback {
     pub fn is_paused(&self) -> bool {
         self.state.as_deref().map(str::trim).is_some_and(|s| s.eq_ignore_ascii_case("paused"))
     }
-
-    /// The playhead in whole seconds, when one was sent.
-    pub fn position_secs(&self) -> Option<u64> {
-        self.position_ms.map(|ms| (ms / 1000) as u64)
-    }
 }
 
 // ── Response types ──
@@ -705,7 +700,7 @@ mod tests {
 
         let pb = info.tapedeck_playback.unwrap();
         // Seconds, because that is what `Progress` and the deck deal in.
-        assert_eq!(pb.position_secs(), Some(84));
+        assert_eq!(pb.position_ms, Some(84210));
         assert!(pb.is_paused());
 
         let s = info.tapedeck_session.unwrap();

@@ -501,7 +501,7 @@ mod tests {
             Play::new("Xtal".into(), "Aphex Twin".into(), 0, "test".into(), "ingest".into());
         play.album = Some("Selected Ambient Works 85-92".into());
         play.duration = Some(297);
-        let mut np = NowPlaying::from_play(&play, "ingest", None, Progress::Exact(84));
+        let mut np = NowPlaying::from_play(&play, "ingest", None, Progress::Exact { ms: 84_000 });
         np.chain_name = Some("Desk → HD 569".into());
         np.listening_context = Some("Critical".into());
         np.format_type = Some("pcm".into());

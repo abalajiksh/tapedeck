@@ -16734,6 +16734,7 @@ components:
           required:
           - playing
           - position
+          - position_ms
           - position_known
           - paused
           properties:
@@ -16744,6 +16745,11 @@ components:
               type: integer
               format: int64
               description: Seconds into the track.
+              minimum: 0
+            position_ms:
+              type: integer
+              format: int64
+              description: The same, in milliseconds.
               minimum: 0
             position_known:
               type: boolean
@@ -18075,6 +18081,16 @@ components:
             readout — for a source with no playhead it is the server's own
             wall-clock arithmetic, not a measurement.
           minimum: 0
+        position_ms:
+          type:
+          - integer
+          - 'null'
+          format: int64
+          description: |-
+            The same, in milliseconds. Anchor a running clock to this rather than
+            ticking whole seconds: whole seconds and a 1 s timer were half of why
+            the deck jumped.
+          minimum: 0
         track:
           oneOf:
           - type: 'null'
@@ -18090,9 +18106,11 @@ components:
       - title
       - artist
       - progress
+      - progress_ms
       - position_known
       - paused
       - updated_at
+      - updated_at_ms
       - source
       properties:
         title:
@@ -18116,7 +18134,14 @@ components:
           description: |-
             Seconds in **as of `updated_at`**. Extrapolate from there rather than
             expecting a tick per second — but see `position_known` first, and stop
-            extrapolating when `paused`.
+            extrapolating when `paused`. `progress_ms` is the same, unrounded.
+          minimum: 0
+        progress_ms:
+          type: integer
+          format: int64
+          description: |-
+            Milliseconds in as of `updated_at_ms`. The number the registry works in;
+            `progress` is this in whole seconds.
           minimum: 0
         position_known:
           type: boolean
@@ -18138,6 +18163,10 @@ components:
           type: integer
           format: int64
           description: Unix seconds when this was last reported.
+        updated_at_ms:
+          type: integer
+          format: int64
+          description: Unix milliseconds when this was last reported.
         source:
           type: string
           description: '`Plex`, `Roon`, `ingest`, `physical`…'

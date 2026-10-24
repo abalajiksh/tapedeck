@@ -452,6 +452,10 @@ pub struct MediaBrowserTrack {
     /// Seconds into the track — both servers report a real playhead, so the deck
     /// gets a true position rather than one counted up from first sight.
     pub position: u64,
+    /// The same playhead in milliseconds, for the deck: `PositionTicks` carries
+    /// ten million to the second, and rounding it to whole seconds threw away
+    /// what the hold rule compares.
+    pub position_ms: u64,
     pub session_id: String,
     /// The client this is playing on, so the listen can carry a device and
     /// therefore a signal chain. `None` only when the server reported no
@@ -690,12 +694,9 @@ impl MediaBrowserSource {
                 continue;
             }
 
-            let position = session
-                .play_state
-                .as_ref()
-                .and_then(|p| p.position_ticks)
-                .map(|t| t / TICKS_PER_SECOND)
-                .unwrap_or(0);
+            let ticks = session.play_state.as_ref().and_then(|p| p.position_ticks).unwrap_or(0);
+            let position = ticks / TICKS_PER_SECOND;
+            let position_ms = ticks / (TICKS_PER_SECOND / 1000);
             let duration = item.run_time_ticks.map(|t| t / TICKS_PER_SECOND);
 
             let track = MediaBrowserTrack {
@@ -706,6 +707,7 @@ impl MediaBrowserSource {
                 ),
                 play: Self::to_play(self.flavour, item, &session.device_name),
                 position,
+                position_ms,
                 session_id: session.id.clone(),
                 player: Self::to_player(&session),
             };

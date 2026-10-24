@@ -633,6 +633,34 @@ pub struct PlexSource {
     /// its own copy of the threshold too — but the *decision* is one shared
     /// method, so the two cannot drift.
     threshold: ScrobbleThreshold,
+    /// When the last `/status/sessions` request went out and came back, in
+    /// wall-clock milliseconds — what the `playhead` trace measures against.
+    last_fetch_ms: (u64, u64),
+    /// Per session, for the `playhead` trace only. See [`PlayheadTrace`].
+    playhead_trace: HashMap<String, PlayheadTrace>,
+}
+
+/// The `playhead` trace's memory of one session: where the track was when it
+/// was first seen, the last report, and the least stale report so far.
+///
+/// Diagnostic, and only touched when the `playhead` log target is enabled
+/// (`RUST_LOG=…,playhead=debug`). It exists to answer one question with
+/// numbers rather than a guess: how far behind the music is the `viewOffset`
+/// Plex hands us, and how unevenly does that lag arrive?
+#[derive(Debug, Clone)]
+struct PlayheadTrace {
+    rating_key: String,
+    anchor_offset_ms: u64,
+    anchor_wall_ms: u64,
+    last_offset_ms: u64,
+    last_wall_ms: u64,
+    /// The smallest lag seen against the anchor's clock. A report's lag minus
+    /// this is how much staler it is than the freshest one Plex ever sent.
+    min_lag_ms: i64,
+}
+
+fn wall_ms() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
 }
 
 /// How often the Plex history endpoint is walked, independent of how often
@@ -810,6 +838,8 @@ impl PlexSource {
             history_seen_through: None,
             recent_scrobbles: HashMap::new(),
             threshold: ScrobbleThreshold::default(),
+            last_fetch_ms: (0, 0),
+            playhead_trace: HashMap::new(),
         }
     }
 
@@ -1597,6 +1627,7 @@ impl PlexSource {
         // from anywhere else. Same rule as `needs_setup` and the lyrics
         // coverage card: never report a failed read as an absence.
         let endpoint = format!("{}/status/sessions", self.url);
+        let sent_at = wall_ms();
         let sent = self
             .client
             .get(&endpoint)
@@ -1604,6 +1635,7 @@ impl PlexSource {
             .header("Accept", "application/json")
             .send()
             .await;
+        self.last_fetch_ms = (sent_at, wall_ms());
         let parsed = match sent {
             // The top-level message of a transport error names the operation
             // and not the fault, so a refused connection, a DNS failure and a
@@ -1743,6 +1775,64 @@ impl PlexSource {
         Ok(result)
     }
 
+    /// One line per Plex report for the `playhead` trace.
+    ///
+    /// * `off` — the `viewOffset` Plex sent, in ms.
+    /// * `Δoff` / `Δwall` — how far it moved, against how much real time
+    ///   passed between the two responses. Equal means Plex's number is moving
+    ///   with the music; `Δoff = 0` while playing means Plex had nothing new.
+    /// * `rtt` — how long the request took.
+    /// * `lag` — how far behind a steady clock started at the first report this
+    ///   one is; `stale` — the same, less the freshest report seen, which is
+    ///   the part that would drag a deck backwards.
+    ///
+    /// A jump of more than 15 s either way is a seek, and re-anchors.
+    fn trace_playhead(&mut self, session: &str, rating_key: &str, off: u64, track: &PlexTrack) {
+        let (sent, recv) = self.last_fetch_ms;
+        let rtt = recv.saturating_sub(sent);
+        let player = track.player.as_ref().and_then(|p| p.product.as_deref()).unwrap_or("?");
+        let fresh = |off: u64| PlayheadTrace {
+            rating_key: rating_key.to_string(),
+            anchor_offset_ms: off,
+            anchor_wall_ms: recv,
+            last_offset_ms: off,
+            last_wall_ms: recv,
+            min_lag_ms: 0,
+        };
+        let Some(t) = self.playhead_trace.get_mut(session).filter(|t| t.rating_key == rating_key)
+        else {
+            debug!(
+                target: "playhead",
+                "plex {player} '{}' NEW off={off}ms rtt={rtt}ms",
+                track.title
+            );
+            self.playhead_trace.insert(session.to_string(), fresh(off));
+            return;
+        };
+        let d_off = off as i64 - t.last_offset_ms as i64;
+        let d_wall = recv as i64 - t.last_wall_ms as i64;
+        let expected = t.anchor_offset_ms as i64 + (recv as i64 - t.anchor_wall_ms as i64);
+        let lag = expected - off as i64;
+        if lag.abs() > 15_000 {
+            debug!(
+                target: "playhead",
+                "plex {player} '{}' SEEK off={off}ms Δoff={d_off}ms Δwall={d_wall}ms rtt={rtt}ms",
+                track.title
+            );
+            *t = fresh(off);
+            return;
+        }
+        t.min_lag_ms = t.min_lag_ms.min(lag);
+        let stale = lag - t.min_lag_ms;
+        debug!(
+            target: "playhead",
+            "plex {player} '{}' off={off}ms Δoff={d_off}ms Δwall={d_wall}ms rtt={rtt}ms lag={lag}ms stale={stale}ms",
+            track.title
+        );
+        t.last_offset_ms = off;
+        t.last_wall_ms = recv;
+    }
+
     async fn process_live_track(
         &mut self,
         track: PlexTrack,
@@ -1754,6 +1844,9 @@ impl PlexSource {
         let duration = track.duration.unwrap_or(0);
         let view_offset = track.view_offset.unwrap_or(0);
         let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+        if is_playing && tracing::enabled!(target: "playhead", tracing::Level::DEBUG) {
+            self.trace_playhead(&session_key, &rating_key, view_offset, &track);
+        }
 
         if let Some(state) = self.session_states.get(&session_key) {
             if state.rating_key != rating_key {

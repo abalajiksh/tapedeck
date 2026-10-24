@@ -1977,6 +1977,7 @@ async fn live_lyrics(
     let body = LiveLyrics::Playing {
         playing: true,
         position,
+        position_ms: np.position_ms_now(),
         // Whether that position is a measurement. The reader will not drive a
         // highlight from a guess, so it has to be able to tell — the same
         // distinction `Progress` exists to keep, carried one screen further.
@@ -2006,6 +2007,8 @@ pub enum LiveLyrics {
         playing: bool,
         /// Seconds into the track.
         position: u64,
+        /// The same, in milliseconds.
+        position_ms: u64,
         /// Whether `position` is a measurement. Do not drive a highlight from a
         /// guess.
         position_known: bool,
