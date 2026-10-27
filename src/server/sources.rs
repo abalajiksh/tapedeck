@@ -63,6 +63,22 @@ pub struct Source {
     pub last_polled_at: Option<i64>,
     pub last_error: Option<String>,
     pub updated_at: i64,
+    /// Navidrome only: the plugin token made on this source, if there is one.
+    /// While there is, the source is in plugin mode — not polled, and listens
+    /// arrive from the Tapedeck plugin inside Navidrome instead. Filled in by
+    /// the list only.
+    pub plugin: Option<PluginLink>,
+}
+
+/// A source's plugin token, without the token.
+#[derive(Serialize, ToSchema)]
+pub struct PluginLink {
+    /// The token has `write`, so the plugin also sends lyrics from your files.
+    pub lyrics: bool,
+    pub created_at: i64,
+    /// When the plugin last used it, to within five minutes. Null means it
+    /// never has: the token is not pasted into the plugin yet.
+    pub last_used_at: Option<i64>,
 }
 
 #[derive(Serialize, ToSchema)]
@@ -155,6 +171,7 @@ fn public_view(s: &UserSource) -> Source {
         last_polled_at: s.last_polled_at,
         last_error: s.last_error.clone(),
         updated_at: s.updated_at,
+        plugin: None,
     }
 }
 
@@ -174,13 +191,26 @@ fn public_view(s: &UserSource) -> Source {
     )
 )]
 async fn list_sources(State(state): State<Arc<AppState>>, user: AuthUser) -> impl IntoResponse {
-    match state.db.list_sources_for_user(user.user_id).await {
-        Ok(rows) => {
-            let sources = rows.iter().map(public_view).collect();
-            (StatusCode::OK, Json(SourceList { sources, kinds: KINDS.to_vec() })).into_response()
+    let rows = match state.db.list_sources_for_user(user.user_id).await {
+        Ok(rows) => rows,
+        Err(e) => return err(500, e.to_string()),
+    };
+    let mut sources = Vec::with_capacity(rows.len());
+    for s in &rows {
+        let mut view = public_view(s);
+        if s.kind == "navidrome" {
+            view.plugin = match state.db.source_token(user.user_id, s.id).await {
+                Ok(t) => t.map(|(scopes, created_at, last_used_at)| PluginLink {
+                    lyrics: scopes.split([' ', ',']).any(|g| g == "write"),
+                    created_at,
+                    last_used_at,
+                }),
+                Err(e) => return err(500, e.to_string()),
+            };
         }
-        Err(e) => err(500, e.to_string()),
+        sources.push(view);
     }
+    (StatusCode::OK, Json(SourceList { sources, kinds: KINDS.to_vec() })).into_response()
 }
 
 /// A source to save. On update every field is optional, and an omitted or
@@ -612,6 +642,98 @@ async fn delete_source(
     }
 }
 
+#[derive(Deserialize, ToSchema)]
+struct PluginTokenRequest {
+    /// Also grant `write`, so the plugin sends the lyrics in your files. A
+    /// `write` token can edit and delete your Tapedeck data, and whoever runs
+    /// the Navidrome server sees it. Default false.
+    lyrics: Option<bool>,
+}
+
+#[derive(Serialize, ToSchema)]
+struct PluginToken {
+    /// Shown once. Paste it into the Tapedeck plugin's settings in Navidrome.
+    token: String,
+    scopes: String,
+}
+
+// POST /api/v1/sources/:id/plugin-token — put a Navidrome source in plugin mode.
+/// Make a token for the Tapedeck plugin in Navidrome.
+///
+/// Session-only. Puts the source in **plugin mode**: the engine stops polling
+/// it, and listens submitted with this token that name a Navidrome song are
+/// stored as this server's, so cover art and the rest of the library features
+/// work for them. The login is still used for those. Calling again replaces
+/// the token; the old one stops working.
+#[utoipa::path(
+    post,
+    path = "/api/v1/sources/{id}/plugin-token",
+    tag = "Sources",
+    params(("id" = i64, Path)),
+    request_body = PluginTokenRequest,
+    responses(
+        (status = 201, description = "Created.", body = PluginToken),
+        (status = 400, description = "Not a Navidrome source.", body = ErrorResponse),
+        (status = 401, response = Unauthorized),
+        (status = 404, response = NotFound),
+    )
+)]
+async fn create_plugin_token(
+    State(state): State<Arc<AppState>>,
+    user: AuthUser,
+    Path(id): Path<i64>,
+    Json(body): Json<PluginTokenRequest>,
+) -> impl IntoResponse {
+    let source = match state.db.get_source(user.user_id, id).await {
+        Ok(Some(s)) => s,
+        Ok(None) => return err(404, "No such source"),
+        Err(e) => return err(500, e.to_string()),
+    };
+    if source.kind != "navidrome" {
+        return err(400, "Only a Navidrome source has a plugin");
+    }
+    let scopes = if body.lyrics.unwrap_or(false) { "submit write" } else { "submit" };
+    let label = if source.label.is_empty() { "Navidrome" } else { source.label.as_str() };
+    let name = format!("Navidrome plugin · {label}");
+    match state.db.create_source_token(user.user_id, id, &name, scopes).await {
+        Ok(token) => {
+            info!("⚙️ Navidrome source {} in plugin mode for {}", id, user.username);
+            (StatusCode::CREATED, Json(PluginToken { token, scopes: scopes.into() }))
+                .into_response()
+        }
+        Err(e) => err(500, e.to_string()),
+    }
+}
+
+// DELETE /api/v1/sources/:id/plugin-token — back to polling.
+/// Remove the plugin token, and poll the source again.
+///
+/// Session-only. The plugin's listens are refused from now on. Polling picks
+/// up from where it last stopped, and plays the plugin already sent are
+/// recognised as duplicates.
+#[utoipa::path(
+    delete,
+    path = "/api/v1/sources/{id}/plugin-token",
+    tag = "Sources",
+    params(("id" = i64, Path)),
+    responses(
+        (status = 204, description = "Removed."),
+        (status = 401, response = Unauthorized),
+        (status = 404, response = NotFound),
+    )
+)]
+async fn delete_plugin_token(
+    State(state): State<Arc<AppState>>,
+    user: AuthUser,
+    Path(id): Path<i64>,
+) -> impl IntoResponse {
+    match state.db.delete_source_tokens(user.user_id, id).await {
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => err(404, "That source has no plugin token"),
+        Err(e) => err(500, e.to_string()),
+    }
+}
+
 /// Credentials to try. Anything omitted falls back to the stored source named
 /// by `id`.
 #[derive(Deserialize, ToSchema)]
@@ -803,7 +925,15 @@ async fn test_source(
 }
 
 #[derive(utoipa::OpenApi)]
-#[openapi(paths(test_source, list_sources, create_source, update_source, delete_source))]
+#[openapi(paths(
+    test_source,
+    list_sources,
+    create_source,
+    update_source,
+    delete_source,
+    create_plugin_token,
+    delete_plugin_token
+))]
 pub struct Api;
 
 pub fn create_sources_router() -> Router<Arc<AppState>> {
@@ -813,4 +943,8 @@ pub fn create_sources_router() -> Router<Arc<AppState>> {
         .route("/api/v1/sources/test", post(test_source))
         .route("/api/v1/sources", get(list_sources).post(create_source))
         .route("/api/v1/sources/:id", axum::routing::put(update_source).delete(delete_source))
+        .route(
+            "/api/v1/sources/:id/plugin-token",
+            post(create_plugin_token).delete(delete_plugin_token),
+        )
 }

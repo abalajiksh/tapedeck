@@ -82,7 +82,7 @@ info:
   license:
     name: AGPL-3.0-or-later
     identifier: AGPL-3.0-or-later
-  version: 0.124.0
+  version: 0.125.0
 servers:
 - url: /
   description: The Tapedeck instance serving this document.
@@ -6464,6 +6464,71 @@ paths:
           $ref: '#/components/responses/Unauthorized'
         '404':
           $ref: '#/components/responses/NotFound'
+  /api/v1/sources/{id}/plugin-token:
+    post:
+      tags:
+      - Sources
+      summary: Make a token for the Tapedeck plugin in Navidrome.
+      description: |-
+        Session-only. Puts the source in **plugin mode**: the engine stops polling
+        it, and listens submitted with this token that name a Navidrome song are
+        stored as this server's, so cover art and the rest of the library features
+        work for them. The login is still used for those. Calling again replaces
+        the token; the old one stops working.
+      operationId: create_plugin_token
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: integer
+          format: int64
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PluginTokenRequest'
+        required: true
+      responses:
+        '201':
+          description: Created.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PluginToken'
+        '400':
+          description: Not a Navidrome source.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    delete:
+      tags:
+      - Sources
+      summary: Remove the plugin token, and poll the source again.
+      description: |-
+        Session-only. The plugin's listens are refused from now on. Polling picks
+        up from where it last stopped, and plays the plugin already sent are
+        recognised as duplicates.
+      operationId: delete_plugin_token
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: integer
+          format: int64
+      responses:
+        '204':
+          description: Removed.
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
   /api/v1/connections:
     get:
       tags:
@@ -11763,6 +11828,10 @@ components:
           oneOf:
           - type: 'null'
           - $ref: '#/components/schemas/TapedeckPlayback'
+        tapedeck_source:
+          oneOf:
+          - type: 'null'
+          - $ref: '#/components/schemas/TapedeckSource'
     AdoptLyricsRequest:
       type: object
       description: An LRCLIB record to hold for a track.
@@ -19485,6 +19554,49 @@ components:
           format: int64
         name:
           type: string
+    PluginLink:
+      type: object
+      description: A source's plugin token, without the token.
+      required:
+      - lyrics
+      - created_at
+      properties:
+        lyrics:
+          type: boolean
+          description: The token has `write`, so the plugin also sends lyrics from your files.
+        created_at:
+          type: integer
+          format: int64
+        last_used_at:
+          type:
+          - integer
+          - 'null'
+          format: int64
+          description: |-
+            When the plugin last used it, to within five minutes. Null means it
+            never has: the token is not pasted into the plugin yet.
+    PluginToken:
+      type: object
+      required:
+      - token
+      - scopes
+      properties:
+        token:
+          type: string
+          description: Shown once. Paste it into the Tapedeck plugin's settings in Navidrome.
+        scopes:
+          type: string
+    PluginTokenRequest:
+      type: object
+      properties:
+        lyrics:
+          type:
+          - boolean
+          - 'null'
+          description: |-
+            Also grant `write`, so the plugin sends the lyrics in your files. A
+            `write` token can edit and delete your Tapedeck data, and whoever runs
+            the Navidrome server sees it. Default false.
     PollBody:
       type: object
       required:
@@ -22810,6 +22922,15 @@ components:
         updated_at:
           type: integer
           format: int64
+        plugin:
+          oneOf:
+          - type: 'null'
+          - $ref: '#/components/schemas/PluginLink'
+            description: |-
+              Navidrome only: the plugin token made on this source, if there is one.
+              While there is, the source is in plugin mode — not polled, and listens
+              arrive from the Tapedeck plugin inside Navidrome instead. Filled in by
+              the list only.
     SourceAccounts:
       oneOf:
       - type: array
@@ -22908,6 +23029,7 @@ components:
       - kind
       - label
       - enabled
+      - plugin
       properties:
         id:
           type: integer
@@ -22937,6 +23059,11 @@ components:
           type:
           - string
           - 'null'
+        plugin:
+          type: boolean
+          description: |-
+            In plugin mode: listens are pushed by a plugin on the server, so it is
+            not polled and its `last_polled_at` is expected to stand still.
     SourceList:
       type: object
       required:
@@ -24467,6 +24594,27 @@ components:
             What it was played from — a playlist name, an album, a queue, radio.
             Free text: it is your vocabulary for your own containers and there is
             no shared one to normalise against.
+    TapedeckSource:
+      type: object
+      description: |-
+        `additional_info.tapedeck_source` — which library item was played, from a
+        plugin running inside the media server (the Navidrome plugin today).
+
+        Only read when the submitting token was made on a Navidrome source, or the
+        user has exactly one: the id means nothing without knowing which server it
+        belongs to. The listen is then stored as if that source had polled it, so
+        the cover proxy and everything else that reads a library id works as-is.
+      properties:
+        kind:
+          type:
+          - string
+          - 'null'
+          description: '`navidrome`. Anything else is ignored.'
+        song_id:
+          type:
+          - string
+          - 'null'
+          description: The library's own id for the played track (Navidrome's media file id).
     TargetSpec:
       type: object
       description: |-

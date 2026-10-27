@@ -33,8 +33,9 @@ impl Database {
             Option<String>,
             Option<bool>,
             Option<i64>,
+            Option<i64>,
         )> = sqlx::query_as(&crate::sql!("SELECT u.id, u.username, u.role, t.id, t.default_chain_id, t.scopes,
-                        t.imports_are_live, t.last_used_at
+                        t.imports_are_live, t.last_used_at, t.source_ref
              FROM tokens t JOIN users u ON t.user_id = u.id
              WHERE t.token_hash = ? AND (t.expires_at IS NULL OR t.expires_at > ?) AND u.disabled = 0"))
         .bind(&token_hash)
@@ -51,6 +52,7 @@ impl Database {
             scopes,
             imports_are_live,
             last_used,
+            source_ref,
         )) = row
         {
             // Same throttle as the session stamp. Settings shows this as a
@@ -72,6 +74,7 @@ impl Database {
                 default_chain_id,
                 scopes: scopes.unwrap_or_default(),
                 imports_are_live: imports_are_live.unwrap_or(false),
+                source_ref,
             }))
         } else {
             Ok(None)

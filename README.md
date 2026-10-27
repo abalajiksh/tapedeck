@@ -221,6 +221,14 @@ Subsonic hashes `password + salt` on every request, so Navidrome needs the
 account password rather than a token. It's encrypted at rest like every other
 stored credential.
 
+**Plugin mode.** If whoever runs your Navidrome installs the
+Tapedeck plugin for it, tick *Listens come from
+the Tapedeck plugin* on the source. Tapedeck then stops polling it and shows a token once
+for the plugin's settings. The plugin pushes each listen the moment Navidrome counts it,
+with the file's format, the player and the real playhead (pause included), and names the
+song it played, so cover art still comes from your library through the login above.
+Untick it to go back to polling; the token is deleted.
+
 ### Rockbox / DAP imports
 
 Upload a `.scrobbler.log` straight off a Rockbox player. Track numbers, lengths

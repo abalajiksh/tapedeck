@@ -10,13 +10,19 @@ impl Database {
     /// Every enabled source across all users — what the engine reconciles its
     /// registry against each tick. Credentials come back decrypted; a row we
     /// can't decrypt is dropped rather than failing the whole tick.
+    ///
+    /// A source with a token made on it is in plugin mode and left out: its
+    /// listens arrive through that token, and polling as well would race them
+    /// with bare copies. Removing the token brings it back on the next tick.
     pub async fn list_enabled_sources(&self) -> Result<Vec<UserSource>, sqlx::Error> {
         let rows: Vec<UserSourceRow> = sqlx::query_as(&crate::sql!(
             "SELECT s.id, s.user_id, s.kind, s.label, s.enabled, s.url, s.credentials,
                     s.remote_account, s.poll_interval_secs, s.options, s.last_polled_at,
                     s.last_error, s.updated_at, COALESCE(u.role, '') AS owner_role
              FROM user_sources s LEFT JOIN users u ON u.id = s.user_id
-             WHERE s.enabled = 1 ORDER BY s.user_id, s.kind",
+             WHERE s.enabled = 1
+               AND NOT EXISTS (SELECT 1 FROM tokens t WHERE t.source_ref = s.id)
+             ORDER BY s.user_id, s.kind",
         ))
         .fetch_all(&self.pool)
         .await?;
@@ -55,7 +61,8 @@ impl Database {
     pub async fn source_health(&self) -> Result<Vec<SourceHealth>, sqlx::Error> {
         sqlx::query_as(&crate::sql!(
             "SELECT s.id, s.user_id, COALESCE(u.username, '') AS username, s.kind, s.label,
-                    s.enabled, s.poll_interval_secs, s.last_polled_at, s.last_error
+                    s.enabled, s.poll_interval_secs, s.last_polled_at, s.last_error,
+                    EXISTS (SELECT 1 FROM tokens t WHERE t.source_ref = s.id) AS plugin
              FROM user_sources s
              LEFT JOIN users u ON u.id = s.user_id
              ORDER BY s.user_id, s.kind",
@@ -185,6 +192,7 @@ impl Database {
         .bind(id)
         .execute(&mut *tx)
         .await?;
+        Self::delete_source_tokens_in(&mut tx, user_id, id).await?;
         let res =
             sqlx::query(&crate::sql!("DELETE FROM user_sources WHERE user_id = ? AND id = ?"))
                 .bind(user_id)
@@ -193,6 +201,105 @@ impl Database {
                 .await?;
         tx.commit().await?;
         Ok(res.rows_affected() > 0)
+    }
+    /// Make the token a plugin on this source submits with, replacing any
+    /// earlier one. Returns the raw token, which is shown once.
+    ///
+    /// The caller has already checked the source belongs to `user_id`.
+    pub async fn create_source_token(
+        &self,
+        user_id: i64,
+        source_id: i64,
+        name: &str,
+        scopes: &str,
+    ) -> Result<String, sqlx::Error> {
+        use rand::Rng;
+        let raw: [u8; 24] = rand::rng().random();
+        let token = format!("td_{}", hex::encode(raw));
+        let mut tx = self.pool.begin().await?;
+        Self::delete_source_tokens_in(&mut tx, user_id, source_id).await?;
+        sqlx::query(&crate::sql!(
+            "INSERT INTO tokens (user_id, token_hash, name, scopes, created_at, source_ref)
+             VALUES (?, ?, ?, ?, ?, ?)"
+        ))
+        .bind(user_id)
+        .bind(Self::hash_token(&token))
+        .bind(name)
+        .bind(scopes)
+        .bind(Self::now_secs())
+        .bind(source_id)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        info!("🔑 Created plugin token for source {} (user_id {})", source_id, user_id);
+        Ok(token)
+    }
+    /// Remove a source's plugin token, which puts it back to polling.
+    pub async fn delete_source_tokens(
+        &self,
+        user_id: i64,
+        source_id: i64,
+    ) -> Result<bool, sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
+        let n = Self::delete_source_tokens_in(&mut tx, user_id, source_id).await?;
+        tx.commit().await?;
+        Ok(n > 0)
+    }
+    /// Same unlinking as `delete_token`: sessions keep the history and stop
+    /// naming the token, or the foreign key refuses the delete.
+    async fn delete_source_tokens_in(
+        tx: &mut sqlx::Transaction<'_, Db>,
+        user_id: i64,
+        source_id: i64,
+    ) -> Result<u64, sqlx::Error> {
+        sqlx::query(&crate::sql!(
+            "UPDATE sessions SET token_id = NULL
+             WHERE user_id = ? AND token_id IN (SELECT id FROM tokens WHERE source_ref = ?)"
+        ))
+        .bind(user_id)
+        .bind(source_id)
+        .execute(&mut **tx)
+        .await?;
+        let res =
+            sqlx::query(&crate::sql!("DELETE FROM tokens WHERE user_id = ? AND source_ref = ?"))
+                .bind(user_id)
+                .bind(source_id)
+                .execute(&mut **tx)
+                .await?;
+        Ok(res.rows_affected())
+    }
+    /// A source's plugin token, if it has one: `(scopes, created_at,
+    /// last_used_at)`. The token itself is only a hash by now.
+    pub async fn source_token(
+        &self,
+        user_id: i64,
+        source_id: i64,
+    ) -> Result<Option<(String, i64, Option<i64>)>, sqlx::Error> {
+        sqlx::query_as(&crate::sql!(
+            "SELECT COALESCE(scopes, ''), created_at, last_used_at FROM tokens
+             WHERE user_id = ? AND source_ref = ? ORDER BY id DESC LIMIT 1"
+        ))
+        .bind(user_id)
+        .bind(source_id)
+        .fetch_optional(&self.pool)
+        .await
+    }
+    /// The user's one source of `kind`, or `None` when they have none or
+    /// several — a token made under Settings → API Tokens names no source, and
+    /// a guess between two servers would point the art proxy at the wrong one.
+    pub async fn sole_source_of_kind(
+        &self,
+        user_id: i64,
+        kind: &str,
+    ) -> Result<Option<i64>, sqlx::Error> {
+        let ids: Vec<(i64,)> = sqlx::query_as(&crate::sql!(
+            "SELECT id FROM user_sources WHERE user_id = ? AND kind = ? LIMIT 2"
+        ))
+        .bind(user_id)
+        .bind(kind)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(if ids.len() == 1 { Some(ids[0].0) } else { None })
     }
     /// Record the outcome of a poll. Deliberately does *not* touch
     /// `updated_at` — that would look like a config change and make the engine

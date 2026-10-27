@@ -815,6 +815,9 @@ pub struct SourceHealth {
     pub poll_interval_secs: Option<i64>,
     pub last_polled_at: Option<i64>,
     pub last_error: Option<String>,
+    /// In plugin mode: listens are pushed by a plugin on the server, so it is
+    /// not polled and its `last_polled_at` is expected to stand still.
+    pub plugin: bool,
 }
 
 /// A configured source, credentials decrypted. `kind` is `plex` | `navidrome` |
@@ -2778,6 +2781,9 @@ pub struct TokenAuth {
     /// from a backfill — so the operator states it once per token, and
     /// `IMPORT_LIVE_WINDOW_SECS` bounds how far they can be wrong.
     pub imports_are_live: bool,
+    /// The source this token was made on (a Navidrome plugin token), so its
+    /// listens can name the server they came from.
+    pub source_ref: Option<i64>,
 }
 
 impl TokenAuth {

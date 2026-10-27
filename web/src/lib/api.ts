@@ -250,6 +250,8 @@ export interface SourceHealth {
 	poll_interval_secs: number | null;
 	last_polled_at: number | null;
 	last_error: string | null;
+	/** Not polled: a plugin on the server pushes its listens. */
+	plugin: boolean;
 }
 
 export interface OpsStatus {
@@ -1238,11 +1240,14 @@ export interface UserSource {
 	last_polled_at: number | null;
 	last_error: string | null;
 	updated_at: number;
+	/** Navidrome only: set while the source is in plugin mode (not polled; the
+	 *  Tapedeck plugin inside Navidrome sends the listens). */
+	plugin?: { lyrics: boolean; created_at: number; last_used_at: number | null } | null;
 }
 
 /** Partial update. Omitting `token` keeps the stored one. */
 export type UserSourceUpdate = Partial<
-	Omit<UserSource, 'id' | 'kind' | 'has_token' | 'remote_account' | 'last_polled_at' | 'last_error' | 'updated_at'>
+	Omit<UserSource, 'id' | 'kind' | 'has_token' | 'remote_account' | 'last_polled_at' | 'last_error' | 'updated_at' | 'plugin'>
 > & {
 	kind?: string; token?: string; username?: string; password?: string; api_key?: string;
 	/** Plex only. Which account on the server to scrobble. Omit for "whoever
@@ -2323,6 +2328,16 @@ class TapedeckAPI {
 
 	async deleteSource(id: number): Promise<void> {
 		return this.delNoBody(`/api/v1/sources/${id}`);
+	}
+
+	/** Put a Navidrome source in plugin mode, or replace its token. Shown once. */
+	async createPluginToken(id: number, lyrics: boolean): Promise<{ token: string; scopes: string }> {
+		return this.post(`/api/v1/sources/${id}/plugin-token`, { lyrics });
+	}
+
+	/** Back to polling. */
+	async deletePluginToken(id: number): Promise<void> {
+		return this.delNoBody(`/api/v1/sources/${id}/plugin-token`);
 	}
 
 	/** Pass `kind` to test before saving, or `id` to re-test a stored source. */
