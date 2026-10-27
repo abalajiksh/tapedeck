@@ -698,7 +698,7 @@
 	 * ordinary jitter is not drawn as a fault.
 	 */
 	function sourceLate(src: SourceHealth, now: number): boolean {
-		if (!src.enabled) return false;
+		if (!src.enabled || src.plugin) return false;
 		const iv = src.poll_interval_secs || 30;
 		if (!src.last_polled_at) return true;
 		return now - src.last_polled_at > Math.max(iv * 3, 60);
@@ -3739,10 +3739,12 @@
 										<div class="opssub">
 											{#if !src.enabled}
 												Switched off
+											{:else if src.plugin}
+												not polled · a plugin sends its listens
 											{:else}
 												polled {ago(src.last_polled_at, nowSec)} · every {src.poll_interval_secs ?? 30}s
 											{/if}
-											{#if src.last_error}<span class="opserr">· {src.last_error}</span>{/if}
+											{#if src.last_error && !src.plugin}<span class="opserr">· {src.last_error}</span>{/if}
 										</div>
 									</div>
 									<span

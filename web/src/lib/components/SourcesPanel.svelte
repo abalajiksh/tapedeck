@@ -27,7 +27,7 @@
 		{
 			v: 'navidrome',
 			label: 'Navidrome',
-			blurb: 'Signs in as you and backfills the play history Navidrome already keeps, then keeps up live. Your library’s MusicBrainz IDs come along, sparing those listens a lookup.'
+			blurb: 'Signs in as you and backfills the play history Navidrome already keeps, then keeps up live. Your library’s MusicBrainz IDs come along, sparing those listens a lookup. If the Tapedeck plugin is installed in Navidrome, let it send your listens instead: they carry the format, the player and the exact playhead, and this login is kept for artwork.'
 		},
 		{
 			v: 'jellyfin',
@@ -65,6 +65,12 @@
 		 *  impossible for a Jellyfin API key — hence the picker. */
 		plexAccount: string;
 		filters: { libraries_allow: string; libraries_block: string; devices_allow: string; devices_block: string };
+		/** Navidrome: listens come from the Tapedeck plugin, not from polling. */
+		usePlugin: boolean;
+		/** The plugin's token may also send lyrics (`write`). */
+		lyrics: boolean;
+		/** What the stored source had, to tell what Save has to change. */
+		saved: { usePlugin: boolean; lyrics: boolean };
 	};
 	let draft: Draft | null = null;
 	let advanced = false;
@@ -72,11 +78,14 @@
 	let message = '';
 	let test: SourceTestResult | null = null;
 	let confirmDelete: UserSource | null = null;
+	/** A plugin token just made. Only a hash is kept, so this is the one chance to copy it. */
+	let newToken: { label: string; token: string } | null = null;
 
 	const blank = (kind: Kind): Draft => ({
 		id: null, kind, label: '', url: '', enabled: true,
 		secret: '', username: '', hasSecret: false, plexAccount: '',
-		filters: { libraries_allow: '', libraries_block: '', devices_allow: '', devices_block: '' }
+		filters: { libraries_allow: '', libraries_block: '', devices_allow: '', devices_block: '' },
+		usePlugin: false, lyrics: false, saved: { usePlugin: false, lyrics: false }
 	});
 
 	function edit(s: UserSource) {
@@ -97,7 +106,10 @@
 				libraries_block: (s.libraries_block ?? []).join(', '),
 				devices_allow: (s.devices_allow ?? []).join(', '),
 				devices_block: (s.devices_block ?? []).join(', ')
-			}
+			},
+			usePlugin: !!s.plugin,
+			lyrics: s.plugin?.lyrics ?? false,
+			saved: { usePlugin: !!s.plugin, lyrics: s.plugin?.lyrics ?? false }
 		};
 		advanced = false;
 		test = null;
@@ -153,13 +165,48 @@
 		};
 		try {
 			if (d.id == null) {
-				await api.createSource({ kind: d.kind, ...body });
+				// Kept on the draft, so a failed token call below doesn't make Save create it twice.
+				d.id = (await api.createSource({ kind: d.kind, ...body })).id;
 			} else {
 				await api.updateSource(d.id, body);
 			}
+			const id = d.id;
+			let plugin = false;
+			if (d.kind === 'navidrome') {
+				// Scopes are fixed when a token is made, so changing lyrics means a new one.
+				if (d.usePlugin && (!d.saved.usePlugin || d.lyrics !== d.saved.lyrics)) {
+					await makeToken(id, d.label || 'Navidrome', d.lyrics);
+					plugin = true;
+				} else if (!d.usePlugin && d.saved.usePlugin) {
+					await api.deletePluginToken(id);
+				}
+			}
 			await load();
 			draft = null;
-			message = 'Saved — polling picks this up within a few seconds.';
+			message = plugin
+				? 'Saved. Paste the token below into the Tapedeck plugin in Navidrome.'
+				: d.usePlugin
+					? 'Saved.'
+					: 'Saved — polling picks this up within a few seconds.';
+		} catch (e) {
+			error = String(e).replace(/^API \d+: /, '');
+		}
+		busy = false;
+	}
+
+	async function makeToken(id: number, label: string, lyrics: boolean) {
+		const t = await api.createPluginToken(id, lyrics);
+		newToken = { label, token: t.token };
+	}
+
+	/** Replace the token without touching anything else, e.g. after losing it. */
+	async function regenerate() {
+		if (!draft || draft.id == null) return;
+		busy = true; error = ''; message = '';
+		try {
+			await makeToken(draft.id, draft.label || 'Navidrome', draft.saved.lyrics);
+			await load();
+			message = 'New token made. The old one has stopped working.';
 		} catch (e) {
 			error = String(e).replace(/^API \d+: /, '');
 		}
@@ -219,6 +266,21 @@
 
 	{#if error}<div style="font-size:13px;color:#b2622d;margin-bottom:12px;">{error}</div>{/if}
 	{#if message}<div style="font-size:13px;color:var(--td-good-fg);margin-bottom:12px;">✓ {message}</div>{/if}
+	{#if newToken}
+		<div style="padding:12px 14px;border:1px solid var(--td-border);border-radius:16px;background:var(--td-surface2);margin-bottom:18px;">
+			<div style="font-size:13px;font-weight:600;margin-bottom:6px;">Plugin token for {newToken.label}</div>
+			<p style="font-size:12.5px;color:var(--td-muted-2);margin:0 0 8px;">
+				In Navidrome, open the Tapedeck plugin's settings and add a row with your Navidrome
+				username, this Tapedeck's address and this token. It is shown only now; if you lose it,
+				make a new one.
+			</p>
+			<div style="display:flex;gap:8px;flex-wrap:wrap;">
+				<input class="input" style="flex:1;min-width:200px;font-family:monospace;" readonly value={newToken.token} aria-label="Plugin token" on:focus={(e) => e.currentTarget.select()}>
+				<button class="btn btn-secondary" on:click={() => newToken && navigator.clipboard?.writeText(newToken.token)}>Copy</button>
+				<button class="btn btn-secondary" on:click={() => (newToken = null)}>Done</button>
+			</div>
+		</div>
+	{/if}
 
 	{#if loading}
 		<div style="display:flex;justify-content:center;padding:16px;"><div class="spin" style="width:18px;height:18px;border:2px solid var(--td-track);border-top-color:var(--td-accent);border-radius:50%;"></div></div>
@@ -227,7 +289,7 @@
 			<div style="display:flex;flex-direction:column;gap:10px;margin-bottom:18px;">
 				{#each sources as s (s.id)}
 					<div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;padding:12px 14px;border:1px solid var(--td-border);border-radius:16px;background:var(--td-surface2);">
-						<span style="width:8px;height:8px;border-radius:50%;flex:none;background:{s.last_error ? '#b2622d' : s.enabled ? '#7a8a5e' : 'var(--td-muted-3)'};"></span>
+						<span style="width:8px;height:8px;border-radius:50%;flex:none;background:{s.last_error && !s.plugin ? '#b2622d' : s.enabled ? '#7a8a5e' : 'var(--td-muted-3)'};"></span>
 						<div style="flex:1;min-width:150px;">
 							<div style="font-size:14px;font-weight:600;">
 								{s.label || kindLabel(s.kind)}
@@ -237,7 +299,12 @@
 								{s.url}{s.remote_account ? ` · ${s.remote_account}` : ''}
 							</div>
 						</div>
-						{#if s.last_error}
+						{#if s.plugin}
+							<span class="tag tag-neutral" style="font-size:11px;">plugin</span>
+							<span style="font-size:12px;color:var(--td-muted-3);">
+								{s.plugin.last_used_at ? `heard from ${timeAgo(s.plugin.last_used_at)}` : 'token not used yet'}
+							</span>
+						{:else if s.last_error}
 							<span class="tag tag-outline" style="font-size:11px;color:#b2622d;">failing</span>
 						{:else if !s.enabled}
 							<span class="tag tag-neutral" style="font-size:11px;">paused</span>
@@ -247,7 +314,7 @@
 						<button class="btn btn-secondary" style="font-size:12.5px;padding:6px 14px;" on:click={() => edit(s)}>Edit</button>
 						<button class="btn btn-danger" style="font-size:12.5px;padding:6px 14px;" on:click={() => (confirmDelete = s)}>Remove</button>
 					</div>
-					{#if s.last_error}
+					{#if s.last_error && !s.plugin}
 						<p style="font-size:12px;color:#b2622d;margin:-4px 0 0 22px;font-family:monospace;word-break:break-word;">{s.last_error}</p>
 					{/if}
 				{/each}
@@ -277,7 +344,7 @@
 
 			<label style="display:flex;align-items:center;gap:10px;cursor:pointer;font-size:14px;margin-bottom:14px;">
 				<input type="checkbox" bind:checked={draft.enabled} style="width:16px;height:16px;accent-color:var(--td-accent);cursor:pointer;">
-				Poll this server
+				{draft.usePlugin ? 'Use this server' : 'Poll this server'}
 			</label>
 
 			<div style="display:flex;gap:12px;flex-wrap:wrap;">
@@ -325,6 +392,35 @@
 					to be stored rather than exchanged. It's encrypted at rest with a key kept outside the
 					database.
 				</p>
+
+				<label style="display:flex;align-items:center;gap:10px;cursor:pointer;font-size:14px;margin-top:14px;">
+					<input type="checkbox" bind:checked={draft.usePlugin} style="width:16px;height:16px;accent-color:var(--td-accent);cursor:pointer;">
+					Listens come from the Tapedeck plugin in Navidrome
+				</label>
+				{#if draft.usePlugin}
+					<div style="margin:6px 0 0 26px;">
+						<p style="font-size:12.5px;color:var(--td-muted-2);margin:0 0 8px;">
+							This server is then not polled, so the plugin's richer copy of each listen is the
+							one kept. Save makes a token for whoever runs Navidrome to paste into the plugin;
+							they can see it. The login above is still used for cover art.
+						</p>
+						<label style="display:flex;align-items:center;gap:10px;cursor:pointer;font-size:13px;">
+							<input type="checkbox" bind:checked={draft.lyrics} style="width:15px;height:15px;accent-color:var(--td-accent);cursor:pointer;">
+							Also send the lyrics in my files
+						</label>
+						<p style="font-size:12px;color:var(--td-muted-3);margin:4px 0 0 25px;">
+							Needs a token that can also edit and delete your Tapedeck data.
+							{#if draft.saved.usePlugin && draft.lyrics !== draft.saved.lyrics}Saving makes a new token.{/if}
+						</p>
+						{#if draft.saved.usePlugin}
+							<button class="btn btn-ghost" style="margin-top:8px;font-size:13px;" on:click={regenerate} disabled={busy}>Make a new token</button>
+						{/if}
+					</div>
+				{:else if draft.saved.usePlugin}
+					<p style="font-size:12px;color:var(--td-muted-3);margin:4px 0 0 26px;">
+						Saving deletes the plugin's token and polls this server again.
+					</p>
+				{/if}
 			{/if}
 
 			{#if draft.kind === 'plex'}
@@ -397,7 +493,8 @@
 			<div class="dialog-title">Remove this source?</div>
 			<div class="dialog-body" style="color:var(--td-nav-fg);">
 				“{confirmDelete.label || kindLabel(confirmDelete.kind)}” will stop being polled and its
-				credentials are deleted. Listens already recorded from it are kept.
+				credentials are deleted{confirmDelete.plugin ? ', along with its plugin token' : ''}. Listens
+				already recorded from it are kept.
 			</div>
 			<div class="dialog-actions">
 				<button class="btn btn-secondary" on:click={() => (confirmDelete = null)}>Cancel</button>

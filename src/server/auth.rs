@@ -208,6 +208,9 @@ pub struct IngestAuth {
     /// submissions are live listens. **False for a browser session**, which is
     /// not a scrobble client and has no business relaying a backfill onward.
     pub imports_are_live: bool,
+    /// The source the token was made on, if it was. `None` for a browser
+    /// session and for a token made under Settings → API Tokens.
+    pub source_ref: Option<i64>,
 }
 
 #[axum::async_trait]
@@ -225,6 +228,7 @@ impl FromRequestParts<Arc<super::AppState>> for IngestAuth {
                 token_chain_id: None,
                 token_id: None,
                 imports_are_live: false,
+                source_ref: None,
             });
         }
 
@@ -242,6 +246,7 @@ impl FromRequestParts<Arc<super::AppState>> for IngestAuth {
                     token_chain_id: t.default_chain_id,
                     token_id: Some(t.token_id),
                     imports_are_live: t.imports_are_live,
+                    source_ref: t.source_ref,
                 }),
                 Ok(None) => Err(unauthorized("Invalid token")),
                 Err(e) => {

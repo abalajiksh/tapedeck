@@ -340,6 +340,14 @@ impl Database {
                     .await;
         }
 
+        // Migration: a token made on a source puts it in plugin mode (v0.125.0).
+        if !has_column(&self.pool, "tokens", "source_ref").await {
+            info!("⚙️ Migrating: adding tokens.source_ref...");
+            let _ = sqlx::query("ALTER TABLE tokens ADD COLUMN source_ref INTEGER")
+                .execute(&self.pool)
+                .await;
+        }
+
         // Migration: a chain's icon. Which setup a listen came out of is the
         // thing this app is about, and a name in a dropdown is a poor way to
         // recognise one at a glance.

@@ -316,7 +316,12 @@ impl Database {
                 -- inferred: turning it on lets a client write to the owner's
                 -- permanent Last.fm/ListenBrainz record, which is not a decision
                 -- to make on their behalf.
-                imports_are_live BOOLEAN DEFAULT FALSE
+                imports_are_live BOOLEAN DEFAULT FALSE,
+                -- The `user_sources` row this token was made for, when it was
+                -- made on a source (a Navidrome plugin token). Its existence is
+                -- what puts that source in plugin mode: the engine stops
+                -- polling it and listens arrive through the token instead.
+                source_ref INTEGER
             )",
         )
         .await?;

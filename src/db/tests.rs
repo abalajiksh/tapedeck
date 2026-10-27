@@ -3602,6 +3602,58 @@ async fn several_sources_of_one_kind_coexist() {
     assert!(left.iter().any(|s| s.id == nav));
 }
 
+/// A token made on a source takes it out of polling; removing the token, or
+/// the source, puts things back. The token names its source on validation,
+/// which is what lets ingest file the plugin's listens under that server.
+#[tokio::test]
+async fn a_plugin_token_moves_its_source_from_polling_to_the_plugin() {
+    let db = testdb().await;
+    let uid = db.create_user("lena", None, "x", "user").await.unwrap();
+    let other = db.create_user("mo", None, "x", "user").await.unwrap();
+    let nav = db
+        .create_source(
+            uid,
+            "navidrome",
+            "Pi",
+            true,
+            "http://nd",
+            r#"{"username":"lena","password":"pw"}"#,
+            Some("lena"),
+            None,
+            "{}",
+        )
+        .await
+        .unwrap();
+    assert_eq!(db.list_enabled_sources().await.unwrap().len(), 1);
+    assert_eq!(db.sole_source_of_kind(uid, "navidrome").await.unwrap(), Some(nav));
+
+    let first = db.create_source_token(uid, nav, "Navidrome plugin", "submit").await.unwrap();
+    assert!(db.list_enabled_sources().await.unwrap().is_empty(), "plugin mode is not polled");
+    assert_eq!(db.validate_token(&first).await.unwrap().unwrap().source_ref, Some(nav));
+    assert_eq!(db.source_token(uid, nav).await.unwrap().unwrap().0, "submit");
+
+    // Making another replaces the first rather than adding a second.
+    let second =
+        db.create_source_token(uid, nav, "Navidrome plugin", "submit write").await.unwrap();
+    assert!(db.validate_token(&first).await.unwrap().is_none());
+    assert_eq!(db.source_token(uid, nav).await.unwrap().unwrap().0, "submit write");
+
+    // Someone else can't remove it.
+    assert!(!db.delete_source_tokens(other, nav).await.unwrap());
+    assert!(db.validate_token(&second).await.unwrap().is_some());
+
+    // Removing it goes back to polling.
+    assert!(db.delete_source_tokens(uid, nav).await.unwrap());
+    assert!(db.validate_token(&second).await.unwrap().is_none());
+    assert_eq!(db.list_enabled_sources().await.unwrap().len(), 1);
+
+    // Deleting the source takes its token with it.
+    let third = db.create_source_token(uid, nav, "Navidrome plugin", "submit").await.unwrap();
+    assert!(db.delete_source(uid, nav).await.unwrap());
+    assert!(db.validate_token(&third).await.unwrap().is_none());
+    assert_eq!(db.sole_source_of_kind(uid, "navidrome").await.unwrap(), None);
+}
+
 #[tokio::test]
 async fn a_listen_remembers_which_source_produced_it() {
     let db = testdb().await;

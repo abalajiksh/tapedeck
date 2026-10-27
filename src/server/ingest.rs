@@ -352,7 +352,7 @@ fn truthy(v: &Option<String>) -> bool {
 )]
 pub async fn submit_listens(
     State(state): State<Arc<AppState>>,
-    IngestAuth { user, token_chain_id, token_id, imports_are_live }: IngestAuth,
+    IngestAuth { user, token_chain_id, token_id, imports_are_live, source_ref: token_source }: IngestAuth,
     Query(q): Query<SubmitQuery>,
     Json(body): Json<SubmitListensRequest>,
 ) -> impl IntoResponse {
@@ -393,6 +393,9 @@ pub async fn submit_listens(
     let mut rejected: Vec<RejectedListen> = Vec::new();
     let mut previews: Vec<DryRunListen> = Vec::new();
     let mut failed = 0u32; // listens we could not persist (DB error) — triggers a retryable response
+                           // The user's one Navidrome source, looked up once per batch and only if a
+                           // listen from an unlinked token asks.
+    let mut sole_navidrome: Option<Option<i64>> = None;
 
     for (index, listen) in body.payload.iter().enumerate() {
         let timestamp = match body.listen_type {
@@ -498,6 +501,41 @@ pub async fn submit_listens(
                 .filter(|s| !s.is_empty())
                 .map(str::to_uppercase),
         };
+
+        // A plugin inside Navidrome names the file it played. Stored under the
+        // same identity the Navidrome poller gives a listen, so the cover proxy,
+        // AMAI and the artwork backfill read its library id with no special
+        // case. Only when we know which server the id belongs to — a library id
+        // aimed at no source would pre-empt Deezer and Cover Art Archive with a
+        // proxy URL that can only 404.
+        let mut library_ref = None;
+        let song_id = info_ref
+            .and_then(|ai| ai.tapedeck_source.as_ref())
+            .and_then(|s| s.navidrome_song_id())
+            .filter(|_| !info_ref.and_then(|ai| ai.skipped).unwrap_or(false));
+        if let Some(song_id) = song_id {
+            let source = match token_source {
+                Some(id) => Some(id),
+                None => {
+                    if sole_navidrome.is_none() {
+                        sole_navidrome = Some(
+                            state
+                                .db
+                                .sole_source_of_kind(user.user_id, "navidrome")
+                                .await
+                                .ok()
+                                .flatten(),
+                        );
+                    }
+                    sole_navidrome.flatten()
+                }
+            };
+            if let Some(id) = source {
+                play.source_id = format!("navidrome-{song_id}-{timestamp}");
+                play.source_name = "navidrome".into();
+                library_ref = Some(id);
+            }
+        }
 
         // MusicBrainz enrichment is NOT done inline for stored listens — it's a
         // rate-limited network call, so doing it per-listen would make a bulk
@@ -767,7 +805,8 @@ pub async fn submit_listens(
                         None,
                         listening_context.as_deref(),
                         Some(submission_client),
-                        None, // pushed by a client, not pulled from a configured source
+                        // Set only when a plugin named its library item above.
+                        library_ref,
                         disposition,
                     )
                     .await

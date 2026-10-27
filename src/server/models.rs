@@ -174,6 +174,8 @@ pub struct AdditionalInfo {
     pub tapedeck_session: Option<TapedeckSession>,
     #[serde(default, deserialize_with = "lenient")]
     pub tapedeck_playback: Option<TapedeckPlayback>,
+    #[serde(default, deserialize_with = "lenient")]
+    pub tapedeck_source: Option<TapedeckSource>,
 }
 
 /// The schema of a field that takes a number or a numeric string.
@@ -478,6 +480,36 @@ impl TapedeckPlayback {
     /// Whether the listener has paused. Only an explicit `paused` counts.
     pub fn is_paused(&self) -> bool {
         self.state.as_deref().map(str::trim).is_some_and(|s| s.eq_ignore_ascii_case("paused"))
+    }
+}
+
+/// `additional_info.tapedeck_source` — which library item was played, from a
+/// plugin running inside the media server (the Navidrome plugin today).
+///
+/// Only read when the submitting token was made on a Navidrome source, or the
+/// user has exactly one: the id means nothing without knowing which server it
+/// belongs to. The listen is then stored as if that source had polled it, so
+/// the cover proxy and everything else that reads a library id works as-is.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct TapedeckSource {
+    /// `navidrome`. Anything else is ignored.
+    pub kind: Option<String>,
+    /// The library's own id for the played track (Navidrome's media file id).
+    pub song_id: Option<String>,
+}
+
+impl TapedeckSource {
+    /// The Navidrome song id, when this names one that is safe to hand back to
+    /// Navidrome as a Subsonic id. A client-supplied string, so it is checked.
+    pub fn navidrome_song_id(&self) -> Option<&str> {
+        if self.kind.as_deref().map(str::trim) != Some("navidrome") {
+            return None;
+        }
+        let id = self.song_id.as_deref()?.trim();
+        (!id.is_empty()
+            && id.len() <= 128
+            && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'))
+        .then_some(id)
     }
 }
 
@@ -824,5 +856,21 @@ mod tests {
         let m = meta.mbid_mapping.unwrap();
         assert_eq!(m.recording_mbid.as_deref(), Some("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"));
         assert_eq!(m.caa_id, Some(42));
+    }
+
+    /// The song id goes back to Navidrome as a Subsonic id, so only the shapes
+    /// Navidrome issues get through, and only under `kind: navidrome`.
+    #[test]
+    fn a_tapedeck_source_names_a_song_only_when_it_is_a_plain_navidrome_id() {
+        let src = |kind: &str, id: &str| TapedeckSource {
+            kind: Some(kind.into()),
+            song_id: Some(id.into()),
+        };
+        assert_eq!(src("navidrome", " 2f8aB_c-1 ").navidrome_song_id(), Some("2f8aB_c-1"));
+        assert_eq!(src("plex", "abc").navidrome_song_id(), None);
+        assert_eq!(src("navidrome", "").navidrome_song_id(), None);
+        assert_eq!(src("navidrome", "../rest/deleteUser").navidrome_song_id(), None);
+        assert_eq!(src("navidrome", "a&u=admin").navidrome_song_id(), None);
+        assert_eq!(src("navidrome", &"a".repeat(129)).navidrome_song_id(), None);
     }
 }
