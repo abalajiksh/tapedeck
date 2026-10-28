@@ -13,6 +13,7 @@
 	import StatStrip from '$lib/components/StatStrip.svelte';
 	import BioCard from '$lib/components/BioCard.svelte';
 	import BarChart from '$lib/components/BarChart.svelte';
+	import ArtistDossier from '$lib/components/ArtistDossier.svelte';
 	import AlbumCard from '$lib/components/AlbumCard.svelte';
 
 	let artist: ArtistView | null = null;
@@ -99,12 +100,27 @@
 		}
 	}
 
+	// Your history with them. Loaded after the page rather than with it: it
+	// walks the whole history, and the page should not wait on that to show
+	// the artist's name.
+	let dossier: import('$lib/api').ArtistDossier | null = null;
+	async function loadDossier(forId: number) {
+		try {
+			const d = await api.getArtistDossier(forId);
+			if (forId === id) dossier = d;
+		} catch {
+			dossier = null;
+		}
+	}
+
 	async function load() {
 		loading = true;
 		error = '';
+		dossier = null;
 		try {
 			artist = await api.getArtist(id);
 			void loadPatchContext(artist.name);
+			void loadDossier(id);
 		} catch (e) {
 			error = e instanceof Error ? e.message : 'Could not load this artist';
 		}
@@ -226,6 +242,10 @@
 	{#if artist.trend.length > 1}
 		<h3 class="h-display" style="font-size:20px;margin:0 0 12px;">Plays by year</h3>
 		<div style="margin-bottom:14px;"><BarChart bars={artist.trend} /></div>
+	{/if}
+
+	{#if dossier && dossier.plays >= 3}
+		<ArtistDossier d={dossier} name={artist.name} />
 	{/if}
 
 	<!--

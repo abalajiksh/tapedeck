@@ -1720,6 +1720,43 @@ export interface PictureChoices {
 	unreachable: string[];
 }
 
+/** A day of yours with one artist. `date` is local `YYYY-MM-DD`; lay out by
+ *  it, not by `day`, which a browser in another zone would misplace. */
+export interface DossierDay {
+	day: number;
+	date: string;
+	/** Their listens that day. */
+	plays: number;
+	/** Every listen that day — what `plays` is a share of. */
+	all: number;
+}
+
+/** Your history with one artist (`GET /api/v1/artists/:id/dossier`). Every
+ *  count of theirs comes with everyone's over the same skip-free window. */
+export interface ArtistDossier {
+	plays: number;
+	all_plays: number;
+	days: number;
+	all_days: number;
+	first: number | null;
+	last: number | null;
+	/** Local `YYYY-MM-DD` their two-week average climbed fastest. */
+	took_off: string | null;
+	habit: { return_rate: number; span_coverage: number; top_day_share: number; score: number } | null;
+	daily: DossierDay[];
+	months: { month: string; plays: number; all: number }[];
+	/** 7 × 24, Sunday-first rows. */
+	clock: number[][];
+	week_start: number;
+	top_days: DossierDay[];
+	runs: { length: number; start: number; end: number }[];
+	playthroughs: { album: string; start: number; date: string; first_track: number; last_track: number }[];
+	months_at_top: { periods: number; of: number };
+	weeks_at_top: { periods: number; of: number };
+	/** Only the most recent part of a longer history was read. */
+	capped: boolean;
+}
+
 export interface ArtistView {
 	id: number;
 	name: string;
@@ -3731,6 +3768,9 @@ class TapedeckAPI {
 	// ── Album & artist pages ──
 	async getAlbum(id: number): Promise<AlbumView> { return this.get(`/api/v1/albums/${id}`); }
 	async getArtist(id: number): Promise<ArtistView> { return this.get(`/api/v1/artists/${id}`); }
+	async getArtistDossier(id: number): Promise<ArtistDossier> {
+		return this.get(`/api/v1/artists/${id}/dossier`);
+	}
 	/** The record as MusicBrainz has it, including tracks never played. 404s when
 	 *  MusicBrainz has no matching release, which is normal for a great deal of a
 	 *  real library and is not an error worth shouting about. */

@@ -3,6 +3,7 @@ mod analytics;
 mod config;
 mod crypto;
 mod db;
+mod dossier;
 mod engine;
 mod enrich;
 mod everynoise;

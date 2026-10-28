@@ -990,7 +990,7 @@ async fn user_tz(state: &AppState, user_id: i64) -> chrono_tz::Tz {
 /// Defaults to Monday, which is ISO-8601 and what most of the world means by
 /// "this week". Last.fm runs its charts Friday to Friday, which is exactly why
 /// this is a preference rather than a constant.
-async fn user_week_start(state: &AppState, user_id: i64) -> u32 {
+pub(crate) async fn user_week_start(state: &AppState, user_id: i64) -> u32 {
     state
         .db
         .get_preferences(user_id)

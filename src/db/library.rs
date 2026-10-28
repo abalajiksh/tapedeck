@@ -170,6 +170,65 @@ impl Database {
         rows.iter_mut().for_each(|r| r.resolve_cover());
         Ok(rows)
     }
+    /// What an artist page's history section walks: the newest `cap`
+    /// skip-free listens in time order, each marked for whether it credits
+    /// `artist`, and every credit over the same window for "number one". The
+    /// flag says the history is longer than the cap.
+    ///
+    /// The whole sequence rather than only this artist's listens, because a
+    /// run is broken by somebody else and a share needs everybody — over the
+    /// same listens, skip-free on both sides.
+    pub async fn artist_dossier_rows(
+        &self,
+        user_id: i64,
+        artist: &str,
+        cap: i64,
+    ) -> Result<(Vec<crate::dossier::Listen>, Vec<crate::dossier::Credit>, bool), sqlx::Error> {
+        let key = artist.trim().to_lowercase();
+        let mut rows: Vec<(i64, i32, Option<String>, Option<i32>)> =
+            sqlx::query_as(&crate::sql!(&format!(
+                "SELECT s.timestamp, CASE WHEN {CREDITS_ARTIST} THEN 1 ELSE 0 END,
+                        s.album, s.track_number
+                   FROM scrobbles s
+                  WHERE s.user_id = ? AND s.skipped = FALSE
+                  ORDER BY s.timestamp DESC LIMIT ?"
+            )))
+            .bind(&key)
+            .bind(user_id)
+            .bind(cap + 1)
+            .fetch_all(&self.pool)
+            .await?;
+        let capped = rows.len() as i64 > cap;
+        rows.truncate(cap.max(0) as usize);
+        rows.reverse();
+        let since = rows.first().map(|r| r.0).unwrap_or(0);
+
+        let credits: Vec<(i64, String)> = sqlx::query_as(&crate::sql!(
+            "SELECT s.timestamp, sa.artist_key
+               FROM scrobbles s JOIN scrobble_artists sa ON sa.scrobble_id = s.id
+              WHERE s.user_id = ? AND s.skipped = FALSE AND s.timestamp >= ?"
+        ))
+        .bind(user_id)
+        .bind(since)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok((
+            rows.into_iter()
+                .map(|(ts, mine, album, track_number)| crate::dossier::Listen {
+                    ts,
+                    mine: mine != 0,
+                    album,
+                    track_number,
+                })
+                .collect(),
+            credits
+                .into_iter()
+                .map(|(ts, artist_key)| crate::dossier::Credit { ts, artist_key })
+                .collect(),
+            capped,
+        ))
+    }
     /// Headline numbers for one artist, plus their share of everything.
     pub async fn artist_summary(
         &self,
