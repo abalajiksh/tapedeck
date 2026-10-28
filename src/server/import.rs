@@ -1247,12 +1247,13 @@ fn listen_to_play(l: &serde_json::Value) -> Option<ImportedListen> {
         .filter(|v: &Vec<String>| !v.is_empty());
     p.caa_id = mapping["caa_id"].as_i64();
     p.caa_release_mbid = str_of(&mapping["caa_release_mbid"]);
-    p.duration = info["duration_ms"]
-        .as_i64()
+    p.duration = lenient_number(&info["duration_ms"])
         .map(|ms| (ms / 1000).max(0) as u64)
-        .or_else(|| info["duration"].as_i64().map(|s| s.max(0) as u64));
-    p.track_number =
-        info["tracknumber"].as_i64().or_else(|| info["track_number"].as_i64()).map(|n| n as i32);
+        .or_else(|| lenient_number(&info["duration"]).map(|s| s.max(0) as u64));
+    p.track_number = lenient_number(&info["tracknumber"])
+        .or_else(|| lenient_number(&info["track_number"]))
+        .and_then(|n| i32::try_from(n).ok())
+        .filter(|n| *n > 0);
 
     if let Some(credit) = structured_credit(&p.artist, mapping) {
         p.artist = credit[0].0.clone();
@@ -1296,6 +1297,19 @@ fn listen_to_play(l: &serde_json::Value) -> Option<ImportedListen> {
         listen.provenance.spotify_track_id = Some(track_id);
     }
     Some(listen)
+}
+
+/// A number a client may have sent as a number or as text — the rule
+/// `lenient_track_number` applies to live submissions, so an archive of those
+/// same listens reads the same. fooyin sends `"tracknumber": "1"`; read as a
+/// number only, every one of its listens lost its track number on import, and
+/// with it every album playthrough. `"3/12"` is a real tag spelling and gives
+/// 3; a vinyl `"A1"` gives nothing.
+fn lenient_number(v: &serde_json::Value) -> Option<i64> {
+    v.as_i64().or_else(|| {
+        let s = v.as_str()?.trim();
+        s.split('/').next().unwrap_or(s).trim().parse().ok()
+    })
 }
 
 /// A Spotify play that reached ListenBrainz through its Spotify importer:
@@ -1818,6 +1832,21 @@ mod tests {
         let held = listens(&db, uid).await;
         assert_eq!(held.len(), 1, "{held:?}");
         assert_eq!(held[0].0, 1713148240);
+    }
+
+    /// fooyin's track numbers are strings, and a tag may carry the total.
+    #[test]
+    fn a_track_number_sent_as_text_is_kept() {
+        let line = |n: &str| {
+            format!(
+                r#"{{"listened_at": 1774511157, "track_metadata": {{"track_name": "Somnambule", "artist_name": "Cœur de pirate", "additional_info": {{"duration_ms": "182000", "tracknumber": {n}, "media_player": "fooyin"}}}}}}"#
+            )
+        };
+        let p = &parse_listens(&line(r#""1""#)).unwrap()[0].play;
+        assert_eq!((p.track_number, p.duration), (Some(1), Some(182)));
+        assert_eq!(parse_listens(&line(r#""3/12""#)).unwrap()[0].play.track_number, Some(3));
+        assert_eq!(parse_listens(&line(r#""A1""#)).unwrap()[0].play.track_number, None);
+        assert_eq!(parse_listens(&line("0")).unwrap()[0].play.track_number, None);
     }
 
     /// A listen with no mapping at all still imports — most of anyone's older
