@@ -3711,6 +3711,50 @@ paths:
       - apiToken:
         - read
       - sessionCookie: []
+  /api/v1/artists/{id}/dossier:
+    get:
+      tags:
+      - Library
+      summary: Your history with one artist.
+      description: |-
+        Scope: `read`. When they took off, whether they are a habit or a burst,
+        the days, months and hours they were played, their longest runs and
+        album playthroughs, and how often they were your number one. Local days and
+        weeks, by your timezone and week start.
+
+        Every count of their listens comes with the count of all listens over the
+        same window, both skip-free; `capped` says that window is the most recent
+        part of a history longer than the instance reads for analytics.
+      operationId: artist_dossier
+      parameters:
+      - name: id
+        in: path
+        description: The artist's entity id, from `GET /api/v1/resolve`.
+        required: true
+        schema:
+          type: integer
+          format: int64
+      responses:
+        '200':
+          description: OK.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Dossier'
+        '400':
+          description: That entity is not an artist.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+      security:
+      - apiToken:
+        - read
+      - sessionCookie: []
   /api/v1/charts:
     get:
       tags:
@@ -12654,6 +12698,21 @@ components:
         plays:
           type: integer
           format: int64
+    AtTop:
+      type: object
+      description: Is somebody your number one, and how often.
+      required:
+      - periods
+      - of
+      properties:
+        periods:
+          type: integer
+          format: int64
+          description: Periods in which they had the most listens (ties included).
+        of:
+          type: integer
+          format: int64
+          description: Periods with any listening at all.
     AuthStatus:
       type: object
       description: Whether anyone is signed in here, and whether the instance has been set up.
@@ -13802,6 +13861,31 @@ components:
           type: number
           format: double
           description: Over the listens that carry a score; 0 with none.
+    DayCount:
+      type: object
+      description: A day, as the local midnight it began at (Unix seconds).
+      required:
+      - day
+      - date
+      - plays
+      - all
+      properties:
+        day:
+          type: integer
+          format: int64
+        date:
+          type: string
+          description: |-
+            The same day as `YYYY-MM-DD` in your timezone. A browser elsewhere
+            would put `day` on the wrong date; lay out by this.
+        plays:
+          type: integer
+          format: int64
+          description: Their listens that day.
+        all:
+          type: integer
+          format: int64
+          description: Every listen that day — the population `plays` is a share of.
     DeckChain:
       type: object
       description: One chain a deck publishes.
@@ -14152,6 +14236,113 @@ components:
           type: array
           items:
             $ref: '#/components/schemas/DiscoverDeck'
+    Dossier:
+      type: object
+      required:
+      - plays
+      - all_plays
+      - days
+      - all_days
+      - daily
+      - months
+      - clock
+      - week_start
+      - top_days
+      - runs
+      - playthroughs
+      - months_at_top
+      - weeks_at_top
+      - capped
+      properties:
+        plays:
+          type: integer
+          format: int64
+          description: Their skip-free listens in the window.
+        all_plays:
+          type: integer
+          format: int64
+          description: Everyone's — the population every share here is of.
+        days:
+          type: integer
+          format: int64
+          description: Local days they were played on.
+        all_days:
+          type: integer
+          format: int64
+          description: Local days with any listening.
+        first:
+          type:
+          - integer
+          - 'null'
+          format: int64
+        last:
+          type:
+          - integer
+          - 'null'
+          format: int64
+        took_off:
+          type:
+          - string
+          - 'null'
+          description: |-
+            The local day (`YYYY-MM-DD`) their two-week average climbed fastest.
+            Absent under twenty listens, or if it never climbed.
+        habit:
+          oneOf:
+          - type: 'null'
+          - $ref: '#/components/schemas/Habit'
+            description: Absent under five listens, where there is no pattern to score.
+        daily:
+          type: array
+          items:
+            $ref: '#/components/schemas/DayCount'
+          description: Every day they were played, oldest first.
+        months:
+          type: array
+          items:
+            $ref: '#/components/schemas/MonthShare'
+          description: |-
+            Every month from their first to the last of the history, oldest first,
+            including months they were not played in.
+        clock:
+          type: array
+          items:
+            type: array
+            items:
+              type: integer
+              format: int64
+          description: |-
+            7 × 24, rows Sunday first like the Statistics heatmap; the page
+            rotates them by `week_start`.
+        week_start:
+          type: integer
+          format: int32
+          description: First day of the week, 0 = Sunday.
+          minimum: 0
+        top_days:
+          type: array
+          items:
+            $ref: '#/components/schemas/DayCount'
+          description: Their five biggest days.
+        runs:
+          type: array
+          items:
+            $ref: '#/components/schemas/Run'
+          description: The three longest runs, longest first.
+        playthroughs:
+          type: array
+          items:
+            $ref: '#/components/schemas/Playthrough'
+          description: Up to ten, most tracks first.
+        months_at_top:
+          $ref: '#/components/schemas/AtTop'
+        weeks_at_top:
+          $ref: '#/components/schemas/AtTop'
+        capped:
+          type: boolean
+          description: |-
+            The instance caps analytics reads and this history is longer than the
+            cap: everything above describes only the most recent part of it.
     DryRunListen:
       type: object
       description: One listen's resolved state, computed and thrown away.
@@ -15256,6 +15447,35 @@ components:
       enum:
       - sound
       - habit
+    Habit:
+      type: object
+      description: |-
+        A daily habit or a burst? The `musical_personality` loyalty score for this
+        one artist, with the three things it is made of.
+      required:
+      - return_rate
+      - span_coverage
+      - top_day_share
+      - score
+      properties:
+        return_rate:
+          type: number
+          format: double
+          description: |-
+            Days they were played, over the days from their first listen to their
+            last.
+        span_coverage:
+          type: number
+          format: double
+          description: How much of the whole window those first and last listens span.
+        top_day_share:
+          type: number
+          format: double
+          description: The share of their listens that fell on their single biggest day.
+        score:
+          type: number
+          format: double
+          description: 0–100; high is a habit, low a burst.
     HandOver:
       type: object
       required:
@@ -17677,6 +17897,22 @@ components:
           description: |-
             Every release the listens claim, most-claimed first, so the operator can
             pick a different one than the plurality.
+    MonthShare:
+      type: object
+      required:
+      - month
+      - plays
+      - all
+      properties:
+        month:
+          type: string
+          description: '`YYYY-MM`, local.'
+        plays:
+          type: integer
+          format: int64
+        all:
+          type: integer
+          format: int64
     MostSkipped:
       type: object
       required:
@@ -19539,6 +19775,32 @@ components:
           description: |-
             The recording's ISRC. Filled from the history when absent, and where a
             target can look one up no name matching is needed at all.
+    Playthrough:
+      type: object
+      description: |-
+        One of their records played in order — track N, then N+1, … — in one
+        sitting.
+      required:
+      - album
+      - start
+      - date
+      - first_track
+      - last_track
+      properties:
+        album:
+          type: string
+        start:
+          type: integer
+          format: int64
+        date:
+          type: string
+          description: Local `YYYY-MM-DD` of `start`.
+        first_track:
+          type: integer
+          format: int32
+        last_track:
+          type: integer
+          format: int32
     PlexAccount:
       type: object
       description: |-
@@ -21262,6 +21524,25 @@ components:
         status:
           type: string
           description: '`updated`.'
+    Run:
+      type: object
+      description: |-
+        Their listens back to back, nobody else in between and no half-hour
+        silence.
+      required:
+      - length
+      - start
+      - end
+      properties:
+        length:
+          type: integer
+          minimum: 0
+        start:
+          type: integer
+          format: int64
+        end:
+          type: integer
+          format: int64
     SanitisePreview:
       type: object
       description: What the sanitiser would change. Nothing has been changed.

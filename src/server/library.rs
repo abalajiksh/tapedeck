@@ -527,6 +527,57 @@ pub async fn artist_detail(
         .into_response()
 }
 
+// ── GET /api/v1/artists/:id/dossier ──
+
+/// Your history with one artist.
+///
+/// Scope: `read`. When they took off, whether they are a habit or a burst,
+/// the days, months and hours they were played, their longest runs and
+/// album playthroughs, and how often they were your number one. Local days and
+/// weeks, by your timezone and week start.
+///
+/// Every count of their listens comes with the count of all listens over the
+/// same window, both skip-free; `capped` says that window is the most recent
+/// part of a history longer than the instance reads for analytics.
+#[utoipa::path(
+    get,
+    path = "/api/v1/artists/{id}/dossier",
+    tag = "Library",
+    security(("apiToken" = ["read"]), ("sessionCookie" = [])),
+    params(("id" = i64, Path, description = "The artist's entity id, from `GET /api/v1/resolve`.")),
+    responses(
+        (status = 200, description = "OK.", body = crate::dossier::Dossier),
+        (status = 400, description = "That entity is not an artist.", body = ErrorResponse),
+        (status = 401, response = Unauthorized),
+        (status = 404, response = NotFound),
+    )
+)]
+pub async fn artist_dossier(
+    State(state): State<Arc<AppState>>,
+    ReadAuth { user }: ReadAuth,
+    Path(id): Path<i64>,
+) -> impl IntoResponse {
+    let entity = match state.db.get_entity(id).await {
+        Ok(Some(e)) if e.kind == "artist" => e,
+        Ok(Some(_)) => return err(StatusCode::BAD_REQUEST, "That entity is not an artist"),
+        Ok(None) => return not_found("Artist"),
+        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    };
+    let (listens, credits, capped) = match state
+        .db
+        .artist_dossier_rows(user.user_id, &entity.name, state.analytics_row_cap)
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    };
+    let tz = super::scrobbles::user_tz_for(&state, user.user_id).await;
+    let week_start = super::scrobbles::user_week_start(&state, user.user_id).await;
+    let key = entity.name.trim().to_lowercase();
+    let dossier = crate::dossier::compute(&listens, &credits, &key, tz, week_start, capped);
+    (StatusCode::OK, Json(dossier)).into_response()
+}
+
 // ── GET /api/v1/charts ──
 
 #[derive(Debug, Deserialize, IntoParams)]
@@ -800,7 +851,7 @@ pub struct AlbumTracklist {
 }
 
 #[derive(utoipa::OpenApi)]
-#[openapi(paths(album_detail, album_tracklist, artist_detail, charts, resolve))]
+#[openapi(paths(album_detail, album_tracklist, artist_detail, artist_dossier, charts, resolve))]
 pub struct Api;
 
 pub fn create_library_router() -> Router<Arc<AppState>> {
@@ -810,4 +861,5 @@ pub fn create_library_router() -> Router<Arc<AppState>> {
         .route("/api/v1/albums/:id", get(album_detail))
         .route("/api/v1/albums/:id/tracklist", get(album_tracklist))
         .route("/api/v1/artists/:id", get(artist_detail))
+        .route("/api/v1/artists/:id/dossier", get(artist_dossier))
 }
