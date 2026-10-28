@@ -1705,6 +1705,10 @@ mod tests {
         assert!(p.artists.is_none());
     }
 
+    // These run the real import against a scratch SQLite file, so like
+    // `db::tests` they are compiled out of the Postgres build, where
+    // `Database` is a Postgres pool and a `sqlite:` URL is refused.
+    #[cfg(not(feature = "postgres"))]
     async fn scratch_db() -> Database {
         let path =
             std::env::temp_dir().join(format!("td-import-{}-{}.db", std::process::id(), job_id()));
@@ -1716,6 +1720,7 @@ mod tests {
         .unwrap()
     }
 
+    #[cfg(not(feature = "postgres"))]
     fn zipped(name: &str, body: &str) -> Vec<u8> {
         use std::io::Write;
         let mut buf = std::io::Cursor::new(Vec::<u8>::new());
@@ -1728,6 +1733,7 @@ mod tests {
         buf.into_inner()
     }
 
+    #[cfg(not(feature = "postgres"))]
     async fn listens(db: &Database, uid: i64) -> Vec<(i64, String, Option<String>)> {
         let mut rows = db.get_all_scrobbles(uid).await.unwrap();
         rows.sort_by_key(|r| r.id);
@@ -1736,6 +1742,7 @@ mod tests {
 
     /// The path a person takes: both real archives through the real runners,
     /// in both orders. Either way the play is held once, at its start.
+    #[cfg(not(feature = "postgres"))]
     #[tokio::test]
     async fn the_same_play_from_both_archives_is_one_listen_in_either_order() {
         let spotify = zipped(
@@ -1762,6 +1769,7 @@ mod tests {
     /// A history the old importer doubled: the Spotify play, and the relayed
     /// copy filed at its end under `import`. Re-importing the archive must not
     /// add a third; the repair then removes the copy and keeps what it knew.
+    #[cfg(not(feature = "postgres"))]
     #[tokio::test]
     async fn a_history_imported_before_the_fix_is_repaired_not_tripled() {
         let db = scratch_db().await;
@@ -1818,6 +1826,7 @@ mod tests {
     /// The archive alone, imported before and again after the fix: the old row
     /// is at the play's end, a whole play from where the listen now lands,
     /// and only the key it was filed under can find it.
+    #[cfg(not(feature = "postgres"))]
     #[tokio::test]
     async fn re_importing_an_archive_finds_what_the_old_importer_wrote() {
         let db = scratch_db().await;
