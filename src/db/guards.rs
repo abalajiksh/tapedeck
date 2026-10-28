@@ -59,6 +59,12 @@ const EXEMPT: &[(&str, &str)] = &[
                            is a parameter so a skip cannot swallow a real \
                            listen, and neither can erase the other",
     ),
+    (
+        "relay_candidates",
+        "finds Spotify plays held twice; a copy of a play the \
+                          export calls a skip is the pair that was counting a \
+                          skip as a listen, so skips must be read",
+    ),
     // ── Identity lookups: which record is this, not how much was played ───
     (
         "get_scrobble",
@@ -125,7 +131,7 @@ const EXEMPT: &[(&str, &str)] = &[
                                 old classifier misparsed; leaving a skip wrong \
                                 would make two stored columns disagree",
     ),
-    ("enrich_existing", "fills metadata on a listen already matched by identity"),
+    ("sparse_columns", "reads the blanks of a listen already matched by identity, to merge into"),
     ("get_all_scrobbles", "the backup: it must carry everything, skips included"),
     // ── Sessions: selected by session_id, which a skip never has ──────────
     (

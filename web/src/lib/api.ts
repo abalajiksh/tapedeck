@@ -2119,6 +2119,33 @@ export interface PlaylistPushResult {
 	updated_existing?: boolean;
 }
 
+/** Spotify plays held twice — once from the Spotify export, once from a
+ *  ListenBrainz archive that had relayed the same export. Nothing changed. */
+export interface SpotifyDuplicates {
+	/** Pass back to remove them. */
+	copies: number;
+	/** Copies of plays Spotify's own export calls skips. */
+	of_skips: number;
+	by_year: { year: number; copies: number }[];
+	/** The first fifty, oldest first. */
+	sample: {
+		copy_id: number;
+		kept_id: number;
+		title: string;
+		artist: string;
+		copy_at: number;
+		kept_at: number;
+		kept_is_skip: boolean;
+	}[];
+}
+
+export interface SpotifyDuplicatesRemoved {
+	removed: number;
+	/** Left alone: both copies carry a liner note. */
+	kept_for_notes: number;
+	notes_moved: number;
+}
+
 export interface SanitizePreview {
 	/** Albums whose listens disagree about which release they are. */
 	mixed_albums: MixedAlbum[];
@@ -3045,6 +3072,15 @@ class TapedeckAPI {
 		split_edits?: { title: string; album: string; from: string; to: string }[];
 	}): Promise<SanitizeResult> {
 		return this.post('/api/v1/sanitize', opts);
+	}
+
+	async spotifyDuplicates(): Promise<SpotifyDuplicates> {
+		return this.get('/api/v1/import/spotify-duplicates');
+	}
+	/** `copies` is the preview's count; a different count now is a 409 and
+	 *  removes nothing. */
+	async removeSpotifyDuplicates(copies: number): Promise<SpotifyDuplicatesRemoved> {
+		return this.post('/api/v1/import/spotify-duplicates', { copies });
 	}
 
 	// ── Rediscovery ──
