@@ -82,7 +82,7 @@ info:
   license:
     name: AGPL-3.0-or-later
     identifier: AGPL-3.0-or-later
-  version: 0.125.0
+  version: 0.125.1
 servers:
 - url: /
   description: The Tapedeck instance serving this document.
@@ -6945,6 +6945,63 @@ paths:
                 $ref: '#/components/schemas/ImportHistory'
         '401':
           $ref: '#/components/responses/Unauthorized'
+  /api/v1/import/spotify-duplicates:
+    get:
+      tags:
+      - Maintenance
+      summary: Spotify plays held twice — preview.
+      description: |-
+        A history imported from a Spotify export **and** from a ListenBrainz
+        archive whose listens ListenBrainz had itself imported from Spotify holds
+        most of those plays twice: the archive stamped each at its end, the export
+        at its start, one whole play apart. Importing no longer does this; this
+        finds what earlier imports left. Nothing is changed.
+      operationId: spotify_duplicates_preview
+      responses:
+        '200':
+          description: What would be removed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RelayedPreview'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+    post:
+      tags:
+      - Maintenance
+      summary: Spotify plays held twice — remove.
+      description: |-
+        Deletes the copies the preview listed, after filling in anything each
+        knew that the play it duplicates did not (never overwriting). A liner note
+        on a copy moves to the kept play; a pair where both carry one is left.
+
+        **`copies` must equal what a preview would say now.** If the history
+        changed since the preview, nothing is removed and the answer is `409` with
+        the current count — what would go is no longer what was shown.
+      operationId: spotify_duplicates_remove
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RemoveSpotifyDuplicates'
+        required: true
+      responses:
+        '200':
+          description: Removed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RelayedApplied'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '409':
+          description: The count no longer matches; preview again.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
   /api/v1/playlist-targets:
     get:
       tags:
@@ -21072,6 +21129,106 @@ components:
           minimum: 0
         reason:
           type: string
+    RelayedApplied:
+      type: object
+      description: What the repair did.
+      required:
+      - removed
+      - kept_for_notes
+      - notes_moved
+      properties:
+        removed:
+          type: integer
+          description: Copies deleted.
+          minimum: 0
+        kept_for_notes:
+          type: integer
+          description: |-
+            Copies left in place because both they and the play they duplicate
+            carry a liner note, and a note cannot be merged.
+          minimum: 0
+        notes_moved:
+          type: integer
+          description: Liner notes moved from a copy onto the play it duplicated.
+          minimum: 0
+    RelayedCopy:
+      type: object
+      description: One copy and the play it duplicates.
+      required:
+      - copy_id
+      - kept_id
+      - title
+      - artist
+      - copy_at
+      - kept_at
+      - kept_is_skip
+      properties:
+        copy_id:
+          type: integer
+          format: int64
+          description: The listen that would be removed.
+        kept_id:
+          type: integer
+          format: int64
+          description: The Spotify play it duplicates, which stays.
+        title:
+          type: string
+        artist:
+          type: string
+        copy_at:
+          type: integer
+          format: int64
+          description: When the copy says the play happened — its end. Unix seconds.
+        kept_at:
+          type: integer
+          format: int64
+          description: When the play started, from the Spotify export. Unix seconds.
+        kept_is_skip:
+          type: boolean
+          description: |-
+            Spotify's own record calls this play a skip, so the copy was counting
+            a skip as a listen.
+    RelayedPreview:
+      type: object
+      description: What the repair would remove. Nothing has been changed.
+      required:
+      - copies
+      - of_skips
+      - by_year
+      - sample
+      properties:
+        copies:
+          type: integer
+          description: Listens that are relayed copies. Pass this back to apply.
+          minimum: 0
+        of_skips:
+          type: integer
+          description: |-
+            Of those, copies of plays Spotify's export calls skips: they were
+            counting as listens.
+          minimum: 0
+        by_year:
+          type: array
+          items:
+            $ref: '#/components/schemas/RelayedYear'
+        sample:
+          type: array
+          items:
+            $ref: '#/components/schemas/RelayedCopy'
+          description: The first fifty, oldest first.
+    RelayedYear:
+      type: object
+      description: Copies per year, by the kept play's year in UTC.
+      required:
+      - year
+      - copies
+      properties:
+        year:
+          type: integer
+          format: int32
+        copies:
+          type: integer
+          minimum: 0
     ReleaseCandidate:
       type: object
       description: One release an album's listens claim to be, and how many say so.
@@ -21084,6 +21241,18 @@ components:
         plays:
           type: integer
           format: int64
+    RemoveSpotifyDuplicates:
+      type: object
+      description: 'What to remove: the preview''s count, said back.'
+      properties:
+        copies:
+          type:
+          - integer
+          - 'null'
+          description: |-
+            `copies` from the preview. **Required** — this deletes listens, so
+            an empty body is refused rather than read as "all of them".
+          minimum: 0
     Reports:
       type: object
       description: A feed of period cards, newest first.

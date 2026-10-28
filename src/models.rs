@@ -294,6 +294,16 @@ pub struct ImportProvenance {
     /// because it is the only external identifier that export carries and the
     /// alternative to keeping it is asking for the zip a second time.
     pub spotify_track_id: Option<String>,
+    /// The `source_id` an older importer gave this same listen, when it gave
+    /// it a different one.
+    ///
+    /// A Spotify play relayed through ListenBrainz used to be stored at its
+    /// *end* time under an `import` key; it is now stored at its start under
+    /// the Spotify export's own key. Without this, re-importing an archive
+    /// over a history imported before the change would match neither key —
+    /// the old row sits a whole play away, outside the fuzzy window — and add
+    /// the listen a second time.
+    pub previous_source_id: Option<String>,
 }
 
 /// Does this codec string name a DSD stream?

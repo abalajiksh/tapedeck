@@ -173,13 +173,42 @@ pub fn durations(rows: &[(String, u64, bool)]) -> HashMap<String, u64> {
 }
 
 /// Did this play earn a listen, or is it a skip?
-fn counts_as_listen(ms_played: u64, duration_ms: Option<u64>) -> bool {
+///
+/// Public because a Spotify play reaches us through a second door — a
+/// ListenBrainz archive whose listens were themselves imported from a Spotify
+/// export — and the same play must get the same answer whichever door it came
+/// through. ListenBrainz's own threshold is lower, so copying its verdict
+/// would file as listens 1,941 plays this export calls skips.
+pub fn counts_as_listen(ms_played: u64, duration_ms: Option<u64>) -> bool {
     match duration_ms {
         Some(d) if d > 0 => {
             ms_played as f64 >= d as f64 * SCROBBLE_FRACTION || ms_played >= SCROBBLE_AFTER_MS
         }
         _ => ms_played >= MIN_PLAY_MS,
     }
+}
+
+/// When a play began, from when it ended and how long it ran.
+///
+/// The export's `ts` is the **end** of the play. Round rather than truncate:
+/// that seconds-resolution `ts` is already up to a second away from the real
+/// boundary, and rounding halves the error rather than always leaning one way.
+///
+/// Shared with the ListenBrainz import, which meets the same plays stamped at
+/// their end, and must land them on exactly this second — the two copies are
+/// matched on it.
+pub fn start_of_play(end: i64, ms_played: u64) -> i64 {
+    end - ((ms_played + 500) / 1000) as i64
+}
+
+/// The stable key of one Spotify play: the same play, imported from the
+/// export or relayed through ListenBrainz, must produce the same string.
+///
+/// The track id alone would collide on every repeat, and the timestamp alone
+/// on anything played simultaneously on two devices — which this export does
+/// contain.
+pub fn play_source_id(track_id: &str, start: i64) -> String {
+    format!("spotify-{track_id}-{start}")
 }
 
 /// Parse every history file of an export together.
@@ -246,16 +275,12 @@ pub fn parse<S: AsRef<str>>(files: &[S]) -> Parsed {
         }
 
         let duration_ms = lengths.get(&id).copied();
-        // Round rather than truncate: the export's seconds-resolution `ts` is
-        // already up to a second away from the real boundary, and rounding
-        // halves the error rather than always leaning one way.
-        let played_secs = ((row.ms_played + 500) / 1000) as i64;
 
         entries.push(Entry {
             title,
             artist,
             album: row.master_metadata_album_album_name.filter(|a| !a.trim().is_empty()),
-            timestamp: end - played_secs,
+            timestamp: start_of_play(end, row.ms_played),
             duration: duration_ms.map(|ms| ((ms + 500) / 1000).max(1)),
             track_id: id,
             platform: row.platform.filter(|p| !p.trim().is_empty() && p != "unknown"),

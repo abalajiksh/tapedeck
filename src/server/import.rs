@@ -24,7 +24,7 @@ use super::auth::AuthUser;
 use super::models::ErrorResponse;
 use super::AppState;
 use crate::db::{Database, ImportOutcome};
-use crate::models::Play;
+use crate::models::{ImportProvenance, Play};
 use crate::openapi::{BadRequest, NotFound, Unauthorized};
 use utoipa::ToSchema;
 
@@ -635,27 +635,12 @@ async fn run_listenbrainz(
             if ts > 0 && ts < min_ts {
                 min_ts = ts;
             }
-            let tm = &l["track_metadata"];
-            let title = tm["track_name"].as_str().unwrap_or("").to_string();
-            let artist = tm["artist_name"].as_str().unwrap_or("").to_string();
-            if title.is_empty() || artist.is_empty() {
-                continue;
-            }
-            let album = tm["release_name"].as_str().map(str::to_string);
-            let mbid = tm["mbid_mapping"]["recording_mbid"].as_str().map(str::to_string);
-            let outcome = db
-                .import_listen(uid, &play(ts, title, artist, album, mbid))
-                .await
-                .map_err(|e| e.to_string())?;
-            update(reg, id, |j| {
-                j.fetched += 1;
-                if outcome == ImportOutcome::Enriched {
-                    j.enriched += 1;
-                }
-                if outcome == ImportOutcome::Inserted {
-                    j.imported += 1;
-                }
-            });
+            // The same reading as the archive: the API serves the same listen
+            // objects, Spotify relays and all, and this path used to keep only
+            // the names and a recording id.
+            let Some(listen) = listen_to_play(l) else { continue };
+            let outcome = import_one(db, uid, &listen).await?;
+            update(reg, id, |j| count(j, outcome, listen.skipped));
         }
         if listens.len() < 100 || min_ts >= max_ts {
             break;
@@ -792,19 +777,15 @@ async fn run_file(
 
     let is_csv =
         name.to_lowercase().ends_with(".csv") || (!text.trim_start().starts_with(['{', '[']));
-    let plays: Vec<Play> = if is_csv { parse_csv(&text) } else { parse_listens(&text)? };
-    update(reg, id, |j| j.total = Some(plays.len()));
-    for p in &plays {
-        let outcome = db.import_listen(uid, p).await.map_err(|e| e.to_string())?;
-        update(reg, id, |j| {
-            j.fetched += 1;
-            if outcome == ImportOutcome::Enriched {
-                j.enriched += 1;
-            }
-            if outcome == ImportOutcome::Inserted {
-                j.imported += 1;
-            }
-        });
+    let listens: Vec<ImportedListen> = if is_csv {
+        parse_csv(&text).into_iter().map(ImportedListen::from).collect()
+    } else {
+        parse_listens(&text)?
+    };
+    update(reg, id, |j| j.total = Some(listens.len()));
+    for listen in &listens {
+        let outcome = import_one(db, uid, listen).await?;
+        update(reg, id, |j| count(j, outcome, listen.skipped));
     }
     update(reg, id, |j| {
         j.state = "done".into();
@@ -882,14 +863,11 @@ async fn run_spotify_archive(
     let mut skips = 0usize;
     for e in &parsed.entries {
         let mut p = play(e.timestamp, e.title.clone(), e.artist.clone(), e.album.clone(), None);
-        // Stable and unique per play. The track id alone would collide on every
-        // repeat, and the timestamp alone on anything played simultaneously on
-        // two devices — which this export does contain.
-        p.source_id = format!("spotify-{}-{}", e.track_id, e.timestamp);
+        p.source_id = crate::spotify::play_source_id(&e.track_id, e.timestamp);
         p.source_name = "spotify".into();
         p.duration = e.duration;
 
-        let provenance = crate::models::ImportProvenance {
+        let provenance = ImportProvenance {
             // "Spotify (android)" rather than a bare OS name: the row's client
             // really was Spotify, and the platform is what distinguishes one of
             // these listens from another.
@@ -898,6 +876,7 @@ async fn run_spotify_archive(
                 None => "Spotify".into(),
             }),
             spotify_track_id: Some(e.track_id.clone()),
+            ..Default::default()
         };
 
         let outcome = db
@@ -967,7 +946,7 @@ async fn run_listenbrainz_archive(
 
     // Read everything first so `total` is known before the slow part starts —
     // an import with no upper bound shows a progress bar that never fills.
-    let mut plays: Vec<Play> = Vec::new();
+    let mut listens: Vec<ImportedListen> = Vec::new();
     let mut feedback = String::new();
     let mut listen_files = 0usize;
     for i in 0..zip.len() {
@@ -993,29 +972,25 @@ async fn run_listenbrainz_archive(
         }
         entry.read_to_string(&mut text).map_err(|e| format!("Could not read {path}: {e}"))?;
         listen_files += 1;
-        plays.extend(parse_listens(&text)?);
+        listens.extend(parse_listens(&text)?);
     }
 
-    if plays.is_empty() {
+    if listens.is_empty() {
         return Err("No listens found in that archive — is it a ListenBrainz export?".into());
     }
 
     // Oldest first, so an interrupted import leaves a contiguous history rather
     // than a hole in the middle.
-    plays.sort_by_key(|p| p.timestamp);
-    update(reg, id, |j| j.total = Some(plays.len()));
+    listens.sort_by_key(|l| l.play.timestamp);
+    update(reg, id, |j| j.total = Some(listens.len()));
 
-    for p in &plays {
-        let outcome = db.import_listen(uid, p).await.map_err(|e| e.to_string())?;
-        update(reg, id, |j| {
-            j.fetched += 1;
-            if outcome == ImportOutcome::Enriched {
-                j.enriched += 1;
-            }
-            if outcome == ImportOutcome::Inserted {
-                j.imported += 1;
-            }
-        });
+    let mut skips = 0usize;
+    for listen in &listens {
+        let outcome = import_one(db, uid, listen).await?;
+        if outcome == ImportOutcome::Inserted && listen.skipped {
+            skips += 1;
+        }
+        update(reg, id, |j| count(j, outcome, listen.skipped));
     }
 
     let loved = import_feedback(db, uid, &feedback).await;
@@ -1027,6 +1002,9 @@ async fn run_listenbrainz_archive(
             j.enriched,
             &format!(" from {listen_files} file{}", if listen_files == 1 { "" } else { "s" }),
         )];
+        if skips > 0 {
+            parts.push(format!("{skips} skips recorded"));
+        }
         if loved > 0 {
             parts.push(format!("{loved} loved tracks"));
         }
@@ -1157,7 +1135,7 @@ async fn run_scrobbler_log(
 /// export archive actually contains — one JSON object per line. JSONL is
 /// detected by the whole-document parse failing, so a file that is valid JSON is
 /// never re-read line by line.
-fn parse_listens(text: &str) -> Result<Vec<Play>, String> {
+fn parse_listens(text: &str) -> Result<Vec<ImportedListen>, String> {
     if let Ok(v) = serde_json::from_str::<serde_json::Value>(text) {
         if let Some(arr) = v
             .as_array()
@@ -1194,24 +1172,64 @@ fn parse_listens(text: &str) -> Result<Vec<Play>, String> {
     Ok(out)
 }
 
-/// One listen object → a `Play`, keeping everything the export knows.
+/// One listen read out of a ListenBrainz-shaped document, with what the insert
+/// needs beyond the `Play` itself.
+struct ImportedListen {
+    play: Play,
+    /// Only ever true for a Spotify play relayed through ListenBrainz, whose
+    /// disposition is recomputed by Spotify's rule — see `listen_to_play`.
+    skipped: bool,
+    provenance: ImportProvenance,
+}
+
+impl From<Play> for ImportedListen {
+    fn from(play: Play) -> Self {
+        Self { play, skipped: false, provenance: ImportProvenance::default() }
+    }
+}
+
+async fn import_one(db: &Database, uid: i64, l: &ImportedListen) -> Result<ImportOutcome, String> {
+    db.import_listen_detailed(uid, &l.play, l.skipped, l.provenance.clone())
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Progress for one listen. Skips are stored but are not listens, so they
+/// don't inflate the count — the rule the Spotify and Rockbox paths follow.
+fn count(j: &mut ImportJob, outcome: ImportOutcome, skipped: bool) {
+    j.fetched += 1;
+    if outcome == ImportOutcome::Enriched {
+        j.enriched += 1;
+    }
+    if outcome == ImportOutcome::Inserted && !skipped {
+        j.imported += 1;
+    }
+}
+
+/// One listen object → an `ImportedListen`, keeping everything the export knows.
 ///
 /// The archive's `mbid_mapping` is the whole reason this import is cheap:
 /// recording/release/artist MBIDs and the cover-art ids come with it, so these
 /// listens skip MusicBrainz enrichment *and* the artwork chain entirely. Losing
 /// them would mean re-looking-up a decade of history one rate-limited request at
 /// a time.
-fn listen_to_play(l: &serde_json::Value) -> Option<Play> {
+fn listen_to_play(l: &serde_json::Value) -> Option<ImportedListen> {
     let ts = l["listened_at"].as_i64().or_else(|| l["timestamp"].as_i64())?;
     let tm = if l["track_metadata"].is_object() { &l["track_metadata"] } else { l };
     let title = tm["track_name"].as_str().or(tm["title"].as_str())?.to_string();
     let artist = tm["artist_name"].as_str().or(tm["artist"].as_str())?.to_string();
+    if title.trim().is_empty() || artist.trim().is_empty() {
+        return None;
+    }
     let album = tm["release_name"].as_str().or(tm["album"].as_str()).map(str::to_string);
 
     let mapping = &tm["mbid_mapping"];
     let info = &tm["additional_info"];
     let str_of = |v: &serde_json::Value| v.as_str().map(str::to_string);
 
+    // The key is made from the names as written, before the credit below
+    // rewrites the artist, so an archive re-imported over a history imported
+    // before that existed still finds every row by `source_id`.
     let mut p = play(
         ts,
         title,
@@ -1229,13 +1247,120 @@ fn listen_to_play(l: &serde_json::Value) -> Option<Play> {
         .filter(|v: &Vec<String>| !v.is_empty());
     p.caa_id = mapping["caa_id"].as_i64();
     p.caa_release_mbid = str_of(&mapping["caa_release_mbid"]);
-    p.duration = info["duration_ms"]
-        .as_i64()
+    p.duration = lenient_number(&info["duration_ms"])
         .map(|ms| (ms / 1000).max(0) as u64)
-        .or_else(|| info["duration"].as_i64().map(|s| s.max(0) as u64));
-    p.track_number =
-        info["tracknumber"].as_i64().or_else(|| info["track_number"].as_i64()).map(|n| n as i32);
-    Some(p)
+        .or_else(|| lenient_number(&info["duration"]).map(|s| s.max(0) as u64));
+    p.track_number = lenient_number(&info["tracknumber"])
+        .or_else(|| lenient_number(&info["track_number"]))
+        .and_then(|n| i32::try_from(n).ok())
+        .filter(|n| *n > 0);
+
+    if let Some(credit) = structured_credit(&p.artist, mapping) {
+        p.artist = credit[0].0.clone();
+        if credit.iter().all(|(_, mbid)| mbid.is_some()) {
+            p.mbid_artist = Some(credit.iter().filter_map(|(_, m)| m.clone()).collect());
+        }
+        p.artists = Some(credit.into_iter().map(|(name, _)| name).collect());
+    }
+
+    // Kept, rather than every row saying "import": which app sent a listen is
+    // the only thing that tells a relayed Spotify play from a Pano Scrobbler
+    // one after the fact, and its absence is what made the duplicates this
+    // import used to create impossible to separate from real listens.
+    let client = str_of(&info["submission_client"]).filter(|c| !c.trim().is_empty());
+    let mut listen = ImportedListen {
+        play: p,
+        skipped: false,
+        provenance: ImportProvenance { submission_client: client, ..Default::default() },
+    };
+
+    // **A Spotify play relayed through ListenBrainz is a Spotify play.**
+    //
+    // ListenBrainz's own importer stamps `listened_at` with the export's `ts`,
+    // which is the *end* of the play, where our Spotify import stores the
+    // start. Imported both ways, the two copies sat one whole play apart
+    // (median 220s, against a 60s duplicate window), and a history imported
+    // from both doubled: 23,637 of 27,193 relayed listens went in a second
+    // time. So the listen is put back on its start, under the key the Spotify
+    // import gives the same play — the copies then meet on `source_id` and no
+    // window is involved at all — and judged by Spotify's skip rule rather
+    // than ListenBrainz's, so it gets the same disposition through either door.
+    if let Some((track_id, ms_played)) = relayed_spotify_play(info) {
+        let start = crate::spotify::start_of_play(ts, ms_played);
+        let p = &mut listen.play;
+        listen.provenance.previous_source_id = Some(std::mem::take(&mut p.source_id));
+        p.source_id = crate::spotify::play_source_id(&track_id, start);
+        p.source_name = "spotify".into();
+        p.timestamp = start.max(0) as u64;
+        listen.skipped = !crate::spotify::counts_as_listen(ms_played, info["duration_ms"].as_u64());
+        listen.provenance.submission_client = Some("Spotify".into());
+        listen.provenance.spotify_track_id = Some(track_id);
+    }
+    Some(listen)
+}
+
+/// A number a client may have sent as a number or as text — the rule
+/// `lenient_track_number` applies to live submissions, so an archive of those
+/// same listens reads the same. fooyin sends `"tracknumber": "1"`; read as a
+/// number only, every one of its listens lost its track number on import, and
+/// with it every album playthrough. `"3/12"` is a real tag spelling and gives
+/// 3; a vinyl `"A1"` gives nothing.
+fn lenient_number(v: &serde_json::Value) -> Option<i64> {
+    v.as_i64().or_else(|| {
+        let s = v.as_str()?.trim();
+        s.split('/').next().unwrap_or(s).trim().parse().ok()
+    })
+}
+
+/// A Spotify play that reached ListenBrainz through its Spotify importer:
+/// the track id and how long it played.
+///
+/// Recognised by `ms_played`, which only that importer writes, together with a
+/// Spotify track link. A listen ListenBrainz read live from Spotify has the
+/// link and no `ms_played`, and is left exactly as it was sent.
+fn relayed_spotify_play(info: &serde_json::Value) -> Option<(String, u64)> {
+    let ms_played = info["ms_played"].as_u64()?;
+    let link = info["origin_url"].as_str().or(info["spotify_id"].as_str())?;
+    let id = link.strip_prefix("https://open.spotify.com/track/")?.split(['?', '/', '#']).next()?;
+    (!id.is_empty()).then(|| (id.to_string(), ms_played))
+}
+
+/// MusicBrainz's structured credit, when the listen's artist string is exactly
+/// that credit written out — "Lady Gaga, Bruno Mars" against `[Lady Gaga,
+/// Bruno Mars]`.
+///
+/// **The mapping is checked against the string, never trusted over it.**
+/// ListenBrainz maps by name and sometimes picks the wrong recording: one row
+/// in the test archive says "Boyz II Men, Mariah Carey" and maps to a credit
+/// of Boyz II Men and an orchestra. So every credited name must appear in the
+/// string, and what is left between them may only be joining words and
+/// punctuation. Of 4,405 multi-artist mappings in a real archive, 2,922 pass
+/// and the rest keep the string as it came. A single-name credit is never
+/// split, which is what keeps "Simon & Garfunkel" one artist.
+fn structured_credit(
+    artist: &str,
+    mapping: &serde_json::Value,
+) -> Option<Vec<(String, Option<String>)>> {
+    let credits = mapping["artists"].as_array().filter(|a| a.len() > 1)?;
+    let mut rest = artist.to_lowercase();
+    let mut out = Vec::with_capacity(credits.len());
+    for c in credits {
+        let name = c["artist_credit_name"].as_str()?.trim();
+        let folded = name.to_lowercase();
+        if folded.is_empty() {
+            return None;
+        }
+        let at = rest.find(&folded)?;
+        rest.replace_range(at..at + folded.len(), " ");
+        out.push((name.to_string(), c["artist_mbid"].as_str().map(str::to_string)));
+    }
+    let only_joins = rest
+        .split(|c: char| c.is_whitespace() || matches!(c, ',' | '&' | '/' | ';' | '+'))
+        .filter(|w| !w.is_empty())
+        .all(|w| {
+            matches!(w, "and" | "feat." | "feat" | "ft." | "ft" | "featuring" | "with" | "x" | "×")
+        });
+    only_joins.then_some(out)
 }
 
 /// CSV: header row `title,artist,album,format,chain,mbid,time`.
@@ -1290,6 +1415,105 @@ fn split_csv(line: &str) -> Vec<String> {
     fields
 }
 
+// ════════════════════════════════════════════════════════════
+//  Spotify plays imported twice
+// ════════════════════════════════════════════════════════════
+
+/// Spotify plays held twice — preview.
+///
+/// A history imported from a Spotify export **and** from a ListenBrainz
+/// archive whose listens ListenBrainz had itself imported from Spotify holds
+/// most of those plays twice: the archive stamped each at its end, the export
+/// at its start, one whole play apart. Importing no longer does this; this
+/// finds what earlier imports left. Nothing is changed.
+#[utoipa::path(
+    get,
+    path = "/api/v1/import/spotify-duplicates",
+    tag = "Maintenance",
+    responses(
+        (status = 200, description = "What would be removed.", body = crate::db::RelayedPreview),
+        (status = 401, response = Unauthorized),
+    )
+)]
+async fn spotify_duplicates_preview(
+    State(state): State<Arc<AppState>>,
+    user: AuthUser,
+) -> impl IntoResponse {
+    match state.db.preview_relayed_copies(user.user_id).await {
+        Ok(p) => (StatusCode::OK, Json(p)).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse { code: 500, error: e.to_string() }),
+        )
+            .into_response(),
+    }
+}
+
+/// What to remove: the preview's count, said back.
+#[derive(Deserialize, ToSchema)]
+pub struct RemoveSpotifyDuplicates {
+    /// `copies` from the preview. **Required** — this deletes listens, so
+    /// an empty body is refused rather than read as "all of them".
+    pub copies: Option<usize>,
+}
+
+/// Spotify plays held twice — remove.
+///
+/// Deletes the copies the preview listed, after filling in anything each
+/// knew that the play it duplicates did not (never overwriting). A liner note
+/// on a copy moves to the kept play; a pair where both carry one is left.
+///
+/// **`copies` must equal what a preview would say now.** If the history
+/// changed since the preview, nothing is removed and the answer is `409` with
+/// the current count — what would go is no longer what was shown.
+#[utoipa::path(
+    post,
+    path = "/api/v1/import/spotify-duplicates",
+    tag = "Maintenance",
+    request_body = RemoveSpotifyDuplicates,
+    responses(
+        (status = 200, description = "Removed.", body = crate::db::RelayedApplied),
+        (status = 400, response = BadRequest),
+        (status = 401, response = Unauthorized),
+        (status = 409, description = "The count no longer matches; preview again.", body = ErrorResponse),
+    )
+)]
+async fn spotify_duplicates_remove(
+    State(state): State<Arc<AppState>>,
+    user: AuthUser,
+    Json(body): Json<RemoveSpotifyDuplicates>,
+) -> impl IntoResponse {
+    let Some(expected) = body.copies else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                code: 400,
+                error: "`copies` is required: send the count the preview showed".into(),
+            }),
+        )
+            .into_response();
+    };
+    match state.db.apply_relayed_copies(user.user_id, expected).await {
+        Ok(Ok(applied)) => (StatusCode::OK, Json(applied)).into_response(),
+        Ok(Err(now)) => (
+            StatusCode::CONFLICT,
+            Json(ErrorResponse {
+                code: 409,
+                error: format!(
+                    "There are {now} duplicates now, not {expected}; nothing was removed. \
+                     Preview again."
+                ),
+            }),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse { code: 500, error: e.to_string() }),
+        )
+            .into_response(),
+    }
+}
+
 #[derive(utoipa::OpenApi)]
 #[openapi(paths(
     import_listenbrainz,
@@ -1297,7 +1521,9 @@ fn split_csv(line: &str) -> Vec<String> {
     import_file,
     active_jobs,
     job_status,
-    import_history
+    import_history,
+    spotify_duplicates_preview,
+    spotify_duplicates_remove
 ))]
 pub struct Api;
 
@@ -1309,6 +1535,10 @@ pub fn create_import_router() -> Router<Arc<AppState>> {
         .route("/api/v1/import/jobs", get(active_jobs))
         .route("/api/v1/import/jobs/:job_id", get(job_status))
         .route("/api/v1/import/history", get(import_history))
+        .route(
+            "/api/v1/import/spotify-duplicates",
+            get(spotify_duplicates_preview).post(spotify_duplicates_remove),
+        )
 }
 
 #[cfg(test)]
@@ -1340,8 +1570,8 @@ mod tests {
         let js = r#"{"listens":[{"listened_at":1700000000,"track_metadata":{"track_name":"T","artist_name":"A","release_name":"R"}}]}"#;
         let plays = parse_listens(js).unwrap();
         assert_eq!(plays.len(), 1);
-        assert_eq!(plays[0].artist, "A");
-        assert_eq!(plays[0].album.as_deref(), Some("R"));
+        assert_eq!(plays[0].play.artist, "A");
+        assert_eq!(plays[0].play.album.as_deref(), Some("R"));
     }
 
     /// One JSON object per line — the shape inside a ListenBrainz export.
@@ -1352,7 +1582,7 @@ mod tests {
                      {\"listened_at\":1700000100,\"track_metadata\":{\"track_name\":\"B\",\"artist_name\":\"X\"}}\n";
         let plays = parse_listens(jsonl).unwrap();
         assert_eq!(plays.len(), 2);
-        assert_eq!(plays[1].title, "B");
+        assert_eq!(plays[1].play.title, "B");
     }
 
     /// A single unreadable line must not lose the rest of the month.
@@ -1378,7 +1608,7 @@ mod tests {
               "recording_mbid":"1cecdf15-8596-4985-a865-6cbd624b483f",
               "caa_release_mbid":"480bdf50-a119-49cb-b3d1-54e1e811b4fd"},
             "additional_info":{"duration_ms":213376,"tracknumber":3}}}"#;
-        let p = &parse_listens(line).unwrap()[0];
+        let p = &parse_listens(line).unwrap()[0].play;
         assert_eq!(p.mbid_recording.as_deref(), Some("1cecdf15-8596-4985-a865-6cbd624b483f"));
         assert_eq!(p.mbid_release.as_deref(), Some("480bdf50-a119-49cb-b3d1-54e1e811b4fd"));
         assert_eq!(p.mbid_artist.as_deref().map(|v| v.len()), Some(1));
@@ -1387,12 +1617,244 @@ mod tests {
         assert_eq!(p.track_number, Some(3));
     }
 
+    /// One play, out of two real exports of the same history (2024-04-15).
+    /// The Spotify row keeps only the fields the parser reads.
+    const SPOTIFY_ROW: &str = r#"[{"ts": "2024-04-15T02:30:40Z", "platform": "android", "ms_played": 191430,
+        "master_metadata_track_name": "La grenade", "master_metadata_album_artist_name": "Clara Luciani",
+        "master_metadata_album_album_name": "Sainte-Victoire",
+        "spotify_track_uri": "spotify:track:7ixCRBD0FZMRBeOBhTu2KD", "spotify_episode_uri": null,
+        "audiobook_uri": null, "reason_start": "trackdone", "reason_end": "logout", "skipped": false}]"#;
+
+    /// The same play as ListenBrainz's Spotify importer relayed it: stamped at
+    /// `ts`, the end, with `ms_played` and the track link alongside. Byte for
+    /// byte out of a 2026 ListenBrainz archive.
+    const RELAYED_LINE: &str = r#"{"inserted_at": 1786205000.986855, "listened_at": 1713148240, "track_metadata": {"track_name": "La grenade", "artist_name": "Clara Luciani", "mbid_mapping": {"caa_id": 25015720640, "artists": [{"artist_mbid": "a6386935-e6ee-4aaa-aaa8-70f56b79bc29", "join_phrase": "", "artist_credit_name": "Clara Luciani"}], "artist_mbids": ["a6386935-e6ee-4aaa-aaa8-70f56b79bc29"], "release_mbid": "e653264c-420a-4116-8552-1f1f1f70c3d1", "recording_mbid": "68dfb551-6462-4f77-a2cb-71271f4733d2", "recording_name": "La Grenade", "caa_release_mbid": "4aeeff6b-104c-41c7-9f96-854ea0718be0"}, "release_name": "25 Ans Ultratop", "recording_msid": "4bff26a9-a789-4f3b-80a2-f8b9d6dec712", "additional_info": {"ms_played": 191430, "origin_url": "https://open.spotify.com/track/7ixCRBD0FZMRBeOBhTu2KD", "duration_ms": 194480, "tracknumber": 31, "music_service": "spotify.com", "spotify_album_id": "https://open.spotify.com/album/033OTl57rnhrr0522v0UXe", "submission_client": "ListenBrainz Archive Importer", "spotify_artist_ids": ["https://open.spotify.com/artist/2oVrruuEI0Dr2I4NvLtQS0"], "release_artist_name": "Various Artists", "spotify_album_artist_ids": ["https://open.spotify.com/artist/0LyfQWJT6nXafLPZqxe9Of"]}}}"#;
+
+    /// A relayed play lands where the Spotify import puts the same play: on
+    /// its start, under the export's own key. The two copies then meet on
+    /// `source_id`; before, they sat 191 seconds apart and both were kept.
+    #[test]
+    fn a_relayed_spotify_play_lands_on_the_exports_own_key() {
+        let l = &parse_listens(RELAYED_LINE).unwrap()[0];
+        let e = &crate::spotify::parse(&[SPOTIFY_ROW]).entries[0];
+        assert_eq!(l.play.timestamp as i64, e.timestamp);
+        assert_eq!(l.play.timestamp, 1713148049);
+        assert_eq!(l.play.source_id, crate::spotify::play_source_id(&e.track_id, e.timestamp));
+        assert_eq!(l.play.source_name, "spotify");
+        assert!(!l.skipped);
+        assert_eq!(l.provenance.spotify_track_id.as_deref(), Some("7ixCRBD0FZMRBeOBhTu2KD"));
+        assert_eq!(l.provenance.submission_client.as_deref(), Some("Spotify"));
+        // The key the old importer filed it under, so a re-import finds it.
+        assert_eq!(
+            l.provenance.previous_source_id.as_deref(),
+            Some(source_id(1713148240, "Clara Luciani", "La grenade").as_str())
+        );
+        // The mapping still comes with it.
+        assert_eq!(l.play.mbid_recording.as_deref(), Some("68dfb551-6462-4f77-a2cb-71271f4733d2"));
+    }
+
+    /// ListenBrainz kept anything over about thirty seconds as a listen.
+    /// Spotify's rule here wants half the track or four minutes, and the same
+    /// play must get the same answer through either import.
+    #[test]
+    fn a_relayed_partial_play_is_a_skip_by_spotifys_rule() {
+        let line = RELAYED_LINE.replace(r#""ms_played": 191430"#, r#""ms_played": 41000"#);
+        let l = &parse_listens(&line).unwrap()[0];
+        assert!(l.skipped);
+        assert_eq!(l.play.timestamp, 1713148240 - 41);
+    }
+
+    /// A listen ListenBrainz read live from Spotify carries the link but no
+    /// `ms_played`; nothing says when it started, so it is left as sent.
+    #[test]
+    fn a_live_spotify_listen_is_not_taken_for_a_relay() {
+        let line = RELAYED_LINE.replace(r#""ms_played": 191430, "#, "");
+        let l = &parse_listens(&line).unwrap()[0];
+        assert_eq!(l.play.timestamp, 1713148240);
+        assert_eq!(l.play.source_name, "import");
+        assert!(l.provenance.spotify_track_id.is_none());
+        assert_eq!(
+            l.provenance.submission_client.as_deref(),
+            Some("ListenBrainz Archive Importer")
+        );
+    }
+
+    /// "Lady Gaga, Bruno Mars" with MusicBrainz's credit of exactly those two
+    /// is two artists, the first primary. The key is still made from the
+    /// string as written, so a re-import finds the row an older one wrote.
+    #[test]
+    fn a_credit_that_matches_the_string_is_split() {
+        let line = r#"{"listened_at": 1744017897, "track_metadata": {"track_name": "Die With A Smile", "artist_name": "Lady Gaga, Bruno Mars", "mbid_mapping": {"artists": [{"artist_mbid": "650e7db6-b795-4eb5-a702-5ea2fc46c848", "join_phrase": " & ", "artist_credit_name": "Lady Gaga"}, {"artist_mbid": "afb680f2-b6eb-4cd7-a70b-a63b25c763d5", "join_phrase": "", "artist_credit_name": "Bruno Mars"}], "artist_mbids": ["650e7db6-b795-4eb5-a702-5ea2fc46c848", "afb680f2-b6eb-4cd7-a70b-a63b25c763d5"], "recording_mbid": "098ed81a-fa33-4212-ac6d-2cc19dde5fef"}, "additional_info": {"duration_ms": 251667}}}"#;
+        let p = &parse_listens(line).unwrap()[0].play;
+        assert_eq!(p.artist, "Lady Gaga");
+        assert_eq!(
+            p.artists.as_deref(),
+            Some(&["Lady Gaga".to_string(), "Bruno Mars".to_string()][..])
+        );
+        assert_eq!(p.source_id, source_id(1744017897, "Lady Gaga, Bruno Mars", "Die With A Smile"));
+    }
+
+    /// A real mis-mapping: ListenBrainz matched "One Sweet Day" to a version
+    /// credited to Boyz II Men and an orchestra. Splitting on that would erase
+    /// Mariah Carey from her own duet, so the string is kept.
+    #[test]
+    fn a_credit_that_disagrees_with_the_string_is_ignored() {
+        let line = r#"{"listened_at": 1700000000, "track_metadata": {"track_name": "One Sweet Day", "artist_name": "Boyz II Men, Mariah Carey", "mbid_mapping": {"artists": [{"artist_mbid": "b42eca0f-9381-43db-badb-1cba080a7dc2", "join_phrase": " with ", "artist_credit_name": "Boyz II Men"}, {"artist_mbid": "009349f0-b15d-4968-8c8f-37226d1c2cef", "join_phrase": "", "artist_credit_name": "New York Symphonic Arts Ensemble"}]}}}"#;
+        let p = &parse_listens(line).unwrap()[0].play;
+        assert_eq!(p.artist, "Boyz II Men, Mariah Carey");
+        assert!(p.artists.is_none());
+    }
+
+    async fn scratch_db() -> Database {
+        let path =
+            std::env::temp_dir().join(format!("td-import-{}-{}.db", std::process::id(), job_id()));
+        Database::new(
+            &format!("sqlite:{}?mode=rwc", path.display()),
+            Arc::new(crate::crypto::SecretBox::test_key()),
+        )
+        .await
+        .unwrap()
+    }
+
+    fn zipped(name: &str, body: &str) -> Vec<u8> {
+        use std::io::Write;
+        let mut buf = std::io::Cursor::new(Vec::<u8>::new());
+        {
+            let mut zip = zip::ZipWriter::new(&mut buf);
+            zip.start_file(name, zip::write::SimpleFileOptions::default()).unwrap();
+            zip.write_all(body.as_bytes()).unwrap();
+            zip.finish().unwrap();
+        }
+        buf.into_inner()
+    }
+
+    async fn listens(db: &Database, uid: i64) -> Vec<(i64, String, Option<String>)> {
+        let mut rows = db.get_all_scrobbles(uid).await.unwrap();
+        rows.sort_by_key(|r| r.id);
+        rows.into_iter().map(|r| (r.timestamp, r.source_name, r.mbid_recording)).collect()
+    }
+
+    /// The path a person takes: both real archives through the real runners,
+    /// in both orders. Either way the play is held once, at its start.
+    #[tokio::test]
+    async fn the_same_play_from_both_archives_is_one_listen_in_either_order() {
+        let spotify = zipped(
+            "Spotify Extended Streaming History/Streaming_History_Audio_2024.json",
+            SPOTIFY_ROW,
+        );
+        let lb = zipped("listens/2024/4.jsonl", RELAYED_LINE);
+        for order in [[&spotify, &lb], [&lb, &spotify]] {
+            let db = scratch_db().await;
+            let uid = db.create_user("ash", None, "pw", "user").await.unwrap();
+            let reg: ImportRegistry = Default::default();
+            for bytes in order {
+                let id = start(&reg, &db, "file", uid).await;
+                run_file(&reg, &id, &db, uid, bytes, "export.zip", None).await.unwrap();
+            }
+            let held = listens(&db, uid).await;
+            assert_eq!(held.len(), 1, "{held:?}");
+            assert_eq!((held[0].0, held[0].1.as_str()), (1713148049, "spotify"));
+            // Whichever came second filled in the mapping the export lacks.
+            assert_eq!(held[0].2.as_deref(), Some("68dfb551-6462-4f77-a2cb-71271f4733d2"));
+        }
+    }
+
+    /// A history the old importer doubled: the Spotify play, and the relayed
+    /// copy filed at its end under `import`. Re-importing the archive must not
+    /// add a third; the repair then removes the copy and keeps what it knew.
+    #[tokio::test]
+    async fn a_history_imported_before_the_fix_is_repaired_not_tripled() {
+        let db = scratch_db().await;
+        let uid = db.create_user("ash", None, "pw", "user").await.unwrap();
+        let reg: ImportRegistry = Default::default();
+        let id = start(&reg, &db, "file", uid).await;
+        let spotify = zipped(
+            "Spotify Extended Streaming History/Streaming_History_Audio_2024.json",
+            SPOTIFY_ROW,
+        );
+        run_file(&reg, &id, &db, uid, &spotify, "export.zip", None).await.unwrap();
+
+        // What the importer wrote before: end time, `import`, no client.
+        let mut old = play(
+            1713148240,
+            "La grenade".into(),
+            "Clara Luciani".into(),
+            Some("25 Ans Ultratop".into()),
+            Some("68dfb551-6462-4f77-a2cb-71271f4733d2".into()),
+        );
+        old.duration = Some(194);
+        db.import_listen(uid, &old).await.unwrap();
+        assert_eq!(listens(&db, uid).await.len(), 2);
+
+        let lb = zipped("listens/2024/4.jsonl", RELAYED_LINE);
+        run_file(&reg, &id, &db, uid, &lb, "export.zip", None).await.unwrap();
+        assert_eq!(listens(&db, uid).await.len(), 2, "a re-import added the play again");
+
+        let preview = db.preview_relayed_copies(uid).await.unwrap();
+        assert_eq!(preview.copies, 1);
+        assert!(
+            db.apply_relayed_copies(uid, 2).await.unwrap().is_err(),
+            "a stale count must refuse"
+        );
+        let applied = db.apply_relayed_copies(uid, 1).await.unwrap().unwrap();
+        assert_eq!(applied.removed, 1);
+
+        assert_eq!(
+            listens(&db, uid).await,
+            vec![(
+                1713148049,
+                "spotify".into(),
+                Some("68dfb551-6462-4f77-a2cb-71271f4733d2".into())
+            )]
+        );
+        assert_eq!(db.preview_relayed_copies(uid).await.unwrap().copies, 0);
+        // The copy said the compilation; the play was on the studio album. Its
+        // recording came across, its release did not.
+        let kept = &db.get_all_scrobbles(uid).await.unwrap()[0];
+        assert_eq!(kept.album.as_deref(), Some("Sainte-Victoire"));
+        assert!(kept.mbid_release.is_none());
+    }
+
+    /// The archive alone, imported before and again after the fix: the old row
+    /// is at the play's end, a whole play from where the listen now lands,
+    /// and only the key it was filed under can find it.
+    #[tokio::test]
+    async fn re_importing_an_archive_finds_what_the_old_importer_wrote() {
+        let db = scratch_db().await;
+        let uid = db.create_user("ash", None, "pw", "user").await.unwrap();
+        let old = play(1713148240, "La grenade".into(), "Clara Luciani".into(), None, None);
+        db.import_listen(uid, &old).await.unwrap();
+
+        let reg: ImportRegistry = Default::default();
+        let id = start(&reg, &db, "file", uid).await;
+        let lb = zipped("listens/2024/4.jsonl", RELAYED_LINE);
+        run_file(&reg, &id, &db, uid, &lb, "export.zip", None).await.unwrap();
+        let held = listens(&db, uid).await;
+        assert_eq!(held.len(), 1, "{held:?}");
+        assert_eq!(held[0].0, 1713148240);
+    }
+
+    /// fooyin's track numbers are strings, and a tag may carry the total.
+    #[test]
+    fn a_track_number_sent_as_text_is_kept() {
+        let line = |n: &str| {
+            format!(
+                r#"{{"listened_at": 1774511157, "track_metadata": {{"track_name": "Somnambule", "artist_name": "Cœur de pirate", "additional_info": {{"duration_ms": "182000", "tracknumber": {n}, "media_player": "fooyin"}}}}}}"#
+            )
+        };
+        let p = &parse_listens(&line(r#""1""#)).unwrap()[0].play;
+        assert_eq!((p.track_number, p.duration), (Some(1), Some(182)));
+        assert_eq!(parse_listens(&line(r#""3/12""#)).unwrap()[0].play.track_number, Some(3));
+        assert_eq!(parse_listens(&line(r#""A1""#)).unwrap()[0].play.track_number, None);
+        assert_eq!(parse_listens(&line("0")).unwrap()[0].play.track_number, None);
+    }
+
     /// A listen with no mapping at all still imports — most of anyone's older
     /// history is un-enriched, and dropping it would be the wrong trade.
     #[test]
     fn a_listen_with_no_mapping_still_imports() {
         let line = r#"{"listened_at":1,"track_metadata":{"track_name":"T","artist_name":"A"}}"#;
-        let p = &parse_listens(line).unwrap()[0];
+        let p = &parse_listens(line).unwrap()[0].play;
         assert!(p.mbid_recording.is_none() && p.caa_id.is_none());
         assert_eq!(p.title, "T");
     }

@@ -359,6 +359,14 @@ impl Database {
         //   3. both carry the same recording MBID, which settles it outright
         //      whatever the two servers chose to call the performer.
         //
+        // **The nearest row wins, not the oldest.** A window can hold two
+        // plays of the same track — a repeat lands one track length after the
+        // first, and a copy stamped at a play's *end* lands on the next play's
+        // start — and `ORDER BY id` handed the incoming listen whichever was
+        // inserted first. Measured on a Spotify history relayed through
+        // ListenBrainz: 3,399 copies attached to the following repeat instead
+        // of their own play.
+        //
         // What this deliberately does **not** do is drop the artist entirely.
         // Two different songs sharing a title within the same minute is rare
         // but real (two covers back to back), and silently swallowing the
@@ -383,7 +391,7 @@ impl Database {
                    OR ? IN ({ph})
                    OR (? IS NOT NULL AND mbid_recording = ?)
                 )
-              ORDER BY id LIMIT 1",
+              ORDER BY ABS(timestamp - ?), id LIMIT 1",
             ph = placeholders
         );
         let stmt = crate::sql!(&sql);
@@ -406,6 +414,7 @@ impl Database {
         let hit: Option<(i64,)> = q
             .bind(&play.mbid_recording)
             .bind(&play.mbid_recording)
+            .bind(timestamp)
             .fetch_optional(&self.pool)
             .await?;
         Ok(hit.map(|(id,)| id))

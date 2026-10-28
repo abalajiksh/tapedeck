@@ -2631,14 +2631,18 @@ pub enum ImportOutcome {
 /// The sparse columns an import can fill in, as they stand on the stored row.
 #[derive(Debug, sqlx::FromRow)]
 struct SparseColumns {
+    artist: String,
+    artist_credit: Option<String>,
     album: Option<String>,
     duration: Option<i64>,
     mbid_recording: Option<String>,
     mbid_release: Option<String>,
+    mbid_release_group: Option<String>,
     mbid_artist: Option<String>,
     caa_id: Option<i64>,
     caa_release_mbid: Option<String>,
     track_number: Option<i64>,
+    isrc: Option<String>,
     spotify_track_id: Option<String>,
 }
 
@@ -3367,6 +3371,8 @@ mod rediscovery;
 // handler that serves them, so they surface here rather than being reached
 // through the module.
 pub use ratings::{IncomingRating, LibraryRatingRow, RatingApply, RatingSourceSummary};
+mod relayed;
+pub use relayed::{RelayedApplied, RelayedPreview};
 mod sanitise;
 mod schema;
 mod sources;

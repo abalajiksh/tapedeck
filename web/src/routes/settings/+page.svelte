@@ -247,6 +247,39 @@
 	let healthStatus = '';
 	let checking = false;
 
+	// ── Spotify plays held twice ──
+	// A history imported from the Spotify export and from a ListenBrainz archive
+	// that had relayed that same export holds most of those plays twice. Shown
+	// only when there are any; removing them is a count said back to the server,
+	// so a history that changed since the preview refuses rather than removing
+	// something nobody looked at.
+	let spotifyDupes: import('$lib/api').SpotifyDuplicates | null = null;
+	let removingDupes = false;
+	let dupesMsg = '';
+
+	async function loadSpotifyDupes() {
+		try { spotifyDupes = await api.spotifyDuplicates(); } catch { spotifyDupes = null; }
+	}
+	async function removeSpotifyDupes() {
+		if (!spotifyDupes?.copies) return;
+		const n = spotifyDupes.copies;
+		if (!confirm(`Remove ${n} duplicate listen${n === 1 ? '' : 's'}?\n\nThe Spotify play each one duplicates stays. This can't be undone.`)) return;
+		removingDupes = true;
+		dupesMsg = '';
+		try {
+			const r = await api.removeSpotifyDuplicates(n);
+			dupesMsg =
+				`Removed ${r.removed} duplicate${r.removed === 1 ? '' : 's'}` +
+				(r.notes_moved ? `, moved ${r.notes_moved} liner note${r.notes_moved === 1 ? '' : 's'} onto the play they were about` : '') +
+				(r.kept_for_notes ? `; left ${r.kept_for_notes} where both copies have a note` : '') +
+				'.';
+		} catch (e) {
+			dupesMsg = 'Failed: ' + String(e).replace(/^API \d+: /, '');
+		}
+		await loadSpotifyDupes();
+		removingDupes = false;
+	}
+
 	// ── Metadata sanitiser ──
 	// Preview first, always. Scrobble metadata that came from a real MusicBrainz
 	// mapping is still data; rewriting it without showing what changes would be
@@ -1519,6 +1552,7 @@
 		loadArtStatus();
 		loadLyricStatus();
 		loadSanitize();
+		loadSpotifyDupes();
 		loadDiscogs();
 		loadAmai();
 		loadEveryNoise();
@@ -3300,6 +3334,53 @@
 		{/if}
 
 		{#if section === 'sanitiser'}
+			{#if spotifyDupes?.copies || dupesMsg}
+				<div class="panel" style="border-radius:22px;padding:24px;margin-bottom:18px;">
+					<h3 class="h-display" style="font-size:19px;margin-bottom:4px;">Spotify plays counted twice</h3>
+					<p style="font-size:13px;color:var(--td-muted);margin:0 0 16px;">
+						Your Spotify history came in twice: once from Spotify's own export, and again inside a
+						ListenBrainz archive whose listens ListenBrainz had imported from that same export.
+						ListenBrainz dated each play by when it ended, so the two copies never matched up.
+						Removing the copies keeps every Spotify play, and anything a copy knew that the play
+						didn't — the recording, the release, the cover — is kept on the play.
+					</p>
+					{#if spotifyDupes?.copies}
+						<div class="san-bar">
+							<span style="font-weight:600;font-size:14px;">
+								{spotifyDupes.copies.toLocaleString()} duplicate listen{spotifyDupes.copies === 1 ? '' : 's'}
+							</span>
+							<span style="font-size:12.5px;color:var(--td-muted-2);">
+								{spotifyDupes.by_year.map((y) => `${y.year}: ${y.copies.toLocaleString()}`).join(' · ')}
+							</span>
+						</div>
+						{#if spotifyDupes.of_skips}
+							<p style="font-size:12.5px;color:var(--td-muted-2);margin:10px 0 0;">
+								{spotifyDupes.of_skips.toLocaleString()} of them are copies of plays Spotify recorded as skips,
+								so they were counting a skip as a listen.
+							</p>
+						{/if}
+						<div class="san-group">The first few</div>
+						{#each spotifyDupes.sample.slice(0, 8) as d (d.copy_id)}
+							<div class="san-row" style="cursor:default;">
+								<span style="flex:1;min-width:0;">
+									<span class="san-name">{d.title}</span>
+									<span class="san-sub">
+										{d.artist} · played {formatDateTime(d.kept_at)}{#if d.kept_is_skip} (a skip){/if},
+										copy dated {formatDuration(d.copy_at - d.kept_at)} later
+									</span>
+								</span>
+							</div>
+						{/each}
+						<button class="btn btn-primary" style="margin-top:16px;" on:click={removeSpotifyDupes}
+							disabled={removingDupes}>
+							{removingDupes ? 'Removing…' : `Remove ${spotifyDupes.copies.toLocaleString()} duplicate${spotifyDupes.copies === 1 ? '' : 's'}`}
+						</button>
+					{/if}
+					{#if dupesMsg}
+						<p style="font-size:13px;color:var(--td-good-fg);margin:12px 0 0;">{dupesMsg}</p>
+					{/if}
+				</div>
+			{/if}
 			<div class="panel" style="border-radius:22px;padding:24px;margin-bottom:18px;">
 				<h3 class="h-display" style="font-size:19px;margin-bottom:4px;">Metadata Sanitiser</h3>
 				<p style="font-size:13px;color:var(--td-muted);margin:0 0 16px;">
