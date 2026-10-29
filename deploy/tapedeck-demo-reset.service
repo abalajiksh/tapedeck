@@ -1,0 +1,6 @@
+[Unit]
+Description=Reset the public Tapedeck demo to its seeded history
+
+[Service]
+Type=oneshot
+ExecStart=%h/tapedeck/demo/demo-reset.sh
