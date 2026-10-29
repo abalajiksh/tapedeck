@@ -173,7 +173,7 @@
 		>
 			<div style="flex:none;display:flex;align-items:center;gap:12px;padding:22px 22px 18px;">
 				<div style="display:inline-flex;align-items:center;justify-content:center;width:42px;height:42px;border-radius:13px;background:var(--td-panel);">
-					<svg viewBox="0 0 32 20" width="24" fill="none"><rect x="1" y="1" width="30" height="18" rx="4" stroke="#f4e7cf" stroke-width="1.7"/><circle cx="11" cy="11" r="3.2" stroke="#c67139" stroke-width="1.7"/><circle cx="21" cy="11" r="3.2" stroke="#7a8a5e" stroke-width="1.7"/></svg>
+					<svg viewBox="9 17 46 30" width="24"><line x1="23" y1="43" x2="45" y2="43" stroke="#F2E6D0" stroke-width="4.5" stroke-linecap="round"/><circle cx="23" cy="31" r="12" fill="#E9A23B"/><circle cx="45" cy="35" r="8" fill="#E9A23B"/><circle cx="23" cy="31" r="3.6" fill="#261A15"/><circle cx="45" cy="35" r="3" fill="#261A15"/></svg>
 				</div>
 				<div style="flex:1;min-width:0;">
 					<div style="font-family:'Caprasimo',serif;font-size:21px;line-height:1;letter-spacing:-.02em;">Tapedeck</div>
@@ -280,7 +280,7 @@
 						<svg viewBox="0 0 24 24" width="22" fill="none" stroke="currentColor" stroke-width="2.75" stroke-linecap="round"><path d="M4 7h16M4 12h16M4 17h16"/></svg>
 					</button>
 					<div style="display:inline-flex;align-items:center;justify-content:center;width:34px;height:34px;border-radius:10px;background:var(--td-panel);">
-						<svg viewBox="0 0 32 20" width="20" fill="none"><rect x="1" y="1" width="30" height="18" rx="4" stroke="#f4e7cf" stroke-width="1.8"/><circle cx="11" cy="11" r="3" stroke="#c67139" stroke-width="1.8"/><circle cx="21" cy="11" r="3" stroke="#7a8a5e" stroke-width="1.8"/></svg>
+						<svg viewBox="9 17 46 30" width="20"><line x1="23" y1="43" x2="45" y2="43" stroke="#F2E6D0" stroke-width="4.5" stroke-linecap="round"/><circle cx="23" cy="31" r="12" fill="#E9A23B"/><circle cx="45" cy="35" r="8" fill="#E9A23B"/><circle cx="23" cy="31" r="3.6" fill="#261A15"/><circle cx="45" cy="35" r="3" fill="#261A15"/></svg>
 					</div>
 					<div style="font-family:'Caprasimo',serif;font-size:19px;letter-spacing:-.02em;">Tapedeck</div>
 				</div>
