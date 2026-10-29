@@ -24,6 +24,7 @@ fn main() {
     // has to be listed, or an edit to it will not trigger a rebuild.
     for path in [
         "web/src",
+        "web/static",
         "web/package.json",
         "web/bun.lock",
         "web/svelte.config.js",
