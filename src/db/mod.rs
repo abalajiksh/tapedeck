@@ -1233,6 +1233,20 @@ resolves_cover!(RediscoveryRow);
 resolves_cover!(AlbumAggregate);
 
 /// The three artwork columns of one listen, unpacked from [`COVER_PICK`].
+/// A listen's `artwork_url` as it may go to somebody who is not its owner.
+///
+/// `/api/v1/art/{id}` — what `backfill_artwork` writes for every listen from a
+/// media server — proxies the *owner's* server and answers only for the
+/// caller's own listens, so on anyone else's screen it is a 404 and a lettered
+/// tile. Dropping it lets the page fall back to the Cover Art Archive ids the
+/// row also carries. Uploads (`/api/v1/art/upload/…`) are instance-wide and
+/// stay.
+pub(crate) fn foreign_artwork(url: Option<String>) -> Option<String> {
+    url.filter(|u| {
+        !u.strip_prefix("/api/v1/art/").is_some_and(|rest| rest.bytes().all(|b| b.is_ascii_digit()))
+    })
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Cover {
     pub artwork_url: Option<String>,

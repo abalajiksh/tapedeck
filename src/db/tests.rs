@@ -8820,6 +8820,185 @@ async fn a_sitting_says_what_it_is_not_showing() {
     assert_eq!(view.withheld, 1, "and the evening says so rather than quietly omitting it");
 }
 
+/// An accepted play carries what the host's deck said about the file.
+///
+/// A capture names the play and nothing more, so every accepted copy used to
+/// land with no codec — no badge on the guest's history, no place in their
+/// fidelity shares — although the room heard exactly that stream. The one
+/// field left behind is `dsd_to_pcm_converted`, which comes from the host's
+/// chain rather than the file.
+#[tokio::test]
+async fn an_accepted_play_carries_the_hosts_audio_details() {
+    let db = testdb().await;
+    let (me, them, chain) = patched_pair(&db).await;
+    let spool = db.start_spool(them, None, &[me], &[]).await.unwrap();
+    db.set_spool_membership(&spool, me, true).await.unwrap();
+
+    let mut q = AudioQuality {
+        codec: Some("FLAC".into()),
+        sample_rate: Some(96_000),
+        bit_depth: Some(24),
+        channels: Some(2),
+        is_lossless: Some(true),
+        dsd_to_pcm_converted: Some(true),
+        ..Default::default()
+    };
+    q.fill_classification();
+    q.compute_score();
+    let p = Play::new(
+        "Teardrop".into(),
+        "Massive Attack".into(),
+        1_760_000_000,
+        "s-hi".into(),
+        "test".into(),
+    );
+    db.save_scrobble(
+        them,
+        &p,
+        Some(&q),
+        None,
+        Some(chain),
+        None,
+        None,
+        None,
+        None,
+        ListenDisposition::LIVE,
+    )
+    .await
+    .unwrap();
+    // No audio reported: the copy must not borrow another play's.
+    listen(&db, them, Some(chain), "Angel", "Massive Attack", 1_760_000_400).await;
+
+    let ids: Vec<i64> = db.spool_captures(me).await.unwrap().iter().map(|c| c.id).collect();
+    assert_eq!(db.settle_captures(me, &ids, true).await.unwrap().0, 2);
+
+    type Audio = (
+        Option<String>,
+        Option<String>,
+        Option<i64>,
+        Option<i64>,
+        Option<bool>,
+        Option<f64>,
+        Option<bool>,
+    );
+    let audio = |uid: i64, title: &'static str| {
+        let db = &db;
+        async move {
+            sqlx::query_as::<_, Audio>(
+                "SELECT format_type, codec, sample_rate, bit_depth, is_lossless, quality_score,
+                        dsd_to_pcm_converted
+                   FROM scrobbles WHERE user_id = ? AND title = ?",
+            )
+            .bind(uid)
+            .bind(title)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap()
+        }
+    };
+    let host = audio(them, "Teardrop").await;
+    let copy = audio(me, "Teardrop").await;
+    assert!(host.1.is_some() && host.5.is_some(), "the fixture reported a codec and scored it");
+    assert_eq!(
+        (&copy.0, &copy.1, copy.2, copy.3, copy.4, copy.5),
+        (&host.0, &host.1, host.2, host.3, host.4, host.5),
+        "the guest's copy says what the room heard"
+    );
+    assert_eq!(copy.6, None, "a chain-derived fact stays with the host's chain");
+
+    let bare = audio(me, "Angel").await;
+    assert_eq!((bare.1, bare.5), (None, None), "nothing reported, nothing copied");
+}
+
+/// *Show patched decks every listen* reaches the sitting page, not only the
+/// Reel.
+///
+/// Found on a running instance (2026-10-31): a guest switched it on mid-sitting
+/// and the host's page still counted all three of their plays as withheld,
+/// while the guest's page showed the host's — one evening, two different
+/// timelines, and the same plays on the host's Reel. The page had kept the
+/// chain-only rule the Reel dropped in August.
+#[tokio::test]
+async fn a_sitting_shows_what_the_open_everything_switch_opens() {
+    let db = testdb().await;
+    let (me, them, _) = patched_pair(&db).await;
+    // Patched the other way round: `them` follows lou, so lou may be invited,
+    // but lou was never let into `them`'s deck.
+    let stranger = db.create_user("lou", None, "pw", "user").await.unwrap();
+    let ask = db.request_patch(them, stranger).await.unwrap();
+    db.settle_patch(&ask, stranger, true).await.unwrap();
+
+    let spool = db.start_spool(them, None, &[me, stranger], &[]).await.unwrap();
+    db.set_spool_membership(&spool, me, true).await.unwrap();
+    db.set_spool_membership(&spool, stranger, true).await.unwrap();
+    // Navidrome-style: no chain at all, so only the switch can publish it.
+    listen(&db, them, None, "Teardrop", "Massive Attack", 1_760_000_000).await;
+
+    let closed = db.spool_detail(&spool, me).await.unwrap().unwrap();
+    assert!(closed.plays.is_empty(), "with the switch off a chainless play is withheld");
+    assert_eq!(closed.withheld, 1);
+
+    db.set_share_all_with_patched(them, true).await.unwrap();
+
+    let open = db.spool_detail(&spool, me).await.unwrap().unwrap();
+    assert_eq!(open.plays.len(), 1, "the switch publishes it to a deck they let in");
+    assert_eq!(open.withheld, 0);
+    assert_eq!(
+        open.plays[0].standing, "theirs",
+        "seen, never offered — capturing into a history still takes a shared chain"
+    );
+    assert_eq!(db.spool_history(me, 50).await.unwrap()[0].plays, 1, "and the list counts it too");
+
+    let outsider = db.spool_detail(&spool, stranger).await.unwrap().unwrap();
+    assert!(
+        outsider.plays.is_empty(),
+        "being in the room is not a patch: the switch opens up to decks they let in"
+    );
+    assert_eq!(outsider.withheld, 1);
+}
+
+/// Somebody else's play never carries the artwork proxy URL.
+///
+/// `/api/v1/art/{id}` answers only for the caller's own listens, so the
+/// sitting drew the host's Plex plays as lettered tiles on the guest's screen
+/// while the host saw covers. Their play goes out with the Cover Art Archive
+/// ids alone; your own keeps the proxy.
+#[tokio::test]
+async fn a_sitting_does_not_hand_out_somebody_elses_artwork_proxy() {
+    let db = testdb().await;
+    let (me, them, chain) = patched_pair(&db).await;
+    let spool = db.start_spool(them, None, &[me], &[]).await.unwrap();
+    db.set_spool_membership(&spool, me, true).await.unwrap();
+    listen(&db, them, Some(chain), "Teardrop", "Massive Attack", 1_760_000_000).await;
+
+    let id: i64 = sqlx::query_scalar("SELECT id FROM scrobbles WHERE title = 'Teardrop'")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    db.set_scrobble_artwork(id, &format!("/api/v1/art/{id}"), None, None).await.unwrap();
+
+    let theirs = db.spool_detail(&spool, me).await.unwrap().unwrap();
+    assert_eq!(theirs.plays[0].artwork_url, None, "a 404 on the guest's screen");
+    let own = db.spool_detail(&spool, them).await.unwrap().unwrap();
+    assert_eq!(own.plays[0].artwork_url, Some(format!("/api/v1/art/{id}")));
+    assert!(
+        db.reel(me, 50, None, None, None).await.unwrap().iter().all(|r| r.artwork_url.is_none()),
+        "nor on the Reel"
+    );
+}
+
+#[test]
+fn foreign_artwork_drops_the_listen_proxy_and_nothing_else() {
+    assert_eq!(foreign_artwork(Some("/api/v1/art/914".into())), None);
+    for kept in [
+        "/api/v1/art/upload/0123456789abcdef01234567.jpg",
+        "https://coverartarchive.org/release/x/1-250.jpg",
+    ] {
+        assert_eq!(foreign_artwork(Some(kept.into())).as_deref(), Some(kept));
+    }
+    assert_eq!(foreign_artwork(None), None);
+}
+
 /// A sitting stays visible after the patch that made it possible is gone.
 ///
 /// The decision, and it is a deliberate widening rather than an inherited rule:

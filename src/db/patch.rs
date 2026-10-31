@@ -699,6 +699,13 @@ impl Database {
         .bind(limit)
         .fetch_all(&self.pool)
         .await
+        .map(|mut rows: Vec<ReelListen>| {
+            // Every row is somebody else's: you cannot patch into yourself.
+            for r in &mut rows {
+                r.artwork_url = foreign_artwork(r.artwork_url.take());
+            }
+            rows
+        })
     }
     /// Decks on this instance that this user could patch into.
     ///
@@ -1602,6 +1609,26 @@ impl Database {
             captured,
         }))
     }
+    /// Whether a play in a sitting reaches this viewer's timeline. Binds the
+    /// viewer's id twice; needs `s` (scrobbles), `u` (its owner) and a
+    /// `LEFT JOIN`ed `c` (its chain).
+    ///
+    /// Your own, always. Somebody else's on `PATCH_VISIBLE_LISTENS`' terms:
+    /// they share the chain it ran through, or they have opened everything to
+    /// the decks they let in and yours is one of them. Through v0.126.2 this was
+    /// the chain alone — the rule the Reel dropped on 2026-08-26 — so a member
+    /// who had switched on *show patched decks every listen* still had every
+    /// play counted as withheld here while the same plays sat on your Reel.
+    ///
+    /// What this does **not** widen is capturing: a play enters somebody else's
+    /// history only through a shared chain (`set_chain_shared`). Seen here
+    /// through the switch alone, a play is `theirs` — it happened, nobody
+    /// offered it.
+    const SITTING_VISIBLE: &'static str = "(s.user_id = ? OR c.shared = 1 \
+         OR (u.share_all_with_patched = 1 AND EXISTS (SELECT 1 FROM patches p \
+             WHERE p.follower_user_id = ? AND p.target_user_id = s.user_id \
+               AND p.state = 'accepted')))";
+
     /// Every sitting this person was actually in, newest first.
     ///
     /// **Membership is the gate, not the patch**, and that is a deliberate
@@ -1616,8 +1643,8 @@ impl Database {
     /// has vanished is a row with nothing to explain it.
     ///
     /// What that widening does **not** touch is what any of it *shows*. A
-    /// sitting still only ever renders the plays the chain gate allows, which
-    /// is applied here in the SQL and again in [`Database::spool_detail`] —
+    /// sitting still only ever renders the plays `SITTING_VISIBLE` allows,
+    /// which both this and [`Database::spool_detail`] apply in the SQL —
     /// never in a handler, which is a filter a second handler can forget.
     ///
     /// Four queries whatever the page holds, folded in Rust: the sittings, then
@@ -1699,18 +1726,20 @@ impl Database {
         let sql = format!(
             "SELECT s.joint_session_id, COUNT(*)
                FROM scrobbles s
+               JOIN users u ON u.id = s.user_id
                LEFT JOIN signal_chains c ON c.id = s.chain_id
               WHERE s.joint_session_id IN ({uuid_marks}) AND s.skipped = FALSE
                 AND s.source_name != 'Shared Spool'
-                AND (s.user_id = ? OR c.shared = 1)
-              GROUP BY s.joint_session_id"
+                AND {}
+              GROUP BY s.joint_session_id",
+            Self::SITTING_VISIBLE
         );
         let stmt = crate::sql!(&sql);
         let mut q = sqlx::query_as::<_, (String, i64)>(&stmt);
         for u in &uuids {
             q = q.bind(u);
         }
-        let play_rows = q.bind(user_id).fetch_all(&self.pool).await?;
+        let play_rows = q.bind(user_id).bind(user_id).fetch_all(&self.pool).await?;
 
         let sql = format!(
             "SELECT sp.uuid, COUNT(*)
@@ -1825,7 +1854,7 @@ impl Database {
 
         // Every listen carrying this sitting's id, whoever's it is, with the
         // two things that decide what happens to it: whose it is, and whether
-        // the chain it ran through is shared.
+        // this viewer may see it (`SITTING_VISIBLE`).
         #[allow(clippy::type_complexity)]
         let rows: Vec<(
             i64,
@@ -1842,17 +1871,20 @@ impl Database {
             Option<i64>,
             Option<String>,
             String,
-        )> = sqlx::query_as(&crate::sql!(
+        )> = sqlx::query_as(&crate::sql!(&format!(
             "SELECT s.user_id, u.username, u.display_name, s.title, s.artist, s.album,
                     s.duration, s.timestamp, s.source_name,
-                    CASE WHEN c.shared = 1 THEN 1 ELSE 0 END,
+                    CASE WHEN {} THEN 1 ELSE 0 END,
                     s.artwork_url, s.caa_id, s.caa_release_mbid, s.source_id
                FROM scrobbles s
                JOIN users u ON u.id = s.user_id
                LEFT JOIN signal_chains c ON c.id = s.chain_id
               WHERE s.joint_session_id = ? AND s.skipped = FALSE
-              ORDER BY s.timestamp"
-        ))
+              ORDER BY s.timestamp",
+            Self::SITTING_VISIBLE
+        )))
+        .bind(user_id)
+        .bind(user_id)
         .bind(uuid)
         .fetch_all(&self.pool)
         .await?;
@@ -1902,7 +1934,7 @@ impl Database {
                 duration,
                 at,
                 source_name,
-                shared,
+                visible,
                 artwork_url,
                 caa_id,
                 caa_release_mbid,
@@ -1918,10 +1950,9 @@ impl Database {
                 }
                 continue;
             }
-            // Your own listens are always yours to see. Everybody else's are
-            // published by the chain gate and by nothing else — the default has
-            // to be exclusion, the same call `reel` makes.
-            if !mine && shared.unwrap_or(0) == 0 {
+            // Your own listens are always yours to see; everybody else's only
+            // as `SITTING_VISIBLE` allows. The default has to be exclusion.
+            if !mine && visible.unwrap_or(0) == 0 {
                 withheld += 1;
                 continue;
             }
@@ -1967,7 +1998,11 @@ impl Database {
                 from_display_name: display_name.clone(),
                 standing,
                 capture_id,
-                artwork_url: artwork_url.clone(),
+                artwork_url: if mine {
+                    artwork_url.clone()
+                } else {
+                    foreign_artwork(artwork_url.clone())
+                },
                 caa_id: *caa_id,
                 caa_release_mbid: caa_release_mbid.clone(),
             });
@@ -2897,13 +2932,15 @@ impl Database {
     ) -> Result<Option<HandedSittingDetail>, sqlx::Error> {
         // Readable by the recipient, or by whoever handed it over — so you can
         // see what you actually passed on, holes included.
-        let Some((session_uuid, note, from_username, from_display_name)): Option<(
+        #[allow(clippy::type_complexity)]
+        let Some((session_uuid, note, from_user_id, from_username, from_display_name)): Option<(
             String,
             Option<String>,
+            i64,
             String,
             Option<String>,
         )> = sqlx::query_as(&crate::sql!(
-            "SELECT ss.session_uuid, ss.note, u.username, u.display_name
+            "SELECT ss.session_uuid, ss.note, ss.from_user_id, u.username, u.display_name
                FROM shared_sessions ss JOIN users u ON u.id = ss.from_user_id
               WHERE ss.uuid = ? AND (ss.to_user_id = ? OR ss.from_user_id = ?)"
         ))
@@ -2944,7 +2981,7 @@ impl Database {
             }));
         };
 
-        let listens: Vec<HandedListen> = sqlx::query_as(&crate::sql!(
+        let mut listens: Vec<HandedListen> = sqlx::query_as(&crate::sql!(
             "SELECT s.title, s.artist, s.album, s.timestamp, s.duration, s.artwork_url,
                     s.caa_id, s.caa_release_mbid,
                     CASE WHEN c.shared = 1 THEN c.name END AS chain_name
@@ -2958,6 +2995,11 @@ impl Database {
         .bind(session_id)
         .fetch_all(&self.pool)
         .await?;
+        if from_user_id != viewer_id {
+            for l in &mut listens {
+                l.artwork_url = foreign_artwork(l.artwork_url.take());
+            }
+        }
 
         // Everything in the sitting that the reader is not being shown. One
         // count, stated on the document — never a silent difference.
@@ -3210,15 +3252,16 @@ impl Database {
 
         let sql = format!(
             "SELECT cap.id, cap.title, cap.artist, cap.album, cap.duration, cap.played_at,
-                    sp.uuid, cap.company
+                    sp.uuid, cap.company, cap.from_user_id
                FROM spool_captures cap JOIN spools sp ON sp.id = cap.spool_id
               WHERE cap.user_id = ? AND cap.state = 'pending'
                 AND cap.id IN ({placeholders})"
         );
         let stmt = crate::sql!(&sql);
+        #[allow(clippy::type_complexity)]
         let mut q = sqlx::query_as::<
             _,
-            (i64, String, String, Option<String>, Option<i64>, i64, String, Option<String>),
+            (i64, String, String, Option<String>, Option<i64>, i64, String, Option<String>, i64),
         >(&stmt)
         .bind(user_id);
         for id in ids {
@@ -3229,8 +3272,9 @@ impl Database {
         let mut settled = 0;
         let mut forwarded = 0;
         let now = Self::now_secs();
-        for (id, title, artist, album, duration, played_at, spool_uuid, company) in rows {
+        for (id, title, artist, album, duration, played_at, spool_uuid, company, from) in rows {
             if accept {
+                let quality = self.host_audio(from, &spool_uuid, &title, played_at).await?;
                 let mut play = Play::new(
                     title,
                     artist,
@@ -3251,7 +3295,7 @@ impl Database {
                 self.save_scrobble(
                     user_id,
                     &play,
-                    None,
+                    quality.as_ref(),
                     None,
                     chain_id,
                     None,
@@ -3288,6 +3332,86 @@ impl Database {
             settled += 1;
         }
         Ok((settled, forwarded))
+    }
+    /// What the host's deck reported about the file behind a capture, for the
+    /// copy an accepted capture writes.
+    ///
+    /// A capture carries only what names the play, so every accepted copy used
+    /// to arrive with no codec, no badge and no place in a fidelity share,
+    /// although the room heard exactly the stream the host's listen describes.
+    /// Read from the host's original at accept time rather than stored on the
+    /// capture, so the three places that create captures stay as they are.
+    ///
+    /// Matched the way `spool_detail` matches: whose deck, what title, nearest
+    /// time — a capture's clock can be corrected and then no longer equals the
+    /// listen's. `dsd_to_pcm_converted` stays behind: it is derived from the
+    /// host's chain, and the copy is filed under the guest's.
+    async fn host_audio(
+        &self,
+        host: i64,
+        spool_uuid: &str,
+        title: &str,
+        played_at: i64,
+    ) -> Result<Option<AudioQuality>, sqlx::Error> {
+        #[derive(FromRow)]
+        struct HostAudio {
+            format_type: Option<String>,
+            codec: Option<String>,
+            bitrate: Option<i32>,
+            sample_rate: Option<i32>,
+            bit_depth: Option<i32>,
+            channels: Option<i32>,
+            container: Option<String>,
+            source_quality: Option<String>,
+            is_lossless: Option<bool>,
+            dsd_rate: Option<i64>,
+            dsd_multiplier: Option<i32>,
+            delivery_codec: Option<String>,
+            delivery_bitrate: Option<i32>,
+            delivery_sample_rate: Option<i32>,
+            delivery_bit_depth: Option<i32>,
+            is_transcoded: Option<bool>,
+            transcode_reason: Option<String>,
+            quality_score: Option<f64>,
+        }
+        let row: Option<HostAudio> = sqlx::query_as(&crate::sql!(
+            "SELECT format_type, codec, bitrate, sample_rate, bit_depth, channels, container,
+                    source_quality, is_lossless, dsd_rate, dsd_multiplier,
+                    delivery_codec, delivery_bitrate, delivery_sample_rate, delivery_bit_depth,
+                    is_transcoded, transcode_reason, quality_score
+               FROM scrobbles
+              WHERE user_id = ? AND joint_session_id = ? AND skipped = FALSE
+                AND source_name != 'Shared Spool' AND LOWER(title) = LOWER(?)
+              ORDER BY ABS(timestamp - ?)
+              LIMIT 1"
+        ))
+        .bind(host)
+        .bind(spool_uuid)
+        .bind(title)
+        .bind(played_at)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|h| AudioQuality {
+            format_type: h.format_type,
+            codec: h.codec,
+            bitrate: h.bitrate,
+            sample_rate: h.sample_rate,
+            bit_depth: h.bit_depth.map(|v| v as i16),
+            channels: h.channels.map(|v| v as i16),
+            container: h.container,
+            is_lossless: h.is_lossless,
+            dsd_rate: h.dsd_rate,
+            dsd_multiplier: h.dsd_multiplier.map(|v| v as i16),
+            delivery_codec: h.delivery_codec,
+            delivery_bitrate: h.delivery_bitrate,
+            delivery_sample_rate: h.delivery_sample_rate,
+            delivery_bit_depth: h.delivery_bit_depth,
+            source_quality: h.source_quality,
+            dsd_to_pcm_converted: None,
+            is_transcoded: h.is_transcoded,
+            transcode_reason: h.transcode_reason,
+            quality_score: h.quality_score,
+        }))
     }
     /// Whether this account wants accepted Shared Spool plays relayed onward.
     pub async fn forward_spool_listens(&self, user_id: i64) -> Result<bool, sqlx::Error> {
