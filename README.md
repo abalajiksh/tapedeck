@@ -451,6 +451,23 @@ Deliberately **not** condition grading (M/NM/VG+): that describes the object's
 wear rather than where it came from, and it is the field people abandon filling
 in.
 
+**Where it lives, and which edition it is** — "Living room, shelf 2", "Clear,
+180 g" — plus the label and country, all free text. Search reads them, so a
+shelf of three hundred records can be narrowed to one crate.
+
+**Labels for the sleeve.** *The Shelf → Labels* prints QR codes, 64 × 30 mm, for
+the inside of a sleeve or a tape case. Scanning one opens that record on your
+shelf with its sides ready to start — it never starts one by itself, because a
+label can be scanned by accident and a listen is something you say happened.
+
+**Coming from DVinyl.** [DVinyl](https://github.com/Kyonew/DVinyl) has no API
+to sync against, so its collection export is the way in: *Settings → Data →
+From DVinyl* takes the zip (with your uploaded images) or the JSON, shows what
+it would do, and then does it. Discogs' side letters become sides; label,
+catalogue number, country, edition and location come across; your comments,
+sleeve condition and own fields go into the note; the wishlist goes into the
+Crate. Digital releases and non-music items are left, and so is market value.
+
 **Every track of a record wears that record's sleeve.** A side used to go in
 with no artwork, so the artwork chain resolved each listen by asking a provider
 about the song — and a provider answers per song, so one side came back with a
@@ -1523,6 +1540,7 @@ src/
 │   ├── deezer.rs            Deezer artwork provider
 │   ├── bio.rs               BioProvider chain (Last.fm → TheAudioDB → …)
 │   └── release_lookup.rs    Pressing lookup for the shelf (MusicBrainz, Discogs)
+├── dvinyl/                  Reading a DVinyl collection export (fixtures: a real 3.2.1 one)
 ├── patch/                   Actor documents, keypairs, HTTP signatures
 ├── mcp/                     Model Context Protocol: dispatch, tools, prompts
 ├── report_image/            A report chapter drawn as a PNG (fonts, SVG, layout)
@@ -1826,6 +1844,10 @@ See LICENSE file for details.
 - [Every Noise at Once](https://everynoise.com) — Glenn McDonald's map of the
   genre space, which the Genre Map and Playlist Lab are both built on
 - [Discogs](https://www.discogs.com) — pressing-level release data for the shelf
+- [DVinyl](https://github.com/Kyonew/DVinyl) — Kyo's collection manager, whose
+  location field, editions and QR labels the shelf borrowed, and whose export it
+  reads
+- [uqr](https://github.com/unjs/uqr) — the QR codes on shelf labels
 - [AudioMuse-AI](https://github.com/NeptuneHub/AudioMuse-AI) — NeptuneHub's
   sonic analysis of your own library, the optional source of per-recording audio
   vectors

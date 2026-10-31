@@ -1979,6 +1979,23 @@ export interface SpinUpdate {
 	start_secs?: number;
 }
 
+/** What a DVinyl import did — or, on a dry run, would do. */
+export interface DvinylImported {
+	dry_run: boolean;
+	collection: string;
+	dvinyl_version: string | null;
+	releases: number;
+	already_on_the_shelf: number;
+	wants: number;
+	wants_already_in_the_crate: number;
+	images: number;
+	missing_scans: number;
+	skipped_digital: number;
+	skipped_not_music: number;
+	skipped_unreadable: number;
+	note: string;
+}
+
 export interface PhysicalRelease {
 	id: number;
 	kind: 'vinyl' | 'cassette' | 'cd' | 'sacd';
@@ -2004,6 +2021,14 @@ export interface PhysicalRelease {
 	/** Where from — the shop, the fair, the person. Free text, because that is
 	 *  the half that makes a thrift find a story rather than a flag. */
 	acquired_from: string | null;
+	/** Where it lives — a room, a shelf, a box. Free text. */
+	location: string | null;
+	/** The edition as the sleeve says it: a colour, a weight, "Record Store
+	 *  Day". Free text. */
+	edition: string | null;
+	country: string | null;
+	/** The record label. */
+	label: string | null;
 	/** What it is normally played on. The deck pre-fills from these and writes
 	 *  the answer back, so a record with one turntable is asked once. */
 	chain_id: number | null;
@@ -3205,6 +3230,9 @@ class TapedeckAPI {
 			purchased_at?: number | null;
 			acquired_as?: string | null;
 			acquired_from?: string | null;
+			location?: string | null;
+			edition?: string | null;
+			label?: string | null;
 			/** Pull the sleeve, labels and booklet from the Cover Art Archive as
 			 *  part of adding it. Defaults to on server-side. */
 			fetch_images?: boolean;
@@ -3299,6 +3327,12 @@ class TapedeckAPI {
 			 *  answer is worse than a blank. */
 			acquired_as?: string | null;
 			acquired_from?: string | null;
+			/** Where it lives, which edition, where it was released, and on
+			 *  which label. All clearable. */
+			location?: string | null;
+			edition?: string | null;
+			country?: string | null;
+			label?: string | null;
 		}
 	): Promise<{ status: string; sides_rewritten?: boolean }> {
 		return this.patch(`/api/v1/physical/${id}`, body);
@@ -3912,6 +3946,34 @@ class TapedeckAPI {
 			method: 'POST', credentials: 'same-origin', body: form
 		});
 		if (!res.ok) throw new Error(`API ${res.status}: ${await res.text()}`);
+		return res.json();
+	}
+
+	/** Bring a collection over from DVinyl — its per-collection export, the
+	 *  zip (with uploaded images) or the bare JSON.
+	 *
+	 *  Records, tapes and discs go onto the shelf; the wishlist goes into the
+	 *  Crate. With `dryRun`, nothing is written and the counts say what would
+	 *  happen. Matched before inserting, so importing twice changes nothing. */
+	async importDvinyl(file: File, dryRun: boolean): Promise<DvinylImported> {
+		const form = new FormData();
+		form.append('file', file);
+		const res = await fetch(
+			`${BASE}/api/v1/physical/import/dvinyl${dryRun ? '?dry_run=1' : ''}`,
+			{ method: 'POST', credentials: 'same-origin', body: form }
+		);
+		if (!res.ok) {
+			// The refusals are sentences for the person who chose the file —
+			// which export to make instead — so the sentence is what is shown.
+			const text = await res.text();
+			let msg = text;
+			try {
+				msg = JSON.parse(text).error ?? text;
+			} catch {
+				// a proxy's own page, or the body limit's plain-text 413
+			}
+			throw new Error(res.status === 413 ? 'That file is larger than 64 MB.' : msg);
+		}
 		return res.json();
 	}
 

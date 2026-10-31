@@ -1,0 +1,624 @@
+{
+  "collectionName": "Vinyl",
+  "albums": [
+    {
+      "_id": "6ae5dbc89a4113f8590692bb",
+      "title": "The Dark Side of the Moon",
+      "sort_title": "dark side of the moon",
+      "year": "1973",
+      "cover_image": "https://i.discogs.com/example/cover.jpg",
+      "user_image": "/uploads/items/item-82f4121a-f240-42d9-901a-6d782c7b3138.jpg",
+      "images": [
+        "https://i.discogs.com/example/cover.jpg",
+        "/uploads/items/item-82f4121a-f240-42d9-901a-6d782c7b3138.jpg"
+      ],
+      "in_wishlist": false,
+      "comments": "Bought at the Kreuzberg record fair.",
+      "location": "Living room, shelf 2",
+      "quantity": 1,
+      "genre": "Rock",
+      "genres": [
+        "Rock"
+      ],
+      "styles": [
+        "Prog Rock",
+        "Psychedelic Rock"
+      ],
+      "barcode": "5099902987613",
+      "barcode_locked": false,
+      "source": "",
+      "source_id": "",
+      "added_at": "2024-05-18T00:00:00.000Z",
+      "kind": "Music",
+      "artist": "Pink Floyd",
+      "label": "Harvest",
+      "catalog_number": "SHVL 804",
+      "media_type": "vinyl",
+      "format_type": "Vinyl, LP, Album, Reissue, Remastered, 180 Gram",
+      "variant_color": "Clear",
+      "sleeve_condition": "VG+",
+      "discogs_id": 1873013,
+      "country": "Europe",
+      "tracklist": [
+        {
+          "position": "A1",
+          "title": "Speak to Me",
+          "duration": "1:13",
+          "tags": [],
+          "_id": "6ae5dbc89a4113f8590692bc"
+        },
+        {
+          "position": "A2",
+          "title": "Breathe",
+          "duration": "2:43",
+          "tags": [],
+          "_id": "6ae5dbc89a4113f8590692bd"
+        },
+        {
+          "position": "A3",
+          "title": "On the Run",
+          "duration": "3:36",
+          "tags": [],
+          "_id": "6ae5dbc89a4113f8590692be"
+        },
+        {
+          "position": "A4",
+          "title": "Time",
+          "duration": "7:01",
+          "tags": [],
+          "_id": "6ae5dbc89a4113f8590692bf"
+        },
+        {
+          "position": "A5",
+          "title": "The Great Gig in the Sky",
+          "duration": "4:36",
+          "tags": [],
+          "_id": "6ae5dbc89a4113f8590692c0"
+        },
+        {
+          "position": "B1",
+          "title": "Money",
+          "duration": "6:22",
+          "tags": [],
+          "_id": "6ae5dbc89a4113f8590692c1"
+        },
+        {
+          "position": "B2",
+          "title": "Us and Them",
+          "duration": "7:46",
+          "tags": [],
+          "_id": "6ae5dbc89a4113f8590692c2"
+        },
+        {
+          "position": "B3",
+          "title": "Any Colour You Like",
+          "duration": "3:25",
+          "tags": [],
+          "_id": "6ae5dbc89a4113f8590692c3"
+        },
+        {
+          "position": "B4",
+          "title": "Brain Damage",
+          "duration": "3:48",
+          "tags": [],
+          "_id": "6ae5dbc89a4113f8590692c4"
+        },
+        {
+          "position": "B5",
+          "title": "Eclipse",
+          "duration": "2:03",
+          "tags": [],
+          "_id": "6ae5dbc89a4113f8590692c5"
+        }
+      ],
+      "updated_at": "2026-10-31T12:15:04.852Z"
+    },
+    {
+      "_id": "6ae5dbc89a4113f8590692d3",
+      "title": "Untrue",
+      "sort_title": "untrue",
+      "year": "2007",
+      "cover_image": "",
+      "user_image": "",
+      "images": [],
+      "in_wishlist": false,
+      "comments": "",
+      "location": "Living room, shelf 3",
+      "quantity": 2,
+      "genre": "",
+      "genres": [],
+      "styles": [],
+      "barcode": "",
+      "barcode_locked": false,
+      "source": "",
+      "source_id": "",
+      "added_at": "2026-10-31T12:15:04.879Z",
+      "kind": "Music",
+      "artist": "Burial",
+      "label": "Hyperdub",
+      "catalog_number": "HDBLP002",
+      "media_type": "vinyl",
+      "format_type": "Vinyl, 12\", Album",
+      "sleeve_condition": "",
+      "country": "UK",
+      "tracklist": [
+        {
+          "position": "A1",
+          "title": "Untitled",
+          "duration": "0:45",
+          "tags": [],
+          "_id": "6ae5dbc89a4113f8590692d4"
+        },
+        {
+          "position": "A2",
+          "title": "Archangel",
+          "duration": "3:58",
+          "tags": [],
+          "_id": "6ae5dbc89a4113f8590692d5"
+        },
+        {
+          "position": "B1",
+          "title": "Near Dark",
+          "duration": "3:54",
+          "tags": [],
+          "_id": "6ae5dbc89a4113f8590692d6"
+        },
+        {
+          "position": "B2",
+          "title": "Ghost Hardware",
+          "duration": "4:53",
+          "tags": [],
+          "_id": "6ae5dbc89a4113f8590692d7"
+        },
+        {
+          "position": "C1",
+          "title": "Endorphin",
+          "duration": "2:56",
+          "tags": [],
+          "_id": "6ae5dbc89a4113f8590692d8"
+        },
+        {
+          "position": "C2",
+          "title": "Etched Headplate",
+          "duration": "5:59",
+          "tags": [],
+          "_id": "6ae5dbc89a4113f8590692d9"
+        },
+        {
+          "position": "D1",
+          "title": "Untrue",
+          "duration": "6:16",
+          "tags": [],
+          "_id": "6ae5dbc89a4113f8590692da"
+        },
+        {
+          "position": "D2",
+          "title": "Raver",
+          "duration": "4:59",
+          "tags": [],
+          "_id": "6ae5dbc89a4113f8590692db"
+        }
+      ],
+      "updated_at": "2026-10-31T12:15:04.881Z"
+    },
+    {
+      "_id": "6ae5dbc89a4113f8590692e7",
+      "title": "Paul's Boutique",
+      "sort_title": "paul's boutique",
+      "year": "1989",
+      "cover_image": "",
+      "user_image": "",
+      "images": [],
+      "in_wishlist": false,
+      "comments": "",
+      "location": "Car",
+      "quantity": 1,
+      "genre": "",
+      "genres": [],
+      "styles": [],
+      "barcode": "",
+      "barcode_locked": false,
+      "source": "",
+      "source_id": "",
+      "added_at": "2026-10-31T12:15:04.900Z",
+      "kind": "Music",
+      "artist": "Beastie Boys",
+      "media_type": "cassette",
+      "format_type": "Cassette, Album",
+      "sleeve_condition": "",
+      "country": "",
+      "tracklist": [
+        {
+          "position": "A1",
+          "title": "To All the Girls",
+          "duration": "",
+          "tags": [],
+          "_id": "6ae5dbc89a4113f8590692e8"
+        },
+        {
+          "position": "A2",
+          "title": "Shake Your Rump",
+          "duration": "",
+          "tags": [],
+          "_id": "6ae5dbc89a4113f8590692e9"
+        },
+        {
+          "position": "B1",
+          "title": "Car Thief",
+          "duration": "",
+          "tags": [],
+          "_id": "6ae5dbc89a4113f8590692ea"
+        }
+      ],
+      "updated_at": "2026-10-31T12:15:04.902Z"
+    },
+    {
+      "_id": "6ae5dbc89a4113f8590692f4",
+      "title": "Kind of Blue",
+      "sort_title": "kind of blue",
+      "year": "1959",
+      "cover_image": "",
+      "user_image": "",
+      "images": [],
+      "in_wishlist": false,
+      "comments": "",
+      "location": "",
+      "quantity": 1,
+      "genre": "",
+      "genres": [],
+      "styles": [],
+      "barcode": "074646493520",
+      "barcode_locked": false,
+      "source": "",
+      "source_id": "",
+      "added_at": "2026-10-31T12:15:04.920Z",
+      "kind": "Music",
+      "artist": "Miles Davis",
+      "media_type": "cd",
+      "format_type": "CD, Album, Reissue",
+      "sleeve_condition": "",
+      "country": "",
+      "tracklist": [
+        {
+          "position": "1",
+          "title": "So What",
+          "duration": "9:22",
+          "tags": [],
+          "_id": "6ae5dbc89a4113f8590692f5"
+        },
+        {
+          "position": "2",
+          "title": "Freddie Freeloader",
+          "duration": "9:46",
+          "tags": [],
+          "_id": "6ae5dbc89a4113f8590692f6"
+        },
+        {
+          "position": "3",
+          "title": "Blue in Green",
+          "duration": "5:37",
+          "tags": [],
+          "_id": "6ae5dbc89a4113f8590692f7"
+        }
+      ],
+      "updated_at": "2026-10-31T12:15:04.921Z"
+    },
+    {
+      "_id": "6ae5dbc89a4113f859069301",
+      "title": "Random Access Memories",
+      "sort_title": "random access memories",
+      "year": "2013",
+      "cover_image": "",
+      "user_image": "",
+      "images": [],
+      "in_wishlist": false,
+      "comments": "",
+      "location": "",
+      "quantity": 1,
+      "genre": "",
+      "genres": [],
+      "styles": [],
+      "barcode": "",
+      "barcode_locked": false,
+      "source": "",
+      "source_id": "",
+      "added_at": "2026-10-31T12:15:04.937Z",
+      "kind": "Music",
+      "artist": "Daft Punk",
+      "media_type": "digital",
+      "format_type": "File, FLAC",
+      "sleeve_condition": "",
+      "country": "",
+      "tracklist": [],
+      "updated_at": "2026-10-31T12:15:04.938Z"
+    },
+    {
+      "_id": "6ae5dbc89a4113f85906930b",
+      "title": "Selected Ambient Works 85-92",
+      "sort_title": "selected ambient works 85-92",
+      "year": "1992",
+      "cover_image": "",
+      "user_image": "",
+      "images": [],
+      "in_wishlist": true,
+      "comments": "Only the R&S original pressing.",
+      "location": "",
+      "quantity": 1,
+      "genre": "",
+      "genres": [],
+      "styles": [],
+      "barcode": "",
+      "barcode_locked": false,
+      "source": "",
+      "source_id": "",
+      "added_at": "2026-10-31T12:15:04.954Z",
+      "kind": "Music",
+      "artist": "Aphex Twin",
+      "media_type": "vinyl",
+      "format_type": "Vinyl",
+      "sleeve_condition": "",
+      "country": "",
+      "tracklist": [],
+      "updated_at": "2026-10-31T12:15:04.955Z"
+    },
+    {
+      "_id": "6ae5dbc89a4113f859069315",
+      "title": "Last Night a DJ Saved My Life",
+      "sort_title": "last night a dj saved my life",
+      "cover_image": "",
+      "user_image": "",
+      "images": [],
+      "in_wishlist": false,
+      "comments": "",
+      "location": "",
+      "quantity": 1,
+      "genre": "",
+      "genres": [],
+      "styles": [],
+      "barcode": "",
+      "barcode_locked": false,
+      "source": "",
+      "source_id": "",
+      "added_at": "2026-10-31T12:15:04.971Z",
+      "kind": "Book",
+      "author": "Bill Brewster",
+      "hardcover_slug": "",
+      "format": "paperback",
+      "readingStatus": "to_read",
+      "rating": 0,
+      "description": "",
+      "updated_at": "2026-10-31T12:15:04.972Z"
+    },
+    {
+      "_id": "6ae5dcef9a4113f859069370",
+      "title": "Blue",
+      "sort_title": "blue",
+      "year": "1971",
+      "cover_image": "",
+      "user_image": "",
+      "images": [],
+      "in_wishlist": false,
+      "comments": "",
+      "location": "",
+      "quantity": 1,
+      "genre": "",
+      "genres": [],
+      "styles": [],
+      "barcode": "",
+      "barcode_locked": false,
+      "source": "",
+      "source_id": "",
+      "added_at": "2026-10-31T12:19:59.590Z",
+      "extra": {
+        "custom_528faa1b42c0": "24 EUR"
+      },
+      "kind": "Music",
+      "artist": "Joni Mitchell",
+      "media_type": "vinyl",
+      "format_type": "Vinyl, LP, Album",
+      "sleeve_condition": "",
+      "country": "",
+      "tracklist": [
+        {
+          "position": "1",
+          "title": "All I Want",
+          "duration": "3:32",
+          "tags": [],
+          "_id": "6ae5dcef9a4113f859069371"
+        },
+        {
+          "position": "2",
+          "title": "My Old Man",
+          "duration": "3:33",
+          "tags": [],
+          "_id": "6ae5dcef9a4113f859069372"
+        },
+        {
+          "position": "3",
+          "title": "Little Green",
+          "duration": "3:25",
+          "tags": [],
+          "_id": "6ae5dcef9a4113f859069373"
+        },
+        {
+          "position": "4",
+          "title": "Carey",
+          "duration": "3:00",
+          "tags": [],
+          "_id": "6ae5dcef9a4113f859069374"
+        },
+        {
+          "position": "5",
+          "title": "Blue",
+          "duration": "3:00",
+          "tags": [],
+          "_id": "6ae5dcef9a4113f859069375"
+        },
+        {
+          "position": "6",
+          "title": "California",
+          "duration": "3:48",
+          "tags": [],
+          "_id": "6ae5dcef9a4113f859069376"
+        },
+        {
+          "position": "7",
+          "title": "This Flight Tonight",
+          "duration": "2:50",
+          "tags": [],
+          "_id": "6ae5dcef9a4113f859069377"
+        },
+        {
+          "position": "8",
+          "title": "River",
+          "duration": "4:00",
+          "tags": [],
+          "_id": "6ae5dcef9a4113f859069378"
+        },
+        {
+          "position": "9",
+          "title": "A Case of You",
+          "duration": "4:20",
+          "tags": [],
+          "_id": "6ae5dcef9a4113f859069379"
+        },
+        {
+          "position": "10",
+          "title": "The Last Time I Saw Richard",
+          "duration": "4:13",
+          "tags": [],
+          "_id": "6ae5dcef9a4113f85906937a"
+        }
+      ],
+      "updated_at": "2026-10-31T12:19:59.593Z"
+    }
+  ],
+  "furniture": [
+    {
+      "name": "Living room, shelf 2",
+      "layout": "cubes",
+      "columns": 1,
+      "rows": 3,
+      "order": 100,
+      "cells": [
+        {
+          "name": "Living room, shelf 2",
+          "key": "living room, shelf 2",
+          "row": 0,
+          "column": 0,
+          "capacity": 0
+        },
+        {
+          "name": "Living room, shelf 3",
+          "key": "living room, shelf 3",
+          "row": 1,
+          "column": 0,
+          "capacity": 0
+        },
+        {
+          "name": "Car",
+          "key": "car",
+          "row": 2,
+          "column": 0,
+          "capacity": 0
+        }
+      ]
+    }
+  ],
+  "lists": [],
+  "info": {
+    "enabled": false,
+    "shareVisible": true,
+    "title": "",
+    "body": "",
+    "images": [],
+    "updated_at": null
+  },
+  "settings": {
+    "aspectRatioClass": "aspect-square",
+    "fastAdd": "",
+    "instantAdd": false,
+    "mergeDuplicates": true,
+    "modules": {
+      "music": true,
+      "books": false,
+      "dvd": false,
+      "games": false,
+      "lego": false,
+      "boardgames": false
+    },
+    "navbarShortcuts": [
+      "global_home",
+      "music",
+      "music_vinyl",
+      "music_cd",
+      "music_cassette",
+      "music_digital",
+      "global_wishlist"
+    ],
+    "pluginCustomization": {},
+    "pluginExtraFields": {
+      "music": [
+        {
+          "name": "custom_528faa1b42c0",
+          "label": "Price paid",
+          "type": "text",
+          "required": false,
+          "group": "metadata",
+          "keyVersion": 1
+        }
+      ]
+    },
+    "pluginSettings": {
+      "music": {
+        "advancedCD": false
+      }
+    },
+    "siteName": "DVinyl",
+    "sourceOrder": {},
+    "statsWidgets": [
+      "total",
+      "vinyl",
+      "cd",
+      "cassette",
+      "digital",
+      "artist",
+      "music_genre",
+      "label"
+    ],
+    "theme": {
+      "home": {
+        "preset": "default"
+      },
+      "music": {
+        "preset": "default"
+      },
+      "books": {
+        "preset": "default"
+      },
+      "dvd": {
+        "preset": "default"
+      },
+      "games": {
+        "preset": "default"
+      },
+      "lego": {
+        "preset": "default"
+      },
+      "boardgames": {
+        "preset": "default"
+      }
+    },
+    "visibility": {
+      "applyToAdmin": false,
+      "hiddenGenres": [],
+      "hiddenItems": [],
+      "hiddenTypes": []
+    }
+  },
+  "metadata": {
+    "version": "3.2.1",
+    "type": "collection",
+    "date": "2026-10-31T12:19:59.629Z"
+  }
+}

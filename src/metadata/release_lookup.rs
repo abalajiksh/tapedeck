@@ -850,40 +850,22 @@ pub async fn discogs_release(
 
     // Discogs marks side headings as `type_: "heading"` — they are not tracks
     // and would otherwise become entries with no duration.
-    let real: Vec<&Tr> =
-        r.tracklist.iter().filter(|t| t.kind.as_deref().unwrap_or("track") == "track").collect();
-
-    let numbers: Vec<String> =
-        real.iter().map(|t| t.position.clone().unwrap_or_default()).collect();
-    let durations: Vec<Option<i64>> =
-        real.iter().map(|t| parse_duration(t.duration.as_deref())).collect();
-    let sides = r.formats.len().max(1) * 2;
-    // Discogs names the medium in `formats[].name`; a disc gets one numbered
-    // side per disc rather than a guessed A/B break.
-    let side_of = if is_disc(r.formats.first().and_then(|f| f.name.as_deref())) {
-        disc_sides(&[real.len()])
-    } else {
-        assign_sides(&numbers, &durations, sides)
-    };
-
-    let mut tracks = Vec::with_capacity(real.len());
-    let mut per_side_pos: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
-    for (i, t) in real.iter().enumerate() {
-        let side = side_of.get(i).cloned().unwrap_or_else(|| "A".into());
-        let pos = per_side_pos.entry(side.clone()).or_insert(0);
-        *pos += 1;
-        tracks.push(PhysicalTrack {
-            side,
-            position: *pos,
-            title: t.title.clone().unwrap_or_else(|| "Untitled".into()),
-            artist: None,
-            duration_secs: durations[i],
-            // Discogs' tracklist is flat and names no medium per track, so
-            // there is nothing to record here. `None` says that, rather than
-            // claiming disc 1.
-            disc: None,
-        });
-    }
+    let real: Vec<DiscogsTrackRow> = r
+        .tracklist
+        .iter()
+        .filter(|t| t.kind.as_deref().unwrap_or("track") == "track")
+        .map(|t| DiscogsTrackRow {
+            position: t.position.as_deref().unwrap_or_default(),
+            title: t.title.as_deref(),
+            duration: t.duration.as_deref(),
+        })
+        .collect();
+    // Discogs names the medium in `formats[].name`.
+    let tracks = discogs_tracks(
+        &real,
+        is_disc(r.formats.first().and_then(|f| f.name.as_deref())),
+        r.formats.len().max(1) * 2,
+    );
 
     Ok(Some(ReleaseCandidate {
         source: "discogs",
@@ -903,6 +885,53 @@ pub async fn discogs_release(
         artwork_url: r.images.into_iter().find_map(|i| i.uri),
         tracks,
     }))
+}
+
+/// One track as Discogs writes it: a position string (`A1`, `B2`, `3`), a
+/// title, and a `4:33` duration that is often blank.
+pub struct DiscogsTrackRow<'a> {
+    pub position: &'a str,
+    pub title: Option<&'a str>,
+    pub duration: Option<&'a str>,
+}
+
+/// Turn a Discogs-shaped tracklist into sides.
+///
+/// Shared by the Discogs lookup and the DVinyl import, which stores Discogs'
+/// own position strings. A disc gets one numbered side per disc rather than a
+/// guessed A/B break; anything else keeps the side letters the positions carry
+/// and falls back to a split by playing time across `sides` when they carry
+/// none.
+pub fn discogs_tracks(rows: &[DiscogsTrackRow], disc: bool, sides: usize) -> Vec<PhysicalTrack> {
+    let numbers: Vec<String> = rows.iter().map(|t| t.position.to_string()).collect();
+    let durations: Vec<Option<i64>> = rows.iter().map(|t| parse_duration(t.duration)).collect();
+    let side_of =
+        if disc { disc_sides(&[rows.len()]) } else { assign_sides(&numbers, &durations, sides) };
+
+    let mut tracks = Vec::with_capacity(rows.len());
+    let mut per_side_pos: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
+    for (i, t) in rows.iter().enumerate() {
+        let side = side_of.get(i).cloned().unwrap_or_else(|| "A".into());
+        let pos = per_side_pos.entry(side.clone()).or_insert(0);
+        *pos += 1;
+        tracks.push(PhysicalTrack {
+            side,
+            position: *pos,
+            title: t
+                .title
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .unwrap_or("Untitled")
+                .to_string(),
+            artist: None,
+            duration_secs: durations[i],
+            // Discogs' tracklist is flat and names no medium per track, so
+            // there is nothing to record here. `None` says that, rather than
+            // claiming disc 1.
+            disc: None,
+        });
+    }
+    tracks
 }
 
 // ════════════════════════════════════════════════════════════

@@ -71,6 +71,32 @@ impl Database {
         .await?;
         Ok((row.first().map(|r| r.0).ok_or(sqlx::Error::RowNotFound)?, true))
     }
+    /// Is this already in the crate, whoever put it there?
+    ///
+    /// For writers that must not take over somebody else's card:
+    /// `add_recommendation` updates the reason and origin of an existing row,
+    /// which is right for a recommender restating itself and wrong for an
+    /// import that only means to fill gaps.
+    pub async fn has_recommendation(
+        &self,
+        user_id: i64,
+        kind: &str,
+        artist: &str,
+        name: Option<&str>,
+    ) -> Result<bool, sqlx::Error> {
+        let row: Option<(i64,)> = sqlx::query_as(&crate::sql!(
+            "SELECT id FROM recommendations
+             WHERE user_id = ? AND kind = ? AND LOWER(TRIM(artist)) = ?
+               AND LOWER(TRIM(COALESCE(name,''))) = ?"
+        ))
+        .bind(user_id)
+        .bind(kind)
+        .bind(Self::artist_key(artist))
+        .bind(Self::artist_key(name.unwrap_or("")))
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.is_some())
+    }
     /// The crate, with each entry's first listen derived from the history.
     ///
     /// **The derivation is one bounded scan, not a subquery per row.** A

@@ -573,7 +573,19 @@ impl Database {
                 -- which is what this shelf is for. Written for cassettes only —
                 -- see `park_tape` for why a record deliberately has no memory.
                 parked_side TEXT,
-                parked_secs INTEGER
+                parked_secs INTEGER,
+                -- Where it lives: a room, a shelf, the car. Free text,
+                -- because a shelf of three hundred records is only useful if
+                -- you can find the one you want on it.
+                location TEXT,
+                -- The edition as the sleeve or the sticker says it: a colour,
+                -- a weight, Record Store Day. Free text on purpose — a
+                -- vocabulary would be out of date by the next pressing.
+                edition TEXT,
+                country TEXT,
+                -- The record label. `catalog_number` without it is half a
+                -- citation.
+                label TEXT
             )",
         )
         .await?;

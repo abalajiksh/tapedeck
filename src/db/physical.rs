@@ -4,6 +4,38 @@
 
 use super::*;
 
+/// The shelf-keeping text fields of a pressing that came from DVinyl: where it
+/// lives and which edition it is. `Option<Option<_>>` throughout — see
+/// [`Database::set_physical_details`].
+#[derive(Debug, Default, Clone)]
+pub struct PressingDetails {
+    pub location: Option<Option<String>>,
+    pub edition: Option<Option<String>>,
+    pub country: Option<Option<String>>,
+    pub label: Option<Option<String>>,
+}
+
+impl PressingDetails {
+    /// Set every field that has a value and leave the rest alone — the shape
+    /// an add or an import wants, where a blank means "not said".
+    pub fn given(
+        location: Option<&str>,
+        edition: Option<&str>,
+        country: Option<&str>,
+        label: Option<&str>,
+    ) -> Self {
+        let keep = |v: Option<&str>| {
+            v.map(str::trim).filter(|s| !s.is_empty()).map(|s| Some(s.to_string()))
+        };
+        Self {
+            location: keep(location),
+            edition: keep(edition),
+            country: keep(country),
+            label: keep(label),
+        }
+    }
+}
+
 impl Database {
     pub async fn list_physical(
         &self,
@@ -226,6 +258,60 @@ impl Database {
         }
         let res = q.bind(user_id).bind(id).execute(&self.pool).await?;
         Ok(res.rows_affected() > 0)
+    }
+    /// Where a pressing lives and which edition it is.
+    ///
+    /// Its own write rather than four more arguments on `update_physical`,
+    /// which every caller would then have to pad with `None`s. Same
+    /// absent-versus-null rule: an outer `None` leaves the column alone, an
+    /// inner one clears it, and a blank string is stored as a clear.
+    pub async fn set_physical_details(
+        &self,
+        user_id: i64,
+        id: i64,
+        details: &PressingDetails,
+    ) -> Result<bool, sqlx::Error> {
+        let fields = [
+            ("location", &details.location),
+            ("edition", &details.edition),
+            ("country", &details.country),
+            ("label", &details.label),
+        ];
+        let sets: Vec<String> =
+            fields.iter().filter(|(_, v)| v.is_some()).map(|(c, _)| format!("{c} = ?")).collect();
+        if sets.is_empty() {
+            return Ok(self.get_physical(user_id, id).await?.is_some());
+        }
+        let sql = format!(
+            "UPDATE physical_releases SET {} WHERE user_id = ? AND id = ?",
+            sets.join(", ")
+        );
+        let stmt = crate::sql!(&sql);
+        let mut q = sqlx::query(&stmt);
+        for v in fields.iter().filter_map(|(_, v)| v.as_ref()) {
+            q = q.bind(v.as_deref().map(str::trim).filter(|s| !s.is_empty()).map(str::to_string));
+        }
+        let res = q.bind(user_id).bind(id).execute(&self.pool).await?;
+        Ok(res.rows_affected() > 0)
+    }
+    /// When a pressing was catalogued. Only an import writes this: everywhere
+    /// else it is the moment of the add, but a shelf moved from another tool
+    /// already knows when each record went on it.
+    pub async fn set_physical_added_at(
+        &self,
+        user_id: i64,
+        id: i64,
+        added_at: i64,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(&crate::sql!(
+            "UPDATE physical_releases SET added_at = ? WHERE user_id = ? AND id = ?"
+        ))
+        .bind(added_at)
+        .bind(user_id)
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
     }
     /// The side currently on this user's deck, if any.
     pub async fn get_spin(&self, user_id: i64) -> Result<Option<PhysicalSpin>, sqlx::Error> {

@@ -4,6 +4,7 @@ mod config;
 mod crypto;
 mod db;
 mod dossier;
+mod dvinyl;
 mod engine;
 mod enrich;
 mod everynoise;

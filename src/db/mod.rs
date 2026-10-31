@@ -693,6 +693,14 @@ pub struct PhysicalRelease {
     /// no state to remember, so these stay null for every other medium.
     pub parked_side: Option<String>,
     pub parked_secs: Option<i64>,
+    /// Where it lives — a room, a shelf, a box. Free text.
+    pub location: Option<String>,
+    /// The edition as the sleeve says it: a colour, a weight, "Record Store
+    /// Day". Free text.
+    pub edition: Option<String>,
+    pub country: Option<String>,
+    /// The record label.
+    pub label: Option<String>,
     /// How many sides have been played, and for how long. Derived in the
     /// query rather than kept as a counter, so they cannot drift from the
     /// plays they claim to count.
@@ -3377,7 +3385,7 @@ mod sanitise;
 mod schema;
 mod sources;
 mod stats;
-pub use physical::DashboardStats;
+pub use physical::{DashboardStats, PressingDetails};
 pub use stats::RangedStats;
 mod users;
 

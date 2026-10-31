@@ -1,5 +1,6 @@
 <script lang="ts">
 	import { onMount, tick } from 'svelte';
+	import { syncUrl } from '$lib/url';
 	import { slide } from 'svelte/transition';
 	import { cubicOut } from 'svelte/easing';
 	import {
@@ -111,6 +112,12 @@
 	];
 	let acquiredAs = '';
 	let acquiredFrom = '';
+	/** Where it lives, which edition, and on which label — free text, each
+	 *  clearable. The first is what makes a big shelf findable: search reads it. */
+	let livesIn = '';
+	let edition = '';
+	let labelName = '';
+	let country = '';
 	let savingMeta = false;
 
 	// ── What each side has been through ──
@@ -907,7 +914,10 @@
 		.filter(
 			(r) =>
 				!q ||
-				fold(`${r.artist} ${r.title} ${r.catalog_number ?? ''} ${r.barcode ?? ''}`).includes(q)
+				fold(
+					`${r.artist} ${r.title} ${r.catalog_number ?? ''} ${r.barcode ?? ''} ` +
+						`${r.label ?? ''} ${r.edition ?? ''} ${r.location ?? ''}`
+				).includes(q)
 		);
 
 	async function load() {
@@ -919,6 +929,21 @@
 			error = String(e).replace(/^API \d+: /, '');
 		}
 		loading = false;
+	}
+
+	/** Open the record a printed label points at: `/shelf?record=<id>`.
+	 *
+	 *  Opened and nothing more — the side is started by a tap on the panel,
+	 *  because a label can be scanned by accident and a listen is something the
+	 *  user says happened. The parameter is dropped once read, so a reload or a
+	 *  Back does not keep reopening it. */
+	async function openFromLabel() {
+		const id = Number(new URLSearchParams(location.search).get('record'));
+		if (!Number.isInteger(id) || id <= 0) return;
+		syncUrl('/shelf');
+		const r = shelf.find((x) => x.id === id);
+		if (r) await openRelease(r);
+		else error = 'That label points at a record that is no longer on this shelf.';
 	}
 
 	// ── What the shelf is wearing out ──
@@ -1068,6 +1093,10 @@
 		purchased = toDateInput(r.purchased_at);
 		acquiredAs = r.acquired_as ?? '';
 		acquiredFrom = r.acquired_from ?? '';
+		livesIn = r.location ?? '';
+		edition = r.edition ?? '';
+		labelName = r.label ?? '';
+		country = r.country ?? '';
 		try {
 			openTracks = JSON.parse(r.tracks) as PhysicalTrack[];
 		} catch {
@@ -1215,7 +1244,11 @@
 				// clears rather than being skipped. Both fields are nullable and
 				// null means nobody said, never "new".
 				acquired_as: acquiredAs || null,
-				acquired_from: acquiredFrom.trim() || null
+				acquired_from: acquiredFrom.trim() || null,
+				location: livesIn.trim() || null,
+				edition: edition.trim() || null,
+				label: labelName.trim() || null,
+				country: country.trim() || null
 			});
 			await load();
 			const fresh = shelf.find((x) => x.id === open?.id);
@@ -1423,7 +1456,7 @@
 			void loadSitting();
 		};
 		window.addEventListener('focus', refocus);
-		load();
+		void load().then(openFromLabel);
 		loadGear();
 		return () => {
 			clearInterval(tick);
@@ -1444,7 +1477,7 @@
 			side or a disc records every track on it.
 		</p>
 	</div>
-	<div style="display:flex;gap:8px;">
+	<div style="display:flex;gap:8px;flex-wrap:wrap;">
 		<!-- Export and import both live in Settings → Data now. Having the way
 		     *out* of the shelf on this page and the way *in* nowhere at all was
 		     the inconsistency; a link keeps it discoverable from here without
@@ -1452,6 +1485,10 @@
 		<a class="btn btn-secondary" href="/settings#data"
 			title="Export or import the shelf — pressings, sides played, gear, and your own scans">
 			Export &amp; import
+		</a>
+		<a class="btn btn-secondary" href="/shelf/labels"
+			title="Print QR labels that open a record here, ready to play">
+			Labels
 		</a>
 		<button class="btn btn-primary" on:click={() => (adding = !adding)}>
 			{adding ? 'Cancel' : 'Add to the shelf'}
@@ -2006,9 +2043,18 @@
 						<h3 class="h-display" style="font-size:21px;margin:0;">{open.title}</h3>
 						<p style="margin:4px 0 0;color:var(--td-muted);font-size:14px;">
 							{open.artist}{open.year ? ` · ${open.year}` : ''}
-							{open.catalog_number ? ` · ${open.catalog_number}` : ''}
+							{open.label || open.catalog_number
+								? ` · ${[open.label, open.catalog_number].filter(Boolean).join(' ')}`
+								: ''}
+							{open.country ? ` · ${open.country}` : ''}
+							{open.edition ? ` · ${open.edition}` : ''}
 							{open.barcode ? ` · ${open.barcode}` : ''}
 						</p>
+						{#if open.location}
+							<p style="margin:4px 0 0;color:var(--td-muted-2);font-size:12.5px;">
+								Lives in {open.location}
+							</p>
+						{/if}
 						{#if open.last_played}
 							<p style="margin:4px 0 0;color:var(--td-muted-2);font-size:12.5px;">
 								Last played {formatDateTime(open.last_played)}
@@ -2026,6 +2072,8 @@
 						     and now looks it; `Close` stays neutral because it is the safe
 						     one and should read as the default. -->
 						<button class="btn btn-secondary" on:click={() => (open = null)}>Close</button>
+						<a class="btn btn-secondary" href={`/shelf/labels?ids=${open.id}`}
+							title="A QR label for the sleeve that opens this record here">Label</a>
 						<button class="btn btn-danger" on:click={() => open && remove(open)}>Remove</button>
 					</div>
 				</div>
@@ -2107,6 +2155,24 @@
 								bind:value={acquiredFrom}
 								on:change={saveMeta}
 							>
+						</div>
+						<div class="field" style="flex:1;min-width:180px;">
+							<label for="k-loc">Where it lives</label>
+							<input id="k-loc" class="input" placeholder="a room, a shelf, a box"
+								bind:value={livesIn} on:change={saveMeta}>
+						</div>
+						<div class="field" style="flex:1;min-width:150px;">
+							<label for="k-ed">Edition</label>
+							<input id="k-ed" class="input" placeholder="colour, weight, reissue"
+								bind:value={edition} on:change={saveMeta}>
+						</div>
+						<div class="field" style="flex:1;min-width:150px;">
+							<label for="k-label">Label</label>
+							<input id="k-label" class="input" bind:value={labelName} on:change={saveMeta}>
+						</div>
+						<div class="field" style="flex:0 0 130px;">
+							<label for="k-country">Country</label>
+							<input id="k-country" class="input" bind:value={country} on:change={saveMeta}>
 						</div>
 						<div style="font-size:12px;color:var(--td-muted-2);flex:1;min-width:180px;align-self:center;">
 							{#if savingMeta}

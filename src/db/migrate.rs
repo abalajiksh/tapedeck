@@ -662,6 +662,17 @@ impl Database {
                     .await;
             }
         }
+        // Where a pressing lives and which edition it is (v0.126.0, from
+        // DVinyl). After the rebuild for the same reason as the block above.
+        for col in ["location", "edition", "country", "label"] {
+            if !has_column(&self.pool, "physical_releases", col).await {
+                info!("⚙️ Migrating: adding physical_releases.{col}...");
+                let _ =
+                    sqlx::query(&format!("ALTER TABLE physical_releases ADD COLUMN {col} TEXT"))
+                        .execute(&self.pool)
+                        .await;
+            }
+        }
         if !has_column(&self.pool, "equipment", "purchased_at").await {
             info!("⚙️ Migrating: adding equipment.purchased_at...");
             let _ = sqlx::query("ALTER TABLE equipment ADD COLUMN purchased_at INTEGER")
