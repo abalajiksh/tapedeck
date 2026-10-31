@@ -29,7 +29,7 @@ use super::models::ErrorResponse;
 use super::now_playing::{NowPlaying, Progress};
 use super::AppState;
 use crate::db::PhysicalImage;
-use crate::db::{PhysicalRelease, SidePlays};
+use crate::db::{PhysicalRelease, PressingDetails, SidePlays};
 use crate::metadata::release_lookup::ReleaseCandidate;
 use crate::metadata::release_lookup::{self, PhysicalTrack};
 use crate::models::{ListenDisposition, Play};
@@ -657,6 +657,15 @@ pub struct NewRelease {
     /// Free text, because that is the half that makes a thrift find a story
     /// rather than a flag.
     pub acquired_from: Option<String>,
+    /// Where it lives — a room, a shelf, a box.
+    pub location: Option<String>,
+    /// The edition as the sleeve says it: a colour, a weight, "Record Store
+    /// Day".
+    pub edition: Option<String>,
+    /// Where the pressing was released, as the lookup returned it.
+    pub country: Option<String>,
+    /// The record label.
+    pub label: Option<String>,
     /// Pull the sleeve, labels and booklet from the Cover Art Archive as part
     /// of adding it. On by default. A failure does **not** fail the add, and
     /// it does nothing without `mbid_release`.
@@ -737,6 +746,15 @@ async fn add_release(
         Ok(id) => id,
         Err(e) => return err(500, e.to_string()),
     };
+    let details = PressingDetails::given(
+        body.location.as_deref(),
+        body.edition.as_deref(),
+        body.country.as_deref(),
+        body.label.as_deref(),
+    );
+    if let Err(e) = state.db.set_physical_details(user.user_id, id, &details).await {
+        warn!("Could not store where {} — {} lives: {e}", body.artist, body.title);
+    }
     info!("💿 Added {} to the shelf: {} — {}", kind, body.artist, body.title);
     if let Some(k) = corrected {
         info!("   (filed as {k} rather than {} — the release says so)", body.kind);
@@ -829,6 +847,21 @@ pub struct ReleaseUpdate {
     #[serde(default, deserialize_with = "explicit")]
     #[schema(value_type = Option<String>)]
     pub mbid_release: Option<Option<String>>,
+    /// Where it lives — a room, a shelf, a box.
+    #[serde(default, deserialize_with = "explicit")]
+    #[schema(value_type = Option<String>)]
+    pub location: Option<Option<String>>,
+    /// The edition as the sleeve says it.
+    #[serde(default, deserialize_with = "explicit")]
+    #[schema(value_type = Option<String>)]
+    pub edition: Option<Option<String>>,
+    #[serde(default, deserialize_with = "explicit")]
+    #[schema(value_type = Option<String>)]
+    pub country: Option<Option<String>>,
+    /// The record label.
+    #[serde(default, deserialize_with = "explicit")]
+    #[schema(value_type = Option<String>)]
+    pub label: Option<Option<String>>,
 }
 
 /// The shelf's formats. Mirrors the CHECK on `physical_releases.kind` — a value
@@ -936,6 +969,15 @@ async fn update_release(
         Ok(true) => {}
         Ok(false) => return err(404, "No such record"),
         Err(e) => return err(500, e.to_string()),
+    }
+    let details = PressingDetails {
+        location: body.location,
+        edition: body.edition,
+        country: body.country,
+        label: body.label,
+    };
+    if let Err(e) = state.db.set_physical_details(user.user_id, id, &details).await {
+        return err(500, e.to_string());
     }
 
     let mut resplit = false;
@@ -3334,14 +3376,7 @@ async fn import_shelf(
         // far more likely than owning a duplicate.
         let barcode = entry.get("barcode").and_then(|v| v.as_str());
         let mbid = entry.get("mbid_release").and_then(|v| v.as_str());
-        let already = existing.iter().find(|r| {
-            (barcode.is_some() && r.barcode.as_deref() == barcode)
-                || (mbid.is_some() && r.mbid_release.as_deref() == mbid)
-                || (r.kind == kind
-                    && r.artist.eq_ignore_ascii_case(artist)
-                    && r.title.eq_ignore_ascii_case(title))
-        });
-        if already.is_some() {
+        if on_shelf(&existing, kind, artist, title, barcode, mbid, None) {
             report.already += 1;
             continue;
         }
@@ -3380,6 +3415,15 @@ async fn import_shelf(
             }
         };
         report.releases += 1;
+        let s = |k: &str| entry.get(k).and_then(|v| v.as_str());
+        let details = PressingDetails::given(s("location"), s("edition"), s("country"), s("label"));
+        let _ = state.db.set_physical_details(user.user_id, id, &details).await;
+        // The export has always written when each record went on the shelf;
+        // without this the whole shelf came back dated to the moment of the
+        // import.
+        if let Some(added) = entry.get("added_at").and_then(|v| v.as_i64()) {
+            let _ = state.db.set_physical_added_at(user.user_id, id, added).await;
+        }
 
         // What it is normally played on, resolved from the names the export
         // wrote. Missing either is normal — the chain may not exist here.
@@ -3468,19 +3512,10 @@ async fn import_shelf(
                 .filter(|e| e.len() <= 5 && e.chars().all(|c| c.is_ascii_alphanumeric()))
                 .unwrap_or("jpg")
                 .to_ascii_lowercase();
-            let dir =
-                state.uploads_dir.join("shelf").join(user.user_id.to_string()).join(id.to_string());
-            if tokio::fs::create_dir_all(&dir).await.is_err() {
+            let Some((rel, mime)) = write_scan(&state, user.user_id, id, &bytes, &ext).await else {
                 report.missing_scans += 1;
                 continue;
-            }
-            let fname = format!("{}.{}", random_name(), ext);
-            let rel = format!("shelf/{}/{}/{}", user.user_id, id, fname);
-            if tokio::fs::write(dir.join(&fname), &bytes).await.is_err() {
-                report.missing_scans += 1;
-                continue;
-            }
-            let mime = mime_guess::from_path(&fname).first_raw().unwrap_or("image/jpeg");
+            };
             let _ = state
                 .db
                 .add_physical_image(
@@ -3530,6 +3565,394 @@ async fn import_shelf(
         }),
     )
         .into_response()
+}
+
+#[derive(Debug, Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
+pub struct DvinylImportQuery {
+    /// Any value but `0` or `false`: read the file and say what would happen,
+    /// writing nothing.
+    pub dry_run: Option<String>,
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct DvinylImported {
+    /// True when nothing was written.
+    pub dry_run: bool,
+    /// The collection's name in DVinyl.
+    pub collection: String,
+    /// The DVinyl version that wrote the file.
+    pub dvinyl_version: Option<String>,
+    /// Pressings added to the shelf (or that would be, on a dry run).
+    pub releases: usize,
+    /// Matched a pressing already on the shelf and left alone.
+    pub already_on_the_shelf: usize,
+    /// Wishlist entries filed in the Crate.
+    pub wants: usize,
+    /// Wishlist entries the Crate already held, left as they were.
+    pub wants_already_in_the_crate: usize,
+    pub images: usize,
+    /// Uploaded scans the file points at but does not carry — every one of
+    /// them, for a bare JSON export.
+    pub missing_scans: usize,
+    /// Digital releases, which are files rather than objects on a shelf.
+    pub skipped_digital: usize,
+    /// Books, films, games: not music.
+    pub skipped_not_music: usize,
+    /// Music items with no artist or title.
+    pub skipped_unreadable: usize,
+    /// What did not come across, and why.
+    pub note: String,
+}
+
+/// Is a pressing already on the shelf?
+///
+/// A barcode, a release MBID or a Discogs id identifies a pressing exactly;
+/// without any, the artist, title and medium together are the best available
+/// key. Two copies of one record is a thing that happens, but importing the
+/// same file twice is far more likely.
+fn on_shelf(
+    existing: &[PhysicalRelease],
+    kind: &str,
+    artist: &str,
+    title: &str,
+    barcode: Option<&str>,
+    mbid: Option<&str>,
+    discogs_id: Option<&str>,
+) -> bool {
+    existing.iter().any(|r| {
+        (barcode.is_some() && r.barcode.as_deref() == barcode)
+            || (mbid.is_some() && r.mbid_release.as_deref() == mbid)
+            || (discogs_id.is_some() && r.discogs_id.as_deref() == discogs_id)
+            || (r.kind == kind
+                && r.artist.eq_ignore_ascii_case(artist)
+                && r.title.eq_ignore_ascii_case(title))
+    })
+}
+
+/// Write an uploaded scan under the user's uploads and return its relative
+/// path and type. The path is built here — a name out of an archive never
+/// reaches the filesystem.
+async fn write_scan(
+    state: &AppState,
+    user_id: i64,
+    release_id: i64,
+    bytes: &[u8],
+    ext: &str,
+) -> Option<(String, &'static str)> {
+    let dir =
+        state.uploads_dir.join("shelf").join(user_id.to_string()).join(release_id.to_string());
+    tokio::fs::create_dir_all(&dir).await.ok()?;
+    let fname = format!("{}.{}", random_name(), ext);
+    tokio::fs::write(dir.join(&fname), bytes).await.ok()?;
+    let mime = mime_guess::from_path(&fname).first_raw().unwrap_or("image/jpeg");
+    Some((format!("shelf/{user_id}/{release_id}/{fname}"), mime))
+}
+
+// POST /api/v1/physical/import/dvinyl — bring a collection over from DVinyl.
+//
+// DVinyl has no API to sync against (server-rendered pages behind a login
+// cookie, no tokens), so its collection export is the way in. The parsing is
+// in `crate::dvinyl`; this decides what is new and writes it.
+//
+// The wishlist goes into the Crate directly, **not through `crate_shelf::file`**:
+// that path refuses anything already in the history, which is right for a
+// recommender and wrong here — wanting the vinyl of an album you stream all
+// the time is the commonest reason to have a wishlist at all. An entry the
+// Crate already holds is left alone rather than restated, because
+// `add_recommendation` would overwrite whoever's reason was there.
+/// Bring a collection over from DVinyl.
+///
+/// Session-only, `multipart/form-data`, 64 MB maximum (the server's upload
+/// limit). Takes DVinyl's per-collection export — the zip (with your uploaded images) or the bare
+/// JSON. A whole-instance backup is refused: it holds every account on the
+/// DVinyl server.
+///
+/// Records, tapes and discs go onto the shelf with their tracklists (Discogs'
+/// side letters become sides), label, catalogue number, country, edition,
+/// location and images. Comments, the format descriptor, sleeve condition,
+/// copies and your own fields go into the note. The **wishlist goes into the
+/// Crate**, filed as from "DVinyl wishlist". Digital releases and non-music
+/// items are counted and left.
+///
+/// Everything is matched before it is inserted, so importing the same file
+/// twice changes nothing the second time. With `dry_run`, nothing is written
+/// and the counts say what would happen.
+#[utoipa::path(
+    post,
+    path = "/api/v1/physical/import/dvinyl",
+    tag = "Shelf",
+    params(DvinylImportQuery),
+    request_body(content = FileUpload, content_type = "multipart/form-data"),
+    responses(
+        (status = 200, description = "Imported, or what would be.", body = DvinylImported),
+        (status = 400, response = BadRequest),
+        (status = 401, response = Unauthorized),
+        (status = 413, description = "Larger than 64 MB.", body = ErrorResponse),
+    )
+)]
+async fn import_dvinyl(
+    State(state): State<Arc<AppState>>,
+    user: AuthUser,
+    Query(q): Query<DvinylImportQuery>,
+    mut multipart: Multipart,
+) -> impl IntoResponse {
+    let dry_run = q.dry_run.as_deref().is_some_and(|v| !matches!(v, "0" | "false"));
+    let mut body: Option<Vec<u8>> = None;
+    while let Ok(Some(field)) = multipart.next_field().await {
+        if let Ok(b) = field.bytes().await {
+            if !b.is_empty() {
+                body = Some(b.to_vec());
+                break;
+            }
+        }
+    }
+    let Some(body) = body else { return err(400, "No file in the request") };
+    if body.len() > MAX_IMPORT_BYTES {
+        return err(413, "That file is larger than 256 MB");
+    }
+    // Parsed off the async runtime: a zip of a few hundred scans is real work.
+    let export = match tokio::task::spawn_blocking(move || crate::dvinyl::parse(&body)).await {
+        Ok(Ok(e)) => e,
+        Ok(Err(msg)) => return err(400, msg),
+        Err(e) => return err(500, e.to_string()),
+    };
+
+    let mut existing = match state.db.list_physical(user.user_id, None).await {
+        Ok(v) => v,
+        Err(e) => return err(500, e.to_string()),
+    };
+    let mut out = DvinylImported {
+        dry_run,
+        collection: export.collection.clone(),
+        dvinyl_version: export.version.clone(),
+        releases: 0,
+        already_on_the_shelf: 0,
+        wants: 0,
+        wants_already_in_the_crate: 0,
+        images: 0,
+        missing_scans: 0,
+        skipped_digital: export.skipped.digital,
+        skipped_not_music: export.skipped.not_music,
+        skipped_unreadable: export.skipped.unreadable,
+        note: String::new(),
+    };
+
+    for p in &export.pressings {
+        if on_shelf(
+            &existing,
+            p.kind,
+            &p.artist,
+            &p.title,
+            p.barcode.as_deref(),
+            None,
+            p.discogs_id.as_deref(),
+        ) {
+            out.already_on_the_shelf += 1;
+            continue;
+        }
+        let missing = p
+            .images
+            .iter()
+            .filter(|i| {
+                matches!(i, crate::dvinyl::ImageRef::Archived(n) if !export.images.contains_key(n))
+            })
+            .count();
+        if dry_run {
+            out.releases += 1;
+            out.images += p.images.len() - missing;
+            out.missing_scans += missing;
+            // Two entries in one file can be the same pressing; the second
+            // has to match the first on a dry run as it would for real.
+            existing.push(placeholder(p));
+            continue;
+        }
+
+        let tracks = serde_json::to_string(&p.tracks).unwrap_or_else(|_| "[]".into());
+        let id = match state
+            .db
+            .create_physical(
+                user.user_id,
+                p.kind,
+                &p.artist,
+                &p.title,
+                p.year,
+                None,
+                p.discogs_id.as_deref(),
+                p.barcode.as_deref(),
+                p.catalog_number.as_deref(),
+                None,
+                &tracks,
+                p.notes.as_deref(),
+                None,
+                None,
+                None,
+            )
+            .await
+        {
+            Ok(id) => id,
+            Err(e) => {
+                warn!("DVinyl import: {} — {}: {e}", p.artist, p.title);
+                out.skipped_unreadable += 1;
+                continue;
+            }
+        };
+        out.releases += 1;
+        let details = PressingDetails::given(
+            p.location.as_deref(),
+            p.edition.as_deref(),
+            p.country.as_deref(),
+            p.label.as_deref(),
+        );
+        let _ = state.db.set_physical_details(user.user_id, id, &details).await;
+        if let Some(added) = p.added_at {
+            let _ = state.db.set_physical_added_at(user.user_id, id, added).await;
+        }
+
+        // DVinyl's first image is the cover; what follows is the rest of the
+        // gallery, in its order.
+        for (position, img) in p.images.iter().enumerate() {
+            let kind = if position == 0 { "front" } else { "other" };
+            match img {
+                crate::dvinyl::ImageRef::Remote(url) => {
+                    let _ = state
+                        .db
+                        .add_physical_image(
+                            user.user_id,
+                            id,
+                            kind,
+                            crate::dvinyl::provider_of(url),
+                            Some(url),
+                            None,
+                            None,
+                            None,
+                            None,
+                            None,
+                            position as i64,
+                            None,
+                        )
+                        .await;
+                    out.images += 1;
+                }
+                crate::dvinyl::ImageRef::Archived(name) => {
+                    let Some(bytes) = export.images.get(name) else {
+                        out.missing_scans += 1;
+                        continue;
+                    };
+                    let Some((rel, mime)) =
+                        write_scan(&state, user.user_id, id, bytes, "jpg").await
+                    else {
+                        out.missing_scans += 1;
+                        continue;
+                    };
+                    let _ = state
+                        .db
+                        .add_physical_image(
+                            user.user_id,
+                            id,
+                            kind,
+                            "upload",
+                            None,
+                            None,
+                            Some(&rel),
+                            Some(mime),
+                            Some(bytes.len() as i64),
+                            None,
+                            position as i64,
+                            None,
+                        )
+                        .await;
+                    out.images += 1;
+                }
+            }
+        }
+        existing.push(placeholder(p));
+    }
+
+    for w in &export.wants {
+        let held = state
+            .db
+            .has_recommendation(user.user_id, "album", &w.artist, Some(&w.title))
+            .await
+            .unwrap_or(false);
+        if held {
+            out.wants_already_in_the_crate += 1;
+            continue;
+        }
+        if !dry_run {
+            let rec = crate::db::NewRecommendation {
+                kind: "album".into(),
+                artist: w.artist.clone(),
+                name: Some(w.title.clone()),
+                mbid: None,
+                reason: w.note.clone(),
+                because: Some("On your DVinyl wishlist.".into()),
+            };
+            if let Err(e) =
+                state.db.add_recommendation(user.user_id, &rec, "DVinyl wishlist", None).await
+            {
+                warn!("DVinyl import: wishlist {} — {}: {e}", w.artist, w.title);
+                continue;
+            }
+        }
+        out.wants += 1;
+    }
+
+    // Said plainly rather than left to be discovered.
+    let mut note = String::from(
+        "DVinyl keeps no listening, so these records start with no plays. Its lists, \
+shelf layout, genres and market value have no counterpart here and were left.",
+    );
+    if !export.archive && out.missing_scans > 0 {
+        note.push_str(
+            " This was the JSON export, which does not carry the images you uploaded to \
+DVinyl — import the zip (Export collection as archive) to bring those too.",
+        );
+    }
+    out.note = note;
+    if !dry_run {
+        info!(
+            "💿 DVinyl import for user {}: {} added, {} already on the shelf, {} to the Crate",
+            user.user_id, out.releases, out.already_on_the_shelf, out.wants
+        );
+    }
+    (StatusCode::OK, Json(out)).into_response()
+}
+
+/// Enough of a shelf row for `on_shelf` to match the next entry against it.
+fn placeholder(p: &crate::dvinyl::Pressing) -> PhysicalRelease {
+    PhysicalRelease {
+        id: 0,
+        kind: p.kind.to_string(),
+        artist: p.artist.clone(),
+        title: p.title.clone(),
+        year: p.year,
+        mbid_release: None,
+        discogs_id: p.discogs_id.clone(),
+        barcode: p.barcode.clone(),
+        catalog_number: p.catalog_number.clone(),
+        artwork_url: None,
+        tracks: String::new(),
+        notes: None,
+        added_at: 0,
+        purchased_at: None,
+        acquired_as: None,
+        acquired_from: None,
+        chain_id: None,
+        equipment_id: None,
+        chain_variant_id: None,
+        parked_side: None,
+        parked_secs: None,
+        location: None,
+        edition: None,
+        country: None,
+        label: None,
+        play_count: 0,
+        played_secs: 0,
+        last_played: None,
+        image_count: 0,
+        cover_thumb: None,
+    }
 }
 
 /// The biggest shelf archive we will read. A hundred records with booklets is
@@ -3741,6 +4164,10 @@ async fn export_shelf(State(state): State<Arc<AppState>>, user: AuthUser) -> imp
                     // of the shelf rather than most of one.
                     "acquired_as": r.acquired_as,
                     "acquired_from": r.acquired_from,
+                    "location": r.location,
+                    "edition": r.edition,
+                    "country": r.country,
+                    "label": r.label,
                     "added_at": r.added_at,
                     "notes": r.notes,
                     "played_sides": r.play_count,
@@ -3894,6 +4321,7 @@ fn csv(s: &str) -> String {
     lookup,
     export_shelf,
     import_shelf,
+    import_dvinyl,
     discogs_detail,
     equipment_wear,
     get_discogs,
@@ -3930,6 +4358,7 @@ pub fn create_physical_router() -> Router<Arc<AppState>> {
         .route("/api/v1/physical/lookup", get(lookup))
         .route("/api/v1/physical/export", get(export_shelf))
         .route("/api/v1/physical/import", post(import_shelf))
+        .route("/api/v1/physical/import/dvinyl", post(import_dvinyl))
         .route("/api/v1/physical/discogs/:id", get(discogs_detail))
         .route("/api/v1/physical/equipment/:id/wear", get(equipment_wear))
         .route("/api/v1/physical/settings/discogs", get(get_discogs).put(set_discogs))

@@ -82,7 +82,7 @@ info:
   license:
     name: AGPL-3.0-or-later
     identifier: AGPL-3.0-or-later
-  version: 0.125.1
+  version: 0.126.0
 servers:
 - url: /
   description: The Tapedeck instance serving this document.
@@ -8323,6 +8323,60 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
+  /api/v1/physical/import/dvinyl:
+    post:
+      tags:
+      - Shelf
+      summary: Bring a collection over from DVinyl.
+      description: |-
+        Session-only, `multipart/form-data`, 64 MB maximum (the server's upload
+        limit). Takes DVinyl's per-collection export — the zip (with your uploaded images) or the bare
+        JSON. A whole-instance backup is refused: it holds every account on the
+        DVinyl server.
+
+        Records, tapes and discs go onto the shelf with their tracklists (Discogs'
+        side letters become sides), label, catalogue number, country, edition,
+        location and images. Comments, the format descriptor, sleeve condition,
+        copies and your own fields go into the note. The **wishlist goes into the
+        Crate**, filed as from "DVinyl wishlist". Digital releases and non-music
+        items are counted and left.
+
+        Everything is matched before it is inserted, so importing the same file
+        twice changes nothing the second time. With `dry_run`, nothing is written
+        and the counts say what would happen.
+      operationId: import_dvinyl
+      parameters:
+      - name: dry_run
+        in: query
+        description: |-
+          Any value but `0` or `false`: read the file and say what would happen,
+          writing nothing.
+        required: false
+        schema:
+          type: string
+      requestBody:
+        content:
+          multipart/form-data:
+            schema:
+              $ref: '#/components/schemas/FileUpload'
+        required: true
+      responses:
+        '200':
+          description: Imported, or what would be.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DvinylImported'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '413':
+          description: Larger than 64 MB.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
   /api/v1/physical/discogs/{id}:
     get:
       tags:
@@ -14685,6 +14739,73 @@ components:
             plays only** — a partial play records how many tracks ran but never
             which, so its wear cannot be reconstructed and is left alone.
           minimum: 0
+    DvinylImported:
+      type: object
+      required:
+      - dry_run
+      - collection
+      - releases
+      - already_on_the_shelf
+      - wants
+      - wants_already_in_the_crate
+      - images
+      - missing_scans
+      - skipped_digital
+      - skipped_not_music
+      - skipped_unreadable
+      - note
+      properties:
+        dry_run:
+          type: boolean
+          description: True when nothing was written.
+        collection:
+          type: string
+          description: The collection's name in DVinyl.
+        dvinyl_version:
+          type:
+          - string
+          - 'null'
+          description: The DVinyl version that wrote the file.
+        releases:
+          type: integer
+          description: Pressings added to the shelf (or that would be, on a dry run).
+          minimum: 0
+        already_on_the_shelf:
+          type: integer
+          description: Matched a pressing already on the shelf and left alone.
+          minimum: 0
+        wants:
+          type: integer
+          description: Wishlist entries filed in the Crate.
+          minimum: 0
+        wants_already_in_the_crate:
+          type: integer
+          description: Wishlist entries the Crate already held, left as they were.
+          minimum: 0
+        images:
+          type: integer
+          minimum: 0
+        missing_scans:
+          type: integer
+          description: |-
+            Uploaded scans the file points at but does not carry — every one of
+            them, for a bare JSON export.
+          minimum: 0
+        skipped_digital:
+          type: integer
+          description: Digital releases, which are files rather than objects on a shelf.
+          minimum: 0
+        skipped_not_music:
+          type: integer
+          description: 'Books, films, games: not music.'
+          minimum: 0
+        skipped_unreadable:
+          type: integer
+          description: Music items with no artist or title.
+          minimum: 0
+        note:
+          type: string
+          description: What did not come across, and why.
     EditedListen:
       oneOf:
       - $ref: '#/components/schemas/Listen'
@@ -18248,6 +18369,28 @@ components:
             Where from — the shop, the record fair, the person who gave it to you.
             Free text, because that is the half that makes a thrift find a story
             rather than a flag.
+        location:
+          type:
+          - string
+          - 'null'
+          description: Where it lives — a room, a shelf, a box.
+        edition:
+          type:
+          - string
+          - 'null'
+          description: |-
+            The edition as the sleeve says it: a colour, a weight, "Record Store
+            Day".
+        country:
+          type:
+          - string
+          - 'null'
+          description: Where the pressing was released, as the lookup returned it.
+        label:
+          type:
+          - string
+          - 'null'
+          description: The record label.
         fetch_images:
           type: boolean
           description: |-
@@ -22833,6 +22976,27 @@ components:
           - integer
           - 'null'
           format: int64
+        location:
+          type:
+          - string
+          - 'null'
+          description: Where it lives — a room, a shelf, a box. Free text.
+        edition:
+          type:
+          - string
+          - 'null'
+          description: |-
+            The edition as the sleeve says it: a colour, a weight, "Record Store
+            Day". Free text.
+        country:
+          type:
+          - string
+          - 'null'
+        label:
+          type:
+          - string
+          - 'null'
+          description: The record label.
         play_count:
           type: integer
           format: int64
@@ -22936,6 +23100,25 @@ components:
           description: |-
             The MusicBrainz release this pressing is, typed in by hand — also the
             cheapest way to ask for running times.
+        location:
+          type:
+          - string
+          - 'null'
+          description: Where it lives — a room, a shelf, a box.
+        edition:
+          type:
+          - string
+          - 'null'
+          description: The edition as the sleeve says it.
+        country:
+          type:
+          - string
+          - 'null'
+        label:
+          type:
+          - string
+          - 'null'
+          description: The record label.
     ShelfRow:
       type: object
       required:

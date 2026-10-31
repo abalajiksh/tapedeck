@@ -9,7 +9,7 @@
 		SourceHealth
 	} from '$lib/api';
 	import { api } from '$lib/api';
-	import type { TokenInfo } from '$lib/api';
+	import type { DvinylImported, TokenInfo } from '$lib/api';
 	import { formatDateTime, formatDuration } from '$lib/utils';
 	import { theme, setTheme, type ThemeMode } from '$lib/theme';
 	import { showArtwork, setShowArtwork } from '$lib/prefs';
@@ -89,6 +89,74 @@
 		}
 		shelfImporting = false;
 		input.value = '';
+	}
+
+	// ── From DVinyl ──
+	// Preview first, then import: a collection is hundreds of records landing
+	// on a page you look at, so the counts are shown before anything is
+	// written. The file is held between the two calls rather than chosen twice.
+	let dvinylFile: File | null = null;
+	let dvinylPreview: DvinylImported | null = null;
+	let dvinylBusy = false;
+	let dvinylMsg = '';
+	let dvinylErr = '';
+
+	const plural = (n: number, one: string, many: string) => `${n} ${n === 1 ? one : many}`;
+
+	function dvinylSummary(r: DvinylImported): string {
+		const verb = r.dry_run ? 'would be added' : 'added';
+		return [
+			`${plural(r.releases, 'record', 'records')} ${verb}`,
+			r.already_on_the_shelf ? `${r.already_on_the_shelf} already on the shelf` : '',
+			r.wants ? `${plural(r.wants, 'wishlist entry', 'wishlist entries')} to the Crate` : '',
+			r.wants_already_in_the_crate ? `${r.wants_already_in_the_crate} already in the Crate` : '',
+			r.images ? plural(r.images, 'image', 'images') : '',
+			r.missing_scans ? `${plural(r.missing_scans, 'uploaded image', 'uploaded images')} not in the file` : '',
+			r.skipped_digital ? `${plural(r.skipped_digital, 'digital release', 'digital releases')} left out` : '',
+			r.skipped_not_music ? `${plural(r.skipped_not_music, 'non-music item', 'non-music items')} left out` : '',
+			r.skipped_unreadable ? `${r.skipped_unreadable} unreadable` : ''
+		]
+			.filter(Boolean)
+			.join(' · ');
+	}
+
+	async function onDvinylChosen(ev: Event) {
+		const input = ev.target as HTMLInputElement;
+		const file = input.files?.[0];
+		input.value = '';
+		if (!file) return;
+		dvinylFile = file;
+		dvinylPreview = null;
+		dvinylMsg = '';
+		dvinylErr = '';
+		dvinylBusy = true;
+		try {
+			dvinylPreview = await api.importDvinyl(file, true);
+		} catch (e) {
+			dvinylErr = e instanceof Error ? e.message : String(e);
+			dvinylFile = null;
+		}
+		dvinylBusy = false;
+	}
+
+	async function runDvinylImport() {
+		if (!dvinylFile) return;
+		dvinylBusy = true;
+		dvinylErr = '';
+		try {
+			const r = await api.importDvinyl(dvinylFile, false);
+			dvinylMsg = `${dvinylSummary(r)}. ${r.note}`;
+			dvinylPreview = null;
+			dvinylFile = null;
+		} catch (e) {
+			dvinylErr = e instanceof Error ? e.message : String(e);
+		}
+		dvinylBusy = false;
+	}
+
+	function cancelDvinyl() {
+		dvinylFile = null;
+		dvinylPreview = null;
 	}
 
 	// ── Account ──
@@ -3329,6 +3397,52 @@
 					restore a backup for the history and the chain hours derived from it.
 					Everything is matched before it is added, so importing the same archive
 					twice changes nothing the second time.
+				</p>
+			</div>
+
+			<!-- DVinyl has no API to sync against, so its collection export is
+			     the way in. A preview first: this can be hundreds of records. -->
+			<div class="panel" style="border-radius:22px;padding:24px;margin-bottom:18px;">
+				<h3 class="h-display" style="font-size:19px;margin-bottom:4px;">From DVinyl</h3>
+				<p style="font-size:13px;color:var(--td-muted);margin:0 0 16px;">
+					Bring your records, tapes and discs over from a DVinyl collection. In DVinyl,
+					open Settings → Backup and export the collection — the archive (.zip) carries
+					the images you uploaded, the JSON does not.
+				</p>
+				{#if dvinylPreview}
+					<p style="font-size:13px;margin:0 0 12px;">
+						<strong>{dvinylPreview.collection}</strong>{#if dvinylPreview.dvinyl_version}<span
+								style="color:var(--td-muted);">{` · DVinyl ${dvinylPreview.dvinyl_version}`}</span>{/if}:
+						{dvinylSummary(dvinylPreview)}.
+					</p>
+					<div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center;">
+						<button class="btn btn-primary" disabled={dvinylBusy || (!dvinylPreview.releases && !dvinylPreview.wants)}
+							on:click={runDvinylImport}>
+							{dvinylBusy ? 'Importing…' : 'Import'}
+						</button>
+						<button class="btn btn-secondary" disabled={dvinylBusy} on:click={cancelDvinyl}>Cancel</button>
+					</div>
+				{:else}
+					<label class="btn btn-secondary" style="cursor:pointer;">
+						{dvinylBusy ? 'Reading…' : 'Choose a DVinyl export'}
+						<input type="file" accept=".zip,.json,application/zip,application/json" style="display:none;"
+							disabled={dvinylBusy} on:change={onDvinylChosen} />
+					</label>
+				{/if}
+				{#if dvinylMsg}
+					<p style="font-size:13px;color:var(--td-good-fg);background:var(--td-good-bg);padding:9px 14px;border-radius:12px;margin:14px 0 0;">
+						{dvinylMsg}
+					</p>
+				{/if}
+				{#if dvinylErr}
+					<p style="font-size:13px;color:var(--td-bad-fg);margin:14px 0 0;">{dvinylErr}</p>
+				{/if}
+				<p style="font-size:12px;color:var(--td-muted-2);margin:14px 0 0;">
+					Side letters, label, catalogue number, country, edition and where each record
+					lives come across; your comments, sleeve condition and own fields go into its
+					note. The wishlist goes into the <a href="/crate">Crate</a>. Digital releases,
+					books and films are left out, and so are DVinyl's lists and market value. Matched
+					before anything is added, so importing twice changes nothing.
 				</p>
 			</div>
 		{/if}
