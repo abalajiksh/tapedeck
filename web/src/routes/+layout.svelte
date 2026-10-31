@@ -6,6 +6,7 @@
 	import { deck, watchNowPlaying } from '$lib/nowplaying';
 	import { initPrefs } from '$lib/prefs';
 	import { theme, initTheme, setTheme, type ThemeMode } from '$lib/theme';
+	import TapedeckLogo from '$lib/components/TapedeckLogo.svelte';
 
 	let state: 'loading' | 'public' | 'authenticated' | 'error' = 'loading';
 	let errorMsg = '';
@@ -172,9 +173,7 @@
 				: 'width:250px;flex:none;position:sticky;top:0;height:100vh;'}"
 		>
 			<div style="flex:none;display:flex;align-items:center;gap:12px;padding:22px 22px 18px;">
-				<div style="display:inline-flex;align-items:center;justify-content:center;width:42px;height:42px;border-radius:13px;background:var(--td-panel);">
-					<svg viewBox="9 17 46 30" width="24"><line x1="23" y1="43" x2="45" y2="43" stroke="#F2E6D0" stroke-width="4.5" stroke-linecap="round"/><circle cx="23" cy="31" r="12" fill="#E9A23B"/><circle cx="45" cy="35" r="8" fill="#E9A23B"/><circle cx="23" cy="31" r="3.6" fill="#261A15"/><circle cx="45" cy="35" r="3" fill="#261A15"/></svg>
-				</div>
+				<span style="display:flex;color:var(--td-text);"><TapedeckLogo width={48} /></span>
 				<div style="flex:1;min-width:0;">
 					<div style="font-family:'Caprasimo',serif;font-size:21px;line-height:1;letter-spacing:-.02em;">Tapedeck</div>
 					<div style="font-size:11px;color:var(--td-muted-2);margin-top:3px;">listening journal</div>
@@ -279,9 +278,7 @@
 					<button on:click={() => (navOpen = true)} aria-label="Open menu" style="border:none;background:var(--td-sidebar);cursor:pointer;color:var(--td-text);width:40px;height:40px;border-radius:12px;display:flex;align-items:center;justify-content:center;">
 						<svg viewBox="0 0 24 24" width="22" fill="none" stroke="currentColor" stroke-width="2.75" stroke-linecap="round"><path d="M4 7h16M4 12h16M4 17h16"/></svg>
 					</button>
-					<div style="display:inline-flex;align-items:center;justify-content:center;width:34px;height:34px;border-radius:10px;background:var(--td-panel);">
-						<svg viewBox="9 17 46 30" width="20"><line x1="23" y1="43" x2="45" y2="43" stroke="#F2E6D0" stroke-width="4.5" stroke-linecap="round"/><circle cx="23" cy="31" r="12" fill="#E9A23B"/><circle cx="45" cy="35" r="8" fill="#E9A23B"/><circle cx="23" cy="31" r="3.6" fill="#261A15"/><circle cx="45" cy="35" r="3" fill="#261A15"/></svg>
-					</div>
+					<span style="display:flex;color:var(--td-text);"><TapedeckLogo width={40} /></span>
 					<div style="font-family:'Caprasimo',serif;font-size:19px;letter-spacing:-.02em;">Tapedeck</div>
 				</div>
 			{/if}

@@ -1,6 +1,7 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
 	import { api } from '$lib/api';
+	import TapedeckLogo from '$lib/components/TapedeckLogo.svelte';
 
 	let username = 'admin';
 	let displayName = '';
@@ -49,9 +50,7 @@
 <div style="min-height:100vh;display:flex;align-items:center;justify-content:center;padding:32px;background:radial-gradient(120% 120% at 50% 0%, var(--td-surface) 0%, var(--td-bg) 100%);">
 	<div style="width:100%;max-width:440px;">
 		<div style="text-align:center;margin-bottom:26px;">
-			<div style="display:inline-flex;align-items:center;justify-content:center;width:64px;height:64px;border-radius:20px;background:var(--td-panel);box-shadow:0 8px 24px rgba(46,43,37,.25);">
-				<svg viewBox="9 17 46 30" width="34"><line x1="23" y1="43" x2="45" y2="43" stroke="#F2E6D0" stroke-width="4.5" stroke-linecap="round"/><circle cx="23" cy="31" r="12" fill="#E9A23B"/><circle cx="45" cy="35" r="8" fill="#E9A23B"/><circle cx="23" cy="31" r="3.6" fill="#261A15"/><circle cx="45" cy="35" r="3" fill="#261A15"/></svg>
-			</div>
+			<div style="display:flex;justify-content:center;color:var(--td-text);"><TapedeckLogo width={88} /></div>
 			<h1 class="h-display" style="font-size:40px;margin:14px 0 2px;">Tapedeck</h1>
 			<p style="margin:0;color:var(--td-muted);font-size:14.5px;">Welcome — set up your admin account</p>
 		</div>

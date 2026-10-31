@@ -1,8 +1,7 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64">
-<rect width="64" height="64" rx="14" fill="#261A15"/>
-<line x1="23" y1="43" x2="45" y2="43" stroke="#F2E6D0" stroke-width="4.5" stroke-linecap="round"/>
-<circle cx="23" cy="31" r="12" fill="#E9A23B"/>
-<circle cx="45" cy="35" r="8" fill="#E9A23B"/>
-<circle cx="23" cy="31" r="3.6" fill="#261A15"/>
-<circle cx="45" cy="35" r="3" fill="#261A15"/>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">
+<style>
+.shell{fill:#261A15}.tape{fill:#E9A23B}
+@media (prefers-color-scheme:dark){.shell{fill:#F2E6D0}}
+</style>
+<path class="shell" fill-rule="evenodd" d="M4 6H28A3 3 0 0 1 31 9V23A3 3 0 0 1 28 26H4A3 3 0 0 1 1 23V9A3 3 0 0 1 4 6ZM10.75 10.5H21.25A4.25 4.25 0 0 1 25.5 14.75V14.75A4.25 4.25 0 0 1 21.25 19H10.75A4.25 4.25 0 0 1 6.5 14.75V14.75A4.25 4.25 0 0 1 10.75 10.5ZM8.5 26L10.2 22.2H21.8L23.5 26Z"/><path class="tape" fill-rule="evenodd" d="M7.9 14.75A3.3 3.3 0 1 0 14.5 14.75A3.3 3.3 0 1 0 7.9 14.75ZM10.05 14.75A1.15 1.15 0 1 0 12.35 14.75A1.15 1.15 0 1 0 10.05 14.75ZM18.5 14.75A2.3 2.3 0 1 0 23.1 14.75A2.3 2.3 0 1 0 18.5 14.75ZM19.9 14.75A0.9 0.9 0 1 0 21.7 14.75A0.9 0.9 0 1 0 19.9 14.75Z"/><path class="tape" d="M11.85 23.6H20.15A0.65 0.65 0 0 1 20.8 24.25V24.25A0.65 0.65 0 0 1 20.15 24.9H11.85A0.65 0.65 0 0 1 11.2 24.25V24.25A0.65 0.65 0 0 1 11.85 23.6Z"/>
 </svg>
