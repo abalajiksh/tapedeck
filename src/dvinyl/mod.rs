@@ -153,7 +153,10 @@ fn parse_archive(bytes: &[u8]) -> Result<Export, String> {
     let mut images = HashMap::new();
     for i in 0..zip.len() {
         let Ok(f) = zip.by_index(i) else { continue };
-        let Some(name) = f.name().strip_prefix("images/").map(str::to_string) else { continue };
+        // A name zip 9 cannot reconcile with the central directory is an
+        // error, and that entry is simply not one of DVinyl's images.
+        let Ok(full) = f.name() else { continue };
+        let Some(name) = full.strip_prefix("images/").map(str::to_string) else { continue };
         if !is_dvinyl_image_name(&name) || f.size() > MAX_IMAGE_BYTES {
             continue;
         }

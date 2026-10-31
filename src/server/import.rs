@@ -801,7 +801,10 @@ async fn run_file(
 fn zip_entry_names(bytes: &[u8]) -> Result<Vec<String>, String> {
     let reader = std::io::Cursor::new(bytes);
     let zip = zip::ZipArchive::new(reader).map_err(|e| format!("Unreadable zip: {e}"))?;
-    Ok(zip.file_names().map(str::to_string).collect())
+    // Since zip 9 a name is a `Result`: one whose local header disagrees with
+    // the central directory is an error rather than trusted (CVE-2026-115905,
+    // td-security#7). Such an entry is not a file this import knows.
+    Ok(zip.file_names().filter_map(|n| n.ok().map(|n| n.into_owned())).collect())
 }
 
 /// A Spotify "Extended Streaming History" archive.
@@ -836,7 +839,9 @@ async fn run_spotify_archive(
         if !entry.is_file() {
             continue;
         }
-        let path = entry.name().to_string();
+        // An entry whose name zip 9 refuses to reconcile is skipped, like
+        // any other file this import does not know.
+        let Ok(path) = entry.name().map(|n| n.into_owned()) else { continue };
         // macOS zips carry a __MACOSX shadow tree of AppleDouble files.
         if path.starts_with("__MACOSX/") || path.contains("/.") || path.starts_with('.') {
             continue;
@@ -954,7 +959,9 @@ async fn run_listenbrainz_archive(
         if !entry.is_file() {
             continue;
         }
-        let path = entry.name().to_string();
+        // An entry whose name zip 9 refuses to reconcile is skipped, like
+        // any other file this import does not know.
+        let Ok(path) = entry.name().map(|n| n.into_owned()) else { continue };
         // macOS zips carry a __MACOSX shadow tree of AppleDouble files.
         if path.starts_with("__MACOSX/") || path.contains("/.") || path.starts_with('.') {
             continue;

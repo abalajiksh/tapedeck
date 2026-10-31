@@ -88,7 +88,7 @@ ammonia = "4.1.4"
 # ListenBrainz hands out its export as a zip of JSONL files, which is the form
 # people actually have. Deflate only — that's what the export uses, and the other
 # codecs pull in C libraries that would spoil cross-compiling for ARM boards.
-zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
+zip = { version = "9.0.5", default-features = false, features = ["deflate"] }
 unicode-normalization = "0.1.25"
 lindera = { version = "6.2.0", default-features = false, features = ["embed-ipadic", "embed-cc-cedict"], optional = true }
 # A lone hanzi's most common reading, which CC-CEDICT does not order by.

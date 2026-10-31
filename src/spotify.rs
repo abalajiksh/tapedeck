@@ -555,7 +555,7 @@ mod tests {
         let mut files = Vec::new();
         for i in 0..zip.len() {
             let mut e = zip.by_index(i).unwrap();
-            if e.is_file() && is_history_file(e.name()) {
+            if e.is_file() && is_history_file(&e.name().unwrap()) {
                 let mut s = String::new();
                 e.read_to_string(&mut s).unwrap();
                 files.push(s);
