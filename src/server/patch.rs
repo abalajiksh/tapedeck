@@ -40,6 +40,7 @@ use crate::db::{
 };
 use crate::openapi::{Bytes as Binary, Unauthorized};
 use crate::patch::{actor as doc, signatures};
+use crate::sources::egress::Egress;
 
 /// A whole inbox request's budget for reaching a third party, not one HTTP
 /// call's. **The handler's own deadline**, which is the rule this codebase
@@ -3700,19 +3701,16 @@ async fn resolve_local(state: &Arc<AppState>, name: &str, headers: &HeaderMap) -
     }
 }
 
+// The client a stranger's URL is fetched with. It used to be a plain client
+// with `Policy::limited(2)`, and `fetch_actor` checked only the first URL: a
+// `keyId` on a public https host could answer 302 to http://127.0.0.1/ or to
+// the cloud metadata address, and the body came back as the actor's key
+// (td-security#8). `Egress::Stranger` judges every hop — https only, and the
+// *resolved* address public — which also closes a public name whose DNS points
+// inward, something `is_private_host` (a check on spelling) never could.
 fn http() -> &'static reqwest::Client {
     static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
-    CLIENT.get_or_init(|| {
-        reqwest::Client::builder()
-            .timeout(FETCH_TIMEOUT)
-            // A redirect chain is somebody else's server telling us where to
-            // look. Two hops is enough for a host that has moved and few enough
-            // that it cannot be walked somewhere interesting.
-            .redirect(reqwest::redirect::Policy::limited(2))
-            .user_agent(concat!("Tapedeck/", env!("CARGO_PKG_VERSION")))
-            .build()
-            .unwrap_or_default()
-    })
+    CLIENT.get_or_init(|| Egress::Stranger.client(FETCH_TIMEOUT))
 }
 
 /// Find a remote actor, from cache or from their server.
@@ -3785,6 +3783,10 @@ async fn fetch_actor(uri: &str, deadline: tokio::time::Instant) -> Option<Value>
         warn!("📡 refusing to fetch an actor on a private host: {uri}");
         return None;
     }
+    if let Err(e) = Egress::Stranger.check_url(uri) {
+        warn!("📡 refusing to fetch an actor at {uri}: {e}");
+        return None;
+    }
 
     let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
     if remaining.is_zero() {
@@ -3794,6 +3796,7 @@ async fn fetch_actor(uri: &str, deadline: tokio::time::Instant) -> Option<Value>
     let request = http()
         .get(uri)
         .header(header::ACCEPT, "application/activity+json, application/ld+json")
+        .header(header::USER_AGENT, concat!("Tapedeck/", env!("CARGO_PKG_VERSION")))
         .send();
 
     let response = match tokio::time::timeout(remaining, request).await {

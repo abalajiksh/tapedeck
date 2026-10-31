@@ -18,6 +18,12 @@
 //!   inside the networks the operator lists in `TAPEDECK_SOURCE_NETWORKS`.
 //!   Empty by default: a member pointing at the LAN is the operator's call.
 //!
+//! A third rule, [`Egress::Stranger`], is for URLs nobody on this instance
+//! chose: an actor document named by the `keyId` of an unauthenticated
+//! federation delivery. It reaches the public internet only, over `https`
+//! only, on every hop — td-security#8 was the Patch inbox applying those
+//! guards to the first URL and then following redirects anywhere.
+//!
 //! Enforced twice. The handlers check up front so a refusal is a clear 400
 //! instead of a connection error ([`Egress::check_url_resolved`]). The member
 //! client re-checks at connect time — its resolver drops refused addresses and
@@ -66,6 +72,10 @@ pub enum Egress {
     Open,
     /// A member's source: the public internet, plus the operator's networks.
     Member,
+    /// A URL a stranger chose — a federation `keyId`. The public internet
+    /// only, `https` only, and no operator networks: nobody on this instance
+    /// vouched for it.
+    Stranger,
 }
 
 /// Why an address was refused. Its text is what the member sees.
@@ -160,6 +170,7 @@ fn canonical(ip: IpAddr) -> IpAddr {
 
 const NEVER: &str =
     "A source can't point at this server, a link-local address or an unroutable one";
+const STRANGER: &str = "A remote server can't send this server to a private address";
 const PRIVATE: &str =
     "A source can't point at a private address unless an admin allows its network \
                        (TAPEDECK_SOURCE_NETWORKS)";
@@ -181,6 +192,7 @@ impl Egress {
         match classify(ip) {
             Class::Public => Ok(()),
             Class::Never => Err(Refusal(NEVER.into())),
+            Class::Private if self == Egress::Stranger => Err(Refusal(STRANGER.into())),
             Class::Private if networks().iter().any(|n| n.contains(&canonical(ip))) => Ok(()),
             Class::Private => Err(Refusal(PRIVATE.into())),
         }
@@ -197,6 +209,12 @@ impl Egress {
             .map_err(|_| Refusal("That doesn't look like a server URL".into()))?;
         if !matches!(parsed.scheme(), "http" | "https") {
             return Err(Refusal("A source URL has to be http or https".into()));
+        }
+        // Key material fetched in the clear is key material whoever is on the
+        // path chose. A redirect from https to http is refused here too, which
+        // is the downgrade td-security#8 found.
+        if self == Egress::Stranger && parsed.scheme() != "https" {
+            return Err(Refusal("A remote server has to be reached over https".into()));
         }
         match parsed.host_str().map(|h| h.trim_start_matches('[').trim_end_matches(']')) {
             // The URL parser has already normalised the integer, octal and
@@ -276,30 +294,38 @@ impl Egress {
         ));
         let builder = match self {
             Egress::Open => builder,
-            Egress::Member => builder.dns_resolver(Arc::new(GuardedResolver)).redirect(
-                reqwest::redirect::Policy::custom(|attempt| {
-                    if attempt.previous().len() >= 10 {
-                        return attempt.error("too many redirects");
-                    }
-                    match Egress::Member.check_url(attempt.url().as_str()) {
-                        Ok(()) => attempt.follow(),
-                        Err(e) => attempt.error(e),
-                    }
-                }),
-            ),
+            // Every hop is judged by the same rule as the first: its scheme
+            // and literal here, its resolved addresses by the resolver. A
+            // stranger gets two hops — enough for a host that has moved, few
+            // enough that a chain cannot be walked somewhere interesting.
+            Egress::Member | Egress::Stranger => {
+                let hops = if self == Egress::Stranger { 2 } else { 10 };
+                builder.dns_resolver(Arc::new(GuardedResolver(self))).redirect(
+                    reqwest::redirect::Policy::custom(move |attempt| {
+                        if attempt.previous().len() >= hops {
+                            return attempt.error("too many redirects");
+                        }
+                        match self.check_url(attempt.url().as_str()) {
+                            Ok(()) => attempt.follow(),
+                            Err(e) => attempt.error(e),
+                        }
+                    }),
+                )
+            }
         };
         builder.build().unwrap_or_else(|_| reqwest::Client::new())
     }
 }
 
-/// Resolves a member's hostnames and hands the connector only the addresses
-/// [`Egress::Member`] allows. Checking at this point rather than before the
-/// request is what defeats rebinding: the address judged is the address used.
-struct GuardedResolver;
+/// Resolves hostnames and hands the connector only the addresses its rule
+/// allows. Checking at this point rather than before the request is what
+/// defeats rebinding: the address judged is the address used.
+struct GuardedResolver(Egress);
 
 impl reqwest::dns::Resolve for GuardedResolver {
     fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
         let host = name.as_str().to_string();
+        let rule = self.0;
         Box::pin(async move {
             // getaddrinfo blocks, so it runs off the runtime, the way
             // reqwest's own resolver does it.
@@ -308,7 +334,7 @@ impl reqwest::dns::Resolve for GuardedResolver {
                 .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)??;
             let mut refusal = None;
             let allowed: Vec<SocketAddr> = addrs
-                .filter(|a| match Egress::Member.check_ip(a.ip()) {
+                .filter(|a| match rule.check_ip(a.ip()) {
                     Ok(()) => true,
                     Err(e) => {
                         refusal = Some(e);
@@ -432,5 +458,71 @@ mod tests {
         let e = member.expect_err("a member client must not reach loopback");
         let chain = format!("{:?}", e);
         assert!(chain.contains("can't point at this server"), "{chain}");
+    }
+
+    /// td-security#8: a stranger's URL reaches the public internet over https
+    /// and nothing else — not the operator's networks, which a member may
+    /// reach, and never plain http.
+    #[test]
+    fn a_stranger_gets_public_https_only() {
+        assert!(Egress::Stranger.check_url("https://mastodon.example/users/a").is_ok());
+        assert!(Egress::Stranger.check_url("https://93.184.216.34/users/a").is_ok());
+        for url in [
+            "http://mastodon.example/users/a",
+            "https://127.0.0.1/users/a",
+            "https://169.254.169.254/latest/meta-data/",
+            "https://192.168.178.20/users/a",
+            "https://[::1]/users/a",
+            "https://[::ffff:127.0.0.1]/users/a",
+            "https://2130706433/users/a",
+        ] {
+            assert!(Egress::Stranger.check_url(url).is_err(), "{url}");
+        }
+        assert!(Egress::Stranger.check_ip(ip("100.100.1.1")).is_err(), "CGNAT is a LAN");
+    }
+
+    /// The finding itself, live: a server the first URL is allowed to reach
+    /// answers with a redirect inward. The stranger's client must refuse the
+    /// hop — to plain http, to a private literal, and to a name that resolves
+    /// to loopback — where the old `Policy::limited(2)` client followed all
+    /// three. The first request goes to the stub directly (its address is a
+    /// literal, which the caller's `check_url` would refuse; this test is
+    /// about the hops after it).
+    #[tokio::test]
+    async fn a_stranger_client_will_not_follow_a_redirect_inward() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            loop {
+                if let Ok((mut s, _)) = listener.accept().await {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buf = [0u8; 1024];
+                    let n = s.read(&mut buf).await.unwrap_or(0);
+                    let req = String::from_utf8_lossy(&buf[..n]);
+                    let to = if req.starts_with("GET /http ") {
+                        "http://mastodon.example/actor".to_string()
+                    } else if req.starts_with("GET /literal ") {
+                        "https://169.254.169.254/latest/meta-data/".to_string()
+                    } else {
+                        format!("https://localhost:{port}/actor")
+                    };
+                    let resp = format!(
+                        "HTTP/1.1 302 Found\r\nlocation: {to}\r\ncontent-length: 0\r\n\r\n"
+                    );
+                    let _ = s.write_all(resp.as_bytes()).await;
+                }
+            }
+        });
+        let client = Egress::Stranger.client(Duration::from_secs(5));
+        for (path, why) in [
+            ("http", "https"),
+            ("literal", "can't point at this server"),
+            ("name", "can't point at this server"),
+        ] {
+            let e =
+                client.get(format!("http://127.0.0.1:{port}/{path}")).send().await.expect_err(path);
+            let chain = format!("{e:?}");
+            assert!(chain.contains(why), "{path}: {chain}");
+        }
     }
 }
