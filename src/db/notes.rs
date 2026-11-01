@@ -1001,6 +1001,15 @@ impl Database {
         .fetch_all(&self.pool)
         .await
     }
+    /// Total for [`Self::list_sessions`]' paging, with the same filter.
+    pub async fn count_sessions(&self, user_id: i64) -> Result<i64, sqlx::Error> {
+        sqlx::query_scalar(&crate::sql!(
+            "SELECT COUNT(*) FROM sessions WHERE user_id = ? AND track_count > 0"
+        ))
+        .bind(user_id)
+        .fetch_one(&self.pool)
+        .await
+    }
     pub async fn get_session(
         &self,
         user_id: i64,

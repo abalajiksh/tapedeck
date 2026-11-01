@@ -48,6 +48,8 @@ pub struct ListenPage {
     pub scrobbles: Vec<ScrobbleRecord>,
     /// Rows in this page, not in the history.
     pub count: usize,
+    /// Listens matching the same filters across the whole history.
+    pub total: i64,
     pub limit: i64,
     pub offset: i64,
 }
@@ -75,24 +77,33 @@ pub async fn list_scrobbles(
     let limit = params.limit.unwrap_or(50).clamp(1, 500);
     let offset = params.offset.unwrap_or(0).max(0);
 
-    match state
-        .db
-        .get_recent_scrobbles(
-            user.user_id,
-            limit,
-            offset,
-            params.artist.as_deref(),
-            params.album.as_deref(),
-            params.track.as_deref(),
-            params.after,
-            params.before,
-            params.social,
-        )
-        .await
-    {
-        Ok(scrobbles) => {
+    let (artist, album, track) =
+        (params.artist.as_deref(), params.album.as_deref(), params.track.as_deref());
+    let page = state.db.get_recent_scrobbles(
+        user.user_id,
+        limit,
+        offset,
+        artist,
+        album,
+        track,
+        params.after,
+        params.before,
+        params.social,
+    );
+    let total = state.db.count_scrobbles(
+        user.user_id,
+        artist,
+        album,
+        track,
+        params.after,
+        params.before,
+        params.social,
+    );
+    match tokio::try_join!(page, total) {
+        Ok((scrobbles, total)) => {
             let count = scrobbles.len();
-            (StatusCode::OK, Json(ListenPage { scrobbles, count, limit, offset })).into_response()
+            (StatusCode::OK, Json(ListenPage { scrobbles, count, total, limit, offset }))
+                .into_response()
         }
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
