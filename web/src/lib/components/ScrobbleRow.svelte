@@ -22,7 +22,7 @@
 	/** Off in selection mode, where a click is meant to select the row. */
 	$: linkable = !selectable;
 
-	const dispatch = createEventDispatcher<{ menu: Scrobble; toggle: Scrobble }>();
+	const dispatch = createEventDispatcher<{ menu: { scrobble: Scrobble; rect: DOMRect }; toggle: Scrobble }>();
 
 	$: q = qualityLabel(scrobble);
 	// A side of vinyl has no codec, so the fidelity badge is empty for one and the
@@ -109,7 +109,7 @@
 	<span class="dur">{formatDuration(scrobble.duration)}</span>
 	<span class="when">{showMenu ? time : timeAgo(scrobble.timestamp)}</span>
 	{#if showMenu && !selectable}
-		<button on:click={() => dispatch('menu', scrobble)} aria-label="Listen actions" style="border:none;background:transparent;cursor:pointer;color:var(--td-muted-3);padding:5px;border-radius:8px;flex:none;display:flex;">
+		<button on:click={(e) => dispatch('menu', { scrobble, rect: e.currentTarget.getBoundingClientRect() })} aria-label="Listen actions" style="border:none;background:transparent;cursor:pointer;color:var(--td-muted-3);padding:5px;border-radius:8px;flex:none;display:flex;">
 			<svg viewBox="0 0 24 24" width="18" fill="currentColor"><circle cx="12" cy="5" r="1.7"/><circle cx="12" cy="12" r="1.7"/><circle cx="12" cy="19" r="1.7"/></svg>
 		</button>
 	{/if}

@@ -130,6 +130,14 @@
 
 	// row menu + dialogs
 	let menuFor: Scrobble | null = null;
+	// Anchored to the ⋯ button; opens upward in the lower half so it stays on screen.
+	let menuPos = '';
+	function openMenu(d: { scrobble: Scrobble; rect: DOMRect }) {
+		const r = d.rect;
+		const v = r.bottom > window.innerHeight / 2 ? `bottom:${window.innerHeight - r.top}px` : `top:${r.bottom}px`;
+		menuPos = `${v};right:${window.innerWidth - r.right}px;`;
+		menuFor = d.scrobble;
+	}
 	let inspecting: Scrobble | null = null;
 	let editing: Scrobble | null = null;
 	let edit = { title: '', artist: '', album: '', mbid_recording: '', signal_chain_id: 0, chain_variant_id: 0, format_type: '' };
@@ -672,7 +680,7 @@
 		<div class="panel" style="border-radius:22px;overflow:hidden;">
 			{#each g.items as s (s.id)}
 				<ScrobbleRow scrobble={s} chains={chainsById} showMenu selectable={selectMode} selected={selected.has(s.id)}
-					on:menu={(e) => (menuFor = e.detail)} on:toggle={(e) => toggleSelect(e.detail)} />
+					on:menu={(e) => openMenu(e.detail)} on:toggle={(e) => toggleSelect(e.detail)} />
 			{/each}
 		</div>
 	{/each}
@@ -690,9 +698,10 @@
 {/if}
 
 <!-- Row menu -->
+<svelte:window on:scroll={() => (menuFor = null)} on:resize={() => (menuFor = null)} />
 {#if menuFor}
 	<div on:click={() => (menuFor = null)} on:keydown={() => {}} role="presentation" style="position:fixed;inset:0;z-index:65;"></div>
-	<div style="position:fixed;z-index:66;right:40px;top:50%;transform:translateY(-50%);background:var(--td-surface);border:1px solid var(--td-border);border-radius:14px;box-shadow:0 12px 32px rgba(46,43,37,.2);padding:6px;min-width:180px;display:flex;flex-direction:column;">
+	<div style="position:fixed;z-index:66;{menuPos}background:var(--td-surface);border:1px solid var(--td-border);border-radius:14px;box-shadow:0 12px 32px rgba(46,43,37,.2);padding:6px;min-width:180px;display:flex;flex-direction:column;">
 		<!-- The bare heart on the row means the track; album and artist are
 		     explicit here, where there's room to say which. -->
 		{#each [{ k: 'album', label: 'album' }, { k: 'artist', label: 'artist' }] as t}
