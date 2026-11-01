@@ -2444,7 +2444,7 @@ class TapedeckAPI {
 		/** true for listening marked as heard in company, false for the rest.
 		 *  Omit for everything — an unmarked listen is unmarked, not solitary. */
 		social?: boolean;
-	}): Promise<{ scrobbles: Scrobble[]; count: number }> {
+	}): Promise<{ scrobbles: Scrobble[]; count: number; total: number }> {
 		const query = new URLSearchParams();
 		if (params?.limit) query.set('limit', String(params.limit));
 		if (params?.offset) query.set('offset', String(params.offset));
@@ -3711,7 +3711,7 @@ class TapedeckAPI {
 	}
 
 	// ── Sessions ──
-	async getSessions(limit = 50, offset = 0): Promise<{ sessions: Session[]; count: number }> {
+	async getSessions(limit = 50, offset = 0): Promise<{ sessions: Session[]; count: number; total: number }> {
 		return this.get(`/api/v1/sessions?limit=${limit}&offset=${offset}`);
 	}
 	async getSession(id: number): Promise<{ session: Session; scrobbles: Scrobble[] }> {

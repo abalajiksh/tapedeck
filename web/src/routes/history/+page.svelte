@@ -9,6 +9,7 @@
 	import { loadLoves, lovedKeys, isLoved, toggleLove } from '$lib/loves';
 	import SessionCard from '$lib/components/SessionCard.svelte';
 	import ToTop from '$lib/components/ToTop.svelte';
+	import Pager from '$lib/components/Pager.svelte';
 	import type { Session } from '$lib/api';
 
 	let scrobbles: Scrobble[] = [];
@@ -19,9 +20,13 @@
 	$: chainsById = Object.fromEntries(chains.map((c) => [c.id, { name: c.name, icon: c.icon }]));
 	let filter = '';
 	let loading = true;
-	let offset = 0;
-	let hasMore = true;
+	// Numbered pages kept in the URL, so a reload or Back lands where you were.
+	// shortcut: offset paging drifts by however many listens arrive while you
+	// read page 2+; keyset on (timestamp, id) if that ever bites.
+	let page = 1;
+	let total = 0;
 	const PAGE = 50;
+	let jumpDate = '';
 
 	// ── Sessions ──
 	// A calendar day is an arbitrary boundary for listening; a session is the
@@ -30,6 +35,9 @@
 	let groupBy: 'day' | 'session' = 'day';
 	let sessions: Session[] = [];
 	let sessionsLoading = false;
+	let sessPage = 1;
+	let sessTotal = 0;
+	const SESS_PAGE = 30;
 	let mergeMode = false;
 	let mergePick = new Set<number>();
 	let merging = false;
@@ -38,7 +46,9 @@
 	async function loadSessions() {
 		sessionsLoading = true;
 		try {
-			sessions = (await api.getSessions(60)).sessions;
+			const res = await api.getSessions(SESS_PAGE, (sessPage - 1) * SESS_PAGE);
+			sessions = res.sessions;
+			sessTotal = res.total;
 		} catch (e) { console.warn('sessions', e); }
 		sessionsLoading = false;
 	}
@@ -47,6 +57,47 @@
 		groupBy = g;
 		if (g === 'session' && !sessions.length) loadSessions();
 		if (g === 'day') exitMerge();
+		syncPlace();
+	}
+
+	/** Write the view, scope and page into the address bar. */
+	function syncPlace() {
+		const q = new URLSearchParams();
+		if (scope.artist) q.set('artist', scope.artist);
+		if (scope.album) q.set('album', scope.album);
+		if (scope.track) q.set('track', scope.track);
+		if (groupBy === 'session') {
+			q.set('view', 'session');
+			if (sessPage > 1) q.set('page', String(sessPage));
+		} else if (page > 1) q.set('page', String(page));
+		const qs = q.toString();
+		syncUrl(`/history${qs ? '?' + qs : ''}`);
+	}
+
+	// Selections and merge picks are sets of ids, so they survive a page turn.
+	function goPage(p: number) {
+		page = p;
+		syncPlace();
+		void load();
+		window.scrollTo({ top: 0 });
+	}
+	function goSessPage(p: number) {
+		sessPage = p;
+		syncPlace();
+		void loadSessions();
+		window.scrollTo({ top: 0 });
+	}
+
+	/** The page holding the last listen on or before that day: count what's
+	 *  newer under the same filters, and that count *is* the offset. */
+	async function jumpTo() {
+		if (!jumpDate) return;
+		const end = new Date(jumpDate + 'T00:00:00');
+		end.setDate(end.getDate() + 1);
+		try {
+			const newer = (await api.getScrobbles({ ...filters(), limit: 1, after: Math.floor(end.getTime() / 1000) })).total;
+			goPage(Math.floor(newer / PAGE) + 1);
+		} catch (e) { console.warn('jump', e); }
 	}
 
 	function toggleMergePick(sess: Session) {
@@ -74,7 +125,6 @@
 
 	function clearScope() {
 		scope = {};
-		syncUrl('/history');
 		load(true);
 	}
 
@@ -197,7 +247,7 @@
 			// listen can reorder the list and change which day it falls under,
 			// so the page's own grouping has to be rebuilt from the answer.
 			selected = new Set();
-			await load(true);
+			await load();
 		} catch (e) {
 			timeNotice = 'Could not move those: ' + e;
 		}
@@ -251,23 +301,31 @@
 		return out;
 	}
 
+	function filters() {
+		return {
+			// The typed filter is an artist filter; a scope from search can
+			// narrow by album or track instead.
+			artist: filter || scope.artist || undefined,
+			album: scope.album,
+			track: scope.track,
+			social: socialFilter ?? undefined
+		};
+	}
+
+	/** `reset` is a filter change: back to page 1, since the old page number
+	 *  means nothing under a different filter. */
 	async function load(reset = false) {
-		if (reset) { offset = 0; scrobbles = []; hasMore = true; }
+		if (reset) { page = 1; syncPlace(); }
 		loading = true;
 		try {
-			const res = await api.getScrobbles({
-				limit: PAGE,
-				offset,
-				// The typed filter is an artist filter; a scope from search can
-				// narrow by album or track instead.
-				artist: filter || scope.artist || undefined,
-				album: scope.album,
-				track: scope.track,
-				social: socialFilter ?? undefined
-			});
-			scrobbles = reset ? res.scrobbles : [...scrobbles, ...res.scrobbles];
-			offset += res.scrobbles.length;
-			hasMore = res.scrobbles.length === PAGE;
+			const res = await api.getScrobbles({ ...filters(), limit: PAGE, offset: (page - 1) * PAGE });
+			scrobbles = res.scrobbles;
+			total = res.total;
+			// Past the end (a stale URL, or deletes): land on the last real page.
+			if (!scrobbles.length && total && page > 1) {
+				loading = false;
+				return goPage(Math.ceil(total / PAGE));
+			}
 		} catch (e) { console.warn('history', e); }
 		loading = false;
 	}
@@ -306,9 +364,9 @@
 
 	// ── Keeping up with what's playing ──
 	// This page used to load once and never again, so leaving it open through an
-	// album meant watching a list that had stopped being the history. It pulls
-	// the newest page back and merges, rather than reloading: a reload would
-	// throw away everything paged in and put the reader back at the top.
+	// album meant watching a list that had stopped being the history. Only page
+	// 1 follows along: on an older page new listens would shuffle rows under
+	// the reader, so it stays put and the total catches up on the next turn.
 	const REFRESH_MS = 20_000;
 	let refreshTimer: ReturnType<typeof setInterval> | null = null;
 	const onWake = () => { if (!document.hidden) refreshHead(); };
@@ -321,29 +379,15 @@
 
 	async function refreshHead() {
 		if (refreshPaused || loading || (typeof document !== 'undefined' && document.hidden)) return;
+		if (groupBy === 'day' ? page !== 1 : sessPage !== 1) return;
 		try {
-			const res = await api.getScrobbles({
-				limit: PAGE,
-				offset: 0,
-				artist: filter || scope.artist || undefined,
-				album: scope.album,
-				track: scope.track,
-				social: socialFilter ?? undefined
-			});
+			const res = await api.getScrobbles({ ...filters(), limit: PAGE, offset: 0 });
 			const known = new Set(scrobbles.map((s) => s.id));
-			const fresh = res.scrobbles.filter((s) => !known.has(s.id));
-			if (!fresh.length) return;
-			// Sorted rather than prepended: a listen added by hand carries its own
-			// timestamp and can legitimately land in the middle of what's already
-			// loaded, and groupByDay walks the list in order — an out-of-order row
-			// would split its day into two headings.
-			scrobbles = [...fresh, ...scrobbles].sort(
-				(a, b) => b.timestamp - a.timestamp || b.id - a.id
-			);
-			// `offset` is a row offset into the server's own ordering, so rows that
-			// appeared above the window shift it. Without this, "load more" would
-			// re-serve the last `fresh.length` rows it already gave us.
-			offset += fresh.length;
+			if (!res.scrobbles.some((s) => !known.has(s.id))) return;
+			// Replaced, not merged: page 1 is a fixed window, and the server's
+			// order is the one groupByDay needs.
+			scrobbles = res.scrobbles;
+			total = res.total;
 			if (groupBy === 'session') loadSessions();
 		} catch {
 			// Same call the deck poll makes: a failed refresh leaves what's on
@@ -425,6 +469,7 @@
 		try {
 			await api.deleteScrobble(s.id);
 			scrobbles = scrobbles.filter((x) => x.id !== s.id);
+			total -= 1;
 		} catch (e) { alert('Failed to delete: ' + e); }
 		confirmDelete = null;
 		menuFor = null;
@@ -437,6 +482,12 @@
 			album: q.get('album') ?? undefined,
 			track: q.get('track') ?? undefined
 		};
+		const p = Math.max(1, Number(q.get('page')) || 1);
+		if (q.get('view') === 'session') {
+			groupBy = 'session';
+			sessPage = p;
+			void loadSessions();
+		} else page = p;
 		loadLoves();
 		// One request for the whole set, the way loves are loaded. Not awaited:
 		// the menu item is offered everywhere until it arrives, which is the
@@ -447,7 +498,7 @@
 		// variant picker on a session card.
 		try { variants = (await api.getVariants()).variants; } catch { /* optional */ }
 		void loadPeers();
-		await load(true);
+		await load();
 
 		refreshTimer = setInterval(refreshHead, REFRESH_MS);
 		// Coming back to the tab is the moment the list is most obviously stale,
@@ -504,6 +555,7 @@
 				<button class="seg-btn" class:on={socialFilter === false} on:click={() => setSocial(false)}>Unmarked</button>
 			</div>
 			<input class="input" style="width:200px;" bind:value={filter} on:input={onFilter} placeholder="Filter by artist…">
+			<input class="input" style="width:auto;" type="date" bind:value={jumpDate} on:change={jumpTo} aria-label="Jump to a date">
 		{/if}
 	</div>
 </div>
@@ -604,6 +656,7 @@
 				on:changed={loadSessions}
 			/>
 		{/each}
+		<Pager page={sessPage} size={SESS_PAGE} total={sessTotal} noun="sessions" busy={sessionsLoading} on:go={(e) => goSessPage(e.detail)} />
 	{:else}
 		<div class="panel" style="border-radius:22px;padding:44px;text-align:center;color:var(--td-muted);">
 			No sessions yet — they're grouped from your listens as they arrive.
@@ -623,11 +676,7 @@
 			{/each}
 		</div>
 	{/each}
-	{#if hasMore}
-		<div style="display:flex;justify-content:center;margin-top:22px;">
-			<button class="btn btn-secondary" on:click={() => load(false)} disabled={loading}>{loading ? 'Loading…' : 'Load older tapes'}</button>
-		</div>
-	{/if}
+	<Pager {page} size={PAGE} {total} busy={loading} on:go={(e) => goPage(e.detail)} />
 {:else if loading}
 	<div style="display:flex;justify-content:center;padding:60px;"><div class="spin" style="width:22px;height:22px;border:2px solid var(--td-track);border-top-color:var(--td-accent);border-radius:50%;"></div></div>
 {:else if filter}

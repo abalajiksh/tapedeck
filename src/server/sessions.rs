@@ -53,6 +53,8 @@ pub struct SessionList {
     pub sessions: Vec<SessionRow>,
     /// Rows in this page.
     pub count: usize,
+    /// Sessions across every page.
+    pub total: i64,
 }
 
 /// One session and its listens, in play order.
@@ -118,9 +120,11 @@ pub async fn list_sessions(
 ) -> impl IntoResponse {
     let limit = q.limit.unwrap_or(50).clamp(1, 200);
     let offset = q.offset.unwrap_or(0).max(0);
-    match state.db.list_sessions(user.user_id, limit, offset).await {
-        Ok(sessions) => {
-            (StatusCode::OK, Json(SessionList { count: sessions.len(), sessions })).into_response()
+    let page = state.db.list_sessions(user.user_id, limit, offset);
+    match tokio::try_join!(page, state.db.count_sessions(user.user_id)) {
+        Ok((sessions, total)) => {
+            (StatusCode::OK, Json(SessionList { count: sessions.len(), total, sessions }))
+                .into_response()
         }
         Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     }

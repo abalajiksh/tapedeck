@@ -6,6 +6,16 @@
 
 use super::*;
 
+/// The History filter, shared by the page query and its count so the total can
+/// never disagree with the rows. Binds: user, then each filter twice.
+const HISTORY_WHERE: &str = "WHERE user_id = ? AND skipped = FALSE
+               AND (? IS NULL OR LOWER(artist) LIKE '%' || LOWER(?) || '%')
+               AND (? IS NULL OR LOWER(album) LIKE '%' || LOWER(?) || '%')
+               AND (? IS NULL OR LOWER(title) LIKE '%' || LOWER(?) || '%')
+               AND (? IS NULL OR timestamp >= ?)
+               AND (? IS NULL OR timestamp <= ?)
+               AND (? IS NULL OR (company IS NOT NULL) = ?)";
+
 impl Database {
     /// Store one listen.
     ///
@@ -544,16 +554,11 @@ impl Database {
         before: Option<i64>,
         social: Option<bool>,
     ) -> Result<Vec<ScrobbleRecord>, sqlx::Error> {
-        sqlx::query_as::<_, ScrobbleRecord>(&crate::sql!(
-            "SELECT * FROM scrobbles WHERE user_id = ? AND skipped = FALSE
-               AND (? IS NULL OR LOWER(artist) LIKE '%' || LOWER(?) || '%')
-               AND (? IS NULL OR LOWER(album) LIKE '%' || LOWER(?) || '%')
-               AND (? IS NULL OR LOWER(title) LIKE '%' || LOWER(?) || '%')
-               AND (? IS NULL OR timestamp >= ?)
-               AND (? IS NULL OR timestamp <= ?)
-               AND (? IS NULL OR (company IS NOT NULL) = ?)
-             ORDER BY timestamp DESC LIMIT ? OFFSET ?",
-        ))
+        sqlx::query_as::<_, ScrobbleRecord>(&crate::sql!(&format!(
+            "SELECT * FROM scrobbles {}
+             ORDER BY timestamp DESC, id DESC LIMIT ? OFFSET ?",
+            HISTORY_WHERE
+        )))
         .bind(user_id)
         .bind(artist_filter)
         .bind(artist_filter)
@@ -570,6 +575,39 @@ impl Database {
         .bind(limit)
         .bind(offset)
         .fetch_all(&self.pool)
+        .await
+    }
+    /// How many listens [`Self::get_recent_scrobbles`] would page through with
+    /// the same filters — the History page's total and its jump-to-date.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn count_scrobbles(
+        &self,
+        user_id: i64,
+        artist_filter: Option<&str>,
+        album_filter: Option<&str>,
+        track_filter: Option<&str>,
+        after: Option<i64>,
+        before: Option<i64>,
+        social: Option<bool>,
+    ) -> Result<i64, sqlx::Error> {
+        sqlx::query_scalar(&crate::sql!(&format!(
+            "SELECT COUNT(*) FROM scrobbles {}",
+            HISTORY_WHERE
+        )))
+        .bind(user_id)
+        .bind(artist_filter)
+        .bind(artist_filter)
+        .bind(album_filter)
+        .bind(album_filter)
+        .bind(track_filter)
+        .bind(track_filter)
+        .bind(after)
+        .bind(after)
+        .bind(before)
+        .bind(before)
+        .bind(social)
+        .bind(social)
+        .fetch_one(&self.pool)
         .await
     }
     /// Search a user's own listening history by name.

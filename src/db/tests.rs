@@ -5945,6 +5945,20 @@ async fn company_is_marked_on_the_listen_and_survives_a_session_rebuild() {
     let all =
         db.get_recent_scrobbles(uid, 10, 0, None, None, None, None, None, None).await.unwrap();
     assert_eq!(all.len(), 2, "no filter means no filter");
+    // The History total is the same filter counted, not the page length.
+    assert_eq!(db.count_scrobbles(uid, None, None, None, None, None, None).await.unwrap(), 2);
+    assert_eq!(db.count_scrobbles(uid, None, None, None, None, None, Some(true)).await.unwrap(), 1);
+    assert_eq!(
+        db.count_scrobbles(uid, None, None, None, Some(1_760_000_150), None, None).await.unwrap(),
+        1,
+        "jump-to-date counts what is newer through `after`"
+    );
+    assert_eq!(
+        db.get_recent_scrobbles(uid, 1, 1, None, None, None, None, None, None).await.unwrap()[0]
+            .title,
+        "Alone",
+        "offset pages through the same ordering the count covers"
+    );
 
     // **The reason it is not on `sessions`.** A rebuild deletes every
     // session row and re-inserts it, so anything held there is erased by a

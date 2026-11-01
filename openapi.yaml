@@ -17038,6 +17038,7 @@ components:
       required:
       - scrobbles
       - count
+      - total
       - limit
       - offset
       properties:
@@ -17049,6 +17050,10 @@ components:
           type: integer
           description: Rows in this page, not in the history.
           minimum: 0
+        total:
+          type: integer
+          format: int64
+          description: Listens matching the same filters across the whole history.
         limit:
           type: integer
           format: int64
@@ -22485,6 +22490,7 @@ components:
       required:
       - sessions
       - count
+      - total
       properties:
         sessions:
           type: array
@@ -22494,6 +22500,10 @@ components:
           type: integer
           description: Rows in this page.
           minimum: 0
+        total:
+          type: integer
+          format: int64
+          description: Sessions across every page.
     SessionRow:
       type: object
       description: |-
