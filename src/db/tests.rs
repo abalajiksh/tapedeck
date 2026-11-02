@@ -10960,3 +10960,173 @@ async fn the_sanitiser_splits_joined_credits_already_in_the_history() {
     let again = db.joined_artist_credits(uid).await.unwrap();
     assert_eq!(again.iter().map(|j| j.artist.as_str()).collect::<Vec<_>>(), ["Simon & Garfunkel"]);
 }
+
+/// A joined listen is the same listen whichever spelling each copy is in.
+///
+/// Found testing the branch against a household export (2026-11-02): a
+/// "Rihanna, Britney Spears" listen re-sent with `artist_names` was stored as
+/// "Rihanna", never met the unsplit row already held, and was banked twice.
+/// The same copy without the list was caught. Neither side has a recording
+/// MBID here, so only the artist comparison can catch them.
+#[tokio::test]
+async fn a_joined_listen_dedups_against_either_spelling() {
+    let db = testdb().await;
+    let uid = db.create_user("kit", None, "x", "user").await.unwrap();
+    let count = |title: &'static str| {
+        let db = &db;
+        async move {
+            let (n,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM scrobbles WHERE title = ?")
+                .bind(title)
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+            n
+        }
+    };
+
+    // Stored before `normalise_credit`: the joined string is the artist.
+    sqlx::query(
+        "INSERT INTO scrobbles (user_id, title, artist, timestamp, source_id, source_name, status)
+         VALUES (?, 'S&M Remix', 'Rihanna, Britney Spears', 1000, 'spotify-1', 'spotify', 'imported')",
+    )
+    .bind(uid)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    let mut listed = play("S&M Remix", "Rihanna, Britney Spears", 1_005);
+    listed.artists = Some(vec!["Rihanna".into(), "Britney Spears".into()]);
+    let saved = db
+        .save_scrobble(
+            uid,
+            &listed,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            ListenDisposition::LIVE,
+        )
+        .await
+        .unwrap();
+    assert!(!saved, "a listed copy is the unsplit listen already held");
+    let mut imported = listed.clone();
+    imported.source_id = "lb-1".into();
+    imported.timestamp = 1_003;
+    assert_ne!(db.import_listen(uid, &imported).await.unwrap(), ImportOutcome::Inserted);
+    assert_eq!(count("S&M Remix").await, 1);
+
+    // The other way round: stored split, the copy arrives without a list.
+    let mut first = play("Die With A Smile", "Lady Gaga, Bruno Mars", 2_000);
+    first.artists = Some(vec!["Lady Gaga".into(), "Bruno Mars".into()]);
+    db.save_scrobble(
+        uid,
+        &first,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        ListenDisposition::LIVE,
+    )
+    .await
+    .unwrap();
+    let bare = play("Die With A Smile", "Lady Gaga, Bruno Mars", 2_004);
+    let saved = db
+        .save_scrobble(
+            uid,
+            &bare,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            ListenDisposition::LIVE,
+        )
+        .await
+        .unwrap();
+    assert!(!saved, "a list-less copy matches the split row's artist_display");
+    assert_eq!(count("Die With A Smile").await, 1);
+
+    // A different artist with the same title is still a different listen.
+    let cover = play("Die With A Smile", "Some Cover Band", 2_006);
+    assert!(db
+        .save_scrobble(
+            uid,
+            &cover,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            ListenDisposition::LIVE
+        )
+        .await
+        .unwrap());
+}
+
+/// A split that leaves a part still joined is never proposed, and a row an
+/// earlier split left that way comes back for a hand split against its whole
+/// credit.
+#[tokio::test]
+async fn a_split_that_leaves_a_joined_part_goes_to_the_hand_list() {
+    let db = testdb().await;
+    let uid = db.create_user("kit", None, "x", "user").await.unwrap();
+    let insert = |artist: &str, credit: Option<&str>, ts: i64| {
+        let (db, artist, credit) = (&db, artist.to_string(), credit.map(str::to_string));
+        async move {
+            sqlx::query(
+                "INSERT INTO scrobbles (user_id, title, artist, artist_credit, timestamp,
+                                        source_id, source_name, status)
+                 VALUES (?, 't', ?, ?, ?, ?, 'old', 'imported')",
+            )
+            .bind(uid)
+            .bind(&artist)
+            .bind(&credit)
+            .bind(ts)
+            .bind(format!("old-{ts}"))
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        }
+    };
+    // Cut on `;`, the second half would be four composers filed as one.
+    insert("Yuja Wang; Kapustin, Schumann, Tchaikovsky, Prokofiev", None, 1).await;
+    // What applying that kind of split used to leave behind.
+    insert("Aftab Darvishi, Unsuk Chin", Some("Aftab Darvishi, Unsuk Chin; Anne-Sophie Mutter"), 2)
+        .await;
+    // A clean `;` split is still proposed.
+    insert("Bach; Hilary Hahn", None, 3).await;
+
+    let preview = db.joined_artist_credits(uid).await.unwrap();
+    let yuja = preview.iter().find(|j| j.artist.starts_with("Yuja Wang")).unwrap();
+    assert!(yuja.names.is_empty(), "not proposed");
+    let stuck = preview.iter().find(|j| j.artist.starts_with("Aftab Darvishi")).unwrap();
+    assert!(stuck.names.is_empty(), "offered again, by hand");
+    assert_eq!(stuck.subject(), "Aftab Darvishi, Unsuk Chin; Anne-Sophie Mutter");
+    let bach = preview.iter().find(|j| j.artist.starts_with("Bach")).unwrap();
+    assert_eq!(bach.names, ["Bach", "Hilary Hahn"]);
+
+    // The hand split is checked against the whole credit, so it cannot drop
+    // the soloist the earlier split had kept.
+    assert!(!credit_covers(stuck.subject(), &["Aftab Darvishi", "Unsuk Chin"]));
+    let all = ["Aftab Darvishi", "Unsuk Chin", "Anne-Sophie Mutter"];
+    assert!(credit_covers(stuck.subject(), &all));
+    let names: Vec<String> = all.iter().map(|s| s.to_string()).collect();
+    db.split_artist_credit(uid, &stuck.artist, stuck.credit.as_deref(), &names).await.unwrap();
+    assert_eq!(db.artist_plays(uid, "Unsuk Chin").await.unwrap(), 1);
+    assert_eq!(db.artist_plays(uid, "Anne-Sophie Mutter").await.unwrap(), 1);
+    assert!(db
+        .joined_artist_credits(uid)
+        .await
+        .unwrap()
+        .iter()
+        .all(|j| !j.artist.starts_with("Aftab")));
+}

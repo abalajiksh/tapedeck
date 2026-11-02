@@ -480,8 +480,9 @@ pub struct JoinedEdit {
     #[serde(default)]
     pub credit: Option<String>,
     /// A hand split, primary first. Omit it to take the split the preview
-    /// derived. Refused unless the names account for the whole string, so a
-    /// split can never introduce an artist the listen didn't name.
+    /// derived. Refused unless the names account for the whole credit (`credit`
+    /// when set, otherwise `artist`), so a split can never introduce an artist
+    /// the listen didn't name, nor drop one it did.
     #[serde(default)]
     pub names: Option<Vec<String>>,
 }
@@ -748,13 +749,13 @@ async fn sanitize_apply(
                             .filter(|n| !n.is_empty())
                             .collect();
                         let refs: Vec<&str> = hand.iter().map(String::as_str).collect();
-                        if !crate::db::credit_covers(&c.artist, &refs) {
+                        if !crate::db::credit_covers(c.subject(), &refs) {
                             return err_response(
                                 StatusCode::BAD_REQUEST,
                                 format!(
                                     "\"{}\" doesn't split into {} — every name must appear in it, \
                                      with only joining words left over",
-                                    c.artist,
+                                    c.subject(),
                                     hand.join(" + ")
                                 ),
                             );

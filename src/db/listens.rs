@@ -47,15 +47,17 @@ impl Database {
         source_ref: Option<i64>,
         disposition: ListenDisposition,
     ) -> Result<bool, sqlx::Error> {
-        // One primary in `artist`, everyone in `artists` — before dedup, so a
-        // re-sent listen is compared in the shape it will be stored in.
+        // One primary in `artist`, everyone in `artists`. The fuzzy check gets
+        // the play as sent, so it can compare both spellings (see
+        // `fuzzy_existing_id`); normalising first would leave it only the primary.
+        let sent = play;
         let mut play = play.clone();
         let artist_display = normalise_credit(&mut play);
         let play = &play;
         if self.exists(user_id, &play.source_id, &play.source_name).await? {
             return Ok(false);
         }
-        if self.fuzzy_exists(user_id, play, disposition.skipped).await? {
+        if self.fuzzy_exists(user_id, sent, disposition.skipped).await? {
             debug!("Skipping duplicate play (fuzzy match): {} - {}", play.artist, play.title);
             return Ok(false);
         }
@@ -375,6 +377,17 @@ impl Database {
         //   3. both carry the same recording MBID, which settles it outright
         //      whatever the two servers chose to call the performer.
         //
+        // **Each side is compared in both of its spellings.** `normalise_credit`
+        // stores "Lady Gaga, Bruno Mars" as "Lady Gaga" only when the source
+        // sent a list (Navidrome, ListenBrainz `artist_names`); the same play
+        // without one, and every listen stored before the split existed, keeps
+        // the joined string. So the incoming listen is offered as sent *and* as
+        // its primary, against the stored `artist` *and* `artist_display`.
+        // Without it, a copy arriving with a list never met the unsplit copy
+        // already held and was banked twice. Callers may pass the play raw or
+        // already normalised; normalising here gives the same pair either way
+        // whenever the source string survives in `play.artist`.
+        //
         // **The nearest row wins, not the oldest.** A window can hold two
         // plays of the same track — a repeat lands one track length after the
         // first, and a copy stamped at a play's *end* lands on the next play's
@@ -394,6 +407,14 @@ impl Database {
         // `idx_scrobbles_user_time` serves them, so the fold only ever runs
         // over the handful of rows inside a two-minute slice of one user's
         // history.
+        // Folded in SQL, not here: SQLite's `LOWER` touches ASCII only, and
+        // Rust's `to_lowercase` would fold "Ólafur" where the column never is.
+        let sent = &play.artist;
+        let primary = {
+            let mut p = play.clone();
+            normalise_credit(&mut p);
+            p.artist
+        };
         let placeholders = VARIOUS_ARTISTS_KEYS.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
         let sql = format!(
             "SELECT id FROM scrobbles
@@ -402,7 +423,8 @@ impl Database {
                 AND timestamp BETWEEN ? - ? AND ? + ?
                 AND LOWER(TRIM(title)) = LOWER(TRIM(?))
                 AND (
-                      LOWER(TRIM(artist)) = LOWER(TRIM(?))
+                      LOWER(TRIM(artist)) IN (LOWER(TRIM(?)), LOWER(TRIM(?)))
+                   OR LOWER(TRIM(artist_display)) IN (LOWER(TRIM(?)), LOWER(TRIM(?)))
                    OR LOWER(TRIM(artist)) IN ({ph})
                    OR ? IN ({ph})
                    OR (? IS NOT NULL AND mbid_recording = ?)
@@ -419,11 +441,14 @@ impl Database {
             .bind(timestamp)
             .bind(window)
             .bind(&play.title)
-            .bind(&play.artist);
+            .bind(sent)
+            .bind(&primary)
+            .bind(sent)
+            .bind(&primary);
         for k in VARIOUS_ARTISTS_KEYS {
             q = q.bind(*k);
         }
-        q = q.bind(play.artist.trim().to_lowercase());
+        q = q.bind(sent.trim().to_lowercase());
         for k in VARIOUS_ARTISTS_KEYS {
             q = q.bind(*k);
         }

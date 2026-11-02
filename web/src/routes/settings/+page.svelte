@@ -375,6 +375,8 @@
 	const guessSplit = (artist: string) =>
 		artist.split(/,\s+|\s+&\s+|\s+x\s+|\s+and\s+|\s+\+\s+|\s+vs\.?\s+/i).join('; ');
 	const parseSplit = (text: string) => text.split(';').map((n) => n.trim()).filter(Boolean);
+	/** What a hand split must cover — `JoinedCredit::subject` on the server. */
+	const handSubject = (j: { artist: string; credit: string | null }) => j.credit ?? j.artist;
 
 	/** Everything ticked, which is genuinely the common case. */
 	function selectAll(on: boolean) {
@@ -493,7 +495,7 @@
 			}
 			handSplit = {};
 			for (const j of sanitize.joined_credits) {
-				if (!j.names.length) handSplit[joinedKey(j)] = guessSplit(j.artist);
+				if (!j.names.length) handSplit[joinedKey(j)] = guessSplit(handSubject(j));
 			}
 			selectAll(true);
 		} catch { sanitize = null; }
@@ -3689,6 +3691,8 @@
 									names — “Simon &amp; Garfunkel” is one artist — so nothing is proposed.
 									Edit the names (separated by <code>;</code>) and tick only the ones that
 									really are several people. Every name has to appear in the original.
+									A row “filed under” someone was split before, but one part of it still
+									holds several names; its split has to name everyone in the credit.
 								</p>
 								{#each hands as j (joinedKey(j))}
 									{@const key = joinedKey(j)}
@@ -3698,12 +3702,14 @@
 											disabled={handNames.length < 2}
 											on:change={() => (pickedJoined = toggle(pickedJoined, key))}>
 										<span style="flex:1;min-width:0;">
-											<span class="san-name">{j.artist}</span>
-											<span class="san-sub">{j.plays} play{j.plays === 1 ? '' : 's'}</span>
+											<span class="san-name">{handSubject(j)}</span>
+											<span class="san-sub">
+												{j.plays} play{j.plays === 1 ? '' : 's'}{j.credit ? ` · filed under ${j.artist}` : ''}
+											</span>
 											<span class="san-controls">
 												<input class="input san-select" style="min-width:16rem;"
 													value={handSplit[key] ?? ''}
-													aria-label={`Artists in ${j.artist}, separated by semicolons`}
+													aria-label={`Artists in ${handSubject(j)}, separated by semicolons`}
 													on:input={(e) => (handSplit = { ...handSplit, [key]: e.currentTarget.value })}>
 												{#if handNames.length >= 2}
 													<span class="san-sub" style="margin:0;">→ {handNames.join(' + ')}</span>

@@ -16127,8 +16127,9 @@ components:
             type: string
           description: |-
             A hand split, primary first. Omit it to take the split the preview
-            derived. Refused unless the names account for the whole string, so a
-            split can never introduce an artist the listen didn't name.
+            derived. Refused unless the names account for the whole credit (`credit`
+            when set, otherwise `artist`), so a split can never introduce an artist
+            the listen didn't name, nor drop one it did.
     JsonRpcError:
       type: object
       required:

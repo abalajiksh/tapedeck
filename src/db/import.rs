@@ -277,7 +277,9 @@ impl Database {
         skipped: bool,
         provenance: ImportProvenance,
     ) -> Result<ImportOutcome, sqlx::Error> {
-        // The same rule `save_scrobble` applies, and before dedup for the same reason.
+        // The same rule `save_scrobble` applies, with the fuzzy check again
+        // given the play as sent.
+        let sent = play;
         let mut play = play.clone();
         let artist_display = normalise_credit(&mut play);
         let play = &play;
@@ -295,7 +297,7 @@ impl Database {
             }
         }
         if held.is_none() {
-            held = self.fuzzy_existing_id(user_id, play, skipped).await?;
+            held = self.fuzzy_existing_id(user_id, sent, skipped).await?;
         }
         if let Some(id) = held {
             return Ok(if self.enrich_existing(id, play, &provenance).await? {

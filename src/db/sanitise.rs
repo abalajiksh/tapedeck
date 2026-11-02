@@ -228,7 +228,8 @@ impl Database {
     /// have if it arrived today. Strings it cannot split but which *look*
     /// joined (a `,`, `&`, ` x `, ` and ` or ` + `) are returned with no
     /// names, for a hand split; "Simon & Garfunkel" is among them and simply
-    /// stays unticked.
+    /// stays unticked. So are splits that would leave a part still looking
+    /// joined, and stored credits that already hold such a part.
     pub async fn joined_artist_credits(
         &self,
         user_id: i64,
@@ -264,9 +265,23 @@ impl Database {
             // leftover, still credited in `scrobble_artists` as one phantom.
             let recredited =
                 names.len() > 1 && credit.as_deref() != Some(names.join("; ").as_str());
-            if renamed || recredited {
+            // A part that still looks joined means the cut was in the wrong
+            // place. "Yuja Wang; Kapustin, Schumann, Tchaikovsky, Prokofiev"
+            // splits on `;` into a second "artist" who is four composers, and
+            // once applied the row no longer counted as joined at all, so it
+            // could never be fixed from here. Such a split is not proposed.
+            let still_joined = names.iter().any(|n| looks_joined(n));
+            if (renamed || recredited) && !still_joined {
                 out.push(JoinedCredit { artist, credit, names, plays });
-            } else if credit.is_none() && !is_various_artists(&artist) && looks_joined(&artist) {
+            } else if is_various_artists(&artist) {
+                continue;
+            } else if renamed
+                || recredited
+                || still_joined
+                || (credit.is_none() && looks_joined(&artist))
+            {
+                // By hand, against `JoinedCredit::subject` — the stored credit
+                // when there is one, since that names everyone the listen does.
                 out.push(JoinedCredit { artist, credit, names: Vec::new(), plays });
             }
         }

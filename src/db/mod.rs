@@ -2659,6 +2659,15 @@ pub struct JoinedCredit {
     pub plays: i64,
 }
 
+impl JoinedCredit {
+    /// What a hand split has to account for: the stored credit when there is
+    /// one, because after an earlier split `artist` is only the primary and
+    /// checking against it would let the hand split drop everyone else.
+    pub fn subject(&self) -> &str {
+        self.credit.as_deref().unwrap_or(&self.artist)
+    }
+}
+
 /// One track carrying two different artists on the same record.
 #[derive(Debug, serde::Serialize, utoipa::ToSchema)]
 pub struct SplitAttribution {
