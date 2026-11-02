@@ -277,6 +277,10 @@ impl Database {
         skipped: bool,
         provenance: ImportProvenance,
     ) -> Result<ImportOutcome, sqlx::Error> {
+        // The same rule `save_scrobble` applies, and before dedup for the same reason.
+        let mut play = play.clone();
+        let artist_display = normalise_credit(&mut play);
+        let play = &play;
         // A duplicate is no longer the end of it. The incoming copy may know
         // things the stored one never did — a ListenBrainz archive carries a
         // full `mbid_mapping` — and dropping it whole meant the enrichment
@@ -308,16 +312,17 @@ impl Database {
         let artist_credit = play.artists.as_ref().filter(|a| a.len() > 1).map(|a| a.join("; "));
         sqlx::query(&crate::sql!(
             "INSERT INTO scrobbles (
-                user_id, title, artist, artist_credit, album, timestamp, duration, source_id,
+                user_id, title, artist, artist_credit, artist_display, album, timestamp, duration, source_id,
                 source_name, status, mbid_recording, mbid_release, mbid_release_group, mbid_artist,
                 caa_id, caa_release_mbid, isrc, submission_client, track_number, skipped,
                 spotify_track_id
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'imported', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'imported', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
         ))
         .bind(user_id)
         .bind(&play.title)
         .bind(&play.artist)
         .bind(&artist_credit)
+        .bind(&artist_display)
         .bind(&play.album)
         .bind(play.timestamp as i64)
         .bind(play.duration.map(|d| d as i64))

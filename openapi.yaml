@@ -16077,6 +16077,58 @@ components:
           format: int64
         pulse:
           $ref: '#/components/schemas/InstancePulse'
+    JoinedCredit:
+      type: object
+      description: |-
+        Listens whose `artist` is several artists written as one string.
+
+        One row per exact `(artist, artist_credit)` pair, because that pair is what
+        decides the split. `names` is the proposed credit, primary first — **empty
+        when nothing safe can be derived** ("A, B" with no stored list), which is
+        the row the operator splits by hand.
+      required:
+      - artist
+      - names
+      - plays
+      properties:
+        artist:
+          type: string
+        credit:
+          type:
+          - string
+          - 'null'
+        names:
+          type: array
+          items:
+            type: string
+        plays:
+          type: integer
+          format: int64
+    JoinedEdit:
+      type: object
+      description: One joined artist string to split.
+      required:
+      - artist
+      properties:
+        artist:
+          type: string
+          description: |-
+            The string as stored, and the credit beside it — together they name
+            exactly the listens the preview counted.
+        credit:
+          type:
+          - string
+          - 'null'
+        names:
+          type:
+          - array
+          - 'null'
+          items:
+            type: string
+          description: |-
+            A hand split, primary first. Omit it to take the split the preview
+            derived. Refused unless the names account for the whole string, so a
+            split can never introduce an artist the listen didn't name.
     JsonRpcError:
       type: object
       required:
@@ -16743,6 +16795,13 @@ components:
             what the artist pages and charts aggregate over, so a listen crediting a
             soloist appears under both names there while this field still names the
             one the record is filed under.
+        artist_credit:
+          type:
+          - string
+          - 'null'
+          description: |-
+            Everyone credited, `"; "`-joined and primary first, when there is more
+            than one — what a listen row splits into one link per artist.
         album:
           type:
           - string
@@ -21868,6 +21927,7 @@ components:
       - featured_artists
       - artist_variants
       - split_attributions
+      - joined_credits
       properties:
         mixed_albums:
           type: array
@@ -21891,6 +21951,13 @@ components:
           items:
             $ref: '#/components/schemas/SplitAttribution'
           description: Tracks carrying two different artists on the same record.
+        joined_credits:
+          type: array
+          items:
+            $ref: '#/components/schemas/JoinedCredit'
+          description: |-
+            Several artists stored as one string. `names` empty means no safe split
+            was found, and the row needs one by hand.
     Sanitised:
       type: object
       description: |-
@@ -21905,6 +21972,8 @@ components:
       - variant_listens_changed
       - splits_merged
       - split_listens_changed
+      - joined_split
+      - joined_listens_changed
       properties:
         albums_fixed:
           type: integer
@@ -21935,6 +22004,14 @@ components:
           format: int64
           minimum: 0
         split_listens_changed:
+          type: integer
+          format: int64
+          minimum: 0
+        joined_split:
+          type: integer
+          format: int64
+          minimum: 0
+        joined_listens_changed:
           type: integer
           format: int64
           minimum: 0
@@ -21972,6 +22049,15 @@ components:
           type: array
           items:
             $ref: '#/components/schemas/SplitEdit'
+        joined:
+          type: boolean
+          description: |-
+            Every derivable joined-credit split. Never includes the hand-split rows,
+            which have no split until someone writes one.
+        joined_edits:
+          type: array
+          items:
+            $ref: '#/components/schemas/JoinedEdit'
     SaveNoteRequest:
       allOf:
       - $ref: '#/components/schemas/TargetSpec'

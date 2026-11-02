@@ -1349,25 +1349,15 @@ fn structured_credit(
     mapping: &serde_json::Value,
 ) -> Option<Vec<(String, Option<String>)>> {
     let credits = mapping["artists"].as_array().filter(|a| a.len() > 1)?;
-    let mut rest = artist.to_lowercase();
-    let mut out = Vec::with_capacity(credits.len());
-    for c in credits {
-        let name = c["artist_credit_name"].as_str()?.trim();
-        let folded = name.to_lowercase();
-        if folded.is_empty() {
-            return None;
-        }
-        let at = rest.find(&folded)?;
-        rest.replace_range(at..at + folded.len(), " ");
-        out.push((name.to_string(), c["artist_mbid"].as_str().map(str::to_string)));
-    }
-    let only_joins = rest
-        .split(|c: char| c.is_whitespace() || matches!(c, ',' | '&' | '/' | ';' | '+'))
-        .filter(|w| !w.is_empty())
-        .all(|w| {
-            matches!(w, "and" | "feat." | "feat" | "ft." | "ft" | "featuring" | "with" | "x" | "×")
-        });
-    only_joins.then_some(out)
+    let out: Vec<(String, Option<String>)> = credits
+        .iter()
+        .map(|c| {
+            let name = c["artist_credit_name"].as_str()?.trim().to_string();
+            Some((name, c["artist_mbid"].as_str().map(str::to_string)))
+        })
+        .collect::<Option<_>>()?;
+    let names: Vec<&str> = out.iter().map(|(n, _)| n.as_str()).collect();
+    crate::db::credit_covers(artist, &names).then_some(out)
 }
 
 /// CSV: header row `title,artist,album,format,chain,mbid,time`.

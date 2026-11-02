@@ -421,7 +421,7 @@ impl Database {
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_id INTEGER NOT NULL DEFAULT 1,
                 title TEXT NOT NULL, artist TEXT NOT NULL, album TEXT,
-                artist_credit TEXT,
+                artist_credit TEXT, artist_display TEXT,
                 timestamp INTEGER NOT NULL, duration INTEGER,
                 source_id TEXT NOT NULL, source_name TEXT NOT NULL,
                 status TEXT NOT NULL DEFAULT 'pending',

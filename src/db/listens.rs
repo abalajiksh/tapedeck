@@ -9,7 +9,7 @@ use super::*;
 /// The History filter, shared by the page query and its count so the total can
 /// never disagree with the rows. Binds: user, then each filter twice.
 const HISTORY_WHERE: &str = "WHERE user_id = ? AND skipped = FALSE
-               AND (? IS NULL OR LOWER(artist) LIKE '%' || LOWER(?) || '%')
+               AND (? IS NULL OR LOWER(artist || ' ' || COALESCE(artist_credit, '')) LIKE '%' || LOWER(?) || '%')
                AND (? IS NULL OR LOWER(album) LIKE '%' || LOWER(?) || '%')
                AND (? IS NULL OR LOWER(title) LIKE '%' || LOWER(?) || '%')
                AND (? IS NULL OR timestamp >= ?)
@@ -47,6 +47,11 @@ impl Database {
         source_ref: Option<i64>,
         disposition: ListenDisposition,
     ) -> Result<bool, sqlx::Error> {
+        // One primary in `artist`, everyone in `artists` — before dedup, so a
+        // re-sent listen is compared in the shape it will be stored in.
+        let mut play = play.clone();
+        let artist_display = normalise_credit(&mut play);
+        let play = &play;
         if self.exists(user_id, &play.source_id, &play.source_name).await? {
             return Ok(false);
         }
@@ -76,7 +81,7 @@ impl Database {
 
         sqlx::query(&crate::sql!(
             "INSERT INTO scrobbles (
-                user_id, title, artist, artist_credit, album, timestamp, duration,
+                user_id, title, artist, artist_credit, artist_display, album, timestamp, duration,
                 source_id, source_name, status, skipped,
                 mbid_recording, mbid_release, mbid_artist,
                 mbid_release_group, mbid_release_track, mbid_work, mbid_album_artist,
@@ -93,13 +98,14 @@ impl Database {
                 ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
                 ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
                 ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                ?, ?, ?
+                ?, ?, ?, ?
             )"
         ))
         .bind(user_id)
         .bind(&play.title)
         .bind(&play.artist)
         .bind(&artist_credit)
+        .bind(&artist_display)
         .bind(&play.album)
         .bind(play.timestamp as i64)
         .bind(play.duration.map(|d| d as i64))
@@ -444,6 +450,18 @@ impl Database {
         ))
         .fetch_all(&self.pool)
         .await?;
+        // Forwarded as the client named it: `artist` holds only the primary
+        // once `normalise_credit` has split a credit, and sending Last.fm the
+        // primary alone would rewrite a public record nobody asked to change.
+        let displays: std::collections::HashMap<i64, String> =
+            sqlx::query_as::<_, (i64, String)>(&crate::sql!(
+                "SELECT id, artist_display FROM scrobbles
+                 WHERE status = 'pending' AND artist_display IS NOT NULL",
+            ))
+            .fetch_all(&self.pool)
+            .await?
+            .into_iter()
+            .collect();
 
         Ok(records
             .into_iter()
@@ -461,7 +479,7 @@ impl Database {
                     delivered,
                     play: Play {
                         title: r.title,
-                        artist: r.artist,
+                        artist: displays.get(&r.id).cloned().unwrap_or(r.artist),
                         album: r.album,
                         timestamp: r.timestamp as u64,
                         duration: r.duration.map(|d| d as u64),
@@ -471,6 +489,9 @@ impl Database {
                         mbid_recording: r.mbid_recording,
                         mbid_release: r.mbid_release,
                         mbid_artist,
+                        // Left empty on purpose: the Last.fm sink reads the
+                        // first entry as the *album* artist, so filling it from
+                        // the credit would change what gets forwarded.
                         artists: None,
                         mbid_release_group: None,
                         mbid_release_track: None,
@@ -635,12 +656,15 @@ impl Database {
             return Ok((Vec::new(), Vec::new(), Vec::new()));
         }
 
-        let artists: Vec<(String, i64)> = sqlx::query_as(&crate::sql!(&format!(
-            "SELECT artist, COUNT(*) AS plays FROM scrobbles
-             WHERE user_id = ? AND skipped = FALSE AND LOWER(artist) LIKE '%' || ? || '%'
-               AND LOWER(TRIM(artist)) {NOT_VARIOUS}
-             GROUP BY LOWER(artist) ORDER BY plays DESC LIMIT ?"
-        )))
+        // Over the credits, as the charts are, so a featured artist is
+        // findable and a joined credit string is never offered as one.
+        // `scrobble_artists` never holds the Various Artists placeholder.
+        let artists: Vec<(String, i64)> = sqlx::query_as(&crate::sql!(
+            "SELECT MAX(sa.name) AS artist, COUNT(*) AS plays
+             FROM scrobble_artists sa JOIN scrobbles s ON s.id = sa.scrobble_id
+             WHERE s.user_id = ? AND s.skipped = FALSE AND sa.artist_key LIKE '%' || ? || '%'
+             GROUP BY sa.artist_key ORDER BY plays DESC LIMIT ?"
+        ))
         .bind(user_id)
         .bind(&needle)
         .bind(limit)

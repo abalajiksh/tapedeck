@@ -10798,3 +10798,165 @@ fn what_counts_as_a_hand_set_picture() {
     // Nothing fills a wide picture automatically, so every one was a choice.
     assert_eq!(hand_set_source("wide", "https://cdn-images.dzcdn.net/images/a.jpg"), Some("link"));
 }
+
+/// A joined credit is stored as one primary plus everyone credited, and still
+/// forwarded as the client named it.
+///
+/// This is the Navidrome-plugin shape: `artist_name` is the display string
+/// "Lady Gaga, Bruno Mars" and `artist_names` the real list. Before
+/// `normalise_credit` the display string became `scrobbles.artist`, so the
+/// history, search and the album grouping showed one artist who does not
+/// exist, and `scrobble_artists` credited that phantom first.
+#[tokio::test]
+async fn a_joined_credit_stores_a_primary_and_forwards_the_original() {
+    let db = testdb().await;
+    let uid = db.create_user("kit", None, "x", "user").await.unwrap();
+
+    let mut listed = play("Die With A Smile", "Lady Gaga, Bruno Mars", 1_000);
+    listed.artists = Some(vec!["Lady Gaga".into(), "Bruno Mars".into()]);
+    let split = play("Get Lucky", "Daft Punk feat. Pharrell Williams", 2_000);
+    let band = play("Mrs. Robinson", "Simon & Garfunkel", 3_000);
+    for p in [&listed, &split, &band] {
+        db.save_scrobble(uid, p, None, None, None, None, None, None, None, ListenDisposition::LIVE)
+            .await
+            .unwrap();
+    }
+
+    let stored: Vec<(String, Option<String>, Option<String>)> = sqlx::query_as(
+        "SELECT artist, artist_display, artist_credit FROM scrobbles ORDER BY timestamp",
+    )
+    .fetch_all(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        stored,
+        vec![
+            (
+                "Lady Gaga".into(),
+                Some("Lady Gaga, Bruno Mars".into()),
+                Some("Lady Gaga; Bruno Mars".into())
+            ),
+            (
+                "Daft Punk".into(),
+                Some("Daft Punk feat. Pharrell Williams".into()),
+                Some("Daft Punk; Pharrell Williams".into())
+            ),
+            ("Simon & Garfunkel".into(), None, None),
+        ]
+    );
+
+    // Both are credited, and nobody called "Lady Gaga, Bruno Mars" is.
+    assert_eq!(db.artist_plays(uid, "Bruno Mars").await.unwrap(), 1);
+    assert_eq!(db.artist_plays(uid, "Lady Gaga").await.unwrap(), 1);
+    assert_eq!(db.artist_plays(uid, "Lady Gaga, Bruno Mars").await.unwrap(), 0);
+
+    // A featured artist is still findable: search offers both real names
+    // and never the joined string, and the history filter matches the credit.
+    let (found, _, _) = db.search_library(uid, "bruno", 10).await.unwrap();
+    assert_eq!(found.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(), ["Bruno Mars"]);
+    for who in ["Bruno Mars", "pharrell"] {
+        let rows = db
+            .get_recent_scrobbles(uid, 10, 0, Some(who), None, None, None, None, None)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1, "history filtered by {who}");
+    }
+
+    // Forwarding is unchanged: Last.fm gets the string it always got.
+    let pending: Vec<String> =
+        db.get_pending_scrobbles().await.unwrap().into_iter().map(|p| p.play.artist).collect();
+    assert_eq!(
+        pending,
+        ["Lady Gaga, Bruno Mars", "Daft Punk feat. Pharrell Williams", "Simon & Garfunkel"]
+    );
+}
+
+/// The history pass: listens stored before `normalise_credit` existed get the
+/// split a new listen would, and are re-credited so the phantom joined artist
+/// disappears from the charts.
+#[tokio::test]
+async fn the_sanitiser_splits_joined_credits_already_in_the_history() {
+    let db = testdb().await;
+    let uid = db.create_user("kit", None, "x", "user").await.unwrap();
+
+    // Written the way the old insert did: the joined string is the artist and
+    // is credited in `scrobble_artists` as if it were a person.
+    let old = |title: &str, artist: &str, credit: Option<&str>, ts: i64| {
+        let (db, title, artist, credit) =
+            (&db, title.to_string(), artist.to_string(), credit.map(str::to_string));
+        async move {
+            sqlx::query(
+                "INSERT INTO scrobbles (user_id, title, artist, artist_credit, timestamp,
+                                        source_id, source_name, status)
+                 VALUES (?, ?, ?, ?, ?, ?, 'old', 'pending')",
+            )
+            .bind(uid)
+            .bind(&title)
+            .bind(&artist)
+            .bind(&credit)
+            .bind(ts)
+            .bind(format!("old-{ts}"))
+            .execute(&db.pool)
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO scrobble_artists (scrobble_id, artist_key, name, position)
+                 SELECT id, LOWER(artist), artist, 0 FROM scrobbles WHERE source_id = ?",
+            )
+            .bind(format!("old-{ts}"))
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        }
+    };
+    old("Die With A Smile", "Lady Gaga, Bruno Mars", Some("Lady Gaga; Bruno Mars"), 1).await;
+    old("Die With A Smile", "Lady Gaga, Bruno Mars", Some("Lady Gaga; Bruno Mars"), 2).await;
+    old("Get Lucky", "Daft Punk feat. Pharrell Williams", None, 3).await;
+    old("Mrs. Robinson", "Simon & Garfunkel", None, 4).await;
+    old("Xtal", "Aphex Twin", None, 5).await;
+    // What the older featured-credit fold left behind: the primary already
+    // in `artist`, the whole string in the credit, credited as a phantom.
+    old("One More Time", "Daft Punk", Some("Daft Punk feat. Romanthony"), 6).await;
+    sqlx::query("UPDATE scrobble_artists SET artist_key = 'daft punk feat. romanthony', name = 'Daft Punk feat. Romanthony' WHERE scrobble_id = (SELECT id FROM scrobbles WHERE source_id = 'old-6')")
+        .execute(&db.pool).await.unwrap();
+
+    let preview = db.joined_artist_credits(uid).await.unwrap();
+    let mut shape: Vec<(&str, Vec<&str>, i64)> = preview
+        .iter()
+        .map(|j| (j.artist.as_str(), j.names.iter().map(String::as_str).collect(), j.plays))
+        .collect();
+    // Ordered by plays; ties are in no particular order.
+    shape.sort_by(|a, b| b.2.cmp(&a.2).then(a.0.cmp(b.0)));
+    assert_eq!(
+        shape,
+        vec![
+            ("Lady Gaga, Bruno Mars", vec!["Lady Gaga", "Bruno Mars"], 2),
+            ("Daft Punk", vec!["Daft Punk", "Romanthony"], 1),
+            ("Daft Punk feat. Pharrell Williams", vec!["Daft Punk", "Pharrell Williams"], 1),
+            // Offered for a hand split, with nothing proposed.
+            ("Simon & Garfunkel", vec![], 1),
+        ]
+    );
+
+    for j in preview.iter().filter(|j| !j.names.is_empty()) {
+        db.split_artist_credit(uid, &j.artist, j.credit.as_deref(), &j.names).await.unwrap();
+    }
+
+    assert_eq!(db.artist_plays(uid, "Lady Gaga").await.unwrap(), 2);
+    assert_eq!(db.artist_plays(uid, "Bruno Mars").await.unwrap(), 2);
+    assert_eq!(db.artist_plays(uid, "Pharrell Williams").await.unwrap(), 1);
+    assert_eq!(db.artist_plays(uid, "Lady Gaga, Bruno Mars").await.unwrap(), 0);
+    assert_eq!(db.artist_plays(uid, "Simon & Garfunkel").await.unwrap(), 1, "left alone");
+    assert_eq!(db.artist_plays(uid, "Romanthony").await.unwrap(), 1);
+    assert_eq!(db.artist_plays(uid, "Daft Punk feat. Romanthony").await.unwrap(), 0);
+
+    // Still forwarded exactly as it was written.
+    let pending: Vec<String> =
+        db.get_pending_scrobbles().await.unwrap().into_iter().map(|p| p.play.artist).collect();
+    assert_eq!(pending[0], "Lady Gaga, Bruno Mars");
+    assert_eq!(pending[2], "Daft Punk feat. Pharrell Williams");
+
+    // And once split, nothing is offered again.
+    let again = db.joined_artist_credits(uid).await.unwrap();
+    assert_eq!(again.iter().map(|j| j.artist.as_str()).collect::<Vec<_>>(), ["Simon & Garfunkel"]);
+}

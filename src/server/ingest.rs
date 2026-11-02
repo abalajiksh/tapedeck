@@ -258,34 +258,14 @@ fn import_is_live(listen_type: &ListenType, timestamp: i64, now: i64, token_is_l
     token_is_live && (now - timestamp) <= IMPORT_LIVE_WINDOW_SECS && (timestamp - now) <= 3600
 }
 
-/// Everyone a submission credits, or `None` when it names only one.
+/// The structured credit list, when the client sent one.
 ///
-/// Two sources, and the order matters. `additional_info.artist_names` is
-/// ListenBrainz's own structured field and is believed outright. Failing that,
-/// a **semicolon-separated** `artist_name` is unpacked: `;` is the multi-value
-/// separator in Vorbis comments and ID3, it is the separator Tapedeck's own
-/// `artist_credit` already uses, and it is what a tagged classical library
-/// actually contains — "Bach; Hilary Hahn".
-///
-/// Nothing else is split, and that restraint is the whole safety of it. `&` and
-/// `,` appear inside real names — "Simon & Garfunkel", "Earth, Wind & Fire" —
-/// so splitting on them would invent artists who do not exist and scatter one
-/// band's listening across three chart rows. The sanitiser refuses to touch
-/// those forms for exactly the same reason.
-fn submitted_artists(artist_name: &str, info: Option<&AdditionalInfo>) -> Option<Vec<String>> {
-    if let Some(names) = info.and_then(|i| i.artist_names.as_ref()) {
-        let cleaned: Vec<String> =
-            names.iter().map(|n| n.trim().to_string()).filter(|n| !n.is_empty()).collect();
-        if cleaned.len() > 1 {
-            return Some(cleaned);
-        }
-    }
-
-    let split: Vec<String> =
-        artist_name.split(';').map(|n| n.trim().to_string()).filter(|n| !n.is_empty()).collect();
-    // One name is not a credit list. Leaving it `None` keeps `artist_credit`
-    // unwritten, which is the existing rule for a single-artist listen.
-    (split.len() > 1).then_some(split)
+/// `additional_info.artist_names` is ListenBrainz's own field (Navidrome fills
+/// it from its participants) and is believed outright. Splitting a bare
+/// `artist_name` is not done here: `db::normalise_credit` does it for every
+/// source at once, on Navidrome's separators.
+fn submitted_artists(info: Option<&AdditionalInfo>) -> Option<Vec<String>> {
+    info.and_then(|i| i.artist_names.clone()).filter(|names| names.len() > 1)
 }
 
 /// Accepts `1`, `true`, `yes`, `on` and a bare `?dry_run` — a plugin author
@@ -484,7 +464,7 @@ pub async fn submit_listens(
             mbid_recording,
             mbid_release,
             mbid_artist,
-            artists: submitted_artists(&meta.artist_name, info_ref),
+            artists: submitted_artists(info_ref),
             mbid_release_group,
             mbid_release_track,
             mbid_work,

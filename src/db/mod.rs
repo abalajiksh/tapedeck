@@ -39,6 +39,10 @@ pub struct ScrobbleRecord {
     /// soloist appears under both names there while this field still names the
     /// one the record is filed under.
     pub artist: String,
+    /// Everyone credited, `"; "`-joined and primary first, when there is more
+    /// than one — what a listen row splits into one link per artist.
+    #[sqlx(default)]
+    pub artist_credit: Option<String>,
     pub album: Option<String>,
     /// Unix seconds, UTC, **start** of play.
     pub timestamp: i64,
@@ -1323,6 +1327,235 @@ pub fn credited_artists(play: &Play) -> Vec<(String, Option<String>)> {
         .collect()
 }
 
+/// Where a single artist string is cut into several, when no list came with it.
+///
+/// **Navidrome's own defaults** (`resources/mappings.yaml`, `artists.split`),
+/// matched case-insensitively, plus the parenthesised `feat.` forms and a bare
+/// `;` — the Vorbis/ID3 multi-value separator ingest has always honoured.
+/// `,`, `&`, `and`, `x` and `with` are deliberately absent: they occur inside
+/// real names ("Simon & Garfunkel", "Earth, Wind & Fire"), and Navidrome leaves
+/// them alone for the same reason. Those credits are fixed only when the source
+/// sends a list.
+const CREDIT_SEPARATORS: [&str; 10] = [
+    " (feat. ",
+    " (ft. ",
+    " (featuring ",
+    " / ",
+    " feat. ",
+    " feat ",
+    " ft. ",
+    " ft ",
+    " featuring ",
+    ";",
+];
+
+/// Cut `s` on [`CREDIT_SEPARATORS`]. One element means nothing was cut.
+fn split_credit(s: &str) -> Vec<String> {
+    let b = s.as_bytes();
+    let (mut parts, mut start, mut i) = (Vec::new(), 0, 0);
+    while i < b.len() {
+        // Every separator starts with an ASCII byte, so `i` is a char boundary
+        // whenever one matches, and slicing there cannot panic.
+        match CREDIT_SEPARATORS.iter().find(|sep| {
+            b[i..].len() >= sep.len() && b[i..i + sep.len()].eq_ignore_ascii_case(sep.as_bytes())
+        }) {
+            Some(sep) => {
+                parts.push(&s[start..i]);
+                i += sep.len();
+                start = i;
+            }
+            None => i += 1,
+        }
+    }
+    parts.push(&s[start..]);
+
+    let mut out: Vec<String> = Vec::new();
+    for p in parts {
+        let mut p = p.trim();
+        // The close of "A (feat. B)", but never a bracket that is part of a
+        // name — "B (UK)" is balanced and keeps its own.
+        if p.ends_with(')') && p.matches(')').count() > p.matches('(').count() {
+            p = p[..p.len() - 1].trim_end();
+        }
+        if !p.is_empty() && !out.iter().any(|o| Database::artist_key(o) == Database::artist_key(p))
+        {
+            out.push(p.to_string());
+        }
+    }
+    out
+}
+
+/// Reduce `play.artist` to **one** primary and put everyone credited in
+/// `play.artists`, primary first. Returns the string the source sent when it
+/// was changed, so the listen can still be forwarded exactly as named.
+///
+/// Called by both insert paths (`save_scrobble`, `import_listen_detailed`)
+/// before dedup, so every source gets the same rule:
+///
+/// * **A list wins.** ListenBrainz `artist_names`, Navidrome `participants`,
+///   Jellyfin `Artists`. The stored `artist` is kept when it is already one of
+///   the names (Plex and Jellyfin pick a primary themselves); otherwise the
+///   first name is the primary — Navidrome's display string "A, B" with the
+///   list `[A, B]` is that case.
+/// * **No list**: the string is cut on [`CREDIT_SEPARATORS`].
+/// * **"Various Artists" is never touched** — compilations group on it.
+pub fn normalise_credit(play: &mut Play) -> Option<String> {
+    let display = play.artist.trim().to_string();
+    if is_various_artists(&display) {
+        return None;
+    }
+    let listed: Vec<String> =
+        play.artists.iter().flatten().map(|n| n.trim().to_string()).filter(|n| !n.is_empty()).fold(
+            Vec::new(),
+            |mut acc, n| {
+                if !acc.iter().any(|a| Database::artist_key(a) == Database::artist_key(&n)) {
+                    acc.push(n);
+                }
+                acc
+            },
+        );
+    let mut names = if listed.len() > 1 { listed } else { split_credit(&display) };
+    if names.len() < 2 {
+        return None;
+    }
+
+    match names.iter().position(|n| Database::artist_key(n) == Database::artist_key(&display)) {
+        // Already a primary. Move it to the front so position 0 is the primary
+        // in `scrobble_artists`, and its MBID with it when the two line up.
+        Some(i) => {
+            if i > 0 {
+                let n = names.remove(i);
+                names.insert(0, n);
+                if let Some(m) = play.mbid_artist.as_mut().filter(|m| m.len() == names.len()) {
+                    let id = m.remove(i);
+                    m.insert(0, id);
+                }
+            }
+            play.artists = Some(names);
+            None
+        }
+        None => {
+            play.artist = names[0].clone();
+            play.artists = Some(names);
+            Some(display)
+        }
+    }
+}
+
+/// Does `names` account for **all** of `artist`, with only joining words and
+/// punctuation left between them?
+///
+/// The guard on any split Tapedeck did not derive itself — a ListenBrainz
+/// mapping (which sometimes names the wrong recording: "Boyz II Men, Mariah
+/// Carey" mapped to Boyz II Men and an orchestra) or a hand split in the
+/// sanitiser. It is what stops either from inventing an artist the string never
+/// named. Fewer than two names is never a split.
+pub fn credit_covers(artist: &str, names: &[&str]) -> bool {
+    if names.len() < 2 {
+        return false;
+    }
+    let mut rest = artist.to_lowercase();
+    for name in names {
+        let folded = name.trim().to_lowercase();
+        if folded.is_empty() {
+            return false;
+        }
+        let Some(at) = rest.find(&folded) else { return false };
+        rest.replace_range(at..at + folded.len(), " ");
+    }
+    rest.split(|c: char| c.is_whitespace() || matches!(c, ',' | '&' | '/' | ';' | '+' | '(' | ')'))
+        .filter(|w| !w.is_empty())
+        .all(|w| {
+            matches!(w, "and" | "feat." | "feat" | "ft." | "ft" | "featuring" | "with" | "x" | "×")
+        })
+}
+
+#[cfg(test)]
+mod credit_tests {
+    use super::*;
+
+    fn play(artist: &str, artists: Option<&[&str]>) -> Play {
+        let mut p = Play::new("t".into(), artist.into(), 0, "s".into(), "n".into());
+        p.artists = artists.map(|a| a.iter().map(|s| s.to_string()).collect());
+        p
+    }
+
+    #[test]
+    fn a_list_names_the_primary_and_keeps_the_display_string() {
+        let mut p = play("Lady Gaga, Bruno Mars", Some(&["Lady Gaga", "Bruno Mars"]));
+        assert_eq!(normalise_credit(&mut p).as_deref(), Some("Lady Gaga, Bruno Mars"));
+        assert_eq!(p.artist, "Lady Gaga");
+        assert_eq!(p.artists.unwrap(), ["Lady Gaga", "Bruno Mars"]);
+    }
+
+    #[test]
+    fn a_primary_the_source_chose_is_kept_and_moved_first() {
+        let mut p = play("Bach", Some(&["Hilary Hahn", "Bach"]));
+        p.mbid_artist = Some(vec!["hahn".into(), "bach".into()]);
+        assert_eq!(normalise_credit(&mut p), None);
+        assert_eq!(p.artist, "Bach");
+        assert_eq!(p.artists.unwrap(), ["Bach", "Hilary Hahn"]);
+        assert_eq!(p.mbid_artist.unwrap(), ["bach", "hahn"]);
+    }
+
+    #[test]
+    fn navidromes_separators_split_without_a_list() {
+        for (s, want) in [
+            ("Daft Punk feat. Pharrell Williams", &["Daft Punk", "Pharrell Williams"][..]),
+            ("Daft Punk FT Pharrell", &["Daft Punk", "Pharrell"]),
+            ("A / B / C", &["A", "B", "C"]),
+            ("Bach; Hilary Hahn", &["Bach", "Hilary Hahn"]),
+            ("A (feat. B (UK))", &["A", "B (UK)"]),
+            ("A (feat. B)", &["A", "B"]),
+        ] {
+            let mut p = play(s, None);
+            assert_eq!(normalise_credit(&mut p).as_deref(), Some(s), "{s}");
+            assert_eq!(p.artist, want[0], "{s}");
+            assert_eq!(p.artists.unwrap(), want, "{s}");
+        }
+    }
+
+    #[test]
+    fn names_that_only_look_joined_are_left_alone() {
+        for s in [
+            "Simon & Garfunkel",
+            "Earth, Wind & Fire",
+            "AC/DC",
+            "Crosby, Stills & Nash",
+            "Daft Punk",
+        ] {
+            let mut p = play(s, None);
+            assert_eq!(normalise_credit(&mut p), None, "{s}");
+            assert_eq!(p.artist, s);
+            assert!(p.artists.is_none());
+        }
+    }
+
+    #[test]
+    fn various_artists_is_never_rewritten() {
+        let mut p = play("Various Artists", Some(&["A", "B"]));
+        assert_eq!(normalise_credit(&mut p), None);
+        assert_eq!(p.artist, "Various Artists");
+    }
+
+    #[test]
+    fn a_hand_split_must_account_for_the_whole_string() {
+        assert!(credit_covers("Lady Gaga, Bruno Mars", &["Lady Gaga", "Bruno Mars"]));
+        assert!(credit_covers("Calvin Harris x Dua Lipa", &["calvin harris", "dua lipa"]));
+        // Inventing a name, dropping one, or a single "split" are all refused.
+        assert!(!credit_covers("Lady Gaga, Bruno Mars", &["Lady Gaga", "Burial"]));
+        assert!(!credit_covers("Lady Gaga, Bruno Mars, Kendrick", &["Lady Gaga", "Bruno Mars"]));
+        assert!(!credit_covers("Simon & Garfunkel", &["Simon & Garfunkel"]));
+    }
+
+    #[test]
+    fn a_single_listed_name_falls_back_to_the_split() {
+        let mut p = play("A feat. B", Some(&["A feat. B"]));
+        assert_eq!(normalise_credit(&mut p).as_deref(), Some("A feat. B"));
+        assert_eq!(p.artist, "A");
+    }
+}
+
 /// The population every fidelity readout divides by: listens whose format is
 /// actually known.
 ///
@@ -2409,6 +2642,20 @@ pub struct MixedAlbum {
 pub struct FeaturedArtist {
     pub artist: String,
     pub primary: String,
+    pub plays: i64,
+}
+
+/// Listens whose `artist` is several artists written as one string.
+///
+/// One row per exact `(artist, artist_credit)` pair, because that pair is what
+/// decides the split. `names` is the proposed credit, primary first — **empty
+/// when nothing safe can be derived** ("A, B" with no stored list), which is
+/// the row the operator splits by hand.
+#[derive(Debug, serde::Serialize, utoipa::ToSchema)]
+pub struct JoinedCredit {
+    pub artist: String,
+    pub credit: Option<String>,
+    pub names: Vec<String>,
     pub plays: i64,
 }
 

@@ -308,6 +308,17 @@ impl Database {
                 .await;
         }
 
+        // Migration: the artist string the source sent, kept only when
+        // `normalise_credit` reduced `artist` to the primary — so a listen is
+        // forwarded exactly as the client named it while every grouping query
+        // sees one artist.
+        if !has_column(&self.pool, "scrobbles", "artist_display").await {
+            info!("⚙️ Migrating: adding scrobbles.artist_display...");
+            let _ = sqlx::query("ALTER TABLE scrobbles ADD COLUMN artist_display TEXT")
+                .execute(&self.pool)
+                .await;
+        }
+
         // Migration: which token a session's listens came in on. A change of
         // token means a change of app, which in practice means a change of
         // setup — so it ends the session even inside the 30-minute gap.

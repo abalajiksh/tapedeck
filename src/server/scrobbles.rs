@@ -389,7 +389,17 @@ pub async fn search(
 )]
 async fn sanitize_preview(State(state): State<Arc<AppState>>, user: AuthUser) -> impl IntoResponse {
     let albums = state.db.albums_with_mixed_releases(user.user_id).await.unwrap_or_default();
-    let artists = state.db.artists_with_featured_credits(user.user_id).await.unwrap_or_default();
+    let joined = state.db.joined_artist_credits(user.user_id).await.unwrap_or_default();
+    // A `feat.` string the joined-credit pass can split is offered there, where
+    // the featured artist keeps a credit of their own, not folded here as well.
+    let artists: Vec<_> = state
+        .db
+        .artists_with_featured_credits(user.user_id)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|a| !joined.iter().any(|j| !j.names.is_empty() && j.artist == a.artist))
+        .collect();
     let variants = state.db.artists_with_spelling_variants(user.user_id).await.unwrap_or_default();
     let splits = state.db.tracks_with_split_attribution(user.user_id).await.unwrap_or_default();
     (
@@ -399,6 +409,7 @@ async fn sanitize_preview(State(state): State<Arc<AppState>>, user: AuthUser) ->
             featured_artists: artists,
             artist_variants: variants,
             split_attributions: splits,
+            joined_credits: joined,
         }),
     )
         .into_response()
@@ -416,6 +427,9 @@ pub struct SanitisePreview {
     pub artist_variants: Vec<crate::db::VariantArtist>,
     /// Tracks carrying two different artists on the same record.
     pub split_attributions: Vec<crate::db::SplitAttribution>,
+    /// Several artists stored as one string. `names` empty means no safe split
+    /// was found, and the row needs one by hand.
+    pub joined_credits: Vec<crate::db::JoinedCredit>,
 }
 
 /// One album to unify, and onto which release.
@@ -457,6 +471,21 @@ pub struct SplitEdit {
     pub to: String,
 }
 
+/// One joined artist string to split.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct JoinedEdit {
+    /// The string as stored, and the credit beside it — together they name
+    /// exactly the listens the preview counted.
+    pub artist: String,
+    #[serde(default)]
+    pub credit: Option<String>,
+    /// A hand split, primary first. Omit it to take the split the preview
+    /// derived. Refused unless the names account for the whole string, so a
+    /// split can never introduce an artist the listen didn't name.
+    #[serde(default)]
+    pub names: Option<Vec<String>>,
+}
+
 /// What to apply.
 ///
 /// Two ways to say it, because both are the common case at different times: the
@@ -482,6 +511,12 @@ pub struct SanitizeRequest {
     pub splits: bool,
     #[serde(default)]
     pub split_edits: Vec<SplitEdit>,
+    /// Every derivable joined-credit split. Never includes the hand-split rows,
+    /// which have no split until someone writes one.
+    #[serde(default)]
+    pub joined: bool,
+    #[serde(default)]
+    pub joined_edits: Vec<JoinedEdit>,
 }
 
 // POST /api/v1/sanitize — apply the fixes the preview listed.
@@ -574,7 +609,13 @@ async fn sanitize_apply(
             Ok(c) => c,
             Err(e) => return server_error(e.to_string()),
         };
-        for c in candidates {
+        // The same filter the preview applies: a string the joined-credit pass
+        // can split goes there, where the featured artist keeps a credit.
+        let joined = state.db.joined_artist_credits(user.user_id).await.unwrap_or_default();
+        for c in candidates
+            .into_iter()
+            .filter(|a| !joined.iter().any(|j| !j.names.is_empty() && j.artist == a.artist))
+        {
             if let Ok(n) = state.db.fold_artist_credit(user.user_id, &c.artist, &c.primary).await {
                 if n > 0 {
                     artist_rows += n;
@@ -679,15 +720,84 @@ async fn sanitize_apply(
         }
     }
 
+    // ── Joined credits ──
+    //
+    // A derived split is recomputed from the preview, never taken from the
+    // request; a hand split must pass `credit_covers`. Either way the result can
+    // only name artists the stored string already named.
+    let mut joined_rows = 0u64;
+    let mut joined_split = 0u64;
+    if !body.joined_edits.is_empty() || body.joined {
+        let candidates = match state.db.joined_artist_credits(user.user_id).await {
+            Ok(c) => c,
+            Err(e) => return server_error(e.to_string()),
+        };
+        let mut wanted: Vec<(String, Option<String>, Vec<String>)> = Vec::new();
+        if !body.joined_edits.is_empty() {
+            for e in &body.joined_edits {
+                let Some(c) =
+                    candidates.iter().find(|c| c.artist == e.artist && c.credit == e.credit)
+                else {
+                    continue;
+                };
+                let names: Vec<String> = match &e.names {
+                    Some(hand) => {
+                        let hand: Vec<String> = hand
+                            .iter()
+                            .map(|n| n.trim().to_string())
+                            .filter(|n| !n.is_empty())
+                            .collect();
+                        let refs: Vec<&str> = hand.iter().map(String::as_str).collect();
+                        if !crate::db::credit_covers(&c.artist, &refs) {
+                            return err_response(
+                                StatusCode::BAD_REQUEST,
+                                format!(
+                                    "\"{}\" doesn't split into {} — every name must appear in it, \
+                                     with only joining words left over",
+                                    c.artist,
+                                    hand.join(" + ")
+                                ),
+                            );
+                        }
+                        hand
+                    }
+                    None => c.names.clone(),
+                };
+                wanted.push((c.artist.clone(), c.credit.clone(), names));
+            }
+        } else {
+            wanted = candidates
+                .into_iter()
+                .filter(|c| !c.names.is_empty())
+                .map(|c| (c.artist, c.credit, c.names))
+                .collect();
+        }
+        for (artist, credit, names) in wanted {
+            if names.len() < 2 {
+                continue;
+            }
+            if let Ok(n) =
+                state.db.split_artist_credit(user.user_id, &artist, credit.as_deref(), &names).await
+            {
+                if n > 0 {
+                    joined_rows += n;
+                    joined_split += 1;
+                }
+            }
+        }
+    }
+
     tracing::info!(
         "🧹 Sanitised: {} listens across {} albums, {} listens across {} artist credits, \
-         {} listens across {} spellings",
+         {} listens across {} spellings, {} listens across {} joined credits",
         album_rows,
         albums_fixed,
         artist_rows,
         artists_folded,
         variant_rows,
-        variants_merged
+        variants_merged,
+        joined_rows,
+        joined_split
     );
 
     (
@@ -701,6 +811,8 @@ async fn sanitize_apply(
             variant_listens_changed: variant_rows,
             splits_merged,
             split_listens_changed: split_rows,
+            joined_split,
+            joined_listens_changed: joined_rows,
         }),
     )
         .into_response()
@@ -718,6 +830,8 @@ pub struct Sanitised {
     pub variant_listens_changed: u64,
     pub splits_merged: u64,
     pub split_listens_changed: u64,
+    pub joined_split: u64,
+    pub joined_listens_changed: u64,
 }
 
 /// Dashboard counters.

@@ -6,6 +6,8 @@ export interface Scrobble {
 	id: number;
 	title: string;
 	artist: string;
+	/** Everyone credited, `; `-joined and primary first, when more than one. */
+	artist_credit?: string | null;
 	album: string | null;
 	/** Who this was heard with, or null for not marked. Null means nobody
 	 *  recorded it — never that they were definitely alone. */
@@ -2228,6 +2230,17 @@ export interface SanitizePreview {
 	 *  singers. `primary_album_tracks` is *why* the winner won and shows how
 	 *  strong the case is: a director on twelve tracks is obvious, two is a guess. */
 	split_attributions: SplitAttribution[];
+	/** Several artists stored as one string ("Lady Gaga, Bruno Mars").
+	 *  `names` is the proposed split, primary first; empty means no safe split
+	 *  was found and the row needs one by hand. */
+	joined_credits: JoinedCredit[];
+}
+
+export interface JoinedCredit {
+	artist: string;
+	credit: string | null;
+	names: string[];
+	plays: number;
 }
 
 export interface SplitAttribution {
@@ -2249,6 +2262,8 @@ export interface SanitizeResult {
 	artist_listens_changed: number;
 	variants_merged: number;
 	variant_listens_changed: number;
+	joined_split?: number;
+	joined_listens_changed?: number;
 }
 
 export interface SearchResults {
@@ -3132,6 +3147,9 @@ class TapedeckAPI {
 		variant_edits?: { from: string; to: string }[];
 		splits?: boolean;
 		split_edits?: { title: string; album: string; from: string; to: string }[];
+		joined?: boolean;
+		/** `names` only for a hand split; omitted, the preview's own split is used. */
+		joined_edits?: { artist: string; credit: string | null; names?: string[] }[];
 	}): Promise<SanitizeResult> {
 		return this.post('/api/v1/sanitize', opts);
 	}

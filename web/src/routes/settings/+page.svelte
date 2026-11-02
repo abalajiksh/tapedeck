@@ -368,6 +368,13 @@
 	const variantKey = (from: string, to: string) => `${from}\u0001${to}`;
 	let pickedSplits = new Set<string>();
 	const splitKey = (t: string, al: string, from: string) => `${t}\u0001${al}\u0001${from}`;
+	let pickedJoined = new Set<string>();
+	const joinedKey = (j: { artist: string; credit: string | null }) => `${j.artist}\u0001${j.credit ?? ''}`;
+	/** Hand splits, `;`-separated — the one character artist names don't use. */
+	let handSplit: Record<string, string> = {};
+	const guessSplit = (artist: string) =>
+		artist.split(/,\s+|\s+&\s+|\s+x\s+|\s+and\s+|\s+\+\s+|\s+vs\.?\s+/i).join('; ');
+	const parseSplit = (text: string) => text.split(';').map((n) => n.trim()).filter(Boolean);
 
 	/** Everything ticked, which is genuinely the common case. */
 	function selectAll(on: boolean) {
@@ -388,10 +395,15 @@
 					)
 				: []
 		);
+		// Hand-split rows are never ticked for you: "Simon & Garfunkel" is one of them.
+		pickedJoined = new Set(
+			on ? sanitize.joined_credits.filter((j) => j.names.length).map(joinedKey) : []
+		);
 	}
 
 	$: pickedCount =
-		pickedAlbums.size + pickedCredits.size + pickedVariants.size + pickedSplits.size;
+		pickedAlbums.size + pickedCredits.size + pickedVariants.size + pickedSplits.size +
+		pickedJoined.size;
 
 	// ── Rebuilding sessions ──
 	// Needed on any existing install: `assign_session` kept the session rows but
@@ -479,6 +491,10 @@
 			for (const a of sanitize.mixed_albums) {
 				if (a.winner) albumChoice[albumKey(a)] = a.winner;
 			}
+			handSplit = {};
+			for (const j of sanitize.joined_credits) {
+				if (!j.names.length) handSplit[joinedKey(j)] = guessSplit(j.artist);
+			}
 			selectAll(true);
 		} catch { sanitize = null; }
 	}
@@ -507,13 +523,23 @@
 					sp.folding
 						.filter((f) => pickedSplits.has(splitKey(sp.title, sp.album, f[0])))
 						.map((f) => ({ title: sp.title, album: sp.album, from: f[0], to: sp.primary }))
-				)
+				),
+				joined_edits: sanitize.joined_credits
+					.filter((j) => pickedJoined.has(joinedKey(j)))
+					// A hand row emptied after ticking is no split at all; drop it rather than 400.
+					.filter((j) => j.names.length || parseSplit(handSplit[joinedKey(j)] ?? '').length >= 2)
+					.map((j) => ({
+						artist: j.artist,
+						credit: j.credit,
+						...(j.names.length ? {} : { names: parseSplit(handSplit[joinedKey(j)] ?? '') })
+					}))
 			});
 			sanitizeMsg =
 				`Fixed ${r.albums_fixed} album${r.albums_fixed === 1 ? '' : 's'} (${r.album_listens_changed} listens), ` +
 				`folded ${r.artists_folded} featured credit${r.artists_folded === 1 ? '' : 's'} (${r.artist_listens_changed} listens) ` +
 				`merged ${r.variants_merged} spelling${r.variants_merged === 1 ? '' : 's'} (${r.variant_listens_changed} listens) ` +
-				`and put ${r.splits_merged ?? 0} track${(r.splits_merged ?? 0) === 1 ? '' : 's'} back on their record's artist (${r.split_listens_changed ?? 0} listens). ` +
+				`put ${r.splits_merged ?? 0} track${(r.splits_merged ?? 0) === 1 ? '' : 's'} back on their record's artist (${r.split_listens_changed ?? 0} listens) ` +
+				`and split ${r.joined_split ?? 0} joined credit${(r.joined_split ?? 0) === 1 ? '' : 's'} (${r.joined_listens_changed ?? 0} listens). ` +
 				`Artwork will re-resolve in the background.`;
 			await loadSanitize();
 		} catch (e) {
@@ -3504,8 +3530,8 @@
 				</p>
 
 				{#if sanitize}
-					{@const total = sanitize.mixed_albums.length + sanitize.featured_artists.length + sanitize.artist_variants.length + sanitize.split_attributions.reduce((n, sp) => n + sp.folding.length, 0)}
-					{#if total}
+					{@const total = sanitize.mixed_albums.length + sanitize.featured_artists.length + sanitize.artist_variants.length + sanitize.split_attributions.reduce((n, sp) => n + sp.folding.length, 0) + sanitize.joined_credits.filter((j) => j.names.length).length}
+					{#if total || sanitize.joined_credits.length}
 						<div class="san-bar">
 							<span style="font-weight:600;font-size:14px;">{pickedCount} of {total} selected</span>
 							<span style="flex:1;"></span>
@@ -3625,6 +3651,68 @@
 									</label>
 								{/each}
 							{/each}
+						{/if}
+
+						{#if sanitize.joined_credits.some((j) => j.names.length)}
+							<div class="san-group">Several artists stored as one</div>
+							<p style="font-size:12.5px;color:var(--td-muted);margin:0 0 10px;">
+								Older listens kept a joined name like “A, B” as if it were one artist, so it
+								shows up in history, search and the charts as somebody who doesn't exist.
+								Splitting files the listen under the first name and credits everyone. The
+								original string is kept, and listens not yet sent to Last.fm still go out as
+								it — but there is <strong>no undo</strong>, and loves or liner notes made
+								under the joined name stay with it.
+							</p>
+							{#each sanitize.joined_credits.filter((j) => j.names.length) as j (joinedKey(j))}
+								{@const key = joinedKey(j)}
+								<label class="san-row" class:on={pickedJoined.has(key)}>
+									<input type="checkbox" checked={pickedJoined.has(key)}
+										on:change={() => (pickedJoined = toggle(pickedJoined, key))}>
+									<span style="flex:1;min-width:0;">
+										<span class="san-name">{j.credit && j.artist === j.names[0] ? j.credit : j.artist}</span>
+										<span class="san-sub">
+											→ {j.names.join(' + ')} · {j.plays} play{j.plays === 1 ? '' : 's'} · filed under {j.names[0]}
+										</span>
+									</span>
+								</label>
+							{/each}
+						{/if}
+
+						{#if sanitize.joined_credits.some((j) => !j.names.length)}
+							{@const hands = sanitize.joined_credits.filter((j) => !j.names.length)}
+							<details style="margin-top:14px;">
+								<summary class="san-group" style="cursor:pointer;">
+									Might be several artists — split by hand ({hands.length})
+								</summary>
+								<p style="font-size:12.5px;color:var(--td-muted);margin:6px 0 10px;">
+									These contain a comma, “&amp;”, “x” or “and”, which are also part of real
+									names — “Simon &amp; Garfunkel” is one artist — so nothing is proposed.
+									Edit the names (separated by <code>;</code>) and tick only the ones that
+									really are several people. Every name has to appear in the original.
+								</p>
+								{#each hands as j (joinedKey(j))}
+									{@const key = joinedKey(j)}
+									{@const handNames = parseSplit(handSplit[key] ?? '')}
+									<label class="san-row" class:on={pickedJoined.has(key)}>
+										<input type="checkbox" checked={pickedJoined.has(key)}
+											disabled={handNames.length < 2}
+											on:change={() => (pickedJoined = toggle(pickedJoined, key))}>
+										<span style="flex:1;min-width:0;">
+											<span class="san-name">{j.artist}</span>
+											<span class="san-sub">{j.plays} play{j.plays === 1 ? '' : 's'}</span>
+											<span class="san-controls">
+												<input class="input san-select" style="min-width:16rem;"
+													value={handSplit[key] ?? ''}
+													aria-label={`Artists in ${j.artist}, separated by semicolons`}
+													on:input={(e) => (handSplit = { ...handSplit, [key]: e.currentTarget.value })}>
+												{#if handNames.length >= 2}
+													<span class="san-sub" style="margin:0;">→ {handNames.join(' + ')}</span>
+												{/if}
+											</span>
+										</span>
+									</label>
+								{/each}
+							</details>
 						{/if}
 
 						<button class="btn btn-primary" style="margin-top:16px;" on:click={runSanitize}

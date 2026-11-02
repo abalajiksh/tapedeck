@@ -106,6 +106,11 @@ const EXEMPT: &[(&str, &str)] = &[
     ("mark_sink_delivered", "reads delivered_sinks for one listen by id"),
     ("link_scrobble_artists", "writes credit rows for one listen by id"),
     (
+        "split_artist_credit",
+        "a sanitiser rewrite selecting rows by their exact artist string; \
+                               a skipped listen has the same joined credit and is fixed too",
+    ),
+    (
         "backfill_scrobble_artists",
         "one-off pass writing credit rows for every \
                                    listen; the filter belongs on the readers, \

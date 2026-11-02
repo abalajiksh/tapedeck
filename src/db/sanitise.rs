@@ -221,4 +221,134 @@ impl Database {
         });
         Ok(out)
     }
+    /// Joined artist strings in the history, and how each would split.
+    ///
+    /// Runs `normalise_credit` — the rule every new listen gets at insert — over
+    /// what is already stored, so an old listen ends up exactly as it would
+    /// have if it arrived today. Strings it cannot split but which *look*
+    /// joined (a `,`, `&`, ` x `, ` and ` or ` + `) are returned with no
+    /// names, for a hand split; "Simon & Garfunkel" is among them and simply
+    /// stays unticked.
+    pub async fn joined_artist_credits(
+        &self,
+        user_id: i64,
+    ) -> Result<Vec<JoinedCredit>, sqlx::Error> {
+        let rows: Vec<(String, Option<String>, i64)> = sqlx::query_as(&crate::sql!(
+            "SELECT artist, artist_credit, COUNT(*) AS plays FROM scrobbles
+             WHERE user_id = ? AND skipped = FALSE
+             GROUP BY artist, artist_credit ORDER BY plays DESC"
+        ))
+        .bind(user_id)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut out = Vec::new();
+        for (artist, credit, plays) in rows {
+            let mut play =
+                Play::new(String::new(), artist.clone(), 0, String::new(), String::new());
+            // The stored list — or, when that is one entry, the string the older
+            // featured-credit fold kept there ("Daft Punk feat. Romanthony",
+            // with "Daft Punk" already in `artist`), cut the same way a new
+            // listen's would be.
+            play.artists = credit.as_deref().map(|c| {
+                let listed = split_stored_credit(c);
+                if listed.len() > 1 {
+                    listed
+                } else {
+                    split_credit(c)
+                }
+            });
+            let renamed = normalise_credit(&mut play).is_some();
+            let names = play.artists.clone().unwrap_or_default();
+            // A rewrite of the credit alone counts too: that is the fold's
+            // leftover, still credited in `scrobble_artists` as one phantom.
+            let recredited =
+                names.len() > 1 && credit.as_deref() != Some(names.join("; ").as_str());
+            if renamed || recredited {
+                out.push(JoinedCredit { artist, credit, names, plays });
+            } else if credit.is_none() && !is_various_artists(&artist) && looks_joined(&artist) {
+                out.push(JoinedCredit { artist, credit, names: Vec::new(), plays });
+            }
+        }
+        Ok(out)
+    }
+
+    /// Split every listen stored as exactly `(artist, credit)` onto `names`,
+    /// primary first, and re-credit them in `scrobble_artists`.
+    ///
+    /// The original string goes into `artist_display` (unless one is already
+    /// there), which is what `get_pending_scrobbles` forwards — so a listen
+    /// still waiting to go out reaches Last.fm as it always would have. The
+    /// caller has already checked `names` (derived, or `credit_covers`).
+    pub async fn split_artist_credit(
+        &self,
+        user_id: i64,
+        artist: &str,
+        credit: Option<&str>,
+        names: &[String],
+    ) -> Result<u64, sqlx::Error> {
+        let Some(primary) = names.first() else { return Ok(0) };
+        let mut tx = self.pool.begin().await?;
+        let ids: Vec<(i64, Option<String>)> = sqlx::query_as(&crate::sql!(
+            "SELECT id, mbid_artist FROM scrobbles
+             WHERE user_id = ? AND artist = ? AND COALESCE(artist_credit, '') = ?"
+        ))
+        .bind(user_id)
+        .bind(artist)
+        .bind(credit.unwrap_or(""))
+        .fetch_all(&mut *tx)
+        .await?;
+
+        for (id, mbid_artist) in &ids {
+            sqlx::query(&crate::sql!(
+                "UPDATE scrobbles
+                    SET artist_display = COALESCE(artist_display, artist),
+                        artist = ?, artist_credit = ?
+                  WHERE id = ?"
+            ))
+            .bind(primary)
+            .bind(names.join("; "))
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+
+            // Rebuilt rather than patched: the old rows credit the joined
+            // string itself, which is the phantom artist this removes.
+            sqlx::query(&crate::sql!("DELETE FROM scrobble_artists WHERE scrobble_id = ?"))
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
+            let mut play =
+                Play::new(String::new(), primary.clone(), 0, String::new(), String::new());
+            play.artists = Some(names.to_vec());
+            play.mbid_artist = mbid_artist.as_deref().and_then(|m| serde_json::from_str(m).ok());
+            for (position, (name, mbid)) in credited_artists(&play).into_iter().enumerate() {
+                sqlx::query(&crate::sql!(
+                    "INSERT INTO scrobble_artists (scrobble_id, artist_key, name, position, mbid)
+                     VALUES (?, ?, ?, ?, ?) ON CONFLICT DO NOTHING"
+                ))
+                .bind(id)
+                .bind(Database::artist_key(&name))
+                .bind(&name)
+                .bind(position as i64)
+                .bind(mbid)
+                .execute(&mut *tx)
+                .await?;
+            }
+        }
+        tx.commit().await?;
+        Ok(ids.len() as u64)
+    }
+}
+
+/// `artist_credit` as stored: everyone, joined with `"; "`.
+fn split_stored_credit(c: &str) -> Vec<String> {
+    c.split(';').map(|n| n.trim().to_string()).filter(|n| !n.is_empty()).collect()
+}
+
+/// A string a person might have to split by hand. Deliberately loose — it only
+/// decides what is *shown*, never what is changed.
+fn looks_joined(artist: &str) -> bool {
+    let a = artist.to_lowercase();
+    [", ", " & ", " x ", " and ", " + ", " vs. ", " vs "].iter().any(|j| a.contains(j))
 }
