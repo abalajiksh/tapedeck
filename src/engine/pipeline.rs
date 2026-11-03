@@ -1323,9 +1323,39 @@ impl ScrobbleEngine {
                 user_id
             );
 
+            // Borrowed again: the one from the fetch cannot live across the
+            // `self.sources[i]` writes above.
+            let Some(plex) = self.sources[i].source.as_any_mut().downcast_mut::<PlexSource>()
+            else {
+                continue;
+            };
             let current_time = now_secs() as u64;
-            for plex_track in session_result.ready_to_scrobble {
+            for mut plex_track in session_result.ready_to_scrobble {
                 let mut play = plex_track.to_play(&format!("scrobble-{}", current_time));
+
+                // A history row needs a library lookup for its duration and
+                // quality, but most rows of a catch-up walk are already stored
+                // under their own `plex-hist-` key. Ask that first, so only a
+                // row that might be new costs a request to Plex — then hydrate
+                // and dedup in full, since the fuzzy window reads the duration.
+                if plex_track.history_key.is_some() {
+                    match db.exists(user_id, &play.source_id, &play.source_name).await {
+                        Ok(true) => {
+                            debug!("Skipping already-scrobbled: {} - {}", play.artist, play.title);
+                            continue;
+                        }
+                        Ok(false) => {}
+                        Err(e) => {
+                            warn!(
+                                "Could not check for a duplicate ({}) — leaving it for the next tick",
+                                e
+                            );
+                            continue;
+                        }
+                    }
+                    plex.hydrate_from_library(&mut plex_track).await;
+                    play = plex_track.to_play(&format!("scrobble-{}", current_time));
+                }
 
                 // Dedup before enrichment, so a duplicate doesn't cost a
                 // MusicBrainz call.
