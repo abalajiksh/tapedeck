@@ -233,7 +233,40 @@ async fn disconnect(
     if !matches!(service.as_str(), "lastfm" | "listenbrainz" | "librefm") {
         return err(400, "Unknown service");
     }
-    match state.db.delete_connection(user.user_id, &service).await {
+    delete_connection(&state, user.user_id, &service).await
+}
+
+/// Disconnect ListenBrainz.
+///
+/// Session-only. The same as `DELETE /api/v1/connections/{service}` with
+/// `listenbrainz`.
+// Its own route because `/api/v1/connections/listenbrainz` is a literal path
+// (the PUT that connects), and axum 0.7 matches a literal before `/:service`
+// and then answers 405 for any method the literal lacks. Without this, a
+// ListenBrainz connection could not be removed from the UI at all — found on
+// the household instance 2026-11-03, replacing a token that had gone bad.
+#[utoipa::path(
+    delete,
+    path = "/api/v1/connections/listenbrainz",
+    tag = "Connections",
+    responses(
+        (status = 204, description = "Disconnected, or was never connected."),
+        (status = 401, response = Unauthorized),
+    )
+)]
+async fn disconnect_listenbrainz(
+    State(state): State<Arc<AppState>>,
+    user: AuthUser,
+) -> impl IntoResponse {
+    delete_connection(&state, user.user_id, "listenbrainz").await
+}
+
+async fn delete_connection(
+    state: &AppState,
+    user_id: i64,
+    service: &str,
+) -> axum::response::Response {
+    match state.db.delete_connection(user_id, service).await {
         Ok(_) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => err(500, e.to_string()),
     }
@@ -554,6 +587,7 @@ mod tests {
     get_spool_forwarding,
     put_spool_forwarding,
     disconnect,
+    disconnect_listenbrainz,
     connect_listenbrainz,
     lastfm_start,
     lastfm_complete,
@@ -574,7 +608,10 @@ pub fn create_connections_router() -> Router<Arc<AppState>> {
             get(get_spool_forwarding).put(put_spool_forwarding),
         )
         .route("/api/v1/connections/:service", delete(disconnect))
-        .route("/api/v1/connections/listenbrainz", put(connect_listenbrainz))
+        .route(
+            "/api/v1/connections/listenbrainz",
+            put(connect_listenbrainz).delete(disconnect_listenbrainz),
+        )
         .route("/api/v1/connections/lastfm/start", post(lastfm_start))
         .route("/api/v1/connections/lastfm/complete", post(lastfm_complete))
         .route("/api/v1/connections/librefm/start", post(librefm_start))
