@@ -1747,7 +1747,7 @@ impl PlexSource {
                 // opinion on plays we watched happen — and its rows carry the
                 // album artist and no quality metadata, so letting one through
                 // is a visibly worse duplicate of a row we already have.
-                let mut fresh: Vec<PlexTrack> = history
+                let fresh: Vec<PlexTrack> = history
                     .into_iter()
                     .filter(|t| !self.recent_scrobbles.contains_key(&t.rating_key))
                     .collect();
@@ -1757,12 +1757,13 @@ impl PlexSource {
                     fresh.len(),
                     fetched - fresh.len()
                 );
-                // Only the rows that survive suppression are worth a lookup, and
-                // at a 5s session cadence that is close to nothing — this is the
-                // catch-up path, not the common one.
-                for track in &mut fresh {
-                    self.hydrate_from_library(track).await;
-                }
+                // Not hydrated here. "New" means only "not banked live this
+                // run": after a restart the walk covers the whole 7-day window
+                // and nearly every row is already stored. Hydrating them all
+                // first was one sequential metadata request per row — ~720 on
+                // the Pi on 2026-11-03, minutes with no poll tick — before the
+                // pipeline could see they were duplicates. The pipeline
+                // hydrates a row once it knows the row is not stored already.
                 result.ready_to_scrobble.extend(fresh);
             }
         }
@@ -2022,7 +2023,7 @@ impl PlexSource {
     /// that is a property of a session that has already ended, so a
     /// history-derived listen keeps `is_transcoded` unset rather than claiming
     /// a direct play it cannot vouch for.
-    async fn hydrate_from_library(&self, track: &mut PlexTrack) {
+    pub async fn hydrate_from_library(&self, track: &mut PlexTrack) {
         let endpoint = format!("{}/library/metadata/{}", self.url, track.rating_key);
         let resp = match self
             .client
