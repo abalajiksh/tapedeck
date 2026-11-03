@@ -7,6 +7,7 @@
 	import { initPrefs } from '$lib/prefs';
 	import { theme, initTheme, setTheme, type ThemeMode } from '$lib/theme';
 	import TapedeckLogo from '$lib/components/TapedeckLogo.svelte';
+	import SectionTabs from '$lib/components/SectionTabs.svelte';
 
 	let state: 'loading' | 'public' | 'authenticated' | 'error' = 'loading';
 	let errorMsg = '';
@@ -23,27 +24,65 @@
 	const isPublic = path === '/login' || path === '/setup' || path === '/authorize';
 	if (isPublic) state = 'public';
 
-	const nav = [
+	// Pages that share one sidebar entry. Each keeps its own URL; the group
+	// shows a tab strip (SectionTabs) above the page to move between them.
+	type Group = { id: string; label: string; tabs: { href: string; label: string }[] };
+	const GROUPS: Group[] = [
+		{
+			id: 'insights',
+			label: 'Insights',
+			tabs: [
+				{ href: '/charts', label: 'Top Charts' },
+				{ href: '/stats', label: 'Statistics' },
+				{ href: '/reports', label: 'Reports' }
+			]
+		},
+		{
+			id: 'discover',
+			label: 'Discover',
+			tabs: [
+				{ href: '/rediscover', label: 'Rediscovery' },
+				{ href: '/playlists/saved', label: 'Playlists' },
+				{ href: '/playlists', label: 'Playlist Lab' },
+				{ href: '/map', label: 'Genre Map' }
+			]
+		}
+	];
+
+	type NavItem = { href: string; label: string; icon: string; badge?: string; group?: string };
+	const nav: NavItem[] = [
 		{ href: '/', label: 'Dashboard', icon: 'dashboard' },
 		{ href: '/history', label: 'History', icon: 'history' },
 		{ href: '/search', label: 'Search', icon: 'search' },
-		{ href: '/charts', label: 'Top Charts', icon: 'charts' },
-		{ href: '/stats', label: 'Statistics', icon: 'stats' },
-		{ href: '/reports', label: 'Reports', icon: 'reports' },
+		{ href: '/charts', label: 'Insights', icon: 'stats', group: 'insights' },
 		{ href: '/loved', label: 'Loved', icon: 'loved' },
 		{ href: '/notes', label: 'Liner Notes', icon: 'notes' },
 		{ href: '/shelf', label: 'The Shelf', icon: 'shelf' },
 		{ href: '/radio', label: 'Radio', icon: 'radio' },
 		{ href: '/crate', label: 'The Crate', icon: 'crate' },
-		{ href: '/rediscover', label: 'Rediscovery', icon: 'rediscover' },
+		{ href: '/rediscover', label: 'Discover', icon: 'discover', group: 'discover' },
 		{ href: '/patch', label: 'Patch', icon: 'patch', badge: 'patch' },
-		{ href: '/playlists/saved', label: 'Playlists', icon: 'playlists' },
-		{ href: '/playlists', label: 'Playlist Lab', icon: 'playlists' },
-		{ href: '/map', label: 'Genre Map', icon: 'map' },
-		{ href: '/import', label: 'Import', icon: 'import' },
 		{ href: '/chains', label: 'Signal Chains', icon: 'chains' },
 		{ href: '/settings', label: 'Settings', icon: 'settings' }
 	];
+
+	// Segment-boundary match, so /chartsomething never counts as /charts.
+	const onPath = (p: string, h: string) => p === h || p.startsWith(h + '/');
+
+	/** The tab of a group the path is on. Most specific wins, so
+	 *  /playlists/saved is "Playlists" and not also "Playlist Lab". */
+	function tabFor(p: string, g: Group): string | null {
+		let best: string | null = null;
+		for (const t of g.tabs) if (onPath(p, t.href) && (!best || t.href.length > best.length)) best = t.href;
+		return best;
+	}
+
+	// The group entry in the sidebar takes you back to the tab you last had
+	// open in that group, rather than always to its first one.
+	// Reactive rather than a plain function: the template only re-runs a call
+	// when something it can see changes, and `lastTab` is hidden inside one.
+	let lastTab: Record<string, string> = {};
+	$: groupHref = (item: NavItem): string => (item.group && lastTab[item.group]) || item.href;
 
 	// What is waiting on you in Patch. One request, refreshed when the tab comes
 	// back and when you navigate — a poll would be a request per interval on
@@ -58,21 +97,22 @@
 	}
 
 	$: current = $page.url.pathname;
+	$: activeGroup = GROUPS.find((g) => tabFor(current, g)) ?? null;
+	$: activeTab = activeGroup ? tabFor(current, activeGroup) : null;
+	$: if (activeGroup && activeTab) lastTab = { ...lastTab, [activeGroup.id]: activeTab };
 	// Re-read on navigation and on focus. Settling something in the inbox is the
 	// moment the badge is most obviously stale, and leaving the Patch page is
 	// what follows it — so the two triggers between them cover it without a
 	// timer running on every screen. Guarded on `state` so it does not fire
 	// before the session is known.
 	$: if (state === 'authenticated' && current) void refreshPatchBadge();
-	function isActive(href: string) {
-		if (href === '/') return current === '/';
-		// Match on a segment boundary, and let a more specific entry win. Adding
-		// /playlists/saved beside /playlists otherwise lights both, and a bare
-		// `startsWith` would also match /chartsomething against /charts.
-		const onPath = (h: string) => current === h || current.startsWith(h + '/');
-		if (nav.some((n) => n.href !== href && n.href.startsWith(href + '/') && onPath(n.href)))
-			return false;
-		return onPath(href);
+	function isActive(item: NavItem | string) {
+		const it = typeof item === 'string' ? { href: item } as NavItem : item;
+		if (it.group) return activeGroup?.id === it.group;
+		if (it.href === '/') return current === '/';
+		// A page that belongs to a group lights only the group entry.
+		if (activeGroup) return false;
+		return onPath(current, it.href);
 	}
 
 	function toggleTheme() {
@@ -191,27 +231,22 @@
 			<nav class="nav-scroll" style="display:flex;flex-direction:column;gap:3px;padding:8px 12px;flex:1;min-height:0;overflow-y:auto;">
 				{#each nav as item}
 					<a
-						href={item.href}
+						href={groupHref(item)}
 						on:click={() => (navOpen = false)}
 						class="navlink"
-						class:active={isActive(item.href)}
+						class:active={isActive(item)}
 					>
 						{#if item.icon === 'dashboard'}<svg viewBox="0 0 24 24" width="20" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round"><circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="2.4"/></svg>
 						{:else if item.icon === 'history'}<svg viewBox="0 0 24 24" width="20" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3.5 2"/></svg>
 						{:else if item.icon === 'search'}<svg viewBox="0 0 24 24" width="20" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"/><path d="M20 20l-3.6-3.6"/></svg>
-						{:else if item.icon === 'charts'}<svg viewBox="0 0 24 24" width="20" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><path d="M8 21h8"/><path d="M12 17v4"/><path d="M7 4h10v4a5 5 0 0 1-10 0z"/><path d="M17 5h3v2a3 3 0 0 1-3 3"/><path d="M7 5H4v2a3 3 0 0 0 3 3"/></svg>
-					{:else if item.icon === 'stats'}<svg viewBox="0 0 24 24" width="20" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><path d="M4 20V4"/><path d="M4 20h16"/><rect x="7" y="11" width="3.2" height="6" rx="1"/><rect x="13.5" y="7" width="3.2" height="10" rx="1"/></svg>
-					{:else if item.icon === 'reports'}<svg viewBox="0 0 24 24" width="20" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><path d="M6 3h9l4 4v14a1 1 0 0 1-1 1H6a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1z"/><path d="M14 3v5h5"/><path d="M9 13h6"/><path d="M9 17h4"/></svg>
-						{:else if item.icon === 'import'}<svg viewBox="0 0 24 24" width="20" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12"/><path d="M8 11l4 4 4-4"/><path d="M5 21h14"/></svg>
+						{:else if item.icon === 'stats'}<svg viewBox="0 0 24 24" width="20" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><path d="M4 20V4"/><path d="M4 20h16"/><rect x="7" y="11" width="3.2" height="6" rx="1"/><rect x="13.5" y="7" width="3.2" height="10" rx="1"/></svg>
 						{:else if item.icon === 'notes'}<svg viewBox="0 0 24 24" width="20" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><path d="M6 4h9l4 4v12H6z"/><path d="M9 12h7"/><path d="M9 16h5"/></svg>
-						{:else if item.icon === 'playlists'}<svg viewBox="0 0 24 24" width="20" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><path d="M5 17.5l5.5-8.5 4 5 4.5-8"/><circle cx="5" cy="17.5" r="1.9" fill="currentColor" stroke="none"/><circle cx="10.5" cy="9" r="1.9" fill="currentColor" stroke="none"/><circle cx="14.5" cy="14" r="1.9" fill="currentColor" stroke="none"/><circle cx="19" cy="6" r="1.9" fill="currentColor" stroke="none"/></svg>
-					{:else if item.icon === 'map'}<svg viewBox="0 0 24 24" width="20" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><path d="M9 4 3 6.5v13L9 17l6 2.5 6-2.5v-13L15 7z"/><path d="M9 4v13"/><path d="M15 7v12.5"/></svg>
 						{:else if item.icon === 'loved'}<svg viewBox="0 0 24 24" width="20" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><path d="M20.8 6.6a5 5 0 0 0-7.3-.5L12 7.6l-1.5-1.5a5 5 0 0 0-7.3 6.8L12 21l8.8-8.1a5 5 0 0 0 0-6.3z"/></svg>
 						{:else if item.icon === 'patch'}<svg viewBox="0 0 24 24" width="20" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><circle cx="8" cy="12" r="4.4"/><circle cx="16" cy="12" r="4.4"/></svg>
-						{:else if item.icon === 'rediscover'}<svg viewBox="0 0 24 24" width="20" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><path d="M3 5v5h5"/><path d="M4.2 14a8 8 0 1 0 1.3-6.3L3 10"/></svg>
 						{:else if item.icon === 'shelf'}<svg viewBox="0 0 24 24" width="20" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="3"/></svg>
 						{:else if item.icon === 'radio'}<svg viewBox="0 0 24 24" width="20" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="8" width="18" height="12" rx="2.5"/><path d="M7 8l9-5"/><circle cx="15.5" cy="14" r="2.6"/><path d="M6.5 12.5h3"/><path d="M6.5 15.5h3"/></svg>
 						{:else if item.icon === 'crate'}<svg viewBox="0 0 24 24" width="20" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="7" width="18" height="12.6" rx="1.5"/><path d="M7.6 10.6v5.6"/><path d="M11.4 10.6v5.6"/><path d="M16.6 11l-2.2 5.2"/></svg>
+						{:else if item.icon === 'discover'}<svg viewBox="0 0 24 24" width="20" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M15.6 8.4l-2.1 5.1-5.1 2.1 2.1-5.1z"/></svg>
 						{:else if item.icon === 'chains'}<svg viewBox="0 0 24 24" width="20" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><path d="M9 12a3 3 0 0 1 3-3h2a3 3 0 0 1 0 6"/><path d="M15 12a3 3 0 0 1-3 3h-2a3 3 0 0 1 0-6"/></svg>
 						{:else}<svg viewBox="0 0 24 24" width="20" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><line x1="4" y1="8" x2="20" y2="8"/><circle cx="15" cy="8" r="2.4" fill="var(--td-sidebar)"/><line x1="4" y1="16" x2="20" y2="16"/><circle cx="9" cy="16" r="2.4" fill="var(--td-sidebar)"/></svg>
 						{/if}
@@ -283,6 +318,9 @@
 				</div>
 			{/if}
 			<div style="max-width:1100px;margin:0 auto;padding:28px 22px 60px;">
+				{#if activeGroup && activeTab}
+					<SectionTabs label={activeGroup.label} tabs={activeGroup.tabs} active={activeTab} />
+				{/if}
 				<slot />
 			</div>
 		</main>

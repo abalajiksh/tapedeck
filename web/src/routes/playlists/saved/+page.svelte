@@ -109,7 +109,6 @@
 		<h1 class="h-display">Playlists</h1>
 		<p class="sub">Lists kept in Tapedeck — yours, and any an assistant has handed back.</p>
 	</div>
-	<a class="btn btn-secondary" href="/playlists">Playlist Lab →</a>
 </div>
 
 {#if loading}

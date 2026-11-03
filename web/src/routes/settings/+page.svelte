@@ -24,6 +24,7 @@
 		RatingApplyResult
 	} from '$lib/api';
 	import SourcesPanel from '$lib/components/SourcesPanel.svelte';
+	import ImportPanel from '$lib/components/ImportPanel.svelte';
 
 	const uiVersion = __UI_VERSION__;
 	let backendVersion = '…';
@@ -44,7 +45,7 @@
 		{ id: 'connections', label: 'Connections', hint: 'Where listens are forwarded' },
 		{ id: 'tokens', label: 'API Tokens', hint: 'Scrobble clients' },
 		{ id: 'ai', label: 'AI Connections', hint: 'Chatbots that can read your listening' },
-		{ id: 'data', label: 'Data', hint: 'Export, backup, wipe' },
+		{ id: 'data', label: 'Data', hint: 'Import, export, backup' },
 		{ id: 'sanitiser', label: 'Sanitiser', hint: 'Fix split albums, artists and credits' },
 		{ id: 'maintenance', label: 'Maintenance', hint: 'Enrichment and health' },
 		{ id: 'genremap', label: 'Genre Map', hint: 'Every Noise at Once' },
@@ -3352,18 +3353,10 @@
 				</p>
 			</div>
 
-			<!-- Listens keep their own page rather than being inlined here: an
-			     import is a long-running job with progress and a history, which
-			     is a screen rather than a button. The pointer is what makes this
-			     section the one index of everything in and out. -->
-			<div class="panel" style="border-radius:22px;padding:24px;margin-bottom:18px;">
-				<h3 class="h-display" style="font-size:19px;margin-bottom:4px;">Listens</h3>
-				<p style="font-size:13px;color:var(--td-muted);margin:0 0 16px;">
-					Bring in a history from ListenBrainz, Last.fm, Spotify or a Rockbox
-					player. Large imports run as a job you can watch.
-				</p>
-				<a class="btn btn-secondary" href="/import">Import listens →</a>
-			</div>
+			<!-- Listen imports live here, beside every other way in and out of
+			     Tapedeck. The job runs server-side, so leaving the section does not
+			     stop it; coming back re-attaches to the progress bar. -->
+			<ImportPanel />
 
 			<!-- The shelf. Its export used to live only on the shelf page and its
 			     import did not exist at all — so "how do I get my collection out
