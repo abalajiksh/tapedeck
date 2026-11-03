@@ -6713,6 +6713,19 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
+    delete:
+      tags:
+      - Connections
+      summary: Disconnect ListenBrainz.
+      description: |-
+        Session-only. The same as `DELETE /api/v1/connections/{service}` with
+        `listenbrainz`.
+      operationId: disconnect_listenbrainz
+      responses:
+        '204':
+          description: Disconnected, or was never connected.
+        '401':
+          $ref: '#/components/responses/Unauthorized'
   /api/v1/connections/lastfm/start:
     post:
       tags:
