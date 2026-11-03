@@ -693,7 +693,7 @@
 	<div class="panel" style="border-radius:22px;padding:48px 44px;text-align:center;">
 		<div class="h-display" style="font-size:20px;margin-bottom:6px;">The tape is blank</div>
 		<div style="color:var(--td-muted);font-size:14px;max-width:340px;margin:0 auto 18px;">No listens recorded yet — import a backup or start scrobbling from your player.</div>
-		<a class="btn btn-primary" href="/import" style="text-decoration:none;">Import listens</a>
+		<a class="btn btn-primary" href="/settings#data" style="text-decoration:none;">Import listens</a>
 	</div>
 {/if}
 

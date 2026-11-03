@@ -247,7 +247,7 @@
 				{/if}
 			{:else}
 				<h2 class="h-display" style="font-size:26px;margin:0 0 6px;">The deck is empty</h2>
-				<p style="margin:0;color:var(--td-muted);font-size:15px;">Nothing recorded yet — <a href="/import">import a backup</a> or start scrobbling.</p>
+				<p style="margin:0;color:var(--td-muted);font-size:15px;">Nothing recorded yet — <a href="/settings#data">import a backup</a> or start scrobbling.</p>
 			{/if}
 		</div>
 	</div>
