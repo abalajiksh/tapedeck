@@ -326,6 +326,24 @@
 	let removingDupes = false;
 	let dupesMsg = '';
 
+	// Albums MusicBrainz does not have — a record bought on Qobuz that nobody
+	// has added yet. Listed so it can be added there and looked up again; a
+	// miss is otherwise never asked about twice.
+	let mbMisses: import('$lib/api').MusicBrainzMiss[] = [];
+	let mbRetried: Record<string, boolean> = {};
+	const missKey = (m: { artist: string; album: string }) => `${m.artist}\u0000${m.album}`;
+	const mbSearchUrl = (m: { artist: string; album: string }) =>
+		`https://musicbrainz.org/search?type=release&method=indexed&query=${encodeURIComponent(`release:"${m.album}" AND artist:"${m.artist}"`)}`;
+	async function loadMbMisses() {
+		try { mbMisses = (await api.musicbrainzMisses()).albums; } catch { mbMisses = []; }
+	}
+	async function retryMbMiss(m: { artist: string; album: string }) {
+		try {
+			await api.retryMusicbrainzMiss(m.artist, m.album);
+			mbRetried = { ...mbRetried, [missKey(m)]: true };
+		} catch { /* the row stays as it was */ }
+	}
+
 	async function loadSpotifyDupes() {
 		try { spotifyDupes = await api.spotifyDuplicates(); } catch { spotifyDupes = null; }
 	}
@@ -1659,6 +1677,7 @@
 		loadLyricStatus();
 		loadSanitize();
 		loadSpotifyDupes();
+		loadMbMisses();
 		loadDiscogs();
 		loadAmai();
 		loadEveryNoise();
@@ -3479,25 +3498,63 @@
 
 		{#if section === 'sanitiser'}
 			<div class="panel" style="border-radius:22px;padding:24px;margin-bottom:18px;">
-				<div class="row" style="border:none;padding:0;">
+				<h3 class="h-display" style="font-size:19px;margin-bottom:4px;">Artist credits</h3>
+				<p style="font-size:13px;color:var(--td-muted);margin:0;max-width:64ch;">
+					Everyone credited on a listen is counted on their own. These decide only who it
+					leads with.
+				</p>
+				<div class="row">
 					<div class="row-main">
-						<div class="row-title">Classical records are filed under</div>
+						<div class="row-title">Classical records lead with</div>
 						<div class="row-sub">
 							MusicBrainz credits a recording to its performers and names the composer on the
-							work. When your library names the composer too, both are credited and counted;
-							this only decides which one the listen is filed under. Changing it re-files those
-							listens in the background.
+							work. When your library names the composer too, both are credited and counted.
+							Changing it re-files those listens in the background.
 						</div>
 					</div>
 					<div style="display:flex;gap:8px;align-items:center;">
-						<select class="input" style="width:auto;" bind:value={creditPrimary} on:change={saveCreditPrimary}>
-							<option value="performer">The performer</option>
-							<option value="composer">The composer</option>
-						</select>
 						{#if creditSaved}<span style="color:var(--td-good-fg);">✓</span>{/if}
+						<div style="display:flex;background:var(--td-sidebar);border-radius:999px;padding:4px;gap:2px;">
+							<button class="seg-btn" class:on={creditPrimary === 'performer'}
+								on:click={() => { if (creditPrimary !== 'performer') { creditPrimary = 'performer'; saveCreditPrimary(); } }}>The performer</button>
+							<button class="seg-btn" class:on={creditPrimary === 'composer'}
+								on:click={() => { if (creditPrimary !== 'composer') { creditPrimary = 'composer'; saveCreditPrimary(); } }}>The composer</button>
+						</div>
 					</div>
 				</div>
 			</div>
+			{#if mbMisses.length}
+				<div class="panel" style="border-radius:22px;padding:24px;margin-bottom:18px;">
+					<h3 class="h-display" style="font-size:19px;margin-bottom:4px;">Not on MusicBrainz</h3>
+					<p style="font-size:13px;color:var(--td-muted);margin:0 0 6px;max-width:64ch;">
+						Albums Tapedeck looked for and MusicBrainz doesn't have — often a record sold
+						on Qobuz or Bandcamp that nobody has added yet. Until it's there, its listens
+						keep the credits your sources sent.
+					</p>
+					<p style="font-size:12.5px;color:var(--td-muted-3);margin:0;max-width:64ch;">
+						Anyone can add a release to MusicBrainz; Harmony imports one from a Qobuz,
+						Bandcamp or Spotify link. Once it's there, <em>Look again</em> asks on the
+						next pass.
+					</p>
+					{#each mbMisses as m (missKey(m))}
+						<div class="row">
+							<div class="row-main">
+								<div class="row-title">{m.album}</div>
+								<div class="row-sub">{m.artist} · {m.plays.toLocaleString()} {m.plays === 1 ? 'play' : 'plays'}</div>
+							</div>
+							<div style="display:flex;gap:14px;align-items:center;flex-wrap:wrap;font-size:13px;">
+								<a href={mbSearchUrl(m)} target="_blank" rel="noopener noreferrer">Search MusicBrainz ↗</a>
+								<a href="https://harmony.pulsewidth.org.uk/" target="_blank" rel="noopener noreferrer">Add with Harmony ↗</a>
+								{#if mbRetried[missKey(m)]}
+									<span style="color:var(--td-good-fg);">Queued ✓</span>
+								{:else}
+									<button class="btn btn-secondary" on:click={() => retryMbMiss(m)}>Look again</button>
+								{/if}
+							</div>
+						</div>
+					{/each}
+				</div>
+			{/if}
 			{#if spotifyDupes?.copies || dupesMsg}
 				<div class="panel" style="border-radius:22px;padding:24px;margin-bottom:18px;">
 					<h3 class="h-display" style="font-size:19px;margin-bottom:4px;">Spotify plays counted twice</h3>

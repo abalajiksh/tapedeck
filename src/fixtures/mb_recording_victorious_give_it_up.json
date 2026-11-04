@@ -1,0 +1,291 @@
+{
+ "first-release-date": "2011-08-01",
+ "disambiguation": "",
+ "video": false,
+ "length": 165146,
+ "artist-credit": [
+  {
+   "joinphrase": " & ",
+   "artist": {
+    "disambiguation": "US actress and singer",
+    "sort-name": "Gillies, Liz",
+    "type-id": "b6e035f4-3ce9-331c-97df-83397230b0df",
+    "country": "US",
+    "type": "Person",
+    "name": "Liz Gillies",
+    "id": "8d7b2288-dc37-429f-a99a-8ce1e42641db"
+   },
+   "name": "Elizabeth Gillies"
+  },
+  {
+   "joinphrase": "",
+   "artist": {
+    "id": "f4fdbb4c-e4b7-47a0-b83b-d91bbfcfa387",
+    "name": "Ariana Grande",
+    "disambiguation": "",
+    "country": "US",
+    "type-id": "b6e035f4-3ce9-331c-97df-83397230b0df",
+    "type": "Person",
+    "sort-name": "Grande, Ariana"
+   },
+   "name": "Ariana Grande"
+  }
+ ],
+ "relations": [
+  {
+   "source-credit": "",
+   "ended": false,
+   "begin": null,
+   "target-credit": "",
+   "attribute-ids": {
+    "keyboard": "95b0c3d2-9606-4ef5-a019-9b7437f3adda"
+   },
+   "attribute-credits": {
+    "keyboard": "keyboards"
+   },
+   "target-type": "artist",
+   "attributes": [
+    "keyboard"
+   ],
+   "artist": {
+    "disambiguation": "The Super Chris",
+    "sort-name": "Abraham, C.J.",
+    "country": null,
+    "type-id": "b6e035f4-3ce9-331c-97df-83397230b0df",
+    "type": "Person",
+    "name": "C.J. Abraham",
+    "id": "6bbcc79a-d9d4-4eda-9d38-d6082ae2f476"
+   },
+   "type-id": "59054b12-01ac-43ee-a618-285fd397e461",
+   "type": "instrument",
+   "attribute-values": {},
+   "end": null,
+   "direction": "backward"
+  },
+  {
+   "attribute-values": {},
+   "direction": "backward",
+   "end": null,
+   "target-credit": "Michael Corcoran",
+   "begin": null,
+   "attribute-ids": {},
+   "ended": false,
+   "source-credit": "",
+   "attributes": [],
+   "artist": {
+    "sort-name": "Backhouse Mike",
+    "type-id": "b6e035f4-3ce9-331c-97df-83397230b0df",
+    "type": "Person",
+    "country": "US",
+    "disambiguation": "",
+    "name": "Backhouse Mike",
+    "id": "37596bba-85c3-4b36-a612-4c0d77f0fc68"
+   },
+   "type-id": "59054b12-01ac-43ee-a618-285fd397e461",
+   "type": "instrument",
+   "target-type": "artist"
+  },
+  {
+   "attribute-values": {},
+   "direction": "backward",
+   "end": null,
+   "attribute-ids": {},
+   "target-credit": "",
+   "begin": null,
+   "ended": false,
+   "source-credit": "",
+   "type": "producer",
+   "type-id": "5c0ceac3-feb4-41f0-868d-dc06f6e27fc0",
+   "artist": {
+    "sort-name": "Abraham, C.J.",
+    "type": "Person",
+    "type-id": "b6e035f4-3ce9-331c-97df-83397230b0df",
+    "country": null,
+    "disambiguation": "The Super Chris",
+    "name": "C.J. Abraham",
+    "id": "6bbcc79a-d9d4-4eda-9d38-d6082ae2f476"
+   },
+   "attributes": [],
+   "target-type": "artist"
+  },
+  {
+   "end": null,
+   "direction": "backward",
+   "attribute-values": {},
+   "target-type": "artist",
+   "type-id": "5c0ceac3-feb4-41f0-868d-dc06f6e27fc0",
+   "type": "producer",
+   "artist": {
+    "type-id": "b6e035f4-3ce9-331c-97df-83397230b0df",
+    "type": "Person",
+    "country": "US",
+    "sort-name": "Backhouse Mike",
+    "disambiguation": "",
+    "id": "37596bba-85c3-4b36-a612-4c0d77f0fc68",
+    "name": "Backhouse Mike"
+   },
+   "attributes": [],
+   "source-credit": "",
+   "ended": false,
+   "attribute-ids": {},
+   "target-credit": "",
+   "begin": null
+  },
+  {
+   "attribute-values": {},
+   "direction": "backward",
+   "end": null,
+   "target-credit": "",
+   "begin": null,
+   "attribute-ids": {
+    "background vocals": "75052401-7340-4e5b-a71d-ea024a128849"
+   },
+   "source-credit": "",
+   "ended": false,
+   "artist": {
+    "sort-name": "Chutnik, Dena",
+    "type": "Person",
+    "type-id": "b6e035f4-3ce9-331c-97df-83397230b0df",
+    "country": null,
+    "disambiguation": "",
+    "name": "Dena Chutnik",
+    "id": "9c7c0693-557f-49cb-a1d0-0ffbc4df9bce"
+   },
+   "attributes": [
+    "background vocals"
+   ],
+   "type": "vocal",
+   "type-id": "0fdbe3c6-7700-4a31-ae54-b53f06ae1cfa",
+   "target-type": "artist",
+   "attribute-credits": {}
+  },
+  {
+   "direction": "backward",
+   "end": null,
+   "attribute-values": {},
+   "attributes": [],
+   "artist": {
+    "name": "Liz Gillies",
+    "id": "8d7b2288-dc37-429f-a99a-8ce1e42641db",
+    "disambiguation": "US actress and singer",
+    "sort-name": "Gillies, Liz",
+    "type-id": "b6e035f4-3ce9-331c-97df-83397230b0df",
+    "type": "Person",
+    "country": "US"
+   },
+   "type-id": "0fdbe3c6-7700-4a31-ae54-b53f06ae1cfa",
+   "type": "vocal",
+   "target-type": "artist",
+   "target-credit": "Elizabeth Gillies",
+   "begin": null,
+   "attribute-ids": {},
+   "ended": false,
+   "source-credit": ""
+  },
+  {
+   "type": "vocal",
+   "type-id": "0fdbe3c6-7700-4a31-ae54-b53f06ae1cfa",
+   "artist": {
+    "type-id": "b6e035f4-3ce9-331c-97df-83397230b0df",
+    "type": "Person",
+    "country": "US",
+    "sort-name": "Grande, Ariana",
+    "disambiguation": "",
+    "id": "f4fdbb4c-e4b7-47a0-b83b-d91bbfcfa387",
+    "name": "Ariana Grande"
+   },
+   "attributes": [
+    "lead vocals"
+   ],
+   "target-type": "artist",
+   "attribute-credits": {},
+   "attribute-ids": {
+    "lead vocals": "8e2a3255-87c2-4809-a174-98cb3704f1a5"
+   },
+   "begin": null,
+   "target-credit": "",
+   "source-credit": "",
+   "ended": false,
+   "direction": "backward",
+   "end": null,
+   "attribute-values": {}
+  },
+  {
+   "target-type": "work",
+   "attributes": [],
+   "type-id": "a3005666-a872-32c3-ad06-98af558e99b0",
+   "type": "performance",
+   "ended": false,
+   "source-credit": "",
+   "target-credit": "",
+   "begin": null,
+   "attribute-ids": {},
+   "end": null,
+   "work": {
+    "id": "4bd3990e-3b88-4e88-8d8b-9e770fc2e1d2",
+    "iswcs": [],
+    "title": "Give It Up",
+    "relations": [
+     {
+      "ended": false,
+      "source-credit": "",
+      "begin": null,
+      "target-credit": "",
+      "attribute-ids": {},
+      "target-type": "artist",
+      "artist": {
+       "name": "C.J. Abraham",
+       "id": "6bbcc79a-d9d4-4eda-9d38-d6082ae2f476",
+       "sort-name": "Abraham, C.J.",
+       "type": "Person",
+       "type-id": "b6e035f4-3ce9-331c-97df-83397230b0df",
+       "country": null,
+       "disambiguation": "The Super Chris"
+      },
+      "attributes": [],
+      "type": "writer",
+      "type-id": "a255bca1-b157-4518-9108-7b147dc3fc68",
+      "attribute-values": {},
+      "end": null,
+      "direction": "backward"
+     },
+     {
+      "source-credit": "",
+      "ended": false,
+      "attribute-ids": {},
+      "target-credit": "Michael Corcoran",
+      "begin": null,
+      "target-type": "artist",
+      "type-id": "a255bca1-b157-4518-9108-7b147dc3fc68",
+      "type": "writer",
+      "artist": {
+       "disambiguation": "",
+       "country": "US",
+       "type-id": "b6e035f4-3ce9-331c-97df-83397230b0df",
+       "type": "Person",
+       "sort-name": "Backhouse Mike",
+       "id": "37596bba-85c3-4b36-a612-4c0d77f0fc68",
+       "name": "Backhouse Mike"
+      },
+      "attributes": [],
+      "attribute-values": {},
+      "end": null,
+      "direction": "backward"
+     }
+    ],
+    "type-id": "f061270a-2fd6-32f1-a641-f0f8676d14e6",
+    "type": "Song",
+    "languages": [
+     "eng"
+    ],
+    "attributes": [],
+    "language": "eng",
+    "disambiguation": ""
+   },
+   "direction": "forward",
+   "attribute-values": {}
+  }
+ ],
+ "title": "Give It Up",
+ "id": "b46aa725-95a4-4a1b-b1a6-22a8367c538f"
+}

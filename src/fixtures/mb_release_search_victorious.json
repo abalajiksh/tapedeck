@@ -1,0 +1,1241 @@
+{
+ "created": "2026-11-04T11:26:31.685Z",
+ "count": 10,
+ "offset": 0,
+ "releases": [
+  {
+   "id": "d8094fa6-8ddd-4ae8-8f71-041a41a1b3d4",
+   "score": 100,
+   "status-id": "4e304316-386d-3409-af2e-78857eec5cfe",
+   "packaging-id": "ec27701a-4a22-37f4-bfac-6616e0f9750a",
+   "artist-credit-id": "2abe1a10-e175-3def-8101-fd596bdb2421",
+   "count": 1,
+   "title": "Victorious: Music from the Hit TV Show",
+   "status": "Official",
+   "packaging": "Jewel Case",
+   "text-representation": {
+    "language": "eng",
+    "script": "Latn"
+   },
+   "artist-credit": [
+    {
+     "name": "Victorious Cast",
+     "artist": {
+      "id": "19c682b6-31cc-41fa-bf6e-1796f2a1e778",
+      "name": "Victorious Cast",
+      "sort-name": "Victorious Cast"
+     }
+    }
+   ],
+   "release-group": {
+    "id": "17278767-3c89-4c6c-8d56-b835e5eb6ffa",
+    "type-id": "22a628ad-c082-3c4f-b1b6-d41665107b88",
+    "primary-type-id": "f529b476-6e62-324f-b0aa-1f3e33d313fc",
+    "title": "Victorious: Music from the Hit TV Show",
+    "primary-type": "Album",
+    "secondary-types": [
+     "Soundtrack"
+    ],
+    "secondary-type-ids": [
+     "22a628ad-c082-3c4f-b1b6-d41665107b88"
+    ]
+   },
+   "date": "2012",
+   "country": "XE",
+   "release-events": [
+    {
+     "date": "2012",
+     "area": {
+      "id": "89a675c2-3e37-3518-b83c-418bad59a85a",
+      "name": "Europe",
+      "sort-name": "Europe",
+      "iso-3166-1-codes": [
+       "XE"
+      ]
+     }
+    }
+   ],
+   "barcode": "886919061826",
+   "label-info": [
+    {
+     "catalog-number": "88691906182",
+     "label": {
+      "id": "9e6b4d7f-4958-4db7-8504-d89e315836af",
+      "name": "Sony Music"
+     }
+    },
+    {
+     "catalog-number": "88691906182",
+     "label": {
+      "id": "011d1192-6f65-45bd-85c4-0400dd45693e",
+      "name": "Columbia"
+     }
+    },
+    {
+     "catalog-number": "88691906182",
+     "label": {
+      "id": "972a60b4-d280-465e-8812-c25836c00fcf",
+      "name": "Nickelodeon"
+     }
+    }
+   ],
+   "track-count": 13,
+   "media": [
+    {
+     "id": "5fd226dd-f52f-35b6-93f8-5358a356c8fa",
+     "format": "CD",
+     "disc-count": 1,
+     "track-count": 13
+    }
+   ]
+  },
+  {
+   "id": "3d56b337-a16f-4b97-8e4c-7b286cd256fe",
+   "score": 100,
+   "status-id": "4e304316-386d-3409-af2e-78857eec5cfe",
+   "packaging-id": "119eba76-b343-3e02-a292-f0f00644bb9b",
+   "artist-credit-id": "2abe1a10-e175-3def-8101-fd596bdb2421",
+   "count": 1,
+   "title": "Victorious: Music from the Hit TV Show",
+   "status": "Official",
+   "packaging": "None",
+   "text-representation": {
+    "language": "eng",
+    "script": "Latn"
+   },
+   "artist-credit": [
+    {
+     "name": "Victorious Cast",
+     "artist": {
+      "id": "19c682b6-31cc-41fa-bf6e-1796f2a1e778",
+      "name": "Victorious Cast",
+      "sort-name": "Victorious Cast"
+     }
+    }
+   ],
+   "release-group": {
+    "id": "17278767-3c89-4c6c-8d56-b835e5eb6ffa",
+    "type-id": "22a628ad-c082-3c4f-b1b6-d41665107b88",
+    "primary-type-id": "f529b476-6e62-324f-b0aa-1f3e33d313fc",
+    "title": "Victorious: Music from the Hit TV Show",
+    "primary-type": "Album",
+    "secondary-types": [
+     "Soundtrack"
+    ],
+    "secondary-type-ids": [
+     "22a628ad-c082-3c4f-b1b6-d41665107b88"
+    ]
+   },
+   "date": "2011-08-02",
+   "country": "BH",
+   "release-events": [
+    {
+     "date": "2011-08-02",
+     "area": {
+      "id": "65f4f7a6-d3c1-3a6b-a726-85e147d555b7",
+      "name": "Bahrain",
+      "sort-name": "Bahrain",
+      "iso-3166-1-codes": [
+       "BH"
+      ]
+     }
+    },
+    {
+     "date": "2011-08-02",
+     "area": {
+      "id": "8e0551f2-95c2-3cc0-a0a9-f2d344f10667",
+      "name": "Egypt",
+      "sort-name": "Egypt",
+      "iso-3166-1-codes": [
+       "EG"
+      ]
+     }
+    },
+    {
+     "date": "2011-08-02",
+     "area": {
+      "id": "b0525ccb-15e9-3c56-81fa-471db3b31cfa",
+      "name": "Iraq",
+      "sort-name": "Iraq",
+      "iso-3166-1-codes": [
+       "IQ"
+      ]
+     }
+    },
+    {
+     "date": "2011-08-02",
+     "area": {
+      "id": "2e40127e-0b8a-3a01-bfbc-58c7fcdba532",
+      "name": "Jordan",
+      "sort-name": "Jordan",
+      "iso-3166-1-codes": [
+       "JO"
+      ]
+     }
+    },
+    {
+     "date": "2011-08-02",
+     "area": {
+      "id": "f03f2625-dc7d-38b2-a058-4e9ca0e10424",
+      "name": "Kuwait",
+      "sort-name": "Kuwait",
+      "iso-3166-1-codes": [
+       "KW"
+      ]
+     }
+    },
+    {
+     "date": "2011-08-02",
+     "area": {
+      "id": "8138206e-5786-3f86-a53b-19a7303e7419",
+      "name": "Lebanon",
+      "sort-name": "Lebanon",
+      "iso-3166-1-codes": [
+       "LB"
+      ]
+     }
+    },
+    {
+     "date": "2011-08-02",
+     "area": {
+      "id": "1509aaae-8271-30cb-89c1-d8660cf73975",
+      "name": "Libya",
+      "sort-name": "Libya",
+      "iso-3166-1-codes": [
+       "LY"
+      ]
+     }
+    },
+    {
+     "date": "2011-08-02",
+     "area": {
+      "id": "3e08b2cd-69f3-317c-b1e4-e71be581839e",
+      "name": "Mexico",
+      "sort-name": "Mexico",
+      "iso-3166-1-codes": [
+       "MX"
+      ]
+     }
+    },
+    {
+     "date": "2011-08-02",
+     "area": {
+      "id": "7ccdff29-2e00-3e50-9520-b9ea1e918bc2",
+      "name": "Oman",
+      "sort-name": "Oman",
+      "iso-3166-1-codes": [
+       "OM"
+      ]
+     }
+    },
+    {
+     "date": "2011-08-02",
+     "area": {
+      "id": "348dcc25-7bb6-3f75-8739-97eabc84a330",
+      "name": "Qatar",
+      "sort-name": "Qatar",
+      "iso-3166-1-codes": [
+       "QA"
+      ]
+     }
+    },
+    {
+     "date": "2011-08-02",
+     "area": {
+      "id": "9705be0d-51fb-3990-8726-ec9f56c66ba0",
+      "name": "Saudi Arabia",
+      "sort-name": "Saudi Arabia",
+      "iso-3166-1-codes": [
+       "SA"
+      ]
+     }
+    },
+    {
+     "date": "2011-08-02",
+     "area": {
+      "id": "471c46a7-afc5-31c4-923c-d0444f5053a4",
+      "name": "Spain",
+      "sort-name": "Spain",
+      "iso-3166-1-codes": [
+       "ES"
+      ]
+     }
+    },
+    {
+     "date": "2011-08-02",
+     "area": {
+      "id": "23d10872-f5ae-3f0c-bf55-332788a16ecb",
+      "name": "Sweden",
+      "sort-name": "Sweden",
+      "iso-3166-1-codes": [
+       "SE"
+      ]
+     }
+    },
+    {
+     "date": "2011-08-02",
+     "area": {
+      "id": "fe40c648-ba74-3e17-b768-58181d5ee563",
+      "name": "United Arab Emirates",
+      "sort-name": "United Arab Emirates",
+      "iso-3166-1-codes": [
+       "AE"
+      ]
+     }
+    },
+    {
+     "date": "2011-08-02",
+     "area": {
+      "id": "489ce91b-6658-3307-9877-795b68554c98",
+      "name": "United States",
+      "sort-name": "United States",
+      "iso-3166-1-codes": [
+       "US"
+      ]
+     }
+    },
+    {
+     "date": "2011-08-02",
+     "area": {
+      "id": "e8e9ecdc-19d3-360b-8f1a-9c80e6c12830",
+      "name": "Yemen",
+      "sort-name": "Yemen",
+      "iso-3166-1-codes": [
+       "YE"
+      ]
+     }
+    }
+   ],
+   "barcode": "886443113015",
+   "label-info": [
+    {
+     "label": {
+      "id": "972a60b4-d280-465e-8812-c25836c00fcf",
+      "name": "Nickelodeon"
+     }
+    },
+    {
+     "label": {
+      "id": "011d1192-6f65-45bd-85c4-0400dd45693e",
+      "name": "Columbia"
+     }
+    }
+   ],
+   "track-count": 13,
+   "media": [
+    {
+     "id": "e1f17506-5acb-377d-b484-f5f88098aede",
+     "format": "Digital Media",
+     "disc-count": 0,
+     "track-count": 13
+    }
+   ]
+  },
+  {
+   "id": "58fd34e1-e5e3-4722-84bd-aff5e5c0b0ea",
+   "score": 100,
+   "status-id": "4e304316-386d-3409-af2e-78857eec5cfe",
+   "packaging-id": "ec27701a-4a22-37f4-bfac-6616e0f9750a",
+   "artist-credit-id": "2abe1a10-e175-3def-8101-fd596bdb2421",
+   "count": 1,
+   "title": "Victorious: Music from the Hit TV Show",
+   "status": "Official",
+   "packaging": "Jewel Case",
+   "text-representation": {
+    "language": "eng",
+    "script": "Latn"
+   },
+   "artist-credit": [
+    {
+     "name": "Victorious Cast",
+     "artist": {
+      "id": "19c682b6-31cc-41fa-bf6e-1796f2a1e778",
+      "name": "Victorious Cast",
+      "sort-name": "Victorious Cast"
+     }
+    }
+   ],
+   "release-group": {
+    "id": "17278767-3c89-4c6c-8d56-b835e5eb6ffa",
+    "type-id": "22a628ad-c082-3c4f-b1b6-d41665107b88",
+    "primary-type-id": "f529b476-6e62-324f-b0aa-1f3e33d313fc",
+    "title": "Victorious: Music from the Hit TV Show",
+    "primary-type": "Album",
+    "secondary-types": [
+     "Soundtrack"
+    ],
+    "secondary-type-ids": [
+     "22a628ad-c082-3c4f-b1b6-d41665107b88"
+    ]
+   },
+   "date": "2012",
+   "country": "XE",
+   "release-events": [
+    {
+     "date": "2012",
+     "area": {
+      "id": "89a675c2-3e37-3518-b83c-418bad59a85a",
+      "name": "Europe",
+      "sort-name": "Europe",
+      "iso-3166-1-codes": [
+       "XE"
+      ]
+     }
+    }
+   ],
+   "barcode": "886976834128",
+   "label-info": [
+    {
+     "catalog-number": "88697683412",
+     "label": {
+      "id": "9e6b4d7f-4958-4db7-8504-d89e315836af",
+      "name": "Sony Music"
+     }
+    },
+    {
+     "catalog-number": "88697683412",
+     "label": {
+      "id": "972a60b4-d280-465e-8812-c25836c00fcf",
+      "name": "Nickelodeon"
+     }
+    },
+    {
+     "catalog-number": "88697683412",
+     "label": {
+      "id": "011d1192-6f65-45bd-85c4-0400dd45693e",
+      "name": "Columbia"
+     }
+    }
+   ],
+   "track-count": 12,
+   "media": [
+    {
+     "id": "695f924c-70e1-3269-91ac-0e6540fae937",
+     "format": "CD",
+     "disc-count": 0,
+     "track-count": 12
+    }
+   ]
+  },
+  {
+   "id": "561f31ce-407b-4761-955d-862ad5f3334a",
+   "score": 100,
+   "status-id": "4e304316-386d-3409-af2e-78857eec5cfe",
+   "packaging-id": "119eba76-b343-3e02-a292-f0f00644bb9b",
+   "artist-credit-id": "2abe1a10-e175-3def-8101-fd596bdb2421",
+   "count": 1,
+   "title": "Victorious: Music from the Hit TV Show",
+   "status": "Official",
+   "packaging": "None",
+   "text-representation": {
+    "language": "eng",
+    "script": "Latn"
+   },
+   "artist-credit": [
+    {
+     "name": "Victorious Cast",
+     "artist": {
+      "id": "19c682b6-31cc-41fa-bf6e-1796f2a1e778",
+      "name": "Victorious Cast",
+      "sort-name": "Victorious Cast"
+     }
+    }
+   ],
+   "release-group": {
+    "id": "17278767-3c89-4c6c-8d56-b835e5eb6ffa",
+    "type-id": "22a628ad-c082-3c4f-b1b6-d41665107b88",
+    "primary-type-id": "f529b476-6e62-324f-b0aa-1f3e33d313fc",
+    "title": "Victorious: Music from the Hit TV Show",
+    "primary-type": "Album",
+    "secondary-types": [
+     "Soundtrack"
+    ],
+    "secondary-type-ids": [
+     "22a628ad-c082-3c4f-b1b6-d41665107b88"
+    ]
+   },
+   "date": "2011-08-01",
+   "country": "AF",
+   "release-events": [
+    {
+     "date": "2011-08-01",
+     "area": {
+      "id": "aa95182f-df0a-3ad6-8bfb-4b63482cd276",
+      "name": "Afghanistan",
+      "sort-name": "Afghanistan",
+      "iso-3166-1-codes": [
+       "AF"
+      ]
+     }
+    },
+    {
+     "date": "2011-08-01",
+     "area": {
+      "id": "106e0bec-b638-3b37-b731-f53d507dc00e",
+      "name": "Australia",
+      "sort-name": "Australia",
+      "iso-3166-1-codes": [
+       "AU"
+      ]
+     }
+    },
+    {
+     "date": "2011-08-01",
+     "area": {
+      "id": "caac77d1-a5c8-3e6e-8e27-90b44dcc1446",
+      "name": "Austria",
+      "sort-name": "Austria",
+      "iso-3166-1-codes": [
+       "AT"
+      ]
+     }
+    },
+    {
+     "date": "2011-08-01",
+     "area": {
+      "id": "65f4f7a6-d3c1-3a6b-a726-85e147d555b7",
+      "name": "Bahrain",
+      "sort-name": "Bahrain",
+      "iso-3166-1-codes": [
+       "BH"
+      ]
+     }
+    },
+    {
+     "date": "2011-08-01",
+     "area": {
+      "id": "20395c3e-610c-34fd-9995-6b6f299121f2",
+      "name": "Bangladesh",
+      "sort-name": "Bangladesh",
+      "iso-3166-1-codes": [
+       "BD"
+      ]
+     }
+    },
+    {
+     "date": "2011-08-01",
+     "area": {
+      "id": "2cbd5484-647d-3752-8acd-933ced4f9a24",
+      "name": "Bhutan",
+      "sort-name": "Bhutan",
+      "iso-3166-1-codes": [
+       "BT"
+      ]
+     }
+    },
+    {
+     "date": "2011-08-01",
+     "area": {
+      "id": "5d1fe672-9c9a-3d58-a221-4b23e9274709",
+      "name": "Brunei",
+      "sort-name": "Brunei",
+      "iso-3166-1-codes": [
+       "BN"
+      ]
+     }
+    },
+    {
+     "date": "2011-08-01",
+     "area": {
+      "id": "ee26e886-87f5-33a2-8e8e-f9591490426d",
+      "name": "Cambodia",
+      "sort-name": "Cambodia",
+      "iso-3166-1-codes": [
+       "KH"
+      ]
+     }
+    },
+    {
+     "date": "2011-08-01",
+     "area": {
+      "id": "71bbafaa-e825-3e15-8ca9-017dcad1748b",
+      "name": "Canada",
+      "sort-name": "Canada",
+      "iso-3166-1-codes": [
+       "CA"
+      ]
+     }
+    },
+    {
+     "date": "2011-08-01",
+     "area": {
+      "id": "a75b525f-8c01-31f6-975e-4a32a2b001d5",
+      "name": "Cyprus",
+      "sort-name": "Cyprus",
+      "iso-3166-1-codes": [
+       "CY"
+      ]
+     }
+    },
+    {
+     "date": "2011-08-01",
+     "area": {
+      "id": "738aed7d-cc30-3a90-af20-21477ba1e8cc",
+      "name": "Timor-Leste",
+      "sort-name": "Timor-Leste",
+      "iso-3166-1-codes": [
+       "TL"
+      ]
+     }
+    },
+    {
+     "date": "2011-08-01",
+     "area": {
+      "id": "8e0551f2-95c2-3cc0-a0a9-f2d344f10667",
+      "name": "Egypt",
+      "sort-name": "Egypt",
+      "iso-3166-1-codes": [
+       "EG"
+      ]
+     }
+    },
+    {
+     "date": "2011-08-01",
+     "area": {
+      "id": "031eba2b-79b5-3314-a14b-288407ad42ab",
+      "name": "Fiji",
+      "sort-name": "Fiji",
+      "iso-3166-1-codes": [
+       "FJ"
+      ]
+     }
+    },
+    {
+     "date": "2011-08-01",
+     "area": {
+      "id": "85752fda-13c4-31a3-bee5-0e5cb1f51dad",
+      "name": "Germany",
+      "sort-name": "Germany",
+      "iso-3166-1-codes": [
+       "DE"
+      ]
+     }
+    },
+    {
+     "date": "2011-08-01",
+     "area": {
+      "id": "803db0ca-b6ed-3bbc-aeb8-f89efd0a2168",
+      "name": "Greece",
+      "sort-name": "Greece",
+      "iso-3166-1-codes": [
+       "GR"
+      ]
+     }
+    },
+    {
+     "date": "2011-08-01",
+     "area": {
+      "id": "0373cdff-eac8-3fbc-92dc-36a607da06d1",
+      "name": "Hong Kong",
+      "sort-name": "Hong Kong",
+      "iso-3166-1-codes": [
+       "HK"
+      ]
+     }
+    },
+    {
+     "date": "2011-08-01",
+     "area": {
+      "id": "d31a9a15-537f-3669-ad53-25753ddd2772",
+      "name": "India",
+      "sort-name": "India",
+      "iso-3166-1-codes": [
+       "IN"
+      ]
+     }
+    },
+    {
+     "date": "2011-08-01",
+     "area": {
+      "id": "d3a68bd0-7419-3f99-a5bd-204d6e057089",
+      "name": "Indonesia",
+      "sort-name": "Indonesia",
+      "iso-3166-1-codes": [
+       "ID"
+      ]
+     }
+    },
+    {
+     "date": "2011-08-01",
+     "area": {
+      "id": "b0525ccb-15e9-3c56-81fa-471db3b31cfa",
+      "name": "Iraq",
+      "sort-name": "Iraq",
+      "iso-3166-1-codes": [
+       "IQ"
+      ]
+     }
+    },
+    {
+     "date": "2011-08-01",
+     "area": {
+      "id": "2e40127e-0b8a-3a01-bfbc-58c7fcdba532",
+      "name": "Jordan",
+      "sort-name": "Jordan",
+      "iso-3166-1-codes": [
+       "JO"
+      ]
+     }
+    },
+    {
+     "date": "2011-08-01",
+     "area": {
+      "id": "2b425457-0a4f-3282-9d2f-0a0e0f7db2e5",
+      "name": "Kiribati",
+      "sort-name": "Kiribati",
+      "iso-3166-1-codes": [
+       "KI"
+      ]
+     }
+    },
+    {
+     "date": "2011-08-01",
+     "area": {
+      "id": "b9f7d640-46e8-313e-b158-ded6d18593b3",
+      "name": "South Korea",
+      "sort-name": "South Korea",
+      "iso-3166-1-codes": [
+       "KR"
+      ]
+     }
+    },
+    {
+     "date": "2011-08-01",
+     "area": {
+      "id": "f03f2625-dc7d-38b2-a058-4e9ca0e10424",
+      "name": "Kuwait",
+      "sort-name": "Kuwait",
+      "iso-3166-1-codes": [
+       "KW"
+      ]
+     }
+    },
+    {
+     "date": "2011-08-01",
+     "area": {
+      "id": "c81cb1f4-0858-3f28-9082-c06e2ce24bea",
+      "name": "Laos",
+      "sort-name": "Laos",
+      "iso-3166-1-codes": [
+       "LA"
+      ]
+     }
+    },
+    {
+     "date": "2011-08-01",
+     "area": {
+      "id": "8138206e-5786-3f86-a53b-19a7303e7419",
+      "name": "Lebanon",
+      "sort-name": "Lebanon",
+      "iso-3166-1-codes": [
+       "LB"
+      ]
+     }
+    },
+    {
+     "date": "2011-08-01",
+     "area": {
+      "id": "1509aaae-8271-30cb-89c1-d8660cf73975",
+      "name": "Libya",
+      "sort-name": "Libya",
+      "iso-3166-1-codes": [
+       "LY"
+      ]
+     }
+    },
+    {
+     "date": "2011-08-01",
+     "area": {
+      "id": "d2007481-eefe-37c0-be71-2256dfe148cb",
+      "name": "Liechtenstein",
+      "sort-name": "Liechtenstein",
+      "iso-3166-1-codes": [
+       "LI"
+      ]
+     }
+    },
+    {
+     "date": "2011-08-01",
+     "area": {
+      "id": "ed4e8ad9-2b33-3133-b105-28bb719d6ce8",
+      "name": "Macao",
+      "sort-name": "Macao",
+      "iso-3166-1-codes": [
+       "MO"
+      ]
+     }
+    },
+    {
+     "date": "2011-08-01",
+     "area": {
+      "id": "305d19c7-c040-349c-8d5f-6ac75d2d2a09",
+      "name": "Malaysia",
+      "sort-name": "Malaysia",
+      "iso-3166-1-codes": [
+       "MY"
+      ]
+     }
+    },
+    {
+     "date": "2011-08-01",
+     "area": {
+      "id": "a195ee41-7f39-3a60-83ca-4a6f91cd4d2e",
+      "name": "Maldives",
+      "sort-name": "Maldives",
+      "iso-3166-1-codes": [
+       "MV"
+      ]
+     }
+    },
+    {
+     "date": "2011-08-01",
+     "area": {
+      "id": "bf8c2e6f-2401-3a52-aad2-7e8baa8b447e",
+      "name": "Marshall Islands",
+      "sort-name": "Marshall Islands",
+      "iso-3166-1-codes": [
+       "MH"
+      ]
+     }
+    },
+    {
+     "date": "2011-08-01",
+     "area": {
+      "id": "3e08b2cd-69f3-317c-b1e4-e71be581839e",
+      "name": "Mexico",
+      "sort-name": "Mexico",
+      "iso-3166-1-codes": [
+       "MX"
+      ]
+     }
+    },
+    {
+     "date": "2011-08-01",
+     "area": {
+      "id": "aabae773-4997-37ba-950a-394c06847631",
+      "name": "Federated States of Micronesia",
+      "sort-name": "Federated States of Micronesia",
+      "iso-3166-1-codes": [
+       "FM"
+      ]
+     }
+    },
+    {
+     "date": "2011-08-01",
+     "area": {
+      "id": "7784f515-5886-3831-9b33-a7f665795d7f",
+      "name": "Nauru",
+      "sort-name": "Nauru",
+      "iso-3166-1-codes": [
+       "NR"
+      ]
+     }
+    },
+    {
+     "date": "2011-08-01",
+     "area": {
+      "id": "8815c87e-cf3f-362c-a5c6-05ce853a4c79",
+      "name": "Nepal",
+      "sort-name": "Nepal",
+      "iso-3166-1-codes": [
+       "NP"
+      ]
+     }
+    },
+    {
+     "date": "2011-08-01",
+     "area": {
+      "id": "8524c7d9-f472-3890-a458-f28d5081d9c4",
+      "name": "New Zealand",
+      "sort-name": "New Zealand",
+      "iso-3166-1-codes": [
+       "NZ"
+      ]
+     }
+    },
+    {
+     "date": "2011-08-01",
+     "area": {
+      "id": "7ccdff29-2e00-3e50-9520-b9ea1e918bc2",
+      "name": "Oman",
+      "sort-name": "Oman",
+      "iso-3166-1-codes": [
+       "OM"
+      ]
+     }
+    },
+    {
+     "date": "2011-08-01",
+     "area": {
+      "id": "7c87112d-504d-31f1-8147-11ff45fc3bfd",
+      "name": "Pakistan",
+      "sort-name": "Pakistan",
+      "iso-3166-1-codes": [
+       "PK"
+      ]
+     }
+    },
+    {
+     "date": "2011-08-01",
+     "area": {
+      "id": "9d800529-1ef8-39bb-9e42-1fa74f2eac97",
+      "name": "Palau",
+      "sort-name": "Palau",
+      "iso-3166-1-codes": [
+       "PW"
+      ]
+     }
+    },
+    {
+     "date": "2011-08-01",
+     "area": {
+      "id": "2366f623-b236-3073-bbfe-c26d6d6f195f",
+      "name": "Papua New Guinea",
+      "sort-name": "Papua New Guinea",
+      "iso-3166-1-codes": [
+       "PG"
+      ]
+     }
+    },
+    {
+     "date": "2011-08-01",
+     "area": {
+      "id": "786532a5-2e36-315a-bdf2-221dc1b64b72",
+      "name": "Philippines",
+      "sort-name": "Philippines",
+      "iso-3166-1-codes": [
+       "PH"
+      ]
+     }
+    },
+    {
+     "date": "2011-08-01",
+     "area": {
+      "id": "27b5df20-d817-3126-b3a0-1be6a75f7496",
+      "name": "Pitcairn",
+      "sort-name": "Pitcairn",
+      "iso-3166-1-codes": [
+       "PN"
+      ]
+     }
+    },
+    {
+     "date": "2011-08-01",
+     "area": {
+      "id": "781b0c54-3d54-362d-a941-8a617def4992",
+      "name": "Portugal",
+      "sort-name": "Portugal",
+      "iso-3166-1-codes": [
+       "PT"
+      ]
+     }
+    },
+    {
+     "date": "2011-08-01",
+     "area": {
+      "id": "348dcc25-7bb6-3f75-8739-97eabc84a330",
+      "name": "Qatar",
+      "sort-name": "Qatar",
+      "iso-3166-1-codes": [
+       "QA"
+      ]
+     }
+    },
+    {
+     "date": "2011-08-01",
+     "area": {
+      "id": "2cc3ea35-b05a-3ec0-a5a2-88e8a482854a",
+      "name": "Samoa",
+      "sort-name": "Samoa",
+      "iso-3166-1-codes": [
+       "WS"
+      ]
+     }
+    },
+    {
+     "date": "2011-08-01",
+     "area": {
+      "id": "9705be0d-51fb-3990-8726-ec9f56c66ba0",
+      "name": "Saudi Arabia",
+      "sort-name": "Saudi Arabia",
+      "iso-3166-1-codes": [
+       "SA"
+      ]
+     }
+    },
+    {
+     "date": "2011-08-01",
+     "area": {
+      "id": "aa344640-fd57-3960-afb4-84d0d3b69d3d",
+      "name": "Singapore",
+      "sort-name": "Singapore",
+      "iso-3166-1-codes": [
+       "SG"
+      ]
+     }
+    },
+    {
+     "date": "2011-08-01",
+     "area": {
+      "id": "7fe4001e-eda5-3b5b-bbd8-0f773e76d09c",
+      "name": "Solomon Islands",
+      "sort-name": "Solomon Islands",
+      "iso-3166-1-codes": [
+       "SB"
+      ]
+     }
+    },
+    {
+     "date": "2011-08-01",
+     "area": {
+      "id": "471c46a7-afc5-31c4-923c-d0444f5053a4",
+      "name": "Spain",
+      "sort-name": "Spain",
+      "iso-3166-1-codes": [
+       "ES"
+      ]
+     }
+    },
+    {
+     "date": "2011-08-01",
+     "area": {
+      "id": "6e2d562d-a754-3036-8484-7ac576606e27",
+      "name": "Sri Lanka",
+      "sort-name": "Sri Lanka",
+      "iso-3166-1-codes": [
+       "LK"
+      ]
+     }
+    },
+    {
+     "date": "2011-08-01",
+     "area": {
+      "id": "23d10872-f5ae-3f0c-bf55-332788a16ecb",
+      "name": "Sweden",
+      "sort-name": "Sweden",
+      "iso-3166-1-codes": [
+       "SE"
+      ]
+     }
+    },
+    {
+     "date": "2011-08-01",
+     "area": {
+      "id": "1333ff06-8e3d-3c8e-9f3a-13a2a38b41df",
+      "name": "Switzerland",
+      "sort-name": "Switzerland",
+      "iso-3166-1-codes": [
+       "CH"
+      ]
+     }
+    },
+    {
+     "date": "2011-08-01",
+     "area": {
+      "id": "41637cec-9a4f-389c-86d2-fc6abf3357b5",
+      "name": "Taiwan",
+      "sort-name": "Taiwan",
+      "iso-3166-1-codes": [
+       "TW"
+      ]
+     }
+    },
+    {
+     "date": "2011-08-01",
+     "area": {
+      "id": "ce209e56-cda5-358e-96db-830e3405b675",
+      "name": "Thailand",
+      "sort-name": "Thailand",
+      "iso-3166-1-codes": [
+       "TH"
+      ]
+     }
+    },
+    {
+     "date": "2011-08-01",
+     "area": {
+      "id": "a2b8e506-3570-3a56-826e-939049c59428",
+      "name": "Tonga",
+      "sort-name": "Tonga",
+      "iso-3166-1-codes": [
+       "TO"
+      ]
+     }
+    },
+    {
+     "date": "2011-08-01",
+     "area": {
+      "id": "529117db-25de-3d09-9722-b54937a17590",
+      "name": "Tuvalu",
+      "sort-name": "Tuvalu",
+      "iso-3166-1-codes": [
+       "TV"
+      ]
+     }
+    },
+    {
+     "date": "2011-08-01",
+     "area": {
+      "id": "fe40c648-ba74-3e17-b768-58181d5ee563",
+      "name": "United Arab Emirates",
+      "sort-name": "United Arab Emirates",
+      "iso-3166-1-codes": [
+       "AE"
+      ]
+     }
+    },
+    {
+     "date": "2011-08-01",
+     "area": {
+      "id": "489ce91b-6658-3307-9877-795b68554c98",
+      "name": "United States",
+      "sort-name": "United States",
+      "iso-3166-1-codes": [
+       "US"
+      ]
+     }
+    },
+    {
+     "date": "2011-08-01",
+     "area": {
+      "id": "c2021af8-7645-3f38-aa1b-ada0a13d4faf",
+      "name": "Vanuatu",
+      "sort-name": "Vanuatu",
+      "iso-3166-1-codes": [
+       "VU"
+      ]
+     }
+    },
+    {
+     "date": "2011-08-01",
+     "area": {
+      "id": "0158e991-c3c6-374a-9b9d-024bbaff6980",
+      "name": "Vietnam",
+      "sort-name": "Vietnam",
+      "iso-3166-1-codes": [
+       "VN"
+      ]
+     }
+    },
+    {
+     "date": "2011-08-01",
+     "area": {
+      "id": "e8e9ecdc-19d3-360b-8f1a-9c80e6c12830",
+      "name": "Yemen",
+      "sort-name": "Yemen",
+      "iso-3166-1-codes": [
+       "YE"
+      ]
+     }
+    },
+    {
+     "date": "2011-08-01",
+     "area": {
+      "id": "7d24dd34-a00f-37a1-8307-f2ef1dd3dbcd",
+      "name": "Palestine",
+      "sort-name": "Palestine",
+      "iso-3166-1-codes": [
+       "PS"
+      ]
+     }
+    }
+   ],
+   "barcode": "886443108233",
+   "label-info": [
+    {
+     "label": {
+      "id": "011d1192-6f65-45bd-85c4-0400dd45693e",
+      "name": "Columbia"
+     }
+    },
+    {
+     "label": {
+      "id": "972a60b4-d280-465e-8812-c25836c00fcf",
+      "name": "Nickelodeon"
+     }
+    }
+   ],
+   "track-count": 12,
+   "media": [
+    {
+     "id": "b71389d6-200c-36d3-b24c-45505a530f41",
+     "format": "Digital Media",
+     "disc-count": 0,
+     "track-count": 12
+    }
+   ]
+  },
+  {
+   "id": "404e5e9c-6939-4c70-8301-14ec16982360",
+   "score": 100,
+   "status-id": "4e304316-386d-3409-af2e-78857eec5cfe",
+   "packaging-id": "ec27701a-4a22-37f4-bfac-6616e0f9750a",
+   "artist-credit-id": "2abe1a10-e175-3def-8101-fd596bdb2421",
+   "count": 1,
+   "title": "Victorious: Music from the Hit TV Show",
+   "status": "Official",
+   "packaging": "Jewel Case",
+   "text-representation": {
+    "language": "eng",
+    "script": "Latn"
+   },
+   "artist-credit": [
+    {
+     "name": "Victorious Cast",
+     "artist": {
+      "id": "19c682b6-31cc-41fa-bf6e-1796f2a1e778",
+      "name": "Victorious Cast",
+      "sort-name": "Victorious Cast"
+     }
+    }
+   ],
+   "release-group": {
+    "id": "17278767-3c89-4c6c-8d56-b835e5eb6ffa",
+    "type-id": "22a628ad-c082-3c4f-b1b6-d41665107b88",
+    "primary-type-id": "f529b476-6e62-324f-b0aa-1f3e33d313fc",
+    "title": "Victorious: Music from the Hit TV Show",
+    "primary-type": "Album",
+    "secondary-types": [
+     "Soundtrack"
+    ],
+    "secondary-type-ids": [
+     "22a628ad-c082-3c4f-b1b6-d41665107b88"
+    ]
+   },
+   "date": "2011-08-02",
+   "country": "JP",
+   "release-events": [
+    {
+     "date": "2011-08-02",
+     "area": {
+      "id": "2db42837-c832-3c27-b4a3-08198f75693c",
+      "name": "Japan",
+      "sort-name": "Japan",
+      "iso-3166-1-codes": [
+       "JP"
+      ]
+     }
+    }
+   ],
+   "barcode": "4547366186871",
+   "label-info": [
+    {
+     "catalog-number": "SICP-3696",
+     "label": {
+      "id": "c9a4ea86-7611-4fff-9f4f-41f18be7e14b",
+      "name": "Sony Records International"
+     }
+    }
+   ],
+   "track-count": 12,
+   "media": [
+    {
+     "id": "734e4230-981c-3fec-8720-841a71779a9a",
+     "format": "CD",
+     "disc-count": 0,
+     "track-count": 12
+    }
+   ]
+  }
+ ]
+}

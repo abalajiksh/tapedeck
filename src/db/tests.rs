@@ -11562,3 +11562,258 @@ fn credit_mbids_attach_only_when_the_lists_line_up() {
         ]
     );
 }
+
+/// The Victorious case end to end, on MusicBrainz's real answers (captured
+/// 2026-11-04): Spotify sent "Victorious Cast" with the singers in the title
+/// and no recording MBID. The album lookup finds the recordings through the
+/// cast's release; the credits pass then credits the singers, keeps the cast
+/// last, and files the album under the cast.
+#[tokio::test]
+async fn a_cast_album_is_found_through_its_release_and_credits_its_singers() {
+    use crate::musicbrainz::{parse_recording_credits, parse_release_tracks, RecordingCredits};
+    let db = testdb().await;
+    let uid = db.create_user("vic", None, "x", "user").await.unwrap();
+    let album = "Victorious: Music From The Hit TV Show (feat. Victoria Justice)";
+    let vj = "4ce94c22-acbc-4535-a0e4-b8a8d002887e";
+    let mut give =
+        play("Give It Up (feat. Elizabeth Gillies & Ariana Grande)", "Victorious Cast", 10_000);
+    give.album = Some(album.into());
+    let mut freak = play("Freak The Freak Out (feat. Victoria Justice)", "Victorious Cast", 20_000);
+    freak.album = Some(album.into());
+    freak.mbid_artist = Some(vec![vj.into()]);
+    let mut stray = play("A Song Not On It", "Victorious Cast", 30_000);
+    stray.album = Some(album.into());
+    for p in [&give, &freak, &stray] {
+        db.save_scrobble(uid, p, None, None, None, None, None, None, None, ListenDisposition::LIVE)
+            .await
+            .unwrap();
+    }
+
+    assert_eq!(
+        db.albums_needing_lookup(10).await.unwrap(),
+        vec![("Victorious Cast".to_string(), album.to_string())]
+    );
+    let release: serde_json::Value =
+        serde_json::from_str(include_str!("../fixtures/mb_release_victorious_bh.json")).unwrap();
+    let release = parse_release_tracks(&release);
+    let titles = db.album_lookup_titles("Victorious Cast", album).await.unwrap();
+    assert_eq!(crate::db::tracks_matched(&titles, &release), 2);
+    assert_eq!(
+        db.apply_album_lookup("Victorious Cast", album, Some(&release)).await.unwrap(),
+        (2, 1)
+    );
+    assert!(db.albums_needing_lookup(10).await.unwrap().is_empty(), "nothing asked twice");
+
+    // The release filed the album under the cast, by its title with the
+    // "(feat. …)" aside.
+    let filed: Vec<(String, Option<String>, Option<String>, Option<String>)> = sqlx::query_as(
+        "SELECT title, album_filed_under, credit_source, mbid_release_group FROM scrobbles ORDER BY timestamp",
+    )
+    .fetch_all(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(filed[0].1.as_deref(), Some("Victorious Cast"));
+    assert_eq!(filed[0].2.as_deref(), Some("album-matched"));
+    assert_eq!(filed[0].3.as_deref(), Some("17278767-3c89-4c6c-8d56-b835e5eb6ffa"));
+    assert_eq!(filed[2].2.as_deref(), Some("album-miss"));
+
+    // The credits pass.
+    let mut queued = db.recordings_needing_credits(10).await.unwrap();
+    queued.sort();
+    assert_eq!(queued.len(), 2);
+    let give_credits: serde_json::Value =
+        serde_json::from_str(include_str!("../fixtures/mb_recording_victorious_give_it_up.json"))
+            .unwrap();
+    let give_rec = release.tracks[6].recording.clone();
+    db.apply_recording_credits(&give_rec, &parse_recording_credits(&give_credits)).await.unwrap();
+    let freak_rec = release.tracks[1].recording.clone();
+    let freak_credits = RecordingCredits {
+        artists: vec![crate::musicbrainz::CreditedArtist {
+            name: "Victoria Justice".into(),
+            mbid: vj.into(),
+            join: String::new(),
+            credited_as: "Victoria Justice".into(),
+        }],
+        composers: vec![],
+    };
+    db.apply_recording_credits(&freak_rec, &freak_credits).await.unwrap();
+
+    let rows: Vec<(String, String, Option<String>, Option<String>, Option<String>)> = sqlx::query_as(
+        "SELECT title, artist, artist_credit, album_filed_under, credit_source FROM scrobbles ORDER BY timestamp",
+    )
+    .fetch_all(&db.pool)
+    .await
+    .unwrap();
+    // MusicBrainz's canonical name; the recording credits her as "Elizabeth".
+    assert_eq!(rows[0].1, "Liz Gillies");
+    assert_eq!(rows[0].2.as_deref(), Some("Liz Gillies; Ariana Grande; Victorious Cast"));
+    assert_eq!(rows[0].3.as_deref(), Some("Victorious Cast"), "the album stays under the cast");
+    assert_eq!(rows[0].4.as_deref(), Some("musicbrainz-album"));
+    assert_eq!(rows[1].1, "Victoria Justice");
+    assert_eq!(rows[1].2.as_deref(), Some("Victoria Justice; Victorious Cast"));
+    assert_eq!(rows[2].1, "Victorious Cast", "the stray listen is left as it was");
+
+    // The cast is counted on both, and each singer on their own.
+    let credited: Vec<(String,)> =
+        sqlx::query_as("SELECT name FROM scrobble_artists WHERE artist_key = 'victorious cast'")
+            .fetch_all(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(credited.len(), 3);
+
+    // Switching the setting requeues them under the same provenance.
+    db.set_credit_primary(uid, "composer").await.unwrap();
+    let sources: Vec<(Option<String>,)> =
+        sqlx::query_as("SELECT credit_source FROM scrobbles ORDER BY timestamp")
+            .fetch_all(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(sources[0].0.as_deref(), Some("album-matched"));
+    assert_eq!(sources[1].0.as_deref(), Some("album-matched"));
+}
+
+/// A recording MBID from anywhere but the album lookup never takes the
+/// album-artist rule — a wrong ListenBrainz mapping is refused as before, even
+/// when the sent artist and the album artist agree.
+#[tokio::test]
+async fn the_album_artist_rule_never_rescues_a_mapped_recording() {
+    use crate::musicbrainz::{CreditedArtist, RecordingCredits};
+    let db = testdb().await;
+    let uid = db.create_user("map", None, "x", "user").await.unwrap();
+    let mut p = play("On Bended Knee", "Boyz II Men", 1_000);
+    p.album = Some("II".into());
+    p.album_artist = Some("Boyz II Men".into());
+    p.mbid_recording = Some("wrong-rec".into());
+    db.save_scrobble(uid, &p, None, None, None, None, None, None, None, ListenDisposition::LIVE)
+        .await
+        .unwrap();
+    let wrong = RecordingCredits {
+        artists: vec![CreditedArtist {
+            name: "An Orchestra".into(),
+            mbid: "orch".into(),
+            join: String::new(),
+            credited_as: "An Orchestra".into(),
+        }],
+        composers: vec![],
+    };
+    assert_eq!(db.apply_recording_credits("wrong-rec", &wrong).await.unwrap(), (0, 1));
+    let (artist, source): (String, Option<String>) =
+        sqlx::query_as("SELECT artist, credit_source FROM scrobbles")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!((artist.as_str(), source.as_deref()), ("Boyz II Men", Some("refused")));
+}
+
+/// Spellings only spacing and punctuation tell apart fold onto the most
+/// credited one, with or without MBIDs — "A. R. Rahman" charted at #81 beside
+/// "A.R. Rahman" at #10 (2026-11-04). Short acronyms and spellings whose MBIDs
+/// disagree are left apart.
+#[tokio::test]
+async fn spellings_apart_only_by_punctuation_fold() {
+    let db = testdb().await;
+    let uid = db.create_user("arr", None, "x", "user").await.unwrap();
+    let mut n = 0u64;
+    let mut save = |title: &str, artist: &str, mbid: Option<&str>| {
+        n += 1;
+        let mut p = play(title, artist, 1_000 + n * 1_000);
+        p.mbid_artist = mbid.map(|m| vec![m.to_string()]);
+        p
+    };
+    let plays = vec![
+        save("New York Nagaram", "A.R. Rahman", Some("rahman")),
+        save("Munbe Vaa", "A.R. Rahman", None),
+        save("Kilimanjaro", "A.R. Rahman", None),
+        save("Irumbile Oru Idhaiyam", "A. R. Rahman", None),
+        save("Mannipaaya", "A. R. Rahman", Some("rahman")),
+        save("Paper Planes", "M.I.A.", None),
+        save("Some Song", "Mia", None),
+        save("September", "Earth, Wind & Fire", None),
+        save("Let's Groove", "Earth, Wind & Fire", None),
+        save("Boogie Wonderland", "Earth Wind & Fire", None),
+        save("Thunderstruck", "AC/DC", None),
+        save("Highway to Hell", "ACDC", None),
+        save("Song A", "Jo Smith", Some("jo-1")),
+        save("Song B", "Jo Smith", Some("jo-1")),
+        save("Song C", "Jo-Smith", Some("jo-2")),
+    ];
+    for p in &plays {
+        db.save_scrobble(uid, p, None, None, None, None, None, None, None, ListenDisposition::LIVE)
+            .await
+            .unwrap();
+    }
+
+    db.unify_artist_spellings().await.unwrap();
+
+    let names: Vec<(String, i64)> = sqlx::query_as(
+        "SELECT name, COUNT(*) FROM scrobble_artists GROUP BY artist_key ORDER BY name",
+    )
+    .fetch_all(&db.pool)
+    .await
+    .unwrap();
+    let count = |name: &str| names.iter().find(|(n, _)| n == name).map(|(_, c)| *c);
+    assert_eq!(count("A.R. Rahman"), Some(5), "with and without MBIDs");
+    assert_eq!(count("A. R. Rahman"), None);
+    assert_eq!(count("Earth, Wind & Fire"), Some(3));
+    // Four letters: under the floor, so left to MusicBrainz like "M.I.A.".
+    assert_eq!((count("AC/DC"), count("ACDC")), (Some(1), Some(1)));
+    assert_eq!(count("M.I.A."), Some(1), "too short to fold on");
+    assert_eq!(count("Mia"), Some(1));
+    assert_eq!(count("Jo Smith"), Some(2), "different MBIDs stay apart");
+    assert_eq!(count("Jo-Smith"), Some(1));
+
+    // Both spellings open the one artist.
+    assert_eq!(
+        db.credited_spelling(uid, "A. R. Rahman").await.unwrap().as_deref(),
+        Some("A.R. Rahman")
+    );
+    // Folding twice changes nothing.
+    assert_eq!(db.unify_artist_spellings().await.unwrap(), 0);
+}
+
+/// An album MusicBrainz lacks is listed for its owner and can be queued for
+/// another lookup once someone adds it — a miss is otherwise never re-asked.
+#[tokio::test]
+async fn a_musicbrainz_miss_is_listed_and_can_be_asked_again() {
+    let db = testdb().await;
+    let me = db.create_user("ash", None, "x", "user").await.unwrap();
+    let other = db.create_user("kit", None, "x", "user").await.unwrap();
+    for (uid, t, ts) in
+        [(me, "Mandram Vandha", 1_000), (me, "Sundari", 2_000), (other, "Sundari", 3_000)]
+    {
+        let mut p = play(t, "Ilaiyaraaja", ts);
+        p.album = Some("Ilayaraja Love bites".into());
+        db.save_scrobble(
+            uid,
+            &p,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            ListenDisposition::LIVE,
+        )
+        .await
+        .unwrap();
+    }
+    assert_eq!(
+        db.apply_album_lookup("Ilaiyaraaja", "Ilayaraja Love bites", None).await.unwrap(),
+        (0, 3)
+    );
+
+    let misses = db.musicbrainz_misses(me).await.unwrap();
+    assert_eq!(misses.len(), 1);
+    assert_eq!(
+        (misses[0].0.as_str(), misses[0].1.as_str(), misses[0].2),
+        ("Ilaiyaraaja", "Ilayaraja Love bites", 2)
+    );
+    assert!(db.albums_needing_lookup(10).await.unwrap().is_empty());
+
+    // Only my listens go back on the queue.
+    assert_eq!(db.retry_album_lookup(me, "ilaiyaraaja", "ILAYARAJA LOVE BITES").await.unwrap(), 2);
+    assert!(db.musicbrainz_misses(me).await.unwrap().is_empty());
+    assert_eq!(db.musicbrainz_misses(other).await.unwrap().len(), 1);
+    assert_eq!(db.albums_needing_lookup(10).await.unwrap().len(), 1);
+}

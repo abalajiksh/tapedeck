@@ -921,8 +921,14 @@ pub async fn backfill_credits(
 ) -> usize {
     let mut credited = 0usize;
     let mut budget = mb_budget;
+    // **Shared, not first-come.** Recording credits take at most half the
+    // lookups and the release pass leaves two for the album-first lookup (one
+    // search and one tracklist): with ~47,000 credited-but-unasked recordings
+    // in the household history, a first-come budget starved the two queues
+    // behind it for days (2026-11-04). What one queue leaves unused flows on.
+    let album_reserve = 2.min(mb_budget);
     for mbid in db.recordings_needing_credits(batch).await.unwrap_or_default() {
-        if budget <= 0 {
+        if budget <= mb_budget / 2 {
             break;
         }
         budget -= 1;
@@ -935,12 +941,67 @@ pub async fn backfill_credits(
     // The record's own credit and its release group, by release MBID — what an
     // album is filed under on a box set or a soundtrack.
     for mbid in db.releases_needing_info(batch).await.unwrap_or_default() {
-        if budget <= 0 {
+        if budget <= album_reserve {
             break;
         }
         budget -= 1;
         let Ok(info) = mb.fetch_release_info(&mbid).await else { continue };
         let _ = db.apply_release_info(&mbid, &info).await;
+    }
+
+    // Album-first: listens with no recording MBID at all, found through the
+    // release that carries the name the source sent. A search, then up to
+    // three exact-score editions of that title, keeping the one whose
+    // tracklist matches most of the listens; the next pass credits them.
+    for (artist, album) in db.albums_needing_lookup(batch.min(3)).await.unwrap_or_default() {
+        if budget < 2 {
+            break;
+        }
+        budget -= 1;
+        let wanted = crate::db::normalise_artist(crate::db::strip_featuring(&album));
+        let Ok(hits) = mb.search_releases(crate::db::strip_featuring(&album), &artist).await else {
+            continue;
+        };
+        let titles = db.album_lookup_titles(&artist, &album).await.unwrap_or_default();
+        let editions: Vec<_> = hits
+            .into_iter()
+            .filter(|h| {
+                h.score >= 100
+                    && crate::db::normalise_artist(crate::db::strip_featuring(&h.title)) == wanted
+            })
+            .take(3)
+            .collect();
+        let mut best: Option<(usize, crate::musicbrainz::ReleaseTracks)> = None;
+        let mut asked_all = true;
+        for hit in &editions {
+            if budget <= 0 {
+                asked_all = false;
+                break;
+            }
+            budget -= 1;
+            let Ok(release) = mb.fetch_release_tracks(&hit.id).await else {
+                asked_all = false;
+                continue;
+            };
+            let n = crate::db::tracks_matched(&titles, &release);
+            let whole = n == titles.len();
+            if n > best.as_ref().map_or(0, |b| b.0) {
+                best = Some((n, release));
+            }
+            if whole {
+                break;
+            }
+        }
+        // A miss is only recorded once every candidate was actually asked:
+        // a failed request or a spent budget leaves the album queued.
+        if best.is_some() || asked_all {
+            let found = best.map(|b| b.1);
+            if let Ok((matched, _)) = db.apply_album_lookup(&artist, &album, found.as_ref()).await {
+                if matched > 0 {
+                    debug!("💿 Found {matched} listens of \"{album}\" through its release");
+                }
+            }
+        }
     }
 
     // Cheap — one grouped read of the credits table — but not free, so not
