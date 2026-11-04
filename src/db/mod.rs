@@ -326,6 +326,9 @@ pub struct BindingRow {
     pub interface: Option<String>,
     /// Null for one seen but not mapped yet — offered for one-tap assignment.
     pub chain_id: Option<i64>,
+    /// Which setup (variant) of that chain listens through this output get.
+    /// Null is the chain as wired.
+    pub chain_variant_id: Option<i64>,
     /// Unix seconds.
     pub last_seen: i64,
     /// Listens that reported it.

@@ -577,6 +577,10 @@ pub struct DryRunListen {
     // The score `AudioQuality::compute_score` derives from the submitted fields.
     pub quality_score: Option<f64>,
     pub chain_id: Option<i64>,
+    /// The setup (variant) of that chain the listen would be saved with. Set
+    /// only when `chain_source` is `output_binding` and that output was mapped
+    /// to a setup.
+    pub chain_variant_id: Option<i64>,
     pub chain_name: Option<String>,
     /// **Which rung of the ladder won:** `explicit`, `output_binding`,
     /// `token_default`, `device_default` or `none`. The single most useful

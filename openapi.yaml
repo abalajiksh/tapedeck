@@ -82,7 +82,7 @@ info:
   license:
     name: AGPL-3.0-or-later
     identifier: AGPL-3.0-or-later
-  version: 0.126.7
+  version: 0.127.0
 servers:
 - url: /
   description: The Tapedeck instance serving this document.
@@ -5152,8 +5152,12 @@ paths:
     put:
       tags:
       - Chains
-      summary: Bind an output device name to a chain.
-      description: Session-only.
+      summary: Bind an output device name to a chain, and to a setup of it.
+      description: |-
+        Session-only. Rung 2 of the chain ladder, and the only rung that also
+        names a setup: listens through this output are saved with
+        `chain_variant_id`, so their hours land on the gear that setup fits.
+        Sending a chain always rewrites the setup.
       operationId: set_binding
       requestBody:
         content:
@@ -5169,7 +5173,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/Ok'
         '400':
-          description: '`chain_id` absent, or not one of your chains.'
+          description: '`chain_id` absent, not one of your chains, or `chain_variant_id` not a setup of it.'
           content:
             application/json:
               schema:
@@ -13059,6 +13063,14 @@ components:
           - 'null'
           format: int64
           description: Null for one seen but not mapped yet — offered for one-tap assignment.
+        chain_variant_id:
+          type:
+          - integer
+          - 'null'
+          format: int64
+          description: |-
+            Which setup (variant) of that chain listens through this output get.
+            Null is the chain as wired.
         last_seen:
           type: integer
           format: int64
@@ -14604,6 +14616,15 @@ components:
           - integer
           - 'null'
           format: int64
+        chain_variant_id:
+          type:
+          - integer
+          - 'null'
+          format: int64
+          description: |-
+            The setup (variant) of that chain the listen would be saved with. Set
+            only when `chain_source` is `output_binding` and that output was mapped
+            to a setup.
         chain_name:
           type:
           - string
@@ -22956,6 +22977,14 @@ components:
           description: |-
             The chain it maps to. **Required: `null` clears the mapping; absent is
             a 400.** Must be one of your chains.
+        chain_variant_id:
+          type:
+          - integer
+          - 'null'
+          format: int64
+          description: |-
+            Which setup (variant) of that chain this output carries. Absent or
+            `null` is the chain as wired. Must be a variant of `chain_id`.
     SetDeviceChainRequest:
       type: object
       required:

@@ -2379,8 +2379,8 @@ async fn chain_name_and_output_binding_resolve() {
     // auto-learn an output, unmapped resolves to None, then bind it
     db.record_output(uid, "Schiit Mimir", Some("usb")).await.unwrap();
     assert_eq!(db.resolve_binding(uid, "Schiit Mimir").await.unwrap(), None);
-    db.set_binding(uid, "Schiit Mimir", Some(cid)).await.unwrap();
-    assert_eq!(db.resolve_binding(uid, "Schiit Mimir").await.unwrap(), Some(cid));
+    db.set_binding(uid, "Schiit Mimir", Some(cid), None).await.unwrap();
+    assert_eq!(db.resolve_binding(uid, "Schiit Mimir").await.unwrap(), Some((cid, None)));
 }
 
 #[tokio::test]
@@ -11816,4 +11816,91 @@ async fn a_musicbrainz_miss_is_listed_and_can_be_asked_again() {
     assert!(db.musicbrainz_misses(me).await.unwrap().is_empty());
     assert_eq!(db.musicbrainz_misses(other).await.unwrap().len(), 1);
     assert_eq!(db.albums_needing_lookup(10).await.unwrap().len(), 1);
+}
+
+/// An output carries a setup, not only a chain — and the setup stays true to
+/// the gear through every operation that rewrites variants.
+///
+/// The signal-chain rework (v0.127.0): a dongle the Hexa is always plugged
+/// into is "Commute Phone with the Hexa in", and saying only "Commute Phone"
+/// credited the HD 569 for every listen through it.
+#[tokio::test]
+async fn an_output_bound_to_a_setup_keeps_naming_the_gear_it_names() {
+    let db = testdb().await;
+    let uid = db.create_user("ash", None, "pw", "user").await.unwrap();
+
+    let phone = db.upsert_equipment(uid, "Xperia", "dap", None, None, 0.0, None).await.unwrap();
+    let hd569 =
+        db.upsert_equipment(uid, "HD 569", "headphones", None, None, 0.0, None).await.unwrap();
+    let hexa = db.upsert_equipment(uid, "Hexa", "iem", None, None, 0.0, None).await.unwrap();
+    let commute =
+        chain_of(&db, uid, "Commute Phone", &[("Xperia", phone), ("HD 569", hd569)]).await;
+    let desk = chain_of(&db, uid, "Desk", &[("Xperia", phone)]).await;
+    let summer = db
+        .create_variant(
+            uid,
+            commute,
+            "Summer",
+            &[VariantOverride { position: 1, equipment_id: Some(hexa), name: Some("Hexa".into()) }],
+        )
+        .await
+        .unwrap();
+
+    db.record_output(uid, "Moondrop dongle", Some("usb")).await.unwrap();
+    db.set_binding(uid, "Moondrop dongle", Some(commute), Some(summer)).await.unwrap();
+    assert_eq!(
+        db.resolve_binding(uid, "Moondrop dongle").await.unwrap(),
+        Some((commute, Some(summer))),
+        "the setup comes back with the chain"
+    );
+    let row = db.list_bindings(uid).await.unwrap().into_iter().next().unwrap();
+    assert_eq!(row.chain_variant_id, Some(summer), "and the list shows it");
+
+    // Clearing the chain clears the setup, whatever the caller sent.
+    db.set_binding(uid, "Moondrop dongle", None, Some(summer)).await.unwrap();
+    assert_eq!(db.resolve_binding(uid, "Moondrop dongle").await.unwrap(), None);
+    let row = db.list_bindings(uid).await.unwrap().into_iter().next().unwrap();
+    assert_eq!(row.chain_variant_id, None, "no setup is left behind without its chain");
+
+    // Promoting the setup makes it the chain: the output now carries the
+    // chain as wired, which *is* the Hexa — still the same gear.
+    db.set_binding(uid, "Moondrop dongle", Some(commute), Some(summer)).await.unwrap();
+    db.record_output(uid, "Laptop jack", None).await.unwrap();
+    db.set_binding(uid, "Laptop jack", Some(commute), None).await.unwrap();
+    let old_base = db.promote_variant(uid, summer, "HD 569").await.unwrap();
+    assert_eq!(
+        db.resolve_binding(uid, "Moondrop dongle").await.unwrap(),
+        Some((commute, None)),
+        "the promoted setup is the chain now"
+    );
+    assert_eq!(
+        db.resolve_binding(uid, "Laptop jack").await.unwrap(),
+        Some((commute, Some(old_base))),
+        "the output on the old wiring follows it into its new setup"
+    );
+
+    // Deleting a setup leaves the output on the chain as wired.
+    assert!(db.delete_variant(uid, old_base).await.unwrap());
+    assert_eq!(db.resolve_binding(uid, "Laptop jack").await.unwrap(), Some((commute, None)));
+
+    // Folding a chain in as a setup moves its outputs onto that setup.
+    db.record_output(uid, "Desk DAC", None).await.unwrap();
+    db.set_binding(uid, "Desk DAC", Some(desk), None).await.unwrap();
+    let out = db
+        .fold_chain_into_variant(uid, desk, commute, FoldTarget::New("Desk"))
+        .await
+        .unwrap()
+        .expect("the fold is allowed");
+    assert_eq!(out.bindings, 1);
+    assert_eq!(
+        db.resolve_binding(uid, "Desk DAC").await.unwrap(),
+        Some((commute, Some(out.variant_id))),
+        "the folded chain's output lands on the setup it became"
+    );
+
+    // Deleting the chain lets go of the setup and the chain both.
+    assert!(db.delete_chain(uid, commute).await.unwrap());
+    assert_eq!(db.resolve_binding(uid, "Desk DAC").await.unwrap(), None);
+    let rows = db.list_bindings(uid).await.unwrap();
+    assert!(rows.iter().all(|b| b.chain_id.is_none() && b.chain_variant_id.is_none()));
 }

@@ -133,7 +133,7 @@
 			scrobbles = [];
 			if (open) scrobbles = (await api.getSession(session.id)).scrobbles;
 			dispatch('changed');
-		} catch (e) { alert('Failed to set the variant: ' + e); }
+		} catch (e) { alert('Failed to set the setup: ' + e); }
 		busy = false;
 	}
 
@@ -219,8 +219,8 @@
 					<select class="input" style="width:auto;min-width:150px;font-size:12.5px;"
 						value={session.chain_variant_id ?? ''} disabled={busy}
 						on:change={(e) => setVariant(e.currentTarget.value)}
-						aria-label="Which variant of that chain">
-						<option value="">— as the chain is —</option>
+						aria-label="Which setup of that chain">
+						<option value="">— as wired —</option>
 						{#each ownVariants as v}<option value={v.id}>{v.name}</option>{/each}
 					</select>
 				{/if}

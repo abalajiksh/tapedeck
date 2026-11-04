@@ -1096,11 +1096,22 @@ pub struct SetBindingRequest {
     #[serde(default, deserialize_with = "deserialize_some")]
     #[schema(value_type = Option<i64>, required = true)]
     pub chain_id: Option<Option<i64>>,
+    /// Which setup (variant) of that chain this output carries. Absent or
+    /// `null` is the chain as wired. Must be a variant of `chain_id`.
+    // A plain `Option` on purpose, unlike `chain_id`: the variant is always
+    // rewritten along with the chain — a variant left over from the previous
+    // chain would pair listens with gear never fitted together — so absent and
+    // null mean the same thing here, as they do on a session.
+    #[serde(default)]
+    pub chain_variant_id: Option<i64>,
 }
 
-/// Bind an output device name to a chain.
+/// Bind an output device name to a chain, and to a setup of it.
 ///
-/// Session-only.
+/// Session-only. Rung 2 of the chain ladder, and the only rung that also
+/// names a setup: listens through this output are saved with
+/// `chain_variant_id`, so their hours land on the gear that setup fits.
+/// Sending a chain always rewrites the setup.
 #[utoipa::path(
     put,
     path = "/api/v1/bindings",
@@ -1108,7 +1119,7 @@ pub struct SetBindingRequest {
     request_body = SetBindingRequest,
     responses(
         (status = 200, description = "Saved. `status` is `ok`.", body = OkResponse),
-        (status = 400, description = "`chain_id` absent, or not one of your chains.", body = ErrorResponse),
+        (status = 400, description = "`chain_id` absent, not one of your chains, or `chain_variant_id` not a setup of it.", body = ErrorResponse),
         (status = 401, response = Unauthorized),
     )
 )]
@@ -1131,7 +1142,24 @@ async fn set_binding(
             Err(e) => return internal(e),
         }
     }
-    match state.db.set_binding(user.user_id, &body.identifier, chain_id).await {
+    // A setup only means anything on its own chain — `variant_fits_chain`
+    // checks both that and ownership. A setup with no chain is refused rather
+    // than quietly dropped, since it is a request that cannot be what was meant.
+    if let Some(vid) = body.chain_variant_id {
+        let Some(cid) = chain_id else {
+            return bad("A setup needs its chain — send chain_id too");
+        };
+        match state.db.variant_fits_chain(user.user_id, vid, cid).await {
+            Ok(true) => {}
+            Ok(false) => return bad("That setup isn't one of that chain's"),
+            Err(e) => return internal(e),
+        }
+    }
+    match state
+        .db
+        .set_binding(user.user_id, &body.identifier, chain_id, body.chain_variant_id)
+        .await
+    {
         Ok(()) => (StatusCode::OK, OkResponse::new("ok")).into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,

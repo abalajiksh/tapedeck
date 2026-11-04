@@ -207,7 +207,9 @@ impl Database {
     /// a foreign-key violation, the same trap `delete_chain` documents.
     pub async fn delete_variant(&self, user_id: i64, id: i64) -> Result<bool, sqlx::Error> {
         let mut tx = self.pool.begin().await?;
-        for table in ["scrobbles", "physical_plays", "physical_releases"] {
+        // An output mapped to this setup keeps its chain and falls back to the
+        // chain as wired, like the listens.
+        for table in ["scrobbles", "physical_plays", "physical_releases", "chain_bindings"] {
             sqlx::query(&crate::sql!(&format!(
                 "UPDATE {table} SET chain_variant_id = NULL
                   WHERE chain_variant_id = ? AND user_id = ?"
@@ -283,9 +285,12 @@ impl Database {
     /// * **Sessions carry no variant**, by design: a session's variant is read
     ///   off its listens, so moving the listens moves it and the two cannot
     ///   disagree.
-    /// * **A device default, a token default and a binding carry no variant
-    ///   either** — they are standing statements about a *chain*, and there is
-    ///   no slot for which stylus is in the headshell. They follow the chain.
+    /// * **A device default and a token default carry no variant either** —
+    ///   they are standing statements about a *chain*, with no slot for which
+    ///   stylus is in the headshell. They follow the chain. **A binding does
+    ///   carry one** (since the signal-chain rework): the folded chain's
+    ///   outputs ran through exactly the gear the new variant describes, so
+    ///   they land on it, the same as its listens.
     ///
     /// Not reversible. The caller says so before running it.
     pub async fn fold_chain_into_variant(
@@ -395,11 +400,13 @@ impl Database {
         };
 
         // The listening, which is the whole point: chain *and* variant, so the
-        // hours resolve against the gear that was fitted.
+        // hours resolve against the gear that was fitted. Outputs go the same
+        // way, so the next listen through one lands where the old ones did.
         for (table, slot) in [
             ("scrobbles", &mut out.listens),
             ("physical_plays", &mut out.sides),
             ("physical_releases", &mut out.releases),
+            ("chain_bindings", &mut out.bindings),
         ] {
             let res = sqlx::query(&crate::sql!(&format!(
                 "UPDATE {table} SET chain_id = ?, chain_variant_id = ?
@@ -419,7 +426,6 @@ impl Database {
         for (table, column, slot) in [
             ("sessions", "chain_id", &mut out.sessions),
             ("devices", "default_chain_id", &mut out.devices),
-            ("chain_bindings", "chain_id", &mut out.bindings),
             ("tokens", "default_chain_id", &mut out.tokens),
         ] {
             let res = sqlx::query(&crate::sql!(&format!(
