@@ -681,14 +681,17 @@ impl Database {
         user_id: i64,
         limit: i64,
     ) -> Result<Vec<String>, sqlx::Error> {
+        // Over the credits, so the artists the charts actually show — featured
+        // artists and soloists included — are the ones that get a portrait.
         let rows: Vec<(String,)> = sqlx::query_as(&crate::sql!(&format!(
-            "SELECT s.artist FROM scrobbles s
-              LEFT JOIN artists a ON a.name_key = LOWER(TRIM(s.artist))
+            "SELECT MAX(sa.name) FROM scrobble_artists sa
+               JOIN scrobbles s ON s.id = sa.scrobble_id
+              LEFT JOIN artists a ON a.name_key = sa.artist_key
               WHERE s.user_id = ? AND s.skipped = FALSE
-                AND TRIM(s.artist) != ''
-                AND LOWER(TRIM(s.artist)) {NOT_VARIOUS}
+                AND TRIM(sa.name) != ''
+                AND sa.artist_key {NOT_VARIOUS}
                 AND (a.image_url IS NULL)
-              GROUP BY LOWER(TRIM(s.artist))
+              GROUP BY sa.artist_key
               ORDER BY COUNT(*) DESC
               LIMIT ?"
         )))

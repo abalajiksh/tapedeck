@@ -125,7 +125,8 @@ impl Database {
         // is exactly the v0.59.0 regression.
         speed!(
             "CREATE INDEX IF NOT EXISTS idx_scrobbles_album_release
-                 ON scrobbles(user_id, LOWER(TRIM(artist)), LOWER(TRIM(album)), mbid_release)
+                 ON scrobbles(user_id, LOWER(TRIM(COALESCE(album_filed_under, artist))),
+                              LOWER(TRIM(album)), mbid_release)
                 WHERE mbid_release IS NOT NULL AND TRIM(mbid_release) != ''"
         );
 
@@ -248,6 +249,11 @@ impl Database {
                 -- and that answer cannot differ between Last.fm and
                 -- ListenBrainz without meaning two different things at once.
                 forward_spool_listens INTEGER NOT NULL DEFAULT 0,
+                -- Which credited artist a listen is filed under when MusicBrainz
+                -- names both the performers and the work's composer:
+                -- 'performer' (the default) or 'composer'. Only reorders who
+                -- MusicBrainz credits; never adds or drops anyone.
+                credit_primary TEXT NOT NULL DEFAULT 'performer',
                 -- Which chain an accepted Shared Spool play is filed under —
                 -- the room you were in rather than a rig of your own.
                 --
@@ -421,7 +427,21 @@ impl Database {
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_id INTEGER NOT NULL DEFAULT 1,
                 title TEXT NOT NULL, artist TEXT NOT NULL, album TEXT,
-                artist_credit TEXT, artist_display TEXT,
+                artist_credit TEXT, artist_display TEXT, previous_artist_credit TEXT,
+                -- The record's artist by name, as the source or MusicBrainz's
+                -- release credit names it; NULL when nothing said.
+                album_artist TEXT,
+                -- Who the record this listen belongs to is filed under: the album
+                -- artist when anything named one, else the track's artist as
+                -- stored. Set once and moved only by a known album artist, so
+                -- re-crediting a track never moves its album. NULL on rows
+                -- written before it existed reads as `artist` (every album query
+                -- says `COALESCE(album_filed_under, artist)`).
+                album_filed_under TEXT,
+                -- Whether MusicBrainz's recording credit has been applied:
+                -- NULL not yet, 'musicbrainz' applied, 'refused' when its names
+                -- disagreed with the source's, 'none' when it credits no one.
+                credit_source TEXT,
                 timestamp INTEGER NOT NULL, duration INTEGER,
                 source_id TEXT NOT NULL, source_name TEXT NOT NULL,
                 status TEXT NOT NULL DEFAULT 'pending',

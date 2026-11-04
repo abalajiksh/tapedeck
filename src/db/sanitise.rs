@@ -24,7 +24,7 @@ impl Database {
         let row: Option<(String,)> = sqlx::query_as(&crate::sql!(
             "SELECT mbid_release
                FROM scrobbles
-              WHERE user_id = ? AND LOWER(TRIM(artist)) = LOWER(TRIM(?))
+              WHERE user_id = ? AND LOWER(TRIM(COALESCE(album_filed_under, artist))) = LOWER(TRIM(?))
                 AND LOWER(TRIM(album)) = LOWER(TRIM(?))
                 AND mbid_release IS NOT NULL AND TRIM(mbid_release) != ''
               GROUP BY mbid_release
@@ -49,11 +49,11 @@ impl Database {
         // because deciding whether a 4-of-29 plurality is trustworthy is
         // exactly the judgement being handed to the operator.
         let rows: Vec<(String, String, Option<String>, i64)> = sqlx::query_as(&crate::sql!(
-            "SELECT artist, album, mbid_release, COUNT(*) AS n
+            "SELECT MAX(COALESCE(album_filed_under, artist)), MAX(album), mbid_release, COUNT(*) AS n
                FROM scrobbles
               WHERE user_id = ? AND skipped = FALSE
                 AND album IS NOT NULL AND TRIM(album) != ''
-              GROUP BY LOWER(TRIM(artist)), LOWER(TRIM(album)), mbid_release
+              GROUP BY LOWER(TRIM(COALESCE(album_filed_under, artist))), LOWER(TRIM(album)), mbid_release
               ORDER BY n DESC"
         ))
         .bind(user_id)
@@ -112,7 +112,7 @@ impl Database {
             "UPDATE scrobbles
                 SET mbid_release = ?, artwork_url = NULL, caa_id = NULL, caa_release_mbid = NULL
               WHERE user_id = ?
-                AND LOWER(TRIM(artist)) = ? AND LOWER(TRIM(album)) = ?
+                AND LOWER(TRIM(COALESCE(album_filed_under, artist))) = ? AND LOWER(TRIM(album)) = ?
                 AND (mbid_release IS NULL OR mbid_release != ?)"
         ))
         .bind(mbid_release)
@@ -295,6 +295,12 @@ impl Database {
     /// there), which is what `get_pending_scrobbles` forwards — so a listen
     /// still waiting to go out reaches Last.fm as it always would have. The
     /// caller has already checked `names` (derived, or `credit_covers`).
+    ///
+    /// **Reversible.** The credit it replaces goes into `previous_artist_credit`
+    /// the first time a split touches the row — `''` when there was none, so
+    /// "never split" (NULL) and "had no credit" stay distinct. Undoing is
+    /// `artist = artist_display, artist_credit = NULLIF(previous_artist_credit,
+    /// '')` and rebuilding that row's `scrobble_artists`.
     pub async fn split_artist_credit(
         &self,
         user_id: i64,
@@ -318,6 +324,8 @@ impl Database {
             sqlx::query(&crate::sql!(
                 "UPDATE scrobbles
                     SET artist_display = COALESCE(artist_display, artist),
+                        previous_artist_credit =
+                            COALESCE(previous_artist_credit, COALESCE(artist_credit, '')),
                         artist = ?, artist_credit = ?
                   WHERE id = ?"
             ))
@@ -365,5 +373,5 @@ fn split_stored_credit(c: &str) -> Vec<String> {
 /// decides what is *shown*, never what is changed.
 fn looks_joined(artist: &str) -> bool {
     let a = artist.to_lowercase();
-    [", ", " & ", " x ", " and ", " + ", " vs. ", " vs "].iter().any(|j| a.contains(j))
+    [", ", " & ", " x ", " and ", " avec ", " + ", " vs. ", " vs "].iter().any(|j| a.contains(j))
 }

@@ -506,6 +506,7 @@ impl RoonSource {
             mbid_release_track: None,
             mbid_work: None,
             mbid_album_artist: None,
+            album_artist: None,
             artists: None,
             caa_id: None,
             caa_release_mbid: None,

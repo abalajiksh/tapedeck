@@ -147,6 +147,10 @@ pub struct AdditionalInfo {
     /// than a fallback for `artist_mbids`.
     #[serde(default, deserialize_with = "lenient_string_list")]
     pub album_artist_mbids: Option<Vec<String>>,
+    /// The record's artist by name, as ListenBrainz's archive importer and
+    /// several clients send it. A bad value costs the field, not the listen.
+    #[serde(default, deserialize_with = "lenient")]
+    pub release_artist_name: Option<String>,
 
     /// Everyone credited, where the client can separate them — the only
     /// structured way to say "Bach *and* Hilary Hahn". All of them are recorded

@@ -4,6 +4,7 @@
 	import { page } from '$app/stores';
 	import { api } from '$lib/api';
 	import { deck, watchNowPlaying } from '$lib/nowplaying';
+	import { creditedNames } from '$lib/credits';
 	import { initPrefs } from '$lib/prefs';
 	import { theme, initTheme, setTheme, type ThemeMode } from '$lib/theme';
 	import TapedeckLogo from '$lib/components/TapedeckLogo.svelte';
@@ -239,7 +240,7 @@
 						<span style="font-size:10px;letter-spacing:.14em;text-transform:uppercase;color:#c9a678;">Now Playing</span>
 					</div>
 					<div style="font-size:13.5px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">{$deck.track.title}</div>
-					<div style="font-size:12px;color:#b3a487;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">{$deck.track.artist}</div>
+					<div style="font-size:12px;color:#b3a487;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">{creditedNames($deck.track.artist, $deck.track.artist_credit).join(', ')}</div>
 				</a>
 			{/if}
 

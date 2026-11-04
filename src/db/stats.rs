@@ -107,7 +107,12 @@ pub struct TopAlbum {
 pub struct TopTrack {
     pub title: String,
     pub artist: String,
+    /// Everyone credited, `"; "`-joined and primary first, when there is more
+    /// than one. `artist` is the primary alone.
+    pub artist_credit: Option<String>,
     pub album: Option<String>,
+    /// Who `album` is filed under, which opens it.
+    pub album_artist: Option<String>,
     pub plays: i64,
     /// One decimal place.
     pub hours: f64,
@@ -275,10 +280,12 @@ impl Database {
 
         let album_rows: Vec<(String, String, i64, Option<i64>)> =
             sqlx::query_as(&crate::sql!(&format!(
-                "SELECT album, artist, COUNT(*) as plays, SUM(duration) as secs
+                "SELECT MAX(album), MAX(COALESCE(album_filed_under, artist)), COUNT(*) as plays,
+                    SUM(duration) as secs
              FROM scrobbles WHERE user_id = ? AND skipped = FALSE AND (? IS NULL OR timestamp >= ?)
                AND album IS NOT NULL AND album != ''
-             GROUP BY album, artist ORDER BY {} LIMIT 50",
+             GROUP BY LOWER(TRIM(album)), LOWER(TRIM(COALESCE(album_filed_under, artist)))
+             ORDER BY {} LIMIT 50",
                 order
             )))
             .bind(user_id)
@@ -299,11 +306,23 @@ impl Database {
         // Grouped case-insensitively on title+artist, like every other listing
         // query — the same song submitted as "Xtal" and "XTAL" by two clients is
         // one track, not two entries competing for the same slot.
-        let track_rows: Vec<(String, String, Option<String>, i64, Option<i64>)> = sqlx::query_as(&crate::sql!(&format!(            "SELECT title, artist, MAX(album) AS album, COUNT(*) as plays, SUM(duration) as secs
+        #[allow(clippy::type_complexity)]
+        let track_rows: Vec<(
+            String,
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            i64,
+            Option<i64>,
+        )> = sqlx::query_as(&crate::sql!(&format!(
+            "SELECT title, artist, MAX(artist_credit) AS artist_credit, MAX(album) AS album,
+                    MAX(COALESCE(album_filed_under, artist)) AS album_artist,
+                    COUNT(*) as plays, SUM(duration) as secs
              FROM scrobbles WHERE user_id = ? AND skipped = FALSE AND (? IS NULL OR timestamp >= ?)
              GROUP BY LOWER(TRIM(title)), LOWER(TRIM(artist)) ORDER BY {} LIMIT 50",
-                order
-            ),))
+            order
+        ),))
         .bind(user_id)
         .bind(after)
         .bind(after)
@@ -311,10 +330,12 @@ impl Database {
         .await?;
         let top_tracks: Vec<TopTrack> = track_rows
             .into_iter()
-            .map(|(title, artist, album, plays, secs)| TopTrack {
+            .map(|(title, artist, artist_credit, album, album_artist, plays, secs)| TopTrack {
                 title,
                 artist,
+                artist_credit,
                 album,
+                album_artist,
                 plays,
                 hours: (secs.unwrap_or(0) as f64 / 3600.0 * 10.0).round() / 10.0,
             })

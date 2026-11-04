@@ -1528,7 +1528,7 @@ impl ScrobbleEngine {
 
         // Named so a skipped round can say what it skipped. The order is the
         // one they were written in; `backfill_cursor` decides where it starts.
-        const PASSES: usize = 8;
+        const PASSES: usize = 9;
         let mut ran = 0usize;
 
         for step in 0..PASSES {
@@ -1627,6 +1627,13 @@ impl ScrobbleEngine {
                             8,
                         )
                         .await;
+                    }
+
+                    // Who MusicBrainz credits on each recording — the full credit
+                    // the search behind `enrich_play` keeps only the first artist
+                    // of — applied to every listen that knows its recording.
+                    7 => {
+                        crate::enrich::backfill_credits(&self.db, &self.mb_client, 25, 8).await;
                     }
 
                     _ => self.backfill_artist_images().await,

@@ -3,6 +3,7 @@
 	import { api, type RangedStats, type StatsRange, type Personality } from '$lib/api';
 	import CoverArt from '$lib/components/CoverArt.svelte';
 	import BarChart from '$lib/components/BarChart.svelte';
+	import ArtistLinks from '$lib/components/ArtistLinks.svelte';
 	import { openAlbum, openArtist } from '$lib/entities';
 	import { fidelity, fidelityLabel } from '$lib/fidelity';
 
@@ -40,8 +41,8 @@
 	/** There is no track page, so a track opens the record it's on — which is
 	 *  where its play count sits in context. Without an album there's nothing to
 	 *  open, so it falls back to the listens themselves. */
-	function openTrack(t: { title: string; artist: string; album: string | null }) {
-		if (t.album) return openAlbum(t.artist, t.album);
+	function openTrack(t: { title: string; artist: string; album: string | null; album_artist?: string | null }) {
+		if (t.album) return openAlbum(t.album_artist ?? t.artist, t.album);
 		window.location.href = `/history?track=${encodeURIComponent(t.title)}`;
 	}
 	$: maxHeat = stats ? Math.max(1, ...stats.heatmap.flat()) : 1;
@@ -397,7 +398,7 @@
 						{@const v = metric === 'plays' ? t.plays : t.hours}
 						<button class="rank-row block" on:click={() => openTrack(t)} title={t.album ? `Open ${t.album}` : `Listens of ${t.title}`}>
 							<div class="rank-line">
-								<span class="rank-label"><span class="rank-n inline">{i + 1}</span><span class="rank-name">{t.title}</span><span class="rank-sub"> — {t.artist}</span></span>
+								<span class="rank-label"><span class="rank-n inline">{i + 1}</span><span class="rank-name">{t.title}</span><span class="rank-sub">{' — '}<ArtistLinks artist={t.artist} credit={t.artist_credit} nested /></span></span>
 								<span class="rank-val">{v}{unit}</span>
 							</div>
 							<div class="rank-track"><div style="width:{(v / maxTrack * 100).toFixed(0)}%;height:100%;background:linear-gradient(90deg,#b2622d,#e0a06a);border-radius:999px;"></div></div>

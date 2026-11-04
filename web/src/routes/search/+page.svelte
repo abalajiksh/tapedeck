@@ -4,6 +4,7 @@
 	import { api } from '$lib/api';
 	import type { SearchResults } from '$lib/api';
 	import { openAlbum, openArtist } from '$lib/entities';
+	import ArtistLinks from '$lib/components/ArtistLinks.svelte';
 
 	let q = '';
 	let results: SearchResults | null = null;
@@ -46,8 +47,8 @@
 	/** Same rule everywhere a track is listed: there is no track page, so it
 	 *  opens the record it's on, and only falls back to the raw listens when
 	 *  there's no album to open. */
-	function openTrack(t: { title: string; artist: string; album: string | null }) {
-		if (t.album) return openAlbum(t.artist, t.album);
+	function openTrack(t: { title: string; artist: string; album: string | null; album_artist?: string | null }) {
+		if (t.album) return openAlbum(t.album_artist ?? t.artist, t.album);
 		window.location.href = `/history?track=${encodeURIComponent(t.title)}`;
 	}
 
@@ -107,7 +108,7 @@
 		<div class="panel list">
 			{#each results.albums as al}
 				<button class="hit" on:click={() => openAlbum(al.artist, al.name)}>
-					<span class="name">{al.name}<span class="sub">&nbsp;— {al.artist}</span></span>
+					<span class="name">{al.name}<span class="sub">&nbsp;— <ArtistLinks artist={al.artist} names={al.credited} max={4} nested /></span></span>
 					<span class="count">{plays(al.plays)}</span>
 				</button>
 			{/each}
@@ -119,7 +120,7 @@
 		<div class="panel list">
 			{#each results.tracks as t}
 				<button class="hit" on:click={() => openTrack(t)}>
-					<span class="name">{t.title}<span class="sub">&nbsp;— {t.artist}{t.album ? ` · ${t.album}` : ''}</span></span>
+					<span class="name">{t.title}<span class="sub">&nbsp;— <ArtistLinks artist={t.artist} credit={t.artist_credit} max={4} nested />{t.album ? ` · ${t.album}` : ''}</span></span>
 					<span class="count">{plays(t.plays)}</span>
 				</button>
 			{/each}

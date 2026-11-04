@@ -822,6 +822,7 @@ impl MediaBrowserSource {
                 .as_ref()
                 .and_then(|p| p.musicbrainz_album_artist.clone())
                 .map(|id| vec![id]),
+            album_artist: item.album_artist.clone().filter(|a| !a.trim().is_empty()),
             caa_id: None,
             caa_release_mbid: None,
             isrc: None,

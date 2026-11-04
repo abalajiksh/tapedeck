@@ -41,6 +41,11 @@ pub struct Play {
     /// `mbid_artist` for the same reason `artist_credit` is kept apart from
     /// `artist`.
     pub mbid_album_artist: Option<Vec<String>>,
+    /// The record's artist by name — Plex's `grandparentTitle`, Navidrome's
+    /// and Jellyfin's album artist, MusicBrainz's release credit. What an album
+    /// is filed under, which on a soundtrack or a box set is not the track's
+    /// performer.
+    pub album_artist: Option<String>,
     pub caa_id: Option<i64>,
     pub caa_release_mbid: Option<String>,
     /// The recording's ISRC, when anything knew it. The only identifier that
@@ -74,6 +79,7 @@ impl Play {
             mbid_release_track: None,
             mbid_work: None,
             mbid_album_artist: None,
+            album_artist: None,
             caa_id: None,
             caa_release_mbid: None,
             isrc: None,

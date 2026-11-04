@@ -758,12 +758,17 @@ impl Database {
     /// codebase has now found four times, and in production it exhausted the
     /// connection pool and took the instance down. See the incident note in
     /// CLAUDE.md.
+    ///
+    /// Keyed by `artist_key` over the credits, like every artist count in
+    /// Patch, so a performer you both play is an overlap even when one of you
+    /// has them filed under a composer.
     async fn my_artist_plays(&self, user_id: i64) -> Result<HashMap<String, i64>, sqlx::Error> {
         let rows: Vec<(String, i64)> = sqlx::query_as(&crate::sql!(&format!(
-            "SELECT LOWER(TRIM(artist)), COUNT(*) FROM scrobbles
-              WHERE user_id = ? AND skipped = FALSE
-                AND LOWER(TRIM(artist)) {NOT_VARIOUS}
-              GROUP BY LOWER(TRIM(artist))"
+            "SELECT sa.artist_key, COUNT(*)
+               FROM scrobble_artists sa JOIN scrobbles s ON s.id = sa.scrobble_id
+              WHERE s.user_id = ? AND s.skipped = FALSE
+                AND sa.artist_key {NOT_VARIOUS}
+              GROUP BY sa.artist_key"
         )))
         .bind(user_id)
         .fetch_all(&self.pool)
@@ -791,17 +796,17 @@ impl Database {
         since: Option<i64>,
     ) -> Result<Vec<PatchArtist>, sqlx::Error> {
         let mut artists: Vec<PatchArtist> = sqlx::query_as(&crate::sql!(&format!(
-            "SELECT s.artist AS name, COUNT(*) AS plays, \
+            "SELECT MAX(sa.name) AS name, COUNT(*) AS plays, \
                     COUNT(DISTINCT s.user_id) AS decks, \
                     GROUP_CONCAT(DISTINCT u.username) AS who, \
                     MAX(s.timestamp) AS last_played, \
                     MIN(s.timestamp) AS first_played, 0 AS mine, \
                     NULL AS genre \
                {} AND (?2 IS NULL OR s.timestamp >= ?2) \
-                AND LOWER(TRIM(s.artist)) {NOT_VARIOUS} \
-            GROUP BY LOWER(TRIM(s.artist)) \
+                AND sa.artist_key {NOT_VARIOUS} \
+            GROUP BY sa.artist_key \
             ORDER BY plays DESC LIMIT ?3",
-            Self::PATCH_VISIBLE_LISTENS
+            Self::PATCH_VISIBLE_CREDITS
         )))
         .bind(user_id)
         .bind(since)
@@ -889,13 +894,14 @@ impl Database {
         // no index can serve it and it becomes a full scan of the viewer's
         // history *per artist of theirs*. See `my_artist_plays`.
         let theirs: Vec<(String, String)> = sqlx::query_as(&crate::sql!(&format!(
-            "SELECT s.artist, LOWER(TRIM(s.artist)) FROM scrobbles s
+            "SELECT MAX(sa.name), sa.artist_key FROM scrobbles s
+               JOIN scrobble_artists sa ON sa.scrobble_id = s.id
                JOIN users u ON u.id = s.user_id
                LEFT JOIN signal_chains c ON c.id = s.chain_id
               WHERE s.user_id = ? AND s.skipped = FALSE
                 AND (u.share_all_with_patched = 1 OR c.shared = 1)
-                AND LOWER(TRIM(s.artist)) {NOT_VARIOUS}
-              GROUP BY LOWER(TRIM(s.artist))
+                AND sa.artist_key {NOT_VARIOUS}
+              GROUP BY sa.artist_key
               ORDER BY COUNT(*) DESC"
         )))
         .bind(id)
@@ -1002,11 +1008,12 @@ impl Database {
 
         // Every deck's shared artists, in one pass over the shared listens.
         let shared: Vec<(i64, String, String, i64)> = sqlx::query_as(&crate::sql!(
-            "SELECT s.user_id, s.artist, LOWER(TRIM(s.artist)), COUNT(*) AS plays
+            "SELECT s.user_id, MAX(sa.name), sa.artist_key, COUNT(*) AS plays
                FROM scrobbles s
+               JOIN scrobble_artists sa ON sa.scrobble_id = s.id
                JOIN signal_chains c ON c.id = s.chain_id AND c.shared = 1
               WHERE s.skipped = FALSE
-              GROUP BY s.user_id, LOWER(TRIM(s.artist))
+              GROUP BY s.user_id, sa.artist_key
               ORDER BY plays DESC",
         ))
         .fetch_all(&self.pool)
@@ -1048,6 +1055,11 @@ impl Database {
         const SHARED: &str = "FROM scrobbles s \
              JOIN signal_chains c ON c.id = s.chain_id AND c.shared = 1 \
             WHERE s.skipped = FALSE";
+        // The same listens fanned out to their credits, for the artist counts.
+        const SHARED_CREDITS: &str = "FROM scrobbles s \
+             JOIN scrobble_artists sa ON sa.scrobble_id = s.id \
+             JOIN signal_chains c ON c.id = s.chain_id AND c.shared = 1 \
+            WHERE s.skipped = FALSE";
 
         let decks: i64 =
             sqlx::query_scalar(&crate::sql!("SELECT COUNT(*) FROM users WHERE disabled = 0"))
@@ -1077,21 +1089,21 @@ impl Database {
         .await?;
 
         let artists: Vec<PatchArtist> = sqlx::query_as(&crate::sql!(&format!(
-            "SELECT s.artist AS name, COUNT(*) AS plays, \
+            "SELECT MAX(sa.name) AS name, COUNT(*) AS plays, \
                     COUNT(DISTINCT s.user_id) AS decks, \
                     GROUP_CONCAT(DISTINCT (SELECT username FROM users WHERE id = s.user_id)) AS who, \
                     MAX(s.timestamp) AS last_played, \
                     MIN(s.timestamp) AS first_played, 0 AS mine, NULL AS genre \
-               {SHARED} AND s.timestamp >= ? \
-                AND LOWER(TRIM(s.artist)) {NOT_VARIOUS} \
-            GROUP BY LOWER(TRIM(s.artist)) ORDER BY plays DESC LIMIT 8"
+               {SHARED_CREDITS} AND s.timestamp >= ? \
+                AND sa.artist_key {NOT_VARIOUS} \
+            GROUP BY sa.artist_key ORDER BY plays DESC LIMIT 8"
         )))
         .bind(since)
         .fetch_all(&self.pool)
         .await?;
 
         let artists_heard: i64 = sqlx::query_scalar(&crate::sql!(&format!(
-            "SELECT COUNT(DISTINCT LOWER(TRIM(s.artist))) {SHARED} AND s.timestamp >= ?"
+            "SELECT COUNT(DISTINCT sa.artist_key) {SHARED_CREDITS} AND s.timestamp >= ?"
         )))
         .bind(since)
         .fetch_one(&self.pool)

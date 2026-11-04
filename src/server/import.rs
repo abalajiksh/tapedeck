@@ -207,6 +207,7 @@ fn play(
         mbid_release_track: None,
         mbid_work: None,
         mbid_album_artist: None,
+        album_artist: None,
         caa_id: None,
         caa_release_mbid: None,
         isrc: None,
@@ -715,11 +716,17 @@ async fn run_lastfm(
                 continue;
             }
             let album = t["album"]["#text"].as_str().filter(|s| !s.is_empty()).map(str::to_string);
-            let mbid = t["mbid"].as_str().filter(|s| !s.is_empty()).map(str::to_string);
-            let outcome = db
-                .import_listen(uid, &play(ts, title, artist, album, mbid))
-                .await
-                .map_err(|e| e.to_string())?;
+            let id_of = |v: &serde_json::Value| {
+                v.as_str().map(str::trim).filter(|s| !s.is_empty()).map(str::to_string)
+            };
+            let mbid = id_of(&t["mbid"]);
+            let mut p = play(ts, title, artist, album, mbid);
+            // Last.fm hands back the artist's and the album's MusicBrainz ids
+            // beside the track's; they were read and dropped. The album id is a
+            // release id.
+            p.mbid_artist = id_of(&t["artist"]["mbid"]).map(|m| vec![m]);
+            p.mbid_release = id_of(&t["album"]["mbid"]);
+            let outcome = db.import_listen(uid, &p).await.map_err(|e| e.to_string())?;
             update(reg, id, |j| {
                 j.fetched += 1;
                 if outcome == ImportOutcome::Enriched {
@@ -1098,6 +1105,7 @@ async fn run_scrobbler_log(
             mbid_release_track: None,
             mbid_work: None,
             mbid_album_artist: None,
+            album_artist: None,
             caa_id: None,
             caa_release_mbid: None,
             isrc: None,
@@ -1246,12 +1254,31 @@ fn listen_to_play(l: &serde_json::Value) -> Option<ImportedListen> {
             .or_else(|| str_of(&tm["mbid_recording"]))
             .or_else(|| str_of(&info["recording_mbid"])),
     );
+    // Every identifier the archive carries is kept, from the mapping first and
+    // the client's own `additional_info` after it: a field nothing reads yet
+    // is still the one lookup that never has to be made.
+    let ids = |v: &serde_json::Value| {
+        v.as_array()
+            .map(|a| a.iter().filter_map(|m| m.as_str().map(str::to_string)).collect::<Vec<_>>())
+            .filter(|v: &Vec<String>| !v.is_empty())
+    };
     p.mbid_release = str_of(&mapping["release_mbid"]).or_else(|| str_of(&info["release_mbid"]));
-    p.mbid_release_group = str_of(&mapping["release_group_mbid"]);
-    p.mbid_artist = mapping["artist_mbids"]
-        .as_array()
-        .map(|a| a.iter().filter_map(|m| m.as_str().map(str::to_string)).collect::<Vec<_>>())
-        .filter(|v: &Vec<String>| !v.is_empty());
+    p.mbid_release_group =
+        str_of(&mapping["release_group_mbid"]).or_else(|| str_of(&info["release_group_mbid"]));
+    // ListenBrainz calls the release-track id `track_mbid`.
+    p.mbid_release_track =
+        str_of(&info["track_mbid"]).or_else(|| str_of(&info["release_track_mbid"]));
+    p.mbid_work = ids(&info["work_mbids"])
+        .and_then(|w| w.into_iter().next())
+        .or_else(|| str_of(&info["work_mbid"]));
+    p.mbid_artist = ids(&mapping["artist_mbids"]).or_else(|| ids(&info["artist_mbids"]));
+    p.mbid_album_artist =
+        ids(&info["album_artist_mbids"]).or_else(|| ids(&info["release_artist_mbids"]));
+    p.isrc = str_of(&info["isrc"]).map(|s| s.trim().to_uppercase()).filter(|s| !s.is_empty());
+    p.album_artist = str_of(&info["release_artist_name"])
+        .or_else(|| str_of(&tm["release_artist_name"]))
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
     p.caa_id = mapping["caa_id"].as_i64();
     p.caa_release_mbid = str_of(&mapping["caa_release_mbid"]);
     p.duration = lenient_number(&info["duration_ms"])

@@ -6,7 +6,9 @@
 	import { deck, watchNowPlaying } from '$lib/nowplaying';
 	import { formatDuration, qualityLabel, tierTagClass, mediumLabel } from '$lib/utils';
 	import { loadLoves, lovedKeys, isLovedNamed, toggleLoveByName } from '$lib/loves';
-	import { openAlbum, openArtist } from '$lib/entities';
+	import { openAlbum } from '$lib/entities';
+	import { creditedNames } from '$lib/credits';
+	import ArtistLinks from '$lib/components/ArtistLinks.svelte';
 	import { fidelity, fidelityLabel } from '$lib/fidelity';
 	import LyricStrip from '$lib/components/LyricStrip.svelte';
 
@@ -96,6 +98,11 @@
 	// derived from names either way — so both cases work without caring which.
 	/** The template's `{#if hero.album}` doesn't narrow inside a click handler,
 	 *  and a listen without an album is normal — guard here instead. */
+	/** Who the hero's album is filed under: the listen's own filing, the
+	 *  source's album artist on the deck, else the primary artist. */
+	function heroAlbumArtist(h: { artist: string; artist_credit?: string | null; album_artist?: string | null; album_filed_under?: string | null }): string {
+		return h.album_filed_under?.trim() || h.album_artist?.trim() || (creditedNames(h.artist, h.artist_credit)[0] ?? h.artist);
+	}
 	function openAlbumOf(artist: string, album: string | null | undefined): void {
 		if (album) void openAlbum(artist, album);
 	}
@@ -195,7 +202,7 @@
 					</button>
 				</div>
 				<p style="margin:0 0 14px;color:var(--td-muted);font-size:15.5px;">
-					<button class="deck-link" on:click={() => hero && openArtist(hero.artist)}>{hero.artist}</button>{#if hero.album} — <button class="deck-link" on:click={() => hero && openAlbumOf(hero.artist, hero.album)}>{hero.album}</button>{/if}
+					<ArtistLinks artist={hero.artist} credit={hero.artist_credit} />{#if hero.album} — <button class="deck-link" on:click={() => hero && openAlbumOf(heroAlbumArtist(hero), hero.album)}>{hero.album}</button>{/if}
 				</p>
 
 				<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;{live ? 'margin-bottom:16px;' : ''}">

@@ -694,6 +694,29 @@ impl MusicBrainzClient {
                 language TEXT,          -- NULL/'' = looked up, none found
                 fetched_at INTEGER NOT NULL
             );
+
+            -- Who a recording credits, from the lookup endpoint (the search
+            -- keeps only the first artist). JSON `RecordingCredits`; an empty
+            -- list is a real answer and the tombstone, like the ISRC cache.
+            CREATE TABLE IF NOT EXISTS mb_credit_cache (
+                recording_mbid TEXT PRIMARY KEY,
+                credits TEXT NOT NULL,
+                fetched_at INTEGER NOT NULL
+            );
+
+            -- A release's own credit and its release group. JSON `ReleaseInfo`.
+            CREATE TABLE IF NOT EXISTS mb_release_cache (
+                release_mbid TEXT PRIMARY KEY,
+                info TEXT NOT NULL,
+                fetched_at INTEGER NOT NULL
+            );
+
+            -- An artist's canonical name and band membership. JSON `ArtistInfo`.
+            CREATE TABLE IF NOT EXISTS mb_artist_cache (
+                artist_mbid TEXT PRIMARY KEY,
+                info TEXT NOT NULL,
+                fetched_at INTEGER NOT NULL
+            );
             "#,
         )
         .await?;
@@ -834,6 +857,143 @@ impl MusicBrainzClient {
         Ok(isrcs)
     }
 
+    /// Everyone a recording credits, and the composers of the work it performs.
+    ///
+    /// The **lookup** endpoint, because `fetch_metadata`'s search keeps only the
+    /// first artist of the credit — which is how Loud fell off "Cœur de pirate
+    /// avec Loud". `artist-rels` is needed alongside `work-level-rels` or the
+    /// work comes back with its work-to-work links only and no composer.
+    ///
+    /// Cached by recording MBID, an empty answer included, so a track played
+    /// fifty times costs one request and a recording MusicBrainz no longer has
+    /// is not asked about forever. A failed request is an `Err` and caches
+    /// nothing.
+    pub async fn fetch_recording_credits(&self, recording_mbid: &str) -> Result<RecordingCredits> {
+        let cached: Option<(String,)> = sqlx::query_as(&crate::sql!(
+            "SELECT credits FROM mb_credit_cache WHERE recording_mbid = ?",
+        ))
+        .bind(recording_mbid)
+        .fetch_optional(&self.sqlite_pool)
+        .await
+        .unwrap_or(None);
+        if let Some((raw,)) = cached {
+            return Ok(serde_json::from_str(&raw).unwrap_or_default());
+        }
+
+        let url = format!(
+            "{}/recording/{}?inc=artist-credits+artist-rels+work-rels+work-level-rels&fmt=json",
+            self.config.api_base_url.trim_end_matches('/'),
+            recording_mbid
+        );
+        let resp = self.api_get(&url).await?;
+        let credits = if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            RecordingCredits::default()
+        } else if !resp.status().is_success() {
+            return Err(anyhow!("MusicBrainz API error: {}", resp.status()));
+        } else {
+            parse_recording_credits(&resp.json::<serde_json::Value>().await?)
+        };
+
+        let _ = sqlx::query(&crate::sql!(
+            "INSERT INTO mb_credit_cache (recording_mbid, credits, fetched_at)
+             VALUES (?, ?, ?)
+             ON CONFLICT (recording_mbid) DO UPDATE SET
+                credits = excluded.credits, fetched_at = excluded.fetched_at",
+        ))
+        .bind(recording_mbid)
+        .bind(serde_json::to_string(&credits).unwrap_or_else(|_| "{}".into()))
+        .bind(chrono::Utc::now().timestamp())
+        .execute(&self.sqlite_pool)
+        .await;
+        Ok(credits)
+    }
+
+    /// An artist's canonical name and the bands it is in or has as members.
+    /// Cached by artist MBID; same rules as [`Self::fetch_recording_credits`].
+    pub async fn fetch_artist(&self, artist_mbid: &str) -> Result<ArtistInfo> {
+        if let Some(info) = self.cached_artist(artist_mbid).await {
+            return Ok(info);
+        }
+        let url = format!(
+            "{}/artist/{}?inc=artist-rels&fmt=json",
+            self.config.api_base_url.trim_end_matches('/'),
+            artist_mbid
+        );
+        let resp = self.api_get(&url).await?;
+        let info = if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            ArtistInfo::default()
+        } else if !resp.status().is_success() {
+            return Err(anyhow!("MusicBrainz API error: {}", resp.status()));
+        } else {
+            parse_artist_info(&resp.json::<serde_json::Value>().await?)
+        };
+        let _ = sqlx::query(&crate::sql!(
+            "INSERT INTO mb_artist_cache (artist_mbid, info, fetched_at)
+             VALUES (?, ?, ?)
+             ON CONFLICT (artist_mbid) DO UPDATE SET
+                info = excluded.info, fetched_at = excluded.fetched_at",
+        ))
+        .bind(artist_mbid)
+        .bind(serde_json::to_string(&info).unwrap_or_else(|_| "{}".into()))
+        .bind(chrono::Utc::now().timestamp())
+        .execute(&self.sqlite_pool)
+        .await;
+        Ok(info)
+    }
+
+    /// Who a release is credited to, and its release group. Cached by release
+    /// MBID; same rules as [`Self::fetch_recording_credits`].
+    pub async fn fetch_release_info(&self, release_mbid: &str) -> Result<ReleaseInfo> {
+        let cached: Option<(String,)> = sqlx::query_as(&crate::sql!(
+            "SELECT info FROM mb_release_cache WHERE release_mbid = ?",
+        ))
+        .bind(release_mbid)
+        .fetch_optional(&self.sqlite_pool)
+        .await
+        .unwrap_or(None);
+        if let Some((raw,)) = cached {
+            return Ok(serde_json::from_str(&raw).unwrap_or_default());
+        }
+        let url = format!(
+            "{}/release/{}?inc=artist-credits+release-groups&fmt=json",
+            self.config.api_base_url.trim_end_matches('/'),
+            release_mbid
+        );
+        let resp = self.api_get(&url).await?;
+        let info = if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            ReleaseInfo::default()
+        } else if !resp.status().is_success() {
+            return Err(anyhow!("MusicBrainz API error: {}", resp.status()));
+        } else {
+            parse_release_info(&resp.json::<serde_json::Value>().await?)
+        };
+        let _ = sqlx::query(&crate::sql!(
+            "INSERT INTO mb_release_cache (release_mbid, info, fetched_at)
+             VALUES (?, ?, ?)
+             ON CONFLICT (release_mbid) DO UPDATE SET
+                info = excluded.info, fetched_at = excluded.fetched_at",
+        ))
+        .bind(release_mbid)
+        .bind(serde_json::to_string(&info).unwrap_or_else(|_| "{}".into()))
+        .bind(chrono::Utc::now().timestamp())
+        .execute(&self.sqlite_pool)
+        .await;
+        Ok(info)
+    }
+
+    /// The cached answer only — for a page, which must never wait on a
+    /// rate-limited service. `None` until a backfill has asked.
+    pub async fn cached_artist(&self, artist_mbid: &str) -> Option<ArtistInfo> {
+        let row: Option<(String,)> =
+            sqlx::query_as(&crate::sql!("SELECT info FROM mb_artist_cache WHERE artist_mbid = ?",))
+                .bind(artist_mbid)
+                .fetch_optional(&self.sqlite_pool)
+                .await
+                .ok()
+                .flatten();
+        row.and_then(|(raw,)| serde_json::from_str(&raw).ok())
+    }
+
     pub async fn fetch_recording_language(&self, recording_mbid: &str) -> Result<Option<String>> {
         let cached: Option<(Option<String>,)> = sqlx::query_as(&crate::sql!(
             "SELECT language FROM mb_language_cache WHERE recording_mbid = ?",
@@ -958,6 +1118,172 @@ struct PostgresMBRow {
     artist_name: String,
     release_gid: Option<String>,
     release_name: Option<String>,
+}
+
+/// One artist named in a recording's credit, under MusicBrainz's canonical
+/// name — not the credited-as spelling, so one artist is one name everywhere.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct CreditedArtist {
+    pub name: String,
+    pub mbid: String,
+    /// What MusicBrainz writes after this name: `" avec "`, `", "`, `" feat. "`.
+    #[serde(default)]
+    pub join: String,
+    /// The name as this recording credits it ("Oslo Philharmonic" where the
+    /// artist is "Oslo‐Filharmonien") — what a source's string will say.
+    #[serde(default)]
+    pub credited_as: String,
+}
+
+/// Who a recording credits, in MusicBrainz's order, and who wrote the work.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct RecordingCredits {
+    pub artists: Vec<CreditedArtist>,
+    /// Composers of the performed work (and of its parent work, for a
+    /// movement), first seen first. Kept apart from `artists`: MusicBrainz
+    /// credits a classical recording to its performers, and a composer is
+    /// credited on a listen only where the source named them too.
+    #[serde(default)]
+    pub composers: Vec<CreditedArtist>,
+}
+
+/// An artist's canonical name and band membership, from `artist?inc=artist-rels`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ArtistInfo {
+    pub name: String,
+    /// Bands this artist is a member of.
+    #[serde(default)]
+    pub member_of: Vec<CreditedArtist>,
+    /// This band's members.
+    #[serde(default)]
+    pub members: Vec<CreditedArtist>,
+}
+
+/// A release's own credit — who the record is by, which on a compilation or a
+/// box set is not who performs a given track — and its release group.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ReleaseInfo {
+    /// The release's own title, which a listen's album name has to match
+    /// before its credit may file the listen: a ListenBrainz mapping often
+    /// points a box-set track at the album it first came out on.
+    #[serde(default)]
+    pub title: String,
+    pub artists: Vec<CreditedArtist>,
+    #[serde(default)]
+    pub release_group: Option<String>,
+}
+
+impl ReleaseInfo {
+    /// The credit as MusicBrainz prints it: "Daft Punk", "Hilary Hahn, Oslo‐Filharmonien".
+    pub fn display(&self) -> String {
+        self.artists.iter().map(|a| format!("{}{}", a.credited_as, a.join)).collect()
+    }
+}
+
+/// Read a release lookup (`inc=artist-credits+release-groups`).
+pub fn parse_release_info(v: &serde_json::Value) -> ReleaseInfo {
+    let artists = v["artist-credit"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|c| {
+            let a = &c["artist"];
+            let name = a["name"].as_str().or_else(|| c["name"].as_str())?.to_string();
+            Some(CreditedArtist {
+                credited_as: c["name"].as_str().unwrap_or(&name).to_string(),
+                name,
+                mbid: a["id"].as_str()?.to_string(),
+                join: c["joinphrase"].as_str().unwrap_or("").to_string(),
+            })
+        })
+        .collect();
+    ReleaseInfo {
+        title: v["title"].as_str().unwrap_or("").to_string(),
+        artists,
+        release_group: v["release-group"]["id"].as_str().map(str::to_string),
+    }
+}
+
+/// Each related artist once, in order of first appearance — MusicBrainz lists a
+/// member twice when they left and rejoined, and a composer twice when they
+/// both wrote and revised the work.
+fn push_unique(out: &mut Vec<CreditedArtist>, name: &str, mbid: &str) {
+    if !mbid.is_empty() && !name.is_empty() && !out.iter().any(|a| a.mbid == mbid) {
+        out.push(CreditedArtist {
+            name: name.to_string(),
+            mbid: mbid.to_string(),
+            join: String::new(),
+            credited_as: name.to_string(),
+        });
+    }
+}
+
+/// Composers named on a work's own relations.
+fn composers_of(rels: &serde_json::Value, out: &mut Vec<CreditedArtist>) {
+    for r in rels.as_array().into_iter().flatten() {
+        if r["target-type"] == "artist" && r["type"] == "composer" {
+            push_unique(
+                out,
+                r["artist"]["name"].as_str().unwrap_or(""),
+                r["artist"]["id"].as_str().unwrap_or(""),
+            );
+        }
+    }
+}
+
+/// Read a recording lookup. Pure, so it is pinned against captured responses.
+pub fn parse_recording_credits(v: &serde_json::Value) -> RecordingCredits {
+    let artists = v["artist-credit"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|c| {
+            let a = &c["artist"];
+            let name = a["name"].as_str().or_else(|| c["name"].as_str())?.to_string();
+            Some(CreditedArtist {
+                credited_as: c["name"].as_str().unwrap_or(&name).to_string(),
+                name,
+                mbid: a["id"].as_str()?.to_string(),
+                join: c["joinphrase"].as_str().unwrap_or("").to_string(),
+            })
+        })
+        .collect();
+
+    let mut composers = Vec::new();
+    for rel in v["relations"].as_array().into_iter().flatten() {
+        if rel["target-type"] != "work" {
+            continue;
+        }
+        let work = &rel["work"];
+        composers_of(&work["relations"], &mut composers);
+        // A movement's composer is often recorded on the parent work only.
+        for parent in work["relations"].as_array().into_iter().flatten() {
+            if parent["target-type"] == "work" && parent["type"] == "parts" {
+                composers_of(&parent["work"]["relations"], &mut composers);
+            }
+        }
+    }
+    RecordingCredits { artists, composers }
+}
+
+/// Read an artist lookup. "member of band" points from the member to the band,
+/// so on a band's own record it arrives `backward`.
+pub fn parse_artist_info(v: &serde_json::Value) -> ArtistInfo {
+    let mut info =
+        ArtistInfo { name: v["name"].as_str().unwrap_or("").to_string(), ..Default::default() };
+    for r in v["relations"].as_array().into_iter().flatten() {
+        if r["target-type"] != "artist" || r["type"] != "member of band" {
+            continue;
+        }
+        let (name, mbid) =
+            (r["artist"]["name"].as_str().unwrap_or(""), r["artist"]["id"].as_str().unwrap_or(""));
+        match r["direction"].as_str() {
+            Some("forward") => push_unique(&mut info.member_of, name, mbid),
+            Some("backward") => push_unique(&mut info.members, name, mbid),
+            _ => {}
+        }
+    }
+    info
 }
 
 #[derive(Debug, Deserialize)]
@@ -1136,5 +1462,68 @@ mod refusal_tests {
         let err = c.fetch_metadata("Xtal", "Aphex Twin", None).await.unwrap_err();
         let msg = format!("{err:#}");
         assert!(!msg.contains("placeholder"), "should not have been refused locally: {msg}");
+    }
+}
+
+#[cfg(test)]
+mod credit_parse_tests {
+    use super::*;
+
+    fn fixture(raw: &str) -> serde_json::Value {
+        serde_json::from_str(raw).expect("fixture parses")
+    }
+
+    /// Captured 2026-11-03 from `recording/fab491d2…?inc=artist-credits+artist-rels+work-rels+work-level-rels`.
+    /// The credit the search path dropped to its first artist: Loud is here,
+    /// joined with " avec ", under his own MBID.
+    #[test]
+    fn a_recording_lookup_names_everyone_credited() {
+        let c = parse_recording_credits(&fixture(include_str!(
+            "fixtures/mb_recording_dans_la_nuit.json"
+        )));
+        let names: Vec<(&str, &str)> =
+            c.artists.iter().map(|a| (a.name.as_str(), a.join.as_str())).collect();
+        assert_eq!(names, [("Cœur de pirate", " avec "), ("Loud", "")]);
+        assert_eq!(c.artists[1].mbid, "a5348ead-9a1e-4916-ac9a-aa788bea070a");
+        assert!(c.composers.is_empty());
+    }
+
+    /// Captured 2026-11-03: Hahn's Mendelssohn concerto. The recording credits
+    /// the performers; the composer is on the work, reached through
+    /// `artist-rels` — without it the work comes back with no composer at all.
+    #[test]
+    fn a_classical_recording_credits_performers_and_names_the_composer() {
+        let c = parse_recording_credits(&fixture(include_str!(
+            "fixtures/mb_recording_hahn_mendelssohn.json"
+        )));
+        let names: Vec<&str> = c.artists.iter().map(|a| a.name.as_str()).collect();
+        assert_eq!(names, ["Hilary Hahn", "Oslo‐Filharmonien", "Hugh Wolff"]);
+        let composers: Vec<&str> = c.composers.iter().map(|a| a.name.as_str()).collect();
+        assert_eq!(composers, ["Felix Mendelssohn"], "once, though also credited as reviser");
+    }
+
+    /// Captured 2026-11-04 from `release/bbfc83ad…?inc=artist-credits+release-groups`:
+    /// Random Access Memories is Daft Punk's record, whoever is featured on a
+    /// track, and the release group is what holds its editions together.
+    #[test]
+    fn a_release_lookup_names_the_record_and_its_group() {
+        let r = parse_release_info(&fixture(include_str!("fixtures/mb_release_ram.json")));
+        assert_eq!(r.display(), "Daft Punk");
+        assert_eq!(r.title, "Random Access Memories");
+        assert_eq!(r.artists[0].mbid, "056e4f3e-d505-4dad-8ec1-d04f521cbb56");
+        assert_eq!(r.release_group.as_deref(), Some("aa997ea0-2936-40bd-884d-3af8a0e064dc"));
+    }
+
+    /// Captured 2026-11-03 from `artist/48646387…?inc=artist-rels`. Members
+    /// who left and rejoined are listed twice by MusicBrainz and once here.
+    #[test]
+    fn a_band_lists_its_members_once() {
+        let info = parse_artist_info(&fixture(include_str!("fixtures/mb_artist_blackpink.json")));
+        assert_eq!(info.name, "BLACKPINK");
+        let members: Vec<&str> = info.members.iter().map(|a| a.name.as_str()).collect();
+        for m in ["JENNIE", "JISOO", "LISA", "ROSÉ"] {
+            assert_eq!(members.iter().filter(|n| **n == m).count(), 1, "{m}");
+        }
+        assert!(info.member_of.is_empty());
     }
 }

@@ -4,9 +4,11 @@
 	import CoverArt from './CoverArt.svelte';
 	import SourceIcon from './SourceIcon.svelte';
 	import ChainIcon from './ChainIcon.svelte';
+	import ArtistLinks from './ArtistLinks.svelte';
 	import { createEventDispatcher } from 'svelte';
-	import { lovedKeys, isLoved, toggleLove } from '$lib/loves';
-	import { openAlbum, openArtist } from '$lib/entities';
+	import { lovedKeys, isLoved, toggleLove, albumArtistOf } from '$lib/loves';
+	import { openAlbum } from '$lib/entities';
+	import { creditedNames } from '$lib/credits';
 
 	export let scrobble: Scrobble;
 	export let showMenu = false;
@@ -30,15 +32,9 @@
 	// never both apply: a listen either came off an object or out of a file.
 	$: medium = mediumLabel(scrobble);
 	$: seed = scrobble.artist || scrobble.title || '?';
-	// One link per credited artist, primary first. Same split as the server's
-	// `artist_credit` format; a listen with no credit is just its artist.
-	$: credited = (() => {
-		const names = (scrobble.artist_credit ?? '').split(';').map((n) => n.trim()).filter(Boolean);
-		// One entry is not a list — it's what the old `feat.` fold left there.
-		if (names.length < 2) return [scrobble.artist];
-		const lower = scrobble.artist.trim().toLowerCase();
-		return [scrobble.artist, ...names.filter((n) => n.toLowerCase() !== lower)];
-	})();
+	// One link per credited artist, primary first; a listen with no credit is
+	// just its artist.
+	$: credited = creditedNames(scrobble.artist, scrobble.artist_credit);
 	$: time = new Date(scrobble.timestamp * 1000).toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' });
 
 	// The bare heart means the *song*, matching Last.fm and ListenBrainz.
@@ -64,10 +60,10 @@
 					<!-- Buttons rather than anchors: the row knows names, and an entity
 					     id has to be resolved (and possibly created) before there is a
 					     URL to go to. -->
-					{#each credited as name, i}{#if i}<span aria-hidden="true">, </span>{/if}<button class="xref" on:click|stopPropagation={() => openArtist(name)}>{name}</button>{/each}
+					<ArtistLinks names={credited} />
 					{#if scrobble.album}
 						<span aria-hidden="true"> — </span>
-						<button class="xref" on:click|stopPropagation={() => scrobble.album && openAlbum(scrobble.artist, scrobble.album)}>{scrobble.album}</button>
+						<button class="xref" on:click|stopPropagation={() => scrobble.album && openAlbum(albumArtistOf(scrobble), scrobble.album)}>{scrobble.album}</button>
 					{/if}
 				{:else}
 					{credited.join(', ')}{scrobble.album ? ` — ${scrobble.album}` : ''}

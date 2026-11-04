@@ -8,6 +8,10 @@ export interface Scrobble {
 	artist: string;
 	/** Everyone credited, `; `-joined and primary first, when more than one. */
 	artist_credit?: string | null;
+	/** The record's artist, when a source or MusicBrainz named it. */
+	album_artist?: string | null;
+	/** Who the album is filed under — what opens it. Null means `artist`. */
+	album_filed_under?: string | null;
 	album: string | null;
 	/** Who this was heard with, or null for not marked. Null means nobody
 	 *  recorded it — never that they were definitely alone. */
@@ -358,7 +362,7 @@ export interface RangedStats {
 	};
 	top_artists: { name: string; plays: number; hours: number; image_url: string | null }[];
 	top_albums: { name: string; artist: string; plays: number; hours: number }[];
-	top_tracks: { title: string; artist: string; album: string | null; plays: number; hours: number }[];
+	top_tracks: { title: string; artist: string; artist_credit?: string | null; album: string | null; album_artist?: string | null; plays: number; hours: number }[];
 	fidelity: { name: string; plays: number; pct: number }[];
 	/** A track carries several tags, so these are shares of tag mentions, not of listens. */
 	genres: { name: string; plays: number; pct: number }[];
@@ -403,7 +407,7 @@ export interface ReportPeriod {
 		landscape_url?: string | null;
 	} | null;
 	top_album: { name: string; artist: string; plays: number } | null;
-	top_track: { title: string; artist: string; plays: number } | null;
+	top_track: { title: string; artist: string; artist_credit?: string | null; plays: number } | null;
 	/** 24 counts, bucketed in your own timezone. */
 	clock: number[];
 	/** Plays per sub-bucket: days across a week, weeks across a month, months
@@ -423,7 +427,7 @@ export interface ReportPeriod {
 	/** Play-weighted average of the period's genre colours. Null until the
 	 *  genre map has been fetched. */
 	colour: string | null;
-	on_repeat: { title: string; artist: string; plays: number }[];
+	on_repeat: { title: string; artist: string; artist_credit?: string | null; plays: number }[];
 	/** The most-played artist you had never played before. Absent for the
 	 *  oldest period, where everything is new by construction. */
 	crush: { name: string; plays: number; since: number } | null;
@@ -1181,7 +1185,11 @@ export interface Equipment {
 export interface NowPlayingTrack {
 	title: string;
 	artist: string;
+	/** Everyone credited, `"; "`-joined and primary first; see `creditedNames`. */
+	artist_credit?: string | null;
 	album: string | null;
+	/** Who the album is filed under, when the source named an album artist. */
+	album_artist?: string | null;
 	duration: number | null;
 	progress: number;
 	/**
@@ -1594,6 +1602,9 @@ export interface TrackAggregate {
 	duration: number | null;
 	track_number: number | null;
 	album: string | null;
+	artist_credit?: string | null;
+	/** Artist top-tracks only: who the track is filed under, which opens its album. */
+	artist?: string | null;
 	format_type: string | null;
 	codec: string | null;
 	bit_depth: number | null;
@@ -1605,6 +1616,8 @@ export interface TrackAggregate {
 
 export interface AlbumAggregate {
 	name: string;
+	/** Who the record is filed under, which opens it. */
+	artist?: string | null;
 	plays: number;
 	year: number | null;
 	artwork_url: string | null;
@@ -1634,6 +1647,8 @@ export interface AlbumView {
 	id: number;
 	title: string;
 	artist: string;
+	/** Everyone credited on the record's listens, its own artist first. */
+	credited: string[];
 	artist_entity_id: number | null;
 	mbid: string | null;
 	year: number | null;
@@ -1763,6 +1778,10 @@ export interface ArtistView {
 	id: number;
 	name: string;
 	mbid: string | null;
+	/** Bands this artist is in, from MusicBrainz — only ones in your history. */
+	member_of?: string[];
+	/** This band's members, on the same rule. */
+	members?: string[];
 	/** Portrait as **you** see it: your own choice, else the shared one the
 	 *  metadata chain or your library supplied. Null means the lettered tile. */
 	image_url: string | null;
@@ -1793,6 +1812,10 @@ export interface ChartRow {
 	sub: string | null;
 	/** Tracks only: the record it's on, so the row can open the album. */
 	album: string | null;
+	/** Tracks only: everyone credited; `sub` is the primary alone. */
+	artist_credit?: string | null;
+	/** Tracks only: who `album` is filed under, which opens it. */
+	album_artist?: string | null;
 	plays: number;
 	seconds: number;
 	artwork_url: string | null;
@@ -2268,8 +2291,8 @@ export interface SanitizeResult {
 
 export interface SearchResults {
 	artists: { name: string; plays: number }[];
-	albums: { name: string; artist: string; plays: number }[];
-	tracks: { title: string; artist: string; album: string | null; plays: number }[];
+	albums: { name: string; artist: string; credited: string[]; plays: number }[];
+	tracks: { title: string; artist: string; artist_credit?: string | null; album: string | null; album_artist?: string | null; plays: number }[];
 }
 
 export interface TokenInfo {

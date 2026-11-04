@@ -8,7 +8,7 @@
 	export let artist: string;
 </script>
 
-<button class="card" on:click={() => openAlbum(artist, album.name)}>
+<button class="card" on:click={() => openAlbum(album.artist ?? artist, album.name)}>
 	<div class="art">
 		<CoverArt
 			url={album.artwork_url}

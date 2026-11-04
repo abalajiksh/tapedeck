@@ -469,6 +469,12 @@ pub async fn submit_listens(
             mbid_release_track,
             mbid_work,
             mbid_album_artist,
+            // ListenBrainz's own key for the record's artist.
+            album_artist: info_ref
+                .and_then(|ai| ai.release_artist_name.as_deref())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string),
             caa_id,
             caa_release_mbid,
             // Taken straight from the bag when the client knew it. A tag read

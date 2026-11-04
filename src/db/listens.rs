@@ -87,7 +87,7 @@ impl Database {
                 source_id, source_name, status, skipped,
                 mbid_recording, mbid_release, mbid_artist,
                 mbid_release_group, mbid_release_track, mbid_work, mbid_album_artist,
-                caa_id, caa_release_mbid, isrc,
+                album_artist, album_filed_under, caa_id, caa_release_mbid, isrc,
                 format_type, codec, bitrate, sample_rate, bit_depth, channels,
                 container, source_quality, is_lossless,
                 dsd_rate, dsd_multiplier, dsd_to_pcm_converted,
@@ -100,7 +100,7 @@ impl Database {
                 ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
                 ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
                 ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                ?, ?, ?, ?
+                ?, ?, ?, ?, ?, ?
             )"
         ))
         .bind(user_id)
@@ -122,6 +122,8 @@ impl Database {
         .bind(&play.mbid_release_track)
         .bind(&play.mbid_work)
         .bind(&mbid_album_artist_json)
+        .bind(&play.album_artist)
+        .bind(play.album_artist.as_deref().map(str::trim).filter(|a| !a.is_empty()))
         .bind(play.caa_id)
         .bind(&play.caa_release_mbid)
         .bind(&play.isrc)
@@ -522,6 +524,7 @@ impl Database {
                         mbid_release_track: None,
                         mbid_work: None,
                         mbid_album_artist: None,
+                        album_artist: None,
                         caa_id: r.caa_id,
                         caa_release_mbid: r.caa_release_mbid,
                         isrc: r.isrc,
@@ -662,6 +665,11 @@ impl Database {
     /// for things already annotated or loved, so searching them would find only
     /// what you've already been to. Grouped rather than a flat row list because
     /// "that Radiohead album" is an album, not fifty listens of it.
+    ///
+    /// Albums and tracks match on their own name **or on anyone credited**, so
+    /// searching a soloist finds the concerto filed under its composer. Each
+    /// album comes back with everyone credited on it, and each track with its
+    /// credit, so no line reads as if the record's artist were the one asked for.
     #[allow(clippy::type_complexity)]
     pub async fn search_library(
         &self,
@@ -671,8 +679,8 @@ impl Database {
     ) -> Result<
         (
             Vec<(String, i64)>,
-            Vec<(String, String, i64)>,
-            Vec<(String, String, Option<String>, i64)>,
+            Vec<(String, String, i64, Vec<String>)>,
+            Vec<(String, String, Option<String>, Option<String>, Option<String>, i64)>,
         ),
         sqlx::Error,
     > {
@@ -696,28 +704,49 @@ impl Database {
         .fetch_all(&self.pool)
         .await?;
 
-        let albums: Vec<(String, String, i64)> = sqlx::query_as(&crate::sql!(
-            "SELECT album, artist, COUNT(*) AS plays FROM scrobbles
+        // The credit match is one pass over `scrobble_artists` into a set, not
+        // a probe per listen: `LIKE '%…%'` cannot use an index either way, and
+        // the table is one row per credit, a little over one per listen.
+        let found: Vec<(String, String, i64)> = sqlx::query_as(&crate::sql!(
+            "SELECT MAX(album) AS album, MAX(COALESCE(album_filed_under, artist)) AS artist,
+                    COUNT(*) AS plays FROM scrobbles
              WHERE user_id = ? AND skipped = FALSE AND album IS NOT NULL AND album != ''
-               AND LOWER(album) LIKE '%' || ? || '%'
-             GROUP BY LOWER(album), LOWER(artist) ORDER BY plays DESC LIMIT ?"
+               AND (LOWER(album) LIKE '%' || ? || '%'
+                    OR id IN (SELECT scrobble_id FROM scrobble_artists
+                               WHERE artist_key LIKE '%' || ? || '%'))
+             GROUP BY LOWER(TRIM(album)), LOWER(TRIM(COALESCE(album_filed_under, artist)))
+             ORDER BY plays DESC LIMIT ?"
         ))
         .bind(user_id)
+        .bind(&needle)
         .bind(&needle)
         .bind(limit)
         .fetch_all(&self.pool)
         .await?;
+        let mut albums = Vec::with_capacity(found.len());
+        for (album, artist, plays) in found {
+            let credited = self.album_credits(user_id, &artist, &album, 6).await?;
+            albums.push((album, artist, plays, credited));
+        }
 
-        let tracks: Vec<(String, String, Option<String>, i64)> = sqlx::query_as(&crate::sql!(
-            "SELECT title, artist, album, COUNT(*) AS plays FROM scrobbles
-             WHERE user_id = ? AND skipped = FALSE AND LOWER(title) LIKE '%' || ? || '%'
-             GROUP BY LOWER(title), LOWER(artist) ORDER BY plays DESC LIMIT ?"
-        ))
-        .bind(user_id)
-        .bind(&needle)
-        .bind(limit)
-        .fetch_all(&self.pool)
-        .await?;
+        let tracks: Vec<(String, String, Option<String>, Option<String>, Option<String>, i64)> =
+            sqlx::query_as(&crate::sql!(
+                "SELECT MAX(title) AS title, MAX(artist) AS artist, MAX(album) AS album,
+                        MAX(artist_credit) AS artist_credit,
+                        MAX(COALESCE(album_filed_under, artist)) AS album_artist,
+                        COUNT(*) AS plays FROM scrobbles
+                 WHERE user_id = ? AND skipped = FALSE
+                   AND (LOWER(title) LIKE '%' || ? || '%'
+                        OR id IN (SELECT scrobble_id FROM scrobble_artists
+                                   WHERE artist_key LIKE '%' || ? || '%'))
+                 GROUP BY LOWER(title), LOWER(artist) ORDER BY plays DESC LIMIT ?"
+            ))
+            .bind(user_id)
+            .bind(&needle)
+            .bind(&needle)
+            .bind(limit)
+            .fetch_all(&self.pool)
+            .await?;
 
         Ok((artists, albums, tracks))
     }

@@ -93,6 +93,20 @@ impl Database {
                 .bind(&key)
                 .fetch_optional(&self.pool)
                 .await?;
+        // 1b. A key the entity was **known by** before it moved — an album
+        // filed under its album artist was once keyed by a track's artist.
+        let existing = match existing {
+            Some(hit) => Some(hit),
+            None => {
+                sqlx::query_as(&crate::sql!(
+                    "SELECT entity_id FROM entity_aliases WHERE alias_kind = 'key' AND value = ?
+                      ORDER BY entity_id LIMIT 1"
+                ))
+                .bind(&key)
+                .fetch_optional(&self.pool)
+                .await?
+            }
+        };
         let existing = match existing {
             Some(hit) => Some(hit),
             None => match mbid.map(str::trim).filter(|m| !m.is_empty()) {
@@ -261,10 +275,11 @@ impl Database {
 
             // `ORDER BY (artist = ctx) DESC` prefers the record by the artist
             // this note is about when two of them share a title.
-            "release" => sqlx::query_as(&crate::sql!("SELECT album, artist, mbid_release FROM scrobbles
+            "release" => sqlx::query_as(&crate::sql!("SELECT album, COALESCE(album_filed_under, artist), mbid_release FROM scrobbles
                  WHERE user_id = ? AND LOWER(TRIM(album)) = ?
-                 ORDER BY (LOWER(TRIM(artist)) = ?) DESC, id DESC LIMIT 1"))
+                 ORDER BY (LOWER(TRIM(COALESCE(album_filed_under, artist))) = ?) DESC, (LOWER(TRIM(artist)) = ?) DESC, id DESC LIMIT 1"))
             .bind(user_id).bind(&needle)
+            .bind(ctx_artist.unwrap_or_default().trim().to_lowercase())
             .bind(ctx_artist.unwrap_or_default().trim().to_lowercase())
             .fetch_optional(&self.pool).await?,
 
@@ -1290,19 +1305,22 @@ impl Database {
         let sql: String = match kind {
             "albums" => {
                 format!(
-                    "SELECT album AS name, artist AS sub, NULL AS album, COUNT(*) AS plays,
+                    "SELECT MAX(album) AS name, MAX(COALESCE(album_filed_under, artist)) AS sub,
+                        NULL AS album, COUNT(*) AS plays,
                         COALESCE(SUM(duration), 0) AS seconds,
                         {COVER_PICK} AS cover_pick
                  FROM scrobbles
                  WHERE user_id = ? AND skipped = FALSE AND (? IS NULL OR timestamp >= ?)
                    AND album IS NOT NULL AND TRIM(album) != ''
-                 GROUP BY LOWER(TRIM(album)), LOWER(TRIM(artist))
+                 GROUP BY LOWER(TRIM(album)), LOWER(TRIM(COALESCE(album_filed_under, artist)))
                  ORDER BY {order} LIMIT ?"
                 )
             }
             "tracks" => {
                 format!(
-                    "SELECT title AS name, artist AS sub, MAX(album) AS album, COUNT(*) AS plays,
+                    "SELECT title AS name, artist AS sub, MAX(album) AS album,
+                        MAX(COALESCE(album_filed_under, artist)) AS album_artist,
+                        MAX(artist_credit) AS artist_credit, COUNT(*) AS plays,
                         COALESCE(SUM(duration), 0) AS seconds,
                         {COVER_PICK} AS cover_pick
                  FROM scrobbles
@@ -1826,6 +1844,16 @@ impl Database {
                 keys.push(Self::mbid_key(&kind, &m));
             }
         }
+        // And the keys a loved entity was known by before it moved, so a heart
+        // recorded against an album's old key stays filled.
+        let aliases: Vec<(String,)> = sqlx::query_as(&crate::sql!(
+            "SELECT a.value FROM loves l JOIN entity_aliases a ON a.entity_id = l.entity_id
+              WHERE l.user_id = ? AND a.alias_kind = 'key'"
+        ))
+        .bind(user_id)
+        .fetch_all(&self.pool)
+        .await?;
+        keys.extend(aliases.into_iter().map(|(v,)| v));
         keys.sort();
         keys.dedup();
         Ok(keys)

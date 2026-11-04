@@ -141,7 +141,10 @@ pub struct SearchArtist {
 #[derive(Serialize, ToSchema)]
 pub struct SearchAlbum {
     pub name: String,
+    /// The artist the record is filed under, which opens it.
     pub artist: String,
+    /// Everyone credited on its listens, the record's artist first.
+    pub credited: Vec<String>,
     pub plays: i64,
 }
 
@@ -149,7 +152,12 @@ pub struct SearchAlbum {
 pub struct SearchTrack {
     pub title: String,
     pub artist: String,
+    /// Everyone credited, `"; "`-joined and primary first, when there is more
+    /// than one.
+    pub artist_credit: Option<String>,
     pub album: Option<String>,
+    /// Who `album` is filed under, which opens it.
+    pub album_artist: Option<String>,
     pub plays: i64,
 }
 
@@ -341,11 +349,23 @@ pub async fn search(
                 artists.into_iter().map(|(name, plays)| SearchArtist { name, plays }).collect();
             let albums = albums
                 .into_iter()
-                .map(|(name, artist, plays)| SearchAlbum { name, artist, plays })
+                .map(|(name, artist, plays, credited)| SearchAlbum {
+                    name,
+                    artist,
+                    credited,
+                    plays,
+                })
                 .collect();
             let tracks = tracks
                 .into_iter()
-                .map(|(title, artist, album, plays)| SearchTrack { title, artist, album, plays })
+                .map(|(title, artist, album, artist_credit, album_artist, plays)| SearchTrack {
+                    title,
+                    artist,
+                    artist_credit,
+                    album,
+                    album_artist,
+                    plays,
+                })
                 .collect();
             (StatusCode::OK, Json(SearchResults { artists, albums, tracks })).into_response()
         }

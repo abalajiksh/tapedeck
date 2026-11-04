@@ -299,6 +299,42 @@ impl Database {
             keys.insert(Self::entity_key("artist", "", &artist));
             keys.insert(Self::match_key("artist", "", &artist));
         }
+        // Albums under the artist they are filed under, beside the track
+        // artist above: a soundtrack is the music director's record however
+        // its tracks are credited.
+        let filed: Vec<(String, String)> = sqlx::query_as(&crate::sql!(
+            "SELECT MAX(album_filed_under), MAX(album) FROM scrobbles
+              WHERE user_id = ? AND skipped = FALSE
+                AND album_filed_under IS NOT NULL AND TRIM(album_filed_under) != ''
+                AND album IS NOT NULL AND TRIM(album) != ''
+              GROUP BY LOWER(TRIM(album_filed_under)), LOWER(TRIM(album))"
+        ))
+        .bind(user_id)
+        .fetch_all(&self.pool)
+        .await?;
+        for (artist, album) in filed {
+            keys.insert(Self::entity_key("release", &artist, &album));
+            keys.insert(Self::match_key("release", &artist, &album));
+        }
+        // And everyone credited: a library that rates the featured artist, or
+        // the soloist on a record filed under its composer, is rating something
+        // you did listen to. Tracks too, under each credited name, since a
+        // server files a duet under whichever of the two it chose.
+        let credited: Vec<(String, String)> = sqlx::query_as(&crate::sql!(
+            "SELECT MAX(sa.name), MAX(s.title)
+               FROM scrobble_artists sa JOIN scrobbles s ON s.id = sa.scrobble_id
+              WHERE s.user_id = ? AND s.skipped = FALSE AND TRIM(s.title) != ''
+              GROUP BY sa.artist_key, LOWER(TRIM(s.title))"
+        ))
+        .bind(user_id)
+        .fetch_all(&self.pool)
+        .await?;
+        for (artist, title) in credited {
+            keys.insert(Self::entity_key("artist", "", &artist));
+            keys.insert(Self::match_key("artist", "", &artist));
+            keys.insert(Self::entity_key("recording", &artist, &title));
+            keys.insert(Self::match_key("recording", &artist, &title));
+        }
         Ok(keys)
     }
 

@@ -42,6 +42,16 @@ impl utoipa::PartialSchema for Preferences {
                 ),
             )
             .property(
+                "credit_primary",
+                prop(
+                    Type::String,
+                    "Who a classical listen is filed under when MusicBrainz names both the \
+                     performers and the work's composer: `performer` (the default) or \
+                     `composer`. Only reorders who is credited; changing it re-files the \
+                     MusicBrainz-credited listens in the background.",
+                ),
+            )
+            .property(
                 "week_start",
                 prop(Type::Integer, "First day of the week, 0 = Sunday … 6 = Saturday. Monday (1) when unset."),
             )
@@ -181,6 +191,30 @@ async fn put_preferences(
             Json(ErrorResponse { code: 400, error: "Body must be a JSON object".into() }),
         )
             .into_response();
+    }
+    // The one preference the credits backfill reads per listen lives on
+    // `users` as well, and changing it requeues what it decided.
+    if let Some(v) = body.get("credit_primary").and_then(|v| v.as_str()) {
+        if v != "performer" && v != "composer" {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse {
+                    code: 400,
+                    error: "credit_primary is `performer` or `composer`".into(),
+                }),
+            )
+                .into_response();
+        }
+        let current = state.db.credit_primary(user.user_id).await.unwrap_or_default();
+        if current != v {
+            if let Err(e) = state.db.set_credit_primary(user.user_id, v).await {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ErrorResponse { code: 500, error: e.to_string() }),
+                )
+                    .into_response();
+            }
+        }
     }
     match state.db.merge_preferences(user.user_id, &body).await {
         Ok(prefs) => (StatusCode::OK, Json(prefs)).into_response(),

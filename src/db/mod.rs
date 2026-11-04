@@ -43,6 +43,13 @@ pub struct ScrobbleRecord {
     /// than one — what a listen row splits into one link per artist.
     #[sqlx(default)]
     pub artist_credit: Option<String>,
+    /// The record's artist, when a source or MusicBrainz named it.
+    #[sqlx(default)]
+    pub album_artist: Option<String>,
+    /// Who the album is filed under — what opens it and what an album love is
+    /// keyed by. Null means `artist`.
+    #[sqlx(default)]
+    pub album_filed_under: Option<String>,
     pub album: Option<String>,
     /// Unix seconds, UTC, **start** of play.
     pub timestamp: i64,
@@ -393,6 +400,15 @@ pub struct TrackAggregate {
     pub track_number: Option<i32>,
     /// Set on artist top-tracks (where the album varies), null on an album page.
     pub album: Option<String>,
+    /// Everyone credited on the track, `"; "`-joined and primary first, when
+    /// there is more than one.
+    #[sqlx(default)]
+    pub artist_credit: Option<String>,
+    /// The artist the track's *album* is filed under. Set on artist
+    /// top-tracks, where it can be someone else — a soloist's concerto filed
+    /// under its composer — and is what opens the album; null on an album page.
+    #[sqlx(default)]
+    pub artist: Option<String>,
     pub format_type: Option<String>,
     pub codec: Option<String>,
     pub bit_depth: Option<i32>,
@@ -405,6 +421,10 @@ pub struct TrackAggregate {
 #[derive(Debug, FromRow, serde::Serialize, utoipa::ToSchema)]
 pub struct AlbumAggregate {
     pub name: String,
+    /// The artist the record is filed under, which is what opens it — on an
+    /// artist page that can be someone else (a soloist on a composer's record).
+    #[sqlx(default)]
+    pub artist: Option<String>,
     pub plays: i64,
     pub year: Option<i32>,
     /// A cover, from one of the listens counted.
@@ -1288,8 +1308,16 @@ impl Cover {
 /// in `play.artists` follows.
 ///
 /// MBIDs are positional in `play.mbid_artist`, which is how MusicBrainz and
-/// ListenBrainz both send them, so they are zipped by index and simply run out
-/// when there are fewer of them than names.
+/// ListenBrainz both send them — positional *in the source's own list*. So a
+/// name gets an MBID only when that list and the MBIDs line up one for one;
+/// otherwise nobody does, and the full list stays on the listen.
+//
+// Zipping by index whatever the lengths was the rule until 2026-11-04, and it
+// put the wrong artist's MBID on thousands of rows: a box-set listen filed
+// under Shostakovich with the set's three MBIDs gave Shostakovich the first
+// (Hilary Hahn's), and `unify_artist_spellings` then folded him into Bach,
+// who carried the same one. A name with no MBID costs a lookup; a name with
+// someone else's costs the listen its artist.
 pub fn credited_artists(play: &Play) -> Vec<(String, Option<String>)> {
     let mut names: Vec<String> = Vec::new();
     let mut push = |n: &str| {
@@ -1320,10 +1348,25 @@ pub fn credited_artists(play: &Play) -> Vec<(String, Option<String>)> {
     }
 
     let mbids = play.mbid_artist.as_deref().unwrap_or(&[]);
+    // The list the MBIDs were sent alongside: the source's own, or the one
+    // name when there was no list.
+    let source: Vec<&str> = match play.artists.as_deref() {
+        Some(list) if !list.is_empty() => list.iter().map(|s| s.trim()).collect(),
+        _ => vec![play.artist.trim()],
+    };
+    let lined_up = source.len() == mbids.len();
     names
         .into_iter()
-        .enumerate()
-        .map(|(i, name)| (name, mbids.get(i).filter(|m| !m.trim().is_empty()).cloned()))
+        .map(|name| {
+            let key = Database::artist_key(&name);
+            let mbid = lined_up
+                .then(|| source.iter().position(|s| Database::artist_key(s) == key))
+                .flatten()
+                .and_then(|i| mbids.get(i))
+                .filter(|m| !m.trim().is_empty())
+                .cloned();
+            (name, mbid)
+        })
         .collect()
 }
 
@@ -1331,21 +1374,26 @@ pub fn credited_artists(play: &Play) -> Vec<(String, Option<String>)> {
 ///
 /// **Navidrome's own defaults** (`resources/mappings.yaml`, `artists.split`),
 /// matched case-insensitively, plus the parenthesised `feat.` forms and a bare
-/// `;` — the Vorbis/ID3 multi-value separator ingest has always honoured.
+/// `;` — the Vorbis/ID3 multi-value separator ingest has always honoured —
+/// and French `avec`, how French credits write "featuring" ("Cœur de pirate
+/// avec Loud", "Clara Luciani avec Kool & the Gang"), which unlike `with` is
+/// not found inside names.
 /// `,`, `&`, `and`, `x` and `with` are deliberately absent: they occur inside
 /// real names ("Simon & Garfunkel", "Earth, Wind & Fire"), and Navidrome leaves
 /// them alone for the same reason. Those credits are fixed only when the source
 /// sends a list.
-const CREDIT_SEPARATORS: [&str; 10] = [
+const CREDIT_SEPARATORS: [&str; 12] = [
     " (feat. ",
     " (ft. ",
     " (featuring ",
+    " (avec ",
     " / ",
     " feat. ",
     " feat ",
     " ft. ",
     " ft ",
     " featuring ",
+    " avec ",
     ";",
 ];
 
@@ -1463,10 +1511,19 @@ pub fn credit_covers(artist: &str, names: &[&str]) -> bool {
         let Some(at) = rest.find(&folded) else { return false };
         rest.replace_range(at..at + folded.len(), " ");
     }
+    only_joining_words(&rest)
+}
+
+/// Is what is left of an artist string, once the names are taken out, only
+/// punctuation and the words that join names?
+pub(crate) fn only_joining_words(rest: &str) -> bool {
     rest.split(|c: char| c.is_whitespace() || matches!(c, ',' | '&' | '/' | ';' | '+' | '(' | ')'))
         .filter(|w| !w.is_empty())
         .all(|w| {
-            matches!(w, "and" | "feat." | "feat" | "ft." | "ft" | "featuring" | "with" | "x" | "×")
+            matches!(
+                w,
+                "and" | "feat." | "feat" | "ft." | "ft" | "featuring" | "with" | "avec" | "x" | "×"
+            )
         })
 }
 
@@ -1507,6 +1564,9 @@ mod credit_tests {
             ("Bach; Hilary Hahn", &["Bach", "Hilary Hahn"]),
             ("A (feat. B (UK))", &["A", "B (UK)"]),
             ("A (feat. B)", &["A", "B"]),
+            ("Cœur de pirate avec Loud", &["Cœur de pirate", "Loud"]),
+            ("Clara Luciani AVEC Kool & the Gang", &["Clara Luciani", "Kool & the Gang"]),
+            ("A (avec B)", &["A", "B"]),
         ] {
             let mut p = play(s, None);
             assert_eq!(normalise_credit(&mut p).as_deref(), Some(s), "{s}");
@@ -2065,6 +2125,20 @@ impl Database {
         WHERE p.follower_user_id = ? AND p.state = 'accepted' AND s.skipped = FALSE \
           AND (u.share_all_with_patched = 1 OR c.shared = 1)";
 
+    /// [`Self::PATCH_VISIBLE_LISTENS`] with every listen fanned out to its
+    /// credits as `sa`, for counting artists the way the charts do.
+    ///
+    /// Written out rather than built from the other, because `db::guards` reads
+    /// a fragment's skip filter from its literal text; that the two share one
+    /// visibility rule is pinned by `patch_visibility_is_one_rule` instead.
+    pub(crate) const PATCH_VISIBLE_CREDITS: &'static str = "FROM scrobbles s \
+         JOIN scrobble_artists sa ON sa.scrobble_id = s.id \
+         JOIN users u ON u.id = s.user_id \
+         LEFT JOIN signal_chains c ON c.id = s.chain_id \
+         JOIN patches p ON p.target_user_id = s.user_id \
+        WHERE p.follower_user_id = ? AND p.state = 'accepted' AND s.skipped = FALSE \
+          AND (u.share_all_with_patched = 1 OR c.shared = 1)";
+
     /// How a chain is named to somebody who may see the listen.
     ///
     /// Shared chains are named; a chain its owner keeps private is present but
@@ -2581,6 +2655,13 @@ pub struct ChartRow {
     /// Only set on a tracks chart — the record the track is on, so the row can
     /// open the album like every other track listing in the app.
     pub album: Option<String>,
+    /// Only set on a tracks chart: everyone credited, `"; "`-joined and primary
+    /// first, when there is more than one. `sub` is the primary alone.
+    #[sqlx(default)]
+    pub artist_credit: Option<String>,
+    /// Only set on a tracks chart: who `album` is filed under, which opens it.
+    #[sqlx(default)]
+    pub album_artist: Option<String>,
     pub plays: i64,
     pub seconds: i64,
     /// A cover, from one of the listens counted.
@@ -2916,6 +2997,10 @@ struct SparseColumns {
     mbid_recording: Option<String>,
     mbid_release: Option<String>,
     mbid_release_group: Option<String>,
+    mbid_release_track: Option<String>,
+    mbid_work: Option<String>,
+    mbid_album_artist: Option<String>,
+    album_artist: Option<String>,
     mbid_artist: Option<String>,
     caa_id: Option<i64>,
     caa_release_mbid: Option<String>,
@@ -3029,6 +3114,10 @@ pub struct ReportRow {
     pub artist_credit: Option<String>,
     pub title: String,
     pub album: Option<String>,
+    /// Who the album is filed under; an album belongs to its record's artist,
+    /// not to whoever performs one of its tracks.
+    #[sqlx(default)]
+    pub album_filed_under: Option<String>,
     pub duration: Option<i64>,
     /// JSON array of tag names, written by the genre backfill. Absent until
     /// that listen has been enriched.
@@ -3628,6 +3717,8 @@ mod auth;
 mod chains;
 mod connections;
 mod crate_shelf;
+mod credits;
+pub use credits::{credit_extends, same_spelling};
 pub mod dialect;
 mod gear;
 #[cfg(test)]

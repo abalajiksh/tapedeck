@@ -373,7 +373,7 @@
 	/** Hand splits, `;`-separated — the one character artist names don't use. */
 	let handSplit: Record<string, string> = {};
 	const guessSplit = (artist: string) =>
-		artist.split(/,\s+|\s+&\s+|\s+x\s+|\s+and\s+|\s+\+\s+|\s+vs\.?\s+/i).join('; ');
+		artist.split(/,\s+|\s+&\s+|\s+x\s+|\s+and\s+|\s+avec\s+|\s+\+\s+|\s+vs\.?\s+/i).join('; ');
 	const parseSplit = (text: string) => text.split(';').map((n) => n.trim()).filter(Boolean);
 	/** What a hand split must cover — `JoinedCredit::subject` on the server. */
 	const handSubject = (j: { artist: string; credit: string | null }) => j.credit ?? j.artist;
@@ -678,6 +678,9 @@
 	 *  runs Friday to Friday, which is why this is settable at all. */
 	let weekStart = 1;
 	let weekSaved = false;
+	/** Who a classical listen is filed under when MusicBrainz names both. */
+	let creditPrimary: 'performer' | 'composer' = 'performer';
+	let creditSaved = false;
 
 	// ── Scrobble threshold ──
 	// The defaults every source used to hardcode. Held as the numbers the
@@ -1071,6 +1074,11 @@
 		} catch (e) {
 			discogsMsg = String(e).replace(/^API \d+: /, '');
 		}
+	}
+
+	async function saveCreditPrimary() {
+		try { await api.putPreferences({ credit_primary: creditPrimary }); creditSaved = true; setTimeout(() => (creditSaved = false), 2000); }
+		catch { /* ignore */ }
 	}
 
 	async function saveWeekStart() {
@@ -1640,6 +1648,7 @@
 			if (typeof prefs.scrobble_threshold_secs === 'number')
 				thresholdSecs = Math.min(3600, Math.max(10, Math.round(prefs.scrobble_threshold_secs)));
 			if (prefs.lyrics_indic_style === 'iso') indicStyle = 'iso';
+			if (prefs.credit_primary === 'composer') creditPrimary = 'composer';
 			if (prefs.lyrics_cyrillic_style === 'iso') cyrillicStyle = 'iso';
 		} catch { timezone = 'UTC'; }
 		try { isAdmin = (await api.me()).is_admin; } catch { /* optional */ }
@@ -3476,6 +3485,26 @@
 		{/if}
 
 		{#if section === 'sanitiser'}
+			<div class="panel" style="border-radius:22px;padding:24px;margin-bottom:18px;">
+				<div class="row" style="border:none;padding:0;">
+					<div class="row-main">
+						<div class="row-title">Classical records are filed under</div>
+						<div class="row-sub">
+							MusicBrainz credits a recording to its performers and names the composer on the
+							work. When your library names the composer too, both are credited and counted;
+							this only decides which one the listen is filed under. Changing it re-files those
+							listens in the background.
+						</div>
+					</div>
+					<div style="display:flex;gap:8px;align-items:center;">
+						<select class="input" style="width:auto;" bind:value={creditPrimary} on:change={saveCreditPrimary}>
+							<option value="performer">The performer</option>
+							<option value="composer">The composer</option>
+						</select>
+						{#if creditSaved}<span style="color:var(--td-good-fg);">✓</span>{/if}
+					</div>
+				</div>
+			</div>
 			{#if spotifyDupes?.copies || dupesMsg}
 				<div class="panel" style="border-radius:22px;padding:24px;margin-bottom:18px;">
 					<h3 class="h-display" style="font-size:19px;margin-bottom:4px;">Spotify plays counted twice</h3>
