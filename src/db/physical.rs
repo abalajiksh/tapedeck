@@ -1175,7 +1175,7 @@ impl Database {
     ) -> Result<Vec<ReportRow>, sqlx::Error> {
         sqlx::query_as(&crate::sql!(
             "SELECT timestamp, artist, artist_credit, title, album, duration, genres, chain_id,
-                    company
+                    company, COALESCE(album_filed_under, artist) AS album_filed_under
              FROM scrobbles
              WHERE user_id = ? AND skipped = FALSE
              ORDER BY timestamp ASC LIMIT ?",
@@ -1632,11 +1632,15 @@ impl Database {
         &self,
         user_id: i64,
     ) -> Result<Vec<(String, String, i64)>, sqlx::Error> {
+        // Every credited artist takes the listen's genres, so a soloist sits in
+        // the genre of what they played rather than vanishing behind the
+        // composer the record is filed under.
         sqlx::query_as(&crate::sql!(
-            "SELECT g.value AS genre, s.artist, COUNT(*) AS plays
-               FROM scrobbles s, json_each(s.genres) g
+            "SELECT MAX(g.value) AS genre, MAX(sa.name) AS artist, COUNT(*) AS plays
+               FROM scrobbles s JOIN scrobble_artists sa ON sa.scrobble_id = s.id,
+                    json_each(s.genres) g
               WHERE s.user_id = ? AND s.skipped = FALSE AND s.genres IS NOT NULL
-              GROUP BY LOWER(g.value), s.artist
+              GROUP BY LOWER(g.value), sa.artist_key
               ORDER BY plays DESC"
         ))
         .bind(user_id)
@@ -2158,11 +2162,14 @@ impl Database {
         } else {
             0
         };
+        // Over the credits, as the charts are, so the dashboard and Top Charts
+        // name the same artist for the same month.
         let top_artist: Option<(String, i64)> = sqlx::query_as(&crate::sql!(&format!(
-            "SELECT artist, COUNT(*) as cnt FROM scrobbles
-              WHERE user_id = ? AND skipped = FALSE AND timestamp >= ?
-                AND LOWER(TRIM(artist)) {NOT_VARIOUS}
-              GROUP BY artist ORDER BY cnt DESC LIMIT 1"
+            "SELECT MAX(sa.name) AS artist, COUNT(*) as cnt
+               FROM scrobble_artists sa JOIN scrobbles s ON s.id = sa.scrobble_id
+              WHERE s.user_id = ? AND s.skipped = FALSE AND s.timestamp >= ?
+                AND sa.artist_key {NOT_VARIOUS}
+              GROUP BY sa.artist_key ORDER BY cnt DESC LIMIT 1"
         )))
         .bind(user_id)
         .bind(now - 30 * 86400)

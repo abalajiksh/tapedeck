@@ -308,6 +308,73 @@ impl Database {
                 .await;
         }
 
+        // Migration: the artist string the source sent, kept only when
+        // `normalise_credit` reduced `artist` to the primary — so a listen is
+        // forwarded exactly as the client named it while every grouping query
+        // sees one artist.
+        if !has_column(&self.pool, "scrobbles", "artist_display").await {
+            info!("⚙️ Migrating: adding scrobbles.artist_display...");
+            let _ = sqlx::query("ALTER TABLE scrobbles ADD COLUMN artist_display TEXT")
+                .execute(&self.pool)
+                .await;
+        }
+
+        // Migration: the credit a sanitiser split overwrote, kept the first
+        // time it is overwritten. With `artist_display` holding the artist, it
+        // makes every split reversible: the older featured-credit fold's string
+        // ("Daft Punk feat. Romanthony") lived only in `artist_credit`.
+        // Migration: whether MusicBrainz's recording credit has been applied —
+        // the queue the credits backfill works through, one listen once.
+        if !has_column(&self.pool, "scrobbles", "credit_source").await {
+            info!("⚙️ Migrating: adding scrobbles.credit_source...");
+            let _ = sqlx::query("ALTER TABLE scrobbles ADD COLUMN credit_source TEXT")
+                .execute(&self.pool)
+                .await;
+        }
+
+        // Migration: the record's artist by name — kept wherever a source or
+        // MusicBrainz says it, since it is what an album is filed under on a
+        // compilation, a soundtrack or a box set.
+        if !has_column(&self.pool, "scrobbles", "album_artist").await {
+            info!("⚙️ Migrating: adding scrobbles.album_artist...");
+            let _ = sqlx::query("ALTER TABLE scrobbles ADD COLUMN album_artist TEXT")
+                .execute(&self.pool)
+                .await;
+        }
+
+        // Migration: who a record is filed under, frozen so that re-crediting a
+        // track never moves its album. NULL reads as `artist`, so there is
+        // nothing to backfill; a known album artist is copied in.
+        if !has_column(&self.pool, "scrobbles", "album_filed_under").await {
+            info!("⚙️ Migrating: adding scrobbles.album_filed_under...");
+            let _ = sqlx::query("ALTER TABLE scrobbles ADD COLUMN album_filed_under TEXT")
+                .execute(&self.pool)
+                .await;
+            let _ = sqlx::query(
+                "UPDATE scrobbles SET album_filed_under = album_artist
+                  WHERE album_artist IS NOT NULL AND TRIM(album_artist) != ''",
+            )
+            .execute(&self.pool)
+            .await;
+        }
+
+        // Migration: performer or composer as the primary on a classical listen.
+        if !has_column(&self.pool, "users", "credit_primary").await {
+            info!("⚙️ Migrating: adding users.credit_primary...");
+            let _ = sqlx::query(
+                "ALTER TABLE users ADD COLUMN credit_primary TEXT NOT NULL DEFAULT 'performer'",
+            )
+            .execute(&self.pool)
+            .await;
+        }
+
+        if !has_column(&self.pool, "scrobbles", "previous_artist_credit").await {
+            info!("⚙️ Migrating: adding scrobbles.previous_artist_credit...");
+            let _ = sqlx::query("ALTER TABLE scrobbles ADD COLUMN previous_artist_credit TEXT")
+                .execute(&self.pool)
+                .await;
+        }
+
         // Migration: which token a session's listens came in on. A change of
         // token means a change of app, which in practice means a change of
         // setup — so it ends the session even inside the 30-minute gap.
@@ -1107,9 +1174,25 @@ impl Database {
         // ~3.2 MB on 50,000 listens. **Still to be confirmed on the Pi**
         // (`temp/measure-tapedeck.sh`): the step count is hardware-independent
         // evidence and a laptop's clock is not.
+        // Albums are filed under `album_filed_under` now, so the seek moved
+        // with them; an index built on the old expression is dropped first,
+        // since `IF NOT EXISTS` would keep it under the same name.
+        let old: Option<(String,)> = sqlx::query_as(
+            "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = 'idx_scrobbles_album_release'",
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .ok()
+        .flatten();
+        if old.is_some_and(|(sql,)| !sql.contains("album_filed_under")) {
+            let _ = sqlx::query("DROP INDEX IF EXISTS idx_scrobbles_album_release")
+                .execute(&self.pool)
+                .await;
+        }
         let _ = sqlx::query(
             "CREATE INDEX IF NOT EXISTS idx_scrobbles_album_release
-                 ON scrobbles(user_id, LOWER(TRIM(artist)), LOWER(TRIM(album)), mbid_release)
+                 ON scrobbles(user_id, LOWER(TRIM(COALESCE(album_filed_under, artist))),
+                              LOWER(TRIM(album)), mbid_release)
                 WHERE mbid_release IS NOT NULL AND TRIM(mbid_release) != ''",
         )
         .execute(&self.pool)

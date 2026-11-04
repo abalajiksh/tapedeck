@@ -383,6 +383,9 @@ impl PlexTrack {
             mbid_release_track: None,
             mbid_work: None,
             mbid_album_artist: None,
+            // `grandparentTitle`: the record's artist, "Various Artists" on a
+            // compilation — what the album is filed under, whoever performed.
+            album_artist: Some(self.artist.clone()).filter(|a| !a.trim().is_empty()),
             mbid_recording: None,
             caa_id: None,
             caa_release_mbid: None,

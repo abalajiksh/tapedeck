@@ -11960,6 +11960,13 @@ components:
             Whoever the *record* is credited to. On a compilation or a soundtrack
             that is not the performer, which is why it is a field of its own rather
             than a fallback for `artist_mbids`.
+        release_artist_name:
+          type:
+          - string
+          - 'null'
+          description: |-
+            The record's artist by name, as ListenBrainz's archive importer and
+            several clients send it. A bad value costs the field, not the listen.
         artist_names:
           type:
           - array
@@ -12170,6 +12177,13 @@ components:
       properties:
         name:
           type: string
+        artist:
+          type:
+          - string
+          - 'null'
+          description: |-
+            The artist the record is filed under, which is what opens it — on an
+            artist page that can be someone else (a soloist on a composer's record).
         plays:
           type: integer
           format: int64
@@ -12218,6 +12232,7 @@ components:
       - kind
       - title
       - artist
+      - credited
       - track_count
       - listening_seconds
       - plays
@@ -12239,6 +12254,14 @@ components:
           type: string
         artist:
           type: string
+        credited:
+          type: array
+          items:
+            type: string
+          description: |-
+            Everyone credited on the listens of this record, most played first, the
+            record's own artist leading. Each track's own credit is on its row in
+            `tracks`.
         artist_entity_id:
           type:
           - integer
@@ -12728,6 +12751,8 @@ components:
       - id
       - kind
       - name
+      - member_of
+      - members
       - rank
       - artist_total
       - plays
@@ -12753,6 +12778,18 @@ components:
           type:
           - string
           - 'null'
+        member_of:
+          type: array
+          items:
+            type: string
+          description: |-
+            Bands this artist is a member of, from MusicBrainz — only those in your
+            own history, so the page never presents someone else's listening.
+        members:
+          type: array
+          items:
+            type: string
+          description: This band's members, on the same rule.
         image_url:
           type:
           - string
@@ -13406,6 +13443,18 @@ components:
           description: |-
             Only set on a tracks chart — the record the track is on, so the row can
             open the album like every other track listing in the app.
+        artist_credit:
+          type:
+          - string
+          - 'null'
+          description: |-
+            Only set on a tracks chart: everyone credited, `"; "`-joined and primary
+            first, when there is more than one. `sub` is the primary alone.
+        album_artist:
+          type:
+          - string
+          - 'null'
+          description: 'Only set on a tracks chart: who `album` is filed under, which opens it.'
         plays:
           type: integer
           format: int64
@@ -16090,6 +16139,59 @@ components:
           format: int64
         pulse:
           $ref: '#/components/schemas/InstancePulse'
+    JoinedCredit:
+      type: object
+      description: |-
+        Listens whose `artist` is several artists written as one string.
+
+        One row per exact `(artist, artist_credit)` pair, because that pair is what
+        decides the split. `names` is the proposed credit, primary first — **empty
+        when nothing safe can be derived** ("A, B" with no stored list), which is
+        the row the operator splits by hand.
+      required:
+      - artist
+      - names
+      - plays
+      properties:
+        artist:
+          type: string
+        credit:
+          type:
+          - string
+          - 'null'
+        names:
+          type: array
+          items:
+            type: string
+        plays:
+          type: integer
+          format: int64
+    JoinedEdit:
+      type: object
+      description: One joined artist string to split.
+      required:
+      - artist
+      properties:
+        artist:
+          type: string
+          description: |-
+            The string as stored, and the credit beside it — together they name
+            exactly the listens the preview counted.
+        credit:
+          type:
+          - string
+          - 'null'
+        names:
+          type:
+          - array
+          - 'null'
+          items:
+            type: string
+          description: |-
+            A hand split, primary first. Omit it to take the split the preview
+            derived. Refused unless the names account for the whole credit (`credit`
+            when set, otherwise `artist`), so a split can never introduce an artist
+            the listen didn't name, nor drop one it did.
     JsonRpcError:
       type: object
       required:
@@ -16756,6 +16858,25 @@ components:
             what the artist pages and charts aggregate over, so a listen crediting a
             soloist appears under both names there while this field still names the
             one the record is filed under.
+        artist_credit:
+          type:
+          - string
+          - 'null'
+          description: |-
+            Everyone credited, `"; "`-joined and primary first, when there is more
+            than one — what a listen row splits into one link per artist.
+        album_artist:
+          type:
+          - string
+          - 'null'
+          description: The record's artist, when a source or MusicBrainz named it.
+        album_filed_under:
+          type:
+          - string
+          - 'null'
+          description: |-
+            Who the album is filed under — what opens it and what an album love is
+            keyed by. Null means `artist`.
         album:
           type:
           - string
@@ -18640,10 +18761,25 @@ components:
           type: string
         artist:
           type: string
+          description: |-
+            As the source sent it — the string a skip is written with and the deck
+            falls back to.
+        artist_credit:
+          type:
+          - string
+          - 'null'
+          description: |-
+            Everyone credited, `"; "`-joined and primary first, when there is more
+            than one: the same split `save_scrobble` will store the listen with.
         album:
           type:
           - string
           - 'null'
+        album_artist:
+          type:
+          - string
+          - 'null'
+          description: Who the album is filed under, when the source named an album artist.
         duration:
           type:
           - integer
@@ -19562,6 +19698,13 @@ components:
           type: string
         artist:
           type: string
+        artist_credit:
+          type:
+          - string
+          - 'null'
+          description: |-
+            Everyone credited, `"; "`-joined and primary first, when there is more
+            than one.
         plays:
           type: integer
           format: int64
@@ -19632,6 +19775,34 @@ components:
             Which physical disc of the set this track is on, from 1.
 
             Null means nobody recorded which disc, not disc 1.
+        mbid_recording:
+          type:
+          - string
+          - 'null'
+          description: |-
+            The MusicBrainz ids the release lookup returns for this track — the
+            recording, and this track on this release. Kept on the tracklist (a
+            JSON blob, so no migration) and carried onto every listen of the side.
+        mbid_release_track:
+          type:
+          - string
+          - 'null'
+        artists:
+          type:
+          - array
+          - 'null'
+          items:
+            type: string
+          description: |-
+            Everyone the track credits, in order, with their MBIDs — set only when
+            MusicBrainz credits the track itself (it does whenever the track's
+            artist differs from the release's).
+        mbid_artist:
+          type:
+          - array
+          - 'null'
+          items:
+            type: string
     PictureCandidate:
       type: object
       description: One picture on offer.
@@ -20091,6 +20262,9 @@ components:
         timezone:
           type: string
           description: An IANA region, e.g. `Europe/Berlin` — never a fixed abbreviation like `CET`. Decides "today", the heatmap and every calendar bucket. UTC when unset.
+        credit_primary:
+          type: string
+          description: 'Who a classical listen is filed under when MusicBrainz names both the performers and the work''s composer: `performer` (the default) or `composer`. Only reorders who is credited; changing it re-files the MusicBrainz-credited listens in the background.'
         week_start:
           type: integer
           description: First day of the week, 0 = Sunday … 6 = Saturday. Monday (1) when unset.
@@ -21881,6 +22055,7 @@ components:
       - featured_artists
       - artist_variants
       - split_attributions
+      - joined_credits
       properties:
         mixed_albums:
           type: array
@@ -21904,6 +22079,13 @@ components:
           items:
             $ref: '#/components/schemas/SplitAttribution'
           description: Tracks carrying two different artists on the same record.
+        joined_credits:
+          type: array
+          items:
+            $ref: '#/components/schemas/JoinedCredit'
+          description: |-
+            Several artists stored as one string. `names` empty means no safe split
+            was found, and the row needs one by hand.
     Sanitised:
       type: object
       description: |-
@@ -21918,6 +22100,8 @@ components:
       - variant_listens_changed
       - splits_merged
       - split_listens_changed
+      - joined_split
+      - joined_listens_changed
       properties:
         albums_fixed:
           type: integer
@@ -21948,6 +22132,14 @@ components:
           format: int64
           minimum: 0
         split_listens_changed:
+          type: integer
+          format: int64
+          minimum: 0
+        joined_split:
+          type: integer
+          format: int64
+          minimum: 0
+        joined_listens_changed:
           type: integer
           format: int64
           minimum: 0
@@ -21985,6 +22177,15 @@ components:
           type: array
           items:
             $ref: '#/components/schemas/SplitEdit'
+        joined:
+          type: boolean
+          description: |-
+            Every derivable joined-credit split. Never includes the hand-split rows,
+            which have no split until someone writes one.
+        joined_edits:
+          type: array
+          items:
+            $ref: '#/components/schemas/JoinedEdit'
     SaveNoteRequest:
       allOf:
       - $ref: '#/components/schemas/TargetSpec'
@@ -22355,12 +22556,19 @@ components:
       required:
       - name
       - artist
+      - credited
       - plays
       properties:
         name:
           type: string
         artist:
           type: string
+          description: The artist the record is filed under, which opens it.
+        credited:
+          type: array
+          items:
+            type: string
+          description: Everyone credited on its listens, the record's artist first.
         plays:
           type: integer
           format: int64
@@ -22406,10 +22614,22 @@ components:
           type: string
         artist:
           type: string
+        artist_credit:
+          type:
+          - string
+          - 'null'
+          description: |-
+            Everyone credited, `"; "`-joined and primary first, when there is more
+            than one.
         album:
           type:
           - string
           - 'null'
+        album_artist:
+          type:
+          - string
+          - 'null'
+          description: Who `album` is filed under, which opens it.
         plays:
           type: integer
           format: int64
@@ -25724,10 +25944,22 @@ components:
           type: string
         artist:
           type: string
+        artist_credit:
+          type:
+          - string
+          - 'null'
+          description: |-
+            Everyone credited, `"; "`-joined and primary first, when there is more
+            than one. `artist` is the primary alone.
         album:
           type:
           - string
           - 'null'
+        album_artist:
+          type:
+          - string
+          - 'null'
+          description: Who `album` is filed under, which opens it.
         plays:
           type: integer
           format: int64
@@ -25765,6 +25997,21 @@ components:
           - string
           - 'null'
           description: Set on artist top-tracks (where the album varies), null on an album page.
+        artist_credit:
+          type:
+          - string
+          - 'null'
+          description: |-
+            Everyone credited on the track, `"; "`-joined and primary first, when
+            there is more than one.
+        artist:
+          type:
+          - string
+          - 'null'
+          description: |-
+            The artist the track's *album* is filed under. Set on artist
+            top-tracks, where it can be someone else — a soloist's concerto filed
+            under its composer — and is what opens the album; null on an album page.
         format_type:
           type:
           - string

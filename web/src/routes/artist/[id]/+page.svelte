@@ -9,6 +9,7 @@
 	import type { ArtistView } from '$lib/api';
 	import { formatDuration, qualityLabel, tierTagClass } from '$lib/utils';
 	import { openAlbum } from '$lib/entities';
+	import ArtistLinks from '$lib/components/ArtistLinks.svelte';
 	import { lovedKeys, isLovedNamed } from '$lib/loves';
 	import StatStrip from '$lib/components/StatStrip.svelte';
 	import BioCard from '$lib/components/BioCard.svelte';
@@ -185,6 +186,15 @@
 				{artist.album_count} album{artist.album_count === 1 ? '' : 's'} ·
 				{artist.track_count} track{artist.track_count === 1 ? '' : 's'} in your history
 			</p>
+			{#if artist.member_of?.length || artist.members?.length}
+				<!-- Linked, never counted: a group's listens are the group's and a
+				     member's are theirs. Only artists already in your history. -->
+				<p class="band">
+					{#if artist.member_of?.length}Member of <ArtistLinks names={artist.member_of} />{/if}
+					{#if artist.member_of?.length && artist.members?.length}{' · '}{/if}
+					{#if artist.members?.length}Members: <ArtistLinks names={artist.members} />{/if}
+				</p>
+			{/if}
 			<div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center;">
 				{#if artist.rank > 0}
 					<span class="rank">
@@ -331,8 +341,13 @@
 					<span class="n">{i + 1}</span>
 					<div style="flex:1;min-width:0;">
 						<div class="t-title">{t.title}</div>
+						{#if t.artist_credit?.includes(';')}
+							<div class="t-credit"><ArtistLinks artist={t.artist ?? artist.name} credit={t.artist_credit} /></div>
+						{/if}
 						{#if t.album}
-							<button class="t-album" on:click={() => artist && t.album && openAlbum(artist.name, t.album)}>{t.album}</button>
+							<!-- Opened under the artist it is filed under: a soloist's concerto
+							     lives on the composer's record, not on one of the soloist's. -->
+							<button class="t-album" on:click={() => artist && t.album && openAlbum(t.artist ?? artist.name, t.album)}>{t.album}</button>
 						{/if}
 						<div class="bar"><div class="fill" style="width:{topPlays ? (t.plays / topPlays) * 100 : 0}%"></div></div>
 					</div>
@@ -457,6 +472,13 @@
 		border: none; background: transparent; padding: 0; cursor: pointer;
 		font: inherit; font-size: 12.5px; color: var(--td-muted);
 		display: block; margin-top: 1px;
+	}
+	.band { margin: -8px 0 16px; color: var(--td-muted); font-size: 14px; }
+	/* Only on a track credited to more than one artist. */
+	.t-credit {
+		font-size: 12.5px; color: var(--td-muted);
+		white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+		margin-top: 1px;
 	}
 	.t-album:hover { color: var(--td-accent); text-decoration: underline; }
 	.bar {

@@ -7,6 +7,7 @@
 	import type { AlbumView, AlbumTracklist, TracklistTrack } from '$lib/api';
 	import { formatDuration, qualityLabel, tierTagClass } from '$lib/utils';
 	import { openArtist } from '$lib/entities';
+	import ArtistLinks from '$lib/components/ArtistLinks.svelte';
 	import { lovedKeys, isLovedNamed, toggleLoveByName } from '$lib/loves';
 	import CoverArt from '$lib/components/CoverArt.svelte';
 	import StatStrip from '$lib/components/StatStrip.svelte';
@@ -272,7 +273,7 @@
 			<div class="eyebrow">Album</div>
 			<h1 class="h-display" style="font-size:40px;margin:0 0 6px;line-height:1.04;">{album.title}</h1>
 			<p style="margin:0 0 16px;color:var(--td-muted);font-size:16px;">
-				<button class="linkish" on:click={() => album && openArtist(album.artist)}>{album.artist}</button>
+				<ArtistLinks artist={album.artist} names={album.credited} max={6} />
 				{album.year ? ` · ${album.year}` : ''}
 				{album.track_count ? ` · ${album.track_count} track${album.track_count === 1 ? '' : 's'}` : ''}
 			</p>
@@ -371,6 +372,9 @@
 					<span class="n">{showSides && r.side ? `${r.side}${r.position ?? ''}` : (r.position ?? '—')}</span>
 					<div style="flex:1;min-width:0;">
 						<div class="t-title">{r.title}</div>
+						{#if r.played?.artist_credit?.includes(';')}
+							<div class="t-credit"><ArtistLinks artist={r.artist} credit={r.played.artist_credit} /></div>
+						{/if}
 						<div class="bar"><div class="fill" style="width:{topPlays ? (r.plays / topPlays) * 100 : 0}%"></div></div>
 					</div>
 					<button class="t-love" class:on={isLoved}
@@ -394,6 +398,9 @@
 					<span class="n">{sort === 'sequence' ? (t.track_number ?? '—') : i + 1}</span>
 					<div style="flex:1;min-width:0;">
 						<div class="t-title">{t.title}</div>
+						{#if t.artist_credit?.includes(';')}
+							<div class="t-credit"><ArtistLinks artist={album.artist} credit={t.artist_credit} /></div>
+						{/if}
 						<div class="bar"><div class="fill" style="width:{topPlays ? (t.plays / topPlays) * 100 : 0}%"></div></div>
 					</div>
 					<button class="t-love" class:on={isLoved}
@@ -519,6 +526,12 @@
 	.t-title {
 		font-size: 14.5px; font-weight: 600;
 		white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+	}
+	/* Only on a track credited to more than the record's artist. */
+	.t-credit {
+		font-size: 12.5px; color: var(--td-muted);
+		white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+		margin-top: 2px;
 	}
 	.bar {
 		height: 5px; border-radius: 999px; background: var(--td-track);

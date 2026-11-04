@@ -1629,7 +1629,8 @@ deploy/                      Sample hardened systemd unit
 - [x] **Album and artist pages** — aggregations over your own listens, provider
       bios with attribution, artist portraits and wide pictures chosen per person
 - [x] **Metadata sanitiser** — per-edit review for mixed releases, featured
-      credits, artist spellings and tracks credited two ways on one record
+      credits, artist spellings, tracks credited two ways on one record, and
+      several artists stored as one name ("A, B" → A + B, or split by hand)
 - [x] **Sessions as objects** — merge, split, rebuild; stable UUIDs
 - [x] **Vinyl & cassette** — catalogue by barcode, catalogue number or name;
       play a side and it records every track on it, with a real 33⅓ platter,

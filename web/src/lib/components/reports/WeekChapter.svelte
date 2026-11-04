@@ -9,6 +9,7 @@
 	 */
 	import type { ReportPeriod } from '$lib/api';
 	import { openAlbum } from '$lib/entities';
+	import { creditedNames } from '$lib/credits';
 	import PeriodBars from '$lib/components/charts/PeriodBars.svelte';
 	import ChapterHead from './ChapterHead.svelte';
 	import TrendTrio from './TrendTrio.svelte';
@@ -61,7 +62,7 @@
 					kind="track"
 					label="Track of the week"
 					title={p.top_track.title}
-					sub={`${p.top_track.artist} · ${nf(p.top_track.plays)} plays`}
+					sub={`${creditedNames(p.top_track.artist, p.top_track.artist_credit).join(', ')} · ${nf(p.top_track.plays)} plays`}
 					iconSize={60}
 					onOpen={p.top_album ? () => openAlbum(p.top_album?.artist ?? '', p.top_album?.name ?? '') : null}
 				/>

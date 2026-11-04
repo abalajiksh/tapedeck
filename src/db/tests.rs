@@ -757,7 +757,7 @@ async fn the_whole_record_lookup_seeks_instead_of_scanning() {
     let p = plan(
         &db,
         "SELECT mbid_release FROM scrobbles
-              WHERE user_id = 1 AND LOWER(TRIM(artist)) = LOWER(TRIM('Burial'))
+              WHERE user_id = 1 AND LOWER(TRIM(COALESCE(album_filed_under, artist))) = LOWER(TRIM('Burial'))
                 AND LOWER(TRIM(album)) = LOWER(TRIM('Untrue'))
                 AND mbid_release IS NOT NULL AND TRIM(mbid_release) != ''
               GROUP BY mbid_release ORDER BY COUNT(*) DESC LIMIT 1",
@@ -10797,4 +10797,768 @@ fn what_counts_as_a_hand_set_picture() {
     assert_eq!(hand_set_source("portrait", "  "), None);
     // Nothing fills a wide picture automatically, so every one was a choice.
     assert_eq!(hand_set_source("wide", "https://cdn-images.dzcdn.net/images/a.jpg"), Some("link"));
+}
+
+/// A joined credit is stored as one primary plus everyone credited, and still
+/// forwarded as the client named it.
+///
+/// This is the Navidrome-plugin shape: `artist_name` is the display string
+/// "Lady Gaga, Bruno Mars" and `artist_names` the real list. Before
+/// `normalise_credit` the display string became `scrobbles.artist`, so the
+/// history, search and the album grouping showed one artist who does not
+/// exist, and `scrobble_artists` credited that phantom first.
+#[tokio::test]
+async fn a_joined_credit_stores_a_primary_and_forwards_the_original() {
+    let db = testdb().await;
+    let uid = db.create_user("kit", None, "x", "user").await.unwrap();
+
+    let mut listed = play("Die With A Smile", "Lady Gaga, Bruno Mars", 1_000);
+    listed.artists = Some(vec!["Lady Gaga".into(), "Bruno Mars".into()]);
+    let split = play("Get Lucky", "Daft Punk feat. Pharrell Williams", 2_000);
+    let band = play("Mrs. Robinson", "Simon & Garfunkel", 3_000);
+    for p in [&listed, &split, &band] {
+        db.save_scrobble(uid, p, None, None, None, None, None, None, None, ListenDisposition::LIVE)
+            .await
+            .unwrap();
+    }
+
+    let stored: Vec<(String, Option<String>, Option<String>)> = sqlx::query_as(
+        "SELECT artist, artist_display, artist_credit FROM scrobbles ORDER BY timestamp",
+    )
+    .fetch_all(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        stored,
+        vec![
+            (
+                "Lady Gaga".into(),
+                Some("Lady Gaga, Bruno Mars".into()),
+                Some("Lady Gaga; Bruno Mars".into())
+            ),
+            (
+                "Daft Punk".into(),
+                Some("Daft Punk feat. Pharrell Williams".into()),
+                Some("Daft Punk; Pharrell Williams".into())
+            ),
+            ("Simon & Garfunkel".into(), None, None),
+        ]
+    );
+
+    // Both are credited, and nobody called "Lady Gaga, Bruno Mars" is.
+    assert_eq!(db.artist_plays(uid, "Bruno Mars").await.unwrap(), 1);
+    assert_eq!(db.artist_plays(uid, "Lady Gaga").await.unwrap(), 1);
+    assert_eq!(db.artist_plays(uid, "Lady Gaga, Bruno Mars").await.unwrap(), 0);
+
+    // A featured artist is still findable: search offers both real names
+    // and never the joined string, and the history filter matches the credit.
+    let (found, _, _) = db.search_library(uid, "bruno", 10).await.unwrap();
+    assert_eq!(found.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(), ["Bruno Mars"]);
+    for who in ["Bruno Mars", "pharrell"] {
+        let rows = db
+            .get_recent_scrobbles(uid, 10, 0, Some(who), None, None, None, None, None)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1, "history filtered by {who}");
+    }
+
+    // Forwarding is unchanged: Last.fm gets the string it always got.
+    let pending: Vec<String> =
+        db.get_pending_scrobbles().await.unwrap().into_iter().map(|p| p.play.artist).collect();
+    assert_eq!(
+        pending,
+        ["Lady Gaga, Bruno Mars", "Daft Punk feat. Pharrell Williams", "Simon & Garfunkel"]
+    );
+}
+
+/// The history pass: listens stored before `normalise_credit` existed get the
+/// split a new listen would, and are re-credited so the phantom joined artist
+/// disappears from the charts.
+#[tokio::test]
+async fn the_sanitiser_splits_joined_credits_already_in_the_history() {
+    let db = testdb().await;
+    let uid = db.create_user("kit", None, "x", "user").await.unwrap();
+
+    // Written the way the old insert did: the joined string is the artist and
+    // is credited in `scrobble_artists` as if it were a person.
+    let old = |title: &str, artist: &str, credit: Option<&str>, ts: i64| {
+        let (db, title, artist, credit) =
+            (&db, title.to_string(), artist.to_string(), credit.map(str::to_string));
+        async move {
+            sqlx::query(
+                "INSERT INTO scrobbles (user_id, title, artist, artist_credit, timestamp,
+                                        source_id, source_name, status)
+                 VALUES (?, ?, ?, ?, ?, ?, 'old', 'pending')",
+            )
+            .bind(uid)
+            .bind(&title)
+            .bind(&artist)
+            .bind(&credit)
+            .bind(ts)
+            .bind(format!("old-{ts}"))
+            .execute(&db.pool)
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO scrobble_artists (scrobble_id, artist_key, name, position)
+                 SELECT id, LOWER(artist), artist, 0 FROM scrobbles WHERE source_id = ?",
+            )
+            .bind(format!("old-{ts}"))
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        }
+    };
+    old("Die With A Smile", "Lady Gaga, Bruno Mars", Some("Lady Gaga; Bruno Mars"), 1).await;
+    old("Die With A Smile", "Lady Gaga, Bruno Mars", Some("Lady Gaga; Bruno Mars"), 2).await;
+    old("Get Lucky", "Daft Punk feat. Pharrell Williams", None, 3).await;
+    old("Mrs. Robinson", "Simon & Garfunkel", None, 4).await;
+    old("Xtal", "Aphex Twin", None, 5).await;
+    // What the older featured-credit fold left behind: the primary already
+    // in `artist`, the whole string in the credit, credited as a phantom.
+    old("One More Time", "Daft Punk", Some("Daft Punk feat. Romanthony"), 6).await;
+    sqlx::query("UPDATE scrobble_artists SET artist_key = 'daft punk feat. romanthony', name = 'Daft Punk feat. Romanthony' WHERE scrobble_id = (SELECT id FROM scrobbles WHERE source_id = 'old-6')")
+        .execute(&db.pool).await.unwrap();
+
+    let preview = db.joined_artist_credits(uid).await.unwrap();
+    let mut shape: Vec<(&str, Vec<&str>, i64)> = preview
+        .iter()
+        .map(|j| (j.artist.as_str(), j.names.iter().map(String::as_str).collect(), j.plays))
+        .collect();
+    // Ordered by plays; ties are in no particular order.
+    shape.sort_by(|a, b| b.2.cmp(&a.2).then(a.0.cmp(b.0)));
+    assert_eq!(
+        shape,
+        vec![
+            ("Lady Gaga, Bruno Mars", vec!["Lady Gaga", "Bruno Mars"], 2),
+            ("Daft Punk", vec!["Daft Punk", "Romanthony"], 1),
+            ("Daft Punk feat. Pharrell Williams", vec!["Daft Punk", "Pharrell Williams"], 1),
+            // Offered for a hand split, with nothing proposed.
+            ("Simon & Garfunkel", vec![], 1),
+        ]
+    );
+
+    for j in preview.iter().filter(|j| !j.names.is_empty()) {
+        db.split_artist_credit(uid, &j.artist, j.credit.as_deref(), &j.names).await.unwrap();
+    }
+
+    assert_eq!(db.artist_plays(uid, "Lady Gaga").await.unwrap(), 2);
+    assert_eq!(db.artist_plays(uid, "Bruno Mars").await.unwrap(), 2);
+    assert_eq!(db.artist_plays(uid, "Pharrell Williams").await.unwrap(), 1);
+    assert_eq!(db.artist_plays(uid, "Lady Gaga, Bruno Mars").await.unwrap(), 0);
+    assert_eq!(db.artist_plays(uid, "Simon & Garfunkel").await.unwrap(), 1, "left alone");
+    assert_eq!(db.artist_plays(uid, "Romanthony").await.unwrap(), 1);
+    assert_eq!(db.artist_plays(uid, "Daft Punk feat. Romanthony").await.unwrap(), 0);
+
+    // Still forwarded exactly as it was written.
+    let pending: Vec<String> =
+        db.get_pending_scrobbles().await.unwrap().into_iter().map(|p| p.play.artist).collect();
+    assert_eq!(pending[0], "Lady Gaga, Bruno Mars");
+    assert_eq!(pending[2], "Daft Punk feat. Pharrell Williams");
+
+    // And once split, nothing is offered again.
+    let again = db.joined_artist_credits(uid).await.unwrap();
+    assert_eq!(again.iter().map(|j| j.artist.as_str()).collect::<Vec<_>>(), ["Simon & Garfunkel"]);
+}
+
+/// A joined listen is the same listen whichever spelling each copy is in.
+///
+/// Found testing the branch against a household export (2026-11-02): a
+/// "Rihanna, Britney Spears" listen re-sent with `artist_names` was stored as
+/// "Rihanna", never met the unsplit row already held, and was banked twice.
+/// The same copy without the list was caught. Neither side has a recording
+/// MBID here, so only the artist comparison can catch them.
+#[tokio::test]
+async fn a_joined_listen_dedups_against_either_spelling() {
+    let db = testdb().await;
+    let uid = db.create_user("kit", None, "x", "user").await.unwrap();
+    let count = |title: &'static str| {
+        let db = &db;
+        async move {
+            let (n,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM scrobbles WHERE title = ?")
+                .bind(title)
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+            n
+        }
+    };
+
+    // Stored before `normalise_credit`: the joined string is the artist.
+    sqlx::query(
+        "INSERT INTO scrobbles (user_id, title, artist, timestamp, source_id, source_name, status)
+         VALUES (?, 'S&M Remix', 'Rihanna, Britney Spears', 1000, 'spotify-1', 'spotify', 'imported')",
+    )
+    .bind(uid)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    let mut listed = play("S&M Remix", "Rihanna, Britney Spears", 1_005);
+    listed.artists = Some(vec!["Rihanna".into(), "Britney Spears".into()]);
+    let saved = db
+        .save_scrobble(
+            uid,
+            &listed,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            ListenDisposition::LIVE,
+        )
+        .await
+        .unwrap();
+    assert!(!saved, "a listed copy is the unsplit listen already held");
+    let mut imported = listed.clone();
+    imported.source_id = "lb-1".into();
+    imported.timestamp = 1_003;
+    assert_ne!(db.import_listen(uid, &imported).await.unwrap(), ImportOutcome::Inserted);
+    assert_eq!(count("S&M Remix").await, 1);
+
+    // The other way round: stored split, the copy arrives without a list.
+    let mut first = play("Die With A Smile", "Lady Gaga, Bruno Mars", 2_000);
+    first.artists = Some(vec!["Lady Gaga".into(), "Bruno Mars".into()]);
+    db.save_scrobble(
+        uid,
+        &first,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        ListenDisposition::LIVE,
+    )
+    .await
+    .unwrap();
+    let bare = play("Die With A Smile", "Lady Gaga, Bruno Mars", 2_004);
+    let saved = db
+        .save_scrobble(
+            uid,
+            &bare,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            ListenDisposition::LIVE,
+        )
+        .await
+        .unwrap();
+    assert!(!saved, "a list-less copy matches the split row's artist_display");
+    assert_eq!(count("Die With A Smile").await, 1);
+
+    // A different artist with the same title is still a different listen.
+    let cover = play("Die With A Smile", "Some Cover Band", 2_006);
+    assert!(db
+        .save_scrobble(
+            uid,
+            &cover,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            ListenDisposition::LIVE
+        )
+        .await
+        .unwrap());
+}
+
+/// A split that leaves a part still joined is never proposed, and a row an
+/// earlier split left that way comes back for a hand split against its whole
+/// credit.
+#[tokio::test]
+async fn a_split_that_leaves_a_joined_part_goes_to_the_hand_list() {
+    let db = testdb().await;
+    let uid = db.create_user("kit", None, "x", "user").await.unwrap();
+    let insert = |artist: &str, credit: Option<&str>, ts: i64| {
+        let (db, artist, credit) = (&db, artist.to_string(), credit.map(str::to_string));
+        async move {
+            sqlx::query(
+                "INSERT INTO scrobbles (user_id, title, artist, artist_credit, timestamp,
+                                        source_id, source_name, status)
+                 VALUES (?, 't', ?, ?, ?, ?, 'old', 'imported')",
+            )
+            .bind(uid)
+            .bind(&artist)
+            .bind(&credit)
+            .bind(ts)
+            .bind(format!("old-{ts}"))
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        }
+    };
+    // Cut on `;`, the second half would be four composers filed as one.
+    insert("Yuja Wang; Kapustin, Schumann, Tchaikovsky, Prokofiev", None, 1).await;
+    // What applying that kind of split used to leave behind.
+    insert("Aftab Darvishi, Unsuk Chin", Some("Aftab Darvishi, Unsuk Chin; Anne-Sophie Mutter"), 2)
+        .await;
+    // A clean `;` split is still proposed.
+    insert("Bach; Hilary Hahn", None, 3).await;
+
+    let preview = db.joined_artist_credits(uid).await.unwrap();
+    let yuja = preview.iter().find(|j| j.artist.starts_with("Yuja Wang")).unwrap();
+    assert!(yuja.names.is_empty(), "not proposed");
+    let stuck = preview.iter().find(|j| j.artist.starts_with("Aftab Darvishi")).unwrap();
+    assert!(stuck.names.is_empty(), "offered again, by hand");
+    assert_eq!(stuck.subject(), "Aftab Darvishi, Unsuk Chin; Anne-Sophie Mutter");
+    let bach = preview.iter().find(|j| j.artist.starts_with("Bach")).unwrap();
+    assert_eq!(bach.names, ["Bach", "Hilary Hahn"]);
+
+    // The hand split is checked against the whole credit, so it cannot drop
+    // the soloist the earlier split had kept.
+    assert!(!credit_covers(stuck.subject(), &["Aftab Darvishi", "Unsuk Chin"]));
+    let all = ["Aftab Darvishi", "Unsuk Chin", "Anne-Sophie Mutter"];
+    assert!(credit_covers(stuck.subject(), &all));
+    let names: Vec<String> = all.iter().map(|s| s.to_string()).collect();
+    db.split_artist_credit(uid, &stuck.artist, stuck.credit.as_deref(), &names).await.unwrap();
+    assert_eq!(db.artist_plays(uid, "Unsuk Chin").await.unwrap(), 1);
+    assert_eq!(db.artist_plays(uid, "Anne-Sophie Mutter").await.unwrap(), 1);
+    assert!(db
+        .joined_artist_credits(uid)
+        .await
+        .unwrap()
+        .iter()
+        .all(|j| !j.artist.starts_with("Aftab")));
+}
+
+/// Every surface that names a track's artist can name all of them, and search
+/// finds a record by anyone credited on it.
+///
+/// The case Ashwin raised (2026-11-03): searching "hilary hahn" must find the
+/// concerto she plays on a record filed under its composer, and each line must
+/// name everyone rather than reading as if the record's artist were her.
+#[tokio::test]
+async fn credits_reach_charts_albums_and_search() {
+    let db = testdb().await;
+    let uid = db.create_user("kit", None, "x", "user").await.unwrap();
+    for ts in [1_000u64, 2_000] {
+        let mut p = play("Violin Concerto", "Felix Mendelssohn", ts);
+        p.album = Some("Mendelssohn & Shostakovich".into());
+        p.artists = Some(vec!["Felix Mendelssohn".into(), "Hilary Hahn".into()]);
+        db.save_scrobble(
+            uid,
+            &p,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            ListenDisposition::LIVE,
+        )
+        .await
+        .unwrap();
+    }
+    let mut solo = play("Partita No. 2", "Johann Sebastian Bach", 3_000);
+    solo.album = Some("Bach Partitas".into());
+    db.save_scrobble(uid, &solo, None, None, None, None, None, None, None, ListenDisposition::LIVE)
+        .await
+        .unwrap();
+
+    // The tracks chart carries the credit beside the primary.
+    let chart = db.chart(uid, "tracks", None, 10, false).await.unwrap();
+    let concerto = chart.iter().find(|r| r.name == "Violin Concerto").unwrap();
+    assert_eq!(concerto.sub.as_deref(), Some("Felix Mendelssohn"));
+    assert_eq!(concerto.artist_credit.as_deref(), Some("Felix Mendelssohn; Hilary Hahn"));
+
+    // The album names everyone, its own artist first, and so does its tracklist.
+    let credited =
+        db.album_credits(uid, "Felix Mendelssohn", "Mendelssohn & Shostakovich", 10).await.unwrap();
+    assert_eq!(credited, ["Felix Mendelssohn", "Hilary Hahn"]);
+    let tracks =
+        db.album_tracks(uid, "Felix Mendelssohn", "Mendelssohn & Shostakovich").await.unwrap();
+    assert_eq!(tracks[0].artist_credit.as_deref(), Some("Felix Mendelssohn; Hilary Hahn"));
+
+    // Her artist page opens the record under the artist it is filed under.
+    let top = db.artist_top_tracks(uid, "Hilary Hahn", 10).await.unwrap();
+    assert_eq!(top[0].artist.as_deref(), Some("Felix Mendelssohn"));
+
+    // Search: her name finds the album and the track filed under Mendelssohn,
+    // and never the Bach record she is not on.
+    let (artists, albums, tracks) = db.search_library(uid, "hilary hahn", 10).await.unwrap();
+    assert_eq!(artists.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(), ["Hilary Hahn"]);
+    assert_eq!(albums.len(), 1);
+    assert_eq!(albums[0].0, "Mendelssohn & Shostakovich");
+    assert_eq!(albums[0].3, ["Felix Mendelssohn", "Hilary Hahn"]);
+    assert_eq!(tracks.len(), 1);
+    assert_eq!(tracks[0].3.as_deref(), Some("Felix Mendelssohn; Hilary Hahn"));
+}
+
+/// A sanitiser split keeps the credit it overwrote, so it can be undone.
+#[tokio::test]
+async fn a_split_keeps_the_credit_it_replaced() {
+    let db = testdb().await;
+    let uid = db.create_user("kit", None, "x", "user").await.unwrap();
+    for (ts, artist, credit) in
+        [(1, "Daft Punk", Some("Daft Punk feat. Romanthony")), (2, "Lady Gaga, Bruno Mars", None)]
+    {
+        sqlx::query(
+            "INSERT INTO scrobbles (user_id, title, artist, artist_credit, timestamp,
+                                    source_id, source_name, status)
+             VALUES (?, 't', ?, ?, ?, ?, 'old', 'imported')",
+        )
+        .bind(uid)
+        .bind(artist)
+        .bind(credit)
+        .bind(ts)
+        .bind(format!("old-{ts}"))
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    }
+    let names = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+    db.split_artist_credit(
+        uid,
+        "Daft Punk",
+        Some("Daft Punk feat. Romanthony"),
+        &names(&["Daft Punk", "Romanthony"]),
+    )
+    .await
+    .unwrap();
+    db.split_artist_credit(
+        uid,
+        "Lady Gaga, Bruno Mars",
+        None,
+        &names(&["Lady Gaga", "Bruno Mars"]),
+    )
+    .await
+    .unwrap();
+    // A second split of the same row keeps the first record of what was there.
+    db.split_artist_credit(
+        uid,
+        "Lady Gaga",
+        Some("Lady Gaga; Bruno Mars"),
+        &names(&["Bruno Mars", "Lady Gaga"]),
+    )
+    .await
+    .unwrap();
+
+    let rows: Vec<(String, Option<String>, Option<String>)> = sqlx::query_as(
+        "SELECT artist_display, previous_artist_credit, artist_credit FROM scrobbles
+          ORDER BY timestamp",
+    )
+    .fetch_all(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        rows,
+        vec![
+            (
+                "Daft Punk".into(),
+                Some("Daft Punk feat. Romanthony".into()),
+                Some("Daft Punk; Romanthony".into())
+            ),
+            (
+                "Lady Gaga, Bruno Mars".into(),
+                Some(String::new()),
+                Some("Bruno Mars; Lady Gaga".into())
+            ),
+        ]
+    );
+}
+
+/// Patch's two visibility fragments are one rule: the credits form only adds
+/// the fan-out join. A change to who may see a listen has to land in both.
+#[test]
+fn patch_visibility_is_one_rule() {
+    let tail = |f: &str| f.split_once("JOIN users").map(|(_, t)| t.to_string()).unwrap();
+    assert_eq!(tail(Database::PATCH_VISIBLE_LISTENS), tail(Database::PATCH_VISIBLE_CREDITS));
+    assert!(Database::PATCH_VISIBLE_CREDITS
+        .contains("JOIN scrobble_artists sa ON sa.scrobble_id = s.id"));
+}
+
+/// A soundtrack or a box set is one album under its album artist, whoever
+/// performs each track — and a listen stored before there was an album artist
+/// still groups exactly as it did.
+#[tokio::test]
+async fn an_album_is_filed_under_its_album_artist() {
+    let db = testdb().await;
+    let uid = db.create_user("kit", None, "x", "user").await.unwrap();
+    for (ts, title, artist) in [
+        (1_000u64, "Partita No. 2", "Johann Sebastian Bach"),
+        (2_000, "Violin Concerto", "Felix Mendelssohn"),
+    ] {
+        let mut p = play(title, artist, ts);
+        p.album = Some("The Complete Sony Recordings".into());
+        p.album_artist = Some("Hilary Hahn".into());
+        db.save_scrobble(
+            uid,
+            &p,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            ListenDisposition::LIVE,
+        )
+        .await
+        .unwrap();
+    }
+    // Written the old way: no filing, so it groups by its artist as before.
+    sqlx::query(
+        "INSERT INTO scrobbles (user_id, title, artist, album, timestamp, source_id, source_name, status)
+         VALUES (?, 'Xtal', 'Aphex Twin', 'Selected Ambient Works', 3000, 'old-1', 'old', 'imported')",
+    )
+    .bind(uid)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+
+    let albums = db.chart(uid, "albums", None, 10, false).await.unwrap();
+    let box_set = albums.iter().find(|r| r.name == "The Complete Sony Recordings").unwrap();
+    assert_eq!(box_set.sub.as_deref(), Some("Hilary Hahn"));
+    assert_eq!(box_set.plays, 2, "one album, not one per composer");
+    let old = albums.iter().find(|r| r.name == "Selected Ambient Works").unwrap();
+    assert_eq!(old.sub.as_deref(), Some("Aphex Twin"));
+
+    let tracks = db.album_tracks(uid, "Hilary Hahn", "The Complete Sony Recordings").await.unwrap();
+    assert_eq!(tracks.len(), 2);
+    assert_eq!(
+        db.album_tracks(uid, "Aphex Twin", "Selected Ambient Works").await.unwrap().len(),
+        1
+    );
+}
+
+/// Re-crediting a track to its performer never moves its album; a release's
+/// credit files a listen only when the listen is on that record.
+#[tokio::test]
+async fn credits_never_move_an_album_and_a_release_files_only_its_own_tracks() {
+    use crate::musicbrainz::{CreditedArtist, RecordingCredits, ReleaseInfo};
+    let db = testdb().await;
+    let uid = db.create_user("kit", None, "x", "user").await.unwrap();
+    let a = |name: &str, mbid: &str| CreditedArtist {
+        name: name.into(),
+        mbid: mbid.into(),
+        join: String::new(),
+        credited_as: name.into(),
+    };
+    let insert = |title: &str, artist: &str, album: &str, rec: &str, rel: &str, ts: i64| {
+        let (db, title, artist, album, rec, rel) = (
+            &db,
+            title.to_string(),
+            artist.to_string(),
+            album.to_string(),
+            rec.to_string(),
+            rel.to_string(),
+        );
+        async move {
+            sqlx::query(
+                "INSERT INTO scrobbles (user_id, title, artist, album, timestamp, source_id,
+                                        source_name, status, mbid_recording, mbid_release)
+                 VALUES (?, ?, ?, ?, ?, ?, 'old', 'imported', ?, ?)",
+            )
+            .bind(uid)
+            .bind(&title)
+            .bind(&artist)
+            .bind(&album)
+            .bind(ts)
+            .bind(format!("old-{ts}"))
+            .bind(&rec)
+            .bind(&rel)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        }
+    };
+    insert("Violin Concerto", "Felix Mendelssohn", "Violin Concertos", "rec-1", "rel-vc", 1).await;
+    insert(
+        "Partita No. 2",
+        "Johann Sebastian Bach",
+        "The Complete Sony Recordings",
+        "rec-2",
+        "rel-bach",
+        2,
+    )
+    .await;
+
+    let concerto = RecordingCredits {
+        artists: vec![a("Hilary Hahn", "hahn")],
+        composers: vec![a("Felix Mendelssohn", "fm")],
+    };
+    db.apply_recording_credits("rec-1", &concerto).await.unwrap();
+    let (artist, filed): (String, Option<String>) = sqlx::query_as(
+        "SELECT artist, album_filed_under FROM scrobbles WHERE mbid_recording = 'rec-1'",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(artist, "Hilary Hahn", "filed under the performer by default");
+    assert_eq!(filed.as_deref(), Some("Felix Mendelssohn"), "the album stays where it was");
+
+    // The release title matches this listen's album: its credit files it.
+    let vc = ReleaseInfo {
+        title: "Violin Concertos".into(),
+        artists: vec![a("Hilary Hahn", "hahn")],
+        release_group: Some("rg-vc".into()),
+    };
+    assert_eq!(db.apply_release_info("rel-vc", &vc).await.unwrap(), 1);
+    // A box-set track mapped to the album it first came out on: not filed.
+    let bach = ReleaseInfo {
+        title: "Hilary Hahn plays Bach".into(),
+        artists: vec![a("Bach", "bach"), a("Hilary Hahn", "hahn")],
+        release_group: Some("rg-bach".into()),
+    };
+    assert_eq!(db.apply_release_info("rel-bach", &bach).await.unwrap(), 0);
+
+    let rows: Vec<(String, Option<String>, Option<String>)> = sqlx::query_as(
+        "SELECT title, album_filed_under, mbid_release_group FROM scrobbles ORDER BY timestamp",
+    )
+    .fetch_all(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        rows[0],
+        ("Violin Concerto".into(), Some("Hilary Hahn".into()), Some("rg-vc".into()))
+    );
+    assert_eq!(
+        rows[1],
+        ("Partita No. 2".into(), None, Some("rg-bach".into())),
+        "the group is kept all the same"
+    );
+}
+
+/// A love on an album follows the album onto its album artist and keeps
+/// answering to its old key.
+#[tokio::test]
+async fn an_album_love_moves_with_its_album_and_keeps_its_old_key() {
+    let db = testdb().await;
+    let uid = db.create_user("kit", None, "x", "user").await.unwrap();
+    let mut p = play("Kadhal Aasai", "Sid Sriram", 1_000);
+    p.album = Some("Anjaan".into());
+    db.save_scrobble(uid, &p, None, None, None, None, None, None, None, ListenDisposition::LIVE)
+        .await
+        .unwrap();
+    let id = db.upsert_entity("release", "Anjaan", "Sid Sriram", None).await.unwrap();
+    db.set_love(uid, id, true).await.unwrap();
+
+    // The album artist becomes known.
+    sqlx::query("UPDATE scrobbles SET album_artist = 'Yuvan Shankar Raja', album_filed_under = 'Yuvan Shankar Raja'")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let (moved, left) = db.migrate_album_entities().await.unwrap();
+    assert_eq!((moved, left.len()), (1, 0));
+
+    let e = db.get_entity(id).await.unwrap().unwrap();
+    assert_eq!(e.artist_name, "Yuvan Shankar Raja");
+    // The old key still finds the same entity, and still fills the heart.
+    assert_eq!(db.upsert_entity("release", "Anjaan", "Sid Sriram", None).await.unwrap(), id);
+    let keys = db.loved_keys(uid).await.unwrap();
+    assert!(keys.contains(&"release|yuvan shankar raja|anjaan".to_string()));
+    assert!(keys.contains(&"release|sid sriram|anjaan".to_string()));
+    // Run again, nothing more to do.
+    assert_eq!(db.migrate_album_entities().await.unwrap().0, 0);
+}
+
+/// An MBID shared by two different names folds neither — the box-set listen
+/// filed under Shostakovich that carried the set's MBIDs was folded into Bach
+/// (2026-11-04). Two spellings of one name under one MBID still fold.
+#[tokio::test]
+async fn a_shared_mbid_folds_only_spellings_of_one_name() {
+    let db = testdb().await;
+    let uid = db.create_user("sam", None, "x", "user").await.unwrap();
+    let hahn = "93dbb52a-3d19-4f64-adc6-524f1921765b";
+    let mut n = 0u64;
+    let mut save = |title: &str, artist: &str, mbids: Vec<&str>| {
+        n += 1;
+        let mut p = play(title, artist, 1_000 + n * 1_000);
+        p.album = Some("Hilary Hahn: The Complete Sony Recordings".into());
+        p.mbid_artist = Some(mbids.into_iter().map(String::from).collect());
+        p
+    };
+    let plays = vec![
+        save("Partita No. 2", "Johann Sebastian Bach", vec![hahn]),
+        save("Partita No. 3", "Johann Sebastian Bach", vec![hahn]),
+        save("Violin Concerto No. 1", "Dmitri Shostakovich", vec![hahn, "b", "c"]),
+        save("Let's Get It Started", "The Black Eyed Peas", vec!["bep"]),
+        save("Pump It", "The Black Eyed Peas", vec!["bep"]),
+        save("Where Is the Love", "Black Eyed Peas", vec!["bep"]),
+        save("Vogue", "Madonna", vec!["mad"]),
+        save("Frozen", "Madonna", vec!["mad"]),
+        save("Popular", "Madonna & Sabrina Carpenter", vec!["mad"]),
+    ];
+    for p in &plays {
+        db.save_scrobble(uid, p, None, None, None, None, None, None, None, ListenDisposition::LIVE)
+            .await
+            .unwrap();
+    }
+    // Simulate a row written under the old positional rule: Shostakovich with
+    // Hahn's MBID.
+    sqlx::query("UPDATE scrobble_artists SET mbid = ? WHERE artist_key = 'dmitri shostakovich'")
+        .bind(hahn)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+    db.unify_artist_spellings().await.unwrap();
+
+    let names: Vec<(String, String)> = sqlx::query_as(
+        "SELECT s.title, sa.name FROM scrobble_artists sa JOIN scrobbles s ON s.id = sa.scrobble_id
+          ORDER BY s.timestamp",
+    )
+    .fetch_all(&db.pool)
+    .await
+    .unwrap();
+    let by =
+        |t: &str| names.iter().filter(|(x, _)| x == t).map(|(_, n)| n.clone()).collect::<Vec<_>>();
+    assert_eq!(by("Violin Concerto No. 1"), vec!["Dmitri Shostakovich"], "never folded into Bach");
+    assert_eq!(by("Where Is the Love"), vec!["The Black Eyed Peas"], "a spelling folds");
+    assert_eq!(
+        by("Popular"),
+        vec!["Madonna & Sabrina Carpenter"],
+        "a joined credit is not a spelling"
+    );
+
+    // The folded spelling still opens the artist; one with credits of its own
+    // is left as it is.
+    assert_eq!(
+        db.credited_spelling(uid, "Black Eyed Peas").await.unwrap().as_deref(),
+        Some("The Black Eyed Peas")
+    );
+    assert_eq!(db.credited_spelling(uid, "Dmitri Shostakovich").await.unwrap(), None);
+    assert_eq!(db.credited_spelling(uid, "Nobody At All").await.unwrap(), None);
+}
+
+/// A name gets an MBID only when the source's list lines up with the MBIDs.
+#[test]
+fn credit_mbids_attach_only_when_the_lists_line_up() {
+    let mut p = play("Violin Concerto No. 1", "Dmitri Shostakovich", 1);
+    p.mbid_artist = Some(vec!["hahn".into(), "b".into(), "c".into()]);
+    assert_eq!(credited_artists(&p), vec![("Dmitri Shostakovich".to_string(), None)]);
+
+    let mut p = play("Dans la nuit", "Cœur de pirate", 1);
+    p.artists = Some(vec!["Cœur de pirate".into(), "Loud".into()]);
+    p.mbid_artist = Some(vec!["cdp".into(), "loud".into()]);
+    assert_eq!(
+        credited_artists(&p),
+        vec![
+            ("Cœur de pirate".to_string(), Some("cdp".to_string())),
+            ("Loud".to_string(), Some("loud".to_string()))
+        ]
+    );
+
+    // Primary first, MBIDs still by the source's own order.
+    let mut p = play("Concerto", "Hilary Hahn", 1);
+    p.artists = Some(vec!["Felix Mendelssohn".into(), "Hilary Hahn".into()]);
+    p.mbid_artist = Some(vec!["mendelssohn".into(), "hahn".into()]);
+    assert_eq!(
+        credited_artists(&p),
+        vec![
+            ("Hilary Hahn".to_string(), Some("hahn".to_string())),
+            ("Felix Mendelssohn".to_string(), Some("mendelssohn".to_string()))
+        ]
+    );
 }

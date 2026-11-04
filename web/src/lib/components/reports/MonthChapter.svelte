@@ -4,6 +4,8 @@
 	 *  a genre split, which a week does not. */
 	import type { ReportPeriod } from '$lib/api';
 	import { openAlbum, openArtist } from '$lib/entities';
+	import { creditedNames } from '$lib/credits';
+	import ArtistLinks from '$lib/components/ArtistLinks.svelte';
 	import PeriodBars from '$lib/components/charts/PeriodBars.svelte';
 	import ListeningClock from '$lib/components/charts/ListeningClock.svelte';
 	import Fingerprint from '$lib/components/charts/Fingerprint.svelte';
@@ -89,7 +91,7 @@
 						kind="track"
 						label="Track of the month"
 						title={p.top_track.title}
-						sub={`${p.top_track.artist} · ${nf(p.top_track.plays)} plays`}
+						sub={`${creditedNames(p.top_track.artist, p.top_track.artist_credit).join(', ')} · ${nf(p.top_track.plays)} plays`}
 						onOpen={p.top_album
 							? () => openAlbum(p.top_album?.artist ?? '', p.top_album?.name ?? '')
 							: () => openArtist(p.top_track?.artist ?? '')}
@@ -150,7 +152,7 @@
 					<div class="ini h-display">{(r.artist || r.title).charAt(0).toUpperCase()}</div>
 					<div style="flex:1;min-width:0;">
 						<div class="rt">{r.title}</div>
-						<div class="ra">{r.artist}</div>
+						<div class="ra"><ArtistLinks artist={r.artist} credit={r.artist_credit} /></div>
 					</div>
 					<div class="rn"><div class="h-display">{r.plays}</div><div class="rl">in one day</div></div>
 				</div>

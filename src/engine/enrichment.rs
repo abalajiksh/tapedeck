@@ -19,11 +19,29 @@ pub async fn enrich_play(
             let caa_id_str =
                 metadata.caa_id.map(|id| id.to_string()).unwrap_or_else(|| "none".to_string());
 
-            play.mbid_recording = metadata.track_mbid;
-            play.mbid_release = metadata.album_mbid;
-            play.mbid_artist = metadata.artist_mbid.as_ref().map(|id| vec![id.clone()]);
-            play.caa_id = metadata.caa_id;
-            play.caa_release_mbid = metadata.caa_release_mbid;
+            // **Blanks only.** A source's own ids came off the file's tags and
+            // outrank a name search's best guess; overwriting them threw away
+            // exactly the metadata Tapedeck runs on. The search keeps only the
+            // first credited artist, so it never replaces a fuller list either —
+            // the full credit comes from the recording lookup
+            // (`fetch_recording_credits`) once the recording MBID is known.
+            let same_release =
+                play.mbid_release.is_none() || play.mbid_release == metadata.album_mbid;
+            if play.mbid_recording.is_none() {
+                play.mbid_recording = metadata.track_mbid;
+            }
+            if play.mbid_release.is_none() {
+                play.mbid_release = metadata.album_mbid;
+            }
+            if play.mbid_artist.as_ref().is_none_or(|a| a.is_empty()) {
+                play.mbid_artist = metadata.artist_mbid.as_ref().map(|id| vec![id.clone()]);
+            }
+            // The cover belongs to the release the search found; only where
+            // that is the listen's release too.
+            if same_release && play.caa_id.is_none() {
+                play.caa_id = metadata.caa_id;
+                play.caa_release_mbid = metadata.caa_release_mbid;
+            }
 
             info!(
                 "✓ Enriched: {} - {} [recording: {}, release: {}, artist: {}, caa: {}]",

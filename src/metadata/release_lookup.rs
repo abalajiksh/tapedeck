@@ -81,6 +81,20 @@ pub struct PhysicalTrack {
     // disc", not "disc 1", and the panel groups only when it actually knows.
     #[serde(default)]
     pub disc: Option<i64>,
+    /// The MusicBrainz ids the release lookup returns for this track — the
+    /// recording, and this track on this release. Kept on the tracklist (a
+    /// JSON blob, so no migration) and carried onto every listen of the side.
+    #[serde(default)]
+    pub mbid_recording: Option<String>,
+    #[serde(default)]
+    pub mbid_release_track: Option<String>,
+    /// Everyone the track credits, in order, with their MBIDs — set only when
+    /// MusicBrainz credits the track itself (it does whenever the track's
+    /// artist differs from the release's).
+    #[serde(default)]
+    pub artists: Option<Vec<String>>,
+    #[serde(default)]
+    pub mbid_artist: Option<Vec<String>>,
 }
 
 /// A candidate pressing.
@@ -506,6 +520,17 @@ pub async fn musicbrainz_release(
         name: String,
         #[serde(default)]
         joinphrase: Option<String>,
+        #[serde(default)]
+        artist: Option<CreditArtist>,
+    }
+    #[derive(Deserialize)]
+    struct CreditArtist {
+        id: String,
+        name: String,
+    }
+    #[derive(Deserialize)]
+    struct Recording {
+        id: String,
     }
     #[derive(Deserialize)]
     struct LabelInfo {
@@ -521,12 +546,19 @@ pub async fn musicbrainz_release(
     }
     #[derive(Deserialize)]
     struct Track {
+        /// The release-track MBID.
+        #[serde(default)]
+        id: Option<String>,
         #[serde(default)]
         number: Option<String>,
         #[serde(default)]
         title: Option<String>,
         #[serde(default)]
         length: Option<i64>,
+        #[serde(default)]
+        recording: Option<Recording>,
+        #[serde(rename = "artist-credit", default)]
+        artist_credit: Vec<ArtistCredit>,
     }
 
     let http = client()?;
@@ -586,13 +618,36 @@ pub async fn musicbrainz_release(
         let side = side_of.get(i).cloned().unwrap_or_else(|| "A".into());
         let pos = per_side_pos.entry(side.clone()).or_insert(0);
         *pos += 1;
+        // The track's own credit, canonical names and MBIDs, only when it
+        // names someone other than the release — otherwise the release's
+        // artist stands, as it always has.
+        let credited: Vec<&CreditArtist> =
+            t.artist_credit.iter().filter_map(|c| c.artist.as_ref()).collect();
+        let own_credit = !credited.is_empty() && {
+            let release_ids: Vec<&str> = r
+                .artist_credit
+                .iter()
+                .filter_map(|c| c.artist.as_ref().map(|a| a.id.as_str()))
+                .collect();
+            credited.iter().map(|a| a.id.as_str()).collect::<Vec<_>>() != release_ids
+        };
         tracks.push(PhysicalTrack {
             side,
             position: *pos,
             title: t.title.clone().unwrap_or_else(|| "Untitled".into()),
-            artist: None,
+            artist: own_credit.then(|| {
+                t.artist_credit
+                    .iter()
+                    .map(|a| format!("{}{}", a.name, a.joinphrase.clone().unwrap_or_default()))
+                    .collect::<String>()
+            }),
             duration_secs: durations[i],
             disc: disc_of.get(i).copied(),
+            mbid_recording: t.recording.as_ref().map(|rec| rec.id.clone()),
+            mbid_release_track: t.id.clone(),
+            artists: (own_credit && credited.len() > 1)
+                .then(|| credited.iter().map(|a| a.name.clone()).collect()),
+            mbid_artist: own_credit.then(|| credited.iter().map(|a| a.id.clone()).collect()),
         });
     }
 
@@ -929,6 +984,11 @@ pub fn discogs_tracks(rows: &[DiscogsTrackRow], disc: bool, sides: usize) -> Vec
             // there is nothing to record here. `None` says that, rather than
             // claiming disc 1.
             disc: None,
+            // Discogs knows no MusicBrainz ids.
+            mbid_recording: None,
+            mbid_release_track: None,
+            artists: None,
+            mbid_artist: None,
         });
     }
     tracks
@@ -1267,6 +1327,10 @@ mod tests {
             artist: None,
             duration_secs: secs,
             disc: None,
+            mbid_recording: None,
+            mbid_release_track: None,
+            artists: None,
+            mbid_artist: None,
         }
     }
 

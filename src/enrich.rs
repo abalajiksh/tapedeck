@@ -902,3 +902,87 @@ mod tests {
         assert!(!answers_the_question("", "Aphex Twin", &answered("Xtal", "Aphex Twin")));
     }
 }
+
+/// Apply MusicBrainz's credit to listens that know their recording.
+///
+/// One lookup per *recording* (cached, so a track played fifty times costs one
+/// request and an already-asked recording costs none), applied to every listen
+/// of it under the guards in `db::credits`. A failed request is not an answer:
+/// the recording stays queued and is asked again next pass.
+///
+/// Then two passes that need no new requests for listens already credited: one
+/// artist MBID's spellings fold into one artist, and band membership is looked
+/// up for the most-credited artists, a few per pass.
+pub async fn backfill_credits(
+    db: &Database,
+    mb: &MusicBrainzClient,
+    batch: i64,
+    mb_budget: i64,
+) -> usize {
+    let mut credited = 0usize;
+    let mut budget = mb_budget;
+    for mbid in db.recordings_needing_credits(batch).await.unwrap_or_default() {
+        if budget <= 0 {
+            break;
+        }
+        budget -= 1;
+        let Ok(credits) = mb.fetch_recording_credits(&mbid).await else { continue };
+        if let Ok((n, _)) = db.apply_recording_credits(&mbid, &credits).await {
+            credited += n as usize;
+        }
+    }
+
+    // The record's own credit and its release group, by release MBID — what an
+    // album is filed under on a box set or a soundtrack.
+    for mbid in db.releases_needing_info(batch).await.unwrap_or_default() {
+        if budget <= 0 {
+            break;
+        }
+        budget -= 1;
+        let Ok(info) = mb.fetch_release_info(&mbid).await else { continue };
+        let _ = db.apply_release_info(&mbid, &info).await;
+    }
+
+    // Cheap — one grouped read of the credits table — but not free, so not
+    // on every pass: only when this one changed something, or hourly.
+    static LAST_UNIFY: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+    let now = chrono::Utc::now().timestamp();
+    if credited > 0 || now - LAST_UNIFY.load(std::sync::atomic::Ordering::Relaxed) > 3600 {
+        LAST_UNIFY.store(now, std::sync::atomic::Ordering::Relaxed);
+        if let Ok(n) = db.unify_artist_spellings().await {
+            if n > 0 {
+                debug!("🎼 Folded {n} artist credits onto one spelling per MusicBrainz id");
+            }
+        }
+        // Loves and liner notes on an album follow it onto its album artist.
+        if let Ok((moved, left)) = db.migrate_album_entities().await {
+            if moved > 0 {
+                tracing::info!("💿 Moved {moved} album loves/notes onto their album artist");
+            }
+            if !left.is_empty() {
+                tracing::info!(
+                    "💿 {} album loves/notes left on their old key — their listens name more \
+                     than one album artist: {}",
+                    left.len(),
+                    left.join("; ")
+                );
+            }
+        }
+    }
+
+    // Band membership, for the "Member of" / "Members" links on artist pages.
+    // Read from the cache by the page; asked for here, never by a page.
+    let mut asked = 0;
+    for mbid in db.credited_artist_mbids(200).await.unwrap_or_default() {
+        if budget <= 0 || asked >= 4 {
+            break;
+        }
+        if mb.cached_artist(&mbid).await.is_some() {
+            continue;
+        }
+        budget -= 1;
+        asked += 1;
+        let _ = mb.fetch_artist(&mbid).await;
+    }
+    credited
+}

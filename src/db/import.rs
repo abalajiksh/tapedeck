@@ -277,6 +277,12 @@ impl Database {
         skipped: bool,
         provenance: ImportProvenance,
     ) -> Result<ImportOutcome, sqlx::Error> {
+        // The same rule `save_scrobble` applies, with the fuzzy check again
+        // given the play as sent.
+        let sent = play;
+        let mut play = play.clone();
+        let artist_display = normalise_credit(&mut play);
+        let play = &play;
         // A duplicate is no longer the end of it. The incoming copy may know
         // things the stored one never did — a ListenBrainz archive carries a
         // full `mbid_mapping` — and dropping it whole meant the enrichment
@@ -291,7 +297,7 @@ impl Database {
             }
         }
         if held.is_none() {
-            held = self.fuzzy_existing_id(user_id, play, skipped).await?;
+            held = self.fuzzy_existing_id(user_id, sent, skipped).await?;
         }
         if let Some(id) = held {
             return Ok(if self.enrich_existing(id, play, &provenance).await? {
@@ -308,16 +314,18 @@ impl Database {
         let artist_credit = play.artists.as_ref().filter(|a| a.len() > 1).map(|a| a.join("; "));
         sqlx::query(&crate::sql!(
             "INSERT INTO scrobbles (
-                user_id, title, artist, artist_credit, album, timestamp, duration, source_id,
+                user_id, title, artist, artist_credit, artist_display, album, timestamp, duration, source_id,
                 source_name, status, mbid_recording, mbid_release, mbid_release_group, mbid_artist,
+                mbid_release_track, mbid_work, mbid_album_artist, album_artist, album_filed_under,
                 caa_id, caa_release_mbid, isrc, submission_client, track_number, skipped,
                 spotify_track_id
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'imported', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'imported', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
         ))
         .bind(user_id)
         .bind(&play.title)
         .bind(&play.artist)
         .bind(&artist_credit)
+        .bind(&artist_display)
         .bind(&play.album)
         .bind(play.timestamp as i64)
         .bind(play.duration.map(|d| d as i64))
@@ -327,6 +335,11 @@ impl Database {
         .bind(&play.mbid_release)
         .bind(&play.mbid_release_group)
         .bind(&mbid_artist_json)
+        .bind(&play.mbid_release_track)
+        .bind(&play.mbid_work)
+        .bind(play.mbid_album_artist.as_ref().map(|a| serde_json::to_string(a).unwrap_or_default()))
+        .bind(&play.album_artist)
+        .bind(play.album_artist.as_deref().map(str::trim).filter(|a| !a.is_empty()))
         .bind(play.caa_id)
         .bind(&play.caa_release_mbid)
         .bind(&play.isrc)
@@ -365,8 +378,9 @@ pub(super) async fn sparse_columns(
 ) -> Result<Option<SparseColumns>, sqlx::Error> {
     sqlx::query_as::<_, SparseColumns>(&crate::sql!(
         "SELECT artist, artist_credit, album, duration, mbid_recording, mbid_release,
-                mbid_release_group, mbid_artist, caa_id, caa_release_mbid, track_number,
-                isrc, spotify_track_id
+                mbid_release_group, mbid_release_track, mbid_work, mbid_album_artist,
+                album_artist, mbid_artist, caa_id, caa_release_mbid, track_number, isrc,
+                spotify_track_id
            FROM scrobbles WHERE id = ?",
     ))
     .bind(id)
@@ -472,6 +486,12 @@ pub(super) fn blanks_to_fill(
             fills.push(Fill::Text("isrc", v));
         }
     }
+    // The work a recording performs is as true of it as its MBID.
+    if blank(&held.mbid_work) {
+        if let Some(v) = given(&play.mbid_work) {
+            fills.push(Fill::Text("mbid_work", v));
+        }
+    }
     if held.duration.is_none() {
         if let Some(d) = play.duration {
             fills.push(Fill::Int("duration", d as i64));
@@ -529,6 +549,33 @@ pub(super) fn blanks_to_fill(
                 fills.push(Fill::Text("mbid_release_group", v));
             }
         }
+        if blank(&held.mbid_release_track) {
+            if let Some(v) = given(&play.mbid_release_track) {
+                fills.push(Fill::Text("mbid_release_track", v));
+            }
+        }
+        let held_album_artist_blank = held
+            .mbid_album_artist
+            .as_deref()
+            .unwrap_or("")
+            .trim_matches(['[', ']', ' '])
+            .is_empty();
+        if blank(&held.album_artist) {
+            if let Some(v) = given(&play.album_artist) {
+                // A known album artist is what files the record, so it
+                // moves the album with it.
+                fills.push(Fill::Text("album_filed_under", v.clone()));
+                fills.push(Fill::Text("album_artist", v));
+            }
+        }
+        if held_album_artist_blank {
+            if let Some(a) = play.mbid_album_artist.as_ref().filter(|a| !a.is_empty()) {
+                fills.push(Fill::Text(
+                    "mbid_album_artist",
+                    serde_json::to_string(a).unwrap_or_else(|_| "[]".into()),
+                ));
+            }
+        }
         if held.caa_id.is_none_or(|c| c <= 0) {
             if let Some(c) = play.caa_id.filter(|c| *c > 0) {
                 fills.push(Fill::Int("caa_id", c));
@@ -576,6 +623,10 @@ pub(super) fn play_from_sparse(title: &str, s: &SparseColumns) -> Play {
     p.mbid_recording = s.mbid_recording.clone();
     p.mbid_release = s.mbid_release.clone();
     p.mbid_release_group = s.mbid_release_group.clone();
+    p.mbid_release_track = s.mbid_release_track.clone();
+    p.mbid_work = s.mbid_work.clone();
+    p.mbid_album_artist = s.mbid_album_artist.as_deref().and_then(|j| serde_json::from_str(j).ok());
+    p.album_artist = s.album_artist.clone();
     p.mbid_artist = s.mbid_artist.as_deref().and_then(|j| serde_json::from_str(j).ok());
     p.caa_id = s.caa_id;
     p.caa_release_mbid = s.caa_release_mbid.clone();
@@ -605,6 +656,10 @@ mod merge_tests {
             mbid_recording: None,
             mbid_release: None,
             mbid_release_group: None,
+            mbid_release_track: None,
+            mbid_work: None,
+            mbid_album_artist: None,
+            album_artist: None,
             mbid_artist: None,
             caa_id: None,
             caa_release_mbid: None,

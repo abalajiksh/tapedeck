@@ -74,8 +74,15 @@ impl Progress {
 #[schema(as = NowPlayingTrack)]
 pub struct NowPlaying {
     pub title: String,
+    /// As the source sent it — the string a skip is written with and the deck
+    /// falls back to.
     pub artist: String,
+    /// Everyone credited, `"; "`-joined and primary first, when there is more
+    /// than one: the same split `save_scrobble` will store the listen with.
+    pub artist_credit: Option<String>,
     pub album: Option<String>,
+    /// Who the album is filed under, when the source named an album artist.
+    pub album_artist: Option<String>,
     /// Track length in seconds, when the source reports one.
     pub duration: Option<u64>,
     /// Seconds in **as of `updated_at`**. Extrapolate from there rather than
@@ -199,10 +206,17 @@ impl NowPlaying {
         quality: Option<&AudioQuality>,
         progress: Progress,
     ) -> Self {
+        let artist_credit = {
+            let mut p = play.clone();
+            crate::db::normalise_credit(&mut p);
+            p.artists.filter(|a| a.len() > 1).map(|a| a.join("; "))
+        };
         Self {
             title: play.title.clone(),
             artist: play.artist.clone(),
+            artist_credit,
             album: play.album.clone(),
+            album_artist: play.album_artist.clone(),
             duration: play.duration,
             progress: progress.millis() / 1000,
             progress_ms: progress.millis(),
@@ -715,7 +729,9 @@ mod tests {
         NowPlaying {
             title: title.into(),
             artist: "Aphex Twin".into(),
+            artist_credit: None,
             album: Some("Selected Ambient Works 85-92".into()),
+            album_artist: None,
             duration: Some(300),
             progress: 0,
             progress_ms: 0,

@@ -97,9 +97,16 @@ export function loveKey(s: Scrobble, kind: LoveKind): string | null {
 	if (kind === 'artist') return `artist||${norm(s.artist)}`;
 	if (kind === 'album') {
 		if (!s.album) return null;
-		return `release|${norm(s.artist)}|${norm(s.album)}`;
+		// Under the artist the record is filed under — `Database::entity_key`
+		// keys an album the same way since albums moved onto their album artist.
+		return `release|${norm(albumArtistOf(s))}|${norm(s.album)}`;
 	}
 	return `recording|${norm(s.artist)}|${norm(s.title)}`;
+}
+
+/** Who a listen's album is filed under: the album artist, else its artist. */
+export function albumArtistOf(s: Scrobble): string {
+	return s.album_filed_under?.trim() ? s.album_filed_under : s.artist;
 }
 
 /**
@@ -117,10 +124,18 @@ export function loveCandidates(s: Scrobble, kind: LoveKind): string[] {
 	out.push(exact);
 
 	if (kind === 'artist') out.push(foldedKey('artist', '', s.artist));
-	else if (kind === 'album') out.push(foldedKey('release', s.artist, s.album!));
+	else if (kind === 'album') {
+		out.push(foldedKey('release', albumArtistOf(s), s.album!));
+		// The keys an album love had before albums moved onto their album
+		// artist; the server also keeps them as aliases of the moved entity.
+		out.push(`release|${norm(s.artist)}|${norm(s.album!)}`);
+		out.push(foldedKey('release', s.artist, s.album!));
+		if (s.mbid_release) out.push(`mbid:release:${s.mbid_release.trim().toLowerCase()}`);
+	}
 	else out.push(foldedKey('recording', s.artist, s.title));
 
-	// Only the recording id travels on a listen row — an album or artist id
+	// The recording id for a track (the release id is added for an album
+	// above); an artist id
 	// would need columns the row does not carry.
 	if (kind === 'track' && s.mbid_recording) {
 		out.push(`mbid:recording:${s.mbid_recording.trim().toLowerCase()}`);

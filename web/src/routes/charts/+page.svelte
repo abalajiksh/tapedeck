@@ -5,6 +5,7 @@
 	import type { ChartRow, ChartKind, ChartRange } from '$lib/api';
 	import { openAlbum, openArtist } from '$lib/entities';
 	import CoverArt from '$lib/components/CoverArt.svelte';
+	import ArtistLinks from '$lib/components/ArtistLinks.svelte';
 	import ToTop from '$lib/components/ToTop.svelte';
 
 	const kinds: { k: ChartKind; label: string }[] = [
@@ -47,7 +48,7 @@
 		if (kind === 'artists') return openArtist(r.name);
 		if (kind === 'albums' && r.sub) return openAlbum(r.sub, r.name);
 		if (kind === 'tracks') {
-			if (r.album && r.sub) return openAlbum(r.sub, r.album);
+			if (r.album && r.sub) return openAlbum(r.album_artist ?? r.sub, r.album);
 			if (r.sub) return openArtist(r.sub);
 		}
 		return undefined;
@@ -153,7 +154,7 @@
 					seed={r.name} size={38} radius={kind === 'artists' ? 999 : 9} />
 				<div style="flex:1;min-width:0;">
 					<div class="name">{r.name}</div>
-					{#if r.sub}<div class="sub">{r.sub}</div>{/if}
+					{#if r.sub}<div class="sub"><ArtistLinks artist={r.sub} credit={r.artist_credit} nested /></div>{/if}
 					<div class="bar" style="max-width:260px;margin-top:6px;"><div class="fill" style="width:{(value(r) / max) * 100}%"></div></div>
 				</div>
 				<span class="val">{value(r)}{unit}</span>

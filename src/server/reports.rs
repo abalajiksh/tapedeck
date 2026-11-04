@@ -176,6 +176,9 @@ pub struct PeriodAlbum {
 pub struct PeriodTrack {
     pub title: String,
     pub artist: String,
+    /// Everyone credited, `"; "`-joined and primary first, when there is more
+    /// than one.
+    pub artist_credit: Option<String>,
     pub plays: i64,
 }
 
@@ -596,6 +599,13 @@ struct Bucket {
     run_len: i64,
     /// (track key, local day) -> plays, for "on repeat".
     per_day: HashMap<(String, i32), (String, String, i64)>,
+    /// Folded album-artist key -> the spelling as stored, for naming the
+    /// record's artist where they are not among the credited artists.
+    filed_names: HashMap<String, String>,
+    /// Track key -> everyone credited, for the track lines. Kept beside
+    /// `tracks` rather than in its tuple, which a dozen readers index by
+    /// position.
+    track_credits: HashMap<String, String>,
     /// Artists whose very first listen anywhere falls inside this period.
     new_artists: HashMap<String, i64>,
     first_seen_at: HashMap<String, i64>,
@@ -813,13 +823,17 @@ pub async fn reports(
             // The key is lowercased for grouping; show the spelling that was
             // actually submitted, or the card reads "epitone project".
             let akey = k.split('|').next().unwrap_or("");
-            let artist =
-                display.get(akey).map(|(_, last)| last.clone()).unwrap_or_else(|| akey.to_string());
+            let artist = display
+                .get(akey)
+                .map(|(_, last)| last.clone())
+                .or_else(|| b.filed_names.get(akey).cloned())
+                .unwrap_or_else(|| akey.to_string());
             PeriodAlbum { name: v.0.clone(), artist, plays: v.1 }
         });
-        let top_track = top_by(&b.tracks, |v| v.2).map(|(_, v)| PeriodTrack {
+        let top_track = top_by(&b.tracks, |v| v.2).map(|(k, v)| PeriodTrack {
             title: v.0.clone(),
             artist: v.1.clone(),
+            artist_credit: b.track_credits.get(k).cloned(),
             plays: v.2,
         });
 
@@ -829,7 +843,12 @@ pub async fn reports(
         let on_repeat: Vec<PeriodTrack> = repeat
             .iter()
             .take(4)
-            .map(|(_, v)| PeriodTrack { title: v.0.clone(), artist: v.1.clone(), plays: v.2 })
+            .map(|(k, v)| PeriodTrack {
+                title: v.0.clone(),
+                artist: v.1.clone(),
+                artist_credit: b.track_credits.get(&k.0).cloned(),
+                plays: v.2,
+            })
             .collect();
 
         // The crush: the most-played artist you had never played before.
@@ -1267,6 +1286,7 @@ mod tests {
             artist_credit: credit.map(str::to_string),
             title: "a track".into(),
             album: Some(album.into()),
+            album_filed_under: None,
             duration: Some(240),
             genres: None,
             chain_id: None,
@@ -1386,6 +1406,7 @@ mod tests {
             artist_credit: None,
             title: title.into(),
             album: None,
+            album_filed_under: None,
             duration: None,
             genres: None,
             chain_id: None,
@@ -1796,7 +1817,14 @@ fn fold_periods(rows: Vec<ReportRow>, tz: Tz, unit: Unit) -> Folded {
         }
 
         if let Some(al) = r.album.as_deref().filter(|a| !a.trim().is_empty()) {
-            let k = format!("{}|{}", akey, al.trim().to_lowercase());
+            // Under the record's artist, so a soundtrack is one album and not
+            // one per singer.
+            let filed = r.album_filed_under.as_deref().map(str::trim).filter(|f| !f.is_empty());
+            let fkey = filed.map(str::to_lowercase).unwrap_or_else(|| akey.clone());
+            if let Some(f) = filed {
+                b.filed_names.entry(fkey.clone()).or_insert_with(|| f.to_string());
+            }
+            let k = format!("{}|{}", fkey, al.trim().to_lowercase());
             let e = b.albums.entry(k).or_insert((al.trim().to_string(), 0));
             e.1 += 1;
         }
@@ -1804,6 +1832,9 @@ fn fold_periods(rows: Vec<ReportRow>, tz: Tz, unit: Unit) -> Folded {
         let tkey = format!("{}|{}", akey, r.title.trim().to_lowercase());
         let e = b.tracks.entry(tkey.clone()).or_insert((r.title.clone(), r.artist.clone(), 0));
         e.2 += 1;
+        if let Some(c) = r.artist_credit.as_deref().filter(|c| c.contains(';')) {
+            b.track_credits.entry(tkey.clone()).or_insert_with(|| c.to_string());
+        }
 
         let day = dt.num_days_from_ce();
         let e = b.per_day.entry((tkey, day)).or_insert((r.title.clone(), r.artist.clone(), 0));

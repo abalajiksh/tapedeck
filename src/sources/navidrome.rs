@@ -96,6 +96,20 @@ pub struct NavidromeSong {
     /// listen carrying one never needs the rate-limited lookup that would
     /// otherwise find it.
     pub isrc: Option<String>,
+    /// Every track artist, from Navidrome's `participants` (0.55+). `None` on
+    /// an older server, where `artist` is split on separators instead.
+    pub artists: Option<Vec<String>>,
+    /// Every other MusicBrainz id the file's tags carry. Nothing is dropped:
+    /// each is a lookup that never has to be made.
+    pub mbid_release: Option<String>,
+    pub mbid_release_group: Option<String>,
+    pub mbid_release_track: Option<String>,
+    /// One per credited artist, in `artists` order when the participants
+    /// carry them, else the tag's own list.
+    pub mbid_artist: Option<Vec<String>>,
+    pub mbid_album_artist: Option<Vec<String>>,
+    /// The record's artist by name, which on a compilation is not `artist`.
+    pub album_artist: Option<String>,
 }
 
 // ── Native API wire types ──
@@ -150,6 +164,69 @@ struct NativeSong {
     /// expose no ISRC field whatsoever, so this is the only source of its kind.
     #[serde(default)]
     isrc: Vec<String>,
+    /// Navidrome's multi-artist split, done against the file's own tags —
+    /// the same list its ListenBrainz scrobbler sends as `artist_names`.
+    #[serde(default)]
+    participants: Option<NativeParticipants>,
+    /// The rest of the file's MusicBrainz tags, as Navidrome's `MediaFile`
+    /// names them. A multi-valued tag arrives `;`-joined.
+    #[serde(default, alias = "mbzAlbumID")]
+    mbz_album_id: Option<String>,
+    #[serde(default, alias = "mbzReleaseGroupID")]
+    mbz_release_group_id: Option<String>,
+    #[serde(default, alias = "mbzReleaseTrackID")]
+    mbz_release_track_id: Option<String>,
+    #[serde(default, alias = "mbzArtistID")]
+    mbz_artist_id: Option<String>,
+    #[serde(default, alias = "mbzAlbumArtistID")]
+    mbz_album_artist_id: Option<String>,
+    #[serde(default)]
+    album_artist: Option<String>,
+}
+
+#[derive(Deserialize, Default)]
+struct NativeParticipants {
+    #[serde(default)]
+    artist: Vec<NamedArtist>,
+}
+
+/// One artist as both APIs spell it: a participant (native) or an
+/// OpenSubsonic `ArtistID3`: the name, and the MusicBrainz id when tagged.
+#[derive(Deserialize)]
+struct NamedArtist {
+    name: String,
+    #[serde(default, alias = "mbzArtistId", alias = "mbzArtistID", alias = "musicBrainzId")]
+    mbz_artist_id: Option<String>,
+}
+
+/// The participants' MBIDs, positional with `artist_names` — only when every
+/// participant has one, since a gap would shift each id onto the wrong name.
+fn artist_mbids(list: &[NamedArtist]) -> Option<Vec<String>> {
+    let ids: Vec<String> = list
+        .iter()
+        .map(|a| a.mbz_artist_id.as_deref().map(str::trim).unwrap_or("").to_string())
+        .collect();
+    (!ids.is_empty() && ids.iter().all(|i| !i.is_empty())).then_some(ids)
+}
+
+/// A tag that may hold several ids, `;`- or `/`-joined.
+fn id_list(raw: &Option<String>) -> Option<Vec<String>> {
+    let ids: Vec<String> = raw
+        .as_deref()
+        .unwrap_or("")
+        .split([';', '/'])
+        .map(|i| i.trim().to_string())
+        .filter(|i| !i.is_empty())
+        .collect();
+    (!ids.is_empty()).then_some(ids)
+}
+
+fn id_one(raw: Option<String>) -> Option<String> {
+    raw.map(|i| i.trim().to_string()).filter(|i| !i.is_empty())
+}
+
+fn artist_names(list: &[NamedArtist]) -> Option<Vec<String>> {
+    Some(list.iter().map(|a| a.name.clone()).collect::<Vec<_>>()).filter(|v| v.len() > 1)
 }
 
 // ── Subsonic wire types ──
@@ -487,6 +564,17 @@ impl NavidromeSource {
                             .into_iter()
                             .map(|v| v.trim().to_uppercase())
                             .find(|v| !v.is_empty()),
+                        artists: s.participants.as_ref().and_then(|p| artist_names(&p.artist)),
+                        mbid_artist: s
+                            .participants
+                            .as_ref()
+                            .and_then(|p| artist_mbids(&p.artist))
+                            .or_else(|| id_list(&s.mbz_artist_id)),
+                        mbid_album_artist: id_list(&s.mbz_album_artist_id),
+                        album_artist: id_one(s.album_artist),
+                        mbid_release: id_one(s.mbz_album_id),
+                        mbid_release_group: id_one(s.mbz_release_group_id),
+                        mbid_release_track: id_one(s.mbz_release_track_id),
                     },
                 )
             })
@@ -854,6 +942,7 @@ impl NavidromeSource {
                         mbid_release_track: None,
                         mbid_work: None,
                         mbid_album_artist: None,
+                        album_artist: None,
                         caa_id: None,
                         caa_release_mbid: None,
                         isrc: None,
@@ -881,13 +970,15 @@ impl NavidromeSong {
             duration: self.duration,
             track_number: self.track_number,
             mbid_recording: self.mbid.clone(),
-            mbid_release: None,
-            mbid_artist: None,
-            artists: None,
-            mbid_release_group: None,
-            mbid_release_track: None,
+            mbid_release: self.mbid_release.clone(),
+            mbid_artist: self.mbid_artist.clone(),
+            artists: self.artists.clone(),
+            mbid_release_group: self.mbid_release_group.clone(),
+            mbid_release_track: self.mbid_release_track.clone(),
+            // Navidrome's `MediaFile` carries no work id.
             mbid_work: None,
-            mbid_album_artist: None,
+            mbid_album_artist: self.mbid_album_artist.clone(),
+            album_artist: self.album_artist.clone(),
             caa_id: None,
             caa_release_mbid: None,
             isrc: self.isrc.clone(),
@@ -1015,6 +1106,13 @@ mod tests {
             track_number: Some(1),
             mbid: Some("mbid-xtal".into()),
             isrc: None,
+            artists: None,
+            mbid_release: None,
+            mbid_release_group: None,
+            mbid_release_track: None,
+            mbid_artist: None,
+            mbid_album_artist: None,
+            album_artist: None,
         }
     }
 
@@ -1091,6 +1189,28 @@ mod tests {
         }
     }
 
+    /// Navidrome 0.55+ sends the split it made from the tags as
+    /// `participants.artist`; that list is what reaches `Play::artists`, while
+    /// `artist` stays the display string for `normalise_credit` to reduce.
+    #[test]
+    fn participants_become_the_credit_list() {
+        let song: NativeSong = serde_json::from_str(
+            r#"{"id":"1","title":"Die With A Smile","artist":"Lady Gaga, Bruno Mars",
+                "participants":{"artist":[{"id":"a","name":"Lady Gaga"},{"id":"b","name":"Bruno Mars"}],
+                                "albumartist":[{"id":"a","name":"Lady Gaga"}]}}"#,
+        )
+        .expect("parses");
+        let names = song.participants.as_ref().and_then(|p| artist_names(&p.artist));
+        assert_eq!(names.unwrap(), ["Lady Gaga", "Bruno Mars"]);
+
+        // One participant is not a credit list.
+        let solo: NativeSong = serde_json::from_str(
+            r#"{"id":"1","title":"T","artist":"A","participants":{"artist":[{"id":"a","name":"A"}]}}"#,
+        )
+        .expect("parses");
+        assert!(solo.participants.as_ref().and_then(|p| artist_names(&p.artist)).is_none());
+    }
+
     /// Picard writes the ISRC into the tag and OpenSubsonic surfaces it, so a
     /// Navidrome listen can carry an exact identifier that cost nothing.
     ///
@@ -1105,6 +1225,7 @@ mod tests {
         )
         .expect("parses");
         assert_eq!(song.isrc, vec!["USSM18300073", "DELV42300297"]);
+        assert!(song.participants.is_none(), "absent participants are not an error");
 
         // A server that predates the field sends nothing, which is not an error.
         let older: NativeSong =

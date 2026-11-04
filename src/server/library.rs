@@ -80,6 +80,10 @@ pub struct AlbumPage {
     pub kind: &'static str,
     pub title: String,
     pub artist: String,
+    /// Everyone credited on the listens of this record, most played first, the
+    /// record's own artist leading. Each track's own credit is on its row in
+    /// `tracks`.
+    pub credited: Vec<String>,
     /// The artist's page.
     pub artist_entity_id: Option<i64>,
     pub mbid: Option<String>,
@@ -115,6 +119,11 @@ pub struct ArtistPage {
     pub kind: &'static str,
     pub name: String,
     pub mbid: Option<String>,
+    /// Bands this artist is a member of, from MusicBrainz — only those in your
+    /// own history, so the page never presents someone else's listening.
+    pub member_of: Vec<String>,
+    /// This band's members, on the same rule.
+    pub members: Vec<String>,
     /// The portrait the charts use.
     pub image_url: Option<String>,
     /// The wide image, only where you chose one.
@@ -287,6 +296,8 @@ pub async fn album_detail(
     };
 
     let tracks = state.db.album_tracks(user.user_id, &artist, &album).await.unwrap_or_default();
+    let credited =
+        state.db.album_credits(user.user_id, &artist, &album, 12).await.unwrap_or_default();
     let more =
         state.db.artist_albums(user.user_id, &artist, Some(&album), 4).await.unwrap_or_default();
     // A hand-set cover beats the derived one outright, including its CAA id —
@@ -368,6 +379,7 @@ pub async fn album_detail(
             kind: "album",
             title: album,
             artist,
+            credited,
             artist_entity_id,
             mbid: entity.mbid,
             year: summary.as_ref().and_then(|s| s.year),
@@ -433,6 +445,36 @@ pub async fn artist_detail(
 
     let albums = state.db.artist_albums(user.user_id, &name, None, 6).await.unwrap_or_default();
     let top_tracks = state.db.artist_top_tracks(user.user_id, &name, 10).await.unwrap_or_default();
+    // Membership from the cache the credits backfill fills — a page never
+    // waits on a rate-limited service. Empty until it has been asked.
+    let artist_mbid = match entity.mbid.clone() {
+        Some(m) => Some(m),
+        None => state.db.artist_mbid_for(user.user_id, &name).await.ok().flatten(),
+    };
+    let band = match artist_mbid.as_deref() {
+        // Only if MusicBrainz's artist is this page's: a credit's MBID can be
+        // someone else's (a positional guess, a wrong mapping).
+        Some(m) => state
+            .mb_client
+            .cached_artist(m)
+            .await
+            .filter(|b| crate::db::same_spelling(&b.name, &name)),
+        None => None,
+    };
+    let names = |list: &[crate::musicbrainz::CreditedArtist]| {
+        list.iter().map(|a| a.name.clone()).collect::<Vec<_>>()
+    };
+    let (member_of, members) = match &band {
+        Some(b) => (
+            state
+                .db
+                .artists_in_history(user.user_id, &names(&b.member_of))
+                .await
+                .unwrap_or_default(),
+            state.db.artists_in_history(user.user_id, &names(&b.members)).await.unwrap_or_default(),
+        ),
+        None => (Vec::new(), Vec::new()),
+    };
     let trend = state.db.artist_trend(user.user_id, &name).await.unwrap_or_default();
     let (rank, artist_total) = state.db.artist_rank(user.user_id, &name).await.unwrap_or((0, 0));
     let all_plays = state.db.total_plays(user.user_id).await.unwrap_or(0);
@@ -508,6 +550,8 @@ pub async fn artist_detail(
             kind: "artist",
             name,
             mbid: entity.mbid,
+            member_of,
+            members,
             image_url,
             landscape_url,
             artist_row_id,
@@ -701,7 +745,7 @@ pub async fn resolve(
     // Unused, and required anyway: `entities` is a shared table with no
     // `user_id`, so there is nothing here to scope — but this endpoint *writes*,
     // and an unauthenticated caller must not be able to fill it with rows.
-    WriteAuth { user: _user }: WriteAuth,
+    WriteAuth { user }: WriteAuth,
     Query(q): Query<ResolveQuery>,
 ) -> impl IntoResponse {
     let kind = match crate::notes::RefKind::parse(&q.kind).and_then(|k| k.entity_kind()) {
@@ -715,6 +759,12 @@ pub async fn resolve(
     // An artist entity's name *is* the artist — carrying it twice would make a
     // second row for the same person. Mirrors `resolve_target` in notes.rs.
     let artist = if kind == "artist" { "" } else { q.artist.as_deref().unwrap_or("").trim() };
+    // A spelling folded onto another opens the one its credits are under.
+    let folded = match kind {
+        "artist" => state.db.credited_spelling(user.user_id, name).await.ok().flatten(),
+        _ => None,
+    };
+    let name = folded.as_deref().unwrap_or(name);
 
     match state.db.upsert_entity(kind, name, artist, None).await {
         Ok(id) => (StatusCode::OK, Json(Resolved { id, kind })).into_response(),
