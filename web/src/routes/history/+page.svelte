@@ -591,7 +591,7 @@
 		{#if bulkVariants.length}
 			<select class="input" style="width:auto;min-width:150px;" bind:value={bulkVariant}
 				aria-label="Which setup of that chain">
-				<option value="">— as the chain is —</option>
+				<option value="">— as wired —</option>
 				{#each bulkVariants as v}<option value={v.id}>{v.name}</option>{/each}
 			</select>
 		{/if}
@@ -765,7 +765,7 @@
 							     the one that was actually fitted. -->
 							<div class="field" style="flex:1;min-width:180px;"><label for="ev">Setup</label>
 								<select id="ev" class="input" bind:value={edit.chain_variant_id}>
-									<option value={0}>— as the chain is —</option>
+									<option value={0}>— as wired —</option>
 									{#each editVariants as v}<option value={v.id}>{v.name}</option>{/each}
 								</select>
 							</div>

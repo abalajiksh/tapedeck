@@ -1047,6 +1047,9 @@ export interface Binding {
 	identifier: string;
 	interface: string | null;
 	chain_id: number | null; // null = detected but unmapped
+	/** Which setup (variant) of that chain the output carries; null is the
+	 *  chain as wired. Listens through it are saved with this setup. */
+	chain_variant_id: number | null;
 	last_seen: number;
 	hits: number;
 }
@@ -3872,8 +3875,13 @@ class TapedeckAPI {
 
 	// ── Output-device → chain bindings ──
 	async getBindings(): Promise<{ bindings: Binding[] }> { return this.get('/api/v1/bindings'); }
-	async setBinding(identifier: string, chain_id: number | null): Promise<void> {
-		await this.request('PUT', '/api/v1/bindings', { identifier, chain_id });
+	/** The setup always travels with the chain: leaving it out clears it. */
+	async setBinding(
+		identifier: string,
+		chain_id: number | null,
+		chain_variant_id: number | null = null
+	): Promise<void> {
+		await this.request('PUT', '/api/v1/bindings', { identifier, chain_id, chain_variant_id });
 	}
 	async deleteBinding(id: number): Promise<void> { return this.delNoBody(`/api/v1/bindings/${id}`); }
 

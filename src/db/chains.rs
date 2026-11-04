@@ -322,7 +322,7 @@ impl Database {
 
         // Anything pointing at a *variant* of this chain has to let go before
         // the variants themselves can be deleted.
-        for table in ["scrobbles", "physical_plays", "physical_releases"] {
+        for table in ["scrobbles", "physical_plays", "physical_releases", "chain_bindings"] {
             sqlx::query(&crate::sql!(&format!(
                 "UPDATE {table} SET chain_variant_id = NULL
                   WHERE chain_variant_id IN
@@ -392,42 +392,61 @@ impl Database {
         .await?;
         Ok(())
     }
-    /// Resolve an output-device identifier to its bound chain, if mapped.
+    /// Resolve an output-device identifier to its bound chain and the setup
+    /// of it that output carries, if mapped.
+    ///
+    /// The variant is the one the person chose for this output, which is why
+    /// it is the one rung of the ladder that may name a variant at ingest: a
+    /// client cannot know which stylus is fitted, but the person who mapped
+    /// the output told us what is usually on it — the rule a pressing's
+    /// `chain_variant_id` already follows on the shelf.
     pub async fn resolve_binding(
         &self,
         user_id: i64,
         identifier: &str,
-    ) -> Result<Option<i64>, sqlx::Error> {
-        let row: Option<(Option<i64>,)> = sqlx::query_as(&crate::sql!(
-            "SELECT chain_id FROM chain_bindings WHERE user_id = ? AND identifier = ?",
+    ) -> Result<Option<(i64, Option<i64>)>, sqlx::Error> {
+        let row: Option<(Option<i64>, Option<i64>)> = sqlx::query_as(&crate::sql!(
+            "SELECT chain_id, chain_variant_id FROM chain_bindings
+              WHERE user_id = ? AND identifier = ?",
         ))
         .bind(user_id)
         .bind(identifier)
         .fetch_optional(&self.pool)
         .await?;
-        Ok(row.and_then(|(c,)| c))
+        Ok(row.and_then(|(c, v)| c.map(|c| (c, v))))
     }
     pub async fn list_bindings(&self, user_id: i64) -> Result<Vec<BindingRow>, sqlx::Error> {
         sqlx::query_as(&crate::sql!("SELECT * FROM chain_bindings WHERE user_id = ? ORDER BY chain_id IS NOT NULL, last_seen DESC"))
             .bind(user_id).fetch_all(&self.pool).await
     }
-    /// Assign (or clear, with None) the chain for an output identifier. Creates
-    /// the binding if the identifier hasn't been seen yet (manual add).
+    /// Assign (or clear, with None) the chain for an output identifier, and
+    /// which setup of it. Creates the binding if the identifier hasn't been
+    /// seen yet (manual add).
+    ///
+    /// **Both are always written together**, the rule a session follows: a
+    /// variant left behind when the chain changes would pair listens with
+    /// components that were never fitted together. The caller checks the
+    /// variant belongs to the chain; clearing the chain clears the variant
+    /// here regardless.
     pub async fn set_binding(
         &self,
         user_id: i64,
         identifier: &str,
         chain_id: Option<i64>,
+        chain_variant_id: Option<i64>,
     ) -> Result<(), sqlx::Error> {
         let now = Self::now_secs();
+        let chain_variant_id = chain_id.and(chain_variant_id);
         sqlx::query(&crate::sql!(
-            "INSERT INTO chain_bindings (user_id, identifier, chain_id, last_seen, hits)
-             VALUES (?, ?, ?, ?, 0)
-             ON CONFLICT(user_id, identifier) DO UPDATE SET chain_id = excluded.chain_id",
+            "INSERT INTO chain_bindings (user_id, identifier, chain_id, chain_variant_id, last_seen, hits)
+             VALUES (?, ?, ?, ?, ?, 0)
+             ON CONFLICT(user_id, identifier) DO UPDATE SET
+                chain_id = excluded.chain_id, chain_variant_id = excluded.chain_variant_id",
         ))
         .bind(user_id)
         .bind(identifier)
         .bind(chain_id)
+        .bind(chain_variant_id)
         .bind(now)
         .execute(&self.pool)
         .await?;

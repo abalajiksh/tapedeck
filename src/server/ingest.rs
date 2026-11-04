@@ -604,33 +604,38 @@ pub async fn submit_listens(
         // dry run — but it is the single most useful thing to see there, since
         // a chain arriving from the wrong rung looks identical to one arriving
         // from the right one.
-        let (chain_id, chain_source): (Option<i64>, &'static str) =
+        //
+        // Only rung 2 names a setup (variant). The person who mapped the output
+        // said what is usually on it; a chain name, a token or a machine is a
+        // statement about the chain alone, so their listens go through it as
+        // wired.
+        let (chain_id, chain_variant_id, chain_source): (Option<i64>, Option<i64>, &'static str) =
             if let Some(name) = explicit_chain_name {
                 match state.db.get_chain_by_name(user.user_id, name).await {
-                    Ok(Some(id)) => (Some(id), "explicit"),
+                    Ok(Some(id)) => (Some(id), None, "explicit"),
                     Ok(None) => {
                         debug!("Unknown chain name from client: {}", name);
-                        (None, "none")
+                        (None, None, "none")
                     }
                     Err(e) => {
                         debug!("Chain lookup failed: {}", e);
-                        (None, "none")
+                        (None, None, "none")
                     }
                 }
-            } else if let Some(binding) = match output_dev {
+            } else if let Some((bound, variant)) = match output_dev {
                 Some(dev) => state.db.resolve_binding(user.user_id, dev).await.ok().flatten(),
                 None => None,
             } {
-                (Some(binding), "output_binding")
+                (Some(bound), variant, "output_binding")
             } else if let Some(tc) = token_chain_id {
-                (Some(tc), "token_default")
+                (Some(tc), None, "token_default")
             } else if let Some(dev) = device_id {
                 match state.db.get_device_default_chain(user.user_id, dev).await.ok().flatten() {
-                    Some(cid) => (Some(cid), "device_default"),
-                    None => (None, "none"),
+                    Some(cid) => (Some(cid), None, "device_default"),
+                    None => (None, None, "none"),
                 }
             } else {
-                (None, "none")
+                (None, None, "none")
             };
 
         // ── Phase 2: Listening context from chain default ──
@@ -668,6 +673,7 @@ pub async fn submit_listens(
                 timestamp,
                 quality_score: quality.quality_score,
                 chain_id,
+                chain_variant_id,
                 chain_name,
                 chain_source,
                 device_id,
@@ -786,9 +792,12 @@ pub async fn submit_listens(
                         quality_opt,
                         device_id,
                         chain_id,
-                        // A scrobble client has no idea which stylus is fitted; a
-                        // variant is set by the shelf or by retagging afterwards.
-                        None,
+                        // A scrobble client has no idea which stylus is fitted.
+                        // The setup comes from the output binding when that is
+                        // the rung that won — the person mapping the output said
+                        // what is on it — and otherwise from the shelf or from
+                        // retagging afterwards.
+                        chain_variant_id,
                         listening_context.as_deref(),
                         Some(submission_client),
                         // Set only when a plugin named its library item above.

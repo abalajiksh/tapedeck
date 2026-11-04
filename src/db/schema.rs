@@ -794,6 +794,10 @@ impl Database {
                 identifier TEXT NOT NULL,
                 interface TEXT,
                 chain_id INTEGER REFERENCES signal_chains(id),
+                -- Which setup of that chain is usually on this output. NULL is
+                -- the chain as wired. `migrate()` adds it too, for databases
+                -- predating it.
+                chain_variant_id INTEGER REFERENCES chain_variants(id),
                 last_seen INTEGER NOT NULL,
                 hits INTEGER NOT NULL DEFAULT 0,
                 UNIQUE(user_id, identifier)

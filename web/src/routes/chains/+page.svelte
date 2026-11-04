@@ -218,6 +218,7 @@
 	 * you act on.
 	 */
 	function openSwap(c: SignalChain, i: number) {
+		bindFor = null;
 		vChain = c;
 		vId = null;
 		vMode = 'variant';
@@ -229,6 +230,7 @@
 	}
 
 	function newVariant(c: SignalChain) {
+		bindFor = null;
 		vChain = c;
 		vId = null;
 		vMode = 'variant';
@@ -256,6 +258,7 @@
 	 *  is the only one anything in this UI can create.
 	 */
 	function editVariant(c: SignalChain, v: ChainVariant) {
+		bindFor = null;
 		vChain = c;
 		vId = v.id;
 		// Editing an existing variant is never a chain rewrite: the variant is
@@ -277,7 +280,7 @@
 		// Replacing a step in the chain needs no name — the chain already has
 		// one. Only a variant is a new thing that has to be called something.
 		if (vMode === 'chain') return replaceStep();
-		if (!vName.trim()) { vErr = 'A variant needs a name.'; return; }
+		if (!vName.trim()) { vErr = 'A setup needs a name.'; return; }
 		vSaving = true;
 		vErr = '';
 		try {
@@ -286,9 +289,13 @@
 				equipment_id: vGear,
 				name: equipment.find((e) => e.id === vGear)?.name ?? null
 			}];
-			if (vId == null) await api.createVariant({ chain_id: vChain.id, name: vName.trim(), overrides });
-			else await api.updateVariant(vId, { name: vName.trim(), overrides });
+			if (vId == null) {
+				const made = await api.createVariant({ chain_id: vChain.id, name: vName.trim(), overrides });
+				// Opened from an output: the setup exists so that output can carry it.
+				if (bindFor) await api.setBinding(bindFor.identifier, vChain.id, made.id);
+			} else await api.updateVariant(vId, { name: vName.trim(), overrides });
 			vOpen = false;
+			bindFor = null;
 			await load();
 		} catch (e) {
 			vErr = String(e).replace(/^API \d+: /, '');
@@ -438,7 +445,7 @@
 
 	async function doFold() {
 		if (fFrom == null || fInto?.id == null) { fErr = 'Pick a chain to fold in.'; return; }
-		if (fVariant === 'new' && !fName.trim()) { fErr = 'Name the variant it becomes.'; return; }
+		if (fVariant === 'new' && !fName.trim()) { fErr = 'Name the setup it becomes.'; return; }
 		fBusy = true;
 		fErr = '';
 		try {
@@ -632,13 +639,95 @@
 		loading = false;
 	}
 
-	async function assignBinding(b: Binding, value: string) {
-		const cid = value ? Number(value) : null;
+	// ── Outputs: a chain, or one setup of it ──
+	//
+	// One picker rather than a chain picker and a setup picker beside it
+	// (Ashwin's call, 2026-11-04): each chain with setups is a group, so the
+	// choice is a single value and a setup can never be paired with the wrong
+	// chain. It also carries the two ways to make what is missing, because an
+	// output that fits nothing you have is exactly when you want one.
+	//
+	// Values: '' unmapped · `c:<chain>` as wired · `v:<variant>` a setup ·
+	// `new-chain` / `new-setup` open an editor.
+
+	/** The output a chain or setup editor was opened from. Saving maps it. */
+	let bindFor: Binding | null = null;
+
+	const bindingValue = (b: Binding) =>
+		b.chain_id == null ? '' : b.chain_variant_id != null ? `v:${b.chain_variant_id}` : `c:${b.chain_id}`;
+
+	async function assignBinding(b: Binding, sel: HTMLSelectElement) {
+		const value = sel.value;
+		if (value === 'new-chain' || value === 'new-setup') {
+			// Put the select back on what is saved: the editor might be cancelled,
+			// and a picker reading "+ New chain…" over an output that is still
+			// unmapped would be a lie.
+			sel.value = bindingValue(b);
+			if (value === 'new-chain') newChainForOutput(b);
+			else newSetupForOutput(b);
+			return;
+		}
+		let cid: number | null = null;
+		let vid: number | null = null;
+		if (value.startsWith('c:')) cid = Number(value.slice(2));
+		else if (value.startsWith('v:')) {
+			const v = variants.find((x) => x.id === Number(value.slice(2)));
+			if (!v) return;
+			cid = v.chain_id;
+			vid = v.id;
+		}
 		try {
-			await api.setBinding(b.identifier, cid);
-			bindings = bindings.map((x) => (x.id === b.id ? { ...x, chain_id: cid } : x));
-		} catch (e) { alert('Failed to set binding: ' + e); }
+			await api.setBinding(b.identifier, cid, vid);
+			bindings = bindings.map((x) =>
+				x.id === b.id ? { ...x, chain_id: cid, chain_variant_id: vid } : x
+			);
+		} catch (e) {
+			sel.value = bindingValue(b);
+			alert('Failed to map that output: ' + e);
+		}
 	}
+
+	/** A new chain named after the output. When the output's name is a piece of
+	 *  gear you have already added — a DAC reports itself by name — that gear is
+	 *  the first step, so the chain starts as something rather than a blank. */
+	function newChainForOutput(b: Binding) {
+		newChain();
+		bindFor = b;
+		cName = b.identifier;
+		const id = b.identifier.trim().toLowerCase();
+		const g = equipment.find((e) => e.name.trim().toLowerCase() === id);
+		if (g) {
+			cComps = [{
+				...blankComp(componentTypeForGear[g.equipment_type] ?? 'dac'),
+				name: g.name,
+				equipment_id: g.id
+			}];
+		}
+	}
+
+	/** A new setup for this output, of the chain it is on already, or of the
+	 *  chain you listen through most when it is on none. The dialog lets you
+	 *  pick a different chain either way. */
+	function newSetupForOutput(b: Binding) {
+		const c = chains.find((x) => x.id === b.chain_id) ?? chainRows[0];
+		if (!c) return;
+		newVariant(c);
+		bindFor = b;
+	}
+
+	/** The setup dialog's chain picker, shown only when it was opened from an
+	 *  output. Changing chain starts the swap over: the slot and the gear were
+	 *  positions in the other chain. */
+	function pickSetupChain(raw: string) {
+		const c = chains.find((x) => x.id === Number(raw));
+		if (!c) return;
+		vChain = c;
+		vSlot = Math.max(0, (c.components?.length ?? 1) - 1);
+		vGear = null;
+	}
+
+	function closeChainEditor() { chainOpen = false; bindFor = null; }
+	function closeSetupEditor() { vOpen = false; bindFor = null; }
 	async function removeBinding(b: Binding) {
 		try { await api.deleteBinding(b.id); bindings = bindings.filter((x) => x.id !== b.id); } catch (e) { alert('Delete failed: ' + e); }
 	}
@@ -653,11 +742,13 @@
 
 	// ── chain editor ──
 	function newChain() {
+		bindFor = null;
 		chainId = null; cName = ''; cDesc = ''; cContext = 'active'; cIcon = null;
 		cComps = [blankComp('source')];
 		chainOpen = true;
 	}
 	function editChain(c: SignalChain) {
+		bindFor = null;
 		chainId = c.id; cName = c.name; cDesc = c.description ?? ''; cContext = c.listening_context;
 		cIcon = c.icon ?? null;
 		cComps = c.components?.length ? c.components.map((x) => ({ ...x })) : [blankComp('source')];
@@ -665,6 +756,7 @@
 	}
 	/** Most second chains are the first with one box swapped. */
 	function duplicateChain(c: SignalChain) {
+		bindFor = null;
 		chainId = null;
 		cName = `${c.name} (copy)`; cDesc = c.description ?? ''; cContext = c.listening_context;
 		cIcon = c.icon ?? null;
@@ -772,9 +864,13 @@
 			components: cComps.filter((c) => c.name.trim()).map((c) => ({ ...c, detail: c.detail || null }))
 		};
 		try {
-			if (chainId == null) await api.createChain(data);
-			else await api.updateChain(chainId, data);
+			if (chainId == null) {
+				const made = await api.createChain(data);
+				// Opened from an output: the chain exists so that output can use it.
+				if (bindFor) await api.setBinding(bindFor.identifier, made.id, null);
+			} else await api.updateChain(chainId, data);
 			chainOpen = false;
+			bindFor = null;
 			await load();
 		} catch (e) { alert('Failed to save chain: ' + e); }
 		savingChain = false;
@@ -884,7 +980,7 @@
 	// one page — the single biggest source of scrolling on this screen — behind
 	// one control. Not remembered across visits: Equipment is the answer to
 	// "what do I own", which is what people come here for.
-	let secTab: 'equipment' | 'devices' | 'outputs' = 'equipment';
+	let secTab: 'equipment' | 'outputs' | 'machines' = 'equipment';
 
 	// A `[[gear:…]]` shortcode in a liner note links to /chains?gear=<id>. There
 	// is no gear detail page yet, so the link highlights the row it means rather
@@ -981,10 +1077,10 @@
 	     output one, which is only ever a tidy-up, still waits for both to
 	     clear. Two lines maximum. -->
 	{#if unmappedDevices.length}
-		<button class="nudge" aria-label="Review devices with no default chain" on:click={() => (secTab = 'devices')}>
+		<button class="nudge" aria-label="Review machines with no default chain" on:click={() => (secTab = 'machines')}>
 			<svg viewBox="0 0 24 24" width="17" fill="none" stroke="var(--td-accent)" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" style="flex:none;"><circle cx="12" cy="12" r="9"/><path d="M12 8h.01M11 12h1v4h1"/></svg>
 			<span style="flex:1;font-size:13.5px;">
-				{unmappedDevices.length} device{unmappedDevices.length > 1 ? 's have' : ' has'} no default chain —
+				{unmappedDevices.length} machine{unmappedDevices.length > 1 ? 's have' : ' has'} no default chain —
 				listens through {unmappedDevices.length > 1 ? 'them' : 'it'} won’t be attributed.
 			</span>
 			<span class="nudge-cta">Review →</span>
@@ -1003,7 +1099,7 @@
 			<span style="flex:1;font-size:13.5px;">
 				{dupes.length === 1 ? '“' + dupes[0].fold_name + '” is' : dupes.length + ' chains are'}
 				near-{dupes.length === 1 ? 'identical to “' + dupes[0].base_name + '”' : 'duplicates of another'} —
-				fold {dupes.length === 1 ? 'it' : 'them'} in as {dupes.length === 1 ? 'a variant' : 'variants'} and the hours add up.
+				fold {dupes.length === 1 ? 'it' : 'them'} in as {dupes.length === 1 ? 'a setup' : 'setups'} and the hours add up.
 			</span>
 			<span class="nudge-cta">Fold →</span>
 		</button>
@@ -1114,12 +1210,17 @@
 		{/if}
 	</div>
 
-	<!-- Equipment / Devices / Outputs behind one control. -->
+	<!-- Equipment / Outputs / Machines behind one control.
+	     Outputs before Machines because that is the order the ladder tries them:
+	     an output's mapping wins over everything but an explicit chain name, and
+	     a machine's default is the last fallback. "Machines" rather than
+	     "Devices" (2026-11-04) — the outputs are what clients call an *output
+	     device*, and two tabs both called a device was half the confusion. -->
 	<div class="sechead">
 		<div class="seg">
 			<button class="seg-btn" class:on={secTab === 'equipment'} on:click={() => (secTab = 'equipment')}>Equipment · {equipment.length}</button>
-			<button class="seg-btn" class:on={secTab === 'devices'} on:click={() => (secTab = 'devices')}>Devices · {devices.length}</button>
 			<button class="seg-btn" class:on={secTab === 'outputs'} on:click={() => (secTab = 'outputs')}>Outputs · {bindings.length}</button>
+			<button class="seg-btn" class:on={secTab === 'machines'} on:click={() => (secTab = 'machines')}>Machines · {devices.length}</button>
 		</div>
 		{#if secTab === 'equipment'}
 			<button class="btn btn-secondary" on:click={newGear}>+ Add gear</button>
@@ -1249,8 +1350,8 @@
 		{/if}
 	{/if}
 
-	{#if secTab === 'devices'}
-		<p class="sechint">Machines that submit listens. A device's default chain is the last fallback — a token's own chain always wins.</p>
+	{#if secTab === 'machines'}
+		<p class="sechint">The computers and phones that submit listens. A machine's default chain is the last fallback — an output's mapping and an app token's chain both win over it.</p>
 		{#if devices.length}
 			<div class="panel" style="border-radius:20px;padding:8px;">
 				{#each devices as d (d.id)}
@@ -1276,14 +1377,18 @@
 			</div>
 		{:else}
 			<div class="panel empty">
-				<div class="empty-t">No devices yet</div>
+				<div class="empty-t">No machines yet</div>
 				<p>They appear here once a client submits a listen carrying a machine id.</p>
 			</div>
 		{/if}
 	{/if}
 
 	{#if secTab === 'outputs'}
-		<p class="sechint">Map each playback output to a chain once — every future listen through it attributes automatically.</p>
+		<p class="sechint">
+			Map each playback output once — to a chain, or to one setup of it — and every future listen
+			through it lands there. It is the most specific rule, so it wins over an app token and the
+			machine. Listens already logged stay as they are; retag those from History.
+		</p>
 		{#if bindings.length}
 			<div class="panel" style="border-radius:20px;padding:8px;">
 				{#each [...unmapped, ...mapped] as b (b.id)}
@@ -1298,11 +1403,34 @@
 							</div>
 							<div style="font-size:12.5px;color:var(--td-muted-2);margin-top:1px;">{b.hits} plays · last seen {timeAgo(b.last_seen)}</div>
 						</div>
+						<!-- One picker: a chain with setups is a group of them, so the
+						     choice is one value and a setup cannot land on the wrong
+						     chain. Option text repeats the chain because a closed
+						     select shows only the option, not its group. -->
 						<select class="input assign" class:needs={b.chain_id == null}
-							value={b.chain_id ?? ''} aria-label="Chain for {b.identifier}"
-							on:change={(e) => assignBinding(b, e.currentTarget.value)}>
+							value={bindingValue(b)} aria-label="Chain or setup for {b.identifier}"
+							on:change={(e) => assignBinding(b, e.currentTarget)}>
 							<option value="">— unmapped —</option>
-							{#each chains as c}<option value={c.id}>{c.name}</option>{/each}
+							{#each chainRows as c (c.id)}
+								{#if variantsFor(c.id).length}
+									<optgroup label={c.name}>
+										<option value="c:{c.id}">{c.name} · as wired</option>
+										{#each variantsFor(c.id) as v (v.id)}
+											<option value="v:{v.id}">{c.name} · {v.name}</option>
+										{/each}
+									</optgroup>
+								{:else}
+									<option value="c:{c.id}">{c.name}</option>
+								{/if}
+							{/each}
+							<optgroup label="Nothing fits?">
+								<option value="new-chain">+ New chain from “{b.identifier}”…</option>
+								{#if chains.length}
+									<option value="new-setup">
+										+ New setup of {b.chain_id != null ? `“${chains.find((c) => c.id === b.chain_id)?.name ?? 'a chain'}”` : 'a chain'}…
+									</option>
+								{/if}
+							</optgroup>
 						</select>
 						<button class="icon-btn danger" title="Forget this output" on:click={() => removeBinding(b)} aria-label="Delete binding">✕</button>
 					</div>
@@ -1410,7 +1538,7 @@
 							     a name and a marker in nested divs, which reads as a
 							     paragraph rather than as what the button does. -->
 							<button class="pstep" on:click={() => openChain && openSwap(openChain, i)}
-								title="Swap this step — as a variant, or in the chain itself"
+								title="Swap this step — as a setup, or in the chain itself"
 								aria-label="Swap {step.name}">
 								<div class="prole">{roleLabel(step)}</div>
 								<div style="font-size:15.5px;font-weight:600;margin-top:1px;display:flex;align-items:center;gap:6px;">
@@ -1433,7 +1561,7 @@
 
 			<!-- Variants: the same chain with one step swapped. Two cartridges on
 			     one turntable are a choice, not two decks. -->
-			<div class="drawer-label" style="margin-top:26px;">Also logged as</div>
+			<div class="drawer-label" style="margin-top:26px;">Setups</div>
 			{#each variantsFor(openChain.id) as v (v.id)}
 				<div class="vrow" title={overrideSummary(openChain, v)}>
 					<span style="font-size:14px;min-width:0;">{v.name}</span>
@@ -1446,27 +1574,27 @@
 						<button class="icon-btn" style="width:26px;height:26px;" title="Make this the chain"
 							aria-label="Make {v.name} the chain"
 							on:click={() => openChain && promote(openChain, v)}>★</button>
-						<button class="icon-btn" style="width:26px;height:26px;" title="Edit this variant"
-							aria-label="Edit variant {v.name}"
+						<button class="icon-btn" style="width:26px;height:26px;" title="Edit this setup"
+							aria-label="Edit setup {v.name}"
 							on:click={() => openChain && editVariant(openChain, v)}>✎</button>
-						<button class="icon-btn danger" style="width:26px;height:26px;" title="Delete this variant"
-							aria-label="Delete variant {v.name}" on:click={() => removeVariant(v)}>✕</button>
+						<button class="icon-btn danger" style="width:26px;height:26px;" title="Delete this setup"
+							aria-label="Delete setup {v.name}" on:click={() => removeVariant(v)}>✕</button>
 					</span>
 				</div>
 			{:else}
 				<p style="font-size:12.5px;color:var(--td-muted-2);margin:0 0 8px;">
-					One setup. Add a variant when you swap a single box — the other stylus, the other IEMs —
+					Just the one. Add a setup when you swap a single box — the other stylus, the other IEMs —
 					and its hours land on the gear that was actually fitted.
 				</p>
 			{/each}
 			<div style="display:flex;gap:8px;flex-wrap:wrap;">
-				<button class="vadd" on:click={() => openChain && newVariant(openChain)}>+ variant</button>
+				<button class="vadd" on:click={() => openChain && newVariant(openChain)}>+ setup</button>
 				<!-- Only offered where there is something to compare. With no
 				     variants the path above this *is* the overview, and a button
 				     opening a picture of one line is a button that does nothing. -->
 				{#if openChain && variantsFor(openChain.id).length}
 					<button class="vadd" on:click={() => (overviewOpen = true)}
-						title="See the chain and every variant of it side by side">
+						title="See the chain and every setup of it side by side">
 						⛓ see all setups
 					</button>
 				{/if}
@@ -1475,7 +1603,7 @@
 				     is something to fold. -->
 				{#if openChain && foldable(openChain).length}
 					<button class="vadd" on:click={() => openChain && openFold(openChain)}
-						title="Move another chain's listening onto this one as a variant">
+						title="Move another chain's listening onto this one as a setup">
 						⤵ fold a chain in
 					</button>
 				{/if}
@@ -1495,6 +1623,11 @@
 						<svg viewBox="0 0 24 24" width="16" fill="none" stroke="var(--td-muted-2)" stroke-width="2.3" stroke-linecap="round" stroke-linejoin="round" style="flex:none;"><path d="M11 5L6 9H2v6h4l5 4V5z"/><path d="M15.5 8.5a5 5 0 0 1 0 7M19 5a9 9 0 0 1 0 14"/></svg>
 						<span style="font-size:14px;">{b.identifier}</span>
 						{#if b.interface}<span style="font-size:12px;color:var(--td-muted-3);">{b.interface}</span>{/if}
+						<!-- Which setup, so the drawer answers what the output puts
+						     in the path and not only which chain. -->
+						<span style="font-size:12px;color:var(--td-muted-2);margin-left:auto;">
+							{variants.find((v) => v.id === b.chain_variant_id)?.name ?? 'as wired'}
+						</span>
 					</div>
 				{/each}
 			{/if}
@@ -1607,24 +1740,40 @@
 {/if}
 
 {#if vOpen && vChain}
-	<div class="dialog-backdrop" on:click={() => (vOpen = false)} on:keydown={() => {}} role="presentation">
+	<div class="dialog-backdrop" on:click={closeSetupEditor} on:keydown={() => {}} role="presentation">
 		<div class="dialog" style="width:min(520px,100%);" on:click|stopPropagation on:keydown|stopPropagation role="presentation">
 			<div class="dialog-title">
-				{vId == null ? (vMode === 'chain' ? 'Swap a step in' : 'New variant of') : 'Edit variant of'}
+				{vId == null ? (vMode === 'chain' ? 'Swap a step in' : 'New setup of') : 'Edit setup of'}
 				{vChain.name}
 			</div>
 			<div class="dialog-body">
 				<div style="display:flex;flex-direction:column;gap:13px;">
+					<!-- Opened from an output: which chain this is a setup of is the
+					     first question, and saving maps the output to it. There is
+					     no "replace in the chain" here — rewiring a chain is not
+					     something to do on the way to mapping an output. -->
+					{#if bindFor && vId == null}
+						<div class="field">
+							<label for="vc">A setup of</label>
+							<select id="vc" class="input" value={String(vChain.id)}
+								on:change={(e) => pickSetupChain(e.currentTarget.value)}>
+								{#each chainRows as c (c.id)}<option value={String(c.id)}>{c.name}</option>{/each}
+							</select>
+							<p style="font-size:12px;color:var(--td-muted-2);margin:5px 0 0;">
+								Saving maps “{bindFor.identifier}” to it.
+							</p>
+						</div>
+					{/if}
 					<!-- The two meanings of swapping a box, stated rather than
 					     guessed at. Only offered when creating: editing an
 					     existing variant is about that variant, and redirecting
 					     the save onto the chain would be a different and
 					     destructive operation behind the same button. -->
-					{#if vId == null}
+					{#if vId == null && !bindFor}
 						<div class="vmode">
 							<button class="vmode-btn" class:on={vMode === 'variant'}
 								on:click={() => (vMode = 'variant')}>
-								<span class="vmode-t">Save as a variant</span>
+								<span class="vmode-t">Save as a setup</span>
 								<span class="vmode-s">Both stay yours. Hours split between them.</span>
 							</button>
 							<button class="vmode-btn" class:on={vMode === 'chain'}
@@ -1662,7 +1811,7 @@
 						</select>
 						{#if vMode === 'variant'}
 							<p style="font-size:12px;color:var(--td-muted-2);margin:5px 0 0;">
-								Listens tagged with this variant credit their hours here instead of
+								Listens through this setup credit their hours here instead of
 								whatever the chain names at that step — which is what makes
 								per-stylus wear answerable.
 							</p>
@@ -1675,7 +1824,7 @@
 								This is retroactive: hours are worked out from the listens, so
 								every hour already logged through this chain moves onto the new
 								box. Right when you replaced the old one for good — use a
-								variant if you still swap between them.
+								setup if you still swap between them.
 							</p>
 						{/if}
 					</div>
@@ -1683,9 +1832,9 @@
 				</div>
 			</div>
 			<div class="dialog-actions">
-				<button class="btn btn-secondary" on:click={() => (vOpen = false)}>Cancel</button>
+				<button class="btn btn-secondary" on:click={closeSetupEditor}>Cancel</button>
 				<button class="btn btn-primary" on:click={saveVariant} disabled={vSaving}>
-					{vSaving ? 'Saving…' : vMode === 'chain' ? 'Replace in the chain' : 'Save variant'}
+					{vSaving ? 'Saving…' : vMode === 'chain' ? 'Replace in the chain' : bindFor ? 'Save and map' : 'Save setup'}
 				</button>
 			</div>
 		</div>
@@ -1721,14 +1870,14 @@
 							</select>
 							<p style="font-size:12px;color:var(--td-muted-2);margin:5px 0 0;">
 								Its listening moves onto “{fInto.name}” and the chain itself is deleted.
-								A chain carrying variants of its own can’t fold — its overrides point at
+								A chain carrying setups of its own can’t fold — its overrides point at
 								steps this would replace.
 							</p>
 						</div>
 						<div class="field">
 							<label for="fv">Logged as</label>
 							<select id="fv" class="input" bind:value={fVariant}>
-								<option value="new">— a new variant —</option>
+								<option value="new">— a new setup —</option>
 								{#each variantsFor(fInto.id) as v}
 									<option value={v.id}>{v.name}</option>
 								{/each}
@@ -1741,14 +1890,14 @@
 								</p>
 							{:else}
 								<p style="font-size:12px;color:var(--td-muted-2);margin:5px 0 0;">
-									The moved listens credit whatever this variant swaps in. Pick the one
+									The moved listens credit whatever this setup swaps in. Pick the one
 									that matches how that chain was wired.
 								</p>
 							{/if}
 						</div>
 						<p style="font-size:12.5px;color:var(--td-muted-2);margin:0;border-left:2px solid var(--td-muted-3);padding-left:10px;">
 							Not reversible. The listens keep everything else — only which chain and
-							variant they went through changes.
+							setup they went through changes.
 						</p>
 						{#if fErr}<p style="font-size:13px;color:#b2622d;margin:0;">{fErr}</p>{/if}
 					</div>
@@ -1775,9 +1924,14 @@
 
 <!-- Chain editor dialog -->
 {#if chainOpen}
-	<div class="dialog-backdrop" on:click={() => (chainOpen = false)} on:keydown={() => {}} role="presentation">
+	<div class="dialog-backdrop" on:click={closeChainEditor} on:keydown={() => {}} role="presentation">
 		<div class="dialog" style="width:min(620px,100%);" on:click|stopPropagation on:keydown|stopPropagation role="presentation">
 			<div class="dialog-title">{chainId == null ? 'New signal chain' : 'Edit chain'}</div>
+			{#if bindFor && chainId == null}
+				<p style="font-size:12.5px;color:var(--td-muted-2);margin:-4px 0 10px;">
+					For listens through “{bindFor.identifier}” — saving maps that output to it.
+				</p>
+			{/if}
 			<div class="dialog-body" style="max-height:70vh;overflow-y:auto;">
 				<div style="display:flex;flex-direction:column;gap:13px;">
 					<div class="field"><label for="cn">Name</label><input id="cn" class="input" bind:value={cName} placeholder="Desktop Reference"></div>
@@ -1861,7 +2015,7 @@
 				</div>
 			</div>
 			<div class="dialog-actions">
-				<button class="btn btn-secondary" on:click={() => (chainOpen = false)}>Cancel</button>
+				<button class="btn btn-secondary" on:click={closeChainEditor}>Cancel</button>
 				<button class="btn btn-primary" on:click={saveChain} disabled={savingChain || !cName.trim()}>{savingChain ? 'Saving…' : 'Save chain'}</button>
 			</div>
 		</div>

@@ -1229,6 +1229,15 @@ impl Database {
             .execute(&self.pool)
             .await;
         }
+        // An output names the setup it usually carries, not only the chain.
+        if !has_column(&self.pool, "chain_bindings", "chain_variant_id").await {
+            let _ = sqlx::query(
+                "ALTER TABLE chain_bindings ADD COLUMN chain_variant_id INTEGER
+                   REFERENCES chain_variants(id)",
+            )
+            .execute(&self.pool)
+            .await;
+        }
         if !has_column(&self.pool, "sessions", "notes").await {
             let _ =
                 sqlx::query("ALTER TABLE sessions ADD COLUMN notes TEXT").execute(&self.pool).await;
