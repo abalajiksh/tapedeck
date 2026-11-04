@@ -3438,6 +3438,102 @@ fn err_response(code: StatusCode, msg: String) -> axum::response::Response {
     (code, Json(ErrorResponse { code: code.as_u16(), error: msg })).into_response()
 }
 
+/// An album the album-first lookup found nowhere on MusicBrainz.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct MusicBrainzMiss {
+    /// As your listens spell it.
+    pub artist: String,
+    pub album: String,
+    pub plays: i64,
+    /// Unix seconds.
+    pub last_played: i64,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct MusicBrainzMisses {
+    pub albums: Vec<MusicBrainzMiss>,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct RetryLookup {
+    pub artist: String,
+    pub album: String,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct RetriedLookup {
+    /// Listens put back on the lookup queue.
+    pub requeued: u64,
+}
+
+// GET /api/v1/sanitize/musicbrainz-misses
+/// Albums MusicBrainz does not have.
+///
+/// Albums whose listens carry no MusicBrainz IDs and that the album-first
+/// lookup could not find there — a record bought on Qobuz that nobody has
+/// added yet. Adding it to MusicBrainz and asking again
+/// (`POST /api/v1/sanitize/musicbrainz-misses/retry`) lets its listens be
+/// credited like any other.
+#[utoipa::path(
+    get,
+    path = "/api/v1/sanitize/musicbrainz-misses",
+    tag = "Maintenance",
+    responses(
+        (status = 200, description = "Missed albums, most played first.", body = MusicBrainzMisses),
+        (status = 401, response = Unauthorized),
+    )
+)]
+async fn musicbrainz_misses(
+    State(state): State<Arc<AppState>>,
+    user: AuthUser,
+) -> impl IntoResponse {
+    match state.db.musicbrainz_misses(user.user_id).await {
+        Ok(rows) => Json(MusicBrainzMisses {
+            albums: rows
+                .into_iter()
+                .map(|(artist, album, plays, last_played)| MusicBrainzMiss {
+                    artist,
+                    album,
+                    plays,
+                    last_played,
+                })
+                .collect(),
+        })
+        .into_response(),
+        Err(e) => server_error(e.to_string()),
+    }
+}
+
+// POST /api/v1/sanitize/musicbrainz-misses/retry
+/// Look a missed album up again.
+///
+/// Puts your listens of it back on the album-first lookup's queue; the
+/// backfill asks MusicBrainz on its next pass. Nothing else changes.
+#[utoipa::path(
+    post,
+    path = "/api/v1/sanitize/musicbrainz-misses/retry",
+    tag = "Maintenance",
+    request_body = RetryLookup,
+    responses(
+        (status = 200, description = "Queued.", body = RetriedLookup),
+        (status = 400, response = BadRequest),
+        (status = 401, response = Unauthorized),
+    )
+)]
+async fn retry_musicbrainz_miss(
+    State(state): State<Arc<AppState>>,
+    user: AuthUser,
+    Json(body): Json<RetryLookup>,
+) -> impl IntoResponse {
+    if body.artist.trim().is_empty() || body.album.trim().is_empty() {
+        return bad_request("artist and album are required");
+    }
+    match state.db.retry_album_lookup(user.user_id, &body.artist, &body.album).await {
+        Ok(requeued) => Json(RetriedLookup { requeued }).into_response(),
+        Err(e) => server_error(e.to_string()),
+    }
+}
+
 fn server_error(msg: String) -> axum::response::Response {
     (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { code: 500, error: msg }))
         .into_response()
@@ -3475,6 +3571,8 @@ fn server_error(msg: String) -> axum::response::Response {
     backfill_languages_now,
     sanitize_preview,
     sanitize_apply,
+    musicbrainz_misses,
+    retry_musicbrainz_miss,
 ))]
 pub struct Api;
 
@@ -3489,6 +3587,11 @@ pub fn create_scrobbles_router() -> Router<Arc<AppState>> {
         .route("/api/v1/search", get(search))
         .route("/api/v1/skips", get(list_skips))
         .route("/api/v1/sanitize", get(sanitize_preview).post(sanitize_apply))
+        .route("/api/v1/sanitize/musicbrainz-misses", get(musicbrainz_misses))
+        .route(
+            "/api/v1/sanitize/musicbrainz-misses/retry",
+            axum::routing::post(retry_musicbrainz_miss),
+        )
         .route("/api/v1/stats/dashboard", get(dashboard_stats))
         .route("/api/v1/stats", get(ranged_stats))
         .route("/api/v1/personality", get(personality))

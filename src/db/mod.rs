@@ -3042,6 +3042,27 @@ pub fn artist_matches(a: &str, b: &str) -> bool {
     !a.is_empty() && a == b
 }
 
+/// A title or album name without a trailing bracketed featuring credit:
+/// "Give It Up (feat. Elizabeth Gillies & Ariana Grande)" → "Give It Up",
+/// "Victorious: Music From The Hit TV Show (feat. Victoria Justice)" → the
+/// release's own title. Spotify writes credits into titles this way; MusicBrainz
+/// keeps them in the artist credit. Only `(…)`/`[…]` groups that start with
+/// feat./ft./featuring, and only at the end, so "(Victorious Theme)" stays.
+pub fn strip_featuring(s: &str) -> &str {
+    let t = s.trim_end();
+    let Some(close) = t.chars().last().filter(|c| *c == ')' || *c == ']') else {
+        return t;
+    };
+    let open = if close == ')' { '(' } else { '[' };
+    let Some(start) = t.rfind(open) else { return t };
+    let inner = t[start + 1..].trim_start().to_lowercase();
+    if ["feat. ", "feat ", "ft. ", "ft ", "featuring "].iter().any(|m| inner.starts_with(m)) {
+        t[..start].trim_end()
+    } else {
+        t
+    }
+}
+
 /// Split `Artist feat. Someone` into its primary artist.
 ///
 /// Only the explicit credit forms are matched. `&` and `,` are deliberately
@@ -3721,7 +3742,7 @@ mod chains;
 mod connections;
 mod crate_shelf;
 mod credits;
-pub use credits::{credit_extends, same_spelling};
+pub use credits::{credit_extends, same_spelling, tracks_matched};
 pub mod dialect;
 mod gear;
 #[cfg(test)]

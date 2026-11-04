@@ -1,0 +1,1036 @@
+{
+ "id": "3d56b337-a16f-4b97-8e4c-7b286cd256fe",
+ "status-id": "4e304316-386d-3409-af2e-78857eec5cfe",
+ "text-representation": {
+  "language": "eng",
+  "script": "Latn"
+ },
+ "quality": "normal",
+ "release-group": {
+  "primary-type-id": "f529b476-6e62-324f-b0aa-1f3e33d313fc",
+  "artist-credit": [
+   {
+    "artist": {
+     "id": "19c682b6-31cc-41fa-bf6e-1796f2a1e778",
+     "name": "Victorious Cast",
+     "type-id": "e431f5f6-b5d2-343d-8b36-72607fffb74b",
+     "type": "Group",
+     "country": "US",
+     "sort-name": "Victorious Cast",
+     "disambiguation": ""
+    },
+    "name": "Victorious Cast",
+    "joinphrase": ""
+   }
+  ],
+  "primary-type": "Album",
+  "disambiguation": "",
+  "first-release-date": "2011-08-01",
+  "id": "17278767-3c89-4c6c-8d56-b835e5eb6ffa",
+  "secondary-types": [
+   "Soundtrack"
+  ],
+  "secondary-type-ids": [
+   "22a628ad-c082-3c4f-b1b6-d41665107b88"
+  ],
+  "title": "Victorious: Music from the Hit TV Show"
+ },
+ "artist-credit": [
+  {
+   "name": "Victorious Cast",
+   "artist": {
+    "sort-name": "Victorious Cast",
+    "type-id": "e431f5f6-b5d2-343d-8b36-72607fffb74b",
+    "type": "Group",
+    "country": "US",
+    "disambiguation": "",
+    "name": "Victorious Cast",
+    "id": "19c682b6-31cc-41fa-bf6e-1796f2a1e778"
+   },
+   "joinphrase": ""
+  }
+ ],
+ "barcode": "886443113015",
+ "status": "Official",
+ "date": "2011-08-02",
+ "disambiguation": "",
+ "asin": null,
+ "cover-art-archive": {
+  "back": false,
+  "front": true,
+  "darkened": false,
+  "count": 1,
+  "artwork": true
+ },
+ "title": "Victorious: Music from the Hit TV Show",
+ "packaging": "None",
+ "country": "BH",
+ "media": [
+  {
+   "format": "Digital Media",
+   "position": 1,
+   "tracks": [
+    {
+     "number": "1",
+     "position": 1,
+     "artist-credit": [
+      {
+       "name": "Victoria Justice",
+       "artist": {
+        "name": "Victoria Justice",
+        "id": "4ce94c22-acbc-4535-a0e4-b8a8d002887e",
+        "disambiguation": "US actress & singer",
+        "sort-name": "Justice, Victoria",
+        "country": "US",
+        "type-id": "b6e035f4-3ce9-331c-97df-83397230b0df",
+        "type": "Person"
+       },
+       "joinphrase": ""
+      }
+     ],
+     "length": 187000,
+     "id": "b1e49e08-0a04-3c89-94af-0f871b997203",
+     "recording": {
+      "id": "139a3d66-8bee-49ab-b088-ea6f6e9ece17",
+      "title": "Make It Shine (Victorious Theme)",
+      "artist-credit": [
+       {
+        "name": "Victoria Justice",
+        "artist": {
+         "type-id": "b6e035f4-3ce9-331c-97df-83397230b0df",
+         "type": "Person",
+         "country": "US",
+         "sort-name": "Justice, Victoria",
+         "disambiguation": "US actress & singer",
+         "id": "4ce94c22-acbc-4535-a0e4-b8a8d002887e",
+         "name": "Victoria Justice"
+        },
+        "joinphrase": ""
+       }
+      ],
+      "length": 187773,
+      "video": false,
+      "disambiguation": "",
+      "first-release-date": "2010-04-13"
+     },
+     "title": "Make It Shine (Victorious Theme)"
+    },
+    {
+     "number": "2",
+     "artist-credit": [
+      {
+       "name": "Victoria Justice",
+       "artist": {
+        "disambiguation": "US actress & singer",
+        "sort-name": "Justice, Victoria",
+        "type-id": "b6e035f4-3ce9-331c-97df-83397230b0df",
+        "country": "US",
+        "type": "Person",
+        "name": "Victoria Justice",
+        "id": "4ce94c22-acbc-4535-a0e4-b8a8d002887e"
+       },
+       "joinphrase": ""
+      }
+     ],
+     "position": 2,
+     "length": 234000,
+     "id": "0ff9be60-b562-3a20-973c-47564daa9f3a",
+     "title": "Freak the Freak Out",
+     "recording": {
+      "title": "Freak the Freak Out",
+      "id": "b9774cad-6344-4c25-b9c5-2fdfc39183b0",
+      "first-release-date": "2010-11-22",
+      "disambiguation": "",
+      "video": false,
+      "length": 234000,
+      "artist-credit": [
+       {
+        "artist": {
+         "sort-name": "Justice, Victoria",
+         "country": "US",
+         "type-id": "b6e035f4-3ce9-331c-97df-83397230b0df",
+         "type": "Person",
+         "disambiguation": "US actress & singer",
+         "name": "Victoria Justice",
+         "id": "4ce94c22-acbc-4535-a0e4-b8a8d002887e"
+        },
+        "name": "Victoria Justice",
+        "joinphrase": ""
+       }
+      ]
+     }
+    },
+    {
+     "title": "Best Friend\u2019s Brother",
+     "recording": {
+      "first-release-date": "2011-05-20",
+      "disambiguation": "",
+      "video": false,
+      "length": 218000,
+      "artist-credit": [
+       {
+        "joinphrase": "",
+        "artist": {
+         "disambiguation": "US actress & singer",
+         "type": "Person",
+         "type-id": "b6e035f4-3ce9-331c-97df-83397230b0df",
+         "country": "US",
+         "sort-name": "Justice, Victoria",
+         "id": "4ce94c22-acbc-4535-a0e4-b8a8d002887e",
+         "name": "Victoria Justice"
+        },
+        "name": "Victoria Justice"
+       }
+      ],
+      "title": "Best Friend\u2019s Brother",
+      "id": "4e561a8d-3a71-45a7-8d50-589eb757b33c"
+     },
+     "id": "d3b48de9-5dd5-356b-80d4-316e0811a7f9",
+     "length": 218000,
+     "number": "3",
+     "artist-credit": [
+      {
+       "joinphrase": "",
+       "name": "Victoria Justice",
+       "artist": {
+        "name": "Victoria Justice",
+        "id": "4ce94c22-acbc-4535-a0e4-b8a8d002887e",
+        "disambiguation": "US actress & singer",
+        "sort-name": "Justice, Victoria",
+        "type-id": "b6e035f4-3ce9-331c-97df-83397230b0df",
+        "country": "US",
+        "type": "Person"
+       }
+      }
+     ],
+     "position": 3
+    },
+    {
+     "length": 193000,
+     "number": "4",
+     "position": 4,
+     "artist-credit": [
+      {
+       "joinphrase": "",
+       "name": "Victoria Justice",
+       "artist": {
+        "id": "4ce94c22-acbc-4535-a0e4-b8a8d002887e",
+        "name": "Victoria Justice",
+        "disambiguation": "US actress & singer",
+        "country": "US",
+        "type-id": "b6e035f4-3ce9-331c-97df-83397230b0df",
+        "type": "Person",
+        "sort-name": "Justice, Victoria"
+       }
+      }
+     ],
+     "recording": {
+      "disambiguation": "",
+      "first-release-date": "2011-04-01",
+      "video": false,
+      "length": 194000,
+      "artist-credit": [
+       {
+        "name": "Victoria Justice",
+        "artist": {
+         "name": "Victoria Justice",
+         "id": "4ce94c22-acbc-4535-a0e4-b8a8d002887e",
+         "disambiguation": "US actress & singer",
+         "sort-name": "Justice, Victoria",
+         "type": "Person",
+         "type-id": "b6e035f4-3ce9-331c-97df-83397230b0df",
+         "country": "US"
+        },
+        "joinphrase": ""
+       }
+      ],
+      "title": "Beggin' on Your Knees",
+      "id": "a1523a14-29b1-48e7-b08a-cf10bf095adf"
+     },
+     "title": "Beggin\u2019 on Your Knees",
+     "id": "5b922d96-d08b-3826-a3e9-2f690de91d10"
+    },
+    {
+     "id": "7546c848-d410-35ad-9fe8-02314ae3bdb1",
+     "title": "All I Want Is Everything",
+     "recording": {
+      "first-release-date": "2011-08-01",
+      "disambiguation": "",
+      "length": 182000,
+      "video": false,
+      "artist-credit": [
+       {
+        "name": "Victoria Justice",
+        "artist": {
+         "id": "4ce94c22-acbc-4535-a0e4-b8a8d002887e",
+         "name": "Victoria Justice",
+         "disambiguation": "US actress & singer",
+         "type-id": "b6e035f4-3ce9-331c-97df-83397230b0df",
+         "type": "Person",
+         "country": "US",
+         "sort-name": "Justice, Victoria"
+        },
+        "joinphrase": ""
+       }
+      ],
+      "title": "All I Want Is Everything",
+      "id": "2adea3f2-f0cd-410b-829c-f2a301175e89"
+     },
+     "artist-credit": [
+      {
+       "name": "Victoria Justice",
+       "artist": {
+        "disambiguation": "US actress & singer",
+        "sort-name": "Justice, Victoria",
+        "type": "Person",
+        "type-id": "b6e035f4-3ce9-331c-97df-83397230b0df",
+        "country": "US",
+        "name": "Victoria Justice",
+        "id": "4ce94c22-acbc-4535-a0e4-b8a8d002887e"
+       },
+       "joinphrase": ""
+      }
+     ],
+     "position": 5,
+     "number": "5",
+     "length": 182000
+    },
+    {
+     "title": "You\u2019re the Reason",
+     "recording": {
+      "video": false,
+      "length": 173573,
+      "first-release-date": "2011-08-01",
+      "disambiguation": "",
+      "artist-credit": [
+       {
+        "name": "Victoria Justice",
+        "artist": {
+         "id": "4ce94c22-acbc-4535-a0e4-b8a8d002887e",
+         "name": "Victoria Justice",
+         "type-id": "b6e035f4-3ce9-331c-97df-83397230b0df",
+         "type": "Person",
+         "country": "US",
+         "sort-name": "Justice, Victoria",
+         "disambiguation": "US actress & singer"
+        },
+        "joinphrase": ""
+       }
+      ],
+      "title": "You\u2019re the Reason",
+      "id": "401563e2-47e3-467a-8cb2-bd9b5aa00fd2"
+     },
+     "id": "6efc7ea4-3d2f-36bc-ae02-b8dbaebfb184",
+     "length": 173000,
+     "number": "6",
+     "artist-credit": [
+      {
+       "artist": {
+        "sort-name": "Justice, Victoria",
+        "type-id": "b6e035f4-3ce9-331c-97df-83397230b0df",
+        "country": "US",
+        "type": "Person",
+        "disambiguation": "US actress & singer",
+        "name": "Victoria Justice",
+        "id": "4ce94c22-acbc-4535-a0e4-b8a8d002887e"
+       },
+       "name": "Victoria Justice",
+       "joinphrase": ""
+      }
+     ],
+     "position": 6
+    },
+    {
+     "recording": {
+      "title": "Give It Up",
+      "id": "b46aa725-95a4-4a1b-b1a6-22a8367c538f",
+      "length": 165146,
+      "video": false,
+      "first-release-date": "2011-08-01",
+      "disambiguation": "",
+      "artist-credit": [
+       {
+        "joinphrase": " & ",
+        "artist": {
+         "name": "Liz Gillies",
+         "id": "8d7b2288-dc37-429f-a99a-8ce1e42641db",
+         "sort-name": "Gillies, Liz",
+         "type-id": "b6e035f4-3ce9-331c-97df-83397230b0df",
+         "country": "US",
+         "type": "Person",
+         "disambiguation": "US actress and singer"
+        },
+        "name": "Elizabeth Gillies"
+       },
+       {
+        "joinphrase": "",
+        "name": "Ariana Grande",
+        "artist": {
+         "type-id": "b6e035f4-3ce9-331c-97df-83397230b0df",
+         "type": "Person",
+         "country": "US",
+         "sort-name": "Grande, Ariana",
+         "disambiguation": "",
+         "id": "f4fdbb4c-e4b7-47a0-b83b-d91bbfcfa387",
+         "name": "Ariana Grande"
+        }
+       }
+      ]
+     },
+     "title": "Give It Up",
+     "id": "8e8bfd53-4548-3387-8a01-92d6d0b0cd7b",
+     "length": 165000,
+     "number": "7",
+     "position": 7,
+     "artist-credit": [
+      {
+       "joinphrase": " & ",
+       "name": "Elizabeth Gillies",
+       "artist": {
+        "disambiguation": "US actress and singer",
+        "sort-name": "Gillies, Liz",
+        "country": "US",
+        "type-id": "b6e035f4-3ce9-331c-97df-83397230b0df",
+        "type": "Person",
+        "name": "Liz Gillies",
+        "id": "8d7b2288-dc37-429f-a99a-8ce1e42641db"
+       }
+      },
+      {
+       "joinphrase": "",
+       "artist": {
+        "name": "Ariana Grande",
+        "id": "f4fdbb4c-e4b7-47a0-b83b-d91bbfcfa387",
+        "disambiguation": "",
+        "sort-name": "Grande, Ariana",
+        "type": "Person",
+        "type-id": "b6e035f4-3ce9-331c-97df-83397230b0df",
+        "country": "US"
+       },
+       "name": "Ariana Grande"
+      }
+     ]
+    },
+    {
+     "title": "I Want You Back",
+     "recording": {
+      "first-release-date": "2011-08-01",
+      "disambiguation": "",
+      "length": 179920,
+      "video": false,
+      "artist-credit": [
+       {
+        "name": "Victoria Justice",
+        "artist": {
+         "name": "Victoria Justice",
+         "id": "4ce94c22-acbc-4535-a0e4-b8a8d002887e",
+         "sort-name": "Justice, Victoria",
+         "type": "Person",
+         "type-id": "b6e035f4-3ce9-331c-97df-83397230b0df",
+         "country": "US",
+         "disambiguation": "US actress & singer"
+        },
+        "joinphrase": " & "
+       },
+       {
+        "artist": {
+         "disambiguation": "",
+         "type-id": "e431f5f6-b5d2-343d-8b36-72607fffb74b",
+         "country": "US",
+         "type": "Group",
+         "sort-name": "Victorious Cast",
+         "id": "19c682b6-31cc-41fa-bf6e-1796f2a1e778",
+         "name": "Victorious Cast"
+        },
+        "name": "\u201cVictorious\u201d Cast",
+        "joinphrase": ""
+       }
+      ],
+      "title": "I Want You Back",
+      "id": "97a993c7-6e63-42f3-baf3-45b29f04961a"
+     },
+     "id": "5b6fdd2a-69ab-3260-b8e7-90e0f35fb780",
+     "length": 179000,
+     "number": "8",
+     "artist-credit": [
+      {
+       "artist": {
+        "id": "4ce94c22-acbc-4535-a0e4-b8a8d002887e",
+        "name": "Victoria Justice",
+        "type-id": "b6e035f4-3ce9-331c-97df-83397230b0df",
+        "country": "US",
+        "type": "Person",
+        "sort-name": "Justice, Victoria",
+        "disambiguation": "US actress & singer"
+       },
+       "name": "Victoria Justice",
+       "joinphrase": " & "
+      },
+      {
+       "joinphrase": "",
+       "name": "\u201cVictorious\u201d Cast",
+       "artist": {
+        "type-id": "e431f5f6-b5d2-343d-8b36-72607fffb74b",
+        "type": "Group",
+        "country": "US",
+        "sort-name": "Victorious Cast",
+        "disambiguation": "",
+        "id": "19c682b6-31cc-41fa-bf6e-1796f2a1e778",
+        "name": "Victorious Cast"
+       }
+      }
+     ],
+     "position": 8
+    },
+    {
+     "id": "075bfb23-64bb-3de7-8d55-f1f1ab8fc245",
+     "recording": {
+      "title": "Song 2 You",
+      "id": "5ce9c1f5-89d7-4b1c-a0c9-957066e1248d",
+      "video": false,
+      "length": 218373,
+      "first-release-date": "2011-08-01",
+      "disambiguation": "",
+      "artist-credit": [
+       {
+        "name": "Leon Thomas III",
+        "artist": {
+         "sort-name": "Thomas, Leon",
+         "type-id": "b6e035f4-3ce9-331c-97df-83397230b0df",
+         "type": "Person",
+         "country": "US",
+         "disambiguation": "contemporary US R&B/soul musician, actor",
+         "name": "Leon Thomas",
+         "id": "412ff65d-26bf-4849-ba19-d2a58030fd1a"
+        },
+        "joinphrase": " & "
+       },
+       {
+        "joinphrase": "",
+        "artist": {
+         "name": "Victoria Justice",
+         "id": "4ce94c22-acbc-4535-a0e4-b8a8d002887e",
+         "sort-name": "Justice, Victoria",
+         "type-id": "b6e035f4-3ce9-331c-97df-83397230b0df",
+         "type": "Person",
+         "country": "US",
+         "disambiguation": "US actress & singer"
+        },
+        "name": "Victoria Justice"
+       }
+      ]
+     },
+     "title": "Song 2 You",
+     "position": 9,
+     "artist-credit": [
+      {
+       "artist": {
+        "sort-name": "Thomas, Leon",
+        "type-id": "b6e035f4-3ce9-331c-97df-83397230b0df",
+        "type": "Person",
+        "country": "US",
+        "disambiguation": "contemporary US R&B/soul musician, actor",
+        "name": "Leon Thomas",
+        "id": "412ff65d-26bf-4849-ba19-d2a58030fd1a"
+       },
+       "name": "Leon Thomas III",
+       "joinphrase": " & "
+      },
+      {
+       "joinphrase": "",
+       "name": "Victoria Justice",
+       "artist": {
+        "id": "4ce94c22-acbc-4535-a0e4-b8a8d002887e",
+        "name": "Victoria Justice",
+        "disambiguation": "US actress & singer",
+        "country": "US",
+        "type-id": "b6e035f4-3ce9-331c-97df-83397230b0df",
+        "type": "Person",
+        "sort-name": "Justice, Victoria"
+       }
+      }
+     ],
+     "number": "9",
+     "length": 218000
+    },
+    {
+     "artist-credit": [
+      {
+       "name": "Victoria Justice",
+       "artist": {
+        "disambiguation": "US actress & singer",
+        "country": "US",
+        "type-id": "b6e035f4-3ce9-331c-97df-83397230b0df",
+        "type": "Person",
+        "sort-name": "Justice, Victoria",
+        "id": "4ce94c22-acbc-4535-a0e4-b8a8d002887e",
+        "name": "Victoria Justice"
+       },
+       "joinphrase": " & "
+      },
+      {
+       "artist": {
+        "country": "US",
+        "type-id": "b6e035f4-3ce9-331c-97df-83397230b0df",
+        "type": "Person",
+        "sort-name": "Thomas, Leon",
+        "disambiguation": "contemporary US R&B/soul musician, actor",
+        "id": "412ff65d-26bf-4849-ba19-d2a58030fd1a",
+        "name": "Leon Thomas"
+       },
+       "name": "Leon Thomas III",
+       "joinphrase": ""
+      }
+     ],
+     "position": 10,
+     "number": "10",
+     "length": 161000,
+     "id": "d4bcc67d-1220-3d3a-84fa-51ab85ef0134",
+     "title": "Tell Me That You Love Me",
+     "recording": {
+      "title": "Tell Me That You Love Me",
+      "id": "46605119-7488-4225-9a94-a586f2407a1b",
+      "video": false,
+      "length": 161000,
+      "disambiguation": "",
+      "first-release-date": "2011-08-01",
+      "artist-credit": [
+       {
+        "joinphrase": " & ",
+        "artist": {
+         "disambiguation": "US actress & singer",
+         "sort-name": "Justice, Victoria",
+         "country": "US",
+         "type-id": "b6e035f4-3ce9-331c-97df-83397230b0df",
+         "type": "Person",
+         "name": "Victoria Justice",
+         "id": "4ce94c22-acbc-4535-a0e4-b8a8d002887e"
+        },
+        "name": "Victoria Justice"
+       },
+       {
+        "joinphrase": "",
+        "name": "Leon Thomas III",
+        "artist": {
+         "disambiguation": "contemporary US R&B/soul musician, actor",
+         "sort-name": "Thomas, Leon",
+         "country": "US",
+         "type-id": "b6e035f4-3ce9-331c-97df-83397230b0df",
+         "type": "Person",
+         "name": "Leon Thomas",
+         "id": "412ff65d-26bf-4849-ba19-d2a58030fd1a"
+        }
+       }
+      ]
+     }
+    },
+    {
+     "title": "Finally Falling",
+     "recording": {
+      "title": "Finally Falling",
+      "id": "322f3dbf-ce8f-487a-b32c-6fbc7c76239e",
+      "length": 170000,
+      "video": false,
+      "first-release-date": "2011-08-01",
+      "disambiguation": "",
+      "artist-credit": [
+       {
+        "artist": {
+         "disambiguation": "US actress & singer",
+         "sort-name": "Justice, Victoria",
+         "country": "US",
+         "type-id": "b6e035f4-3ce9-331c-97df-83397230b0df",
+         "type": "Person",
+         "name": "Victoria Justice",
+         "id": "4ce94c22-acbc-4535-a0e4-b8a8d002887e"
+        },
+        "name": "Victoria Justice",
+        "joinphrase": ""
+       }
+      ]
+     },
+     "id": "5ab4abc9-d874-3fbe-aced-865221329383",
+     "length": 170000,
+     "artist-credit": [
+      {
+       "name": "Victoria Justice",
+       "artist": {
+        "disambiguation": "US actress & singer",
+        "type-id": "b6e035f4-3ce9-331c-97df-83397230b0df",
+        "type": "Person",
+        "country": "US",
+        "sort-name": "Justice, Victoria",
+        "id": "4ce94c22-acbc-4535-a0e4-b8a8d002887e",
+        "name": "Victoria Justice"
+       },
+       "joinphrase": ""
+      }
+     ],
+     "position": 11,
+     "number": "11"
+    },
+    {
+     "number": "12",
+     "artist-credit": [
+      {
+       "artist": {
+        "name": "Victoria Justice",
+        "id": "4ce94c22-acbc-4535-a0e4-b8a8d002887e",
+        "disambiguation": "US actress & singer",
+        "sort-name": "Justice, Victoria",
+        "type": "Person",
+        "type-id": "b6e035f4-3ce9-331c-97df-83397230b0df",
+        "country": "US"
+       },
+       "name": "Victoria Justice",
+       "joinphrase": ", "
+      },
+      {
+       "joinphrase": " & ",
+       "artist": {
+        "id": "19c682b6-31cc-41fa-bf6e-1796f2a1e778",
+        "name": "Victorious Cast",
+        "disambiguation": "",
+        "type": "Group",
+        "type-id": "e431f5f6-b5d2-343d-8b36-72607fffb74b",
+        "country": "US",
+        "sort-name": "Victorious Cast"
+       },
+       "name": "Victorious Cast"
+      },
+      {
+       "artist": {
+        "id": "968bb434-4098-4328-8f8f-1dea116d3b1e",
+        "name": "iCarly Cast",
+        "type-id": "e431f5f6-b5d2-343d-8b36-72607fffb74b",
+        "country": "US",
+        "type": "Group",
+        "sort-name": "iCarly Cast",
+        "disambiguation": ""
+       },
+       "name": "iCarly",
+       "joinphrase": ""
+      }
+     ],
+     "position": 12,
+     "length": 132000,
+     "id": "20d3d2aa-aa88-31f1-ba66-4a0f516e7046",
+     "title": "Leave It All to Shine",
+     "recording": {
+      "artist-credit": [
+       {
+        "joinphrase": " & ",
+        "artist": {
+         "name": "iCarly Cast",
+         "id": "968bb434-4098-4328-8f8f-1dea116d3b1e",
+         "sort-name": "iCarly Cast",
+         "type": "Group",
+         "type-id": "e431f5f6-b5d2-343d-8b36-72607fffb74b",
+         "country": "US",
+         "disambiguation": ""
+        },
+        "name": "iCarly"
+       },
+       {
+        "name": "Victorious Casts",
+        "artist": {
+         "id": "19c682b6-31cc-41fa-bf6e-1796f2a1e778",
+         "name": "Victorious Cast",
+         "type-id": "e431f5f6-b5d2-343d-8b36-72607fffb74b",
+         "country": "US",
+         "type": "Group",
+         "sort-name": "Victorious Cast",
+         "disambiguation": ""
+        },
+        "joinphrase": ""
+       }
+      ],
+      "disambiguation": "",
+      "first-release-date": "2011-06-10",
+      "length": 132706,
+      "video": false,
+      "id": "2f39ffda-2aba-4a2b-8da6-3c402f60ca84",
+      "title": "Leave It All to Shine"
+     }
+    },
+    {
+     "id": "8731eed7-e30d-310e-8205-56792e757f7b",
+     "recording": {
+      "length": 145520,
+      "video": false,
+      "first-release-date": "2011-08-02",
+      "disambiguation": "",
+      "artist-credit": [
+       {
+        "joinphrase": "",
+        "artist": {
+         "disambiguation": "American actor",
+         "sort-name": "Bennett, Matt",
+         "type-id": "b6e035f4-3ce9-331c-97df-83397230b0df",
+         "country": null,
+         "type": "Person",
+         "name": "Matt Bennett",
+         "id": "327b3122-80e0-4ade-b1f5-1a4c78c2bad6"
+        },
+        "name": "Matt Bennett"
+       }
+      ],
+      "title": "Broken Glass",
+      "id": "0e959e03-0d79-492c-aa77-4b54f6a458f6"
+     },
+     "title": "Broken Glass",
+     "position": 13,
+     "artist-credit": [
+      {
+       "joinphrase": "",
+       "name": "Matt Bennett",
+       "artist": {
+        "id": "bc6d4061-954a-405d-9246-4d4db9564985",
+        "name": "Matt Bennett",
+        "country": "US",
+        "type-id": "b6e035f4-3ce9-331c-97df-83397230b0df",
+        "type": "Person",
+        "sort-name": "Bennett, Matt",
+        "disambiguation": ""
+       }
+      }
+     ],
+     "number": "13",
+     "length": 145000
+    }
+   ],
+   "track-offset": 0,
+   "id": "e1f17506-5acb-377d-b484-f5f88098aede",
+   "track-count": 13,
+   "format-id": "907a28d9-b3b2-3ef6-89a8-7b18d91d4794",
+   "title": ""
+  }
+ ],
+ "packaging-id": "119eba76-b343-3e02-a292-f0f00644bb9b",
+ "release-events": [
+  {
+   "date": "2011-08-02",
+   "area": {
+    "iso-3166-1-codes": [
+     "BH"
+    ],
+    "name": "Bahrain",
+    "id": "65f4f7a6-d3c1-3a6b-a726-85e147d555b7",
+    "sort-name": "Bahrain",
+    "type": null,
+    "type-id": null,
+    "disambiguation": ""
+   }
+  },
+  {
+   "date": "2011-08-02",
+   "area": {
+    "sort-name": "Egypt",
+    "type": null,
+    "type-id": null,
+    "disambiguation": "",
+    "name": "Egypt",
+    "iso-3166-1-codes": [
+     "EG"
+    ],
+    "id": "8e0551f2-95c2-3cc0-a0a9-f2d344f10667"
+   }
+  },
+  {
+   "area": {
+    "disambiguation": "",
+    "sort-name": "Iraq",
+    "type-id": null,
+    "type": null,
+    "name": "Iraq",
+    "iso-3166-1-codes": [
+     "IQ"
+    ],
+    "id": "b0525ccb-15e9-3c56-81fa-471db3b31cfa"
+   },
+   "date": "2011-08-02"
+  },
+  {
+   "date": "2011-08-02",
+   "area": {
+    "name": "Jordan",
+    "iso-3166-1-codes": [
+     "JO"
+    ],
+    "id": "2e40127e-0b8a-3a01-bfbc-58c7fcdba532",
+    "sort-name": "Jordan",
+    "type-id": null,
+    "type": null,
+    "disambiguation": ""
+   }
+  },
+  {
+   "date": "2011-08-02",
+   "area": {
+    "disambiguation": "",
+    "sort-name": "Kuwait",
+    "type-id": null,
+    "type": null,
+    "iso-3166-1-codes": [
+     "KW"
+    ],
+    "name": "Kuwait",
+    "id": "f03f2625-dc7d-38b2-a058-4e9ca0e10424"
+   }
+  },
+  {
+   "date": "2011-08-02",
+   "area": {
+    "id": "8138206e-5786-3f86-a53b-19a7303e7419",
+    "name": "Lebanon",
+    "iso-3166-1-codes": [
+     "LB"
+    ],
+    "disambiguation": "",
+    "type-id": null,
+    "type": null,
+    "sort-name": "Lebanon"
+   }
+  },
+  {
+   "area": {
+    "id": "1509aaae-8271-30cb-89c1-d8660cf73975",
+    "name": "Libya",
+    "iso-3166-1-codes": [
+     "LY"
+    ],
+    "type": null,
+    "type-id": null,
+    "sort-name": "Libya",
+    "disambiguation": ""
+   },
+   "date": "2011-08-02"
+  },
+  {
+   "date": "2011-08-02",
+   "area": {
+    "disambiguation": "",
+    "type": null,
+    "type-id": null,
+    "sort-name": "Mexico",
+    "id": "3e08b2cd-69f3-317c-b1e4-e71be581839e",
+    "name": "Mexico",
+    "iso-3166-1-codes": [
+     "MX"
+    ]
+   }
+  },
+  {
+   "date": "2011-08-02",
+   "area": {
+    "id": "7ccdff29-2e00-3e50-9520-b9ea1e918bc2",
+    "name": "Oman",
+    "iso-3166-1-codes": [
+     "OM"
+    ],
+    "type-id": null,
+    "type": null,
+    "sort-name": "Oman",
+    "disambiguation": ""
+   }
+  },
+  {
+   "area": {
+    "iso-3166-1-codes": [
+     "QA"
+    ],
+    "name": "Qatar",
+    "id": "348dcc25-7bb6-3f75-8739-97eabc84a330",
+    "disambiguation": "",
+    "sort-name": "Qatar",
+    "type": null,
+    "type-id": null
+   },
+   "date": "2011-08-02"
+  },
+  {
+   "area": {
+    "id": "9705be0d-51fb-3990-8726-ec9f56c66ba0",
+    "iso-3166-1-codes": [
+     "SA"
+    ],
+    "name": "Saudi Arabia",
+    "disambiguation": "",
+    "type": null,
+    "type-id": null,
+    "sort-name": "Saudi Arabia"
+   },
+   "date": "2011-08-02"
+  },
+  {
+   "date": "2011-08-02",
+   "area": {
+    "sort-name": "Spain",
+    "type": null,
+    "type-id": null,
+    "disambiguation": "",
+    "iso-3166-1-codes": [
+     "ES"
+    ],
+    "name": "Spain",
+    "id": "471c46a7-afc5-31c4-923c-d0444f5053a4"
+   }
+  },
+  {
+   "date": "2011-08-02",
+   "area": {
+    "name": "Sweden",
+    "iso-3166-1-codes": [
+     "SE"
+    ],
+    "id": "23d10872-f5ae-3f0c-bf55-332788a16ecb",
+    "sort-name": "Sweden",
+    "type-id": null,
+    "type": null,
+    "disambiguation": ""
+   }
+  },
+  {
+   "area": {
+    "type-id": null,
+    "type": null,
+    "sort-name": "United Arab Emirates",
+    "disambiguation": "",
+    "id": "fe40c648-ba74-3e17-b768-58181d5ee563",
+    "iso-3166-1-codes": [
+     "AE"
+    ],
+    "name": "United Arab Emirates"
+   },
+   "date": "2011-08-02"
+  },
+  {
+   "area": {
+    "type-id": null,
+    "type": null,
+    "sort-name": "United States",
+    "disambiguation": "",
+    "id": "489ce91b-6658-3307-9877-795b68554c98",
+    "name": "United States",
+    "iso-3166-1-codes": [
+     "US"
+    ]
+   },
+   "date": "2011-08-02"
+  },
+  {
+   "date": "2011-08-02",
+   "area": {
+    "id": "e8e9ecdc-19d3-360b-8f1a-9c80e6c12830",
+    "iso-3166-1-codes": [
+     "YE"
+    ],
+    "name": "Yemen",
+    "disambiguation": "",
+    "type-id": null,
+    "type": null,
+    "sort-name": "Yemen"
+   }
+  }
+ ]
+}

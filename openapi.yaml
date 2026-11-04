@@ -82,7 +82,7 @@ info:
   license:
     name: AGPL-3.0-or-later
     identifier: AGPL-3.0-or-later
-  version: 0.127.0
+  version: 0.128.0
 servers:
 - url: /
   description: The Tapedeck instance serving this document.
@@ -2509,6 +2509,53 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Sanitised'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+  /api/v1/sanitize/musicbrainz-misses:
+    get:
+      tags:
+      - Maintenance
+      summary: Albums MusicBrainz does not have.
+      description: |-
+        Albums whose listens carry no MusicBrainz IDs and that the album-first
+        lookup could not find there — a record bought on Qobuz that nobody has
+        added yet. Adding it to MusicBrainz and asking again
+        (`POST /api/v1/sanitize/musicbrainz-misses/retry`) lets its listens be
+        credited like any other.
+      operationId: musicbrainz_misses
+      responses:
+        '200':
+          description: Missed albums, most played first.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MusicBrainzMisses'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+  /api/v1/sanitize/musicbrainz-misses/retry:
+    post:
+      tags:
+      - Maintenance
+      summary: Look a missed album up again.
+      description: |-
+        Puts your listens of it back on the album-first lookup's queue; the
+        backfill asks MusicBrainz on its next pass. Nothing else changes.
+      operationId: retry_musicbrainz_miss
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RetryLookup'
+        required: true
+      responses:
+        '200':
+          description: Queued.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RetriedLookup'
         '400':
           $ref: '#/components/responses/BadRequest'
         '401':
@@ -18265,6 +18312,36 @@ components:
         skips:
           type: integer
           format: int64
+    MusicBrainzMiss:
+      type: object
+      description: An album the album-first lookup found nowhere on MusicBrainz.
+      required:
+      - artist
+      - album
+      - plays
+      - last_played
+      properties:
+        artist:
+          type: string
+          description: As your listens spell it.
+        album:
+          type: string
+        plays:
+          type: integer
+          format: int64
+        last_played:
+          type: integer
+          format: int64
+          description: Unix seconds.
+    MusicBrainzMisses:
+      type: object
+      required:
+      - albums
+      properties:
+        albums:
+          type: array
+          items:
+            $ref: '#/components/schemas/MusicBrainzMiss'
     MyGenre:
       type: object
       required:
@@ -21935,6 +22012,26 @@ components:
           type: string
           description: '`restarting`.'
         note:
+          type: string
+    RetriedLookup:
+      type: object
+      required:
+      - requeued
+      properties:
+        requeued:
+          type: integer
+          format: int64
+          description: Listens put back on the lookup queue.
+          minimum: 0
+    RetryLookup:
+      type: object
+      required:
+      - artist
+      - album
+      properties:
+        artist:
+          type: string
+        album:
           type: string
     Revision:
       type: object

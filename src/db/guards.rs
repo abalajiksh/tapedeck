@@ -111,6 +111,11 @@ const EXEMPT: &[(&str, &str)] = &[
                               listen is on the same record and is filed the same",
     ),
     (
+        "apply_album_lookup",
+        "a metadata fill selecting an album's listens by name; a skipped \
+                              listen is on the same record and gets the same MBIDs",
+    ),
+    (
         "apply_recording_credits",
         "a metadata rewrite selecting rows by recording MBID; a skipped \
                                    listen is the same recording and is credited the same",

@@ -981,6 +981,42 @@ impl MusicBrainzClient {
         Ok(info)
     }
 
+    /// Releases with this title credited to this artist — the album-first
+    /// lookup. A recording search names the *track* credit, so a listen whose
+    /// source sent the album's artist ("Victorious Cast" on a song MusicBrainz
+    /// credits to Elizabeth Gillies & Ariana Grande) is never found that way;
+    /// the release carries the name the source sent. Not cached: what it
+    /// finds is written onto the listens, and a miss is marked on them.
+    pub async fn search_releases(&self, album: &str, artist: &str) -> Result<Vec<ReleaseHit>> {
+        let query =
+            format!(r#"release:"{}" AND artist:"{}""#, lucene_phrase(album), lucene_phrase(artist));
+        let url = format!(
+            "{}/release?query={}&fmt=json&limit=5",
+            self.config.api_base_url.trim_end_matches('/'),
+            urlencoding::encode(&query)
+        );
+        let resp = self.api_get(&url).await?;
+        if !resp.status().is_success() {
+            return Err(anyhow!("MusicBrainz API error: {}", resp.status()));
+        }
+        Ok(parse_release_search(&resp.json::<serde_json::Value>().await?))
+    }
+
+    /// A release with its tracklist, for matching listens to recordings.
+    /// Not cached, for the same reason as [`Self::search_releases`].
+    pub async fn fetch_release_tracks(&self, release_mbid: &str) -> Result<ReleaseTracks> {
+        let url = format!(
+            "{}/release/{}?inc=recordings+artist-credits+release-groups&fmt=json",
+            self.config.api_base_url.trim_end_matches('/'),
+            release_mbid
+        );
+        let resp = self.api_get(&url).await?;
+        if !resp.status().is_success() {
+            return Err(anyhow!("MusicBrainz API error: {}", resp.status()));
+        }
+        Ok(parse_release_tracks(&resp.json::<serde_json::Value>().await?))
+    }
+
     /// The cached answer only — for a page, which must never wait on a
     /// rate-limited service. `None` until a backfill has asked.
     pub async fn cached_artist(&self, artist_mbid: &str) -> Option<ArtistInfo> {
@@ -1178,6 +1214,72 @@ impl ReleaseInfo {
     pub fn display(&self) -> String {
         self.artists.iter().map(|a| format!("{}{}", a.credited_as, a.join)).collect()
     }
+}
+
+/// One track of a release: its title as printed and the recording it is.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ReleaseTrack {
+    pub title: String,
+    pub recording: String,
+}
+
+/// A release with its tracklist — what the album-first lookup matches a
+/// listen's title against when the listen has no recording MBID.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ReleaseTracks {
+    pub id: String,
+    pub info: ReleaseInfo,
+    pub tracks: Vec<ReleaseTrack>,
+}
+
+/// A release search hit: its MBID, title and Lucene score (100 = exact).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ReleaseHit {
+    pub id: String,
+    pub title: String,
+    pub score: i64,
+}
+
+/// Read a release lookup with `inc=recordings+artist-credits+release-groups`.
+pub fn parse_release_tracks(v: &serde_json::Value) -> ReleaseTracks {
+    let tracks = v["media"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .flat_map(|m| m["tracks"].as_array().into_iter().flatten())
+        .filter_map(|t| {
+            Some(ReleaseTrack {
+                title: t["title"].as_str()?.to_string(),
+                recording: t["recording"]["id"].as_str()?.to_string(),
+            })
+        })
+        .collect();
+    ReleaseTracks {
+        id: v["id"].as_str().unwrap_or("").to_string(),
+        info: parse_release_info(v),
+        tracks,
+    }
+}
+
+/// Read a `/release?query=` search.
+pub fn parse_release_search(v: &serde_json::Value) -> Vec<ReleaseHit> {
+    v["releases"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|r| {
+            Some(ReleaseHit {
+                id: r["id"].as_str()?.to_string(),
+                title: r["title"].as_str().unwrap_or("").to_string(),
+                score: r["score"].as_i64().unwrap_or(0),
+            })
+        })
+        .collect()
+}
+
+/// A phrase for a Lucene query: quotes and backslashes would end it early.
+fn lucene_phrase(s: &str) -> String {
+    s.chars().filter(|c| *c != '"' && *c != '\\').collect()
 }
 
 /// Read a release lookup (`inc=artist-credits+release-groups`).
@@ -1525,5 +1627,46 @@ mod credit_parse_tests {
             assert_eq!(members.iter().filter(|n| **n == m).count(), 1, "{m}");
         }
         assert!(info.member_of.is_empty());
+    }
+
+    /// Captured 2026-11-04 from `release/3d56b337…?inc=recordings+artist-credits+release-groups`.
+    /// The release is the cast's; its tracks are the singers'.
+    #[test]
+    fn a_release_lookup_carries_its_tracklist() {
+        let r =
+            parse_release_tracks(&fixture(include_str!("fixtures/mb_release_victorious_bh.json")));
+        assert_eq!(r.id, "3d56b337-a16f-4b97-8e4c-7b286cd256fe");
+        assert_eq!(r.info.display(), "Victorious Cast");
+        assert_eq!(r.info.title, "Victorious: Music from the Hit TV Show");
+        assert_eq!(r.info.release_group.as_deref(), Some("17278767-3c89-4c6c-8d56-b835e5eb6ffa"));
+        assert_eq!(r.tracks.len(), 13);
+        assert_eq!(r.tracks[6].title, "Give It Up");
+        assert!(r.tracks[6].recording.starts_with("b46aa725"));
+    }
+
+    /// Captured 2026-11-04 from `release?query=release:"Victorious: Music From
+    /// The Hit TV Show" AND artist:"Victorious Cast"`.
+    #[test]
+    fn a_release_search_lists_scored_hits() {
+        let hits = parse_release_search(&fixture(include_str!(
+            "fixtures/mb_release_search_victorious.json"
+        )));
+        assert_eq!(hits.len(), 5);
+        assert!(hits.iter().all(|h| h.score == 100));
+        assert!(hits.iter().any(|h| h.id.starts_with("3d56b337")));
+        assert_eq!(hits[0].title, "Victorious: Music from the Hit TV Show");
+    }
+
+    /// Captured 2026-11-04 from `recording/b46aa725…` with the credits lookup's
+    /// `inc`: MusicBrainz credits the singers, not the cast.
+    #[test]
+    fn a_cast_song_credits_its_singers() {
+        let c = parse_recording_credits(&fixture(include_str!(
+            "fixtures/mb_recording_victorious_give_it_up.json"
+        )));
+        let names: Vec<&str> = c.artists.iter().map(|a| a.name.as_str()).collect();
+        // Canonical names: she is credited as "Elizabeth Gillies" here.
+        assert_eq!(names, ["Liz Gillies", "Ariana Grande"]);
+        assert_eq!(c.artists[0].credited_as, "Elizabeth Gillies");
     }
 }

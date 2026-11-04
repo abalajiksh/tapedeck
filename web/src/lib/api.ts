@@ -2211,6 +2211,14 @@ export interface PlaylistPushResult {
 
 /** Spotify plays held twice — once from the Spotify export, once from a
  *  ListenBrainz archive that had relayed the same export. Nothing changed. */
+export interface MusicBrainzMiss {
+	artist: string;
+	album: string;
+	plays: number;
+	/** Unix seconds. */
+	last_played: number;
+}
+
 export interface SpotifyDuplicates {
 	/** Pass back to remove them. */
 	copies: number;
@@ -3178,6 +3186,15 @@ class TapedeckAPI {
 		joined_edits?: { artist: string; credit: string | null; names?: string[] }[];
 	}): Promise<SanitizeResult> {
 		return this.post('/api/v1/sanitize', opts);
+	}
+
+	/** Albums the album-first lookup found nowhere on MusicBrainz. */
+	async musicbrainzMisses(): Promise<{ albums: MusicBrainzMiss[] }> {
+		return this.get('/api/v1/sanitize/musicbrainz-misses');
+	}
+	/** Queue a missed album for another lookup, once it is on MusicBrainz. */
+	async retryMusicbrainzMiss(artist: string, album: string): Promise<{ requeued: number }> {
+		return this.post('/api/v1/sanitize/musicbrainz-misses/retry', { artist, album });
 	}
 
 	async spotifyDuplicates(): Promise<SpotifyDuplicates> {
