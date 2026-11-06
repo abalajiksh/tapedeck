@@ -1797,6 +1797,10 @@ Things that look finished and aren't:
 
 ## Contributing
 
+**Read [CONTRIBUTING.md](CONTRIBUTING.md) first.** It covers how PRs are tested
+and reported on, why a failing PR is closed, the database migration report, and
+the conventions a change is held to. The quick local loop:
+
 ```bash
 cargo fmt
 cargo clippy
