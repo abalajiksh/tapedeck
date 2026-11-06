@@ -13418,11 +13418,23 @@ components:
       type: object
       required:
       - chains
+      - last_used
       properties:
         chains:
           type: array
           items:
             $ref: '#/components/schemas/Chain'
+        last_used:
+          type: object
+          description: |-
+            When each chain last carried a listen, unix seconds, keyed by chain id.
+            A chain nothing has played through is absent. Skips do not count.
+          additionalProperties:
+            type: integer
+            format: int64
+          propertyNames:
+            type: integer
+            format: int64
     ChainShareSwitch:
       type: object
       required:

@@ -1,0 +1,592 @@
+<script lang="ts">
+	// One chain, opened: the route, how plays find it, the hours on its gear,
+	// and who sees what played through it.
+	//
+	// The design's "Place" layout built from today's data (phase 1). Two parts
+	// of the design wait for later phases and are drawn as what exists now:
+	// * **What's on now** is a picker with backdating in the design. Until slots
+	//   land (phase 3) a swapped position lists its setups read-only, and the
+	//   Setups section below keeps every tool it had.
+	// * **How plays find this chain** lists the outputs and machines that point
+	//   here. Per-device outputs and the inbox are phase 2.
+	//
+	// It owns no state that outlives it: every action goes back to the page,
+	// which holds the dialogs and the data.
+	import { createEventDispatcher } from 'svelte';
+	import type { Binding, ChainVariant, Device, Equipment, SignalChain } from '$lib/api';
+	import ChainIcon from '$lib/components/ChainIcon.svelte';
+	import { formatHours } from '$lib/utils';
+	import { COLUMNS, columnOf } from './layout';
+	import { lastUsedPhrase } from './format';
+
+	export let chain: SignalChain;
+	export let variants: ChainVariant[] = [];
+	export let equipment: Equipment[] = [];
+	export let devices: Device[] = [];
+	export let bindings: Binding[] = [];
+	export let lastUsed: number | null = null;
+	export let sharing = false;
+	export let canFold = false;
+
+	const dispatch = createEventDispatcher<{
+		close: void;
+		share: boolean;
+		swap: number;
+		promote: ChainVariant;
+		editVariant: ChainVariant;
+		removeVariant: ChainVariant;
+		newVariant: void;
+		overview: void;
+		fold: void;
+		delete: void;
+		duplicate: void;
+		edit: void;
+	}>();
+
+	$: steps = chain.components ?? [];
+	$: mine = variants.filter((v) => v.chain_id === chain.id);
+	$: gearName = (id: number | null | undefined, fallback?: string | null) =>
+		(id != null ? equipment.find((e) => e.id === id)?.name : null) ?? fallback ?? '—';
+	/** What a setup puts at a position, for the read-only "what's on now". */
+	$: optionsAt = (i: number) =>
+		mine.flatMap((v) =>
+			(v.overrides ?? [])
+				.filter((o) => o.position === i)
+				.map((o) => ({ v, name: gearName(o.equipment_id, o.name) }))
+		);
+	/** What a setup changes, for its row's tooltip: "HD 569 → Hexa". */
+	function summary(v: ChainVariant): string {
+		if (!v.overrides?.length) return 'Same as the chain';
+		return v.overrides
+			.map((o) => {
+				const was = steps[o.position]?.name;
+				const now = gearName(o.equipment_id, o.name);
+				return was ? `${was} → ${now}` : `+ ${now}`;
+			})
+			.join(', ');
+	}
+	const CONTEXT_TAG: Record<string, string> = {
+		active: 'tag-accent-2',
+		'active-mobile': 'tag-accent-2',
+		passive: 'tag-accent'
+	};
+
+	$: routing = [
+		...bindings
+			.filter((b) => b.chain_id === chain.id)
+			.map((b) => ({
+				key: `b${b.id}`,
+				label: b.identifier,
+				kind: b.interface ?? 'output',
+				says:
+					b.chain_variant_id != null
+						? `Comes here, on ${mine.find((v) => v.id === b.chain_variant_id)?.name ?? 'a setup'}`
+						: 'Comes here, as wired'
+			})),
+		...devices
+			.filter((d) => d.default_chain_id === chain.id)
+			.map((d) => ({
+				key: `d${d.id}`,
+				label: d.name ?? d.machine_id,
+				kind: d.platform ?? 'machine',
+				says: 'Comes here when nothing more specific says where'
+			}))
+	];
+	// Hours per piece of gear on *this* chain, from the same breakdown the
+	// equipment table uses, so the two cannot disagree.
+	$: gearHours = equipment
+		.map((e) => ({
+			name: e.name,
+			hours: (e.sources ?? []).filter((s) => s.chain_id === chain.id).reduce((a, s) => a + s.hours, 0)
+		}))
+		.filter((g) => g.hours > 0)
+		.sort((a, b) => b.hours - a.hours);
+
+	function onKey(e: KeyboardEvent) {
+		if (e.key === 'Escape') dispatch('close');
+	}
+</script>
+
+<svelte:window on:keydown={onKey} />
+
+<div class="back" on:click={() => dispatch('close')} on:keydown={() => {}} role="presentation"></div>
+<aside class="drawer" aria-label="{chain.name}">
+	<header class="dhead">
+		<span class="dicon" aria-hidden="true"><ChainIcon name={chain.icon} size={22} title="" /></span>
+		<div class="dtitle">
+			<h2 class="h-display">{chain.name}</h2>
+			<p class="dsub">
+				{formatHours(chain.total_hours)} on this chain · {lastUsedPhrase(lastUsed)}
+			</p>
+			{#if chain.description}<p class="ddesc">{chain.description}</p>{/if}
+			<span class="tag {CONTEXT_TAG[chain.listening_context] ?? 'tag-neutral'} dctx">{chain.listening_context}</span>
+		</div>
+		<button class="btn btn-secondary dclose" aria-label="Close" on:click={() => dispatch('close')}>
+			<svg viewBox="0 0 24 24" width="18" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round"><path d="M6 6l12 12M18 6L6 18" /></svg>
+		</button>
+	</header>
+
+	<div class="dbody">
+		<section aria-label="The route">
+			<div class="kicker">The route</div>
+			{#each steps as s, i}
+				{@const opts = optionsAt(i)}
+				<div class="step">
+					<div class="rail">
+						<span class="rdot"></span>
+						{#if i < steps.length - 1}<span class="rline"></span>{/if}
+					</div>
+					<button class="sbody" on:click={() => dispatch('swap', i)} aria-label="Swap {s.name}"
+						title="Swap this step: as a setup, or in the chain itself">
+						<span class="srole">{COLUMNS[columnOf(s.type)]}{opts.length ? ' · what’s on now' : ''}</span>
+						<span class="sname">{s.name}<span class="shint" aria-hidden="true">swap</span></span>
+						{#if s.detail}<span class="sdetail">{s.detail}</span>{/if}
+						{#if opts.length}
+							<span class="alts">
+								<span class="alt cur">{s.name} · as wired</span>
+								{#each opts as o}<span class="alt">{o.name} · {o.v.name}{o.v.total_hours > 0 ? ` · ${formatHours(o.v.total_hours)}` : ''}</span>{/each}
+							</span>
+						{/if}
+					</button>
+				</div>
+			{:else}
+				<p class="muted">No steps yet. Edit the route to describe the path.</p>
+			{/each}
+		</section>
+
+		<section aria-label="Setups">
+			<div class="kicker">Setups</div>
+			{#each mine as v (v.id)}
+				<div class="vrow" title={summary(v)}>
+					<span class="vname">{v.name}</span>
+					<span class="vend">
+						<span class="vhrs">{formatHours(v.total_hours)}</span>
+						<button class="ibtn" title="Make this the chain" aria-label="Make {v.name} the chain" on:click={() => dispatch('promote', v)}>★</button>
+						<button class="ibtn" title="Edit this setup" aria-label="Edit setup {v.name}" on:click={() => dispatch('editVariant', v)}>✎</button>
+						<button class="ibtn danger" title="Delete this setup" aria-label="Delete setup {v.name}" on:click={() => dispatch('removeVariant', v)}>✕</button>
+					</span>
+				</div>
+			{:else}
+				<p class="muted">
+					Just the one. Add a setup when you swap a single box (the other stylus, the other IEMs)
+					and its hours land on the gear that was actually fitted.
+				</p>
+			{/each}
+			<div class="vacts">
+				<button class="vadd" on:click={() => dispatch('newVariant')}>+ setup</button>
+				{#if mine.length}<button class="vadd" on:click={() => dispatch('overview')}>⛓ see all setups</button>{/if}
+				{#if canFold}<button class="vadd" on:click={() => dispatch('fold')}>⤵ fold a chain in</button>{/if}
+			</div>
+		</section>
+
+		<section aria-label="How plays find this chain">
+			<div class="kicker">How plays find this chain</div>
+			{#each routing as r (r.key)}
+				<div class="rule">
+					<span class="tag tag-neutral rtag" title={r.kind}>{r.label}</span>
+					<span class="rsays">{r.says}</span>
+				</div>
+			{:else}
+				<p class="muted">
+					Nothing sends plays here on its own yet. They land here when a client names this
+					chain, or when an output or machine below the graph is set to it.
+				</p>
+			{/each}
+		</section>
+
+		{#if gearHours.length}
+			<section aria-label="Gear hours on this chain">
+				<div class="kicker">Gear hours on this chain</div>
+				<div class="gtiles">
+					{#each gearHours as g (g.name)}
+						<div class="gtile"><div class="gbig">{formatHours(g.hours)}</div><div class="gname">{g.name}</div></div>
+					{/each}
+				</div>
+			</section>
+		{/if}
+
+		<section class="who" aria-label="Who sees these plays">
+			<div class="wtext">
+				<div class="wtitle">Who sees these plays</div>
+				<p class="muted">
+					{#if chain.shared}
+						Decks you’ve patched in see these plays and the format they arrived in. Never this
+						chain’s name, gear or hours.
+					{:else}
+						Nobody but you.
+					{/if}
+				</p>
+			</div>
+			<div class="seg" role="group" aria-label="Who sees plays through {chain.name}">
+				<button class="seg-btn" class:on={!chain.shared} aria-pressed={!chain.shared} disabled={sharing}
+					on:click={() => chain.shared && dispatch('share', false)}>Only me</button>
+				<button class="seg-btn" class:on={chain.shared} aria-pressed={chain.shared} disabled={sharing}
+					on:click={() => !chain.shared && dispatch('share', true)}>Friends too</button>
+			</div>
+		</section>
+	</div>
+
+	<footer class="dfoot">
+		<button class="btn btn-ghost del" on:click={() => dispatch('delete')}>Delete chain</button>
+		<span style="flex:1"></span>
+		<button class="btn btn-secondary" on:click={() => dispatch('duplicate')}>Duplicate</button>
+		<button class="btn btn-primary" on:click={() => dispatch('edit')}>Edit the route</button>
+	</footer>
+</aside>
+
+<style>
+	.back {
+		position: fixed;
+		inset: 0;
+		z-index: 80;
+		background: rgba(27, 23, 18, 0.42);
+		backdrop-filter: blur(2px);
+		animation: td-fade-in 0.2s ease;
+	}
+	.drawer {
+		position: fixed;
+		top: 0;
+		right: 0;
+		z-index: 81;
+		width: min(520px, 100%);
+		height: 100vh;
+		background: var(--td-surface);
+		border-left: 1px solid var(--td-border);
+		box-shadow: -14px 0 44px rgba(46, 43, 37, 0.22);
+		display: flex;
+		flex-direction: column;
+		animation: td-slide-in 0.28s cubic-bezier(0.4, 0, 0.2, 1);
+	}
+	@media (prefers-reduced-motion: reduce) {
+		.drawer,
+		.back {
+			animation: none;
+		}
+	}
+	.dhead {
+		display: flex;
+		align-items: flex-start;
+		gap: 12px;
+		padding: 24px 24px 16px;
+	}
+	.dicon {
+		flex: none;
+		width: 44px;
+		height: 44px;
+		border-radius: 999px;
+		display: flex;
+		align-items: center;
+		justify-content: center;
+		background: var(--td-accent);
+		color: var(--td-on-accent);
+	}
+	.dtitle {
+		flex: 1;
+		min-width: 0;
+	}
+	.dtitle h2 {
+		font-size: 26px;
+		line-height: 1.1;
+	}
+	.dsub {
+		margin: 4px 0 0;
+		font-size: 13px;
+		color: var(--td-muted);
+	}
+	.ddesc {
+		margin: 6px 0 0;
+		font-size: 13px;
+		color: var(--td-muted-2);
+	}
+	.dctx {
+		margin-top: 8px;
+	}
+	.dclose {
+		width: 40px;
+		padding: 0;
+		justify-content: center;
+	}
+	.dbody {
+		flex: 1;
+		overflow-y: auto;
+		padding: 4px 24px 24px;
+		display: flex;
+		flex-direction: column;
+		gap: 24px;
+	}
+	.kicker {
+		font-size: 11px;
+		letter-spacing: 0.1em;
+		text-transform: uppercase;
+		font-weight: 700;
+		color: var(--td-muted-2);
+		margin-bottom: 10px;
+	}
+	.muted {
+		margin: 0;
+		font-size: 13px;
+		color: var(--td-muted);
+		line-height: 1.45;
+	}
+	.step {
+		display: flex;
+		gap: 12px;
+		align-items: stretch;
+	}
+	.rail {
+		display: flex;
+		flex-direction: column;
+		align-items: center;
+		flex: none;
+		width: 16px;
+	}
+	.rdot {
+		width: 14px;
+		height: 14px;
+		border-radius: 999px;
+		margin-top: 12px;
+		background: var(--td-accent);
+		box-shadow: 0 0 0 4px color-mix(in srgb, var(--td-accent) 16%, transparent);
+	}
+	.rline {
+		width: 2px;
+		flex: 1;
+		min-height: 18px;
+		margin: 3px 0;
+		background: color-mix(in srgb, var(--td-muted-3) 55%, transparent);
+	}
+	.sbody {
+		flex: 1;
+		min-width: 0;
+		display: flex;
+		flex-direction: column;
+		gap: 1px;
+		text-align: left;
+		border: none;
+		background: transparent;
+		font: inherit;
+		color: inherit;
+		padding: 8px 10px;
+		margin-bottom: 6px;
+		border-radius: 12px;
+		cursor: pointer;
+	}
+	.sbody:hover,
+	.sbody:focus-visible {
+		background: var(--td-surface2);
+	}
+	.srole {
+		font-size: 11.5px;
+		font-weight: 600;
+		color: var(--td-muted-2);
+	}
+	.sname {
+		font-size: 15.5px;
+		font-weight: 700;
+		display: flex;
+		align-items: center;
+		gap: 8px;
+	}
+	.shint {
+		font-size: 10.5px;
+		letter-spacing: 0.1em;
+		text-transform: uppercase;
+		font-weight: 500;
+		color: var(--td-muted-3);
+		opacity: 0;
+	}
+	.sbody:hover .shint,
+	.sbody:focus-visible .shint {
+		opacity: 1;
+	}
+	.sdetail {
+		font-size: 12.5px;
+		color: var(--td-muted-2);
+	}
+	.alts {
+		display: flex;
+		flex-wrap: wrap;
+		gap: 4px;
+		margin-top: 6px;
+	}
+	.alt {
+		font-size: 11.5px;
+		padding: 1px 8px;
+		border-radius: 999px;
+		border: 1px solid var(--td-border);
+		color: var(--td-muted);
+	}
+	.alt.cur {
+		background: color-mix(in srgb, var(--td-accent) 18%, transparent);
+		border-color: transparent;
+		color: var(--td-text);
+		font-weight: 600;
+	}
+	.vrow {
+		display: flex;
+		align-items: center;
+		justify-content: space-between;
+		gap: 10px;
+		background: var(--td-surface2);
+		border: 1px solid var(--td-border);
+		border-radius: 12px;
+		padding: 6px 8px 6px 14px;
+		margin-bottom: 7px;
+	}
+	.vname {
+		font-size: 14px;
+		min-width: 0;
+	}
+	.vend {
+		display: flex;
+		align-items: center;
+		gap: 4px;
+		flex: none;
+	}
+	.vhrs {
+		font-size: 12.5px;
+		color: var(--td-muted-2);
+		font-variant-numeric: tabular-nums;
+		margin-right: 4px;
+	}
+	.ibtn {
+		border: none;
+		background: transparent;
+		cursor: pointer;
+		color: var(--td-muted-2);
+		width: 26px;
+		height: 26px;
+		border-radius: 8px;
+		display: inline-flex;
+		align-items: center;
+		justify-content: center;
+		font: inherit;
+	}
+	.ibtn:hover {
+		background: var(--td-nav-hover);
+		color: var(--td-text);
+	}
+	.ibtn.danger:hover {
+		color: var(--td-bad-fg);
+	}
+	.vacts {
+		display: flex;
+		gap: 8px;
+		flex-wrap: wrap;
+		margin-top: 4px;
+	}
+	.vadd {
+		background: none;
+		border: 1px dashed var(--td-border);
+		border-radius: 999px;
+		padding: 4px 12px;
+		font-size: 12.5px;
+		color: var(--td-muted);
+		cursor: pointer;
+		font-family: inherit;
+	}
+	.vadd:hover {
+		border-color: var(--td-accent);
+		color: var(--td-text);
+	}
+	.rule {
+		display: flex;
+		align-items: center;
+		gap: 12px;
+		padding: 8px 0;
+		border-top: 1px solid var(--td-border);
+	}
+	.rtag {
+		min-width: 118px;
+		justify-content: center;
+		white-space: nowrap;
+		overflow: hidden;
+		text-overflow: ellipsis;
+		max-width: 180px;
+	}
+	.rsays {
+		flex: 1;
+		font-size: 13.5px;
+	}
+	.gtiles {
+		display: grid;
+		grid-template-columns: repeat(3, minmax(0, 1fr));
+		gap: 8px;
+	}
+	.gtile {
+		background: var(--td-surface2);
+		border: 1px solid var(--td-border);
+		border-radius: 14px;
+		padding: 12px 14px;
+	}
+	.gbig {
+		font-family: 'Caprasimo', serif;
+		font-size: 22px;
+		line-height: 1;
+	}
+	.gname {
+		font-size: 12px;
+		color: var(--td-muted);
+		margin-top: 4px;
+		white-space: nowrap;
+		overflow: hidden;
+		text-overflow: ellipsis;
+	}
+	.who {
+		display: flex;
+		align-items: center;
+		gap: 12px;
+		flex-wrap: wrap;
+		padding: 16px 18px;
+		border-radius: 20px;
+		background: var(--td-bg);
+		border: 1px solid var(--td-border);
+	}
+	.wtext {
+		flex: 1 1 240px;
+		min-width: 0;
+	}
+	.wtitle {
+		font-weight: 700;
+		margin-bottom: 2px;
+	}
+	.seg {
+		display: flex;
+		gap: 4px;
+		background: var(--td-sidebar);
+		border-radius: 999px;
+		padding: 4px;
+	}
+	.seg-btn {
+		white-space: nowrap;
+		border: none;
+		cursor: pointer;
+		font-family: inherit;
+		font-size: 12.5px;
+		padding: 8px 14px;
+		border-radius: 999px;
+		background: transparent;
+		color: var(--td-nav-fg);
+		font-weight: 500;
+	}
+	.seg-btn.on {
+		background: var(--td-accent);
+		color: var(--td-on-accent);
+		font-weight: 600;
+	}
+	.seg-btn:disabled {
+		opacity: 0.6;
+		cursor: default;
+	}
+	.dfoot {
+		display: flex;
+		align-items: center;
+		gap: 8px;
+		padding: 14px 24px 20px;
+		border-top: 1px solid var(--td-border);
+		flex-wrap: wrap;
+	}
+	.del {
+		color: var(--td-bad-fg);
+	}
+</style>

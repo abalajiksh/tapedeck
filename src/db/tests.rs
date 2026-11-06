@@ -11978,3 +11978,43 @@ async fn an_output_bound_to_a_setup_keeps_naming_the_gear_it_names() {
     let rows = db.list_bindings(uid).await.unwrap();
     assert!(rows.iter().all(|b| b.chain_id.is_none() && b.chain_variant_id.is_none()));
 }
+
+/// "Last used" on the Signal Chains list: the newest listen through each chain,
+/// never a skip, and nothing for a chain nothing has played through.
+#[tokio::test]
+async fn a_chain_is_last_used_at_its_newest_listen_not_its_newest_skip() {
+    let db = testdb().await;
+    let uid = db.create_user("ash", None, "pw", "user").await.unwrap();
+    let mk = |name: &'static str| {
+        sqlx::query_scalar::<_, i64>(
+            "INSERT INTO signal_chains (user_id, name, created_at) VALUES (?, ?, ?) RETURNING id",
+        )
+        .bind(uid)
+        .bind(name)
+        .bind(Database::now_secs())
+    };
+    let desk = mk("Desk").fetch_one(&db.pool).await.unwrap();
+    let idle = mk("Idle").fetch_one(&db.pool).await.unwrap();
+
+    listen(&db, uid, Some(desk), "One", "A", 1_760_000_100).await;
+    listen(&db, uid, Some(desk), "Two", "A", 1_760_000_200).await;
+    let skip = Play::new("Bailed".into(), "A".into(), 1_760_000_900, "sk-1".into(), "test".into());
+    db.save_scrobble(
+        uid,
+        &skip,
+        None,
+        None,
+        Some(desk),
+        None,
+        None,
+        None,
+        None,
+        ListenDisposition { imported: false, skipped: true },
+    )
+    .await
+    .unwrap();
+
+    let last = db.chain_last_used(uid).await.unwrap();
+    assert_eq!(last.get(&desk), Some(&1_760_000_200), "the newest listen, not the skip after it");
+    assert_eq!(last.get(&idle), None, "a chain nothing played through has no last use");
+}

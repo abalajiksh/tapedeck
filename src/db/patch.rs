@@ -2789,14 +2789,16 @@ impl Database {
         .unwrap_or(false);
 
         let shared: bool = match chain_id {
-            Some(cid) => sqlx::query_scalar::<_, i64>(&crate::sql!(
+            Some(cid) => {
+                sqlx::query_scalar::<_, i64>(&crate::sql!(
                 "SELECT COUNT(*) FROM signal_chains WHERE id = ? AND user_id = ? AND shared = TRUE",
             ))
-            .bind(cid)
-            .bind(user_id)
-            .fetch_one(&self.pool)
-            .await?
-                > 0,
+                .bind(cid)
+                .bind(user_id)
+                .fetch_one(&self.pool)
+                .await?
+                    > 0
+            }
             None => false,
         };
 

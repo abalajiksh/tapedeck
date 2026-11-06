@@ -3148,7 +3148,12 @@ class TapedeckAPI {
 		return this.put('/api/v1/radio/settings', body);
 	}
 
-	async getChains(): Promise<{ chains: SignalChain[] }> { return this.get('/api/v1/chains'); }
+	/** `last_used` is unix seconds of the newest listen through each chain, keyed
+	 *  by chain id (a JSON object, so the keys arrive as strings). A chain
+	 *  nothing played through is absent. */
+	async getChains(): Promise<{ chains: SignalChain[]; last_used: Record<string, number> }> {
+		return this.get('/api/v1/chains');
+	}
 	async getChain(id: number): Promise<SignalChain> { return this.get(`/api/v1/chains/${id}`); }
 	async createChain(data: ChainInput): Promise<{ id: number }> {
 		return this.post('/api/v1/chains', data);

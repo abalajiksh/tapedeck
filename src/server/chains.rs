@@ -45,6 +45,14 @@ pub struct VariantId {
 #[derive(Serialize, ToSchema)]
 pub struct ChainList {
     pub chains: Vec<SignalChain>,
+    /// When each chain last carried a listen, unix seconds, keyed by chain id.
+    /// A chain nothing has played through is absent. Skips do not count.
+    //
+    // A map beside the list rather than a field on `SignalChain`: it is a
+    // fact about listens, not about the chain, and one grouped query here is
+    // one scan where a correlated subquery in `CHAIN_COLUMNS` would be one per
+    // chain on every read of a chain anywhere.
+    pub last_used: std::collections::BTreeMap<i64, i64>,
 }
 
 #[derive(Serialize, ToSchema)]
@@ -610,8 +618,18 @@ pub async fn list_chains(
     State(state): State<Arc<AppState>>,
     ReadAuth { user }: ReadAuth,
 ) -> impl IntoResponse {
+    let last_used = match state.db.chain_last_used(user.user_id).await {
+        Ok(m) => m,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse { code: 500, error: e.to_string() }),
+            )
+                .into_response();
+        }
+    };
     match state.db.get_chains(user.user_id).await {
-        Ok(chains) => (StatusCode::OK, Json(ChainList { chains })).into_response(),
+        Ok(chains) => (StatusCode::OK, Json(ChainList { chains, last_used })).into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(ErrorResponse { code: 500, error: e.to_string() }),

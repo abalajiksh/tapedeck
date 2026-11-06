@@ -4,6 +4,13 @@
 	import type { SignalChain, Equipment, ChainComponent, ChainInput, EquipmentInput, Binding, Device, ChainVariant, FoldSuggestion } from '$lib/api';
 	import { formatHours, timeAgo, toDateInput, fromDateInput, ownedFor, formatDateTime } from '$lib/utils';
 	import ChainIcon, { CHAIN_ICONS, CHAIN_ICON_LABELS } from '$lib/components/ChainIcon.svelte';
+	import ChainGraph from '$lib/components/chains/ChainGraph.svelte';
+	import ChainList from '$lib/components/chains/ChainList.svelte';
+	import ChainDrawer from '$lib/components/chains/ChainDrawer.svelte';
+	import ShelfLine from '$lib/components/chains/ShelfLine.svelte';
+	import { gearInUse } from '$lib/components/chains/layout';
+	import { lastUsedPhrase } from '$lib/components/chains/format';
+	import { syncUrl } from '$lib/url';
 
 	let chains: SignalChain[] = [];
 	let variants: ChainVariant[] = [];
@@ -26,18 +33,6 @@
 	// unanswerable, since "which chain" does not say what was fitted.
 	$: variantsFor = (chainId: number | null | undefined) =>
 		variants.filter((v) => v.chain_id === chainId);
-
-	/** What a variant actually changes, for the chip's tooltip. */
-	function overrideSummary(c: SignalChain, v: ChainVariant): string {
-		if (!v.overrides.length) return 'Same as the chain';
-		return v.overrides
-			.map((o) => {
-				const was = c.components?.[o.position]?.name;
-				const now = o.name ?? equipment.find((e) => e.id === o.equipment_id)?.name ?? '—';
-				return was ? `${was} → ${now}` : `+ ${now}`;
-			})
-			.join(', ');
-	}
 
 	// ── The role palette ──
 	//
@@ -134,6 +129,32 @@
 	// it under whatever you set up most recently.
 	$: chainRows = [...chains].sort((a, b) => b.total_hours - a.total_hours || a.name.localeCompare(b.name));
 	$: loggingCount = chains.filter((c) => c.total_hours > 0).length;
+
+	// ── Which chain the graph lights ──
+	//
+	// Separate from the drawer: choosing a chain lights its route, and the
+	// drawer opens from the bar under the graph. In the URL (`?chain=`) so a
+	// lit route survives a reload and Back undoes a pick, through `syncUrl`.
+	let selectedChainId: number | null = null;
+	let lastUsed: Record<string, number> = {};
+	$: if (chains.length && !chains.some((c) => c.id === selectedChainId)) selectedChainId = chainRows[0]?.id ?? null;
+	$: selectedChain = chains.find((c) => c.id === selectedChainId) ?? null;
+	$: usedGear = gearInUse(chains, variants);
+	$: stepGear = gearInUse(chains, []);
+	$: selectedLine = selectedChain
+		? [
+				(selectedChain.components ?? []).filter((s) => s.name.trim()).map((s) => s.name).join(' → ') ||
+					'No steps yet',
+				`${formatHours(selectedChain.total_hours)} on this chain`,
+				lastUsedPhrase(lastUsed[String(selectedChain.id)])
+			].join(' · ')
+		: '';
+	function selectChain(id: number) {
+		selectedChainId = id;
+		const url = new URL(window.location.href);
+		url.searchParams.set('chain', String(id));
+		syncUrl(url.pathname + url.search);
+	}
 	$: totalChainHours = chains.reduce((a, c) => a + c.total_hours, 0);
 
 	// ── The setups overview ──
@@ -616,11 +637,6 @@
 	// the new gear drops straight into the slot that asked for it.
 	let gearForComp: number | null = null;
 
-	function ctxClass(ctx: string): string {
-		const map: Record<string, string> = { active: 'tag-accent-2', 'active-mobile': 'tag-accent-2', passive: 'tag-accent' };
-		return 'tag ' + (map[ctx] ?? 'tag-neutral');
-	}
-
 	async function load() {
 		try {
 			const [c, g, b, d, v, dup] = await Promise.all([
@@ -628,6 +644,7 @@
 				api.getChainDuplicates()
 			]);
 			chains = c.chains;
+			lastUsed = c.last_used ?? {};
 			variants = v.variants;
 			dupes = dup.duplicates;
 			equipment = g.equipment;
@@ -1006,8 +1023,11 @@
 	}
 
 	onMount(async () => {
-		const g = new URLSearchParams(window.location.search).get('gear');
+		const q = new URLSearchParams(window.location.search);
+		const g = q.get('gear');
 		highlightGear = g ? Number(g) : null;
+		const picked = Number(q.get('chain'));
+		if (picked) selectedChainId = picked;
 		await load();
 		// Failing to read it leaves the picker on "No chain", which is the
 		// default and therefore honest — never an error banner over a
@@ -1060,7 +1080,7 @@
 		<div class="tile">
 			<div class="tile-big">{equipment.length}</div>
 			<div class="tile-label">pieces of gear</div>
-			<div class="tile-sub">{spareGear.length} not in a chain</div>
+			<div class="tile-sub">{equipment.length - [...usedGear].filter((id) => equipment.some((e) => e.id === id)).length} on the shelf</div>
 		</div>
 	</div>
 
@@ -1149,66 +1169,49 @@
 		</div>
 	{/if}
 
-	<!-- Chain rows.
-	     One line each, path included, instead of a card with three icon buttons
-	     and a collapsible path. Eight chains used to be eight blocks; they are
-	     now eight lines you can scan, and everything that was in the card lives
-	     in the drawer a click away. -->
-	<div class="rows">
-		{#if chainRows.length}
-			{#each chainRows as c (c.id)}
-				<!-- Named explicitly: the row's text is a name, a path and a running
-				     time in nested divs, which reads as a paragraph rather than as
-				     what the control does. -->
-				<button class="crow" class:on={openChainId === c.id}
-					aria-label="Open {c.name}" aria-expanded={openChainId === c.id}
-					on:click={() => (openChainId = c.id)}>
-					<div class="cname">
-						<div class="cname-t"><ChainIcon name={c.icon} size={16} title={c.name} />{c.name}</div>
-						{#if c.description}<div class="cname-d">{c.description}</div>{/if}
-					</div>
-					<div class="cpath">
-						{#if c.components?.length}
-							{#each c.components as step, i}
-								<span class="cstep">
-									<span class="dot" style="background:{roleColour(step.type)};"></span>
-									<span>{step.name}</span>
-								</span>
-								{#if i < c.components.length - 1}<span class="arrow">→</span>{/if}
-							{/each}
-						{:else}
-							<span class="cnone">No steps yet</span>
-						{/if}
-						{#if variantsFor(c.id).length}
-							<span class="setups" title="One chain, {variantsFor(c.id).length + 1} ways of wiring it">
-								{variantsFor(c.id).length + 1} setups
-							</span>
-						{/if}
-						<!-- An indicator, not a switch. `.crow` is itself a <button>,
-						     and a nested interactive element is invalid markup that
-						     browsers resolve however they like. The design puts the
-						     switch on the row; the row here cannot hold one, so the
-						     row *shows* the state and the switch lives one click away
-						     in the drawer — which is where v0.62.0 moved everything
-						     else the card used to carry. -->
-						{#if c.shared}
-							<span class="shared-pill" title="Listens through this chain, and their format, reach the Reel of anyone patched into you. The chain is never named.">
-								Shared
-							</span>
-						{/if}
-					</div>
-					<div class="cend">
-						<span class="chrs" class:zero={c.total_hours <= 0}>{formatHours(c.total_hours)}</span>
-						<svg viewBox="0 0 24 24" width="17" fill="none" stroke="var(--td-muted-3)" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M9 6l6 6-6 6"/></svg>
-					</div>
-				</button>
-			{/each}
-		{:else}
-			<div class="panel" style="border-radius:22px;padding:44px;text-align:center;color:var(--td-muted);">
-				No signal chains yet — <button class="btn btn-ghost" on:click={newChain}>create your first</button>
+	<!-- The chains and how they are wired, side by side.
+	     The list is how you get around (one button per chain, keyboard and all);
+	     the graph is a picture of the same thing with every piece of gear drawn
+	     once, the chosen chain's route lit. The drawer opens from the bar under
+	     the graph, so scanning never pops a panel over what you were reading. -->
+	{#if chainRows.length}
+		<div class="wired">
+			<div class="wlist">
+				<ChainList chains={chainRows} {variants} {lastUsed} selectedId={selectedChainId}
+					on:select={(e) => selectChain(e.detail)} />
 			</div>
-		{/if}
-	</div>
+			<section class="panel wgraph" aria-label="How it is wired">
+				<div class="whead">
+					<div>
+						<h2 class="h-display" style="font-size:22px;">How it’s wired</h2>
+						<p class="wsub">
+							Pick a chain to light its route. Every piece of gear shows up once, with its
+							hours; <span class="wswap">⇄</span> marks gear a setup swaps.
+						</p>
+					</div>
+				</div>
+				<ChainGraph {chains} {variants} {equipment} selectedId={selectedChainId}
+					on:select={(e) => selectChain(e.detail)} />
+				{#if selectedChain}
+					<div class="wsel">
+						<div style="flex:1 1 320px;min-width:0;">
+							<div style="font-weight:700;">{selectedChain.name}</div>
+							<div class="wsub" style="margin:0;">{selectedLine}</div>
+						</div>
+						<button class="btn btn-secondary" on:click={() => (openChainId = selectedChain?.id ?? null)}>
+							Open {selectedChain.name}
+						</button>
+					</div>
+				{/if}
+			</section>
+		</div>
+	{:else}
+		<div class="panel" style="border-radius:22px;padding:44px;text-align:center;color:var(--td-muted);">
+			No signal chains yet — <button class="btn btn-ghost" on:click={newChain}>create your first</button>
+		</div>
+	{/if}
+
+	<ShelfLine {equipment} inUse={usedGear} onGraph={stepGear} on:edit={(e) => editGear(e.detail)} />
 
 	<!-- Equipment / Outputs / Machines behind one control.
 	     Outputs before Machines because that is the order the ladder tries them:
@@ -1449,198 +1452,31 @@
 {/if}
 
 <!-- ── Chain detail drawer ──
-     Everything the card used to carry, at the size it deserves: the path drawn
-     vertically with its roles, the variants with their own hours, and what
-     actually attributes to this chain. -->
+     The design's "Place" layout on today's data; see `ChainDrawer`. Every
+     action comes back here, where the dialogs and the data live. -->
 {#if openChain}
-	<div class="drawer-back" on:click={() => (openChainId = null)} on:keydown={() => {}} role="presentation"></div>
-	<aside class="drawer" aria-label="Chain detail">
-		<div class="drawer-head">
-			<div style="min-width:0;">
-				<div class="h-display" style="font-size:23px;line-height:1.15;display:flex;align-items:center;gap:9px;">
-					<ChainIcon name={openChain.icon} size={20} title={openChain.name} />{openChain.name}
-				</div>
-				{#if openChain.description}<div style="font-size:13px;color:var(--td-muted);margin-top:4px;">{openChain.description}</div>{/if}
-			</div>
-			<button class="icon-btn" on:click={() => (openChainId = null)} aria-label="Close">
-				<svg viewBox="0 0 24 24" width="20" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round"><path d="M6 6l12 12M18 6L6 18"/></svg>
-			</button>
-		</div>
-
-		<div class="drawer-body">
-			<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:20px;">
-				<span class="hours-pill">
-					<svg viewBox="0 0 24 24" width="14" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3.5 2"/></svg>
-					{formatHours(openChain.total_hours)} logged on this chain
-				</span>
-				<span class={ctxClass(openChain.listening_context)}>{openChain.listening_context}</span>
-			</div>
-
-			<!-- The sharing switch. **The same state as Patch → Decks** — one
-			     state, two places — because both call
-			     `PUT /api/v1/patch/chains/:id/shared`. It is here rather than
-			     buried in the editor because it is a standing decision about
-			     how you listen, not a property of the wiring. -->
-			<div class="share-row">
-				<div style="min-width:0;">
-					<div style="font-size:14px;font-weight:600;">Who sees what played here</div>
-					<div style="font-size:12.5px;color:var(--td-muted);line-height:1.45;max-width:46ch;">
-						<strong>Private</strong> is the default and means nobody but you.
-						<strong>Shared</strong> means listens through it reach the Reel of anyone
-						patched into your deck, with the format they arrived in. The chain itself
-						stays yours either way: nobody else is told its name, gear or hours.
-					</div>
-				</div>
-				<!--
-					A segmented pair, not a checkbox. The checkbox was labelled with
-					the *current state* ("Private" when unshared), and a checkbox
-					label conventionally says what ticking it does — so "☐ Private"
-					read as "tick to make private", which is the opposite of what it
-					did. Two segments cannot be misread: the lit one is the state.
-				-->
-				<div class="seg share-seg" role="group" aria-label="Who hears this chain">
-					<button
-						class="seg-btn"
-						class:on={!openChain.shared}
-						aria-pressed={!openChain.shared}
-						disabled={sharingChain === openChain.id}
-						on:click={() => openChain?.shared && toggleShared(openChain, false)}
-					>Private</button>
-					<button
-						class="seg-btn"
-						class:on={openChain.shared}
-						aria-pressed={openChain.shared}
-						disabled={sharingChain === openChain.id}
-						on:click={() => openChain && !openChain.shared && toggleShared(openChain, true)}
-					>Shared</button>
-					<!-- Each guard means clicking the segment that is already lit
-					     does nothing, rather than spending a PUT to set the state
-					     it is already in. -->
-				</div>
-			</div>
-
-			<div class="drawer-label">Signal path</div>
-			{#if openChain.components?.length}
-				<div style="display:flex;flex-direction:column;">
-					{#each openChain.components as step, i}
-						<!-- Stretched rather than `flex-start`: the connector grows to
-						     whatever height the step's text takes, so a step carrying a
-						     `detail` line doesn't leave a visible break in the path. -->
-						<div style="display:flex;gap:14px;align-items:stretch;">
-							<div style="display:flex;flex-direction:column;align-items:center;flex:none;">
-								<span class="pdot" style="background:{roleColour(step.type)};box-shadow:0 0 0 4px color-mix(in srgb, {roleColour(step.type)} 16%, transparent);"></span>
-								{#if i < openChain.components.length - 1}<span class="pconn"></span>{/if}
-							</div>
-							<!-- The node is the control. The path was already drawn here and
-							     was the one thing on the screen that named the step you want
-							     to change, while the editor asked you to find it again in a
-							     select. `aria-label` because the visible content is a role,
-							     a name and a marker in nested divs, which reads as a
-							     paragraph rather than as what the button does. -->
-							<button class="pstep" on:click={() => openChain && openSwap(openChain, i)}
-								title="Swap this step — as a setup, or in the chain itself"
-								aria-label="Swap {step.name}">
-								<div class="prole">{roleLabel(step)}</div>
-								<div style="font-size:15.5px;font-weight:600;margin-top:1px;display:flex;align-items:center;gap:6px;">
-									{step.name}
-									{#if step.equipment_id != null}<span title="From your equipment" style="color:var(--td-accent);font-size:10px;">●</span>{/if}
-									<span class="pswap" aria-hidden="true">swap</span>
-								</div>
-								{#if step.detail}<div style="font-size:12.5px;color:var(--td-muted-2);">{step.detail}</div>{/if}
-								<!-- Only where there is one: the great majority of steps have
-								     been there as long as the chain has, and saying so on
-								     every row would bury the one that has not. -->
-								{#if step.since}<div class="psince">{sinceLabel(step.since)}</div>{/if}
-							</button>
-						</div>
-					{/each}
-				</div>
-			{:else}
-				<p style="font-size:13.5px;color:var(--td-muted);margin:0;">No steps yet — edit the chain to describe the path.</p>
-			{/if}
-
-			<!-- Variants: the same chain with one step swapped. Two cartridges on
-			     one turntable are a choice, not two decks. -->
-			<div class="drawer-label" style="margin-top:26px;">Setups</div>
-			{#each variantsFor(openChain.id) as v (v.id)}
-				<div class="vrow" title={overrideSummary(openChain, v)}>
-					<span style="font-size:14px;min-width:0;">{v.name}</span>
-					<span style="display:flex;align-items:center;gap:6px;flex:none;">
-						<span style="font-size:12.5px;color:var(--td-muted-2);font-variant-numeric:tabular-nums;">{formatHours(v.total_hours)}</span>
-						<!-- The common case this exists for: the variant is the one
-						     actually in use most of the time, so it should be what the
-						     chain *is*. A relabelling — nothing about what was fitted
-						     for any listen changes, and neither do anyone's hours. -->
-						<button class="icon-btn" style="width:26px;height:26px;" title="Make this the chain"
-							aria-label="Make {v.name} the chain"
-							on:click={() => openChain && promote(openChain, v)}>★</button>
-						<button class="icon-btn" style="width:26px;height:26px;" title="Edit this setup"
-							aria-label="Edit setup {v.name}"
-							on:click={() => openChain && editVariant(openChain, v)}>✎</button>
-						<button class="icon-btn danger" style="width:26px;height:26px;" title="Delete this setup"
-							aria-label="Delete setup {v.name}" on:click={() => removeVariant(v)}>✕</button>
-					</span>
-				</div>
-			{:else}
-				<p style="font-size:12.5px;color:var(--td-muted-2);margin:0 0 8px;">
-					Just the one. Add a setup when you swap a single box — the other stylus, the other IEMs —
-					and its hours land on the gear that was actually fitted.
-				</p>
-			{/each}
-			<div style="display:flex;gap:8px;flex-wrap:wrap;">
-				<button class="vadd" on:click={() => openChain && newVariant(openChain)}>+ setup</button>
-				<!-- Only offered where there is something to compare. With no
-				     variants the path above this *is* the overview, and a button
-				     opening a picture of one line is a button that does nothing. -->
-				{#if openChain && variantsFor(openChain.id).length}
-					<button class="vadd" on:click={() => (overviewOpen = true)}
-						title="See the chain and every setup of it side by side">
-						⛓ see all setups
-					</button>
-				{/if}
-				<!-- The other way to get a variant: an existing chain that is
-				     really this one wired differently. Only offered when there
-				     is something to fold. -->
-				{#if openChain && foldable(openChain).length}
-					<button class="vadd" on:click={() => openChain && openFold(openChain)}
-						title="Move another chain's listening onto this one as a setup">
-						⤵ fold a chain in
-					</button>
-				{/if}
-			</div>
-
-			{#if devices.some((d) => d.default_chain_id === openChain?.id) || bindings.some((b) => b.chain_id === openChain?.id)}
-				<div class="drawer-label" style="margin-top:26px;">Attributing to this chain</div>
-				{#each devices.filter((d) => d.default_chain_id === openChain?.id) as d (d.id)}
-					<div class="arow">
-						<svg viewBox="0 0 24 24" width="16" fill="none" stroke="var(--td-muted-2)" stroke-width="2.3" stroke-linecap="round" stroke-linejoin="round" style="flex:none;"><rect x="3" y="4" width="18" height="12" rx="2"/><path d="M8 20h8M12 16v4"/></svg>
-						<span style="font-size:14px;">{d.name ?? d.machine_id}</span>
-						{#if d.platform}<span style="font-size:12px;color:var(--td-muted-3);">{d.platform}</span>{/if}
-					</div>
-				{/each}
-				{#each bindings.filter((b) => b.chain_id === openChain?.id) as b (b.id)}
-					<div class="arow">
-						<svg viewBox="0 0 24 24" width="16" fill="none" stroke="var(--td-muted-2)" stroke-width="2.3" stroke-linecap="round" stroke-linejoin="round" style="flex:none;"><path d="M11 5L6 9H2v6h4l5 4V5z"/><path d="M15.5 8.5a5 5 0 0 1 0 7M19 5a9 9 0 0 1 0 14"/></svg>
-						<span style="font-size:14px;">{b.identifier}</span>
-						{#if b.interface}<span style="font-size:12px;color:var(--td-muted-3);">{b.interface}</span>{/if}
-						<!-- Which setup, so the drawer answers what the output puts
-						     in the path and not only which chain. -->
-						<span style="font-size:12px;color:var(--td-muted-2);margin-left:auto;">
-							{variants.find((v) => v.id === b.chain_variant_id)?.name ?? 'as wired'}
-						</span>
-					</div>
-				{/each}
-			{/if}
-		</div>
-
-		<div class="drawer-foot">
-			<button class="btn btn-ghost" style="color:#b2622d;" on:click={() => (confirmChain = openChain)}>Delete</button>
-			<div style="display:flex;gap:8px;">
-				<button class="btn btn-secondary" on:click={() => openChain && duplicateChain(openChain)}>Duplicate</button>
-				<button class="btn btn-primary" on:click={() => openChain && editChain(openChain)}>Edit chain</button>
-			</div>
-		</div>
-	</aside>
+	<ChainDrawer
+		chain={openChain}
+		{variants}
+		{equipment}
+		{devices}
+		{bindings}
+		lastUsed={lastUsed[String(openChain.id)] ?? null}
+		sharing={sharingChain === openChain.id}
+		canFold={foldable(openChain).length > 0}
+		on:close={() => (openChainId = null)}
+		on:share={(e) => openChain && toggleShared(openChain, e.detail)}
+		on:swap={(e) => openChain && openSwap(openChain, e.detail)}
+		on:promote={(e) => openChain && promote(openChain, e.detail)}
+		on:editVariant={(e) => openChain && editVariant(openChain, e.detail)}
+		on:removeVariant={(e) => removeVariant(e.detail)}
+		on:newVariant={() => openChain && newVariant(openChain)}
+		on:overview={() => (overviewOpen = true)}
+		on:fold={() => openChain && openFold(openChain)}
+		on:delete={() => (confirmChain = openChain)}
+		on:duplicate={() => openChain && duplicateChain(openChain)}
+		on:edit={() => openChain && editChain(openChain)}
+	/>
 {/if}
 
 <!-- Variant editor: pick a slot, pick what goes in it. Deliberately one slot
@@ -2117,67 +1953,6 @@
 	}
 	.nudge:hover { border-color: var(--td-accent); }
 	.nudge-cta { font-size: 13px; font-weight: 600; color: var(--td-accent); white-space: nowrap; }
-
-	/* ── Chain rows ──
-	   One line per chain. This is the whole decluttering: a card per chain with
-	   its own icon buttons and a collapsible path turned eight setups into a
-	   page you scroll; eight lines is a page you scan. */
-	.rows { display: flex; flex-direction: column; gap: 9px; margin-bottom: 34px; }
-	.crow {
-		display: flex; align-items: center; gap: 16px; width: 100%; text-align: left;
-		cursor: pointer; background: var(--td-surface);
-		border: 1px solid var(--td-border); border-radius: 16px; padding: 13px 18px;
-		font-family: inherit; color: var(--td-text);
-		transition: border-color .16s ease, background .16s ease;
-	}
-	.crow:hover { border-color: var(--td-accent); background: var(--td-surface2); }
-	.crow.on { border-color: var(--td-accent); box-shadow: 0 0 0 2px color-mix(in srgb, var(--td-accent) 30%, transparent); }
-	@media (prefers-reduced-motion: reduce) { .crow { transition: none; } }
-	.cname { flex: 0 0 auto; width: 158px; min-width: 0; }
-	.cname-t {
-		font-weight: 600; font-size: 15px; display: flex; align-items: center; gap: 7px;
-		white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
-	}
-	.cname-d { font-size: 12.5px; color: var(--td-muted-2); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-	.cpath { flex: 1; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; min-width: 0; }
-	.cstep { display: inline-flex; align-items: center; gap: 7px; font-size: 13px; white-space: nowrap; }
-	.dot { width: 9px; height: 9px; border-radius: 999px; flex: none; }
-	.arrow { color: var(--td-muted-3); font-size: 12px; }
-	.cnone { font-size: 13px; color: var(--td-muted-3); font-style: italic; }
-	.setups {
-		display: inline-flex; align-items: center; font-size: 11px; color: var(--td-muted-2);
-		background: var(--td-surface2); border: 1px solid var(--td-border);
-		border-radius: 999px; padding: 2px 9px; white-space: nowrap;
-	}
-
-	/* An indicator on the row, a switch in the drawer — see the markup note.
-	   Green rather than accent: accent is "this is selected", and a chain that
-	   publishes to other people is a state, not a selection. */
-	.shared-pill {
-		font-size: 11px;
-		font-weight: 600;
-		padding: 2px 8px;
-		border-radius: 999px;
-		background: var(--td-good-bg);
-		color: var(--td-good-fg);
-		white-space: nowrap;
-		flex: none;
-	}
-	.share-row {
-		display: flex;
-		align-items: center;
-		justify-content: space-between;
-		gap: 16px;
-		flex-wrap: wrap;
-		padding: 14px 16px;
-		margin-bottom: 20px;
-		border-radius: 16px;
-		background: var(--td-surface2);
-	}
-	.share-seg { flex: none; align-self: flex-start; }
-	.share-seg .seg-btn { font-size: 12.5px; }
-	.share-seg .seg-btn:disabled { opacity: .6; cursor: default; }
-	.cend { flex: 0 0 auto; display: flex; align-items: center; gap: 14px; }
 	/* — where a gear total came from —
 	   The figure is derived from listens across possibly several chains, so it
 	   reads as a claim. This turns it into an addition you can check. */
@@ -2211,18 +1986,6 @@
 	.hrs-total {
 		margin-top: 5px; padding-top: 7px; font-weight: 600;
 		border-top: 1px solid var(--td-muted-3);
-	}
-
-	.chrs { font-variant-numeric: tabular-nums; font-weight: 600; font-size: 14px; white-space: nowrap; color: var(--td-good-fg); }
-	.chrs.zero { color: var(--td-muted-3); }
-	@media (max-width: 720px) {
-		.crow { flex-wrap: wrap; gap: 10px; }
-		.cname { flex: 1 1 100%; width: auto; }
-		.cpath { flex: 1 1 auto; }
-		/* Once the path wraps to its own line the hours follow it and land on
-		   the left, under the dots. Pushed back to the right so the column of
-		   running times reads down the page the way it does on a wide screen. */
-		.cend { margin-left: auto; }
 	}
 
 	/* ── The secondary panel ── */
@@ -2277,27 +2040,6 @@
 		font-size: 12px; font-family: inherit; cursor: pointer;
 	}
 	.tagsel.tagged { font-weight: 600; }
-
-	/* ── The node as a control ──
-	   A step is a button now, so it has to stop looking like one: no chrome
-	   until it is pointed at, since a column of framed buttons would undo the
-	   thing v0.62.0 was for. `text-align:left` because a button centres its
-	   content and the path reads as a list. */
-	.pstep {
-		border: none;
-		background: transparent;
-		font: inherit;
-		color: inherit;
-		text-align: left;
-		padding: 0 8px 10px;
-		margin: 0 0 0 -8px;
-		border-radius: 10px;
-		min-width: 0;
-		cursor: pointer;
-		display: block;
-		width: 100%;
-	}
-	.pstep:hover, .pstep:focus-visible { background: var(--td-surface2); }
 	/* Svelte scopes styles per component, so this is repeated here rather than
 	   inherited from the four other pages that use it — matching them exactly
 	   matters more than deduplicating, and a class defined nowhere renders as a
@@ -2314,17 +2056,6 @@
 	.linkish:hover { color: var(--td-accent-hi); }
 	.cwhen { display: flex; align-items: center; gap: 8px; margin: -2px 0 4px 176px; }
 	@media (max-width: 560px) { .cwhen { margin-left: 0; } }
-	.psince { font-size: 12px; color: var(--td-muted-2); font-style: italic; margin-top: 1px; }
-	.pswap {
-		font-size: 10.5px;
-		letter-spacing: .1em;
-		text-transform: uppercase;
-		color: var(--td-muted-3);
-		opacity: 0;
-		transition: opacity .12s;
-	}
-	.pstep:hover .pswap, .pstep:focus-visible .pswap { opacity: 1; }
-	@media (prefers-reduced-motion: reduce) { .pswap { transition: none; } }
 
 	/* ── The two meanings of a swap ── */
 	.vmode { display: flex; gap: 8px; flex-wrap: wrap; }
@@ -2402,58 +2133,6 @@
 	.ov-thru { width: 100%; height: 2px; border-radius: 2px; background: var(--td-muted-3); opacity: .3; }
 	.ov-none { font-size: 12px; color: var(--td-muted-3); font-style: italic; }
 
-	/* ── Chain drawer ── */
-	.drawer-back {
-		position: fixed; inset: 0; z-index: 80;
-		background: rgba(27, 23, 18, .42); backdrop-filter: blur(2px);
-		animation: td-fade-in .2s ease;
-	}
-	.drawer {
-		position: fixed; top: 0; right: 0; z-index: 81;
-		width: min(440px, 100%); height: 100vh;
-		background: var(--td-surface); border-left: 1px solid var(--td-border);
-		box-shadow: -14px 0 44px rgba(46, 43, 37, .22);
-		display: flex; flex-direction: column;
-		animation: td-slide-in .28s cubic-bezier(.4, 0, .2, 1);
-	}
-	@media (prefers-reduced-motion: reduce) {
-		.drawer, .drawer-back { animation: none; }
-	}
-	.drawer-head {
-		display: flex; align-items: flex-start; justify-content: space-between; gap: 12px;
-		padding: 22px 22px 16px; border-bottom: 1px solid var(--td-border);
-	}
-	.drawer-body { flex: 1; overflow-y: auto; padding: 20px 22px; }
-	.drawer-foot {
-		display: flex; align-items: center; justify-content: space-between; gap: 10px;
-		padding: 14px 22px; border-top: 1px solid var(--td-border); flex-wrap: wrap;
-	}
-	.drawer-label {
-		font-size: 11px; letter-spacing: .08em; text-transform: uppercase;
-		color: var(--td-muted-3); margin-bottom: 11px;
-	}
-	.hours-pill {
-		display: inline-flex; align-items: center; gap: 8px; font-size: 13px;
-		color: var(--td-good-fg); background: var(--td-good-bg);
-		border-radius: 999px; padding: 5px 13px;
-	}
-	.pdot { width: 14px; height: 14px; border-radius: 999px; flex: none; margin-top: 3px; }
-	/* Not `--td-border`, which the design used: at 8–12% alpha a 2px rule is
-	   invisible, and the vertical path is the main thing in this drawer. This is
-	   a line you are meant to see, so it is the hairline the shelf's dividers
-	   are, not the almost-nothing a panel edge is. */
-	.pconn {
-		width: 2px; flex: 1; min-height: 22px; margin: 3px 0;
-		background: color-mix(in srgb, var(--td-muted-3) 55%, transparent);
-	}
-	.prole { font-size: 10.5px; letter-spacing: .09em; text-transform: uppercase; color: var(--td-muted-3); }
-	.vrow {
-		display: flex; align-items: center; justify-content: space-between; gap: 10px;
-		background: var(--td-surface2); border: 1px solid var(--td-border);
-		border-radius: 12px; padding: 7px 8px 7px 14px; margin-bottom: 7px;
-	}
-	.arow { display: flex; align-items: center; gap: 10px; padding: 7px 2px; }
-
 	/* ── Shared bits ── */
 	/* A grid of toggles rather than a dropdown: a glyph is quicker to recognise
 	   than a word to read, which is the entire point of having them. A fixed
@@ -2477,13 +2156,6 @@
 	.icon-pick.on { border-color: var(--td-accent); color: var(--td-accent); background: color-mix(in srgb, var(--td-accent) 10%, transparent); }
 
 	.spin { animation: td-spin 0.7s linear infinite; }
-
-	.vadd {
-		background: none; border: 1px dashed var(--td-border); border-radius: 999px;
-		padding: 4px 12px; font-size: 12.5px; color: var(--td-muted); cursor: pointer;
-		font-family: inherit;
-	}
-	.vadd:hover { border-color: var(--td-accent); color: var(--td-text); }
 
 	.icon-btn {
 		border: none; background: transparent; cursor: pointer; color: var(--td-muted-2);
@@ -2512,4 +2184,21 @@
 	.sc-sub { font-size: 12.5px; color: var(--td-muted); margin-top: 2px; line-height: 1.45; }
 	.sc-pick { width: auto; min-width: 160px; }
 
+
+	/* ── The chain list and the graph, side by side ──
+	   The list keeps a reading width; the graph takes the rest and drops under
+	   the list on a narrow screen rather than shrinking past legibility. */
+	.wired { display: flex; flex-wrap: wrap; gap: 20px; align-items: flex-start; margin: 4px 0 16px; }
+	.wlist { flex: 1 1 260px; max-width: 320px; }
+	.wgraph { flex: 999 1 560px; min-width: 0; border-radius: 22px; padding: 18px 18px 14px; }
+	.whead { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; padding: 0 4px 12px; }
+	.wsub { font-size: 13px; color: var(--td-muted); margin: 3px 0 0; }
+	.wswap { padding: 0 6px; border-radius: 999px; border: 1px dashed var(--td-muted-3); }
+	.wsel {
+		display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+		padding: 14px 6px 2px; border-top: 1px solid var(--td-border); margin-top: 12px;
+	}
+	@media (max-width: 720px) {
+		.wlist { max-width: none; }
+	}
 </style>

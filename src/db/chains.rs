@@ -94,6 +94,22 @@ impl Database {
         .await?;
         Ok(rows.into_iter().map(|r| r.into()).collect())
     }
+    /// When each of this user's chains last carried a listen, by chain id.
+    /// Skips are not listening, so they do not count as use.
+    pub async fn chain_last_used(
+        &self,
+        user_id: i64,
+    ) -> Result<std::collections::BTreeMap<i64, i64>, sqlx::Error> {
+        let rows: Vec<(i64, i64)> = sqlx::query_as(&crate::sql!(
+            "SELECT chain_id, MAX(timestamp) FROM scrobbles
+              WHERE user_id = ? AND chain_id IS NOT NULL AND skipped = FALSE
+              GROUP BY chain_id"
+        ))
+        .bind(user_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().collect())
+    }
     pub async fn get_chain(
         &self,
         user_id: i64,
