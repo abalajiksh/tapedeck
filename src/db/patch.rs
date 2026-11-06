@@ -613,7 +613,7 @@ impl Database {
     /// relaxed without saying why:
     ///
     /// * **`state = 'accepted'`** — a pending or rejected patch reads nothing.
-    /// * **`c.shared = 1`** — the chain's owner switched it on.
+    /// * **`c.shared = TRUE`** — the chain's owner switched it on.
     /// * **`s.chain_id` is joined, not left-joined.** A listen with no chain is
     ///   never shared: nobody switched anything on for it, so the *default* has
     ///   to be exclusion. A `LEFT JOIN` here would publish every unattributed
@@ -659,9 +659,9 @@ impl Database {
                     -- Named only when its owner shares it; present-but-private
                     -- and absent-entirely are different facts and the row draws
                     -- them differently. See `CHAIN_VISIBILITY`.
-                    CASE WHEN c.shared = 1 THEN c.name END AS chain_name,
-                    CASE WHEN c.shared = 1 THEN c.icon END AS chain_icon,
-                    CASE WHEN c.shared = 1 THEN c.components END AS chain_components,
+                    CASE WHEN c.shared = TRUE THEN c.name END AS chain_name,
+                    CASE WHEN c.shared = TRUE THEN c.icon END AS chain_icon,
+                    CASE WHEN c.shared = TRUE THEN c.components END AS chain_components,
                     CASE WHEN s.chain_id IS NULL THEN 0 ELSE 1 END AS has_chain
                FROM scrobbles s
                LEFT JOIN signal_chains c ON c.id = s.chain_id
@@ -671,7 +671,7 @@ impl Database {
               WHERE p.follower_user_id = ? AND p.state = 'accepted'
                 AND s.skipped = FALSE
                 -- The gate, and the whole of it — see `PATCH_VISIBLE_LISTENS`.
-                AND (u.share_all_with_patched = 1 OR c.shared = 1)
+                AND (u.share_all_with_patched = 1 OR c.shared = TRUE)
                 AND (? IS NULL OR s.timestamp < ?)
                 AND (? IS NULL OR u.username = ?)
                 AND (? IS NULL OR
@@ -880,7 +880,7 @@ impl Database {
                          WHERE sc.chain_id = c.id AND sc.skipped = FALSE
                     ), 0) AS REAL) / 3600.0 AS hours
                FROM signal_chains c
-              WHERE c.user_id = ? AND c.shared = 1
+              WHERE c.user_id = ? AND c.shared = TRUE
               ORDER BY hours DESC"
         ))
         .bind(id)
@@ -899,7 +899,7 @@ impl Database {
                JOIN users u ON u.id = s.user_id
                LEFT JOIN signal_chains c ON c.id = s.chain_id
               WHERE s.user_id = ? AND s.skipped = FALSE
-                AND (u.share_all_with_patched = 1 OR c.shared = 1)
+                AND (u.share_all_with_patched = 1 OR c.shared = TRUE)
                 AND sa.artist_key {NOT_VARIOUS}
               GROUP BY sa.artist_key
               ORDER BY COUNT(*) DESC"
@@ -920,7 +920,7 @@ impl Database {
                JOIN users u ON u.id = s.user_id
                LEFT JOIN signal_chains c ON c.id = s.chain_id
               WHERE s.user_id = ? AND s.skipped = FALSE
-                AND (u.share_all_with_patched = 1 OR c.shared = 1)"
+                AND (u.share_all_with_patched = 1 OR c.shared = TRUE)"
         ))
         .bind(id)
         .fetch_one(&self.pool)
@@ -993,7 +993,7 @@ impl Database {
             "SELECT u.id AS user_id, u.username, u.display_name, u.bio, u.avatar_url,
                     u.created_at,
                     (SELECT COUNT(*) FROM signal_chains c
-                      WHERE c.user_id = u.id AND c.shared = 1) AS shared_chains,
+                      WHERE c.user_id = u.id AND c.shared = TRUE) AS shared_chains,
                     (SELECT state FROM patches p
                       WHERE p.follower_user_id = ? AND p.target_user_id = u.id) AS state,
                     '' AS overlap
@@ -1011,7 +1011,7 @@ impl Database {
             "SELECT s.user_id, MAX(sa.name), sa.artist_key, COUNT(*) AS plays
                FROM scrobbles s
                JOIN scrobble_artists sa ON sa.scrobble_id = s.id
-               JOIN signal_chains c ON c.id = s.chain_id AND c.shared = 1
+               JOIN signal_chains c ON c.id = s.chain_id AND c.shared = TRUE
               WHERE s.skipped = FALSE
               GROUP BY s.user_id, sa.artist_key
               ORDER BY plays DESC",
@@ -1053,12 +1053,12 @@ impl Database {
     /// publish a chain, and is the same for everyone who asks.
     pub async fn instance_pulse(&self, since: i64) -> Result<InstancePulse, sqlx::Error> {
         const SHARED: &str = "FROM scrobbles s \
-             JOIN signal_chains c ON c.id = s.chain_id AND c.shared = 1 \
+             JOIN signal_chains c ON c.id = s.chain_id AND c.shared = TRUE \
             WHERE s.skipped = FALSE";
         // The same listens fanned out to their credits, for the artist counts.
         const SHARED_CREDITS: &str = "FROM scrobbles s \
              JOIN scrobble_artists sa ON sa.scrobble_id = s.id \
-             JOIN signal_chains c ON c.id = s.chain_id AND c.shared = 1 \
+             JOIN signal_chains c ON c.id = s.chain_id AND c.shared = TRUE \
             WHERE s.skipped = FALSE";
 
         let decks: i64 =
@@ -1066,14 +1066,15 @@ impl Database {
                 .fetch_one(&self.pool)
                 .await?;
         let publishing: i64 = sqlx::query_scalar(&crate::sql!(
-            "SELECT COUNT(DISTINCT user_id) FROM signal_chains WHERE shared = 1",
+            "SELECT COUNT(DISTINCT user_id) FROM signal_chains WHERE shared = TRUE",
         ))
         .fetch_one(&self.pool)
         .await?;
-        let shared_chains: i64 =
-            sqlx::query_scalar(&crate::sql!("SELECT COUNT(*) FROM signal_chains WHERE shared = 1"))
-                .fetch_one(&self.pool)
-                .await?;
+        let shared_chains: i64 = sqlx::query_scalar(&crate::sql!(
+            "SELECT COUNT(*) FROM signal_chains WHERE shared = TRUE"
+        ))
+        .fetch_one(&self.pool)
+        .await?;
 
         let listens: i64 = sqlx::query_scalar(&crate::sql!(&format!(
             "SELECT COUNT(*) {SHARED} AND s.timestamp >= ?"
@@ -1487,7 +1488,7 @@ impl Database {
             sqlx::query_as(&crate::sql!(
                 "SELECT s.user_id, s.title, s.artist, s.album, s.duration, s.timestamp
                FROM scrobbles s
-               JOIN signal_chains c ON c.id = s.chain_id AND c.shared = 1
+               JOIN signal_chains c ON c.id = s.chain_id AND c.shared = TRUE
               WHERE s.joint_session_id = ? AND s.user_id != ? AND s.skipped = FALSE
                 AND s.timestamp >= COALESCE(?, s.timestamp)
                 AND s.timestamp <= COALESCE(?, s.timestamp)
@@ -1636,7 +1637,7 @@ impl Database {
     /// history only through a shared chain (`set_chain_shared`). Seen here
     /// through the switch alone, a play is `theirs` — it happened, nobody
     /// offered it.
-    const SITTING_VISIBLE: &'static str = "(s.user_id = ? OR c.shared = 1 \
+    const SITTING_VISIBLE: &'static str = "(s.user_id = ? OR c.shared = TRUE \
          OR (u.share_all_with_patched = 1 AND EXISTS (SELECT 1 FROM patches p \
              WHERE p.follower_user_id = ? AND p.target_user_id = s.user_id \
                AND p.state = 'accepted')))";
@@ -2601,7 +2602,7 @@ impl Database {
             sqlx::query_as(&crate::sql!(
                 "SELECT s.title, s.artist, s.album, s.duration, s.timestamp
                FROM scrobbles s
-               JOIN signal_chains c ON c.id = s.chain_id AND c.shared = 1
+               JOIN signal_chains c ON c.id = s.chain_id AND c.shared = TRUE
               WHERE s.session_id = ? AND s.skipped = FALSE
               ORDER BY s.timestamp"
             ))
@@ -2716,7 +2717,7 @@ impl Database {
                                  OR (p.follower_user_id = u.id AND p.target_user_id = ?1)))
                       AS patched
                FROM scrobbles s
-               JOIN signal_chains c ON c.id = s.chain_id AND c.shared = 1
+               JOIN signal_chains c ON c.id = s.chain_id AND c.shared = TRUE
                JOIN users u ON u.id = s.user_id
                LEFT JOIN actors a ON a.user_id = u.id
               WHERE s.skipped = FALSE
@@ -2764,7 +2765,7 @@ impl Database {
     /// Whether a deck you have patched with sees **all** your listens.
     pub async fn share_all_with_patched(&self, user_id: i64) -> Result<bool, sqlx::Error> {
         Ok(sqlx::query_scalar(&crate::sql!(
-            "SELECT share_all_with_patched FROM users WHERE id = ?"
+            "SELECT (share_all_with_patched <> 0) FROM users WHERE id = ?"
         ))
         .bind(user_id)
         .fetch_optional(&self.pool)
@@ -2784,7 +2785,7 @@ impl Database {
         on: bool,
     ) -> Result<(), sqlx::Error> {
         sqlx::query(&crate::sql!("UPDATE users SET share_all_with_patched = ? WHERE id = ?"))
-            .bind(on)
+            .bind(i64::from(on))
             .bind(user_id)
             .execute(&self.pool)
             .await?;
@@ -2812,7 +2813,7 @@ impl Database {
         chain_id: Option<i64>,
     ) -> Result<Visible, sqlx::Error> {
         let all: bool = sqlx::query_scalar(&crate::sql!(
-            "SELECT share_all_with_patched FROM users WHERE id = ?"
+            "SELECT (share_all_with_patched <> 0) FROM users WHERE id = ?"
         ))
         .bind(user_id)
         .fetch_optional(&self.pool)
@@ -2822,7 +2823,7 @@ impl Database {
         let named: Option<String> = match chain_id {
             Some(cid) => {
                 sqlx::query_scalar(&crate::sql!(
-                    "SELECT name FROM signal_chains WHERE id = ? AND user_id = ? AND shared = 1",
+                    "SELECT name FROM signal_chains WHERE id = ? AND user_id = ? AND shared = TRUE",
                 ))
                 .bind(cid)
                 .bind(user_id)
@@ -2996,12 +2997,12 @@ impl Database {
         let mut listens: Vec<HandedListen> = sqlx::query_as(&crate::sql!(
             "SELECT s.title, s.artist, s.album, s.timestamp, s.duration, s.artwork_url,
                     s.caa_id, s.caa_release_mbid,
-                    CASE WHEN c.shared = 1 THEN c.name END AS chain_name
+                    CASE WHEN c.shared = TRUE THEN c.name END AS chain_name
                FROM scrobbles s
                JOIN users u ON u.id = s.user_id
                LEFT JOIN signal_chains c ON c.id = s.chain_id
               WHERE s.session_id = ? AND s.skipped = FALSE
-                AND (u.share_all_with_patched = 1 OR c.shared = 1)
+                AND (u.share_all_with_patched = 1 OR c.shared = TRUE)
               ORDER BY s.timestamp",
         ))
         .bind(session_id)
@@ -3165,7 +3166,7 @@ impl Database {
             return Ok(());
         };
         let shared: i64 = sqlx::query_scalar(&crate::sql!(
-            "SELECT COUNT(*) FROM signal_chains WHERE id = ? AND user_id = ? AND shared = 1",
+            "SELECT COUNT(*) FROM signal_chains WHERE id = ? AND user_id = ? AND shared = TRUE",
         ))
         .bind(chain_id)
         .bind(user_id)

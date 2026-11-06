@@ -160,7 +160,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Every source belongs to a user (`user_sources`), and the engine builds
     // them itself on its first tick — one code path for startup and for later
     // edits from the UI. `main` only migrates the old server-wide Plex row.
-    migrate_global_plex(&db, &config).await?;
+    migrate_global_plex(&db, &config.plex).await?;
 
     // ── Sinks ──
     // There are no server-wide sinks: every listen forwards only to the
@@ -322,21 +322,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// silent behaviour change otherwise.
 async fn migrate_global_plex(
     db: &Database,
-    config: &Config,
+    plex: &crate::config::PlexConfig,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Seed the legacy row from config on a first run so an existing
     // docker-compose keeps working long enough to be migrated below.
     if db.get_plex_settings().await?.is_none() {
         let seeded = PlexSettings {
-            enabled: config.plex.enabled,
-            url: config.plex.url.clone(),
-            token: config.plex.token.clone(),
-            users_allow: config.plex.users_allow.join(","),
-            users_block: config.plex.users_block.join(","),
-            devices_allow: config.plex.devices_allow.join(","),
-            devices_block: config.plex.devices_block.join(","),
-            libraries_allow: config.plex.libraries_allow.join(","),
-            libraries_block: config.plex.libraries_block.join(","),
+            enabled: plex.enabled,
+            url: plex.url.clone(),
+            token: plex.token.clone(),
+            users_allow: plex.users_allow.join(","),
+            users_block: plex.users_block.join(","),
+            devices_allow: plex.devices_allow.join(","),
+            devices_block: plex.devices_block.join(","),
+            libraries_allow: plex.libraries_allow.join(","),
+            libraries_block: plex.libraries_block.join(","),
             updated_at: 0,
         };
         db.save_plex_settings(&seeded).await?;

@@ -2072,9 +2072,9 @@ impl Database {
     /// The other end of a patch, as both directions need it. One list so the
     /// two cannot drift into describing a person differently.
     const PATCH_PEER_COLUMNS: &'static str = "u.id AS user_id, u.username, u.display_name, \
-         u.bio, u.avatar_url, u.share_all_with_patched AS shares_everything, \
+         u.bio, u.avatar_url, (u.share_all_with_patched <> 0) AS shares_everything, \
          (SELECT COUNT(*) FROM signal_chains c \
-           WHERE c.user_id = u.id AND c.shared = 1) AS shared_chains";
+           WHERE c.user_id = u.id AND c.shared = TRUE) AS shared_chains";
 
     // ════════════════════════════════════════════════════════════
     //  Patch — the screens, Dubs and Spools (Phase 6, Step 3)
@@ -2093,7 +2093,7 @@ impl Database {
     ///
     /// **The sharing unit moved from the chain to the patch** (Ashwin,
     /// 2026-08-26), and this is where that lives. It used to `JOIN
-    /// signal_chains … AND c.shared = 1`, so a listen was published by the
+    /// signal_chains … AND c.shared = TRUE`, so a listen was published by the
     /// *equipment* it ran through — which meant a deck you had deliberately
     /// let in still saw nothing of anything played on gear you had not
     /// switched on, including everything with no chain at all (Navidrome, an
@@ -2114,7 +2114,7 @@ impl Database {
     /// unattributed listen being published. That warning was right *while the
     /// chain was the gate*. It is not the gate any more, so the join is there
     /// to name the chain rather than to decide, and the deciding is in the
-    /// `WHERE`. `c.shared = 1` over a missing row is NULL, which is false — so
+    /// `WHERE`. `c.shared = TRUE` over a missing row is NULL, which is false — so
     /// a chainless listen is still excluded unless the switch is on.
     ///
     /// Three narrowings are **unchanged and must stay**: the patch is
@@ -2126,7 +2126,7 @@ impl Database {
          LEFT JOIN signal_chains c ON c.id = s.chain_id \
          JOIN patches p ON p.target_user_id = s.user_id \
         WHERE p.follower_user_id = ? AND p.state = 'accepted' AND s.skipped = FALSE \
-          AND (u.share_all_with_patched = 1 OR c.shared = 1)";
+          AND (u.share_all_with_patched = 1 OR c.shared = TRUE)";
 
     /// [`Self::PATCH_VISIBLE_LISTENS`] with every listen fanned out to its
     /// credits as `sa`, for counting artists the way the charts do.
@@ -2140,7 +2140,7 @@ impl Database {
          LEFT JOIN signal_chains c ON c.id = s.chain_id \
          JOIN patches p ON p.target_user_id = s.user_id \
         WHERE p.follower_user_id = ? AND p.state = 'accepted' AND s.skipped = FALSE \
-          AND (u.share_all_with_patched = 1 OR c.shared = 1)";
+          AND (u.share_all_with_patched = 1 OR c.shared = TRUE)";
 
     /// How a chain is named to somebody who may see the listen.
     ///
@@ -2149,7 +2149,7 @@ impl Database {
     /// leaving a hole. A listen with no chain at all says nothing — those are
     /// different facts and the row draws them differently.
     pub(crate) const CHAIN_VISIBILITY: &'static str =
-        "CASE WHEN c.shared = 1 THEN c.name END AS chain_name, \
+        "CASE WHEN c.shared = TRUE THEN c.name END AS chain_name, \
          CASE WHEN s.chain_id IS NULL THEN 0 ELSE 1 END AS has_chain";
 
     // ── Dubs: a record passed hand to hand ──

@@ -172,7 +172,7 @@ impl Database {
             .bind(r.mbid.as_deref())
             .bind(value)
             .bind(scale_max)
-            .bind(r.starred)
+            .bind(i64::from(r.starred))
             .bind(r.rated_at)
             .bind(now)
             .execute(&mut *tx)
@@ -224,7 +224,7 @@ impl Database {
         sqlx::query_as(&crate::sql!(
             "SELECT r.source_id, r.source_kind, COALESCE(s.label, '') AS label,
                     SUM(CASE WHEN r.rating IS NOT NULL AND r.rating > 0 THEN 1 ELSE 0 END) AS rated,
-                    SUM(CASE WHEN r.starred THEN 1 ELSE 0 END) AS starred,
+                    SUM(CASE WHEN r.starred <> 0 THEN 1 ELSE 0 END) AS starred,
                     MAX(r.scale_max) AS scale_max, MAX(r.fetched_at) AS fetched_at
                FROM library_ratings r
                LEFT JOIN user_sources s ON s.id = r.source_id
@@ -245,7 +245,7 @@ impl Database {
     ) -> Result<Vec<LibraryRatingRow>, sqlx::Error> {
         sqlx::query_as(&crate::sql!(
             "SELECT id, source_id, source_kind, kind, artist, name, album,
-                    rating, scale_max, starred, rated_at
+                    rating, scale_max, (starred <> 0) AS starred, rated_at
                FROM library_ratings
               WHERE user_id = ?
               ORDER BY (CASE WHEN scale_max > 0 THEN COALESCE(rating, 0) / scale_max ELSE 0 END)
@@ -386,7 +386,7 @@ impl Database {
         type RatingTuple = (String, String, String, Option<String>, Option<f64>, f64, bool);
 
         let rows: Vec<RatingTuple> = sqlx::query_as(&crate::sql!(
-            "SELECT kind, artist, name, mbid, rating, scale_max, starred
+            "SELECT kind, artist, name, mbid, rating, scale_max, (starred <> 0) AS starred
                    FROM library_ratings WHERE user_id = ?"
         ))
         .bind(user_id)

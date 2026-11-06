@@ -4,8 +4,8 @@
 //! Every block is guarded — `has_column`, or the constraint text in
 //! `sqlite_master` where SQLite cannot alter a CHECK in place and the table has
 //! to be rebuilt. **To add a column: add it to the `CREATE TABLE` in
-//! `schema.rs` *and* append a guarded block here**, or existing databases
-//! break.
+//! `schema.rs` *and* append a guarded block to both arms here** (SQLite and
+//! Postgres), or existing databases break.
 //!
 //! An index naming a migrated column belongs here rather than in `schema.rs`,
 //! because `init()` runs first and would fail on a database that has not yet
@@ -16,27 +16,76 @@ use super::*;
 impl Database {
     /// Walk a database forward to the shape [`super::schema`]'s `init` writes.
     ///
-    /// **This is SQLite-only work, and not by omission.** Every block below
-    /// exists to carry a database forward from a shape that only ever existed
-    /// in SQLite — the `postgres` feature has never shipped, so no Postgres
-    /// database of this application predates the current schema. A fresh one
-    /// gets the whole shape from `init()`, and one filled by a future
-    /// `migrate-db` tool lands on that same shape.
+    /// **Two arms, one per backend, and they are not translations of each
+    /// other.** The SQLite arm carries a database forward from shapes that
+    /// only ever existed in SQLite. The Postgres arm starts at v0.126.7, the
+    /// first release a Postgres database could have been created by: anything
+    /// older than that never existed there, so it has nothing to answer for.
     ///
-    /// **That stops being true the moment Postgres ships and the schema next
-    /// changes.** The first Postgres migration goes here, in an arm of its own
-    /// — `has_column` below is SQLite's `pragma_table_info` and is compiled out
-    /// with the rest, so a Postgres arm needs its own guard against
-    /// `information_schema.columns`. Do not translate the blocks below to get
-    /// one: they are answers to questions a Postgres database never asked.
+    /// **Adding a column now means three places**: the `CREATE TABLE` in
+    /// `schema.rs`, a guarded block in [`Self::migrate_sqlite`], and one in
+    /// [`Self::migrate_postgres`]. Do not translate the SQLite blocks to get
+    /// the Postgres one — most of them are answers to questions a Postgres
+    /// database never asked.
     ///
     /// The indexes are the part both backends need, and they are in
     /// [`Database::indexes`] rather than here for exactly that reason.
     pub(super) async fn migrate(&self) -> Result<(), sqlx::Error> {
         #[cfg(feature = "postgres")]
-        return Ok(());
+        return self.migrate_postgres().await;
         #[cfg(not(feature = "postgres"))]
         self.migrate_sqlite().await
+    }
+
+    /// Walk a Postgres database forward from the shape v0.126.7 created.
+    ///
+    /// Written in Postgres's own spelling rather than through
+    /// `dialect::rewrite_ddl`: these statements only ever run here, and the
+    /// column has to come out exactly as `init()` would have made it on a fresh
+    /// database (`BIGINT`, and the same auto-named foreign key), or an upgraded
+    /// database and a new one quietly disagree about their own shape.
+    ///
+    /// Unlike the SQLite arm, a failure here **stops startup**. Postgres DDL is
+    /// transactional and loud, so a failed `ALTER` means something is genuinely
+    /// wrong, and serving on a half-upgraded schema would push the error into
+    /// the first query that touches the column instead.
+    #[cfg(feature = "postgres")]
+    async fn migrate_postgres(&self) -> Result<(), sqlx::Error> {
+        /// Does `table` in **this** schema already have `column`?
+        ///
+        /// Scoped to `current_schema()` because one database can hold several
+        /// copies of the application's tables — the `pg_live` checks each work
+        /// in a schema of their own — and an answer from the wrong copy would
+        /// skip a migration this one needs.
+        async fn has_column(
+            pool: &Pool<Db>,
+            table: &str,
+            column: &str,
+        ) -> Result<bool, sqlx::Error> {
+            sqlx::query_scalar(
+                "SELECT EXISTS (SELECT 1 FROM information_schema.columns
+                                 WHERE table_schema = current_schema()
+                                   AND table_name = $1 AND column_name = $2)",
+            )
+            .bind(table)
+            .bind(column)
+            .fetch_one(pool)
+            .await
+        }
+
+        // v0.127.0: an output names the setup it usually carries, not only the
+        // chain.
+        if !has_column(&self.pool, "chain_bindings", "chain_variant_id").await? {
+            info!("⚙️ Migrating: chain_bindings.chain_variant_id...");
+            sqlx::query(
+                "ALTER TABLE chain_bindings ADD COLUMN chain_variant_id BIGINT
+                   REFERENCES chain_variants(id)",
+            )
+            .execute(&self.pool)
+            .await?;
+        }
+
+        Ok(())
     }
 
     #[cfg(not(feature = "postgres"))]
