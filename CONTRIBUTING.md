@@ -121,7 +121,9 @@ codebase's worst bugs were exactly that.
 ## What happens when you open a PR
 
 A Jenkins pipeline called the **PR guard** tests every PR. It starts within a minute of
-you opening the PR, pushing to it, or a maintainer labelling it.
+you opening the PR, pushing to it, or a maintainer labelling it, and **a run takes about
+15 minutes**. While it runs, both statuses show as pending, with a link to the build.
+Runs are one at a time, so with several PRs open yours may wait in the queue first.
 
 ### Who gets tested
 
@@ -191,9 +193,12 @@ What does **not** close your PR:
 - **An infrastructure problem.** The CI machine is down, a download times out, or the
   guard itself crashes. The status then says `error`, which closes nothing; a maintainer
   re-runs the build.
-- **A migration problem already on `main`.** The migration check also runs against
-  `main`, and lists anything it finds there under *"Already on main, not this PR's
-  doing"*. Those findings never fail your PR.
+- **A problem `main` or the last release already has.** The migration check also runs
+  against `main`, and against the last release itself on an empty database. Anything
+  found there is listed under *"Already on main or in vX.Y.Z, not this PR's doing"*,
+  and those findings never fail your PR. If neither the release nor your change can
+  start on a backend at all, that backend is reported as *not checked* rather than
+  failed.
 - **A title starting with `WIP:` or `[WIP]`.** The PR is tested and reported on, but
   left open. Remove the prefix when it's ready.
 
@@ -213,7 +218,7 @@ What does **not** close your PR:
 Tapedeck runs on people's own machines with years of listening history in them. An
 upgrade that loses some of it can't be taken back, so every PR is checked for what it
 does to a database made by **the last release**, by running both versions rather than
-reading the diff. For each backend, SQLite and Postgres:
+reading the diff. This is most of the 15 minutes. For each backend, SQLite and Postgres:
 
 1. **fresh**: your change starts on an empty database. This is the shape a new install
    gets.
