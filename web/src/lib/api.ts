@@ -618,11 +618,28 @@ export interface PatchArtist {
 	mine: number;
 }
 
-export interface DeckChain {
-	name: string;
-	icon: string | null;
-	components: string;
-	hours: number;
+/** A listen's format and transcode details, as a **shared** chain hands them
+ *  to somebody else. Every field is null when the chain is not shared, when
+ *  the listen ran through no chain, or when the source never reported it.
+ *
+ *  A signal chain is private by design, shared or not: nobody else is ever
+ *  told its name, gear or hours. Sharing one shares what the signal was. */
+export interface SharedFormat {
+	format_type: string | null;
+	codec: string | null;
+	bitrate: number | null;
+	sample_rate: number | null;
+	bit_depth: number | null;
+	is_lossless: boolean | null;
+	dsd_rate: number | null;
+	dsd_multiplier: number | null;
+	dsd_to_pcm_converted: boolean | null;
+	delivery_codec: string | null;
+	delivery_bitrate: number | null;
+	delivery_sample_rate: number | null;
+	delivery_bit_depth: number | null;
+	is_transcoded: boolean | null;
+	transcode_reason: string | null;
 }
 
 /** Somebody else's deck, seen through an accepted patch. */
@@ -635,7 +652,6 @@ export interface DeckView {
 	created_at: number;
 	/** Listens through their **shared** chains — not their history. */
 	listens: number;
-	chains: DeckChain[];
 	both_play: string[];
 	/** Null when they have no ActivityPub identity, which is a normal state. */
 	actor: string | null;
@@ -664,7 +680,6 @@ export interface InstancePulse {
 	 *  list is cut to the top 8 for the panel. */
 	artists_heard: number;
 	artists: PatchArtist[];
-	chains: { name: string; plays: number }[];
 	/** Raw (timestamp, hours) pairs — the day boundary is the reader's. */
 	daily: { at: number; hours: number }[];
 }
@@ -827,10 +842,9 @@ export interface ArtistDeck {
  *
  *  Gated by exactly the rule the Reel uses — an accepted patch, and then
  *  either the deck has opened up or the listen ran through a chain they share.
- *  `chain_name` is therefore nullable: `null` with `has_chain` means "Private
- *  signal chain", and `null` without it means the listen ran through nothing
- *  anybody recorded. Two different facts, drawn differently. */
-export interface LiveDeck {
+ *  The format fields are filled only for a shared chain; the chain is never
+ *  named. */
+export interface LiveDeck extends SharedFormat {
 	user_id: number;
 	username: string;
 	display_name: string | null;
@@ -844,16 +858,7 @@ export interface LiveDeck {
 	 *  playhead. Drawn as an estimate, never as a measurement. */
 	position_known: boolean;
 	paused: boolean;
-	/** Named only when its owner shares the chain — see the note above. */
-	chain_name: string | null;
-	/** Whether there was a chain at all, whatever its owner shares. */
-	has_chain: boolean;
 	artwork_url: string | null;
-	format_type: string | null;
-	codec: string | null;
-	bit_depth: number | null;
-	sample_rate: number | null;
-	is_lossless: boolean | null;
 }
 
 /** A sitting somebody handed you. **A document, never captures** — it enters
@@ -886,7 +891,7 @@ export interface HandedSitting {
 	ended_at: number | null;
 }
 
-export interface HandedListen {
+export interface HandedListen extends SharedFormat {
 	title: string;
 	artist: string;
 	album: string | null;
@@ -895,7 +900,6 @@ export interface HandedListen {
 	artwork_url: string | null;
 	caa_id: number | null;
 	caa_release_mbid: string | null;
-	chain_name: string | null;
 }
 
 export interface HandedSittingDetail {
@@ -958,8 +962,9 @@ export interface PatchDecks {
 	followers: PatchPeer[];
 }
 
-/** A listen on someone else's deck, reaching you through a patch. */
-export interface ReelListen {
+/** A listen on someone else's deck, reaching you through a patch. Its format
+ *  fields are filled only when the chain it ran through is shared. */
+export interface ReelListen extends SharedFormat {
 	id: number;
 	timestamp: number;
 	title: string;
@@ -968,12 +973,6 @@ export interface ReelListen {
 	artwork_url: string | null;
 	caa_id: number | null;
 	caa_release_mbid: string | null;
-	format_type: string | null;
-	codec: string | null;
-	bitrate: number | null;
-	sample_rate: number | null;
-	bit_depth: number | null;
-	is_lossless: boolean | null;
 	submission_client: string | null;
 	user_id: number;
 	username: string;
@@ -984,16 +983,6 @@ export interface ReelListen {
 	 *  with no actor has no published address, and showing one would invent
 	 *  something that resolves nowhere. */
 	actor_uri: string | null;
-	/** The chain, **when its owner shares it**.
-	 *
-	 *  `null` has two meanings and the row must not conflate them, which is
-	 *  what `has_chain` is for: a chain kept private reads "Private signal
-	 *  chain", and a listen that ran through no chain at all says nothing. */
-	chain_name: string | null;
-	chain_icon: string | null;
-	chain_components: string | null;
-	/** Whether there was a chain, whatever its owner shares. */
-	has_chain: boolean;
 }
 
 export interface ReelPage {

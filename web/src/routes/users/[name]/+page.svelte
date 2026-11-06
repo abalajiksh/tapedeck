@@ -13,7 +13,6 @@
 	import { page } from '$app/stores';
 	import { api } from '$lib/api';
 	import type { DeckView } from '$lib/api';
-	import ChainIcon from '$lib/components/ChainIcon.svelte';
 
 	let deck: DeckView | null = null;
 	let loading = true;
@@ -39,24 +38,6 @@
 			n.slice(0, 2).toUpperCase()
 		);
 	}
-
-	function steps(c: { components: string }): { name: string; type: string }[] {
-		try {
-			return JSON.parse(c.components ?? '[]');
-		} catch {
-			return [];
-		}
-	}
-
-	const ROLE_COLOURS: Record<string, string> = {
-		source: 'var(--td-accent)',
-		dac: 'var(--td-accent-2)',
-		amp: 'var(--td-muted-2)',
-		transducer: 'var(--td-accent-hi)'
-	};
-	const roleColour = (t: string) => ROLE_COLOURS[t] ?? 'var(--td-muted-3)';
-
-	const hours = (h: number) => (h >= 1 ? `${h.toFixed(1)}h` : `${Math.round(h * 60)}min`);
 
 	let copied = '';
 	async function copy(text: string, which: string) {
@@ -104,38 +85,6 @@
 		</div>
 	{/if}
 
-	<h2 class="h-display sech">Chains they share</h2>
-	<p class="sub">
-		Only the chains they switched to shared. What isn't here isn't theirs to be asked about.
-	</p>
-	{#if deck.chains.length}
-		<div class="chaingrid">
-			{#each deck.chains as c}
-				<div class="chaincard">
-					<div class="cname"><ChainIcon name={c.icon} size={16} title={c.name} />{c.name}</div>
-					<div class="cpath">
-						{#each steps(c) as st, i}
-							<span class="cstep">
-								<span class="dot" style="background:{roleColour(st.type)};"></span>{st.name}
-							</span>
-							{#if i < steps(c).length - 1}<span class="arrow">→</span>{/if}
-						{:else}
-							<span class="cnone">No steps listed</span>
-						{/each}
-					</div>
-					<div class="chrs">{hours(c.hours)} logged</div>
-				</div>
-			{/each}
-		</div>
-	{:else}
-		<div class="panel empty small">
-			<p class="esub">
-				They publish no chains yet, so nothing of theirs reaches your Reel. That's theirs to
-				switch on, not yours.
-			</p>
-		</div>
-	{/if}
-
 	<h2 class="h-display sech">Where this deck answers</h2>
 	{#if deck.actor}
 		<p class="sub">The addresses another server uses to find them.</p>
@@ -158,8 +107,9 @@
 	{/if}
 
 	<p class="footnote">
-		You're seeing this because they accepted your patch. It shows listens from their shared
-		chains and nothing else — no history, no counts, no notes.
+		You're seeing this because they accepted your patch. It shows the listens they let patched
+		decks see, and nothing else — no history, no counts, no notes. Their signal chains stay
+		theirs: a chain they share tells you the format a listen arrived in, never the gear.
 	</p>
 {/if}
 
@@ -170,7 +120,6 @@
 		padding: 30px;
 	}
 	.empty { text-align: center; }
-	.empty.small { text-align: left; padding: 20px; }
 	.esub { font-size: 13.5px; color: var(--td-muted); margin: 0; line-height: 1.5; }
 
 	.hero {
@@ -225,33 +174,6 @@
 		background: var(--td-good-bg);
 		color: var(--td-good-fg);
 	}
-
-	.chaingrid {
-		display: grid;
-		grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
-		gap: 12px;
-		margin-bottom: 28px;
-	}
-	.chaincard {
-		background: var(--td-surface);
-		border: 1px solid var(--td-border);
-		border-radius: 18px;
-		padding: 16px 18px;
-	}
-	.cname {
-		display: flex;
-		align-items: center;
-		gap: 8px;
-		font-size: 14.5px;
-		font-weight: 600;
-		margin-bottom: 8px;
-	}
-	.cpath { display: flex; flex-wrap: wrap; align-items: center; gap: 7px; font-size: 12.5px; }
-	.cstep { display: inline-flex; align-items: center; gap: 6px; color: var(--td-muted); }
-	.dot { width: 7px; height: 7px; border-radius: 999px; display: block; }
-	.arrow { color: var(--td-muted-3); }
-	.cnone { color: var(--td-muted-3); font-style: italic; }
-	.chrs { font-size: 12px; color: var(--td-muted-3); margin-top: 10px; }
 
 	.uris { display: flex; flex-direction: column; gap: 8px; margin-bottom: 24px; }
 	.urirow {

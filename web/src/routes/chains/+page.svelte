@@ -1192,7 +1192,7 @@
 						     in the drawer — which is where v0.62.0 moved everything
 						     else the card used to carry. -->
 						{#if c.shared}
-							<span class="shared-pill" title="Listens through this chain reach the Reel of anyone patched into you">
+							<span class="shared-pill" title="Listens through this chain, and their format, reach the Reel of anyone patched into you. The chain is never named.">
 								Shared
 							</span>
 						{/if}
@@ -1483,12 +1483,12 @@
 			     how you listen, not a property of the wiring. -->
 			<div class="share-row">
 				<div style="min-width:0;">
-					<div style="font-size:14px;font-weight:600;">Who hears this chain</div>
+					<div style="font-size:14px;font-weight:600;">Who sees what played here</div>
 					<div style="font-size:12.5px;color:var(--td-muted);line-height:1.45;max-width:46ch;">
 						<strong>Private</strong> is the default and means nobody but you.
 						<strong>Shared</strong> means listens through it reach the Reel of anyone
-						patched into your deck — and it is the only thing that publishes a
-						listen, so there is no per-listen setting.
+						patched into your deck, with the format they arrived in. The chain itself
+						stays yours either way: nobody else is told its name, gear or hours.
 					</div>
 				</div>
 				<!--

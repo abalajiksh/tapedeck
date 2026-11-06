@@ -4676,7 +4676,8 @@ async fn a_patch_reads_nothing_until_it_is_accepted() {
     assert_eq!(reel.len(), 1);
     assert_eq!(reel[0].title, "Teardrop");
     assert_eq!(reel[0].username, "kim");
-    assert_eq!(reel[0].chain_name.as_deref(), Some("Study Chain"), "a shared chain is still named");
+    let row = serde_json::to_string(&reel[0]).unwrap();
+    assert!(!row.contains("Study Chain"), "a shared chain is never named: {row}");
 
     // And withdrawing takes it away again.
     assert!(db.unpatch(me, them).await.unwrap());
@@ -5164,8 +5165,8 @@ async fn nothing_unshared_reaches_any_of_the_step_three_screens() {
 
     let deck = db.deck_view(me, "kim").await.unwrap().expect("the deck");
     assert_eq!(deck.listens, 1, "deck page counts only shared listens");
-    assert_eq!(deck.chains.len(), 1, "and lists only shared chains");
-    assert_eq!(deck.chains[0].name, "Study");
+    let page = serde_json::to_string(&deck).unwrap();
+    assert!(!page.contains("Study"), "and never names a chain, shared or not: {page}");
 
     let pulse = db.instance_pulse(0).await.unwrap();
     let pulse_names: Vec<String> = pulse.artists.iter().map(|a| a.name.clone()).collect();
@@ -5275,15 +5276,9 @@ async fn opening_a_deck_up_shows_every_listen_and_still_spares_the_instance() {
         "everything they played, newest first — and never the skip"
     );
 
-    // The chain is named only where they share it, and "private" is told
-    // apart from "there was none".
-    let by_title = |t: &str| reel.iter().find(|r| r.title == t).expect("row");
-    assert_eq!(by_title("Shared").chain_name.as_deref(), Some("Study"));
-    assert!(by_title("Shared").has_chain);
-    assert_eq!(by_title("Hidden").chain_name, None, "a private chain is not named");
-    assert!(by_title("Hidden").has_chain, "but the screen must know there *was* one");
-    assert_eq!(by_title("Orphan").chain_name, None);
-    assert!(!by_title("Orphan").has_chain, "and that this one ran through nothing");
+    // No chain is named on any row, shared, private or absent.
+    let rows = serde_json::to_string(&reel).unwrap();
+    assert!(!rows.contains("Study") && !rows.contains("Bedroom"), "no chain is named: {rows}");
 
     // The rest of the patched screens follow.
     let names: Vec<String> =
@@ -5291,7 +5286,8 @@ async fn opening_a_deck_up_shows_every_listen_and_still_spares_the_instance() {
     assert_eq!(names.len(), 3, "artists tab, got {names:?}");
     let deck = db.deck_view(me, "kim").await.unwrap().expect("the deck");
     assert_eq!(deck.listens, 3, "deck page");
-    assert_eq!(deck.chains.len(), 1, "but it still lists only the chains they share");
+    let page = serde_json::to_string(&deck).unwrap();
+    assert!(!page.contains("Study") && !page.contains("Bedroom"), "nor on the deck page: {page}");
 
     // And the instance does not. This is the assertion that matters most:
     // it is the one place a person who never agreed to any of this is read.
@@ -5513,13 +5509,17 @@ async fn searching_the_reel_narrows_it_and_never_widens_it() {
         "the unshared listen is not on the Reel to begin with"
     );
 
-    // By track, by artist, by chain, by deck — all narrow.
+    // By track, by artist, by deck — all narrow. Not by chain: a chain is
+    // never named to anybody else, so its name must not find anything either.
     assert_eq!(titles(db.reel(me, 40, None, Some("spoon"), None).await.unwrap()), ["Spoon"]);
     assert_eq!(
         titles(db.reel(me, 40, None, Some("talk talk"), None).await.unwrap()),
         ["Ascension Day"]
     );
-    assert_eq!(titles(db.reel(me, 40, None, Some("study"), None).await.unwrap()).len(), 2);
+    assert!(
+        titles(db.reel(me, 40, None, Some("study"), None).await.unwrap()).is_empty(),
+        "a chain's name is not something the Reel can be searched by"
+    );
     assert_eq!(titles(db.reel(me, 40, None, None, Some("kim")).await.unwrap()).len(), 2);
     assert!(titles(db.reel(me, 40, None, None, Some("nobody")).await.unwrap()).is_empty());
 
@@ -5537,11 +5537,85 @@ async fn searching_the_reel_narrows_it_and_never_widens_it() {
 
 /// A live deck is gated exactly as a banked listen is.
 ///
+/// **A signal chain is private by design, shared or not** (Ashwin,
+/// 2026-11-06). Sharing a chain hands over the listen's format and transcode
+/// details and nothing about the chain: not its name, not its gear, not its
+/// hours. Not shared, and the format stays home too.
+#[tokio::test]
+async fn a_shared_chain_hands_over_the_format_and_never_itself() {
+    let db = testdb().await;
+    let (me, them, shared) = patched_pair(&db).await;
+    sqlx::query("UPDATE signal_chains SET components = ? WHERE id = ?")
+        .bind(r#"[{"type":"transducer","name":"Hexa Monitor"}]"#)
+        .bind(shared)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let private = sqlx::query_scalar::<_, i64>(
+        "INSERT INTO signal_chains (user_id, name, created_at) VALUES (?, 'Bedroom', ?) \
+             RETURNING id",
+    )
+    .bind(them)
+    .bind(Database::now_secs())
+    .fetch_all(&db.pool)
+    .await
+    .unwrap()[0];
+    db.set_share_all_with_patched(them, true).await.unwrap();
+
+    let q = AudioQuality {
+        format_type: Some("pcm".into()),
+        codec: Some("flac".into()),
+        sample_rate: Some(96_000),
+        bit_depth: Some(24),
+        is_lossless: Some(true),
+        delivery_codec: Some("aac".into()),
+        delivery_bitrate: Some(256),
+        is_transcoded: Some(true),
+        transcode_reason: Some("bandwidth".into()),
+        ..Default::default()
+    };
+    for (chain, title, ts) in [(shared, "Out", 1_760_000_100u64), (private, "Home", 1_760_000_200)]
+    {
+        let p = Play::new(title.into(), "Artist".into(), ts, format!("f-{ts}"), "test".into());
+        db.save_scrobble(
+            them,
+            &p,
+            Some(&q),
+            None,
+            Some(chain),
+            None,
+            None,
+            None,
+            None,
+            ListenDisposition::LIVE,
+        )
+        .await
+        .unwrap();
+    }
+
+    let reel = db.reel(me, 50, None, None, None).await.unwrap();
+    let out = reel.iter().find(|r| r.title == "Out").expect("shared row");
+    assert_eq!(out.format.codec.as_deref(), Some("flac"));
+    assert_eq!(out.format.sample_rate, Some(96_000));
+    assert_eq!(out.format.delivery_codec.as_deref(), Some("aac"));
+    assert_eq!(out.format.is_transcoded, Some(true));
+    assert_eq!(out.format.transcode_reason.as_deref(), Some("bandwidth"));
+    let home = reel.iter().find(|r| r.title == "Home").expect("private row");
+    assert_eq!(home.format.codec, None, "an unshared chain keeps the format home");
+    assert_eq!(home.format.delivery_codec, None);
+
+    let rows = serde_json::to_string(&reel).unwrap();
+    for leak in ["Study", "Bedroom", "Hexa Monitor", "chain"] {
+        assert!(!rows.contains(leak), "{leak:?} reached a patched deck: {rows}");
+    }
+    // A search cannot probe for a chain by name either.
+    assert!(db.reel(me, 50, None, Some("study"), None).await.unwrap().is_empty());
+}
+
 /// With the switch **off** — the default, and every account that predates
-/// it — that is the shared chain, unchanged. `live_visibility` returns the
-/// chain's *name* rather than a boolean so one round trip answers both
-/// questions, which is also what stops a caller showing the name of a
-/// chain it never checked.
+/// it — that is the shared chain, unchanged. `live_visibility` answers
+/// whether the listen shows and whether its format goes with it; it never
+/// returns the chain's name (2026-11-06).
 #[tokio::test]
 async fn a_live_deck_is_gated_on_the_same_shared_chain_a_listen_is() {
     let db = testdb().await;
@@ -5558,7 +5632,7 @@ async fn a_live_deck_is_gated_on_the_same_shared_chain_a_listen_is() {
 
     assert_eq!(
         db.live_visibility(them, Some(shared)).await.unwrap(),
-        Visible::Yes(Some("Study".into()))
+        Visible::Yes { format_shared: true }
     );
     assert_eq!(
         db.live_visibility(them, Some(private)).await.unwrap(),
@@ -5575,8 +5649,8 @@ async fn a_live_deck_is_gated_on_the_same_shared_chain_a_listen_is() {
     // — what must not happen is their chain's name coming back on it.
     assert_eq!(
         db.live_visibility(me, Some(shared)).await.unwrap(),
-        Visible::Yes(None),
-        "a chain that is not theirs is never named on their deck"
+        Visible::Yes { format_shared: false },
+        "a chain that is not theirs shares nothing on their deck"
     );
 
     // With the switch on, the track shows and the private chain is simply
@@ -5584,17 +5658,17 @@ async fn a_live_deck_is_gated_on_the_same_shared_chain_a_listen_is() {
     db.set_share_all_with_patched(them, true).await.unwrap();
     assert_eq!(
         db.live_visibility(them, Some(shared)).await.unwrap(),
-        Visible::Yes(Some("Study".into())),
-        "a shared chain is still named"
+        Visible::Yes { format_shared: true },
+        "a shared chain still hands over the format"
     );
     assert_eq!(
         db.live_visibility(them, Some(private)).await.unwrap(),
-        Visible::Yes(None),
-        "a private chain shows the track and withholds the name"
+        Visible::Yes { format_shared: false },
+        "a private chain shows the track and withholds the format"
     );
     assert_eq!(
         db.live_visibility(them, None).await.unwrap(),
-        Visible::Yes(None),
+        Visible::Yes { format_shared: false },
         "and a chainless listen shows too — 'all the music they scrobble' means all of it"
     );
 

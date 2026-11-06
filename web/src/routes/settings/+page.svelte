@@ -2195,9 +2195,9 @@
 							<div class="row-sub">
 								Off, they see only what runs through chains you have shared — which
 								leaves out anything played on gear you keep private, and everything
-								with no chain recorded at all. On, they see every listen, and a chain
-								you keep private simply reads <em>Private signal chain</em> instead of
-								its name.
+								with no chain recorded at all. On, they see every listen. Either way no
+								chain is ever named to them: a shared chain adds the format each listen
+								arrived in, never the gear.
 							</div>
 						</div>
 						<label style="display:flex;align-items:center;gap:8px;cursor:pointer;font-size:14px;white-space:nowrap;">

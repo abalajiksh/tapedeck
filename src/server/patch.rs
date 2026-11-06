@@ -248,16 +248,11 @@ pub struct LiveDeck {
     /// The position was measured rather than extrapolated.
     pub position_known: bool,
     pub paused: bool,
-    /// Null with `has_chain` true is a private chain; null with it false is a
-    /// listen through nothing anybody recorded.
-    pub chain_name: Option<String>,
-    pub has_chain: bool,
     pub artwork_url: Option<String>,
-    pub format_type: Option<String>,
-    pub codec: Option<String>,
-    pub bit_depth: Option<i16>,
-    pub sample_rate: Option<i32>,
-    pub is_lossless: Option<bool>,
+    /// Format and transcode details, **only when the chain is shared**. The
+    /// chain itself is never named.
+    #[serde(flatten)]
+    pub format: crate::db::SharedFormat,
 }
 
 #[derive(Serialize, ToSchema)]
@@ -485,7 +480,8 @@ struct ReelQuery {
     /// Keyset paging: the `next` from the previous page. Not an offset — the
     /// Reel grows from the top while it is being read.
     before: Option<i64>,
-    /// Narrows on track, artist, album, chain or deck, server-side.
+    /// Narrows on track, artist, album or deck, server-side. Not on chain: a
+    /// chain is never named to anybody else, so it cannot be searched for.
     //
     // **Server-side**, because the Reel is keyset-paged: a filter applied to
     // the loaded page would silently search only what has been scrolled to and
@@ -521,9 +517,10 @@ struct ReelQuery {
 /// every listen they play, whatever chain it ran through or whether it ran
 /// through one at all. **`shared_chains`** is how many chains they publish,
 /// which is what decides visibility when that switch is off — and, either
-/// way, whether the chain is *named* on a row. Zero chains **and** closed is
-/// the empty patch that needs saying on screen rather than looking broken;
-/// zero chains and open is a deck publishing everything it plays, unnamed.
+/// way, whether a row carries its format. A chain is never named. Zero chains
+/// **and** closed is the empty patch that needs saying on screen rather than
+/// looking broken; zero chains and open is a deck publishing everything it
+/// plays, without formats.
 #[utoipa::path(
     get,
     path = "/api/v1/patch/decks",
@@ -783,17 +780,19 @@ async fn withdraw(
 
 // `PUT /api/v1/patch/chains/:id/shared` — publish a chain, or stop.
 //
-// **The sharing unit is the chain, and this is the only switch there is.** It
-// lives here rather than on the chains router because it is a Patch decision
+// The switch lives here rather than on the chains router because it is a Patch decision
 // rather than a piece of gear configuration — but the Signal Chains page calls
 // exactly this endpoint, which is what makes "one state, two places" true
 // rather than aspirational.
-/// Publish a signal chain to the people patched into you, or stop.
+/// Share what a signal chain played, and in what format, or stop.
 ///
-/// **The sharing unit is the chain, and this is the only switch there is.**
-/// A listen reaches the Reel because the chain it ran through was switched
-/// on by its owner — there is no per-listen override and there should not
-/// be one. It makes "what am I publishing?" answerable by looking at a list
+/// **A chain is private by design, shared or not.** Sharing one never names
+/// it, its gear or its hours to anybody. It lets the listens through it reach
+/// the people patched into you (when you have not opened up everything), and
+/// it hands over each listen's format and transcode details: codec, bitrate,
+/// sample rate, bit depth, DSD rate, and what it was delivered as.
+///
+/// There is no per-listen override and there should not be one. It makes "what am I publishing?" answerable by looking at a list
 /// of chains you already understand, and it makes the decision a standing
 /// one about *how you listen* rather than a choice to make per play.
 ///
@@ -853,20 +852,17 @@ async fn set_shared(
 ///
 /// **The one read in this application that returns another user's
 /// listens**, and every narrowing is in the query rather than the handler:
-/// the patch must be `accepted`, the listen's chain must be `shared`, the
-/// listen must have a chain at all, and skips are excluded.
-///
-/// A listen with no chain is never shared — nobody switched anything on for
-/// it, so the default is exclusion.
+/// the patch must be `accepted`, the deck must have opened up or the
+/// listen's chain must be `shared`, and skips are excluded.
 ///
 /// Paged by keyset on `before`, not by offset: the Reel grows from the top
 /// while it is being read, and an offset would repeat or skip rows as it
 /// shifted underneath. `next` is null when the page was short.
 ///
-/// Rows carry the chain — its name, icon and components — because that is
-/// what makes a Tapedeck listen a Tapedeck listen rather than a sentence.
-/// They deliberately do not carry the source id, the delivery state or the
-/// session, which are nobody else's business.
+/// Rows carry the listen's **format and transcode details when its chain is
+/// shared**, and nothing about the chain itself: no name, gear or hours. They
+/// deliberately do not carry the source id, the delivery state or the
+/// session either, which are nobody else's business.
 #[utoipa::path(
     get,
     path = "/api/v1/patch/reel",
@@ -1023,7 +1019,7 @@ async fn discover(State(state): State<Arc<AppState>>, user: super::auth::AuthUse
     security(("sessionCookie" = [])),
     params(SinceQuery),
     responses(
-        (status = 200, description = "Decks, listens, hours, top artists, chains and daily hours.", body = InstanceView),
+        (status = 200, description = "Decks, listens, hours, top artists and daily hours.", body = InstanceView),
         (status = 401, response = Unauthorized),
     )
 )]
@@ -1108,8 +1104,8 @@ async fn ops(State(state): State<Arc<AppState>>, user: super::auth::AuthUser) ->
 // `GET /api/v1/patch/deck/:username` — one deck, through an accepted patch.
 /// One deck, through an accepted patch.
 ///
-/// Session-only. The deck's profile, how much it has played, its shared
-/// chains with their hours, and the artists you both play. A deck that does
+/// Session-only. The deck's profile, how much it has played, and the artists
+/// you both play. Never their chains: a chain is private by design. A deck that does
 /// not exist and one you are not patched into are the same 404.
 #[utoipa::path(
     get,
@@ -1507,9 +1503,9 @@ async fn artist_context(
 /// Decks you're patched into that are playing something right now.
 ///
 /// **Gated by exactly the rule the Reel uses** — an accepted patch, and the
-/// listen running through a chain its owner switched to **shared**. A live
-/// entry that could not be checked never appears, which is why `chain_name`
-/// is always present on a row here.
+/// listen running through a chain its owner switched to **shared**, or an
+/// owner who opened up. A live entry that could not be checked never appears.
+/// The chain is never named; a shared one hands over the listen's format.
 ///
 /// That gate is what `NowPlaying.chain_id` exists for. A name could not do
 /// it — a name is not a key, and a polled source sets no chain name at all,
@@ -1557,12 +1553,28 @@ async fn live(State(state): State<Arc<AppState>>, user: super::auth::AuthUser) -
         // now when its owner has opened up, because "all the music they
         // scrobble" has to mean all of it — see `PATCH_VISIBLE_LISTENS`.
         match state.db.live_visibility(p.user_id, np.chain_id).await {
-            Ok(crate::db::Visible::Yes(chain_name)) => out.push(LiveDeck {
+            Ok(crate::db::Visible::Yes { format_shared }) => out.push(LiveDeck {
                 user_id: p.user_id,
                 username: p.username,
                 display_name: p.display_name,
                 avatar_url: p.avatar_url,
-                has_chain: np.chain_id.is_some(),
+                // The registry carries no transcode reason or delivery rates, so
+                // a live row shares what a now-playing entry knows and no more.
+                format: if format_shared {
+                    crate::db::SharedFormat {
+                        format_type: np.format_type.clone(),
+                        codec: np.codec.clone(),
+                        sample_rate: np.sample_rate.map(i64::from),
+                        bit_depth: np.bit_depth.map(i64::from),
+                        is_lossless: np.is_lossless,
+                        dsd_multiplier: np.dsd_multiplier.map(i64::from),
+                        dsd_to_pcm_converted: np.dsd_to_pcm_converted,
+                        delivery_codec: np.delivery_codec.clone(),
+                        ..Default::default()
+                    }
+                } else {
+                    crate::db::SharedFormat::default()
+                },
                 title: np.title,
                 artist: np.artist,
                 album: np.album,
@@ -1574,16 +1586,7 @@ async fn live(State(state): State<Arc<AppState>>, user: super::auth::AuthUser) -
                 // to stop.
                 position_known: np.position_known,
                 paused: np.paused,
-                // Null with `has_chain` true is "Private signal chain" on the
-                // strip; null with it false is a listen that ran through
-                // nothing anybody recorded. Different facts, drawn differently.
-                chain_name,
                 artwork_url: np.artwork_url,
-                format_type: np.format_type,
-                codec: np.codec,
-                bit_depth: np.bit_depth,
-                sample_rate: np.sample_rate,
-                is_lossless: np.is_lossless,
             }),
             Ok(crate::db::Visible::No) => {}
             Err(e) => warn!("📡 live: {e}"),

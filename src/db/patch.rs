@@ -581,11 +581,12 @@ impl Database {
     /// Instance tab, Discover, "who else here plays them", and whether a Shared
     /// Spool may capture a play into somebody else's history.
     ///
-    /// It also decides whether the chain is **named**. `CHAIN_VISIBILITY` draws
-    /// three states, not two: a shared chain by name, a private one as "Private
-    /// signal chain", and a listen that ran through nothing says nothing. So
-    /// this remains the answer to "who may see how I listen", which is a
-    /// different question from "who may see what I listen to".
+    /// It also decides whether the listen's **format** goes with it: codec,
+    /// rate, depth and the transcode details (`SHARED_FORMAT`). It never names
+    /// the chain — a chain is private by design, shared or not (Ashwin,
+    /// 2026-11-06), so the gear, the name and the hours stay on this instance
+    /// and with this person. This remains the answer to "who may see what the
+    /// signal was", a different question from "who may see what I listen to".
     ///
     /// There is still no per-listen override and there should not be one: the
     /// decision is a standing one about *how you listen* rather than a choice
@@ -624,7 +625,8 @@ impl Database {
     /// It is deliberately **not** scoped by `user_id = ?` the way every other
     /// read is; that is the relaxation Phase 6 exists to make, and it is
     /// narrowed by the patch and the chain instead.
-    /// `q` narrows on track, artist, album, chain or deck; `deck` pins it to one
+    /// `q` narrows on track, artist, album or deck — **not chain**: matching
+    /// on a chain's name would let a search probe for it — and `deck` pins it to one
     /// username. **Both server-side**, because the Reel is keyset-paged — a
     /// filter applied to the loaded page would silently search only what has
     /// been scrolled to, and say nothing about it.
@@ -649,20 +651,14 @@ impl Database {
                     .replace('_', "\\_")
             )
         });
-        sqlx::query_as(&crate::sql!(
+        sqlx::query_as(&crate::sql!(&format!(
             "SELECT s.id, s.timestamp, s.title, s.artist, s.album,
                     s.artwork_url, s.caa_id, s.caa_release_mbid,
-                    s.format_type, s.codec, s.bitrate, s.sample_rate, s.bit_depth, s.is_lossless,
+                    -- The format, when the chain is shared; never the chain.
+                    {},
                     s.submission_client,
                     u.id AS user_id, u.username, u.display_name, u.avatar_url,
-                    a.uri AS actor_uri,
-                    -- Named only when its owner shares it; present-but-private
-                    -- and absent-entirely are different facts and the row draws
-                    -- them differently. See `CHAIN_VISIBILITY`.
-                    CASE WHEN c.shared = TRUE THEN c.name END AS chain_name,
-                    CASE WHEN c.shared = TRUE THEN c.icon END AS chain_icon,
-                    CASE WHEN c.shared = TRUE THEN c.components END AS chain_components,
-                    CASE WHEN s.chain_id IS NULL THEN 0 ELSE 1 END AS has_chain
+                    a.uri AS actor_uri
                FROM scrobbles s
                LEFT JOIN signal_chains c ON c.id = s.chain_id
                JOIN users u ON u.id = s.user_id
@@ -678,18 +674,17 @@ impl Database {
                      LOWER(s.title) LIKE ? ESCAPE '\\' OR
                      LOWER(s.artist) LIKE ? ESCAPE '\\' OR
                      LOWER(COALESCE(s.album, '')) LIKE ? ESCAPE '\\' OR
-                     LOWER(c.name) LIKE ? ESCAPE '\\' OR
                      LOWER(u.username) LIKE ? ESCAPE '\\' OR
                      LOWER(COALESCE(u.display_name, '')) LIKE ? ESCAPE '\\')
               ORDER BY s.timestamp DESC
-              LIMIT ?"
-        ))
+              LIMIT ?",
+            Self::SHARED_FORMAT
+        )))
         .bind(user_id)
         .bind(before)
         .bind(before)
         .bind(deck)
         .bind(deck)
-        .bind(&needle)
         .bind(&needle)
         .bind(&needle)
         .bind(&needle)
@@ -870,22 +865,9 @@ impl Database {
 
         let (id, username, display_name, bio, avatar_url, created_at) = row;
 
-        // Only the chains they publish. An unshared chain is not theirs to be
-        // asked about, and listing it would say what they own without saying
-        // what they played — which is worse than saying nothing.
-        let chains: Vec<DeckChain> = sqlx::query_as(&crate::sql!(
-            "SELECT c.name, c.icon, c.components,
-                    CAST(COALESCE((
-                        SELECT SUM(sc.duration) FROM scrobbles sc
-                         WHERE sc.chain_id = c.id AND sc.skipped = FALSE
-                    ), 0) AS REAL) / 3600.0 AS hours
-               FROM signal_chains c
-              WHERE c.user_id = ? AND c.shared = TRUE
-              ORDER BY hours DESC"
-        ))
-        .bind(id)
-        .fetch_all(&self.pool)
-        .await?;
+        // No chains. Until 2026-11-06 this listed every shared chain with its
+        // name, gear and hours; a chain is private by design now, shared or
+        // not, and sharing one hands over the format of what ran through it.
 
         // What you both play. Overlap only — no score, no ranking of people.
         //
@@ -943,7 +925,6 @@ impl Database {
             avatar_url,
             created_at,
             listens,
-            chains,
             both_play: both,
             actor,
         }))
@@ -1110,14 +1091,6 @@ impl Database {
         .fetch_one(&self.pool)
         .await?;
 
-        let chains: Vec<(String, i64)> = sqlx::query_as(&crate::sql!(&format!(
-            "SELECT c.name, COUNT(*) AS plays {SHARED} AND s.timestamp >= ? \
-              GROUP BY c.id ORDER BY plays DESC LIMIT 6"
-        )))
-        .bind(since)
-        .fetch_all(&self.pool)
-        .await?;
-
         // Per day, oldest first, as raw (day, hours) — bucketed here by UTC
         // day and re-bucketed by the caller's timezone would be wrong, so the
         // *timestamps* go out and the client draws them. Seven numbers.
@@ -1137,7 +1110,6 @@ impl Database {
             hours,
             artists_heard,
             artists,
-            chains: chains.into_iter().map(|(name, plays)| ChainTally { name, plays }).collect(),
             daily: daily.into_iter().map(|(at, hours)| DailyHour { at, hours }).collect(),
         })
     }
@@ -2792,16 +2764,12 @@ impl Database {
         Ok(())
     }
     /// May a patched deck see what this person is playing, and may it be told
-    /// what through?
+    /// the format?
     ///
-    /// Two questions, and since 2026-08-26 they have different answers — which
-    /// is the whole of what changed. `Visible::No` means the listen is not
-    /// shown at all; `Visible::Yes(None)` means it is shown with *"Private
-    /// signal chain"* where the chain would be.
-    ///
-    /// Returns the name rather than a boolean so one round trip answers both
-    /// "may this be shown" and "what is it called" — and so a caller cannot
-    /// accidentally show the name of a chain it did not check.
+    /// Two questions, and since 2026-08-26 they have different answers.
+    /// `Visible::No` means the listen is not shown at all; `Visible::Yes` says
+    /// whether its chain is shared, which is what lets the format and transcode
+    /// details go with it. The chain is never named (2026-11-06).
     ///
     /// `chain_id` is `None` for a source that reports no chain at all
     /// (Navidrome, an unattributed submission). Those used to be excluded
@@ -2820,23 +2788,22 @@ impl Database {
         .await?
         .unwrap_or(false);
 
-        let named: Option<String> = match chain_id {
-            Some(cid) => {
-                sqlx::query_scalar(&crate::sql!(
-                    "SELECT name FROM signal_chains WHERE id = ? AND user_id = ? AND shared = TRUE",
-                ))
-                .bind(cid)
-                .bind(user_id)
-                .fetch_optional(&self.pool)
-                .await?
-            }
-            None => None,
+        let shared: bool = match chain_id {
+            Some(cid) => sqlx::query_scalar::<_, i64>(&crate::sql!(
+                "SELECT COUNT(*) FROM signal_chains WHERE id = ? AND user_id = ? AND shared = TRUE",
+            ))
+            .bind(cid)
+            .bind(user_id)
+            .fetch_one(&self.pool)
+            .await?
+                > 0,
+            None => false,
         };
 
         // A shared chain is visible however the switch is set — that is the old
-        // rule, intact.
-        if named.is_some() || all {
-            Ok(Visible::Yes(named))
+        // rule, intact. What it unlocks is the format, never its own name.
+        if shared || all {
+            Ok(Visible::Yes { format_shared: shared })
         } else {
             Ok(Visible::No)
         }
@@ -2994,17 +2961,18 @@ impl Database {
             }));
         };
 
-        let mut listens: Vec<HandedListen> = sqlx::query_as(&crate::sql!(
+        let mut listens: Vec<HandedListen> = sqlx::query_as(&crate::sql!(&format!(
             "SELECT s.title, s.artist, s.album, s.timestamp, s.duration, s.artwork_url,
                     s.caa_id, s.caa_release_mbid,
-                    CASE WHEN c.shared = TRUE THEN c.name END AS chain_name
+                    {}
                FROM scrobbles s
                JOIN users u ON u.id = s.user_id
                LEFT JOIN signal_chains c ON c.id = s.chain_id
               WHERE s.session_id = ? AND s.skipped = FALSE
                 AND (u.share_all_with_patched = 1 OR c.shared = TRUE)
               ORDER BY s.timestamp",
-        ))
+            Self::SHARED_FORMAT
+        )))
         .bind(session_id)
         .fetch_all(&self.pool)
         .await?;
