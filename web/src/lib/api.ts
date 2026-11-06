@@ -1036,12 +1036,58 @@ export interface EquipmentInput {
 	 *  Note the update endpoint is a whole-record replace, so every caller has
 	 *  to send this back or tagging a spare clears it. */
 	status?: string | null;
+	/** Other names this box reports as. Absent leaves them alone: the one
+	 *  field the whole-record replace does not clear. */
+	aliases?: string[];
 }
 
 export interface Connection {
 	service: string;
 	username: string | null;
 	connected_at: number;
+}
+
+/** An output learned from one box (a device or token tied to a piece of
+ *  gear). Outranks a `Binding` of the same name. */
+export interface DeviceBinding {
+	id: number;
+	equipment_id: number;
+	equipment_name: string;
+	identifier: string;
+	interface: string | null;
+	chain_id: number | null;
+	chain_variant_id: number | null;
+	last_seen: number;
+	hits: number;
+}
+
+/** A device or token, as the inbox names it. */
+export interface InboxReporter {
+	kind: 'device' | 'token';
+	id: number;
+	name: string;
+	sub: string;
+	equipment_id: number | null;
+}
+
+/** One question in the Signal Chains inbox. */
+export interface InboxQuestion {
+	key: string;
+	kind: 'same_box' | 'which_box' | 'where';
+	equipment_id?: number;
+	equipment_name?: string;
+	reporters?: InboxReporter[];
+	plays?: number;
+	first?: number;
+	last?: number;
+	since?: number;
+	device?: InboxReporter;
+	token?: InboxReporter;
+	output?: string;
+	source_name?: string;
+	/** What an answer remembers: an output of a box, an output by name, the
+	 *  token's or the device's default chain, or nothing at all. */
+	rule?: 'device_output' | 'output' | 'token' | 'device' | 'none';
 }
 
 export interface Binding {
@@ -1066,6 +1112,8 @@ export interface Device {
 	default_chain_id: number | null;
 	total_listens: number;
 	last_seen: number;
+	/** The box this device is, once tied to one. */
+	equipment_id?: number | null;
 }
 
 /** Your own account. `avatar` is a URL the browser can load directly — either
@@ -1184,6 +1232,10 @@ export interface Equipment {
 	/** Which chains and variants `total_hours` is made of, largest first. Empty
 	 *  for gear nothing has logged time through. */
 	sources: GearHours[];
+	/** Other names this box reports as (a model number). */
+	aliases: string[];
+	/** The devices and tokens tied to this box, by name. */
+	reporters: string[];
 }
 
 /** Live playback state. Field names mirror `Scrobble` so `qualityLabel()` works on it. */
@@ -3915,14 +3967,51 @@ class TapedeckAPI {
 	async deleteEquipment(id: number): Promise<void> { return this.delNoBody(`/api/v1/equipment/${id}`); }
 
 	// ── Output-device → chain bindings ──
-	async getBindings(): Promise<{ bindings: Binding[] }> { return this.get('/api/v1/bindings'); }
+	async getBindings(): Promise<{ bindings: Binding[]; device_bindings: DeviceBinding[] }> {
+		return this.get('/api/v1/bindings');
+	}
+	async deleteDeviceBinding(id: number): Promise<void> {
+		return this.delNoBody(`/api/v1/device-bindings/${id}`);
+	}
+	async getChainInbox(): Promise<{ questions: InboxQuestion[]; window_days: number }> {
+		return this.get('/api/v1/chains/inbox');
+	}
+	async answerInboxWhere(body: {
+		device_id: number | null;
+		token_id: number | null;
+		output: string | null;
+		source_name: string;
+		since: number;
+		chain_id: number;
+		chain_variant_id?: number | null;
+		backfill: boolean;
+	}): Promise<{ rule: string; moved: number }> {
+		return this.post('/api/v1/chains/inbox/where', body);
+	}
+	async answerInboxBox(body: {
+		equipment_id: number;
+		device_ids: number[];
+		token_ids: number[];
+		alias?: string | null;
+	}): Promise<void> {
+		await this.post('/api/v1/chains/inbox/box', body);
+	}
+	async dismissInbox(key: string): Promise<void> {
+		await this.post('/api/v1/chains/inbox/dismiss', { key });
+	}
 	/** The setup always travels with the chain: leaving it out clears it. */
 	async setBinding(
 		identifier: string,
 		chain_id: number | null,
-		chain_variant_id: number | null = null
+		chain_variant_id: number | null = null,
+		equipment_id: number | null = null
 	): Promise<void> {
-		await this.request('PUT', '/api/v1/bindings', { identifier, chain_id, chain_variant_id });
+		await this.request('PUT', '/api/v1/bindings', {
+			identifier,
+			chain_id,
+			chain_variant_id,
+			...(equipment_id != null ? { equipment_id } : {})
+		});
 	}
 	async deleteBinding(id: number): Promise<void> { return this.delNoBody(`/api/v1/bindings/${id}`); }
 

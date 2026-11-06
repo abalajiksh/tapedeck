@@ -85,6 +85,25 @@ impl Database {
             .await?;
         }
 
+        // v0.129.0: where a listen came from, which box a reporter is, and the
+        // other names a box reports as (the Signal Chains inbox). Plain columns,
+        // no constraints; see the notes in `schema.rs`.
+        for (table, column, ty) in [
+            ("scrobbles", "token_id", "BIGINT"),
+            ("scrobbles", "output_identifier", "TEXT"),
+            ("scrobbles", "chain_source", "TEXT"),
+            ("devices", "equipment_id", "BIGINT"),
+            ("tokens", "equipment_id", "BIGINT"),
+            ("equipment", "aliases", "TEXT"),
+        ] {
+            if !has_column(&self.pool, table, column).await? {
+                info!("⚙️ Migrating: {table}.{column}...");
+                sqlx::query(&format!("ALTER TABLE {table} ADD COLUMN {column} {ty}"))
+                    .execute(&self.pool)
+                    .await?;
+            }
+        }
+
         Ok(())
     }
 
@@ -1286,6 +1305,23 @@ impl Database {
             )
             .execute(&self.pool)
             .await;
+        }
+        // v0.129.0: where a listen came from, which box a reporter is, and the
+        // other names a box reports as (the Signal Chains inbox).
+        for (table, column, ty) in [
+            ("scrobbles", "token_id", "INTEGER"),
+            ("scrobbles", "output_identifier", "TEXT"),
+            ("scrobbles", "chain_source", "TEXT"),
+            ("devices", "equipment_id", "INTEGER"),
+            ("tokens", "equipment_id", "INTEGER"),
+            ("equipment", "aliases", "TEXT"),
+        ] {
+            if !has_column(&self.pool, table, column).await {
+                info!("⚙️ Migrating: adding {table}.{column}...");
+                let _ = sqlx::query(&format!("ALTER TABLE {table} ADD COLUMN {column} {ty}"))
+                    .execute(&self.pool)
+                    .await;
+            }
         }
         if !has_column(&self.pool, "sessions", "notes").await {
             let _ =

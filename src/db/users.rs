@@ -338,6 +338,8 @@ impl Database {
             // pairing in flight failed on the foreign key.
             "pairing_requests",
             "chain_bindings",
+            "device_bindings",
+            "chain_inbox_dismissed",
             "devices",
             // A room's link rows point at a chain and a room, so they clear
             // before both; the rooms point at nothing else.
@@ -645,7 +647,7 @@ impl Database {
     pub async fn list_tokens(&self, user_id: i64) -> Result<Vec<TokenRecord>, sqlx::Error> {
         sqlx::query_as(&crate::sql!(
             "SELECT t.id, t.name, t.scopes, t.created_at, t.last_used_at, t.default_chain_id,
-                    t.imports_are_live, c.name AS default_chain_name
+                    t.imports_are_live, c.name AS default_chain_name, t.equipment_id
              FROM tokens t LEFT JOIN signal_chains c ON c.id = t.default_chain_id
              WHERE t.user_id = ? ORDER BY t.created_at ASC",
         ))

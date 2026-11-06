@@ -578,18 +578,20 @@ pub struct DryRunListen {
     pub quality_score: Option<f64>,
     pub chain_id: Option<i64>,
     /// The setup (variant) of that chain the listen would be saved with. Set
-    /// only when `chain_source` is `output_binding` and that output was mapped
-    /// to a setup.
+    /// only when `chain_source` is `device_output` or `output_binding` and that
+    /// output was mapped to a setup.
     pub chain_variant_id: Option<i64>,
     pub chain_name: Option<String>,
-    /// **Which rung of the ladder won:** `explicit`, `output_binding`,
-    /// `token_default`, `device_default` or `none`. The single most useful
+    /// **Which rung of the ladder won:** `explicit`, `device_output` (an
+    /// output of the box this device or token is tied to), `output_binding`
+    /// (an output by name, from anything), `token_default`, `device_default`
+    /// or `none`. The single most useful
     /// field here: a chain arriving from the wrong rung looks identical to one
     /// arriving from the right one, so without this a misconfiguration is
     /// invisible until someone reads their history months later.
     #[schema(
         value_type = String,
-        pattern = "^(explicit|output_binding|token_default|device_default|none)$"
+        pattern = "^(explicit|device_output|output_binding|token_default|device_default|none)$"
     )]
     pub chain_source: &'static str,
     pub device_id: Option<i64>,

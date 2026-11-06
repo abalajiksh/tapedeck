@@ -3538,7 +3538,13 @@ impl Database {
         // 3. Repoint what was recorded — and the outputs mapped to this chain,
         //    which must go on naming the gear they named. **Null first**, or
         //    the second statement would catch the rows the first just wrote.
-        for table in ["scrobbles", "physical_plays", "physical_releases", "chain_bindings"] {
+        for table in [
+            "scrobbles",
+            "physical_plays",
+            "physical_releases",
+            "chain_bindings",
+            "device_bindings",
+        ] {
             sqlx::query(&crate::sql!(&format!(
                 "UPDATE {table} SET chain_variant_id = ?
                   WHERE user_id = ? AND chain_id = ? AND chain_variant_id IS NULL"

@@ -5202,6 +5202,127 @@ paths:
           $ref: '#/components/responses/Unauthorized'
         '404':
           $ref: '#/components/responses/NotFound'
+  /api/v1/chains/inbox:
+    get:
+      tags:
+      - Chains
+      summary: The questions about plays that landed in no chain.
+      description: |-
+        Session-only. From the last 30 days, grouped by where the plays came from:
+        first which box a device or token is (`same_box`, `which_box`), then where
+        unfiled plays should have gone (`where`), most plays first. Questions put
+        off with "not now" are left out for 30 days.
+      operationId: chain_inbox
+      responses:
+        '200':
+          description: OK.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InboxList'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+  /api/v1/chains/inbox/where:
+    post:
+      tags:
+      - Chains
+      summary: Answer "where were you?" for plays that landed in no chain.
+      description: |-
+        Session-only. Writes the most specific rule the plays allow, so future
+        ones find the chain: an output (of the box when the reporter is tied to
+        one), else the token's default chain, else the device's. With none of
+        those (`rule: none`) nothing can be remembered and only the counted plays
+        can be filed. `backfill` files the plays the question counted, no others.
+      operationId: answer_inbox_where
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AnswerWhereRequest'
+        required: true
+      responses:
+        '200':
+          description: The rule written and the plays filed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WhereAnswered'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+  /api/v1/chains/inbox/box:
+    post:
+      tags:
+      - Chains
+      summary: Tie devices and tokens to the box they are.
+      description: |-
+        Session-only. Answers "are these your Xperia?" and "which box is this?".
+        Hours never move: grouping changes how reporters are drawn and which
+        outputs are learned per box, not where any listen was attributed. Ids that
+        are not yours are ignored. `alias` is remembered on the box.
+      operationId: answer_inbox_box
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AnswerBoxRequest'
+        required: true
+      responses:
+        '200':
+          description: Tied. `status` is `ok`.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Ok'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+  /api/v1/chains/inbox/dismiss:
+    post:
+      tags:
+      - Chains
+      summary: Put an inbox question off for 30 days.
+      description: Session-only.
+      operationId: dismiss_inbox
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DismissRequest'
+        required: true
+      responses:
+        '200':
+          description: Put off. `status` is `ok`.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Ok'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+  /api/v1/device-bindings/{id}:
+    delete:
+      tags:
+      - Chains
+      summary: Remove an output learned per box.
+      description: Session-only.
+      operationId: delete_device_binding
+      parameters:
+      - name: id
+        in: path
+        description: The output.
+        required: true
+        schema:
+          type: integer
+          format: int64
+      responses:
+        '204':
+          description: Deleted.
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
   /api/v1/rooms:
     get:
       tags:
@@ -12827,6 +12948,78 @@ components:
           oneOf:
           - type: 'null'
           - $ref: '#/components/schemas/AnnotationTarget'
+    AnswerBoxRequest:
+      type: object
+      required:
+      - equipment_id
+      properties:
+        equipment_id:
+          type: integer
+          format: int64
+          description: The box they are. One of your gear.
+        device_ids:
+          type: array
+          items:
+            type: integer
+            format: int64
+        token_ids:
+          type: array
+          items:
+            type: integer
+            format: int64
+        alias:
+          type:
+          - string
+          - 'null'
+          description: |-
+            Remember this as another name the box reports as (a model number), so
+            the next reporter carrying it is suggested. Optional.
+    AnswerWhereRequest:
+      type: object
+      required:
+      - source_name
+      - since
+      - chain_id
+      - backfill
+      properties:
+        device_id:
+          type:
+          - integer
+          - 'null'
+          format: int64
+          description: |-
+            Echo the question's `device`, `token`, `output` and `source_name`: they
+            identify the plays and decide which rule is written.
+        token_id:
+          type:
+          - integer
+          - 'null'
+          format: int64
+        output:
+          type:
+          - string
+          - 'null'
+        source_name:
+          type: string
+        since:
+          type: integer
+          format: int64
+          description: |-
+            The question's `since`, so "also file them" moves exactly the plays it
+            counted.
+        chain_id:
+          type: integer
+          format: int64
+          description: Where they should have gone. One of your chains.
+        chain_variant_id:
+          type:
+          - integer
+          - 'null'
+          format: int64
+          description: A setup of that chain; only remembered on an output rule.
+        backfill:
+          type: boolean
+          description: Also file the counted plays. **Required**, because it changes history.
     ApplyDurations:
       type: object
       description: The proposals exactly as the preview showed them.
@@ -13243,11 +13436,18 @@ components:
       type: object
       required:
       - bindings
+      - device_bindings
       properties:
         bindings:
           type: array
           items:
             $ref: '#/components/schemas/Binding'
+          description: 'Outputs by name, from anything not tied to a box: rung 3.'
+        device_bindings:
+          type: array
+          items:
+            $ref: '#/components/schemas/DeviceBindingRow'
+          description: 'Outputs learned per box, from devices and tokens tied to one: rung 2.'
     Bio:
       type: object
       description: |-
@@ -14438,6 +14638,56 @@ components:
         total_listens:
           type: integer
           format: int64
+        equipment_id:
+          type:
+          - integer
+          - 'null'
+          format: int64
+          description: The box this device is, when it has been tied to one (the inbox asks).
+    DeviceBindingRow:
+      type: object
+      description: An output seen from one box, and the chain it is mapped to.
+      required:
+      - id
+      - equipment_id
+      - equipment_name
+      - identifier
+      - last_seen
+      - hits
+      properties:
+        id:
+          type: integer
+          format: int64
+        equipment_id:
+          type: integer
+          format: int64
+          description: The box it was seen from.
+        equipment_name:
+          type: string
+        identifier:
+          type: string
+        interface:
+          type:
+          - string
+          - 'null'
+        chain_id:
+          type:
+          - integer
+          - 'null'
+          format: int64
+          description: Null when seen but not mapped yet.
+        chain_variant_id:
+          type:
+          - integer
+          - 'null'
+          format: int64
+          description: Which setup of that chain it carries; null is the chain as wired.
+        last_seen:
+          type: integer
+          format: int64
+        hits:
+          type: integer
+          format: int64
     DeviceList:
       type: object
       required:
@@ -14629,6 +14879,14 @@ components:
           type: array
           items:
             $ref: '#/components/schemas/DiscoverDeck'
+    DismissRequest:
+      type: object
+      required:
+      - key
+      properties:
+        key:
+          type: string
+          description: The question's `key`.
     Dossier:
       type: object
       required:
@@ -14784,8 +15042,8 @@ components:
           format: int64
           description: |-
             The setup (variant) of that chain the listen would be saved with. Set
-            only when `chain_source` is `output_binding` and that output was mapped
-            to a setup.
+            only when `chain_source` is `device_output` or `output_binding` and that
+            output was mapped to a setup.
         chain_name:
           type:
           - string
@@ -14793,12 +15051,14 @@ components:
         chain_source:
           type: string
           description: |-
-            **Which rung of the ladder won:** `explicit`, `output_binding`,
-            `token_default`, `device_default` or `none`. The single most useful
+            **Which rung of the ladder won:** `explicit`, `device_output` (an
+            output of the box this device or token is tied to), `output_binding`
+            (an output by name, from anything), `token_default`, `device_default`
+            or `none`. The single most useful
             field here: a chain arriving from the wrong rung looks identical to one
             arriving from the right one, so without this a misconfiguration is
             invisible until someone reads their history months later.
-          pattern: ^(explicit|output_binding|token_default|device_default|none)$
+          pattern: ^(explicit|device_output|output_binding|token_default|device_default|none)$
         device_id:
           type:
           - integer
@@ -15161,6 +15421,8 @@ components:
       - equipment_type
       - total_hours
       - sources
+      - aliases
+      - reporters
       properties:
         id:
           type: integer
@@ -15231,6 +15493,21 @@ components:
             Why this piece is not in a chain — `new`, `spare` or `lent`. Null is the
             usual state and means nothing has been said. Free text: the UI owns the
             vocabulary.
+        aliases:
+          type: array
+          items:
+            type: string
+          description: |-
+            Other names this box reports as (a phone's model number), remembered
+            from inbox answers or typed in. A reporter matching one is suggested as
+            this box, never tied to it without asking.
+        reporters:
+          type: array
+          items:
+            type: string
+          description: |-
+            The devices and tokens tied to this box, by name: the apps and players
+            that report plays from it.
     EquipmentList:
       type: object
       required:
@@ -16307,6 +16584,128 @@ components:
           type: integer
           format: int64
           description: Zero, rather than an error, when it cannot be read.
+    InboxList:
+      type: object
+      required:
+      - questions
+      - window_days
+      properties:
+        questions:
+          type: array
+          items:
+            $ref: '#/components/schemas/InboxQuestion'
+        window_days:
+          type: integer
+          format: int64
+          description: How far back the questions look, in days.
+    InboxQuestion:
+      type: object
+      description: One question in the inbox.
+      required:
+      - key
+      - kind
+      properties:
+        key:
+          type: string
+          description: Stable for as long as the question stands; what "not now" stores.
+        kind:
+          type: string
+          description: |-
+            `same_box` — are these reporters this box? `which_box` — which box is
+            this reporter? `where` — plays landed nowhere; where were you?
+        equipment_id:
+          type:
+          - integer
+          - 'null'
+          format: int64
+          description: '`same_box`: the box suggested, by a name or model it matches.'
+        equipment_name:
+          type:
+          - string
+          - 'null'
+        reporters:
+          type: array
+          items:
+            $ref: '#/components/schemas/InboxReporter'
+          description: |-
+            `same_box`: every reporter not yet tied to a box that matches it.
+            `which_box`: the one reporter asked about.
+        plays:
+          type:
+          - integer
+          - 'null'
+          format: int64
+          description: '`where`: how many unfiled plays, and over what span.'
+        first:
+          type:
+          - integer
+          - 'null'
+          format: int64
+        last:
+          type:
+          - integer
+          - 'null'
+          format: int64
+        since:
+          type:
+          - integer
+          - 'null'
+          format: int64
+          description: |-
+            `where`: the start of the window counted. Send it back with the answer
+            so "also file them" moves exactly the plays that were counted.
+        device:
+          oneOf:
+          - type: 'null'
+          - $ref: '#/components/schemas/InboxReporter'
+            description: '`where`: what the plays came through.'
+        token:
+          oneOf:
+          - type: 'null'
+          - $ref: '#/components/schemas/InboxReporter'
+        output:
+          type:
+          - string
+          - 'null'
+        source_name:
+          type:
+          - string
+          - 'null'
+        rule:
+          type:
+          - string
+          - 'null'
+          description: |-
+            `where`: what an answer will set so future plays find the chain:
+            `device_output` (an output of a box), `output` (an output name from
+            anything), `token`, `device`, or `none` when nothing identifies the
+            source and only the counted plays can be filed.
+    InboxReporter:
+      type: object
+      description: One device or token, as the inbox names it.
+      required:
+      - kind
+      - id
+      - name
+      - sub
+      properties:
+        kind:
+          type: string
+          description: '`device` or `token`.'
+        id:
+          type: integer
+          format: int64
+        name:
+          type: string
+        sub:
+          type: string
+          description: 'What it is: the platform for a device, "a token" for a token.'
+        equipment_id:
+          type:
+          - integer
+          - 'null'
+          format: int64
+          description: The box it is already tied to, if any.
     InstancePulse:
       type: object
       description: What the instance has been playing, over shared chains only.
@@ -23119,6 +23518,15 @@ components:
           description: |-
             Which setup (variant) of that chain this output carries. Absent or
             `null` is the chain as wired. Must be a variant of `chain_id`.
+        equipment_id:
+          type:
+          - integer
+          - 'null'
+          format: int64
+          description: |-
+            The box this output belongs to, for an output learned per box (see
+            `device_bindings` in the list). Absent maps the output by name, from
+            anything — the rung below.
     SetChainRoomsRequest:
       type: object
       required:
@@ -26179,6 +26587,12 @@ components:
           - string
           - 'null'
           description: The default chain's name.
+        equipment_id:
+          type:
+          - integer
+          - 'null'
+          format: int64
+          description: The box this token's app runs on, when it has been tied to one.
     TokenValidation:
       type: object
       description: ListenBrainz's answer, plus what this token may do when it is valid.
@@ -26720,6 +27134,16 @@ components:
           - string
           - 'null'
           description: 'Why it is not in a chain: `new`, `spare`, `lent`. Absent clears it.'
+        aliases:
+          type:
+          - array
+          - 'null'
+          items:
+            type: string
+          description: |-
+            Other names this box reports as. **The one field absent leaves alone**
+            rather than clearing: gear editors that predate it send the record
+            without it, and must not wipe what the inbox remembered.
     UpdateProfileRequest:
       type: object
       description: |-
@@ -27108,6 +27532,21 @@ components:
           type: string
         frozen:
           type: boolean
+    WhereAnswered:
+      type: object
+      description: What a `where` answer did.
+      required:
+      - rule
+      - moved
+      properties:
+        rule:
+          type: string
+          description: The rule written, as in `InboxQuestion.rule`.
+        moved:
+          type: integer
+          format: int64
+          description: How many counted plays were filed. Zero unless asked.
+          minimum: 0
     Word:
       type: object
       description: 'A word: parts written together, words separated by a space.'

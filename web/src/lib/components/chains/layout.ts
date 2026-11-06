@@ -184,8 +184,13 @@ export function buildLayout(
 				n = {
 					key,
 					name: g?.name ?? s.name,
+					// A box its apps are tied to says who reports from it (the
+					// design's reporter chips), which is the question the graph
+					// answers about a phone or a laptop; otherwise brand and model.
 					sub: g
-						? [g.brand, g.model].filter(Boolean).join(' ') || (TYPE_LABEL[s.type] ?? s.type)
+						? g.reporters?.length
+							? g.reporters.join(' · ')
+							: [g.brand, g.model].filter(Boolean).join(' ') || (TYPE_LABEL[s.type] ?? s.type)
 						: (TYPE_LABEL[s.type] ?? s.type),
 					hours: g ? g.total_hours : null,
 					column: effCol,

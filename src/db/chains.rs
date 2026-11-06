@@ -338,7 +338,13 @@ impl Database {
 
         // Anything pointing at a *variant* of this chain has to let go before
         // the variants themselves can be deleted.
-        for table in ["scrobbles", "physical_plays", "physical_releases", "chain_bindings"] {
+        for table in [
+            "scrobbles",
+            "physical_plays",
+            "physical_releases",
+            "chain_bindings",
+            "device_bindings",
+        ] {
             sqlx::query(&crate::sql!(&format!(
                 "UPDATE {table} SET chain_variant_id = NULL
                   WHERE chain_variant_id IN
@@ -360,6 +366,7 @@ impl Database {
             ("sessions", "chain_id"),
             ("devices", "default_chain_id"),
             ("chain_bindings", "chain_id"),
+            ("device_bindings", "chain_id"),
             ("tokens", "default_chain_id"),
             ("physical_plays", "chain_id"),
             ("physical_releases", "chain_id"),

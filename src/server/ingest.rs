@@ -577,20 +577,28 @@ pub async fn submit_listens(
         let output_iface = info_ref
             .and_then(|ai| ai.tapedeck_device.as_ref())
             .and_then(|td| td.interface.as_ref().or(td.output_type.as_ref()));
+        // The box behind the reporter, when the device or token has been tied
+        // to one: its outputs are learned and resolved per box, so two phones
+        // that both say "Phone speaker" are two outputs, not one.
+        let source_box =
+            state.db.source_equipment(user.user_id, device_id, token_id).await.ok().flatten();
         if let Some(dev) = output_dev {
             if !dry_run {
-                let _ = state
-                    .db
-                    .record_output(user.user_id, dev, output_iface.map(|s| s.as_str()))
-                    .await;
+                let iface = output_iface.map(|s| s.as_str());
+                let _ = match source_box {
+                    Some(eq) => state.db.record_device_output(user.user_id, eq, dev, iface).await,
+                    None => state.db.record_output(user.user_id, dev, iface).await,
+                };
             }
         }
 
         // ── Resolve chain (layered, first match wins) ──
         //   1. explicit chain name from the client
-        //   2. output-device binding (auto-learned / user-set)
-        //   3. the submitting token's default chain
-        //   4. source device's default chain
+        //   2. an output of the reporter's box (when it is tied to one)
+        //   3. an output by name, from anything (the bindings before boxes)
+        //   4. the submitting token's default chain
+        //   5. source device's default chain
+        //   none: stored with no chain, and asked about in the inbox
         //
         // The token layer sits below the binding because a binding is evidence
         // about *this* listen (what it actually came out of) while the token is
@@ -622,6 +630,13 @@ pub async fn submit_listens(
                         (None, None, "none")
                     }
                 }
+            } else if let Some((bound, variant)) = match (source_box, output_dev) {
+                (Some(eq), Some(dev)) => {
+                    state.db.resolve_device_binding(user.user_id, eq, dev).await.ok().flatten()
+                }
+                _ => None,
+            } {
+                (Some(bound), variant, "device_output")
             } else if let Some((bound, variant)) = match output_dev {
                 Some(dev) => state.db.resolve_binding(user.user_id, dev).await.ok().flatten(),
                 None => None,
@@ -821,6 +836,29 @@ pub async fn submit_listens(
                                 &play.title,
                                 &play.artist,
                             );
+                        }
+
+                        // Where it came from, so a listen that found no chain can
+                        // be asked about from the inbox, grouped with others from
+                        // the same token, output and device. A note about the
+                        // listen like the one below: losing it must not fail the
+                        // submission.
+                        let origin = crate::db::ListenOrigin {
+                            token_id,
+                            output: output_dev.map(|s| s.as_str()),
+                            chain_source,
+                        };
+                        if let Err(e) = state
+                            .db
+                            .set_listen_origin(
+                                user.user_id,
+                                &play.source_id,
+                                &play.source_name,
+                                &origin,
+                            )
+                            .await
+                        {
+                            debug!("Could not record where a listen came from: {}", e);
                         }
 
                         // What the client saw of the playing itself. Written

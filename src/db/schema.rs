@@ -318,6 +318,8 @@ impl Database {
                 last_used_at INTEGER,
                 expires_at INTEGER,
                 default_chain_id INTEGER REFERENCES signal_chains(id),
+                -- The box this token's app runs on; see `devices.equipment_id`.
+                equipment_id INTEGER,
                 -- Whether this client's import-type submissions are
                 -- live listens rather than a backfill. Off by default and never
                 -- inferred: turning it on lets a client write to the owner's
@@ -339,6 +341,12 @@ impl Database {
                 machine_id TEXT NOT NULL, name TEXT, platform TEXT,
                 product TEXT, device_type TEXT,
                 default_chain_id INTEGER REFERENCES signal_chains(id),
+                -- The physical box this reporter is (a phone, a laptop). Several
+                -- devices and tokens can be one box: the app, the browser and the
+                -- model number a phone reports as. No REFERENCES, because
+                -- `equipment` is created after this table; `delete_equipment`
+                -- clears it. `migrate()` adds it.
+                equipment_id INTEGER,
                 first_seen INTEGER NOT NULL, last_seen INTEGER NOT NULL,
                 total_listens INTEGER DEFAULT 0,
                 UNIQUE(user_id, machine_id)
@@ -367,6 +375,11 @@ impl Database {
                 -- constraint here would mean a rebuild to add a word. NULL is
                 -- the usual state and means nothing has been said.
                 status TEXT,
+                -- Other names this box reports as, a JSON array of strings: a
+                -- phone's model number (XQ-DQ54), an app's own name for it. Filled
+                -- by answering the inbox, never guessed; a reporter matching one is
+                -- *suggested* as this box and still asked about.
+                aliases TEXT,
                 UNIQUE(user_id, name)
             )",
         )
@@ -483,6 +496,17 @@ impl Database {
                 is_transcoded BOOLEAN, transcode_reason TEXT, quality_score REAL,
                 device_id INTEGER REFERENCES devices(id),
                 chain_id INTEGER REFERENCES signal_chains(id),
+                -- Where the listen came from, recorded at ingest so a play that
+                -- landed in no chain can be asked about later (the Signal Chains
+                -- inbox): the token that sent it, the output the client named, and
+                -- which rung of the ladder decided its chain. NULL on listens older
+                -- than v0.129.0 and on sources that report none of it. `token_id`
+                -- has no REFERENCES on purpose: a deleted token's id stays, so the
+                -- inbox can still group the plays it sent (a token you deleted)
+                -- and deleting one never rewrites history. `migrate()` adds all three.
+                token_id INTEGER,
+                output_identifier TEXT,
+                chain_source TEXT,
                 session_id INTEGER REFERENCES sessions(id),
                 listening_context TEXT, submission_client TEXT,
                 delivered_sinks TEXT NOT NULL DEFAULT '[]',
@@ -802,6 +826,43 @@ impl Database {
                 last_seen INTEGER NOT NULL,
                 hits INTEGER NOT NULL DEFAULT 0,
                 UNIQUE(user_id, identifier)
+            )",
+        )
+        .await?;
+
+        // ── Outputs per box ──
+        // `chain_bindings` is one row per output *name*, so "Phone speaker"
+        // from two phones could only ever point at one chain. A box that its
+        // reporters have been tied to records its outputs here instead, keyed
+        // by the box; `chain_bindings` stays as the rung for outputs from
+        // anything not tied to a box. Same columns, so every statement that
+        // moves `chain_bindings` rows can move these with it.
+        self.ddl(
+            "CREATE TABLE IF NOT EXISTS device_bindings (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL REFERENCES users(id),
+                equipment_id INTEGER NOT NULL REFERENCES equipment(id),
+                identifier TEXT NOT NULL,
+                interface TEXT,
+                chain_id INTEGER REFERENCES signal_chains(id),
+                chain_variant_id INTEGER REFERENCES chain_variants(id),
+                last_seen INTEGER NOT NULL,
+                hits INTEGER NOT NULL DEFAULT 0,
+                UNIQUE(user_id, equipment_id, identifier)
+            )",
+        )
+        .await?;
+
+        // ── The Signal Chains inbox: questions put off ──
+        // The questions are computed on read from the listens; only "not now"
+        // is stored, as the question's key and when to ask again.
+        self.ddl(
+            "CREATE TABLE IF NOT EXISTS chain_inbox_dismissed (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL REFERENCES users(id),
+                key TEXT NOT NULL,
+                until INTEGER NOT NULL,
+                UNIQUE(user_id, key)
             )",
         )
         .await?;

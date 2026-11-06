@@ -12225,3 +12225,278 @@ async fn a_new_room_lands_before_the_built_ins() {
     db.create_room(uid, "Garden", None).await.unwrap().unwrap();
     assert_eq!(names(db.list_rooms(uid).await.unwrap()), ["Study", "Garden", "On the go"]);
 }
+
+// ── Phase 2: where listens come from, boxes, the inbox ──
+
+/// A listen saved with no chain, from a device and/or token and/or output, the
+/// way ingest records it.
+async fn unfiled(
+    db: &Database,
+    uid: i64,
+    ts: i64,
+    device: Option<i64>,
+    token: Option<i64>,
+    output: Option<&str>,
+    source: &str,
+    skipped: bool,
+) {
+    let p = Play::new(format!("T{ts}"), "A".into(), ts as u64, format!("u-{ts}"), source.into());
+    db.save_scrobble(
+        uid,
+        &p,
+        None,
+        device,
+        None,
+        None,
+        None,
+        None,
+        None,
+        ListenDisposition { imported: false, skipped },
+    )
+    .await
+    .unwrap();
+    db.set_listen_origin(
+        uid,
+        &p.source_id,
+        source,
+        &ListenOrigin { token_id: token, output, chain_source: "none" },
+    )
+    .await
+    .unwrap();
+}
+
+async fn token_id_named(db: &Database, uid: i64, name: &str) -> i64 {
+    db.create_token(uid, name, "submit", None, false).await.unwrap();
+    sqlx::query_scalar("SELECT id FROM tokens WHERE user_id = ? AND name = ?")
+        .bind(uid)
+        .bind(name)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap()
+}
+
+/// Two phones both report "Phone speaker". Once their reporters are tied to
+/// boxes, each box's output is its own and outranks the old by-name mapping.
+#[tokio::test]
+async fn an_output_learned_per_box_outranks_the_same_name_from_anything() {
+    let db = testdb().await;
+    let uid = db.create_user("ash", None, "pw", "user").await.unwrap();
+    let xperia = db.upsert_equipment(uid, "Xperia", "phone", None, None, 0.0, None).await.unwrap();
+    let pixel = db.upsert_equipment(uid, "Pixel", "phone", None, None, 0.0, None).await.unwrap();
+    let commute = chain_of(&db, uid, "Commute", &[]).await;
+    let kitchen = chain_of(&db, uid, "Kitchen", &[]).await;
+
+    // The old world: one row per name, so both phones share it.
+    db.record_output(uid, "Phone speaker", None).await.unwrap();
+    db.set_binding(uid, "Phone speaker", Some(kitchen), None).await.unwrap();
+
+    let dev = db.upsert_device(uid, "m-x", Some("TIDAL on XQ-DQ54"), None, None).await.unwrap();
+    assert_eq!(db.source_equipment(uid, Some(dev), None).await.unwrap(), None);
+    db.tie_reporters(uid, Some(xperia), &[dev], &[]).await.unwrap();
+    assert_eq!(db.source_equipment(uid, Some(dev), None).await.unwrap(), Some(xperia));
+
+    db.record_device_output(uid, xperia, "Phone speaker", Some("speaker")).await.unwrap();
+    assert_eq!(
+        db.resolve_device_binding(uid, xperia, "Phone speaker").await.unwrap(),
+        None,
+        "seen, not mapped"
+    );
+    db.set_device_binding(uid, xperia, "Phone speaker", Some(commute), None).await.unwrap();
+    assert_eq!(
+        db.resolve_device_binding(uid, xperia, "Phone speaker").await.unwrap(),
+        Some((commute, None))
+    );
+    assert_eq!(
+        db.resolve_device_binding(uid, pixel, "Phone speaker").await.unwrap(),
+        None,
+        "the other phone's is its own"
+    );
+    assert_eq!(
+        db.resolve_binding(uid, "Phone speaker").await.unwrap(),
+        Some((kitchen, None)),
+        "the old rung still answers"
+    );
+
+    // Deleting the chain lets go of the box's output; deleting the box takes
+    // its outputs and frees its reporters.
+    assert!(db.delete_chain(uid, commute).await.unwrap());
+    assert_eq!(db.resolve_device_binding(uid, xperia, "Phone speaker").await.unwrap(), None);
+    assert!(db.delete_equipment(uid, xperia).await.unwrap());
+    assert!(db.list_device_bindings(uid).await.unwrap().is_empty());
+    assert_eq!(db.source_equipment(uid, Some(dev), None).await.unwrap(), None);
+}
+
+/// The inbox asks only about unfiled, unskipped plays from the last 30 days,
+/// suggests a box only by a name it carries, and asks which box when nothing
+/// matches. "Not now" hides a question.
+#[tokio::test]
+async fn the_inbox_asks_about_unfiled_plays_and_suggests_boxes_by_name() {
+    let db = testdb().await;
+    let uid = db.create_user("ash", None, "pw", "user").await.unwrap();
+    let now = Database::now_secs();
+    let xperia = db
+        .upsert_equipment(uid, "Xperia 1 V", "phone", Some("Sony"), Some("XQ-DQ54"), 0.0, None)
+        .await
+        .unwrap();
+    let tidal = db
+        .upsert_device(uid, "m-t", Some("TIDAL on XQ-DQ54"), Some("Android"), None)
+        .await
+        .unwrap();
+    let navi = db.upsert_device(uid, "m-n", Some("NavidromeUI"), Some("Web"), None).await.unwrap();
+    let tok = token_id_named(&db, uid, "xperia 1 v").await;
+
+    unfiled(&db, uid, now - 3600, Some(tidal), None, Some("Bluetooth"), "ingest", false).await;
+    unfiled(&db, uid, now - 3500, Some(tidal), None, Some("Bluetooth"), "ingest", false).await;
+    unfiled(&db, uid, now - 3400, Some(navi), None, None, "ingest", false).await;
+    unfiled(&db, uid, now - 3300, Some(navi), None, None, "ingest", true).await; // a skip: never asked
+    unfiled(&db, uid, now - 40 * 86_400, Some(navi), None, None, "ingest", false).await; // too old
+    unfiled(&db, uid, now - 3200, None, None, None, "Navidrome", false).await;
+
+    let qs = db.chain_inbox(uid).await.unwrap();
+    let kinds: Vec<&str> = qs.iter().map(|q| q.kind).collect();
+    assert_eq!(
+        kinds,
+        ["same_box", "which_box", "where", "where", "where"],
+        "boxes first: {kinds:?}"
+    );
+
+    let same = &qs[0];
+    assert_eq!(same.equipment_id, Some(xperia));
+    let named: Vec<&str> = same.reporters.iter().map(|r| r.name.as_str()).collect();
+    assert!(
+        named.contains(&"TIDAL on XQ-DQ54") && named.contains(&"xperia 1 v"),
+        "the model number and the name both match: {named:?}"
+    );
+    assert!(!named.contains(&"NavidromeUI"));
+    assert_eq!(qs[1].reporters[0].name, "NavidromeUI", "nothing matches, so it asks which box");
+
+    let tidal_q = qs.iter().find(|q| q.device.as_ref().is_some_and(|d| d.id == tidal)).unwrap();
+    assert_eq!((tidal_q.plays, tidal_q.rule), (Some(2), Some("output")));
+    let navi_q = qs.iter().find(|q| q.device.as_ref().is_some_and(|d| d.id == navi)).unwrap();
+    assert_eq!(
+        (navi_q.plays, navi_q.rule),
+        (Some(1), Some("device")),
+        "the skip and the old play are not counted"
+    );
+    let bare = qs.iter().find(|q| q.source_name.as_deref() == Some("Navidrome")).unwrap();
+    assert_eq!(bare.rule, Some("none"), "nothing identifies it, so nothing can be remembered");
+
+    // Tie the phone's reporters; its question goes and its output rule becomes
+    // the box's own.
+    db.tie_reporters(uid, Some(xperia), &[tidal], &[tok]).await.unwrap();
+    db.dismiss_inbox(uid, &qs[1].key).await.unwrap();
+    let qs = db.chain_inbox(uid).await.unwrap();
+    assert!(qs.iter().all(|q| q.kind == "where"), "both box questions answered or put off");
+    let tidal_q = qs.iter().find(|q| q.device.as_ref().is_some_and(|d| d.id == tidal)).unwrap();
+    assert_eq!(tidal_q.rule, Some("device_output"));
+    let _ = tok;
+}
+
+/// Answering "where were you?" writes the rule future plays follow and files
+/// exactly the plays it counted: not the skip, not the one from before the
+/// window, not one from another output.
+#[tokio::test]
+async fn answering_where_files_exactly_what_was_counted() {
+    let db = testdb().await;
+    let uid = db.create_user("ash", None, "pw", "user").await.unwrap();
+    let now = Database::now_secs();
+    let phone = db.upsert_equipment(uid, "Xperia", "phone", None, None, 0.0, None).await.unwrap();
+    let dev = db.upsert_device(uid, "m-x", Some("Phone"), None, None).await.unwrap();
+    db.tie_reporters(uid, Some(phone), &[dev], &[]).await.unwrap();
+    let commute = chain_of(&db, uid, "Commute", &[]).await;
+
+    unfiled(&db, uid, now - 100, Some(dev), None, Some("Bluetooth"), "ingest", false).await;
+    unfiled(&db, uid, now - 90, Some(dev), None, Some("Bluetooth"), "ingest", false).await;
+    unfiled(&db, uid, now - 80, Some(dev), None, Some("Bluetooth"), "ingest", true).await;
+    unfiled(&db, uid, now - 70, Some(dev), None, Some("Jack"), "ingest", false).await;
+    unfiled(&db, uid, now - 40 * 86_400, Some(dev), None, Some("Bluetooth"), "ingest", false).await;
+
+    let q = db
+        .chain_inbox(uid)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|q| q.output.as_deref() == Some("Bluetooth"))
+        .unwrap();
+    assert_eq!(q.plays, Some(2));
+    let done = db
+        .answer_where(
+            uid,
+            Some(dev),
+            None,
+            Some("Bluetooth"),
+            "ingest",
+            q.since.unwrap(),
+            commute,
+            None,
+            true,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        (done.rule, done.moved),
+        ("device_output", 2),
+        "the number on the button is the number that moves"
+    );
+    assert_eq!(
+        db.resolve_device_binding(uid, phone, "Bluetooth").await.unwrap(),
+        Some((commute, None))
+    );
+
+    let filed: Vec<(i64, Option<i64>)> = sqlx::query_as(
+        "SELECT timestamp, chain_id FROM scrobbles WHERE user_id = ? ORDER BY timestamp",
+    )
+    .bind(uid)
+    .fetch_all(&db.pool)
+    .await
+    .unwrap();
+    let chain_at = |ts: i64| filed.iter().find(|(t, _)| *t == ts).unwrap().1;
+    assert_eq!(chain_at(now - 100), Some(commute));
+    assert_eq!(chain_at(now - 90), Some(commute));
+    assert_eq!(chain_at(now - 80), None, "a skip is not filed");
+    assert_eq!(chain_at(now - 70), None, "another output is another question");
+    assert_eq!(chain_at(now - 40 * 86_400), None, "older than what was counted");
+
+    // A token rung, without backfill: the rule only.
+    let tok = token_id_named(&db, uid, "laptop").await;
+    let done = db
+        .answer_where(uid, None, Some(tok), None, "ingest", now - 86_400, commute, None, false)
+        .await
+        .unwrap();
+    assert_eq!((done.rule, done.moved), ("token", 0));
+    let default: Option<i64> =
+        sqlx::query_scalar("SELECT default_chain_id FROM tokens WHERE id = ?")
+            .bind(tok)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(default, Some(commute));
+}
+
+/// An alias is remembered once, ignoring case and punctuation, and a reporter
+/// carrying it is suggested as that box.
+#[tokio::test]
+async fn an_alias_is_remembered_once_and_suggests_the_box() {
+    let db = testdb().await;
+    let uid = db.create_user("ash", None, "pw", "user").await.unwrap();
+    let now = Database::now_secs();
+    let phone = db.upsert_equipment(uid, "Phone", "phone", None, None, 0.0, None).await.unwrap();
+    db.add_alias(uid, phone, "XQ-DQ54").await.unwrap();
+    db.add_alias(uid, phone, "xq dq54").await.unwrap();
+    db.add_alias(uid, phone, "   ").await.unwrap();
+    let gear = db.get_equipment(uid).await.unwrap();
+    assert_eq!(gear.iter().find(|g| g.id == phone).unwrap().aliases, vec!["XQ-DQ54".to_string()]);
+
+    let chrome = db.upsert_device(uid, "m-c", Some("Chrome on xq-dq54"), None, None).await.unwrap();
+    unfiled(&db, uid, now - 60, Some(chrome), None, None, "ingest", false).await;
+    let qs = db.chain_inbox(uid).await.unwrap();
+    assert_eq!(qs[0].kind, "same_box");
+    assert_eq!(qs[0].equipment_id, Some(phone));
+
+    db.tie_reporters(uid, Some(phone), &[chrome], &[]).await.unwrap();
+    let gear = db.get_equipment(uid).await.unwrap();
+    assert_eq!(
+        gear.iter().find(|g| g.id == phone).unwrap().reporters,
+        vec!["Chrome on xq-dq54".to_string()]
+    );
+}

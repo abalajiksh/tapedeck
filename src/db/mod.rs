@@ -3281,6 +3281,9 @@ pub struct TokenRecord {
     /// The default chain's name.
     // Joined for display so the token list doesn't need a second round-trip.
     pub default_chain_name: Option<String>,
+    /// The box this token's app runs on, when it has been tied to one.
+    #[sqlx(default)]
+    pub equipment_id: Option<i64>,
 }
 
 /// How big a history is and how much of it is actually populated.
@@ -3675,6 +3678,9 @@ pub struct DeviceRow {
     pub first_seen: i64,
     pub last_seen: i64,
     pub total_listens: i64,
+    /// The box this device is, when it has been tied to one (the inbox asks).
+    #[sqlx(default)]
+    pub equipment_id: Option<i64>,
 }
 
 /// Where one piece of gear's hours came from.
@@ -3763,6 +3769,19 @@ pub struct EquipmentRow {
     /// usual state and means nothing has been said. Free text: the UI owns the
     /// vocabulary.
     pub status: Option<String>,
+    /// Other names this box reports as (a phone's model number), remembered
+    /// from inbox answers or typed in. A reporter matching one is suggested as
+    /// this box, never tied to it without asking.
+    #[sqlx(skip)]
+    pub aliases: Vec<String>,
+    #[sqlx(rename = "aliases", default)]
+    #[serde(skip)]
+    #[schema(ignore)]
+    pub aliases_raw: Option<String>,
+    /// The devices and tokens tied to this box, by name: the apps and players
+    /// that report plays from it.
+    #[sqlx(skip)]
+    pub reporters: Vec<String>,
 }
 
 mod auth;
@@ -3794,6 +3813,11 @@ mod rediscovery;
 pub use ratings::{IncomingRating, LibraryRatingRow, RatingApply, RatingSourceSummary};
 mod relayed;
 pub use relayed::{RelayedApplied, RelayedPreview};
+mod inbox;
+pub use inbox::{
+    parse_aliases, DeviceBindingRow, InboxQuestion, InboxReporter, ListenOrigin, WhereAnswered,
+    INBOX_WINDOW_SECS,
+};
 mod rooms;
 mod sanitise;
 pub use rooms::{Room, RoomRefusal};

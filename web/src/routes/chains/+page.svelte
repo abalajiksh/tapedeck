@@ -1,7 +1,7 @@
 <script lang="ts">
 	import { onMount, tick } from 'svelte';
 	import { api } from '$lib/api';
-	import type { Room, SignalChain, Equipment, ChainComponent, ChainInput, EquipmentInput, Binding, Device, ChainVariant, FoldSuggestion } from '$lib/api';
+	import type { DeviceBinding, InboxQuestion, Room, SignalChain, Equipment, ChainComponent, ChainInput, EquipmentInput, Binding, Device, ChainVariant, FoldSuggestion } from '$lib/api';
 	import { formatHours, timeAgo, toDateInput, fromDateInput, ownedFor, formatDateTime } from '$lib/utils';
 	import ChainIcon, { CHAIN_ICONS, CHAIN_ICON_LABELS } from '$lib/components/ChainIcon.svelte';
 	import ChainGraph from '$lib/components/chains/ChainGraph.svelte';
@@ -10,6 +10,7 @@
 	import ShelfLine from '$lib/components/chains/ShelfLine.svelte';
 	import RoomChips from '$lib/components/chains/RoomChips.svelte';
 	import RoomSuggest from '$lib/components/chains/RoomSuggest.svelte';
+	import InboxCard from '$lib/components/chains/InboxCard.svelte';
 	import { gearInUse } from '$lib/components/chains/layout';
 	import { lastUsedPhrase } from '$lib/components/chains/format';
 	import { syncUrl } from '$lib/url';
@@ -18,6 +19,8 @@
 	let variants: ChainVariant[] = [];
 	let equipment: Equipment[] = [];
 	let bindings: Binding[] = [];
+	/** Outputs learned per box, from reporters tied to a piece of gear. */
+	let deviceBindings: DeviceBinding[] = [];
 	let devices: Device[] = [];
 	let loading = true;
 	let error = '';
@@ -145,6 +148,25 @@
 	// (`?room=`) so a room view can be bookmarked; it never re-lays the graph
 	// out. Rooms do not touch attribution, so a failure to load them leaves the
 	// page working without them rather than showing an error.
+	// ── The inbox ──
+	// Questions about plays that landed in no chain. The first one sits at the
+	// top of the page; the rest are a click away. Like rooms, a failure to load
+	// it leaves the page working rather than showing an error.
+	let inbox: InboxQuestion[] = [];
+	let inboxDone = '';
+	async function loadInbox() {
+		try {
+			inbox = (await api.getChainInbox()).questions;
+		} catch {
+			inbox = [];
+		}
+	}
+	async function inboxAnswered(text: string) {
+		inboxDone = text;
+		await Promise.all([load(), loadInbox()]);
+		setTimeout(() => (inboxDone = ''), 6000);
+	}
+
 	let rooms: Room[] = [];
 	let roomFilter: number | null = null;
 	let movingRooms = false;
@@ -675,6 +697,8 @@
 	 *  when Tapedeck first saw it — most gear is owned well before it is
 	 *  catalogued, and burn-in hours are counted from the purchase. */
 	let gBought = '';
+	/** Other names this box reports as, comma-separated in the dialog. */
+	let gAliases = '';
 	let savingGear = false;
 	let confirmGear: Equipment | null = null;
 	// Set when the gear dialog was opened from inside a chain component row, so
@@ -693,6 +717,7 @@
 			dupes = dup.duplicates;
 			equipment = g.equipment;
 			bindings = b.bindings;
+			deviceBindings = b.device_bindings ?? [];
 			devices = d.devices;
 		} catch (e) {
 			error = e instanceof Error ? e.message : 'Failed to load data';
@@ -789,6 +814,35 @@
 
 	function closeChainEditor() { chainOpen = false; bindFor = null; }
 	function closeSetupEditor() { vOpen = false; bindFor = null; }
+	// ── Outputs of one box ──
+	// The same chain-or-setup values as the picker for outputs by name, and
+	// the same rule that the setup always travels with its chain.
+	const deviceBindingValue = (b: DeviceBinding) =>
+		b.chain_id == null ? '' : b.chain_variant_id != null ? `v:${b.chain_variant_id}` : `c:${b.chain_id}`;
+	async function assignDeviceBinding(b: DeviceBinding, value: string) {
+		let cid: number | null = null;
+		let vid: number | null = null;
+		if (value.startsWith('c:')) cid = Number(value.slice(2));
+		if (value.startsWith('v:')) {
+			const v = variants.find((x) => x.id === Number(value.slice(2)));
+			if (!v) return;
+			cid = v.chain_id;
+			vid = v.id;
+		}
+		try {
+			await api.setBinding(b.identifier, cid, vid, b.equipment_id);
+			deviceBindings = (await api.getBindings()).device_bindings ?? [];
+		} catch (e) {
+			alert(e instanceof Error ? e.message : 'Could not save that output');
+		}
+	}
+	async function removeDeviceBinding(b: DeviceBinding) {
+		if (!confirm(`Forget “${b.identifier}” on ${b.equipment_name}? It is learned again the next time it plays.`)) return;
+		await api.deleteDeviceBinding(b.id);
+		deviceBindings = deviceBindings.filter((x) => x.id !== b.id);
+	}
+	$: deviceBoxes = [...new Set(deviceBindings.map((b) => b.equipment_name))];
+
 	async function removeBinding(b: Binding) {
 		try { await api.deleteBinding(b.id); bindings = bindings.filter((x) => x.id !== b.id); } catch (e) { alert('Delete failed: ' + e); }
 	}
@@ -947,7 +1001,7 @@
 
 	// ── equipment editor ──
 	function newGear() {
-		gearId = null; gName = ''; gType = 'headphones'; gBrand = ''; gModel = ''; gNotes = '';
+		gearId = null; gName = ''; gType = 'headphones'; gBrand = ''; gModel = ''; gNotes = ''; gAliases = '';
 		gBought = ''; gStatus = null;
 		gearOpen = true;
 	}
@@ -959,6 +1013,7 @@
 		gNotes = e.notes ?? '';
 		gStatus = e.status ?? null;
 		gBought = toDateInput(e.purchased_at);
+		gAliases = (e.aliases ?? []).join(', ');
 		gearOpen = true;
 	}
 	function closeGear() { gearOpen = false; gearForComp = null; }
@@ -979,7 +1034,11 @@
 			// editing a brand doesn't clear the tag.
 			const result = gearId == null
 				? await api.createEquipment(data)
-				: await api.updateEquipment(gearId, { ...data, status: gStatus });
+				: await api.updateEquipment(gearId, {
+						...data,
+						status: gStatus,
+						aliases: gAliases.split(',').map((a) => a.trim()).filter(Boolean)
+					});
 			// Refresh gear without reloading chains — the chain editor may be open
 			// behind this dialog with unsaved edits in it.
 			equipment = (await api.getEquipment()).equipment;
@@ -1075,6 +1134,7 @@
 		const inRoom = Number(q.get('room'));
 		if (inRoom) roomFilter = inRoom;
 		void loadRooms();
+		void loadInbox();
 		await load();
 		// Failing to read it leaves the picker on "No chain", which is the
 		// default and therefore honest — never an error banner over a
@@ -1221,6 +1281,16 @@
 	     the graph is a picture of the same thing with every piece of gear drawn
 	     once, the chosen chain's route lit. The drawer opens from the bar under
 	     the graph, so scanning never pops a panel over what you were reading. -->
+	{#if inboxDone}<div class="inbox-done">✓ {inboxDone}</div>{/if}
+	{#if inbox.length}
+		<div class="inbox-top">
+			{#key inbox[0].key}
+				<InboxCard q={inbox[0]} {chains} {equipment} position="1 of {inbox.length}"
+					on:done={(e) => inboxAnswered(e.detail)} />
+			{/key}
+			{#if inbox.length > 1}<a class="btn btn-ghost inbox-all" href="/chains/inbox">See all {inbox.length} →</a>{/if}
+		</div>
+	{/if}
 	{#if chainRows.length}
 		<RoomSuggest chains={chainRows} {equipment} {rooms} on:done={loadRooms} />
 		<RoomChips {rooms} chainCount={chains.length} roomId={roomFilter} on:pick={(e) => pickRoom(e.detail)} />
@@ -1271,7 +1341,7 @@
 	<div class="sechead">
 		<div class="seg">
 			<button class="seg-btn" class:on={secTab === 'equipment'} on:click={() => (secTab = 'equipment')}>Equipment · {equipment.length}</button>
-			<button class="seg-btn" class:on={secTab === 'outputs'} on:click={() => (secTab = 'outputs')}>Outputs · {bindings.length}</button>
+			<button class="seg-btn" class:on={secTab === 'outputs'} on:click={() => (secTab = 'outputs')}>Outputs · {bindings.length + deviceBindings.length}</button>
 			<button class="seg-btn" class:on={secTab === 'machines'} on:click={() => (secTab = 'machines')}>Machines · {devices.length}</button>
 		</div>
 		{#if secTab === 'equipment'}
@@ -1441,6 +1511,48 @@
 			through it lands there. It is the most specific rule, so it wins over an app token and the
 			machine. Listens already logged stay as they are; retag those from History.
 		</p>
+		{#if deviceBindings.length}
+			<!-- Outputs learned from one box, once its apps are tied to it from
+			     the inbox. They outrank an output of the same name below. -->
+			{#each deviceBoxes as boxName (boxName)}
+				<div class="secsub">Outputs of {boxName}</div>
+				<div class="panel" style="border-radius:20px;padding:8px;margin-bottom:12px;">
+					{#each deviceBindings.filter((x) => x.equipment_name === boxName) as b (b.id)}
+						<div class="drow">
+							<div class="dicon">
+								<svg viewBox="0 0 24 24" width="19" fill="none" stroke="currentColor" stroke-width="2.3" stroke-linecap="round" stroke-linejoin="round"><path d="M11 5L6 9H2v6h4l5 4V5z"/><path d="M15.5 8.5a5 5 0 0 1 0 7M19 5a9 9 0 0 1 0 14"/></svg>
+							</div>
+							<div style="flex:1;min-width:160px;">
+								<div style="font-weight:600;font-size:14.5px;display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
+									{b.identifier}
+									{#if b.interface}<span class="tag tag-neutral">{b.interface}</span>{/if}
+								</div>
+								<div style="font-size:12.5px;color:var(--td-muted-2);margin-top:1px;">{b.hits} plays · last seen {timeAgo(b.last_seen)}</div>
+							</div>
+							<select class="input assign" class:needs={b.chain_id == null}
+								value={deviceBindingValue(b)} aria-label="Chain or setup for {b.identifier} on {b.equipment_name}"
+								on:change={(e) => assignDeviceBinding(b, e.currentTarget.value)}>
+								<option value="">— unmapped —</option>
+								{#each chainRows as c (c.id)}
+									{#if variantsFor(c.id).length}
+										<optgroup label={c.name}>
+											<option value="c:{c.id}">{c.name} · as wired</option>
+											{#each variantsFor(c.id) as v (v.id)}
+												<option value="v:{v.id}">{c.name} · {v.name}</option>
+											{/each}
+										</optgroup>
+									{:else}
+										<option value="c:{c.id}">{c.name}</option>
+									{/if}
+								{/each}
+							</select>
+							<button class="icon-btn danger" title="Forget this output" on:click={() => removeDeviceBinding(b)} aria-label="Forget {b.identifier} on {b.equipment_name}">✕</button>
+						</div>
+					{/each}
+				</div>
+			{/each}
+			{#if bindings.length}<div class="secsub">Outputs by name, from anything else</div>{/if}
+		{/if}
 		{#if bindings.length}
 			<div class="panel" style="border-radius:20px;padding:8px;">
 				{#each [...unmapped, ...mapped] as b (b.id)}
@@ -1488,7 +1600,7 @@
 					</div>
 				{/each}
 			</div>
-		{:else}
+		{:else if !deviceBindings.length}
 			<div class="panel empty dashed">
 				<div class="empty-icon">
 					<svg viewBox="0 0 24 24" width="24" fill="none" stroke="currentColor" stroke-width="2.3" stroke-linecap="round" stroke-linejoin="round"><path d="M11 5L6 9H2v6h4l5 4V5z"/><path d="M15.5 8.5a5 5 0 0 1 0 7M19 5a9 9 0 0 1 0 14"/></svg>
@@ -1944,6 +2056,15 @@
 						</div>
 					</div>
 					<div class="field"><label for="go">Notes</label><input id="go" class="input" bind:value={gNotes}></div>
+					{#if gearId != null}
+						<!-- Remembered from the inbox, editable here: an app that reports
+						     one of these names is suggested as this box, never tied to it
+						     without asking. -->
+						<div class="field">
+							<label for="galias">Also reports as</label>
+							<input id="galias" class="input" bind:value={gAliases} placeholder="A model number, say XQ-DQ54">
+						</div>
+					{/if}
 				</div>
 			</div>
 			<div class="dialog-actions">
@@ -2252,5 +2373,13 @@
 	}
 	@media (max-width: 720px) {
 		.wlist { max-width: none; }
+	}
+
+	/* ── The inbox at the top ── */
+	.inbox-top { display: flex; flex-direction: column; gap: 6px; margin-bottom: 14px; }
+	.inbox-all { align-self: flex-end; }
+	.inbox-done {
+		margin-bottom: 12px; padding: 10px 14px; border-radius: 14px;
+		background: var(--td-good-bg); color: var(--td-good-fg); font-size: 13.5px;
 	}
 </style>
