@@ -65,6 +65,15 @@
 //!   translation.
 //! * **`VACUUM INTO`** (8) is the whole backup endpoint and has no Postgres
 //!   equivalent short of `pg_dump`.
+//! * **On/off flags stored as `INTEGER`** (`users.disabled`,
+//!   `user_sources.enabled`, `plex_settings.enabled`, …) become `BIGINT`, and
+//!   Postgres will neither take a Rust `bool` into one nor hand one back as a
+//!   `bool`. SQLite does both, so nothing on that side notices. Bind
+//!   `i64::from(flag)` and select `(col <> 0) AS col`, both of which mean the
+//!   same on either backend. The reverse holds for the real `BOOLEAN` columns
+//!   (`signal_chains.shared`, `scrobbles.skipped`): compare them with
+//!   `TRUE`/`FALSE`, never `1`/`0`, because Postgres has no `boolean =
+//!   integer`. v0.128.1 found the first one by crashing on startup.
 
 use std::borrow::Cow;
 

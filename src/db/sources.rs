@@ -16,7 +16,7 @@ impl Database {
     /// with bare copies. Removing the token brings it back on the next tick.
     pub async fn list_enabled_sources(&self) -> Result<Vec<UserSource>, sqlx::Error> {
         let rows: Vec<UserSourceRow> = sqlx::query_as(&crate::sql!(
-            "SELECT s.id, s.user_id, s.kind, s.label, s.enabled, s.url, s.credentials,
+            "SELECT s.id, s.user_id, s.kind, s.label, (s.enabled <> 0) AS enabled, s.url, s.credentials,
                     s.remote_account, s.poll_interval_secs, s.options, s.last_polled_at,
                     s.last_error, s.updated_at, COALESCE(u.role, '') AS owner_role
              FROM user_sources s LEFT JOIN users u ON u.id = s.user_id
@@ -35,7 +35,7 @@ impl Database {
         user_id: i64,
     ) -> Result<Vec<UserSource>, sqlx::Error> {
         let rows: Vec<UserSourceRow> = sqlx::query_as(&crate::sql!(
-            "SELECT s.id, s.user_id, s.kind, s.label, s.enabled, s.url, s.credentials,
+            "SELECT s.id, s.user_id, s.kind, s.label, (s.enabled <> 0) AS enabled, s.url, s.credentials,
                     s.remote_account, s.poll_interval_secs, s.options, s.last_polled_at,
                     s.last_error, s.updated_at, COALESCE(u.role, '') AS owner_role
              FROM user_sources s LEFT JOIN users u ON u.id = s.user_id
@@ -61,7 +61,7 @@ impl Database {
     pub async fn source_health(&self) -> Result<Vec<SourceHealth>, sqlx::Error> {
         sqlx::query_as(&crate::sql!(
             "SELECT s.id, s.user_id, COALESCE(u.username, '') AS username, s.kind, s.label,
-                    s.enabled, s.poll_interval_secs, s.last_polled_at, s.last_error,
+                    (s.enabled <> 0) AS enabled, s.poll_interval_secs, s.last_polled_at, s.last_error,
                     EXISTS (SELECT 1 FROM tokens t WHERE t.source_ref = s.id) AS plugin
              FROM user_sources s
              LEFT JOIN users u ON u.id = s.user_id
@@ -78,7 +78,7 @@ impl Database {
         id: i64,
     ) -> Result<Option<UserSource>, sqlx::Error> {
         let row: Option<UserSourceRow> = sqlx::query_as(&crate::sql!(
-            "SELECT s.id, s.user_id, s.kind, s.label, s.enabled, s.url, s.credentials,
+            "SELECT s.id, s.user_id, s.kind, s.label, (s.enabled <> 0) AS enabled, s.url, s.credentials,
                     s.remote_account, s.poll_interval_secs, s.options, s.last_polled_at,
                     s.last_error, s.updated_at, COALESCE(u.role, '') AS owner_role
              FROM user_sources s LEFT JOIN users u ON u.id = s.user_id
@@ -135,7 +135,7 @@ impl Database {
         .bind(user_id)
         .bind(kind)
         .bind(label)
-        .bind(enabled)
+        .bind(i64::from(enabled))
         .bind(url)
         .bind(sealed)
         .bind(remote_account)
@@ -167,7 +167,7 @@ impl Database {
              WHERE id = ? AND user_id = ?"
         ))
         .bind(label)
-        .bind(enabled)
+        .bind(i64::from(enabled))
         .bind(url)
         .bind(sealed)
         .bind(remote_account)
@@ -374,7 +374,7 @@ impl Database {
     /// The stored Plex config, or `None` before first-run seeding.
     pub async fn get_plex_settings(&self) -> Result<Option<PlexSettings>, sqlx::Error> {
         sqlx::query_as(&crate::sql!(
-            "SELECT enabled, url, token, users_allow, users_block, devices_allow,
+            "SELECT (enabled <> 0) AS enabled, url, token, users_allow, users_block, devices_allow,
                     devices_block, libraries_allow, libraries_block, updated_at
              FROM plex_settings WHERE id = 1"
         ))
@@ -396,7 +396,7 @@ impl Database {
                 libraries_allow=excluded.libraries_allow, libraries_block=excluded.libraries_block,
                 updated_at=excluded.updated_at"
         ))
-        .bind(s.enabled)
+        .bind(i64::from(s.enabled))
         .bind(&s.url)
         .bind(&s.token)
         .bind(&s.users_allow)

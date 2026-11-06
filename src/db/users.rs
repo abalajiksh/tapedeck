@@ -127,11 +127,12 @@ impl Database {
         &self,
         id: i64,
     ) -> Result<Option<(String, bool)>, sqlx::Error> {
-        let row: Option<(String, bool)> =
-            sqlx::query_as(&crate::sql!("SELECT role, disabled FROM users WHERE id = ?"))
-                .bind(id)
-                .fetch_optional(&self.pool)
-                .await?;
+        let row: Option<(String, bool)> = sqlx::query_as(&crate::sql!(
+            "SELECT role, (disabled <> 0) AS disabled FROM users WHERE id = ?"
+        ))
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
         Ok(row)
     }
     /// Count admins who can actually log in (enabled). Used to guard against
@@ -154,7 +155,7 @@ impl Database {
     }
     pub async fn set_user_disabled(&self, id: i64, disabled: bool) -> Result<bool, sqlx::Error> {
         let res = sqlx::query(&crate::sql!("UPDATE users SET disabled = ? WHERE id = ?"))
-            .bind(disabled)
+            .bind(i64::from(disabled))
             .bind(id)
             .execute(&self.pool)
             .await?;
@@ -194,7 +195,8 @@ impl Database {
     /// A user's own profile, for the account screen.
     pub async fn get_profile(&self, id: i64) -> Result<Option<UserProfile>, sqlx::Error> {
         sqlx::query_as::<_, UserProfile>(&crate::sql!(
-            "SELECT id, username, display_name, role, created_at, avatar_url, bio, disabled
+            "SELECT id, username, display_name, role, created_at, avatar_url, bio,
+                    (disabled <> 0) AS disabled
                FROM users WHERE id = ?",
         ))
         .bind(id)
@@ -625,7 +627,7 @@ impl Database {
         Ok(count.0 > 0)
     }
     pub async fn list_users(&self) -> Result<Vec<UserRecord>, sqlx::Error> {
-        sqlx::query_as(&crate::sql!("SELECT id, username, display_name, role, created_at, disabled FROM users ORDER BY id ASC"))
+        sqlx::query_as(&crate::sql!("SELECT id, username, display_name, role, created_at, (disabled <> 0) AS disabled FROM users ORDER BY id ASC"))
             .fetch_all(&self.pool).await
     }
     pub async fn list_tokens(&self, user_id: i64) -> Result<Vec<TokenRecord>, sqlx::Error> {
@@ -793,7 +795,7 @@ impl Database {
         let now = Self::now_secs();
         let row: Option<(i64, i64, String, String, String, bool, Option<i64>, Option<i64>)> =
             sqlx::query_as(&crate::sql!(
-                "SELECT c.id, u.id, u.username, u.role, c.scopes, u.disabled,
+                "SELECT c.id, u.id, u.username, u.role, c.scopes, (u.disabled <> 0) AS disabled,
                         c.expires_at, c.revoked_at
                  FROM mcp_connections c JOIN users u ON u.id = c.user_id
                  WHERE c.token_hash = ?"
@@ -921,7 +923,7 @@ impl Database {
         .bind(method)
         .bind(tool)
         .bind(args)
-        .bind(ok)
+        .bind(i64::from(ok))
         .bind(rows_returned)
         .bind(ms)
         .execute(&self.pool)
@@ -936,7 +938,7 @@ impl Database {
         limit: i64,
     ) -> Result<Vec<McpAuditRow>, sqlx::Error> {
         sqlx::query_as(&crate::sql!(
-            "SELECT a.id, a.at, a.method, a.tool, a.args, a.ok, a.rows_returned, a.ms,
+            "SELECT a.id, a.at, a.method, a.tool, a.args, (a.ok <> 0) AS ok, a.rows_returned, a.ms,
                     c.name AS connection_name
              FROM mcp_audit a LEFT JOIN mcp_connections c ON c.id = a.connection_id
              WHERE a.user_id = ? ORDER BY a.at DESC, a.id DESC LIMIT ?",
@@ -976,7 +978,7 @@ impl Database {
         .bind(client_id)
         .bind(client_name)
         .bind(redirect_uris)
-        .bind(registered_by_url)
+        .bind(i64::from(registered_by_url))
         .bind(Self::now_secs())
         .execute(&self.pool)
         .await?;
@@ -987,7 +989,8 @@ impl Database {
         client_id: &str,
     ) -> Result<Option<OAuthClient>, sqlx::Error> {
         sqlx::query_as(&crate::sql!(
-            "SELECT client_id, client_name, redirect_uris, registered_by_url
+            "SELECT client_id, client_name, redirect_uris,
+                    (registered_by_url <> 0) AS registered_by_url
              FROM oauth_clients WHERE client_id = ?"
         ))
         .bind(client_id)
