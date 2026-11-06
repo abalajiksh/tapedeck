@@ -563,6 +563,19 @@ export interface SignalChain {
 	total_hours: number;
 }
 
+/** Where chains live. A chain may be in several rooms; rooms never affect
+ *  where a listen is attributed. `portable` ("On the go") and `elsewhere` are
+ *  built in and cannot be renamed or deleted. */
+export interface Room {
+	id: number;
+	name: string;
+	icon: string | null;
+	kind: 'room' | 'portable' | 'elsewhere';
+	sort: number;
+	created_at: number;
+	chain_ids: number[];
+}
+
 export interface ChainComponent {
 	type: string;
 	name: string;
@@ -3155,6 +3168,23 @@ class TapedeckAPI {
 		return this.get('/api/v1/chains');
 	}
 	async getChain(id: number): Promise<SignalChain> { return this.get(`/api/v1/chains/${id}`); }
+	async getRooms(): Promise<{ rooms: Room[] }> {
+		return this.get('/api/v1/rooms');
+	}
+	async createRoom(name: string, icon: string | null): Promise<{ id: number }> {
+		return this.post('/api/v1/rooms', { name, icon });
+	}
+	/** Absent fields are left alone; `icon: null` clears the icon. */
+	async updateRoom(id: number, body: { name?: string; icon?: string | null; sort?: number }): Promise<{ id: number }> {
+		return this.patch(`/api/v1/rooms/${id}`, body);
+	}
+	async deleteRoom(id: number): Promise<void> {
+		return this.delNoBody(`/api/v1/rooms/${id}`);
+	}
+	/** Replaces the chain's rooms; `[]` takes it out of every room. */
+	async setChainRooms(chainId: number, roomIds: number[]): Promise<{ id: number }> {
+		return this.put(`/api/v1/chains/${chainId}/rooms`, { room_ids: roomIds });
+	}
 	async createChain(data: ChainInput): Promise<{ id: number }> {
 		return this.post('/api/v1/chains', data);
 	}

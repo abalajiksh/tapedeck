@@ -1,13 +1,15 @@
 <script lang="ts">
 	import { onMount, tick } from 'svelte';
 	import { api } from '$lib/api';
-	import type { SignalChain, Equipment, ChainComponent, ChainInput, EquipmentInput, Binding, Device, ChainVariant, FoldSuggestion } from '$lib/api';
+	import type { Room, SignalChain, Equipment, ChainComponent, ChainInput, EquipmentInput, Binding, Device, ChainVariant, FoldSuggestion } from '$lib/api';
 	import { formatHours, timeAgo, toDateInput, fromDateInput, ownedFor, formatDateTime } from '$lib/utils';
 	import ChainIcon, { CHAIN_ICONS, CHAIN_ICON_LABELS } from '$lib/components/ChainIcon.svelte';
 	import ChainGraph from '$lib/components/chains/ChainGraph.svelte';
 	import ChainList from '$lib/components/chains/ChainList.svelte';
 	import ChainDrawer from '$lib/components/chains/ChainDrawer.svelte';
 	import ShelfLine from '$lib/components/chains/ShelfLine.svelte';
+	import RoomChips from '$lib/components/chains/RoomChips.svelte';
+	import RoomSuggest from '$lib/components/chains/RoomSuggest.svelte';
 	import { gearInUse } from '$lib/components/chains/layout';
 	import { lastUsedPhrase } from '$lib/components/chains/format';
 	import { syncUrl } from '$lib/url';
@@ -137,6 +139,48 @@
 	// lit route survives a reload and Back undoes a pick, through `syncUrl`.
 	let selectedChainId: number | null = null;
 	let lastUsed: Record<string, number> = {};
+
+	// ── Rooms ──
+	// Where chains live. A filter on the list and the graph, in the URL
+	// (`?room=`) so a room view can be bookmarked; it never re-lays the graph
+	// out. Rooms do not touch attribution, so a failure to load them leaves the
+	// page working without them rather than showing an error.
+	let rooms: Room[] = [];
+	let roomFilter: number | null = null;
+	let movingRooms = false;
+	$: if (roomFilter != null && rooms.length && !rooms.some((r) => r.id === roomFilter)) roomFilter = null;
+	$: filterRoom = rooms.find((r) => r.id === roomFilter) ?? null;
+	// Picking a room keeps the lit chain when it is in the room, and otherwise
+	// lights the room's busiest, as the design does.
+	$: if (filterRoom && selectedChainId != null && !filterRoom.chain_ids.includes(selectedChainId)) {
+		const first = chainRows.find((c) => filterRoom?.chain_ids.includes(c.id));
+		if (first) selectedChainId = first.id;
+	}
+	async function loadRooms() {
+		try {
+			rooms = (await api.getRooms()).rooms;
+		} catch {
+			rooms = [];
+		}
+	}
+	function pickRoom(id: number | null) {
+		roomFilter = id;
+		const url = new URL(window.location.href);
+		if (id == null) url.searchParams.delete('room');
+		else url.searchParams.set('room', String(id));
+		syncUrl(url.pathname + url.search);
+	}
+	async function moveChainRooms(chain: SignalChain, ids: number[]) {
+		movingRooms = true;
+		try {
+			await api.setChainRooms(chain.id, ids);
+			await loadRooms();
+		} catch (e) {
+			alert(e instanceof Error ? e.message : 'Could not change the rooms');
+		} finally {
+			movingRooms = false;
+		}
+	}
 	$: if (chains.length && !chains.some((c) => c.id === selectedChainId)) selectedChainId = chainRows[0]?.id ?? null;
 	$: selectedChain = chains.find((c) => c.id === selectedChainId) ?? null;
 	$: usedGear = gearInUse(chains, variants);
@@ -1028,6 +1072,9 @@
 		highlightGear = g ? Number(g) : null;
 		const picked = Number(q.get('chain'));
 		if (picked) selectedChainId = picked;
+		const inRoom = Number(q.get('room'));
+		if (inRoom) roomFilter = inRoom;
+		void loadRooms();
 		await load();
 		// Failing to read it leaves the picker on "No chain", which is the
 		// default and therefore honest — never an error banner over a
@@ -1175,10 +1222,12 @@
 	     once, the chosen chain's route lit. The drawer opens from the bar under
 	     the graph, so scanning never pops a panel over what you were reading. -->
 	{#if chainRows.length}
+		<RoomSuggest chains={chainRows} {equipment} {rooms} on:done={loadRooms} />
+		<RoomChips {rooms} chainCount={chains.length} roomId={roomFilter} on:pick={(e) => pickRoom(e.detail)} />
 		<div class="wired">
 			<div class="wlist">
-				<ChainList chains={chainRows} {variants} {lastUsed} selectedId={selectedChainId}
-					on:select={(e) => selectChain(e.detail)} />
+				<ChainList chains={chainRows} {variants} {lastUsed} {rooms} roomId={roomFilter}
+					selectedId={selectedChainId} on:select={(e) => selectChain(e.detail)} />
 			</div>
 			<section class="panel wgraph" aria-label="How it is wired">
 				<div class="whead">
@@ -1190,8 +1239,8 @@
 						</p>
 					</div>
 				</div>
-				<ChainGraph {chains} {variants} {equipment} selectedId={selectedChainId}
-					on:select={(e) => selectChain(e.detail)} />
+				<ChainGraph {chains} {variants} {equipment} {rooms} roomId={roomFilter}
+					selectedId={selectedChainId} on:select={(e) => selectChain(e.detail)} />
 				{#if selectedChain}
 					<div class="wsel">
 						<div style="flex:1 1 320px;min-width:0;">
@@ -1464,6 +1513,9 @@
 		lastUsed={lastUsed[String(openChain.id)] ?? null}
 		sharing={sharingChain === openChain.id}
 		canFold={foldable(openChain).length > 0}
+		{rooms}
+		{movingRooms}
+		on:rooms={(e) => openChain && moveChainRooms(openChain, e.detail)}
 		on:close={() => (openChainId = null)}
 		on:share={(e) => openChain && toggleShared(openChain, e.detail)}
 		on:swap={(e) => openChain && openSwap(openChain, e.detail)}

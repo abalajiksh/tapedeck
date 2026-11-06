@@ -12018,3 +12018,210 @@ async fn a_chain_is_last_used_at_its_newest_listen_not_its_newest_skip() {
     assert_eq!(last.get(&desk), Some(&1_760_000_200), "the newest listen, not the skip after it");
     assert_eq!(last.get(&idle), None, "a chain nothing played through has no last use");
 }
+
+// ── Rooms ──
+
+fn room_of(rooms: &[Room], name: &str) -> Room {
+    rooms.iter().find(|r| r.name == name).unwrap_or_else(|| panic!("no room {name}")).clone()
+}
+
+/// A room is a person's own: one name each (ignoring case), never usable by
+/// anybody else, and "On the go" is there without anybody making it.
+#[tokio::test]
+async fn rooms_are_one_persons_and_named_once() {
+    let db = testdb().await;
+    let ash = db.create_user("ash", None, "pw", "user").await.unwrap();
+    let kim = db.create_user("kim", None, "pw", "user").await.unwrap();
+
+    let study = db.create_room(ash, "  Study  ", Some("desk")).await.unwrap().unwrap();
+    assert_eq!(db.create_room(ash, "study", None).await.unwrap(), Err(RoomRefusal::Duplicate));
+    assert_eq!(db.create_room(ash, "   ", None).await.unwrap(), Err(RoomRefusal::BadName));
+    assert_eq!(
+        db.create_room(ash, &"x".repeat(61), None).await.unwrap(),
+        Err(RoomRefusal::BadName)
+    );
+    // Somebody else may have a Study of their own.
+    assert!(db.create_room(kim, "Study", None).await.unwrap().is_ok());
+
+    let rooms = db.list_rooms(ash).await.unwrap();
+    assert_eq!(room_of(&rooms, "Study").icon.as_deref(), Some("desk"), "whitespace collapsed");
+    assert_eq!(room_of(&rooms, "On the go").kind, "portable", "the built-in arrives on its own");
+    assert_eq!(rooms.len(), 2);
+    // Asking again does not make a second one.
+    assert_eq!(db.list_rooms(ash).await.unwrap().len(), 2);
+
+    // kim cannot touch ash's room, and cannot put a chain of theirs in it.
+    assert_eq!(
+        db.update_room(kim, study, Some("Mine"), None, None).await.unwrap(),
+        Err(RoomRefusal::NotFound)
+    );
+    assert_eq!(db.delete_room(kim, study).await.unwrap(), Err(RoomRefusal::NotFound));
+    let kims = chain_of(&db, kim, "Desk", &[]).await;
+    assert_eq!(db.set_chain_rooms(kim, kims, &[study]).await.unwrap(), Err(RoomRefusal::NotFound));
+    let ashs = chain_of(&db, ash, "Desk", &[]).await;
+    assert_eq!(
+        db.set_chain_rooms(kim, ashs, &[]).await.unwrap(),
+        Err(RoomRefusal::NotFound),
+        "nor change which rooms ash's chain is in"
+    );
+}
+
+/// A chain may live in several rooms, and taking either side away is clean:
+/// deleting a room never deletes a chain, deleting a chain never deletes a room.
+#[tokio::test]
+async fn a_chain_lives_in_several_rooms_and_either_side_can_go() {
+    let db = testdb().await;
+    let uid = db.create_user("ash", None, "pw", "user").await.unwrap();
+    let study = db.create_room(uid, "Study", None).await.unwrap().unwrap();
+    let kitchen = db.create_room(uid, "Kitchen", None).await.unwrap().unwrap();
+    let speaker = chain_of(&db, uid, "BT speaker", &[]).await;
+    let desk = chain_of(&db, uid, "Desk", &[]).await;
+
+    db.set_chain_rooms(uid, speaker, &[study, kitchen, study]).await.unwrap().unwrap();
+    db.set_chain_rooms(uid, desk, &[study]).await.unwrap().unwrap();
+    let rooms = db.list_rooms(uid).await.unwrap();
+    assert_eq!(room_of(&rooms, "Study").chain_ids, vec![speaker.min(desk), speaker.max(desk)]);
+    assert_eq!(room_of(&rooms, "Kitchen").chain_ids, vec![speaker], "a repeat is one link");
+
+    // The room goes; both chains stay, and the speaker is still in the Study.
+    db.delete_room(uid, study).await.unwrap().unwrap();
+    assert_eq!(db.get_chains(uid).await.unwrap().len(), 2);
+    let rooms = db.list_rooms(uid).await.unwrap();
+    assert_eq!(room_of(&rooms, "Kitchen").chain_ids, vec![speaker]);
+
+    // The chain goes; the room stays, empty.
+    assert!(db.delete_chain(uid, speaker).await.unwrap());
+    let rooms = db.list_rooms(uid).await.unwrap();
+    assert!(room_of(&rooms, "Kitchen").chain_ids.is_empty());
+
+    // [] takes a chain out of every room.
+    db.set_chain_rooms(uid, desk, &[kitchen]).await.unwrap().unwrap();
+    db.set_chain_rooms(uid, desk, &[]).await.unwrap().unwrap();
+    assert!(db.list_rooms(uid).await.unwrap().iter().all(|r| r.chain_ids.is_empty()));
+}
+
+/// The built-ins can be reordered, not renamed or deleted; and a room of your
+/// own already called "On the go" becomes the built-in rather than a clash.
+#[tokio::test]
+async fn built_in_rooms_keep_their_names() {
+    let db = testdb().await;
+    let uid = db.create_user("ash", None, "pw", "user").await.unwrap();
+    let mine = db.create_room(uid, "On the go", Some("car")).await.unwrap().unwrap();
+    let rooms = db.list_rooms(uid).await.unwrap();
+    assert_eq!(rooms.len(), 1, "adopted, not duplicated");
+    assert_eq!(room_of(&rooms, "On the go").id, mine);
+    assert_eq!(room_of(&rooms, "On the go").kind, "portable");
+
+    assert_eq!(
+        db.update_room(uid, mine, Some("Car"), None, None).await.unwrap(),
+        Err(RoomRefusal::BuiltIn)
+    );
+    assert_eq!(db.delete_room(uid, mine).await.unwrap(), Err(RoomRefusal::BuiltIn));
+    db.update_room(uid, mine, None, Some(None), Some(5)).await.unwrap().unwrap();
+    let r = room_of(&db.list_rooms(uid).await.unwrap(), "On the go");
+    assert_eq!((r.icon, r.sort), (None, 5), "an icon and a place in the order may change");
+}
+
+/// Folding a chain into another carries its rooms over, and deleting the
+/// person takes their rooms with them.
+#[tokio::test]
+async fn rooms_follow_a_fold_and_go_with_their_owner() {
+    let db = testdb().await;
+    let uid = db.create_user("ash", None, "pw", "user").await.unwrap();
+    let phone = db.upsert_equipment(uid, "Xperia", "dap", None, None, 0.0, None).await.unwrap();
+    let hd569 =
+        db.upsert_equipment(uid, "HD 569", "headphones", None, None, 0.0, None).await.unwrap();
+    let hexa = db.upsert_equipment(uid, "Hexa", "iem", None, None, 0.0, None).await.unwrap();
+    let commute =
+        chain_of(&db, uid, "Commute Phone", &[("Xperia", phone), ("HD 569", hd569)]).await;
+    let summer = chain_of(&db, uid, "Summer Commute", &[("Xperia", phone), ("Hexa", hexa)]).await;
+    let car = db.create_room(uid, "Car", None).await.unwrap().unwrap();
+    let go = db.ensure_builtin_room(uid, "portable").await.unwrap();
+    db.set_chain_rooms(uid, commute, &[go]).await.unwrap().unwrap();
+    db.set_chain_rooms(uid, summer, &[go, car]).await.unwrap().unwrap();
+
+    db.fold_chain_into_variant(uid, summer, commute, FoldTarget::New("Hexa"))
+        .await
+        .unwrap()
+        .expect("the fold is allowed");
+    let rooms = db.list_rooms(uid).await.unwrap();
+    assert_eq!(
+        room_of(&rooms, "Car").chain_ids,
+        vec![commute],
+        "the folded chain's room carries over"
+    );
+    assert_eq!(room_of(&rooms, "On the go").chain_ids, vec![commute], "once, not twice");
+
+    assert!(db.delete_user(uid).await.unwrap(), "rooms must not block deleting their owner");
+    let left: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM rooms").fetch_one(&db.pool).await.unwrap();
+    assert_eq!(left, 0);
+}
+
+/// Deleting a person who has used the chain features fully: a setup, a mapped
+/// output carrying it, a machine with a default chain, a pairing in flight and
+/// a room. Each of those used to block the delete on a foreign key.
+#[tokio::test]
+async fn deleting_a_person_with_setups_outputs_machines_and_rooms_succeeds() {
+    let db = testdb().await;
+    let uid = db.create_user("ash", None, "pw", "user").await.unwrap();
+    let hd = db.upsert_equipment(uid, "HD 569", "headphones", None, None, 0.0, None).await.unwrap();
+    let hexa = db.upsert_equipment(uid, "Hexa", "iem", None, None, 0.0, None).await.unwrap();
+    let chain = chain_of(&db, uid, "Commute", &[("HD 569", hd)]).await;
+    let v = db
+        .create_variant(
+            uid,
+            chain,
+            "Summer",
+            &[VariantOverride { position: 0, equipment_id: Some(hexa), name: Some("Hexa".into()) }],
+        )
+        .await
+        .unwrap();
+    db.record_output(uid, "Bluetooth", None).await.unwrap();
+    db.set_binding(uid, "Bluetooth", Some(chain), Some(v)).await.unwrap();
+    let dev = db.upsert_device(uid, "m-1", Some("Phone"), None, None).await.unwrap();
+    sqlx::query("UPDATE devices SET default_chain_id = ? WHERE id = ?")
+        .bind(chain)
+        .bind(dev)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO pairing_requests (device_code_hash, user_code, client_name, scopes, \
+         user_id, default_chain_id, created_at, expires_at) VALUES ('h', 'C', 'x', 'submit', ?, ?, 0, 9e9)",
+    )
+    .bind(uid)
+    .bind(chain)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    let room = db.create_room(uid, "Study", None).await.unwrap().unwrap();
+    db.set_chain_rooms(uid, chain, &[room]).await.unwrap().unwrap();
+
+    assert!(db.delete_user(uid).await.unwrap());
+    for table in ["chain_variants", "signal_chains", "chain_bindings", "devices", "rooms"] {
+        let n: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {table}"))
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(n, 0, "{table} left behind");
+    }
+}
+
+/// A new room goes after the person's own rooms and before the built-ins,
+/// even after a reorder has moved a built-in up the list.
+#[tokio::test]
+async fn a_new_room_lands_before_the_built_ins() {
+    let db = testdb().await;
+    let uid = db.create_user("ash", None, "pw", "user").await.unwrap();
+    let go = db.ensure_builtin_room(uid, "portable").await.unwrap();
+    let study = db.create_room(uid, "Study", None).await.unwrap().unwrap();
+    let names = |rs: Vec<Room>| rs.into_iter().map(|r| r.name).collect::<Vec<_>>();
+    assert_eq!(names(db.list_rooms(uid).await.unwrap()), ["Study", "On the go"]);
+
+    // The way the Rooms page reorders: every position rewritten.
+    db.update_room(uid, study, None, None, Some(0)).await.unwrap().unwrap();
+    db.update_room(uid, go, None, None, Some(1)).await.unwrap().unwrap();
+    db.create_room(uid, "Garden", None).await.unwrap().unwrap();
+    assert_eq!(names(db.list_rooms(uid).await.unwrap()), ["Study", "Garden", "On the go"]);
+}

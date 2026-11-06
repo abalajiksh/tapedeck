@@ -5202,6 +5202,163 @@ paths:
           $ref: '#/components/responses/Unauthorized'
         '404':
           $ref: '#/components/responses/NotFound'
+  /api/v1/rooms:
+    get:
+      tags:
+      - Chains
+      summary: Your rooms, in order, with the chains in each.
+      description: |-
+        Scope: `read`. The built-in "On the go" room is created the first time this
+        is asked, so it is always there to pick. A chain may appear in several
+        rooms' `chain_ids`.
+      operationId: list_rooms
+      responses:
+        '200':
+          description: OK.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RoomList'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+      security:
+      - sessionCookie: []
+      - apiToken:
+        - read
+    post:
+      tags:
+      - Chains
+      summary: Make a room of your own.
+      description: Session-only. Names are unique per person, ignoring case.
+      operationId: create_room
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateRoomRequest'
+        required: true
+      responses:
+        '201':
+          description: Created.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RowCreated'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '409':
+          description: You already have a room with that name.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+  /api/v1/rooms/{id}:
+    delete:
+      tags:
+      - Chains
+      summary: Delete a room of your own.
+      description: |-
+        Session-only. Its chains leave the room and are otherwise untouched:
+        deleting a room never deletes a chain. Built-in rooms cannot be deleted.
+      operationId: delete_room
+      parameters:
+      - name: id
+        in: path
+        description: The room.
+        required: true
+        schema:
+          type: integer
+          format: int64
+      responses:
+        '204':
+          description: Deleted.
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    patch:
+      tags:
+      - Chains
+      summary: Rename a room, change its icon, or move it in the order.
+      description: |-
+        Session-only. A built-in room can be reordered and given an icon, never
+        renamed.
+      operationId: update_room
+      parameters:
+      - name: id
+        in: path
+        description: The room.
+        required: true
+        schema:
+          type: integer
+          format: int64
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateRoomRequest'
+        required: true
+      responses:
+        '200':
+          description: Updated.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RowUpdated'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: You already have a room with that name.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+  /api/v1/chains/{id}/rooms:
+    put:
+      tags:
+      - Chains
+      summary: Put a chain in exactly these rooms.
+      description: |-
+        Session-only. Replaces the chain's rooms; `[]` takes it out of all of them.
+        Refused whole if the chain or any room is not yours.
+      operationId: set_chain_rooms
+      parameters:
+      - name: id
+        in: path
+        description: The chain.
+        required: true
+        schema:
+          type: integer
+          format: int64
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SetChainRoomsRequest'
+        required: true
+      responses:
+        '200':
+          description: Updated.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RowUpdated'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
   /api/v1/notes:
     get:
       tags:
@@ -13897,6 +14054,19 @@ components:
             when Tapedeck first saw it — gear is usually owned for a while before
             anyone gets round to cataloguing it, and burn-in hours are counted from
             the purchase.
+    CreateRoomRequest:
+      type: object
+      required:
+      - name
+      properties:
+        name:
+          type: string
+          description: Up to 60 characters; whitespace is collapsed.
+        icon:
+          type:
+          - string
+          - 'null'
+          description: A glyph name from the UI's set. Not validated, like a chain's icon.
     CreateTokenRequest:
       type: object
       required:
@@ -22025,6 +22195,53 @@ components:
           description: |-
             Whether this build reads kanji and hanzi. Without it (a build with no
             default features) kana is romanized and ideographs are left as written.
+    Room:
+      type: object
+      description: One room and the chains in it.
+      required:
+      - id
+      - name
+      - kind
+      - sort
+      - created_at
+      - chain_ids
+      properties:
+        id:
+          type: integer
+          format: int64
+        name:
+          type: string
+        icon:
+          type:
+          - string
+          - 'null'
+          description: A glyph name from the UI's set, or null.
+        kind:
+          type: string
+          description: |-
+            `room` for your own, `portable` (On the go) or `elsewhere` for the
+            built-ins, which cannot be renamed or deleted.
+        sort:
+          type: integer
+          format: int64
+        created_at:
+          type: integer
+          format: int64
+        chain_ids:
+          type: array
+          items:
+            type: integer
+            format: int64
+          description: The chains in this room, by id. A chain may be in several rooms.
+    RoomList:
+      type: object
+      required:
+      - rooms
+      properties:
+        rooms:
+          type: array
+          items:
+            $ref: '#/components/schemas/Room'
     RotatedToken:
       type: object
       description: A re-issued token.
@@ -22902,6 +23119,19 @@ components:
           description: |-
             Which setup (variant) of that chain this output carries. Absent or
             `null` is the chain as wired. Must be a variant of `chain_id`.
+    SetChainRoomsRequest:
+      type: object
+      required:
+      - room_ids
+      properties:
+        room_ids:
+          type: array
+          items:
+            type: integer
+            format: int64
+          description: |-
+            Every room the chain is in. **Required:** `[]` takes it out of every
+            room; an absent field is a 400, because this replaces what was there.
     SetDeviceChainRequest:
       type: object
       required:
@@ -26516,6 +26746,25 @@ components:
           description: |-
             Must be an `http(s)` URL. A relative value is refused with 400 — only
             the upload endpoint may write a path this server serves.
+    UpdateRoomRequest:
+      type: object
+      properties:
+        name:
+          type:
+          - string
+          - 'null'
+          description: A new name. Absent leaves it; a built-in room cannot be renamed.
+        icon:
+          type:
+          - string
+          - 'null'
+          description: A new icon, or `null` to clear it. Absent leaves it alone.
+        sort:
+          type:
+          - integer
+          - 'null'
+          format: int64
+          description: Position in the order; lower comes first.
     UpdateScrobble:
       type: object
       description: Every field optional; only the fields sent change.

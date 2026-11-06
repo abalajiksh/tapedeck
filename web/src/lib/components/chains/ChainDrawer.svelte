@@ -13,10 +13,11 @@
 	// It owns no state that outlives it: every action goes back to the page,
 	// which holds the dialogs and the data.
 	import { createEventDispatcher } from 'svelte';
-	import type { Binding, ChainVariant, Device, Equipment, SignalChain } from '$lib/api';
+	import type { Binding, ChainVariant, Device, Equipment, Room, SignalChain } from '$lib/api';
 	import ChainIcon from '$lib/components/ChainIcon.svelte';
 	import { formatHours } from '$lib/utils';
-	import { COLUMNS, columnOf } from './layout';
+	import { COLUMNS, columnOf, roomGlyph } from './layout';
+	import RoomIcon from './RoomIcon.svelte';
 	import { lastUsedPhrase } from './format';
 
 	export let chain: SignalChain;
@@ -27,6 +28,9 @@
 	export let lastUsed: number | null = null;
 	export let sharing = false;
 	export let canFold = false;
+	export let rooms: Room[] = [];
+	/** A rooms change is in flight. */
+	export let movingRooms = false;
 
 	const dispatch = createEventDispatcher<{
 		close: void;
@@ -41,7 +45,13 @@
 		delete: void;
 		duplicate: void;
 		edit: void;
+		rooms: number[];
 	}>();
+
+	$: inRooms = rooms.filter((r) => r.chain_ids.includes(chain.id)).map((r) => r.id);
+	function toggleRoom(id: number) {
+		dispatch('rooms', inRooms.includes(id) ? inRooms.filter((x) => x !== id) : [...inRooms, id]);
+	}
 
 	$: steps = chain.components ?? [];
 	$: mine = variants.filter((v) => v.chain_id === chain.id);
@@ -152,6 +162,28 @@
 			{:else}
 				<p class="muted">No steps yet. Edit the route to describe the path.</p>
 			{/each}
+		</section>
+
+		<section aria-label="Where it lives">
+			<div class="kicker">Where it lives</div>
+			<div class="rchips" role="group" aria-label="Rooms {chain.name} is in">
+				{#each rooms as r (r.id)}
+					<button class="rchip" class:on={inRooms.includes(r.id)} aria-pressed={inRooms.includes(r.id)}
+						disabled={movingRooms} on:click={() => toggleRoom(r.id)}>
+						<RoomIcon name={roomGlyph(r)} size={13} title="" />{r.name}
+					</button>
+				{/each}
+				<a class="rmanage" href="/chains/rooms">+ Room</a>
+			</div>
+			<p class="muted rnote">
+				{#if inRooms.length > 1}
+					In {inRooms.length} rooms. Gear is drawn once on the graph, in the room it gets the most hours in.
+				{:else if !inRooms.length}
+					In no room yet. Rooms only group chains on this page; where plays land is unchanged.
+				{:else}
+					Rooms only group chains on this page; where plays land is unchanged.
+				{/if}
+			</p>
 		</section>
 
 		<section aria-label="Setups">
@@ -421,6 +453,45 @@
 		border-color: transparent;
 		color: var(--td-text);
 		font-weight: 600;
+	}
+	.rchips {
+		display: flex;
+		flex-wrap: wrap;
+		gap: 6px;
+		align-items: center;
+	}
+	.rchip {
+		display: inline-flex;
+		align-items: center;
+		gap: 6px;
+		min-height: 34px;
+		padding: 0 12px;
+		border-radius: 999px;
+		border: 1px solid var(--td-border);
+		background: var(--td-surface2);
+		color: var(--td-text);
+		font: inherit;
+		font-size: 13px;
+		font-weight: 600;
+		cursor: pointer;
+	}
+	.rchip.on {
+		background: var(--td-accent);
+		border-color: var(--td-accent);
+		color: var(--td-on-accent);
+	}
+	.rchip:disabled {
+		opacity: 0.6;
+		cursor: default;
+	}
+	.rmanage {
+		font-size: 13px;
+		color: var(--td-accent);
+		padding: 0 6px;
+	}
+	.rnote {
+		margin-top: 8px;
+		font-size: 12.5px;
 	}
 	.vrow {
 		display: flex;

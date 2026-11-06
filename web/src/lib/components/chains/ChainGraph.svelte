@@ -9,9 +9,10 @@
 	import { createEventDispatcher } from 'svelte';
 	import { SvelteFlow, Background, Controls, type Node, type Edge } from '@xyflow/svelte';
 	import '@xyflow/svelte/dist/style.css';
-	import type { ChainVariant, Equipment, SignalChain } from '$lib/api';
+	import type { ChainVariant, Equipment, Room, SignalChain } from '$lib/api';
 	import { formatHours } from '$lib/utils';
 	import GearNode from './nodes/GearNode.svelte';
+	import BandNode from './nodes/BandNode.svelte';
 	import FitOnResize from './FitOnResize.svelte';
 	import { buildLayout, chainKeys, edgeKey, COLUMNS, NODE_W, type GearNodeData } from './layout';
 
@@ -19,11 +20,18 @@
 	export let variants: ChainVariant[] = [];
 	export let equipment: Equipment[] = [];
 	export let selectedId: number | null = null;
+	export let rooms: Room[] = [];
+	/** The room filter. Everything outside it dims and the view fits its band;
+	 *  nothing moves. */
+	export let roomId: number | null = null;
 
 	const dispatch = createEventDispatcher<{ select: number }>();
-	const nodeTypes = { gear: GearNode };
+	const nodeTypes = { gear: GearNode, band: BandNode };
 
-	$: layout = buildLayout(chains, variants, equipment);
+	$: layout = buildLayout(chains, variants, equipment, rooms);
+	$: room = roomId == null ? null : (rooms.find((r) => r.id === roomId) ?? null);
+	$: roomChains = new Set(room?.chain_ids ?? []);
+	$: inRoom = (chainIds: number[]) => !room || chainIds.some((c) => roomChains.has(c));
 	$: selected = chains.find((c) => c.id === selectedId) ?? null;
 	$: litNodes = new Set(selected ? chainKeys(selected) : []);
 	$: litEdges = new Set(
@@ -39,6 +47,12 @@
 	}
 
 	const HEAD_Y = -42;
+	// Bands run the full width with their label in a gutter on the right.
+	const BAND_X = -24;
+	const BAND_LABEL = 132;
+	$: banded = layout.bands.length > 0;
+	$: bandWidth = layout.width - 2 * BAND_X + BAND_LABEL;
+	$: drawnWidth = banded ? bandWidth : layout.width;
 
 	// Column headings ride along as non-interactive nodes so they pan and zoom
 	// with the graph instead of floating over it.
@@ -60,6 +74,22 @@
 	let nodes: Node[] = [];
 	let edges: Edge[] = [];
 	$: nodes = [
+		...layout.bands.map(
+			(b): Node => ({
+				id: b.key,
+				type: 'band',
+				position: { x: BAND_X, y: b.y },
+				data: { name: b.name, chainCount: b.chainCount, icon: b.icon, kind: b.kind },
+				class: room ? (b.roomId === room.id ? 'on' : 'off') : '',
+				width: bandWidth,
+				height: b.height,
+				zIndex: -1,
+				draggable: false,
+				selectable: false,
+				focusable: false,
+				connectable: false
+			})
+		),
 		...heads,
 		...layout.nodes.map(
 			(n): Node => ({
@@ -67,7 +97,13 @@
 				type: 'gear',
 				position: { x: n.x, y: n.y },
 				data: n.data,
-				class: selected ? (litNodes.has(n.id) ? 'lit' : 'dim') : '',
+				class: !inRoom(n.data.chains)
+					? 'away'
+					: selected
+						? litNodes.has(n.id)
+							? 'lit'
+							: 'dim'
+						: '',
 				draggable: false,
 				connectable: false,
 				ariaLabel: label(n.data)
@@ -79,7 +115,7 @@
 			id: e.id,
 			source: e.source,
 			target: e.target,
-			class: selected ? (litEdges.has(e.id) ? 'lit' : 'dim') : '',
+			class: !inRoom(e.chains) ? 'away' : selected ? (litEdges.has(e.id) ? 'lit' : 'dim') : '',
 			animated: litEdges.has(e.id),
 			selectable: false,
 			focusable: false
@@ -106,7 +142,19 @@
 	// whenever the panel is narrower than the drawing. Never zoomed past 1:1.
 	let width = 0;
 	const PAD = 48;
-	$: scale = width ? Math.min(1, width / (layout.width + PAD)) : 1;
+	$: scale = width ? Math.min(1, width / (drawnWidth + PAD)) : 1;
+
+	// What the view fits when a room is picked: its band, plus any box of one of
+	// its chains drawn in another room's band. Null fits everything.
+	$: focus = (() => {
+		if (!room) return null;
+		const band = layout.bands.find((b) => b.roomId === room.id);
+		const boxes = layout.nodes.filter((n) => inRoom(n.data.chains));
+		if (!band && !boxes.length) return null;
+		const ys = [...(band ? [band.y, band.y + band.height] : []), ...boxes.flatMap((n) => [n.y, n.y + 64])];
+		const top = Math.min(...ys);
+		return { x: BAND_X, y: top, width: banded ? bandWidth : layout.width, height: Math.max(...ys) - top };
+	})();
 	$: height = Math.round(Math.min(720, Math.max(240, (layout.height - HEAD_Y + PAD) * scale + PAD)));
 </script>
 
@@ -131,7 +179,7 @@
 			proOptions={{ hideAttribution: true }}
 			onnodeclick={({ node }) => pick(node.id)}
 		>
-			<FitOnResize key="{width}x{height}:{layout.nodes.length}" />
+			<FitOnResize key="{width}x{height}:{layout.nodes.length}:{roomId ?? 'all'}" bounds={focus} />
 			<Background gap={22} size={1.4} />
 			<Controls showLock={false} />
 		</SvelteFlow>
@@ -190,5 +238,12 @@
 	}
 	.graph :global(.svelte-flow__edge.dim path) {
 		opacity: 0.45;
+	}
+	.graph :global(.svelte-flow__edge.away path) {
+		opacity: 0.1;
+	}
+	.graph :global(.svelte-flow__node-band) {
+		pointer-events: none;
+		cursor: default;
 	}
 </style>

@@ -169,6 +169,7 @@ impl Database {
             "physical_releases",
             "physical_plays",
             "physical_images",
+            "rooms",
         ] {
             constraint!(&format!(
                 "CREATE UNIQUE INDEX IF NOT EXISTS idx_{table}_uuid ON {table}(uuid)"
@@ -801,6 +802,44 @@ impl Database {
                 last_seen INTEGER NOT NULL,
                 hits INTEGER NOT NULL DEFAULT 0,
                 UNIQUE(user_id, identifier)
+            )",
+        )
+        .await?;
+
+        // ── Rooms: where chains live ──
+        // A room holds chains, not gear: headphones move between rooms and the
+        // chains they are in do not. A chain may be in several rooms
+        // (`chain_rooms`, Ashwin 2026-11-06), so it is a link table rather than
+        // a column on `signal_chains`. `kind` is 'room' for the person's own,
+        // 'portable' for the built-in "On the go" and 'elsewhere' for the
+        // built-in that will hold "At a friend's"; the built-ins are created
+        // lazily and cannot be renamed or deleted. `icon` follows the rule
+        // `signal_chains.icon` does: the UI owns the vocabulary.
+        self.ddl(
+            "CREATE TABLE IF NOT EXISTS rooms (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                -- Stable id for replicas; see the note on `notes.uuid`.
+                uuid TEXT,
+                user_id INTEGER NOT NULL REFERENCES users(id),
+                name TEXT NOT NULL,
+                icon TEXT,
+                kind TEXT NOT NULL DEFAULT 'room',
+                sort INTEGER NOT NULL DEFAULT 0,
+                created_at INTEGER NOT NULL,
+                UNIQUE(user_id, name)
+            )",
+        )
+        .await?;
+        // `user_id` although the chain already names its owner: every read
+        // here is scoped by it without a join, and `delete_user` can clear the
+        // table in its loop like any other.
+        self.ddl(
+            "CREATE TABLE IF NOT EXISTS chain_rooms (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL REFERENCES users(id),
+                chain_id INTEGER NOT NULL REFERENCES signal_chains(id),
+                room_id INTEGER NOT NULL REFERENCES rooms(id),
+                UNIQUE(chain_id, room_id)
             )",
         )
         .await?;

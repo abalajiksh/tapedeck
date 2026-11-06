@@ -14,6 +14,7 @@ use super::models::{ErrorResponse, OkResponse};
 use super::AppState;
 use crate::db::{
     BindingRow, ChainVariant, DeviceRow, EquipmentRow, FoldOutcome, FoldSuggestion, FoldTarget,
+    Room, RoomRefusal,
 };
 use crate::models::*;
 use crate::openapi::{BadRequest, Forbidden, NotFound, Unauthorized};
@@ -1244,8 +1245,229 @@ async fn delete_binding(
     list_bindings,
     set_binding,
     delete_binding,
+    list_rooms,
+    create_room,
+    update_room,
+    delete_room,
+    set_chain_rooms,
 ))]
 pub struct Api;
+
+// ── Rooms ──
+//
+// Where chains live. Rooms group chains on the Signal Chains page and nothing
+// else: no rung of the attribution ladder reads them, so nothing here can move
+// a listen or an hour.
+
+#[derive(Serialize, ToSchema)]
+pub struct RoomList {
+    pub rooms: Vec<Room>,
+}
+
+#[derive(Deserialize, ToSchema)]
+pub struct CreateRoomRequest {
+    /// Up to 60 characters; whitespace is collapsed.
+    pub name: String,
+    /// A glyph name from the UI's set. Not validated, like a chain's icon.
+    #[serde(default)]
+    pub icon: Option<String>,
+}
+
+#[derive(Deserialize, ToSchema)]
+pub struct UpdateRoomRequest {
+    /// A new name. Absent leaves it; a built-in room cannot be renamed.
+    #[serde(default)]
+    pub name: Option<String>,
+    /// A new icon, or `null` to clear it. Absent leaves it alone.
+    #[serde(default, deserialize_with = "deserialize_some")]
+    #[schema(value_type = Option<String>)]
+    pub icon: Option<Option<String>>,
+    /// Position in the order; lower comes first.
+    #[serde(default)]
+    pub sort: Option<i64>,
+}
+
+#[derive(Deserialize, ToSchema)]
+pub struct SetChainRoomsRequest {
+    /// Every room the chain is in. **Required:** `[]` takes it out of every
+    /// room; an absent field is a 400, because this replaces what was there.
+    #[schema(value_type = Vec<i64>, required = true)]
+    pub room_ids: Option<Vec<i64>>,
+}
+
+fn room_refused(r: RoomRefusal) -> axum::response::Response {
+    let (status, error) = match r {
+        RoomRefusal::NotFound => (StatusCode::NOT_FOUND, "No such room or chain of yours"),
+        RoomRefusal::BuiltIn => {
+            (StatusCode::BAD_REQUEST, "A built-in room cannot be renamed or deleted")
+        }
+        RoomRefusal::Duplicate => (StatusCode::CONFLICT, "You already have a room with that name"),
+        RoomRefusal::BadName => {
+            (StatusCode::BAD_REQUEST, "A room needs a name of 1 to 60 characters")
+        }
+    };
+    (status, Json(ErrorResponse { code: status.as_u16(), error: error.into() })).into_response()
+}
+
+fn db_failed(e: sqlx::Error) -> axum::response::Response {
+    (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { code: 500, error: e.to_string() }))
+        .into_response()
+}
+
+/// Your rooms, in order, with the chains in each.
+///
+/// Scope: `read`. The built-in "On the go" room is created the first time this
+/// is asked, so it is always there to pick. A chain may appear in several
+/// rooms' `chain_ids`.
+#[utoipa::path(
+    get,
+    path = "/api/v1/rooms",
+    tag = "Chains",
+    security(("sessionCookie" = []), ("apiToken" = ["read"])),
+    responses(
+        (status = 200, description = "OK.", body = RoomList),
+        (status = 401, response = Unauthorized),
+        (status = 403, response = Forbidden),
+    )
+)]
+pub async fn list_rooms(
+    State(state): State<Arc<AppState>>,
+    ReadAuth { user }: ReadAuth,
+) -> impl IntoResponse {
+    match state.db.list_rooms(user.user_id).await {
+        Ok(rooms) => (StatusCode::OK, Json(RoomList { rooms })).into_response(),
+        Err(e) => db_failed(e),
+    }
+}
+
+/// Make a room of your own.
+///
+/// Session-only. Names are unique per person, ignoring case.
+#[utoipa::path(
+    post,
+    path = "/api/v1/rooms",
+    tag = "Chains",
+    request_body = CreateRoomRequest,
+    responses(
+        (status = 201, description = "Created.", body = Created),
+        (status = 400, response = BadRequest),
+        (status = 401, response = Unauthorized),
+        (status = 409, description = "You already have a room with that name.", body = ErrorResponse),
+    )
+)]
+async fn create_room(
+    State(state): State<Arc<AppState>>,
+    user: AuthUser,
+    Json(body): Json<CreateRoomRequest>,
+) -> impl IntoResponse {
+    match state.db.create_room(user.user_id, &body.name, body.icon.as_deref()).await {
+        Ok(Ok(id)) => {
+            (StatusCode::CREATED, Json(Created { id, status: "created" })).into_response()
+        }
+        Ok(Err(r)) => room_refused(r),
+        Err(e) => db_failed(e),
+    }
+}
+
+/// Rename a room, change its icon, or move it in the order.
+///
+/// Session-only. A built-in room can be reordered and given an icon, never
+/// renamed.
+#[utoipa::path(
+    patch,
+    path = "/api/v1/rooms/{id}",
+    tag = "Chains",
+    params(("id" = i64, Path, description = "The room.")),
+    request_body = UpdateRoomRequest,
+    responses(
+        (status = 200, description = "Updated.", body = Updated),
+        (status = 400, response = BadRequest),
+        (status = 401, response = Unauthorized),
+        (status = 404, response = NotFound),
+        (status = 409, description = "You already have a room with that name.", body = ErrorResponse),
+    )
+)]
+async fn update_room(
+    State(state): State<Arc<AppState>>,
+    user: AuthUser,
+    Path(id): Path<i64>,
+    Json(body): Json<UpdateRoomRequest>,
+) -> impl IntoResponse {
+    let icon = body.icon.as_ref().map(|i| i.as_deref());
+    match state.db.update_room(user.user_id, id, body.name.as_deref(), icon, body.sort).await {
+        Ok(Ok(())) => (StatusCode::OK, Json(Updated { id, status: "updated" })).into_response(),
+        Ok(Err(r)) => room_refused(r),
+        Err(e) => db_failed(e),
+    }
+}
+
+/// Delete a room of your own.
+///
+/// Session-only. Its chains leave the room and are otherwise untouched:
+/// deleting a room never deletes a chain. Built-in rooms cannot be deleted.
+#[utoipa::path(
+    delete,
+    path = "/api/v1/rooms/{id}",
+    tag = "Chains",
+    params(("id" = i64, Path, description = "The room.")),
+    responses(
+        (status = 204, description = "Deleted."),
+        (status = 400, response = BadRequest),
+        (status = 401, response = Unauthorized),
+        (status = 404, response = NotFound),
+    )
+)]
+async fn delete_room(
+    State(state): State<Arc<AppState>>,
+    user: AuthUser,
+    Path(id): Path<i64>,
+) -> impl IntoResponse {
+    match state.db.delete_room(user.user_id, id).await {
+        Ok(Ok(())) => StatusCode::NO_CONTENT.into_response(),
+        Ok(Err(r)) => room_refused(r),
+        Err(e) => db_failed(e),
+    }
+}
+
+/// Put a chain in exactly these rooms.
+///
+/// Session-only. Replaces the chain's rooms; `[]` takes it out of all of them.
+/// Refused whole if the chain or any room is not yours.
+#[utoipa::path(
+    put,
+    path = "/api/v1/chains/{id}/rooms",
+    tag = "Chains",
+    params(("id" = i64, Path, description = "The chain.")),
+    request_body = SetChainRoomsRequest,
+    responses(
+        (status = 200, description = "Updated.", body = Updated),
+        (status = 400, response = BadRequest),
+        (status = 401, response = Unauthorized),
+        (status = 404, response = NotFound),
+    )
+)]
+async fn set_chain_rooms(
+    State(state): State<Arc<AppState>>,
+    user: AuthUser,
+    Path(id): Path<i64>,
+    Json(body): Json<SetChainRoomsRequest>,
+) -> impl IntoResponse {
+    let Some(room_ids) = body.room_ids else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                code: 400,
+                error: "`room_ids` is required; send [] to take the chain out of every room".into(),
+            }),
+        )
+            .into_response();
+    };
+    match state.db.set_chain_rooms(user.user_id, id, &room_ids).await {
+        Ok(Ok(())) => (StatusCode::OK, Json(Updated { id, status: "updated" })).into_response(),
+        Ok(Err(r)) => room_refused(r),
+        Err(e) => db_failed(e),
+    }
+}
 
 // ── Router ──
 
@@ -1266,6 +1488,9 @@ pub fn create_gear_router() -> Router<Arc<AppState>> {
         // which matchit prefers over "/:id".
         .route("/api/v1/chains/duplicates", get(list_duplicates))
         .route("/api/v1/chains/:id/fold", post(fold_chain))
+        .route("/api/v1/chains/:id/rooms", axum::routing::put(set_chain_rooms))
+        .route("/api/v1/rooms", get(list_rooms).post(create_room))
+        .route("/api/v1/rooms/:id", patch(update_room).delete(delete_room))
         .route("/api/v1/devices", get(list_devices))
         .route("/api/v1/devices/:id", patch(set_device_chain))
         .route("/api/v1/equipment", post(create_equipment).get(list_equipment))

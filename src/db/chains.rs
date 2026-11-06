@@ -374,6 +374,13 @@ impl Database {
             .await?;
         }
 
+        // Rooms hold the chain by a link row; the rooms themselves stay.
+        sqlx::query(&crate::sql!("DELETE FROM chain_rooms WHERE chain_id = ? AND user_id = ?"))
+            .bind(chain_id)
+            .bind(user_id)
+            .execute(&mut *tx)
+            .await?;
+
         let res =
             sqlx::query(&crate::sql!("DELETE FROM signal_chains WHERE id = ? AND user_id = ?"))
                 .bind(chain_id)

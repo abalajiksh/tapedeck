@@ -11,7 +11,7 @@
 // A step names its gear by `equipment_id` when it was picked from your gear,
 // and by name otherwise, so two chains that typed "MR4" by hand share a box.
 
-import type { ChainComponent, ChainVariant, Equipment, SignalChain } from '$lib/api';
+import type { ChainComponent, ChainVariant, Equipment, Room, SignalChain } from '$lib/api';
 
 export const COLUMNS = ['Plays from', 'Converts', 'Amplifies', 'Heard on'] as const;
 
@@ -92,9 +92,23 @@ export interface LaidEdge {
 	chains: number[];
 }
 
+/** One room's horizontal band behind its rows. `roomId` is null for the
+ *  "No room yet" band, drawn only when some chains have a room and some not. */
+export interface LaidBand {
+	key: string;
+	roomId: number | null;
+	name: string;
+	kind: string;
+	icon: string | null;
+	y: number;
+	height: number;
+	chainCount: number;
+}
+
 export interface Layout {
 	nodes: LaidNode[];
 	edges: LaidEdge[];
+	bands: LaidBand[];
 	/** Left edge of each column, for the headings above it. */
 	columnX: number[];
 	width: number;
@@ -126,10 +140,19 @@ const TYPE_LABEL: Record<string, string> = {
 	bluetooth: 'Bluetooth'
 };
 
+/** A room's glyph: its own icon, or the built-in's. */
+export function roomGlyph(r: Pick<Room, 'icon' | 'kind'>): string | null {
+	return r.icon ?? (r.kind === 'portable' ? 'go' : r.kind === 'elsewhere' ? 'away' : null);
+}
+
+const BAND_PAD = 16;
+const BAND_GAP = 22;
+
 export function buildLayout(
 	chains: SignalChain[],
 	variants: ChainVariant[],
-	equipment: Equipment[]
+	equipment: Equipment[],
+	rooms: Room[] = []
 ): Layout {
 	const gear = new Map(equipment.map((e) => [e.id, e]));
 	const nodes = new Map<string, GearNodeData>();
@@ -227,7 +250,40 @@ export function buildLayout(
 	const xOf = (n: GearNodeData) =>
 		columnX[n.column] + (sub.get(n.key) ?? 0) * (NODE_W + SUB_GAP);
 
-	// ── y: one barycentre pass, rank by rank, left to right ──
+	// ── Which room's band each box sits in ──
+	// A box can be in chains in several rooms (headphones on the desk and on
+	// the commute). It is drawn once, in the room where it has the most hours,
+	// and its wires reach into the others. A chain in two rooms counts in both.
+	const roomsOf = new Map<number, number[]>();
+	for (const r of rooms) for (const cid of r.chain_ids) roomsOf.set(cid, [...(roomsOf.get(cid) ?? []), r.id]);
+	const banded = roomsOf.size > 0;
+	const order = new Map(rooms.map((r, i) => [r.id, i]));
+	const chainHours = new Map(chains.map((c) => [c.id, c.total_hours]));
+	const bandOf = new Map<string, number | null>();
+	for (const n of nodes.values()) {
+		if (!banded) {
+			bandOf.set(n.key, null);
+			continue;
+		}
+		const weight = new Map<number, number>();
+		for (const cid of n.chains)
+			for (const rid of roomsOf.get(cid) ?? [])
+				// A little per chain, so a room still wins on chains alone when
+				// nothing has logged hours yet.
+				weight.set(rid, (weight.get(rid) ?? 0) + (chainHours.get(cid) ?? 0) + 0.001);
+		const best = [...weight.entries()].sort(
+			(a, b) => b[1] - a[1] || (order.get(a[0]) ?? 0) - (order.get(b[0]) ?? 0)
+		)[0];
+		bandOf.set(n.key, best ? best[0] : null);
+	}
+	const bandKeys: (number | null)[] = banded
+		? [
+				...rooms.filter((r) => [...bandOf.values()].includes(r.id)).map((r) => r.id),
+				...([...bandOf.values()].includes(null) ? [null] : [])
+			]
+		: [null];
+
+	// ── y: one barycentre pass per band, rank by rank, left to right ──
 	const incoming = new Map<string, string[]>();
 	for (const e of edges.values()) {
 		const list = incoming.get(e.target) ?? [];
@@ -235,33 +291,64 @@ export function buildLayout(
 		incoming.set(e.target, list);
 	}
 	const rankOf = (n: GearNodeData) => n.column * 10 + (sub.get(n.key) ?? 0);
-	const ranks = [...new Set([...nodes.values()].map(rankOf))].sort((a, b) => a - b);
 	const y = new Map<string, number>();
 	const step = NODE_H + ROW_GAP;
 	// Ties break by hours, then by name, so equal inputs always draw the same.
 	const byWeight = (a: GearNodeData, b: GearNodeData) =>
 		(b.hours ?? 0) - (a.hours ?? 0) || a.name.localeCompare(b.name);
-	let height = 0;
-	for (const r of ranks) {
-		const here = [...nodes.values()].filter((n) => rankOf(n) === r);
-		const want = (n: GearNodeData) => {
-			const ys = (incoming.get(n.key) ?? []).map((k) => y.get(k)).filter((v) => v != null) as number[];
-			return ys.length ? ys.reduce((a, b) => a + b, 0) / ys.length : Number.POSITIVE_INFINITY;
-		};
-		here.sort((a, b) => want(a) - want(b) || byWeight(a, b));
-		let next = 0;
-		for (const n of here) {
-			const w = want(n);
-			const at = Number.isFinite(w) ? Math.max(w, next) : next;
-			y.set(n.key, at);
-			next = at + step;
+	const bands: LaidBand[] = [];
+	let top = 0;
+	for (const bk of bandKeys) {
+		const inBand = [...nodes.values()].filter((n) => bandOf.get(n.key) === bk);
+		if (!inBand.length) continue;
+		const ranks = [...new Set(inBand.map(rankOf))].sort((a, b) => a - b);
+		const start = top + (banded ? BAND_PAD : 0);
+		let bottom = start;
+		for (const r of ranks) {
+			const here = inBand.filter((n) => rankOf(n) === r);
+			// Only boxes in this band pull on each other; a wire from another
+			// room's band must not drag a box out of its own.
+			const want = (n: GearNodeData) => {
+				const ys = (incoming.get(n.key) ?? [])
+					.filter((k) => bandOf.get(k) === bk)
+					.map((k) => y.get(k))
+					.filter((v) => v != null) as number[];
+				return ys.length ? ys.reduce((a, b) => a + b, 0) / ys.length : Number.POSITIVE_INFINITY;
+			};
+			here.sort((a, b) => want(a) - want(b) || byWeight(a, b));
+			let next = start;
+			for (const n of here) {
+				const w = want(n);
+				const at = Number.isFinite(w) ? Math.max(w, next) : next;
+				y.set(n.key, at);
+				next = at + step;
+			}
+			bottom = Math.max(bottom, next - ROW_GAP);
 		}
-		height = Math.max(height, next - ROW_GAP);
+		const end = bottom + (banded ? BAND_PAD : 0);
+		if (banded) {
+			const room = bk == null ? null : rooms.find((r) => r.id === bk);
+			bands.push({
+				key: `band:${bk ?? 'none'}`,
+				roomId: bk,
+				name: room?.name ?? 'No room yet',
+				kind: room?.kind ?? 'none',
+				icon: room ? roomGlyph(room) : null,
+				y: top,
+				height: end - top,
+				chainCount: bk == null
+					? chains.filter((c) => !roomsOf.has(c.id)).length
+					: (room?.chain_ids.length ?? 0)
+			});
+		}
+		top = end + (banded ? BAND_GAP : ROW_GAP);
 	}
+	const height = Math.max(0, top - (banded ? BAND_GAP : ROW_GAP));
 
 	return {
 		nodes: [...nodes.values()].map((d) => ({ id: d.key, x: xOf(d), y: y.get(d.key) ?? 0, data: d })),
 		edges: [...edges.values()],
+		bands,
 		columnX,
 		width,
 		height

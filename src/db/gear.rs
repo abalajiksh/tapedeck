@@ -454,6 +454,26 @@ impl Database {
             .await?;
         }
 
+        // The folded chain's rooms become the kept chain's too: it was the same
+        // rig, so wherever either of them lived, the one left lives there now.
+        sqlx::query(&crate::sql!(
+            "INSERT INTO chain_rooms (user_id, chain_id, room_id)
+             SELECT user_id, ?, room_id FROM chain_rooms
+              WHERE chain_id = ? AND user_id = ?
+                AND room_id NOT IN (SELECT room_id FROM chain_rooms WHERE chain_id = ?)"
+        ))
+        .bind(into_chain_id)
+        .bind(from_chain_id)
+        .bind(user_id)
+        .bind(into_chain_id)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(&crate::sql!("DELETE FROM chain_rooms WHERE chain_id = ? AND user_id = ?"))
+            .bind(from_chain_id)
+            .bind(user_id)
+            .execute(&mut *tx)
+            .await?;
+
         sqlx::query(&crate::sql!("DELETE FROM signal_chains WHERE id = ? AND user_id = ?"))
             .bind(from_chain_id)
             .bind(user_id)

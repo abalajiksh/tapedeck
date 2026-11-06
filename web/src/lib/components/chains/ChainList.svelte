@@ -6,7 +6,7 @@
 	// over what you were looking at. Each row is one button, so the list works
 	// with a keyboard however the graph is drawn.
 	import { createEventDispatcher } from 'svelte';
-	import type { ChainVariant, SignalChain } from '$lib/api';
+	import type { ChainVariant, Room, SignalChain } from '$lib/api';
 	import ChainIcon from '$lib/components/ChainIcon.svelte';
 	import { lastUsedLabel, swappedPositions } from './format';
 
@@ -14,12 +14,37 @@
 	export let variants: ChainVariant[] = [];
 	export let lastUsed: Record<string, number> = {};
 	export let selectedId: number | null = null;
+	export let rooms: Room[] = [];
+	/** The room filter: only that room's chains are listed. */
+	export let roomId: number | null = null;
 
 	const dispatch = createEventDispatcher<{ select: number }>();
+
+	// Grouped by room in the rooms' own order, once any chain has a room. A
+	// chain in two rooms is listed under both, because that is where it is;
+	// chains with no room come last, under "No room yet".
+	$: roomed = new Set(rooms.flatMap((r) => r.chain_ids));
+	$: groups =
+		roomed.size === 0
+			? [{ key: 'all', title: null as string | null, list: chains }]
+			: [
+					...rooms
+						.filter((r) => (roomId == null ? r.chain_ids.length > 0 : r.id === roomId))
+						.map((r) => ({
+							key: `r${r.id}`,
+							title: r.name as string | null,
+							list: chains.filter((c) => r.chain_ids.includes(c.id))
+						})),
+					...(roomId == null
+						? [{ key: 'none', title: 'No room yet' as string | null, list: chains.filter((c) => !roomed.has(c.id)) }]
+						: [])
+				].filter((g) => g.list.length || roomId != null);
 </script>
 
 <nav class="clist" aria-label="Your chains">
-	{#each chains as c (c.id)}
+	{#each groups as g (g.key)}
+	{#if g.title}<div class="rhead">{g.title}<span class="n">· {g.list.length}</span></div>{/if}
+	{#each g.list as c (`${g.key}:${c.id}`)}
 		{@const swaps = swappedPositions(c, variants)}
 		{@const steps = (c.components ?? []).filter((s) => s.name.trim())}
 		<button
@@ -46,6 +71,9 @@
 				<span class="pwhen">{lastUsedLabel(lastUsed[String(c.id)])}</span>
 			</span>
 		</button>
+	{:else}
+		<p class="empty">No chains in this room yet. Open a chain and add it to the room.</p>
+	{/each}
 	{/each}
 </nav>
 
@@ -54,6 +82,29 @@
 		display: flex;
 		flex-direction: column;
 		gap: 4px;
+	}
+	.rhead {
+		display: flex;
+		align-items: center;
+		gap: 8px;
+		padding: 12px 12px 4px;
+		font-size: 11px;
+		letter-spacing: 0.1em;
+		text-transform: uppercase;
+		font-weight: 700;
+		color: var(--td-muted-2);
+	}
+	.rhead .n {
+		letter-spacing: 0;
+		text-transform: none;
+		font-weight: 600;
+		color: var(--td-muted-3);
+	}
+	.empty {
+		margin: 0;
+		padding: 8px 12px;
+		font-size: 13px;
+		color: var(--td-muted);
 	}
 	.place {
 		display: flex;

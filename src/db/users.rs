@@ -330,10 +330,22 @@ impl Database {
             // failed on the foreign key.
             "sessions",
             "tokens",
-            "signal_chains",
-            "devices",
-            "equipment",
+            // Everything below that names a chain or a setup clears before
+            // `chain_variants` and `signal_chains`. Until 2026-11-06 the
+            // variants were never cleared at all, and bindings, devices and
+            // pairing requests came after the chains, so deleting anyone with a
+            // setup, a mapped output, a machine with a default chain or a
+            // pairing in flight failed on the foreign key.
+            "pairing_requests",
             "chain_bindings",
+            "devices",
+            // A room's link rows point at a chain and a room, so they clear
+            // before both; the rooms point at nothing else.
+            "chain_rooms",
+            "rooms",
+            "chain_variants",
+            "signal_chains",
+            "equipment",
             "import_jobs",
             "web_sessions",
             "user_connections",
