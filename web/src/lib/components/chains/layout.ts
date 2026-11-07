@@ -30,18 +30,18 @@ export const columnOf = (type: string): number => COLUMN_OF[type] ?? 0;
 
 /** Gear that is part of another box (a laptop's own speakers, a phone's
  *  speaker). Drawn dashed: it is not something you could unplug. */
-const BUILT_IN = new Set(['builtin-speakers']);
+export const BUILT_IN = new Set(['builtin-speakers']);
 
 /** A `ChainIcon` glyph for a box, from its gear type or, for a typed-in step,
  *  its role. */
-const ICON_FOR_GEAR: Record<string, string> = {
+export const ICON_FOR_GEAR: Record<string, string> = {
 	headphones: 'headphones', iem: 'iem', earbuds: 'earbuds', speakers: 'speakers',
 	subwoofer: 'subwoofer', 'builtin-speakers': 'speakers', dac: 'dac', 'dac-amp': 'dac',
 	interface: 'dac', receiver: 'amp', amp: 'amp', preamp: 'amp', phono: 'amp',
 	phone: 'phone', computer: 'laptop', dap: 'dap', turntable: 'turntable',
 	cartridge: 'turntable', headshell: 'turntable', radio: 'radio', transport: 'cdplayer'
 };
-const ICON_FOR_ROLE: Record<string, string> = {
+export const ICON_FOR_ROLE: Record<string, string> = {
 	dac: 'dac', amp: 'amp', transducer: 'speakers', bluetooth: 'earbuds', transport: 'cdplayer'
 };
 

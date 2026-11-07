@@ -1,3 +1,19 @@
+<script lang="ts" context="module">
+	/** A rule for how plays find a chain, moved to another chain (or to none)
+	 *  from the drawer. The page carries it out. */
+	export interface RuleChange {
+		kind: 'binding' | 'device_binding' | 'device';
+		/** The binding's or device's id. */
+		id: number;
+		identifier: string;
+		equipmentId: number | null;
+		/** Where it goes now; null stops it coming here (an output is forgotten
+		 *  and learned again on its next play). */
+		chainId: number | null;
+		label: string;
+	}
+</script>
+
 <script lang="ts">
 	// One chain, opened: the route and what's on now at its slots, how plays
 	// find it, the hours on its gear, and who sees what played through it.
@@ -11,7 +27,7 @@
 	// It owns no state that outlives it: every action goes back to the page,
 	// which holds the dialogs and the data, and `changed` asks it to reload.
 	import { createEventDispatcher } from 'svelte';
-	import type { Binding, ChainVariant, Device, Equipment, Room, SignalChain, WhatsOn } from '$lib/api';
+	import type { Binding, ChainVariant, Device, DeviceBinding, Equipment, Room, SignalChain, WhatsOn } from '$lib/api';
 	import ChainIcon from '$lib/components/ChainIcon.svelte';
 	import { formatHours } from '$lib/utils';
 	import { COLUMNS, columnOf, roomGlyph } from './layout';
@@ -24,6 +40,9 @@
 	export let equipment: Equipment[] = [];
 	export let devices: Device[] = [];
 	export let bindings: Binding[] = [];
+	export let deviceBindings: DeviceBinding[] = [];
+	/** Every chain, for moving a rule to another one. */
+	export let chains: SignalChain[] = [];
 	export let lastUsed: number | null = null;
 	export let sharing = false;
 	/** Another chain differs from this one at one box, so it can merge in. */
@@ -44,7 +63,9 @@
 		delete: void;
 		duplicate: void;
 		edit: void;
+		rename: void;
 		rooms: number[];
+		rule: RuleChange;
 		changed: string;
 	}>();
 
@@ -81,22 +102,36 @@
 		passive: 'tag-accent'
 	};
 
+	/** What a binding says it does here. */
+	const says = (variantId: number | null) =>
+		variantId != null
+			? `Comes here and puts on ${(() => {
+					const v = mine.find((x) => x.id === variantId);
+					return v ? variantLabel(v, equipment) : 'other gear';
+				})()} by itself`
+			: whatsOn?.slots.length
+				? 'Comes here, on whatever is on now'
+				: 'Comes here';
+	// Most specific first, the order the ladder tries them: an output of a box,
+	// an output by name, then a machine's fallback.
 	$: routing = [
+		...deviceBindings
+			.filter((b) => b.chain_id === chain.id)
+			.map((b) => ({
+				key: `db${b.id}`,
+				label: b.identifier,
+				kind: `${b.equipment_name} · ${b.interface ?? 'output'}`,
+				says: says(b.chain_variant_id),
+				rule: { kind: 'device_binding', id: b.id, identifier: b.identifier, equipmentId: b.equipment_id, label: b.identifier } as const
+			})),
 		...bindings
 			.filter((b) => b.chain_id === chain.id)
 			.map((b) => ({
 				key: `b${b.id}`,
 				label: b.identifier,
 				kind: b.interface ?? 'output',
-				says:
-					b.chain_variant_id != null
-						? `Comes here and puts on ${(() => {
-								const v = mine.find((x) => x.id === b.chain_variant_id);
-								return v ? variantLabel(v, equipment) : 'other gear';
-							})()} by itself`
-						: whatsOn?.slots.length
-							? 'Comes here, on whatever is on now'
-							: 'Comes here'
+				says: says(b.chain_variant_id),
+				rule: { kind: 'binding', id: b.id, identifier: b.identifier, equipmentId: null, label: b.identifier } as const
 			})),
 		...devices
 			.filter((d) => d.default_chain_id === chain.id)
@@ -104,9 +139,14 @@
 				key: `d${d.id}`,
 				label: d.name ?? d.machine_id,
 				kind: d.platform ?? 'machine',
-				says: 'Comes here when nothing more specific says where'
+				says: 'Comes here when nothing more specific says where',
+				rule: { kind: 'device', id: d.id, identifier: '', equipmentId: null, label: d.name ?? d.machine_id } as const
 			}))
 	];
+	function move(r: (typeof routing)[number], value: string) {
+		dispatch('rule', { ...r.rule, chainId: value === '' ? null : Number(value) });
+	}
+
 	// Hours per piece of gear on *this* chain, from the same breakdown the
 	// equipment table uses, so the two cannot disagree.
 	$: gearHours = equipment
@@ -235,11 +275,18 @@
 				<div class="rule">
 					<span class="tag tag-neutral rtag" title={r.kind}>{r.label}</span>
 					<span class="rsays">{r.says}</span>
+					<select class="input rmove" value="" aria-label="Move {r.label} to another chain"
+						on:change={(e) => { const v = e.currentTarget.value; e.currentTarget.value = ''; if (v) move(r, v === 'none' ? '' : v); }}>
+						<option value="">Move…</option>
+						{#each chains.filter((c) => c.id !== chain.id) as c (c.id)}<option value={c.id}>to {c.name}</option>{/each}
+						<option value="none">{r.rule.kind === 'device' ? 'Stop: no fallback' : 'Forget it (asked again next play)'}</option>
+					</select>
 				</div>
 			{:else}
 				<p class="muted">
 					Nothing sends plays here on its own yet. They land here when a client names this
-					chain, or when an output or machine below the graph is set to it.
+					chain, when you answer a question in the inbox, or when you send an output here from
+					the route editor’s first box.
 				</p>
 			{/each}
 		</section>
@@ -280,6 +327,7 @@
 		<button class="btn btn-ghost del" on:click={() => dispatch('delete')}>Delete chain</button>
 		<span style="flex:1"></span>
 		<button class="btn btn-secondary" on:click={() => dispatch('duplicate')}>Duplicate</button>
+		<button class="btn btn-secondary" on:click={() => dispatch('rename')}>Rename</button>
 		<button class="btn btn-primary" on:click={() => dispatch('edit')}>Edit the route</button>
 	</footer>
 </aside>
@@ -598,6 +646,13 @@
 		overflow: hidden;
 		text-overflow: ellipsis;
 		max-width: 180px;
+	}
+	.rmove {
+		width: auto;
+		max-width: 130px;
+		font-size: 12px;
+		padding: 4px 8px;
+		margin-left: auto;
 	}
 	.rsays {
 		flex: 1;

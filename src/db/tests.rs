@@ -12859,3 +12859,132 @@ async fn a_chain_that_swaps_one_box_merges_in_as_an_option() {
     assert_eq!(gear_secs(&db, uid).await, before, "the Hexa hour stays on the Hexa");
     assert!(db.merge_candidates(uid).await.unwrap().is_empty());
 }
+
+// ── The route editor (phase 4) ──
+
+/// "From now on": the old route stays on every play already logged, what is
+/// on now carries over by gear, an output's own pick keeps picking, and a
+/// switch cannot reach back past the change.
+#[tokio::test]
+async fn a_route_saved_from_now_on_leaves_past_plays_on_the_old_route() {
+    let db = testdb().await;
+    let uid = db.create_user("ash", None, "pw", "user").await.unwrap();
+    let g = |n: &'static str, t: &'static str| {
+        let db = &db;
+        async move { db.upsert_equipment(uid, n, t, None, None, 0.0, None).await.unwrap() }
+    };
+    let (dell, mimir, dawn) =
+        (g("Dell", "computer").await, g("Mimir", "dac").await, g("Dawn", "dac").await);
+    let (hd650, hexa) = (g("HD 650", "headphones").await, g("Hexa", "iem").await);
+    let steps = |dac: (i64, &str)| {
+        vec![
+            step_of(ComponentType::Source, "Dell", dell, None),
+            step_of(ComponentType::Dac, dac.1, dac.0, None),
+            step_of(ComponentType::Transducer, "HD 650", hd650, Some(vec![hd650, hexa])),
+        ]
+    };
+    let chain = chain_with(&db, uid, "Desk", steps((mimir, "Mimir"))).await;
+    let day = 86_400;
+    let t0 = Database::now_secs() - 30 * day;
+    played(&db, uid, chain, t0, None).await;
+    played(&db, uid, chain, t0 + day, None).await;
+    db.fit(uid, chain, 2, hexa, Some(t0 + 2 * day), false).await.unwrap().unwrap();
+    played(&db, uid, chain, t0 + 3 * day, None).await;
+    // An output that puts the Hexa on by itself.
+    let hexa_v = variant_at(&db, uid, t0 + 3 * day).await.unwrap();
+    db.set_binding(uid, "Bluetooth", Some(chain), Some(hexa_v)).await.unwrap();
+    let before = gear_secs(&db, uid).await;
+
+    let out = db.save_route(uid, chain, &steps((dawn, "Dawn")), true).await.unwrap().unwrap();
+    assert_eq!((out.past, out.kept, out.unchanged), ("keep", 2, false));
+    assert_eq!(gear_secs(&db, uid).await, before, "no hour moves");
+
+    // A new play runs through the new route with the Hexa still on.
+    let now = Database::now_secs();
+    played(&db, uid, chain, now + 5, None).await;
+    let secs: HashMap<i64, i64> = gear_secs(&db, uid).await.into_iter().collect();
+    assert_eq!(secs.get(&dawn), Some(&3600));
+    assert_eq!(secs.get(&mimir), Some(&(3 * 3600)));
+    assert_eq!(secs.get(&hexa), Some(&(2 * 3600)));
+    let on = db.whats_on(uid, chain).await.unwrap().unwrap();
+    assert_eq!(on.slots[0].on, hexa);
+
+    // The output still picks the Hexa, now on the new route.
+    let (bound, v) = db.resolve_binding(uid, "Bluetooth").await.unwrap().unwrap();
+    assert_eq!(bound, chain);
+    let v = v.unwrap();
+    assert_ne!(v, hexa_v);
+    let resolved = {
+        let vs = db.list_variants(uid).await.unwrap();
+        let c = db.get_chain(uid, chain).await.unwrap().unwrap();
+        crate::models::resolve_variant(
+            &c.components,
+            &vs.iter().find(|x| x.id == v).unwrap().overrides,
+        )
+    };
+    let gear: Vec<Option<i64>> = resolved.iter().map(|c| c.equipment_id).collect();
+    assert_eq!(gear, vec![Some(dell), Some(dawn), Some(hexa)]);
+
+    // A switch cannot be backdated across the route change.
+    assert_eq!(
+        db.fit(uid, chain, 2, hd650, Some(t0 + day), true).await.unwrap(),
+        Err(FitRefusal::BeforeRouteChange)
+    );
+    // Switching now works on the new route.
+    db.fit(uid, chain, 2, hd650, None, false).await.unwrap().unwrap();
+    assert!(db.delete_chain(uid, chain).await.unwrap());
+}
+
+/// "Rewrite past plays too": every play is read through the new route, and
+/// a swap follows its gear to wherever it sits now.
+#[tokio::test]
+async fn a_rewritten_route_moves_the_hours_and_swaps_follow_their_gear() {
+    let db = testdb().await;
+    let uid = db.create_user("ash", None, "pw", "user").await.unwrap();
+    let dell = db.upsert_equipment(uid, "Dell", "computer", None, None, 0.0, None).await.unwrap();
+    let mimir = db.upsert_equipment(uid, "Mimir", "dac", None, None, 0.0, None).await.unwrap();
+    let amp = db.upsert_equipment(uid, "Midgaard", "amp", None, None, 0.0, None).await.unwrap();
+    let hd650 =
+        db.upsert_equipment(uid, "HD 650", "headphones", None, None, 0.0, None).await.unwrap();
+    let hexa = db.upsert_equipment(uid, "Hexa", "iem", None, None, 0.0, None).await.unwrap();
+    let chain = chain_with(
+        &db,
+        uid,
+        "Desk",
+        vec![
+            step_of(ComponentType::Source, "Dell", dell, None),
+            step_of(ComponentType::Transducer, "HD 650", hd650, Some(vec![hd650, hexa])),
+        ],
+    )
+    .await;
+    let t = Database::now_secs() - 10 * 86_400;
+    played(&db, uid, chain, t, None).await;
+    db.fit(uid, chain, 1, hexa, Some(t + 100), false).await.unwrap().unwrap();
+    played(&db, uid, chain, t + 4000, None).await;
+
+    // A DAC and an amp go in between: the headphones move from 1 to 3.
+    let new = vec![
+        step_of(ComponentType::Source, "Dell", dell, None),
+        step_of(ComponentType::Dac, "Mimir", mimir, None),
+        step_of(ComponentType::Amp, "Midgaard", amp, None),
+        step_of(ComponentType::Transducer, "HD 650", hd650, None),
+    ];
+    let out = db.save_route(uid, chain, &new, false).await.unwrap().unwrap();
+    assert_eq!((out.past, out.unchanged), ("rewrite", false));
+    let comps = db.get_chain(uid, chain).await.unwrap().unwrap().components;
+    assert_eq!(comps[3].options, Some(vec![hd650, hexa]), "options carried by gear");
+    let secs: HashMap<i64, i64> = gear_secs(&db, uid).await.into_iter().collect();
+    assert_eq!(secs.get(&mimir), Some(&(2 * 3600)), "every past play runs through the new boxes");
+    assert_eq!(secs.get(&hexa), Some(&3600), "the Hexa swap followed the headphones to step 3");
+    assert_eq!(secs.get(&hd650), Some(&3600));
+
+    // The same wiring again is no change at all.
+    let again = db.save_route(uid, chain, &comps, true).await.unwrap().unwrap();
+    assert!(again.unchanged);
+    // Gear that is not yours is refused.
+    let other = db.create_user("kim", None, "pw", "user").await.unwrap();
+    let theirs = db.upsert_equipment(other, "Theirs", "dac", None, None, 0.0, None).await.unwrap();
+    let mut bad = comps.clone();
+    bad[1].equipment_id = Some(theirs);
+    assert!(db.save_route(uid, chain, &bad, true).await.unwrap().is_err());
+}

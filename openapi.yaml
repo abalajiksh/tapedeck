@@ -5616,6 +5616,44 @@ paths:
                 $ref: '#/components/schemas/MoodsRetired'
         '401':
           $ref: '#/components/responses/Unauthorized'
+  /api/v1/chains/{id}/route:
+    put:
+      tags:
+      - Chains
+      summary: Save a chain's route from the route editor.
+      description: |-
+        Session-only. With `past: keep` the old route is kept as hidden history:
+        past plays stay on it, every other variant keeps naming the gear it did,
+        and a switch now starts the new route with whatever was on at its slots
+        (outputs that pick gear by themselves keep picking it). With `past:
+        rewrite` the steps are replaced and every past play is read through them.
+        Name, icon and the rest stay with `PATCH /api/v1/chains/{id}`.
+      operationId: save_route
+      parameters:
+      - name: id
+        in: path
+        description: The chain.
+        required: true
+        schema:
+          type: integer
+          format: int64
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SaveRouteRequest'
+        required: true
+      responses:
+        '200':
+          description: Saved.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RouteSaved'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
   /api/v1/notes:
     get:
       tags:
@@ -22987,6 +23025,24 @@ components:
           description: The new secret, returned once. The old one stops working now.
         message:
           type: string
+    RouteSaved:
+      type: object
+      description: What a route save did.
+      required:
+      - past
+      - kept
+      - unchanged
+      properties:
+        past:
+          type: string
+          description: '`keep` (past plays keep the old route) or `rewrite`.'
+        kept:
+          type: integer
+          format: int64
+          description: Plays (skips excluded) now filed with the old route. 0 for `rewrite`.
+        unchanged:
+          type: boolean
+          description: The route did not change; only slot options or names were saved.
     RowCreated:
       type: object
       description: A row that was just created.
@@ -23189,6 +23245,26 @@ components:
             - 'null'
             description: '`private` by default.'
       description: A note's target, flattened alongside its body.
+    SaveRouteRequest:
+      type: object
+      required:
+      - components
+      - past
+      properties:
+        components:
+          type: array
+          items:
+            $ref: '#/components/schemas/ChainComponent'
+          description: |-
+            The steps in order, as the editor wired them. Slot `options` travel
+            on the steps; leaving them out keeps the ones a step had.
+        past:
+          type: string
+          description: |-
+            `keep`: plays already logged keep the route they had (from now on).
+            `rewrite`: every play ever logged here is read through the new route.
+            Required: on an endpoint that can move every hour of a chain, "which
+            one" must never be a default.
     SavedPlaylist:
       type: object
       required:

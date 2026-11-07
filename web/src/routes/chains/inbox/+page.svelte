@@ -65,7 +65,7 @@
 	</div>
 {/if}
 
-<p class="foot">Answers can be changed later from the chain they went to, or from the Outputs and Machines tabs.</p>
+<p class="foot">Answers can be changed later from the chain they went to: open it and use “How plays find this chain”, or its route editor.</p>
 
 <style>
 	.back {

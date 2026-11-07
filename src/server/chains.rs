@@ -15,7 +15,7 @@ use super::AppState;
 use crate::db::{
     BindingRow, ChainVariant, DeviceBindingRow, DeviceRow, EquipmentRow, FitOutcome, FitRefusal,
     FoldOutcome, FoldSuggestion, FoldTarget, InboxQuestion, MoodsRetired, Room, RoomRefusal,
-    WhatsOn, WhereAnswered,
+    RouteSaved, WhatsOn, WhereAnswered,
 };
 use crate::models::*;
 use crate::openapi::{BadRequest, Forbidden, NotFound, Unauthorized};
@@ -1323,8 +1323,61 @@ async fn delete_binding(
     fit_slot,
     merge_chain,
     retire_moods,
+    save_route,
 ))]
 pub struct Api;
+
+// ── The route editor ──
+
+#[derive(Deserialize, ToSchema)]
+pub struct SaveRouteRequest {
+    /// The steps in order, as the editor wired them. Slot `options` travel
+    /// on the steps; leaving them out keeps the ones a step had.
+    pub components: Vec<ChainComponent>,
+    /// `keep`: plays already logged keep the route they had (from now on).
+    /// `rewrite`: every play ever logged here is read through the new route.
+    /// Required: on an endpoint that can move every hour of a chain, "which
+    /// one" must never be a default.
+    pub past: String,
+}
+
+/// Save a chain's route from the route editor.
+///
+/// Session-only. With `past: keep` the old route is kept as hidden history:
+/// past plays stay on it, every other variant keeps naming the gear it did,
+/// and a switch now starts the new route with whatever was on at its slots
+/// (outputs that pick gear by themselves keep picking it). With `past:
+/// rewrite` the steps are replaced and every past play is read through them.
+/// Name, icon and the rest stay with `PATCH /api/v1/chains/{id}`.
+#[utoipa::path(
+    put,
+    path = "/api/v1/chains/{id}/route",
+    tag = "Chains",
+    params(("id" = i64, Path, description = "The chain.")),
+    request_body = SaveRouteRequest,
+    responses(
+        (status = 200, description = "Saved.", body = RouteSaved),
+        (status = 400, response = BadRequest),
+        (status = 401, response = Unauthorized),
+    )
+)]
+async fn save_route(
+    State(state): State<Arc<AppState>>,
+    user: AuthUser,
+    Path(id): Path<i64>,
+    Json(body): Json<SaveRouteRequest>,
+) -> impl IntoResponse {
+    let keep = match body.past.as_str() {
+        "keep" => true,
+        "rewrite" => false,
+        _ => return bad("past must be keep or rewrite"),
+    };
+    match state.db.save_route(user.user_id, id, &body.components, keep).await {
+        Ok(Ok(out)) => (StatusCode::OK, Json(out)).into_response(),
+        Ok(Err(why)) => bad(&why),
+        Err(e) => internal(e),
+    }
+}
 
 // ── What's on now ──
 //
@@ -1411,6 +1464,9 @@ async fn fit_slot(
         Ok(Err(FitRefusal::NotASlot)) => bad("That step has no options to pick from"),
         Ok(Err(FitRefusal::NotAnOption)) => bad("That gear is not one of this step's options"),
         Ok(Err(FitRefusal::InFuture)) => bad("A switch cannot start in the future"),
+        Ok(Err(FitRefusal::BeforeRouteChange)) => {
+            bad("That is before the route last changed; pick a time after it")
+        }
         Err(e) => internal(e),
     }
 }
@@ -1979,6 +2035,7 @@ pub fn create_gear_router() -> Router<Arc<AppState>> {
         .route("/api/v1/chains/:id/whats-on", get(whats_on))
         .route("/api/v1/chains/:id/fit", post(fit_slot))
         .route("/api/v1/chains/:id/merge", post(merge_chain))
+        .route("/api/v1/chains/:id/route", axum::routing::put(save_route))
         .route("/api/v1/device-bindings/:id", axum::routing::delete(delete_device_binding))
         .route("/api/v1/chains/:id/fold", post(fold_chain))
         .route("/api/v1/chains/:id/rooms", axum::routing::put(set_chain_rooms))

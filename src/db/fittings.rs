@@ -91,6 +91,9 @@ pub enum FitRefusal {
     NotASlot,
     NotAnOption,
     InFuture,
+    /// The moment is before the route last changed: those plays ran
+    /// through the old route, which has no slot to pick at.
+    BeforeRouteChange,
 }
 
 /// The steps that are slots: (position, wired gear, options).
@@ -125,7 +128,10 @@ pub fn picks_of(components: &[ChainComponent], overrides: &[VariantOverride]) ->
 /// A variant's overrides as a comparable set of (position, gear), or None
 /// when it does anything a slot pick cannot (adds or removes a step, names
 /// free text, overrides a step that is not a slot).
-fn pick_set(components: &[ChainComponent], overrides: &[VariantOverride]) -> Option<Picks> {
+pub(super) fn pick_set(
+    components: &[ChainComponent],
+    overrides: &[VariantOverride],
+) -> Option<Picks> {
     let slots: HashMap<i64, i64> =
         slots_of(components).into_iter().map(|(p, w, _)| (p, w)).collect();
     let mut out = Picks::new();
@@ -494,16 +500,27 @@ impl Database {
             })
             .collect();
         // Named after the gear it puts on, because a few older screens and
-        // the session API print the name as it is; unique per chain only
-        // because the column is.
+        // the session API print the name as it is.
         let stem = overrides
             .iter()
             .map(|o| o.name.clone().unwrap_or_else(|| "gear".into()))
             .collect::<Vec<_>>()
             .join(" + ");
-        let json = serde_json::to_string(&overrides).unwrap_or_else(|_| "[]".into());
+        self.insert_auto_variant(user_id, chain_id, &stem, &overrides).await.map(Some)
+    }
+
+    /// A new `auto` variant, its name made unique per chain (only because the
+    /// column is) by a counter.
+    pub(super) async fn insert_auto_variant(
+        &self,
+        user_id: i64,
+        chain_id: i64,
+        stem: &str,
+        overrides: &[VariantOverride],
+    ) -> Result<i64, sqlx::Error> {
+        let json = serde_json::to_string(overrides).unwrap_or_else(|_| "[]".into());
         for n in 1..50 {
-            let name = if n == 1 { stem.clone() } else { format!("{stem} ({n})") };
+            let name = if n == 1 { stem.to_string() } else { format!("{stem} ({n})") };
             let res = sqlx::query_as::<_, (i64,)>(&crate::sql!(
                 "INSERT INTO chain_variants (uuid, user_id, chain_id, name, overrides, created_at, auto)
                  VALUES (?, ?, ?, ?, ?, ?, TRUE) RETURNING id"
@@ -517,12 +534,12 @@ impl Database {
             .fetch_all(&self.pool)
             .await;
             match res {
-                Ok(r) => return Ok(r.first().map(|r| r.0)),
+                Ok(r) => return r.first().map(|r| r.0).ok_or(sqlx::Error::RowNotFound),
                 Err(sqlx::Error::Database(e)) if e.is_unique_violation() => continue,
                 Err(e) => return Err(e),
             }
         }
-        Err(sqlx::Error::Protocol("could not name a variant for those picks".into()))
+        Err(sqlx::Error::Protocol("could not name a variant".into()))
     }
 
     /// Put `equipment_id` on at a slot from `since` (now when None).
@@ -569,7 +586,7 @@ impl Database {
         // Where the change stops: the first later switch at which this step's
         // pick changes, read on the history as it stands.
         let mut prev = picks_at(effective_at(t)).get(&position).copied().unwrap_or(wired);
-        let mut until = None;
+        let mut until: Option<i64> = None;
         for (_, s, v) in fittings.iter().filter(|f| f.1 > t) {
             let p = picks_at(*v).get(&position).copied().unwrap_or(wired);
             if p != prev {
@@ -577,6 +594,18 @@ impl Database {
                 break;
             }
             prev = p;
+        }
+        // A stretch filed with an older route (a variant that does more than
+        // pick at slots) is out of reach: picking there would re-file those
+        // plays onto today's route.
+        let is_pick = |v: Option<i64>| {
+            v.is_none_or(|v| variants.get(&v).is_some_and(|o| pick_set(&comps, o).is_some()))
+        };
+        if !is_pick(effective_at(t)) {
+            return Ok(Err(FitRefusal::BeforeRouteChange));
+        }
+        if let Some(f) = fittings.iter().find(|f| f.1 > t && !is_pick(f.2)) {
+            until = Some(until.map_or(f.1, |u| u.min(f.1)));
         }
         let in_range = |ts: i64| ts >= t && until.is_none_or(|u| ts < u);
 

@@ -1,18 +1,19 @@
 <script lang="ts">
 	import { onMount, tick } from 'svelte';
+	import { goto } from '$app/navigation';
 	import { api } from '$lib/api';
 	import type { DeviceBinding, InboxQuestion, Room, SignalChain, Equipment, ChainComponent, ChainInput, EquipmentInput, Binding, Device, ChainVariant, FoldSuggestion, WhatsOn } from '$lib/api';
 	import { formatHours, timeAgo, toDateInput, fromDateInput, ownedFor, formatDateTime } from '$lib/utils';
 	import ChainIcon, { CHAIN_ICONS, CHAIN_ICON_LABELS } from '$lib/components/ChainIcon.svelte';
 	import ChainGraph from '$lib/components/chains/ChainGraph.svelte';
 	import ChainList from '$lib/components/chains/ChainList.svelte';
-	import ChainDrawer from '$lib/components/chains/ChainDrawer.svelte';
+	import ChainDrawer, { type RuleChange } from '$lib/components/chains/ChainDrawer.svelte';
 	import ShelfLine from '$lib/components/chains/ShelfLine.svelte';
 	import RoomChips from '$lib/components/chains/RoomChips.svelte';
 	import RoomSuggest from '$lib/components/chains/RoomSuggest.svelte';
 	import InboxCard from '$lib/components/chains/InboxCard.svelte';
 	import { gearInUse } from '$lib/components/chains/layout';
-	import { lastUsedPhrase, variantLabel } from '$lib/components/chains/format';
+	import { lastUsedPhrase } from '$lib/components/chains/format';
 	import { syncUrl } from '$lib/url';
 
 	let chains: SignalChain[] = [];
@@ -25,9 +26,6 @@
 	let loading = true;
 	let error = '';
 
-	$: unmapped = bindings.filter((b) => b.chain_id == null);
-	$: mapped = bindings.filter((b) => b.chain_id != null);
-	$: unmappedDevices = devices.filter((d) => d.default_chain_id == null);
 
 
 	// ── The role palette ──
@@ -470,147 +468,25 @@
 		loading = false;
 	}
 
-	// ── Outputs: a chain, or a chain and what the output puts on ──
-	//
-	// One picker (Ashwin's call, 2026-11-04): a chain with slots is a group,
-	// so the choice is a single value and a pick can never be paired with the
-	// wrong chain. "Puts on TW4 by itself" is for an output whose name gives
-	// the gear away (Bluetooth earbuds); every other output takes whatever is
-	// on now. It also carries the way to make a chain, because an output that
-	// fits nothing you have is exactly when you want one.
-	//
-	// Values: '' unmapped · `c:<chain>` on whatever is on now ·
-	// `p:<chain>:<position>:<gear>` puts that gear on by itself ·
-	// `v:<variant>` an older pinned variant no single pick describes ·
-	// `new-chain` opens the editor.
-
-	/** The output a chain editor was opened from. Saving maps it. */
+	// Outputs and machines are set from the chain drawer ("How plays find
+	// this chain"), the route editor's source box and the inbox, since the
+	// Outputs and Machines tabs went (phase 4). `bindFor` is the output a new
+	// chain was started from; nothing sets it today, the save still honours it.
 	let bindFor: Binding | null = null;
 
-	/** The single slot pick a variant describes, if that is all it is. */
-	function pickOf(v: ChainVariant): { pos: number; eq: number } | null {
-		const o = v.overrides ?? [];
-		if (o.length !== 1 || o[0].equipment_id == null) return null;
-		const c = chains.find((x) => x.id === v.chain_id);
-		const step = c?.components?.[o[0].position];
-		return step?.options?.includes(o[0].equipment_id) ? { pos: o[0].position, eq: o[0].equipment_id } : null;
-	}
-	function outputValue(b: { chain_id: number | null; chain_variant_id: number | null }): string {
-		if (b.chain_id == null) return '';
-		if (b.chain_variant_id == null) return `c:${b.chain_id}`;
-		const v = variants.find((x) => x.id === b.chain_variant_id);
-		const p = v ? pickOf(v) : null;
-		return p ? `p:${b.chain_id}:${p.pos}:${p.eq}` : `v:${b.chain_variant_id}`;
-	}
-	const bindingValue = (b: Binding) => outputValue(b);
-	const gearName = (id: number) => equipment.find((e) => e.id === id)?.name ?? 'other gear';
-	/** The picks a chain's output can make by itself: every option at every
-	 *  slot that is not the wired gear. */
-	$: picksFor = (c: SignalChain) =>
-		(c.components ?? []).flatMap((s, i) =>
-			(s.options ?? []).filter((eq) => eq !== s.equipment_id).map((eq) => ({ value: `p:${c.id}:${i}:${eq}`, label: `${c.name} · puts on ${gearName(eq)} by itself` }))
-		);
-	/** Older pinned variants an output points at that no single pick says. */
-	$: pinnedFor = (c: SignalChain, current: string) =>
-		current.startsWith('v:')
-			? variants.filter((v) => v.chain_id === c.id && `v:${v.id}` === current).map((v) => ({ value: current, label: `${c.name} · ${variantLabel(v, equipment)}` }))
-			: [];
-
-	/** Turn a picker value into the (chain, variant) a binding stores, making
-	 *  the variant for a pick when no variant says exactly that yet. */
-	async function resolveOutputValue(value: string): Promise<[number | null, number | null] | null> {
-		if (value === '') return [null, null];
-		if (value.startsWith('c:')) return [Number(value.slice(2)), null];
-		if (value.startsWith('v:')) {
-			const v = variants.find((x) => x.id === Number(value.slice(2)));
-			return v ? [v.chain_id, v.id] : null;
-		}
-		if (value.startsWith('p:')) {
-			const [cid, pos, eq] = value.slice(2).split(':').map(Number);
-			const have = variants.find((v) => v.chain_id === cid && pickOf(v)?.pos === pos && pickOf(v)?.eq === eq);
-			if (have) return [cid, have.id];
-			// Tapedeck takes a setup that swaps one box as a pick of its own
-			// on the next read (`adopt_setups`), so this is never named on screen.
-			const made = await api.createVariant({
-				chain_id: cid,
-				name: `picks ${gearName(eq)} · ${Date.now()}`,
-				overrides: [{ position: pos, equipment_id: eq, name: gearName(eq) }]
-			});
-			return [cid, made.id];
-		}
-		return null;
-	}
-
-	async function assignBinding(b: Binding, sel: HTMLSelectElement) {
-		const value = sel.value;
-		if (value === 'new-chain') {
-			// Put the select back on what is saved: the editor might be cancelled,
-			// and a picker reading "+ New chain…" over an output that is still
-			// unmapped would be a lie.
-			sel.value = bindingValue(b);
-			newChainForOutput(b);
-			return;
-		}
-		try {
-			const r = await resolveOutputValue(value);
-			if (!r) return;
-			await api.setBinding(b.identifier, r[0], r[1]);
-			await load();
-		} catch (e) {
-			sel.value = bindingValue(b);
-			alert('Failed to map that output: ' + e);
-		}
-	}
-
-	/** A new chain named after the output. When the output's name is a piece of
-	 *  gear you have already added — a DAC reports itself by name — that gear is
-	 *  the first step, so the chain starts as something rather than a blank. */
-	function newChainForOutput(b: Binding) {
-		newChain();
-		bindFor = b;
-		cName = b.identifier;
-		const id = b.identifier.trim().toLowerCase();
-		const g = equipment.find((e) => e.name.trim().toLowerCase() === id);
-		if (g) {
-			cComps = [{
-				...blankComp(componentTypeForGear[g.equipment_type] ?? 'dac'),
-				name: g.name,
-				equipment_id: g.id
-			}];
-		}
-	}
-
 	function closeChainEditor() { chainOpen = false; bindFor = null; }
-	// ── Outputs of one box ──
-	// The same values as the picker for outputs by name.
-	const deviceBindingValue = (b: DeviceBinding) => outputValue(b);
-	async function assignDeviceBinding(b: DeviceBinding, value: string) {
+	// ── How plays find a chain, changed from its drawer ──
+	async function changeRule(r: RuleChange) {
 		try {
-			const r = await resolveOutputValue(value);
-			if (!r) return;
-			await api.setBinding(b.identifier, r[0], r[1], b.equipment_id);
+			if (r.kind === 'device') await api.setDeviceChain(r.id, r.chainId);
+			else if (r.chainId == null && r.kind === 'binding') await api.deleteBinding(r.id);
+			else if (r.chainId == null && r.kind === 'device_binding') await api.deleteDeviceBinding(r.id);
+			else await api.setBinding(r.identifier, r.chainId, null, r.kind === 'device_binding' ? r.equipmentId : null);
+			drawerNotice = r.chainId == null ? `${r.label} no longer comes here.` : `${r.label} goes to ${chains.find((c) => c.id === r.chainId)?.name ?? 'that chain'} now.`;
 			await load();
 		} catch (e) {
-			alert(e instanceof Error ? e.message : 'Could not save that output');
+			alert(e instanceof Error ? e.message : 'Could not change that');
 		}
-	}
-	async function removeDeviceBinding(b: DeviceBinding) {
-		if (!confirm(`Forget “${b.identifier}” on ${b.equipment_name}? It is learned again the next time it plays.`)) return;
-		await api.deleteDeviceBinding(b.id);
-		deviceBindings = deviceBindings.filter((x) => x.id !== b.id);
-	}
-	$: deviceBoxes = [...new Set(deviceBindings.map((b) => b.equipment_name))];
-
-	async function removeBinding(b: Binding) {
-		try { await api.deleteBinding(b.id); bindings = bindings.filter((x) => x.id !== b.id); } catch (e) { alert('Delete failed: ' + e); }
-	}
-
-	async function assignDevice(d: Device, value: string) {
-		const cid = value ? Number(value) : null;
-		try {
-			await api.setDeviceChain(d.id, cid);
-			devices = devices.map((x) => (x.id === d.id ? { ...x, default_chain_id: cid } : x));
-		} catch (e) { alert('Failed to set device chain: ' + e); }
 	}
 
 	// ── chain editor ──
@@ -858,7 +734,6 @@
 	// one page — the single biggest source of scrolling on this screen — behind
 	// one control. Not remembered across visits: Equipment is the answer to
 	// "what do I own", which is what people come here for.
-	let secTab: 'equipment' | 'outputs' | 'machines' = 'equipment';
 
 	// A `[[gear:…]]` shortcode in a liner note links to /chains?gear=<id>. There
 	// is no gear detail page yet, so the link highlights the row it means rather
@@ -889,6 +764,16 @@
 		highlightGear = g ? Number(g) : null;
 		const picked = Number(q.get('chain'));
 		if (picked) selectedChainId = picked;
+		// Back from the route editor: open the chain and say what the save did.
+		const saved = q.get('saved');
+		if (picked && saved) {
+			openChainId = picked;
+			whatsOnFor = picked;
+			void loadWhatsOn().then(() => (drawerNotice = saved));
+			const url = new URL(window.location.href);
+			url.searchParams.delete('saved');
+			syncUrl(url.pathname + url.search);
+		}
 		const inRoom = Number(q.get('room'));
 		if (inRoom) roomFilter = inRoom;
 		void loadRooms();
@@ -920,7 +805,7 @@
 		<h1 class="h-display" style="font-size:38px;">Signal Chains</h1>
 		<p style="margin:6px 0 0;color:var(--td-muted);font-size:15px;">The path your music takes, from source to ears.</p>
 	</div>
-	<button class="btn btn-primary" on:click={newChain}>+ New chain</button>
+	<a class="btn btn-primary" href="/chains/new">+ New chain</a>
 </div>
 
 {#if loading}
@@ -961,27 +846,6 @@
 	     that describe *data being lost or split right now* both show; the
 	     output one, which is only ever a tidy-up, still waits for both to
 	     clear. Two lines maximum. -->
-	{#if unmappedDevices.length}
-		<button class="nudge" aria-label="Review machines with no default chain" on:click={() => (secTab = 'machines')}>
-			<svg viewBox="0 0 24 24" width="17" fill="none" stroke="var(--td-accent)" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" style="flex:none;"><circle cx="12" cy="12" r="9"/><path d="M12 8h.01M11 12h1v4h1"/></svg>
-			<span style="flex:1;font-size:13.5px;">
-				{unmappedDevices.length} machine{unmappedDevices.length > 1 ? 's have' : ' has'} no default chain —
-				listens through {unmappedDevices.length > 1 ? 'them' : 'it'} won’t be attributed.
-			</span>
-			<span class="nudge-cta">Review →</span>
-		</button>
-	{/if}
-	{#if unmapped.length && !unmappedDevices.length}
-		<button class="nudge" aria-label="Review unmapped outputs" on:click={() => (secTab = 'outputs')}>
-			<svg viewBox="0 0 24 24" width="17" fill="none" stroke="var(--td-accent)" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" style="flex:none;"><circle cx="12" cy="12" r="9"/><path d="M12 8h.01M11 12h1v4h1"/></svg>
-			<span style="flex:1;font-size:13.5px;">
-				{unmapped.length} output{unmapped.length > 1 ? 's are' : ' is'} detected but unmapped —
-				map {unmapped.length > 1 ? 'them' : 'it'} once and every future listen attributes itself.
-			</span>
-			<span class="nudge-cta">Review →</span>
-		</button>
-	{/if}
-
 	<!-- Rooms you sit in.
 	     A play accepted out of a Shared Spool used to land with no chain at
 	     all, so those listens earned no gear hours, carried no fidelity and
@@ -1066,31 +930,21 @@
 		</div>
 	{:else}
 		<div class="panel" style="border-radius:22px;padding:44px;text-align:center;color:var(--td-muted);">
-			No signal chains yet — <button class="btn btn-ghost" on:click={newChain}>create your first</button>
+			No signal chains yet — <a class="btn btn-ghost" href="/chains/new">create your first</a>
 		</div>
 	{/if}
 
 	<ShelfLine {equipment} inUse={usedGear} onGraph={stepGear} on:edit={(e) => editGear(e.detail)} />
 
-	<!-- Equipment / Outputs / Machines behind one control.
-	     Outputs before Machines because that is the order the ladder tries them:
-	     an output's mapping wins over everything but an explicit chain name, and
-	     a machine's default is the last fallback. "Machines" rather than
-	     "Devices" (2026-11-04) — the outputs are what clients call an *output
-	     device*, and two tabs both called a device was half the confusion. -->
+	<!-- The gear table. Outputs and machines used to be two tabs beside it;
+	     they are set from a chain's drawer, the route editor and the inbox
+	     now (phase 4). -->
 	<div class="sechead">
-		<div class="seg">
-			<button class="seg-btn" class:on={secTab === 'equipment'} on:click={() => (secTab = 'equipment')}>Equipment · {equipment.length}</button>
-			<button class="seg-btn" class:on={secTab === 'outputs'} on:click={() => (secTab = 'outputs')}>Outputs · {bindings.length + deviceBindings.length}</button>
-			<button class="seg-btn" class:on={secTab === 'machines'} on:click={() => (secTab = 'machines')}>Machines · {devices.length}</button>
-		</div>
-		{#if secTab === 'equipment'}
-			<button class="btn btn-secondary" on:click={newGear}>+ Add gear</button>
-		{/if}
+		<h2 class="h-display" style="font-size:20px;margin:0;">Gear · {equipment.length}</h2>
+		<button class="btn btn-secondary" on:click={newGear}>+ Add gear</button>
 	</div>
 
-	{#if secTab === 'equipment'}
-		{#if equipment.length}
+	{#if equipment.length}
 			{#if inChainGear.length}
 				<div class="panel sectable">
 					<div class="secsub">In your chains</div>
@@ -1209,141 +1063,8 @@
 				<p>Add the boxes you listen through and they become one-click steps in a chain.</p>
 				<button class="btn btn-ghost" on:click={newGear}>Add your first</button>
 			</div>
-		{/if}
 	{/if}
 
-	{#if secTab === 'machines'}
-		<p class="sechint">The computers and phones that submit listens. A machine's default chain is the last fallback — an output's mapping and an app token's chain both win over it.</p>
-		{#if devices.length}
-			<div class="panel" style="border-radius:20px;padding:8px;">
-				{#each devices as d (d.id)}
-					<div class="drow">
-						<div class="dicon">
-							<svg viewBox="0 0 24 24" width="19" fill="none" stroke="currentColor" stroke-width="2.3" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="12" rx="2"/><path d="M8 20h8M12 16v4"/></svg>
-						</div>
-						<div style="flex:1;min-width:160px;">
-							<div style="font-weight:600;font-size:14.5px;">
-								{d.name ?? d.machine_id}
-								{#if d.platform}<span style="font-weight:400;font-size:12px;color:var(--td-muted-3);margin-left:5px;">{d.platform}</span>{/if}
-							</div>
-							<div style="font-size:12.5px;color:var(--td-muted-2);margin-top:1px;">{d.total_listens} listens · last seen {timeAgo(d.last_seen)}</div>
-						</div>
-						<select class="input assign" class:needs={d.default_chain_id == null}
-							value={d.default_chain_id ?? ''} aria-label="Default chain for {d.name ?? d.machine_id}"
-							on:change={(e) => assignDevice(d, e.currentTarget.value)}>
-							<option value="">— no default —</option>
-							{#each chains as c}<option value={c.id}>{c.name}</option>{/each}
-						</select>
-					</div>
-				{/each}
-			</div>
-		{:else}
-			<div class="panel empty">
-				<div class="empty-t">No machines yet</div>
-				<p>They appear here once a client submits a listen carrying a machine id.</p>
-			</div>
-		{/if}
-	{/if}
-
-	{#if secTab === 'outputs'}
-		<p class="sechint">
-			Map each playback output once, to a chain (and, for earbuds a Bluetooth name gives away, the gear it
-			puts on by itself), and every future listen
-			through it lands there. It is the most specific rule, so it wins over an app token and the
-			machine. Listens already logged stay as they are; retag those from History.
-		</p>
-		{#if deviceBindings.length}
-			<!-- Outputs learned from one box, once its apps are tied to it from
-			     the inbox. They outrank an output of the same name below. -->
-			{#each deviceBoxes as boxName (boxName)}
-				<div class="secsub">Outputs of {boxName}</div>
-				<div class="panel" style="border-radius:20px;padding:8px;margin-bottom:12px;">
-					{#each deviceBindings.filter((x) => x.equipment_name === boxName) as b (b.id)}
-						<div class="drow">
-							<div class="dicon">
-								<svg viewBox="0 0 24 24" width="19" fill="none" stroke="currentColor" stroke-width="2.3" stroke-linecap="round" stroke-linejoin="round"><path d="M11 5L6 9H2v6h4l5 4V5z"/><path d="M15.5 8.5a5 5 0 0 1 0 7M19 5a9 9 0 0 1 0 14"/></svg>
-							</div>
-							<div style="flex:1;min-width:160px;">
-								<div style="font-weight:600;font-size:14.5px;display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
-									{b.identifier}
-									{#if b.interface}<span class="tag tag-neutral">{b.interface}</span>{/if}
-								</div>
-								<div style="font-size:12.5px;color:var(--td-muted-2);margin-top:1px;">{b.hits} plays · last seen {timeAgo(b.last_seen)}</div>
-							</div>
-							<select class="input assign" class:needs={b.chain_id == null}
-								value={deviceBindingValue(b)} aria-label="Chain for {b.identifier} on {b.equipment_name}"
-								on:change={(e) => assignDeviceBinding(b, e.currentTarget.value)}>
-								<option value="">— unmapped —</option>
-								{#each chainRows as c (c.id)}
-									{@const extra = [...picksFor(c), ...pinnedFor(c, deviceBindingValue(b))]}
-									{#if extra.length}
-										<optgroup label={c.name}>
-											<option value="c:{c.id}">{c.name} · on whatever is on now</option>
-											{#each extra as o (o.value)}<option value={o.value}>{o.label}</option>{/each}
-										</optgroup>
-									{:else}
-										<option value="c:{c.id}">{c.name}</option>
-									{/if}
-								{/each}
-							</select>
-							<button class="icon-btn danger" title="Forget this output" on:click={() => removeDeviceBinding(b)} aria-label="Forget {b.identifier} on {b.equipment_name}">✕</button>
-						</div>
-					{/each}
-				</div>
-			{/each}
-			{#if bindings.length}<div class="secsub">Outputs by name, from anything else</div>{/if}
-		{/if}
-		{#if bindings.length}
-			<div class="panel" style="border-radius:20px;padding:8px;">
-				{#each [...unmapped, ...mapped] as b (b.id)}
-					<div class="drow">
-						<div class="dicon">
-							<svg viewBox="0 0 24 24" width="19" fill="none" stroke="currentColor" stroke-width="2.3" stroke-linecap="round" stroke-linejoin="round"><path d="M11 5L6 9H2v6h4l5 4V5z"/><path d="M15.5 8.5a5 5 0 0 1 0 7M19 5a9 9 0 0 1 0 14"/></svg>
-						</div>
-						<div style="flex:1;min-width:160px;">
-							<div style="font-weight:600;font-size:14.5px;display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
-								{b.identifier}
-								{#if b.interface}<span class="tag tag-neutral">{b.interface}</span>{/if}
-							</div>
-							<div style="font-size:12.5px;color:var(--td-muted-2);margin-top:1px;">{b.hits} plays · last seen {timeAgo(b.last_seen)}</div>
-						</div>
-						<!-- One picker: a chain with slots is a group, so the choice is
-						     one value and a pick cannot land on the wrong chain. Option
-						     text repeats the chain because a closed select shows only
-						     the option, not its group. -->
-						<select class="input assign" class:needs={b.chain_id == null}
-							value={bindingValue(b)} aria-label="Chain for {b.identifier}"
-							on:change={(e) => assignBinding(b, e.currentTarget)}>
-							<option value="">— unmapped —</option>
-							{#each chainRows as c (c.id)}
-								{@const extra = [...picksFor(c), ...pinnedFor(c, bindingValue(b))]}
-								{#if extra.length}
-									<optgroup label={c.name}>
-										<option value="c:{c.id}">{c.name} · on whatever is on now</option>
-										{#each extra as o (o.value)}<option value={o.value}>{o.label}</option>{/each}
-									</optgroup>
-								{:else}
-									<option value="c:{c.id}">{c.name}</option>
-								{/if}
-							{/each}
-							<optgroup label="Nothing fits?">
-								<option value="new-chain">+ New chain from “{b.identifier}”…</option>
-							</optgroup>
-						</select>
-						<button class="icon-btn danger" title="Forget this output" on:click={() => removeBinding(b)} aria-label="Delete binding">✕</button>
-					</div>
-				{/each}
-			</div>
-		{:else if !deviceBindings.length}
-			<div class="panel empty dashed">
-				<div class="empty-icon">
-					<svg viewBox="0 0 24 24" width="24" fill="none" stroke="currentColor" stroke-width="2.3" stroke-linecap="round" stroke-linejoin="round"><path d="M11 5L6 9H2v6h4l5 4V5z"/><path d="M15.5 8.5a5 5 0 0 1 0 7M19 5a9 9 0 0 1 0 14"/></svg>
-				</div>
-				<div class="empty-t">No outputs detected yet</div>
-				<p>They appear here automatically once a client reports its output device — a USB DAC, Bluetooth endpoint, or headphone jack.</p>
-			</div>
-		{/if}
-	{/if}
 {/if}
 
 <!-- ── Chain detail drawer ──
@@ -1356,6 +1077,8 @@
 		{equipment}
 		{devices}
 		{bindings}
+		{deviceBindings}
+		{chains}
 		{whatsOn}
 		notice={drawerNotice}
 		lastUsed={lastUsed[String(openChain.id)] ?? null}
@@ -1368,10 +1091,12 @@
 		on:share={(e) => openChain && toggleShared(openChain, e.detail)}
 		on:changed={(e) => drawerChanged(e.detail)}
 		on:removeVariant={(e) => removeVariant(e.detail)}
+		on:rule={(e) => changeRule(e.detail)}
 		on:merge={() => openChain && openMerge(openChain)}
 		on:delete={() => (confirmChain = openChain)}
 		on:duplicate={() => openChain && duplicateChain(openChain)}
-		on:edit={() => openChain && editChain(openChain)}
+		on:edit={() => openChain && goto(`/chains/${openChain.id}/route`)}
+		on:rename={() => openChain && editChain(openChain)}
 	/>
 {/if}
 
@@ -1431,7 +1156,7 @@
 {#if chainOpen}
 	<div class="dialog-backdrop" on:click={closeChainEditor} on:keydown={() => {}} role="presentation">
 		<div class="dialog" style="width:min(620px,100%);" on:click|stopPropagation on:keydown|stopPropagation role="presentation">
-			<div class="dialog-title">{chainId == null ? 'New signal chain' : 'Edit chain'}</div>
+			<div class="dialog-title">{chainId == null ? 'New signal chain' : 'Rename and describe'}</div>
 			{#if bindFor && chainId == null}
 				<p style="font-size:12.5px;color:var(--td-muted-2);margin:-4px 0 10px;">
 					For listens through “{bindFor.identifier}” — saving maps that output to it.
@@ -1465,6 +1190,9 @@
 							{/each}
 						</div>
 					</div>
+					<!-- A chain that exists changes its route in the route editor,
+					     which asks what happens to plays already logged. -->
+					{#if chainId == null}
 					<div class="field">
 						<div style="font-size:12px;margin-bottom:5px;color:var(--td-muted);">Components (source → ears)</div>
 						<div style="display:flex;flex-direction:column;gap:8px;">
@@ -1517,6 +1245,7 @@
 							<button class="btn btn-ghost" style="align-self:flex-start;" on:click={addComp}>+ Add component</button>
 						</div>
 					</div>
+					{/if}
 				</div>
 			</div>
 			<div class="dialog-actions">
@@ -1621,16 +1350,6 @@
 	.tile-big { font-family: 'Caprasimo', serif; font-size: 28px; line-height: 1; letter-spacing: -.01em; }
 	.tile-label { font-size: 13px; color: var(--td-muted); margin-top: 7px; }
 	.tile-sub { font-size: 11.5px; color: var(--td-muted-3); margin-top: 2px; }
-
-	/* ── The nudge ── */
-	.nudge {
-		display: flex; align-items: center; gap: 11px; width: 100%; text-align: left;
-		cursor: pointer; font-family: inherit; color: var(--td-text);
-		background: var(--td-good-bg); border: 1px solid var(--td-border);
-		border-radius: 14px; padding: 11px 16px; margin-bottom: 18px;
-	}
-	.nudge:hover { border-color: var(--td-accent); }
-	.nudge-cta { font-size: 13px; font-weight: 600; color: var(--td-accent); white-space: nowrap; }
 	/* — where a gear total came from —
 	   The figure is derived from listens across possibly several chains, so it
 	   reads as a claim. This turns it into an addition you can check. */
@@ -1668,14 +1387,6 @@
 
 	/* ── The secondary panel ── */
 	.sechead { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; margin-bottom: 16px; }
-	.seg { display: flex; gap: 4px; background: var(--td-sidebar); border-radius: 999px; padding: 4px; flex-wrap: wrap; }
-	.seg-btn {
-		white-space: nowrap; text-align: center; border: none; cursor: pointer;
-		font-family: inherit; font-size: 13.5px; padding: 9px 16px; border-radius: 999px;
-		background: transparent; color: var(--td-nav-fg); font-weight: 500;
-	}
-	.seg-btn.on { background: var(--td-accent); color: #fbf5ea; font-weight: 600; }
-	.sechint { margin: 0 0 14px; color: var(--td-muted); font-size: 13.5px; }
 	.sectable { border-radius: 20px; padding: 4px 20px 12px; margin-bottom: 18px; }
 	.secsub {
 		font-size: 11px; letter-spacing: .08em; text-transform: uppercase;
@@ -1689,25 +1400,8 @@
 	.tablewrap { overflow-x: auto; }
 
 	.empty { border-radius: 20px; padding: 40px 28px; text-align: center; }
-	.empty.dashed { border-style: dashed; border-color: var(--td-muted-3); }
-	.empty-icon {
-		display: inline-flex; align-items: center; justify-content: center;
-		width: 52px; height: 52px; border-radius: 16px;
-		background: var(--td-surface2); color: var(--td-muted-2); margin-bottom: 14px;
-	}
 	.empty-t { font-family: 'Caprasimo', serif; font-size: 19px; margin-bottom: 6px; }
 	.empty p { margin: 0 auto 12px; max-width: 46ch; color: var(--td-muted); font-size: 13.5px; line-height: 1.55; }
-
-	.drow { display: flex; align-items: center; gap: 14px; padding: 12px 14px; border-radius: 14px; flex-wrap: wrap; }
-	.drow:hover { background: var(--td-surface2); }
-	.dicon {
-		width: 38px; height: 38px; flex: none; border-radius: 11px;
-		background: var(--td-surface2); border: 1px solid var(--td-border);
-		display: flex; align-items: center; justify-content: center; color: var(--td-muted);
-	}
-	.assign { width: auto; min-width: 170px; font-size: 13px; padding: 8px 12px; }
-	/* An unassigned row is the one thing on this tab worth looking at. */
-	.assign.needs { border-color: var(--td-accent); color: var(--td-accent); font-weight: 600; }
 
 	/* The gear tag. A select styled as a pill: same four choices as the design's
 	   popover, reachable from a keyboard, and no positioning code. */

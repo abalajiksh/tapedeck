@@ -3825,6 +3825,8 @@ pub use inbox::{
 };
 mod fittings;
 pub use fittings::{FitOutcome, FitRefusal, InboxMerge, InboxSetup, MoodsRetired, Picks, WhatsOn};
+mod route;
+pub use route::RouteSaved;
 mod rooms;
 mod sanitise;
 pub use rooms::{Room, RoomRefusal};

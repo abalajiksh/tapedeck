@@ -47,5 +47,8 @@ export function picksLabel(v: ChainVariant, equipment: Equipment[]): string {
  *  they put on, never by their internal name; a setup someone named before
  *  slots existed keeps its name. */
 export function variantLabel(v: ChainVariant, equipment: Equipment[]): string {
+	// The old route a "from now on" route edit keeps for past plays is named
+	// for when it ended, which says more than its list of differences.
+	if (v.auto && v.name.startsWith('Route until')) return v.name;
 	return v.auto ? picksLabel(v, equipment) || 'as wired' : v.name;
 }

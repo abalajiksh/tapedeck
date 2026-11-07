@@ -3313,6 +3313,14 @@ class TapedeckAPI {
 	): Promise<FitOutcome> {
 		return this.post(`/api/v1/chains/${chainId}/fit`, body);
 	}
+	/** Save the route editor's steps. `keep`: plays already logged keep the
+	 *  route they had; `rewrite`: every past play is read through the new one. */
+	async saveRoute(
+		chainId: number,
+		body: { components: ChainComponent[]; past: 'keep' | 'rewrite' }
+	): Promise<{ past: string; kept: number; unchanged: boolean }> {
+		return this.request('PUT', `/api/v1/chains/${chainId}/route`, body);
+	}
 	/** Merge a chain that differs at one box into this one, as an option. Not reversible. */
 	async mergeChain(chainId: number, fromChainId: number): Promise<FoldOutcome> {
 		return this.post(`/api/v1/chains/${chainId}/merge`, { from_chain_id: fromChainId });
